@@ -10,6 +10,20 @@ An item that exists in either ledger is invisible here and is that gate's busine
 exists in neither is invisible there and is this one's. Neither subsumes the other, and the near-
 identical names are the reason this paragraph is the first thing in the file.
 
+AND THE NAMES DIVERGE ON WIRING TOO, WHICH IS THE HALF THAT MISLEADS. That sibling IS run in CI
+(`.github/workflows/backlog-hygiene.yml`, and its test is named in `ci.yml`'s docs-lane list). THIS
+SCRIPT IS RUN BY NO WORKFLOW AND NO PRE-COMMIT HOOK -- it reaches CI only through
+`tests/test_dangling_citation_check.py`, which is manifest-classified and therefore runs on the
+tooling leg. Measured, with a positive control in the same pass: `dangling_citation_check` returns
+ZERO hits across `.github/` and `.pre-commit-config.yaml`, while `backlog_status_check`, `ledger_check`
+and `scan_forbidden` return 3, 2 and 3 -- so the probe finds wiring where wiring exists.
+
+WHY THAT IS WORTH A PARAGRAPH RATHER THAN LEFT TO BE LOOKED UP: a grep for `citation_check` HITS A
+WORKFLOW, and the hit belongs to the sibling. The answer is confident, well-formed, and wrong in the
+direction of believing a change here is CI-covered when it is not. Anyone reasoning about whether a
+behaviour change in this file can red a build must grep the FULL name, and should treat a bare
+`citation_check` match as evidence about the other script until they have checked which one it named.
+
 WHAT THE DEFECT IS. While a number names nothing, a citation to it resolves to NOTHING -- honest and
 harmless, and it advertises its own brokenness. If that number is later issued, the citation starts
 resolving to unrelated work and NOTHING anywhere reports a problem. The ledger's own erratum names
@@ -115,6 +129,16 @@ def _load_backlog_module() -> object:
     return module
 
 
+#: The scan's coverage bound, stated ONCE and printed on EVERY exit path (BACKLOG #1235).
+#: It used to be a literal inside the hits branch, so a CLEAN run never showed it -- the bound was
+#: absent at exactly the moment a reader concludes "clean", which is the population it qualifies.
+#: Naming it is not tidiness: two copies of a caveat drift, and the copy that goes stale is the one
+#: nobody reads because it only prints on the path they are not on.
+_COVERAGE_BOUND = (
+    "Not scanned: the private companion repository, where a citation is invisible to this repo."
+)
+
+
 def allocation_floor(sources: list[Path] | None = None) -> int:
     """The highest item number the ledgers know about. Nothing at or below it can ever be issued.
 
@@ -198,6 +222,27 @@ def unresolved_citations(paths: list[Path], allocated: set[int]) -> list[Hit]:
     return hits
 
 
+def is_live_shape(hit: Hit, floor: int) -> bool:
+    """True iff this unresolved citation can EVER arm -- the shape the exit code keys on.
+
+    THE ONE DEFINITION (BACKLOG #1235 residual 2). This predicate previously existed twice: once
+    inline in :func:`main` and once re-derived inside the gate test, agreeing by convention with
+    nothing binding them. Two definitions of the rule a gate fires on is the defect this whole tool
+    exists to catch in other people's gates, reproduced inside it.
+
+    Both conditions exclude a citation that is REPORTED but is not a defect:
+
+    * ``number > floor`` -- at or below the allocator's high-water mark a number can never be
+      issued (``alloc.ps1`` starts at ``$observed + 1`` and only ever scans upward), so the
+      citation resolves to nothing permanently rather than by luck.
+    * ``not pr_shaped`` -- a PR, issue or foreign-repo reference is not a backlog citation at all.
+
+    Keeping them here rather than at the call site is what makes a single mutation red BOTH the
+    exit-code arms and the real-tree gate. Before this, mutating one left the other green.
+    """
+    return hit.number > floor and not hit.pr_shaped
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
@@ -220,11 +265,49 @@ def main(argv: list[str] | None = None) -> int:
 
     paths = args.paths or sorted(Path("docs").rglob("*.md"))
     allocated = allocated_numbers()
+
+    # BACKLOG #1235: REFUSE AN EMPTY POPULATION INSTEAD OF REPORTING IT CLEAN.
+    #
+    # The default path list is `Path("docs").rglob(...)` -- relative to the CURRENT WORKING DIRECTORY,
+    # not the repo root. MEASURED from a directory with no `docs/`: this printed
+    #     No unresolved backlog citation in 0 file(s).
+    #     Resolved against 0 allocated item numbers (open and closed).
+    # and exited 0. **Both counts were zero and nothing objected.** A green that is a statement about
+    # the ENVIRONMENT rather than the SUBJECT, which is worse than an untested gate because it closes
+    # the question instead of inviting it.
+    #
+    # THIS IS THE TRAP UNDER THE ITEM'S FIRST DISJUNCT, not a hypothetical: the >200-file population
+    # floor lives ONLY in `test_the_docs_scan_actually_covers_something`, so it guards the PYTEST arm
+    # and nothing else. Anyone who satisfies the item by wiring this CLI into `.github/` or
+    # `.pre-commit-config.yaml` -- the documented way to close it -- inherits a gate that reports clean
+    # when it scanned nothing, and inherits it precisely BECAUSE they closed the item.
+    #
+    # Refusing on an empty ALLOCATION as well as an empty PATH list is deliberate: an unreadable ledger
+    # resolves every citation to "no filed item", which fails the other way and would bury a real run
+    # in false positives. Both zeros mean the same thing -- the tool is not looking at this repository.
+    if not paths or not allocated:
+        print(
+            f"ERROR: refusing to report on an empty population -- {len(paths)} file(s) scanned, "
+            f"{len(allocated)} allocated item number(s) resolved.\n"
+            f"       scanned from: {Path.cwd()}\n"
+            "       The default path list is CWD-relative, so this is what running outside the repo "
+            "root looks like.\n"
+            "       A clean result over nothing is not a clean result. Pass paths explicitly, or run "
+            "from the repo root.",
+            file=sys.stderr,
+        )
+        return 1
+
     hits = unresolved_citations(list(paths), allocated)
 
     if not hits:
         print(f"No unresolved backlog citation in {len(paths)} file(s).")
         print(f"Resolved against {len(allocated)} allocated item numbers (open and closed).")
+        # BACKLOG #1235: THE COVERAGE BOUND PRINTS ON A CLEAN RUN TOO. It used to sit only after the
+        # hits loop, so this early return skipped it -- absent at exactly the moment a reader concludes
+        # "clean", which is the whole population the bound exists to qualify. It is in the docstring,
+        # and a docstring is not what a CI log shows.
+        print(_COVERAGE_BOUND)
         return 0
 
     floor = allocation_floor()
@@ -237,13 +320,35 @@ def main(argv: list[str] | None = None) -> int:
         )
         print(f"{hit.path}:{hit.lineno}: #{hit.number} resolves to no filed item{note}")
         print(f"    {hit.line}")
-        state = (
-            f"BELOW THE FLOOR ({floor}) -- the allocator only ever issues above its high-water "
-            "mark, so this number can NEVER be issued and the citation is permanently harmless."
-            if hit.number <= floor
-            else f"ABOVE THE FLOOR ({floor}) -- this number CAN still be issued to unrelated work. "
-            "This is the live shape."
-        )
+        # BACKLOG #1235: THE ANNOTATION ASKS `is_live_shape`, THE SAME PREDICATE THE EXIT CODE ASKS.
+        #
+        # It used to branch on `hit.number <= floor` ALONE and never consult `pr_shaped` -- a THIRD
+        # definition of the live-shape rule, beside the exit list and the test's copy, and it
+        # DISAGREED IN PRODUCTION rather than in principle. MEASURED at 4c28badd: six hits printed
+        # BOTH `[PR/issue/foreign-repo shaped -- very likely NOT a backlog citation]` AND `This is
+        # the live shape.` -- two contradictory annotations on the SAME hit, two lines apart -- while
+        # the process exited 0. A reader saw six live-shape citations above a green gate.
+        #
+        # It survived the single-definition refactor that is this item's own subject, which is the
+        # part worth keeping: `is_live_shape` was extracted and the exit list and the test were both
+        # repointed at it, while the branch that PRINTS the verdict to a human was left behind. The
+        # definitions a tool COMPUTES with get unified; the one it NARRATES with is easy to miss
+        # precisely because no assertion reads it.
+        if hit.number <= floor:
+            state = (
+                f"BELOW THE FLOOR ({floor}) -- the allocator only ever issues above its high-water "
+                "mark, so this number can NEVER be issued and the citation is permanently harmless."
+            )
+        elif not is_live_shape(hit, floor):
+            state = (
+                f"ABOVE THE FLOOR ({floor}), but NOT the live shape -- see the annotation above. "
+                "The exit code passes over this hit deliberately."
+            )
+        else:
+            state = (
+                f"ABOVE THE FLOOR ({floor}) -- this number CAN still be issued to unrelated work. "
+                "This is the live shape."
+            )
         print(f"    -> {state}")
 
     distinct = sorted({hit.number for hit in hits})
@@ -262,9 +367,7 @@ def main(argv: list[str] | None = None) -> int:
         "This is an UPPER BOUND ON CITATIONS, NOT A COUNT OF DEFECTS -- some hits are very likely"
     )
     print("not backlog references at all. Each is printed above with its source line; judge them.")
-    print(
-        "Not scanned: the private companion repository, where a citation is invisible to this repo."
-    )
+    print(_COVERAGE_BOUND)
     # FAIL CLOSED, ON THE LIVE SHAPE ONLY (BACKLOG #1235). The first version of this took `--fail`
     # as opt-in and nothing passed it, so a planted dangling citation was reported correctly AND the
     # process still exited 0 -- a checker that cannot fail is not a check, which is the defect this
@@ -275,7 +378,7 @@ def main(argv: list[str] | None = None) -> int:
     # never be issued, and a PR/issue/foreign-repo reference is not a backlog citation at all; both
     # are reported for a human to read and neither is a defect. Failing on them would red the tree
     # today for hits that are correct, and a gate that cries wolf gets switched off.
-    live = [h for h in hits if h.number > floor and not h.pr_shaped]
+    live = [h for h in hits if is_live_shape(h, floor)]
     if live:
         print()
         print(f"LIVE SHAPE: {len(live)} citation(s) name a number that can still be issued.")

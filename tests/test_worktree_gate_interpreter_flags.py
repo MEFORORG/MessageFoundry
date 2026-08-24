@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Organization and contributors
 """Which flags count as an INTERPRETER flag, and why the answer has to be a rule rather than a list.
 
 ``Get-ScannableSegments`` does not blank the quoted argument of an interpreter flag, it RECURSES into
@@ -311,3 +313,132 @@ def test_a_multi_line_interpreter_argument_still_denies(
     "fixed" against a green nobody could have seen fail."""
     command = f'pwsh -NoProfile {flag} "\n{PAYLOAD}\n"'
     assert_denied(run_gate(shell(command, cwd=primary), repos_file))
+
+
+# ------------------------------------- the flag shape is a QUESTION, not the answer (BACKLOG #1229)
+#
+# Everything above establishes which flag SPELLINGS an interpreter accepts. It does not establish that
+# the program in front of the flag is an interpreter, and ``$shFlag`` is ``-[a-z]*c`` under (?i) -- so
+# it matches ``-C``, ``-ic``, ``-rc``, ``-static``, ``-sync`` and ``-exec``, while ``$cmdExeFlag``
+# walks an ordinary POSIX path one component at a time. Enumerated over a hand-built axis: 28 of 33
+# NON-interpreter invocations matched, and 18 of 36 real interpreter invocations did not. The flag
+# shape is close to uncorrelated with executing an argument.
+#
+# The consequence was that an ordinary search of a log file was scanned as code and DENIED. Whether
+# each program below actually executes its argument was settled by driving the real binary with a
+# payload that COMPUTES (``expr 111 \* 3`` -> 333, so an echo-back cannot be mistaken for a run):
+# every row here left no marker, while ``bash -c``, ``sh -c`` and ``python -c`` all printed 333.
+#
+# WHAT THIS DOES NOT CLOSE, stated so no stronger claim is inferred: the 18 interpreter spellings the
+# matcher never reaches -- ``perl -e``, ``node -e``, ``ruby -e``, ``awk``, ``eval``, ``ssh host CMD``
+# -- are unaffected. They were ALLOW before and are ALLOW now. ``Get-FlagOwner`` is asked only about
+# flags the matcher already found.
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        # THE ROW THAT MOTIVATES THIS: an ordinary search of a shell history for a dangerous command.
+        "grep -c 'git reset --hard' /c/logs/history.log",
+        "grep -ic '{payload}' notes.txt",
+        "grep -rc '{payload}' .",
+        "rg -c '{payload}' .",
+        "ag -c '{payload}' .",
+        # -c on programs where it means count, check, stdout, bytes, characters, create, compare...
+        "sort -c '{payload}'",
+        "uniq -c '{payload}'",
+        "wc -c '{payload}'",
+        "cut -c '{payload}'",
+        "head -c '{payload}'",
+        "tail -c '{payload}'",
+        "ls -c '{payload}'",
+        "tar -c '{payload}'",
+        "gzip -c '{payload}'",
+        "md5sum -c '{payload}'",
+        "cmp -c '{payload}'",
+        "diff -c '{payload}'",
+        "rsync -c '{payload}'",
+        # A long option that merely ENDS in c, which `-[a-z]*c` also reaches.
+        "gcc -static '{payload}'",
+        # curl -c takes a cookie-jar FILENAME.
+        "curl -c '{payload}' https://example.invalid",
+        # The family-flag path arguments, already pinned above as must-allow, now for a payload that
+        # DOES carry a git token and a gated verb -- which is what makes these rows non-vacuous.
+        "make -C '{payload}'",
+        "git -C '{payload}'",
+    ],
+)
+def test_a_program_that_does_not_EXECUTE_its_argument_is_not_recursed_into(
+    primary: Path, repos_file: Path, command: str
+) -> None:
+    """The false-deny half, with the discriminating control inline on every row."""
+    payload = f"git -C {primary} reset --hard"
+    assert run_gate(shell(command.format(payload=payload), cwd=primary), repos_file) is None, (
+        "this program does not run its argument, so its argument is data and denying it stops "
+        "legitimate work (BACKLOG #1229 residual, fourth round)"
+    )
+    # THE DISCRIMINATING CONTROL, varying the PROGRAM alone: an interpreter handed the identical
+    # string must still deny. Without it a gate that had stopped recursing entirely -- which is a
+    # total bypass of rules 3, 3b, 3c and 3d through `bash -c` -- would pass every row above.
+    assert_denied(run_gate(shell(f"bash -c '{payload}'", cwd=primary), repos_file))
+
+
+@pytest.mark.parametrize(
+    "invocation",
+    [
+        # A NON-INTERPRETER WORD SITS BETWEEN the interpreter and its flag in every row here, which is
+        # exactly what an adjacency test gets wrong. The scan goes leftward, skipping options and
+        # switch components, bounded by the last command separator.
+        "su someone -c",
+        "flock /tmp/l -c",
+        "script -c",
+        "timeout 5 bash -c",
+        "env FOO=1 bash -c",
+        "docker run --rm img sh -c",
+        "/usr/bin/bash -c",
+        "bash.exe -c",
+        # `find -exec` really executes, and `-exec` ends in `c`, so it was caught by accident before.
+        # Dropping `find` from the recursing set was measured to regress this from DENY to ALLOW.
+        "find . -name x -exec",
+    ],
+)
+def test_an_interpreter_behind_a_wrapper_word_is_still_recursed_into(
+    primary: Path, repos_file: Path, invocation: str
+) -> None:
+    """The fail-open half. Each row really runs the quoted string."""
+    payload = f"git -C {primary} reset --hard"
+    suffix = " \\;" if invocation.endswith("-exec") else ""
+    assert_denied(run_gate(shell(f"{invocation} '{payload}'{suffix}", cwd=primary), repos_file))
+    # THE CONTROL: the same shape with a program that does NOT execute its argument must allow, or
+    # this test would be green against a gate that recursed into everything -- the state it replaces.
+    assert run_gate(shell(f"grep -c '{payload}' f.txt", cwd=primary), repos_file) is None
+
+
+def test_an_UNKNOWN_program_with_an_interpreter_flag_is_a_known_open_residual(
+    primary: Path, repos_file: Path
+) -> None:
+    """A TRIPWIRE OVER THE COST OF THIS CHANGE. It asserts ALLOW and that is NOT an endorsement.
+
+    ``Get-FlagOwner`` decides by an ALLOWLIST of program names, because there is no syntactic property
+    separating ``cp`` from ``sudo`` or ``ls /usr/src/c`` from ``cmd /usr/src/c``. A program it does not
+    know gets no recursion::
+
+        myrunner -c '<gated>'        ALLOW    (origin/main: DENY)
+
+    If ``myrunner`` really is an interpreter that is a fail-open. It is the same class as the 18
+    interpreter spellings the flag matcher already misses -- ``perl -e``, ``node -e``, ``eval`` -- and
+    the previous catch was an accident of the flag shape rather than a decision, but it is still a
+    deliberate DENY-to-ALLOW move against origin/main and it is recorded as one. It also covers the
+    fifth counterexample the gate's ``$cmdExeFlag`` note lists: a renamed or aliased copy of cmd.exe.
+
+    WHEN THIS TEST REDS, that is the success signal: somebody added the name, or replaced the
+    allowlist. Delete the row; do not restore the ALLOW.
+    """
+    payload = f"git -C {primary} reset --hard"
+    assert run_gate(shell(f"myrunner -c '{payload}'", cwd=primary), repos_file) is None, (
+        "myrunner -c now DENIES. If you widened the interpreter vocabulary deliberately, that is the "
+        "intended outcome -- delete this test and the residual note in Get-ScannableSegments. Do NOT "
+        "restore the ALLOW to make this pass."
+    )
+    # The control that keeps this tripwire attached to the VOCABULARY and not to the whole mechanism.
+    assert_denied(run_gate(shell(f"sh -c '{payload}'", cwd=primary), repos_file))

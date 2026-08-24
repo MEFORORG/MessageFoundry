@@ -47,15 +47,18 @@ from messagefoundry.config.tls_policy import (
     HopPosture,
     InsecureHopRefused,
     RevocationHopGuard,
+    build_asserted_https_handler,
     cleartext_acceptance_audit_sink,
     current_hop_posture,
     enforce_insecure_hop,
+    harden_cipher_suites,
     insecure_hop_disposition,
     is_loopback_hop_host,
     relax_verify_expiry,
 )
 from messagefoundry.controlchars import strip_control_chars
 from messagefoundry.transports.base import (
+    ECH_UNSUPPORTED_DESTINATION_MSG,
     DeliveryError,
     DeliveryResponse,
     DestinationConnector,
@@ -70,6 +73,7 @@ __all__ = [
     "InsecureHopGuard",
     "ProxyConfig",
     "RestDestination",
+    "ech_readdressed_request",
     "capture_response_headers",
     "ech_sidecar_url_from_settings",
     "egress_route_from_settings",
@@ -224,8 +228,21 @@ class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
         return None
 
 
-# Shared opener that verifies TLS (urllib's default context) and never follows redirects.
-_NO_REDIRECT_OPENER = urllib.request.build_opener(_NoRedirectHandler)
+def _asserted_https_handler() -> urllib.request.HTTPSHandler:
+    """urllib's own default https handler for this connector family, with its context ASSERTED.
+
+    ``build_opener(_NoRedirectHandler)`` alone leaves urllib to fill in the ``HTTPSHandler``, and the
+    context that handler builds is one the engine never names — so the default REST / FHIR /
+    DICOMweb / ``fhir_lookup`` egress path, which every HTTP-family destination falls back to unless
+    it needs a proxy, an escape or an expiry relaxation, had an inherited suite list that nothing
+    checked. Naming the handler here lets
+    :func:`~messagefoundry.config.tls_policy.harden_cipher_suites` run on the context it carries.
+
+    It does NOT substitute a context: urllib's own is asserted in place. See
+    :func:`~messagefoundry.config.tls_policy.build_asserted_https_handler` for the measurement that
+    forced that choice — a hand-built ``ssl.create_default_context()`` differs from urllib's on ALPN
+    and post-handshake auth, so passing one would have changed the handshake."""
+    return build_asserted_https_handler(connector="HTTP-family destination (REST/FHIR/DICOMweb)")
 
 
 def _no_redirect_opener(
@@ -237,7 +254,17 @@ def _no_redirect_opener(
     opener is **never** mutated (ADR 0126). Passing a ``ProxyHandler`` here also suppresses urllib's
     default env-reading ProxyHandler (``build_opener`` skips a default whose class a supplied handler
     already covers), so there is never a competing double-proxy."""
-    return urllib.request.build_opener(_NoRedirectHandler, *extra_handlers)
+    return urllib.request.build_opener(
+        _NoRedirectHandler, _asserted_https_handler(), *extra_handlers
+    )
+
+
+# Shared opener that verifies TLS and never follows redirects, reused by every connection that needs
+# no extra handler. Built through _no_redirect_opener with no extras rather than repeating the
+# expression, so there is exactly ONE construction of this opener to keep asserted. Handler-for-handler
+# identical to the previous `build_opener(_NoRedirectHandler)`: build_opener would have added an
+# HTTPSHandler of its own, and this supplies the same class built the same way.
+_NO_REDIRECT_OPENER = _no_redirect_opener()
 
 
 def _insecure_opener(
@@ -248,6 +275,9 @@ def _insecure_opener(
     ctx = ssl.create_default_context()
     ctx.check_hostname = False
     ctx.verify_mode = ssl.CERT_NONE
+    # Verification is off, but the traffic is still encrypted, so the suite list still matters: assert
+    # forward secrecy here too (ASVS 12.1.2), after the verify-off configuration is applied.
+    harden_cipher_suites(ctx, connector="HTTP-family destination (TLS verification disabled)")
     return urllib.request.build_opener(
         _NoRedirectHandler, urllib.request.HTTPSHandler(context=ctx), *extra_handlers
     )
@@ -265,6 +295,7 @@ def _expiry_relaxed_opener(
     still rejected. Shared verbatim by the SOAP destination."""
     ctx = ssl.create_default_context()
     relax_verify_expiry(ctx, host=host)  # chain + hostname stay enforced; only expiry is relaxed
+    harden_cipher_suites(ctx, connector="HTTP-family destination (expired-certificate tolerance)")
     return urllib.request.build_opener(
         _NoRedirectHandler, urllib.request.HTTPSHandler(context=ctx), *extra_handlers
     )
@@ -1120,6 +1151,37 @@ def ech_sidecar_url_from_settings(s: Mapping[str, Any]) -> str | None:
     return sidecar.rstrip("/")
 
 
+def ech_readdressed_request(
+    sidecar: str,
+    url: str,
+    *,
+    data: bytes | None,
+    headers: Mapping[str, str],
+    method: str,
+) -> urllib.request.Request:
+    """Re-address one request to the loopback ECH sidecar (ADR 0139): it goes to the sidecar over
+    cleartext http with the real upstream in the ``Host`` header, and the sidecar re-originates the
+    ``https`` + ECH connection to that host (verifying its cert), so the SNI never leaves this host in
+    cleartext. Destination TLS is delegated to the sidecar; the engine->sidecar hop is same-host
+    loopback (ADR 0092 posture).
+
+    Shared, because a connection has more than one outbound hop. The delivery hop
+    (:meth:`RestDestination._ech_request`) and the **token-endpoint hop** (``http_auth`` / ``smart``)
+    must both take it — ADR 0126 already rules that the token POST follows the connection's egress
+    route, and before #1176 the ECH path was the one route that did not, so an ``ech_egress``
+    connection with OAuth2 or SMART auth still put the authorization server's hostname in a cleartext
+    outer ClientHello."""
+    parsed = urllib.parse.urlsplit(url)
+    path = parsed.path or "/"
+    if parsed.query:
+        path += "?" + parsed.query
+    h = dict(headers)
+    h["Host"] = parsed.netloc  # tell the sidecar the real upstream (host[:port])
+    return urllib.request.Request(  # noqa: S310  # nosec B310 — http to a validated loopback sidecar
+        sidecar + path, data=data, headers=h, method=method
+    )
+
+
 def egress_route_from_settings(
     s: Mapping[str, Any],
     *,
@@ -1134,13 +1196,16 @@ def egress_route_from_settings(
     implemented only on the REST destination in this build, so any *other* connector that reaches here
     with ``ech_egress`` set would silently NOT hide the SNI — refuse loudly rather than leak it. (The
     REST destination resolves ECH itself via :func:`ech_sidecar_url_from_settings` and never calls this
-    for the ECH case.)"""
+    for the ECH case.)
+
+    Since #1176 the same refusal is also hoisted into
+    :func:`~messagefoundry.transports.base.build_destination`, which covers **every** connector rather
+    than only the ones routing through here. This one stays for the callers that are **not** destinations
+    and so never reach that seam — ``FhirLookupExecutor`` (ADR 0043, ``fhir.py``) is the live case. Both
+    raise the **same** message, so a doubly-covered connector never shows an operator two different
+    explanations for one key."""
     if s.get("ech_egress"):
-        raise ValueError(
-            "ech_egress (ASVS 12.1.5 SNI hiding) is supported only on the REST destination in this "
-            "build; on this connector it would NOT hide the SNI, so it is refused rather than silently "
-            "leaking it (ADR 0139)"
-        )
+        raise ValueError(ECH_UNSUPPORTED_DESTINATION_MSG)
     return proxy_config_from_settings(
         s,
         dest_scheme=dest_scheme,
@@ -1251,8 +1316,14 @@ class RestDestination(DestinationConnector):
         # in _post; the two modes are mutually exclusive (a loud HttpAuthError otherwise).
         from messagefoundry.transports.http_auth import bearer_provider_from_settings
 
-        # ADR 0126: the token-endpoint call must ALSO traverse the proxy — thread the same ProxyConfig in.
-        self._token_provider = bearer_provider_from_settings(s, proxy=self._proxy)
+        # ADR 0126: the token-endpoint call must ALSO traverse the connection's egress route — thread it
+        # in. The two routes are mutually exclusive (refused above), so exactly one of these is set:
+        # a forward proxy carried as opener handlers, or the ECH sidecar the request is re-addressed to.
+        # #1176: before this, the ECH case passed `proxy=None` and nothing else, so the token hop went
+        # DIRECT and leaked the authorization server's SNI while the payload hop was routed.
+        self._token_provider = bearer_provider_from_settings(
+            s, proxy=self._proxy, ech_sidecar=self._ech_sidecar
+        )
         if self._token_provider is not None:
             # The SMART bearer is injected per-request in _post, so the static-header cleartext check
             # above can't see it. Re-run the check treating the connection as credential-bearing, so a
@@ -1324,7 +1395,10 @@ class RestDestination(DestinationConnector):
                 )
             if self._opener is _NO_REDIRECT_OPENER:
                 # Rebuild a per-connection verifying opener so add_handler never touches the shared one.
-                self._opener = urllib.request.build_opener(_NoRedirectHandler)
+                # Through _no_redirect_opener, not a bare build_opener: the bare form lets urllib
+                # fill in an HTTPSHandler whose context the engine never names, so the forward-secrecy
+                # assertion cannot reach this hop (ASVS 12.1.2).
+                self._opener = _no_redirect_opener()
             self._opener.add_handler(digest)
         if self._ech_sidecar is not None:
             # ECH mode (ADR 0139): the engine->sidecar hop is cleartext http over loopback (the sidecar
@@ -1335,20 +1409,10 @@ class RestDestination(DestinationConnector):
     def _ech_request(
         self, data: bytes | None, headers: dict[str, str], method: str
     ) -> urllib.request.Request:
-        """Re-address the request to the loopback ECH sidecar (ADR 0139): the request goes to the sidecar
-        over cleartext http with the real destination in the ``Host`` header; the sidecar re-originates
-        the ``https`` + ECH connection to that host (verifying its cert), so the SNI never leaves this
-        host in cleartext. Destination TLS is delegated to the sidecar; the engine->sidecar hop is
-        same-host loopback (ADR 0092 posture)."""
+        """Re-address the delivery request to this connection's loopback ECH sidecar (ADR 0139)."""
         assert self._ech_sidecar is not None  # only called on the ECH path (guarded by the caller)
-        parsed = urllib.parse.urlsplit(self.url)
-        path = parsed.path or "/"
-        if parsed.query:
-            path += "?" + parsed.query
-        h = dict(headers)
-        h["Host"] = parsed.netloc  # tell the sidecar the real upstream (host[:port])
-        return urllib.request.Request(  # noqa: S310  # nosec B310 — http to a validated loopback sidecar
-            self._ech_sidecar + path, data=data, headers=h, method=method
+        return ech_readdressed_request(
+            self._ech_sidecar, self.url, data=data, headers=headers, method=method
         )
 
     @staticmethod

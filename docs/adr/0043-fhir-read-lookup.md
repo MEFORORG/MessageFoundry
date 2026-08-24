@@ -100,7 +100,9 @@ Mirror ADR 0010's split **exactly**: a declared, pooled, env()-resolvable **conn
   (the `_active` `ContextVar` runner holder, `set_active`/`reset`/`activated`, `FhirLookupError(RuntimeError)`,
   and the `LookupRunner` type). `query` is **one of two read shapes**, both read-only:
   - a **read-by-id**: `fhir_lookup("epic", "Patient/123")` (or a structured `("Patient", "123")`) → `GET {base}/Patient/123`;
-  - a **search**: `fhir_lookup("epic", "Patient?identifier=MRN|123")` → `GET {base}/Patient?identifier=MRN|123`.
+  - a **search**: ~~`fhir_lookup("epic", "Patient?identifier=MRN|123")` → `GET {base}/Patient?identifier=MRN|123`.~~
+    **SUPERSEDED by the 2026-08-13 amendment below (BACKLOG #1243).** The flat `?`-query is refused; a search is
+    the path in `query` plus the fields in `params` — `fhir_lookup("epic", "Patient", {"identifier": "MRN|123"})`.
   It returns the parsed result as a **plain dict** (a single resource) or a **`Bundle` searchset dict** (a search),
   read on demand by the Handler via the pure `parsing/fhir/` codec (`FhirPeek`/`FhirResource`) — never a typed object
   pushed through the pipeline. `config/` stays import-clean: it owns **only** the accessor + the active-runner holder;

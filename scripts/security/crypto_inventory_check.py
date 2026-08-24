@@ -61,9 +61,22 @@ from pathlib import Path
 # The five first-party roots the gate walks — byte-identical (as basenames) to
 # ``tests/test_security_static.py``'s ``_CRYPTO_ROOTS`` (#283 owns that pin; this gate consumes it).
 # ``ide/`` is deliberately absent: it is the TypeScript VS Code extension and contains ZERO ``.py``
-# files, so there is no crypto call site for the AST scanner to find there — the exclusion is a fact
-# about the tree, not a filter (``_assert_ide_is_typescript`` below turns that fact into an enforced
-# invariant, so a future ``.py`` under ``ide/`` reds the gate instead of silently escaping the walk).
+# files, so THIS scanner — which rglobs ``*.py`` and walks the Python AST — has nothing to read there.
+# ``_assert_ide_is_typescript`` below turns that into an enforced invariant, so a future ``.py`` under
+# ``ide/`` reds the gate instead of silently escaping the walk.
+#
+# WHAT THAT EXCLUSION DOES **NOT** MEAN, and this comment used to say otherwise (BACKLOG #1164): it is
+# NOT a finding that ``ide/`` is crypto-free. Zero ``.py`` files is a fact about the LANGUAGE, and the
+# question this gate exists to answer is whether a tree contains cryptography. ``ide/`` does:
+# ``ide/src/cspNonce.ts`` imports ``randomBytes`` from ``node:crypto`` and draws CSPRNG bytes consumed
+# across the extension, and ``ide/src/engineClient.ts`` pins a TLS floor it applies to every https
+# request. Both are first-party crypto in a shipped artifact and NEITHER is discoverable from here.
+#
+# ADDING ``ide/`` TO WALK_ROOTS WOULD BE A NO-OP THAT LOOKS LIKE A FIX: the Python AST scanner would
+# find zero ``.py`` there, report clean, and the TypeScript sites would stay invisible while the tree
+# gained a green whose greenness is evidence of nothing. Covering them needs a TypeScript arm on a
+# merge-gating context, which is unbuilt. Until it exists this gate's green means "no undocumented
+# crypto in the PYTHON of five roots", and that is the only claim it supports.
 # ``samples/`` is absent by design too, on the SAME rationale as the ``ide/`` exclusion (ASVS 11.1.3):
 # it is author-space EXAMPLE config, not shipped engine code, so its crypto (e.g. a content-fingerprint
 # ``hashlib.sha256`` in a sample Handler) is out of the deployed-system inventory scope — the gate
@@ -91,6 +104,14 @@ CRYPTO_SEAM_MODULES = frozenset(
         "messagefoundry.store.keyprovider_vault",
         "messagefoundry.store.crypto_transit",
         "messagefoundry.store.backup_codec",
+        # BACKLOG #1323. The TLS-policy seam: importing it means this file resolves a TLS posture
+        # (minimum version, cipher/curve policy, verification mode, trust anchor) through the shared
+        # helper rather than hand-rolling an SSLContext. Before this entry the seam set was
+        # messagefoundry.store.* ONLY, so it was STORE-ONLY BY CONSTRUCTION -- a first-party TLS seam
+        # in any other package could not be matched by any entry, and the gate reported the same green
+        # whether that surface was sound or not. pipeline/alert_sinks.py was the worked example: it
+        # imports smtplib and this module, and no entry could see it.
+        "messagefoundry.config.tls_policy",
     }
 )
 
@@ -104,14 +125,14 @@ INVENTORY: dict[str, frozenset[str]] = {
     # ADR 0030: keyed BLAKE2b derives the deterministic, salt-keyed seed that picks a surrogate, so
     # the anonymizer's pseudonymization is consistent-within-a-dataset yet one-way (re-id-resistant).
     "messagefoundry/anon/keying.py": frozenset({"hashlib"}),
-    "messagefoundry/api/tls.py": frozenset({"ssl"}),
+    "messagefoundry/api/tls.py": frozenset({"messagefoundry.config.tls_policy", "ssl"}),
     # ASVS 12.1.1: the startup TLS-floor probe. Client contexts ONLY, and deliberately weakened ones —
     # a withdrawn-version offer (minimum==maximum==TLSv1/1.1) at ALL:@SECLEVEL=0 with CERT_NONE, so the
     # ClientHello is actually sent and an untrusted internal CA cannot abort before the version is
     # settled. It measures the operator's proxy and carries NO application data; the contexts are built,
     # used for one handshake, and never returned. Not a data path — do not reuse these settings.
     "messagefoundry/config/tls_probe.py": frozenset({"ssl"}),
-    "messagefoundry/auth/ldap.py": frozenset({"ssl"}),
+    "messagefoundry/auth/ldap.py": frozenset({"messagefoundry.config.tls_policy", "ssl"}),
     # ADR 0142 (OIDC relying party, BACKLOG #274): the federated-SSO layer.
     #   claims.py — hmac.compare_digest for the constant-time nonce comparison; cryptography only for
     #     catching InvalidSignature (the verification itself is transports/signing.py, inventoried).
@@ -127,10 +148,10 @@ INVENTORY: dict[str, frozenset[str]] = {
     "messagefoundry/auth/oidc/claims.py": frozenset({"cryptography", "hmac"}),
     "messagefoundry/auth/oidc/flow.py": frozenset({"hashlib", "hmac", "secrets"}),
     "messagefoundry/auth/oidc/jwks.py": frozenset({"cryptography"}),
-    "messagefoundry/auth/oidc_http.py": frozenset({"ssl"}),
+    "messagefoundry/auth/oidc_http.py": frozenset({"messagefoundry.config.tls_policy", "ssl"}),
     "messagefoundry/auth/passwords.py": frozenset({"argon2"}),
     "messagefoundry/auth/policy.py": frozenset({"hashlib"}),
-    "messagefoundry/auth/service.py": frozenset({"secrets"}),
+    "messagefoundry/auth/service.py": frozenset({"messagefoundry.config.tls_policy", "secrets"}),
     "messagefoundry/auth/tokens.py": frozenset({"hashlib", "secrets"}),
     "messagefoundry/auth/totp.py": frozenset({"hashlib", "hmac", "secrets"}),
     # WP #285 (ASVS 6.7.1): SHA-256 fingerprint of an operator-supplied auth-path trust anchor
@@ -169,7 +190,7 @@ INVENTORY: dict[str, frozenset[str]] = {
     # ssl.SSLContext (forward_protocol="tls") — verified against forward_tls_ca_file per forward_tls_verify,
     # with opt-in client-cert mTLS. Transport-layer confidentiality for the off-box audit/log stream; the
     # default udp/tcp forwarders and the no-collector path use no crypto.
-    "messagefoundry/logging_setup.py": frozenset({"ssl"}),
+    "messagefoundry/logging_setup.py": frozenset({"messagefoundry.config.tls_policy", "ssl"}),
     # BACKLOG #31: XML-DSig signature verification for the XML codec runs via signxml (which pulls in
     # cryptography + hashlib for the DSig digest/signature primitives). The hashlib import in
     # signature.py is the crypto-inventory anchor making that otherwise-transitive provenance visible.
@@ -237,10 +258,16 @@ INVENTORY: dict[str, frozenset[str]] = {
     # here and no digest is COMPUTED here — the digest primitive stays the shared audit_row_hash in
     # store/store.py, so all three backends produce byte-identical chains.
     "messagefoundry/store/postgres.py": frozenset(
-        {"hashlib", "hmac", "ssl", "messagefoundry.store.crypto"}
+        {
+            "messagefoundry.config.tls_policy",
+            "hashlib",
+            "hmac",
+            "ssl",
+            "messagefoundry.store.crypto",
+        }
     ),
     "messagefoundry/store/sqlserver.py": frozenset(
-        {"hashlib", "hmac", "messagefoundry.store.crypto"}
+        {"messagefoundry.config.tls_policy", "hashlib", "hmac", "messagefoundry.store.crypto"}
     ),
     # #190: hmac = the keyed HMAC-SHA256 audit-chain digest (audit_row_hash) — tamper-evidence that a
     # row-writer without the store DEK cannot forge; hashlib = the keyless SHA-256 chain + delivery/body
@@ -249,7 +276,7 @@ INVENTORY: dict[str, frozenset[str]] = {
     "messagefoundry/store/store.py": frozenset({"hashlib", "hmac", "messagefoundry.store.crypto"}),
     # ADR 0025: the DICOM C-STORE SCP's server SSLContext (Phase 1) + the C-STORE SCU's client SSLContext
     # (Phase 2) for DICOM-over-TLS (the MLLP inbound/outbound posture).
-    "messagefoundry/transports/dicom.py": frozenset({"ssl"}),
+    "messagefoundry/transports/dicom.py": frozenset({"messagefoundry.config.tls_policy", "ssl"}),
     # ADR 0025 Phase 2: a per-request random multipart boundary (secrets.token_hex) for the DICOMweb
     # STOW-RS body, generated absent from the object bytes (RFC 2046 §5.1.1) — framing, not a secret.
     "messagefoundry/transports/dicomweb.py": frozenset({"secrets"}),
@@ -259,11 +286,13 @@ INVENTORY: dict[str, frozenset[str]] = {
     # layer above. The context is built by tls_policy.build_smtp_tls_context and handed to smtplib,
     # which otherwise defaults to ssl._create_stdlib_context -- which IS _create_unverified_context
     # (CERT_NONE / check_hostname=False). CERT_NONE only under the CLAMPED tls_verify=false escape.
-    "messagefoundry/transports/direct.py": frozenset({"cryptography", "ssl"}),
+    "messagefoundry/transports/direct.py": frozenset(
+        {"messagefoundry.config.tls_policy", "cryptography", "ssl"}
+    ),
     # #323: EMAIL outbound STARTTLS (587) / implicit TLS (465). Same factory, same reason as above --
     # an explicit verifying context anchored to the OS roots, a per-connection tls_ca_file, or
     # [tls].internal_ca_file (ADR 0093), because smtplib's own default verifies nothing.
-    "messagefoundry/transports/email.py": frozenset({"ssl"}),
+    "messagefoundry/transports/email.py": frozenset({"messagefoundry.config.tls_policy", "ssl"}),
     # ADR 0129 (#142): hashlib = sha256 of a source file's identity (name+mtime+size) as a HASHED dedup
     # key for the leave-in-place processed_files ledger — a DERIVED id, never a cleartext filename (which
     # can embed an MRN), never logged. Not a secret/keyed primitive.
@@ -271,19 +300,25 @@ INVENTORY: dict[str, frozenset[str]] = {
     # ADR 0023: the inbound HTTP/1.1 listen source reuses MLLP's _mllp_ssl_context (server=True) to
     # build its per-connection HTTPS server identity (+ opt-in mTLS) — the same MLLP inbound-TLS posture.
     "messagefoundry/transports/http_listener.py": frozenset({"ssl"}),
-    "messagefoundry/transports/mllp.py": frozenset({"ssl"}),
+    "messagefoundry/transports/mllp.py": frozenset({"messagefoundry.config.tls_policy", "ssl"}),
     # SEC-001 (CWE-295): FTPS (ftplib.FTP_TLS) builds a verifying ssl.create_default_context() for the
     # remote-file connector's TLS control/data channel; CERT_NONE only under the insecure_tls_allowed()
     # escape, mirroring mllp.py's outbound posture. ADR 0129 (#142): hashlib = sha256 of a remote file's
     # name+size as a HASHED dedup key for the leave-in-place processed_files ledger (a derived id, never
     # a cleartext filename).
-    "messagefoundry/transports/remotefile.py": frozenset({"ssl", "hashlib"}),
-    "messagefoundry/transports/rest.py": frozenset({"ssl"}),
+    "messagefoundry/transports/remotefile.py": frozenset(
+        {"messagefoundry.config.tls_policy", "ssl", "hashlib"}
+    ),
+    "messagefoundry/transports/rest.py": frozenset({"messagefoundry.config.tls_policy", "ssl"}),
     "messagefoundry/transports/signing.py": frozenset({"cryptography"}),
     # ADR 0024: a random `jti` for the SMART Backend Services client_assertion JWT (the JWT signing
     # itself reuses signing.py's `cryptography`).
-    "messagefoundry/transports/smart.py": frozenset({"secrets"}),
-    "messagefoundry/transports/soap.py": frozenset({"hashlib", "ssl"}),
+    "messagefoundry/transports/smart.py": frozenset(
+        {"messagefoundry.config.tls_policy", "secrets"}
+    ),
+    "messagefoundry/transports/soap.py": frozenset(
+        {"messagefoundry.config.tls_policy", "hashlib", "ssl"}
+    ),
     # ADR 0113 (2026-07-22 amendment): the tray's TOKENLESS /health + /ui probes must verify the
     # engine's server cert when [api].tls_cert_file makes the loopback bind serve https. Builds the
     # same OS-trust-store context the engine client uses (truststore.SSLContext, lazily imported) —
@@ -301,7 +336,11 @@ INVENTORY: dict[str, frozenset[str]] = {
     # gates a keyless PHI start, and surfaces KeyProviderError — all delegated through the store seams,
     # with zero direct stdlib-crypto import in the module.
     "messagefoundry/__main__.py": frozenset(
-        {"messagefoundry.store.crypto", "messagefoundry.store.keyprovider"}
+        {
+            "messagefoundry.config.tls_policy",
+            "messagefoundry.store.crypto",
+            "messagefoundry.store.keyprovider",
+        }
     ),
     # ADR 0019 §5: the `vault` connector-secret provider does a Vault KV v2 read of a connector
     # credential (AD bind / SMTP password) over hvac, fail-closed, value never logged — the delegated
@@ -316,6 +355,7 @@ INVENTORY: dict[str, frozenset[str]] = {
     # and the key provider (store.keyprovider); every primitive is delegated through the seams.
     "messagefoundry/store/base.py": frozenset(
         {
+            "messagefoundry.config.tls_policy",
             "messagefoundry.store.crypto",
             "messagefoundry.store.crypto_transit",
             "messagefoundry.store.keyprovider",
@@ -383,6 +423,28 @@ INVENTORY: dict[str, frozenset[str]] = {
     # SHA-256 rather than BLAKE2 or a non-approved digest only because the engine renders a fips_mode
     # attestation, and a non-approved hash in the shipped surface invites a FIPS question for no gain.
     "scripts/webconsole_seam_snapshot.py": frozenset({"hashlib"}),
+    # BACKLOG #1323 -- ELEVEN SITES THE GATE COULD NOT SEE AT ALL until the TLS-policy seam was
+    # added above. Each imports messagefoundry.config.tls_policy and NONE of the six stdlib crypto
+    # modules, so before the seam widened there was no token that could match them and no row was
+    # owed. THE SHARED REASON, stated once because it IS shared: each resolves a TLS posture through
+    # the common helper instead of building an SSLContext by hand -- which is the point of the seam,
+    # and centralising it is why these files import no `ssl`. Where a file's usage is not merely that,
+    # it carries its own line below.
+    "messagefoundry/api/app.py": frozenset({"messagefoundry.config.tls_policy"}),
+    "messagefoundry/api/security.py": frozenset({"messagefoundry.config.tls_policy"}),
+    # reach the seam to parse and bound it rather than to open a connection.
+    "messagefoundry/config/models.py": frozenset({"messagefoundry.config.tls_policy"}),
+    # settings/models are where the operator's TLS posture is DECLARED and validated, so they
+    "messagefoundry/config/settings.py": frozenset({"messagefoundry.config.tls_policy"}),
+    # alert_sinks also imports smtplib: the alert SMTP hop's STARTTLS posture. This is the file
+    # BACKLOG #1323 named as the worked example of a seam the store-only set could not match.
+    "messagefoundry/pipeline/alert_sinks.py": frozenset({"messagefoundry.config.tls_policy"}),
+    "messagefoundry/pipeline/engine.py": frozenset({"messagefoundry.config.tls_policy"}),
+    "messagefoundry/pipeline/security_notify.py": frozenset({"messagefoundry.config.tls_policy"}),
+    "messagefoundry/pipeline/wiring_runner.py": frozenset({"messagefoundry.config.tls_policy"}),
+    "messagefoundry/transports/ai_broker.py": frozenset({"messagefoundry.config.tls_policy"}),
+    "messagefoundry/transports/database.py": frozenset({"messagefoundry.config.tls_policy"}),
+    "messagefoundry/transports/http_auth.py": frozenset({"messagefoundry.config.tls_policy"}),
 }
 
 

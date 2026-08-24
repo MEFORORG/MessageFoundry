@@ -5,8 +5,9 @@
 BACKLOG #1027 added ``packaging/messagefoundry-webconsole/tests`` to the root ``testpaths`` so a
 bare local ``pytest`` stops silently excluding roughly 350 tests. That fix has a CI-side
 consequence the original change did not carry: ``ci.yml`` runs a bare ``pytest`` for the engine
-step AND a second explicit step for the console package, so once ``testpaths`` includes the
-console the SAME tests run TWICE on every leg.
+step AND a second explicit invocation for the console package -- now in its own ``webconsole`` job
+rather than a second step on the same leg -- so once ``testpaths`` includes the console the SAME
+tests run TWICE per leg unless the engine step subtracts them.
 
 Measured 2026-08-08: bare collection 11,956; console-only 356; with the subtraction 11,600.
 

@@ -62,7 +62,11 @@ from messagefoundry.config.settings import (
     INSECURE_TLS_ESCAPE_ENV,
     weakened_tls_escape_permitted_here,
 )
-from messagefoundry.config.tls_policy import build_smtp_tls_context
+from messagefoundry.config.tls_policy import (
+    InsecureHopRefused,
+    build_smtp_tls_context,
+    smtp_login_approved,
+)
 from messagefoundry.transports.base import (
     DeliveryError,
     DeliveryResponse,
@@ -226,6 +230,21 @@ class DirectDestination(DestinationConnector):
                 raise ValueError(
                     "Direct destination sends SMTP AUTH credentials over an UNVERIFIED TLS session "
                     "(tls_verify=false); refused — credentials require a verified TLS session"
+                )
+        else:
+            # BACKLOG #1314: the THIRD weakening axis. The chain IS verified here, but with
+            # `tls_check_hostname=false` the peer NAME is not, so any certificate chaining to the
+            # configured anchor is accepted whatever it was issued to -- the AUTH exchange then
+            # hands the credential to a peer whose identity was never established.
+            #
+            # ABSOLUTE, like the two arms above, and deliberately keyed on no escape: in both of
+            # them the escape governs the BODY posture and never the CREDENTIAL. A third arm keeps
+            # that split, so a hop cannot attest its way to a credentialed unverified-name session.
+            if not self.tls_check_hostname and self.username is not None:
+                raise ValueError(
+                    "Direct destination sends SMTP AUTH credentials over a TLS session whose peer "
+                    "NAME is unverified (tls_check_hostname=false); refused — credentials "
+                    "require a session bound to the host, not merely to the trust anchor"
                 )
         # Built once at construction (fail-fast), reused by every send. None when TLS is off entirely.
         # DIRECT does not take a RevocationHopGuard even though the hop now verifies: adding it would
@@ -400,8 +419,31 @@ class DirectDestination(DestinationConnector):
         try:
             with self._connect() as smtp:
                 if self.username is not None:
-                    smtp.login(self.username, self.password or "")
+                    # NOT smtp.login(): it tries CRAM-MD5 FIRST, an HMAC over MD5 (BACKLOG
+                    # #1171, ASVS 11.4.1). escape_permitted=False because this cell's
+                    # cleartext-credential refusal at construction is absolute -- a send-time
+                    # backstop that is weaker than the gate it backs up is a hole.
+                    smtp_login_approved(
+                        smtp,
+                        self.username,
+                        self.password or "",
+                        channel_encrypted=self.use_tls,
+                        escape_permitted=False,
+                        cell="DIRECT outbound",
+                    )
                 smtp.send_message(msg)
+        except InsecureHopRefused as exc:
+            # A POLICY refusal is not an internal code error. Unconverted it is a ValueError,
+            # which escapes the arms below and lands in the delivery worker's catch-all --
+            # labelled "internal error (our bug, not the partner)" and dead-lettered. That
+            # sends an operator to read our source over a partner that offers no approved AUTH
+            # mechanism, or a connection configured without TLS. Same misdirection as mapping a
+            # rejected credential to a refusal, one layer down (BACKLOG #1171).
+            #
+            # The refusal text is config and capability only -- host, cell, mechanism names --
+            # so it is carried whole rather than reduced to a type name: it is the one thing an
+            # operator needs and it contains no message content.
+            raise DeliveryError(f"Direct {self.host}:{self.port} refused: {exc}") from exc
         except smtplib.SMTPException as exc:
             raise DeliveryError(
                 f"Direct {self.host}:{self.port} SMTP send failed: {type(exc).__name__}"
@@ -422,8 +464,29 @@ class DirectDestination(DestinationConnector):
             with self._connect() as smtp:
                 smtp.ehlo_or_helo_if_needed()
                 if self.username is not None:
-                    smtp.login(self.username, self.password or "")
+                    # Same restriction as _send: a probe that authenticated via CRAM-MD5
+                    # would report a hop healthy that the real send path refuses.
+                    smtp_login_approved(
+                        smtp,
+                        self.username,
+                        self.password or "",
+                        channel_encrypted=self.use_tls,
+                        escape_permitted=False,
+                        cell="DIRECT outbound probe",
+                    )
                 smtp.noop()
+        except InsecureHopRefused as exc:
+            # A POLICY refusal is not an internal code error. Unconverted it is a ValueError,
+            # which escapes the arms below and lands in the delivery worker's catch-all --
+            # labelled "internal error (our bug, not the partner)" and dead-lettered. That
+            # sends an operator to read our source over a partner that offers no approved AUTH
+            # mechanism, or a connection configured without TLS. Same misdirection as mapping a
+            # rejected credential to a refusal, one layer down (BACKLOG #1171).
+            #
+            # The refusal text is config and capability only -- host, cell, mechanism names --
+            # so it is carried whole rather than reduced to a type name: it is the one thing an
+            # operator needs and it contains no message content.
+            raise DeliveryError(f"Direct {self.host}:{self.port} refused: {exc}") from exc
         except smtplib.SMTPException as exc:
             raise DeliveryError(
                 f"Direct {self.host}:{self.port} probe failed: {type(exc).__name__}"

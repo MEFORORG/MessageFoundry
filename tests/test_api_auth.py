@@ -971,6 +971,15 @@ async def test_list_and_revoke_own_session(engine: Engine) -> None:
         sessions = (await c.get("/me/sessions", headers=h2)).json()["sessions"]
         assert len(sessions) == 2 and sum(s["current"] for s in sessions) == 1  # one marked current
         other = next(s for s in sessions if not s["current"])  # the t1 session
+        # BACKLOG #1149 (ASVS 7.5.2). This assertion is INVERTED from its original form, and the
+        # inversion is the point: it used to log in and terminate with NO intervening authentication,
+        # which is precisely the state 7.5.2 forbids ("having authenticated AGAIN"). A login-seeded
+        # window is not an authentication event subsequent to the login.
+        fresh = await c.delete(f"/me/sessions/{other['id']}", headers=h2)
+        assert fresh.status_code == 403
+        assert fresh.headers.get("X-Step-Up-Action") == "session_terminate"
+        assert (await c.get("/auth/me", headers=_auth(t1))).status_code == 200  # nothing revoked
+        assert (await _reauth(c, t2, purpose="session_terminate")).status_code == 200
         assert (await c.delete(f"/me/sessions/{other['id']}", headers=h2)).status_code == 200
         assert (await c.get("/auth/me", headers=_auth(t1))).status_code == 401  # revoked
         assert (await c.get("/auth/me", headers=h2)).status_code == 200  # current still valid
@@ -983,6 +992,14 @@ async def test_revoke_other_sessions_keeps_current(engine: Engine) -> None:
     async with _client(engine, service) as c:
         t1 = (await _login(c, "u")).json()["token"]
         t2 = (await _login(c, "u")).json()["token"]
+        # BACKLOG #1149 (ASVS 7.5.2). Also inverted, and this is the route the cell turns on: a
+        # freshly-logged-in caller could sign every other session of the account out with no proof
+        # beyond the sign-in they already held.
+        fresh = await c.delete("/me/sessions", headers=_auth(t2))
+        assert fresh.status_code == 403
+        assert fresh.headers.get("X-Step-Up-Action") == "session_terminate"
+        assert (await c.get("/auth/me", headers=_auth(t1))).status_code == 200  # untouched
+        assert (await _reauth(c, t2, purpose="session_terminate")).status_code == 200
         resp = await c.delete("/me/sessions", headers=_auth(t2))  # sign out everywhere else
         assert resp.status_code == 200 and "1" in resp.json()["detail"]
         assert (await c.get("/auth/me", headers=_auth(t1))).status_code == 401
@@ -997,6 +1014,12 @@ async def test_cannot_revoke_another_users_session(engine: Engine) -> None:
         ta = (await _login(c, "a")).json()["token"]
         tb = (await _login(c, "b")).json()["token"]
         b_sid = (await c.get("/me/sessions", headers=_auth(tb))).json()["sessions"][0]["id"]
+        # BACKLOG #1149: the action-bound gate now runs BEFORE the body, so a caller with no grant is
+        # 403 whether the id is theirs or not — which is the property that keeps ownership from
+        # leaking. Clear the gate first, so the 404 below still measures OWNERSHIP rather than the
+        # step-up. Without this reauth the test would pass on the gate and prove nothing about it.
+        assert (await c.delete(f"/me/sessions/{b_sid}", headers=_auth(ta))).status_code == 403
+        assert (await _reauth(c, ta, purpose="session_terminate")).status_code == 200
         # a tries to revoke b's session → 404 (ownership-checked, doesn't confirm/touch it)
         assert (await c.delete(f"/me/sessions/{b_sid}", headers=_auth(ta))).status_code == 404
         assert (await c.get("/auth/me", headers=_auth(tb))).status_code == 200  # b still signed in
@@ -1022,7 +1045,7 @@ async def test_revoke_session_requires_reauth_when_stale(engine: Engine) -> None
         assert (
             await c.get("/auth/me", headers=_auth(t1))
         ).status_code == 200  # nothing revoked yet
-        assert (await _reauth(c, t2)).status_code == 200
+        assert (await _reauth(c, t2, purpose="session_terminate")).status_code == 200
         assert (await c.delete(f"/me/sessions/{t1_sid}", headers=_auth(t2))).status_code == 200
         assert (await c.get("/auth/me", headers=_auth(t1))).status_code == 401  # now revoked
 
@@ -1037,7 +1060,7 @@ async def test_revoke_other_sessions_requires_reauth_when_stale(engine: Engine) 
         stale = await c.delete("/me/sessions", headers=_auth(t2))
         assert stale.status_code == 403 and stale.headers.get("X-Step-Up-Required") == "1"
         assert (await c.get("/auth/me", headers=_auth(t1))).status_code == 200  # t1 untouched
-        assert (await _reauth(c, t2)).status_code == 200
+        assert (await _reauth(c, t2, purpose="session_terminate")).status_code == 200
         assert (await c.delete("/me/sessions", headers=_auth(t2))).status_code == 200
         assert (await c.get("/auth/me", headers=_auth(t1))).status_code == 401  # t1 signed out
         assert (await c.get("/auth/me", headers=_auth(t2))).status_code == 200  # current kept
@@ -1055,7 +1078,7 @@ async def test_revoke_no_mfa_user_gate_is_password_only(engine: Engine) -> None:
         assert stale.status_code == 403
         assert stale.headers.get("X-Step-Up-Required") == "1"
         assert stale.headers.get("X-MFA-Required") is None  # NOT the MFA gate
-        assert (await _reauth(c, t)).status_code == 200
+        assert (await _reauth(c, t, purpose="session_terminate")).status_code == 200
         assert (await c.delete("/me/sessions", headers=_auth(t))).status_code == 200
 
 
@@ -1073,7 +1096,7 @@ async def test_revoke_ownership_404_survives_reauth(engine: Engine) -> None:
         assert (
             await c.delete(f"/me/sessions/{b_sid}", headers=_auth(ta))
         ).status_code == 403  # stale
-        assert (await _reauth(c, ta)).status_code == 200
+        assert (await _reauth(c, ta, purpose="session_terminate")).status_code == 200
         assert (
             await c.delete(f"/me/sessions/{b_sid}", headers=_auth(ta))
         ).status_code == 404  # own
@@ -1106,7 +1129,7 @@ async def test_session_cap_evicts_oldest_on_login(engine: Engine) -> None:
         assert len((await c.get("/me/sessions", headers=_auth(t3))).json()["sessions"]) == 2
 
 
-async def test_ad_login_maps_groups_and_grants_permission(engine: Engine) -> None:
+async def test_ad_session_maps_groups_and_grants_permission(engine: Engine) -> None:
     principal = AdPrincipal(
         username="jdoe",
         display_name="J Doe",
@@ -1133,13 +1156,20 @@ async def test_ad_login_maps_groups_and_grants_permission(engine: Engine) -> Non
     await service.initialize()
     await service.set_ad_group_map([("CN=MF-Ops,DC=x", "operator")], actor="admin")
     async with _client(engine, service) as c:
-        r = await _login(c, "jdoe", "pw", provider="ad")
-        assert r.status_code == 200 and r.json()["user"]["roles"] == ["operator"]
-        assert r.json()["user"]["auth_provider"] == "ad"
-        h = _auth(r.json()["token"])
+        # AD PASSWORD LOGIN is retired (BACKLOG #1137), so the session is minted through the tail
+        # Kerberos and OIDC both end at. The subject is unchanged: an AD-provider session carries the
+        # group-mapped role, and that role's permission is honoured at a real API route.
+        out = await service._complete_ad_login(principal, None, mfa_verified=True)
+        assert out.ok and out.token is not None
+        h = _auth(out.token)
+        # Read the role back over HTTP rather than off the outcome object: this is an API test, and
+        # /auth/me is the serialising path a console actually calls.
+        me = (await c.get("/auth/me", headers=h)).json()
+        assert me["roles"] == ["operator"] and me["auth_provider"] == "ad"
         # operator has connections:control — a missing connection yields 404 (not 403)
         assert (await c.post("/connections/none/start", headers=h)).status_code == 404
-        assert (await c.get("/auth/providers", headers=h)).json()["ad"] is True
+        # The API advertises the retired form as GONE, so a client stops rendering it.
+        assert (await c.get("/auth/providers", headers=h)).json()["ad"] is False
 
 
 async def test_disabled_auth_fails_closed_unless_opted_in(engine: Engine) -> None:
@@ -1214,13 +1244,22 @@ async def test_admin_reset_password_endpoint(engine: Engine) -> None:
     )
     await engine.store.create_user(user_id="ad9", username="ad9", auth_provider="ad")
     async with _client(engine, service) as c:
-        admin = _auth((await _login(c, "root")).json()["token"])
+        admin_token = (await _login(c, "root")).json()["token"]
+        admin = _auth(admin_token)
         viewer = _auth((await _login(c, "vw")).json()["token"])
-        # deny-by-default: a viewer lacks users:manage
+        # deny-by-default: a viewer lacks users:manage. Unchanged by #1148 -- the permission check is
+        # the BASE of the action gate, so it still refuses before any grant is consulted.
         assert (
             await c.post(f"/users/{carol_id}/reset-password", headers=viewer)
         ).status_code == 403
-        # admin reset → a one-time temp returned once
+        # BACKLOG #1148 (ASVS 7.5.1). INVERTED: this used to reset on a fresh login with no further
+        # proof, because the gate's only recency test was the login-seeded window. That passing was
+        # the defect. The grant is SINGLE-USE, so every gated call below mints its own.
+        fresh = await c.post(f"/users/{carol_id}/reset-password", headers=admin)
+        assert fresh.status_code == 403
+        assert fresh.headers.get("X-Step-Up-Action") == "admin_reset_password"
+        # admin reset → a one-time temp returned once, after an action-bound re-proof
+        assert (await _reauth(c, admin_token, purpose="admin_reset_password")).status_code == 200
         reset = await c.post(f"/users/{carol_id}/reset-password", headers=admin)
         assert reset.status_code == 200
         temp = reset.json()["temp_password"]
@@ -1234,10 +1273,15 @@ async def test_admin_reset_password_endpoint(engine: Engine) -> None:
             json={"current_password": temp, "new_password": "rotated-strong-passphrase-7"},
         )
         assert rotated.status_code == 200
-        # unknown → 404; AD user → 400; your own account → 400 (use change-password)
+        # unknown → 404; AD user → 400; your own account → 400 (use change-password). Each needs its
+        # own grant: the gate runs BEFORE the body, so without one these would all be 403 and the
+        # test would stop measuring what it is named for.
+        assert (await _reauth(c, admin_token, purpose="admin_reset_password")).status_code == 200
         assert (await c.post("/users/nope/reset-password", headers=admin)).status_code == 404
+        assert (await _reauth(c, admin_token, purpose="admin_reset_password")).status_code == 200
         assert (await c.post("/users/ad9/reset-password", headers=admin)).status_code == 400
         me_id = (await c.get("/auth/me", headers=admin)).json()["user_id"]
+        assert (await _reauth(c, admin_token, purpose="admin_reset_password")).status_code == 200
         assert (await c.post(f"/users/{me_id}/reset-password", headers=admin)).status_code == 400
 
 
@@ -1436,3 +1480,91 @@ async def test_engine_internal_write_does_not_inherit_a_request_address(engine: 
     await engine.store.record_audit("retention.purge", actor="system")
     row = dict((await engine.store.list_audit(limit=1))[0])
     assert row["action"] == "retention.purge" and row["client"] is None
+
+
+async def test_disabling_the_LAST_second_factor_is_a_400_not_a_500(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #1022: the guard's refusal has to reach the caller as a CLIENT error.
+
+    The refusal itself lives in AuthService and has its own unit tests. What this pins is the ROUTE:
+    an uncaught ValueError out of ``disable_mfa`` surfaces as a 500, which reports a user-correctable
+    condition as a server fault AND swallows the remedy the message carries. The neighbouring
+    ``/me/mfa/confirm`` route already mapped ValueError to 400; this one did not, so adding the guard
+    without touching the route would have turned a refusal into an internal error.
+    """
+    service = await _service(engine, AuthSettings(login_rate_limit_enabled=False))
+    await _add(service, "adm", Role.ADMINISTRATOR)
+    async with _client(engine, service) as c:
+        tok = (await _login(c, "adm")).json()["token"]
+        await _reauth(c, tok, purpose="mfa_enroll")
+        secret = (await c.post("/me/mfa/enroll", headers=_auth(tok))).json()["secret"]
+        t0 = 1_000_000.0
+        pin_totp_clock(monkeypatch, t0)
+        await _reauth(c, tok, purpose="mfa_confirm")
+        confirmed = await c.post(
+            "/me/mfa/confirm", json={"code": totp.totp(secret, now=t0)}, headers=_auth(tok)
+        )
+        assert confirmed.status_code == 200, confirmed.text
+
+        # A LATER step deliberately: the activating code is single-use and cannot be replayed on
+        # /auth/mfa-verify inside its own window (BACKLOG #1021), so reusing it here would 401 and
+        # this test would fail for a reason that has nothing to do with what it is testing.
+        t1 = t0 + totp.DEFAULT_PERIOD
+        pin_totp_clock(monkeypatch, t1)
+        verified = await c.post(
+            "/auth/mfa-verify", json={"code": totp.totp(secret, now=t1)}, headers=_auth(tok)
+        )
+        assert verified.status_code == 200, verified.text
+
+        # TOTP is now the ONLY second factor and require_mfa defaults on, so the disable must refuse.
+        await _reauth(c, tok, purpose="mfa_disable")
+        r = await c.delete("/me/mfa", headers=_auth(tok))
+        assert r.status_code == 400, r.text
+        assert "enroll another factor first" in r.text
+        # AND MFA MUST STILL BE ON. A 400 whose side effect already happened is worse than a 500.
+        assert (await c.get("/me/mfa", headers=_auth(tok))).json()["enabled"] is True
+
+
+# --- BACKLOG #1148 (ASVS 7.5.1): the admin reset-MFA lane, which had NO test at all ---------------
+
+
+async def test_admin_reset_mfa_requires_an_action_bound_proof_and_keeps_the_mfa_gate(
+    engine: Engine,
+) -> None:
+    """The sharper of the two admin reset lanes, and it shipped untested.
+
+    `admin_reset_mfa` disables TOTP and deletes every passkey, and `disable_totp` NULLs the recovery
+    codes alongside the secret -- ONE call clears the second factor, every recovery code and every
+    passkey on someone else's account. Before #1148 it rode the login-seeded window, so an admin who
+    signed in under `step_up_max_age_seconds` ago could do that with zero fresh proof.
+
+    THE SECOND ASSERTION IS THE ONE THAT MATTERS AND IT IS EASY TO LOSE. The research for this item
+    said to use the `mfa_gate=False` factory, which would have DROPPED the MFA gate from this route
+    -- a weakening that reads as hardening, since the action binding is the visible half. The
+    deadlock that justifies `mfa_gate=False` is an ENROLMENT one and does not transfer here: the
+    operator's own enrolment status has nothing to do with the target's. So this pins BOTH: the proof
+    is action-bound, AND the second factor is still demanded.
+    """
+    service = await _service(engine, AuthSettings(require_mfa=True, login_rate_limit_enabled=False))
+    await _add(service, "root", Role.ADMINISTRATOR)
+    target = await service.create_local_user(
+        username="mallory",
+        password=PW,
+        display_name=None,
+        email=None,
+        roles=["viewer"],
+        actor="root",
+    )
+    async with _client(engine, service) as c:
+        tok = (await _login(c, "root")).json()["token"]
+        h = _auth(tok)
+        # require_mfa is on and root has not verified a factor, so the MFA gate refuses FIRST --
+        # X-MFA-Required, not X-Step-Up-Action. If this ever flips to the step-up header, the gate
+        # has been dropped and the route is weaker than it shipped.
+        blocked = await c.post(f"/users/{target}/reset-mfa", headers=h)
+        assert blocked.status_code == 403
+        assert blocked.headers.get("X-MFA-Required") == "1", (
+            "the MFA gate is gone from admin reset-MFA -- require_step_up_action was replaced with a "
+            "reauth-only factory, which is the weakening #1148's research recommended"
+        )

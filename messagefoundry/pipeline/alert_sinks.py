@@ -45,7 +45,13 @@ from messagefoundry.config.settings import (
     EscalationTier,
     weakened_tls_escape_permitted,
 )
-from messagefoundry.config.tls_policy import HopPosture, TrustAnchorPolicy, build_smtp_tls_context
+from messagefoundry.config.tls_policy import (
+    HopPosture,
+    TrustAnchorPolicy,
+    build_asserted_https_handler,
+    build_smtp_tls_context,
+    smtp_login_approved,
+)
 
 __all__ = [
     "AlertTransport",
@@ -269,8 +275,30 @@ class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
         return None
 
 
-# A shared opener that never follows redirects; reused for every webhook POST.
-_NO_REDIRECT_OPENER = urllib.request.build_opener(_NoRedirectHandler)
+def _build_no_redirect_opener() -> urllib.request.OpenerDirector:
+    """Build the shared webhook opener: verifying https, never follows a redirect.
+
+    The ``HTTPSHandler`` is NAMED rather than left for ``build_opener`` to fill in. urllib's default
+    handler builds its own TLS context, which the engine never held a reference to — so this hop's
+    suite list was inherited and unchecked. :func:`~messagefoundry.config.tls_policy.
+    build_asserted_https_handler` returns that same default handler with its context asserted forward-
+    secret (ASVS 12.1.2). It substitutes nothing: see that function for why replacing the context
+    would have changed the handshake. Handler-for-handler identical to the previous
+    ``build_opener(_NoRedirectHandler)``.
+
+    A named function, not an inline module-level expression, so a test can call the exact construction
+    the shared opener is built from instead of reloading this module.
+
+    Built through the ``tls_policy`` factory so this module still never names ``ssl`` itself, matching
+    the plain-data TLS settings :class:`EmailTransport` carries for the same reason."""
+    return urllib.request.build_opener(
+        _NoRedirectHandler,
+        build_asserted_https_handler(connector="alert webhook destination"),
+    )
+
+
+# The shared opener, reused for every webhook POST.
+_NO_REDIRECT_OPENER = _build_no_redirect_opener()
 
 
 class WebhookTransport:
@@ -405,6 +433,27 @@ def send_plain_email(
     allowed = tuple(h.lower() for h in allowed_hosts)
     if allowed and host.lower() not in allowed:
         raise ValueError(f"SMTP host {host!r} is not in the configured allowlist")
+    # SMTP AUTH over an un-encrypted channel puts the password on the wire (BACKLOG #1171, ASVS
+    # 11.4.1). The AUTH call below runs whenever a username is set, while STARTTLS runs only when
+    # `use_tls` — so `[alerts].email_use_tls=false` beside `email_username` sent the credential in
+    # cleartext, with no refusal at the function, at EmailTransport, or at the serve gate.
+    #
+    # ABSOLUTE, matching the sibling arms rather than introducing a second rule: transports/email.py
+    # and transports/direct.py already refuse this exact combination at construction, and their tests
+    # set the escape env var and still assert the raise. So there is no escape here either — a
+    # credential over cleartext is refused on every instance, in every environment.
+    #
+    # IT LIVES HERE RATHER THAN AT THE SERVE GATE, and the docstring above is precisely why that is
+    # consistent: the tls_verify=false decision was pushed to the serve gate because it needs the
+    # CLAMPED posture, which this module cannot read. This refusal needs NO posture, so the chokepoint
+    # every caller passes belongs to it — EmailTransport.send and security_notify both pass the same
+    # `[alerts].email_use_tls` knob, so one refusal here covers both rather than two that can drift.
+    if username is not None and not use_tls:
+        raise ValueError(
+            "alerts SMTP sends AUTH credentials over cleartext (use_tls=false); refused — "
+            "credentials require STARTTLS. Set [alerts].email_use_tls=true, or drop "
+            "[alerts].email_username/email_password to send unauthenticated."
+        )
     # Built AFTER the allowlist check, deliberately: tests/test_alerts_test_email.py runs the REAL
     # function and depends on a disallowed host raising before ANY other work happens.
     tls_context = (
@@ -430,7 +479,19 @@ def send_plain_email(
             # context= is REQUIRED (#323): starttls()'s own default verifies NOTHING.
             smtp.starttls(context=tls_context)
         if username is not None:
-            smtp.login(username, password or "")
+            # NOT smtp.login(): it tries CRAM-MD5 FIRST, an HMAC over MD5 (BACKLOG #1171,
+            # ASVS 11.4.1). The refusal above already guarantees use_tls here, so
+            # channel_encrypted is not merely asserted -- it is the same value that gate read.
+            # escape_permitted=False: this cell's cleartext-credential refusal has no escape,
+            # matching the two connectors rather than introducing a third posture.
+            smtp_login_approved(
+                smtp,
+                username,
+                password or "",
+                channel_encrypted=use_tls,
+                escape_permitted=False,
+                cell="alerts SMTP transport",
+            )
         smtp.send_message(msg)
 
 
@@ -767,6 +828,15 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
                 "not_after": not_after,
                 "days_remaining": days_remaining,
             }
+        )
+
+    def crl_expiry(self, name: str, *, path: str, not_after: str, days_remaining: int) -> None:
+        """BACKLOG #1005. Routed exactly like :meth:`cert_expiry` -- same fan-out, same redaction --
+        because a CRL path is config metadata and carries no PHI. Kept a SEPARATE method because an
+        expired CRL refuses every client rather than degrading one identity, so an operator filtering
+        on it is asking a different question."""
+        self.cert_expiry(
+            f"{name} (CRL)", path=path, not_after=not_after, days_remaining=days_remaining
         )
 
     def secret_rotation_due(

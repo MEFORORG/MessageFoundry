@@ -859,3 +859,224 @@ compatibility story.
   newer IDE meeting an older engine — is a one-shot retry without the flag, asserted in
   `ide/src/test/suite/steps-contract.test.ts` under "contract negotiation", including the negative case
   that a genuine refusal is never retried away as an argument problem.
+
+## Amendment E (2026-08-23) — writable `templated` mode: a bounded interpolation becomes an admitted argument shape (BACKLOG #237)
+
+### E.1 What this widens, and the §2 rule it widens under
+
+§2's rule is: **"widening the roster is an ordinary addition, widening the *grammar* (§4) requires
+amending this ADR."** Making `templated` mode **writable** is a grammar widening, and this amendment
+exists for that reason alone.
+
+The reason is narrow and worth stating exactly, because the read-only half of this item would not have
+needed an amendment at all. §4 admits an action row's arguments as *"literal args or bounded
+`Message`-read expressions"*. `static` writes a literal, already admitted. A path picker writing one
+bounded `msg[...]` read is also already admitted. **`templated` means an interpolation over upstream
+values, which is neither** — so a writable `templated` makes `lens rewrite` emit a shape the grammar
+does not currently accept.
+
+**The sibling item is the proof that the read-only reading was available.** #235 (schema-driven parameter
+forms, closed 2026-08-05) records in its own closing line that it *"widens what is editable without
+widening the recognition grammar"*. Same seam, same surface, no amendment. This one differs only because
+of what E.2 records.
+
+**What this does NOT widen.** No row kind is added, so §3's enum is untouched. No statement becomes
+recognized that was not recognized before, and none stops being recognized. The degradation ladder is
+unchanged: a row that was `code` stays `code`. Amendments A and D each added a row kind *and* a
+recognition rule; this adds neither.
+
+### E.2 The owner ruling this executes, and the reasoning it overrides
+
+**Owner ruling, 2026-08-23: `templated` is writable in v1, and this ADR is to be amended for it.** The
+question was put as a scoping fork — read-only `templated` needs no ADR, writable `templated` needs this
+one — and a third option, writable but deferred past v1, was offered and **declined**. The door is open
+now, deliberately.
+
+**This overrides a stated reason in #237's own build sketch, and the override is deliberately partial.**
+The sketch says *"dynamic mode stays read-only in v1 (shows the verbatim source) so no new rewrite class
+is introduced."* That reasoning is sound and **still governs `dynamic`**. It is set aside for `templated`
+only.
+
+Recorded here because the next reader meets two sibling modes with opposite writability and one sentence
+that appears to forbid both. Without this paragraph that reads as an inconsistency, and the likeliest
+repair a reader reaches for is to "fix" whichever one looks wrong.
+
+### E.3 Why `templated` writes and `dynamic` does not — boundedness, not preference
+
+The divergence is not a taste call and not a phasing convenience. It is the same boundedness test §4
+already applies to control-row tests (`_is_bounded`, `messagefoundry/lens.py`).
+
+- **`templated` is a bounded, enumerable shape**: literal text plus bounded `Message` reads, and nothing
+  else. A rewriter can emit it *and read it back to the same mode*. **Round-trip is total over the
+  admitted set**, and that is what makes writing it safe.
+- **`dynamic` is "everything else" by construction**, an open set. A rewriter cannot round-trip an open
+  set, so writing it would either restrict what an author may express or silently rewrite code the lens
+  did not fully understand. Both are worse than read-only.
+
+So the rule generalises rather than special-cases: **a mode is writable exactly when its shape is bounded
+enough to round-trip.** If a later amendment bounds some subset of `dynamic`, that subset becomes
+writable under this same test, introducing no new principle.
+
+### E.4 §3 delta — per-argument modes
+
+Today the row contract carries a **binary** split per argument and only that: `params` renders a literal
+as its value and anything else as verbatim source, while `literal_params` is the subset that is an
+`ast.Constant` (`messagefoundry/lens.py:286`). **There is no mode concept on either side of the seam.**
+
+An `action` / `lookup` row gains one field:
+
+```
+{ "kind": "action", "action": "copy_field",
+  "params":         {"src": "PID-5.1", "dst": "NK1-2.1"},
+  "literal_params": ["src", "dst"],
+  "param_modes":    {"src": "static", "dst": "static"},   // NEW: static | templated | dynamic
+  "line_start": <int>, "line_end": <int>, "nesting": <int> }
+```
+
+- `param_modes` is **total over `params`**. Every argument gets a mode, never a partial map, so a
+  consumer never has to decide what a missing key means.
+- `literal_params` is **retained unchanged**, not replaced. It is in the shipped contract and E.8 depends
+  on an older consumer continuing to read it. **`static` and `literal_params` must agree exactly OVER THE
+  EDITABLE PARAMS**, and AC-M2 asserts that rather than assuming it.
+
+**WHY THAT SCOPE, AND IT IS THE WHOLE REASON THIS CRITERION NEEDED CORRECTING (see E.10): THE TWO FIELDS
+ANSWER DIFFERENT QUESTIONS.** `literal_params` answers *is this argument EDITABLE*. `param_modes` answers
+*what SHAPE is this argument*. Those coincide almost everywhere, which is what makes the collision easy
+to miss -- but **a read-only display kwarg is a LITERAL THAT IS NOT EDITABLE**, and that is a coherent
+state an unscoped biconditional cannot express. On the native-action path `params` is built from
+`native.slots` **plus** `native.display` while `literal_params` covers slots only, deliberately, because
+a display kwarg is never editable in Phase A.
+
+### E.5 §4 delta — the admitted interpolation, stated as a closed set
+
+§4's action/lookup clause gains **one** admitted argument shape, deliberately the smallest one that
+delivers the mode:
+
+> a **bounded interpolation**: an f-string (`ast.JoinedStr`) whose every `FormattedValue` is itself a
+> bounded `Message` read (`msg["…"]` / `msg.field(…)`) carrying no format spec and no conversion, and
+> whose every remaining part is an `ast.Constant` string.
+
+**Explicitly not admitted, each of which stays `dynamic` and read-only:** `+` concatenation, `%`
+formatting, `str.format`, `str.join`, a nested call of any kind, a format spec, a conversion (`!r` / `!s`),
+a comprehension, a walrus, a conditional expression, or an f-string containing any of these. A shape not
+on the admitted list is not a degradation and not an error. It is `dynamic`, and it renders exactly as it
+does today.
+
+**Why a closed set rather than a predicate over safe-looking expressions:** an open predicate is a second
+grammar that drifts from this one. That is the failure `scripts/quality/lens_coverage.py:12-16` already
+refuses by driving the shipped `lens parse --json` instead of reimplementing recognition.
+
+### E.6 Invariants this widening must preserve (each is a build gate, not a caveat)
+
+§5 is the load-bearing correctness section, and a new rewrite class is exactly what it governs. None of
+these relax.
+
+1. **Row-scoped splice, never reformat.** `lens rewrite` regenerates only the edited row's line range;
+   untouched rows, blank lines and comments stay byte-identical. No whole-file `ast.unparse`, no
+   `libcst`.
+2. **Exact partition.** Rows' line ranges still exactly partition the def body. A mode is metadata about
+   an argument inside a row, so it can neither create nor consume a line.
+3. **Round-trip totality.** For every shape admitted by E.5, parsing the emitted source returns the same
+   mode with the same parts. This property is what licenses writing at all, so it is a gate rather than a
+   test wish.
+4. **A `dynamic` argument is never emitted.** The rewriter must refuse to write an argument whose mode is
+   `dynamic` rather than passing its source through. A passthrough would silently re-emit code the lens
+   did not fully parse.
+5. **Static analysis only, and no PHI.** `lens parse` and `lens rewrite` still never import or execute a
+   config module. No message content is involved. This amendment adds no PHI surface and no persisted
+   artifact.
+6. **Encoding characters are not assumed.** A templated part naming an HL7 path goes through the same
+   `Message` accessors as today. Nothing here hardcodes the separator set.
+
+### E.7 Non-goals (each is how this becomes a different, declined feature)
+
+- **No arbitrary expression authoring.** That is `dynamic`, and it stays read-only in v1 (E.2, E.3).
+- **No second artifact and no second execution path.** The `.py` remains the only artifact and the only
+  execution path. That is the stated test of the BACKLOG #26 carve-out, and it is what keeps a mode
+  selector on the permitted side of a line the owner drew. Declarative logic execution, declarative
+  field-mapping and drag-drop canvas authoring remain declined.
+- **No new rewrite class beyond E.5's closed set**, and no widening of that set by predicate.
+- **No mode concept on `code` or `control` rows.** Modes are per-argument, on rows that have typed
+  arguments.
+
+### E.8 Contract-version skew (must be handled, not discovered)
+
+`param_modes` is a new field on an existing kind, so an older IDE meeting a newer engine receives a key
+it does not know. That is the safe direction only if it is asserted: an older consumer must keep reading
+`params` and `literal_params` and ignore `param_modes` with no behaviour change.
+
+The reverse direction needs its own handling. A newer IDE meeting an older engine receives no
+`param_modes` at all, and must degrade to today's binary split rather than reading an absent map as
+"every argument is dynamic".
+
+### E.9 Consequence deltas
+
+- A parameter slot that is an interpolation stops reading as "this row is not editable" and starts
+  reading as "this argument is in templated mode", which is both more honest and more useful. That was
+  the item's original claim, and it becomes true of a shape the contract actually computes.
+- The editable share of the corpus moves. Per Amendment A §A.8's measurement discipline, templated
+  arguments are counted in **their own bucket** rather than folded into the editable numerator, so this
+  amendment cannot flatter the #239 coverage figure without converting anything.
+- One new rewrite class enters `lens rewrite`, the first widening of §5's emit surface since this ADR was
+  written. E.6.3 and E.6.4 are the gates that bound it.
+
+### E.10 Correction (2026-08-23) — AC-M2 was unsatisfiable as written, and the fix is a scope
+
+**AC-M1 AND AC-M2 COULD NOT BOTH HOLD.** AC-M1 requires `param_modes` total over `params`; AC-M2 as
+originally written required `static` if and only if the argument appears in `literal_params`. Those are
+jointly satisfiable only where the two sets coincide, and **on the native-action path they do not**.
+
+**Found by building to the criteria, not by reading them**, which is the only way this surfaces: the
+step-1 classifier is correct under both readings, and the contradiction appears the moment emission is
+attempted. The live instance is `tests/test_lens_native.py`, whose `msg.set("OBX-5", "V", occurrence=2)`
+row carries `occurrence` in `params`, classifies `static` by shape, and asserts `occurrence` is **not**
+in `literal_params` — commented there as *"never promoted to an editable literal_param"*.
+
+**OWNER RULING, 2026-08-23: scope AC-M2 to editable params.** So `static`-and-editable equals
+`literal_params`, on both paths. The criterion keeps its entire anti-drift purpose — stopping
+`param_modes` becoming a second, drifting truth about which arguments are literals — and becomes true.
+
+**Two repairs were considered and NOT taken, recorded so neither is re-opened:**
+
+- **Making `literal_params` include constant display kwargs.** That flips a deliberate shipped choice,
+  and E.8 depends on an older consumer reading `literal_params` unchanged.
+- **Dropping AC-M2.** The anti-drift guarantee is the reason the criterion exists.
+
+**This changes no substance.** `templated` stays writable, E.5's admitted set is untouched, and nothing
+the owner ruled on 2026-08-23 is revisited. It corrects a criterion that could not be met, which is a
+different act from relaxing one that could.
+
+**THE ROOT CAUSE IS WORTH MORE THAN THE FIX, and it is why E.4 now carries it inline: the two fields
+answer different questions.** `literal_params` answers *is this editable*; `param_modes` answers *what
+shape is this*. The amendment was written assuming one question, so a literal-but-not-editable argument
+had no expressible state. Any future field added beside these two should be checked against that
+question before it is checked against these sets.
+
+## Acceptance Criteria (Amendment E)
+
+- [ ] **AC-M1** — WHEN `lens parse` emits an `action` or `lookup` row, THE SYSTEM SHALL emit a
+  `param_modes` map TOTAL over that row's `params` — every argument named, none missing — so a consumer
+  never has to interpret an absent key.
+- [ ] **AC-M2** *(corrected 2026-08-23 by owner ruling — see E.10)* — WHERE an argument is EDITABLE,
+  THE SYSTEM SHALL classify it `static` IF AND ONLY IF it appears in `literal_params`. The test asserts
+  the two agree across the whole samples corpus in BOTH directions **over the editable params**, so drift
+  in either field fails rather than the newer field quietly becoming the only truth. **The scope is
+  load-bearing, not a hedge:** a constant `display` kwarg is `static` by shape and absent from
+  `literal_params` by design, so an unscoped biconditional is unsatisfiable on the native path — it is
+  not merely hard to meet.
+- [ ] **AC-M3** — WHEN an argument is an f-string meeting E.5 exactly, THE SYSTEM SHALL classify it
+  `templated`; WHEN it is any shape on E.5's exclusion list, THE SYSTEM SHALL classify it `dynamic`. The
+  test carries one case per excluded shape, so widening the admitted set fails a test rather than passing
+  silently.
+- [ ] **AC-M4** — WHEN a `templated` argument is rewritten, THE SYSTEM SHALL produce source that
+  re-parses to the SAME mode with the SAME parts (round-trip totality, E.6.3), asserted over generated
+  part sequences rather than hand-picked examples.
+- [ ] **AC-M5** — WHEN a rewrite is attempted on an argument whose mode is `dynamic`, THE SYSTEM SHALL
+  refuse, and SHALL NOT pass the argument's source through unchanged (E.6.4). The negative case is the
+  point, because a passthrough would look like success.
+- [ ] **AC-M6** — WHEN any row is rewritten, THE SYSTEM SHALL leave every untouched row, blank line and
+  comment byte-identical, and the rows SHALL still exactly partition the def body. These are the existing
+  §5 and A.4 gates, re-asserted here because a new emit path is the thing most likely to break them.
+- [ ] **AC-M7** — WHERE a consumer requests the pre-Amendment-E contract version, THE SYSTEM SHALL emit
+  no `param_modes` key, and the rest of the payload SHALL be byte-identical to today's across the whole
+  samples corpus.

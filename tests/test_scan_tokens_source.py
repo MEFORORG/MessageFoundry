@@ -759,6 +759,177 @@ def test_worktree_slug_casing_variant_is_flagged(
 
 
 # --------------------------------------------------------------------------------------------------
+# BACKLOG #1083: the slug detector required a ``claude/`` / ``worktrees/`` PATH PREFIX, so the same
+# slug written bare in prose matched the shape and not the pattern. Assembled from parts, like the
+# fixtures above, so no SOURCE line here is itself a match -- this file is scanned by the gate it
+# tests. Every hex below is invented and names no real session.
+# --------------------------------------------------------------------------------------------------
+
+#: A bare slug whose hex is NOT one of the documentation stand-ins, so the bare arm may fire on it.
+_BARE_SLUG = "quiet-" + "harbour-" + "7c4e91"
+#: Same shape, but the hand-written stand-in hex this repo uses when it writes ABOUT slugs.
+_PLACEHOLDER_SLUG = "some-" + "task-" + "a1b2c3"
+
+
+@pytest.mark.parametrize(
+    ("body", "why"),
+    [
+        (f"raised by session `{_BARE_SLUG}` while sweeping the citations", "backticked + lead-in"),
+        (f"see `{_BARE_SLUG}` for the banked patch", "backticked, no lead-in word"),
+        (f"the roster label is worktree: {_BARE_SLUG} and not an address", "lead-in, no backticks"),
+        (f"handed back to lane {_BARE_SLUG}", "a different lead-in word"),
+        (f"branch {_BARE_SLUG.upper()} was never pushed", "upper-cased, as the prefixed arm folds"),
+    ],
+)
+def test_a_bare_slug_with_no_path_prefix_is_flagged(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, body: str, why: str
+) -> None:
+    """The negative control this defect WAS the absence of.
+
+    The existing fixtures all carry a ``worktrees/`` prefix, so the suite could not tell "no slug
+    present" from "slug present in a shape I do not match" -- the same blindness as the guard. A
+    bare slug reached ``origin`` for two days under a green gate.
+    """
+    mod = _load(None, monkeypatch)
+    assert mod.TOKENS_PRESENT is False, "precondition: structural-only"  # type: ignore[attr-defined]
+    f = tmp_path / "notes.md"
+    f.write_text(body + "\n", encoding="utf-8")
+    hits = mod.scan_file(f, "docs/notes.md")  # type: ignore[attr-defined]
+    assert any("worktree/branch slug" in h for h in hits), why
+    # Reason-only: the slug IS the disclosure, so it must not be echoed into a public CI log.
+    assert not any("harbour" in h.lower() for h in hits)
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        # A bare slug shape with NO context at all. Deliberately NOT flagged: measured over the
+        # tracked tree, an ungated bare shape matched 116 lines, of which the overwhelming majority
+        # were ordinary prose. A guard that fires on healthy content gets allowlisted into
+        # uselessness, which is worse than the leak.
+        f"the value {_BARE_SLUG} is returned verbatim",
+        # The English words that are also six hex digits. These are why the shape alone cannot work.
+        "the FHIR-facade and the server-facade share a per-facade cache",
+        # A short hex written in ordinary prose, which this repo does constantly.
+        "re-measured against 780ee1d9 with a self-test",
+        # A dotted namespace that merely ends in six hex-ish characters.
+        "xmlns:wsu=oasis-200401-wss-wssecurity-utility",
+    ],
+)
+def test_ordinary_prose_carrying_the_bare_shape_does_not_fire(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, body: str
+) -> None:
+    """The false-positive control, and it is the half that keeps the guard usable.
+
+    #1083 asked for the widening to be assessed for false-positive cost BEFORE taking it, and the
+    answer was to narrow by CONTEXT (a backticked token, or a session/worktree/branch lead-in)
+    rather than by widening the shape.
+    """
+    mod = _load(None, monkeypatch)
+    f = tmp_path / "prose.md"
+    f.write_text(body + "\n", encoding="utf-8")
+    hits = mod.scan_file(f, "docs/prose.md")  # type: ignore[attr-defined]
+    assert not any("worktree/branch slug" in h for h in hits), body
+
+
+def test_a_stand_in_hex_is_exempt_bare_but_a_PREFIXED_stand_in_still_fires(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Pinned deliberately, not incidentally -- it is an asymmetry a later reader could 'tidy' away.
+
+    Prose ABOUT this detector uses hand-written stand-in hex (``a1b2c3``), and a guard that fires on
+    its own documentation is exactly the pressure that gets a guard allowlisted off. The bare arm
+    therefore exempts that closed set. The PREFIXED arm must NOT: the ``worktrees/`` prefix is its
+    own evidence, and lifting the exemption there would silently retire the two casing fixtures
+    above -- both of which use a stand-in hex.
+    """
+    mod = _load(None, monkeypatch)
+    bare = tmp_path / "bare.md"
+    bare.write_text(f"raised by session `{_PLACEHOLDER_SLUG}` in the write-up\n", encoding="utf-8")
+    assert not any(
+        "worktree/branch slug" in h
+        for h in mod.scan_file(bare, "docs/bare.md")  # type: ignore[attr-defined]
+    ), "a stand-in hex written bare is documentation, not a disclosure"
+
+    prefixed = tmp_path / "prefixed.md"
+    prefixed.write_text("see .claude/work" + f"trees/{_PLACEHOLDER_SLUG} now\n", encoding="utf-8")
+    assert any(
+        "worktree/branch slug" in h
+        for h in mod.scan_file(prefixed, "docs/prefixed.md")  # type: ignore[attr-defined]
+    ), "the prefix is its own evidence -- the stand-in exemption must not reach this arm"
+
+
+@pytest.mark.parametrize(
+    ("body", "fires", "why"),
+    [
+        # A LONGER hex run is a blob id, not a slug suffix. Without the trailing guard the pattern
+        # would take its first six characters and call it a slug.
+        ("reviewed on branch foo-bar-1234567890ab today", False, "12-hex tail is a blob id"),
+        ("reviewed on branch foo-bar-7c4e91a today", False, "7-hex tail is not a slug suffix"),
+        # There is deliberately NO leading guard. A symmetric one suppressed exactly this line while
+        # changing the tracked-corpus hit set by nothing, so it was measured out rather than kept.
+        # Interpolated, not written out: spelled literally this line trips the gate that scans it --
+        # which it duly did on the first run, and is the positive control for the case.
+        (f"handed to session -{_BARE_SLUG} yesterday", True, "hyphen separator, still a slug"),
+    ],
+)
+def test_the_bare_tail_is_bounded_but_the_head_is_not(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, body: str, fires: bool, why: str
+) -> None:
+    """The two guards are asymmetric on purpose; this pins which one exists and which does not."""
+    mod = _load(None, monkeypatch)
+    f = tmp_path / "probe.md"
+    f.write_text(body + "\n", encoding="utf-8")
+    hits = mod.scan_file(f, "docs/probe.md")  # type: ignore[attr-defined]
+    assert any("worktree/branch slug" in h for h in hits) is fires, why
+
+
+def test_a_ONE_WORD_head_fires_only_with_a_path_prefix(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The second deliberate asymmetry, and the one a later reader is most likely to "tidy" away.
+
+    Arm 1 accepts a one-word head; the bare arm requires two. A one-word head plus a six-letter tail
+    is just a hyphenated English word -- ``per-facade``, ``FHIR-facade`` -- and backticked prose is
+    full of them. The tracked corpus reported ZERO cost for allowing one word, which was luck rather
+    than evidence: no such token happened to be backticked anywhere in the tree until the fix's own
+    comment block wrote three, and they tripped the detector they described. The accepted price is
+    pinned here: a genuine one-word bare slug is MISSED.
+    """
+    mod = _load(None, monkeypatch)
+    one_word = "harbour-" + "7c4e91"
+
+    bare = tmp_path / "bare.md"
+    bare.write_text(f"raised by session `{one_word}` today\n", encoding="utf-8")
+    assert not any(
+        "worktree/branch slug" in h
+        for h in mod.scan_file(bare, "docs/bare.md")  # type: ignore[attr-defined]
+    ), "accepted gap: one word plus a six-hex tail is indistinguishable from a hyphenated word"
+
+    prefixed = tmp_path / "prefixed.md"
+    prefixed.write_text("see .claude/work" + f"trees/{one_word} now\n", encoding="utf-8")
+    assert any(
+        "worktree/branch slug" in h
+        for h in mod.scan_file(prefixed, "docs/prefixed.md")  # type: ignore[attr-defined]
+    ), "arm 1 has always accepted a one-word head and must keep doing so"
+
+
+def test_a_line_carrying_both_forms_is_reported_once(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """``worktrees/`` is itself a lead-in word, so a prefixed path satisfies BOTH arms.
+
+    Double-reporting one line adds noise rather than information -- the same reasoning the estate
+    pass already applies a few lines below the call site.
+    """
+    mod = _load(None, monkeypatch)
+    f = tmp_path / "both.md"
+    f.write_text("see .claude/work" + f"trees/{_BARE_SLUG} for details\n", encoding="utf-8")
+    hits = mod.scan_file(f, "docs/both.md")  # type: ignore[attr-defined]
+    assert sum("worktree/branch slug" in h for h in hits) == 1
+
+
+# --------------------------------------------------------------------------------------------------
 # Round-3 hardening: parser diagnostics, allowlist breadth, and per-section floors.
 # --------------------------------------------------------------------------------------------------
 

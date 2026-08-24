@@ -118,12 +118,13 @@ async def test_export_requires_step_up(engine: Engine) -> None:
     await _seed(engine)
     async with _client(engine, service) as c:
         token = await _login(c, "op")
-        # Fresh login is within the step-up window → export works.
-        ok = await c.get("/messages/export", headers=_auth(token), params={"content": "JANE"})
+        # Fresh login is within the step-up window → export works. POST, because a needle-selected
+        # save-all now sends its criteria in the body (BACKLOG #1184); the gate is the same on both.
+        ok = await c.post("/messages/export", headers=_auth(token), json={"content": "JANE"})
         assert ok.status_code == 200, ok.text
         # Back-date the step-up window → refused with the step-up signal, before any body streams.
         await service.store.mark_session_reauthed(hash_token(token), now=0.0)
-        blocked = await c.get("/messages/export", headers=_auth(token), params={"content": "JANE"})
+        blocked = await c.post("/messages/export", headers=_auth(token), json={"content": "JANE"})
         assert blocked.status_code == 403
         assert blocked.headers.get("X-Step-Up-Required") == "1"
 
@@ -135,7 +136,7 @@ async def test_export_denied_without_export_permission(engine: Engine) -> None:
     await _seed(engine)
     async with _client(engine, service) as c:
         token = await _login(c, "view")
-        r = await c.get("/messages/export", headers=_auth(token), params={"content": "JANE"})
+        r = await c.post("/messages/export", headers=_auth(token), json={"content": "JANE"})
         assert r.status_code == 403
 
 
@@ -160,10 +161,10 @@ async def test_export_save_all_streams_decrypted_bodies(engine: Engine) -> None:
     await _seed(engine)
     async with _client(engine, service) as c:
         token = await _login(c, "op")
-        r = await c.get(
+        r = await c.post(
             "/messages/export",
             headers=_auth(token),
-            params={"content": "ADT", "message_type": "ADT^A01"},
+            json={"content": "ADT", "message_type": "ADT^A01"},
         )
         assert r.status_code == 200, r.text
         assert r.headers["content-type"].startswith("application/x-ndjson")
@@ -222,10 +223,10 @@ async def test_export_audited_counts_every_body_without_needle(engine: Engine) -
     await _seed(engine)
     async with _client(engine, service) as c:
         token = await _login(c, "op")
-        r = await c.get(
+        r = await c.post(
             "/messages/export",
             headers=_auth(token),
-            params={"content": "9001", "channel_id": "IB_A"},
+            json={"content": "9001", "channel_id": "IB_A"},
         )
         assert r.status_code == 200, r.text
     rows = [dict(x) for x in await engine.store.list_audit(limit=50)]
@@ -253,7 +254,10 @@ async def test_export_charges_the_per_actor_phi_read_budget(engine: Engine) -> N
         h = _auth(await _login(c, "op"))
         for _ in range(2):  # exhaust the per-actor budget on the ordinary PHI-read route
             assert (await c.get("/messages", headers=h)).status_code == 200
-        throttled = await c.get("/messages/export", headers=h, params={"content": "ADT"})
+        # Stays a GET on purpose: the property under test is that a step-up GET pays the PHI-read
+        # budget even though step-up's own pacing is NON-GET only. A POST would be paced by the
+        # admin-write bucket too, and the assertion could no longer tell the two apart.
+        throttled = await c.get("/messages/export", headers=h, params={"field_path": "PID-3"})
         assert throttled.status_code == 429
         assert "retry-after" in throttled.headers
 
@@ -272,7 +276,7 @@ async def test_export_throttled_at_admission_writes_no_audit_and_streams_nothing
     async with _client(engine, service) as c:
         h = _auth(await _login(c, "op"))
         assert (await c.get("/messages", headers=h)).status_code == 200  # budget spent
-        r = await c.get("/messages/export", headers=h, params={"content": "ADT"})
+        r = await c.get("/messages/export", headers=h, params={"field_path": "PID-3"})
         assert r.status_code == 429
         assert "DOE^JANE" not in r.text  # no body escaped with the refusal
     rows = [dict(x) for x in await engine.store.list_audit(limit=50)]
@@ -292,3 +296,43 @@ async def test_export_ids_mode_audit_counts_selection(engine: Engine) -> None:
     ]
     parsed = json.loads(export_rows[0]["detail"])
     assert parsed["mode"] == "ids" and parsed["selected"] == 2 and parsed["requested"] == 2
+
+
+# --- BACKLOG #1184 (ASVS 14.2.1): the PHI needle is off the query string --------------------------
+
+
+async def test_export_get_no_longer_honours_a_needle_on_the_query_string(engine: Engine) -> None:
+    """Export's save-all selection may no longer be driven by a needle typed onto the URL.
+
+    Control in the same test: ``field_path`` on the SAME route still selects the seeded rows, so the
+    400 is the needle being gone rather than the route being broken."""
+    service = await _service(engine)
+    await _add_user(service, "op", [Role.OPERATOR.value])
+    await _seed(engine)
+    async with _client(engine, service) as c:
+        token = await _login(c, "op")
+        stale = await c.get("/messages/export", headers=_auth(token), params={"content": "JANE"})
+        assert stale.status_code == 400, (
+            f"a query-string needle still selected an export: {stale.status_code} {stale.text}"
+        )
+        ok = await c.get("/messages/export", headers=_auth(token), params={"field_path": "PID-3"})
+        assert ok.status_code == 200, ok.text
+        assert len(_ndjson(ok.text)) == 2  # control: the route works, field_path is kept
+
+
+async def test_export_takes_the_needle_in_a_post_body(engine: Engine) -> None:
+    """POST /messages/export selects by criteria carried in the BODY, and streams the same NDJSON."""
+    service = await _service(engine)
+    await _add_user(service, "op", [Role.OPERATOR.value])
+    await _seed(engine)
+    async with _client(engine, service) as c:
+        token = await _login(c, "op")
+        r = await c.post("/messages/export", headers=_auth(token), json={"content": "JANE"})
+        assert r.status_code == 200, r.text
+        rows = _ndjson(r.text)
+        assert [row["control_id"] for row in rows] == ["MSGA"]
+        assert "JANE" not in str(r.request.url), f"the needle rode the URL: {r.request.url}"
+        assert b"JANE" in r.request.content  # control: it really was sent, in the body
+    audits = [dict(a) for a in await engine.store.list_audit(limit=50)]
+    detail = next(a["detail"] for a in audits if a["action"] == "messages_export")
+    assert "JANE" not in detail  # the needle value is still never recorded

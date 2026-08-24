@@ -594,6 +594,25 @@ def main(argv: list[str] | None = None) -> int:
     )
     cert_self_signed.add_argument("--json", action="store_true", help="emit JSON")
 
+    # BACKLOG #1236 (ASVS availability). A sole-administrator deployment had NO recovery from account
+    # lockout: the bootstrap account is named `admin` so it is the one an attacker guesses first, it is
+    # created with no email so the ACCOUNT_LOCKED notice never leaves the process, self-reset is
+    # refused, an admin reset needs ANOTHER admin, re-bootstrap only fires on an EMPTY users table, and
+    # no CLI managed users. Every exit is individually deliberate; they close SIMULTANEOUSLY for a
+    # deployment with one administrator. This is the offline exit.
+    admin_unlock = sub.add_parser(
+        "admin-unlock",
+        help="clear a local account's lockout from the host (offline sole-administrator recovery)",
+    )
+    admin_unlock.add_argument("--username", required=True, help="the locked account to unlock")
+    admin_unlock.add_argument(
+        "--service-config",
+        default=None,
+        help="service settings TOML (default: ./messagefoundry.toml if present)",
+    )
+    admin_unlock.add_argument("--db", default=None, help="store path (overrides [store].path)")
+    admin_unlock.add_argument("--json", action="store_true", help="emit JSON")
+
     audit_verify = sub.add_parser(
         "audit-verify", help="verify the audit-log hash chain (tamper-evidence)"
     )
@@ -2110,8 +2129,49 @@ def _serve(args: argparse.Namespace) -> int:
     # beyond the declaration itself" — true of a declaration, false of a measurement. A reachable
     # front door that speaks TLS 1.0 is a fact, on loopback or not.
     #
-    # Scope is deliberately the posture the requirement is about: a declared terminator, PHI, and
-    # `enforce`. Every other posture never reaches here and is byte-identical.
+    # REQUIRE `public_origin` IN THIS POSTURE, REGARDLESS OF `serve_ui` (BACKLOG #1026, owner-ruled
+    # 2026-08-14). There IS a refusal for an unset `public_origin`, and it is gated on the console:
+    # `if settings.api.serve_ui and settings.api.tls_terminated_upstream`. With `serve_ui` false
+    # nothing required it, so a PHI instance behind a declared terminator under `enforce` could start
+    # with it unset and the probe below simply never ran -- with nothing reporting the skip.
+    #
+    # That is the failure this same block already refuses twice, one level down. It returns 2 when the
+    # probe's MECHANISM is missing, because "a check that degrades to a no-op when its mechanism
+    # disappears reports success forever afterwards", and it refuses on unreachable because "a gate
+    # that is trivially defeated is not a gate". Leaving `public_origin` unset WAS trivially defeating
+    # this gate, and the outcome WAS a check that reports success forever. The principle was stated
+    # twice here and violated one level up.
+    #
+    # This refuses a posture that starts today. Per CLAUDE.md section 0 there are zero deployments, so
+    # that costs nothing now and will never be cheaper to add -- and the owner was told the cost
+    # rather than it being hidden. It is NOT the reason the answer is (a): the reason is that this is
+    # the only end where the control measures its own posture instead of measuring whether someone
+    # happened to configure an unrelated console setting.
+    if (
+        settings.api.tls_terminated_upstream
+        and data_class is DataClass.PHI
+        and enforcing
+        and not settings.api.public_origin
+    ):
+        print(
+            f"error: refusing to serve on a PHI instance ({env_name!r}) behind a declared TLS "
+            "terminator under `enforce` without [api].public_origin — the ASVS 12.1.1 TLS-floor "
+            "probe dials that origin, so leaving it unset silently disables the check rather than "
+            'failing it. Set [api].public_origin to the origin the browser uses (e.g. "https://'
+            'mefor.example.org"). See docs/security/OFF-LOOPBACK-DEPLOYMENT.md.',
+            file=sys.stderr,
+        )
+        return 2
+
+    # Scope is the posture the requirement is about: a declared terminator, PHI, and `enforce`. Every
+    # other posture never reaches here and is byte-identical.
+    #
+    # `public_origin` appears as a fourth condition and is NOT a fourth scope narrowing: the refusal
+    # directly above guarantees it is set for exactly this posture, so the two agree by construction
+    # rather than by coincidence. It is kept as a belt-and-braces and as the type narrowing the probe
+    # call needs. Before #1026 this comment named three conditions while the gate had four, and the
+    # undocumented fourth was the whole defect -- a reader concluded the probe runs whenever a PHI
+    # instance sits behind a declared terminator under `enforce`, and it did not.
     if (
         settings.api.tls_terminated_upstream
         and data_class is DataClass.PHI
@@ -3848,6 +3908,78 @@ def _resolve_expected_anchor(args: argparse.Namespace) -> tuple[int, str] | None
         return 2
 
 
+def _admin_unlock(args: argparse.Namespace) -> int:
+    """Clear a local account's lockout from the host (BACKLOG #1236, ADR 0171).
+
+    THE GATE IS HOST ACCESS, AND IT IS A REAL ONE RATHER THAN AN ABSENT ONE. Reaching this needs the
+    service config, the store path and, on an encrypted store, the key material -- which is the
+    operator who installed the engine. Anyone holding all three already has the database and does not
+    need an unlock affordance to reach an account. So this grants no capability that the trust
+    boundary did not already imply, which is what makes it safe to ship unauthenticated.
+
+    IT DOES NOT RESET A PASSWORD, DELIBERATELY. Clearing the lockout returns the account to its
+    ordinary state and the holder still needs their credential. An unlock is the narrowest thing that
+    resolves the lockout, and a reset would hand whoever runs this a working account.
+    """
+    import asyncio
+    import getpass
+    from pathlib import Path
+
+    from pydantic import ValidationError
+
+    from messagefoundry.config.settings import StoreBackend, load_settings
+    from messagefoundry.store.base import open_store
+
+    cli: dict[str, dict[str, object]] = {}
+    if args.db is not None:
+        cli.setdefault("store", {})["path"] = args.db
+    try:
+        settings = load_settings(config_path=args.service_config, cli=cli)
+    except (FileNotFoundError, ValueError, ValidationError) as exc:
+        return _emit_error(str(exc), as_json=args.json)
+
+    # The same M-31 guard _audit_verify carries, and it matters identically here: a SQLite store is
+    # CREATED on open, so a typo'd path would yield a fresh empty DB and report "no such user" --
+    # which reads as "you got the username wrong" when the truth is "you got the DATABASE wrong".
+    if settings.store.backend == StoreBackend.SQLITE and not Path(settings.store.path).exists():
+        return _emit_error(
+            f"no store at {settings.store.path} — refusing to create one and report a false "
+            f"'no such user' (check --db / [store].path)",
+            as_json=args.json,
+        )
+
+    async def run() -> tuple[str, float | None]:
+        store = await open_store(settings.store)
+        try:
+            user = await store.get_user_by_username(args.username)
+            if user is None:
+                return ("no-such-user", None)
+            was = user.locked_until
+            # Reuse the shipped write rather than adding a protocol method. `record_login_failure`
+            # with zero attempts and no deadline is exactly "the lockout state is cleared", and it is
+            # already implemented on all backends -- so this needs no migration and no store change.
+            # The name reads oddly at a call site that UNLOCKS, which is why it is explained here.
+            await store.record_login_failure(user.id, failed_attempts=0, locked_until=None)
+            await store.record_audit(
+                "auth.admin_unlocked",
+                actor=f"cli:{getpass.getuser()}",
+                detail=json.dumps({"username": args.username, "was_locked_until": was}),
+            )
+            return ("unlocked", was)
+        finally:
+            await store.close()
+
+    outcome, was = asyncio.run(run())
+    if outcome == "no-such-user":
+        return _emit_error(f"no local account named {args.username!r}", as_json=args.json)
+    if args.json:
+        print(json.dumps({"ok": True, "username": args.username, "was_locked_until": was}))
+    else:
+        state = "was not locked" if was is None else f"was locked until epoch {was:.0f}"
+        print(f"OK: cleared lockout for {args.username!r} ({state}); the password is UNCHANGED")
+    return 0
+
+
 def _audit_verify(args: argparse.Namespace) -> int:
     import asyncio
     from pathlib import Path
@@ -4956,6 +5088,7 @@ _DISPATCH = {
     "gen-key": _gen_key,
     "cert": _cert,
     "protect-key": _protect_key,
+    "admin-unlock": _admin_unlock,
     "audit-verify": _audit_verify,
     "audit-anchor": _audit_anchor,
     "rekey-audit": _rekey_audit,

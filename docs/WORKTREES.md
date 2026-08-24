@@ -248,6 +248,74 @@ same invocation wherever one is possible (a refusal test refuses the whole run b
 a session arrives, the fence dies, the metadata is touched — before answering, which reproduces the
 race deterministically with no threads and no sleeps.
 
+## Claims stranded by every other removal path — `claim-reconcile.ps1`, `claim-adjudicate.ps1`
+
+`prune-merged.ps1` releases the claims held by a worktree **it** removes, behind a merged-and-clean-and
+-unoccupied proof. That is one removal path and there are several: `git worktree remove` by hand,
+`git worktree prune`, deleting the folder in Explorer, bulk cleanup by path list. Every one of them
+strands the claim, and `claim.ps1 -Take` hard-blocks on a claim file that exists — so the key becomes
+**unclaimable by every future session**, and it stays that way until somebody looks.
+
+Two sweeps read that population. They ask different questions and neither subsumes the other.
+
+```
+scripts\coord\claim-reconcile.ps1        # did the BRANCH land?  -Apply releases what it proves
+scripts\coord\claim-adjudicate.ps1       # is the KEY protected on origin/main?  never writes
+```
+
+**`claim-reconcile.ps1` asks about the branch**, on four arms: containment in `origin/main`, a merged
+PR at this exact tip, blob-identity against the landing commit, and the branch being gone everywhere.
+Where it proves a landing, `-Apply` releases through `claim.ps1` and the ledger records it.
+
+**`claim-adjudicate.ps1` asks about the key**, because a branch is not the unit a claim is about.
+Measured 2026-08-18 on the live registry: 20 stranded claims sat on **six** branches, one carrying
+**nine** keys, and reconcile cleared **none** of them. That is not a defect in it — a seat branch
+accumulates commits from every item the seat ever touched, so branch containment can only ever clear
+a whole seat at once, and a long-lived seat branch never clears.
+
+### The criterion is the project's own, and it is not "is the work done"
+
+Item #1010's banner on `origin/main` states it: the registry is **machine-local and unversioned**, so
+"*this banner is the protection that travels; the claim is not*". A claim is not valuable in itself —
+it is a **weak** guard against a duplicate build, weak because it exists on one machine. So the
+question is not whether the work finished but whether something durable has replaced the guard:
+
+> **SUPERSEDED** = the item exists in the backlog namespace on `origin/main` **and** its banner there
+> already protects it — a CLOSED status glyph, or a do-not-rebuild banner naming the landing.
+
+Nothing else is ever proposed for release. Not age, not quiet, not a note saying the work is done.
+The tool has **no `-Apply`** and will not grow one: `claim.ps1` owns the `.history` ledger and writes
+the record before removing the file (BACKLOG #1068), and a second writer would be a second definition
+of it. Adjudicate prints the `claim.ps1 -Release` line; a human runs it.
+
+### Three things that look like evidence and are not
+
+Each was tried against the live data on 2026-08-18 and produced a wrong answer.
+
+| Tempting signal | What it actually is |
+| --- | --- |
+| A `BACKLOG #N` citation in a landed commit | `BACKLOG #340` hits a commit reading "…and in BACKLOG #340, making this the third document to…" — **prose reference**. `BACKLOG #328` hits "Also BACKLOG #328, **sections 1-2**" — part of an item. `backlog-hygiene.yml` matches the bare token on purpose; it enforces that a claiming PR updates the banner and is not a closure oracle. Citations are **printed, never scored**. |
+| A note saying the work landed | A note may *nominate* a hypothesis; only `origin/main` may confirm it. #1010's note said "ALREADY LANDED ON MAIN … Verify before believing me" and was right — and what licensed acting on it was the banner saying so independently. |
+| A banner reading OPEN | Cuts one way only. #1010 carries **no status glyph at all** while landed, because the flip was written on an unmerged branch and "a banner protects nobody until it is on `main`". OPEN means *not superseded here*, never *not landed*. |
+
+### Reading the report
+
+`SUPERSEDED` is a **floor** on what is safe to release, never a ceiling on what has landed. Every
+other verdict is a question the instrument could not close, not a finding that the work is live:
+
+- **BLOCKING** — nothing on `origin/main` protects the item, so the key is stuck in the worst way:
+  unclaimable *and* unbuilt. These are **grouped by branch**, because that is where the decision
+  lives — one *land it or abandon it* call cleared nine keys at once on the day this was written.
+- **NO-ITEM** — the key is outside the backlog namespace (`ha-recheck-inc145`, `usage-forecast` on
+  the live registry). The instrument does not reach it. That is not a finding about the work.
+- **STRANDED-REGISTERED** — half a removal. `prune-merged.ps1` owns it and releases as it removes.
+- **UNREADABLE** — `claim_check.py` reads a malformed claim as *unclaimed*, so the key is already
+  ungated. Deleting the file would hide that rather than fix it.
+
+Tests: [`tests/test_coord_claim_adjudicate.py`](../tests/test_coord_claim_adjudicate.py). Every
+releasing test is paired with the case that would **also** pass if the tool released what it cannot
+see, and one test asserts the registry is byte-identical after every code path.
+
 ## Your PR won't merge — triage before you touch anything
 
 With several sessions merging into one `main`, a PR that was green ten minutes ago routinely stops
@@ -434,10 +502,17 @@ judge.** Instances: BACKLOG #1057, #1059, #1060.
 
 ## Automatic coordination context (SessionStart hook)
 
+> **NOT WIRED as of 2026-08-17 -- this section describes what the hook DOES, not a control that is
+> running.** `install-coordination.ps1 -Status` reports `scripts/worktree/session-context.ps1` MISSING
+> in **all five** config roots, and an independent read of each `settings.json` agrees; the project
+> `.claude/settings.json` this paragraph used to name carries **no hook rows at all**. Nothing on this
+> box currently prints the banner below. Check before relying on it -- `pwsh -NoProfile -File
+> scripts\coord\install-coordination.ps1 -Status` -- and never take this paragraph as the answer.
+
 You don't have to brief each new chat by hand. A `SessionStart` hook
-([../scripts/worktree/session-context.ps1](../scripts/worktree/session-context.ps1), wired in
-[`../.claude/settings.json`](../.claude/settings.json)) injects context into every new Claude Code
-window. It always prints the project's Ultracode working-default reminder, and **when 2+ worktrees
+([../scripts/worktree/session-context.ps1](../scripts/worktree/session-context.ps1)) injects context
+into every new Claude Code window. It always prints the project's Ultracode working-default
+reminder, and **when 2+ worktrees
 share this `.git`** it appends the parallel-session block: which worktree/branch this chat owns, the
 full worktree list, and the shared-memory write rule above. With a single worktree it prints only the
 working-default line.
@@ -534,6 +609,63 @@ pwsh -NoProfile -File scripts\hooks\collision_gate.ps1 -PathOverride docs\BACKLO
 
 Empty output means no live session holds it. Documented in-script as a test affordance; surfaced here
 because a session that needed the answer found it by reading the source.
+
+## Account usage — knowing before a session is cut off
+
+**What it fixes.** Sessions were hitting the plan limit mid-task and losing work. The account's real
+quota state exists — Settings > Usage shows it — but it is not visible from inside a session, so nobody
+knew how much headroom was left until it ran out.
+
+**The one place the numbers arrive.** Claude Code hands `rate_limits` to a **statusLine command's stdin
+and nowhere else**. Not `SessionStart`, not `UserPromptSubmit`, not `Stop` — the payloads were enumerated
+in the shipped binary and it appears in exactly one of them. So quota state cannot be subscribed to; it
+has to be *collected* by a statusLine and published somewhere shared. That single fact determines the
+whole shape:
+
+| | |
+|---|---|
+| [`usage-collect.ps1`](../scripts/coord/usage-collect.ps1) | the statusLine. Publishes to `~/.claude/mefor-usage/latest.json` |
+| [`usage.ps1`](../scripts/coord/usage.ps1) | reads it, adds burn rate, answers *will this run out before it resets* |
+| [`install-usage-statusline.ps1`](../scripts/coord/install-usage-statusline.ps1) | wires it (owner, plain terminal) |
+
+**One publisher, N readers.** The quota is **account-wide** — every session in every repo draws down the
+same 5-hour and 7-day pools — so any one session's reading is the truth for all of them. Do not run a
+collector per session expecting to sum them; that double-counts a shared pool. The publish path is
+user-level for the same reason: the data is a property of the account, not of a checkout.
+
+**It only runs in an interactive session.** The statusLine is part of the TUI's render tree and never
+executes under `claude -p` or the SDK. A headless coordinator can *read* what this publishes and can
+never publish it itself. `refreshInterval` is set because statusLine updates are event-driven and go
+silent when a session is idle — Anthropic's docs name *"a coordinator waits on background subagents"* as
+exactly the case where that leaves you blind.
+
+**Two of the four Settings > Usage numbers are not available.** The payload carries `five_hour` and
+`seven_day` only; the **model-scoped weekly bucket** (the "Weekly / Fable" bar) and the **plan tier** are
+absent, and the request to expose them was closed as not-planned. `usage.ps1` prints that every run.
+
+**Opus is not one of the gaps** — and the first version of this section said it was. Opus and Sonnet have
+**no separate weekly bucket**: they draw on *All models*, which is the `seven_day` window this reads, so
+Opus work is fully covered. That error came from finding `seven_day_opus` / `seven_day_sonnet` in an
+undocumented endpoint's **schema** and assuming a field implies an active limit — it does not. **A false
+blind spot is its own defect**, and a worse one than an omission: a session told its headroom is
+unknowable stops trusting a reading that was accurate. Corrected against the actual panel, 2026-08-02.
+
+```powershell
+pwsh -NoProfile -File scripts\coord\usage.ps1          # human
+pwsh -NoProfile -File scripts\coord\usage.ps1 -Json    # coordinator
+```
+
+Exit codes so a coordinator can branch without parsing prose: **0** ok, **10** warn, **11** critical,
+**20** unknown. `UNKNOWN` is a real answer here and is returned whenever the reading is stale, undateable
+or future-dated — a percentage is never extrapolated from a dead publisher, and every number is printed
+with its own age. **Do not read a missing bucket as an empty one.**
+
+> **`ccusage` does not do this**, despite being the tool everyone recommends and despite several
+> summaries claiming it "fetches real rate limit data". It parses transcripts for tokens and dollars; its
+> "5-hour block" is a client-side reconstruction and its statusline percentage is context-window.
+> `claude-usage-tracker` is the same mistake in cruder form — real token parsing compared against a
+> hardcoded limit table. Anything reading plan state from either is confidently wrong at exactly the
+> moment it matters. Tokens and plan-limit consumption are different quantities.
 
 ## Announcing yourself (UserPromptSubmit hook)
 

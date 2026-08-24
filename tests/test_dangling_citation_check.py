@@ -188,25 +188,26 @@ def _repo_root() -> Path:
 
 
 def _live_shape_citations() -> list[tuple[str, int, int]]:
-    """Citations naming a number ABOVE the floor that are not PR/foreign-repo shaped.
+    """Citations naming a number that can still be issued -- the shape that can arm.
 
-    Below the floor is unreachable forever, and a foreign reference is not a backlog citation at
-    all; both are reported by the tool for a human to read and neither is a defect.
+    CALLS THE SHIPPED PREDICATES RATHER THAN RE-DERIVING THEM (BACKLOG #1235 residual 2). This
+    helper previously re-implemented both halves inline -- `number in filed` duplicating
+    `unresolved_citations`, and `number <= floor or pr_shaped` duplicating what `main` filters on.
+    Two of the three agreed with the script by convention, with nothing binding them: a rule with
+    two definitions is the exact defect this tool exists to catch in other people's gates.
+
+    The consequence is checkable and is the point: a single mutation to `cc.is_live_shape` now reds
+    BOTH this real-tree gate and the exit-code arms below. Before, mutating one left the other
+    green, which is what "agreeing by convention" buys you.
     """
     root = _repo_root()
     floor = cc.allocation_floor()
-    filed = cc.allocated_numbers()
-    out: list[tuple[str, int, int]] = []
-    for path in sorted((root / "docs").rglob("*.md")):
-        try:
-            text = path.read_text(encoding="utf-8")
-        except (OSError, UnicodeDecodeError):
-            continue
-        for lineno, number, _line, pr_shaped in cc.citations_in(text):
-            if number in filed or number <= floor or pr_shaped:
-                continue
-            out.append((str(path.relative_to(root)), lineno, number))
-    return out
+    hits = cc.unresolved_citations(sorted((root / "docs").rglob("*.md")), cc.allocated_numbers())
+    return [
+        (str(hit.path.relative_to(root)), hit.lineno, hit.number)
+        for hit in hits
+        if cc.is_live_shape(hit, floor)
+    ]
 
 
 def test_the_docs_scan_actually_covers_something() -> None:
@@ -224,3 +225,198 @@ def test_no_docs_citation_names_a_number_that_can_still_be_issued() -> None:
     assert not live, "citations naming a still-issuable number:\n  " + "\n  ".join(
         f"{p}:{n} #{num}" for p, n, num in live
     )
+
+
+# --- main()'s EXIT CODE, which nothing above asserts (BACKLOG #1235, residual) ---------------------
+#
+# HOW THE GAP WAS FOUND, because the method transfers: a SET DIFFERENCE over the module's public
+# surface, not a grep for something missing. The module defines six top-level names --
+# _load_backlog_module, allocation_floor, allocated_numbers, citations_in, unresolved_citations,
+# main -- and the suite above exercises four. `main` was the SOLE untouched public entry point.
+# That is a positive enumeration on both sides, so it does not depend on anyone's choice of pattern.
+#
+# WHY IT MATTERS HERE SPECIFICALLY: main()'s last line IS the fail-closed contract --
+#     return 1 if (live and not args.advisory) else 0
+# -- and it had ZERO coverage. Invert the `not`, or return 0 unconditionally, and every test above
+# still passes. This file's own header calls a detector that cannot fail "not a gate"; its exit code
+# was in exactly that state.
+#
+# THE LAST TWO ARMS ARE THE POINT. Both produce HITS and both must exit 0, because the contract keys
+# on the LIVE SHAPE rather than on the hit count. Without them, a mutation to `return 1 if hits
+# else 0` passes everything -- and that mutation reds the tree today on 26 permanently-harmless
+# citations, which is how a gate gets switched off.
+
+
+def _unissued_above_floor() -> int:
+    """A number the allocator CAN still issue -- the only shape that can ever arm."""
+    # int() is load-bearing for mypy, not decoration: `cc` is loaded via importlib at runtime, so
+    # every attribute on it is Any and the arithmetic silently widens the return type.
+    number = int(cc.allocation_floor()) + 100
+    assert number < 9000, "citations_in only scans [1000,9000); pick differently"
+    return number
+
+
+def _unissued_below_floor() -> int:
+    """A permanent hole: at or below the high-water mark, so never issuable.
+
+    Derived rather than hardcoded. A literal would silently become a RESOLVING number the day it is
+    filed, at which point this stops testing the below-floor branch and nothing would say so.
+    """
+    allocated = cc.allocated_numbers()
+    floor = cc.allocation_floor()
+    for number in range(1000, floor + 1):
+        if number not in allocated:
+            return number
+    raise AssertionError("no hole below the floor; this arm needs a different construction")
+
+
+def _doc(tmp_path: pathlib.Path, body: str) -> str:
+    path = tmp_path / "doc.md"
+    path.write_text(body, encoding="utf-8")
+    return str(path)
+
+
+def test_a_live_shape_citation_makes_main_exit_1(tmp_path: pathlib.Path) -> None:
+    """FAIL CLOSED BY DEFAULT. The whole point of the flip from opt-in `--fail`."""
+    doc = _doc(tmp_path, f"see #{_unissued_above_floor()} for the rationale\n")
+    assert cc.main([doc]) == 1
+
+
+def test_advisory_reports_the_same_hit_and_exits_0(tmp_path: pathlib.Path) -> None:
+    """The documented escape. Untested, an opt-out is indistinguishable from a broken gate."""
+    doc = _doc(tmp_path, f"see #{_unissued_above_floor()} for the rationale\n")
+    assert cc.main([doc]) == 1  # same corpus, so the arms differ ONLY by the flag
+    assert cc.main([doc, "--advisory"]) == 0
+
+
+def test_a_file_with_no_citation_exits_0(tmp_path: pathlib.Path) -> None:
+    assert cc.main([_doc(tmp_path, "no citation here at all\n")]) == 0
+
+
+def test_a_citation_BELOW_the_floor_is_reported_but_does_not_fail(tmp_path: pathlib.Path) -> None:
+    """ASYMMETRIC ARM 1: a hit that must NOT fail. Below the high-water mark the allocator can never
+    issue that number, so the citation is permanently harmless -- reported for a human, not a defect.
+    """
+    doc = _doc(tmp_path, f"see #{_unissued_below_floor()} for the rationale\n")
+    assert cc.main([doc]) == 0
+
+
+def test_a_PR_SHAPED_reference_is_reported_but_does_not_fail(tmp_path: pathlib.Path) -> None:
+    """ASYMMETRIC ARM 2, on the other axis: a foreign reference is not a backlog citation at all,
+    even when its number is above the floor."""
+    doc = _doc(tmp_path, f"shipped in PR #{_unissued_above_floor()}\n")
+    assert cc.main([doc]) == 0
+
+
+# --- BACKLOG #1235: the ANNOTATION must ask the same predicate the EXIT CODE asks ----------------
+
+
+def test_a_pr_shaped_hit_is_not_narrated_as_the_live_shape(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The third definition of the live-shape rule, and the only one that talks to a human.
+
+    MEASURED at 4c28badd before this fix: six hits printed BOTH
+    ``[PR/issue/foreign-repo shaped -- very likely NOT a backlog citation]`` AND
+    ``This is the live shape.`` -- two contradictory annotations on the SAME hit, two lines apart --
+    while the process exited 0.
+
+    Asserted on the CONTRADICTION rather than on either sentence alone, because either one in
+    isolation is correct: the hit IS above the floor, and it IS pr-shaped. Only their co-occurrence
+    on one hit is the defect, so only that co-occurrence can pin it.
+    """
+    doc = tmp_path / "d.md"
+    floor = cc.allocation_floor()
+    doc.write_text(f"see upstream `someproject#{floor + 500}` for context\n", encoding="utf-8")
+    assert cc.main([str(doc)]) == 0, "a pr-shaped hit must not fail the gate"
+    out = capsys.readouterr().out
+    assert "PR/issue/foreign-repo shaped" in out, "control failed: the hit was not annotated at all"
+    assert "This is the live shape." not in out, (
+        "the annotation called a pr-shaped hit the live shape while the exit code passed over it "
+        "-- a third definition of the rule, disagreeing with the other two (BACKLOG #1235)"
+    )
+
+
+def test_a_genuinely_live_hit_is_still_narrated_as_the_live_shape(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The negative control. Suppressing the sentence everywhere would pass the test above and
+    destroy the tool's only human-readable verdict -- a fix that trades a wrong answer for none."""
+    doc = tmp_path / "d.md"
+    floor = cc.allocation_floor()
+    doc.write_text(f"resolves to BACKLOG #{floor + 500} which was never filed\n", encoding="utf-8")
+    assert cc.main([str(doc)]) == 1, "a genuinely live citation must fail the gate"
+    assert "This is the live shape." in capsys.readouterr().out
+
+
+# --- BACKLOG #1235: a clean result over an EMPTY population is not a clean result -----------------
+
+
+def test_an_empty_population_is_REFUSED_not_reported_clean(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The trap under the item's first disjunct, and it arms by CLOSING the item.
+
+    The default path list is ``Path("docs").rglob(...)`` -- CWD-relative, not repo-relative.
+    MEASURED before this fix, from a directory with no ``docs/``::
+
+        No unresolved backlog citation in 0 file(s).
+        Resolved against 0 allocated item numbers (open and closed).
+        exit 0
+
+    Both counts zero, nothing objecting. The >200-file population floor lives only in
+    ``test_the_docs_scan_actually_covers_something``, so it guards the PYTEST arm and nothing else --
+    anyone who satisfies the item by wiring this CLI into CI, which is the documented way to close it,
+    inherits a gate that reports clean when it scanned nothing.
+    """
+    monkeypatch.chdir(tmp_path)
+    assert cc.main([]) == 1
+    err = capsys.readouterr().err
+    assert "empty population" in err
+    assert "0 file(s) scanned" in err, "the refusal must print WHAT it scanned, not just refuse"
+    assert str(tmp_path) in err, "and WHERE from -- the defect is a CWD-relative default"
+
+
+def test_a_real_population_is_still_reported_normally(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The negative control, and without it the fix above could be 'always refuse'.
+
+    Run against the real docs/ from the repo root: a populated scan must still reach a verdict rather
+    than trip the emptiness guard. This is the arm that makes the refusal a guard instead of a wall.
+    """
+    assert cc.main([]) in (0, 1)  # a verdict, whichever way -- NOT the emptiness refusal
+    assert "empty population" not in capsys.readouterr().err
+
+
+def test_the_coverage_bound_prints_on_a_CLEAN_run_too(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """It used to print only after the hits loop, so the early clean return skipped it.
+
+    The bound was therefore absent at exactly the moment a reader concludes "clean" -- which is the
+    whole population it exists to qualify. It is in the module docstring, and a docstring is not what
+    a CI log shows.
+    """
+    doc = tmp_path / "clean.md"
+    doc.write_text("no citations here at all\n", encoding="utf-8")
+    assert cc.main([str(doc)]) == 0
+    out = capsys.readouterr().out
+    assert "No unresolved backlog citation" in out, "control: this must be the CLEAN path"
+    assert cc._COVERAGE_BOUND in out, (
+        "the coverage bound is absent from the clean run, which is the one a reader acts on"
+    )
+
+
+def test_the_coverage_bound_has_ONE_definition() -> None:
+    """Both exit paths print the same text because there is only one string to print.
+
+    Two copies of a caveat drift, and the copy that goes stale is the one nobody reads -- it only
+    prints on the path they are not on. This is the same single-definition rule the item is about,
+    applied to prose rather than to a predicate.
+    """
+    # Read the module's OWN file, via the loaded object, so this cannot drift from what was
+    # imported. Naming the path again here would be a second definition inside a test whose
+    # subject is second definitions.
+    source = Path(cc.__file__).read_text(encoding="utf-8")
+    assert source.count("Not scanned: the private companion repository") == 1

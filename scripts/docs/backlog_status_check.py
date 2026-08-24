@@ -81,6 +81,56 @@ _OPEN = "🔢🚧"
 _BANNER = re.compile(rf"^>\s(?P<emoji>[{_CLOSED}{_OPEN}])️?\s")
 _HEADING = re.compile(r"^## (?P<num>\d+)\.\s")
 
+# Machine-readable state inside the banner blockquote: `> Verdict: build`. Only these three keys are
+# recognised, because an open key set is a second, undocumented schema. They are deliberately IN the
+# banner block -- the only region this parser reads.
+_FIELD_KEYS = ("verdict", "research", "closing-act")
+_FIELD = re.compile(rf"^>\s*(?P<key>{'|'.join(_FIELD_KEYS)})\s*:\s*(?P<value>.+?)\s*$", re.I)
+
+# Closing acts a BUILDER can perform themselves. An item outside this set is still WORKABLE -- the
+# seat writes the code and finishes with an open item, which is a complete outcome, not a failure.
+#
+# CANNOT CLOSE IS NOT CANNOT BE WORKED. Measured 2026-08-22: refusing every non-code closing act
+# would have blocked #1112, #1171 and #1187, all of which reached main -- #1171 being the SMTP
+# credential-exposure fix. The first version of the dispatch gate did exactly that, and this comment
+# exists because the constant's old name (BUILDABLE_) invited the conflation.
+BUILDER_CLOSABLE_ACTS = frozenset({"code"})
+
+# Who performs each closing act. A dispatch NAMES this rather than refusing the item.
+#
+# EVERY ENTRY NAMES TWO ACTS, AND THAT IS THE POINT. The first version said "scorecard-rescore: the
+# ASVS Tracker" -- one seat -- and a reader concludes the item finishes there. It does not.
+# `BUILDER.md:253` forbids a builder concluding an item CLOSED ("banner flips and ledger reconciles
+# are not the builder's") and `:148` gives the banner to the LANDER. So the work act and the banner
+# act have different owners, and the handoff between them is where an item stalls: the re-score
+# lands in a vault file gitignored from every engine checkout, so the seat that must flip the banner
+# cannot see that the first act happened. Both seats do their job correctly and the item stays open.
+#
+# Naming only the first act is how a tool tells a reader the item is somebody else's problem, when
+# what it actually needs is a message.
+CLOSING_SEAT = {
+    "code": "the builder writes it; the LANDER flips the banner on merge",
+    "scorecard-rescore": (
+        "the ASVS Tracker re-scores the cell in the vault, THEN mails the LANDER the item numbers "
+        "for the banner flip. Two acts, two seats -- the re-score alone does not close it, and the "
+        "vault file is invisible from an engine checkout, so the handoff must be a message"
+    ),
+    "owner-ruling": "the owner rules via the LIAISON; the Dispatcher or Lander records it",
+    "banner-only": "the DISPATCHER or LANDER, in the ledger",
+}
+
+# BACKLOG #1259: an unresolved git conflict parses CLEANLY here without this check, and the reason is
+# specific -- `>>>>>>> branch` starts with ">", so the banner-block scanner below treats it as a
+# blockquote line and keeps scanning rather than ending the block. Both sides' items are then read,
+# and the census counts them all. Measured: the live ledger and a marker-poisoned copy of it produced
+# IDENTICAL counts with no exception raised. The counts agreeing is what made it undetectable -- a
+# reader handed a conflicted source reports a plausible number, not an error.
+#
+# `=======` is deliberately NOT matched. A Markdown setext H1 underline is a run of "=" and can be
+# exactly seven, so matching it could refuse a legitimate ledger; every real conflict carries the
+# other two markers, so leaving it out costs no detection and removes the false positive.
+_CONFLICT = re.compile(r"^(?:<{7}|>{7})(?:\s|$)", re.M)
+
 # Unambiguous CHANGELOG citations of a *backlog item* (not a PR number), considered only on a change
 # *entry* (a list bullet). Narrative prose that merely mentions an item — "the correctness edge is
 # closed (… BACKLOG #82) or field-confirmed benign" — is a reference, not a shipped claim, and a
@@ -90,16 +140,34 @@ _CL_EXPLICIT = re.compile(r"BACKLOG\s+#(\d+)", re.IGNORECASE)
 _CL_ADR_FORM = re.compile(r"\(#(\d+),\s*\[?ADR", re.IGNORECASE)
 
 
+#: One field line that was overwritten by a later line for the same key: the key, the 1-based
+#: line number of the SECOND occurrence, the value it displaced, and the value that displaced it.
+DuplicateField = tuple[str, int, str, str]
+
+
 class Item:
     """One numbered backlog item and the status banners in its leading blockquote block."""
 
-    __slots__ = ("num", "line", "closed", "open")
+    __slots__ = ("num", "line", "closed", "open", "fields", "duplicate_fields")
 
     def __init__(self, num: int, line: int) -> None:
         self.num = num
         self.line = line
         self.closed: list[str] = []
         self.open: list[str] = []
+        # Machine-readable state declared INSIDE the banner block, so `parse_items` can see it.
+        # BACKLOG state that lives below the banner block is invisible to every tool that reads this
+        # ledger: measured 2026-08-22, `Verdict:` is present on 302 of 328 items and every one sits
+        # BELOW the line where this parser stops, so nothing has ever read it. A 30-item wave was
+        # dispatched whose every item carried `Verdict: research` -- a verdict that has closed ZERO
+        # times in 330 closed items -- and closed zero.
+        self.fields: dict[str, str] = {}
+        # A DUPLICATE FIELD LINE USED TO VANISH INTO THE ASSIGNMENT BELOW (#1338). `fields` is a
+        # dict, so a second `> Research: ...` overwrote the first and left NO trace: item count,
+        # open count and even `len(fields)` are identical with and without the duplicate -- and
+        # those totals are the entire check every seat runs after a ledger edit. The reader could
+        # not represent the defect, so nothing downstream could detect it.
+        self.duplicate_fields: list[DuplicateField] = []
 
     @property
     def is_open(self) -> bool:
@@ -111,7 +179,21 @@ def parse_items(text: str) -> list[Item]:
 
     The banner block runs from the heading to the first line that is neither blank nor a blockquote,
     so a status banner must appear *before* the item's prose (Cluster/Scope/Why...).
+
+    Raises :class:`ValueError` when ``text`` still carries git conflict markers (#1259). The refusal
+    lives in the READER, not in a pre-commit hook, because the way this bit was a gate handed a tree
+    IN MEMORY -- a merge-tree blob read before its exit code was checked. A hook on the working copy
+    would not have been running at all.
     """
+    conflict = _CONFLICT.search(text)
+    if conflict is not None:
+        line_no = text.count("\n", 0, conflict.start()) + 1
+        raise ValueError(
+            f"refusing to parse a source with an unresolved conflict marker (line {line_no}). "
+            "This is not a formatting complaint: a conflicted ledger parses WITHOUT error here and "
+            "yields a census that silently counts items from BOTH sides, so the number looks right. "
+            "Resolve the merge, or check the merge's exit status, before reading it."
+        )
     lines = text.splitlines()
     items: list[Item] = []
     i = 0
@@ -129,6 +211,16 @@ def parse_items(text: str) -> list[Item]:
                 if b:
                     emoji = b.group("emoji")
                     (item.closed if emoji in _CLOSED else item.open).append(emoji)
+                f = _FIELD.match(line)
+                if f:
+                    key = f.group("key").strip().lower()
+                    value = f.group("value").strip()
+                    # Record before overwriting. `dispatch_gate.py` reads verdict / research /
+                    # closing-act out of this dict and would otherwise act on whichever copy
+                    # happened to come last, with nothing reporting that a second one existed.
+                    if key in item.fields:
+                        item.duplicate_fields.append((key, j + 1, item.fields[key], value))
+                    item.fields[key] = value
                 j += 1
                 continue
             break
@@ -165,6 +257,18 @@ def scan(
             )
         else:
             seen[it.num] = (label, it.line)
+
+        # THE CHECK ITSELF MUST REPORT IT, not merely the reader (#1338). This gate runs UNGATED
+        # on every pull request including docs-only ones, which is the change shape that
+        # introduces a duplicate; the pytest guard covers the same ground but rides a lane that a
+        # curated allowlist could silently drop it from.
+        for key, dup_line, displaced, kept in it.duplicate_fields:
+            errors.append(
+                f"{label}:{dup_line}: item #{it.num} declares '{key}' twice — {displaced!r} is "
+                f"overwritten by {kept!r}. A duplicate moves NO count, so the item and open "
+                f"totals every seat checks after a ledger edit report success over it, and "
+                f"dispatch_gate.py then acts on whichever copy happened to come last."
+            )
 
         if not it.closed and not it.open:
             errors.append(
@@ -257,6 +361,25 @@ def main(argv: list[str] | None = None) -> int:
             print(f"ERROR: --backlog {p} does not exist", file=sys.stderr)
         return 1
 
+    # BACKLOG #1259: surface the conflict refusal as a REPORT, not a traceback, and NAME THE FILE.
+    #
+    # `parse_items` already refuses a source carrying conflict markers, and that refusal is what makes
+    # this file safe to read. But it raises from inside `scan`, so every caller -- the CI leg and now
+    # the pre-commit hook -- rendered it as an uncaught ValueError. Two costs, and the second is the
+    # one that matters: a traceback reads as *the checker is broken* rather than *your ledger is
+    # conflicted*, which sends an author to the wrong file; and the exception carries a LINE number
+    # but no PATH, so with several sources scanned it does not say which one to open.
+    #
+    # Parsing each source here also removes a real double-parse -- the count and the scanned-list
+    # below each called `parse_items` again on every source.
+    parsed: list[tuple[str, int]] = []
+    for label, text in sources:
+        try:
+            parsed.append((label, len(parse_items(text))))
+        except ValueError as exc:
+            print(f"ERROR: {label}: {exc}", file=sys.stderr)
+            return 1
+
     changelog = args.changelog.read_text(encoding="utf-8") if args.changelog else None
     errors, warnings = scan(sources, changelog)
 
@@ -265,8 +388,8 @@ def main(argv: list[str] | None = None) -> int:
     for e in errors:
         print(f"ERROR: {e}", file=sys.stderr)
 
-    n = sum(len(parse_items(text)) for _, text in sources)
-    scanned = ", ".join(f"{label} ({len(parse_items(text))})" for label, text in sources)
+    n = sum(count for _, count in parsed)
+    scanned = ", ".join(f"{label} ({count})" for label, count in parsed)
 
     if args.min_items is not None and n < args.min_items:
         # Printed to stderr *with the file list*, because "which files did you actually read" is the

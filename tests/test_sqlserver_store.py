@@ -496,6 +496,71 @@ async def test_mark_session_reauthed_reanchors_client(store) -> None:
     await store.delete_user("u2")
 
 
+async def test_set_password_claim_stamp_round_trip(store) -> None:
+    """BACKLOG #1245 ``users.password_claimed_at`` on the real SQL Server backend.
+
+    ``password_claim_set`` is shared by all three backends, so the SQL TEXT of the claim term is
+    single-sourced — but the ARGUMENT BINDING around it is hand-written per backend and nothing
+    else on this leg executes ``set_password`` at all. This backend is the sharp one: the claim
+    value is spliced POSITIONALLY into the MIDDLE of a ``?`` list, between the
+    ``must_change_password`` bind and the ``updated_at`` bind. An arity mismatch between the term
+    and its argument shifts every later bind by one, which would write the claim timestamp into a
+    neighbouring column (or the user id into a FLOAT one) rather than failing outright.
+
+    Every assertion below compares against the EXACT timestamp passed, never merely ``is not
+    None``: a shifted bind that landed the ``must_change_password`` flag in the column would still
+    read as non-NULL and pass a presence check. The neighbouring columns the term sits between
+    (``password_changed_at``, ``updated_at``, ``failed_attempts``) are asserted for the same reason.
+    """
+    await store.create_user(
+        user_id="u3",
+        username="carol",
+        auth_provider="local",
+        display_name=None,
+        email=None,
+        password_hash="h0",
+        now=1_000.0,
+    )
+    # Precondition: the INSERT does not list the column, so a stamp seen later came from set_password.
+    seeded = await store.get_user("u3")
+    assert seeded is not None and seeded.password_claimed_at is None
+    # A non-zero lock state, so the statement's own `failed_attempts=0, locked_until=NULL` reset is a
+    # positive control that the UPDATE actually executed rather than silently matching zero rows.
+    await store.record_login_failure("u3", failed_attempts=3, locked_until=5_000.0, now=1_500.0)
+
+    # must_change_password False = a credential the holder chose, so this call records the claim. This
+    # is the arity that carries the EXTRA positional argument in the middle of the list.
+    await store.set_password("u3", password_hash="h1", must_change_password=False, now=2_000.0)
+    claimed = await store.get_user("u3")
+    assert claimed is not None
+    assert claimed.password_claimed_at == 2_000.0
+    assert claimed.password_hash == "h1"
+    assert claimed.password_changed_at == 2_000.0
+    assert claimed.updated_at == 2_000.0
+    assert claimed.must_change_password is False
+    assert claimed.failed_attempts == 0 and claimed.locked_until is None
+
+    # Second rotation: COALESCE makes the claim write-once, so the stamp must NOT move. The other two
+    # timestamps moving to 3000.0 is what makes that a real assertion — it proves this UPDATE ran.
+    await store.set_password("u3", password_hash="h2", must_change_password=False, now=3_000.0)
+    rotated = await store.get_user("u3")
+    assert rotated is not None
+    assert rotated.password_claimed_at == 2_000.0
+    assert rotated.password_changed_at == 3_000.0 and rotated.updated_at == 3_000.0
+
+    # must_change_password True (an admin reset) takes the OTHER arity — an empty claim term and an
+    # empty claim_args tuple, so the column is absent from the SET list and the statement can neither
+    # stamp nor clear it. Both arities are hand-bound; neither was executed on this leg before this test.
+    await store.set_password("u3", password_hash="h3", must_change_password=True, now=4_000.0)
+    reset = await store.get_user("u3")
+    assert reset is not None
+    assert reset.password_claimed_at == 2_000.0  # an admin reset leaves the claim alone
+    assert reset.must_change_password is True
+    assert reset.password_changed_at == 4_000.0 and reset.updated_at == 4_000.0
+
+    await store.delete_user("u3")
+
+
 # --- staged pipeline (ADR 0001) — ingress -> routed -> outbound on real SQL Server -------------
 # These exercise the concurrency-correct paths the faked-driver tests can't (DELETE...OUTPUT claim
 # idempotency, the sp_getapplock finalize serialization, RCSI) against the live container.
@@ -867,10 +932,10 @@ async def test_purge_search_presets_ss(store) -> None:
     """
     try:
         await store.upsert_search_preset(
-            preset_id="ss-stale", owner="alice", name="stale", criteria="{}", now=0.0
+            preset_id="ss-stale", owner_user_id="alice", name="stale", criteria="{}", now=0.0
         )
         await store.upsert_search_preset(
-            preset_id="ss-fresh", owner="alice", name="fresh", criteria="{}", now=40 * DAY
+            preset_id="ss-fresh", owner_user_id="alice", name="fresh", criteria="{}", now=40 * DAY
         )
 
         assert await store.purge_search_presets(older_than=30 * DAY) == 1
@@ -893,10 +958,12 @@ async def test_search_preset_retention_keys_on_last_used_ss(store) -> None:
     try:
         for pid, name in (("ss-used", "used"), ("ss-idle", "idle"), ("ss-legacy", "legacy")):
             await store.upsert_search_preset(
-                preset_id=pid, owner="alice", name=name, criteria="{}", now=0.0
+                preset_id=pid, owner_user_id="alice", name=name, criteria="{}", now=0.0
             )
         # The recall stamps last_used_at past the cutoff...
-        got = await store.get_search_preset(preset_id="ss-used", owner="alice", now=40 * DAY)
+        got = await store.get_search_preset(
+            preset_id="ss-used", owner_user_id="alice", now=40 * DAY
+        )
         assert got is not None and got["last_used_at"] is None  # PRE-stamp snapshot
         row = await store._fetchone("SELECT last_used_at FROM search_presets WHERE id='ss-used'")
         assert row is not None and row["last_used_at"] == 40 * DAY
@@ -3367,7 +3434,7 @@ async def test_summary_access_census_survives_and_coalesces_ss(store) -> None:
     await c.note(store, "alice", "ch1", 1, 3600.0)  # hour 1 -> flush hour-0 window (count 5)
     rows = [r for r in await store.list_audit() if r["action"] == "summary_access"]
     assert len(rows) == 1
-    assert json.loads(rows[0]["detail"]) == {"count": 5, "window_start": 0}
+    assert json.loads(rows[0]["detail"]) == {"count": 5, "masked": 0, "window_start": 0}
     assert rows[0]["actor"] == "alice" and rows[0]["channel_id"] == "ch1"
 
     await c.note(store, "bob", "", 4, 3600.0)  # hour 1, scope "" -> channel_id NULL (NVARCHAR NULL)

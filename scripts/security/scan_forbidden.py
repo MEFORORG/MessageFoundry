@@ -97,7 +97,75 @@ _ALLOWED_IP = re.compile(
 # scripts/worktree/new.ps1 hands -Branch to `git worktree add -b` after validating it with
 # `git check-ref-format` (which permits mixed case), and -Name reaches the worktree DIRECTORY verbatim.
 # So an upper-cased slug is reachable -- and unlike _HOME_PATH no common URL shape collides here.
-_WORKTREE_SLUG = re.compile(r"(?i:(?:claude/|worktrees/)[a-z0-9]+(?:-[a-z0-9]+)*-[0-9a-f]{6})")
+#
+# The shape, assembled from ONE word atom so the two arms below cannot drift into different
+# definitions of "slug". A second spelling of the shape is a second thing to keep in step, and the
+# arms disagreeing about what a slug is would be invisible.
+_SLUG_WORD = r"[a-z0-9]+"
+_SLUG_HEAD = rf"{_SLUG_WORD}(?:-{_SLUG_WORD})*"  # one or more words -- whatever the task was called
+_SLUG_HEAD_MULTI = rf"{_SLUG_WORD}(?:-{_SLUG_WORD})+"  # two or more; see the bare arm for why
+_SLUG_HEX = r"[0-9a-f]{6}"  # the suffix the tooling appends
+
+# ARM 1 -- the path-prefixed form. The prefix IS the evidence, so this arm needs no other context and
+# fires anywhere in a line. Unchanged behaviour: it is the detector that has always shipped.
+_WORKTREE_SLUG_PATH = re.compile(rf"(?i:(?:claude/|worktrees/){_SLUG_HEAD}-{_SLUG_HEX})")
+
+# ARM 2 -- the BARE form (BACKLOG #1083). The prefix used to be MANDATORY, so the identical slug
+# written in prose matched the shape and not the pattern and shipped; one instance sat on `origin`
+# for two days while the guard passed every commit.
+#
+# Making the prefix merely optional is the wrong fix, and this is MEASURED, not feared: over the 1968
+# tracked non-binary files at b3bc8026 an ungated bare shape matched 116 lines, nearly all of them
+# ordinary prose -- hyphenated words whose tail is six letters that are also six hex digits, dotted
+# namespaces ending in a six-digit year-month, and the short blob ids this repo writes constantly. A
+# guard that fires on healthy content gets allowlisted into uselessness, which is worse than the leak
+# it misses. So the bare arm narrows by CONTEXT rather than by shape: the slug must either BE a
+# backticked token, or follow a lead-in word that says an identifier is coming. Same corpus, same
+# run: 5 lines, all five genuine bare slugs, zero false positives.
+#
+# The lead-in set is closed and deliberately short. Adding a word widens the gate everywhere; it is
+# cheaper to be missed here than to be switched off.
+_SLUG_LEAD_IN = r"\b(?:session|worktree|branch|lane|slug|agent|seat)(?:es|s)?\b"
+
+# Hand-written stand-in hex. Prose ABOUT this detector -- the backlog items that describe it, the
+# fixtures in its own test suite -- spells the suffix as an obvious placeholder, and a guard that
+# refuses its own documentation is exactly the pressure that gets a guard allowlisted off. The same
+# judgement (and the same closed-list shape) as _HOME_PATH's `me`/`svc`/`you` exemption below.
+# SCOPED TO THIS ARM ON PURPOSE: arm 1 has the prefix as its evidence and must keep firing on a
+# prefixed stand-in, which is how both of its casing fixtures are written.
+_SLUG_PLACEHOLDER_HEX = r"(?:a1b2c3|abc123|abcdef|123456|000000)"
+
+# TWO words minimum, where arm 1 accepts one, and the asymmetry was measured the hard way. Over the
+# tracked corpus a one-word bare head cost nothing -- a NULL produced by luck rather than by a
+# mechanism, since no such token happened to be backticked anywhere in the tree. The missing positive
+# control arrived from writing this comment block: an earlier draft named three of the colliding
+# tokens in backticks, and the detector fired on the paragraph describing it. They were reworded to
+# the prose form used above, which is why no example here is spelled out. A one-word head plus a
+# six-letter tail is a hyphenated English word; the generated slugs this guard exists for are
+# adjective-noun-hex. The cost is a real and accepted gap: a genuine one-word bare slug is missed
+# unless it carries a path prefix.
+#
+# The TRAILING guard is load-bearing in a way the prefixed arm's is not: `[0-9a-f]{6}` would
+# otherwise match the first six characters of a longer hex run, so a full-length blob id after a
+# lead-in word (`branch foo-bar-1234567890ab`) would read as a slug. There is deliberately no LEADING
+# guard: a symmetric one was written and then measured out. It suppressed a real detection
+# (`session -quiet-harbour-<hex>`, where the separator is a hyphen) and, over the same 1968-file
+# corpus, changed the hit set by nothing in either direction -- the mid-slug start it was meant to
+# prevent still reports the same LINE, which is the granularity this scanner reports at.
+_SLUG_BARE = (
+    rf"{_SLUG_HEAD_MULTI}-(?!{_SLUG_PLACEHOLDER_HEX}(?![A-Za-z0-9-]))"
+    rf"{_SLUG_HEX}(?![A-Za-z0-9-])"
+)
+_WORKTREE_SLUG_BARE = re.compile(
+    rf"(?i:`{_SLUG_BARE}`|{_SLUG_LEAD_IN}[^A-Za-z0-9]{{1,12}}{_SLUG_BARE})"
+)
+
+#: Both arms, reported as ONE finding per line. `worktrees/` is itself a lead-in word, so a prefixed
+#: path satisfies both; double-reporting one line adds noise rather than information.
+_WORKTREE_SLUG_DETECTORS: tuple[re.Pattern[str], ...] = (
+    _WORKTREE_SLUG_PATH,
+    _WORKTREE_SLUG_BARE,
+)
 # An absolute user-home path carries the OS account name, and inside a worktree path the slug as well.
 # Exempt: bracket/env placeholders (<you>, $HOME, %USERPROFILE%, {home}), the well-known shared and CI
 # accounts, and the DOCUMENTATION placeholder names this repo already uses in examples (me, svc, you,
@@ -727,7 +795,7 @@ _ALLOWLIST_CANARIES: tuple[str, ...] = (
 
 
 #: Identifier separators neutralised before the second name-pattern pass. Only ``_`` today: it is
-#: the one separator that is also a WORD character, so it is the only one that defeats . Kept as
+#: the one separator that is also a WORD character, so it is the only one that defeats `\b`. Kept as
 #: a pattern (not str.replace) so a future separator is a one-character edit.
 _IDENT_SEP = re.compile(r"_")
 
@@ -909,7 +977,7 @@ def scan_file(path: Path, rel_posix: str | None = None, *, show_context: bool = 
                     hits.append(f"{posix}:{lineno}: routable IP address{value}{ctx}")
         # Internal-environment disclosure. Reason-only, never the value: the slug or account name IS
         # the disclosure, so echoing it into a public CI log would publish what the hit is reporting.
-        if _WORKTREE_SLUG.search(line):
+        if any(p.search(line) for p in _WORKTREE_SLUG_DETECTORS):
             hits.append(f"{posix}:{lineno}: worktree/branch slug (internal project name)")
         if _HOME_PATH.search(line):
             hits.append(f"{posix}:{lineno}: absolute user-home path (OS account name)")

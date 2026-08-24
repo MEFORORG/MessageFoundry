@@ -221,20 +221,41 @@ async def test_a_recreated_username_does_not_inherit_the_departed_operators_pres
             p["name"] for p in (await c.get("/search/presets", headers=h)).json()["presets"]
         ] == ["mine"]
 
-        # alice leaves. Her preset row survives the account -- that is the enabling half.
+        # alice leaves.
         alice = await service.store.get_user_by_username("alice")
         assert alice is not None
+        # Capture the row FIRST. BACKLOG #1233 makes delete_user purge it, and this test needs it
+        # back afterwards -- see the two-controls note below.
+        raw = await engine.store._db.execute(
+            "SELECT * FROM search_presets WHERE owner_user_id=?", (alice.id,)
+        )
+        captured = [dict(r) for r in await raw.fetchall()]
+        assert captured, "precondition: alice's preset exists before she is deleted"
+
         await service.store.delete_user(alice.id)
-        # Key-AGNOSTIC on purpose: the point of the precondition is that the ROW outlives the
-        # account, whichever column value it was written under. Asserting it by user_id would make a
-        # username-keyed build fail HERE, masking the substantive assertion below -- the test would
-        # go red for the wrong reason and prove nothing about who can read the preset.
-        survived = await engine.store.list_search_presets(
-            alice.id
-        ) or await engine.store.list_search_presets("alice")
-        assert survived, (
-            "precondition: delete_user does not purge preset rows, which is why the KEY has to be "
-            "the one thing that cannot be reissued"
+
+        # BACKLOG #1233: delete_user now PURGES preset rows. This assertion replaces a precondition
+        # that asserted the exact opposite -- "delete_user does not purge preset rows" -- which was
+        # true when written and is the defect #1233 fixes. Retraction recorded rather than the old
+        # line quietly deleted.
+        assert not await engine.store.list_search_presets(alice.id)
+        assert not await engine.store.list_search_presets("alice")
+
+        # TWO INDEPENDENT CONTROLS, AND #1233 WOULD OTHERWISE RETIRE THE OTHER ONE'S ONLY TEST.
+        # #1233 purges the row; #1225 keys it to an id that cannot be reissued. With the row purged,
+        # the assertions below would pass TRIVIALLY -- nothing to inherit -- and would stop being
+        # evidence about the KEY at all. So the captured row is put back, which is not artificial:
+        # it is exactly the state of a database upgraded from before #1233, where orphan rows already
+        # exist and only the key protects them.
+        for row in captured:
+            cols = ", ".join(row)
+            marks = ", ".join("?" for _ in row)
+            await engine.store._db.execute(
+                f"INSERT INTO search_presets ({cols}) VALUES ({marks})", tuple(row.values())
+            )
+        await engine.store._db.commit()
+        assert await engine.store.list_search_presets(alice.id), (
+            "the orphan row is restored, so what follows tests the KEY and not the purge"
         )
 
         # A NEW person is given the freed username.

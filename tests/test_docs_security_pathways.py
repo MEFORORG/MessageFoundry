@@ -171,10 +171,14 @@ def test_row_count_tracks_the_login_entry_points_in_code() -> None:
         if name.startswith("_login")
         and "LoginOutcome" in str(inspect.signature(member).return_annotation)
     }
-    assert private == {"_login_local", "_login_ad"}, (
-        f"the private login coroutines changed: {sorted(private ^ {'_login_local', '_login_ad'})}. A "
-        "new `_login_*` returning a LoginOutcome is a new authentication pathway and needs a "
-        "comparative-strength row in docs/SECURITY.md (ASVS 6.1.3)."
+    # `_login_ad` was DELETED, not renamed: the AD password sign-in is retired (BACKLOG #1137), so
+    # `login()` dispatches into exactly one private leg. Shrinking this set is the deliberate update
+    # the retirement owed the guard -- the guard itself is unweakened, because it still fails on any
+    # `_login_*` appearing, which is the direction that ships an undocumented pathway.
+    assert private == {"_login_local"}, (
+        f"the private login coroutines changed: {sorted(private ^ {'_login_local'})}. A new `_login_*` "
+        "returning a LoginOutcome is a new authentication pathway and needs a comparative-strength row "
+        "in docs/SECURITY.md (ASVS 6.1.3)."
     )
 
 
@@ -218,7 +222,12 @@ def test_companion_table_covers_the_remaining_strength_dimensions() -> None:
             True,
             "`[auth].oidc_require_mfa_claim` defaults **on**",
         ),
-        (AuthSettings, "require_mfa", True, "`[auth].require_mfa` defaults **on**"),
+        # The MODEL field stays `AuthSettings.require_mfa` (the internal desugared field), but the
+        # OPERATOR-FACING key is `[security].require_mfa`: `("auth", "require_mfa")` is in
+        # `_RELOCATED_TO_SECURITY`, so the `[auth]` spelling raises at load and `serve` exits 2. The
+        # rendered token has to quote the key an operator can actually set, or this guard pins the
+        # documentation to a config that cannot start.
+        (AuthSettings, "require_mfa", True, "`[security].require_mfa` defaults **on**"),
         (
             AuthSettings,
             "ad_session_recheck_seconds",
@@ -409,15 +418,20 @@ def test_local_row_scopes_the_second_factor_to_step_up_and_administrator() -> No
         )
 
 
-def test_ad_rows_disclose_the_unconditional_mfa_satisfied_grant() -> None:
-    """AD is the dominant pathway in the scored posture, so its MFA truth belongs in the TABLE.
+def test_the_delegated_row_discloses_the_unconditional_mfa_satisfied_grant() -> None:
+    """The delegated directory pathway is the dominant one in the scored posture, so its MFA truth
+    belongs in the TABLE.
 
     Since ASVS 6.3.4 the grant is a per-mechanism ARGUMENT rather than a literal inside
-    ``_complete_ad_login``, so this is pinned at the call sites: the AD simple-bind leg still passes a
-    hard ``True`` (the owner-signed delegated relaxation — an AD password clears every engine MFA gate
-    with zero engine-verified evidence, which is what the AD rows must disclose), while the federated
-    leg must NOT, because its grant is derived from ``oidc_require_mfa_claim``. Asserting both halves
-    keeps the two legs from silently converging in either direction.
+    ``_complete_ad_login``, so this is pinned at the call sites: the delegated leg still passes a hard
+    ``True`` (the owner-signed relaxation — a directory sign-in clears every engine MFA gate with zero
+    engine-verified evidence, which is what its row must disclose), while the federated leg must NOT,
+    because its grant is derived from ``oidc_require_mfa_claim``. Asserting both halves keeps the two
+    legs from silently converging in either direction.
+
+    RETIREMENT NOTE (BACKLOG #1137): the hard ``True`` used to be read off ``_login_ad``. That leg is
+    gone, so the assertion follows the FACT to the caller that still makes the grant — Kerberos —
+    rather than being dropped. The disclosure did not change; only which pathway carries it did.
     """
 
     def _mfa_grant(func: object) -> list[ast.expr]:
@@ -430,32 +444,32 @@ def test_ad_rows_disclose_the_unconditional_mfa_satisfied_grant() -> None:
             if kw.arg == "mfa_verified"
         ]
 
-    bind_grant = _mfa_grant(AuthService._login_ad)
+    bind_grant = _mfa_grant(AuthService.authenticate_kerberos)
     assert bind_grant and all(
         isinstance(v, ast.Constant) and v.value is True for v in bind_grant
     ), (
-        "the AD simple-bind leg no longer mints sessions mfa_verified=True under the signed "
-        "relaxation; the AD rows' disclosure is stale — re-derive it."
+        "the Kerberos leg no longer mints sessions mfa_verified=True under the signed relaxation; the "
+        "Kerberos rows' disclosure is stale — re-derive it."
     )
     oidc_grant = _mfa_grant(AuthService.authenticate_oidc)
     assert oidc_grant and not any(isinstance(v, ast.Constant) for v in oidc_grant), (
         "the OIDC leg passes a CONSTANT mfa_verified; 6.3.4 requires it to be derived from "
         "[auth].oidc_require_mfa_claim, and the OIDC row claims the engine verifies it."
     )
-    factor = next(r for r in _primary_table()[1:] if r[0].startswith("**AD**"))[1]
+    factor = next(r for r in _primary_table()[1:] if r[0].startswith("**Kerberos"))[1]
     for token in ("MFA-satisfied", "unverifiable"):
         assert token in factor, (
-            f"the AD Factor cell must state {token!r}: the engine grants MFA satisfaction with no "
-            "evidence, which is a comparative-strength fact, not a footnote."
+            f"the Kerberos Factor cell must state {token!r}: the engine grants MFA satisfaction with "
+            "no evidence, which is a comparative-strength fact, not a footnote."
         )
     companion = next(
         t for t in _tables(_section()) if t[0][:2] == ["Pathway", "Phishing resistance"]
     )
     mfa_col = companion[0].index("MFA support")
-    ad_mfa = next(r for r in companion[1:] if r[0].startswith("**AD**"))[mfa_col]
-    assert "unverifiable" in ad_mfa, (
-        "the companion AD row reads as an enforcement claim ('delegated to the directory'); it must "
-        "say the grant is unconditional and unverifiable at the engine."
+    kerb_mfa = next(r for r in companion[1:] if r[0].startswith("**Kerberos"))[mfa_col]
+    assert "unverifiable" in kerb_mfa, (
+        "the companion Kerberos row reads as an enforcement claim ('delegated to the directory'); it "
+        "must say the grant is unconditional and unverifiable at the engine."
     )
     block = _section()
     marker = "ASVS 6.1.3"

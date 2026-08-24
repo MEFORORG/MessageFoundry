@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Organization and contributors
 """Tests for rule 3b of the worktree gate: hijacking a LINKED WORKTREE onto an existing branch.
 
 Rule 3 protects only the shared PRIMARY. Rule 3b protects every OTHER governed worktree from the one
@@ -457,3 +459,101 @@ def test_a_worktree_of_an_UNGOVERNED_repo_is_untouched(tmp_path: Path) -> None:
     repos = tmp_path / "repos.txt"
     repos.write_text(f"{tmp_path / 'SomethingGoverned'}\n", encoding="utf-8")  # NOT the alien repo
     assert run_gate(shell("git checkout some-branch", cwd=wt), repos) is None
+
+
+# ------------------------------------------- a quoted path must not SHADOW the verb rule 3b judges
+#
+# BACKLOG #1229 residual, fourth round. Rule 3 records the FIRST verb-bearing segment it sees and
+# revises that record only when a later segment resolves a GOVERNED target. Inside a linked worktree no
+# segment ever does, so whatever line one carries is what rule 3b is handed -- so any line that LOOKS
+# like a git command carrying a gated verb eats the hijack behind it.
+#
+# WHAT THIS GUARDS IS THE CASE-SENSITIVITY OF THE EMIT IN Remove-QuotedSpans, and that is why it lives
+# here rather than beside the false-deny rows in tests/test_worktree_gate_escaped_quote.py. A
+# case-INSENSITIVE emit -- tried, and reverted on 2026-08-21 -- gave `cp -r "/c/backups/Git" switch` a
+# git token, and a real `git switch <free branch>` in somebody else's worktree then came back ALLOW.
+# So the case rule is not only a false-deny question: relaxing it opens a fail-OPEN on rule 3b.
+
+
+@pytest.mark.parametrize(
+    "leaf",
+    [
+        "Git",  # the Title-cased spelling a case-insensitive emit would have kept
+        "Git.exe",  # and the `.exe` spelling, which a fix that special-cased `.exe` would still leak
+    ],
+)
+@pytest.mark.parametrize(
+    "shadow_verb",
+    [
+        "switch",  # the same verb as the hijack below
+        "clean",  # any gated verb captures the record -- it need not be a hijack verb
+    ],
+)
+def test_a_quoted_git_path_on_an_earlier_line_does_not_shadow_a_hijack(
+    repo: SimpleNamespace, leaf: str, shadow_verb: str
+) -> None:
+    """MEASURED main=DENY, case-insensitive-emit=ALLOW, this build=DENY, over the real hook.
+
+    The two parametrised axes are not thoroughness. ``leaf`` separates a fix that governs every
+    spelling from one that special-cases ``.exe`` -- the latter closes the first row and leaves the
+    second ALLOWing, which is exactly the shape a reader would call fixed. ``shadow_verb`` proves the
+    capture is of the RECORD and not of a matching verb pair.
+    """
+    command = f'cp -r "/c/backups/{leaf}" {shadow_verb}\ngit switch {repo.other}'
+    reason = assert_denied(run_gate(shell(command, cwd=repo.wt), repo.repos))
+    assert "LINKED WORKTREE" in reason, (
+        "the deny must be rule 3b judging the hijack on line two, not some other rule objecting to "
+        f"line one -- otherwise this test would stay green over the shadow. Reason was: {reason}"
+    )
+
+
+def test_the_shadow_probe_is_discriminating(repo: SimpleNamespace) -> None:
+    """CONTROLS for the test above, and it needs three of them.
+
+    Without these the shadow rows would pass against a gate that denied any two-line command, any
+    command mentioning a directory called Git, or the hijack line on its own regardless of context.
+    """
+    # ONE: the hijack alone denies, so the ALLOW the shadow produced came from the ADDED line.
+    assert_denied(run_gate(shell(f"git switch {repo.other}", cwd=repo.wt), repo.repos))
+    # TWO: a leaf that does not end in a git token never emitted one, so it never shadowed -- and this
+    # row denies under a case-INSENSITIVE emit too. It separates "the emit" from "an extra line".
+    assert_denied(
+        run_gate(
+            shell(f'cp -r "/c/backups/GitHub" switch\ngit switch {repo.other}', cwd=repo.wt),
+            repo.repos,
+        )
+    )
+    # THREE: the line that used to shadow must not now deny ON ITS OWN. If it did, the rows above
+    # would be green for the wrong reason -- a false deny standing in for a repaired fail-open.
+    assert run_gate(shell('cp -r "/c/backups/Git" switch', cwd=repo.wt), repo.repos) is None
+
+
+def test_a_SAME_LINE_semicolon_compound_still_shadows_and_is_NOT_fixed_here(
+    repo: SimpleNamespace,
+) -> None:
+    """A KNOWN OPEN RESIDUAL, asserted as ALLOW, and NOT an endorsement -- read before acting on it.
+
+    ``Get-ScannableSegments`` splits on NEWLINES only, so a ``;`` compound is ONE segment, and
+    ``Test-WorktreeHijack`` strips a segment up to its FIRST gated verb. So the shadow survives on one
+    line, with or without any quoted path::
+
+        cp -r "/c/backups/Git" switch ; git switch <free branch>     ALLOW
+        git -C <ungoverned> clean -fd  NEWLINE  git switch <branch>  ALLOW  (no quoting at all)
+
+    Both ALLOW on origin/main as well, so neither is introduced by anything in the emit and neither is
+    closed by it. This row exists because a shadow test written on ONE LINE would pass vacuously --
+    it would be measuring the segment splitter, not the emit -- and the next person to write one needs
+    to see that stated rather than rediscover it.
+
+    WHEN THIS TEST REDS, somebody fixed rule 3b's first-verb capture. Delete the row; do not restore
+    the ALLOW.
+    """
+    same_line = f'cp -r "/c/backups/Git" switch ; git switch {repo.other}'
+    assert run_gate(shell(same_line, cwd=repo.wt), repo.repos) is None, (
+        "the same-line shadow now DENIES. If you fixed rule 3b's first-verb capture deliberately, "
+        "that is the intended outcome -- delete this test. Do NOT restore the ALLOW."
+    )
+    # The quoting-free twin, which proves the residual is the SEGMENT SPLIT and the first-verb capture
+    # rather than anything Remove-QuotedSpans does.
+    unquoted = f"git -C {repo.primary.parent} clean -fd\ngit switch {repo.other}"
+    assert run_gate(shell(unquoted, cwd=repo.wt), repo.repos) is None

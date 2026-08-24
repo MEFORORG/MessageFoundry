@@ -136,7 +136,8 @@ for your own risk posture and for any ASVS-scoped review.
 **On MFA specifically.** Your **directory (AD / Entra) is the identity provider** and enforces MFA per
 your policy — which healthcare organizations are now **required** to do — so MEFOR does not re-implement
 it. One accuracy point for a security reviewer: a back-channel **LDAP simple-bind validates the password
-but does not itself prompt the second factor**, so MFA applies through **Kerberos / Windows SSO** (the
+but does not itself prompt the second factor**, which is why MEFOR **retired that sign-in outright**
+(BACKLOG #1137) rather than documenting around it. MFA applies through **Kerberos / Windows SSO** (the
 workstation logon was already MFA'd), your **Conditional Access on a federated-SSO front**, or an
 **MFA-terminating reverse proxy**. Local accounts now have a **native second factor** — RFC 6238 TOTP
 (`[security].require_mfa`, WP-14) — **on by default for every local account**, so leave it on; AD / SSO

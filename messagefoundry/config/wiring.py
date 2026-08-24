@@ -515,8 +515,12 @@ def FhirLookup(
     cleartext_reason: str | None = None,
 ) -> FhirLookupSpec:
     """Declare a named live-lookup FHIR connection (ADR 0043). A Handler reads it at run time with
-    ``fhir_lookup(name, query)`` — a **read-only** read-by-id (``"Patient/123"``) or search
-    (``"Patient?identifier=MRN|123"``); the parsed resource / searchset ``Bundle`` comes back as a dict.
+    ``fhir_lookup(name, query, params)`` — a **read-only** read-by-id (``fhir_lookup(name,
+    "Patient/123")``) or a search whose path is ``query`` and whose fields are the structured ``params``
+    mapping (``fhir_lookup(name, "Patient", {"identifier": "MRN|123"})``). ``params`` is the **only**
+    search form — each value is percent-encoded by the engine, so a value cannot inject an extra search
+    parameter, and a ``?``-query inside ``query`` is refused (BACKLOG #1243). The parsed resource /
+    searchset ``Bundle`` comes back as a dict.
     Side-effecting (it self-registers), like :func:`Reference` / :func:`inbound`, **and** returns the spec
     so SMART auth can be composed onto it::
 
@@ -590,7 +594,19 @@ def resolve_env_settings(settings: Mapping[str, Any], values: Mapping[str, Any])
                     try:
                         resolved[name] = value.cast(raw)
                     except (ValueError, TypeError) as exc:
-                        bad.append(f"setting {name!r} (env {value.key!r}={raw!r}): {exc}")
+                        # NEVER the raw value: a MEFOR_VALUE_* env() setting carries store passwords
+                        # and connector keys, and this string is raised at startup into the operator
+                        # log, the support bundle and GET /logs/tail (BACKLOG #1183). The value used to
+                        # appear TWICE here -- once from this f-string and once inside the cast's own
+                        # ValueError text ("invalid literal for int() with base 10: '<value>'") -- so
+                        # dropping only the f-string half would still have leaked it. Name the setting,
+                        # the key and the expected TYPE, which is the whole diagnostic an operator
+                        # needs to go fix the value they already hold.
+                        want = getattr(value.cast, "__name__", None) or type(value.cast).__name__
+                        bad.append(
+                            f"setting {name!r} (env {value.key!r}): value is not a valid {want} "
+                            f"({type(exc).__name__}; value withheld)"
+                        )
             elif value.default is not _UNSET:
                 resolved[name] = value.default
             else:
@@ -1014,6 +1030,16 @@ def MLLP(
     max_connections: int | None = 256,  # cap concurrent clients (connection-flood guard)
     receive_timeout: float | None = 60.0,  # close a client idle this many seconds (slowloris)
     max_frame_bytes: int | None = 16 * 1024 * 1024,  # cap one frame's bytes (OOM guard); both dirs
+    # INBOUND message-RATE pacing (BACKLOG #1249). Unlike the caps above these default to OFF, and
+    # that is ruled rather than accidental: a rate on a clinical interface is only safe at a number
+    # taken from a real feed profile. The connector has read both keys since the pacer was built --
+    # until now no factory parameter and no connections.toml key could populate them, so the setting
+    # existed and could not be reached. Over budget the listener PAUSES READING so TCP back-pressures
+    # the sender: nothing is dropped, refused, NAK'd or reordered, which the count-and-log invariant
+    # requires (a discarding limiter was never an option here).
+    max_messages_per_second: float | None = None,  # None/0 = no rate bound (the shipped default)
+    message_burst: float
+    | None = None,  # allowance over the sustained rate; None = one second's worth
     connect_timeout: float = 10.0,  # outbound: TCP connect timeout (seconds)
     timeout_seconds: float = 30.0,  # outbound: wait this long for the ACK
     no_ack: bool = False,  # OUTBOUND (MLLP-only): fire-and-forward — skip the ACK read, deliver on the TCP write (at-most-once-confirmation; ADR 0124). Incompatible with capture_response/reingress_to.
@@ -1042,6 +1068,8 @@ def MLLP(
     | None = None,  # passphrase for an ENCRYPTED tls_key_file (put the secret in env())
     tls_ca_file: str
     | None = None,  # trust anchor — inbound: verify client certs (mTLS); outbound: verify server
+    tls_crl_file: str
+    | None = None,  # INBOUND: opt-in CRL for mTLS client certs (#1005) — CA bundle + CRL, PEM
     tls_verify: bool = True,  # OUTBOUND: verify the server cert (false is MITM-able → needs MEFOR_ALLOW_INSECURE_TLS)
     tls_check_hostname: bool = True,  # OUTBOUND: require the server cert to match `host`
     tls_allow_expired: bool = False,  # OUTBOUND: honour an EXPIRED server cert (chain+hostname still verified; #129)
@@ -1138,6 +1166,8 @@ def MLLP(
             "max_connections": max_connections,
             "receive_timeout": receive_timeout,
             "max_frame_bytes": max_frame_bytes,
+            "max_messages_per_second": max_messages_per_second,
+            "message_burst": message_burst,
             "connect_timeout": connect_timeout,
             "timeout_seconds": timeout_seconds,
             "no_ack": no_ack,
@@ -1155,6 +1185,7 @@ def MLLP(
             "tls_key_file": tls_key_file,
             "tls_key_password": tls_key_password,
             "tls_ca_file": tls_ca_file,
+            "tls_crl_file": tls_crl_file,
             "tls_verify": tls_verify,
             "tls_check_hostname": tls_check_hostname,
             "tls_allow_expired": tls_allow_expired,
@@ -1322,6 +1353,8 @@ def Http(
     | EnvRef
     | None = None,  # passphrase for an ENCRYPTED tls_key_file (put the secret in env())
     tls_ca_file: str | None = None,  # trust anchor — opt-in mTLS (require + verify a client cert)
+    tls_crl_file: str
+    | None = None,  # opt-in CRL for mTLS client certs (#1005) — CA bundle + CRL, PEM
     # --- Intake authentication (ADR 0154 D6) — a PEER control on this connector, not admin RBAC ---
     intake_auth: Literal[
         "none", "api_key", "bearer", "mtls_subject"
@@ -1432,6 +1465,7 @@ def Http(
         "tls_key_file": tls_key_file,
         "tls_key_password": tls_key_password,
         "tls_ca_file": tls_ca_file,
+        "tls_crl_file": tls_crl_file,
         "intake_auth": intake_auth,
         "intake_api_key": intake_api_key,
         "intake_api_key_next": intake_api_key_next,
@@ -2164,6 +2198,9 @@ def DICOM(
     tls_ca_file: str
     | EnvRef
     | None = None,  # opt-in mTLS: require + verify a calling peer's client cert
+    tls_crl_file: str
+    | EnvRef
+    | None = None,  # opt-in CRL for mTLS client certs (#1005) — CA bundle + CRL, PEM
     tls_allow_expired: bool = False,  # OUTBOUND SCU: honour an EXPIRED PACS cert (chain+hostname still verified; #129)
     max_object_bytes: int | None = 128 * 1024 * 1024,  # per-C-STORE-object cap; over-cap → DIMSE
     # failure BEFORE the durable commit (the X12 max_interchange_bytes analog; OOM/DoS guard, §9)
@@ -2207,6 +2244,7 @@ def DICOM(
             "tls_key_file": tls_key_file,
             "tls_key_password": tls_key_password,
             "tls_ca_file": tls_ca_file,
+            "tls_crl_file": tls_crl_file,
             "tls_allow_expired": tls_allow_expired,
             "max_object_bytes": max_object_bytes,
             "max_associations": max_associations,

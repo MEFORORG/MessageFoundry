@@ -13,12 +13,25 @@ This is the first cut (build-order step 1 of docs/CONFIGURATION.md): ``[store]``
 synchronous), ``[api]`` (host/port), and ``[logging]`` (level + structured-JSON ``format`` + off-box
 ``forward_*`` syslog shipping — sec-offbox-log). ``[retention]`` is now enforced (the
 ``RetentionRunner``), except its ``audit_days`` key, which is reserved/keep-forever by design.
-Remaining planned keys (some server-DB ``[store]`` keys) are accepted-but-ignored for now so a
-forward-looking config file still loads.
+
+An unrecognized **key in the TOML file** is **refused** at load (:func:`_reject_unknown_file_keys`) — a
+silently-dropped key leaves the setting it was meant to apply un-applied, with nothing anywhere
+reporting a problem. An unknown top-level **section** is still tolerated.
+
+The refusal is scoped to the **file** on purpose, and the scope is load-bearing rather than an
+oversight: the **env** and **CLI** layers still drop an unrecognized key silently. Env cannot be
+checked the same way because roughly a dozen documented ``MEFOR_*`` variables are read straight from
+``os.environ`` by their consuming module and are not fields on any section (``MEFOR_STORE_VAULT_ADDR``,
+``MEFOR_TLS_REVOCATION_ATTESTED`` and siblings), so a field-membership test would refuse a
+correctly-configured deployment; CLI keys are engine-written, never operator-spelled. The one
+exception is ``[security]``, refused from env as well (the arm inside :func:`_desugar_security`).
+Anything stated to an operator about this refusal must carry that scope — see
+``docs/CONFIGURATION.md``.
 """
 
 from __future__ import annotations
 
+import difflib
 import ipaddress
 import logging
 import os
@@ -171,7 +184,16 @@ class SqlAuth(str, Enum):  # noqa: UP042
 
 
 class _Section(BaseModel):
-    # Ignore unknown keys so a forward-looking file (planned retention/delivery keys) still loads.
+    # extra="ignore" stays on the MODEL; unknown keys are refused by the LOADER instead
+    # (_reject_unknown_file_keys). A model-level extra="forbid" would refuse the engine's OWN writes:
+    # _env_overrides scrapes every MEFOR_<section>_<key> into its section dict, and a dozen documented
+    # variables are read straight from os.environ by their consuming module rather than being fields here
+    # (the Vault KMS/Transit and secret-provider credentials, MEFOR_TLS_REVOCATION_ATTESTED, the two
+    # phase-timing levers) — a Vault-backed store configured exactly as the shipped docs instruct would
+    # fail to start. Two further reasons the model is the wrong surface: pydantic's extra_forbidden error
+    # echoes the offending VALUE and the CLI prints the exception verbatim to a log file, so a mistyped
+    # SECRET key would disclose the secret; and `security show` validates SecuritySettings directly, so a
+    # forbidding model would deny an operator the very view they use to repair the typo.
     model_config = ConfigDict(extra="ignore")
 
 
@@ -439,9 +461,11 @@ class StoreSettings(_Section):
     # task, each prune audited `upload.prune`). Quotas are enforced per-`uploads_dir`, NOT per-process:
     # the check reads the sidecars off disk with no cache, so engine shards sharing one dir see each
     # other's files and the budget does NOT multiply (measured 2026-08-10 — two UploadStores over one
-    # dir, the second refused the same uploader at quota, against a live positive control). What IS
-    # shared across them is the check-then-write race below, which overshoots by at most one file per
-    # concurrently in-flight upload. Shards given SEPARATE dirs get separate budgets, by construction.
+    # dir, the second refused the same uploader at quota, against a live positive control). The
+    # check-then-write race that used to survive across them — an overshoot of one file per shard
+    # caught between its scan and its write — is closed by an atomic reservation on the unified store
+    # every shard shares (ASVS 2.3.4, BACKLOG #1112); the surviving residuals are stated once in
+    # `uploads.UploadQuotaError`. Shards given SEPARATE dirs get separate budgets, by construction.
     max_upload_files_per_user: int = Field(
         default=100,
         ge=1,
@@ -744,6 +768,15 @@ class ApiSettings(_Section):
     tls_ciphers: str | None = None
     # Optional CA bundle to verify CLIENT certs (mTLS for the console; opt-in, future).
     tls_client_ca_file: str | None = None
+    #: Opt-in CRL for the mTLS client certificates `tls_client_ca_file` verifies (BACKLOG #1005).
+    #: A PEM carrying the CA **and** its CRL. Absent, client certificates are verified for chain
+    #: and RFC 5280 conformance but NOT for revocation -- measured, a revoked-but-chain-valid
+    #: client is ACCEPTED. Set it and a revoked partner certificate is refused at the handshake.
+    #:
+    #: **An expired CRL refuses EVERY client, not only revoked ones**, so this is read at startup
+    #: and refused loudly there rather than at the first partner handshake. See
+    #: :func:`~messagefoundry.config.tls_policy.harden_crl_check`.
+    tls_client_crl_file: str | None = None
     # WP #285 (ASVS 6.7.1): optional SHA-256 pin over the mTLS client-CA trust anchor above. Set to the
     # lowercase-hex SHA-256 of the PEM file's bytes; the loaded anchor's fingerprint is checked against
     # it at construction AND at reload and a mismatch REFUSES to start — always, independent of
@@ -1805,7 +1838,12 @@ class AuthSettings(_Section):
     lockout_threshold: int = 5  # consecutive failed logins before the account locks
     lockout_minutes: int = 15
     # First-run bootstrap admin: auto-disabled once a second administrator exists, and (if still
-    # unclaimed — never password-changed) disabled this many hours after creation. 0 = no time expiry.
+    # unclaimed — never password-changed) disabled this many hours after creation. 0 = no time expiry
+    # OF THE ACCOUNT, which is not the same as no expiry of its CREDENTIAL (BACKLOG #1245): the
+    # printed first-run password is separately bounded by `initial_password_expiry_hours`, so at 0 the
+    # account survives indefinitely while the credential still dies on that other clock. Setting this
+    # LONGER than that value has the same shape. The deadline surfaced in `bootstrap-admin.txt` is the
+    # EARLIER of the two for exactly this reason.
     bootstrap_expiry_hours: int = 72
     # ASVS 6.4.5 arm 2: how many hours BEFORE that auto-disable to start reminding an operator (via the
     # `bootstrap_admin_expiring` AlertSink event) that the unclaimed first-run credential is about to be
@@ -1816,12 +1854,25 @@ class AuthSettings(_Section):
     # is never claimed EXPIRES this many hours after it was set. Without it, an unused reset password
     # grants an authenticated session indefinitely — and the one action it permits is to SET the
     # password, i.e. account takeover. Keyed on `password_changed_at`; a user who set their own password
-    # has `must_change_password=False` and is unaffected. The bootstrap admin has its own
-    # `bootstrap_expiry_hours` path and is exempt. 0 = no expiry (not recommended on a PHI instance).
+    # has `must_change_password=False` and is unaffected. THE BOOTSTRAP ADMIN IS NOT EXEMPT (BACKLOG
+    # #1245): it used to be, on the premise that `bootstrap_expiry_hours` covered it, but WP-3 retires
+    # an ACCOUNT while this expires a CREDENTIAL, and WP-3 cannot bound the credential at all when
+    # `bootstrap_expiry_hours = 0` or is set longer than this value. 0 = no expiry (not recommended on
+    # a PHI instance) — and note that setting THIS to 0 now also unbounds the first-run credential.
     initial_password_expiry_hours: int = 72
 
     # Active Directory / LDAP. The bind password is a secret: MEFOR_AUTH_AD_BIND_PASSWORD.
+    #
+    # `ad_enabled` means DIRECTORY BIND CAPABILITY -- this engine can reach AD and resolve principals.
+    # It is what Kerberos SSO, federated OIDC and the session reconciler each depend on, and it is why
+    # they all validate against it rather than against the login pathway below (BACKLOG #1137).
     ad_enabled: bool = False
+    # Whether a user may present an AD password to OUR login form, which we verify by SIMPLE-binding as
+    # them. Split out of `ad_enabled` because the two are different decisions that happened to share a
+    # switch: wanting federated login (which needs the bind) forced you to also expose this
+    # credential-accepting surface, since `oidc_enabled` refuses to validate without `ad_enabled`.
+    # Defaults True so the split alone changes nothing; whether this pathway should survive at all is a
+    # separate question and deliberately not decided here.
     ad_server: str | None = None  # e.g. ldaps://dc1.example.com:636
     ad_domain: str | None = None  # e.g. example.com (UPN suffix)
     ad_user_search_base: str | None = None
@@ -3990,6 +4041,72 @@ def _warn_file_secrets(file_data: Mapping[str, Any], path: Path) -> None:
             )
 
 
+def _section_models() -> dict[str, type[BaseModel]]:
+    """``{section name: its settings model}``, derived from :class:`ServiceSettings` itself so it cannot
+    drift out of step with the sections that exist (a hand-kept list would silently stop checking a
+    section someone added)."""
+    out: dict[str, type[BaseModel]] = {}
+    for name, field in ServiceSettings.model_fields.items():
+        annotation = field.annotation
+        if isinstance(annotation, type) and issubclass(annotation, BaseModel):
+            out[name] = annotation
+    return out
+
+
+def _near_field(model: type[BaseModel], key: str) -> str | None:
+    """The closest real field name to ``key``, or ``None`` when nothing is close enough. A refusal that
+    names the typo's likely intent is the difference between a fix and a search."""
+    near = difflib.get_close_matches(key, sorted(model.model_fields), n=1)
+    return near[0] if near else None
+
+
+def _unknown_key_report(items: Sequence[tuple[str, str, str | None]]) -> str:
+    """Render ``(section, key, suggestion)`` triples as ``[section].key (did you mean 'x'?)``.
+
+    Names the section and key only — **never the value**. The offending value is frequently a secret
+    (``_FILE_SECRET_KEYS`` exists because secrets land in this file), and the CLI prints a load failure
+    verbatim to stderr, which the service captures to a log file."""
+    return ", ".join(
+        f"[{section}].{key}" + (f" (did you mean '{suggestion}'?)" if suggestion else "")
+        for section, key, suggestion in items
+    )
+
+
+def _reject_unknown_file_keys(file_data: Mapping[str, Any]) -> None:
+    """Raise ``ValueError`` if the config FILE sets a key its section does not define.
+
+    Owner ruling, 2026-08-16: refuse unknown keys. A key the engine does not recognize used to load
+    clean, do nothing, and say nothing — so a mistyped ``[egress].deny_by_defalt`` left the operator
+    believing a control was configured while the engine applied its permissive default. Refusing at load
+    is the only way that failure surfaces at all: nothing downstream can distinguish "not set" from
+    "set, misspelt, dropped".
+
+    Scoped to the FILE deliberately. The env layer (:func:`_env_overrides`) scrapes any
+    ``MEFOR_<section>_<key>`` into its section dict, including a dozen documented variables that their
+    consuming module reads straight from ``os.environ`` and that are not fields here — refusing there
+    would refuse a variable the shipped docs tell operators to set. The CLI layer and the ``[security]``
+    desugar write only real fields, and the file is the surface the ruling names. Unknown top-level
+    **sections** stay tolerated (``ServiceSettings`` is ``extra="ignore"``) — a separate question."""
+    models = _section_models()
+    offenders: list[tuple[str, str, str | None]] = []
+    for section, values in file_data.items():
+        model = models.get(section)
+        if model is None or not isinstance(values, dict):
+            continue  # unknown SECTION (tolerated) or a non-table value (pydantic reports the type)
+        allowed = set(model.model_fields)
+        for key in values:
+            if key in allowed:
+                continue
+            offenders.append((section, key, _near_field(model, key)))
+    if offenders:
+        raise ValueError(
+            f"unrecognized config key(s): {_unknown_key_report(offenders)}. An unrecognized key is "
+            "REFUSED, not ignored — a dropped key leaves the setting it was meant to apply silently "
+            "un-applied. Check the spelling against docs/CONFIGURATION.md; a key that MOVED to another "
+            "section is reported by name instead."
+        )
+
+
 # --- ADR 0118: the [security] section desugars into the internal fields it replaces ----------------
 _LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
 
@@ -4057,20 +4174,34 @@ def _desugar_security(data: dict[str, dict[str, Any]]) -> None:
     if not isinstance(raw, dict):
         return
 
-    # Pydantic sections are extra="ignore", so an UNKNOWN [security] key loads clean, does nothing, and
-    # says nothing. For posture switches that is a silent fail-open: mistype `block_unlisted_outbound`
+    # Pydantic sections are extra="ignore", so an UNKNOWN [security] key would load clean, do nothing,
+    # and say nothing. For posture switches that is a silent fail-open: mistype `block_unlisted_outbound`
     # or set a switch that does not exist yet (a key backported from newer docs), and the operator
-    # believes a control is on while the engine applies its permissive default. Relocated keys are the
-    # loud exception (_reject_relocated_keys), which is exactly the signal this restores for the rest.
-    # WARN rather than reject: an unknown key may be a forward-compatible config shared across an estate
-    # mid-upgrade, and refusing would turn a harmless typo into a failed start on every host at once.
+    # believes a control is on while the engine applies its permissive default.
+    #
+    # This arm REFUSES where it used to warn (owner ruling, 2026-08-16: "refuse unknown keys"). The
+    # reasoning it replaces is recorded here rather than deleted, so a future reader can see the decision
+    # instead of re-deriving the old one: warning was chosen because an unknown key might be a
+    # forward-compatible config shared across an estate mid-upgrade, where refusing would turn a harmless
+    # typo into a failed start on every host at once. That argument assumed an INSTALLED ESTATE. There is
+    # none — zero deployments, zero adopters (CLAUDE.md §0) — so the cost it guarded against is zero
+    # today, while the fail-open it accepted in exchange is real on the first deployment. If an estate
+    # ever exists, the answer is a documented upgrade path, not a return to silence: zero deployments
+    # removes the migration cost, it does not make the refusal optional.
+    #
+    # _reject_unknown_file_keys covers the FILE for every section including this one; this arm stays
+    # because it also sees ENV-delivered [security] keys, which the file check cannot. Safe here
+    # specifically: every MEFOR_SECURITY_* variable in the tree maps to a real field, so unlike
+    # [store]/[secrets]/[tls] there is no out-of-band env variable for it to collide with.
     unknown = sorted(set(raw) - set(SecuritySettings.model_fields))
     if unknown:
-        _log.warning(
-            "[security] has unrecognized key(s): %s — IGNORED, so any posture they were meant to set "
-            "is NOT in effect. Check the spelling against docs/CONFIGURATION.md; a switch that moved "
-            "sections is rejected loudly instead.",
-            ", ".join(unknown),
+        raise ValueError(
+            f"unrecognized config key(s): "
+            f"{_unknown_key_report([('security', k, _near_field(SecuritySettings, k)) for k in unknown])}. An "
+            "unrecognized posture switch is REFUSED, not ignored — ignoring it would leave the operator "
+            "believing a control is in effect while the engine applies its permissive default. Check the "
+            "spelling against docs/CONFIGURATION.md; a switch that MOVED sections is reported by name "
+            "instead."
         )
 
     # Validate through the model so env-delivered STRINGS are coerced properly ("false" → False, not the
@@ -4150,6 +4281,17 @@ def security_loosenings(
     ``password_check_breached``) that are gated elsewhere and are not reported here. That list is
     enumerated in the floor test's exemption set so the gap is a written decision that a new switch
     cannot silently join.
+
+    **``[auth].initial_password_expiry_hours`` is also unreported, and BACKLOG #1245 made it
+    load-bearing — recorded here as the written decision this paragraph demands, not left implied.**
+    It is not a ``[security]`` field, so the completeness floor (which iterates
+    ``SecuritySettings.model_fields``) never covered it and its absence is not a floor-test gap. What
+    changed is the consequence: since #1245 removed the bootstrap's carve-out from the ASVS 6.4.1
+    gate, this value is the ONLY bound on the printed first-run administrator credential whenever
+    ``bootstrap_expiry_hours`` is 0 or longer than it. So setting it to 0 unbounds that credential,
+    and nothing in this registry says so. Reporting it needs a new REQUIRED parameter (every one here
+    is required by design, so an optional detector cannot be added quietly), which is a larger change
+    than the item that exposed it — filed as content rather than folded in.
 
     Every parameter is REQUIRED, not optional, and deliberately so. There is exactly ONE shipped posture
     and an operator may only loosen from it, so a deviation that this registry cannot see is a second
@@ -4417,6 +4559,7 @@ def load_settings(
     """
     environ = os.environ if environ is None else environ
     data: dict[str, dict[str, Any]] = {}
+    file_data: Mapping[str, Any] = {}
 
     path = Path(config_path) if config_path is not None else Path(_DEFAULT_FILE)
     if config_path is not None and not path.exists():
@@ -4433,6 +4576,9 @@ def load_settings(
     # keys in their old sections (file+env), then desugar [security] into the internal fields it replaces
     # — BEFORE the CLI merge, so a --host/--db override still wins over a [security] value.
     _reject_relocated_keys(data)
+    # After _reject_relocated_keys so a MOVED key keeps its specific "moved to [security].X" message, and
+    # over `file_data` rather than `data` so it never sees a key the env overlay or the desugar wrote.
+    _reject_unknown_file_keys(file_data)
     _desugar_security(data)
 
     if cli:

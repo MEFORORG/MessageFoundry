@@ -86,6 +86,59 @@ _BOUNDARY4_HEADING = "### Web console (browser `/ui`) — boundary 4"
 _TOML_TOKEN_RE = re.compile(r"\[([a-z_]+)\]\.([a-z_]+)")
 
 
+#: Unit suffixes a bound is written with, as their multiplier. Binary units only: every size in
+#: this document is a MiB/KiB quantity, and accepting "MB" here would silently equate 10**6 with
+#: 2**20 -- a 4.9 percent error no assertion would ever report.
+_UNIT_MULTIPLIER: dict[str, float] = {
+    "": 1,
+    "s": 1,
+    "bits": 1,
+    "attempts": 1,
+    "KiB": 1024,
+    "MiB": 1024 * 1024,
+    "GiB": 1024 * 1024 * 1024,
+}
+
+#: A label's trailing value: a number, an optional unit, then any prose or parenthetical gloss,
+#: deliberately ignored -- "2.0 s (POSIX)", "512 (reject-when-full)" and "100 attempts by default"
+#: each carry a machine-checkable bound in front of their commentary.
+_LABEL_VALUE_RE = re.compile(
+    r"=\s*(?P<number>\d[\d,]*(?:\.\d+)?)\s*(?P<unit>KiB|MiB|GiB|bits|attempts|s)?\b"
+)
+
+
+def _bounds_from_label(label: str) -> tuple[float, ...] | None:
+    """The bound a row's label states, as its admissible readings, or ``None`` for a posture.
+
+    THE LABEL IS THE BRIDGE, and that is the point of this function. The chain this module needs
+    is ``document -> label -> literal -> live constant``. Only the last link was ever asserted
+    (BACKLOG #1214), so a literal could be edited to match a code change while the label beside
+    it -- the half a reader actually reads -- went on stating the old bound, and nothing failed.
+
+    TWO READINGS, NOT ONE, AND THIS IS A MEASURED CORRECTION RATHER THAN A HEDGE. A first version
+    scaled every size to bytes and immediately flagged ``sandbox mem cap = 512 MiB`` against its
+    literal ``512``. That was a false positive in the CHECK, not drift in the row: the live value
+    is ``s.sandbox.mem_mb``, denominated in MiB, while ``file cap = 16 MiB`` sits beside a literal
+    of ``16 * mib`` in BYTES. **A literal's unit is a property of its constant and is not
+    recoverable from the label**, so insisting on one convention would red honest rows.
+
+    Both readings are therefore admissible and a row passes if either matches. Weaker on purpose:
+    it still catches the class this exists for -- a label and its literal naming genuinely
+    different bounds -- while declining to assert a unit it cannot know. What it cannot catch is
+    a label and literal that agree numerically under the wrong unit.
+
+    Returns ``None`` for a row like "= unlimited" or "ACK-on-receipt is the default": those state
+    a posture with no numeric form, and the caller COUNTS them rather than skipping silently,
+    because an unstated exclusion is how a partial check comes to read as a total one.
+    """
+    match = _LABEL_VALUE_RE.search(label)
+    if match is None:
+        return None
+    number = float(match.group("number").replace(",", ""))
+    scaled = number * _UNIT_MULTIPLIER[match.group("unit") or ""]
+    return (number,) if scaled == number else (number, scaled)
+
+
 # --- the curated registries the doc must keep enumerating --------------------------------------
 
 #: ``row-label fragment -> a token that row must carry``, for the surfaces whose bare anchor occurs
@@ -628,11 +681,11 @@ def test_removed_setting_allowlist_is_not_stale() -> None:
 # --- 5. numeric parity against the live code ------------------------------------------------------
 
 
-def test_documented_bounds_match_the_live_constants() -> None:
-    """Every default the two sections quote is asserted against the LIVE value by import.
+def _checks() -> list[tuple[str, object, object]]:
+    """The ``(label, live value, transcribed bound)`` rows that BOTH bound tests read.
 
-    A code-side flip fails here naming the doc row it invalidated, instead of leaving the doc
-    asserting a bound the engine no longer enforces.
+    At module scope so the two assertions share one table. Two copies of a 64-row transcription
+    would drift apart, which is precisely the defect class this module exists to catch.
     """
     from messagefoundry.api import app as api_app
     from messagefoundry.auth import oidc_http
@@ -657,7 +710,7 @@ def test_documented_bounds_match_the_live_constants() -> None:
     s = ServiceSettings()
     mib = 1024 * 1024
 
-    checks: list[tuple[str, object, object]] = [
+    return [
         # --- 15.1.3 data plane ---
         ("15.1.3 HL7 parse cap = 16 MiB", peek.DEFAULT_MAX_MESSAGE_BYTES, 16 * mib),
         ("15.1.3 HL7 segment cap = 10,000", peek.DEFAULT_MAX_SEGMENTS, 10_000),
@@ -766,14 +819,69 @@ def test_documented_bounds_match_the_live_constants() -> None:
         # limb B). Without that clause the threat model asserts a broader control than ships.
     ]
 
+
+def test_transcribed_bounds_match_the_live_constants() -> None:
+    """Every bound TRANSCRIBED IN THIS FILE is asserted against the live value by import.
+
+    RENAMED FROM ``test_documented_bounds_match_the_live_constants`` (BACKLOG #1214). "documented"
+    promised the DOCUMENT, and this assertion never opens it. The failure text was corrected first;
+    the NAME outlived it, and a name is what a reader sees in a CI failure list before any message.
+    A check named for its subject rather than its assertion is SDS-3.8 in one identifier.
+
+    REWORDED IN SUBSTANCE, NOT COSMETICALLY (BACKLOG #1214). This reported a mismatch as
+    ``doc says {expected}``, which was false of all 64 of its rows: ``expected`` is a literal in
+    this file and nothing binds it to the document. The comparison is real and worth keeping --
+    it catches the CODE drifting from the transcription -- but it is structurally incapable of
+    catching the TRANSCRIPTION drifting from the document, so it must not say otherwise. A gate
+    whose failure text names an artefact it never opened sends every reader to the wrong file.
+    """
     drifted = [
-        f"{label}: doc says {expected!r}, code says {actual!r}"
-        for label, actual, expected in checks
+        f"{label}: this file transcribes {expected!r}, code says {actual!r}"
+        for label, actual, expected in _checks()
         if actual != expected
     ]
     assert not drifted, (
-        "THREAT-MODEL.md now states a bound the engine no longer enforces — fix the doc row(s) "
-        f"in the SAME change: {drifted}"
+        "A live constant no longer matches the bound transcribed here. This assertion does NOT "
+        "open THREAT-MODEL.md, so fix the row AND re-check the document by hand in the SAME "
+        f"change: {drifted}"
+    )
+
+
+def test_each_label_states_the_bound_its_row_transcribes() -> None:
+    """A row's label and its literal must agree -- the link BACKLOG #1214 found missing.
+
+    The chain this module needs is ``document -> label -> literal -> live constant``. Only the
+    last link was ever asserted, so a literal could be updated to match a code change while the
+    label beside it -- the half a reader actually reads -- went on stating the old bound, with
+    nothing failing. This runs everywhere and needs no document, because both sides are here.
+    """
+    disagreed: list[str] = []
+    for label, _actual, expected in _checks():
+        stated = _bounds_from_label(label)
+        if stated is None or isinstance(expected, bool) or not isinstance(expected, (int, float)):
+            continue
+        if float(expected) not in stated:
+            disagreed.append(f"{label}: label states {stated!r}, row transcribes {expected!r}")
+    assert not disagreed, (
+        "A row's label and its transcribed literal state DIFFERENT bounds, so the two halves of "
+        f"one row disagree about what the document says: {disagreed}"
+    )
+
+
+def test_the_label_check_states_the_rows_it_cannot_see() -> None:
+    """A partial check that does not state its own scope reads as a total one.
+
+    Rows stating a posture in words -- "= unlimited", "ACK-on-receipt is the default" -- have no
+    numeric form, so the label check cannot see them. The floors below are the guard on that: if
+    a future edit made most labels unparseable, the check above would go quietly vacuous and
+    still pass, which is this module's own defect class one level up.
+    """
+    rows = _checks()
+    covered = [label for label, _a, _e in rows if _bounds_from_label(label) is not None]
+    assert len(rows) >= 60, f"the transcription table shrank unexpectedly: {len(rows)} rows"
+    assert len(covered) >= 45, (
+        f"only {len(covered)} of {len(rows)} labels carry a machine-checkable bound, so the "
+        "label check has gone largely vacuous"
     )
 
 
@@ -1001,7 +1109,7 @@ def test_the_open_gap_is_tracked_against_an_artifact_that_exists() -> None:
 
 #: ``(row-label fragment, live value, the rendered form the row must carry)``.
 #:
-#: ``test_documented_bounds_match_the_live_constants`` compares a live constant to a literal
+#: ``test_transcribed_bounds_match_the_live_constants`` compares a live constant to a literal
 #: hardcoded in THIS FILE — it never reads the document, so editing THREAT-MODEL.md to say "32 MiB"
 #: left the suite green. That is the rot mode that matters for a cell scored on documentation, so
 #: this closes the other half: the rendered value must appear in that row's own line.

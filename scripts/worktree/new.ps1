@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Organization and contributors
 <#
 .SYNOPSIS
     Create an isolated git worktree (+ its own .venv) for a parallel MessageFoundry build session.
@@ -229,7 +231,16 @@ if ($NoInstall) {
 # editable install would import whichever checkout it was installed from).
 $venv = Join-Path $WorktreePath ".venv"
 $venvPy = Join-Path $venv "Scripts\python.exe"
-$extras = if ($Sqlserver) { "dev,harness,sqlserver" } else { "dev,harness" }
+# EXTRAS MUST MATCH ci.yml's TEST LEG, and the reason is a FALSE GREEN rather than convenience
+# (BACKLOG #1335). A lane installing fewer extras COLLECTS FEWER TESTS: the extras-gated suites skip
+# at MODULE scope, so a large number of absent tests collapses into a handful of skip lines and the
+# lane reads green over a tree it never ran. `testpaths` also collects the web console suite, which
+# needs the console package installed -- without it that whole suite is silently absent.
+#
+# KEPT IN SYNC BY A TEST, NOT BY CARE: tests/test_worktree_venv_extras_parity.py fails if this line
+# and ci.yml's install line drift. Same remedy tests/test_lint_scope_parity.py already applies to
+# ruff and bandit, whose scopes were written twice and drifted until a test held them together.
+$extras = if ($Sqlserver) { "dev,harness,fhir,dicom,x12,xml,webauthn,sqlserver" } else { "dev,harness,fhir,dicom,x12,xml,webauthn" }
 
 Write-Host "Creating virtualenv + installing .[$extras] (this can take a minute)..."
 & $Python -m venv $venv
@@ -243,15 +254,24 @@ try {
     # pyproject's ranges and a fresh worktree gets whatever PyPI serves today.
     #
     # Not hypothetical: a worktree created 2026-07-29 came up with ruff 0.16.0 while constraints.lock
-    # pinned 0.15.22. That worktree then reported ~829 findings CI does not have — and because the
-    # ruff pre-commit hook runs `ruff check --fix`, it REWROTE files to match, stripping `# noqa`
-    # directives the pinned ruff still wants. A venv that lints differently from CI does not merely
-    # mislead; it edits your source on commit.
+    # pinned 0.15.22. That worktree then reported ~829 findings CI does not have — and `ruff check
+    # --fix` REWROTE files to match, stripping `# noqa` directives the pinned ruff still wants. A venv
+    # that lints differently from CI does not merely mislead; it edits your source.
+    #
+    # NARROWED 2026-08-18. That `--fix` WAS the pre-commit hook at the time — `language: system`, so
+    # it ran whatever ruff the shell's PATH offered — which is what made the rewrite land on commit,
+    # unasked. The ruff hooks now install their own pinned ruff (see .pre-commit-config.yaml's ruff
+    # block), so a commit still rewrites source — `ruff-format` writes and `ruff-check` keeps
+    # `args: [--fix]` — but it is the PINNED ruff doing it, which agrees with CI. What THIS venv's
+    # ruff still drives is the hand run: CLAUDE.md section 7's bare `ruff format .` writes with
+    # whatever ruff this venv resolved. The flag below is not thereby less needed — nothing in
+    # .pre-commit-config.yaml pins mypy or pytest, so a freely re-resolved venv still moves at least
+    # those two off CI.
     #
     # This is the same reasoning as the DEP-1 `--require-hashes` install, one rung down: CI proves the
     # lock installs, this makes a developer's environment agree with it.
-    & $venvPy -m pip install --constraint constraints.lock -e ".[$extras]"
-    if ($LASTEXITCODE -ne 0) { throw "pip install -e .[$extras] failed (exit $LASTEXITCODE)" }
+    & $venvPy -m pip install --constraint constraints.lock -e ".[$extras]" -e packaging/messagefoundry-webconsole
+    if ($LASTEXITCODE -ne 0) { throw "pip install -e .[$extras] + webconsole failed (exit $LASTEXITCODE)" }
 } finally {
     Pop-Location
 }

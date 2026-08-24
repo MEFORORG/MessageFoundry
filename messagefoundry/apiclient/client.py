@@ -19,7 +19,7 @@ from collections.abc import Callable, Sequence
 from json import JSONDecodeError
 from types import TracebackType
 from typing import TypeVar
-from urllib.parse import urlsplit
+from urllib.parse import quote, urlsplit
 
 import httpx
 from pydantic import BaseModel, ValidationError
@@ -72,6 +72,10 @@ __all__ = ["EngineClient", "ApiError"]
 _log = logging.getLogger(__name__)
 _LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1"}
 
+# ASVS 1.2.2 (BACKLOG #1107), the protocol half: the ONLY URL schemes this client will speak. A
+# positive allow-list, not a deny-list -- see _assert_safe_transport for why the shape matters.
+_ALLOWED_URL_SCHEMES = frozenset({"http", "https"})
+
 # ASVS 4.2.5, the client half. Deliberately DUPLICATED from transports/rest.py's
 # MAX_OUTBOUND_URL_LEN / MAX_OUTBOUND_HEADER_VALUE_LEN rather than imported: ADR 0088 makes this
 # package Qt-free AND engine-free, so a GUI or harness process can depend on it without dragging in
@@ -113,15 +117,60 @@ def _decode_list(response: httpx.Response, model: type[_Model]) -> list[_Model]:
         raise ApiError(f"invalid response from engine: {exc}") from exc
 
 
-def _assert_safe_transport(base_url: str, *, allow_insecure: bool) -> None:
-    """Refuse plaintext ``http`` to a non-loopback host (CONSOLE-3).
+def _seg(value: str | int) -> str:
+    """Percent-encode ``value`` for use as ONE URL path segment (ASVS 1.2.2, BACKLOG #1107).
 
-    A remote ``http://`` URL would put the bearer token and PHI on the wire in cleartext, so a
-    remote engine must be reached over the engine's built-in TLS (``https://``, WP-13a). Loopback
-    http and any https are fine; a non-loopback http URL requires an explicit ``allow_insecure``
-    opt-in (trusted-network dev only), which is then loudly warned."""
+    ``safe=""`` is the whole point: ``quote``'s default is ``safe="/"``, which leaves untouched the
+    one character a path segment turns on. Without this, an identifier carrying ``..``, ``/``, ``?``
+    or ``#`` does not merely look wrong on the wire -- httpx RESOLVES it, so
+    ``start_connection("../../users/admin")`` leaves ``/connections/`` and retargets the request at
+    ``/users/admin/start``, and a ``#`` truncates the path at the fragment, dropping the verb.
+
+    Applied at every interpolation site rather than only the ones carrying free text. Most of the
+    identifiers here are engine-minted hex ids, but four sites carry a CONNECTION NAME, which is
+    unconstrained: ``Registry._add`` (config/wiring.py) checks a new name only for a duplicate. The
+    alternative -- resting URL correctness on a data-grammar invariant that no URL-building line
+    asserts -- is the argument BACKLOG #1107 names as its live trap, so the encode is unconditional.
+
+    Ints are coerced because ``quote`` raises ``TypeError`` on a non-str and two alert routes take
+    an ``int`` id. Encoding is idempotent for the identifiers actually in use (engine ids and
+    connection names contain no ``%``), and no caller pre-encodes, so nothing double-encodes.
+    """
+    return quote(str(value), safe="")
+
+
+def _assert_safe_transport(base_url: str, *, allow_insecure: bool) -> None:
+    """Permit only safe URL schemes, then refuse plaintext ``http`` to a non-loopback host.
+
+    Two checks, in this order, and the order is load-bearing.
+
+    **Scheme allow-list (ASVS 1.2.2, BACKLOG #1107).** Only ``http`` and ``https`` are permitted.
+    This has to run FIRST because everything below it is keyed on the HOST, and a URL like
+    ``javascript:``, ``data:``, ``file:`` or an OS protocol handler (``ms-msdt:``) has no hostname
+    at all -- ``parts.hostname`` is ``None``, so the ``host == ""`` early return below waves it
+    through. That made the shipped check a host-keyed deny-list for plaintext http rather than a
+    protocol allow-list, and the two schemes the ASVS verb names by name were exactly the two that
+    passed. A positive allow-list is the shape that fixes it: a deny-list of known-bad schemes
+    cannot cover the OS protocol handlers a given Windows install happens to register.
+
+    A base URL with no scheme at all fails here too (``urlsplit("127.0.0.1:8765")`` yields scheme
+    ``""``), which is a deliberate change: such a URL could never have reached an engine, and
+    failing at construction beats failing later with an opaque transport error.
+
+    **Plaintext http to a remote host (CONSOLE-3).** A remote ``http://`` URL would put the bearer
+    token and PHI on the wire in cleartext, so a remote engine must be reached over the engine's
+    built-in TLS (``https://``, WP-13a). Loopback http and any https are fine; a non-loopback http
+    URL requires an explicit ``allow_insecure`` opt-in (trusted-network dev only), loudly warned.
+    """
     parts = urlsplit(base_url)
-    if parts.scheme == "https":
+    scheme = parts.scheme.lower()
+    if scheme not in _ALLOWED_URL_SCHEMES:
+        found = f"scheme {scheme!r}" if scheme else "no scheme"
+        raise ApiError(
+            f"refusing a base URL with {found}: this client permits only the "
+            f"{' and '.join(sorted(_ALLOWED_URL_SCHEMES))} schemes."
+        )
+    if scheme == "https":
         return
     host = (parts.hostname or "").lower()
     if host in _LOOPBACK_HOSTS or host == "":
@@ -404,7 +453,7 @@ class EngineClient:
 
     def reset_user_mfa(self, user_id: str) -> None:
         """Admin: clear a user's MFA enrollment and revoke their sessions (step-up gated)."""
-        self._request("POST", f"/users/{user_id}/reset-mfa")
+        self._request("POST", f"/users/{_seg(user_id)}/reset-mfa")
 
     # --- endpoints -----------------------------------------------------------
 
@@ -421,17 +470,17 @@ class EngineClient:
     # --- code-first connection operations ------------------------------------
 
     def start_connection(self, name: str) -> None:
-        self._request("POST", f"/connections/{name}/start")
+        self._request("POST", f"/connections/{_seg(name)}/start")
 
     def stop_connection(self, name: str) -> None:
-        self._request("POST", f"/connections/{name}/stop")
+        self._request("POST", f"/connections/{_seg(name)}/stop")
 
     def restart_connection(self, name: str) -> None:
-        self._request("POST", f"/connections/{name}/restart")
+        self._request("POST", f"/connections/{_seg(name)}/restart")
 
     def purge_connection(self, name: str, scope: str = "all") -> PurgeResult:
         return _decode(
-            self._request("POST", f"/connections/{name}/purge", params={"scope": scope}),
+            self._request("POST", f"/connections/{_seg(name)}/purge", params={"scope": scope}),
             PurgeResult,
         )
 
@@ -491,29 +540,38 @@ class EngineClient:
     ) -> MessageSearchResults:
         """Content search (ADR 0046 #51): match by an HL7 field path or a raw/summary substring. The
         engine scans-and-decrypts off the event loop, bounded by ``scan_limit`` + ``limit`` (the result
-        reports ``truncated`` when the scan ceiling was hit). Requires a stepped-up session server-side."""
+        reports ``truncated`` when the scan ceiling was hit). Requires a stepped-up session server-side.
+
+        Sent as a POST with the criteria in the BODY (BACKLOG #1184, ASVS 14.2.1). ``content`` and
+        ``field_value`` are whatever an operator typed to find a patient, so they are PHI-shaped, and a
+        query string is copied verbatim into the engine's access log and any proxy log on the way —
+        neither of which the log redactor can reach. The engine's GET no longer accepts them at all.
+        Nothing is created here; POST is the carrier, not the semantics."""
         return _decode(
-            self._get(
+            self._request(
+                "POST",
                 "/messages/search",
-                content=content,
-                field_path=field_path,
-                field_value=field_value,
-                target=target,
-                channel_id=channel_id,
-                status=status,
-                message_type=message_type,
-                control_id=control_id,
-                limit=limit,
-                scan_limit=scan_limit,
+                json={
+                    "content": content,
+                    "field_path": field_path,
+                    "field_value": field_value,
+                    "target": target,
+                    "channel_id": channel_id,
+                    "status": status,
+                    "message_type": message_type,
+                    "control_id": control_id,
+                    "limit": limit,
+                    "scan_limit": scan_limit,
+                },
             ),
             MessageSearchResults,
         )
 
     def get_message(self, message_id: str) -> MessageDetail:
-        return _decode(self._get(f"/messages/{message_id}"), MessageDetail)
+        return _decode(self._get(f"/messages/{_seg(message_id)}"), MessageDetail)
 
     def replay(self, message_id: str) -> ReplayResult:
-        return _decode(self._request("POST", f"/messages/{message_id}/replay"), ReplayResult)
+        return _decode(self._request("POST", f"/messages/{_seg(message_id)}/replay"), ReplayResult)
 
     # --- dead letters --------------------------------------------------------
 
@@ -585,11 +643,13 @@ class EngineClient:
 
     def ack_alert(self, alert_id: int) -> AlertInstanceInfo:
         """Acknowledge an open alert instance (ADR 0044). Gated by ``monitoring:diagnose``."""
-        return _decode(self._request("POST", f"/alerts/{alert_id}/ack"), AlertInstanceInfo)
+        return _decode(self._request("POST", f"/alerts/{_seg(alert_id)}/ack"), AlertInstanceInfo)
 
     def resolve_alert(self, alert_id: int) -> AlertInstanceInfo:
         """Resolve an open/acknowledged alert instance (ADR 0044). Gated by ``monitoring:diagnose``."""
-        return _decode(self._request("POST", f"/alerts/{alert_id}/resolve"), AlertInstanceInfo)
+        return _decode(
+            self._request("POST", f"/alerts/{_seg(alert_id)}/resolve"), AlertInstanceInfo
+        )
 
     def status(self) -> SystemStatus:
         return _decode(self._get("/status"), SystemStatus)
@@ -681,7 +741,7 @@ class EngineClient:
 
     def revoke_session(self, session_id: str) -> None:
         """Revoke one of the user's own sessions by its ``id`` (the session's ``token_hash``)."""
-        self._request("DELETE", f"/me/sessions/{session_id}")
+        self._request("DELETE", f"/me/sessions/{_seg(session_id)}")
 
     def revoke_other_sessions(self) -> str:
         """Revoke every session except this one ("sign out everywhere else"); returns the summary."""
@@ -689,7 +749,9 @@ class EngineClient:
 
     def revoke_user_sessions(self, user_id: str) -> str:
         """Admin force-sign-out: revoke all of ``user_id``'s sessions; returns the summary."""
-        return _decode(self._request("DELETE", f"/users/{user_id}/sessions"), SimpleMessage).detail
+        return _decode(
+            self._request("DELETE", f"/users/{_seg(user_id)}/sessions"), SimpleMessage
+        ).detail
 
     # --- user administration -------------------------------------------------
 
@@ -725,10 +787,14 @@ class EngineClient:
             "description": description,
             "permissions": permissions,
         }
-        return _decode(self._request("PUT", f"/roles/custom/{role_id}", json=body), CustomRoleInfo)
+        return _decode(
+            self._request("PUT", f"/roles/custom/{_seg(role_id)}", json=body), CustomRoleInfo
+        )
 
     def delete_custom_role(self, role_id: str) -> str:
-        return _decode(self._request("DELETE", f"/roles/custom/{role_id}"), SimpleMessage).detail
+        return _decode(
+            self._request("DELETE", f"/roles/custom/{_seg(role_id)}"), SimpleMessage
+        ).detail
 
     def list_users(self) -> list[UserSummary]:
         return _decode_list(self._get("/users"), UserSummary)
@@ -752,18 +818,18 @@ class EngineClient:
         return _decode(self._request("POST", "/users", json=body), UserSummary)
 
     def set_user_roles(self, user_id: str, roles: list[str]) -> None:
-        self._request("PUT", f"/users/{user_id}/roles", json={"roles": roles})
+        self._request("PUT", f"/users/{_seg(user_id)}/roles", json={"roles": roles})
 
     def get_channel_scope(self, user_id: str) -> list[str] | None:
         """A user's per-channel RBAC scope (``None`` = all channels)."""
-        return _decode(self._get(f"/users/{user_id}/channel-scope"), ChannelScope).channels
+        return _decode(self._get(f"/users/{_seg(user_id)}/channel-scope"), ChannelScope).channels
 
     def set_channel_scope(self, user_id: str, channels: list[str] | None) -> None:
         """Set a user's per-channel RBAC scope (``None`` = all channels)."""
-        self._request("PUT", f"/users/{user_id}/channel-scope", json={"channels": channels})
+        self._request("PUT", f"/users/{_seg(user_id)}/channel-scope", json={"channels": channels})
 
     def delete_user(self, user_id: str) -> None:
-        self._request("DELETE", f"/users/{user_id}")
+        self._request("DELETE", f"/users/{_seg(user_id)}")
 
     def audit(self, *, limit: int = 100) -> AuditList:
         return _decode(self._get("/audit", limit=limit), AuditList)

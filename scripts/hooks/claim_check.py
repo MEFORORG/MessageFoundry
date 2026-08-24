@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Organization and contributors
 """Claim gate -- stop two sessions building the same backlog item in parallel (BACKLOG #309).
 
 `ledger_check.py` stops two sessions taking the same ADR/BACKLOG *number*. This stops them doing the same
@@ -46,6 +48,62 @@ _ITEM = re.compile(r"#(\d{1,5})\b")
 _DOC_PREFIXES = ("docs/", ".github/")
 _DOC_SUFFIXES = (".md",)
 
+# NEVER DOCUMENTATION, WHEREVER IT LIVES (BACKLOG #1345). The prefixes above classify by LOCATION, so
+# before this a file DECLARED ITSELF documentation merely by sitting under one -- and `.github/` holds
+# the CI workflows. Measured on this tree: 28 `.yml`/`.yaml` under `.github/` and 2 `.py` under
+# `docs/`, all of which a commit could change ALONE while the gate held it to no claim at all.
+# Rewiring CI is exactly the change two sessions can collide on, which is the collision this gate
+# exists to stop, so the extension decides before the directory does.
+_CODE_SUFFIXES = (
+    ".py",
+    ".ps1",
+    ".psm1",
+    ".sh",
+    ".yml",
+    ".yaml",
+    ".ts",
+    ".js",
+    ".mjs",
+    ".cjs",
+    ".toml",
+    ".cfg",
+    ".ini",
+)
+
+
+def _safe_for_message(value: object, limit: int = 400) -> str:
+    """Fold a value that is about to be INTERPOLATED INTO PROSE AN AGENT IS TOLD TO ACT ON.
+
+    BACKLOG #1040. This gate's deny text is read by a model that then does what it says, so any value
+    carrying a newline can forge a second remedy block -- and a forged block placed FIRST is the one a
+    reader reaching top-down obeys. That is not hypothetical: the same defect was proven on
+    ``worktree_gate.ps1``, where a ``Write`` whose ``file_path`` held embedded newlines produced a
+    reason with two ``Do this instead:`` blocks, the injected one first. It needed nothing on disk --
+    only the JSON field -- so no other gate saw it.
+
+    THE VALUE MOST WORTH FOLDING HERE IS ``note``. It is free text any peer writes with
+    ``claim.ps1 -Take <n> -Note "<what>"``, it is routinely hundreds of characters, and nothing
+    constrains its content. ``worktree`` and ``branch`` are folded too: a refname is not inert either,
+    because ``git check-ref-format`` accepts ``;``, ``$``, ``|``, ``"`` and ``'``.
+
+    A LOCAL HELPER RATHER THAN A SHARED MODULE, and the reason is mechanical rather than stylistic.
+    ``install-git-hooks.ps1`` COPIES this file into the git hooks directory and runs it from there
+    (``exec "$PY" "$HOOK_DIR/claim_check.py"``), so an import of anything under ``scripts/hooks/``
+    resolves at development time and fails at the moment the gate actually runs. ``collision_gate.ps1``
+    took a local copy of its PowerShell equivalent for exactly this reason, recorded on #1040.
+
+    Folds every line break to a space, collapses runs of whitespace, strips control characters, and
+    truncates -- so the value can still be READ, but it can no longer add a line.
+    """
+    text = "" if value is None else str(value)
+    # Control characters, not just \n and \r: a lone \x1b can rewrite a terminal line, and \x08 can
+    # erase what precedes it, so a value that "contains no newline" is not therefore inert.
+    text = "".join(" " if ch < " " or ch == "\x7f" else ch for ch in text)
+    text = " ".join(text.split())
+    if len(text) > limit:
+        text = text[: limit - 3] + "..."
+    return text
+
 
 def _git(*args: str) -> str:
     return subprocess.run(  # nosec B603 B607 - fixed argv, no shell, no caller-supplied executable
@@ -62,6 +120,10 @@ def _touches_code(paths: list[str]) -> bool:
     """True if any staged path is not documentation. An empty diff counts as no code (e.g. --amend of a
     message), so a message-only fixup is never blocked."""
     for p in paths:
+        # THE EXTENSION IS CHECKED FIRST, ON PURPOSE. It must OVERRIDE the location: the whole defect
+        # is that a prefix let an executable declare itself documentation.
+        if p.endswith(_CODE_SUFFIXES):
+            return True
         if p.startswith(_DOC_PREFIXES):
             continue
         if p.endswith(_DOC_SUFFIXES):
@@ -130,9 +192,10 @@ def main() -> int:
         if _norm(str(claim.get("worktree", ""))) != me:
             problems.append(
                 f"  BACKLOG #{item} is claimed by ANOTHER worktree:\n"
-                f"      held by: {claim.get('worktree')} [{claim.get('branch')}]\n"
-                f"      since  : {claim.get('claimed')}\n"
-                f"      note   : {claim.get('note')}\n"
+                f"      held by: {_safe_for_message(claim.get('worktree'))} "
+                f"[{_safe_for_message(claim.get('branch'))}]\n"
+                f"      since  : {_safe_for_message(claim.get('claimed'))}\n"
+                f"      note   : {_safe_for_message(claim.get('note'))}\n"
                 f"      Do not build it in parallel. Coordinate with that session, or if it is dead:\n"
                 f"          pwsh -NoProfile -File scripts\\coord\\claim.ps1 -Release {item} -Force"
             )

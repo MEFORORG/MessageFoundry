@@ -823,6 +823,11 @@ def _build_record(
         wake_fanout_per_s=wake_per_s,
         empty_claims_per_msg=empty_per_msg,
         fd_count_peak=proc.handles_peak,
+        # Carried BESIDE fd_count_peak, never instead of it: a consumer that sees None needs to know
+        # whether the probe could not measure or measured nothing, and those are different verdicts.
+        fd_probe_ticks=proc.probe_ticks,
+        fd_probe_degraded_ticks=proc.probe_degraded_ticks,
+        fd_probe_degraded=proc.probe_degraded,
         reload_seconds=reload_seconds,
         ack_p50_ms=ack.p50_ms,
         ack_p95_ms=ack.p95_ms,
@@ -952,9 +957,36 @@ def _empty_claims_per_msg(total_per_s: float, achieved_read_per_s: float) -> flo
     """Empty claims per message absorbed — the wall-clock-free form of wall #3 (BACKLOG #1101).
 
     Both inputs are Δ/span over the SAME first→last in-hold samples, so ``span`` cancels and this is
-    exactly ``Δempty_claims / Δread``. That is why it survives runner contention: slowing the run
-    scales numerator and denominator identically. The per-SECOND form does not — it keeps ``span`` in
-    the denominator, so a slow arm reads as an improvement, which is the defect #1101 records.
+    exactly ``Δempty_claims / Δread``. That removes the per-SECOND form's defect, which keeps ``span``
+    in the denominator so a slow arm reads as an improvement (#1101).
+
+    **IT IS NOT CONTENTION-IMMUNE, AND THIS DOCSTRING USED TO SAY IT WAS** (BACKLOG #1211). The old
+    wording — *"that is why it survives runner contention: slowing the run scales numerator and
+    denominator identically"* — is an argument from the algebra that the measurements refute. Three
+    excursions past the SLO band were recorded on `windows-2025`, on pull requests with ZERO overlap
+    with connscale, the store or the pipeline:
+
+    ===========  ============================  =====================  ==========
+    PR           reading at ``N=24``           band floor             short by
+    ===========  ============================  =====================  ==========
+    #343         36                            48.4 * 0.75 = 36.30    0.30
+    #355         34.9                          48.2 * 0.75 = 36.15    1.25
+    ===========  ============================  =====================  ==========
+
+    **The margin is widening across independent runs** (0.30 then 1.25) against a ``prior`` that
+    barely moved, which is a different signal from a single excursion.
+
+    WHY THE ALGEBRA DOES NOT DELIVER WHAT IT LOOKS LIKE IT DELIVERS: ``span`` cancelling makes the
+    ratio free of WALL CLOCK, not free of CONTENTION. The two counters do not respond to load
+    identically — empty claims are produced by POLLING, which continues on its own cadence, while
+    reads are produced by WORK ARRIVING. Under contention those two decouple, so their ratio moves
+    even though neither is divided by time. Cancelling ``span`` was necessary and is not sufficient.
+
+    **The SLO band is NOT widened here, deliberately.** ``_MONOTONIC_TOLERANCE`` is 0.25 and the row's
+    own re-score says the true distribution needs several deliberate samples at one N on a hosted
+    runner before anything is widened. Picking a wider number from these three points would be
+    choosing a constant to fit the failures I happen to have, which is how the 0.25 came to be
+    trusted in the first place. That half needs a seat that can iterate against the runner.
 
     Returns ``None`` when no messages were absorbed in the window. The ratio is genuinely undefined
     there and returning 0.0 would be a fabricated reading that then chains through the monotonicity
@@ -987,13 +1019,27 @@ _CPU_FLAT_GAP_SPAN_S = 5.0
 
 @dataclass(frozen=True)
 class _ProcDerived:
-    """Derived process-footprint gauges over the window (each None where the OS probe couldn't read)."""
+    """Derived process-footprint gauges over the window (each None where the OS probe couldn't read).
+
+    The last three fields are the window's probe PROVENANCE, not gauges: they say how much of the
+    window the OS probe actually measured and, where it did not, WHY. Without them a ``None`` gauge is
+    indistinguishable across a starved host, a dead process tree and a broken enumerator — three
+    conditions with three different verdicts."""
 
     handles_peak: int | None
     cpu_seconds_total: float | None
     cpu_util_cores_peak: float | None
     cpu_util_cores_mean: float | None
     working_set_peak_bytes: int | None
+    #: How many probe ticks this window collected at all. The SCOPE for the count below: "2 degraded"
+    #: means nothing without it, and 2-of-3 and 2-of-200 warrant opposite reactions.
+    probe_ticks: int
+    #: How many of those ticks were full gaps (:attr:`ProcSample.degraded` set).
+    probe_degraded_ticks: int
+    #: The DISTINCT degradation causes seen across the window, sorted. Values are
+    #: :class:`ProbeDegraded` members, carried as plain strings so the report layer need not import
+    #: the probe. Empty when every tick read something.
+    probe_degraded: tuple[str, ...]
 
 
 def _drain_proc(samples: list[EngineSample]) -> _ProcDerived:
@@ -1011,7 +1057,12 @@ def _drain_proc(samples: list[EngineSample]) -> _ProcDerived:
     the total and its elapsed span to ``covered_span``; a set-change interval is degraded to a gap (it
     contributes nothing), and the peak-cores loop is gated the same way. The flat-CPU-gap guard and
     ``cpu_mean`` are recomputed over ``covered_span``, and the CPU gauges degrade to ``None`` when zero
-    clean intervals contributed (or fewer than two CPU readings exist). See BACKLOG #220."""
+    clean intervals contributed (or fewer than two CPU readings exist). See BACKLOG #220.
+
+    It also carries the window's probe PROVENANCE through to the record: how many ticks were collected,
+    how many of those were full gaps, and the distinct causes behind them. The gauges alone cannot
+    express the difference between "the host was too slow to answer" and "the enumerator returned zero
+    rows" — both are ``None`` — and a consumer that has to choose a verdict needs exactly that."""
     readings: list[tuple[float, ProcSample]] = []
     for s in samples:
         proc = _PROC_BY_SAMPLE.pop(id(s), None)
@@ -1029,6 +1080,30 @@ def _drain_proc(samples: list[EngineSample]) -> _ProcDerived:
 
     handles_peak = max(handles) if handles else None
     ws_peak = max(working_set) if working_set else None
+
+    # Probe PROVENANCE for the window. A gauge that reads None because the host was starved and one
+    # that reads None because the enumerator is broken are the same value and opposite findings, so the
+    # causes the probe recorded per tick are carried through to the record rather than discarded here.
+    probe_ticks = len(readings)
+    degraded = [p.degraded for _, p in readings if p.degraded is not None]
+    causes = tuple(sorted({str(c) for c in degraded}))
+
+    def _derived(
+        cpu_total: float | None, cpu_peak: float | None, cpu_mean: float | None
+    ) -> _ProcDerived:
+        """Assemble the result, filling the provenance fields in ONE place. The CPU gauges have three
+        legitimate exit paths; routing them all through here means no path can ship a gap that has
+        dropped its cause on the way out."""
+        return _ProcDerived(
+            handles_peak=handles_peak,
+            cpu_seconds_total=cpu_total,
+            cpu_util_cores_peak=cpu_peak,
+            cpu_util_cores_mean=cpu_mean,
+            working_set_peak_bytes=ws_peak,
+            probe_ticks=probe_ticks,
+            probe_degraded_ticks=len(degraded),
+            probe_degraded=causes,
+        )
 
     cpu_total: float | None = None
     cpu_mean: float | None = None
@@ -1054,13 +1129,7 @@ def _drain_proc(samples: list[EngineSample]) -> _ProcDerived:
         if clean_intervals == 0:
             # Every interval was a membership change (or non-advancing time): no clean CPU measurement
             # survived, so report a gap rather than a fabricated 0.00.
-            return _ProcDerived(
-                handles_peak=handles_peak,
-                cpu_seconds_total=None,
-                cpu_util_cores_peak=None,
-                cpu_util_cores_mean=None,
-                working_set_peak_bytes=ws_peak,
-            )
+            return _derived(None, None, None)
         # A3 / B-class guard, recomposed over the summed clean span: a FLAT cumulative CPU counter over
         # a non-trivial covered span is not a physical "0% CPU" — the counter's unit is 100 ns (Windows
         # ticks) / a clock tick (POSIX), and we only got here because the process was READABLE. A live
@@ -1069,24 +1138,12 @@ def _drain_proc(samples: list[EngineSample]) -> _ProcDerived:
         # spawned). Reporting 0.00 here is the signature defect of this harness: a plausible number where
         # there is no measurement. Emit an explicit gap (None) so it renders "n/a" and draws no verdict.
         if total == 0.0 and covered_span >= _CPU_FLAT_GAP_SPAN_S:
-            return _ProcDerived(
-                handles_peak=handles_peak,
-                cpu_seconds_total=None,
-                cpu_util_cores_peak=None,
-                cpu_util_cores_mean=None,
-                working_set_peak_bytes=ws_peak,
-            )
+            return _derived(None, None, None)
         cpu_total = total
         cpu_peak = peak
         if covered_span > 0.0:
             cpu_mean = total / covered_span
-    return _ProcDerived(
-        handles_peak=handles_peak,
-        cpu_seconds_total=cpu_total,
-        cpu_util_cores_peak=cpu_peak,
-        cpu_util_cores_mean=cpu_mean,
-        working_set_peak_bytes=ws_peak,
-    )
+    return _derived(cpu_total, cpu_peak, cpu_mean)
 
 
 def _peak_int(values: list[int | None]) -> int | None:

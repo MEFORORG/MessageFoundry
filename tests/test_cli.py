@@ -735,12 +735,26 @@ def test_serve_insecure_bind_clamp_keys_on_enforcement_not_tier(
 # out explicitly (require_mfa = false). _expose_toml writes that opt-out by default.
 
 
+class _PassingProbe:
+    """Stand-in for TlsFloorProbe: the startup ladder reads only `.ok` and `.describe()`.
+
+    Stubbed to PASS for the same reason `uvicorn.run` is -- these cases test CONFIG gates, and
+    the probe's own network behaviour is covered by tests/test_tls_floor_probe.py. Stubbing it
+    to FAIL would assert the probe rather than the ladder."""
+
+    ok = True
+
+    def describe(self) -> str:
+        return "stubbed probe (test)"
+
+
 def _expose_toml(
     tmp_path: Path,
     *,
     require_mfa: bool = False,
     enforcement: str | None = None,
     synthetic: bool = False,
+    public_origin: str | None = None,
 ) -> None:
     """A non-loopback bind (exposed via a declared TLS-terminating proxy) with egress locked down.
 
@@ -774,7 +788,18 @@ def _expose_toml(
         # Declared here with the rest of the non-MFA plumbing so no case in this file is reading
         # the LAST rung's output while asserting on the one under test.
         "security.memory_encryption_operator_declared = true\n"
-        '[api]\ntls_terminated_upstream = true\ntrusted_proxies = ["10.0.0.1"]\n'
+        # BACKLOG #1026: a PHI instance behind a declared terminator under `enforce` now REFUSES
+        # without a public address, because the ASVS 12.1.1 probe dials it and an unset value
+        # silently disabled that check. Opt-in (default None) so only the cases that reach the
+        # refusal declare it and the rest of this file is untouched. The AUTHORED key is
+        # `[security].web_console_public_address` -- ADR 0118 retired `[api].public_origin`, which
+        # is the internal settings name and is refused outright.
+        + (
+            f'security.web_console_public_address = "{public_origin}"\n'
+            if public_origin is not None
+            else ""
+        )
+        + '[api]\ntls_terminated_upstream = true\ntrusted_proxies = ["10.0.0.1"]\n'
         'proxy_intra_service_auth = "network"\nproxy_tls_min_version = "1.2"\n'
         "[retention]\ndead_letter_days = 30\n" + _SECURE_ALERTS,
         encoding="utf-8",
@@ -885,9 +910,12 @@ def test_serve_exposed_with_mfa_on_starts_in_prod(
     # so the ONLY posture under test is require_mfa.
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("MEFOR_STORE_ENCRYPTION_KEY", "x" * 44)
-    _expose_toml(tmp_path, require_mfa=True)
+    _expose_toml(tmp_path, require_mfa=True, public_origin="https://mefor.example.org")
     monkeypatch.setattr("messagefoundry.api.create_managed_app", lambda **kw: object())
     monkeypatch.setattr("uvicorn.run", lambda *a, **k: None)
+    monkeypatch.setattr(
+        "messagefoundry.config.tls_probe.probe_tls_floor", lambda origin: _PassingProbe()
+    )
     assert (
         main(["serve", "--config", str(SAMPLES_CONFIG), "--allow-insecure-bind", "--env", "prod"])
         == 0
@@ -913,6 +941,9 @@ def test_serve_exposed_prod_phi_single_factor_ack_starts_with_warning(
         # ADR 0152 rung 2 declaration (see _expose_toml): the single-factor ACK is what is on
         # trial here, not the last rung in the ladder.
         "security.memory_encryption_operator_declared = true\n"
+        # BACKLOG #1026, same reason: a declared-terminator PHI instance under `enforce` refuses
+        # without a public address, and the single-factor ACK is what is on trial here.
+        'security.web_console_public_address = "https://mefor.example.org"\n'
         '[api]\ntls_terminated_upstream = true\ntrusted_proxies = ["10.0.0.1"]\n'
         'proxy_intra_service_auth = "network"\nproxy_tls_min_version = "1.2"\n'
         "[retention]\ndead_letter_days = 30\n" + _SECURE_ALERTS,
@@ -920,6 +951,9 @@ def test_serve_exposed_prod_phi_single_factor_ack_starts_with_warning(
     )
     monkeypatch.setattr("messagefoundry.api.create_managed_app", lambda **kw: object())
     monkeypatch.setattr("uvicorn.run", lambda *a, **k: None)
+    monkeypatch.setattr(
+        "messagefoundry.config.tls_probe.probe_tls_floor", lambda origin: _PassingProbe()
+    )
     assert (
         main(["serve", "--config", str(SAMPLES_CONFIG), "--allow-insecure-bind", "--env", "prod"])
         == 0
@@ -1989,3 +2023,125 @@ def test_serve_require_encryption_starts_with_configured_key(
     monkeypatch.setattr("uvicorn.run", lambda *a, **k: None)
     assert main(["serve", "--config", str(SAMPLES_CONFIG), "--env", "dev"]) == 0
     assert "require_encryption" not in capsys.readouterr().err  # presence satisfied → no refusal
+
+
+# --- BACKLOG #1236 / ADR 0171: offline sole-administrator lockout recovery ------------------------
+
+
+def _seed_locked(db: Path, *, locked_until: float | None) -> tuple[str, str]:
+    """Create a local account and set its lockout state directly. Returns (user_id, password_hash)."""
+    import asyncio
+
+    from messagefoundry.auth import hash_password
+    from messagefoundry.store.store import MessageStore
+
+    async def seed() -> tuple[str, str]:
+        s = await MessageStore.open(db)
+        try:
+            pw_hash = hash_password("a-strong-test-passphrase")
+            await s.create_user(
+                user_id="u-locked",
+                username="admin",
+                auth_provider="local",
+                password_hash=pw_hash,
+            )
+            if locked_until is not None:
+                await s.record_login_failure(
+                    "u-locked", failed_attempts=5, locked_until=locked_until
+                )
+            return ("u-locked", pw_hash)
+        finally:
+            await s.close()
+
+    return asyncio.run(seed())
+
+
+def _read_lock(db: Path) -> tuple[float | None, str | None]:
+    import asyncio
+
+    from messagefoundry.store.store import MessageStore
+
+    async def read() -> tuple[float | None, str | None]:
+        s = await MessageStore.open(db)
+        try:
+            u = await s.get_user_by_username("admin")
+            assert u is not None
+            return (u.locked_until, u.password_hash)
+        finally:
+            await s.close()
+
+    return asyncio.run(read())
+
+
+def test_admin_unlock_clears_the_lock_without_waiting_and_leaves_the_password_alone(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """THE ITEM'S ACCEPTANCE CRITERION, and it is the amended one rather than the filed one.
+
+    #1236's filed test -- "recover without editing the database and without a second admin" -- PASSES
+    ON THE SHIPPED SYSTEM BY WAITING, because the lock self-expires after `lockout_minutes`. A test a
+    defect-free system and the defective system both pass is not a test. The amendment requires
+    recovery reachable ON DEMAND and FASTER than that window.
+
+    So this locks the account until FAR in the future and never advances any clock. Waiting cannot
+    satisfy it; only the recovery path can.
+    """
+    import time
+
+    monkeypatch.chdir(tmp_path)
+    db = tmp_path / "unlock.db"
+    _, pw_hash = _seed_locked(db, locked_until=time.time() + 86_400)  # a day out: unwaitable
+
+    assert main(["admin-unlock", "--username", "admin", "--db", str(db)]) == 0
+    assert "UNCHANGED" in capsys.readouterr().out
+
+    locked_until, after_hash = _read_lock(db)
+    assert locked_until is None, "the lockout was not cleared"
+    assert after_hash == pw_hash, "the password changed -- unlock must be narrower than a reset"
+
+
+def test_admin_unlock_refuses_a_missing_store_rather_than_creating_one(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # M-31: a SQLite store is CREATED on open, so a typo'd path would yield a fresh empty DB and a
+    # "no such user" -- which reads as a wrong USERNAME when the truth is a wrong DATABASE.
+    monkeypatch.chdir(tmp_path)
+    missing = tmp_path / "nope.db"
+    assert main(["admin-unlock", "--username", "admin", "--db", str(missing), "--json"]) == 1
+    payload = json.loads(capsys.readouterr().out)
+    assert "refusing to create one" in payload["error"]
+    assert not missing.exists(), "the refusal still created the database"
+
+
+def test_admin_unlock_reports_an_unknown_account_as_json(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    db = tmp_path / "unlock2.db"
+    _seed_locked(db, locked_until=None)
+    assert main(["admin-unlock", "--username", "ghost", "--db", str(db), "--json"]) == 1
+    assert "ghost" in json.loads(capsys.readouterr().out)["error"]
+
+
+def test_admin_unlock_writes_an_audit_row(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """An unlock affordance is a control an attacker wants, so its use must be recorded."""
+    import asyncio
+    import time
+
+    from messagefoundry.store.store import MessageStore
+
+    monkeypatch.chdir(tmp_path)
+    db = tmp_path / "unlock3.db"
+    _seed_locked(db, locked_until=time.time() + 86_400)
+    assert main(["admin-unlock", "--username", "admin", "--db", str(db)]) == 0
+
+    async def rows() -> list[str]:
+        s = await MessageStore.open(db)
+        try:
+            return [r["action"] for r in await s.list_audit(limit=50)]
+        finally:
+            await s.close()
+
+    assert "auth.admin_unlocked" in asyncio.run(rows())

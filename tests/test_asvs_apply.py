@@ -405,3 +405,296 @@ def test_scorecard_path_is_required_and_has_no_default(tmp_path: Path) -> None:
     with pytest.raises(SystemExit) as e:
         main([str(_payload(tmp_path, [_cell_111()]))])
     assert e.value.code == 2  # argparse usage error, not a silent fallback
+
+
+def test_an_unknown_key_INSIDE_a_subtable_entry_survives() -> None:  # #1242 limb 4
+    """The carry-through was delivered for TOP-LEVEL scalars and silently not for sub-table entries.
+
+    Evidence and absence entries were re-emitted as exactly path/line/expect and
+    pattern/positive_control/mutation, so any other field in an entry vanished on every rewrite --
+    the same silent loss as the allowlist incident, one level down, and equally invisible because an
+    absent field reads as a valid default.
+
+    The key used here is deliberately one the writer has never heard of. A test naming a field that
+    exists today would pass against a fix that simply lengthened the list, which is the defect again.
+    """
+    cell = {
+        "id": "1.2.3",
+        "level": 1,
+        "verdict": "Pass",
+        "last_verified": "2026-08-14",
+        "verified_at": "0" * 40,
+        "evidence": [
+            {"path": "a.py", "line": 3, "expect": "x", "a_future_note": "must survive"},
+        ],
+        "absence": [
+            {"pattern": "p", "positive_control": "c", "mutation": "m", "a_future_flag": True},
+        ],
+    }
+    out = render(cell)
+    assert 'a_future_note = "must survive"' in out
+    assert "a_future_flag = true" in out
+    # The ordered keys must be untouched, TYPES included -- `line` stays a bare int. Carrying unknown
+    # fields through is worthless if it re-types the known ones on the way past.
+    assert "  line = 3" in out
+    assert '  path = "a.py"' in out
+    assert '  pattern = "p"' in out
+
+
+def test_the_preservation_backstop_fires_when_a_SUBTABLE_field_is_dropped(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """MUTATION PROOF for the sub-table half of the invariant.
+
+    The test above proves the carry-through works today; this proves the record is still DEFENDED if
+    someone breaks it. Counting entries cannot see a field vanish from inside one, so before this the
+    writer and the guard were blind in the same place -- a rewrite could drop a field from every
+    evidence entry, keep the count, and report green.
+    """
+    import scripts.asvs.apply as mod
+
+    real_render = mod.render
+
+    def dropping_render(cell: dict, live: dict | None = None) -> str:
+        text = real_render(cell, live)
+        kept = [ln for ln in text.splitlines() if not ln.strip().startswith("expect = ")]
+        return "\n".join(kept) + "\n"
+
+    monkeypatch.setattr(mod, "render", dropping_render)
+    rec = _record(tmp_path)
+    before = rec.read_bytes()
+    rc = main([str(_payload(tmp_path, [_cell_111()])), "--scorecard", str(rec), "--apply"])
+    assert rc == 1, "a field was dropped from every evidence entry and the invariant did not fire"
+    assert rec.read_bytes() == before, "refused, but wrote anyway"
+    # It must refuse for THIS reason. Several other guards in this writer also return 1, and a
+    # mutation proof that passes by tripping an unrelated check proves nothing about its invariant.
+    out = capsys.readouterr().out
+    assert "evidence[0] would LOSE" in out and "expect" in out, out
+
+
+# --- #1242: the value half. Carrying a KEY while corrupting its VALUE is not carrying it. ---------
+
+
+def test_a_table_or_array_value_ROUND_TRIPS_rather_than_becoming_a_repr(tmp_path: Path) -> None:
+    """The writer used to emit any non-bool, non-int value as ``toml_str(str(value))``, so a table
+    became a quoted PYTHON REPR: ``sym_table = "{'a': 1}"``. That parses, so nothing went red, and
+    re-reading returned the STRING -- the value was unrecoverable from the file.
+
+    THE ASSERTION IS THE ROUND TRIP, NOT THE RENDERING. Checking the emitted text looks right passes
+    against a serializer that emits JSON (``{"a": 1}``), which is not TOML and will not parse. Only
+    reading it back with the same parser the record is read with proves the value survived.
+    """
+    rec = _record(tmp_path)
+    payload = _cell_111(
+        sym_table={"a": 1, "b": "two"},
+        sym_list=[1, "x", True],
+        deep={"outer": {"inner": "v"}},
+        rows=[{"a": 1}, {"b": 2}],
+        ratio=1.5,
+        flag=True,
+    )
+    rc = main([str(_payload(tmp_path, [payload])), "--scorecard", str(rec), "--apply"])
+    assert rc == 0
+
+    cell = next(
+        c for c in tomllib.loads(rec.read_text(encoding="utf-8"))["cell"] if c["id"] == "1.1.1"
+    )
+    for key in ("sym_table", "sym_list", "deep", "rows", "ratio", "flag"):
+        assert cell[key] == payload[key], f"{key} did not survive the write: {cell[key]!r}"
+
+
+def test_a_DOTTED_key_is_QUOTED_rather_than_silently_re_nested(tmp_path: Path) -> None:
+    """THE ONLY BAD KEY THAT FAILS QUIETLY, and the reason the quoting rule is unconditional.
+
+    A dotted key is not a syntax error in TOML -- it is a NESTING OPERATOR. Emitted bare,
+    ``{1.2.2 = "x"}`` is VALID and reads back as ``{'1': {'2': {'2': 'x'}}}``: the file loads, the
+    gate stays green, the structure differs. Spaces and quotes fail LOUDLY and are therefore safe.
+
+    It is not hypothetical here -- ASVS requirement ids ARE that shape. A test using only plain keys
+    passes either way, which is why this one uses a dotted key specifically, with a plain key beside
+    it as the negative control.
+    """
+    rec = _record(tmp_path)
+    payload = _cell_111(dotted={"1.2.2": "pass", "12.1.1": "fail"}, plain={"ok": 1})
+    rc = main([str(_payload(tmp_path, [payload])), "--scorecard", str(rec), "--apply"])
+    assert rc == 0
+
+    cell = next(
+        c for c in tomllib.loads(rec.read_text(encoding="utf-8"))["cell"] if c["id"] == "1.1.1"
+    )
+    assert cell["dotted"] == {"1.2.2": "pass", "12.1.1": "fail"}, cell["dotted"]
+    assert cell["plain"] == {"ok": 1}  # the control: plain keys were never the problem
+
+
+def test_the_TYPE_guard_refuses_a_value_the_writer_would_have_mangled(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """MUTATION PROOF for the value half, and the reason the key-set check is not enough.
+
+    ``lost = set(was) - set(now)`` is a pure KEY-SET difference: a type-mangled field KEEPS ITS KEY,
+    so it passes. That is not a flaw in that check -- it was written to catch DROPPED keys and it
+    does -- but it means a rewrite could corrupt every value while preserving every key and report
+    green. Without the type comparison this mutation is invisible.
+    """
+    import scripts.asvs.apply as mod
+
+    rec = _record(tmp_path)
+    # First write the table for real, so the LIVE record holds a table to be corrupted.
+    assert (
+        main(
+            [
+                str(_payload(tmp_path, [_cell_111(sym_table={"a": 1})])),
+                "--scorecard",
+                str(rec),
+                "--apply",
+            ]
+        )
+        == 0
+    )
+
+    real_render = mod.render
+
+    def mangling_render(cell: dict, live: dict | None = None) -> str:
+        text = real_render(cell, live)
+        return text.replace("sym_table = { a = 1 }", "sym_table = \"{'a': 1}\"")
+
+    monkeypatch.setattr(mod, "render", mangling_render)
+    before = rec.read_bytes()
+    # The payload deliberately does NOT mention sym_table: this is the WRITER changing a type nobody
+    # asked it to change, which is exactly the case the guard is scoped to.
+    rc = main([str(_payload(tmp_path, [_cell_111()])), "--scorecard", str(rec), "--apply"])
+
+    assert rc == 1
+    assert rec.read_bytes() == before, "refused, but wrote anyway"
+    # It must refuse for THIS reason -- several other guards here also return 1, and a mutation proof
+    # that passes by tripping an unrelated check proves nothing about the invariant it claims.
+    out = capsys.readouterr().out
+    assert "would CHANGE the TYPE" in out and "sym_table" in out, out
+
+
+def test_the_TYPE_guard_does_NOT_refuse_a_payload_that_intentionally_retypes(
+    tmp_path: Path,
+) -> None:
+    """THE SCOPING, and without it the guard gets disabled the first time it cries wolf.
+
+    The check compares the VAULT against the REWRITTEN FILE, so an unscoped version would also refuse
+    a payload that legitimately changes a field's type -- schema evolution, a scalar becoming a
+    table. That is an EDIT, not damage. The corruption case is the WRITER retyping a key the payload
+    never mentioned, so the check skips keys the payload carries.
+    """
+    rec = _record(tmp_path)
+    assert (
+        main(
+            [
+                str(_payload(tmp_path, [_cell_111(note="a plain string")])),
+                "--scorecard",
+                str(rec),
+                "--apply",
+            ]
+        )
+        == 0
+    )
+    # Same key, deliberately a different type, stated by the payload.
+    rc = main(
+        [
+            str(_payload(tmp_path, [_cell_111(note={"now": "a table"})])),
+            "--scorecard",
+            str(rec),
+            "--apply",
+        ]
+    )
+    assert rc == 0, "an intentional retype by the payload must be allowed"
+
+    cell = next(
+        c for c in tomllib.loads(rec.read_text(encoding="utf-8"))["cell"] if c["id"] == "1.1.1"
+    )
+    assert cell["note"] == {"now": "a table"}
+
+
+# --- BACKLOG #1307: a retirement is a SANCTIONED outcome the writer could not express -------------
+#
+# The shrink guard refuses any payload where an evidence or absence list gets shorter, and it took no
+# flag. But the tracking loop names four causes for an anchor that no longer resolves, and one of them
+# is "the gap it certified was CLOSED, so retire it" -- the case where the engine got BETTER and the
+# fix deleted the line the anchor quoted. That left a maintainer with a legitimate retirement choosing
+# between a stale anchor and the unsafe writer.
+#
+# THE GUARD IS CORRECT AND IS NOT WIDENED. It exists because a truncating repair once cut one cell
+# 15 -> 10 and another 17 -> 1 with the verifier green throughout. So the four arms below pin that the
+# only way through is a DECLARED retirement whose arithmetic agrees -- the flag alone opens nothing.
+
+
+def _shrunk_111(**over: object) -> dict:
+    """The 1.1.1 payload with one of its two evidence anchors removed."""
+    cell = _cell_111()
+    cell["evidence"] = cell["evidence"][:1]
+    cell.update(over)
+    return cell
+
+
+def test_a_shrink_is_still_refused_without_the_flag(tmp_path: Path) -> None:
+    """MUST REFUSE. The default is unchanged: a silent cardinality drop is the thing the guard is
+    for, and #1307 must not have relaxed it."""
+    rec = _record(tmp_path)
+    rc = main([str(_payload(tmp_path, [_shrunk_111()])), "--scorecard", str(rec), "--apply"])
+    assert rc == 1
+    assert rec.read_text(encoding="utf-8") == FIXTURE, "a refused run must not touch the file"
+
+
+def test_the_flag_alone_does_not_unlock_a_shrink(tmp_path: Path) -> None:
+    """MUST REFUSE, AND THIS IS THE ARM THAT MAKES THE FEATURE SAFE RATHER THAN A BYPASS.
+
+    A bare `--allow-retirement` behaving like `--allow-verdict-change` would convert the guard into a
+    speed bump: the flag would be reached for reflexively on any refusal. The payload has to say WHAT
+    is being retired."""
+    rec = _record(tmp_path)
+    rc = main(
+        [
+            str(_payload(tmp_path, [_shrunk_111()])),
+            "--scorecard",
+            str(rec),
+            "--apply",
+            "--allow-retirement",
+        ]
+    )
+    assert rc == 1
+    assert rec.read_text(encoding="utf-8") == FIXTURE
+
+
+def test_a_declaration_whose_arithmetic_disagrees_is_refused(tmp_path: Path) -> None:
+    """MUST REFUSE. Declaring ONE retirement while the count drops by TWO is the shape that would
+    let a truncation ride in behind a legitimate-looking declaration -- which is precisely the
+    incident the guard was built for, wearing a permit."""
+    rec = _record(tmp_path)
+    # DROPS ONE (2 -> 1) but DECLARES TWO. Deliberately this direction rather than dropping both:
+    # an empty evidence list trips a DIFFERENT guard ("partial needs at least one anchor"), and the
+    # first version of this test did exactly that -- it passed while never reaching the arithmetic
+    # check at all. Caught by mutating the check away and seeing NOTHING go red.
+    cell = _cell_111()
+    cell["evidence"] = cell["evidence"][:1]
+    cell["retired_evidence"] = ["messagefoundry/m.py:10", "messagefoundry/m.py:20"]
+    rc = main(
+        [str(_payload(tmp_path, [cell])), "--scorecard", str(rec), "--apply", "--allow-retirement"]
+    )
+    assert rc == 1
+    assert rec.read_text(encoding="utf-8") == FIXTURE
+
+
+def test_a_declared_retirement_whose_arithmetic_agrees_is_applied(tmp_path: Path) -> None:
+    """MUST APPLY -- the arm without which the other three are satisfied by a writer that refuses
+    everything, and the outcome the item exists to make reachable."""
+    rec = _record(tmp_path)
+    rc = main(
+        [
+            str(_payload(tmp_path, [_shrunk_111(retired_evidence=["messagefoundry/m.py:20"])])),
+            "--scorecard",
+            str(rec),
+            "--apply",
+            "--allow-retirement",
+        ]
+    )
+    assert rc == 0, "a declared, arithmetic-consistent retirement must go through"
+    after = rec.read_text(encoding="utf-8")
+    assert "verify_mode" not in after, "the retired anchor should be gone"
+    assert "tls_cert_file" in after, "the surviving anchor must remain"
+    assert "5.4.3" in after, "the untouched cell must survive byte-for-byte"

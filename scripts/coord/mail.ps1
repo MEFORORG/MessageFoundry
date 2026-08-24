@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Organization and contributors
 <#
 .SYNOPSIS
     Asynchronous session-to-session mail for the sessions the realtime channel cannot reach.
@@ -160,6 +162,7 @@ function Get-MailRoot {
 $MAIL_CAP_MESSAGES = 5
 $MAIL_CAP_BODY_BYTES = 2000
 $MAIL_CAP_TOTAL_BYTES = 8000
+$MAIL_CAP_LINE_CHARS = 240
 
 function Initialize-Box {
     param([Parameter(Mandatory)][string]$Root, [Parameter(Mandatory)][string]$Key)
@@ -315,8 +318,33 @@ if ($Send) {
     if ($Body.Length -gt $MAIL_CAP_BODY_BYTES) {
         throw ("-Body is $($Body.Length) characters; the receiver renders at most $MAIL_CAP_BODY_BYTES per message and " +
             "truncates the rest. Write the long form to a file in your worktree and mail the PATH. " +
+            "There is AT LEAST ONE MORE CAP this sender also checks -- a per-line one -- and the drain " +
+            "may apply others: passing here is not a prediction that your message renders whole. " +
             "(This check is a courtesy, NOT a control: the cap that binds is in mail-drain.ps1, because " +
             "anyone who can write a file into the inbox never runs this code.)")
+    }
+    # SECOND ARM, and the two are disjoint: a body well under the byte cap still loses any line over
+    # $MAIL_CAP_LINE_CHARS, cut mid-sentence at render. Measured 2026-08-18 across five senders, the
+    # byte arm alone missed every line-cap truncation in the corpus -- the caps bind independently, so
+    # one test cannot stand in for the other.
+    #
+    # Deliberately measured on the RAW line, not a folded copy. The drain folds before it cuts, and
+    # folding only ever SHORTENS (control chars and non-ASCII map 1:1, whitespace runs collapse, Trim
+    # trims), so raw <= cap implies folded <= cap and this arm has no false negatives. It can refuse a
+    # whitespace-heavy line the renderer would have kept -- accepted, because the alternative is a
+    # SECOND copy of Get-Fold in the sender, and this file's own header says why duplicated logic here
+    # is the thing that drifts. The over-refusal is visible in the message below rather than silent.
+    $long = @($Body -split "`r?`n" | Where-Object { $_.Length -gt $MAIL_CAP_LINE_CHARS })
+    if ($long.Count -gt 0) {
+        $worst = ($long | Measure-Object -Property Length -Maximum).Maximum
+        throw ("-Body has $($long.Count) line(s) over $MAIL_CAP_LINE_CHARS characters (longest $worst); " +
+            "the receiver folds each line and cuts what is left over $MAIL_CAP_LINE_CHARS, so those lines " +
+            "arrive truncated mid-sentence even though the body is under the $MAIL_CAP_BODY_BYTES-byte cap. " +
+            "Wrap the body, or write the long form to a file and mail the PATH. A line just over may " +
+            "survive intact if it carries runs of whitespace, which the fold collapses first. " +
+            "This arm and the byte arm above are what THIS sender checks; the drain may cut for reasons " +
+            "neither of them models, so clearing both is not a guarantee of an intact render. " +
+            "(A courtesy like the byte check above, NOT a control: mail-drain.ps1 holds the cap that binds.)")
     }
     if (-not $To) { throw "-To is required (a worktree path). Refusing to guess a recipient." }
 
@@ -343,7 +371,7 @@ if ($Send) {
         $me = (Get-Location).Path.TrimEnd('\', '/').ToLowerInvariant()
         foreach ($r in $roster) {
             # Cwd, NOT Worktree. `Worktree` is the roster's DISPLAY LABEL -- a bare leaf name like
-            # `builder-1-session-d229ce` -- while `Cwd` carries the addressable absolute path. The two
+            # `builder-<n>-session-<hex>` -- while `Cwd` carries the addressable absolute path. The two
             # fields answer neighbouring questions and only one of them is an address.
             #
             # MEASURED 2026-08-13, AND IT HAD EATEN EVERY BROADCAST THIS REPO EVER SENT.
@@ -449,7 +477,14 @@ if ($Send) {
         # The sender is told what queuing does and does NOT mean. A queued message is not a delivered one,
         # and the difference is the entire failure mode this channel is designed to make visible.
         Write-Host "  Queued is not delivered. It is delivered when that session's drain hook next runs and"
-        Write-Host "  writes a receipt under mefor-coord/mail/receipts/. Check with -Status."
+        Write-Host "  writes a receipt under mefor-coord/mail/receipts/<id>.json, keyed on the id above."
+        # NAMING THE RECEIPT, NOT -Status, AND THAT IS A CORRECTION (BACKLOG #1228). -Status reports
+        # THIS worktree's own box -- what was sent TO you -- so it can never answer "was the message I
+        # SENT ever read". Pointing the sender at it sent them to a view that cannot contain the
+        # answer, which is worse than silence because it looks like the check was performed.
+        Write-Host "  Read that file to see what became of it. disposition 'shown-consumed' or"
+        Write-Host "  'shown-held' means it was rendered; 'expired-unshown' means it reached its TTL"
+        Write-Host "  first and NOBODY EVER SAW IT; no file at all means no drain has run yet."
         Write-Host ""
     }
     if (@($written | Where-Object { $_.Status -ne 'queued' }).Count -gt 0) { exit 1 }
@@ -466,6 +501,13 @@ if ($List) {
                 Inbox    = @(Get-BoxMessages -Root $root -Key $d.Name -Sub 'inbox').Count
                 Seen     = @(Get-BoxMessages -Root $root -Key $d.Name -Sub 'seen').Count
                 Done     = @(Get-BoxMessages -Root $root -Key $d.Name -Sub 'done').Count
+                # EXPIRY IS OTHERWISE VISIBLE FOR ONE TURN AND THEN GONE (BACKLOG #1228). The drain
+                # sweeps a message past its TTL into expired/ and says so once, in the render of the
+                # turn that swept it. After that no surface names it: the sender's receipt says
+                # queued, the recipient was never told, and both counts above stay whole. A message
+                # that expired unshown is the one outcome this channel most needs to be able to
+                # report, so it must be countable after the fact and not only as it happens.
+                Expired  = @(Get-BoxMessages -Root $root -Key $d.Name -Sub 'expired').Count
                 # A claim mid-flight and a claim whose owner died are different facts, and neither is
                 # visible from inbox/seen alone -- a claimed message is in NEITHER.
                 Claiming = @(Get-BoxMessages -Root $root -Key $d.Name -Sub 'claiming').Count
@@ -483,8 +525,8 @@ if ($List) {
     Write-Host "Mail boxes under $root  (as of $([DateTime]::UtcNow.ToString('o')))"
     if ($boxes.Count -eq 0) { Write-Host "  (none)" }
     foreach ($b in $boxes) {
-        Write-Host ("  {0,-52} inbox={1} shown={2} seen={3} done={4} claiming={5} stranded={6}" -f `
-                $b.Key, $b.Inbox, $b.Shown, $b.Seen, $b.Done, $b.Claiming, $b.Stranded)
+        Write-Host ("  {0,-52} inbox={1} shown={2} seen={3} done={4} claiming={5} stranded={6} expired={7}" -f `
+                $b.Key, $b.Inbox, $b.Shown, $b.Seen, $b.Done, $b.Claiming, $b.Stranded, $b.Expired)
     }
     Write-Host ""
     exit 0
@@ -497,6 +539,9 @@ $inbox = @(Get-BoxMessages -Root $root -Key $key -Sub 'inbox')
 $seen = @(Get-BoxMessages -Root $root -Key $key -Sub 'seen')
 $claiming = @(Get-BoxMessages -Root $root -Key $key -Sub 'claiming')
 $stranded = @(Get-BoxMessages -Root $root -Key $key -Sub 'stranded')
+# See the note in the -List block: without this, a swept message is nameable only during the turn that
+# swept it, and silence afterwards is indistinguishable from nothing having expired.
+$expired = @(Get-BoxMessages -Root $root -Key $key -Sub 'expired')
 # SHOWING IS NOT CONSUMING, so "Undelivered: <inbox count>" would be a lie. The drain renders mail at
 # SessionStart and LEAVES IT IN THE INBOX, consuming it only at that session's next turn boundary --
 # see docs/SESSION-MAIL.md, "Showing is not consuming". Counting held mail as undelivered would put the
@@ -527,6 +572,7 @@ if ($Json) {
             Worktree = $here; Key = $key; Inbox = $inbox.Count; Seen = $seen.Count
             ShownHeld = $shownHeld
             Claiming = $claiming.Count; Stranded = $stranded.Count
+            Expired = $expired.Count
             NextDrainShowsAtLeast = $fits
             MailRoot = $root; AsOfUtc = [DateTime]::UtcNow.ToString('o')
         } | ConvertTo-Json -Depth 4) | Write-Output
@@ -547,6 +593,9 @@ Write-Host "               turn boundary after OFF is removed."
 Write-Host ("Next drain shows: at least {0} of {1} (caps: {2} messages / {3} bytes); {4} deferred to later drains." -f `
         $fits, $inbox.Count, $MAIL_CAP_MESSAGES, $MAIL_CAP_TOTAL_BYTES, [Math]::Max(0, $inbox.Count - $fits))
 Write-Host "In flight:     $($claiming.Count) claimed by a drain that has not finished"
+Write-Host "Expired:       $($expired.Count) swept past their TTL. NOBODY WAS TOLD -- expiry is silent to"
+Write-Host "               the sender and to the recipient, so a non-zero count here is the only place"
+Write-Host "               a message that died unread is named after the turn that swept it."
 Write-Host "As of:         $([DateTime]::UtcNow.ToString('o'))"
 
 if ($stranded.Count -gt 0) {

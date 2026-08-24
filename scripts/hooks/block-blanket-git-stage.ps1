@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Organization and contributors
 # PreToolUse guard: block blanket git staging so parallel Claude Code sessions sharing a working
 # tree can't sweep each other's files into one commit. Reads the tool-call JSON on stdin; if the
 # command does a broad stage (git add -A/--all/-u/. or git commit -a/-am/--all) it returns a
@@ -24,7 +26,20 @@ $reason = $null
 # Examine each shell-separated simple command on its own, so '... && git add -A' is still caught.
 foreach ($seg in [regex]::Split($cmd, '(\|\||&&|[;|&\n])')) {
     $s = $seg.Trim()
-    if ($s -cnotmatch '^git(\s|$)') { continue }
+    # The PROGRAM NAME is matched case-INSENSITIVELY, and only it. Windows resolves git, Git and
+    # GIT to the same git.exe, so 'Git add -A' staged the tree while 'git add -A' was denied. The
+    # subcommand and flag tests below stay -cmatch on purpose: git rejects 'git ADD', and '-A' and
+    # '-a' are different flags.
+    #
+    # '^' pins this to the front of a SEGMENT, which is NOT the same as program position -- the
+    # splitter above carries no quote or line state, so quoted text after a newline, ';', '|' or
+    # '&' also lands at a segment front. That makes prose quoting a blanket-stage command deny.
+    # The class is pre-existing: every measured case has a lowercase twin that already denied, so
+    # this widens it from one spelling to all rather than creating it. What it costs, and what
+    # would actually fix it, are recorded ONCE in tests/test_blanket_stage_guard.py. Read that
+    # before widening this line further; the sibling worktree_gate.ps1 had a case fix rejected
+    # over this same class (BACKLOG #1305).
+    if ($s -inotmatch '^git(\s|$)') { continue }
 
     # git add with -A / --all / -u / a bare '.' (stages the whole tree).
     if ($s -cmatch '\badd\b' -and $s -cmatch '(^|\s)(-A|--all|-u|\.)(\s|$)') {

@@ -72,6 +72,7 @@ from messagefoundry.config.settings import (
 from messagefoundry.config.tls_policy import (
     HopDisposition,
     HopPosture,
+    harden_cipher_suites,
     is_loopback_hop_host,
     revocation_hop_disposition,
     tls_revocation_attested,
@@ -80,6 +81,7 @@ from messagefoundry.parsing.binary import strip_documents as _strip_documents
 from messagefoundry.redaction import safe_text
 from messagefoundry.store.audit_tee import emit_audit_tee
 from messagefoundry.store.base import (
+    UPLOAD_RESERVATION_STALE_AFTER,
     Row,
     acquire_pooled,
     warm_pool_connections,
@@ -148,6 +150,7 @@ from messagefoundry.store.store import (
     delivery_key,
     not_deployed_detail,
     owned_lane_scope,
+    password_claim_set,
     should_record_event,
 )
 
@@ -495,6 +498,16 @@ _SCHEMA: list[str] = [
         invocations BIGINT NOT NULL DEFAULT 0,
         updated_at  DOUBLE PRECISION NOT NULL
     )""",
+    # Cross-process upload-quota reservation (ASVS 2.3.4, BACKLOG #1112) — see the SQLite `_SCHEMA`
+    # for the in-flight-only rationale. This is the backend a real sharded deployment runs:
+    # `require_unified_store` makes a server DB mandatory past one shard. No PHI (an account id and
+    # two counters).
+    """CREATE TABLE IF NOT EXISTS upload_quota (
+        uploader_id    TEXT PRIMARY KEY,
+        inflight_files BIGINT NOT NULL DEFAULT 0,
+        inflight_bytes BIGINT NOT NULL DEFAULT 0,
+        since          DOUBLE PRECISION NOT NULL
+    )""",
     """CREATE TABLE IF NOT EXISTS pending_approvals (
         id           TEXT PRIMARY KEY,
         operation    TEXT NOT NULL,
@@ -530,7 +543,8 @@ _SCHEMA: list[str] = [
         totp_recovery_codes  TEXT,
         last_totp_step       INTEGER,
         oidc_issuer          TEXT,
-        oidc_subject         TEXT
+        oidc_subject         TEXT,
+        password_claimed_at  DOUBLE PRECISION
     )""",
     """CREATE TABLE IF NOT EXISTS roles (
         id           TEXT PRIMARY KEY,
@@ -595,7 +609,7 @@ _SCHEMA: list[str] = [
     # _schema_hash() automatically — the ADR 0064 bump.
     """CREATE TABLE IF NOT EXISTS search_presets (
         id         TEXT PRIMARY KEY,
-        owner      TEXT NOT NULL,
+        owner_user_id TEXT NOT NULL,
         name       TEXT NOT NULL,
         criteria   TEXT,
         created_at DOUBLE PRECISION NOT NULL,
@@ -612,7 +626,7 @@ _SCHEMA: list[str] = [
     "ALTER TABLE search_presets ADD COLUMN IF NOT EXISTS last_used_at DOUBLE PRECISION",
     # UNIQUE(owner, name) covers the owner-scoped list + the upsert; get/delete use the id PK (no
     # separate owner index needed — ADR 0136, review follow-up).
-    "CREATE UNIQUE INDEX IF NOT EXISTS ux_search_presets_owner_name ON search_presets(owner, name)",
+    "CREATE UNIQUE INDEX IF NOT EXISTS ux_search_presets_owner_name ON search_presets(owner_user_id, name)",
     # Secret-rotation watch state (ASVS 13.3.4, BACKLOG #282) — mirrors the SQLite `secret_rotation_meta`
     # table (store/store.py). One row per tracked secret CLASS. EVERY column is NON-SECRET: `fingerprint`
     # is a keyed MAC (DEK-derived HMAC subkey) OR the DEK's one-way key-id — never the value; the dates are
@@ -654,7 +668,15 @@ _SCHEMA: list[str] = [
 # Bump when _migrate_lease_columns (the open-path migration code OUTSIDE _SCHEMA) changes behavior:
 # unlike _SCHEMA edits — which change _schema_hash automatically — the migration function's Python
 # body is invisible to the content hash, so this constant is its stand-in in the hash input.
-_MIGRATION_REV = 1
+# 2 (BACKLOG #1245): the users.password_claimed_at ADD + its one-time backfill live in
+# _migrate_lease_columns, so that body changed behavior and the contract above requires the bump —
+# the bump is the ONLY thing tying the changed migration body to the hash input. It is NOT what
+# moves the hash for THIS change: the same change also adds the column to the users CREATE TABLE in
+# _SCHEMA above, and _schema_hash() hashes "\n".join(_SCHEMA), so the hash moves either way here.
+# Leaning on that coincidence is the trap the contract exists to close — a later edit confined to
+# _migrate_lease_columns would move nothing, and an already-open DB would take the schema_meta fast
+# path straight past it.
+_MIGRATION_REV = 2
 
 
 def _schema_hash() -> str:
@@ -708,6 +730,9 @@ def _build_ssl(settings: StoreSettings, *, posture: HopPosture | None = None) ->
         ctx = _ssl.create_default_context()
         ctx.check_hostname = False
         ctx.verify_mode = _ssl.CERT_NONE
+        # Verification is off but the store hop is still encrypted, so the suite list still decides
+        # whether recorded PHI traffic survives a future key compromise (ASVS 12.1.2).
+        harden_cipher_suites(ctx, connector="Postgres store (TLS verification disabled)")
         return ctx
     # #201 (ADR 0078 amendment): the engine->store hop below VERIFIES the peer cert (a pinned CA or the
     # system trust store) but asyncpg rides stdlib ssl, which does NO OCSP/CRL revocation — a
@@ -725,7 +750,14 @@ def _build_ssl(settings: StoreSettings, *, posture: HopPosture | None = None) ->
         # Pin a private / self-signed CA WITHOUT touching the OS trust store: verify the server cert
         # (+ hostname) against this PEM bundle. create_default_context() already sets CERT_REQUIRED +
         # check_hostname=True, so this stays a fully-verifying posture (a bad path raises at connect).
-        return _ssl.create_default_context(cafile=settings.ssl_root_cert)
+        ctx = _ssl.create_default_context(cafile=settings.ssl_root_cert)
+        harden_cipher_suites(ctx, connector="Postgres store (pinned CA)")
+        return ctx
+    # A RESIDUAL, stated rather than papered over: `True` hands asyncpg the job of building the
+    # context, so no context exists in engine code for harden_cipher_suites to assert on. Asserting a
+    # look-alike built here would grade an object the connection never uses. Closing it means building
+    # the verifying default context here and returning it instead, which changes what asyncpg receives
+    # on the DEFAULT store path — a separate decision, not a rider on this change.
     return True  # verifying TLS against the system trust store (the secure default)
 
 
@@ -1096,6 +1128,19 @@ class PostgresStore:
         ):
             if column not in users_cols:
                 await conn.execute(f"ALTER TABLE users ADD COLUMN {column} {decl}")
+        # Claimed-ness of the bootstrap admin (BACKLOG #1245): NULL on an existing row would read as
+        # "never claimed", which is what would retire an account whose holder claimed it long ago —
+        # this defect, re-introduced by its own fix. So the ADD is paired with a one-time backfill:
+        # a local account not flagged must_change_password already rotated its own credential, and
+        # password_changed_at is when. The backfill MUST stay inside this creation guard. Hoisted out
+        # it becomes a permanent SECOND WRITER of the column, and single-writer monotonicity is the
+        # entire point — a second writer is exactly the defect #1245 documents.
+        if "password_claimed_at" not in users_cols:
+            await conn.execute("ALTER TABLE users ADD COLUMN password_claimed_at DOUBLE PRECISION")
+            await conn.execute(
+                "UPDATE users SET password_claimed_at = password_changed_at"
+                " WHERE must_change_password = FALSE AND password_hash IS NOT NULL"
+            )
         sessions_has_mfa = await conn.fetch(
             "SELECT 1 FROM information_schema.columns"
             " WHERE table_name='sessions' AND column_name='mfa_verified_at'"
@@ -4041,12 +4086,20 @@ class PostgresStore:
     # --- saved-search presets (ADR 0136, BACKLOG #151) -----------------------
 
     async def upsert_search_preset(
-        self, *, preset_id: str, owner: str, name: str, criteria: str, now: float | None = None
+        self,
+        *,
+        preset_id: str,
+        owner_user_id: str,
+        name: str,
+        criteria: str,
+        now: float | None = None,
     ) -> tuple[str, bool]:
         now = time.time() if now is None else now
         async with self._timed_acquire() as conn, conn.transaction():
             existing = await conn.fetchval(
-                "SELECT id FROM search_presets WHERE owner=$1 AND name=$2", owner, name
+                "SELECT id FROM search_presets WHERE owner_user_id=$1 AND name=$2",
+                owner_user_id,
+                name,
             )
             effective_id = str(existing) if existing is not None else preset_id
             enc = self._enc(criteria, aad=cell_aad("search_presets", "criteria", effective_id))
@@ -4059,10 +4112,10 @@ class PostgresStore:
                 )
                 return effective_id, True
             await conn.execute(
-                "INSERT INTO search_presets (id, owner, name, criteria, created_at, updated_at)"
+                "INSERT INTO search_presets (id, owner_user_id, name, criteria, created_at, updated_at)"
                 " VALUES ($1,$2,$3,$4,$5,$6)",
                 effective_id,
-                owner,
+                owner_user_id,
                 name,
                 enc,
                 now,
@@ -4070,22 +4123,22 @@ class PostgresStore:
             )
             return effective_id, False
 
-    async def list_search_presets(self, owner: str) -> list[dict[str, Any]]:
+    async def list_search_presets(self, owner_user_id: str) -> list[dict[str, Any]]:
         rows = await self._pool.fetch(
             "SELECT id, name, created_at, updated_at FROM search_presets"
-            " WHERE owner=$1 ORDER BY name",
-            owner,
+            " WHERE owner_user_id=$1 ORDER BY name",
+            owner_user_id,
         )
         return [dict(r) for r in rows]
 
     async def get_search_preset(
-        self, *, preset_id: str, owner: str, now: float | None = None
+        self, *, preset_id: str, owner_user_id: str, now: float | None = None
     ) -> dict[str, Any] | None:
         row = await self._pool.fetchrow(
             "SELECT id, name, criteria, created_at, updated_at, last_used_at FROM search_presets"
-            " WHERE id=$1 AND owner=$2",
+            " WHERE id=$1 AND owner_user_id=$2",
             preset_id,
-            owner,
+            owner_user_id,
         )
         if row is None:
             return None
@@ -4105,10 +4158,12 @@ class PostgresStore:
             log.warning("failed to stamp search-preset last_used_at", exc_info=True)
         return out
 
-    async def delete_search_preset(self, *, preset_id: str, owner: str) -> bool:
+    async def delete_search_preset(self, *, preset_id: str, owner_user_id: str) -> bool:
         deleted = _delete_count(
             await self._pool.execute(
-                "DELETE FROM search_presets WHERE id=$1 AND owner=$2", preset_id, owner
+                "DELETE FROM search_presets WHERE id=$1 AND owner_user_id=$2",
+                preset_id,
+                owner_user_id,
             )
         )
         return deleted > 0
@@ -6035,6 +6090,67 @@ class PostgresStore:
         )
         return int(row["invocations"]) if row is not None else int(count)
 
+    async def reserve_upload_quota(
+        self,
+        uploader_id: str,
+        *,
+        files: int,
+        size_bytes: int,
+        max_files: int = 0,
+        max_total_bytes: int = 0,
+        stale_after: float = UPLOAD_RESERVATION_STALE_AFTER,
+    ) -> bool:
+        """Atomically reserve (or release) an uploader's in-flight upload budget — see
+        :meth:`messagefoundry.store.base.Store.reserve_upload_quota` for the contract, and the SQLite
+        twin for the statement shape.
+
+        One statement carries the budget predicate into the ``DO UPDATE``, so no other connection can
+        land between the read and the write. ``RETURNING`` (absent on a refusal) discriminates applied
+        from refused."""
+        now = time.time()
+        if files <= 0:
+            # RELEASE — unconditional, clamped at zero (a double release cannot mint budget).
+            await self._execute(
+                "UPDATE upload_quota SET"
+                " inflight_files = GREATEST(0, inflight_files + $2),"
+                " inflight_bytes = GREATEST(0, inflight_bytes + $3),"
+                " since = $4"
+                " WHERE uploader_id = $1",
+                uploader_id,
+                int(files),
+                int(size_bytes),
+                now,
+            )
+            return True
+        if files > max_files or size_bytes > max_total_bytes:
+            # Fail closed before touching the row: the insert branch applies unconditionally.
+            return False
+        stale = now - max(0.0, stale_after)
+        row = await self._fetchone(
+            "INSERT INTO upload_quota (uploader_id, inflight_files, inflight_bytes, since)"
+            " VALUES ($1,$2,$3,$4)"
+            " ON CONFLICT (uploader_id) DO UPDATE SET"
+            " inflight_files ="
+            " CASE WHEN upload_quota.since <= $5 THEN 0 ELSE upload_quota.inflight_files END + $2,"
+            " inflight_bytes ="
+            " CASE WHEN upload_quota.since <= $5 THEN 0 ELSE upload_quota.inflight_bytes END + $3,"
+            " since = CASE WHEN upload_quota.since <= $5 OR upload_quota.inflight_files <= 0"
+            " THEN $4 ELSE upload_quota.since END"
+            " WHERE (CASE WHEN upload_quota.since <= $5 THEN 0"
+            " ELSE upload_quota.inflight_files END) + $2 <= $6"
+            " AND (CASE WHEN upload_quota.since <= $5 THEN 0"
+            " ELSE upload_quota.inflight_bytes END) + $3 <= $7"
+            " RETURNING 1 AS applied",
+            uploader_id,
+            int(files),
+            int(size_bytes),
+            now,
+            stale,
+            int(max_files),
+            int(max_total_bytes),
+        )
+        return row is not None
+
     async def cipher_invocations(self, key_id: str) -> int:
         """``key_id``'s persisted cumulative invocation total (0 when the key has no row yet)."""
         row = await self._fetchone("SELECT invocations FROM cipher_meta WHERE key_id = $1", key_id)
@@ -6184,6 +6300,15 @@ class PostgresStore:
         d = await self._fetchone("SELECT * FROM users WHERE username=$1", username)
         return UserRecord.from_mapping(dict(d)) if d else None
 
+    async def get_user_by_federated_subject(self, issuer: str, subject: str) -> UserRecord | None:
+        # BACKLOG #1256. Both columns, never `subject` alone -- a subject is unique only within its
+        # issuer, so a subject-only match would refuse two unrelated people sharing an opaque
+        # identifier at different IdPs.
+        d = await self._fetchone(
+            "SELECT * FROM users WHERE oidc_issuer=$1 AND oidc_subject=$2", issuer, subject
+        )
+        return UserRecord.from_mapping(dict(d)) if d else None
+
     async def list_users(self) -> list[UserRecord]:
         rows = await self._fetchall("SELECT * FROM users ORDER BY username")
         return [UserRecord.from_mapping(dict(r)) for r in rows]
@@ -6196,12 +6321,15 @@ class PostgresStore:
         user_id: str,
         *,
         password_hash: str,
-        must_change_password: bool = False,
+        must_change_password: bool = True,
         now: float | None = None,
     ) -> None:
         now = time.time() if now is None else now
+        # $2 is already `now`, so the claim term reuses it and the argument list is unchanged.
+        claim_set = password_claim_set(must_change_password, "$2")
         await self._execute(
             "UPDATE users SET password_hash=$1, password_changed_at=$2, must_change_password=$3,"
+            f"{claim_set}"
             " failed_attempts=0, locked_until=NULL, updated_at=$2 WHERE id=$4",
             password_hash,
             now,
@@ -6425,6 +6553,11 @@ class PostgresStore:
             await conn.execute("DELETE FROM user_roles WHERE user_id=$1", user_id)
             await conn.execute("DELETE FROM sessions WHERE user_id=$1", user_id)
             await conn.execute("DELETE FROM webauthn_credentials WHERE user_id=$1", user_id)
+            # BACKLOG #1233, verbatim with the SQLite and SQL Server bodies: presets are owner-scoped
+            # by Identity.user_id (#1225) with no FK cascade, so without this the rows outlive the
+            # account carrying PHI-shaped `criteria` (ADR 0136) that no owner can reach or purge.
+            # This leg is CI-only, so a divergence between the three backends surfaces first in CI.
+            await conn.execute("DELETE FROM search_presets WHERE owner_user_id=$1", user_id)
             await conn.execute("DELETE FROM users WHERE id=$1", user_id)
 
     async def record_login_success(self, user_id: str, *, now: float | None = None) -> None:

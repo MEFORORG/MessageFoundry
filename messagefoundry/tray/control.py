@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Organization and contributors
 """Tray service-control wrapper (ADR 0113 §4).
 
 Thin adapter over the shipped, injection-hardened ``messagefoundry.service.control_service_ex`` —

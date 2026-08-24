@@ -42,9 +42,34 @@ from __future__ import annotations
 #: screens values destined for byte-oriented sinks -- a request line, a header, a path -- where C0
 #: and DEL are the injection alphabet. Widening it is a behaviour change at seven call sites at
 #: once, which is exactly the leverage this module exists to provide; make it deliberately.
+def _is_control_char(ch: str) -> bool:
+    """THE ONE DEFINITION of the alphabet this module screens for (BACKLOG #1273).
+
+    It was previously written out TWICE -- once in each public arm -- inside the module whose whole
+    purpose is to state it once. The module docstring above records that this replaced the same
+    expression written seven times across six files; it then kept two copies of its own.
+
+    That is not a cosmetic duplication, and the risk is ASYMMETRIC -- measured on the two-copy
+    structure before this change, not predicted:
+
+    * widening the **predicate** arm alone was **CAUGHT** -- 4 tests red, because
+      ``test_c1_and_unicode_separators_are_deliberately_NOT_caught`` pins the alphabet directly;
+    * widening the **strip** arm alone was **NOT CAUGHT** -- 47 passed, exit 0.
+
+    So the copies were partly bound and partly not, and the unguarded direction is the one that
+    matters: **widening the alphabet is the stated reason this module exists** ("a behaviour change
+    at seven call sites at once ... make it deliberately"), and a deliberate widening applied to the
+    neutraliser would silently strip more than the screen refuses -- a screen and its neutraliser
+    disagreeing about their own alphabet, with every test green.
+
+    One definition closes both directions by construction rather than by a test noticing.
+    """
+    return ord(ch) < 0x20 or ord(ch) == 0x7F
+
+
 def has_control_char(text: str) -> bool:
     """True if ``text`` contains any C0 control character or DEL."""
-    return any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in text)
+    return any(_is_control_char(ch) for ch in text)
 
 
 def strip_control_chars(text: str) -> str:
@@ -53,4 +78,4 @@ def strip_control_chars(text: str) -> str:
     The strip arm, used where a value must be neutralised rather than refused. See the module
     docstring: this is NOT the general remedy and must not be substituted for a rejection.
     """
-    return "".join(ch for ch in text if not (ord(ch) < 0x20 or ord(ch) == 0x7F))
+    return "".join(ch for ch in text if not _is_control_char(ch))

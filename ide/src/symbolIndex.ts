@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 MessageFoundry Organization and contributors
 // Symbol index for the sidebar search (BACKLOG #228). The wired-graph tree matches element names —
 // inbound/outbound/router/handler — but a *transform* (a plain `def xform_…` helper the handler calls)
 // is not a graph element, and in a role-combined feed module the @handler/@router function name is a

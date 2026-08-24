@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 MessageFoundry Organization and contributors
 // Engine setup — the guided page the status pill leads with in a STORE-LESS workspace (BACKLOG #238,
 // ADR 0112 amendment 2026-07-16). A webview, not a QuickPick, because the situation needs room to
 // explain: production engines run as a service (docs/SERVICE.md), so an authoring checkout normally
@@ -12,15 +14,7 @@
 // the panel-shell template only; its handler inserts snippets and dispatches nothing.
 import * as vscode from "vscode";
 import { SETUP_LEDE, SETUP_SECTIONS, SETUP_TITLE, buttonById } from "./engineSetupContent";
-
-function nonce(): string {
-  let s = "";
-  const chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
-  for (let i = 0; i < 24; i++) {
-    s += chars.charAt(Math.floor(Math.random() * chars.length));
-  }
-  return s;
-}
+import { nonce } from "./cspNonce";
 
 function esc(s: string): string {
   // Escape quotes too, not just &<>: these values land inside double-quoted HTML attributes

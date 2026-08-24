@@ -271,14 +271,106 @@ diverge enough to warrant it; keep this root file general.
 - `/compact` before long sessions hit the limit; focus the summary on API shape and decisions
   (e.g. "preserve the connector registry and the inbound/outbound/@router/@handler interface").
 
+### Declare what your seat is for
+- **Declare at the start of a session, before the work.** A SessionStart hook asks; answering takes
+  one command, and it is what every fleet view reads:
+
+  ```
+  pwsh -NoProfile -File scripts\coord\seat.ps1 -Declare -Seat <role> -Goal "<one line>"
+  ```
+
+  Optional on the same call: `-Done "<what finished looks like>"`, `-OutOfScope "<what you will not
+  touch>"`, `-Handoff <path>`.
+- **Why this is a rule and not a nicety.** The mechanical half of the episode record has always
+  worked — a Stop hook fires `seat.ps1 -Record` and every episode carries `writes`, `touchedPaths`,
+  `dirty`, `unpushed` and `tip`. The declared half did not. Measured 2026-08-18 across the live
+  seats directory: **22 records, 1 with a goal, 1 with a seat.** So the fleet could always answer
+  *"is this seat alive and writing"* and never *"what is it trying to do"* — which is the question a
+  person actually asks. The schema was never missing; nothing fed it.
+- **The hook cannot do it for you, by design.** It stamps `goalPromptedAt`, and where the payload
+  names the session it writes a `seat` label marked `seatSource: derived:caller`. It will never
+  write a `goal`: a goal is intent, and a machine that invents one produces a record that looks
+  declared and says nothing — the hollow-record failure this repo refuses elsewhere. A derived label
+  never overwrites a declared one, and `declaredAt` stays null until somebody actually says
+  something.
+- **An undeclared seat is now visible rather than silent.** `goalPromptedAt` separates *asked and
+  ignored* from *never asked* — two states with opposite fixes that used to render identically.
+
+### Route it to the seat that owns it
+
+**Owner-set 2026-08-22. Two routes, each conditional on that seat actually running:**
+
+| What you are holding | Send it to | Instead of |
+|---|---|---|
+| A question or issue for the owner | the **Liaison** | asking the owner directly |
+| A push, PR, or merge | the **Lander** | doing it yourself |
+
+**Check which seats are live with one command** — read the `SEAT` column on rows whose `STATE` is
+`RUNNING`:
+
+```
+pwsh -NoProfile -File scripts\coord\fleet.ps1
+```
+
+**MATCH THE SEAT NAME CASE-INSENSITIVELY.** Measured 2026-08-22, the live rows carried `liaison`,
+`LANDER`, `Steward` and `asvs-tracker` — four seats, four casings, in one render. A case-sensitive
+test for `lander` finds nothing and reports it as "no Lander running", which is the failure that
+looks like a clean answer.
+
+**No such seat running? The old path stands** — ask the owner directly, and get their approval for
+your own push. **Neither seat is a required hop.** Neither may sit on your item either: a Liaison that
+is slow must say so and tell you to go direct.
+
+**Reach them with `mail.ps1` (leaves a receipt, reaches an idle or different-login peer) or a
+cross-session message (faster, no receipt, dies with the session).**
+
+**WHO MAY DO WHAT. Three rules, and the first two only look contradictory.**
+
+1. **The LANDER holds STANDING authority to push, PR and merge, on the engine repo AND the vault, and
+   needs no per-action owner approval.** Source: `roles/LANDER.md` line 87 **on `origin/main`**, which
+   states the grant and adds that you should not go looking for a separate one; ratified by the owner
+   2026-08-22.
+2. **Every OTHER seat still needs the owner's approval to PERFORM an outward-facing action itself** --
+   your own push, your own PR, your own merge. The Lander's grant covers the LANDER'S act of landing.
+   It does not cover yours.
+3. **HANDING YOUR BRANCH TO THE LANDER IS THE DEFAULT ACTION, NOT A QUESTION.** It needs no approval
+   and you do not ask for one.
+
+**Rules 2 and 3 govern different acts: PERFORMING a push versus ROUTING one.** The version of this
+paragraph they replace collapsed the two, so it read as forbidding the handover as well, and seats sat
+on finished work waiting for an approval nobody owed them. **The Liaison half is unchanged: it
+compresses and presents your question, and it does not answer it.**
+
+**READ A ROLE PLAYBOOK WITH `git show origin/main:roles/<FILE>.md`, NEVER FROM THE
+`MessageFoundry-vault` WORKING TREE.** That checkout sits on a branch `git merge-base --is-ancestor`
+reports is **not** an ancestor of `origin/main`, so every file in it can be stale in a way a directory
+listing cannot show. Measured 2026-08-22, independently by several seats within about twenty minutes,
+three of which broadcast confident wrong conclusions drawn from it -- including on the authority
+question this section states, where the correcting text was among the lines a stale copy was missing.
+**And two playbooks do not exist in that checkout at all**, so the folder looks complete while the
+document about instruments that lie is absent entirely. **An `ls` of that directory is not evidence
+that you have the file.**
+
 ### Git discipline
 - Work on a **feature branch and open a PR**; commit at logical stops, **one coherent layer per
   commit**, with clear messages. (Direct pushes to `main` are blocked by the harness, so
   branch + PR is the path.)
 - **Commits at logical stops are Claude's own judgment** — proactively commit coherent, tested,
   one-layer-per-commit changes and narrate each (respect the ledger gate — never `--no-verify` or a
-  rename workaround). **Pushes, PRs, and merges need the owner's approval**: they are outward-facing
-  and, with auto-merge on, a PR effectively merges to `main`.
+  rename workaround). **A push, PR or merge YOU perform needs the owner's approval**: it is
+  outward-facing and, with auto-merge on, a PR effectively merges to `main`. **Handing the branch to
+  the Lander instead needs no approval and is the default** -- its standing grant is stated above, and
+  waiting on an approval for the handover is the failure that rule exists to stop.
+- **Whoever executes a push or merge announces it** — one `mail.ps1 -Send -To all` line, before
+  (heads-up: `"pushing #N now, touches X"`) and/or after (`"landed #N at <sha>, touches X, rebase if
+  BEHIND"`). Worded around the *action*, not a fixed identity — no gate enforces *who* may push a
+  branch or merge a PR, only *which* refs (`push_guard.py` blocks direct pushes to protected refs; it
+  cannot see `gh pr merge` at all), so hard-coding this to a role would leave the exact lapse case
+  silently uncovered. **Never a hold/freeze/wait request or a promise about future state** — a
+  2026-08-01 rehearsal of exactly that shape stayed "in force" for hours after the condition it named
+  had already resolved, while `main` moved four times underneath it (`docs/WORKTREES.md`, "Announcing
+  yourself"). This is an **unenforced courtesy norm, not a substitute** for `gh pr view <N> --json
+  mergeStateStatus`, which stays the only authoritative merge-state check.
 - **Never grep for the next free ADR / BACKLOG number.** Two sessions that both grep pick the *same*
   number, create differently-named files, **merge clean**, and silently corrupt the ledger (it has fired
   three times). Allocate it atomically — `pwsh -NoProfile -File scripts\coord\alloc.ps1 -Kind adr -Title
@@ -505,6 +597,18 @@ harness process only.)
   and until it lands those five glyphs stay. **No NEW glyph vocabulary may be introduced anywhere**,
   and nothing outside those two files may adopt one.
 
+  **THE WARNING SIGN (U+26A0) IS NOT A SIXTH HOLDOUT — owner-ruled 2026-08-14, "not sanctioned".** It
+  is in neither `_CLOSED` nor `_OPEN`, so `parse_items` ignores it and it carries no status semantics
+  anywhere; it is decoration, which the rule above forbids outright. **The measured population is
+  recorded here so nobody re-derives the false zero that stalled this question once already: 496
+  occurrences across 80 files** at `ae76b9f9` — 447 under `docs/` (121 in `BACKLOG.md`, 93 in
+  `BACKLOG-CLOSED.md`, 35 in `docs/adr/`), 10 in `tests/`, 4 in `ide/`, 3 in engine source, and **zero
+  in `scripts/`, in the web console, and in this file**. Retiring them is **BACKLOG #1265**, a filed
+  migration — *not* a licence to start editing those 496 lines, and not a cp1252 hazard (the cp1252
+  gate covers `scripts/**/*.py`, which contains none of them). **Census this population only with the
+  ledger counts as a positive control** — the first attempt returned a false zero off a broken shell
+  escape, and a pattern that finds nothing anywhere is indistinguishable from a clean repo.
+
   **When you must read that alphabet, import `parse_items` from `backlog_status_check.py`. Never
   re-derive it.** It *defines* item status — the banner block ends at the first line that is neither
   blank nor a blockquote — and a hand-rolled scan is a second, silently different definition. That is
@@ -552,6 +656,24 @@ harness process only.)
   When a cell's anchor points at code that has moved or gone, say **"the cell has a stale anchor"**:
   the engine is not insecure and the vault is not broken, the *evidence* went stale — usually
   **because the code got better and the fix deleted the line the anchor quoted**.
+  - **"Elsewhere" is where, and reading it is one command.** The record is
+    `docs/security/asvs-scorecard.toml` in the separate `MessageFoundry-vault` clone, checked out
+    **beside this repository** (the same clone [`docs/LEDGER-GATE.md`](docs/LEDGER-GATE.md) describes).
+    `docs/security/` is gitignored here, so from an engine checkout `git ls-files docs/security`
+    returns **zero** — the record does not look misplaced, it looks like it does not exist, which is
+    why sessions conclude there is nothing to read. The current score, with **no** engine tree, corpus
+    or network needed, in well under a second:
+
+    ```
+    python scripts/asvs/scorecard.py --scorecard <vault>/docs/security/asvs-scorecard.toml --status
+    ```
+
+    A full verify additionally needs `--corpus` and an **explicit `--root`** naming the engine tree.
+    `--root` is REQUIRED in verify mode and `verify` refuses a root that CONTAINS the scorecard:
+    resolving anchors against the repository that stores the record produces a self-consistent, wrong
+    answer, and the vault carries its own tracked copy of `messagefoundry/` for exactly that trap to
+    fall into. **No number this tool prints is a fact without the ref pair it prints beside it** — the
+    `# asvs-verify scorecard=X engine=Y` header is part of the measurement, not decoration.
   - **Never say "vault cell", "gate cell", or "vault gate cell".** All three name the filing cabinet
     instead of the subject, and the third also fuses the checker with the checked — a cell exists
     whether or not any job is running. Measured 2026-08-12: that phrasing sent a reader looking at the

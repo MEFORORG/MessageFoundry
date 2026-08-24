@@ -49,7 +49,7 @@ ADT = "MSH|^~\\&|S|F|R|RF|20260101||ADT^A01|MSGSEED|P|2.5.1\rPID|1||MRN9001^^^H^
 _SURFACES: tuple[tuple[str, str], ...] = (
     ("/dead-letters", "viewer"),
     ("/messages", "viewer"),
-    ("/messages/search?content=JANE", "viewer"),
+    ("/messages/search?field_path=PID-3", "viewer"),
     ("/messages/{mid}", "rawonly"),
     ("/messages/{eid}", "rawonly"),  # the ERROR-disposition row carries MessageDetail.error
     # The DEAD-lettered message. Its detail is the ONLY surface on which OutboxInfo.last_error is
@@ -200,7 +200,7 @@ async def seeded(tmp_path: Path) -> AsyncIterator[_Seed]:
             assert seeded_user is not None, f"seed user {username!r} was not created"
             preset_id, _replaced = await engine.store.upsert_search_preset(
                 preset_id=f"preset-{username}",
-                owner=seeded_user.id,
+                owner_user_id=seeded_user.id,
                 name="jane",
                 criteria=json.dumps({"content": "JANE", "target": "both", "limit": 50}),
             )

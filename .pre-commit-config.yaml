@@ -3,10 +3,133 @@
 #   pip install pre-commit  &&  pre-commit install
 #   pwsh -NoProfile -File scripts/coord/install-git-hooks.ps1     # claim gate (commit-msg)
 # Run across the whole tree on demand:  pre-commit run --all-files
-# Keep hook versions roughly in step with CI (.github/workflows/security.yml) and pyproject.
+# Keep hook versions roughly in step with CI (.github/workflows/security.yml) and pyproject. Ruff's
+# `rev` below is the exception and is NOT a judgement call: tests/test_lint_scope_parity.py fails if
+# it drifts from constraints.lock or off pyproject's deliberate version cap.
 repos:
-  # Ruff lint + format from the project's own environment, so pre-commit can never disagree with the
-  # CI/dev ruff on a version (language: system uses the installed ruff from the active venv).
+  # RUFF, from a pre-commit-managed environment pinned to the version constraints.lock installs.
+  #
+  # WHAT THESE TWO HOOKS WERE, AND WHY IT FAILED. They lived in the `- repo: local` block below as
+  # `language: system` entries `ruff format` and `ruff check --fix`, on the reasoning -- stated in
+  # the comment this replaces -- that sharing one interpreter with CI made a version disagreement
+  # impossible. The reasoning was sound, the mechanism was not: `language: system` resolves the
+  # entry as a bare program name on PATH, and `ruff` is on no ambient PATH here. The generated
+  # .git/hooks/pre-commit execs the primary checkout's .venv/Scripts/python.exe, and invoking a
+  # venv's interpreter directly does NOT put that venv's Scripts on PATH -- only Activate.ps1 does.
+  # So both hooks exited 1 with "Executable `ruff` not found" for anyone who had not activated a
+  # venv in the shell they were committing from. Measured 2026-08-18: `Get-Command ruff` and `which
+  # ruff` both return nothing; pre-commit's own resolver, parse_shebang.find_executable('ruff'),
+  # returns None; the PRIMARY checkout failed identically, and the same command with .venv/Scripts
+  # prepended to PATH passed. Never a worktree bug, and no global ruff was hiding it.
+  #
+  # WHY IT STAYED INVISIBLE, AND WHAT IT COST. A human follows docs/WORKTREES.md and runs
+  # Activate.ps1, so the hooks worked for them. An agent session cannot: shell state does not
+  # survive between tool calls. Every commit from one hit two red hooks whose only apparent remedy
+  # was `--no-verify` -- which CLAUDE.md forbids, and which does not skip ruff surgically: it drops
+  # the ledger gate and the leak gate along with it. A gate people are pushed to bypass WHOLESALE is
+  # worse than the narrower one it was meant to be.
+  #
+  # THE VERSION CONCERN IS REAL AND IS NOW HELD BY A TEST rather than by a shared interpreter:
+  # tests/test_lint_scope_parity.py::test_ruff_hook_pin_matches_the_lock_and_the_cap asserts this
+  # `rev` equals constraints.lock's `ruff==` pin and satisfies pyproject's `ruff>=0.4,<0.16` cap.
+  # Move pyproject, uv.lock, constraints.lock, requirements.lock and this rev together. A bare
+  # `pre-commit autoupdate` walks this rev to the newest upstream tag with no idea the cap exists
+  # (v0.16.0 through v0.16.3 are already published), and that test is at least the main thing that
+  # stops it -- do not delete it on the assumption that something else re-derives the version.
+  #
+  # `args: [--fix]` IS NOT DECORATION. Upstream ships `args: []` with only `--force-exclude` in the
+  # entry, so omitting it silently retires the autofix the old `ruff check --fix` hook did. Nothing
+  # about the hook's own BEHAVIOUR reveals that -- it still runs and still passes or fails on the
+  # same rules, it just stops fixing things, and the loss surfaces weeks later as a vague "it used
+  # to do that". So the value is asserted rather than trusted:
+  # tests/test_lint_scope_parity.py::test_ruff_hook_args_carry_the_autofix_and_nothing_else pins this
+  # list to exactly ["--fix"], which also refuses the reverse edit -- a scope or rule flag added here
+  # that CI's bare `ruff check .` never gets.
+  #
+  # DO NOT ADD AN `entry:` OVERRIDE. Upstream's entry carries `--force-exclude`, which fixes a real
+  # defect the local hooks had: pre-commit passes filenames explicitly, and without that flag ruff
+  # ignores pyproject's [tool.ruff] extend-exclude for a file named on the command line. Staging a
+  # file under docs/benchmarks/results therefore blocked the commit on 3 findings that CI's `ruff
+  # check .` can never report -- the hook-STRICTER-than-CI trap tests/test_lint_scope_parity.py
+  # exists to prevent. Measured 2026-08-18: exit 1 without the flag, exit 0 with it, and a
+  # non-excluded file still scanned either way (so it is not a blanket skip).
+  #
+  # UPSTREAM'S `types_or: [python, pyi, jupyter]` REPLACES `types: [python]`, and it NARROWS the
+  # hook-versus-CI gap by at least two file kinds -- it does not close it (see the paragraph below,
+  # which exists so this one is not read as closure). `ruff check .` -- the CI command -- discovers
+  # .pyi and .ipynb by default: measured 2026-08-18 against the pinned 0.15.22, a .py, a .pyi and an
+  # .ipynb all reported F401 from ONE `ruff check .`. But `identify` tags .pyi as `pyi` and .ipynb
+  # as `jupyter`, NEITHER of them `python`, so the old `types: [python]` hook skipped files CI lints.
+  # Zero of either are tracked today, so nothing changes now; the first one added would have
+  # diverged silently, and in the direction that lets a finding reach main.
+  #
+  # WHAT REMAINS UNCOVERED, and it is PRE-EXISTING rather than a regression: `ruff check .` also
+  # walks pyproject.toml (3 tracked), and no `types_or` value would ever hand those to the hook --
+  # `identify` tags them `toml`. Measured 2026-08-18 against the pinned 0.15.22 on a synthetic
+  # `name = 123`: `ruff check .` reported RUF200 on the pyproject.toml while the same run over an
+  # explicit .py file list -- which is how pre-commit invokes a hook -- reported only the .py
+  # finding. So it is the FILE KIND the hook never sees, not the rule. The gap yields nothing today:
+  # under this repo's own `extend-select` the same broken pyproject.toml reported zero, and only an
+  # added `--extend-select RUF200` (the positive control, so the null above is not just a silent
+  # instrument) made it fire. It opens the day `RUF` joins extend-select, and the retired
+  # `types: [python]` hook had it identically -- so this move neither caused it nor cures it.
+  #
+  # Hook ORDER is the old one, format before check, deliberately unchanged. Upstream's README
+  # suggests lint first so the formatter has the last word; both converge in two passes (a hook that
+  # rewrites a file fails the run, and the retry re-runs everything), so that is not worth bundling
+  # an unrelated behavior change into this one.
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.15.22
+    hooks:
+      - id: ruff-format
+      - id: ruff-check
+        args: [--fix]
+
+  # These four stay `language: system`, and they are safe there for the reason ruff was not: they
+  # resolve `python`, which DOES exist on the ambient PATH (the Windows Python Manager 3.14.6 shim),
+  # and every entry point is stdlib-only -- so they run with no venv, from any shell, in a worktree
+  # that has never been provisioned. Measured 2026-08-18 in a worktree with no .venv at all: these
+  # four Passed and the two ruff hooks Failed. That measurement is WINDOWS-ONLY and the allowlist
+  # named below states its own bound rather than implying universal resolvability -- `python` (as
+  # distinct from `python3`) is not on a stock Ubuntu PATH, and nothing here measures these four on
+  # Linux. `language: system` is not the defect; a `language: system` entry naming a program that
+  # only a venv provides is. That distinction is held by
+  # tests/test_lint_scope_parity.py::test_language_system_hook_entries_resolve_without_an_activated_venv.
+  #
+  # WHAT THAT GUARD CATCHES, stated exactly, because this paragraph first claimed more than the guard
+  # enforced. It said the test "allows `python` here and reds on any other program -- so the ruff
+  # defect cannot be rewritten under a new hook id", and it could: a check on the first word of the
+  # entry passes `entry: python -m ruff check --fix`. The program is `python`, which resolves; the
+  # thing actually executed is ruff, out of whatever environment that python resolves to. So the guard
+  # now reads the entry AS FAR AS THE TARGET -- `python` as the interpreter, its inert flags, and then
+  # either a `-m` module from an allowlist that is deliberately empty or a `.py` path this repo TRACKS
+  # (what all four hooks below do). It stops at the target deliberately, and the earlier wording here
+  # ("reads the WHOLE entry") claimed more than that: the tokens after a target are that target's own
+  # argv and cannot change which program runs, so reading them would buy no reach and would red on a
+  # hook that legitimately passes its script a literal argument. Measured 2026-08-18 in a worktree
+  # with no .venv: `python -m ruff --version` exits 1 with "No module named ruff", exactly as dead as
+  # bare `ruff`, which is why `python -m` is not a remedy for an unrunnable hook and the assertion no
+  # longer offers it as one.
+  #
+  # TRACKS IS THE LOAD-BEARING WORD, and it replaces "exists in this checkout" -- which is what the
+  # guard actually checked, and a weaker property than the sentence around it implied. A script that
+  # exists here and was never `git add`ed runs for its author and for nobody else, and the commit
+  # introducing it goes green. The guard asks `git ls-files` instead, and refuses a target that is
+  # anchored (a drive, a root, a UNC host) or climbs out with `..` before it gets that far, since
+  # neither names a repo-relative file at all -- measured 2026-08-18, joining the repo root to
+  # `C:/Windows/Temp/evil.py` or `//host/share/evil.py` discards the repo root outright, so the old
+  # existence check was asking about a file anywhere on the machine.
+  #
+  # WHAT IT DOES NOT CATCH, so none of the above reads as a guarantee. It sees only hooks whose
+  # `language:` THIS file states: a third-party repo shipping the same defect declares its entry in
+  # its own manifest, and nothing in this checkout reads that. (Writing `language: system` HERE onto a
+  # third-party hook is the near case and IS caught -- it leaves a hook with no entry this file can
+  # see, and the guard reds on that rather than vouching for it.) And it is a check on names, not an
+  # execution -- it cannot tell that a script it accepts imports a third-party package, so
+  # "stdlib-only" above remains a property of these four scripts rather than something a gate holds.
+  # It is also deliberately blunt in the safe direction: `pwsh` resolves on the ambient PATH here and
+  # a hook naming it would still red, because nothing has measured it. Adding a program or a module to
+  # either allowlist means measuring it first and writing the measurement down beside it.
   - repo: local
     hooks:
       # The LEDGER GATE runs here rather than as a standalone .git/hooks/pre-commit, and that is a
@@ -28,16 +151,36 @@ repos:
         language: system
         pass_filenames: false
         always_run: true
-      - id: ruff-format
-        name: ruff format
-        entry: ruff format
+      # BACKLOG #1259: the ledger must PARSE at commit time, not only in CI.
+      #
+      # `parse_items` refuses a source carrying conflict markers, and that refusal landed -- but it
+      # protected only programmatic readers and the CI leg. NOTHING called it on the commit path.
+      # MEASURED at dd655da2 against a docs/BACKLOG.md carrying a realistic prose-level conflict:
+      # every wired hook PASSED, overall rc 0, so the conflicted ledger commits cleanly, while the
+      # checker itself exits 1 on the same file. The capability existed and was simply not wired.
+      #
+      # NOT `pre-commit/pre-commit-hooks`' check-merge-conflict, and the reason is not dependency
+      # squeamishness. That repo is absent from this config, so it would be a NEW third-party source
+      # with its own pinned rev -- but the deciding argument is SINGLE SOURCE: `parse_items` *defines*
+      # what a readable ledger is, and CLAUDE.md section 11 requires this file be read through it and
+      # never through a hand-rolled scan. A generic textual matcher is exactly that second, silently
+      # different definition, and it would drift from the one every other reader uses.
+      #
+      # SCOPED TO THE LEDGER FILES, not always_run: the checker reads the whole namespace itself, so
+      # running it on unrelated commits buys nothing and spends the credibility a gate needs on the
+      # day it fires. `pass_filenames: false` because it resolves its own sources -- feeding it a
+      # staged path list would narrow the corpus that `--min-items` exists to protect.
+      #
+      # A CONFLICT THAT ADDS A HEADING IS ALREADY CAUGHT, INCIDENTALLY, BY THE GATE ABOVE -- both
+      # sides' `## N.` headings read as unallocated numbers. That is why the measurement above uses a
+      # PROSE conflict: it is the case nothing covers, and testing the heading case instead would
+      # have shown a green gate and concluded there was no defect.
+      - id: backlog-parses
+        name: backlog ledger parses (conflict markers)
+        entry: python scripts/docs/backlog_status_check.py --quiet
         language: system
-        types: [python]
-      - id: ruff-check
-        name: ruff check
-        entry: ruff check --fix
-        language: system
-        types: [python]
+        pass_filenames: false
+        files: ^docs/(BACKLOG\.md|archive/backlog/.*\.md)$
       # Leak guard (always on): keep customer/PHI-adjacent strings -- partner names, site data,
       # routable host IPs, internal worktree slugs and absolute home paths -- out of the TRACKED tree
       # so they can never reach this public repo. Mirrors the CI forbidden-content gate.
@@ -55,10 +198,52 @@ repos:
         pass_filenames: true
         types: [text]
         exclude: ^scripts/security/scan-tokens\.local\.txt$
+      # LICENCE HEADER (BACKLOG #1010): every first-party source must declare the project's SPDX
+      # identifier. It asserts the VALUE, not the presence of the string -- five files declared
+      # Apache-2.0 in an AGPL project and a presence-only check passed every one of them.
+      #
+      # SCOPE IS SINGLE-SOURCED IN THE SCRIPT (its COMMENT_PREFIXES map), not restated here and again
+      # in ci.yml. That is deliberate: ruff and bandit each had their scope written twice, drifted, and
+      # needed tests/test_lint_scope_parity.py to hold them together. Here `files:` only narrows what
+      # pre-commit bothers to forward -- the script filters by extension itself and CI passes no paths
+      # at all -- so the hook and the CI step cannot disagree about what is in scope.
+      - id: licence-header
+        name: licence header (SPDX)
+        entry: python scripts/quality/licence_header_check.py
+        language: system
+        pass_filenames: true
+        files: \.(py|ps1|sh|ts|js|go)$
+
+      # Control bytes (invisible defects): an escape that collapses into the byte it names -- a
+      # backslash-b becoming 0x08, a backslash-a becoming 0x07 -- is invisible in an editor, in git
+      # diff and in review. Measured three times in this repository within a week, once inside a
+      # regex where it silently matched nothing, and once in THIS comment while it was being
+      # written: the gate caught its own commit. pass_filenames keeps it to the files a commit
+      # touches, because ide/src/stepsModel.ts and ide/src/symbolIndex.ts carry DELIBERATE raw NUL
+      # separators in composite keys -- converting those is their owner's decision, not this gate's
+      # to force.
+      - id: control-char
+        name: control characters (invisible bytes)
+        entry: python scripts/quality/control_char_check.py
+        language: system
+        pass_filenames: true
+        files: \.(py|ps1|sh|ts|js|go|md|toml|ya?ml|json|cfg|ini|txt)$
+
+      # BACKLOG #1226. always_run with pass_filenames FALSE: the screen walks its own DEFAULT_SCOPE,
+      # and handing it a changed-file list would silently narrow what it looked at while still
+      # printing a confident total -- the shape this screen exists to catch, in its own wiring.
+      - id: username-access-key
+        name: username-as-access-key screen (new sites only)
+        entry: python scripts/quality/username_access_key_screen.py --baseline scripts/quality/username_access_key_baseline.txt
+        language: system
+        pass_filenames: false
+        always_run: true
 
   # Secret scanning — blocks a commit that would introduce a credential/token/key.
   # (rev is verified by `pre-commit autoupdate` on first install; a wrong tag fails loudly there,
-  # never silently in CI.)
+  # never silently in CI. Run it TARGETED -- `pre-commit autoupdate --repo
+  # https://github.com/gitleaks/gitleaks` -- because a bare `autoupdate` also walks the ruff rev
+  # above, which is pinned to constraints.lock and capped below 0.16 by pyproject.)
   - repo: https://github.com/gitleaks/gitleaks
     rev: v8.18.4
     hooks:

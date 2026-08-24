@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 MessageFoundry Organization and contributors
 // The Steps view editor (ADR 0076 §2 phase 2b + phase 3 / BACKLOG #222). A `CustomTextEditorProvider`
 // over a Handler `.py` that renders it as a Corepoint-style ordered, nested typed Steps view:
 // action / lookup / control / send rows with parameter forms, and in-place read-only `code` rows for
@@ -92,6 +94,7 @@ import {
 } from "./hl7schema";
 import { buildSegmentScope, sampleSegments } from "./hl7scope";
 import { pickHl7Path, type PickScope } from "./hl7Picker";
+import { nonce } from "./cspNonce";
 
 /** Debounce (ms) before re-parsing after the underlying document changes in a split text view. */
 const RERENDER_DEBOUNCE_MS = 250;
@@ -144,15 +147,6 @@ async function runInsertPrompts(item: AddMenuItem): Promise<Record<string, strin
     values[p.field] = value;
   }
   return values;
-}
-
-function nonce(): string {
-  let s = "";
-  const chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
-  for (let i = 0; i < 24; i++) {
-    s += chars.charAt(Math.floor(Math.random() * chars.length));
-  }
-  return s;
 }
 
 export class StepsEditorProvider implements vscode.CustomTextEditorProvider {

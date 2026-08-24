@@ -52,6 +52,7 @@ from messagefoundry.transports.rest import (
     _no_redirect_opener,
     _redact_url,
     cleartext_acceptance_from_settings,
+    ech_readdressed_request,
     enforce_outbound_length_limits,
     proxy_auth_handler_from_settings,
     refuse_cleartext_credential_hop,
@@ -131,6 +132,13 @@ class OAuth2ClientCredentialsProvider:
         cleartext_reason: str | None = None,
         connection: str | None = None,
         proxy: ProxyConfig | None = None,
+        # #1176 (ADR 0139): this connection's loopback ECH sidecar, when it has one. The token-endpoint
+        # POST follows the connection's egress route exactly as ADR 0126 rules it must for a forward
+        # proxy; for ECH that means the request is RE-ADDRESSED to the sidecar with the real
+        # authorization-server host in ``Host``, so the AS hostname is never in a cleartext outer
+        # ClientHello. Mutually exclusive with ``proxy`` (refused at connector construction). None
+        # (default) -> byte-identical.
+        ech_sidecar: str | None = None,
     ) -> None:
         if not token_url:
             raise HttpAuthError("OAuth2 client-credentials requires an 'oauth2_token_url' setting")
@@ -199,9 +207,24 @@ class OAuth2ClientCredentialsProvider:
         self._proxy_auth: dict[str, str] = (
             token_proxy.auth_headers() if token_proxy is not None else {}
         )
+        self._ech_sidecar = ech_sidecar
         self._lock = threading.Lock()
         self._cached_token: str | None = None
         self._cached_expiry_monotonic = 0.0
+
+    def _token_request(self, data: bytes, headers: dict[str, str]) -> urllib.request.Request:
+        """The token-endpoint POST, on this connection's egress route. With an ECH sidecar the request
+        is re-addressed to it (#1176); without one it goes straight to the configured ``token_url``,
+        byte-identical. The cleartext-credential refusal above keys on the DECLARED ``token_url``
+        scheme, which is what the sidecar re-originates — the engine->sidecar leg is same-host loopback
+        (ADR 0092), exactly as the delivery hop's is."""
+        if self._ech_sidecar is not None:
+            return ech_readdressed_request(
+                self._ech_sidecar, self.token_url, data=data, headers=headers, method="POST"
+            )
+        return urllib.request.Request(  # noqa: S310  # nosec B310 — scheme constrained to http(s) above
+            self.token_url, data=data, headers=headers, method="POST"
+        )
 
     def access_token(self) -> str:
         """A valid bearer token — cached until it nears expiry, else freshly acquired. Blocking (a token
@@ -248,9 +271,7 @@ class OAuth2ClientCredentialsProvider:
         # env(), so an env value that resolved to an unexpected blob would otherwise surface as an
         # opaque IdP-side failure on the first mint rather than as a clear config error.
         enforce_outbound_length_limits(self.token_url, dict(headers))
-        req = urllib.request.Request(  # noqa: S310  # nosec B310 — scheme constrained to http(s) above
-            self.token_url, data=data, headers=headers, method="POST"
-        )
+        req = self._token_request(data, headers)
         try:
             with self._opener.open(req, timeout=self.timeout_seconds) as resp:
                 body = resp.read().decode("utf-8", errors="replace")
@@ -287,12 +308,14 @@ class OAuth2ClientCredentialsProvider:
 
 
 def oauth2_cc_provider_from_settings(
-    s: Mapping[str, Any], *, proxy: ProxyConfig | None = None
+    s: Mapping[str, Any], *, proxy: ProxyConfig | None = None, ech_sidecar: str | None = None
 ) -> OAuth2ClientCredentialsProvider | None:
     """The :class:`OAuth2ClientCredentialsProvider` for an ``env()``-resolved settings mapping, or ``None``
     when symmetric OAuth2-CC auth is off (``oauth2_token_url`` absent, or ``oauth2_enabled`` is False) — so
     any connection that didn't configure it is byte-identical. ``proxy`` (ADR 0126) routes the
-    token-endpoint POST through the connection's forward proxy."""
+    token-endpoint POST through the connection's forward proxy; ``ech_sidecar`` (#1176, ADR 0139)
+    re-addresses it to the connection's loopback ECH sidecar instead. The two are mutually exclusive by
+    construction."""
     if not s.get("oauth2_token_url"):
         return None
     if not s.get("oauth2_enabled", True):
@@ -318,18 +341,21 @@ def oauth2_cc_provider_from_settings(
         cleartext_reason=_accepted[1],
         connection=_accepted[2],
         proxy=proxy,  # ADR 0126: forward-proxy the token-endpoint POST
+        ech_sidecar=ech_sidecar,  # #1176: ...or re-address it to the ECH sidecar (ADR 0139)
     )
 
 
 def bearer_provider_from_settings(
-    s: Mapping[str, Any], *, proxy: ProxyConfig | None = None
+    s: Mapping[str, Any], *, proxy: ProxyConfig | None = None, ech_sidecar: str | None = None
 ) -> BearerTokenProvider | None:
     """The active bearer-token provider for an HTTP destination, or ``None`` when none is configured
     (byte-identical). Unifies the SMART Backend Services provider (ADR 0024, asymmetric JWT) and the
     OAuth2 client-credentials provider (#65, symmetric secret) behind the one bearer seam the connector
     drives. The two are **mutually exclusive** on one connection — configuring both is a loud
     :class:`HttpAuthError` (a connection has exactly one identity). ``proxy`` (ADR 0126) routes whichever
-    provider's token-endpoint call through the connection's forward proxy."""
+    provider's token-endpoint call through the connection's forward proxy; ``ech_sidecar`` (#1176,
+    ADR 0139) re-addresses it to the connection's loopback ECH sidecar instead, so the ECH connection's
+    token hop stops leaking the authorization server's SNI while its payload hop is routed."""
     # Detect the conflict from settings PRESENCE before constructing either provider, so a "both
     # configured" mistake reports the mutual-exclusion error rather than whichever provider's own
     # validation happens to fire first on partial config.
@@ -340,9 +366,45 @@ def bearer_provider_from_settings(
             "a connection cannot use BOTH SMART Backend Services and OAuth2 client-credentials auth "
             "(mutually exclusive — configure exactly one)"
         )
-    return token_provider_from_settings(s, proxy=proxy) or oauth2_cc_provider_from_settings(
-        s, proxy=proxy
-    )
+    return token_provider_from_settings(
+        s, proxy=proxy, ech_sidecar=ech_sidecar
+    ) or oauth2_cc_provider_from_settings(s, proxy=proxy, ech_sidecar=ech_sidecar)
+
+
+#: Digest algorithms this engine will answer a challenge with (BACKLOG #1171, ASVS 11.4.1). The
+#: ``-sess`` variants are the same hash and are accepted by stripping the suffix.
+#:
+#: **The SERVER chooses, not us.** ``urllib``'s handler reads ``chal.get('algorithm', 'MD5')`` -- so an
+#: endpoint that simply OMITS the parameter, which is the common RFC 2617 case, gets answered with MD5.
+#: Appendix C marks MD5 **D**: disallowed for any cryptographic purpose, in a clause with no default-off
+#: escape. There is no way to dictate the algorithm to the peer, so the only honest options are refuse
+#: or remove, and refusing keeps the feature for endpoints that offer an approved hash.
+_APPROVED_DIGEST_ALGORITHMS = frozenset({"SHA-256", "SHA-512-256"})
+
+
+class _ApprovedDigestAuthHandler(urllib.request.HTTPDigestAuthHandler):
+    """Refuses a Digest challenge that names a disallowed hash, instead of silently answering it.
+
+    LOUD, not ``return None``. Returning ``None`` makes urllib skip the auth and the request fails as a
+    bare 401 -- an operator would read that as bad credentials and go looking in the wrong place. This
+    raises with the algorithm named, in the same ``HttpAuthError`` contract the rest of this seam uses
+    for a refused hop.
+    """
+
+    def get_authorization(self, req: Any, chal: Mapping[str, str]) -> Any:
+        # Mirrors urllib's own default EXACTLY: an absent parameter means MD5, which is the case that
+        # makes this reachable without a hostile server -- a plain RFC 2617 endpoint.
+        named = str(chal.get("algorithm", "MD5")).strip()
+        base = named.upper().removesuffix("-SESS")
+        if base not in _APPROVED_DIGEST_ALGORITHMS:
+            raise HttpAuthError(
+                f"the endpoint's HTTP Digest challenge names algorithm {named!r}, which is not an "
+                f"approved hash (ASVS 11.4.1; approved here: {sorted(_APPROVED_DIGEST_ALGORITHMS)}). "
+                "urllib defaults to MD5 when the challenge omits the parameter, so an endpoint that "
+                "names nothing lands here too. Use an endpoint offering SHA-256 Digest, or a different "
+                "http_auth mode (BACKLOG #1171)."
+            )
+        return super().get_authorization(req, chal)
 
 
 def digest_handler_from_settings(
@@ -398,7 +460,7 @@ def digest_handler_from_settings(
     # A default-realm entry keyed on the endpoint URL: urllib matches by URL prefix, so the same
     # credential answers whatever realm the server names in its 401 challenge.
     pwmgr.add_password(None, url, user, password)
-    return urllib.request.HTTPDigestAuthHandler(pwmgr)
+    return _ApprovedDigestAuthHandler(pwmgr)
 
 
 def _require_http_spec(spec: ConnectionSpec, mode: str) -> None:

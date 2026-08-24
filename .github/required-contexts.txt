@@ -44,9 +44,21 @@
 # it, no `if:` gated on a non-PR event) BEFORE it lands here or in branch protection.
 
 # --- ci.yml ---------------------------------------------------------------------------------------
-# `CI gate` (ci.yml, job `ci-gate`) is a ROLL-UP, not a test. It is `if: always()` over six legs that
-# are PATH-GATED or nightly -- sqlserver-store, postgres-store, load-test, load-test-sqlserver,
-# windows-service-smoke, changes -- and fails if any of them failed or was cancelled.
+# `CI gate` (ci.yml, job `ci-gate`) is a ROLL-UP, not a test. It is `if: always()` over EIGHT legs
+# and fails if any of them failed or was cancelled:
+#
+#   PATH-GATED or nightly -- these cannot be required directly (see below):
+#     sqlserver-store, postgres-store, load-test, load-test-sqlserver, windows-service-smoke, changes
+#   NOT path-gated -- these RUN ON EVERY PULL REQUEST and are the two most likely to report:
+#     webconsole, tooling
+#
+# THE SECOND GROUP WAS ABSENT FROM THIS FILE UNTIL BACKLOG #1300, AND THAT IS THE FAILURE THIS FILE
+# EXISTS TO PREVENT. This file's whole purpose is to be the checked-in answer to "does this check
+# block a merge". A session whose `repo harness tests` or `webconsole` leg is red reads this file,
+# finds no such context, and concludes it is not blocking. The correct answer was always written out
+# in ci.yml's `needs:` -- but a reader who knew to go there would not have needed this file.
+# `tests/test_required_contexts.py` now reconciles this comment against that `needs:` list, so the
+# two cannot drift again silently.
 #
 # Requiring the roll-up is the only way to gate those six. They cannot be required directly: a
 # path-gated job does not report on a PR that touches none of its paths, which is the

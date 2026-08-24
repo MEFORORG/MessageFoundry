@@ -60,7 +60,14 @@ from messagefoundry.api._ui_seam import ENGINE_UI_SEAM, CoreHandlers, UiDeps
 from messagefoundry.api.approvals import ApprovalError, ApprovalGate
 from messagefoundry.api.auth_routes import add_auth_routes
 from messagefoundry.api.client_networks import ClientNetworkMiddleware
-from messagefoundry.api.field_authz import count_exposed, redact_unauthorized
+from messagefoundry.api.field_authz import count_exposed, count_masked, redact_unauthorized
+from messagefoundry.api.header_floor import (
+    BASELINE_SECURITY_HEADERS,
+    HSTS_HEADER,
+    HSTS_VALUE,
+    SecurityHeaderFloorMiddleware,
+    hsts_applies,
+)
 from messagefoundry.api.metrics import (
     METRICS_CONTENT_TYPE,
     MetricsHistory,
@@ -116,8 +123,10 @@ from messagefoundry.api.models import (
     LogLevelUpdate,
     LogTailPage,
     MessageDetail,
+    MessageExportRequest,
     MessageList,
     MessageResponses,
+    MessageSearchRequest,
     MessageSearchResults,
     MessageSummary,
     MetricsHistoryResponse,
@@ -151,6 +160,7 @@ from messagefoundry.api.models import (
     UploadDeleteResult,
     UploadedFileInfo,
     UploadedFileList,
+    UploadedMessageSearchRequest,
     UploadedMessagesResult,
     UploadedMessageSummary,
     UploadResendRequest,
@@ -181,7 +191,7 @@ from messagefoundry.api.security import (
 # mount_ui), so the engine imports + boots + serves the JSON API with the console ABSENT. serve_ui-on
 # behavior is preserved via three seams the console installs: app.state.ui_csp,
 # app.state.ui_ws_authorize, app.state.ui_connections_render (read by the always-on middleware/routes).
-from messagefoundry.auth import Identity, Permission
+from messagefoundry.auth import Identity, Permission, Role
 from messagefoundry.auth.service import AuthService, BootstrapAdmin
 from messagefoundry.auth.trust_anchors import (
     AnchorSpec,
@@ -758,6 +768,21 @@ def _needle_shape(needle: str) -> str:
     return "mixed"
 
 
+def _scan_limit_or_default(value: int | None) -> int:
+    """Resolve a POST body's optional ``scan_limit`` against the bounds the GET's ``Query`` enforces.
+
+    The body model cannot carry the ceiling itself: the constants live in
+    :mod:`messagefoundry.store.content_search`, and importing them into ``api/models.py`` would drag
+    the engine into every process that imports those models — the coupling ADR 0088 exists to prevent.
+    So the resolution happens here, where the real constants are already in scope. 422 is what FastAPI
+    returns for an out-of-range ``Query``, so both shapes refuse the same way."""
+    if value is None:
+        return DEFAULT_CONTENT_SCAN_LIMIT
+    if value > MAX_CONTENT_SCAN_LIMIT:
+        raise HTTPException(422, f"scan_limit must be at most {MAX_CONTENT_SCAN_LIMIT}")
+    return value
+
+
 def _search_audit_detail(
     spec: SearchSpec, result: object, *, filters: dict[str, str | None]
 ) -> dict[str, object]:
@@ -982,47 +1007,70 @@ class _SummaryAuditCoalescer:
     because the engine is a single uvicorn worker (single-connection store + ``asyncio.Lock``)."""
 
     def __init__(self) -> None:
-        # (actor, scope) -> {"hour": int, "count": int}; scope is the channel filter ("" = all channels)
+        # (actor, scope) -> {"hour": int, "count": int, "masked": int}; scope is the channel filter
+        # ("" = all channels). ``count`` is summaries the caller could READ; ``masked`` is rows
+        # returned display-masked, kept apart so one can never be read as the other.
         self._windows: dict[tuple[str | None, str], dict[str, int]] = {}
 
     def _roll(
-        self, actor: str | None, scope: str, count: int, hour: int
-    ) -> list[tuple[str | None, str, int, int]]:
-        """Accumulate ``count`` into the ``(actor, scope)`` window for ``hour`` and return any windows
-        to flush now — every window whose hour has passed. Synchronous (no ``await``), so the dict is
-        mutated atomically w.r.t. the event loop and a window can't be double-emitted."""
-        emit: list[tuple[str | None, str, int, int]] = []
+        self, actor: str | None, scope: str, count: int, hour: int, *, masked: int = 0
+    ) -> list[tuple[str | None, str, int, int, int]]:
+        """Accumulate ``count`` and ``masked`` into the ``(actor, scope)`` window for ``hour`` and
+        return any windows to flush now — every window whose hour has passed. Synchronous (no
+        ``await``), so the dict is mutated atomically w.r.t. the event loop and a window can't be
+        double-emitted."""
+        emit: list[tuple[str | None, str, int, int, int]] = []
         for (a, sc), win in list(self._windows.items()):
             if win["hour"] != hour:
-                emit.append((a, sc, win["hour"], win["count"]))
+                emit.append((a, sc, win["hour"], win["count"], win.get("masked", 0)))
                 del self._windows[(a, sc)]
-        self._windows.setdefault((actor, scope), {"hour": hour, "count": 0})["count"] += count
+        win = self._windows.setdefault((actor, scope), {"hour": hour, "count": 0, "masked": 0})
+        win["count"] += count
+        win["masked"] += masked
         return emit
 
     async def note(
-        self, store: Store, actor: str | None, scope: str | None, count: int, now: float
+        self,
+        store: Store,
+        actor: str | None,
+        scope: str | None,
+        count: int,
+        now: float,
+        *,
+        masked: int = 0,
     ) -> None:
-        """Count ``count`` exposed summaries for ``actor``; emit a coalesced audit row for any window
-        that just rolled over. No-op when nothing was exposed."""
-        if count <= 0:
+        """Count ``count`` exposed and ``masked`` display-masked summaries for ``actor``; emit a
+        coalesced audit row for any window that just rolled over.
+
+        A window is opened by EITHER count, so a bulk list fetch that returned only masked rows is
+        still audited (ASVS 14.2.6, BACKLOG #1187) -- it disclosed nothing, but a 5,000-row scrape
+        must not become indistinguishable from no request at all. ``count`` keeps its meaning:
+        summaries the caller could actually READ."""
+        if count <= 0 and masked <= 0:
             return
-        for a, sc, win_hour, win_count in self._roll(actor, scope or "", count, int(now // 3600)):
-            await self._emit(store, a, sc, win_hour, win_count)
+        rolled = self._roll(actor, scope or "", count, int(now // 3600), masked=masked)
+        for a, sc, win_hour, win_count, win_masked in rolled:
+            await self._emit(store, a, sc, win_hour, win_count, win_masked)
 
     async def flush(self, store: Store) -> None:
         """Emit every pending window (e.g. on engine shutdown) so an active window isn't lost."""
         windows = list(self._windows.items())
         self._windows.clear()
         for (a, sc), win in windows:
-            await self._emit(store, a, sc, win["hour"], win["count"])
+            await self._emit(store, a, sc, win["hour"], win["count"], win.get("masked", 0))
 
     @staticmethod
-    async def _emit(store: Store, actor: str | None, scope: str, hour: int, count: int) -> None:
+    async def _emit(
+        store: Store, actor: str | None, scope: str, hour: int, count: int, masked: int = 0
+    ) -> None:
+        # ``count`` keeps its documented meaning -- summaries the caller could READ -- so a reader
+        # of an older row is not silently re-scoped. ``masked`` is additive and distinguishes a
+        # scrape that harvested nothing from one that harvested identifiers.
         await store.record_audit(
             "summary_access",
             actor=actor,
             channel_id=(scope or None),
-            detail=json.dumps({"count": count, "window_start": hour * 3600}),
+            detail=json.dumps({"count": count, "masked": masked, "window_start": hour * 3600}),
         )
 
 
@@ -1106,6 +1154,12 @@ def create_app(
             max_files_per_user=store_settings.max_upload_files_per_user,
             max_total_bytes_per_user=store_settings.max_upload_total_bytes_per_user,
             retention_days=store_settings.uploads_retention_days,
+            # ASVS 2.3.4: the quota's cross-PROCESS half. The per-uploader lock inside UploadStore is
+            # an asyncio.Lock and so is per-event-loop; N engine shards over one uploads_dir hold N
+            # of them. Every shard shares this ONE unified store (ADR 0063), so it is the decision
+            # point that spans them. None here is the genuinely store-LESS path (embedding / tests) —
+            # the same path that falls back to build_store_cipher above.
+            store=engine.store if engine is not None else None,
         )
     # ADR 0118: the EFFECTIVE [security] switch values (serve syncs the gate-flipped egress/retention back
     # in) back the read-only GET /security/posture view. None → the secure defaults for the test/embedding
@@ -1215,7 +1269,16 @@ def create_app(
         _log.error(
             "unhandled error on %s %s: %s", request.method, request.url.path, type(exc).__name__
         )
-        return JSONResponse({"detail": "internal error"}, status_code=500)
+        # The baseline security headers are set HERE, not left to the middleware that sets them on
+        # every other response. Starlette routes a handler registered for Exception/500 to
+        # ServerErrorMiddleware, which build_middleware_stack places OUTSIDE user_middleware by
+        # construction — so neither _security_headers below nor the outermost
+        # SecurityHeaderFloorMiddleware is in this response's path, and a 500 shipped with none of
+        # them. Status and body are unchanged: this adds headers only.
+        headers = dict(BASELINE_SECURITY_HEADERS)
+        if hsts_applies(request.url.scheme, exposure_protected):
+            headers[HSTS_HEADER] = HSTS_VALUE
+        return JSONResponse({"detail": "internal error"}, status_code=500, headers=headers)
 
     @app.exception_handler(RequestValidationError)
     async def _validation_error(request: Request, exc: RequestValidationError) -> JSONResponse:
@@ -1264,13 +1327,13 @@ def create_app(
                 "docs/security/OFF-LOOPBACK-DEPLOYMENT.md."
             )
         response = await call_next(request)
-        response.headers.setdefault("X-Content-Type-Options", "nosniff")
-        response.headers.setdefault("Referrer-Policy", "no-referrer")
-        response.headers.setdefault("X-Frame-Options", "DENY")
-        if request.url.scheme == "https" or exposure_protected:
-            response.headers.setdefault(
-                "Strict-Transport-Security", "max-age=31536000; includeSubDomains"
-            )
+        # The header names/values and the HSTS condition come from api/header_floor.py so this
+        # middleware and the outermost floor that backstops it cannot drift apart. This one still
+        # exists for the PATH-CONDITIONAL work below, which the floor deliberately does not duplicate.
+        for name, value in BASELINE_SECURITY_HEADERS:
+            response.headers.setdefault(name, value)
+        if hsts_applies(request.url.scheme, exposure_protected):
+            response.headers.setdefault(HSTS_HEADER, HSTS_VALUE)
         # /ui browser surface (ADR 0065 §5): a strict CSP (no unsafe-*) and no-store on every HTML
         # response; the vendored /ui/static assets keep StaticFiles' own cache. PHI JSON reads also get
         # no-store (every _NO_STORE_PREFIXES family, ASVS 14.2.2) so a browser/proxy never caches a
@@ -2681,10 +2744,10 @@ def create_app(
         # patient-identifying `summary` and the delivery `last_error` (which can quote field values —
         # review low-8); a caller without it gets them nulled. Exposure audited server-side (M-5).
         dead = [redact_unauthorized(d, identity) for d in dead]
-        exposed = count_exposed(dead)
-        if exposed:
+        exposed, masked = count_exposed(dead), count_masked(dead)
+        if exposed or masked:
             await request.app.state.summary_auditor.note(
-                engine.store, identity.username, channel_id, exposed, time.time()
+                engine.store, identity.username, channel_id, exposed, time.time(), masked=masked
             )
         return DeadLetterList(total=total, limit=limit, offset=offset, dead_letters=dead)
 
@@ -2986,42 +3049,49 @@ def create_app(
         # Every patient-identifying value actually returned is audited SERVER-SIDE (coalesced per
         # actor/hour) — never gated on a client flag, so a scripted bulk fetch can't harvest the
         # patient census unaudited (review M-5). Counted post-redaction = exactly what's returned.
-        exposed = count_exposed(messages)
-        if exposed:
+        exposed, masked = count_exposed(messages), count_masked(messages)
+        if exposed or masked:
             await request.app.state.summary_auditor.note(
-                engine.store, identity.username, channel_id, exposed, time.time()
+                engine.store, identity.username, channel_id, exposed, time.time(), masked=masked
             )
         return MessageList(total=total, limit=limit, offset=offset, messages=messages)
 
-    @app.get("/messages/search", response_model=MessageSearchResults)
     async def search_messages(
         request: Request,
-        engine: Engine = Depends(_get_engine),
-        # Step-up (NOT just require_phi_read): content search decrypts bodies the caller never explicitly
-        # "opened" — a bulk-PHI operation, like replay (ADR 0046 D1 §4). It therefore demands a fresh
-        # re-verification + the second factor on top of the MESSAGES_READ permission.
-        identity: Identity = Depends(require_step_up(Permission.MESSAGES_READ)),
-        content: str | None = Query(None, max_length=512),
-        field_path: str | None = Query(None, max_length=32),
-        field_value: str | None = Query(None, max_length=512),
-        target: str = Query("both", pattern="^(raw|summary|both)$"),
-        channel_id: str | None = Query(None, max_length=256),
-        status: str | None = Query(None, max_length=64),
-        message_type: str | None = Query(None, max_length=64),
-        control_id: str | None = Query(None, max_length=256),
-        limit: int = Query(50, ge=1, le=500),
-        scan_limit: int = Query(DEFAULT_CONTENT_SCAN_LIMIT, ge=1, le=MAX_CONTENT_SCAN_LIMIT),
+        *,
+        engine: Engine,
+        identity: Identity,
+        content: str | None = None,
+        field_path: str | None = None,
+        field_value: str | None = None,
+        target: str = "both",
+        channel_id: str | None = None,
+        status: str | None = None,
+        message_type: str | None = None,
+        control_id: str | None = None,
+        limit: int = 50,
+        scan_limit: int = DEFAULT_CONTENT_SCAN_LIMIT,
     ) -> MessageSearchResults:
         """Search messages by what is *in* them — an HL7 field path (``PID-3``) or a raw/summary
         substring (ADR 0046 #51). Because the store is encrypted at rest, this scans-and-decrypts: it
         pre-filters on the indexed metadata, then decrypts + matches each candidate body in memory off
         the event loop, bounded by ``scan_limit`` decrypts and ``limit`` matches (truncate-and-tell). It
         sits behind step-up (a bulk-PHI read), inherits the ``view_summary`` redaction, and writes a
-        dedicated ``message_search`` audit row that never records an MRN-shaped needle."""
+        dedicated ``message_search`` audit row that never records an MRN-shaped needle.
+
+        This is the shared implementation behind BOTH request shapes (BACKLOG #1184): the GET below,
+        which takes only the non-PHI criteria, and the POST, which is the only way to send ``content``
+        or ``field_value``. It is also what the mounted console calls in-process, so its parameters are
+        plain keywords rather than FastAPI ``Query`` declarations."""
         # #200 residual (ADR 0092): search is a bulk-PHI read behind require_step_up, NOT require_phi_read,
         # so it doesn't inherit the folded data-path guard — apply it explicitly before any decrypt.
         enforce_phi_read_hop(request)
-        enforce_phi_read_pacing(request, identity)  # step-up paces NON-GET only; this is a GET
+        # Charged here rather than in a Depends because require_step_up's own pacing is NON-GET only:
+        # the GET below would otherwise select bodies in bulk unpaced. The POST does pay that
+        # admin-write bucket as well, which is the stricter direction and immaterial at its 12/second
+        # default; this charge is the per-actor PHI-READ budget, a different bucket, and both shapes
+        # must draw on it.
+        enforce_phi_read_pacing(request, identity)
         try:
             spec = make_spec(
                 content=content,
@@ -3068,10 +3138,10 @@ def create_app(
         )
         # The summary exposure (matched rows actually carrying a summary) is ALSO coalesced into the
         # standard summary_access audit, mirroring /messages — so a search-then-harvest can't dodge it.
-        exposed = count_exposed(messages)
-        if exposed:
+        exposed, masked = count_exposed(messages), count_masked(messages)
+        if exposed or masked:
             await request.app.state.summary_auditor.note(
-                engine.store, identity.username, channel_id, exposed, time.time()
+                engine.store, identity.username, channel_id, exposed, time.time(), masked=masked
             )
         return MessageSearchResults(
             messages=messages,
@@ -3082,27 +3152,86 @@ def create_app(
             scan_limit=spec.scan_limit,
         )
 
-    @app.get("/messages/export")
-    async def export_messages(
+    # Step-up (NOT just require_phi_read) on both shapes: content search decrypts bodies the caller
+    # never explicitly "opened" — a bulk-PHI operation, like replay (ADR 0046 D1 §4). It therefore
+    # demands a fresh re-verification + the second factor on top of the MESSAGES_READ permission.
+    @app.get("/messages/search", response_model=MessageSearchResults)
+    async def search_messages_get(
         request: Request,
         engine: Engine = Depends(_get_engine),
-        # LARGEST PHI surface in the cluster (bulk raw bodies → a file): the strongest interactive gate —
-        # a fresh step-up + second factor over BOTH messages:view_raw AND a dedicated messages:export
-        # capability (ADR 0131 §2). Bulk egress is a distinct privilege from opening one message.
-        identity: Identity = Depends(
-            require_step_up(Permission.MESSAGES_EXPORT, Permission.MESSAGES_VIEW_RAW)
-        ),
-        ids: list[str] = Query(default=[]),  # noqa: B006 — FastAPI repeated ?ids= (save-selected)
-        content: str | None = Query(None, max_length=512),
+        identity: Identity = Depends(require_step_up(Permission.MESSAGES_READ)),
         field_path: str | None = Query(None, max_length=32),
-        field_value: str | None = Query(None, max_length=512),
         target: str = Query("both", pattern="^(raw|summary|both)$"),
         channel_id: str | None = Query(None, max_length=256),
         status: str | None = Query(None, max_length=64),
         message_type: str | None = Query(None, max_length=64),
         control_id: str | None = Query(None, max_length=256),
-        limit: int = Query(1000, ge=1, le=100_000),
+        limit: int = Query(50, ge=1, le=500),
         scan_limit: int = Query(DEFAULT_CONTENT_SCAN_LIMIT, ge=1, le=MAX_CONTENT_SCAN_LIMIT),
+    ) -> MessageSearchResults:
+        """Search on a field PATH and the metadata filters — the criteria that are safe on a URL.
+
+        ``content`` and ``field_value`` are deliberately absent (BACKLOG #1184, ASVS 14.2.1): they hold
+        whatever an operator typed to find a patient, and a query string is copied into the engine's
+        access log, the reverse proxy's log and browser history, none of which the log redactor reaches.
+        Send those to ``POST /messages/search`` instead. ``field_path`` stays because it is a structural
+        locator rather than a value — the same reason ``_search_audit_detail`` records it verbatim."""
+        return await search_messages(
+            request,
+            engine=engine,
+            identity=identity,
+            field_path=field_path,
+            target=target,
+            channel_id=channel_id,
+            status=status,
+            message_type=message_type,
+            control_id=control_id,
+            limit=limit,
+            scan_limit=scan_limit,
+        )
+
+    @app.post("/messages/search", response_model=MessageSearchResults)
+    async def search_messages_post(
+        request: Request,
+        criteria: MessageSearchRequest,
+        engine: Engine = Depends(_get_engine),
+        identity: Identity = Depends(require_step_up(Permission.MESSAGES_READ)),
+    ) -> MessageSearchResults:
+        """The needle-bearing shape of the search above (BACKLOG #1184): identical selection, identical
+        gate, identical audit — the criteria simply arrive in the request BODY, which no access log,
+        proxy log or browser history records. A POST here creates nothing; it is a search."""
+        return await search_messages(
+            request,
+            engine=engine,
+            identity=identity,
+            content=criteria.content,
+            field_path=criteria.field_path,
+            field_value=criteria.field_value,
+            target=criteria.target,
+            channel_id=criteria.channel_id,
+            status=criteria.status,
+            message_type=criteria.message_type,
+            control_id=criteria.control_id,
+            limit=criteria.limit,
+            scan_limit=_scan_limit_or_default(criteria.scan_limit),
+        )
+
+    async def export_messages(
+        request: Request,
+        *,
+        engine: Engine,
+        identity: Identity,
+        ids: list[str],
+        content: str | None = None,
+        field_path: str | None = None,
+        field_value: str | None = None,
+        target: str = "both",
+        channel_id: str | None = None,
+        status: str | None = None,
+        message_type: str | None = None,
+        control_id: str | None = None,
+        limit: int = 1000,
+        scan_limit: int = DEFAULT_CONTENT_SCAN_LIMIT,
     ) -> StreamingResponse:
         """Stream a batch of message bodies to a downloadable NDJSON file (#124, ADR 0131) — the
         Corepoint-parity bulk export a one-at-a-time ``/messages/{id}`` raw view can't provide.
@@ -3115,13 +3244,18 @@ def create_app(
         The whole export is recorded as ONE ``messages_export`` audit row **before streaming** — actor +
         selection mode + basic filters + needle SHAPE (never the value) + the count of selected bodies — so
         a scripted save-all cannot pull a body that was not first counted in a durable audit row. The
-        PHI-safe destination is the operator's responsibility."""
+        PHI-safe destination is the operator's responsibility.
+
+        This is the shared implementation behind both request shapes (BACKLOG #1184): the GET below,
+        which takes ids and the URL-safe criteria, and the POST, which is the only way to select by
+        ``content`` or ``field_value``."""
         # #200 (ADR 0092): a bulk-PHI read behind step-up (NOT require_phi_read), so apply the data-path
         # hop guard explicitly before any body is decrypted — exactly as the step-up search route does.
         enforce_phi_read_hop(request)
-        # Charged BEFORE selection: export is a step-up GET, and step-up pacing is NON-GET only, so
-        # without this a single actor can stream far more bodies per minute here than the per-actor
-        # budget allows through /messages/{id}. Admission-time so a refused call does no store work.
+        # Charged BEFORE selection: step-up pacing is NON-GET only, so without this a single actor can
+        # stream far more bodies per minute through the export GET than the per-actor budget allows
+        # through /messages/{id}. Admission-time so a refused call does no store work. The POST shape
+        # draws on this same PHI-read bucket (its admin-write charge is a different, stricter one).
         enforce_phi_read_pacing(request, identity)
         allowed = _scope(identity)  # per-channel RBAC (None = all)
         if ids:
@@ -3189,6 +3323,76 @@ def create_app(
             _iter_ndjson(),
             media_type="application/x-ndjson",
             headers={"Content-Disposition": 'attachment; filename="messages-export.ndjson"'},
+        )
+
+    # LARGEST PHI surface in the cluster (bulk raw bodies → a file), on both shapes: the strongest
+    # interactive gate — a fresh step-up + second factor over BOTH messages:view_raw AND a dedicated
+    # messages:export capability (ADR 0131 §2). Bulk egress is a distinct privilege from opening one
+    # message.
+    @app.get("/messages/export")
+    async def export_messages_get(
+        request: Request,
+        engine: Engine = Depends(_get_engine),
+        identity: Identity = Depends(
+            require_step_up(Permission.MESSAGES_EXPORT, Permission.MESSAGES_VIEW_RAW)
+        ),
+        ids: list[str] = Query(default=[]),  # noqa: B006 — FastAPI repeated ?ids= (save-selected)
+        field_path: str | None = Query(None, max_length=32),
+        target: str = Query("both", pattern="^(raw|summary|both)$"),
+        channel_id: str | None = Query(None, max_length=256),
+        status: str | None = Query(None, max_length=64),
+        message_type: str | None = Query(None, max_length=64),
+        control_id: str | None = Query(None, max_length=256),
+        limit: int = Query(1000, ge=1, le=100_000),
+        scan_limit: int = Query(DEFAULT_CONTENT_SCAN_LIMIT, ge=1, le=MAX_CONTENT_SCAN_LIMIT),
+    ) -> StreamingResponse:
+        """Export by explicit ``ids`` or by the URL-safe search criteria (BACKLOG #1184, ASVS 14.2.1).
+
+        ``content`` and ``field_value`` are gone from here for the reason the search route states: an
+        operator-typed needle is PHI-shaped and a query string is logged in three places the redactor
+        cannot reach. Send a needle-bearing save-all to ``POST /messages/export``. Message ids stay —
+        they are engine-minted opaque identifiers, not patient data."""
+        return await export_messages(
+            request,
+            engine=engine,
+            identity=identity,
+            ids=ids,
+            field_path=field_path,
+            target=target,
+            channel_id=channel_id,
+            status=status,
+            message_type=message_type,
+            control_id=control_id,
+            limit=limit,
+            scan_limit=scan_limit,
+        )
+
+    @app.post("/messages/export")
+    async def export_messages_post(
+        request: Request,
+        criteria: MessageExportRequest,
+        engine: Engine = Depends(_get_engine),
+        identity: Identity = Depends(
+            require_step_up(Permission.MESSAGES_EXPORT, Permission.MESSAGES_VIEW_RAW)
+        ),
+    ) -> StreamingResponse:
+        """The needle-bearing shape of the export above (BACKLOG #1184): same gate, same per-row channel
+        re-check, same pre-stream audit — the selection criteria arrive in the request BODY."""
+        return await export_messages(
+            request,
+            engine=engine,
+            identity=identity,
+            ids=criteria.ids,
+            content=criteria.content,
+            field_path=criteria.field_path,
+            field_value=criteria.field_value,
+            target=criteria.target,
+            channel_id=criteria.channel_id,
+            status=criteria.status,
+            message_type=criteria.message_type,
+            control_id=criteria.control_id,
+            limit=criteria.limit,
+            scan_limit=_scan_limit_or_default(criteria.scan_limit),
         )
 
     @app.get("/messages/{message_id}", response_model=MessageDetail)
@@ -3260,15 +3464,27 @@ def create_app(
         # EXACT type (no MRO walk), so the MessageDetail wrapper and each nested OutboxInfo/EventInfo are
         # redacted individually. The raw body stays on this route's view_raw gate. Exposure is audited
         # server-side, mirroring the list endpoints (count after redaction = what's actually returned).
+        # OPENING ONE MESSAGE IS THE REVEAL ACT (ASVS 14.2.6). The list and search surfaces mask the
+        # summary, because those are where complete identifiers could be read off a screen opened for
+        # another reason. This route is a deliberate, per-message, already-audited open — record_view
+        # above plus the tamper-evident audit chain — so it is the specific act that lifts the mask,
+        # and it lifts it for THIS message only. The reveal is a call argument with nowhere to live
+        # between calls, so it cannot become a session-wide toggle by accident.
         outbox = [redact_unauthorized(o, identity) for o in detail.outbox]
         events = [redact_unauthorized(e, identity) for e in detail.events]
-        detail = redact_unauthorized(detail, identity).model_copy(
+        detail = redact_unauthorized(detail, identity, revealed=frozenset({"summary"})).model_copy(
             update={"outbox": outbox, "events": events}
         )
-        exposed = count_exposed([detail, *outbox, *events])
-        if exposed:
+        rows = [detail, *outbox, *events]
+        exposed, masked = count_exposed(rows), count_masked(rows)
+        if exposed or masked:
             await request.app.state.summary_auditor.note(
-                engine.store, identity.username, row["channel_id"], exposed, time.time()
+                engine.store,
+                identity.username,
+                row["channel_id"],
+                exposed,
+                time.time(),
+                masked=masked,
             )
         return detail
 
@@ -3954,20 +4170,20 @@ def create_app(
             total=len(files), files=[_upload_info(m) for m in files], scope=scope
         )
 
-    @app.get("/uploads/{file_id}/messages", response_model=UploadedMessagesResult)
     async def browse_uploaded_file(
         request: Request,
+        *,
         file_id: str,
-        engine: Engine = Depends(_get_engine),
-        identity: Identity = Depends(require_step_up(Permission.FILES_BROWSE)),
-        content: str | None = Query(None, max_length=512),
-        field_path: str | None = Query(None, max_length=32),
-        field_value: str | None = Query(None, max_length=512),
-        target: str = Query("both", pattern="^(raw|summary|both)$"),
-        message_type: str | None = Query(None, max_length=64),
-        control_id: str | None = Query(None, max_length=256),
-        limit: int = Query(50, ge=1, le=500),
-        offset: int = Query(0, ge=0),
+        engine: Engine,
+        identity: Identity,
+        content: str | None = None,
+        field_path: str | None = None,
+        field_value: str | None = None,
+        target: str = "both",
+        message_type: str | None = None,
+        control_id: str | None = None,
+        limit: int = 50,
+        offset: int = 0,
     ) -> UploadedMessagesResult:
         """Browse an uploaded file's split messages as a filterable log (BACKLOG #125). Decrypts + splits
         real PHI, so it is step-up-gated + PHI-read-hop-guarded (like content search) and audited with the
@@ -3978,7 +4194,7 @@ def create_app(
         needle occur in that file", so an unscoped browse is a content oracle over another operator's
         PHI, which is why the check runs BEFORE the body is decrypted."""
         enforce_phi_read_hop(request)
-        enforce_phi_read_pacing(request, identity)  # bulk decrypt+split on a step-up GET
+        enforce_phi_read_pacing(request, identity)  # bulk decrypt+split behind a step-up gate
         us = _require_upload_store(request)
         spec: SearchSpec | None = None
         if content or field_path:
@@ -4043,6 +4259,64 @@ def create_app(
             scanned=result.scanned,
             matched=result.matched,
             truncated=result.truncated,
+        )
+
+    @app.get("/uploads/{file_id}/messages", response_model=UploadedMessagesResult)
+    async def browse_uploaded_file_get(
+        request: Request,
+        file_id: str,
+        engine: Engine = Depends(_get_engine),
+        identity: Identity = Depends(require_step_up(Permission.FILES_BROWSE)),
+        field_path: str | None = Query(None, max_length=32),
+        target: str = Query("both", pattern="^(raw|summary|both)$"),
+        message_type: str | None = Query(None, max_length=64),
+        control_id: str | None = Query(None, max_length=256),
+        limit: int = Query(50, ge=1, le=500),
+        offset: int = Query(0, ge=0),
+    ) -> UploadedMessagesResult:
+        """List the file's split messages, filtered by the criteria that are safe on a URL.
+
+        ``content`` and ``field_value`` are gone (BACKLOG #1184, ASVS 14.2.1) — the needle an operator
+        types here is the same PHI-shaped term the content search takes, and the query string reaches
+        the access log, the proxy log and browser history alike. Use
+        ``POST /uploads/{file_id}/messages/search``. ``field_path`` stays: it is a structural locator."""
+        return await browse_uploaded_file(
+            request,
+            file_id=file_id,
+            engine=engine,
+            identity=identity,
+            field_path=field_path,
+            target=target,
+            message_type=message_type,
+            control_id=control_id,
+            limit=limit,
+            offset=offset,
+        )
+
+    @app.post("/uploads/{file_id}/messages/search", response_model=UploadedMessagesResult)
+    async def browse_uploaded_file_post(
+        request: Request,
+        file_id: str,
+        criteria: UploadedMessageSearchRequest,
+        engine: Engine = Depends(_get_engine),
+        identity: Identity = Depends(require_step_up(Permission.FILES_BROWSE)),
+    ) -> UploadedMessagesResult:
+        """The needle-bearing shape of the browse above (BACKLOG #1184): same owner check, same step-up,
+        same shape-only audit — the criteria arrive in the request BODY. A distinct ``/search`` path
+        rather than a POST on ``/messages``, which would read as creating a message in the file."""
+        return await browse_uploaded_file(
+            request,
+            file_id=file_id,
+            engine=engine,
+            identity=identity,
+            content=criteria.content,
+            field_path=criteria.field_path,
+            field_value=criteria.field_value,
+            target=criteria.target,
+            message_type=criteria.message_type,
+            control_id=criteria.control_id,
+            limit=criteria.limit,
+            offset=criteria.offset,
         )
 
     @app.post("/uploads/{file_id}/resend", response_model=UploadResendResult)
@@ -4198,7 +4472,7 @@ def create_app(
             # BACKLOG #1225: the OWNER KEY is the immutable Identity.user_id, never the reassignable
             # username. This is the WRITE the other three sites read; re-keying only the readers
             # would make every newly created preset invisible to its own creator.
-            owner=identity.user_id,
+            owner_user_id=identity.user_id,
             name=body.name,
             criteria=crit.model_dump_json(),
         )
@@ -4228,7 +4502,7 @@ def create_app(
     ) -> SearchPresetDeleteResult:
         """Delete one of the caller's presets (owner-scoped). Audited."""
         deleted = await engine.store.delete_search_preset(
-            preset_id=preset_id, owner=identity.user_id
+            preset_id=preset_id, owner_user_id=identity.user_id
         )
         if not deleted:
             raise HTTPException(404, f"no such preset: {preset_id}")
@@ -4263,7 +4537,9 @@ def create_app(
             raise HTTPException(400, f"at most {_MAX_PRESET_LAYERS} presets may be layered")
         criterias: list[dict[str, Any]] = []
         for preset_id in ids:
-            row = await engine.store.get_search_preset(preset_id=preset_id, owner=identity.user_id)
+            row = await engine.store.get_search_preset(
+                preset_id=preset_id, owner_user_id=identity.user_id
+            )
             if row is None:
                 raise HTTPException(404, f"no such preset: {preset_id}")
             try:
@@ -5273,13 +5549,14 @@ def create_app(
     # streaming is never cut mid-body — see api/request_timeout.py.
     app.add_middleware(RequestTimeoutMiddleware)
 
-    # [security].allowed_client_networks — registered LAST, so Starlette makes it the OUTERMOST user
-    # middleware (add_middleware inserts at index 0; the stack is built from reversed(user_middleware)).
-    # It therefore runs above the attachment CSP re-assert, the console's UiSecurityHeadersMiddleware,
-    # the body cap, the security-headers middleware, the /ui/static mount and every auth dependency — a
-    # refused address reaches no route, no dependency and no body buffer. Registered OUTSIDE serve_ui so a
-    # JSON-only deployment is equally covered, and unconditionally so the control can never be
-    # silently missing after a config edit (an empty list short-circuits inside it).
+    # [security].allowed_client_networks — registered so that only the response-header floor below is
+    # further out. It therefore runs above the attachment CSP re-assert, the console's
+    # UiSecurityHeadersMiddleware, the body cap, the security-headers middleware, the /ui/static mount
+    # and every auth dependency — a refused address reaches no route, no dependency and no body buffer.
+    # The floor does not weaken that: it runs NOTHING on the request path (it wraps `send` only), so it
+    # adds no reachable surface ahead of the gate. Registered OUTSIDE serve_ui so a JSON-only deployment
+    # is equally covered, and unconditionally so the control can never be silently missing after a
+    # config edit (an empty list short-circuits inside it).
     #
     # It must stay INSIDE uvicorn's ProxyHeadersMiddleware, which it is automatically by being part of
     # the app uvicorn wraps. Do NOT wrap the app in __main__ before uvicorn.run: that would put the
@@ -5287,7 +5564,81 @@ def create_app(
     # declared-proxy topology (R2) would break completely — every client would look like the proxy.
     app.add_middleware(ClientNetworkMiddleware)
 
+    # ASVS 3.4.4/3.4.5 — registered LAST, so Starlette makes it the OUTERMOST user middleware
+    # (add_middleware inserts at index 0; the stack is built from reversed(user_middleware)) and its
+    # response-path send wrapper runs after every other emitter. That position is the whole point:
+    # _security_headers is the INNERMOST user middleware, so the body cap's four short-circuits above
+    # shipped with no baseline headers at all, and both middlewares that hand-copy the baseline
+    # (client_networks._DENIAL_HEADERS, request_timeout._TIMEOUT_HEADERS) omit HSTS. The floor
+    # setdefaults, never assigns, so the attachment sandbox CSP re-asserted above and every other
+    # last-writer-wins header is untouched. See api/header_floor.py — including why it CANNOT cover the
+    # unhandled 500 (ServerErrorMiddleware sits outside user_middleware; _unhandled_exception sets the
+    # same baseline itself) and why the path-conditional Cache-Control/CSP is deliberately not copied.
+    app.add_middleware(SecurityHeaderFloorMiddleware)
+
     return app
+
+
+async def _assert_security_notice_is_deliverable(
+    store: Store,
+    *,
+    auth_settings: AuthSettings | None,
+    alerts_settings: AlertsSettings | None,
+    ai_settings: AiSettings | None,
+    security_settings: SecuritySettings | None,
+) -> None:
+    """BACKLOG #1020: refuse to serve a PHI instance whose security notices reach NOBODY.
+
+    The serve gate in ``messagefoundry/__main__.py`` already refuses without a notification channel,
+    but it computes readiness from ``notify_security_events`` + ``email_smtp_host`` + ``email_from``
+    -- **SMTP wiring alone**. That asks *"is a transport configured"* and never *"can the account
+    that matters actually receive"*: the instrument answering the adjacent question (SDS-3.8). On a
+    first run the only account that exists is the bootstrap administrator, created with no address,
+    so the gate passes green while every one of the ten notice types about the account holding
+    ``frozenset(Permission)`` silently no-ops -- including ``LOGIN_AFTER_FAILURES``, the classic
+    someone-guessed-it signal.
+
+    **This check must live here and not beside the transport gate.** ``_serve`` is synchronous and
+    opens no store, so at that point there is no user table to ask. The ASGI lifespan is the only
+    place the store and the freshly minted bootstrap admin are both in hand -- which is why the
+    owner's ruling (option (b), 2026-08-13) corrected the item's own stated fix location.
+
+    **Why deliverability rather than "require an email at creation".** ``update_user_profile`` issues
+    ``UPDATE users SET display_name=?, email=?`` unconditionally on every directory login, so any
+    address a human sets on an AD or OIDC account is overwritten at that holder's next sign-in. A fix
+    resting on an OPERATOR ACTION cannot cover that population; a startup assertion about the state
+    of the table can.
+
+    Deliberately narrow: it asks only whether SOME enabled administrator carries an address, not
+    whether mail to it would arrive. Proving actual delivery needs an SMTP round trip at startup,
+    which is a different and much larger change.
+    """
+    auth_settings = auth_settings or AuthSettings()
+    if not auth_settings.enabled or not auth_settings.notify_security_events:
+        return  # no notices to deliver; the transport gate already governs whether that is allowed
+    alerts = alerts_settings or AlertsSettings()
+    if not alerts.security_notifications_required:
+        return  # the audited, in-writing opt-out -- the pull-only feed is accepted
+    data_class, _production = (ai_settings or AiSettings()).derived_posture()
+    if data_class is not DataClass.PHI:
+        return
+    for user in await store.list_users():
+        if user.disabled or not user.email:
+            continue
+        if Role.ADMINISTRATOR.value in await store.get_user_role_ids(user.id):
+            return
+    detail = (
+        "no enabled Administrator has an email address, so every out-of-band security notice about "
+        "the most privileged accounts would be silently dropped (SecurityEventNotifier returns "
+        "early when the recipient has no address). The [alerts] SMTP transport being configured "
+        "does not make a notice deliverable -- on a first run the bootstrap administrator is created "
+        "without one. Set an address on at least one enabled Administrator, or accept the pull-only "
+        "/me/security-events feed in writing via [alerts].security_notifications_required=false."
+    )
+    enforcement = (security_settings or SecuritySettings()).enforcement
+    if enforcement is SecurityEnforcement.ENFORCE:
+        raise RuntimeError(f"refusing to start a PHI instance: {detail}")
+    _log.warning("PHI instance with no deliverable security-notice recipient: %s", detail)
 
 
 def _emit_bootstrap_admin(bootstrap: BootstrapAdmin, store_settings: StoreSettings) -> None:
@@ -5563,6 +5914,9 @@ def create_managed_app(
                 max_files_per_user=resolved.max_upload_files_per_user,
                 max_total_bytes_per_user=resolved.max_upload_total_bytes_per_user,
                 retention_days=resolved.uploads_retention_days,
+                # ASVS 2.3.4: bind the cross-shard quota ledger to the SAME store this lifespan just
+                # opened — this is the serve path, so it is the one that actually runs sharded.
+                store=store,
             )
         # Operational alert notifier (webhook/email). None when no transport is configured → the
         # engine falls back to the logging sink. Its background dispatch task is owned by this
@@ -5728,198 +6082,224 @@ def create_managed_app(
             if registry_filter is not None:
                 loaded = registry_filter(loaded)
             engine.add_registry(loaded)
-        await engine.start()
-        # #144 (ADR 0128): inject the connection-control callback INTO the notifier (the sink never imports
-        # RegistryRunner). A rule's control_action then auto-remediates via restart_inbound/restart_outbound;
-        # re-reading engine.registry_runner each call keeps it correct across a config reload that swaps the
-        # runner. The sink dispatches this off-worker + never-raise, so exceptions here are logged, not fatal.
-        if notifier is not None:
-
-            async def _alert_control(action: str, target: str) -> None:
-                rr = engine.registry_runner
-                if rr is None:
-                    return
-                if action == "restart_inbound":
-                    await rr.restart_inbound(target)
-                elif action == "restart_outbound":
-                    await rr.restart_outbound(target)
-
-            notifier.set_control_callback(_alert_control)
-        app.state.engine = engine
-        # #285: stash the trust anchors so /config/reload re-verifies the on-disk PEMs (a swapped anchor
-        # is caught + audited, a pinned-but-substituted anchor refuses the deploy) — the reload seam.
-        app.state.trust_anchor_specs = tuple(trust_anchor_specs)
-        app.state.trust_anchors_enforcing = trust_anchors_enforcing
-        app.state.store_settings = resolved  # back GET /security/posture (M5)
-        app.state.alerts_settings = alerts_settings
-        # #143: expose the running notifier so POST /alerts/{id}/suspend|resume can update its in-memory
-        # suspend cache live (None here in a JSON-only/no-transport deployment — the durable store governs).
-        app.state.notifier = notifier
-        # ASVS 6.4.5: the cert-identity resolver reads [cert_monitor].warn_days off app.state to decide
-        # whether a service caller's client cert, observed at the mTLS handshake, is inside the warn
-        # window. None (the direct create_app / embedding path) leaves that check inert — deny-by-default
-        # for a monitoring signal, and byte-identical to before.
-        app.state.cert_monitor_settings = cert_monitor_settings
-        # #118: expose the connector SecretProvider so POST /alerts/test-email can resolve an
-        # email_password_secret reference (fail-closed) exactly as notifier_from_settings does. None on
-        # the embedded/test path — then only a plain env-sourced email_password can be tested.
-        app.state.secret_provider = secret_provider
-        # #323 layer 3: expose the [tls] trust-anchor policy so POST /alerts/test-email builds its
-        # EmailTransport with the SAME anchors as the live notifier. None on the embedded/test path.
-        app.state.tls_settings = tls_settings
-        app.state.service_settings = service_settings  # back GET /service/status (L6a)
-        app.state.log_dir = log_dir  # back GET /status app-log metering (#50)
-        app.state.approval_gate = _build_approval_gate(
-            engine, approvals_settings or ApprovalsSettings()
-        )
-        # ASVS 5.2.4: age-based retention prune for the uploaded-logs surface. Owned by this lifespan
-        # (started here, stopped in the finally) — the runner pattern of cert_expiry, but wired where the
-        # UploadStore lives (built in create_app from store_settings). None when [store].uploads_dir is
-        # unset (the subsystem is opt-in), so a deployment without uploaded logs spawns no task. The audit
-        # callback closes over the opened store so the leaf uploads module never imports it.
+        # #1257: hoisted above the try because the finally below now guards STARTUP too, and it
+        # reaches these names before it reaches engine.stop(). Left in place inside the span, a
+        # failure before they were bound raises UnboundLocalError IN THE TEARDOWN, which aborts it
+        # early -- so the store never closes and the process hangs exactly as it did before the
+        # fix, with the real startup error replaced by the UnboundLocalError. Measured by removing
+        # one of these five: the hang came straight back. They are load-bearing, not tidiness.
         upload_retention_runner: UploadRetentionRunner | None = None
-        _upload_store: UploadStore | None = getattr(app.state, "upload_store", None)
-        if _upload_store is not None:
-
-            async def _audit_upload_prune(meta: UploadedFileMeta) -> None:
-                # BACKLOG #1224: the retention runner has no operator and no request behind it, so
-                # the row is attributed to the system principal (matching pipeline/retention.py's
-                # `retention_purge`) rather than to the pruned file's uploader. The uploader is
-                # carried as DATA in `detail`, where a reader can still see whose file went. Both
-                # this site and the request-path sweep had to change together: fixing one would have
-                # left the same false attribution reachable by the other path.
-                await store.record_audit(
-                    "upload.prune",
-                    actor="system",
-                    detail=json.dumps(
-                        {
-                            "file_id": meta.file_id,
-                            "uploader": meta.uploader,
-                            "uploader_id": meta.uploader_id,
-                        }
-                    ),
-                )
-
-            upload_retention_runner = UploadRetentionRunner(
-                _upload_store, audit=_audit_upload_prune
-            )
-            upload_retention_runner.start()
         reaper: asyncio.Task[None] | None = None
         reconciler: asyncio.Task[None] | None = None
         bootstrap_reminder: asyncio.Task[None] | None = None
         security_notifier = None
-        # Back the COMPLETE loosening list on GET /security/posture: [auth] carries posture switches
-        # (ad_session_recheck_seconds) that security_loosenings() must see. Stashed here, OUTSIDE the
-        # `enabled` guard below, deliberately — a settings object that exists but is disabled is still
-        # the resolved settings, and stashing it only on the enabled path would make the route silently
-        # fall back to AuthSettings() defaults and report a subset. Mirrors store_settings above.
-        if auth_settings is not None:
-            app.state.auth_settings = auth_settings
-        if auth_settings is not None and auth_settings.enabled:
-            # Out-of-band security-event push (#188, ASVS 6.3.5/6.3.7) — reuses the [alerts] SMTP
-            # transport, sent to each affected user's own address. The notifier is wired only when the
-            # [auth].notify_security_events kill-switch is on AND a transport can be built (SMTP
-            # configured): security_notifier_from_settings returns None when SMTP is unset, so we never
-            # fabricate a transport — then only the audited /me/security-events pull feed records events.
-            # The effective-by-default guarantee (an exposed PHI instance MUST have a real push channel,
-            # or opt out in writing via [alerts].security_notifications_required) is enforced fail-closed
-            # at startup by the serve gate (messagefoundry/__main__.py), which checks these SAME two
-            # conditions — not here. This task is owned by the lifespan (started here, drained + closed
-            # after the engine in the finally below).
-            if auth_settings.notify_security_events and alerts_settings is not None:
-                security_notifier = security_notifier_from_settings(
-                    alerts_settings,
-                    secret_provider=secret_provider,
-                    trust_anchor_policy=tls_settings.policy() if tls_settings else None,
-                )
-                if security_notifier is not None:
-                    security_notifier.start()
-            auth = AuthService(
-                store,
-                auth_settings,
-                security_notifier=security_notifier,
-                secret_provider=secret_provider,
-                # #285 (ASVS 6.7.1): pass the enforcement dial so the OIDC anchor's construction-site
-                # preflight in build_idp_opener honors [security].enforcement — warn+audit (via the
-                # central run_anchor_preflight above) rather than refusing at enforce-only. Central
-                # preflight already ran before any listener bound; this keeps the seam consistent.
-                enforcing=trust_anchors_enforcing,
-                # #329: thread the derived instance posture to the LDAPS bind so its ad_tls_verify=false
-                # escape is clamped on an enforcing-PHI instance (LdapAuthenticator is built out of the
-                # connector-construction gate, so the clamp is inert unless the posture arrives here).
-                hop_posture=_hop_posture,
-            )
-            bootstrap = await auth.initialize()
-            app.state.auth = auth
-            if bootstrap is not None:
-                _emit_bootstrap_admin(bootstrap, resolved)
-            if not auth.webauthn_available() and await store.any_webauthn_credentials():
-                # L5b (ADR 0068 decision 5): enrolled passkeys exist but the [webauthn] extra is
-                # not installed (engine moved/reinstalled, same DB) — affected users stay
-                # MFA-required while every assertion path is unavailable. The reauth page renders
-                # a legible notice; this is the loud operator-facing half.
-                _log.warning(
-                    "WebAuthn passkeys are enrolled in this store but the [webauthn] extra is "
-                    "NOT installed — affected users cannot complete passkey step-up on this "
-                    "install. pip install messagefoundry[webauthn], or clear a stranded user's "
-                    "factors with POST /users/{id}/reset-mfa (admin_reset_mfa)."
-                )
-            if auth.kerberos_enabled:
-                # L5c (ADR 0068 §9): boot-once SPNEGO acceptor preflight — a missing keytab/SPN
-                # credential degrades browser SSO legibly (providers kerberos=false, the login
-                # link hidden, /ui/sso -> e=sso_unavailable) instead of failing per-request. The
-                # JSON /auth/negotiate deliberately keeps its per-request attempt (additive-only).
-                from messagefoundry.auth.ldap import LdapError, kerberos_acceptor_preflight
-
-                try:
-                    await asyncio.to_thread(kerberos_acceptor_preflight, auth_settings)
-                except LdapError as exc:
-                    _log.warning(
-                        "Kerberos SSO acceptor preflight failed — browser SSO is disabled until "
-                        "restart (the JSON /auth/negotiate still attempts per-request). Check the "
-                        "HTTP/<fqdn> SPN + keytab/service identity (see "
-                        "docs/security/OFF-LOOPBACK-DEPLOYMENT.md): %s",
-                        exc,
-                    )
-                    auth.mark_kerberos_unavailable(str(exc))
-            if auth.oidc_enabled:
-                # ADR 0142: a CONFIG-ONLY preflight. Deliberately NOT the Kerberos shape above —
-                # it performs no network I/O and cannot mark the IdP unavailable, because
-                # "must not make a reachable IdP a precondition for operating the engine" is an
-                # explicit ADR constraint and AC-8 wants recovery without a restart. The settings
-                # validators already refuse a misconfigured [auth].oidc_* at load (AC-9), so this
-                # only surfaces the posture an operator should see in the boot log.
-                _log.info(
-                    "Federated sign-in (OIDC) is ENABLED for the browser console: issuer=%s "
-                    "redirect=%s. The engine verifies what the IdP ASSERTS about MFA, "
-                    "cryptographically — it cannot prove the IdP enforced it.",
-                    auth_settings.oidc_issuer,
-                    auth_settings.oidc_redirect_path,
-                )
-            reaper = asyncio.create_task(_session_reaper(store))
-            if auth_settings.bootstrap_expiry_hours > 0:
-                # ASVS 6.4.5 arm 2: nudge an operator BEFORE an unclaimed first-run bootstrap admin is
-                # auto-disabled. API-lifespan-owned (like the session reaper), NOT engine-owned — it
-                # reaches the AuthService directly. The warn method latches once-per-window; the sink logs
-                # (LoggingAlertSink fallback) or notifies. No task when time-expiry is off (byte-identical).
-                bootstrap_reminder = asyncio.create_task(
-                    _bootstrap_expiry_reminder(auth, notifier or LoggingAlertSink())
-                )
-            if auth.directory_reconcile_enabled:
-                # ADR 0079 mechanism 2: propagate an AD disable/delete to live engine sessions.
-                # Default OFF (ad_session_recheck_seconds = 0) — no task, no behaviour change.
-                _log.info(
-                    "Directory session reconciliation is ENABLED: live AD sessions are "
-                    "re-resolved every %ds; a principal absent from the directory for %d "
-                    "consecutive passes has its sessions revoked. A directory outage revokes "
-                    "NOTHING, and a pass that would revoke too many at once aborts and alerts.",
-                    auth_settings.ad_session_recheck_seconds,
-                    auth_settings.ad_session_recheck_strikes,
-                )
-                reconciler = asyncio.create_task(
-                    _directory_reconciler(auth, auth_settings.ad_session_recheck_seconds)
-                )
+        # The teardown guards this ENTIRE span, not just the yield. Everything started below --
+        # the engine, both notifiers, the retention runner, the three tasks -- was otherwise
+        # abandoned in place on a startup failure. engine.stop() ends in store.close(), and
+        # aiosqlite's connection worker is NON-DAEMON, so skipping it left the process unable to
+        # exit: uvicorn refused correctly, printed 'Exiting.', and then hung forever.
         try:
+            await engine.start()
+            # #144 (ADR 0128): inject the connection-control callback INTO the notifier (the sink never imports
+            # RegistryRunner). A rule's control_action then auto-remediates via restart_inbound/restart_outbound;
+            # re-reading engine.registry_runner each call keeps it correct across a config reload that swaps the
+            # runner. The sink dispatches this off-worker + never-raise, so exceptions here are logged, not fatal.
+            if notifier is not None:
+
+                async def _alert_control(action: str, target: str) -> None:
+                    rr = engine.registry_runner
+                    if rr is None:
+                        return
+                    if action == "restart_inbound":
+                        await rr.restart_inbound(target)
+                    elif action == "restart_outbound":
+                        await rr.restart_outbound(target)
+
+                notifier.set_control_callback(_alert_control)
+            app.state.engine = engine
+            # #285: stash the trust anchors so /config/reload re-verifies the on-disk PEMs (a swapped anchor
+            # is caught + audited, a pinned-but-substituted anchor refuses the deploy) — the reload seam.
+            app.state.trust_anchor_specs = tuple(trust_anchor_specs)
+            app.state.trust_anchors_enforcing = trust_anchors_enforcing
+            app.state.store_settings = resolved  # back GET /security/posture (M5)
+            app.state.alerts_settings = alerts_settings
+            # #143: expose the running notifier so POST /alerts/{id}/suspend|resume can update its in-memory
+            # suspend cache live (None here in a JSON-only/no-transport deployment — the durable store governs).
+            app.state.notifier = notifier
+            # ASVS 6.4.5: the cert-identity resolver reads [cert_monitor].warn_days off app.state to decide
+            # whether a service caller's client cert, observed at the mTLS handshake, is inside the warn
+            # window. None (the direct create_app / embedding path) leaves that check inert — deny-by-default
+            # for a monitoring signal, and byte-identical to before.
+            app.state.cert_monitor_settings = cert_monitor_settings
+            # #118: expose the connector SecretProvider so POST /alerts/test-email can resolve an
+            # email_password_secret reference (fail-closed) exactly as notifier_from_settings does. None on
+            # the embedded/test path — then only a plain env-sourced email_password can be tested.
+            app.state.secret_provider = secret_provider
+            # #323 layer 3: expose the [tls] trust-anchor policy so POST /alerts/test-email builds its
+            # EmailTransport with the SAME anchors as the live notifier. None on the embedded/test path.
+            app.state.tls_settings = tls_settings
+            app.state.service_settings = service_settings  # back GET /service/status (L6a)
+            app.state.log_dir = log_dir  # back GET /status app-log metering (#50)
+            app.state.approval_gate = _build_approval_gate(
+                engine, approvals_settings or ApprovalsSettings()
+            )
+            # ASVS 5.2.4: age-based retention prune for the uploaded-logs surface. Owned by this lifespan
+            # (started here, stopped in the finally) — the runner pattern of cert_expiry, but wired where the
+            # UploadStore lives (built in create_app from store_settings). None when [store].uploads_dir is
+            # unset (the subsystem is opt-in), so a deployment without uploaded logs spawns no task. The audit
+            # callback closes over the opened store so the leaf uploads module never imports it.
+            _upload_store: UploadStore | None = getattr(app.state, "upload_store", None)
+            if _upload_store is not None:
+
+                async def _audit_upload_prune(meta: UploadedFileMeta) -> None:
+                    # BACKLOG #1224: the retention runner has no operator and no request behind it, so
+                    # the row is attributed to the system principal (matching pipeline/retention.py's
+                    # `retention_purge`) rather than to the pruned file's uploader. The uploader is
+                    # carried as DATA in `detail`, where a reader can still see whose file went. Both
+                    # this site and the request-path sweep had to change together: fixing one would have
+                    # left the same false attribution reachable by the other path.
+                    await store.record_audit(
+                        "upload.prune",
+                        actor="system",
+                        detail=json.dumps(
+                            {
+                                "file_id": meta.file_id,
+                                "uploader": meta.uploader,
+                                "uploader_id": meta.uploader_id,
+                            }
+                        ),
+                    )
+
+                upload_retention_runner = UploadRetentionRunner(
+                    _upload_store, audit=_audit_upload_prune
+                )
+                upload_retention_runner.start()
+            # Back the COMPLETE loosening list on GET /security/posture: [auth] carries posture switches
+            # (ad_session_recheck_seconds) that security_loosenings() must see. Stashed here, OUTSIDE the
+            # `enabled` guard below, deliberately — a settings object that exists but is disabled is still
+            # the resolved settings, and stashing it only on the enabled path would make the route silently
+            # fall back to AuthSettings() defaults and report a subset. Mirrors store_settings above.
+            if auth_settings is not None:
+                app.state.auth_settings = auth_settings
+            if auth_settings is not None and auth_settings.enabled:
+                # Out-of-band security-event push (#188, ASVS 6.3.5/6.3.7) — reuses the [alerts] SMTP
+                # transport, sent to each affected user's own address. The notifier is wired only when the
+                # [auth].notify_security_events kill-switch is on AND a transport can be built (SMTP
+                # configured): security_notifier_from_settings returns None when SMTP is unset, so we never
+                # fabricate a transport — then only the audited /me/security-events pull feed records events.
+                # The effective-by-default guarantee (an exposed PHI instance MUST have a real push channel,
+                # or opt out in writing via [alerts].security_notifications_required) is enforced fail-closed
+                # at startup by the serve gate (messagefoundry/__main__.py), which checks these SAME two
+                # conditions — not here. This task is owned by the lifespan (started here, drained + closed
+                # after the engine in the finally below).
+                if auth_settings.notify_security_events and alerts_settings is not None:
+                    security_notifier = security_notifier_from_settings(
+                        alerts_settings,
+                        secret_provider=secret_provider,
+                        trust_anchor_policy=tls_settings.policy() if tls_settings else None,
+                    )
+                    if security_notifier is not None:
+                        security_notifier.start()
+                auth = AuthService(
+                    store,
+                    auth_settings,
+                    security_notifier=security_notifier,
+                    secret_provider=secret_provider,
+                    # #285 (ASVS 6.7.1): pass the enforcement dial so the OIDC anchor's construction-site
+                    # preflight in build_idp_opener honors [security].enforcement — warn+audit (via the
+                    # central run_anchor_preflight above) rather than refusing at enforce-only. Central
+                    # preflight already ran before any listener bound; this keeps the seam consistent.
+                    enforcing=trust_anchors_enforcing,
+                    # #329: thread the derived instance posture to the LDAPS bind so its ad_tls_verify=false
+                    # escape is clamped on an enforcing-PHI instance (LdapAuthenticator is built out of the
+                    # connector-construction gate, so the clamp is inert unless the posture arrives here).
+                    hop_posture=_hop_posture,
+                )
+                bootstrap = await auth.initialize()
+                app.state.auth = auth
+                if bootstrap is not None:
+                    _emit_bootstrap_admin(bootstrap, resolved)
+                await _assert_security_notice_is_deliverable(
+                    store,
+                    auth_settings=auth_settings,
+                    alerts_settings=alerts_settings,
+                    ai_settings=ai_settings,
+                    security_settings=security_settings,
+                )
+                if not auth.webauthn_available() and await store.any_webauthn_credentials():
+                    # L5b (ADR 0068 decision 5): enrolled passkeys exist but the [webauthn] extra is
+                    # not installed (engine moved/reinstalled, same DB) — affected users stay
+                    # MFA-required while every assertion path is unavailable. The reauth page renders
+                    # a legible notice; this is the loud operator-facing half.
+                    _log.warning(
+                        "WebAuthn passkeys are enrolled in this store but the [webauthn] extra is "
+                        "NOT installed — affected users cannot complete passkey step-up on this "
+                        "install. pip install messagefoundry[webauthn], or clear a stranded user's "
+                        "factors with POST /users/{id}/reset-mfa (admin_reset_mfa)."
+                    )
+                if auth.kerberos_enabled:
+                    # L5c (ADR 0068 §9): boot-once SPNEGO acceptor preflight — a missing keytab/SPN
+                    # credential degrades browser SSO legibly (providers kerberos=false, the login
+                    # link hidden, /ui/sso -> e=sso_unavailable) instead of failing per-request. The
+                    # JSON /auth/negotiate deliberately keeps its per-request attempt (additive-only).
+                    from messagefoundry.auth.ldap import LdapError, kerberos_acceptor_preflight
+
+                    try:
+                        await asyncio.to_thread(kerberos_acceptor_preflight, auth_settings)
+                    except LdapError as exc:
+                        _log.warning(
+                            "Kerberos SSO acceptor preflight failed — browser SSO is disabled until "
+                            "restart (the JSON /auth/negotiate still attempts per-request). Check the "
+                            "HTTP/<fqdn> SPN + keytab/service identity (see "
+                            "docs/security/OFF-LOOPBACK-DEPLOYMENT.md): %s",
+                            exc,
+                        )
+                        auth.mark_kerberos_unavailable(str(exc))
+                if auth.oidc_enabled:
+                    # ADR 0142: a CONFIG-ONLY preflight. Deliberately NOT the Kerberos shape above —
+                    # it performs no network I/O and cannot mark the IdP unavailable, because
+                    # "must not make a reachable IdP a precondition for operating the engine" is an
+                    # explicit ADR constraint and AC-8 wants recovery without a restart. The settings
+                    # validators already refuse a misconfigured [auth].oidc_* at load (AC-9), so this
+                    # only surfaces the posture an operator should see in the boot log.
+                    _log.info(
+                        "Federated sign-in (OIDC) is ENABLED for the browser console: issuer=%s "
+                        "redirect=%s. The engine verifies what the IdP ASSERTS about MFA, "
+                        "cryptographically — it cannot prove the IdP enforced it.",
+                        auth_settings.oidc_issuer,
+                        auth_settings.oidc_redirect_path,
+                    )
+                reaper = asyncio.create_task(_session_reaper(store))
+                if auth.bootstrap_deadline_configured:
+                    # ASVS 6.4.5 arm 2: nudge an operator BEFORE an unclaimed first-run bootstrap admin is
+                    # auto-disabled. API-lifespan-owned (like the session reaper), NOT engine-owned — it
+                    # reaches the AuthService directly. The warn method latches once-per-window; the sink logs
+                    # (LoggingAlertSink fallback) or notifies. No task when NEITHER bound is configured.
+                    #
+                    # BACKLOG #1141: this open-coded `auth_settings.bootstrap_expiry_hours > 0`, a THIRD copy
+                    # of a question `bootstrap_expiry_warning` answers over TWO bounds — WP-3 account
+                    # retirement AND the ASVS 6.4.1 credential expiry. At bootstrap_expiry_hours=0 with
+                    # initial_password_expiry_hours set, that method computed a correct deadline and this
+                    # task — ITS ONLY CONSUMER — was never created, so the warning arm was SILENTLY DEAD.
+                    # BACKLOG #1245 corrected the two computations in auth/service.py and never reached the
+                    # gate deciding whether they run. Ask the AuthService, which owns the predicate now.
+                    bootstrap_reminder = asyncio.create_task(
+                        _bootstrap_expiry_reminder(auth, notifier or LoggingAlertSink())
+                    )
+                if auth.directory_reconcile_enabled:
+                    # ADR 0079 mechanism 2: propagate an AD disable/delete to live engine sessions.
+                    # Default OFF (ad_session_recheck_seconds = 0) — no task, no behaviour change.
+                    _log.info(
+                        "Directory session reconciliation is ENABLED: live AD sessions are "
+                        "re-resolved every %ds; a principal absent from the directory for %d "
+                        "consecutive passes has its sessions revoked. A directory outage revokes "
+                        "NOTHING, and a pass that would revoke too many at once aborts and alerts.",
+                        auth_settings.ad_session_recheck_seconds,
+                        auth_settings.ad_session_recheck_strikes,
+                    )
+                    reconciler = asyncio.create_task(
+                        _directory_reconciler(auth, auth_settings.ad_session_recheck_seconds)
+                    )
             yield
         finally:
             if upload_retention_runner is not None:

@@ -22,4 +22,46 @@ regexes = [
   # Fake test-fixture lease key (ADR 0114 claim-proc live test, tests/test_adr0114_claim_proc_live.py):
   # a hardcoded literal string naming the test scenario, not a credential — trips generic-api-key on entropy.
   '''adr0114-fence-test''',
+  # --- BACKLOG #1183 -- log-redaction secret-domain fixtures --------------------------------------
+  # Nine SYNTHETIC needles invented for tests/test_log_redaction_secret_domain.py (plus one sibling in
+  # tests/test_environments.py). Each is a value a redaction test asserts does NOT survive a log line,
+  # so each is published in test source by construction. They trip generic-api-key on ENTROPY, and the
+  # entropy is deliberate: every token carries a hyphen AND an underscore to break the long-base64
+  # run, so no family can be redacted by the backstop by accident and pass for the wrong reason.
+  #
+  # EXACT LITERALS, never a family prefix. A tidy `sk-live-.*` would also allowlist a REAL leaked key
+  # that happened to match the shape, leaving the scanner blind to the exact thing it exists to catch.
+  #
+  # Family "mefor_env_value" -- a MEFOR_STORE_ENCRYPTION_KEY= startup line; pattern _MEFOR_SECRET.
+  '''kv-Str0ng_Key-11''',
+  # Family "labelled_token" -- "cache hit token: ..."; pattern _BEARER.
+  '''mf-sess_9aZ-Qx_7Lp''',
+  # Family "api_key_kv" -- "calling partner api_key=..."; pattern _BEARER.
+  '''ak-live_7Qp-3Zx''',
+  # Family "mfb64_body" -- an mfb64:v1: carriage blob; patterns _MFB64 + _LONG_B64. This one is
+  # DEMONSTRABLY not a secret: it base64-decodes to the ASCII string "HelloWorldHelloWorld".
+  '''SGVsbG9Xb3JsZEhlbGxvV29ybGQ=''',
+  # Family "authorization_bearer_header" -- "Authorization: Bearer ..."; _BEARER + _AUTH_SCHEME.
+  '''sk-live-AbCdEf_1234-XYZ''',
+  # Family "bare_auth_scheme" -- a bare "Bearer ..." retry line; pattern _AUTH_SCHEME.
+  '''sk-live-Zz9_Aa8-QQwe''',
+  # Family "password_kv" -- "connect failed password=..."; pattern _CREDENTIAL_KV.
+  '''pw-Str0ng_Pass-22''',
+  # Family "odbc_pwd" -- an ODBC connection string's PWD=; pattern _CREDENTIAL_KV.
+  '''pw-0dbc_Pass-33''',
+  # tests/test_environments.py -- the needle proving a cast failure never echoes an env() value into
+  # the startup error (#1183). Never a real credential; it is chosen to FAIL int() on purpose.
+  '''pw-C4st_Val-66''',
 ]
+
+# BACKLOG #1091's `mefor-defaulted-credential` RULE LIVED HERE AND WAS DELIBERATELY REMOVED, not
+# abandoned. It is now a TIP-SCOPED check in tests/test_defaulted_credential_lint.py.
+#
+# THE PLACEMENT WAS THE DEFECT, NOT THE RULE. A LEAKED SECRET and a DEFAULTED CREDENTIAL mean
+# opposite things by history: a leaked value is compromised the moment it is pushed, so scanning all
+# history is CORRECT for it; a defaulted credential is a property of the SHIPPED ARTIFACT, so fixing
+# the tip removes it. security.yml runs gitleaks at fetch-depth 0, and the pattern matched 12 of 14
+# historical revisions of docker/compose.yaml -- so a clean tip could never turn the gate green. That
+# was the scanner doing its job on a rule that was not its business, not a tuning problem.
+#
+# DO NOT RE-ADD IT HERE. Every default rule below still scans full history, which is right for them.

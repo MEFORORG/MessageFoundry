@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Organization and contributors
 """The SIGIL that introduces an interpreter flag, and the two other spelling axes measured beside it.
 
 :mod:`tests.test_worktree_gate_interpreter_flags` replaced a hand-typed list of flag spellings with a
@@ -491,95 +493,69 @@ def test_the_double_slash_sigil_is_a_known_open_residual(
     )
 
 
-def test_the_cmd_switch_cluster_prefix_costs_a_posix_path_false_deny(
+def test_the_cmd_switch_cluster_prefix_no_longer_costs_a_posix_path_false_deny(
     primary: Path, repos_file: Path
 ) -> None:
-    """A DISCLOSED COST OF THIS CHANGE, pinned so it cannot be lost, and NOT an endorsement.
+    """THIS TEST USED TO ASSERT THE DENY. It now asserts the ALLOW, and that inversion is the point.
 
-    THE CAUSE IS THE CLUSTER PREFIX, NOT THE SEPARATOR. This test was first written as
-    ``test_the_relaxed_cmd_separator_costs_...`` and that name, and the four places that repeated it,
-    were WRONG -- caught by an adversarial re-read of the commit that introduced them. ``$cmdExeFlag``
-    is ``(?:/[^/\\s]+)*/[ck]``. The leading ``(?:/[^/\\s]+)*`` was added so cmd's CONCATENATED switch
-    runs (``/Q/C``, ``/V:ON/C``) are recognised, and it is that prefix which lets an ordinary POSIX
-    path walk into the matcher: ``/usr`` then ``/src`` then ``/c``. Rebuilt the pattern and measured
-    the row directly::
+    It was named ``test_the_cmd_switch_cluster_prefix_COSTS_a_posix_path_false_deny`` and its docstring
+    said: "If someone later narrows ``$cmdExeFlag`` so this ALLOWs again, this test reds, and that is
+    the intended signal to come and read this docstring rather than a regression to paper over." The
+    tripwire fired. This is what it was pointing at.
 
-        cluster prefix + \\s*   -> MATCH, captures `git checkout main`
-        cluster prefix + \\s+   -> MATCH, captures `git checkout main`     <-- separator irrelevant
-        no cluster     + \\s*   -> no match
-        no cluster     + \\s+   -> no match
+    WHAT THE OLD DOCSTRING GOT RIGHT, and it is most of it. ``$cmdExeFlag`` is
+    ``(?:/[^/\\s]+)*/[ck]``, and the leading cluster prefix is NOT an over-match -- cmd.exe really does
+    accept arbitrary ``/junk`` components in a switch run and then execute the quoted payload::
 
-    The line has a literal space before the quote, so the ``\\s*`` relaxation was never involved. It
-    was blamed because it was the newest thing nearby -- the same mistake as the separator claim this
-    lane corrected one commit earlier, made while correcting it.
-
-    A POSIX path whose last component is ``c`` matches that shape, so a quoted span after it is
-    recursed into as if it were cmd's command argument. Measured against both gates::
-
-        ls /usr/src/c   "some file.txt"      main ALLOW   this build ALLOW    (no git token: vacuous)
-        ls /usr/src/c   "git checkout main"  main ALLOW   this build DENY     <-- the new false deny
-        ls /usr/src/lib "git checkout main"  main ALLOW   this build ALLOW    (control: the `/c` ending
-                                                                              is the trigger, not the path)
-
-    THIS TEST ASSERTS THE DENY, which is a deliberate and uncomfortable choice, so read why. The row it
-    replaced asserted ALLOW on a payload with no git token -- green under any matcher, including one
-    widened to match everything. A guard that cannot fail is not a guard, and this file's own
-    neighbouring docstring congratulates itself for removing exactly that defect elsewhere.
-
-    So the choice was between deleting the row (losing the record) and pinning the real behaviour. It is
-    pinned. A false DENY is a cost, not a hole: it stops legitimate work rather than admitting illegitimate
-    work, and the rule-3 direction that matters -- DENY becoming ALLOW -- is unaffected. If someone later
-    narrows ``$cmdExeFlag`` so this ALLOWs again, this test reds, and that is the intended signal to come
-    and read this docstring rather than a regression to paper over.
-
-    DECIDED, AND THE DECISION REVERSED THE PREMISE. This docstring previously said the narrowing that
-    works is "require a cmd-like PROGRAM token before the switch run". That was MEASURED FALSE and is
-    corrected here, because it is the sentence a future reader would act on.
-
-    THE CLUSTER PREFIX IS NOT THE SLOPPY PART. cmd.exe itself accepts arbitrary ``/junk`` components
-    in a switch run and then executes the quoted payload. Driven against the real binary with a
-    payload that COMPUTES its answer (``set /a 111*3`` -> 333, so an echo-back cannot be mistaken for
-    a run), with controls in the same batch -- ``cmd /c`` must run, ``cmdd /c`` must not::
-
-        cmd /usr/src/c  "<payload>"   RUNS        cmd /zzz/c      "<payload>"  RUNS  (z is no switch)
+        cmd /usr/src/c  "<payload>"   RUNS        cmd /zzz/c      "<payload>"  RUNS
         cmd /mnt/c      "<payload>"   RUNS        cmd /usr/lib/k  "<payload>"  RUNS
-        cmd /a:/c       "<payload>"   RUNS        cmd /d /usr/src/c "<p>"      RUNS
 
-    ``/usr`` binds as ``/U``, ``/src`` as ``/S``, ``/zzz`` is ignored. So ``(?:/[^/\\s]+)*/[ck]`` is
-    very nearly EXACTLY the family cmd accepts, and dropping it would lose real coverage rather than
-    trim an over-match.
+    So the flag pattern was never the thing to narrow, and dropping the cluster prefix would have lost
+    real coverage. That analysis stands; the rows above are still asserted below.
 
-    SO THIS IS A PROGRAM-IDENTITY PROBLEM, and it is not solvable at this layer. The only thing
-    separating ``ls /usr/src/c "..."`` from ``cmd /usr/src/c "..."`` is the program token -- but every
-    program-token spelling tried was defeated by something that EXECUTES: ``echo hi;cmd /k`` and
-    ``(cmd /mnt/c`` (neither ``;`` nor ``(`` is whitespace, and the outer ``(?:^|\\s)`` anchor sits
-    before the whole alternation), an alias, a renamed copy of cmd.exe, and ``cmd /d /Q/C`` where the
-    program is not adjacent to the switch run. Five candidates were built and driven as real gate
-    mutants; each traded this one disclosed false deny for four or more measured DENY-to-ALLOW
-    regressions on shapes that run.
+    WHAT IT GOT WRONG WAS ONE SENTENCE: "SO THIS IS A PROGRAM-IDENTITY PROBLEM, and it is not solvable
+    at this layer." The first clause is right. The second was inferred from five candidate mutants,
+    each defeated by something that EXECUTES -- ``echo hi;cmd /k``, ``(cmd /mnt/c``, an alias, a
+    renamed copy of cmd.exe, and ``cmd /d /Q/C`` where the program is not adjacent to the switch run.
 
-    The false deny is therefore KEPT. At this rule's threat model the two directions are not
-    symmetric: a false DENY stops legitimate work loudly and has a workaround, while a false ALLOW
-    lets a reset land in the shared primary silently.
+    FOUR OF THOSE FIVE BREAK ADJACENCY, NOT IDENTITY. Every one of those candidates asked "is the token
+    IMMEDIATELY LEFT of the switch run a cmd spelling", and every counterexample simply put something
+    in between. ``Get-FlagOwner`` scans LEFTWARD, skipping options and switch components, bounded by
+    the last command separator -- a different instrument -- and all four survive it, measured on the
+    real hook and asserted below. The fifth, a renamed or aliased cmd.exe, is NOT closed and is not
+    claimed: an unknown program name gets no recursion, which is the same disclosed weakening the gate
+    records for ``myrunner -c '<gated>'``.
 
-    AND ONE NON-REMEDY, RECORDED SO NOBODY REACHES FOR IT: dropping the ``\\s*`` relaxation does NOT
-    remove this false deny (see the table above -- it matches under ``\\s+`` too) and it REGRESSES
-    ``cmd /c"git checkout main"`` from DENY to ALLOW, because the attached form is exactly what
-    ``\\s*`` exists to catch. That advice was printed here in the first version of this docstring. It
-    would have cost a real DENY-to-ALLOW and bought nothing."""
-    reason = assert_denied(
-        run_gate(shell('ls /usr/src/c "git checkout main"', cwd=primary), repos_file)
+    THE DIRECTION ASYMMETRY THE OLD DOCSTRING ENDED ON STILL HOLDS -- a false DENY stops legitimate
+    work loudly and has a workaround, a false ALLOW lets a reset land in the shared primary silently.
+    It is not what changed. What changed is that this row stopped costing anything to fix.
+    """
+    # THE CLOSURE. `ls` is not an interpreter, so its quoted argument is no longer scanned as code.
+    assert run_gate(shell('ls /usr/src/c "git checkout main"', cwd=primary), repos_file) is None, (
+        "the POSIX-path false deny is back. If you widened the recursion deliberately, that is the "
+        "intended outcome -- rewrite this docstring. Do NOT restore the DENY to make this pass."
     )
-    # ATTRIBUTE the deny, do not merely count it. Asserting "something denied" would keep this
-    # tripwire green if some future unrelated rule denied the same string, and it would then hold
-    # green straight through a $cmdExeFlag narrowing -- the tripwire silently measuring nothing.
-    # Today the deny is fully attributable: removing the cluster prefix ALLOWs this outright.
-    assert "checkout" in reason, (
-        "the POSIX-path false deny is still a deny, but no longer for the gated verb -- so this "
-        f"tripwire is no longer measuring the cluster-prefix path. Reason was: {reason}"
-    )
-    # The control: the same payload behind a path NOT ending in `c` must still ALLOW, or the cause is
-    # something wider than the cmd branch and this test is measuring the wrong thing.
+    # THE OTHER ARM, and without it the assertion above would be satisfied by a gate that had simply
+    # stopped recursing at all. Every row here was measured to RUN against the real cmd.exe with a
+    # payload that COMPUTES its answer (`set /a 111*3` -> 333, so an echo-back cannot be mistaken for
+    # a run). The last three are the adjacency counterexamples that defeated the five earlier
+    # candidates; they are the reason the scan is leftward and bounded rather than adjacent.
+    gated = f"git -C {primary} checkout main"
+    for still_denies in (
+        f"cmd /c '{gated}'",
+        f"cmd /usr/src/c '{gated}'",
+        f"cmd /zzz/c '{gated}'",
+        f"cmd /mnt/c '{gated}'",
+        f"cmd /usr/lib/k '{gated}'",
+        f"cmd /d /Q/C '{gated}'",
+        f"echo hi;cmd /k '{gated}'",
+        f"(cmd /mnt/c '{gated}'",
+    ):
+        reason = assert_denied(run_gate(shell(still_denies, cwd=primary), repos_file))
+        # ATTRIBUTE the deny, do not merely count it: a deny for some other reason would keep this
+        # arm green straight through a recursion that had stopped working.
+        assert "checkout" in reason, f"{still_denies} denied, but not for the gated verb: {reason}"
+    # The original control, unchanged: a path NOT ending in `c` was never the trigger.
     assert run_gate(shell('ls /usr/src/lib "git checkout main"', cwd=primary), repos_file) is None
 
 

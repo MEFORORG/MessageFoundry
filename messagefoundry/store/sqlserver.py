@@ -65,7 +65,12 @@ from messagefoundry.config.tls_policy import HopPosture
 from messagefoundry.parsing.binary import strip_documents as _strip_documents
 from messagefoundry.redaction import safe_text
 from messagefoundry.store.audit_tee import emit_audit_tee
-from messagefoundry.store.base import acquire_pooled, warm_pool_connections, warm_pool_target
+from messagefoundry.store.base import (
+    UPLOAD_RESERVATION_STALE_AFTER,
+    acquire_pooled,
+    warm_pool_connections,
+    warm_pool_target,
+)
 from messagefoundry.store.content_search import SearchSpec, row_matches
 from messagefoundry.store.crypto import MARKER_PREFIX as _ENC_MARKER_PREFIX
 from messagefoundry.store.crypto import (
@@ -130,6 +135,7 @@ from messagefoundry.store.store import (
     delivery_key,
     not_deployed_detail,
     owned_lane_scope,
+    password_claim_set,
     should_record_event,
 )
 
@@ -1338,6 +1344,14 @@ _SCHEMA: list[str] = [
     """IF OBJECT_ID('cipher_meta','U') IS NULL CREATE TABLE cipher_meta (
         key_id NVARCHAR(64) COLLATE Latin1_General_100_BIN2 NOT NULL PRIMARY KEY,
         invocations BIGINT NOT NULL DEFAULT 0, updated_at FLOAT NOT NULL)""",
+    # Cross-process upload-quota reservation (ASVS 2.3.4, BACKLOG #1112) — see the SQLite `_SCHEMA`
+    # for the in-flight-only rationale. One of the two backends a real sharded deployment runs
+    # (`require_unified_store` makes a server DB mandatory past one shard). No PHI (an account id and
+    # two counters). BIN2 collation matches the other id-keyed tables.
+    """IF OBJECT_ID('upload_quota','U') IS NULL CREATE TABLE upload_quota (
+        uploader_id NVARCHAR(64) COLLATE Latin1_General_100_BIN2 NOT NULL PRIMARY KEY,
+        inflight_files BIGINT NOT NULL DEFAULT 0, inflight_bytes BIGINT NOT NULL DEFAULT 0,
+        since FLOAT NOT NULL)""",
     """IF OBJECT_ID('pending_approvals','U') IS NULL CREATE TABLE pending_approvals (
         id NVARCHAR(64) NOT NULL PRIMARY KEY, operation NVARCHAR(128) NOT NULL,
         params NVARCHAR(MAX) NOT NULL, requester NVARCHAR(256) NOT NULL,
@@ -1345,8 +1359,16 @@ _SCHEMA: list[str] = [
         approver NVARCHAR(256) NULL, decided_at FLOAT NULL, expires_at FLOAT NULL)""",
     """IF INDEXPROPERTY(OBJECT_ID('pending_approvals'),'ix_pending_approvals_status','IndexID') IS NULL
         CREATE INDEX ix_pending_approvals_status ON pending_approvals(status, requested_at)""",
+    # BACKLOG #1268: `username` carries the same binary collation as every other identifier column in
+    # this schema, and it is the one the engine authenticates against. Without it the column inherits
+    # the DATABASE default -- case-INsensitive on a stock install (SQL_Latin1_General_CP1_CI_AS) --
+    # while SQLite (BINARY) and Postgres (TEXT) are both case-SENSITIVE. That made `Admin` and `admin`
+    # two accounts on two backends and one account on the third, under a UNIQUE constraint that reads
+    # as if it had settled the question. Pinning it here makes account identity a property of the
+    # ENGINE rather than of whichever collation an operator's database happened to be created with.
     """IF OBJECT_ID('users','U') IS NULL CREATE TABLE users (
-        id NVARCHAR(64) NOT NULL PRIMARY KEY, username NVARCHAR(256) NOT NULL UNIQUE,
+        id NVARCHAR(64) NOT NULL PRIMARY KEY,
+        username NVARCHAR(256) COLLATE Latin1_General_100_BIN2 NOT NULL UNIQUE,
         auth_provider NVARCHAR(16) NOT NULL, display_name NVARCHAR(256) NULL,
         email NVARCHAR(256) NULL, disabled BIT NOT NULL DEFAULT 0, created_at FLOAT NOT NULL,
         updated_at FLOAT NOT NULL, last_login_at FLOAT NULL, password_hash NVARCHAR(512) NULL,
@@ -1355,7 +1377,8 @@ _SCHEMA: list[str] = [
         channel_scope NVARCHAR(MAX) NULL, totp_secret NVARCHAR(MAX) NULL,
         totp_enabled BIT NOT NULL DEFAULT 0, totp_enrolled_at FLOAT NULL,
         totp_recovery_codes NVARCHAR(MAX) NULL, last_totp_step INT NULL,
-        oidc_issuer NVARCHAR(MAX) NULL, oidc_subject NVARCHAR(MAX) NULL)""",
+        oidc_issuer NVARCHAR(MAX) NULL, oidc_subject NVARCHAR(MAX) NULL,
+        password_claimed_at FLOAT NULL)""",
     """IF COL_LENGTH('users','channel_scope') IS NULL
         ALTER TABLE users ADD channel_scope NVARCHAR(MAX) NULL""",
     # MFA (WP-14): TOTP columns ALTER-ed in for a pre-existing users table (idempotent).
@@ -1376,6 +1399,22 @@ _SCHEMA: list[str] = [
         ALTER TABLE users ADD oidc_issuer NVARCHAR(MAX) NULL""",
     """IF COL_LENGTH('users','oidc_subject') IS NULL
         ALTER TABLE users ADD oidc_subject NVARCHAR(MAX) NULL""",
+    # Claimed-ness of the bootstrap admin (BACKLOG #1245): NULL on an existing row would read as
+    # "never claimed", which is what would retire an account whose holder claimed it long ago — this
+    # defect, re-introduced by its own fix. So the ADD is paired with a one-time backfill: a local
+    # account not flagged must_change_password already rotated its own credential, and
+    # password_changed_at is when. The backfill MUST stay inside this COL_LENGTH guard. Split out into
+    # its own _SCHEMA entry it becomes a permanent SECOND WRITER of the column (every schema re-apply
+    # would re-run it), and single-writer monotonicity is the entire point — a second writer is
+    # exactly the defect #1245 documents. The backfill goes through EXEC so its parse is DEFERRED:
+    # a statement naming a column added earlier in the SAME batch fails to compile, which would fail
+    # the must-succeed _ensure_schema transaction on every upgrading open.
+    """IF COL_LENGTH('users','password_claimed_at') IS NULL
+    BEGIN
+        ALTER TABLE users ADD password_claimed_at FLOAT NULL;
+        EXEC(N'UPDATE users SET password_claimed_at = password_changed_at
+               WHERE must_change_password = 0 AND password_hash IS NOT NULL');
+    END""",
     """IF OBJECT_ID('roles','U') IS NULL CREATE TABLE roles (
         id NVARCHAR(64) NOT NULL PRIMARY KEY, display_name NVARCHAR(128) NOT NULL,
         description NVARCHAR(512) NULL, builtin BIT NOT NULL DEFAULT 1,
@@ -1493,7 +1532,7 @@ _SCHEMA: list[str] = [
     # AES-256-GCM-encrypted at rest (id-keyed cell-AAD, in the cipher registry). Adding this DDL moves
     # _schema_hash() — the ADR 0064 bump. NVARCHAR(MAX) body; owner/name capped for the unique index.
     """IF OBJECT_ID('search_presets','U') IS NULL CREATE TABLE search_presets (
-        id NVARCHAR(64) NOT NULL PRIMARY KEY, owner NVARCHAR(256) NOT NULL, name NVARCHAR(256) NOT NULL,
+        id NVARCHAR(64) NOT NULL PRIMARY KEY, owner_user_id NVARCHAR(256) NOT NULL, name NVARCHAR(256) NOT NULL,
         criteria NVARCHAR(MAX) NULL, created_at FLOAT NOT NULL, updated_at FLOAT NOT NULL,
         last_used_at FLOAT NULL)""",
     # #306: last RECALL stamp (get_search_preset), so the retention window keys on last-USED and not
@@ -1504,10 +1543,10 @@ _SCHEMA: list[str] = [
     # byte-identical to pre-#306. Adding this DDL moves _schema_hash() — the ADR 0064 bump.
     """IF COL_LENGTH('search_presets','last_used_at') IS NULL
         ALTER TABLE search_presets ADD last_used_at FLOAT NULL""",
-    # UNIQUE(owner, name) covers the owner-scoped list + the upsert; get/delete use the id PK (no
+    # UNIQUE(owner_user_id, name) covers the owner-scoped list + the upsert; get/delete use the id PK (no
     # separate owner index needed — ADR 0136, review follow-up).
     """IF INDEXPROPERTY(OBJECT_ID('search_presets'),'ux_search_presets_owner_name','IndexID') IS NULL
-        CREATE UNIQUE INDEX ux_search_presets_owner_name ON search_presets(owner, name)""",
+        CREATE UNIQUE INDEX ux_search_presets_owner_name ON search_presets(owner_user_id, name)""",
     # Secret-rotation watch state (ASVS 13.3.4, BACKLOG #282) — mirrors the SQLite `secret_rotation_meta`
     # table (store/store.py). One row per tracked secret CLASS. EVERY column is NON-SECRET: `fingerprint`
     # is a keyed MAC (DEK-derived HMAC subkey) OR the DEK's one-way key-id — never the value; the dates are
@@ -4799,13 +4838,20 @@ class SqlServerStore:
     # --- saved-search presets (ADR 0136, BACKLOG #151) -----------------------
 
     async def upsert_search_preset(
-        self, *, preset_id: str, owner: str, name: str, criteria: str, now: float | None = None
+        self,
+        *,
+        preset_id: str,
+        owner_user_id: str,
+        name: str,
+        criteria: str,
+        now: float | None = None,
     ) -> tuple[str, bool]:
         now = time.time() if now is None else now
         async with self._acquire() as conn, self._cursor(conn) as cur:
             try:
                 await cur.execute(
-                    "SELECT id FROM search_presets WHERE owner=? AND name=?", (owner, name)
+                    "SELECT id FROM search_presets WHERE owner_user_id=? AND name=?",
+                    (owner_user_id, name),
                 )
                 row = await cur.fetchone()
                 effective_id = str(row[0]) if row is not None else preset_id
@@ -4819,8 +4865,8 @@ class SqlServerStore:
                 else:
                     await cur.execute(
                         "INSERT INTO search_presets"
-                        " (id, owner, name, criteria, created_at, updated_at) VALUES (?,?,?,?,?,?)",
-                        (effective_id, owner, name, enc, now, now),
+                        " (id, owner_user_id, name, criteria, created_at, updated_at) VALUES (?,?,?,?,?,?)",
+                        (effective_id, owner_user_id, name, enc, now, now),
                     )
                     replaced = False
                 await self._commit(conn)
@@ -4829,20 +4875,20 @@ class SqlServerStore:
                 await conn.rollback()
                 raise
 
-    async def list_search_presets(self, owner: str) -> list[dict[str, Any]]:
+    async def list_search_presets(self, owner_user_id: str) -> list[dict[str, Any]]:
         return await self._fetchall(
             "SELECT id, name, created_at, updated_at FROM search_presets"
-            " WHERE owner=? ORDER BY name",
-            (owner,),
+            " WHERE owner_user_id=? ORDER BY name",
+            (owner_user_id,),
         )
 
     async def get_search_preset(
-        self, *, preset_id: str, owner: str, now: float | None = None
+        self, *, preset_id: str, owner_user_id: str, now: float | None = None
     ) -> dict[str, Any] | None:
         row = await self._fetchone(
             "SELECT id, name, criteria, created_at, updated_at, last_used_at FROM search_presets"
-            " WHERE id=? AND owner=?",
-            (preset_id, owner),
+            " WHERE id=? AND owner_user_id=?",
+            (preset_id, owner_user_id),
         )
         if row is None:
             return None
@@ -4860,11 +4906,12 @@ class SqlServerStore:
             log.warning("failed to stamp search-preset last_used_at", exc_info=True)
         return row
 
-    async def delete_search_preset(self, *, preset_id: str, owner: str) -> bool:
+    async def delete_search_preset(self, *, preset_id: str, owner_user_id: str) -> bool:
         async with self._acquire() as conn, self._cursor(conn) as cur:
             try:
                 await cur.execute(
-                    "DELETE FROM search_presets WHERE id=? AND owner=?", (preset_id, owner)
+                    "DELETE FROM search_presets WHERE id=? AND owner_user_id=?",
+                    (preset_id, owner_user_id),
                 )
                 deleted = cur.rowcount if cur.rowcount and cur.rowcount > 0 else 0
                 await self._commit(conn)
@@ -8832,6 +8879,88 @@ class SqlServerStore:
                 raise
         return total
 
+    async def reserve_upload_quota(
+        self,
+        uploader_id: str,
+        *,
+        files: int,
+        size_bytes: int,
+        max_files: int = 0,
+        max_total_bytes: int = 0,
+        stale_after: float = UPLOAD_RESERVATION_STALE_AFTER,
+    ) -> bool:
+        """Atomically reserve (or release) an uploader's in-flight upload budget — see
+        :meth:`messagefoundry.store.base.Store.reserve_upload_quota` for the contract, and the SQLite
+        twin for the statement shape.
+
+        MERGE with HOLDLOCK is the SQL Server upsert that is safe under the concurrent opens of an
+        engine-shard fleet (a bare IF EXISTS/INSERT races) — the same pattern
+        :meth:`add_cipher_invocations` uses. The budget predicate rides ``WHEN MATCHED AND``, so a
+        refusal matches no rows and ``OUTPUT`` returns nothing."""
+        now = time.time()
+        if files <= 0:
+            # RELEASE — unconditional, clamped at zero (a double release cannot mint budget).
+            await self._execute(
+                "UPDATE upload_quota SET"
+                " inflight_files = CASE WHEN inflight_files + ? < 0 THEN 0 ELSE inflight_files + ? END,"
+                " inflight_bytes = CASE WHEN inflight_bytes + ? < 0 THEN 0 ELSE inflight_bytes + ? END,"
+                " since = ?"
+                " WHERE uploader_id = ?",
+                (
+                    int(files),
+                    int(files),
+                    int(size_bytes),
+                    int(size_bytes),
+                    now,
+                    uploader_id,
+                ),
+            )
+            return True
+        if files > max_files or size_bytes > max_total_bytes:
+            # Fail closed before touching the row: WHEN NOT MATCHED inserts unconditionally.
+            return False
+        stale = now - max(0.0, stale_after)
+        async with self._acquire() as conn, self._cursor(conn) as cur:
+            try:
+                await cur.execute(
+                    "MERGE upload_quota WITH (HOLDLOCK) AS t"
+                    " USING (SELECT ? AS uploader_id, ? AS files, ? AS size_bytes, ? AS now_ts,"
+                    " ? AS stale_ts, ? AS max_files, ? AS max_total_bytes) AS s"
+                    " ON t.uploader_id = s.uploader_id"
+                    " WHEN MATCHED AND"
+                    " (CASE WHEN t.since <= s.stale_ts THEN 0 ELSE t.inflight_files END)"
+                    " + s.files <= s.max_files"
+                    " AND (CASE WHEN t.since <= s.stale_ts THEN 0 ELSE t.inflight_bytes END)"
+                    " + s.size_bytes <= s.max_total_bytes"
+                    " THEN UPDATE SET"
+                    " t.inflight_files ="
+                    " (CASE WHEN t.since <= s.stale_ts THEN 0 ELSE t.inflight_files END) + s.files,"
+                    " t.inflight_bytes ="
+                    " (CASE WHEN t.since <= s.stale_ts THEN 0 ELSE t.inflight_bytes END)"
+                    " + s.size_bytes,"
+                    " t.since = CASE WHEN t.since <= s.stale_ts OR t.inflight_files <= 0"
+                    " THEN s.now_ts ELSE t.since END"
+                    " WHEN NOT MATCHED THEN"
+                    " INSERT (uploader_id, inflight_files, inflight_bytes, since)"
+                    " VALUES (s.uploader_id, s.files, s.size_bytes, s.now_ts)"
+                    " OUTPUT INSERTED.inflight_files;",
+                    (
+                        uploader_id,
+                        int(files),
+                        int(size_bytes),
+                        now,
+                        stale,
+                        int(max_files),
+                        int(max_total_bytes),
+                    ),
+                )
+                row = await cur.fetchone()
+                await self._commit(conn)
+            except Exception:
+                await conn.rollback()
+                raise
+        return row is not None
+
     async def cipher_invocations(self, key_id: str) -> int:
         """``key_id``'s persisted cumulative invocation total (0 when the key has no row yet)."""
         row = await self._fetchone(
@@ -9103,6 +9232,18 @@ class SqlServerStore:
         d = await self._fetchone("SELECT * FROM users WHERE username=?", (username,))
         return UserRecord.from_mapping(d) if d else None
 
+    async def get_user_by_federated_subject(self, issuer: str, subject: str) -> UserRecord | None:
+        # BACKLOG #1256. Both columns, never `subject` alone -- a subject is unique only within its
+        # issuer. NOTE the comparison is the DATABASE's, and these columns carry no explicit COLLATE:
+        # under a case-insensitive server default two subjects differing only in case would match
+        # here, which is SAFE for this predicate (it can only refuse MORE) but is the opposite of the
+        # byte-exact comparison SQLite and Postgres perform. The BIN2 remedy this file applies to
+        # `reference_sets.[key]` is the fix if that divergence ever needs closing.
+        d = await self._fetchone(
+            "SELECT * FROM users WHERE oidc_issuer=? AND oidc_subject=?", (issuer, subject)
+        )
+        return UserRecord.from_mapping(d) if d else None
+
     async def list_users(self) -> list[UserRecord]:
         rows = await self._fetchall("SELECT * FROM users ORDER BY username")
         return [UserRecord.from_mapping(d) for d in rows]
@@ -9115,14 +9256,17 @@ class SqlServerStore:
         user_id: str,
         *,
         password_hash: str,
-        must_change_password: bool = False,
+        must_change_password: bool = True,
         now: float | None = None,
     ) -> None:
         now = time.time() if now is None else now
+        claim_set = password_claim_set(must_change_password, "?")
+        claim_args: tuple[float, ...] = () if must_change_password else (now,)
         await self._execute(
             "UPDATE users SET password_hash=?, password_changed_at=?, must_change_password=?,"
+            f"{claim_set}"
             " failed_attempts=0, locked_until=NULL, updated_at=? WHERE id=?",
-            (password_hash, now, 1 if must_change_password else 0, now, user_id),
+            (password_hash, now, 1 if must_change_password else 0, *claim_args, now, user_id),
         )
 
     # --- MFA: native TOTP second factor (local accounts, WP-14) --------------
@@ -9383,6 +9527,12 @@ class SqlServerStore:
                 await cur.execute("DELETE FROM user_roles WHERE user_id=?", (user_id,))
                 await cur.execute("DELETE FROM sessions WHERE user_id=?", (user_id,))
                 await cur.execute("DELETE FROM webauthn_credentials WHERE user_id=?", (user_id,))
+                # BACKLOG #1233, verbatim with the SQLite and Postgres bodies: presets are
+                # owner-scoped by Identity.user_id (#1225) with no FK cascade, so without this the
+                # rows outlive the account carrying PHI-shaped `criteria` (ADR 0136) that no owner can
+                # reach or purge. This leg is CI-only, so an asymmetry between the three backends
+                # surfaces first in CI rather than here.
+                await cur.execute("DELETE FROM search_presets WHERE owner_user_id=?", (user_id,))
                 await cur.execute("DELETE FROM users WHERE id=?", (user_id,))
                 await self._commit(conn)
             except Exception:

@@ -206,6 +206,78 @@ def test_resolve_principal_builds_only_finitely_timed_ldap_objects(
     _assert_all_finite(rec)
 
 
+# --- BACKLOG #1140 (ASVS 6.3.8): the AD leg must not leak account existence by response TIME ------
+
+
+def _shape_search(monkeypatch: pytest.MonkeyPatch, *, uac: str | None) -> None:
+    """Make every user search return no match (``uac=None``) or one with that userAccountControl."""
+    import ldap3
+
+    patched = ldap3.Connection  # the FakeConnection installed by _install_fakes
+
+    class Shaped(patched):  # type: ignore[misc, valid-type]
+        def search(self, **kwargs: Any) -> bool:
+            super().search(**kwargs)
+            if str(kwargs.get("search_base", "")).startswith("OU=Groups"):
+                return True
+            self.entries = (
+                []
+                if uac is None
+                else [
+                    _FakeEntry(
+                        "CN=ghost,OU=Users,DC=example,DC=com",
+                        {"sAMAccountName": "ghost", "userAccountControl": uac},
+                    )
+                ]
+            )
+            return True
+
+    monkeypatch.setattr(ldap3, "Connection", Shaped)
+
+
+@pytest.mark.parametrize(
+    ("uac", "why"),
+    [(None, "no such principal"), ("514", "present but ACCOUNTDISABLE (512|0x2)")],
+)
+def test_rejected_principal_costs_the_same_ldap_work_as_an_accepted_one(
+    monkeypatch: pytest.MonkeyPatch, uac: str | None, why: str
+) -> None:
+    """Both rejection branches must build the SAME Server+Connection pair the success path builds.
+
+    Before #1140 the absent/disabled branch returned before the password-verifying bind, so one case
+    cost a Server build, a TCP connect and a bind round trip that the other did not -- a username
+    oracle behind an identical response. The success-path counts are pinned one test above at 2/2,
+    which is what makes 2/2 here an EQUALITY claim rather than a bare number.
+    """
+    rec = _install_fakes(monkeypatch)
+    _shape_search(monkeypatch, uac=uac)
+
+    principal = LdapAuthenticator(_ad_settings()).authenticate("ghost", "synthetic-user-pw")
+
+    assert principal is None, f"{why} must not authenticate"
+    assert len(rec.servers) == 2, f"{why}: expected 2 Server builds, got {len(rec.servers)}"
+    assert len(rec.connections) == 2, (
+        f"{why}: expected 2 Connection builds, got {len(rec.connections)} -- the equalizing bind "
+        "did not run, so this branch is cheaper than the accepted one and leaks existence"
+    )
+    _assert_all_finite(rec)  # the equalizing connection is not exempt from the timeout rule
+
+
+def test_equalizing_the_bind_did_not_move_the_disabled_check_off_the_kerberos_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """THE HAZARD GUARD for #1140, and the reason the fix equalizes the CALLER instead of relocating
+    the check. ``_find_user`` rejects ACCOUNTDISABLE and has two callers: ``authenticate`` binds, and
+    ``resolve_principal`` (Kerberos/SSO) does not. Moving that check into the bind path would have
+    equalized the timing and let a DISABLED ACCOUNT AUTHENTICATE OVER SSO -- a bypass, traded for a
+    timing leak. This asserts the SSO leg still refuses.
+    """
+    _install_fakes(monkeypatch)
+    _shape_search(monkeypatch, uac="514")  # present, ACCOUNTDISABLE set
+
+    assert LdapAuthenticator(_ad_settings()).resolve_principal("ghost") is None
+
+
 # --- static guard: no construction site can escape the runtime tests -----------------------------
 
 _REQUIRED_KWARG = {"Server": "connect_timeout", "Connection": "receive_timeout"}

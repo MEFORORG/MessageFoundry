@@ -114,10 +114,33 @@ def _claim_test_slot() -> int:
     return 0  # saturated: fall back to the shared defaults rather than failing the run
 
 
+# PUBLISHING THE SLOT: `setdefault` IS WRONG INSIDE AN XDIST WORKER, and silently so.
+#
+# Under pytest-xdist the CONTROLLER parses config and loads the initial conftests BEFORE it spawns any
+# worker -- pyproject's `testpaths` makes `tests` an initial arg, so THIS module runs in the controller
+# first. It claims a slot and publishes it into its own environ. execnet then spawns the workers with
+# no env override, so every worker INHERITS those values and `setdefault` is a no-op in all of them:
+# N workers all reading one port base, which is precisely the collision the slot machinery above exists
+# to prevent. Nothing would report it -- the workers would simply race for the same ports.
+#
+# So a worker must claim its OWN slot and OVERWRITE. `PYTEST_XDIST_WORKER` is set by xdist in the
+# worker process only ("gw0", "gw1", ...) and is absent in the controller and in any serial run, which
+# makes it the exact discriminator. On a serial run this reduces to the original `setdefault`
+# behaviour, so an outer harness can still pin the slot by exporting these before invoking pytest.
+_IN_XDIST_WORKER = "PYTEST_XDIST_WORKER" in os.environ
+
+
+def _publish_slot_var(name: str, value: str) -> None:
+    if _IN_XDIST_WORKER:
+        os.environ[name] = value
+    else:
+        os.environ.setdefault(name, value)
+
+
 _SLOT = _claim_test_slot()
-os.environ.setdefault("MEFOR_TEST_SLOT", str(_SLOT))
-os.environ.setdefault("MEFOR_TEST_PORT_BASE", str(20000 + _PORTS_PER_SLOT * _SLOT))
-os.environ.setdefault("MEFOR_TEST_QSETTINGS_ORG", f"MEFOR-Test-{_SLOT}")
+_publish_slot_var("MEFOR_TEST_SLOT", str(_SLOT))
+_publish_slot_var("MEFOR_TEST_PORT_BASE", str(20000 + _PORTS_PER_SLOT * _SLOT))
+_publish_slot_var("MEFOR_TEST_QSETTINGS_ORG", f"MEFOR-Test-{_SLOT}")
 
 
 @pytest.fixture(scope="session", autouse=True)
@@ -369,3 +392,50 @@ def pytest_report_header() -> list[str]:
 
 def pytest_terminal_summary(terminalreporter: pytest.TerminalReporter) -> None:
     write_incomplete_run_summary(terminalreporter)
+
+
+# ---------------------------------------------------------------------------------------------------
+# THE TOOLING PARTITION -- marks the repo-harness tier so ci.yml can run it as its own path-gated job.
+#
+# The tier is 17 percent of the suite's tests and 66 percent of its TIME (measured 2026-08-16: 94
+# files, 2,145s of 3,249s), because each test spawns real pwsh/git children. Its subject is the
+# development harness, not the engine, so an engine-only PR cannot change its result -- yet it sets
+# the `--dist loadfile` floor for every engine leg. `-m 'not tooling'` takes it off that path.
+#
+# MEMBERSHIP IS A MANIFEST, NOT A PATTERN, AND NOT A DIRECTORY. Three regex classifiers were tried
+# and each got a different obvious case wrong (one would have moved `test_dependency_boundaries` --
+# the one-way import rule -- off the engine legs). Relocating the files into tests/tooling/ was then
+# tried and reverted: they are coupled to their location in at least five ways, two of which only
+# surfaced by running the suite. Both failure modes are the same one CLAUDE.md section 11 records for
+# the backlog glyph parser -- a classifier that agrees with the corpus by luck. So the list is
+# written down, and tests/test_tooling_partition.py pins it against the tree.
+#
+# A MISSING OR UNREADABLE MANIFEST RAISES. It must not degrade to "mark nothing": that spelling keeps
+# `-m 'not tooling'` correct-but-slow while making `-m tooling` collect ZERO, so the entire harness
+# tier would stop running and its job would go green having tested nothing. Loud beats silent in the
+# direction that loses coverage.
+#
+# Scoped to files sitting DIRECTLY in tests/. The other testpath
+# (packaging/messagefoundry-webconsole/tests) is a separate suite with its own pytest config; keying
+# on the basename alone would let a same-named file there inherit a mark meant for this directory.
+# ---------------------------------------------------------------------------------------------------
+
+_TESTS_DIR = Path(__file__).resolve().parent
+_TOOLING_MANIFEST = _TESTS_DIR / "tooling_manifest.txt"
+
+
+def _tooling_basenames() -> frozenset[str]:
+    text = _TOOLING_MANIFEST.read_text(encoding="utf-8")  # raises if absent -- see above
+    return frozenset(
+        line.strip().rsplit("/", 1)[-1]
+        for line in text.splitlines()
+        if line.strip() and not line.lstrip().startswith("#")
+    )
+
+
+def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
+    names = _tooling_basenames()
+    for item in items:
+        path = getattr(item, "path", None)
+        if path is not None and path.parent == _TESTS_DIR and path.name in names:
+            item.add_marker(pytest.mark.tooling)

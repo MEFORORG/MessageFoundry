@@ -105,6 +105,27 @@ All notable changes to MessageFoundry are documented here. The format follows
   surface — and the refusal names it. Keep the AE list; it is still doing work.
   Tracked as **BACKLOG #316**. Options considered and declined: an audited opt-out switch, and
   documenting the weakness without changing the gate.
+- **BREAKING — an unrecognized key in a known config section now fails the start instead of loading
+  silently.** Every section model inherits `extra="ignore"`, so a mistyped or stale key in
+  `messagefoundry.toml` loaded clean, did nothing, and said nothing: an operator could misspell
+  `block_unlisted_outbound` and believe a posture control was on while the engine applied its
+  permissive default. Exactly one section, `[security]`, warned about it; the other 27 were silent.
+  The loader now refuses, naming the section and the offending key and suggesting the closest valid
+  field name.
+  **Scope, and it is deliberate — the refusal covers the config FILE only.** `MEFOR_*` environment
+  variables and CLI flags are still accepted silently, because about a dozen documented `MEFOR_*`
+  variables (the Vault store and secrets providers, the TLS revocation attestation, the lane timing
+  probes) are read straight from `os.environ` by consumers that are not settings fields — so refusing
+  an unrecognized environment key would refuse a deployment configured exactly as the shipped
+  documentation instructs. `[security]` is the exception and is refused from the environment too.
+  The check lives in the loader rather than a pydantic `extra="forbid"` for a second reason: pydantic
+  echoes the offending **value** in its error, and the CLI prints validation errors verbatim to
+  stderr, which the Windows service captures to a log file — so a mistyped secret key would have
+  written the secret to disk. Both existing config refusals name keys only, never values.
+  **Who this would bite on first deployment:** a config file carrying a key that is not a field of
+  its section — a typo, a key copied from newer documentation, or a setting since removed from the
+  engine. **Remedy:** correct the spelling; the error names the section and the key. Nothing needs
+  migrating, because a key that is refused now was doing nothing before.
 
 ### Security
 - **The web console's message editor would have opened the raw body to a custom role holding
@@ -122,6 +143,15 @@ All notable changes to MessageFoundry are documented here. The format follows
   and every such read was already audited. ([BACKLOG #324](docs/archive/backlog/BACKLOG-CLOSED.md#324-custom-role-with-messagesedit-alone-reads-raw-phi-via-the-ui-editor))
 
 ### Fixed
+- **The shipped VS Code snippet generated a FHIR lookup the engine now refuses.** The
+  `meforfhirlookup` snippet built its search by concatenating a message field into a flat `?`-query —
+  the form removed along with `[egress].fhir_require_structured_params` — so the snippet emitted a
+  Handler that raises on first use. The `FhirLookup` docstring, the `fhir_lookup` docstring and the
+  Steps palette taught the same removed form. All now use the per-value-encoded `params=` form; the
+  read-by-id form is unchanged. **Why it shipped broken:** nothing read that file. A new test parses
+  every shipped snippet body and asserts none teaches the removed form — a test that merely checked
+  the JSON parses would not have caught it.
+  ([ADR 0043](docs/adr/0043-fhir-read-lookup.md))
 - **A CR/LF inside an exception message could forge a whole log line on the text sink.**
   `ControlCharScrubFilter` escaped only the rendered message, and `logging.Formatter` appends a record's
   traceback (`exc_text`) and stack dump (`stack_info`) **verbatim** — so a newline-bearing exception

@@ -46,6 +46,7 @@ from messagefoundry.store.document_strip import StripResult
 from messagefoundry.store.keyprovider import resolve_key_provider
 from messagefoundry.store.pool_metrics import PoolStatus
 from messagefoundry.store.store import (
+    UPLOAD_RESERVATION_STALE_AFTER,
     AlertInstance,
     CapturedResponse,
     ClaimedHeads,
@@ -112,6 +113,7 @@ __all__ = [
     "pool_over_provisioned_warning",
     "POOL_SIZE_OPTIMUM",
     "POOL_SIZE_CLIFF",
+    "UPLOAD_RESERVATION_STALE_AFTER",
 ]
 
 
@@ -1234,6 +1236,45 @@ class QueueStore(StoreLifecycle, Protocol):
         :func:`messagefoundry.store.gcm_bound.checkpoint_invocations`."""
         ...
 
+    # --- cross-process upload-quota reservation (ASVS 2.3.4) -----------------
+    async def reserve_upload_quota(
+        self,
+        uploader_id: str,
+        *,
+        files: int,
+        size_bytes: int,
+        max_files: int = 0,
+        max_total_bytes: int = 0,
+        stale_after: float = UPLOAD_RESERVATION_STALE_AFTER,
+    ) -> bool:
+        """Atomically reserve (or release) an uploader's IN-FLIGHT upload budget; return whether the
+        reserve applied. The one cross-process decision point behind the per-uploader upload quota.
+
+        **Why the store owns this.** ``UploadStore._quota_lock`` is an ``asyncio.Lock``, so it is
+        per-event-loop and therefore per-process. Engine sharding is the built, shipped, default
+        scaling axis and nothing partitions ``uploads_dir`` per shard, so N shards over one directory
+        hold N independent locks and each can overshoot the budget by one file. Every shard sits on
+        the ONE unified store (ADR 0063 — and ``require_unified_store`` makes a server DB mandatory
+        past one shard), so this row is authoritative for all of them.
+
+        **What is counted here, and what is not.** The files already ON DISK are counted by the
+        caller's sidecar scan, which is uncached and therefore already fleet-visible. The gap this
+        closes is only the uploads IN FLIGHT on other shards — reserved but not yet landed, so
+        invisible to any scan. The caller passes its remaining HEADROOM (cap minus what its scan
+        observed) as ``max_files`` / ``max_total_bytes``; this method holds only the in-flight sum.
+
+        ``files > 0`` reserves: the post-add in-flight totals must fit inside the headroom or nothing
+        is written and this returns ``False`` (fail-closed — a caller that forgets the headroom
+        arguments gets the 0 defaults and is refused). ``files <= 0`` releases, always applies,
+        clamps at zero, ignores the headroom arguments and returns ``True``.
+
+        ``stale_after`` bounds a leak: a process killed between reserve and release never releases,
+        and its slot would otherwise consume the uploader's budget forever. A row whose reservation
+        has been CONTINUOUSLY outstanding for longer than ``stale_after`` seconds is reset to zero
+        before the add. The reset can only restore today's behaviour (an overshoot bounded by the
+        number of concurrent writers), never something worse."""
+        ...
+
     # --- retention / purge + maintenance (PHI.md §8) -------------------------
     async def purge_message_bodies(
         self,
@@ -1552,12 +1593,20 @@ class AuthStore(Protocol):
 
     async def count_users(self) -> int: ...
 
+    # ``must_change_password`` DEFAULTS TO TRUE, and the default is a security control rather than a
+    # style choice (BACKLOG #1245). Passing False is what records the credential claim in
+    # ``users.password_claimed_at``, and that stamp is write-once and monotonic -- once set it can
+    # never be undone, and an account carrying it is permanently exempt from WP-3 auto-retirement.
+    # So the DANGEROUS branch must never be the one a caller gets by omission. With False as the
+    # default a caller that simply forgot the keyword would silently stamp a claim on an account
+    # nobody claimed, which is the very shape #1245 documents. Every existing caller passes the
+    # argument explicitly, so this default is unreachable today -- it exists to bound the NEXT caller.
     async def set_password(
         self,
         user_id: str,
         *,
         password_hash: str,
-        must_change_password: bool = False,
+        must_change_password: bool = True,
         now: float | None = None,
     ) -> None: ...
 
@@ -1657,19 +1706,25 @@ class AuthStore(Protocol):
     # --- saved-search presets (ADR 0136, BACKLOG #151) — per-user, criteria encrypted at rest -----
 
     async def upsert_search_preset(
-        self, *, preset_id: str, owner: str, name: str, criteria: str, now: float | None = None
+        self,
+        *,
+        preset_id: str,
+        owner_user_id: str,
+        name: str,
+        criteria: str,
+        now: float | None = None,
     ) -> tuple[str, bool]:
         """Create-or-replace a per-user preset by ``(owner, name)`` (id reused on a name collision so the
         cell-AAD stays stable). ``criteria`` is a JSON blob encrypted at rest. Returns
         ``(effective_id, replaced)``."""
         ...
 
-    async def list_search_presets(self, owner: str) -> list[dict[str, Any]]:
+    async def list_search_presets(self, owner_user_id: str) -> list[dict[str, Any]]:
         """A user's presets (id/name/timestamps only — NEVER the criteria)."""
         ...
 
     async def get_search_preset(
-        self, *, preset_id: str, owner: str, now: float | None = None
+        self, *, preset_id: str, owner_user_id: str, now: float | None = None
     ) -> dict[str, Any] | None:
         """One owner-scoped preset with its criteria DECRYPTED, or ``None``.
 
@@ -1678,8 +1733,8 @@ class AuthStore(Protocol):
         swallowed, never raised, so it cannot break the recall. ``now`` overrides the clock (tests)."""
         ...
 
-    async def delete_search_preset(self, *, preset_id: str, owner: str) -> bool:
-        """Delete an owner-scoped preset; ``True`` iff a row was removed. Idempotent."""
+    async def delete_search_preset(self, *, preset_id: str, owner_user_id: str) -> bool:
+        """Delete an owner_user_id-scoped preset; ``True`` iff a row was removed. Idempotent."""
         ...
 
     async def set_user_roles(
@@ -1701,6 +1756,21 @@ class AuthStore(Protocol):
         """Bind a user's verified federated ``(issuer, sub)`` identity (BACKLOG #1015). Recorded on the
         first federated login so a later login whose reassignable username resolves to this account but
         carries a different subject is refused, not handed the account."""
+        ...
+
+    async def get_user_by_federated_subject(self, issuer: str, subject: str) -> UserRecord | None:
+        """The account bound to this verified ``(issuer, sub)``, or ``None`` (BACKLOG #1256).
+
+        **The inverse of the #1015 guard, and the direction that guard cannot look.** That check
+        resolves a user by USERNAME and asks whether *this account* carries a different subject --
+        so it constrains WHICH subject may bind to a given account, and is structurally incapable of
+        seeing a SECOND ACCOUNT already holding the same subject. Nothing else could see it either:
+        measured, there is no UNIQUE constraint naming the federated columns on any of the three
+        backends (0/0/0, against 13/8/10 total UNIQUE declarations as the positive control).
+
+        Deliberately a lookup rather than a scan: it sits on the federated login path, and
+        ``list_users()`` would make every sign-in O(number of accounts).
+        """
         ...
 
     async def roles_for_ad_groups(self, groups: Iterable[str]) -> set[str]: ...

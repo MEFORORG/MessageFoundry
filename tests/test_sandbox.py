@@ -919,8 +919,40 @@ def _orphan_graph(tmp_path: Path) -> tuple[Registry, str, Path]:
     return load_config(tmp_path), str(tmp_path), pidfile
 
 
-def _pid_alive(pid: int) -> bool:
-    """Whether ``pid`` names a live process — cross-platform, no third-party deps."""
+def _proc_state(pid: int) -> str | None:
+    """The Linux ``/proc/<pid>/stat`` process-state field, or ``None`` where ``/proc`` is absent.
+
+    Only ``Z`` is load-bearing here: exited, every fd already released, but the pid is still in the
+    table because nobody has ``waitpid``-ed it yet."""
+    try:
+        with open(f"/proc/{pid}/stat", encoding="utf-8") as fh:
+            text = fh.read()
+    # UnicodeDecodeError is not an OSError, and a non-Linux /proc need not be text at all — a
+    # platform we cannot read is a "cannot tell", never a crash in a helper the asserts depend on.
+    except (OSError, UnicodeDecodeError):
+        return None
+    if ")" not in text:  # pragma: no cover - a Linux /proc always parenthesises comm
+        return None
+    # Field 2 (`comm`) can contain spaces and parens, so everything after the LAST ')' is field 3
+    # onward and field N sits at index N-3 — the idiom `_posix_stat_ppid_starttime` already uses in
+    # harness/load/connscale/probe.py. State is field 3, hence index 0.
+    after = text.rpartition(")")[2].split()
+    return after[0] if after else None
+
+
+def _pid_running(pid: int) -> bool | None:
+    """Whether ``pid`` names a process that is still RUNNING. ``None`` = this platform cannot tell a
+    runner from an exited-but-unreaped pid.
+
+    Deliberately NOT "does this pid exist", because on POSIX those are different questions and the
+    difference is the whole point of the caller below. ``os.kill(pid, 0)`` keeps succeeding for a
+    ZOMBIE: a process that has already exited and released every fd it held, but whose pid stays in
+    the table until its reaper calls ``waitpid``. Terminating a process is something a caller can
+    demand; retiring its pid afterwards is the reaper's business and on its schedule.
+
+    Windows has no zombie state — there is no exited-but-unretired pid to be fooled by, and
+    ``GetExitCodeProcess`` stops reporting ``STILL_ACTIVE`` once the process has terminated — so the
+    plain liveness check already IS the running/not-running answer there."""
     if sys.platform == "win32":
         import ctypes
 
@@ -929,7 +961,7 @@ def _pid_alive(pid: int) -> bool:
         kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
         handle = kernel32.OpenProcess(process_query_limited_information, False, pid)
         if not handle:
-            return False  # no such pid (or already fully reaped)
+            return False  # no such pid (or already fully gone)
         try:
             code = ctypes.c_ulong()
             if not kernel32.GetExitCodeProcess(handle, ctypes.byref(code)):
@@ -940,10 +972,40 @@ def _pid_alive(pid: int) -> bool:
     try:
         os.kill(pid, 0)
     except ProcessLookupError:
-        return False
+        return False  # reaped: out of the process table entirely
     except PermissionError:
-        return True  # exists but owned by someone else — still "alive"
-    return True
+        return True  # exists but owned by someone else — still "running" as far as we can see
+    state = _proc_state(pid)
+    if state is None:
+        # `_proc_state` returns None for TWO situations that must not be collapsed, and collapsing
+        # them turns a SUCCESS into a red on Linux. `os.kill(pid, 0)` above and the `/proc` read here
+        # are two syscalls with a gap between them, and a reaper can retire the pid inside that gap --
+        # so a MISSING `/proc/<pid>` on a kernel that HAS `/proc` is a definite answer, "gone", not an
+        # inability to answer. Only a platform with no `/proc` at all (macOS) genuinely cannot tell a
+        # zombie from a runner, and that is the case `None` is reserved for.
+        #
+        # Reading the directory rather than the platform string: `sys.platform` says which OS, and the
+        # question here is whether THIS kernel exposes the interface. They agree today and the second
+        # is what the code actually depends on.
+        if os.path.isdir("/proc"):
+            return False  # /proc exists and this pid is not in it: retired between the two calls
+        return None  # no /proc at all: a zombie and a runner are indistinguishable here
+    return state != "Z"
+
+
+def _wait_until_not_running(pid: int, timeout: float) -> bool | None:
+    """Poll :func:`_pid_running` until ``pid`` stops running, returning its last answer.
+
+    Bounded rather than instantaneous because a POSIX exit is not atomic: the kernel closes the
+    dying process's fds — which is what releases a pipe — BEFORE it marks the task a zombie, so a
+    single check taken at the instant of pipe-EOF can still land inside that tail. This waits for
+    TERMINATION only and never for the reap, so it asks for nothing the engine does not guarantee."""
+    deadline = time.monotonic() + timeout
+    while True:
+        running = _pid_running(pid)
+        if running is not True or time.monotonic() >= deadline:
+            return running
+        time.sleep(0.01)
 
 
 def _best_effort_kill_pid(pid: int) -> None:
@@ -968,21 +1030,42 @@ def _best_effort_kill_pid(pid: int) -> None:
 
 
 def test_worker_kill_reaps_the_whole_process_tree(tmp_path: Path) -> None:
-    """Killing the worker must reap the WHOLE tree, not just the immediate child (BACKLOG #342).
+    """Killing the worker must take down the WHOLE tree, not just the immediate child.
 
     A Handler spawns a grandchild that inherits fd 1 (the response pipe). Before the fix a bare
     ``proc.kill()`` terminated only the worker, leaving the grandchild alive — an orphan still holding
-    the pipe, so the pipe never reached EOF and the kill was incomplete. The fix reaps the tree: a
-    Windows ``JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`` job object (exercised locally, this host is
+    the pipe, so the pipe never reached EOF and the kill was incomplete. The fix takes down the tree:
+    a Windows ``JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`` job object (exercised locally, this host is
     Windows) or a POSIX new-session process group killed with ``killpg`` (exercised by the CI
     ubuntu-latest leg).
 
-    The observable is platform-neutral: for THIS grandchild — which holds fd 1 until it exits —
-    pipe-EOF is equivalent to "grandchild reaped", so the primary assert covers BOTH halves of the
-    defect (pipe released AND no lingering process). ``_pid_alive`` re-checks the process half
-    directly. See the FALSIFICATION recorded in the lane report: forcing
-    ``_assign_kill_on_close_job`` to return ``None`` degrades the Windows path to a bare
-    ``proc.kill()``, the grandchild survives, the pipe never EOFs, and this test goes red."""
+    Note the two senses of "reap" that meet here. ``_reap_process_tree`` reaps in this codebase's
+    sense — TERMINATE every process in the tree. POSIX ``waitpid`` reaping is a different act —
+    RETIRE an already-exited pid from the process table — and the engine neither performs nor can
+    bound it for an orphan. The asserts below are split along exactly that line:
+
+    * PRIMARY, pipe-EOF: proves every holder of fd 1 has EXITED and released it — the worker AND the
+      grandchild. That is precisely what ``_reap_process_tree`` guarantees, so it is the pass/fail
+      proof of the fix.
+    * SECONDARY, the process half: proves the grandchild is NOT RUNNING. It must not ask whether the
+      pid was ``waitpid``-ed, which an earlier version of this test did by asserting
+      ``os.kill(pid, 0)`` raises the instant EOF landed. That ordering is not available: this
+      grandchild is an ORPHAN — its parent was killed and ``proc.wait()``-ed first, so pytest cannot
+      ``waitpid`` it and the reap falls to PID 1 or the nearest ``PR_SET_CHILD_SUBREAPER`` ancestor.
+      A reap is therefore STRICTLY AFTER the exit that produced the EOF, by an interval nothing in
+      this repo controls. Measured on Linux with the same shape: microseconds under systemd, and
+      never at all inside a 5s busy-poll under a subreaper that is not in a ``waitpid`` loop — which
+      is what a containerised CI leg or a ``systemd --user`` session supplies. Windows has no zombie
+      state to be caught by, and measured on this host it never once reported ``STILL_ACTIVE`` at
+      pipe-EOF (0 of 30, plain and slow-teardown grandchildren both), so the exposure is a POSIX one.
+
+    The secondary is not redundant with the primary: it is the guard against the primary going
+    VACUOUSLY green if someone later edits ``_ORPHAN_GRAPH`` so the grandchild no longer holds fd 1,
+    in which case EOF would fire on the worker's death alone and say nothing about the tree.
+
+    See the FALSIFICATION recorded in the lane report: forcing ``_assign_kill_on_close_job`` to
+    return ``None`` degrades the Windows path to a bare ``proc.kill()``, the grandchild survives,
+    the pipe never EOFs, and this test goes red."""
     registry, config_dir, pidfile = _orphan_graph(tmp_path)
     session = _session(config_dir)
     grandchild_pid: int | None = None
@@ -1009,8 +1092,20 @@ def test_worker_kill_reaps_the_whole_process_tree(tmp_path: Path) -> None:
             "response pipe never reached EOF -- a grandchild still holds it; the worker tree "
             "was not reaped"
         )
-        # SECONDARY: the process half, asserted directly.
-        assert not _pid_alive(grandchild_pid), "the grandchild survived the worker kill"
+        # SECONDARY: the process half, asserted directly — NOT-RUNNING, not reaped (see docstring).
+        # The 5s bound is derived from the FALSIFICATION MARGIN, not from any reaper's latency: the
+        # grandchild sleeps 30s, so one that genuinely survived the kill is still running through
+        # every one of these seconds and the assert stays red. It also matches `_kill`'s own
+        # `proc.wait(timeout=5)`. Waiting here can therefore only absorb a process's exit tail; it
+        # can never convert the defect into a pass.
+        running = _wait_until_not_running(grandchild_pid, timeout=5.0)
+        # `None` means the platform cannot separate a zombie from a runner (POSIX without /proc,
+        # e.g. macOS) and there is no sound process-half assertion to make there. Neither CI
+        # platform is one — Windows has no zombie state, Linux has /proc — so pin that: a `None`
+        # on either is `_pid_running` having broken, and must not slip through as "nothing to say".
+        if sys.platform == "win32" or sys.platform.startswith("linux"):
+            assert running is not None, "_pid_running went blind on a platform CI actually runs"
+        assert running is not True, "the grandchild is still running after the worker kill"
     finally:
         if grandchild_pid is not None:
             _best_effort_kill_pid(grandchild_pid)

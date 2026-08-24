@@ -57,6 +57,11 @@ class PhiGatedModel(BaseModel):
     #: default is the control: an instance nobody authorized emits ``null`` for every gated property.
     _phi_released: frozenset[str] = PrivateAttr(default=frozenset())
 
+    #: Which released properties carry a display mask instead of the real value. Empty is the
+    #: default and the safe one: an unmarked property counts as a real exposure, so forgetting to
+    #: mark one OVER-reports the audit rather than hiding a disclosure.
+    _phi_masked: frozenset[str] = PrivateAttr(default=frozenset())
+
     @classmethod
     def __pydantic_init_subclass__(cls, **kwargs: Any) -> None:
         super().__pydantic_init_subclass__(**kwargs)
@@ -79,6 +84,20 @@ class PhiGatedModel(BaseModel):
     def release_phi(self, properties: Iterable[str]) -> None:
         """Clear ``properties`` (intersected with this model's gate) for JSON serialization."""
         self._phi_released = frozenset(properties) & type(self).phi_gated_properties
+
+    def mark_phi_masked(self, properties: Iterable[str]) -> None:
+        """Record which released properties carry a DISPLAY MASK rather than the real value.
+
+        Serialization is unaffected -- a masked property is released and is emitted. This exists so
+        the PHI-exposure audit can count what the caller could actually READ: a masked value is
+        non-empty, so a counter keyed on emptiness alone reports an exposure for a row whose
+        identifiers were never shown (ASVS 14.2.6, BACKLOG #1187).
+
+        Recorded by the masker rather than inferred from the value, because inference cannot work:
+        a real summary may legitimately contain the mask characters, so "looks masked" is not a
+        decidable question at the point of counting.
+        """
+        self._phi_masked = frozenset(properties) & type(self).phi_gated_properties
 
     @field_serializer(*sorted(GATEABLE_PROPERTIES), when_used="json", check_fields=False)
     def _withhold_unreleased_phi(

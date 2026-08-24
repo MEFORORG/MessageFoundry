@@ -112,17 +112,136 @@ jobs:
           # deny-listed private docs on releases 0.1.0..0.2.15. This gate fails the release BEFORE the
           # (last-step) PyPI publish if any sdist member is outside the package + its standard metadata,
           # so a regression in the allowlist can never re-leak. Belt-and-suspenders to the pyproject pin.
-          sd=$(ls dist/*.tar.gz)
+          #
+          # THIS GATE DECIDES ON EVIDENCE OF A LISTING, NEVER ON THE ABSENCE OF MATCHES. The earlier
+          # body asked only the second question, and three inputs measured against it printed
+          # "package-only" and exited 0 having inspected nothing: two tarballs in dist/ (`sd` went
+          # multiline, so the tar argument was malformed, and one of the two carried
+          # docs/security/PRIVATE.md), a corrupt or truncated tarball, and a tarball listing zero
+          # members. Two more were caught only by luck: an empty dist/ died on the bare `ls` under the
+          # runner's `bash -e`, with no ::error:: annotation, and a foreign sdist tripped only because
+          # its own members happened to sit outside the allowlist. A green that inspected nothing is
+          # the worst outcome for the one step whose entire value is that a human believes it, so
+          # steps (1) to (4) below each PROVE something before the allowlist question is asked at all.
+          #
+          # `set -o pipefail` would not have fixed that, and is not what fixes it here. Measured: the
+          # old body under pipefail still printed package-only and returned 0 on all three, because
+          # the trailing `|| true` swallowed the status whichever pipeline element failed. Separating
+          # the listing from the filtering is what fixes it.
+
+          # (1) EXACTLY ONE sdist. Resolved through an array so zero matches and two matches are both
+          # visible as a count, instead of collapsing into one silently malformed `tar` argument.
+          shopt -s nullglob
+          sdists=(dist/*.tar.gz)
+          if [ "${#sdists[@]}" -ne 1 ]; then
+            echo "::error::leak gate needs exactly one sdist in dist/, found ${#sdists[@]}: ${sdists[*]:-none}"
+            exit 1
+          fi
+          sd="${sdists[0]}"
+
+          # (2) THE LISTING MUST SUCCEED **AND COVER THE WHOLE FILE**. `--ignore-zeros` is the
+          # load-bearing flag, not a nicety: plain `tar tzf` STOPS AT THE FIRST end-of-archive marker
+          # and exits 0, so a clean sdist with a SECOND gzip stream appended lists only the clean
+          # members and passes. Measured: such a file hides docs/security/PRIVATE.md from `tar tzf`
+          # while `gzip -dc | grep -a` recovers its body text, and the private bytes ship. Proving the
+          # listing SUCCEEDED is not proving it was COMPLETE. No pipe on this line on purpose: the
+          # status has to be tar's own, and in `tar ... | sed ...` it is the sed's.
+          if ! raw=$(tar --ignore-zeros -tzf "$sd"); then
+            echo "::error::leak gate could not list $sd (tar failed), so nothing was inspected"
+            exit 1
+          fi
+
+          # (3) A LISTING OF ZERO MEMBERS is not a clean sdist, it is no evidence at all.
+          rawcount=$(grep -c . <<<"$raw" || true)
+          if [ "$rawcount" -eq 0 ]; then
+            echo "::error::leak gate listed $sd and got ZERO members, so nothing was inspected"
+            exit 1
+          fi
+
+          # (4) ONE ROOT, AND IT MUST BE OURS. This is an IDENTITY check and the strip depends on it.
+          # The old form stripped `^[^/]+/` from EACH LINE INDEPENDENTLY and then asked whether SOME
+          # line began `messagefoundry/`. Both halves were exploitable and both were measured:
+          #   - a foreign tarball whose members are `evilpkg-9.9/messagefoundry/...` satisfied the
+          #     "is it ours" test, because that test only ever saw the SECOND path component;
+          #   - `docs/messagefoundry/security/PRIVATE.md` inside an sdist rooted at
+          #     `messagefoundry-0.3.0/` laundered itself into `messagefoundry/security/PRIVATE.md`,
+          #     which the allowlist then trusted. A per-line strip is not a prefix removal.
+          # So: derive the ONE root from the first member, require EVERY member to carry it, and strip
+          # that exact literal. A sdist has a single root by construction, so this rejects nothing real.
+          root=${raw%%/*}
+          if [ "$root" = "$raw" ] || [ -z "$root" ]; then
+            echo "::error::leak gate could not derive a single root directory from $sd"
+            exit 1
+          fi
+          case "$root" in
+            messagefoundry-*) ;;
+            *)
+              echo "::error::leak gate found root '$root', not messagefoundry-<version>, so this is not the MessageFoundry sdist"
+              exit 1
+              ;;
+          esac
+          # Matched with `case`, not `grep "^$root/"`: a version contains dots, and in an ERE a dot is
+          # any character, so the regex form would also accept a root spelled `messagefoundry-0X3X0`.
+          # Stripped with `${line#"$root"/}`, not `${raw//"$root"\//}`: the latter substitutes EVERY
+          # occurrence anywhere in the member, so a crafted `<root>/docs/<root>/x` would be rewritten
+          # mid-path. Remove exactly one LEADING root per line, which is what "strip the prefix" means.
+          members=""
+          while IFS= read -r line; do
+            [ -n "$line" ] || continue
+            case "$line" in
+              "$root"/*) members+="${line#"$root"/}"$'\n' ;;
+              *)
+                echo "::error::sdist member does not carry the archive root '$root/', refusing to strip a prefix that is not one: $line"
+                exit 1
+                ;;
+            esac
+          done <<<"$raw"
+          count=$(grep -c . <<<"$members" || true)
+
+          # (5) THE ARCHIVE MUST BE COMPLETE, not merely readable. A tar stream truncated and THEN
+          # gzipped is a VALID gzip of a SHORT tar: measured at 10 and 50 percent, `tar` listed a
+          # partial member set, exited 0 and warned about nothing. Publishing that burns the version
+          # number on PyPI forever, so a partial listing must not read as a clean one.
+          #
+          # A complete tar ends with an end-of-archive marker of NUL blocks, and a truncated one is
+          # cut mid-data. So decompress and require the last 1024 bytes to be entirely NUL. Measured
+          # across the fixtures: clean, leaky and gzip-concatenated archives all give 0 non-NUL
+          # trailing bytes; the 50-percent truncation gives 119. NOTE A SIZE CHECK WOULD NOT WORK -
+          # that truncation is still a whole multiple of 512, so block alignment proves nothing.
+          trailing=$(gzip -dc "$sd" | tail -c 1024 | tr -d '\000' | wc -c)
+          if [ "$trailing" -ne 0 ]; then
+            echo "::error::sdist $sd does not end in a tar end-of-archive marker ($trailing non-NUL bytes in the last 1024) - the archive is truncated"
+            exit 1
+          fi
+
+          # (6) AND IT MUST HAVE THE SHAPE OF AN sdist. Cheap, independent of (5), and it catches a
+          # well-formed archive that is simply not one: hatchling force-includes both of these in
+          # every sdist it emits.
+          for required in PKG-INFO pyproject.toml; do
+            if ! grep -qxF "$required" <<<"$members"; then
+              echo "::error::sdist is missing $required, which hatchling force-includes in every sdist - this is not a hatchling sdist"
+              exit 1
+            fi
+          done
+
+          # Only now the allowlist question.
           # allowlist = the package tree + the metadata files hatchling force-includes in every sdist
           # (PKG-INFO, pyproject.toml, .gitignore) + README/CHANGELOG + license files (root or licenses/).
-          leak=$(tar tzf "$sd" | sed -E 's#^[^/]+/##' \
-            | grep -vE '^(messagefoundry/|licenses/|README\.md$|CHANGELOG\.md$|LICENSE$|NOTICE$|PKG-INFO$|pyproject\.toml$|\.gitignore$|$)' || true)
+          #
+          # KEEP THE `|| true` ON THIS GREP. grep exits 1 when it matches nothing, and "nothing outside
+          # the allowlist" is the CLEAN case, so a nonzero status here is a pass. The bug was never
+          # `|| true` itself: it was that ONE `|| true` covered BOTH the tar and the grep, so an
+          # upstream listing failure and a clean result became the same empty string. The listing is
+          # proved separately above, which is what makes this `|| true` safe. Do not merge the two
+          # back into a single pipeline.
+          leak=$(grep -vE '^(messagefoundry/|licenses/|README\.md$|CHANGELOG\.md$|LICENSE$|NOTICE$|PKG-INFO$|pyproject\.toml$|\.gitignore$|$)' <<<"$members" || true)
           if [ -n "$leak" ]; then
             echo "::error::sdist contains non-package files — private-doc leak guard tripped:"
             printf '%s\n' "$leak"
             exit 1
           fi
-          echo "sdist is package-only ✓"
+          # Print the COUNT, not just a word: a green log line has to show the gate inspected something.
+          echo "sdist is package-only: inspected $count members in $sd, none outside the allowlist"
 
       - name: Smoke-check the built wheel (clean venv → import + version)
         run: |
@@ -276,7 +395,7 @@ jobs:
       # `github.event.repository.private` is populated on the tag-push event.
       - name: Attest build provenance (SLSA) for sdist + wheel
         if: ${{ !github.event.repository.private }}
-        uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
           subject-path: "dist/*.tar.gz, dist/*.whl, messagefoundry-sbom.cdx.json, messagefoundry-vex.openvex.json"
 

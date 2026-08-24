@@ -174,7 +174,9 @@ def _load(tmp_path: Path, toml: str) -> ServiceSettings:
 def test_shipped_default_does_not_break_a_non_ad_deployment(tmp_path: Path) -> None:
     """The reason the refusal had to be re-keyed: with a non-zero SHIPPED default, an unconditional
     'requires ad_enabled' rule would fail startup on every deployment that does not use AD."""
-    settings = _load(tmp_path, "[auth]\nlocal_users = true\n")
+    # `local_users` was not an AuthSettings field, so this fixture used to say nothing at all — the very
+    # silence the unknown-key refusal now removes. `ad_enabled = false` states "no AD" in a real field.
+    settings = _load(tmp_path, "[auth]\nad_enabled = false\n")
     assert settings.auth.ad_session_recheck_seconds == 300
     assert settings.auth.ad_enabled is False
 
@@ -256,6 +258,13 @@ _CONNECTION_DEVIATIONS_EXEMPT = {
     "tls_key_file": "material/path, not a posture switch",
     "tls_key_password": "material/path, not a posture switch",
     "tls_ca_file": "material/path, not a posture switch",
+    # BACKLOG #1005 added this one. It is exempt for BOTH of the reasons already used above, and
+    # stating only the first would be the weaker half: it is a material PATH like tls_ca_file
+    # beside it, AND its ABSENCE is GATED rather than reported -- check_inbound_revocation refuses
+    # an mTLS listener with no CRL on an enforcing PHI instance, the same way the ADR 0092 hop cell
+    # gates tls/tls_verify below. A reader that merely reported "no CRL configured" would be strictly
+    # weaker than the refusal that already exists.
+    "tls_crl_file": "material/path; its absence is gated by #1005's posture-keyed revocation refusal",
     # Not TLS at all — the regex matches the word 'verify' in an HL7 ACK correlation check.
     "verify_ack_control_id": "HL7 ACK control-id correlation, unrelated to transport TLS",
     # Verify-off and TLS-off are GATED rather than reported: the ADR 0092 posture-keyed cell refuses

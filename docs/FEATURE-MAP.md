@@ -129,7 +129,7 @@ is sourced, and the Mirth/NextGen Connect parity reference lives in
 
 | Feature | Status | Notes |
 |---------|:--:|-------|
-| Local + Active Directory password authn (LDAP simple-bind) | ✅ | |
+| Local password authn (argon2id) + Active Directory sign-in | ✅ | AD signs in through **Windows SSO or OIDC**. The LDAP simple-bind SIGN-IN is **retired** (BACKLOG #1137) — `POST /auth/login` with `provider=ad` is refused and audited. The service-account bind, nested-group resolution and AD-group role re-sync are unchanged; binding **as the user** survives only for step-up re-auth at `POST /me/reauth` |
 | Passwordless Windows SSO (Kerberos / SPNEGO) | ✅ | **Browser SSO built (L5c, ADR 0068 §9 — experimental, off by default):** `GET /ui/sso` RFC 4559 challenge flow over the single-leg acceptor (Kerberos-only, no NTLM/multi-leg — any failure is an audited 303, never a challenge loop), one cookie session with `seed_reauth=False` (ambient proof ⇒ first sensitive action forces the directory-password step-up), boot-once keytab/SPN acceptor preflight degrading legibly (providers flag + login link + `e=sso_unavailable`). JSON `/auth/negotiate` unchanged. Mock-seam CI coverage; a domain-joined smoke is advised before recommending it (ADR 0068 open item) |
 | RBAC — fixed roles, deny-by-default per-route, **per-channel** | ✅ | |
 | Opaque sessions + full audit log (hash-chained, tamper-evident) | ✅ | |

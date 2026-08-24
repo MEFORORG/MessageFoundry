@@ -251,18 +251,22 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         request: Request, e: str | None = Query(None, max_length=32)
     ) -> HTMLResponse:
         auth = get_auth(request)
-        ad_enabled = auth is not None and auth.ad_enabled
+        # NO ad_enabled COMPUTATION. The simple-bind login pathway is retired (BACKLOG #1137), so
+        # there is no AD password form to gate and nothing here to decide.
+        #
+        # What stood here was a getattr fallback from the layer-1 split, reading
+        # ad_password_login_enabled and degrading to ad_enabled for an older engine. Once layer 2
+        # DELETED that setting the fallback stopped being a compatibility shim and became the
+        # defect: it fell through to ad_enabled -- the directory BIND, still true because SSO and
+        # OIDC need it -- and re-rendered the AD password form the retirement had just removed.
+        # A shim that survives the thing it was shimming inverts into a feature switch.
         sso_enabled = auth is not None and auth.kerberos_available
         # getattr: an older engine (seam < 10) has no oidc_available property at all, and a bare
         # attribute read would AttributeError rather than degrade (the exposure_protected
         # precedent). oidc_available, not oidc_enabled -- the LINK should disappear while the IdP
         # is known-down, even though the start leg still attempts per-request (AC-8).
         oidc_enabled = bool(getattr(auth, "oidc_available", False))
-        resp = HTMLResponse(
-            pages.login(
-                e, ad_enabled=ad_enabled, sso_enabled=sso_enabled, oidc_enabled=oidc_enabled
-            )
-        )
+        resp = HTMLResponse(pages.login(e, sso_enabled=sso_enabled, oidc_enabled=oidc_enabled))
         # ASVS 14.3.1: this render IS the post-termination landing page when either the outcome code
         # says so (the watchdog's ?e=expired, the redirect target of POST /ui/logout, or the
         # server's own expiry redirect) OR the browser still presents a session cookie that no
@@ -328,6 +332,15 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         # affordance ASVS 7.4.4 makes visible), which means the origin check is the only
         # request-provenance control it will ever have: without it a cross-site POST the browser
         # attaches the cookie to would forcibly terminate the operator's session.
+        #
+        # IT ALSO CHARGES NO WRITE BUDGET, AND THAT IS DELIBERATE (BACKLOG #287). Having no Depends
+        # gate, it never reaches `require_ui`, where every other non-GET /ui route now spends
+        # `allow_admin_write`. Do not "correct" that: a throttled logout is a signed-in operator who
+        # cannot sign out, which is the 7.4.4 affordance failing exactly when someone is trying to
+        # end a session they no longer trust. Signing out is also not the operation a write budget
+        # exists to bound — it REMOVES authority rather than exercising it. Written down because an
+        # unwritten right answer is indistinguishable from an oversight, and this one now sits
+        # conspicuously alone.
         assert_same_origin(request)
         auth = get_auth(request)
         token = session_token(request)

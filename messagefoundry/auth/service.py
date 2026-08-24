@@ -33,6 +33,7 @@ from messagefoundry.auth.notifications import (
     ACCOUNT_LOCKED,
     ADMIN_NEW_IP,
     EMAIL_CHANGED,
+    FEDERATED_IDENTITY_BOUND,
     LOGIN_AFTER_FAILURES,
     MFA_DISABLED,
     MFA_ENABLED,
@@ -122,6 +123,22 @@ STEP_UP_ACTION_MFA_DISABLE = "mfa_disable"
 STEP_UP_ACTION_WEBAUTHN_ENROLL = "webauthn_enroll"
 STEP_UP_ACTION_WEBAUTHN_DELETE = "webauthn_delete"
 STEP_UP_ACTION_ADMIN_USER_UPDATE = "admin_user_update"
+# BACKLOG #1149 (ASVS 7.5.2). Terminating a session is bound to an ACTION rather than to the shared
+# session window, because 7.5.2's verb is "having authenticated AGAIN" — an authentication event
+# SUBSEQUENT to the one that established the session. A window seeded by the login ceremony satisfies
+# a recency test the moment a session exists, so `require_reauth_only` alone let a caller mass-revoke
+# every other session of the account with no proof beyond the sign-in they already had.
+STEP_UP_ACTION_SESSION_TERMINATE = "session_terminate"
+# BACKLOG #1148 (ASVS 7.5.1). The verb asks for full re-authentication before modifications to
+# attributes that affect authentication, naming MFA configuration verbatim and NOT qualifying whose.
+# The self-service half already satisfies it; the ADMIN half did not -- both reset lanes rode the
+# plain login-seeded window, so an administrator who signed in under step_up_max_age_seconds ago
+# could act with ZERO fresh proof. What that gate protects is the most complete modification
+# available to the named attribute: admin_reset_mfa disables TOTP and deletes every passkey, and
+# disable_totp NULLs the recovery codes alongside the secret -- one call clears the second factor,
+# every recovery code and every passkey, on someone else's account.
+STEP_UP_ACTION_ADMIN_RESET_MFA = "admin_reset_mfa"
+STEP_UP_ACTION_ADMIN_RESET_PASSWORD = "admin_reset_password"  # nosec B105 — step-up action id, not a credential; echoed publicly in X-Step-Up-Action
 
 _T = TypeVar("_T")
 
@@ -175,9 +192,11 @@ class BootstrapAdmin:
 
     username: str
     password: str
-    # ASVS 6.4.5: the instant an unclaimed bootstrap credential is auto-disabled
-    # (created_at + [auth].bootstrap_expiry_hours), or None when expiry is off (hours=0). Surfaced at
-    # issuance so the renewal instruction ("claim it before <ISO>") ships WITH the credential.
+    # ASVS 6.4.5: the instant this credential stops working — the EARLIER of the two bounds, since
+    # BACKLOG #1245 (WP-3 retiring the ACCOUNT at created_at + [auth].bootstrap_expiry_hours, and
+    # ASVS 6.4.1 expiring the CREDENTIAL at password_changed_at + [auth].initial_password_expiry_hours).
+    # None only when BOTH are off. Surfaced at issuance so the renewal instruction ("claim it before
+    # <ISO>") ships WITH the credential — which is exactly why it must not name the later of the two.
     expires_at: float | None = None
 
 
@@ -440,6 +459,12 @@ class AuthService:
 
     @property
     def ad_enabled(self) -> bool:
+        """Whether this engine can BIND to the directory -- what Kerberos SSO, federated OIDC and the
+        session reconciler each need.
+
+        This is a DIRECTORY-BIND capability, never a statement that a user may present a directory
+        password: that pathway is retired (BACKLOG #1137). The step-up re-bind still uses the bind,
+        so this staying true is correct and is not a leftover."""
         return self._ldap is not None
 
     @property
@@ -544,12 +569,32 @@ class AuthService:
         await self._audit("auth.bootstrap_admin_created", actor="bootstrap")
         # ASVS 6.4.5: derive the expiry from the STORED created_at (the same base
         # _retire_superseded_bootstrap uses), so the surfaced deadline is exactly the retirement instant.
-        expiry_hours = self._settings.bootstrap_expiry_hours
-        expires_at: float | None = None
-        if expiry_hours > 0:
-            created = await self._store.get_user(user_id)
-            if created is not None:
-                expires_at = created.created_at + expiry_hours * 3600
+        # BACKLOG #1245: the surfaced deadline is the EARLIER of the two bounds that can end this
+        # credential, not the WP-3 one alone. Computing it from `bootstrap_expiry_hours` by itself was
+        # the same account-versus-credential conflation #1245 removed from the login gate, surviving
+        # in the one field whose entire job is telling the operator when the credential dies — and it
+        # made `bootstrap-admin.txt` LIE in both directions once 6.4.1 stopped carving the bootstrap
+        # out: at `bootstrap_expiry_hours = 0` the file stated NO deadline while the credential
+        # expired at `initial_password_expiry_hours`, and at 8760 it stated a window 121x the real
+        # one. Each arm contributes nothing when its own setting is 0, so with both off there is
+        # genuinely no deadline and None is still correct.
+        created = await self._store.get_user(user_id)
+        deadlines: list[float] = []
+        if created is not None:
+            if self._settings.bootstrap_expiry_hours > 0:
+                # WP-3 retires the ACCOUNT, keyed on created_at.
+                deadlines.append(created.created_at + self._settings.bootstrap_expiry_hours * 3600)
+            if self._settings.initial_password_expiry_hours > 0 and (
+                created.password_changed_at is not None
+            ):
+                # ASVS 6.4.1 expires the CREDENTIAL, keyed on password_changed_at. For a freshly
+                # minted bootstrap these two stamps are the same clock read, so at equal windows the
+                # minimum is that shared instant and the surfaced value is unchanged.
+                deadlines.append(
+                    created.password_changed_at
+                    + self._settings.initial_password_expiry_hours * 3600
+                )
+        expires_at: float | None = min(deadlines) if deadlines else None
         return BootstrapAdmin(username=BOOTSTRAP_USERNAME, password=password, expires_at=expires_at)
 
     def _generate_policy_password(self) -> str:
@@ -573,16 +618,53 @@ class AuthService:
                 return True
         return False
 
+    async def _unclaimed_bootstrap(self) -> UserRecord | None:
+        """The first-run bootstrap admin while it is still present, enabled and **never claimed** —
+        otherwise ``None``. This is the ONE claimed-ness test of the WP-3 lifecycle: both the
+        retirement (:meth:`_retire_superseded_bootstrap`) and its advisory warning
+        (:meth:`bootstrap_expiry_warning`) go through it, because two open-coded copies of one
+        lifecycle test is exactly how the warn path silently inherited BACKLOG #1245.
+
+        Claimed-ness is the RECORDED ``users.password_claimed_at`` — stamped write-once when the
+        holder sets their own credential through authenticated self-service rotation — never the
+        INFERRED ``must_change_password``. That distinction is the fix: "never claimed" is
+        monotonic (once claimed, always claimed) while ``must_change_password`` is not, since an
+        admin password reset legitimately re-raises it (ASVS 6.4.6 wants an admin-issued credential
+        to be a one-time temp, so that write must stay). Reading the flag as claimed-ness therefore
+        made a reset of the account named ``admin`` look never-claimed again, and the next trigger
+        would disable an account claimed long ago — on a single-admin deployment, with no second
+        administrator left able to re-enable it. A recorded fact cannot be un-recorded by a writer
+        that means something else.
+
+        Note ``password_claimed_at`` records that the holder once set their own credential, NOT
+        that they are still in control — recovering a compromised account is what the admin reset
+        is for, and it deliberately does not restore retirement eligibility."""
+        boot = await self._store.get_user_by_username(BOOTSTRAP_USERNAME)
+        if boot is None or boot.disabled or boot.password_claimed_at is not None:
+            return None  # gone, already disabled, or claimed (a real account now)
+        # WP-3 governs the LOCAL first-run account and nothing else. This guard is not incidental to
+        # the claimed-ness fix, it is REQUIRED BY it: the retired ``must_change_password`` test
+        # excluded a directory-provisioned account BY ACCIDENT, because such a row has no password
+        # and so carries the flag False, and the old predicate returned early on exactly that. The
+        # recorded stamp does not reproduce that side effect -- a federated row has no stamp either,
+        # which reads as "never claimed" -- so replacing the flag without this line would newly
+        # auto-disable a real directory administrator who happens to be named ``admin``, revoking
+        # their sessions and auditing it as a bootstrap retirement. That is the same lockout class
+        # WP-3's own fix exists to prevent, re-opened on a different row shape.
+        if boot.auth_provider != AuthProvider.LOCAL.value:
+            return None
+        return boot
+
     async def _retire_superseded_bootstrap(self, now: float | None = None) -> None:
         """Disable the first-run bootstrap admin once it's no longer needed (WP-3): when a **second**
-        administrator exists, or — while still **unclaimed** (never password-changed) — once its expiry
-        window lapses. Only ever touches an unclaimed bootstrap (``must_change_password`` still set): if
-        the operator changed its password it is a normal admin account and is left alone, so this can't
-        lock out a legitimate single-admin deployment."""
+        administrator exists, or — while still **unclaimed** — once its expiry window lapses. It only
+        ever touches an account that has never been claimed per :meth:`_unclaimed_bootstrap`; an
+        account whose holder set their own credential is a normal admin account and is left alone,
+        so retirement cannot lock a single-admin deployment out of its only administrator."""
         now = time.time() if now is None else now
-        boot = await self._store.get_user_by_username(BOOTSTRAP_USERNAME)
-        if boot is None or boot.disabled or not boot.must_change_password:
-            return  # gone, already disabled, or claimed (a real account now)
+        boot = await self._unclaimed_bootstrap()
+        if boot is None:
+            return
         expiry_hours = self._settings.bootstrap_expiry_hours
         expired = expiry_hours > 0 and now >= boot.created_at + expiry_hours * 3600
         superseded = await self._other_enabled_admin_exists(boot.id)
@@ -597,8 +679,9 @@ class AuthService:
         )
 
     async def bootstrap_expiry_warning(self, now: float | None = None) -> tuple[float, int] | None:
-        """ASVS 6.4.5 arm 2: if the first-run bootstrap admin is STILL UNCLAIMED and ``now`` sits inside
-        its warn window ``[expires_at - bootstrap_warn_hours, expires_at)``, return the retirement instant
+        """ASVS 6.4.5 arm 2: if the first-run bootstrap admin is STILL UNCLAIMED (the shared test,
+        :meth:`_unclaimed_bootstrap`) and ``now`` sits inside its warn window
+        ``[expires_at - bootstrap_warn_hours, expires_at)``, return the retirement instant
         + whole hours remaining ONCE — an in-memory latch means a periodic caller emits exactly one
         reminder per process. Returns ``None`` when time-expiry is off, the bootstrap is
         gone/disabled/claimed, ``now`` is before the window (or already at/past it — retirement itself has
@@ -611,14 +694,28 @@ class AuthService:
         the PHI-free ``bootstrap_admin_expiring`` AlertSink event; the password is never surfaced."""
         if self._bootstrap_expiry_warned:
             return None
-        expiry_hours = self._settings.bootstrap_expiry_hours
-        if expiry_hours <= 0:
-            return None  # no time-expiry configured → nothing to warn about
-        boot = await self._store.get_user_by_username(BOOTSTRAP_USERNAME)
-        if boot is None or boot.disabled or not boot.must_change_password:
-            return None  # gone, already disabled, or claimed (a real account now)
+        # BACKLOG #1245: warn about whichever bound comes FIRST. Gating on bootstrap_expiry_hours
+        # alone meant that at 0 this returned None and the operator got no warning at all for the
+        # deadline that now actually ends the credential (ASVS 6.4.1), and at a long WP-3 window it
+        # would have warned about the later bound. Keyed off the same minimum the issuance deadline
+        # uses, so the two can never disagree.
+        boot = await self._unclaimed_bootstrap()
+        if boot is None:
+            return None
+        candidates: list[float] = []
+        if self._settings.bootstrap_expiry_hours > 0:
+            candidates.append(boot.created_at + self._settings.bootstrap_expiry_hours * 3600)
+        if (
+            self._settings.initial_password_expiry_hours > 0
+            and boot.password_changed_at is not None
+        ):
+            candidates.append(
+                boot.password_changed_at + self._settings.initial_password_expiry_hours * 3600
+            )
+        if not candidates:
+            return None  # no bound of either kind configured → nothing to warn about
         now = time.time() if now is None else now
-        expires_at = boot.created_at + expiry_hours * 3600
+        expires_at = min(candidates)
         warn_start = expires_at - max(0, self._settings.bootstrap_warn_hours) * 3600
         if not (warn_start <= now < expires_at):
             return None  # not yet in the window, or already at/past the retirement instant
@@ -637,7 +734,26 @@ class AuthService:
         client: str | None = None,
     ) -> LoginOutcome:
         if provider is AuthProvider.AD:
-            return await self._login_ad(username, password, client=client)
+            # RETIRED (BACKLOG #1137, owner ruling 2026-08-22). The engine no longer accepts a
+            # directory password: current good practice is that an application does not collect
+            # directory credentials, and supporting AD is not the same as supporting simple bind --
+            # every real AD deployment already provides Kerberos, so the replacement is in place
+            # wherever the pathway was.
+            #
+            # Refused here rather than deleted from the dispatch, because falling through to the
+            # local path would authenticate an AD username against the LOCAL credential store, which
+            # is a worse failure than a refusal: a directory name that happens to collide with a
+            # local account would silently log in as that account.
+            #
+            # THE STEP-UP RE-BIND (`_reauth_ad`) DELIBERATELY SURVIVES THIS. It is the only step-up
+            # path any AD-stamped identity has -- Kerberos and OIDC logins are stamped AD too -- so
+            # removing it in the same change would lock every AD operator out of factor enrolment
+            # and MFA-disable. See docs/research/ad-step-up-after-simple-bind-retirement.md.
+            await self._directory_reject_audit(username, "simple_bind", "pathway_retired")
+            return LoginOutcome(
+                ok=False,
+                error="Directory password sign-in has been retired; use Windows SSO or OIDC",
+            )
         return await self._login_local(username, password, client=client)
 
     async def _login_local(
@@ -645,11 +761,28 @@ class AuthService:
     ) -> LoginOutcome:
         # Enforce bootstrap expiry/supersession before the credential check: an unclaimed bootstrap
         # that lapsed (or was superseded) is disabled here, so the disabled-account path below refuses
-        # it like any other invalid login (WP-3). Scoped to the bootstrap username to keep normal
-        # logins free of the extra lookups.
-        if username == BOOTSTRAP_USERNAME:
-            await self._retire_superseded_bootstrap()
+        # it like any other invalid login (WP-3).
+        #
+        # BACKLOG #1268: THE GATE ASKS THE ROW THE STORE RESOLVED, NEVER THE CALLER'S SPELLING. It
+        # used to read `if username == BOOTSTRAP_USERNAME` -- a PYTHON comparison against the input,
+        # while the lookup below is resolved by the COLUMN'S COLLATION. On a case-insensitive store
+        # those disagree in exactly one direction: `Admin` FAILS the Python guard, so retirement never
+        # runs, and then SUCCEEDS at the lookup, handing back the very row the skipped call would have
+        # disabled. MEASURED before this fix: a lapsed, unclaimed bootstrap credential logged in
+        # successfully as `Admin` while the identical attempt as `admin` was refused and retired.
+        # That is SDS-3.7 exactly -- a compensating control resting on a false premise, the premise
+        # being that the username the gate compared is the username the store matched.
+        #
+        # Comparing the STORED value keeps this correct under any collation, including one the engine
+        # does not control (an operator-supplied database, a restored dump, a column altered
+        # downstream), so it does not depend on the sibling fix in the SQL Server DDL. The `==` is
+        # exact on purpose: `_ensure_bootstrap_admin` writes the canonical spelling, so the stored
+        # value is canonical by construction. The cost is one extra lookup ON THE BOOTSTRAP PATH ONLY
+        # -- an ordinary login still does the single lookup it always did, plus a string compare.
         user = await self._store.get_user_by_username(username)
+        if user is not None and user.username == BOOTSTRAP_USERNAME:
+            await self._retire_superseded_bootstrap()
+            user = await self._store.get_user(user.id)  # re-read: retirement may have disabled it
         if user is None or user.auth_provider != AuthProvider.LOCAL.value or user.disabled:
             # Equalize timing with the real-password path so a missing/disabled/AD account is not
             # distinguishable from a wrong password (defeats username enumeration via latency).
@@ -688,13 +821,29 @@ class AuthService:
         # ASVS 6.4.1: an admin-issued initial/reset credential that was never claimed EXPIRES — the
         # password verified, but a `must_change_password` temp that is older than
         # `initial_password_expiry_hours` is refused like any other invalid login (a generic error, so
-        # it is indistinguishable from a wrong password) and audited. The bootstrap admin has its own
-        # expiry path (handled above) and is carved out; a user who set their own password has
-        # `must_change_password=False` and is never gated here.
+        # it is indistinguishable from a wrong password) and audited. A user who set their own
+        # password has `must_change_password=False` and is never gated here.
+        #
+        # THERE IS NO BOOTSTRAP CARVE-OUT HERE, AND BACKLOG #1245 IS WHY IT WENT. It used to exempt
+        # the bootstrap entirely, on the premise that WP-3 gives that account its own deadline. That
+        # premise CONFLATES TWO DIFFERENT CONTROLS: WP-3 retires an ACCOUNT, 6.4.1 expires a
+        # CREDENTIAL. Different triggers, different outcomes, and one is not a substitute for the
+        # other — which becomes visible the moment WP-3 cannot bound the credential at all:
+        #
+        #   - `bootstrap_expiry_hours = 0` is a documented, supported value that disables the time
+        #     arm outright (settings.py, "0 = no time expiry"), and the supersession arm needs a
+        #     second administrator who may never be created. MEASURED before this fix: the printed
+        #     first-run credential still logged in at 73 hours, 8760 hours and 87600 hours.
+        #   - `bootstrap_expiry_hours` set LONGER than this policy (say 8760) bounded the credential
+        #     at 100x the 6.4.1 window.
+        #
+        # Neither is reported by security_loosenings(), so both were silent. Dropping the carve-out
+        # is near-behaviour-neutral at the stock 72/72 defaults — a freshly minted bootstrap has
+        # created_at and password_changed_at within milliseconds of each other, so 6.4.1 comes due at
+        # the same instant WP-3 retirement already does — while closing both misconfigurations.
         expiry_hours = self._settings.initial_password_expiry_hours
         if (
-            username != BOOTSTRAP_USERNAME
-            and user.must_change_password
+            user.must_change_password
             and expiry_hours > 0
             and user.password_changed_at is not None
             and now - user.password_changed_at > expiry_hours * 3600.0
@@ -768,31 +917,6 @@ class AuthService:
         )
         return attempts, locked_until is not None
 
-    async def _login_ad(self, username: str, password: str, *, client: str | None) -> LoginOutcome:
-        if self._ldap is None:
-            return LoginOutcome(ok=False, error="AD authentication is not configured")
-        try:
-            principal = await asyncio.to_thread(self._ldap.authenticate, username, password)
-        except LdapError as exc:
-            await self._audit(
-                "auth.login_error",
-                actor=username,
-                detail=_json({"provider": "ad", "error": str(exc)}),
-                client=client,
-            )
-            return LoginOutcome(ok=False, error="directory unavailable")
-        if principal is None:
-            await self._audit(
-                "auth.login_failed", actor=username, detail=_json({"provider": "ad"}), client=client
-            )
-            return LoginOutcome(ok=False, error="invalid credentials")
-        # Signed relaxation (ASVS 6.3.4): a SIMPLE bind proves the password only — it carries no
-        # assertion about what the directory enforced — so strength is delegated to Entra Conditional
-        # Access / the MFA proxy. Minting at the MINIMUM instead is 6.8.4 arm 3, deferred to #296:
-        # an AD identity has no enrollable engine factor, so flipping it here locks directory admins
-        # out. This parameter is the seam that flip uses.
-        return await self._complete_ad_login(principal, client, mfa_verified=True)
-
     async def authenticate_kerberos(
         self, token: bytes, *, client: str | None = None, seed_reauth: bool = True
     ) -> LoginOutcome:
@@ -818,8 +942,10 @@ class AuthService:
         if principal is None:
             await self._directory_reject_audit(username, "kerberos", "not_in_directory")
             return LoginOutcome(ok=False, error="user not found in directory")
-        # Same signed relaxation as the simple-bind leg (ASVS 6.3.4): a Kerberos service ticket carries
-        # no factor-strength assertion that pyspnego surfaces, so directory delegation stands.
+        # The signed delegated-directory relaxation (ASVS 6.3.4): a Kerberos service ticket carries no
+        # factor-strength assertion that pyspnego surfaces, so directory delegation stands. Since the
+        # AD password sign-in was retired (BACKLOG #1137) this is the ONLY leg passing a hard True --
+        # docs/SECURITY.md's Kerberos rows are where that grant is now disclosed.
         return await self._complete_ad_login(
             principal, client, mfa_verified=True, seed_reauth=seed_reauth
         )
@@ -1091,8 +1217,8 @@ class AuthService:
         federated_subject: tuple[str, str] | None = None,
     ) -> LoginOutcome:
         # ``federated_subject`` is the verified OIDC ``(issuer, sub)`` and is passed ONLY by the
-        # federated path (BACKLOG #1015). It defaults to None, so the AD-simple-bind and Kerberos
-        # callers stay byte-identical — no extra store write, no changed audit row. The federated
+        # federated path (BACKLOG #1015). It defaults to None, so the Kerberos caller stays
+        # byte-identical — no extra store write, no changed audit row. The federated
         # caller has already enforced the subject-continuity guard before reaching here.
         existing = await self._store.get_user_by_username(principal.username)
         if existing is not None and existing.auth_provider != AuthProvider.AD.value:
@@ -1113,11 +1239,55 @@ class AuthService:
             )
             != federated_subject
         ):
+            # BACKLOG #1256: SUBJECT-EXCLUSIVITY, the direction #1015's guard cannot look. That guard
+            # resolves by username and asks whether THIS ACCOUNT holds a different subject; it is
+            # structurally incapable of seeing a SECOND ACCOUNT already bound to the subject now
+            # presenting. Nothing else sees it either -- measured, no UNIQUE constraint names these
+            # columns on any backend (0/0/0, positive control 13/8/10 total UNIQUE declarations).
+            #
+            # Without this, one verified identity could come to own two accounts: bind as `alice`,
+            # have the directory resolve you to `bob` later, and both rows carry your subject with
+            # #1015 refusing neither, because each account's own binding is self-consistent.
+            #
+            # Refused rather than re-pointed: silently moving a binding would hand the subject the
+            # newer account and strand the older one, which is the account-takeover-without-
+            # credential-compromise shape #1015 exists to prevent, arriving from the other side.
+            holder = await self._store.get_user_by_federated_subject(*federated_subject)
+            if holder is not None and holder.id != user.id:
+                await self._directory_reject_audit(
+                    principal.username, "oidc", "federated_subject_already_bound"
+                )
+                return LoginOutcome(
+                    ok=False,
+                    error="federated sign-in failed",
+                    reason="federated_subject_already_bound",
+                )
             # First federated login for this account (or an unbound AD account's first): record the
             # (issuer, sub) binding so a later reassigned-username login carrying a different subject is
             # refused by the guard above. A matching binding is left untouched (no updated_at churn).
             await self._store.set_user_federated_subject(
                 user.id, federated_subject[0], federated_subject[1]
+            )
+            # BACKLOG #1248. Binding an external identity decides WHO MAY SIGN IN as this account
+            # from now on, so it is a privilege change and gets the same two records the role
+            # resync below emits: an audit row, and an out-of-band notice to the account holder
+            # (ASVS 6.3.7). Before this it was the only silent write in the method.
+            await self._audit(
+                "auth.federated_subject_bound",
+                actor=user.username,
+                detail=_json({"issuer": federated_subject[0], "subject": federated_subject[1]}),
+                client=client,
+            )
+            # THE NOTICE CARRIES THE ISSUER AND NOT THE SUBJECT, deliberately. The audit row needs
+            # the exact ``sub`` so an operator can tell two bindings apart; the account holder needs
+            # to know WHICH PROVIDER was linked, and an opaque identifier in an email tells them
+            # nothing while putting it somewhere less protected than the audit store.
+            await self._notify_security(
+                FEDERATED_IDENTITY_BOUND,
+                username=user.username,
+                email=user.email,
+                client=client,
+                detail={"issuer": federated_subject[0]},
             )
         role_ids = sorted(await self._store.roles_for_ad_groups(principal.groups))
         previous = set(await self._store.get_user_role_ids(user.id))
@@ -1234,6 +1404,31 @@ class AuthService:
         wired. Drives whether the API lifespan creates the loop at all — at the default
         ``ad_session_recheck_seconds = 0`` no task exists and the upgrade is byte-identical."""
         return bool(self._settings.ad_session_recheck_seconds) and self._ldap is not None
+
+    @property
+    def bootstrap_deadline_configured(self) -> bool:
+        """Whether ANY bound can end the unclaimed bootstrap credential -- so whether the ASVS 6.4.5
+        reminder task has anything to warn about. Drives whether the API lifespan creates it at all.
+
+        BACKLOG #1141. This exists because the lifespan gate open-coded
+        ``bootstrap_expiry_hours > 0`` while :meth:`bootstrap_expiry_warning` warns on the EARLIER of
+        **two** bounds -- WP-3 account retirement and the ASVS 6.4.1 credential expiry. Those are
+        different questions, and BACKLOG #1245 corrected the two computations in this file without
+        reaching the gate that decides whether they ever run.
+
+        THE CONSEQUENCE WAS A SILENTLY DEAD WARNING ARM, not a style defect: at
+        ``bootstrap_expiry_hours = 0`` with ``initial_password_expiry_hours`` set, the warning method
+        correctly computes a deadline and **nothing ever calls it**, because the reminder task is its
+        only consumer and was never created. The operator gets no notice before the credential dies.
+
+        Same lesson :meth:`_unclaimed_bootstrap` records one level over: two open-coded copies of one
+        lifecycle question is how the warn path inherited #1245. This is the third copy, in another
+        module, and it inherited it too.
+        """
+        return (
+            self._settings.bootstrap_expiry_hours > 0
+            or self._settings.initial_password_expiry_hours > 0
+        )
 
     @property
     def directory_reconcile_alert(self) -> str | None:
@@ -2129,18 +2324,58 @@ class AuthService:
                 # legitimate code.
                 return await self._store.consume_totp_step(user.id, matched_step)
         normalized = code.upper()  # recovery codes are minted uppercase
-        hashes = await self._store.get_recovery_code_hashes(user.id)
-        for h in hashes:
-            if await self._argon2(verify_password, h, normalized):
-                # Atomic compare-and-delete: only the caller that actually removes the hash wins, so a
-                # concurrent verify of the same single-use code can't double-spend it (WP-14).
-                return await self._store.consume_recovery_code_hash(user.id, h)
-        return False
+        real = list(await self._store.get_recovery_code_hashes(user.id))
+        # ASVS 11.2.4 (BACKLOG #1149's sibling, #1167; ADR 0170). This walk used to `return` on the
+        # first argon2id match, so the NUMBER of ~64 MiB verifications was a function of which code
+        # was presented -- and, on the failure path, of how many codes REMAINED. Timing a single
+        # failed attempt therefore leaked the user's remaining recovery-code count.
+        #
+        # Constant WORK, not a short-circuit: always run exactly the configured slot count, padding
+        # with the same fixed dummy hash the local login leg uses, and pick the winner afterwards.
+        #
+        # THIS ADDS NO AMPLIFICATION CEILING, WHICH IS THE OBJECTION THE OBVIOUS FIX DESERVES AND
+        # THIS ONE DOES NOT. The failure path ALREADY verified every remaining hash, so the cost here
+        # is today's WORST CASE made unconditional -- bounded by `mfa_recovery_code_count` (default
+        # 10, validator-capped at 50), which is the same bound that already shipped. `_argon2` also
+        # holds a semaphore, so this cannot widen the concurrent-argon2 footprint either.
+        slots = max(self._settings.mfa_recovery_code_count, len(real))
+        matched = -1
+        for i in range(slots):
+            h = real[i] if i < len(real) else _DUMMY_PASSWORD_HASH
+            ok = await self._argon2(verify_password, h, normalized)
+            if ok and i < len(real) and matched < 0:
+                matched = i  # recorded, NOT returned -- returning here restores the leak
+        if matched < 0:
+            return False
+        # Atomic compare-and-delete: only the caller that actually removes the hash wins, so a
+        # concurrent verify of the same single-use code can't double-spend it (WP-14).
+        return await self._store.consume_recovery_code_hash(user.id, real[matched])
 
     async def disable_mfa(self, identity: Identity, *, client: str | None = None) -> None:
         """Self-service: turn off the caller's TOTP MFA (the API gates this behind step-up). Audited +
-        the user is notified out-of-band (ASVS 6.3.7)."""
+        the user is notified out-of-band (ASVS 6.3.7).
+
+        Raises :class:`ValueError` when TOTP is the caller's LAST second factor and MFA is still
+        required — the same refusal, on the same condition, as
+        :meth:`delete_webauthn_credential` (ADR 0068 decision 5). BACKLOG #1022: these are two
+        self-service routes to zero factors behind one step-up gate, and only one of them asked.
+
+        This is NOT the admin escape hatch — that is :meth:`admin_reset_mfa`, which clears TOTP and
+        every passkey and is deliberately unguarded. Nothing here narrows it.
+        """
         user = await self._store.get_user(identity.user_id)
+        if user is not None and user.totp_enabled:
+            creds = await self._store.list_webauthn_credentials(identity.user_id)
+            # Dropping to zero factors while MFA is required is not a lockout — it lands the user in
+            # the enroll-required flow. So NEITHER self-service path is a recovery path, which is
+            # precisely why both must refuse identically rather than one being an escape hatch.
+            if not creds and self._mfa_required_for(
+                user, identity.roles, second_factor_enrolled=False
+            ):
+                raise ValueError(
+                    "this is your last second factor and MFA is required for your account — "
+                    "enroll another factor first"
+                )
         await self._store.disable_totp(identity.user_id)
         await self._audit(
             "auth.mfa_disabled",
@@ -2773,6 +3008,37 @@ class AuthService:
             if Role.ADMINISTRATOR.value in await self._store.get_user_role_ids(user.id):
                 admins.add(user.id)
         return admins == {user_id}
+
+    async def has_notifiable_admin(self) -> bool:
+        """True iff at least one ENABLED administrator has an email address on file.
+
+        BACKLOG #1020. The PHI startup gate computes notification readiness from the SMTP transport
+        alone (``notify_security_events`` + ``email_smtp_host`` + ``email_from``), which answers
+        *"is a transport configured"* and never *"can the account that matters actually receive"*.
+        Those come apart on a first run: ``_ensure_bootstrap_admin`` creates the account holding
+        ``frozenset(Permission)`` with no ``email=``, and ``SecurityEventNotifier.notify`` starts
+        ``if not event.email: return`` -- so every notice about the most privileged account on the
+        instance no-ops while the gate reports a healthy channel.
+
+        Deliberately scoped to the ROLE, not to the bootstrap account: ``email`` is optional in
+        ``UserCreateRequest`` and is not required for the Administrator role, so a hand-created
+        privileged account has the identical hole. Keying on the bootstrap user alone would close
+        the instance this was found on and leave the class open.
+
+        Enumerates as :meth:`is_last_enabled_admin` and :meth:`_other_enabled_admin_exists` do --
+        same store calls, same disabled-skip, same role test. **That agreement is a convention, not
+        a mechanism, and this docstring must not claim otherwise:** these are now THREE independent
+        copies of "who is an enabled administrator", and nothing binds them. If one gains a
+        condition -- a lockout check, an auth_provider filter -- the others keep the old answer
+        silently. Extracting a shared enumeration is worth its own item; it is deliberately not done
+        here, because it would rewrite two guards this change has no business touching.
+        """
+        for user in await self._store.list_users():
+            if user.disabled or not user.email:
+                continue
+            if Role.ADMINISTRATOR.value in await self._store.get_user_role_ids(user.id):
+                return True
+        return False
 
     async def set_ad_group_map(self, entries: Sequence[tuple[str, str]], *, actor: str) -> None:
         await self._store.set_ad_group_role_map(entries)
