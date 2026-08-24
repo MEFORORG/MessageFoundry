@@ -7,6 +7,7 @@ guard. Postgres/SQL Server parity is CI's job; these run on SQLite."""
 
 from __future__ import annotations
 
+import asyncio
 import json
 from collections.abc import AsyncIterator
 from pathlib import Path
@@ -870,3 +871,90 @@ async def test_uploaded_browse_moves_the_needle_into_a_post_body(
     browse = [a for a in await engine.store.list_audit() if a["action"] == "upload.browse"]
     joined = " ".join(str(a["detail"] or "") for a in browse)
     assert "MRN123" not in joined  # the needle value is still never audited
+
+
+async def test_the_RUNNER_prune_audit_row_also_names_the_system(tmp_path: Path) -> None:
+    """BACKLOG #1224, THE SECOND SITE -- the one the suite could not see.
+
+    Two code paths prune expired uploads and BOTH audit as ``actor="system"``: the save-time sweep
+    inside ``upload_file`` (guarded by the sibling test above) and the background
+    ``UploadRetentionRunner`` wired in ``create_managed_app``'s lifespan. Only the first had a test.
+
+    **MEASURED, WHICH IS WHY THIS EXISTS.** Reverting the lifespan closure to
+    ``actor=meta.uploader`` left the ENTIRE suite green -- 13578 passed, byte-identical to baseline --
+    while the same mutation on the request-path site reddened exactly one test. So the runner's
+    attribution was unguarded, and the item's own scope names a test for it as the open limb.
+
+    **WHY THE SUITE MISSED IT, and it is not that nothing drives a lifespan.** Tests DO construct the
+    real closure and DO reach ``run_once`` -- ``tests/test_asvs_gcm_invocation_bound.py`` enters a
+    managed app's lifespan. It prunes ZERO files, because nothing in those fixtures is aged, so the
+    loop body carrying ``actor="system"`` never executes. **A path that runs but never enters its
+    branch is invisible to coverage-by-execution**, which is the same green-and-blind shape the
+    surrounding items are about.
+
+    **TWO LIFESPANS ARE LOAD-BEARING, not incidental.** ``_run`` calls ``run_once`` BEFORE its first
+    sleep, so the sweep happens at startup. The file therefore has to be aged BETWEEN two startups:
+    the first app creates it (the runner's sweep has already passed), the second app's sweep finds it
+    expired. One lifespan cannot both create and prune.
+    """
+    import dataclasses
+    import time
+
+    pytest.importorskip("psutil")
+    from messagefoundry.api import create_managed_app
+    from messagefoundry.store.crypto import generate_key
+
+    uploads = tmp_path / "runner-uploads"
+    settings = StoreSettings(
+        path=str(tmp_path / "runner.db"),
+        encryption_key=generate_key(),
+        uploads_dir=str(uploads),
+        max_upload_bytes=1_000_000,
+        uploads_retention_days=30,
+    )
+
+    # PASS 1 -- create the file, then age it past the window. The runner's startup sweep for THIS app
+    # already ran before the file existed, so nothing is pruned here.
+    app1 = create_managed_app(store_settings=settings, poll_interval=0.05)
+    async with app1.router.lifespan_context(app1):
+        us = app1.state.upload_store
+        assert us is not None, "[store].uploads_dir was set -- the subsystem must be wired"
+        meta = await us.save(
+            data=BATCH.encode(), filename="acme.hl7", uploader="op", uploader_id="u-1"
+        )
+        aged = dataclasses.replace(meta, uploaded_at=time.time() - 31 * 86_400)
+        (uploads / f"{meta.file_id}.meta").write_text(
+            us._encrypt_meta(aged),  # noqa: SLF001 -- mirrors the sibling test's backdating
+            encoding="utf-8",
+        )
+        assert await app1.state.engine.store.list_audit() is not None
+
+    # PASS 2 -- a fresh app over the SAME db and uploads dir. Its startup sweep finds the aged file
+    # and calls the REAL _audit_upload_prune closure.
+    app2 = create_managed_app(store_settings=settings, poll_interval=0.05)
+    rows: list[dict[str, object]] = []
+    async with app2.router.lifespan_context(app2):
+        # The sweep runs in a task the lifespan does not await, so poll rather than sleeping a fixed
+        # amount -- a fixed sleep is either flaky or slow, and this is neither.
+        for _ in range(200):
+            rows = [
+                a
+                for a in await app2.state.engine.store.list_audit()
+                if a["action"] == "upload.prune"
+            ]
+            if rows:
+                break
+            await asyncio.sleep(0.02)
+
+    assert len(rows) == 1, (
+        f"the runner's sweep should have pruned exactly the aged file, got {rows}"
+    )
+    assert rows[0]["actor"] == "system", (
+        "the retention runner has no operator and no request behind it; naming the pruned file's "
+        "uploader attributes an automated deletion to someone who did not perform it"
+    )
+    detail = json.loads(str(rows[0]["detail"]))
+    assert detail["uploader"] == "op", (
+        "the owner must survive as DATA in detail -- dropping it would trade a false attribution "
+        "for an unreadable row"
+    )
