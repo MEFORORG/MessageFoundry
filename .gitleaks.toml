@@ -53,3 +53,15 @@ regexes = [
   # the startup error (#1183). Never a real credential; it is chosen to FAIL int() on purpose.
   '''pw-C4st_Val-66''',
 ]
+
+# BACKLOG #1091's `mefor-defaulted-credential` RULE LIVED HERE AND WAS DELIBERATELY REMOVED, not
+# abandoned. It is now a TIP-SCOPED check in tests/test_defaulted_credential_lint.py.
+#
+# THE PLACEMENT WAS THE DEFECT, NOT THE RULE. A LEAKED SECRET and a DEFAULTED CREDENTIAL mean
+# opposite things by history: a leaked value is compromised the moment it is pushed, so scanning all
+# history is CORRECT for it; a defaulted credential is a property of the SHIPPED ARTIFACT, so fixing
+# the tip removes it. security.yml runs gitleaks at fetch-depth 0, and the pattern matched 12 of 14
+# historical revisions of docker/compose.yaml -- so a clean tip could never turn the gate green. That
+# was the scanner doing its job on a rule that was not its business, not a tuning problem.
+#
+# DO NOT RE-ADD IT HERE. Every default rule below still scans full history, which is right for them.
