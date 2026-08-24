@@ -29,12 +29,31 @@
 
 ## 1. Context
 
-### 1.1 What ASVS 12.1.4 asks, in two directions
+### 1.1 What ASVS 12.1.4 asks, and the reading this ADR applies to it
 
-The requirement asks that "proper certificate revocation, such as OCSP stapling, is enabled and
-configured". That sentence covers two independent behaviours, and they have different remedies:
+The requirement is **one sentence**, graded Level 3. Quoted exactly from the ASVS 5.0.0 source the
+vault tracks (`docs/security/asvs-5.0.0-source/OWASP_Application_Security_Verification_Standard_5.0.0_en.csv`,
+line 254):
 
-| # | Direction | The engine's role | The question it answers |
+> Verify that proper certification revocation, such as Online Certificate Status Protocol (OCSP)
+> Stapling, is enabled and configured.
+
+**An earlier revision of this ADR misquoted that sentence** -- as "proper *certificate* revocation,
+such as OCSP stapling" -- and asserted it "covers two independent behaviours". Corrected 2026-08-24
+against the primary source. Two things follow, and **neither moves the verdict**:
+
+* **The sentence names one behaviour and one example.** It contains no "client", no "peer" and no
+  "server". ASVS uses the same `such as` construction one row up (12.1.1, "such as TLS 1.2 and TLS
+  1.3") for a plainly non-exhaustive example, which is internal evidence that the operative noun is
+  *proper certification revocation*. The client-side duty lives in a **different** requirement --
+  12.3.2, Level 2 -- and that one is about *validation*, not revocation.
+* **So the split into directions below is THIS ADR's reading, not the requirement's structure.** It
+  is kept, because it is how the engine's surfaces genuinely differ and the two have different
+  remedies. It is now labelled an interpretation rather than presented as the standard's wording.
+  Whether the reasoning resting on it is amended is an **open owner decision**; the `fail` verdict
+  stands either way, because a contested reading resolves to the worse verdict.
+
+| # | Direction (this ADR's axes, not the requirement's) | The engine's role | The question it answers |
 |---|---|---|---|
 | **1** | **Staple my own status** | **terminating** (the engine is the TLS server) | can a client learn, from my handshake, that my certificate is still good, without fetching from my issuer? |
 | **2** | **Check the peer's status** | **originating** (the engine is the TLS client) | is the certificate this partner just presented revoked? |
@@ -448,9 +467,11 @@ names a fact that is checkable.
 
 ## 7. ASVS linkage
 
-**Requirement: ASVS 12.1.4 (L3), certificate revocation.** A scorecard cell for 12.1.4 may cite this
-ADR as the reasoning for both graded directions. The vocabulary CLAUDE.md fixes applies: the subject
-is the engine, the record lives elsewhere, and this ADR is neither.
+**Requirement: ASVS 12.1.4 (L3), *certification* revocation** -- the standard's noun, quoted in full
+at §1.1. A scorecard cell for 12.1.4 may cite this ADR as the reasoning for both graded directions,
+provided it carries §1.1's caveat that those directions are this ADR's axes rather than the
+requirement's. The vocabulary CLAUDE.md fixes applies: the subject is the engine, the record lives
+elsewhere, and this ADR is neither.
 
 What a cell may take from here:
 
