@@ -79,6 +79,7 @@ tests/test_dependabot_automerge_guardrails.py
 tests/test_docs_runbooks.py
 tests/test_feature_map_claims.py
 tests/test_freethread_smoke_liveness.py
+tests/test_gate_install_receipt.py
 tests/test_gate_installed_parity.py
 tests/test_gate_liveness.py
 tests/test_gate_rule_scan_agreement.py
