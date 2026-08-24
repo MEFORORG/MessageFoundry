@@ -15733,6 +15733,64 @@ cannot tell those apart has never demonstrated it is testing occupancy at all.*
 
 **Expiry:** this stops being right if `claim.ps1` gains a liveness probe, or if worktree directories are
 removed with their sessions.
+## 1339. the blanket-stage guard is wired in no settings file while the record calls it a built control
+
+> 🔢 **Filed 2026-08-23 -- not started. `scripts/hooks/block-blanket-git-stage.ps1` IS REFERENCED BY NO `PreToolUse` MATCHER ANYWHERE ON THIS MACHINE -- 0 of 110 settings files -- WHILE AT LEAST SIX TRACKED SITES DESCRIBE IT AS A LIVE CONTROL, THREE OF THEM IN A CONTROLS TABLE.** Measured independently by three readers within one hour, each carrying a positive control of the same shape: `collision_gate` and `worktree_gate` return 4 and 4 in the two user-level files, so the search fires and the zero is real.
+
+> **IT WAS NEVER WIRED, WHICH IS DIFFERENT FROM HAVING DRIFTED.** `git log -S 'block-blanket-git-stage' -- .claude/settings.json` returns **zero commits**, against a control on `seat-declare-prompt` that returns one. The tracked file wires exactly one hook and it is not this one.
+
+> **AND #327 IS NOT THIS, BECAUSE ITS OWN FIX SHIPPED.** #327 ruled the guard "does not travel" *because* the matcher lived in an untracked file under the ignored `/.claude/` tree. That cause was removed: the file was tracked at `7d873ec6` specifically so it would travel. The guard still is not wired, because nobody ever put it in. "Does not reach a fresh clone" and "is wired nowhere on a fully configured box" are different findings with different fixes, and only the first was answered.
+
+> **THE SHARPEST LIMB, AND IT IS NOT THE PROSE.** [`docs/Secure_AI_Development_Standards.md`](Secure_AI_Development_Standards.md) `:305-317` prints a `settings.json` excerpt captioned *"excerpt -- abridged; the real file has more denies"*, which asserts the lines shown ARE the real file. They are not, in two measured ways. Its deny rules use the `./` anchor (`Read(./.env)`, `Read(./secrets/**)`) -- the exact form `tests/test_claude_settings_contract.py::test_no_deny_rule_uses_the_narrow_dot_anchor` asserts does not exist, while the tracked file carries 27 deny rules and **zero** dot-anchored. Its hook objects carry an `"if"` key that appears in **0 of 4** settings files. **So a reader who applies the documented installation instructions produces a configuration the suite fails.** This is not an uninstalled control. It is an uninstallable one as written, sitting beside a table asserting it is built.
+
+> **WHY NOTHING CAUGHT IT.** `tests/test_claude_settings_contract.py` screens **referenced** hook scripts only -- it walks the handler lists and asserts each reference is anchored and on disk. A script referenced by **no** handler yields an empty reference list, so every assertion passes vacuously. A contract test that cannot fail on absence renders green over the state it was written to catch. `tests/test_blanket_stage_guard.py` exercises the payload thoroughly, so the behaviour is well tested and the wiring is tested by nothing.
+
+> **SCOPE IT TO THE CLAIM, NOT TO ONE SCRIPT.** [`CONTRIBUTING.md`](../CONTRIBUTING.md) `:130-141` is headed *"this repo ships two hooks"* and names `block-blanket-git-stage.ps1` **and** `scripts/worktree/session-context.ps1`. Both measure zero references across the same 110 files.
+
+> **THE FIX MUST BE AN INSTRUMENT, NOT A FOURTH PROSE EDIT.** Three corrections have already been attempted on this claim and each landed a new false statement. Assert that every script under `scripts/hooks/` is either referenced by a matcher in the tracked `settings.json` or named in an explicit, short, reviewed unwired list. **Sequencing:** if the resolution is to wire it, wire only after #1341 -- wiring it first ships that false-deny class to every seat on every clone, and that friction is what gets a control disarmed.
+
+**Cluster:** Developer guardrail / control integrity. **Priority:** P2. **Verdict:** build.
+**Severity:** no deployment axis (sec. 0) -- this guard is coordination tooling and is not shipped in the wheel. **Conditional, per section 0:** nothing is presently exposed, because nothing is running. What is wrong is that the record describes a control governing every session while it governs none, which is the false-premise defect section 11 forbids.
+
+**Related:** #1340 and #1341 (defects in the same guard, both reachable only once this one resolves toward wiring), #327 (the closed item whose premise this supersedes), #1305 (same file family, different axis).
+
+## 1340. the blanket-stage guard enumerates part of the add vocabulary, so git stage -A and six other forms stage everything unblocked
+
+> 🔢 **Filed 2026-08-23 -- not started. SEVEN COMMAND FORMS PERFORM A REAL BLANKET STAGE AND THE GUARD ALLOWS EVERY ONE.** Verified against real git 2.53.0.windows.2, each form first confirmed to actually stage the whole tree, then driven through the committed hook as a subprocess: `git stage -A`, `git stage .`, `git add --update`, `git add :/`, `git add ./`, `git.exe add -A`, `git add -Av`. Discriminating controls in the same run: `git add -A`, `git add -u`, `git add .` and `git commit -am` all DENY.
+
+> **`git stage` NEEDS NO TRICKERY AT ALL.** `stage` is a documented git synonym for `add`. The rule tests `\badd\b`, so the synonym defeats the flag rows **and** the bare-dot row together.
+
+> **THIS IS NOT #1305 AND MUST NOT BE FILED UNDER IT.** #1305's axis is the program NAME -- *"compare the resolved executable, not a spelling"* -- and it is scoped to `worktree_gate.ps1` throughout. Build #1305 exactly as filed and **six of these seven still stage the whole tree**, because they are a subcommand synonym, a missing long flag, two pathspec forms and a flag cluster. Only `git.exe add -A` is #1305's shape. Do not write a closure conditional on #1305 landing: that makes a row in this file depend on a fix in a different file, and it will read as satisfied when it is not.
+
+> **THE UNDECIDED MIDDLE, and both neighbours are already ruled.** #1097 (closed, shipped 2026-08-12) ruled that a gate enumerating part of a flag family is a defect, and replaced the enumeration with a **generating rule**. Separately, the commit branch of *this same guard* already handles a single-dash flag cluster. The add branch, one line above it in the same loop, got neither treatment: a four-member enumeration, no cluster form, no `--update`, no synonym handling. Same file, same loop, one line apart, opposite treatment.
+
+> **NO DECISION WAS RECORDED, so these are not a deliberate pin.** `tests/test_blanket_stage_guard.py` does pin intentional ALLOWs and six known over-denies. None of these seven forms appears anywhere in it.
+
+**Three limbs for whoever builds it.** (1) Subcommand synonym: `stage` alongside `add`. (2) Flag family expressed as a generating rule per #1097's settled method rather than a longer list -- `-A`, `--all`, `-u`, `--update` and single-dash clusters. (3) Whole-tree pathspecs: `.`, `./`, `:/`.
+
+**Cluster:** Developer guardrail / matcher completeness. **Priority:** P3. **Verdict:** build.
+**Severity:** no deployment axis (sec. 0). **Conditional, per section 0:** nothing bites today because the guard runs in no session (#1339), and that is the trap -- the cost arrives all at once if #1339 resolves toward wiring. A guard that denies `git add -A` and allows `git stage -A` is worse than no guard, because a seat will believe the tree is protected.
+
+**Related:** #1339 (priority follows its resolution), #1341 (the opposite failure direction in the same file: this one is a false ALLOW, that one a false DENY -- do not fuse them), #1097 (the settled method), #1305 (same class, different axis).
+
+## 1341. block-blanket-git-stage splits without quote state, so quoted prose reaches program position and denies
+
+> 🔢 **Filed 2026-08-23 -- not started. THE GUARD SPLITS WITH A REGEX THAT CARRIES NO QUOTE OR LINE STATE.** Quoted text after a newline, `;`, `|` or `&` lands at the front of a segment, and the `^git` anchor reads a segment front as program position. Prose that quotes a blanket-stage command is therefore refused: a heredoc writing a doc, a commit message body, a `gh pr create --body`, even a single-line markdown table cell.
+
+> **TWO OF THE REFUSALS ARE NOT PROSE.** `git log --all --grep commit` and `git grep -n add -- .` are read-only and both DENY, because the subcommand and flag tokens are matched **anywhere in the segment** rather than at argv position. That is where this guard's precision problem actually lives.
+
+> **PRE-EXISTING, AND MEASURED AS SUCH.** Every case was driven against the committed guard in its lowercase spelling first, and every one already denied. The case fix widened the class from one spelling to all of them; it created no new class, and across roughly 800 driven payloads nothing flipped from DENY to ALLOW. Six cases are pinned as capitalised/lowercase pairs in `tests/test_blanket_stage_guard.py`, so whoever repairs this flips them deliberately rather than discovering them.
+
+> **IT DOES NOT RIDE #1086, AND THE RETIREMENT STANDARD SETTLES IT.** #1086's fix, as specified in the landed ledger, is a closed enumeration of git message flags governing which quoted spans `Get-ScannableSegments` blanks. Ship it exactly and this hook still splits on a bare regex with no quote state. The repo's own retirement test is *same file, same function, same defect*, and this fails two of three outright. **The two hooks share no code:** `block-blanket-git-stage.ps1` has zero functions, no dot-source and no import, while `Get-ScannableSegments` is defined and called only inside `worktree_gate.ps1`.
+
+> **THE GAP IS ALREADY WRITTEN DOWN TWICE WITH NO NUMBER ATTACHED**, which is why it kept being rediscovered. [`docs/SESSION-DRIFT-CONTROLS.md`](SESSION-DRIFT-CONTROLS.md) row B4: *"the split helper is still not shared with `block-blanket-git-stage.ps1`, so the two hooks can still disagree about what a command is."* And the test module landed with the case fix says the repair *"belongs with the shared segment-scanner work, which has no allocated number here."*
+
+> **BUILD AFTER #1086, NOT BESIDE IT.** Consume whatever helper #1086 produces rather than growing a third scanner. **And carry #1229's measured ruling in:** a program-position test (`Test-GitProgramPosition`, present at `c0d6cef8^` and removed by the revert at `c0d6cef8`) was built and reverted because it bought back false denies at the price of **two new fail-opens**. Whoever redoes it here must measure that axis, not only the false denies -- on a fail-open guard, a fail-open is the direction that loses coverage silently.
+
+**Cluster:** Developer guardrail / command parsing. **Priority:** P3. **Verdict:** build.
+**Severity:** no deployment axis (sec. 0). **Conditional, per section 0:** nothing bites today because the guard runs in no session (#1339). If #1339 resolves toward wiring, this becomes the prerequisite -- a guard that refuses the commit documenting it is exactly the friction that gets a control disarmed.
+
+**Related:** #1339 (priority follows its resolution; this is the prerequisite if that resolves toward wiring), #1340 (opposite failure direction in the same file -- a false ALLOW, not a false DENY), #1086 (same class on the sibling hook, and the source of the helper this should consume), #1229 (the reverted program-position experiment and its two fail-opens), #1306 (the other consumer of the same root cause).
 
 ## 1349. a rescue ref can silently hold an ancestor instead of the tip, and the population where that matters is the population where it cannot be checked
 
