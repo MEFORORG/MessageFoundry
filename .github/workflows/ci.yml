@@ -240,7 +240,8 @@ jobs:
             tests/test_backlog_status_check.py tests/test_sds_rule_ids_are_stable.py
             tests/test_link_resolution.py tests/test_dast_claims.py
             tests/test_claude_section_citations.py tests/test_write_share_denominator.py
-            tests/test_cutover_slug_rot.py tests/test_backlog_citation_check.py"
+            tests/test_cutover_slug_rot.py tests/test_backlog_citation_check.py
+            tests/test_dangling_citation_check.py"
           # Every named module must EXIST. A path typo would otherwise make pytest error on an unknown
           # file, or — worse under a future -k/--ignore form — silently scan nothing and read as a pass.
           for m in $DOC_GUARDS; do
