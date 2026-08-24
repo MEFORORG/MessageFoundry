@@ -336,3 +336,223 @@ def test_a_setext_heading_underline_is_NOT_read_as_a_conflict_marker() -> None:
     text = "A Heading\n=======\n\n## 1. An item\n\nprose\n"
     items = bsc.parse_items(text)
     assert [it.num for it in items] == [1]
+
+
+# --- BACKLOG #1259: the refusal must reach the COMMIT path, and reach it as a REPORT -------------
+
+
+def test_a_conflicted_source_is_reported_with_its_PATH_not_raised(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """``main`` must NAME THE FILE and exit 1, rather than let the ValueError escape.
+
+    Two costs, and the second is the one that matters. A traceback reads as *the checker is broken*
+    rather than *your ledger is conflicted*, which sends an author to the wrong file. And the
+    exception carries a LINE number but no PATH, so with several sources scanned it does not say
+    which one to open -- and this checker scans the published ledger plus every archive file by
+    default.
+    """
+    ledger = tmp_path / "BACKLOG.md"
+    ledger.write_text(
+        "## 1. An item\n\n<<<<<<< HEAD\nmine\n=======\ntheirs\n>>>>>>> other\n", encoding="utf-8"
+    )
+    assert bsc.main(["--backlog", str(ledger)]) == 1
+    err = capsys.readouterr().err
+    assert "BACKLOG.md" in err, "the report must name which source is conflicted"
+    assert "conflict marker" in err
+    assert "Traceback" not in err
+
+
+def test_a_clean_source_still_passes(tmp_path: Path) -> None:
+    """The negative control. A gate that fires on the healthy case is one everybody learns to skip."""
+    ledger = tmp_path / "BACKLOG.md"
+    ledger.write_text("## 1. An item\n\n> \U0001f6a7 open\n\nprose\n", encoding="utf-8")
+    assert bsc.main(["--backlog", str(ledger), "--quiet"]) == 0
+
+
+def test_the_checker_is_WIRED_to_the_commit_path() -> None:
+    """The whole of what #1259 had left, and it is a wiring fact rather than a code one.
+
+    The refusal shipped and protected programmatic readers and CI, while NOTHING called it before a
+    commit. Measured at dd655da2 against a docs/BACKLOG.md carrying a realistic PROSE-level conflict:
+    every wired hook passed, overall rc 0. Asserted on the config rather than by running pre-commit,
+    because the executable resolves from the PRIMARY checkout's venv and is absent from a lane venv --
+    a test that shelled out would skip silently in exactly the trees this repo is developed in.
+
+    A conflict that ADDS A HEADING is already caught incidentally by the ledger gate (both sides'
+    numbers read as unallocated), which is why the case that needed covering is the prose one.
+    """
+    raw = (Path(__file__).resolve().parents[1] / ".pre-commit-config.yaml").read_text(
+        encoding="utf-8"
+    )
+    # Read the DIRECTIVES, never the raw text. Both assertions below name strings this file's own
+    # explanatory comments also contain, and the first draft of this test FAILED on its own prose --
+    # which is the same no-inline-code-stripping shape that makes a certain CI grep read a quoted
+    # token as a claim. A substring check over a commented config cannot tell a wiring from a note
+    # explaining why that wiring was NOT chosen.
+    directives = [
+        line.split("#", 1)[0] for line in raw.splitlines() if line.split("#", 1)[0].strip()
+    ]
+    body = "\n".join(directives)
+    assert "backlog_status_check.py" in body, (
+        "the ledger parse check is not wired into .pre-commit-config.yaml, so a conflicted "
+        "docs/BACKLOG.md commits with every gate green (BACKLOG #1259)"
+    )
+    assert "check-merge-conflict" not in body, (
+        "a generic textual matcher is a SECOND definition of what a readable ledger is; "
+        "CLAUDE.md section 11 requires this file be read through parse_items and nothing else"
+    )
+
+
+# ---------------------------------------------------------------------------
+# BACKLOG #1338 -- a duplicated banner field is invisible to a count-preserving check.
+#
+# `Item.fields` is a dict, so a repeated `> Research:` line overwrote the first and left no trace.
+# Every signal a seat checks after a ledger edit -- item count, open count, even `len(fields)` --
+# is IDENTICAL with and without the duplicate. `test_the_totals_every_seat_checks_cannot_see_it`
+# below is that claim as an executable assertion, and it is why a new FIELD was needed rather than
+# a new check: the reader could not REPRESENT the defect, so nothing downstream could detect it.
+# ---------------------------------------------------------------------------
+
+_OPEN_BANNER = "> \U0001f522 **Filed 2026-08-23 - not started.**"
+
+_WITH_DUP = (
+    "## 9. an item\n\n"
+    f"{_OPEN_BANNER}\n"
+    "> Verdict: build\n"
+    "> Research: none\n"
+    "> Research: done 2026-08-20\n"
+    "\n**Cluster:** x\n"
+)
+
+_WITHOUT_DUP = (
+    f"## 9. an item\n\n{_OPEN_BANNER}\n> Verdict: build\n> Research: none\n\n**Cluster:** x\n"
+)
+
+
+def test_a_duplicated_banner_field_is_recorded_rather_than_silently_overwritten() -> None:
+    """MUST FIRE, and the record must be ACTIONABLE rather than a bare flag.
+
+    Naming only "this item has a duplicate" leaves the reader to find which key and which line,
+    which is the work the record exists to save."""
+    (item,) = bsc.parse_items(_WITH_DUP)
+    assert len(item.duplicate_fields) == 1, item.duplicate_fields
+    key, line, displaced, kept = item.duplicate_fields[0]
+    assert key == "research"
+    assert line == 6, "the record must name the line of the SECOND occurrence"
+    assert displaced == "none", "the overwritten value must survive in the record"
+    assert kept == "done 2026-08-20"
+    assert item.fields["research"] == "done 2026-08-20", "last-one-wins parsing is unchanged"
+
+
+def test_the_same_item_without_the_duplicate_records_nothing() -> None:
+    """MUST NOT FIRE -- the twin, differing by exactly one line.
+
+    Without it, a detector that recorded unconditionally would satisfy the arm above."""
+    (item,) = bsc.parse_items(_WITHOUT_DUP)
+    assert item.duplicate_fields == []
+    assert item.fields["research"] == "none"
+
+
+def test_the_totals_every_seat_checks_cannot_see_it() -> None:
+    """THE ITEM'S THESIS AS AN ASSERTION. This arm is what justifies changing the reader.
+
+    A seat verifying a ledger edit compares item count and open count. Both are identical across
+    these two texts, and so is `len(fields)`, because a duplicate key does not grow a dict. The
+    check every seat quotes therefore reports success over the corrupted row -- and would have
+    done so for 93 duplicated lines, which is the near-miss this item was filed against."""
+    dup = bsc.parse_items(_WITH_DUP)
+    clean = bsc.parse_items(_WITHOUT_DUP)
+
+    assert len(dup) == len(clean), "item count is blind to it"
+    assert sum(1 for i in dup if i.is_open) == sum(1 for i in clean if i.is_open), (
+        "open count is blind to it"
+    )
+    assert len(dup[0].fields) == len(clean[0].fields), (
+        "even the field COUNT is blind to it -- a duplicate key does not grow a dict"
+    )
+
+    # ...and the one signal that is not blind:
+    assert len(dup[0].duplicate_fields) == 1
+    assert clean[0].duplicate_fields == []
+
+
+def test_a_field_key_in_prose_below_the_banner_is_not_a_duplicate() -> None:
+    """MUST NOT FIRE, AND THIS LANDMINE IS REAL RATHER THAN HYPOTHETICAL.
+
+    The item that DOCUMENTS the verdict vocabulary necessarily writes `Verdict: ...` into its own
+    body, and a sibling checker (#1342) hit exactly that. The banner block ends at the first line
+    that is neither blank nor a blockquote, so prose is already out of scope; this pins it."""
+    text = (
+        "## 9. an item\n\n"
+        f"{_OPEN_BANNER}\n"
+        "> Verdict: build\n"
+        "\n"
+        "The vocabulary is `Verdict: build | research | demand-gate`.\n"
+        "> Verdict: research\n"
+    )
+    (item,) = bsc.parse_items(text)
+    assert item.duplicate_fields == [], "a blockquote below the prose is outside the banner block"
+    assert item.fields["verdict"] == "build"
+
+
+def test_two_items_each_declaring_one_verdict_is_not_a_duplicate() -> None:
+    """MUST NOT FIRE. The record is per ITEM, not per file -- otherwise every ledger with more
+    than one item reports hundreds of duplicates and the signal is worthless."""
+    text = (
+        f"## 9. first\n\n{_OPEN_BANNER}\n> Verdict: build\n\n**Cluster:** x\n\n"
+        f"## 10. second\n\n{_OPEN_BANNER}\n> Verdict: build\n\n**Cluster:** y\n"
+    )
+    items = bsc.parse_items(text)
+    assert len(items) == 2
+    assert all(i.duplicate_fields == [] for i in items)
+
+
+def test_the_real_backlog_carries_no_duplicate_banner_field() -> None:
+    """THE OPERATIVE GUARD, with its denominator asserted so a clean result cannot be vacuous.
+
+    A run that parsed nothing and a run that parsed a clean ledger both report zero duplicates.
+    Pinning the population above a floor is what separates them -- the same reason
+    `test_the_docs_scan_actually_covers_something` exists for the citation detector."""
+    present = [
+        (p.relative_to(_ROOT).as_posix(), p.read_text(encoding="utf-8"))
+        for p in _SOURCES
+        if p.exists()
+    ]
+    assert present, "no backlog source exists -- DEFAULT_SOURCES is stale"
+
+    offenders: list[str] = []
+    with_fields = 0
+    for label, text in present:
+        for item in bsc.parse_items(text):
+            if item.fields:
+                with_fields += 1
+            for key, line, displaced, kept in item.duplicate_fields:
+                offenders.append(
+                    f"{label}:{line} item #{item.num} declares {key!r} twice "
+                    f"({displaced!r} overwritten by {kept!r})"
+                )
+
+    assert with_fields > 100, (
+        f"only {with_fields} items carry a banner field -- too few for this guard to mean "
+        "anything, so the zero below would be an artefact of an empty parse, not a result"
+    )
+    assert not offenders, "duplicated banner field(s):\n  " + "\n  ".join(offenders)
+
+
+def test_scan_reports_a_duplicated_banner_field_as_an_error() -> None:
+    """MUST FIRE THROUGH THE CHECKER, not only through the reader.
+
+    The item names THE LEDGER CHECK, and this gate runs ungated on every PR -- including the
+    docs-only shape that introduces a duplicate in the first place. Recording it on the Item
+    without reporting it here would leave the defect visible to nothing that actually runs."""
+    errors, _ = _scan(_WITH_DUP)
+    assert len(errors) == 1, errors
+    assert "declares 'research' twice" in errors[0]
+    assert "'none'" in errors[0] and "'done 2026-08-20'" in errors[0]
+
+
+def test_scan_is_silent_on_the_same_item_without_the_duplicate() -> None:
+    """MUST NOT FIRE -- the twin. A checker that errored unconditionally would pass the arm
+    above while making every ledger unmergeable."""
+    assert _scan(_WITHOUT_DUP)[0] == []

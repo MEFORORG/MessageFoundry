@@ -72,6 +72,7 @@ from messagefoundry.config.settings import (
 from messagefoundry.config.tls_policy import (
     HopDisposition,
     HopPosture,
+    harden_cipher_suites,
     is_loopback_hop_host,
     revocation_hop_disposition,
     tls_revocation_attested,
@@ -607,7 +608,7 @@ _SCHEMA: list[str] = [
     # _schema_hash() automatically — the ADR 0064 bump.
     """CREATE TABLE IF NOT EXISTS search_presets (
         id         TEXT PRIMARY KEY,
-        owner      TEXT NOT NULL,
+        owner_user_id TEXT NOT NULL,
         name       TEXT NOT NULL,
         criteria   TEXT,
         created_at DOUBLE PRECISION NOT NULL,
@@ -624,7 +625,7 @@ _SCHEMA: list[str] = [
     "ALTER TABLE search_presets ADD COLUMN IF NOT EXISTS last_used_at DOUBLE PRECISION",
     # UNIQUE(owner, name) covers the owner-scoped list + the upsert; get/delete use the id PK (no
     # separate owner index needed — ADR 0136, review follow-up).
-    "CREATE UNIQUE INDEX IF NOT EXISTS ux_search_presets_owner_name ON search_presets(owner, name)",
+    "CREATE UNIQUE INDEX IF NOT EXISTS ux_search_presets_owner_name ON search_presets(owner_user_id, name)",
     # Secret-rotation watch state (ASVS 13.3.4, BACKLOG #282) — mirrors the SQLite `secret_rotation_meta`
     # table (store/store.py). One row per tracked secret CLASS. EVERY column is NON-SECRET: `fingerprint`
     # is a keyed MAC (DEK-derived HMAC subkey) OR the DEK's one-way key-id — never the value; the dates are
@@ -728,6 +729,9 @@ def _build_ssl(settings: StoreSettings, *, posture: HopPosture | None = None) ->
         ctx = _ssl.create_default_context()
         ctx.check_hostname = False
         ctx.verify_mode = _ssl.CERT_NONE
+        # Verification is off but the store hop is still encrypted, so the suite list still decides
+        # whether recorded PHI traffic survives a future key compromise (ASVS 12.1.2).
+        harden_cipher_suites(ctx, connector="Postgres store (TLS verification disabled)")
         return ctx
     # #201 (ADR 0078 amendment): the engine->store hop below VERIFIES the peer cert (a pinned CA or the
     # system trust store) but asyncpg rides stdlib ssl, which does NO OCSP/CRL revocation — a
@@ -745,7 +749,14 @@ def _build_ssl(settings: StoreSettings, *, posture: HopPosture | None = None) ->
         # Pin a private / self-signed CA WITHOUT touching the OS trust store: verify the server cert
         # (+ hostname) against this PEM bundle. create_default_context() already sets CERT_REQUIRED +
         # check_hostname=True, so this stays a fully-verifying posture (a bad path raises at connect).
-        return _ssl.create_default_context(cafile=settings.ssl_root_cert)
+        ctx = _ssl.create_default_context(cafile=settings.ssl_root_cert)
+        harden_cipher_suites(ctx, connector="Postgres store (pinned CA)")
+        return ctx
+    # A RESIDUAL, stated rather than papered over: `True` hands asyncpg the job of building the
+    # context, so no context exists in engine code for harden_cipher_suites to assert on. Asserting a
+    # look-alike built here would grade an object the connection never uses. Closing it means building
+    # the verifying default context here and returning it instead, which changes what asyncpg receives
+    # on the DEFAULT store path — a separate decision, not a rider on this change.
     return True  # verifying TLS against the system trust store (the secure default)
 
 
@@ -4074,12 +4085,20 @@ class PostgresStore:
     # --- saved-search presets (ADR 0136, BACKLOG #151) -----------------------
 
     async def upsert_search_preset(
-        self, *, preset_id: str, owner: str, name: str, criteria: str, now: float | None = None
+        self,
+        *,
+        preset_id: str,
+        owner_user_id: str,
+        name: str,
+        criteria: str,
+        now: float | None = None,
     ) -> tuple[str, bool]:
         now = time.time() if now is None else now
         async with self._timed_acquire() as conn, conn.transaction():
             existing = await conn.fetchval(
-                "SELECT id FROM search_presets WHERE owner=$1 AND name=$2", owner, name
+                "SELECT id FROM search_presets WHERE owner_user_id=$1 AND name=$2",
+                owner_user_id,
+                name,
             )
             effective_id = str(existing) if existing is not None else preset_id
             enc = self._enc(criteria, aad=cell_aad("search_presets", "criteria", effective_id))
@@ -4092,10 +4111,10 @@ class PostgresStore:
                 )
                 return effective_id, True
             await conn.execute(
-                "INSERT INTO search_presets (id, owner, name, criteria, created_at, updated_at)"
+                "INSERT INTO search_presets (id, owner_user_id, name, criteria, created_at, updated_at)"
                 " VALUES ($1,$2,$3,$4,$5,$6)",
                 effective_id,
-                owner,
+                owner_user_id,
                 name,
                 enc,
                 now,
@@ -4103,22 +4122,22 @@ class PostgresStore:
             )
             return effective_id, False
 
-    async def list_search_presets(self, owner: str) -> list[dict[str, Any]]:
+    async def list_search_presets(self, owner_user_id: str) -> list[dict[str, Any]]:
         rows = await self._pool.fetch(
             "SELECT id, name, created_at, updated_at FROM search_presets"
-            " WHERE owner=$1 ORDER BY name",
-            owner,
+            " WHERE owner_user_id=$1 ORDER BY name",
+            owner_user_id,
         )
         return [dict(r) for r in rows]
 
     async def get_search_preset(
-        self, *, preset_id: str, owner: str, now: float | None = None
+        self, *, preset_id: str, owner_user_id: str, now: float | None = None
     ) -> dict[str, Any] | None:
         row = await self._pool.fetchrow(
             "SELECT id, name, criteria, created_at, updated_at, last_used_at FROM search_presets"
-            " WHERE id=$1 AND owner=$2",
+            " WHERE id=$1 AND owner_user_id=$2",
             preset_id,
-            owner,
+            owner_user_id,
         )
         if row is None:
             return None
@@ -4138,10 +4157,12 @@ class PostgresStore:
             log.warning("failed to stamp search-preset last_used_at", exc_info=True)
         return out
 
-    async def delete_search_preset(self, *, preset_id: str, owner: str) -> bool:
+    async def delete_search_preset(self, *, preset_id: str, owner_user_id: str) -> bool:
         deleted = _delete_count(
             await self._pool.execute(
-                "DELETE FROM search_presets WHERE id=$1 AND owner=$2", preset_id, owner
+                "DELETE FROM search_presets WHERE id=$1 AND owner_user_id=$2",
+                preset_id,
+                owner_user_id,
             )
         )
         return deleted > 0
@@ -6520,7 +6541,7 @@ class PostgresStore:
             # by Identity.user_id (#1225) with no FK cascade, so without this the rows outlive the
             # account carrying PHI-shaped `criteria` (ADR 0136) that no owner can reach or purge.
             # This leg is CI-only, so a divergence between the three backends surfaces first in CI.
-            await conn.execute("DELETE FROM search_presets WHERE owner=$1", user_id)
+            await conn.execute("DELETE FROM search_presets WHERE owner_user_id=$1", user_id)
             await conn.execute("DELETE FROM users WHERE id=$1", user_id)
 
     async def record_login_success(self, user_id: str, *, now: float | None = None) -> None:

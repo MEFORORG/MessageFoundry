@@ -1358,8 +1358,16 @@ _SCHEMA: list[str] = [
         approver NVARCHAR(256) NULL, decided_at FLOAT NULL, expires_at FLOAT NULL)""",
     """IF INDEXPROPERTY(OBJECT_ID('pending_approvals'),'ix_pending_approvals_status','IndexID') IS NULL
         CREATE INDEX ix_pending_approvals_status ON pending_approvals(status, requested_at)""",
+    # BACKLOG #1268: `username` carries the same binary collation as every other identifier column in
+    # this schema, and it is the one the engine authenticates against. Without it the column inherits
+    # the DATABASE default -- case-INsensitive on a stock install (SQL_Latin1_General_CP1_CI_AS) --
+    # while SQLite (BINARY) and Postgres (TEXT) are both case-SENSITIVE. That made `Admin` and `admin`
+    # two accounts on two backends and one account on the third, under a UNIQUE constraint that reads
+    # as if it had settled the question. Pinning it here makes account identity a property of the
+    # ENGINE rather than of whichever collation an operator's database happened to be created with.
     """IF OBJECT_ID('users','U') IS NULL CREATE TABLE users (
-        id NVARCHAR(64) NOT NULL PRIMARY KEY, username NVARCHAR(256) NOT NULL UNIQUE,
+        id NVARCHAR(64) NOT NULL PRIMARY KEY,
+        username NVARCHAR(256) COLLATE Latin1_General_100_BIN2 NOT NULL UNIQUE,
         auth_provider NVARCHAR(16) NOT NULL, display_name NVARCHAR(256) NULL,
         email NVARCHAR(256) NULL, disabled BIT NOT NULL DEFAULT 0, created_at FLOAT NOT NULL,
         updated_at FLOAT NOT NULL, last_login_at FLOAT NULL, password_hash NVARCHAR(512) NULL,
@@ -1523,7 +1531,7 @@ _SCHEMA: list[str] = [
     # AES-256-GCM-encrypted at rest (id-keyed cell-AAD, in the cipher registry). Adding this DDL moves
     # _schema_hash() — the ADR 0064 bump. NVARCHAR(MAX) body; owner/name capped for the unique index.
     """IF OBJECT_ID('search_presets','U') IS NULL CREATE TABLE search_presets (
-        id NVARCHAR(64) NOT NULL PRIMARY KEY, owner NVARCHAR(256) NOT NULL, name NVARCHAR(256) NOT NULL,
+        id NVARCHAR(64) NOT NULL PRIMARY KEY, owner_user_id NVARCHAR(256) NOT NULL, name NVARCHAR(256) NOT NULL,
         criteria NVARCHAR(MAX) NULL, created_at FLOAT NOT NULL, updated_at FLOAT NOT NULL,
         last_used_at FLOAT NULL)""",
     # #306: last RECALL stamp (get_search_preset), so the retention window keys on last-USED and not
@@ -1534,10 +1542,10 @@ _SCHEMA: list[str] = [
     # byte-identical to pre-#306. Adding this DDL moves _schema_hash() — the ADR 0064 bump.
     """IF COL_LENGTH('search_presets','last_used_at') IS NULL
         ALTER TABLE search_presets ADD last_used_at FLOAT NULL""",
-    # UNIQUE(owner, name) covers the owner-scoped list + the upsert; get/delete use the id PK (no
+    # UNIQUE(owner_user_id, name) covers the owner-scoped list + the upsert; get/delete use the id PK (no
     # separate owner index needed — ADR 0136, review follow-up).
     """IF INDEXPROPERTY(OBJECT_ID('search_presets'),'ux_search_presets_owner_name','IndexID') IS NULL
-        CREATE UNIQUE INDEX ux_search_presets_owner_name ON search_presets(owner, name)""",
+        CREATE UNIQUE INDEX ux_search_presets_owner_name ON search_presets(owner_user_id, name)""",
     # Secret-rotation watch state (ASVS 13.3.4, BACKLOG #282) — mirrors the SQLite `secret_rotation_meta`
     # table (store/store.py). One row per tracked secret CLASS. EVERY column is NON-SECRET: `fingerprint`
     # is a keyed MAC (DEK-derived HMAC subkey) OR the DEK's one-way key-id — never the value; the dates are
@@ -4829,13 +4837,20 @@ class SqlServerStore:
     # --- saved-search presets (ADR 0136, BACKLOG #151) -----------------------
 
     async def upsert_search_preset(
-        self, *, preset_id: str, owner: str, name: str, criteria: str, now: float | None = None
+        self,
+        *,
+        preset_id: str,
+        owner_user_id: str,
+        name: str,
+        criteria: str,
+        now: float | None = None,
     ) -> tuple[str, bool]:
         now = time.time() if now is None else now
         async with self._acquire() as conn, self._cursor(conn) as cur:
             try:
                 await cur.execute(
-                    "SELECT id FROM search_presets WHERE owner=? AND name=?", (owner, name)
+                    "SELECT id FROM search_presets WHERE owner_user_id=? AND name=?",
+                    (owner_user_id, name),
                 )
                 row = await cur.fetchone()
                 effective_id = str(row[0]) if row is not None else preset_id
@@ -4849,8 +4864,8 @@ class SqlServerStore:
                 else:
                     await cur.execute(
                         "INSERT INTO search_presets"
-                        " (id, owner, name, criteria, created_at, updated_at) VALUES (?,?,?,?,?,?)",
-                        (effective_id, owner, name, enc, now, now),
+                        " (id, owner_user_id, name, criteria, created_at, updated_at) VALUES (?,?,?,?,?,?)",
+                        (effective_id, owner_user_id, name, enc, now, now),
                     )
                     replaced = False
                 await self._commit(conn)
@@ -4859,20 +4874,20 @@ class SqlServerStore:
                 await conn.rollback()
                 raise
 
-    async def list_search_presets(self, owner: str) -> list[dict[str, Any]]:
+    async def list_search_presets(self, owner_user_id: str) -> list[dict[str, Any]]:
         return await self._fetchall(
             "SELECT id, name, created_at, updated_at FROM search_presets"
-            " WHERE owner=? ORDER BY name",
-            (owner,),
+            " WHERE owner_user_id=? ORDER BY name",
+            (owner_user_id,),
         )
 
     async def get_search_preset(
-        self, *, preset_id: str, owner: str, now: float | None = None
+        self, *, preset_id: str, owner_user_id: str, now: float | None = None
     ) -> dict[str, Any] | None:
         row = await self._fetchone(
             "SELECT id, name, criteria, created_at, updated_at, last_used_at FROM search_presets"
-            " WHERE id=? AND owner=?",
-            (preset_id, owner),
+            " WHERE id=? AND owner_user_id=?",
+            (preset_id, owner_user_id),
         )
         if row is None:
             return None
@@ -4890,11 +4905,12 @@ class SqlServerStore:
             log.warning("failed to stamp search-preset last_used_at", exc_info=True)
         return row
 
-    async def delete_search_preset(self, *, preset_id: str, owner: str) -> bool:
+    async def delete_search_preset(self, *, preset_id: str, owner_user_id: str) -> bool:
         async with self._acquire() as conn, self._cursor(conn) as cur:
             try:
                 await cur.execute(
-                    "DELETE FROM search_presets WHERE id=? AND owner=?", (preset_id, owner)
+                    "DELETE FROM search_presets WHERE id=? AND owner_user_id=?",
+                    (preset_id, owner_user_id),
                 )
                 deleted = cur.rowcount if cur.rowcount and cur.rowcount > 0 else 0
                 await self._commit(conn)
@@ -9493,7 +9509,7 @@ class SqlServerStore:
                 # rows outlive the account carrying PHI-shaped `criteria` (ADR 0136) that no owner can
                 # reach or purge. This leg is CI-only, so an asymmetry between the three backends
                 # surfaces first in CI rather than here.
-                await cur.execute("DELETE FROM search_presets WHERE owner=?", (user_id,))
+                await cur.execute("DELETE FROM search_presets WHERE owner_user_id=?", (user_id,))
                 await cur.execute("DELETE FROM users WHERE id=?", (user_id,))
                 await self._commit(conn)
             except Exception:

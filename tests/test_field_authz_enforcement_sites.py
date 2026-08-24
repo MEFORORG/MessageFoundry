@@ -200,7 +200,7 @@ async def seeded(tmp_path: Path) -> AsyncIterator[_Seed]:
             assert seeded_user is not None, f"seed user {username!r} was not created"
             preset_id, _replaced = await engine.store.upsert_search_preset(
                 preset_id=f"preset-{username}",
-                owner=seeded_user.id,
+                owner_user_id=seeded_user.id,
                 name="jane",
                 criteria=json.dumps({"content": "JANE", "target": "both", "limit": 50}),
             )

@@ -92,6 +92,61 @@ def key_to_pem(key: PrivateKeyTypes) -> bytes:
     )
 
 
+@dataclass(frozen=True)
+class CrlFacts:
+    """Read-only public facts about one certificate revocation list (BACKLOG #1005).
+
+    The revocation sibling of :class:`CertFacts`, and it keeps that class's conventions exactly:
+    ``days_remaining`` is negative once the CRL is past ``nextUpdate``, and ``expired`` is precisely
+    ``days_remaining < 0``. Same ``86_400`` s/day arithmetic as the expiry monitor.
+
+    **Why a CRL's expiry is an AVAILABILITY fact and not a security one.** Past ``nextUpdate``
+    OpenSSL refuses EVERY client presenting a certificate under that issuer, not merely revoked
+    ones -- measured on CPython 3.14.6 / OpenSSL 3.5.7, verify error 12 ``CRL has expired``. So a
+    CRL nobody refreshed converts a PKI housekeeping lapse into a total interface outage whose
+    first symptom is every partner dropping at once. That is why this is read at construction and
+    alarmed on before expiry, rather than discovered at a partner handshake."""
+
+    issuer: str
+    next_update_iso: str
+    days_remaining: int
+
+    @property
+    def expired(self) -> bool:
+        return self.days_remaining < 0
+
+
+def read_crl_facts(pem: bytes, *, now: float) -> CrlFacts:
+    """Parse a PEM CRL into its public inventory facts, evaluated at ``now`` (epoch seconds).
+
+    Accepts a bundle: a file may concatenate the issuing CA and its CRL, which is exactly the shape
+    ``harden_crl_check`` loads through ``cafile=``. The FIRST ``X509 CRL`` block is read and any
+    certificate blocks are skipped, so the same path serves a bare ``.crl`` and a CA+CRL bundle.
+
+    Raises ``ValueError`` when the bytes carry no CRL at all -- a configured-but-CRL-less file must
+    never degrade to "revocation checking silently off"."""
+    marker = b"-----BEGIN X509 CRL-----"
+    end = b"-----END X509 CRL-----"
+    start = pem.find(marker)
+    if start < 0:
+        raise ValueError("no CRL found in the supplied PEM (expected an 'X509 CRL' block)")
+    stop = pem.find(end, start)
+    if stop < 0:
+        raise ValueError("truncated CRL: an 'X509 CRL' block opened but never closed")
+    crl = x509.load_pem_x509_crl(pem[start : stop + len(end)])
+    nxt = crl.next_update_utc
+    if nxt is None:
+        # RFC 5280 makes nextUpdate optional, but OpenSSL treats a CRL without one as never
+        # expiring, which would silence the freshness control entirely. Refuse rather than
+        # inherit an unbounded lifetime.
+        raise ValueError("the CRL carries no nextUpdate, so its freshness cannot be checked")
+    return CrlFacts(
+        issuer=crl.issuer.rfc4514_string(),
+        next_update_iso=nxt.isoformat(),
+        days_remaining=int((nxt.timestamp() - now) // 86_400),
+    )
+
+
 def read_cert_facts(pem: bytes, *, now: float) -> CertFacts:
     """Parse a PEM certificate into its public inventory facts, evaluated at ``now`` (epoch seconds).
 

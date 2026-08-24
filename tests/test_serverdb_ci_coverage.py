@@ -9,7 +9,7 @@ and does not surface as a skip anywhere a human looks: it silently never runs. S
 holding 83 tests accumulated before this test existed, including engine-shard crash recovery on
 both server backends, the PostgreSQL failover suite, and the DR seed-gate and backup suites.
 
-Two mechanical invariants:
+The mechanical invariants, at least these:
 
 1. **Every module-gated suite is named by at least one workflow step.** Adding one without wiring
    it reds this test, so the wiring decision is forced at authoring time rather than discovered
@@ -19,6 +19,15 @@ Two mechanical invariants:
    A file a leg runs but the alternation does not match is covered only by the nightly cron: editing
    it does not pull the leg that proves it. The regex's own comment already demands this
    ("Keep this in sync with those steps"); nothing enforced it.
+3. **It also admits every engine SOURCE those suites import** (BACKLOG #1322). Invariant 2 binds the
+   ASSERTING file and not the ASSERTED-ON file, so it is structurally blind to a source change that
+   breaks a server-DB assertion. That is not hypothetical: a PR added a key to the ``summary_access``
+   audit detail built in ``messagefoundry/api/app.py``, touched ``api/`` only, so ``serverdb`` was
+   false, the legs never ran on it, and it merged green leaving both server-DB store suites asserting
+   the old shape. Eighteen of the thirty-six imported modules were unmatched when this was measured.
+4. **And it still refuses something.** A regex widened until it matches everything satisfies 2 and 3
+   vacuously while running the container legs on every pull request, so that is asserted separately
+   rather than assumed.
 
 **Scope — module-gated only.** A module whose gate sits on individual tests or on one fixture
 parametrization still executes its ungated (SQLite) cases, so it is not invisible in the same way;
@@ -162,6 +171,114 @@ def test_serverdb_path_gate_admits_every_file_those_legs_run() -> None:
         "does NOT pull the leg that proves it — it is covered only by the nightly cron:\n  "
         + "\n  ".join(unmatched)
         + "\n\nExtend the `tests/test_(...)` alternation to cover them."
+    )
+
+
+def _serverdb_full_pattern() -> re.Pattern[str]:
+    """The WHOLE ``serverdb`` change-detection regex, source arms included.
+
+    ``_serverdb_alternation`` above deliberately extracts only the ``tests/test_(...)`` group,
+    because the invariant IT guards is about test files. This one keeps every arm, because BACKLOG
+    #1322's invariant is about the SOURCES those suites assert against.
+    """
+    for line in CI_YML.read_text(encoding="utf-8").splitlines():
+        if "grep -qE" in line and "tests/test_(" in line:
+            match = re.search(r"grep -qE '(\^\(.*\))'", line)
+            if match:
+                return re.compile(match.group(1))
+    pytest.fail(
+        "could not locate the `serverdb` change-detection regex (a `grep -qE` line containing "
+        "`tests/test_(...)`) in .github/workflows/ci.yml"
+    )
+
+
+def _engine_modules_imported_by_server_db_suites() -> dict[str, str]:
+    """Each ``messagefoundry`` module those suites import, mapped to its repo-relative path.
+
+    A PACKAGE maps to ``pkg/__init__.py``, never ``pkg.py``. Getting that wrong reports a package as
+    unmatched while the directory arm plainly admits it -- a FALSE ALARM, which is the failure that
+    trains readers to discount this test. The first draft of this measurement made exactly that
+    mistake and over-reported the hole.
+    """
+    paths: dict[str, str] = {}
+    for name in sorted(_files_run_by_server_db_steps()):
+        source = REPO_ROOT / "tests" / f"{name}.py"
+        if not source.is_file():
+            continue
+        for node in ast.walk(ast.parse(source.read_text(encoding="utf-8"))):
+            if isinstance(node, ast.ImportFrom):
+                names = [node.module] if (node.module or "").startswith("messagefoundry") else []
+            elif isinstance(node, ast.Import):
+                names = [a.name for a in node.names if a.name.startswith("messagefoundry")]
+            else:
+                continue
+            for module in names:
+                base = str(module).replace(".", "/")
+                for candidate in (f"{base}.py", f"{base}/__init__.py"):
+                    if (REPO_ROOT / candidate).is_file():
+                        paths[str(module)] = candidate
+                        break
+    return paths
+
+
+def test_serverdb_path_gate_admits_every_source_those_suites_import() -> None:
+    """Editing a SOURCE those suites assert against must pull the legs that prove it (#1322).
+
+    The older invariant bound the ASSERTING file and not the ASSERTED-ON file, and could not see
+    this class. It has already fired: a PR added a key to the ``summary_access`` audit detail built
+    in ``messagefoundry/api/app.py``, touched ``api/`` only, so ``serverdb`` was false, the DB legs
+    never ran on that PR, and it merged green leaving both server-DB store suites asserting the old
+    shape.
+
+    IMPORT-REACHABILITY IS A PROXY FOR "ASSERTS AGAINST", and a deliberately WIDE one. It is what a
+    machine can check without running anything, and being wider than the true assertion set costs
+    extra leg-runs rather than missed coverage -- the safe direction for a merge gate.
+    """
+    pattern = _serverdb_full_pattern()
+    imported = _engine_modules_imported_by_server_db_suites()
+    assert imported, (
+        "found no messagefoundry imports in the server-DB-gated suites — either the step parsing "
+        "in _files_run_by_server_db_steps or the AST walk here has drifted"
+    )
+
+    unmatched = sorted(
+        f"{module}  ({path})" for module, path in imported.items() if not pattern.match(path)
+    )
+
+    assert not unmatched, (
+        f"{len(unmatched)} engine source(s) imported by a SQL Server / PostgreSQL suite are not "
+        "matched by the `serverdb` change-detection regex in .github/workflows/ci.yml, so editing "
+        "one does NOT pull the leg that would catch a regression in it — it is covered only by the "
+        "nightly cron, which reports after the fact and cannot stop the merge:\n  "
+        + "\n  ".join(unmatched)
+        + "\n\nExtend the SOURCE arms of that regex to cover them."
+    )
+
+
+def test_the_serverdb_gate_still_refuses_unrelated_paths() -> None:
+    """Guard the guard: an alternation widened to match EVERYTHING passes the test above vacuously.
+
+    That is the specific way the #1322 fix could go wrong -- a gate that admits every path is not a
+    gate, and it would buy a green here while running the container legs on every pull request.
+    """
+    pattern = _serverdb_full_pattern()
+
+    never_engine = [path for path in ("README.md", "docs/BACKLOG.md") if pattern.match(path)]
+    assert not never_engine, (
+        f"the `serverdb` regex admits {never_engine}, which no server-DB leg asserts against — the "
+        "source arms have over-widened"
+    )
+
+    # And SOME engine source must still be refused. Derived rather than hard-coded, so this keeps
+    # working as the tree grows: a named file could legitimately become imported one day.
+    engine = {
+        str(p.relative_to(REPO_ROOT)).replace("\\", "/")
+        for p in (REPO_ROOT / "messagefoundry").rglob("*.py")
+    }
+    assert engine, "found no engine sources — the rglob has drifted"
+    assert any(not pattern.match(path) for path in engine), (
+        "the `serverdb` regex admits EVERY file under messagefoundry/, so it selects nothing and "
+        "the SQL Server / PostgreSQL legs would run on every pull request"
     )
 
 

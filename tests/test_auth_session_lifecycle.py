@@ -11,7 +11,6 @@ import time
 import pytest
 
 from messagefoundry.api.security import ws_token
-from messagefoundry.auth.identity import AuthProvider
 from messagefoundry.auth.ldap import AdPrincipal
 from messagefoundry.auth.service import AuthService
 from messagefoundry.auth.tokens import hash_token, mint_token
@@ -143,12 +142,16 @@ async def test_ad_role_change_on_relogin_revokes_other_sessions() -> None:
         service = AuthService(store, _ad_settings(), ldap=_FakeLdap())  # type: ignore[arg-type]
         await service.initialize()
         await service.set_ad_group_map([("cn=mf-ops,dc=x", "operator")], actor="admin")
-        t1 = (await service.login("jdoe", "pw", provider=AuthProvider.AD)).token
+        # AD PASSWORD LOGIN is retired (BACKLOG #1137); this session is a fixture, so it mints
+
+        # through the surviving tail Kerberos and OIDC both end at.
+
+        t1 = (await service._complete_ad_login(principal, None, mfa_verified=True)).token
         assert t1 is not None and await service.identity_for_token(t1) is not None
 
         # Directory-side role change: the next login resolves different roles.
         await service.set_ad_group_map([("cn=mf-ops,dc=x", "viewer")], actor="admin")
-        t2 = (await service.login("jdoe", "pw", provider=AuthProvider.AD)).token
+        t2 = (await service._complete_ad_login(principal, None, mfa_verified=True)).token
         assert t2 is not None
 
         assert await service.identity_for_token(t1) is None  # prior session revoked on delta
@@ -216,7 +219,11 @@ async def test_local_and_ad_session_expiry_is_unchanged_by_the_cap_seam() -> Non
         created, expires = await _session_for(store, local_token)
         assert expires - created == pytest.approx(absolute, abs=2)
 
-        ad_token = (await service.login("jdoe", "pw", provider=AuthProvider.AD)).token
+        # AD PASSWORD LOGIN is retired (BACKLOG #1137); this session is a fixture, so it mints
+
+        # through the surviving tail Kerberos and OIDC both end at.
+
+        ad_token = (await service._complete_ad_login(principal, None, mfa_verified=True)).token
         assert ad_token is not None
         created, expires = await _session_for(store, ad_token)
         assert expires - created == pytest.approx(absolute, abs=2)
@@ -246,7 +253,9 @@ async def test_ad_login_success_audit_detail_is_byte_identical() -> None:
 
         service = AuthService(store, _ad_settings(), ldap=_FakeLdap())  # type: ignore[arg-type]
         await service.initialize()
-        assert (await service.login("jdoe", "pw", provider=AuthProvider.AD)).ok
+        # AD PASSWORD LOGIN is retired (BACKLOG #1137). The byte-identity property is about the
+        # audit row the SURVIVING directory paths write, so it is pinned on their shared tail.
+        assert (await service._complete_ad_login(principal, None, mfa_verified=True)).ok
 
         rows = [a for a in await store.list_audit() if a["action"] == "auth.login_success"]
         assert len(rows) == 1

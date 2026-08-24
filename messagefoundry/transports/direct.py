@@ -231,6 +231,21 @@ class DirectDestination(DestinationConnector):
                     "Direct destination sends SMTP AUTH credentials over an UNVERIFIED TLS session "
                     "(tls_verify=false); refused — credentials require a verified TLS session"
                 )
+        else:
+            # BACKLOG #1314: the THIRD weakening axis. The chain IS verified here, but with
+            # `tls_check_hostname=false` the peer NAME is not, so any certificate chaining to the
+            # configured anchor is accepted whatever it was issued to -- the AUTH exchange then
+            # hands the credential to a peer whose identity was never established.
+            #
+            # ABSOLUTE, like the two arms above, and deliberately keyed on no escape: in both of
+            # them the escape governs the BODY posture and never the CREDENTIAL. A third arm keeps
+            # that split, so a hop cannot attest its way to a credentialed unverified-name session.
+            if not self.tls_check_hostname and self.username is not None:
+                raise ValueError(
+                    "Direct destination sends SMTP AUTH credentials over a TLS session whose peer "
+                    "NAME is unverified (tls_check_hostname=false); refused — credentials "
+                    "require a session bound to the host, not merely to the trust anchor"
+                )
         # Built once at construction (fail-fast), reused by every send. None when TLS is off entirely.
         # DIRECT does not take a RevocationHopGuard even though the hop now verifies: adding it would
         # make the enumerated count eight and force four "seven verifying hops" docs to change, and the

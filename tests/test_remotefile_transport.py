@@ -35,6 +35,7 @@ from messagefoundry.transports.base import (
     NegativeAckError,
 )
 from messagefoundry.transports.remotefile import (
+    _APPROVED_SFTP_CIPHERS,
     _APPROVED_SFTP_MACS,
     RemoteFileDestination,
     RemoteFileSource,
@@ -800,23 +801,39 @@ class _AuthException(Exception):
 
 
 class _FakeTransport:
-    """Stands in for ``paramiko.Transport``, carrying the real preferred-MAC list.
+    """Stands in for ``paramiko.Transport``, carrying the real preferred-MAC and preferred-cipher lists.
 
-    The connector reads this to derive its ``disabled_algorithms`` (BACKLOG #1171), so the fake has
-    to HAVE it. Production deliberately does not tolerate its absence: a missing attribute there
+    The connector reads these to derive its ``disabled_algorithms`` (BACKLOG #1171), so the fake has
+    to HAVE them. Production deliberately does not tolerate their absence: a missing attribute there
     would yield an empty deny list, which silently restores the weak proposals -- the unsafe
-    direction. A fake that omitted it would push the code toward that tolerance.
+    direction. A fake that omitted one would push the code toward that tolerance.
+
+    Both tuples are copied from paramiko 5.0.0, the version ``constraints.lock`` pins. A copy can go
+    stale against the real library, so ``test_fake_paramiko_algorithm_lists_match_the_installed_library``
+    compares them where the ``[sftp]`` extra is installed -- and SKIPS, loudly, where it is not.
     """
 
     _preferred_macs = (
-        "hmac-sha2-256-etm@openssh.com",
-        "hmac-sha2-512-etm@openssh.com",
         "hmac-sha2-256",
         "hmac-sha2-512",
+        "hmac-sha2-256-etm@openssh.com",
+        "hmac-sha2-512-etm@openssh.com",
         "hmac-sha1",
         "hmac-md5",
         "hmac-sha1-96",
         "hmac-md5-96",
+    )
+
+    _preferred_ciphers = (
+        "aes128-ctr",
+        "aes192-ctr",
+        "aes256-ctr",
+        "aes128-cbc",
+        "aes192-cbc",
+        "aes256-cbc",
+        "3des-cbc",
+        "aes128-gcm@openssh.com",
+        "aes256-gcm@openssh.com",
     )
 
 
@@ -851,6 +868,27 @@ def test_sftp_unknown_host_key_accepted_with_escape(monkeypatch: pytest.MonkeyPa
     assert client._accept_unknown is True  # AutoAddPolicy will be selected (logged loudly)
 
 
+def _sftp_connect_kwargs(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
+    """Drive ``_SftpClient._connect`` against the fake paramiko and return what it passed to connect.
+
+    One capture path for every negotiation test: each one asserts about a different key of the same
+    ``disabled_algorithms`` argument, and a per-test copy of the plumbing is a place for them to
+    diverge without anyone noticing.
+    """
+    captured: dict[str, Any] = {}
+
+    class _CapturingClient(_FakeSSHClient):
+        def connect(self, **kw: Any) -> None:
+            captured.update(kw)
+
+    class _Paramiko(_FakeParamiko):
+        SSHClient = _CapturingClient
+
+    monkeypatch.setattr(remotefile, "_import_paramiko", lambda: _Paramiko)
+    _SftpClient({"host": "h", "port": 22, "remote_dir": "/in"})._connect()
+    return captured
+
+
 def test_sftp_proposes_no_weak_mac_and_the_check_cannot_pass_vacuously(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -866,25 +904,13 @@ def test_sftp_proposes_no_weak_mac_and_the_check_cannot_pass_vacuously(
     paramiko that renamed ``_preferred_macs``) would produce. So the surviving set is asserted
     NON-EMPTY first. A connector that proposes nothing is a different defect, not a pass.
     """
-    captured: dict[str, Any] = {}
     # _FakeTransport carries the real paramiko preferred list, weak members INCLUDED -- that fixture
     # is the thing under test, so the subtraction has to remove them rather than the fixture omitting
     # them. Referenced rather than re-declared here: two copies of the list would drift, and the copy
     # that drifted would be the one asserting safety.
     offered = _FakeTransport._preferred_macs
 
-    class _CapturingClient(_FakeSSHClient):
-        def connect(self, **kw: Any) -> None:
-            captured.update(kw)
-
-    class _Paramiko(_FakeParamiko):
-        SSHClient = _CapturingClient
-
-    monkeypatch.setattr(remotefile, "_import_paramiko", lambda: _Paramiko)
-    client = _SftpClient({"host": "h", "port": 22, "remote_dir": "/in"})
-    client._connect()
-
-    disabled = captured["disabled_algorithms"]["mac"]
+    disabled = _sftp_connect_kwargs(monkeypatch)["disabled_algorithms"]["macs"]
     effective = [m for m in offered if m not in disabled]
 
     # POSITIVE CONTROL FIRST: the connector still proposes something.
@@ -897,6 +923,121 @@ def test_sftp_proposes_no_weak_mac_and_the_check_cannot_pass_vacuously(
     assert not weak, f"the SFTP connector still proposes a disallowed-hash MAC: {weak}"
     # And the allow-list itself cannot acquire one without this reddening.
     assert not [m for m in _APPROVED_SFTP_MACS if "md5" in m.lower() or "sha1" in m.lower()]
+
+
+def test_sftp_proposes_only_encrypt_then_mac(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Every MAC the connector still proposes must be an ``-etm@openssh.com`` name.
+
+    Encrypt-then-MAC is the composition order ASVS 11.3.5 asks about. The plain ``hmac-sha2-256`` /
+    ``hmac-sha2-512`` names are SSH's Encrypt-and-MAC: the tag covers the PLAINTEXT, so a receiver
+    decrypts attacker-chosen ciphertext before it can authenticate it. Same hash, wrong order -- a
+    sound hash is why the two are easy to leave in, not a reason to.
+
+    THE CONTROLS COME FIRST, AND ONLY THE LAST ASSERTION IS THE CLAIM. "No Encrypt-and-MAC name
+    survives" passes for free against an empty surviving set, and equally for free against a fixture
+    that offered no Encrypt-and-MAC name to begin with; both are checked before the claim is read.
+    The empty-deny-list check between them is not a vacuity guard -- an empty deny list would make
+    the claim FAIL -- it is there so that failure names the broken subtraction rather than making a
+    reader infer it from a list of survivors.
+    """
+    offered = _FakeTransport._preferred_macs
+    disabled = _sftp_connect_kwargs(monkeypatch)["disabled_algorithms"]["macs"]
+    effective = [m for m in offered if m not in disabled]
+
+    # CONTROL 1: the fixture really does offer a non-ETM name for the subtraction to remove.
+    assert [m for m in offered if not m.endswith("-etm@openssh.com")], (
+        "the fake's preferred-MAC list carries no Encrypt-and-MAC name, so this test would pass "
+        "without the connector doing anything. Restore the real paramiko list."
+    )
+    # CONTROL 2: the subtraction found something. An empty deny list would redden the claim below
+    # rather than hiding it, so this assertion is for the message a reader gets, not for the coverage.
+    assert disabled, (
+        "the derived MAC deny list is EMPTY -- the allow-list subtracted nothing, which is what a "
+        "renamed paramiko attribute looks like. Every Encrypt-and-MAC name would be proposed."
+    )
+    # CONTROL 3: the connector still proposes something.
+    assert effective, (
+        "every MAC was disabled -- the connector would propose none and negotiation would fail. "
+        f"disabled={disabled}"
+    )
+    encrypt_and_mac = [m for m in effective if not m.endswith("-etm@openssh.com")]
+    assert not encrypt_and_mac, (
+        f"the SFTP connector still proposes an Encrypt-and-MAC name: {encrypt_and_mac}"
+    )
+    # And the allow-list itself cannot acquire one without this reddening.
+    assert all(m.endswith("-etm@openssh.com") for m in _APPROVED_SFTP_MACS)
+
+
+def test_sftp_proposes_no_cbc_or_undersized_cipher_and_the_check_cannot_pass_vacuously(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The connector must constrain the CIPHER proposal too, not just the MAC.
+
+    paramiko 5.0.0's preferred cipher list carries ``aes128-cbc``, ``aes192-cbc``, ``aes256-cbc`` and
+    ``3des-cbc``. CBC in SSH is what the chosen-ciphertext plaintext-recovery attack of CVE-2008-5161
+    targets; 3DES adds a 64-bit block (Sweet32) and roughly 112 bits of effective strength, under the
+    128-bit floor. With no cipher deny list the shipped connector OFFERS all four, and a server that
+    selects one gets it -- the same defect the MAC arm above fixes, one key over in the same argument.
+
+    The FIRST assertion is that the ``cipher`` key exists at all. Reading a missing key would raise,
+    which is a red test, but the message a reader gets should name the control that is absent rather
+    than a KeyError.
+    """
+    offered = _FakeTransport._preferred_ciphers
+    disabled_algorithms = _sftp_connect_kwargs(monkeypatch)["disabled_algorithms"]
+
+    assert "ciphers" in disabled_algorithms, (
+        "the connector passed no cipher deny list, so paramiko's full default proposal -- CBC and "
+        f"3DES included -- would go on the wire. keys passed: {sorted(disabled_algorithms)}"
+    )
+    disabled = disabled_algorithms["ciphers"]
+    effective = [c for c in offered if c not in disabled]
+
+    # CONTROL 1: the fixture really does offer a weak cipher for the subtraction to remove. Against a
+    # fixture that offered none, the claim below passes without the connector doing anything.
+    assert [c for c in offered if c.endswith("-cbc") or c.startswith("3des")], (
+        "the fake's preferred-cipher list carries no CBC or 3DES name, so this test would pass for "
+        "free. Restore the real paramiko list."
+    )
+    # CONTROL 2: the subtraction found something. An empty deny list is what a renamed paramiko
+    # attribute produces. It would redden the claim below rather than hiding it, so this assertion is
+    # for the message a reader gets, not for the coverage.
+    assert disabled, (
+        "the derived cipher deny list is EMPTY -- the allow-list subtracted nothing, which is what a "
+        "renamed paramiko attribute looks like. Every weak cipher would be proposed."
+    )
+    # CONTROL 3: the connector still proposes something.
+    assert effective, (
+        "every cipher was disabled -- the connector would propose none and negotiation would fail. "
+        f"disabled={disabled}"
+    )
+    weak = [c for c in effective if c.endswith("-cbc") or c.startswith("3des")]
+    assert not weak, f"the SFTP connector still proposes a CBC or undersized cipher: {weak}"
+    # And the allow-list itself cannot acquire one without this reddening.
+    assert not [c for c in _APPROVED_SFTP_CIPHERS if c.endswith("-cbc") or c.startswith("3des")]
+
+
+def test_fake_paramiko_algorithm_lists_match_the_installed_library() -> None:
+    """The fake's copies of paramiko's preferred lists are the real ones -- checked, where it can be.
+
+    The negotiation tests above subtract the allow-lists from a HARDCODED copy of paramiko 5.0.0's
+    ``_preferred_macs`` and ``_preferred_ciphers``. A copy can go stale, and a stale copy would let
+    those tests stay green while the real library proposed something nobody had graded.
+
+    This test SKIPS where the ``[sftp]`` extra is not installed, which is the default: the extra is
+    not in the dev install and CI's test legs do not add it. A skip is reported as a skip and not as
+    a pass, which is the honest reading -- the comparison did not happen, so it claims nothing.
+    """
+    try:
+        import paramiko
+    except ImportError:
+        pytest.skip(
+            "the [sftp] extra is not installed, so paramiko's real preferred lists cannot be read "
+            "here and the fake's copies go unverified. Install 'messagefoundry[sftp]' to check them."
+        )
+
+    assert tuple(paramiko.Transport._preferred_macs) == _FakeTransport._preferred_macs
+    assert tuple(paramiko.Transport._preferred_ciphers) == _FakeTransport._preferred_ciphers
 
 
 # === egress allowlist ([egress].allowed_remote) ==============================
@@ -1295,3 +1436,61 @@ async def test_a_safe_entry_beside_a_hostile_one_still_flows(
     src._handler = h
     await src._poll_once()
     assert h.bodies == [rb"MSH|^~\&|A"]
+
+
+# --- the key names ARE the control -------------------------------------------------------------
+#
+# This pair exists because the shipped control was INERT and every test in this file stayed green.
+# `disabled_algorithms` was passed as {"mac": ...}; paramiko reads "macs". `_filter_algorithm` does
+# `self.disabled_algorithms.get(type_, [])`, so a singular key returns the empty default and every
+# weak algorithm stays on the wire. paramiko neither validates the keys nor warns about an unknown
+# one, so nothing anywhere reported a problem.
+#
+# The old tests could not catch it because they READ THE SAME WRONG KEY the production code wrote,
+# then recomputed the subtraction by hand against the fake. Test and code agreed on a fiction. Their
+# "cannot pass vacuously" guard fired on an EMPTY deny list -- the renamed-attribute failure -- while
+# a WRONG KEY yields a fully populated deny list that paramiko silently ignores.
+#
+# So the first test below pins the literal key names and runs EVERYWHERE, including where paramiko
+# is absent, which is the environment this repository's CI test legs actually use. The second checks
+# those literals against the installed library when there is one. Neither alone is enough: the first
+# cannot know the names are right, and the second does not run often enough to rely on.
+
+_PARAMIKO_DISABLED_ALGORITHM_KEYS = frozenset(
+    {"ciphers", "macs", "keys", "pubkeys", "kex", "compression"}
+)
+
+
+def test_disabled_algorithms_uses_plural_keys_and_this_test_runs_without_paramiko(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The regression guard for an inert control. Asserts the EXACT key set the connector passes."""
+    passed = _sftp_connect_kwargs(monkeypatch)["disabled_algorithms"]
+    assert set(passed) == {"macs", "ciphers"}, (
+        f"the connector passed {sorted(passed)}. paramiko reads {sorted(_PARAMIKO_DISABLED_ALGORITHM_KEYS)}; "
+        "a key outside that set disables NOTHING and the weak algorithms stay on the wire."
+    )
+    # Belt and braces: every key must be one paramiko actually consults, so a future third arm
+    # ("kex", say) cannot be added under a singular name and go quietly inert the same way.
+    assert set(passed) <= _PARAMIKO_DISABLED_ALGORITHM_KEYS
+    # CONTROL: the deny lists must be non-empty, or the right key would be carrying nothing.
+    assert passed["macs"] and passed["ciphers"]
+
+
+def test_the_pinned_key_names_match_the_installed_paramiko() -> None:
+    """Check the literals above against the real library when it is importable.
+
+    Skips honestly where the ``[sftp]`` extra is absent -- which is most environments here -- rather
+    than asserting a comparison it did not make. The test above is the one that always runs.
+    """
+    paramiko = pytest.importorskip("paramiko", reason="the [sftp] extra is not installed")
+    import inspect
+    import re
+
+    src = inspect.getsource(paramiko.transport)
+    called_with = set(re.findall(r"""_filter_algorithm\(\s*["']([a-z]+)["']""", src))
+    assert called_with, "control: found no _filter_algorithm call sites, so this proves nothing"
+    assert {"macs", "ciphers"} <= called_with, (
+        f"installed paramiko {paramiko.__version__} filters on {sorted(called_with)}; the connector's "
+        "keys are no longer the ones it reads, so the control is inert again."
+    )

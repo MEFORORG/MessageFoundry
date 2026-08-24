@@ -33,7 +33,7 @@ from typing import TYPE_CHECKING, Any
 
 from messagefoundry.config.settings import CertMonitorSettings
 from messagefoundry.pipeline.alerts import AlertSink, LoggingAlertSink
-from messagefoundry.pki import read_cert_facts
+from messagefoundry.pki import read_cert_facts, read_crl_facts
 
 if TYPE_CHECKING:
     from messagefoundry.config.wiring import Registry
@@ -61,6 +61,11 @@ class MonitoredCert:
 
     label: str
     path: str
+    #: ``"cert"`` or ``"crl"`` (BACKLOG #1005). Defaults so every existing construction is unchanged.
+    #: A CRL is watched by the same monitor because the operator question is identical -- "is a file
+    #: I depend on about to expire" -- but it alerts down a SEPARATE sink method, because an expired
+    #: CRL refuses every client rather than degrading one identity.
+    kind: str = "cert"
 
 
 @dataclass(frozen=True)
@@ -72,6 +77,7 @@ class CertCheck:
     path: str
     not_after_iso: str
     days_remaining: int
+    kind: str = "cert"
 
     @property
     def expired(self) -> bool:
@@ -123,6 +129,13 @@ def certs_from_registry(
             ib_path = ib.spec.settings.get("tls_cert_file")
             if isinstance(ib_path, str) and ib_path:
                 certs.append(MonitoredCert(ib.name, ib_path))
+            # BACKLOG #1005: a configured CRL expires like a certificate, and unrefreshed it takes
+            # the listener DOWN -- past nextUpdate OpenSSL refuses every client, not just revoked
+            # ones. Inbound only: a CRL verifies the peers we REQUIRE certificates from, and only an
+            # inbound listener does that.
+            ib_crl = ib.spec.settings.get("tls_crl_file")
+            if isinstance(ib_crl, str) and ib_crl:
+                certs.append(MonitoredCert(ib.name, ib_crl, kind="crl"))
         for ob in registry.outbound.values():
             ob_path = ob.spec.settings.get("tls_cert_file")
             if isinstance(ob_path, str) and ob_path:
@@ -245,6 +258,19 @@ class CertExpiryRunner:
                 continue
             checks.append(check)
             if check.days_remaining <= self._settings.warn_days:
+                if check.kind == "crl":
+                    try:
+                        self._alert_sink.crl_expiry(
+                            check.label,
+                            path=check.path,
+                            not_after=check.not_after_iso,
+                            days_remaining=check.days_remaining,
+                        )
+                    except Exception:
+                        log.warning(
+                            "crl_expiry alert sink failed for %r", check.label, exc_info=True
+                        )
+                    continue
                 # The sink never raises (contract), but be defensive — one bad sink call must not
                 # abort the scan of the remaining certs.
                 try:
@@ -264,6 +290,15 @@ class CertExpiryRunner:
         try:
             with open(cert.path, "rb") as fh:
                 pem = fh.read()
+            if cert.kind == "crl":
+                crl_facts = read_crl_facts(pem, now=now)
+                return CertCheck(
+                    label=cert.label,
+                    path=cert.path,
+                    not_after_iso=crl_facts.next_update_iso,
+                    days_remaining=crl_facts.days_remaining,
+                    kind="crl",
+                )
             facts = read_cert_facts(pem, now=now)
         except FileNotFoundError:
             log.warning("cert_expiry: certificate for %r not found: %s", cert.label, cert.path)

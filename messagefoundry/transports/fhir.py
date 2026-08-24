@@ -68,7 +68,6 @@ from messagefoundry.transports.rest import (
     _expiry_relaxed_opener,
     _insecure_opener,
     _no_redirect_opener,
-    _NoRedirectHandler,
     _redact_url,
     capture_response_headers,
     cleartext_acceptance_from_settings,
@@ -409,7 +408,10 @@ class FhirDestination(DestinationConnector):
                     "(mutually exclusive — configure exactly one)"
                 )
             if self._opener is _NO_REDIRECT_OPENER:
-                self._opener = urllib.request.build_opener(_NoRedirectHandler)
+                # _no_redirect_opener, not a bare build_opener: the bare form lets urllib fill in an
+                # HTTPSHandler whose context the engine never names, so the forward-secrecy assertion
+                # cannot reach this hop (ASVS 12.1.2).
+                self._opener = _no_redirect_opener()
             self._opener.add_handler(digest)
 
     def _build_headers(self, s: dict[str, Any]) -> dict[str, str]:

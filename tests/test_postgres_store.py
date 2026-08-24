@@ -3058,10 +3058,10 @@ async def test_purge_search_presets_pg(store) -> None:
     """
     try:
         await store.upsert_search_preset(
-            preset_id="pg-stale", owner="alice", name="stale", criteria="{}", now=0.0
+            preset_id="pg-stale", owner_user_id="alice", name="stale", criteria="{}", now=0.0
         )
         await store.upsert_search_preset(
-            preset_id="pg-fresh", owner="alice", name="fresh", criteria="{}", now=40 * DAY
+            preset_id="pg-fresh", owner_user_id="alice", name="fresh", criteria="{}", now=40 * DAY
         )
 
         assert await store.purge_search_presets(older_than=30 * DAY) == 1
@@ -3083,10 +3083,12 @@ async def test_search_preset_retention_keys_on_last_used_pg(store) -> None:
     try:
         for pid, name in (("pg-used", "used"), ("pg-idle", "idle"), ("pg-legacy", "legacy")):
             await store.upsert_search_preset(
-                preset_id=pid, owner="alice", name=name, criteria="{}", now=0.0
+                preset_id=pid, owner_user_id="alice", name=name, criteria="{}", now=0.0
             )
         # The recall stamps last_used_at past the cutoff...
-        got = await store.get_search_preset(preset_id="pg-used", owner="alice", now=40 * DAY)
+        got = await store.get_search_preset(
+            preset_id="pg-used", owner_user_id="alice", now=40 * DAY
+        )
         assert got is not None and got["last_used_at"] is None  # PRE-stamp snapshot
         async with store._pool.acquire() as conn:
             stamped = await conn.fetchval(
@@ -3406,7 +3408,7 @@ async def test_summary_access_census_survives_and_coalesces_pg(store) -> None:
     await c.note(store, "alice", "ch1", 1, 3600.0)  # hour 1 -> flush hour-0 window (count 5)
     rows = [r for r in await store.list_audit() if r["action"] == "summary_access"]
     assert len(rows) == 1
-    assert json.loads(rows[0]["detail"]) == {"count": 5, "window_start": 0}
+    assert json.loads(rows[0]["detail"]) == {"count": 5, "masked": 0, "window_start": 0}
     assert rows[0]["actor"] == "alice" and rows[0]["channel_id"] == "ch1"
 
     await c.note(store, "bob", "", 4, 3600.0)  # hour 1, scope "" -> channel_id NULL

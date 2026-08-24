@@ -16,7 +16,7 @@ import pytest
 from _totp_clock import fresh_totp, pin_totp_clock
 
 from messagefoundry.auth import totp
-from messagefoundry.auth.identity import AuthProvider, Identity
+from messagefoundry.auth.identity import Identity
 from messagefoundry.auth.ldap import AdPrincipal
 from messagefoundry.auth.notifications import MFA_DISABLED, MFA_ENABLED, SecurityEvent
 from messagefoundry.auth.service import AuthService
@@ -298,7 +298,10 @@ async def test_ad_login_is_mfa_satisfied_by_delegation() -> None:
         await service.initialize()
         await service.set_ad_group_map([("CN=MF-Admins,DC=x", "administrator")], actor="admin")
 
-        out = await service.login("jdoe", "pw", provider=AuthProvider.AD)
+        # The subject is DELEGATED MFA, not the login mechanism. The simple-bind pathway is retired
+        # (BACKLOG #1137), so this mints the session through _complete_ad_login -- the shared tail
+        # where mfa_verified is stamped, reached identically by Kerberos and OIDC.
+        out = await service._complete_ad_login(principal, None, mfa_verified=True)
         assert out.ok and out.token is not None
         assert out.mfa_required is False  # delegated to the directory, never an engine TOTP
         assert await service.mfa_satisfied(out.token) is True

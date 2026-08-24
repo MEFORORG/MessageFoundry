@@ -311,6 +311,84 @@ function ConvertTo-WorktreeSlug([string]$Branch) {
 # resolved to `../elsewhere` and allowed a swap of the tree the git call had already acted on. A prefix
 # that is ambiguous -- `popd`, `cd -`, a subshell, or more than one `cd` -- falls back to the session cwd,
 # which is the DENY-side default.
+# --- BACKLOG #1059: shell variable indirection -------------------------------
+#
+# The gate reads a tool ARGUMENT before anything runs, so a variable's value is generally a runtime
+# fact no static resolver can follow. That much was already recorded as a pinned residual, and it is
+# TRUE FOR COMPUTED VALUES. It is NOT true of the two spellings the residual actually pinned:
+#
+#     p="<governed wt>"; git worktree remove "$p"
+#     p=../Primary-wt;   git worktree remove "$p"
+#
+# Both assign from a LITERAL, in the SAME line the gate is already holding. A segment here is a LINE
+# (see Get-ScannableSegments), so the assignment is not somewhere else in the process -- it is in
+# the string under the scanner's nose. The residual's justification was broader than its own test
+# data, which is why two gate versions passed over this.
+#
+# SCOPE, AND IT IS DELIBERATELY THE STATICALLY-KNOWABLE SUBSET ONLY. Anything computed -- `$(...)`,
+# a reference to another variable, an environment value, a value set on an earlier line -- returns
+# $null and the caller keeps today's behaviour. This closes accidental indirection, which is what a
+# GUARDRAIL is for; it does not pretend to stop a deliberate evasion, and the gate's own .SYNOPSIS
+# already says it is not a security boundary.
+
+function Get-LiteralAssignments([string]$Prefix) {
+    <#
+    Variable name -> literal value, for assignments in ``$Prefix`` whose value is a plain literal.
+
+    A value carrying `$`, `%` or a backtick is NOT a literal -- it is another indirection, and
+    resolving it would be guessing. Those are skipped, so the name stays unresolved and the caller
+    refuses rather than substituting something it cannot stand behind.
+    #>
+    $map = @{}
+    # POSIX `NAME=VALUE` at a command position, plus cmd's `set NAME=VALUE`. Anchored on a command
+    # boundary so `--opt=x` and a bare `a=b` inside a longer token are not read as assignments.
+    $pattern = '(?:^|[;&|]|\s)(?:set\s+)?(?<n>[A-Za-z_][A-Za-z0-9_]*)=(?<v>"[^"]*"|''[^'']*''|[^\s;&|]*)'
+    foreach ($m in [regex]::Matches($Prefix, $pattern)) {
+        $v = $m.Groups['v'].Value
+        if ($v.Length -ge 2) {
+            $first = $v[0]; $last = $v[$v.Length - 1]
+            if (($first -eq '"' -and $last -eq '"') -or ($first -eq "'" -and $last -eq "'")) {
+                $v = $v.Substring(1, $v.Length - 2)
+            }
+        }
+        # \x24 = $, \x25 = %, \x60 = backtick. Written as hex so the class cannot be broken by the
+        # quoting of whatever edits this line next -- a `$` inside a PowerShell string is a live wire.
+        if ($v -match '[\x24\x25\x60]') { continue }
+        $map[$m.Groups['n'].Value] = $v
+    }
+    $map
+}
+
+function Resolve-ShellIndirection([string]$Token, [string]$Prefix) {
+    <#
+    ``$Token`` with every variable reference replaced by a literal assigned in ``$Prefix``, or
+    ``$null`` when it cannot be resolved WITHOUT GUESSING.
+
+    $null is the honest answer, not a failure: it means the value is a runtime fact. The caller
+    decides what to do with that, and today it keeps existing behaviour so this change can only
+    convert an ALLOW the gate could already have decided -- never alter one it could not.
+    #>
+    # \x24 = $, \x25 = %. No sigil at all is the overwhelmingly common case: return unchanged so the
+    # ordinary path pays nothing.
+    if ($Token -notmatch '[\x24\x25]') { return $Token }
+
+    $refPattern = '\$\{(?<n>[A-Za-z_][A-Za-z0-9_]*)\}|\$(?<n>[A-Za-z_][A-Za-z0-9_]*)|%(?<n>[A-Za-z_][A-Za-z0-9_]*)%'
+    $refs = [regex]::Matches($Token, $refPattern)
+    # A sigil we do NOT model -- `$(...)`, `$1`, a bare `$` -- is unresolvable by construction.
+    if ($refs.Count -eq 0) { return $null }
+
+    $map = Get-LiteralAssignments $Prefix
+    foreach ($r in $refs) {
+        if (-not $map.ContainsKey($r.Groups['n'].Value)) { return $null }
+    }
+    $out = $Token
+    foreach ($r in $refs) { $out = $out.Replace($r.Value, $map[$r.Groups['n'].Value]) }
+    # A sigil surviving substitution means a literal itself contained one, so the result is still
+    # partly unresolved. Half-resolved is worse than unresolved: it looks decided.
+    if ($out -match '[\x24\x25]') { return $null }
+    $out
+}
+
 function Get-GitTargetCandidatesRaw([string]$Line, [string]$Prefix, [string]$CwdRaw) {
     $out = @()
 
@@ -344,7 +422,31 @@ function Get-GitTargetCandidatesRaw([string]$Line, [string]$Prefix, [string]$Cwd
 #
 # Three false positives came from scanning the raw string: a two-line command whose second line read
 # `echo about to merge stuff` denied with verb=merge; `echo "git checkout main"` denied; and
-function Remove-QuotedSpans([string]$s) {
+function Remove-QuotedSpans([string]$s, [bool]$PosixEscapes = $false) {
+    <#
+    ``$PosixEscapes`` -- DOES THIS HOST TREAT A BACKSLASH AS AN ESCAPE? (BACKLOG #1229 residual, second
+    round.) `sh` does; **PowerShell does NOT** -- its escape is the BACKTICK, so `"C:\Temp\"` is a
+    COMPLETE string there and whatever follows it RUNS.
+
+    THIS PARAMETER EXISTS BECAUSE ITS ABSENCE RE-CREATED #1229's OWN DEFECT ON THE OTHER HOST. The
+    first version of this fix honoured the escape unconditionally, which is correct POSIX -- but line
+    999 scans BOTH tool names through ONE matcher, so on a PowerShell payload the scan held a span open
+    that PowerShell had already closed, straddled the live command between it and a later quote, and
+    blanked it. MEASURED on the shipped fix, both tool names:
+
+        Write-Output "C:\Temp\" ; git -C <governed> reset --hard ; Write-Output "x"     ALLOW
+        ... same line with ONE FEWER backslash (control)                                DENY
+        ... same line with TWO backslashes (even count)                                 DENY
+
+    An ODD count before the closer was the trigger. Verified the middle statement really executes with
+    an inert payload that COMPUTES rather than echoes, so an echo-back could not be mistaken for a run.
+
+    DEFAULT IS $false, AND THE DIRECTION IS THE WHOLE POINT. Honouring the escape makes spans LONGER,
+    so it BLANKS MORE and can hide a command -- fail OPEN. Refusing it makes spans shorter, leaving more
+    text visible to the rules -- fail CLOSED. An unknown or unrecognised host therefore gets the
+    conservative reading, and only a host known to use backslash escapes opts in.
+    #>
+
     <#
     Blank every quoted span in ONE LEFT-TO-RIGHT PASS, so the quote that OPENS FIRST owns the span and
     the other quote character is an ordinary literal inside it -- which is what a POSIX shell does.
@@ -375,12 +477,67 @@ function Remove-QuotedSpans([string]$s) {
     for ($i = 0; $i -lt $s.Length; $i++) {
         $ch = $s[$i]
         if ($quote -eq [char]0) {
-            if ($ch -eq '"' -or $ch -eq "'") { $quote = $ch; $openAt = $i }
+            # A BACKSLASH ESCAPE OUTSIDE A SPAN IS A LITERAL AND OPENS NOTHING (BACKLOG #1229
+            # residual). `\"` is an ordinary character to the shell, so the command around it RUNS --
+            # but this scan treated it as an opener, paired it with the next escaped quote, and blanked
+            # the live command between them. Same straddle as the two-regex defect above, one character
+            # class over, and RULE-AGNOSTIC: it disarms whatever rule sits behind it, so it hid
+            # `reset --hard` and `worktree add` and not only `checkout`.
+            if ($PosixEscapes -and $ch -eq '\' -and $i + 1 -lt $s.Length) {
+                [void]$out.Append($ch); [void]$out.Append($s[$i + 1]); $i++
+            }
+            elseif ($ch -eq '"' -or $ch -eq "'") { $quote = $ch; $openAt = $i }
             else { [void]$out.Append($ch) }
         }
+        elseif ($PosixEscapes -and $quote -eq '"' -and $ch -eq '\' -and $i + 1 -lt $s.Length) {
+            # Inside a DOUBLE-quoted span a backslash escapes the next character, so `\"` does not
+            # close it. DELIBERATELY NOT APPLIED INSIDE A SINGLE-QUOTED SPAN: sh gives the backslash no
+            # special meaning there, so `'a\'` really does close at that quote. Treating the two alike
+            # would swallow the rest of the line from a trailing backslash -- fail-open, which is the
+            # direction this whole function exists to avoid.
+            $i++
+        }
         elseif ($ch -eq $quote) {
-            # Emit the blanked pair only on a CLOSED span, matching what the regexes produced.
-            [void]$out.Append($quote); [void]$out.Append($quote)
+            # A QUOTED PROGRAM PATH KEEPS ITS GIT TOKEN, DECIDED HERE RATHER THAN IN A PRE-PASS
+            # (BACKLOG #1229 residual). This used to be two regexes run BEFORE this scan, double quotes
+            # first -- which is the same ordered-pair shape the scan replaced, so it straddled the same
+            # way: `"` ... `/git"` paired ACROSS a live command and collapsed it to a bare `git`,
+            # stripping the verb and its arguments so no rule matched. Deciding it on a span this scan
+            # already OWNS means it cannot pair across anything.
+            #
+            # CASE-SENSITIVE, AND THE CASE-INSENSITIVE VERSION IS A RETRACTION RATHER THAN AN
+            # OVERSIGHT (owner ruling 2026-08-21). This site briefly used `-match` plus
+            # `.ToLowerInvariant()`, on the reasoning that `GIT.EXE` is a real Windows spelling the
+            # case-SENSITIVE rules downstream would otherwise skip, so canonicalising was the
+            # fail-CLOSED direction. That reasoning is sound in isolation and was withdrawn on
+            # measurement, because this emit does not only ever see programs:
+            #
+            #     "<...>\Git\bin\GIT.EXE" -C <governed> reset --hard    a PROGRAM. Should deny.
+            #     cp -r "/c/backups/Git" restore                        a PATH. Must not deny.
+            #
+            # A case-insensitive match cannot tell those apart -- both end in separator-then-`Git` --
+            # so canonicalising minted a `git` token for the second and the next ordinary word became
+            # its verb. MEASURED: 12 shapes DENY here and ALLOW on `origin/main` (`cp`, `mv`, `ls`,
+            # `rsync`, `find -exec`, `7z`, `echo`, `python --src`, `Copy-Item`, `Move-Item`), against
+            # ZERO fail-opens gained. Twelve daily false denies on the guard itself is what buys a
+            # gate disabled wholesale, which is the failure this file's own preamble names.
+            #
+            # WHAT THIS DELIBERATELY DOES NOT FIX, stated because a one-sided note reads as a clean
+            # win: the quoted `GIT.EXE`-as-PROGRAM spelling stays ALLOW. That is NOT a regression --
+            # `origin/main` allows it today, measured -- it is a pre-existing hole this change
+            # declines to close, because the only remedy tried costs the twelve above. Closing it
+            # needs a POSITION test (is this span a program or an argument). That was built, and
+            # measured to open `cmd /c "<git.exe>"` and PowerShell dot-source as NEW fail-opens that
+            # main denies, so it was reverted. Do NOT re-add the lowercase emit without that
+            # discriminator, and do not add the discriminator without re-measuring those two.
+            $span = $s.Substring($openAt + 1, $i - $openAt - 1)
+            if ($span -cmatch '[\\/](git(?:\.exe)?)$') {
+                [void]$out.Append($Matches[1])
+            }
+            else {
+                # Emit the blanked pair only on a CLOSED span, matching what the regexes produced.
+                [void]$out.Append($quote); [void]$out.Append($quote)
+            }
             $quote = [char]0; $openAt = -1
         }
     }
@@ -400,7 +557,82 @@ function Remove-QuotedSpans([string]$s) {
 # Each entry carries BOTH forms. Scan is for deciding whether a git verb is present; Raw is for parsing
 # PATHS out of the same line, since the blanking that stops a commit message supplying a verb would also
 # erase the path.
-function Get-ScannableSegments([string]$Cmd) {
+function Get-FlagOwner([string]$Left) {
+    <#
+    WHICH PROGRAM OWNS THE FLAG THAT WAS JUST MATCHED, and does it EXECUTE its argument?
+    (BACKLOG #1229 residual, fourth round.) Returns 'posix', 'win' or 'none'.
+
+    THE FLAG SHAPE IS NOT THE QUESTION, AND IT IS BARELY CORRELATED WITH THE ANSWER. `$shFlag` is
+    `-[a-z]*c` under (?i), which matches `-C`, `-ic`, `-rc`, `-static`, `-sync`, `-exec` -- and
+    `$cmdExeFlag` walks an ordinary POSIX path one component at a time. Enumerated over a hand-built
+    axis of 33 non-interpreter invocations, 28 matched; over 36 real interpreter invocations, 18 did
+    not. Two consequences, and this function is the answer to the first:
+
+      1. A NON-INTERPRETER'S ARGUMENT WAS SCANNED AS CODE. `grep -c 'git reset --hard' history.log`
+         -- an ordinary search of a log -- DENIED. So did `rg -c`, `ag -c`, `curl -c`, `sort -c`,
+         `uniq -c`, `wc -c`, `cut -c`, `head -c`, `tail -c`, `ls -c`, `tar -c`, `gzip -c`, `md5sum -c`,
+         `cmp -c`, `diff -c`, `rsync -c`, `gcc -static` and `make -C`. None of them executes its
+         argument: driven on the real binaries with a payload that COMPUTES (`expr 111 \* 3` -> 333,
+         so an echo-back cannot be mistaken for a run), every one left no marker, while `bash -c`,
+         `sh -c` and `python -c` all printed 333.
+      2. THE SPELLINGS IT MISSES STAY MISSED. `perl -e`, `node -e`, `ruby -e`, `awk`, `eval` and
+         `ssh host CMD` never match the flag pattern at all, so their payload is blanked as inert data.
+         Pre-existing, unchanged here, and NOT closed by this function -- it is asked only about flags
+         the matcher already found.
+
+    WHY AN ALLOWLIST, WHEN THIS FILE'S OWN DOCTRINE PREFERS A GENERATING RULE. There is no syntactic
+    property separating `cp` from `sudo`, or `ls /usr/src/c` from `cmd /usr/src/c`; program identity is
+    the only discriminator, and identity cannot be generated. Read both sets as "AT LEAST these"
+    (CLAUDE.md section 11), and see the disclosed cost in the caller.
+
+    THE SCAN IS BOUNDED AND IT CONTINUES LEFT. Bounding it at the last command separator is what stops
+    a program named before a `;` or a pipe from voting on this flag, and continuing left past bare
+    words is what keeps `su someone -c`, `docker run --rm img sh -c` and `cmd /d /Q/C` classified --
+    each has a non-interpreter word between the interpreter and its flag.
+
+    THAT IS WHY THE $cmdExeFlag NOTE ABOVE IS CORRECTED RATHER THAN CITED. It listed five shapes that
+    defeated five earlier program-token candidates: `echo hi;cmd /k`, `(cmd /mnt/c`, `cmd /d /Q/C`, an
+    ALIAS, and a RENAMED copy of cmd.exe. The first three break ADJACENCY -- every one of those
+    candidates asked whether the token IMMEDIATELY LEFT of the switch run was a cmd spelling -- and all
+    three were measured to DENY under this scan, which is a different instrument. The last two break
+    IDENTITY, and this function does not close them: an unknown name gets no recursion, which is the
+    disclosed cost recorded at the caller. Four of five, not five of five.
+    #>
+    # Both hosts take their code under `/c` as well as `-Command`, so a cmd-family match is theirs.
+    $winSet = @('pwsh', 'powershell', 'cmd', 'wsl')
+    # Anything that runs the string it is handed. `find` is NOT optional: `-exec` ends in `c`, so the
+    # matcher reaches it, and `find . -name x -exec '<gated>' \;` really executes -- dropping find from
+    # this list was measured to regress it from DENY to ALLOW.
+    $posixSet = @(
+        'sh', 'bash', 'dash', 'zsh', 'ksh', 'ash', 'mksh', 'busybox', 'fish', 'csh', 'tcsh',
+        'env', 'nohup', 'timeout', 'xargs', 'nice', 'ionice', 'setsid', 'stdbuf', 'script',
+        'flock', 'watch', 'parallel', 'su', 'runuser', 'chroot', 'ssh', 'find', 'command', 'eval',
+        'python', 'python3', 'py', 'perl', 'ruby', 'node', 'nodejs', 'php', 'lua', 'tclsh',
+        'awk', 'gawk', 'mawk', 'deno', 'bun', 'osascript', 'rscript', 'julia'
+    )
+    $seg = $Left -replace '(?s).*[;&|()`]', ''
+    # WRAPPED IN @() AND THAT IS LOAD-BEARING. On a single-token left context [regex]::Split returns a
+    # SCALAR string, so indexing it yields a [char], .StartsWith throws, every owner comes back 'none'
+    # and the caller then refuses ALL recursion -- including `bash -c`. That is a silent, total
+    # fail-open, and a prototype hit it. Quote characters are delimiters for the same class of reason:
+    # without them the inner `-c` of `bash -c 'bash -c "<gated>"'` reads its program as `'bash`.
+    $toks = @([regex]::Split($seg, '[\s"'']+') | Where-Object { $_ })
+    for ($k = $toks.Count - 1; $k -ge 0; $k--) {
+        $t = $toks[$k]
+        if ($t.StartsWith('-')) { continue }                    # an option, not a program
+        # A SINGLE-COMPONENT slash token is a cmd switch (`/d`, `/Q`) and is skipped. A MULTI-component
+        # one is a POSIX path and IS a program -- `/usr/bin/bash -c` must still classify, so this
+        # cannot be a blanket "starts with a slash" skip.
+        if ($t -match '^/[^/]*$') { continue }
+        if ($t -match '^[A-Za-z_][A-Za-z0-9_]*=') { continue }  # FOO=1, an assignment prefix
+        $name = ($t -split '[\\/]')[-1] -replace '(?i)\.exe$', ''
+        if ($winSet -contains $name.ToLowerInvariant()) { return 'win' }
+        if ($posixSet -contains $name.ToLowerInvariant()) { return 'posix' }
+    }
+    'none'
+}
+
+function Get-ScannableSegments([string]$Cmd, [bool]$PosixEscapes = $false) {
     # Fold line continuations FIRST, or the per-line split below separates `git \` from its verb and the
     # rule stops seeing the command at all. Prose does not end a line with a continuation character, so
     # this does not resurrect the `echo about to merge stuff` false positive.
@@ -473,10 +705,15 @@ function Get-ScannableSegments([string]$Cmd) {
     #
     # COST, measured rather than assumed: recursion only ADDS a scan line, and a line still needs a git
     # token AND a gated verb to deny, so a path argument behind a family flag (`git -C "<path>"`,
-    # `tar -C "<dir>"`) changes no verdict. The one class that widens is a search whose PATTERN spells a
-    # git command -- `grep -vc "git checkout main"` now denies where it did not. That class already
-    # existed for `-c` (`grep -c "git checkout main"` has always denied), so this adds members to it
-    # rather than creating it.
+    # `tar -C "<dir>"`) changes no verdict.
+    #
+    # THIS PARAGRAPH USED TO NAME A CLASS THAT NO LONGER EXISTS, and the correction matters more than
+    # the deletion would. It said the one widening was "a search whose PATTERN spells a git command --
+    # `grep -vc "git checkout main"` now denies where it did not", and called that acceptable because
+    # `grep -c` had always denied. Both halves were true and the conclusion was wrong: the flag shape
+    # is not evidence of interpreter-ness at all, and 28 of 33 non-interpreter invocations matched it.
+    # A flag match is now a QUESTION, answered by Get-FlagOwner below, and a program that does not
+    # execute its argument gets no recursion. `grep -c 'git reset --hard' history.log` allows.
     #
     # ---------------------------------------------------------------------------------------------
     #
@@ -589,12 +826,12 @@ function Get-ScannableSegments([string]$Cmd) {
     # the attached form it does, so the across-the-board relaxation reddens it and the per-host split does
     # not. Recorded because the useless probe LOOKED like the bound: it named the right risk, asserted the
     # right verdict, and could not fail.
-    # A KNOWN FALSE DENY THIS RULE COSTS, recorded HERE because this script is what gets installed to
-    # %USERPROFILE%\.claude\hooks and it travels without the tests -- a note that lives only in a test
-    # file is invisible to whoever is reading the installed copy:
+    # A FALSE DENY THIS RULE USED TO COST, kept here rather than deleted because the reasoning under it
+    # is what a later reader needs, and because this script is what gets installed to
+    # %USERPROFILE%\.claude\hooks and travels without the tests:
     #
-    #     ls /usr/src/c "git checkout main"      DENIES, and should not
-    #     ls /usr/src/lib "git checkout main"    ALLOWs  (control: the `/c` ending is the trigger)
+    #     ls /usr/src/c "git checkout main"      DENIED, and should not have. Now ALLOWs.
+    #     ls /usr/src/lib "git checkout main"    ALLOWs  (control: the `/c` ending was the trigger)
     #
     # THE CAUSE IS THE `(?:/[^/\s]+)*` CLUSTER PREFIX IN $cmdExeFlag, not the `\s*` separator beside
     # it. The prefix exists so cmd's CONCATENATED switch runs (`/Q/C`, `/V:ON/C`) are recognised, and
@@ -619,17 +856,26 @@ function Get-ScannableSegments([string]$Cmd) {
     # `/usr` binds as `/U`, `/src` as `/S`, `/zzz` is ignored. So `(?:/[^/\s]+)*/[ck]` is very nearly
     # EXACTLY the family cmd accepts, not an over-match.
     #
-    # WHICH MAKES THIS A PROGRAM-IDENTITY PROBLEM, and that is why it is not fixed here. The only
-    # thing separating `ls /usr/src/c "..."` from `cmd /usr/src/c "..."` is the program token -- but
-    # every program-token spelling tried was defeated by something that EXECUTES: `echo hi;cmd /k`
-    # and `(cmd /mnt/c` (the `;` and `(` are not whitespace, and the outer `(?:^|\s)` anchor sits
-    # before this whole alternation), an alias, a renamed copy of cmd.exe, and `cmd /d /Q/C` where the
-    # program is not adjacent to the switch run. Five candidates were built and driven as real gate
-    # mutants; each traded this one disclosed false deny for four or more measured DENY-to-ALLOW
-    # regressions. At this rule's threat model the two directions are not symmetric -- a false DENY
-    # stops legitimate work loudly and has a workaround; a false ALLOW lets a reset land in the shared
-    # primary silently -- so the false deny is KEPT and disclosed.
-    # tests/test_worktree_gate_interpreter_sigils.py pins the deny so the cost cannot be lost.
+    # WHICH MAKES THIS A PROGRAM-IDENTITY PROBLEM -- and that half was right. The sentence that
+    # followed it, "and that is why it is not fixed here", was WRONG, and it is corrected rather than
+    # deleted because it is the sentence a reader would have acted on. It rested on five candidates
+    # that were each defeated by something that EXECUTES: `echo hi;cmd /k`, `(cmd /mnt/c`, an alias, a
+    # renamed copy of cmd.exe, and `cmd /d /Q/C` where the program is not adjacent to the switch run.
+    #
+    # FOUR OF THOSE FIVE SHARE ONE PROPERTY: they break ADJACENCY, not identity. Each candidate asked
+    # "is the token immediately left of the switch run a cmd spelling", and each counterexample simply
+    # put something between. A LEFTWARD SCAN BOUNDED BY THE LAST COMMAND SEPARATOR is a different
+    # instrument, and all four were measured to survive it: `echo hi;cmd /k`, `(cmd /mnt/c`,
+    # `cmd /d /Q/C` and `cmd /usr/src/c` all still DENY, because the scan skips options and switches
+    # and keeps going left until it reaches `cmd` or a separator. See Get-FlagOwner below.
+    #
+    # THE FIFTH IS NOT CLOSED AND IS NOT CLAIMED: a renamed copy of cmd.exe, or an alias, is an
+    # unknown program name and gets no recursion. That is the same disclosed weakening the caller
+    # records for `myrunner -c '<gated>'`, and it is the price of an allowlist.
+    #
+    # SO THE FALSE DENY IS CLOSED, not kept: `ls /usr/src/c "git checkout main"` ALLOWs. The direction
+    # asymmetry the old note ended on still holds and still governs the rest of this file; what
+    # changed is that this row no longer costs anything to fix.
     $flagThenSep = "(?:(?:$psFlag|$shFlag)\s+|$cmdExeFlag\s*)"
 
     # The payload is a NAMED group. It was Groups[1], which still resolves correctly (.NET numbers
@@ -637,22 +883,89 @@ function Get-ScannableSegments([string]$Cmd) {
     # now that $sigil contributes a named group of its own.
     $inner = @()
     foreach ($ln in $lines) {
+        # THE EXTRACTION MUST AGREE WITH THE BLANKING ABOUT WHERE THE ARGUMENT ENDS
+        # (BACKLOG #1229 residual, third round). `[^"]*` is escape-BLIND: it stops at the first
+        # quote, INCLUDING an escaped one. Once Remove-QuotedSpans became escape-AWARE, the two
+        # disagreed -- and the inner code was never re-scanned:
+        #
+        #     bash -c "bash -c \\"git -C <governed> reset --hard\\""
+        #     extraction got:  `bash -c \\`   -- truncated at the escaped quote, no verb
+        #     blanking removed: the whole span     -- so nothing reached any rule  -> ALLOW
+        #
+        # MEASURED: main DENY x3, the escape-aware fix ALLOW x3, and the control (same nesting,
+        # NO escape) DENY on both -- so the trigger is the ESCAPE, not the nesting. The inner
+        # command really runs: `bash -c "bash -c \\"expr 111 \\* 3\\""` prints 333.
+        #
+        # ON MAIN THE TWO AGREED BY ACCIDENT, both being escape-blind, which left the verb visible
+        # OUTSIDE the span. Making one side escape-aware removed the accident without replacing it.
+        # This is why a host flag alone cannot close it: the failing host is BASH, where the escape
+        # is real and honouring it is correct.
+        #
+        # The SINGLE-quoted arm stays escape-blind on purpose: sh gives the backslash no special
+        # meaning inside a single-quoted word, which is the same asymmetry Remove-QuotedSpans keeps.
+        $dqCode = if ($PosixEscapes) { "(?<code>(?:\\.|[^`"\\])*)" } else { "(?<code>[^`"]*)" }
         foreach ($pat in @(
-            "(?i)(?:^|\s)$flagThenSep`"(?<code>[^`"]*)`""
+            "(?i)(?:^|\s)$flagThenSep`"$dqCode`""
             "(?i)(?:^|\s)$flagThenSep'(?<code>[^']*)'"
         )) {
-            foreach ($m in [regex]::Matches($ln, $pat)) { $inner += $m.Groups['code'].Value }
+            foreach ($m in [regex]::Matches($ln, $pat)) {
+                # WHO OWNS THIS FLAG DECIDES BOTH QUESTIONS -- whether to recurse at all, and under
+                # WHICH ESCAPE CONVENTION (BACKLOG #1229 residual, fourth round). `(?:^|\s)` consumes
+                # the separator, so $m.Index lands on the whitespace before the flag and the text left
+                # of it is the command segment that owns it.
+                $owner = Get-FlagOwner $ln.Substring(0, $m.Index)
+                # A PROGRAM THAT DOES NOT EXECUTE ITS ARGUMENT GETS NO RECURSION. The span then falls
+                # through to the blanking below as the ordinary quoted data it is.
+                #
+                # THE DISCLOSED COST, in the same shape as this file's other owner-ruled weakenings:
+                # `myrunner -c '<gated>'` -- an unknown program with a -c flag -- goes DENY to ALLOW,
+                # and if such a program IS an interpreter that is a fail-open. It is the same class as
+                # the 18 interpreter spellings the flag pattern already misses, and the old catch was
+                # accidental rather than designed, but it is a deliberate move against origin/main.
+                if ($owner -eq 'none') { continue }
+                # THE CONVENTION MUST COME FROM THE INTERPRETER, NOT THE OUTER TOOL NAME, and that was
+                # a live fail-open. `$PosixEscapes` is decided once from the tool name at each call
+                # site, so a Bash tool call invoking pwsh applied POSIX backslash rules to a PowerShell
+                # payload; the span straddled `C:\Temp\` and swallowed the gated command between it and
+                # a later quote. MEASURED to really run, with a payload that COMPUTES (marker 333):
+                #     pwsh -Command '$d = "C:\Temp\" ; git -C <governed> reset --hard ; ...'   ALLOW
+                # and the same for `pwsh -c` and `powershell -Command`. The IDENTICAL payload text
+                # under `bash -c` is INERT on this host (bash reports an unterminated quote), so the
+                # ALLOW there is CORRECT -- the same characters have opposite right answers depending
+                # on which interpreter receives them, which is why one flag for the whole line cannot
+                # express it. `win` maps to $false, which is also the direction the parameter's own
+                # docstring names conservative: shorter spans, more text left visible, fail CLOSED.
+                #
+                # The EXTRACTION regex above keeps the OUTER convention on purpose: it is parsing the
+                # OUTER command line's quoting, and that line really is the outer host's.
+                $inner += [pscustomobject]@{ Text = $m.Groups['code'].Value; Posix = ($owner -eq 'posix') }
+            }
         }
     }
 
-    foreach ($line in @($lines + $inner)) {
+    # RAW LINES FIRST, then payloads -- the order is not cosmetic. Rule 3 records the FIRST
+    # verb-bearing segment it sees, so putting extracted payloads last keeps a recursed line from
+    # outranking a gated command written plainly on a raw line.
+    foreach ($line in $lines) {
         # A quoted PROGRAM path must keep its git token -- `"C:\Program Files\Git\bin\git.exe" checkout
-        # main` is a real spelling and blanking it wholesale would be a false NEGATIVE. Collapse that form
-        # to a bare token first, then blank every remaining quoted span.
-        $s = $line -replace '"[^"]*[\\/](git(?:\.exe)?)"', '$1'
-        $s = $s -replace "'[^']*[\\/](git(?:\.exe)?)'", '$1'
-        $s = Remove-QuotedSpans $s
+        # main` is a real spelling and blanking it wholesale would be a false NEGATIVE. That collapse now
+        # happens INSIDE Remove-QuotedSpans, on a span the scan already owns.
+        #
+        # IT USED TO BE TWO ORDERED REGEXES RIGHT HERE, DOUBLE QUOTES FIRST, AND THAT WAS A SECOND LIVE
+        # FAIL-OPEN OF THE EXACT SHAPE THE SCAN BELOW EXISTS TO CLOSE. Running before the scan, they
+        # could pair a quote with a distant `/git"` ACROSS a gated command and replace the whole middle
+        # with a bare token -- verb and arguments gone, nothing left for any rule to match. Ownership
+        # cannot be decided by a regex that has no idea which quote opened first, which is the same
+        # sentence this file already wrote about the blanking order.
+        $s = Remove-QuotedSpans $line $PosixEscapes
         [pscustomobject]@{ Raw = $line; Scan = $s }
+    }
+
+    # Each extracted payload carries ITS OWN convention, taken from the interpreter that was matched
+    # rather than from the tool name at the call site. See the note at the extraction above.
+    foreach ($item in $inner) {
+        $s = Remove-QuotedSpans $item.Text $item.Posix
+        [pscustomobject]@{ Raw = $item.Text; Scan = $s }
     }
 }
 
@@ -973,12 +1286,35 @@ if ($tool -in @("Bash", "PowerShell")) {
     # sibling worktrees and the primary alike. Any git failure falls through to ALLOW.
     # -----------------------------------------------------------------------------------------------
     $dangerKeys = 'core\.hookspath|core\.worktree|alias\.[\w.-]+|include\.path|includeif\.'
-    foreach ($seg in (Get-ScannableSegments $cmd)) {
+    foreach ($seg in (Get-ScannableSegments $cmd ($tool -eq "Bash"))) {
         if ($seg.Scan -cnotmatch '(^|[\s;&|(''"\\/])git(\.exe)?["'']?(\s|$)') { continue }
-        if ($seg.Scan -notmatch "(?:\bconfig\b[^|;&]*?\s|-c\s+)(?<key>$dangerKeys)") { continue }
+        if ($seg.Scan -notmatch "(?<via>\bconfig\b[^|;&]*?\s|-c\s+)(?<key>$dangerKeys)(?<rest>[^|;&]*)") { continue }
+        # READ EVERY GROUP OUT OF $Matches BEFORE RUNNING ANOTHER -match. `-match` REPLACES $Matches
+        # wholesale, so computing $viaConfig first left $rest reading the SECOND match's groups, where
+        # no 'rest' exists -- it came back $null, satisfied the no-value test below, and the rule FAILED
+        # OPEN on its own positive control: `git config core.hooksPath /dev/null` was ALLOWED. Caught by
+        # keeping the must-deny rows in the fix's test table rather than only the row being fixed.
         $badKey = $Matches['key']
-        # A read is not a write.
+        $rest = $Matches['rest']
+        $via = $Matches['via']
+        $viaConfig = $via -match '\bconfig\b'
+        # A read is not a write -- the EXPLICIT read flags.
         if ($seg.Scan -match '(?:^|\s)--(get|get-all|get-regexp|list|show-origin)(\s|$)') { continue }
+        # ...AND THE IMPLICIT ONE (BACKLOG #1306). `git config <key>` with NO VALUE AFTER IT assigns
+        # nothing -- it is the bare read, and `--get` is merely its explicit spelling. Measured against
+        # real git: bare `git config <key>` exits 1 on an unset key and stores nothing, while
+        # `git config <key> <value>` stores. Denying the bare form told the caller "would change the
+        # SHARED git configuration" about a command that changes nothing, and the same false statement
+        # reached anyone documenting the rule.
+        #
+        # SCOPED TO THE `config` SUBCOMMAND ON PURPOSE -- DO NOT EXTEND IT TO `-c`. Measured on the same
+        # git: `-c <key>` WITHOUT an `=` still injects the key for that command (the value arrives
+        # empty), so absence-of-value there is not a read and an empty core.hooksPath is not obviously
+        # inert. The two forms only look alike; `-c` keeps denying whatever follows it.
+        #
+        # `$rest` stops at the next `|;&` because those start a new command, so a trailing separator
+        # cannot be mistaken for a value.
+        if ($viaConfig -and $rest -notmatch '\S') { continue }
 
         $at = [regex]::Match($seg.Raw, '(^|[\s;&|(''"\\/])git(\.exe)?["'']?(\s|$)')
         $pfx = $(if ($at.Success) { $seg.Raw.Substring(0, $at.Index) } else { "" })
@@ -1101,7 +1437,7 @@ What to do instead:
     # entirely. Ask git whether the path is a registered worktree of a governed repo instead. Any git
     # failure -- a path that is not a worktree, or does not exist -- falls through to ALLOW.
     # -----------------------------------------------------------------------------------------------
-    foreach ($seg in (Get-ScannableSegments $cmd)) {
+    foreach ($seg in (Get-ScannableSegments $cmd ($tool -eq "Bash"))) {
         if ($seg.Scan -cnotmatch '(^|[\s;&|(''"\\/])git(\.exe)?["'']?(\s|$)') { continue }
         if ($seg.Scan -cnotmatch '\bworktree\s+(?<wtverb>remove|move)(?=\s|$)') { continue }
         $wtVerb = $Matches['wtverb']
@@ -1149,6 +1485,14 @@ What to do instead:
         }
         if (-not $victimRaw) { continue }
 
+        # BACKLOG #1059 -- resolve a victim named through a shell variable, WHERE THAT IS DECIDABLE.
+        # A segment is a LINE, so `p=<path>; git worktree remove "$p"` carries its own assignment.
+        # ADDITIVE BY CONSTRUCTION: an unresolvable token returns $null and falls through to exactly
+        # today's handling, so this can only DENY a case the gate could already have decided.
+        $prefixForVars = ($seg.Raw -split ('(?s)\bworktree\s+' + $wtVerb + '\b'), 2)[0]
+        $victimResolved = Resolve-ShellIndirection $victimRaw $prefixForVars
+        if ($victimResolved) { $victimRaw = $victimResolved }
+
         # RESOLVE THE VICTIM AGAINST THE BEST AVAILABLE ESTIMATE OF THE DIRECTORY GIT WILL STAND IN
         # (defect B) -- an ESTIMATE, and the residual list below names where it is wrong -- by calling
         # the resolver rules 3 and 3c already use rather than growing a fourth. This read
@@ -1171,6 +1515,14 @@ What to do instead:
         # in". That is FALSE for every shape below, and an adversarial re-read found them in an hour,
         # which is the reason for the hedge rather than a longer list (CLAUDE.md section 11, SDS-3.6).
         #
+        #   * A VICTIM NAMED THROUGH A COMPUTED VARIABLE. `Resolve-ShellIndirection` (BACKLOG #1059)
+        #     now follows a variable assigned from a LITERAL earlier in the same line, which is what
+        #     the two spellings pinned as an open residual actually were. It does NOT follow `$(...)`,
+        #     a variable of a variable, an environment value, or an assignment on an earlier line --
+        #     those are runtime facts, it returns $null, and this rule keeps its prior behaviour.
+        #     tests/test_worktree_gate_control_plane.py asserts BOTH halves; the ALLOW half is a
+        #     negative control (BACKLOG #1000), not an endorsement, and it is what stops a later fix
+        #     from denying every sigil and breaking `git worktree remove "$HOME/scratch"`.
         #   * A `-C` VALUE CONTAINING A SPACE. Get-GitTargetCandidatesRaw matches `-C\s+"?([^"\s]+)"?`,
         #     and `[^"\s]+` stops at the space: measured, `git -C "C:/Pri mary" ...` captures
         #     `C:/Pri`. This is the SAME space family the victim scan above now handles, so this rule
@@ -1364,7 +1716,7 @@ $cleanupBullet
     # denying it because the primary's path appears in the `cd` is a false positive.
     $anyInferredTarget = $false
     $gitToken = '(^|[\s;&|(''"\\/])git(\.exe)?["'']?(\s|$)'
-    foreach ($seg in (Get-ScannableSegments $cmd)) {
+    foreach ($seg in (Get-ScannableSegments $cmd ($tool -eq "Bash"))) {
         # Match a git invocation however it is spelled: git, git.exe, or an absolute path to either.
         if ($seg.Scan -cnotmatch $gitToken) { continue }
         if ($seg.Scan -cnotmatch "\bgit(\.exe)?\b[^|;&]*?\s(?<verb>$verbs)(?=\s|$)") { continue }
@@ -1654,7 +2006,7 @@ turned off and I need you to do it." Do not disable it yourself.
 #                                 "already claimed by another session": the exact duplicate build the
 #                                 registry exists to stop.
 #   overlap-cache.json            overlap.ps1 trusts it as data for 60s, bounded only against a future
-#                                 stamp and a root mismatch. A `rows: []` payload makes collision_gate.ps1
+#                                 stamp and a root/HEAD mismatch. A `rows: []` payload makes collision_gate.ps1
 #                                 read "RESOLVED, and nobody else is touching it" and ALLOW with no
 #                                 additionalContext -- indistinguishable from a real all-clear, which is
 #                                 the silent-green failure that gate was built to remove.

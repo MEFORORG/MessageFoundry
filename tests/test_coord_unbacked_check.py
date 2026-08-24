@@ -215,3 +215,116 @@ def test_a_comma_list_through_dash_file_is_split(repo: Path, tmp_path: Path) -> 
     res = check(repo, second)
     assert "Path does not exist" not in res.stdout + res.stderr
     assert "2 repositories" in res.stdout
+
+
+# --- BACKLOG #1299: content-durability classification -------------------------------------------
+#
+# `--not --remotes` answers "does this COMMIT OBJECT exist on a remote". The reader asks "is any WORK
+# at risk". Measured on the fleet box 2026-08-23, EVERY alarm was that divergence -- 8 of 8 -- and the
+# remedy the script printed would have force-pushed rescue tags for work already on `main`.
+#
+# The four tests below are two PAIRS. Each must-not-trip arm has a must-trip twin that differs by the
+# one property the classification turns on, because a classifier that suppressed everything would pass
+# the must-not-trip arms alone.
+
+
+def test_a_squash_landed_branch_is_reclassified_not_alarmed(repo: Path) -> None:
+    """MUST NOT TRIP. The squash-merge case: `main` carries the CONTENT under a different sha, so the
+    branch points at an object on no remote while nothing is at risk."""
+    git(repo, "checkout", "-q", "-b", "side")
+    (repo / "g.txt").write_text("landed", encoding="utf-8")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-qm", "work")
+    # main gets the same CONTENT as a different commit -- what a squash-merge produces.
+    git(repo, "checkout", "-q", "main")
+    (repo / "g.txt").write_text("landed", encoding="utf-8")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-qm", "squashed: work")
+    git(repo, "push", "-q", "origin", "main")
+    git(repo, "fetch", "-q", "origin")
+
+    r = check(repo)
+    assert "0 unbacked commits" in r.stdout, r.stdout + r.stderr
+    assert r.returncode == 0, r.stdout + r.stderr
+    # The reclassification must be VISIBLE. A silent one is how a real alarm gets suppressed with
+    # nobody aware the mechanism exists.
+    assert "durable  :" in r.stdout
+    assert "squash/rebase-landed" in r.stdout
+
+
+def test_genuinely_unpushed_work_still_trips(repo: Path) -> None:
+    """MUST TRIP -- the twin of the test above, differing only in that the content is nowhere else.
+    Without this, a classifier that suppressed every finding would pass its partner."""
+    git(repo, "checkout", "-q", "-b", "side")
+    (repo / "g.txt").write_text("this exists on exactly one disk", encoding="utf-8")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-qm", "real work")
+
+    r = check(repo)
+    assert r.returncode == 1, r.stdout + r.stderr
+    assert "exist on no remote" in r.stdout
+    assert "Remedy" in r.stdout
+
+
+def test_a_clean_merge_over_backed_parents_is_reclassified(repo: Path) -> None:
+    """MUST NOT TRIP. A local `merge origin/main into <branch>` makes a NEW commit whose parents are
+    both backed and which contributes nothing of its own -- it is re-derivable by re-running it."""
+    git(repo, "checkout", "-q", "-b", "side")
+    (repo / "side.txt").write_text("side", encoding="utf-8")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-qm", "side work")
+    git(repo, "push", "-q", "origin", "side")
+    git(repo, "checkout", "-q", "main")
+    (repo / "main.txt").write_text("main", encoding="utf-8")  # a DIFFERENT file: merges cleanly
+    git(repo, "add", "-A")
+    git(repo, "commit", "-qm", "main work")
+    git(repo, "push", "-q", "origin", "main")
+    git(repo, "fetch", "-q", "origin")
+    git(repo, "checkout", "-q", "side")
+    git(repo, "merge", "-q", "--no-ff", "-m", "merge main into side", "main")
+
+    r = check(repo)
+    assert "0 unbacked commits" in r.stdout, r.stdout + r.stderr
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "tree identical to the automatic merge" in r.stdout
+
+
+def test_a_merge_carrying_a_HAND_RESOLUTION_still_trips(repo: Path) -> None:
+    """MUST TRIP, AND THIS IS THE ARM THAT MAKES THE CLASSIFICATION SOUND RATHER THAN USUALLY-RIGHT.
+
+    Its twin above differs by ONE property: there the merge was automatic, here a human resolved a
+    conflict. Both parents are backed in both cases, so a 'parents are backed' test alone -- the
+    obvious fix -- clears BOTH. But a hand resolution exists in NEITHER parent and nowhere else on
+    earth, so clearing it would lose exactly the work this script exists to protect.
+
+    MUTATION-VERIFIED, and the first wording of this docstring had it backwards. Replacing the tree
+    comparison in `Test-CommitContentDurable` with an unconditional pass was measured: THIS test FAILS
+    (the script clears the merge and returns 0 where 1 is required) while its twin above still PASSES.
+    That asymmetry is the proof -- the twin alone cannot detect the missing check, so a suite holding
+    only must-not-trip arms would be green over a classifier that loses hand-resolved work."""
+    git(repo, "checkout", "-q", "-b", "side")
+    (repo / "f.txt").write_text("side version", encoding="utf-8")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-qm", "side edits f")
+    git(repo, "push", "-q", "origin", "side")
+    git(repo, "checkout", "-q", "main")
+    (repo / "f.txt").write_text("main version", encoding="utf-8")  # SAME file: conflicts
+    git(repo, "add", "-A")
+    git(repo, "commit", "-qm", "main edits f")
+    git(repo, "push", "-q", "origin", "main")
+    git(repo, "fetch", "-q", "origin")
+    git(repo, "checkout", "-q", "side")
+    subprocess.run(
+        ["git", "-C", str(repo), "merge", "--no-ff", "-m", "merge"], capture_output=True, text=True
+    )
+    subprocess.run(
+        ["git", "-C", str(repo), "merge", "main"], capture_output=True, text=True, timeout=TIMEOUT
+    )
+    # Resolve by hand to a value in NEITHER parent. This text exists on one disk.
+    (repo / "f.txt").write_text("hand-resolved: neither side nor main", encoding="utf-8")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-qm", "merge main into side, resolved by hand")
+
+    r = check(repo)
+    assert r.returncode == 1, "a hand-resolved merge is NOT re-derivable\n" + r.stdout + r.stderr
+    assert "exist on no remote" in r.stdout

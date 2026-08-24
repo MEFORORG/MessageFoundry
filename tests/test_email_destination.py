@@ -551,6 +551,31 @@ def test_tls_verify_false_refuses_credentials_even_with_escape(
         EmailDestination(_dest(tls_verify=False, username="svc", password="pw"))
 
 
+def test_check_hostname_false_refuses_credentials() -> None:
+    # BACKLOG #1314, the THIRD weakening axis. TLS is on and the chain IS verified, but the peer
+    # NAME is not checked, so any certificate chaining to the configured anchor is accepted
+    # regardless of who it was issued to. An AUTH exchange on that hop hands the credential to a
+    # peer whose identity was never established -- the same loss the two arms above refuse.
+    #
+    # ABSOLUTE, and deliberately not keyed on any escape: in both existing arms the escape governs
+    # the BODY posture and never the credential. A third arm keeps that split.
+    with pytest.raises(ValueError, match="tls_check_hostname=false"):
+        EmailDestination(_dest(tls_check_hostname=False, username="svc", password="pw"))
+
+
+def test_check_hostname_false_without_credentials_still_constructs() -> None:
+    # NEGATIVE CONTROL. The refusal must be keyed on the CREDENTIAL, not on the posture. A
+    # name-unchecked hop carrying no username is this item's out of scope -- widening to it would
+    # be the "must not widen the existing arms" failure the item names.
+    EmailDestination(_dest(tls_check_hostname=False))
+
+
+def test_credentials_over_a_fully_verified_hop_still_construct() -> None:
+    # POSITIVE CONTROL. Proves the new gate can be PASSED, so the test above is not green merely
+    # because EmailDestination refuses every credentialed construction.
+    EmailDestination(_dest(username="svc", password="pw"))
+
+
 async def test_tls_verify_false_with_escape_builds_an_unverified_context(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
