@@ -154,8 +154,12 @@ services:
     environment:
       POSTGRES_DB: messagefoundry
       POSTGRES_USER: mefor
-      # DEV password — override via the env_file / your secret store for anything real.
-      POSTGRES_PASSWORD: "${MEFOR_STORE_PASSWORD:-mefor-dev-password}"
+      # NO DEFAULT, DELIBERATELY (BACKLOG #1091). A `:-` fallback SHIPS its literal the moment the
+      # variable is unset, and the two required secret gates cannot see it -- bandit does not parse
+      # yaml, gitleaks' generic rule is entropy-gated. NOTE this is COMPOSE SUBSTITUTION, which is a
+      # different mechanism from the `env_file:` the other services use: env_file sets variables
+      # INSIDE the container and does not feed substitution at all.
+      POSTGRES_PASSWORD: "${MEFOR_STORE_PASSWORD:?required. Compose SUBSTITUTION reads the shell environment or a .env beside compose.yaml -- an env_file: does NOT feed it. Export it, or pass --env-file docker/secrets.env}"
     volumes:
       - mefor-pg:/var/lib/postgresql/data
     healthcheck:
