@@ -62,8 +62,20 @@ def _engine_step_run_line() -> str:
                 run = step.get("run", "")
                 for line in run.splitlines():
                     stripped = line.strip()
-                    if stripped.startswith("pytest "):
-                        return stripped
+                    # THE INVOCATION MAY BE WRAPPED, and the wrapper is not this guard's business.
+                    # PR 566 (BACKLOG #1260) put this step behind
+                    # `bash scripts/ci/retry-native-crash.sh`, so the `pytest` token is no longer
+                    # first on the line. Requiring it to be first re-coupled this locator to the
+                    # step's SPELLING -- the very defect the comment above says it was rewritten
+                    # to remove -- and it then failed as "runs no pytest command" rather than
+                    # "the step is wrapped". Slicing FROM the token leaves every assertion below
+                    # unchanged.
+                    #
+                    # Matching mid-line is safe ONLY because the step is already located by NAME.
+                    # A mid-line search over the whole file is what would hit the doc-guards step.
+                    idx = stripped.find("pytest ")
+                    if idx == 0 or (idx > 0 and stripped[idx - 1].isspace()):
+                        return stripped[idx:]
                 pytest.fail(f"the {_ENGINE_STEP!r} step runs no `pytest` command:\n{run}")
     pytest.fail(f"no step named {_ENGINE_STEP!r} found in {_CI}")
 
