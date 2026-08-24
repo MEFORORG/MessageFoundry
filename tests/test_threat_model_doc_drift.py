@@ -820,8 +820,13 @@ def _checks() -> list[tuple[str, object, object]]:
     ]
 
 
-def test_documented_bounds_match_the_live_constants() -> None:
+def test_transcribed_bounds_match_the_live_constants() -> None:
     """Every bound TRANSCRIBED IN THIS FILE is asserted against the live value by import.
+
+    RENAMED FROM ``test_documented_bounds_match_the_live_constants`` (BACKLOG #1214). "documented"
+    promised the DOCUMENT, and this assertion never opens it. The failure text was corrected first;
+    the NAME outlived it, and a name is what a reader sees in a CI failure list before any message.
+    A check named for its subject rather than its assertion is SDS-3.8 in one identifier.
 
     REWORDED IN SUBSTANCE, NOT COSMETICALLY (BACKLOG #1214). This reported a mismatch as
     ``doc says {expected}``, which was false of all 64 of its rows: ``expected`` is a literal in
@@ -1104,7 +1109,7 @@ def test_the_open_gap_is_tracked_against_an_artifact_that_exists() -> None:
 
 #: ``(row-label fragment, live value, the rendered form the row must carry)``.
 #:
-#: ``test_documented_bounds_match_the_live_constants`` compares a live constant to a literal
+#: ``test_transcribed_bounds_match_the_live_constants`` compares a live constant to a literal
 #: hardcoded in THIS FILE — it never reads the document, so editing THREAT-MODEL.md to say "32 MiB"
 #: left the suite green. That is the rot mode that matters for a cell scored on documentation, so
 #: this closes the other half: the rendered value must appear in that row's own line.
