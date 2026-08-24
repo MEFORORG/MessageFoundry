@@ -31,6 +31,9 @@ PASSWORD_CHANGED = "password_changed"  # nosec B105 — event-type label, not a 
 PASSWORD_RESET = "password_reset"  # nosec B105 — event label, not a credential; admin-initiated (6.3.7/6.4.6)
 EMAIL_CHANGED = "email_changed"  # 6.3.7 — the account's email address was changed
 ROLES_CHANGED = "roles_changed"  # 6.3.7 — an admin changed the account's roles
+FEDERATED_IDENTITY_BOUND = (
+    "federated_identity_bound"  # 6.3.7 - an external identity was bound to the account
+)
 ACCOUNT_DISABLED = "account_disabled"  # 6.3.7 — an admin disabled the account
 MFA_ENABLED = "mfa_enabled"  # 6.3.7 — a second factor (TOTP) was enrolled on the account
 MFA_DISABLED = (
