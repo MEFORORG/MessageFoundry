@@ -168,3 +168,71 @@ def test_missing_message_argument_is_a_no_op(repo: Path) -> None:
     """Not wired as a commit-msg hook -> do nothing, rather than guess at a message file."""
     r = subprocess.run([sys.executable, str(_CHECK)], cwd=repo, capture_output=True, text=True)
     assert r.returncode == 0
+
+
+# ------------------------------------------------- BACKLOG #1345: location must not outrank extension
+#
+# `_DOC_PREFIXES` classifies by LOCATION, so before this fix a file DECLARED ITSELF documentation
+# merely by sitting under one -- and `.github/` holds the CI workflows. A commit rewiring CI, citing
+# an item, touching nothing else, was held to no claim at all. Rewiring CI is exactly the change two
+# sessions collide on, which is the collision this gate exists to stop.
+
+
+def test_a_ci_workflow_only_commit_is_HELD_to_the_claim_rule(repo: Path) -> None:
+    """MUST BLOCK. `.github/` is a documentation prefix and a workflow is not a `.md`, so this
+    commit was classified as documentation and waved through."""
+    (repo / ".github" / "workflows").mkdir(parents=True)
+    (repo / ".github" / "workflows" / "ci.yml").write_text("on: push\n", encoding="utf-8")
+    _git(repo, "add", ".github/workflows/ci.yml")
+    proc = _run(repo, "ci: rewire the gate (BACKLOG #42)")
+    assert proc.returncode != 0, f"a CI-only commit escaped the claim rule:\n{proc.stdout}"
+
+
+def test_an_executable_under_a_documentation_prefix_is_HELD(repo: Path) -> None:
+    """MUST BLOCK. Two such files exist on the real tree today, under docs/benchmarks/results/."""
+    (repo / "docs" / "bench").mkdir(parents=True)
+    (repo / "docs" / "bench" / "microbench.py").write_text("x = 1\n", encoding="utf-8")
+    _git(repo, "add", "docs/bench/microbench.py")
+    proc = _run(repo, "perf: adjust the harness (BACKLOG #42)")
+    assert proc.returncode != 0, f"a .py under docs/ escaped the claim rule:\n{proc.stdout}"
+
+
+def test_a_markdown_only_commit_is_STILL_never_blocked(repo: Path) -> None:
+    """MUST NOT BLOCK -- the twin, and the property the fix must not break.
+
+    Banner flips and ledger reconciles cite an item without building it. A fix that made every
+    docs/ path require a claim would have the gate fight the bookkeeping that keeps the backlog
+    honest, which is a worse failure than the hole it closes."""
+    _git(repo, "add", "docs/BACKLOG.md")
+    assert _run(repo, "docs(backlog): flip banner (BACKLOG #42)").returncode == 0
+
+
+def test_a_DATA_file_under_docs_is_still_documentation(repo: Path) -> None:
+    """MUST NOT BLOCK. The live tree carries 61 .txt, 58 .json and 42 .csv under docs/ -- benchmark
+    results and fixtures. The narrowing is to EXECUTABLE and CONFIG extensions, not to everything
+    that is not markdown, because the wider rule would block a benchmark commit for no benefit."""
+    (repo / "docs" / "bench").mkdir(parents=True)
+    (repo / "docs" / "bench" / "results.csv").write_text("a,b\n1,2\n", encoding="utf-8")
+    _git(repo, "add", "docs/bench/results.csv")
+    assert _run(repo, "docs(bench): record results (BACKLOG #42)").returncode == 0
+
+
+def test_the_live_tree_really_contains_files_this_guard_changes() -> None:
+    """THE ANTI-VACUITY ARM. If no such file existed, every arm above would pass over a hypothetical
+    and the guard would be protecting nothing -- indistinguishable, in a green run, from one that
+    works."""
+    root = Path(__file__).resolve().parents[1]
+    listed = subprocess.run(
+        ["git", "-C", str(root), "ls-files"], capture_output=True, text=True, check=True
+    ).stdout.splitlines()
+    assert listed, "git ls-files returned nothing -- this assertion cannot mean anything"
+
+    reclassified = [
+        p
+        for p in listed
+        if p.startswith((".github/", "docs/")) and p.endswith((".yml", ".yaml", ".py"))
+    ]
+    assert len(reclassified) >= 20, (
+        f"only {len(reclassified)} file(s) sit under a documentation prefix with an executable or "
+        "config extension; this guard was measured against 30"
+    )
