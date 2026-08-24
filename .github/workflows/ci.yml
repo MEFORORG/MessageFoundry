@@ -371,6 +371,18 @@ jobs:
         if: runner.os == 'Linux'
         run: python scripts/quality/control_char_check.py
 
+      # BACKLOG #1226. The screen shipped and NOTHING RAN IT, so it read as coverage and produced
+      # none -- a username reaching a WHERE clause was found three times by accident and zero times
+      # on purpose. --baseline is what makes this step able to FAIL without turning the screen into
+      # a verdict-emitter: it is silent on the judged sites and red on a key nobody has read yet.
+      # Several judged entries are deliberately CORRECT code and one is a confirmed defect, so the
+      # baseline records that a human looked, never that a site is fine. stdlib only.
+      - name: Username-as-access-key screen (new sites only)
+        if: runner.os == 'Linux'
+        run: >-
+          python scripts/quality/username_access_key_screen.py
+          --baseline scripts/quality/username_access_key_baseline.txt
+
       # Two mypy passes on Linux so BOTH platforms' typed branches are checked without paying for a
       # Windows mypy: the default linux-platform run, plus an explicit --platform win32 run that types
       # the sys.platform=='win32' branches (ctypes.windll / DPAPI / service_control) the linux run

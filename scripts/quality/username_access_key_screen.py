@@ -242,7 +242,34 @@ def screen_source(path: str, source: str) -> tuple[list[Candidate], list[Candida
     return candidates, labels
 
 
+#: Judged sites, one ``file::callee::slot`` per line. A key records that a HUMAN HAS LOOKED, never
+#: that the site is correct -- several judged entries are deliberately correct code, and one is a
+#: known defect awaiting its own item. Keys carry NO LINE NUMBER on purpose: the same site is
+#: `create_search_preset` or `upsert_search_preset` depending where you stand, at different lines
+#: depending on your base, which is why ``Candidate.key`` was built stable and unused until now.
+DEFAULT_BASELINE = _ROOT / "scripts" / "quality" / "username_access_key_baseline.txt"
+
+
+def load_baseline(path: Path) -> set[str]:
+    out: set[str] = set()
+    for raw in path.read_text(encoding="utf-8").splitlines():
+        line = raw.split("#", 1)[0].strip()
+        if line:
+            out.add(line)
+    return out
+
+
 def main(argv: list[str]) -> int:
+    # --baseline turns the screen from an advisory report into a step that can FAIL, WITHOUT making
+    # it a verdict-emitter. It fails only on a key nobody has judged yet. Wiring it without this
+    # would install a CI step that cannot fail for the reason it exists -- decoration that reads as
+    # coverage, which is the class this screen was written to catch.
+    baseline_path: Path | None = None
+    if "--baseline" in argv:
+        i = argv.index("--baseline")
+        baseline_path = Path(argv[i + 1]) if i + 1 < len(argv) else DEFAULT_BASELINE
+        argv = argv[:i] + argv[i + 2 :] if i + 1 < len(argv) else argv[:i]
+
     paths = argv or [str(_ROOT / p) for p in DEFAULT_SCOPE]
     all_candidates: list[Candidate] = []
     label_total = 0
@@ -272,7 +299,31 @@ def main(argv: list[str]) -> int:
         "  These are CANDIDATES, not defects. A username is correct as a label on an audit row "
         "and wrong as a key that scopes a resource; only a reader can tell which this is."
     )
-    return 0
+
+    if baseline_path is None:
+        return 0
+
+    judged = load_baseline(baseline_path)
+    seen = {f"{c.path}::{c.key}" for c in all_candidates}
+    unjudged = sorted(seen - judged)
+    resolved = sorted(judged - seen)
+
+    # STATED EVEN WHEN EMPTY. A baseline entry that no longer matches is either a fixed site or a
+    # screen that stopped seeing it, and those are opposite facts; printing the count is what lets a
+    # reader notice the second one.
+    print(f"  baseline: {len(judged)} judged, {len(seen)} seen, {len(resolved)} no longer reported")
+    for key in resolved:
+        print(f"    NO LONGER REPORTED (fixed, or the screen stopped seeing it): {key}")
+    if not unjudged:
+        return 0
+    print("")
+    print(
+        "username-access-key: NEW UNJUDGED SITE(S) -- read each, then add its key to the baseline:"
+    )
+    for key in unjudged:
+        print(f"    {key}")
+    print(f"  baseline file: {baseline_path}")
+    return 1
 
 
 if __name__ == "__main__":
