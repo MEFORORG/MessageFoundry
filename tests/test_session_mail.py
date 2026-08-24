@@ -1685,3 +1685,120 @@ def test_the_fresh_control_alone_produces_no_expiry_line(repo: Path, tmp_path: P
     assert "FRESH-ONLY" in out
     assert "0 expired" in out, out
     assert "EXPIRED AND NEVER SHOWN" not in out, out
+
+
+# ---------------------------------------------------------------------------------------------
+# BACKLOG #1228 -- expiry was visible for exactly one turn and then unnameable.
+#
+# The drain sweeps a message past its TTL into expired/ and reports it in the render of the turn that
+# swept it. Nothing named it afterwards: the sender's receipt still says queued, the recipient was
+# never told, and every other count stays whole. So "no expired messages" and "expired messages I can
+# no longer see" rendered IDENTICALLY -- and a message that died unread is the one outcome this
+# channel most needs to be able to report.
+#
+# Measured on the live queue the moment the column existed: NINE boxes carried a non-zero count,
+# twelve messages in total, none of which any surface could name.
+# ---------------------------------------------------------------------------------------------
+
+
+def _mail_json(repo: Path, *args: str, cwd: Path | None = None) -> Any:
+    """Drive the REAL mail.ps1 and parse its -Json output.
+
+    -List emits an array of box rows; the default -Status path emits one object for the cwd's box.
+    Both are the shipped render paths rather than a reimplementation, which is the same
+    single-definition rule the rest of this module follows.
+    """
+    proc = subprocess.run(
+        [
+            "pwsh",
+            "-NoProfile",
+            "-NonInteractive",
+            "-File",
+            str(MAIL),
+            "-MailRoot",
+            str(mail_root(repo)),
+            "-Json",
+            *args,
+        ],
+        cwd=str(cwd or repo),
+        capture_output=True,
+        text=True,
+        timeout=TIMEOUT,
+        check=False,
+    )
+    assert proc.returncode == 0, proc.stderr
+    return json.loads(proc.stdout)
+
+
+def _expire_one(root: Path, key: str, ident: str = "20260101T000000000-expiry") -> Path:
+    """Put one message in a box's ``expired/`` sub, as the drain's sweep does."""
+    d = root / "box" / key / "expired"
+    d.mkdir(parents=True, exist_ok=True)
+    f = d / f"{ident}.json"
+    f.write_text(json.dumps({"id": ident, "body": "swept"}), encoding="utf-8")
+    return f
+
+
+def test_the_List_render_names_a_boxs_expired_count(repo: Path) -> None:
+    """MUST FIRE. Before this, -List rendered inbox/shown/seen/done/claiming/stranded and simply had
+    no column for the one terminal state nobody is told about."""
+    seeded = seed(repo, repo, [{"body": "live"}])
+    _expire_one(mail_root(repo), seeded["key"])
+    out = _mail_json(repo, "-List")
+    row = next(r for r in out if r["Key"] == seeded["key"])
+    assert row["Expired"] == 1, row
+
+
+def test_the_List_render_reports_ZERO_rather_than_omitting_the_column(repo: Path) -> None:
+    """MUST NOT FIRE, AND IT IS THE HALF THAT MAKES THE COLUMN MEAN ANYTHING.
+
+    A column that appears only when non-zero cannot distinguish "none expired" from "this render
+    does not know about expiry" -- which is the state the item was filed against."""
+    seeded = seed(repo, repo, [{"body": "live"}])
+    row = next(r for r in _mail_json(repo, "-List") if r["Key"] == seeded["key"])
+    assert "Expired" in row, "the key must be present even at zero"
+    assert row["Expired"] == 0
+
+
+def test_the_Status_render_names_this_boxs_expired_count(repo: Path) -> None:
+    """MUST FIRE on the OTHER render path. The two paths are separate code and a fix to one says
+    nothing about the other -- which is why the item names both."""
+    seeded = seed(repo, repo, [{"body": "live"}])
+    _expire_one(mail_root(repo), seeded["key"])
+    assert _mail_json(repo, cwd=repo)["Expired"] == 1
+
+
+def test_a_swept_message_is_still_nameable_LONG_AFTER_the_turn_that_swept_it(repo: Path) -> None:
+    """THE ITEM'S ACTUAL THESIS. The count is derived from the filesystem, not from a report emitted
+    during the sweep, so it survives any number of later drains that know nothing about it."""
+    seeded = seed(repo, repo, [{"body": "live"}])
+    _expire_one(mail_root(repo), seeded["key"])
+    for _ in range(2):
+        run_drain(repo)
+    row = next(r for r in _mail_json(repo, "-List") if r["Key"] == seeded["key"])
+    assert row["Expired"] == 1, "two later drains must not erase the record of an expiry"
+
+
+def test_the_Status_TEXT_render_says_nobody_was_told(repo: Path) -> None:
+    """The human path, not just the JSON one. A count with no explanation invites the reader to treat
+    expiry as a routine sweep, when it is the one disposition that reaches neither end."""
+    seed(repo, repo, [{"body": "live"}])
+    proc = subprocess.run(
+        [
+            "pwsh",
+            "-NoProfile",
+            "-NonInteractive",
+            "-File",
+            str(MAIL),
+            "-MailRoot",
+            str(mail_root(repo)),
+        ],
+        cwd=str(repo),
+        capture_output=True,
+        text=True,
+        timeout=TIMEOUT,
+        check=False,
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert "Expired:" in proc.stdout
+    assert "NOBODY WAS TOLD" in proc.stdout
