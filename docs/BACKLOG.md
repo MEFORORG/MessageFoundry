@@ -16110,3 +16110,22 @@ federation on, the authorization request would travel the browser-visible front 
 identity provider is the only party positioned to reject tampering. That is true, and it is not by
 itself a finding against this cell.
 
+
+## 1353. the public engine repo reports zero Dependabot alerts on a lockfile a fork of the same lockfile flags four times
+
+> 🔢 **Filed 2026-08-24 - not started. A VULNERABILITY SCANNER REPORTING CLEAN AND A VULNERABILITY SCANNER NOT LOOKING RENDER IDENTICALLY.** `MEFORORG/MessageFoundry` returns **zero** open Dependabot alerts. `wshallwshall/MessageFoundry`, a fork carrying the same `uv.lock` and the same `ide/package-lock.json`, returns **four HIGH**. Both pin `cryptography==50.0.0` on their default branch. The org repo's alerts endpoint returned an **empty list, not a 403**, so this is a real zero rather than a permission error, and `dependabot_security_updates` reads `enabled`.
+> Verdict: research
+> Closing-act: code
+
+**Cluster:** Supply chain / CI security. **Priority:** P2. **Verdict:** research.
+**Severity:** no live exposure - there are zero deployments (sec. 0). The cost is that **a security claim resting on "the engine repo shows no open advisories" would be resting on a premise a fork of the same lockfile contradicts**, which is the compensating-control-on-a-false-premise defect sec. 11 forbids. A deploying site would ship the flagged versions.
+
+**The four, as the fork reports them.** `cryptography` (`uv.lock`) - PKCS#7 EnvelopedData decryption exposes a Bleichenbacher oracle. `js-yaml`, `fast-uri` and `brace-expansion`, all `ide/package-lock.json`, all in the VS Code extension's tree rather than the engine's runtime.
+
+**One reachability measurement, and it is a floor rather than a clearance.** The advisory is on **decryption**. `messagefoundry/transports/direct.py:361-379` builds `PKCS7SignatureBuilder` and `PKCS7EnvelopeBuilder` - it **signs and encrypts**. A search of `messagefoundry/` for `load_pem_pkcs7`, `load_der_pkcs7` and pkcs7-decrypt spellings returned nothing, against a control confirming `cryptography` is imported in at least `auth/oidc/claims.py`, `auth/oidc/jwks.py` and `pki.py`. **That is an absence over the spellings searched, not a proof no decryption path exists**, and it says nothing about the three npm advisories.
+
+**The question this item exists to answer.** Why do two repositories holding the same manifests disagree? At least these need ruling out before the zero can be trusted: the org repo's Dependabot has not completed a scan; the two default branches carry manifests that differ despite matching on the `cryptography` pin; alerts exist but are dismissed rather than open; or the fork is scanning a path the org repo excludes.
+
+**Why this is not "just update the pins".** The pins may well need moving. But **the finding is about the instrument, not the dependency** - if the org repo cannot see advisories its own fork can, then every future clean report from it means nothing, and no amount of dependency bumping fixes that. Establish why the numbers differ first; the four advisories are the sample that exposed it, not the subject.
+
+**How it was found.** A landing seat mentioned in passing that "the vault remote reports 4 high dependabot advisories", having read the remote it had just pushed to. That remote is `wshallwshall/MessageFoundry`, which is a fork of the engine and not a separate documentation vault - the name in use across the fleet is misleading, and it is why the finding read as unrelated to engine security when it was first mentioned.
