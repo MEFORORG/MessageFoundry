@@ -190,6 +190,38 @@ same key and the check was a no-op between them. [WORKTREE-GATE.md](WORKTREE-GAT
 session into its own worktree, which is what makes worktree-keyed ownership meaningful. The two gates are
 a pair.
 
+### When the owning worktree is gone — recreate it (BACKLOG #1293)
+
+`Checker.owns` compares the recorded worktree path to the committing one by **casefolded string
+equality**, with no fallback. So removing a worktree that holds an unlanded allocation strands the
+number: `owns()` returns false for **every** session from then on, and any PR that must re-introduce
+that heading is unlandable **by anyone**. PR #397 was stranded exactly this way.
+
+**Prevention is enforced.** `scripts/worktree/remove.ps1` refuses a removal while this worktree owns a
+number whose item is not yet on `origin/main`, and a cannot-tell reads as at-risk. The override is
+`-AllowOrphanedAllocations` and deliberately **not** `-Force`: that one already means *"I accept losing
+uncommitted changes"*, and one consent must not silently cover a second, irreversible risk.
+
+**Recovery, for a number already stranded: RECREATE A WORKTREE AT THE RECORDED PATH.** Owner ruling,
+2026-08-21. Its closeness to the rename workaround [`CLAUDE.md`](../CLAUDE.md) §5 forbids was put to the
+owner explicitly and ruled acceptable **for this case only**.
+
+**THE DISCRIMINATOR IS WHY THE RULING IS COHERENT, AND IT TRAVELS WITH THE REMEDY:**
+
+| | |
+|---|---|
+| recreating the path **RESTORES the condition the gate tests** | `owns()` compares a path string; restoring the path restores the referent, and the commit is then *genuinely* made from the owning worktree |
+| a rename workaround **BYPASSES the test** | the condition is never satisfied; the check is fooled into passing |
+
+**THIS IS NOT GENERAL PERMISSION FOR RENAME WORKAROUNDS — the §5 prohibition stands unchanged.** Quote
+the discriminator, never the permission: a remedy repeated without its reason is indistinguishable from
+the workaround it is not.
+
+**Two alternatives were considered and NOT taken**, recorded so neither is re-opened as novel: an
+explicit `alloc.ps1 -Reassign` (honest, but it puts a hole in the non-transferable rule the gate rests
+on), and letting a missing owner fall through to the CI carve-out (narrowest, but it fails **open** once
+per number, so "missing" would have to be unforgeable).
+
 ## The ref store, and the cleanup of 2026-08-05
 
 This section exists because the ratchet warning above names refs a future session will go looking for and
