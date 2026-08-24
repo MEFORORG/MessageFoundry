@@ -48,6 +48,28 @@ _ITEM = re.compile(r"#(\d{1,5})\b")
 _DOC_PREFIXES = ("docs/", ".github/")
 _DOC_SUFFIXES = (".md",)
 
+# NEVER DOCUMENTATION, WHEREVER IT LIVES (BACKLOG #1345). The prefixes above classify by LOCATION, so
+# before this a file DECLARED ITSELF documentation merely by sitting under one -- and `.github/` holds
+# the CI workflows. Measured on this tree: 28 `.yml`/`.yaml` under `.github/` and 2 `.py` under
+# `docs/`, all of which a commit could change ALONE while the gate held it to no claim at all.
+# Rewiring CI is exactly the change two sessions can collide on, which is the collision this gate
+# exists to stop, so the extension decides before the directory does.
+_CODE_SUFFIXES = (
+    ".py",
+    ".ps1",
+    ".psm1",
+    ".sh",
+    ".yml",
+    ".yaml",
+    ".ts",
+    ".js",
+    ".mjs",
+    ".cjs",
+    ".toml",
+    ".cfg",
+    ".ini",
+)
+
 
 def _safe_for_message(value: object, limit: int = 400) -> str:
     """Fold a value that is about to be INTERPOLATED INTO PROSE AN AGENT IS TOLD TO ACT ON.
@@ -98,6 +120,10 @@ def _touches_code(paths: list[str]) -> bool:
     """True if any staged path is not documentation. An empty diff counts as no code (e.g. --amend of a
     message), so a message-only fixup is never blocked."""
     for p in paths:
+        # THE EXTENSION IS CHECKED FIRST, ON PURPOSE. It must OVERRIDE the location: the whole defect
+        # is that a prefix let an executable declare itself documentation.
+        if p.endswith(_CODE_SUFFIXES):
+            return True
         if p.startswith(_DOC_PREFIXES):
             continue
         if p.endswith(_DOC_SUFFIXES):
