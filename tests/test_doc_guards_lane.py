@@ -71,6 +71,38 @@ def test_the_lane_is_not_empty_and_names_real_test_modules() -> None:
 
 
 @pytest.mark.skipif(shutil.which("git") is None, reason="needs git to build an isolated fixture")
+def test_the_citation_guards_are_IN_the_lane(tmp_path: Path) -> None:
+    """A FLOOR MEMBER, NOT A CENSUS (BACKLOG #1235).
+
+    This file's own docstring says the list is "a FLOOR, NOT a census", and this test does not
+    change that: it names the members whose ABSENCE was the defect, and says nothing about the rest.
+
+    #1235's whole thesis is a citation to an unallocated number, which is introduced BY EDITING
+    PROSE. So its detector must run on the pull requests that edit prose -- and `ci.yml`'s
+    documentation-only step is the only leg that runs there. `tests/test_dangling_citation_check.py`
+    was absent from DOC_GUARDS while TWO citation siblings were present, so the gate existed,
+    passed its own tests, and never ran on the shape it was built for.
+
+    WITHOUT THIS TEST, DELETING THAT LINE REGRESSES SILENTLY. The lane's other checks do not catch
+    it: `test_every_named_doc_guard_exists` only validates the modules that ARE named, and
+    `test_the_lane_is_not_empty` passes at any count above ten. A guard removed from the list is
+    indistinguishable from a guard that was never in it.
+    """
+    guards = set(_doc_guards())
+    required = {
+        "tests/test_dangling_citation_check.py",
+        "tests/test_backlog_citation_check.py",
+        "tests/test_claude_section_citations.py",
+    }
+    missing = sorted(required - guards)
+    assert not missing, (
+        "citation guards dropped from the documentation-only lane: "
+        + ", ".join(missing)
+        + " -- a citation is introduced by editing prose, so a detector that does not run on a "
+        "docs-only PR does not run on the shape it exists for (BACKLOG #1235)."
+    )
+
+
 def test_THE_LANE_CAN_FAIL_on_a_planted_documentation_violation(tmp_path: Path) -> None:
     """THE ARM THE ITEM WAS LEFT OPEN FOR: prove a docs-only violation turns this lane RED.
 
