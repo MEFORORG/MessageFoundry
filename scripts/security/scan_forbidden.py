@@ -226,10 +226,17 @@ _HOME_PATH = re.compile(
 # one a false positive (a dated OASIS namespace quoted in security-critical code, a CFR citation, a
 # sandbox depth constant, a synthetic MRN).
 #
-# NOT gated on the _SITE_SKIP_* sets, unlike the site-code detectors. Their skip exists because BARE
-# digit runs storm in lock/SVG/password files; the anchor already removes that storm (measured: zero
-# matches across those files), so the skip would only open a hole -- a flame-graph SVG's frame labels
-# are function names, and a transform function name is one of the two forms this exists for.
+# NOT gated on the _SITE_SKIP_* sets, unlike the site-code detectors, because that set includes
+# ``.svg`` and a flame-graph SVG's frame labels are function names -- a transform function name is one
+# of the two forms this exists for, so the blanket skip would open a hole.
+#
+# IT IS gated on _ESTATE_SKIP_NAMES, which is narrower and exists because the original reasoning
+# EXPIRED. That reasoning was "the anchor already removes that storm (measured: zero matches across
+# those files)", and it was true when written. It is not true now: common_passwords.txt grew to
+# 15,256 lines on main after this detector was written, and the anchored pattern fires 9 times on it
+# -- every hit a wordlist entry that happens to join a letter-bearing segment to a six-digit run.
+# A measured claim is only as current as its measurement. The skip names the ONE file whose content
+# is a generated wordlist rather than authored text, and leaves lock and SVG scanning intact.
 _ESTATE_ID_SHAPE = re.compile(
     r"(?<![A-Za-z0-9.])"
     # Arm 1, code-trailing: `PT_<code>_ADT`, `IB_FEED_<code>.py`. The trailing lookahead permits `.`
@@ -257,6 +264,11 @@ _IP_SKIP_NAMES = {"requirements.lock", "uv.lock", "package-lock.json"}
 
 # Lock/SVG/password-list files are dense with incidental standalone digit runs -> skip the site-code
 # file scan (only) on them to avoid a false-positive storm.
+#: Content-scan skip for _ESTATE_ID_SHAPE ONLY, and by NAME only -- deliberately not by suffix, so
+#: .svg and .lock keep their estate-shape content scanning. The file-NAME check earlier in
+#: _scan_file is never skipped: a file whose own name carries the shape is still a hit.
+_ESTATE_SKIP_NAMES = {"common_passwords.txt"}
+
 _SITE_SKIP_SUFFIXES = {".lock", ".svg"}
 _SITE_SKIP_NAMES = {
     "requirements.lock",
@@ -948,6 +960,7 @@ def scan_file(path: Path, rel_posix: str | None = None, *, show_context: bool = 
         return hits
     ip_scan = path.suffix not in _IP_SKIP_SUFFIXES and path.name not in _IP_SKIP_NAMES
     site_scan = path.suffix not in _SITE_SKIP_SUFFIXES and path.name not in _SITE_SKIP_NAMES
+    estate_scan = path.name not in _ESTATE_SKIP_NAMES
     for lineno, line in enumerate(text.splitlines(), 1):
         if any(a.search(line) for a in ALLOWLIST):
             continue
@@ -983,7 +996,7 @@ def scan_file(path: Path, rel_posix: str | None = None, *, show_context: bool = 
             hits.append(f"{posix}:{lineno}: absolute user-home path (OS account name)")
         # Reason-only for the same reason as the two above, and NOT ``ctx``-appended even under
         # show_context: the identifier IS the disclosure.
-        if _ESTATE_ID_SHAPE.search(line):
+        if estate_scan and _ESTATE_ID_SHAPE.search(line):
             hits.append(
                 f"{posix}:{lineno}: {_ESTATE_ID_REASON} (the ported-estate site-code shape)"
             )
