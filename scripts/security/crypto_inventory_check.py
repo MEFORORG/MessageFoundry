@@ -182,6 +182,12 @@ INVENTORY: dict[str, frozenset[str]] = {
     # (ssl.create_default_context), plus opt-in client-cert mTLS (load_cert_chain). Builds the
     # client-side TLS verification context.
     "messagefoundry/apiclient/client.py": frozenset({"ssl", "truststore"}),
+    # BACKLOG #1276 part A: the engine always serves TLS now and mints a self-signed placeholder when
+    # no operator cert is configured. This harness supplies its own certificate instead — one pair
+    # minted per run (ssl.create_default_context(cafile=...) pins to it) rather than chasing the one
+    # the engine mints, so no client ever races a file that doesn't exist until the engine writes it.
+    # Non-prod only: the pair lives in a per-process temp dir and covers loopback names alone.
+    "harness/load/tlsmat.py": frozenset({"ssl"}),
     # ADR 0041 (D3): SHA-256 hashes of the loaded first-party modules vs the wheel dist-info/RECORD at
     # startup self-attestation — drift detection (integrity/tamper-evidence, not a secret); the engine
     # alerts by default and (opt-in) fails closed on drift.

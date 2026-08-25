@@ -84,6 +84,10 @@ _NOT_KEY_MATERIAL: dict[str, str] = {
     "Console → engine TLS": "a TLS hop configured from the engine's own listener cert (scoped in "
     "the Cert tooling row)",
     "Tray → engine TLS": "a tokenless local TLS probe; no engine-held key",
+    "Load-test harness → spawned-engine TLS": "a TLS hop whose certificate is minted via the same "
+    "self-signed dev-cert path already scoped in the Cert tooling row (pki.make_self_signed); the "
+    "harness process holds the pair only long enough to hand it to the child it spawned, in a "
+    "per-run temp directory, and nothing about it is engine-held or persisted",
     "Engine-shard lane ownership": "a coordination record, not cryptographic material",
     "DAST scan-target credential": "a throwaway CSPRNG password for two ephemeral scan identities, "
     "stored only as an argon2id hash in a temp-directory store the scan destroys; a credential is "
