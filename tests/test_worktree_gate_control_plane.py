@@ -350,10 +350,14 @@ def test_a_target_that_cannot_be_RESOLVED_fails_closed(repo: SimpleNamespace) ->
 
 def test_removing_another_sessions_worktree_is_denied(repo: SimpleNamespace) -> None:
     """Every other rule protects a tree from being SWAPPED. This one protects it from being DELETED,
-    which is strictly worse and was entirely unguarded: `git worktree remove` takes the directory and its
-    branch with any uncommitted work in them, and the session using it finds out when its next read
-    fails. The verb list could never have caught it -- `worktree remove` is two tokens where every other
-    entry is one."""
+    which is strictly worse and was entirely unguarded: `git worktree remove` takes the directory and
+    any uncommitted work in it, and the session using it finds out when its next read fails. The verb
+    list could never have caught it -- `worktree remove` is two tokens where every other entry is one.
+
+    THIS DOCSTRING USED TO SAY "the directory and its branch" AND THAT IS FALSE (BACKLOG #1017).
+    Measured: create a worktree on a new branch, `git worktree remove` it, and the branch still
+    resolves. remove.ps1 only deletes one behind its own `-DeleteBranch` switch. The falsehood was in
+    the deny text AND here, so the test would have vouched for the sentence it existed to check."""
     reason = assert_denied(
         run_gate(shell(f'git worktree remove "{repo.wt}"', cwd=repo.primary), repo.repos)
     )
@@ -364,6 +368,19 @@ def test_removing_another_sessions_worktree_is_denied(repo: SimpleNamespace) -> 
     assert "ANOTHER SESSION" not in reason
     assert "NOT the tree" in reason
     assert "cannot tell" in reason
+
+    # BACKLOG #1017. The refusal must not overstate the harm. `git worktree remove` does NOT delete
+    # the branch, so committed work survives the tree; it is the DIRTY tree that is unrecoverable.
+    # Overstating is not a safe error here: a reader who knows git spots that the gate is wrong about
+    # git, and a control wrong about its own subject is the one people route around.
+    assert "THE BRANCH SURVIVES" in reason
+    assert "-DeleteBranch" in reason, (
+        "the refusal must name the separate act that DOES delete a branch, or the correction just "
+        "removes information instead of replacing it"
+    )
+    assert "working tree and its branch" not in reason, (
+        "the false claim is back: `git worktree remove` does not take the branch"
+    )
 
 
 def test_removing_your_own_worktree_is_not_blamed_on_another_session(
