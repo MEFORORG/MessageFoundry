@@ -642,7 +642,7 @@ def _inbound_rows_per_node(nodes: list[EngineNode]) -> list[int]:
     counts: list[int] = []
     for node in nodes:
         try:
-            client = EngineClient(node.url)
+            client = EngineClient(node.url, cacert=node.cacert)
             try:
                 rows = client.connections()
             finally:
@@ -683,7 +683,7 @@ def _attribute_engines_sync(
         foreign_rows = 0
         reads = 0
         try:
-            client = EngineClient(node.url)
+            client = EngineClient(node.url, cacert=node.cacert)
             try:
                 rows = client.connections()
             finally:

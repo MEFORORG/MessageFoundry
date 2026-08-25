@@ -68,6 +68,7 @@ from harness.load.metrics import Counters, Histogram, LiveMetrics
 from harness.load.profile import TypeMix, load_profile_text
 from harness.load.sender import PersistentConnection
 from harness.load.sink import CorrelationSink
+from harness.load.tlsmat import harness_ssl_context
 from messagefoundry.config.wiring import load_config
 from messagefoundry.pipeline.sharding import (
     owned_destination_set,
@@ -1115,9 +1116,9 @@ def _free_contiguous(n: int, start: int = 3600, tries: int = 60) -> int:
 
 async def _await_health(url: str, *, timeout: float) -> bool:
     deadline = time.monotonic() + timeout
-    # verify=False: url is always a locally-spawned ShardCertNode/EngineNode's own address -- the PID
-    # this harness holds is the trust anchor, not the self-signed placeholder cert that PID minted.
-    async with httpx.AsyncClient(timeout=2.0, verify=False) as client:
+    # url is always a locally-spawned ShardCertNode/EngineNode address (verified: every call site
+    # passes node.url or restart.url), so the run's own pinned certificate covers it.
+    async with httpx.AsyncClient(timeout=2.0, verify=harness_ssl_context()) as client:
         while time.monotonic() < deadline:
             with contextlib.suppress(Exception):
                 r = await client.get(f"{url}/health")
@@ -3382,6 +3383,16 @@ async def run_shardcert_driver(
         # Drain against the engines' REMOTE /stats — the authoritative drain signal, polled off-box.
         # allow_insecure: the remote engine API is plaintext http, so the poller needs it (loopback
         # never does) — else poller.open() fail-closes on the non-loopback http URL.
+        # STILL http, KNOWINGLY. This is the TWO-BOX path: the engine runs on another host that
+        # this process never spawned, so the run's own anchor (harness.load.tlsmat) cannot cover it
+        # and EnginePoller._cacert_for deliberately declines to pin a non-loopback URL.
+        #
+        # #1276 makes that remote engine serve TLS too, so this rig needs its own answer -- either
+        # the two boxes share one certificate (export MEFOR_HARNESS_TLS_CERT_FILE/KEY_FILE on both,
+        # which the tlsmat inheritance already honours) or the rig ships the engine box's cert to the
+        # load box. That is a rig-provisioning decision, not a code one, and it is NOT exercised by
+        # any CI workflow -- so it is left visible here rather than half-converted to https, which
+        # would fail verification against a cert this box has never seen.
         urls = [f"http://{engine_host}:{p}" for p in api_ports]
         poller = EnginePoller(urls, None, origin=time.perf_counter(), allow_insecure=allow_insecure)
         await poller.open()
@@ -4452,6 +4463,16 @@ async def run_shardcert_drive(
         driver_dones = await _await_indexed(
             coord, DRIVER_DONE, driver_count, timeout=driver_done_wait
         )
+        # STILL http, KNOWINGLY. This is the TWO-BOX path: the engine runs on another host that
+        # this process never spawned, so the run's own anchor (harness.load.tlsmat) cannot cover it
+        # and EnginePoller._cacert_for deliberately declines to pin a non-loopback URL.
+        #
+        # #1276 makes that remote engine serve TLS too, so this rig needs its own answer -- either
+        # the two boxes share one certificate (export MEFOR_HARNESS_TLS_CERT_FILE/KEY_FILE on both,
+        # which the tlsmat inheritance already honours) or the rig ships the engine box's cert to the
+        # load box. That is a rig-provisioning decision, not a code one, and it is NOT exercised by
+        # any CI workflow -- so it is left visible here rather than half-converted to https, which
+        # would fail verification against a cert this box has never seen.
         urls = [f"http://{engine_host}:{p}" for p in api_ports]
         # allow_insecure threads the plaintext-http-to-remote posture: the engine box's API is http and
         # off-box, so without it EngineClient fail-closes and poller.open() raises AFTER the children are

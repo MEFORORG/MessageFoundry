@@ -667,11 +667,13 @@ def _is_rcsi_gate(detail: str) -> bool:
 async def _await_node_healthy(node: EngineNode, *, timeout: float) -> None:
     import httpx
 
+    from harness.load.tlsmat import harness_ssl_context
+
     start = time.perf_counter()
-    # verify=False: the harness spawned this process and holds its PID, which is the real trust
-    # anchor. Verifying the self-signed cert it just watched that process mint would only confirm
-    # the file on disk matches the socket -- the PID already establishes that.
-    async with httpx.AsyncClient(timeout=4.0, verify=False) as client:
+    # Pin to the run's own certificate (harness.load.tlsmat): the harness minted it and handed it to
+    # the node as operator-supplied [api] material, so it is on disk before the process starts. That
+    # is what makes pinning cheaper than skipping verification here -- there is no file to wait for.
+    async with httpx.AsyncClient(timeout=4.0, verify=harness_ssl_context()) as client:
         while time.perf_counter() - start < timeout:
             if not node.alive:
                 raise ConnScaleError(f"engine exited during startup:\n{node.log_tail()}")
