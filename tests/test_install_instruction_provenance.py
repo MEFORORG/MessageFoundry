@@ -237,3 +237,64 @@ def test_the_synthetic_probe_name_is_not_a_real_distribution() -> None:
     assert _SYNTHETIC_UNPUBLISHED not in packaged, (
         f"{_SYNTHETIC_UNPUBLISHED!r} is now a real distribution — pick another fictional probe name"
     )
+
+
+# --- BACKLOG #1193 (ASVS 15.2.4): the README's signing claim must match the workflow -------------
+
+
+def _release_publish_jobs() -> dict[str, str]:
+    """Each top-level job in ``release.yml`` that publishes a distribution, name -> its YAML text.
+
+    Read as TEXT rather than parsed YAML: the question is which STEPS a job contains, and the job
+    boundary is a top-level two-space key, which is unambiguous here and needs no dependency.
+    """
+    path = _ROOT / ".github" / "workflows" / "release.yml"
+    lines = path.read_text(encoding="utf-8").splitlines()
+    starts: list[tuple[int, str]] = []
+    for i, line in enumerate(lines):
+        m = re.match(r"^  ([a-z][A-Za-z0-9_-]*):$", line)
+        if m:
+            starts.append((i, m.group(1)))
+    jobs: dict[str, str] = {}
+    for idx, (line_no, name) in enumerate(starts):
+        end = starts[idx + 1][0] if idx + 1 < len(starts) else len(lines)
+        body = "\n".join(lines[line_no:end])
+        if "pypi-publish" in body or "attestations: true" in body:
+            jobs[name] = body
+    return jobs
+
+
+def test_readme_does_not_claim_signing_coverage_the_release_workflow_does_not_provide() -> None:
+    """README must not tell every reader that EVERY release is Sigstore-signed when two are not.
+
+    Measured: only the engine job runs Sigstore signing, ``attest-build-provenance`` and the SBOM.
+    ``release-webconsole`` and ``release-harness`` carry none of those steps -- they set
+    ``attestations: true`` on the publish action, which is the PyPI-side PEP 740 attestation and a
+    different artifact from a GitHub attestation. A reader who installs the console wheel (the README
+    lists that command directly above this note) and runs ``gh attestation verify`` against it finds
+    nothing, having been told the opposite.
+
+    Derived rather than prose-pinned: if someone later adds signing to the console job the unscoped
+    claim becomes TRUE, and this test stops objecting to it on its own.
+    """
+    jobs = _release_publish_jobs()
+    signing = re.compile(r"sigstore|attest-build-provenance|cyclonedx", re.IGNORECASE)
+    signed = {name for name, body in jobs.items() if signing.search(body)}
+
+    # POSITIVE CONTROLS, both directions: the parse found the jobs, and the detector can SEE signing
+    # where signing exists. Without these a broken job-splitter yields an empty unsigned set and this
+    # test passes while measuring nothing.
+    assert len(jobs) >= 3, f"the release-job parse found {len(jobs)} publish jobs; expected 3+"
+    assert signed, (
+        "no publish job appears to sign -- the detector matched nothing, so its silence is meaningless"
+    )
+
+    unsigned = set(jobs) - signed
+    if not unsigned:
+        return  # every published artifact is signed; an unscoped claim would be true
+
+    readme = (_ROOT / "README.md").read_text(encoding="utf-8")
+    assert "ENGINE wheel only" in readme, (
+        "README must say which artifacts the signing covers, because it does not cover all of them: "
+        f"unsigned publish jobs are {sorted(unsigned)}"
+    )

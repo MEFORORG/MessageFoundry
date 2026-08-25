@@ -381,6 +381,39 @@ class _FtpClient(_RemoteClient):
                 ftp.close()
 
 
+#: SSH MAC algorithms this connector will PROPOSE (BACKLOG #1171, ASVS 11.4.1). Appendix C of the
+#: ASVS V11 chapter marks HMAC-MD5 **D** (disallowed) and SHA-1 **L** (restricted: "not suitable for
+#: HMAC"), and paramiko's own preferred list carries `hmac-md5`, `hmac-sha1` and their -96 truncations.
+#: With no restriction the shipped connector OFFERS them, and a server that selects one gets it -- on
+#: a use case this requirement names by name, in a clause with no default-off escape.
+#:
+#: STATED AS AN ALLOW-LIST, DELIBERATELY. paramiko's API takes a DENY list (``disabled_algorithms``),
+#: so :func:`_disabled_sftp_macs` derives that deny list by subtracting this set from whatever the
+#: installed paramiko offers. A deny list would have to be edited every time the library adds an
+#: algorithm, and the failure mode of forgetting is that the new algorithm is PROPOSED. Here the
+#: failure mode of forgetting is that it is excluded -- wrong in the safe direction, by construction.
+_APPROVED_SFTP_MACS = frozenset(
+    {
+        "hmac-sha2-256",
+        "hmac-sha2-512",
+        "hmac-sha2-256-etm@openssh.com",
+        "hmac-sha2-512-etm@openssh.com",
+    }
+)
+
+
+def _disabled_sftp_macs(paramiko: Any) -> list[str]:
+    """Every MAC the installed paramiko would offer that is NOT in :data:`_APPROVED_SFTP_MACS`.
+
+    Reads the library's own preferred list rather than a hardcoded one, so the subtraction stays
+    correct across paramiko versions. If that attribute ever disappears the result is an EMPTY deny
+    list, which would silently restore the weak proposals -- so the caller asserts non-emptiness
+    rather than trusting this to have found something.
+    """
+    offered = getattr(paramiko.Transport, "_preferred_macs", None)
+    return [m for m in (offered or ()) if m not in _APPROVED_SFTP_MACS]
+
+
 def _import_paramiko() -> Any:
     """Import the optional ``paramiko`` SSH library, raising a clear install hint if the ``[sftp]``
     extra isn't present — so installs that never use SFTP never touch it (mirrors ``_import_aioodbc``)."""
@@ -435,7 +468,11 @@ class _SftpClient(_RemoteClient):
             paramiko.AutoAddPolicy() if self._accept_unknown else paramiko.RejectPolicy()
         )
         pkey = self._load_key(paramiko)
+        # Constrain the MAC proposal to the approved set (BACKLOG #1171). Passed on every connect, not
+        # behind a setting: a control an operator has to switch on is not a control.
+        disabled = {"mac": _disabled_sftp_macs(paramiko)}
         client.connect(
+            disabled_algorithms=disabled,
             hostname=self._host,
             port=self._port,
             username=str(self._user) if self._user else None,

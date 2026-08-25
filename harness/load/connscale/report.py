@@ -149,6 +149,19 @@ class ConnScaleRecord:
     # non-batching record deserializes unchanged. The batch comparison pairs B0 vs B1 by this tag (it
     # reuses the fusion comparator's verdict path keyed on this field instead of ``fuse_thread_hops``).
     batch_handoff_statements: bool = False
+    # --- wall #4 probe provenance: why `fd_count_peak` is None, when it is None ---
+    # `fd_count_peak = None` used to be the whole story, and it is the same value whether the host was
+    # too starved to enumerate, the process tree was gone, or the enumerator ran and returned zero
+    # rows. Those warrant different verdicts, so the OS probe's own account of the window travels with
+    # the gauge. `fd_probe_ticks` is the SCOPE for `fd_probe_degraded_ticks` (a degraded count without
+    # its denominator is not readable), and `fd_probe_degraded` holds the DISTINCT causes as strings
+    # (`harness.load.connscale.probe.ProbeDegraded` values) — strings, so this module keeps its
+    # independence from the probe. All three default so an older artifact deserializes unchanged;
+    # an empty `fd_probe_degraded` alongside `fd_probe_ticks == 0` means the probe did not run at all,
+    # which is itself distinct from having run and failed.
+    fd_probe_ticks: int = 0
+    fd_probe_degraded_ticks: int = 0
+    fd_probe_degraded: tuple[str, ...] = ()
 
     def to_json_dict(self) -> dict[str, object]:
         return {
@@ -212,7 +225,16 @@ class ConnScaleRecord:
                     else round(self.empty_claims_per_msg, 3)
                 ),
             },
-            "wall4_fd": {"count_peak": self.fd_count_peak},
+            "wall4_fd": {
+                "count_peak": self.fd_count_peak,
+                # The gap's account of itself. Present even on a clean window (0 degraded of N ticks),
+                # because "the probe measured every tick" is a fact worth reading in an artifact too.
+                "probe": {
+                    "ticks": self.fd_probe_ticks,
+                    "degraded_ticks": self.fd_probe_degraded_ticks,
+                    "degraded": list(self.fd_probe_degraded),
+                },
+            },
             "wall5_reload": {"seconds": self.reload_seconds},
             "wall6_ack_ms": {
                 "p50": round(self.ack_p50_ms, 3),
@@ -370,6 +392,15 @@ class ConnScaleReport:
                 f"{_na(r.fd_count_peak):>7}{_na(_round_or_none(r.cpu_seconds_total, 1)):>8}"
                 f"{_na(r.reload_seconds):>8}{r.ack_p99_ms:>9.1f}"
             )
+        # The `fd` column renders `n/a` on a gap, and nobody can act on `n/a`. Name the mechanism beside
+        # it, with the scope of the count, so the console says which of the probe's degrade paths fired.
+        for r in self.records:
+            if r.fd_probe_degraded_ticks:
+                causes = ", ".join(r.fd_probe_degraded) or "cause not recorded"
+                lines.append(
+                    f"fd probe: {r.sweep_mode}@N={r.count} -- {r.fd_probe_degraded_ticks} of "
+                    f"{r.fd_probe_ticks} tick(s) measured nothing [{causes}]"
+                )
         lines.append("")
         lines.append("SLOs:")
         if not self.slos:

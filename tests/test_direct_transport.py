@@ -173,6 +173,10 @@ class _FakeSMTP:
         self.tls_context = context  # #323 — see test_email_destination._FakeSMTP
         self.started_tls = False
         self.logged_in: tuple[str, str] | None = None
+        self.auth_mechanism: str | None = None
+        self.user = ""
+        self.password = ""
+        self.esmtp_features = {"auth": "CRAM-MD5 PLAIN LOGIN"}
         self.sent: list[EmailMessage] = []
         self.did_ehlo = False
         self.did_noop = False
@@ -199,6 +203,27 @@ class _FakeSMTP:
         if self.fail_at == "login":
             raise smtplib.SMTPAuthenticationError(535, b"bad creds")
         self.logged_in = (user, password)
+
+    # BACKLOG #1171: the connector drives auth() directly, NOT login(). login()'s preference order is
+    # internal and tries CRAM-MD5 FIRST -- an HMAC over MD5. So this fake models the negotiation the
+    # production code actually performs, and ADVERTISES CRAM-MD5 on purpose: if the code ever regresses
+    # to login(), CRAM-MD5 is what it would pick, and a fake that offered only PLAIN/LOGIN could not
+    # tell the difference.
+    def has_extn(self, name: str) -> bool:
+        return name.lower() == "auth"
+
+    def auth(self, mechanism: str, authobject: Any, *, initial_response_ok: bool = True) -> None:
+        if self.fail_at == "login":
+            raise smtplib.SMTPAuthenticationError(535, b"bad creds")
+        self.auth_mechanism = mechanism
+        # smtp_login_approved sets .user/.password before calling auth(), exactly as login() does.
+        self.logged_in = (self.user, self.password)
+
+    def auth_plain(self, challenge: bytes | None = None) -> str:
+        return ""
+
+    def auth_login(self, challenge: bytes | None = None) -> str:
+        return ""
 
     def noop(self) -> tuple[int, bytes]:
         self.did_noop = True

@@ -143,7 +143,7 @@ def _browse_filters(
     message_type: str,
     control_id: str,
 ) -> Markup:
-    """A GET filter form over an uploaded file's split messages (metadata + optional content needle)."""
+    """A POST filter form over an uploaded file's split messages (metadata + optional content needle)."""
     return el(
         "form",
         el(
@@ -161,8 +161,10 @@ def _browse_filters(
             placeholder="control id (optional)",
         ),
         el("button", "Filter", type="submit"),
-        method="get",
-        action=f"/ui/uploaded-logs/file/{file_id}",
+        # POST for the same reason the content-search form is one (BACKLOG #1184, ASVS 14.2.1): the
+        # field value and substring are PHI-shaped, and a GET form puts them on the URL.
+        method="post",
+        action=f"/ui/uploaded-logs/file/{file_id}/filter",
         class_="filters",
     )
 

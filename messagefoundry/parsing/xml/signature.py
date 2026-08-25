@@ -20,8 +20,10 @@ Pure: no engine imports.
 
 from __future__ import annotations
 
+import dataclasses
 import hashlib  # noqa: F401 - crypto-inventory anchor: XML-DSig digests run via signxml/cryptography
 from dataclasses import dataclass
+from typing import Any
 
 from messagefoundry.parsing.xml._deps import load_signxml
 from messagefoundry.parsing.xml.errors import XmlError
@@ -38,6 +40,37 @@ class XmlSignatureResult:
 
     verified: bool
     reason: str | None = None
+
+
+def _approved_signature_config(signxml: Any) -> Any:
+    """signxml's accept-set minus every algorithm built on a sub-254-bit digest (BACKLOG #1171).
+
+    ``XMLVerifier.verify`` takes ``expect_config`` and this call passed NONE, so the library's own
+    default decided which algorithms a partner's signature could use. Measured on the pinned version,
+    that default admits **SHA-224 and SHA3-224** as digests and six signature methods built on them.
+    The V11 appendix's general-use preamble disqualifies a sub-254-bit digest output for new designs
+    in any collision-resistance-requiring application, and a signature is one.
+
+    DERIVED BY SUBTRACTION FROM THE LIBRARY'S DEFAULT, not rebuilt. ``replace`` keeps every other
+    field the pinned version ships -- ``require_x509``, ``expect_references``, the c14n method -- so a
+    future signxml that hardens a default we never named is not silently reverted by this call. A
+    hand-built config would freeze today's answer to questions this code is not trying to decide.
+
+    SCOPE, STATED BECAUSE IT IS NARROWER THAN THE ITEM'S: only the digest-STRENGTH limb is applied
+    here. #1171 also reads the appendix as disallowing RSA-PKCS#1-v1.5 and DSA outright, and both are
+    in the default accept-set (``RSA_SHA256`` and its siblings are PKCS#1 v1.5; ``DSA_SHA256`` is
+    present). That restriction is NOT applied, because it would refuse the most common XML-DSig
+    signature in use and the appendix's text cannot be read from this checkout to confirm it. Applying
+    a break-the-common-case restriction on a relayed reading of a standard is not a call this change
+    makes.
+    """
+    default = signxml.SignatureConfiguration()
+    weak = "224"
+    return dataclasses.replace(
+        default,
+        digest_algorithms=frozenset(d for d in default.digest_algorithms if weak not in d.name),
+        signature_methods=frozenset(m for m in default.signature_methods if weak not in m.name),
+    )
 
 
 def verify(
@@ -68,7 +101,12 @@ def verify(
     root = parse_bytes(document)
     verifier = signxml.XMLVerifier()
     try:
-        verifier.verify(root, x509_cert=x509_cert, ca_pem_file=ca_pem_file)
+        verifier.verify(
+            root,
+            x509_cert=x509_cert,
+            ca_pem_file=ca_pem_file,
+            expect_config=_approved_signature_config(signxml),
+        )
     except signxml.exceptions.InvalidSignature as exc:
         return XmlSignatureResult(verified=False, reason=type(exc).__name__)
     except signxml.exceptions.InvalidInput as exc:

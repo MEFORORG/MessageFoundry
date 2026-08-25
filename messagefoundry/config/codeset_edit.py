@@ -165,14 +165,21 @@ def rename_code_set(
 ) -> dict[str, Any]:
     """Rename ``codesets/<old>.<ext>`` to ``codesets/<new>.<same ext>`` (atomic ``os.replace``).
 
-    ``new`` is checked with the same name-safety rules as ``upsert``; the rename is rejected if **any**
-    supported file already exists for ``new`` (a stem collision). Raises :class:`WiringError` if
-    ``old``/``new`` is missing, the source is absent, ``new`` is unsafe, or the stem collides."""
+    **Both** ``old`` and ``new`` are checked with the same name-safety rules as ``upsert``; the rename
+    is rejected if **any** supported file already exists for ``new`` (a stem collision). Raises
+    :class:`WiringError` if ``old``/``new`` is missing or unsafe, the source is absent, or the stem
+    collides."""
     if not old:
         raise WiringError("--name is required for `codeset rename`")
     if not new:
         raise WiringError("--to is required for `codeset rename`")
     codesets_dir = _codesets_dir(config_dir)
+    # The rename SOURCE is untrusted too, and it builds a filesystem path at ``_existing_path``, so it
+    # must clear the same rules as ``new`` BEFORE that lookup, exactly as show/remove do with theirs.
+    # Otherwise a traversal ``old`` resolves outside codesets/ and the ``os.replace`` below MOVES that
+    # file in, contents intact. Kept after the empty-argument checks so the `--name is required`
+    # wording still wins for an empty name (``_validate_name`` has its own, less specific message).
+    _validate_name(codesets_dir, old)
     src = _existing_path(codesets_dir, old)
     _validate_name(codesets_dir, new)
     # For a rename, ANY supported file for the new stem is a collision (unlike upsert, which may

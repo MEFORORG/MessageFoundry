@@ -123,8 +123,10 @@ from messagefoundry.api.models import (
     LogLevelUpdate,
     LogTailPage,
     MessageDetail,
+    MessageExportRequest,
     MessageList,
     MessageResponses,
+    MessageSearchRequest,
     MessageSearchResults,
     MessageSummary,
     MetricsHistoryResponse,
@@ -158,6 +160,7 @@ from messagefoundry.api.models import (
     UploadDeleteResult,
     UploadedFileInfo,
     UploadedFileList,
+    UploadedMessageSearchRequest,
     UploadedMessagesResult,
     UploadedMessageSummary,
     UploadResendRequest,
@@ -765,6 +768,21 @@ def _needle_shape(needle: str) -> str:
     return "mixed"
 
 
+def _scan_limit_or_default(value: int | None) -> int:
+    """Resolve a POST body's optional ``scan_limit`` against the bounds the GET's ``Query`` enforces.
+
+    The body model cannot carry the ceiling itself: the constants live in
+    :mod:`messagefoundry.store.content_search`, and importing them into ``api/models.py`` would drag
+    the engine into every process that imports those models — the coupling ADR 0088 exists to prevent.
+    So the resolution happens here, where the real constants are already in scope. 422 is what FastAPI
+    returns for an out-of-range ``Query``, so both shapes refuse the same way."""
+    if value is None:
+        return DEFAULT_CONTENT_SCAN_LIMIT
+    if value > MAX_CONTENT_SCAN_LIMIT:
+        raise HTTPException(422, f"scan_limit must be at most {MAX_CONTENT_SCAN_LIMIT}")
+    return value
+
+
 def _search_audit_detail(
     spec: SearchSpec, result: object, *, filters: dict[str, str | None]
 ) -> dict[str, object]:
@@ -1113,6 +1131,12 @@ def create_app(
             max_files_per_user=store_settings.max_upload_files_per_user,
             max_total_bytes_per_user=store_settings.max_upload_total_bytes_per_user,
             retention_days=store_settings.uploads_retention_days,
+            # ASVS 2.3.4: the quota's cross-PROCESS half. The per-uploader lock inside UploadStore is
+            # an asyncio.Lock and so is per-event-loop; N engine shards over one uploads_dir hold N
+            # of them. Every shard shares this ONE unified store (ADR 0063), so it is the decision
+            # point that spans them. None here is the genuinely store-LESS path (embedding / tests) —
+            # the same path that falls back to build_store_cipher above.
+            store=engine.store if engine is not None else None,
         )
     # ADR 0118: the EFFECTIVE [security] switch values (serve syncs the gate-flipped egress/retention back
     # in) back the read-only GET /security/posture view. None → the secure defaults for the test/embedding
@@ -3009,35 +3033,42 @@ def create_app(
             )
         return MessageList(total=total, limit=limit, offset=offset, messages=messages)
 
-    @app.get("/messages/search", response_model=MessageSearchResults)
     async def search_messages(
         request: Request,
-        engine: Engine = Depends(_get_engine),
-        # Step-up (NOT just require_phi_read): content search decrypts bodies the caller never explicitly
-        # "opened" — a bulk-PHI operation, like replay (ADR 0046 D1 §4). It therefore demands a fresh
-        # re-verification + the second factor on top of the MESSAGES_READ permission.
-        identity: Identity = Depends(require_step_up(Permission.MESSAGES_READ)),
-        content: str | None = Query(None, max_length=512),
-        field_path: str | None = Query(None, max_length=32),
-        field_value: str | None = Query(None, max_length=512),
-        target: str = Query("both", pattern="^(raw|summary|both)$"),
-        channel_id: str | None = Query(None, max_length=256),
-        status: str | None = Query(None, max_length=64),
-        message_type: str | None = Query(None, max_length=64),
-        control_id: str | None = Query(None, max_length=256),
-        limit: int = Query(50, ge=1, le=500),
-        scan_limit: int = Query(DEFAULT_CONTENT_SCAN_LIMIT, ge=1, le=MAX_CONTENT_SCAN_LIMIT),
+        *,
+        engine: Engine,
+        identity: Identity,
+        content: str | None = None,
+        field_path: str | None = None,
+        field_value: str | None = None,
+        target: str = "both",
+        channel_id: str | None = None,
+        status: str | None = None,
+        message_type: str | None = None,
+        control_id: str | None = None,
+        limit: int = 50,
+        scan_limit: int = DEFAULT_CONTENT_SCAN_LIMIT,
     ) -> MessageSearchResults:
         """Search messages by what is *in* them — an HL7 field path (``PID-3``) or a raw/summary
         substring (ADR 0046 #51). Because the store is encrypted at rest, this scans-and-decrypts: it
         pre-filters on the indexed metadata, then decrypts + matches each candidate body in memory off
         the event loop, bounded by ``scan_limit`` decrypts and ``limit`` matches (truncate-and-tell). It
         sits behind step-up (a bulk-PHI read), inherits the ``view_summary`` redaction, and writes a
-        dedicated ``message_search`` audit row that never records an MRN-shaped needle."""
+        dedicated ``message_search`` audit row that never records an MRN-shaped needle.
+
+        This is the shared implementation behind BOTH request shapes (BACKLOG #1184): the GET below,
+        which takes only the non-PHI criteria, and the POST, which is the only way to send ``content``
+        or ``field_value``. It is also what the mounted console calls in-process, so its parameters are
+        plain keywords rather than FastAPI ``Query`` declarations."""
         # #200 residual (ADR 0092): search is a bulk-PHI read behind require_step_up, NOT require_phi_read,
         # so it doesn't inherit the folded data-path guard — apply it explicitly before any decrypt.
         enforce_phi_read_hop(request)
-        enforce_phi_read_pacing(request, identity)  # step-up paces NON-GET only; this is a GET
+        # Charged here rather than in a Depends because require_step_up's own pacing is NON-GET only:
+        # the GET below would otherwise select bodies in bulk unpaced. The POST does pay that
+        # admin-write bucket as well, which is the stricter direction and immaterial at its 12/second
+        # default; this charge is the per-actor PHI-READ budget, a different bucket, and both shapes
+        # must draw on it.
+        enforce_phi_read_pacing(request, identity)
         try:
             spec = make_spec(
                 content=content,
@@ -3098,27 +3129,86 @@ def create_app(
             scan_limit=spec.scan_limit,
         )
 
-    @app.get("/messages/export")
-    async def export_messages(
+    # Step-up (NOT just require_phi_read) on both shapes: content search decrypts bodies the caller
+    # never explicitly "opened" — a bulk-PHI operation, like replay (ADR 0046 D1 §4). It therefore
+    # demands a fresh re-verification + the second factor on top of the MESSAGES_READ permission.
+    @app.get("/messages/search", response_model=MessageSearchResults)
+    async def search_messages_get(
         request: Request,
         engine: Engine = Depends(_get_engine),
-        # LARGEST PHI surface in the cluster (bulk raw bodies → a file): the strongest interactive gate —
-        # a fresh step-up + second factor over BOTH messages:view_raw AND a dedicated messages:export
-        # capability (ADR 0131 §2). Bulk egress is a distinct privilege from opening one message.
-        identity: Identity = Depends(
-            require_step_up(Permission.MESSAGES_EXPORT, Permission.MESSAGES_VIEW_RAW)
-        ),
-        ids: list[str] = Query(default=[]),  # noqa: B006 — FastAPI repeated ?ids= (save-selected)
-        content: str | None = Query(None, max_length=512),
+        identity: Identity = Depends(require_step_up(Permission.MESSAGES_READ)),
         field_path: str | None = Query(None, max_length=32),
-        field_value: str | None = Query(None, max_length=512),
         target: str = Query("both", pattern="^(raw|summary|both)$"),
         channel_id: str | None = Query(None, max_length=256),
         status: str | None = Query(None, max_length=64),
         message_type: str | None = Query(None, max_length=64),
         control_id: str | None = Query(None, max_length=256),
-        limit: int = Query(1000, ge=1, le=100_000),
+        limit: int = Query(50, ge=1, le=500),
         scan_limit: int = Query(DEFAULT_CONTENT_SCAN_LIMIT, ge=1, le=MAX_CONTENT_SCAN_LIMIT),
+    ) -> MessageSearchResults:
+        """Search on a field PATH and the metadata filters — the criteria that are safe on a URL.
+
+        ``content`` and ``field_value`` are deliberately absent (BACKLOG #1184, ASVS 14.2.1): they hold
+        whatever an operator typed to find a patient, and a query string is copied into the engine's
+        access log, the reverse proxy's log and browser history, none of which the log redactor reaches.
+        Send those to ``POST /messages/search`` instead. ``field_path`` stays because it is a structural
+        locator rather than a value — the same reason ``_search_audit_detail`` records it verbatim."""
+        return await search_messages(
+            request,
+            engine=engine,
+            identity=identity,
+            field_path=field_path,
+            target=target,
+            channel_id=channel_id,
+            status=status,
+            message_type=message_type,
+            control_id=control_id,
+            limit=limit,
+            scan_limit=scan_limit,
+        )
+
+    @app.post("/messages/search", response_model=MessageSearchResults)
+    async def search_messages_post(
+        request: Request,
+        criteria: MessageSearchRequest,
+        engine: Engine = Depends(_get_engine),
+        identity: Identity = Depends(require_step_up(Permission.MESSAGES_READ)),
+    ) -> MessageSearchResults:
+        """The needle-bearing shape of the search above (BACKLOG #1184): identical selection, identical
+        gate, identical audit — the criteria simply arrive in the request BODY, which no access log,
+        proxy log or browser history records. A POST here creates nothing; it is a search."""
+        return await search_messages(
+            request,
+            engine=engine,
+            identity=identity,
+            content=criteria.content,
+            field_path=criteria.field_path,
+            field_value=criteria.field_value,
+            target=criteria.target,
+            channel_id=criteria.channel_id,
+            status=criteria.status,
+            message_type=criteria.message_type,
+            control_id=criteria.control_id,
+            limit=criteria.limit,
+            scan_limit=_scan_limit_or_default(criteria.scan_limit),
+        )
+
+    async def export_messages(
+        request: Request,
+        *,
+        engine: Engine,
+        identity: Identity,
+        ids: list[str],
+        content: str | None = None,
+        field_path: str | None = None,
+        field_value: str | None = None,
+        target: str = "both",
+        channel_id: str | None = None,
+        status: str | None = None,
+        message_type: str | None = None,
+        control_id: str | None = None,
+        limit: int = 1000,
+        scan_limit: int = DEFAULT_CONTENT_SCAN_LIMIT,
     ) -> StreamingResponse:
         """Stream a batch of message bodies to a downloadable NDJSON file (#124, ADR 0131) — the
         Corepoint-parity bulk export a one-at-a-time ``/messages/{id}`` raw view can't provide.
@@ -3131,13 +3221,18 @@ def create_app(
         The whole export is recorded as ONE ``messages_export`` audit row **before streaming** — actor +
         selection mode + basic filters + needle SHAPE (never the value) + the count of selected bodies — so
         a scripted save-all cannot pull a body that was not first counted in a durable audit row. The
-        PHI-safe destination is the operator's responsibility."""
+        PHI-safe destination is the operator's responsibility.
+
+        This is the shared implementation behind both request shapes (BACKLOG #1184): the GET below,
+        which takes ids and the URL-safe criteria, and the POST, which is the only way to select by
+        ``content`` or ``field_value``."""
         # #200 (ADR 0092): a bulk-PHI read behind step-up (NOT require_phi_read), so apply the data-path
         # hop guard explicitly before any body is decrypted — exactly as the step-up search route does.
         enforce_phi_read_hop(request)
-        # Charged BEFORE selection: export is a step-up GET, and step-up pacing is NON-GET only, so
-        # without this a single actor can stream far more bodies per minute here than the per-actor
-        # budget allows through /messages/{id}. Admission-time so a refused call does no store work.
+        # Charged BEFORE selection: step-up pacing is NON-GET only, so without this a single actor can
+        # stream far more bodies per minute through the export GET than the per-actor budget allows
+        # through /messages/{id}. Admission-time so a refused call does no store work. The POST shape
+        # draws on this same PHI-read bucket (its admin-write charge is a different, stricter one).
         enforce_phi_read_pacing(request, identity)
         allowed = _scope(identity)  # per-channel RBAC (None = all)
         if ids:
@@ -3205,6 +3300,76 @@ def create_app(
             _iter_ndjson(),
             media_type="application/x-ndjson",
             headers={"Content-Disposition": 'attachment; filename="messages-export.ndjson"'},
+        )
+
+    # LARGEST PHI surface in the cluster (bulk raw bodies → a file), on both shapes: the strongest
+    # interactive gate — a fresh step-up + second factor over BOTH messages:view_raw AND a dedicated
+    # messages:export capability (ADR 0131 §2). Bulk egress is a distinct privilege from opening one
+    # message.
+    @app.get("/messages/export")
+    async def export_messages_get(
+        request: Request,
+        engine: Engine = Depends(_get_engine),
+        identity: Identity = Depends(
+            require_step_up(Permission.MESSAGES_EXPORT, Permission.MESSAGES_VIEW_RAW)
+        ),
+        ids: list[str] = Query(default=[]),  # noqa: B006 — FastAPI repeated ?ids= (save-selected)
+        field_path: str | None = Query(None, max_length=32),
+        target: str = Query("both", pattern="^(raw|summary|both)$"),
+        channel_id: str | None = Query(None, max_length=256),
+        status: str | None = Query(None, max_length=64),
+        message_type: str | None = Query(None, max_length=64),
+        control_id: str | None = Query(None, max_length=256),
+        limit: int = Query(1000, ge=1, le=100_000),
+        scan_limit: int = Query(DEFAULT_CONTENT_SCAN_LIMIT, ge=1, le=MAX_CONTENT_SCAN_LIMIT),
+    ) -> StreamingResponse:
+        """Export by explicit ``ids`` or by the URL-safe search criteria (BACKLOG #1184, ASVS 14.2.1).
+
+        ``content`` and ``field_value`` are gone from here for the reason the search route states: an
+        operator-typed needle is PHI-shaped and a query string is logged in three places the redactor
+        cannot reach. Send a needle-bearing save-all to ``POST /messages/export``. Message ids stay —
+        they are engine-minted opaque identifiers, not patient data."""
+        return await export_messages(
+            request,
+            engine=engine,
+            identity=identity,
+            ids=ids,
+            field_path=field_path,
+            target=target,
+            channel_id=channel_id,
+            status=status,
+            message_type=message_type,
+            control_id=control_id,
+            limit=limit,
+            scan_limit=scan_limit,
+        )
+
+    @app.post("/messages/export")
+    async def export_messages_post(
+        request: Request,
+        criteria: MessageExportRequest,
+        engine: Engine = Depends(_get_engine),
+        identity: Identity = Depends(
+            require_step_up(Permission.MESSAGES_EXPORT, Permission.MESSAGES_VIEW_RAW)
+        ),
+    ) -> StreamingResponse:
+        """The needle-bearing shape of the export above (BACKLOG #1184): same gate, same per-row channel
+        re-check, same pre-stream audit — the selection criteria arrive in the request BODY."""
+        return await export_messages(
+            request,
+            engine=engine,
+            identity=identity,
+            ids=criteria.ids,
+            content=criteria.content,
+            field_path=criteria.field_path,
+            field_value=criteria.field_value,
+            target=criteria.target,
+            channel_id=criteria.channel_id,
+            status=criteria.status,
+            message_type=criteria.message_type,
+            control_id=criteria.control_id,
+            limit=criteria.limit,
+            scan_limit=_scan_limit_or_default(criteria.scan_limit),
         )
 
     @app.get("/messages/{message_id}", response_model=MessageDetail)
@@ -3970,20 +4135,20 @@ def create_app(
             total=len(files), files=[_upload_info(m) for m in files], scope=scope
         )
 
-    @app.get("/uploads/{file_id}/messages", response_model=UploadedMessagesResult)
     async def browse_uploaded_file(
         request: Request,
+        *,
         file_id: str,
-        engine: Engine = Depends(_get_engine),
-        identity: Identity = Depends(require_step_up(Permission.FILES_BROWSE)),
-        content: str | None = Query(None, max_length=512),
-        field_path: str | None = Query(None, max_length=32),
-        field_value: str | None = Query(None, max_length=512),
-        target: str = Query("both", pattern="^(raw|summary|both)$"),
-        message_type: str | None = Query(None, max_length=64),
-        control_id: str | None = Query(None, max_length=256),
-        limit: int = Query(50, ge=1, le=500),
-        offset: int = Query(0, ge=0),
+        engine: Engine,
+        identity: Identity,
+        content: str | None = None,
+        field_path: str | None = None,
+        field_value: str | None = None,
+        target: str = "both",
+        message_type: str | None = None,
+        control_id: str | None = None,
+        limit: int = 50,
+        offset: int = 0,
     ) -> UploadedMessagesResult:
         """Browse an uploaded file's split messages as a filterable log (BACKLOG #125). Decrypts + splits
         real PHI, so it is step-up-gated + PHI-read-hop-guarded (like content search) and audited with the
@@ -3994,7 +4159,7 @@ def create_app(
         needle occur in that file", so an unscoped browse is a content oracle over another operator's
         PHI, which is why the check runs BEFORE the body is decrypted."""
         enforce_phi_read_hop(request)
-        enforce_phi_read_pacing(request, identity)  # bulk decrypt+split on a step-up GET
+        enforce_phi_read_pacing(request, identity)  # bulk decrypt+split behind a step-up gate
         us = _require_upload_store(request)
         spec: SearchSpec | None = None
         if content or field_path:
@@ -4059,6 +4224,64 @@ def create_app(
             scanned=result.scanned,
             matched=result.matched,
             truncated=result.truncated,
+        )
+
+    @app.get("/uploads/{file_id}/messages", response_model=UploadedMessagesResult)
+    async def browse_uploaded_file_get(
+        request: Request,
+        file_id: str,
+        engine: Engine = Depends(_get_engine),
+        identity: Identity = Depends(require_step_up(Permission.FILES_BROWSE)),
+        field_path: str | None = Query(None, max_length=32),
+        target: str = Query("both", pattern="^(raw|summary|both)$"),
+        message_type: str | None = Query(None, max_length=64),
+        control_id: str | None = Query(None, max_length=256),
+        limit: int = Query(50, ge=1, le=500),
+        offset: int = Query(0, ge=0),
+    ) -> UploadedMessagesResult:
+        """List the file's split messages, filtered by the criteria that are safe on a URL.
+
+        ``content`` and ``field_value`` are gone (BACKLOG #1184, ASVS 14.2.1) — the needle an operator
+        types here is the same PHI-shaped term the content search takes, and the query string reaches
+        the access log, the proxy log and browser history alike. Use
+        ``POST /uploads/{file_id}/messages/search``. ``field_path`` stays: it is a structural locator."""
+        return await browse_uploaded_file(
+            request,
+            file_id=file_id,
+            engine=engine,
+            identity=identity,
+            field_path=field_path,
+            target=target,
+            message_type=message_type,
+            control_id=control_id,
+            limit=limit,
+            offset=offset,
+        )
+
+    @app.post("/uploads/{file_id}/messages/search", response_model=UploadedMessagesResult)
+    async def browse_uploaded_file_post(
+        request: Request,
+        file_id: str,
+        criteria: UploadedMessageSearchRequest,
+        engine: Engine = Depends(_get_engine),
+        identity: Identity = Depends(require_step_up(Permission.FILES_BROWSE)),
+    ) -> UploadedMessagesResult:
+        """The needle-bearing shape of the browse above (BACKLOG #1184): same owner check, same step-up,
+        same shape-only audit — the criteria arrive in the request BODY. A distinct ``/search`` path
+        rather than a POST on ``/messages``, which would read as creating a message in the file."""
+        return await browse_uploaded_file(
+            request,
+            file_id=file_id,
+            engine=engine,
+            identity=identity,
+            content=criteria.content,
+            field_path=criteria.field_path,
+            field_value=criteria.field_value,
+            target=criteria.target,
+            message_type=criteria.message_type,
+            control_id=criteria.control_id,
+            limit=criteria.limit,
+            offset=criteria.offset,
         )
 
     @app.post("/uploads/{file_id}/resend", response_model=UploadResendResult)
@@ -5654,6 +5877,9 @@ def create_managed_app(
                 max_files_per_user=resolved.max_upload_files_per_user,
                 max_total_bytes_per_user=resolved.max_upload_total_bytes_per_user,
                 retention_days=resolved.uploads_retention_days,
+                # ASVS 2.3.4: bind the cross-shard quota ledger to the SAME store this lifespan just
+                # opened — this is the serve path, so it is the one that actually runs sharded.
+                store=store,
             )
         # Operational alert notifier (webhook/email). None when no transport is configured → the
         # engine falls back to the logging sink. Its background dispatch task is owned by this
@@ -6007,11 +6233,19 @@ def create_managed_app(
                         auth_settings.oidc_redirect_path,
                     )
                 reaper = asyncio.create_task(_session_reaper(store))
-                if auth_settings.bootstrap_expiry_hours > 0:
+                if auth.bootstrap_deadline_configured:
                     # ASVS 6.4.5 arm 2: nudge an operator BEFORE an unclaimed first-run bootstrap admin is
                     # auto-disabled. API-lifespan-owned (like the session reaper), NOT engine-owned — it
                     # reaches the AuthService directly. The warn method latches once-per-window; the sink logs
-                    # (LoggingAlertSink fallback) or notifies. No task when time-expiry is off (byte-identical).
+                    # (LoggingAlertSink fallback) or notifies. No task when NEITHER bound is configured.
+                    #
+                    # BACKLOG #1141: this open-coded `auth_settings.bootstrap_expiry_hours > 0`, a THIRD copy
+                    # of a question `bootstrap_expiry_warning` answers over TWO bounds — WP-3 account
+                    # retirement AND the ASVS 6.4.1 credential expiry. At bootstrap_expiry_hours=0 with
+                    # initial_password_expiry_hours set, that method computed a correct deadline and this
+                    # task — ITS ONLY CONSUMER — was never created, so the warning arm was SILENTLY DEAD.
+                    # BACKLOG #1245 corrected the two computations in auth/service.py and never reached the
+                    # gate deciding whether they run. Ask the AuthService, which owns the predicate now.
                     bootstrap_reminder = asyncio.create_task(
                         _bootstrap_expiry_reminder(auth, notifier or LoggingAlertSink())
                     )

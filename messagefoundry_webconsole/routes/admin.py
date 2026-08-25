@@ -23,7 +23,11 @@ from messagefoundry.api.auth_models import (
 )
 from messagefoundry.auth import Identity, Permission
 from messagefoundry.auth.permissions import CUSTOM_ROLE_FORBIDDEN_PERMISSIONS
-from messagefoundry.auth.service import AuthService
+from messagefoundry.auth.service import (
+    STEP_UP_ACTION_ADMIN_RESET_MFA,
+    STEP_UP_ACTION_ADMIN_RESET_PASSWORD,
+    AuthService,
+)
 
 from .. import pages
 from .._auth import (
@@ -31,14 +35,30 @@ from .._auth import (
     register_ui_action,
     require_ui,
     require_ui_step_up,
+    require_ui_step_up_action,
 )
 from .._service import _service
 from ._common import _form_pairs
 
 register_ui_action(r"^/ui/users/new$", Permission.USERS_MANAGE, auto_retry=False, unlock=True)
 register_ui_action(r"^/ui/users/[^/?#]+$", Permission.USERS_MANAGE, auto_retry=False, unlock=True)
+# BACKLOG #1148 (ASVS 7.5.1): the two RESET lanes are split out and TAGGED. Combined and untagged,
+# /ui/reauth minted nothing for them, so the browser path -- the only operator surface that ships --
+# kept riding the login-seeded window even after the JSON routes were bound. revoke-sessions and
+# delete stay combined and untagged: they are out of 7.5.1's scope, which names attributes that
+# affect AUTHENTICATION, and tagging them would be motion without a requirement behind it.
 register_ui_action(
-    r"^/ui/users/[^/?#]+/(reset-password|reset-mfa|revoke-sessions|delete)$",
+    r"^/ui/users/[^/?#]+/reset-password$",
+    Permission.USERS_MANAGE,
+    action=STEP_UP_ACTION_ADMIN_RESET_PASSWORD,
+)
+register_ui_action(
+    r"^/ui/users/[^/?#]+/reset-mfa$",
+    Permission.USERS_MANAGE,
+    action=STEP_UP_ACTION_ADMIN_RESET_MFA,
+)
+register_ui_action(
+    r"^/ui/users/[^/?#]+/(revoke-sessions|delete)$",
     Permission.USERS_MANAGE,
 )
 register_ui_action(r"^/ui/roles/new$", Permission.USERS_MANAGE, auto_retry=False, unlock=True)
@@ -251,7 +271,11 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         user_id: str,
         request: Request,
         service: AuthService = Depends(_service),
-        identity: Identity = Depends(require_ui_step_up(Permission.USERS_MANAGE)),
+        # BACKLOG #1148: action-bound, and it must be enforced HERE. The JSON dependency does not
+        # run on this path -- the handler FUNCTION is called through the seam below, not the route.
+        identity: Identity = Depends(
+            require_ui_step_up_action(STEP_UP_ACTION_ADMIN_RESET_PASSWORD, Permission.USERS_MANAGE)
+        ),
     ) -> Response:
         assert_same_origin(request)
         try:
@@ -272,7 +296,11 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         user_id: str,
         request: Request,
         service: AuthService = Depends(_service),
-        identity: Identity = Depends(require_ui_step_up(Permission.USERS_MANAGE)),
+        # BACKLOG #1148: the browser twin of the lane that clears TOTP, every recovery code and
+        # every passkey. require_ui_step_up_ACTION keeps the MFA gate, like its JSON counterpart.
+        identity: Identity = Depends(
+            require_ui_step_up_action(STEP_UP_ACTION_ADMIN_RESET_MFA, Permission.USERS_MANAGE)
+        ),
     ) -> Response:
         assert_same_origin(request)
         try:

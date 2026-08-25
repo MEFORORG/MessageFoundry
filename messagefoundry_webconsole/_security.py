@@ -73,8 +73,16 @@ degrades-silently-with-a-named compensating control:
 This list is the in-code source of truth the runbook's operator-facing copy mirrors, and a CI guard
 (``test_ui_csp_canary.py``) derives all three sets from the CODE — the header writes, the
 ``window.<Feature>`` reads, and the ``set_cookie`` attributes — and fails if any member is missing
-here or from the runbook, so a newly-shipped header, detect or cookie attribute cannot slip in
-unbucketed. Anything OUTSIDE those three sets is outside the claim.
+HERE, so a newly-shipped header, detect or cookie attribute cannot slip in unbucketed. Anything
+OUTSIDE those three sets is outside the claim.
+
+The parallel check that the RUNBOOK still mirrors this list skips wherever
+``docs/security/OFF-LOOPBACK-DEPLOYMENT.md`` is absent, which is every public checkout — that path is
+deny-listed by design. So the runbook can drift from this list without anything going red outside a
+tree that carries it. Said plainly because this paragraph previously claimed both halves ran: they
+were one test each, the runbook accessor was reached FIRST, and its skip took the code-side check
+down with it, so the enumeration shipping in this wheel was checked by nothing at all (BACKLOG
+#1124). The two are now separate tests — the code-side one passes publicly, the runbook one skips.
 
 * **Secure transport context** — DETECTED and WARNED. The nonce'd page-shell script reads
   ``window.isSecureContext``; false raises a visible ``role="alert"`` banner

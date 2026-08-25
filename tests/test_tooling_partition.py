@@ -72,6 +72,15 @@ _STAYS_WITHOUT_IMPORTING = frozenset(
         "test_crypto_inventory_scanner.py",
         "test_dependency_boundaries.py",
         "test_ech_record_premise.py",
+        # Same shape as control_char_check and licence_header_gate above, and listed for the same
+        # reason: a repo-wide scanner over TRACKED SOURCE, which includes messagefoundry/**. An
+        # invalid escape landing in engine source becomes a SyntaxError on a future Python and takes
+        # that whole module at COLLECTION -- so it surfaces as FEWER TESTS, not as a failure, and
+        # this gate is the only thing that catches it. Gating it behind scripts/** would leave the
+        # engine change that introduced one facing nothing. Most arms build in tmp_path, but
+        # test_the_tracked_tree_is_clean and test_list_reports_scope_and_exits_clean read the real
+        # `git ls-files` scope -- which is the half that makes it engine-subject.
+        "test_escape_sequence_check.py",
         "test_external_link_interstitial.py",
         "test_licence_header_gate.py",
         "test_packaging.py",
@@ -81,6 +90,14 @@ _STAYS_WITHOUT_IMPORTING = frozenset(
         "test_scan_tokens_source.py",
         "test_seam_discovery.py",
         "test_security_static.py",
+        # Engine-subject for the same reason as control_char_check and escape_sequence_check above,
+        # and the reason is the one arm that does not use tmp_path: the screen's DEFAULT SCOPE is
+        # messagefoundry/api/app.py and auth_routes.py, so test_the_live_api_scope_still_surfaces_the
+        # _unjudged_candidate parses real engine source. A username re-appearing as an access key
+        # arrives in an API route -- an engine diff -- and the tooling job's path gate (scripts/**,
+        # .github/**, the ledger) is not tripped by one, so gating this behind scripts/** would
+        # leave exactly the change that reintroduces the defect facing nothing.
+        "test_username_access_key_screen.py",
         # The four below were WRONGLY LISTED as tooling in the first cut of the manifest and were
         # caught by adversarial review, not by any guard here. Each reads real engine source without
         # importing it, so the marker took them off every engine leg while the tooling job's path gate
