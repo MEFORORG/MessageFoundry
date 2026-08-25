@@ -494,7 +494,7 @@ def is_unlock_action(next_path: str | None) -> bool:
     *registering* it, not by editing this function.
 
     ONE REGISTERED PATTERN IS QUERY-TOLERANT and the promise above is correspondingly weaker for it:
-    the uploaded-logs resend confirm page (BACKLOG #1227) matches ``resend-confirm(\?[^#]*)?``, so an
+    the uploaded-logs resend confirm page (BACKLOG #1227) matches ``resend-confirm(\\?[^#]*)?``, so an
     arbitrary same-site query on THAT ONE PATH reaches the re-auth. It has to, because the action's
     two parameters ride the query and ``_reauth_redirect`` puts the whole continuation into ``next``.
     The path prefix is still anchored, the ``..`` rejection above still applies first, and the
