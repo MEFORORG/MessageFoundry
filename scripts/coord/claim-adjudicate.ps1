@@ -213,14 +213,41 @@ function Get-LeadingQuote([string]$Block) {
 # ---------------------------------------------------------------------------------------------
 # Delivery citations. COLLECTED AND PRINTED, NEVER SCORED -- see .NOTES.
 # ---------------------------------------------------------------------------------------------
+# A SIBLING CITATION IS STILL A CITATION, AND THIS FOUND NONE OF THEM (BACKLOG #1347).
+#
+# The old query was `--grep="BACKLOG #$ItemKey"`, which matches only when the item is the one
+# carrying the prefix. The house form writes the prefix ONCE -- `(BACKLOG #1319, #1322, #1323,
+# #1331)` -- so three of those four were invisible here, and the failure direction is the expensive
+# one: work that landed reads as never delivered, and a dispatcher hands a builder a finished item.
+# The control is `df8acc95`, the commit that misled two seats into holding three claims for landed
+# work.
+#
+# TWO STAGES, because neither alone is right. git finds CANDIDATES by the number, which is cheap and
+# has good recall; the scoped regex then decides whether the number is really a backlog citation.
+# Doing it in one `--grep` is what forces the choice between missing siblings and matching anything.
+#
+# THE SCOPE IS THE PARENTHETICAL, and that is what keeps a squash suffix out. A landed subject reads
+# `(BACKLOG #1040) (#547)`; a rule that took every `#N` after the BACKLOG token would report #547 as
+# a delivery of item 547. Measured over `git log --all` on 2026-08-25: unscoped calls 641 subjects
+# multi-item, parenthetical-scoped calls 38 of 1070.
+#
+# STILL COLLECTED AND PRINTED, NEVER SCORED -- see .NOTES. This widens RECALL of a display; it does
+# not turn a citation into proof of delivery, which the .NOTES block explains at length it is not.
 function Get-Citations([string]$ItemKey) {
     if ($ItemKey -notmatch '^\d+$') { return @() }
-    $raw = @(& git -C $repo log --format="%h%x09%s" --grep="BACKLOG #$ItemKey([^0-9]|`$)" -E --max-count=5 $mainRef 2>$null)
+    # Candidates: any subject naming this number at all. Deliberately broader than the old query.
+    $raw = @(& git -C $repo log --format="%h%x09%s" --grep="#$ItemKey([^0-9]|`$)" -E --max-count=40 $mainRef 2>$null)
+    # Inside a `(BACKLOG ... )` group, or after a bare `BACKLOG` token with no parenthetical.
+    $inParen = [regex]"(?i)\(\s*BACKLOG\b[^)]*?#$ItemKey\b[^)]*\)"
+    $afterTok = [regex]"(?i)\bBACKLOG\b[^(]*?#$ItemKey\b"
     $out = @()
     foreach ($r in $raw) {
         $p = $r -split "`t", 2
         if ($p.Count -lt 2) { continue }
-        $out += [pscustomobject]@{ commit = $p[0]; subject = $p[1] }
+        $subject = $p[1]
+        if (-not ($inParen.IsMatch($subject) -or $afterTok.IsMatch($subject))) { continue }
+        $out += [pscustomobject]@{ commit = $p[0]; subject = $subject }
+        if ($out.Count -ge 5) { break }   # the old cap, applied AFTER filtering rather than before
     }
     return $out
 }
