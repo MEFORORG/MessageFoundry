@@ -3,9 +3,17 @@
 """`.claude/settings.json` is now a TRACKED control, so its shape gets a test.
 
 Tracking the file (see `tests/test_private_paths_stay_ignored.py` for the boundary half) is what
-carries the deny-list and the `block-blanket-git-stage` guard to a fresh clone and to every
-`git worktree add`. That only buys anything if the payload still works when it arrives, and the two
-ways it silently stops working are both invisible to review:
+carries the deny-list, and whatever matchers the file wires, to a fresh clone and to every
+`git worktree add`. That only buys anything if the payload still works when it arrives, and the
+ways it silently stops working are invisible to review:
+
+CORRECTED, AND THE SENTENCE WAS IN THIS FILE (BACKLOG #1339). This paragraph used to say tracking
+the file carries "the deny-list and the `block-blanket-git-stage` guard". It carries the deny-list.
+It carried nothing about that guard, because no matcher in it names the script -- so the module
+whose job is to catch a control that reads as enforced and is not was itself asserting one. The
+third check below is what makes that statement checkable instead of merely rewritten; three earlier
+prose corrections on this claim each landed a new false statement, which is why the fix had to be
+an instrument.
 
   * **A hook that cannot start does not block.** Claude Code's hooks reference is explicit that a
     command hook which fails to launch "lands in the same non-blocking bucket" and that for most
