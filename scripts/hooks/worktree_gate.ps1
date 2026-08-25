@@ -1682,9 +1682,16 @@ BLOCKED: 'git worktree $wtVerb $victimMsg' acts on a worktree of $($govWt.Displa
 this session is running in. This gate cannot tell whether another session is using it -- it has no
 occupancy or authorship signal -- so it refuses rather than guess.
 
-If it IS in use, removing it deletes that session's working tree and its branch, along with any
-uncommitted work in them. There is no undo, and the session using it finds out when its next file read
-fails. That asymmetry is why the default is refusal even though the tree may well be abandoned.
+If it IS in use, removing it deletes that session's WORKING TREE and any uncommitted work in it. There
+is no undo for the uncommitted half, and the session using it finds out when its next file read fails.
+That asymmetry is why the default is refusal even though the tree may well be abandoned.
+
+THE BRANCH SURVIVES, and this refusal used to say otherwise. `git worktree remove` does not touch the
+branch -- deleting one is a separate act (`remove.ps1 -DeleteBranch`, or `git branch -d` by hand). So
+anything COMMITTED there is still reachable by name after the tree is gone; it is the dirty tree that
+is unrecoverable. Overstating the harm is not a safe error in a refusal: a reader who knows git spots
+that the gate is wrong about git, and a control that is wrong about its own subject is the one people
+route around.
 
 What to do instead:
 $cleanupBullet
