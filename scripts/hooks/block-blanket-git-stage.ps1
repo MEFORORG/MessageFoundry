@@ -131,8 +131,26 @@ $scan = Hide-QuotedSpans (Hide-HeredocBodies $cmd)
 
 $reason = $null
 # Examine each shell-separated simple command on its own, so '... && git add -A' is still caught.
-foreach ($seg in [regex]::Split($scan, '(\|\||&&|[;|&\n])')) {
-    $s = $seg.Trim()
+#
+# TWO VIEWS OF THE SAME SEGMENT, AND THE SPLIT BETWEEN THEM IS DELIBERATE. Both Hide- passes above
+# preserve LENGTH exactly, so an offset into $scan is the same offset into $cmd. The blanked view
+# answers "where does a command start, and is this git" -- questions where quoted text must not
+# count. The raw view answers "what are this command's arguments" -- where a quoted token is an
+# ordinary argument and blanking it would hide a real pathspec. `git add ':(top)'` needs the raw
+# view; `git commit -m "wip; git add -a"` needs the blanked one. The resolved SUBCOMMAND is what
+# selects between them, below.
+$bounds = New-Object 'System.Collections.Generic.List[int[]]'
+$cursor = 0
+foreach ($m in [regex]::Matches($scan, '(\|\||&&|[;|&\n])')) {
+    $bounds.Add(@($cursor, ($m.Index - $cursor)))
+    $cursor = $m.Index + $m.Length
+}
+$bounds.Add(@($cursor, ($scan.Length - $cursor)))
+
+foreach ($b in $bounds) {
+    if ($b[1] -le 0) { continue }
+    $s = $scan.Substring($b[0], $b[1]).Trim()
+    $rawSeg = $cmd.Substring($b[0], $b[1]).Trim()
     # The PROGRAM NAME is matched case-INSENSITIVELY, and only it. Windows resolves git, Git and
     # GIT to the same git.exe, so 'Git add -A' staged the tree while 'git add -A' was denied. The
     # subcommand and flag tests below stay -cmatch on purpose: git rejects 'git ADD', and '-A' and
@@ -144,7 +162,12 @@ foreach ($seg in [regex]::Split($scan, '(\|\||&&|[;|&\n])')) {
     # not covered -- that is BACKLOG #1305's axis, on a different file, and deliberately not
     # widened here: doing so needs a wrapper allowlist, which is the construct #1229 proved
     # fails open.
-    if ($s -inotmatch '^git(\s|$)') { continue }
+    # `git.exe` is the SAME executable spelled with its extension, and it was one of the seven
+    # measured bypasses. Only the BARE spelling is covered: a path-qualified or wrapper-dispatched
+    # git ('C:/.../git.exe add -A', 'env git add -A') is BACKLOG #1305's axis and is left alone,
+    # because closing it needs a wrapper allowlist -- the construct BACKLOG #1229 measured as
+    # fail-open on the sibling gate.
+    if ($s -inotmatch '^git(\.exe)?(\s|$)') { continue }
 
     $tokens = @($s -split '\s+' | Where-Object { $_ })
 
@@ -154,9 +177,73 @@ foreach ($seg in [regex]::Split($scan, '(\|\||&&|[;|&\n])')) {
     $sub = Resolve-GitSubcommand $tokens
     if ($null -ne $sub -and $READ_ONLY_SUBCOMMANDS -ccontains $sub) { continue }
 
-    # git add with -A / --all / -u / a bare '.' (stages the whole tree).
-    if ($s -cmatch '\badd\b' -and $s -cmatch '(^|\s)(-A|--all|-u|\.)(\s|$)') {
-        $reason = "git add -A/--all/-u/. stages everything, including files another session may be editing."
+    # LIMB 1 -- the SUBCOMMAND, including the synonym. `stage` is documented and dispatches to the
+    # same builtin (`git stage -h` prints `usage: git add`), so testing only `add` let every flag
+    # and pathspec row below be defeated by one word.
+    #
+    # WHICH VIEW THE ARGUMENTS ARE READ FROM IS DECIDED HERE, and it is decided by the RESOLVED
+    # subcommand rather than by searching for the word. When the subcommand IS add/stage, every
+    # non-flag argument is a pathspec, so the raw view is correct and safe -- `git add` has no
+    # message flag whose quoted value could be mistaken for one. When it is anything else, the
+    # blanked view is correct: `git commit -m "wip; git add -a"` must not be read as a stage.
+    # A subcommand that does not resolve falls back to the ORIGINAL token search on the blanked
+    # view, which preserves every deny this guard made before.
+    $argView = if ($sub -ceq 'add' -or $sub -ceq 'stage') { $rawSeg } else { $s }
+    $staging = ($sub -ceq 'add' -or $sub -ceq 'stage') -or
+               ($null -eq $sub -and $s -cmatch '(^|\s)(?:add|stage)(\s|$)') -or
+               ($null -ne $sub -and $sub -cne 'commit' -and $s -cmatch '(^|\s)(?:add|stage)(\s|$)')
+
+    # LIMB 2 -- the blanket-stage FLAG family, GENERATED from the option words rather than typed,
+    # per the method BACKLOG #1097 settled for worktree_gate.ps1's interpreter flag. A longer list
+    # has the same shape as the defect and decays the same way.
+    #
+    # WHY A LADDER AND NOT TWO SPELLINGS: git's parse-options binds a long option by any
+    # UNAMBIGUOUS ABBREVIATION, so `--a`, `--al`, `--up`, `--upd` and `--updat` all stage the tree.
+    # Generating an ambiguous rung costs nothing -- git refuses it, and a command git refuses is
+    # not a command to protect.
+    $blanketWords = @('all', 'update', 'no-ignore-removal')
+    $longNames = @(
+        $blanketWords | ForEach-Object { $w = $_; 1..$w.Length | ForEach-Object { $w.Substring(0, $_) } }
+    ) | Sort-Object -Property Length -Descending   # longest first: `--all` binds as `all`, not `a`+`ll`
+    $longFlag = "--(?:$($longNames -join '|'))"
+    # A short-option CLUSTER, the same construction the commit branch below already used. The
+    # trigger set is EXACTLY {A, u} and CASE-SENSITIVE, and the case is the whole bound:
+    #   -A  --all      stages everything          MUST trigger
+    #   -u  --update   stages every tracked change MUST trigger
+    #   -a             NOT a git add flag; `git add -a` exits 129 `unknown switch`. Folding case
+    #                  here would deny commands git itself refuses: pure false-deny, zero gain.
+    #   -U  --unified  IS a real flag and stages nothing. Matching it denies legitimate work.
+    # `-a` and `-U` are pinned as ALLOW tests so the next reader cannot "simplify" this to (?i)[au].
+    $shortFlag = '-[A-Za-z]*[Au][A-Za-z]*'
+    $blanketFlag = "(?:$longFlag|$shortFlag)"
+
+    # LIMB 3 -- a whole-tree PATHSPEC, kept a SEPARATE limb from the flags on purpose. A flag can be
+    # anchored on a leading `-`; a pathspec cannot, and the only thing separating the blanket
+    # `git add ./` from the scoped `git add ./src/x.py` is the trailing boundary. One fused rule
+    # would need one boundary to satisfy both tests and would be wrong for one of them. The two
+    # also earn different deny messages: telling an operator who typed `:/` that the problem was a
+    # flag is the wrong sentence.
+    # AT LEAST these four -- this is not an enumeration of git's pathspec grammar.
+    # QUOTES ARE TOLERATED AROUND THE WHOLE TOKEN because `:(top)` cannot be typed unquoted in
+    # either shell -- the parentheses are syntax. The token must still be EXACTLY the pathspec:
+    # `git add './src/x.py'` stays allowed, because the trailing boundary is outside the quote.
+    $treeRoot = '["'']?(?:\.|\./|:/|:\(top\))["'']?'
+
+    # WHAT THESE THREE LIMBS DELIBERATELY DO NOT REACH, stated beside the rule per CLAUDE.md
+    # section 11 rather than left for a reader to discover:
+    #   --renormalize             implies -u; `git add --renormalize .` stages tracked changes
+    #   --pathspec-from-file=-    the pathspec is on stdin, so no pathspec appears in the command
+    #   :^x / :!x / :(glob) / *   the rest of magic pathspec; an exclude-only spec is a blanket
+    #                             stage spelled as an exclusion
+    #   any dispatching wrapper   `cmd /c "git add -A"`, `env git add -A`, a path-qualified git.
+    #                             That is BACKLOG #1305's axis and needs a wrapper allowlist, the
+    #                             construct BACKLOG #1229 measured as fail-open.
+    if ($staging -and $argView -cmatch "(^|\s)$blanketFlag(\s|$)") {
+        $reason = "git add/stage -A/--all/-u/--update (or a cluster containing A or u) stages everything, including files another session may be editing."
+        break
+    }
+    if ($staging -and $argView -cmatch "(^|\s)$treeRoot(\s|$)") {
+        $reason = "git add/stage with a whole-tree pathspec (. ./ :/ :(top)) stages everything, including files another session may be editing."
         break
     }
     # git commit with -a / -am / --all (auto-stages every tracked change). A single-dash flag
