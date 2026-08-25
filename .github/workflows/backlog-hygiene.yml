@@ -63,8 +63,46 @@ jobs:
 
           # Does this PR *claim* to implement a backlog item? Only the explicit `BACKLOG #N` token
           # counts — a bare `#123` is ambiguous in this repo (it is usually a PR number).
-          claim="$(printf '%s\n%s\n' "$PR_TITLE" "$PR_BODY" | grep -oiE 'BACKLOG #[0-9]+' | head -1 || true)"
-          if [ -z "$claim" ]; then
+          #
+          # EVERY CITED ITEM, NOT JUST THE FIRST (BACKLOG #1347). The house form is
+          # `(BACKLOG #1319, #1322, #1323, #1331)`: the prefix appears ONCE and the siblings carry a
+          # bare `#N`. `grep -oiE 'BACKLOG #[0-9]+' | head -1` saw #1319 and none of the other three,
+          # so a four-item PR was told to update one banner while four were owed. The repo already
+          # solved this for the claim gate -- scripts/hooks/claim_check.py takes every `#N` AFTER the
+          # BACKLOG token -- and that rule is reused here.
+          #
+          # SCOPED TO THE PARENTHETICAL, WHICH claim_check.py DOES NOT NEED TO BE AND THIS DOES.
+          # A squash-merge appends the pull-request number as a trailing group, so a landed subject
+          # reads `(BACKLOG #1040) (#547)`. Taking every `#N` after the token would claim item #547.
+          # claim_check.py is safe from that only by TIMING -- it runs at commit-msg time, before the
+          # suffix exists -- while this gate reads a PR title that can already carry one. Measured
+          # over `git log --all` on 2026-08-25: the unscoped rule calls 641 subjects multi-item, the
+          # parenthetical-scoped rule calls 38 of 1070. A ~17x inflation, and every one of those 603
+          # extra would be a demand to update the banner of a pull-request number.
+          # SPLIT ON `)` RATHER THAN MATCHING `\(BACKLOG...\)`, for two independent reasons.
+          #
+          # 1. It scopes without a regex. Each `)` ends a group, so the line carrying BACKLOG holds
+          #    exactly that group's numbers and the trailing squash group `(#547)` becomes its own
+          #    line with no BACKLOG token -- excluded by the grep rather than by a lookahead.
+          # 2. A pattern containing literal parens CANNOT be written here.
+          #    tests/test_security_posture.py::test_required_jobs_have_no_neutered_steps strips
+          #    command substitutions before applying its `|| true` rule, because `x="$(... || true)"`
+          #    is the idiomatic guard for grep exiting 1 on no-match under `set -euo pipefail`. Its
+          #    substitution regex stops at the FIRST `)`, so any close-paren earlier in the line --
+          #    in a grep pattern OR in a quoted `tr` argument -- orphans the `|| true` and the
+          #    required gate reports a false positive on a correct script. Hence `\051`, the octal
+          #    escape for `)`: it leaves the substitution's own closing paren as the first one on the
+          #    line, which is what that strip is written to find. Measured: the literal-paren forms
+          #    failed that gate, this one passes it.
+          #    THIS IS A REAL LIMITATION IN THAT DETECTOR, not a quirk of this file -- any required
+          #    step whose command substitution quotes a `)` hits it. Reported, not worked around
+          #    silently.
+          #
+          # It also removes the need for a no-parenthetical fallback: a subject with no parens at all
+          # is one line, and it still carries its BACKLOG token.
+          items="$(printf '%s\n%s\n' "$PR_TITLE" "$PR_BODY" | tr '\051' '\n' | grep -i BACKLOG | grep -oE '#[0-9]+' | tr -d '#' | sort -un || true)"
+          claim="$(printf '%s' "$items" | head -1 | sed 's/^/BACKLOG #/')"
+          if [ -z "$items" ]; then
             echo "No 'BACKLOG #N' claim in this PR — nothing to enforce."
             echo "(If this PR completes a backlog item, say so with 'BACKLOG #N' and update its banner.)"
             exit 0
@@ -97,12 +135,19 @@ jobs:
             exit 0
           fi
 
-          n="$(printf '%s' "$claim" | grep -oE '[0-9]+')"
+          n="$(printf '%s' "$items" | head -1)"
+          all_items="$(printf '%s' "$items" | tr '\n' ' ' | sed 's/ *$//')"
+          count="$(printf '%s\n' "$items" | grep -c . || true)"
           cat >&2 <<EOF
-          ERROR: this PR says it implements '$claim' and changes engine/IDE code, but it does not
-          touch docs/BACKLOG.md or any file under docs/archive/backlog/.
+          ERROR: this PR cites $count backlog item(s) — $all_items — and changes engine/IDE code, but
+          it does not touch docs/BACKLOG.md or any file under docs/archive/backlog/.
 
-          Update item #$n's status banner in the same PR — in docs/BACKLOG.md if the item is still
+          EVERY ITEM LISTED ABOVE OWES A BANNER, not just the first. The house citation form writes
+          the BACKLOG prefix once and the siblings after it, so '(BACKLOG #1319, #1322)' declares
+          TWO items. A gate that read only the first sent authors to update one banner of four
+          (BACKLOG #1347).
+
+          Update each item's status banner in the same PR — in docs/BACKLOG.md if the item is still
           open, or in its docs/archive/backlog/ file if it has already been retired. If the work is
           complete:
 
