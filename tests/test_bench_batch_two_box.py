@@ -116,7 +116,7 @@ def test_build_remote_argv_shape() -> None:
         report_path=Path("out/x.json"),
     )
     assert argv[1:4] == ["-m", "harness", "connscale-remote"]
-    assert "--engine-url" in argv and "http://10.0.0.5:9001" in argv
+    assert "--engine-url" in argv and "https://10.0.0.5:9001" in argv
     assert argv[argv.index("--inbound-base") + 1] == "2604"
     assert argv[argv.index("--sink-base") + 1] == "40002"
     assert argv[argv.index("--engine-index-base") + 1] == "2"
@@ -211,7 +211,7 @@ def _install_engine_fakes(monkeypatch: pytest.MonkeyPatch) -> types.SimpleNamesp
             self.node_id = node_id
             self.api_port = api_port
             self.env = dict(env)
-            self.url = f"http://127.0.0.1:{api_port}"
+            self.url = f"https://127.0.0.1:{api_port}"
             counter["pid"] += 1
             self.pid: int | None = counter["pid"]
             rec.node_envs.append(self.env)

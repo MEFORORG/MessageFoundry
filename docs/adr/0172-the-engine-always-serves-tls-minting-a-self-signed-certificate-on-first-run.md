@@ -6,7 +6,7 @@
 - **Status:** Accepted (2026-08-22)
 - **Date:** 2026-08-22
 - **Supersedes:** [ADR 0143](0143-web-console-on-by-default-disableable-with-loopback-secure-context-browser-hardening.md)'s *decision*, not its analysis — see "What of 0143 survives" below
-- **Related:** [ADR 0002](0002-tls-everywhere.md) · [ADR 0065](0065-web-ops-dashboard.md) · [ADR 0118](0118-secure-by-default-security-configuration-section.md) · BACKLOG #1276
+- **Related:** [ADR 0002](0002-phase2-transport-security-and-strong-auth.md) · [ADR 0065](0065-web-ops-dashboard.md) · [ADR 0118](0118-secure-by-default-security-configuration-section.md) · BACKLOG #1276
 
 ## Context
 
