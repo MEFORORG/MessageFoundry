@@ -15159,9 +15159,9 @@ per-lane virtualenv.
 ## 1336. Rule 3c asks one string two questions, so every fix for the false deny widens the bypass and back
 
 > 🔢 **Filed 2026-08-23 - not started.** `#1066` (a quoted danger key is invisible, FAIL OPEN) and `#1086` (a quoted body reads as a command, FALSE DENY) are **the same design error pulling in opposite directions**: rule 3c asks both questions of `$seg.Scan`, the quote-blanked text. Blanking more fixes `#1086` and widens `#1066`. Blanking less does the reverse. **Neither row can be fixed alone.**
-> Verdict: build
+> Verdict: owner-ruling
 > Research: none
-> Closing-act: code
+> Closing-act: owner-ruling
 
 **Cluster:** commit gates / secret scanning. **Priority:** P1 -- higher than either row it reconciles,
 because **a fix to either one alone makes the other worse and the last three attempts did exactly

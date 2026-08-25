@@ -240,14 +240,20 @@ function Get-GateHash([string]$Path) {
 # question it answers is "which rules does the gate that is RUNNING have, and are they all wired", and the
 # source's rule set is not evidence for either. That is the whole point of the audit -- rule 4 was in the
 # source, declared by this installer, and covered by tests, while the running gate had never heard of it.
+#
+# THE COMMA ON BOTH EXIT PATHS IS LOAD-BEARING, for the reason Get-WiredMatchers above already
+# states in full -- read it there rather than here. The short form: a bare return UNROLLS, so a
+# zero-tool corpus arrives as $null and a ONE-tool corpus as a [String] whose .Contains() is a
+# substring test wearing set membership. Callers must NOT re-wrap in @(); doing so re-hides the
+# defect behind the caller's own grace, which is what BACKLOG #1291 is about.
 function Get-HandledTools([string]$Path) {
-    if (-not (Test-Path -LiteralPath $Path)) { return @() }
+    if (-not (Test-Path -LiteralPath $Path)) { return ,@() }
     $text = Get-Content -LiteralPath $Path -Raw
     $tools = [System.Collections.Generic.HashSet[string]]::new()
     foreach ($m in [regex]::Matches($text, '\$tool\s+-(?:not)?in\s+@\(([^)]*)\)')) {
         foreach ($q in [regex]::Matches($m.Groups[1].Value, '"([^"]+)"')) { $null = $tools.Add($q.Groups[1].Value) }
     }
-    @($tools)
+    ,@($tools)
 }
 
 # ------------------------------------------------------------------------------------------ status
@@ -299,7 +305,7 @@ if ($Status) {
 
     # Compare the wired matchers against the rules the INSTALLED script actually implements -- an
     # expectation, not a count. A count of "3" is not information unless you know whether 3 is right.
-    $handled = @(Get-HandledTools $GateDst)
+    $handled = Get-HandledTools $GateDst
     foreach ($cd in $ConfigDir) {
         $sp = Join-Path $cd "settings.json"
         $wired = Get-WiredMatchers $sp
