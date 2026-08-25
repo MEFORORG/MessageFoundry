@@ -219,8 +219,117 @@ def test_list_still_flags_a_vanished_holder(repo: Path, tmp_path: Path) -> None:
 
 
 def test_list_still_reports_a_living_holders_quiet_hours(repo: Path, tmp_path: Path) -> None:
-    """Anti-regression for the shared helper: 'present' must still carry its commit age."""
+    """Anti-regression for the shared helper: 'present' must still carry its commit age.
+
+    The wording moved with BACKLOG #1348 -- "holder last committed Nh ago" became "LIVE SESSION in
+    the holder, last committed Nh ago" -- because the old phrase was true of a directory nobody was
+    in. The commit age is still there; only the claim about WHO is there is new.
+    """
     peer_holding(repo, tmp_path, "k")
     out = claim(repo, "-List").stdout
-    assert "holder last committed" in out
+    assert "last committed" in out
     assert "HOLDER GONE" not in out
+
+
+# --------------------------------------------------------------------------------------------------
+# THE THIRD STATE: a holder that is a DIRECTORY rather than a SESSION (BACKLOG #1348)
+# --------------------------------------------------------------------------------------------------
+
+# `present` used to mean "the path exists". It never asked whether a session was IN it, so a
+# worktree that outlived its session rendered identically to a lane actively building. Measured on
+# the live board when this landed: 35 holders gone, 8 with a live session, and 23 that were a
+# directory with nobody in it -- and all 31 of the last two groups had been rendering the same way.
+#
+# THE STATE REPORTS. IT DOES NOT PERMIT. Every test below pins BOTH halves, because a fix that
+# turned the new state into a licence to release would be worse than the defect: occupancy.ps1's own
+# rule is that it "may only ever VETO an action; a DEAD/STALE/absent verdict must never by itself
+# authorise one", since a session working in a path by ABSOLUTE PATH from another cwd is invisible
+# to a cwd-keyed probe.
+
+
+@pytest.fixture
+def repo_with_occupancy(repo: Path) -> Path:
+    """The sandbox, plus the occupancy probe claim.ps1 consults.
+
+    The base `repo` fixture deliberately copies ONLY claim.ps1, which is what makes the probe
+    unavailable there -- and that is a real configuration, not an artifact: a checkout carrying a
+    partial scripts/coord/ behaves exactly that way. Both are worth testing, so they get separate
+    fixtures rather than one that hides the difference.
+    """
+    src = CLAIM.parent
+    for name in ("occupancy.ps1", "session-registry.ps1"):
+        shutil.copy2(src / name, repo / "scripts" / "coord" / name)
+    return repo
+
+
+def test_a_holder_with_no_live_session_is_distinguishable_from_one_with_a_session(
+    repo_with_occupancy: Path, tmp_path: Path
+) -> None:
+    """The whole point of #1348: the two must not render identically.
+
+    Nothing is running in the sandbox's peer worktree, so the probe places zero sessions in it.
+    """
+    peer_holding(repo_with_occupancy, tmp_path, "k")
+    out = claim(repo_with_occupancy, "-List").stdout
+    assert "DIRECTORY ONLY" in out, out
+    assert "no live session in it" in out
+    # and it must not claim someone is there
+    assert "LIVE SESSION in the holder" not in out
+
+
+def test_the_third_state_still_refuses_a_take(repo_with_occupancy: Path, tmp_path: Path) -> None:
+    """Distinguishable is not releasable. The refusal is unchanged."""
+    peer_holding(repo_with_occupancy, tmp_path, "k")
+    proc = claim(repo_with_occupancy, "-Take", "k", "-Note", "mine now")
+    assert proc.returncode != 0, "an unoccupied holder must still block a take"
+    assert "A DIRECTORY, NOT A SESSION" in proc.stdout
+    assert "still not yours to -force" in proc.stdout.lower()
+
+
+def test_the_third_state_does_not_recommend_force_on_a_release(
+    repo_with_occupancy: Path, tmp_path: Path
+) -> None:
+    """`-Force` is recommended for exactly one state, and this is not it.
+
+    The negative control is the vanished-holder case above, which DOES recommend it -- so this
+    assertion is about the state, not about the word being absent everywhere.
+    """
+    peer_holding(repo_with_occupancy, tmp_path, "k")
+    proc = claim(repo_with_occupancy, "-Release", "k")
+    assert proc.returncode != 0
+    assert "A DIRECTORY, NOT A SESSION" in proc.stdout
+    assert "Safe to take over" not in proc.stdout
+
+
+def test_a_vanished_holder_still_outranks_the_third_state(
+    repo_with_occupancy: Path, tmp_path: Path
+) -> None:
+    """Positive control for the probe being live at all.
+
+    With occupancy available, a DELETED worktree must still read GONE and still recommend -Force.
+    If this ever reported the third state instead, the new branch would be swallowing the one
+    verdict that is safe to act on unasked.
+    """
+    peer = peer_holding(repo_with_occupancy, tmp_path, "k")
+    orphan(repo_with_occupancy, peer)
+    out = claim(repo_with_occupancy, "-List").stdout
+    assert "HOLDER GONE" in out
+    assert "DIRECTORY ONLY" not in out
+
+
+def test_without_the_probe_it_falls_back_to_REFUSING_not_to_the_new_state(
+    repo: Path, tmp_path: Path
+) -> None:
+    """THE POLARITY RULE, and it is the one that must never regress.
+
+    The base fixture has no occupancy.ps1, so the probe cannot load. A missing answer must cost a
+    REFUSAL, never a licence: recognition may only ever suppress. If an unloadable probe ever
+    produced "DIRECTORY ONLY", every checkout with a partial scripts/coord/ would start reporting
+    live lanes as abandoned -- the same false record, arrived at from the other side.
+    """
+    peer_holding(repo, tmp_path, "k")
+    out = claim(repo, "-List").stdout
+    assert "DIRECTORY ONLY" not in out, "an unavailable probe must not produce the new state"
+    assert "last committed" in out
+    proc = claim(repo, "-Take", "k", "-Note", "mine now")
+    assert proc.returncode != 0, "the take must still be refused when the probe cannot load"

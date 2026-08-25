@@ -68,6 +68,12 @@ $ErrorActionPreference = "Stop"
 # Hook right, tool wrong, and only the tool can be invoked from somewhere else.
 $repo = (& git -C $PSScriptRoot rev-parse --path-format=absolute --show-toplevel 2>$null)
 if (-not $repo) { throw "scripts/coord/ is not inside a git repository: $PSScriptRoot" }
+
+# Occupancy is what lets a holder that is a DIRECTORY be told apart from one that is a SESSION
+# (BACKLOG #1348). Loaded best-effort and NEVER fatal: if this fails, Get-HolderLiveness keeps its
+# older, stricter meaning and refuses, which is the safe direction. Dot-sourced at script scope
+# because functions sourced inside a function do not survive it.
+try { . "$PSScriptRoot/occupancy.ps1" } catch { }
 $repo = $repo.Trim()
 $common = (& git -C $repo rev-parse --path-format=absolute --git-common-dir).Trim()
 $claims = Join-Path $common "mefor-coord/claims"
@@ -154,23 +160,69 @@ function Add-HistoryLine([string]$Line) {
 # Reports only what it can PROVE. A vanished directory is a fact and the one state safe to act on
 # unasked. Everything else is 'unknown' or a quiet-hours count -- never "probably fine": a session can
 # be alive and simply not committing, so silence is not evidence of death.
+# A DIRECTORY IS NOT A PERSON, AND THIS FUNCTION USED TO CONFLATE THEM (BACKLOG #1348).
+#
+# `present` meant "the path exists". It never asked whether a SESSION was in it, so a worktree that
+# outlived its session -- the directory still on disk, nobody in it -- rendered identically to a
+# lane that is actively building. That is a THIRD state the tool could not represent, and it is the
+# one that produces work that is done, correct, and held by nobody: the sanctioned verbs refuse,
+# `-Force` is forbidden by CLAUDE.md, and the claim cannot be regularised by anything.
+#
+# ***THE NEW STATE REPORTS. IT DOES NOT PERMIT.*** `unoccupied` still REFUSES, exactly as `present`
+# does, and this is not timidity -- `occupancy.ps1` states the rule it inherits: "there is no
+# heartbeat on this host, so nothing here can prove a session is GONE. Occupancy may therefore only
+# ever VETO an action; a DEAD/STALE/absent verdict must never by itself authorise one." What the
+# item asked for is that the two be DISTINGUISHABLE, not that the second become releasable.
+#
+# POLARITY, and it is the same rule the blanket-stage guard carries (#1341, #1229): recognition may
+# only ever SUPPRESS. Downgrading to `unoccupied` requires a POSITIVE determination -- the occupancy
+# probe loaded, reported itself Available, and returned zero vetoing sessions for that exact path.
+# Every other outcome, including the probe failing to load at all, stays `present`. A missing
+# answer must cost a refusal, never a licence.
+$script:OccupancyProbe = $null   # $null = not yet tried; $false = unavailable; else the object
+
+function Get-OccupancyOnce {
+    if ($null -ne $script:OccupancyProbe) { return $script:OccupancyProbe }
+    try {
+        if (-not (Get-Command Get-WorktreeOccupancy -EA SilentlyContinue)) {
+            $script:OccupancyProbe = $false
+            return $false
+        }
+        $occ = Get-WorktreeOccupancy -Repo $repo
+        # `Available` false means the fence could not be built -- an unplaceable record, no repo.
+        # Treat that exactly like a failed probe.
+        $script:OccupancyProbe = if ($occ -and $occ.Available) { $occ } else { $false }
+    }
+    catch { $script:OccupancyProbe = $false }
+    return $script:OccupancyProbe
+}
+
 function Get-HolderLiveness([string]$HeldPath) {
     try {
         if (-not (Test-Path -LiteralPath $HeldPath)) {
-            return [pscustomobject]@{ State = 'gone'; QuietHours = $null }
+            return [pscustomobject]@{ State = 'gone'; QuietHours = $null; Occupants = $null }
         }
         $ct = & git -C $HeldPath log -1 --format=%ct 2>$null
         if ($ct) {
             $quiet = [int]((Get-Date) - [System.DateTimeOffset]::FromUnixTimeSeconds([long]$ct).LocalDateTime).TotalHours
-            return [pscustomobject]@{ State = 'present'; QuietHours = $quiet }
+            $occ = Get-OccupancyOnce
+            if ($occ) {
+                $who = @(Get-WorktreeOccupants -Occupancy $occ -Path $HeldPath)
+                if ($who.Count -eq 0) {
+                    return [pscustomobject]@{ State = 'unoccupied'; QuietHours = $quiet; Occupants = 0 }
+                }
+                return [pscustomobject]@{ State = 'present'; QuietHours = $quiet; Occupants = $who.Count }
+            }
+            # Probe unavailable: fall back to the old meaning, which refuses. Never to 'unoccupied'.
+            return [pscustomobject]@{ State = 'present'; QuietHours = $quiet; Occupants = $null }
         }
         # Present on disk but no commit to date it by -- a brand-new worktree looks exactly like this.
-        return [pscustomobject]@{ State = 'unknown'; QuietHours = $null }
+        return [pscustomobject]@{ State = 'unknown'; QuietHours = $null; Occupants = $null }
     }
     catch {
         # Say so rather than returning 'gone'. A failed probe that reported death would turn an
         # unreadable path into a licence to release someone's live claim.
-        return [pscustomobject]@{ State = 'failed'; QuietHours = $null }
+        return [pscustomobject]@{ State = 'failed'; QuietHours = $null; Occupants = $null }
     }
 }
 
@@ -200,8 +252,16 @@ function Show-List {
             switch ($live.State) {
                 'gone'    { $age = "  [HOLDER GONE -- worktree no longer exists; release with -Force]" }
                 'present' {
-                    $age = "  [held ${hrs}h; holder last committed $($live.QuietHours)h ago]"
-                    if ($live.QuietHours -ge 12) { $age += " -- QUIET, confirm with the holder before releasing" }
+                    $age = "  [held ${hrs}h; LIVE SESSION in the holder, last committed $($live.QuietHours)h ago]"
+                    if ($live.QuietHours -ge 12) { $age += " -- QUIET but OCCUPIED, ask before releasing" }
+                }
+                # THE THIRD STATE, and the listing is the surface that matters (BACKLOG #1348).
+                # -List is what a Cleaner or Dispatcher reads to decide where to spend attention, so
+                # a directory that outlived its session must not render identically to a lane that
+                # is building. It still says ROUTE, not release: the refusal is unchanged.
+                'unoccupied' {
+                    $age = "  [held ${hrs}h; DIRECTORY ONLY -- no live session in it, last commit $($live.QuietHours)h ago]"
+                    $age += " -- ROUTE to the Cleaner/Dispatcher; not releasable on this signal alone"
                 }
                 default   { $age = "  [held ${hrs}h; holder liveness UNKNOWN -- confirm before releasing]" }
             }
@@ -245,10 +305,18 @@ if ($Release) {
                 Write-Host "  Safe to take over:  claim.ps1 -Release $Release -Force"
             }
             'present' {
-                Write-Host "  HOLDER IS STILL THERE -- that worktree exists and last committed $($live.QuietHours)h ago." -ForegroundColor Red
+                Write-Host "  HOLDER IS STILL THERE -- that worktree exists, a live session is IN it, and it last committed $($live.QuietHours)h ago." -ForegroundColor Red
                 Write-Host "  Do NOT -Force it on the strength of a quiet period: a session can be alive and"
                 Write-Host "  simply not committing. Ask that session first -- releasing a live claim is how two"
                 Write-Host "  sessions end up building the same thing."
+            }
+            'unoccupied' {
+                Write-Host "  HOLDER IS A DIRECTORY, NOT A SESSION -- that worktree exists and last committed $($live.QuietHours)h ago," -ForegroundColor Yellow
+                Write-Host "  but NO live session is placed in it. This is the third state (BACKLOG #1348)."
+                Write-Host "  STILL NOT YOURS TO -Force. Nothing on this host can prove a session is gone: occupancy"
+                Write-Host "  sees a session by the cwd it launched in, so one working here BY ABSOLUTE PATH from"
+                Write-Host "  elsewhere is invisible to it. This is reported so you can ROUTE it, not act on it."
+                Write-Host "  Route to the Cleaner or the Dispatcher -- releasing another worktree's claim is theirs."
             }
             default {
                 Write-Host "  HOLDER LIVENESS UNKNOWN -- the worktree exists but could not be dated." -ForegroundColor Yellow
@@ -424,10 +492,18 @@ try {
             Write-Host "      pwsh -NoProfile -File scripts\coord\claim.ps1 -Take $Take -Note ""<what>"""
         }
         'present' {
-            Write-Host "  HOLDER IS STILL THERE -- that worktree exists and last committed $($live.QuietHours)h ago." -ForegroundColor Red
+            Write-Host "  HOLDER IS STILL THERE -- that worktree exists, a live session is IN it, and it last committed $($live.QuietHours)h ago." -ForegroundColor Red
             Write-Host "  Do NOT build it in parallel -- that is the duplicate-work this gate exists to stop,"
             Write-Host "  and do NOT -Force it: quiet is not dead. Coordinate with that session or pick"
             Write-Host "  different work. Its note above says what it is doing."
+        }
+        'unoccupied' {
+            Write-Host "  HOLDER IS A DIRECTORY, NOT A SESSION -- that worktree exists and last committed $($live.QuietHours)h ago," -ForegroundColor Yellow
+            Write-Host "  but NO live session is placed in it. This is the third state (BACKLOG #1348)."
+            Write-Host "  STILL NOT YOURS TO -Force, and the refusal is deliberate: occupancy can VETO but never"
+            Write-Host "  authorise, because nothing here can prove a session is gone. A session working in this"
+            Write-Host "  path BY ABSOLUTE PATH from another cwd does not appear as an occupant."
+            Write-Host "  Hand it to the Cleaner or the Dispatcher with this line; do not build it in parallel."
         }
         default {
             Write-Host "  HOLDER LIVENESS UNKNOWN -- the worktree exists but could not be dated." -ForegroundColor Yellow
