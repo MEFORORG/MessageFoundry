@@ -87,6 +87,72 @@ def _dot_anchored_denies(settings: dict[str, Any]) -> list[str]:
     return [r for r in settings["permissions"]["deny"] if "(./" in r]
 
 
+# --------------------------------------------------------- is every hook script wired AT ALL?
+
+# THE HOLE THIS CLOSES (BACKLOG #1339). Every check above walks `hooks.<event>[].hooks[]` -- that
+# is, over REFERENCED scripts. A script referenced by NO handler yields an empty reference list, so
+# every assertion passes VACUOUSLY over it. `block-blanket-git-stage.ps1` was referenced by nothing,
+# on any settings file, while at least eight tracked sites described it as a live control -- and
+# nothing here could see that, because the thing to see was an ABSENCE.
+#
+# WHY THIS IS THREE STATES AND NOT TWO, WHICH IS THE WHOLE DESIGN. A wired/unwired instrument would
+# be WRONG and would assert the exact falsehood this test exists to stop. Six scripts are wired at
+# USER level by a TRACKED INSTALLER, not by the tracked settings.json:
+# `scripts/coord/install-coordination.ps1` wires five, `scripts/worktree/install-gate.ps1` wires
+# `worktree_gate.ps1`. Those are installed and live. Under two states they would all land on the
+# "deliberately not wired" list, producing a reviewed record claiming six live hooks are switched
+# off. So the second state is MEASURED FROM THE INSTALLERS rather than hand-listed, which is also
+# what stops it decaying into another enumeration.
+_INSTALLERS = (
+    Path("scripts/coord/install-coordination.ps1"),
+    Path("scripts/worktree/install-gate.ps1"),
+    Path("scripts/coord/install-git-hooks.ps1"),
+)
+
+# Scripts that are genuinely wired NOWHERE. Each carries its reason, because a bare list is a
+# dumping ground and an entry nobody can justify is how this decays back into a false record.
+# Keep it SHORT. If it grows, that is the signal, not the workaround.
+_KNOWN_UNWIRED: dict[str, str] = {
+    "block-blanket-git-stage.ps1": (
+        "BACKLOG #1339. Present and fully tested, wired nowhere. Owner ruled 2026-08-25 (relayed "
+        "via the Liaison) that it IS a control and is to be wired AFTER the quote-state splitter "
+        "repair -- wiring it before that shipped a false-deny class to every seat on every clone, "
+        "and that friction is what gets a control disarmed. The repair is BACKLOG #1341."
+    ),
+    "lane-level.ps1": "Not a PreToolUse guard; invoked directly by coordination scripts.",
+    "steer-inject.ps1": "Opt-in steering channel, armed per-session rather than by a matcher.",
+    "steer-send.ps1": "The sending half of the same opt-in channel; never a hook handler.",
+}
+
+
+def _hook_scripts() -> list[str]:
+    return sorted(p.name for p in (_ROOT / "scripts" / "hooks").glob("*.ps1"))
+
+
+def _installer_wired(root: Path | None = None) -> set[str]:
+    """Hook script basenames a TRACKED installer wires. Measured, never asserted."""
+    base = root or _ROOT
+    wired: set[str] = set()
+    for rel in _INSTALLERS:
+        f = base / rel
+        if not f.is_file():
+            continue
+        for name in _hook_scripts():
+            if name in f.read_text(encoding="utf-8"):
+                wired.add(name)
+    return wired
+
+
+def _unclassified_hook_scripts(settings: dict[str, Any], root: Path | None = None) -> list[str]:
+    """Hook scripts that are in NONE of the three states. This is the thing that must be empty."""
+    referenced: set[str] = set()
+    for _event, handler in _hook_handlers(settings):
+        for ref in _repo_script_refs(handler):
+            referenced.add(ref.rsplit("/", 1)[-1])
+    accounted = referenced | _installer_wired(root) | set(_KNOWN_UNWIRED)
+    return [n for n in _hook_scripts() if n not in accounted]
+
+
 def test_settings_is_valid_json() -> None:
     """A malformed tracked settings file is a repo-wide outage, not a local one."""
     assert _load()["permissions"], "permissions block is missing or empty"
@@ -141,6 +207,64 @@ def test_every_hook_script_actually_exists() -> None:
     )
 
 
+def test_every_hook_script_is_wired_or_explicitly_named_as_unwired() -> None:
+    """A hook script in none of the three states is an UNRECORDED absence, which is the defect.
+
+    This is the assertion the module could not previously make, because every other check walks
+    the handler lists and therefore cannot see a script no handler names.
+    """
+    unclassified = _unclassified_hook_scripts(_load())
+    assert not unclassified, (
+        f"{len(unclassified)} hook script(s) are wired nowhere and are not named as unwired: "
+        f"{unclassified}.\n"
+        "Either wire it in .claude/settings.json, or add it to _KNOWN_UNWIRED WITH ITS REASON. "
+        "The point is that an unwired hook is a DECISION somebody made and can defend, not a "
+        "state the repo drifted into -- BACKLOG #1339 exists because at least eight tracked sites "
+        "described a control that was wired nowhere, and nothing could see it."
+    )
+
+
+def test_the_unwired_list_does_not_name_a_script_that_is_actually_wired() -> None:
+    """The list must not rot in the other direction either.
+
+    A name left on _KNOWN_UNWIRED after the script gets wired produces a reviewed record asserting
+    a live control is switched off -- the same false-record defect, pointing the other way.
+    """
+    settings = _load()
+    referenced = {
+        ref.rsplit("/", 1)[-1]
+        for _event, handler in _hook_handlers(settings)
+        for ref in _repo_script_refs(handler)
+    }
+    wired = referenced | _installer_wired()
+    stale = sorted(set(_KNOWN_UNWIRED) & wired)
+    assert not stale, (
+        f"{len(stale)} script(s) are named as deliberately unwired but ARE wired: {stale}.\n"
+        "Remove them from _KNOWN_UNWIRED. A list that keeps a wired hook is a record claiming a "
+        "live control is off."
+    )
+
+
+def test_the_unwired_list_only_names_scripts_that_exist() -> None:
+    missing = sorted(set(_KNOWN_UNWIRED) - set(_hook_scripts()))
+    assert not missing, (
+        f"_KNOWN_UNWIRED names {len(missing)} script(s) that are not in scripts/hooks/: {missing}.\n"
+        "A renamed or deleted script leaves an entry that silently excuses nothing."
+    )
+
+
+def _unclassified_for_planted(settings: dict[str, Any]) -> list[str]:
+    """Detector shim for the planted-defect row below.
+
+    The planted document is checked against a root with NO installers and NO real hooks directory,
+    so `_installer_wired` contributes nothing and the only thing accounting for a script is the
+    settings document itself. That isolates what this row is testing.
+    """
+    return _unclassified_hook_scripts(
+        settings, root=Path(__file__).resolve().parent / "_nonexistent"
+    )
+
+
 @pytest.mark.parametrize(
     ("planted", "checker", "label"),
     [
@@ -161,8 +285,18 @@ def test_every_hook_script_actually_exists() -> None:
             _dot_anchored_denies,
             "dot-anchored deny rule",
         ),
+        (
+            # A settings document that wires NOTHING, checked against a root with no installers.
+            # Every real hook script is then unaccounted for except the four on _KNOWN_UNWIRED, so
+            # the detector must return a non-empty list. If it returns nothing here, it cannot see
+            # an unwired script at all and the assertion above is passing for the wrong reason --
+            # which is exactly the vacuity BACKLOG #1339 is about.
+            {"permissions": {"deny": []}, "hooks": {}},
+            _unclassified_for_planted,
+            "hook script wired nowhere",
+        ),
     ],
-    ids=["unanchored-hook", "dot-anchored-deny"],
+    ids=["unanchored-hook", "dot-anchored-deny", "unwired-hook-script"],
 )
 def test_the_checks_can_actually_fail(planted: dict[str, Any], checker: Any, label: str) -> None:
     """A guard that cannot be shown to fail is not a guard.
