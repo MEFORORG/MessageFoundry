@@ -112,6 +112,59 @@ destructive script in this directory can be **execution-tested**
 repo); without it the only repository a test could reach was this one, so the branch-delete path was
 covered by review alone. (BACKLOG #1037.)
 
+### "Will be permanently discarded" is an INDEX test, not a LOSS test — `recoverable.ps1`
+
+**The archive dialog's warning about untracked files is wrong in the common case, and the common
+case is a worktree branched behind `main`.** It reasons from *not in this worktree's index* straight
+to *will be lost*, and skips the question that decides it: **is the content somewhere else.**
+
+A tree cut before a file landed does not have that file in its index. A copy of it sitting in the
+tree is therefore untracked **there** while tracked on `main` — recoverable, and named in the
+warning anyway. Every session branched behind `main` meets this, on every file that landed since,
+and the prompt arrives exactly when a seat is trying to finish.
+
+Measured on this repository 2026-08-24, on a tree detached at `720f9436`, one commit before
+`tests/test_ci_retry_native_crash.py` landed at `6e758a87`, holding `main`'s copy of that file:
+
+```
+git status --porcelain   ->  ?? tests/test_ci_retry_native_crash.py
+git hash-object <file>   ->  5498a64cad057ed729d7220591246f75f2d21f15
+git rev-parse origin/main:<file>  ->  5498a64cad057ed729d7220591246f75f2d21f15
+```
+
+Identical. The dialog called that permanent loss.
+
+**Answer it with [`recoverable.ps1`](../scripts/coord/recoverable.ps1) rather than by eye:**
+
+```
+pwsh -NoProfile -File scripts\coord\recoverable.ps1                 # this worktree
+pwsh -NoProfile -File scripts\coord\recoverable.ps1 -Worktree <p> -Json
+```
+
+It classifies every untracked file into one of three, and exits non-zero if any is at risk:
+
+| Verdict | Means |
+|---|---|
+| `RECOVERABLE` | byte-identical to the ref — the warning is wrong about this file |
+| `AT-RISK` — absent from the ref | genuinely nowhere else |
+| `AT-RISK` — on the ref but MODIFIED | the path is on `main`, **the local edit is not** |
+
+**The third row is why an existence check is not enough.** "Is it on main" answers *yes* for a file
+whose local edit is the only thing that would be lost.
+
+**Two rules it is built on, and both are about which way to be wrong.**
+
+- **Anything it cannot read is reported AT-RISK, never clean** — the same direction
+  [`occupancy.ps1`](../scripts/coord/occupancy.ps1) states for its own fence. A false `AT-RISK`
+  costs a look; a false `RECOVERABLE` costs the file.
+- **`-NoFetch` is safe for the same reason.** A stale ref can only fail to contain something that
+  has since landed, so it can only move a file from `RECOVERABLE` to `AT-RISK`. It cannot invent a
+  match. The ref and its sha are printed with every run, because a verdict quoted without the ref it
+  was computed against cannot be re-checked.
+
+**The dialog is the Claude Code harness, not this repository's code.** Nothing here changes its
+wording; this answers the question it raises but cannot itself answer. (BACKLOG #1298.)
+
 ## Prune the finished ones — `prune-merged.ps1`
 
 Worktrees pile up. [`prune-merged.ps1`](../scripts/worktree/prune-merged.ps1) sweeps the finished
