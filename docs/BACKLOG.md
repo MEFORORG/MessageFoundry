@@ -2902,6 +2902,14 @@ def route_demo_oru(msg):
 > shipped:** no stop condition, no state dump, no pin mechanism, no "test up to row N" surface.
 > None of the step-scoped run symbols this row's own re-score names as absent from `ide/src` exist
 > yet. This PR fixes the UX dead-end the Filed paragraph called out in passing, not the item.
+> **Confirmed by the owner via the Liaison: mocking-by-default is DECLINED even as a filed ADR 0010
+> amendment, and closing this item OUTRIGHT is DECLINED.** Both records agree -- the ledger stayed
+> open through this PR by design, not by oversight.
+> **The stop condition is a design question, not a to-do -- do not add it to this item casually.**
+> `dryrun_trace.py` implements the traced dry-run as a `sys.settrace` observer; stopping a handler
+> mid-execution means raising out of the trace function, which changes the execution semantics of
+> the thing being observed. It is not a flag to add. The Dispatcher split it out as its own unfiled
+> piece for exactly this reason.
 >
 > **Filed 2026-07-30 — not started.** Largely a stop condition + state dump on ADR 0072's traced dry-run; lookup rows must mock by default, not as an afterthought.
 > Verdict: build
