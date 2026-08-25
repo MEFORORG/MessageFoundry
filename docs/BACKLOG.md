@@ -2893,6 +2893,16 @@ def route_demo_oru(msg):
 
 > 🔢 **Re-scored 2026-08-20 -> P2.** Value **5/10** · Difficulty **4/10** · _fill-in_. None of the step-scoped run symbols exist in ide/src, so the feature is unstarted, but the substrate it needs is shipped: the traced dry-run, the line-containment fold and the sample picker are all present. Value is capped at parity with a clean workaround, since running the whole handler in the Test Bench already works; difficulty sits at 4 because the stop condition and state dump ride an existing path while the pin mechanism, the redaction reuse and the IDE surface cross the CLI-to-extension seam. _(was 5/10 · 4/10.)_
 >
+> **PARTIAL 2026-08-25 -- THE "NOT AS AN AFTERTHOUGHT" WRINKLE IS FIXED (PR #605). THE STEP-SCOPED
+> FEATURE ITSELF IS STILL UNSTARTED.** A skipped `db_lookup`/`fhir_lookup` used to render "live
+> lookup - not evaluated in preview" and dead-end there; it now points at ADR 0010:62's supported
+> preview path (stub the call's wrapper) instead. Also fixed: `mergeLiveValues` had dropped the
+> annotation's kind, so a skipped lookup inherited the live-value tooltip "Live value (redacted by
+> default)" -- it is not a value and nothing was redacted. **None of the feature this item names
+> shipped:** no stop condition, no state dump, no pin mechanism, no "test up to row N" surface.
+> None of the step-scoped run symbols this row's own re-score names as absent from `ide/src` exist
+> yet. This PR fixes the UX dead-end the Filed paragraph called out in passing, not the item.
+>
 > **Filed 2026-07-30 — not started.** Largely a stop condition + state dump on ADR 0072's traced dry-run; lookup rows must mock by default, not as an afterthought.
 > Verdict: build
 > Closing-act: code
