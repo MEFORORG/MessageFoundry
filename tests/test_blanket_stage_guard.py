@@ -205,13 +205,26 @@ def test_the_commit_deny_names_its_own_rule() -> None:
     assert "-a/-am/--all" in reason
 
 
-# -------------------------------------------------------------- the known over-deny, pinned
+# ------------------------------------------------- the former over-deny class, FIXED (#1341)
 
-# These are WRONG, and they are pinned so a future program-position fix flips them on purpose
-# rather than finding them. Each pair asserts the capitalised form the case fix newly denies AND
-# the lowercase form that already denied before it -- the pair is the evidence that this widens an
-# existing class rather than creating one. See the module docstring.
-OVER_DENY_PAIRS = [
+# THESE SIX USED TO DENY AND NOW ALLOW. THE FLIP IS DELIBERATE (BACKLOG #1341).
+#
+# They were pinned as known-wrong so that whoever repaired the splitter would flip them on purpose
+# instead of discovering them. This is that flip. Nothing here is a coverage reduction: each row
+# asserts the SAME payload as before, with the opposite expectation, so the case is still driven
+# and a regression that re-denies any of them fails this test.
+#
+# Two mechanisms, and the pairs separate them:
+#   * rows 1-4 were segmentation. A separator inside a quoted span or a heredoc body split the
+#     command, so prose landed at a segment front and was read as program position. The guard now
+#     blanks quoted spans and heredoc bodies before splitting.
+#   * rows 5-6 were argv position. `add` and `commit` were matched ANYWHERE in a segment, so a
+#     read-only search whose ARGUMENT was the word `add` denied. The guard now resolves the
+#     subcommand past git's global options and suppresses on a recognised read-only one.
+#
+# The capitalised/lowercase pairing is KEPT rather than collapsed. It is what shows the class was
+# pre-existing and not created by the case fix, and it costs one extra driven payload per row.
+FIXED_FORMER_OVER_DENY_PAIRS = [
     pytest.param(
         'git commit -m "fix\nGit add -A is blocked"',
         'git commit -m "fix\ngit add -A is blocked"',
@@ -245,10 +258,75 @@ OVER_DENY_PAIRS = [
 ]
 
 
-@pytest.mark.parametrize(("capitalised", "lowercase"), OVER_DENY_PAIRS)
-def test_prose_and_read_only_commands_are_over_denied(capitalised: str, lowercase: str) -> None:
-    assert_denied(run_guard(bash(capitalised)))
-    assert_denied(run_guard(bash(lowercase)))
+@pytest.mark.parametrize(("capitalised", "lowercase"), FIXED_FORMER_OVER_DENY_PAIRS)
+def test_prose_and_read_only_commands_are_allowed(capitalised: str, lowercase: str) -> None:
+    """Prose quoting a blanket-stage command, and read-only searches, must not be refused."""
+    assert_allowed(run_guard(bash(capitalised)))
+    assert_allowed(run_guard(bash(lowercase)))
+
+
+# ------------------------------------------------- the fix must not have bought a fail-open
+
+# WHY THIS TEST EXISTS AND WHY IT IS NOT A FALSE-DENY CORPUS (BACKLOG #1229's reverted experiment).
+#
+# A program-position predicate was built for the sibling worktree_gate.ps1 and withdrawn six hours
+# later. Its measurement was 93 rows of "does the shape that should allow, allow?" -- and A
+# FALSE-DENY CORPUS CANNOT FIND A FAIL-OPEN BY CONSTRUCTION. It disclosed one fail-open and shipped
+# at least ten more it never probed, because every row it drove asked the other question.
+#
+# The rows below are the other direction: shapes that MUST still be refused. On this guard a
+# fail-open is the direction that loses coverage silently, so widening the allow side without this
+# test is how the same mistake gets made on a second file.
+MUST_STILL_DENY = [
+    # The plain forms. If any of these ever allows, the guard is off.
+    "git add -A",
+    "git add --all",
+    "git add -u",
+    "git add .",
+    "git commit -a",
+    "git commit -am wip",
+    "git commit --all",
+    # A GLOBAL OPTION BEFORE THE SUBCOMMAND. This is the specific fail-open the subcommand
+    # resolver could have introduced: if `-C` did not consume its value, the resolver would read
+    # the PATH as the subcommand, fail to recognise it, and -- in a design where recognition were
+    # required to keep the token -- allow. It must deny.
+    "git -C /some/path add -A",
+    "git -c user.name=x add -A",
+    "git --git-dir=/tmp/x add -A",
+    # An UNKNOWN global option must not become an escape hatch either. The resolver cannot know
+    # whether it takes a value, so the subcommand resolves to something unrecognised -- which must
+    # fall through to a deny, never to an allow.
+    "git --some-future-option add -A",
+    "git --some-future-option value add -A",
+    # A read-only subcommand NAME appearing as an argument must not suppress a real stage.
+    "git add -A -- log",
+    "git add -A -- status",
+    # Separators outside quotes still split, so a real stage after one is still caught.
+    "echo hi && git add -A",
+    "echo hi ; git add -A",
+    "echo hi | git add -A",
+    # A quoted argument elsewhere on the line must not hide a real stage outside the quotes.
+    'git commit -m "message" && git add -A',
+    # A heredoc that ENDS before the real command does not blank it.
+    "cat <<'EOF' > f.txt\nsome body\nEOF\ngit add -A",
+]
+
+
+@pytest.mark.parametrize("command", MUST_STILL_DENY)
+def test_the_fix_did_not_buy_a_fail_open(command: str) -> None:
+    assert_denied(run_guard(bash(command)))
+
+
+def test_an_unrecognised_subcommand_falls_through_to_deny_not_allow() -> None:
+    """The polarity rule, asserted directly rather than left to the rows above.
+
+    Recognition may only ever SUPPRESS a deny. `zzz-not-a-subcommand` is not in the read-only
+    list and never will be, so a command carrying it must still be judged by the staging
+    predicates -- which deny. If this ever allows, the resolver has been rewritten so that failing
+    to recognise something produces an allow, and that is the exact defect that killed the
+    predicate in BACKLOG #1229.
+    """
+    assert_denied(run_guard(bash("git zzz-not-a-subcommand add -A")))
 
 
 # --------------------------------------------------------------------------------- still fail-open
