@@ -13218,6 +13218,7 @@ measurement from this row's subject and it is named here rather than performed.*
 
 > 🔢 **Re-scored 2026-08-20 -> P3.** Value **4/10** · Difficulty **2/10** · _fill-in_. One limb remains and it is a pure refactor: logging_setup.py:66-70 still derives its own table from range(0x20) plus 0x7F and does not import controlchars at all, while the module now states the alphabet once at :67 with both arms reading it. Value 4 because nothing is mis-screened today, two of the three named copies already agree, and at least two further independent derivations sit outside this item's scope (spreadsheet.py:37, soap.py:263), so folding logging_setup in buys the stated cross-module leverage for one file rather than repo-wide. Difficulty 2 for one import, one derivation with an explicit tab subtraction, a test pinning that tab stays excluded, and renaming the acceptance test's scrub_control_chars, which returns zero code hits. _(previously unscored.)_
 >
+> **PARTIAL 2026-08-25 -- THE THIRD SPELLING IS NOW GONE TOO. STILL STAYS OPEN** (spreadsheet.py:37 and soap.py:263 are named out-of-scope above, and remain so). `logging_setup.py` now imports `controlchars` and states its own table as that alphabet minus TAB, proved byte-identical to the pre-change table entry-for-entry (32 entries both sides) rather than asserted. Verified before writing this note, not taken from the branch's own claim.
 > **PARTIAL 2026-08-20 -- ONE OF THE TWO SPELLINGS INSIDE THE MODULE IS GONE; THE THIRD, IN ANOTHER MODULE, IS NOT. THIS ITEM STAYS OPEN.** `controlchars.py` now states the set once, in `_is_control_char` at `:67`, and both `has_control_char` and `strip_control_chars` read it -- so the module's own interior no longer contradicts its docstring. **But `logging_setup.py:66-70` still re-derives the same set independently** (`for _i in range(0x20)` plus `[0x7F]`), and the landing branch does not touch that file at all. The item names **three** spellings and asks for **one definition of the SET**; two of three now share one. **The leverage the module exists to provide is still absent across the module boundary:** widen `_is_control_char` and it reaches neither `_CTRL_TRANSLATION` nor anything reading it, and nothing reports the omission. Measured on the landing branch, not inferred. Recorded by the lander under ADR 0165, because a closing banner that lists what a change fixed and not what it left is half a record.
 > 🔢 **Filed 2026-08-15 - not started. THE CONSOLIDATION DOES NOT CONSOLIDATE ITS OWN TWO FUNCTIONS.** [`controlchars.py`](../messagefoundry/controlchars.py) was created by [#1253](BACKLOG.md) to write the C0/DEL test **once**; its docstring is titled *"The C0/DEL control-character test, written once"* and ends *"THE POINT IS THE COPYING PRACTICE, not the seven known lines. If you need this test, import it."* **It then spells the predicate out twice inside itself**, and a third statement of the same set lives in `logging_setup`.
 > **MEASURED, three independent spellings of one set:**
@@ -16120,3 +16121,35 @@ federation on, the authorization request would travel the browser-visible front 
 identity provider is the only party positioned to reject tampering. That is true, and it is not by
 itself a finding against this cell.
 
+
+## 1358. claim.ps1 -Release records the script copy's tree as the actor, and nothing downstream catches a misdirected release
+
+> 🔢 **Filed 2026-08-25 - not started.** ***The release audit record names WHICHEVER CHECKOUT'S COPY OF THE SCRIPT WAS INVOKED, not the seat that invoked it -- so a release run from another tree is silently misattributed.*** **And the asymmetry is the item:** the same anchoring on `-Take` is caught downstream by the ledger gate, because a claim naming the wrong tree makes the commit fail. **A release is never re-checked by anything**, so a wrong actor in the record stands permanently and looks correct.
+> Verdict: build
+> Research: none
+> Closing-act: code
+
+**Cluster:** coordination tooling. **Priority:** P2. **Verdict:** build.
+**Severity:** no product axis (sec. 0). ***The cost is an audit record that names the wrong actor while reading as authoritative*** -- and that record exists specifically because `-Force` takeovers previously "left no record of who released whose claim". **The defect is the record silently failing at the job it was built for, one verb over.**
+
+**MEASURED.** `scripts/coord/claim.ps1:69` derives `$repo` from `$PSScriptRoot`, and `released_by` at `:272` and `:302` is that `$repo`. Resolving the same expression against three checked-out copies:
+
+| script copy invoked | resulting `$repo` |
+|---|---|
+| the PRIMARY checkout's copy | the primary checkout, branch `main` |
+| worktree A's copy | worktree A |
+| worktree B's copy | worktree B |
+
+Three copies, three different values, from the one expression at `:69`. The specific trees do not
+matter and are deliberately not named here -- what matters is that `$repo` tracks the COPY, never the
+caller.
+
+A seat that runs its OWN copy is recorded correctly. A seat that runs another copy -- an absolute `-File` path to the primary is the easy way in -- is recorded as that other tree. **A real release performed from the primary was recorded as `released_by: .../MessageFoundry, branch main` and is unattributable.**
+
+**THE ASYMMETRY, AND WHY `-Take` IS NOT THE SAME BUG.** `claim_check.py` reads the repo from **cwd**, which is correct for it because it runs as a commit hook and cwd IS the committing worktree. So a claim TAKEN against the wrong tree makes the later commit fail the gate -- loudly, at the point of use. **BACKLOG #1297 is the worked instance of exactly that**, from the allocator rather than the claim tool: allocated from the primary checkout, gate correctly refused with *"#1297 was not allocated to this worktree"*, item re-filed at #1298, lesson written up at [docs/BACKLOG.md](BACKLOG.md) lines 53-55. **Nothing plays that role for a release.** Verified: `released_by` and `release` appear nowhere in `scripts/hooks/claim_check.py`, so the enforcing gate never reads a release record at all.
+
+**DO NOT SIMPLY RE-ANCHOR ON cwd.** The `$PSScriptRoot` anchoring is DELIBERATE, its reasoning is written out at the head of `alloc.ps1` under **BACKLOG #1060**, and `claim.ps1:62-68` records that this file was fixed the same way *"by inspection rather than by a second reproduction"*. For `-Take` the claim must name the tree that will commit, and the anchoring is what makes a mismatch detectable. **Flipping the anchor would trade a silent wrong actor for a silently-passing wrong claim, which is worse.** The likely shape is recording BOTH trees, or refusing/warning when the script's tree and cwd differ -- a design call inside a small file, not a one-liner.
+
+**Acceptance should include the negative case:** a release invoked from a tree other than the script's must not produce a record that reads as authoritative about who acted. A test that only exercises the same-tree path cannot fail on this defect, since the same-tree path is already correct.
+
+**Related:** #1297 (the worked `-Take` instance, allocator side), #1060 (why the anchoring exists and must not be naively reverted).
