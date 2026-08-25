@@ -13952,7 +13952,7 @@ class as the release gate `a92ab10f` fixed, and it is why (b) is not cosmetic.
 
 ## 1307. the safe ASVS writer has no path to retire an anchor
 
-> 🔢 **Filed 2026-08-22 - not started.** Value **5/10** · Difficulty **2/10** · _fill-in_. **Retirement is a SANCTIONED outcome the only safe writer cannot express**, so one live tracking item is blocked indefinitely with no workaround that keeps the guard intact. Difficulty 2 because the fix mirrors an override that already exists in the same tool.
+> ✅ **SHIPPED -- verified on main 2026-08-25 at `995de69b`.** `scripts/asvs/apply.py` now takes an explicit `--allow-retirement` flag (`:208`); a bare flag deliberately does not unlock a drop by itself -- the payload must also declare which anchors it retires, or the writer still refuses. **Filed 2026-08-22 - not started.** Value **5/10** · Difficulty **2/10** · _fill-in_. **Retirement is a SANCTIONED outcome the only safe writer cannot express**, so one live tracking item is blocked indefinitely with no workaround that keeps the guard intact. Difficulty 2 because the fix mirrors an override that already exists in the same tool.
 > Verdict: build
 > Closing-act: code
 
@@ -14274,11 +14274,11 @@ this fix is larger than this item and independently true.***
 
 ## 1320. messagefoundry check cannot fail on an unloadable service config -- it catches the refusal and reports skipped
 
-> 🔢 **Filed 2026-08-22 - not started.** Value **9/10** · Difficulty **3/10** · _quick win_. **The commit and CI gate LOADS a refused config, RECEIVES the exact refusal, PRINTS it, and returns rc=0 as a SKIP.** Value 9 because it is not one bug -- no config error of this class has ever been failable; difficulty 3 because the fix is to distinguish two states the `except` clause currently merges.
+> ✅ **SHIPPED -- verified on main 2026-08-25 at `1d26ef36`.** The four required-check catch sites in `messagefoundry/checks.py` now distinguish an absent config (legitimate skip) from one that exists and was refused (fail), each printing what it skipped and why. **Filed 2026-08-22 - not started.** Value **9/10** · Difficulty **3/10** · _quick win_. **The commit and CI gate LOADS a refused config, RECEIVES the exact refusal, PRINTS it, and returns rc=0 as a SKIP.** Value 9 because it is not one bug -- no config error of this class has ever been failable; difficulty 3 because the fix is to distinguish two states the `except` clause currently merges.
 > Verdict: build
 > Closing-act: code
 
-***BUILT 2026-08-23 AT `d4c96f14` alongside `#1318` -- PR 551.*** **The `except` clause now distinguishes the two states it merged: an ABSENT file is the legitimate skip and is handled earlier, so reaching the handler means the file EXISTS and the loader refused it.**
+***BUILT 2026-08-23 AT `1d26ef36` alongside `#1318` -- PR 551.*** *(citation corrected 2026-08-25: the row originally cited `d4c96f14`, which is not an ancestor of `origin/main`; `1d26ef36` is.)* **The `except` clause now distinguishes the two states it merged: an ABSENT file is the legitimate skip and is handled earlier, so reaching the handler means the file EXISTS and the loader refused it.**
 ***THE SCOPE IS WIDER THAN THIS ROW STATES AND THE COUNT IS DELIBERATELY OPEN-ENDED: AT LEAST FOUR SITES, THREE OF THEM `required=True`.*** *Found by scanning for the detail string `settings did not load`.* **A second scan by CLASS -- any except-handler returning `ok=True` -- surfaces a second string, `config did not load`, at two further `required=True` sites.** *One of those states its reason verbatim and is deliberate; **the other carries the same shape with NO stated reason and is unresolved.*** ***That limb is NOT filed as a number and is named as a subject instead, because whether it is a defect or an undocumented instance of the justified case cannot be settled without establishing what `validate` blocks -- and nobody should guess on a required check.***
 **The enumeration is the hazard here.** *`four` was written where `at least four` was available, twice, at two different levels -- **once from the string the report was phrased in, once inherited from it.*** *Prefer `at least`.*
 
@@ -15159,9 +15159,9 @@ per-lane virtualenv.
 ## 1336. Rule 3c asks one string two questions, so every fix for the false deny widens the bypass and back
 
 > 🔢 **Filed 2026-08-23 - not started.** `#1066` (a quoted danger key is invisible, FAIL OPEN) and `#1086` (a quoted body reads as a command, FALSE DENY) are **the same design error pulling in opposite directions**: rule 3c asks both questions of `$seg.Scan`, the quote-blanked text. Blanking more fixes `#1086` and widens `#1066`. Blanking less does the reverse. **Neither row can be fixed alone.**
-> Verdict: owner-ruling
+> Verdict: build
 > Research: none
-> Closing-act: owner-ruling
+> Closing-act: code
 
 **Cluster:** commit gates / secret scanning. **Priority:** P1 -- higher than either row it reconciles,
 because **a fix to either one alone makes the other worse and the last three attempts did exactly
