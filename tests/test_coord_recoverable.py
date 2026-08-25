@@ -73,13 +73,22 @@ def run_helper(worktree: Path, ref: str = "origin/main") -> tuple[int, dict[str,
     return proc.returncode, dict(json.loads(proc.stdout))
 
 
-def verdicts(payload: dict[str, object]) -> dict[str, str]:
+def by_path(payload: dict[str, object], field: str) -> dict[str, str]:
+    """Map path -> one field of its row. One unpacker, so the isinstance dance is written once."""
     rows = payload["Rows"]
     assert isinstance(rows, list)
     out: dict[str, str] = {}
     for r in rows:
-        out[str(r["Path"])] = str(r["Verdict"])
+        out[str(r["Path"])] = str(r[field])
     return out
+
+
+def verdicts(payload: dict[str, object]) -> dict[str, str]:
+    return by_path(payload, "Verdict")
+
+
+def reasons(payload: dict[str, object]) -> dict[str, str]:
+    return by_path(payload, "Reason")
 
 
 @pytest.fixture
@@ -159,6 +168,13 @@ def test_a_file_on_the_ref_but_locally_modified_is_at_risk(
     code, payload = run_helper(behind)
     print(json.dumps(payload, indent=2))
     assert verdicts(payload)["landed.txt"] == "AT-RISK"
+    # The reason must be `modified`, NOT `absent`. Both are AT-RISK, so Verdict alone cannot tell
+    # this test from the one above it -- and an existence-only check would have said RECOVERABLE.
+    got_reasons = reasons(payload)
+    assert got_reasons["landed.txt"] == "modified", (
+        f"expected the on-ref-but-edited reason, got {got_reasons}; if this says 'absent' the ref "
+        "lookup is failing and every file would be reported at risk for the wrong reason"
+    )
     assert code == 1
 
 
@@ -181,6 +197,17 @@ def test_the_three_arms_do_not_collapse_to_one_answer(
 
     assert got["landed.txt"] == "RECOVERABLE"
     assert got["genuinely_new.txt"] == "AT-RISK"
+
+    # AND THE REASONS MUST DIFFER, not just the verdicts. Verdict is deliberately BINARY -- three of
+    # its four causes are AT-RISK -- so a suite that only asserts Verdict cannot tell "absent from
+    # the ref" from "on the ref but modified", which is the distinction the docs call the whole
+    # point. Without this block a consumer would have to parse English with the ref interpolated
+    # into it, and nothing here would notice if Reason collapsed to one value.
+    got_reasons = reasons(payload)
+    assert got_reasons["landed.txt"] == "identical"
+    assert got_reasons["genuinely_new.txt"] == "absent"
+    assert len(set(got_reasons.values())) == 2, f"the reasons collapsed to one value: {got_reasons}"
+
     # base.txt is TRACKED and modified, so it is not untracked and not this script's subject.
     assert "base.txt" not in got, (
         "a tracked-but-modified file is not what the archive warning is about; including it would "

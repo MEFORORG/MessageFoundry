@@ -112,7 +112,12 @@ destructive script in this directory can be **execution-tested**
 repo); without it the only repository a test could reach was this one, so the branch-delete path was
 covered by review alone. (BACKLOG #1037.)
 
-### "Will be permanently discarded" is an INDEX test, not a LOSS test — `recoverable.ps1`
+## "Will be permanently discarded" is an INDEX test, not a LOSS test — `recoverable.ps1`
+
+> **A `##`, not a `###` under "Remove one".** The question governs every way a tree goes away —
+> `remove.ps1`, `prune-merged.ps1`, a rescue, the archive dialog, a manual directory delete — so
+> nesting it under the one script it does *not* concern hides it from a reader scanning the headings
+> for exactly this.
 
 **The archive dialog's warning about untracked files is wrong in the common case, and the common
 case is a worktree branched behind `main`.** It reasons from *not in this worktree's index* straight
@@ -141,16 +146,20 @@ pwsh -NoProfile -File scripts\coord\recoverable.ps1                 # this workt
 pwsh -NoProfile -File scripts\coord\recoverable.ps1 -Worktree <p> -Json
 ```
 
-It classifies every untracked file into one of three, and exits non-zero if any is at risk:
+It exits non-zero if any file is at risk. Each row carries a **binary `Verdict`** — the only thing a
+caller has to act on — and a **`Reason`** from a closed set, because three of the four causes are
+`AT-RISK` and "absent" is not the same problem as "modified":
 
-| Verdict | Means |
-|---|---|
-| `RECOVERABLE` | byte-identical to the ref — the warning is wrong about this file |
-| `AT-RISK` — absent from the ref | genuinely nowhere else |
-| `AT-RISK` — on the ref but MODIFIED | the path is on `main`, **the local edit is not** |
+| `Verdict` | `Reason` | Means |
+|---|---|---|
+| `RECOVERABLE` | `identical` | byte-identical to the ref — the warning is wrong about this file |
+| `AT-RISK` | `absent` | genuinely nowhere else |
+| `AT-RISK` | `modified` | the path is on `main`, **the local edit is not** |
+| `AT-RISK` | `unreadable` | the working copy could not be hashed — see the rules below |
 
-**The third row is why an existence check is not enough.** "Is it on main" answers *yes* for a file
-whose local edit is the only thing that would be lost.
+**The `modified` row is why an existence check is not enough.** "Is it on main" answers *yes* for a
+file whose local edit is the only thing that would be lost. `Reason` is machine-readable on purpose:
+without it a consumer would have to parse the `Detail` sentence, which interpolates the ref name.
 
 **Two rules it is built on, and both are about which way to be wrong.**
 

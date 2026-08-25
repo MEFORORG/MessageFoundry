@@ -16,15 +16,11 @@
     the warning is wrong. Every session branched behind `main` meets this, on every file that landed
     since, and the prompt arrives at exactly the moment a seat is trying to finish.
 
-    REPRODUCED ON THIS REPOSITORY 2026-08-24, which is what establishes the mechanism rather than a
-    coincidence. A worktree detached at 720f9436, one commit before `tests/test_ci_retry_native_crash.py`
-    landed at 6e758a87, with `main`'s copy of that file placed in it:
-
-        git status --porcelain   ->  ?? tests/test_ci_retry_native_crash.py
-        worktree blob            ->  5498a64cad057ed729d7220591246f75f2d21f15
-        origin/main blob         ->  5498a64cad057ed729d7220591246f75f2d21f15
-
-    Identical. The dialog called that permanent loss.
+    The mechanism was REPRODUCED on this repository before this script was written, on a worktree
+    detached one commit before a file landed, holding `main`'s copy of it: git called it untracked
+    while the two blob hashes were identical. **The measurement, with its shas, is stated ONCE in
+    docs/WORKTREES.md under "Will be permanently discarded" -- read it there.** Six sha citations
+    maintained in two files is how the two copies drift.
 
 .NOTES
     THE DIALOG IS THE CLAUDE CODE HARNESS AND IS NOT THIS REPOSITORY'S CODE. Nothing here can change
@@ -103,41 +99,59 @@ foreach ($e in $entries) {
     if ($e.Length -lt 4 -or $e.Substring(0, 2) -ne '??') { continue }
     $path = $e.Substring(3)
 
-    $verdict = $null
-    $detail = $null
+    # RESET PER ITERATION. Load-bearing: without these, a hash from the PREVIOUS file survives into
+    # this row on any branch that does not assign it, and the row then reports a sha for a file
+    # nobody hashed. $verdict and $reason need no reset -- every branch below assigns both.
     $wtHash = $null
     $refHash = $null
 
-    & git -C $script:Root cat-file -e "${Ref}:${path}" 2>$null | Out-Null
-    $onRef = ($LASTEXITCODE -eq 0)
+    # ONE call, not two. `rev-parse <ref>:<path>` already exits non-zero when the path is absent
+    # from the ref, so the `cat-file -e` existence probe that used to sit here asked a question this
+    # line answers on its way to the sha -- a third of the per-file work for nothing. Verified:
+    # `git rev-parse origin/main:no/such/path` exits 128, `origin/main:README.md` exits 0.
+    $refHash = & git -C $script:Root rev-parse "${Ref}:${path}" 2>$null
+    $onRef = ($LASTEXITCODE -eq 0 -and $refHash)
 
     if (-not $onRef) {
+        $refHash = $null
         $verdict = 'AT-RISK'
-        $detail = "absent from $Ref"
+        $reason = 'absent'
     }
     else {
-        $refHash = & git -C $script:Root rev-parse "${Ref}:${path}" 2>$null
         $wtHash = & git -C $script:Root hash-object -- "$path" 2>$null
-        if ($LASTEXITCODE -ne 0 -or -not $wtHash -or -not $refHash) {
+        if ($LASTEXITCODE -ne 0 -or -not $wtHash) {
             # UNREADABLE COUNTS AS AT RISK. It is on the ref, so it is tempting to call it clean --
             # but we could not read the working copy, so we do not know it is the same content, and
             # the one thing we must never do is tell someone a file is safe when we could not look.
             $verdict = 'AT-RISK'
-            $detail = 'UNREADABLE -- could not hash the working copy; treated as at risk, not as clean'
+            $reason = 'unreadable'
         }
         elseif ($wtHash -eq $refHash) {
             $verdict = 'RECOVERABLE'
-            $detail = "identical to $Ref"
+            $reason = 'identical'
         }
         else {
             $verdict = 'AT-RISK'
-            $detail = "on $Ref but MODIFIED here"
+            $reason = 'modified'
         }
+    }
+
+    # REASON IS THE MACHINE-READABLE ARM AND DETAIL IS THE SENTENCE. Verdict answers the only
+    # question a caller has to act on -- would this be lost -- and is deliberately BINARY. But three
+    # of its four causes are AT-RISK, and a consumer that wants to tell "absent" from "modified"
+    # would otherwise have to parse English with the ref name interpolated into it. Reason is a
+    # closed set: identical, absent, modified, unreadable.
+    $detail = switch ($reason) {
+        'absent'     { "absent from $Ref" }
+        'modified'   { "on $Ref but MODIFIED here" }
+        'identical'  { "identical to $Ref" }
+        'unreadable' { 'UNREADABLE -- could not hash the working copy; treated as at risk, not as clean' }
     }
 
     $rows += [pscustomobject]@{
         Path        = $path
         Verdict     = $verdict
+        Reason      = $reason
         Detail      = $detail
         WorktreeSha = $wtHash
         RefSha      = $refHash
