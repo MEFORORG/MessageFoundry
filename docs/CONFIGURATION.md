@@ -210,7 +210,15 @@ The one row that *does* vary:
 > (`tls_terminated_upstream`) an unset origin is a startup REFUSAL, not a degraded ceremony**: with
 > the console served, `serve` exits 2 until `web_console_public_address` is set, because the `Host`
 > header is client-forwardable there and both the `/ui` CSRF check and the passkey origin binding
-> need the exact external origin. It is only in the **in-process-TLS off-loopback** case that the
+> need the exact external origin.
+>
+> **IT IS NO LONGER A CONSOLE SETTING ON A PHI INSTANCE, and that is a SECOND, INDEPENDENT
+> refusal** (BACKLOG #1026). A **PHI** instance behind a declared terminator under `enforce` exits 2
+> with the origin unset **even with the console off**. The reason has nothing to do with `/ui`: the
+> ASVS 12.1.1 startup probe dials that origin to measure the terminator's TLS floor, so leaving it
+> unset *silently disabled the check* rather than failing it — and a control that degrades to a
+> no-op reports success forever afterwards. So on a PHI instance, read this as a property of the
+> **deployment posture**, not of whether you serve the console. It is only in the **in-process-TLS off-loopback** case that the
 > engine warns and starts — and *there* the ceremonies do fail closed (no passkeys) until you set it.
 > Either way, **changing its host later invalidates every enrolled passkey** (they pin their
 > mint-time RP; the account page marks them "unusable (origin changed)").
