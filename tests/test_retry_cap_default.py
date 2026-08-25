@@ -26,7 +26,10 @@ if the implementation changed underneath it).
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
+from pydantic import ValidationError
 
 from messagefoundry.config.models import ContentType, OrderingMode, RetryPolicy
 from messagefoundry.config.settings import DeliverySettings
@@ -208,3 +211,65 @@ def test_the_refusal_still_fires_on_an_explicit_retry_forever() -> None:
             reg,
             delivery=DeliverySettings(ordering=OrderingMode.UNORDERED, retry_max_attempts=None),
         )
+
+
+# --- BACKLOG #1217: the catalog row must describe the loader that ships ----------------------
+#
+# The floor landed in PR #383 and the docs/CONFIGURATION.md row was not moved with it, so the
+# catalog asserted "`0` or a negative value is accepted and dead-letters on the first failure"
+# about a loader that had started REFUSING both. A catalog row describing a configuration the
+# loader refuses is worse than silence: an operator writes it, the start fails, and the document
+# that sent them there still reads as authoritative.
+#
+# These drive the REAL settings model rather than re-reading the Field, and then check the prose
+# against that behaviour, so the two cannot drift apart again silently.
+
+
+@pytest.mark.parametrize("value", [0, -1, -100])
+def test_the_operator_facing_retry_cap_refuses_zero_and_negatives(value: int) -> None:
+    """The floor itself, driven rather than read off the Field declaration."""
+    with pytest.raises(ValidationError):
+        DeliverySettings(retry_max_attempts=value)
+
+
+@pytest.mark.parametrize("value", [1, 100, None])
+def test_the_floor_does_not_narrow_what_was_already_legal(value: int | None) -> None:
+    """The other direction. A floor that also refuses `None` would delete the documented
+    retry-forever posture, and a suite that only asserts refusals could not tell the two apart."""
+    assert DeliverySettings(retry_max_attempts=value).retry_max_attempts == value
+
+
+def test_the_internal_no_retry_idiom_is_untouched_by_the_operator_facing_floor() -> None:
+    """THE ONE THAT MUST NOT BE 'TIDIED'. `RetryPolicy(max_attempts=0)` is the deliberate idiom for
+    a permanent, no-retry failure and FOUR test modules depend on it -- test_batch_completion,
+    test_postgres_store, test_resend, test_sqlserver_store.
+
+    Adding `ge=1` to the RetryPolicy field looks like the symmetrical completion of the same
+    tightening and would instead DELETE A USED MECHANISM. settings.py says so in its own comment;
+    this makes it executable.
+    """
+    assert RetryPolicy(max_attempts=0).max_attempts == 0
+
+
+def test_the_configuration_catalog_does_not_still_promise_the_pre_floor_behaviour() -> None:
+    """BACKLOG #1217. Pins the PROSE against the behaviour asserted above.
+
+    Deliberately negative rather than matching the new wording: an exact-sentence assertion would
+    red on any rewording, which trains the next author to edit the test instead of the doc. What
+    must never come back is the CLAIM that a zero loads.
+    """
+    doc = (Path(__file__).resolve().parents[1] / "docs" / "CONFIGURATION.md").read_text(
+        encoding="utf-8"
+    )
+    row = next((ln for ln in doc.splitlines() if ln.startswith("| `retry_max_attempts`")), None)
+    assert row is not None, "the retry_max_attempts catalog row has moved or been renamed"
+
+    assert "is accepted and dead-letters on the first failure" not in row, (
+        "the catalog again promises that a zero loads. It has not since PR #383 -- the loader "
+        "refuses it, which the tests above drive directly."
+    )
+    assert "REFUSED at load" in row, "the row must say what the loader actually does with a zero"
+    assert "RetryPolicy(max_attempts=0)" in row, (
+        "the row must keep naming the internal idiom the floor deliberately does NOT touch, or a "
+        "later reader completes the tightening and deletes it"
+    )
