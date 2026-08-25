@@ -1115,7 +1115,9 @@ def _free_contiguous(n: int, start: int = 3600, tries: int = 60) -> int:
 
 async def _await_health(url: str, *, timeout: float) -> bool:
     deadline = time.monotonic() + timeout
-    async with httpx.AsyncClient(timeout=2.0) as client:
+    # verify=False: url is always a locally-spawned ShardCertNode/EngineNode's own address -- the PID
+    # this harness holds is the trust anchor, not the self-signed placeholder cert that PID minted.
+    async with httpx.AsyncClient(timeout=2.0, verify=False) as client:
         while time.monotonic() < deadline:
             with contextlib.suppress(Exception):
                 r = await client.get(f"{url}/health")

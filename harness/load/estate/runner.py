@@ -107,7 +107,7 @@ async def run_estate(
     result_ok = all(c.ok for c in slos)
     return EstateReport(
         profile=profile.name,
-        engine_url=f"http://{sink_host}:{engine_api_port}",
+        engine_url=f"https://{sink_host}:{engine_api_port}",
         db_backend=profile.store_backend,
         records=records,
         slos=slos,
@@ -293,7 +293,10 @@ async def _await_node_healthy(node: EngineNode, *, timeout: float) -> None:
     import httpx
 
     start = time.perf_counter()
-    async with httpx.AsyncClient(timeout=4.0) as client:
+    # verify=False: the harness spawned this process and holds its PID, which is the real trust
+    # anchor. Verifying the self-signed cert it just watched that process mint would only confirm
+    # the file on disk matches the socket -- the PID already establishes that.
+    async with httpx.AsyncClient(timeout=4.0, verify=False) as client:
         while time.perf_counter() - start < timeout:
             if not node.alive:
                 raise EstateError(f"engine exited during startup:\n{node.log_tail()}")

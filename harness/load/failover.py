@@ -118,7 +118,9 @@ class EngineNode:
     ) -> None:
         self.node_id = node_id
         self.api_port = api_port
-        self.url = f"http://127.0.0.1:{api_port}"
+        # The engine always serves TLS now (BACKLOG #1276 part A) and mints a self-signed placeholder
+        # on first run when no operator cert is configured -- which this harness never configures.
+        self.url = f"https://127.0.0.1:{api_port}"
         self._env = dict(env)
         # GIVEN 1 (ADR 0148): the default env `dev` now derives PHI, so a bare `serve --env dev` runs the
         # secure PHI posture (keyless/egress/retention/notify refusals). This harness node serves the
@@ -480,7 +482,13 @@ async def run_failover_load(
         for tag, api in (("a", ports.api_a), ("b", ports.api_b))
     ]
 
-    async with httpx.AsyncClient(timeout=4.0) as client:
+    # verify=False: the harness's trust anchor is the PID it spawned and holds the handle to, not the
+    # certificate -- verifying a self-signed placeholder it just watched that process mint proves the
+    # file on disk matches the socket, which the PID already establishes. Cert-trust (reading the
+    # generated cert path off the node's own state dir) was considered and declined for the same
+    # reason plus the cost: a per-node cert path threaded through every call site, adding a
+    # wait-for-file-to-exist whose timeout would present identically to the bug this fixes.
+    async with httpx.AsyncClient(timeout=4.0, verify=False) as client:
         try:
             await sink.start()
             for node in nodes:
