@@ -712,3 +712,87 @@ def test_the_cla_allowlist_is_an_enumeration_and_not_a_glob() -> None:
         "the CLA allowlist emptied; every maintainer push would need a signature"
     )
     assert "*" not in allowlist, f"the CLA allowlist contains a glob: {allowlist!r}"
+
+
+# ===================================================================================================
+# SIBLING CITATIONS -- the gate saw the first item and none of the rest (BACKLOG #1347).
+# ===================================================================================================
+
+# The house citation form writes the BACKLOG prefix ONCE and the siblings after it:
+# `(BACKLOG #1319, #1322, #1323, #1331)`. The gate extracted the first match with
+# `grep -oiE 'BACKLOG #[0-9]+' | head -1`, so a four-item PR was told to update ONE banner.
+#
+# The failure direction is the expensive one. It is not that the gate wrongly passes -- any
+# backlog-namespace edit satisfies it -- but that its ERROR TEXT names one item of four, and a
+# citation screen built on the same rule reports three landed siblings as never delivered.
+#
+# THE SQUASH SUFFIX IS THE TRAP ON THE OTHER SIDE, and it is why the rule is scoped to the
+# parenthetical rather than "every #N after the token". A landed subject reads
+# `(BACKLOG #1040) (#547)`; an unscoped rule claims item 547. Measured over `git log --all` on
+# 2026-08-25: unscoped calls 641 subjects multi-item, parenthetical-scoped calls 38 of 1070.
+
+
+def test_the_hygiene_gate_names_every_cited_sibling_not_just_the_first(
+    hygiene: tuple[str, str, Path, dict[str, str], str, str],
+) -> None:
+    bash, script, repo, env, base, head = hygiene
+    # A code change with no ledger edit: the gate must refuse, and its message is what we read.
+    target = repo / "messagefoundry" / "x.py"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text("x = 1\n", encoding="utf-8")
+    _run(["git", "add", "-A"], repo, env)
+    _run(["git", "commit", "-m", "code"], repo, env)
+    head = _text(_run(["git", "rev-parse", "HEAD"], repo, env)).strip()
+
+    code, out = _run_hygiene(
+        bash,
+        script,
+        repo,
+        env,
+        title="four gates (BACKLOG #1319, #1322, #1323, #1331)",
+        body="",
+        base=base,
+        head=head,
+    )
+    assert code != 0, f"a code PR with no ledger edit must be refused\n{_ascii(out)}"
+    for item in ("1319", "1322", "1323", "1331"):
+        assert item in out, (
+            f"the gate refused but never named item #{item}. It used to report only the first of a "
+            f"sibling group, sending the author to update one banner of four.\n{_ascii(out)}"
+        )
+
+
+def test_the_hygiene_gate_does_not_read_a_squash_suffix_as_an_item(
+    hygiene: tuple[str, str, Path, dict[str, str], str, str],
+) -> None:
+    """The negative that bounds the fix.
+
+    Widening from "the first BACKLOG #N" to "every #N after the token" would close the sibling gap
+    and open this one: a squash-merged title carries the pull-request number as a trailing group,
+    and the gate would demand a status banner for a PR number. Scoping to the parenthetical is what
+    buys the first without the second, so both directions are pinned.
+    """
+    bash, script, repo, env, base, head = hygiene
+    target = repo / "messagefoundry" / "x.py"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text("x = 1\n", encoding="utf-8")
+    _run(["git", "add", "-A"], repo, env)
+    _run(["git", "commit", "-m", "code"], repo, env)
+    head = _text(_run(["git", "rev-parse", "HEAD"], repo, env)).strip()
+
+    code, out = _run_hygiene(
+        bash,
+        script,
+        repo,
+        env,
+        title="fix(hooks): the deny text (BACKLOG #1040) (#547)",
+        body="",
+        base=base,
+        head=head,
+    )
+    assert code != 0
+    assert "1040" in out, f"the real item must still be named\n{_ascii(out)}"
+    assert "547" not in out, (
+        "the gate read the squash-merge pull-request suffix as a backlog item. A banner would be "
+        f"demanded for a PR number that has no ledger row.\n{_ascii(out)}"
+    )
