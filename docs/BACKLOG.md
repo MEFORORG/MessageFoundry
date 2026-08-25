@@ -12284,6 +12284,19 @@ BUILDS it.*
 
 ## 1255. two testpaths ship a top-level conftest each, so a bare import conftest binds to whichever loaded first
 
+> **PARTIAL 2026-08-25 -- A GUARD LANDED, STAYS OPEN.** `tests/test_conftest_name_collision_guard.py`
+> statically walks every testpath root for a bare `import conftest`/`from conftest import` and reds on
+> one; nothing does that today, so it is a regression guard, not a fix for a present-tense defect --
+> the row's own "latent, not live" framing still holds. Verified: 13/13 across the guard and its
+> tooling-partition registration, ruff + mypy strict clean.
+> **THE ROW'S OWN RECOMMENDED FIX (option B, `__init__.py` in both roots) WAS MEASURED AND DOES NOT
+> WORK.** It doesn't merely fail to help -- it turns the LATENT collision FATAL: both directories are
+> named `tests`, so both conftests become `tests.conftest`, and the whole suite fails to collect
+> (`_pytest.pathlib.ImportPathMismatchError`) rather than silently mis-binding. Option A
+> (`importmode = "importlib"`) removes the collision but its own stated 44-file-breakage risk did not
+> reproduce in a sandbox on pytest 9.1.1 -- a sandbox isn't the real 691-file tree, so that needs
+> re-measuring before anyone adopts or dismisses it, and switching import semantics for 691 files on
+> an unreproduced premise is exactly what landing the guard alone avoids needing right now.
 > 🔢 **Re-scored 2026-08-20 -> P2.** Value **5/10** · Difficulty **3/10** · _fill-in_. Every precondition re-verifies at HEAD: no importmode at pyproject.toml:317, neither test root carries an __init__.py, and the collision is still untripped (zero bare conftest imports), so the trap is latent exactly as filed. Difficulty is above a plain additive edit because option B changes pytest module naming for roughly 680 files and the item's own rule is that the only honest check is a both-testpaths full-suite run. _(was 6/10 · 2/10.)_
 >
 > **THE FAILURE MODE IS WORSE THAN FILED, AND THE FIX IS A DECISION RATHER THAN A TASK. Measured 2026-08-15; verified independently here.** This item describes the signature as an `AttributeError` naming a module path from the wrong package -- i.e. failing loudly-ish. **It can fail SILENTLY instead.**
