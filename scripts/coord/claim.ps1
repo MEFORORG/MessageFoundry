@@ -211,9 +211,22 @@ function Get-HolderLiveness([string]$HeldPath) {
                 if ($who.Count -eq 0) {
                     return [pscustomobject]@{ State = 'unoccupied'; QuietHours = $quiet; Occupants = 0 }
                 }
-                return [pscustomobject]@{ State = 'present'; QuietHours = $quiet; Occupants = $who.Count }
+                return [pscustomobject]@{ State = 'occupied'; QuietHours = $quiet; Occupants = $who.Count }
             }
-            # Probe unavailable: fall back to the old meaning, which refuses. Never to 'unoccupied'.
+            # PROBE UNAVAILABLE -> `present`, which keeps its PRE-#1348 meaning exactly: the path is
+            # there and that is all this function knows. It still refuses.
+            #
+            # THIS SPLIT IS A BUG FIX, NOT A TIDY-UP. The first version of #1348 returned `present`
+            # for BOTH "the probe looked and found an occupant" and "the probe could not look", and
+            # then labelled `present` "LIVE SESSION in the holder". On a machine with no Claude
+            # config root -- every CI runner -- the probe reports Available=false, so the fallback
+            # fired and the tool ASSERTED A LIVE SESSION IT HAD NEVER OBSERVED. Caught by the
+            # required windows-2025 leg on PR 585, three tests, deterministic rather than flaky.
+            #
+            # One state cannot mean both "I measured this" and "I could not measure this", and the
+            # deny text is where that conflation becomes a false statement to an operator. `occupied`
+            # is now the only state that claims a session, and it is reachable only through a probe
+            # that returned Available with a vetoing occupant for this exact path.
             return [pscustomobject]@{ State = 'present'; QuietHours = $quiet; Occupants = $null }
         }
         # Present on disk but no commit to date it by -- a brand-new worktree looks exactly like this.
@@ -251,9 +264,14 @@ function Show-List {
             $live = Get-HolderLiveness $held
             switch ($live.State) {
                 'gone'    { $age = "  [HOLDER GONE -- worktree no longer exists; release with -Force]" }
-                'present' {
+                'occupied' {
                     $age = "  [held ${hrs}h; LIVE SESSION in the holder, last committed $($live.QuietHours)h ago]"
                     if ($live.QuietHours -ge 12) { $age += " -- QUIET but OCCUPIED, ask before releasing" }
+                }
+                # The probe could not run -- no Claude config root, or it failed. Says what it knows
+                # and no more: the path is there. It must NOT claim a session it never looked for.
+                'present' {
+                    $age = "  [held ${hrs}h; holder present, last committed $($live.QuietHours)h ago; OCCUPANCY UNKNOWN -- the session probe could not run]"
                 }
                 # THE THIRD STATE, and the listing is the surface that matters (BACKLOG #1348).
                 # -List is what a Cleaner or Dispatcher reads to decide where to spend attention, so
@@ -305,6 +323,14 @@ if ($Release) {
                 Write-Host "  Safe to take over:  claim.ps1 -Release $Release -Force"
             }
             'present' {
+                Write-Host "  HOLDER IS STILL THERE -- that worktree exists and last committed $($live.QuietHours)h ago." -ForegroundColor Red
+                Write-Host "  OCCUPANCY UNKNOWN: the session probe could not run, so this does NOT say whether"
+                Write-Host "  anyone is in it. Treat that as MORE reason to coordinate, not less."
+                Write-Host "  Do NOT -Force it on the strength of a quiet period: a session can be alive and"
+                Write-Host "  simply not committing. Ask that session first -- releasing a live claim is how two"
+                Write-Host "  sessions end up building the same thing."
+            }
+            'occupied' {
                 Write-Host "  HOLDER IS STILL THERE -- that worktree exists, a live session is IN it, and it last committed $($live.QuietHours)h ago." -ForegroundColor Red
                 Write-Host "  Do NOT -Force it on the strength of a quiet period: a session can be alive and"
                 Write-Host "  simply not committing. Ask that session first -- releasing a live claim is how two"
@@ -492,6 +518,14 @@ try {
             Write-Host "      pwsh -NoProfile -File scripts\coord\claim.ps1 -Take $Take -Note ""<what>"""
         }
         'present' {
+            Write-Host "  HOLDER IS STILL THERE -- that worktree exists and last committed $($live.QuietHours)h ago." -ForegroundColor Red
+            Write-Host "  OCCUPANCY UNKNOWN: the session probe could not run, so this does NOT say whether"
+            Write-Host "  anyone is in it. Treat that as MORE reason to coordinate, not less."
+            Write-Host "  Do NOT build it in parallel -- that is the duplicate-work this gate exists to stop,"
+            Write-Host "  and do NOT -Force it: quiet is not dead. Coordinate with that session or pick"
+            Write-Host "  different work. Its note above says what it is doing."
+        }
+        'occupied' {
             Write-Host "  HOLDER IS STILL THERE -- that worktree exists, a live session is IN it, and it last committed $($live.QuietHours)h ago." -ForegroundColor Red
             Write-Host "  Do NOT build it in parallel -- that is the duplicate-work this gate exists to stop,"
             Write-Host "  and do NOT -Force it: quiet is not dead. Coordinate with that session or pick"

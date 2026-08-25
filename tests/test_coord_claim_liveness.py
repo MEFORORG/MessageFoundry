@@ -23,6 +23,7 @@ pass if the probe simply always said "gone".
 
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import subprocess
@@ -248,17 +249,58 @@ def test_list_still_reports_a_living_holders_quiet_hours(repo: Path, tmp_path: P
 
 
 @pytest.fixture
-def repo_with_occupancy(repo: Path) -> Path:
-    """The sandbox, plus the occupancy probe claim.ps1 consults.
+def repo_with_occupancy(repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """The sandbox, plus the occupancy probe claim.ps1 consults, plus a config root it can read.
 
     The base `repo` fixture deliberately copies ONLY claim.ps1, which is what makes the probe
     unavailable there -- and that is a real configuration, not an artifact: a checkout carrying a
     partial scripts/coord/ behaves exactly that way. Both are worth testing, so they get separate
     fixtures rather than one that hides the difference.
+
+    *** THE PLANTED CONFIG ROOT IS WHY THIS PASSES ON CI, and its absence is why the first version
+    of these tests did not. *** `Get-WorktreeOccupancy` reports Available=FALSE unless it finds at
+    least one READABLE SESSION RECORD -- not merely a config root, an actual record. Measured:
+
+        no config root at all          Available=False  "no Claude config root ... was found"
+        a config root, empty sessions  Available=False  "not one readable session record in them"
+        a config root + one record     Available=True   Sessions=0
+
+    A CI runner has no Claude session registry, so the probe was unavailable there and the code fell
+    back to its unknown-occupancy state -- while these tests asserted the DIRECTORY-ONLY state, which
+    is reachable only through an available probe. They passed on a developer box and failed on
+    windows-2025, which is the worst shape a test can have: green exactly where nobody is watching.
+
+    The record carries a DEAD pid, so it makes the probe available while placing NO occupant
+    anywhere. Occupancy is decided by whether the pid is running (session-registry.ps1), and 999999
+    is not a live process on any runner. The cwd points outside the sandbox for the same reason.
     """
     src = CLAIM.parent
     for name in ("occupancy.ps1", "session-registry.ps1"):
         shutil.copy2(src / name, repo / "scripts" / "coord" / name)
+
+    home = tmp_path / "fakehome"
+    sessions = home / ".claude" / "sessions"
+    sessions.mkdir(parents=True)
+    (sessions / "999999.json").write_text(
+        json.dumps(
+            {
+                "cwd": str(tmp_path / "somewhere-else"),
+                "pid": 999999,
+                "sessionId": "planted-dead-session",
+                "startedAt": "2026-01-01T00:00:00Z",
+                "procStart": "2026-01-01T00:00:00Z",
+                "kind": "desktop",
+                "entrypoint": "test",
+                "name": "planted",
+                "nameSource": "test",
+                "peerProtocol": "none",
+            }
+        ),
+        encoding="utf-8",
+    )
+    # Both, because the roots are resolved from the user profile and the two differ across shells.
+    monkeypatch.setenv("USERPROFILE", str(home))
+    monkeypatch.setenv("HOME", str(home))
     return repo
 
 
@@ -333,3 +375,37 @@ def test_without_the_probe_it_falls_back_to_REFUSING_not_to_the_new_state(
     assert "last committed" in out
     proc = claim(repo, "-Take", "k", "-Note", "mine now")
     assert proc.returncode != 0, "the take must still be refused when the probe cannot load"
+
+
+def test_an_unavailable_probe_never_claims_a_live_session(repo: Path, tmp_path: Path) -> None:
+    """THE REGRESSION TEST FOR THE BUG THAT REACHED CI. One state cannot mean two things.
+
+    The first version of BACKLOG #1348 returned `present` BOTH when the probe looked and found an
+    occupant AND when the probe could not look at all -- then labelled `present` "LIVE SESSION in
+    the holder". On any machine with no Claude session registry, which is every CI runner, the
+    fallback fired and the tool ASSERTED A LIVE SESSION IT HAD NEVER OBSERVED.
+
+    That is not a cosmetic wording defect. The whole point of the item is telling a DIRECTORY apart
+    from a PERSON, and a state that reports "person" when it means "I could not look" is the same
+    conflation the item exists to remove, reintroduced in the deny text.
+
+    The base `repo` fixture copies only claim.ps1, so occupancy.ps1 cannot be dot-sourced and the
+    probe is genuinely unavailable -- the same condition as a runner, reached a different way.
+    """
+    peer_holding(repo, tmp_path, "k")
+    out = claim(repo, "-List").stdout
+    assert "LIVE SESSION in the holder" not in out, (
+        "the tool claimed a live session while the occupancy probe could not run. It cannot know "
+        f"that, and saying it is what shipped to CI.\n{out}"
+    )
+    assert "OCCUPANCY UNKNOWN" in out, (
+        "an unavailable probe must SAY it could not look, not fall silent into a state that reads "
+        f"as a measurement.\n{out}"
+    )
+    # And it must still refuse -- naming the unknown is not a licence.
+    proc = claim(repo, "-Take", "k", "-Note", "mine now")
+    assert proc.returncode != 0
+    assert "quiet is not dead" in proc.stdout, (
+        "the unknown-occupancy branch dropped the safety guidance the occupied branch carries. "
+        "Only the liveness CLAIM should differ between them; the advice must not."
+    )
