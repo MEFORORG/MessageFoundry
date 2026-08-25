@@ -210,7 +210,15 @@ The one row that *does* vary:
 > (`tls_terminated_upstream`) an unset origin is a startup REFUSAL, not a degraded ceremony**: with
 > the console served, `serve` exits 2 until `web_console_public_address` is set, because the `Host`
 > header is client-forwardable there and both the `/ui` CSRF check and the passkey origin binding
-> need the exact external origin. It is only in the **in-process-TLS off-loopback** case that the
+> need the exact external origin.
+>
+> **IT IS NO LONGER A CONSOLE SETTING ON A PHI INSTANCE, and that is a SECOND, INDEPENDENT
+> refusal** (BACKLOG #1026). A **PHI** instance behind a declared terminator under `enforce` exits 2
+> with the origin unset **even with the console off**. The reason has nothing to do with `/ui`: the
+> ASVS 12.1.1 startup probe dials that origin to measure the terminator's TLS floor, so leaving it
+> unset *silently disabled the check* rather than failing it — and a control that degrades to a
+> no-op reports success forever afterwards. So on a PHI instance, read this as a property of the
+> **deployment posture**, not of whether you serve the console. It is only in the **in-process-TLS off-loopback** case that the
 > engine warns and starts — and *there* the ceremonies do fail closed (no passkeys) until you set it.
 > Either way, **changing its host later invalidates every enrolled passkey** (they pin their
 > mint-time RP; the account page marks them "unusable (origin changed)").
@@ -779,7 +787,7 @@ Because the local diff is cheap and PHI-safe it is **on by default** (zero phone
 ### `[delivery]`
 | Key | Type | Default | Notes |
 |---|---|---|---|
-| `retry_max_attempts` | int | `100` | attempts before a delivery dead-letters. **Finite by default** (BACKLOG #1051): 100 attempts under the backoff below is a 28,215 s / 7 h 50 m 15 s window, long enough to ride out a partner outage without letting a lane wedge indefinitely. Safe as a default because attempts are counted **per row** (an outage burns the cap on roughly the lane heads, not the backlog) and an exhausted row **dead-letters into the replayable DLQ**. Raise or lower it freely, but note the two edges: **there is no TOML or env spelling for retry-forever** — this key takes an integer, and `""`/`none`/`null` are load errors — so a never-give-up posture is a per-outbound, code-first `retry=RetryPolicy(max_attempts=None)` (under FIFO that head then blocks its lane until it succeeds or is purged); and **`0` or a negative value is accepted and dead-letters on the first failure**, since the check is `attempts >= max_attempts` against a post-increment count. A permanent `AR` reject fails fast regardless. |
+| `retry_max_attempts` | int | `100` | attempts before a delivery dead-letters. **Finite by default** (BACKLOG #1051): 100 attempts under the backoff below is a 28,215 s / 7 h 50 m 15 s window, long enough to ride out a partner outage without letting a lane wedge indefinitely. Safe as a default because attempts are counted **per row** (an outage burns the cap on roughly the lane heads, not the backlog) and an exhausted row **dead-letters into the replayable DLQ**. Raise or lower it freely, but note the two edges: **there is no TOML or env spelling for retry-forever** — this key takes an integer, and `""`/`none`/`null` are load errors — so a never-give-up posture is a per-outbound, code-first `retry=RetryPolicy(max_attempts=None)` (under FIFO that head then blocks its lane until it succeeds or is purged); and **`0` or a negative value is now REFUSED at load** (`ge=1`, BACKLOG #1051). It used to be accepted and dead-letter on the FIRST failure — the check is `attempts >= max_attempts` against a post-increment count, so `0` gave up immediately while *reading* like "no limit". That is why the floor is on this key rather than a documentation note. **The floor is on this operator-facing setting ONLY:** the code-first `retry=RetryPolicy(max_attempts=0)` stays legal and is the deliberate idiom for a permanent, no-retry failure. A permanent `AR` reject fails fast regardless. |
 | `retry_backoff_seconds`, `retry_backoff_multiplier`, `retry_max_backoff_seconds` | num | 5 / 2 / 300 | exponential backoff between attempts (per-outbound `retry=` overrides) |
 | `ordering` | enum | `fifo` | default queue ordering per outbound: `fifo` (strict in-order, head-of-line on failure) or `unordered` (batch + rotate-past-failures). Per-outbound `ordering=` overrides. |
 | `internal_error` | enum | `continue` | what a delivery worker does on an **internal/code error** (a non-`DeliveryError` exception from `send` — our bug, not the partner's): `continue` (dead-letter the row + advance) or `stop` (halt the connection's worker, preserve the message for replay, raise a `connection_stopped` alert). Per-outbound `internal_error=` overrides. Partner NAKs / transport failures are unaffected. |
