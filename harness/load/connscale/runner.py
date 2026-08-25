@@ -51,6 +51,7 @@ from harness.load.connscale.report import (
     ConnScaleReport,
     NoLoss,
     SloCheck,
+    monotonic_pairs,
 )
 from harness.load.corpus import Corpus, build_corpus
 from harness.load.correlator import Correlator
@@ -1206,31 +1207,19 @@ def _monotonic_slo(  # type: ignore[no-untyped-def]
     timing-derived counters on noisy CI runners (mf-ci-test-flakes), so a small dip is jitter, not a
     regression. Fails only on a real drop (``v < prior * (1 - tolerance)``). Missing readings (None) are
     skipped, not failed."""
-    ok = True
-    detail_parts: list[str] = []
-    # Group by (sweep_mode, claim_mode), NOT sweep_mode alone (BACKLOG #1101). Chaining prev_val across
-    # claim modes compares per_lane against pooled, and compare.py:22-25 states pooled's empty-claim
-    # rate SHOULD be materially lower — so a correct engine would fail this the moment a profile set
-    # claim_modes = ["per_lane", "pooled"]. No shipped profile does, which is the only reason it has
-    # never fired; the grouping is wrong independently of that.
-    by_mode: dict[tuple[str, str], list[ConnScaleRecord]] = {}
-    for r in records:
-        by_mode.setdefault((r.sweep_mode, r.claim_mode), []).append(r)
-    floor = 1.0 - tolerance
-    for (mode, claim_mode), rs in by_mode.items():
-        ordered = sorted(rs, key=lambda r: r.count)
-        prev_val: float | None = None
-        for r in ordered:
-            val = key(r)
-            if val is None:
-                continue
-            v = float(val)
-            if prev_val is not None and v < prev_val * floor:
-                ok = False
-                label = mode if claim_mode == "per_lane" else f"{mode}/{claim_mode}"
-                detail_parts.append(
-                    f"{label}@N={r.count}: {v:.3g} < prior {prev_val:.3g} * {floor:.2f}"
-                )
-            prev_val = v
-    observed = "monotonic" if ok else "; ".join(detail_parts)
-    return SloCheck(name, f"non-decreasing vs N (±{int(tolerance * 100)}% jitter)", observed, ok)
+    # The pairing itself — including the group-by-(sweep_mode, claim_mode) rule BACKLOG #1101 records
+    # as load-bearing — lives in `monotonic_pairs`. The emitter that records EVERY reading reads the
+    # same function, so a passing run and a failing run cannot describe the sequence differently.
+    pairs = monotonic_pairs(records, key, tolerance=tolerance)
+    breaches = [p for p in pairs if not p.ok]
+    observed = (
+        "monotonic"
+        if not breaches
+        else "; ".join(
+            f"{p.label}@N={p.count}: {p.value:.3g} < prior {p.prior:.3g} * {p.tolerance_floor:.2f}"
+            for p in breaches
+        )
+    )
+    return SloCheck(
+        name, f"non-decreasing vs N (±{int(tolerance * 100)}% jitter)", observed, not breaches
+    )
