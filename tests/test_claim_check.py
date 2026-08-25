@@ -197,6 +197,28 @@ def test_an_executable_under_a_documentation_prefix_is_HELD(repo: Path) -> None:
     assert proc.returncode != 0, f"a .py under docs/ escaped the claim rule:\n{proc.stdout}"
 
 
+def test_the_extension_test_is_case_INSENSITIVE(repo: Path) -> None:
+    """MUST BLOCK, and it did not until this arm was added.
+
+    `_CODE_SUFFIXES` is all-lowercase, so a bare `endswith` classified `docs/Tool.PY` as documentation
+    and waved it through -- the SAME FILE as `docs/tool.py`, which the arm above correctly blocks, told
+    apart only by how its extension is spelled.
+
+    THIS IS THE ORIGINAL DEFECT RESTATED AT THE SUFFIX. #1345's row names the shape it was closing --
+    "a test on the SPELLING of a path standing in for a question about what the file IS" -- and the
+    first fix moved that test from the prefix to the suffix without removing its dependence on
+    spelling. Measured against the landed gate before this change: `docs/Tool.PY`, `docs/Tool.Py` and
+    `.github/run.PS1` all read as documentation while their lowercase twins read as code."""
+    (repo / "docs" / "bench").mkdir(parents=True)
+    (repo / "docs" / "bench" / "Tool.PY").write_text("x = 1\n", encoding="utf-8")
+    _git(repo, "add", "docs/bench/Tool.PY")
+    proc = _run(repo, "perf: adjust the harness (BACKLOG #42)")
+    assert proc.returncode != 0, (
+        f"an UPPERCASE .PY under docs/ escaped the claim rule while its lowercase twin does not:\n"
+        f"{proc.stdout}"
+    )
+
+
 def test_a_markdown_only_commit_is_STILL_never_blocked(repo: Path) -> None:
     """MUST NOT BLOCK -- the twin, and the property the fix must not break.
 
