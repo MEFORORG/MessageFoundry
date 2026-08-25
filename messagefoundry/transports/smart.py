@@ -56,6 +56,7 @@ from messagefoundry.transports.rest import (
     _no_redirect_opener,
     _redact_url,
     cleartext_acceptance_from_settings,
+    ech_readdressed_request,
     enforce_outbound_length_limits,
     refuse_cleartext_credential_hop,
 )
@@ -117,6 +118,13 @@ class SmartBackendTokenProvider:
         cleartext_reason: str | None = None,
         connection: str | None = None,
         proxy: ProxyConfig | None = None,
+        # #1176 (ADR 0139): this connection's loopback ECH sidecar, when it has one. The token-endpoint
+        # POST follows the connection's egress route exactly as ADR 0126 rules it must for a forward
+        # proxy; for ECH that means the request is RE-ADDRESSED to the sidecar with the real
+        # authorization-server host in ``Host``, so the AS hostname is never in a cleartext outer
+        # ClientHello. Mutually exclusive with ``proxy`` (refused at connector construction). None
+        # (default) -> byte-identical.
+        ech_sidecar: str | None = None,
     ) -> None:
         if not token_url:
             raise SmartAuthError("SMART Backend Services requires a 'smart_token_url' setting")
@@ -180,9 +188,24 @@ class SmartBackendTokenProvider:
         self._proxy_auth: dict[str, str] = (
             token_proxy.auth_headers() if token_proxy is not None else {}
         )
+        self._ech_sidecar = ech_sidecar
         self._lock = threading.Lock()
         self._cached_token: str | None = None
         self._cached_expiry_monotonic = 0.0
+
+    def _token_request(self, data: bytes, headers: dict[str, str]) -> urllib.request.Request:
+        """The token-endpoint POST, on this connection's egress route. With an ECH sidecar the request
+        is re-addressed to it (#1176); without one it goes straight to the pinned ``token_url``,
+        byte-identical. The cleartext-credential refusal above keys on the DECLARED ``token_url``
+        scheme, which is what the sidecar re-originates — the engine->sidecar leg is same-host loopback
+        (ADR 0092), exactly as the delivery hop's is."""
+        if self._ech_sidecar is not None:
+            return ech_readdressed_request(
+                self._ech_sidecar, self.token_url, data=data, headers=headers, method="POST"
+            )
+        return urllib.request.Request(  # noqa: S310  # nosec B310 — scheme constrained to http(s) above
+            self.token_url, data=data, headers=headers, method="POST"
+        )
 
     def access_token(self) -> str:
         """A valid bearer token — cached until it nears expiry, otherwise freshly acquired. Blocking
@@ -233,15 +256,13 @@ class SmartBackendTokenProvider:
         # here -- both are config, so a blob-valued env() surfaces as a config error rather than an
         # opaque IdP failure on the first mint.
         enforce_outbound_length_limits(self.token_url, dict(self._proxy_auth))
-        req = urllib.request.Request(  # noqa: S310  # nosec B310 — scheme constrained to http(s) in __init__
-            self.token_url,
-            data=data,
-            headers={
+        req = self._token_request(
+            data,
+            {
                 "Content-Type": "application/x-www-form-urlencoded",
                 "Accept": "application/json",
                 **self._proxy_auth,  # ADR 0126: pre-emptive Proxy-Authorization when behind an auth proxy
             },
-            method="POST",
         )
         try:
             with self._opener.open(req, timeout=self.timeout_seconds) as resp:
@@ -279,7 +300,7 @@ class SmartBackendTokenProvider:
 
 
 def token_provider_from_settings(
-    s: Mapping[str, Any], *, proxy: ProxyConfig | None = None
+    s: Mapping[str, Any], *, proxy: ProxyConfig | None = None, ech_sidecar: str | None = None
 ) -> SmartBackendTokenProvider | None:
     """The :class:`SmartBackendTokenProvider` for an already-``env()``-resolved settings mapping, or
     ``None`` when SMART auth is off.
@@ -288,7 +309,9 @@ def token_provider_from_settings(
     ``False``), so any connection that didn't compose ``with_smart_backend`` is byte-identical. Shared by
     the FHIR/REST outbound (:func:`token_provider_from_destination`) and the ``FhirLookup`` read executor
     (ADR 0043) — both inject the minted bearer per request off-loop past the queue boundary. ``proxy``
-    (ADR 0126) routes the token-endpoint POST through the connection's forward proxy."""
+    (ADR 0126) routes the token-endpoint POST through the connection's forward proxy; ``ech_sidecar``
+    (#1176, ADR 0139) re-addresses it to the connection's loopback ECH sidecar instead. The two are
+    mutually exclusive by construction."""
     if not s.get("smart_token_url"):
         return None
     if not s.get("smart_enabled", True):
@@ -317,6 +340,7 @@ def token_provider_from_settings(
         cleartext_reason=accepted[1],
         connection=accepted[2],
         proxy=proxy,  # ADR 0126: forward-proxy the token-endpoint POST
+        ech_sidecar=ech_sidecar,  # #1176: ...or re-address it to the ECH sidecar (ADR 0139)
     )
 
 

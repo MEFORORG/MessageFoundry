@@ -123,9 +123,17 @@ retired in favour of the web console — BACKLOG #103; PySide6 now backs only th
 tooling.) The **VS Code extension is a separate product, not on PyPI** (a VS Code extension is a
 different ecosystem); see *VS Code extension & test harness* below for where to get it.
 
-> **Verify before you install (supply chain).** Every release is built by a GitHub Actions workflow,
-> Sigstore-signed, and carries SLSA build-provenance + PEP 740 attestations. Verify a downloaded
-> wheel against its source commit with
+> **Verify before you install (supply chain).** Every release is built by a GitHub Actions workflow
+> and published with **PEP 740 attestations** — all three publish jobs set `attestations: true`.
+>
+> **Sigstore signing, SLSA build-provenance and the CycloneDX SBOM cover the ENGINE wheel only.** The
+> `messagefoundry-webconsole` and `messagefoundry-harness` release jobs contain no signing, attestation
+> or SBOM step (BACKLOG #1193) — this note previously said "every release", which is why it is spelled
+> out per artifact rather than tightened in place. So `gh attestation verify` finds a GitHub
+> attestation for the engine wheel and **will not** find one for the console or harness wheel; those
+> carry the PyPI-side attestation only.
+>
+> Verify a downloaded **engine** wheel against its source commit with
 > `gh attestation verify <wheel> --repo MEFORORG/MessageFoundry`, or pull the signed wheel + SBOM
 > from the [GitHub Release assets](https://github.com/MEFORORG/MessageFoundry/releases). For an
 > air-gapped site, mirror the wheel to a private index.

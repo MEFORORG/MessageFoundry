@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import datetime
 import json
+import time
 from pathlib import Path
 
 import pytest
@@ -351,6 +352,55 @@ def test_self_signed_is_self_issued_with_san(
     san = cert.extensions.get_extension_for_class(x509.SubjectAlternativeName).value
     assert san.get_values_for_type(x509.DNSName) == ["dev.local", "alt.local"]
     assert serialization.load_pem_private_key((out / "key.pem").read_bytes(), password=None)
+
+
+def test_self_signed_ip_literal_lands_as_ip_address_san(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """An IP-literal name must be an ``iPAddress`` SAN entry, never a ``DNSName`` spelling the digits.
+
+    Hostname verification for an IP-literal URL is satisfied ONLY by an ``iPAddress`` entry -- a DNS
+    entry carrying the same characters does not match it. Every shipped first-party client defaults
+    to ``http://127.0.0.1:8765`` (``ide/src/cli.ts``, ``tray/config.py``, ``apiclient/client.py``) and
+    ``[api].host`` binds ``127.0.0.1``, so minting for the engine's own default produced a
+    certificate that could not verify against any of them. BACKLOG #1179.
+    """
+    out = tmp_path / "o"
+    rc = main(
+        [
+            "cert",
+            "self-signed",
+            "--cn",
+            "127.0.0.1",
+            "--san",
+            "localhost",
+            "--san",
+            "::1",
+            "--days",
+            "30",
+            "--out-dir",
+            str(out),
+            "--json",
+        ]
+    )
+    assert rc == 0
+    cert = x509.load_pem_x509_certificate((out / "cert.pem").read_bytes())
+    san = cert.extensions.get_extension_for_class(x509.SubjectAlternativeName).value
+
+    # The two IP literals are iPAddress entries; only the real hostname is a DNSName.
+    assert {str(ip) for ip in san.get_values_for_type(x509.IPAddress)} == {"127.0.0.1", "::1"}
+    assert san.get_values_for_type(x509.DNSName) == ["localhost"]
+
+    # The CLI's own JSON echoes the INPUT names, so it cannot witness this -- asserting on it would
+    # pass whatever the certificate contained. Read the minted file back instead.
+    assert json.loads(capsys.readouterr().out)["sans"] == ["127.0.0.1", "localhost", "::1"]
+
+    # The READER is a second, coupled site: it collected DNSName values only, so fixing the writer
+    # alone would make `cert inventory` under-report a certificate whose names are IP addresses.
+    from messagefoundry import pki
+
+    facts = pki.read_cert_facts((out / "cert.pem").read_bytes(), now=time.time())
+    assert facts.sans == ["127.0.0.1", "localhost", "::1"]
 
 
 def test_self_signed_human_output_warns_dev_only(

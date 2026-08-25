@@ -64,6 +64,31 @@ def test_resolve_env_settings_cast_failure_is_wiringerror_not_raw() -> None:
         resolve_env_settings(settings, {"epic_port": "66O1"})  # letter O, not a number
 
 
+def test_resolve_env_settings_cast_failure_never_echoes_the_value() -> None:
+    # The raw value of an env() setting can be a secret -- MEFOR_VALUE_* carries store passwords and
+    # connector keys -- and this error string is raised at startup into the operator's log, the support
+    # bundle and GET /logs/tail (BACKLOG #1183). It must name the setting and the KEY so the operator
+    # can fix it, and never the value. The value used to appear TWICE: once from the f-string and once
+    # inside the cast's own ValueError text, so dropping the f-string half alone is not enough.
+    secret = "pw-C4st_Val-66"
+    settings = {"store_password": env("store_password", cast=int)}
+    with pytest.raises(WiringError) as ei:
+        resolve_env_settings(settings, {"store_password": secret})
+    msg = str(ei.value)
+    assert secret not in msg, f"the raw env value survived into the error text: {msg!r}"
+    # Positive control, and it must assert what THIS change contributes. "store_password" and
+    # "uncastable" both survive on the PRE-FIX code -- the name came from the old f-string and
+    # "uncastable" from the WiringError wrapper's own header -- so asserting them proves the wrapper
+    # works, not that the diagnostic survived the redaction. Measured, not assumed. Pin the two
+    # halves the fix actually adds: the expected TYPE, and that withholding is stated rather than
+    # silent.
+    assert "store_password" in msg
+    assert "not a valid int" in msg, (
+        f"the expected type is the operator's whole diagnostic: {msg!r}"
+    )
+    assert "value withheld" in msg, f"a silent redaction reads as a truncated error: {msg!r}"
+
+
 def test_resolve_env_settings_reports_missing_and_uncastable_together() -> None:
     settings = {"host": env("a_host"), "port": env("b_port", cast=int)}
     with pytest.raises(WiringError) as ei:

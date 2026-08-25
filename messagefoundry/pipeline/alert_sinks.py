@@ -45,7 +45,12 @@ from messagefoundry.config.settings import (
     EscalationTier,
     weakened_tls_escape_permitted,
 )
-from messagefoundry.config.tls_policy import HopPosture, TrustAnchorPolicy, build_smtp_tls_context
+from messagefoundry.config.tls_policy import (
+    HopPosture,
+    TrustAnchorPolicy,
+    build_smtp_tls_context,
+    smtp_login_approved,
+)
 
 __all__ = [
     "AlertTransport",
@@ -405,6 +410,27 @@ def send_plain_email(
     allowed = tuple(h.lower() for h in allowed_hosts)
     if allowed and host.lower() not in allowed:
         raise ValueError(f"SMTP host {host!r} is not in the configured allowlist")
+    # SMTP AUTH over an un-encrypted channel puts the password on the wire (BACKLOG #1171, ASVS
+    # 11.4.1). The AUTH call below runs whenever a username is set, while STARTTLS runs only when
+    # `use_tls` — so `[alerts].email_use_tls=false` beside `email_username` sent the credential in
+    # cleartext, with no refusal at the function, at EmailTransport, or at the serve gate.
+    #
+    # ABSOLUTE, matching the sibling arms rather than introducing a second rule: transports/email.py
+    # and transports/direct.py already refuse this exact combination at construction, and their tests
+    # set the escape env var and still assert the raise. So there is no escape here either — a
+    # credential over cleartext is refused on every instance, in every environment.
+    #
+    # IT LIVES HERE RATHER THAN AT THE SERVE GATE, and the docstring above is precisely why that is
+    # consistent: the tls_verify=false decision was pushed to the serve gate because it needs the
+    # CLAMPED posture, which this module cannot read. This refusal needs NO posture, so the chokepoint
+    # every caller passes belongs to it — EmailTransport.send and security_notify both pass the same
+    # `[alerts].email_use_tls` knob, so one refusal here covers both rather than two that can drift.
+    if username is not None and not use_tls:
+        raise ValueError(
+            "alerts SMTP sends AUTH credentials over cleartext (use_tls=false); refused — "
+            "credentials require STARTTLS. Set [alerts].email_use_tls=true, or drop "
+            "[alerts].email_username/email_password to send unauthenticated."
+        )
     # Built AFTER the allowlist check, deliberately: tests/test_alerts_test_email.py runs the REAL
     # function and depends on a disallowed host raising before ANY other work happens.
     tls_context = (
@@ -430,7 +456,19 @@ def send_plain_email(
             # context= is REQUIRED (#323): starttls()'s own default verifies NOTHING.
             smtp.starttls(context=tls_context)
         if username is not None:
-            smtp.login(username, password or "")
+            # NOT smtp.login(): it tries CRAM-MD5 FIRST, an HMAC over MD5 (BACKLOG #1171,
+            # ASVS 11.4.1). The refusal above already guarantees use_tls here, so
+            # channel_encrypted is not merely asserted -- it is the same value that gate read.
+            # escape_permitted=False: this cell's cleartext-credential refusal has no escape,
+            # matching the two connectors rather than introducing a third posture.
+            smtp_login_approved(
+                smtp,
+                username,
+                password or "",
+                channel_encrypted=use_tls,
+                escape_permitted=False,
+                cell="alerts SMTP transport",
+            )
         smtp.send_message(msg)
 
 

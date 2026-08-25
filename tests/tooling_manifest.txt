@@ -33,6 +33,7 @@ tests/test_asvs_tally_lint.py
 tests/test_asvs_verifier_vault_contract.py
 tests/test_backlog_citation_check.py
 tests/test_backlog_status_check.py
+tests/test_bash_resolver.py
 tests/test_ci_docs_only_detector.py
 tests/test_ci_engine_step_excludes_webconsole.py
 tests/test_ci_leg_data_class.py
@@ -54,6 +55,7 @@ tests/test_coord_overlap_cache.py
 tests/test_coord_overlap_signals.py
 tests/test_coord_presence.py
 tests/test_coord_seat_prompt.py
+tests/test_coord_seat_session_key.py
 tests/test_coord_unbacked_check.py
 tests/test_coord_usage.py
 tests/test_cutover_slug_rot.py

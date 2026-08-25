@@ -302,6 +302,117 @@ def test_hostile_values_are_escaped_not_injected() -> None:
     ast.parse(src)
 
 
+def _named_inbound_export(inbound_name: str) -> str:
+    """A minimal one-channel export whose ``inbound.name`` is caller-chosen (the untrusted value)."""
+    return json.dumps(
+        {
+            "channels": [
+                {
+                    "name": "X",
+                    "inbound": {"connector": "mllp", "name": inbound_name, "port": 2615},
+                    "destinations": [{"name": "OB_X", "connector": "mllp", "host": "h", "port": 7}],
+                    "handlers": [
+                        {
+                            "name": "h",
+                            "actions": [{"class": "ItemReplace", "target": "MSH-6", "value": "V"}],
+                        }
+                    ],
+                }
+            ]
+        }
+    )
+
+
+def _import_and_census(
+    inbound_name: str, root: Path, census_base: Path | None = None
+) -> tuple[list[Path], list[Path]]:
+    """Import an export naming ``inbound_name``, then census EVERY .py under ``census_base``.
+
+    Returns ``(inside_out_dir, outside_out_dir)``. The out dir is nested several levels below
+    ``root`` so a traversal escape still lands inside the temp tree and can be seen, rather than
+    escaping the census and reading as containment.
+
+    ``census_base`` defaults to ``root`` and exists because that nesting only covers escapes SHALLOW
+    ENOUGH to stay under ``root``. A deeper traversal, an absolute path or a drive-letter path lands
+    ABOVE it, where an ``rglob`` rooted at ``root`` cannot see it -- and an escape the census cannot
+    see reads exactly like containment. Pass a wider base to close that. Found by the adversarial
+    pass on BACKLOG #1130."""
+    out = root / "a" / "b" / "c" / "out"
+    export = root / "export.json"
+    export.write_text(_named_inbound_export(inbound_name), encoding="utf-8")
+    import_corepoint(export, out)
+    found = sorted((census_base or root).rglob("*.py"))
+    return (
+        [p for p in found if p.is_relative_to(out)],
+        [p for p in found if not p.is_relative_to(out)],
+    )
+
+
+def test_a_hostile_inbound_name_cannot_write_outside_the_output_directory(tmp_path: Path) -> None:
+    """``inbound.name`` is the one export value that becomes a filesystem path (the module's filename
+    stem, and the emitted ``inbound()`` connection name with it), so it is untrusted text reaching a
+    write. A traversal name must land inside the output directory and nowhere else."""
+    # POSITIVE CONTROL, same census, benign name: the module IS written and the census DOES see it,
+    # so the empty escape list on the hostile run below is a containment result, not a blind probe.
+    benign_root = tmp_path / "benign"
+    benign_root.mkdir()
+    benign_inside, benign_outside = _import_and_census("IB_ACME_ADT", benign_root)
+    assert benign_inside == [benign_root / "a" / "b" / "c" / "out" / "IB_ACME_ADT.py"]
+    assert benign_outside == []
+
+    hostile_root = tmp_path / "hostile"
+    hostile_root.mkdir()
+    hostile_inside, hostile_outside = _import_and_census("../../../evil", hostile_root)
+    assert hostile_outside == []
+    # The channel is still imported, under a folded stem: the name is sanitized, never dropped. The
+    # exact stem is deliberately not asserted, because that would pin the fold, not the containment.
+    assert len(hostile_inside) == 1
+
+
+@pytest.mark.parametrize(
+    "hostile",
+    [
+        "../../../../../../evil",
+        "/etc/cron.d/evil",
+        "C:\\Windows\\Temp\\evil",
+        "\\\\server\\share\\evil",
+        "a/b/evil",
+        "..",
+    ],
+    ids=["deep-traversal", "posix-absolute", "drive-absolute", "unc", "subdir", "bare-dotdot"],
+)
+def test_no_hostile_inbound_name_escapes_a_census_WIDER_than_the_out_root(
+    tmp_path: Path, hostile: str
+) -> None:
+    """Escape classes the original census could not have seen, so its silence meant nothing.
+
+    The helper nests the out dir three levels under ``root`` so that ``../../../x`` still lands
+    inside ``root``. That covers exactly one class. A DEEPER traversal, a POSIX-absolute path, a
+    drive-letter path or a UNC path all resolve ABOVE ``root`` -- outside an ``rglob`` rooted there,
+    where the escape is invisible and the empty result reads as containment.
+
+    Censusing from ``tmp_path`` instead is what makes the assertion mean anything: it is the widest
+    base this test can see, and it contains every target the classes above can reach in-process.
+
+    Mutation: drop the ``_sanitize`` call at ``corepoint_import.py``'s ``module_name`` site.
+    MEASURED RED, and it is NOT the failure this docstring first predicted -- recorded exactly
+    because the two are easy to confuse. Five of six ids go red; the observed mechanism is
+    ``FileNotFoundError`` on the write, because the unsanitized stem names a parent directory the
+    importer never created. That still proves the thing under test -- the name reached the
+    filesystem path unsanitized -- but it is a WRITE FAILURE, not a non-empty ``outside`` census.
+    A reader re-running the mutation and expecting an escape would see an unrelated-looking error
+    and distrust the test.
+
+    ``bare-dotdot`` PASSES under the plant and is kept deliberately: ``..`` alone resolves to the out
+    dir's parent as a directory rather than a new stem, so it produces no write for the census to
+    catch. It is a must-not-trip control -- if it ever starts failing, the fold changed shape."""
+    root = tmp_path / "hostile"
+    root.mkdir()
+    inside, outside = _import_and_census(hostile, root, census_base=tmp_path)
+    assert outside == [], f"{hostile!r} wrote outside the out dir: {outside}"
+    assert len(inside) == 1, f"{hostile!r} did not produce exactly one module: {inside}"
+
+
 def test_malformed_export_raises() -> None:
     with pytest.raises(CorepointImportError):
         parse_export("{ not json ")

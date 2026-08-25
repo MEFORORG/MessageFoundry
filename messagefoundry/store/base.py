@@ -46,6 +46,7 @@ from messagefoundry.store.document_strip import StripResult
 from messagefoundry.store.keyprovider import resolve_key_provider
 from messagefoundry.store.pool_metrics import PoolStatus
 from messagefoundry.store.store import (
+    UPLOAD_RESERVATION_STALE_AFTER,
     AlertInstance,
     CapturedResponse,
     ClaimedHeads,
@@ -112,6 +113,7 @@ __all__ = [
     "pool_over_provisioned_warning",
     "POOL_SIZE_OPTIMUM",
     "POOL_SIZE_CLIFF",
+    "UPLOAD_RESERVATION_STALE_AFTER",
 ]
 
 
@@ -1232,6 +1234,45 @@ class QueueStore(StoreLifecycle, Protocol):
         """Reconcile the live cipher's spend against its persisted reserve; return the cumulative total,
         or ``None`` when the store's cipher carries no bound (identity / ``vault_transit``). See
         :func:`messagefoundry.store.gcm_bound.checkpoint_invocations`."""
+        ...
+
+    # --- cross-process upload-quota reservation (ASVS 2.3.4) -----------------
+    async def reserve_upload_quota(
+        self,
+        uploader_id: str,
+        *,
+        files: int,
+        size_bytes: int,
+        max_files: int = 0,
+        max_total_bytes: int = 0,
+        stale_after: float = UPLOAD_RESERVATION_STALE_AFTER,
+    ) -> bool:
+        """Atomically reserve (or release) an uploader's IN-FLIGHT upload budget; return whether the
+        reserve applied. The one cross-process decision point behind the per-uploader upload quota.
+
+        **Why the store owns this.** ``UploadStore._quota_lock`` is an ``asyncio.Lock``, so it is
+        per-event-loop and therefore per-process. Engine sharding is the built, shipped, default
+        scaling axis and nothing partitions ``uploads_dir`` per shard, so N shards over one directory
+        hold N independent locks and each can overshoot the budget by one file. Every shard sits on
+        the ONE unified store (ADR 0063 — and ``require_unified_store`` makes a server DB mandatory
+        past one shard), so this row is authoritative for all of them.
+
+        **What is counted here, and what is not.** The files already ON DISK are counted by the
+        caller's sidecar scan, which is uncached and therefore already fleet-visible. The gap this
+        closes is only the uploads IN FLIGHT on other shards — reserved but not yet landed, so
+        invisible to any scan. The caller passes its remaining HEADROOM (cap minus what its scan
+        observed) as ``max_files`` / ``max_total_bytes``; this method holds only the in-flight sum.
+
+        ``files > 0`` reserves: the post-add in-flight totals must fit inside the headroom or nothing
+        is written and this returns ``False`` (fail-closed — a caller that forgets the headroom
+        arguments gets the 0 defaults and is refused). ``files <= 0`` releases, always applies,
+        clamps at zero, ignores the headroom arguments and returns ``True``.
+
+        ``stale_after`` bounds a leak: a process killed between reserve and release never releases,
+        and its slot would otherwise consume the uploader's budget forever. A row whose reservation
+        has been CONTINUOUSLY outstanding for longer than ``stale_after`` seconds is reset to zero
+        before the add. The reset can only restore today's behaviour (an overshoot bounded by the
+        number of concurrent writers), never something worse."""
         ...
 
     # --- retention / purge + maintenance (PHI.md §8) -------------------------

@@ -461,9 +461,11 @@ class StoreSettings(_Section):
     # task, each prune audited `upload.prune`). Quotas are enforced per-`uploads_dir`, NOT per-process:
     # the check reads the sidecars off disk with no cache, so engine shards sharing one dir see each
     # other's files and the budget does NOT multiply (measured 2026-08-10 — two UploadStores over one
-    # dir, the second refused the same uploader at quota, against a live positive control). What IS
-    # shared across them is the check-then-write race below, which overshoots by at most one file per
-    # concurrently in-flight upload. Shards given SEPARATE dirs get separate budgets, by construction.
+    # dir, the second refused the same uploader at quota, against a live positive control). The
+    # check-then-write race that used to survive across them — an overshoot of one file per shard
+    # caught between its scan and its write — is closed by an atomic reservation on the unified store
+    # every shard shares (ASVS 2.3.4, BACKLOG #1112); the surviving residuals are stated once in
+    # `uploads.UploadQuotaError`. Shards given SEPARATE dirs get separate budgets, by construction.
     max_upload_files_per_user: int = Field(
         default=100,
         ge=1,
@@ -1851,7 +1853,18 @@ class AuthSettings(_Section):
     initial_password_expiry_hours: int = 72
 
     # Active Directory / LDAP. The bind password is a secret: MEFOR_AUTH_AD_BIND_PASSWORD.
+    #
+    # `ad_enabled` means DIRECTORY BIND CAPABILITY -- this engine can reach AD and resolve principals.
+    # It is what Kerberos SSO, federated OIDC and the session reconciler each depend on, and it is why
+    # they all validate against it rather than against the login pathway below (BACKLOG #1137).
     ad_enabled: bool = False
+    # Whether a user may present an AD password to OUR login form, which we verify by SIMPLE-binding as
+    # them. Split out of `ad_enabled` because the two are different decisions that happened to share a
+    # switch: wanting federated login (which needs the bind) forced you to also expose this
+    # credential-accepting surface, since `oidc_enabled` refuses to validate without `ad_enabled`.
+    # Defaults True so the split alone changes nothing; whether this pathway should survive at all is a
+    # separate question and deliberately not decided here.
+    ad_password_login_enabled: bool = True
     ad_server: str | None = None  # e.g. ldaps://dc1.example.com:636
     ad_domain: str | None = None  # e.g. example.com (UPN suffix)
     ad_user_search_base: str | None = None

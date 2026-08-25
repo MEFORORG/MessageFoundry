@@ -22,7 +22,8 @@ Windows/Unix built-ins so no new runtime dep):
   statm`` (resident pages). Where the launching interpreter spawns no shim the subtree is just the one
   process — byte-identical to single-process sampling. Every field is ``None`` when nothing in the
   subtree could be read (a dead tree / a missing tool), so the runner records a gap rather than
-  crashing.
+  crashing — and that gap CARRIES ITS CAUSE (:class:`ProbeDegraded`), because a gap that cannot say
+  which of the probe's seven degrade paths produced it is not attributable to anything.
 
   The walk is **provenance-checked** (BACKLOG #1210): a candidate that PREDATES the root is not a
   descendant of it, so it is rejected along with its subtree. Windows never rewrites
@@ -42,6 +43,7 @@ import subprocess
 import sys
 import time
 from dataclasses import dataclass
+from enum import StrEnum
 from pathlib import Path
 
 from messagefoundry.apiclient import ApiError, EngineClient
@@ -75,6 +77,58 @@ _CREATION_SKEW_TOLERANCE_S = 1.0
 type ProcRow = tuple[int, int, float | None]
 
 
+class ProbeDegraded(StrEnum):
+    """WHY a :class:`ProcSample` carries no reading — the path that degraded this tick.
+
+    A gap that does not name its cause is UNATTRIBUTABLE, and this probe has seven distinct ways to
+    produce one. They were previously indistinguishable: every path returned the same all-``None``
+    sample, so a record could say only THAT the probe did not read, never WHICH mechanism stopped it —
+    and a CI red was mis-attributed to unrelated work three times over precisely because the artifact
+    did not carry the information needed to attribute it.
+
+    The one distinction a CONSUMER has to draw is BUDGET-EXHAUSTED vs not (:attr:`is_budget_exhausted`),
+    because the two earn OPPOSITE verdicts: a shell-out that spent its whole ``_PROBE_TIMEOUT_S``
+    measures the RUNNER (a starved host could not answer in time), while every other member means the
+    probe RAN and produced nothing usable, which is a defect in the probe. That line is stated here
+    ONCE. ``tests/test_connscale_cpu_probe.py`` draws the same line at the walk level from the seconds a
+    failed walk actually spent (``_BUDGET_CONSUMED_FRACTION``), and the two must stay one vocabulary:
+    "budget exhausted" is could-not-measure, anything faster is measured-and-broken."""
+
+    # --- the subtree walk: one process-table snapshot, per `FdSampler._resolve_pids` ---
+    # The walk spent its whole timeout. This measures the runner, not the engine.
+    WALK_TIMEOUT = "walk_timeout"
+    # The walk's shell-out raised something OTHER than a timeout (OSError / a non-timeout
+    # SubprocessError), so it failed without using its budget.
+    WALK_ERROR = "walk_error"
+    # The walk COMPLETED and yielded zero usable rows. A live host always has many processes, so this
+    # is a silent enumeration failure (truncated output / a walk that never really ran), never a
+    # genuine empty result -- see `_enumerate_windows`.
+    WALK_EMPTY = "walk_empty"
+    # The snapshot carried no row for the ROOT pid, so no candidate could be validated against the
+    # root's creation instant. Fail closed (`_validated_descendants`) rather than walk unchecked.
+    WALK_NO_ROOT = "walk_no_root"
+
+    # --- the per-PID read: `FdSampler._sample_windows` / `._sample_posix` ---
+    # The per-PID read spent its whole timeout. Measures the runner, as WALK_TIMEOUT does.
+    READ_TIMEOUT = "read_timeout"
+    # The per-PID read raised something other than a timeout, without using its budget.
+    READ_ERROR = "read_error"
+    # The per-PID read RAN and returned zero usable rows across the whole subtree. Not a timeout at
+    # all -- the enumeration happened and produced nothing.
+    READ_EMPTY = "read_empty"
+
+    @property
+    def is_budget_exhausted(self) -> bool:
+        """True when this cause is a shell-out that SPENT its whole ``_PROBE_TIMEOUT_S``.
+
+        The discriminator a consumer needs, and the only one: budget-exhausted says the host was too
+        slow to answer, so the probe reports COULD NOT MEASURE and the subject under test is not
+        implicated. Every other member says the probe ran and produced nothing usable, which IS a
+        finding. Kept as a property on the vocabulary itself so no consumer re-derives the split from a
+        member list of its own that could then drift member-by-member."""
+        return self in (ProbeDegraded.WALK_TIMEOUT, ProbeDegraded.READ_TIMEOUT)
+
+
 @dataclass(frozen=True)
 class ProcSample:
     """One OS-side reading of the engine process (all ``None`` when unreadable — a poll tick gap).
@@ -88,15 +142,28 @@ class ProcSample:
       to derive utilisation, and that difference is only a clean CPU delta when the summed-over PID set
       is unchanged — A3's periodic subtree re-resolution can add a joining ``serve --shard`` worker or
       drop a departing one mid-window, so the runner uses this set to sum only same-set intervals and
-      degrade the rest to a gap (BACKLOG #220)."""
+      degrade the rest to a gap (BACKLOG #220).
+    * ``degraded`` — WHY this tick measured nothing, when it measured nothing. Set **iff** the tick is a
+      FULL gap (every field above ``None``); a tick that read anything at all carries ``None`` here. A
+      partial POSIX read (handles present, CPU absent) is NOT a degradation — the gauges that read still
+      read, and the ones that did not are visible as their own ``None``."""
 
     handles: int | None
     cpu_seconds: float | None
     working_set_bytes: int | None
     cpu_pids: frozenset[int] | None = None
+    degraded: ProbeDegraded | None = None
 
 
-_EMPTY_PROC = ProcSample(handles=None, cpu_seconds=None, working_set_bytes=None, cpu_pids=None)
+def _gap(cause: ProbeDegraded) -> ProcSample:
+    """A full-gap sample that NAMES the path that produced it.
+
+    Every degrade site goes through here, so a gap cannot be constructed without stating its cause —
+    which is the whole point: an unattributed gap is what let one starved-runner timeout and one
+    genuinely broken enumeration render as the same artifact."""
+    return ProcSample(
+        handles=None, cpu_seconds=None, working_set_bytes=None, cpu_pids=None, degraded=cause
+    )
 
 
 class FdSampler:
@@ -107,17 +174,21 @@ class FdSampler:
     resolved periodically and cached in between; each :meth:`sample_proc` sums a cheap per-PID read
     across it. :meth:`sample` keeps the legacy handle-count-only shape (``int | None``). Every field is
     ``None`` when nothing in the subtree could be read (a dead tree / a missing tool) so a poll tick
-    records a gap, never raises."""
+    records a gap, never raises — and that gap names the path that produced it
+    (:attr:`ProcSample.degraded`)."""
 
     def __init__(self, pid: int, *, resolve_every: int = _RESOLVE_EVERY_TICKS) -> None:
         self._pid = pid
         self._pids: list[int] | None = None  # [root, *descendants], re-resolved every N ticks
-        # True while the last subtree resolution ERRORED (Windows enumeration failed/timed out, or the
-        # root's own creation instant was absent so nothing could be validated against it) — as opposed
-        # to a genuine no-descendants result. An errored resolution is NOT cached (so a later tick
-        # retries) and its samples are reported probe-degraded (all None) rather than measuring a root
-        # that may be only the launcher shim.
-        self._resolve_errored = False
+        # WHY the last subtree resolution failed, or None when it succeeded (Windows enumeration
+        # timed out / errored / came back empty, or the root's own creation instant was absent so
+        # nothing could be validated against it) — as opposed to a genuine no-descendants result. An
+        # errored resolution is NOT cached (so a later tick retries) and its samples are reported
+        # probe-degraded rather than measuring a root that may be only the launcher shim.
+        #
+        # This holds the CAUSE, not a bool, because the bool was the defect: four different resolution
+        # failures set it identically and the tick they degraded could not say which had fired.
+        self._resolve_degraded: ProbeDegraded | None = None
         # A3: the subtree is NOT stable for a SHARDED engine — ADR 0037's supervisor spawns one
         # `serve --shard` subprocess per shard, and a subtree cached before they appear measures an idle
         # supervisor forever (a flat CPU counter that used to render as a plausible 0.00). Re-resolve
@@ -129,6 +200,12 @@ class FdSampler:
     def pid(self) -> int:
         return self._pid
 
+    @property
+    def _resolve_errored(self) -> bool:
+        """Did the last subtree resolution fail? DERIVED from :attr:`_resolve_degraded` so the fact is
+        stored once — a separate bool beside the cause is two statements of one fact, and they drift."""
+        return self._resolve_degraded is not None
+
     def sample(self) -> int | None:
         """The current handle/fd count across the engine subtree, or ``None`` if it can't be read
         (legacy shape). Delegates to :meth:`sample_proc` so it stays one cheap read per PID."""
@@ -139,12 +216,13 @@ class FdSampler:
         each field ``None`` when nothing could be read. Runs the OS probe synchronously — the runner
         calls it in ``run_in_executor`` (off the event loop), like the rest of the sampling."""
         pids = self._resolve_pids()
-        if self._resolve_errored:
-            # Subtree resolution ERRORED (a failed/timed-out Windows enumeration, or no row for the
-            # root). Reading the root PID alone would report a launcher shim's footprint as the
+        if self._resolve_degraded is not None:
+            # Subtree resolution FAILED (a timed-out / errored / empty Windows enumeration, or no row
+            # for the root). Reading the root PID alone would report a launcher shim's footprint as the
             # engine's — worse than a gap, because it's a plausible-looking WRONG number that could flip
-            # a footprint delta. Record a probe-degraded gap (all None) and let a later tick retry.
-            return _EMPTY_PROC
+            # a footprint delta. Record a probe-degraded gap CARRYING WHICH of those fired, and let a
+            # later tick retry.
+            return _gap(self._resolve_degraded)
         if _WINDOWS:
             return self._sample_windows(pids)
         return self._sample_posix(pids)
@@ -173,15 +251,21 @@ class FdSampler:
                 # Serving a previously-VALIDATED subtree. If the last re-resolve errored, that error
                 # applied to that tick only — the cached subtree is still the best known truth, and
                 # degrading every tick until the next re-walk would turn one transient enumeration
-                # failure into a run-long blackout. Clear the flag so this tick reports a real reading.
-                self._resolve_errored = False
+                # failure into a run-long blackout. Clear the cause so this tick reports a real reading.
+                self._resolve_degraded = None
                 return self._pids
         self._ticks_since_resolve = 0
+        # Cleared BEFORE the walk: the walk itself records why it failed, and a stale cause from the
+        # previous walk would otherwise be attributed to this one.
+        self._resolve_degraded = None
         descendants = self._descendants_windows() if _WINDOWS else self._descendants_posix()
         if descendants is None:
-            self._resolve_errored = True
+            if self._resolve_degraded is None:
+                # Defensive: `_descendants_windows` names every failure it returns None for. A stand-in
+                # that returns None without naming one still gets a cause rather than an unattributed
+                # gap — an unnamed cause is the exact condition this field exists to remove.
+                self._resolve_degraded = ProbeDegraded.WALK_ERROR
             return [self._pid]  # transient (this tick only), not cached — retry next tick
-        self._resolve_errored = False
         ordered = [self._pid]
         for pid in descendants:
             if pid not in ordered:
@@ -218,8 +302,14 @@ class FdSampler:
                 text=True,
                 timeout=_PROBE_TIMEOUT_S,
             )
+        # TimeoutExpired is caught FIRST because it is a SubprocessError subclass, and it is the one
+        # failure here that measures the RUNNER rather than the probe (see ProbeDegraded).
+        except subprocess.TimeoutExpired:
+            self._resolve_degraded = ProbeDegraded.WALK_TIMEOUT
+            return None  # spent its whole budget — NOT "no descendants"
         except (OSError, subprocess.SubprocessError):
-            return None  # errored/timed out — NOT "no descendants"
+            self._resolve_degraded = ProbeDegraded.WALK_ERROR
+            return None  # errored without using its budget — NOT "no descendants"
         # Parse whatever rows came back regardless of the exit code (a partial result is still usable).
         rows: list[ProcRow] = []
         for line in out.stdout.splitlines():
@@ -236,6 +326,7 @@ class FdSampler:
         # (a silent failure / truncated output). Signal errored so the caller retries + degrades rather
         # than caching root-only and reporting the launcher shim's footprint as the engine's.
         if not rows:
+            self._resolve_degraded = ProbeDegraded.WALK_EMPTY
             return None
         return rows
 
@@ -267,8 +358,14 @@ class FdSampler:
     def _descendants_windows(self) -> list[int] | None:
         rows = self._enumerate_windows()
         if rows is None:
-            return None
-        return _validated_descendants(rows, self._pid)
+            return None  # `_enumerate_windows` recorded WHICH enumeration failure this was
+        walked = _validated_descendants(rows, self._pid)
+        if walked is None:
+            # The enumeration itself SUCCEEDED; what failed is validation — the snapshot carried no row
+            # for the root, so nothing could be checked against its creation instant. A distinct
+            # mechanism from any enumeration failure, and it must not be reported as one.
+            self._resolve_degraded = ProbeDegraded.WALK_NO_ROOT
+        return walked
 
     def _descendants_posix(self) -> list[int]:
         walked = _validated_descendants(self._enumerate_posix(), self._pid)
@@ -294,8 +391,12 @@ class FdSampler:
                 text=True,
                 timeout=_PROBE_TIMEOUT_S,
             )
+        # TimeoutExpired first (it subclasses SubprocessError): a read that spent its whole budget
+        # measures the runner, an immediate error is the probe failing. Opposite verdicts downstream.
+        except subprocess.TimeoutExpired:
+            return _gap(ProbeDegraded.READ_TIMEOUT)
         except (OSError, subprocess.SubprocessError):
-            return _EMPTY_PROC
+            return _gap(ProbeDegraded.READ_ERROR)
         # NB: ignore the exit code. `Get-Process -Id a,b` where one PID has since exited emits a
         # non-terminating error (exit 1) EVEN under -ErrorAction SilentlyContinue, yet still writes the
         # live processes' rows to stdout. Trust the parsed rows; only zero rows ⇒ a genuine gap.
@@ -322,7 +423,9 @@ class FdSampler:
             cpu_pids.add(pid)
             rows += 1
         if rows == 0:
-            return _EMPTY_PROC
+            # The read RAN and parsed nothing. NOT a timeout — no budget was exhausted, the command
+            # completed and produced no usable row for any PID in the subtree.
+            return _gap(ProbeDegraded.READ_EMPTY)
         return ProcSample(
             handles=handles,
             cpu_seconds=cpu_ticks / _WIN_CPU_TICKS_PER_S,
@@ -350,6 +453,14 @@ class FdSampler:
             if r is not None:
                 rss_sum += r
                 r_seen += 1
+        if not (h_seen or c_seen or r_seen):
+            # Nothing in the whole subtree was readable — the reads RAN and produced no usable row, so
+            # this is READ_EMPTY for the same reason the Windows zero-rows branch is. The POSIX side
+            # does not split out a timeout: /proc reads are file reads with no budget to exhaust, and
+            # the one budgeted call (the lsof fallback) is per-PID, so a subtree-wide gap here is not
+            # attributable to any single PID's timeout. Claiming a timeout we did not observe would be
+            # exactly the fabricated cause this vocabulary exists to prevent.
+            return _gap(ProbeDegraded.READ_EMPTY)
         return ProcSample(
             handles=handles_sum if h_seen else None,
             cpu_seconds=cpu_sum if c_seen else None,
