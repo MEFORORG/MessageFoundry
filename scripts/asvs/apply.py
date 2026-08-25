@@ -15,6 +15,7 @@ import argparse
 import json
 import re
 import tomllib
+from collections import Counter
 from pathlib import Path
 from typing import Any
 
@@ -36,6 +37,33 @@ _BANNED = re.compile(
     "\ufe0f\ufe0e"  # variation selectors
     "]"
 )
+
+
+def _introduced_banned(payload: str, live: str) -> tuple[str, int] | None:
+    """The first banned codepoint the payload carries MORE of than the record already does.
+
+    Returns ``(character, how_many_more)`` or ``None``. BACKLOG #1308.
+
+    Scanning the payload alone made a record UNWRITABLE once its own prose held a banned
+    character: every payload must carry the residual forward, so every payload re-presented it and
+    was refused. The comparison is what separates *carrying* from *introducing*.
+
+    COUNTS, NOT PRESENCE. Presence alone would let a payload add a SECOND warning sign to a cell
+    that already had one -- new vocabulary, which is exactly what the ban is for. Counting refuses
+    that while allowing the character to be kept or moved.
+
+    Iterating the PAYLOAD rather than the counter keys is deliberate: it makes the reported
+    codepoint the first offender as written, so the refusal points at a place the author can find,
+    and it is stable rather than dependent on dict ordering.
+    """
+    if not payload:
+        return None
+    live_counts = Counter(ch for ch in live if _BANNED.search(ch))
+    payload_counts = Counter(ch for ch in payload if _BANNED.search(ch))
+    for ch in payload:
+        if ch in payload_counts and payload_counts[ch] > live_counts[ch]:
+            return ch, payload_counts[ch] - live_counts[ch]
+    return None
 
 
 def toml_str(s: str) -> str:
@@ -287,14 +315,34 @@ def main(argv: list[str] | None = None) -> int:
             c.get("evidence") or c.get("absence")
         ):
             problems.append(f"{c['id']}: {c['verdict']} needs at least one anchor or absence claim")
-        blob = "" if anchor_repair else " ".join(str(v) for v in (c.get("residual", ""),))
-        hit = _BANNED.search(blob)
-        if hit:
+        # SCAN WHAT THE PAYLOAD INTRODUCES, NOT WHAT THE RECORD ALREADY CARRIES (BACKLOG #1308).
+        #
+        # THE DEFECT THIS FIXES IS UNWRITABILITY, NOT UNTIDINESS -- read the other way round it
+        # reads as a cosmetic item and gets deferred forever. Scanning the whole residual meant a
+        # cell whose EXISTING prose held a banned character could never be written again by this
+        # tool, however mechanical the edit: every payload has to carry the residual forward, so
+        # every payload re-presented the same character and was refused. The record became
+        # read-only through its own guard, and the only way to touch it was to edit prose the pass
+        # was not about.
+        #
+        # COUNTED PER CODEPOINT, not merely "is it present". Presence alone would let a payload
+        # ADD a second warning sign to a cell that already had one -- new vocabulary, which is the
+        # thing the ban exists to stop. Counting refuses that while allowing the character to be
+        # kept or MOVED, since neither introduces anything a later reader could copy forward.
+        #
+        # FAIL-CLOSED WHERE THERE IS NO RECORD: a cell with no live counterpart has a live count of
+        # zero for everything, so any banned character in a NEW cell is introduced and refused.
+        payload_residual = "" if anchor_repair else str(c.get("residual", "") or "")
+        introduced = _introduced_banned(
+            payload_residual, str((live or {}).get("residual", "") or "")
+        )
+        if introduced:
             # Report the codepoint, never the character: echoing it to a cp1252 console raises
             # UnicodeEncodeError and the refusal turns into a traceback that hides its own reason.
+            ch, extra = introduced
             problems.append(
-                f"{c['id']}: residual contains a banned glyph U+{ord(hit.group()):04X} "
-                f"at offset {hit.start()}"
+                f"{c['id']}: residual INTRODUCES a banned glyph U+{ord(ch):04X} "
+                f"({extra} more than the record already carries)"
             )
     if problems:
         print("REFUSING TO APPLY:")
