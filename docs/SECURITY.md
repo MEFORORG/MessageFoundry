@@ -341,7 +341,7 @@ tuple: they act only on the caller's own account.
 | `GET` | `/me/mfa` | `require` | |
 | `POST` | `/me/mfa/enroll` | `require_reauth_only_action` (action `mfa_enroll`) | password-only step-up — the MFA gate is skipped so a required-but-unenrolled user cannot deadlock |
 | `POST` | `/me/mfa/confirm` | `require_reauth_only_action` (action `mfa_confirm`) | per-actor ceremony limiter; password-only step-up |
-| `DELETE` | `/me/mfa` | `require_step_up_action` (action `mfa_disable`) | step-up bound to the disable action (current factor + a fresh password). ⚠️ **No last-factor guard** — this is the TOTP path (`disable_mfa`), and it does **not** refuse when it would leave the account with zero enrolled factors. The passkey removal path does refuse; see BACKLOG #1022 for the asymmetry |
+| `DELETE` | `/me/mfa` | `require_step_up_action` (action `mfa_disable`) | step-up bound to the disable action (current factor + a fresh password). **Refuses (400) when TOTP is your last second factor and MFA is required for your account** — the same refusal, on the same condition, as the passkey removal path (`AuthService.disable_mfa`, ADR 0068 decision 5). The asymmetry this row used to record is closed (BACKLOG #1022) |
 | `GET` | `/me/sessions` | `require` | |
 | `GET` | `/me/security-events` | `require` | |
 | `DELETE` | `/me/sessions/{session_id}` | `require_reauth_only_action` (action `session_terminate`) | password-only step-up, bound to the action (ASVS 7.5.2): a login-seeded window does not unlock a terminate |
@@ -364,7 +364,7 @@ tuple: they act only on the caller's own account.
 | `DELETE` | `/users/{user_id}/sessions` | `users:manage` | `require_step_up` |
 | `PUT` | `/users/{user_id}/roles` | `users:manage` | `require_step_up` |
 | `POST` | `/users/{user_id}/reset-password` | `users:manage` | `require_step_up_action` (action `admin_reset_password`) |
-| `POST` | `/users/{user_id}/reset-mfa` | `users:manage` | `require_step_up_action` (action `admin_reset_mfa`) |
+| `POST` | `/users/{user_id}/reset-mfa` | `users:manage` | `require_step_up_action` (action `admin_reset_mfa`); **refuses (400) when `user_id` is the caller's own** — use the self-service MFA settings instead. Targeting yourself here was a third route to zero factors that skipped the last-factor refusal both self-service paths make (BACKLOG #1022). Cross-user reset is untouched: it is the always-available recovery for a locked-out passkey user (ADR 0068 §2) |
 | `GET` | `/users/{user_id}/channel-scope` | `users:manage` | `require` (a read on the `users:manage` tier, not `users:read`) |
 | `PUT` | `/users/{user_id}/channel-scope` | `users:manage` | `require_step_up` |
 | `GET` | `/ad-group-map` | `users:manage` | `require` |
