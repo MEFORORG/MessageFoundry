@@ -424,3 +424,57 @@ def test_the_script_carries_no_control_characters() -> None:
     text = ADJUDICATE.read_text(encoding="utf-8")
     bad = {hex(ord(c)) for c in text if ord(c) < 32 and c not in "\r\n\t"}
     assert not bad, f"control characters in claim-adjudicate.ps1: {sorted(bad)}"
+
+
+# ===================================================================================================
+# SIBLING CITATIONS -- three items of four were invisible here (BACKLOG #1347).
+# ===================================================================================================
+
+
+def test_a_sibling_citation_is_collected_not_just_the_item_carrying_the_prefix(
+    repo: Path, tmp_path: Path
+) -> None:
+    """The house form writes `BACKLOG` ONCE and the siblings after it.
+
+    `--grep="BACKLOG #<item>"` matched only the item carrying the prefix, so a commit reading
+    `(BACKLOG #1319, #1322, #1323, #1331)` surfaced for #1319 and for nothing else. The failure
+    direction is the expensive one: work that landed reads as never delivered, and a dispatcher
+    hands a builder a finished item. The live control is `df8acc95`, the commit that misled two
+    seats into holding three claims for landed work.
+    """
+    backlog(repo, f"## 22. Sibling thing\n\n> {PRIORITIZED} open\n\nbody\n")
+    (repo / "other.txt").write_text("y", encoding="utf-8")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-qm", "four gates that could not fail (BACKLOG #19, #22, #23, #31)")
+    git(repo, "push", "-q", "origin", "main")
+    unmerged_branch(repo, "seat")
+    write_claim(repo, "22", tmp_path / "gone", "seat")
+    r = rows(repo)["22"]
+    assert any("#22" in c["subject"] for c in r["citations"]), (
+        "a sibling citation was not collected. #22 carries no BACKLOG prefix of its own -- it sits "
+        "after the one prefix the house form writes -- and that is exactly the shape that was "
+        f"invisible. citations={r['citations']}"
+    )
+
+
+def test_a_squash_merge_suffix_is_not_collected_as_a_citation(repo: Path, tmp_path: Path) -> None:
+    """The negative that bounds the widening, and it is the reason for scoping to the parenthetical.
+
+    Closing the sibling gap by taking every `#N` after the BACKLOG token would collect the
+    pull-request number a squash-merge appends: `(BACKLOG #1040) (#547)` would report a delivery of
+    item 547. Measured over `git log --all` on 2026-08-25, unscoped calls 641 subjects multi-item
+    against 38 of 1070 for the scoped rule -- so the unscoped form is wrong about roughly 17 times
+    as many commits as it is right about.
+    """
+    backlog(repo, f"## 47. Not delivered by a PR number\n\n> {PRIORITIZED} open\n\nbody\n")
+    (repo / "other.txt").write_text("y", encoding="utf-8")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-qm", "fix(hooks): the deny text (BACKLOG #40) (#47)")
+    git(repo, "push", "-q", "origin", "main")
+    unmerged_branch(repo, "seat")
+    write_claim(repo, "47", tmp_path / "gone", "seat")
+    r = rows(repo)["47"]
+    assert not r["citations"], (
+        "the squash-merge pull-request suffix was collected as a delivery citation for item 47. "
+        f"citations={r['citations']}"
+    )
