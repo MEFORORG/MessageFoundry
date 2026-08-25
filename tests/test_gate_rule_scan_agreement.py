@@ -52,7 +52,7 @@ INSTALLER = ROOT / "scripts" / "worktree" / "install-gate.ps1"
 # hook wiring for every session on this box. The AST is used rather than a text slice on purpose: a
 # regex that carves a function body out of a script would itself be a text scan of a text scanner, and
 # it would break on the next brace someone adds.
-_EXTRACT = r"""
+_LIFT = r"""
 param([string]$Installer, [string]$Corpus)
 $ErrorActionPreference = 'Stop'
 $ast = [System.Management.Automation.Language.Parser]::ParseFile($Installer, [ref]$null, [ref]$null)
@@ -62,8 +62,21 @@ $fn = $ast.Find({
 }, $true)
 if (-not $fn) { throw "Get-HandledTools is not defined in $Installer -- copy 3 moved or was renamed" }
 . ([scriptblock]::Create($fn.Extent.Text))
-@(Get-HandledTools $Corpus) | Sort-Object | ConvertTo-Json -AsArray
 """
+
+# Two probes now share that lift, so it is written ONCE. A second copy would put the
+# brace-walking Find in two places, which is the failure the comment above says the AST
+# was chosen to avoid -- the next brace someone adds would then break it twice.
+_EXTRACT = (
+    _LIFT
+    + r"""
+# The comma-wrapper Get-HandledTools returns unrolls ONCE on assignment, which is what
+# makes the @() below correct again. Piping the call straight into Sort-Object unrolls it
+# a second time and hands ConvertTo-Json a bare string on the one-element arm.
+$t = Get-HandledTools $Corpus
+@($t) | Sort-Object | ConvertTo-Json -AsArray
+"""
+)
 
 
 def _powershell_copy(corpus: Path, tmp_path: Path) -> set[str]:
@@ -229,4 +242,112 @@ def test_the_one_known_divergence_is_the_comment_filter_and_is_pinned_here(
         "copy 2's comment filter is the ONE documented difference between the three scanners. If it is "
         "gone, the credit-a-rule-from-prose failure it was added for is back; if copies 1 or 3 grew one "
         "too, delete this pin and say so."
+    )
+
+
+# --------------------------------------------------------------------- the return contract (#1291)
+#
+# Everything above asks WHICH tools Get-HandledTools finds. This asks what SHAPE it hands back, which
+# nothing else does -- and that is the whole of BACKLOG #1291: both production callers wrap the result
+# in @(), so the function has always been correct by its CALLER'S grace rather than on its own terms.
+#
+# The arms are not symmetric, and the middle one is why this is a defect and not a tidiness note. A
+# bare return UNROLLS: zero tools arrive as $null, which is LOUD (the next .Contains() throws), and
+# one tool arrives as a [String], which is SILENT -- String.Contains() is a substring test, so it
+# answers True for "as" against a corpus whose only tool is "Task". Exit code 0, clean wrong answer.
+_RETURN_SHAPE = (
+    _LIFT
+    + r"""
+# NO @() WRAPPER, deliberately. This is what a NEW caller writes; both shipped ones happen to wrap.
+$r = Get-HandledTools $Corpus
+[pscustomobject]@{
+    IsNull       = ($null -eq $r)
+    TypeName     = $(if ($null -eq $r) { 'null' } else { $r.GetType().Name })
+    Count        = $(if ($null -eq $r) { -1 } else { @($r).Count })
+    SubstringHit = $(if ($null -eq $r) { $false } else { [bool]($r -is [string] -and $r.Contains('as')) })
+} | ConvertTo-Json -Compress
+"""
+)
+
+
+def _return_shape(corpus: Path, tmp_path: Path) -> dict[str, object]:
+    runner = tmp_path / "return-shape.ps1"
+    runner.write_text(_RETURN_SHAPE, encoding="utf-8")
+    r = subprocess.run(
+        [
+            "pwsh",
+            "-NoProfile",
+            "-NonInteractive",
+            "-File",
+            str(runner),
+            "-Installer",
+            str(INSTALLER),
+            "-Corpus",
+            str(corpus),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=120,
+        check=False,
+    )
+    assert r.returncode == 0, f"lifting Get-HandledTools failed: {r.stderr} {r.stdout}"
+    return dict(json.loads(r.stdout))
+
+
+@pytest.mark.parametrize(
+    ("arm", "body", "expected_count"),
+    [
+        (
+            "MISSING FILE -- the Test-Path early return, a SEPARATE null path from zero-tool",
+            None,
+            0,
+        ),
+        (
+            "zero tools -- the LOUD arm, a bare return gives $null",
+            '# no tool guards at all\nWrite-Host "hi"\n',
+            0,
+        ),
+        (
+            "one tool -- the SILENT arm, a bare return gives [String]",
+            'if ($tool -in @("Task")) { }\n',
+            1,
+        ),
+        (
+            "two tools -- already correct, the contrast that localises the other two",
+            'if ($tool -in @("Task")) { }\nif ($tool -notin @("Bash")) { }\n',
+            2,
+        ),
+    ],
+)
+def test_get_handled_tools_returns_an_array_on_every_arm(
+    arm: str, body: str | None, expected_count: int, tmp_path: Path
+) -> None:
+    """BACKLOG #1291. The function hands back an array WITHOUT the caller wrapping it.
+
+    Each arm asserts a different observable, so the three cases cannot funnel to one
+    assertion: the zero arm pins not-null, the one arm pins that the substring test is
+    dead, and all three pin the count. Drop the comma from either exit path and the
+    first two arms go red for different reasons.
+    """
+    corpus = tmp_path / "corpus.ps1"
+    if body is None:
+        # DELIBERATELY NOT CREATED. The Test-Path guard is a SECOND exit path, and the
+        # item names both. A suite that only ever passes an existing corpus never runs
+        # this line at all: dropping the comma from the early return survived exactly
+        # such a suite here, which is how this arm came to be written.
+        assert not corpus.exists()
+    else:
+        corpus.write_text(body, encoding="utf-8")
+    got = _return_shape(corpus, tmp_path)
+    print(f"{arm}: {got}")
+
+    assert not got["IsNull"], (
+        f"{arm}: returned $null to an unwrapped caller. The comma on the early return at the "
+        "Test-Path guard is missing, so the empty array unrolled to nothing."
+    )
+    assert got["Count"] == expected_count, f"{arm}: expected {expected_count} tool(s), got {got}"
+    assert not got["SubstringHit"], (
+        f"{arm}: the result is a [String], so .Contains('as') answered True against a corpus "
+        "whose only tool is 'Task' -- a substring test wearing set membership. The comma on the "
+        "tail return is missing. This arm is SILENT: no exception, exit 0, wrong answer."
     )
