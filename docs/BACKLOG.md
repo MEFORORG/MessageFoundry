@@ -4997,6 +4997,19 @@ a file, which is the fact the whole finding rests on.
 > **AMENDED 2026-08-14 (lander) -- THE IMPLEMENTATION LANDED IN THIS PR; THE STATUS BANNER IS DELIBERATELY UNCHANGED.** `public_origin` is now required in the declared-terminator PHI enforce posture, which makes the comment at `:2113-2114` true **by construction** rather than by convention. A negative control was run and still discriminates: reverted, the console-OFF case fails while console-ON and non-PHI pass. **Closing this item is a judgement about completeness, not a mechanical consequence of the code landing, so it is left to the ledger seats rather than taken by the seat that merely supplied the paired commit.**
 > Verdict: build
 > Closing-act: code
+> **PROGRESS 2026-08-26 (lander) -- THIS PR CLOSES THE REMEDIATION-STRING LIMB THIS ITEM'S OWN
+> RE-SCORE FLAGGED.** The re-score above names the exact gap: the refusal this item's own fix added
+> tells an operator to set `[api].public_origin`, which ADR 0118 relocated and the loader now rejects
+> at load, so the remediation fails on the operator's next start. This PR renames the instruction to
+> `[security].web_console_public_address` and pins the assertion against `_RELOCATED_TO_SECURITY`
+> itself rather than a string literal, so a future relocation cannot drift the two apart silently
+> again. **A second instance of the identical defect, found by this branch's own test:** an earlier
+> `serve_ui`-gated refusal carries the same stale key name and is fixed alongside.
+> **Deliberately incomplete, stated rather than hidden:** the matching `docs/CONFIGURATION.md`
+> paragraph is not in this PR -- the collision gate correctly refused it because Builder 2 holds
+> uncommitted changes to that file, so it was asked for rather than overridden, and follows
+> separately. **Stays OPEN once this lands too**, per this item's own stated design: closing it is a
+> judgement about completeness, not a mechanical consequence of a landed commit.
 **Cluster:** Security / startup gates, ASVS 12.1.1. **Priority:** P2. **Verdict:** build (small). **Severity:** would leave an ASVS 12.1.1 control silently inert in a legitimate deployment posture on first deployment — the TLS floor of the terminator in front of a PHI API would go unmeasured, with nothing reporting the skip.
 
 **The gate, measured at `e0482aea`.** `messagefoundry/__main__.py` runs the probe under:
