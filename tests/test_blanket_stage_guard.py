@@ -16,21 +16,30 @@ below pin that. Measured against real git: `git ADD .` returns "git: 'ADD' is no
 `git add -a` returns "error: unknown switch `a'", and `git commit --ALL` returns "error: unknown
 option `ALL'". Folding case there would deny commands git itself refuses to run.
 
-KNOWN OVER-DENY, AND THE CASE FIX WIDENED IT. The guard splits on `(\|\||&&|[;|&\n])`, which
-carries no quote or line state, so quoted text after a newline, `;`, `|` or `&` lands at the front
-of a segment and is read there as a program name. Prose that quotes a blanket-stage command is
-denied on that path: a heredoc writing a doc, a commit message body, a `gh pr create --body`, even
-a single-line markdown table cell. Two non-prose commands go the same way -- `git log --all --grep
-commit` and `git grep -n add -- .` are read-only and both deny -- because the subcommand and flag
-tokens are matched ANYWHERE in the segment rather than at argv position.
+THE OVER-DENY CLASS THIS FILE USED TO PIN IS NOW FIXED (BACKLOG #1341). The guard split on
+`(\|\||&&|[;|&\n])`, which carried no quote or line state, so quoted text after a newline, `;`, `|`
+or `&` landed at the front of a segment and was read there as a program name -- a heredoc writing a
+doc, a commit message body, a `gh pr create --body`, a markdown table cell. Two non-prose commands
+went the same way, `git log --all --grep commit` and `git grep -n add -- .`, because the subcommand
+and flag tokens were matched ANYWHERE in a segment rather than at argv position. The guard now
+blanks quoted spans and heredoc bodies before splitting, and resolves the subcommand past git's
+global options. Those twelve payloads are still driven, under
+`test_prose_and_read_only_commands_are_allowed`, with the opposite expectation.
 
-THE CLASS IS PRE-EXISTING, WHICH IS WHY THE CASE FIX STILL LANDED. Every case below was driven
-against the committed guard in its lowercase spelling first, and every one already denied. The fix
-widens the class from one spelling to all of them; it creates no new class, and across roughly 800
-driven payloads nothing flipped from DENY to ALLOW. The real repair is a program-position test over
-a quote-aware splitter -- `Test-GitProgramPosition` exists at `c0d6cef8^` and was removed by the
-revert at `c0d6cef8` -- which belongs to the shared segment-scanner work and has no allocated
-number here. The cases are pinned below so that work flips them deliberately.
+WHY THE HISTORY IS KEPT RATHER THAN DELETED. The class was PRE-EXISTING and the case fix only
+widened it from one spelling to all of them -- every case was driven in its lowercase spelling
+first and already denied. That is what made the case fix landable while a known over-deny sat
+beside it, and a future reader deciding whether a similar trade is acceptable needs the precedent,
+not just the outcome.
+
+THE ADD VOCABULARY IS A GENERATED FAMILY, NOT A LIST (BACKLOG #1340). Seven forms were filed; a
+ground-truth pass measured at least 33 that really stage the whole tree, so patching literals would
+have fixed almost nothing. The flag rule is generated from the option words per the method BACKLOG
+#1097 settled, because a longer list has the same shape as the defect and decays the same way.
+WHAT IS STILL NOT REACHED is stated in the guard beside the rules rather than left to be
+discovered: magic pathspec beyond `.`, `./`, `:/` and `:(top)`; `--renormalize`;
+`--pathspec-from-file`; and any wrapper-dispatched or path-qualified git, which is BACKLOG #1305's
+axis and needs the allowlist construct BACKLOG #1229 measured as fail-open.
 
 A MEASUREMENT THAT DID NOT ANSWER THIS QUESTION, recorded so it is not repeated. A scan of every
 tracked file found 1 segment that already trips the guard and 0 that the case fix newly trips. The
@@ -194,10 +203,23 @@ def test_the_anchor_holds_so_a_word_ending_in_git_is_not_the_program() -> None:
 # ------------------------------------------------------------------------------ the deny message
 
 
-def test_the_add_deny_names_the_flag_and_the_way_forward() -> None:
+def test_the_flag_deny_names_the_flag_family_and_the_way_forward() -> None:
+    """The message changed with BACKLOG #1340, and the change is the point.
+
+    It used to read `-A/--all/-u/.` -- one sentence covering flags AND a pathspec. That told an
+    operator who typed `:/` the problem was a flag, and it named neither `stage` nor `--update`,
+    both of which now deny. The flag limb and the pathspec limb carry their own messages.
+    """
     reason = assert_denied(run_guard(bash("GIT add -A")))
-    assert "-A/--all/-u/." in reason
+    assert "add/stage" in reason  # the synonym is real; the message must not hide it
+    assert "--update" in reason
     assert "git add <path>" in reason  # a deny must say how to proceed, not just say no
+
+
+def test_the_pathspec_deny_names_the_pathspec_not_a_flag() -> None:
+    reason = assert_denied(run_guard(bash("git add :/")))
+    assert "pathspec" in reason
+    assert "git add <path>" in reason
 
 
 def test_the_commit_deny_names_its_own_rule() -> None:
@@ -205,13 +227,26 @@ def test_the_commit_deny_names_its_own_rule() -> None:
     assert "-a/-am/--all" in reason
 
 
-# -------------------------------------------------------------- the known over-deny, pinned
+# ------------------------------------------------- the former over-deny class, FIXED (#1341)
 
-# These are WRONG, and they are pinned so a future program-position fix flips them on purpose
-# rather than finding them. Each pair asserts the capitalised form the case fix newly denies AND
-# the lowercase form that already denied before it -- the pair is the evidence that this widens an
-# existing class rather than creating one. See the module docstring.
-OVER_DENY_PAIRS = [
+# THESE SIX USED TO DENY AND NOW ALLOW. THE FLIP IS DELIBERATE (BACKLOG #1341).
+#
+# They were pinned as known-wrong so that whoever repaired the splitter would flip them on purpose
+# instead of discovering them. This is that flip. Nothing here is a coverage reduction: each row
+# asserts the SAME payload as before, with the opposite expectation, so the case is still driven
+# and a regression that re-denies any of them fails this test.
+#
+# Two mechanisms, and the pairs separate them:
+#   * rows 1-4 were segmentation. A separator inside a quoted span or a heredoc body split the
+#     command, so prose landed at a segment front and was read as program position. The guard now
+#     blanks quoted spans and heredoc bodies before splitting.
+#   * rows 5-6 were argv position. `add` and `commit` were matched ANYWHERE in a segment, so a
+#     read-only search whose ARGUMENT was the word `add` denied. The guard now resolves the
+#     subcommand past git's global options and suppresses on a recognised read-only one.
+#
+# The capitalised/lowercase pairing is KEPT rather than collapsed. It is what shows the class was
+# pre-existing and not created by the case fix, and it costs one extra driven payload per row.
+FIXED_FORMER_OVER_DENY_PAIRS = [
     pytest.param(
         'git commit -m "fix\nGit add -A is blocked"',
         'git commit -m "fix\ngit add -A is blocked"',
@@ -245,10 +280,162 @@ OVER_DENY_PAIRS = [
 ]
 
 
-@pytest.mark.parametrize(("capitalised", "lowercase"), OVER_DENY_PAIRS)
-def test_prose_and_read_only_commands_are_over_denied(capitalised: str, lowercase: str) -> None:
-    assert_denied(run_guard(bash(capitalised)))
-    assert_denied(run_guard(bash(lowercase)))
+@pytest.mark.parametrize(("capitalised", "lowercase"), FIXED_FORMER_OVER_DENY_PAIRS)
+def test_prose_and_read_only_commands_are_allowed(capitalised: str, lowercase: str) -> None:
+    """Prose quoting a blanket-stage command, and read-only searches, must not be refused."""
+    assert_allowed(run_guard(bash(capitalised)))
+    assert_allowed(run_guard(bash(lowercase)))
+
+
+# ------------------------------------------- the add vocabulary, closed as a family (#1340)
+
+# EVERY ROW HERE WAS MEASURED TO REALLY STAGE THE WHOLE TREE, against real git 2.53.0.windows.2,
+# in a throwaway repo, BEFORE being driven through the guard -- and every one was ALLOWED by the
+# committed guard. An alleged bypass that does not actually stage anything is not a bypass, so the
+# real-git step is what makes these rows evidence rather than assertion.
+#
+# The item named seven. The ground-truth pass measured at least 33 and stopped searching, not
+# because the surface was exhausted. Patching seven literals would have fixed almost nothing --
+# which is precisely why the flag rule below is GENERATED from the option words per BACKLOG #1097's
+# settled method, rather than being a longer list.
+NEWLY_DENIED_BLANKET_STAGES = [
+    # the synonym, which alone defeated every flag row and the bare-dot row together
+    "git stage -A",
+    "git stage .",
+    "git stage --all",
+    "git stage :/",
+    "git stage -Av",
+    "git stage -u",
+    "git stage --update",
+    # the long-flag family, including git's unambiguous-abbreviation binding
+    "git add --update",
+    "git add --al",
+    "git add --a",
+    "git add --up",
+    "git add --upd",
+    "git add --no-ignore-removal",
+    # single-dash clusters
+    "git add -Av",
+    "git add -vA",
+    "git add -uv",
+    # whole-tree pathspecs
+    "git add :/",
+    "git add ./",
+    "git add ':(top)'",
+    "git add -f :/",
+    "git add --update :/",
+    # the bare .exe spelling of the same executable
+    "git.exe add -A",
+    "git.exe commit -am wip",
+]
+
+
+@pytest.mark.parametrize("command", NEWLY_DENIED_BLANKET_STAGES)
+def test_a_real_blanket_stage_is_denied_however_it_is_spelled(command: str) -> None:
+    assert_denied(run_guard(bash(command)))
+
+
+# THE NEGATIVE THAT BOUNDS THE FLAG FAMILY. Without these the next reader "simplifies" the
+# case-sensitive `[Au]` cluster to `(?i)[au]` and the rule stops describing the family.
+#
+# `A`/`a` and `u`/`U` are FOUR DIFFERENT THINGS in this one command, and only two stage:
+#   -a   is not a git add flag at all -- `git add -a` exits 129, `unknown switch 'a'`
+#   -U   IS a real flag (--unified) and stages nothing
+# Denying either buys zero protection and costs real work. Measured, not read off documentation.
+CASE_BOUND_FLAG_ALLOW = [
+    "git add -a",  # exit 129 in real git; denying it refuses what git already refuses
+    "git add -na",  # same, clustered
+    "git add -U 3 tracked.txt",  # --unified, a real flag that stages nothing
+    "git add -p",  # patch mode, interactive and scoped
+    "git add -n README.md",  # dry run on one path
+    "git add -N newfile",  # intent-to-add, NOT --all despite the capital
+]
+
+
+@pytest.mark.parametrize("command", CASE_BOUND_FLAG_ALLOW)
+def test_a_flag_that_is_not_a_blanket_stage_is_allowed(command: str) -> None:
+    assert_allowed(run_guard(bash(command)))
+
+
+# THE PATHSPEC LIMB'S OWN BOUND. A scoped path that merely CONTAINS a dot or a slash is ordinary
+# work. The trailing boundary is the only thing separating these from the blanket forms above,
+# which is why the pathspec limb cannot be fused into the flag rule.
+SCOPED_PATHSPEC_ALLOW = [
+    "git add ./src/x.py",
+    "git add .gitignore",
+    "git add src/.",
+    "git add ./sub",
+    "git add README.md",
+]
+
+
+@pytest.mark.parametrize("command", SCOPED_PATHSPEC_ALLOW)
+def test_a_scoped_path_is_not_a_whole_tree_pathspec(command: str) -> None:
+    assert_allowed(run_guard(bash(command)))
+
+
+# ------------------------------------------------- the fix must not have bought a fail-open
+
+# WHY THIS TEST EXISTS AND WHY IT IS NOT A FALSE-DENY CORPUS (BACKLOG #1229's reverted experiment).
+#
+# A program-position predicate was built for the sibling worktree_gate.ps1 and withdrawn six hours
+# later. Its measurement was 93 rows of "does the shape that should allow, allow?" -- and A
+# FALSE-DENY CORPUS CANNOT FIND A FAIL-OPEN BY CONSTRUCTION. It disclosed one fail-open and shipped
+# at least ten more it never probed, because every row it drove asked the other question.
+#
+# The rows below are the other direction: shapes that MUST still be refused. On this guard a
+# fail-open is the direction that loses coverage silently, so widening the allow side without this
+# test is how the same mistake gets made on a second file.
+MUST_STILL_DENY = [
+    # The plain forms. If any of these ever allows, the guard is off.
+    "git add -A",
+    "git add --all",
+    "git add -u",
+    "git add .",
+    "git commit -a",
+    "git commit -am wip",
+    "git commit --all",
+    # A GLOBAL OPTION BEFORE THE SUBCOMMAND. This is the specific fail-open the subcommand
+    # resolver could have introduced: if `-C` did not consume its value, the resolver would read
+    # the PATH as the subcommand, fail to recognise it, and -- in a design where recognition were
+    # required to keep the token -- allow. It must deny.
+    "git -C /some/path add -A",
+    "git -c user.name=x add -A",
+    "git --git-dir=/tmp/x add -A",
+    # An UNKNOWN global option must not become an escape hatch either. The resolver cannot know
+    # whether it takes a value, so the subcommand resolves to something unrecognised -- which must
+    # fall through to a deny, never to an allow.
+    "git --some-future-option add -A",
+    "git --some-future-option value add -A",
+    # A read-only subcommand NAME appearing as an argument must not suppress a real stage.
+    "git add -A -- log",
+    "git add -A -- status",
+    # Separators outside quotes still split, so a real stage after one is still caught.
+    "echo hi && git add -A",
+    "echo hi ; git add -A",
+    "echo hi | git add -A",
+    # A quoted argument elsewhere on the line must not hide a real stage outside the quotes.
+    'git commit -m "message" && git add -A',
+    # A heredoc that ENDS before the real command does not blank it.
+    "cat <<'EOF' > f.txt\nsome body\nEOF\ngit add -A",
+]
+
+
+@pytest.mark.parametrize("command", MUST_STILL_DENY)
+def test_the_fix_did_not_buy_a_fail_open(command: str) -> None:
+    assert_denied(run_guard(bash(command)))
+
+
+def test_an_unrecognised_subcommand_falls_through_to_deny_not_allow() -> None:
+    """The polarity rule, asserted directly rather than left to the rows above.
+
+    Recognition may only ever SUPPRESS a deny. `zzz-not-a-subcommand` is not in the read-only
+    list and never will be, so a command carrying it must still be judged by the staging
+    predicates -- which deny. If this ever allows, the resolver has been rewritten so that failing
+    to recognise something produces an allow, and that is the exact defect that killed the
+    predicate in BACKLOG #1229.
+    """
+    assert_denied(run_guard(bash("git zzz-not-a-subcommand add -A")))
 
 
 # --------------------------------------------------------------------------------- still fail-open
