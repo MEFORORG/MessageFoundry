@@ -392,17 +392,40 @@ function Resolve-ShellIndirection([string]$Token, [string]$Prefix) {
 function Get-GitTargetCandidatesRaw([string]$Line, [string]$Prefix, [string]$CwdRaw) {
     $out = @()
 
+    # THE `cd` PREFIX IS COMPUTED FOR BOTH BRANCHES, NOT ONLY THE ELSE (BACKLOG #1085). It used to sit
+    # inside the else, so a `-C` value was PREFERRED and the `cd` DISCARDED -- but a real shell resolves a
+    # RELATIVE `-C` against the post-`cd` directory, not against the session cwd. From a governed primary,
+    #     cd ../Unrelated && git -C . config core.hooksPath /dev/null
+    # therefore DENIED and named the primary, while the write landed in the ungoverned ../Unrelated. A deny
+    # that names a repository the command does not touch actively misinforms the session reading it.
+    #
+    # THE FIX IS COMPOSITION, NOT PREFERENCE. The two are not alternatives: `cd` sets the base and a
+    # relative `-C` is resolved against it. An ABSOLUTE `-C` ignores the base, which is why the join below
+    # is guarded on IsPathRooted rather than applied unconditionally.
+    #
+    # The bail-outs are unchanged and still guard both branches: `popd` and `cd -` restore an unknown
+    # directory, and `(`/`{` mean a subshell whose `cd` does not affect the parent -- in all three the
+    # prefix cannot be composed and $cd stays null, which falls back to exactly the old behaviour.
+    $cd = $null
+    if ($Prefix -notmatch '(?:^|\s)(?:popd|cd\s+-(?:\s|$))' -and $Prefix -notmatch '[({]') {
+        $cds = [regex]::Matches($Prefix, '(?:^|\s)(?:cd|pushd)\s+"?([^"&|;]+?)"?\s*(?:&&|;|\||$)')
+        if ($cds.Count -eq 1) { $cd = $cds[0].Groups[1].Value.Trim() }
+    }
+
     # git's global `-C <path>`, read CASE-SENSITIVELY. `-match` is case-INsensitive in PowerShell, so
     # git's lowercase `-c name=value` config override was captured as if it were a path -- and being the
     # first match it also shadowed a real `-C` later in the same command.
     if ($Line -cmatch '(?:^|\s)-C\s+"?([^"\s]+)"?') {
-        $out += $Matches[1]
-    } else {
-        $cd = $null
-        if ($Prefix -notmatch '(?:^|\s)(?:popd|cd\s+-(?:\s|$))' -and $Prefix -notmatch '[({]') {
-            $cds = [regex]::Matches($Prefix, '(?:^|\s)(?:cd|pushd)\s+"?([^"&|;]+?)"?\s*(?:&&|;|\||$)')
-            if ($cds.Count -eq 1) { $cd = $cds[0].Groups[1].Value.Trim() }
+        $dashC = $Matches[1]
+        if ($cd -and -not [System.IO.Path]::IsPathRooted($dashC)) {
+            # Join, never replace. The result stays RAW and possibly relative (`../Unrelated/.`); the
+            # caller roots it with Get-FullPathRaw against the session cwd, which is the same base the
+            # shell would use for the `cd` itself, so a relative `cd` composes correctly too.
+            $out += (Join-Path $cd $dashC)
+        } else {
+            $out += $dashC
         }
+    } else {
         $out += $(if ($cd) { $cd } else { $CwdRaw })
     }
 
@@ -1535,9 +1558,13 @@ What to do instead:
         #     `C:\git` directory is ordinary on a developer's box, so this is the most reachable of
         #     the set.
         #   * A FAILED `cd`, and a SUBSHELL prefix `( cd x && git ... )`.
-        #   * COMPOSE vs PREFER: the resolver PREFERS `-C` and discards a `cd` prefix, where a shell
-        #     COMPOSES them and resolves a relative `-C` against the post-`cd` directory. That is
-        #     BACKLOG #1085.
+        #   * COMPOSE vs PREFER -- FIXED 2026-08-26 (BACKLOG #1085), and listed here rather than
+        #     deleted so this inventory is not read as still complete. The resolver used to PREFER
+        #     `-C` and discard a `cd` prefix; it now COMPOSES them, joining a RELATIVE `-C` onto the
+        #     `cd` target and leaving an ABSOLUTE one alone. The fix is in the resolver, which is
+        #     where this note said it belonged. The three bail-outs (`popd`, `cd -`, a subshell
+        #     prefix) now guard both branches, so the FAILED-`cd` and SUBSHELL entries above are
+        #     unchanged by it.
         #   * THE PRE-SPLITTER ONE LINE ABOVE, `-split '(?:&&|\|\||;|\|)'`, is NOT quote-aware. A
         #     quoted victim path containing `;` or `&&` is truncated before the quote-aware scan ever
         #     runs, so the awareness gained above does not extend to that character class.

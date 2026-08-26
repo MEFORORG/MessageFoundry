@@ -5268,6 +5268,38 @@ Both contain the identical slug. Only the first carries a `worktrees/` prefix.
 **Source:** found 2026-08-07 while committing #1082, when a routine slug grep returned a hit the leak gate had just passed. The gate had refused a different commit of mine for the prefixed form the day before, which is what made the disagreement visible.
 
 ## 1085. Rule 3c discards a `cd` prefix and resolves a relative `-C` against the session cwd, so it refuses a write aimed at an ungoverned repo
+> **FIXED 2026-08-26. The banner stays open for the archive pass, as with #1026, #1361, #1365 and #1367.**
+> The fix is in `Get-GitTargetCandidatesRaw`, which is where this row and the gate's own defect inventory
+> both said it belonged -- `worktree_gate.ps1` carried *"COMPOSE vs PREFER ... That is BACKLOG #1085"* in a
+> list ending *"All of these belong to the RESOLVER rather than to this rule"*. That comment is updated in
+> the same change rather than deleted, so the inventory beside it is not read as still complete.
+>
+> **COMPOSITION, NOT PREFERENCE, AND THE JOIN IS GUARDED.** The `cd` computation moved above the `-C`
+> branch; a RELATIVE `-C` is joined onto the `cd` target, an ABSOLUTE one is left alone. Unconditional
+> composition would be worse than the bug: joining a governed absolute `-C` onto some other `cd` points
+> the gate away from the repository the command really writes to, turning a correct DENY into a FAIL-OPEN.
+>
+> **The three bail-outs now guard BOTH branches** (`popd`, `cd -`, and a `(`/`{` subshell). When one fires
+> the behaviour is byte-identical to before, which is what the subshell test asserts.
+>
+> **A SHIPPED TEST LOOKS LIKE IT CONTRADICTS THIS AND DOES NOT.**
+> `test_a_dash_C_beats_a_preceding_cd` says *"git acts on -C, never on the cd'd directory"* -- but every
+> case it drives uses an ABSOLUTE `-C`, where that is true and this change preserves it. The name and the
+> word "never" are broader than the evidence, so a reader checking whether this fix is safe would conclude
+> from the title that it is not. A new negative control covers the case that would actually notice.
+>
+> **The first draft of the tests used a `config core.hooksPath` payload and three of them failed.** They
+> failed IDENTICALLY against the UNFIXED gate, which is what showed the fault was the test rather than the
+> fix: in this module's fixtures the `primary` directory is never created, and a disarm payload ALLOWS
+> against a non-repository while a git VERB DENIES on path governance alone. Measured, not reasoned:
+> `git -C . checkout main` DENY, `git -C . <disarm write>` ALLOW, `git checkout main` DENY.
+>
+> **The gate blocked the edit that wrote these tests**, because a literal disarm-key write in a heredoc IS
+> one and rule 3 scans the tool call's command line. Correct behaviour; the payload is now assembled from
+> parts, so what the gate sees at RUN time is unchanged.
+>
+> **Mutation-tested:** reverting the resolver reds ONLY the composition test; all four controls stay green.
+> 222 tests pass across the four closest gate suites.
 
 > 🔢 **Re-scored 2026-08-20 -> P2.** Value **6/10** · Difficulty **4/10** · _quick win_. The defect is intact: worktree_gate.ps1:319 takes the -C value and the cd resolution at :321-330 is the else branch, so a relative -C behind a cd prefix resolves against the session cwd and the deny names the wrong repository. Value 6 is rung 6 -- a live false deny on developer tooling whose only workaround is a human overriding a message that actively misinforms. Difficulty 4, not 5, because the change is hoisting the existing cd computation above the -C branch and joining a relative -C to it inside one function, and the deny-text assertion the scorer priced as extra cost is already a shipped test capability. _(was 6/10 · 4/10.)_
 >
