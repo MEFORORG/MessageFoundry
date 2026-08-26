@@ -50,10 +50,27 @@ import pytest
 
 SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "worktree" / "prune-merged.ps1"
 
-pytestmark = pytest.mark.skipif(
-    shutil.which("pwsh") is None or os.name != "nt",
-    reason="prune-merged.ps1 needs pwsh on Windows (Process.StartTime liveness fence)",
-)
+# TWO marks, and the timeout one is load-bearing on CI. Every subprocess wait in this file outlives
+# the leg's own `--timeout=120`: 300 s at the `run`/`run_text` helpers and 180 s at two tests. When a
+# wait outlives the pytest timeout, pytest-timeout dumps the stacks and calls `os._exit(1)`, which
+# kills the xdist worker before execnet can relay the dump -- so it surfaces as `worker 'gwN' crashed`
+# with NO traceback and reads like a native crash. Precedent and full diagnosis: a824cc749, which gave
+# tests/test_session_mail.py the same treatment for the same signature.
+#
+# MODULE-LEVEL, DEPARTING FROM THAT PRECEDENT'S PER-TEST SHAPE, and the reason is measured: 74 of the
+# 75 tests here reach the 300 s helpers, so 74 individual markers would be noise carrying no
+# information. The precedent's file had four slow tests among many, which is why per-test was right
+# THERE. Its PRINCIPLE -- the marker must outlive the subprocess wait -- is what transfers.
+#
+# 360 s is the precedent's headroom, not a guess: it used timeout(300) against a 240 s maximum wait,
+# i.e. 60 s of margin. This file's maximum wait is 300 s, so 360 keeps the same margin.
+pytestmark = [
+    pytest.mark.skipif(
+        shutil.which("pwsh") is None or os.name != "nt",
+        reason="prune-merged.ps1 needs pwsh on Windows (Process.StartTime liveness fence)",
+    ),
+    pytest.mark.timeout(360),
+]
 
 # Metadata files the activity signal reads. Backdating these is how a fixture gets past the veto
 # without turning it off.

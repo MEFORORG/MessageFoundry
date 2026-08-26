@@ -9416,6 +9416,22 @@ Nothing here touches the TLS/FTPS context in the same module, which was already 
 > 🔢 **Re-scored 2026-08-20 -> P2.** Value **6/10** · Difficulty **3/10** · _quick win_. The concrete IDE defect is closed by cspNonce.ts and its negative test, so what remains is the recovery-code shortfall (totp.py:58-60, 31^15 or about 74.3 bits, ten issued by default at settings.py:1798) plus the cross-language inventory question the crypto gate still cannot answer (crypto_inventory_check.py:456-472 excludes ide/ by invariant rather than inventorying it). An operator can only work around the shortfall by setting the count to 0, which is the awkward-workaround band. _(was 6/10 · 4/10.)_
 > Research: done 2026-08-20
 >
+> **PARTIAL 2026-08-25 -- THE PROPOSED BUILD SHIPPED (PR #603). THE ROW STAYS OPEN: the item's own
+> closing act is a scorecard re-score, not this build, and that re-score is explicitly not run.**
+> `_RECOVERY_GROUPS` went 3 -> 6 over the existing alphabet (148.63 bits, 142.98 after the
+> multiplicity adjustment -- 15 bits of margin against the 128-bit floor rather than 59 bits short
+> of it); the bare 26-character widening named below as a trap was NOT taken, matching this item's
+> own reasoning. `_generate_policy_password` now draws 24 bytes rather than 16, so the
+> `token_urlsafe` byte/character mismatch this research flagged as "safe by accident" no longer
+> depends on accident. An entropy-floor regression test derives its bit count from the three
+> shipped constants and the validator's own maximum count rather than transcribing either, with a
+> mutation control run against the shipped constant (not just asserted): reverting
+> `_RECOVERY_GROUPS` to 3 fails the new test, restored by byte-copy with the hash verified.
+> **Still explicitly open, all named in this item's own proposed-work list and none touched by
+> PR #603:** the ASVS 11.5.1 scorecard re-score itself; the scope-completeness adversarial pass this
+> item's own caveat says was never run; recording the five zero-margin values its census already
+> flags; and the cross-language randomness inventory arm.
+>
 > **Filed 2026-08-08 - not started. RESEARCH item: the goal is an HONEST pass, and "cannot honestly reach pass" is a valid finding.** ASVS **11.5.1** (L2) currently scores **partial**. The pinned verb sets a 128-bit floor on every non-guessable random value. TOTP recovery codes are CSPRNG-drawn but reach only about 74.3 bits, and the IDE extension mints its webview CSP nonces from `Math.random()`.
 > Verdict: research
 > Closing-act: scorecard-rescore
@@ -13218,6 +13234,7 @@ measurement from this row's subject and it is named here rather than performed.*
 
 > 🔢 **Re-scored 2026-08-20 -> P3.** Value **4/10** · Difficulty **2/10** · _fill-in_. One limb remains and it is a pure refactor: logging_setup.py:66-70 still derives its own table from range(0x20) plus 0x7F and does not import controlchars at all, while the module now states the alphabet once at :67 with both arms reading it. Value 4 because nothing is mis-screened today, two of the three named copies already agree, and at least two further independent derivations sit outside this item's scope (spreadsheet.py:37, soap.py:263), so folding logging_setup in buys the stated cross-module leverage for one file rather than repo-wide. Difficulty 2 for one import, one derivation with an explicit tab subtraction, a test pinning that tab stays excluded, and renaming the acceptance test's scrub_control_chars, which returns zero code hits. _(previously unscored.)_
 >
+> **PARTIAL 2026-08-25 -- THE THIRD SPELLING IS NOW GONE TOO. STILL STAYS OPEN** (spreadsheet.py:37 and soap.py:263 are named out-of-scope above, and remain so). `logging_setup.py` now imports `controlchars` and states its own table as that alphabet minus TAB, proved byte-identical to the pre-change table entry-for-entry (32 entries both sides) rather than asserted. Verified before writing this note, not taken from the branch's own claim.
 > **PARTIAL 2026-08-20 -- ONE OF THE TWO SPELLINGS INSIDE THE MODULE IS GONE; THE THIRD, IN ANOTHER MODULE, IS NOT. THIS ITEM STAYS OPEN.** `controlchars.py` now states the set once, in `_is_control_char` at `:67`, and both `has_control_char` and `strip_control_chars` read it -- so the module's own interior no longer contradicts its docstring. **But `logging_setup.py:66-70` still re-derives the same set independently** (`for _i in range(0x20)` plus `[0x7F]`), and the landing branch does not touch that file at all. The item names **three** spellings and asks for **one definition of the SET**; two of three now share one. **The leverage the module exists to provide is still absent across the module boundary:** widen `_is_control_char` and it reaches neither `_CTRL_TRANSLATION` nor anything reading it, and nothing reports the omission. Measured on the landing branch, not inferred. Recorded by the lander under ADR 0165, because a closing banner that lists what a change fixed and not what it left is half a record.
 > 🔢 **Filed 2026-08-15 - not started. THE CONSOLIDATION DOES NOT CONSOLIDATE ITS OWN TWO FUNCTIONS.** [`controlchars.py`](../messagefoundry/controlchars.py) was created by [#1253](BACKLOG.md) to write the C0/DEL test **once**; its docstring is titled *"The C0/DEL control-character test, written once"* and ends *"THE POINT IS THE COPYING PRACTICE, not the seven known lines. If you need this test, import it."* **It then spells the predicate out twice inside itself**, and a third statement of the same set lives in `logging_setup`.
 > **MEASURED, three independent spellings of one set:**
