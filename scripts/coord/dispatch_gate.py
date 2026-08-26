@@ -76,6 +76,48 @@ from backlog_status_check import (  # type: ignore[import-not-found]  # noqa: E4
 # Below this, the ledger did not parse and no verdict from this gate is evidence.
 MIN_ITEMS = 50
 
+# VERDICTS THAT MEAN DO NOT JUST BUILD IT, and what lifts each (BACKLOG #1334).
+#
+# This is DISPATCH POLICY -- what a verdict says about STARTING work -- not ledger parsing, so it
+# lives here rather than in the shared parser. The closed verdict vocabulary itself is ``_VERDICTS``
+# in ``scripts/docs/verdict_divergence_check.py``; these keys must stay a SUBSET of it, and
+# ``test_the_gated_verdicts_are_a_subset_of_the_closed_vocabulary`` enforces that rather than
+# trusting this sentence.
+#
+# WHY THIS EXISTS -- and read the second paragraph, because the obvious story is WRONG.
+#
+# This gate green-lit BACKLOG #1336 to a dispatcher on 2026-08-24. #1336 was not startable: an owner
+# ruling in its body put a shell tokeniser out of scope with no fifth candidate, and that ruling sat
+# ~105 lines BELOW the banner block this gate reads. The item was dispatched, and a builder lost a
+# slot to it.
+#
+# THIS CHANGE WOULD NOT HAVE CAUGHT IT, and saying otherwise would be a false justification on a true
+# observation. Measured at 883f7734^, #1336's banner read `Verdict: build, Closing-act: code` -- so
+# this branch, which keys on the VERDICT FIELD, returns ``ok`` on it exactly as the old code did. The
+# banner was WRONG, and a reader of the banner cannot detect a wrong banner. What fixed #1336 was a
+# person reading the body and correcting the row (PR 578). The two are COMPLEMENTARY: that corrected
+# the DATA, this corrects the READER, and neither substitutes for the other.
+#
+# WHAT THIS DOES BUY, stated at its real size. 31 items on the ledger at 883f7734 declare a gated
+# verdict. Every one of them is ALREADY ``advise`` on its closing act, so on today's corpus this
+# changes NO LEVEL -- it changes the REASON for 31 items, from one naming only who closes them to one
+# naming what gates them and who lifts it. The level arm is real and unexercised: it fires the moment
+# a gated-verdict item carries a ``code`` closing act, which today's 31 do not (29 close by
+# owner-ruling, 2 by blocked). The self-test drives that case directly rather than waiting for the
+# ledger to produce one.
+GATED_VERDICTS = {
+    "demand-gate": (
+        "the DEMAND is unproven, not the design -- nobody has ruled that this should exist. "
+        "Scoping and research are legitimate. SHIPPING THE CODE IS NOT A COMPLETE OUTCOME here, "
+        "because the gate is lifted by an owner ruling via the LIAISON, never by a merge."
+    ),
+    "owner-ruling": (
+        "the SCOPE question belongs to the owner and is routed as one. Do not build a candidate "
+        "before it is answered; the ruling comes via the LIAISON, and the Dispatcher or Lander "
+        "records it."
+    ),
+}
+
 
 def load_items(root: Path) -> dict[int, Item]:
     """Every item across the ledger namespace, keyed by number."""
@@ -101,6 +143,11 @@ def judge(item: Item) -> tuple[str, str]:
 
     So the rule is NAME THE CLOSING ACT, NEVER REFUSE IT. The only ``refuse`` left is an item whose
     state nobody has declared, because there the dispatch cannot name anything at all.
+
+    **The gated verdicts ADVISE, they do not refuse** -- the same correction governs them. A
+    ``demand-gate`` item can legitimately be scoped or researched; what it cannot be is silently
+    treated as ordinary build work. So the note leads with what gates it and who lifts it, and the
+    seat still decides.
     """
     act = item.fields.get("closing-act", "").strip().lower()
     verdict = item.fields.get("verdict", "").strip().lower()
@@ -114,6 +161,20 @@ def judge(item: Item) -> tuple[str, str]:
         )
 
     notes: list[str] = []
+
+    # THIS BRANCH GOES FIRST, and the order is load-bearing rather than cosmetic. The closing-act
+    # note below ends "That is a complete outcome, not a failure." Left to lead, it tells the reader
+    # of a demand-gate item that shipping the code finishes the job -- the exact opposite of what a
+    # demand gate means. test_the_gated_note_leads pins the ordering, because a comment cannot.
+    #
+    # AND IT IS UNCONDITIONAL ON `Research:`, deliberately NOT mirroring the research branch's
+    # `research in ("", "none")` guard below. A demand gate is not lifted by finishing research; it
+    # is lifted by a ruling. Copying that guard is the plausible wrong fix and it re-greens the item
+    # the moment someone records a completed pass -- which is why two tests here drive these
+    # verdicts WITH research done.
+    if verdict in GATED_VERDICTS:
+        notes.append(f"Verdict is {verdict!r} -- DO NOT JUST BUILD IT: {GATED_VERDICTS[verdict]}")
+
     if act not in BUILDER_CLOSABLE_ACTS:
         who = CLOSING_SEAT.get(act, "a seat this tool does not know")
         notes.append(
@@ -165,6 +226,27 @@ def _self_test() -> int:
             {"closing-act": "code", "verdict": "research", "research": "done 2026-08-20"},
             "ok",
             "research done, closing act is code",
+        ),
+        (
+            {"closing-act": "code", "verdict": "demand-gate", "research": "none"},
+            "advise",
+            "a demand gate means the DEMAND is unproven -- shipping the code does not close it",
+        ),
+        (
+            {"closing-act": "code", "verdict": "demand-gate", "research": "done 2026-08-20"},
+            "advise",
+            "THE DISCRIMINATOR: a demand gate is lifted by a RULING, never by finished research, so "
+            "mirroring the research branch's guard here would wrongly re-green this",
+        ),
+        (
+            {"closing-act": "code", "verdict": "owner-ruling", "research": "none"},
+            "advise",
+            "an owner-ruling verdict routes the scope question to the owner before anyone builds",
+        ),
+        (
+            {"closing-act": "code", "verdict": "owner-ruling", "research": "done 2026-08-20"},
+            "advise",
+            "DISCRIMINATOR TWIN: research done does not answer a question routed to the owner",
         ),
     ]
     for fields, want, why in cases:
