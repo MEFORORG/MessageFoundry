@@ -181,7 +181,7 @@ class _Eof:
 _EOF: Final = _Eof()
 
 
-# --- child stderr relay (BACKLOG #343, ADR 0166) ------------------------------
+# --- child stderr relay (BACKLOG #343, ADR 0176) ------------------------------
 
 #: One ``read(2)``. The child is spawned with ``bufsize=0``, so ``proc.stderr`` is RAW: this is the
 #: syscall size, not a buffer fill, and a short read is normal. Sized well above the line cap so a
@@ -191,7 +191,7 @@ _STDERR_READ: Final = 65536
 #: Longest run held while waiting for a newline. A MEMORY bound on the parent, never a redaction: a
 #: Handler can write megabytes with no terminator, and an unbounded carry lets the child size the
 #: parent's heap. Reaching it splits one write across several DEBUG records and DISCARDS NOTHING --
-#: which is exactly what distinguishes it from the per-line byte cap ADR 0166 rejected. That cap was
+#: which is exactly what distinguishes it from the per-line byte cap ADR 0176 rejected. That cap was
 #: rejected for a reason specific to this payload: truncating an HL7 v2 message to its first N bytes
 #: keeps MSH and PID -- the header and the patient identifiers -- and discards the clinically bulky
 #: remainder, so it preserves precisely the most identifying part of the record. It is the worst
@@ -209,7 +209,7 @@ _STDERR_JOIN_SECONDS: Final = 1.0
 
 
 class _StderrRelay:
-    """One worker GENERATION's stderr, turned into log records (BACKLOG #343, ADR 0166).
+    """One worker GENERATION's stderr, turned into log records (BACKLOG #343, ADR 0176).
 
     Content at DEBUG and only DEBUG; at INFO and above an attributed, rate-limited notice carrying
     identity and a COUNT and no content. CLAUDE.md section 9 holds here **by construction** rather than
@@ -329,7 +329,7 @@ class _StderrRelay:
         self._last_notice = now
         log.warning(
             "sandbox worker wrote to stderr [%s pid %d gen %d]: %d line(s) since the last notice, "
-            "%d total for this worker; content is relayed at DEBUG only (ADR 0166)",
+            "%d total for this worker; content is relayed at DEBUG only (ADR 0176)",
             self._inbound,
             self._pid,
             self._gen,
@@ -562,7 +562,7 @@ class SandboxSession:
     ) -> None:
         self.policy = policy
         # Required, with no default, deliberately: this is what attributes a relayed stderr line to a
-        # feed (ADR 0166), and a default would silently reinstate the unattributable relay for every
+        # feed (ADR 0176), and a default would silently reinstate the unattributable relay for every
         # future caller. Parent-side only -- it is not marshalled, on the same rule as ``_env`` below.
         self._inbound = inbound
         self._config_dir = str(Path(config_dir))
@@ -617,7 +617,7 @@ class SandboxSession:
             [sys.executable, "-m", WORKER_MODULE],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
-            # CAPTURED, not inherited (BACKLOG #343, ADR 0166): with ``stderr=None`` the child's stderr
+            # CAPTURED, not inherited (BACKLOG #343, ADR 0176): with ``stderr=None`` the child's stderr
             # WAS the engine's, so admin-authored Handler code wrote unframed, unattributed bytes --
             # including whole message bodies -- straight into the operator's log of record.
             stderr=subprocess.PIPE,
@@ -761,7 +761,7 @@ class SandboxSession:
         with the rest of the worker's tree, so it cannot keep writing to the pipe.
 
         **The justification is the protocol violation, NOT a claim that fd 1 is unreachable.** An
-        earlier version of this docstring said the ADR 0166 stdout rebind meant "the text layer cannot
+        earlier version of this docstring said the ADR 0176 stdout rebind meant "the text layer cannot
         reach fd 1 at all", so "there is no benign case to preserve". **Both were false, and this
         docstring is where a DESTRUCTIVE action is reasoned from, which is what made it worth
         correcting rather than softening.** Rebinding the *name* ``sys.stdout`` leaves the descriptor
@@ -769,7 +769,7 @@ class SandboxSession:
         ``BufferedWriter`` :func:`_sandbox_worker.main` captured as the frame writer — and
         ``os.write(1, ...)`` and ``open(1, "wb")`` reach it too. What the rebind actually removes is
         the *accidental* case (a bare ``print()`` in a Handler), which is worth having and is all it
-        claims in ADR 0166 and in the worker's own bootstrap comment; asserting more here contradicted
+        claims in ADR 0176 and in the worker's own bootstrap comment; asserting more here contradicted
         both, in the same change that wrote them.
 
         The action is unchanged and does not need the stronger claim: a frame no outstanding request

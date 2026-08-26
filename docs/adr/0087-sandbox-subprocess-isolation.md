@@ -346,7 +346,7 @@ exotic object now reports a *codec* rejection rather than the pickle error text 
   handler-to-handler integrity is false. The boundary drawn here is between admin code and the
   **engine**. Per-Handler confinement would need a worker per Handler.
 - **The child's stderr is captured and relayed, no longer inherited** — closed by
-  [ADR 0166](0166-sandbox-child-stderr-is-captured-and-relayed-with-content-confined-below-info.md)
+  [ADR 0176](0176-sandbox-child-stderr-is-captured-and-relayed-content-below-info.md)
   (BACKLOG #343). It was `stderr=None`, so a sandboxed Handler that printed wrote unframed and
   unattributed straight into the engine's log: a log-injection / PHI-to-log surface, not a frame
   surface. It is now `stderr=PIPE` drained by a per-worker thread, attributed to the inbound and

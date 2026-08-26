@@ -449,7 +449,7 @@ def test_run_context_codec_snapshots_mappingproxy_views() -> None:
 
 def _session(config_dir: str, inbound: str = "IB_T", **kw: object) -> SandboxSession:
     # The default lives in this TEST helper only, never in the production constructor, where a default
-    # would silently reinstate the unattributable relay ADR 0166 exists to close.
+    # would silently reinstate the unattributable relay ADR 0176 exists to close.
     return SandboxSession(
         SandboxPolicy(mode=SandboxMode.SUBPROCESS, wall_seconds=15.0),
         inbound=inbound,
@@ -1113,7 +1113,7 @@ def test_worker_kill_reaps_the_whole_process_tree(tmp_path: Path) -> None:
 
 
 # --- (e) child stderr is captured and relayed, content confined below INFO -----
-# BACKLOG #343 / ADR 0166. Two problems share one root: (a) a sandboxed Handler's line was
+# BACKLOG #343 / ADR 0176. Two problems share one root: (a) a sandboxed Handler's line was
 # byte-indistinguishable from an engine line, and (b) a Handler that printed a message body wrote a
 # full payload into the general log. (b) is the one CLAUDE.md section 9 forbids, and the tests below
 # pin the property that closes it BY CONSTRUCTION: no call site above DEBUG carries child content.
@@ -1134,7 +1134,7 @@ def r_err(msg):
 
 @handler("h_body")
 def h_body(msg):
-    # ADR 0166 (b): a Handler writing a full message body to stderr. Synthetic HL7 only.
+    # ADR 0176 (b): a Handler writing a full message body to stderr. Synthetic HL7 only.
     print(str(msg), file=sys.stderr)
     return Send("OB_ERR", "OK")
 
@@ -1158,7 +1158,7 @@ def h_raw_stdout(msg):
 """
 
 #: Writes 1 MiB to stderr at MODULE scope, i.e. inside ``load_config()`` -- before the child can write
-#: its boot reply. This is the deadlock ADR 0166 says the decision CREATES: a PIPE nobody drains blocks
+#: its boot reply. This is the deadlock ADR 0176 says the decision CREATES: a PIPE nobody drains blocks
 #: its writer once the OS buffer fills (order 64 KiB).
 _FLOOD_GRAPH = """
 import sys
@@ -1283,7 +1283,7 @@ def test_at_debug_content_is_relayed_attributed_and_control_scrubbed(
 def test_a_raw_write_to_fd_1_cannot_forge_a_frame_because_stdout_is_rebound(
     tmp_path: Path,
 ) -> None:
-    """ADR 0166 D3, the adjacent defect closed with the same fd discipline.
+    """ADR 0176 D3, the adjacent defect closed with the same fd discipline.
 
     The Handler writes a COMPLETE forged frame through ``sys.stdout.buffer``. With the bootstrap rebind
     ``sys.stdout`` is stderr, so those bytes go to fd 2 and the dispatch answers normally. Without it
@@ -1314,7 +1314,7 @@ def test_a_bootstrap_stderr_flood_does_not_wedge_the_spawn(tmp_path: Path) -> No
 
     NOT below the boot-frame WRITE, which is what this said first and is measurably wrong: starting
     the drain immediately after the write does NOT wedge, because the parent then blocks on the reply
-    while the drain is already running (ADR 0166 records the measurement). A falsification that does
+    while the drain is already running (ADR 0176 records the measurement). A falsification that does
     not falsify is worse than none -- it reads as a checked escape hatch, and the one person who
     follows it concludes the guard is untestable rather than that the instruction was wrong."""
     (tmp_path / "graph.py").write_text(_FLOOD_GRAPH, encoding="utf-8")
@@ -1334,7 +1334,7 @@ def test_a_bootstrap_stderr_flood_does_not_wedge_the_spawn(tmp_path: Path) -> No
 
 
 def test_the_relay_thread_ends_when_the_worker_tree_is_reaped(tmp_path: Path) -> None:
-    """A second drain thread is a second teardown obligation (ADR 0166), and it is EOF-driven.
+    """A second drain thread is a second teardown obligation (ADR 0176), and it is EOF-driven.
 
     Reuses the orphan graph so a GRANDCHILD also holds fd 2 -- which is the case the EOF argument
     actually rests on, since the immediate worker dying is not enough to close a pipe another process
@@ -1437,7 +1437,7 @@ def test_the_line_cap_bounds_a_record_without_discarding_a_byte(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     """The cap is a MEMORY bound on the parent, never a redaction -- which is what distinguishes it
-    from the per-line byte cap ADR 0166 rejected. Reaching it splits one write across several records
+    from the per-line byte cap ADR 0176 rejected. Reaching it splits one write across several records
     and discards nothing. (The rejected cap would have kept MSH and PID and thrown the rest away: the
     worst available redaction for an HL7 v2 payload, since that is precisely the identifying part.)"""
     caplog.set_level(logging.DEBUG)

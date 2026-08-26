@@ -25,7 +25,7 @@ direction, in either process.
    answers the call it made.
 
 stdout is the binary IPC channel — **nothing else may write to it**, and :func:`_redirect_stdout_to_stderr`
-states that intent by pointing ``sys.stdout`` at stderr for the rest of the process (ADR 0166). Logging
+states that intent by pointing ``sys.stdout`` at stderr for the rest of the process (ADR 0176). Logging
 and any diagnostics go to stderr — which the parent CAPTURES and relays, attributed, with content
 confined below INFO — through the **same PHI-redaction + control-char-scrub filter chain the engine
 installs on its own handlers** (:func:`~messagefoundry.logging_setup.configure_stderr_logging`), so a

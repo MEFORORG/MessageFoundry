@@ -113,7 +113,7 @@ def scrub_control_chars(text: str) -> str:
     record on a configured handler; a caller that assembles a record's content from an untrusted BYTE
     stream needs it at the point of assembly, because "one peer write is one log record" is that
     caller's own framing contract and cannot depend on how the host process configured logging — today
-    the ADR 0166 sandbox stderr relay. Idempotent: the escaped forms contain no control characters."""
+    the ADR 0176 sandbox stderr relay. Idempotent: the escaped forms contain no control characters."""
     return text.translate(_CTRL_TRANSLATION)
 
 
@@ -520,7 +520,7 @@ def configure_stderr_logging(level: int = logging.WARNING) -> logging.Handler:
     redaction here is a property of the **handler**, not of the logger or the call site (see
     :func:`_install_phi_filters`), so a child that builds its own handler builds an unfiltered one
     unless it asks for the chain: its records would reach the stderr the parent captures and relays
-    (ADR 0166) with neither PHI redaction nor CR/LF neutralization (BACKLOG #1054). Every process that
+    (ADR 0176) with neither PHI redaction nor CR/LF neutralization (BACKLOG #1054). Every process that
     logs installs the chain, or it does not have it.
 
     The text formatter is the shared one, so a child line is byte-compatible with the parent's and

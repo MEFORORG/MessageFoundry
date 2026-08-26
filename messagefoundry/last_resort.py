@@ -70,7 +70,7 @@ def _thread_excepthook(args: threading.ExceptHookArgs) -> None:
 
     The concrete engine threads include **at least** the sandbox session's two per-worker daemon
     drains — the raw stdout frame reader (``SandboxSession._reader_loop``) and the stderr relay
-    (``_StderrRelay.run``, ADR 0166) — each of whose ``except`` clauses catches only ``OSError`` by
+    (``_StderrRelay.run``, ADR 0176) — each of whose ``except`` clauses catches only ``OSError`` by
     design; anything else escapes ``run()`` and lands here, and the bytes either one was mid-read on
     are message-derived. Both threads are named for their pipe, their inbound and their worker
     generation, so ``args.thread.name`` below identifies which one died. ``SystemExit`` is ignored as the

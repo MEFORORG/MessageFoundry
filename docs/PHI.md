@@ -1037,7 +1037,7 @@ docstrings link here rather than restate it. Two independent mechanisms cover it
   Router/Handler code, or by a library it pulls, is redacted and CR/LF-scrubbed at the source.
   Redaction is a property of the **handler**, so this is a second installation of the chain rather
   than something the child inherits along with a file descriptor.
-- **In the engine parent (ADR 0166, BACKLOG #343).** The child is spawned with
+- **In the engine parent (ADR 0176, BACKLOG #343).** The child is spawned with
   `stderr=subprocess.PIPE` — it no longer *inherits* stream 1's sink — and a per-worker drain thread
   turns those bytes into engine log records attributed to the inbound, the child pid and the worker
   generation. **Content is relayed at `DEBUG` and only at `DEBUG`.** At `INFO` and above the engine
@@ -1055,7 +1055,7 @@ docstrings link here rather than restate it. Two independent mechanisms cover it
   child's own `DEBUG`/`INFO` records, which the child never emitted. **A byte-cap truncation was
   rejected, not overlooked:** truncating an HL7 v2 message to its first N bytes keeps MSH and PID and
   discards the clinically bulky remainder, so it preserves precisely the most identifying part of the
-  record (ADR 0166).
+  record (ADR 0176).
 
 ---
 

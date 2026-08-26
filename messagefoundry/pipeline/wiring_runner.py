@@ -2623,7 +2623,7 @@ class RegistryRunner:
             # so the child serves exactly what mode=off would rather than its own re-read of codesets/.
             session = SandboxSession(
                 policy,
-                inbound=name,  # attributes the child's relayed stderr to this feed (ADR 0166)
+                inbound=name,  # attributes the child's relayed stderr to this feed (ADR 0176)
                 config_dir=cfg_dir,
                 env=env,
                 code_sets=self.registry.code_sets,

@@ -58,7 +58,7 @@ def test_sandbox_worker_child_logs_redacted_and_scrubbed_to_stderr() -> None:
 
 
 def test_the_stdout_rebind_sits_between_the_frame_capture_and_the_boot_read() -> None:
-    """ADR 0166 D3 is a SOURCE-ORDER property, so it needs a source-order instrument (SDS-3.8).
+    """ADR 0176 D3 is a SOURCE-ORDER property, so it needs a source-order instrument (SDS-3.8).
 
     ``_redirect_stdout_to_stderr()`` must run AFTER ``main`` captures ``sys.stdout.buffer`` -- at module
     scope that capture would resolve to fd 2 and every MFW2 frame would go to the wrong pipe -- and
@@ -106,6 +106,6 @@ def test_the_stdout_rebind_sits_between_the_frame_capture_and_the_boot_read() ->
     boot_read = _call_line("_read_frame_bytes")
     assert capture < rebind < boot_read, (
         "the fd-1 capture / stdout rebind / boot-frame read are out of order in main(): the rebind "
-        f"must follow the capture and precede the first untrusted code, ADR 0166 D3 "
+        f"must follow the capture and precede the first untrusted code, ADR 0176 D3 "
         f"(capture line {capture}, rebind {rebind}, boot read {boot_read})"
     )

@@ -679,7 +679,7 @@ def test_the_sandbox_worker_stderr_writer_is_filtered_not_disclosed() -> None:
     stream 1's own sink outside the chain, and §7 disclosed that. It now calls
     ``configure_stderr_logging``, which installs the same three filters (BACKLOG #1054), so the
     disclosure must be gone instead. In the PARENT: the child's stderr is no longer *inherited* at all
-    (ADR 0166) — it is captured and relayed, with content gated below INFO — so §7's claim now rests on
+    (ADR 0176) — it is captured and relayed, with content gated below INFO — so §7's claim now rests on
     that gate too, and the gate is pinned here rather than only described in prose.
 
     Pinned BOTH ways, because the interesting direction is the regression: a future edit that put
@@ -693,7 +693,7 @@ def test_the_sandbox_worker_stderr_writer_is_filtered_not_disclosed() -> None:
     sandbox = (_ROOT / "messagefoundry" / "pipeline" / "sandbox.py").read_text(encoding="utf-8")
     assert "stderr=subprocess.PIPE" in sandbox, (
         "the child's stderr is no longer captured by the parent — it is inherited raw again, so §7's "
-        "'content only at DEBUG' gate does not exist. Revisit §7 and ADR 0166."
+        "'content only at DEBUG' gate does not exist. Revisit §7 and ADR 0176."
     )
     assert "isEnabledFor(logging.DEBUG)" in sandbox, (
         "the stderr relay no longer gates content on DEBUG. §7 claims the never-log-bodies rule holds "
@@ -706,7 +706,7 @@ def test_the_sandbox_worker_stderr_writer_is_filtered_not_disclosed() -> None:
         assert disclosed, (
             "the sandbox worker child emits through a bare basicConfig, whose handler carries no "
             "filters, so §7's 'three filters on every record' claim is not true at the source. The "
-            "parent's ADR 0166 relay does not cover this: relayed records ride the engine's handlers, "
+            "parent's ADR 0176 relay does not cover this: relayed records ride the engine's handlers, "
             "but a record the CHILD writes unredacted is already unredacted on the wire. Say so."
         )
         assert "in the engine process" in text, (
