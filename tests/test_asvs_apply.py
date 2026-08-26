@@ -20,7 +20,7 @@ from pathlib import Path
 
 import pytest
 
-from scripts.asvs.apply import _BANNED, main, render
+from scripts.asvs.apply import _BANNED, _introduced_banned, main, render
 
 #: A two-cell record. `5.4.3` is owner-CLOSED, mirroring the real one, because the closed-cell guards
 #: are the ones with the worst failure mode: an un-closing is invisible to every downstream check.
@@ -698,3 +698,116 @@ def test_a_declared_retirement_whose_arithmetic_agrees_is_applied(tmp_path: Path
     assert "verify_mode" not in after, "the retired anchor should be gone"
     assert "tls_cert_file" in after, "the surviving anchor must remain"
     assert "5.4.3" in after, "the untouched cell must survive byte-for-byte"
+
+
+# ------------------------------------------- carrying vs introducing a banned glyph (BACKLOG #1308)
+#
+# THE DEFECT IS UNWRITABILITY, NOT UNTIDINESS. Scanning the whole residual meant a cell whose own
+# prose already held a banned character could never be written by this tool again: every payload has
+# to carry the residual forward, so every payload re-presented the character and was refused. The
+# record went read-only through its own guard, and the only route to touching it was editing prose
+# the pass was not about.
+#
+# Every test below drives the REAL main() against a record whose LIVE residual carries U+26D4, so
+# the reassuring arm and the alarming arm differ only in what the PAYLOAD does with it.
+
+_GLYPH = "\u26d4"  # no-entry, one of the explicitly banned singles
+_OTHER_GLYPH = "\u2705"  # check mark, a DIFFERENT banned single
+
+_FIXTURE_WITH_GLYPH = FIXTURE.replace(
+    'residual = "a control exists but ships off"',
+    f'residual = "a control exists but ships off {_GLYPH} see note"',
+)
+
+
+def _record_with_glyph(tmp_path: Path) -> Path:
+    p = tmp_path / "asvs-scorecard.toml"
+    p.write_text(_FIXTURE_WITH_GLYPH, encoding="utf-8")
+    return p
+
+
+def _live_residual() -> str:
+    return f"a control exists but ships off {_GLYPH} see note"
+
+
+def test_a_residual_byte_identical_to_the_live_one_still_applies(tmp_path: Path) -> None:
+    """THE ARM THE OLD CHECK MADE IMPOSSIBLE. Carrying a glyph forward is not introducing one.
+
+    Before BACKLOG #1308 this returned 1: the payload must repeat the residual, the scan saw the
+    character, and the cell could not be rewritten at all.
+    """
+    rec = _record_with_glyph(tmp_path)
+    rc = main(
+        [
+            str(_payload(tmp_path, [_cell_111(residual=_live_residual())])),
+            "--scorecard",
+            str(rec),
+            "--apply",
+        ]
+    )
+    assert rc == 0, "a byte-identical residual must remain writable"
+
+
+def test_introducing_a_DIFFERENT_glyph_is_still_refused(tmp_path: Path) -> None:
+    """The alarming arm, over the same record. Relaxing the scan must not disarm it."""
+    rec = _record_with_glyph(tmp_path)
+    rc = main(
+        [
+            str(
+                _payload(tmp_path, [_cell_111(residual=_live_residual() + f" and {_OTHER_GLYPH}")])
+            ),
+            "--scorecard",
+            str(rec),
+            "--apply",
+        ]
+    )
+    assert rc == 1, "a glyph the record does not carry is INTRODUCED and must refuse"
+
+
+def test_adding_MORE_of_a_glyph_the_record_already_carries_is_refused(tmp_path: Path) -> None:
+    """The arm a presence test cannot see, which is why the predicate COUNTS.
+
+    A payload that adds a SECOND copy of a character the cell already had is introducing new
+    vocabulary just as surely as a new character. `is it present` answers yes either way and would
+    let this through.
+    """
+    rec = _record_with_glyph(tmp_path)
+    rc = main(
+        [
+            str(_payload(tmp_path, [_cell_111(residual=_live_residual() + f" {_GLYPH}")])),
+            "--scorecard",
+            str(rec),
+            "--apply",
+        ]
+    )
+    assert rc == 1, "a second copy is new vocabulary; counting is what catches it"
+
+
+def test_moving_a_glyph_within_the_residual_still_applies(tmp_path: Path) -> None:
+    """The count is per codepoint, not per offset, so a rewording that keeps it is writable.
+
+    This is the case that makes the item worth building: an ordinary mechanical edit to a cell whose
+    prose carries a glyph. The old scan refused it and there was no way round short of editing the
+    glyph out, which is a different act needing a different decision.
+    """
+    rec = _record_with_glyph(tmp_path)
+    rc = main(
+        [
+            str(_payload(tmp_path, [_cell_111(residual=f"{_GLYPH} moved to the front, reworded")])),
+            "--scorecard",
+            str(rec),
+            "--apply",
+        ]
+    )
+    assert rc == 0
+
+
+def test_a_glyph_in_a_cell_with_no_live_record_is_refused(tmp_path: Path) -> None:
+    """FAIL-CLOSED where there is nothing to compare against.
+
+    A cell with no live counterpart has a live count of zero for every character, so anything banned
+    in it is introduced. That is the direction to be wrong in: the comparison relaxes the scan only
+    where a record exists to relax it against.
+    """
+    assert _introduced_banned(f"brand new {_GLYPH} text", "") is not None
+    assert _introduced_banned("brand new text", "") is None
