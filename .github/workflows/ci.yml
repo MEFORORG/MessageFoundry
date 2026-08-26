@@ -1,6 +1,12 @@
 name: CI
 
 on:
+  # BACKLOG #340 step 1. INERT UNTIL A MERGE QUEUE EXISTS: with no queue configured GitHub never
+  # emits merge_group, so this workflow behaves identically today. It is added FIRST and separately
+  # because the failure mode of the reverse order is total -- enable a queue while a required
+  # context's workflow has no merge_group trigger and that check never reports in the queue, so
+  # NOTHING MERGES.
+  merge_group:
   push:
     branches: [main]
   pull_request:
