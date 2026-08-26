@@ -127,20 +127,29 @@ concrete features go in **Issues**; security vulnerabilities go through a
 Building two changes in parallel? Don't share one checkout — give each its own **git worktree**
 (`scripts\worktree\new.ps1 -Name <x>`). See [docs/WORKTREES.md](docs/WORKTREES.md).
 
-### If you use Claude Code: this repo ships two hooks
+### If you use Claude Code: what the tracked settings file actually wires
 
 [`.claude/settings.json`](.claude/settings.json) is **tracked**, so cloning this repo configures
 Claude Code, and you should read it before you trust it. It is the only tracked file under
 `.claude/`; everything else there is session state and stays ignored.
 
-- **It wires two PowerShell scripts to run automatically.**
-  [`scripts/hooks/block-blanket-git-stage.ps1`](scripts/hooks/block-blanket-git-stage.ps1) runs
-  before any git command the agent issues, and
-  [`scripts/worktree/session-context.ps1`](scripts/worktree/session-context.ps1) runs at session
-  start. Both are in-repo, reviewable, and covered by the same review as any other script here.
-- **They need PowerShell 7 (`pwsh`).** A hook that cannot start is **non-blocking** — the action
-  proceeds and you get a notice, not a refusal. So on a machine without `pwsh` the staging guard is
-  absent rather than failing loudly. Do not treat it as coverage you can rely on; the leak gate
+- **It wires one PowerShell script to run automatically**, and the count is asserted by a test
+  rather than by this sentence:
+  [`scripts/hooks/seat-declare-prompt.ps1`](scripts/hooks/seat-declare-prompt.ps1) at session
+  start. It is in-repo, reviewable, and covered by the same review as any other script here.
+- **The repo contains other hook scripts that this file does NOT wire, and the difference matters.**
+  [`scripts/worktree/session-context.ps1`](scripts/worktree/session-context.ps1) is wired at
+  **user** level by [`scripts/coord/install-coordination.ps1`](scripts/coord/install-coordination.ps1),
+  which the maintainer runs from a plain terminal — so it is live on a configured box and absent on
+  a fresh clone.
+  [`scripts/hooks/block-blanket-git-stage.ps1`](scripts/hooks/block-blanket-git-stage.ps1) is
+  **present and fully tested but wired nowhere at all**, and must not be counted as a control until
+  it is (BACKLOG #1339). `tests/test_claude_settings_contract.py` asserts that every script under
+  `scripts/hooks/` is either wired or named, with its reason, on an explicit unwired list — so this
+  paragraph cannot drift from the code without a red test.
+- **Hooks need PowerShell 7 (`pwsh`).** A hook that cannot start is **non-blocking** — the action
+  proceeds and you get a notice, not a refusal. So on a machine without `pwsh` a guard is absent
+  rather than failing loudly. Do not treat any of them as coverage you can rely on; the leak gate
   above is the control that fails closed.
 - **The deny rules cover the directory you started the agent in.** They keep `.env`, `secrets/`,
   keys and the local `*.db` store away from the agent's file tools at any depth *below that
