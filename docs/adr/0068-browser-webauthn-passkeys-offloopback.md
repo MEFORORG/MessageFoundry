@@ -317,6 +317,11 @@ advisory-only, restated).
   SYSTEM SHALL log a startup advisory naming `admin_reset_mfa` and render a legible
   "passkeys unavailable on this install" notice at reauth — never a silent loop.
   → `tests/test_webui.py::test_webauthn_extra_less_renders_notice` + `tests/test_webui.py::test_reauth_extra_less_with_credentials_renders_notice`
+- **AC-17** — IF an operator targets their OWN account on `POST /users/{user_id}/reset-mfa`, THEN
+  THE SYSTEM SHALL refuse (400) and direct them to the self-service MFA settings; cross-user reset
+  is unaffected and remains the recovery path of §2. AC-10 refuses the last-factor case on the
+  self-service paths, and this closes the third route to zero factors that reached neither.
+  → `tests/test_api_auth.py::test_admin_reset_mfa_refuses_to_target_the_caller`
 
 ## Options considered
 
