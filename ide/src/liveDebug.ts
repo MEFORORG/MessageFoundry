@@ -350,7 +350,9 @@ export function inlineValuesFor(invocations: TraceInvocation[], reveal: boolean)
     out.push({
       line: line - 1,
       after: WARNING_TEXT,
-      hover: `\`${call}\` is a live, read-only lookup — not evaluated in this offline preview.`,
+      hover:
+        `\`${call}\` is a live, read-only lookup — not evaluated in this offline preview.\n\n` +
+        "Preview the feed by stubbing this call's wrapper function (ADR 0010).",
       kind: "warning",
     });
   }
