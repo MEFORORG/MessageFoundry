@@ -6588,6 +6588,18 @@ contention; recorded in the #1095 handoff note rather than lost.
 
 ## 1100. The master test plan asserts document contradictions that were resolved before it was written
 
+> **PROGRESS 2026-08-26 (lander), NOT A CLOSURE -- this item stays OPEN.** Landed the documentation
+> half of stranded PR #433 on a fresh branch (the original ref carried an owner-armed auto-merge that
+> would have fused it to six unrelated engine commits; disarmed and split per the owner's 2026-08-26
+> ruling, ADR 0165 authorship note below). Measured directly against this landed diff, not carried
+> forward from the branch's own claim: 18 chapter files, +90/-75, matching the branch's own count
+> exactly. **WHAT IS NOT ESTABLISHED, and it is why this stays open: nobody has verified that the NINE
+> SITES THIS ITEM NAMES are among those revised.** Closing needs a pass that walks those nine sites
+> and checks each against the now-landed chapters. **Author's note, ADR 0165:** this progress note is
+> Lander-authored on the builder's behalf -- the 64 underlying commits are the builder's own verified
+> work, cherry-picked unmodified; only this ledger paragraph is mine, because ledger authorship on an
+> open item is reserved to the Dispatcher or Lander.
+>
 > 🔢 **Re-scored 2026-08-20 -> P2.** Value **5/10** · Difficulty **3/10** · _fill-in_. The stale claims are not confined to narrative: :593 is item 4 of the chapter's numbered release sign-off list (the three contradicting documents agree with the code) and :606 declares Blocks: ALERT-08, 09, 58, 67 as the chapter's only P0 with a real security consequence, so a plan executor is held on a question the code answered on 2026-08-02. Difficulty is nine content edits, each requiring the claim re-checked against code first, at least one possibly warranting deletion, with the item forbidding a scripted pass. _(was 6/10 · 3/10.)_
 >
 > **Filed 2026-08-07 - not started.** Nine sites in the master test
