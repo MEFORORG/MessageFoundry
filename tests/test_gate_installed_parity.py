@@ -314,7 +314,9 @@ def _source_rel() -> str:
     return SOURCE_GATE.relative_to(ROOT).as_posix()
 
 
-def drift_verdict(installed: str, source: str, main: str | None) -> str:
+def drift_verdict(
+    installed: str, source: str, main: str | None, rel_path: str | None = None
+) -> str:
     """WHICH copy is the odd one out, decided rather than left to the reader.
 
     The assertion below already told the reader to work out which copy was older before reinstalling,
@@ -331,6 +333,7 @@ def drift_verdict(installed: str, source: str, main: str | None) -> str:
     read. A None says so in the text -- an attribution that quietly disappears when its input is
     missing would be worse than none, because the message would read as complete.
     """
+    rel_path = _source_rel() if rel_path is None else rel_path
     if main is None:
         return (
             "ATTRIBUTION UNAVAILABLE: origin/main's copy of this file could not be read, so which "
@@ -342,7 +345,16 @@ def drift_verdict(installed: str, source: str, main: str | None) -> str:
             "Either it is behind (fetch and rebase), or it is legitimately CHANGING the gate, in "
             "which case this is expected until the change lands and is installed. DO NOT REINSTALL "
             "FROM HERE -- the installed copy is current and installing an older one downgrades it "
-            "for every session on this box."
+            "for every session on this box.\n"
+            # NAME THE FILE AND THE CONTROL, because a commit count cannot answer this. Measured
+            # 2026-08-26: an 11-commits-behind tree passes all seven of these, because the gate
+            # source did not move in those eleven. Distance is not the predicate -- whether THIS
+            # FILE moved is. A reader reaching for `git rev-list --count HEAD..origin/main` gets a
+            # number that does not decide anything, which is how a note came to record "31 commits
+            # behind" as though the number were the cause.
+            f"    THE FILE: {rel_path}\n"
+            f"    THE CONTROL, which answers it where a commit count does not:\n"
+            f"        git diff --quiet origin/main -- {rel_path}   # exit 0 = your tree matches main"
         )
     if source == main and installed != main:
         return (
@@ -657,9 +669,19 @@ def test_the_verdict_blames_the_checkout_when_the_installed_copy_matches_main() 
     """The false alarm three seats acted on. A behind checkout, or one legitimately CHANGING the gate,
     both land here -- and both must be told NOT to reinstall, because installing an older copy
     downgrades a machine-global file for every session."""
-    text = drift_verdict(installed=_MAIN, source=_CHECKOUT, main=_MAIN)
+    text = drift_verdict(installed=_MAIN, source=_CHECKOUT, main=_MAIN, rel_path="a/b/gate.ps1")
     assert "YOUR CHECKOUT IS THE ODD ONE OUT" in text
     assert "DO NOT REINSTALL" in text
+
+    # NAME THE FILE AND HAND OVER THE CONTROL THAT ACTUALLY DECIDES IT. A reader reaching for a
+    # commit count gets a number that decides nothing: an 11-commits-behind tree passes all seven of
+    # these when the gate source did not move, and a 1-behind tree reds when it did. The Cleaner's
+    # note recorded "31 commits behind" as though the number were the cause; it was the circumstance.
+    assert "a/b/gate.ps1" in text, "the verdict must name the file, not just the side"
+    assert "git diff --quiet origin/main -- a/b/gate.ps1" in text
+    assert "rev-list" not in text, (
+        "do not offer a commit count here -- it is the instrument that does not answer this question"
+    )
 
 
 def test_the_verdict_blames_the_installed_copy_when_the_checkout_matches_main() -> None:
