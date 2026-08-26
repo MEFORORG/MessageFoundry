@@ -602,7 +602,11 @@ class AuthService:
         is held to the same bar operators are. ``token_urlsafe(n)`` yields ~1.33·n chars (so length is
         guaranteed ≥ ``min_length``); the loop covers the astronomically-unlikely breach/context hit
         or an opt-in character-class requirement a given token happens to miss."""
-        length = max(16, self._policy.min_length)
+        # 24 BYTES (192 bits), not 16. token_urlsafe's argument is a byte count, and the floor is
+        # raised here rather than left at the policy minimum because min_length is a CHARACTER count
+        # -- passing it as bytes happens to be safe but ties an entropy floor to a legibility knob an
+        # operator may lower (BACKLOG #1172).
+        length = max(24, self._policy.min_length)
         for _ in range(16):
             candidate = secrets.token_urlsafe(length)
             if not self._policy.violations(candidate):

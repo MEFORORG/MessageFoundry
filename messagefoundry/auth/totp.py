@@ -57,7 +57,14 @@ _SECRET_BYTES = 20
 # Recovery codes: human-legible groups from an unambiguous alphabet (no 0/O/1/I/L confusion).
 _RECOVERY_ALPHABET = "ABCDEFGHJKMNPQRSTUVWXYZ23456789"
 _RECOVERY_GROUP_LEN = 5
-_RECOVERY_GROUPS = 3  # e.g. "K7QF2-9DMNA-3XZP4" → ~74 bits of entropy
+# SIX groups, not three. Three gave 74.31 bits per code; against the 50-code ceiling
+# `[auth].mfa_recovery_code_count` permits, an attacker needs any ONE of them, so the guessing
+# strength is 74.31 - log2(50) = 68.67 bits -- 59 bits UNDER a 128-bit floor. Six gives 148.63,
+# i.e. 142.98 after the same adjustment, clearing the floor by 15 bits (BACKLOG #1172).
+# The floor is asserted in tests/test_recovery_code_entropy.py, DERIVED from these three constants
+# and from the validator's own ceiling, so none of them can drift away from it silently.
+# e.g. "K7QF2-9DMNA-3XZP4-B8VWR-6JTCH-2YQD5"
+_RECOVERY_GROUPS = 6
 
 
 def generate_secret() -> str:
