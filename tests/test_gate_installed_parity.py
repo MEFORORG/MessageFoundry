@@ -309,6 +309,77 @@ def source_is_committed() -> bool:
     return out.returncode == 0 and not out.stdout.strip()
 
 
+def _source_rel() -> str:
+    """The gate's repo-relative posix path -- the form ``git show <ref>:<path>`` wants."""
+    return SOURCE_GATE.relative_to(ROOT).as_posix()
+
+
+def drift_verdict(installed: str, source: str, main: str | None) -> str:
+    """WHICH copy is the odd one out, decided rather than left to the reader.
+
+    The assertion below already told the reader to work out which copy was older before reinstalling,
+    and warned that installing from an older checkout DOWNGRADES a machine-global file. That warning
+    was correct and three seats skipped it anyway, because it asks for a `git log` under time pressure.
+    One of them reinstalled a gate that was already correct and left 121 worktrees ungoverned for some
+    minutes. So this computes the attribution instead of requesting it.
+
+    PURE, and separated from the git read on purpose: the verdict is what needs testing, and a test
+    that had to mutate the installed gate to reach it would be taking a machine-global file out from
+    under every concurrent session.
+
+    ``main`` is the content hash of the same path at ``origin/main``, or None when it could not be
+    read. A None says so in the text -- an attribution that quietly disappears when its input is
+    missing would be worse than none, because the message would read as complete.
+    """
+    if main is None:
+        return (
+            "ATTRIBUTION UNAVAILABLE: origin/main's copy of this file could not be read, so which "
+            "side drifted is NOT established here. Work it out by hand before acting."
+        )
+    if installed == main and source != main:
+        return (
+            "ATTRIBUTED: THE INSTALLED GATE MATCHES origin/main. YOUR CHECKOUT IS THE ODD ONE OUT. "
+            "Either it is behind (fetch and rebase), or it is legitimately CHANGING the gate, in "
+            "which case this is expected until the change lands and is installed. DO NOT REINSTALL "
+            "FROM HERE -- the installed copy is current and installing an older one downgrades it "
+            "for every session on this box."
+        )
+    if source == main and installed != main:
+        return (
+            "ATTRIBUTED: YOUR CHECKOUT MATCHES origin/main AND THE INSTALLED COPY DOES NOT. This is "
+            "the case this test exists for: the running gate is not what the repository says it "
+            "should be. Diff them, and only then reinstall from a PLAIN terminal."
+        )
+    if installed != main and source != main:
+        return (
+            "ATTRIBUTED: NEITHER COPY MATCHES origin/main. Nothing here can say which is intended, "
+            "and that is the strongest of the three readings -- treat it as unexplained until you "
+            "have diffed both against origin/main by hand."
+        )
+    # installed == source == main is not a drift at all; the assertion cannot have fired.
+    return "NO DRIFT: both copies match origin/main."
+
+
+def main_content_hash(rel_path: str) -> str | None:
+    """``content_hash`` of ``rel_path`` at ``origin/main``, or None if it cannot be read.
+
+    Returns None rather than raising: this is diagnostics attached to a failure, and turning a
+    diagnostics problem into a different failure would obscure the one being reported.
+    """
+    try:
+        out = subprocess.run(
+            ["git", "show", "origin/main:" + rel_path],
+            cwd=ROOT,
+            capture_output=True,
+            timeout=30,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if out.returncode != 0 or not out.stdout:
+        return None
+    return content_hash(out.stdout)
+
+
 def test_the_installed_gate_matches_the_committed_source() -> None:
     # Announce the target BEFORE any skip. A print after a skip never runs, and with no -rs in the pytest
     # config the reason is not shown either -- the file then renders as a bare "sss." on CI, which is the
@@ -343,6 +414,10 @@ def test_the_installed_gate_matches_the_committed_source() -> None:
         f"CONTENT DRIFT: the RUNNING gate is not this checkout's script.\n"
         f"  installed: {INSTALLED_GATE}  content={installed[:12]}\n"
         f"  source   : {SOURCE_GATE}  content={source[:12]}\n"
+        # Computed, not requested. The paragraph below already tells the reader to work out which
+        # copy is older first; that instruction is correct and was skipped three times in one day,
+        # so the answer is worked out here instead. Evaluated only when the assertion fires.
+        f"{drift_verdict(installed, source, main_content_hash(_source_rel()))}\n"
         f"Line endings are folded out of this comparison, so CRLF vs LF alone cannot have produced it. "
         f"That is the only difference the fold hides, which is NOT the same as this being a difference "
         f"in rules or logic: the fold rewrites \\r\\n and nothing else, so at least three non-rule "
@@ -566,3 +641,92 @@ def test_the_opt_in_list_only_names_tools_the_gate_actually_has() -> None:
     assert handled >= OPT_IN_TOOLS, (
         f"OPT_IN_TOOLS names {sorted(OPT_IN_TOOLS - handled)}, which the gate no longer implements"
     )
+
+
+# --- the drift attribution (BACKLOG #1367) ----------------------------------------
+#
+# Driven against the PURE verdict function with injected hashes. The alternative -- mutating the
+# installed gate to produce each case -- would take a machine-global file out from under every
+# concurrent session on this box, which is the same reasoning the negative control above gives for
+# testing its predicate directly rather than the installed copy.
+
+_INSTALLED, _CHECKOUT, _MAIN, _THIRD = "aaa", "bbb", "ccc", "ddd"
+
+
+def test_the_verdict_blames_the_checkout_when_the_installed_copy_matches_main() -> None:
+    """The false alarm three seats acted on. A behind checkout, or one legitimately CHANGING the gate,
+    both land here -- and both must be told NOT to reinstall, because installing an older copy
+    downgrades a machine-global file for every session."""
+    text = drift_verdict(installed=_MAIN, source=_CHECKOUT, main=_MAIN)
+    assert "YOUR CHECKOUT IS THE ODD ONE OUT" in text
+    assert "DO NOT REINSTALL" in text
+
+
+def test_the_verdict_blames_the_installed_copy_when_the_checkout_matches_main() -> None:
+    """The case the test exists for: the running gate is not what the repository says it should be."""
+    text = drift_verdict(installed=_INSTALLED, source=_MAIN, main=_MAIN)
+    assert "THE INSTALLED COPY DOES NOT" in text
+    assert "DO NOT REINSTALL" not in text  # here a reinstall IS the remedy, once diffed
+
+
+def test_the_verdict_refuses_to_choose_when_neither_side_matches_main() -> None:
+    text = drift_verdict(installed=_INSTALLED, source=_CHECKOUT, main=_THIRD)
+    assert "NEITHER COPY MATCHES" in text
+
+
+def test_the_verdict_says_so_rather_than_guessing_when_main_cannot_be_read() -> None:
+    """THE BRANCH MOST LIKELY TO BE DROPPED FOR TIDINESS, AND THE ONE THAT MUST NOT BE.
+
+    A missing fetch, a detached ref and a network-less runner all land here. If this degraded into
+    silently picking one of the other three readings, the message would look complete while naming a
+    culprit nothing established -- which is a worse failure than the one this attribution fixes,
+    because a computed-looking verdict is trusted more than a request to go and check.
+    """
+    text = drift_verdict(installed=_INSTALLED, source=_CHECKOUT, main=None)
+    assert "ATTRIBUTION UNAVAILABLE" in text
+    assert "NOT established" in text
+    # It must not blame either side.
+    assert "ODD ONE OUT" not in text
+    assert "THE INSTALLED COPY DOES NOT" not in text
+
+
+def test_the_verdict_branches_are_distinguishable_from_each_other() -> None:
+    """A control on the four above: they are only worth asserting if they differ. Four branches that
+    returned the same text would pass every test in this block."""
+    texts = [
+        drift_verdict(_MAIN, _CHECKOUT, _MAIN),
+        drift_verdict(_INSTALLED, _MAIN, _MAIN),
+        drift_verdict(_INSTALLED, _CHECKOUT, _THIRD),
+        drift_verdict(_INSTALLED, _CHECKOUT, None),
+    ]
+    assert len(set(texts)) == 4, f"branches collapsed: {len(set(texts))} distinct of 4"
+
+
+def test_the_failure_message_actually_carries_the_verdict(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """WIRING, not verdict. The five tests above prove ``drift_verdict`` is correct; none of them
+    proves the assertion CALLS it. A typo in the call site, or a later edit dropping the interpolation,
+    leaves every one of them green while the message loses the attribution -- which is the whole fix.
+
+    Drives the real assertion by pointing INSTALLED_GATE at a TEMPORARY copy with altered bytes. The
+    machine-global file is never read for this and never written: every PreToolUse hook on this box
+    reads that path, and a test may not take it out from under a concurrent session.
+    """
+    import tests.test_gate_installed_parity as mod
+
+    fake = tmp_path / "worktree_gate.ps1"
+    fake.write_bytes(SOURCE_GATE.read_bytes() + b"\n# drift planted by a test\n")
+    monkeypatch.setattr(mod, "INSTALLED_GATE", fake)
+
+    with pytest.raises(AssertionError) as caught:
+        mod.test_the_installed_gate_matches_the_committed_source()
+
+    text = str(caught.value)
+    assert "CONTENT DRIFT" in text, "the assertion fired but the message is not the drift message"
+    # The planted copy matches neither side, so the verdict must be one of the attributed readings --
+    # asserted as "some verdict is present", because which one depends on this checkout's distance
+    # from origin/main, and pinning that would make this test pass or fail on the tree it runs in.
+    assert any(
+        marker in text for marker in ("ATTRIBUTED:", "ATTRIBUTION UNAVAILABLE", "NO DRIFT:")
+    ), f"the failure message carries no attribution at all:\n{text[:400]}"
