@@ -70,8 +70,21 @@ _LOGON32_PROVIDER_WINNT50 = 3
 #: How long :meth:`CredentialContext.close` waits for an in-flight impersonated call to finish before
 #: it stops waiting, logs, and returns. It does NOT abort the call and it is NOT an I/O timeout: the
 #: share operation has none (only the OS redirector bounds it), so the worker thread runs to its own
-#: completion either way. What the bound buys is that a wedged share can no longer make a stop/reload
-#: wait on it — see :meth:`CredentialContext.close` for why the wait cannot simply be blocking.
+#: completion either way.
+#:
+#: WHAT THE BOUND BUYS, AND ON WHICH PATH. On the DESTINATION side it is real: ``aclose`` can be
+#: called with a delivery in flight, so the drain runs and a wedged share can no longer make that
+#: teardown wait on it.
+#:
+#: IT DOES NOT COVER AN INBOUND SOURCE, AND AN INBOUND SOURCE'S STOP IS STILL UNBOUNDED.
+#: ``FileSource.stop`` awaits ``asyncio.gather(self._task, ...)`` with no cancel and no timeout
+#: (``file.py:520``) and only reaches ``close`` afterwards (``:525``). The poll task is inside
+#: ``_run_fs``, which is this context's ``run``, so on a wedged share that gather never returns,
+#: ``close`` is never reached, and ``_inflight`` is therefore always zero by the time it is. The
+#: drain below and its warning are UNREACHABLE on that path. Making them reachable means
+#: cancelling the poll task or bounding the gather, which is a behaviour change and not this one.
+#:
+#: See :meth:`CredentialContext.close` for why the wait cannot simply be blocking.
 _CLOSE_DRAIN_TIMEOUT_S = 5.0
 
 #: Poll interval for that drain. Small enough that the ordinary case (a call that finishes in
