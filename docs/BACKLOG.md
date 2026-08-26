@@ -10895,14 +10895,19 @@ gate is the wrong shape, validation of the walk is the right one.
 
 ## 1215. ADR 0161 and `mail-drain.ps1` describe the pre-wiring channel, and the script contradicts itself about markers
 
-> **PARTIAL 2026-08-26 (lander), NOT A CLOSURE -- this item stays OPEN.** Corrects two of the false
-> claims `mail-drain.ps1` carries: the "THIS DOES NOT WIRE ANYTHING" paragraph (the same commit that
-> added it also introduced the `install-coordination.ps1` rows wiring both events, so the claim was
-> false in the commit that made it) and the marker-gates-a-consume paragraph (inverted twice; the
-> shipped guard skips the marker check entirely when consuming, so a marker suppresses a re-display
-> and nothing else). **What is NOT done: ADR 0161's own status line and "what gates wiring" section,
-> plus one line-258 inline comment in the same script** -- coordinated live with the builder holding
-> that half (disjoint from this change, confirmed before landing), landing separately.
+> **PARTIAL 2026-08-26 (lander), NOT A CLOSURE -- this item stays OPEN, one limb of at least four.**
+> The item names four defects. **Two land here**, in `mail-drain.ps1`: the "THIS DOES NOT WIRE
+> ANYTHING" paragraph (the same commit that added it also introduced the
+> `install-coordination.ps1` rows wiring both events, so the claim was false in the commit that made
+> it) and the marker-gates-a-consume paragraph (inverted twice; the shipped guard skips the marker
+> check entirely when consuming, so a marker suppresses a re-display and nothing else). **A third
+> already landed separately, on `main` before this PR**: PR #604 (`871f146ae`) fixed ADR 0161's own
+> status line, its "Status and what gates wiring" section, and the line-258 inline comment --
+> coordinated live with the builder holding that half, confirmed disjoint before either landed.
+> **A fourth is still open and neither PR touches it**: `docs/adr/0161-*.md` still carries one
+> warning-glyph (⚠️) at the line the item cites, verified present on `main` directly before writing
+> this note. Do not read the item as closed once this PR and #604 are both counted -- one named
+> defect survives both.
 
 > 🔢 **Re-scored 2026-08-20 -> P3.** Value **4/10** · Difficulty **1/10** · _fill-in_. The inverted marker model is rewritten, leaving two false status claims and one glyph. Value stays 4 because the remainder is the same trap class rather than a milder one: ADR 0161's Status line and its Status section agree with mail-drain.ps1's header that nothing is wired, so a reader who re-reads either document has the error confirmed, and only reading install-coordination.ps1:278-279 or the ADR's own contradicting checklist at :405-408 falsifies it. Difficulty 1 because the remainder is edits to two documentation surfaces with no code and no test. _(was 4/10 · 2/10.)_
 >
