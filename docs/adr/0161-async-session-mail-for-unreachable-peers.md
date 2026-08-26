@@ -3,7 +3,10 @@
 
 # ADR 0161 — Async session mail for unreachable peers
 
-- **Status:** Proposed (2026-08-05) — the code is a **prototype and is deliberately NOT WIRED**; see §"Status and what gates wiring"
+- **Status:** Proposed (2026-08-05) — **but the code IS WIRED AND LIVE** as of 2026-08-25 (BACKLOG
+  #1215); the "deliberately not wired" claim this line used to carry was false. Whether the
+  disposition should move off `Proposed` is an owner call and is deliberately NOT made here. See
+  §"Status and what gates wiring"
 - **Date:** 2026-08-05
 - **Related:** [BACKLOG #1028](../BACKLOG.md) · [SESSION-MAIL.md](../SESSION-MAIL.md) (the operator-facing document) · [ADR 0158](0158-silent-controls-green-signals-that-mean-nothing-and-shape-over-detection.md) (silent controls — a green signal that means nothing) · [ADR 0160](0160-public-repo-content-policy-operator-and-security-review-material-only.md) (what belongs in the public repo) · [CLAUDE.md](../../CLAUDE.md) §5 (worktrees, git discipline), §9 (PHI), §11 (state a load-bearing fact once; no glyphs) · [PHI.md](../PHI.md)
 
@@ -331,6 +334,25 @@ the realtime channel (D2).
 
 ## Status and what gates wiring
 
+> **CORRECTED 2026-08-25 (BACKLOG #1215). THE PARAGRAPH BELOW WAS TRUE WHEN WRITTEN AND IS NOW
+> FALSE.** It is kept rather than deleted because the *gating* argument still stands and a reader
+> needs to see what changed. **The drain is wired and live.** Measured three ways, each failing
+> differently:
+>
+> 1. **Source.** `scripts/coord/install-coordination.ps1` carries drain rows for `SessionStart` and
+>    `Stop` — the same rows the paragraph says "stay exactly as they are".
+> 2. **Installed state.** TWO installed config roots carry `scripts/hooks/mail-drain.ps1`, each at
+>    **both** `SessionStart` and `Stop`. So a config root HAS been installed from them.
+> 3. **Observed.** The drain fired during a real session on 2026-08-25 and reported on that session's
+>    own inbox by path. That is the channel running, not a description of it.
+>
+> The sentence that misleads is *"nothing is live in any session"*. A reader checking whether this
+> mechanism can affect them gets a definitive no from an ADR, while the hook is executing on every
+> session start and stop. **What remains accurate:** wiring was meant to be a separate,
+> owner-approved step gated on [BACKLOG #1028](../BACKLOG.md), and nothing here records that approval
+> — so the open question is not whether it is wired but whether it was wired through the gate this
+> ADR describes.
+
 This ADR is `Proposed`, and the code it describes is a **prototype that is deliberately not wired**.
 The rows for the drain hook exist in `scripts/coord/install-coordination.ps1` and stay exactly as
 they are; no config root has been installed from them, so nothing is live in any session. Wiring is a
@@ -396,7 +418,15 @@ Two results, and the second is the one that matters:
       row pointing at it. The only other occurrence in SESSION-MAIL.md is an internal link back to
       that section, which is the shape this box asks for rather than a second statement.
 - [x] Owner decision on whether the urgent `asyncRewake` tier is wired at all, given D11.
-      **DECIDED 2026-08-06: NOT WIRED, and not rebuilt yet.** The default tier has never delivered
+      **DECIDED 2026-08-06: NOT WIRED, and not rebuilt yet.**
+      > **THE SHIPPED STATE CONTRADICTS THIS DECISION (measured 2026-08-25, BACKLOG #1215).**
+      > `scripts/hooks/mail-watch.ps1` is wired at `Stop` in TWO installed config roots, and
+      > `install-coordination.ps1:305` carries a row for it (`Marker = $WAKE_MARKER`, `Async = $true`)
+      > -- so both halves of the sibling claim in [SESSION-MAIL.md](../SESSION-MAIL.md) ("the tier is
+      > not wired and is not in the installer's wiring table") are false too. **This is a recorded
+      > owner decision, so it is NOT re-decided here:** either the decision changed and the record did
+      > not, or the tier was wired without it. Which of those it is, and what the record should say,
+      > is the owner's to settle. The default tier has never delivered
       mail in real use -- everything to date is rig-verified and the code is unmerged -- so building a
       second tier to cut a latency nobody has measured is a demand-gate item, not a gap. The rebuild
       path is recorded in [SESSION-MAIL.md](../SESSION-MAIL.md) so it is not rediscovered: arm on
