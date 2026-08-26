@@ -67,7 +67,12 @@ param(
     # than losing it. See docs/SESSION-DRIFT-CONTROLS.md.
     [switch]$EnterWorktreeGate,
     # Config dirs to wire the hook into. Default: ~/.claude plus every existing ~/.claude-account-*.
-    [string[]]$ConfigDir
+    [string[]]$ConfigDir,
+    # Refuse to overwrite the installed gate when its content does not match the receipt this
+    # installer last wrote -- i.e. when SOMETHING ELSE wrote it. Off by default, because the common
+    # case is a first install or a legitimate upgrade and refusing those would make the installer
+    # unusable; on, it preserves the unattributable bytes for inspection instead of destroying them.
+    [switch]$RefuseOnMismatch
 )
 
 $ErrorActionPreference = "Stop"
@@ -438,7 +443,68 @@ $resolved = foreach ($r in $Repo) {
 }
 
 New-Item -ItemType Directory -Force -Path $HooksDir | Out-Null
-Copy-Item -LiteralPath (Join-Path $RepoRoot "scripts\hooks\worktree_gate.ps1") -Destination $GateDst -Force
+
+# A WRITE TO A MACHINE-GLOBAL SAFETY CONTROL NOW LEAVES A RECORD (BACKLOG #1247). The bare Copy-Item
+# this replaces left four separate ways to attribute a change, and none of them existed: no backup of
+# the overwritten bytes, no receipt, no log line, and Copy-Item PRESERVES THE SOURCE mtime -- so the
+# installed file's timestamp described a checkout rather than the install, which is worse than no
+# timestamp because it reads as one.
+$GateSrc     = Join-Path $RepoRoot "scripts\hooks\worktree_gate.ps1"
+$ReceiptPath = "$GateDst.receipt.json"
+
+# The hash BEING REPLACED, captured before anything is written. Null on a first install.
+$hashBefore = Get-GateHash $GateDst
+
+# Get-GateHash, NOT Get-FileHash and NOT a second basis of my own: it folds CRLF on bytes, and its
+# own comment records that a byte-exact digest made every Windows checkout read as STALE while
+# `git status` called the file clean. tests	est_gate_installed_parity.py uses the same function, so
+# the receipt, -Status and the test cannot disagree about one file.
+$hashSource = Get-GateHash $GateSrc
+
+# DID SOMETHING ELSE WRITE THIS? Only answerable against a receipt we previously wrote. A mismatch is
+# not proof of tampering -- an older installer, a hand-copy or a legitimate out-of-band fix all look
+# the same -- so the default RECORDS it and only -RefuseOnMismatch stops.
+$priorReceipt = $null
+if (Test-Path -LiteralPath $ReceiptPath) {
+    try { $priorReceipt = Get-Content -LiteralPath $ReceiptPath -Raw | ConvertFrom-Json } catch { $priorReceipt = $null }
+}
+$unattributed = $null -ne $priorReceipt -and $null -ne $hashBefore -and $priorReceipt.content_hash -ne $hashBefore
+if ($unattributed) {
+    $msg = "the installed gate does not match the receipt this installer last wrote: receipt says " +
+           "$($priorReceipt.content_hash), on disk is $hashBefore. Something else wrote it."
+    if ($RefuseOnMismatch) {
+        throw "$msg Refusing (-RefuseOnMismatch). The bytes are preserved; diff them before re-installing."
+    }
+    Write-Warning "$msg Overwriting; the replaced hash is recorded in the receipt."
+}
+
+# BACKUP FIRST. Nothing preserved the overwritten bytes, and this is the only copy of whatever a
+# previous unattributed write left behind.
+if (Test-Path -LiteralPath $GateDst) { Copy-Item -LiteralPath $GateDst "$GateDst.bak" -Force }
+
+Copy-Item -LiteralPath $GateSrc -Destination $GateDst -Force
+
+# THE REAL WRITE TIME. Copy-Item carries the SOURCE mtime across, so without this the installed file
+# claims the checkout's timestamp. The row this closes records that inherited mtime carrying a true
+# finding into retraction.
+$writtenAt = [DateTime]::UtcNow
+(Get-Item -LiteralPath $GateDst).LastWriteTimeUtc = $writtenAt
+
+$srcCommit = (& git -C $RepoRoot rev-parse HEAD 2>$null)
+$srcBlob   = (& git -C $RepoRoot rev-parse "HEAD:scripts/hooks/worktree_gate.ps1" 2>$null)
+[ordered]@{
+    schema         = 1
+    written_at_utc = $writtenAt.ToString("o")
+    content_hash   = Get-GateHash $GateDst
+    hash_replaced  = $hashBefore
+    # Whether the bytes we just overwrote were ones THIS installer put there. False means a previous
+    # write is unattributed -- the exact question nobody could answer when this item was filed.
+    replaced_ours  = $null -eq $hashBefore -or (-not $unattributed)
+    source_repo    = $RepoRoot
+    source_commit  = if ($srcCommit) { $srcCommit.Trim() } else { $null }
+    source_blob    = if ($srcBlob) { $srcBlob.Trim() } else { $null }
+    installer      = $PSCommandPath
+} | ConvertTo-Json | Set-Content -LiteralPath $ReceiptPath -Encoding utf8
 
 @(
     "# Primary checkouts governed by the worktree gate (scripts\hooks\worktree_gate.ps1)."

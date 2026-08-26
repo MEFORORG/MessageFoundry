@@ -573,3 +573,98 @@ def test_one_wired_matcher_is_membership_not_a_substring_search(tmp_path: Path) 
     # The contrast that localises it: same dir, same single matcher, but not a substring of it.
     assert "MultiEdit" in unwired, f"MultiEdit is not wired here either:\n{out}"
     assert "NotebookEdit" not in unwired, f"NotebookEdit IS wired here:\n{out}"
+
+
+# ------------------------------------------------------- the install receipt (BACKLOG #1247)
+#
+# STRUCTURAL, AND THAT IS FORCED RATHER THAN CHOSEN. install-gate.ps1 REFUSES to run when
+# ``$env:CLAUDECODE`` is set -- "a session that can install its own gate can uninstall it" -- so the
+# write path cannot be executed from a test session at all, in a sandboxed HOME or otherwise.
+# Unsetting that variable to reach the code would be defeating the control the file exists to be.
+# `_status_against` above works only because ``-Status`` sits ABOVE that refusal and writes nothing.
+#
+# So these read the writer the way the wiring tests above read it, and each pins ONE of the four
+# mechanisms BACKLOG #1247 found absent, so removing any one of them reds a named test rather than
+# quietly restoring the gap.
+
+
+def _installer_src() -> str:
+    return INSTALLER.read_text(encoding="utf-8")
+
+
+def test_the_gate_install_backs_up_the_bytes_it_overwrites() -> None:
+    """Mechanism 1 of 4. Nothing preserved the overwritten bytes, and on an unattributed write those
+    are the only copy of what was there."""
+    src = _installer_src()
+    assert '$GateDst "$GateDst.bak"' in src, (
+        "the gate install no longer backs up the file it replaces; an unattributed write is then "
+        "unrecoverable as well as unattributable"
+    )
+
+
+def test_the_gate_install_writes_a_receipt_carrying_both_hashes() -> None:
+    """Mechanism 2 of 4, and the hash REPLACED is the half that answers 'who wrote this'."""
+    src = _installer_src()
+    assert "$ReceiptPath" in src, "install-gate.ps1 writes no receipt"
+    for field in (
+        "content_hash",
+        "hash_replaced",
+        "replaced_ours",
+        "written_at_utc",
+        "source_commit",
+    ):
+        assert field in src, f"the install receipt no longer records {field!r}"
+
+
+def test_the_receipt_hashes_on_the_same_basis_as_status_and_the_parity_test() -> None:
+    """A SECOND hashing basis is the defect this file already fixed once.
+
+    ``Get-GateHash`` folds CRLF on bytes because a byte-exact digest made every Windows checkout read
+    as STALE while ``git status`` called the file clean -- and the printed remedy was a re-install,
+    which DOWNGRADES a machine-global control. A receipt hashing with ``Get-FileHash`` would
+    reintroduce exactly that, one instrument over.
+    """
+    src = _installer_src()
+    start = src.index("$ReceiptPath")
+    end = src.index("Set-Content -LiteralPath $ReceiptPath", start)
+    region = src[start:end]
+
+    # CODE lines only. Both occurrences of "Get-FileHash" in this installer sit in COMMENTS -- one in
+    # Get-GateHash's own rationale, one in the receipt's comment saying "Get-GateHash, NOT
+    # Get-FileHash". The first draft of this test searched the raw text and MATCHED ITS OWN
+    # DISCLAIMER, failing on a file that was correct. A string search cannot see whether a name is
+    # being CALLED or being RULED OUT, and the mention most likely to appear is the one ruling it out.
+    code_lines = [ln for ln in region.splitlines() if not ln.lstrip().startswith("#")]
+
+    assert any("Get-GateHash" in ln for ln in code_lines), (
+        "the receipt does not use the shared content hash"
+    )
+    assert not any("Get-FileHash" in ln for ln in code_lines), (
+        "the receipt CALLS Get-FileHash: a byte-exact digest disagrees with -Status and with "
+        "test_gate_installed_parity.py on any CRLF checkout"
+    )
+
+
+def test_the_installed_gate_carries_the_install_time_not_the_sources() -> None:
+    """Mechanism 4 of 4, and the one that is worse than absent.
+
+    ``Copy-Item`` carries the SOURCE mtime across, so without an explicit stamp the installed file
+    reports the checkout's timestamp as though it were the install's. #1247 records that inherited
+    mtime carrying a true finding into retraction.
+    """
+    assert "LastWriteTimeUtc = $writtenAt" in _installer_src(), (
+        "the install no longer stamps the real write time; Copy-Item leaves the source's mtime, "
+        "which reads as an install time and is not one"
+    )
+
+
+def test_a_mismatch_against_the_receipt_can_refuse_rather_than_overwrite() -> None:
+    """The flag exists AND defaults off. Refusing by default would make first installs and ordinary
+    upgrades fail, so the default records the replaced hash and only the flag stops."""
+    src = _installer_src()
+    assert "[switch]$RefuseOnMismatch" in src, "no refuse-on-mismatch flag"
+    assert "if ($RefuseOnMismatch)" in src, "the flag is declared but never consulted"
+    assert "Write-Warning" in src, (
+        "without the warning branch a mismatch would be silent when the flag is off, which is the "
+        "unattributable-write case this item was filed for"
+    )
