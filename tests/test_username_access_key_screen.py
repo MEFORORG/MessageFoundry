@@ -36,6 +36,7 @@ from __future__ import annotations
 import subprocess
 import sys
 from pathlib import Path
+from types import ModuleType
 
 ROOT = Path(__file__).resolve().parents[1]
 SCREEN = ROOT / "scripts" / "quality" / "username_access_key_screen.py"
@@ -248,4 +249,91 @@ def test_the_screen_is_wired_in_BOTH_places_like_its_sibling() -> None:
     assert "username_access_key_screen" in pre, "not wired into pre-commit"
     assert "--baseline" in ci and "--baseline" in pre, (
         "wired WITHOUT --baseline, which installs a step that can never fail"
+    )
+
+
+# ---------------------------------------------------------------------------------------------
+# BACKLOG #1226, THE PROOF CLAUSE. The screen can be silently narrowed to nothing, and every
+# assertion above stays GREEN while it happens.
+#
+# MEASURED, not reasoned. Move "uploader" from ACCESS_KEY_NAMES into LABEL_NAMES -- a one-line
+# edit that looks like reclassifying a field -- and:
+#     the suite                         10 passed, unchanged
+#     the live report      8 candidates -> 7,  excluded 80 -> 81
+#     app.py save(uploader=...)         DISAPPEARS from the report
+# The uploads site stops being surfaced for judgement and is silently recorded as
+# "excluded as correct" instead. Nothing reds. That is the defect this clause closes.
+#
+# A DISJOINTNESS TEST DOES NOT CATCH IT, which is the trap worth naming: the mutation REMOVES the
+# name from one set and ADDS it to the other, so the two stay disjoint throughout. Membership has
+# to be PINNED, the same device `test_the_pinned_list_has_not_silently_shrunk` uses in
+# tests/test_private_paths_stay_ignored.py.
+# ---------------------------------------------------------------------------------------------
+
+
+def _load_screen() -> ModuleType:
+    """Import the screen as a module so its constants can be asserted on directly.
+
+    It lives under scripts/ rather than in an installed package, so it is loaded by path -- the
+    same device tests/test_scan_forbidden.py uses for the leak scanner.
+    """
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location("username_access_key_screen", SCREEN)
+    assert spec is not None and spec.loader is not None
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+#: Access-key names whose REMOVAL would empty part of the report. Pinned rather than derived: this
+#: list existing is the point, and a name leaving it must be a reviewed edit rather than a side
+#: effect of reclassifying a field. "at least these" -- adding is free, removing must red.
+_PINNED_ACCESS_KEY_NAMES = frozenset({"owner", "uploader", "user", "key"})
+
+
+def test_the_access_key_names_have_not_silently_shrunk() -> None:
+    screen = _load_screen()
+    missing = _PINNED_ACCESS_KEY_NAMES - screen.ACCESS_KEY_NAMES
+    assert not missing, (
+        f"{sorted(missing)} left ACCESS_KEY_NAMES. Each one is a shape that scopes a RESOURCE by "
+        "username -- the class this screen exists for. Removing one narrows the report with no "
+        "other signal: the suite stays green and the sites it covered are recorded as excluded."
+    )
+
+
+def test_no_access_key_name_is_also_an_audit_label() -> None:
+    """The two sets must not overlap, and this is the WEAKER of the two guards on purpose.
+
+    It cannot catch the measured mutation -- moving a name from one set to the other keeps them
+    disjoint. It catches the sloppier edit that adds a name to LABEL_NAMES without removing it,
+    where the exclusion would silently win.
+    """
+    screen = _load_screen()
+    both = screen.ACCESS_KEY_NAMES & screen.LABEL_NAMES
+    assert not both, (
+        f"{sorted(both)} is in BOTH ACCESS_KEY_NAMES and LABEL_NAMES. The exclusion wins, so those "
+        "sites vanish from the report while the name still reads as covered."
+    )
+
+
+def test_the_uploads_site_stays_REVIEWABLE_rather_than_absent() -> None:
+    """THE PROOF CLAUSE ITSELF, and it is deliberately about the REPORT, not about the sets.
+
+    The item's requirement is that the uploads report stay reviewable -- each hit adjudicated as
+    correctly-keyed rather than ABSENT. `save(uploader=...)` in api/app.py is the site that carries
+    that: `uploader=identity.username` may well be correct code (a sibling `uploader_id` can carry
+    the key), and this test does NOT assert it is a defect. It asserts the reader still gets to see
+    it and decide.
+
+    Asserted on the SHIPPED SCREEN's output rather than on its constants, so ANY narrowing that
+    removes the site reds here -- a set edit, a rule change, a scope change. The two set-level tests
+    above cover one route each; this covers the outcome regardless of route.
+    """
+    proc = run()
+    assert proc.returncode == 0, proc.stderr
+    assert "save(uploader=...)" in proc.stdout, (
+        "the uploads site is no longer surfaced for judgement. The screen has gone quiet on the "
+        "shape BACKLOG #1226 is about, and being absent from the report is indistinguishable from "
+        f"having been adjudicated correct.\n{proc.stdout}"
     )
