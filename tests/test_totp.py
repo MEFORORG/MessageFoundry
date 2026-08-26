@@ -110,7 +110,13 @@ def test_recovery_codes_count_format_and_uniqueness() -> None:
     assert len(set(codes)) == 10  # no collisions
     for code in codes:
         groups = code.split("-")
-        assert len(groups) == 3
-        assert all(len(g) == 5 for g in groups)
+        # DERIVED from the constants, not transcribed. These three assertions carried the literals
+        # 3, 5 and the alphabet until BACKLOG #1172 raised the group count -- at which point the
+        # test failed for describing the old shape rather than for anything being wrong. A test that
+        # transcribes a constant goes stale the first time the constant is right to change.
+        # Whether the values are ADEQUATE is a separate question, asserted as an entropy floor in
+        # tests/test_recovery_code_entropy.py.
+        assert len(groups) == totp._RECOVERY_GROUPS
+        assert all(len(g) == totp._RECOVERY_GROUP_LEN for g in groups)
         # Drawn from the unambiguous alphabet only (no 0/O/1/I/L).
-        assert all(ch in "ABCDEFGHJKMNPQRSTUVWXYZ23456789" for g in groups for ch in g)
+        assert all(ch in totp._RECOVERY_ALPHABET for g in groups for ch in g)
