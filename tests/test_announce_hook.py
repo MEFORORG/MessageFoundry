@@ -856,9 +856,14 @@ def test_selftest_does_not_read_stdin(repo: Path, tmp_path: Path) -> None:
 
 
 def test_two_concurrent_runs_announce_once(repo: Path, tmp_path: Path) -> None:
-    """session-context.ps1 is registered TWICE on this box today and block-blanket-git-stage twice in
-    the project file, so double firing is a live pattern; lock.ps1 records PowerShell silently losing
-    4 of 8 concurrent writes."""
+    """session-context.ps1 is registered TWICE on this box today, so double firing is a live
+    pattern; lock.ps1 records PowerShell silently losing 4 of 8 concurrent writes.
+
+    CORRECTED (BACKLOG #1339): this used to add "and block-blanket-git-stage twice in the project
+    file". That is FALSE -- that script is referenced ZERO times, in the project file and in every
+    other settings file. The assertion below was never affected; only this rationale was wrong,
+    which is the harder kind to notice because nothing goes red.
+    """
     sd = tmp_path / "state"
     presence = presence_stub(tmp_path, [SELF_ROW, PEER])
     with concurrent.futures.ThreadPoolExecutor(max_workers=2) as ex:

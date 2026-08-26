@@ -302,20 +302,34 @@ python -m messagefoundry check   # exit-coded validate + dryrun, reused by git-h
 **Deterministic guardrails the model cannot bypass** — the `.claude/settings.json` deny-list and the PreToolUse hook:
 
 ```json
-// .claude/settings.json — deny-list + PreToolUse wiring (excerpt — abridged; the real file has more denies + timeout/statusMessage)
+// .claude/settings.json — deny-list (excerpt — abridged; the real file carries 27 deny rules)
 "deny": [
-  "Read(./.env)", "Read(./.env.*)", "Read(./secrets/**)",
-  "Read(./*.key)", "Read(./*.pem)", "Read(./*.pfx)", "Read(./*.db)",
-  "Edit(./secrets/**)", "Write(./secrets/**)",
+  "Read(.env)", "Read(.env.*)", "Read(secrets/**)",
+  "Read(*.key)", "Read(*.pem)", "Read(*.pfx)", "Read(*.db)",
+  "Edit(secrets/**)", "Write(secrets/**)",
   "Bash(rm -rf:*)", "Bash(git push --force:*)", "Bash(git reset --hard:*)"
-],
-"PreToolUse": [
-  { "matcher": "Bash",       "hooks": [ { "type": "command", "if": "Bash(git *)",
-    "command": "pwsh -NoProfile -File scripts/hooks/block-blanket-git-stage.ps1" } ] },
-  { "matcher": "PowerShell", "hooks": [ { "type": "command", "if": "PowerShell(git *)",
-    "command": "pwsh -NoProfile -File scripts/hooks/block-blanket-git-stage.ps1" } ] }
 ]
 ```
+
+> **THIS EXCERPT WAS WRONG IN THREE MEASURED WAYS AND A READER WHO APPLIED IT PRODUCED A
+> CONFIGURATION THIS REPO'S OWN SUITE FAILS.** Corrected 2026-08-25 under BACKLOG #1339; recorded
+> rather than silently fixed, because the failure mode is the point of SDS-3.7.
+>
+> 1. **Every deny rule was `./`-anchored** (`Read(./.env)`). Bare patterns follow gitignore
+>    semantics and match at **any depth**; the `./` form matches one directory and is strictly
+>    narrower, which is the worst combination for a control whose whole job is to be broad.
+>    `tests/test_claude_settings_contract.py::test_no_deny_rule_uses_the_narrow_dot_anchor`
+>    asserts **zero** such rules, and the tracked file has zero of 27.
+> 2. **The hook path was bare** (`scripts/hooks/...`), which resolves against the session's working
+>    directory rather than the repo. `test_every_hook_resolves_through_the_project_dir_placeholder`
+>    requires `${CLAUDE_PROJECT_DIR}` in exec form. *(This one was not in the original report; it
+>    was found while correcting the other two.)*
+> 3. **The `"if"` key appears in 0 of 9 settings files** on this machine and is not a key this
+>    schema carries.
+>
+> **The PreToolUse block is removed rather than corrected, because it documented wiring that does
+> not exist.** `block-blanket-git-stage.ps1` is present and fully tested but is referenced by **no
+> matcher in any settings file** — see the note under the guardrail tables below.
 
 > **Transferable principle — fail-OPEN by design.** The git-staging guard blocks *blanket* staging (`git add -A`/`.`) so the human curates each commit; if the guard itself errors it lets the command **through** (fail-open) rather than wedging the workflow — a deliberate tradeoff for a *workflow* guard. (Contrast the engine's *fail-closed* bind guard for a *security* boundary.)
 
@@ -445,12 +459,32 @@ This standard governs *how* to use AI at each tier; it **does not mandate** usin
 | Claude Code primitive | Control it implements | Guardrail type | Live MEFOR file |
 |---|---|---|---|
 | `.claude/settings.json` deny-list | No secrets/keys/`*.db`/`.env` to the assistant | **Deterministic gate** | [`.claude/settings.json`](../.claude/settings.json) |
-| PreToolUse hook | Block blanket git staging (fail-open) | **Deterministic gate** | [`scripts/hooks/block-blanket-git-stage.ps1`](../scripts/hooks/block-blanket-git-stage.ps1) |
+| PreToolUse hook | Block blanket git staging (fail-open) | **PRESENT, NOT WIRED** -- see the note below this table | [`scripts/hooks/block-blanket-git-stage.ps1`](../scripts/hooks/block-blanket-git-stage.ps1) |
 | SessionStart hook | Inject worktree/branch context | **Context** | [`scripts/worktree/session-context.ps1`](../scripts/worktree/session-context.ps1) |
 | Blocking security CI | SAST/SCA/secret-scan/forbidden-content | **Deterministic gate** | [`.github/workflows/security.yml`](../.github/workflows/security.yml) |
 | `messagefoundry check` | Validate + dryrun, exit-coded | **Deterministic gate** | [`messagefoundry/checks.py`](../messagefoundry/checks.py) |
 | `CLAUDE.md` | Standing contract / invariants | **Context** | [`../CLAUDE.md`](../CLAUDE.md) |
 | Plan mode, `/code-review`, `/security-review` | Plan approval, diff review | **Advisory** (human arbitrates) | — (Claude Code feature) |
+
+> **NOTE ON THE PreToolUse ROW -- THE FILE EXISTS AND THE CONTROL DOES NOT RUN (BACKLOG #1339).**
+> `block-blanket-git-stage.ps1` is written, reviewable and thoroughly tested, and is referenced by
+> **no PreToolUse matcher in any settings file** -- measured zero across every settings file on a
+> fully configured machine, against a positive control (`collision_gate` and `worktree_gate`, wired
+> at user level by [`install-coordination.ps1`](../scripts/coord/install-coordination.ps1) and
+> [`install-gate.ps1`](../scripts/worktree/install-gate.ps1), return non-zero by the same probe).
+>
+> **The gap is not "does not reach a fresh clone" -- that was BACKLOG #327 and its fix shipped**
+> when `.claude/settings.json` became tracked. This is the different finding underneath it: nobody
+> ever added the matcher. **A control described in a table as built, that runs in no session, is a
+> compensating control resting on a false premise -- the defect SDS-3.7 names.**
+>
+> **What stops this recurring is an instrument, not this paragraph.** Three earlier prose
+> corrections on this same claim each landed a new false statement.
+> `tests/test_claude_settings_contract.py` now asserts that every script under `scripts/hooks/` is
+> either wired, or wired by a tracked installer, or named with its reason on an explicit unwired
+> list -- so the next drift is a red test rather than a sentence somebody has to notice. **Owner
+> ruling 2026-08-25: the guard IS a control and is to be wired after the quote-state splitter
+> repair** (BACKLOG #1341); this row becomes *Deterministic gate* at that point and not before.
 
 This document **owns and expands** the SDS §A.6 line — *"AI-assisted review as a compensating control"* — for the solo-maintainer **PO.2 / PW.7** deviation. The detailed record is Appendix A.6.
 
@@ -480,7 +514,7 @@ The repo's tiered-honesty taxonomy, applied to the **dev-process tooling itself*
 
 **Built (in code today):**
 
-- PreToolUse [`block-blanket-git-stage.ps1`](../scripts/hooks/block-blanket-git-stage.ps1) (Bash + PowerShell, fail-open).
+- **NOT a live control:** [`block-blanket-git-stage.ps1`](../scripts/hooks/block-blanket-git-stage.ps1) is written and fully tested but is wired by **no** PreToolUse matcher in any settings file (BACKLOG #1339). It is listed here so it is not counted twice: the file exists, the control does not run.
 - [`.claude/settings.json`](../.claude/settings.json) secrets/keys/`*.db` **path-based** deny-list + destructive-command denies.
 - Blocking security CI: bandit, semgrep ([`.semgrep/messagefoundry.yml`](../.semgrep/messagefoundry.yml)), pip-audit, gitleaks, crypto-inventory, forbidden-content ([`scripts/security/scan_forbidden.py`](../scripts/security/scan_forbidden.py)). The CycloneDX **SBOM** job is **advisory** (`continue-on-error`), not blocking.
 - **Dependency-CVE fast response (SSDF RV.2 evidence):** dependency-vulnerability metrics ([`vuln-metrics.yml`](../.github/workflows/vuln-metrics.yml)), scoped Dependabot auto-merge + supply-chain cooldown ([`dependabot-auto-merge.yml`](../.github/workflows/dependabot-auto-merge.yml)), auto lock-resync ([`dependabot-lock-resync.yml`](../.github/workflows/dependabot-lock-resync.yml)), and the adopter vulnerable-pin CI tripwire. The **`CI gate` roll-up** required check gates the conditional/matrix legs in [`ci.yml`](../.github/workflows/ci.yml). *(This is the **audit/known-CVE** posture. The distinct hallucinated/typosquatted **new-dependency-introduction** check is now built alongside it — [`new_dependency_check.py`](../scripts/security/new_dependency_check.py), a step in the same required `pip-audit` job — with a documented residual; see below.)*
@@ -565,8 +599,8 @@ MEFOR is an open-source HL7 v2.x integration engine (Python; FastAPI; SQLite/WAL
 
 | Guardrail | File | Tag |
 |---|---|---|
-| Secrets/keys/`*.db` deny-list + destructive-cmd denies; PreToolUse + SessionStart hooks | [`.claude/settings.json`](../.claude/settings.json) | Built |
-| Blanket-git-stage guard (fail-open) | [`scripts/hooks/block-blanket-git-stage.ps1`](../scripts/hooks/block-blanket-git-stage.ps1) | Built |
+| Secrets/keys/`*.db` deny-list + destructive-cmd denies; SessionStart hook | [`.claude/settings.json`](../.claude/settings.json) | Built |
+| Blanket-git-stage guard (fail-open) | [`scripts/hooks/block-blanket-git-stage.ps1`](../scripts/hooks/block-blanket-git-stage.ps1) | **Written, NOT wired** (BACKLOG #1339) |
 | Worktree context + isolation | [`scripts/worktree/session-context.ps1`](../scripts/worktree/session-context.ps1), [`new.ps1`/`remove.ps1`](../scripts/worktree/) | Built |
 | Exit-coded validate + dryrun gate | [`messagefoundry/checks.py`](../messagefoundry/checks.py) | Built |
 | Blocking SAST/SCA/secret-scan/crypto-inventory/forbidden-content (+ advisory SBOM) | [`.github/workflows/security.yml`](../.github/workflows/security.yml) | Built |
