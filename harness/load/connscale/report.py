@@ -362,6 +362,61 @@ def monotonic_pairs(
 
 
 @dataclass(frozen=True)
+class DiagnosticField:
+    """One reading emitted for DIAGNOSIS, with no band and therefore no verdict.
+
+    Deliberately separate from :class:`MonotonicPair`. A pair carries `prior`, `threshold` and an `ok`
+    flag because its metric HAS an SLO band; these fields do not. Rendering a floor for a band-less
+    field would print a threshold computed from an adjacent reading -- a number that looks measured and
+    is manufactured by the renderer. Two shapes, because there are two kinds of reading.
+    """
+
+    label: str
+    read: Callable[[ConnScaleRecord], object]
+    #: Why this field is here -- which competing explanation it separates. Emitted in the table's
+    #: preamble so a reader meeting it in a job summary knows what it is FOR, not just what it is.
+    discriminates: str
+
+
+#: The band-less readings emitted on every run (BACKLOG #1366).
+#:
+#: THESE ARE EXACTLY THE FIELDS THAT SEPARATE THE SURVIVING EXPLANATIONS for a connscale failure, which
+#: is why the set is small and named rather than "everything on the record". Without them a failure is
+#: permanently undiagnosable: the ratio says THAT something moved, and nothing says WHICH.
+#:
+#: Single definition -- the emitter and its tests both read this tuple, so a field added here is
+#: covered without editing a second list.
+DIAGNOSTIC_FIELDS: tuple[DiagnosticField, ...] = (
+    DiagnosticField(
+        "drain_seconds",
+        lambda r: r.drain_seconds,
+        "drain-tail vs reload-probe: these two separate ONLY on drain_seconds against reload_seconds",
+    ),
+    DiagnosticField(
+        "reload_seconds",
+        lambda r: r.reload_seconds,
+        "the other half of that pair; None means the reload probe did not measure this step",
+    ),
+    DiagnosticField(
+        "fd_probe_ticks",
+        lambda r: r.fd_probe_ticks,
+        "how many intervals the FD walk actually sampled -- a low count is a coarse gauge, not a fault",
+    ),
+    DiagnosticField(
+        "fd_probe_degraded_ticks",
+        lambda r: r.fd_probe_degraded_ticks,
+        "contention vs probe-cost: NON-ZERO means the walk could not measure, ZERO means it measured "
+        "cleanly and any wrong reading is a wrong SUBJECT rather than a failed sample",
+    ),
+    DiagnosticField(
+        "cpu_util_cores_mean",
+        lambda r: r.cpu_util_cores_mean,
+        "how loaded the box was across the hold, which is the input every contention story needs",
+    ),
+)
+
+
+@dataclass(frozen=True)
 class ConnScaleReport:
     profile: str
     engine_url: str
@@ -556,6 +611,79 @@ class ConnScaleReport:
             "context": dict(context or {}),
             "readings": readings,
         }
+
+    def render_diagnostics_markdown(
+        self,
+        fields: tuple[DiagnosticField, ...] = DIAGNOSTIC_FIELDS,
+        *,
+        context: dict[str, str] | None = None,
+        max_rows: int = _MAX_SUMMARY_ROWS,
+    ) -> str:
+        """The band-less diagnostic table, emitted on every run (BACKLOG #1366).
+
+        NOT a variant of :meth:`render_readings_markdown`, and the separation is the point. That one
+        renders `prior`, `band floor` and `margin` because its metric has an SLO band. ONLY
+        ``empty_claims_monotonic`` and ``fd_count_monotonic`` have one; every field here has none, so
+        those columns would be a floor computed from whichever reading happened to precede it --
+        false precision manufactured by the renderer rather than measured by anything.
+
+        So this table carries NO verdict column and NO threshold. It says what was observed and what
+        each field is FOR, and leaves the judgement to a reader who has the competing explanations in
+        front of them.
+
+        Pure: returns text, writes nothing. Row count capped for the same reason as the banded table --
+        an oversized ``$GITHUB_STEP_SUMMARY`` write is dropped in full rather than trimmed.
+        """
+        head = ["### connscale diagnostics (no band, no verdict)"]
+        ctx = {
+            "profile": self.profile,
+            "db_backend": self.db_backend or "sqlite",
+            **(context or {}),
+        }
+        head.append("")
+        head.append(" | ".join(f"{k}: {v}" for k, v in ctx.items()))
+        head.append("")
+        head.append(
+            "Recorded on every run, pass or fail. **None of these has an SLO band**, so there is no "
+            "threshold here and nothing below is a verdict -- they are the readings that separate "
+            "competing explanations for a failure (BACKLOG #1366)."
+        )
+        head.append("")
+        for f in fields:
+            head.append(f"- `{f.label}` -- {f.discriminates}")
+        head.append("")
+
+        if not self.records:
+            head.append("No record was produced by this run.")
+            return "\n".join(head) + "\n"
+
+        head.append("| lane | N | " + " | ".join(f.label for f in fields) + " |")
+        head.append("|---|---|" + "---|" * len(fields))
+
+        rows: list[str] = []
+        dropped = 0
+        for r in sorted(self.records, key=lambda r: (r.sweep_mode, r.claim_mode, r.count)):
+            if len(rows) >= max_rows:
+                dropped += 1
+                continue
+            cells = []
+            for f in fields:
+                v = f.read(r)
+                # `None` renders as an explicit dash, NEVER as 0. "the probe did not measure" and
+                # "the probe measured zero" are different verdicts and the whole point of these
+                # fields is telling them apart.
+                cells.append("-" if v is None else (f"{v:.4g}" if isinstance(v, float) else str(v)))
+            rows.append(
+                f"| {lane_label(r.sweep_mode, r.claim_mode)} | {r.count} | "
+                + " | ".join(cells)
+                + " |"
+            )
+
+        out = head + rows
+        if dropped:
+            out.append("")
+            out.append(f"{dropped} further row(s) not shown: capped at {max_rows}.")
+        return "\n".join(out) + "\n"
 
     def to_csv(self) -> str:
         """One row per (sweep_mode, N) step — for spreadsheet curve plotting."""

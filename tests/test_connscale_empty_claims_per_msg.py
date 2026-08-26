@@ -19,13 +19,16 @@ still-detects-a-real-regression property are pinned TOGETHER: neither alone is e
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import pathlib
+import re
 import warnings
 
 import pytest
 
 from harness.load.connscale.report import (
+    DIAGNOSTIC_FIELDS,
     ConnScaleRecord,
     ConnScaleReport,
     NoLoss,
@@ -37,6 +40,7 @@ from harness.load.connscale.runner import (
     _empty_claims_per_msg,
     _monotonic_slo,
 )
+from tests import test_connscale_smoke as _smoke_module
 from tests.test_connscale_smoke import (
     _DEFAULT_READINGS_PATH,
     _LOCAL_READINGS_ENV,
@@ -548,3 +552,188 @@ def test_a_failed_json_write_warns_rather_than_failing_the_run(tmp_path, monkeyp
 
     with pytest.warns(UserWarning, match="could not write connscale readings JSON"):
         _write_readings_json({"schema_version": 1})
+
+
+# --------------------------------------------------------------------------------------------------
+# BACKLOG #1366: the BAND-LESS diagnostic fields.
+#
+# The ratio says THAT something moved; these say WHICH. Drain-tail and reload-probe separate ONLY on
+# drain_seconds against reload_seconds; contention separates from probe-cost ONLY on the FD probe's
+# tick counts. Every one of these readings already existed on the record and never left the `test`
+# job, which uploads no artifacts -- so a connscale failure was undiagnosable from CI alone.
+#
+# NONE OF THEM HAS AN SLO BAND, and that is the design constraint the whole shape follows from. Only
+# empty_claims_monotonic and fd_count_monotonic have one. Rendering `prior` / `band floor` / `margin`
+# for a band-less field would print a threshold computed from whichever reading happened to precede it
+# -- false precision manufactured by the renderer. Hence a SECOND table rather than a reuse of the
+# banded one.
+# --------------------------------------------------------------------------------------------------
+
+
+def _diag(mode: str, count: int, **over: object) -> ConnScaleRecord:
+    """A record with the diagnostic fields set. Reuses `_rec` so the inert placeholders stay in one
+    place; `dataclasses.replace` works because ConnScaleRecord is frozen."""
+    base = _rec(mode, count, per_msg=10.0)
+    return dataclasses.replace(base, **over)  # type: ignore[arg-type]
+
+
+def _diag_report(*records: ConnScaleRecord) -> ConnScaleReport:
+    return ConnScaleReport(
+        profile="smoke",
+        engine_url="http://127.0.0.1:0",
+        db_backend=None,
+        shim_installed=True,
+        records=list(records),
+        slos=[],
+        result_ok=True,
+        exit_code=0,
+    )
+
+
+#: The fields this item ships, written out INDEPENDENTLY of the constant under test.
+#:
+#: THE FIRST VERSION OF THE TEST BELOW ITERATED `DIAGNOSTIC_FIELDS` AND CHECKED EACH LABEL AGAINST THE
+#: RENDERED TEXT. That is self-referential: rename a field in the set and the test looks for the NEW
+#: name, finds it, and passes. A mutation run proved it -- renaming `cpu_util_cores_mean` out of the
+#: shipped set SURVIVED. A test that reads the same constant it is testing measures nothing.
+_EXPECTED_DIAGNOSTIC_LABELS = frozenset(
+    {
+        "drain_seconds",
+        "reload_seconds",
+        "fd_probe_ticks",
+        "fd_probe_degraded_ticks",
+        "cpu_util_cores_mean",
+    }
+)
+
+
+def test_the_shipped_field_set_is_exactly_what_this_item_promises() -> None:
+    """Pinned against a LITERAL, not against the constant itself, so an add, a removal or a rename all
+    fail here and have to be made deliberately."""
+    shipped = {f.label for f in DIAGNOSTIC_FIELDS}
+    assert shipped == _EXPECTED_DIAGNOSTIC_LABELS, (
+        f"the shipped diagnostic set changed. Added: {sorted(shipped - _EXPECTED_DIAGNOSTIC_LABELS)}; "
+        f"removed: {sorted(_EXPECTED_DIAGNOSTIC_LABELS - shipped)}. That is a scope change to BACKLOG "
+        f"#1366, not a refactor -- update this literal in the same commit and say why."
+    )
+
+
+def test_every_shipped_diagnostic_field_reaches_the_table() -> None:
+    """...and each one actually renders. Checked against the LITERAL for the same reason."""
+    text = _diag_report(_diag("fixed_per_conn", 12)).render_diagnostics_markdown()
+    for label in sorted(_EXPECTED_DIAGNOSTIC_LABELS):
+        assert label in text, f"{label} never reached the table: {text}"
+
+
+def test_each_field_says_what_it_DISCRIMINATES_not_just_what_it_is() -> None:
+    """A reader meeting these in a job summary needs to know which explanation each one separates.
+    A bare column header is a number with no question attached to it."""
+    text = _diag_report(_diag("fixed_per_conn", 12)).render_diagnostics_markdown()
+    for field in DIAGNOSTIC_FIELDS:
+        assert field.discriminates in text, f"{field.label} emitted without its rationale"
+
+
+def test_THE_DISTINCTION_THAT_MATTERS_none_renders_as_a_dash_never_as_zero() -> None:
+    """ "the probe did not measure" and "the probe measured zero" are DIFFERENT VERDICTS, and telling
+    them apart is the entire point of fd_probe_degraded_ticks. A None coerced to 0 would assert a
+    clean measurement that never happened."""
+    text = _diag_report(
+        _diag("fixed_per_conn", 12, reload_seconds=None, fd_probe_degraded_ticks=0)
+    ).render_diagnostics_markdown()
+    row = next(line for line in text.splitlines() if line.startswith("| fixed_per_conn |"))
+    assert "| - |" in row, f"an unmeasured field must render as a dash: {row}"
+    assert "| 0 |" in row, f"a measured zero must still render as 0: {row}"
+
+
+def test_the_table_carries_NO_band_and_says_so() -> None:
+    """The constraint that produced a second renderer. A threshold column here would be manufactured."""
+    text = _diag_report(_diag("fixed_per_conn", 12)).render_diagnostics_markdown()
+    header = next(line for line in text.splitlines() if line.startswith("| lane | N |"))
+    for forbidden in ("prior", "band floor", "margin", "verdict"):
+        assert forbidden not in header, f"a band-less table must not carry a {forbidden!r} column"
+    # PINNED TO THE SENTENCE, NOT THE PHRASE. The first version asserted "no band" over the whole
+    # text, which the HEADING also satisfies -- so deleting the explanatory sentence SURVIVED a
+    # mutation. A substring occurring twice cannot witness the presence of either occurrence.
+    assert "None of these has an SLO band" in text, (
+        "the preamble must state IN PROSE that these fields carry no band. The heading alone is not "
+        "enough -- a reader skimming to the table needs it beside the numbers."
+    )
+
+
+def test_it_emits_on_a_PASSING_report():  # noqa: ANN201
+    """The selection-bias property, one metric family over from #1211. A field recorded only on
+    failure cannot establish its own normal range."""
+    report = _diag_report(_diag("fixed_per_conn", 12), _diag("fixed_per_conn", 24))
+    assert report.result_ok, "the test lost its own premise"
+    text = report.render_diagnostics_markdown()
+    assert text.count("| fixed_per_conn |") == 2, text
+
+
+def test_the_lane_label_is_the_SAME_definition_the_banded_table_uses() -> None:
+    """Two tables from one run must name a lane identically, or a reader diffing them chases a
+    difference in the labelling rather than in the data."""
+    recs = [_diag("fixed_per_conn", 12, claim_mode="pooled")]
+    text = _diag_report(*recs).render_diagnostics_markdown()
+    assert f"| {lane_label('fixed_per_conn', 'pooled')} |" in text
+    assert "| fixed_per_conn/pooled |" in text
+
+
+def test_a_run_with_no_records_says_so_rather_than_rendering_an_empty_table() -> None:
+    text = _diag_report().render_diagnostics_markdown()
+    assert "No record was produced" in text
+    assert "| lane | N |" not in text
+
+
+def test_a_capped_DIAGNOSTICS_table_states_what_it_dropped() -> None:
+    """Same reason as the banded table: an oversized step-summary write is dropped ENTIRELY, so a big
+    profile must lose rows -- and may not lose them silently.
+
+    NAMED DISTINCTLY FROM THE BANDED TABLE'S CAP TEST ON PURPOSE. This function first shared that
+    name, and Python silently REPLACED the earlier definition -- pytest collected one, #236's cap test
+    stopped running, and nothing reported it. The guard below now fails the file rather than the run
+    going quietly one test lighter."""
+    recs = [_diag("fixed_per_conn", n) for n in range(12, 30)]
+    text = _diag_report(*recs).render_diagnostics_markdown(max_rows=4)
+    assert "capped at 4" in text
+    assert "14 further row(s) not shown" in text
+    assert len([x for x in text.splitlines() if x.startswith("| fixed_per_conn |")]) == 4
+
+
+def test_the_fixture_emits_diagnostics_UNCONDITIONALLY_not_only_on_failure() -> None:
+    """The renderer emitting on a passing report is only half the property. The FIXTURE must call it
+    without a condition -- gating it on `result_ok` would restore exactly the selection bias #1211
+    exists to remove, and the renderer's own tests could not see that.
+
+    Scanned rather than driven: the fixture spawns engine subprocesses, so running it here would cost
+    the whole sweep to assert one call site.
+    """
+    source = pathlib.Path(_smoke_module.__file__).read_text(encoding="utf-8")
+    body = source[source.index("async def smoke_report") :]
+    call = re.search(r"^\s*_record_diagnostics\(report\)\s*$", body, re.M)
+    assert call, f"the fixture must call _record_diagnostics; body was {body[:400]!r}"
+    line = body[: call.start()].count(chr(10))
+    preceding = body.splitlines()[max(0, line - 3) : line]
+    assert not any(re.match(r"\s*(if|elif|else|try|except)\b", p) for p in preceding), (
+        f"the call must be unconditional; the three lines before it were {preceding}"
+    )
+
+
+def test_no_two_tests_in_this_file_share_a_name() -> None:
+    """A duplicate `def test_...` is SILENT: the later definition replaces the earlier, pytest collects
+    one, and the lost test leaves no error, no warning and no failing assertion. The only visible trace
+    is a collected count one lower than the number of definitions -- which nobody reads.
+
+    Caught here for real: a new cap test was given the name of an existing one, and #236's cap coverage
+    vanished. The file counted 29 definitions and ran 28.
+    """
+    source = pathlib.Path(__file__).read_text(encoding="utf-8")
+    names = re.findall(r"^def (test_[A-Za-z0-9_]+)", source, re.M)
+    duplicates = sorted({n for n in names if names.count(n) > 1})
+    assert not duplicates, (
+        f"these test names are defined more than once, so the earlier definition is silently "
+        f"discarded: {duplicates}. Rename one; do not delete either."
+    )
+    # Positive control: the scan must actually be finding tests, or the assertion above is vacuous.
+    assert len(names) > 20, (
+        f"the name scan found only {len(names)} tests; it is not reading the file"
+    )
