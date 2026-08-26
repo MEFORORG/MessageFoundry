@@ -95,13 +95,33 @@ def _operator_facing_hits(source: str) -> list[str]:
     return hits
 
 
+def _corpus() -> list[pathlib.Path]:
+    return sorted(_ENGINE.rglob("*.py"))
+
+
 def _census() -> collections.Counter[tuple[str, str]]:
     counts: collections.Counter[tuple[str, str]] = collections.Counter()
-    for path in sorted(_ENGINE.rglob("*.py")):
+    for path in _corpus():
         rel = path.relative_to(_ENGINE.parent).as_posix()
         for spelling in _operator_facing_hits(path.read_text(encoding="utf-8")):
             counts[(rel, spelling)] += 1
     return counts
+
+
+def test_the_census_examined_a_population() -> None:
+    """THE DENOMINATOR. `found 0 of 24 examined` is a reading; `found 0 of 0 examined` is a failure,
+    and the two print the same number.
+
+    Without this, a wrong ``_ENGINE`` path makes both census tests below pass over ZERO files, and the
+    positive control above does NOT catch it -- that one feeds the scanner a string and never touches
+    the tree. So a clean census and an empty census are indistinguishable, in exactly the direction
+    that reads as "nothing is wrong".
+    """
+    examined = len(_corpus())
+    assert examined > 100, (
+        f"the census examined {examined} files under {_ENGINE}; that is an empty or wrong corpus, not "
+        "a clean one, and every other assertion in this file is vacuous when it happens"
+    )
 
 
 def test_the_scanner_actually_detects_a_violation() -> None:
