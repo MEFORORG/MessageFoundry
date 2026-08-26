@@ -16328,3 +16328,38 @@ apart correctly.
 declared serialised write order on that file. Building this alongside those without agreeing an order
 first risks the exact same-file collision this project's own collision-detection conventions exist to
 catch.
+
+## 1357. The connscale FD probe cannot see a multi-process engine: PID-set re-resolution never runs
+
+> 🔢 **Filed 2026-08-25 - not started.** ***A single probe tick costs LONGER THAN THE ENTIRE MEASUREMENT WINDOW, so the PID set is resolved once per sweep step and never re-resolved -- and a multi-process engine's worker children are invisible to the FD gauge.*** **Measured: one tick costs 1419-1848 ms against `hold_seconds = 1.5`.** So `_RESOLVE_EVERY_TICKS = 8` ([`probe.py:60`](../harness/load/connscale/probe.py)) is **unreachable by construction** -- not a badly-chosen constant, a constant the window cannot afford at any cadence. Its own comment reasons at "the runner's poll cadence", which this profile does not have.
+> Verdict: build
+> Research: none
+> Closing-act: code
+
+**Cluster:** test harness / measurement. **Priority:** P2. **Verdict:** build.
+**Severity:** no product axis (sec. 0) -- this is an instrument, not shipped engine behaviour. ***The cost is that NOTHING ON THIS PROJECT CAN CURRENTLY MEASURE THE RESOURCE POSTURE OF A MULTI-PROCESS ENGINE***, which is what holds BACKLOG #1278 rather than any test failure.
+
+**THE EVIDENCE, one run, every tick traced with its cost and PID-set size:**
+
+| handles | pids | tick cost |
+|---|---|---|
+| 1266 | 8 | 1419 ms |
+| 543 | 3 | 1528 ms |
+| 7118 | 50 | 1732 ms |
+| 406 | 2 | 1483 ms |
+| 479 | 2 | 1848 ms |
+
+**The walk's PID set varies 2, 3, 8, 50 ACROSS CONSECUTIVE TICKS OF ONE RUN, and handles track it almost linearly.** So `handles_peak` is not measuring the engine's footprint -- **it is measuring how many processes the walk happened to catch.** 50 pids for a 24-inbound engine is roughly double the 25 processes the design predicts, so the walk is plausibly crediting sink or harness processes.
+
+**HOW IT SURFACES.** Flipping `[sandbox].mode` to `subprocess` spawns one worker child per inbound. `tests/test_connscale_smoke.py::test_the_fd_and_empty_claim_curves_are_monotonic_in_n` then fails **4 runs in 5**, against **0 in 5** at `mode=off` (controlled A/B, same worktree, same tests, nothing else running; Fisher exact two-tailed p = 0.0476). Under `off` the count is near-noiseless -- ~385 at N=12 rising to ~421 at N=24 -- because with no children an engine-only PID set is COMPLETE.
+
+**FOUR THINGS THIS IS NOT, each checked rather than assumed:**
+
+1. **NOT probe degradation.** `fd_probe_degraded_ticks = 0` and `fd_probe_degraded = ()` on every record, every run, both arms, including every failing run. And it could not have mattered, for a reason that runs end to end: EVERY degrade site in the probe returns through `_gap()` ([`probe.py:165`](../harness/load/connscale/probe.py)), which sets `handles=None`; and [`runner.py:1225-1226`](../harness/load/connscale/runner.py) does `if val is None: continue` **before** `v` is computed and **without updating `prev_val`**. So a degraded reading is not merely skipped -- it can never be either endpoint of a comparison. **Degradation makes this SLO pass VACUOUSLY; it cannot red it.** That is a guard which cannot fail until its trigger fires, and it is a different severity from limb A, which is wrong today. *(The `_gap()` half of this chain is the Dispatcher's reading, verified here against both files.)*
+2. **NOT the `#220` PID-set gate.** That predicate lives only in the `cpu_readings` comprehension; the FD gauge at `:1071` is a plain `max(handles)` with no PID-set predicate.
+3. **NOT [PR 598](https://github.com/MEFORORG/MessageFoundry/pull/598).** Verified by grep against its diff: it touches neither `_RESOLVE_EVERY_TICKS` nor its call sites. That fix is about re-resolution producing the wrong VERDICT when it runs; this is re-resolution NOT RUNNING. **Worse, 598's test constructs `FdSampler(os.getpid(), resolve_every=1)` explicitly, so the fixed guard PASSES against this defect** -- it proves re-resolution works when asked, and production never asks.
+4. **NOT a loose SLO tipping over.** `_MONOTONIC_TOLERANCE = 0.25`, so a red needs the larger-N reading **below 75 percent** of the smaller-N one. That is a collapse, not jitter.
+
+**A FIGURE THIS ITEM DELIBERATELY DOES NOT CARRY.** Forcing `resolve_every=1` produced readings of ~3745 handles against a ~385 baseline, which would be ~312 handles per worker child. **That number is WITHDRAWN and must not be quoted from here:** the trace above shows the denominator is not stable enough to divide by. The resource question is real and open; this item is the reason nobody can answer it yet.
+
+**Reproducer:** the per-tick trace and the A/B harness live in the filing session's scratchpad (`fdprobe_ab.py`); it reuses `test_connscale_smoke`'s own fixture setup and takes ~25 s a run. Rebuilding it is a few lines against `run_connscale`.
