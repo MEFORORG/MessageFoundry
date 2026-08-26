@@ -412,3 +412,107 @@ def test_zero_examined_still_refuses_rather_than_reporting_clean(sf_main, tmp_pa
     empty = tmp_path / "empty"
     empty.mkdir()
     assert sf_main.main(["--path", str(empty)]) == 2
+
+
+# --- security-record content: a requirement id BESIDE a verdict (BACKLOG #1337) ----------------------
+
+# THE TWO CONTROLS ARE BOTH REQUIRED AND NEITHER MAY BE DELETED WITHOUT THE OTHER.
+#
+# A screen with only the fire-case is indistinguishable from one that matches everything; a screen
+# with only the quiet-case is indistinguishable from one that matches nothing. The row filing this
+# reached BOTH failures in ten minutes while deriving the spec, which is why they are gates here
+# rather than advice.
+#
+# WHY THE DETECTOR IS A PAIR AND NOT A SHAPE. A requirement identifier and a semantic version are
+# the same shape, and this repository is full of versions. Measured over 2045 tracked files: the
+# bare dotted-triple appears 8018 times across 649 files. Proximity does not rescue it either --
+# "within 120 characters of a verdict word" still scores 1028 across 119 files, and adding an ASVS
+# context marker leaves 548 across 50, mostly the backlog's own legitimate citations. Only the tight
+# pair discriminates, and it scores ZERO over the same corpus.
+
+# THE FIXTURES ARE STORED AS PARTS AND JOINED AT RUNTIME, and that is not styling.
+# A literal `<id><sep><verdict>` written into this file IS the shape the detector hunts, so the gate
+# would fire on the test that proves the gate works -- and a control that reds CI on its own test
+# data is exactly how a control gets switched off. Keeping the identifier and the verdict as
+# separate literals means the source carries no pair, the scanner is silent on this file, and no
+# allowlist entry or reserved-placeholder exemption is needed. Both of those alternatives were
+# tried; this one leaves no standing bypass.
+_RECORD_PARTS: list[tuple[str, str, str]] = [
+    ("1.2.2", ": ", "pass"),
+    ("11.4.1", " | ", "fail"),
+    ("3.5.5", " = ", "partial"),
+    ("16.2.2", " -> ", "needs-review"),
+    ("7.5.1", " -- ", "n/a"),
+]
+# The OTHER direction, verdict first. Both arms of the detector are real code and a fixture list
+# covering only one would leave half of it unexercised while the count looked healthy.
+_RECORD_PARTS_VERDICT_FIRST: list[tuple[str, str, str]] = [
+    ("fail", ": ", "12.1.5"),
+    ("partial", " <- ", "4.2.1"),
+]
+_RECORD_CONTENT_MUST_FIRE = [f"{a}{s}{b}" for a, s, b in _RECORD_PARTS] + [
+    f"{a}{s}{b}" for a, s, b in _RECORD_PARTS_VERDICT_FIRST
+]
+
+_RECORD_CONTENT_MUST_STAY_QUIET = [
+    # Lockfile dependency versions -- the collision the whole design is shaped around.
+    "pyside6==6.11.1",
+    "ruff==0.15.22",
+    'version = "0.11.25"',
+    # A BARE CITATION is a forward reference, not an assessment, and is legitimately public. This is
+    # the exact shape of the backlog's own item titles.
+    "#1107 ASVS 1.2.2 -- apiclient path encoding and URL scheme allow-list",
+    "a bare citation: ASVS 1.2.2 applies to this module",
+    # Prose where a verdict word happens to be near a version. `pass` is unavoidable in a test repo.
+    "the suite will pass; see 1.2.2 later for the rationale",
+    "requires 3.14.6 to pass the collection step",
+]
+
+
+@pytest.mark.parametrize("line", _RECORD_CONTENT_MUST_FIRE)
+def test_a_requirement_id_beside_a_verdict_is_flagged(sf, tmp_path: Path, line: str) -> None:
+    """CONTROL 1. Without this, a screen that matches nothing looks identical to a correct one."""
+    p = tmp_path / "note.md"
+    p.write_text(f"context above\n{line}\ncontext below\n", encoding="utf-8")
+    hits = sf.scan_file(p)
+    assert any("security-record content" in h for h in hits), (
+        f"{line!r} pairs an identifier with a verdict -- that pair IS the assessment, and the "
+        f"assessment is vaulted. hits={hits}"
+    )
+
+
+@pytest.mark.parametrize("line", _RECORD_CONTENT_MUST_STAY_QUIET)
+def test_a_version_or_a_bare_citation_is_not_record_content(sf, tmp_path: Path, line: str) -> None:
+    """CONTROL 2. Without this, a screen that matches everything looks identical to a correct one.
+
+    A gate firing on ordinary text gets allowlisted into uselessness, and the pipeline keeps showing
+    a passing step while nothing is being checked.
+    """
+    p = tmp_path / "note.md"
+    p.write_text(f"context above\n{line}\ncontext below\n", encoding="utf-8")
+    hits = [h for h in sf.scan_file(p) if "security-record content" in h]
+    assert not hits, (
+        f"{line!r} is a dependency version or a bare forward citation, not an assessment. "
+        f"Flagging it is how this gate gets switched off. hits={hits}"
+    )
+
+
+def test_the_record_detector_reports_no_value(sf, tmp_path: Path) -> None:
+    """The pair IS the disclosure, so the reason must never echo it into a public CI log.
+
+    Same rule the worktree-slug and home-path detectors already follow, asserted here because this
+    detector is the one whose matched text is itself the vaulted content.
+    """
+    p = tmp_path / "note.md"
+    # Reuses a joined fixture rather than writing a second literal pair into this file. Every such
+    # literal is itself the shape the detector hunts, so one source of fixtures means one place that
+    # has to stay split.
+    identifier, sep, verdict = _RECORD_PARTS[1]
+    p.write_text(f"{identifier}{sep}{verdict}\n", encoding="utf-8")
+    hits = [h for h in sf.scan_file(p) if "security-record content" in h]
+    assert hits, "the fixture line must fire, or this asserts nothing"
+    for h in hits:
+        assert identifier not in h, f"the reason echoed the identifier it exists to keep out: {h!r}"
+        assert verdict not in h.split("security-record content")[0], (
+            f"reason leaked the verdict: {h!r}"
+        )
