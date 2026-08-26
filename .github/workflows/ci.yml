@@ -1,6 +1,12 @@
 name: CI
 
 on:
+  # BACKLOG #340 step 1. INERT UNTIL A MERGE QUEUE EXISTS: with no queue configured GitHub never
+  # emits merge_group, so this workflow behaves identically today. It is added FIRST and separately
+  # because the failure mode of the reverse order is total -- enable a queue while a required
+  # context's workflow has no merge_group trigger and that check never reports in the queue, so
+  # NOTHING MERGES.
+  merge_group:
   push:
     branches: [main]
   pull_request:
@@ -255,7 +261,7 @@ jobs:
       # PySide6's offscreen platform plugin needs a few system libraries even
       # headless. Linux-only; Windows runners need no equivalent.
       - name: Install Qt offscreen system libraries
-        if: (needs.changes.outputs.code == 'true' || github.event_name == 'push' || github.event_name == 'workflow_dispatch') && runner.os == 'Linux'
+        if: (needs.changes.outputs.code == 'true' || github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event_name == 'merge_group') && runner.os == 'Linux'
         # BOUNDED AND RETRIED. Unguarded, this step turns an external apt-mirror hiccup into a
         # blocked merge queue: measured 2026-08-18, three hangs across two attempts on three
         # different jobs, one of them 27+ minutes on `test (ubuntu-latest, py3.14)` -- a REQUIRED
@@ -290,7 +296,7 @@ jobs:
       # while each job still installs only ITS OWN extras (so windows-service-smoke's deliberately
       # narrow set stays narrow; the docker-smoke job builds from docker/locks/* and installs nothing).
       - name: Set up uv
-        if: needs.changes.outputs.code == 'true' || github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+        if: needs.changes.outputs.code == 'true' || github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event_name == 'merge_group'
         uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
         with:
           cache-dependency-glob: |
@@ -298,7 +304,7 @@ jobs:
             requirements.lock
 
       - name: Install project (dev + console + fhir + dicom + x12 + xml extras)
-        if: needs.changes.outputs.code == 'true' || github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+        if: needs.changes.outputs.code == 'true' || github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event_name == 'merge_group'
         run: |
           # [fhir] so the FHIR typed-tier tests (incl. the PHI-no-leak invariant, ADR 0022) actually
           # run their assertions in CI rather than importorskip-skipping (extra-less local runs skip).
@@ -331,11 +337,11 @@ jobs:
       # pyproject's [tool.ruff] extend-exclude — instead of being re-stated, differently, per tool.
       # tests/test_lint_scope_parity.py fails if the two drift apart again.
       - name: Lint (ruff)
-        if: (needs.changes.outputs.code == 'true' || github.event_name == 'push' || github.event_name == 'workflow_dispatch') && runner.os == 'Linux'
+        if: (needs.changes.outputs.code == 'true' || github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event_name == 'merge_group') && runner.os == 'Linux'
         run: ruff check .
 
       - name: Format check (ruff)
-        if: (needs.changes.outputs.code == 'true' || github.event_name == 'push' || github.event_name == 'workflow_dispatch') && runner.os == 'Linux'
+        if: (needs.changes.outputs.code == 'true' || github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event_name == 'merge_group') && runner.os == 'Linux'
         run: ruff format --check .
 
       # Licence headers (BACKLOG #1010). Mirrors the `licence-header` pre-commit hook. Scope lives in
@@ -395,13 +401,13 @@ jobs:
       # platform but real under win32. Nothing in the engine imports it (it is a leaf entry point), so
       # --exclude cleanly drops it from the linux build.
       - name: Type-check (mypy, strict — linux platform)
-        if: (needs.changes.outputs.code == 'true' || github.event_name == 'push' || github.event_name == 'workflow_dispatch') && runner.os == 'Linux'
+        if: (needs.changes.outputs.code == 'true' || github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event_name == 'merge_group') && runner.os == 'Linux'
         run: mypy messagefoundry messagefoundry_webconsole --exclude 'messagefoundry/tray/'
 
       # The win32 pass types messagefoundry/tray (now inside the messagefoundry package, so no separate
       # path argument) plus every other sys.platform=='win32' branch.
       - name: Type-check (mypy, strict — win32 platform)
-        if: (needs.changes.outputs.code == 'true' || github.event_name == 'push' || github.event_name == 'workflow_dispatch') && runner.os == 'Linux'
+        if: (needs.changes.outputs.code == 'true' || github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event_name == 'merge_group') && runner.os == 'Linux'
         run: mypy --platform win32 messagefoundry
 
       # Step-level watchdog UNDER the job cap (#55): the windows-2022 leg intermittently
@@ -740,7 +746,7 @@ jobs:
 
       - name: Tests (pytest)
         id: tests
-        if: needs.changes.outputs.code == 'true' || github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+        if: needs.changes.outputs.code == 'true' || github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event_name == 'merge_group'
         timeout-minutes: ${{ matrix.step_timeout }}
         env:
           QT_QPA_PLATFORM: offscreen
@@ -1567,7 +1573,7 @@ jobs:
     # Nightly / on-demand, or a PR that touches the server-DB surface. `changes` sets serverdb=false
     # on push (both halves of the no-per-merge-run guard live there — see its comment) and on
     # schedule, where the first arm below already covers the run.
-    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || needs.changes.outputs.serverdb == 'true'
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || github.event_name == 'merge_group' || needs.changes.outputs.serverdb == 'true'
     runs-on: ubuntu-latest
     # Matrix the gated suite across every supported SQL Server major (2022 = 16.x, 2025 = 17.x) so a
     # version-specific T-SQL / engine regression can't merge. fail-fast: false keeps a 2025-only hiccup
@@ -1901,7 +1907,7 @@ jobs:
     name: postgres store
     needs: changes
     # Nightly / on-demand / server-DB PRs (serverdb=false on push and schedule — see `changes`).
-    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || needs.changes.outputs.serverdb == 'true'
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || github.event_name == 'merge_group' || needs.changes.outputs.serverdb == 'true'
     runs-on: ubuntu-latest
     services:
       postgres:
@@ -2093,7 +2099,7 @@ jobs:
     # (the server-DB suites are nightly + PR-path-gated too, as of the same cost pass). This
     # multi-minute serve+load run no longer fires once per commit. NOT a required check,
     # so dropping it from push is safe; ci-gate `needs` it but counts a `skipped` leg as a pass.
-    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || github.event_name == 'merge_group'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -2171,7 +2177,7 @@ jobs:
     # end-to-end SQL Server store path is still smoked nightly (x2 majors) + on demand, and the SQL
     # Server functional coverage stays in `sqlserver-store` (nightly + server-DB-PR path-gate). NOT
     # required; ci-gate treats skip as pass.
-    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || github.event_name == 'merge_group'
     runs-on: ubuntu-latest
     # Smoke the end-to-end SQL Server store path on every supported major (2022/2025). Push/dispatch-only,
     # so no PR cost; fail-fast: false keeps the two legs independent.
@@ -2343,7 +2349,7 @@ jobs:
     # here (public) and billed to the owner of a fork. Nightly schedule + manual dispatch only. ci-gate
     # `needs` this job, but a `skipped` leg counts as a pass there, so gating it off a fork cannot wedge
     # the gate.
-    if: (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && github.repository == 'MEFORORG/MessageFoundry'
+    if: (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || github.event_name == 'merge_group') && github.repository == 'MEFORORG/MessageFoundry'
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
