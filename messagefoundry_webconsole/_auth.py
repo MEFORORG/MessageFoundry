@@ -492,6 +492,14 @@ def is_unlock_action(next_path: str | None) -> bool:
     never to an arbitrary URL. Same ``..`` rejection (a normalized ``/..`` segment is never a valid
     target) and same append-only registry as the only source of truth — a lane opts a form page in by
     *registering* it, not by editing this function.
+
+    ONE REGISTERED PATTERN IS QUERY-TOLERANT and the promise above is correspondingly weaker for it:
+    the uploaded-logs resend confirm page (BACKLOG #1227) matches ``resend-confirm(\\?[^#]*)?``, so an
+    arbitrary same-site query on THAT ONE PATH reaches the re-auth. It has to, because the action's
+    two parameters ride the query and ``_reauth_redirect`` puts the whole continuation into ``next``.
+    The path prefix is still anchored, the ``..`` rejection above still applies first, and the
+    confirm route's own ``Query(..., ge=0)`` / ``max_length=256`` bounds reject anything the pattern
+    admits — so the widening is bounded to a query string on a single registered page.
     """
     if not next_path or ".." in next_path:
         return False

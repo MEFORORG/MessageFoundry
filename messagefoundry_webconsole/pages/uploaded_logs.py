@@ -10,6 +10,8 @@ inject markup. No decrypted message body is ever rendered here (metadata only)."
 
 from __future__ import annotations
 
+from urllib.parse import urlencode
+
 from messagefoundry.api.models import UploadedFileList, UploadedMessagesResult
 
 from .._html import Markup, el, page, register_nav, rows_table, text
@@ -17,6 +19,7 @@ from .._html import Markup, el, page, register_nav, rows_table, text
 __all__ = [
     "uploaded_log_delete_confirm",
     "uploaded_log_detail",
+    "uploaded_log_resend_confirm",
     "uploaded_logs",
     "uploaded_logs_upload",
 ]
@@ -206,8 +209,15 @@ def uploaded_log_detail(
             ),
         ),
         el("button", "Resend into inbound", type="submit"),
-        method="post",
-        action=f"/ui/uploaded-logs/file/{file_id}/resend",
+        # GET, so ``index`` and ``to`` land in the query string of the confirm page, which makes the
+        # follow-on POST body-less and therefore auto-retryable across a re-auth redirect (#1227).
+        # Deliberately NOT the #1184 hazard the filter form above avoids: those criteria are
+        # PHI-shaped needles, whereas an ordinal and a connection name are structural locators the
+        # engine already writes to the audit store by name on every resend.
+        # Keep this action QUERY-LESS: an HTML GET form replaces the action URL's query with the
+        # serialized fields, so anything written here would be discarded silently.
+        method="get",
+        action=f"/ui/uploaded-logs/file/{file_id}/resend-confirm",
         class_="ctl",
     )
     parts: list[object] = [
@@ -248,6 +258,43 @@ def uploaded_log_detail(
         ]
     )
     return page("Uploaded log", *parts, active="uploaded-logs")
+
+
+def uploaded_log_resend_confirm(file_id: str, filename: str, index: int, to: str) -> Markup:
+    """The resend confirm step (BACKLOG #1227) — the body-less half of the step-up gate.
+
+    The POST this renders carries NOTHING in its body: the selection lives in this page's own URL, so
+    the action survives a re-auth redirect and can be auto-retried. That is the whole reason this
+    shape was chosen over stashing the message body server-side across re-auth, which would give a
+    message body a new location, a new lifetime and a new deletion question (CLAUDE.md section 9).
+
+    ``to`` is an operator-authored connection name — ``Registry._add`` checks only for a duplicate, so
+    it is unconstrained free text and is rendered through the escaping builders like everything else
+    here. ``urlencode`` builds the POST target because these are QUERY values; the path-segment
+    helper used by the apiclient is the wrong tool and would over-escape the separators."""
+    query = urlencode({"index": index, "to": to})
+    return page(
+        "Resend uploaded message",
+        el("p", el("a", "← Uploaded logs", href="/ui/uploaded-logs")),
+        el("h1", "Resend this message?"),
+        el(
+            "p",
+            text(
+                f"This injects message #{index} from “{filename}” into the inbound connection "
+                f"“{to}” as a fresh receipt. The resend is audited."
+            ),
+            class_="muted",
+        ),
+        el(
+            "form",
+            el("button", "Resend into inbound", type="submit"),
+            el("a", "Cancel", href=f"/ui/uploaded-logs/file/{file_id}", class_="btn-link"),
+            method="post",
+            action=f"/ui/uploaded-logs/file/{file_id}/resend?{query}",
+            class_="ctl",
+        ),
+        active="uploaded-logs",
+    )
 
 
 def uploaded_log_delete_confirm(file_id: str, filename: str) -> Markup:
