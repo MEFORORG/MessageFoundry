@@ -16199,3 +16199,48 @@ A seat that runs its OWN copy is recorded correctly. A seat that runs another co
 **Acceptance should include the negative case:** a release invoked from a tree other than the script's must not produce a record that reads as authoritative about who acted. A test that only exercises the same-tree path cannot fail on this defect, since the same-tree path is already correct.
 
 **Related:** #1297 (the worked `-Take` instance, allocator side), #1060 (why the anchoring exists and must not be naively reverted).
+
+## 1359. the worktree gate hands off branch-switch detection to rule 3b by verb, not by whether the command names a branch
+
+> 🔢 **Filed 2026-08-26 - not started.** `scripts/hooks/worktree_gate.ps1`'s own comment states the
+> gap in its own words (`:295-296`): *"3b only handles checkout/switch, so for the other nine verbs
+> there was no hand-off at all."* The working-tree-TARGET resolver that rules 3 and 3b share was
+> already unified and fixed (same comment block, `:291-307`) -- what remains open is narrower and
+> different: rule 3b's own BRANCH-CHANGE check fires only for the literal verbs `checkout`/`switch`,
+> so a command that changes what a governed worktree's HEAD points at through a different verb
+> (`reset --hard <branch>`, a fast-forward `merge <branch>`, `rebase <branch>`, and whichever of the
+> other seven this item's own build work still needs to enumerate) is not evaluated as a branch
+> change at all by that rule, regardless of whether the surrounding target-path checks still apply
+> to it.
+> Verdict: build
+> Research: none
+> Closing-act: code
+
+**Cluster:** Worktree gate / developer guardrail. **Priority:** P2. **Verdict:** build.
+**Severity:** no deployment axis (sec. 0) -- coordination tooling, not shipped in the wheel. The
+cost is the same shape as #1305/#1066/#1336: a guard believed to govern every session is bypassed
+by an ordinary-looking command that happens to use a different verb than the two the gate checks.
+
+**NOT RE-DERIVED HERE, AND DELIBERATELY NOT CLAIMED AS A FULL DIAGNOSIS.** This item exists to make
+an already-documented, already-discussed gap trackable and claimable -- it was sitting in coordination
+handoffs (Dispatcher's 2026-08-24 seat handoff and others) as *"unfiled and unclaimed"* rather than
+in the ledger, which is exactly the state this project's own conventions warn is invisible to every
+instrument that checks the ledger rather than reading prose. The precise list of which of the "other
+nine verbs" actually reach a governed worktree's HEAD, and which are already caught by an orthogonal
+check elsewhere in the file, is real analysis work for whoever builds this -- stated as open, not
+assumed.
+
+**THE PINNED SAFE FORM, so a naive patch is not re-attempted blind.** `tests/test_worktree_gate.py:549`
+(`test_git_rebase_into_sibling_worktree_extending_the_primary_is_allowed`) pins that `git -C <sibling>
+rebase main` must stay ALLOWED when `<sibling>`'s name merely contains the primary's name as a prefix
+substring (`Repo2` extending `Repo`) -- the `-C` already resolved to a genuinely different, non-governed
+tree. A patch that extends branch-change detection to `rebase` by matching on target-name-similarity
+rather than on the already-correct resolved path will red this test. The fix has to extend the SET OF
+VERBS rule 3b evaluates, not weaken the path resolution that already tells rule 3b and 3b's siblings
+apart correctly.
+
+**CONTENDED -- do not start without coordinating first.** `worktree_gate.ps1` and its companion
+`occupancy.ps1` currently carry three real claims, two of them live and held by Builder 2 with a
+declared serialised write order on that file. Building this alongside those without agreeing an order
+first risks the exact same-file collision this project's own collision-detection conventions exist to
+catch.
