@@ -126,7 +126,7 @@ is never redirected to a committed file, a ticket, or a CI log.
 message families the engine handles: `adt`, `oru`, `orm`, `oml`, `orl`, `mdm`, `mfn`, `dft`, `bar`,
 `ras`, `rde`, `siu`, `vxu`, `documents`, with `all_types.py` as the registry. Two entry points:
 
-- `messagefoundry generate` — the CLI subcommand ([`__main__.py:349`](../../../messagefoundry/__main__.py)).
+- `messagefoundry generate` — the CLI subcommand ([`__main__.py:350`](../../../messagefoundry/__main__.py) — **RE-POINTED 2026-08-15 (BACKLOG #1100), was `:349`, which is now blank**; the subparser is `generate = sub.add_parser(` at `:350` with the name `"generate"` on `:351`, and its flags follow at `:353-361`).
 - `python -m messagefoundry.generators.adt [--triggers A01,A04] [--count N] [--out DIR]` — the ADT
   corpus builder: **57 triggers across 25 message structures** (A01–A62 excluding the A19 query event
   and reserved A56–A59), with segment order and the allowed segment set driven by **hl7apy's own
