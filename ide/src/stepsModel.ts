@@ -233,6 +233,13 @@ export interface RowViewModel {
   code?: string; // verbatim source slice — code rows only (the degradation-ladder passthrough)
   liveValue?: string; // redacted-by-default #92 annotation (see mergeLiveValues); undefined = none
   /**
+   * Which kind of annotation `liveValue` holds. `mergeLiveValues` folds the inline values' TEXT into one
+   * string and used to drop their `kind`, so a skipped-lookup row rendered inside the live-value tooltip
+   * and told the author it was showing a redacted live value -- the opposite of what happened (BACKLOG
+   * #236). Carried so the renderer can offer the right affordance instead.
+   */
+  liveValueKind?: "value" | "warning";
+  /**
    * The PROJECTION-TIME source text of this row's [lineStart, lineEnd] range — the row exactly as the user
    * saw it when the lens projected the inputs (engine newline model: split on `\r\n`|`\r`|`\n`, joined by
    * `\n`, no trailing EOL; mirrors `messagefoundry/lens._physical_lines`). Carried through an edit as the
@@ -654,6 +661,25 @@ export interface LiveInlineValue {
   kind: "value" | "warning";
 }
 
+/**
+ * The tooltip on a row whose annotation is a SKIPPED LIVE LOOKUP (BACKLOG #236).
+ *
+ * A `db_lookup`/`fhir_lookup` does not do I/O in a dry-run -- it RAISES, and the tracer records a
+ * `live_lookup_skipped` annotation and re-raises so the disposition is byte-identical
+ * (`dryrun_trace.classify_live_lookup`). The row's old tooltip said "Live value (redacted by default)",
+ * which is wrong twice over: it is not a value and nothing was redacted.
+ *
+ * So the tooltip names the mechanism ADR 0010 already specifies instead of restating the failure --
+ * `ADR 0010`: "a feed that uses it is previewed by stubbing its wrapper". That is the supported preview
+ * path, and pointing at it is the whole of this item: the engine is unchanged and nothing is mocked.
+ */
+export const LIVE_LOOKUP_TIP =
+  "Live read-only lookup: a dry-run cannot run it, so this row was not evaluated. " +
+  "Preview the feed by stubbing this call's wrapper function (ADR 0010).";
+
+/** The tooltip on a row showing a real captured value. Unchanged wording (BACKLOG #92). */
+export const LIVE_VALUE_TIP = "Live value (redacted by default — synthetic samples only)";
+
 /** The redacted annotation shown by default (matches liveDebug's VALUE_MARKER + REVEAL_PLACEHOLDER). */
 export const REDACTED_LIVE_VALUE = "▸ ⋯";
 
@@ -672,6 +698,9 @@ export function mergeLiveValues(rows: RowViewModel[], inline: LiveInlineValue[])
     );
     if (hits.length > 0) {
       row.liveValue = hits.map((h) => h.after).join("  ·  ");
+      // A warning WINS over a value. `traceRowValues` already suppresses values on a warned line, so a
+      // warning hit means this row's annotation is the skipped-lookup notice, not a reading.
+      row.liveValueKind = hits.some((h) => h.kind === "warning") ? "warning" : "value";
     }
   }
   return rows;
@@ -2624,8 +2653,10 @@ export function renderRowHtml(
   const indent = `style="margin-left:${row.nesting * INDENT_PX}px"`;
   const badge = row.badge ? `<span class="badge">${escapeHtml(row.badge)}</span>` : "";
   const subtitle = row.subtitle ? `<span class="subtitle">${escapeHtml(row.subtitle)}</span>` : "";
+  const liveTip = row.liveValueKind === "warning" ? LIVE_LOOKUP_TIP : LIVE_VALUE_TIP;
+  const liveClass = row.liveValueKind === "warning" ? "live warn" : "live";
   const live = row.liveValue
-    ? `<span class="live" data-tip="Live value (redacted by default — synthetic samples only)">${escapeHtml(row.liveValue)}</span>`
+    ? `<span class="${liveClass}" data-tip="${escapeHtml(liveTip)}">${escapeHtml(row.liveValue)}</span>`
     : "";
   // A field is editable only when the handler name is known (the write path); read-only callers pass "".
   const editable = new Set(handlerName ? (row.editableParams ?? []) : []);
