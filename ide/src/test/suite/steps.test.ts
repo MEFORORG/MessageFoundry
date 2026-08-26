@@ -5,6 +5,8 @@ import * as fs from "fs";
 import * as path from "path";
 
 import {
+  LIVE_LOOKUP_TIP,
+  LIVE_VALUE_TIP,
   REDACTED_LIVE_VALUE,
   buildHandlerViewModels,
   buildLensTraceArgs,
@@ -318,6 +320,10 @@ suite("stepsModel — buildLensTraceArgs never requests PHI (the lens's redacted
 });
 
 suite("stepsModel — traceRowValues folds a traced dry-run onto rows (redacted by default)", () => {
+  const lookupRow = (): RowViewModel[] => [
+    { index: 0, kind: "action", nesting: 0, lineStart: 4, lineEnd: 4, title: "Lookup", params: [] },
+  ];
+
   test("redacted by default (reveal off): each executed line is the ▸ ⋯ placeholder, no real value", () => {
     const off = traceRowValues([PRODUCING], false);
     assert.strictEqual(off.length, 2);
@@ -387,6 +393,123 @@ suite("stepsModel — traceRowValues folds a traced dry-run onto rows (redacted 
     assert.ok(warn?.after.includes("live lookup"), warn?.after);
   });
 
+  test("a skipped lookup carries its KIND to the row, not just its text (BACKLOG #236)", () => {
+    // The affordance depends on the row knowing WHICH annotation it holds. `mergeLiveValues` used to
+    // fold only the text, so a skipped-lookup row was indistinguishable from a value row downstream.
+    const skipped = traceRowValues(
+      [inv({ annotations: [{ line: 4, kind: "live_lookup_skipped", call: "db_lookup" }] })],
+      false,
+    );
+    const rows = lookupRow();
+    mergeLiveValues(rows, skipped);
+    assert.strictEqual(rows[0].liveValueKind, "warning", "the row must know it holds a warning");
+  });
+
+  test("a row holding real captured values is still marked a value", () => {
+    const rows = lookupRow();
+    mergeLiveValues(rows, [{ line: 3, after: REDACTED_LIVE_VALUE, kind: "value" }]);
+    assert.strictEqual(rows[0].liveValueKind, "value");
+  });
+
+  test("a warning WINS over a value landing in the same row", () => {
+    // `traceRowValues` already suppresses values on a warned LINE, but a multi-line row can hold both
+    // a warned line and a producing one. The row's affordance must follow the warning.
+    const rows = lookupRow();
+    mergeLiveValues(rows, [
+      { line: 3, after: REDACTED_LIVE_VALUE, kind: "value" },
+      { line: 3, after: "not evaluated", kind: "warning" },
+    ]);
+    assert.strictEqual(rows[0].liveValueKind, "warning");
+  });
+
+  test("a row with no annotation gets no kind at all", () => {
+    const rows = lookupRow();
+    mergeLiveValues(rows, []);
+    assert.strictEqual(rows[0].liveValueKind, undefined);
+    assert.strictEqual(rows[0].liveValue, undefined);
+  });
+});
+
+// --------------------------------------------------------------------------------------------------
+// BACKLOG #236: the lookup row's tooltip must OFFER THE SUPPORTED PREVIEW PATH rather than restate the
+// failure. A db_lookup/fhir_lookup does not do I/O in a dry-run -- it RAISES, and the tracer records a
+// `live_lookup_skipped` annotation and re-raises (dryrun_trace.classify_live_lookup). ADR 0010 already
+// names the mechanism: "a feed that uses it is previewed by stubbing its wrapper". Nothing is mocked and
+// no engine file changes; the IDE just stops pointing at a dead end.
+// --------------------------------------------------------------------------------------------------
+
+suite("stepsModel — a skipped live lookup offers the stubbing affordance (BACKLOG #236)", () => {
+  const warnRow = (): RowViewModel => ({
+    index: 0,
+    kind: "action",
+    nesting: 0,
+    lineStart: 4,
+    lineEnd: 4,
+    title: "Lookup",
+    params: [],
+    liveValue: "not evaluated",
+    liveValueKind: "warning",
+  });
+
+  test("the warning row's tooltip names the mechanism instead of restating the failure", () => {
+    const html = renderRowHtml(warnRow());
+    assert.ok(html.includes("stubbing"), `expected the stubbing affordance, got: ${html}`);
+    assert.ok(html.includes("ADR 0010"), "the tooltip must cite where the mechanism is specified");
+  });
+
+  test("THE MISLABEL: a skipped lookup no longer claims to be a redacted live value", () => {
+    // It is not a value and nothing was redacted. Telling an author the opposite of what happened is
+    // the defect this fixes; it was reached because mergeLiveValues dropped the kind.
+    const html = renderRowHtml(warnRow());
+    assert.ok(!html.includes(LIVE_VALUE_TIP), "the value tooltip must not appear on a warning row");
+    assert.ok(!html.includes("redacted"), `no redaction claim on a skipped lookup: ${html}`);
+  });
+
+  test("a real value row's tooltip is UNCHANGED (BACKLOG #92 wording preserved)", () => {
+    const row = { ...warnRow(), liveValue: REDACTED_LIVE_VALUE, liveValueKind: "value" as const };
+    const html = renderRowHtml(row);
+    assert.ok(html.includes(LIVE_VALUE_TIP), "the existing value tooltip must survive verbatim");
+    assert.ok(!html.includes(LIVE_LOOKUP_TIP), "a value row must not offer the lookup affordance");
+  });
+
+  test("a row with no annotation renders no tooltip span at all", () => {
+    const row = { ...warnRow(), liveValue: undefined, liveValueKind: undefined };
+    const html = renderRowHtml(row);
+    assert.ok(!html.includes(LIVE_LOOKUP_TIP) && !html.includes(LIVE_VALUE_TIP), html);
+  });
+
+  test("END TO END: a live_lookup_skipped annotation reaches the rendered row as the affordance", () => {
+    // The whole chain the author actually meets: tracer annotation -> traceRowValues -> mergeLiveValues
+    // -> renderRowHtml. Each step is covered above; this asserts they compose.
+    const skipped = traceRowValues(
+      [inv({ annotations: [{ line: 4, kind: "live_lookup_skipped", call: "db_lookup" }] })],
+      false,
+    );
+    const rows = [
+      {
+        index: 0,
+        kind: "action" as const,
+        nesting: 0,
+        lineStart: 4,
+        lineEnd: 4,
+        title: "Lookup",
+        params: [],
+      },
+    ];
+    mergeLiveValues(rows, skipped);
+    const html = renderRowHtml(rows[0]);
+    assert.ok(html.includes("stubbing"), `affordance missing end to end: ${html}`);
+    assert.ok(!html.includes("redacted"), `mislabel survived end to end: ${html}`);
+  });
+
+  test("the affordance text carries no glyph (CLAUDE.md section 11)", () => {
+    // The row's inline text keeps its pre-existing warning glyph, which belongs to BACKLOG #1265's
+    // migration. The text THIS item adds must not introduce another.
+    assert.ok(!/[\u2700-\u27bf\u2b00-\u2bff\u26a0\u2705\u274c\ufe0f]|[\ud800-\udbff]/.test(LIVE_LOOKUP_TIP), LIVE_LOOKUP_TIP);
+  });
+});
+
+suite("stepsModel — traceRowValues, continued", () => {
   test("across traced messages, the newest invocation's value wins for a shared line", () => {
     const first = inv({ events: [{ line: 3, event: "line", assigned: { x: "AAA" } }] });
     const second = inv({ events: [{ line: 3, event: "line", assigned: { x: "BBB" } }] });
