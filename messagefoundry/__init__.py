@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 MessageFoundry Organization and contributors
+# lander-hygiene-debug: throwaway diagnostic touch, not for main.
 """messagefoundry — an open-source integration engine for healthcare.
 
 The engine is an importable library. The PySide6 console (and any other client)

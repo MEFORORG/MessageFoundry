@@ -126,6 +126,15 @@ jobs:
             exit 0
           fi
 
+          # TEMPORARY DIAGNOSTIC (Lander, throwaway branch, not for main): dump the exact three-dot
+          # diff and item list this run computed, to settle whether the divergence is upstream (the
+          # diff) or downstream (the match) of extraction. Remove before this ever reaches main.
+          echo "::group::HYGIENE DEBUG" >&2
+          echo "items=[$items]" >&2
+          echo "changed (name-only, one per line):" >&2
+          printf '%s\n' "$changed" | cat -A >&2
+          echo "::endgroup::" >&2
+
           # The item's banner lives in docs/BACKLOG.md while the item is open, and moves verbatim into
           # docs/archive/backlog/ once it is retired. Updating a retired item's banner is a legitimate
           # satisfaction of this rule, so both locations count -- otherwise the one PR shape that
