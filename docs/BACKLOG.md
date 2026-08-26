@@ -14015,7 +14015,9 @@ class as the release gate `a92ab10f` fixed, and it is why (b) is not cosmetic.
 
 ## 1307. the safe ASVS writer has no path to retire an anchor
 
-> ✅ **SHIPPED -- verified on main 2026-08-25 at `995de69b`.** `scripts/asvs/apply.py` now takes an explicit `--allow-retirement` flag (`:208`); a bare flag deliberately does not unlock a drop by itself -- the payload must also declare which anchors it retires, or the writer still refuses. **Filed 2026-08-22 - not started.** Value **5/10** · Difficulty **2/10** · _fill-in_. **Retirement is a SANCTIONED outcome the only safe writer cannot express**, so one live tracking item is blocked indefinitely with no workaround that keeps the guard intact. Difficulty 2 because the fix mirrors an override that already exists in the same tool.
+> ✅ **SHIPPED (PARTIAL RETIREMENTS ONLY -- the full-list shape is #1363) -- verified on main 2026-08-25 at `995de69b`.** `scripts/asvs/apply.py` now takes an explicit `--allow-retirement` flag (`:208`); a bare flag deliberately does not unlock a drop by itself -- the payload must also declare which anchors it retires, or the writer still refuses.
+>
+> **AMENDED 2026-08-26 (lander) to say WHICH HALF shipped -- the banner did not, and a false CLOSED removes an item from the queue so nobody looks again.** The flag is reached and works when SOME entries remain. It is **unreachable when the LAST entry of `evidence` or `absence` is retired**: `render()` emits no block for an empty list (`:197`), so the key vanishes on the round-trip, and the pure key-set guard -- `lost = set(was) - set(now)` at `:403`, refusing at `:405-406` -- returns **sixty-two lines before `allow_retirement` is consulted at `:468`** (assigned `:255`; those two are its only occurrences tree-wide). **Measured with a firing control rather than read:** retiring 1 of 2 exits 0 and WROTE the file; retiring 1 of 1 exits 1 on `REFUSING: ... would LOSE field(s) ['absence']`, never reaching the retirement logic. Both authorised retirements are the full-list shape. **Not reopened**, because the partial half is a real shipment and the `995de69b` evidence stands for exactly what it covers; the remainder is filed as its own row because the mechanism differs -- #1307 was "no flag exists", #1363 is "the flag is preempted". **Filed 2026-08-22 - not started.** Value **5/10** · Difficulty **2/10** · _fill-in_. **Retirement is a SANCTIONED outcome the only safe writer cannot express**, so one live tracking item is blocked indefinitely with no workaround that keeps the guard intact. Difficulty 2 because the fix mirrors an override that already exists in the same tool.
 > Verdict: build
 > Closing-act: code
 
@@ -16309,3 +16311,40 @@ catch.
 **A FIGURE THIS ITEM DELIBERATELY DOES NOT CARRY.** Forcing `resolve_every=1` produced readings of ~3745 handles against a ~385 baseline, which would be ~312 handles per worker child. **That number is WITHDRAWN and must not be quoted from here:** the trace above shows the denominator is not stable enough to divide by. The resource question is real and open; this item is the reason nobody can answer it yet.
 
 **Reproducer:** the per-tick trace and the A/B harness live in the filing session's scratchpad (`fdprobe_ab.py`); it reuses `test_connscale_smoke`'s own fixture setup and takes ~25 s a run. Rebuilding it is a few lines against `run_connscale`.
+
+---
+
+## 1363. the retirement flag is preempted by the key-set guard, so a full-list retirement cannot be expressed
+
+> 🔢 **Filed 2026-08-26 (lander) - not started. Successor to [#1307](#1307-the-safe-asvs-writer-has-no-path-to-retire-an-anchor), whose banner is amended rather than reopened.** Value **5/10** · Difficulty **3/10** · _fill-in_. #1307 shipped `--allow-retirement` and the flag genuinely works for a PARTIAL retirement. It is unreachable for a FULL-LIST one, and that is the shape both authorised retirements take -- so the sanctioned outcome #1307 exists to make expressible still cannot be expressed for the case that prompted it.
+> Verdict: build
+> Closing-act: code
+
+**Cluster:** ASVS tooling. **Priority:** P2. **Verdict:** build.
+**Severity:** no engine effect, no PHI axis, no deployment axis (sec. 0), and no verdict moves. The cost is that two owner-authorised retirements cannot be applied by the safe writer, leaving a maintainer the same choice #1307 was filed to remove: keep a stale anchor, or reach for the unsafe path.
+
+**What:** `scripts/asvs/apply.py` refuses a retirement that empties an `evidence` or `absence` list, and refuses it *before* the flag that authorises retirement is ever read. The chain, every line verified on `origin/main`:
+
+- `:197` -- `for a in cell.get("absence") or []:` emits no `[[cell.absence]]` block for an empty list, so the **key disappears** from the rendered cell rather than surviving as an empty array.
+- `:403` -- `lost = set(was) - set(now)` is a pure KEY-SET difference over the round-trip.
+- `:405-406` -- `print(f"REFUSING: cell {c['id']} would LOSE field(s) {sorted(lost)}")` then `return 1`.
+- `:255` / `:468` -- `allow_retirement` is assigned at the first and consulted at the second. Those are its **only two occurrences tree-wide**, and `:468` sits **sixty-two lines after the return**.
+
+**Measured, with a control that fires, rather than read off the source:**
+
+```
+CONTROL  absence 2 -> 1, retired_absence declared   exit 0   WROTE the file   (retirement logic reached)
+SUBJECT  absence 1 -> 0, retired_absence declared   exit 1   REFUSING: ... would LOSE field(s) ['absence']
+```
+
+The control is what makes the subject mean anything: it holds the flag, the declaration and the arithmetic constant and varies **only** whether the list empties. One arm reaches the retirement logic; the other never does.
+
+**Why this is a second blindness rather than the one already documented.** The guard's own comment at `:408-412` says it is a pure key-set difference and is therefore blind to *value* corruption -- that is #1242, a different limb with a different fix. This is a distinct blind spot in the same check: it cannot tell a key **dropped by accident** from a key that vanished because its list was **legitimately emptied**. It was written to catch the first and it catches the second identically, which is correct behaviour for the check in isolation and wrong for the tool.
+
+**Not the fix:** widening the key-set guard, or making it skip `evidence`/`absence`. That guard exists because a truncating repair once cut one cell 15 -> 10 and another 17 -> 1 with the verifier green throughout; relaxing it to admit this case is how that returns. The distinction the tool needs is *declared and arithmetically consistent* versus *silently absent*, which is exactly what the retirement logic at `:468` already computes -- it simply never runs.
+
+**Ordering is the whole defect.** Any fix has to let a DECLARED, arithmetic-consistent full-list retirement reach `:468` while an UNDECLARED key loss still refuses at `:405`. A fix that reorders the two checks without preserving that asymmetry converts a loud false-refusal into a quiet always-pass, which is strictly worse than today.
+
+**Related:** #1307 (the flag itself -- shipped, partial shapes only); #1242 (the sibling blindness in the same guard, value corruption rather than key loss).
+
+**Source:** routed by the Liaison from a false-closed-row sweep, verified to the line by the Dispatcher, and reproduced with a two-arm control by the Lander before filing, 2026-08-26.
