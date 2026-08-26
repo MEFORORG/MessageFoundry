@@ -32,6 +32,10 @@ from dataclasses import dataclass
 from typing import Any
 
 from messagefoundry.config.tls_policy import harden_cipher_suites
+
+# A LEAF MODULE, imported for its DEFINITION rather than its behaviour (BACKLOG #1273). controlchars
+# imports nothing from this package, so there is no cycle -- checked by import, not assumed.
+from messagefoundry.controlchars import _is_control_char
 from messagefoundry.redaction import redact
 
 __all__ = [
@@ -64,11 +68,33 @@ _UVICORN_LOGGERS = ("uvicorn", "uvicorn.error", "uvicorn.access")
 
 # C0 control characters (and DEL) escaped to keep one log record on one line. CR/LF are the
 # log-injection vector; tab (0x09) is left intact as benign whitespace.
+#
+# THE ALPHABET IS controlchars._is_control_char's, MINUS TAB (BACKLOG #1273, limb 3). It used to be
+# re-derived here as `range(0x20)` plus a separate `0x7F` line -- a second statement of the same set
+# in a codebase whose controlchars module exists precisely to state it once. The two agreed, so
+# nothing was mis-escaped; the cost is the future-tense one #1239 named and #1253 acted on, that a
+# later widening applied to one copy silently does not apply to the other.
+#
+# THE SUBTRACTION IS THE POINT, so it is written as one. Documenting this as "excluded" and leaving
+# the copy was considered and is refuted by the residual block on #1273: the parsing/sniff.py
+# carve-out earns its separate definition by being BYTE-wise and subtracting a whole allowlist,
+# while this is CHARACTER-wise, escapes CR/LF rather than tolerating them, and differs by EXACTLY
+# ONE code point. Measured: controlchars 33 code points, this table 32, symmetric difference {0x09}.
+# One code point of divergence is a subtraction, not a different predicate.
 _CTRL_TRANSLATION: dict[int, str] = {0x0A: "\\n", 0x0D: "\\r"}
-for _i in range(0x20):
-    if _i not in (0x09, 0x0A, 0x0D):
+# RANGE 0x100, NOT 0x80, AND THAT IS THE DIFFERENCE BETWEEN A REAL FOLD AND A COSMETIC ONE. The
+# alphabet is C0+DEL today, so both bounds produce the identical 32 entries -- proved by the
+# byte-identity check in the commit. But `_is_control_char`'s docstring names widening to C1
+# (U+0080-U+009F) as the deliberate change this shared module exists to make cheap, and a 0x80 bound
+# would silently NOT follow it: the escape table would keep the old alphabet while every other call
+# site moved, which is the exact two-copy drift limb 3 removes. Iterating past the current boundary
+# costs 128 predicate calls at import and makes the widening propagate by construction.
+for _i in range(0x100):
+    # TAB IS THE ONLY SUBTRACTION and test_tab_is_the_only_control_character_left_intact pins it.
+    # CR/LF are excluded from this loop because they get readable escapes above, not because they
+    # are tolerated -- they are the injection vector this whole table exists for.
+    if _is_control_char(chr(_i)) and _i not in (0x09, 0x0A, 0x0D):
         _CTRL_TRANSLATION[_i] = f"\\x{_i:02x}"
-_CTRL_TRANSLATION[0x7F] = "\\x7f"
 
 #: Stamped on every physical line of a record's ``exc_text``/``stack_info`` (BACKLOG #335). A traceback
 #: is multi-line by nature, so collapsing it the way the rendered message is collapsed would cost the

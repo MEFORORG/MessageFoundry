@@ -927,3 +927,66 @@ def test_serve_time_sync_ok_within_threshold_starts_clean(
         ["serve", "--config", str(tmp_path), "--db", str(tmp_path / "x.db"), "--env", "dev"]
     )
     assert rc == 0
+
+
+# --- BACKLOG #1273 limb 3: ONE definition of the alphabet, with the tab subtraction pinned -------
+#
+# `_CTRL_TRANSLATION` used to re-derive the control-character set as `range(0x20)` plus a separate
+# `0x7F` line -- a second statement of the set that `controlchars` exists to state once. The two
+# agreed, so nothing was mis-escaped. The cost was the future-tense one: a later widening applied to
+# one copy silently does not apply to the other, and nothing reports the omission.
+#
+# These tests pin the RELATIONSHIP rather than either set's contents, which is what survives a
+# deliberate widening: widen `_is_control_char` and the table follows automatically, and if it does
+# not, the first test goes red naming the code points that drifted.
+
+
+def test_the_log_escape_table_is_the_controlchars_alphabet_minus_tab() -> None:
+    """The whole of limb 3, as one assertion about the DIFFERENCE.
+
+    Not "the table has 32 entries" -- that pins a number and would have to be edited by whoever
+    widens the alphabet, which is precisely the person who should be told rather than asked to
+    update a constant. This pins the SUBTRACTION, so a legitimate widening passes untouched and a
+    divergence names its own code points.
+    """
+    from messagefoundry.controlchars import _is_control_char
+    from messagefoundry.logging_setup import _CTRL_TRANSLATION
+
+    alphabet = {cp for cp in range(0x80) if _is_control_char(chr(cp))}
+    escaped = set(_CTRL_TRANSLATION)
+
+    assert alphabet - escaped == {0x09}, (
+        f"the log escape table and controlchars have drifted: "
+        f"{sorted(hex(c) for c in (alphabet - escaped) - {0x09})} are screened as control "
+        f"characters but not escaped in a log line"
+    )
+    assert not escaped - alphabet, (
+        f"the log table escapes {sorted(hex(c) for c in escaped - alphabet)}, which controlchars "
+        f"does not treat as control characters -- one of the two has been widened alone"
+    )
+
+
+def test_tab_is_the_only_control_character_left_intact() -> None:
+    """Tab is benign whitespace in a log line; CR/LF are the injection vector and must not join it.
+
+    The asymmetry is the reason this is a separate test from the one above: that one would still
+    pass if tab were swapped for CR in the subtraction, because the difference would still be a
+    single code point.
+    """
+    from messagefoundry.logging_setup import _CTRL_TRANSLATION
+
+    assert 0x09 not in _CTRL_TRANSLATION, "tab must survive a log line unescaped"
+    assert _CTRL_TRANSLATION[0x0A] == "\\n", "LF is the injection vector and must be escaped"
+    assert _CTRL_TRANSLATION[0x0D] == "\\r", "CR is the injection vector and must be escaped"
+    assert _CTRL_TRANSLATION[0x00] == "\\x00"
+    assert _CTRL_TRANSLATION[0x7F] == "\\x7f", "DEL is in the alphabet and must still be escaped"
+
+
+def test_a_tab_survives_the_real_scrub_and_a_newline_does_not() -> None:
+    """Drives the shipped filter rather than the table, so the two cannot agree while the code differs."""
+    from messagefoundry.logging_setup import _CTRL_TRANSLATION
+
+    scrubbed = "before\tafter\nnext".translate(_CTRL_TRANSLATION)
+    assert "\t" in scrubbed, "the tab was escaped; a log line lost its benign whitespace"
+    assert "\n" not in scrubbed, "a real newline survived; one record can now forge a second line"
+    assert scrubbed == "before\tafter\\nnext"
