@@ -222,3 +222,115 @@ def test_an_item_absent_from_the_ledger_is_reported(
     assert gate.main(["999999", "--root", str(_ROOT)]) == 0
     assert "NOT IN THE LEDGER" in capsys.readouterr().out
     assert gate.main(["999999", "--root", str(_ROOT), "--refuse"]) == 1
+
+
+# ------------------------------------------------------------------ gated verdicts (BACKLOG #1334)
+#
+# `judge()` tested exactly ONE verdict value. `demand-gate` and `owner-ruling` -- the two that mean
+# DO NOT JUST BUILD IT -- fell through and were green-lit as ordinary build work.
+#
+# WHAT THESE TESTS ARE AND ARE NOT ABOUT. They pin the READER, not the data. A banner that declares
+# the wrong verdict is invisible to any of this, which is why the fix could not have caught #1336:
+# that row read `Verdict: build` while an owner ruling 105 lines below said otherwise.
+
+
+def test_a_demand_gate_verdict_is_advised_not_green(gate: ModuleType) -> None:
+    level, reason = gate.judge(
+        _item(gate, **{"closing-act": "code", "verdict": "demand-gate", "research": "none"})
+    )
+    assert level == "advise"
+    # The LEVEL alone is a weak assertion: an over-broad fix that advises every non-build verdict
+    # would also produce it. The reason text is the only thing that tells a seat what gates the item.
+    assert "DO NOT JUST BUILD IT" in reason
+    assert "LIAISON" in reason
+
+
+def test_a_demand_gate_verdict_stays_advised_when_research_is_done(gate: ModuleType) -> None:
+    """THE DISCRIMINATOR. A demand gate is lifted by a RULING, never by finished research.
+
+    The plausible wrong fix mirrors the research branch's ``research in ("", "none")`` guard. That
+    passes the test above and fails this one, re-greening the item the moment somebody records a
+    completed pass.
+    """
+    level, reason = gate.judge(
+        _item(
+            gate,
+            **{"closing-act": "code", "verdict": "demand-gate", "research": "done 2026-08-20"},
+        )
+    )
+    assert level == "advise"
+    assert "DO NOT JUST BUILD IT" in reason
+
+
+def test_an_owner_ruling_verdict_is_advised_not_green(gate: ModuleType) -> None:
+    level, reason = gate.judge(
+        _item(gate, **{"closing-act": "code", "verdict": "owner-ruling", "research": "none"})
+    )
+    assert level == "advise"
+    assert "DO NOT JUST BUILD IT" in reason
+    assert "owner" in reason.lower()
+    assert "LIAISON" in reason
+
+
+def test_an_owner_ruling_verdict_stays_advised_when_research_is_done(gate: ModuleType) -> None:
+    """Discriminator twin. Research done does not answer a question routed to the owner."""
+    level, _ = gate.judge(
+        _item(
+            gate,
+            **{"closing-act": "code", "verdict": "owner-ruling", "research": "done 2026-08-20"},
+        )
+    )
+    assert level == "advise"
+
+
+def test_a_plain_build_verdict_is_still_green(gate: ModuleType) -> None:
+    """The opposite direction: this must NOT become a blanket advisory.
+
+    A NOTE ON WHAT THIS DOES AND DOES NOT CATCH, because the obvious claim is wrong. It does catch a
+    blanket advise. It does NOT catch ``if verdict != "build"`` -- that variant leaves build items
+    untouched, so this test passes over it. The guard against THAT shape is
+    ``test_completed_research_with_a_code_closing_act_passes``, which goes red under it. Do not trim
+    that test as redundant, and see the mutation note in the module docstring above.
+    """
+    level, reason = gate.judge(
+        _item(gate, **{"closing-act": "code", "verdict": "build", "research": "none"})
+    )
+    assert level == "ok"
+    assert "DO NOT JUST BUILD IT" not in reason
+
+
+def test_the_gated_note_leads(gate: ModuleType) -> None:
+    """Ordering is load-bearing, so it is asserted rather than left to a comment.
+
+    The closing-act note ends "That is a complete outcome, not a failure." Left to lead, it tells the
+    reader of a gated item that shipping the code finishes the job -- the opposite of what a demand
+    gate means.
+    """
+    _, reason = gate.judge(
+        _item(
+            gate,
+            **{"closing-act": "scorecard-rescore", "verdict": "demand-gate", "research": "none"},
+        )
+    )
+    assert "DO NOT JUST BUILD IT" in reason
+    assert "complete outcome" in reason, "precondition: both notes must be present to order them"
+    assert reason.index("DO NOT JUST BUILD IT") < reason.index("complete outcome")
+
+
+def test_the_gated_verdicts_are_a_subset_of_the_closed_vocabulary(gate: ModuleType) -> None:
+    """Makes the constant's own comment executable instead of merely true when written.
+
+    ``GATED_VERDICTS`` is dispatch policy and lives here; the closed verdict vocabulary lives in
+    ``verdict_divergence_check.py``. A typo here would silently gate nothing, and every test above
+    would still pass because they all drive ``judge()`` with the same spelling this module defines.
+    Reaching for the private ``_VERDICTS`` is deliberate: a second copy of the vocabulary is the
+    defect, not the fix.
+    """
+    checker = _load(
+        Path(__file__).resolve().parents[1] / "scripts" / "docs" / "verdict_divergence_check.py",
+        "verdict_divergence_check_for_gate_test",
+    )
+    assert set(gate.GATED_VERDICTS) <= set(checker._VERDICTS), (
+        f"GATED_VERDICTS has a value the ledger vocabulary does not know: "
+        f"{set(gate.GATED_VERDICTS) - set(checker._VERDICTS)}"
+    )
