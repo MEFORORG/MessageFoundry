@@ -9417,6 +9417,22 @@ Nothing here touches the TLS/FTPS context in the same module, which was already 
 > 🔢 **Re-scored 2026-08-20 -> P2.** Value **6/10** · Difficulty **3/10** · _quick win_. The concrete IDE defect is closed by cspNonce.ts and its negative test, so what remains is the recovery-code shortfall (totp.py:58-60, 31^15 or about 74.3 bits, ten issued by default at settings.py:1798) plus the cross-language inventory question the crypto gate still cannot answer (crypto_inventory_check.py:456-472 excludes ide/ by invariant rather than inventorying it). An operator can only work around the shortfall by setting the count to 0, which is the awkward-workaround band. _(was 6/10 · 4/10.)_
 > Research: done 2026-08-20
 >
+> **PARTIAL 2026-08-25 -- THE PROPOSED BUILD SHIPPED (PR #603). THE ROW STAYS OPEN: the item's own
+> closing act is a scorecard re-score, not this build, and that re-score is explicitly not run.**
+> `_RECOVERY_GROUPS` went 3 -> 6 over the existing alphabet (148.63 bits, 142.98 after the
+> multiplicity adjustment -- 15 bits of margin against the 128-bit floor rather than 59 bits short
+> of it); the bare 26-character widening named below as a trap was NOT taken, matching this item's
+> own reasoning. `_generate_policy_password` now draws 24 bytes rather than 16, so the
+> `token_urlsafe` byte/character mismatch this research flagged as "safe by accident" no longer
+> depends on accident. An entropy-floor regression test derives its bit count from the three
+> shipped constants and the validator's own maximum count rather than transcribing either, with a
+> mutation control run against the shipped constant (not just asserted): reverting
+> `_RECOVERY_GROUPS` to 3 fails the new test, restored by byte-copy with the hash verified.
+> **Still explicitly open, all named in this item's own proposed-work list and none touched by
+> PR #603:** the ASVS 11.5.1 scorecard re-score itself; the scope-completeness adversarial pass this
+> item's own caveat says was never run; recording the five zero-margin values its census already
+> flags; and the cross-language randomness inventory arm.
+>
 > **Filed 2026-08-08 - not started. RESEARCH item: the goal is an HONEST pass, and "cannot honestly reach pass" is a valid finding.** ASVS **11.5.1** (L2) currently scores **partial**. The pinned verb sets a 128-bit floor on every non-guessable random value. TOTP recovery codes are CSPRNG-drawn but reach only about 74.3 bits, and the IDE extension mints its webview CSP nonces from `Math.random()`.
 > Verdict: research
 > Closing-act: scorecard-rescore
