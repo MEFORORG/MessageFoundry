@@ -46,9 +46,14 @@ _PRIVATE_PATHS: list[tuple[str, str]] = [
 # The ONE negated path in the block, and the only tracked file any private rule may cover.
 #
 # `/.claude/` became `/.claude/*` plus `!/.claude/settings.json` so the enforced controls -- the
-# deny-list and the `block-blanket-git-stage` PreToolUse guard -- reach a fresh clone and every
+# deny-list, and whatever matchers the file wires -- reach a fresh clone and every
 # `git worktree add`, which deliver tracked files only. Before that, this repo's own #327 note
-# recorded the guard as one that "does not actually travel" and said not to count it as coverage.
+# recorded `block-blanket-git-stage.ps1` as one that "does not actually travel".
+#
+# #327's CAUSE WAS REMOVED AND ITS SYMPTOM WAS NOT, so do not read this rule as covering that
+# guard. Tracking the file fixed "does not reach a fresh clone"; the script is still referenced by
+# NO matcher in it, so tracking carries it as a FILE and not as a wired control. Measured and
+# asserted in tests/test_claude_settings_contract.py, BACKLOG #1339.
 #
 # This is an exact SET, not a floor. Adding a second negation to the block -- `.claude/rules/`,
 # `.claude/skills/`, an agent definition, anything -- fails here until someone writes it down, and
