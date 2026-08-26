@@ -193,6 +193,55 @@ _HOME_PATH = re.compile(
 # so ``.search``/``.finditer``/``.fullmatch`` never fire and ``.pattern`` stays a valid string.
 _NEVER: re.Pattern[str] = re.compile(r"(?!)")
 
+# --------------------------------------------------------------------------------------------------
+# SECURITY-RECORD CONTENT (BACKLOG #1337). A requirement identifier PAIRED WITH ITS VERDICT.
+#
+# WHAT IS AND IS NOT RECORD CONTENT, because the distinction is the whole detector:
+#   * A BARE CITATION is a forward reference -- "this code was written with that requirement in
+#     mind". It asserts no coverage, no result and no gap, and it is legitimately public: the
+#     backlog's own item titles read `#1107 ASVS 1.2.2 -- apiclient path encoding`. NOT a hit.
+#   * AN IDENTIFIER SITTING BESIDE A VERDICT is the assessment itself, and the assessment is
+#     vaulted. THAT is the pair this matches.
+#
+# WHY NOT MATCH THE IDENTIFIER SHAPE. Because it is the SAME SHAPE AS A SEMANTIC VERSION, and this
+# repository is full of them. Measured over 2045 tracked files: the bare dotted-triple appears
+# 8018 times across 649 files -- 1233 in ide/package-lock.json, 934 in uv.lock, 661 in
+# docs/BACKLOG.md, every one a version or an item number. A gate firing 8018 times is switched off
+# within a day, and a gate that is off is worse than one never built, because the pipeline still
+# shows a passing step.
+#
+# PROXIMITY ALONE IS ALSO NOT ENOUGH, and this is measured rather than assumed. "Identifier within
+# 120 characters of a verdict word" scores 1028 hits across 119 files; adding an ASVS context marker
+# still leaves 548 across 50, dominated by the backlog's own legitimate citations. Only the TIGHT
+# PAIR -- identifier and verdict adjacent on one line, separated by punctuation -- discriminates.
+#
+# MEASURED RESULT OF THE RULE BELOW, over the same 2045 tracked files: ZERO hits. It is silent on
+# uv.lock (934 triples), ide/package-lock.json (1233), constraints.lock (90), docs/BACKLOG.md (661),
+# docs/ASVS-ASSESSMENT-METHOD.md (23) and docs/research/asvs-16-2-2-*.md (3) -- the last two being
+# tracked, public, and specifically flagged as the shape most likely to produce a false positive.
+# A zero over a corpus is only evidence beside a control that fires; both live in
+# tests/test_scan_forbidden.py and neither may be deleted without the other.
+# NO PLACEHOLDER EXEMPTION, DELIBERATELY, and the alternative is worth recording because it was
+# built and then withdrawn. ``_SLUG_PLACEHOLDER_HEX`` above exempts obviously-fake values so the slug
+# detector's fixtures stay quiet, and the same device works here -- reserving 0.0.0/9.9.9/99.99.99
+# was implemented and measured discriminating correctly on all sixteen probes.
+#
+# It was dropped because it buys nothing this detector needs and costs a standing bypass: four
+# identifier values that can never be reported, forever, in any file. The test fixtures keep the
+# identifier and the verdict as SEPARATE string literals and join them at runtime instead, so the
+# source carries no pair for this rule to match and no exemption is required. A future document that
+# genuinely must illustrate the pair verbatim is an allowlist entry with a written reason, which is
+# the sanctioned path and leaves a record; a reserved-value list leaves none.
+_RECORD_ID = r"(?<![\w.])\d{1,2}\.\d{1,2}\.\d{1,3}(?![\w.])"
+_RECORD_VERDICT = r"(?:pass|fail|partial|needs-review|not[- ]applicable|n/a)"
+# Separated ONLY by punctuation that binds a label to a value -- colon, equals, pipe, dash, arrow, a
+# table cell edge. A space alone is deliberately not enough: `see 1.2.2 later, this will pass` is
+# prose, and admitting it is what took the earlier attempts to 548 hits.
+_RECORD_PAIR: tuple[re.Pattern[str], ...] = (
+    re.compile(rf"(?i){_RECORD_ID}\s*[:=|\-—>\]]+\s*{_RECORD_VERDICT}\b"),
+    re.compile(rf"(?i)\b{_RECORD_VERDICT}\s*[:=|\-—<\[]+\s*{_RECORD_ID}"),
+)
+
 # Skip routable-IP detection (only) where dotted numbers are package versions, not hosts.
 _IP_SKIP_SUFFIXES = {".lock"}
 _IP_SKIP_NAMES = {"requirements.lock", "uv.lock", "package-lock.json"}
@@ -899,6 +948,13 @@ def scan_file(path: Path, rel_posix: str | None = None, *, show_context: bool = 
             hits.append(f"{posix}:{lineno}: worktree/branch slug (internal project name)")
         if _HOME_PATH.search(line):
             hits.append(f"{posix}:{lineno}: absolute user-home path (OS account name)")
+        # Security-record content (BACKLOG #1337). REASON-ONLY, never the value, for the same reason
+        # as the slug above: the identifier-verdict pair IS the disclosure, so echoing it into a
+        # public CI log would publish exactly what the hit reports.
+        if any(p.search(line) for p in _RECORD_PAIR):
+            hits.append(
+                f"{posix}:{lineno}: security-record content (requirement id beside a verdict)"
+            )
         # Estate substrings run LAST and only on a line nothing else flagged: the sets overlap (the
         # customer name is typically in [names] AND [estate]), and double-reporting one line adds noise
         # rather than information. What this adds is the case no other detector can reach -- a token
