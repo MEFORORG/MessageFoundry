@@ -104,6 +104,53 @@ def test_wrong_identifier_is_its_own_class(tmp_path: Path, declared: str) -> Non
     assert declared in result[1]
 
 
+# --------------------------------------------------------------------------------------------------
+# VENDORED_LICENCES (BACKLOG #1364): a named exception must still assert a value, not just skip.
+# --------------------------------------------------------------------------------------------------
+
+
+def test_vendored_override_accepts_its_own_licence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A path listed in VENDORED_LICENCES is checked against ITS licence, not the project's."""
+    path = tmp_path / "vendored.js"
+    path.write_text("// SPDX-License-Identifier: Apache-2.0\nconsole.log(1);\n", encoding="utf-8")
+    monkeypatch.setitem(_MOD.VENDORED_LICENCES, path.as_posix(), "Apache-2.0")
+    assert _MOD.check_file(path) is None
+
+
+def test_vendored_override_still_rejects_the_wrong_value(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The override asserts an exact value -- it does not just exempt the path entirely."""
+    path = tmp_path / "vendored.js"
+    path.write_text(f"// {_MOD.SPDX_TAG} MIT\nconsole.log(1);\n", encoding="utf-8")
+    monkeypatch.setitem(_MOD.VENDORED_LICENCES, path.as_posix(), "Apache-2.0")
+    result = _MOD.check_file(path)
+    assert result is not None
+    assert result[0] == _MOD.WRONG
+    assert "Apache-2.0" in result[1]
+
+
+def test_an_unlisted_path_still_uses_the_project_licence(tmp_path: Path) -> None:
+    """VENDORED_LICENCES is per-path, not global -- an unregistered file is unaffected."""
+    path = tmp_path / "vendored.js"
+    path.write_text("// SPDX-License-Identifier: Apache-2.0\nconsole.log(1);\n", encoding="utf-8")
+    assert path.as_posix() not in _MOD.VENDORED_LICENCES  # sanity: never registered
+    result = _MOD.check_file(path)
+    assert result is not None
+    assert result[0] == _MOD.WRONG
+
+
+def test_the_real_vendored_cla_action_file_is_compliant() -> None:
+    """The one real VENDORED_LICENCES entry (BACKLOG #1364) names an actual, compliant file."""
+    assert _MOD.VENDORED_LICENCES, "no entries left to check -- update or remove this test"
+    for rel_path in _MOD.VENDORED_LICENCES:
+        real = _ROOT / rel_path
+        assert real.is_file(), f"VENDORED_LICENCES entry {rel_path!r} does not exist"
+        assert _MOD.check_file(real) is None
+
+
 def test_tag_inside_a_string_literal_does_not_count(tmp_path: Path) -> None:
     """A header-emitting file is not a headered file."""
     path = tmp_path / "emitter.py"

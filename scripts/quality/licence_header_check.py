@@ -20,13 +20,20 @@ project). An affirmative misstatement of licence is worse than an omission, so a
 reported as its own violation class and is never quietly folded into "missing".
 
 SCOPE IS STATED POSITIVELY AND WAS MEASURED, NOT ASSUMED. Every tracked file carrying one of the
-extensions in ``COMMENT_PREFIXES`` is in scope, with NO tree exemptions. That is a measured result
-rather than a policy choice: the trees a reader would expect to need an exemption do not need one.
-``tee/`` (vendored) is already fully compliant, as are ``harness/``, ``samples/``, ``packaging/``,
-``docker/``, ``messagefoundry_webconsole/`` and the archived ``docs/benchmarks/results/``; and a scan
-for generated content (``*.d.ts``, ``*_pb2.py``, ``*.min.js``, ``generated/``, ``vendor/``) returns
-nothing among tracked sources. An exemption list would therefore be a list of things that do not
-exist, which is worse than no list -- it would read as policy and quietly widen.
+extensions in ``COMMENT_PREFIXES`` is in scope. There is still no TREE exemption -- every directory
+this project owns is checked against ``EXPECTED_IDENTIFIER`` with no exceptions. ``tee/`` (vendored
+from this project's own ``messagefoundry/anon/``) is already fully compliant, as are ``harness/``,
+``samples/``, ``packaging/``, ``docker/``, ``messagefoundry_webconsole/`` and the archived
+``docs/benchmarks/results/``.
+
+``VENDORED_LICENCES`` is the one narrow exception, and it is a FILE list, not a tree exemption: each
+entry still asserts an exact expected value, just not this project's own. It exists because BACKLOG
+#1364 vendored genuinely third-party, differently-licensed code (an Apache-2.0 GitHub Action,
+authored by SAP, pinned to a specific upstream commit) into ``.github/actions/``. Stamping this
+project's AGPL identifier on someone else's Apache-2.0 file would be exactly the affirmative
+misstatement this gate exists to catch, and worse than the omission it would paper over. Add an
+entry here only for a file that is genuinely someone else's code under its own real licence -- never
+to wave through a first-party file that is merely inconvenient to header.
 
 ``tests/`` IS IN SCOPE, on evidence rather than assumption: the tree sits at roughly 94 percent
 compliance on its own, which is not what a deliberately-exempt tree looks like, and no config, hook
@@ -54,6 +61,13 @@ from pathlib import Path
 
 # The SPDX identifier every first-party source must declare. Stated once, here.
 EXPECTED_IDENTIFIER = "AGPL-3.0-or-later"
+
+# One specific vendored file -> the licence IT actually carries upstream. See the module docstring's
+# VENDORED_LICENCES paragraph for why this exists and what does and does not belong here. Keyed by
+# the exact git-tracked path (forward slashes, as `git ls-files` emits), never a prefix or glob.
+VENDORED_LICENCES: dict[str, str] = {
+    ".github/actions/cla-assistant-lite/dist/index.js": "Apache-2.0",
+}
 
 # The tag whose VALUE is asserted. Kept separate from the identifier so a file carrying the tag with
 # the wrong value is distinguishable from a file carrying no tag at all -- see WRONG vs MISSING.
@@ -102,6 +116,9 @@ def tracked_files() -> list[str]:
 def check_file(path: Path) -> tuple[str, str] | None:
     """Classify one file. Returns ``(class, detail)`` for a violation, or None when compliant."""
     prefix = COMMENT_PREFIXES[path.suffix]
+    # .as_posix(), not str(path): on Windows str() renders backslashes, and VENDORED_LICENCES is
+    # keyed the way git ls-files emits paths (forward slashes) on every platform.
+    expected = VENDORED_LICENCES.get(path.as_posix(), EXPECTED_IDENTIFIER)
     try:
         head = path.read_bytes().decode("utf-8", errors="replace").splitlines()[:HEAD_LINES]
     except OSError as exc:  # unreadable is a violation we must not swallow
@@ -115,9 +132,9 @@ def check_file(path: Path) -> tuple[str, str] | None:
         if SPDX_TAG not in stripped:
             continue
         value = stripped.split(SPDX_TAG, 1)[1].strip()
-        if value == EXPECTED_IDENTIFIER:
+        if value == expected:
             return None
-        return (WRONG, f"declares {value!r}, expected {EXPECTED_IDENTIFIER!r}")
+        return (WRONG, f"declares {value!r}, expected {expected!r}")
 
     return (MISSING, f"no {SPDX_TAG} comment in the first {HEAD_LINES} lines")
 
@@ -149,8 +166,14 @@ def main(argv: list[str]) -> int:
             violations.append((result[0], name, result[1]))
 
     if not violations:
+        vendored_note = (
+            f" ({len(VENDORED_LICENCES)} vendored under its own upstream licence)"
+            if VENDORED_LICENCES
+            else ""
+        )
         print(
-            f"licence-header: OK -- {len(candidates)} file(s) checked, all declare {EXPECTED_IDENTIFIER}"
+            f"licence-header: OK -- {len(candidates)} file(s) checked, all declare their expected "
+            f"licence{vendored_note}"
         )
         return 0
 

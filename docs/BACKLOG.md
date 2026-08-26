@@ -16274,3 +16274,72 @@ apart correctly.
 declared serialised write order on that file. Building this alongside those without agreeing an order
 first risks the exact same-file collision this project's own collision-detection conventions exist to
 catch.
+
+## 1364. cla.yml pins an archived GitHub Action
+
+> 🔢 **Filed 2026-08-26 - fix built.** `contributor-assistant/github-action`, pinned in
+> `.github/workflows/cla.yml:50` at `ca4a40a7d1004f18d9960b404b97e5f30a505a08` (v2.6.1), was archived
+> by its maintainer (SAP ran out of bandwidth). zizmor's `archived-uses` rule flags it; zizmor is
+> advisory-only here (paths-filtered, not in `.github/required-contexts.txt`), so nothing is blocked
+> today. The fix -- vendoring the action's own code into this repo -- is committed and handed to the
+> Lander to open the PR.
+> Verdict: build
+> Research: none
+> Closing-act: code
+
+**Cluster:** CI workflow supply chain. **Priority:** P3. **Severity:** no deployment axis (sec. 0) --
+CI tooling, not shipped in the wheel. The cost is a frozen, unpatchable dependency sitting on the
+required `cla` status-check context that gates every external PR merge -- real, but not urgent while
+zizmor stays advisory.
+
+**What was checked before deciding to vendor.** All 138 forks of the archived repo were surveyed for
+one with real adoption or a patch record; none qualified (the most active, `iainmcgin/cla-github-action`,
+has 4 stars and one maintainer; the rest have 0 stars or are stale since 2020). The one non-fork
+alternative, the hosted `cla-assistant.io` service, needs a GitHub App install and stores signatures on
+its own server -- `cla.yml`'s own comments call out in-repo signature storage specifically so no extra
+secret is needed, and a hosted service gives that up. Neither is a drop-in.
+
+**The fix.** The action is small and self-contained: 15 TypeScript files compiled to one
+`dist/index.js` (~1.2MB), Apache-2.0 licensed, and it only calls the GitHub API -- no third-party
+server. Vendored as `.github/actions/cla-assistant-lite/` (`action.yml`, `dist/index.js`, `LICENSE`,
+a short `README.md` naming the upstream commit), with `cla.yml`'s `uses:` repointed at the local path.
+Every `with:` input, the `if:` condition, the `on:` trigger set (`merge_group` / `issue_comment` /
+`pull_request_target: [opened, synchronize]`, deliberately no `closed`), `permissions:`, and the job
+key `cla` itself (the required-status-check context, per `docs/CI.md` and
+`.github/required-contexts.txt`) are unchanged -- confirmed by six independent verification passes,
+five PASS outright: job key/triggers/permissions/`if:` unchanged; `with:` block byte-for-byte
+unchanged bar the `uses:` line; every input `cla.yml` sets exists in the vendored `action.yml`; the
+vendored files checksum-match an independent fresh fetch of the same pinned commit; the Apache-2.0
+LICENSE and attribution are preserved. The sixth check split into two sub-results: zizmor itself
+isn't installed in this sandbox so it could not be re-run locally (CI will exercise it on push), but
+the no-new-glyphs / comments-explain-why check it also carried did PASS.
+
+**What auditing the vendored code actually amounts to.** Nobody has read all 1.2MB of the compiled
+bundle line by line -- a build sandbox's own safety monitor flagged exactly this during the build,
+since only its shape and checksum had been confirmed at that point. A follow-up pattern scan (every
+`http(s)://` literal, `child_process`, `eval(`, `new Function(`, `exec(`) found nothing outside
+`api.github.com`/`github.com`/`uploads.github.com` calls and documentation-comment URLs pulled in from
+bundled open-source libraries; the one `eval(` is the well-known `eval("require")("encoding")` idiom
+node-fetch uses to dodge bundler static analysis, not dynamic code execution; every `exec(` hit is
+`RegExp.exec()`, not a shell call. That is a pattern scan, not a full audit, and the vendored bytes are
+checksum-identical to what has already been running in this exact workflow under the pinned SHA --
+vendoring relocates an already-trusted dependency, it does not introduce a new one.
+
+**Two gates caught real problems on the first commit attempt, before anything landed.** `.gitignore`'s
+blanket `dist/` rule (a Python build-artifact convention) was silently dropping
+`dist/index.js` from every `git add` -- fixed with a narrow negation plus a `-text` `.gitattributes`
+entry for this one path (`text eol=lf` was tried first and re-encoded roughly 1,300 bytes on staging,
+which would have committed a file that no longer matched its own recorded checksum). Separately, the
+licence-header gate had no way to accept a file that legitimately isn't AGPL-3.0 -- this repo's own
+licence, forced onto someone else's Apache-2.0 code, is exactly the "affirmative misstatement of
+licence" that gate exists to catch. Fixed by adding a narrow, named `VENDORED_LICENCES` override to
+`scripts/quality/licence_header_check.py` (one file, one entry, still asserting an exact value) and a
+two-line `// SPDX-License-Identifier: Apache-2.0` + provenance comment at the top of the vendored
+file. That comment is the only byte difference from the pure upstream copy: stripping the first 176
+bytes reproduces the original verified checksum exactly
+(`a44111084c0d4782206c04b4276292f7fec6d1f7a33525512fbeef3242079dfb`); the as-committed file's own
+checksum is `2f8271c83b98e86b8b203205c0dda08415fa49c8c300921e481aabf5c9b989f8`. Both changes are
+committed alongside the fix rather than filed separately, since neither makes sense without it.
+
+**Not done:** pushing, opening a PR, or anything that would exercise this in real CI. Committed and
+handed to the Lander.
