@@ -611,6 +611,117 @@ def test_the_TYPE_guard_does_NOT_refuse_a_payload_that_intentionally_retypes(
     assert cell["note"] == {"now": "a table"}
 
 
+def test_the_TYPE_guard_sees_a_corruption_the_payload_ALSO_MENTIONS(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """THE SCOPING HOLE, found by the ASVS Tracker against a scoping this author wrote and could not
+    check (BACKLOG #1242).
+
+    ``k not in c`` skipped every key the payload carries, so the guard covered the WRITER-only case
+    and stopped looking at the exact moment a cell is being rewritten. **That is the case that
+    matters rather than a corner:** measured on the real record, exactly ONE cell of 345 holds a
+    top-level non-scalar, and the natural payload for rewriting that cell ECHOES the key. So the
+    guard covered every cell that cannot be hurt and skipped the one that can.
+
+    THE THREE ARMS, and the third is what makes the second attributable:
+
+    ==========  =====================================  ==================================
+    arm         setup                                  required
+    ==========  =====================================  ==================================
+    control     payload OMITS the key, writer broken   refuse (the sibling test above)
+    subject     payload CARRIES the key, writer broken refuse -- THIS test
+    sanity      payload CARRIES the key, writer sound  allow (the retype test above)
+    ==========  =====================================  ==================================
+
+    Carrying the key is not what corrupts the value; the writer regression is. Without the sanity
+    arm a refusal here would be equally consistent with "the guard now refuses any carried key",
+    which is the unscoped version this scoping exists to avoid.
+
+    THE FIX COMPARES AGAINST WHAT THE PAYLOAD STATED rather than declining to look. The payload IS
+    the record of the type the author asked for, so an intentional retype still agrees with its own
+    payload and passes, while a writer corruption disagrees in BOTH zones.
+    """
+    import scripts.asvs.apply as mod
+
+    rec = _record(tmp_path)
+    assert (
+        main(
+            [
+                str(_payload(tmp_path, [_cell_111(sym_table={"a": 1})])),
+                "--scorecard",
+                str(rec),
+                "--apply",
+            ]
+        )
+        == 0
+    )
+
+    real_render = mod.render
+
+    def mangling_render(cell: dict, live: dict | None = None) -> str:
+        text = real_render(cell, live)
+        return text.replace("sym_table = { a = 1 }", "sym_table = \"{'a': 1}\"")
+
+    monkeypatch.setattr(mod, "render", mangling_render)
+    before = rec.read_bytes()
+    # The payload DOES carry sym_table, and carries it as the same dict it already is. Under the
+    # old scoping this is the silent-corruption path: the key is skipped, the guard never looks,
+    # and the file comes back holding a Python repr inside a TOML string.
+    rc = main(
+        [
+            str(_payload(tmp_path, [_cell_111(sym_table={"a": 1})])),
+            "--scorecard",
+            str(rec),
+            "--apply",
+        ]
+    )
+
+    assert rc == 1, "a writer corruption is invisible whenever the payload happens to carry the key"
+    assert rec.read_bytes() == before, "refused, but wrote anyway"
+    out = capsys.readouterr().out
+    assert "would CHANGE the TYPE" in out and "sym_table" in out, out
+
+
+def test_the_TYPE_guard_does_NOT_refuse_a_field_the_writer_COERCES_BY_DESIGN(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """THE FALSE-REFUSAL ARM for the corrected scoping (BACKLOG #1242).
+
+    Comparing the payload's stated type against the output would be wrong for the keys ``render()``
+    deliberately NORMALISES: ``level`` goes through ``int()``, and verdict / last_verified /
+    verified_at are emitted quoted. A payload stating ``level`` as the string ``"1"`` therefore
+    produces an int in the file **by design**, and refusing that is precisely the cry-wolf failure
+    the scoping exists to avoid -- a guard that refuses legitimate writes is a guard someone
+    disables.
+
+    WITHOUT THIS TEST THE ``_ORDERED`` EXCLUSION IS UNPINNED. Measured while writing it: dropping
+    that clause left all 23 other tests green, so the suite was silent about exactly the region the
+    clause occupies -- which is this item's own defect one level up (COMMON 4.5.1).
+
+    Its sibling ``_SUBTABLES`` clause is deliberately NOT pinned here and is belt-and-braces rather
+    than load-bearing: ``evidence`` and ``absence`` render as arrays of tables on both sides, so the
+    comparison cannot fire for them today. It is kept because that is a property of the current
+    writer rather than an invariant, and the sub-table entries have their own key check below.
+    """
+    rec = _record(tmp_path)
+    rc = main(
+        [
+            str(_payload(tmp_path, [_cell_111(level="1")])),
+            "--scorecard",
+            str(rec),
+            "--apply",
+        ]
+    )
+
+    out = capsys.readouterr().out
+    assert rc == 0, f"a by-design coercion must not read as corruption: {out}"
+    assert "would CHANGE the TYPE" not in out, out
+    cell = next(
+        c for c in tomllib.loads(rec.read_text(encoding="utf-8"))["cell"] if c["id"] == "1.1.1"
+    )
+    assert cell["level"] == 1, "the writer's own int() normalisation still happened"
+
+
 # --- BACKLOG #1307: a retirement is a SANCTIONED outcome the writer could not express -------------
 #
 # The shrink guard refuses any payload where an evidence or absence list gets shorter, and it took no
