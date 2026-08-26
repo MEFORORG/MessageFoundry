@@ -152,9 +152,10 @@ scripts/security/scan-tokens.local.txt
 # adds there later, which is ignored by DEFAULT rather than by enumeration.
 #
 # WHY settings.json IS TRACKED. It carries ENFORCED controls -- the deny-list covering `.env`,
-# `secrets/**`, keys and the local `*.db` store, plus the `block-blanket-git-stage` PreToolUse
-# guard -- and settings are enforced by the client where CLAUDE.md is only context, so section 5's
-# prose is not a substitute for it. Untracked, it hit the exact CLAUDE.md failure described above:
+# `secrets/**`, keys and the local `*.db` store -- and settings are enforced by the client where
+# CLAUDE.md is only context, so section 5's prose is not a substitute for it. It does NOT wire
+# `block-blanket-git-stage.ps1`: that script is present and tested but referenced by no matcher
+# (BACKLOG #1339). Untracked, it hit the exact CLAUDE.md failure described above:
 # measured 2026-08-13, of 62 local checkouts carrying CLAUDE.md only 12 had `.claude/settings.json`,
 # so 50 ran with no deny-list and no staging guard. `git worktree add` delivers tracked files only.
 /.claude/*
