@@ -2,9 +2,10 @@
 # Copyright (C) 2026 MessageFoundry Organization and contributors
 """Tests for the async session-mail channel (``scripts/coord/mail*.ps1``, ``scripts/hooks/mail-drain.ps1``).
 
-The channel is a PROTOTYPE and is deliberately NOT wired. These tests exist to close the red-team
-findings before it ever is, so every one of them drives the REAL script as a subprocess against a
-throwaway ``git init`` repo under ``tmp_path``. The live checkout is never touched: sibling sessions
+The channel WAS a prototype and is now WIRED -- ``mail-drain.ps1`` runs at ``SessionStart`` and
+``Stop`` (BACKLOG #1215; this docstring said "deliberately NOT wired" until then). These tests exist
+to close the red-team findings, which they did before wiring, so every one of them drives the REAL
+script as a subprocess against a throwaway ``git init`` repo under ``tmp_path``. The live checkout is never touched: sibling sessions
 are using its mail queue while the suite runs, and the drain mutates state (it claims, moves and
 receipts) rather than merely reading.
 
