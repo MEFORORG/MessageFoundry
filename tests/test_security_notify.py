@@ -96,11 +96,15 @@ async def test_notify_send_failure_is_swallowed(monkeypatch: pytest.MonkeyPatch)
 
 def test_body_says_the_address_was_removed_when_there_is_no_new_one() -> None:
     """BACKLOG #1139 (ASVS 6.3.7): an EMAIL_CHANGED carrying no ``new_email`` is a REMOVAL. Saying
-    only "was changed" and then omitting the new value reads as a truncated notice, and this is the
-    last message the address will receive — ``notify`` returns early once the account has none."""
+    only "was changed" and then omitting the new value reads as a truncated notice. THE SCOPE OF THE
+    CLAIM IS THE POINT: an earlier version promised this was the LAST notice the address would ever
+    get and asserted it, pinning a claim two shipped paths falsify -- ``users.email`` has no
+    UNIQUE constraint, and ``admin_user_update`` has no ``_externally_managed`` guard."""
     body = _build_body(SecurityEvent(EMAIL_CHANGED, username="bob", email="old@example.org"))
     assert "removed" in body.lower()
-    assert "last security notice" in body.lower()
+    assert "about this account" in body.lower()
+    # The negative half: it must not promise anything about the address BEYOND this account.
+    assert "last security notice" not in body.lower()
 
 
 def test_body_names_the_new_address_on_a_repoint_and_does_not_say_removed() -> None:

@@ -87,16 +87,26 @@ def _build_body(event: SecurityEvent) -> str:
         # BACKLOG #1139: an EMAIL_CHANGED carrying no ``new_email`` is a REMOVAL, not a repoint, and
         # it must not render as the repoint wording minus a line. Two reasons this arm is worth its
         # own sentence: "was changed" with the new value silently omitted reads as a truncated
-        # notice, and this really is the last message this address will get — :meth:`notify` returns
-        # early the moment the account has no address, so every later notice about the account is
-        # dropped. Saying so is what lets the holder act while they still can.
+        # notice, and the holder needs to know the address is gone while they can still act.
+        #
+        # WHAT THIS SENTENCE MUST NOT SAY, and did until 2026-08-26: that this is the LAST notice
+        # the address will ever receive. Two shipped paths falsify that. ``users.email`` carries NO
+        # UNIQUE constraint on any of the three store backends -- only ``username`` does -- so a
+        # second account may hold the same address and keep notifying it. And ``admin_user_update``
+        # applies no ``_externally_managed`` guard, though this same module guards three other
+        # routes with one, so an admin may clear a directory account's address and
+        # ``_upsert_ad_user`` restores it on the next directory login.
+        #
+        # A security notice written to make someone act NOW, resting on a promise the schema
+        # contradicts, is the compensating-control-on-a-false-premise shape SDS-3.7 forbids. Scope
+        # the claim to THIS ACCOUNT, which is true and is all the holder needs.
         new_email = event.detail.get("new_email")
         if new_email:
             lines.append(f"New email on file: {new_email}")
         else:
             lines.append(
-                "The address was removed from the account, so this is the last security "
-                "notice this address will receive."
+                "This address was removed from the account, so it will receive no further "
+                "security notices about this account."
             )
     if event.client_ip:
         lines.append(f"Source IP: {event.client_ip}")
