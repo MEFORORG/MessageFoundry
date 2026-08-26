@@ -61,6 +61,17 @@ _STAYS_WITHOUT_IMPORTING = frozenset(
         "test_asvs_apply.py",
         "test_asvs_residual_lint.py",
         "test_c901_delta.py",
+        # NOT engine source, so this entry WIDENS the list's stated rule and the claim is spelled out
+        # for review. Its subject is the TEST TREES: it scans both `testpaths` roots for a bare
+        # `import conftest`, which binds to whichever root pytest loaded first (BACKLOG #1255). The
+        # gating argument is the one that keeps test_control_char_check.py here, applied to a
+        # different scanned population: what it guards is `tests/**` and
+        # `packaging/messagefoundry-webconsole/tests/**`, and a change to either sets `code=true` (a
+        # .py path) but NOT `tooling=true` -- that gate names only three tests/ files (conftest.py,
+        # tooling_manifest.txt, test_tooling_partition.py). Listed as tooling it would be deselected
+        # by `-m 'not tooling'` on the engine legs AND unreached by the tooling job's path gate, so
+        # the PR that adds the offending import would face nothing.
+        "test_conftest_name_collision_guard.py",
         "test_cp1252_console_safety.py",
         # Arrived with #421 while this branch was in flight. Same shape as cp1252_console_safety and
         # licence_header_gate above: a repo-wide scanner over TRACKED TEXT, which includes
