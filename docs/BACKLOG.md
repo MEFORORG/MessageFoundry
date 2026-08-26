@@ -16361,3 +16361,88 @@ The control is what makes the subject mean anything: it holds the flag, the decl
 **Related:** #1307 (the flag itself -- shipped, partial shapes only); #1242 (the sibling blindness in the same guard, value corruption rather than key loss).
 
 **Source:** routed by the Liaison from a false-closed-row sweep, verified to the line by the Dispatcher, and reproduced with a two-arm control by the Lander before filing, 2026-08-26.
+
+## 1365. MEFOR_SANDBOX_MODE is silently dropped: [sandbox] is missing from the env-override section list
+
+> 🔢 **Filed 2026-08-26 -- FIXED IN THIS CHANGE; the status banner is deliberately unchanged**
+> (same handling as #1026 and #1361) so the archive pass owns the flip. `_env_overrides` gates on
+> `_SECTIONS`, `[sandbox]` was not in it, so `MEFOR_SANDBOX_MODE` resolved to a section that does not
+> exist and the variable was **dropped**. The identical key in the config FILE worked.
+
+**Cluster:** Configuration / ADR 0087 sandbox. **Priority:** P3. **Verdict:** build (small).
+**Severity:** would make a deploying site believe isolation was on while it ran in-process.
+
+**Why it is worse than an unsupported variable.** This is ADR 0087 subprocess isolation, the ASVS
+15.2.5 hard boundary. An operator setting it by environment gets `mode="off"` and **no warning from
+logs or config validation**, while the same setting in `messagefoundry.toml` takes effect. A control
+that silently reports itself enabled is the shape this repo treats as worse than a missing one.
+Written in the conditional per section 0: there are no deployments, so nothing is exposed today.
+
+**Measured through the real loader, both arms, with a DISCRIMINATING control:**
+
+```
+MEFOR_PIPELINE_PER_LANE_WAKE=true    False -> True     CHANGED   <- the env path works
+MEFOR_SANDBOX_MODE=subprocess        'off' -> 'off'    NOT CHANGED
+MEFOR_SANDBOX_MODE=nonsense-value    accepted, no error
+[sandbox] mode="subprocess" in TOML  -> 'subprocess'   works
+```
+
+The first control matters and the first attempt at it was **vacuous**: `per_lane_wake` already held
+`False`, so setting it `false` could not tell *applied* from *dropped*. The arm only means something
+because the value was flipped. The test written here bakes that in -- it asserts the value CHANGED,
+never that it equals a literal.
+
+**A second limb was proposed and is NOT needed -- measured rather than assumed.** The concern was that
+listing the section would turn "silently ignored" into "silently accepts garbage". It does not:
+`mode` is a `Literal["off", "subprocess"]`, so once the section resolves pydantic refuses an
+unrecognised value and names the choices. Verified by simulating the fix and feeding it garbage. The
+negative arm is a test here, not a code change.
+
+**FOUR MORE SECTIONS ARE ALSO ABSENT, and three of them cannot be fixed by an entry.** Comparing
+`_section_models()` (28) against `_SECTIONS` (23 before this change) leaves `cert_monitor`,
+`secret_rotation`, `service`, `update_check`.
+
+`_env_overrides` partitions the variable name on its **first** underscore, so:
+
+```
+MEFOR_SANDBOX_MODE            -> section 'sandbox'  key 'mode'            reachable
+MEFOR_SERVICE_FOO             -> section 'service'  key 'foo'             reachable
+MEFOR_CERT_MONITOR_ENABLED    -> section 'cert'     key 'monitor_enabled' UNREACHABLE
+MEFOR_SECRET_ROTATION_ENABLED -> section 'secret'   key 'rotation_enabled' UNREACHABLE
+MEFOR_UPDATE_CHECK_ENABLED    -> section 'update'   key 'check_enabled'   UNREACHABLE
+```
+
+So a section whose NAME contains an underscore is unaddressable regardless of `_SECTIONS`; listing it
+would change nothing. That needs a parser change and is not this item. **`service` is single-word and
+IS reachable once listed -- the same defect as this row, left out deliberately to keep the fix to what
+was dispatched.** It is recorded here rather than fixed quietly, and it is not a decision that it
+should stay unreachable.
+
+**The guard, which is the durable half.** A section absent from `_SECTIONS` does not fail -- it
+**disappears**: `_env_overrides` drops the variable and returns normally, so nothing reports a problem
+and no test could notice. `test_every_section_model_is_env_overridable_or_documented_as_not` compares
+the section models against `_SECTIONS` as a set difference, with each of the four exclusions carrying
+the reason it is not a bug being hidden. Adding a new settings section without deciding this question
+now reds instead of shipping an unreachable switch. The inverse is asserted too: an `_SECTIONS` entry
+naming no model would route env values into nothing.
+
+**Mutation-tested.** Removing `"sandbox"` from `_SECTIONS` reds all three tests; restoring it greens
+them. The guard is not asserting something that cannot fail.
+
+**THIS WAS ALREADY KNOWN AND WRITTEN DOWN -- cite it rather than claim it.** The finding was
+rediscovered here from a CI diagnosis, but
+[`docs/testing/master-test-plan/07-config-wiring-and-cli.md`](testing/master-test-plan/07-config-wiring-and-cli.md)
+already carries it as a risk row -- *"5 of 28 settings sections unreachable by `MEFOR_*`: sandbox,
+service, cert_monitor, secret_rotation, update_check"* -- which matches this census exactly and
+corroborates it independently. The plan also lists the cases:
+
+| Plan case | Subject | State after this change |
+|---|---|---|
+| CFG-11 | `_SECTIONS` set-equal to the section models | **partially closed** -- asserted as a set difference with four documented exclusions, not set-equality, because three of the four cannot be fixed by an entry |
+| CFG-12 | `MEFOR_SANDBOX_MODE` and the four other unreachable sections | **closed for `sandbox`**, and the other four are named in the guard's exclusion list with their reasons |
+| CFG-13 | Multi-word section names through the `.partition("_")` split | **still open** -- measured and recorded above, not tested or fixed here |
+
+Its open question 2 asks whether `_SECTIONS` should be asserted set-equal and whether the
+`partition("_")` split should change. This change answers only the first half, and answers it
+*pragmatically* -- a set difference with reasons -- because set-equality would red on three sections
+that no entry can rescue. **The `partition` half is untouched and still needs a decision.**

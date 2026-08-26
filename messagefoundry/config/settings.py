@@ -143,6 +143,11 @@ _SECTIONS = (
     "dr",
     "pipeline",  # enables MEFOR_PIPELINE_* env overrides (e.g. MEFOR_PIPELINE_PER_LANE_WAKE, ADR 0061)
     "security",  # ADR 0118: the plain-language posture switches (MEFOR_SECURITY_* env overrides)
+    # ADR 0087 subprocess isolation. ABSENT UNTIL BACKLOG #1365, which made MEFOR_SANDBOX_MODE parse
+    # to a section that did not exist and be DROPPED -- so an operator who set it by environment got
+    # in-process execution and no warning, while the identical key in the config FILE worked. A
+    # missing entry here does not fail; it disappears, which is why nothing caught it.
+    "sandbox",
 )
 _ENV_PREFIX = "MEFOR_"
 _DEFAULT_FILE = "messagefoundry.toml"

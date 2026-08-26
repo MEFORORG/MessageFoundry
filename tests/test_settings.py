@@ -83,6 +83,74 @@ def test_tls_client_cert_files_from_env_splits_on_pathsep() -> None:
     assert s.api.tls_client_cert_files == ["/certs/acme/client.pem", "/certs/globex/client.pem"]
 
 
+def test_sandbox_mode_is_settable_by_env(tmp_path: Path) -> None:
+    """BACKLOG #1365: ``[sandbox]`` was missing from ``_SECTIONS``, so ``MEFOR_SANDBOX_MODE`` parsed to
+    a section that did not exist and was DROPPED. The identical key in the config FILE worked, so an
+    operator setting it by environment got in-process execution with nothing saying otherwise -- ADR
+    0087 isolation (ASVS 15.2.5) silently reporting itself on.
+
+    ASSERTS THE VALUE CHANGED, NOT THAT IT EQUALS A LITERAL. An assertion against a fixed expected
+    value passes whenever that value happens to be the default, which is precisely the arm that cannot
+    tell "applied" from "dropped" -- the first version of this check picked a field already holding the
+    value it set and proved nothing.
+    """
+    cfg = _write(tmp_path / "messagefoundry.toml", '[ai]\nenvironment = "dev"\n')
+    base = load_settings(config_path=cfg, environ={})
+    other = "subprocess" if base.sandbox.mode == "off" else "off"
+    assert other != base.sandbox.mode  # the arm is only meaningful if it flips
+
+    s = load_settings(config_path=cfg, environ={"MEFOR_SANDBOX_MODE": other})
+    assert s.sandbox.mode == other
+    assert s.sandbox.mode != base.sandbox.mode
+
+
+def test_an_unrecognised_sandbox_mode_is_refused_rather_than_defaulting(tmp_path: Path) -> None:
+    """A typo must fail closed. Before #1365 the whole variable was dropped, so a garbage value was
+    accepted in silence; once the section resolves, the ``Literal`` rejects it and names the choices."""
+    cfg = _write(tmp_path / "messagefoundry.toml", '[ai]\nenvironment = "dev"\n')
+    with pytest.raises(ValidationError, match="subprocess"):
+        load_settings(config_path=cfg, environ={"MEFOR_SANDBOX_MODE": "nonsense-value"})
+
+
+def test_every_section_model_is_env_overridable_or_documented_as_not(tmp_path: Path) -> None:
+    """THE GUARD THAT WOULD HAVE CAUGHT #1365, AND WILL CATCH THE NEXT ONE.
+
+    A section absent from ``_SECTIONS`` does not fail -- it DISAPPEARS. ``_env_overrides`` drops the
+    variable and returns normally, so nothing anywhere reports a problem. Only a comparison against the
+    section models makes the absence visible, which is why this is a set difference rather than a test
+    of any one key.
+
+    Each exclusion carries its reason. Adding a new settings section without deciding this question
+    reds here instead of silently shipping an unreachable switch.
+    """
+    from messagefoundry.config.settings import _ENV_PREFIX, _SECTIONS, _section_models
+
+    # Sections deliberately NOT reachable by ``MEFOR_*`` today, each with the reason it is not a bug
+    # this test should hide.
+    known_absent = {
+        # UNREACHABLE BY CONSTRUCTION, not merely unlisted. `_env_overrides` partitions on the FIRST
+        # underscore, so MEFOR_CERT_MONITOR_ENABLED resolves to section "cert", not "cert_monitor".
+        # Listing these would NOT make them settable; that needs a parser change, not an entry here.
+        "cert_monitor",
+        "secret_rotation",
+        "update_check",
+        # Single-word and therefore reachable the moment it is listed -- the same defect as #1365,
+        # left out of that item deliberately to keep the fix to what was dispatched. Not a decision
+        # that it should stay unreachable.
+        "service",
+    }
+    models = set(_section_models())
+    unreachable = sorted(models - set(_SECTIONS) - known_absent)
+    assert not unreachable, (
+        f"settings section(s) {unreachable} have a model but no _SECTIONS entry, so MEFOR_"
+        f"{_ENV_PREFIX and ''}<SECTION>_<KEY> for them is silently DROPPED rather than refused. Add "
+        "the entry, or add the name above with the reason it cannot be env-set."
+    )
+    # And the inverse: an entry naming no model would route env values into nothing.
+    orphans = sorted(set(_SECTIONS) - models)
+    assert not orphans, f"_SECTIONS names section(s) with no settings model: {orphans}"
+
+
 def test_inbound_bind_host_default(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.chdir(tmp_path)
     s = load_settings(environ={})
