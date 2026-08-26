@@ -254,7 +254,9 @@ function Get-Clean {
     # interpolated into a line, and nothing else in this script builds a line from message content.
     # Same idiom as announce-session.ps1's Get-Clean, with one step added. It is duplicated rather than
     # shared because announce-session.ps1 is an executable hook that ends in `exit 0` and cannot be
-    # dot-sourced; extracting it would edit a WIRED hook, and this channel is deliberately not wired.
+    # dot-sourced; extracting it would edit a WIRED hook. (The original reason added "and this channel
+    # is deliberately not wired" -- FALSE since BACKLOG #1215: this hook is wired at SessionStart and
+    # Stop. The duplication argument stands on the dot-sourcing half alone.)
     #
     # ORDER IS LOAD-BEARING:
     #   1. \p{C} -> space. Control characters AND newlines become word breaks, so a field cannot break
