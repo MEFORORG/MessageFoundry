@@ -16737,3 +16737,74 @@ share a shape.
 **Related:** #1307 (the retirement flag itself), #1363 (the ordering defect in the same path), #1242 (the carry-through's silent-drop incident, whose fix this must not undo).
 
 **Source:** routed by the Liaison. Their brief said `apply.py` never reads the field and that it appears only in argparse help; both are wrong -- the reader is built dynamically as `retired_{sub}`, which a literal grep for `retired_absence` cannot see. Their brief also said the ledger had zero mentions of it; #1363's evidence block carries two.
+
+## 1367. The gate-parity failure asks the reader to attribute the drift instead of computing it
+
+> 🔢 **Filed 2026-08-26 -- FIXED IN THIS CHANGE; the status banner is deliberately unchanged**
+> (same handling as #1026, #1361 and #1365). `test_the_installed_gate_matches_the_committed_source`
+> compares the installed gate against THIS CHECKOUT, which is the right question. Its failure text
+> then correctly REFUSES to name a culprit and hands the reader a `git log` to run. Three seats did
+> not run it.
+
+**Cluster:** Tooling / worktree gate. **Priority:** P3. **Verdict:** build (small, test-only).
+**Severity:** a misread of this message left 121 worktrees ungoverned for some minutes.
+
+**The message was already right, and that is the point.** It says, verbatim: *"WORK OUT WHICH COPY IS
+OLDER FIRST. Installing from a checkout older than the installed gate DOWNGRADES a machine-global file
+for every session on this box"*, and *"A re-install would clear any of the three ... but it clears a
+genuine rule difference the same way, so the fact that it worked tells you NOTHING about which one you
+had."* That is exactly the trap that was then fallen into, warned about in advance, in the text being
+looked at. **An instruction that must be followed under time pressure is one that will not be.** The
+defect is that the test asks for an attribution it can compute itself.
+
+**Two premises in the dispatch were wrong, and both were measured rather than argued.**
+
+*"Every seat with an open PR is behind main, so every seat sees this."* Distance is not the predicate:
+
+```
+wtcsartifact    0 behind    7 passed
+builder-1       11 behind   7 passed      <- behind, and PASSES
+gate files changed on main in those 11 commits: 0
+```
+
+**The gate SOURCE has to have moved.** A seat 40 commits behind whose gate files did not move is
+green; a seat 1 behind whose gate file did move is red. The true statement is *"every seat is exposed
+in the window after a gate change lands"*, which is a much smaller claim.
+
+*"2 failed, 22 passed"* is 24 tests and this file has 7 (control: `grep -c '^def test_'` = 7), so that
+reading is from a wider selection and does not describe this file.
+
+**The fix is STRICTLY ADDITIVE. What is compared does not change and the assertion does not move.** A
+computed verdict is added to the failure text, from `origin/main`'s blob of the same path:
+
+| installed | checkout | verdict |
+|---|---|---|
+| == main | != main | YOUR CHECKOUT is the odd one out -- behind, or legitimately changing the gate. **Do not reinstall.** |
+| != main | == main | THE INSTALLED COPY is the odd one out. This is what the test exists for. |
+| != main | != main | Neither matches. Unattributable, and the strongest reading. |
+| main unreadable | | **ATTRIBUTION UNAVAILABLE** -- says so rather than guessing. |
+
+**The two rejected shapes, recorded because rejecting them is most of the work.**
+
+*Comparing against `origin/main` INSTEAD* would go green when the installed copy is **tampered with**,
+so long as it matches main -- strictly worse than the problem being solved -- and would red a pull
+request that is legitimately CHANGING the gate.
+
+*Skipping when the checkout is behind* risks a **false green**, and this file's own negative control
+exists to prevent exactly that: its docstring says folding CRLF out of the comparison was *"precisely
+the edit that could turn a false RED into a false GREEN"*. Spending a guard to quiet a message is the
+trade this project refuses everywhere else.
+
+**Additive attribution cannot produce a false green, because the assertion is untouched.** That is the
+whole argument for this shape.
+
+**The unreadable branch is the one that matters most and is easiest to lose.** A missing fetch, a
+detached ref and a network-less runner all land there. If it degraded into silently picking one of the
+other three, the message would look complete while naming a culprit nothing established -- worse than
+the original, because a computed-looking verdict is trusted more than a request to go and check. It
+has its own test saying so, and a fifth test asserts the four branches are mutually distinct, since
+four branches returning the same text would pass every other assertion in the block.
+
+**Driven against the PURE verdict function with injected hashes**, never by mutating the installed
+gate: that file is machine-global and every PreToolUse hook on this box reads it, so a test may not
+take it out from under a concurrent session. Same reasoning the existing negative control gives.
