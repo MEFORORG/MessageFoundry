@@ -12398,6 +12398,35 @@ BUILDS it.*
 **Provenance.** Diagnosed by the lane whose own commit tripped it: seven tests in one file failed in a full run and **passed in isolation, twice**. It reported the negative control alongside the fix -- restoring the bare import reproduced exactly those seven failures -- which is what makes the green meaningful. Recorded here rather than left in session mail because the collision outlives the commit that revealed it. It is the same shape as the rest of this cluster: **the name resolved to the neighbouring module, and nothing said so.**
 
 ## 1256. the federated binding guards account-continuity but never subject-exclusivity, so two accounts can bind one identity
+> **THE ATOMICITY HALF IS BUILT 2026-08-27; banner left open for the archive pass.** A partial/filtered
+> unique index `ux_users_federated_subject` on `(oidc_issuer, oidc_subject)` now exists on all three
+> backends, and the race loser is rendered as the SAME `federated_subject_already_bound` outcome the
+> sequential path returns rather than a 500.
+>
+> **THE ACCEPTANCE DEMONSTRATES THE RACE, as this row's correction demands.** Two concurrent first
+> logins for one subject, interleave FORCED by an `asyncio.Barrier` so both reads complete before
+> either write. Removing the index reds it: both bind. **A second test asserts both logins observed
+> NO holder** -- without that, a future refactor that quietly serialises them would leave the first
+> test green while the index was never consulted, which is this row's own failure mode one level up.
+>
+> **THREE CORRECTIONS MADE WHILE BUILDING, each found by asking what the codebase already does:**
+> 1. The SQLite index CANNOT live in `_SCHEMA`: it runs at `store.py:2087`, `_migrate` at `:2088`, so
+>    on a users table predating the federated columns it references a column that does not exist yet.
+>    It sits in `_migrate` beside `ix_queue_body_ref`, which records that same reasoning.
+> 2. SQL Server needed a RE-TYPE migration, not just a declaration change. The `ALTER TABLE ... ADD`
+>    guards are `COL_LENGTH(...) IS NULL` and fire only when a column is ABSENT, so an existing table
+>    keeps `NVARCHAR(MAX)` -- which cannot be an index key. `COL_LENGTH` returns **-1** for MAX, which
+>    is the discriminator. NVARCHAR(256), not 450: 2x256x2 = 1024 bytes, inside the 1700-byte limit.
+> 3. **A contract exception was added and REVERTED.** `FederatedSubjectConflict` in `store/base.py`
+>    existed so `auth/` would not import three drivers -- but `auth/service.py:2558` already solves
+>    that without one, joining the class MRO names and testing for `Integrity`/`UniqueViolation`
+>    (ADR 0068 4's duplicate-label race, the same check-then-act shape). Sound reasoning, wrong
+>    mechanism, because the constraint it designed around had already been dissolved. Do not re-add.
+>
+> **The `WHERE ... IS NOT NULL` filter is stylistic on SQLite and Postgres and REQUIRED on SQL Server**,
+> where NULLs compare EQUAL in a unique index -- unfiltered, it would admit exactly ONE unfederated
+> user in the table. A reader who learned the rule from the SQLite file would delete it as redundant.
+>
 
 > 🔢 **Re-scored 2026-08-20 -> P2.** Value **5/10** · Difficulty **4/10** · _fill-in_. The behavioural half is closed in shipped code -- auth/service.py:1219-1232 refuses a second account binding one (issuer, subject), with the lookup on all three backends and a sequential test at tests/test_auth_oidc_service.py:456 -- so the remainder is only the database constraint that makes the read-then-write at :1219/:1232 atomic, which is worth a 5 as auth hardening with the app guard covering every non-concurrent case. Difficulty drops to 4 because the amendment moved the design half (refuse rather than re-point) into shipped code and comment, leaving a well-precedented seam: all three backends already declare unique indexes (ux_webauthn_label, ux_search_presets_owner_name), so the novel cost is one first-of-kind SQL Server ALTER COLUMN off NVARCHAR(MAX) (store/sqlserver.py:1358; the file contains zero ALTER COLUMN today), a filtered index for SQL Server NULL semantics, and a CI-only concurrent-bind test on the two server backends. _(was 7/10 · 5/10.)_
 >
