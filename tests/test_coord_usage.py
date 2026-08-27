@@ -1416,3 +1416,102 @@ def test_install_then_the_wired_command_then_the_reader_all_agree(fake_home: Pat
     code2, doc2, _ = reader("-Json", pin=fake_home / ".claude-account-2", home=fake_home)
     assert code2 == UNKNOWN
     assert doc2["reason"] == "no data"
+
+
+# --- the predicate now exists in four places, so pin them against each other -------------------
+
+COORD_INSTALL = ROOT / "scripts" / "coord" / "install-coordination.ps1"
+GATE_INSTALL = ROOT / "scripts" / "worktree" / "install-gate.ps1"
+
+#: Names that actually occur, or plausibly could, under a home directory on a box running several
+#: Claude logins. Each entry is (name, is_a_launchable_account_root).
+_ROOT_NAMES = [
+    (".claude-account-1", True),
+    (".claude-account-42", True),
+    (".claude-account-2.lock", False),  # a real directory on this box; carries a settings.json
+    (".claude-account-", False),
+    (".claude-account-2b", False),
+    (".claude-desktop-1", False),  # carries a .claude.json; nothing launches from it
+    (".claude-hooks", False),
+    (".claude-tools", False),
+    (".claudex", False),
+]
+
+
+def test_the_shared_predicate_matches_the_one_install_gate_and_its_python_twin_use() -> None:
+    """FOUR COPIES OF ONE RULE, AND THIS IS WHAT KEEPS THEM HONEST.
+
+    ``config-roots.ps1`` was added so ``install-usage-statusline.ps1`` would not write a fourth. It
+    could not simply absorb the other three: ``install-gate.ps1`` pairs its copy with a deliberately
+    WIDER independent audit population that must not be selected by the same predicate it checks, and
+    ``tests/test_gate_installed_parity.py`` holds that copy in parity with a Python reader. Folding
+    them in is its own migration with its own test surface.
+
+    So instead of one definition, the rule is one BEHAVIOUR, asserted here across every copy. A future
+    edit to any of them turns this red instead of going silent — which is the outcome SDS-3.5 is
+    actually after.
+    """
+    script = "; ".join(
+        [
+            f". '{CONFIG_ROOTS}'",
+            "$g = [regex]'\\A\\.claude-account-\\d+\\z'",  # install-gate.ps1:114, quoted
+            "foreach ($n in @(" + ",".join(f"'{n}'" for n, _ in _ROOT_NAMES) + ")) { "
+            "$mine = $script:ClaudeAccountRootName.IsMatch($n); "
+            "$gate = $g.IsMatch($n); "
+            "$coord = $n -match '^\\.claude$|^\\.claude-account-\\d+$'; "
+            'Write-Output "$n $mine $gate $coord" }',
+        ]
+    )
+    proc = subprocess.run(
+        ["pwsh", "-NoProfile", "-NonInteractive", "-Command", script],
+        capture_output=True,
+        text=True,
+        timeout=TIMEOUT,
+        check=True,
+    )
+    seen: dict[str, tuple[bool, bool, bool]] = {}
+    for line in proc.stdout.strip().splitlines():
+        dir_name, a, b, c = line.split()
+        seen[dir_name] = (a == "True", b == "True", c == "True")
+
+    for name, expected in _ROOT_NAMES:
+        mine, gate, coord = seen[name]
+        assert mine == expected, (
+            f"config-roots.ps1 classifies {name} as {mine}, expected {expected}"
+        )
+        assert gate == expected, f"install-gate.ps1's copy disagrees on {name}"
+        assert coord == expected, f"install-coordination.ps1's copy disagrees on {name}"
+
+    # The literal is quoted above rather than parsed out of install-gate.ps1, so assert it is still
+    # the literal that file carries — otherwise this test pins a string nobody uses.
+    assert "[regex]'\\A\\.claude-account-\\d+\\z'" in GATE_INSTALL.read_text(encoding="utf-8")
+    assert "'^\\.claude$|^\\.claude-account-\\d+$'" in COORD_INSTALL.read_text(encoding="utf-8")
+
+
+def test_the_one_place_the_copies_disagree_is_named_rather_than_discovered() -> None:
+    """CASE. ``install-coordination.ps1`` uses ``-match``, which is case-INSENSITIVE by default;
+    ``[regex]::IsMatch`` is case-SENSITIVE. A ``.Claude-Account-2`` is creatable on Windows and would
+    be accepted by one copy and rejected by the other.
+
+    No such directory exists on the box this was measured on, so nothing differs today. It is asserted
+    here anyway, because a difference that is written down is a decision and a difference that is only
+    latent is a trap — and the ``-Status`` audit in ``install-usage-statusline.ps1`` reports any
+    ``~/.claude*`` directory carrying a settings.json that the predicate rejected, which is what makes
+    this under-reach loud rather than silent.
+    """
+    script = (
+        f". '{CONFIG_ROOTS}'; "
+        "$n = '.Claude-Account-2'; "
+        "Write-Output $script:ClaudeAccountRootName.IsMatch($n); "
+        "Write-Output ($n -match '^\\.claude$|^\\.claude-account-\\d+$')"
+    )
+    proc = subprocess.run(
+        ["pwsh", "-NoProfile", "-NonInteractive", "-Command", script],
+        capture_output=True,
+        text=True,
+        timeout=TIMEOUT,
+        check=True,
+    )
+    strict, loose = proc.stdout.split()
+    assert strict == "False", "the shared predicate stopped being case-sensitive"
+    assert loose == "True", "install-coordination.ps1's -match stopped being case-insensitive"

@@ -686,14 +686,33 @@ whole shape:
 
 | | |
 |---|---|
-| [`usage-collect.ps1`](../scripts/coord/usage-collect.ps1) | the statusLine. Publishes to `~/.claude/mefor-usage/latest.json` |
-| [`usage.ps1`](../scripts/coord/usage.ps1) | reads it, adds burn rate, answers *will this run out before it resets* |
-| [`install-usage-statusline.ps1`](../scripts/coord/install-usage-statusline.ps1) | wires it (owner, plain terminal) |
+| [`usage-collect.ps1`](../scripts/coord/usage-collect.ps1) | the statusLine. Publishes to `<config root>/mefor-usage/latest.json` — one per account root |
+| [`usage.ps1`](../scripts/coord/usage.ps1) | reads it, adds burn rate, answers *will this run out before it resets*. `-AllRoots` surveys every root |
+| [`install-usage-statusline.ps1`](../scripts/coord/install-usage-statusline.ps1) | wires it (owner, plain terminal). Defaults to this session's pinned root; `-ConfigDir <dir>` names one, `-AllRoots` does every account root |
+| [`config-roots.ps1`](../scripts/coord/config-roots.ps1) | definitions the other three share: what a config root is, which one am I in, where does its state live |
 
-**One publisher, N readers.** The quota is **account-wide** — every session in every repo draws down the
-same 5-hour and 7-day pools — so any one session's reading is the truth for all of them. Do not run a
-collector per session expecting to sum them; that double-counts a shared pool. The publish path is
-user-level for the same reason: the data is a property of the account, not of a checkout.
+**One publisher, N readers — per account.** The quota is **account-wide**: every session in every repo
+draws down the same 5-hour and 7-day pools, so any one session's reading is the truth for all sessions
+*on that account*. Do not run a collector per session expecting to sum them; that double-counts a shared
+pool.
+
+**It is not machine-wide, and an earlier version of this section said it was.** A box can run several
+config roots at once, and **a config root holds one credential set and therefore one Anthropic account**
+— measured on this box, five account roots carrying five different account emails and five separate
+pools. Publishing them all to one user-level file is last-writer-wins across unrelated quotas, and the
+damage compounds: the percentage flaps, the carry-forward can leave `five_hour` from one account beside
+`seven_day` from another in one document, and `usage.ps1`'s staleness guard **never fires** because some
+other account keeps the file warm. That last one is the worst — the guard looks present and is disarmed.
+So the publish path is per config root, derived by one shared function that the collector, the reader and
+the installer all call. The full statement of the rule lives in
+[`usage-collect.ps1`](../scripts/coord/usage-collect.ps1)'s header; everything else links to it.
+
+**The installer writes the root a session actually reads.** It used to write `~/.claude/settings.json`
+unconditionally and report *"INSTALLED (user level — every session on this machine)"*. Claude Code reads
+settings from the root named by `CLAUDE_CONFIG_DIR`, which every launcher here pins, so the statusLine
+never fired, nothing ever published, and `usage.ps1` correctly said the collector was not installed — an
+install success followed by a reader saying it was never installed. The success message now names each
+file it wrote and nothing else.
 
 **It only runs in an interactive session.** The statusLine is part of the TUI's render tree and never
 executes under `claude -p` or the SDK. A headless coordinator can *read* what this publishes and can
@@ -713,14 +732,22 @@ blind spot is its own defect**, and a worse one than an omission: a session told
 unknowable stops trusting a reading that was accurate. Corrected against the actual panel, 2026-08-02.
 
 ```powershell
-pwsh -NoProfile -File scripts\coord\usage.ps1          # human
-pwsh -NoProfile -File scripts\coord\usage.ps1 -Json    # coordinator
+pwsh -NoProfile -File scripts\coord\usage.ps1             # human -- THIS session's account
+pwsh -NoProfile -File scripts\coord\usage.ps1 -Json       # coordinator
+pwsh -NoProfile -File scripts\coord\usage.ps1 -AllRoots   # every config root, side by side
 ```
+
+The bare invocation still works and now means **this session's account**, not the box. `-AllRoots` is a
+**survey, never a merge**: the roots are different accounts with different pools, so nothing is summed,
+averaged or worst-of'd across them, and the exit code stays this session's verdict.
 
 Exit codes so a coordinator can branch without parsing prose: **0** ok, **10** warn, **11** critical,
 **20** unknown. `UNKNOWN` is a real answer here and is returned whenever the reading is stale, undateable
 or future-dated — a percentage is never extrapolated from a dead publisher, and every number is printed
-with its own age. **Do not read a missing bucket as an empty one.**
+with its own age. **Do not read a missing bucket as an empty one.** Two more states return it: a document
+stamped with a config root other than the one it sits under is **refused** rather than reported as this
+session's headroom, and when there is no data at all the message diagnoses *which* of five states this
+root is in, each with a different fix, instead of saying "not installed or has not run yet".
 
 > **`ccusage` does not do this**, despite being the tool everyone recommends and despite several
 > summaries claiming it "fetches real rate limit data". It parses transcripts for tokens and dollars; its
