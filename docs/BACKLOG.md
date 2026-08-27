@@ -5531,6 +5531,36 @@ complete result, not a stall.
 **Source:** the bypass was found 2026-08-05 by a session auditing its own change after a peer noted that `ledger_check.py`'s ownership model depends on the worktree gate; `--detach` and `-d` were then found by asking the same question a second time rather than patching the first flag.
 
 ## 1040. Hook deny text is attacker-influenceable output that an agent is instructed to act on, and nothing treats it as such
+> **BOTH REMAINING SURFACES ARE CLOSED 2026-08-27; banner left open for the archive pass.**
+> `push_guard.py` and `ledger_check.py` now fold every attacker-influenceable value they interpolate
+> into deny prose -- `remote_ref` (which arrives on STDIN) and `_describe(hits)` in the first,
+> ADR filenames in the second, where they land in a REMEDIATION BLOCK an agent is told to act on.
+>
+> **THIS ROW'S OWN COORDINATES WERE STALE AND ARE CORRECTED HERE.** It still pointed at the
+> `claim_check.py` site as outstanding. That LANDED on 2026-08-23 in `889dd9409` (PR #547), whose
+> commit message names these two as the ones NOT done. Measured now: `claim_check.py` folds at **5**
+> sites. A reader taking the row at face value would have rebuilt merged work.
+>
+> **A LOCAL COPY OF THE HELPER IN EACH FILE, WHICH IS MECHANICAL AND NOT A STYLE CHOICE.**
+> `install-git-hooks.ps1` COPIES these files into the git hooks directory and runs them from there,
+> so an import of anything under `scripts/hooks/` resolves at development time and fails at the moment
+> the gate actually runs. `collision_gate.ps1` took a local copy of its PowerShell equivalent for the
+> same reason.
+>
+> **PROSE ONLY -- no command quoting was needed.** Every remediation command in both files already
+> uses a `<branch>` / `<ref>` placeholder rather than interpolating the value, so the injection
+> surface here is the prose alone. Checked before changing anything.
+>
+> **TWO MUTATIONS, AND THEY RED IN OPPOSITE DIRECTIONS -- which is why both test kinds exist.**
+> Unwrapping one call site reds ONLY the wiring row; neutering the fold body reds ONLY the property
+> rows. A working fold that is never called, and a called fold that does nothing, are different
+> defects and each row is blind to the other's.
+>
+> **NOT OVERSTATED.** #1056 measured push_guard's ls-tree surface as NOT injectable -- git C-quotes
+> control characters, and `remote_ref` comes from `line.split()` so it carries no space or line break.
+> What `git check-ref-format` DOES accept is `;`, `$`, `|`, `"` and `'`. The fold is cheap and uniform
+> with the sibling gate; it removes the question rather than re-deriving it at each new call site.
+>
 
 > 🚧 **Re-scored 2026-08-20 -> P2.** Value **6/10** · Difficulty **3/10** · _quick win_. The two proven-exploitable surfaces are closed and one helper per class exists in PowerShell, so the residual is applying the same treatment to the Python hooks, of which claim_check.py:134-140 is a confirmed untreated prose interpolation of a newline-capable value. Value drops from 8 because the highest-influence values (a refname into a command, a Write file_path into prose) are now folded, and difficulty drops from 5 because the audit is done and the Python hooks need one small helper rather than the PowerShell one. _(was 8/10 · 5/10.)_
 >
