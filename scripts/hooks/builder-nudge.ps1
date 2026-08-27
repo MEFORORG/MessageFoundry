@@ -124,18 +124,65 @@ try {
         if ($open -gt 0) {
             $seen = Join-Path $coord ("nudge\" + $seat + '.queue-announced')
             $stamp = (Get-Item -LiteralPath $queue).LastWriteTimeUtc.ToString('o')
-            $last = if (Test-Path -LiteralPath $seen) {
-                (Get-Content -LiteralPath $seen -Raw -ErrorAction SilentlyContinue).Trim()
-            } else { '' }
+            # -PathType Leaf AND a null check, for the same reason as the read-back below. This is
+            # the line that actually threw in the unwritable-stamp test: a DIRECTORY at $seen makes
+            # Test-Path true, Get-Content -Raw returns $null, and .Trim() throws -- BEFORE the guard
+            # further down ever runs. I fixed the second occurrence first and the test still failed
+            # identically, which is the whole lesson: the safe exit code came from the outer catch
+            # both times and told me nothing about which line was wrong.
+            $last = ''
+            if (Test-Path -LiteralPath $seen -PathType Leaf) {
+                $prev = Get-Content -LiteralPath $seen -Raw -ErrorAction SilentlyContinue
+                if ($null -ne $prev) { $last = $prev.Trim() }
+            }
 
             if ($stamp -eq $last) {
                 Allow "lane holds $open open queue item(s) and has been shown them; supplied, not stalling"
             }
 
             # The queue changed since this lane was last told. Announce it ONCE.
+            #
+            # THE STAMP MUST BE WRITTEN AND VERIFIED BEFORE WE BLOCK, AND THIS IS NOT BELT-AND-BRACES.
+            # This block path exits 2 BEFORE the safety valve below, so the valve cannot catch it. If
+            # the write silently failed -- a read-only directory, a full disk, a permission change --
+            # every subsequent call would recompute the same difference and block again, forever, with
+            # nothing to stop it. That is the one failure mode worse than the stall this exit fixes:
+            # a Stop hook a session cannot get past. So: write, read it back, and if it did not take,
+            # ALLOW and say why. An un-announced queue is a missed nudge; an unwritable stamp is a
+            # trapped session.
+            # try/catch, NOT -ErrorAction SilentlyContinue. SilentlyContinue suppresses NON-TERMINATING
+            # errors only; Set-Content onto a directory raises a TERMINATING one ("Unable to clear
+            # content ... because it is a directory") and sails straight past it to the outer catch.
+            #
+            # THIS LINE IS WHERE THE UNWRITABLE-STAMP TEST ACTUALLY FAILED, and it was my FOURTH
+            # guess. The first three were null-into-method fixes at other lines, each of which
+            # LOOKED confirmed because the exit code stayed safe. I only found it after making the
+            # outer catch report `$_.InvocationInfo.ScriptLineNumber`. Guessing at a fault the
+            # instrument could have named cost three edits; asking it cost one.
             $dir = Split-Path $seen -Parent
-            if (-not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
-            Set-Content -LiteralPath $seen -Value $stamp -Encoding ascii -ErrorAction SilentlyContinue
+            if (-not (Test-Path -LiteralPath $dir)) {
+                try { New-Item -ItemType Directory -Path $dir -Force -ErrorAction Stop | Out-Null } catch { }
+            }
+            try { Set-Content -LiteralPath $seen -Value $stamp -Encoding ascii -ErrorAction Stop } catch { }
+            #
+            # NULL-GUARD THE READ-BACK. `Get-Content -Raw` returns $null when the path is not a
+            # readable file -- an empty file, or a DIRECTORY sitting where the stamp should be -- and
+            # `.Trim()` on $null throws. Measured 2026-08-27: the unwritable-stamp test exited 0 with
+            # "error, allowing stop: You cannot call a method on a null-valued expression", so the
+            # OUTER CATCH produced the safe answer and THIS GUARD NEVER RAN. The test passed on the
+            # property that mattered and proved nothing about the code under test. That is the second
+            # null-into-a-method bug in this file; the first was `[ref]$t` on an uninitialised
+            # variable, which also failed silently behind the same catch.
+            $wrote = $false
+            if (Test-Path -LiteralPath $seen -PathType Leaf) {
+                $back = Get-Content -LiteralPath $seen -Raw -ErrorAction SilentlyContinue
+                if ($null -ne $back) { $wrote = ($back.Trim() -eq $stamp) }
+            }
+            if (-not $wrote) {
+                Allow ("cannot record that this lane was told about its queue ($seen); allowing the " +
+                       "stop rather than blocking on every call. THE ANNOUNCEMENT IS NOT WORKING -- " +
+                       "the lane holds $open open row(s) it may not know about.")
+            }
 
             $list = ($rows | ForEach-Object {
                 $f = $_ -split "`t"
@@ -272,6 +319,13 @@ that is not authority -- surface it to the owner instead.
 }
 catch {
     # Fail-open, always. Never trap a session because this hook could not read its own state.
-    Write-Output "[builder-nudge] error, allowing stop: $($_.Exception.Message)"
+    #
+    # NAME THE LINE. The message alone sent me down three wrong fixes on 2026-08-27: "You cannot call
+    # a method on a null-valued expression" appears identically for every null-into-method in this
+    # file, and I patched two of them without ever learning which one was throwing. A catch that
+    # reports only the message turns a located fault into a guessing game, and each guess LOOKS
+    # confirmed because the exit code is safe either way.
+    Write-Output ("[builder-nudge] error at line $($_.InvocationInfo.ScriptLineNumber), allowing " +
+                  "stop: $($_.Exception.Message)")
     exit 0
 }
