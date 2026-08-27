@@ -431,7 +431,17 @@ def test_the_installer_refuses_to_replace_someone_elses_statusline(tmp_path: Pat
 def test_the_installed_command_actually_runs_the_collector(tmp_path: Path) -> None:
     """A wired command that resolves to nothing is this repo's most-repeated defect — the announce hook
     sat merged-and-never-installed for hours, and its own missing-script notice could not fire because it
-    lived inside the shim that was never wired. So assert the wired string EXECUTES and publishes."""
+    lived inside the shim that was never wired. So assert the wired string EXECUTES and publishes.
+
+    IT NOW RUNS THE COMMAND VERBATIM, which is what this docstring always claimed. The earlier version
+    rewrote it — ``cmd.replace("-File $s", "-File $s -StateDir '<tmp>'")`` — because the wired command
+    carried no publish path, so the test had to inject one to keep the collector off the real
+    user-level file. Since the installer now bakes a per-root path in, that injection produces
+    ``-StateDir`` twice and pwsh refuses to bind it (measured: exit 1, "specified more than once").
+    Deleting the rewrite is what lets the test exercise the actual production string, and the fixture
+    is safe by construction: ``-SettingsPath`` puts the root at ``tmp_path``, so the wired path is
+    ``tmp_path/mefor-usage``.
+    """
     settings = tmp_path / "settings.json"
     settings.write_text("{}", encoding="utf-8")
     subprocess.run(
@@ -454,18 +464,14 @@ def test_the_installed_command_actually_runs_the_collector(tmp_path: Path) -> No
     cmd = json.loads(settings.read_text(encoding="utf-8"))["statusLine"]["command"]
     assert "mefor-usage" in cmd
 
-    state = tmp_path / "state"
+    state = tmp_path / "mefor-usage"
+    # The publish path is baked into the command, so assert it points where this root reads — a
+    # recomputed expectation would agree with a wrong wiring.
+    assert f"$d = '{state}'" in cmd, f"the wired command names no per-root publish path: {cmd!r}"
+
     payload = json.dumps({"session_id": "wired", "rate_limits": {"five_hour": window(55.0, 3600)}})
-    # Run the wired command itself, with the collector's state redirected so the test cannot write to
-    # the real user-level publish path.
     proc = subprocess.run(
-        [
-            "pwsh",
-            "-NoProfile",
-            "-NonInteractive",
-            "-Command",
-            cmd.replace("-File $s", f"-File $s -StateDir '{state}'"),
-        ],
+        ["pwsh", "-NoProfile", "-NonInteractive", "-Command", cmd],
         input=payload,
         capture_output=True,
         text=True,
@@ -475,3 +481,938 @@ def test_the_installed_command_actually_runs_the_collector(tmp_path: Path) -> No
     assert proc.returncode == 0, proc.stderr
     assert "55" in proc.stdout, f"the wired command produced no reading: {proc.stdout!r}"
     assert (state / "latest.json").exists(), "the wired command ran but published nothing"
+
+
+# ------------------------------------------------------------- config roots and the publish partition
+#
+# WHY THIS SECTION EXISTS. The installer used to write ``~/.claude/settings.json`` unconditionally and
+# report "INSTALLED (user level -- every session on this machine)". On a box whose launchers pin
+# ``CLAUDE_CONFIG_DIR`` to ``~/.claude-account-<N>``, Claude Code reads the PINNED root, so the
+# statusLine never fired, nothing ever published, and ``usage.ps1`` correctly said the collector was
+# not installed. An install success followed by a reader saying it was never installed.
+#
+# The second half is the publish path. A config root holds one credential set and therefore one
+# Anthropic account; measured on the box this was written for, five account roots carry five different
+# account emails and five separate 5h/7d pools. Publishing them all to one user-level file is
+# last-writer-wins across unrelated quotas, and it disarms the staleness guard -- some other account
+# keeps the file warm, so a reading always looks fresh. So the publish path is per config root, and
+# these tests pin that the writer and the reader derive it from the same rule.
+
+CONFIG_ROOTS = ROOT / "scripts" / "coord" / "config-roots.ps1"
+
+
+def _env(pin: Path | str | None) -> dict[str, str]:
+    """A child environment with the pin set EXPLICITLY, or explicitly absent.
+
+    ``os.environ.copy()`` alone is not enough and the gap is silent: this suite runs inside a Claude
+    Code session, which on this box is itself pinned, so a child inherits ``CLAUDE_CONFIG_DIR`` and the
+    "no pin" arm would quietly test the "pinned" one and pass. It is popped, never merely overwritten.
+    """
+    env = os.environ.copy()
+    env.pop("CLAUDE_CONFIG_DIR", None)
+    if pin is not None:
+        env["CLAUDE_CONFIG_DIR"] = str(pin)
+    return env
+
+
+def install(
+    *args: str,
+    pin: Path | str | None = None,
+    home: Path | None = None,
+    collector: Path | None = COLLECT,
+) -> subprocess.CompletedProcess[str]:
+    cmd = ["pwsh", "-NoProfile", "-NonInteractive", "-File", str(INSTALL)]
+    if home is not None:
+        cmd += ["-HomeDir", str(home)]
+    if collector is not None:
+        cmd += ["-CollectorPath", str(collector)]
+    cmd += list(args)
+    return subprocess.run(
+        cmd, capture_output=True, text=True, timeout=TIMEOUT, check=False, env=_env(pin)
+    )
+
+
+def reader(
+    *args: str,
+    pin: Path | str | None = None,
+    home: Path | None = None,
+    script: Path | None = None,
+) -> tuple[int, dict[str, Any], str]:
+    cmd = ["pwsh", "-NoProfile", "-NonInteractive", "-File", str(script or READ)]
+    if home is not None:
+        cmd += ["-HomeDir", str(home)]
+    cmd += list(args)
+    proc = subprocess.run(
+        cmd, capture_output=True, text=True, timeout=TIMEOUT, check=False, env=_env(pin)
+    )
+    out = proc.stdout.strip()
+    parsed: dict[str, Any] = {}
+    if "-Json" in args and out:
+        parsed = json.loads(out)
+    return proc.returncode, parsed, proc.stdout
+
+
+def wired(settings: Path) -> str:
+    cmd: str = json.loads(settings.read_text(encoding="utf-8"))["statusLine"]["command"]
+    return cmd
+
+
+@pytest.fixture
+def fake_home(tmp_path: Path) -> Path:
+    """A home directory shaped like the real box, INCLUDING the three kinds of look-alike.
+
+    ``.claude-account-2.lock`` is a real directory on this machine carrying a settings.json and no
+    ``.claude.json`` — a loose ``.claude-account-*`` glob adopts it, and ``install-gate.ps1`` wired it
+    on every run for weeks (BACKLOG #1024). ``.claude-desktop-<N>`` carry a ``.claude.json`` and
+    nothing launches from them, which is why "has a .claude.json" is also the wrong predicate.
+    """
+    h = tmp_path / "home"
+    for name in (
+        ".claude",
+        ".claude-account-1",
+        ".claude-account-2",
+        ".claude-account-2.lock",
+        ".claude-desktop-1",
+        ".claude-tools",
+    ):
+        (h / name).mkdir(parents=True)
+    (h / ".claude-account-2.lock" / "settings.json").write_text("{}", encoding="utf-8")
+    return h
+
+
+# --- requirement 1: honour the pin -------------------------------------------------------------
+
+
+def test_a_pinned_config_dir_is_where_the_statusline_lands(fake_home: Path) -> None:
+    """THE LIVE SYMPTOM, REPRODUCED. Reverting the installer to a ``-SettingsPath`` default of
+    ``<home>\\.claude\\settings.json`` makes this fail on the second assertion."""
+    pin = fake_home / ".claude-account-1"
+    proc = install(pin=pin, home=fake_home)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert (pin / "settings.json").exists(), "the pinned root was not written"
+    assert not (fake_home / ".claude" / "settings.json").exists(), (
+        "the default root was written even though CLAUDE_CONFIG_DIR named another"
+    )
+
+
+def test_a_pinned_root_does_not_steal_an_explicit_settings_path(
+    fake_home: Path, tmp_path: Path
+) -> None:
+    """Rule 1 outranks rule 4, and the script-scope explicitness capture actually works.
+
+    THE TWO PRE-EXISTING INSTALLER TESTS CANNOT CATCH THIS. They check only their own fixture root, so
+    they pass whether or not the pin is honoured. If ``$PSBoundParameters`` were tested inside the
+    resolver function instead of at script scope it would read False for every caller (measured: a
+    function's own ``$PSBoundParameters`` is EMPTY), rules 1 and 2 would be unreachable, and this
+    install would land in the caller's live pinned root instead of the fixture.
+    """
+    fixture = tmp_path / "fixture"
+    fixture.mkdir()
+    settings = fixture / "settings.json"
+    settings.write_text("{}", encoding="utf-8")
+    pin = fake_home / ".claude-account-2"
+
+    proc = install("-SettingsPath", str(settings), pin=pin, home=fake_home)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "statusLine" in json.loads(settings.read_text(encoding="utf-8"))
+    assert not (pin / "settings.json").exists(), "the pin overrode an explicit -SettingsPath"
+
+
+def test_no_pin_still_installs_into_the_default_config_dir(fake_home: Path) -> None:
+    """The negative arm: with no pin the shipped behaviour is restored exactly, so rule 5 is a
+    regression fence rather than a new claim."""
+    proc = install(pin=None, home=fake_home)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert (fake_home / ".claude" / "settings.json").exists()
+
+
+def test_the_no_pin_arm_really_runs_without_a_pin_and_inside_the_fixture_home() -> None:
+    """A TEST ABOUT THE TESTS, and the one standing between this suite and the real account roots.
+
+    Two ways the fixtures could be lying. First, ``CLAUDE_CONFIG_DIR`` is set in this very process on
+    the box these scripts were written for, so a child that merely inherits it would make every "no
+    pin" test exercise the pinned path. Second, ``-HomeDir`` has to be a real seam: measured, with
+    ``USERPROFILE`` overridden to ``C:/fake/home`` a child pwsh still reports
+    ``[Environment]::GetFolderPath('UserProfile') = C:\\Users\\Scott``, so a script that resolved home
+    itself could not be redirected — and ``-AllRoots`` would enumerate and WIRE the owner's live
+    account roots.
+    """
+    probe = subprocess.run(
+        [
+            "pwsh",
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            "if ($env:CLAUDE_CONFIG_DIR) { 'PINNED:' + $env:CLAUDE_CONFIG_DIR } else { 'NOPIN' }",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=TIMEOUT,
+        check=True,
+        env=_env(None),
+    )
+    assert probe.stdout.strip() == "NOPIN", (
+        "the child inherited a pin, so every 'no pin' test in this file is testing the pinned path"
+    )
+    # And the installer must accept -HomeDir at all, or the redirection above is decorative.
+    assert "-HomeDir" in INSTALL.read_text(encoding="utf-8")
+
+
+def test_a_pin_naming_a_directory_that_does_not_exist_is_refused_not_created(
+    fake_home: Path,
+) -> None:
+    """A typo'd CLAUDE_CONFIG_DIR must not manufacture a config root nothing can launch from. This
+    repo has already paid once for an installer writing into such a directory (BACKLOG #1024), and
+    ``New-Item -Force`` creates every missing parent, so the wrong reflex here is one character."""
+    ghost = fake_home / ".claude-account-99"
+    proc = install(pin=ghost, home=fake_home)
+    assert proc.returncode == 2, proc.stdout
+    assert "CANNOT START" in proc.stdout
+    assert not ghost.exists(), "a nonexistent pin was created rather than refused"
+
+
+# --- requirement 2: multi-root ------------------------------------------------------------------
+
+
+def test_all_roots_wires_the_account_roots_and_skips_the_look_alikes_and_the_default(
+    fake_home: Path,
+) -> None:
+    """Requirement 2, the anchored predicate, and the deliberate exclusion of ``~/.claude``.
+
+    NOT COVERED HERE, and stated rather than implied: the ``-Force`` on the directory glob. Its
+    absence is invisible on Windows (a dot-prefixed directory carries no hidden attribute) and
+    collapses the set to nothing on Linux. This module is skipif'd to ``os.name == "nt"``, so it can
+    never observe that failure; only a CI ubuntu leg could, and this file has none.
+    """
+    proc = install("-AllRoots", pin=None, home=fake_home)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+
+    assert (fake_home / ".claude-account-1" / "settings.json").exists()
+    assert (fake_home / ".claude-account-2" / "settings.json").exists()
+    # The three that must be left alone, each for a different reason.
+    assert not (fake_home / ".claude" / "settings.json").exists(), (
+        "-AllRoots wired the default root"
+    )
+    assert not (fake_home / ".claude-desktop-1" / "settings.json").exists(), (
+        "a .claude-desktop dir was wired -- the 'has a .claude.json' filter would do this"
+    )
+    lock = json.loads((fake_home / ".claude-account-2.lock" / "settings.json").read_text("utf-8"))
+    assert lock == {}, "the .lock look-alike was wired -- the anchors are not holding"
+
+
+def test_all_roots_on_a_home_with_no_account_roots_touches_nothing_and_says_so(
+    tmp_path: Path,
+) -> None:
+    """The removed empty-set fallback. Seeding ``~/.claude`` when the glob finds nothing would make
+    this guard dead code AND manufacture a target that by definition does not exist."""
+    empty = tmp_path / "empty-home"
+    empty.mkdir()
+    proc = install("-AllRoots", pin=None, home=empty)
+    assert proc.returncode == 2, proc.stdout
+    assert "no account config root found" in proc.stdout
+    assert not (empty / ".claude").exists()
+
+
+def test_each_root_is_wired_to_its_own_publish_path_and_they_do_not_bleed(
+    fake_home: Path,
+) -> None:
+    """THE PARTITION ITSELF. Two roots, two publish paths, and neither names the other's.
+
+    Reverting ``Get-UsageStateDir`` to a single user-level literal makes both wired commands name one
+    path, and the second assertion fails.
+    """
+    assert install("-AllRoots", pin=None, home=fake_home).returncode == 0
+    a = wired(fake_home / ".claude-account-1" / "settings.json")
+    b = wired(fake_home / ".claude-account-2" / "settings.json")
+    pa = str(fake_home / ".claude-account-1" / "mefor-usage")
+    pb = str(fake_home / ".claude-account-2" / "mefor-usage")
+    assert f"$d = '{pa}'" in a
+    assert f"$d = '{pb}'" in b
+    assert pb not in a and pa not in b, "one root's wired command names another root's publish path"
+
+
+def test_a_root_with_a_foreign_statusline_is_refused_without_abandoning_the_others(
+    fake_home: Path,
+) -> None:
+    """The refusal survives multi-root: PER ROOT, and it does not abort the run.
+
+    A foreign statusLine in one root must not cost the other roots their wiring — an installer that
+    stops at the first refusal would leave a partially wired box and a tally that says so only if you
+    read it closely, which is why the exit code for that state is 3 and not 0 or 1.
+    """
+    (fake_home / ".claude-account-1" / "settings.json").write_text(
+        json.dumps({"statusLine": {"type": "command", "command": "my-own-thing"}}), encoding="utf-8"
+    )
+    proc = install("-AllRoots", pin=None, home=fake_home)
+    assert proc.returncode == 3, f"partial outcome must be exit 3: {proc.stdout}"
+    assert "REFUSING" in proc.stdout
+    assert (fake_home / ".claude-account-2" / "settings.json").exists(), (
+        "one refusal abandoned the remaining roots"
+    )
+    kept = json.loads((fake_home / ".claude-account-1" / "settings.json").read_text("utf-8"))
+    assert kept["statusLine"]["command"] == "my-own-thing"
+
+
+def test_a_foreign_statusline_that_merely_mentions_the_marker_is_still_refused(
+    tmp_path: Path,
+) -> None:
+    """The ownership test had to stop being a substring match when the publish path went INTO the
+    command. The wired command now contains ``\\mefor-usage`` inside its ``-StateDir`` argument, so
+    ``command -like "*mefor-usage*"`` would judge any foreign statusLine that merely mentions the
+    publish path to be ours — and silently replace it, in up to five roots at once."""
+    settings = tmp_path / "settings.json"
+    theirs = "echo ~/.claude/mefor-usage/latest.json"
+    settings.write_text(
+        json.dumps({"statusLine": {"type": "command", "command": theirs}}), encoding="utf-8"
+    )
+    proc = install("-SettingsPath", str(settings), pin=None)
+    assert proc.returncode == 1
+    assert "REFUSING" in proc.stdout
+    assert json.loads(settings.read_text(encoding="utf-8"))["statusLine"]["command"] == theirs
+
+
+def test_a_statusline_with_an_empty_command_is_treated_as_absent_not_foreign(
+    tmp_path: Path,
+) -> None:
+    """A state that would otherwise have no exit. Classified FOREIGN, this root could never be wired:
+    the refusal would print with nothing after the colon (which reads as truncated output, not as a
+    finding) and offer a remedy — "merge the two commands by hand" — naming a command that does not
+    exist."""
+    settings = tmp_path / "settings.json"
+    settings.write_text(json.dumps({"statusLine": {"type": "command", "command": ""}}), "utf-8")
+    proc = install("-SettingsPath", str(settings), pin=None)
+    assert proc.returncode == 0, proc.stdout
+    assert "REFUSING" not in proc.stdout
+    assert "mefor-usage" in wired(settings)
+
+
+# --- requirement 3: the message must not claim more than it did ---------------------------------
+
+
+def test_the_success_message_names_the_file_it_wrote(fake_home: Path) -> None:
+    """Requirement 3, positive half. A truthful message would have surfaced this defect on the first
+    run instead of costing a debugging round."""
+    pin = fake_home / ".claude-account-1"
+    proc = install(pin=pin, home=fake_home)
+    assert str(pin / "settings.json") in proc.stdout, (
+        f"the success output does not name the file it wrote: {proc.stdout}"
+    )
+
+
+def test_a_single_root_install_does_not_claim_every_session_on_this_machine(
+    fake_home: Path,
+) -> None:
+    """Requirement 3, negative half, and the exact sentence that was false.
+
+    A completeness claim is a liability (CLAUDE.md section 11 / SDS-3.6). The phrase is deleted rather
+    than conditioned, because naming the files is shorter AND true.
+    """
+    out = install(pin=fake_home / ".claude-account-1", home=fake_home).stdout
+    assert "every session on this machine" not in out
+    # And no line that PRINTS can carry it either — the .DESCRIPTION quotes the old claim on purpose,
+    # as the explanation of the defect, so a plain "not in the file" check would forbid the history.
+    printing = [
+        ln
+        for ln in INSTALL.read_text(encoding="utf-8").splitlines()
+        if ("Write-Host" in ln or "Write-Output" in ln) and "every session on this machine" in ln
+    ]
+    assert not printing, f"the claim is still printed: {printing}"
+
+
+def test_no_line_claims_a_publish_that_has_not_happened(fake_home: Path) -> None:
+    """The present-tense overclaim. Writing a settings key is not publishing, and nothing on this box
+    had ever published when the defect was found — so a line reading "publishes to" would assert
+    something no check in the script supports."""
+    out = install(pin=fake_home / ".claude-account-1", home=fake_home).stdout
+    assert "wired to publish to" in out
+    assert "nothing has published there yet" in out
+    assert "publishes to " not in out
+
+
+def test_all_roots_names_each_root_it_wrote_and_the_tally_agrees(fake_home: Path) -> None:
+    """Requirement 3 under multi-root, where a bare count is most tempting and least useful.
+
+    The lines and the tally are the same counter, so they cannot disagree — the "summary says N while
+    the lines say M" defect is structurally excluded rather than asserted away.
+    """
+    out = install("-AllRoots", pin=None, home=fake_home).stdout
+    named = [ln for ln in out.splitlines() if ln.strip().startswith("WROTE")]
+    assert len(named) == 2, out
+    assert str(fake_home / ".claude-account-1" / "settings.json") in out
+    assert str(fake_home / ".claude-account-2" / "settings.json") in out
+    assert "wrote: 2" in out
+    assert "Roots examined: 2" in out
+
+
+def test_whatif_enumerates_every_target_and_exits_zero(fake_home: Path) -> None:
+    """A dry run must be safe to run and must not report failure. Under ``-WhatIf`` ShouldProcess
+    returns false for every root, so a purely tally-driven exit rule would return 1 — a dry run
+    reporting total failure, which is the summary-contradicts-the-lines defect inverted."""
+    proc = install("-AllRoots", "-WhatIf", pin=None, home=fake_home)
+    assert proc.returncode == 0, proc.stdout
+    assert proc.stdout.count("WOULD WRITE") == 2
+    assert "would write: 2" in proc.stdout
+    assert not (fake_home / ".claude-account-1" / "settings.json").exists()
+
+
+def test_a_settings_file_too_deep_to_serialise_is_failed_not_silently_truncated(
+    tmp_path: Path,
+) -> None:
+    """The guard a parse-back check cannot provide, and the draft of this design assumed it could.
+
+    Measured with a 24-level document: ``ConvertTo-Json -Depth 20`` emits a truncation warning AND THE
+    TRUNCATED TEXT STILL PARSES BACK CLEANLY, with the deep node replaced by its type name as a
+    string. So one ``-AllRoots`` run would quietly truncate up to five live account roots and count
+    every one as written.
+    """
+    settings = tmp_path / "settings.json"
+    deep: dict[str, Any] = {"leaf": 1}
+    for _ in range(24):
+        deep = {"a": deep}
+    original = json.dumps(deep)
+    settings.write_text(original, encoding="utf-8")
+
+    proc = install("-SettingsPath", str(settings), pin=None)
+    assert proc.returncode == 1, proc.stdout
+    assert "TRUNCATED" in proc.stdout
+    assert settings.read_text(encoding="utf-8") == original, "the file was rewritten anyway"
+
+
+# --- -Status and -Uninstall ---------------------------------------------------------------------
+
+
+def test_status_under_a_pin_does_not_report_the_default_root_as_configured(
+    fake_home: Path,
+) -> None:
+    """The disagreement, from the other side. ``-Status`` used to read the default root's settings
+    while every session read a pinned root — so it reported CONFIGURED about a file no session on the
+    box loads. This is the test whose failure message a person would recognise as their own problem."""
+    (fake_home / ".claude" / "settings.json").write_text(
+        json.dumps({"statusLine": {"type": "command", "command": "# mefor-usage\n$s = 'x'"}}),
+        encoding="utf-8",
+    )
+    pin = fake_home / ".claude-account-1"
+    proc = install("-Status", pin=pin, home=fake_home, collector=None)
+    assert str(pin / "settings.json") in proc.stdout
+    assert proc.returncode == 1, "an unwired pinned root must not report success"
+
+
+def test_status_reads_the_publish_path_out_of_the_wired_command_not_a_recomputed_one(
+    fake_home: Path, tmp_path: Path
+) -> None:
+    """The SDS-3.8 defect: the shipped ``-Status`` reported "script exists" against a path THAT
+    INVOCATION had just resolved from git, so a root wired from a checkout since deleted still
+    reported True. Across roots wired at different times from different checkouts, one recomputed line
+    describes none of them."""
+    pin = fake_home / ".claude-account-1"
+    elsewhere = tmp_path / "some-other-root" / "mefor-usage"
+    (pin / "settings.json").write_text(
+        json.dumps(
+            {
+                "statusLine": {
+                    "type": "command",
+                    "command": f"# mefor-usage\n$s = 'c.ps1'; $d = '{elsewhere}'; x",
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    proc = install("-Status", pin=pin, home=fake_home, collector=None)
+    assert str(elsewhere) in proc.stdout, "-Status recomputed the path instead of reading it back"
+    assert "ELSEWHERE" in proc.stdout
+    assert proc.returncode == 1
+
+
+def test_status_reports_a_legacy_command_as_its_own_state(fake_home: Path) -> None:
+    """A command written before publish paths were per-root — including every one the out-of-repo
+    propagate stopgap copied — names no ``-StateDir`` at all. Folding that into WIRED is how it goes
+    silent; where it publishes then depends on the collector's run-time fallback."""
+    pin = fake_home / ".claude-account-1"
+    (pin / "settings.json").write_text(
+        json.dumps(
+            {"statusLine": {"type": "command", "command": "# mefor-usage\n$s = 'c.ps1'; x"}}
+        ),
+        encoding="utf-8",
+    )
+    proc = install("-Status", pin=pin, home=fake_home, collector=None)
+    assert "legacy command, no -StateDir" in proc.stdout
+
+
+def test_uninstall_names_the_roots_it_actually_removed_from(fake_home: Path) -> None:
+    """The mirror-image lie, and worse than the install one because the operator believes they turned
+    something off. A single-root ``-Uninstall`` under a pin used to strip one root, print REMOVED, exit
+    0 — and leave every other root wired and still publishing."""
+    assert install("-AllRoots", pin=None, home=fake_home).returncode == 0
+    proc = install("-AllRoots", "-Uninstall", pin=None, home=fake_home, collector=None)
+    assert proc.returncode == 0, proc.stdout
+    assert str(fake_home / ".claude-account-1" / "settings.json") in proc.stdout
+    assert str(fake_home / ".claude-account-2" / "settings.json") in proc.stdout
+    assert "removed: 2" in proc.stdout
+    for n in (".claude-account-1", ".claude-account-2"):
+        assert "statusLine" not in json.loads(
+            (fake_home / n / "settings.json").read_text(encoding="utf-8")
+        )
+
+
+# --- the reader half ----------------------------------------------------------------------------
+
+
+def test_the_reader_defaults_to_its_own_config_roots_state_dir(fake_home: Path) -> None:
+    """Publisher and reader now derive the path from ONE function. They used to agree only because two
+    separate string literals happened to match, which is agreement by luck, not by construction."""
+    pin = fake_home / ".claude-account-1"
+    state = pin / "mefor-usage"
+    state.mkdir()
+    now = datetime.now(UTC).isoformat()
+    (state / "latest.json").write_text(
+        json.dumps(
+            {
+                "captured_at": now,
+                "five_hour": {
+                    "used_percentage": 12.0,
+                    "resets_at_epoch": int(time.time()) + 3600,
+                    "captured_at": now,
+                },
+                "seven_day": {
+                    "used_percentage": 30.0,
+                    "resets_at_epoch": int(time.time()) + 280000,
+                    "captured_at": now,
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    code, doc, _ = reader("-Json", pin=pin, home=fake_home)
+    # Both windows are fresh, so the verdict is a real OK rather than the UNKNOWN that a partly
+    # published document would give — which would let this pass while reading the wrong directory.
+    assert code == OK, doc
+    assert doc["config_root"].lower() == str(pin).lower()
+    assert doc["state_dir"].lower() == str(state).lower()
+    assert doc["five_hour"]["used_percentage"] == pytest.approx(12.0)
+
+
+def test_the_no_data_error_diagnoses_which_state_this_root_is_in(fake_home: Path) -> None:
+    """Requirement 4. Five states with five different fixes must not share one message.
+
+    The old message said "not installed or has not run yet" and printed the bare installer command
+    with NO root — so following the reader's own advice re-ran the exact invocation that produced the
+    false INSTALLED claim.
+    """
+    pin = fake_home / ".claude-account-1"
+
+    # (a) no settings.json at all
+    code, doc, out = reader("-Json", pin=pin, home=fake_home)
+    assert code == UNKNOWN
+    assert doc["statusline_state"] == "NOT_WIRED_NO_SETTINGS"
+    assert doc["config_root"].lower() == str(pin).lower()
+
+    # (b) settings.json with no statusLine
+    (pin / "settings.json").write_text("{}", encoding="utf-8")
+    _, doc, _ = reader("-Json", pin=pin, home=fake_home)
+    assert doc["statusline_state"] == "NOT_WIRED_NO_STATUSLINE"
+
+    # (c) somebody else's statusLine
+    (pin / "settings.json").write_text(
+        json.dumps({"statusLine": {"type": "command", "command": "theirs"}}), encoding="utf-8"
+    )
+    _, doc, out = reader("-Json", pin=pin, home=fake_home)
+    assert doc["statusline_state"] == "FOREIGN_STATUSLINE"
+
+    # (d) unreadable. The installer REFUSES this root (exit 1) rather than rewriting a file it could
+    # not parse, which is why the fixture is reset before arm (e): a bad write here would silently
+    # disable every setting in the file, not just this one.
+    (pin / "settings.json").write_text("{ not json", encoding="utf-8")
+    _, doc, _ = reader("-Json", pin=pin, home=fake_home)
+    assert doc["statusline_state"] == "SETTINGS_UNREADABLE"
+    assert install("-ConfigDir", str(pin), pin=None, home=fake_home).returncode == 1
+
+    # (e) ours, and pointing where this reader looks -- so the fix really is "start a new session"
+    (pin / "settings.json").write_text("{}", encoding="utf-8")
+    assert install("-ConfigDir", str(pin), pin=None, home=fake_home).returncode == 0
+    _, doc, out = reader("-Json", pin=pin, home=fake_home)
+    assert doc["statusline_state"] == "WIRED_HERE"
+    _, _, human = reader(pin=pin, home=fake_home)
+    assert "Start a NEW session" in human
+    # Every remedy must name the root, or it repeats the original defect.
+    assert str(pin) in human
+
+
+def test_the_no_data_error_says_so_when_a_root_publishes_somewhere_else(
+    fake_home: Path, tmp_path: Path
+) -> None:
+    """THE ARM THE WHOLE DIAGNOSIS EXISTS FOR. Without it the reader tells the operator to restart and
+    wait, forever, with nothing anywhere saying the two halves disagree — the original defect
+    relocated rather than fixed."""
+    pin = fake_home / ".claude-account-1"
+    other = tmp_path / "other-root" / "mefor-usage"
+    (pin / "settings.json").write_text(
+        json.dumps(
+            {"statusLine": {"type": "command", "command": f"# mefor-usage\n$s='c'; $d = '{other}'"}}
+        ),
+        encoding="utf-8",
+    )
+    code, doc, _ = reader("-Json", pin=pin, home=fake_home)
+    assert code == UNKNOWN
+    assert doc["statusline_state"] == "WIRED_ELSEWHERE"
+    assert doc["wired_state_dir"].lower() == str(other).lower()
+    _, _, human = reader(pin=pin, home=fake_home)
+    assert "WAITING WILL NOT FIX THIS" in human
+
+
+def test_a_document_stamped_with_another_config_root_is_refused(tmp_path: Path) -> None:
+    """THE TRIPWIRE. A layout mistake becomes loud instead of plausible.
+
+    It gates on ``config_root_env`` — the ambient pin, recorded live — and NOT on ``config_root``,
+    which is derived from the write path and therefore agrees with it by construction. A stamp derived
+    from where we wrote can detect nothing.
+    """
+    state = tmp_path / "acct-a" / "mefor-usage"
+    state.mkdir(parents=True)
+    (state / "latest.json").write_text(
+        json.dumps(
+            {
+                "captured_at": datetime.now(UTC).isoformat(),
+                "published_by": {"config_root_env": str(tmp_path / "acct-b")},
+                "five_hour": {
+                    "used_percentage": 99.0,
+                    "resets_at_epoch": int(time.time()) + 3600,
+                    "captured_at": datetime.now(UTC).isoformat(),
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    code, doc, _ = reader("-StateDir", str(state), "-Json", pin=None)
+    assert code == UNKNOWN
+    assert doc["provenance"] == "FOREIGN"
+    assert "another account's headroom" in doc["reason"]
+
+
+def test_a_document_with_no_stamp_is_read_and_says_the_guard_could_not_run(
+    tmp_path: Path,
+) -> None:
+    """Absence is UNVERIFIABLE provenance, not WRONG provenance — two different facts, and only one is
+    an error. Refusing on absence would also break every hand-written fixture in this file and every
+    document written before the stamp existed, for no gain."""
+    collect(tmp_path, {"session_id": "x", "rate_limits": {"five_hour": window(40.0, 3600)}})
+    doc = latest(tmp_path)
+    del doc["published_by"]["config_root_env"]
+    (tmp_path / "latest.json").write_text(json.dumps(doc), encoding="utf-8")
+
+    code, parsed, _ = reader("-StateDir", str(tmp_path), "-Json", pin=None)
+    assert parsed["provenance"] == "UNVERIFIED"
+    assert parsed["five_hour"]["used_percentage"] == pytest.approx(40.0), (
+        "an unstamped reading must still be read"
+    )
+    _, _, human = reader("-StateDir", str(tmp_path), pin=None)
+    assert "provenance: UNVERIFIED" in human
+
+
+def test_an_explicit_state_dir_is_not_refused_for_being_another_root(tmp_path: Path) -> None:
+    """The refusal must fire on ERROR, not on INTENT.
+
+    It compares the stamp against the READ-FROM root — the root the document sits under — and not
+    against the reader's own. Comparing against the reader's root would break the documented
+    cross-root peek (``usage.ps1 -StateDir <other root>\\mefor-usage``, the only way to look at
+    another account) and would make every row of the ``-AllRoots`` survey but one render as a refusal.
+    """
+    other = tmp_path / "acct-b"
+    state = other / "mefor-usage"
+    state.mkdir(parents=True)
+    (state / "latest.json").write_text(
+        json.dumps(
+            {
+                "captured_at": datetime.now(UTC).isoformat(),
+                "published_by": {"config_root_env": str(other)},
+                "five_hour": {
+                    "used_percentage": 33.0,
+                    "resets_at_epoch": int(time.time()) + 3600,
+                    "captured_at": datetime.now(UTC).isoformat(),
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    # Read it from a session pinned somewhere else entirely.
+    _, doc, _ = reader("-StateDir", str(state), "-Json", pin=tmp_path / "acct-a")
+    assert doc["provenance"] == "OK", doc
+    assert doc["five_hour"]["used_percentage"] == pytest.approx(33.0)
+
+
+def test_the_survey_lists_every_root_and_computes_nothing_across_them(fake_home: Path) -> None:
+    """A SURVEY, NEVER A MERGE. These are different accounts with different pools; summing, averaging
+    or taking a worst-of across them would rebuild the exact lie the partitioning removes."""
+    for name, pct in ((".claude-account-1", 10.0), (".claude-account-2", 90.0)):
+        st = fake_home / name / "mefor-usage"
+        st.mkdir()
+        (st / "latest.json").write_text(
+            json.dumps(
+                {
+                    "captured_at": datetime.now(UTC).isoformat(),
+                    "published_by": {"config_root_env": str(fake_home / name)},
+                    "five_hour": {
+                        "used_percentage": pct,
+                        "resets_at_epoch": int(time.time()) + 3600,
+                        "captured_at": datetime.now(UTC).isoformat(),
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+    pin = fake_home / ".claude-account-1"
+    code, doc, _ = reader("-AllRoots", "-Json", pin=pin, home=fake_home)
+    rows = {r["root"].lower(): r for r in doc["roots"]}
+    assert str(fake_home / ".claude-account-1").lower() in rows
+    assert str(fake_home / ".claude-account-2").lower() in rows
+    assert str(fake_home / ".claude").lower() in rows, (
+        "the survey must list every root, not only ours"
+    )
+    assert rows[str(fake_home / ".claude-account-2").lower()]["five"] == pytest.approx(90.0)
+    # The exit code is THIS session's verdict, not a roll-up across accounts.
+    assert doc["five_hour"]["used_percentage"] == pytest.approx(10.0)
+    assert doc["exit_code"] == code
+
+
+# --- the collector half, and the shared rule ----------------------------------------------------
+
+
+def test_the_collector_publishes_under_its_pinned_root_when_given_no_state_dir(
+    fake_home: Path,
+) -> None:
+    """The other end of the shared derivation. A LEGACY wired command passes no ``-StateDir``, so this
+    is the path such a root actually takes at run time."""
+    pin = fake_home / ".claude-account-2"
+    proc = subprocess.run(
+        [
+            "pwsh",
+            "-NoProfile",
+            "-NonInteractive",
+            "-File",
+            str(COLLECT),
+            "-HomeDir",
+            str(fake_home),
+        ],
+        input=json.dumps({"session_id": "p", "rate_limits": {"five_hour": window(21.0, 3600)}}),
+        capture_output=True,
+        text=True,
+        timeout=TIMEOUT,
+        check=False,
+        env=_env(pin),
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert (pin / "mefor-usage" / "latest.json").exists()
+    assert not (fake_home / ".claude" / "mefor-usage").exists()
+
+
+def test_the_collector_never_manufactures_a_config_root(fake_home: Path) -> None:
+    """The installer refuses to create a root; the collector must not disagree about the same input.
+
+    ``New-Item -ItemType Directory -Force`` creates every missing ANCESTOR (measured), so without an
+    explicit guard a typo'd or stale ``CLAUDE_CONFIG_DIR`` would have a live session build a directory
+    nothing can launch from — on every statusLine fire.
+    """
+    ghost = fake_home / ".claude-account-99"
+    payload = json.dumps({"session_id": "g", "rate_limits": {"five_hour": window(5.0, 3600)}})
+    for args, pin in (
+        ([], ghost),  # resolved from the pin
+        (["-StateDir", str(ghost / "mefor-usage")], None),  # named explicitly
+    ):
+        proc = subprocess.run(
+            [
+                "pwsh",
+                "-NoProfile",
+                "-NonInteractive",
+                "-File",
+                str(COLLECT),
+                "-HomeDir",
+                str(fake_home),
+                *args,
+            ],
+            input=payload,
+            capture_output=True,
+            text=True,
+            timeout=TIMEOUT,
+            check=False,
+            env=_env(pin),
+        )
+        assert proc.returncode == 0, proc.stderr
+        assert "no config root to publish to" in proc.stdout
+        assert not ghost.exists(), f"the collector created {ghost} (args={args})"
+
+
+def test_the_collector_still_publishes_when_the_shared_library_is_missing(
+    fake_home: Path, tmp_path: Path
+) -> None:
+    """NEVER THROWS, NEVER BLOCKS outranks one-definition for a statusLine, so the collector keeps a
+    literal fallback copy of the two-line state-dir rule. This pins that the fallback both EXISTS and
+    AGREES with the shared function — drift goes red rather than silent."""
+    isolated = tmp_path / "isolated"
+    isolated.mkdir()
+    shutil.copy(COLLECT, isolated / "usage-collect.ps1")
+    pin = fake_home / ".claude-account-1"
+    proc = subprocess.run(
+        [
+            "pwsh",
+            "-NoProfile",
+            "-NonInteractive",
+            "-File",
+            str(isolated / "usage-collect.ps1"),
+            "-HomeDir",
+            str(fake_home),
+        ],
+        input=json.dumps({"session_id": "iso", "rate_limits": {"five_hour": window(7.0, 3600)}}),
+        capture_output=True,
+        text=True,
+        timeout=TIMEOUT,
+        check=False,
+        env=_env(pin),
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert (pin / "mefor-usage" / "latest.json").exists(), (
+        "the fallback state-dir rule disagrees with Get-UsageStateDir"
+    )
+
+
+def test_the_reader_refuses_to_diagnose_when_the_shared_library_is_missing(
+    tmp_path: Path,
+) -> None:
+    """THE LOUD FLOOR, and the reader needs it more than the collector does.
+
+    ``usage.ps1`` runs under ``SilentlyContinue``, which converts a dot-source failure into a WRONG
+    ANSWER rather than an error: the missing functions are swallowed, ``$StateDir`` stays null,
+    ``Join-Path $null "latest.json"`` yields the empty string, and the script would print "Nothing has
+    published to ." and then diagnose ``\\settings.json``. Testing the resolved PATH is not enough —
+    an explicit ``-StateDir`` resolves it without the library while every downstream check still comes
+    from there.
+    """
+    isolated = tmp_path / "isolated"
+    isolated.mkdir()
+    shutil.copy(READ, isolated / "usage.ps1")
+    code, _, out = reader("-StateDir", str(tmp_path), pin=None, script=isolated / "usage.ps1")
+    assert code == UNKNOWN
+    assert "config-roots.ps1 did not load" in out
+
+
+def test_config_roots_ps1_keeps_the_contract_three_scripts_depend_on(tmp_path: Path) -> None:
+    """FOUR CONSTRAINTS ON A FILE THAT IS DOT-SOURCED INTO A STATUSLINE, made executable.
+
+    Dot-sourcing runs in the CALLER's scope, so anything at top level here happens to them. A comment
+    cannot enforce that, and the collector is bound by NEVER THROWS, NEVER BLOCKS.
+    """
+    text = CONFIG_ROOTS.read_text(encoding="utf-8")
+    # BOTH comment forms, and the block form is the one that matters: this file's own header explains
+    # the four constraints, so a line-only stripper would find every forbidden token inside the prose
+    # that forbids it and fail on the documentation rather than on the code.
+    code_lines: list[str] = []
+    in_block = False
+    for ln in text.splitlines():
+        s = ln.strip()
+        if in_block:
+            if "#>" in s:
+                in_block = False
+            continue
+        if s.startswith("<#"):
+            in_block = "#>" not in s
+            continue
+        if s and not s.startswith("#"):
+            code_lines.append(ln)
+    body = "\n".join(code_lines)
+    assert "$ErrorActionPreference" not in body, (
+        "assigning a preference variable would override the caller's and let a statusLine throw"
+    )
+    # A top-level param() would consume the caller's own arguments. Any param( here must be indented
+    # inside a function.
+    assert not any(ln.startswith("param(") for ln in code_lines), "top-level param() block"
+    assert "$env:USERPROFILE" not in body, (
+        "resolving home inside the library defeats the -HomeDir seam every test depends on"
+    )
+    # Loading it must produce no output and no side effects.
+    proc = subprocess.run(
+        [
+            "pwsh",
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            f". '{CONFIG_ROOTS}'; Write-Output 'LOADED'",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=TIMEOUT,
+        check=False,
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout.strip() == "LOADED", f"loading it emitted output: {proc.stdout!r}"
+
+
+def test_the_root_list_survives_being_wrapped_in_an_array_at_one_element(
+    tmp_path: Path,
+) -> None:
+    """A one-element result must arrive as ONE STRING, not as a nested array.
+
+    This is not hypothetical: an earlier draft returned ``,@(...)`` — correct for the HashSet in
+    ``install-gate.ps1``, wrong for an array — and ``@(Get-ClaudeConfigRoots ...)`` then produced a
+    single element that WAS the array. Its string form is every path joined by a space, so
+    ``-AllRoots`` resolved one bogus target named ``<root-1> C:\\...\\<root-2>\\settings.json`` and
+    reported "Roots examined: 1". Silent, and it survived a smoke test because ``Split-Path`` happens
+    to accept arrays.
+    """
+    home = tmp_path / "h"
+    (home / ".claude-account-3").mkdir(parents=True)
+    script = (
+        f". '{CONFIG_ROOTS}'; "
+        f"$r = @(Get-ClaudeConfigRoots -HomeDir '{home}'); "
+        "Write-Output $r.Count; Write-Output $r[0].GetType().Name"
+    )
+    proc = subprocess.run(
+        ["pwsh", "-NoProfile", "-NonInteractive", "-Command", script],
+        capture_output=True,
+        text=True,
+        timeout=TIMEOUT,
+        check=True,
+    )
+    assert proc.stdout.split() == ["1", "String"], proc.stdout
+
+
+def test_install_then_the_wired_command_then_the_reader_all_agree(fake_home: Path) -> None:
+    """THE ANCHOR TEST: the one path that exercises the whole partition end to end.
+
+    Every other test in this section checks one hop. This one installs into a pinned root, runs the
+    string the installer actually wired exactly as Claude Code would, and then reads it back the way a
+    session in that root would — with nothing recomputed by the test. A hand-written stamp would let
+    this pass whether or not the collector produces one.
+    """
+    pin = fake_home / ".claude-account-1"
+    assert install(pin=pin, home=fake_home).returncode == 0
+
+    cmd = wired(pin / "settings.json")
+    proc = subprocess.run(
+        ["pwsh", "-NoProfile", "-NonInteractive", "-Command", cmd],
+        # BOTH windows, deliberately: with only five_hour the seven_day window is legitimately
+        # "never published", the overall verdict is UNKNOWN, and this test would be asserting the
+        # partition works by reading a code that means "I could not tell".
+        input=json.dumps(
+            {
+                "session_id": "e2e",
+                "rate_limits": {"five_hour": window(64.0, 3600), "seven_day": window(31.0, 280000)},
+            }
+        ),
+        capture_output=True,
+        text=True,
+        timeout=TIMEOUT,
+        check=False,
+        env=_env(pin),
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert "64" in proc.stdout
+
+    code, doc, _ = reader("-Json", pin=pin, home=fake_home)
+    assert code == OK, doc
+    assert doc["five_hour"]["used_percentage"] == pytest.approx(64.0)
+    assert doc["provenance"] == "OK", (
+        "the collector did not stamp the pin, so the cross-root guard cannot fire"
+    )
+    assert doc["config_root"].lower() == str(pin).lower()
+    # And the second root sees nothing, which is the whole point of partitioning.
+    code2, doc2, _ = reader("-Json", pin=fake_home / ".claude-account-2", home=fake_home)
+    assert code2 == UNKNOWN
+    assert doc2["reason"] == "no data"
