@@ -16713,3 +16713,32 @@ raised message via `ast` and reds on that revert.
 confusing rather than broken, and churning that many message strings in one change buys less than the
 guard that stops the next one. Anyone taking them should take the `[egress]` six as one job -- they
 share a shape.
+## 1368. the leak-gate detector floor is never checked against the real token list, so it can silently stop meaning anything
+
+> 🔢 **Filed 2026-08-26 (builder 2) - BUILT IN THIS COMMIT, not yet landed.** Implements **SEC-04** from [`16-security-phi-and-supply-chain`](testing/master-test-plan/16-security-phi-and-supply-chain.md), which had no ledger row.
+> Verdict: build
+> Closing-act: code
+
+**Cluster:** Security testing. **Priority:** P0 (per the spec row). **Verdict:** build.
+**Severity:** no engine effect and no deployment axis (sec. 0). The cost is that the leak gate's fail-closed floor can drift into meaninglessness with nothing reporting it -- a control resting on a number nobody re-checks.
+
+**What:** `MEFOR_MIN_DETECTORS` is a per-section FLOOR, and `token_floor_failure` fails when the token list drops below it. **Nothing asked the opposite question.** A floor of 7 against a list of 40 is satisfied by any 7 detectors surviving, so the gate stays green while constraining almost nothing. The counts are printed on every run and **nothing has ever compared them to the floor**, which is why the drift is silent rather than merely unfixed.
+
+**Measured against the live list, 2026-08-26** (counts only -- the list is a secret and appears nowhere):
+
+```
+section         floor  live   floor/live
+names           7      8       87.5%
+estate          13     14      92.9%
+site_prefixes   1      2       50.0%   <- would FAIL a flat 80% rule
+```
+
+**THE SPEC'S 80% RATIO IS THE WRONG SHAPE AT SMALL N, and the item found that by building it.** Growth from 1 to 2 scores 50% however healthy it is, so at that size a ratio measures the SECTION'S SIZE rather than the floor's staleness, and the rule as written would red the gate on its first real run while nothing was wrong. Shipped instead: **a ratio above four loaded detectors, an absolute lag of at most one at or below four.** Both arms fire on their own section and name both numbers. Deviation from the spec routed to the owner via the Liaison rather than shipped quietly.
+
+**AND THE COUNTS CANNOT TELL YOU WHICH TABLE YOU MEASURED.** On 2026-08-26 the SYNTHETIC example set and the REAL list both reported **8/14/2** -- three identical numbers from two tables, one of which matches nothing real. Anyone verifying a floor from counts alone would assert it against a set that cannot fire and read the pass as evidence. `scan_forbidden` already distinguishes three load states, and only the MODE marker discriminates them, so `--print-detector-counts` emits `mode=` first and a test pins that the count lines are byte-identical between the two.
+
+**Not in scope:** raising any floor. The live list is within the shipped rule today, so no threshold moves in this change; if it later drifts, the gate says so and a human decides. `branch-leak-scan.yml` pins the same floor and is NOT wired here -- same rule, different job, and it deserves its own decision rather than being swept in.
+
+**Related:** #1080 (the setup script reporting a loaded set as if it were the installed one -- the same family of "the gate reported something adjacent to what you asked"), SEC-05.
+
+**Source:** SEC-04 in the master test plan, routed by the Liaison; scoped down by this lane after measuring that half the brief's build already existed.
