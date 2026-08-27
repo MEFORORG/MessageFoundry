@@ -554,7 +554,31 @@ function Remove-QuotedSpans([string]$s, [bool]$PosixEscapes = $false) {
             # main denies, so it was reverted. Do NOT re-add the lowercase emit without that
             # discriminator, and do not add the discriminator without re-measuring those two.
             $span = $s.Substring($openAt + 1, $i - $openAt - 1)
-            if ($span -cmatch '[\\/](git(?:\.exe)?)$') {
+            # BACKLOG #1069: A QUOTED SPAN HOLDING ONE BARE WORD IS UNMASKED, because quoting an argument
+            # is ORDINARY and blanking it erased the disarm key before rule 3c ever ran. Measured on the
+            # shipped gate, all ALLOW where the unquoted spelling DENIES:
+            #     git -c "core.hooksPath=/dev/null" commit -m x
+            #     git config 'core.hooksPath' '/dev/null'
+            #     git config --add "core.hooksPath" /dev/null
+            #
+            # WHY NOT MATCH THE RAW TEXT INSTEAD: a commit message quoting the rule's own name would then
+            # refuse, and this workstream writes such messages constantly. The discriminator is WHITESPACE
+            # -- prose has it and stays masked; a config key does not and becomes visible.
+            #
+            # DELIBERATELY NOT LENGTH-PRESERVING, against this item's own prose. That rationale is "the same
+            # offsets read paths back out of the raw text afterwards", and NO RULE DOES THAT: every path
+            # site re-runs [regex]::Match($seg.Raw, ...) and computes offsets inside Raw from scratch.
+            # Length-preserving masking would change what every other rule sees for zero benefit, and
+            # widening scope is exactly how the earlier attempt at this item acquired five new fail-opens.
+            #
+            # ONE SPELLING STAYS OPEN BY DESIGN: a quoted MULTI-WORD value such as
+            # -c 'alias.ci=commit --no-verify'. Its value contains a space, so quoting is its only writable
+            # spelling and this carve-out cannot reach it without re-admitting the prose false-deny. Pinned
+            # as an ALLOW test so a later change cannot close it silently or claim it was never there.
+            if ($span.Length -gt 0 -and $span -cnotmatch '[\s''"$(){};&|`]') {
+                [void]$out.Append($span)
+            }
+            elseif ($span -cmatch '[\\/](git(?:\.exe)?)$') {
                 [void]$out.Append($Matches[1])
             }
             else {
