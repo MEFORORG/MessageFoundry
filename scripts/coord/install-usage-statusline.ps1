@@ -430,10 +430,12 @@ foreach ($t in $targets) {
         }
 
         $wasState = $null
+        $wasColl = $null
         $isOurs = ($own -eq 'OURS')
         if ($isOurs) {
             $existing = [string]$settings['statusLine']['command']
             $wasState = Get-WiredStateDir $existing
+            $wasColl = Get-WiredCollectorPath $existing
             if ($existing -ceq $cmd -and [int]$settings['statusLine']['refreshInterval'] -eq $RefreshInterval) {
                 Write-Host "  UNCHANGED  $($t.Settings)"
                 Write-Host "             already carries exactly this command and refreshInterval; not rewritten, no backup taken"
@@ -460,10 +462,33 @@ foreach ($t in $targets) {
             # Printed separately from WROTE rather than folded into it: "we wired a root that had
             # nothing" and "we corrected a root that was publishing to the wrong account" are different
             # facts to an operator deciding whether a stray file needs cleaning up.
+            #
+            # AND THE REASON IS DERIVED, NOT ASSUMED. This branch is entered whenever the command is
+            # not byte-identical, which is a WEAKER fact than any of the sentences below. An earlier
+            # version printed "published somewhere else" unconditionally, and an operator's real run
+            # produced a block reading "published somewhere else / was: <path> / now: <the same path>"
+            # -- the publish path had not moved at all, the COLLECTOR had. A line that contradicts the
+            # two lines under it is the same defect this whole change exists to remove.
+            $why = if (-not $wasState) {
+                "carried no -StateDir, so the collector chose its own default at run time"
+            }
+            elseif (-not (Test-SameRoot $wasState $stateDir)) {
+                "published somewhere else"
+            }
+            elseif ($wasColl -and $wasColl -ne $CollectorPath) {
+                "named a different collector"
+            }
+            else {
+                "differed from this command in some other way (refreshInterval, or an unrecognised shape)"
+            }
             Write-Host "  REWIRED    $($t.Settings)"
-            Write-Host "             replaced a $MARKER statusLine that published somewhere else"
+            Write-Host "             replaced a $MARKER statusLine that $why"
             Write-Host "             was: $(if ($wasState) { $wasState } else { '(no -StateDir -- the collector chose its own default)' })"
             Write-Host "             now: $stateDir"
+            if ($wasColl -and $wasColl -ne $CollectorPath) {
+                Write-Host "             collector was: $wasColl"
+                Write-Host "             collector now: $CollectorPath"
+            }
             $rewired++
         }
         else {

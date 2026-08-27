@@ -1968,3 +1968,56 @@ def test_the_survey_ages_a_row_by_its_windows_not_by_the_document(fake_home: Pat
     assert row["stale"] is True, row
     _, _, human = reader("-AllRoots", pin=pin, home=fake_home)
     assert "STALE" in human, human
+
+
+def test_rewired_says_which_thing_changed_not_always_the_publish_path(tmp_path: Path) -> None:
+    """A LINE THAT CONTRADICTS THE TWO LINES UNDER IT.
+
+    REWIRED is entered whenever the command is not byte-identical, which is a WEAKER fact than any
+    single reason for it. The message asserted "published somewhere else" unconditionally, and the
+    owner's real run produced:
+
+        replaced a mefor-usage statusLine that published somewhere else
+        was: <account-5>/mefor-usage
+        now: <account-5>/mefor-usage
+
+    The publish path had not moved at all. The COLLECTOR had. Same defect class as the claim this
+    whole branch removes: a sentence stating more than the check behind it established.
+    """
+    root = tmp_path / "root"
+    root.mkdir()
+    other_collector = tmp_path / "elsewhere" / "usage-collect.ps1"
+    other_collector.parent.mkdir()
+    other_collector.write_text("# stand-in", encoding="utf-8")
+
+    # Wired to the RIGHT publish path but a DIFFERENT collector.
+    # collector= KEYWORD, not -CollectorPath in args: the helper always adds that flag, so passing it
+    # again binds the parameter twice and pwsh refuses it ("specified more than once").
+    assert install("-ConfigDir", str(root), pin=None, collector=other_collector).returncode == 0
+    first = wired(root / "settings.json")
+    assert str(tmp_path / "elsewhere") in first
+
+    out = install("-ConfigDir", str(root), pin=None).stdout
+    assert "REWIRED" in out, out
+    assert "published somewhere else" not in out, (
+        f"the publish path did not move, but the line says it did:\n{out}"
+    )
+    assert "named a different collector" in out, out
+    assert "collector was:" in out and "collector now:" in out, out
+
+    # And the genuine case must still say what it always said.
+    root2 = tmp_path / "root2"
+    root2.mkdir()
+    (root2 / "settings.json").write_text(
+        json.dumps(
+            {
+                "statusLine": {
+                    "type": "command",
+                    "command": f"# mefor-usage\n$s = '{COLLECT}'; $d = '{tmp_path / 'far-away'}'; x",
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    out2 = install("-ConfigDir", str(root2), pin=None).stdout
+    assert "published somewhere else" in out2, out2
