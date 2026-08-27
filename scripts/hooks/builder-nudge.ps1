@@ -91,13 +91,79 @@ try {
     #
     # A lane with open queue rows is SUPPLIED. Supplied is the state this hook exists to produce,
     # so it must not keep firing once it has been reached.
+    #
+    # BUT "SUPPLIED" AND "KNOWS IT IS SUPPLIED" ARE DIFFERENT STATES, AND THIS EXIT COULD NOT TELL
+    # THEM APART UNTIL 2026-08-27. Measured that morning: builder-2 sat idle for 117 minutes holding
+    # FOUR open rows. It was not wedged, not blocked, and not analysing -- it had last read its queue
+    # file at 03:36Z, three rows were appended after that, and NOTHING TOLD IT. It said "queue empty"
+    # for roughly six consecutive turns, each one a carried-forward claim from that single stale
+    # reading. This exit allowed every one of those stops, correctly by its own rule and wrong in
+    # outcome.
+    #
+    # DISPATCH IS A SILENT FILE APPEND. The dispatcher writes a row; no signal reaches the lane. So
+    # the discriminator is not "does the lane have rows" but "has the lane been TOLD about the rows
+    # it has" -- which no reading of the lane's disk state can produce, and which is why the stall
+    # was invisible to the dispatcher's queue-depth check too. The queue read FULL the whole time.
+    #
+    # THE FIX NEEDS NOTHING FROM THE BUILDER. Remember the queue file's write time; when it differs
+    # from what was last announced, BLOCK ONCE and print the open rows. Appending a row re-arms it
+    # exactly once. A lane that has already been shown the current queue is never nudged again, so
+    # the property this exit was written to protect -- do not nag a working lane -- still holds.
+    #
+    # NOTE ON WHY THE COUNT WAS NOT ALREADY REACHING ANYONE: this exit has always COMPUTED $open and
+    # passed it to Allow, but Allow writes to stdout and exits 0, and it is the BLOCK path (stderr,
+    # exit 2) that is returned to the session. The number the lane needed was computed and then, as
+    # far as can be told from here, discarded. That is stated as the reason this had to become a
+    # block rather than a louder allow -- not as a verified claim about hook plumbing.
     $queue = Join-Path $coord ("queue\" + $seat + ".tsv")
     if (Test-Path -LiteralPath $queue) {
-        $open = @(Get-Content -LiteralPath $queue -ErrorAction SilentlyContinue |
+        $rows = @(Get-Content -LiteralPath $queue -ErrorAction SilentlyContinue |
             Where-Object { $_.Trim() -and -not $_.StartsWith('#') } |
-            Where-Object { ($_ -split "`t")[0].Trim().ToLower() -notin @('done', 'cancelled', 'status') }
-        ).Count
-        if ($open -gt 0) { Allow "lane holds $open open queue item(s); it is supplied, not stalling" }
+            Where-Object { ($_ -split "`t")[0].Trim().ToLower() -notin @('done', 'cancelled', 'status') })
+        $open = $rows.Count
+        if ($open -gt 0) {
+            $seen = Join-Path $coord ("nudge\" + $seat + '.queue-announced')
+            $stamp = (Get-Item -LiteralPath $queue).LastWriteTimeUtc.ToString('o')
+            $last = if (Test-Path -LiteralPath $seen) {
+                (Get-Content -LiteralPath $seen -Raw -ErrorAction SilentlyContinue).Trim()
+            } else { '' }
+
+            if ($stamp -eq $last) {
+                Allow "lane holds $open open queue item(s) and has been shown them; supplied, not stalling"
+            }
+
+            # The queue changed since this lane was last told. Announce it ONCE.
+            $dir = Split-Path $seen -Parent
+            if (-not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
+            Set-Content -LiteralPath $seen -Value $stamp -Encoding ascii -ErrorAction SilentlyContinue
+
+            $list = ($rows | ForEach-Object {
+                $f = $_ -split "`t"
+                $name = if ($f.Count -ge 2) { $f[1].Trim() } else { '(unnamed)' }
+                $desc = if ($f.Count -ge 3) { $f[2].Trim() } else { '' }
+                if ($desc.Length -gt 140) { $desc = $desc.Substring(0, 140) + ' ...' }
+                "    [$($f[0].Trim())] $name`n        $desc"
+            }) -join "`n"
+
+            $announce = @"
+[builder-nudge] YOUR QUEUE CHANGED. $open OPEN ROW(S). Read them before you stop.
+
+THIS FIRES ONCE PER CHANGE, and it is not a nudge to ask for work -- you already have work. It
+exists because DISPATCH IS A SILENT FILE APPEND: the dispatcher writes a row and nothing reaches
+you. On 2026-08-27 a lane sat idle 117 minutes holding four rows, saying "queue empty" for about
+six turns, because it had last read the file before three of them arrived. Its queue read FULL the
+whole time, so neither this hook nor the dispatcher's depth check could see the stall.
+
+  $queue
+
+$list
+
+IF YOU ALREADY KNOW ABOUT THESE, stop and carry on -- this will not fire again until the file
+changes. IF ANY IS NEW TO YOU, that is the case this exists for.
+"@
+            [Console]::Error.WriteLine($announce)
+            exit 2
+        }
     }
 
     $state = Join-Path $coord 'nudge'
