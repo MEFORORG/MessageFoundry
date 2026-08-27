@@ -3900,12 +3900,17 @@ class ServiceSettings(BaseModel):
     def _oidc_requires_public_origin(self) -> ServiceSettings:
         """A federated redirect URI is built from ``[api].public_origin`` — refuse ``oidc_enabled``
         without a resolvable one, rather than silently constructing a wrong URI the IdP rejects at
-        runtime. This spans ``[auth]`` and ``[api]``, so it lives here (ADR 0142)."""
+        runtime. This spans ``[auth]`` and ``[api]``, so it lives here (ADR 0142).
+
+        ``[api].public_origin`` is the INTERNAL field. The operator-facing key is
+        ``[security].web_console_public_address``, which desugars into it; the old spelling is REFUSED
+        as file/env input (ADR 0118), so the refusal below must name the [security] one or it hands out
+        a remediation that dies at load (BACKLOG #1361)."""
         if self.auth.oidc_enabled and not self.api.public_origin:
             raise ValueError(
-                "[auth].oidc_enabled requires [api].public_origin (the federated redirect URI is "
-                "derived from it); set it to the browser-reachable origin, e.g. "
-                "'https://ops.example.com' or 'http://localhost:8765' for a loopback lab"
+                "[auth].oidc_enabled requires an external origin (the federated redirect URI is "
+                "derived from it); set [security].web_console_public_address to the browser-reachable "
+                "origin, e.g. 'https://ops.example.com' or 'http://localhost:8765' for a loopback lab"
             )
         return self
 

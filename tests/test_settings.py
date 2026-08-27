@@ -837,7 +837,11 @@ def test_auth_oidc_a_real_secret_still_loads(tmp_path: Path) -> None:
 def test_auth_oidc_requires_public_origin(tmp_path: Path) -> None:
     cfg = _write(tmp_path / "messagefoundry.toml", _OIDC_AD + _OIDC_BLOCK)
     env = {k: v for k, v in _OIDC_ENV.items() if k != "MEFOR_SECURITY_WEB_CONSOLE_PUBLIC_ADDRESS"}
-    with pytest.raises(ValidationError, match="public_origin"):
+    # Matches the OPERATOR-FACING key, not the internal field (BACKLOG #1361). The refusal used to say
+    # `[api].public_origin`, which ADR 0118 relocated and the loader REJECTS as file or env input -- so
+    # doing what it said failed at load. Do not "fix" this back to public_origin: the substring differs
+    # (`public_address`), which is exactly why the rename did not red until a full run.
+    with pytest.raises(ValidationError, match="web_console_public_address"):
         load_settings(config_path=cfg, environ=env)
 
 
