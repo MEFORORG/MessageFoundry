@@ -1121,6 +1121,31 @@ function Test-Governed([string]$Candidate) {
     return $null
 }
 
+# The COMMON DIR of a governed root, as a comparable path -- the object rule 3c actually governs
+# (BACKLOG #1067). Empty when the root is not a repository, or is not a repository's TOP LEVEL: an
+# allowlist entry may legitimately name a directory that merely CONTAINS checkouts, and a root that is a
+# SUBDIRECTORY of some repo would otherwise report THAT repo's git dir and quietly govern all of it.
+#
+# Cached because the roots cannot change within one invocation and each answer costs two git calls. Rule
+# 3c reaches here only once a disarm key is already present, so this is never on the ordinary path.
+$rootCommonCache = @{}
+function Get-RootCommonDirCmp($Root) {
+    $key = $Root.Compare
+    if ($rootCommonCache.ContainsKey($key)) { return $rootCommonCache[$key] }
+    $value = ""
+    # The RAW spelling, never the Compare form: that one is lowercased, and this file warns twice that a
+    # lowercased path handed to `git -C` passes on Windows and misses the real directory on a
+    # case-sensitive filesystem. Any git failure just means "no answer", which is the empty string.
+    $where = $Root.Display
+    $top = "$(& git -C $where rev-parse --path-format=absolute --show-toplevel 2>$null)".Trim()
+    if ($LASTEXITCODE -eq 0 -and $top -and (Get-ComparablePath $top) -eq $key) {
+        $common = "$(& git -C $where rev-parse --path-format=absolute --git-common-dir 2>$null)".Trim()
+        if ($LASTEXITCODE -eq 0 -and $common) { $value = Get-ComparablePath $common }
+    }
+    $rootCommonCache[$key] = $value
+    return $value
+}
+
 # ---------------------------------------------------------------------------------------------------
 # Rule 3b -- hijacking a LINKED WORKTREE by switching it onto an ALREADY-EXISTING branch. Rule 3 below
 # protects only the shared PRIMARY; this protects every OTHER governed worktree from the one move that
@@ -1411,9 +1436,36 @@ What to do instead:
         $common = "$(& git -C $whereRaw rev-parse --git-common-dir 2>$null)".Trim()
         if ($LASTEXITCODE -ne 0 -or -not $common) { continue }
         $commonCmp = Get-ComparablePath $common $whereRaw
+        # GOVERNANCE IS REPOSITORY IDENTITY, NOT A PATH PREFIX (BACKLOG #1067). This compared the
+        # TARGET's common dir against the root's WORKING TREE path, so any repository living anywhere
+        # UNDER a governed root inherited its governance -- including an independent clone vendored
+        # there, which shares nothing with it but its path. The refusal then went on to assert a shared
+        # .git directory that such a clone does not have, and a refusal which misdescribes what it
+        # blocked is exactly what teaches people to route around the gate; rule 3's own comment in this
+        # file records that having happened.
+        #
+        # Comparing against the ROOT'S OWN common dir keeps every case that must keep denying: the
+        # primary and each of its worktrees -- sibling, or nested under .claude/worktrees -- all answer
+        # the SAME common dir, so path shape stops being what decides it.
+        #
+        # EQUALITY-OR-UNDER, not equality alone, and that is the load-bearing half: a SUBMODULE's git
+        # dir is <root>/.git/modules/<name>, so the identity-only predicate the item warned about would
+        # have flipped submodules from DENY to ALLOW as a silent side effect of fixing the vendored
+        # case. Under-the-common-dir leaves them exactly where they were. Whether a submodule SHOULD be
+        # governed is its own decision, pinned by a test so that answering it has to be one.
         $govCfg = $null
         foreach ($r in $roots) {
-            if ($commonCmp -eq $r.Compare -or $commonCmp.StartsWith("$($r.Compare)/")) { $govCfg = $r; break }
+            $rootCommon = Get-RootCommonDirCmp $r
+            if (-not $rootCommon) {
+                # The root is not a repository's top level, so there is no identity to compare and the
+                # path test remains the only answer available. Unchanged deliberately: a root that
+                # merely contains checkouts must not start failing OPEN on a shape it used to catch.
+                if ($commonCmp -eq $r.Compare -or
+                    $commonCmp.StartsWith("$($r.Compare)/", [System.StringComparison]::Ordinal)) { $govCfg = $r; break }
+                continue
+            }
+            if ($commonCmp -eq $rootCommon -or
+                $commonCmp.StartsWith("$rootCommon/", [System.StringComparison]::Ordinal)) { $govCfg = $r; break }
         }
         if (-not $govCfg) { continue }
 
