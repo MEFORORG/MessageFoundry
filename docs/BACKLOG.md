@@ -10336,6 +10336,19 @@ Nothing here touches the TLS/FTPS context in the same module, which was already 
 
 ## 1195. research an honest pass for ASVS 15.4.4 -- fair thread access on the shipped SQLite posture, or a measured argument that the existing pools already suffice
 
+> **PARTIAL 2026-08-26 (lander), NOT A CLOSURE -- this item stays OPEN.** Lands one concrete instance
+> of the shared-pool problem this item is about, rather than the item's research question. The
+> alt-credential connector ran its blocking work on a dedicated `ThreadPoolExecutor` but `close()`
+> shut it down via `run_in_executor(None, ...)` -- and `None` is the **shared default pool**, so
+> teardown of the private worker borrowed a thread from exactly the pool this item says everything
+> already contends on. **RESCUED WORK: authored 2026-08-22, sat unlanded since on
+> `worktree-wf_c0bc7854-33d-2`, a branch named for a workflow worktree rather than a seat, with no PR
+> and a claim record whose holder directory no longer exists.** Verified live on `main` before landing
+> (`transports/wincred.py:176` still passed `None`); 105 tests pass, ruff and mypy clean. **What is
+> NOT done: the item's actual subject** -- fair thread access on the shipped SQLite posture, or the
+> measured argument that bounded pools already satisfy the verb. That still needs the measurement the
+> re-score names, and this changes none of it.
+
 > 🔢 **Re-scored 2026-08-20 -> P2.** Value **5/10** · Difficulty **7/10** · _money pit_. The only cross-subsystem reservation still ships off and is still SQL-Server-only by construction, so on the shipped SQLite posture route and transform CPU and all blocking transport I/O share one default pool with the argon2 semaphore as the sole reservation. Value 5 because connector timeouts bound the wait and the recorded assessor dissent may be right that bounded pools already satisfy the verb, so the practical exposure is a delay rather than starvation; difficulty 7 because any mechanism has to clear ADR 0071's measured NO-GO boundary without regressing throughput, and the operative phrase about a reasonable timeframe is recorded as unassessed, so even the argument route needs a new measurement. _(was 5/10 · 7/10.)_
 > Research: done 2026-08-20
 >
