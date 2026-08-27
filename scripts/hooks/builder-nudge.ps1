@@ -81,6 +81,25 @@ try {
         }
     }
 
+    # --- exit 3a: THE LANE ALREADY HAS WORK ------------------------------------------------------
+    #
+    # THIS EXIT WAS MISSING AND THE OMISSION IS THE WHOLE BUG. The hook asked "has this seat
+    # recorded an ask" and never "does this seat have anything to do". A builder holding four
+    # queued items has NO REASON to ask for work, so it got nudged on every single turn and the
+    # safety valve fired on builder-1 at 02:47 on 2026-08-26 -- 10 nudges in 30 minutes against a
+    # lane that was building the whole time.
+    #
+    # A lane with open queue rows is SUPPLIED. Supplied is the state this hook exists to produce,
+    # so it must not keep firing once it has been reached.
+    $queue = Join-Path $coord ("queue\" + $seat + ".tsv")
+    if (Test-Path -LiteralPath $queue) {
+        $open = @(Get-Content -LiteralPath $queue -ErrorAction SilentlyContinue |
+            Where-Object { $_.Trim() -and -not $_.StartsWith('#') } |
+            Where-Object { ($_ -split "`t")[0].Trim().ToLower() -notin @('done', 'cancelled', 'status') }
+        ).Count
+        if ($open -gt 0) { Allow "lane holds $open open queue item(s); it is supplied, not stalling" }
+    }
+
     $state = Join-Path $coord 'nudge'
     if (-not (Test-Path -LiteralPath $state)) { New-Item -ItemType Directory -Path $state -Force | Out-Null }
 
