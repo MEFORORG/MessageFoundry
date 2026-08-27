@@ -1,3 +1,11 @@
+            # 'blocked' JOINED THIS LIST 2026-08-27 AND IT IS NOT COSMETIC. A row can be assigned,
+            # real, and IMPOSSIBLE FOR THE LANE TO BEGIN -- waiting on an owner ruling, a gate, or
+            # another item. Counting those as supply is how a lane reads FOUR and holds ONE it can
+            # actually start. That happened three times in one morning: two DELIVERED rows (#1040
+            # landed on main, #1256 open as PR 640) and one OWNER-GATED row (#328, blocked on a
+            # comparator-semantics decision that is not a builder's to make). A lane reading
+            # supplied with nothing startable is the exact stall this mechanism exists to prevent,
+            # and the queue depth alone cannot show it.
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 MessageFoundry Organization and contributors
 # Stop hook: a builder seat does not go idle silently.
@@ -119,7 +127,7 @@ try {
     if (Test-Path -LiteralPath $queue) {
         $rows = @(Get-Content -LiteralPath $queue -ErrorAction SilentlyContinue |
             Where-Object { $_.Trim() -and -not $_.StartsWith('#') } |
-            Where-Object { ($_ -split "`t")[0].Trim().ToLower() -notin @('done', 'cancelled', 'status') })
+            Where-Object { ($_ -split "`t")[0].Trim().ToLower() -notin @('done', 'cancelled', 'status', 'blocked') })
         $open = $rows.Count
         if ($open -gt 0) {
             $seen = Join-Path $coord ("nudge\" + $seat + '.queue-announced')
