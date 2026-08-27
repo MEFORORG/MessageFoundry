@@ -93,20 +93,55 @@ def bash_sees(bash: Path, tmp_path: Path, env: dict[str, str] | None = None) -> 
     cannot, it is looking at a different filesystem and every verdict it returns would be about
     nothing.
     """
+    return _probe(bash, tmp_path, env)[0]
+
+
+def probe_env(bash: Path, env: dict[str, str] | None = None) -> dict[str, str]:
+    """A child environment that can find the ordinary utilities (BACKLOG #1373).
+
+    ***THE UTILITIES SHIP BESIDE BASH, SO THE INTERPRETER'S OWN DIRECTORY IS THE ANSWER.*** On Git
+    for Windows ``cat``, ``tr``, ``grep`` and ``sort`` live in the same ``usr/bin`` as ``bash.exe``;
+    on Linux they share ``/usr/bin``. Deriving it from the interpreter means no install location is
+    spelled out here, and a caller that already supplied a working PATH is unaffected.
+
+    ***APPENDED, NEVER PREPENDED, AND THAT IS LOAD-BEARING.*** ``bash_preserves_path_order`` asserts
+    that an entry the CALLER prepended is still first in the child. That control exists because Git
+    ships ``curl.exe`` in ``mingw64/bin``, and a stub that lost to it sent a release-age check to the
+    live network. Prepending here would shadow the caller's stub and defeat that control silently.
+    Appending cannot: it only adds a fallback behind everything the caller already chose.
+    """
+    child = dict(env) if env is not None else dict(os.environ)
+    own = str(bash.parent)
+    current = child.get("PATH", "")
+    child["PATH"] = current + os.pathsep + own if current else own
+    return child
+
+
+def _probe(
+    bash: Path, tmp_path: Path, env: dict[str, str] | None = None
+) -> tuple[bool, int | None]:
+    """Run the read-back probe. Returns (saw the token, the exit code).
+
+    ***THE EXIT CODE IS CARRIED OUT BECAUSE 127 IS NOT A VERDICT ABOUT THE CANDIDATE.*** This module
+    already says so at ``BASH_HARNESS_FAILURE``: 127 is a finding about the HARNESS. A caller given
+    only a bool cannot tell "this interpreter is in another filesystem namespace" from "the probe
+    could not run at all", and those want opposite responses -- reject the candidate, or repair the
+    environment. ``None`` means the process never started.
+    """
     probe = tmp_path / _PROBE_NAME
     probe.write_text(_PROBE_TOKEN + "\n", encoding="utf-8")
     try:
         out = subprocess.run(  # noqa: S603  # nosec B603 - fixed argv, no shell, test-local paths
             [str(bash), "-c", f"cat {_PROBE_NAME}"],
             cwd=str(tmp_path),
-            env=env,
+            env=probe_env(bash, env),
             capture_output=True,
             timeout=_TIMEOUT,
             check=False,
         )
     except OSError:
-        return False
-    return out.returncode == 0 and _PROBE_TOKEN.encode() in out.stdout
+        return False, None
+    return out.returncode == 0 and _PROBE_TOKEN.encode() in out.stdout, out.returncode
 
 
 def bash_preserves_path_order(
@@ -155,6 +190,7 @@ def require_bash(tmp_path: Path, env: dict[str, str] | None = None) -> str:
     error naming every interpreter tried.
     """
     tried: list[str] = []
+    codes: list[int | None] = []
     for candidate in bash_candidates():
         if not candidate.is_file():
             continue
@@ -162,10 +198,22 @@ def require_bash(tmp_path: Path, env: dict[str, str] | None = None) -> str:
         # BOTH controls, because they answer different questions and a candidate can pass one
         # while failing the other. The MINGW64 wrapper sees the filesystem perfectly and
         # rewrites PATH; a WSL bash preserves PATH order and cannot open the file.
-        if bash_sees(candidate, tmp_path, env) and bash_preserves_path_order(
-            candidate, tmp_path, env
-        ):
+        saw, code = _probe(candidate, tmp_path, env)
+        codes.append(code)
+        if saw and bash_preserves_path_order(candidate, tmp_path, env):
             return str(candidate)
+    # EVERY CANDIDATE EXITED 127 => THE PROBE NEVER RAN, so nothing observed is a finding about any
+    # interpreter's filesystem namespace (BACKLOG #1373). Saying "no bash can read a file this
+    # process just wrote" there is FALSE, and it is the expensive kind of false: it names a namespace
+    # problem, so a reader goes looking at WSL and interpreter paths instead of at PATH.
+    if codes and all(c == BASH_HARNESS_FAILURE for c in codes):
+        raise RuntimeError(
+            f"{explain_returncode(BASH_HARNESS_FAILURE, 'the bash probe')} Every candidate exited "
+            f"{BASH_HARNESS_FAILURE}, so this says NOTHING about any interpreter's filesystem "
+            f"namespace -- the probe could not run. Tried: {tried}. The probe needs ordinary "
+            "utilities (`cat`); a PATH without them, which is what PowerShell and cmd supply by "
+            "default, produces exactly this."
+        )
     raise RuntimeError(
         "no bash on this machine can read a file this process just wrote. Tried: "
         f"{tried or '(none found)'}. On Windows, `bash` on PATH is often "

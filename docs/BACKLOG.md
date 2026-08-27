@@ -17317,3 +17317,36 @@ committed alongside the fix rather than filed separately, since neither makes se
 
 **Not done:** pushing, opening a PR, or anything that would exercise this in real CI. Committed and
 handed to the Lander.
+
+## 1373. the bash resolver rejects a working interpreter when coreutils is absent from PATH, conflating a harness fault with a namespace verdict
+
+> 🔢 **Filed 2026-08-27 -- REPRODUCED ON ONE VARIABLE, and the file already carried the distinction it drops.** `tests/_bash_resolver.py` defines `BASH_HARNESS_FAILURE = 127` at :40 under a comment saying 127 is *"a finding about the HARNESS"* and that conflating it *"lets a broken harness impersonate a failing test"*, and `explain_returncode` implements exactly that split at :177. `bash_sees` at :87 runs `cat mf_bash_probe.txt` and returns a bare bool, so a PATH without coreutils -- what PowerShell and cmd supply -- makes bash exit 127 and the probe reports it as a FILESYSTEM NAMESPACE failure. The distinction is built deliberately and then dropped at one call, 77 lines away.
+>
+> **MEASURED, same interpreter, same filesystem, same probe file, only PATH moved:**
+>
+> ```
+> PATH = the interpreter's own directory      True
+> PATH = empty                                False   <- a working bash, rejected
+> PATH = C:\Windows\System32                 False   <- a working bash, rejected
+> ```
+>
+> **END TO END under the real condition** -- Git's `cmd` on PATH so `git` resolves, but not its `usr/bin`, so no coreutils. On the shipped code `require_bash` RAISES; with the fix it returns `Git/usr/bin/bash.exe`, and NOT the WSL launcher, because the git-derived candidate is tried first and now passes.
+>
+> **THE FIX IS AN ENV CHANGE, NOT A COMMAND CHANGE, AND THAT IS WHY IT IS SAFE.** The obvious alternative -- swap `cat` for a bash builtin -- is precisely the change whose behaviour against the WSL launcher #1216 says must not be settled in either direction until somebody measures it. Appending a directory to PATH cannot touch that: a working WSL resolves `cat` from its own rootfs and ignores the Windows PATH. **That argument holds by construction, on machines this suite will never run on** -- which is stronger than any measurement available here.
+>
+> **APPENDED, NEVER PREPENDED.** `bash_preserves_path_order` asserts a CALLER's prepended entry is still first; Git ships `curl.exe` in `mingw64/bin` and a stub that lost to it sent a release-age check to the live network. Prepending would shadow every such stub silently. Pinned by a test arm, and the prepend mutant reds it.
+>
+> **THE WIDER HALF, taken deliberately:** a probe-only fix leaves the CHILD failing at 127, because the shipped gate steps run `tr`, `grep` and `sort`. `tests/test_dependabot_automerge_guardrails.py` built its child env from `os.environ` alone; it now goes through the same helper.
+>
+> **A BROKEN-INSTRUMENT FINDING NOBODY SHOULD RE-DERIVE, and it is why this row does not settle #1216's open question.** Driving `C:\Windows\System32\bash.exe` here returns rc=1 with UTF-16LE *"The RPC call contains a handle that diff..."* -- **a Windows RPC error, so the launcher never started and never reached a filesystem namespace at all.** A rejection measured on this box is therefore evidence about RPC, not about namespaces, in either direction. Two earlier passes read that same rejection as two different things (a namespace verdict; an argv/quoting artifact) and **their disagreement is fully explained if neither was measuring what it thought.** Not a claim that they were wrong -- a claim that this box cannot distinguish the readings, and neither could they. Settling it needs a host with working WSL.
+>
+> **AND `bash_sees` DOES NOT RELIABLY IMPLEMENT THE #1216 GUARD, which is PRE-EXISTING and is NOT fixed here.** With an inherited environment the WSL launcher PASSES the probe -- measured three trials on `origin/main`'s own code and three on the fix, `[True, True, True]` both times. It is not reachable through `require_bash` today, because under the PATH that would offer the launcher the git-derived candidates are offered first and now succeed. **Recorded rather than quietly fixed: widening this probe is how the sibling gate acquired five new fail-opens.**
+> Verdict: build
+> Closing-act: code
+
+**Cluster:** Test harness / instrument integrity. **Priority:** P2. **Verdict:** build.
+**Severity:** developer tooling only -- no product, engine or PHI surface, and nothing deployed (section 0). The cost is that **every local run from PowerShell or cmd is red and CI is green**, which is the worst arrangement for a harness fault: the box that would notice is the one that cannot, and the failure text sends the reader to edit workflow content that was never wrong.
+
+**Do not overclaim the result.** 7 ids stay SKIPPED on any box without `jq`. The honest sentence is *"every row that can execute here passes"*, never *"every row passes"*.
+
+**Source:** dispatched from the Cleaner's retraction of an earlier shim-backslash filing, which correctly re-diagnosed the symptom as a coreutils-less PATH rather than a path-handling defect. Reproduced here from the shipped source before building.
