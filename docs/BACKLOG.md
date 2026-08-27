@@ -5795,6 +5795,25 @@ The literal spellings are all caught, including the newline form. Only the indir
 **Source:** found 2026-08-05 by a session doing unrelated branch cleanup, from noticing that a rule 3b deny named a worktree the command was not going to act on. Verified against both the source gate and the installed one before filing. The reporting session did not build the fix, did not exploit the bypass, and used literal paths for its own subsequent work rather than the hole it had just found.
 
 ## 1061. Rule 3c fails open when the primary is named by a relative path, disarming every worktree's commit gates
+> **HALF OF WHAT THIS ROW OWES IS NOW DISCHARGED, AND IT STILL MUST NOT CLOSE.** This banner records
+> that what remains is *"a ledger correction plus repairing #1071"*. The #1071 half is done as of
+> 2026-08-26: that row's title asserts `rev-parse --absolute-git-dir` as the mechanism and the shipped
+> gate never calls it, so a retraction stamp now sits directly under its heading rather than twelve lines
+> below. Re-measured independently: `absolute-git-dir` **0** hits in `scripts/hooks/worktree_gate.ps1`,
+> against same-file positive controls of `git-common-dir` **4** and `rev-parse` **10**.
+>
+> **THE REFUSAL BELOW STANDS AND IS NOT WEAKENED BY THIS.** `12aa0674` (PR #478) records a deliberate
+> decision not to close this row, and this body already anticipates the next reader: *"A prior seat
+> already decided this; a later verifier finding the code merged is not new information."* That sentence
+> is the reason this stamp records progress instead of flipping a banner.
+>
+> **AND THE STRUCTURAL HAZARD IS WORTH NAMING, because a dispatcher hit it tonight.** The refusal above
+> sits BELOW the banner block, where `parse_items` stops reading. A fields-only filter sees
+> `open / verdict=build / closing-act=code` and queues this as fresh code work. Measured 2026-08-26 across
+> the dispatch pool: **14 of 48** free candidates carry refusal or warning language below their banner.
+> #1071 is a DIFFERENT shape of the same trap -- it contradicts itself between title and body, which no
+> warning-vocabulary scan can catch.
+>
 
 > 🔢 **Re-scored 2026-08-20 -> P3.** Value **2/10** · Difficulty **1/10** · _fill-in_. Nothing buildable remains under this item's own title: the relative-path fail-open denies on main in the two-step shape it prescribed (scripts/hooks/worktree_gate.ps1:1031 roots the target via Get-FullPathRaw at :147, :1032-1050 is the fail-closed deny, :1054 resolves the common dir against the rooted target), the fail-closed branch is tested at tests/test_worktree_gate_control_plane.py:332, and the installed hook is byte-identical to the repo copy at sha256 61a63c95, refuting the banner's still-commit-a67838d2 sentence. Value 2 and difficulty 1 because what is owed is a ledger correction plus repairing #1071, which asserts the gate asks rev-parse --absolute-git-dir when that string returns zero hits against a git-common-dir control of four. _(was 9/10 · 3/10.)_
 >
@@ -6095,6 +6114,15 @@ git -c 'alias.ci=commit --no-verify' ci -m x
 **Source:** the two `GIT_CONFIG_*` twins were measured by the adversarial verification of round 2's patch; `GIT_CONFIG=` and `git config edit` by round 3's git-config grammar pass.
 
 ## 1071. A UNC-spelled governed root is not de-aliased by rev-parse, so rule 3c allows a config write through it
+> **THE TITLE OF THIS ROW IS RETRACTED. `rev-parse` IS NOT THE MECHANISM.** The heading names
+> `rev-parse --absolute-git-dir`; the shipped gate never calls it. Re-measured 2026-08-26 on
+> `scripts/hooks/worktree_gate.ps1`: `absolute-git-dir` **0** hits, against same-file positive controls of
+> `git-common-dir` **4** and `rev-parse` **10** -- so the zero is a real zero and not a dead probe. The
+> comparison is LEXICAL, in `Get-ComparablePath`. **This stamp sits here because the retraction it points
+> at is twelve lines below, and a builder who reads a title and starts work never reaches it** -- the same
+> below-the-fold failure this ledger has now hit twice. The heading is left unchanged deliberately: it is
+> mirrored in the index table at line 352, and two spellings drifting apart is worse than one stale one.
+>
 
 > 🔢 **Re-scored 2026-08-20 -> P2.** Value **5/10** · Difficulty **4/10** · _fill-in_. The hole is open and the gate file records it: scripts/hooks/worktree_gate.ps1:1607-1614 states that an extended-length or UNC admin-share spelling normalises to //?/c:/... or //localhost/c$/..., matches no governed root, was verified live on this box, and that closing it means folding both prefixes into Get-ComparablePath, moving rules 3, 3b, 3c and 3d with it. Difficulty 4 because the change itself is a lexical fold inside a five-line function (:164-168) and the cost is the cross-rule test matrix plus a negative control, not a new mechanism. _(was 5/10 · 5/10.)_
 >
