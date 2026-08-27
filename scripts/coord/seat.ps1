@@ -122,7 +122,7 @@ function Write-WriterError {
     try {
         if (-not $script:SeatsDir) { return }
         $f = Join-Path $script:SeatsDir '.writer-errors.txt'
-        $line = '{0}`t{1}`t{2}`t{3}' -f ([DateTime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ssZ')), $env:COMPUTERNAME, $Stage, ($Message -replace '\s+', ' ')
+        $line = "{0}`t{1}`t{2}`t{3}" -f ([DateTime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ssZ')), $env:COMPUTERNAME, $Stage, ($Message -replace '\s+', ' ')
         Add-Content -Path $f -Value $line -Encoding utf8 -EA SilentlyContinue
     } catch { }
 }
@@ -589,6 +589,23 @@ try {
 
     $handoffObj = Prior 'handoff' $null
     if ($Declare -and $Handoff) {
+        # A BARE FILENAME IS WHAT CALLERS ACTUALLY PASS, AND IT COULD NEVER RESOLVE. Test-Path on a
+        # relative path resolves against the CALLER's cwd, which is a worktree, never the handoffs
+        # directory -- so the pointer was stored unresolved and the seat was told nothing, because
+        # Write-WriterError goes to a file. Measured: ALL 17 lines ever written to .writer-errors.txt
+        # are this one failure, and 2 of the 32 live pointers name a file that exists and is reported
+        # as missing. The skill documents "-Handoff needs an ABSOLUTE path" and four seats walked
+        # past that sentence inside twenty minutes on 2026-08-24; this seat made it five on 08-27.
+        # Prose was doing a mechanism's job.
+        #
+        # The as-given test still runs FIRST, so an absolute path and a genuinely relative one both
+        # behave exactly as before. This only adds a fallback for the shape that had no working
+        # meaning at all.
+        if (-not (Test-Path -LiteralPath $Handoff) -and -not [System.IO.Path]::IsPathRooted($Handoff)) {
+            $hoDir = Join-Path (Split-Path -Parent $script:SeatsDir) 'handoffs'
+            $cand = Join-Path $hoDir $Handoff
+            if (Test-Path -LiteralPath $cand -PathType Leaf) { $Handoff = $cand }
+        }
         if (Test-Path -LiteralPath $Handoff) {
             $hi = Get-Item -LiteralPath $Handoff
             $handoffObj = [ordered]@{

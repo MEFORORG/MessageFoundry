@@ -6,6 +6,7 @@ import * as path from "path";
 
 import {
   EditLoopGuard,
+  LiveValueArming,
   REDACTED_LIVE_VALUE,
   RerenderDebouncer,
   drainEdits,
@@ -347,8 +348,24 @@ suite("Steps #234 invariant 2 — a deferred refresh keeps live values save-gate
     );
     assert.ok(
       /shouldAttachLiveValues\(document\.isDirty\)/.test(gates[0].line),
-      `the live-value gate must be keyed on the document's dirty state (#225), never on how the ` +
-        `projection was triggered; scanned ${scanned}, got ${JSON.stringify(gates[0])}`,
+      `the live-value gate must be keyed on the document's dirty state (#225); scanned ${scanned}, ` +
+        `got ${JSON.stringify(gates[0])}`,
+    );
+    // BACKLOG #234 NARROWED THIS ASSERTION, AND THE REASON IS THE POINT. It used to read "never on how
+    // the projection was triggered", which #234 option B now deliberately does -- a change-triggered
+    // render attaches no live values. The old wording FORBADE A CLASS CONTAINING BOTH A DANGEROUS AND A
+    // SAFE FORM, and passed anyway because it only tested for a substring.
+    //
+    // What actually keeps #225 excluded is that any extra condition is a CONJUNCT. `A && gate` attaches
+    // live values on a strict SUBSET of the cases `gate` alone would, so it can only ever NARROW. A
+    // DISJUNCT could attach them against a dirty buffer, which is precisely #225's hazard. So the
+    // property to pin is the operator, not the absence of a term.
+    assert.ok(
+      !/\|\|/.test(gates[0].line),
+      `an additional condition on the live-value gate must be a CONJUNCT (&&), never a disjunct ` +
+        `(||): a conjunction can only NARROW the gate so #225's hazard cannot be reintroduced, ` +
+        `whereas a disjunction could attach live values against a dirty buffer. Scanned ${scanned}, ` +
+        `got ${JSON.stringify(gates[0])}`,
     );
     assert.strictEqual(
       acquisitions.length,
@@ -462,5 +479,162 @@ suite("Steps #234 invariant 3 — refreshing more often adds no second state of 
           `pipe the buffer to \`lens parse -\` over stdin — otherwise the projection input is a disk read`,
       );
     }
+  });
+});
+
+// ---- INVARIANT 4: the CHANGE trigger (BACKLOG #234 option B, ADR 0076 section 5 relaxation) --------
+//
+// ADR 0076 section 5 adopted "sync on save only" wholesale. The owner ruled that acceptance criterion
+// OPEN and a lane free to relax it -- permission, not a specification of how. This is the bounded
+// relaxation: the PROJECTION trigger only, live values untouched.
+//
+// The row flattens two paths with different reasons and its own non-goal says leave live values alone,
+// so relaxing both is not what was ruled in. `LiveValueArming` is the pure half of that separation and
+// is driven directly here; the wiring is vscode-coupled and is scanned.
+
+suite("Steps #234 invariant 4 - a change-triggered projection never arms live values", () => {
+  test("a save arms; a change does not", () => {
+    const a = new LiveValueArming();
+    assert.strictEqual(a.pending, false, "nothing pending before any trigger");
+    a.armRowsOnly();
+    assert.strictEqual(a.pending, false, "a CHANGE must never arm live values");
+    a.armSave();
+    assert.strictEqual(a.pending, true, "a SAVE arms them");
+  });
+
+  test("consume reads AND resets, so the next projection starts from nothing", () => {
+    const a = new LiveValueArming();
+    a.armSave();
+    assert.strictEqual(a.consume(), true);
+    assert.strictEqual(a.consume(), false, "a second render must not inherit the first's arming");
+  });
+
+  test("THE DIRECTION THAT MATTERS: a change arriving while a save is pending does NOT disarm it", () => {
+    // The save is the instant disk == buffer, which is exactly when live values become attachable.
+    // Letting a later keystroke downgrade it would discard a reading the user just earned by saving.
+    const a = new LiveValueArming();
+    a.armSave();
+    a.armRowsOnly();
+    a.armRowsOnly();
+    assert.strictEqual(a.consume(), true, "the pending save survived two intervening changes");
+  });
+
+  test("...and the other order too: a save arriving after a change still wins", () => {
+    const a = new LiveValueArming();
+    a.armRowsOnly();
+    a.armSave();
+    assert.strictEqual(a.consume(), true);
+  });
+
+  test("a change alone yields a projection with NO live values", () => {
+    const a = new LiveValueArming();
+    a.armRowsOnly();
+    assert.strictEqual(a.consume(), false, "rows only");
+  });
+
+  test("the provider subscribes to document CHANGE and routes it to the rows-only schedule", () => {
+    const text = fs.readFileSync(STEPS_VIEW_TS, "utf8");
+    assert.ok(
+      /onDidChangeTextDocument/.test(text),
+      "the change trigger is the whole feature; without this subscription nothing relaxes",
+    );
+    assert.ok(
+      /scheduleRowsOnlyRerender\(\)/.test(text),
+      "the change path must route through the rows-only schedule, not the save-flavoured one",
+    );
+  });
+
+  // The change path's four bounds, ONE TEST EACH. They were a single test until a mutation run showed
+  // two different defects -- dropping the focus condition and dropping the zero-change guard -- reding
+  // under one name. A shared red set means one name covers two failures, and the reader cannot tell
+  // which bound went without opening the assertion.
+  const changeHandler = (): string => {
+    const text = fs.readFileSync(STEPS_VIEW_TS, "utf8");
+    const body = text.slice(text.indexOf("onDidChangeTextDocument"));
+    return body.slice(0, body.indexOf("panel.onDidDispose"));
+  };
+
+  test("bound 1: it ignores changes to any OTHER document", () => {
+    const handler = changeHandler();
+    assert.ok(
+      /e\.document\.uri\.toString\(\) !== document\.uri\.toString\(\)/.test(handler),
+      `a change in an unrelated editor must not re-project this panel; handler was:\n${handler}`,
+    );
+  });
+
+  test("bound 2: a zero-change event is not an edit, so a SAVE cannot re-project twice", () => {
+    const handler = changeHandler();
+    assert.ok(
+      /contentChanges\.length === 0/.test(handler),
+      `a zero-change event is a metadata flip (the dirty flag itself), not an edit. Without this ` +
+        `guard a save fires BOTH subscriptions and the webview HTML is replaced twice; handler ` +
+        `was:\n${handler}`,
+    );
+  });
+
+  test("bound 3: the update-loop guard still runs first on the change path", () => {
+    const handler = changeHandler();
+    assert.ok(
+      /shouldReactToDocumentChange\(\)/.test(handler),
+      `our own lens rewrite WorkspaceEdit must not re-trigger a projection -- that is the loop ` +
+        `ADR 0076 section 5's guard exists to break; handler was:\n${handler}`,
+    );
+  });
+
+  test("bound 4: it does NOT re-project while the webview holds focus", () => {
+    const handler = changeHandler();
+    assert.ok(
+      /panel\.active/.test(handler),
+      `THE OBJECTION THE SAVE GATE ACTUALLY RAISED: a re-projection replaces the ENTIRE webview ` +
+        `HTML, destroying focus, selection and a half-typed param input. Typing in the split TEXT ` +
+        `editor costs nothing to re-project; typing in a webview input is the case the guardrail ` +
+        `was adopted for. A condition, not a threshold; handler was:\n${handler}`,
+    );
+  });
+
+  test("it reuses the ONE debounced re-projection channel", () => {
+    // MIS-SPECIFIED ON THE FIRST ATTEMPT, AND THE TEST CAUGHT IT: this counted EVERY `setTimeout(` in
+    // the provider and asserted 1. There are 2, both pre-existing on origin/main and neither added
+    // here -- the debouncer's injected timer, and an unrelated 3s watchdog arming the webview
+    // handshake at the script-load site. Counting all timers answers "how many timers exist", not
+    // "is there a second RE-PROJECTION channel", which is the invariant ADR 0076 section 5 actually
+    // carries. The debouncer count is the right population.
+    const text = fs.readFileSync(STEPS_VIEW_TS, "utf8");
+    const debouncers = (text.match(/new RerenderDebouncer/g) ?? []).length;
+    assert.strictEqual(
+      debouncers,
+      1,
+      `ADR 0076 section 5's single re-projection channel is load-bearing: a second, differently-timed ` +
+        `render would replace the webview HTML twice, ~250ms apart. Found ${debouncers} debouncers.`,
+    );
+    // ...and the change path must FEED that channel rather than grow its own.
+    assert.ok(
+      /const scheduleRowsOnlyRerender[\s\S]{0,240}?rerender\.schedule\(\)/.test(text),
+      "the rows-only schedule must route through the shared debouncer, not a timer of its own",
+    );
+  });
+
+  test("the change subscription is disposed with the panel", () => {
+    const text = fs.readFileSync(STEPS_VIEW_TS, "utf8");
+    assert.ok(
+      /changeSub\.dispose\(\)/.test(text),
+      "an undisposed subscription keeps re-projecting into a disposed panel",
+    );
+  });
+
+  test("...and that is DISCRIMINATING: an arming that ignores the save flavour loses live values", () => {
+    // The kept-in-tree falsification this file's other suites carry. If `armSave` were a no-op --
+    // the shape a careless refactor produces when it decides "the flag is always false anyway" --
+    // every save-triggered projection would silently stop attaching live values, and the ONLY
+    // symptom would be an absent marker. Prove the tests above can see it.
+    class Broken extends LiveValueArming {
+      override armSave(): void {}
+    }
+    const b = new Broken();
+    b.armSave();
+    assert.strictEqual(b.consume(), false, "the falsification behaves as described");
+    const good = new LiveValueArming();
+    good.armSave();
+    assert.strictEqual(good.consume(), true, "and the real one differs from it");
   });
 });

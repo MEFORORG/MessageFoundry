@@ -10,19 +10,68 @@ An item that exists in either ledger is invisible here and is that gate's busine
 exists in neither is invisible there and is this one's. Neither subsumes the other, and the near-
 identical names are the reason this paragraph is the first thing in the file.
 
-AND THE NAMES DIVERGE ON WIRING TOO, WHICH IS THE HALF THAT MISLEADS. That sibling IS run in CI
-(`.github/workflows/backlog-hygiene.yml`, and its test is named in `ci.yml`'s docs-lane list). THIS
-SCRIPT IS RUN BY NO WORKFLOW AND NO PRE-COMMIT HOOK -- it reaches CI only through
-`tests/test_dangling_citation_check.py`, which is manifest-classified and therefore runs on the
-tooling leg. Measured, with a positive control in the same pass: `dangling_citation_check` returns
-ZERO hits across `.github/` and `.pre-commit-config.yaml`, while `backlog_status_check`, `ledger_check`
-and `scan_forbidden` return 3, 2 and 3 -- so the probe finds wiring where wiring exists.
+AND THE NAMES DIVERGE ON WIRING TOO, BUT NOT WHERE A READER EXPECTS: THE SCRIPTS DIVERGE AND THE
+TESTS NO LONGER DO. The sibling's SCRIPT is invoked by a workflow -- `backlog-hygiene.yml:187` runs
+`scripts/docs/backlog_citation_check.py` over a PR range. THIS SCRIPT IS INVOKED BY NO WORKFLOW AND
+NO PRE-COMMIT HOOK: repo-wide at `origin/main` the path `scripts/docs/dangling_citation_check.py`
+occurs on Markdown lines only, `.mefor-hooks/pre-commit` `exec`s `messagefoundry check` and nothing
+else, and `main()` is called from nothing but its own test. ITS TEST, THOUGH, RUNS ON TWO CI LEGS --
+and "only" one leg is the word PR #560 (`b47c9fd9`, 2026-08-24) falsified in the version of this
+paragraph written two days earlier. TOOLING LEG: `tests/tooling_manifest.txt` names
+`tests/test_dangling_citation_check.py`, `conftest` marks it `tooling` from that manifest, and the
+tooling job's `pytest -m tooling` selects it. DOC-GUARD LEG: #560 added the same module to
+`ci.yml`'s `DOC_GUARDS` at `:244`, which the documentation-only step runs with NO marker filter.
+NEITHER LEG SUBSUMES THE OTHER, so do not collapse them into one: editing this `.py` matches
+`alwayscode` and sets `code=true`, which SKIPS the documentation-only step and leaves the tooling
+leg as the only cover, while a change touching only a path that is `noncode` AND matches no
+`tooling` arm -- a root `README.md`, say -- is covered by the doc-guard leg alone. The example is a
+root `README.md` and not a doc because `^docs/` is itself a `tooling` arm, so a `docs/**` PR trips
+BOTH legs and cannot show the complement. So the question a reader actually brings -- CAN A
+BEHAVIOUR CHANGE HERE RED A BUILD -- now answers YES, by way of the test, never by way of the
+script.
 
-WHY THAT IS WORTH A PARAGRAPH RATHER THAN LEFT TO BE LOOKED UP: a grep for `citation_check` HITS A
-WORKFLOW, and the hit belongs to the sibling. The answer is confident, well-formed, and wrong in the
-direction of believing a change here is CI-covered when it is not. Anyone reasoning about whether a
-behaviour change in this file can red a build must grep the FULL name, and should treat a bare
-`citation_check` match as evidence about the other script until they have checked which one it named.
+Measured 2026-08-25 at `origin/main` (`50adeb3a`), counting LINES that contain the literal script
+path across `.github/` plus `.pre-commit-config.yaml`, with positive and null controls in the same
+pass: `scripts/docs/dangling_citation_check.py` 0, `scripts/docs/backlog_citation_check.py` 1,
+`scripts/docs/backlog_status_check.py` 3, `scripts/hooks/ledger_check.py` 2,
+`scripts/security/scan_forbidden.py` 3, and the invented `scripts/docs/zzz_nonsense.py` 0 -- so the
+probe finds wiring where wiring exists and reports nothing where nothing is. THE CORPUS AND THE
+COUNTING RULE ARE SPELLED OUT BECAUSE A COUNT WITHOUT THEM CANNOT BE RE-RUN: the `3, 2 and 3` this
+paragraph used to carry were sound readings wearing the wrong label. They still reproduce exactly at
+this ref -- but only as FILE counts of the BARE tokens over `.github/workflows/` plus
+`.pre-commit-config.yaml`, a corpus the prose never named. Over the corpus it DID name they were 5,
+2 and 3 on the day they were written, so two of the three were wrong on arrival and the one that
+later went stale hid it.
+
+WHY THAT IS WORTH A PARAGRAPH RATHER THAN LEFT TO BE LOOKED UP: THE OBVIOUS GREP NOW MISLEADS IN
+BOTH DIRECTIONS AT ONCE. A bare `citation_check` under `.github/` returns three lines in two files:
+`backlog-hygiene.yml:187`, which is the sibling's SCRIPT and the only real invocation of the three,
+then `ci.yml:243` and `:244`, two `DOC_GUARDS` entries naming the sibling's TEST and THIS file's
+test. Land on the invocation and you conclude this script is workflow-run; land on `ci.yml:244` and
+you conclude the same thing for the opposite reason. Both answers are confident, well-formed and
+wrong -- only the direction moved -- and grepping the FULL name no longer rescues you, because a
+test filename contains its subject's name, so `dangling_citation_check` hits `ci.yml` too. THE
+DISTINCTION THAT DECIDES IT IS SCRIPT VERSUS TEST, NOT FULL NAME VERSUS BARE. Read the matched line:
+a `run:` naming `scripts/docs/<name>.py` is script wiring, a `tests/test_<name>.py` inside
+`DOC_GUARDS` is test wiring. Treat neither a bare nor a full match as evidence about either script
+until you have read which of those two shapes it is.
+
+HOW TO TELL THIS PARAGRAPH HAS GONE STALE AGAIN. It went stale once already, on the day #560 merged,
+and nothing anywhere reported it -- no check reads this docstring, so a wiring claim here is only as
+fresh as the date above it. Three things falsify it, and the useful half of the news is that two of
+them cannot happen quietly:
+
+  * SOMEONE WIRES THE SCRIPT UP. Re-run the probe above, controls in the same pass; the first number
+    stops being 0. NOTHING GUARDS THIS ONE. A zero with nothing beside it is not a measurement, and
+    a count whose corpus and rule are not restated is answering some other question.
+  * THE DOC-GUARD LEG GOES AWAY. `tests/test_doc_guards_lane.py`, in
+    `test_the_citation_guards_are_IN_the_lane`, names this module as a member of `DOC_GUARDS`, so
+    deleting `ci.yml:244` reds that test.
+  * THE TOOLING LEG GOES AWAY. `tests/test_tooling_partition.py`, in
+    `test_every_non_engine_test_is_classified`, reds if this module leaves
+    `tests/tooling_manifest.txt` -- BUT IT PINS BY GLOB OVER `tests/test_*.py`, NOT BY NAME, so
+    grepping for this module finds no such guard and the leg reads as unpinned when it is not.
+    Verified 2026-08-25 by dropping the manifest entry in memory and re-running that classifier.
 
 WHAT THE DEFECT IS. While a number names nothing, a citation to it resolves to NOTHING -- honest and
 harmless, and it advertises its own brokenness. If that number is later issued, the citation starts
@@ -36,11 +85,12 @@ different states both look like "resolves to nothing", and only one of them can 
   * BELOW THE HIGH-WATER MARK. `scripts/coord/alloc.ps1` starts its search at ``$observed + 1`` and
     scans UPWARD, never filling a hole -- "numbers are never reclaimed ... holes are free,
     collisions are not". A number at or below the mark is therefore unreachable FOREVER, and the
-    citation is harmless permanently rather than by luck. Measured here: 26 of 32 hits.
+    citation is harmless permanently rather than by luck. Measured here 2026-08-25 by running this
+    tool over the tree: 41 of 50 hits, floor 1352.
   * ABOVE IT. That number will be issued in the normal course, and on the day it is, the citation
     silently starts naming unrelated work. This is the only shape that can arm.
 
-A tool reporting only "resolves in the ledger or not" rates those identically and raises 26 false
+A tool reporting only "resolves in the ledger or not" rates those identically and raises 41 false
 alarms on this repository alone.
 
 WHY THE FLOOR AND NOT THE ALLOCATION REGISTRY. An earlier version of this tool classified by looking

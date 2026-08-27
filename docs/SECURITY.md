@@ -341,7 +341,7 @@ tuple: they act only on the caller's own account.
 | `GET` | `/me/mfa` | `require` | |
 | `POST` | `/me/mfa/enroll` | `require_reauth_only_action` (action `mfa_enroll`) | password-only step-up — the MFA gate is skipped so a required-but-unenrolled user cannot deadlock |
 | `POST` | `/me/mfa/confirm` | `require_reauth_only_action` (action `mfa_confirm`) | per-actor ceremony limiter; password-only step-up |
-| `DELETE` | `/me/mfa` | `require_step_up_action` (action `mfa_disable`) | step-up bound to the disable action (current factor + a fresh password). ⚠️ **No last-factor guard** — this is the TOTP path (`disable_mfa`), and it does **not** refuse when it would leave the account with zero enrolled factors. The passkey removal path does refuse; see BACKLOG #1022 for the asymmetry |
+| `DELETE` | `/me/mfa` | `require_step_up_action` (action `mfa_disable`) | step-up bound to the disable action (current factor + a fresh password). **Refuses (400) when TOTP is your last second factor and MFA is required for your account** — the same refusal, on the same condition, as the passkey removal path (`AuthService.disable_mfa`, ADR 0068 decision 5). The asymmetry this row used to record is closed (BACKLOG #1022) |
 | `GET` | `/me/sessions` | `require` | |
 | `GET` | `/me/security-events` | `require` | |
 | `DELETE` | `/me/sessions/{session_id}` | `require_reauth_only_action` (action `session_terminate`) | password-only step-up, bound to the action (ASVS 7.5.2): a login-seeded window does not unlock a terminate |
@@ -364,7 +364,7 @@ tuple: they act only on the caller's own account.
 | `DELETE` | `/users/{user_id}/sessions` | `users:manage` | `require_step_up` |
 | `PUT` | `/users/{user_id}/roles` | `users:manage` | `require_step_up` |
 | `POST` | `/users/{user_id}/reset-password` | `users:manage` | `require_step_up_action` (action `admin_reset_password`) |
-| `POST` | `/users/{user_id}/reset-mfa` | `users:manage` | `require_step_up_action` (action `admin_reset_mfa`) |
+| `POST` | `/users/{user_id}/reset-mfa` | `users:manage` | `require_step_up_action` (action `admin_reset_mfa`); **refuses (400) when `user_id` is the caller's own** — use the self-service MFA settings instead. Targeting yourself here was a third route to zero factors that skipped the last-factor refusal both self-service paths make (BACKLOG #1022). Cross-user reset is untouched: it is the always-available recovery for a locked-out passkey user (ADR 0068 §2) |
 | `GET` | `/users/{user_id}/channel-scope` | `users:manage` | `require` (a read on the `users:manage` tier, not `users:read`) |
 | `PUT` | `/users/{user_id}/channel-scope` | `users:manage` | `require_step_up` |
 | `GET` | `/ad-group-map` | `users:manage` | `require` |
@@ -627,7 +627,8 @@ inferred — `POST /ui/connections/bulk-control`, `POST /ui/connections/purge-bu
 | `POST` | `/ui/uploaded-logs/file/{file_id}/filter` | `files:browse` | `require_ui_step_up` |
 | `POST` | `/ui/uploaded-logs/file/{file_id}/delete` | `files:delete` | `require_ui_step_up` |
 | `GET` | `/ui/uploaded-logs/file/{file_id}/delete-confirm` | `files:delete` | `require_ui` |
-| `POST` | `/ui/uploaded-logs/file/{file_id}/resend` | `files:browse` | `require_ui` |
+| `POST` | `/ui/uploaded-logs/file/{file_id}/resend` | `files:browse` | `require_ui_step_up` |
+| `GET` | `/ui/uploaded-logs/file/{file_id}/resend-confirm` | `files:browse` | `require_ui` |
 | `GET` | `/ui/uploaded-logs/upload` | `files:upload` | `require_ui` |
 | `POST` | `/ui/uploaded-logs/upload` | `files:upload` | `require_ui` |
 | `GET` | `/ui/users` | `users:read` | `require_ui` |
@@ -680,11 +681,20 @@ else would need its own authorization rule stated here.
    browser cannot act on.
 2. **No `/ui` route charges the per-actor admin-write pacing floor** (see the interim note under
    [Anti-automation](#admin-password-reset-wp-l3-12-asvs-646)).
-3. **Two console routes lose a step-up their JSON counterparts have**:
-   `POST /ui/uploaded-logs/upload` and `POST /ui/uploaded-logs/file/{file_id}/resend` are plain
-   `require_ui`, while `POST /uploads` and `POST /uploads/{file_id}/resend` are `require_step_up` —
-   a multipart body cannot survive the re-auth redirect. So a PHI-at-rest write and a PHI
-   re-injection are gated on `files:upload` / `files:browse` alone on this plane.
+3. **One console route loses a step-up its JSON counterpart has**: `POST /ui/uploaded-logs/upload`
+   is plain `require_ui`, while `POST /uploads` is `require_step_up` — a multipart body cannot
+   survive the re-auth redirect. So a PHI-at-rest write is gated on `files:upload` alone on this
+   plane. **The resend half of this divergence is CLOSED (BACKLOG #1227):**
+   `POST /ui/uploaded-logs/file/{file_id}/resend` is now `require_ui_step_up`, reached through a
+   body-less confirm step that carries its two parameters in the query, so it survives the re-auth
+   redirect the way `delete` does. The premise that used to stand in for the gate — that the POST
+   arrives from an already-stepped-up browse page — was never enforced by anything.
+   That step introduces one *new*, narrower divergence, disclosed here rather than left to be
+   discovered: `GET /ui/uploaded-logs/file/{file_id}/resend-confirm` is plain `require_ui` while the
+   permission-equivalent JSON browse route carries a step-up. It **cannot** carry one, because it is
+   the re-auth continuation itself — gating it would bounce the operator back to `/ui/reauth`
+   indefinitely. It is accepted because the page renders **no message body**: a filename, an ordinal
+   and a connection name, all three of which the operator supplied on the previous screen.
 4. **The ADR 0092 PHI-read hop refusal does not apply on the `/ui` browse routes.**
    `enforce_phi_read_hop` appears nowhere in `messagefoundry_webconsole/`; the console's own gates —
    `require_ui(..., phi=True)` and `require_ui_step_up(..., phi=True)` — apply only the per-actor

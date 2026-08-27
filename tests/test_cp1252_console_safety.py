@@ -65,6 +65,7 @@ generalising to PowerShell is a different decision and is left to the existing p
 
 from __future__ import annotations
 
+import ast
 import re
 from pathlib import Path
 
@@ -199,3 +200,265 @@ def test_a_synthetic_offender_is_caught_and_a_hardened_one_is_not() -> None:
     assert not _HARDENS_STDOUT.search(bare)
     assert _unencodable(hardened) == [glyph]
     assert _HARDENS_STDOUT.search(hardened)
+
+
+# =================================================================================================
+# THE ENGINE HALF (BACKLOG #1030, the Dispatcher's 2026-08-22 amendment).
+#
+# The amendment measured that this item's scope sentence -- "the surface is scripts/ rather than the
+# engine" -- is backwards: 0 of 39 gated script files carried U+2192 against 134 of 267 engine files
+# and 1,028 lines. It also said plainly that 1,028 is A POPULATION, NOT A DEFECT COUNT, because a
+# character only bites if it REACHES a console, and that nobody had measured that subset.
+#
+# MEASURED 2026-08-27, and the subset is two orders of magnitude smaller. Of 1,647 non-cp1252
+# characters across the engine's 267 files: 865 sit in comments (never evaluated), 759 in docstrings
+# (which reach a console only through --help or help()), and 23 in evaluable string literals. Of
+# those 23, exactly ONE is lexically inside a call that writes to a console.
+#
+# THAT MEASUREMENT DECIDES THE PREDICATE, WHICH THE ITEM NAMES AS THE OPEN DESIGN QUESTION --
+# "whether to gate on encodability or on reaching an unguarded stream, since those give different
+# answers for a file that reconfigures". Gating the engine on ENCODABILITY, the way the scripts half
+# above is gated, fires 1,647 times and would be switched off the same day. Gating on REACH fires
+# once. The scripts half keeps the wider predicate because it can afford to: measured on the same
+# run, all 46 script files carry 12 such characters between them, in a single file that hardens
+# itself. Two predicates, two surfaces, both stated rather than implied.
+#
+# WHY IT IS WORTH GATING WHEN NO SHIPPED PATH IS BROKEN TODAY. messagefoundry/__main__.py:main()
+# reconfigures both streams, NSSM launches "messagefoundry serve", and uvicorn.run is called from
+# inside __main__.py -- so every shipped entry point is hardened and the one live site is protected
+# by the file it lives in. THE PROTECTION IS ONE FUNCTION CALL AWAY FROM ANY NEW ENTRY POINT, and
+# nothing detects a new printed glyph. That is this item's whole thesis: enforcement that is
+# hand-placed decays between sweeps.
+# =================================================================================================
+
+_ENGINE = _ROOT / "messagefoundry"
+
+#: THE ENGINE HARDENS IN A SHAPE `_HARDENS_STDOUT` ABOVE CANNOT SEE, and that is worth stating
+#: rather than quietly widening. `messagefoundry/__main__.py` reconfigures through
+#: `getattr(_stream, "reconfigure", None)` over a `(sys.stdout, sys.stderr)` tuple -- guarded,
+#: because some stream wrappers lack the method -- so the literal `stdout.reconfigure(` never
+#: appears and the scripts-half regex reports the repo's single most important hardening site
+#: as UNHARDENED. That regex was built from the one shape scripts happen to use.
+#:
+#: So the engine's exemption asks for both halves of the evidence separately: a reconfigure
+#: that is really a CALL or a getattr lookup, AND the word stdout somewhere in the file. A
+#: promissory comment satisfies neither; a stderr-only hardening satisfies only the first. The
+#: scripts half keeps its own narrower regex -- widening that one would change what an already
+#: shipped gate exempts, which is a different decision on a different surface.
+_RECONFIGURES = re.compile(r'reconfigure\s*\(|["\']reconfigure["\']')
+
+
+def _hardens_a_console(text: str) -> bool:
+    return bool(_RECONFIGURES.search(text)) and "stdout" in text
+
+
+#: Logging method names. A record that cannot encode is NOT a crash -- logging catches the
+#: UnicodeEncodeError in the handler, reports it on stderr and DROPS the record. So the failure mode
+#: on this path is a silently missing log line, which is why a promissory comment will not do.
+_LOG_METHODS = frozenset(
+    {"debug", "info", "warning", "warn", "error", "exception", "critical", "log"}
+)
+
+
+def _engine_modules() -> list[Path]:
+    return sorted(p for p in _ENGINE.rglob("*.py") if "__pycache__" not in p.parts)
+
+
+def _dotted(node: ast.expr) -> list[str]:
+    """The dotted path of an attribute chain, outermost last. `self._log.warning` -> the 3 parts."""
+    parts: list[str] = []
+    while isinstance(node, ast.Attribute):
+        parts.append(node.attr)
+        node = node.value
+    if isinstance(node, ast.Name):
+        parts.append(node.id)
+    return list(reversed(parts))
+
+
+def _writes_to_a_console(call: ast.Call) -> bool:
+    """Does this call put its arguments on stdout/stderr?
+
+    Deliberately LEXICAL and deliberately narrow. It does not chase a string through a variable,
+    so it under-reports by construction -- which is the right direction for a gate: every hit is
+    real, and the cost of a miss is a character that was already only a risk.
+    """
+    func = call.func
+    if isinstance(func, ast.Name) and func.id == "print":
+        return True
+    if not isinstance(func, ast.Attribute):
+        return False
+    parts = _dotted(func)
+    if func.attr == "write" and len(parts) >= 2 and parts[-2] in ("stdout", "stderr"):
+        return True
+    # A logger is identified by its NAME rather than by its type, because the type is not available
+    # to a static scan. `log`, `logger`, `self._log` and `logging` all match; `self.catalog.info()`
+    # deliberately does not, because "catalog" is not a segment that equals a logger name.
+    return func.attr in _LOG_METHODS and any(
+        part.strip("_").lower() in ("log", "logger", "logging") for part in parts[:-1]
+    )
+
+
+def _printed_unencodable(text: str) -> list[tuple[int, str]]:
+    """(line, character) for every non-cp1252 character inside a console-bound string literal.
+
+    PER-CHARACTER VIA THE AST, NOT PER-LINE. A line-oriented version of this was written first and
+    was wrong in a way that read as a clean result: on
+
+        self._alert_leadership_lost("released")  # #145: clean step-down (inverse -> auto-resolve)
+
+    a line scan sees a string token spanning the line and files the COMMENT's character as a live
+    string. Measured on this repo, that inflated the engine's reach count from 15 to 31 and every
+    inflated entry looked plausible in the dump. Only the argument subtree is walked here, so a
+    comment and a docstring are out of scope by construction rather than by exclusion.
+    """
+    try:
+        tree = ast.parse(text)
+    except SyntaxError:  # a file that will not parse is caught by its own test below
+        return []
+    hits: list[tuple[int, str]] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call) or not _writes_to_a_console(node):
+            continue
+        for arg in list(node.args) + [kw.value for kw in node.keywords]:
+            for sub in ast.walk(arg):
+                if isinstance(sub, ast.Constant) and isinstance(sub.value, str):
+                    for ch in _unencodable(sub.value):
+                        hits.append((sub.lineno, ch))
+    return sorted(set(hits))
+
+
+def test_the_engine_scan_actually_covers_something() -> None:
+    """The same positive control the scripts half carries, for the same reason.
+
+    It pins __main__.py by name because a `messagefoundry/**/*.py` git pathspec DROPS every
+    top-level file -- measured on this repo: 240 files against 267 from three other spellings, and
+    the 27 it loses include __main__.py, the one file whose hardening this whole scope rests on.
+    """
+    found = _engine_modules()
+    print(f"scanned {len(found)} python files under messagefoundry/")
+    assert len(found) >= 200, f"only {len(found)} engine files -- the walk is not finding them"
+    assert (_ENGINE / "__main__.py") in found
+
+
+def test_no_engine_module_puts_an_unencodable_character_on_a_console() -> None:
+    """The engine gate: a console-bound literal stays cp1252-safe unless its file hardens stdout."""
+    offenders: list[str] = []
+    exempted: list[str] = []
+    for path in _engine_modules():
+        text = path.read_text(encoding="utf-8")
+        hits = _printed_unencodable(text)
+        if not hits:
+            continue
+        rel = path.relative_to(_ROOT)
+        shown = ", ".join(f"line {ln} U+{ord(c):04X}" for ln, c in hits[:6])
+        if _hardens_a_console(text):
+            exempted.append(f"{rel} ({shown})")
+            continue
+        offenders.append(
+            f"{rel} sends {len(hits)} non-cp1252 character(s) [{shown}] to a console and does "
+            f"NOT reconfigure sys.stdout -- on a stock Windows console print() aborts and a log "
+            f"record is DROPPED with only a stderr notice"
+        )
+    print(f"console-bound and hardened, therefore allowed: {exempted or 'none'}")
+    assert not offenders, "\n  ".join(
+        ["engine modules that can lose or abort console output:", *offenders]
+    )
+
+
+def test_every_engine_module_decodes_as_utf8_and_parses() -> None:
+    """Never a silent skip, for both reasons: a file that will not decode is the likeliest to carry
+    the bytes this gate hunts, and a file that will not parse would make _printed_unencodable return
+    an empty list that is indistinguishable from a clean one."""
+    broken: list[str] = []
+    for path in _engine_modules():
+        try:
+            source = path.read_text(encoding="utf-8")
+        except UnicodeDecodeError as exc:
+            broken.append(f"{path.relative_to(_ROOT)}: not UTF-8: {exc}")
+            continue
+        try:
+            ast.parse(source)
+        except SyntaxError as exc:
+            broken.append(f"{path.relative_to(_ROOT)}: will not parse: {exc}")
+    assert not broken, "engine modules the scan could not read:\n  " + "\n  ".join(broken)
+
+
+# --- the engine detector's own controls ----------------------------------------------------------
+
+
+def test_the_engine_detector_catches_a_console_bound_glyph() -> None:
+    """Caught in each of the three shapes that actually occur in this repo."""
+    glyph = chr(0x2192)
+    assert _printed_unencodable(f'print("a {glyph} b")') == [(1, glyph)]
+    assert _printed_unencodable(f'sys.stdout.write("a {glyph} b")') == [(1, glyph)]
+    assert _printed_unencodable(f'log.warning("depth %d{glyph}%d", a, b)') == [(1, glyph)]
+
+
+def test_the_engine_detector_ignores_what_is_never_evaluated() -> None:
+    """The precision that makes the gate survivable. These are the 1,624 characters a naive
+    encodability scan over the engine would report, and every one of them is a false positive."""
+    glyph = chr(0x2192)
+    assert _printed_unencodable(f"x = 1  # a comment with {glyph} in it") == []
+    assert _printed_unencodable(f'"""A module docstring with {glyph}."""\nx = 1') == []
+    # A bare assignment is not a call, so it is out of scope by construction.
+    assert _printed_unencodable(f'BOM_STRIP = "{glyph}"') == []
+    # A literal bound to a name and never printed is out of scope: the scan is lexical by design.
+    assert _printed_unencodable(f'name = f"{{a}} {glyph} b"') == []
+
+
+def test_the_engine_detector_does_not_fire_on_representable_text() -> None:
+    """An em dash and a pound sign ARE cp1252-representable. A gate that fires on an em dash gets
+    switched off within a day, and this repo's prose uses both."""
+    text = "an em dash " + chr(0x2014) + " and a pound " + chr(0x00A3)
+    assert _printed_unencodable(f'print("{text}")') == []
+
+
+def test_a_logger_is_matched_by_name_and_a_lookalike_is_not() -> None:
+    """The logger heuristic proved in both directions, so its precision is evidence not assertion."""
+    glyph = chr(0x2705)
+    for good in ("log", "logger", "logging", "self._log", "self.logger"):
+        assert _printed_unencodable(f'{good}.info("{glyph}")') == [(1, glyph)], good
+    for other in ("self.catalog", "backlog", "dialog"):
+        assert _printed_unencodable(f'{other}.info("{glyph}")') == [], other
+
+
+def test_the_engine_gate_would_have_caught_the_alert_that_prompted_it() -> None:
+    """The known-answer case, kept as a literal because the shipped line has since been fixed.
+
+    Driven end to end on 2026-08-27 against the real LoggingAlertSink and a real cp1252 stream:
+    an ASCII sibling method wrote 54 bytes, this format string wrote 105 bytes on a UTF-8 stream,
+    and wrote ZERO on cp1252 while logging swallowed the UnicodeEncodeError. The alert announcing a
+    backing-up lane was precisely the line that vanished.
+    """
+    shipped = (
+        'log.warning("ALERT saturation: lane %r (%s) backlog RISING '
+        + chr(0x2014)
+        + " depth %d"
+        + chr(0x2192)
+        + '%d (+%.2f/s); ingest exceeding drain", name, stage, a, b, c)'
+    )
+    hits = _printed_unencodable(shipped)
+    assert hits == [(1, chr(0x2192))], (
+        f"expected only the arrow to be flagged, got {hits} -- the em dash in the same string is "
+        f"cp1252-representable and must NOT be reported"
+    )
+
+
+def test_the_engine_hardening_signal_sees_the_shape_the_engine_actually_uses() -> None:
+    """Proved against the real __main__.py rather than a reconstruction of it.
+
+    The scripts-half regex is asserted to MISS that same text, so the divergence is a measured fact
+    and not a claim. If someone later unifies the two signals, this is the line that tells them what
+    they are changing.
+    """
+    real = (_ENGINE / "__main__.py").read_text(encoding="utf-8")
+    assert _hardens_a_console(real), "the engine's own hardening must exempt it"
+    assert not _HARDENS_STDOUT.search(real), (
+        "if this now matches, __main__.py moved to the literal form and the note above is stale"
+    )
+
+    assert _hardens_a_console('sys.stdout.reconfigure(errors="replace")')
+    getattr_shape = "for s in (sys.stdout, sys.stderr):" + chr(10) + '    getattr(s, "reconfigure")'
+    assert _hardens_a_console(getattr_shape)
+    assert not _hardens_a_console("# we should probably reconfigure stdout one day")
+    assert not _hardens_a_console("sys.stderr.reconfigure(encoding='utf-8')")

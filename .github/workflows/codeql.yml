@@ -22,6 +22,18 @@ name: CodeQL
 # Settings -> Security -> Code scanning (one toggle, auto-pinned, auto-updated). Default setup and this
 # advanced workflow are mutually exclusive — if you turn default setup ON, delete this file.
 on:
+  # BACKLOG #340. THE QUEUE IS LIVE AND THESE THREE CONTEXTS ARE REQUIRED, so without this
+  # trigger CodeQL never reports on a merge_group event and NOTHING MERGES. Measured
+  # 2026-08-27 on the first entry the queue ever held: PR 619 sat AWAITING_CHECKS with 32
+  # check-runs green on gh-readonly-queue/main/pr-619-bca93ee1 and exactly three contexts
+  # absent -- CodeQL, CodeQL (python), CodeQL (javascript-typescript).
+  #
+  # security.yml's own on: block predicted this in the PR that added merge_group to the other
+  # four workflows: "the failure mode of the reverse order is total -- enable a queue while a
+  # required context's workflow has no merge_group trigger and that check never reports in the
+  # queue, so NOTHING MERGES." codeql.yml was not among those four, and the contexts were made
+  # required afterwards.
+  merge_group:
   push:
     branches: [main]
   pull_request:

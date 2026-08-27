@@ -290,15 +290,48 @@ class TestFleetRecomputesRatherThanTrustingTheRecord:
         assert "duplicate records" not in " ".join(out["receipt"]["stopConditions"])
 
     def test_the_receipt_reports_a_ratio_not_a_bare_count(self, repo: Path) -> None:
-        """A numerator alone cannot be read: 1 dangling is a crisis at 2 pointers and noise at 200."""
+        """A numerator alone cannot be read: 1 dangling is a crisis at 2 pointers and noise at 200.
+
+        THE FIXTURE CHANGED FROM A DRIFTED POINTER TO A DANGLING ONE (BACKLOG #1372) AND THE
+        ASSERTION THIS TEST EXISTS FOR DID NOT. Drift was only the cheapest way to make a stop
+        condition appear; the property under test is the RATIO FORMAT. Since drift no longer feeds
+        the roll-up, a drifted fixture now produces no stop at all and this would have been
+        asserting the format of a string that is never emitted.
+        """
+        doc = repo / "h.md"
+        doc.write_text("body", encoding="utf-8")
+        seat(repo, "-Declare", "-Seat", "lander", "-Goal", "g", "-Handoff", str(doc))
+        doc.unlink()
+        out = self._fleet_json(repo)
+        assert out["receipt"]["handoffPointersDangling"] == 1
+        stops = " ".join(out["receipt"]["stopConditions"])
+        assert "handoffPointersBroken=1 of 1" in stops, stops
+
+    def test_a_drifted_pointer_alone_raises_no_stop_condition(self, repo: Path) -> None:
+        """THE RULED BEHAVIOUR (BACKLOG #1372), pinned so it cannot be reverted by accident.
+
+        A pointer exists so a seat told to READ THE HANDOFF reaches the right document. When the
+        file has been UPDATED they reach the CURRENT one -- misdescribing a byte count and
+        misdirecting a reader are different harms, and only the second is brokenness.
+
+        Measured before the change: all five drifted seats in the live store were the seats keeping
+        their handoffs current under the PROTECT rung, one of them entering the state ninety seconds
+        after repairing it, while the 22 pointers naming a file that does not exist sat flat and
+        invisible inside an 81% roll-up.
+
+        THE DRIFT IS STILL COUNTED AND STILL REPORTED -- this asserts that too, so the change cannot
+        be mistaken for suppressing it.
+        """
         doc = repo / "h.md"
         doc.write_text("body", encoding="utf-8")
         seat(repo, "-Declare", "-Seat", "lander", "-Goal", "g", "-Handoff", str(doc))
         doc.write_text("body grown longer", encoding="utf-8")
+
         out = self._fleet_json(repo)
-        assert out["receipt"]["handoffPointersDrifted"] == 1
-        stops = " ".join(out["receipt"]["stopConditions"])
-        assert "handoffPointersBroken=1 of 1" in stops, stops
+        assert out["receipt"]["handoffPointersDrifted"] == 1, "the drift must still be REPORTED"
+        assert out["receipt"]["handoffPointersDangling"] == 0
+        stops = out["receipt"]["stopConditions"]
+        assert not [s for s in stops if "handoffPointers" in s], stops
 
     def test_an_intact_pointer_raises_no_stop_condition(self, repo: Path) -> None:
         """NEGATIVE CONTROL. A gate that fires on everything reports nothing."""

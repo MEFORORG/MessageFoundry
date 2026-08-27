@@ -18,15 +18,21 @@ A small N (12 → 24) keeps it inside the pytest-timeout budget; the shipped ``c
 
 from __future__ import annotations
 
+import json
+import os
+import pathlib
 import sys
+import tempfile
+import warnings
 from collections.abc import Sequence
 
 import pytest
 
+from harness.load.connscale.intake_audit import MOMENT_POST_MORTEM
 from harness.load.connscale.probe import ProbeDegraded
 from harness.load.connscale.profile import load_connscale_profile_text
 from harness.load.connscale.report import ConnScaleRecord, ConnScaleReport
-from harness.load.connscale.runner import run_connscale
+from harness.load.connscale.runner import _MONOTONIC_TOLERANCE, run_connscale
 from tests._connscale_ports import (
     INBOUND_PORT_HI,
     INBOUND_PORT_LO,
@@ -173,7 +179,156 @@ def _assert_fd_probe(records: Sequence[ConnScaleRecord]) -> None:
     )
 
 
+def _assert_intake_audit(records: Sequence[ConnScaleRecord]) -> None:
+    """Assert the BACKLOG #1292 discriminator on every step, in the order its verdicts matter.
+
+    Four properties, each pinning a different way this could go quietly wrong:
+
+    1. NO step is ``engine_suspect``. This is the finding the item is about: the engine framed an
+       accept-ACK for a message and its own stopped, committed store has no row for it.
+    2. EVERY step's audit is CONCLUSIVE. A PROBE_UNUSABLE result is not a pass -- it means the
+       instrument could not answer, and an instrument that silently stops answering leaves the
+       original unattributable failure in place while looking green.
+    3. EVERY step's sweep read rows (``store_total > 0``) against a step that sent messages. This is
+       the positive control: a set comparison against an empty set is clean for the wrong reason.
+    4. The authoritative audit is the POST-MORTEM one. A live read could be explained away as early
+       sampling; a read of a stopped engine's store cannot, and mislabelling one as the other would
+       destroy the only distinction the second moment exists to make.
+    """
+    for r in records:
+        audit = r.intake_audit
+        assert not audit.engine_suspect, (
+            f"COUNT-AND-LOG INVARIANT -- {r.sweep_mode}@N={r.count}: {audit.summary()}. The engine "
+            f"accept-ACKed those sends and its own stopped, committed store has no messages row for "
+            f"them, so a deploying site would be able to lose an acknowledged message at intake. "
+            f"The sequence numbers above name them; this is reproducible, not statistical."
+        )
+        assert audit.conclusive, (
+            f"INTAKE AUDIT COULD NOT ANSWER -- {r.sweep_mode}@N={r.count}: {audit.summary()}. The "
+            f"discriminator is the whole point of this step's no-loss coverage, so a probe that did "
+            f"not run or could not read is reported as a failure rather than tolerated: tolerating "
+            f"it restores exactly the unattributable red this check exists to replace."
+        )
+        assert audit.moment == MOMENT_POST_MORTEM, audit
+        assert audit.store_total > 0, (
+            f"INTAKE AUDIT POSITIVE CONTROL -- {r.sweep_mode}@N={r.count} sent {r.sent} message(s) "
+            f"and the store sweep read {audit.store_total} row(s): {audit.summary()}. A clean set "
+            f"comparison over an empty read says nothing about intake."
+        )
+
+
 # --- the one expensive run, shared by every property below ----------------------------------------
+
+
+#: Overrides where a LOCAL run appends its readings. Named so a variance-gathering sweep can
+#: point every run at one file instead of hunting a temp path per invocation.
+_LOCAL_READINGS_ENV = "MEFOR_CONNSCALE_READINGS"
+
+#: Where a local run lands when neither variable is set. Named once so a test can assert the
+#: write happened without re-deriving the path -- a second copy of it here would be a second
+#: definition, free to drift from the one the emitter actually uses.
+_DEFAULT_READINGS_PATH = pathlib.Path(tempfile.gettempdir()) / "connscale-readings.md"
+
+#: Where the MACHINE-READABLE copy goes. `out/` is gitignored and is where this repo's load
+#: harness already drops its reports, so CI can upload this the same way it uploads those.
+_READINGS_JSON_ENV = "MEFOR_CONNSCALE_READINGS_JSON"
+_DEFAULT_JSON_PATH = pathlib.Path("out") / "connscale" / "empty_claims.json"
+
+
+def _append_step_summary(text: str) -> None:
+    """Append to the job summary, which renders whether the job passed or failed.
+
+    APPEND, never truncate: ``$GITHUB_STEP_SUMMARY`` accumulates across every step of the job, so
+    overwriting it would eat another step's output.
+
+    A write that fails WARNS rather than raising. The reading is diagnostics, and turning a
+    diagnostics failure into a red leg on an unrelated pull request is the disease BACKLOG #1211 is
+    treating, not a cure for it. It is not swallowed either -- a silent emitter and a working one
+    would be indistinguishable.
+
+    OFF CI there is no job summary, so the readings go to a FILE and a warning names it. Precedence
+    is ``$GITHUB_STEP_SUMMARY`` first, then ``$MEFOR_CONNSCALE_READINGS``, then a temp file -- CI
+    keeps its existing behaviour untouched, and a local sweep can aim every run at one file.
+    """
+    path = os.environ.get("GITHUB_STEP_SUMMARY") or os.environ.get(_LOCAL_READINGS_ENV)
+    if not path:
+        # A LOCAL RUN GETS A REAL FILE, and the earlier stderr fallback was wrong about why it did
+        # not need one. pytest captures at the FILE DESCRIPTOR by default and DISCARDS the capture
+        # when the test PASSES -- which is precisely the run this emitter exists to record, since an
+        # excursion-only sample is selected on the outcome. Measured both ways on this repo: a
+        # passing test's stderr marker appears 0 times under default capture and 1 time under -s.
+        # The warning names the file because warnings survive that same capture and a reading nobody
+        # can find is not a reading.
+        path = str(_DEFAULT_READINGS_PATH)
+        warnings.warn(f"connscale readings appended to {path}", stacklevel=2)
+    try:
+        with open(path, "a", encoding="utf-8") as handle:
+            handle.write(text)
+    except OSError as exc:
+        warnings.warn(
+            f"could not record connscale readings to the step summary: {exc}", stacklevel=2
+        )
+
+
+def _record_ratio_readings(report: ConnScaleReport) -> None:
+    """Persist every ``empty_claims_per_msg`` reading this run produced (BACKLOG #1211).
+
+    The SLO records a number only once it has already left its band, so the only samples that ever
+    survived a run were the excursions -- and a sample selected on having excursioned cannot measure
+    the distribution it came from. #1211 needs the variance before anyone may touch the band, so the
+    readings are written here, from the FIXTURE, which runs before any assertion and therefore records
+    a passing run and a failing one alike.
+
+    The tolerance is IMPORTED, not typed in. A second copy of 0.25 here would be a second definition
+    of the band, and the emitted floor could then drift away from the one the SLO actually enforces.
+    """
+    context = {
+        # What a later reader needs to tell samples apart. #1211's whole question is whether the
+        # ratio moves with runner contention, so the core count is part of the reading, not trivia.
+        "runner_os": os.environ.get("RUNNER_OS", "local"),
+        "cpus": str(os.cpu_count()),
+        "run_id": os.environ.get("GITHUB_RUN_ID", "-"),
+        "sha": os.environ.get("GITHUB_SHA", "-")[:8] or "-",
+    }
+    _append_step_summary(
+        report.render_readings_markdown(
+            "empty_claims_per_msg",
+            lambda r: r.empty_claims_per_msg,
+            tolerance=_MONOTONIC_TOLERANCE,
+            context=context,
+        )
+    )
+    _write_readings_json(
+        report.readings_payload(
+            "empty_claims_per_msg",
+            lambda r: r.empty_claims_per_msg,
+            tolerance=_MONOTONIC_TOLERANCE,
+            context=context,
+        )
+    )
+
+
+def _write_readings_json(payload: dict[str, object]) -> None:
+    """Persist the readings where a TOOL can fetch them (BACKLOG #1211).
+
+    THE MARKDOWN COPY IS UNREADABLE BY ANY TOOL AND THAT IS THE WHOLE PROBLEM. It goes to
+    ``$GITHUB_STEP_SUMMARY``, and no GitHub API exposes a step summary -- measured 2026-08-27 from
+    two directions: the jobs endpoint carries no summary-bearing key, and the rendered page answers
+    "Sign in to view logs" even on a public repository. So every passing run has been recording its
+    values and then losing them, which defeats the point of recording a passing run.
+
+    An uploaded artifact IS fully API-reachable via ``gh run download``, and this repo's load
+    harness already proves the pattern. The workflow uploads ``out/connscale/``.
+
+    Same failure discipline as the markdown: a write that fails WARNS and never raises. Turning a
+    diagnostics failure into a red leg on an unrelated pull request is the disease #1211 treats.
+    """
+    target = pathlib.Path(os.environ.get(_READINGS_JSON_ENV) or _DEFAULT_JSON_PATH)
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    except OSError as exc:
+        warnings.warn(f"could not write connscale readings JSON: {exc}", stacklevel=2)
 
 
 @pytest.fixture(scope="module")
@@ -211,7 +366,7 @@ async def smoke_report() -> ConnScaleReport:
     # below the OS ephemeral floors, so the kernel cannot hand one out after it is probed.
     api_port, sink_port = reserve_api_and_sink_bases(profile, sink_ports=1)  # type: ignore[arg-type]
 
-    return await run_connscale(
+    report = await run_connscale(
         profile,  # type: ignore[arg-type]
         engine_api_port_base=api_port,
         sink_host="127.0.0.1",
@@ -219,6 +374,9 @@ async def smoke_report() -> ConnScaleReport:
         sink_ports=1,
         install_executor_shim=True,
     )
+    # In the FIXTURE, so the readings are recorded before any assertion can fail the module.
+    _record_ratio_readings(report)
+    return report
 
 
 # --- the properties, ONE NAME EACH ----------------------------------------------------------------
@@ -257,6 +415,19 @@ def test_no_loss_reconciles_at_every_step(smoke_report: ConnScaleReport) -> None
     for r in smoke_report.records:
         assert r.sent > 0, r
         assert r.no_loss.ok, (r.sweep_mode, r.count, r.no_loss.detail)
+
+
+def test_no_accept_acked_message_is_absent_from_the_stopped_engines_store(
+    smoke_report: ConnScaleReport,
+) -> None:
+    """BACKLOG #1292 -- the PER-MESSAGE intake audit, asserted INDEPENDENTLY of the count check above.
+
+    Strictly ADDITIONAL, not a restatement: the count check compares totals and forgives an
+    unconfirmed send, so a message the engine ACCEPT-ACKed and then has no row for passes it whenever
+    that message also happened to be excused as a timeout. This asserts the thing the count check
+    cannot: that no accept-ACKed message is absent from the engine's own committed store.
+    """
+    _assert_intake_audit(smoke_report.records)
 
 
 def test_the_fd_and_empty_claim_curves_are_monotonic_in_n(smoke_report: ConnScaleReport) -> None:

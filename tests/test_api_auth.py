@@ -1568,3 +1568,67 @@ async def test_admin_reset_mfa_requires_an_action_bound_proof_and_keeps_the_mfa_
             "the MFA gate is gone from admin reset-MFA -- require_step_up_action was replaced with a "
             "reauth-only factory, which is the weakening #1148's research recommended"
         )
+
+
+async def test_admin_reset_mfa_refuses_to_target_the_caller(engine: Engine) -> None:
+    """BACKLOG #1022: the admin MFA reset was a THIRD, unasked route to zero factors.
+
+    `disable_totp` and `delete_webauthn_credential` both refuse when they would drop the caller to
+    zero factors while MFA is required (ADR 0068 decision 5). Pointing the ADMIN reset at your own
+    account skipped that check entirely -- it clears TOTP, every recovery code and every passkey in
+    one call. `AuthService.disable_totp`'s own docstring names this item: two self-service routes to
+    zero factors behind one step-up gate, and only one of them asked.
+
+    THE SIBLING ROUTE HAS CARRIED THIS GUARD SINCE ASVS 6.4.6. `reset_user_password` refuses
+    `user_id == identity.user_id` twenty-five lines above; reset-MFA, the sharper of the two, did not.
+
+    WHY REFUSING SELF-TARGETING DOES NOT COST A RECOVERY PATH, which is the thing to get right:
+    `AuthService.admin_reset_mfa` stays unguarded and is still the always-available recovery for a
+    locked-out passkey user (ADR 0068 section 2). Cross-user reset is untouched -- the assertion
+    below pins that. And self-targeting was never recovery: reaching this route requires passing
+    `require_step_up_action(... ADMIN_RESET_MFA ...)`, which is itself MFA-gated, so an operator who
+    has genuinely lost every factor cannot call it at all.
+    """
+    service = await _service(
+        engine, AuthSettings(require_mfa=False, login_rate_limit_enabled=False)
+    )
+    # `_add` discards the id it creates, and this test is specifically ABOUT the caller's own id --
+    # so root is created the long way, exactly as `_add` does internally, to keep it.
+    root_id = await service.create_local_user(
+        username="root",
+        password=PW,
+        display_name=None,
+        email=None,
+        roles=[Role.ADMINISTRATOR.value],
+        actor="test",
+    )
+    await _clear_must_change(service, root_id)
+    target = await service.create_local_user(
+        username="mallory",
+        password=PW,
+        display_name=None,
+        email=None,
+        roles=["viewer"],
+        actor="root",
+    )
+    async with _client(engine, service) as c:
+        tok = (await _login(c, "root")).json()["token"]
+        h = _auth(tok)
+
+        # A grant bound to THIS action, so the request reaches the route body rather than the gate.
+        assert (await _reauth(c, tok, purpose="admin_reset_mfa")).status_code == 200
+        mine = await c.post(f"/users/{root_id}/reset-mfa", headers=h)
+        assert mine.status_code == 400, (
+            "the admin MFA reset accepted the caller's own id. That is a route to zero factors "
+            "which bypasses the last-factor refusal both self-service paths make."
+        )
+        assert "own account" in mine.json()["detail"]
+
+        # THE OTHER HALF, and without it this test would pass just as well if the route were broken
+        # outright: a DIFFERENT user is still resettable, so recovery is intact.
+        assert (await _reauth(c, tok, purpose="admin_reset_mfa")).status_code == 200
+        other = await c.post(f"/users/{target}/reset-mfa", headers=h)
+        assert other.status_code == 200, (
+            "cross-user admin MFA reset broke. That is the always-available recovery for a "
+            "locked-out passkey user (ADR 0068 section 2) and the self-exclusion must not touch it."
+        )
