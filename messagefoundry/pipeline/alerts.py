@@ -277,7 +277,7 @@ class LoggingAlertSink:
         self, name: str, *, stage: str, depth: int, depth_start: int, growth_per_second: float
     ) -> None:
         log.warning(
-            "ALERT saturation: lane %r (%s) backlog RISING — depth %d→%d (+%.2f/s); ingest exceeding drain",
+            "ALERT saturation: lane %r (%s) backlog RISING — depth %d->%d (+%.2f/s); ingest exceeding drain",
             name,
             stage,
             depth_start,
