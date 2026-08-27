@@ -59,6 +59,9 @@ which is which, is worse than either alone.
 
 | Date (CT) | PR | Context | Symptom | Verdict | Cause and resolution |
 |---|---|---|---|---|---|
+| 2026-08-26 19:20 | all | the merge queue itself | PR 619 sat `AWAITING_CHECKS` 40 min with `main` unmoved; **32 check-runs green on the queue branch, 0 failing, 0 pending** | `gate-artifact` | The three `CodeQL` contexts were made required, and `codeql.yml` has **no `merge_group` trigger** -- PR 616 added one to `ci.yml`, `backlog-hygiene.yml`, `cla.yml`, `security.yml` and not to codeql. A merge_group event cannot start it, so those contexts can never report on a queue branch and **every entry waits forever**. `security.yml`'s own `on:` block predicted this verbatim in the PR that added the other four. Fix: PR 629. |
+| 2026-08-26 19:12 | 625 | `test (ubuntu-latest / windows-2022 / windows-2025)` | my sweep reported all three as FAILING | `instrument` | **They were pending, not failing.** My classifier's `case` had no arm for an empty conclusion, so `""` fell through to the failure branch. `gh run list --branch` showed `CI` still `in_progress`. Same absent-versus-queued ambiguity as the 613 row below, in a tool I wrote after logging that one. |
+| 2026-08-26 18:40 | 623 | `test (windows-2025, py3.14)` | `empty_claims_monotonic: fixed_per_conn@N=24: 25 < prior 44.5 * 0.75` | `flake` | Short by **8.375** against prior recorded excursions of 1.400, 1.250 and 0.300 -- six times worse than any before it. The PR touches zero connscale files. **The branch predated #1211 limb one, so it ran the version that RECORDS NOTHING**: `render_readings_markdown` present 0 times at its head, 3 on main. A re-run would have produced a fifth bare verdict; merging main in produced the first instrumented sample. |
 | 2026-08-26 17:41 | 613 | 15 of 16 required | all reported `ABSENT` in the PR checks rollup | `instrument` | Not absent. The workflows had been queued about 9 minutes and registered 1 minute after the reading. **A never-run context and a not-yet-registered one are the same empty string in a PR's checks.** Discriminator is `gh run list --branch <ref>`, not the PR's checks. |
 | 2026-08-26 17:33 | 613 | `repo harness tests` (ubuntu, windows-2025), `CI gate` | `test_every_relative_link_in_the_repo_resolves` -- unresolved link to `docs/adr/0166-sandbox-...md` | `pr-defect` | An ADR renumbering (0166 to 0176) renamed the file; 31 citations were not updated. **Only 1 of the 31 is a markdown link, so CI saw 3% of the defect.** Fixed all 30 real citations; 1 left deliberately (a synthetic near-miss path in a negative-control table, not a citation). |
 | 2026-08-26 17:20 | 623 | `a PR that implements BACKLOG #N must update BACKLOG.md` | required context FAILURE | `pr-defect` | Subject cited `BACKLOG #234`; the PR touched no ledger row. Gate working correctly. Row added, context cleared. |
@@ -92,6 +95,13 @@ lands green.**
 `mergeable: MERGEABLE` sits next to `mergeStateStatus: BLOCKED` and both are true. An absent context
 and a queued one render identically. A subset probe reports truthfully about its subset. The rule
 that survives all three: **check each required context by name against the live required list.**
+
+**A REQUIRED CONTEXT THAT CANNOT FIRE ON THE EVENT IS INVISIBLE UNTIL SOMETHING WAITS ON IT.** The
+merge-queue deadlock is the sharpest instance: 32 green checks, nothing red, nothing pending, and
+three contexts simply never arriving. **A rollup cannot distinguish "absent" from "queued" from
+"will never report"** -- all three render as nothing. Reading the required list BY NAME against the
+SHA that is actually being gated is the only thing that separates them, and it has now been the
+answer four times in one evening on four different surfaces.
 
 **`diff-coverage (advisory)` has not produced a usable result on any PR observed.** It is cancelled
 by a job budget every time. It is harmless to merges and useless for coverage, which is the worst
