@@ -80,6 +80,28 @@ try {
         Where-Object { $_ -match '(?i)^builder' } |
         Sort-Object -Unique
     )
+
+    # A LANE IS NOT THE SAME THING AS A LANE'S PER-ITEM WORKTREE, AND THIS HOOK COULD NOT TELL THEM
+    # APART UNTIL 2026-08-27. A builder does not build in its lane checkout: it cuts a worktree per
+    # item and commits there. builder-1's LANE checkout went 17 hours without a commit while the
+    # lane was healthy the whole time, because every commit was landing in its per-item worktrees.
+    #
+    # So the moment a lane STARTED the row it had just been handed, a per-item worktree named after
+    # it appeared, matched `^builder`, held no queue file, counted ZERO open
+    # rows, and this hook fired "BUILDER LANES ARE BELOW THE FLOOR" -- at the exact instant supply
+    # was working correctly. A hook that alarms on success teaches the reader to dismiss it, which
+    # costs more than the missed alarm it was written to prevent.
+    #
+    # THE DISCRIMINATOR IS PREFIX EXTENSION, NOT THE QUEUE FILE. Filtering on "has a queue file"
+    # looks simpler and is wrong: a genuinely NEW lane has no queue file either, and silencing it is
+    # the one case this hook exists to catch. A per-item worktree, by contrast, always extends its
+    # lane's own name with a further hyphenated suffix. Drop anything that starts
+    # with another builder worktree's name plus a hyphen; a new lane extends nothing, so it counts.
+    $lanes = @($lanes | Where-Object {
+        $candidate = $_
+        -not ($lanes | Where-Object { $_ -ne $candidate -and $candidate.StartsWith($_ + '-', 'OrdinalIgnoreCase') })
+    })
+
     if (-not $lanes -or $lanes.Count -eq 0) { Allow 'no builder lanes exist' }
 
     # --- count each lane's open queue ----------------------------------------------------------
