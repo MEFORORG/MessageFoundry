@@ -132,7 +132,28 @@ try {
     if ($recent.Count -ge $MaxNudges) {
         # Do NOT keep blocking. Reaching here means the seat cannot act on the nudge, and a hook
         # that spins a session is a worse failure than the idle it was written to prevent.
-        $msg = "[builder-nudge] SAFETY VALVE: $seat nudged $($recent.Count) times in $WindowMinutes min without recording an ask. Letting the stop through. THIS IS A DEFECT IN THE NUDGE, not an idle lane -- investigate before re-arming."
+        # THE VALVE MUST NOT NAME A CAUSE. It cannot distinguish the two, and its first wording
+        # ("THIS IS A DEFECT IN THE NUDGE, not an idle lane") asserted one -- wrongly, twice, on
+        # 2026-08-26. A reader who trusts that sentence looks in the wrong place; a reader who
+        # learns it is unreliable stops reading the valve at all. A safety valve that mislabels its
+        # own trigger trains people to ignore it, which costs more than the false label.
+        #
+        # State what fired and what the two readings ARE, and name the discriminator. That is all
+        # this hook knows.
+        $msg = @"
+[builder-nudge] SAFETY VALVE: $seat nudged $($recent.Count) times in $WindowMinutes min with no
+recorded ask and no open queue rows. Letting the stop through so this cannot spin.
+
+TWO READINGS AND THIS HOOK CANNOT TELL THEM APART:
+  (a) THE LANE IS GENUINELY IDLE and is not asking for work -- exactly what the nudge exists to
+      catch, in which case the fix is to supply or re-task the lane.
+  (b) THE NUDGE IS MISFIRING at a lane that is working.
+
+THE DISCRIMINATOR IS THE SEAT ITSELF, NOT THIS MESSAGE AND NOT A COMMIT COUNT. Scoping, a
+serialised suite and a genuinely dry lane all produce zero commits. Ask the lane.
+BEWARE THE SEAT RECORD: its `asOf` is refreshed on every stop while its `goal` only changes when
+the seat re-declares, so a two-day-old goal reads as current. Compare `declaredAt`, not `asOf`.
+"@
         Write-Output $msg
         $mail = Join-Path $top.Trim() 'scripts\coord\mail.ps1'
         if (Test-Path -LiteralPath $mail) {
