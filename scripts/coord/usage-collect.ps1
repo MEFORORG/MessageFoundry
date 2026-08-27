@@ -10,11 +10,28 @@
     coordinator cannot subscribe to quota state; it has to be COLLECTED here and written somewhere shared.
     That single fact is why this script exists and why it is a statusLine rather than a hook.
 
-    ONE PUBLISHER, N READERS. The quota is ACCOUNT-WIDE: all sessions in every repo draw down the same
-    5-hour and 7-day pools, so any ONE session's reading is the truth for all of them. Do not run a
-    collector per session expecting to add them up -- summing double-counts the same shared pool. The
-    output path is therefore user-level, not repo-level: the data is a property of the account, not of
-    a checkout, and a repo-scoped copy would be a second truth that goes stale.
+    ONE PUBLISHER, N READERS, PER ACCOUNT -- AND THE "PER ACCOUNT" IS THE HALF THAT WAS MISSING. This
+    is the single place that premise is stated; everything else links here.
+
+    The quota is ACCOUNT-WIDE: all sessions in every repo draw down the same 5-hour and 7-day pools, so
+    any ONE session's reading is the truth for all sessions ON THAT ACCOUNT. Do not run a collector per
+    session expecting to add them up -- summing double-counts the same shared pool. The output path is
+    therefore not repo-level: the data is a property of the account, not of a checkout, and a
+    repo-scoped copy would be a second truth that goes stale.
+
+    IT IS NOT MACHINE-WIDE EITHER, and an earlier version of this file wrote as if it were. A box can
+    run several Claude config roots at once, each pinned through CLAUDE_CONFIG_DIR, and A CONFIG ROOT
+    HOLDS ONE CREDENTIAL SET AND THEREFORE ONE ANTHROPIC ACCOUNT. Measured on the box this was written
+    for: five account roots, five different account emails, five separate pools. Publishing all of them
+    to one user-level file is last-writer-wins across unrelated quotas, and the damage compounds -- the
+    percentage flaps; the carry-forward below can leave five_hour from one account beside seven_day
+    from another in one document; and usage.ps1's staleness guard never fires, because some OTHER
+    account keeps the file warm. That last one is the worst: the guard looks present and is disarmed.
+
+    SO THE PUBLISH PATH IS PER CONFIG ROOT: <config root>\mefor-usage. The rule lives once, in
+    config-roots.ps1 (Get-UsageStateDir), and usage.ps1 derives its read path from the same function --
+    so publisher and reader cannot drift apart. The filesystem is the partition key, which is why two
+    roots cannot collide however CLAUDE_CONFIG_DIR is spelled.
 
     WHAT IT CANNOT SEE, STATED HERE SO NOTHING DOWNSTREAM IMPLIES OTHERWISE. The statusLine payload
     carries `five_hour` and `seven_day` only. Absent: the MODEL-SCOPED weekly bucket (the "Weekly /
@@ -42,16 +59,57 @@
 #>
 [CmdletBinding()]
 param(
-    # Where to publish. User-level by default: the quota is account-wide, so this is not repo state.
-    [string]$StateDir = (Join-Path $env:USERPROFILE ".claude\mefor-usage"),
+    # Where to publish. NO DEFAULT HERE -- resolved in the body, because a param-block default cannot
+    # call a function this script dot-sources (param() must be the first statement). That constraint is
+    # a gift: computing it in the body is what lets collector, reader and installer share ONE
+    # derivation instead of three string literals that agree by luck.
+    #
+    # The wired statusLine ALWAYS passes this explicitly, so the body's resolution is only ever reached
+    # by a hand run or by a LEGACY wired command written before publish paths were per-root.
+    [string]$StateDir,
     # Raw payload capture, for verifying the schema against a real session. Off by default: the payload
-    # carries cwd and session ids, and this is a shared machine-level path.
-    [switch]$CaptureRaw
+    # carries cwd and session ids.
+    [switch]$CaptureRaw,
+    # A parameter, not an environment read, for the test-safety reason config-roots.ps1 states:
+    # [Environment]::GetFolderPath ignores a USERPROFILE override, so a callee that resolves home
+    # itself cannot be redirected by a test.
+    [string]$HomeDir = $(if ($env:USERPROFILE) { $env:USERPROFILE } else { [Environment]::GetFolderPath('UserProfile') })
 )
 
 # NO `$ErrorActionPreference = "Stop"`. This decorates a live session; a throw here is a worse outcome
 # than a missing reading, every time.
 $ErrorActionPreference = "SilentlyContinue"
+
+# DOT-SOURCED GUARDED, WITH A LITERAL FALLBACK. This file decorates a live session and must survive a
+# missing or broken sibling; a throw here is worse than any wrong path, every time. The fallback is a
+# SECOND copy of a two-line rule, which is exactly the duplication SDS-3.5 warns about -- kept
+# deliberately because "never throws" outranks "one definition" for a statusLine, and pinned by a test
+# in tests/test_coord_usage.py so drift goes red rather than silent.
+$HaveConfigRoots = $false
+try { . (Join-Path $PSScriptRoot 'config-roots.ps1'); $HaveConfigRoots = $true } catch { }
+
+# Loaded UNCONDITIONALLY, not only when $StateDir needs resolving: the wired statusLine always passes
+# -StateDir, so a load inside that branch would leave the stamp helpers undefined on the one path that
+# actually runs in production.
+function Get-RootLabel([string]$Path) {
+    if ([string]::IsNullOrWhiteSpace($Path)) { return $null }
+    if ($HaveConfigRoots) { return (ConvertTo-NormalRootPath $Path) }
+    try { return ([System.IO.Path]::GetFullPath($Path)).TrimEnd('\', '/') } catch { return $Path }
+}
+
+$ConfigRootEnv = if ($env:CLAUDE_CONFIG_DIR) { $env:CLAUDE_CONFIG_DIR } else { $null }
+if (-not $StateDir) {
+    $root = $null
+    if ($HaveConfigRoots) { $root = (Resolve-CurrentConfigRoot -HomeDir $HomeDir).Path }
+    else { $root = if ($ConfigRootEnv) { $ConfigRootEnv } else { Join-Path $HomeDir '.claude' } }
+    # AN UNVALIDATED PIN MUST NOT MANUFACTURE A CONFIG ROOT. New-Item -Force creates every missing
+    # parent (measured: it created a .claude-account-99 as a side effect), so a typo'd or stale
+    # CLAUDE_CONFIG_DIR would have a live session build a directory nothing can launch from -- the
+    # exact input the installer refuses to create. Publishing nothing is a state this script already
+    # handles quietly.
+    if ($root -and (Test-Path -LiteralPath $root -PathType Container)) { $StateDir = Join-Path $root 'mefor-usage' }
+}
+if (-not $StateDir) { Write-Output "mefor-usage: no config root to publish to"; exit 0 }
 
 function Write-AtomicText([string]$Path, [string]$Text) {
     # Temp-then-rename. [IO.File]::Move with overwrite is MoveFileEx(MOVEFILE_REPLACE_EXISTING), which
@@ -81,6 +139,13 @@ try {
     try { $p = $raw | ConvertFrom-Json -ErrorAction Stop } catch { }
     if (-not $p) { Write-Output "mefor-usage: unreadable statusline payload"; exit 0 }
 
+    # THE LEAF ONLY, AGAINST A PARENT THAT ALREADY EXISTS. -Force creates every missing ancestor, so
+    # without this guard an explicit -StateDir naming a root that is gone would have this script build
+    # the whole chain. Same rule as the resolution above; stated here because the wired command reaches
+    # this line without passing through it.
+    if (-not (Test-Path -LiteralPath (Split-Path $StateDir -Parent) -PathType Container)) {
+        Write-Output "mefor-usage: no config root to publish to"; exit 0
+    }
     New-Item -ItemType Directory -Force -Path $StateDir | Out-Null
     if ($CaptureRaw) { Write-AtomicText (Join-Path $StateDir "raw-payload.json") $raw | Out-Null }
 
@@ -136,10 +201,29 @@ try {
 
     $doc = [ordered]@{
         captured_at   = $now
+        # WHERE THIS DOCUMENT CAME FROM, IN THREE FIELDS, BECAUSE ONE WOULD DETECT NOTHING.
+        #
+        # config_root is a LABEL derived from the write path, so it is always correct and can never be
+        # a gate: a stamp derived from where we wrote agrees with where we wrote by construction. A
+        # root mis-wired to publish into ANOTHER root's directory would land there stamped with that
+        # other root, and every check would pass.
+        #
+        # config_root_env is THE DETECTOR: the ambient CLAUDE_CONFIG_DIR, read live, never derived from
+        # the write path. usage.ps1 refuses a document whose config_root_env names a root other than
+        # the one the document sits under -- which is the only comparison that can catch a mis-wire.
+        #
+        # "unset" IS A VALUE, distinct from absent. Absent means an older collector wrote this; unset
+        # means this collector ran with no pin. usage.ps1 treats both as unverifiable provenance and
+        # SAYS SO on every reading, rather than either lying about coverage or refusing correct data.
+        # Whether CLAUDE_CONFIG_DIR even reaches a statusLine child process is UNMEASURED on this box;
+        # if it does not, that line prints forever, which is the correct loud outcome.
         published_by  = [ordered]@{
-            session_id = [string]$p.session_id
-            version    = [string]$p.version
-            cwd        = [string]$p.cwd
+            session_id      = [string]$p.session_id
+            version         = [string]$p.version
+            cwd             = [string]$p.cwd
+            state_dir       = $StateDir
+            config_root     = (Get-RootLabel (Split-Path $StateDir -Parent))
+            config_root_env = $(if ($ConfigRootEnv) { (Get-RootLabel $ConfigRootEnv) } else { "unset" })
         }
         five_hour     = $five
         seven_day     = $seven

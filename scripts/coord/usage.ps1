@@ -12,7 +12,11 @@
     A percentage on its own does not answer that. 80% with two hours left and nothing running is fine;
     45% with 30 minutes left and six sessions compiling is not.
 
-    THREE HONESTY RULES, because a usage tool that is confidently wrong is worse than no usage tool --
+    WHICH ACCOUNT'S NUMBERS. This root's. The publish path is per config root -- see usage-collect.ps1
+    for why, stated once there -- so a bare invocation answers for the account THIS session booted
+    against, not for the box. Use -AllRoots to see every root side by side.
+
+    FOUR HONESTY RULES, because a usage tool that is confidently wrong is worse than no usage tool --
     it converts "I should check" into "I already know".
 
       1. NO PERCENTAGE WITHOUT ITS AGE. Every number is printed with how long ago it was observed.
@@ -26,29 +30,77 @@
          `seven_day` window read here, so Opus work is fully covered. An earlier draft warned about an
          invisible Opus bucket that does not exist -- a false blind spot is its own failure, because a
          session told its headroom is unknowable stops trusting a reading that was accurate.
+      4. REFUSE A READING FROM SOMEBODY ELSE'S ACCOUNT, AND SAY WHEN THAT CANNOT BE CHECKED. A document
+         stamped with a config root other than the one it sits under is reported UNKNOWN, never as this
+         session's headroom. A document carrying no stamp is read, and labelled UNVERIFIED -- absence
+         of provenance and wrong provenance are different facts, and only one of them is an error.
 
     EXIT CODES, so a coordinator can branch without parsing prose:
         0  OK
         10 WARN     -- high, or projected to exhaust before reset with slack
         11 CRITICAL -- projected to exhaust before reset, or already at the ceiling
-        20 UNKNOWN  -- no data, stale data, or not enough samples to say
+        20 UNKNOWN  -- no data, stale data, not enough samples, or a reading this root may not trust
+    Every diagnostic state added for the per-root publish path is UNKNOWN/20: they distinguish WHICH
+    FIX to apply, not how bad the situation is, and a coordinator branches on the four codes above.
 
 .EXAMPLE
     pwsh -NoProfile -File scripts\coord\usage.ps1
     pwsh -NoProfile -File scripts\coord\usage.ps1 -Json
+    pwsh -NoProfile -File scripts\coord\usage.ps1 -AllRoots
+    # Peek at another root without leaving this session:
+    pwsh -NoProfile -File scripts\coord\usage.ps1 -StateDir "$HOME\.claude-account-1\mefor-usage"
 #>
 [CmdletBinding()]
 param(
-    [string]$StateDir = (Join-Path $env:USERPROFILE ".claude\mefor-usage"),
+    # NO DEFAULT. Resolved in the body from this session's own config root, because a param-block
+    # default cannot call a function the script dot-sources (param() must be the first statement).
+    # That constraint is a gift: computing it in the body is what lets reader, collector and installer
+    # share ONE derivation instead of restating a literal that agrees by luck.
+    [string]$StateDir,
     # Machine-readable, for the coordinator.
     [switch]$Json,
     # Older than this and a reading is reported but NOT projected from.
     [int]$MaxAgeMinutes = 20,
     # Rate is measured over at most this much recent history.
-    [int]$RateWindowMinutes = 90
+    [int]$RateWindowMinutes = 90,
+    # One line per config root on this box. A SURVEY, NEVER A MERGE: these are different accounts with
+    # different 5h and 7d pools, so summing, averaging or taking a worst-of across them would rebuild
+    # the exact lie the per-root publish path removes.
+    [switch]$AllRoots,
+    # A parameter for the test-safety reason config-roots.ps1 states.
+    [string]$HomeDir = $(if ($env:USERPROFILE) { $env:USERPROFILE } else { [Environment]::GetFolderPath('UserProfile') })
 )
 
+$script:GaveStateDir = $PSBoundParameters.ContainsKey('StateDir')
+
 $ErrorActionPreference = "SilentlyContinue"
+
+# THE READER NEEDS THIS GUARD MORE THAN THE COLLECTOR DOES, and SilentlyContinue is why. With the
+# library missing, the dot-source failure is swallowed, Resolve-CurrentConfigRoot is not found
+# (swallowed), $StateDir stays $null, Join-Path $null "latest.json" yields the EMPTY STRING, and this
+# script would print "Nothing has published to ." and then diagnose `\settings.json` -- a confidently
+# wrong answer, which is the one outcome the honesty rules above exist to prevent. The shipped param
+# default could not fail this way; removing it introduces the hazard, so it is closed here.
+$rootInfo = $null
+$haveLib = $false
+try {
+    . (Join-Path $PSScriptRoot 'config-roots.ps1')
+    $rootInfo = Resolve-CurrentConfigRoot -HomeDir $HomeDir
+    $haveLib = $true
+}
+catch { }
+# THE FLOOR IS THE LIBRARY, NOT THE PATH, and testing the path alone would leave a hole. An explicit
+# -StateDir resolves the path without the library, but every downstream check -- Test-IsOurStatusLine,
+# Get-WiredStateDir, Test-SameRoot -- comes from it, and under SilentlyContinue a missing function is
+# swallowed rather than raised. That would produce a full, confidently wrong diagnosis. Refuse on the
+# library, whatever the path.
+if (-not $haveLib) {
+    $reason = "cannot resolve this session's config root -- scripts\coord\config-roots.ps1 did not load"
+    if ($Json) { @{ state = "UNKNOWN"; reason = $reason; path = $null } | ConvertTo-Json -Compress | Write-Output }
+    else { Write-Host ""; Write-Host "UNKNOWN. $reason" -ForegroundColor Yellow; Write-Host "" }
+    exit 20
+}
+if (-not $StateDir) { $StateDir = Get-UsageStateDir $rootInfo.Path }
 
 $latestPath = Join-Path $StateDir "latest.json"
 $histPath = Join-Path $StateDir "history.jsonl"
@@ -56,12 +108,146 @@ $histPath = Join-Path $StateDir "history.jsonl"
 $doc = $null
 try { $doc = Get-Content -LiteralPath $latestPath -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop } catch { }
 
+# WHY THE READER DIAGNOSES AND THE INSTALLER CANNOT. The reader is the only half that runs INSIDE the
+# pin, so it is the only one positioned to see which root a session really boots against. And because
+# it already has to open this root's settings.json to answer at all, the wired command is in hand at
+# no extra cost -- which is what lets it distinguish "not wired" from "wired to publish somewhere
+# else", two states with completely different fixes that the old one-line message merged.
+#
+# EIGHT STATES. The old message named none of them: it said "not installed or has not run yet" and
+# printed the bare installer command with no root -- so following the reader's own advice re-ran the
+# exact invocation that produced the false INSTALLED claim in the first place.
+function Get-StatusLineDiagnosis([string]$Root, [string]$ReadingFrom) {
+    $settingsPath = Join-Path $Root "settings.json"
+    $o = [ordered]@{
+        settings_path = $settingsPath
+        state         = "NOT_WIRED_NO_SETTINGS"
+        line          = "NOT WIRED -- this root has no settings.json"
+        remedy        = @("No session booting from this root can publish. Wire it (owner, plain terminal):",
+            "  pwsh -NoProfile -File scripts\coord\install-usage-statusline.ps1 -ConfigDir `"$Root`"")
+        wired_state_dir = $null
+        wired_collector = $null
+    }
+    if (-not (Test-Path -LiteralPath $settingsPath)) { return $o }
+
+    $settings = $null
+    try { $settings = Get-Content -LiteralPath $settingsPath -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop }
+    catch {
+        $o.state = "SETTINGS_UNREADABLE"
+        $o.line = "UNKNOWN -- settings.json is not valid JSON"
+        $o.remedy = @("An unparseable settings.json silently disables EVERY setting in it, not just this one.",
+            "Fix that first.")
+        return $o
+    }
+
+    $cmd = [string]$settings.statusLine.command
+    if ([string]::IsNullOrWhiteSpace($cmd)) {
+        $o.state = "NOT_WIRED_NO_STATUSLINE"
+        $o.line = "NOT WIRED -- settings.json carries no statusLine"
+        return $o
+    }
+    if (-not (Test-IsOurStatusLine $cmd)) {
+        $o.state = "FOREIGN_STATUSLINE"
+        $o.line = "FOREIGN -- a statusLine that is not ours owns this root's status bar"
+        $o.remedy = @("The collector never runs here, and the installer REFUSES to replace someone else's",
+            "statusLine. Merge the two commands by hand, or remove theirs, then re-install.")
+        return $o
+    }
+
+    $o.wired_state_dir = Get-WiredStateDir $cmd
+    $o.wired_collector = Get-WiredCollectorPath $cmd
+    $reinstall = @("Re-wire this root so the two agree:",
+        "  pwsh -NoProfile -File scripts\coord\install-usage-statusline.ps1 -ConfigDir `"$Root`"")
+
+    if ($null -eq $o.wired_state_dir) {
+        $o.state = "WIRED_LEGACY"
+        $o.line = "WIRED (ours) but the command carries no -StateDir -- written before publish paths were per-root. Where it publishes depends on the collector's own fallback at run time."
+        $o.remedy = $reinstall
+        return $o
+    }
+    if ($o.wired_collector -and -not (Test-Path -LiteralPath $o.wired_collector)) {
+        $o.state = "WIRED_COLLECTOR_MISSING"
+        $o.line = "WIRED (ours) but the collector it names is absent: $($o.wired_collector)"
+        $o.remedy = @("The status bar shows 'mefor-usage: collector missing' and nothing publishes.",
+            "Advance the primary checkout, or re-install to point at a collector that exists.")
+        return $o
+    }
+    if (-not (Test-SameRoot $o.wired_state_dir $ReadingFrom)) {
+        # THIS ARM IS THE POINT OF THE WHOLE DIAGNOSIS. Without it the reader tells the operator to
+        # restart and wait, forever, with nothing anywhere saying the two halves disagree -- which is
+        # the original defect relocated rather than fixed.
+        $o.state = "WIRED_ELSEWHERE"
+        $o.line = "WIRED (ours) but it publishes to $($o.wired_state_dir), and this session reads $ReadingFrom. WAITING WILL NOT FIX THIS."
+        $o.remedy = $reinstall
+        return $o
+    }
+    $o.state = "WIRED_HERE"
+    $o.line = "WIRED (ours), and it is wired to publish where this reader is looking"
+    $o.remedy = @("Settings are read at session START, so a session already running when it was wired still",
+        "has none. Start a NEW session pinned to this root and give it about ten seconds. Interactive",
+        "only -- it never runs under 'claude -p' or the SDK, so a headless coordinator can read this",
+        "and can never publish it.")
+    return $o
+}
+
+$readRoot = Split-Path $StateDir -Parent
+$rootSource = if ($script:GaveStateDir) { "-StateDir" } elseif ($rootInfo) { $rootInfo.Source } else { "unknown" }
+
 if (-not $doc) {
-    $msg = "NO USAGE DATA. Nothing has published to $latestPath."
-    $fix = "The statusLine collector is not installed or has not run yet. Install it (owner, plain terminal):`n    pwsh -NoProfile -File scripts\coord\install-usage-statusline.ps1`nIt only runs in an INTERACTIVE session -- never under 'claude -p' or the SDK."
-    if ($Json) { @{ state = "UNKNOWN"; reason = "no data"; path = $latestPath } | ConvertTo-Json -Compress | Write-Output }
-    else { Write-Host ""; Write-Host $msg -ForegroundColor Yellow; Write-Host $fix; Write-Host "" }
+    $dx = Get-StatusLineDiagnosis $readRoot $StateDir
+    if ($Json) {
+        [ordered]@{
+            state             = "UNKNOWN"
+            reason            = "no data"
+            path              = $latestPath
+            config_root       = $readRoot
+            config_root_source = $rootSource
+            settings_path     = $dx.settings_path
+            statusline_state  = $dx.state
+            state_dir         = $StateDir
+            wired_state_dir   = $dx.wired_state_dir
+            wired_collector   = $dx.wired_collector
+        } | ConvertTo-Json -Compress | Write-Output
+    }
+    else {
+        Write-Host ""
+        Write-Host "NO USAGE DATA. Nothing has published to $latestPath." -ForegroundColor Yellow
+        Write-Host "  config root : $readRoot   (from $rootSource)"
+        Write-Host "  settings    : $($dx.settings_path)"
+        Write-Host "  statusLine  : $($dx.line)"
+        Write-Host ""
+        foreach ($l in $dx.remedy) { Write-Host "  $l" }
+        Write-Host ""
+        Write-Host "  This reads the FILE. A file that carries the statusLine is not the same as a statusLine that FIRED."
+        Write-Host ""
+    }
     exit 20
+}
+
+# RULE 4, THE REFUSAL. Compared against the READ-FROM root -- the root the document actually sits
+# under -- and NOT against the reader's own root. Those are identical on the default path, but
+# comparing against the reader's root would break the two invocations that exist precisely to look
+# elsewhere: the documented single-root peek (-StateDir <other root>) and every row of the -AllRoots
+# survey but one. It still catches the failure it exists for: a reader in A opens A's file, the stamp
+# says B, B is not A, refuse.
+#
+# THE STAMP IT GATES ON IS config_root_env, NOT config_root. config_root is derived from the write
+# path, so it agrees with the write path by construction and could never detect a mis-wire.
+$stampEnv = [string]$doc.published_by.config_root_env
+$provenance = "OK"
+if ($stampEnv -and $stampEnv -ne "unset") {
+    if (-not (Test-SameRoot $stampEnv $readRoot)) {
+        $reason = "published from a DIFFERENT config root ($stampEnv); this document sits under $readRoot -- refusing to report another account's headroom as this session's"
+        if ($Json) { [ordered]@{ state = "UNKNOWN"; reason = $reason; path = $latestPath; config_root = $readRoot; provenance = "FOREIGN" } | ConvertTo-Json -Compress | Write-Output }
+        else { Write-Host ""; Write-Host "UNKNOWN. $reason" -ForegroundColor Yellow; Write-Host "" }
+        exit 20
+    }
+}
+else {
+    # ABSENCE IS UNVERIFIABLE PROVENANCE, NOT WRONG PROVENANCE -- so the reading is used, and the fact
+    # that the guard could not run is stated on every line of output rather than assumed away. It is
+    # also what keeps every hand-written fixture and every pre-change document readable.
+    $provenance = "UNVERIFIED"
 }
 
 $nowUtc = (Get-Date).ToUniversalTime()
@@ -211,6 +397,42 @@ $advice = switch ($overall) {
 
 $blindSpot = "NOT MEASURED: the model-scoped weekly bucket (Fable) and the plan tier are absent from the statusLine payload. Opus and Sonnet are NOT gaps -- they have no separate bucket and count against the 7d all-models window above, so Opus work is fully covered here."
 
+# ONE LINE PER CONFIG ROOT, AND NOTHING COMPUTED ACROSS THEM. Each row is validated against ITS OWN
+# root, which is why the refusal above compares to the read-from root rather than the reader's -- with
+# the other comparison every row but this session's would render as a refusal.
+function Get-RootSummary([string]$Root) {
+    $sd = Get-UsageStateDir $Root
+    $lp = Join-Path $sd "latest.json"
+    $s = [ordered]@{ root = $Root; state_dir = $sd; published = $false; note = ""; five = $null; seven = $null; age_min = $null }
+    $d = $null
+    try { $d = Get-Content -LiteralPath $lp -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop } catch { }
+    if (-not $d) {
+        $dx = Get-StatusLineDiagnosis $Root $sd
+        $s.note = "never published  [statusLine: $($dx.state)]"
+        return $s
+    }
+    $env_ = [string]$d.published_by.config_root_env
+    if ($env_ -and $env_ -ne "unset" -and -not (Test-SameRoot $env_ $Root)) {
+        $s.note = "REFUSED -- stamped with a different config root ($env_)"
+        return $s
+    }
+    $s.published = $true
+    $s.five = if ($d.five_hour) { [double]$d.five_hour.used_percentage } else { $null }
+    $s.seven = if ($d.seven_day) { [double]$d.seven_day.used_percentage } else { $null }
+    $s.age_min = Get-AgeMinutes $d.captured_at
+    if (-not $env_ -or $env_ -eq "unset") { $s.note = "provenance UNVERIFIED" }
+    return $s
+}
+
+$survey = $null
+if ($AllRoots) {
+    $survey = @()
+    foreach ($r in @(Get-ClaudeConfigRoots -HomeDir $HomeDir)) { $survey += Get-RootSummary $r }
+    if ($rootInfo -and -not ($survey | Where-Object { Test-SameRoot $_.root $readRoot })) {
+        $survey += Get-RootSummary $readRoot
+    }
+}
+
 if ($Json) {
     [ordered]@{
         state        = $overall
@@ -219,6 +441,11 @@ if ($Json) {
         seven_day    = $seven
         advice       = $advice
         not_measured = $blindSpot
+        provenance   = $provenance
+        config_root  = $readRoot
+        config_root_source = $rootSource
+        state_dir    = $StateDir
+        roots        = $survey
         published_by = $doc.published_by
         captured_at  = $doc.captured_at
     } | ConvertTo-Json -Depth 6 | Write-Output
@@ -242,12 +469,36 @@ function Show-Window($o) {
 
 Write-Host ""
 Write-Host "Claude account usage  --  $overall" -ForegroundColor $(switch ($overall) { "CRITICAL" { "Red" } "WARN" { "Yellow" } "UNKNOWN" { "DarkGray" } default { "Green" } })
+# WHOSE NUMBERS THESE ARE, ON EVERY RUN. Five roots on this box are five different accounts with five
+# separate pools, so a percentage with no root beside it is an unattributed number -- the same shape of
+# omission as a percentage with no age.
+Write-Host "  config root: $readRoot   (from $rootSource)" -ForegroundColor DarkGray
 Write-Host ""
 Show-Window $five
 Show-Window $seven
 Write-Host ""
 Write-Host "  $advice"
+if ($provenance -eq "UNVERIFIED") {
+    Write-Host ""
+    Write-Host "  provenance: UNVERIFIED -- the publisher recorded no CLAUDE_CONFIG_DIR, so the cross-root guard could not run" -ForegroundColor DarkGray
+}
 Write-Host ""
 Write-Host "  $blindSpot" -ForegroundColor DarkGray
+if ($survey) {
+    Write-Host ""
+    Write-Host "  Every config root on this box (a survey -- nothing is summed across accounts):"
+    foreach ($s in $survey) {
+        $mark = if (Test-SameRoot $s.root $readRoot) { "  <- this session" } else { "" }
+        if ($s.published) {
+            $f = if ($null -ne $s.five) { "5h {0,3:0}%" -f $s.five } else { "5h   -" }
+            $v = if ($null -ne $s.seven) { "7d {0,3:0}%" -f $s.seven } else { "7d   -" }
+            Write-Host ("    {0,-46} {1}  {2}   [seen {3} min ago]{4}" -f $s.root, $f, $v, $s.age_min, $mark)
+            if ($s.note) { Write-Host ("    {0,-46} {1}" -f "", $s.note) -ForegroundColor DarkGray }
+        }
+        else {
+            Write-Host ("    {0,-46} {1}{2}" -f $s.root, $s.note, $mark) -ForegroundColor DarkGray
+        }
+    }
+}
 Write-Host ""
 exit $rank[$overall]
