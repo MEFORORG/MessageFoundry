@@ -19,7 +19,9 @@ A small N (12 → 24) keeps it inside the pytest-timeout budget; the shipped ``c
 from __future__ import annotations
 
 import os
+import pathlib
 import sys
+import tempfile
 import warnings
 from collections.abc import Sequence
 
@@ -178,6 +180,16 @@ def _assert_fd_probe(records: Sequence[ConnScaleRecord]) -> None:
 # --- the one expensive run, shared by every property below ----------------------------------------
 
 
+#: Overrides where a LOCAL run appends its readings. Named so a variance-gathering sweep can
+#: point every run at one file instead of hunting a temp path per invocation.
+_LOCAL_READINGS_ENV = "MEFOR_CONNSCALE_READINGS"
+
+#: Where a local run lands when neither variable is set. Named once so a test can assert the
+#: write happened without re-deriving the path -- a second copy of it here would be a second
+#: definition, free to drift from the one the emitter actually uses.
+_DEFAULT_READINGS_PATH = pathlib.Path(tempfile.gettempdir()) / "connscale-readings.md"
+
+
 def _append_step_summary(text: str) -> None:
     """Append to the job summary, which renders whether the job passed or failed.
 
@@ -188,12 +200,22 @@ def _append_step_summary(text: str) -> None:
     diagnostics failure into a red leg on an unrelated pull request is the disease BACKLOG #1211 is
     treating, not a cure for it. It is not swallowed either -- a silent emitter and a working one
     would be indistinguishable.
+
+    OFF CI there is no job summary, so the readings go to a FILE and a warning names it. Precedence
+    is ``$GITHUB_STEP_SUMMARY`` first, then ``$MEFOR_CONNSCALE_READINGS``, then a temp file -- CI
+    keeps its existing behaviour untouched, and a local sweep can aim every run at one file.
     """
-    path = os.environ.get("GITHUB_STEP_SUMMARY")
+    path = os.environ.get("GITHUB_STEP_SUMMARY") or os.environ.get(_LOCAL_READINGS_ENV)
     if not path:
-        # Local runs have no job summary. stderr keeps the reading reachable without inventing a file.
-        sys.stderr.write(text)
-        return
+        # A LOCAL RUN GETS A REAL FILE, and the earlier stderr fallback was wrong about why it did
+        # not need one. pytest captures at the FILE DESCRIPTOR by default and DISCARDS the capture
+        # when the test PASSES -- which is precisely the run this emitter exists to record, since an
+        # excursion-only sample is selected on the outcome. Measured both ways on this repo: a
+        # passing test's stderr marker appears 0 times under default capture and 1 time under -s.
+        # The warning names the file because warnings survive that same capture and a reading nobody
+        # can find is not a reading.
+        path = str(_DEFAULT_READINGS_PATH)
+        warnings.warn(f"connscale readings appended to {path}", stacklevel=2)
     try:
         with open(path, "a", encoding="utf-8") as handle:
             handle.write(text)
@@ -393,3 +415,104 @@ def test_fd_sampler_reads_self() -> None:
 # The port-allocator's own guards (contiguity, fail-loud exhaustion, the too-narrow window, and
 # #1103's "every port the sweep will use was reserved") live in tests/test_connscale_ports.py,
 # beside the allocator they cover.
+
+
+# --- the readings fallback (BACKLOG #1211) -------------------------------------------------------
+# These do NOT use the smoke_report fixture. The emitter is pure I/O against an env var, and binding
+# its tests to a two-engine sweep would make the cheap half of this file cost minutes.
+
+
+def test_the_local_fallback_writes_a_file_because_stderr_does_not_survive_a_pass(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """THE DEFECT THIS REPLACES, stated as the reason rather than as a note.
+
+    The old fallback wrote to ``sys.stderr`` and its comment claimed that "keeps the reading
+    reachable without inventing a file". It does not: pytest captures at the FILE DESCRIPTOR and
+    DISCARDS the capture when the test PASSES -- which is exactly the run this emitter exists to
+    record, because an excursion-only sample is selected on the outcome and cannot measure the
+    distribution it came from. Measured both directions on this repo before the fix: a passing
+    test's stderr marker appears 0 times under default capture and 1 time under ``-s``.
+    """
+    target = tmp_path / "readings.md"
+    monkeypatch.delenv("GITHUB_STEP_SUMMARY", raising=False)
+    monkeypatch.setenv(_LOCAL_READINGS_ENV, str(target))
+
+    _append_step_summary("first\n")
+    _append_step_summary("second\n")
+
+    # APPEND, not truncate -- the second call must not eat the first.
+    assert target.read_text(encoding="utf-8") == "first\nsecond\n"
+
+
+def test_the_job_summary_wins_over_the_local_override(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """CI behaviour is unchanged by the local escape hatch, which is the point of the precedence."""
+    summary = tmp_path / "summary.md"
+    local = tmp_path / "local.md"
+    monkeypatch.setenv("GITHUB_STEP_SUMMARY", str(summary))
+    monkeypatch.setenv(_LOCAL_READINGS_ENV, str(local))
+
+    _append_step_summary("ci\n")
+
+    assert summary.read_text(encoding="utf-8") == "ci\n"
+    assert not local.exists(), "the local override must not shadow a real job summary"
+
+
+def test_with_no_env_at_all_it_still_lands_somewhere_and_says_where(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A reading nobody can find is not a reading, so the path is announced.
+
+    The announcement is a WARNING rather than a print because warnings survive the same capture that
+    swallows stdout and stderr on a passing test -- the very mechanism this fallback exists to route
+    around. A print here would reproduce the defect in the fix.
+    """
+    monkeypatch.delenv("GITHUB_STEP_SUMMARY", raising=False)
+    monkeypatch.delenv(_LOCAL_READINGS_ENV, raising=False)
+
+    marker = "readings-probe-" + str(id(monkeypatch))
+    with pytest.warns(UserWarning, match="connscale readings appended to") as caught:
+        _append_step_summary(marker + "\n")
+
+    named = str(caught[0].message).split("appended to ", 1)[1].strip()
+    written = pathlib.Path(named)
+    assert written.is_file(), f"the warning named {named} but nothing is there"
+    assert marker in written.read_text(encoding="utf-8")
+
+
+def test_a_write_that_fails_warns_and_does_not_raise(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Diagnostics must never redden a leg. A directory path cannot be opened for append."""
+    monkeypatch.delenv("GITHUB_STEP_SUMMARY", raising=False)
+    monkeypatch.setenv(_LOCAL_READINGS_ENV, str(pathlib.Path(tempfile.gettempdir())))
+
+    with pytest.warns(UserWarning, match="could not record connscale readings"):
+        _append_step_summary("this cannot be written\n")
+
+
+def test_the_default_landing_place_actually_receives_the_write(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Asserts the WRITE, deliberately without asserting the warning.
+
+    Its sibling above checks that the path is announced. This one checks that something arrives, and
+    keeping them separate is what lets the suite tell two different regressions apart: reverting to
+    the old stderr fallback writes NO file, while swapping the warning for a print still writes one.
+    Scored together they produced identical red sets, which is a suite that catches both defects
+    without distinguishing them.
+    """
+    monkeypatch.delenv("GITHUB_STEP_SUMMARY", raising=False)
+    monkeypatch.delenv(_LOCAL_READINGS_ENV, raising=False)
+
+    marker = "landing-probe-" + str(id(monkeypatch))
+    before_size = _DEFAULT_READINGS_PATH.stat().st_size if _DEFAULT_READINGS_PATH.is_file() else 0
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        _append_step_summary(marker + "\n")
+
+    assert _DEFAULT_READINGS_PATH.is_file(), "nothing was written to the default landing place"
+    body = _DEFAULT_READINGS_PATH.read_text(encoding="utf-8")
+    assert marker in body
+    # APPEND, so a shared file across runs grows rather than being replaced.
+    assert _DEFAULT_READINGS_PATH.stat().st_size > before_size
