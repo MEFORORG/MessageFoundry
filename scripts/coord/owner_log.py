@@ -9,18 +9,28 @@ INVISIBLE rather than merely stale. Measured 2026-08-26: two board cycles routed
 6-of-6 items to the owner that needed nothing from them, while three genuinely-owed items sat
 unseen -- and a fourth seat reported an item as still-owed that had been answered hours before.
 
-THE FOUR LEGS. An owner item has two round trips, and a loss at any leg looks like silence:
+THE LEGS. An owner item has two round trips, and a loss at any leg looks like silence:
 
     request_sent      a seat routes an item toward the owner
     request_received  the LIAISON has it and will present it
+    presented         the LIAISON has actually put it in front of the owner   [optional]
     answer_sent       the owner ruled; the LIAISON writes the ruling down
     answer_received   the ORIGINATING seat has the ruling and can act
 
-Gap between legs 1 and 2: a message lost on the way in.
-Gap between 2 and 3: sitting with the owner, or one the Liaison never presented.
-Gap between 3 and 4: A RULING THAT NEVER GOT BACK. That is the worst of the three, because the
-owner believes they answered while the seat is still waiting, and NEITHER SIDE HAS A REASON TO
-SPEAK. No board, message log or PR state can detect it.
+Gap between request_sent and request_received: a message lost on the way in.
+Gap after request_received: THE LIAISON NEVER PRESENTED IT. That is the Liaison's own failure and
+is the one it is least likely to notice, because from inside it feels like an item in progress.
+Gap after presented: waiting on a person. LEGITIMATE, and it may last a night.
+Gap after answer_sent: A RULING THAT NEVER GOT BACK -- the worst of them, because the owner
+believes they answered while the seat is still waiting, and NEITHER SIDE HAS A REASON TO SPEAK.
+No board, message log or PR state can detect it.
+
+WHY `presented` EXISTS. Without it, `request_received` meant BOTH "I never put this in front of
+them" and "they have it and are asleep". Those need OPPOSITE responses and rendered identically,
+so the check flagged a correctly-waiting item every thirty minutes -- which trains its reader to
+skim, which is how the next real gap gets missed. It is optional: an item that goes straight from
+received to answered is fine, and `check` treats a missing `presented` as "never presented" only
+once it is past the stale threshold.
 
 SCOPE. Owner-targeted items ONLY. Not a message log, not a task board. If no human decision is
 required, it does not belong here.
@@ -74,18 +84,27 @@ COLUMNS = ["ts", "item", "event", "actor", "counterparty", "summary", "ruling", 
 #: missing a field.
 LEGACY_COLUMNS = COLUMNS[:-1]
 
-LEGS = ["request_sent", "request_received", "answer_sent", "answer_received"]
+LEGS = ["request_sent", "request_received", "presented", "answer_sent", "answer_received"]
 TERMINAL = {"declined", "withdrawn"}
 NEXT_LEG = {
     "request_sent": "request_received",
-    "request_received": "answer_sent",
+    "request_received": "presented",
+    "presented": "answer_sent",
     "answer_sent": "answer_received",
 }
 MEANING = {
     "request_sent": "the LIAISON has not acknowledged it -- lost on the way in",
-    "request_received": "sitting with the OWNER, or never presented to them",
+    "request_received": "*** NEVER PRESENTED TO THE OWNER *** -- log `presented` once it is in front of them",
+    "presented": "in front of the owner and unanswered",
     "answer_sent": "*** THE RULING NEVER GOT BACK TO THE ORIGINATOR ***",
 }
+
+#: An item the owner has actually been shown is not stalled -- it is waiting on a person, which is a
+#: legitimate state and may last a night. Before this existed, `request_received` meant BOTH "I never
+#: put it in front of them" and "they have it and are asleep", which need OPPOSITE responses and
+#: rendered identically. A check that flags a correctly-waiting item every 30 minutes trains its
+#: reader to skim, which is how the next real gap gets missed.
+PRESENTED_STALE_HOURS = 14.0
 
 HEADER = [
     "# OWNER ITEMS -- four-leg ledger",
@@ -222,6 +241,7 @@ def cmd_check(a: argparse.Namespace) -> int:
         print("  and will stay green forever. Confirm seats are writing before trusting it.")
         return 0
     stale = []
+    waiting = []
     misdelivered = []
     for item, evs in sorted(items.items()):
         seen = {r.get("event") for r in evs}
@@ -249,6 +269,13 @@ def cmd_check(a: argparse.Namespace) -> int:
             continue
         lastev = [r for r in evs if r.get("event") == last][-1]
         mins = age_minutes(lastev.get("ts", ""))
+        if last == "presented":
+            # Waiting on a person who may be asleep. Only alarm if it has been far too long.
+            if mins >= PRESENTED_STALE_HOURS * 60:
+                stale.append((item, last, want, mins, lastev))
+            else:
+                waiting.append((item, mins, lastev))
+            continue
         if mins >= a.stale_minutes:
             stale.append((item, last, want, mins, lastev))
     if misdelivered:
@@ -263,6 +290,11 @@ def cmd_check(a: argparse.Namespace) -> int:
             if summary and summary != "-":
                 print(f"      summary     : {summary[:110]}")
             print("")
+    if waiting:
+        print(f"  {len(waiting)} item(s) AWAITING THE OWNER -- presented, not stalled:")
+        for item, mins, ev in sorted(waiting, key=lambda r: -r[1]):
+            print(f"      {item}  ({mins / 60:.1f}h)  {(ev.get('summary') or '')[:70]}")
+        print("")
     if not stale:
         if misdelivered:
             return 1
@@ -316,6 +348,7 @@ def main() -> int:
         ("received", "request_received"),
         ("answered", "answer_sent"),
         ("delivered", "answer_received"),
+        ("presented", "presented"),
         ("declined", "declined"),
         ("withdrawn", "withdrawn"),
     ]
