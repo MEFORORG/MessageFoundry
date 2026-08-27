@@ -16713,3 +16713,27 @@ raised message via `ast` and reds on that revert.
 confusing rather than broken, and churning that many message strings in one change buys less than the
 guard that stops the next one. Anyone taking them should take the `[egress]` six as one job -- they
 share a shape.
+## 1369. the ASVS writer persists its own control declarations into the record, because the control channel and the data channel are one dict
+
+> 🔢 **Filed 2026-08-27 (builder 2) - BUILT IN THIS COMMIT, not yet landed.**
+> Verdict: build
+> Closing-act: code
+
+**Cluster:** ASVS tooling. **Priority:** P2. **Verdict:** build.
+**Severity:** no engine effect, no PHI axis, no deployment axis (sec. 0), and no verdict moves. The cost is that the record of record accumulates fields nothing reads, written by the writer whose whole job is to keep that record clean.
+
+**What:** `--allow-retirement` requires the payload to DECLARE what it retires, and `apply.py:468` reads that declaration off the cell dict (`c.get(f"retired_{sub}")`). The carry-through at `:183` then writes it **straight back out**, because it emits every key not in `_ORDERED` or `_SUBTABLES` -- and a control declaration is exactly such a key. So a run that retires an anchor leaves `retired_absence = [...]` sitting in the record, where `scorecard.py` has **no reader for it and never will**. THE INSTRUCTION OUTLIVES THE OPERATION IT INSTRUCTED.
+
+**Both halves are individually correct and their intersection is the defect.** The reader is right to require a declaration -- a bare flag would be a blanket bypass, and that guard exists because a truncating repair once cut one cell 15 -> 10 and another 17 -> 1 with the verifier green throughout. The carry-through is right to be permissive -- narrowing it is what caused the 7818991d silent-drop incident, and `_carried`'s docstring rejects a name-keyed fix in terms: *"a name-keyed fix satisfies the symptom and drops the next field anyone adds, which is the defect itself with a longer list."* **ONE DICT CARRIES BOTH CHANNELS, so a control and a data field are indistinguishable by construction rather than by oversight.**
+
+**The fix is a derivation, not a list.** `_control_keys()` returns `tuple(f"retired_{name}" for name in _SUBTABLES)` and the carry loop skips it. A new sub-table brings its own control with it and this code never changes -- which is what the docstring's objection actually demands, and no data key is dropped.
+
+**COMPUTED PER CALL RATHER THAN ONCE, AND THAT IS THE PART A MUTATION RUN FORCED.** The first version was a module constant. A hand-written literal matching today's value **survived every test**, because a snapshot and a derivation are byte-identical in behaviour until someone edits `_SUBTABLES` -- which is the exact moment the rot arrives and the exact moment nothing is watching. A live function can be OBSERVED following a change: the test adds a sub-table and asserts `render` drops the new control too.
+
+**Not the fix, and both were tried:** suppressing every unrecognised key (re-introduces #1242's silent drop -- 23 tests red), or covering only the arm from the incident (leaks the other -- the one-arm fix passes the incident's own case, which is how it would have shipped).
+
+**Interaction with [#1363](#1363), which is unstarted and unclaimed:** that row reorders the key-set guard so a FULL-LIST retirement can reach the retirement logic. This change does **not** move the declaration's location in the payload -- it stays a top-level `retired_{sub}` key -- precisely so #1363's fix needs no adjustment. Whoever takes #1363 should know only that the key is now consumed and not stored.
+
+**Related:** #1307 (the retirement flag itself), #1363 (the ordering defect in the same path), #1242 (the carry-through's silent-drop incident, whose fix this must not undo).
+
+**Source:** routed by the Liaison. Their brief said `apply.py` never reads the field and that it appears only in argparse help; both are wrong -- the reader is built dynamically as `retired_{sub}`, which a literal grep for `retired_absence` cannot see. Their brief also said the ledger had zero mentions of it; #1363's evidence block carries two.
