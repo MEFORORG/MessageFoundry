@@ -66,7 +66,13 @@ import shutil
 import subprocess
 import sys
 
-COLUMNS = ["ts", "item", "event", "actor", "counterparty", "summary", "ruling", "blocks"]
+COLUMNS = ["ts", "item", "event", "actor", "counterparty", "summary", "ruling", "blocks", "target"]
+
+#: Rows written before ``target`` existed. read() accepts both widths and pads the legacy ones,
+#: because a stricter reader would silently DROP every pre-migration row -- 72 of them at the time
+#: this column was added -- and a ledger that quietly forgets its own history is worse than one
+#: missing a field.
+LEGACY_COLUMNS = COLUMNS[:-1]
 
 LEGS = ["request_sent", "request_received", "answer_sent", "answer_received"]
 TERMINAL = {"declined", "withdrawn"}
@@ -154,9 +160,14 @@ def read(path: str) -> list[dict[str, str]]:
             if not line.startswith("|") or line.startswith("|---"):
                 continue
             parts = [p.strip() for p in line.strip("|").split("|")]
-            if len(parts) != len(COLUMNS):
+            if len(parts) == len(COLUMNS):
+                rec = dict(zip(COLUMNS, parts, strict=True))
+            elif len(parts) == len(LEGACY_COLUMNS):
+                # Pre-``target`` row. Pad rather than skip: dropping it would erase history.
+                rec = dict(zip(LEGACY_COLUMNS, parts, strict=True))
+                rec["target"] = "-"
+            else:
                 continue
-            rec = dict(zip(COLUMNS, parts, strict=True))
             if rec.get("ts") == "ts":
                 continue
             rows.append(rec)
@@ -193,6 +204,7 @@ def cmd_event(a: argparse.Namespace) -> int:
             "summary": a.summary,
             "ruling": a.ruling,
             "blocks": a.blocks,
+            "target": getattr(a, "target", "") or a.actor,
         },
     )
     print(f"  ledger: {path}")
@@ -210,9 +222,21 @@ def cmd_check(a: argparse.Namespace) -> int:
         print("  and will stay green forever. Confirm seats are writing before trusting it.")
         return 0
     stale = []
+    misdelivered = []
     for item, evs in sorted(items.items()):
         seen = {r.get("event") for r in evs}
-        if (seen & TERMINAL) or ("answer_received" in seen):
+        if seen & TERMINAL:
+            continue
+        if "answer_received" in seen:
+            # LEG 4 IS PRESENT -- but was it closed by the seat that must ACT?
+            # A router can route an item a builder acts on. If the router logs delivery, the
+            # ledger goes green while the acting seat is still waiting: gap 3->4 wearing a tick.
+            # Keying on "is leg 4 present" cannot see this; keying on WHO closed it can.
+            req = next((r for r in evs if r.get("event") == "request_sent"), None)
+            got = [r for r in evs if r.get("event") == "answer_received"][-1]
+            want = (req or {}).get("target") or (req or {}).get("actor")
+            if want and want not in ("-", "") and got.get("actor") != want:
+                misdelivered.append((item, want, got.get("actor"), (req or {}).get("summary")))
             continue
         last = None
         for leg in LEGS:
@@ -227,7 +251,21 @@ def cmd_check(a: argparse.Namespace) -> int:
         mins = age_minutes(lastev.get("ts", ""))
         if mins >= a.stale_minutes:
             stale.append((item, last, want, mins, lastev))
+    if misdelivered:
+        print(f"  *** {len(misdelivered)} ITEM(S) CLOSED BY THE WRONG SEAT ***")
+        print("  Leg 4 is present, so the ledger reads green -- but the seat that must ACT on the")
+        print("  ruling is not the seat that logged receiving it. Confirm the acting seat has it.")
+        print("")
+        for item, want, got, summary in misdelivered:
+            print(f"  {item}")
+            print(f"      must act    : {want}")
+            print(f"      logged by   : {got}   <- not the acting seat")
+            if summary and summary != "-":
+                print(f"      summary     : {summary[:110]}")
+            print("")
     if not stale:
+        if misdelivered:
+            return 1
         print(f"  {len(items)} item(s). NO GAPS older than {a.stale_minutes:g} min. Exit 0.")
         return 0
     print(f"  *** {len(stale)} STALLED ITEM(S), threshold {a.stale_minutes:g} min ***")
@@ -292,6 +330,16 @@ def main() -> int:
             "--blocks",
             default="",
             help="what stalls without an answer; say 'nothing' if nothing does",
+        )
+        s.add_argument(
+            "--target",
+            default="",
+            help=(
+                "on `sent`: the seat that must ACT on the ruling, when that is not you. "
+                "A router may route an item a BUILDER acts on -- and if the router logs "
+                "delivery, leg 4 closes while the acting seat is still waiting. Defaults "
+                "to --actor."
+            ),
         )
         s.set_defaults(func=cmd_event, event=ev)
     c = sub.add_parser("check", help="find items stalled between legs (EXIT 1 if any)")
