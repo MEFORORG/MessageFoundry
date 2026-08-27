@@ -1674,12 +1674,24 @@ def test_a_root_wired_elsewhere_is_flagged_even_when_it_still_has_an_old_reading
         encoding="utf-8",
     )
 
-    _, doc, human = reader(pin=pin, home=fake_home)
+    code, doc, human = reader(pin=pin, home=fake_home)
     assert "WARNING" in human, f"a mis-wired root reported clean: {human}"
     assert "WAITING WILL NOT FIX THIS" in human
-    _, parsed, _ = reader("-Json", pin=pin, home=fake_home)
+    jcode, parsed, _ = reader("-Json", pin=pin, home=fake_home)
     assert parsed["statusline_state"] == "WIRED_ELSEWHERE"
     assert parsed["wired_state_dir"].lower() == str(elsewhere).lower()
+    # THE VERDICT, NOT ONLY THE PROSE -- AND THIS IS THE TEST THAT CAN PIN IT. Both windows here are
+    # FRESH, so without the fix the verdict is a clean OK and exit 0 while the same document reports
+    # statusline_state=WIRED_ELSEWHERE and the same render prints a WARNING. Two instruments
+    # disagreeing inside one run, which is the defect this whole branch exists to remove.
+    #
+    # The assertion was first written into the no-data test next door, where it could not fail: that
+    # one exits 20 because there is nothing to read, whatever the diagnosis does. Caught by reverting
+    # the fix and watching the test stay green.
+    assert parsed["state"] == "UNKNOWN", parsed
+    assert jcode == UNKNOWN, f"mis-wired root with a fresh reading exited {jcode}"
+    assert code == UNKNOWN, f"mis-wired root with a fresh reading exited {code}"
+    assert "--  OK" not in human, f"the heading claimed OK over a leftover: {human}"
 
 
 def test_a_root_that_has_no_settings_file_gets_no_backup_line(tmp_path: Path) -> None:
