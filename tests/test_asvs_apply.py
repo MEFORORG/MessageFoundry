@@ -1062,3 +1062,138 @@ def test_END_TO_END_a_successful_retirement_leaves_no_declaration_behind(tmp_pat
     # ...and the retirement itself still happened, so this is not passing by doing nothing.
     assert "verify_mode" not in after, "the retired anchor should be gone"
     assert "tls_cert_file" in after, "the surviving anchor must remain"
+
+
+# --------------------------------------------- BACKLOG #1363: a FULL-LIST retirement, 1 -> 0 or n -> 0
+
+
+def _closed_543(**over: object) -> dict:
+    """Cell 5.4.3 from the fixture: verdict ``na``, one anchor.
+
+    ``na`` is the verdict that makes a full-list retirement expressible at all -- ``pass``/``partial``/
+    ``fail`` each need at least one anchor or absence claim, so emptying their evidence trips a
+    DIFFERENT guard and a test built on one of them would never reach the guard under test. The
+    sibling test at ``test_a_declaration_whose_arithmetic_disagrees_is_refused`` records that trap.
+    """
+    base: dict = {
+        "id": "5.4.3",
+        "level": 2,
+        "verdict": "na",
+        "residual": "enterprise-provided control, outside the declared scope",
+        "last_verified": "2026-08-02",
+        "verified_at": "2222222222222222222222222222222222222222",
+        "reviewed_by": "owner",
+        "decision_closed": True,
+        "decision_closed_by": "owner",
+        "evidence": [],
+    }
+    base.update(over)
+    return base
+
+
+def test_a_FULL_LIST_retirement_is_expressible(tmp_path: Path) -> None:
+    """BACKLOG #1363. THE ITEM. A declared, arithmetic-consistent retirement of EVERY anchor.
+
+    ``--allow-retirement`` shipped under #1307 and genuinely works for a PARTIAL retirement, but the
+    field-preservation guard runs FIRST and is a pure key-set difference. ``render()`` emits
+    ``[[cell.evidence]]`` only from inside ``for a in cell.get("evidence") or []``, so emptying the
+    list emits no block at all and the KEY VANISHES -- and ``set(was) - set(now)`` then refuses with
+    "would LOSE field(s)" before the retirement logic is ever reached.
+
+    That is the shape both authorised retirements take, so the sanctioned outcome #1307 exists to make
+    expressible was still unreachable for the case that prompted it.
+    """
+    rec = _record(tmp_path)
+    rc = main(
+        [
+            str(_payload(tmp_path, [_closed_543(retired_evidence=["messagefoundry/m.py:30"])])),
+            "--scorecard",
+            str(rec),
+            "--apply",
+            "--allow-retirement",
+        ]
+    )
+    assert rc == 0, "a declared, arithmetic-consistent FULL-LIST retirement must go through"
+    after = rec.read_text(encoding="utf-8")
+    assert "_no_scan" not in after, "the retired anchor is still in the record"
+    assert "retired_evidence" not in after, "the declaration leaked into the record"
+    assert 'id = "1.1.1"' in after, "the untouched sibling cell was damaged"
+
+
+def test_a_full_list_drop_WITHOUT_the_flag_is_still_refused(tmp_path: Path) -> None:
+    """The arm without which the fix is indistinguishable from deleting the guard.
+
+    It must still refuse, AND it must refuse as a RETIREMENT question rather than as a lost field --
+    the message is what tells the operator which flag makes it expressible, and an unanswerable
+    refusal is the one that gets re-run with an override reflexively.
+    """
+    rec = _record(tmp_path)
+    before = rec.read_bytes()
+    rc = main(
+        [
+            str(_payload(tmp_path, [_closed_543(retired_evidence=["messagefoundry/m.py:30"])])),
+            "--scorecard",
+            str(rec),
+            "--apply",
+        ]
+    )
+    assert rc == 1
+    assert rec.read_bytes() == before
+
+
+def test_a_full_list_drop_WITH_the_flag_but_NO_declaration_is_refused(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The flag permits a DECLARED retirement, never any drop. A bare flag is a blanket bypass, and
+    this guard exists because a truncating repair once cut one cell 15 -> 10 and another 17 -> 1 with
+    the verifier green throughout.
+
+    ASSERTS WHICH REFUSAL FIRED, NOT MERELY THAT ONE DID, and that is not fussiness -- a mutation run
+    caught the first version of this row passing vacuously. With the declaration check removed the
+    ARITHMETIC check refuses the same payload (declaring nothing while the count drops by one), so
+    ``rc == 1`` held and the mutant survived the whole file. Two guards, one exit code.
+    """
+    rec = _record(tmp_path)
+    before = rec.read_bytes()
+    rc = main(
+        [
+            str(_payload(tmp_path, [_closed_543()])),
+            "--scorecard",
+            str(rec),
+            "--apply",
+            "--allow-retirement",
+        ]
+    )
+    assert rc == 1
+    assert "declares no 'retired_evidence'" in capsys.readouterr().out
+    assert rec.read_bytes() == before
+
+
+def test_a_full_list_drop_whose_arithmetic_disagrees_is_refused(tmp_path: Path) -> None:
+    """Declaring TWO retirements while the count drops by ONE. The arithmetic check must survive the
+    key-set exemption -- this is the truncation-behind-a-permit shape, at the full-list boundary."""
+    rec = _record(tmp_path)
+    before = rec.read_bytes()
+    rc = main(
+        [
+            str(
+                _payload(
+                    tmp_path,
+                    [
+                        _closed_543(
+                            retired_evidence=[
+                                "messagefoundry/m.py:30",
+                                "messagefoundry/m.py:31",
+                            ]
+                        )
+                    ],
+                )
+            ),
+            "--scorecard",
+            str(rec),
+            "--apply",
+            "--allow-retirement",
+        ]
+    )
+    assert rc == 1
+    assert rec.read_bytes() == before

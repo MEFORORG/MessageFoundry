@@ -429,7 +429,23 @@ def main(argv: list[str] | None = None) -> int:
     # a resolution check, because fewer anchors that all resolve is a passing state.
     for c in payload:
         was, now = live_cells[c["id"]], by_id[c["id"]]
-        lost = set(was) - set(now)
+        # _SUBTABLES ARE EXEMPT HERE BECAUSE THE CARDINALITY CHECK BELOW OWNS THEM (BACKLOG #1363).
+        # This is a pure KEY-SET difference, and `render()` emits `[[cell.evidence]]` only from
+        # inside `for a in cell.get("evidence") or []` -- so retiring the LAST anchor emits no block
+        # and the KEY VANISHES. That made a FULL-LIST retirement refuse here, before the retirement
+        # logic below was ever reached: `--allow-retirement` shipped under #1307 and worked for a
+        # PARTIAL retirement, while the shape both authorised retirements actually take stayed
+        # unreachable. The sanctioned outcome #1307 exists to express could not be expressed for the
+        # case that prompted it.
+        #
+        # EXEMPTING THEM WEAKENS NOTHING, AND THAT IS THE LOAD-BEARING CLAIM. Every case this check
+        # would have caught for those two keys is caught below with a BETTER message, because
+        # `len(now.get(sub, []))` reads an absent key as zero: a drop with no flag is refused and
+        # told which flag to use, a flag with no declaration is refused, and a declaration whose
+        # arithmetic disagrees is refused. The exemption is scoped to `_SUBTABLES` for the same
+        # reason the retype check below excludes them -- they have their own comparison. Every OTHER
+        # key must keep failing here, because nothing else re-checks it.
+        lost = set(was) - set(now) - set(_SUBTABLES)
         if lost:
             print(f"REFUSING: cell {c['id']} would LOSE field(s) {sorted(lost)}")
             return 1
