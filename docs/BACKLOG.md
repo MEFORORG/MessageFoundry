@@ -5268,7 +5268,10 @@ Both contain the identical slug. Only the first carries a `worktrees/` prefix.
 **Source:** found 2026-08-07 while committing #1082, when a routine slug grep returned a hit the leak gate had just passed. The gate had refused a different commit of mine for the prefixed form the day before, which is what made the disagreement visible.
 
 ## 1085. Rule 3c discards a `cd` prefix and resolves a relative `-C` against the session cwd, so it refuses a write aimed at an ungoverned repo
-> **FIXED 2026-08-26. The banner stays open for the archive pass, as with #1026, #1361, #1365 and #1367.**
+> **FIXED 2026-08-26. The banner stays open for the archive pass, as with #1026 and #1361.**
+> *(Two sibling rows written the same night are deliberately NOT cited here: their numbers are
+> allocated but their ROWS live on branches that have not landed, so a citation to them DANGLES
+> on this branch and reds the citation check. A cross-branch `#N` resolves only once both land.)*
 > The fix is in `Get-GitTargetCandidatesRaw`, which is where this row and the gate's own defect inventory
 > both said it belonged -- `worktree_gate.ps1` carried *"COMPOSE vs PREFER ... That is BACKLOG #1085"* in a
 > list ending *"All of these belong to the RESOLVER rather than to this rule"*. That comment is updated in
