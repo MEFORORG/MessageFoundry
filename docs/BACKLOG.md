@@ -8173,6 +8173,22 @@ filing.
 
 ## 1139. research an honest pass for ASVS 6.3.7 -- notifying a user whose authentication details the directory changed
 
+> **PARTIAL 2026-08-26 (lander), NOT A CLOSURE -- this item stays OPEN.** Lands the email-CLEAR limb:
+> `update_user_profile`'s notify guard read `if email is not None and email != before.email:`, whose
+> first conjunct silently skipped the clear -- and the clear is the one update that must be announced,
+> because it is the last moment the old address is reachable. After it,
+> `SecurityEventNotifier.notify` returns early on the empty address and the account is structurally
+> excluded from every later notice. Guard is now the bare comparison, which is safe rather than merely
+> wider because `PATCH /users/{id}` resolves an omitted field to the account's current value before
+> calling, so the parameter is the intended FINAL state and carries no partial-update ambiguity.
+> **RESCUED WORK, and the provenance matters: the fix was authored 2026-08-22 and has sat unlanded
+> since on `worktree-wf_c0bc7854-33d-1`, a branch named for a workflow worktree rather than a seat,
+> whose only pointer was a claim record whose holder directory no longer exists.** Verified live on
+> `main` before landing (the conjunct was still there at `service.py:2810`); 53 tests pass, ruff and
+> mypy clean. **What is NOT done: the rest of 6.3.7** -- the first-run-Administrator-with-no-email arm
+> (`security_notify.py` returning before enqueue) and the notification-target design question the
+> item's own re-score names. Those stay open.
+
 > 🔢 **Re-scored 2026-08-20 -> P1.** Value **8/10** · Difficulty **5/10** · _quick win_. The rubric prices an ASVS L3 Partial on as-shipped defaults at 8, and 6.3.7 is exactly that with a real missing control arm rather than a record question: a first-run Administrator with no email would get no out-of-band notice of a credential reset (security_notify.py:127-132 returns before enqueue), and a directory-driven email overwrite that redirects every later notice on the account writes neither an audit row nor a notice (service.py:1322-1340), so the change is undetectable after the fact. Difficulty 5 is a bounded change at one upsert plus the notification-target design question, sharing its channel research with 6.3.5. _(was 5/10 · 6/10.)_
 > Research: done 2026-08-20
 >
