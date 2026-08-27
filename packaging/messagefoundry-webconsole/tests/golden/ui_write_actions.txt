@@ -20,6 +20,7 @@
 ^/ui/roles/new$
 ^/ui/uploaded-logs/file/[^/?#]+$
 ^/ui/uploaded-logs/file/[^/?#]+/delete$
+^/ui/uploaded-logs/file/[^/?#]+/resend-confirm(\?[^#]*)?$
 ^/ui/users/[^/?#]+$
 ^/ui/users/[^/?#]+/(revoke-sessions|delete)$
 ^/ui/users/[^/?#]+/reset-mfa$

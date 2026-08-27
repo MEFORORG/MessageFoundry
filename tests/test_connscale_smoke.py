@@ -18,7 +18,9 @@ A small N (12 → 24) keeps it inside the pytest-timeout budget; the shipped ``c
 
 from __future__ import annotations
 
+import os
 import sys
+import warnings
 from collections.abc import Sequence
 
 import pytest
@@ -26,7 +28,7 @@ import pytest
 from harness.load.connscale.probe import ProbeDegraded
 from harness.load.connscale.profile import load_connscale_profile_text
 from harness.load.connscale.report import ConnScaleRecord, ConnScaleReport
-from harness.load.connscale.runner import run_connscale
+from harness.load.connscale.runner import _MONOTONIC_TOLERANCE, run_connscale
 from tests._connscale_ports import (
     INBOUND_PORT_HI,
     INBOUND_PORT_LO,
@@ -176,6 +178,61 @@ def _assert_fd_probe(records: Sequence[ConnScaleRecord]) -> None:
 # --- the one expensive run, shared by every property below ----------------------------------------
 
 
+def _append_step_summary(text: str) -> None:
+    """Append to the job summary, which renders whether the job passed or failed.
+
+    APPEND, never truncate: ``$GITHUB_STEP_SUMMARY`` accumulates across every step of the job, so
+    overwriting it would eat another step's output.
+
+    A write that fails WARNS rather than raising. The reading is diagnostics, and turning a
+    diagnostics failure into a red leg on an unrelated pull request is the disease BACKLOG #1211 is
+    treating, not a cure for it. It is not swallowed either -- a silent emitter and a working one
+    would be indistinguishable.
+    """
+    path = os.environ.get("GITHUB_STEP_SUMMARY")
+    if not path:
+        # Local runs have no job summary. stderr keeps the reading reachable without inventing a file.
+        sys.stderr.write(text)
+        return
+    try:
+        with open(path, "a", encoding="utf-8") as handle:
+            handle.write(text)
+    except OSError as exc:
+        warnings.warn(
+            f"could not record connscale readings to the step summary: {exc}", stacklevel=2
+        )
+
+
+def _record_ratio_readings(report: ConnScaleReport) -> None:
+    """Persist every ``empty_claims_per_msg`` reading this run produced (BACKLOG #1211).
+
+    The SLO records a number only once it has already left its band, so the only samples that ever
+    survived a run were the excursions -- and a sample selected on having excursioned cannot measure
+    the distribution it came from. #1211 needs the variance before anyone may touch the band, so the
+    readings are written here, from the FIXTURE, which runs before any assertion and therefore records
+    a passing run and a failing one alike.
+
+    The tolerance is IMPORTED, not typed in. A second copy of 0.25 here would be a second definition
+    of the band, and the emitted floor could then drift away from the one the SLO actually enforces.
+    """
+    context = {
+        # What a later reader needs to tell samples apart. #1211's whole question is whether the
+        # ratio moves with runner contention, so the core count is part of the reading, not trivia.
+        "runner_os": os.environ.get("RUNNER_OS", "local"),
+        "cpus": str(os.cpu_count()),
+        "run_id": os.environ.get("GITHUB_RUN_ID", "-"),
+        "sha": os.environ.get("GITHUB_SHA", "-")[:8] or "-",
+    }
+    _append_step_summary(
+        report.render_readings_markdown(
+            "empty_claims_per_msg",
+            lambda r: r.empty_claims_per_msg,
+            tolerance=_MONOTONIC_TOLERANCE,
+            context=context,
+        )
+    )
+
+
 @pytest.fixture(scope="module")
 async def smoke_report() -> ConnScaleReport:
     """ONE ``run_connscale`` sweep for the whole module (BACKLOG #1331).
@@ -211,7 +268,7 @@ async def smoke_report() -> ConnScaleReport:
     # below the OS ephemeral floors, so the kernel cannot hand one out after it is probed.
     api_port, sink_port = reserve_api_and_sink_bases(profile, sink_ports=1)  # type: ignore[arg-type]
 
-    return await run_connscale(
+    report = await run_connscale(
         profile,  # type: ignore[arg-type]
         engine_api_port_base=api_port,
         sink_host="127.0.0.1",
@@ -219,6 +276,9 @@ async def smoke_report() -> ConnScaleReport:
         sink_ports=1,
         install_executor_shim=True,
     )
+    # In the FIXTURE, so the readings are recorded before any assertion can fail the module.
+    _record_ratio_readings(report)
+    return report
 
 
 # --- the properties, ONE NAME EACH ----------------------------------------------------------------

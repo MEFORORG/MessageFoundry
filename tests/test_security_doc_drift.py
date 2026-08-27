@@ -63,7 +63,7 @@ _H_CONTEXT = "### Contextual and environmental security inputs (ASVS 8.1.3 / 8.1
 # POST /ui/uploaded-logs/file/{file_id}/filter, so the needle can travel in a body instead of a URL.
 _ROUTES_DEFAULT = 108
 _ROUTES_WITH_DOCS = 112
-_ROUTES_WITH_UI = 208
+_ROUTES_WITH_UI = 209
 
 #: The ``/ui`` routes that legitimately carry no gate: the sign-in, re-auth and second-factor entry
 #: points. The three ``/ui/reauth*`` routes authenticate the session cookie MANUALLY — a gate
@@ -112,9 +112,13 @@ _UI_WEAKER_THAN_JSON_EQUIVALENT = frozenset(
         ("GET", "/ui/messages/{message_id}/attachments/{attachment_id}"),
         ("GET", "/ui/messages/{message_id}/parse-tree"),
         ("GET", "/ui/uploaded-logs"),
+        # BACKLOG #1227: the resend CONFIRM page. It cannot be step-up-gated — it IS the re-auth
+        # continuation, so a step-up there bounces the operator back to /ui/reauth forever. It is
+        # safe to leave on plain require_ui because it renders NO message body: a filename, an
+        # ordinal and a connection name, all of which the operator just supplied.
+        ("GET", "/ui/uploaded-logs/file/{file_id}/resend-confirm"),
         ("POST", "/ui/connections/{name}/flag"),
         ("POST", "/ui/messages/search/presets/{preset_id}/delete"),
-        ("POST", "/ui/uploaded-logs/file/{file_id}/resend"),
         ("POST", "/ui/uploaded-logs/upload"),
     }
 )
@@ -871,7 +875,7 @@ def _ui_route_rows() -> list[tuple[str, str, tuple[str, ...], str | None]]:
 
 
 def test_every_ui_route_appears_in_the_ui_route_map() -> None:
-    """The console plane is 95 of the 200 served functions and the SOLE operator UI in the deployed
+    """The console plane is 96 of the 201 served functions and the SOLE operator UI in the deployed
     posture, so 8.1.1's "every function" includes it.
 
     RULE: a ``/ui`` route needs a row stating its permission and its wrapper, in both directions.
