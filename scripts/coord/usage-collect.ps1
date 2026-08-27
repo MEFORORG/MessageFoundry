@@ -193,8 +193,22 @@ try {
     $prevDoc = $null
     try { $prevDoc = Get-Content -LiteralPath $latestPath -Raw -ErrorAction SilentlyContinue | ConvertFrom-Json -ErrorAction Stop } catch { }
 
-    if ($five) { $five.captured_at = $now } elseif ($prevDoc -and $prevDoc.five_hour) { $five = $prevDoc.five_hour }
-    if ($seven) { $seven.captured_at = $now } elseif ($prevDoc -and $prevDoc.seven_day) { $seven = $prevDoc.seven_day }
+    # THE ORIGIN TRAVELS WITH THE WINDOW, FOR THE SAME REASON captured_at DOES.
+    #
+    # A document-level stamp records who WROTE the file, not where the numbers in it came from, and the
+    # carry-forward is exactly the hop that separates the two. Root A publishes into root B's directory
+    # (a legacy or hand-copied command). B's next session fires before its first API response, carries
+    # A's percentages forward, and rebuilds published_by with B -- so a document-level check compares B
+    # against B, passes, and reports A's headroom as B's. The window kept its older captured_at and
+    # would have been called stale eventually; it would never have been called FOREIGN.
+    #
+    # So a FRESHLY OBSERVED window is stamped here and a CARRIED one keeps whatever stamp it arrived
+    # with. usage.ps1 applies the cross-root refusal per window as well as per document.
+    $stampEnv = $(if ($ConfigRootEnv) { (Get-RootLabel $ConfigRootEnv) } else { "unset" })
+    if ($five) { $five.captured_at = $now; $five.config_root_env = $stampEnv }
+    elseif ($prevDoc -and $prevDoc.five_hour) { $five = $prevDoc.five_hour }
+    if ($seven) { $seven.captured_at = $now; $seven.config_root_env = $stampEnv }
+    elseif ($prevDoc -and $prevDoc.seven_day) { $seven = $prevDoc.seven_day }
 
     # Nothing observed and nothing remembered: publish NOTHING rather than a document full of nulls.
     if (-not $five -and -not $seven) { Write-Output "mefor-usage: no rate_limits yet"; exit 0 }

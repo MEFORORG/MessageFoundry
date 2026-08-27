@@ -50,7 +50,16 @@ OK, WARN, CRITICAL, UNKNOWN = 0, 10, 11, 20
 
 
 def collect(state: Path, payload: dict[str, Any] | str) -> str:
-    """Drive the collector exactly as Claude Code drives a statusLine: JSON on stdin, line on stdout."""
+    """Drive the collector exactly as Claude Code drives a statusLine: JSON on stdin, line on stdout.
+
+    THE PIN IS POPPED, and that is not incidental. The collector stamps each freshly observed window
+    with the config root that saw it, so a helper that inherited this process's own
+    ``CLAUDE_CONFIG_DIR`` would stamp every fixture with the real account root — and any test that then
+    read the fixture back through ``usage.ps1 -StateDir <tmp>`` would trip the cross-root refusal and
+    fail for a reason that has nothing to do with what it is testing. An unpinned publisher stamps
+    ``unset``, which is what a neutral fixture should be. Tests that care about a specific root pass
+    one explicitly.
+    """
     raw = payload if isinstance(payload, str) else json.dumps(payload)
     proc = subprocess.run(
         ["pwsh", "-NoProfile", "-NonInteractive", "-File", str(COLLECT), "-StateDir", str(state)],
@@ -59,6 +68,7 @@ def collect(state: Path, payload: dict[str, Any] | str) -> str:
         text=True,
         timeout=TIMEOUT,
         check=False,
+        env=_env(None),
     )
     # A statusLine that exits non-zero degrades the session it decorates; it must never do that.
     assert proc.returncode == 0, f"collector exited {proc.returncode}: {proc.stderr}"
@@ -1350,7 +1360,7 @@ def test_the_root_list_survives_being_wrapped_in_an_array_at_one_element(
     """A one-element result must arrive as ONE STRING, not as a nested array.
 
     This is not hypothetical: an earlier draft returned ``,@(...)`` — correct for the HashSet in
-    ``install-gate.ps1``, wrong for an array — and ``@(Get-ClaudeConfigRoots ...)`` then produced a
+    ``install-gate.ps1``, wrong for an array — and ``@(Get-LaunchableConfigRoots ...)`` then produced a
     single element that WAS the array. Its string form is every path joined by a space, so
     ``-AllRoots`` resolved one bogus target named ``<root-1> C:\\...\\<root-2>\\settings.json`` and
     reported "Roots examined: 1". Silent, and it survived a smoke test because ``Split-Path`` happens
@@ -1360,7 +1370,7 @@ def test_the_root_list_survives_being_wrapped_in_an_array_at_one_element(
     (home / ".claude-account-3").mkdir(parents=True)
     script = (
         f". '{CONFIG_ROOTS}'; "
-        f"$r = @(Get-ClaudeConfigRoots -HomeDir '{home}'); "
+        f"$r = @(Get-LaunchableConfigRoots -HomeDir '{home}'); "
         "Write-Output $r.Count; Write-Output $r[0].GetType().Name"
     )
     proc = subprocess.run(
@@ -1515,3 +1525,140 @@ def test_the_one_place_the_copies_disagree_is_named_rather_than_discovered() -> 
     strict, loose = proc.stdout.split()
     assert strict == "False", "the shared predicate stopped being case-sensitive"
     assert loose == "True", "install-coordination.ps1's -match stopped being case-insensitive"
+
+
+# --- three defects the adversarial review found in the first pass -------------------------------
+
+
+def test_uninstall_whatif_does_not_claim_it_removed_anything(fake_home: Path) -> None:
+    """A DRY RUN THAT REPORTS SUCCESS IS THE SAME LIE, POINTING THE OTHER WAY.
+
+    ``$removed++`` sat OUTSIDE the ShouldProcess guard, so ``-Uninstall -AllRoots -WhatIf`` printed
+    "removed: 5" and exited 0 having removed nothing. An operator dry-running before committing reads
+    that as "the collector is off" while all five roots keep publishing — and a coordinator branching
+    on the documented exit codes gets 0, which the header defines as every root reaching the desired
+    state. It is worse than the install claim this change deletes, because a person believes they
+    turned something OFF.
+    """
+    assert install("-AllRoots", pin=None, home=fake_home).returncode == 0
+    proc = install("-AllRoots", "-Uninstall", "-WhatIf", pin=None, home=fake_home, collector=None)
+    assert proc.returncode == 0, proc.stdout
+    assert "removed: 0" in proc.stdout, f"a dry run claimed removals: {proc.stdout}"
+    assert "would remove: 2" in proc.stdout
+    # And nothing was actually removed.
+    for n in (".claude-account-1", ".claude-account-2"):
+        assert "statusLine" in json.loads(
+            (fake_home / n / "settings.json").read_text(encoding="utf-8")
+        )
+
+
+def test_a_window_carried_from_another_root_is_refused_even_when_the_document_is_ours(
+    fake_home: Path,
+) -> None:
+    """THE ONE-HOP LAUNDERING PATH, and the reason provenance travels with the WINDOW.
+
+    A document-level stamp records who WROTE the file, not where the numbers in it came from, and the
+    carry-forward is exactly the hop that separates those. Root A publishes into root B's directory (a
+    legacy or hand-copied command). B's next session fires before its first API response, carries A's
+    percentages forward, and rebuilds ``published_by`` with B — so a document-level check compares B
+    against B, passes, and reports A's headroom as B's. The window kept its older ``captured_at`` and
+    would eventually have been called stale; it would never have been called FOREIGN.
+
+    Driven through the real collector, twice, because a hand-written fixture would assert that the
+    fixture agrees with itself rather than that the carry-forward stamps what it should.
+    """
+    a = fake_home / ".claude-account-1"
+    b = fake_home / ".claude-account-2"
+    state = b / "mefor-usage"  # A publishes into B's directory
+
+    def run(pin: Path, payload: dict[str, Any]) -> None:
+        proc = subprocess.run(
+            [
+                "pwsh",
+                "-NoProfile",
+                "-NonInteractive",
+                "-File",
+                str(COLLECT),
+                "-StateDir",
+                str(state),
+                "-HomeDir",
+                str(fake_home),
+            ],
+            input=json.dumps(payload),
+            capture_output=True,
+            text=True,
+            timeout=TIMEOUT,
+            check=False,
+            env=_env(pin),
+        )
+        assert proc.returncode == 0, proc.stderr
+
+    run(a, {"session_id": "A", "rate_limits": {"five_hour": window(91.0, 3600)}})
+    run(b, {"session_id": "B"})  # B has no rate_limits yet, so A's window is carried forward
+
+    doc = latest(state)
+    assert doc["published_by"]["config_root_env"].lower() == str(b).lower(), (
+        "the document should now be stamped by B -- that is what makes this laundering"
+    )
+    assert doc["five_hour"]["config_root_env"].lower() == str(a).lower(), (
+        "the carried window must keep A's stamp, exactly as it keeps A's captured_at"
+    )
+
+    code, parsed, _ = reader("-StateDir", str(state), "-Json", pin=b, home=fake_home)
+    assert code == UNKNOWN
+    assert parsed["five_hour"]["used_percentage"] is None, "A's 91% was reported as B's headroom"
+    assert "DIFFERENT config root" in parsed["five_hour"]["reason"]
+
+
+def test_a_root_wired_elsewhere_is_flagged_even_when_it_still_has_an_old_reading(
+    fake_home: Path, tmp_path: Path
+) -> None:
+    """WIRED_ELSEWHERE was unreachable in the one case where it misleads most.
+
+    The diagnosis ran only inside the no-data branch. So a root re-wired to publish into a sibling,
+    but still holding its own older ``latest.json``, served that stale percentage as current for
+    twenty minutes and then said "no live session is publishing" — which is also false. The session is
+    publishing; it is publishing somewhere else, and nothing in the output said so.
+    """
+    pin = fake_home / ".claude-account-1"
+    elsewhere = tmp_path / "sibling" / "mefor-usage"
+    (pin / "settings.json").write_text(
+        json.dumps(
+            {
+                "statusLine": {
+                    "type": "command",
+                    "command": f"# mefor-usage\n$s='c'; $d = '{elsewhere}'",
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    # This root DOES have a reading of its own, so the no-data branch never runs.
+    state = pin / "mefor-usage"
+    state.mkdir()
+    now = datetime.now(UTC).isoformat()
+    (state / "latest.json").write_text(
+        json.dumps(
+            {
+                "captured_at": now,
+                "five_hour": {
+                    "used_percentage": 20.0,
+                    "resets_at_epoch": int(time.time()) + 3600,
+                    "captured_at": now,
+                },
+                "seven_day": {
+                    "used_percentage": 20.0,
+                    "resets_at_epoch": int(time.time()) + 280000,
+                    "captured_at": now,
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    _, doc, human = reader(pin=pin, home=fake_home)
+    assert "WARNING" in human, f"a mis-wired root reported clean: {human}"
+    assert "WAITING WILL NOT FIX THIS" in human
+    _, parsed, _ = reader("-Json", pin=pin, home=fake_home)
+    assert parsed["statusline_state"] == "WIRED_ELSEWHERE"
+    assert parsed["wired_state_dir"].lower() == str(elsewhere).lower()

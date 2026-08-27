@@ -193,8 +193,15 @@ function Get-StatusLineDiagnosis([string]$Root, [string]$ReadingFrom) {
 $readRoot = Split-Path $StateDir -Parent
 $rootSource = if ($script:GaveStateDir) { "-StateDir" } elseif ($rootInfo) { $rootInfo.Source } else { "unknown" }
 
+# DIAGNOSED ON EVERY RUN, NOT ONLY WHEN THERE IS NOTHING TO READ. An earlier version computed this
+# inside the no-data branch, which made WIRED_ELSEWHERE -- the arm this diagnosis exists for --
+# unreachable in the case where it misleads most: a root now wired to publish into a SIBLING still has
+# its own older latest.json, so the reader served that stale percentage as current for twenty minutes
+# and then said "no live session is publishing", which is also false. The session is publishing; it is
+# publishing somewhere else, and nothing in the output said so.
+$dx = Get-StatusLineDiagnosis $readRoot $StateDir
+
 if (-not $doc) {
-    $dx = Get-StatusLineDiagnosis $readRoot $StateDir
     if ($Json) {
         [ordered]@{
             state             = "UNKNOWN"
@@ -308,9 +315,22 @@ function Get-Rate([string]$Key, [string]$ResetKey, $CurrentResetEpoch) {
     }
 }
 
-function Get-WindowReport($w, [string]$Label, [string]$Key, [string]$ResetKey) {
+function Get-WindowReport($w, [string]$Label, [string]$Key, [string]$ResetKey, [string]$ReadRoot) {
     if (-not $w) {
         return [ordered]@{ label = $Label; state = "UNKNOWN"; reason = "never published"; used_percentage = $null }
+    }
+    # RULE 4, PER WINDOW. A window carries the config root that OBSERVED it, and the carry-forward keeps
+    # that stamp rather than restamping -- so a percentage that came from another account is caught here
+    # even when the document around it was written by this root. The document-level check cannot see
+    # that hop: it compares the writer to the directory, and both are correct.
+    $wEnv = [string]$w.config_root_env
+    if ($wEnv -and $wEnv -ne "unset" -and $ReadRoot -and -not (Test-SameRoot $wEnv $ReadRoot)) {
+        return [ordered]@{
+            label           = $Label
+            state           = "UNKNOWN"
+            reason          = "this window was observed under a DIFFERENT config root ($wEnv) and carried into a document under $ReadRoot -- refusing to report another account's headroom"
+            used_percentage = $null
+        }
     }
     $age = Get-AgeMinutes $w.captured_at
     $pct = [double]$w.used_percentage
@@ -374,8 +394,8 @@ function Get-WindowReport($w, [string]$Label, [string]$Key, [string]$ResetKey) {
     return $o
 }
 
-$five = Get-WindowReport $doc.five_hour "session (5h)" "five_hour" "five_reset"
-$seven = Get-WindowReport $doc.seven_day "weekly (7d)" "seven_day" "seven_reset"
+$five = Get-WindowReport $doc.five_hour "session (5h)" "five_hour" "five_reset" $readRoot
+$seven = Get-WindowReport $doc.seven_day "weekly (7d)" "seven_day" "seven_reset" $readRoot
 
 $rank = @{ "OK" = 0; "WARN" = 10; "CRITICAL" = 11; "UNKNOWN" = 20 }
 $states = @($five.state, $seven.state)
@@ -427,7 +447,7 @@ function Get-RootSummary([string]$Root) {
 $survey = $null
 if ($AllRoots) {
     $survey = @()
-    foreach ($r in @(Get-ClaudeConfigRoots -HomeDir $HomeDir)) { $survey += Get-RootSummary $r }
+    foreach ($r in @(Get-LaunchableConfigRoots -HomeDir $HomeDir)) { $survey += Get-RootSummary $r }
     if ($rootInfo -and -not ($survey | Where-Object { Test-SameRoot $_.root $readRoot })) {
         $survey += Get-RootSummary $readRoot
     }
@@ -442,6 +462,8 @@ if ($Json) {
         advice       = $advice
         not_measured = $blindSpot
         provenance   = $provenance
+        statusline_state = $dx.state
+        wired_state_dir = $dx.wired_state_dir
         config_root  = $readRoot
         config_root_source = $rootSource
         state_dir    = $StateDir
@@ -473,6 +495,15 @@ Write-Host "Claude account usage  --  $overall" -ForegroundColor $(switch ($over
 # separate pools, so a percentage with no root beside it is an unattributed number -- the same shape of
 # omission as a percentage with no age.
 Write-Host "  config root: $readRoot   (from $rootSource)" -ForegroundColor DarkGray
+# A MIS-WIRE IS PRINTED ABOVE THE NUMBERS, not below them and not only when there are none. If this root
+# publishes somewhere else, the percentages under this heading are a leftover, and saying so after the
+# reader has already read them is too late to stop the wrong decision.
+if ($dx.state -in @("WIRED_ELSEWHERE", "WIRED_LEGACY", "WIRED_COLLECTOR_MISSING", "FOREIGN_STATUSLINE", "NOT_WIRED_NO_SETTINGS", "NOT_WIRED_NO_STATUSLINE")) {
+    Write-Host ""
+    Write-Host "  WARNING -- the numbers below may be a leftover:" -ForegroundColor Yellow
+    Write-Host "  $($dx.line)" -ForegroundColor Yellow
+    foreach ($l in $dx.remedy) { Write-Host "  $l" -ForegroundColor DarkGray }
+}
 Write-Host ""
 Show-Window $five
 Show-Window $seven

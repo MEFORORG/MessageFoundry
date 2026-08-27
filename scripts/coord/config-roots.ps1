@@ -69,12 +69,26 @@ $script:UsageStatusLineMarker = "mefor-usage"
 $script:ClaudeAccountRootName = [regex]'\A\.claude-account-\d+\z'
 $script:ClaudeDefaultRootName = [regex]'\A\.claude\z'
 
-function Get-ClaudeConfigRoots {
+function Get-LaunchableConfigRoots {
     <#
     .SYNOPSIS
         Config roots a session can LAUNCH from, under $HomeDir. A READING function: it returns what it
         found, including nothing.
     .DESCRIPTION
+        NOT Get-ClaudeConfigRoots, AND THE NAME IS DELIBERATE. session-registry.ps1 already defines a
+        function by that name in this same directory, dot-sourced by eleven scripts, and it answers a
+        DIFFERENT question: which roots have RUN a session (it filters on a `sessions/` subdirectory).
+        This one answers which roots a session could BOOT from, by name shape. Both are correct for
+        their own caller and neither substitutes for the other -- install-coordination.ps1 records why
+        the `sessions/` filter is wrong for wiring: a root that exists but has not run a session yet
+        has no `sessions/` and still needs wiring, because the first session it runs is exactly the one
+        that would come up unconfigured.
+
+        Sharing the name would make the winner depend on dot-source ORDER. It would also be worse than
+        a plain error in one direction: that function resolves the home directory from
+        $env:USERPROFILE itself, so a caller expecting this one's -HomeDir seam would silently
+        enumerate the real home -- the exact test-safety hole constraint 4 above exists to close.
+
         NO EMPTY-SET FALLBACK, deliberately. Seeding ~/.claude when the glob finds nothing would make
         every caller's "no config root found" guard dead code, and would manufacture a target that by
         definition does not exist. A caller that WANTS that seed keeps it at its own call site, where
@@ -119,13 +133,13 @@ function Get-ClaudeConfigCandidates {
     .SYNOPSIS
         Every ~/.claude* directory carrying a settings.json, WITHOUT judging what it is.
     .DESCRIPTION
-        Deliberately WIDER than Get-ClaudeConfigRoots and deliberately selected by a DIFFERENT rule.
+        Deliberately WIDER than Get-LaunchableConfigRoots and deliberately selected by a DIFFERENT rule.
         This is the independent audit population: it exists to catch a directory the name predicate
         rejects, so it must not be chosen by the predicate whose correctness it checks. A validator
         satisfied by construction reports only its own opinion back to itself.
     #>
     param([Parameter(Mandatory)][string]$HomeDir)
-    # No comma, and callers wrap in @() -- same measured reason as Get-ClaudeConfigRoots above.
+    # No comma, and callers wrap in @() -- same measured reason as Get-LaunchableConfigRoots above.
     return @(
         Get-ChildItem -LiteralPath $HomeDir -Directory -Filter ".claude*" -Force -ErrorAction SilentlyContinue |
             Where-Object { Test-Path -LiteralPath (Join-Path $_.FullName "settings.json") -PathType Leaf }
@@ -232,7 +246,7 @@ function Get-WiredStateDir {
     .SYNOPSIS
         The publish path a root's wired command NAMES. $null means a LEGACY command, which is an answer.
     .DESCRIPTION
-        READ BACK, NEVER RECOMPUTED, and that is the point. install-usage-statusline.ps1:73 used to
+        READ BACK, NEVER RECOMPUTED, and that is the point. The installer's -Status used to
         report "script exists: <bool>" against a path THAT INVOCATION had just resolved from git --
         so a root wired months ago from a checkout since deleted still reported True. Across five
         roots wired at different times from different checkouts, one recomputed line cannot describe

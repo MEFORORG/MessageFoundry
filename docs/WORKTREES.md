@@ -746,8 +746,9 @@ Exit codes so a coordinator can branch without parsing prose: **0** ok, **10** w
 or future-dated — a percentage is never extrapolated from a dead publisher, and every number is printed
 with its own age. **Do not read a missing bucket as an empty one.** Two more states return it: a document
 stamped with a config root other than the one it sits under is **refused** rather than reported as this
-session's headroom, and when there is no data at all the message diagnoses *which* of five states this
-root is in, each with a different fix, instead of saying "not installed or has not run yet".
+session's headroom, and when there is no data at all the message diagnoses *which* state this root is in
+— not wired, wired to publish somewhere else, wired but naming a collector that is gone, someone else's
+statusLine, and so on — each with a different fix, instead of saying "not installed or has not run yet".
 
 > **`ccusage` does not do this**, despite being the tool everyone recommends and despite several
 > summaries claiming it "fetches real rate limit data". It parses transcripts for tokens and dollars; its

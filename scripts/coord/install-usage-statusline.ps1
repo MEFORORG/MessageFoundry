@@ -215,7 +215,7 @@ elseif ($script:GaveConfigDir) {
 }
 elseif ($AllRoots) {
     $targetFrom = "-AllRoots"
-    $roots = @(Get-ClaudeConfigRoots -HomeDir $HomeDir -AccountsOnly)
+    $roots = @(Get-LaunchableConfigRoots -HomeDir $HomeDir -AccountsOnly)
     $addedOutside = $null
     if ($env:CLAUDE_CONFIG_DIR) {
         $pin = ConvertTo-NormalRootPath $env:CLAUDE_CONFIG_DIR
@@ -328,19 +328,29 @@ if ($Status) {
 # leaves every other root still wired and still publishing.
 
 if ($Uninstall) {
-    $removed = 0; $absent = 0; $foreign = 0; $failed = 0
+    $removed = 0; $absent = 0; $foreign = 0; $failed = 0; $wouldRemove = 0
     Write-Host ""
     foreach ($t in $targets) {
         try {
             $settings = Read-Settings $t.Settings
             switch (Get-Ownership $settings) {
                 'OURS' {
+                    # THE COUNTER GOES INSIDE THE GUARD. An earlier version incremented $removed
+                    # outside it, so `-Uninstall -AllRoots -WhatIf` printed "removed: 5" and exited 0
+                    # having removed nothing -- an operator dry-running before committing would read
+                    # that as "the collector is off" while all five roots kept publishing. It is the
+                    # same shape as the install claim this whole change deletes, and worse, because a
+                    # person believes they turned something OFF.
                     if ($PSCmdlet.ShouldProcess($t.Settings, "remove the $MARKER statusLine")) {
                         $settings.Remove('statusLine')
                         Write-SettingsFile $t.Settings $settings
                         Write-Host "  REMOVED      $($t.Settings)   backup $($t.Settings).bak-usage-$BackupStamp"
+                        $removed++
                     }
-                    $removed++
+                    else {
+                        Write-Host "  WOULD REMOVE $($t.Settings)"
+                        $wouldRemove++
+                    }
                 }
                 'FOREIGN' { Write-Host "  FOREIGN      $($t.Settings)   -- someone else's statusLine, left untouched"; $foreign++ }
                 default { Write-Host "  NOT PRESENT  $($t.Settings)   -- no $MARKER statusLine here"; $absent++ }
@@ -353,7 +363,8 @@ if ($Uninstall) {
     }
     Write-Host ""
     Write-Host ("Roots examined: {0}   ({1})" -f $targets.Count, $targetFrom)
-    Write-Host ("  removed: {0}   not present: {1}   foreign: {2}   failed: {3}" -f $removed, $absent, $foreign, $failed)
+    Write-Host ("  removed: {0}   not present: {1}   foreign: {2}   failed: {3}   would remove: {4}" -f `
+            $removed, $absent, $foreign, $failed, $wouldRemove)
     Write-Host ""
     if ($WhatIfPreference) { exit 0 }
     if ($failed -eq 0) { exit 0 }
@@ -374,7 +385,7 @@ if (-not (Test-Path -LiteralPath $CollectorPath)) {
     Stop-Cannot "collector not found at $CollectorPath. The primary checkout does not carry it yet -- merge the branch that adds it, or advance the primary, before installing."
 }
 
-$wrote = 0; $rewired = 0; $unchanged = 0; $refusing = 0; $skipped = 0; $failed = 0; $would = 0
+$wrote = 0; $rewired = 0; $unchanged = 0; $refusing = 0; $failed = 0; $would = 0
 Write-Host ""
 foreach ($t in $targets) {
     $stateDir = Get-UsageStateDir $t.Root
@@ -449,8 +460,12 @@ Write-Host ""
 # THE POPULATION IS NAMED, not left as a bare count. "Roots examined: 5" alone reads as "all of them",
 # which is the completeness claim that produced this whole change.
 Write-Host ("Roots examined: {0}   ({1})" -f $targets.Count, $targetFrom)
-Write-Host ("  wrote: {0}   rewired: {1}   unchanged: {2}   refusing: {3}   skipped: {4}   failed: {5}   would write: {6}" -f `
-        $wrote, $rewired, $unchanged, $refusing, $skipped, $failed, $would)
+# NO "skipped" COLUMN. An earlier draft carried one for "the backup threw so the write was never
+# attempted", but the catch below reports that as FAILED, so nothing could ever increment it. A tally
+# column that is structurally always zero reads as "nothing was skipped" -- a claim about the run
+# rather than a fact about the code, which is the shape of overclaim this whole change removes.
+Write-Host ("  wrote: {0}   rewired: {1}   unchanged: {2}   refusing: {3}   failed: {4}   would write: {5}" -f `
+        $wrote, $rewired, $unchanged, $refusing, $failed, $would)
 if ($AllRoots -and $addedOutside) {
     Write-Host "  added: $addedOutside (this session's CLAUDE_CONFIG_DIR, outside $HomeDir)"
 }
