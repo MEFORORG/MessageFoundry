@@ -707,6 +707,47 @@ export function mergeLiveValues(rows: RowViewModel[], inline: LiveInlineValue[])
 }
 
 /**
+ * Which kind of trigger armed a pending re-projection, and therefore whether live values may be
+ * attached to it at all (BACKLOG #234).
+ *
+ * A SAVE-triggered projection may attach them; a CHANGE-triggered one may NOT. This is a SEPARATE and
+ * STRICTLY STRONGER condition than {@link shouldAttachLiveValues}, never a replacement for it -- the
+ * provider ANDs the two, so live values attach on a strict SUBSET of the cases the dirty-state gate
+ * alone would allow. #225's hazard (a disk trace's line numbers describing a pre-edit file) therefore
+ * cannot be reintroduced by this: a conjunction can only narrow.
+ *
+ * A SAVE ARRIVING WHILE A CHANGE IS PENDING WINS. The flag is only ever SET, never cleared, until a
+ * render consumes it. That direction is deliberate: a save is the instant `disk == buffer`, which is
+ * exactly when live values become attachable, so letting a later keystroke downgrade it would discard
+ * a reading the user just earned by saving.
+ */
+export class LiveValueArming {
+  #armed = false;
+
+  /** A save (or a save the guard deferred and still owes) armed the pending projection. */
+  armSave(): void {
+    this.#armed = true;
+  }
+
+  /** A buffer change armed it. Deliberately a NO-OP on the flag: a change never arms live values,
+   *  and it must not DISARM a save that is already pending. */
+  armRowsOnly(): void {}
+
+  /** Read and reset, for a render that is about to run. Consuming here mirrors the debouncer cancel
+   *  and the guard's debt take: this render satisfies whatever was pending. */
+  consume(): boolean {
+    const armed = this.#armed;
+    this.#armed = false;
+    return armed;
+  }
+
+  /** Whether a save is currently pending, without consuming it. Tests only -- the provider consumes. */
+  get pending(): boolean {
+    return this.#armed;
+  }
+}
+
+/**
  * Whether the lens should attach live values on THIS projection, given the open document's dirty state.
  *
  * Live values come from a SECOND `dryrun --trace json` that reads the module **from disk** (the addendum
