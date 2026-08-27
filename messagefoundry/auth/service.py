@@ -2807,9 +2807,24 @@ class AuthService:
                 await self._store.revoke_user_sessions(user_id)
         await self._audit("user.updated", actor=actor, detail=_json({"user_id": user_id}))
         if before is not None:
-            if email is not None and email != before.email:
+            if email != before.email:
                 # Notify the OLD address — so the legitimate owner is alerted even if an attacker (or a
                 # mistaken admin) repointed the account's email to one they control (ASVS 6.3.7).
+                #
+                # BACKLOG #1139: this guard used to also require `email is not None`, which silently
+                # skipped the CLEAR. update_user_profile's write is unconditional, so a null removes
+                # the stored address — and that is the ONE update to an account's authentication
+                # details that must be announced, because it is the last moment the old address is
+                # reachable. After it, SecurityEventNotifier.notify returns early on the empty address
+                # and the account is structurally excluded from every later notice.
+                #
+                # `email` is the intended FINAL state here, not a patch fragment: PATCH /users/{id}
+                # resolves an omitted field to the account's current value before calling (see
+                # api/auth_routes.py's admin_user_update), and the console form posts the whole
+                # profile with a blanked field as None (messagefoundry_webconsole/routes/admin.py).
+                # So `email != before.email` is exactly "the stored address changed", with no
+                # partial-update ambiguity to inherit — which is why dropping the conjunct is safe
+                # rather than merely wider.
                 await self._notify_security(
                     EMAIL_CHANGED,
                     username=before.username,

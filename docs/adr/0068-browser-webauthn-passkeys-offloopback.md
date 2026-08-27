@@ -136,8 +136,12 @@ TOTP-specific (a WebAuthn-only user's TOTP code gets "not enrolled", never a loc
 **No WebAuthn recovery codes** — they are phishable knowledge secrets that undercut the
 phishing-resistant tier. Recovery = enroll ≥2 passkeys (UI nudge) / keep TOTP alongside /
 `admin_reset_mfa`, which is **extended to also delete all WebAuthn credentials**. Deleting the
-**last remaining second factor while MFA is required is refused** ("enroll another factor first");
-TOTP-disable keeps its existing behavior this lane (parity follow-up recorded). Documented
+**last remaining second factor while MFA is required is refused** ("enroll another factor first").
+*The parity follow-up this lane deferred has since landed: `AuthService.disable_mfa` now refuses on
+the same condition and with the same message, so the two self-service paths to zero factors are
+symmetric. The ADMIN reset additionally refuses when an operator targets their own account, which
+was a third route to zero factors that skipped both (BACKLOG #1022) — `admin_reset_mfa` itself stays
+unguarded and cross-user reset is unchanged, so the recovery path below is intact.* Documented
 consequence: a passkey-only local user cannot satisfy the TOTP-shaped JSON `/auth/mfa-verify`, so
 desktop-console step-up actions become unavailable to them (enroll-page warning; owner-accepted).
 An extra-less install with enrolled credentials gets a **startup advisory** naming

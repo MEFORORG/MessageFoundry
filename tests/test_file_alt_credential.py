@@ -13,12 +13,17 @@ Windows-CI/manual gate. These tests cover everything that IS runnable anywhere:
   ``LogonUser -> Impersonate -> fn -> RevertToSelf -> CloseHandle`` bracketing, the dedicated
   impersonated thread, the release-on-close, and that it **wraps** the File connectors' real
   filesystem work (send / validate_startup) rather than bypassing it;
+* that ``close()`` releases the worker **without touching the event loop's shared default executor**
+  and without waiting on a wedged share forever (BACKLOG #1195, ASVS 15.4.4) — the one path on which
+  this module could have starved the pool it exists to stay off;
 * that a logon failure rides the existing ``except OSError`` paths (DeliveryError / SourceStartupError),
   never a crash.
 """
 
 from __future__ import annotations
 
+import asyncio
+import logging
 import threading
 from pathlib import Path
 from typing import Any
@@ -250,6 +255,108 @@ async def test_logon_failure_surfaces(monkeypatch: pytest.MonkeyPatch) -> None:
     with pytest.raises(wincred.CredentialLogonError):
         await ctx.run(lambda: "never")
     await ctx.close()
+
+
+# --- close() stays OFF the shared default executor (BACKLOG #1195, ASVS 15.4.4) ----------------
+
+
+def _spy_on_the_default_pool(monkeypatch: pytest.MonkeyPatch) -> list[Any]:
+    """Record every dispatch to the event loop's DEFAULT executor, and return the growing list.
+
+    Wraps the running loop's own ``run_in_executor``, which is where both routes land —
+    ``asyncio.to_thread`` calls it with ``executor=None``, and so does a bare
+    ``run_in_executor(None, ...)``. Deliberately NOT ``loop.set_default_executor``: this suite runs on
+    ONE session-scoped loop (see ``[tool.pytest.ini_options]``), so a substitute executor installed
+    here would outlive the test and a shut-down one would break every later ``to_thread`` in the
+    session. ``monkeypatch`` puts the real method back."""
+    loop = asyncio.get_running_loop()
+    real = loop.run_in_executor
+    seen: list[Any] = []
+
+    def spy(executor: Any, func: Any, *args: Any) -> Any:
+        if executor is None:
+            seen.append(func)
+        return real(executor, func, *args)
+
+    monkeypatch.setattr(loop, "run_in_executor", spy)
+    return seen
+
+
+async def _wait_for(flag: threading.Event) -> None:
+    """Await a worker-thread event from the loop without touching the default pool (which is the
+    very thing these tests are counting)."""
+    for _ in range(1000):
+        if flag.is_set():
+            return
+        await asyncio.sleep(0.01)
+    raise AssertionError("the impersonated worker never started")
+
+
+async def test_close_parks_no_thread_on_the_shared_default_executor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The whole point of the dedicated worker is that impersonated share I/O never rides the shared
+    # pool. A blocking `shutdown(wait=True)` handed to `run_in_executor(None, ...)` broke that on the
+    # release path: the pool thread it parked inherited the join's unbounded hold.
+    _FakeWin32().install(monkeypatch)
+    seen = _spy_on_the_default_pool(monkeypatch)
+    ctx = wincred.CredentialContext(username="svc", password="pw")
+    assert await ctx.run(lambda: "ok") == "ok"
+    assert seen == [], "run() must use the context's OWN executor"
+    await ctx.close()
+    assert seen == [], "close() must not dispatch to the shared default executor"
+    # POSITIVE CONTROL, same spy and same loop: a zero above is only evidence if this instrument can
+    # see a default-pool dispatch at all.
+    await asyncio.to_thread(lambda: None)
+    assert len(seen) == 1
+
+
+async def test_close_gives_up_on_a_wedged_worker_and_says_so(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    # A UNC read on a dead share has no engine-owned timeout, so close() must not wait on it forever.
+    _FakeWin32().install(monkeypatch)
+    monkeypatch.setattr(wincred, "_CLOSE_DRAIN_TIMEOUT_S", 0.1)
+    ctx = wincred.CredentialContext(username="svc", password="pw")
+    started, release = threading.Event(), threading.Event()
+
+    def wedged() -> None:
+        started.set()
+        release.wait(timeout=30)  # bounded so a FAILING test cannot wedge the suite too
+
+    task = asyncio.create_task(ctx.run(wedged))
+    await _wait_for(started)
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.transports.wincred"):
+        await asyncio.wait_for(ctx.close(), timeout=10)
+    assert "still running 1 filesystem call(s)" in caplog.text  # loud, never a silent give-up
+    release.set()
+    await task
+
+
+async def test_close_still_drains_an_in_flight_call_it_can_wait_out(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Bounding the wait must not turn it into no wait: an ordinary call that finishes inside the
+    # grace is still drained before close() returns, exactly as the blocking join used to guarantee.
+    fake = _FakeWin32().install(monkeypatch)
+    ctx = wincred.CredentialContext(username="svc", password="pw")
+    started, release = threading.Event(), threading.Event()
+
+    def slow() -> None:
+        started.set()
+        release.wait(timeout=30)
+        fake.calls.append("op")
+
+    task = asyncio.create_task(ctx.run(slow))
+    await _wait_for(started)
+    closing = asyncio.create_task(ctx.close())
+    await asyncio.sleep(0.1)
+    assert not closing.done(), "close() returned while the impersonated call was still running"
+    release.set()
+    await asyncio.wait_for(closing, timeout=10)
+    await task
+    # ...and the credential was reverted and the token closed on that worker, as always.
+    assert fake.calls == ["logon", "impersonate", "op", "revert", "close"]
 
 
 # --- the context WRAPS the File connectors' real filesystem work -------------

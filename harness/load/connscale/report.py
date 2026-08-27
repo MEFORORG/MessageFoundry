@@ -38,6 +38,8 @@ from harness.load.connscale.intake_audit import (
 )
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from harness.load.connscale.compare import (
         ClaimModeComparison,
         FuseModeComparison,
@@ -277,6 +279,88 @@ class ConnScaleRecord:
         }
 
 
+#: Hard cap on rows a CI step summary may carry. An oversized ``$GITHUB_STEP_SUMMARY`` write is dropped
+#: ENTIRELY rather than trimmed, so a large profile must lose rows instead of losing the whole surface.
+#: Truncation is always stated in the rendered text -- never a silent cap.
+_MAX_SUMMARY_ROWS = 200
+
+
+def lane_label(sweep_mode: str, claim_mode: str) -> str:
+    """The lane's name as every connscale reading spells it.
+
+    ``per_lane`` is the default claim mode and stays unqualified, so a pre-existing SLO detail string
+    is unchanged. Defined once because the emitter and the SLO must agree: a reading filed under
+    ``fixed_per_conn`` that a failure reports as ``fixed_per_conn/pooled`` is two distributions.
+    """
+    return sweep_mode if claim_mode == "per_lane" else f"{sweep_mode}/{claim_mode}"
+
+
+@dataclass(frozen=True)
+class MonotonicPair:
+    """One consecutive smaller-N-to-larger-N comparison inside a single lane.
+
+    The lane is ``(sweep_mode, claim_mode)`` — grouping by ``sweep_mode`` alone would chain a pooled
+    reading onto a per_lane one, which BACKLOG #1101 records as wrong independently of whether a
+    shipped profile currently triggers it.
+
+    This is the SINGLE definition of the pairing. :func:`monotonic_pairs` is read both by the SLO that
+    fails on an excursion and by the emitter that records every reading, so the numbers a passing run
+    reports and the numbers a failing run reports cannot drift apart.
+    """
+
+    label: str  # ``sweep_mode``, or ``sweep_mode/claim_mode`` when the claim mode is not per_lane
+    count: int  # the LARGER N — the reading being judged
+    value: float  # the metric at that N
+    prior: float  # the metric at the previous N in the same lane
+    tolerance_floor: float  # the FRACTION, e.g. 0.75 — what the detail string prints after "*"
+    threshold: float  # ``prior * tolerance_floor`` — the number ``value`` must actually beat
+    ok: bool
+
+
+def monotonic_pairs(
+    records: list[ConnScaleRecord],
+    key: Callable[[ConnScaleRecord], float | int | None],
+    *,
+    tolerance: float,
+) -> list[MonotonicPair]:
+    """Every consecutive comparison the loose monotonicity smoke makes, passing ones included.
+
+    The SLO only ever needed the violations. An excursion-only record cannot establish the metric's
+    variance, because the sample is selected on having already left the band (BACKLOG #1211) — so this
+    returns the whole sequence and lets the caller decide which half it wants.
+
+    Readings of ``None`` are skipped rather than failed, and a skipped reading does not become the
+    ``prior`` for the next N.
+    """
+    by_lane: dict[tuple[str, str], list[ConnScaleRecord]] = {}
+    for r in records:
+        by_lane.setdefault((r.sweep_mode, r.claim_mode), []).append(r)
+
+    floor = 1.0 - tolerance
+    pairs: list[MonotonicPair] = []
+    for (mode, claim_mode), rs in by_lane.items():
+        prev_val: float | None = None
+        for r in sorted(rs, key=lambda r: r.count):
+            val = key(r)
+            if val is None:
+                continue
+            v = float(val)
+            if prev_val is not None:
+                pairs.append(
+                    MonotonicPair(
+                        label=lane_label(mode, claim_mode),
+                        count=r.count,
+                        value=v,
+                        prior=prev_val,
+                        tolerance_floor=floor,
+                        threshold=prev_val * floor,
+                        ok=not (v < prev_val * floor),
+                    )
+                )
+            prev_val = v
+    return pairs
+
+
 @dataclass(frozen=True)
 class ConnScaleReport:
     profile: str
@@ -333,6 +417,145 @@ class ConnScaleReport:
 
     def to_json(self) -> str:
         return json.dumps(self.to_json_dict(), indent=2)
+
+    def render_readings_markdown(
+        self,
+        metric: str,
+        key: Callable[[ConnScaleRecord], float | int | None],
+        *,
+        tolerance: float,
+        context: dict[str, str] | None = None,
+        max_rows: int = _MAX_SUMMARY_ROWS,
+    ) -> str:
+        """Every reading of one monotonic metric as a markdown table — the passing ones included.
+
+        BACKLOG #1211 needs the metric's true variance, and the SLO records a number only when it has
+        already left the band. A sample selected on having excursioned cannot measure the distribution
+        it excursioned from, so this renders the whole sequence on every run.
+
+        Pure: returns the text and writes nothing. Row count is capped because an oversized
+        ``$GITHUB_STEP_SUMMARY`` write is dropped in full rather than trimmed; a truncation SAYS so.
+        """
+        pair_by_row = {
+            (p.label, p.count): p for p in monotonic_pairs(self.records, key, tolerance=tolerance)
+        }
+        rows: list[str] = []
+        dropped = 0
+        for r in sorted(self.records, key=lambda r: (r.sweep_mode, r.claim_mode, r.count)):
+            val = key(r)
+            if val is None:
+                continue
+            if len(rows) >= max_rows:
+                dropped += 1
+                continue
+            label = lane_label(r.sweep_mode, r.claim_mode)
+            pair = pair_by_row.get((label, r.count))
+            if pair is None:
+                # First reading in its lane: a real sample, but nothing to compare it against.
+                rows.append(f"| {label} | {r.count} | {float(val):.4g} | | | | first in lane |")
+            else:
+                margin = pair.value - pair.threshold
+                verdict = "within band" if pair.ok else "OUTSIDE BAND"
+                rows.append(
+                    f"| {label} | {r.count} | {pair.value:.4g} | {pair.prior:.4g} "
+                    f"| {pair.threshold:.4g} | {margin:+.4g} | {verdict} |"
+                )
+
+        head = [f"### connscale {metric} readings"]
+        ctx = {
+            "profile": self.profile,
+            "db_backend": self.db_backend or "sqlite",
+            **(context or {}),
+        }
+        head.append("")
+        head.append(" | ".join(f"{k}: {v}" for k, v in ctx.items()))
+        head.append("")
+        head.append(
+            f"Recorded on every run, pass or fail (BACKLOG #1211). Band is prior * "
+            f"{1.0 - tolerance:.2f}; a positive margin is inside it."
+        )
+        head.append("")
+        if not rows:
+            head.append(f"No {metric} reading was produced by this run.")
+            return "\n".join(head) + "\n"
+        head.append(f"| lane | N | {metric} | prior | band floor | margin | verdict |")
+        head.append("|---|---|---|---|---|---|---|")
+        out = head + rows
+        if dropped:
+            out.append("")
+            out.append(f"{dropped} further row(s) not shown: capped at {max_rows}.")
+        return "\n".join(out) + "\n"
+
+    def readings_payload(
+        self,
+        metric: str,
+        key: Callable[[ConnScaleRecord], float | int | None],
+        *,
+        tolerance: float,
+        context: dict[str, str] | None = None,
+    ) -> dict[str, object]:
+        """The same readings as :meth:`render_readings_markdown`, machine-readable.
+
+        WHY THIS EXISTS RATHER THAN JUST THE TABLE. The markdown goes to ``$GITHUB_STEP_SUMMARY``,
+        and **no GitHub API exposes a step summary** -- measured 2026-08-27, on this repo, from two
+        directions: the jobs endpoint carries no summary-bearing key, and the rendered page answers
+        "Sign in to view logs" even though the repository is public. So every passing run's readings
+        have been written and then been unreachable to any tool, which defeats the point of
+        recording a passing run at all. An uploaded artifact IS fully API-reachable
+        (``gh run download``), as this repo's own load reports already demonstrate.
+
+        NOT CAPPED, deliberately, where the markdown is. That cap exists because an oversized step
+        summary write is dropped IN FULL rather than trimmed; an artifact has no such cliff, and
+        silently dropping rows from the machine-readable copy would be the worse trade.
+
+        Both this and the table go through :func:`monotonic_pairs`, so they cannot disagree about a
+        lane, a band or a verdict -- the single-definition rule that function's docstring states.
+        """
+        pair_by_row = {
+            (p.label, p.count): p for p in monotonic_pairs(self.records, key, tolerance=tolerance)
+        }
+        readings: list[dict[str, object]] = []
+        for r in sorted(self.records, key=lambda r: (r.sweep_mode, r.claim_mode, r.count)):
+            val = key(r)
+            if val is None:
+                continue
+            label = lane_label(r.sweep_mode, r.claim_mode)
+            pair = pair_by_row.get((label, r.count))
+            if pair is None:
+                # First reading in its lane: a real sample with nothing to compare against. Recorded
+                # rather than skipped -- it is the PRIOR for the next N and a reader needs its value.
+                readings.append(
+                    {
+                        "lane": label,
+                        "count": r.count,
+                        "value": float(val),
+                        "first_in_lane": True,
+                    }
+                )
+                continue
+            readings.append(
+                {
+                    "lane": label,
+                    "count": r.count,
+                    "value": pair.value,
+                    "prior": pair.prior,
+                    "threshold": pair.threshold,
+                    "margin": pair.value - pair.threshold,
+                    "ratio": (pair.value / pair.prior) if pair.prior else None,
+                    "ok": pair.ok,
+                    "first_in_lane": False,
+                }
+            )
+        return {
+            "schema_version": 1,
+            "metric": metric,
+            "profile": self.profile,
+            "db_backend": self.db_backend or "sqlite",
+            "tolerance": tolerance,
+            "band_floor_fraction": 1.0 - tolerance,
+            "context": dict(context or {}),
+            "readings": readings,
+        }
 
     def to_csv(self) -> str:
         """One row per (sweep_mode, N) step — for spreadsheet curve plotting."""

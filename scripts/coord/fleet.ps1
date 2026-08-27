@@ -297,9 +297,32 @@ foreach ($o in $records) {
         elseif ($null -ne $h.bytes -and [long]$h.bytes -ne (Get-Item -LiteralPath ([string]$h.path) -EA Stop).Length) { $ptrDrifted++ }
     } catch { $ptrUnreadable++ }
 }
-if ($ptrDangling -gt 0 -or $ptrDrifted -gt 0) {
+# BACKLOG #1372: A DRIFTED POINTER IS NOT A BROKEN ONE, so it no longer feeds this stop.
+# A pointer exists so a seat told to READ THE HANDOFF reaches the right document. When the file
+# has been UPDATED they reach the CURRENT one -- misdescribing a byte count and misdirecting a
+# reader are different harms, and only the second is brokenness.
+#
+# MEASURED, and the numbers are why this changed rather than an opinion about it. Two readings 81
+# minutes apart, 2026-08-27:
+#
+#     07:51Z -> 09:12Z      gone 22 -> 22 (FLAT)    drifted 2 -> 5    clean 5 -> 6
+#
+# All five drifted seats were the seats keeping their handoffs current under the 96% PROTECT rung,
+# which demands exactly that every few minutes; one was measured entering the state NINETY SECONDS
+# after repairing it. So the alarm population grows as the fleet behaves correctly, while the 22
+# pointers that name a file which does not exist -- the number a reader actually needs -- sat
+# unchanged and invisible inside an 81% roll-up.
+#
+# THE AUTHOR'S ARGUMENT IN seat.ps1 IS NOT OVERTURNED AND NOTHING HERE ERASES DRIFT. Recorded
+# values are still never repaired, `handoffPointersDrifted` is still counted and still rendered
+# below. What changed is only what the STOP CONDITION aggregates.
+#
+# Ruled 2026-08-27 by the Liaison under the owner's standing AFK authority, with their own conflict
+# declared and the decision logged to the owner-item ledger for overturn. Both obvious deciders --
+# they and this builder -- are among the drifted seats, which is recorded rather than worked around.
+if ($ptrDangling -gt 0) {
     $spread = if ($ptrBoxes.Count -ne $ptrTotal) { " across $($ptrBoxes.Count) seat(s) -- records exceed seats, so at least one seat holds duplicate records" } else { " across $($ptrBoxes.Count) seat(s)" }
-    $stops += "handoffPointersBroken=$($ptrDangling + $ptrDrifted) of $ptrTotal$spread -- a seat told to READ THE HANDOFF would be sent to a file that is missing or is no longer the one that was pointed at"
+    $stops += "handoffPointersBroken=$ptrDangling of $ptrTotal$spread -- a seat told to READ THE HANDOFF would be sent to a file that is MISSING (drifted pointers are counted separately as handoffPointersDrifted and are NOT broken -- see BACKLOG #1372)"
 }
 
 $receipt = [ordered]@{

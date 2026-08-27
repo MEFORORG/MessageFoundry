@@ -2575,9 +2575,24 @@ def main(argv: list[str] | None = None) -> int:
         # The PURE spread goes into the file. `base_spread` reads only the record, so this line moves
         # when the record moves and at no other time -- which is the property a committed artifact
         # needs. See `_base_line` for what happens when a moving number gets committed.
+        # `newline=""` IS LOAD-BEARING AND ITS ABSENCE IS INVISIBLE ON LINUX. Without it Python
+        # translates every `\n` this renderer emits into `os.linesep`, so the same command produces
+        # an LF file on the CI runner and a CRLF file on a maintainer's Windows box. The committed
+        # blob is LF, so a Windows re-render rewrites ALL 163 lines -- and the real change hides
+        # inside a diff that looks like a legitimate large edit rather than like corruption.
+        #
+        # That is worse than a cosmetic annoyance because of what sits downstream: the `render-drift`
+        # job re-renders and fails on any diff, so promoting it to a REQUIRED context (which is the
+        # obvious fix for the published view going stale) would make this re-render mandatory on
+        # every verdict-moving PR -- marching every Windows contributor into the corruption by
+        # default. Fix the tool first; then the gate is safe to require.
+        #
+        # `apply.py`'s writer already does this (`newline=""` at its own `write_text`), so the repo
+        # agreed with itself about the answer and this one call site was simply missed.
         args.render.write_text(
             render_current(cells, anchor_sha=anchor, spread=spread),
             encoding="utf-8",
+            newline="",
         )
         print(f"rendered {args.render}")
 
