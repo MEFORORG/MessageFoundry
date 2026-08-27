@@ -1322,6 +1322,25 @@ re-dispatch. If you were only going to READ, do it directly -- reads are never b
     exit 0
 }
 
+# HOW A git INVOCATION IS RECOGNISED, IN ONE PLACE (BACKLOG #1072). Rules 3, 3c and 3d each carried
+# a byte-identical copy of this expression -- FIVE literals across THREE rules -- so a gap in the
+# leading character class was a gap in all three at once, and closing it at one site would have left
+# the other two open while looking fixed.
+#
+# THE LEADING CLASS INCLUDES A BACKTICK. A disarm write or a tree swap wrapped in backtick command
+# substitution was ALLOWED, because the character immediately before git was not in the class and the
+# token was never seen at all. Measured on the shipped gate at 58e710ad4: all three rules fail open on
+# it while each rule's bare control denies. Thirteen other wrapper spellings already denied, so the
+# wrapper story was thirteen of fourteen measured shapes and never "wrappers no longer hide git".
+#
+# WIDENING A CHARACTER CLASS CAN ONLY ADD MATCHES, SO THE RISK IS A FALSE DENY AND NEVER A NEW FAIL-
+# OPEN. That is the opposite of the failure that got two earlier attempts at this file rejected: each
+# replaced matching with something NARROWER than the regex it displaced, and every place the
+# replacement was narrower became a hole. The narrowness that must survive here is pinned rather than
+# argued -- a backticked ORDINARY config key, and a backticked git inside a single- or double-quoted
+# commit message, all stay ALLOW.
+$gitInvocation = '(^|[\s;&|(''"\\/`])git(\.exe)?["'']?(\s|$)'
+
 # ---------------------------------------------------------------------------------------------------
 # Rule 3 -- a git command that SWAPS THE PRIMARY'S WORKING TREE out from under the sessions standing
 # in it. This is not a hypothetical: a sibling session ran `git checkout <its-branch>` in the shared
@@ -1359,7 +1378,7 @@ if ($tool -in @("Bash", "PowerShell")) {
     # -----------------------------------------------------------------------------------------------
     $dangerKeys = 'core\.hookspath|core\.worktree|alias\.[\w.-]+|include\.path|includeif\.'
     foreach ($seg in (Get-ScannableSegments $cmd ($tool -eq "Bash"))) {
-        if ($seg.Scan -cnotmatch '(^|[\s;&|(''"\\/])git(\.exe)?["'']?(\s|$)') { continue }
+        if ($seg.Scan -cnotmatch $gitInvocation) { continue }
         if ($seg.Scan -notmatch "(?<via>\bconfig\b[^|;&]*?\s|-c\s+)(?<key>$dangerKeys)(?<rest>[^|;&]*)") { continue }
         # READ EVERY GROUP OUT OF $Matches BEFORE RUNNING ANOTHER -match. `-match` REPLACES $Matches
         # wholesale, so computing $viaConfig first left $rest reading the SECOND match's groups, where
@@ -1388,7 +1407,7 @@ if ($tool -in @("Bash", "PowerShell")) {
         # cannot be mistaken for a value.
         if ($viaConfig -and $rest -notmatch '\S') { continue }
 
-        $at = [regex]::Match($seg.Raw, '(^|[\s;&|(''"\\/])git(\.exe)?["'']?(\s|$)')
+        $at = [regex]::Match($seg.Raw, $gitInvocation)
         $pfx = $(if ($at.Success) { $seg.Raw.Substring(0, $at.Index) } else { "" })
         $where = @(Get-GitTargetCandidatesRaw $seg.Raw $pfx $cwdRaw)
         if ($where.Count -eq 0) { continue }
@@ -1578,7 +1597,7 @@ What to do instead:
     # failure -- a path that is not a worktree, or does not exist -- falls through to ALLOW.
     # -----------------------------------------------------------------------------------------------
     foreach ($seg in (Get-ScannableSegments $cmd ($tool -eq "Bash"))) {
-        if ($seg.Scan -cnotmatch '(^|[\s;&|(''"\\/])git(\.exe)?["'']?(\s|$)') { continue }
+        if ($seg.Scan -cnotmatch $gitInvocation) { continue }
         if ($seg.Scan -cnotmatch '\bworktree\s+(?<wtverb>remove|move)(?=\s|$)') { continue }
         $wtVerb = $Matches['wtverb']
 
@@ -1688,7 +1707,7 @@ What to do instead:
         #
         # All of these belong to the RESOLVER rather than to this rule; fixing them here would be the
         # fourth resolution rule in one file, which is what calling the shared helper exists to avoid.
-        $at = [regex]::Match($seg.Raw, '(^|[\s;&|(''"\\/])git(\.exe)?["'']?(\s|$)')
+        $at = [regex]::Match($seg.Raw, $gitInvocation)
         $pfx = $(if ($at.Success) { $seg.Raw.Substring(0, $at.Index) } else { "" })
         $where = @(Get-GitTargetCandidatesRaw $seg.Raw $pfx $cwdRaw)
         $base = $(if ($where.Count -gt 0) { Get-FullPathRaw $where[0] $cwdRaw } else { "" })
@@ -1866,16 +1885,15 @@ $cleanupBullet
     # must not second-guess it -- `cd <primary> && git -C <sibling> rebase` acts on the sibling, and
     # denying it because the primary's path appears in the `cd` is a false positive.
     $anyInferredTarget = $false
-    $gitToken = '(^|[\s;&|(''"\\/])git(\.exe)?["'']?(\s|$)'
     foreach ($seg in (Get-ScannableSegments $cmd ($tool -eq "Bash"))) {
         # Match a git invocation however it is spelled: git, git.exe, or an absolute path to either.
-        if ($seg.Scan -cnotmatch $gitToken) { continue }
+        if ($seg.Scan -cnotmatch $gitInvocation) { continue }
         if ($seg.Scan -cnotmatch "\bgit(\.exe)?\b[^|;&]*?\s(?<verb>$verbs)(?=\s|$)") { continue }
         $segVerb = $Matches['verb']
 
         # Everything BEFORE the git invocation on this line. A `cd` is honoured only from here -- reading
         # it from the whole command made the resolver order-blind (see Get-GitTargetCandidatesRaw).
-        $at = [regex]::Match($seg.Raw, $gitToken)
+        $at = [regex]::Match($seg.Raw, $gitInvocation)
         $segPrefix = $(if ($at.Success) { $seg.Raw.Substring(0, $at.Index) } else { "" })
 
         if ($seg.Raw -cnotmatch '(?:^|\s)-C\s+"?([^"\s]+)"?') { $anyInferredTarget = $true }

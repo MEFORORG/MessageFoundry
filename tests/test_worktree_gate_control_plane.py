@@ -28,7 +28,12 @@ from typing import Any
 
 import pytest
 
-from tests.test_worktree_gate import assert_denied, edit, run_gate  # reuse the subprocess harness
+from tests.test_worktree_gate import (
+    GATE,
+    assert_denied,
+    edit,
+    run_gate,
+)  # reuse the subprocess harness
 
 pytestmark = pytest.mark.skipif(
     shutil.which("pwsh") is None, reason="pwsh (PowerShell 7) not on PATH"
@@ -858,4 +863,110 @@ def test_indirection_the_resolver_CANNOT_follow_still_allows(
     assert run_gate(shell(command.format(wt=repo.wt), cwd=foreign), repo.repos) is None, (
         "the gate resolved something it cannot know. A value computed at runtime is not available to "
         "a hook inspecting an argument BEFORE anything runs -- denying here is guessing, not closing."
+    )
+
+
+# ------------------------------------------------- BACKLOG #1072: the backtick wrapper, across 3 rules
+
+_BACKTICK = chr(96)
+
+
+def _backticked(command: str) -> str:
+    """Wrap a command in backtick command substitution, the shape that was invisible to all three rules."""
+    return f"{_BACKTICK}{command}{_BACKTICK}"
+
+
+def test_a_BACKTICK_WRAPPED_config_disarm_is_denied(repo: SimpleNamespace) -> None:
+    """BACKLOG #1072, rule 3c. The character before ``git`` was not in the leading class, so the token was
+    never seen and the disarm write was ALLOWED. Thirteen other wrapper spellings already denied."""
+    reason = assert_denied(
+        run_gate(
+            shell(_backticked("git config core.hooksPath /dev/null"), cwd=repo.primary), repo.repos
+        )
+    )
+    assert "SHARED git configuration" in reason
+
+
+def test_a_BACKTICK_WRAPPED_tree_swap_is_denied(repo: SimpleNamespace) -> None:
+    """The SAME gap in rule 3, measured rather than assumed. This is a separate row from the one above
+    because the three rules deny for different reasons, and a single row asserting only "denied" would
+    pass identically if two of the three were still open."""
+    reason = assert_denied(
+        run_gate(shell(_backticked("git reset --hard"), cwd=repo.primary), repo.repos)
+    )
+    assert "working tree of the SHARED PRIMARY checkout" in reason
+
+
+def test_a_BACKTICK_WRAPPED_worktree_removal_is_denied(repo: SimpleNamespace) -> None:
+    """And rule 3d. Driven from a REAL second worktree, not a bare directory: from outside any repository
+    ``git worktree remove`` exits "fatal: not a git repository", so a row driven from there would pin the
+    verdict and never the consequence."""
+    reason = assert_denied(
+        run_gate(shell(_backticked(f'git worktree remove "{repo.wt}"'), cwd=repo.other), repo.repos)
+    )
+    assert "acts on a worktree of" in reason
+
+
+def test_a_backticked_ORDINARY_config_key_is_still_allowed(repo: SimpleNamespace) -> None:
+    """Narrowness. Widening a character class can only ADD matches, so the risk this fix carries is a
+    false deny. Deciding HOW a git invocation is spelled must never decide WHICH KEYS are dangerous."""
+    assert (
+        run_gate(
+            shell(_backticked("git config user.email me@example.com"), cwd=repo.primary), repo.repos
+        )
+        is None
+    )
+
+
+@pytest.mark.parametrize("quote", ["'", '"'])
+def test_a_backticked_git_inside_a_QUOTED_commit_message_is_still_allowed(
+    repo: SimpleNamespace, quote: str
+) -> None:
+    """The false deny this fix would most plausibly cause, pinned in both quote styles.
+
+    Prose that NAMES a dangerous command in backticks is written constantly in this repository -- this
+    very change did it -- and it must not refuse. It survives because ``Remove-QuotedSpans`` blanks the
+    quoted span before any rule reads it, so the backtick never reaches the leading class. That is a
+    different mechanism from the one being changed, which is exactly why it is worth a row: if the
+    blanking ever moves, this reds rather than the gap reopening silently.
+    """
+    command = f"git commit -m {quote}never run {_backticked('git reset --hard')} here{quote}"
+    assert run_gate(shell(command, cwd=repo.primary), repo.repos) is None
+
+
+@pytest.mark.parametrize("prefix", ["foo", "legit", "mygit", "x"])
+def test_a_command_whose_name_merely_ENDS_in_git_is_not_a_git_invocation(
+    repo: SimpleNamespace, prefix: str
+) -> None:
+    """The narrowness of the LEADING CLASS ITSELF, which nothing else here pins.
+
+    Added because a mutation round caught this hole rather than because it was foreseen: an over-broad
+    mutant that made the class match ANY character SURVIVED the whole file. The rows above named
+    "narrowness" pin a different mechanism -- quoted-span blanking and the danger-key filter -- so they
+    are blind to the class widening, and a suite can look like it covers both directions while covering
+    one. Widening a character class can only ADD matches, so this is the only direction the change could
+    break, and it was the untested one.
+    """
+    command = f"{prefix}git config core.hooksPath /dev/null"
+    assert run_gate(shell(command, cwd=repo.primary), repo.repos) is None
+
+
+def test_the_git_invocation_pattern_is_defined_EXACTLY_ONCE(repo: SimpleNamespace) -> None:
+    """The duplication WAS the defect, so it gets a test rather than a comment.
+
+    Rules 3, 3c and 3d carried a byte-identical copy of this expression -- five literals across three
+    rules -- so one gap was three gaps, and closing it at one site would have looked like a fix while
+    leaving two open. A structural row is the only thing that stops the copies re-forking: a behavioural
+    row cannot see a fourth copy that happens to agree today.
+    """
+    source = GATE.read_text(encoding="utf-8")
+    assert source.count("$gitInvocation = ") == 1, (
+        "the pattern must be defined in exactly one place"
+    )
+    # No bare copy of the leading class may survive anywhere else in the file.
+    bare = "])git(" + chr(92) + ".exe)?"
+    occurrences = source.count(bare)
+    assert occurrences == 1, (
+        f"found {occurrences} literal copies of the git-invocation class; expected 1 (the definition). "
+        "A second copy is a rule that will not receive the next correction to this pattern."
     )
