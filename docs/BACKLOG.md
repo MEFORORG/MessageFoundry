@@ -17317,3 +17317,35 @@ committed alongside the fix rather than filed separately, since neither makes se
 
 **Not done:** pushing, opening a PR, or anything that would exercise this in real CI. Committed and
 handed to the Lander.
+
+## 1370. operator-supplied names reach /ui URL paths unencoded or half-encoded, so a name carrying a slash addresses a different route
+
+> 🔢 **Filed 2026-08-27 (builder 2) - BUILT IN THIS COMMIT, not yet landed.** Gap 2 of the two the Lander scoped on **PR 530**, this seat's own abandoned lane, re-implemented against current `main` rather than cherry-picked.
+> Verdict: build
+> Closing-act: code
+
+**Cluster:** Web console security. **Priority:** P2. **Verdict:** build.
+**Severity:** no engine effect, no PHI axis, and **no deployment axis (sec. 0)** -- with zero deployments this is a condition a FIRST deployment would meet, not an exposure anyone has today.
+
+**What:** connection names and channel ids are interpolated into `/ui` URL paths. They are **unconstrained free text** -- the registry checks only for a duplicate and no charset gate exists -- so a name carrying `/` splits into two path segments and addresses a different route.
+
+**MAIN WAS IN TWO DIFFERENT STATES, AND THE HALF-PROTECTED ONE IS THE MORE INTERESTING:**
+
+```
+connections.py:64   quote(r.name)     PARTIAL -- quote's default is safe="/", so the separator passes
+connections.py:200  quote(name)       PARTIAL -- same
+admin.py:363,381    {role.id}         RAW
+messages.py:618,628 {ch}/{dest}       RAW
+```
+
+**A bare `quote()` reads as protection and provides none against the one character that matters.** Measured, not reasoned: `quote("IB/ACME")` returns it **unchanged**, while `quote("a?b")` and `quote("a#b")` are encoded -- so the call looks like it works everywhere it is tested by hand. `safe=""` is the whole fix.
+
+**The fix:** `_seg()` in `pages/_common.py`, and the six sites routed through it.
+
+**NOT A BLANKET SWEEP, AND THE EXCLUSION IS THE LOAD-BEARING PART.** `_auth`'s re-auth `next` carries a whole PATH inside a QUERY parameter, where `safe="/"` is **correct**; routing it through `_seg` would break every re-auth redirect. `connections.py:59` and `:384` keep a bare `quote()` for the same reason -- they build `?channel_id=` query values, not path segments. **A sweep of "every `quote()` call" would ship a broken login**, so a test pins the re-auth encoding against exactly that.
+
+**Verification:** the seven tests come from the abandoned branch and **pass unmodified against this re-implementation** -- written for a different implementation of the same contract, so they corroborate rather than restate. Five mutants, all killed, each by a distinct red set: `_seg` reverted to the default `safe`; `_seg` over-encoding (the negative control fires); one site reverted to raw; **one site reverted to a bare `quote()` -- caught by the structural scan alone**; the custom-role site reverted.
+
+**Related:** the sibling gap from the same PR 530 dispatch -- fetch-metadata does not cover the `/ui/static` mount (`_is_ui_fetch_scope` absent from main) -- is **NOT in this commit** and still wants building.
+
+**Source:** dispatched by the Lander off PR 530 with a per-file measurement. Three searches in that scouting returned false zeros on SPELLING alone: `def test` missing 8 `async def test` functions, `def seg` matching `segment_ids` as a prefix, and `\bseg\(` unable to match `_seg(` because underscore is a word character.
