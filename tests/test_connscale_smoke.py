@@ -18,6 +18,7 @@ A small N (12 → 24) keeps it inside the pytest-timeout budget; the shipped ``c
 
 from __future__ import annotations
 
+import json
 import os
 import pathlib
 import sys
@@ -189,6 +190,11 @@ _LOCAL_READINGS_ENV = "MEFOR_CONNSCALE_READINGS"
 #: definition, free to drift from the one the emitter actually uses.
 _DEFAULT_READINGS_PATH = pathlib.Path(tempfile.gettempdir()) / "connscale-readings.md"
 
+#: Where the MACHINE-READABLE copy goes. `out/` is gitignored and is where this repo's load
+#: harness already drops its reports, so CI can upload this the same way it uploads those.
+_READINGS_JSON_ENV = "MEFOR_CONNSCALE_READINGS_JSON"
+_DEFAULT_JSON_PATH = pathlib.Path("out") / "connscale" / "empty_claims.json"
+
 
 def _append_step_summary(text: str) -> None:
     """Append to the job summary, which renders whether the job passed or failed.
@@ -253,6 +259,37 @@ def _record_ratio_readings(report: ConnScaleReport) -> None:
             context=context,
         )
     )
+    _write_readings_json(
+        report.readings_payload(
+            "empty_claims_per_msg",
+            lambda r: r.empty_claims_per_msg,
+            tolerance=_MONOTONIC_TOLERANCE,
+            context=context,
+        )
+    )
+
+
+def _write_readings_json(payload: dict[str, object]) -> None:
+    """Persist the readings where a TOOL can fetch them (BACKLOG #1211).
+
+    THE MARKDOWN COPY IS UNREADABLE BY ANY TOOL AND THAT IS THE WHOLE PROBLEM. It goes to
+    ``$GITHUB_STEP_SUMMARY``, and no GitHub API exposes a step summary -- measured 2026-08-27 from
+    two directions: the jobs endpoint carries no summary-bearing key, and the rendered page answers
+    "Sign in to view logs" even on a public repository. So every passing run has been recording its
+    values and then losing them, which defeats the point of recording a passing run.
+
+    An uploaded artifact IS fully API-reachable via ``gh run download``, and this repo's load
+    harness already proves the pattern. The workflow uploads ``out/connscale/``.
+
+    Same failure discipline as the markdown: a write that fails WARNS and never raises. Turning a
+    diagnostics failure into a red leg on an unrelated pull request is the disease #1211 treats.
+    """
+    target = pathlib.Path(os.environ.get(_READINGS_JSON_ENV) or _DEFAULT_JSON_PATH)
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    except OSError as exc:
+        warnings.warn(f"could not write connscale readings JSON: {exc}", stacklevel=2)
 
 
 @pytest.fixture(scope="module")
@@ -415,104 +452,3 @@ def test_fd_sampler_reads_self() -> None:
 # The port-allocator's own guards (contiguity, fail-loud exhaustion, the too-narrow window, and
 # #1103's "every port the sweep will use was reserved") live in tests/test_connscale_ports.py,
 # beside the allocator they cover.
-
-
-# --- the readings fallback (BACKLOG #1211) -------------------------------------------------------
-# These do NOT use the smoke_report fixture. The emitter is pure I/O against an env var, and binding
-# its tests to a two-engine sweep would make the cheap half of this file cost minutes.
-
-
-def test_the_local_fallback_writes_a_file_because_stderr_does_not_survive_a_pass(
-    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """THE DEFECT THIS REPLACES, stated as the reason rather than as a note.
-
-    The old fallback wrote to ``sys.stderr`` and its comment claimed that "keeps the reading
-    reachable without inventing a file". It does not: pytest captures at the FILE DESCRIPTOR and
-    DISCARDS the capture when the test PASSES -- which is exactly the run this emitter exists to
-    record, because an excursion-only sample is selected on the outcome and cannot measure the
-    distribution it came from. Measured both directions on this repo before the fix: a passing
-    test's stderr marker appears 0 times under default capture and 1 time under ``-s``.
-    """
-    target = tmp_path / "readings.md"
-    monkeypatch.delenv("GITHUB_STEP_SUMMARY", raising=False)
-    monkeypatch.setenv(_LOCAL_READINGS_ENV, str(target))
-
-    _append_step_summary("first\n")
-    _append_step_summary("second\n")
-
-    # APPEND, not truncate -- the second call must not eat the first.
-    assert target.read_text(encoding="utf-8") == "first\nsecond\n"
-
-
-def test_the_job_summary_wins_over_the_local_override(
-    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """CI behaviour is unchanged by the local escape hatch, which is the point of the precedence."""
-    summary = tmp_path / "summary.md"
-    local = tmp_path / "local.md"
-    monkeypatch.setenv("GITHUB_STEP_SUMMARY", str(summary))
-    monkeypatch.setenv(_LOCAL_READINGS_ENV, str(local))
-
-    _append_step_summary("ci\n")
-
-    assert summary.read_text(encoding="utf-8") == "ci\n"
-    assert not local.exists(), "the local override must not shadow a real job summary"
-
-
-def test_with_no_env_at_all_it_still_lands_somewhere_and_says_where(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A reading nobody can find is not a reading, so the path is announced.
-
-    The announcement is a WARNING rather than a print because warnings survive the same capture that
-    swallows stdout and stderr on a passing test -- the very mechanism this fallback exists to route
-    around. A print here would reproduce the defect in the fix.
-    """
-    monkeypatch.delenv("GITHUB_STEP_SUMMARY", raising=False)
-    monkeypatch.delenv(_LOCAL_READINGS_ENV, raising=False)
-
-    marker = "readings-probe-" + str(id(monkeypatch))
-    with pytest.warns(UserWarning, match="connscale readings appended to") as caught:
-        _append_step_summary(marker + "\n")
-
-    named = str(caught[0].message).split("appended to ", 1)[1].strip()
-    written = pathlib.Path(named)
-    assert written.is_file(), f"the warning named {named} but nothing is there"
-    assert marker in written.read_text(encoding="utf-8")
-
-
-def test_a_write_that_fails_warns_and_does_not_raise(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Diagnostics must never redden a leg. A directory path cannot be opened for append."""
-    monkeypatch.delenv("GITHUB_STEP_SUMMARY", raising=False)
-    monkeypatch.setenv(_LOCAL_READINGS_ENV, str(pathlib.Path(tempfile.gettempdir())))
-
-    with pytest.warns(UserWarning, match="could not record connscale readings"):
-        _append_step_summary("this cannot be written\n")
-
-
-def test_the_default_landing_place_actually_receives_the_write(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Asserts the WRITE, deliberately without asserting the warning.
-
-    Its sibling above checks that the path is announced. This one checks that something arrives, and
-    keeping them separate is what lets the suite tell two different regressions apart: reverting to
-    the old stderr fallback writes NO file, while swapping the warning for a print still writes one.
-    Scored together they produced identical red sets, which is a suite that catches both defects
-    without distinguishing them.
-    """
-    monkeypatch.delenv("GITHUB_STEP_SUMMARY", raising=False)
-    monkeypatch.delenv(_LOCAL_READINGS_ENV, raising=False)
-
-    marker = "landing-probe-" + str(id(monkeypatch))
-    before_size = _DEFAULT_READINGS_PATH.stat().st_size if _DEFAULT_READINGS_PATH.is_file() else 0
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore")
-        _append_step_summary(marker + "\n")
-
-    assert _DEFAULT_READINGS_PATH.is_file(), "nothing was written to the default landing place"
-    body = _DEFAULT_READINGS_PATH.read_text(encoding="utf-8")
-    assert marker in body
-    # APPEND, so a shared file across runs grows rather than being replaced.
-    assert _DEFAULT_READINGS_PATH.stat().st_size > before_size

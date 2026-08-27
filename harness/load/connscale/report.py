@@ -453,6 +453,77 @@ class ConnScaleReport:
             out.append(f"{dropped} further row(s) not shown: capped at {max_rows}.")
         return "\n".join(out) + "\n"
 
+    def readings_payload(
+        self,
+        metric: str,
+        key: Callable[[ConnScaleRecord], float | int | None],
+        *,
+        tolerance: float,
+        context: dict[str, str] | None = None,
+    ) -> dict[str, object]:
+        """The same readings as :meth:`render_readings_markdown`, machine-readable.
+
+        WHY THIS EXISTS RATHER THAN JUST THE TABLE. The markdown goes to ``$GITHUB_STEP_SUMMARY``,
+        and **no GitHub API exposes a step summary** -- measured 2026-08-27, on this repo, from two
+        directions: the jobs endpoint carries no summary-bearing key, and the rendered page answers
+        "Sign in to view logs" even though the repository is public. So every passing run's readings
+        have been written and then been unreachable to any tool, which defeats the point of
+        recording a passing run at all. An uploaded artifact IS fully API-reachable
+        (``gh run download``), as this repo's own load reports already demonstrate.
+
+        NOT CAPPED, deliberately, where the markdown is. That cap exists because an oversized step
+        summary write is dropped IN FULL rather than trimmed; an artifact has no such cliff, and
+        silently dropping rows from the machine-readable copy would be the worse trade.
+
+        Both this and the table go through :func:`monotonic_pairs`, so they cannot disagree about a
+        lane, a band or a verdict -- the single-definition rule that function's docstring states.
+        """
+        pair_by_row = {
+            (p.label, p.count): p for p in monotonic_pairs(self.records, key, tolerance=tolerance)
+        }
+        readings: list[dict[str, object]] = []
+        for r in sorted(self.records, key=lambda r: (r.sweep_mode, r.claim_mode, r.count)):
+            val = key(r)
+            if val is None:
+                continue
+            label = lane_label(r.sweep_mode, r.claim_mode)
+            pair = pair_by_row.get((label, r.count))
+            if pair is None:
+                # First reading in its lane: a real sample with nothing to compare against. Recorded
+                # rather than skipped -- it is the PRIOR for the next N and a reader needs its value.
+                readings.append(
+                    {
+                        "lane": label,
+                        "count": r.count,
+                        "value": float(val),
+                        "first_in_lane": True,
+                    }
+                )
+                continue
+            readings.append(
+                {
+                    "lane": label,
+                    "count": r.count,
+                    "value": pair.value,
+                    "prior": pair.prior,
+                    "threshold": pair.threshold,
+                    "margin": pair.value - pair.threshold,
+                    "ratio": (pair.value / pair.prior) if pair.prior else None,
+                    "ok": pair.ok,
+                    "first_in_lane": False,
+                }
+            )
+        return {
+            "schema_version": 1,
+            "metric": metric,
+            "profile": self.profile,
+            "db_backend": self.db_backend or "sqlite",
+            "tolerance": tolerance,
+            "band_floor_fraction": 1.0 - tolerance,
+            "context": dict(context or {}),
+            "readings": readings,
+        }
+
     def to_csv(self) -> str:
         """One row per (sweep_mode, N) step — for spreadsheet curve plotting."""
         buf = io.StringIO()
