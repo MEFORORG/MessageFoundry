@@ -119,6 +119,21 @@ try { $doc = Get-Content -LiteralPath $latestPath -Raw -ErrorAction Stop | Conve
 # exact invocation that produced the false INSTALLED claim in the first place.
 function Get-StatusLineDiagnosis([string]$Root, [string]$ReadingFrom) {
     $settingsPath = Join-Path $Root "settings.json"
+    # THE DIRECTORY ITSELF FIRST. A typo'd CLAUDE_CONFIG_DIR otherwise reads as "this root has no
+    # settings.json", and the remedy printed for that state is an installer invocation the installer
+    # REFUSES (it will not create a config root). The operator follows the advice, gets a refusal, and
+    # nothing anywhere has named the actual fault.
+    if (-not (Test-Path -LiteralPath $Root -PathType Container)) {
+        return [ordered]@{
+            settings_path   = $settingsPath
+            state           = "NO_SUCH_ROOT"
+            line            = "NO SUCH DIRECTORY -- the config root itself does not exist"
+            remedy          = @("Nothing can be wired here, and the installer refuses to create a config root.",
+                "Fix CLAUDE_CONFIG_DIR (or the launcher that sets it) to name a directory that exists.")
+            wired_state_dir = $null
+            wired_collector = $null
+        }
+    }
     $o = [ordered]@{
         settings_path = $settingsPath
         state         = "NOT_WIRED_NO_SETTINGS"
@@ -363,7 +378,11 @@ function Get-WindowReport($w, [string]$Label, [string]$Key, [string]$ResetKey, [
         $o.state = "UNKNOWN"
         $o.reason = if ($null -eq $age) { "reading is undateable" }
         elseif ($age -lt -2) { "reading is dated $([math]::Abs($age)) min in the FUTURE -- clock skew or a bad timestamp; refusing to trust it" }
-        else { "reading is $age min old (max $MaxAgeMinutes) -- no live session is publishing" }
+        # NO CAUSAL CLAIM. This used to read "-- no live session is publishing", which nothing here
+        # checks and which is often false: a session may be publishing perfectly well, into another
+        # root. The mis-wire warning printed above the numbers names that case; this line states the
+        # age and stops.
+        else { "reading is $age min old (max $MaxAgeMinutes)" }
         return $o
     }
 
@@ -517,7 +536,8 @@ Write-Host ""
 Write-Host "  $blindSpot" -ForegroundColor DarkGray
 if ($survey) {
     Write-Host ""
-    Write-Host "  Every config root on this box (a survey -- nothing is summed across accounts):"
+    Write-Host "  Config roots under $HomeDir matching the launcher name shape, plus this session's."
+    Write-Host "  A survey -- nothing is summed across accounts:"
     foreach ($s in $survey) {
         $mark = if (Test-SameRoot $s.root $readRoot) { "  <- this session" } else { "" }
         if ($s.published) {
@@ -529,6 +549,14 @@ if ($survey) {
         else {
             Write-Host ("    {0,-46} {1}{2}" -f $s.root, $s.note, $mark) -ForegroundColor DarkGray
         }
+    }
+    # ENUMERATED BY A DIFFERENT RULE, so the survey cannot confirm its own predicate. The rows above
+    # come from an anchored, case-sensitive name shape; this pass finds every ~/.claude* directory
+    # carrying a settings.json and names any the survey did not cover. Without it, a root spelled
+    # `.Claude-Account-7` and burning quota would be absent from a list the operator reads as complete.
+    foreach ($c in @(Get-ClaudeConfigCandidates -HomeDir $HomeDir)) {
+        if ($survey | Where-Object { Test-SameRoot $_.root $c.FullName }) { continue }
+        Write-Host ("    {0,-46} not surveyed -- carries a settings.json but is not a launcher-shaped root name" -f $c.Name) -ForegroundColor Yellow
     }
 }
 Write-Host ""

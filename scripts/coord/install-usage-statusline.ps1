@@ -158,8 +158,17 @@ function Write-SettingsFile([string]$Path, $Data) {
     try { $null = $json | ConvertFrom-Json } catch { throw "the generated settings JSON is invalid: $_" }
     # NO -ErrorAction SilentlyContinue on the backup. In a loop, a silent backup failure followed by a
     # successful destructive write is a per-root data loss the tally would count as a success.
-    if (Test-Path -LiteralPath $Path) { Copy-Item -LiteralPath $Path -Destination "$Path.bak-usage-$BackupStamp" -Force }
+    # RETURNS WHETHER IT BACKED ONE UP, because the caller prints that line. A root with no
+    # settings.json has nothing to copy, and an -AllRoots run that printed a backup path for all five
+    # would send an operator hunting for backups that were never taken -- a small lie of exactly the
+    # kind this change exists to remove.
+    $backed = $false
+    if (Test-Path -LiteralPath $Path) {
+        Copy-Item -LiteralPath $Path -Destination "$Path.bak-usage-$BackupStamp" -Force
+        $backed = $true
+    }
     Set-Content -LiteralPath $Path -Value $json -Encoding UTF8
+    return $backed
 }
 
 # THREE-WAY, NOT TWO-WAY. A statusLine object present with a null or empty command is NONE, not
@@ -276,6 +285,13 @@ if ($Status) {
             if ($coll) { Write-Host "    collector     : $coll   exists: $(Test-Path -LiteralPath $coll)" }
             else { Write-Host "    collector     : UNKNOWN (command shape not recognised)" }
         }
+        elseif ($own -eq 'UNREADABLE') {
+            # A CORRUPT settings.json IS NOT A CLEAN ONE. It may carry a working statusLine that this
+            # audit cannot see, so reporting "carries none" would send an operator away from a stray
+            # publisher rather than towards it.
+            Write-Host "    publishes to  : UNKNOWN -- settings.json could not be parsed, so its wiring is unknown" -ForegroundColor Yellow
+            $bad++
+        }
         else {
             Write-Host "    publishes to  : nothing -- this root carries no statusLine of ours"
             $bad++
@@ -308,9 +324,10 @@ if ($Status) {
     }
     foreach ($d in $seen) {
         if ($targets | Where-Object { Test-SameRoot $_.Root $d.FullName }) { continue }
-        $orphan = $false
-        try { $orphan = (Get-Ownership (Read-Settings (Join-Path $d.FullName "settings.json"))) -eq 'OURS' } catch { }
-        if ($orphan) { Write-Host "         ORPHAN: $($d.Name) carries a mefor-usage statusLine and is not in the target set" -ForegroundColor Yellow }
+        $orphan = $false; $unreadable = $false
+        try { $orphan = (Get-Ownership (Read-Settings (Join-Path $d.FullName "settings.json"))) -eq 'OURS' } catch { $unreadable = $true }
+        if ($unreadable) { Write-Host "         UNREADABLE: $($d.Name) -- settings.json could not be parsed, ownership unknown" -ForegroundColor Yellow }
+        elseif ($orphan) { Write-Host "         ORPHAN: $($d.Name) carries a mefor-usage statusLine and is not in the target set" -ForegroundColor Yellow }
         else { Write-Host "         not judged: $($d.Name) -- carries no statusLine of ours" }
     }
     Write-Host ""
@@ -343,8 +360,8 @@ if ($Uninstall) {
                     # person believes they turned something OFF.
                     if ($PSCmdlet.ShouldProcess($t.Settings, "remove the $MARKER statusLine")) {
                         $settings.Remove('statusLine')
-                        Write-SettingsFile $t.Settings $settings
-                        Write-Host "  REMOVED      $($t.Settings)   backup $($t.Settings).bak-usage-$BackupStamp"
+                        $backed = Write-SettingsFile $t.Settings $settings
+                        Write-Host ("  REMOVED      {0}{1}" -f $t.Settings, $(if ($backed) { "   backup $($t.Settings).bak-usage-$BackupStamp" } else { "" }))
                         $removed++
                     }
                     else {
@@ -428,7 +445,7 @@ foreach ($t in $targets) {
             command         = $cmd
             refreshInterval = $RefreshInterval
         }
-        Write-SettingsFile $t.Settings $settings
+        $backed = Write-SettingsFile $t.Settings $settings
 
         if ($isOurs) {
             # Printed separately from WROTE rather than folded into it: "we wired a root that had
@@ -448,7 +465,8 @@ foreach ($t in $targets) {
             Write-Host "             wired to publish to $latest $(if (Test-Path -LiteralPath $latest) { '(a reading is already there)' } else { '(nothing has published there yet)' })"
             $wrote++
         }
-        Write-Host "             backup $($t.Settings).bak-usage-$BackupStamp"
+        if ($backed) { Write-Host "             backup $($t.Settings).bak-usage-$BackupStamp" }
+        else { Write-Host "             no backup taken -- this root had no settings.json to preserve" }
     }
     catch {
         Write-Host "  FAILED     $($t.Settings)  -- $($_.Exception.Message)" -ForegroundColor Red

@@ -1662,3 +1662,76 @@ def test_a_root_wired_elsewhere_is_flagged_even_when_it_still_has_an_old_reading
     _, parsed, _ = reader("-Json", pin=pin, home=fake_home)
     assert parsed["statusline_state"] == "WIRED_ELSEWHERE"
     assert parsed["wired_state_dir"].lower() == str(elsewhere).lower()
+
+
+def test_a_root_that_has_no_settings_file_gets_no_backup_line(tmp_path: Path) -> None:
+    """A backup path printed for a file that was never copied sends an operator hunting for backups
+    that do not exist. Write-SettingsFile reports whether it took one; the caller prints accordingly."""
+    fresh = tmp_path / "fresh"
+    fresh.mkdir()
+    out = install("-ConfigDir", str(fresh), pin=None).stdout
+    assert "no backup taken" in out
+    assert ".bak-usage-" not in out
+    assert not list(fresh.glob("*.bak-usage-*"))
+
+    # And a root that DID have one says so, with a file that really exists.
+    out2 = install("-ConfigDir", str(fresh), "-RefreshInterval", "9000", pin=None).stdout
+    assert ".bak-usage-" in out2
+    assert list(fresh.glob("*.bak-usage-*"))
+
+
+def test_status_does_not_report_an_unparseable_root_as_carrying_nothing(fake_home: Path) -> None:
+    """A corrupt settings.json is not a clean one. It may carry a working statusLine this audit cannot
+    see, so "carries none" would steer an operator away from a stray publisher rather than towards it."""
+    pin = fake_home / ".claude-account-1"
+    (pin / "settings.json").write_text("{ not json", encoding="utf-8")
+    out = install("-Status", pin=pin, home=fake_home, collector=None).stdout
+    assert "could not be parsed" in out
+    # The PER-ROOT line, not the audit's wording: the audit legitimately says "carries no statusLine of
+    # ours" about .claude-account-2.lock in the same output, so matching that phrase alone would pass
+    # or fail for the wrong directory.
+    assert "publishes to  : nothing" not in out
+
+
+def test_a_pin_naming_a_missing_directory_is_diagnosed_as_missing_not_unwired(
+    fake_home: Path,
+) -> None:
+    """Two states with different fixes. Reported as "no settings.json", the remedy printed is an
+    installer invocation the installer REFUSES, so the operator follows the advice, gets a refusal, and
+    nothing has named the actual fault."""
+    ghost = fake_home / ".claude-account-77"
+    _, doc, human = reader("-Json", pin=ghost, home=fake_home)
+    assert doc["statusline_state"] == "NO_SUCH_ROOT"
+    _, _, human = reader(pin=ghost, home=fake_home)
+    assert "NO SUCH DIRECTORY" in human
+    assert "Fix CLAUDE_CONFIG_DIR" in human
+
+
+def test_the_survey_names_a_settings_bearing_root_its_own_predicate_rejected(
+    fake_home: Path,
+) -> None:
+    """The survey enumerates by an anchored, case-sensitive name shape. Without a second pass selected
+    by a DIFFERENT rule, it can only ever confirm its own predicate — and a root the predicate rejects
+    while it burns quota would be absent from a list the operator reads as complete."""
+    # .claude-account-2.lock carries a settings.json and is rejected by the name predicate.
+    now = datetime.now(UTC).isoformat()
+    state = fake_home / ".claude-account-1" / "mefor-usage"
+    state.mkdir()
+    (state / "latest.json").write_text(
+        json.dumps(
+            {
+                "captured_at": now,
+                "five_hour": {
+                    "used_percentage": 5.0,
+                    "resets_at_epoch": int(time.time()) + 3600,
+                    "captured_at": now,
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    _, _, human = reader("-AllRoots", pin=fake_home / ".claude-account-1", home=fake_home)
+    assert "not surveyed" in human, f"the audit pass did not run: {human}"
+    assert ".claude-account-2.lock" in human
+    # And the heading must not claim completeness it cannot deliver.
+    assert "Every config root on this box" not in human
