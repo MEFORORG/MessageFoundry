@@ -1417,13 +1417,54 @@ What to do instead:
         }
         if (-not $govCfg) { continue }
 
+        # BACKLOG #1082: SAY WHAT IS TRUE OF THE SCOPE ACTUALLY BEING WRITTEN. A --global or --system
+        # write does NOT land in this repository's config -- it lands in the per-user or machine-wide
+        # file -- so the sentence below was false for those scopes. THE VERDICT DOES NOT MOVE: git
+        # falls back to those scopes when the repository does not set the key, so the write can still
+        # disarm this checkout by inheritance, and whether it does is NOT knowable from the command.
+        #
+        # Measured 2026-08-27 and it depends on WHERE YOU READ FROM, which the row does not say:
+        #   from a worktree   core.hooksPath IS set at worktree scope (75 of 76 config.worktree files)
+        #                     -> a --global write of that key loses to the more specific scope
+        #   from the primary  UNSET at every scope (exit 1; control core.bare exit 0)
+        #                     -> a --global write of that key WOULD take effect
+        # Denying is the correct conservative default for both.
+        #
+        # NOTHING HERE MAY REASSURE. A round-4 candidate printed "This does NOT change the shared
+        # configuration" and three verifiers graded it BLOCKING: segments are judged one at a time and
+        # Write-Deny exits on the first hit, so on a multi-line command whose LATER segment does a
+        # local write, that sentence would print over a real disarm.
+        $scopeFlag = if ($seg.Scan -cmatch '(?:^|\s)--(?<sc>global|system)(?:\s|$)') { $Matches['sc'] } else { $null }
+        $opening = if ($scopeFlag) {
+            "BLOCKED: '$badKey' is on the disarm list, and --$scopeFlag writes your " +
+            $(if ($scopeFlag -eq 'global') { 'per-user' } else { 'machine-wide' }) +
+            " git configuration rather than this repository's.`n`nGit falls back to that scope when " +
+            "$($govCfg.Display) does not set the key itself, so the write can still disarm this " +
+            "checkout's hooks. Which case applies is not knowable from the command alone, so it is refused."
+        }
+        else {
+            "BLOCKED: setting '$badKey' would change the SHARED git configuration of $($govCfg.Display)."
+        }
+        # The mechanism paragraph is scope-aware for the same reason the opening is: the shared-.git
+        # sentence is TRUE of a repository-scope write and FALSE of --global/--system.
+        $mechanism = if ($scopeFlag) {
+            "This is refused on the REACH, not on where the file lands: a key inherited from the " +
+            "$(if ($scopeFlag -eq 'global') { 'per-user' } else { 'machine-wide' }) scope applies to " +
+            "every repository on this machine that does not override it, including every worktree of " +
+            "$($govCfg.Display)."
+        }
+        else {
+            "Every worktree of this repository shares one .git directory, so this is not a local " +
+            "change: it takes effect for all of them at once."
+        }
         Write-Deny -Rule "3c" -Detail "git config $badKey" -Reason @"
-BLOCKED: setting '$badKey' would change the SHARED git configuration of $($govCfg.Display).
+$opening
 
-Every worktree of this repository shares one .git directory, so this is not a local change: it takes
-effect for all of them at once. Repointing core.hooksPath (or aliasing a command, or redirecting
-core.worktree) disables the commit-time ledger, claim and secret-leak gates for every session on this
-machine, and nothing would report that they had stopped running.
+$mechanism
+
+Repointing core.hooksPath (or aliasing a command, or redirecting core.worktree) disables the
+commit-time ledger, claim and secret-leak gates, and nothing would report that they had stopped
+running.
 
 What to do instead:
   * If a commit hook is failing, FIX THE CAUSE -- the hook output names it. Never route around a gate;
