@@ -141,14 +141,25 @@ if ($cwd -and (Test-Path -LiteralPath $cwd)) {
         if ($governed) {
             $homeFile = Join-Path $gitDir 'mefor-home-branch'
             $wtHead = "$(& git -C $cwd rev-parse --abbrev-ref HEAD 2>$null)".Trim()
-            if (Test-Path -LiteralPath $homeFile) {
-                $wtHome = "$(Get-Content -LiteralPath $homeFile -Raw -ErrorAction SilentlyContinue)".Trim()
-                if ($wtHome -and $wtHead -and $wtHead -ne 'HEAD' -and $wtHead -ne $wtHome) {
-                    $notes += "This worktree ($cwd) is on branch '$wtHead' but its recorded HOME branch is '$wtHome'. Another session may have SWITCHED it onto a different branch -- a worktree-hijack (docs/WORKTREES.md), which silently swaps every file under you. If that was not intentional, restore it (commit or stash anything you want to keep FIRST), from a PLAIN terminal:`n    git -C `"$cwd`" switch $wtHome"
-                }
-            } elseif ($wtHead -and $wtHead -ne 'HEAD') {
-                # First sighting with no record yet -> remember the current branch as home (best effort).
-                # Warn-only design means a wrong bootstrap only misses/mis-fires a warning, never mutates.
+            # Owner ruling 2026-08-26: RE-TASKING A POOLED WORKTREE IS SANCTIONED, so the record
+            # FOLLOWS the current branch instead of reporting a hijack.
+            #
+            # The prior shape wrote this file only when ABSENT, so it held the first branch a
+            # directory ever had and mismatched forever after any normal re-task. Claude Desktop's
+            # WorktreePool releases and re-takes these directories on new branches as ordinary
+            # lifecycle -- measured, with desktop-log receipts -- so every legitimate re-point read
+            # as an attack. All three live worktrees were mismatched when this was ruled.
+            #
+            # It also PRINTED a remedy: git switch <home>. The hook never mutated anything, which is
+            # what its old comment claimed -- but it INSTRUCTED a mutation that would swap a running
+            # session onto a stale abandoned branch mid-task. Warn-only is a property of the hook,
+            # not of the outcome.
+            #
+            # HIJACK DETECTION IS DELIBERATELY GIVEN UP HERE. "The branch changed" cannot separate an
+            # attack from the pool doing its job, and the false positives had already trained every
+            # seat to dismiss the warning -- so it was protecting nothing while carrying a sharp edge.
+            # Restoring detection needs a different signal, not a stricter version of this one.
+            if ($wtHead -and $wtHead -ne 'HEAD') {
                 Set-Content -LiteralPath $homeFile -Value $wtHead -Encoding utf8 -ErrorAction SilentlyContinue
             }
         }
