@@ -292,10 +292,13 @@ def cmd_check(a: argparse.Namespace) -> int:
         print("  Leg 4 is present, so the ledger reads green -- but the seat that must ACT on the")
         print("  ruling is not the seat that logged receiving it. Confirm the acting seat has it.")
         print("")
-        for item, want, got, summary in misdelivered:
+        # Named apart from the `got` dict bound above: rebinding it here to the tuple's
+        # `str | None` is a genuine type error, and the runtime only got away with it
+        # because the dict is never read again after this point.
+        for item, want, got_actor, summary in misdelivered:
             print(f"  {item}")
             print(f"      must act    : {want}")
-            print(f"      logged by   : {got}   <- not the acting seat")
+            print(f"      logged by   : {got_actor}   <- not the acting seat")
             if summary and summary != "-":
                 print(f"      summary     : {summary[:110]}")
             print("")
