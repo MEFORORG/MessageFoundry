@@ -18,8 +18,11 @@ A small N (12 → 24) keeps it inside the pytest-timeout budget; the shipped ``c
 
 from __future__ import annotations
 
+import json
 import os
+import pathlib
 import sys
+import tempfile
 import warnings
 from collections.abc import Sequence
 
@@ -178,6 +181,21 @@ def _assert_fd_probe(records: Sequence[ConnScaleRecord]) -> None:
 # --- the one expensive run, shared by every property below ----------------------------------------
 
 
+#: Overrides where a LOCAL run appends its readings. Named so a variance-gathering sweep can
+#: point every run at one file instead of hunting a temp path per invocation.
+_LOCAL_READINGS_ENV = "MEFOR_CONNSCALE_READINGS"
+
+#: Where a local run lands when neither variable is set. Named once so a test can assert the
+#: write happened without re-deriving the path -- a second copy of it here would be a second
+#: definition, free to drift from the one the emitter actually uses.
+_DEFAULT_READINGS_PATH = pathlib.Path(tempfile.gettempdir()) / "connscale-readings.md"
+
+#: Where the MACHINE-READABLE copy goes. `out/` is gitignored and is where this repo's load
+#: harness already drops its reports, so CI can upload this the same way it uploads those.
+_READINGS_JSON_ENV = "MEFOR_CONNSCALE_READINGS_JSON"
+_DEFAULT_JSON_PATH = pathlib.Path("out") / "connscale" / "empty_claims.json"
+
+
 def _append_step_summary(text: str) -> None:
     """Append to the job summary, which renders whether the job passed or failed.
 
@@ -188,12 +206,22 @@ def _append_step_summary(text: str) -> None:
     diagnostics failure into a red leg on an unrelated pull request is the disease BACKLOG #1211 is
     treating, not a cure for it. It is not swallowed either -- a silent emitter and a working one
     would be indistinguishable.
+
+    OFF CI there is no job summary, so the readings go to a FILE and a warning names it. Precedence
+    is ``$GITHUB_STEP_SUMMARY`` first, then ``$MEFOR_CONNSCALE_READINGS``, then a temp file -- CI
+    keeps its existing behaviour untouched, and a local sweep can aim every run at one file.
     """
-    path = os.environ.get("GITHUB_STEP_SUMMARY")
+    path = os.environ.get("GITHUB_STEP_SUMMARY") or os.environ.get(_LOCAL_READINGS_ENV)
     if not path:
-        # Local runs have no job summary. stderr keeps the reading reachable without inventing a file.
-        sys.stderr.write(text)
-        return
+        # A LOCAL RUN GETS A REAL FILE, and the earlier stderr fallback was wrong about why it did
+        # not need one. pytest captures at the FILE DESCRIPTOR by default and DISCARDS the capture
+        # when the test PASSES -- which is precisely the run this emitter exists to record, since an
+        # excursion-only sample is selected on the outcome. Measured both ways on this repo: a
+        # passing test's stderr marker appears 0 times under default capture and 1 time under -s.
+        # The warning names the file because warnings survive that same capture and a reading nobody
+        # can find is not a reading.
+        path = str(_DEFAULT_READINGS_PATH)
+        warnings.warn(f"connscale readings appended to {path}", stacklevel=2)
     try:
         with open(path, "a", encoding="utf-8") as handle:
             handle.write(text)
@@ -231,6 +259,37 @@ def _record_ratio_readings(report: ConnScaleReport) -> None:
             context=context,
         )
     )
+    _write_readings_json(
+        report.readings_payload(
+            "empty_claims_per_msg",
+            lambda r: r.empty_claims_per_msg,
+            tolerance=_MONOTONIC_TOLERANCE,
+            context=context,
+        )
+    )
+
+
+def _write_readings_json(payload: dict[str, object]) -> None:
+    """Persist the readings where a TOOL can fetch them (BACKLOG #1211).
+
+    THE MARKDOWN COPY IS UNREADABLE BY ANY TOOL AND THAT IS THE WHOLE PROBLEM. It goes to
+    ``$GITHUB_STEP_SUMMARY``, and no GitHub API exposes a step summary -- measured 2026-08-27 from
+    two directions: the jobs endpoint carries no summary-bearing key, and the rendered page answers
+    "Sign in to view logs" even on a public repository. So every passing run has been recording its
+    values and then losing them, which defeats the point of recording a passing run.
+
+    An uploaded artifact IS fully API-reachable via ``gh run download``, and this repo's load
+    harness already proves the pattern. The workflow uploads ``out/connscale/``.
+
+    Same failure discipline as the markdown: a write that fails WARNS and never raises. Turning a
+    diagnostics failure into a red leg on an unrelated pull request is the disease #1211 treats.
+    """
+    target = pathlib.Path(os.environ.get(_READINGS_JSON_ENV) or _DEFAULT_JSON_PATH)
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    except OSError as exc:
+        warnings.warn(f"could not write connscale readings JSON: {exc}", stacklevel=2)
 
 
 @pytest.fixture(scope="module")

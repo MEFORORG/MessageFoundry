@@ -19,6 +19,10 @@ still-detects-a-real-regression property are pinned TOGETHER: neither alone is e
 
 from __future__ import annotations
 
+import json
+import pathlib
+import warnings
+
 import pytest
 
 from harness.load.connscale.report import (
@@ -33,7 +37,14 @@ from harness.load.connscale.runner import (
     _empty_claims_per_msg,
     _monotonic_slo,
 )
-from tests.test_connscale_smoke import _append_step_summary, _record_ratio_readings
+from tests.test_connscale_smoke import (
+    _DEFAULT_READINGS_PATH,
+    _LOCAL_READINGS_ENV,
+    _READINGS_JSON_ENV,
+    _append_step_summary,
+    _record_ratio_readings,
+    _write_readings_json,
+)
 
 
 def _rec(
@@ -368,11 +379,82 @@ def test_the_recorder_writes_the_readings_through_to_the_summary(tmp_path, monke
     assert "OUTSIDE BAND" not in body
 
 
-def test_no_step_summary_env_falls_back_to_stderr_without_raising(capsys, monkeypatch) -> None:
-    """A local run has no job summary. It must not invent a file, and must not blow up."""
+def test_a_local_run_writes_a_FILE_because_stderr_does_not_survive_a_pass(
+    tmp_path, monkeypatch
+) -> None:
+    """REPLACES a test that asserted the opposite, and the old one PASSED while the behaviour was broken.
+
+    It read ``assert "readings go here" in capsys.readouterr().err`` and its docstring said the
+    emitter "must not invent a file". **capsys reads pytest's CAPTURE**, so the assertion saw a write
+    that a real passing run never surfaces: pytest captures at the FILE DESCRIPTOR and DISCARDS the
+    capture when the test passes. The test's own instrument was the thing hiding the defect -- it
+    asserted a property that was true and useless, on exactly the runs this emitter exists for.
+
+    Measured both ways before the change: a passing test's stderr marker appears 0 times under
+    default capture and 1 time under ``-s``.
+    """
+    target = tmp_path / "readings.md"
     monkeypatch.delenv("GITHUB_STEP_SUMMARY", raising=False)
-    _append_step_summary("readings go here\n")
-    assert "readings go here" in capsys.readouterr().err
+    monkeypatch.setenv(_LOCAL_READINGS_ENV, str(target))
+
+    _append_step_summary("first\n")
+    _append_step_summary("second\n")
+
+    assert target.read_text(encoding="utf-8") == "first\nsecond\n", "append, never truncate"
+
+
+def test_the_job_summary_outranks_the_local_override(tmp_path, monkeypatch) -> None:
+    """CI behaviour is untouched by the local escape hatch, which is the point of the precedence."""
+    summary = tmp_path / "summary.md"
+    local = tmp_path / "local.md"
+    monkeypatch.setenv("GITHUB_STEP_SUMMARY", str(summary))
+    monkeypatch.setenv(_LOCAL_READINGS_ENV, str(local))
+
+    _append_step_summary("ci\n")
+
+    assert summary.read_text(encoding="utf-8") == "ci\n"
+    assert not local.exists(), "a stray local variable must not divert CI's readings"
+
+
+def test_with_no_variable_set_it_lands_somewhere_and_names_where(monkeypatch) -> None:
+    """A reading nobody can find is not a reading, so the path is announced.
+
+    The announcement is a WARNING and not a print, because warnings survive the same capture that
+    swallows stdout and stderr on a passing test. A print here would reproduce the defect inside the
+    fix.
+    """
+    monkeypatch.delenv("GITHUB_STEP_SUMMARY", raising=False)
+    monkeypatch.delenv(_LOCAL_READINGS_ENV, raising=False)
+
+    marker = "readings-probe-" + str(id(monkeypatch))
+    with pytest.warns(UserWarning, match="connscale readings appended to") as caught:
+        _append_step_summary(marker + "\n")
+
+    named = pathlib.Path(str(caught[0].message).split("appended to ", 1)[1].strip())
+    assert named.is_file(), f"the warning named {named} but nothing is there"
+    assert marker in named.read_text(encoding="utf-8")
+
+
+def test_the_default_landing_place_actually_receives_the_write(monkeypatch) -> None:
+    """Asserts the WRITE, deliberately WITHOUT asserting the warning.
+
+    Its sibling above checks the path is announced. Keeping them separate is what lets the suite tell
+    two different regressions apart: reverting to the old stderr fallback writes NO file, while
+    swapping the warning for a print still writes one. Scored together they produced IDENTICAL red
+    sets -- a suite that catches both defects without distinguishing them.
+    """
+    monkeypatch.delenv("GITHUB_STEP_SUMMARY", raising=False)
+    monkeypatch.delenv(_LOCAL_READINGS_ENV, raising=False)
+
+    marker = "landing-probe-" + str(id(monkeypatch))
+    before = _DEFAULT_READINGS_PATH.stat().st_size if _DEFAULT_READINGS_PATH.is_file() else 0
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        _append_step_summary(marker + "\n")
+
+    assert _DEFAULT_READINGS_PATH.is_file(), "nothing reached the default landing place"
+    assert marker in _DEFAULT_READINGS_PATH.read_text(encoding="utf-8")
+    assert _DEFAULT_READINGS_PATH.stat().st_size > before, "append, so a shared file grows"
 
 
 def test_an_unwritable_summary_warns_rather_than_failing_the_run(tmp_path, monkeypatch) -> None:
@@ -402,3 +484,67 @@ def test_the_pairing_is_shared_rather_than_reimplemented() -> None:
         f"{pair.label}@N={pair.count}: {pair.value:.3g} < prior {pair.prior:.3g} "
         f"* {pair.tolerance_floor:.2f}"
     )
+
+
+# --- the machine-readable copy (BACKLOG #1211) ---------------------------------------------------
+
+
+def test_the_json_copy_carries_the_same_pairs_as_the_markdown(monkeypatch) -> None:
+    """THE ANTI-DRIFT CONTROL, and it is the reason this copy is safe to add at all.
+
+    Two renderings of one measurement is exactly how a second definition of the band gets born. Both
+    go through ``monotonic_pairs``, so this asserts they AGREE on every lane, value and verdict --
+    if either grew its own pairing, this diverges instead of both quietly being plausible.
+    """
+    recs = [
+        _rec("fixed_per_conn", 12, per_msg=48.0),
+        _rec("fixed_per_conn", 24, per_msg=30.0),
+    ]
+    report = _report(*recs)
+    payload = report.readings_payload(
+        "empty_claims_per_msg", lambda r: r.empty_claims_per_msg, tolerance=0.25
+    )
+    table = report.render_readings_markdown(
+        "empty_claims_per_msg", lambda r: r.empty_claims_per_msg, tolerance=0.25
+    )
+
+    judged = [r for r in payload["readings"] if not r["first_in_lane"]]
+    assert len(judged) == 1
+    row = judged[0]
+    assert row["ok"] is False, "30.0 is below 48.0 * 0.75 and both must say so"
+    # The markdown states the same verdict for the same reading.
+    assert "OUTSIDE BAND" in table
+    assert f"{row['value']:.4g}" in table
+    assert f"{row['prior']:.4g}" in table
+    assert row["ratio"] == pytest.approx(30.0 / 48.0)
+
+
+def test_the_json_copy_is_not_capped_where_the_markdown_is(monkeypatch) -> None:
+    """The markdown caps rows because an oversized step summary write is dropped IN FULL. An
+    artifact has no such cliff, so silently dropping rows from the machine-readable copy would be
+    the worse trade -- it is the copy a later reader actually computes from."""
+    recs = []
+    for n in range(2, 60, 2):
+        recs.append(_rec("fixed_per_conn", n, per_msg=float(n)))
+    payload = _report(*recs).readings_payload(
+        "empty_claims_per_msg", lambda r: r.empty_claims_per_msg, tolerance=0.25
+    )
+    assert len(payload["readings"]) == len(recs), "every reading must survive into the JSON"
+
+
+def test_the_json_is_written_to_the_named_path(tmp_path, monkeypatch) -> None:
+    target = tmp_path / "nested" / "readings.json"
+    monkeypatch.setenv(_READINGS_JSON_ENV, str(target))
+
+    _write_readings_json({"schema_version": 1, "readings": []})
+
+    assert target.is_file(), "the parent directory must be created"
+    assert json.loads(target.read_text(encoding="utf-8"))["schema_version"] == 1
+
+
+def test_a_failed_json_write_warns_rather_than_failing_the_run(tmp_path, monkeypatch) -> None:
+    """Same discipline as the markdown: a diagnostics failure must never redden an unrelated PR."""
+    monkeypatch.setenv(_READINGS_JSON_ENV, str(tmp_path))  # a directory cannot be written as a file
+
+    with pytest.warns(UserWarning, match="could not write connscale readings JSON"):
+        _write_readings_json({"schema_version": 1})

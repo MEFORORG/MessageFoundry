@@ -10911,7 +10911,54 @@ gate is the wrong shape, validation of the walk is the right one.
 > Closing-act: code
 
 **Cluster:** Developer Experience & CI. **Priority:** P2. **Verdict:** build. **Severity:** conditional -- it reds a required merge context on unrelated pull requests; there is no deployment consequence.
+**AMENDED 2026-08-27 BY BUILDER 2 -- MEASURED: THE DIRECTION PREMISE IS CORRECT, AND THE METRIC IS BIMODAL RATHER THAN NOISY. THE BAND IS NOT THE DEFECT.**
 
+Limb one shipped the emitter so a passing run records its readings. Those readings live only in CI step summaries, which no API exposes, so the distribution was recovered a second way instead: **truncation is invertible when you also know the truncation rate.**
+
+**THE RATE, WITH NUMERATOR AND DENOMINATOR FROM ONE PASS OVER THE SAME LEGS.** Every `test (windows-*)` leg across the most recent 45 CI runs, classified by DURATION rather than by grepping the log for `connscale` -- pytest prints a test name only when it FAILS, so that needle is a detector that can only ever see failures.
+
+```
+monotonic-assert failures      9
+test legs that actually ran   84      (>300s; 6 short/no-op legs excluded)
+PER-LEG RATE                  9/84 = 10.7%
+```
+
+**10.7% PER LEG AND THE LANDER'S 19% PER RUN ARE THE SAME MEASUREMENT.** A run carries two legs, so `1-(1-0.107)^2 = 20.3%` against their measured 19.0%. At the PR level **19% is the figure a lander should plan on**; the per-leg figure is the one the estimate below needs, because `P(ratio < 0.75)` is a property of one leg. Using 19% there would inflate sigma and pull mu below 1.0 -- manufacturing exactly the "direction is broken" conclusion the raw failures suggest.
+
+**THE NINE FAILING RATIOS:** 0.503, 0.562, 0.612, 0.625, 0.629, 0.655, 0.656, 0.713, 0.745. Tail mean **0.633**.
+
+**0.633 IS NOT THE METRIC'S MEAN -- IT IS THE MEAN OF THE TAIL,** because only sub-0.75 values are ever recorded. Reading it as "the metric falls 37%" is precisely the censoring error this item exists to end.
+
+> **RETRACTED THE SAME DAY, BY THE FIX IN THIS COMMIT. A truncation estimate written here first inverted the censoring under a single-normal assumption and reported `mean 1.05, sd 0.243`, concluding "the band is the defect, not the direction". THAT MODEL IS MISSPECIFIED AND ITS NUMBERS SHOULD NOT BE USED.** The emitter fix made local readings reachable within the hour, and they show the population is **bimodal**, which one normal cannot represent. The direction conclusion happened to survive; the mechanism and every number did not. The retraction sits here rather than below because a reader who stops early must not leave holding the withdrawn figure.
+
+**WHAT THE MEASURED DATA SAYS, seven local runs against the nine CI failures:**
+
+```
+                  N=12            N=24            ratio
+local (7 runs)    47.3            79.7            1.686   sd 0.024
+CI failures (9)   47.9            30.3            0.633   sd 0.073
+                  AGREE to 1.3%   DIVERGE 2.6x
+```
+
+**THE AGREEMENT AT N=12 IS WHAT MAKES THE DIVERGENCE AT N=24 MEAN SOMETHING.** Both populations measure the same engine doing the same thing at N=12. They part company only at N=24, and by a factor of 2.6.
+
+**SO THE METRIC IS NOT NOISY -- IT IS BIMODAL, AND THE BAND IS NOT THE DEFECT.** Local ratio sd is **0.024**, ten times tighter than the fitted estimate claimed and about as deterministic as a load measurement gets. A quantity that stable is not wandering across a 0.75 floor by chance. The failures are a **second mode** in which N=24 collapses to about a third of its healthy value, and the ~10.7% of legs that fail are the legs that landed in it.
+
+**THAT REVERSES THE RECOMMENDATION.** Widening the floor toward 0.49, as the withdrawn estimate implied, would **mask a real 2.6x collapse** rather than absorb noise. The assert looks closer to a true positive about the ENVIRONMENT than to a flake -- which does not make it a good MERGE gate, since it fails a pull request for a condition the change did not cause, but it does mean the fix is not a looser number.
+
+> **THE MECHANISM IS NOT ESTABLISHED, AND THE OBVIOUS CANDIDATE IS RULED OUT.** A first draft of this paragraph called the second mode a "starved regime" and a true positive about "runner capacity". **CPU capacity was then tested and it is not the variable.** The sweep was run pinned to **2 cores**, CI-runner sized, and the ratio was **1.64** -- indistinguishable from the 20-core 1.69. So whatever separates the two modes, it is not core count. Slow CI disk I/O against a SQLite WAL store is the next candidate and is **untested**; nothing here should be read as having identified a cause.
+>
+> **THE FIRST ATTEMPT AT THAT CONSTRAINT WAS VOID AND LOOKED FINE.** It set affinity on an already-running pytest from PowerShell and probed it with a ctypes call that returned `affinity_mask=0` -- for the UNCONSTRAINED baseline as well, which is what exposed it. A broken probe returning a plausible number, and the run it "verified" had also started before the affinity call landed. The measurement above sets affinity BEFORE pytest starts, asserts it took, and asserts a CHILD inherits it, because the engine subprocesses are what must be constrained and not the runner.
+
+**STILL UNMEASURED, AND IT IS THE ONE THING THAT WOULD CLOSE THIS: the CI PASSING values.** If they sit near 1.69 like local, bimodality is confirmed outright. They are written to every run's step summary already and no API exposes them -- **one look at a green run's summary page in a browser settles it.** The local runs are a 20-core box; CI runners are far smaller, so local cannot stand in for the CI passing population and is not offered as such.
+
+**STRUCTURAL CORROBORATION, INDEPENDENT OF THE MODEL:** all 9 failures sit in **9 distinct runs**. A direction wrong by construction would fail both legs of a run together every time; it never does. Under independence at p=0.107 you would expect about 0.5 double-failures across 42 runs, and zero is observed.
+
+**WHY THE WITHDRAWN ESTIMATE FAILED, because the shape of the error is reusable.** It was not arithmetic. Inverting a truncation requires assuming a distribution, the assumption chosen was a single normal, and **a single mode cannot generate both 1.69 and 0.63**. The model returned a mean sitting between the two modes -- a value the metric essentially never takes -- and it looked reasonable because it fell near 1.0. **A sensitivity sweep was run over the RATE and reported honestly, and it could not have caught this: it varied a parameter of the wrong model.** The check that would have caught it was one uncontended reading, which existed only because the emitter defect got fixed.
+
+**A DEFECT IN LIMB ONE, FOUND WHILE TRYING TO USE IT, FIXED IN THIS COMMIT.** The emitter falls back to `stderr` when `GITHUB_STEP_SUMMARY` is unset, and its comment claimed that "keeps the reading reachable without inventing a file". It does not: **pytest captures at the FILE DESCRIPTOR and discards the capture when the test PASSES** -- exactly the run the emitter exists to record. Measured both ways on this repo: a passing test's stderr marker appears **0 times** under default capture and **1 time** under `-s`. A local run now appends to a real file, `MEFOR_CONNSCALE_READINGS` overrides where, and a warning names the path because warnings survive the same capture.
+
+**CORRECTIONS TO THE ATTRIBUTION IN CIRCULATION, from opening every failed leg:** the assert is **not** windows-2022 specific (5 on 2022, 4 on 2025), and non-connscale leg failures exist -- `test_tooling_partition` x4 and `test_licence_header_gate` x2, neither of which is a flake to re-run past.
 
 ## 1212. Bound PHI-body retention by default: `messages_days` and `dead_letter_days` should default to 60 days, not keep-forever
 
