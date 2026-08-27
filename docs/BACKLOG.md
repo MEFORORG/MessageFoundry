@@ -16577,3 +16577,36 @@ Its open question 2 asks whether `_SECTIONS` should be asserted set-equal and wh
 `partition("_")` split should change. This change answers only the first half, and answers it
 *pragmatically* -- a set difference with reasons -- because set-equality would red on three sections
 that no entry can rescue. **The `partition` half is untouched and still needs a decision.**
+## 1372. fleet pointer health conflates three states: file gone, pointer never resolved, and file updated
+
+> 🔢 **Filed 2026-08-27 (builder 2) - TWO HALVES BUILT IN THIS COMMIT, THE THIRD DELIBERATELY NOT.**
+> Verdict: build
+> Closing-act: code
+
+**Cluster:** Fleet coordination. **Priority:** P3. **Verdict:** build (small).
+**Severity:** no engine effect, no PHI axis, no deployment axis (sec. 0). It degrades a roster seats read to decide who is alive and what to read.
+
+**THE DISPATCHING BRIEF'S PREMISE IS REAL AND SMALL, AND THE CENSUS IS WHY THIS ITEM IS NARROW.** The brief held that `fleet.ps1`'s pointer check "penalises diligence" -- a seat updates its handoff under the 95% PROTECT rung, the byte count changes, and the row counts as broken. Measured over **all 32 live pointers**:
+
+```
+genuinely gone, on a nominally-open seat   20   74%   <- real rot, correctly reported
+gone, on a closed seat                      3   11%
+POINTER NEVER RESOLVED (file exists)        2    7%   <- fixed here
+UPDATED since stamped (the diligence class) 2    7%   <- NOT changed, see below
+                                           --
+counted broken by fleet today              27 of 32
+```
+
+**A LIFECYCLE FILTER WAS MY OWN FIRST HYPOTHESIS AND IT IS WRONG:** only **3** of the 27 sit on a closed seat. The dominant population is stale-but-nominally-open records, so filtering by lifecycle would move 3 rows and fix nothing. Recorded because it is the obvious next idea and it does not work.
+
+**WHAT IS FIXED, HALF ONE: A BARE `-Handoff` FILENAME COULD NEVER RESOLVE.** `seat.ps1` ran `Test-Path -LiteralPath $Handoff`, which resolves a relative path against the **caller's** cwd -- always a worktree, never the handoffs directory. So the pointer was stored `unresolved: true, state: "dangling"`, `bytes: null`, and the command exited 0 looking like it worked.
+
+**THE SYSTEM KNEW AND TOLD NOBODY.** `seat.ps1` detected it and called `Write-WriterError`, which appends to `.writer-errors.txt` and never reaches the caller's console -- correct by its own design note, since a broken writer must not take down a Stop hook. **ALL 17 LINES EVER WRITTEN TO THAT FILE ARE THIS ONE FAILURE.** `fleet.ps1` counts those lines and reports the total, so the number was on the roster the whole time with nothing naming its cause.
+
+**AND IT WAS ALREADY DOCUMENTED IN PROSE, WHICH IS THE POINT.** The carry-on skill says outright that `-Handoff` needs an absolute path and that a bare filename fails silently, recording that **four live seats dangled inside twenty minutes on 2026-08-24, all four following that same line**. This seat made it five on 08-27, having read the skill in the same session. **Prose was doing a mechanism's job.** The fix tries the path as given FIRST -- absolute and genuinely-relative callers are unchanged -- and only falls back to the handoffs directory for the shape that had no working meaning at all. Proved end to end on this seat's own live record: `dangling` -> `resolves`, absolute path, 8541 bytes, sha256 present.
+
+**WHAT IS FIXED, HALF TWO: THE WRITER-ERROR LOG IS NOT THE TSV IT LOOKS LIKE.** The line was built with a SINGLE-QUOTED PowerShell format string, `'{0}`t{1}`t{2}`t{3}'`, where `` `t `` is not an escape. Measured on the live file: **0 real tab bytes, 51 literal backtick-t sequences** across 17 lines. **LATENT, NOT LIVE:** `fleet.ps1` only counts lines and never splits fields, so nothing is broken today -- it would bite the first consumer that reads columns. Recorded as latent rather than dressed up.
+
+**WHAT IS DELIBERATELY NOT CHANGED: THE DRIFT CHECK.** The brief proposed relaxing it. `seat.ps1`'s own design comment argues the opposite at length -- that a drifted pointer is the WORSE defect because it resolves, so a reader told "READ THE HANDOFF" gets a document the record misdescribes, which is the stale-anchor shape from CLAUDE.md section 11 -- and states that recorded values are never repaired because overwriting them would erase the drift instead of reporting it. **That reasoning is stated, deliberate, and survives the measurement: the class is 2 of 32.** Relaxing a control with a written rationale, to move two rows, on the authority of a builder who is himself one of the affected seats, is not a trade worth making. **If it is revisited, the honest framing is that `handoffPointersBroken` fires on 27 of 32 and a stop condition that fires at 84% discriminates nothing** -- but the remedy for that is the 20 genuinely dangling rows, not the 2 diligent ones.
+
+**Source:** dispatched with a measured brief that named the PM's population as candidate rather than census and told the builder to re-measure. Re-measured; the brief's own scoping instruction is what kept this from becoming a rewrite.
