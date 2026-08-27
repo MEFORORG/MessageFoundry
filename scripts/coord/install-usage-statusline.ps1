@@ -162,13 +162,22 @@ function Write-SettingsFile([string]$Path, $Data) {
     # settings.json has nothing to copy, and an -AllRoots run that printed a backup path for all five
     # would send an operator hunting for backups that were never taken -- a small lie of exactly the
     # kind this change exists to remove.
-    $backed = $false
+    # A FREE NAME, NOT A FIXED ONE, AND IT RETURNS WHERE THE COPY LANDED. $BackupStamp has
+    # one-second resolution, so two runs inside the same second collide -- measured on a fixture: run
+    # 1 wrote the original 55 bytes, run 2 started immediately after and overwrote that same file with
+    # 771 bytes of run 1's POST-install content. The only pre-install copy was destroyed by the run
+    # that claimed to be making one, which is worse than not backing up at all: the operator is told a
+    # backup exists and it holds the wrong content.
+    $backedTo = $null
     if (Test-Path -LiteralPath $Path) {
-        Copy-Item -LiteralPath $Path -Destination "$Path.bak-usage-$BackupStamp" -Force
-        $backed = $true
+        $dest = "$Path.bak-usage-$BackupStamp"
+        $n = 1
+        while (Test-Path -LiteralPath $dest) { $dest = "$Path.bak-usage-$BackupStamp-$n"; $n++ }
+        Copy-Item -LiteralPath $Path -Destination $dest -Force
+        $backedTo = $dest
     }
     Set-Content -LiteralPath $Path -Value $json -Encoding UTF8
-    return $backed
+    return $backedTo
 }
 
 # THREE-WAY, NOT TWO-WAY. A statusLine object present with a null or empty command is NONE, not
@@ -360,8 +369,8 @@ if ($Uninstall) {
                     # person believes they turned something OFF.
                     if ($PSCmdlet.ShouldProcess($t.Settings, "remove the $MARKER statusLine")) {
                         $settings.Remove('statusLine')
-                        $backed = Write-SettingsFile $t.Settings $settings
-                        Write-Host ("  REMOVED      {0}{1}" -f $t.Settings, $(if ($backed) { "   backup $($t.Settings).bak-usage-$BackupStamp" } else { "" }))
+                        $backedTo = Write-SettingsFile $t.Settings $settings
+                        Write-Host ("  REMOVED      {0}{1}" -f $t.Settings, $(if ($backedTo) { "   backup $backedTo" } else { "" }))
                         $removed++
                     }
                     else {
@@ -445,7 +454,7 @@ foreach ($t in $targets) {
             command         = $cmd
             refreshInterval = $RefreshInterval
         }
-        $backed = Write-SettingsFile $t.Settings $settings
+        $backedTo = Write-SettingsFile $t.Settings $settings
 
         if ($isOurs) {
             # Printed separately from WROTE rather than folded into it: "we wired a root that had
@@ -465,7 +474,7 @@ foreach ($t in $targets) {
             Write-Host "             wired to publish to $latest $(if (Test-Path -LiteralPath $latest) { '(a reading is already there)' } else { '(nothing has published there yet)' })"
             $wrote++
         }
-        if ($backed) { Write-Host "             backup $($t.Settings).bak-usage-$BackupStamp" }
+        if ($backedTo) { Write-Host "             backup $backedTo" }
         else { Write-Host "             no backup taken -- this root had no settings.json to preserve" }
     }
     catch {

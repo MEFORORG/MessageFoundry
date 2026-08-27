@@ -401,8 +401,15 @@ def test_opus_is_not_claimed_as_a_blind_spot(tmp_path: Path) -> None:
     publish(tmp_path, five=10.0, seven=10.0)
     _, d = read(tmp_path)
     text = d["not_measured"].lower()
-    assert "opus" not in text or "not gaps" in text or "fully covered" in text, (
-        f"Opus must not be presented as unmeasured: {d['not_measured']}"
+    # TWO INDEPENDENT ASSERTIONS, NOT ONE DISJUNCTION. As a single `or` this could not fail for the
+    # defect it names: re-inserting the exact false sentence ("heavy Opus use can exhaust a bucket
+    # nothing here can see") while leaving the "NOT gaps" text in place kept the whole expression true,
+    # and the suite stayed green while every session was told its Opus headroom was unknowable.
+    assert "not gaps" in text and "fully covered" in text, (
+        f"Opus must be named as covered, not merely omitted: {d['not_measured']}"
+    )
+    assert "can exhaust" not in text and "nothing here can see" not in text, (
+        f"the false blind spot is back: {d['not_measured']}"
     )
 
 
@@ -971,8 +978,13 @@ def test_the_reader_defaults_to_its_own_config_roots_state_dir(fake_home: Path) 
     """Publisher and reader now derive the path from ONE function. They used to agree only because two
     separate string literals happened to match, which is agreement by luck, not by construction."""
     pin = fake_home / ".claude-account-1"
+    # WIRE IT FIRST. A root holding a fresh document but carrying no statusLine is a state that cannot
+    # occur -- something published there, so something was wired -- and since the wiring diagnosis now
+    # reaches the verdict, that contradiction would make this test assert OK over a root the script
+    # itself calls unwired.
+    assert install("-ConfigDir", str(pin), pin=None, home=fake_home).returncode == 0
     state = pin / "mefor-usage"
-    state.mkdir()
+    state.mkdir(exist_ok=True)
     now = datetime.now(UTC).isoformat()
     (state / "latest.json").write_text(
         json.dumps(
@@ -1065,8 +1077,14 @@ def test_the_no_data_error_says_so_when_a_root_publishes_somewhere_else(
     assert code == UNKNOWN
     assert doc["statusline_state"] == "WIRED_ELSEWHERE"
     assert doc["wired_state_dir"].lower() == str(other).lower()
-    _, _, human = reader(pin=pin, home=fake_home)
+    # THE VERDICT, NOT ONLY THE PROSE. The diagnosis used to reach the printed warning and stop there,
+    # so a root the script itself called mis-wired still exited 0 and reported state=OK beside
+    # statusline_state=WIRED_ELSEWHERE in one document -- two instruments disagreeing inside one run.
+    assert doc["state"] == "UNKNOWN", doc
+    hcode, _, human = reader(pin=pin, home=fake_home)
+    assert hcode == UNKNOWN, f"mis-wired root exited {hcode}"
     assert "WAITING WILL NOT FIX THIS" in human
+    assert "--  OK" not in human, f"the heading claimed OK over a leftover: {human}"
 
 
 def test_a_document_stamped_with_another_config_root_is_refused(tmp_path: Path) -> None:
@@ -1792,3 +1810,149 @@ def test_a_correctly_wired_root_that_stopped_publishing_still_warns(fake_home: P
     assert parsed["five_hour"]["projected_at_reset"] is None, (
         "a stale reading must not be projected"
     )
+
+
+def test_two_installs_in_the_same_second_do_not_destroy_the_only_backup(tmp_path: Path) -> None:
+    """A BACKUP THAT HOLDS POST-INSTALL CONTENT IS WORSE THAN NO BACKUP, because the operator is told
+    one exists. The stamp has one-second resolution, so two runs inside the same second collided:
+    measured on a fixture, run 2 overwrote run 1's pre-install copy with run 1's post-install content,
+    and the only original was destroyed by the run that claimed to be preserving it."""
+    root = tmp_path / "root"
+    root.mkdir()
+    settings = root / "settings.json"
+    original = json.dumps({"mine": "keep me"})
+    settings.write_text(original, encoding="utf-8")
+
+    assert install("-ConfigDir", str(root), pin=None).returncode == 0
+    assert install("-ConfigDir", str(root), "-RefreshInterval", "9000", pin=None).returncode == 0
+
+    backups = sorted(root.glob("settings.json.bak-usage-*"))
+    assert len(backups) == 2, f"the second run reused the first run's backup name: {backups}"
+    # Exactly one of them must still hold the untouched original.
+    contents = [b.read_text(encoding="utf-8") for b in backups]
+    assert original in contents, f"the pre-install content was destroyed: {contents}"
+
+
+def test_the_survey_refuses_a_window_carried_from_another_root(fake_home: Path) -> None:
+    """THE SURVEY IS THE ONLY PLACE ACCOUNTS ARE COMPARED, so it is where this refusal matters most --
+    and it was the one place it did not run.
+
+    Checking only the DOCUMENT stamp passes a carry-forward: the document was written by this root and
+    sits under this root, while the numbers inside came from another. Measured before the fix: the
+    single-root reader refused both windows with "refusing to report another account's headroom", and
+    the survey in the SAME run printed those exact percentages as the other root's own, unlabelled. An
+    operator scanning the survey for the account with the most headroom reads one account's number as
+    another's.
+    """
+    a = fake_home / ".claude-account-1"
+    b = fake_home / ".claude-account-2"
+    state = b / "mefor-usage"
+
+    def fire(pin: Path, payload: dict[str, Any]) -> None:
+        proc = subprocess.run(
+            [
+                "pwsh",
+                "-NoProfile",
+                "-NonInteractive",
+                "-File",
+                str(COLLECT),
+                "-StateDir",
+                str(state),
+                "-HomeDir",
+                str(fake_home),
+            ],
+            input=json.dumps(payload),
+            capture_output=True,
+            text=True,
+            timeout=TIMEOUT,
+            check=False,
+            env=_env(pin),
+        )
+        assert proc.returncode == 0, proc.stderr
+
+    # A publishes into B's directory, then B's own un-warmed session carries it forward.
+    fire(
+        a,
+        {
+            "session_id": "A",
+            "rate_limits": {"five_hour": window(88.0, 3600), "seven_day": window(77.0, 280000)},
+        },
+    )
+    fire(b, {"session_id": "B"})
+    # And A gets a healthy publish of its own, so the survey renders at all.
+    (a / "mefor-usage").mkdir(exist_ok=True)
+    proc = subprocess.run(
+        [
+            "pwsh",
+            "-NoProfile",
+            "-NonInteractive",
+            "-File",
+            str(COLLECT),
+            "-StateDir",
+            str(a / "mefor-usage"),
+            "-HomeDir",
+            str(fake_home),
+        ],
+        input=json.dumps(
+            {
+                "session_id": "A2",
+                "rate_limits": {"five_hour": window(12.0, 3600), "seven_day": window(9.0, 280000)},
+            }
+        ),
+        capture_output=True,
+        text=True,
+        timeout=TIMEOUT,
+        check=False,
+        env=_env(a),
+    )
+    assert proc.returncode == 0, proc.stderr
+
+    _, doc, _ = reader("-AllRoots", "-Json", pin=a, home=fake_home)
+    rows = {r["root"].lower(): r for r in doc["roots"]}
+    row_b = rows[str(b).lower()]
+    assert row_b["five"] is None, f"A's 88% was printed as B's own: {row_b}"
+    assert row_b["seven"] is None, row_b
+    assert "DIFFERENT config root" in row_b["note"], row_b
+    # A's own row is untouched -- the refusal fires on error, not on the survey as a whole.
+    assert rows[str(a).lower()]["five"] == pytest.approx(12.0)
+
+
+def test_the_survey_ages_a_row_by_its_windows_not_by_the_document(fake_home: Path) -> None:
+    """The collector rewrites the document stamp on EVERY fire, including a pure carry-forward, so it
+    dates the last FIRE and not the OBSERVATION. Aged by the document, a six-hour-old reading renders
+    as "[seen 0 min ago]" -- a stale number wearing a fresh timestamp, which is the exact shape rule 1
+    exists to forbid."""
+    pin = fake_home / ".claude-account-1"
+    state = pin / "mefor-usage"
+    state.mkdir()
+    old = (datetime.now(UTC) - timedelta(hours=6)).isoformat()
+    now = datetime.now(UTC).isoformat()
+    # A document written just now, whose windows were observed six hours ago -- what a carry-forward
+    # produces.
+    (state / "latest.json").write_text(
+        json.dumps(
+            {
+                "captured_at": now,
+                "published_by": {"config_root_env": str(pin)},
+                "five_hour": {
+                    "used_percentage": 55.0,
+                    "resets_at_epoch": int(time.time()) + 3600,
+                    "captured_at": old,
+                    "config_root_env": str(pin),
+                },
+                "seven_day": {
+                    "used_percentage": 33.0,
+                    "resets_at_epoch": int(time.time()) + 280000,
+                    "captured_at": old,
+                    "config_root_env": str(pin),
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    _, doc, human = reader("-AllRoots", "-Json", pin=pin, home=fake_home)
+    row = next(r for r in doc["roots"] if r["root"].lower() == str(pin).lower())
+    assert row["age_min"] > 300, f"the row was aged by the document, not its windows: {row}"
+    assert row["stale"] is True, row
+    _, _, human = reader("-AllRoots", pin=pin, home=fake_home)
+    assert "STALE" in human, human

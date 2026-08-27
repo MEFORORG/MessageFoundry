@@ -330,6 +330,16 @@ function Get-Rate([string]$Key, [string]$ResetKey, $CurrentResetEpoch) {
     }
 }
 
+# ONE DEFINITION of the per-window cross-root test. The single-root reader and the -AllRoots survey
+# both call it, because two statements of one rule is exactly how the survey came to print a
+# percentage that the reader four lines above had just refused.
+function Test-WindowFromRoot($w, [string]$ReadRoot) {
+    if (-not $w) { return $true }
+    $e = [string]$w.config_root_env
+    if (-not $e -or $e -eq "unset" -or -not $ReadRoot) { return $true }
+    return [bool](Test-SameRoot $e $ReadRoot)
+}
+
 function Get-WindowReport($w, [string]$Label, [string]$Key, [string]$ResetKey, [string]$ReadRoot) {
     if (-not $w) {
         return [ordered]@{ label = $Label; state = "UNKNOWN"; reason = "never published"; used_percentage = $null }
@@ -339,7 +349,7 @@ function Get-WindowReport($w, [string]$Label, [string]$Key, [string]$ResetKey, [
     # even when the document around it was written by this root. The document-level check cannot see
     # that hop: it compares the writer to the directory, and both are correct.
     $wEnv = [string]$w.config_root_env
-    if ($wEnv -and $wEnv -ne "unset" -and $ReadRoot -and -not (Test-SameRoot $wEnv $ReadRoot)) {
+    if (-not (Test-WindowFromRoot $w $ReadRoot)) {
         return [ordered]@{
             label           = $Label
             state           = "UNKNOWN"
@@ -419,10 +429,24 @@ $seven = Get-WindowReport $doc.seven_day "weekly (7d)" "seven_day" "seven_reset"
 $rank = @{ "OK" = 0; "WARN" = 10; "CRITICAL" = 11; "UNKNOWN" = 20 }
 $states = @($five.state, $seven.state)
 # CRITICAL outranks UNKNOWN: a known emergency in one window is not softened by the other being unknown.
+# ONE LIST, READ TWICE. The warning printed below and the verdict computed here must name the same
+# states, or the prose and the exit code describe different situations -- the two-instruments-
+# disagreeing defect this whole change exists to remove, reproduced inside one script.
+$dxUntrusted = @("WIRED_ELSEWHERE", "WIRED_LEGACY", "WIRED_COLLECTOR_MISSING", "FOREIGN_STATUSLINE",
+    "NOT_WIRED_NO_SETTINGS", "NOT_WIRED_NO_STATUSLINE")
+
 $overall = if ($states -contains "CRITICAL") { "CRITICAL" }
 elseif ($states -contains "WARN") { "WARN" }
 elseif ($states -contains "UNKNOWN") { "UNKNOWN" }
 else { "OK" }
+
+# A READING THIS ROOT MAY NOT TRUST IS UNKNOWN, which is what the exit-code contract promises. The
+# diagnosis used to reach the prose only, so a root the script itself called mis-wired still exited 0
+# and reported state=OK beside statusline_state=WIRED_ELSEWHERE in one document. An explicit -StateDir
+# is exempt: there the operator named the directory, and the root above it need not be wired at all.
+if (-not $script:GaveStateDir -and $overall -ne "CRITICAL" -and $dx.state -in $dxUntrusted) {
+    $overall = "UNKNOWN"
+}
 
 # RULE 3, and the guidance is an ACTION. This repo has already learned that "don't do X" is the wrong
 # primitive when automation has X armed -- see docs/WORKTREES.md. "Commit and hand off" is something a
@@ -442,7 +466,7 @@ $blindSpot = "NOT MEASURED: the model-scoped weekly bucket (Fable) and the plan 
 function Get-RootSummary([string]$Root) {
     $sd = Get-UsageStateDir $Root
     $lp = Join-Path $sd "latest.json"
-    $s = [ordered]@{ root = $Root; state_dir = $sd; published = $false; note = ""; five = $null; seven = $null; age_min = $null }
+    $s = [ordered]@{ root = $Root; state_dir = $sd; published = $false; note = ""; five = $null; seven = $null; age_min = $null; stale = $false }
     $d = $null
     try { $d = Get-Content -LiteralPath $lp -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop } catch { }
     if (-not $d) {
@@ -456,10 +480,31 @@ function Get-RootSummary([string]$Root) {
         return $s
     }
     $s.published = $true
-    $s.five = if ($d.five_hour) { [double]$d.five_hour.used_percentage } else { $null }
-    $s.seven = if ($d.seven_day) { [double]$d.seven_day.used_percentage } else { $null }
-    $s.age_min = Get-AgeMinutes $d.captured_at
-    if (-not $env_ -or $env_ -eq "unset") { $s.note = "provenance UNVERIFIED" }
+    # THE SURVEY IS THE ONLY PLACE ACCOUNTS ARE COMPARED, so it is where the cross-root refusal
+    # matters most -- and it was the one place it did not run. Checking only the DOCUMENT stamp passes
+    # a carry-forward: the document was written by this root and sits under this root, while the
+    # numbers inside came from another. Measured: the single-root reader refused both windows and the
+    # survey four lines later printed them as this root's own.
+    $fiveOurs = Test-WindowFromRoot $d.five_hour $Root
+    $sevenOurs = Test-WindowFromRoot $d.seven_day $Root
+    $s.five = if ($d.five_hour -and $fiveOurs) { [double]$d.five_hour.used_percentage } else { $null }
+    $s.seven = if ($d.seven_day -and $sevenOurs) { [double]$d.seven_day.used_percentage } else { $null }
+    # AGED BY ITS WINDOWS, NOT BY THE DOCUMENT. The collector rewrites the document stamp on EVERY
+    # fire, including a pure carry-forward, so it dates the last fire and not the observation -- a
+    # six-hour-old reading rendered as "[seen 0 min ago]". The OLDER of the two windows is the honest
+    # single number for a row printing both. The @() wrapper is load-bearing: without it a single
+    # surviving age arrives as a scalar and .Count is unreliable.
+    $fa = if ($d.five_hour) { Get-AgeMinutes $d.five_hour.captured_at } else { $null }
+    $sa = if ($d.seven_day) { Get-AgeMinutes $d.seven_day.captured_at } else { $null }
+    $ages = @(@($fa, $sa) | Where-Object { $null -ne $_ })
+    # The document stamp is the fallback only when no window carries one, which keeps pre-change
+    # documents and hand-written fixtures readable.
+    $s.age_min = if ($ages.Count) { ($ages | Measure-Object -Maximum).Maximum } else { Get-AgeMinutes $d.captured_at }
+    $s.stale = ($null -eq $s.age_min) -or ($s.age_min -gt $MaxAgeMinutes)
+    if (-not $fiveOurs -or -not $sevenOurs) {
+        $s.note = "REFUSED -- a window here was observed under a DIFFERENT config root"
+    }
+    elseif (-not $env_ -or $env_ -eq "unset") { $s.note = "provenance UNVERIFIED" }
     return $s
 }
 
@@ -517,7 +562,7 @@ Write-Host "  config root: $readRoot   (from $rootSource)" -ForegroundColor Dark
 # A MIS-WIRE IS PRINTED ABOVE THE NUMBERS, not below them and not only when there are none. If this root
 # publishes somewhere else, the percentages under this heading are a leftover, and saying so after the
 # reader has already read them is too late to stop the wrong decision.
-if ($dx.state -in @("WIRED_ELSEWHERE", "WIRED_LEGACY", "WIRED_COLLECTOR_MISSING", "FOREIGN_STATUSLINE", "NOT_WIRED_NO_SETTINGS", "NOT_WIRED_NO_STATUSLINE")) {
+if ($dx.state -in $dxUntrusted) {
     Write-Host ""
     Write-Host "  WARNING -- the numbers below may be a leftover:" -ForegroundColor Yellow
     Write-Host "  $($dx.line)" -ForegroundColor Yellow
@@ -534,9 +579,18 @@ if ($dx.state -in @("WIRED_ELSEWHERE", "WIRED_LEGACY", "WIRED_COLLECTOR_MISSING"
 # (ownership, an extracted -StateDir matching this directory, and Test-Path on the collector). "nothing
 # fresh" is the window states. The two CAUSES are offered as alternatives, never asserted, because
 # nothing here can tell them apart.
-elseif ($dx.state -eq "WIRED_HERE" -and ($five.state -eq "UNKNOWN" -or $seven.state -eq "UNKNOWN")) {
+# -and, NOT -or. With -or this fired on a document published 0.15 seconds earlier: a fresh five_hour
+# beside a seven_day that has simply never been published leaves one window UNKNOWN, and the warning
+# then claimed "nothing fresh has published here" over a reading taken moments ago. The claim is that
+# NOTHING is fresh, so the test has to be that nothing is.
+elseif ($dx.state -eq "WIRED_HERE" -and $five.state -eq "UNKNOWN" -and $seven.state -eq "UNKNOWN") {
+    # THE COLLECTOR CLAUSE IS CONDITIONAL, because WIRED_HERE does not always mean one was checked: a
+    # wired command carrying a -StateDir but no recognisable collector assignment yields a null
+    # collector path, which skips the Test-Path guard entirely. Asserting it exists would be asserting
+    # a check that never ran.
+    $collClause = if ($dx.wired_collector) { " and the collector it names exists" } else { "" }
     Write-Host ""
-    Write-Host "  WARNING -- this root is wired correctly and the collector it names exists," -ForegroundColor Yellow
+    Write-Host "  WARNING -- this root is wired correctly$collClause," -ForegroundColor Yellow
     Write-Host "  yet nothing fresh has published here. Two causes, and this cannot tell them apart:" -ForegroundColor Yellow
     Write-Host "    - no session has STARTED here since it was wired (settings are read at session start), or" -ForegroundColor DarkGray
     Write-Host "    - the statusLine is configured but never runs. It is part of the terminal UI's render" -ForegroundColor DarkGray
@@ -563,7 +617,14 @@ if ($survey) {
         if ($s.published) {
             $f = if ($null -ne $s.five) { "5h {0,3:0}%" -f $s.five } else { "5h   -" }
             $v = if ($null -ne $s.seven) { "7d {0,3:0}%" -f $s.seven } else { "7d   -" }
-            Write-Host ("    {0,-46} {1}  {2}   [seen {3} min ago]{4}" -f $s.root, $f, $v, $s.age_min, $mark)
+            # Two branches rather than a computed -ForegroundColor: passing $null to that parameter
+            # throws ("Cannot convert null to type System.ConsoleColor"), measured.
+            if ($s.stale) {
+                Write-Host ("    {0,-46} {1}  {2}   [STALE -- oldest window seen {3} min ago, max {4}]{5}" -f $s.root, $f, $v, $s.age_min, $MaxAgeMinutes, $mark) -ForegroundColor DarkGray
+            }
+            else {
+                Write-Host ("    {0,-46} {1}  {2}   [seen {3} min ago]{4}" -f $s.root, $f, $v, $s.age_min, $mark)
+            }
             if ($s.note) { Write-Host ("    {0,-46} {1}" -f "", $s.note) -ForegroundColor DarkGray }
         }
         else {
