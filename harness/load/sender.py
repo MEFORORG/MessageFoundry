@@ -22,6 +22,7 @@ import time
 from collections import deque
 from collections.abc import Callable
 
+from harness.load.connscale.intake_audit import IntakeLedger
 from harness.load.corpus import Outgoing
 from harness.load.correlator import Correlator
 from harness.load.failover_track import FailoverTracker
@@ -66,6 +67,7 @@ class PersistentConnection:
         expect_ack: bool = True,
         queue_max: int = 1000,
         tracker: FailoverTracker | None = None,
+        ledger: IntakeLedger | None = None,
     ) -> None:
         self._host = host
         self._port = port
@@ -73,6 +75,16 @@ class PersistentConnection:
         self._m = metrics
         self._expect_ack = expect_ack
         self._tracker = tracker  # failover-only: record which seqs the engine accept-ACKed
+        # BACKLOG #1292 intake audit: an optional PER-MESSAGE record of how each send left `_inflight`
+        # (a response frame was read, or the connection closed on it). Same opt-in seam as `tracker`
+        # above, and None by default, so the steady-state write path is unchanged when nothing wants
+        # it. Meaningful only with `expect_ack` -- see `_write_loop`.
+        self._ledger = ledger
+        if ledger is not None and not expect_ack:
+            # Refuse rather than fill a ledger that can only ever be empty: with no ACK expected no
+            # response frame is ever read, so every send would be unaccounted and the audit's set
+            # comparison would be vacuous. Loud here beats a clean-looking verdict over nothing.
+            raise ValueError("an intake ledger requires expect_ack (it records response frames)")
         self._queue: asyncio.Queue[_Job] = asyncio.Queue(maxsize=queue_max)
         self._inflight: deque[tuple[int, int, str, OnDone | None]] = deque()
         self._stop = asyncio.Event()
@@ -211,7 +223,15 @@ class PersistentConnection:
         # MLLP ACKs are in-order per connection (the engine ACKs on receipt in send order).
         _seq, send_ns, _cid, on_done = self._inflight.popleft()
         self._m.ack.record(float(ack_ns - send_ns))
-        if _ack_code(ack) in _ACCEPT:
+        # ONE accept decision, made here and PASSED to the ledger rather than re-derived beside it:
+        # a second copy of `_ACCEPT` in the audit module is a two-place constant, and the two
+        # disagreeing would silently move a message between the engine-suspect and harness-suspect
+        # buckets -- the exact attribution the audit exists to get right.
+        code = _ack_code(ack)
+        accepted = code in _ACCEPT
+        if self._ledger is not None:
+            self._ledger.record_confirmed(_cid, _seq, code, accepted=accepted)
+        if accepted:
             self._m.counters.acked += 1
             if self._tracker is not None:
                 # An accept-ACK means the engine durably committed this to the ingress stage (ACK-on-
@@ -228,6 +248,8 @@ class PersistentConnection:
             return
         for _seq, _send_ns, _cid, on_done in self._inflight:
             self._m.counters.timeouts += 1
+            if self._ledger is not None:
+                self._ledger.record_unconfirmed(_cid, _seq)
             if on_done is not None:
                 on_done()
         self._inflight.clear()

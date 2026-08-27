@@ -28,6 +28,7 @@ from collections.abc import Sequence
 
 import pytest
 
+from harness.load.connscale.intake_audit import MOMENT_POST_MORTEM
 from harness.load.connscale.probe import ProbeDegraded
 from harness.load.connscale.profile import load_connscale_profile_text
 from harness.load.connscale.report import ConnScaleRecord, ConnScaleReport
@@ -176,6 +177,44 @@ def _assert_fd_probe(records: Sequence[ConnScaleRecord]) -> None:
         f"in which the FD wall is never compared against itself is not, because the SLO that is "
         f"supposed to cover it silently passes over an empty set."
     )
+
+
+def _assert_intake_audit(records: Sequence[ConnScaleRecord]) -> None:
+    """Assert the BACKLOG #1292 discriminator on every step, in the order its verdicts matter.
+
+    Four properties, each pinning a different way this could go quietly wrong:
+
+    1. NO step is ``engine_suspect``. This is the finding the item is about: the engine framed an
+       accept-ACK for a message and its own stopped, committed store has no row for it.
+    2. EVERY step's audit is CONCLUSIVE. A PROBE_UNUSABLE result is not a pass -- it means the
+       instrument could not answer, and an instrument that silently stops answering leaves the
+       original unattributable failure in place while looking green.
+    3. EVERY step's sweep read rows (``store_total > 0``) against a step that sent messages. This is
+       the positive control: a set comparison against an empty set is clean for the wrong reason.
+    4. The authoritative audit is the POST-MORTEM one. A live read could be explained away as early
+       sampling; a read of a stopped engine's store cannot, and mislabelling one as the other would
+       destroy the only distinction the second moment exists to make.
+    """
+    for r in records:
+        audit = r.intake_audit
+        assert not audit.engine_suspect, (
+            f"COUNT-AND-LOG INVARIANT -- {r.sweep_mode}@N={r.count}: {audit.summary()}. The engine "
+            f"accept-ACKed those sends and its own stopped, committed store has no messages row for "
+            f"them, so a deploying site would be able to lose an acknowledged message at intake. "
+            f"The sequence numbers above name them; this is reproducible, not statistical."
+        )
+        assert audit.conclusive, (
+            f"INTAKE AUDIT COULD NOT ANSWER -- {r.sweep_mode}@N={r.count}: {audit.summary()}. The "
+            f"discriminator is the whole point of this step's no-loss coverage, so a probe that did "
+            f"not run or could not read is reported as a failure rather than tolerated: tolerating "
+            f"it restores exactly the unattributable red this check exists to replace."
+        )
+        assert audit.moment == MOMENT_POST_MORTEM, audit
+        assert audit.store_total > 0, (
+            f"INTAKE AUDIT POSITIVE CONTROL -- {r.sweep_mode}@N={r.count} sent {r.sent} message(s) "
+            f"and the store sweep read {audit.store_total} row(s): {audit.summary()}. A clean set "
+            f"comparison over an empty read says nothing about intake."
+        )
 
 
 # --- the one expensive run, shared by every property below ----------------------------------------
@@ -376,6 +415,19 @@ def test_no_loss_reconciles_at_every_step(smoke_report: ConnScaleReport) -> None
     for r in smoke_report.records:
         assert r.sent > 0, r
         assert r.no_loss.ok, (r.sweep_mode, r.count, r.no_loss.detail)
+
+
+def test_no_accept_acked_message_is_absent_from_the_stopped_engines_store(
+    smoke_report: ConnScaleReport,
+) -> None:
+    """BACKLOG #1292 -- the PER-MESSAGE intake audit, asserted INDEPENDENTLY of the count check above.
+
+    Strictly ADDITIONAL, not a restatement: the count check compares totals and forgives an
+    unconfirmed send, so a message the engine ACCEPT-ACKed and then has no row for passes it whenever
+    that message also happened to be excused as a timeout. This asserts the thing the count check
+    cannot: that no accept-ACKed message is absent from the engine's own committed store.
+    """
+    _assert_intake_audit(smoke_report.records)
 
 
 def test_the_fd_and_empty_claim_curves_are_monotonic_in_n(smoke_report: ConnScaleReport) -> None:

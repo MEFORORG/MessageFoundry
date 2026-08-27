@@ -7,6 +7,13 @@ A curve-shaped report (vs the throughput-shaped :class:`~harness.load.report.Run
 reconcile, plus an SLO verdict. **Metrics + metadata only** — never message bodies or control-id lists
 (PHI rule). Pure + deterministic, so it unit-tests without a live run.
 
+That rule is why the BACKLOG #1292 intake audit reports **sequence numbers**, not the control ids it
+actually matched on: a seq is a dense integer minted by the harness's own counter and meaningless
+outside the run, so it identifies the message for a follow-up without putting a list of message
+identifiers into a shared artifact. The control ids are emitted NOWHERE -- not here and not to the
+log; the previous wording sent readers to a log line that never carried them, and invited a
+maintainer to make the sentence true by logging exactly what this rule exists to keep out.
+
 The thundering-herd measurement is reported **explicitly and separated** (critic must-change #3): the
 ``fixed_aggregate`` sweep (constant R across N) IS the herd measurement, so the report carries the
 ``empty_claims_wake_fanout``-per-second slope vs N AS the wake-fanout cost, kept DISTINCT from the
@@ -22,6 +29,13 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
 from harness._spreadsheet import SPREADSHEET_FORMULA_TRIGGERS, spreadsheet_safe
+from harness.load.connscale.intake_audit import (
+    MOMENT_LIVE,
+    VERDICT_INTAKE_COMPLETE,
+    VERDICT_NOT_RUN,
+    IntakeAudit,
+    not_run,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -164,6 +178,19 @@ class ConnScaleRecord:
     fd_probe_ticks: int = 0
     fd_probe_degraded_ticks: int = 0
     fd_probe_degraded: tuple[str, ...] = ()
+    # --- BACKLOG #1292: the intake audit, the PER-MESSAGE discriminator for a no_loss shortfall ---
+    # `no_loss` compares COUNTS, and a shortfall in it reads identically whether the engine lost an
+    # acknowledged message or the `engine_read` gauge was short. These carry the per-message verdict
+    # that separates the two. `intake_audit` is the POST-MORTEM one (taken against the stopped,
+    # committed store, so sampling timing cannot explain it) and is the authoritative field;
+    # `intake_audit_live` is the one taken while the engine was still up, and runs only on a
+    # shortfall -- the DELTA between them is what says sample-lag vs sum-coverage. Both default to a
+    # NOT_RUN verdict so an older artifact / a record built without the audit deserializes unchanged
+    # and never reads as a clean pass it did not earn.
+    intake_audit: IntakeAudit = field(default_factory=lambda: not_run("audit not wired"))
+    intake_audit_live: IntakeAudit = field(
+        default_factory=lambda: not_run("audit not wired", moment=MOMENT_LIVE)
+    )
 
     def to_json_dict(self) -> dict[str, object]:
         return {
@@ -236,6 +263,12 @@ class ConnScaleRecord:
                     "degraded_ticks": self.fd_probe_degraded_ticks,
                     "degraded": list(self.fd_probe_degraded),
                 },
+            },
+            # BACKLOG #1292. Sequence numbers and MSA-1 codes only -- never control ids, per the
+            # module docstring's metadata-only rule.
+            "intake_audit": {
+                "post_mortem": self.intake_audit.to_json_dict(),
+                "live": self.intake_audit_live.to_json_dict(),
             },
             "wall5_reload": {"seconds": self.reload_seconds},
             "wall6_ack_ms": {
@@ -624,6 +657,15 @@ class ConnScaleReport:
                     f"fd probe: {r.sweep_mode}@N={r.count} -- {r.fd_probe_degraded_ticks} of "
                     f"{r.fd_probe_ticks} tick(s) measured nothing [{causes}]"
                 )
+        # BACKLOG #1292: the per-message attribution, printed whenever it says anything beyond "clean".
+        # A `no_loss` shortfall renders as a bare count in the table above, which is exactly the
+        # unattributable failure this exists to replace -- so the verdict goes on the console beside
+        # it, not only in the JSON artifact.
+        for r in self.records:
+            for audit in (r.intake_audit_live, r.intake_audit):
+                if audit.verdict in (VERDICT_INTAKE_COMPLETE, VERDICT_NOT_RUN):
+                    continue
+                lines.append(f"{r.sweep_mode}@N={r.count} -- {audit.summary()}")
         lines.append("")
         lines.append("SLOs:")
         if not self.slos:
