@@ -1735,3 +1735,60 @@ def test_the_survey_names_a_settings_bearing_root_its_own_predicate_rejected(
     assert ".claude-account-2.lock" in human
     # And the heading must not claim completeness it cannot deliver.
     assert "Every config root on this box" not in human
+
+
+def test_a_correctly_wired_root_that_stopped_publishing_still_warns(fake_home: Path) -> None:
+    """TONIGHT'S ACTUAL FAILURE, and the arm the mis-wire warning cannot reach.
+
+    Every root on the box this was written for is wired correctly, names a collector that exists, and
+    has published NOTHING for the better part of an hour across nine live sessions. A healthy root
+    reports WIRED_HERE, which the mis-wire warning deliberately excludes — so without a second arm this
+    case falls through to a bare "reading is N min old", the line a reader skims past.
+
+    The earlier message said "-- no live session is publishing", which at least signalled that
+    something was wrong. Deleting it was right (nothing checked it, and it is false when a session is
+    publishing into another root) but it left this case with no signal at all. Caught by the Steward
+    seat, whose whole concern is that a quiet plausible stale reading is more dangerous than a loud
+    failure.
+    """
+    pin = fake_home / ".claude-account-1"
+    assert install("-ConfigDir", str(pin), pin=None, home=fake_home).returncode == 0
+
+    state = pin / "mefor-usage"
+    state.mkdir(exist_ok=True)
+    old = (datetime.now(UTC) - timedelta(minutes=48)).isoformat()
+    (state / "latest.json").write_text(
+        json.dumps(
+            {
+                "captured_at": old,
+                "five_hour": {
+                    "used_percentage": 64.0,
+                    "resets_at_epoch": int(time.time()) + 780,
+                    "captured_at": old,
+                },
+                "seven_day": {
+                    "used_percentage": 31.0,
+                    "resets_at_epoch": int(time.time()) + 280000,
+                    "captured_at": old,
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    code, doc, human = reader(pin=pin, home=fake_home)
+    assert code == UNKNOWN
+    assert "WARNING" in human, f"a wired-but-silent root produced no warning:\n{human}"
+    assert "wired correctly" in human
+    # The two causes are offered as alternatives, never asserted -- nothing here can tell them apart.
+    assert "cannot tell them apart" in human
+    # And the properties the staleness guard already provided must survive alongside it.
+    _, parsed, _ = reader("-Json", pin=pin, home=fake_home)
+    assert parsed["statusline_state"] == "WIRED_HERE"
+    assert parsed["five_hour"]["used_percentage"] == pytest.approx(64.0), (
+        "the number must still show"
+    )
+    assert parsed["five_hour"]["reading_age_min"] is not None, "its age must still show"
+    assert parsed["five_hour"]["projected_at_reset"] is None, (
+        "a stale reading must not be projected"
+    )

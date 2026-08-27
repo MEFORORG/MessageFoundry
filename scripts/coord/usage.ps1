@@ -523,6 +523,26 @@ if ($dx.state -in @("WIRED_ELSEWHERE", "WIRED_LEGACY", "WIRED_COLLECTOR_MISSING"
     Write-Host "  $($dx.line)" -ForegroundColor Yellow
     foreach ($l in $dx.remedy) { Write-Host "  $l" -ForegroundColor DarkGray }
 }
+# CORRECTLY WIRED AND STILL NOT FRESH IS ITS OWN FAILURE, and it is the one actually seen on this box:
+# every root wired, every collector present, and latest.json frozen for 47 minutes across nine live
+# sessions. The mis-wire arm above cannot catch it -- a healthy root reports WIRED_HERE -- so without
+# this it falls through to a bare "reading is N min old", which is the line a reader skims past. The
+# earlier "-- no live session is publishing" at least signalled that something was wrong; deleting it
+# as an unchecked causal claim was right, but it left this case with no signal at all.
+#
+# EVERY CLAUSE IS BACKED. "wired, and the collector it names exists" is what WIRED_HERE already tested
+# (ownership, an extracted -StateDir matching this directory, and Test-Path on the collector). "nothing
+# fresh" is the window states. The two CAUSES are offered as alternatives, never asserted, because
+# nothing here can tell them apart.
+elseif ($dx.state -eq "WIRED_HERE" -and ($five.state -eq "UNKNOWN" -or $seven.state -eq "UNKNOWN")) {
+    Write-Host ""
+    Write-Host "  WARNING -- this root is wired correctly and the collector it names exists," -ForegroundColor Yellow
+    Write-Host "  yet nothing fresh has published here. Two causes, and this cannot tell them apart:" -ForegroundColor Yellow
+    Write-Host "    - no session has STARTED here since it was wired (settings are read at session start), or" -ForegroundColor DarkGray
+    Write-Host "    - the statusLine is configured but never runs. It is part of the terminal UI's render" -ForegroundColor DarkGray
+    Write-Host "      tree, so check whether your client shows a status bar at all; a line beginning" -ForegroundColor DarkGray
+    Write-Host "      'mefor-usage' there means it IS firing and the fault is elsewhere." -ForegroundColor DarkGray
+}
 Write-Host ""
 Show-Window $five
 Show-Window $seven
