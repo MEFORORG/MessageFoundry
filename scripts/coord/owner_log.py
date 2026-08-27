@@ -106,6 +106,13 @@ MEANING = {
 #: reader to skim, which is how the next real gap gets missed.
 PRESENTED_STALE_HOURS = 14.0
 
+#: Every event this ledger recognises. read() REJECTS a row whose event is not one of these.
+#: Width alone is not enough: the ledger is a markdown DOCUMENT, a table admits any pipe-led line,
+#: and prose written into it -- including this file's own provenance notes -- parsed as legs for a
+#: second consumer. No gap was ever suppressed, because none of the stray rows carried an answer
+#: event. Whitelisting the vocabulary prevents the class rather than the one instance.
+KNOWN_EVENTS = frozenset(LEGS) | TERMINAL
+
 HEADER = [
     "# OWNER ITEMS -- four-leg ledger",
     "",
@@ -189,6 +196,8 @@ def read(path: str) -> list[dict[str, str]]:
                 continue
             if rec.get("ts") == "ts":
                 continue
+            if rec.get("event") not in KNOWN_EVENTS:
+                continue  # prose, a nested table, or a typo -- not a leg
             rows.append(rec)
     return rows
 
