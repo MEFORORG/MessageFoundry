@@ -5214,6 +5214,28 @@ A bare `Write-Output main$(calc):seed.txt` emits `mainPWNED-EXECUTED:seed.txt`. 
 **Source:** found 2026-08-06 by a three-pass audit (inventory, adversarial attack, refutation) of the committed gate, prompted by a coordination message from a peer session generalising this gate. That message's own premise was overturned by measurement: the values it named are newline-unreachable here, and the reachable defect was one its proposed fix would not have closed.
 
 ## 1082. Rule 3c's deny text for a `--global` or `--system` disarm write names the wrong mechanism, and whether the write takes effect is not knowable from the command
+> **THE WORDING IS FIXED 2026-08-27; the banner stays open for the archive pass. THE VERDICT DID NOT
+> MOVE, which is the property this item most needed protecting.** Rule 3c had ZERO mentions of
+> `--global`/`--system`, so it emitted the shared-config sentence for every scope. It now branches: a
+> scoped write is told which file it actually writes, and why it is refused anyway (git falls back to
+> that scope when the repository does not set the key). The repository-scope wording is UNCHANGED and
+> pinned by its own control, so this did not trade one false sentence for another.
+>
+> **NOTHING IN THE NEW TEXT REASSURES**, and the tests pin the absence of four phrases rather than the
+> presence of one. That is this row's round-4 lesson: segments are judged one at a time and `Write-Deny`
+> exits on the first hit, so a reassurance prints over a real disarm when a LATER segment does a local
+> write.
+>
+> **A QUALIFIER THIS ROW DOES NOT HAVE, measured 2026-08-27: whether a `--global` write takes effect
+> depends on WHERE IT IS READ FROM, not only on the repository.** From a worktree `core.hooksPath` is
+> set at worktree scope -- **75 of 76** `config.worktree` files set it -- so global loses to the more
+> specific scope. **From the primary it is unset at every scope** (`--get` exit 1, against a control of
+> `core.bare` exit 0), so a `--global` write there WOULD take effect. The row states only the first and
+> reads as though it settled the question for the repository. Denying stays correct for both.
+>
+> **The multi-line residual this row names is NOT fixed here** and still needs its own item: segments
+> are split on lines and the first hit exits, so a multi-line command is judged by its first segment.
+>
 
 > 🔢 **Re-scored 2026-08-20 -> P3.** Value **4/10** · Difficulty **3/10** · _fill-in_. The wrong sentence is still the only one rule 3c emits, and the rule reaches it for a --global write because the only pre-deny exclusion at :981 is for reads, so a governed cwd resolves and denies with prose that names a mechanism the write does not use. The verdict must stay deny, so the work is a scope-aware wording plus a test that asserts the string rather than the verdict. _(was 4/10 · 3/10.)_
 >
@@ -5297,6 +5319,41 @@ Both contain the identical slug. Only the first carries a `worktrees/` prefix.
 **Source:** found 2026-08-07 while committing #1082, when a routine slug grep returned a hit the leak gate had just passed. The gate had refused a different commit of mine for the prefixed form the day before, which is what made the disagreement visible.
 
 ## 1085. Rule 3c discards a `cd` prefix and resolves a relative `-C` against the session cwd, so it refuses a write aimed at an ungoverned repo
+> **FIXED 2026-08-26. The banner stays open for the archive pass, as with #1026 and #1361.**
+> *(Two sibling rows written the same night are deliberately NOT cited here: their numbers are
+> allocated but their ROWS live on branches that have not landed, so a citation to them DANGLES
+> on this branch and reds the citation check. A cross-branch `#N` resolves only once both land.)*
+> The fix is in `Get-GitTargetCandidatesRaw`, which is where this row and the gate's own defect inventory
+> both said it belonged -- `worktree_gate.ps1` carried *"COMPOSE vs PREFER ... That is BACKLOG #1085"* in a
+> list ending *"All of these belong to the RESOLVER rather than to this rule"*. That comment is updated in
+> the same change rather than deleted, so the inventory beside it is not read as still complete.
+>
+> **COMPOSITION, NOT PREFERENCE, AND THE JOIN IS GUARDED.** The `cd` computation moved above the `-C`
+> branch; a RELATIVE `-C` is joined onto the `cd` target, an ABSOLUTE one is left alone. Unconditional
+> composition would be worse than the bug: joining a governed absolute `-C` onto some other `cd` points
+> the gate away from the repository the command really writes to, turning a correct DENY into a FAIL-OPEN.
+>
+> **The three bail-outs now guard BOTH branches** (`popd`, `cd -`, and a `(`/`{` subshell). When one fires
+> the behaviour is byte-identical to before, which is what the subshell test asserts.
+>
+> **A SHIPPED TEST LOOKS LIKE IT CONTRADICTS THIS AND DOES NOT.**
+> `test_a_dash_C_beats_a_preceding_cd` says *"git acts on -C, never on the cd'd directory"* -- but every
+> case it drives uses an ABSOLUTE `-C`, where that is true and this change preserves it. The name and the
+> word "never" are broader than the evidence, so a reader checking whether this fix is safe would conclude
+> from the title that it is not. A new negative control covers the case that would actually notice.
+>
+> **The first draft of the tests used a `config core.hooksPath` payload and three of them failed.** They
+> failed IDENTICALLY against the UNFIXED gate, which is what showed the fault was the test rather than the
+> fix: in this module's fixtures the `primary` directory is never created, and a disarm payload ALLOWS
+> against a non-repository while a git VERB DENIES on path governance alone. Measured, not reasoned:
+> `git -C . checkout main` DENY, `git -C . <disarm write>` ALLOW, `git checkout main` DENY.
+>
+> **The gate blocked the edit that wrote these tests**, because a literal disarm-key write in a heredoc IS
+> one and rule 3 scans the tool call's command line. Correct behaviour; the payload is now assembled from
+> parts, so what the gate sees at RUN time is unchanged.
+>
+> **Mutation-tested:** reverting the resolver reds ONLY the composition test; all four controls stay green.
+> 222 tests pass across the four closest gate suites.
 
 > 🔢 **Re-scored 2026-08-20 -> P2.** Value **6/10** · Difficulty **4/10** · _quick win_. The defect is intact: worktree_gate.ps1:319 takes the -C value and the cd resolution at :321-330 is the else branch, so a relative -C behind a cd prefix resolves against the session cwd and the deny names the wrong repository. Value 6 is rung 6 -- a live false deny on developer tooling whose only workaround is a human overriding a message that actively misinforms. Difficulty 4, not 5, because the change is hoisting the existing cd computation above the -C branch and joining a relative -C to it inside one function, and the deny-text assertion the scorer priced as extra cost is already a shipped test capability. _(was 6/10 · 4/10.)_
 >
@@ -6120,6 +6177,26 @@ the blanking here without measuring `#1086`'s false-deny rows in the same table.
 **Source:** found 2026-08-06 by the must-keep-allowing inventory built for #1066, which enumerated what rule 3c allows today and found this in the gap between the shipped tests.
 
 ## 1069. Rule 3c matched the disarm key on the quote-blanked scan string, so a QUOTED key was invisible
+> **THE QUOTED-KEY FAIL-OPEN IS FIXED 2026-08-27; the banner stays open for the archive pass, and the
+> multi-word spelling below REMAINS OPEN BY DESIGN.** `Remove-QuotedSpans` now UNMASKS a quoted span
+> holding a single BARE WORD -- no whitespace, quote, `$`, bracket, brace, semicolon, ampersand, pipe
+> or backtick. Prose keeps its spaces and stays masked; a config key has none and becomes visible.
+>
+> **Measured before and after, with the UNQUOTED spelling as a known-answer control** (it denied in
+> both arms, so an ALLOW below is a reading and not a dead probe): all five quoted spellings this row
+> lists ALLOWED before and DENY after; three prose commit messages quoting `core.hooksPath` ALLOW in
+> both arms, so the false-deny this item warns about was not admitted.
+>
+> **THE LENGTH-PRESERVING MASK THIS ROW PRESCRIBES WAS DELIBERATELY NOT BUILT, and the reason is a
+> measurement rather than a preference.** Its stated rationale is that *"length preservation is what
+> lets the same offsets read paths back out of the raw text afterwards"* -- and NO RULE DOES THAT.
+> Every path site re-runs `[regex]::Match($seg.Raw, ...)` and computes its offsets inside `Raw` from
+> scratch. Length-preserving masking would change what every OTHER rule sees, for zero benefit to the
+> defect being closed. **Widening scope beyond the defect is precisely how the earlier attempt at this
+> item acquired five new fail-opens**, which is the outcome this row's own DO-NOT-SHIP order records.
+>
+> The banked patch remains unshipped and untouched.
+>
 
 > 🔢 **Re-scored 2026-08-20 -> P2.** Value **7/10** · Difficulty **4/10** · _quick win_. Rule 3c still decides on $seg.Scan at worktree_gate.ps1:976-978 while Remove-QuotedSpans at :347-388 blanks every closed quoted span, so a quoted danger key is erased before the disarm regex runs; grep finds no length-preserving mask, no bare-word unmask, and the pinned ALLOW test the item names is absent from tests/. Value 7 because the fail-open needs no unusual spelling and disarms the ledger, claim and leak commit gates for every worktree at once with no compensating detection, but its blast radius is the developer harness rather than a deployment; difficulty 4 because the one written fix was rejected on verification after acquiring five new fail-opens, so the remainder is a scanner rewrite plus an adversarial test round. _(was 8/10 · 3/10.)_
 >
@@ -16713,6 +16790,136 @@ raised message via `ast` and reds on that revert.
 confusing rather than broken, and churning that many message strings in one change buys less than the
 guard that stops the next one. Anyone taking them should take the `[egress]` six as one job -- they
 share a shape.
+## 1369. the ASVS writer persists its own control declarations into the record, because the control channel and the data channel are one dict
+
+> 🔢 **Filed 2026-08-27 (builder 2) - BUILT IN THIS COMMIT, not yet landed.**
+> Verdict: build
+> Closing-act: code
+
+**Cluster:** ASVS tooling. **Priority:** P2. **Verdict:** build.
+**Severity:** no engine effect, no PHI axis, no deployment axis (sec. 0), and no verdict moves. The cost is that the record of record accumulates fields nothing reads, written by the writer whose whole job is to keep that record clean.
+
+**What:** `--allow-retirement` requires the payload to DECLARE what it retires, and `apply.py:468` reads that declaration off the cell dict (`c.get(f"retired_{sub}")`). The carry-through at `:183` then writes it **straight back out**, because it emits every key not in `_ORDERED` or `_SUBTABLES` -- and a control declaration is exactly such a key. So a run that retires an anchor leaves `retired_absence = [...]` sitting in the record, where `scorecard.py` has **no reader for it and never will**. THE INSTRUCTION OUTLIVES THE OPERATION IT INSTRUCTED.
+
+**Both halves are individually correct and their intersection is the defect.** The reader is right to require a declaration -- a bare flag would be a blanket bypass, and that guard exists because a truncating repair once cut one cell 15 -> 10 and another 17 -> 1 with the verifier green throughout. The carry-through is right to be permissive -- narrowing it is what caused the 7818991d silent-drop incident, and `_carried`'s docstring rejects a name-keyed fix in terms: *"a name-keyed fix satisfies the symptom and drops the next field anyone adds, which is the defect itself with a longer list."* **ONE DICT CARRIES BOTH CHANNELS, so a control and a data field are indistinguishable by construction rather than by oversight.**
+
+**The fix is a derivation, not a list.** `_control_keys()` returns `tuple(f"retired_{name}" for name in _SUBTABLES)` and the carry loop skips it. A new sub-table brings its own control with it and this code never changes -- which is what the docstring's objection actually demands, and no data key is dropped.
+
+**COMPUTED PER CALL RATHER THAN ONCE, AND THAT IS THE PART A MUTATION RUN FORCED.** The first version was a module constant. A hand-written literal matching today's value **survived every test**, because a snapshot and a derivation are byte-identical in behaviour until someone edits `_SUBTABLES` -- which is the exact moment the rot arrives and the exact moment nothing is watching. A live function can be OBSERVED following a change: the test adds a sub-table and asserts `render` drops the new control too.
+
+**Not the fix, and both were tried:** suppressing every unrecognised key (re-introduces #1242's silent drop -- 23 tests red), or covering only the arm from the incident (leaks the other -- the one-arm fix passes the incident's own case, which is how it would have shipped).
+
+**Interaction with [#1363](#1363), which is unstarted and unclaimed:** that row reorders the key-set guard so a FULL-LIST retirement can reach the retirement logic. This change does **not** move the declaration's location in the payload -- it stays a top-level `retired_{sub}` key -- precisely so #1363's fix needs no adjustment. Whoever takes #1363 should know only that the key is now consumed and not stored.
+
+**Related:** #1307 (the retirement flag itself), #1363 (the ordering defect in the same path), #1242 (the carry-through's silent-drop incident, whose fix this must not undo).
+
+**Source:** routed by the Liaison. Their brief said `apply.py` never reads the field and that it appears only in argparse help; both are wrong -- the reader is built dynamically as `retired_{sub}`, which a literal grep for `retired_absence` cannot see. Their brief also said the ledger had zero mentions of it; #1363's evidence block carries two.
+
+## 1367. The gate-parity failure asks the reader to attribute the drift instead of computing it
+
+> 🔢 **Filed 2026-08-26 -- FIXED IN THIS CHANGE; the status banner is deliberately unchanged**
+> (same handling as #1026, #1361 and #1365). `test_the_installed_gate_matches_the_committed_source`
+> compares the installed gate against THIS CHECKOUT, which is the right question. Its failure text
+> then correctly REFUSES to name a culprit and hands the reader a `git log` to run. Three seats did
+> not run it.
+
+**Cluster:** Tooling / worktree gate. **Priority:** P3. **Verdict:** build (small, test-only).
+**Severity:** a misread of this message left 121 worktrees ungoverned for some minutes.
+
+**The message was already right, and that is the point.** It says, verbatim: *"WORK OUT WHICH COPY IS
+OLDER FIRST. Installing from a checkout older than the installed gate DOWNGRADES a machine-global file
+for every session on this box"*, and *"A re-install would clear any of the three ... but it clears a
+genuine rule difference the same way, so the fact that it worked tells you NOTHING about which one you
+had."* That is exactly the trap that was then fallen into, warned about in advance, in the text being
+looked at. **An instruction that must be followed under time pressure is one that will not be.** The
+defect is that the test asks for an attribution it can compute itself.
+
+**Two premises in the dispatch were wrong, and both were measured rather than argued.**
+
+*"Every seat with an open PR is behind main, so every seat sees this."* Distance is not the predicate:
+
+```
+wtcsartifact    0 behind    7 passed
+builder-1       11 behind   7 passed      <- behind, and PASSES
+gate files changed on main in those 11 commits: 0
+```
+
+**The gate SOURCE has to have moved.** A seat 40 commits behind whose gate files did not move is
+green; a seat 1 behind whose gate file did move is red. The true statement is *"every seat is exposed
+in the window after a gate change lands"*, which is a much smaller claim.
+
+*"2 failed, 22 passed"* is 24 tests and this file has 7 (control: `grep -c '^def test_'` = 7), so that
+reading is from a wider selection and does not describe this file.
+
+**The fix is STRICTLY ADDITIVE. What is compared does not change and the assertion does not move.** A
+computed verdict is added to the failure text, from `origin/main`'s blob of the same path:
+
+| installed | checkout | verdict |
+|---|---|---|
+| == main | != main | YOUR CHECKOUT is the odd one out -- behind, or legitimately changing the gate. **Do not reinstall.** |
+| != main | == main | THE INSTALLED COPY is the odd one out. This is what the test exists for. |
+| != main | != main | Neither matches. Unattributable, and the strongest reading. |
+| main unreadable | | **ATTRIBUTION UNAVAILABLE** -- says so rather than guessing. |
+
+**The two rejected shapes, recorded because rejecting them is most of the work.**
+
+*Comparing against `origin/main` INSTEAD* would go green when the installed copy is **tampered with**,
+so long as it matches main -- strictly worse than the problem being solved -- and would red a pull
+request that is legitimately CHANGING the gate.
+
+*Skipping when the checkout is behind* risks a **false green**, and this file's own negative control
+exists to prevent exactly that: its docstring says folding CRLF out of the comparison was *"precisely
+the edit that could turn a false RED into a false GREEN"*. Spending a guard to quiet a message is the
+trade this project refuses everywhere else.
+
+**Additive attribution cannot produce a false green, because the assertion is untouched.** That is the
+whole argument for this shape.
+
+**The unreadable branch is the one that matters most and is easiest to lose.** A missing fetch, a
+detached ref and a network-less runner all land there. If it degraded into silently picking one of the
+other three, the message would look complete while naming a culprit nothing established -- worse than
+the original, because a computed-looking verdict is trusted more than a request to go and check. It
+has its own test saying so, and a fifth test asserts the four branches are mutually distinct, since
+four branches returning the same text would pass every other assertion in the block.
+
+**Driven against the PURE verdict function with injected hashes**, never by mutating the installed
+gate: that file is machine-global and every PreToolUse hook on this box reads it, so a test may not
+take it out from under a concurrent session. Same reasoning the existing negative control gives.
+
+## 1366. the four connscale fields that discriminate the surviving failure hypotheses never escape the test job
+
+> 🔢 **Filed 2026-08-26 (builder 2) - BUILT IN THIS COMMIT, not yet landed.** Successor in subject to [#1211](#1211-empty_claims_per_msg-is-not-contention-immune-the-ratio-form-excursions-past-its-own-slo-band-on-a-hosted-runner), whose limb one made the RATIO survive a passing run; this makes the readings that EXPLAIN the ratio survive one too.
+> Verdict: build
+> Closing-act: code
+
+**Cluster:** Developer Experience & CI. **Priority:** P2. **Verdict:** build.
+**Severity:** no engine effect, no PHI axis, no deployment axis (sec. 0). The cost is diagnostic: a connscale failure on a hosted runner cannot be attributed from CI alone, so each occurrence burns a full cycle and ends in a re-run rather than a cause.
+
+**What:** `tests/test_connscale_smoke.py` runs inside the `test` job. **That job uploads no artifacts** -- ci.yml's three `upload-artifact` steps are in `load-test` (:2162), `load-test-sqlserver` (:2331) and `windows-service-smoke` (:2521). So every reading on a `ConnScaleRecord` that is not printed dies with the job. #1211 limb one made ONE metric survive, `empty_claims_per_msg`, via `$GITHUB_STEP_SUMMARY`. The fields that say WHICH explanation is right were not part of that scope.
+
+**The four the investigation actually turns on**, measured absent from the emission on `origin/main`:
+
+```
+drain_seconds            0        reload_seconds           0
+fd_probe_ticks           0        fd_probe_degraded_ticks  0
+cpu_util_cores_mean      0
+```
+
+* **drain-tail vs reload-probe separate ONLY on `drain_seconds` against `reload_seconds`.**
+* **contention vs probe-cost separate ONLY on the FD probe's tick counts** -- `fd_probe_degraded_ticks` non-zero means the walk could not measure; zero means it measured cleanly and a wrong reading is a wrong SUBJECT rather than a failed sample. That distinction is what a live investigation into the connscale FD gauge turned on, and it was unavailable from CI.
+
+**THE DESIGN CONSTRAINT THAT DECIDES THE SHAPE, and it is why this is a second renderer rather than a parameter on the first.** Only **two** metrics have a monotonic SLO -- `empty_claims_monotonic` and `fd_count_monotonic`. Every field above has **no band**. `render_readings_markdown` emits `prior` / `band floor` / `margin`, which for a band-less field would be **a threshold computed from whichever reading happened to precede it** -- false precision manufactured by the renderer and indistinguishable, in a job summary, from a measured one. So the table carries no band, no threshold and no verdict column, and says so in its own preamble.
+
+**Emitted from the FIXTURE, before any assertion**, for the same reason #1211's readings are: a field recorded only on failure cannot establish its own normal range. That is the selection bias #1211 exists to fix, one metric family over.
+
+**`None` renders as a dash and never as `0`.** "the probe did not measure" and "the probe measured zero" are different verdicts, and telling them apart is the whole purpose of `fd_probe_degraded_ticks`.
+
+**Not in scope, deliberately:** artifact upload (the step-summary channel already reaches every run and needs no ci.yml change), and any change to the `empty_claims_per_msg` band -- that is #1211 limb two and it stays blocked until samples exist.
+
+**Related:** #1211 (limb one shipped the channel this reuses; limb two blocked), #1101 (the per-message form these annotate), #320 (windows-2025 leg timing, one of the explanations these fields separate).
+
+**Source:** scoped by the Dispatcher, corrected by this lane's scouting -- the original scoping described artifact-upload work already done and a selection bias already fixed by #1211 limb one; what remained was the band-less fields and the constraint above.
+
 ## 1368. the leak-gate detector floor is never checked against the real token list, so it can silently stop meaning anything
 
 > 🔢 **Filed 2026-08-26 (builder 2) - BUILT IN THIS COMMIT, not yet landed.** Implements **SEC-04** from [`16-security-phi-and-supply-chain`](testing/master-test-plan/16-security-phi-and-supply-chain.md), which had no ledger row.

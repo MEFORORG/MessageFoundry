@@ -28,6 +28,7 @@ from collections.abc import Sequence
 
 import pytest
 
+from harness.load.connscale.intake_audit import MOMENT_POST_MORTEM
 from harness.load.connscale.probe import ProbeDegraded
 from harness.load.connscale.profile import load_connscale_profile_text
 from harness.load.connscale.report import ConnScaleRecord, ConnScaleReport
@@ -178,6 +179,44 @@ def _assert_fd_probe(records: Sequence[ConnScaleRecord]) -> None:
     )
 
 
+def _assert_intake_audit(records: Sequence[ConnScaleRecord]) -> None:
+    """Assert the BACKLOG #1292 discriminator on every step, in the order its verdicts matter.
+
+    Four properties, each pinning a different way this could go quietly wrong:
+
+    1. NO step is ``engine_suspect``. This is the finding the item is about: the engine framed an
+       accept-ACK for a message and its own stopped, committed store has no row for it.
+    2. EVERY step's audit is CONCLUSIVE. A PROBE_UNUSABLE result is not a pass -- it means the
+       instrument could not answer, and an instrument that silently stops answering leaves the
+       original unattributable failure in place while looking green.
+    3. EVERY step's sweep read rows (``store_total > 0``) against a step that sent messages. This is
+       the positive control: a set comparison against an empty set is clean for the wrong reason.
+    4. The authoritative audit is the POST-MORTEM one. A live read could be explained away as early
+       sampling; a read of a stopped engine's store cannot, and mislabelling one as the other would
+       destroy the only distinction the second moment exists to make.
+    """
+    for r in records:
+        audit = r.intake_audit
+        assert not audit.engine_suspect, (
+            f"COUNT-AND-LOG INVARIANT -- {r.sweep_mode}@N={r.count}: {audit.summary()}. The engine "
+            f"accept-ACKed those sends and its own stopped, committed store has no messages row for "
+            f"them, so a deploying site would be able to lose an acknowledged message at intake. "
+            f"The sequence numbers above name them; this is reproducible, not statistical."
+        )
+        assert audit.conclusive, (
+            f"INTAKE AUDIT COULD NOT ANSWER -- {r.sweep_mode}@N={r.count}: {audit.summary()}. The "
+            f"discriminator is the whole point of this step's no-loss coverage, so a probe that did "
+            f"not run or could not read is reported as a failure rather than tolerated: tolerating "
+            f"it restores exactly the unattributable red this check exists to replace."
+        )
+        assert audit.moment == MOMENT_POST_MORTEM, audit
+        assert audit.store_total > 0, (
+            f"INTAKE AUDIT POSITIVE CONTROL -- {r.sweep_mode}@N={r.count} sent {r.sent} message(s) "
+            f"and the store sweep read {audit.store_total} row(s): {audit.summary()}. A clean set "
+            f"comparison over an empty read says nothing about intake."
+        )
+
+
 # --- the one expensive run, shared by every property below ----------------------------------------
 
 
@@ -243,20 +282,12 @@ def _record_ratio_readings(report: ConnScaleReport) -> None:
     The tolerance is IMPORTED, not typed in. A second copy of 0.25 here would be a second definition
     of the band, and the emitted floor could then drift away from the one the SLO actually enforces.
     """
-    context = {
-        # What a later reader needs to tell samples apart. #1211's whole question is whether the
-        # ratio moves with runner contention, so the core count is part of the reading, not trivia.
-        "runner_os": os.environ.get("RUNNER_OS", "local"),
-        "cpus": str(os.cpu_count()),
-        "run_id": os.environ.get("GITHUB_RUN_ID", "-"),
-        "sha": os.environ.get("GITHUB_SHA", "-")[:8] or "-",
-    }
     _append_step_summary(
         report.render_readings_markdown(
             "empty_claims_per_msg",
             lambda r: r.empty_claims_per_msg,
             tolerance=_MONOTONIC_TOLERANCE,
-            context=context,
+            context=_run_context(),
         )
     )
     _write_readings_json(
@@ -264,7 +295,7 @@ def _record_ratio_readings(report: ConnScaleReport) -> None:
             "empty_claims_per_msg",
             lambda r: r.empty_claims_per_msg,
             tolerance=_MONOTONIC_TOLERANCE,
-            context=context,
+            context=_run_context(),
         )
     )
 
@@ -290,6 +321,42 @@ def _write_readings_json(payload: dict[str, object]) -> None:
         target.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     except OSError as exc:
         warnings.warn(f"could not write connscale readings JSON: {exc}", stacklevel=2)
+
+
+def _run_context() -> dict[str, str]:
+    """What a later reader needs to tell one run's samples from another's.
+
+    ONE definition, read by BOTH emitters. Two copies would drift, and a reader diffing the two tables
+    a single run produces would then be chasing a difference in the context rather than in the data.
+
+    #1211's question is whether the ratio moves with runner contention, so the core count is part of
+    the reading rather than trivia.
+    """
+    return {
+        "runner_os": os.environ.get("RUNNER_OS", "local"),
+        "cpus": str(os.cpu_count()),
+        "run_id": os.environ.get("GITHUB_RUN_ID", "-"),
+        "sha": os.environ.get("GITHUB_SHA", "-")[:8] or "-",
+    }
+
+
+def _record_diagnostics(report: ConnScaleReport) -> None:
+    """Persist the band-less diagnostic fields this run produced (BACKLOG #1366).
+
+    THE RATIO SAYS THAT SOMETHING MOVED; THESE SAY WHICH. Without them a connscale failure is
+    permanently undiagnosable from CI alone -- drain-tail and reload-probe separate ONLY on
+    `drain_seconds` against `reload_seconds`, and contention separates from probe-cost ONLY on the FD
+    probe's tick counts. Those readings existed on every record already and never left the `test` job,
+    which uploads no artifacts.
+
+    Emitted from the FIXTURE for the same reason #1211's readings are: it runs before any assertion, so
+    a passing run is recorded as fully as a failing one. A field that appears only on failure cannot
+    establish what its normal range is, which is the defect #1211 exists to fix one metric over.
+
+    NO BAND AND NO VERDICT -- see `render_diagnostics_markdown`. None of these has an SLO, so any
+    threshold printed beside them would be manufactured by the renderer.
+    """
+    _append_step_summary(report.render_diagnostics_markdown(context=_run_context()))
 
 
 @pytest.fixture(scope="module")
@@ -337,6 +404,7 @@ async def smoke_report() -> ConnScaleReport:
     )
     # In the FIXTURE, so the readings are recorded before any assertion can fail the module.
     _record_ratio_readings(report)
+    _record_diagnostics(report)
     return report
 
 
@@ -376,6 +444,19 @@ def test_no_loss_reconciles_at_every_step(smoke_report: ConnScaleReport) -> None
     for r in smoke_report.records:
         assert r.sent > 0, r
         assert r.no_loss.ok, (r.sweep_mode, r.count, r.no_loss.detail)
+
+
+def test_no_accept_acked_message_is_absent_from_the_stopped_engines_store(
+    smoke_report: ConnScaleReport,
+) -> None:
+    """BACKLOG #1292 -- the PER-MESSAGE intake audit, asserted INDEPENDENTLY of the count check above.
+
+    Strictly ADDITIONAL, not a restatement: the count check compares totals and forgives an
+    unconfirmed send, so a message the engine ACCEPT-ACKed and then has no row for passes it whenever
+    that message also happened to be excused as a timeout. This asserts the thing the count check
+    cannot: that no accept-ACKed message is absent from the engine's own committed store.
+    """
+    _assert_intake_audit(smoke_report.records)
 
 
 def test_the_fd_and_empty_claim_curves_are_monotonic_in_n(smoke_report: ConnScaleReport) -> None:

@@ -392,17 +392,40 @@ function Resolve-ShellIndirection([string]$Token, [string]$Prefix) {
 function Get-GitTargetCandidatesRaw([string]$Line, [string]$Prefix, [string]$CwdRaw) {
     $out = @()
 
+    # THE `cd` PREFIX IS COMPUTED FOR BOTH BRANCHES, NOT ONLY THE ELSE (BACKLOG #1085). It used to sit
+    # inside the else, so a `-C` value was PREFERRED and the `cd` DISCARDED -- but a real shell resolves a
+    # RELATIVE `-C` against the post-`cd` directory, not against the session cwd. From a governed primary,
+    #     cd ../Unrelated && git -C . config core.hooksPath /dev/null
+    # therefore DENIED and named the primary, while the write landed in the ungoverned ../Unrelated. A deny
+    # that names a repository the command does not touch actively misinforms the session reading it.
+    #
+    # THE FIX IS COMPOSITION, NOT PREFERENCE. The two are not alternatives: `cd` sets the base and a
+    # relative `-C` is resolved against it. An ABSOLUTE `-C` ignores the base, which is why the join below
+    # is guarded on IsPathRooted rather than applied unconditionally.
+    #
+    # The bail-outs are unchanged and still guard both branches: `popd` and `cd -` restore an unknown
+    # directory, and `(`/`{` mean a subshell whose `cd` does not affect the parent -- in all three the
+    # prefix cannot be composed and $cd stays null, which falls back to exactly the old behaviour.
+    $cd = $null
+    if ($Prefix -notmatch '(?:^|\s)(?:popd|cd\s+-(?:\s|$))' -and $Prefix -notmatch '[({]') {
+        $cds = [regex]::Matches($Prefix, '(?:^|\s)(?:cd|pushd)\s+"?([^"&|;]+?)"?\s*(?:&&|;|\||$)')
+        if ($cds.Count -eq 1) { $cd = $cds[0].Groups[1].Value.Trim() }
+    }
+
     # git's global `-C <path>`, read CASE-SENSITIVELY. `-match` is case-INsensitive in PowerShell, so
     # git's lowercase `-c name=value` config override was captured as if it were a path -- and being the
     # first match it also shadowed a real `-C` later in the same command.
     if ($Line -cmatch '(?:^|\s)-C\s+"?([^"\s]+)"?') {
-        $out += $Matches[1]
-    } else {
-        $cd = $null
-        if ($Prefix -notmatch '(?:^|\s)(?:popd|cd\s+-(?:\s|$))' -and $Prefix -notmatch '[({]') {
-            $cds = [regex]::Matches($Prefix, '(?:^|\s)(?:cd|pushd)\s+"?([^"&|;]+?)"?\s*(?:&&|;|\||$)')
-            if ($cds.Count -eq 1) { $cd = $cds[0].Groups[1].Value.Trim() }
+        $dashC = $Matches[1]
+        if ($cd -and -not [System.IO.Path]::IsPathRooted($dashC)) {
+            # Join, never replace. The result stays RAW and possibly relative (`../Unrelated/.`); the
+            # caller roots it with Get-FullPathRaw against the session cwd, which is the same base the
+            # shell would use for the `cd` itself, so a relative `cd` composes correctly too.
+            $out += (Join-Path $cd $dashC)
+        } else {
+            $out += $dashC
         }
+    } else {
         $out += $(if ($cd) { $cd } else { $CwdRaw })
     }
 
@@ -531,7 +554,31 @@ function Remove-QuotedSpans([string]$s, [bool]$PosixEscapes = $false) {
             # main denies, so it was reverted. Do NOT re-add the lowercase emit without that
             # discriminator, and do not add the discriminator without re-measuring those two.
             $span = $s.Substring($openAt + 1, $i - $openAt - 1)
-            if ($span -cmatch '[\\/](git(?:\.exe)?)$') {
+            # BACKLOG #1069: A QUOTED SPAN HOLDING ONE BARE WORD IS UNMASKED, because quoting an argument
+            # is ORDINARY and blanking it erased the disarm key before rule 3c ever ran. Measured on the
+            # shipped gate, all ALLOW where the unquoted spelling DENIES:
+            #     git -c "core.hooksPath=/dev/null" commit -m x
+            #     git config 'core.hooksPath' '/dev/null'
+            #     git config --add "core.hooksPath" /dev/null
+            #
+            # WHY NOT MATCH THE RAW TEXT INSTEAD: a commit message quoting the rule's own name would then
+            # refuse, and this workstream writes such messages constantly. The discriminator is WHITESPACE
+            # -- prose has it and stays masked; a config key does not and becomes visible.
+            #
+            # DELIBERATELY NOT LENGTH-PRESERVING, against this item's own prose. That rationale is "the same
+            # offsets read paths back out of the raw text afterwards", and NO RULE DOES THAT: every path
+            # site re-runs [regex]::Match($seg.Raw, ...) and computes offsets inside Raw from scratch.
+            # Length-preserving masking would change what every other rule sees for zero benefit, and
+            # widening scope is exactly how the earlier attempt at this item acquired five new fail-opens.
+            #
+            # ONE SPELLING STAYS OPEN BY DESIGN: a quoted MULTI-WORD value such as
+            # -c 'alias.ci=commit --no-verify'. Its value contains a space, so quoting is its only writable
+            # spelling and this carve-out cannot reach it without re-admitting the prose false-deny. Pinned
+            # as an ALLOW test so a later change cannot close it silently or claim it was never there.
+            if ($span.Length -gt 0 -and $span -cnotmatch '[\s''"$(){};&|`]') {
+                [void]$out.Append($span)
+            }
+            elseif ($span -cmatch '[\\/](git(?:\.exe)?)$') {
                 [void]$out.Append($Matches[1])
             }
             else {
@@ -1394,13 +1441,54 @@ What to do instead:
         }
         if (-not $govCfg) { continue }
 
+        # BACKLOG #1082: SAY WHAT IS TRUE OF THE SCOPE ACTUALLY BEING WRITTEN. A --global or --system
+        # write does NOT land in this repository's config -- it lands in the per-user or machine-wide
+        # file -- so the sentence below was false for those scopes. THE VERDICT DOES NOT MOVE: git
+        # falls back to those scopes when the repository does not set the key, so the write can still
+        # disarm this checkout by inheritance, and whether it does is NOT knowable from the command.
+        #
+        # Measured 2026-08-27 and it depends on WHERE YOU READ FROM, which the row does not say:
+        #   from a worktree   core.hooksPath IS set at worktree scope (75 of 76 config.worktree files)
+        #                     -> a --global write of that key loses to the more specific scope
+        #   from the primary  UNSET at every scope (exit 1; control core.bare exit 0)
+        #                     -> a --global write of that key WOULD take effect
+        # Denying is the correct conservative default for both.
+        #
+        # NOTHING HERE MAY REASSURE. A round-4 candidate printed "This does NOT change the shared
+        # configuration" and three verifiers graded it BLOCKING: segments are judged one at a time and
+        # Write-Deny exits on the first hit, so on a multi-line command whose LATER segment does a
+        # local write, that sentence would print over a real disarm.
+        $scopeFlag = if ($seg.Scan -cmatch '(?:^|\s)--(?<sc>global|system)(?:\s|$)') { $Matches['sc'] } else { $null }
+        $opening = if ($scopeFlag) {
+            "BLOCKED: '$badKey' is on the disarm list, and --$scopeFlag writes your " +
+            $(if ($scopeFlag -eq 'global') { 'per-user' } else { 'machine-wide' }) +
+            " git configuration rather than this repository's.`n`nGit falls back to that scope when " +
+            "$($govCfg.Display) does not set the key itself, so the write can still disarm this " +
+            "checkout's hooks. Which case applies is not knowable from the command alone, so it is refused."
+        }
+        else {
+            "BLOCKED: setting '$badKey' would change the SHARED git configuration of $($govCfg.Display)."
+        }
+        # The mechanism paragraph is scope-aware for the same reason the opening is: the shared-.git
+        # sentence is TRUE of a repository-scope write and FALSE of --global/--system.
+        $mechanism = if ($scopeFlag) {
+            "This is refused on the REACH, not on where the file lands: a key inherited from the " +
+            "$(if ($scopeFlag -eq 'global') { 'per-user' } else { 'machine-wide' }) scope applies to " +
+            "every repository on this machine that does not override it, including every worktree of " +
+            "$($govCfg.Display)."
+        }
+        else {
+            "Every worktree of this repository shares one .git directory, so this is not a local " +
+            "change: it takes effect for all of them at once."
+        }
         Write-Deny -Rule "3c" -Detail "git config $badKey" -Reason @"
-BLOCKED: setting '$badKey' would change the SHARED git configuration of $($govCfg.Display).
+$opening
 
-Every worktree of this repository shares one .git directory, so this is not a local change: it takes
-effect for all of them at once. Repointing core.hooksPath (or aliasing a command, or redirecting
-core.worktree) disables the commit-time ledger, claim and secret-leak gates for every session on this
-machine, and nothing would report that they had stopped running.
+$mechanism
+
+Repointing core.hooksPath (or aliasing a command, or redirecting core.worktree) disables the
+commit-time ledger, claim and secret-leak gates, and nothing would report that they had stopped
+running.
 
 What to do instead:
   * If a commit hook is failing, FIX THE CAUSE -- the hook output names it. Never route around a gate;
@@ -1535,9 +1623,13 @@ What to do instead:
         #     `C:\git` directory is ordinary on a developer's box, so this is the most reachable of
         #     the set.
         #   * A FAILED `cd`, and a SUBSHELL prefix `( cd x && git ... )`.
-        #   * COMPOSE vs PREFER: the resolver PREFERS `-C` and discards a `cd` prefix, where a shell
-        #     COMPOSES them and resolves a relative `-C` against the post-`cd` directory. That is
-        #     BACKLOG #1085.
+        #   * COMPOSE vs PREFER -- FIXED 2026-08-26 (BACKLOG #1085), and listed here rather than
+        #     deleted so this inventory is not read as still complete. The resolver used to PREFER
+        #     `-C` and discard a `cd` prefix; it now COMPOSES them, joining a RELATIVE `-C` onto the
+        #     `cd` target and leaving an ABSOLUTE one alone. The fix is in the resolver, which is
+        #     where this note said it belonged. The three bail-outs (`popd`, `cd -`, a subshell
+        #     prefix) now guard both branches, so the FAILED-`cd` and SUBSHELL entries above are
+        #     unchanged by it.
         #   * THE PRE-SPLITTER ONE LINE ABOVE, `-split '(?:&&|\|\||;|\|)'`, is NOT quote-aware. A
         #     quoted victim path containing `;` or `&&` is truncated before the quote-aware scan ever
         #     runs, so the awareness gained above does not extend to that character class.

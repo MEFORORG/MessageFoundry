@@ -7,6 +7,13 @@ A curve-shaped report (vs the throughput-shaped :class:`~harness.load.report.Run
 reconcile, plus an SLO verdict. **Metrics + metadata only** — never message bodies or control-id lists
 (PHI rule). Pure + deterministic, so it unit-tests without a live run.
 
+That rule is why the BACKLOG #1292 intake audit reports **sequence numbers**, not the control ids it
+actually matched on: a seq is a dense integer minted by the harness's own counter and meaningless
+outside the run, so it identifies the message for a follow-up without putting a list of message
+identifiers into a shared artifact. The control ids are emitted NOWHERE -- not here and not to the
+log; the previous wording sent readers to a log line that never carried them, and invited a
+maintainer to make the sentence true by logging exactly what this rule exists to keep out.
+
 The thundering-herd measurement is reported **explicitly and separated** (critic must-change #3): the
 ``fixed_aggregate`` sweep (constant R across N) IS the herd measurement, so the report carries the
 ``empty_claims_wake_fanout``-per-second slope vs N AS the wake-fanout cost, kept DISTINCT from the
@@ -22,6 +29,13 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
 from harness._spreadsheet import SPREADSHEET_FORMULA_TRIGGERS, spreadsheet_safe
+from harness.load.connscale.intake_audit import (
+    MOMENT_LIVE,
+    VERDICT_INTAKE_COMPLETE,
+    VERDICT_NOT_RUN,
+    IntakeAudit,
+    not_run,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -164,6 +178,19 @@ class ConnScaleRecord:
     fd_probe_ticks: int = 0
     fd_probe_degraded_ticks: int = 0
     fd_probe_degraded: tuple[str, ...] = ()
+    # --- BACKLOG #1292: the intake audit, the PER-MESSAGE discriminator for a no_loss shortfall ---
+    # `no_loss` compares COUNTS, and a shortfall in it reads identically whether the engine lost an
+    # acknowledged message or the `engine_read` gauge was short. These carry the per-message verdict
+    # that separates the two. `intake_audit` is the POST-MORTEM one (taken against the stopped,
+    # committed store, so sampling timing cannot explain it) and is the authoritative field;
+    # `intake_audit_live` is the one taken while the engine was still up, and runs only on a
+    # shortfall -- the DELTA between them is what says sample-lag vs sum-coverage. Both default to a
+    # NOT_RUN verdict so an older artifact / a record built without the audit deserializes unchanged
+    # and never reads as a clean pass it did not earn.
+    intake_audit: IntakeAudit = field(default_factory=lambda: not_run("audit not wired"))
+    intake_audit_live: IntakeAudit = field(
+        default_factory=lambda: not_run("audit not wired", moment=MOMENT_LIVE)
+    )
 
     def to_json_dict(self) -> dict[str, object]:
         return {
@@ -236,6 +263,12 @@ class ConnScaleRecord:
                     "degraded_ticks": self.fd_probe_degraded_ticks,
                     "degraded": list(self.fd_probe_degraded),
                 },
+            },
+            # BACKLOG #1292. Sequence numbers and MSA-1 codes only -- never control ids, per the
+            # module docstring's metadata-only rule.
+            "intake_audit": {
+                "post_mortem": self.intake_audit.to_json_dict(),
+                "live": self.intake_audit_live.to_json_dict(),
             },
             "wall5_reload": {"seconds": self.reload_seconds},
             "wall6_ack_ms": {
@@ -326,6 +359,61 @@ def monotonic_pairs(
                 )
             prev_val = v
     return pairs
+
+
+@dataclass(frozen=True)
+class DiagnosticField:
+    """One reading emitted for DIAGNOSIS, with no band and therefore no verdict.
+
+    Deliberately separate from :class:`MonotonicPair`. A pair carries `prior`, `threshold` and an `ok`
+    flag because its metric HAS an SLO band; these fields do not. Rendering a floor for a band-less
+    field would print a threshold computed from an adjacent reading -- a number that looks measured and
+    is manufactured by the renderer. Two shapes, because there are two kinds of reading.
+    """
+
+    label: str
+    read: Callable[[ConnScaleRecord], object]
+    #: Why this field is here -- which competing explanation it separates. Emitted in the table's
+    #: preamble so a reader meeting it in a job summary knows what it is FOR, not just what it is.
+    discriminates: str
+
+
+#: The band-less readings emitted on every run (BACKLOG #1366).
+#:
+#: THESE ARE EXACTLY THE FIELDS THAT SEPARATE THE SURVIVING EXPLANATIONS for a connscale failure, which
+#: is why the set is small and named rather than "everything on the record". Without them a failure is
+#: permanently undiagnosable: the ratio says THAT something moved, and nothing says WHICH.
+#:
+#: Single definition -- the emitter and its tests both read this tuple, so a field added here is
+#: covered without editing a second list.
+DIAGNOSTIC_FIELDS: tuple[DiagnosticField, ...] = (
+    DiagnosticField(
+        "drain_seconds",
+        lambda r: r.drain_seconds,
+        "drain-tail vs reload-probe: these two separate ONLY on drain_seconds against reload_seconds",
+    ),
+    DiagnosticField(
+        "reload_seconds",
+        lambda r: r.reload_seconds,
+        "the other half of that pair; None means the reload probe did not measure this step",
+    ),
+    DiagnosticField(
+        "fd_probe_ticks",
+        lambda r: r.fd_probe_ticks,
+        "how many intervals the FD walk actually sampled -- a low count is a coarse gauge, not a fault",
+    ),
+    DiagnosticField(
+        "fd_probe_degraded_ticks",
+        lambda r: r.fd_probe_degraded_ticks,
+        "contention vs probe-cost: NON-ZERO means the walk could not measure, ZERO means it measured "
+        "cleanly and any wrong reading is a wrong SUBJECT rather than a failed sample",
+    ),
+    DiagnosticField(
+        "cpu_util_cores_mean",
+        lambda r: r.cpu_util_cores_mean,
+        "how loaded the box was across the hold, which is the input every contention story needs",
+    ),
+)
 
 
 @dataclass(frozen=True)
@@ -524,6 +612,79 @@ class ConnScaleReport:
             "readings": readings,
         }
 
+    def render_diagnostics_markdown(
+        self,
+        fields: tuple[DiagnosticField, ...] = DIAGNOSTIC_FIELDS,
+        *,
+        context: dict[str, str] | None = None,
+        max_rows: int = _MAX_SUMMARY_ROWS,
+    ) -> str:
+        """The band-less diagnostic table, emitted on every run (BACKLOG #1366).
+
+        NOT a variant of :meth:`render_readings_markdown`, and the separation is the point. That one
+        renders `prior`, `band floor` and `margin` because its metric has an SLO band. ONLY
+        ``empty_claims_monotonic`` and ``fd_count_monotonic`` have one; every field here has none, so
+        those columns would be a floor computed from whichever reading happened to precede it --
+        false precision manufactured by the renderer rather than measured by anything.
+
+        So this table carries NO verdict column and NO threshold. It says what was observed and what
+        each field is FOR, and leaves the judgement to a reader who has the competing explanations in
+        front of them.
+
+        Pure: returns text, writes nothing. Row count capped for the same reason as the banded table --
+        an oversized ``$GITHUB_STEP_SUMMARY`` write is dropped in full rather than trimmed.
+        """
+        head = ["### connscale diagnostics (no band, no verdict)"]
+        ctx = {
+            "profile": self.profile,
+            "db_backend": self.db_backend or "sqlite",
+            **(context or {}),
+        }
+        head.append("")
+        head.append(" | ".join(f"{k}: {v}" for k, v in ctx.items()))
+        head.append("")
+        head.append(
+            "Recorded on every run, pass or fail. **None of these has an SLO band**, so there is no "
+            "threshold here and nothing below is a verdict -- they are the readings that separate "
+            "competing explanations for a failure (BACKLOG #1366)."
+        )
+        head.append("")
+        for f in fields:
+            head.append(f"- `{f.label}` -- {f.discriminates}")
+        head.append("")
+
+        if not self.records:
+            head.append("No record was produced by this run.")
+            return "\n".join(head) + "\n"
+
+        head.append("| lane | N | " + " | ".join(f.label for f in fields) + " |")
+        head.append("|---|---|" + "---|" * len(fields))
+
+        rows: list[str] = []
+        dropped = 0
+        for r in sorted(self.records, key=lambda r: (r.sweep_mode, r.claim_mode, r.count)):
+            if len(rows) >= max_rows:
+                dropped += 1
+                continue
+            cells = []
+            for f in fields:
+                v = f.read(r)
+                # `None` renders as an explicit dash, NEVER as 0. "the probe did not measure" and
+                # "the probe measured zero" are different verdicts and the whole point of these
+                # fields is telling them apart.
+                cells.append("-" if v is None else (f"{v:.4g}" if isinstance(v, float) else str(v)))
+            rows.append(
+                f"| {lane_label(r.sweep_mode, r.claim_mode)} | {r.count} | "
+                + " | ".join(cells)
+                + " |"
+            )
+
+        out = head + rows
+        if dropped:
+            out.append("")
+            out.append(f"{dropped} further row(s) not shown: capped at {max_rows}.")
+        return "\n".join(out) + "\n"
+
     def to_csv(self) -> str:
         """One row per (sweep_mode, N) step — for spreadsheet curve plotting."""
         buf = io.StringIO()
@@ -624,6 +785,15 @@ class ConnScaleReport:
                     f"fd probe: {r.sweep_mode}@N={r.count} -- {r.fd_probe_degraded_ticks} of "
                     f"{r.fd_probe_ticks} tick(s) measured nothing [{causes}]"
                 )
+        # BACKLOG #1292: the per-message attribution, printed whenever it says anything beyond "clean".
+        # A `no_loss` shortfall renders as a bare count in the table above, which is exactly the
+        # unattributable failure this exists to replace -- so the verdict goes on the console beside
+        # it, not only in the JSON artifact.
+        for r in self.records:
+            for audit in (r.intake_audit_live, r.intake_audit):
+                if audit.verdict in (VERDICT_INTAKE_COMPLETE, VERDICT_NOT_RUN):
+                    continue
+                lines.append(f"{r.sweep_mode}@N={r.count} -- {audit.summary()}")
         lines.append("")
         lines.append("SLOs:")
         if not self.slos:
