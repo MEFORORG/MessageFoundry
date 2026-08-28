@@ -1232,6 +1232,58 @@ def test_a_work_tree_flag_does_NOT_promote_and_that_distinction_is_measured(
     assert "setting 'core.hooksPath'" in reason
 
 
+def test_a_repository_token_inside_a_QUOTED_VALUE_is_not_this_command_s_target(
+    repo: SimpleNamespace, unrelated: Path
+) -> None:
+    """The promotion is gated on the OWNING invocation, read off the BLANKED scan string.
+
+    Reading it off the RAW line opened a hole in one direction and closed work in the other, from one
+    cause. Here the alias VALUE mentions an ungoverned ``--git-dir``; the write itself sets ``alias.zz``
+    in the governed repo the session is standing in. A raw read let the ungoverned mention win the
+    candidate chain and ALLOWED a real disarm.
+    """
+    command = f'git config alias.zz "log --git-dir={unrelated}/.git"'
+    reason = assert_denied(run_gate(shell(command, cwd=repo.wt), repo.repos))
+    assert "setting 'alias.zz'" in reason
+
+    # The environment-variable spelling of the same decoy, which a fix for the flag alone would miss.
+    env_decoy = f'git config alias.zz "!env GIT_DIR={unrelated}/.git git log"'
+    assert_denied(run_gate(shell(env_decoy, cwd=repo.wt), repo.repos))
+
+
+def test_a_governed_path_merely_MENTIONED_does_not_earn_a_refusal(
+    repo: SimpleNamespace, unrelated: Path
+) -> None:
+    """The same cause through the other door, and the reason this is a separate row.
+
+    The write lands in an ungoverned repository; a governed path appears only in a trailing comment.
+    Refusing it names a repository the command never touches -- the BACKLOG #1085 shape -- and a suite
+    that pinned only the hole above would pass against a rule that simply denied every line carrying
+    the characters ``--git-dir``.
+    """
+    command = f'git config core.hooksPath /dev/null # --git-dir="{repo.primary}/.git"'
+    assert run_gate(shell(command, cwd=unrelated), repo.repos) is None
+
+    in_message = (
+        f'git commit --allow-empty -m "see --git-dir={repo.primary}/.git"'
+        " && git config core.hooksPath /nope"
+    )
+    assert run_gate(shell(in_message, cwd=unrelated), repo.repos) is None
+
+
+def test_GIT_DIR_does_not_reach_rules_3_and_3d(repo: SimpleNamespace) -> None:
+    """The opt-in really is opt-in, asserted rather than claimed.
+
+    ``GIT_DIR`` is enumerated for rule 3c only. An earlier version appended it to the candidate list
+    for every caller, reasoning it sat behind the base where it could not win -- but rules 3 and 3d
+    walk the WHOLE list, so it won, and ``GIT_DIR=<governed> git clean -fd`` flipped from ALLOW to
+    DENY. A switch whose off-state is not byte-identical to the previous behaviour is not opt-in.
+    """
+    for verb in ("clean -fd", "reset --hard"):
+        command = f'GIT_DIR="{repo.primary}/.git" git {verb}'
+        assert run_gate(shell(command, cwd=repo.other), repo.repos) is None, verb
+
+
 def test_the_ordering_switch_did_not_leak_into_rules_3_and_3d(
     repo: SimpleNamespace, unrelated: Path
 ) -> None:

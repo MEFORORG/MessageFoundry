@@ -513,9 +513,12 @@ function Get-GitTargetCandidatesRaw([string]$Line, [string]$Prefix, [string]$Cwd
         if ($emitBase) { $out += $(if ($cd) { $cd } else { $CwdRaw }) }
         $out += $explicit
     } else {
+        # $promoted IS NOT EMITTED AT ALL HERE, and that is the correction. Appending it "behind the
+        # base, where it cannot win" was wrong: rules 3 and 3d walk the whole list, so GIT_DIR reached
+        # callers that never opted in and turned `GIT_DIR=<governed> git clean -fd` from ALLOW into
+        # DENY. Byte-identical to the pre-change list is the only safe meaning of opt-in.
         if ($emitBase) { $out += $(if ($cd) { $cd } else { $CwdRaw }) }
         $out += $explicit
-        $out += $promoted
     }
     $out | Where-Object { $_ }
 }
@@ -1539,6 +1542,33 @@ if ($tool -in @("Bash", "PowerShell")) {
         # is a config override and not a path, and reading it as one is how a real `-C` got shadowed once.
         $ownDashC = ($ownWin -cmatch '(?:^|\s)-C\s')
 
+        # DOES THE DISARMING INVOCATION CARRY ITS OWN REPOSITORY TOKEN? Same question -AllTargets asks
+        # about `-C`, and it has to be asked for the same reason: a `--git-dir` that is not this
+        # command's is not this command's target.
+        #
+        # THE WINDOW STARTS AT THE SEPARATOR, NOT AT THE git TOKEN, because an environment assignment
+        # PRECEDES the command: `GIT_DIR=<x> git config ...` puts the token BEFORE `git`, where $ownWin
+        # cannot see it. So this window is [after the last separator at or before the owning git token,
+        # the disarm) and it therefore covers both spellings.
+        #
+        # READ OFF $seg.Scan, WHICH IS WHAT MAKES IT CORRECT. Quoted spans are blanked there, so a
+        # --git-dir inside an alias VALUE or a commit MESSAGE is not in the window at all. Reading the
+        # RAW line instead is exactly the defect this replaces: it opened two holes
+        # (`git config alias.zz "log --git-dir=<ungoverned>"` ALLOWED while the write landed in the
+        # governed repo) and three false denies (a governed path merely MENTIONED in a comment, a
+        # message, or an alias body). Both directions from one cause, which is the tell.
+        $ownStart = 0
+        if ($own) {
+            $sepBefore = [regex]::Matches($seg.Scan.Substring(0, $own.Index), '[;&|(){}]')
+            if ($sepBefore.Count -gt 0) {
+                $last = $sepBefore[$sepBefore.Count - 1]
+                $ownStart = $last.Index + $last.Length
+            }
+        }
+        if ($ownStart -gt $dis.Index) { $ownStart = $dis.Index }
+        $ownCmdWin = $seg.Scan.Substring($ownStart, $dis.Index - $ownStart)
+        $ownGitDir = ($ownCmdWin -match '(?:^|\s)(--git-dir[=\s]|GIT_DIR=)')
+
         # THE CHDIR GUARD, AND ITS POSITION BOUND IS THE LOAD-BEARING HALF. $pfx is sliced at the FIRST git
         # token, so the resolver's own `cd` composer cannot see a chdir that appears AFTER it. Without this
         # guard `git commit -C HEAD && cd <ungoverned> && git config <key> v` denied and NAMED THE GOVERNED
@@ -1585,7 +1615,7 @@ if ($tool -in @("Bash", "PowerShell")) {
         # token must not end the question. The residual is stated rather than hidden: two `-C` tokens
         # inside one owning span are decided by whichever ANSWERS first, so a governed one can still win
         # over an ungoverned one. That errs CLOSED and is narrower than before this change.
-        $where = @(Get-GitTargetCandidatesRaw $seg.Raw $pfx $cwdRaw -AllTargets:$ownDashC -BaseFallback:$fallbackOk -ExplicitFirst)
+        $where = @(Get-GitTargetCandidatesRaw $seg.Raw $pfx $cwdRaw -AllTargets:$ownDashC -BaseFallback:$fallbackOk -ExplicitFirst:$ownGitDir)
         if ($where.Count -eq 0) { continue }
 
         # ROOT THE TARGET AGAINST THE SESSION CWD BEFORE ASKING GIT ANYTHING (BACKLOG #1061). This block
