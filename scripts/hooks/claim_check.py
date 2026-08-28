@@ -139,6 +139,28 @@ def _touches_code(paths: list[str]) -> bool:
 
 
 def _claims_dir() -> Path:
+    """Where the claim records live.
+
+    THE READER AND THE WRITER LIVE IN DIFFERENT REPOSITORIES, AND THIS RESOLVED ONLY THE READER'S
+    (BACKLOG #1346). ``claim.ps1`` is anchored on its own script location, so it always writes to the
+    ENGINE's registry however it is invoked -- running it from a vault worktree REFRESHES the engine
+    record rather than creating a vault one. This hook resolved from the COMMITTING repository's common
+    dir instead, so in any other checkout it read a directory that does not exist, and every
+    code-touching commit whose subject cited an item was refused as unclaimed WITH NO SPELLING THAT
+    COULD EVER SATISFY IT.
+
+    Measured 2026-08-28: the vault carries ``mefor-coord/{alloc,mail,test-slots}`` and no ``claims/``,
+    while the engine's holds 25 records, and the vault's ``commit-msg`` hook does exec this file -- so
+    the gate is wired there and unsatisfiable.
+
+    ONE REGISTRY SERVING BOTH REPOSITORIES IS THE CORRECT SHAPE, NOT A WORKAROUND. A BACKLOG number is
+    an ENGINE ledger number; two registries would let one item be claimed twice, in two places, with
+    neither able to see the other -- the duplicate work this gate exists to stop, reintroduced one
+    level up.
+    """
+    configured = _git("config", "--get", "mefor.claimsDir").strip()
+    if configured:
+        return Path(configured)
     common = _git("rev-parse", "--path-format=absolute", "--git-common-dir").strip()
     return Path(common) / "mefor-coord" / "claims"
 
@@ -211,6 +233,28 @@ def main() -> int:
 
     sys.stderr.write("\nMessageFoundry claim gate\n\n")
     sys.stderr.write("\n\n".join(problems))
+
+    # AND SAY WHY CLAIMING WILL NEVER HELP, WHERE THAT IS TRUE (BACKLOG #1346). APPENDED, NOT
+    # SUBSTITUTED: an absent registry and an unclaimed item are NOT distinguishable from here. A
+    # fresh engine checkout that has simply never had a claim written also has no directory, and
+    # there "NOT CLAIMED, run claim.ps1" is exactly right. The obvious discriminator does not work
+    # either -- "does this repo carry claim.ps1" is true of the vault too, which carries its own copy.
+    #
+    # So the committer always gets the familiar advice, and gets one extra line only when the
+    # directory is missing. In the engine that line is noise it can ignore once; in a repository
+    # claim.ps1 does not write to, it is the only thing that explains an otherwise unanswerable
+    # refusal -- and an unanswerable refusal is what gets a gate overridden reflexively.
+    registry = _claims_dir()
+    if not registry.is_dir():
+        sys.stderr.write(
+            f"  The claim REGISTRY does not exist here, so claiming from this repository will not\n"
+            f"  satisfy this gate.\n"
+            f"      looked in: {_safe_for_message(str(registry))}\n"
+            f"      claim.ps1 is anchored on its own location and records against the ENGINE checkout,\n"
+            f"      so this repository may not be the one it writes to. A BACKLOG number is an engine\n"
+            f"      ledger number, so ONE registry should serve both:\n"
+            f"          git config mefor.claimsDir <engine-checkout>/.git/mefor-coord/claims\n\n"
+        )
     sys.stderr.write(
         "\n\n  See who is building what:  pwsh -NoProfile -File scripts\\coord\\claim.ps1 -List\n"
         "  This fires only on a code-touching commit whose SUBJECT says 'BACKLOG #N'.\n"

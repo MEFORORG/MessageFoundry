@@ -258,3 +258,130 @@ def test_the_live_tree_really_contains_files_this_guard_changes() -> None:
         f"only {len(reclassified)} file(s) sit under a documentation prefix with an executable or "
         "config extension; this guard was measured against 30"
     )
+
+
+# ------------------------------------- BACKLOG #1346: the registry the writer writes, not the reader's
+
+
+def _second_repo(tmp_path: Path) -> Path:
+    """A repository that is NOT the one claim.ps1 writes to -- the vault's shape, in miniature."""
+    r = tmp_path / "other"
+    r.mkdir()
+    _git(r, "init", "-q", "-b", "main")
+    _git(r, "config", "user.email", "t@example.com")
+    _git(r, "config", "user.name", "t")
+    (r / "seed.txt").write_text("s\n", encoding="utf-8")
+    _git(r, "add", "-A")
+    _git(r, "commit", "-q", "-m", "seed")
+    (r / "code.py").write_text("x = 1\n", encoding="utf-8")
+    return r
+
+
+def test_a_repo_with_NO_registry_is_told_WHY_claiming_will_not_help(
+    tmp_path: Path, repo: Path
+) -> None:
+    """BACKLOG #1346. THE ITEM.
+
+    ``claim.ps1`` is anchored on its own location, so it always records against the ENGINE checkout.
+    This hook resolved from the COMMITTING repository, so anywhere else it read a directory that does
+    not exist and refused every code-touching commit citing an item -- with no spelling that could ever
+    satisfy it. Measured on the live vault: ``mefor-coord/`` present with alloc, mail and test-slots,
+    ``claims/`` absent, and its ``commit-msg`` hook does exec this file.
+
+    The refusal must still happen. What must change is that it becomes ANSWERABLE.
+    """
+    other = _second_repo(tmp_path)
+    _git(other, "add", "code.py")
+    r = _run(other, "feat(x): build it (BACKLOG #42)")
+    assert r.returncode == 1
+    assert "The claim REGISTRY does not exist here" in r.stderr
+    assert "mefor.claimsDir" in r.stderr, "the remedy must name the knob that fixes it"
+
+
+def test_the_registry_note_is_APPENDED_not_substituted(tmp_path: Path, repo: Path) -> None:
+    """The familiar advice must survive. An absent registry and an unclaimed item are NOT
+    distinguishable from inside this hook -- a fresh engine checkout that has simply never had a claim
+    written also has no directory, and there ``NOT CLAIMED, run claim.ps1`` is exactly right.
+
+    A first version of this fix BRANCHED instead, replacing the message, and the existing
+    ``test_unclaimed_item_with_code_is_blocked`` caught it. That test was right and this row records why.
+    """
+    other = _second_repo(tmp_path)
+    _git(other, "add", "code.py")
+    r = _run(other, "feat(x): build it (BACKLOG #42)")
+    assert "NOT CLAIMED" in r.stderr, "the ordinary advice must not be replaced"
+    assert "claim.ps1 -Take 42" in r.stderr
+    assert "The claim REGISTRY does not exist here" in r.stderr
+
+
+def test_the_registry_note_is_SILENT_when_the_registry_exists(repo: Path) -> None:
+    """NARROWNESS. The note must appear only where it is true.
+
+    Without this the line prints on every refusal in the engine, where it is false and where a reader
+    who acts on it points a working repository at someone else's registry.
+    """
+    _claims_dir(repo)  # creates it
+    _git(repo, "add", "code.py")
+    r = _run(repo, "feat(x): build it (BACKLOG #42)")
+    assert r.returncode == 1
+    assert "NOT CLAIMED" in r.stderr
+    assert "The claim REGISTRY does not exist here" not in r.stderr
+
+
+def test_mefor_claimsDir_lets_one_registry_serve_a_second_repository(
+    tmp_path: Path, repo: Path
+) -> None:
+    """The half that makes the gate SATISFIABLE, which is what the item asks for.
+
+    A BACKLOG number is an ENGINE ledger number, so one registry serving both repositories is the
+    correct shape rather than a workaround: two registries would let one item be claimed twice, in two
+    places, with neither able to see the other.
+    """
+    other = _second_repo(tmp_path)
+    shared = _claims_dir(repo)
+    rec = {
+        "key": "42",
+        "note": "test",
+        "branch": "b",
+        "worktree": _toplevel(other),
+        "claimed": "2026-07-24T12:00:00.0000000-05:00",
+    }
+    (shared / "42.json").write_bytes(json.dumps(rec, separators=(",", ":")).encode("utf-8"))
+    _git(other, "config", "mefor.claimsDir", str(shared))
+    _git(other, "add", "code.py")
+    r = _run(other, "feat(x): build it (BACKLOG #42)")
+    assert r.returncode == 0, (
+        f"a claim held in the shared registry must satisfy the gate: {r.stderr}"
+    )
+
+
+def test_mefor_claimsDir_pointing_somewhere_UNCLAIMED_still_refuses(
+    tmp_path: Path, repo: Path
+) -> None:
+    """The control without which the row above is satisfied by a knob that disables the gate.
+
+    Naming a registry must not mean passing. It must mean LOOKING THERE.
+    """
+    other = _second_repo(tmp_path)
+    shared = _claims_dir(repo)  # exists, but holds no claim for 42
+    _git(other, "config", "mefor.claimsDir", str(shared))
+    _git(other, "add", "code.py")
+    r = _run(other, "feat(x): build it (BACKLOG #42)")
+    assert r.returncode == 1
+    assert "NOT CLAIMED" in r.stderr
+    assert "The claim REGISTRY does not exist here" not in r.stderr, (
+        "the registry exists; only the claim is missing"
+    )
+
+
+def test_a_docs_only_commit_is_STILL_never_blocked_with_no_registry(
+    tmp_path: Path, repo: Path
+) -> None:
+    """The stand-down must run BEFORE any of this. An absent registry must not start blocking ledger
+    and documentation work, which is the one thing this gate has always promised not to touch."""
+    other = _second_repo(tmp_path)
+    (other / "docs").mkdir()
+    (other / "docs" / "BACKLOG.md").write_text("# backlog\n", encoding="utf-8")
+    _git(other, "add", "docs/BACKLOG.md")
+    r = _run(other, "docs(ledger): flip the banner (BACKLOG #42)")
+    assert r.returncode == 0, f"a docs-only commit must never be blocked: {r.stderr}"
