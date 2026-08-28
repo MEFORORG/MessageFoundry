@@ -970,3 +970,144 @@ def test_the_git_invocation_pattern_is_defined_EXACTLY_ONCE(repo: SimpleNamespac
         f"found {occurrences} literal copies of the git-invocation class; expected 1 (the definition). "
         "A second copy is a rule that will not receive the next correction to this pattern."
     )
+
+
+# ------------------------------------------- rule 3c: the target candidates are a SET (BACKLOG #1065)
+#
+# The rule took the FIRST `-C` on the line as "the repository being configured" and read git exiting
+# non-zero on it as ALLOW. So a `-C` belonging to a quoted config VALUE, to a commit MESSAGE, or to a
+# DIFFERENT git command in the same chain silently became the target, git rejected that token, and the
+# rule fell through. Every row below really does disarm the shared config.
+#
+# TWO MECHANISMS, so the rows split into two groups and the split is load-bearing. The first two are a
+# `-C` genuinely on the line but owned by ANOTHER command, closed by walking the candidates as a chain.
+# The next three are a `-C` that is not a flag at all, closed by reading the owning invocation's own
+# window off the BLANKED scan string. A single row asserting only "denied" would pass with either half
+# still open, so each row names the KEY in the refusal and the two halves assert different keys.
+#
+# THE KEY IS ASSERTED IN ITS QUOTED FORM, and that is not fussiness. The refusal's standing
+# explanation names core.hooksPath, core.worktree and aliasing in prose, so a bare substring test
+# for a key is true of EVERY rule-3c refusal and would pass against a rule that caught the wrong
+# key entirely. Only the first line's `setting '<key>'` says what was actually caught.
+
+
+def test_a_dashC_owned_by_an_EARLIER_command_does_not_end_rule_3c(repo: SimpleNamespace) -> None:
+    """``git commit -C HEAD`` reuses a commit message; it names no repository. Reading its ``-C`` as the
+    config target made git fail on ``HEAD``, and the rule allowed the disarm that followed it."""
+    reason = assert_denied(
+        run_gate(
+            shell("git commit -C HEAD && git config core.hooksPath /nope", cwd=repo.wt), repo.repos
+        )
+    )
+    assert "setting 'core.hooksPath'" in reason
+    assert "SHARED git configuration" in reason
+
+
+def test_a_dashC_owned_by_a_LATER_command_does_not_end_rule_3c(repo: SimpleNamespace) -> None:
+    """The same shape with the operands swapped. It is a separate row because the disarm now precedes the
+    decoy, so a fix that only looked BACKWARDS from the disarm would leave this one open."""
+    reason = assert_denied(
+        run_gate(
+            shell("git config core.hooksPath /nope && git commit -C HEAD", cwd=repo.wt), repo.repos
+        )
+    )
+    assert "setting 'core.hooksPath'" in reason
+
+
+def test_a_dashC_inside_a_config_VALUE_is_not_a_target(repo: SimpleNamespace) -> None:
+    """The two letters are inside the quoted value being written, so they are not a flag at all."""
+    reason = assert_denied(
+        run_gate(shell('git config core.hooksPath "/nope -C HEAD"', cwd=repo.wt), repo.repos)
+    )
+    assert "setting 'core.hooksPath'" in reason
+
+
+def test_a_dashC_inside_an_ALIAS_value_is_not_a_target(repo: SimpleNamespace) -> None:
+    """Asserts a DIFFERENT key from every row above, which is what makes this suite discriminate rather
+    than five names for one assertion: a rule that recognised only ``core.hooksPath`` passes those and
+    fails here."""
+    reason = assert_denied(
+        run_gate(shell('git config alias.x "commit -C HEAD"', cwd=repo.wt), repo.repos)
+    )
+    assert "setting 'alias.x'" in reason
+    assert "setting 'core.hooksPath'" not in reason
+
+
+def test_a_dashC_inside_a_commit_MESSAGE_is_not_a_target(repo: SimpleNamespace) -> None:
+    """A message is arbitrary attacker-chosen text on the same line as a real disarm."""
+    reason = assert_denied(
+        run_gate(
+            shell('git commit -m "use -C HEAD" && git config core.hooksPath /nope', cwd=repo.wt),
+            repo.repos,
+        )
+    )
+    assert "setting 'core.hooksPath'" in reason
+
+
+def test_a_TRAILING_chdir_does_not_revert_the_closure(repo: SimpleNamespace) -> None:
+    """The chdir guard is bounded to [first git token, disarm) and this row is why.
+
+    An unbounded guard searched to the end of the segment, so a trailing ``&& cd ..`` -- a token that
+    provably cannot change which repository the write already landed in -- reverted EVERY closure the
+    rule claims. This row fails against that draft and passes against the bounded one.
+    """
+    reason = assert_denied(
+        run_gate(
+            shell("git commit -C HEAD && git config core.hooksPath /nope && cd ..", cwd=repo.wt),
+            repo.repos,
+        )
+    )
+    assert "setting 'core.hooksPath'" in reason
+
+
+def test_an_UNRESOLVABLE_governed_target_is_still_refused_before_the_chain_runs(
+    repo: SimpleNamespace,
+) -> None:
+    """The chain must not become "somebody answered, so we are done".
+
+    A draft deferred the unresolvable-target refusal behind "did any candidate answer", and an unrelated
+    second command then answered first and ended the rule while the governed, unresolvable target was
+    never refused at all. ``../../..`` from a worktree under ``.claude/worktrees`` is the primary's own
+    root -- the exact spelling BACKLOG #1061 was filed about.
+    """
+    nested = repo.primary / ".claude" / "worktrees" / "wt-chain"
+    nested.parent.mkdir(parents=True, exist_ok=True)
+    subprocess.run(
+        ["git", "worktree", "add", "-b", "chain-branch", str(nested)],
+        cwd=str(repo.primary),
+        check=True,
+        capture_output=True,
+    )
+    command = f'git -C ../../.. config core.hooksPath /nope ; git -C "{repo.wt}" log'
+    assert_denied(run_gate(shell(command, cwd=nested), repo.repos))
+
+
+def test_the_candidate_chain_does_not_manufacture_a_deny_for_an_UNGOVERNED_write(
+    repo: SimpleNamespace, vendored: Path
+) -> None:
+    """The anti-narrowing direction, and the one a wider candidate set actually threatens.
+
+    Adding candidates can only add denials, so the risk this change carries is a refusal EARNED BY THE
+    WRONG CANDIDATE. Here the write reaches an independent clone that merely lives under the governed
+    root, while a governed path sits harmlessly on the same line inside a commit message. A chain that
+    kept walking until something looked governed would refuse this and name a repository the write was
+    never going to touch -- the BACKLOG #1085 defect through a new door.
+    """
+    command = f'git -C "{vendored}" config core.hooksPath /nope'
+    assert run_gate(shell(command, cwd=repo.primary), repo.repos) is None
+
+
+def test_rules_3_and_3d_are_unchanged_by_the_candidate_switches(repo: SimpleNamespace) -> None:
+    """The switches that widen the candidate set are opt-in and only rule 3c opts in.
+
+    Rules 3 and 3d call the resolver with three positional arguments, so their behaviour must be exactly
+    what it was. Asserting the two OTHER refusal texts here pins that: each rule denies for its own
+    reason, and a row that only checked "denied" would pass if all three had collapsed into one.
+    """
+    tree_swap = assert_denied(run_gate(shell("git reset --hard", cwd=repo.primary), repo.repos))
+    assert "working tree of the SHARED PRIMARY checkout" in tree_swap
+
+    removal = assert_denied(
+        run_gate(shell(f'git worktree remove "{repo.wt}"', cwd=repo.other), repo.repos)
+    )
+    assert "working tree of the SHARED PRIMARY checkout" not in removal
