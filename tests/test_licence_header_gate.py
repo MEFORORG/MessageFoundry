@@ -34,6 +34,7 @@ from types import ModuleType
 import pytest
 
 _ROOT = Path(__file__).resolve().parents[1]
+_HERE = Path(__file__).resolve().parent
 _SCRIPT = _ROOT / "scripts" / "quality" / "licence_header_check.py"
 
 
@@ -173,8 +174,14 @@ def inside_repo_js() -> Iterator[tuple[Path, str]]:
     Inside the repo on purpose: that is where the real vendored entry lives, and it is the only place
     a repo-relative key can be formed at all. The file stays untracked, so ``git ls-files`` never
     reports it and ``test_the_real_tracked_tree_is_clean`` is unaffected.
+
+    Nested under ``tests/`` rather than the repo ROOT, and prefixed so ``.gitignore``'s existing
+    ``tmp*``-free ruleset is not relied on. ``TemporaryDirectory`` unwinds on a normal exit, but
+    ``pytest-timeout`` with ``--timeout-method=thread`` does NOT unwind, so a timed-out run strands
+    whatever this created. Stranding it at the repo root is the case that gets committed by an
+    unrelated ``git add -A``; stranding it under ``tests/`` with an obvious name does not.
     """
-    with tempfile.TemporaryDirectory(dir=_ROOT) as raw:
+    with tempfile.TemporaryDirectory(dir=_HERE, prefix="licence_gate_probe_") as raw:
         path = Path(raw).resolve() / "vendored_probe.js"
         yield path, path.relative_to(_ROOT).as_posix()
 
@@ -224,6 +231,72 @@ def test_the_verdict_does_not_depend_on_how_the_path_is_addressed(
     for rel_path in _MOD.VENDORED_LICENCES:
         assert _MOD.check_file(Path(rel_path)) is None, f"{rel_path}: relative"
         assert _MOD.check_file(_ROOT / rel_path) is None, f"{rel_path}: absolute"
+
+
+def test_a_sibling_of_a_registered_file_is_not_exempt(
+    inside_repo_js: tuple[Path, str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The registry is a FILE list, not a directory exemption -- asserted, not merely documented.
+
+    ``licence_header_check``'s docstring states this property twice, and it was the load-bearing
+    reason a registry was acceptable at all: an entry waves through ONE third-party file, never the
+    tree it happens to sit in. NOTHING TESTED IT. An adversarial pass turned the lookup into a
+    prefix match over the entry's parent directory and the whole suite stayed green, so the property
+    the module promises could have been deleted without a single red.
+
+    The one existing per-path test uses ``tmp_path``, which lives OUTSIDE the repo, so it exercises
+    only the outside-the-repo branch of ``registry_key``. This is the inside-the-repo case, which is
+    where every real entry lives and the only place a prefix match could ever fire.
+    """
+    path, key = inside_repo_js
+    sibling = path.parent / "unregistered_sibling.js"
+    sibling.write_text(f"// {_MOD.SPDX_TAG} MIT\nconsole.log(1);\n", encoding="utf-8")
+    monkeypatch.setitem(_MOD.VENDORED_LICENCES, key, "Apache-2.0")
+
+    result = _MOD.check_file(sibling)
+    assert result is not None, "an unregistered sibling inherited its neighbour's exemption"
+    assert result[0] == _MOD.WRONG
+    # WHICH licence is demanded is the discriminating half. Under a directory exemption this file
+    # would be judged against Apache-2.0 and pass; under the per-file rule it is judged against the
+    # project's own identifier and fails. Asserting only WRONG cannot tell those apart.
+    assert _MOD.EXPECTED_IDENTIFIER in result[1]
+    assert "Apache-2.0" not in result[1]
+
+
+def test_the_file_is_read_from_the_path_as_given_not_from_the_registry_key(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Normalisation touches the LOOKUP KEY only; the read still uses the caller's own path.
+
+    That sentence is the entire no-regression argument for this change, in both the commit body and
+    the code comment, and it was UNTESTED -- an adversarial pass rerouted the read through the
+    normalised key and the suite stayed green. The suite could not see it because it is cwd-blind:
+    the subprocess helper hardcodes ``cwd=_ROOT`` and every direct call passes an absolute path, so
+    no test ever ran from anywhere else.
+
+    THE FILE MUST BE INSIDE THE REPO AND ADDRESSED RELATIVELY FROM SOMEWHERE ELSE INSIDE IT. That
+    combination is the only one where the two spellings differ. My first attempt at this test used a
+    file in ``tmp_path`` and it did NOT discriminate: from a cwd outside the repo, ``registry_key``
+    takes its ValueError fallback and returns the path unchanged, so rerouting the read through it
+    is a no-op and the mutation stayed green. The mutation had applied -- the file hash changed --
+    so that was a test which could not fail, not a mutation that did not land.
+    """
+    probe = _HERE / "licence_gate_cwd_probe.py"
+    probe.write_text(f"# {_MOD.SPDX_TAG} MIT\n", encoding="utf-8")
+    try:
+        monkeypatch.chdir(_HERE)
+        as_given = Path(probe.name)  # "licence_gate_cwd_probe.py", resolved against tests/
+        key = _MOD.registry_key(probe)  # "tests/licence_gate_cwd_probe.py", against the repo root
+        assert as_given.as_posix() != key, "the two spellings must differ or this proves nothing"
+
+        # Reading via the key from cwd=tests/ would look for tests/tests/... and report MISSING
+        # "could not read". Reading the path as given finds the file and judges its header.
+        result = _MOD.check_file(as_given)
+        assert result is not None
+        assert result[0] == _MOD.WRONG, f"the read did not use the path as given: {result}"
+        assert "MIT" in result[1]
+    finally:
+        probe.unlink(missing_ok=True)
 
 
 def test_tag_inside_a_string_literal_does_not_count(tmp_path: Path) -> None:
