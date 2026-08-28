@@ -98,7 +98,6 @@ _STAYS_WITHOUT_IMPORTING = frozenset(
         "test_release_pipeline.py",
         "test_sandbox_worker_logging.py",
         "test_scan_forbidden.py",
-        "test_scan_forbidden_loaded_set.py",
         "test_scan_tokens_source.py",
         "test_seam_discovery.py",
         "test_security_static.py",
