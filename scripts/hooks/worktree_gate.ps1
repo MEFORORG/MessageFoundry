@@ -1520,7 +1520,24 @@ if ($tool -in @("Bash", "PowerShell")) {
         # THE FALLBACK IS THE ONLY SUBTRACTIVE PIECE IN THIS CHANGE, and it subtracts from something that
         # did not exist before, so getting either guard wrong leaves a shape unclosed and cannot open one.
         $fallbackOk = (-not $ownDashC) -and (-not $chdirBefore)
-        $where = @(Get-GitTargetCandidatesRaw $seg.Raw $pfx $cwdRaw -AllTargets -BaseFallback:$fallbackOk)
+        # -AllTargets IS GATED ON $ownDashC, and the gate is the whole point (BACKLOG #1065).
+        #
+        # Sweeping EVERY `-C` on the line was too wide, and adversarial measurement caught it: from an
+        # ungoverned clone, `git commit -C HEAD --amend && git -C <governed> status && git config
+        # alias.lg "..."` was REFUSED, naming the governed repository -- while the alias write lands in
+        # the clone the session is standing in. The refusal misdescribes what it blocked, which is the
+        # #1085 defect this rule has already been fixed for once.
+        #
+        # If the DISARMING invocation carries no `-C` of its own, then no `-C` anywhere on the line names
+        # ITS target, and the base is the only honest answer. That is the old single-token reading plus
+        # the fallback, which is why this cannot reopen anything: measured over 335 corpus rows against
+        # the pre-fix gate, gating this switch keeps all 31 closures and zero rows move DENY to ALLOW.
+        #
+        # WHEN the disarming invocation DOES carry a `-C`, the sweep stays on, because a bogus first
+        # token must not end the question. The residual is stated rather than hidden: two `-C` tokens
+        # inside one owning span are decided by whichever ANSWERS first, so a governed one can still win
+        # over an ungoverned one. That errs CLOSED and is narrower than before this change.
+        $where = @(Get-GitTargetCandidatesRaw $seg.Raw $pfx $cwdRaw -AllTargets:$ownDashC -BaseFallback:$fallbackOk)
         if ($where.Count -eq 0) { continue }
 
         # ROOT THE TARGET AGAINST THE SESSION CWD BEFORE ASKING GIT ANYTHING (BACKLOG #1061). This block

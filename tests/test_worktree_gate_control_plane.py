@@ -1097,6 +1097,31 @@ def test_the_candidate_chain_does_not_manufacture_a_deny_for_an_UNGOVERNED_write
     assert run_gate(shell(command, cwd=repo.primary), repo.repos) is None
 
 
+def test_a_governed_dashC_on_a_DIFFERENT_command_does_not_refuse_an_ungoverned_write(
+    repo: SimpleNamespace, vendored: Path
+) -> None:
+    """The row that gates the candidate sweep, found by attacking the first version of this fix.
+
+    Sweeping EVERY ``-C`` on the line was too wide. Here the session stands in an independent clone, the
+    alias write lands in THAT clone, and the only governed path on the line belongs to a ``git status``
+    that writes nothing. The wide sweep refused it and named the governed repository -- a refusal that
+    misdescribes what it blocked, which is the BACKLOG #1085 defect this rule has already been fixed for
+    once.
+
+    The rule now sweeps only when the DISARMING invocation carries a ``-C`` of its own. It does not here,
+    so the base is the answer, and the base is the ungoverned clone.
+
+    This row fails against the first version of the #1065 fix and passes against both the pre-fix gate
+    and the current one -- so it pins a property the fix had to KEEP, not one it added.
+    """
+    command = (
+        "git commit -C HEAD --amend --no-edit"
+        f' && git -C "{repo.primary}" status'
+        ' && git config alias.lg "log --oneline"'
+    )
+    assert run_gate(shell(command, cwd=vendored), repo.repos) is None
+
+
 def test_rules_3_and_3d_are_unchanged_by_the_candidate_switches(repo: SimpleNamespace) -> None:
     """The switches that widen the candidate set are opt-in and only rule 3c opts in.
 
