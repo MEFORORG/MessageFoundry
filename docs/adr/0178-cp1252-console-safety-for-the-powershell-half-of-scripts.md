@@ -83,15 +83,41 @@ gate would report it clean.
 
 **The predicate is kept anyway, but as a host-conditional claim rather than a universal one.** This
 repository standardises on pwsh 7 — measured 2026-08-28, **19 `pwsh` references** across
-`.github/`, `.claude/`, `scripts/` and CLAUDE.md, and **zero `powershell.exe`**. Row 6 governs, and
-on it the assignment alone **is** sufficient. Under WinPS 5.1 it is not. That caveat is
-load-bearing, not decorative: it is the entire reason the host assumption is written down instead of
-left implicit in a regex.
+`.github/`, `.claude/`, `scripts/` and CLAUDE.md. Row 6 governs almost everywhere, and on it the
+assignment alone **is** sufficient.
 
-**Why a BOM is not also required.** On the governing host a BOM is neither necessary (row 6 survives
-without one) nor sufficient (row 7 fails with one). It matters only on WinPS 5.1, which nothing here
-invokes. And **0 of 54 `.ps1` files carry one today**, so requiring it would be a 54-file rewrite
-riding an item that is otherwise a zero-diff ratchet. That is a separate decision.
+**"Almost" is doing real work in that sentence, and the first draft of this ADR did not have it.**
+The draft asserted **zero `powershell.exe`** in the repository. That number came from a grep scoped
+to `.github/`, `.claude/`, `scripts/` and CLAUDE.md — it returned zero honestly, and it **answered a
+narrower question than the one being asked** (SDS-3.8). The question was *"does anything run a gated
+`.ps1` under WinPS 5.1"*, and the scan never looked at the engine. Widening it finds the
+counterexample:
+
+```
+messagefoundry/service.py:270   ShellExecuteW(None, "runas", "powershell.exe", params, ...)
+```
+
+**`powershell.exe` is Windows PowerShell 5.1, not pwsh 7**, and `params` runs
+`scripts/service/install-service.ps1` — a file inside the surface this ADR gates. So exactly one
+gated script has a shipped WinPS 5.1 entry point, and on that host **row 2 says the exemption is not
+sufficient**.
+
+**Why a BOM is not required of every file, and is required of that one.** On the governing host a
+BOM is neither necessary (row 6 survives without one) nor sufficient (row 7 fails with one), and
+**0 of 54 `.ps1` files carry one today**, so requiring it everywhere would be a 54-file rewrite
+riding a zero-diff ratchet.
+
+But leaving the WinPS 5.1 case as prose would be **a compensating control resting on a false
+premise**, which CLAUDE.md §11 (SDS-3.7) forbids outright. So it is closed in the predicate: for a
+script reachable under WinPS 5.1, the exemption **additionally requires a UTF-8 BOM** — both
+channels, as rows 1-4 demand.
+
+**This changes nothing today and is armed for later.** `install-service.ps1` is BOM-less and
+unhardened, but carries **zero** non-cp1252 characters, so it passes the encodability test and never
+reaches the exemption at all. The rule arms on the day someone adds a glyph and "fixes" it with the
+one-line remedy that is correct everywhere else in this repository. The caller list is re-derived
+from `service.py` on every run rather than trusted, because "who launches this file, and with which
+host" is not a property the file itself carries.
 
 ### A side effect the Python remedy does not have
 
@@ -122,6 +148,12 @@ comparing the two surfaces should not assume the analogy is exact.
 - **AC-6** — THE SYSTEM SHALL treat a READ of `[Console]::OutputEncoding`, a `-eq` comparison, a
   promissory comment, and the unrelated `$OutputEncoding` variable as NOT hardening.
   → `tests/test_cp1252_console_safety.py::test_the_powershell_hardening_signal_is_not_vacuous`
+- **AC-7** — WHERE a script has a shipped Windows PowerShell 5.1 entry point, THE SYSTEM SHALL
+  require a UTF-8 BOM in addition to the assignment before exempting it.
+  → `tests/test_cp1252_console_safety.py::test_the_winps_exemption_requires_both_channels`
+- **AC-8** — THE SYSTEM SHALL re-derive that entry point from `messagefoundry/service.py` on every
+  run, and fail if the engine stops launching the named script via `powershell.exe`.
+  → `tests/test_cp1252_console_safety.py::test_the_winps_entry_point_is_still_real`
 
 ## Options considered
 
@@ -130,10 +162,13 @@ comparing the two surfaces should not assume the analogy is exact.
    makes it sufficient is stated above rather than assumed.
 2. **Cherry-pick `673474806`.** Rejected. Its walk and its ratchet-at-zero framing are sound and are
    reused; its exemption model is refuted by row 2, and it is 200 commits behind `origin/main`.
-3. **Require a UTF-8 BOM as well.** Rejected for this item, not on principle. It is the correct
-   answer for a repository that runs WinPS 5.1, and this one does not; it would touch all 54 files
-   and turn a zero-diff ratchet into a bulk rewrite.
-4. **Gate on reaching an unguarded stream, as the engine half does.** Rejected: that predicate
+3. **Require a UTF-8 BOM on every file as well.** Rejected as a blanket rule — it would touch all 54
+   files and turn a zero-diff ratchet into a bulk rewrite — but **adopted for the one script with a
+   WinPS 5.1 entry point**, where the assignment alone is demonstrably unsound.
+4. **Document the WinPS 5.1 gap in prose instead of enforcing it.** Rejected: that is precisely a
+   compensating control resting on a false premise (SDS-3.7). The enforced version costs one
+   constant, one condition and two tests, and changes no file today.
+5. **Gate on reaching an unguarded stream, as the engine half does.** Rejected: that predicate
    exists because encodability fires 1,647 times across the engine. On this surface it fires **zero**
    times, so the wider and simpler predicate is affordable.
 
@@ -143,10 +178,18 @@ comparing the two surfaces should not assume the analogy is exact.
 surfaces. The measured two-channel table is written down, so the next reader does not re-derive it
 and does not repeat the single-channel mistake.
 
-**Negative / accepted** — the exemption is sufficient **only under pwsh 7**. If anything here is ever
-run under Windows PowerShell 5.1, a hardened BOM-less file passes this gate and still corrupts its
-output. The mitigation is the stated host assumption plus the measured zero `powershell.exe`
-invocations, and the honest statement that this is a conditional claim.
+**Negative / accepted** — the exemption is host-conditional, and the condition is now enforced
+rather than assumed. The residual is the **caller list**: `_RUN_UNDER_WINDOWS_POWERSHELL` encodes a
+fact about who launches a file, which the file cannot carry. A NEW WinPS 5.1 launcher added
+somewhere the re-derivation test does not read would reintroduce exactly the hole this ADR closes.
+The test reads `service.py` because that is the only such launcher today; it is a pin against
+rot, not a search.
+
+**A correction is recorded rather than quietly fixed.** The first draft asserted zero
+`powershell.exe` in the repository and was wrong — the grep that produced it never looked at the
+engine. The number was not a typo; it was a scope error that read as a clean measurement, which is
+the failure mode SDS-3.8 exists for. It is left visible above because the next person to bound this
+question will reach for the same convenient scope.
 
 **Scope, stated honestly.** This lands as a **ratchet at zero, not a repair.** Measured 2026-08-28,
 **0 of 54 `.ps1` files carry a non-cp1252 character**, so this commit changes no script and fixes no

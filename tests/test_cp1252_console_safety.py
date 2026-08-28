@@ -246,14 +246,33 @@ def test_a_synthetic_offender_is_caught_and_a_hardened_one_is_not() -> None:
 #
 # THE HOST ASSUMPTION, STATED BECAUSE THE PREDICATE DEPENDS ON IT. This repository standardises on
 # pwsh 7: measured 2026-08-28, 19 `pwsh` references across `.github/`, `.claude/`, `scripts/` and
-# CLAUDE.md, and ZERO `powershell.exe`. Row 6 is therefore the governing row, and on it the
+# CLAUDE.md. Row 6 is therefore the governing row for ALMOST every script here, and on it the
 # assignment alone IS sufficient. Under WinPS 5.1 it is not, and that caveat is load-bearing rather
-# than decorative: it is the whole reason this comment exists instead of a one-line regex.
+# than decorative -- see the next block, where "almost" turns out to have a named exception.
 #
-# WHY A BOM IS NOT ALSO REQUIRED. On the governing host a BOM is neither necessary (row 6 survives
-# without one) nor sufficient (row 7 fails with one). It only matters on WinPS 5.1, which nothing
-# here invokes. And 0 of 54 `.ps1` files carry one today, so requiring it would be a 54-file
-# rewrite riding an item that is otherwise a zero-diff ratchet. That is a separate decision.
+# WHY A BOM IS NOT REQUIRED OF EVERY FILE. On the governing host a BOM is neither necessary (row 6
+# survives without one) nor sufficient (row 7 fails with one). And 0 of 54 `.ps1` files carry one
+# today, so requiring it everywhere would be a 54-file rewrite riding a zero-diff ratchet.
+#
+# BUT "NOTHING HERE RUNS WinPS 5.1" IS FALSE, AND THE FIRST VERSION OF THIS GATE ASSERTED IT.
+# The claim was measured with a grep scoped to `.github/`, `.claude/`, `scripts/` and CLAUDE.md,
+# which returned zero `powershell.exe` -- and that instrument answered a NARROWER question than the
+# one being asked (SDS-3.8). Widening the scan to the engine finds the counterexample:
+#
+#   messagefoundry/service.py:270  ShellExecuteW(None, "runas", "powershell.exe", params, ...)
+#
+# `powershell.exe` is Windows PowerShell 5.1, NOT pwsh 7, and `params` runs
+# `scripts/service/install-service.ps1` -- a file inside the surface this section gates. So exactly
+# one gated script has a shipped WinPS 5.1 entry point, and on that host row 2 says the
+# `[Console]::OutputEncoding` exemption is NOT SUFFICIENT.
+#
+# Left as prose, that would be a compensating control resting on a false premise, which CLAUDE.md
+# section 11 (SDS-3.7) forbids outright. So it is closed in the predicate instead: for a script
+# reachable under WinPS 5.1, the exemption additionally requires a UTF-8 BOM -- both channels, as
+# rows 1-4 demand. Measured 2026-08-28 this changes nothing today (install-service.ps1 is BOM-less
+# and unhardened but carries ZERO non-cp1252 characters, so it is clean on the encodability test and
+# never reaches the exemption at all). It is armed for the day someone adds a glyph and "fixes" it
+# with the one-line remedy that is correct everywhere else in this repository.
 #
 # A SIDE EFFECT THE PYTHON REMEDY DOES NOT HAVE, measured rather than reasoned about. Python's
 # `reconfigure` rebinds one process's own wrapper. The PowerShell assignment mutates the SHARED
@@ -284,8 +303,31 @@ _HARDENS_PS_CONSOLE = re.compile(
 )
 
 
+#: Scripts with a shipped Windows PowerShell 5.1 entry point, where the assignment ALONE is not
+#: enough (row 2) and the exemption additionally requires a UTF-8 BOM. Kept as an explicit list
+#: rather than inferred, because "who launches this file, and with which host" is not a property
+#: the file itself carries. `test_the_winps_entry_point_is_still_real` re-derives the one entry
+#: from the engine source on every run, so this cannot rot into a stale claim unnoticed.
+_RUN_UNDER_WINDOWS_POWERSHELL = frozenset({"service/install-service.ps1"})
+
+
 def _powershell_scripts() -> list[Path]:
     return sorted(_SCRIPTS.rglob("*.ps1"))
+
+
+def _hardens_ps_console(path: Path, text: str, raw: bytes) -> bool:
+    """Is this file's non-cp1252 content actually safe on the host that runs it?
+
+    Both channels where both channels are reachable. For a pwsh-7-only script the output-encoding
+    assignment is sufficient; for one launched by `powershell.exe` the source must ALSO carry a
+    UTF-8 BOM, or WinPS 5.1 reads it as ANSI and the character is destroyed before it is printed.
+    """
+    if not _HARDENS_PS_CONSOLE.search(text):
+        return False
+    rel = path.relative_to(_SCRIPTS).as_posix()
+    if rel in _RUN_UNDER_WINDOWS_POWERSHELL:
+        return raw.startswith(b"\xef\xbb\xbf")
+    return True
 
 
 def test_the_powershell_scan_actually_covers_something() -> None:
@@ -321,19 +363,28 @@ def test_no_powershell_script_can_abort_a_cp1252_console() -> None:
     offenders: list[str] = []
     exempted: list[str] = []
     for path in _powershell_scripts():
-        text = path.read_text(encoding="utf-8")
+        raw = path.read_bytes()
+        text = raw.decode("utf-8")
         bad = _unencodable(text)
         if not bad:
             continue
         rel = path.relative_to(_ROOT)
         shown = " ".join(f"U+{ord(c):04X}" for c in bad[:6])
-        if _HARDENS_PS_CONSOLE.search(text):
+        if _hardens_ps_console(path, text, raw):
             exempted.append(f"{rel} ({len(bad)} distinct: {shown})")
             continue
+        winps = path.relative_to(_SCRIPTS).as_posix() in _RUN_UNDER_WINDOWS_POWERSHELL
+        extra = (
+            " -- and because the engine launches it via powershell.exe (Windows PowerShell 5.1, "
+            "messagefoundry/service.py), it ALSO needs a UTF-8 BOM: without one WinPS 5.1 reads "
+            "the source as ANSI and destroys the character before it is ever printed"
+            if winps
+            else ""
+        )
         offenders.append(
-            f"{rel} carries {len(bad)} non-cp1252 character(s) [{shown}] and does NOT assign "
-            f"[Console]::OutputEncoding -- on a stock Windows console PowerShell SUBSTITUTES the "
-            f"character and still exits 0, so the corruption is silent"
+            f"{rel} carries {len(bad)} non-cp1252 character(s) [{shown}] and is not hardened "
+            f"(assign [Console]::OutputEncoding) -- on a stock Windows console PowerShell "
+            f"SUBSTITUTES the character and still exits 0, so the corruption is silent{extra}"
         )
     print(f"carrying non-cp1252 characters, hardened and therefore allowed: {exempted or 'none'}")
     assert not offenders, "\n  ".join(
@@ -342,6 +393,51 @@ def test_no_powershell_script_can_abort_a_cp1252_console() -> None:
 
 
 # --- the powershell detector's own controls ------------------------------------------------------
+
+
+def test_the_winps_entry_point_is_still_real() -> None:
+    """RE-DERIVE THE WinPS 5.1 LIST FROM THE ENGINE, never trust the constant.
+
+    `_RUN_UNDER_WINDOWS_POWERSHELL` encodes a fact about a CALLER, which the called file cannot
+    carry -- exactly the kind of claim that rots silently. This reads `service.py` and checks the
+    two halves that make the entry point real: it launches `powershell.exe` (which is Windows
+    PowerShell 5.1, NOT pwsh 7), and the script it launches is the one named in the constant.
+
+    If service.py ever moves to `pwsh`, this fails and the constant should LOSE that entry -- the
+    stricter rule would then be protecting a host nothing uses.
+    """
+    src = (_ROOT / "messagefoundry" / "service.py").read_text(encoding="utf-8")
+    assert '"powershell.exe"' in src, (
+        "service.py no longer launches powershell.exe -- if it moved to pwsh, drop the entry from "
+        "_RUN_UNDER_WINDOWS_POWERSHELL, because the BOM requirement then guards nothing"
+    )
+    for rel in _RUN_UNDER_WINDOWS_POWERSHELL:
+        assert (_SCRIPTS / rel).is_file(), f"{rel} is listed but does not exist"
+        assert Path(rel).name in src, f"{rel} is listed but service.py does not launch it"
+
+
+def test_the_winps_exemption_requires_both_channels() -> None:
+    """The stricter arm, proved to DIFFER from the pwsh-7 arm on identical content.
+
+    Same text, same glyph, same hardening line -- exempt as an ordinary script, NOT exempt as the
+    one the engine runs under WinPS 5.1 unless the source also carries a BOM. If these two did not
+    diverge, the WinPS rule would be a second name for the ordinary one.
+    """
+    glyph = chr(0x2192)
+    text = "[Console]::OutputEncoding = [System.Text.Encoding]::UTF8\n" + f'Write-Host "{glyph}"'
+    raw = text.encode("utf-8")
+    with_bom = b"\xef\xbb\xbf" + raw
+
+    ordinary = _SCRIPTS / "coord" / "claim.ps1"
+    winps = _SCRIPTS / next(iter(_RUN_UNDER_WINDOWS_POWERSHELL))
+
+    assert _hardens_ps_console(ordinary, text, raw), "pwsh-7 script: assignment alone suffices"
+    assert not _hardens_ps_console(winps, text, raw), "WinPS script: a BOM-less file is NOT safe"
+    assert _hardens_ps_console(winps, text, with_bom), "WinPS script: both channels together are"
+    # And a BOM without the assignment is still not enough, in either place (rows 3 and 7).
+    bare = f'Write-Host "{glyph}"'
+    assert not _hardens_ps_console(winps, bare, b"\xef\xbb\xbf" + bare.encode("utf-8"))
+    assert not _hardens_ps_console(ordinary, bare, b"\xef\xbb\xbf" + bare.encode("utf-8"))
 
 
 def test_the_powershell_hardening_signal_matches_both_in_tree_spellings() -> None:
