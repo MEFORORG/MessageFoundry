@@ -9,23 +9,40 @@ two tests this file exists for:
   1. a ref written for a branch that is then ADVANCED must fail a tip check
   2. a ref must be verifiable after the branch it names is GONE
 
-**EVERY VERDICT IS ASSERTED SEPARATELY AND THEY MUST DIFFER.** Against the live repository all 1318
-existing refs report ``UNVERIFIABLE`` -- correctly, because none carries provenance -- and a suite
-that only saw that state could not tell a working classifier from one that returns a constant. A
-uniform output is exactly the shape a dead instrument produces, so each arm is driven to a
-DIFFERENT verdict here.
+**AND CONTROL 2 IS NOT SATISFIED BY A SINGLE VERDICT.** The first version of this suite asserted
+only that a ref whose branch is gone comes back ``SELF-DESCRIBING``. Two materially different refs
+-- one that held the tip, one captured SHORT of it -- then produced byte-identical rows, because
+``-Anchor`` recorded ``was-tip`` and ``-Check`` never read it. That is the item's own defect
+surviving inside its fix, in exactly the population the fix is for, so the branch-gone arm is now
+driven with BOTH refs at once and the two are required to differ.
+
+**EVERY VERDICT IS ASSERTED SEPARATELY AND THEY MUST DIFFER.** Against the live repository every
+rescue ref that already exists reports ``UNVERIFIABLE`` -- correctly, because none carries
+provenance -- and a suite that only saw that state could not tell a working classifier from one
+that returns a constant. A uniform output is exactly the shape a dead instrument produces, so each
+arm is driven to a DIFFERENT verdict here.
 
 **THE FIXTURE IS A REAL REPOSITORY, NOT A MOCK.** The behaviour under test is git's -- annotated tag
 dereference, ancestor arithmetic, a deleted branch -- and a fake would be asserting this file's own
 model of git rather than git.
+
+**VERIFYING A REVERT OF ``rescue.ps1`` USES THE BLOB ID, NEVER A FILE HASH.** ``core.autocrlf=true``
+in this repository and no ``.gitattributes`` rule covers ``scripts/coord/*.ps1``, so ``git checkout
+--`` writes the file back with CRLF while the committed blob is LF. A raw ``sha256`` of the working
+copy therefore reads as drift against a file that is provably unchanged. ``git diff --exit-code``
+and ``git hash-object --path <p> <p>`` answer the byte-identity question; a file digest answers an
+adjacent one (SDS-3.8). This matters to anyone mutation-testing the script and restoring it between
+cycles, which is how these tests were checked for discrimination.
 """
 
 from __future__ import annotations
 
 import json
+import re
 import shutil
 import subprocess
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -69,7 +86,7 @@ def _run(repo: Path, *args: str) -> subprocess.CompletedProcess[str]:
         cwd=str(repo),
         capture_output=True,
         text=True,
-        timeout=180,
+        timeout=300,
     )
 
 
@@ -79,14 +96,34 @@ def _advance(repo: Path, text: str) -> str:
     return _git("rev-parse", "HEAD", cwd=repo)
 
 
-def _verdicts(repo: Path) -> dict[str, str]:
+def _rows(repo: Path) -> dict[str, dict[str, Any]]:
     proc = _run(repo, "-Check", "-Json")
     assert proc.returncode == 0, proc.stderr or proc.stdout
-    payload = json.loads(proc.stdout)
-    rows = payload["rows"]
+    rows = json.loads(proc.stdout)["rows"]
     if isinstance(rows, dict):  # ConvertTo-Json collapses a single-element array
         rows = [rows]
-    return {r["ref"]: r["verdict"] for r in rows}
+    return {r["ref"]: r for r in rows}
+
+
+def _verdicts(repo: Path) -> dict[str, str]:
+    return {ref: row["verdict"] for ref, row in _rows(repo).items()}
+
+
+def _declared_verdicts() -> set[str]:
+    """Every verdict the script can assign, read from the script rather than from this file.
+
+    The test this replaces asserted the cardinality of a set of five string literals it had just
+    written down, which is a tautology: it passed against a ZERO-BYTE ``rescue.ps1``. It was also
+    wrong about its subject, omitting ``DIVERGED``. Reading the inventory out of the source means a
+    verdict added without a fixture to exercise it fails here instead of shipping untested.
+    """
+    declared = set(re.findall(r"\$verdict = '([A-Z-]+)'", _RESCUE.read_text(encoding="utf-8")))
+    # The positive control on the scan itself: a regex that matches nothing would otherwise make
+    # "the suite observed everything the script emits" trivially true.
+    assert len(declared) >= 6, (
+        f"the scan is broken -- it read {declared or 'nothing'} from a script"
+    )
+    return declared
 
 
 def test_an_anchored_ref_holds_the_tip_and_says_so(tmp_path: Path) -> None:
@@ -119,6 +156,32 @@ def test_a_ref_whose_branch_ADVANCED_fails_the_tip_check(tmp_path: Path) -> None
     assert "TIP" not in proc.stdout.replace("MULTIPLE", ""), "must not still claim the tip"
 
 
+def test_a_ref_AHEAD_of_the_branch_it_names_is_DIVERGED(tmp_path: Path) -> None:
+    """The item's SECOND named wrong recovery decision, and it was live but untested.
+
+    "Concluding work is lost when a ref still holds commits the branch no longer has" is half the
+    stated motivation for #1349, and ``DIVERGED`` is the arm that reports it. Mutating that literal
+    to ``TIP`` left the whole suite green before this test existed, so the arm shipped unproven.
+
+    The state is reached the way it happens in practice: a ref is anchored at a tip, then the branch
+    is rewound under it by a reset or a force-push, leaving the ref holding commits the branch has
+    dropped.
+    """
+    repo = _repo(tmp_path / "r")
+    base = _git("rev-parse", "HEAD", cwd=repo)
+    _git("checkout", "-b", "work", cwd=repo)
+    _advance(repo, "two\n")
+    _advance(repo, "three\n")
+    _run(repo, "-Anchor", "before-the-rewind")
+    _git("checkout", "main", cwd=repo)
+    _git("update-ref", "refs/heads/work", base, cwd=repo)
+
+    row = _rows(repo)["refs/tags/rescue/before-the-rewind"]
+    assert row["verdict"] == "DIVERGED"
+    assert row["detail"] == "0 behind / 2 ahead of work", "the counts are the recovery fact"
+    assert "DIVERGED" in _run(repo, "-Check").stdout
+
+
 def test_a_ref_SURVIVES_the_deletion_of_the_branch_it_names(tmp_path: Path) -> None:
     """BACKLOG #1349 control 2, and the one the whole item turns on.
 
@@ -135,11 +198,50 @@ def test_a_ref_SURVIVES_the_deletion_of_the_branch_it_names(tmp_path: Path) -> N
     _git("checkout", "main", cwd=repo)
     _git("branch", "-D", "doomed", cwd=repo)
 
-    assert _verdicts(repo) == {"refs/tags/rescue/orphan": "SELF-DESCRIBING"}
+    assert _verdicts(repo) == {"refs/tags/rescue/orphan": "HELD-THE-TIP"}
+
+
+def test_two_anchored_refs_on_a_DELETED_branch_do_not_read_alike(tmp_path: Path) -> None:
+    """The item's defect, reproduced INSIDE the fix, in the population the fix is for.
+
+    ``-Anchor`` records ``was-tip`` and the first ``-Check`` never read it: it matched only
+    ``^branch:`` and ``^commit:``. So a ref that held the tip and a ref captured one commit short of
+    it came back with the same verdict, the same detail string and the same colour once the branch
+    was gone -- while the two TAGS disagreed. Captured and then discarded is worse than never
+    captured, because the report then contradicts the evidence it was built from.
+
+    Both refs are driven in ONE repository so the difference cannot come from anything but the
+    recorded fact.
+    """
+    repo = _repo(tmp_path / "r")
+    _git("checkout", "-b", "feat", cwd=repo)
+    short = _advance(repo, "two\n")
+    _advance(repo, "three\n")
+    _run(repo, "-Anchor", "held-the-tip")
+    _run(repo, "-Anchor", "short-by-one", "-Sha", short)
+    _git("checkout", "main", cwd=repo)
+    _git("branch", "-D", "feat", cwd=repo)
+
+    rows = _rows(repo)
+    held = rows["refs/tags/rescue/held-the-tip"]
+    partial = rows["refs/tags/rescue/short-by-one"]
+
+    assert held["verdict"] != partial["verdict"], "two different refs, one answer -- the item's bug"
+    assert held["verdict"] == "HELD-THE-TIP"
+    assert partial["verdict"] == "SHORT-AT-CAPTURE"
+    assert held["wasTipAtCapture"] is True
+    assert partial["wasTipAtCapture"] is False
+    assert held["detail"] != partial["detail"]
+
+    # The human report is the surface an operator actually reads, so it has to separate them too.
+    out = _run(repo, "-Check").stdout
+    assert "HELD-THE-TIP" in out
+    assert "SHORT-AT-CAPTURE" in out
+    assert "reaching for one of these gets less than the branch held" in out
 
 
 def test_a_legacy_ref_with_no_provenance_is_UNVERIFIABLE_never_clean(tmp_path: Path) -> None:
-    """The 1318 refs that already exist, and the reason the word matters.
+    """The refs that already exist, and the reason the word matters.
 
     A check that cannot tell must not print the word that means it can -- the standard
     ``unbacked_check.ps1`` sets in this directory for reachability. An unverifiable ref is not a
@@ -196,15 +298,128 @@ def test_replacing_an_annotated_rescue_tag_with_a_LIGHTWEIGHT_one_loses_its_prov
     assert _verdicts(repo) == {"refs/tags/rescue/clobbered": "UNVERIFIABLE"}
 
 
-def test_every_arm_produces_a_DIFFERENT_verdict(tmp_path: Path) -> None:
-    """THE ANTI-VACUITY CHECK, and it is why the tests above are not one test wearing five names.
+def test_re_anchoring_an_EXISTING_name_is_refused_and_the_snapshot_survives(
+    tmp_path: Path,
+) -> None:
+    """Overwriting a rescue ref destroys the one snapshot somebody is about to reach for.
 
-    Each state above is asserted in isolation, so a classifier returning a constant would fail four
-    of them -- but only if the four expectations really differ. Asserting that here makes the
-    parametrisation's own claim testable instead of assumed.
+    ``git tag -a`` refuses an existing name and the script turns that non-zero exit into a throw, so
+    the behaviour is already right. It was untested, which is what makes a future change to silently
+    force the tag a change nothing objects to -- and the object it would destroy is unrecoverable by
+    construction, because a rescue ref is consulted only after the original is gone.
     """
-    expected = {"TIP", "BEHIND", "SELF-DESCRIBING", "UNVERIFIABLE", "ALTERED"}
-    assert len(expected) == 5, "five states, five distinct names"
+    repo = _repo(tmp_path / "r")
+    captured = _git("rev-parse", "HEAD", cwd=repo)
+    assert _run(repo, "-Anchor", "keep").returncode == 0
+    moved = _advance(repo, "two\n")
+    assert moved != captured
+
+    proc = _run(repo, "-Anchor", "keep")
+    assert proc.returncode != 0, "re-anchoring an existing name must not overwrite the snapshot"
+    assert _git("rev-parse", "refs/tags/rescue/keep^{commit}", cwd=repo) == captured
+    assert _verdicts(repo) == {"refs/tags/rescue/keep": "BEHIND"}
+
+
+def test_a_hostile_anchor_slug_writes_NO_ref(tmp_path: Path) -> None:
+    """``-Anchor`` interpolates its argument into a ref name, so the traversal case is pinned.
+
+    ``rescue/../../pwned`` would land outside the namespace the audit reads if git accepted it.
+    It does not -- ``check-ref-format`` rejects a ``..`` component -- and the script propagates that
+    refusal instead of continuing. Asserting on the REF SPACE rather than on the message means a
+    future change that writes the ref through some other path still fails here.
+    """
+    repo = _repo(tmp_path / "r")
+    proc = _run(repo, "-Anchor", "../../pwned")
+
+    assert proc.returncode != 0
+    assert "pwned" not in _git("for-each-ref", "--format=%(refname)", cwd=repo)
+
+
+def test_the_suite_OBSERVES_every_verdict_the_script_can_emit(tmp_path: Path) -> None:
+    """THE ANTI-VACUITY CHECK, rebuilt because the version it replaces could not fail.
+
+    That version's entire body was ``expected = {five literals}; assert len(expected) == 5``. It
+    never invoked the script, never imported it, took an unused ``tmp_path``, and passed against a
+    ZERO-BYTE ``rescue.ps1``. It could only fail for an edit to its own literal -- and it carried an
+    incomplete inventory besides, omitting ``DIVERGED`` from a classifier that emits it.
+
+    This drives ONE repository into every state the classifier distinguishes, one ref per state, and
+    checks the observed verdicts against the inventory read out of the script's own source. A
+    constant classifier collapses the mapping; an arm added without a fixture leaves the two sets
+    unequal.
+    """
+    repo = _repo(tmp_path / "r")
+    base = _git("rev-parse", "HEAD", cwd=repo)
+
+    # UNVERIFIABLE -- a hand-written ref carrying no provenance, which is what every ref that
+    # predates -Anchor looks like.
+    _git("update-ref", "refs/rescue/legacy", base, cwd=repo)
+
+    # TIP -- a branch that does not move afterwards.
+    _git("checkout", "-b", "stable", cwd=repo)
+    _advance(repo, "stable-1\n")
+    _run(repo, "-Anchor", "on-the-tip")
+
+    # BEHIND -- anchored, then the branch advances past it.
+    _git("checkout", "main", cwd=repo)
+    _git("checkout", "-b", "moving", cwd=repo)
+    _advance(repo, "moving-1\n")
+    _run(repo, "-Anchor", "before-the-advance")
+    _advance(repo, "moving-2\n")
+
+    # DIVERGED -- anchored, then the branch is rewound under it.
+    _git("checkout", "main", cwd=repo)
+    _git("checkout", "-b", "rewound", cwd=repo)
+    _advance(repo, "rewound-1\n")
+    _advance(repo, "rewound-2\n")
+    _run(repo, "-Anchor", "before-the-rewind")
+    _git("checkout", "main", cwd=repo)
+    _git("update-ref", "refs/heads/rewound", base, cwd=repo)
+
+    # HELD-THE-TIP and SHORT-AT-CAPTURE -- two captures on one branch, then the branch is deleted.
+    _git("checkout", "-b", "doomed", cwd=repo)
+    short = _advance(repo, "doomed-1\n")
+    _advance(repo, "doomed-2\n")
+    _run(repo, "-Anchor", "doomed-tip")
+    _run(repo, "-Anchor", "doomed-short", "-Sha", short)
+    _git("checkout", "main", cwd=repo)
+    _git("branch", "-D", "doomed", cwd=repo)
+
+    # ALTERED -- still claims a capture it no longer points at.
+    _git("checkout", "-b", "moved-under", cwd=repo)
+    _advance(repo, "moved-1\n")
+    _run(repo, "-Anchor", "moved")
+    message = _git("for-each-ref", "--format=%(contents)", "refs/tags/rescue/moved", cwd=repo)
+    elsewhere = _advance(repo, "moved-2\n")
+    _git("tag", "-f", "-a", "rescue/moved", "-m", message, elsewhere, cwd=repo)
+
+    # SELF-DESCRIBING -- provenance present but no was-tip recorded, and no such branch. The honest
+    # verdict is that the ref speaks for itself and still cannot say whether it held the tip.
+    _git(
+        "tag",
+        "-a",
+        "rescue/no-was-tip",
+        "-m",
+        f"mefor-rescue-v1\ncommit: {base}\nbranch: vanished\n",
+        base,
+        cwd=repo,
+    )
+
+    observed = _verdicts(repo)
+    assert observed == {
+        "refs/rescue/legacy": "UNVERIFIABLE",
+        "refs/tags/rescue/before-the-advance": "BEHIND",
+        "refs/tags/rescue/before-the-rewind": "DIVERGED",
+        "refs/tags/rescue/doomed-short": "SHORT-AT-CAPTURE",
+        "refs/tags/rescue/doomed-tip": "HELD-THE-TIP",
+        "refs/tags/rescue/moved": "ALTERED",
+        "refs/tags/rescue/no-was-tip": "SELF-DESCRIBING",
+        "refs/tags/rescue/on-the-tip": "TIP",
+    }
+    assert len(set(observed.values())) == len(observed), "one ref per verdict, so no two can agree"
+    assert set(observed.values()) == _declared_verdicts(), (
+        "the script can emit a verdict no fixture here reaches, or reaches one it cannot emit"
+    )
 
 
 def test_an_annotated_tag_reports_its_COMMIT_not_the_tag_object(tmp_path: Path) -> None:
@@ -222,8 +437,7 @@ def test_an_annotated_tag_reports_its_COMMIT_not_the_tag_object(tmp_path: Path) 
     commit = _git("rev-parse", "refs/tags/rescue/annotated^{commit}", cwd=repo)
     assert tag_object != commit, "fixture is not annotated -- this test would prove nothing"
 
-    proc = _run(repo, "-Check", "-Json")
-    rows = json.loads(proc.stdout)["rows"]
-    if isinstance(rows, dict):
-        rows = [rows]
-    assert rows[0]["commit"] == commit, "reported the tag object instead of the commit"
+    rows = _rows(repo)
+    assert rows["refs/tags/rescue/annotated"]["commit"] == commit, (
+        "reported the tag object instead of the commit"
+    )

@@ -32,6 +32,14 @@
     written -- the information was never captured -- and `-Check` says so about them rather than
     guessing.
 
+    AND `-Check` MUST READ WHAT `-Anchor` RECORDED, WHICH THE FIRST VERSION DID NOT. It matched only
+    `branch:` and `commit:`, so once the branch was gone a ref that HELD THE TIP and a ref captured
+    SHORT of it produced the same verdict, the same detail and the same colour -- in exactly the
+    population this script exists for, while the two tags plainly disagreed. Captured and then
+    discarded is worse than never captured, because the report then contradicts its own evidence.
+    The branch-gone arm therefore reports HELD-THE-TIP or SHORT-AT-CAPTURE, and keeps the bare
+    SELF-DESCRIBING verdict only for a ref whose message carries no `was-tip` line to read.
+
     UNVERIFIABLE IS NOT CLEAN, and that distinction is the entire point of the report. A ref whose
     branch is gone and which carries no recorded provenance gets UNVERIFIABLE, never OK. The honest
     statement is "this check cannot tell", and a check that cannot tell must not print the word that
@@ -41,11 +49,6 @@
     COVERAGE IS A FIRST-CLASS OUTPUT. Every run prints how many refs it examined and across which
     namespaces, including when it finds nothing wrong. A run that examined zero refs and a run that
     examined everything otherwise print the same reassuring line.
-
-    ENUMERATE THE REF SPACE, NEVER GLOB IT. `for-each-ref 'refs/rescue/*'` matches ONE path segment,
-    so it silently misses `refs/rescue/a/b` -- measured on this box as 5 against 1025, a small
-    non-zero that reads as a real answer. This script lists the full ref space and filters in
-    PowerShell, where the filter is visible.
 
     ANNOTATED TAGS DEREFERENCE, AND THE NAIVE READ IS WRONG. `rev-parse <tag>` on an annotated tag
     returns the TAG OBJECT, not the commit it points at, so a comparison against a branch tip fails
@@ -88,13 +91,17 @@ function Get-RescueRecords {
     <#
     ONE `for-each-ref` FOR THE WHOLE AUDIT, AND THE REASON IS MEASURED. The first version of this
     script asked git for the commit, then the contents, per ref. That is three process spawns per
-    ref; against this repository's 1318 rescue refs it exceeded a two-minute budget and had to be
+    ref; across the ref population counted below it exceeded a two-minute budget and had to be
     backgrounded. Windows process creation is the cost, not git.
 
-    A PREFIX PATTERN IS THE CORRECT ENUMERATION AND A GLOB IS NOT. `refs/rescue` as a pattern matches
-    the entire subtree; `refs/rescue/*` matches ONE path segment. Measured on this repository:
-    prefix 1318, single-star 61 -- and 61 is a plausible-looking number that would have read as an
-    answer. Verified equal to a full `for-each-ref` piped through a filter, 1318 both ways.
+    A PREFIX PATTERN IS THE CORRECT ENUMERATION AND A GLOB IS NOT, AND THIS IS THE ONE PLACE THE
+    COUNTS ARE STATED. `refs/rescue` as a pattern matches the entire subtree; `refs/rescue/*` matches
+    ONE path segment. Measured on this repository 2026-08-28: `refs/rescue` 206 against
+    `refs/rescue/*` 73, plus `refs/tags/rescue` 1131, for 1337 across the two prefixes read here. 73
+    is the dangerous kind of wrong -- small, plausible, and it reads as an answer. TREAT THESE AS A
+    DATED SAMPLE, NEVER A CONSTANT: the total rose by four within the minutes it took to correct this
+    comment, and the figure it replaced had been restated elsewhere in the file with a different
+    value. What does not drift is that the glob under-reports the same subtree by roughly two thirds.
 
     `%(*objectname)` is populated ONLY for an annotated tag; for a lightweight ref it is empty and
     `%(objectname)` is already the commit. Taking both and picking is why an annotated tag does not
@@ -185,9 +192,18 @@ foreach ($rec in $records) {
 
     $recordedBranch = $null
     $recordedCommit = $null
+    $recordedWasTip = $null
     if ($selfDescribing) {
         if ($body -match '(?m)^branch:\s*(.+)$') { $recordedBranch = $Matches[1].Trim() }
         if ($body -match '(?m)^commit:\s*([0-9a-f]{7,40})') { $recordedCommit = $Matches[1].Trim() }
+        # READ WHAT -Anchor RECORDED. This line is the entire reason the branch-gone population is
+        # readable at all; matching only branch and commit made a tip capture and a short capture
+        # render identically, which is the item's own defect reproduced inside its fix. Left as
+        # $null when the message carries no was-tip line, because "not recorded" and "recorded
+        # False" are different answers and must not collapse into one.
+        if ($body -match '(?m)^was-tip:\s*(True|False)\s*$') {
+            $recordedWasTip = ($Matches[1] -eq 'True')
+        }
     }
 
     # A self-describing ref is checked against ITSELF first. This is the arm that works when the
@@ -222,16 +238,26 @@ foreach ($rec in $records) {
         }
     }
     elseif ($selfDescribing) {
-        # THE CASE THE ITEM EXISTS FOR, and it is a GOOD outcome rather than a gap: the branch is
-        # gone, so no comparison is possible -- but the ref carries what it captured, so a reader
-        # knows what it holds and whether it was the tip then.
-        $verdict = 'SELF-DESCRIBING'
-        $detail = "branch $branchName is gone; ref records its own capture and is intact"
+        # THE CASE THE ITEM EXISTS FOR. The branch is gone, so no comparison is possible -- but the
+        # ref carries what it captured, and WHICH of these three it is drives opposite recovery
+        # decisions. Reporting them under one name is the failure that made this arm worthless.
+        if ($recordedWasTip -eq $true) {
+            $verdict = 'HELD-THE-TIP'
+            $detail = "branch $branchName is gone; ref is intact and WAS its tip when captured"
+        }
+        elseif ($recordedWasTip -eq $false) {
+            $verdict = 'SHORT-AT-CAPTURE'
+            $detail = "branch $branchName is gone; ref is intact but was NOT its tip when captured -- a partial snapshot"
+        }
+        else {
+            $verdict = 'SELF-DESCRIBING'
+            $detail = "branch $branchName is gone; ref is intact but recorded no was-tip, so whether it held the tip cannot be told"
+        }
     }
 
     $rows += [pscustomobject]@{
         ref = $r; commit = $commit; verdict = $verdict
-        selfDescribing = [bool]$selfDescribing; detail = $detail
+        selfDescribing = [bool]$selfDescribing; wasTipAtCapture = $recordedWasTip; detail = $detail
     }
 }
 
@@ -254,17 +280,30 @@ if ($rows.Count -eq 0) {
 }
 Write-Host ""
 foreach ($g in $byVerdict) {
+    # SHORT-AT-CAPTURE is Gray with BEHIND, not Green with TIP: both are snapshots older than their
+    # branch and neither is a defect, but neither is the outcome a reader hopes for either. Bare
+    # SELF-DESCRIBING falls through to Yellow deliberately -- it is the arm that cannot tell.
     $colour = switch ($g.Name) {
         'TIP' { 'Green' }
-        'SELF-DESCRIBING' { 'Green' }
+        'HELD-THE-TIP' { 'Green' }
         'BEHIND' { 'Gray' }
+        'SHORT-AT-CAPTURE' { 'Gray' }
         'ALTERED' { 'Red' }
         default { 'Yellow' }
     }
     Write-Host ("{0,-16} {1}" -f $g.Name, $g.Count) -ForegroundColor $colour
 }
 
-$unverifiable = ($rows | Where-Object verdict -eq 'UNVERIFIABLE').Count
+$short = @($rows | Where-Object verdict -eq 'SHORT-AT-CAPTURE').Count
+if ($short -gt 0) {
+    Write-Host ""
+    Write-Host "$short ref(s) were SHORT of their branch when captured, and that branch is now gone." -ForegroundColor Yellow
+    Write-Host "  That is not a defect -- a rescue ref is a snapshot by design -- but it is the fact a" -ForegroundColor Yellow
+    Write-Host "  recovery decision turns on: reaching for one of these gets less than the branch held." -ForegroundColor Yellow
+    Write-Host "  Nothing can compare them against anything now, so the recorded answer is the only one." -ForegroundColor Yellow
+}
+
+$unverifiable = @($rows | Where-Object verdict -eq 'UNVERIFIABLE').Count
 if ($unverifiable -gt 0) {
     Write-Host ""
     Write-Host "$unverifiable ref(s) are UNVERIFIABLE, which is NOT the same as healthy." -ForegroundColor Yellow
