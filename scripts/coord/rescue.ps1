@@ -225,9 +225,30 @@ foreach ($rec in $records) {
         else {
             # Only reached for a self-describing ref whose branch still exists -- a small subset, so
             # the per-ref rev-list cost here is bounded rather than paid 1318 times.
+            # $LASTEXITCODE IS READ HERE BECAUSE `2>$null` MAKES A FAILURE LOOK LIKE AN ANSWER.
+            # `git rev-list --count` exits 128 with EMPTY stdout when it cannot resolve a range --
+            # measured, not assumed. Without this guard $ahead is empty, `$ahead -eq '0'` is FALSE,
+            # and control falls to the else branch, which reports DIVERGED with blank counts. That
+            # turns a loud "I CANNOT ANSWER THAT" into the most alarming verdict this script emits,
+            # about a ref that may be perfectly sound. It is the same collapse the was-tip comment
+            # above refuses: "not recorded" and "recorded False" are different answers.
+            #
+            # Reachability, stated honestly: both operands normally resolve, since $commit is the
+            # ref's own target and $tip comes from a local branch this clone just enumerated. So
+            # this is a GUARD, not a fix for a failure seen in the wild. It becomes reachable
+            # whenever the object is absent from the clone doing the asking -- a partial or
+            # alternate clone, or a refspec that maps rescue refs to a different local namespace,
+            # which is exactly how a durability check comes to report "not backed up" about work
+            # that is safely tagged elsewhere.
             $behind = (& git -C $repo rev-list --count "$commit..$tip" 2>$null)
+            $behindOk = ($LASTEXITCODE -eq 0)
             $ahead = (& git -C $repo rev-list --count "$tip..$commit" 2>$null)
-            if ($ahead -eq '0') {
+            $aheadOk = ($LASTEXITCODE -eq 0)
+            if (-not $behindOk -or -not $aheadOk) {
+                $verdict = 'UNVERIFIABLE'
+                $detail = "git could not compare against $branchName in this clone -- a statement about THIS CLONE, not about the ref"
+            }
+            elseif ($ahead -eq '0') {
                 $verdict = 'BEHIND'
                 $detail = "$behind commit(s) short of $branchName -- a snapshot older than its branch, NOT a defect"
             }
