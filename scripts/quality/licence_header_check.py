@@ -59,6 +59,12 @@ import subprocess
 import sys
 from pathlib import Path
 
+# This file is ``<repo>/scripts/quality/licence_header_check.py``, so the root is two levels up.
+# Derived statically rather than shelled out of ``git rev-parse``: the lookup below runs once per
+# file, and a subprocess per file would be the whole cost of the scan. Correct inside a git worktree
+# too, where ``.git`` is a FILE rather than a directory -- nothing here reads it either way.
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+
 # The SPDX identifier every first-party source must declare. Stated once, here.
 EXPECTED_IDENTIFIER = "AGPL-3.0-or-later"
 
@@ -113,12 +119,35 @@ def tracked_files() -> list[str]:
     return sorted(p for p in out.split("\0") if p and in_scope(p))
 
 
+def registry_key(path: Path) -> str:
+    """The VENDORED_LICENCES key for *path*, so one file gets one answer however it is addressed.
+
+    Two traps, and only the first was handled when the registry was written:
+
+    * SEPARATORS. ``.as_posix()``, not ``str(path)``: on Windows ``str()`` renders backslashes, and
+      the registry is keyed the way ``git ls-files`` emits paths (forward slashes) on every platform.
+    * POSITION. The registry is keyed REPO-RELATIVE, but nothing stops a caller passing an absolute
+      path, and an absolute ``as_posix()`` can never equal a relative key. Such a caller would lose
+      the exemption SILENTLY: the ``.get()`` default takes over and the gate would demand this
+      project's AGPL identifier on genuinely third-party code, which is the exact affirmative
+      misstatement VENDORED_LICENCES exists to prevent. Unlike the separator trap it is
+      platform-independent, so it would fail everywhere at once rather than on one OS.
+
+    A path OUTSIDE the repo has no repo-relative form, so it keeps its own spelling. That is not a
+    fallback that weakens anything: an unregistered path still falls through to EXPECTED_IDENTIFIER.
+    """
+    try:
+        return path.resolve().relative_to(_REPO_ROOT).as_posix()
+    except ValueError:  # not under the repo root
+        return path.as_posix()
+
+
 def check_file(path: Path) -> tuple[str, str] | None:
     """Classify one file. Returns ``(class, detail)`` for a violation, or None when compliant."""
     prefix = COMMENT_PREFIXES[path.suffix]
-    # .as_posix(), not str(path): on Windows str() renders backslashes, and VENDORED_LICENCES is
-    # keyed the way git ls-files emits paths (forward slashes) on every platform.
-    expected = VENDORED_LICENCES.get(path.as_posix(), EXPECTED_IDENTIFIER)
+    # Only the LOOKUP key is normalised. The read below deliberately uses *path* as given, so a
+    # relative invocation still resolves against the caller's cwd exactly as it always has.
+    expected = VENDORED_LICENCES.get(registry_key(path), EXPECTED_IDENTIFIER)
     try:
         head = path.read_bytes().decode("utf-8", errors="replace").splitlines()[:HEAD_LINES]
     except OSError as exc:  # unreadable is a violation we must not swallow

@@ -26,6 +26,8 @@ from __future__ import annotations
 import importlib.util
 import subprocess
 import sys
+import tempfile
+from collections.abc import Iterator
 from pathlib import Path
 from types import ModuleType
 
@@ -149,6 +151,79 @@ def test_the_real_vendored_cla_action_file_is_compliant() -> None:
         real = _ROOT / rel_path
         assert real.is_file(), f"VENDORED_LICENCES entry {rel_path!r} does not exist"
         assert _MOD.check_file(real) is None
+
+
+# --------------------------------------------------------------------------------------------------
+# The lookup must not depend on HOW the path is addressed (BACKLOG #1364).
+#
+# VENDORED_LICENCES is keyed the way ``git ls-files`` emits paths -- repo-relative -- but nothing
+# stops a caller handing ``check_file`` an absolute path. The two overrides above register an
+# ABSOLUTE key, and that is correct there rather than sloppy: ``tmp_path`` lives outside the repo
+# (the system temp dir), so no repo-relative key exists for it and ``as_posix()`` IS its key. The
+# consequence is that until this section existed, every registry test reached the registry by a key
+# that happened to equal ``path.as_posix()``, and the real repo-relative entry -- the only kind the
+# shipped registry holds -- was never exercised through the lookup at all.
+# --------------------------------------------------------------------------------------------------
+
+
+@pytest.fixture
+def inside_repo_js() -> Iterator[tuple[Path, str]]:
+    """A throwaway ``.js`` file INSIDE the repo tree, plus its repo-relative registry key.
+
+    Inside the repo on purpose: that is where the real vendored entry lives, and it is the only place
+    a repo-relative key can be formed at all. The file stays untracked, so ``git ls-files`` never
+    reports it and ``test_the_real_tracked_tree_is_clean`` is unaffected.
+    """
+    with tempfile.TemporaryDirectory(dir=_ROOT) as raw:
+        path = Path(raw).resolve() / "vendored_probe.js"
+        yield path, path.relative_to(_ROOT).as_posix()
+
+
+def test_a_repo_relative_key_matches_an_absolutely_addressed_file(
+    inside_repo_js: tuple[Path, str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The real entry's exact shape: a repo-relative key, for a file addressed absolutely."""
+    path, key = inside_repo_js
+    path.write_text(f"// {_MOD.SPDX_TAG} Apache-2.0\nconsole.log(1);\n", encoding="utf-8")
+    assert path.as_posix() != key  # the two addressings really are different strings
+    monkeypatch.setitem(_MOD.VENDORED_LICENCES, key, "Apache-2.0")
+    assert _MOD.check_file(path) is None
+
+
+def test_a_repo_relative_key_still_rejects_the_wrong_value(
+    inside_repo_js: tuple[Path, str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Normalising the key must not turn a registry entry into a blanket exemption.
+
+    The assertion is on WHICH licence is demanded, not merely that the file reds. Before the key was
+    normalised this case ALSO returned WRONG -- but demanding the PROJECT's licence, because the
+    lookup missed entirely. Naming the registered value is the only thing that tells the two apart,
+    so a bare ``result[0] == WRONG`` here would be a test that cannot fail for the reason it claims.
+    """
+    path, key = inside_repo_js
+    path.write_text(f"// {_MOD.SPDX_TAG} MIT\nconsole.log(1);\n", encoding="utf-8")
+    monkeypatch.setitem(_MOD.VENDORED_LICENCES, key, "Apache-2.0")
+    result = _MOD.check_file(path)
+    assert result is not None
+    assert result[0] == _MOD.WRONG
+    assert "Apache-2.0" in result[1]
+    assert _MOD.EXPECTED_IDENTIFIER not in result[1]
+
+
+def test_the_verdict_does_not_depend_on_how_the_path_is_addressed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """One file, one verdict, however the caller spells the path.
+
+    Both shipped callers pass repo-relative paths -- CI goes through ``git ls-files`` and pre-commit
+    forwards relative argv -- so only the first assertion held before this was fixed. An absolute
+    path silently lost the exemption and demanded this project's AGPL identifier on third-party code,
+    which is the affirmative misstatement the registry exists to prevent.
+    """
+    monkeypatch.chdir(_ROOT)
+    for rel_path in _MOD.VENDORED_LICENCES:
+        assert _MOD.check_file(Path(rel_path)) is None, f"{rel_path}: relative"
+        assert _MOD.check_file(_ROOT / rel_path) is None, f"{rel_path}: absolute"
 
 
 def test_tag_inside_a_string_literal_does_not_count(tmp_path: Path) -> None:
