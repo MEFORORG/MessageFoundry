@@ -233,13 +233,19 @@ foreach ($rec in $records) {
             # about a ref that may be perfectly sound. It is the same collapse the was-tip comment
             # above refuses: "not recorded" and "recorded False" are different answers.
             #
-            # Reachability, stated honestly: both operands normally resolve, since $commit is the
-            # ref's own target and $tip comes from a local branch this clone just enumerated. So
-            # this is a GUARD, not a fix for a failure seen in the wild. It becomes reachable
-            # whenever the object is absent from the clone doing the asking -- a partial or
-            # alternate clone, or a refspec that maps rescue refs to a different local namespace,
-            # which is exactly how a durability check comes to report "not backed up" about work
-            # that is safely tagged elsewhere.
+            # Reachability, stated honestly and NARROWED after a measurement: both operands normally
+            # resolve, since $commit is the ref's own target and $tip comes from a local branch this
+            # clone just enumerated. So this is a GUARD, not a fix for a failure seen in the wild.
+            # It needs the OBJECT to be absent from the clone doing the asking, which in practice
+            # means a partial, shallow or otherwise incomplete clone.
+            #
+            # AN EARLIER VERSION OF THIS COMMENT ALSO BLAMED THE REFSPEC THAT REMAPS
+            # +refs/tags/rescue/* INTO refs/remotes/private/rescuetags/*. THAT WAS WRONG AND THE
+            # DISTINCTION IS WORTH KEEPING: a remap changes the NAME a ref is reachable under, not
+            # whether the OBJECT is present -- `git cat-file -t` on such a commit returns `commit`,
+            # measured. So a remap makes `git tag --contains` return zero for work that IS tagged,
+            # which is a real and separate hazard, and it does NOT make rev-list fail here.
+            # Two different failures that both feel like "the ref is missing".
             $behind = (& git -C $repo rev-list --count "$commit..$tip" 2>$null)
             $behindOk = ($LASTEXITCODE -eq 0)
             $ahead = (& git -C $repo rev-list --count "$tip..$commit" 2>$null)
