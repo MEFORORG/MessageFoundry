@@ -65,6 +65,7 @@ __all__ = [
     "TrustAnchorPolicy",
     "active_hop_posture",
     "APPROVED_SMTP_AUTH_MECHANISMS",
+    "assert_ldap3_tls_suites",
     "build_asserted_https_handler",
     "build_smtp_tls_context",
     "smtp_login_approved",
@@ -619,6 +620,74 @@ def build_asserted_https_handler(*, connector: str) -> urllib.request.HTTPSHandl
         )
     harden_cipher_suites(ctx, connector=connector)
     return handler
+
+
+#: The ``ldap3.Tls`` keyword arguments :func:`assert_ldap3_tls_suites` can faithfully replicate.
+#:
+#: These are the two the engine passes, and both are measured: ``validate`` becomes ``verify_mode`` (no
+#: effect on the suite list, replicated anyway so the probe mirrors ldap3's construction rather than
+#: approximating it), and ``ca_certs_file`` changes the trust anchors and not one entry of the
+#: negotiable suite list. Every OTHER ``Tls`` argument is REFUSED rather than ignored — see the
+#: function's docstring for why ``ciphers=`` in particular must never be quietly accepted here.
+_LDAP3_TLS_REPLICABLE_KWARGS = frozenset({"validate", "ca_certs_file"})
+
+
+def assert_ldap3_tls_suites(tls_kwargs: Mapping[str, object], *, connector: str) -> None:
+    """Assert the suite list of the context ``ldap3`` will build from these ``Tls`` arguments.
+
+    The LDAPS sibling of :func:`build_asserted_https_handler`, and the one site where that function's
+    method — hold the library's OWN context and check it — is **not available**. Measured: an
+    ``ldap3.Tls`` carries zero ``SSLContext`` attributes. It stores the arguments and builds the context
+    inside ``Tls.wrap_socket`` at connect time, from ``create_default_context(Purpose.SERVER_AUTH,
+    cafile=...)`` followed by ``check_hostname = False`` and ``verify_mode = validate``; there is no
+    ``ssl_context=`` parameter to inject one through. So the engine can never hold the object this hop
+    will use, and the identity check the urllib openers get in
+    ``tests/test_tls_cipher_assertion_sites.py`` is impossible here.
+
+    This therefore rebuilds ldap3's construction and asserts THAT. It is a weaker guarantee than
+    identity, and it is only honest because the gap is closed by measurement rather than by argument:
+    ``test_the_ldaps_replica_matches_the_context_ldap3_actually_builds`` drives ldap3's **real**
+    ``wrap_socket`` over a socketpair, captures the ``SSLContext`` off the resulting ``SSLSocket``, and
+    requires its suite list to equal this one's. If ldap3 changes how it builds that context, the
+    replica stops matching and that test goes red.
+
+    **It REFUSES any ``Tls`` argument it cannot replicate, and that refusal is load-bearing.** Passing
+    ``ciphers=`` is the obvious-looking way to harden this hop, and it is a trap: ``ldap3/core/tls.py``
+    wraps ``set_ciphers`` in ``except ssl.SSLError: pass``, so a cipher string OpenSSL rejects is
+    **swallowed silently** — measured, the hop then drops to 3 TLS 1.3 suites with the TLS 1.2 list
+    emptied, and nothing anywhere reports it. That is a control that cannot report its own failure, the
+    false-premise shape SDS-3.7 forbids. An argument outside :data:`_LDAP3_TLS_REPLICABLE_KWARGS`
+    therefore raises here rather than being replicated wrongly or passed over in silence.
+
+    ``ca_certs_file`` is accepted and deliberately **not loaded**: it changes the trust anchors and not
+    one entry of the suite list (measured), while loading it would move a missing-CA failure from
+    connect time to construction time — a behaviour change on a control whose whole point is to change
+    nothing about the connection.
+
+    Raises :class:`ValueError` at construction, like every other assertion site.
+    """
+    unreplicable = sorted(set(tls_kwargs) - _LDAP3_TLS_REPLICABLE_KWARGS)
+    if unreplicable:
+        raise ValueError(
+            f"{connector}: cannot assert this hop's TLS suites — ldap3.Tls argument(s) "
+            f"{', '.join(unreplicable)} change the context ldap3 builds in a way this check does not "
+            f"replicate, so it would be asserting a context the hop will not use. Note ldap3 SWALLOWS "
+            f"an invalid `ciphers=` string (except ssl.SSLError: pass), which silently strips every "
+            f"TLS 1.2 suite — route suite policy through this assertion, not through ldap3.Tls."
+        )
+    validate = tls_kwargs.get("validate")
+    if not isinstance(validate, int):
+        raise ValueError(
+            f"{connector}: cannot assert this hop's TLS suites — no `validate` given, so the peer "
+            f"verification mode ldap3 will apply is unknown. Refusing rather than guessing it."
+        )
+    ctx = ssl.create_default_context(purpose=ssl.Purpose.SERVER_AUTH)
+    # Order is ldap3's, and it matters: check_hostname must go False BEFORE verify_mode, or setting
+    # CERT_NONE on a hostname-checking context raises. (ldap3 runs its own hostname check after the
+    # handshake instead — `check_hostname(...)` at the end of Tls.wrap_socket.)
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.VerifyMode(validate)
+    harden_cipher_suites(ctx, connector=connector)
 
 
 def _is_forward_secret(cipher: Mapping[str, object]) -> bool:
