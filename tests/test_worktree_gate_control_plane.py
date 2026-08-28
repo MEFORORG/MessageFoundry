@@ -1136,3 +1136,238 @@ def test_rules_3_and_3d_are_unchanged_by_the_candidate_switches(repo: SimpleName
         run_gate(shell(f'git worktree remove "{repo.wt}"', cwd=repo.other), repo.repos)
     )
     assert "working tree of the SHARED PRIMARY checkout" not in removal
+
+
+# ------------------------------- rule 3c: an EXPLICIT target outranks the IMPLICIT cwd (ordering)
+#
+# Get-GitTargetCandidatesRaw builds an ORDERED candidate list and rule 3c takes the first candidate git
+# ANSWERS on. ``--git-dir`` / ``--work-tree`` / ``GIT_WORK_TREE`` used to be appended AFTER the cwd base,
+# and the cwd ALWAYS answers because it is always a real directory -- so the token the operator actually
+# TYPED could never decide.
+#
+# ONE ROOT CAUSE, SYMPTOMS IN BOTH DIRECTIONS, which is why these rows come in pairs and why the fix is
+# a reorder rather than a widening:
+#
+#     cwd UNGOVERNED, explicit token at the GOVERNED repo  -> was ALLOW, and the write really landed
+#                                                             in the governed config. A fail-open.
+#     cwd GOVERNED,   explicit token at an UNRELATED repo  -> was DENY, naming a repository the write
+#                                                             never touches. The BACKLOG #1085 shape.
+#
+# A test suite that only pinned the first direction would pass against a rule that simply denied
+# everything, so both directions are asserted and neither is optional.
+
+
+@pytest.fixture
+def unrelated(tmp_path: Path) -> Path:
+    """An independent repository OUTSIDE the governed root -- the ungoverned cwd these rows need."""
+    path = tmp_path / "Unrelated"
+    path.mkdir()
+    _init_independent_repo(path)
+    return path
+
+
+def test_an_explicit_gitdir_at_the_governed_repo_denies_from_an_UNGOVERNED_cwd(
+    repo: SimpleNamespace, unrelated: Path
+) -> None:
+    """The fail-open direction. The cwd answers first and is ungoverned, so the rule used to allow a
+    write that lands in the governed shared config."""
+    command = f'git --git-dir="{repo.primary}/.git" config core.hooksPath /nope'
+    reason = assert_denied(run_gate(shell(command, cwd=unrelated), repo.repos))
+    assert "setting 'core.hooksPath'" in reason
+
+
+def test_the_GIT_DIR_ENVIRONMENT_VARIABLE_is_enumerated_at_all(
+    repo: SimpleNamespace, unrelated: Path
+) -> None:
+    """The enumeration half, and the asymmetry was the tell: ``GIT_WORK_TREE`` has always been matched
+    on the line directly above, so the pair should have travelled together."""
+    command = f'GIT_DIR="{repo.primary}/.git" git config core.hooksPath /nope'
+    reason = assert_denied(run_gate(shell(command, cwd=unrelated), repo.repos))
+    assert "setting 'core.hooksPath'" in reason
+
+
+def test_an_explicit_gitdir_at_an_UNRELATED_repo_allows_from_a_GOVERNED_cwd(
+    repo: SimpleNamespace, unrelated: Path
+) -> None:
+    """The false-deny direction, and the row that stops the fix above being 'deny more'.
+
+    The write lands in the unrelated repository. Refusing it named a repository the command was never
+    going to touch, which is what teaches people to route around a gate.
+    """
+    command = f'git --git-dir="{unrelated}/.git" config core.hooksPath /nope'
+    assert run_gate(shell(command, cwd=repo.wt), repo.repos) is None
+
+
+def test_an_explicit_GIT_DIR_at_an_UNRELATED_repo_allows_from_a_GOVERNED_cwd(
+    repo: SimpleNamespace, unrelated: Path
+) -> None:
+    """The same pairing for the environment-variable spelling. Separate row because the enumeration and
+    the ordering are separate defects: a fix for one leaves this passing or failing on its own."""
+    command = f'GIT_DIR="{unrelated}/.git" git config core.hooksPath /nope'
+    assert run_gate(shell(command, cwd=repo.wt), repo.repos) is None
+
+
+def test_a_work_tree_flag_does_NOT_promote_and_that_distinction_is_measured(
+    repo: SimpleNamespace, unrelated: Path
+) -> None:
+    """Only ``--git-dir`` and ``GIT_DIR`` are promoted ahead of the cwd. ``--work-tree`` is not, and the
+    reason is measured rather than reasoned.
+
+    Run from an ungoverned repository with ``--work-tree`` naming the GOVERNED one, a ``git config``
+    write lands in the UNGOVERNED repo you are standing in -- verified by reading the value back, with
+    the ``--git-dir`` form as the control that lands in the governed one. So ``--work-tree`` names the
+    TREE and does not decide WHICH REPOSITORY'S CONFIG is written, which is the only question this rule
+    asks.
+
+    Promoting it anyway cost one hole and four false denies at once, in both directions -- the signature
+    of ranking a token that does not determine the answer. This row is what keeps it unpromoted.
+    """
+    command = f'git --work-tree="{repo.primary}" config core.hooksPath /nope'
+    assert run_gate(shell(command, cwd=unrelated), repo.repos) is None
+
+    # ...AND THE SAME LINE WITH --git-dir ADDED MUST DENY, which is what stops the row above being read
+    # as "work-tree shapes are exempt". The repository token is what decides, and here there is one.
+    both = f'git --work-tree="{repo.primary}" --git-dir="{repo.primary}/.git" config core.hooksPath /nope'
+    reason = assert_denied(run_gate(shell(both, cwd=unrelated), repo.repos))
+    assert "setting 'core.hooksPath'" in reason
+
+
+def test_a_repository_token_inside_a_QUOTED_VALUE_is_not_this_command_s_target(
+    repo: SimpleNamespace, unrelated: Path
+) -> None:
+    """The promotion is gated on the OWNING invocation, read off the BLANKED scan string.
+
+    Reading it off the RAW line opened a hole in one direction and closed work in the other, from one
+    cause. Here the alias VALUE mentions an ungoverned ``--git-dir``; the write itself sets ``alias.zz``
+    in the governed repo the session is standing in. A raw read let the ungoverned mention win the
+    candidate chain and ALLOWED a real disarm.
+    """
+    command = f'git config alias.zz "log --git-dir={unrelated}/.git"'
+    reason = assert_denied(run_gate(shell(command, cwd=repo.wt), repo.repos))
+    assert "setting 'alias.zz'" in reason
+
+    # The environment-variable spelling of the same decoy, which a fix for the flag alone would miss.
+    env_decoy = f'git config alias.zz "!env GIT_DIR={unrelated}/.git git log"'
+    assert_denied(run_gate(shell(env_decoy, cwd=repo.wt), repo.repos))
+
+
+def test_a_governed_path_merely_MENTIONED_does_not_earn_a_refusal(
+    repo: SimpleNamespace, unrelated: Path
+) -> None:
+    """The same cause through the other door, and the reason this is a separate row.
+
+    The write lands in an ungoverned repository; a governed path appears only in a trailing comment.
+    Refusing it names a repository the command never touches -- the BACKLOG #1085 shape -- and a suite
+    that pinned only the hole above would pass against a rule that simply denied every line carrying
+    the characters ``--git-dir``.
+    """
+    command = f'git config core.hooksPath /dev/null # --git-dir="{repo.primary}/.git"'
+    assert run_gate(shell(command, cwd=unrelated), repo.repos) is None
+
+    in_message = (
+        f'git commit --allow-empty -m "see --git-dir={repo.primary}/.git"'
+        " && git config core.hooksPath /nope"
+    )
+    assert run_gate(shell(in_message, cwd=unrelated), repo.repos) is None
+
+
+def test_GIT_DIR_does_not_reach_rules_3_and_3d(repo: SimpleNamespace) -> None:
+    """The opt-in really is opt-in, asserted rather than claimed.
+
+    ``GIT_DIR`` is enumerated for rule 3c only. An earlier version appended it to the candidate list
+    for every caller, reasoning it sat behind the base where it could not win -- but rules 3 and 3d
+    walk the WHOLE list, so it won, and ``GIT_DIR=<governed> git clean -fd`` flipped from ALLOW to
+    DENY. A switch whose off-state is not byte-identical to the previous behaviour is not opt-in.
+    """
+    for verb in ("clean -fd", "reset --hard"):
+        command = f'GIT_DIR="{repo.primary}/.git" git {verb}'
+        assert run_gate(shell(command, cwd=repo.other), repo.repos) is None, verb
+
+
+def test_a_repository_token_owned_by_an_EARLIER_command_is_not_the_disarm_s_target(
+    repo: SimpleNamespace, unrelated: Path
+) -> None:
+    """The owning window's LEFT edge, which no other row pins.
+
+    The window runs from the separator before the DISARMING invocation, so a repository token belonging
+    to an earlier command in the same chain is outside it. Both directions are asserted, because a
+    window that was merely too wide would pass the first and fail the second.
+    """
+    chain = f'git --git-dir="{repo.primary}/.git" log -1 && git config core.hooksPath /dev/null'
+
+    # From a GOVERNED cwd the disarm reaches the governed config, and the earlier token is irrelevant.
+    reason = assert_denied(run_gate(shell(chain, cwd=repo.wt), repo.repos))
+    assert "setting 'core.hooksPath'" in reason
+
+    # From an UNGOVERNED cwd the disarm lands there. A window that swallowed the earlier command's
+    # token would refuse this and name the primary, which the write never touches.
+    assert run_gate(shell(chain, cwd=unrelated), repo.repos) is None
+
+
+def test_a_REPEATED_repository_token_is_read_the_way_git_reads_it(
+    repo: SimpleNamespace, unrelated: Path
+) -> None:
+    """Repeated ``--git-dir`` is LAST-wins in git, and a first-match read inverts the answer.
+
+    PowerShell's ``-cmatch`` keeps the FIRST match. Repeated ``-C`` options are CUMULATIVE in git, so
+    first-to-last is right for those; ``--git-dir`` is not cumulative and the LAST one decides. Reading
+    the first meant a line naming an ungoverned repo and then the governed one really wrote to the
+    GOVERNED config while the rule read the ungoverned token and allowed it.
+
+    Both directions, because a fix that simply reversed without understanding why would pass one.
+    """
+    ungoverned_then_governed = (
+        f'git --git-dir="{unrelated}/.git" --git-dir="{repo.primary}/.git"'
+        " config core.hooksPath /dev/null"
+    )
+    reason = assert_denied(run_gate(shell(ungoverned_then_governed, cwd=repo.primary), repo.repos))
+    assert "setting 'core.hooksPath'" in reason
+
+    governed_then_ungoverned = (
+        f'git --git-dir="{repo.primary}/.git" --git-dir="{unrelated}/.git"'
+        " config core.hooksPath /dev/null"
+    )
+    assert run_gate(shell(governed_then_ungoverned, cwd=unrelated), repo.repos) is None
+
+
+def test_a_RELATIVE_repository_token_composes_the_cd_prefix(
+    repo: SimpleNamespace, unrelated: Path
+) -> None:
+    """Compose, never replace -- the rule the ``-C`` branch already states, absent from the promoted one.
+
+    This is the BACKLOG #1085 defect reintroduced on a new path. An uncomposed relative token resolves
+    against the SESSION cwd, so it misses the repository the ``cd`` actually moved to: the write lands
+    in the governed repo while the rule judges somewhere else entirely.
+    """
+    into_governed = f'cd "{repo.primary}" && git --git-dir=.git config core.hooksPath /dev/null'
+    reason = assert_denied(run_gate(shell(into_governed, cwd=unrelated), repo.repos))
+    assert "setting 'core.hooksPath'" in reason
+
+    into_ungoverned = f'cd "{unrelated}" && git --git-dir=.git config core.hooksPath /dev/null'
+    assert run_gate(shell(into_ungoverned, cwd=repo.primary), repo.repos) is None
+
+
+def test_the_ordering_switch_did_not_leak_into_rules_3_and_3d(
+    repo: SimpleNamespace, unrelated: Path
+) -> None:
+    """The blast-radius control, asserted rather than argued.
+
+    ``-ExplicitFirst`` is opt-in and only rule 3c passes it, so rules 3 and 3d must see the candidate
+    list they always saw. These rows carry the very tokens whose order changed, and each asserts its
+    OWN rule's refusal text -- a row checking only "denied" would pass if all three rules had collapsed
+    into one.
+    """
+    tree_swap = assert_denied(
+        run_gate(
+            shell(f'git --git-dir="{unrelated}/.git" reset --hard', cwd=repo.primary), repo.repos
+        )
+    )
+    assert "working tree of the SHARED PRIMARY checkout" in tree_swap
+
+    removal = assert_denied(
+        run_gate(
+            shell(f'GIT_DIR="{unrelated}/.git" git worktree remove "{repo.wt}"', cwd=repo.other),
+            repo.repos,
+        )
+    )
+    assert "working tree of the SHARED PRIMARY checkout" not in removal

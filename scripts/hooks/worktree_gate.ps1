@@ -390,14 +390,24 @@ function Resolve-ShellIndirection([string]$Token, [string]$Prefix) {
 }
 
 function Get-GitTargetCandidatesRaw([string]$Line, [string]$Prefix, [string]$CwdRaw,
-                                   [switch]$AllTargets, [switch]$BaseFallback) {
+                                   [switch]$AllTargets, [switch]$BaseFallback,
+                                   [switch]$ExplicitFirst) {
     <#
-    TWO OPT-IN SWITCHES, BOTH DEFAULT OFF, ADDED FOR BACKLOG #1065. Rules 3 and 3d call this with three
-    positional arguments and are therefore byte-identical to before; only rule 3c opts in. That is
-    deliberate blast-radius control: #1065 has already killed two rewrites, and both died the same way --
-    the replacement turned out NARROWER than the regex it displaced, and every place it was narrower
-    became a hole. Neither switch replaces any matching. Each only ADDS candidates, so neither can turn a
-    caller's current DENY into an ALLOW.
+    THREE OPT-IN SWITCHES, ALL DEFAULT OFF. Rules 3 and 3d call this with three positional arguments
+    and are therefore byte-identical to before; only rule 3c opts in. That is deliberate blast-radius
+    control: #1065 has already killed two rewrites, and both died the same way -- the replacement turned
+    out NARROWER than the regex it displaced, and every place it was narrower became a hole.
+
+    *** THIS DOCSTRING PREVIOUSLY SAID "TWO SWITCHES" AND CLAIMED THAT "each only ADDS candidates, so
+    neither can turn a caller's current DENY into an ALLOW". BOTH WERE FALSE AND THE SECOND WAS
+    DANGEROUS. *** -ExplicitFirst REORDERS rather than adds, and reordering moves a candidate that used
+    to decide out of first place, which turns DENY into ALLOW by construction -- measured at roughly
+    fifty rows. The false sentence sat directly above the code that violated it, which is the worst
+    place for a wrong claim: a reviewer reads the reassurance instead of the ordering.
+
+    THE STANDING RULE THIS LEAVES BEHIND: a switch is only "additive" if its OFF state is byte-identical
+    AND its ON state appends. -ExplicitFirst satisfies the first and not the second, so it is an
+    ORDERING switch and is documented as one.
 
     ``-AllTargets`` -- return EVERY `-C` on the line, in order, instead of the first alone. The pattern is
     the same string and [regex]::Matches is case-SENSITIVE by default, exactly as the `-cmatch` it
@@ -454,20 +464,93 @@ function Get-GitTargetCandidatesRaw([string]$Line, [string]$Prefix, [string]$Cwd
                 $out += $dashC
             }
         }
-        # LAST, never first: the caller walks these in order, so appending here cannot displace the token
-        # a `-C` names. Inside this branch on purpose -- the else below already emits the base.
-        if ($BaseFallback) { $out += $(if ($cd) { $cd } else { $CwdRaw }) }
+        $emitBase = [bool]$BaseFallback
     } else {
-        $out += $(if ($cd) { $cd } else { $CwdRaw })
+        $emitBase = $true
     }
 
-    # ADDITIONAL, never instead of: see the note above.
-    if ($Line -cmatch '(?:^|\s)--work-tree[=\s]+"?([^"\s]+)"?') { $out += $Matches[1]; $out += $CwdRaw }
-    if ($Line -cmatch '(?:^|\s)GIT_WORK_TREE="?([^"\s]+)"?')    { $out += $Matches[1]; $out += $CwdRaw }
-    # --git-dir names the repo; the tree is its parent. Add both rather than reason about which.
-    if ($Line -cmatch '(?:^|\s)--git-dir[=\s]+"?([^"\s]+)"?') {
-        $out += $Matches[1]
-        $out += (Join-Path $Matches[1] "..")
+    # ===================================================================================================
+    # THE EXPLICITLY NAMED REPOSITORY, COLLECTED SEPARATELY SO IT CAN OUTRANK THE IMPLICIT cwd.
+    #
+    # THE DEFECT THIS FIXES. These tokens used to be APPENDED AFTER the base, and the caller walks the
+    # list taking the first candidate git ANSWERS on. The cwd ALWAYS answers, because it is always a
+    # real directory -- so a `--git-dir` naming a different repository could never win, and the token
+    # the operator actually TYPED was the one that never decided.
+    #
+    # ONE ROOT CAUSE, SYMPTOMS IN BOTH DIRECTIONS, which is why the fix is a reorder and not a widening:
+    #   FAIL-OPEN   cwd ungoverned, `--git-dir` at the governed repo -> ALLOWED, and the write really
+    #               lands in the governed config. Proven by reading the value back, not by verdict.
+    #   FALSE DENY  cwd governed, `--git-dir` at an unrelated repo   -> DENIED, naming a repository the
+    #               write never touches. That is the BACKLOG #1085 shape.
+    # Putting the explicit token first fixes both at once. Neither is reachable by adding candidates.
+    #
+    # GIT_DIR IS ENUMERATED HERE FOR THE FIRST TIME, and its absence was visible in the asymmetry: the
+    # line above it has always matched GIT_WORK_TREE. The pair should have travelled together.
+    # ===================================================================================================
+    # ONLY --git-dir AND GIT_DIR ARE PROMOTED, AND --work-tree IS DELIBERATELY NOT. That distinction is
+    # MEASURED, not reasoned: run from an ungoverned repo with --work-tree naming the GOVERNED one, a
+    # `git config` write lands in the UNGOVERNED repo you are standing in; the same shape with --git-dir
+    # lands in the governed one. So --work-tree names the TREE and does not decide WHICH REPOSITORY'S
+    # CONFIG is written, which is the only question rule 3c asks.
+    #
+    # PROMOTING IT ANYWAY COST ONE HOLE AND FOUR FALSE DENIES, in both directions at once, which is the
+    # signature of ranking a token that does not determine the answer. Those five rows are why the
+    # promotion below is a two-token list rather than the four it started as.
+    #
+    # --work-tree and GIT_WORK_TREE STILL EMIT, unpromoted, exactly where they always did: rule 3 asks
+    # about the WORKING TREE, where they are precisely the right token, and this list is shared.
+    # ===================================================================================================
+    # THE PROMOTED TOKENS GET EVERY TREATMENT THE `-C` BRANCH ABOVE APPLIES. THIS BLOCK IS A PARITY
+    # AUDIT, NOT A FEATURE, and it exists because three separate rounds of defects all had one shape:
+    # the `-C` branch had already solved the problem and this block did not inherit the solution.
+    #
+    #   TREATMENT                       `-C` branch      here
+    #   read off the blanked scan       (caller-side)    yes, via $ownGitDir gating -ExplicitFirst
+    #   every match, not just the first yes              YES, and it was missing -- see LAST-WINS below
+    #   compose a `cd` prefix           yes              YES, and it was missing -- see COMPOSE below
+    #
+    # LAST-WINS, AND IT IS THE OPPOSITE OF THE `-C` BRANCH'S ORDER, DELIBERATELY. Repeated `-C` options
+    # are CUMULATIVE in git, so first-to-last is the right walk there. A repeated `--git-dir` is not
+    # cumulative: THE LAST ONE WINS, and `-cmatch` keeps the FIRST. So a line naming an ungoverned repo
+    # and then the governed one really wrote to the GOVERNED config while this rule read the ungoverned
+    # token and allowed it. Reversing the match order makes the candidate git will actually use the
+    # first one tried.
+    #
+    # COMPOSE, NEVER REPLACE -- the same rule the `-C` branch states, and its absence here was the
+    # BACKLOG #1085 defect reintroduced on a new path: `cd <governed> && git --git-dir=.git config <key>`
+    # writes to the GOVERNED repo while an uncomposed `.git` resolves against the session cwd and misses
+    # it entirely. Guarded on IsPathRooted exactly as above, so an absolute token is untouched.
+    # ===================================================================================================
+    $promoted = @()
+    foreach ($pat in @('(?:^|\s)--git-dir[=\s]+"?([^"\s]+)"?', '(?:^|\s)GIT_DIR="?([^"\s]+)"?')) {
+        $hits = @([regex]::Matches($Line, $pat) | ForEach-Object { $_.Groups[1].Value })
+        [array]::Reverse($hits)
+        foreach ($hit in $hits) {
+            $rooted = $(if ($cd -and -not [System.IO.Path]::IsPathRooted($hit)) { Join-Path $cd $hit } else { $hit })
+            $promoted += $rooted
+            $promoted += (Join-Path $rooted "..")
+        }
+    }
+    $explicit = @()
+    if ($Line -cmatch '(?:^|\s)--work-tree[=\s]+"?([^"\s]+)"?') { $explicit += $Matches[1]; $explicit += $CwdRaw }
+    if ($Line -cmatch '(?:^|\s)GIT_WORK_TREE="?([^"\s]+)"?')    { $explicit += $Matches[1]; $explicit += $CwdRaw }
+
+    # THE SWITCH IS OPT-IN AND DEFAULT-OFF, so rules 3 and 3d keep the exact list they had: explicit
+    # tokens after the base, in the same order, with GIT_DIR appended at the end where -- being behind
+    # the base -- it cannot change any verdict they reach. Only rule 3c opts in. Same blast-radius
+    # control as -AllTargets, and for the same reason: two earlier attempts at this rule were rejected
+    # for changing behaviour a caller did not ask for.
+    if ($ExplicitFirst) {
+        $out += $promoted
+        if ($emitBase) { $out += $(if ($cd) { $cd } else { $CwdRaw }) }
+        $out += $explicit
+    } else {
+        # $promoted IS NOT EMITTED AT ALL HERE, and that is the correction. Appending it "behind the
+        # base, where it cannot win" was wrong: rules 3 and 3d walk the whole list, so GIT_DIR reached
+        # callers that never opted in and turned `GIT_DIR=<governed> git clean -fd` from ALLOW into
+        # DENY. Byte-identical to the pre-change list is the only safe meaning of opt-in.
+        if ($emitBase) { $out += $(if ($cd) { $cd } else { $CwdRaw }) }
+        $out += $explicit
     }
     $out | Where-Object { $_ }
 }
@@ -1491,6 +1574,33 @@ if ($tool -in @("Bash", "PowerShell")) {
         # is a config override and not a path, and reading it as one is how a real `-C` got shadowed once.
         $ownDashC = ($ownWin -cmatch '(?:^|\s)-C\s')
 
+        # DOES THE DISARMING INVOCATION CARRY ITS OWN REPOSITORY TOKEN? Same question -AllTargets asks
+        # about `-C`, and it has to be asked for the same reason: a `--git-dir` that is not this
+        # command's is not this command's target.
+        #
+        # THE WINDOW STARTS AT THE SEPARATOR, NOT AT THE git TOKEN, because an environment assignment
+        # PRECEDES the command: `GIT_DIR=<x> git config ...` puts the token BEFORE `git`, where $ownWin
+        # cannot see it. So this window is [after the last separator at or before the owning git token,
+        # the disarm) and it therefore covers both spellings.
+        #
+        # READ OFF $seg.Scan, WHICH IS WHAT MAKES IT CORRECT. Quoted spans are blanked there, so a
+        # --git-dir inside an alias VALUE or a commit MESSAGE is not in the window at all. Reading the
+        # RAW line instead is exactly the defect this replaces: it opened two holes
+        # (`git config alias.zz "log --git-dir=<ungoverned>"` ALLOWED while the write landed in the
+        # governed repo) and three false denies (a governed path merely MENTIONED in a comment, a
+        # message, or an alias body). Both directions from one cause, which is the tell.
+        $ownStart = 0
+        if ($own) {
+            $sepBefore = [regex]::Matches($seg.Scan.Substring(0, $own.Index), '[;&|(){}]')
+            if ($sepBefore.Count -gt 0) {
+                $last = $sepBefore[$sepBefore.Count - 1]
+                $ownStart = $last.Index + $last.Length
+            }
+        }
+        if ($ownStart -gt $dis.Index) { $ownStart = $dis.Index }
+        $ownCmdWin = $seg.Scan.Substring($ownStart, $dis.Index - $ownStart)
+        $ownGitDir = ($ownCmdWin -match '(?:^|\s)(--git-dir[=\s]|GIT_DIR=)')
+
         # THE CHDIR GUARD, AND ITS POSITION BOUND IS THE LOAD-BEARING HALF. $pfx is sliced at the FIRST git
         # token, so the resolver's own `cd` composer cannot see a chdir that appears AFTER it. Without this
         # guard `git commit -C HEAD && cd <ungoverned> && git config <key> v` denied and NAMED THE GOVERNED
@@ -1537,7 +1647,7 @@ if ($tool -in @("Bash", "PowerShell")) {
         # token must not end the question. The residual is stated rather than hidden: two `-C` tokens
         # inside one owning span are decided by whichever ANSWERS first, so a governed one can still win
         # over an ungoverned one. That errs CLOSED and is narrower than before this change.
-        $where = @(Get-GitTargetCandidatesRaw $seg.Raw $pfx $cwdRaw -AllTargets:$ownDashC -BaseFallback:$fallbackOk)
+        $where = @(Get-GitTargetCandidatesRaw $seg.Raw $pfx $cwdRaw -AllTargets:$ownDashC -BaseFallback:$fallbackOk -ExplicitFirst:$ownGitDir)
         if ($where.Count -eq 0) { continue }
 
         # ROOT THE TARGET AGAINST THE SESSION CWD BEFORE ASKING GIT ANYTHING (BACKLOG #1061). This block
