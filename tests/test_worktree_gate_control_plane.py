@@ -195,6 +195,106 @@ def test_config_in_an_ungoverned_repo_is_untouched(tmp_path: Path, repo: SimpleN
     assert run_gate(shell("git config core.hooksPath /dev/null", cwd=other), repo.repos) is None
 
 
+def _init_independent_repo(path: Path) -> None:
+    """A real, independent repository: its own objects, its own config, its own git dir."""
+    subprocess.run(["git", "init", "-b", "main", str(path)], check=True, capture_output=True)
+    for key, value in (("user.email", "t@example.com"), ("user.name", "t")):
+        subprocess.run(
+            ["git", "config", key, value], cwd=str(path), check=True, capture_output=True
+        )
+
+
+@pytest.fixture
+def vendored(repo: SimpleNamespace) -> Path:
+    """An independent clone living UNDER the governed root -- sharing its path and nothing else."""
+    path = repo.primary / "vendor" / "thirdparty"
+    path.mkdir(parents=True)
+    _init_independent_repo(path)
+    return path
+
+
+def test_a_repo_VENDORED_UNDER_a_governed_root_is_not_governed_by_it(
+    repo: SimpleNamespace, vendored: Path
+) -> None:
+    """BACKLOG #1067. Governance is repository IDENTITY, not a path prefix.
+
+    An independent clone living under a governed root shares nothing with it but its path, so a disarm
+    write there cannot reach the governed repo's config. The committed gate compared the TARGET's common
+    dir against the root's WORKING TREE path, so every repository under that root inherited its
+    governance -- and the refusal went on to assert a shared ``.git`` the vendored clone does not have.
+    A refusal that misdescribes what it blocked teaches people to route around the gate.
+    """
+    assert run_gate(shell("git config core.hooksPath /dev/null", cwd=vendored), repo.repos) is None
+
+
+def test_a_vendored_repo_is_ungoverned_when_named_by_an_ABSOLUTE_PATH_too(
+    repo: SimpleNamespace, vendored: Path
+) -> None:
+    """The same defect through the other door, and the reason this is a second row rather than a second
+    assertion: ``git -C <target>`` is judged from the PRIMARY's cwd, so a fix that consulted only the
+    session's own repository would leave this spelling denying while the row above went green."""
+    command = f'git -C "{vendored}" config core.hooksPath /dev/null'
+    assert run_gate(shell(command, cwd=repo.primary), repo.repos) is None
+
+
+def test_a_worktree_NESTED_under_the_governed_root_still_denies(repo: SimpleNamespace) -> None:
+    """The control that makes the two rows above a fix and not a hole.
+
+    A tree under ``.claude/worktrees/`` has the SAME PATH SHAPE as the vendored clone and the opposite
+    right answer, because its common dir really is the primary's. Path shape cannot tell them apart;
+    repository identity can. Without this row the item's fix is indistinguishable from deleting rule 3c's
+    governance test altogether.
+    """
+    nested = repo.primary / ".claude" / "worktrees" / "wt-nested"
+    nested.parent.mkdir(parents=True)
+    subprocess.run(
+        ["git", "worktree", "add", "-b", "nested-branch", str(nested)],
+        cwd=str(repo.primary),
+        check=True,
+        capture_output=True,
+    )
+    reason = assert_denied(
+        run_gate(shell("git config core.hooksPath /dev/null", cwd=nested), repo.repos)
+    )
+    assert "SHARED git configuration" in reason
+
+
+def test_a_SUBMODULE_of_a_governed_root_still_denies(repo: SimpleNamespace, tmp_path: Path) -> None:
+    """Pins the answer this item deliberately did NOT decide.
+
+    A submodule's git dir is ``<primary>/.git/modules/<name>``, so an identity-ONLY predicate would flip
+    it from DENY to ALLOW as a side effect of fixing the vendored case. Comparing equality-or-UNDER the
+    root's own common dir leaves it exactly where it was. Whether submodules SHOULD be governed is its
+    own question, and this row exists so that answering it has to be a decision.
+    """
+    upstream = tmp_path / "Upstream"
+    _init_independent_repo(upstream)
+    (upstream / "f.txt").write_text("x\n", encoding="utf-8")
+    subprocess.run(["git", "add", "-A"], cwd=str(upstream), check=True, capture_output=True)
+    subprocess.run(["git", "commit", "-m", "s"], cwd=str(upstream), check=True, capture_output=True)
+    added = subprocess.run(
+        [
+            "git",
+            "-c",
+            "protocol.file.allow=always",
+            "submodule",
+            "add",
+            str(upstream).replace("\\", "/"),
+            "sub",
+        ],
+        cwd=str(repo.primary),
+        capture_output=True,
+        text=True,
+    )
+    if added.returncode != 0:
+        pytest.skip(f"git refused a file-protocol submodule here: {added.stderr.strip()[:200]}")
+    sub = repo.primary / "sub"
+    reason = assert_denied(
+        run_gate(shell("git config core.hooksPath /dev/null", cwd=sub), repo.repos)
+    )
+    assert "SHARED git configuration" in reason
+
+
 def test_a_non_repo_cwd_fails_open(tmp_path: Path, repo: SimpleNamespace) -> None:
     """`rev-parse --git-common-dir` fails outside a repo, and every git failure must ALLOW -- a guardrail
     that wedges on an unexpected shape gets uninstalled."""
