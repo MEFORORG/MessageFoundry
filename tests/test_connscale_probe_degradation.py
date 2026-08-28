@@ -140,6 +140,75 @@ def test_a_walk_that_spends_its_budget_records_walk_timeout(
     assert sampler._resolve_degraded is ProbeDegraded.WALK_TIMEOUT
 
 
+def test_the_rewalk_interval_outlives_a_walk_that_spends_its_whole_budget() -> None:
+    """The re-walk interval must be STRICTLY longer than a walk's own timeout.
+
+    ``_resolve_pids`` stamps ``_last_walk_at`` BEFORE the walk, deliberately, so that a failing
+    enumeration is charged for the ATTEMPT rather than retrying flat out. That charge is worth
+    nothing unless the interval outlives the longest legal attempt.
+
+    WHEN THESE TWO WERE EQUAL -- both 5.0, as originally written -- a walk that spent its whole
+    budget returned at exactly ``now - _last_walk_at == 5.0``, the ``>=`` was already satisfied, and
+    the next tick re-walked. A failed walk does not cache, so ``_pids is not None`` stayed satisfied
+    and it was this trigger, rather than the "never resolved, retry next tick" path, that fired --
+    every tick, each one emitting a degraded gap instead of serving the cached reading.
+
+    So the amortisation asserted in ``_FRONTLOAD_WALKS``' docstring and in ADR 0179 was worth exactly
+    zero on the single path it existed to bound: a compensating control resting on a false premise
+    (CLAUDE.md section 11, SDS-3.7). This test is what stops the two drifting back into equality,
+    because nothing else in the file couples them and the failure is silent -- the probe keeps
+    working, it just stops amortising and quietly degrades every reading.
+
+    WALK_TIMEOUT is a first-class enumerated cause with its own test directly above, and the shipped
+    profiles afford many ticks per step for it to repeat in, so this is a reachable condition rather
+    than a theoretical one.
+    """
+    assert probe_module._RESOLVE_INTERVAL_S > probe_module._PROBE_TIMEOUT_S, (
+        f"_RESOLVE_INTERVAL_S ({probe_module._RESOLVE_INTERVAL_S}) must be STRICTLY greater than "
+        f"_PROBE_TIMEOUT_S ({probe_module._PROBE_TIMEOUT_S}): a walk that spends its whole budget "
+        "would otherwise be due for a re-walk the instant it returns, and would re-walk every tick."
+    )
+
+
+def test_a_timed_out_walk_is_not_due_for_a_rewalk_the_instant_it_returns(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The behavioural half: charge the attempt, then honour the interval.
+
+    The constant check above pins the margin; this pins what the margin BUYS, so that a future
+    refactor which keeps the constants apart but stamps ``_last_walk_at`` after the walk -- or drops
+    the stamp on the failure path -- is still caught.
+
+    ``frontload_walks=0`` is load-bearing and my first version of this test omitted it, which made
+    the test fail against the FIXED code. The front-load is a SECOND, independent trigger that runs
+    the opening walks back to back on purpose, so with it active ``_due_for_rewalk`` is true for a
+    reason that has nothing to do with the interval. Isolating the interval is the whole point here;
+    the front-load has its own tests.
+    """
+    _with_subprocess(monkeypatch, _spent_its_budget)
+    # Real interval, front-load exhausted, so the ONLY live trigger is the one under test.
+    sampler = FdSampler(_DEAD_PID, frontload_walks=0)
+    sampler._pids = [_DEAD_PID]  # a cache exists, so the "never resolved" path is not what fires
+
+    assert sampler._resolve_pids() is not None
+    # The walk was charged even though it failed. This alone is worth pinning: drop the stamp on the
+    # failure path and a failing walk re-runs every tick regardless of any interval.
+    assert sampler._last_walk_at > 0.0, "a failed walk must still charge for its attempt"
+
+    # NOW MODEL A WALK THAT ACTUALLY CONSUMED ITS WHOLE BUDGET. The _spent_its_budget stub raises
+    # TimeoutExpired IMMEDIATELY, so no real time passes and the assertion below would hold under ANY
+    # interval -- my first version stopped here and was green even with the two constants equal, which
+    # made it a test that could not fail for the reason it claimed. Rewinding the stamp by exactly the
+    # walk timeout reproduces the real elapsed case without a five-second sleep.
+    sampler._last_walk_at -= probe_module._PROBE_TIMEOUT_S
+
+    assert not sampler._due_for_rewalk(), (
+        f"a walk that spent its full {probe_module._PROBE_TIMEOUT_S}s budget is already due again -- "
+        f"the interval ({probe_module._RESOLVE_INTERVAL_S}s) does not outlive the walk timeout, so "
+        "the attempt charge buys nothing and the probe re-walks every tick"
+    )
+
+
 def test_a_walk_that_errors_fast_records_walk_error(monkeypatch: pytest.MonkeyPatch) -> None:
     # TimeoutExpired subclasses SubprocessError, so a single `except (OSError, SubprocessError)` would
     # collapse this case into the timeout one. The two earn opposite verdicts; keep them apart.

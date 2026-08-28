@@ -80,7 +80,23 @@ _WIN_CPU_TICKS_PER_S = 10_000_000.0
 # covers the beginning of the measurement window.
 _FRONTLOAD_WALKS = 4
 # "Every few seconds" -- what the retired tick constant's comment intended, now stated in its own unit.
-_RESOLVE_INTERVAL_S = 5.0
+#
+# *** IT MUST BE STRICTLY GREATER THAN _PROBE_TIMEOUT_S, AND THAT IS A CORRECTNESS COUPLING RATHER
+# THAN A TASTE. *** `_resolve_pids` stamps `_last_walk_at` BEFORE the walk, deliberately, so a failing
+# enumeration is CHARGED FOR THE ATTEMPT rather than retrying flat out. But charging an attempt buys
+# nothing if the interval is not longer than the attempt can legally take: a walk that spends its
+# whole 5.0s timeout budget returns at exactly `now - _last_walk_at == 5.0`, `>=` is already true, and
+# the next tick re-walks. A failed walk does NOT cache, so `_pids is not None` stays satisfied and it
+# is this trigger -- not the "never resolved, retry next tick" path -- that fires, every tick, each
+# time emitting a degraded gap instead of serving the cached reading.
+#
+# These two were BOTH 5.0 when this was written, so the amortisation the docstring and ADR 0179 claim
+# was worth exactly zero on the one path it existed to bound. WALK_TIMEOUT is not hypothetical: it is
+# an enumerated cause with its own test, and the shipped profiles (connscale.toml hold_seconds 60.0,
+# estate-demo.toml 120.0) afford many ticks per step for it to repeat in. The margin is asserted by
+# test_the_rewalk_interval_outlives_a_walk_that_spends_its_whole_budget so the two cannot drift back
+# into equality unnoticed.
+_RESOLVE_INTERVAL_S = 15.0
 # .NET DateTime.Ticks are 100-ns units on the same scale as TotalProcessorTime.Ticks above, but they
 # mean an INSTANT, not a duration — kept as its own name so the two never get conflated.
 _WIN_DATETIME_TICKS_PER_S = 10_000_000.0
