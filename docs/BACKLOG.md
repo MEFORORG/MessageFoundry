@@ -5214,6 +5214,28 @@ A bare `Write-Output main$(calc):seed.txt` emits `mainPWNED-EXECUTED:seed.txt`. 
 **Source:** found 2026-08-06 by a three-pass audit (inventory, adversarial attack, refutation) of the committed gate, prompted by a coordination message from a peer session generalising this gate. That message's own premise was overturned by measurement: the values it named are newline-unreachable here, and the reachable defect was one its proposed fix would not have closed.
 
 ## 1082. Rule 3c's deny text for a `--global` or `--system` disarm write names the wrong mechanism, and whether the write takes effect is not knowable from the command
+> **THE WORDING IS FIXED 2026-08-27; the banner stays open for the archive pass. THE VERDICT DID NOT
+> MOVE, which is the property this item most needed protecting.** Rule 3c had ZERO mentions of
+> `--global`/`--system`, so it emitted the shared-config sentence for every scope. It now branches: a
+> scoped write is told which file it actually writes, and why it is refused anyway (git falls back to
+> that scope when the repository does not set the key). The repository-scope wording is UNCHANGED and
+> pinned by its own control, so this did not trade one false sentence for another.
+>
+> **NOTHING IN THE NEW TEXT REASSURES**, and the tests pin the absence of four phrases rather than the
+> presence of one. That is this row's round-4 lesson: segments are judged one at a time and `Write-Deny`
+> exits on the first hit, so a reassurance prints over a real disarm when a LATER segment does a local
+> write.
+>
+> **A QUALIFIER THIS ROW DOES NOT HAVE, measured 2026-08-27: whether a `--global` write takes effect
+> depends on WHERE IT IS READ FROM, not only on the repository.** From a worktree `core.hooksPath` is
+> set at worktree scope -- **75 of 76** `config.worktree` files set it -- so global loses to the more
+> specific scope. **From the primary it is unset at every scope** (`--get` exit 1, against a control of
+> `core.bare` exit 0), so a `--global` write there WOULD take effect. The row states only the first and
+> reads as though it settled the question for the repository. Denying stays correct for both.
+>
+> **The multi-line residual this row names is NOT fixed here** and still needs its own item: segments
+> are split on lines and the first hit exits, so a multi-line command is judged by its first segment.
+>
 
 > 🔢 **Re-scored 2026-08-20 -> P3.** Value **4/10** · Difficulty **3/10** · _fill-in_. The wrong sentence is still the only one rule 3c emits, and the rule reaches it for a --global write because the only pre-deny exclusion at :981 is for reads, so a governed cwd resolves and denies with prose that names a mechanism the write does not use. The verdict must stay deny, so the work is a scope-aware wording plus a test that asserts the string rather than the verdict. _(was 4/10 · 3/10.)_
 >
