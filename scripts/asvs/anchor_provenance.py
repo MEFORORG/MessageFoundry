@@ -116,9 +116,12 @@ def _blob(root: Path, ref: str, path: str, cache: dict[tuple[str, str], str | No
     # git is read-only here and every argument is a ref or path the scorecard authored, never a
     # caller-supplied executable.
     proc = subprocess.run(  # nosec B603 B607 - fixed argv, no shell; read-only git
+        # Explicit UTF-8: ``text=True`` alone decodes with the LOCALE encoding, so a source file
+        # carrying any non-ASCII byte would be mangled and its token offsets shifted.
         ["git", "-C", str(root), "show", f"{ref}:{path}"],
         capture_output=True,
         text=True,
+        encoding="utf-8",
         errors="replace",
     )
     cache[key] = proc.stdout if proc.returncode == 0 else None
