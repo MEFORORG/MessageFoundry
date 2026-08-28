@@ -25,7 +25,20 @@ corpus_count_per_trigger = 10
 
 [connscale.slo]
 zero_loss = true
-# Loose `>=` monotonicity smokes (CI runners are noisy — mf-ci-test-flakes): FD count + total
-# empty-claims/sec at N=100 must be >= N=50 within each sweep mode.
+# Loose `>=` monotonicity smoke (CI runners are noisy — mf-ci-test-flakes): FD count at N=100 must
+# be >= N=50 within each sweep mode.
 fd_monotonic = true
-empty_claims_monotonic = true
+# DISARMED TO MATCH THE IN-SUITE PROFILE, and the two are deliberately the same answer because
+# nothing pins them together — a band armed here and disarmed in tests/test_connscale_smoke.py is
+# two definitions of one metric's floor, free to drift.
+#
+# THE EVIDENCE IS FROM N=12/24, NOT FROM THIS PROFILE'S N=50/100. Measured on 252 pairs from 126
+# green CI legs: the ratio's premise holds on ubuntu (median 1.671, sd 0.079, never below parity)
+# and fails on both Windows legs (medians 1.062 and 1.136, at or below parity in 38 and 21 percent
+# of PASSING runs), so the 0.75 floor sits inside the Windows body rather than between two modes.
+#
+# WHETHER THAT CARRIES TO N=50/100 IS UNMEASURED. This profile is not run by any workflow today
+# (`--connscale` appears zero times under .github/), so the flag gates nothing and the safe state is
+# the one that cannot arrive armed in a CI leg somebody wires up later. Re-arm it with readings from
+# THIS N, not from the smoke's. BACKLOG #1211.
+empty_claims_monotonic = false

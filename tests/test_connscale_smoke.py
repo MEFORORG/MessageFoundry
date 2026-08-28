@@ -4,16 +4,24 @@
 
 The harness OWNS a fresh engine subprocess per sweep step (EngineNode), serving ``harness/config/
 connscale`` with ``MEFOR_CONNSCALE_COUNT`` env-set, and drives a tiny connection-count sweep. It
-proves the harness SPINS N connections, NO-LOSS reconcile holds, the FD + empty-claim counters move
-MONOTONICALLY with N (the wall exists and scales), the additive engine fields are present (back-compat
-shim works), and the executor boot-shim populates wall #1 / the reload probe returns a finite number.
+proves the harness SPINS N connections, NO-LOSS reconcile holds, the FD counter moves MONOTONICALLY
+with N (the wall exists and scales), the additive engine fields are present (back-compat shim works),
+and the executor boot-shim populates wall #1 / the reload probe returns a finite number.
+
+THE EMPTY-CLAIM COUNTER IS MEASURED AND RECORDED HERE, NOT GATED. Its band came off once the passing
+CI population was read: the premise holds on ubuntu and fails on both Windows legs, so the floor sat
+inside the Windows distribution rather than between two modes. The reading is unchanged and still
+lands in ``out/connscale/empty_claims.json`` every run. Reasoning and figures:
+``test_the_empty_claim_curve_is_measured_but_no_longer_banded``, BACKLOG #1211.
 
 It does NOT regression-cover wall #1 (executor) or wall #2 (pool) as REAL curves: at small N on
 SQLite the pool wall is a documented no-op and the executor is under-threshold — stated honestly here.
 The Postgres CI leg (pool_size forced to 1-2) gives the acquire-wait wall real small-N coverage.
 
-A small N (12 → 24) keeps it inside the pytest-timeout budget; the shipped ``connscale-smoke`` profile
-(N=50/100), run via the ``--connscale`` CLI in CI, is the larger-N variant.
+A small N (12 → 24) keeps it inside the pytest-timeout budget. The shipped ``connscale-smoke`` profile
+(N=50/100) is the larger-N variant and is run BY HAND via the ``--connscale`` CLI — this paragraph used
+to say "in CI", which is false: ``--connscale`` appears zero times under ``.github/``, so no workflow
+runs it and this module is the only place either monotonicity SLO meets a live engine on a CI leg.
 """
 
 from __future__ import annotations
@@ -31,7 +39,7 @@ import pytest
 from harness.load.connscale.intake_audit import MOMENT_POST_MORTEM
 from harness.load.connscale.probe import ProbeDegraded
 from harness.load.connscale.profile import load_connscale_profile_text
-from harness.load.connscale.report import ConnScaleRecord, ConnScaleReport
+from harness.load.connscale.report import ConnScaleRecord, ConnScaleReport, monotonic_pairs
 from harness.load.connscale.runner import _MONOTONIC_TOLERANCE, run_connscale
 from tests._connscale_ports import (
     INBOUND_PORT_HI,
@@ -74,7 +82,13 @@ corpus_count_per_trigger = 5
 [connscale.slo]
 zero_loss = true
 fd_monotonic = true
-empty_claims_monotonic = true
+# DISARMED, AND THE READINGS KEEP FLOWING. Setting this false drops the check from
+# `_evaluate_slos`, so it leaves `result_ok` and `exit_code` too -- which is the whole point, since
+# an armed SLO reds this module through `test_the_run_reports_overall_success` no matter what any
+# single test asserts. `_record_ratio_readings` builds its pairs from `report.records`, NOT from the
+# SLO list, so out/connscale/empty_claims.json still lands on every run and #1211's variance
+# programme is unaffected. See `test_the_empty_claim_curve_is_measured_but_no_longer_banded`.
+empty_claims_monotonic = false
 """)
 
 
@@ -459,17 +473,101 @@ def test_no_accept_acked_message_is_absent_from_the_stopped_engines_store(
     _assert_intake_audit(smoke_report.records)
 
 
-def test_the_fd_and_empty_claim_curves_are_monotonic_in_n(smoke_report: ConnScaleReport) -> None:
-    """Curve monotonicity smoke (a LOOSE >= per mode; CI runners are noisy): FD count + empty-claims
-    at N=24 >= N=12. Asserted via the report's monotonicity SLOs.
+def test_the_fd_count_curve_is_monotonic_in_n(smoke_report: ConnScaleReport) -> None:
+    """Wall #4 scales: FD count at N=24 >= N=12 within a lane, minus the noise band.
 
-    THIS IS THE THROUGHPUT-SLO ARM the item names, distinct from the intake arm above. Nothing
-    measured shows the two share a root cause; separate names keep that question open instead of
-    quietly answering it.
+    ONE SLO, ONE NAME. This and the empty-claims test below were a single
+    ``test_the_fd_and_empty_claim_curves_are_monotonic_in_n`` until the two arms were measured
+    apart. BACKLOG #1331 split this module's welded end-to-end test for exactly this reason and its
+    own commit body counts "two monotonicity SLOs" among the properties it set out to separate --
+    then produced one test holding both, so the split stopped one level short. It matters because
+    the two arms have opposite records: measured over the whole CI failure log,
+    ``fd_count_monotonic`` appears zero times and ``empty_claims_monotonic`` three times. Under one
+    name a reader could not see that, and a recurring red on one arm read as a defect in the other.
+
+    THIS ARM STAYS HARD, and the evidence for keeping it is off-CI rather than on it. BACKLOG #1357
+    measured this curve going red 4 runs in 5 under ``[sandbox].mode = subprocess`` against 0 in 5
+    at the default -- the test correctly reporting that the FD probe cannot see a multi-process
+    engine's worker children. CI never sets that mode, so it has never fired here; it is a working
+    guard against an instrument defect, and it is cheap.
+
+    Its vacuous-pass hole is closed next door rather than here: ``_monotonic_slo`` returns ok=True
+    over an empty pair list, and ``_assert_fd_probe`` is what requires some lane to have actually
+    been compared.
     """
     slo_by_name = {c.name: c for c in smoke_report.slos}
     assert slo_by_name["fd_count_monotonic"].ok, slo_by_name["fd_count_monotonic"].observed
-    assert slo_by_name["empty_claims_monotonic"].ok, slo_by_name["empty_claims_monotonic"].observed
+
+
+def test_the_empty_claim_curve_is_measured_but_no_longer_banded(
+    smoke_report: ConnScaleReport,
+) -> None:
+    """The empty-claims ratio is still MEASURED and COMPARED on every run, and is no longer GATED.
+
+    WHY THE BAND CAME OFF, measured from 252 pairs downloaded off 126 green CI legs across 42 runs
+    and 33 commits -- the passing population BACKLOG #1211 records as "STILL UNMEASURED", readable
+    since the artifact upload landed:
+
+        leg            lane              n   min    median   sd      at-or-below parity
+        ubuntu-latest  fixed_per_conn   42   1.318  1.671    0.079   0%
+        windows-2022   fixed_per_conn   42   0.818  1.062    0.298   38%
+        windows-2025   fixed_per_conn   42   0.755  1.136    0.365   21%
+
+    IT IS A RUNNER SPLIT, NOT A SECOND MODE. #1211's amendment reads the population as bimodal --
+    a healthy mode at 1.69 with sd 0.024, a collapse mode at 0.63 -- and concludes the band must not
+    be widened because widening would mask a real 2.6x collapse. That 1.69 / sd 0.024 mode is
+    ubuntu, and it matches the 20-core local box the figure came from almost exactly. The Windows
+    legs are a different population centred near parity with four times the spread, and the 0.75
+    floor sits INSIDE that body, about 0.9 sd below its median. Splice the nine recorded failures
+    into the passing readings and the sequence is continuous -- 0.745 fail, then 0.755 pass, largest
+    gap anywhere in the tail 0.059. Two real modes leave a void between them; there is none. The
+    item's own warning that a 20-core box cannot stand in for a hosted runner is what this measures.
+
+    So the SLO's premise -- the wall exists and scales -- holds on Linux 84 times out of 84 and
+    fails on windows-2022 in 38 percent of runs that PASS. A gate cannot be built on a premise its
+    runner does not satisfy, and the failures were never a verdict on the change under test.
+
+    WHAT THIS TEST ASSERTS INSTEAD, and why it is not merely a deleted assertion. Disarming an SLO
+    silently is how a metric stops being collected without anyone noticing, which would end the very
+    variance programme the disarm is meant to protect. So two things are pinned:
+
+    1. The SLO is ABSENT from the report. Re-arming it has to be a deliberate, visible edit rather
+       than a default drifting back, and if it returns this test says so immediately.
+    2. The ratio is still being COMPARED -- some lane has two readings to compare. This is the hole
+       ``_assert_fd_probe`` closes for the FD arm and nothing closed for this one: ``monotonic_pairs``
+       skips a ``None`` without carrying it forward, so a run that measured nothing produced no pairs
+       and any check over them passes over an empty set. Bounded with ``any``, not ``all``, for the
+       reason stated at ``_assert_fd_probe``: a single step timing out is tolerated, a run that never
+       compares the curve against itself is not.
+
+    NOT A FLAKY MARKER, which #1211 rules out in terms. The reading is unchanged, the emitter is
+    untouched, and ``out/connscale/empty_claims.json`` still lands on every run -- see
+    ``_record_ratio_readings``, which builds its pairs from ``report.records`` and never reads the
+    SLO list. What is gone is only this metric's power to block a merge on a condition the change
+    did not cause.
+    """
+    assert "empty_claims_monotonic" not in {c.name for c in smoke_report.slos}, (
+        f"THE BAND IS BACK -- `empty_claims_monotonic` is armed again in this module's profile. That "
+        f"is a real decision and may well be the right one, but it is not a default to drift into: "
+        f"the readings above say the premise holds on Linux and fails on both Windows legs, so an "
+        f"armed band reds a required context for a condition the pull request did not cause. Re-arm "
+        f"it deliberately and update this test in the same change. SLOs: "
+        f"{sorted(c.name for c in smoke_report.slos)}"
+    )
+    pairs = monotonic_pairs(
+        smoke_report.records, lambda r: r.empty_claims_per_msg, tolerance=_MONOTONIC_TOLERANCE
+    )
+    per_lane: dict[str, int] = {}
+    for p in pairs:
+        per_lane[p.label] = per_lane.get(p.label, 0) + 1
+    assert per_lane, (
+        f"THE RATIO WAS NEVER COMPARED -- no lane produced two `empty_claims_per_msg` readings, so "
+        f"this run contributed nothing to the sample #1211 needs and nothing here would have noticed. "
+        f"`empty_claims_per_msg` is None whenever a step absorbed no messages, and `monotonic_pairs` "
+        f"skips a None without carrying it forward, so zero pairs is a SILENT outcome rather than an "
+        f"error. Readings per record: "
+        f"{[(r.sweep_mode, r.count, r.empty_claims_per_msg) for r in smoke_report.records]}"
+    )
 
 
 def test_the_additive_engine_fields_are_populated(smoke_report: ConnScaleReport) -> None:
