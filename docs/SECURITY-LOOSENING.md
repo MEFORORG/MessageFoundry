@@ -53,6 +53,7 @@ section reference.
 | Sign-in & identity | `require_sign_in` | `true` |
 | | `require_mfa` | `true` |
 | | `allow_single_factor_admin_when_exposed` | `false` |
+| Alert transport | `allow_unverified_alert_smtp_tls` | `false` |
 | | `sign_out_after_idle_minutes` | `30` |
 | | `max_session_hours` | `12` |
 | Data handling | `block_unlisted_outbound` | `true` |
@@ -251,6 +252,27 @@ trail.
   strict enforcement is a deliberate, slight **tightening** ([ADR 0140](adr/0140-two-acknowledged-production-phi-no-loosen-carve-outs-single-factor-admin-at-exposure-keyless-phi-in-production.md);
   the ack was renamed from `allow_unencrypted_phi_in_production` by [ADR 0148](adr/0148-phi-default-posture-and-an-explicit-security-enforcement-level.md) when the dial moved from the `production` tier to `enforcement`).
 
+### `allow_unverified_alert_smtp_tls = true` — permit an unauthenticated `[alerts]` SMTP hop
+- **What you lose:** the hop carrying operator alert bodies, **every per-user security-event email**
+  (lockout, password/roles change, new-IP admin action) and the SMTP login credential no longer
+  authenticates the mail relay. It covers **both** unauthenticated shapes: `[alerts].email_use_tls = false`
+  (cleartext) and `[alerts].email_tls_verify = false` (encrypted, but any certificate is accepted). An
+  on-path attacker who can answer for the relay reads all of it — and, since stream 12 is the ASVS
+  6.3.5/6.3.7 out-of-band channel, can also *deny* a user the notice that their account was just taken over.
+- **When acceptable:** a lab/dev relay with a self-signed certificate you cannot re-issue, on a trusted
+  network. Prefer pointing `[alerts].email_tls_ca_file` or `[tls].internal_ca_file` at that relay's CA —
+  that keeps verification on and needs no deviation at all.
+- **Compensating controls:** trusted-network placement; a relay on the same host; a startup **AUDIT** line
+  records the override, `security_loosenings()` names it, and `messagefoundry check`'s `alert-smtp-tls`
+  advisory prints the hop's posture and whether it is acknowledged.
+- **Why an acknowledgment and not the clamped escape:** the EMAIL/DIRECT connectors key their verify-off
+  refusal on `MEFOR_ALLOW_INSECURE_TLS` read through the **clamped**
+  `weakened_tls_escape_permitted_here()`, which reads the construction-time hop posture. The alerts
+  notifier is built in the API lifespan, **outside** `build_check_registry`'s `active_hop_posture` scope,
+  where that clamp degrades to the *unclamped* escape and would provide no refusal at all. So this cell
+  gets an explicit `[security]` acknowledgment instead — the first verify-off hop governed that way.
+- **Still refused:** nothing here relaxes the connectors. This switch reaches the `[alerts]` cell only.
+
 ### `enforcement = warn` — warn instead of refuse on the PHI serve-gate floor
 - **What you lose:** the serve-gate **refuse/warn dial** flips from *refuse* to *warn-and-continue*, and the
   [ADR 0092](adr/0092-posture-keyed-transport-hop-refusal-refuse-the-insecure-phi-hop.md) blunt escapes
@@ -373,9 +395,12 @@ trail.
   invisible — an accepted risk that stops being visible has stopped being accepted and started being
   forgotten. It also cannot relax a hop ADR 0153 does not govern: inbound binds are still decided by the
   exposed-gates, and **revocation / weakened-TLS (`verify_tls = false`) refusals are unaffected** — a
-  verify-off hop is encrypted-but-unauthenticated, not cleartext, so it keeps the clamped
-  `MEFOR_ALLOW_INSECURE_TLS` escape and this declaration does not reach it. Nor does it reach an SMTP
-  `AUTH` over cleartext, which is refused outright.
+  verify-off hop is encrypted-but-unauthenticated, not cleartext, so this declaration does not reach it.
+  At least the connector verify-off cells keep the clamped `MEFOR_ALLOW_INSECURE_TLS` escape; the
+  `[alerts]` SMTP hop is governed instead by the `allow_unverified_alert_smtp_tls` acknowledgment above
+  (its construction sits outside the posture scope the clamp reads), so "the clamped escape" is not a
+  universal statement about verify-off hops and should not be read as one. Nor does this declaration
+  reach an SMTP `AUTH` over cleartext, which is refused outright.
 
 ---
 

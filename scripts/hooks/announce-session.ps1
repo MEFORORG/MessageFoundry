@@ -96,6 +96,13 @@ function Get-ClaimNotes {
     # The claim note is the only field written DELIBERATELY to say what a session is doing, so lead
     # with it where one exists. Fail-open: no claims, unreadable claims, or no claim for a peer all
     # just mean the name is all we have.
+    #
+    # CARRY THE NOTE'S AGE, NOT JUST THE NOTE. Elevating the claim note to authoritative -- which the
+    # roster below explicitly does, telling readers to prefer it over the worktree name -- makes a STALE
+    # note strictly more dangerous than no note: it is read as current intent. Measured 2026-08-02: the
+    # 'announce-hook' note still told every joining session "NO PR OPENED -- honouring the #119 merge
+    # freeze" hours after both #133 and #119 had merged. Age is the cheap signal that lets a reader
+    # discount it. `refreshed` where the holder updated the note, else `claimed`.
     param([string]$ClaimsDir)
     $map = @{}
     try {
@@ -103,7 +110,25 @@ function Get-ClaimNotes {
         foreach ($f in @(Get-ChildItem -LiteralPath $ClaimsDir -Filter '*.json' -ErrorAction SilentlyContinue)) {
             try {
                 $c = Get-Content -LiteralPath $f.FullName -Raw | ConvertFrom-Json
-                if ($c.worktree -and $c.note) { $map[(Get-Norm ([string]$c.worktree))] = [string]$c.note }
+                if (-not ($c.worktree -and $c.note)) { continue }
+                $hrs = $null
+                # An unparseable or absent stamp leaves $hrs null, and the caller then prints the note
+                # with no age claim at all -- an unknown age must not be rendered as a fresh one.
+                try {
+                    # ConvertFrom-Json hands these back as [datetime] already. Round-tripping through
+                    # [string] would lose the offset and then re-parse under the host's culture, which
+                    # is how a date silently becomes a different date.
+                    $at = if ($c.refreshed) { $c.refreshed } else { $c.claimed }
+                    $when = if ($at -is [datetime]) { $at }
+                    elseif ($at -is [datetimeoffset]) { $at.LocalDateTime }
+                    elseif ($at) { [datetime]::Parse([string]$at, [cultureinfo]::InvariantCulture) }
+                    else { $null }
+                    if ($when) { $hrs = [int]((Get-Date) - $when).TotalHours }
+                } catch { $hrs = $null }
+                $map[(Get-Norm ([string]$c.worktree))] = [pscustomobject]@{
+                    Note = [string]$c.note
+                    Hours = $hrs
+                }
             } catch { }
         }
     } catch { }
@@ -565,6 +590,8 @@ try {
         $lines += '    Read "claim:" where present and IGNORE the worktree name: the name is a'
         $lines += '    creation-time label, nothing keeps it current, and one of them is known to'
         $lines += '    describe work that session never did. The claim is written deliberately.'
+        $lines += '    Its bracketed age is how old the NOTE is, not how long the work has run --'
+        $lines += '    an old note may describe a PR that has since merged. Verify before relying.'
         $i = 0
         foreach ($e in $listed) {
             $i++
@@ -575,8 +602,11 @@ try {
             $tail = if ($e.Reason) { "  ($($e.Reason))" } else { '' }
             $lines += "  [$i] $verb $(Get-Clean ([string]$p.Worktree) 40)  [$(Get-Clean ([string]$p.Branch) 60)]  $(Get-Clean ([string]$p.Surface) 16)/$(Get-Clean ([string]$p.Login) 24)$flag$tail"
             $lines += "      cwd: $(Get-Clean ([string]$p.Cwd) 200)"
-            $note = $claims[(Get-Norm ([string]$p.Cwd))]
-            if ($note) { $lines += "      claim: $(Get-Clean ([string]$note) 160)" }
+            $claim = $claims[(Get-Norm ([string]$p.Cwd))]
+            if ($claim) {
+                $stamp = if ($null -ne $claim.Hours) { " [written $($claim.Hours)h ago]" } else { ' [age unknown]' }
+                $lines += "      claim: $(Get-Clean ([string]$claim.Note) 160)$stamp"
+            }
         }
         if ($more -gt 0) {
             $lines += "  ...and $more more (run: pwsh -NoProfile -File scripts\coord\presence.ps1)"

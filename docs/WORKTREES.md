@@ -161,6 +161,20 @@ directory is broken on disk right now. `3` outranks `2` because damage on disk o
 act. In the JSON receipt `counts.orphaned` is a *subset* of `counts.failed` (`failedNonOrphan` is
 spelled out alongside it); `removed + failed + skipped` covers every candidate exactly once.
 
+**A removal releases the work claims the worktree held.** A claim ([`claim.ps1`](../scripts/coord/claim.ps1))
+lives under `<git-common-dir>/mefor-coord/claims/`, beside the *shared* object store, so it outlives the
+worktree that took it — and `-Take` blocks on any claim file that exists. A prune therefore used to leave
+the key unclaimable by every future session until someone ran `-Release <key> -Force` by hand. Released
+only from the branch that has already proven the directory gone *and* deregistered, so it is evidence
+rather than a timer: a claim whose holder is merely **quiet** is never touched, and a dry run releases
+nothing. The match is full normalised path equality — releasing a *living* worktree's claim would hand
+its key away and cause the duplicate build the registry exists to prevent, which is worse than the orphan
+being cleaned up. Reported as `counts.claimsReleased` and, when one could not be cleared,
+`counts.claimsUnreleased` (the key stays blocked, and the run goes red). An unreadable claim file belongs
+to no worktree — not being able to read it is precisely not knowing whose it is — so it is surveyed once
+per run under `claims.unreadable` and left in place. `claims.scanned` is `false` when there is no claims
+directory to read: an empty `unreadable` list is not a green light. (BACKLOG #345.)
+
 **A branch is never force-deleted on a stale verdict.** `git branch -d` refuses a branch merged only
 into `origin/main` whenever the local `main` lags — which it usually does — so `-D` used to be the
 routine path and git's last protection was overridden every time. Now `-d` is tried first, and `-D`
@@ -321,6 +335,87 @@ hooks are wired at **user** level by
 [../scripts/coord/install-coordination.ps1](../scripts/coord/install-coordination.ps1): git cannot
 deliver a project-level hook to a worktree.
 
+**A change to these scripts reaches a session by one of TWO rules, and they are not the same rule.**
+Getting this wrong produces a confident, wrong answer to "can I use it yet", so state which one applies:
+
+| How the script is reached | When your change reaches a session |
+|---|---|
+| **Run by a hook** (`collision_gate.ps1`, and `overlap.ps1` as its callee) | The installed shim resolves the **primary checkout** first, falling back to the calling worktree. So: **when the primary advances** — regardless of what any session's own branch contains |
+| **Run by hand from a worktree** (`claim.ps1`, `overlap.ps1`, `presence.ps1`) | From that session's **own tree**. So: **when that session's branch contains it** — the primary is irrelevant |
+
+Reported 2026-08-02 by a peer session that was told a merged `claim.ps1` improvement was available to
+it, tried it, and got the old behaviour: its branch predated the change. Both halves of the answer were
+individually true and the combination was wrong. Test the property, not the provenance, and test it
+where the script will actually run from:
+
+```powershell
+grep -c <a token from the change> <primary>/scripts/coord/overlap.ps1   # hook-run scripts
+grep -c <a token from the change> ./scripts/coord/claim.ps1             # hand-run scripts
+```
+
+**Asking who holds a file, right now, without changing anything.** The collision gate answers this
+directly, and it is the only command that does — `-PathOverride` makes it skip stdin and print its
+decision:
+
+```powershell
+pwsh -NoProfile -File scripts\hooks\collision_gate.ps1 -PathOverride docs\BACKLOG.md
+```
+
+Empty output means no live session holds it. Documented in-script as a test affordance; surfaced here
+because a session that needed the answer found it by reading the source.
+
+## Account usage — knowing before a session is cut off
+
+**What it fixes.** Sessions were hitting the plan limit mid-task and losing work. The account's real
+quota state exists — Settings > Usage shows it — but it is not visible from inside a session, so nobody
+knew how much headroom was left until it ran out.
+
+**The one place the numbers arrive.** Claude Code hands `rate_limits` to a **statusLine command's stdin
+and nowhere else**. Not `SessionStart`, not `UserPromptSubmit`, not `Stop` — the payloads were enumerated
+in the shipped binary and it appears in exactly one of them. So quota state cannot be subscribed to; it
+has to be *collected* by a statusLine and published somewhere shared. That single fact determines the
+whole shape:
+
+| | |
+|---|---|
+| [`usage-collect.ps1`](../scripts/coord/usage-collect.ps1) | the statusLine. Publishes to `~/.claude/mefor-usage/latest.json` |
+| [`usage.ps1`](../scripts/coord/usage.ps1) | reads it, adds burn rate, answers *will this run out before it resets* |
+| [`install-usage-statusline.ps1`](../scripts/coord/install-usage-statusline.ps1) | wires it (owner, plain terminal) |
+
+**One publisher, N readers.** The quota is **account-wide** — every session in every repo draws down the
+same 5-hour and 7-day pools — so any one session's reading is the truth for all of them. Do not run a
+collector per session expecting to sum them; that double-counts a shared pool. The publish path is
+user-level for the same reason: the data is a property of the account, not of a checkout.
+
+**It only runs in an interactive session.** The statusLine is part of the TUI's render tree and never
+executes under `claude -p` or the SDK. A headless coordinator can *read* what this publishes and can
+never publish it itself. `refreshInterval` is set because statusLine updates are event-driven and go
+silent when a session is idle — Anthropic's docs name *"a coordinator waits on background subagents"* as
+exactly the case where that leaves you blind.
+
+**Two of the four Settings > Usage numbers are not available at all.** The payload carries `five_hour`
+and `seven_day` only. The **per-model weekly buckets** (the Fable/Opus/Sonnet bars) and the **plan tier**
+are absent, and the request to expose them was closed as not-planned. `usage.ps1` prints that on every
+run rather than burying it: if Opus is being burned hard across many sessions, the bucket most likely to
+stop you is the one nothing here can see. Two green bars and an invisible third is worse than no tool.
+
+```powershell
+pwsh -NoProfile -File scripts\coord\usage.ps1          # human
+pwsh -NoProfile -File scripts\coord\usage.ps1 -Json    # coordinator
+```
+
+Exit codes so a coordinator can branch without parsing prose: **0** ok, **10** warn, **11** critical,
+**20** unknown. `UNKNOWN` is a real answer here and is returned whenever the reading is stale, undateable
+or future-dated — a percentage is never extrapolated from a dead publisher, and every number is printed
+with its own age. **Do not read a missing bucket as an empty one.**
+
+> **`ccusage` does not do this**, despite being the tool everyone recommends and despite several
+> summaries claiming it "fetches real rate limit data". It parses transcripts for tokens and dollars; its
+> "5-hour block" is a client-side reconstruction and its statusline percentage is context-window.
+> `claude-usage-tracker` is the same mistake in cruder form — real token parsing compared against a
+> hardcoded limit table. Anything reading plan state from either is confidently wrong at exactly the
+> moment it matters. Tokens and plan-limit consumption are different quantities.
+
 ## Announcing yourself (UserPromptSubmit hook)
 
 **What it fixes.** Everything above is **pull**-based: a new session discovers its peers and the peers
@@ -341,7 +436,11 @@ the id rule; the model does the sending.
 banners is the **registry** id. `ccd_session_mgmt` uses a *different* id for the same session. **The cwd
 is the only join key, and it must be matched exactly, never by prefix** — every worktree cwd is an
 extension of the primary's, so a prefix match resolves a peer in the primary to an arbitrary worktree
-session. Branch is not a join key either: measured 2026-08-01, the two rosters reported different
+session. (The same trap, same nesting, was live in `overlap.ps1` until 2026-08-02: it *needs* a prefix
+match, since a session may sit in any subdirectory, and it took the **first** hit — so the primary's row
+absorbed whichever nested-worktree session the hash table enumerated first and reported the primary LIVE
+on `main`. Where a prefix match is genuinely required, the rule has to be **longest prefix wins**.)
+Branch is not a join key either: measured 2026-08-01, the two rosters reported different
 branches for the same checkout in 2 of 6 cases. A usable id starts with `local_`. **A registry id passed
 to `send_message` fails silently**, which reads as the peer ignoring you.
 
@@ -395,9 +494,37 @@ it by hand. Three constraints came out of that, recorded here so the next attemp
 them:
 
 - **A broadcast needs an expiry or a predicate the *recipient* can evaluate — never a promise from the
-  sender.** A merge freeze went out with "lift when #119 merges". #119 never merged (it died on an
-  unrelated CI timeout), so five sessions held on a condition that could not arrive, and it took a
-  second round to retract.
+  sender.** A merge freeze went out with "lift when #119 merges", and five sessions held. **#119
+  merged** — 2026-08-02 01:45:00Z, merge commit `002be182`, **12h15m** after its auto-merge was armed
+  (`auto_squash_enabled` 2026-08-01 13:29:37Z, from the issue timeline — note the event is
+  `auto_squash_enabled`, so a filter on `auto_merge_enabled` finds nothing and the wait looks
+  unmeasurable). The failure was never that the condition could not arrive; it was that **the world
+  moved while everyone waited**. `main` advanced four times before it did:
+
+  | | |
+  |---|---|
+  | #74 | 2026-08-01 20:27:03Z |
+  | #120 | 2026-08-01 23:59:43Z |
+  | #131 | 2026-08-02 00:35:29Z |
+  | #130 | 2026-08-02 01:01:35Z |
+
+  The first of those landed **8m26s** after the claim declaring the freeze was taken (that claim is
+  stamped 2026-08-01 23:51:17Z and is *still on the board*; #120 merged 23:59:43Z). Stated as the claim
+  timestamp rather than "when the freeze was written" deliberately — `claimed` records when the key was
+  taken, and only a `refreshed` stamp would evidence when the note itself was last edited. That field
+  is absent here, which on the code of the day is consistent: there was no way to edit a note in place,
+  so the two coincide unless someone hand-edited the JSON.
+
+  So the freeze did not hold `main` still even while it was nominally in force — it held only the
+  sessions honouring it, which is the worst of both. And it outlived its own condition in the other
+  direction too: on 2026-08-02 that same claim note was still announcing the freeze to every joining
+  session hours after #119 had merged. A predicate the recipient cannot evaluate does not expire.
+
+  This bullet said "#119 never merged" for a day, which made it a compensating control resting on a
+  false premise — the failure [`CLAUDE.md`](../CLAUDE.md) §11 names, inside the document arguing for
+  it. Corrected against the API, and the same framing was independently corrected in `ci.yml`
+  (`07b6e55a`) and in BACKLOG #340 by two other sessions; timestamps above are theirs, re-verified
+  here rather than restated.
 - **"Don't do X" is the wrong primitive when automation already has X armed.** The freeze asked
   sessions not to merge, while six PRs had auto-merge *armed* and would have landed with nobody
   clicking anything. The correct ask was an action — "disarm auto-merge" — not restraint.

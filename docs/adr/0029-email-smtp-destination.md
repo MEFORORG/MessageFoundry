@@ -31,6 +31,34 @@
 
 ---
 
+## Amendment 2026-08-02 — the SMTP TLS posture this ADR describes is now VERIFIED on all three cells
+
+D3 below says the connector takes "the same posture `send_plain_email` already takes". That sentence was
+written when both cells passed **no** SSL context to `starttls()` — which meant both fell back to
+`ssl._create_stdlib_context`, and that **is** `ssl._create_unverified_context` (`CERT_NONE`,
+`check_hostname=False`). So "STARTTLS by default" was, for the whole life of this ADR, encryption without
+authentication: an on-path attacker presenting any certificate read the Handler payload and the SMTP
+credential.
+
+[BACKLOG #323](../BACKLOG.md) closed that in two steps, and the sentence is true again — but for a
+different reason than it was written for:
+
+- **Layers 1–2 (PR #132)** gave `EmailDestination` / `DirectDestination` an explicit verifying context
+  from `tls_policy.build_smtp_tls_context()`, with per-connection `tls_verify` / `tls_ca_file` /
+  `tls_check_hostname`, refused against the **clamped** `weakened_tls_escape_permitted_here()`.
+- **Layer 3** gave the `[alerts]` cell the same factory, from `[alerts].email_tls_verify` /
+  `email_tls_ca_file`. That cell is gated differently on purpose: it is constructed outside
+  `build_check_registry`'s `active_hop_posture` scope, where the connectors' clamp reads a `None` posture
+  and degrades to the *unclamped* escape — i.e. would provide no refusal at all. It is therefore governed
+  by a `[security].allow_unverified_alert_smtp_tls` **acknowledgment switch at the serve gate**, which
+  refuses an enforcing PHI instance whose alert hop does not authenticate the relay.
+
+**D3's escape wording is also narrower than it reads.** It names `insecure_tls_allowed()` for the
+cleartext arm; that raw call was replaced by the clamped reader in both connectors, and the `[alerts]`
+cell never consulted either — its cleartext arm was ungated until layer 3's serve gate covered it.
+
+---
+
 ## Context
 
 MessageFoundry has no email transport. A common integration ask — "fan a result/alert out as an email to a
