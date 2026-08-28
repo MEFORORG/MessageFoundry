@@ -1136,3 +1136,123 @@ def test_rules_3_and_3d_are_unchanged_by_the_candidate_switches(repo: SimpleName
         run_gate(shell(f'git worktree remove "{repo.wt}"', cwd=repo.other), repo.repos)
     )
     assert "working tree of the SHARED PRIMARY checkout" not in removal
+
+
+# ------------------------------- rule 3c: an EXPLICIT target outranks the IMPLICIT cwd (ordering)
+#
+# Get-GitTargetCandidatesRaw builds an ORDERED candidate list and rule 3c takes the first candidate git
+# ANSWERS on. ``--git-dir`` / ``--work-tree`` / ``GIT_WORK_TREE`` used to be appended AFTER the cwd base,
+# and the cwd ALWAYS answers because it is always a real directory -- so the token the operator actually
+# TYPED could never decide.
+#
+# ONE ROOT CAUSE, SYMPTOMS IN BOTH DIRECTIONS, which is why these rows come in pairs and why the fix is
+# a reorder rather than a widening:
+#
+#     cwd UNGOVERNED, explicit token at the GOVERNED repo  -> was ALLOW, and the write really landed
+#                                                             in the governed config. A fail-open.
+#     cwd GOVERNED,   explicit token at an UNRELATED repo  -> was DENY, naming a repository the write
+#                                                             never touches. The BACKLOG #1085 shape.
+#
+# A test suite that only pinned the first direction would pass against a rule that simply denied
+# everything, so both directions are asserted and neither is optional.
+
+
+@pytest.fixture
+def unrelated(tmp_path: Path) -> Path:
+    """An independent repository OUTSIDE the governed root -- the ungoverned cwd these rows need."""
+    path = tmp_path / "Unrelated"
+    path.mkdir()
+    _init_independent_repo(path)
+    return path
+
+
+def test_an_explicit_gitdir_at_the_governed_repo_denies_from_an_UNGOVERNED_cwd(
+    repo: SimpleNamespace, unrelated: Path
+) -> None:
+    """The fail-open direction. The cwd answers first and is ungoverned, so the rule used to allow a
+    write that lands in the governed shared config."""
+    command = f'git --git-dir="{repo.primary}/.git" config core.hooksPath /nope'
+    reason = assert_denied(run_gate(shell(command, cwd=unrelated), repo.repos))
+    assert "setting 'core.hooksPath'" in reason
+
+
+def test_the_GIT_DIR_ENVIRONMENT_VARIABLE_is_enumerated_at_all(
+    repo: SimpleNamespace, unrelated: Path
+) -> None:
+    """The enumeration half, and the asymmetry was the tell: ``GIT_WORK_TREE`` has always been matched
+    on the line directly above, so the pair should have travelled together."""
+    command = f'GIT_DIR="{repo.primary}/.git" git config core.hooksPath /nope'
+    reason = assert_denied(run_gate(shell(command, cwd=unrelated), repo.repos))
+    assert "setting 'core.hooksPath'" in reason
+
+
+def test_an_explicit_gitdir_at_an_UNRELATED_repo_allows_from_a_GOVERNED_cwd(
+    repo: SimpleNamespace, unrelated: Path
+) -> None:
+    """The false-deny direction, and the row that stops the fix above being 'deny more'.
+
+    The write lands in the unrelated repository. Refusing it named a repository the command was never
+    going to touch, which is what teaches people to route around a gate.
+    """
+    command = f'git --git-dir="{unrelated}/.git" config core.hooksPath /nope'
+    assert run_gate(shell(command, cwd=repo.wt), repo.repos) is None
+
+
+def test_an_explicit_GIT_DIR_at_an_UNRELATED_repo_allows_from_a_GOVERNED_cwd(
+    repo: SimpleNamespace, unrelated: Path
+) -> None:
+    """The same pairing for the environment-variable spelling. Separate row because the enumeration and
+    the ordering are separate defects: a fix for one leaves this passing or failing on its own."""
+    command = f'GIT_DIR="{unrelated}/.git" git config core.hooksPath /nope'
+    assert run_gate(shell(command, cwd=repo.wt), repo.repos) is None
+
+
+def test_a_work_tree_flag_does_NOT_promote_and_that_distinction_is_measured(
+    repo: SimpleNamespace, unrelated: Path
+) -> None:
+    """Only ``--git-dir`` and ``GIT_DIR`` are promoted ahead of the cwd. ``--work-tree`` is not, and the
+    reason is measured rather than reasoned.
+
+    Run from an ungoverned repository with ``--work-tree`` naming the GOVERNED one, a ``git config``
+    write lands in the UNGOVERNED repo you are standing in -- verified by reading the value back, with
+    the ``--git-dir`` form as the control that lands in the governed one. So ``--work-tree`` names the
+    TREE and does not decide WHICH REPOSITORY'S CONFIG is written, which is the only question this rule
+    asks.
+
+    Promoting it anyway cost one hole and four false denies at once, in both directions -- the signature
+    of ranking a token that does not determine the answer. This row is what keeps it unpromoted.
+    """
+    command = f'git --work-tree="{repo.primary}" config core.hooksPath /nope'
+    assert run_gate(shell(command, cwd=unrelated), repo.repos) is None
+
+    # ...AND THE SAME LINE WITH --git-dir ADDED MUST DENY, which is what stops the row above being read
+    # as "work-tree shapes are exempt". The repository token is what decides, and here there is one.
+    both = f'git --work-tree="{repo.primary}" --git-dir="{repo.primary}/.git" config core.hooksPath /nope'
+    reason = assert_denied(run_gate(shell(both, cwd=unrelated), repo.repos))
+    assert "setting 'core.hooksPath'" in reason
+
+
+def test_the_ordering_switch_did_not_leak_into_rules_3_and_3d(
+    repo: SimpleNamespace, unrelated: Path
+) -> None:
+    """The blast-radius control, asserted rather than argued.
+
+    ``-ExplicitFirst`` is opt-in and only rule 3c passes it, so rules 3 and 3d must see the candidate
+    list they always saw. These rows carry the very tokens whose order changed, and each asserts its
+    OWN rule's refusal text -- a row checking only "denied" would pass if all three rules had collapsed
+    into one.
+    """
+    tree_swap = assert_denied(
+        run_gate(
+            shell(f'git --git-dir="{unrelated}/.git" reset --hard', cwd=repo.primary), repo.repos
+        )
+    )
+    assert "working tree of the SHARED PRIMARY checkout" in tree_swap
+
+    removal = assert_denied(
+        run_gate(
+            shell(f'GIT_DIR="{unrelated}/.git" git worktree remove "{repo.wt}"', cwd=repo.other),
+            repo.repos,
+        )
+    )
+    assert "working tree of the SHARED PRIMARY checkout" not in removal

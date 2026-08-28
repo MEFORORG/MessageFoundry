@@ -390,7 +390,8 @@ function Resolve-ShellIndirection([string]$Token, [string]$Prefix) {
 }
 
 function Get-GitTargetCandidatesRaw([string]$Line, [string]$Prefix, [string]$CwdRaw,
-                                   [switch]$AllTargets, [switch]$BaseFallback) {
+                                   [switch]$AllTargets, [switch]$BaseFallback,
+                                   [switch]$ExplicitFirst) {
     <#
     TWO OPT-IN SWITCHES, BOTH DEFAULT OFF, ADDED FOR BACKLOG #1065. Rules 3 and 3d call this with three
     positional arguments and are therefore byte-identical to before; only rule 3c opts in. That is
@@ -454,20 +455,67 @@ function Get-GitTargetCandidatesRaw([string]$Line, [string]$Prefix, [string]$Cwd
                 $out += $dashC
             }
         }
-        # LAST, never first: the caller walks these in order, so appending here cannot displace the token
-        # a `-C` names. Inside this branch on purpose -- the else below already emits the base.
-        if ($BaseFallback) { $out += $(if ($cd) { $cd } else { $CwdRaw }) }
+        $emitBase = [bool]$BaseFallback
     } else {
-        $out += $(if ($cd) { $cd } else { $CwdRaw })
+        $emitBase = $true
     }
 
-    # ADDITIONAL, never instead of: see the note above.
-    if ($Line -cmatch '(?:^|\s)--work-tree[=\s]+"?([^"\s]+)"?') { $out += $Matches[1]; $out += $CwdRaw }
-    if ($Line -cmatch '(?:^|\s)GIT_WORK_TREE="?([^"\s]+)"?')    { $out += $Matches[1]; $out += $CwdRaw }
-    # --git-dir names the repo; the tree is its parent. Add both rather than reason about which.
+    # ===================================================================================================
+    # THE EXPLICITLY NAMED REPOSITORY, COLLECTED SEPARATELY SO IT CAN OUTRANK THE IMPLICIT cwd.
+    #
+    # THE DEFECT THIS FIXES. These tokens used to be APPENDED AFTER the base, and the caller walks the
+    # list taking the first candidate git ANSWERS on. The cwd ALWAYS answers, because it is always a
+    # real directory -- so a `--git-dir` naming a different repository could never win, and the token
+    # the operator actually TYPED was the one that never decided.
+    #
+    # ONE ROOT CAUSE, SYMPTOMS IN BOTH DIRECTIONS, which is why the fix is a reorder and not a widening:
+    #   FAIL-OPEN   cwd ungoverned, `--git-dir` at the governed repo -> ALLOWED, and the write really
+    #               lands in the governed config. Proven by reading the value back, not by verdict.
+    #   FALSE DENY  cwd governed, `--git-dir` at an unrelated repo   -> DENIED, naming a repository the
+    #               write never touches. That is the BACKLOG #1085 shape.
+    # Putting the explicit token first fixes both at once. Neither is reachable by adding candidates.
+    #
+    # GIT_DIR IS ENUMERATED HERE FOR THE FIRST TIME, and its absence was visible in the asymmetry: the
+    # line above it has always matched GIT_WORK_TREE. The pair should have travelled together.
+    # ===================================================================================================
+    # ONLY --git-dir AND GIT_DIR ARE PROMOTED, AND --work-tree IS DELIBERATELY NOT. That distinction is
+    # MEASURED, not reasoned: run from an ungoverned repo with --work-tree naming the GOVERNED one, a
+    # `git config` write lands in the UNGOVERNED repo you are standing in; the same shape with --git-dir
+    # lands in the governed one. So --work-tree names the TREE and does not decide WHICH REPOSITORY'S
+    # CONFIG is written, which is the only question rule 3c asks.
+    #
+    # PROMOTING IT ANYWAY COST ONE HOLE AND FOUR FALSE DENIES, in both directions at once, which is the
+    # signature of ranking a token that does not determine the answer. Those five rows are why the
+    # promotion below is a two-token list rather than the four it started as.
+    #
+    # --work-tree and GIT_WORK_TREE STILL EMIT, unpromoted, exactly where they always did: rule 3 asks
+    # about the WORKING TREE, where they are precisely the right token, and this list is shared.
+    $promoted = @()
     if ($Line -cmatch '(?:^|\s)--git-dir[=\s]+"?([^"\s]+)"?') {
-        $out += $Matches[1]
-        $out += (Join-Path $Matches[1] "..")
+        $promoted += $Matches[1]
+        $promoted += (Join-Path $Matches[1] "..")
+    }
+    if ($Line -cmatch '(?:^|\s)GIT_DIR="?([^"\s]+)"?') {
+        $promoted += $Matches[1]
+        $promoted += (Join-Path $Matches[1] "..")
+    }
+    $explicit = @()
+    if ($Line -cmatch '(?:^|\s)--work-tree[=\s]+"?([^"\s]+)"?') { $explicit += $Matches[1]; $explicit += $CwdRaw }
+    if ($Line -cmatch '(?:^|\s)GIT_WORK_TREE="?([^"\s]+)"?')    { $explicit += $Matches[1]; $explicit += $CwdRaw }
+
+    # THE SWITCH IS OPT-IN AND DEFAULT-OFF, so rules 3 and 3d keep the exact list they had: explicit
+    # tokens after the base, in the same order, with GIT_DIR appended at the end where -- being behind
+    # the base -- it cannot change any verdict they reach. Only rule 3c opts in. Same blast-radius
+    # control as -AllTargets, and for the same reason: two earlier attempts at this rule were rejected
+    # for changing behaviour a caller did not ask for.
+    if ($ExplicitFirst) {
+        $out += $promoted
+        if ($emitBase) { $out += $(if ($cd) { $cd } else { $CwdRaw }) }
+        $out += $explicit
+    } else {
+        if ($emitBase) { $out += $(if ($cd) { $cd } else { $CwdRaw }) }
+        $out += $explicit
+        $out += $promoted
     }
     $out | Where-Object { $_ }
 }
@@ -1537,7 +1585,7 @@ if ($tool -in @("Bash", "PowerShell")) {
         # token must not end the question. The residual is stated rather than hidden: two `-C` tokens
         # inside one owning span are decided by whichever ANSWERS first, so a governed one can still win
         # over an ungoverned one. That errs CLOSED and is narrower than before this change.
-        $where = @(Get-GitTargetCandidatesRaw $seg.Raw $pfx $cwdRaw -AllTargets:$ownDashC -BaseFallback:$fallbackOk)
+        $where = @(Get-GitTargetCandidatesRaw $seg.Raw $pfx $cwdRaw -AllTargets:$ownDashC -BaseFallback:$fallbackOk -ExplicitFirst)
         if ($where.Count -eq 0) { continue }
 
         # ROOT THE TARGET AGAINST THE SESSION CWD BEFORE ASKING GIT ANYTHING (BACKLOG #1061). This block
