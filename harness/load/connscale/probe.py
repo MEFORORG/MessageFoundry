@@ -54,10 +54,33 @@ _PROBE_TIMEOUT_S = 5.0
 # Windows TotalProcessorTime is exposed as .Ticks (100-ns units); seconds = ticks / this. Reading the
 # integer ticks (not the culture-formatted .CPU double) keeps the parse locale-proof.
 _WIN_CPU_TICKS_PER_S = 10_000_000.0
-# A3: re-walk the process table every N sample ticks so a sharded engine's late-spawned `serve --shard`
-# workers join the subtree. A full walk is the expensive part of a tick, so amortise it rather than
-# paying it every time; at the runner's poll cadence this re-checks the topology every few seconds.
-_RESOLVE_EVERY_TICKS = 8
+# A3 / #1357: re-walk the process table so late-spawned workers (a sharded engine's `serve --shard`
+# subprocesses, a subprocess-sandbox worker child) join the subtree. Two triggers, because the topology
+# changes at a moment amortisation alone cannot afford to miss:
+#
+#   FRONT-LOAD -- the first `_FRONTLOAD_WALKS` ticks of a sampler's life each re-walk. The runner builds
+#   one sampler PER SWEEP STEP, so the counter starts over every step, and the workers appear DURING
+#   that step's ramp and early hold (`messagefoundry/pipeline/sandbox.py` spawns the sandbox worker
+#   child lazily on first dispatch). A cache resolved at tick 1 is therefore resolved at the one moment
+#   it is guaranteed to be incomplete.
+#
+#   THEN AMORTISE ON TIME -- afterwards a walk runs only once `_RESOLVE_INTERVAL_S` has elapsed, so the
+#   long profiles keep paying one walk per several seconds rather than one per tick.
+#
+# #1357: THE UNIT IS SECONDS, NOT TICKS, AND THAT WAS THE DEFECT. This gate used to read
+# `_RESOLVE_EVERY_TICKS = 8` and reason about it "at the runner's poll cadence" -- but a tick is not the
+# poll interval, it is the poll interval PLUS the probe's own shell-out. Measured on the maintainer's
+# box: 0.2-1.2 s of walk and per-PID read on top of a 0.25 s interval, so a tick runs 3-5x the unit the
+# constant was reasoned in. Against `hold_seconds = 1.5` a real sweep step collected 2 ticks against the
+# 8 it needed, on all four steps -- unreachable by arithmetic, not by bad luck. Lowering the tick count
+# could not fix it either, because one tick costs longer than the window it has to fire inside.
+#
+# Walk COUNT, not elapsed time, bounds the front-load: it starts at the first SAMPLE rather than at
+# construction, so however long the runner's connection ramp takes between the two, the front-load still
+# covers the beginning of the measurement window.
+_FRONTLOAD_WALKS = 4
+# "Every few seconds" -- what the retired tick constant's comment intended, now stated in its own unit.
+_RESOLVE_INTERVAL_S = 5.0
 # .NET DateTime.Ticks are 100-ns units on the same scale as TotalProcessorTime.Ticks above, but they
 # mean an INSTANT, not a duration — kept as its own name so the two never get conflated.
 _WIN_DATETIME_TICKS_PER_S = 10_000_000.0
@@ -177,9 +200,15 @@ class FdSampler:
     records a gap, never raises — and that gap names the path that produced it
     (:attr:`ProcSample.degraded`)."""
 
-    def __init__(self, pid: int, *, resolve_every: int = _RESOLVE_EVERY_TICKS) -> None:
+    def __init__(
+        self,
+        pid: int,
+        *,
+        frontload_walks: int = _FRONTLOAD_WALKS,
+        resolve_interval_s: float = _RESOLVE_INTERVAL_S,
+    ) -> None:
         self._pid = pid
-        self._pids: list[int] | None = None  # [root, *descendants], re-resolved every N ticks
+        self._pids: list[int] | None = None  # [root, *descendants], re-resolved per _due_for_rewalk
         # WHY the last subtree resolution failed, or None when it succeeded (Windows enumeration
         # timed out / errored / came back empty, or the root's own creation instant was absent so
         # nothing could be validated against it) — as opposed to a genuine no-descendants result. An
@@ -192,9 +221,12 @@ class FdSampler:
         # A3: the subtree is NOT stable for a SHARDED engine — ADR 0037's supervisor spawns one
         # `serve --shard` subprocess per shard, and a subtree cached before they appear measures an idle
         # supervisor forever (a flat CPU counter that used to render as a plausible 0.00). Re-resolve
-        # periodically so late-spawned workers are counted. `resolve_every=1` re-walks every tick.
-        self._resolve_every = max(1, resolve_every)
-        self._ticks_since_resolve = 0
+        # per the two triggers above so late-spawned workers are counted. `resolve_interval_s=0.0`
+        # re-walks every tick (every tick is immediately due).
+        self._frontload_walks = max(1, frontload_walks)
+        self._resolve_interval_s = max(0.0, resolve_interval_s)
+        self._walks = 0
+        self._last_walk_at = 0.0
 
     @property
     def pid(self) -> int:
@@ -227,17 +259,35 @@ class FdSampler:
             return self._sample_windows(pids)
         return self._sample_posix(pids)
 
+    def _due_for_rewalk(self) -> bool:
+        """Is this tick owed a fresh process-table walk? See :attr:`_FRONTLOAD_WALKS` for the two
+        triggers and for why the second one is stated in SECONDS.
+
+        The front-load is checked FIRST and on its own counter, so it cannot be starved by a walk that
+        was slower than the interval: the point of those walks is that they run back to back, over the
+        stretch of a sweep step when the topology is still changing."""
+        if self._walks < self._frontload_walks:
+            return True
+        return time.monotonic() - self._last_walk_at >= self._resolve_interval_s
+
     def _resolve_pids(self) -> list[int]:
-        """Resolve the engine's process subtree (root + descendants), re-walking every
-        ``resolve_every`` ticks so a sharded engine's late-spawned workers are picked up. A cached
-        resolution serves the ticks in between, so this costs one process-table walk per N ticks, not one
-        per tick.
+        """Resolve the engine's process subtree (root + descendants), re-walking per
+        :meth:`_due_for_rewalk` so late-spawned workers are picked up. A cached resolution serves the
+        ticks in between, so the steady state costs one process-table walk per interval, not one per
+        tick.
 
         A3: the subtree was previously resolved exactly ONCE, on the premise that "the engine doesn't
         re-spawn mid-hold". That holds for a single-process engine but NOT for a sharded one (ADR 0037
-        spawns one ``serve --shard`` subprocess per shard). A subtree resolved before those children
-        appear pins the sampler to an idle supervisor for the whole run — its CPU counter never advances,
-        which used to surface as a plausible ``0.00`` rather than a gap.
+        spawns one ``serve --shard`` subprocess per shard) and not for a subprocess-sandbox one. A
+        subtree resolved before those children appear pins the sampler to an idle supervisor for the
+        whole run — its CPU counter never advances, which used to surface as a plausible ``0.00``
+        rather than a gap, and its handle sum reports whatever the one walk happened to catch.
+
+        #1357: A3's periodic re-walk was then made unreachable by its own unit. Counting TICKS to
+        approximate seconds fails once a tick costs multiples of the poll interval, which is exactly
+        what a process-table walk plus a per-PID read costs — so the shipped short profiles ended their
+        step several ticks short of the threshold, every step, and the re-walk never ran where it was
+        needed most. The trigger is now front-load plus elapsed SECONDS.
 
         An ERRORED Windows resolution (enumeration failed/timed out under load, or a snapshot with no
         row for the root) is deliberately NOT cached: where ``self._pid`` is only a launcher shim,
@@ -245,16 +295,20 @@ class FdSampler:
         the current tick, flags ``_resolve_errored`` (so :meth:`sample_proc` emits a degraded gap instead
         of the shim's footprint), and leaves ``_pids`` unresolved so the next tick retries. A GENUINE
         no-descendants result (``[]``) IS cached and NOT flagged."""
-        if self._pids is not None:
-            self._ticks_since_resolve += 1
-            if self._ticks_since_resolve < self._resolve_every:
-                # Serving a previously-VALIDATED subtree. If the last re-resolve errored, that error
-                # applied to that tick only — the cached subtree is still the best known truth, and
-                # degrading every tick until the next re-walk would turn one transient enumeration
-                # failure into a run-long blackout. Clear the cause so this tick reports a real reading.
-                self._resolve_degraded = None
-                return self._pids
-        self._ticks_since_resolve = 0
+        if self._pids is not None and not self._due_for_rewalk():
+            # Serving a previously-VALIDATED subtree. If the last re-resolve errored, that error
+            # applied to that tick only — the cached subtree is still the best known truth, and
+            # degrading every tick until the next re-walk would turn one transient enumeration
+            # failure into a run-long blackout. Clear the cause so this tick reports a real reading.
+            self._resolve_degraded = None
+            return self._pids
+        # Both counters advance for an ATTEMPT, not for a success — a walk that fails still spent its
+        # cost. So the front-load is capped at N attempts rather than N successes, and once a cache
+        # exists a failing RE-walk falls back onto the interval instead of retrying every tick. It does
+        # NOT bound the case where no walk has ever succeeded: with `_pids` still None every tick walks,
+        # which is the pre-existing "not cached, so retry next tick" contract stated above, unchanged.
+        self._walks += 1
+        self._last_walk_at = time.monotonic()
         # Cleared BEFORE the walk: the walk itself records why it failed, and a stale cause from the
         # previous walk would otherwise be attributed to this one.
         self._resolve_degraded = None

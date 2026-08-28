@@ -135,7 +135,7 @@ def test_a_walk_that_spends_its_budget_records_walk_timeout(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _with_subprocess(monkeypatch, _spent_its_budget)
-    sampler = FdSampler(_DEAD_PID, resolve_every=1)
+    sampler = FdSampler(_DEAD_PID, resolve_interval_s=0.0)
     assert sampler._enumerate_windows() is None
     assert sampler._resolve_degraded is ProbeDegraded.WALK_TIMEOUT
 
@@ -144,7 +144,7 @@ def test_a_walk_that_errors_fast_records_walk_error(monkeypatch: pytest.MonkeyPa
     # TimeoutExpired subclasses SubprocessError, so a single `except (OSError, SubprocessError)` would
     # collapse this case into the timeout one. The two earn opposite verdicts; keep them apart.
     _with_subprocess(monkeypatch, _failed_fast)
-    sampler = FdSampler(_DEAD_PID, resolve_every=1)
+    sampler = FdSampler(_DEAD_PID, resolve_interval_s=0.0)
     assert sampler._enumerate_windows() is None
     assert sampler._resolve_degraded is ProbeDegraded.WALK_ERROR
 
@@ -153,7 +153,7 @@ def test_a_walk_that_returns_zero_rows_records_walk_empty(monkeypatch: pytest.Mo
     # A live host always has many processes, so a COMPLETED walk with zero usable rows is a silent
     # enumeration failure -- and, per the scope of this work, the case that must still fail.
     _with_subprocess(monkeypatch, _returned_nothing)
-    sampler = FdSampler(_DEAD_PID, resolve_every=1)
+    sampler = FdSampler(_DEAD_PID, resolve_interval_s=0.0)
     assert sampler._enumerate_windows() is None
     assert sampler._resolve_degraded is ProbeDegraded.WALK_EMPTY
     assert not ProbeDegraded.WALK_EMPTY.is_budget_exhausted
@@ -162,7 +162,7 @@ def test_a_walk_that_returns_zero_rows_records_walk_empty(monkeypatch: pytest.Mo
 def test_a_snapshot_without_the_root_records_walk_no_root(monkeypatch: pytest.MonkeyPatch) -> None:
     # The enumeration SUCCEEDED here; validation is what failed. Reporting it as an enumeration failure
     # would point a reader at the wrong half of the walk.
-    sampler = FdSampler(500, resolve_every=1)
+    sampler = FdSampler(500, resolve_interval_s=0.0)
     monkeypatch.setattr(sampler, "_enumerate_windows", lambda: [(900, 1, 10_000.0)])
     assert sampler._descendants_windows() is None
     assert sampler._resolve_degraded is ProbeDegraded.WALK_NO_ROOT
@@ -176,7 +176,7 @@ def test_a_resolution_that_fails_without_naming_a_cause_is_still_given_one(
     # a stand-in -- which is exactly why it needs pinning: nothing else demonstrates that a resolution
     # failure can never reach `sample_proc` as an UNNAMED gap, and an unnamed gap is the defect.
     monkeypatch.setattr(probe_module, "_WINDOWS", True)
-    sampler = FdSampler(500, resolve_every=1)
+    sampler = FdSampler(500, resolve_interval_s=0.0)
     monkeypatch.setattr(sampler, "_descendants_windows", lambda: None)
     assert sampler.sample_proc().degraded is ProbeDegraded.WALK_ERROR
 
@@ -184,7 +184,7 @@ def test_a_resolution_that_fails_without_naming_a_cause_is_still_given_one(
 def test_a_walk_that_succeeds_records_no_cause(monkeypatch: pytest.MonkeyPatch) -> None:
     # THE POSITIVE CONTROL for the four above: the causes are set by failure, not by merely walking.
     # Without this, a `_resolve_degraded` wired to a constant would pass every rejection test here.
-    sampler = FdSampler(500, resolve_every=1)
+    sampler = FdSampler(500, resolve_interval_s=0.0)
     monkeypatch.setattr(
         sampler, "_enumerate_windows", lambda: [(500, 1, 10_000.0), (600, 500, 10_001.0)]
     )
@@ -251,7 +251,7 @@ def _sample_proc_under(monkeypatch: pytest.MonkeyPatch, behaviour: Any) -> ProcS
     legs that are cheapest and most numerous."""
     monkeypatch.setattr(probe_module, "_WINDOWS", True)
     _with_subprocess(monkeypatch, behaviour)
-    return FdSampler(_DEAD_PID, resolve_every=1).sample_proc()
+    return FdSampler(_DEAD_PID, resolve_interval_s=0.0).sample_proc()
 
 
 def _is_walk(cmd: Any) -> bool:
@@ -312,7 +312,7 @@ def test_a_live_sample_records_a_cause_exactly_when_it_reads_nothing() -> None:
     still pass against a probe that could not read anything at all on this host. This one runs the
     unmodified probe against a live process and pins the biconditional -- a cause is recorded exactly
     when nothing was read -- so it reports honestly whichever way this runner behaves."""
-    got = FdSampler(os.getpid(), resolve_every=1).sample_proc()
+    got = FdSampler(os.getpid(), resolve_interval_s=0.0).sample_proc()
     read_something = any(
         v is not None for v in (got.handles, got.cpu_seconds, got.working_set_bytes)
     )
