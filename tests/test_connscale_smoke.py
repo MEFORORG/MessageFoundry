@@ -282,20 +282,12 @@ def _record_ratio_readings(report: ConnScaleReport) -> None:
     The tolerance is IMPORTED, not typed in. A second copy of 0.25 here would be a second definition
     of the band, and the emitted floor could then drift away from the one the SLO actually enforces.
     """
-    context = {
-        # What a later reader needs to tell samples apart. #1211's whole question is whether the
-        # ratio moves with runner contention, so the core count is part of the reading, not trivia.
-        "runner_os": os.environ.get("RUNNER_OS", "local"),
-        "cpus": str(os.cpu_count()),
-        "run_id": os.environ.get("GITHUB_RUN_ID", "-"),
-        "sha": os.environ.get("GITHUB_SHA", "-")[:8] or "-",
-    }
     _append_step_summary(
         report.render_readings_markdown(
             "empty_claims_per_msg",
             lambda r: r.empty_claims_per_msg,
             tolerance=_MONOTONIC_TOLERANCE,
-            context=context,
+            context=_run_context(),
         )
     )
     _write_readings_json(
@@ -303,7 +295,7 @@ def _record_ratio_readings(report: ConnScaleReport) -> None:
             "empty_claims_per_msg",
             lambda r: r.empty_claims_per_msg,
             tolerance=_MONOTONIC_TOLERANCE,
-            context=context,
+            context=_run_context(),
         )
     )
 
@@ -329,6 +321,42 @@ def _write_readings_json(payload: dict[str, object]) -> None:
         target.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     except OSError as exc:
         warnings.warn(f"could not write connscale readings JSON: {exc}", stacklevel=2)
+
+
+def _run_context() -> dict[str, str]:
+    """What a later reader needs to tell one run's samples from another's.
+
+    ONE definition, read by BOTH emitters. Two copies would drift, and a reader diffing the two tables
+    a single run produces would then be chasing a difference in the context rather than in the data.
+
+    #1211's question is whether the ratio moves with runner contention, so the core count is part of
+    the reading rather than trivia.
+    """
+    return {
+        "runner_os": os.environ.get("RUNNER_OS", "local"),
+        "cpus": str(os.cpu_count()),
+        "run_id": os.environ.get("GITHUB_RUN_ID", "-"),
+        "sha": os.environ.get("GITHUB_SHA", "-")[:8] or "-",
+    }
+
+
+def _record_diagnostics(report: ConnScaleReport) -> None:
+    """Persist the band-less diagnostic fields this run produced (BACKLOG #1366).
+
+    THE RATIO SAYS THAT SOMETHING MOVED; THESE SAY WHICH. Without them a connscale failure is
+    permanently undiagnosable from CI alone -- drain-tail and reload-probe separate ONLY on
+    `drain_seconds` against `reload_seconds`, and contention separates from probe-cost ONLY on the FD
+    probe's tick counts. Those readings existed on every record already and never left the `test` job,
+    which uploads no artifacts.
+
+    Emitted from the FIXTURE for the same reason #1211's readings are: it runs before any assertion, so
+    a passing run is recorded as fully as a failing one. A field that appears only on failure cannot
+    establish what its normal range is, which is the defect #1211 exists to fix one metric over.
+
+    NO BAND AND NO VERDICT -- see `render_diagnostics_markdown`. None of these has an SLO, so any
+    threshold printed beside them would be manufactured by the renderer.
+    """
+    _append_step_summary(report.render_diagnostics_markdown(context=_run_context()))
 
 
 @pytest.fixture(scope="module")
@@ -376,6 +404,7 @@ async def smoke_report() -> ConnScaleReport:
     )
     # In the FIXTURE, so the readings are recorded before any assertion can fail the module.
     _record_ratio_readings(report)
+    _record_diagnostics(report)
     return report
 
 

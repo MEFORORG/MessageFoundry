@@ -16885,3 +16885,37 @@ four branches returning the same text would pass every other assertion in the bl
 **Driven against the PURE verdict function with injected hashes**, never by mutating the installed
 gate: that file is machine-global and every PreToolUse hook on this box reads it, so a test may not
 take it out from under a concurrent session. Same reasoning the existing negative control gives.
+
+## 1366. the four connscale fields that discriminate the surviving failure hypotheses never escape the test job
+
+> 🔢 **Filed 2026-08-26 (builder 2) - BUILT IN THIS COMMIT, not yet landed.** Successor in subject to [#1211](#1211-empty_claims_per_msg-is-not-contention-immune-the-ratio-form-excursions-past-its-own-slo-band-on-a-hosted-runner), whose limb one made the RATIO survive a passing run; this makes the readings that EXPLAIN the ratio survive one too.
+> Verdict: build
+> Closing-act: code
+
+**Cluster:** Developer Experience & CI. **Priority:** P2. **Verdict:** build.
+**Severity:** no engine effect, no PHI axis, no deployment axis (sec. 0). The cost is diagnostic: a connscale failure on a hosted runner cannot be attributed from CI alone, so each occurrence burns a full cycle and ends in a re-run rather than a cause.
+
+**What:** `tests/test_connscale_smoke.py` runs inside the `test` job. **That job uploads no artifacts** -- ci.yml's three `upload-artifact` steps are in `load-test` (:2162), `load-test-sqlserver` (:2331) and `windows-service-smoke` (:2521). So every reading on a `ConnScaleRecord` that is not printed dies with the job. #1211 limb one made ONE metric survive, `empty_claims_per_msg`, via `$GITHUB_STEP_SUMMARY`. The fields that say WHICH explanation is right were not part of that scope.
+
+**The four the investigation actually turns on**, measured absent from the emission on `origin/main`:
+
+```
+drain_seconds            0        reload_seconds           0
+fd_probe_ticks           0        fd_probe_degraded_ticks  0
+cpu_util_cores_mean      0
+```
+
+* **drain-tail vs reload-probe separate ONLY on `drain_seconds` against `reload_seconds`.**
+* **contention vs probe-cost separate ONLY on the FD probe's tick counts** -- `fd_probe_degraded_ticks` non-zero means the walk could not measure; zero means it measured cleanly and a wrong reading is a wrong SUBJECT rather than a failed sample. That distinction is what a live investigation into the connscale FD gauge turned on, and it was unavailable from CI.
+
+**THE DESIGN CONSTRAINT THAT DECIDES THE SHAPE, and it is why this is a second renderer rather than a parameter on the first.** Only **two** metrics have a monotonic SLO -- `empty_claims_monotonic` and `fd_count_monotonic`. Every field above has **no band**. `render_readings_markdown` emits `prior` / `band floor` / `margin`, which for a band-less field would be **a threshold computed from whichever reading happened to precede it** -- false precision manufactured by the renderer and indistinguishable, in a job summary, from a measured one. So the table carries no band, no threshold and no verdict column, and says so in its own preamble.
+
+**Emitted from the FIXTURE, before any assertion**, for the same reason #1211's readings are: a field recorded only on failure cannot establish its own normal range. That is the selection bias #1211 exists to fix, one metric family over.
+
+**`None` renders as a dash and never as `0`.** "the probe did not measure" and "the probe measured zero" are different verdicts, and telling them apart is the whole purpose of `fd_probe_degraded_ticks`.
+
+**Not in scope, deliberately:** artifact upload (the step-summary channel already reaches every run and needs no ci.yml change), and any change to the `empty_claims_per_msg` band -- that is #1211 limb two and it stays blocked until samples exist.
+
+**Related:** #1211 (limb one shipped the channel this reuses; limb two blocked), #1101 (the per-message form these annotate), #320 (windows-2025 leg timing, one of the explanations these fields separate).
+
+**Source:** scoped by the Dispatcher, corrected by this lane's scouting -- the original scoping described artifact-upload work already done and a selection bias already fixed by #1211 limb one; what remained was the band-less fields and the constraint above.
