@@ -67,9 +67,11 @@ only on samples, so the count starts at the first sample rather than at construc
 runner's connection ramp takes between the two, the front-load still covers the beginning of the
 measurement window.
 
-**Both counters advance for an ATTEMPT, not for a success.** A failed walk still spent its cost, so
-charging it keeps a failing enumeration from re-walking flat out, and caps the front-load at four
-attempts rather than four successes. That is the same bound the tick counter gave, restated.
+**Both counters advance for an ATTEMPT, not for a success.** A failed walk still spent its cost. So the
+front-load is capped at four attempts rather than four successes, and once a cache exists a failing
+re-walk falls back onto the interval instead of retrying every tick. It does **not** bound the case
+where no walk has ever succeeded: with `_pids` still `None` every tick walks, which is the pre-existing
+"not cached, so retry next tick" contract and is unchanged here.
 
 ### What this changes about the meaning of `handles_peak`
 
