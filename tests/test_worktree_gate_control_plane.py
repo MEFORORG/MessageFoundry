@@ -1304,6 +1304,49 @@ def test_a_repository_token_owned_by_an_EARLIER_command_is_not_the_disarm_s_targ
     assert run_gate(shell(chain, cwd=unrelated), repo.repos) is None
 
 
+def test_a_REPEATED_repository_token_is_read_the_way_git_reads_it(
+    repo: SimpleNamespace, unrelated: Path
+) -> None:
+    """Repeated ``--git-dir`` is LAST-wins in git, and a first-match read inverts the answer.
+
+    PowerShell's ``-cmatch`` keeps the FIRST match. Repeated ``-C`` options are CUMULATIVE in git, so
+    first-to-last is right for those; ``--git-dir`` is not cumulative and the LAST one decides. Reading
+    the first meant a line naming an ungoverned repo and then the governed one really wrote to the
+    GOVERNED config while the rule read the ungoverned token and allowed it.
+
+    Both directions, because a fix that simply reversed without understanding why would pass one.
+    """
+    ungoverned_then_governed = (
+        f'git --git-dir="{unrelated}/.git" --git-dir="{repo.primary}/.git"'
+        " config core.hooksPath /dev/null"
+    )
+    reason = assert_denied(run_gate(shell(ungoverned_then_governed, cwd=repo.primary), repo.repos))
+    assert "setting 'core.hooksPath'" in reason
+
+    governed_then_ungoverned = (
+        f'git --git-dir="{repo.primary}/.git" --git-dir="{unrelated}/.git"'
+        " config core.hooksPath /dev/null"
+    )
+    assert run_gate(shell(governed_then_ungoverned, cwd=unrelated), repo.repos) is None
+
+
+def test_a_RELATIVE_repository_token_composes_the_cd_prefix(
+    repo: SimpleNamespace, unrelated: Path
+) -> None:
+    """Compose, never replace -- the rule the ``-C`` branch already states, absent from the promoted one.
+
+    This is the BACKLOG #1085 defect reintroduced on a new path. An uncomposed relative token resolves
+    against the SESSION cwd, so it misses the repository the ``cd`` actually moved to: the write lands
+    in the governed repo while the rule judges somewhere else entirely.
+    """
+    into_governed = f'cd "{repo.primary}" && git --git-dir=.git config core.hooksPath /dev/null'
+    reason = assert_denied(run_gate(shell(into_governed, cwd=unrelated), repo.repos))
+    assert "setting 'core.hooksPath'" in reason
+
+    into_ungoverned = f'cd "{unrelated}" && git --git-dir=.git config core.hooksPath /dev/null'
+    assert run_gate(shell(into_ungoverned, cwd=repo.primary), repo.repos) is None
+
+
 def test_the_ordering_switch_did_not_leak_into_rules_3_and_3d(
     repo: SimpleNamespace, unrelated: Path
 ) -> None:

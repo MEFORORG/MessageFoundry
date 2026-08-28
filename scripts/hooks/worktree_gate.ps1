@@ -393,12 +393,21 @@ function Get-GitTargetCandidatesRaw([string]$Line, [string]$Prefix, [string]$Cwd
                                    [switch]$AllTargets, [switch]$BaseFallback,
                                    [switch]$ExplicitFirst) {
     <#
-    TWO OPT-IN SWITCHES, BOTH DEFAULT OFF, ADDED FOR BACKLOG #1065. Rules 3 and 3d call this with three
-    positional arguments and are therefore byte-identical to before; only rule 3c opts in. That is
-    deliberate blast-radius control: #1065 has already killed two rewrites, and both died the same way --
-    the replacement turned out NARROWER than the regex it displaced, and every place it was narrower
-    became a hole. Neither switch replaces any matching. Each only ADDS candidates, so neither can turn a
-    caller's current DENY into an ALLOW.
+    THREE OPT-IN SWITCHES, ALL DEFAULT OFF. Rules 3 and 3d call this with three positional arguments
+    and are therefore byte-identical to before; only rule 3c opts in. That is deliberate blast-radius
+    control: #1065 has already killed two rewrites, and both died the same way -- the replacement turned
+    out NARROWER than the regex it displaced, and every place it was narrower became a hole.
+
+    *** THIS DOCSTRING PREVIOUSLY SAID "TWO SWITCHES" AND CLAIMED THAT "each only ADDS candidates, so
+    neither can turn a caller's current DENY into an ALLOW". BOTH WERE FALSE AND THE SECOND WAS
+    DANGEROUS. *** -ExplicitFirst REORDERS rather than adds, and reordering moves a candidate that used
+    to decide out of first place, which turns DENY into ALLOW by construction -- measured at roughly
+    fifty rows. The false sentence sat directly above the code that violated it, which is the worst
+    place for a wrong claim: a reviewer reads the reassurance instead of the ordering.
+
+    THE STANDING RULE THIS LEAVES BEHIND: a switch is only "additive" if its OFF state is byte-identical
+    AND its ON state appends. -ExplicitFirst satisfies the first and not the second, so it is an
+    ORDERING switch and is documented as one.
 
     ``-AllTargets`` -- return EVERY `-C` on the line, in order, instead of the first alone. The pattern is
     the same string and [regex]::Matches is case-SENSITIVE by default, exactly as the `-cmatch` it
@@ -490,14 +499,37 @@ function Get-GitTargetCandidatesRaw([string]$Line, [string]$Prefix, [string]$Cwd
     #
     # --work-tree and GIT_WORK_TREE STILL EMIT, unpromoted, exactly where they always did: rule 3 asks
     # about the WORKING TREE, where they are precisely the right token, and this list is shared.
+    # ===================================================================================================
+    # THE PROMOTED TOKENS GET EVERY TREATMENT THE `-C` BRANCH ABOVE APPLIES. THIS BLOCK IS A PARITY
+    # AUDIT, NOT A FEATURE, and it exists because three separate rounds of defects all had one shape:
+    # the `-C` branch had already solved the problem and this block did not inherit the solution.
+    #
+    #   TREATMENT                       `-C` branch      here
+    #   read off the blanked scan       (caller-side)    yes, via $ownGitDir gating -ExplicitFirst
+    #   every match, not just the first yes              YES, and it was missing -- see LAST-WINS below
+    #   compose a `cd` prefix           yes              YES, and it was missing -- see COMPOSE below
+    #
+    # LAST-WINS, AND IT IS THE OPPOSITE OF THE `-C` BRANCH'S ORDER, DELIBERATELY. Repeated `-C` options
+    # are CUMULATIVE in git, so first-to-last is the right walk there. A repeated `--git-dir` is not
+    # cumulative: THE LAST ONE WINS, and `-cmatch` keeps the FIRST. So a line naming an ungoverned repo
+    # and then the governed one really wrote to the GOVERNED config while this rule read the ungoverned
+    # token and allowed it. Reversing the match order makes the candidate git will actually use the
+    # first one tried.
+    #
+    # COMPOSE, NEVER REPLACE -- the same rule the `-C` branch states, and its absence here was the
+    # BACKLOG #1085 defect reintroduced on a new path: `cd <governed> && git --git-dir=.git config <key>`
+    # writes to the GOVERNED repo while an uncomposed `.git` resolves against the session cwd and misses
+    # it entirely. Guarded on IsPathRooted exactly as above, so an absolute token is untouched.
+    # ===================================================================================================
     $promoted = @()
-    if ($Line -cmatch '(?:^|\s)--git-dir[=\s]+"?([^"\s]+)"?') {
-        $promoted += $Matches[1]
-        $promoted += (Join-Path $Matches[1] "..")
-    }
-    if ($Line -cmatch '(?:^|\s)GIT_DIR="?([^"\s]+)"?') {
-        $promoted += $Matches[1]
-        $promoted += (Join-Path $Matches[1] "..")
+    foreach ($pat in @('(?:^|\s)--git-dir[=\s]+"?([^"\s]+)"?', '(?:^|\s)GIT_DIR="?([^"\s]+)"?')) {
+        $hits = @([regex]::Matches($Line, $pat) | ForEach-Object { $_.Groups[1].Value })
+        [array]::Reverse($hits)
+        foreach ($hit in $hits) {
+            $rooted = $(if ($cd -and -not [System.IO.Path]::IsPathRooted($hit)) { Join-Path $cd $hit } else { $hit })
+            $promoted += $rooted
+            $promoted += (Join-Path $rooted "..")
+        }
     }
     $explicit = @()
     if ($Line -cmatch '(?:^|\s)--work-tree[=\s]+"?([^"\s]+)"?') { $explicit += $Matches[1]; $explicit += $CwdRaw }
