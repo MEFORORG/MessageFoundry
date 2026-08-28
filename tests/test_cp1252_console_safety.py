@@ -57,10 +57,12 @@ THREE PROPERTIES THIS KEEPS, each of which the item names:
     break a terminal.
   * IT NEVER SILENTLY DROPS A FILE. A file that will not decode as UTF-8 is a FAILURE, not a skip.
 
-SCOPE, STATED RATHER THAN IMPLIED. ``scripts/**/*.py`` only. The engine already hardens both streams
-at ``messagefoundry/__main__.py``, and the ``.ps1`` surface has no equivalent reconfigure, so
-generalising to PowerShell is a different decision and is left to the existing per-file gates.
-``docs/`` is deliberately out: ``docs/BACKLOG.md`` is a sanctioned holdout for that same alphabet.
+SCOPE, STATED RATHER THAN IMPLIED. Three surfaces, three predicates, each stated where it is used:
+``scripts/**/*.py`` here, ``scripts/**/*.ps1`` below, and ``messagefoundry/**/*.py`` at the foot of
+the file. ``docs/`` is deliberately out: ``docs/BACKLOG.md`` is a sanctioned holdout for that same
+alphabet, and it doubles as this detector's positive control (29 distinct non-cp1252 codepoints,
+measured 2026-08-28) -- a detector that finds nothing anywhere is indistinguishable from a clean
+tree, and this repository has produced a false zero on exactly this census before.
 """
 
 from __future__ import annotations
@@ -200,6 +202,195 @@ def test_a_synthetic_offender_is_caught_and_a_hardened_one_is_not() -> None:
     assert not _HARDENS_STDOUT.search(bare)
     assert _unencodable(hardened) == [glyph]
     assert _HARDENS_STDOUT.search(hardened)
+
+
+# =================================================================================================
+# THE POWERSHELL HALF (BACKLOG #1030). See ADR 0178 for the derivation.
+#
+# WHY THE LARGER SURFACE WAS THE UNGATED ONE. Measured 2026-08-28: 54 `.ps1` files under `scripts/`
+# against 47 `.py`. The half this file already gated was the smaller one.
+#
+# THE CONTROL THAT SHOWED THE GAP, run before a line of this section was written: the SAME character
+# (U+2192) planted in `scripts/asvs/apply.py` and in `scripts/coord/claim.ps1`, one gate, one run.
+# The offenders list named the `.py` and did not contain the `.ps1`. With only the `.ps1` poisoned
+# the suite was fully green.
+#
+# THE FAILURE MODE IS WORSE HERE, AND THAT IS MEASURED RATHER THAN ASSUMED. Python raises
+# UnicodeEncodeError, which is catchable, loud, and leaves a traceback. PowerShell SUBSTITUTES.
+# Driven through both real hosts with the console pinned to cp1252, every arm returned rc=0 and
+# none raised: the character came back as `?`, or as three wrong characters, and the script
+# reported success. A silent corruption is strictly harder to notice than a crash.
+#
+# TWO INDEPENDENT CHANNELS, WHERE PYTHON HAS ONE -- the hard part of this item, measured
+# 2026-08-28 on WinPS 5.1.26100 and pwsh 7.6.5, console forced to cp1252 for every run:
+#
+#   host       source BOM   [Console]::OutputEncoding   decode   encode   character survives
+#   WinPS 5.1  no           no                          BAD      ok       NO
+#   WinPS 5.1  no           YES                         BAD      BAD      NO
+#   WinPS 5.1  YES          no                          ok       BAD      NO   (substituted '?')
+#   WinPS 5.1  YES          YES                         ok       ok       YES
+#   pwsh 7.6   no           no                          ok       BAD      NO   (substituted '?')
+#   pwsh 7.6   no           YES                         ok       ok       YES
+#   pwsh 7.6   YES          no                          ok       BAD      NO
+#   pwsh 7.6   YES          YES                         ok       ok       YES
+#
+# Source DECODING (WinPS 5.1 reads a BOM-less file as ANSI; pwsh 7 defaults to UTF-8) and output
+# ENCODING (fixed by `[Console]::OutputEncoding`) are separate, and EITHER ALONE LEAVES THE
+# CHARACTER DESTROYED. `sys.stdout.reconfigure` has no second channel to miss.
+#
+# AN EARLIER READING OF THIS EXEMPTION IS REFUTED ABOVE, WHICH IS WHY THE TABLE IS HERE. A prior
+# unlanded attempt at this gate exempted any file assigning `[Console]::OutputEncoding`, on the
+# reasoning that requiring more "would turn a capability check into a style check". Row 2 is that
+# predicate's blind spot: on WinPS 5.1 a BOM-less hardened file is STILL BROKEN. The predicate is
+# kept anyway, but as a HOST-CONDITIONAL claim rather than a universal one --
+#
+# THE HOST ASSUMPTION, STATED BECAUSE THE PREDICATE DEPENDS ON IT. This repository standardises on
+# pwsh 7: measured 2026-08-28, 19 `pwsh` references across `.github/`, `.claude/`, `scripts/` and
+# CLAUDE.md, and ZERO `powershell.exe`. Row 6 is therefore the governing row, and on it the
+# assignment alone IS sufficient. Under WinPS 5.1 it is not, and that caveat is load-bearing rather
+# than decorative: it is the whole reason this comment exists instead of a one-line regex.
+#
+# WHY A BOM IS NOT ALSO REQUIRED. On the governing host a BOM is neither necessary (row 6 survives
+# without one) nor sufficient (row 7 fails with one). It only matters on WinPS 5.1, which nothing
+# here invokes. And 0 of 54 `.ps1` files carry one today, so requiring it would be a 54-file
+# rewrite riding an item that is otherwise a zero-diff ratchet. That is a separate decision.
+#
+# A SIDE EFFECT THE PYTHON REMEDY DOES NOT HAVE, measured rather than reasoned about. Python's
+# `reconfigure` rebinds one process's own wrapper. The PowerShell assignment mutates the SHARED
+# console: a child was observed taking the code page from 1252 to 65001, and it STAYED 65001 after
+# that child exited, while the parent's cached `[Console]::OutputEncoding` still reported 1252.
+# The remedy is correct and is still the right one to require -- but it is not free, and a reader
+# comparing the two surfaces should not assume the analogy is exact.
+#
+# THIS LANDS AS A RATCHET AT ZERO, NOT AS A REPAIR. Measured 2026-08-28: 0 of 54 `.ps1` files carry
+# a non-cp1252 character, so this commit changes no script and fixes no live break. The zero is a
+# MEASUREMENT, not a silent predicate -- the same detector, on the same run, reports 29 distinct
+# codepoints in `docs/BACKLOG.md`. It is a regression gate for a class that has already recurred.
+# =================================================================================================
+
+#: The remedy, detected as a property of the file, exactly as the Python half does it. Matched
+#: case-insensitively because PowerShell is case-insensitive and `[console]::outputencoding` is a
+#: legal spelling of the same statement; a case-sensitive test would silently un-exempt a correct
+#: file. Both in-tree forms are covered -- `[System.Text.Encoding]::UTF8` and
+#: `[Text.UTF8Encoding]::new($false)` -- because the trailing expression is deliberately NOT
+#: constrained: what matters is that the property is ASSIGNED, not which UTF-8 encoder is chosen.
+#:
+#: THE `=` IS THE WHOLE POINT AND IS REQUIRED. A READ (`[Console]::OutputEncoding.CodePage`, or a
+#: comparison with `-eq`) hardens nothing, and a gate that accepted one would exempt files on the
+#: strength of a mention. `$OutputEncoding` is deliberately NOT matched: it is a different variable
+#: governing what is piped INTO native commands, not what reaches the console.
+_HARDENS_PS_CONSOLE = re.compile(
+    r"\[\s*(?:System\.)?Console\s*\]\s*::\s*OutputEncoding\s*=(?!=)", re.IGNORECASE
+)
+
+
+def _powershell_scripts() -> list[Path]:
+    return sorted(_SCRIPTS.rglob("*.ps1"))
+
+
+def test_the_powershell_scan_actually_covers_something() -> None:
+    """PRINT AND PIN WHAT WAS SCANNED, for the reason the Python half states: a walk that collapses
+    to nothing reports a clean result forever. `claim.ps1` is pinned by name because it is the file
+    the pre-build control poisoned to prove this surface was invisible."""
+    found = _powershell_scripts()
+    print(f"scanned {len(found)} powershell files under scripts/")
+    assert len(found) >= 45, (
+        f"only {len(found)} .ps1 files under scripts/ -- the walk is not finding them"
+    )
+    assert (_SCRIPTS / "coord" / "claim.ps1") in found
+
+
+def test_every_powershell_script_decodes_as_utf8() -> None:
+    """A file that will not decode is a FAILURE, never a silent skip.
+
+    Sharper on this surface than on the Python one: an undecodable `.ps1` is the exact artefact
+    the WinPS-5.1 ANSI-decode row above produces, so treating it as a skip would hide the very
+    failure this section was written to describe.
+    """
+    undecodable: list[str] = []
+    for path in _powershell_scripts():
+        try:
+            path.read_text(encoding="utf-8")
+        except UnicodeDecodeError as exc:
+            undecodable.append(f"{path.relative_to(_ROOT)}: {exc}")
+    assert not undecodable, "not decodable as UTF-8:\n  " + "\n  ".join(undecodable)
+
+
+def test_no_powershell_script_can_abort_a_cp1252_console() -> None:
+    """The gate: a `.ps1` may carry non-cp1252 characters only if it hardens the console itself."""
+    offenders: list[str] = []
+    exempted: list[str] = []
+    for path in _powershell_scripts():
+        text = path.read_text(encoding="utf-8")
+        bad = _unencodable(text)
+        if not bad:
+            continue
+        rel = path.relative_to(_ROOT)
+        shown = " ".join(f"U+{ord(c):04X}" for c in bad[:6])
+        if _HARDENS_PS_CONSOLE.search(text):
+            exempted.append(f"{rel} ({len(bad)} distinct: {shown})")
+            continue
+        offenders.append(
+            f"{rel} carries {len(bad)} non-cp1252 character(s) [{shown}] and does NOT assign "
+            f"[Console]::OutputEncoding -- on a stock Windows console PowerShell SUBSTITUTES the "
+            f"character and still exits 0, so the corruption is silent"
+        )
+    print(f"carrying non-cp1252 characters, hardened and therefore allowed: {exempted or 'none'}")
+    assert not offenders, "\n  ".join(
+        ["powershell scripts that can corrupt a cp1252 console:", *offenders]
+    )
+
+
+# --- the powershell detector's own controls ------------------------------------------------------
+
+
+def test_the_powershell_hardening_signal_matches_both_in_tree_spellings() -> None:
+    """Proved against the real files, not a reconstruction, so a rewrite of either one fails here.
+
+    Reading the shipped text also stops the regex being tuned to a form nobody uses.
+    """
+    for rel in ("coord/overlap.ps1", "coord/claim-adjudicate.ps1", "hooks/announce-session.ps1"):
+        real = (_SCRIPTS / rel).read_text(encoding="utf-8")
+        assert _HARDENS_PS_CONSOLE.search(real), f"{rel} assigns it and must be seen to"
+
+
+def test_the_powershell_hardening_signal_is_not_vacuous() -> None:
+    """The exemption must be the REMEDY, not a mention of one. A read, a comparison, a promissory
+    comment and the unrelated `$OutputEncoding` variable must all fail to exempt."""
+    assert _HARDENS_PS_CONSOLE.search("[Console]::OutputEncoding = [System.Text.Encoding]::UTF8")
+    assert _HARDENS_PS_CONSOLE.search(
+        "[Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)"
+    )
+    assert _HARDENS_PS_CONSOLE.search("[System.Console]::OutputEncoding=[Text.Encoding]::UTF8")
+    # PowerShell is case-insensitive; so is the signal.
+    assert _HARDENS_PS_CONSOLE.search("[console]::outputencoding = [text.encoding]::utf8")
+    # A READ hardens nothing.
+    assert not _HARDENS_PS_CONSOLE.search("$cp = [Console]::OutputEncoding.CodePage")
+    assert not _HARDENS_PS_CONSOLE.search("if ([Console]::OutputEncoding -eq $utf8) { }")
+    assert not _HARDENS_PS_CONSOLE.search("# we should probably set [Console]::OutputEncoding")
+    # A DIFFERENT variable: governs input to native commands, not console output.
+    assert not _HARDENS_PS_CONSOLE.search("$OutputEncoding = [System.Text.Encoding]::UTF8")
+
+
+def test_a_synthetic_powershell_offender_is_caught_and_a_hardened_one_is_not() -> None:
+    """Both directions, on text the gate has never seen -- and note the hardened arm KEEPS the
+    character. The remedy is hardening the stream, never scrubbing the source."""
+    glyph = chr(0x2192)
+    bare = f'Write-Host "depth {glyph} 3"'
+    hardened = "[Console]::OutputEncoding = [System.Text.Encoding]::UTF8\n" + bare
+    assert _unencodable(bare) == [glyph]
+    assert not _HARDENS_PS_CONSOLE.search(bare)
+    assert _unencodable(hardened) == [glyph], "the character must survive the remedy"
+    assert _HARDENS_PS_CONSOLE.search(hardened)
+
+
+def test_the_powershell_detector_discriminates_on_encodability_not_on_ascii() -> None:
+    """U+00E9 is non-ASCII but cp1252 encodes it at 0xE9, so it must NOT fire. A gate that
+    degraded into an ASCII-only rule would fire on legitimately accented strings and be switched
+    off; `scripts/hooks/announce-session.ps1` keeps an ASCII-only source by its own separate rule,
+    and that is a per-file choice this class-wide gate must not silently generalise."""
+    assert _unencodable("resume" + chr(0x00E9) + " and an em dash " + chr(0x2014)) == []
+    assert _unencodable("arrow " + chr(0x2192)) == [chr(0x2192)]
 
 
 # =================================================================================================
