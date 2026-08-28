@@ -5214,6 +5214,28 @@ A bare `Write-Output main$(calc):seed.txt` emits `mainPWNED-EXECUTED:seed.txt`. 
 **Source:** found 2026-08-06 by a three-pass audit (inventory, adversarial attack, refutation) of the committed gate, prompted by a coordination message from a peer session generalising this gate. That message's own premise was overturned by measurement: the values it named are newline-unreachable here, and the reachable defect was one its proposed fix would not have closed.
 
 ## 1082. Rule 3c's deny text for a `--global` or `--system` disarm write names the wrong mechanism, and whether the write takes effect is not knowable from the command
+> **THE WORDING IS FIXED 2026-08-27; the banner stays open for the archive pass. THE VERDICT DID NOT
+> MOVE, which is the property this item most needed protecting.** Rule 3c had ZERO mentions of
+> `--global`/`--system`, so it emitted the shared-config sentence for every scope. It now branches: a
+> scoped write is told which file it actually writes, and why it is refused anyway (git falls back to
+> that scope when the repository does not set the key). The repository-scope wording is UNCHANGED and
+> pinned by its own control, so this did not trade one false sentence for another.
+>
+> **NOTHING IN THE NEW TEXT REASSURES**, and the tests pin the absence of four phrases rather than the
+> presence of one. That is this row's round-4 lesson: segments are judged one at a time and `Write-Deny`
+> exits on the first hit, so a reassurance prints over a real disarm when a LATER segment does a local
+> write.
+>
+> **A QUALIFIER THIS ROW DOES NOT HAVE, measured 2026-08-27: whether a `--global` write takes effect
+> depends on WHERE IT IS READ FROM, not only on the repository.** From a worktree `core.hooksPath` is
+> set at worktree scope -- **75 of 76** `config.worktree` files set it -- so global loses to the more
+> specific scope. **From the primary it is unset at every scope** (`--get` exit 1, against a control of
+> `core.bare` exit 0), so a `--global` write there WOULD take effect. The row states only the first and
+> reads as though it settled the question for the repository. Denying stays correct for both.
+>
+> **The multi-line residual this row names is NOT fixed here** and still needs its own item: segments
+> are split on lines and the first hit exits, so a multi-line command is judged by its first segment.
+>
 
 > 🔢 **Re-scored 2026-08-20 -> P3.** Value **4/10** · Difficulty **3/10** · _fill-in_. The wrong sentence is still the only one rule 3c emits, and the rule reaches it for a --global write because the only pre-deny exclusion at :981 is for reads, so a governed cwd resolves and denies with prose that names a mechanism the write does not use. The verdict must stay deny, so the work is a scope-aware wording plus a test that asserts the string rather than the verdict. _(was 4/10 · 3/10.)_
 >
@@ -6155,6 +6177,26 @@ the blanking here without measuring `#1086`'s false-deny rows in the same table.
 **Source:** found 2026-08-06 by the must-keep-allowing inventory built for #1066, which enumerated what rule 3c allows today and found this in the gap between the shipped tests.
 
 ## 1069. Rule 3c matched the disarm key on the quote-blanked scan string, so a QUOTED key was invisible
+> **THE QUOTED-KEY FAIL-OPEN IS FIXED 2026-08-27; the banner stays open for the archive pass, and the
+> multi-word spelling below REMAINS OPEN BY DESIGN.** `Remove-QuotedSpans` now UNMASKS a quoted span
+> holding a single BARE WORD -- no whitespace, quote, `$`, bracket, brace, semicolon, ampersand, pipe
+> or backtick. Prose keeps its spaces and stays masked; a config key has none and becomes visible.
+>
+> **Measured before and after, with the UNQUOTED spelling as a known-answer control** (it denied in
+> both arms, so an ALLOW below is a reading and not a dead probe): all five quoted spellings this row
+> lists ALLOWED before and DENY after; three prose commit messages quoting `core.hooksPath` ALLOW in
+> both arms, so the false-deny this item warns about was not admitted.
+>
+> **THE LENGTH-PRESERVING MASK THIS ROW PRESCRIBES WAS DELIBERATELY NOT BUILT, and the reason is a
+> measurement rather than a preference.** Its stated rationale is that *"length preservation is what
+> lets the same offsets read paths back out of the raw text afterwards"* -- and NO RULE DOES THAT.
+> Every path site re-runs `[regex]::Match($seg.Raw, ...)` and computes its offsets inside `Raw` from
+> scratch. Length-preserving masking would change what every OTHER rule sees, for zero benefit to the
+> defect being closed. **Widening scope beyond the defect is precisely how the earlier attempt at this
+> item acquired five new fail-opens**, which is the outcome this row's own DO-NOT-SHIP order records.
+>
+> The banked patch remains unshipped and untouched.
+>
 
 > 🔢 **Re-scored 2026-08-20 -> P2.** Value **7/10** · Difficulty **4/10** · _quick win_. Rule 3c still decides on $seg.Scan at worktree_gate.ps1:976-978 while Remove-QuotedSpans at :347-388 blanks every closed quoted span, so a quoted danger key is erased before the disarm regex runs; grep finds no length-preserving mask, no bare-word unmask, and the pinned ALLOW test the item names is absent from tests/. Value 7 because the fail-open needs no unusual spelling and disarms the ledger, claim and leak commit gates for every worktree at once with no compensating detection, but its blast radius is the developer harness rather than a deployment; difficulty 4 because the one written fix was rejected on verification after acquiring five new fail-opens, so the remainder is a scanner rewrite plus an adversarial test round. _(was 8/10 · 3/10.)_
 >
@@ -16843,3 +16885,37 @@ four branches returning the same text would pass every other assertion in the bl
 **Driven against the PURE verdict function with injected hashes**, never by mutating the installed
 gate: that file is machine-global and every PreToolUse hook on this box reads it, so a test may not
 take it out from under a concurrent session. Same reasoning the existing negative control gives.
+
+## 1366. the four connscale fields that discriminate the surviving failure hypotheses never escape the test job
+
+> 🔢 **Filed 2026-08-26 (builder 2) - BUILT IN THIS COMMIT, not yet landed.** Successor in subject to [#1211](#1211-empty_claims_per_msg-is-not-contention-immune-the-ratio-form-excursions-past-its-own-slo-band-on-a-hosted-runner), whose limb one made the RATIO survive a passing run; this makes the readings that EXPLAIN the ratio survive one too.
+> Verdict: build
+> Closing-act: code
+
+**Cluster:** Developer Experience & CI. **Priority:** P2. **Verdict:** build.
+**Severity:** no engine effect, no PHI axis, no deployment axis (sec. 0). The cost is diagnostic: a connscale failure on a hosted runner cannot be attributed from CI alone, so each occurrence burns a full cycle and ends in a re-run rather than a cause.
+
+**What:** `tests/test_connscale_smoke.py` runs inside the `test` job. **That job uploads no artifacts** -- ci.yml's three `upload-artifact` steps are in `load-test` (:2162), `load-test-sqlserver` (:2331) and `windows-service-smoke` (:2521). So every reading on a `ConnScaleRecord` that is not printed dies with the job. #1211 limb one made ONE metric survive, `empty_claims_per_msg`, via `$GITHUB_STEP_SUMMARY`. The fields that say WHICH explanation is right were not part of that scope.
+
+**The four the investigation actually turns on**, measured absent from the emission on `origin/main`:
+
+```
+drain_seconds            0        reload_seconds           0
+fd_probe_ticks           0        fd_probe_degraded_ticks  0
+cpu_util_cores_mean      0
+```
+
+* **drain-tail vs reload-probe separate ONLY on `drain_seconds` against `reload_seconds`.**
+* **contention vs probe-cost separate ONLY on the FD probe's tick counts** -- `fd_probe_degraded_ticks` non-zero means the walk could not measure; zero means it measured cleanly and a wrong reading is a wrong SUBJECT rather than a failed sample. That distinction is what a live investigation into the connscale FD gauge turned on, and it was unavailable from CI.
+
+**THE DESIGN CONSTRAINT THAT DECIDES THE SHAPE, and it is why this is a second renderer rather than a parameter on the first.** Only **two** metrics have a monotonic SLO -- `empty_claims_monotonic` and `fd_count_monotonic`. Every field above has **no band**. `render_readings_markdown` emits `prior` / `band floor` / `margin`, which for a band-less field would be **a threshold computed from whichever reading happened to precede it** -- false precision manufactured by the renderer and indistinguishable, in a job summary, from a measured one. So the table carries no band, no threshold and no verdict column, and says so in its own preamble.
+
+**Emitted from the FIXTURE, before any assertion**, for the same reason #1211's readings are: a field recorded only on failure cannot establish its own normal range. That is the selection bias #1211 exists to fix, one metric family over.
+
+**`None` renders as a dash and never as `0`.** "the probe did not measure" and "the probe measured zero" are different verdicts, and telling them apart is the whole purpose of `fd_probe_degraded_ticks`.
+
+**Not in scope, deliberately:** artifact upload (the step-summary channel already reaches every run and needs no ci.yml change), and any change to the `empty_claims_per_msg` band -- that is #1211 limb two and it stays blocked until samples exist.
+
+**Related:** #1211 (limb one shipped the channel this reuses; limb two blocked), #1101 (the per-message form these annotate), #320 (windows-2025 leg timing, one of the explanations these fields separate).
+
+**Source:** scoped by the Dispatcher, corrected by this lane's scouting -- the original scoping described artifact-upload work already done and a selection bias already fixed by #1211 limb one; what remained was the band-less fields and the constraint above.
