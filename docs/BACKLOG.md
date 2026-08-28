@@ -6102,6 +6102,15 @@ Reach proven with a harmless key, no disarm key executed: `git -C '../../..' con
 
 **Source:** found 2026-08-06 by the adversarial verification pass on #1061's own fix, tasked with refuting the claim that the patch closed the hole. It did not find a defect in the patch; it found that the rule the patch corrected was bypassable by a route the patch did not touch and the item's banner would have implied was closed.
 
+
+**AMENDMENT 2026-08-28 (lander), and it WIDENS the mechanism rather than adding an instance.** The rule-3c half also admits a `--git-dir` inside a **quoted VALUE** -- `git config alias.zz "log --git-dir=<ungoverned>"` -- read as the target, so an ungoverned repository wins the chain while the write lands in the governed one.
+
+**The root cause is this item's own defect, unported to its siblings:** promoted tokens were read off the **RAW line** instead of the **blanked scan string**. This item solved exactly that for the `-C` flag; the treatment was not carried across when the same promotion was applied to the repository-naming tokens.
+
+Fixed in the rule-3c follow-on work. **The rule-3 and rule-3d half is NOT this item** -- it is filed separately as #1377, because a row naming only the enumeration half produces "add the missing spellings", which closes an instance and leaves the class open.
+
+**Two further classes found in the same pass are INHERITED rather than introduced and are filed as #1379**, both consequence-proven against the governed shared config: `-C` precedence composition, and the PowerShell environment-assignment spelling.
+
 ## 1066. Rule 3c strips double quotes only, so a single-quoted -C target bypasses it -- including an absolute one
 
 > ✅ **DECLINED-BY-DESIGN 2026-08-25, OWNER RULING extending the 2026-08-23 tokeniser ruling to the family (#1066/#1070/#1086/#1305/#1336).** Confirmed one-hop: the Liaison put it to the owner directly and read the answer, rather than relaying a third party's account. **#1336 already established this row cannot be fixed alone** -- it and `#1086` are "the same design error pulling in opposite directions," and closing this row's fail-open without widening `#1086`'s false-deny needs exactly the block-tracking shell tokeniser the ruling declines. The banked second fix below remains open evidence of why a narrower attempt still fails: it is MINIMAL-FROM-COMMITTED rather than a parser, and it was REJECTED by four independent verifiers finding at least five new fail-opens and two new false-deny classes -- the same failure shape #1336's own history shows four separate candidates hitting. **The gate governing this machine is unchanged and this row's bypass is real and remains live**; the ruling accepts that risk rather than building a fifth tokeniser-shaped candidate to close it. 🔢 **Re-scored 2026-08-20 -> P2.** Value **7/10** · Difficulty **6/10** · _big bet_. Both halves are live on the repo blob and on the installed hook that actually governs this machine: the -C reader is the unchanged double-quote-only regex and the disarm-key match still reads the quote-blanked scan text, so a single-quoted absolute -C and every quoted -c alias override remain reachable by ordinary spellings. Value 7 because this governs agent behaviour in development with no product or PHI effect, which is above the rubric's parity rungs but below the production and ASVS rungs; difficulty 6 because two written fixes have been rejected by adversarial verification, the second yielding at least five new fail-opens with residuals filed as #1067, #1069, #1070, #1071 and #1072. _(was 9/10 · 3/10.)_
@@ -17027,3 +17036,129 @@ site_prefixes   1      2       50.0%   <- would FAIL a flat 80% rule
 **Related:** #1080 (the setup script reporting a loaded set as if it were the installed one -- the same family of "the gate reported something adjacent to what you asked"), SEC-05.
 
 **Source:** SEC-04 in the master test plan, routed by the Liaison; scoped down by this lane after measuring that half the brief's build already existed.
+
+## 1374. fleet.ps1 originMainAgeMinutes reports fetch recency but measures when origin/main last MOVED, and on the packed-refs path it is null so the stop condition cannot fire
+
+> 🔢 **Filed 2026-08-28 (lander) - reported by the dispatcher and the cleaner; corroborated independently before filing.**
+> Verdict: build
+> Closing-act: code
+
+**Cluster:** Fleet coordination. **Priority:** P3. **Verdict:** build (small).
+**Severity:** no engine effect, no PHI axis, no deployment axis (sec. 0). It degrades a roster seats read to decide whether the board in front of them is complete.
+
+**THE FIELD IS NAMED FOR ONE QUESTION AND ANSWERS ANOTHER.** `originMainAgeMinutes` reads the `origin/main` ref file's mtime, which moves when the ref MOVES, not when it was FETCHED. A fleet that fetched seconds ago but whose `main` has been quiet for an hour reports an hour of staleness and fires the stop condition that prints DO NOT TREAT THE ROSTER BELOW AS COMPLETE.
+
+**CORROBORATED DIRECTLY RATHER THAN ARGUED, and this reading settles it:** taken read-only before any fetch, `.git/FETCH_HEAD` mtime `18:02:16.769` against the loose-ref mtime `18:01:24.059`. A fetch landed **52 seconds after** the ref last moved and left the ref untouched. The two clocks are separate and the field reads the wrong one.
+
+**THE SECOND HALF IS WORSE THAN THE FIRST AND WAS FOUND BY A DIFFERENT SEAT.** On the packed-refs path there is no loose ref to stat, so the value is null, the stop-condition test never fires, and **an absent warning renders identically to a healthy one**. The failing case and the passing case are indistinguishable on screen.
+
+**Related:** #1372 (fleet pointer health) is adjacent and **not a duplicate** -- that item is about pointer state, this one about a time field.
+
+**PROVENANCE:** diagnosed by the cleaner on 2026-08-24 and routed to the dispatcher seat. The board tool was fixed; `fleet.ps1` was not; and no ledger item existed -- a grep over both ledger files returned zero against a working control of 4 hits for `fleet.ps1`. **It fell out because nothing tracked it.**
+
+## 1375. install-gate.ps1 REPLACES the machine-wide gate allowlist on every run rather than merging, with no backup and no warning, and a dropped root fails open silently
+
+> 🔢 **Filed 2026-08-28 (lander) - third version of this item; the two earlier framings were refuted before filing and one is recorded below.**
+> Verdict: build
+> Closing-act: code
+
+**Cluster:** Development harness. **Priority:** P2. **Verdict:** build (small).
+**Severity:** no engine effect, no PHI axis, no deployment axis (sec. 0). It governs agent behaviour on a developer box. **The severity is that the failure is SILENT, not that it is large.**
+
+**THE DEFECT.** `install-gate.ps1` rewrites the machine-wide governance allowlist on every install run rather than merging into it -- **with no backup, no log line, and no warning that a currently governed root has just become ungoverned** -- while `docs/WORKTREE-GATE.md` documents the bare run as "govern this repo" and reads additive.
+
+**CONFIRMED FROM SOURCE, quoted not inferred:** the `Set-Content` REPLACES, and nothing between the branch entry and that write reads the existing file; the only `Get-Content` sits inside the `-Status` branch, which returns before the install path; a bare run writes exactly ONE repo; and the installer never backs up the allowlist -- its `Copy-Item` calls cover `settings.json` and the gate script only.
+
+**LEAD WITH THIS: A DROPPED ROOT FAILS OPEN SILENTLY.** The gate exits zero when the root count is zero, and the comment beside it says why -- the allowlist doubles as the kill switch, so no file and no entries means nothing is governed. Zero protection, no warning, no log line.
+
+**THE PRECONDITION IS LIVE ON THIS BOX, NOT HYPOTHETICAL.** The allowlist currently carries two roots, so a bare run would drop one. **And the two allowlists measurably disagree**, which is the state this defect produces and nothing reports.
+
+**DO NOT WORD THIS AROUND VISIBILITY.** `-Status` already prints the governed list, so "the operator cannot see the scope" is FALSE and would sink the item. **The defect is the missing announcement at the moment scope NARROWS.**
+
+**TWO DECOYS, neither of which covers it:** #1247 covers the gate SCRIPT copy, not the allowlist write. #1367 covers the parity MESSAGE from the same incident and has already landed.
+
+**UNTESTED, AND THE ITEM MUST NOT READ OTHERWISE: nobody has executed the installer in any mode.** Every mechanism claim above is source-reading. Two questions are genuinely open: whether `-Repo a,b` actually governs two repos, and whether a second gate installer exists on this box that nobody has identified.
+
+**A REFUTED FRAMING, KEPT SO IT IS NOT RE-DERIVED:** an earlier version claimed the engine was ungoverned for four days. **Refuted by 70 engine denial proof points across 2026-08-22 to 08-26** against an all-time control of 211. Real engine exposure was at most 72 minutes, both collapses were on 2026-08-26 ten minutes apart, and **the victim is inverted** -- the repository that was ungoverned, for about 24 days, was the vault.
+
+## 1376. the vault ships all three privileged installers and none of the three installed-vs-source parity instruments
+
+> 🔢 **Filed 2026-08-28 (lander) - found by builder 1 while screening before claiming.**
+> Verdict: build
+> Closing-act: code
+
+**Cluster:** Development harness. **Priority:** P3. **Verdict:** build (small).
+**Severity:** no engine effect, no PHI axis, no deployment axis (sec. 0).
+
+**THE MEASUREMENT, with its control:**
+
+```
+                                          vault     engine
+tests/test_selfheal_installed_parity.py   ABSENT    present
+tests/test_gate_installed_parity.py       ABSENT    present
+tests/test_installed_coord_hooks.py       ABSENT    present
+
+CONTROL: the vault tests/ tree holds 527 entries, so this is not a repo-shape artifact.
+AND IT SHIPS THE SUBJECT: install-selfheal.ps1 and worktree-selfheal.ps1 are both present there.
+```
+
+**So the vault carries the same privileged installers and none of the instruments that would tell anyone they had drifted.**
+
+**CORROBORATING, AND LABELLED UNDIAGNOSED BECAUSE THAT IS HOW IT WAS REPORTED:** the vault's installed commit-msg hook is far smaller than the engine's `claim_check.py` source. Vault source and installed are the same blob as each other; the engine's differs. **Nobody chased what the difference is, and this row does not claim to know.**
+
+**NOT A DUPLICATE OF #1019, and the check is specific:** #1019's body mentions the vault **zero** times across all 53 of its lines. **#1019 stays OPEN for its own deliberately-unbuilt installer-side half and must NOT be closed on this item** -- they are different halves of different repositories.
+
+**AND READ #1019's BANNER BLOCK RATHER THAN ITS HEADING:** its title overstates, its banner already says PARTLY LANDED and names the unbuilt half. A seat correcting the banner from the heading would flip a correct banner to wrong.
+
+## 1377. rule 3 and rule 3d walk a promoted token list that GIT_DIR leaks into, so a governed path named only in the environment produces a false deny
+
+> 🔢 **Filed 2026-08-28 (lander) - split out of #1065's rule-3c half, which is amended rather than duplicated.**
+> Verdict: build
+> Closing-act: code
+
+**Cluster:** Development harness. **Priority:** P3. **Verdict:** build (small).
+**Severity:** no product effect and no PHI effect -- this governs agent behaviour in development. *(Clause carried verbatim from #1065, because without it this row reads as a product-severity claim and it is not.)*
+
+**THE MECHANISM.** `GIT_DIR=<governed> git clean -fd` denies. The promoted token list is emitted in the non-opt-in branch on the reasoning that it "sits behind the base where it cannot win" -- **but rules 3 and 3d walk the whole list, so it wins.**
+
+**ALSO IN SCOPE:** a governed path merely MENTIONED in a comment, a commit message or an alias body denies.
+
+**MEASURED, NOT ASSERTED:** the seven defects in this family were re-measured against the COMMITTED gate rather than a handed copy; all 20 rows correct and ten original closures held.
+
+**NOT THIS ROW:** the rule-3c half belongs to #1065, and that item is amended in this same commit rather than duplicated here.
+
+## 1378. rescue refs drift from the branch they were taken for, so a recovery reaches a commit strictly behind the work it was meant to protect
+
+> 🔢 **Filed 2026-08-28 (lander) - a visibility framing of this was refuted before filing; the surviving harm is VALUE drift.**
+> Verdict: build
+> Closing-act: code
+
+**Cluster:** Fleet coordination. **Priority:** P3. **Verdict:** build (small).
+**Severity:** no engine effect, no PHI axis, no deployment axis (sec. 0). It degrades a recovery path seats rely on in order not to lose work.
+
+**THE MEASUREMENT:** 34 of 219 rescue refs have drifted, **29 of them strictly behind** the branch they were taken for. Zero twin refs. Four are gc-droppable.
+
+**THE FAILURE IS SILENT AND SUCCESSFUL-LOOKING, which is why it needs a row rather than a habit.** An older snapshot **opens cleanly**. No error, no dangling ref, no signal. It is the wrongly-resolving reference rather than the broken one -- and a broken reference advertises itself while this one does not.
+
+**DEMONSTRATED IN PRACTICE THE DAY IT WAS FILED:** a seat cited anchor refs in its own handoff that had gone stale between writing and reading -- one anchor held four files while the tree it named had five, six minutes later. **It needs no race, only a person writing a ref name down and time passing.**
+
+**DO NOT FILE THE VISIBILITY STORY, and this is the part that was nearly wrong.** An earlier framing held that a seat checking "is this work backed up?" from a vault checkout gets a false negative because the vault maps no `rescue/auto/*` refspec. **Refuted:** the two repositories are symmetrically blind because they are DIFFERENT REPOSITORIES, so that reduces to asking the wrong repo, not a refspec defect. **A name-only comparison cannot see the real defect, which is value drift.**
+
+**WHAT SURVIVES FROM THE REFUTED VERSION, and it is worth keeping:** one server-side tag can carry different local names per clone, because the engine rewrites `refs/tags/rescue/*` into a remote-tracking namespace. **Name the clone when you name a ref.** That is a naming lesson, not this defect.
+
+## 1379. the -C precedence and PowerShell environment-assignment classes reach the governed shared config on both gates, and no rule models either
+
+> 🔢 **Filed 2026-08-28 (lander) - INHERITED, not introduced; both are allowed on the pre-fix gate too.**
+> Verdict: build
+> Closing-act: code
+
+**Cluster:** Development harness. **Priority:** P2. **Verdict:** build (medium).
+**Severity:** no product effect and no PHI effect -- this governs agent behaviour in development. **Both classes are CONSEQUENCE-PROVEN: the write really reaches the governed shared config, verified by reading the config back.**
+
+**CLASS ONE, `-C` PRECEDENCE.** `git -C X --git-dir=<governed>/.git config <key>` writes the GOVERNED config and is ALLOWED on both the pre-fix and post-fix gates. Real git applies `-C` and then lets `--git-dir` decide; the rule does not model that composition.
+
+**CLASS TWO, THE POWERSHELL ENVIRONMENT SPELLING.** The gate's `GIT_DIR` enumeration matches the POSIX prefix form only. **A pattern cannot reach the PowerShell form, and this was proven by attempting it:** a regex was written, it parsed, it emitted correctly, and three rows were still wrong. In PowerShell the assignment is a separate statement before the separator, so it lands in a **different scan segment** than the git invocation it configures. The gate has no cross-segment environment tracking. **The attempt was reverted rather than shipped, because a regex that looks like coverage and is not is worse than a known gap.**
+
+**SO THIS IS A DESIGN CHANGE, NOT A PATTERN.** Filing it as "add the missing spellings" would ship a fix that closes an instance and leaves the class open.
+
+**PROVENANCE:** both surfaced by a completeness critic during #1065's follow-on work and were explicitly attributed as inherited rather than introduced, after being measured against the pre-fix gate. **Neither is caused by the branch that found them.**
