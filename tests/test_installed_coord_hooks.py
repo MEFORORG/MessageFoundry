@@ -53,10 +53,11 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
-from _bash_resolver import bash_sees, require_bash
+from _bash_resolver import bash_preserves_path_order, bash_sees, require_bash
 
 ROOT = Path(__file__).resolve().parents[1]
 INSTALLER = ROOT / "scripts" / "coord" / "install-coordination.ps1"
@@ -653,6 +654,33 @@ def test_the_shim_refuses_rather_than_permits_when_no_interpreter_resolves(var: 
     )
 
 
+def _posix_shell(tmp_path: Path) -> str:
+    """The interpreter the empty-PATH experiment below runs under, PINNED ON PROOF NOT ON A NAME.
+
+    ``sh`` is preferred -- the shim is POSIX and running it under a POSIX shell is the faithful check
+    -- but WHATEVER is found must be PROVED before it is trusted (BACKLOG #1216). On Windows a PATH
+    lookup can resolve an interpreter in a different filesystem namespace: it is FOUND rather than
+    absent, so a ``which(...) is None`` skip never fires and the body fails for a reason unrelated to
+    the shim. If the found shell fails a probe, fall back to the shared resolver, which raises loudly
+    rather than skipping.
+
+    BOTH probes, matching ``require_bash``, and PATH order is the load-bearing one HERE SPECIFICALLY
+    (BACKLOG #1272). The experiment below sets ``env = {"PATH": str(empty)}`` and nothing else, so
+    PATH is its ONLY variable -- and Git for Windows' ``bin/sh.exe`` wrapper rewrites PATH to put
+    ``/mingw64/bin`` first, refilling the directory the test just emptied. ``bash_sees`` passes it,
+    because the filesystem namespace is fine and PATH order is an orthogonal dimension. The
+    assertions would then hold for a reason unrelated to the shim.
+    """
+    found = shutil.which("sh") or shutil.which("bash")
+    if (
+        found
+        and bash_sees(Path(found), tmp_path)
+        and bash_preserves_path_order(Path(found), tmp_path)
+    ):
+        return found
+    return require_bash(tmp_path)
+
+
 @pytest.mark.parametrize("var", SHIM_VARS)
 def test_the_shim_actually_exits_nonzero_with_no_python_on_path(var: str, tmp_path: Path) -> None:
     """BEHAVIOURAL control for the text assertion above -- run the real shim body with an empty PATH.
@@ -664,15 +692,8 @@ def test_the_shim_actually_exits_nonzero_with_no_python_on_path(var: str, tmp_pa
     Run against a COPY in tmp_path, never against the installed hook -- that file fires on every push
     in every worktree on this box.
     """
-    # `sh` is preferred -- the shim is POSIX and running it under a POSIX shell is the faithful
-    # check -- but WHATEVER is found must be PROVED to see this process's files before it is trusted
-    # (BACKLOG #1216). On Windows a PATH lookup can resolve an interpreter in a different filesystem
-    # namespace: it is FOUND rather than absent, so a `which(...) is None` skip never fires and the
-    # body fails for a reason unrelated to the shim. If the found shell is blind, fall back to the
-    # probed resolver, which raises loudly rather than skipping.
-    found = shutil.which("sh") or shutil.which("bash")
-    sh = found if found and bash_sees(Path(found), tmp_path) else require_bash(tmp_path)
-    print(f"POSIX shell: {sh} (namespace probe passed; which() offered {found or 'NONE'})")
+    sh = _posix_shell(tmp_path)
+    print(f"POSIX shell: {sh}")
 
     script = tmp_path / "shim"
     script.write_text(HERE_STRINGS[var].replace("\r\n", "\n"), encoding="utf-8", newline="")
@@ -695,6 +716,58 @@ def test_the_shim_actually_exits_nonzero_with_no_python_on_path(var: str, tmp_pa
         f"permission. The gate did not run and said everything was fine."
     )
     assert "REFUSING" in r.stderr, f"{var}: refused silently -- stderr does not say what happened"
+
+
+def test_the_shell_selection_consults_both_probes_not_only_the_namespace_one(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """PATH ORDER is the load-bearing dimension HERE SPECIFICALLY, and one probe cannot see it.
+
+    The experiment above sets ``env = {"PATH": str(empty)}`` and nothing else -- PATH is its only
+    variable. Git for Windows' ``bin/bash.exe`` (and the ``bin/sh.exe`` beside it) is the MINGW64
+    wrapper: it REWRITES the inherited PATH so ``/mingw64/bin`` leads. MEASURED on this box, same
+    shim, one variable::
+
+        Git/bin/sh.exe      sees=True  order=False  PATH head -> /mingw64/bin
+        Git/usr/bin/sh.exe  sees=True  order=True   PATH head -> <the empty dir>
+
+    A shell that refills the directory the test emptied DESTROYS the experiment while every assertion
+    still passes -- it passes today only because nothing in ``mingw64/bin`` happens to be named
+    ``python``, which is a property of Git's packaging, not of the shim. ``bash_sees`` cannot catch it
+    and that is not a gap in that probe: it asks about the FILESYSTEM NAMESPACE, and both binaries
+    share ours. The dimensions are orthogonal, so the site must consult BOTH, exactly as
+    ``require_bash`` does.
+
+    Forced rather than waited for. ``which("sh")`` resolves ``usr/bin`` on this box, so the hole is
+    LATENT here and fires wherever PATH orders ``Git/bin`` first -- a test that only ran the real
+    lookup would be green on this machine for a reason unrelated to the code. So ``which`` is pointed
+    at an interpreter that is real, runs, and is not a shell, and the namespace probe is mutated OPEN
+    the way ``test_bash_resolver`` establishes: with the first probe answering yes to everything, only
+    a genuinely consulted second probe can still reject. No skip and no Git-for-Windows needed, so
+    this control is alive on every platform the suite runs on.
+    """
+    real_which = shutil.which
+
+    def fake_which(cmd: str, mode: int = os.F_OK | os.X_OK, path: str | None = None) -> str | None:
+        # Narrow on purpose: `bash_candidates` calls which("git") to anchor itself, and hijacking
+        # that would break the fall-back this test is asserting reaches.
+        if cmd == "sh":
+            return sys.executable
+        return real_which(cmd, mode, path)
+
+    monkeypatch.setattr(shutil, "which", fake_which)
+    monkeypatch.setattr(sys.modules[__name__], "bash_sees", lambda *a, **k: True)
+
+    chosen = _posix_shell(tmp_path)
+    assert chosen != sys.executable, (
+        f"the selection returned {chosen}, an interpreter `require_bash` rejects. It was accepted on "
+        "the strength of one probe, so a shell that rewrites PATH is accepted the same way -- and "
+        "PATH is the only variable this module's empty-PATH experiment has."
+    )
+    assert bash_preserves_path_order(Path(chosen), tmp_path), (
+        f"the selected shell ({chosen}) rewrites PATH, so the empty directory the experiment points "
+        "PATH at is refilled before the shim runs and the assertions hold for the wrong reason"
+    )
 
 
 # Shim variable -> the hook filename the installer writes it to. The parity test below needs the
