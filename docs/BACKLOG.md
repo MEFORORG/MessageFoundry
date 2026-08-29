@@ -17855,3 +17855,72 @@ posture is not weakened. The cost is a documented opt-out that does not work as 
 
 ---
 
+## 1400. the 90 percent Workflow gate is a per-launch question, so its margin does not scale with concurrent launchers or with a fan-out's own later phases
+
+> 🔢 **Filed 2026-08-29 (lander) - not started.** The gate prints `max(5-hour, weekly)` at the
+> instant one session asks, and refuses a new Workflow above `WORKFLOW_GATE_AT`. It answers *"is the
+> pool low enough for MY launch"* correctly every time, and that is the defect: **N launchers each get a
+> correct yes, and the sum is wrong.**
+> Verdict: build
+> Research: none
+> Closing-act: code
+
+**Cluster:** coordination tooling / usage clock. **Priority:** P2. **Verdict:** build.
+**Severity:** no engine, PHI or deployment axis (sec. 0). It governs fleet spend, not the product. **The
+cost is a usage window dying hours early while every seat followed the rule**, which is also why it does
+not present as anyone's error.
+
+**THE MITIGATION THAT EXISTS IS A MARGIN, AND THE MARGIN IS SIZED FOR ONE.** This row does **not** claim
+concurrency was overlooked -- `watch.py` says the opposite in its own header: the owner **lowered**
+`WORKFLOW_GATE_AT` from 92.0 to 90.0 on 2026-08-05 *"because the threshold is a function of
+CONCURRENCY"*, reasoning at `:612` that *"a Workflow moves a pool 5-7 points, so at 92 a single in-flight
+Workflow could cross the ceiling."* **That is a margin for ONE in-flight Workflow. Nothing in the check
+scales it with how many are already running, because the gate has no denominator.**
+
+**LIMB 1 -- AGGREGATE BLINDNESS. Measured 2026-08-29.** Five fan-outs launched between 23:37Z and
+23:45Z, roughly 49 agents. **Every one read the gate and passed honestly at 2-6 percent**, because the
+other launches' costs had not landed yet. The pool went **2 percent at 23:36:53Z to 43 percent at
+23:56:48Z**. Nobody was careless and no seat could have seen it from where it stood.
+
+**LIMB 2 -- IT IS SELF-SYNCHRONISING, WHICH IS WHY THIS IS NOT RARE.** A window reset is the single
+instant when every seat is simultaneously unblocked, holding queued work, and reading the lowest number
+it will see all window. **So the gate is most permissive exactly when demand peaks.** Two consecutive
+windows took this shape; the earlier one ran 5 to 98 percent in about seventy minutes.
+
+**LIMB 3 -- IT IS ALSO BLIND TO THE LAUNCHER'S OWN LATER PHASES.** A per-launch gate reads the launch
+instant; a multi-phase fan-out spends most of its cost later. Reported by the PM against itself: it
+cleared the gate on a workflow whose expensive stage -- a 37-refuter phase -- appeared in no number the
+gate checked, **including the PM's own agent count**. It killed that run at 4 agents spent.
+
+**AND THE OBVIOUS SELF-COUNT UNDER-REPORTS, MEASURED ON THIS FILER'S OWN RUN.** Counting `agent(` call
+sites is the natural way to size your own fan-out and it is wrong, because **fan width lives in the
+array, not at the call site**:
+
+```
+verify-six-rows-by-their-own-instrument
+  grep -c 'agent('        ->  3   call sites, at lines 83, 100 and 130
+  const ROWS = [...]      ->  6   at line 76, nowhere near any of them
+  agents actually started -> 13
+```
+
+**A 4.3x under-report from the instrument a launcher would reach for first.** Read every `parallel()`
+and `.map()`, multiply by the array length, and sum across phases: **a phase's cost is fan width times
+depth and neither appears at the `agent()` call.**
+
+**WHAT WOULD ACTUALLY CLOSE IT, AS OPTIONS RATHER THAN A DESIGN.** A denominator the gate does not have
+today: fan-outs in flight fleet-wide, and agents REMAINING rather than launched. `lane.ps1` is
+first-person by construction and deliberately has no `-Lane` parameter, so this is not that -- it is
+closer to a live census a launcher must read before calling, rather than a broadcast after the fact.
+**Lowering the threshold again is the one thing that will not work**, because it buys margin per
+launcher and the failure is in the sum.
+
+**NOT CLAIMED:** that any seat launched carelessly, that the gate is wrong about the question it asks,
+or that a fix is obvious. Every measured launch cleared it honestly.
+
+**PROVENANCE:** limbs 1 and 2 are the PM's, relayed and measured by the steward; limb 3 is the PM
+reporting its own failure case; the dispatcher screened it against the ledger and the alloc titles and
+routed it as content with no number. **The filer re-ran the screen over `origin/main` and over all 460
+backlog alloc records before allocating** -- `workflow` 0, `concurren` 0, `fan-out` 0 in titles;
+`fanout` 3 all seat-clock (#1264, #1266, #1267); `aggregate` 1 (#1250). Controls: `gate` 72 titles,
+`workflow` 191 lines in the ledger, an impossible string 0. **The `watch.py` margin history above is the
+filer's own read**, and it is the part that changes the row's ask.
