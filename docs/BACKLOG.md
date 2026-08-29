@@ -17688,3 +17688,68 @@ per occurrence and silently strands rows whose bar has lapsed.
 
 ---
 
+## 1394. a dispatch blocker-screen discards 46 percent of the open ledger on a token match, and it preferentially kills the best-documented rows
+
+> 🔢 **FILED 2026-08-29 (builder 2), on a defect the DISPATCHER found in its own instrument
+> and disclosed unprompted.** A dispatcher screened open rows for blockers by matching the token
+> "DO NOT". ***115 OF 251 OPEN ROWS CONTAIN IT -- 46 PERCENT OF THE LIVE LEDGER. ABOUT 24 ACTUALLY
+> BAR WORK.*** An overnight "nothing is dispatchable" finding was published off that screen and has
+> since been withdrawn.
+
+> **ALL 115 WERE THEN READ, in two passes, and the population is mostly ordinary language:**
+
+| class | count | what it is |
+|---|---|---|
+| **REAL BAR** | **~24** | do not build / ship / schedule / dispatch this work |
+| FENCE | ~27 | constrains FILING, CLOSING or SCOPE -- not whether to build |
+| ADVICE | ~34 | design and method guidance inside the row |
+| NOT-A-DIRECTIVE | ~19 | ordinary prose that happens to contain the words |
+| HISTORICAL / QUOTED | ~11 | quotes a directive being reported or overturned |
+
+> ***THE PERVERSE SELECTION IS THE REAL DEFECT, NOT THE FALSE-POSITIVE RATE.*** A row saying *"do not
+> invert it silently"* or *"do not assert structural silence from a three-file sample"* is a row whose
+> author thought carefully about how the work could go wrong. **THE SCREEN KILLS THOSE FIRST.** A
+> thin, under-documented row containing no cautions sails through. **The instrument is
+> anti-correlated with row quality.**
+
+> **THREE FAILURE SHAPES, EACH MEASURED, EACH INVISIBLE TO A TOKEN MATCH:**
+>
+> 1. ***FIRST-HIT CLASSIFICATION.*** A row can carry several "DO NOT"s of different classes. #352
+>    reads as prose on hit one and carries a real fence on hit two; #1242 has three harmless hits and
+>    a fourth that is a real bar. **Classify by the STRONGEST directive, never the first.**
+> 2. ***THE `REBUILD` GAP*** -- see the sibling row filed alongside this one. Four rows say the work
+>    already shipped; no BUILD-verb list matches `REBUILD`, so all four pass as buildable.
+> 3. ***THE EXPIRED BAR.*** #1020 contains "DO NOT BUILD THE GATE YET" **and** "THE STANDING ... PARK
+>    HAS EXPIRED BY ITS OWN TERMS" **and** "UNCHANGED: build now". The screen honours a dead bar.
+
+> ***AND THE BUCKET THAT EXISTS TO STOP DISPATCH IS THE LEAST RELIABLE ONE: of 19 rows a verb-list
+> screen called BAR, 8 DO NOT BAR THE ROW'S WORK -- 42 percent false.*** Five of those eight contain
+> the literal words "DO NOT BUILD", where the phrase means *not that way*, *not there*, *not yet and
+> yet is over*, or is a **quotation**. **#1334's "DO NOT"s are quoted definitions of what
+> `demand-gate` and `owner-ruling` MEAN -- so screening on the words blocks the row that would fix the
+> screening problem.**
+
+> **THE FIX IS NOT A LONGER VERB LIST.** Every shape above turns on whether a sentence is still in
+> force and whom it addresses, which a token match cannot see. ***MAKE THE SCREEN RETURN `MUST BE
+> READ` INSTEAD OF A VERDICT*** -- surface the sentence and its neighbours to a human or a reading
+> pass, and **never let "the screen passed it" stand in for "somebody read it"**. A screen that
+> passes a row has not read it; the DISPATCHER's own #1372 example proves the passing direction fails
+> too (a row its corrected screen passed turned out to be substantively done).
+
+> **EVIDENCE** is anchored at `refs/builder2/dup-hunt-2026-08-29` --
+> `BUILDER2-2026-08-29-DONOT-CLASSIFICATION.md` (the 79 no verb list could classify) and
+> `BUILDER2-2026-08-29-DONOT-36-REREAD.md` (the 36 they could), each read back through the ref
+> against a control phrase. **A ref rather than mail: mail's default TTL is 72 hours and the gap to
+> the next working session is 108.**
+
+> ***WHAT THIS ROW DOES NOT CLAIM: that ~86 dispatchable rows exist.*** An unbarred row is a
+> **candidate**, not a finding. Nor that the class counts are exact -- they are one reader's
+> judgement on 115 rows, recorded per-row on the ref so the next reader can disagree with a specific
+> call rather than the total.
+
+**Cluster:** Fleet coordination / dispatch. **Priority:** P2. **Verdict:** build (small).
+**Severity:** no engine effect, no PHI axis, no deployment axis (sec. 0). It idles build lanes
+against a ledger that has work in it, and it does so by discarding the best-written rows first.
+
+---
+
