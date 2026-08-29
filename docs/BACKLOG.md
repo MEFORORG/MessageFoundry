@@ -17162,3 +17162,48 @@ AND IT SHIPS THE SUBJECT: install-selfheal.ps1 and worktree-selfheal.ps1 are bot
 **SO THIS IS A DESIGN CHANGE, NOT A PATTERN.** Filing it as "add the missing spellings" would ship a fix that closes an instance and leaves the class open.
 
 **PROVENANCE:** both surfaced by a completeness critic during #1065's follow-on work and were explicitly attributed as inherited rather than introduced, after being measured against the pre-fix gate. **Neither is caused by the branch that found them.**
+
+## 1380. the ASVS scorecard gate is path-gated to the one file it validates, so its green history is a history of not running -- and it carries at least two defects that only surface when it does
+
+> 🔢 **Filed 2026-08-29 (lander) - found while holding a scorecard PR; the gate is broken, the PR's content is not.**
+> Verdict: build
+> Closing-act: code
+
+**Cluster:** CI workflow. **Priority:** P2. **Verdict:** build (small).
+**Severity:** no engine effect, no PHI axis, no deployment axis (sec. 0). It governs the vault's security record, not the product. **The severity is that the gate reads as passing while never executing, not that any verdict is wrong.**
+
+**THE SHAPE, AND IT IS THE POINT: A PATH FILTER PLUS A BROKEN INVOCATION IS INDISTINGUISHABLE FROM A HEALTHY GATE.** The `verify` and `render-drift` checks are path-gated to `docs/security/asvs-scorecard.toml`. Nothing else in the repository touches that file. So on every pull request that does not change the scorecard, both checks report **SKIPPED**, the workflow reports **success**, and the rollup is green.
+
+**MEASURED, and the control is what makes it a finding rather than a suspicion.** A first pass compared the scorecard branch against three others and found the workflow succeeding everywhere else and failing only on the scorecard branch -- which reads as a defect in that branch. Checking what those successes were made of inverted it:
+
+```
+vault/lane-gauge-homefix          verify = SKIPPED    render-drift = SKIPPED
+vault/lane-gauge-20260828         verify = SKIPPED    render-drift = SKIPPED
+steward-burn-history              verify = SKIPPED    render-drift = SKIPPED
+asvs-advisory-line-repair-22      verify = FAILURE    render-drift = FAILURE
+```
+
+**Every green was a skip.** The first change in the observable window to actually exercise these checks fails immediately.
+
+**TWO DISTINCT DEFECTS, ON TWO DIFFERENT TIPS OF THE SAME BRANCH. Neither is the branch's content.**
+
+1. **Tip `3e7c02619` -- an argument-arity error.** `accepts at most 1 arg(s), received 4`. A `.toml` content change cannot cause a workflow to pass four arguments to a command that takes one, so the mismatch is between the workflow's command line and whatever CLI actually runs. **Which side moved is UNESTABLISHED and this row does not claim to know.**
+
+2. **Tip `ce3ad71f6` -- a false claim about the data.** The job exits on `::error::[scorecard].anchor_commit is missing`. **It is not missing.** Measured on all three refs:
+
+```
+origin/main                    anchor_commit present, 1 occurrence
+asvs-advisory-line-repair-22   anchor_commit present, 1 occurrence, byte-identical value
+3e7c02619                      anchor_commit present, 1 occurrence
+diff of the second commit against the first, filtered to that key:  EMPTY
+```
+
+**The value exists, is unchanged, and the second commit never touched it.** So the gate's extraction of it is wrong, and it reports a defect in the record when the fault is in its own reading. **That is the third instrument this fleet has nearly filed as a broken subject when the failure was in the instrument's own message.**
+
+**THE MEASURED NEGATIVE, so nobody spends a cycle on the obvious hypothesis.** The natural guess is that the vault's mirrored `scripts/asvs/scorecard.py` is stale against a workflow written for a newer CLI. **It is not the cause.** The whole difference between the vault copy and the engine's is one hunk, 15 lines added and 0 removed, 14 of them comments, and the single executable line is a `newline=""` keyword inside the render path. Both copies produce byte-identical verdict streams. **Landing the mirror is still worth doing for parity; it will not clear this red, and it must not be reported as the fix.**
+
+**WHY THIS BLOCKS SOMETHING TODAY.** A scorecard change is held on it. Its required contexts are green and its content was independently verified, but landing it would mean landing a scorecard change over **the only two checks that would ever validate a scorecard change** -- a compensating control resting on a false premise. The change's author declined to authorise that, correctly: deciding a red gate is acceptable is not the branch author's call.
+
+**Related:** the `verified-at` and `every cited requirement identifier resolves` checks are NOT path-gated and pass normally. They are a different, working pair, and this row is not about them.
+
+**UNTESTED:** nobody has run either check locally, and the workflow's own invocation was read but not executed. Whether the two failures share a root cause, or are two independent breakages that surfaced together because nothing exercised either, is **open**.
