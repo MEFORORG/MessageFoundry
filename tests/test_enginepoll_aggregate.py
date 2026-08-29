@@ -40,6 +40,7 @@ def _shard(
     journal_mode: str = "wal",
     synchronous: str | None = "normal",
     committed_txns: int = 0,
+    claim_lock_timeouts: int = 0,
 ) -> _ShardSample:
     return _ShardSample(
         pending=pending,
@@ -56,6 +57,7 @@ def _shard(
         journal_mode=journal_mode,
         synchronous=synchronous,
         committed_txns=committed_txns,
+        claim_lock_timeouts=claim_lock_timeouts,
     )
 
 
@@ -129,6 +131,29 @@ def test_committed_txns_sums_across_shards(monkeypatch: pytest.MonkeyPatch) -> N
     sample = asyncio.run(poller.sample_once())
     assert sample is not None
     assert sample.committed_txns == 1120  # 700 + 350 + 70
+
+
+def test_claim_lock_timeouts_sums_across_shards(monkeypatch: pytest.MonkeyPatch) -> None:
+    """BACKLOG #1270: the lock-timeout counter aggregates like the other live counters.
+
+    It is the harness's only consumer of the /stats field, and a field nothing reads is a field
+    nothing catches when it breaks — the shipped first attempt had two source lines, no test and no
+    reader. Distinct per-shard values so a dropped shard cannot be masked by a coincidental sum.
+
+    THE UNIT SURVIVES THE SUM. These are ROUND-TRIPS, not lanes: summing shards is right (each shard
+    runs its own claimers), dividing by ``empty_claims`` would not be.
+    """
+    poller = _poller_over(
+        [
+            [_shard(read=100, claim_lock_timeouts=7)],
+            [_shard(read=50, claim_lock_timeouts=2)],
+            [_shard(read=10, claim_lock_timeouts=0)],
+        ],
+        monkeypatch,
+    )
+    sample = asyncio.run(poller.sample_once())
+    assert sample is not None
+    assert sample.claim_lock_timeouts == 9  # 7 + 2 + 0
 
 
 def test_one_unreachable_shard_skips_the_whole_sample(monkeypatch: pytest.MonkeyPatch) -> None:

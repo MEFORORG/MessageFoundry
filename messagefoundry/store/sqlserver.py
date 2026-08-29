@@ -100,7 +100,9 @@ from messagefoundry.store.store import (
     REINGRESS_TARGET_PREFIX,
     AlertInstance,
     CapturedResponse,
+    ClaimAbortPhase,
     ClaimedHeads,
+    ClaimLockTimeout,
     ClaimProcStatus,
     ConnectionEvent,
     ConnectionMetrics,
@@ -6960,6 +6962,12 @@ class SqlServerStore:
         # point is client-side unknowable (statement- vs batch-abort semantics), and on kept≠claimed
         # the guard runs anyway (a doubled reset is idempotent).
         reset_committed = False
+        # BACKLOG #1270: WHICH population a lock timeout aborted on. The try below spans two of them
+        # — the claim batch over the lanes' queue heads, and the H2 skip-and-complete's finalize DML,
+        # which runs in the SAME transaction under the same LOCK_TIMEOUT 0 and is not a queue head at
+        # all. Both reach one handler, so without this marker any single label it prints is wrong for
+        # one of the two. Reassigned at exactly one place: entering the H2 branch.
+        abort_phase = ClaimAbortPhase.HEAD
         async with AsyncExitStack() as stack:
             if use_prepared:
                 # §5: the dedicated holder — retained cursor, deliberately NOT closed per call
@@ -7066,6 +7074,11 @@ class SqlServerStore:
                     # SAFE: no partial finalize, the heads stay PENDING for the next tick. (The
                     # per-message finalize applock uses its own @LockTimeout and is unaffected.)
                     if d["destination_name"] is not None:
+                        # BACKLOG #1270: from here on, a 1222 reaching the handler below came from
+                        # the FINALIZE population described above, not from a queue head. One
+                        # assignment, no restructuring — it stays FINALIZE for the rest of the txn
+                        # because once finalize DML has run in it, the finalize row locks are held.
+                        abort_phase = ClaimAbortPhase.FINALIZE
                         await cur.execute(
                             "SELECT 1 FROM delivered_keys WHERE outbox_id=?", (d["id"],)
                         )
@@ -7104,16 +7117,28 @@ class SqlServerStore:
                     # BACKLOG #1270: the DEBUG line stays — it carries the mechanism, and contention
                     # at scale is normal and must not fill an operator's log. What changes is that the
                     # yield is no longer INDISTINGUISHABLE from "there was nothing to claim": the
-                    # lanes ride out on `contended`, so the dispatcher can say WHY its claim was empty
-                    # instead of dropping to IDLE with every observable reading "no work".
+                    # ATTEMPT rides out on `lock_timeout`, so the dispatcher can say WHY its claim was
+                    # empty instead of dropping to IDLE with every observable reading "no work".
+                    #
+                    # ATTEMPT-LEVEL, AND THAT IS THE CEILING OF WHAT IS KNOWN. The rollback above just
+                    # discarded the transaction and on the HEAD path the abort precedes `fetchall`, so
+                    # NO ROW WAS EVER READ. `lane_list` is the caller's own request — returning it as
+                    # a set of contended lanes (which #1270's first fix did) manufactures up to 256
+                    # findings, at the default chunk, out of zero observations. What is true is "at
+                    # least one row this claim needed was held", and which one is not knowable here.
                     log.debug(
-                        "claim_fifo_heads: lock-timeout (1222) at stage %s on %d lane(s) — head"
+                        "claim_fifo_heads: lock-timeout (1222) at stage %s on %d lane(s) — %s"
                         " contended, yielding EMPTY (never-block guarantee)",
                         stage,
                         len(lane_list),
+                        abort_phase.value,
                     )
                     return ClaimedHeads(
-                        by_lane={}, rearm=frozenset(), contended=frozenset(lane_list)
+                        by_lane={},
+                        rearm=frozenset(),
+                        lock_timeout=ClaimLockTimeout(
+                            phase=abort_phase, lanes_in_claim=len(lane_list)
+                        ),
                     )
                 raise
             finally:

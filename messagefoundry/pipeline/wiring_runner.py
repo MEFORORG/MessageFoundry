@@ -515,32 +515,39 @@ class EmptyClaimCounters:
     total: int = 0
     idle_poll: int = 0
     wake_fanout: int = 0
-    #: BACKLOG #1270. Empty claims the STORE attributed to contention — something else held the row
-    #: this claim wanted. A SEPARATE AXIS from the split above, not a third bucket: the two existing
-    #: counters classify why the WORKER was awake, and are structurally blind to why the STORE returned
-    #: nothing. A contended empty claim increments ``total`` and one of the two, AND this.
+    #: BACKLOG #1270. Claim ROUND-TRIPS the store aborted on a lock timeout — a different unit from
+    #: every other field here, which is why it takes a different noun. The three above count LANES; a
+    #: 256-lane chunk that aborts adds 256 to ``total`` and **1** to this. Do not divide one by the
+    #: other: they are not a part and a whole. #1270's first attempt made exactly that mistake, naming
+    #: a per-attempt event with a per-lane word and documenting it as a sub-count of ``total``.
     #:
-    #: **POOLED MODE ONLY, and zero does NOT mean "no contention".** Only the dispatcher passes
-    #: ``contended`` — the four per-lane worker call sites never call ``claim_fifo_heads``, so they
-    #: cannot observe contention and always leave it False. Add a backend that cannot tell a contended
-    #: lane from an empty one and it reports nothing here either. So zero reads as NOT ESTABLISHED,
-    #: never as a clean bill — the same absence-of-a-veto rule the occupancy fence carries.
-    contended: int = 0
+    #: The two counters above classify why the WORKER was awake and are structurally blind to why the
+    #: STORE returned nothing; this is the store-side axis. It asserts one thing: "a claim attempt
+    #: aborted on a lock timeout, so at least one row it needed was held". It never names a lane and
+    #: never says HOW MANY lanes were held — after the rollback the store has read no row.
+    #:
+    #: **POOLED MODE ONLY, and zero does NOT mean "no contention".** Only the dispatcher calls
+    #: ``claim_fifo_heads``; the four per-lane worker call sites cannot observe an abort at all, so a
+    #: per-lane engine reports zero forever. Postgres's ``FOR UPDATE SKIP LOCKED`` does not abort, so
+    #: it structurally produces no such event either. Zero reads as NOT ESTABLISHED, never as a clean
+    #: bill — the same absence-of-a-veto rule the occupancy fence carries.
+    claim_lock_timeouts: int = 0
 
-    def record_empty(self, *, woken: bool, contended: bool = False) -> None:
-        """Account one empty claim, classified by whether the worker was last *woken* (wake-fanout) or
-        timed out on the poll interval (idle-poll), and separately by whether the STORE said the lane
-        was contended rather than empty (BACKLOG #1270).
-
-        ``contended`` defaults False so every existing call site keeps its exact meaning: a caller that
-        cannot distinguish the two says nothing, rather than asserting the absence of contention."""
+    def record_empty(self, *, woken: bool) -> None:
+        """Account one empty claim FOR ONE LANE, classified by whether the worker was last *woken*
+        (wake-fanout) or timed out on the poll interval (idle-poll)."""
         self.total += 1
         if woken:
             self.wake_fanout += 1
         else:
             self.idle_poll += 1
-        if contended:
-            self.contended += 1
+
+    def record_claim_lock_timeout(self) -> None:
+        """Account ONE claim round-trip the store aborted on a lock timeout (BACKLOG #1270).
+
+        Once per aborted ATTEMPT, never once per lane in the chunk: the lanes it covered are already
+        booked by :meth:`record_empty`, and the store cannot say which of them was actually held."""
+        self.claim_lock_timeouts += 1
 
 
 # --- bench-gated per-delivery phase timing (default OFF) --------------------------------------------

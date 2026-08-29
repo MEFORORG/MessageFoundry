@@ -22,7 +22,9 @@ from messagefoundry.store.base import (
 )
 from messagefoundry.store.document_strip import StripResult
 from messagefoundry.store.store import (
+    ClaimAbortPhase,
     ClaimedHeads,
+    ClaimLockTimeout,
     MessageStatus,
     MessageStore,
     OutboxItem,
@@ -37,6 +39,8 @@ __all__ = [
     "AdminStore",
     "AuditStore",
     "AuthStore",
+    "ClaimAbortPhase",
+    "ClaimLockTimeout",
     "ClaimedHeads",
     "MessageStatus",
     "MessageStore",

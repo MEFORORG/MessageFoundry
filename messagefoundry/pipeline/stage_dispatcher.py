@@ -45,6 +45,7 @@ from typing import Protocol
 
 from messagefoundry.pipeline.alerts import AlertSink, LoggingAlertSink
 from messagefoundry.pipeline.phase_timing import (
+    _DELIVERY_PHASE_EMIT_INTERVAL,  # the ONE definition of this package's log-throttle window
     ClaimPhaseTiming,
     LaneEpisodeTiming,
     delivery_phase_timing_enabled,
@@ -188,11 +189,14 @@ _ProcessItem = Callable[[str, OutboxItem], Awaitable[LaneItemResult]]
 class _EmptyClaimObserver(Protocol):
     """The empty-claim accounting sink the dispatcher delegates to (ADR 0066 PR4, B11 split). PR4
     injects the runner's ``EmptyClaimCounters`` here so a dispatcher empty claim lands in the SAME
-    ``/stats`` counters the per_lane workers feed — a **structural** contract (record_empty only), so
-    the dispatcher never imports ``EmptyClaimCounters`` (no PR4 import cycle). When ``None`` is passed
-    the dispatcher uses a private :class:`_LocalEmptyCounter`, so PR3 stays self-contained."""
+    ``/stats`` counters the per_lane workers feed — a **structural** contract (the two record_*
+    methods only), so the dispatcher never imports ``EmptyClaimCounters`` (no PR4 import cycle). When
+    ``None`` is passed the dispatcher uses a private :class:`_LocalEmptyCounter`, so PR3 stays
+    self-contained."""
 
-    def record_empty(self, *, woken: bool, contended: bool = False) -> None: ...
+    def record_empty(self, *, woken: bool) -> None: ...
+
+    def record_claim_lock_timeout(self) -> None: ...
 
 
 @dataclass
@@ -204,18 +208,20 @@ class _LocalEmptyCounter:
     total: int = 0
     idle_poll: int = 0
     wake_fanout: int = 0
-    #: BACKLOG #1270. Empty claims the STORE attributed to contention. A separate axis, not a third
-    #: bucket — a contended empty claim increments ``total`` and one of the two above, AND this.
-    contended: int = 0
+    #: BACKLOG #1270. Claim ROUND-TRIPS the store aborted on a lock timeout. A DIFFERENT UNIT from the
+    #: three above, which count lanes — one aborted 256-lane chunk is 256 there and 1 here, so the two
+    #: are not a part and a whole and must never be divided.
+    claim_lock_timeouts: int = 0
 
-    def record_empty(self, *, woken: bool, contended: bool = False) -> None:
+    def record_empty(self, *, woken: bool) -> None:
         self.total += 1
         if woken:
             self.wake_fanout += 1
         else:
             self.idle_poll += 1
-        if contended:
-            self.contended += 1
+
+    def record_claim_lock_timeout(self) -> None:
+        self.claim_lock_timeouts += 1
 
 
 class StageDispatcher:
@@ -317,6 +323,13 @@ class StageDispatcher:
         # EmptyClaimCounters); the structural _EmptyClaimObserver contract keeps this import-cycle-free.
         # None -> a private _LocalEmptyCounter, so PR3 / tests stay self-contained.
         self._empty: _EmptyClaimObserver = empty_counter or _LocalEmptyCounter()
+        # BACKLOG #1270: the lock-timeout INFO line's windowed throttle (the claim/delivery phase
+        # summaries' convention, same interval). `-inf` so the FIRST abort of a process emits at once
+        # — a five-second silence at the start is exactly the silence this line exists to break.
+        # Aborts are counted into the window even when the line is suppressed, so the emitted number
+        # is the window's true total and not a sample.
+        self._lock_timeout_last_emit = float("-inf")
+        self._lock_timeouts_since_emit = 0
         # Debug tripwire: the one-consumer-per-lane invariant. Must stay 0 (the 200-lane soak asserts).
         self._busy_violations = 0
 
@@ -714,10 +727,11 @@ class StageDispatcher:
         # ONE clock read for every non-service release this dispatch pass books (they all end at the same
         # instant — the claim has returned and this loop is await-free). Zero when the lever is off.
         rel_ns = time.perf_counter_ns() if self._claim_phase_timing else 0
-        # Contended-empty lanes in THIS round-trip (BACKLOG #1270). A local, not instance state: it
-        # never outlives this call, so there is nothing for a sibling claimer at K>1 to contaminate and
-        # nothing a reader can mistake for a cumulative gauge — that is the counter's job.
-        contended_lanes = 0
+        # BACKLOG #1270: did THIS round-trip abort on a store lock timeout? An ATTEMPT-level fact, so
+        # it is read once here and booked once below — never per lane. Booking it per lane is the
+        # arithmetic half of #1270's first defect: at the default chunk one abort moved the operator
+        # counter by 256 and the log line said "256 of 256 lane(s)", from zero observations.
+        lock_timeout = result.lock_timeout
         for lane in lanes:
             st = self._states[lane]
             items = result.by_lane.get(lane)
@@ -755,38 +769,47 @@ class StageDispatcher:
                 self._drop_lane_episode(
                     st, rel_ns
                 )  # S_lane DROP: same as rearm — occupancy, not service
-                # BACKLOG #1270: an empty claim the store attributed to CONTENTION is not the same
-                # event as an empty lane, and T12 below treats them identically — IDLE, no timer
-                # armed. Recording the distinction is the whole fix: the recovery path is unchanged
-                # (the sweep re-readies it either way), but a lane that stopped claiming because
-                # something else held its head is no longer indistinguishable, from outside, from a
-                # system with nothing to do.
-                contended = lane in result.contended
-                self._record_empty(woken=st.ready_woken, contended=contended)
-                if contended:
-                    contended_lanes += 1
+                # The lane-level books are unchanged: an aborted claim is still an EMPTY claim for
+                # every lane it covered, because that is what happened to each lane. What is NOT
+                # recorded here is any per-lane cause — see the attempt-level booking below.
+                self._record_empty(woken=st.ready_woken)
                 if st.dirty:  # T11: a wake raced the claim -> re-claim now, no sweep wait
                     self._to_ready(lane, woken=True)
                 else:  # T12
                     st.phase = _LanePhase.IDLE
-        # BACKLOG #1270: ONE line per round-trip, at INFO, and COUNTS ONLY. Three deliberate scopings.
-        # (1) INFO, not DEBUG: the proof bar is that the silent case becomes visible without raising
-        # the whole service to DEBUG, which the PHI rule forbids in production anyway.
-        # (2) Counts, never lane NAMES — a lane is a destination_name (the same PHI rule the claim
-        # timer above already states), so the number of contended lanes rides out and nothing else.
-        # (3) Per round-trip, not per lane: a contended chunk would otherwise emit one line per lane
-        # and the log volume would scale with the contention it is reporting, which is how a monitor
-        # becomes the load. Silence here means no contention was REPORTED, which on a backend that
-        # cannot distinguish the cases is not the same as none having occurred.
-        if contended_lanes:
-            log.info(
-                "StageDispatcher %s: %d of %d lane(s) claimed EMPTY because the store reported the "
-                "head CONTENDED, not because the lane was empty; they drop to IDLE and the sweep "
-                "re-readies them (BACKLOG #1270)",
-                self._stage.value,
-                contended_lanes,
-                len(lanes),
-            )
+        # BACKLOG #1270: ONE booking and at most one line per aborted ROUND-TRIP, at INFO, counts only.
+        # (1) The unit is the ATTEMPT. The store rolled the transaction back and read no row, so "at
+        # least one row this claim needed was held" is the whole of what is known — which lane, and
+        # how many, are not. The counter therefore moves by 1 per abort, not by the chunk width.
+        # (2) INFO, not DEBUG: the bar is that the silent case becomes visible without raising the
+        # whole service to DEBUG, which the PHI rule forbids in production anyway.
+        # (3) Counts, never lane NAMES — a lane is a destination_name (the same PHI rule the claim
+        # timer above already states), so the chunk width rides out and nothing else.
+        # (4) THROTTLED. Contention at scale is normal and one abort per round-trip means a contended
+        # stage emits one INFO per claim — measured at 300 round-trips to 300 records, a monitor whose
+        # volume scales with the contention it reports. The alarm rides the log; the RATE rides the
+        # counter, which is unthrottled. Same window the claim/delivery phase summaries use. The
+        # window is per STAGE, not per claimer — like `_claim_phase_stats`, and for the same reason:
+        # sibling claimers at K>1 write the same operator's log. Safe to share because this whole
+        # block is await-free, so a sibling can never interleave a partial update.
+        if lock_timeout is not None:
+            self._empty.record_claim_lock_timeout()
+            self._lock_timeouts_since_emit += 1
+            now = time.monotonic()
+            if now - self._lock_timeout_last_emit >= _DELIVERY_PHASE_EMIT_INTERVAL:
+                self._lock_timeout_last_emit = now
+                log.info(
+                    "StageDispatcher %s: %d claim round-trip(s) in the last window aborted on a "
+                    "store lock timeout (most recent: %s phase, %d lane(s) in the claim); nothing "
+                    "was claimed, every lane in the chunk drops to IDLE and the sweep re-readies "
+                    "them. At least one row the claim needed was held — the claim rolled back "
+                    "before reading a row, so the store cannot say which (BACKLOG #1270)",
+                    self._stage.value,
+                    self._lock_timeouts_since_emit,
+                    lock_timeout.phase.value,
+                    lock_timeout.lanes_in_claim,
+                )
+                self._lock_timeouts_since_emit = 0
         # Flush the episode window on EVERY claim round-trip, exactly as the claim line already does. A
         # stage that has gone quiet still CLAIMS (empty claims keep firing while the sweep re-readies
         # lanes), so this is what guarantees a draining rung's FINAL window — the tail, where S_lane is
@@ -1193,8 +1216,8 @@ class StageDispatcher:
         st.episode_start_ns = 0
         self._book_lane_episode(start_ns, end_ns, rows=0, service=False)
 
-    def _record_empty(self, *, woken: bool, contended: bool = False) -> None:
-        self._empty.record_empty(woken=woken, contended=contended)
+    def _record_empty(self, *, woken: bool) -> None:
+        self._empty.record_empty(woken=woken)
 
     async def _sleep_or_stop(self, seconds: float) -> None:
         try:  # noqa: SIM105
@@ -1329,9 +1352,18 @@ class StageDispatcher:
     def empty_claims(self) -> tuple[int, int, int]:
         """(total, wake_fanout, idle_poll) — the B11 split. Reads the delegated counter: the injected
         observer (PR4's runner ``EmptyClaimCounters``) or the private :class:`_LocalEmptyCounter`
-        default. The observer Protocol only pins ``record_empty``, so read the triple defensively."""
+        default. The observer Protocol pins only the record_* methods, so read the triple
+        defensively."""
         e = self._empty
         return (getattr(e, "total", 0), getattr(e, "wake_fanout", 0), getattr(e, "idle_poll", 0))
+
+    @property
+    def claim_lock_timeouts(self) -> int:
+        """Claim ROUND-TRIPS this dispatcher's store aborted on a lock timeout (BACKLOG #1270).
+
+        A different unit from :attr:`empty_claims`, which counts LANES — one aborted 256-lane chunk is
+        256 there and 1 here. Read defensively for the same reason as the triple above."""
+        return int(getattr(self._empty, "claim_lock_timeouts", 0))
 
     def phase(self, key: str) -> _LanePhase | None:
         st = self._states.get(key)

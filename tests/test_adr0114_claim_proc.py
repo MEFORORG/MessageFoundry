@@ -58,7 +58,7 @@ import pytest
 from messagefoundry.config.settings import StoreSettings
 from messagefoundry.store import sqlserver as ss
 from messagefoundry.store.sqlserver import SqlServerStore
-from messagefoundry.store.store import ClaimedHeads
+from messagefoundry.store.store import ClaimAbortPhase, ClaimedHeads, ClaimLockTimeout
 from tests.test_adr0114_claim_fold import (
     _NOW,
     _bare_store,
@@ -927,13 +927,16 @@ async def test_ac12_in_proc_1222_translates_to_empty_all() -> None:
     ops, store, result = await _drive_proc("ingress", ["lane-0"], fail_batch=_lock_timeout_error())
     assert ops[0][1] == _CALL_CID  # the failure came from the CALL
     # BACKLOG #1270: the EMPTY-all contract is unchanged — `by_lane` and `rearm` are still empty and
-    # no row moves. What is new is that the yield is ATTRIBUTED: the lane rides out on `contended`, so
-    # a caller can tell this apart from a genuinely empty lane. Asserting the EXACT set rather than
-    # truthiness — a bare `if result.contended` would pass on any non-empty set, including a wrong one.
-    # The sibling kept-ne-claimed test below still compares the WHOLE object against an empty result:
-    # a fence race is NOT contention, so that path must keep reporting nothing.
-    assert result.by_lane == {} and result.rearm == frozenset()
-    assert result.contended == frozenset({"lane-0"})
+    # no row moves. What is new is that the ATTEMPT is reported, chunk-wide and naming no lane, so a
+    # caller can tell this apart from a genuinely empty lane. Whole-object equality rather than a
+    # per-field probe: it pins any field a future revision adds, which is how #1270's first attempt
+    # shipped a fabricated lane set past a green suite. The sibling kept-ne-claimed test below
+    # compares against a report-free result: a fence race is NOT a lock timeout and must stay silent.
+    assert result == ClaimedHeads(
+        by_lane={},
+        rearm=frozenset(),
+        lock_timeout=ClaimLockTimeout(phase=ClaimAbortPhase.HEAD, lanes_in_claim=1),
+    )
     kinds = _op_kinds(ops)
     assert "rollback" in kinds and kinds[-1] == "commit"  # guard ran
 

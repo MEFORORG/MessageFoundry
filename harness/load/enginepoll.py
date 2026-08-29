@@ -94,6 +94,11 @@ class EngineSample:
     empty_claims: int = 0  # Σ cumulative empty claims (wall #3)
     empty_claims_idle_poll: int = 0  # the idle-poll re-SELECT share
     empty_claims_wake_fanout: int = 0  # the per-commit wake-fanout (thundering-herd) share
+    # BACKLOG #1270. A DIFFERENT UNIT from the three above: claim ROUND-TRIPS the store aborted on a
+    # lock timeout, not lanes. One aborted 256-lane chunk adds 256 to empty_claims and 1 here, so
+    # never divide one by the other. Zero means NOT ESTABLISHED (pooled mode + SQL Server only), not
+    # "no contention".
+    claim_lock_timeouts: int = 0
     # A1 live cost counters (cumulative since engine start; run totals are last − first). committed_txns =
     # physical transactions committed (the 3+2H+2N/msg cost-model currency, ADR 0051); body_copies =
     # raw/payload body strings durably written (the 2+H+N/msg amplification). Σ across shards; default 0 so
@@ -165,6 +170,7 @@ class _ShardSample:
     empty_claims: int = 0
     empty_claims_idle_poll: int = 0
     empty_claims_wake_fanout: int = 0
+    claim_lock_timeouts: int = 0  # BACKLOG #1270 - ROUND-TRIPS aborted on a lock timeout, not lanes
     committed_txns: int = 0  # A1 live cost counter (summable across shards)
     # Pool acquire-wait COUNT + MEAN (2026-07-13) — PoolWaitInfo exposes both; the poller read only the
     # percentiles. mean_ms x count differenced across a soak splits a store round-trip into engine-side
@@ -630,6 +636,7 @@ class EnginePoller:
             empty_claims=sum(s.empty_claims for s in shard_samples),
             empty_claims_idle_poll=sum(s.empty_claims_idle_poll for s in shard_samples),
             empty_claims_wake_fanout=sum(s.empty_claims_wake_fanout for s in shard_samples),
+            claim_lock_timeouts=sum(s.claim_lock_timeouts for s in shard_samples),  # #1270
             committed_txns=sum(s.committed_txns for s in shard_samples),  # A1
             body_copies=sum(s.body_copies for s in shard_samples),  # A1
             # Pool acquire-wait: the COUNT sums across shards, but the MEAN must be N-WEIGHTED —
@@ -700,6 +707,7 @@ class EnginePoller:
             empty_claims=getattr(stats, "empty_claims", 0) or 0,
             empty_claims_idle_poll=getattr(stats, "empty_claims_idle_poll", 0) or 0,
             empty_claims_wake_fanout=getattr(stats, "empty_claims_wake_fanout", 0) or 0,
+            claim_lock_timeouts=getattr(stats, "claim_lock_timeouts", 0) or 0,  # BACKLOG #1270
             committed_txns=getattr(stats, "committed_txns", 0)
             or 0,  # A1 (getattr → older-engine safe)
             body_copies=getattr(stats, "body_copies", 0) or 0,  # A1 (getattr → older-engine safe)

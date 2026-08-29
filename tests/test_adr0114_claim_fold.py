@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import dataclasses
 import hashlib
 import inspect
 import logging
@@ -48,7 +49,7 @@ import pytest
 from messagefoundry.config.settings import StoreSettings
 from messagefoundry.store.crypto import IdentityCipher
 from messagefoundry.store.sqlserver import SqlServerStore
-from messagefoundry.store.store import ClaimedHeads
+from messagefoundry.store.store import ClaimAbortPhase, ClaimedHeads, ClaimLockTimeout
 
 # --- AC-1 goldens: SHA-256 of the shipped batch text, per (lane family, N, epoch on/off), -------
 # generated from the pre-ADR-0114 construction (commit f1411f3b) with now=1700000000.0.
@@ -140,6 +141,8 @@ class _FakeCursor:
         rows: list[tuple[Any, ...]] | None = None,
         fail_batch: BaseException | None = None,
         fail_reset: BaseException | None = None,
+        fail_h2_update: BaseException | None = None,
+        h2_already_delivered: bool = False,
         reset_started: asyncio.Event | None = None,
         reset_release: asyncio.Event | None = None,
         tag: str = "",
@@ -148,6 +151,14 @@ class _FakeCursor:
         self._rows = rows or []
         self._fail_batch = fail_batch
         self._fail_reset = fail_reset
+        # BACKLOG #1270: the H2 skip-and-complete leg. `h2_already_delivered` makes the
+        # `delivered_keys` probe report a hit so the in-store finalize DML actually runs;
+        # `fail_h2_update` then raises on that UPDATE. Together they reach the SECOND population
+        # that lands in the same lock-timeout handler as the claim batch — a contended FINALIZE row,
+        # which is not a queue head at all. Both default off, so every existing driver is unchanged
+        # (the probe keeps reporting "not delivered" and the UPDATE is unreachable).
+        self._fail_h2_update = fail_h2_update
+        self._h2_already_delivered = h2_already_delivered
         self._reset_started = reset_started
         self._reset_release = reset_release
         # Optional connection-identity tag ("kind@tag" in the op records) so a multi-connection
@@ -172,6 +183,13 @@ class _FakeCursor:
         if "delivered_keys" in sql:
             self.ops.append((self._kind("execute-h2-probe"), sql, tuple(params)))
             return
+        if sql.startswith("UPDATE queue SET status"):
+            # The H2 skip-and-complete DML, reachable only via `h2_already_delivered` (the probe
+            # otherwise reports a miss), so this branch cannot perturb any pre-existing driver.
+            self.ops.append((self._kind("execute-h2-update"), sql, tuple(params)))
+            if self._fail_h2_update is not None:
+                raise self._fail_h2_update
+            return
         self.ops.append((self._kind("execute-batch"), sql, tuple(params)))
         if self._fail_batch is not None:
             raise self._fail_batch
@@ -181,7 +199,8 @@ class _FakeCursor:
         return self._rows
 
     async def fetchone(self) -> Any:
-        return None  # H2 delivered_keys probe: "not already delivered"
+        # H2 delivered_keys probe: "not already delivered" unless the driver asked for a hit.
+        return (1,) if self._h2_already_delivered else None
 
     async def close(self) -> None:
         pass
@@ -275,13 +294,22 @@ async def _drive(
     rows: list[tuple[Any, ...]] | None = None,
     fail_batch: BaseException | None = None,
     fail_reset: BaseException | None = None,
+    fail_h2_update: BaseException | None = None,
+    h2_already_delivered: bool = False,
     fail_first_commit: bool = False,
     per_lane_limit: int = 1,
     store: SqlServerStore | None = None,
 ) -> tuple[_Ops, SqlServerStore, ClaimedHeads]:
     ops: _Ops = []
     store = store if store is not None else _bare_store(fold=fold, epoch=epoch)
-    cur = _FakeCursor(ops, rows=rows, fail_batch=fail_batch, fail_reset=fail_reset)
+    cur = _FakeCursor(
+        ops,
+        rows=rows,
+        fail_batch=fail_batch,
+        fail_reset=fail_reset,
+        fail_h2_update=fail_h2_update,
+        h2_already_delivered=h2_already_delivered,
+    )
     conn = _FakeConn(ops, fail_first_commit=fail_first_commit)
     _wire(store, cur, conn)
     lanes = [f"lane-{i:03d}" for i in range(n_lanes)]
@@ -424,15 +452,98 @@ async def test_fold_clean_path_with_claimed_row() -> None:
 async def test_ac3_1222_yields_empty_all_and_guard_runs(fold: bool) -> None:
     ops, store, result = await _drive("ingress", 4, fold=fold, fail_batch=_lock_timeout_error())
     # BACKLOG #1270: the EMPTY-all contract is unchanged — `by_lane` and `rearm` are still empty and
-    # no row moves. What is new is that the yield is ATTRIBUTED: the lanes ride out on `contended`, so
-    # a caller can tell this apart from a genuinely empty lane. Asserting the EXACT set rather than
-    # truthiness — a bare `if result.contended` would pass on any non-empty set, including a wrong one.
-    assert result.by_lane == {} and result.rearm == frozenset()
-    assert result.contended == frozenset(f"lane-{n:03d}" for n in range(4))
+    # no row moves. What is new is that the ATTEMPT is reported: the claim says it aborted on a lock
+    # timeout, which is what a caller cannot otherwise tell apart from a genuinely empty lane.
+    # WHOLE-OBJECT equality, not a per-field probe: it pins the two unchanged fields AND any field a
+    # future revision adds, which is exactly how #1270's first attempt shipped a fabricated lane set
+    # past a green suite. The report is attempt-level and names no lane — see ClaimLockTimeout.
+    assert result == ClaimedHeads(
+        by_lane={},
+        rearm=frozenset(),
+        lock_timeout=ClaimLockTimeout(phase=ClaimAbortPhase.HEAD, lanes_in_claim=4),
+    )
     kinds = _op_kinds(ops)
     assert "rollback" in kinds
     assert _guard_ran(ops), "the shielded guard must run on the 1222 exit (reset_committed False)"
     assert kinds[-1] == "commit"  # the guard's own commit closes the reset's implicit txn (M-6)
+
+
+# --- BACKLOG #1270: what a lock-timeout yield is allowed to CLAIM to know -------------------------
+
+
+async def test_a_lock_timeout_never_names_a_lane_the_claim_never_observed() -> None:
+    """The regression test for BACKLOG #1270's first shipped attempt.
+
+    THE DEFECT. The batch aborts, the whole transaction rolls back, and NOT ONE ROW WAS EVER READ —
+    ``fetchall`` does not run. The first fix nevertheless returned the caller's own requested lane
+    list as an observation ("these lanes were contended"), so at the production-default chunk of 256
+    a single lock timeout asserted 256 findings the store had established nothing about. Programming
+    the fake cursor WITH a row changes the output not at all, which is the proof: the field was a
+    copy of the REQUEST, never a reading.
+
+    THE PROPERTY, and why it is stated over the WHOLE object rather than one field. Nothing was
+    claimed here, so a lane name appearing ANYWHERE in the result is a fabrication by construction —
+    ``by_lane`` is the only field entitled to carry one and it is empty. Walking every field keeps
+    this pinned against a future field that re-introduces the same claim under a new name, which a
+    single-field assertion would not.
+
+    256 IS THE POINT, not decoration. ``wiring_runner`` computes the pooled chunk as
+    ``min(pooled_claim_lane_chunk, backend_chunk)`` = ``min(256, 500)`` on SQL Server, and pooled is
+    the default claim mode — so this is the default path at its default width. At 1 or 4 lanes (what
+    the pre-existing arms use) naming every requested lane is indistinguishable from correct."""
+    chunk = 256
+    requested = {f"lane-{n:03d}" for n in range(chunk)}
+    _ops, _store, result = await _drive("ingress", chunk, fail_batch=_lock_timeout_error())
+    assert result.by_lane == {} and result.rearm == frozenset(), "sanity: nothing was claimed"
+    named = {
+        f.name: sorted(requested & set(getattr(result, f.name)))
+        for f in dataclasses.fields(result)
+        if isinstance(getattr(result, f.name), frozenset | set | list | tuple | dict)
+        and requested & set(getattr(result, f.name))
+    }
+    assert not named, (
+        f"the claim named lane(s) it never observed: { {k: len(v) for k, v in named.items()} } of"
+        f" {chunk} requested. The batch raised before fetchall ran, so the store read no row and"
+        " cannot attribute this abort to any lane. A per-lane count that is really a copy of the"
+        " request stops discriminating anything."
+    )
+    # What the store IS entitled to say: this ATTEMPT aborted on a lock timeout, and how wide it was.
+    assert result.lock_timeout is not None, "the abort must still be reported, just not per-lane"
+    assert result.lock_timeout.phase == "head"
+    assert result.lock_timeout.lanes_in_claim == chunk
+
+
+async def test_a_lock_timeout_reports_which_population_aborted() -> None:
+    """BACKLOG #1270 finding 2: the handler covers TWO populations, so it must not label them alike.
+
+    The ``try`` that ends in the lock-timeout handler spans the claim batch AND the H2 skip-and-
+    complete's in-store finalize DML. Both run under ``SET LOCK_TIMEOUT 0``, so a finalize row lock
+    held by a concurrent finalizer raises 1222 into the SAME handler — and the first fix labelled it
+    "the head CONTENDED", which is a different row in a different table.
+
+    THE FIRST ASSERTION IS THE DISCRIMINATOR. Same stage, same lane, same lane count: the only
+    difference is WHICH statement aborted. If the two produce identical output they are one case
+    wearing two names, which is exactly what shipped."""
+    lane = "lane-000"
+    _o1, _s1, head = await _drive("outbound", 1, fail_batch=_lock_timeout_error())
+    ops2, _s2, finalize = await _drive(
+        "outbound",
+        1,
+        rows=[_row("r1", destination_name=lane)],
+        h2_already_delivered=True,
+        fail_h2_update=_lock_timeout_error(),
+    )
+    assert head != finalize, (
+        "a contended queue HEAD and a contended FINALIZE row are reported identically — the two"
+        " populations are one case wearing two names, and any label chosen is wrong for one of them"
+    )
+    assert head.lock_timeout is not None and head.lock_timeout.phase == "head"
+    assert finalize.lock_timeout is not None and finalize.lock_timeout.phase == "finalize"
+    # Non-vacuousness: the finalize arm really did get past the claim batch into the H2 DML.
+    assert _op_kinds(ops2)[:3] == ["execute-batch", "execute-h2-probe", "execute-h2-update"]
+    # The EMPTY-all contract is identical on both — only the REPORTING differs, never a row.
+    assert head.by_lane == {} and head.rearm == frozenset()
+    assert finalize.by_lane == {} and finalize.rearm == frozenset()
 
 
 @pytest.mark.parametrize("fold", [False, True])
@@ -535,11 +646,13 @@ async def test_guard_reset_failure_swallowed_on_1222_exit() -> None:
         fail_batch=_lock_timeout_error(),
         fail_reset=RuntimeError("reset boom"),
     )
-    # BACKLOG #1270: EMPTY-all is unchanged; the yield is now ATTRIBUTED. A failing guard reset must
-    # not cost the attribution either — the lanes still ride out on `contended`. Exact set, not
-    # truthiness: a bare `if result.contended` would pass on any non-empty set, including a wrong one.
-    assert result.by_lane == {} and result.rearm == frozenset()
-    assert result.contended == frozenset(f"lane-{n:03d}" for n in range(2))
+    # BACKLOG #1270: EMPTY-all is unchanged; the ATTEMPT is now reported. A failing guard reset must
+    # not cost that report either. Whole-object equality — see the AC-3 1222 test for why.
+    assert result == ClaimedHeads(
+        by_lane={},
+        rearm=frozenset(),
+        lock_timeout=ClaimLockTimeout(phase=ClaimAbortPhase.HEAD, lanes_in_claim=2),
+    )
     assert _op_kinds(ops) == ["execute-batch", "rollback", "execute-reset"]
 
 

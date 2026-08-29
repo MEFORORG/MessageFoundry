@@ -51,7 +51,7 @@ from messagefoundry.config.settings import StoreSettings
 from messagefoundry.store import sqlserver as ss
 from messagefoundry.store.pool_metrics import AcquireWaitHistogram
 from messagefoundry.store.sqlserver import SqlServerStore
-from messagefoundry.store.store import ClaimedHeads
+from messagefoundry.store.store import ClaimAbortPhase, ClaimedHeads, ClaimLockTimeout
 from tests.test_adr0114_claim_fold import (
     _GOLDEN_SQL_SHA256,
     _NOW,
@@ -442,11 +442,15 @@ async def test_1222_yields_empty_guard_runs_on_retained_cursor_holder_kept() -> 
     rig = _Rig(store, fail_batch=_lock_timeout_error())
     result = await rig.claim()
     # BACKLOG #1270: the EMPTY-all contract is unchanged — `by_lane` and `rearm` are still empty and
-    # no row moves. What is new is that the yield is ATTRIBUTED: the lane rides out on `contended`, so
-    # a caller can tell this apart from a genuinely empty lane. Asserting the EXACT set rather than
-    # truthiness — a bare `if result.contended` would pass on any non-empty set, including a wrong one.
-    assert result.by_lane == {} and result.rearm == frozenset()
-    assert result.contended == frozenset({"lane-0"})
+    # no row moves. What is new is that the ATTEMPT is reported, chunk-wide and naming no lane, so a
+    # caller can tell this apart from a genuinely empty lane. Whole-object equality rather than a
+    # per-field probe: it pins any field a future revision adds, which is how #1270's first attempt
+    # shipped a fabricated lane set past a green suite.
+    assert result == ClaimedHeads(
+        by_lane={},
+        rearm=frozenset(),
+        lock_timeout=ClaimLockTimeout(phase=ClaimAbortPhase.HEAD, lanes_in_claim=1),
+    )
     # The shielded guard ran ON THE RETAINED CURSOR — the @ded tags prove the reset+commit hit
     # the DEDICATED session (the one that set LOCK_TIMEOUT 0), not a pooled connection (which
     # would leave the holder poisoned with spurious 1222s for every later claim — B1/M-6).

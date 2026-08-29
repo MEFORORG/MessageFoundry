@@ -4610,7 +4610,7 @@ def create_app(
             empty_claims_wake_fanout=ec.wake_fanout if ec is not None else 0,
             # BACKLOG #1270. getattr-with-default for the same reason the A1 counters below use it: an
             # older or alternative counter object reports 0 rather than 500ing the stats read.
-            empty_claims_contended=getattr(ec, "contended", 0) if ec is not None else 0,
+            claim_lock_timeouts=getattr(ec, "claim_lock_timeouts", 0) if ec is not None else 0,
             executor_queue_depth=exec_depth,
             executor_busy=exec_busy,
             # A1 live cost counters (read-only, additive). getattr-with-default so a backend without them
