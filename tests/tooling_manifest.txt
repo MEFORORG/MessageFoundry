@@ -69,6 +69,7 @@ tests/test_coord_dispatch_gate.py
 tests/test_coord_seat_clock_alarm.py
 tests/test_coord_throughput.py
 tests/test_doc_guards_lane.py
+tests/test_install_gate_records_the_install.py
 tests/test_quality_expiry_audit.py
 tests/test_coord_seat_prompt.py
 tests/test_coord_seat_session_key.py

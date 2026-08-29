@@ -17631,6 +17631,230 @@ send succeeded.**
 **Do not close this by draining the current backlog.** The backlog is the symptom; the cap and the
 silent expiry are the defect.
 
+## 1389. a REQUIRED CI guard is green while asserting against the wrong step: its locator binds the tooling pytest line, not the engine one it names
+
+> 🔢 **FILED 2026-08-29 (builder 2).** `tests/test_ci_engine_step_excludes_webconsole.py` exists to
+> stop the engine pytest step double-running the ~356 web-console tests that `testpaths` includes
+> (BACKLOG #1027). ***IT PASSES. IT IS A REQUIRED CHECK. AND IT IS NOT LOOKING AT THE ENGINE STEP.***
+
+> **IN FLIGHT WHEN FILED: PR 613 ALREADY REPAIRS THIS, AND IT IS DIRTY.** Verified 2026-08-29, not
+> taken on report: `gh pr diff 613 --name-only` matches
+> `tests/test_ci_engine_step_excludes_webconsole.py`, and `gh pr view 613` reads OPEN, not draft,
+> `mergeStateStatus=DIRTY`. **The row stands because the PR may not land** -- if 613 is ever closed
+> unmerged the defect still needs a home, and this row names the mechanism more precisely than 613's
+> body does. ***DO NOT START A SECOND FIX. Read 613 first.*** Overlap found by the DISPATCHER after
+> dispatch, not before -- it screened its bench rows for an open PR and did not screen the filing job
+> it handed out.
+> **THE MECHANISM, AND IT IS NOT "THE LOCATOR STOPPED MATCHING".** `_engine_step_run_line()` scans
+> `ci.yml` for a line whose stripped form starts `run: pytest -q`, and calls `pytest.fail` if it finds
+> none — **so a stopped match would go RED, loudly.** That is not what happens.
+>
+> ***EXACTLY ONE LINE IN ci.yml MATCHES, AND IT IS THE TOOLING STEP:*** L1122,
+> `run: pytest -q -n 4 --dist loadfile -m tooling --ignore-glob='*messagefoundry-webconsole*' ...`.
+> The engine step's run line is L813 and it is WRAPPED: `run: bash scripts/ci/retry-native-crash.sh pytest -q ...`, so it
+> never starts with `run: pytest -q` and is never examined. **The guard binds a step it was not
+> written for, that step happens to carry `--ignore-glob`, and every assertion passes.**
+
+> **NOTHING IS BROKEN TODAY AND THAT IS THE POINT.** The engine step still carries the subtraction
+> (verified AT L813 itself, which carries `--ignore-glob='*messagefoundry-webconsole*'`). ***So
+> there is no live double-run. What is missing is the PROTECTION: if someone "simplified" the engine
+> flag back to `--ignore` — the exact regression this file's own docstring says it exists to catch,
+> and which was MEASURED not to prune — the guard would still be green.***
+
+> **THE DOCSTRING STATES THE HAZARD IT NO LONGER COVERS:** *"A future edit 'simplifying' the flag back
+> to `--ignore` would restore the double-run silently, with every check still green, which is the same
+> shape as the defect #1027 fixed."* ***It now describes itself.***
+
+> **THE FIX IS THE LOCATOR, NOT THE ASSERTIONS.** Bind the step by its `name:` / `id:` (`id: tests`)
+> and read the whole `run:` block, rather than pattern-matching a one-line spelling that a formatting
+> change can move. **A test that identifies its subject by a coincidence of layout will re-break the
+> next time the layout changes.**
+
+> **CONTROLS RUN BEFORE FILING:** the three tests pass on main's files (3 passed); `run: pytest -q`
+> occurs exactly once in `ci.yml`; that occurrence is `-m tooling`; `name: Tests (pytest)` occurs once
+> at L747. Absence probes on origin/main's live and closed ledgers: `test_ci_engine_step` 0 hits,
+> `excludes_webconsole` 0 hits — **this defect had no row.**
+
+**Cluster:** CI reliability / dead controls. **Priority:** P2. **Verdict:** build (small).
+**Severity:** no engine effect, no PHI axis, no deployment axis (sec. 0). Nothing is mis-running now.
+The cost is a REQUIRED check whose green is uninformative about the thing it names — and a required
+check is exactly where an uninformative green is most expensive, because it is the one nobody re-reads.
+
+---
+
+## 1390. cla.yml persists the job token into .git/config on pull_request_target while holding contents: write, and the checkout that does it arrived with the fix for the archived action
+
+> 🔢 **FILED 2026-08-29 (builder 2).** `.github/workflows/cla.yml` checks out at
+> `actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1` (v7.0.1, L59) with **no
+> `persist-credentials` setting anywhere in the file**. The action's default is `true`, so the job's
+> `GITHUB_TOKEN` is written into `.git/config` on the runner. zizmor names this pattern `artipacked`.
+
+> **IN FLIGHT WHEN FILED: PR 681 ALREADY REPAIRS THIS, AND IT IS BLOCKED.** Verified 2026-08-29, not
+> taken on report: `gh pr diff 681 --name-only` matches `.github/workflows/cla.yml` and the diff adds
+> 3 `persist-credentials` lines; `gh pr view 681` reads OPEN, not draft, `mergeStateStatus=BLOCKED`.
+> **The row stands because the PR may not land.** ***DO NOT START A SECOND FIX. Read 681 first.***
+> Same screening miss as #1389, same source, disclosed by the DISPATCHER unprompted.
+> **THE PERMISSIONS AND TRIGGER ARE WHAT MAKE IT WORTH A ROW, not the checkout alone.** The workflow
+> runs on `pull_request_target` (L23) and declares `contents: write`, `pull-requests: write`,
+> `statuses: write` (L35-39). ***`pull_request_target` runs in the BASE repository's context with
+> those permissions available, which is precisely the trigger where a persisted write-capable token
+> is worth the most to anything that can read the runner's filesystem.***
+
+> ***THE PART THAT MAKES THIS INSTRUCTIVE RATHER THAN ROUTINE: THE CHECKOUT ARRIVED WITH THE FIX FOR
+> A DIFFERENT DEFECT.*** cla.yml previously had **zero** checkout steps — measured on origin/main
+> earlier the same day. #1381 vendored the CLA action from a remote reference to a local
+> `uses: ./.github/actions/cla-assistant-lite`, and a local action cannot resolve without a checkout,
+> so PR 678 added one. **The remedy for "the action is archived" introduced the credential
+> persistence. Neither change was wrong on its own terms.**
+
+> **THE FIX IS ONE LINE:** `persist-credentials: false` on that checkout step. The job does not push;
+> it needs the tree only so the local action resolves. **Nothing in the workflow reads the persisted
+> credential, so removing it costs nothing.**
+
+> **CONTROLS RUN BEFORE FILING, on origin/main:** the file reads back 4,853 bytes (a nonzero read, so
+> a zero below is a real absence); `actions/checkout` occurs twice — once in a comment at L48 and once
+> as the step at L59; `persist-credentials` occurs **0** times; `pull_request_target` present at L23.
+> Absence probes on the live and closed ledgers: `persist-credentials` 0 hits, `artipacked` 0 hits —
+> **this defect had no row.**
+
+**Cluster:** CI supply chain / secrets. **Priority:** P2. **Verdict:** build (small).
+**Severity per sec. 0 — CONDITIONAL, and the distinction is load-bearing.** There are ZERO
+deployments and this is a CI workflow, so nothing is exposed today. ***A compromised or malicious
+step in that job WOULD find a write-capable token on disk*** — that is the harm, and it is
+prospective. **Do not write this row up as a live credential exposure; it is not one.**
+
+---
+
+## 1391. the respawn brief points relative commands at the PREDECESSOR checkout, so a replacement seat can declare into a dead box -- but it does not always fire, and the exception is the useful half
+
+> 🔢 **FILED 2026-08-29 (builder 2, who IS a replacement seat and is the counter-example).**
+
+> **THE MECHANISM, VERIFIED IN THE GENERATOR:**
+> `respawn.ps1:1339` emits `"RUN EVERY RELATIVE COMMAND BELOW FROM: $runFrom"`, where `$runFrom` is
+> the **predecessor's** checkout. `:1426` then gives the declare command as a **relative** path,
+> `pwsh -NoProfile -File scripts\coord\seat.ps1 -Declare ...`. And `seat.ps1` derives its box key
+> from the invoking tree — `:241` `$start = if ($Hint) { $Hint } else { (Get-Location).Path }`,
+> `:545` `$boxKey = ConvertTo-BoxKey -Path $wt`. ***Follow the brief literally and the declaration is
+> keyed to a worktree that is not yours.***
+
+> ***AND IT DID NOT HAPPEN TO ME, WHICH IS WHY THIS ROW IS NOT "EVERY REPLACEMENT SEAT".*** My brief
+> carried the predecessor path (the predecessor worktree, named in full) and my declaration still landed in
+> **my own** box: `my own seat record` holds `seat=BUILDER2`,
+> `seatSource=declared`, a real goal, `declaredAt 2026-08-28T17:51:44Z`. **A universal claim was
+> available and is false.**
+
+> ***SO THE OPEN QUESTION IS THE ITEM: WHAT MAKES IT FIRE?*** The plausible discriminator is whether
+> the seat runs the declare with the brief's cwd or from its own tree — but that is UNMEASURED and I
+> am not asserting it. **Establish the discriminator before choosing a fix, because a fix aimed at the
+> wrong half will look like it worked on the seats that were never affected.**
+
+> **THE REPORTED CONSEQUENCE, attributed rather than claimed:** the ASVS-TRACKER found this on itself
+> at 06:34Z and PROCESS-IMPROVEMENT reported the generator still live at ~16:2xZ; the affected seat
+> is reported still reading `seat=ASVS-TRACKER declared 17:50Z` although that seat re-declared at
+> 11:33Z. ***I did not verify that record myself and it is second-hand here.*** The consequence when
+> it does fire: the declaration lands in a dead box, the Stop hook writes an undeclared record under
+> the live one, and mail — addressed by box — goes to the dead one.
+
+> ***THE REASON THIS SURVIVED A DAY OF FOUR SEATS LOOKING AT IT: IT PRESENTS AS THREE UNRELATED
+> THINGS.*** The DISPATCHER reports diagnosing all three wrongly before connecting them — "two seats
+> answering to LIAISON", "mail -To all reaches 11 of 16", and "a seat can be alive and
+> mail-unreachable" published as a **channel** property. **If one root cause can wear three costumes,
+> the first two diagnoses will each look complete.**
+
+> **TWO CANDIDATE FIXES, different sizes:** an ABSOLUTE path in the brief (small, and it only fixes
+> new briefs), or `seat.ps1` keying on the SESSION rather than the invoking tree (larger, and it is
+> the shared root — `lane.ps1` derives its key the same way).
+
+**Cluster:** Fleet coordination. **Priority:** P2. **Verdict:** build (small, pending the discriminator).
+**Severity:** no engine effect, no PHI axis, no deployment axis (sec. 0). It degrades seat addressing:
+an affected seat is alive, working, and unreachable by the channel that leaves a receipt.
+
+---
+
+## 1392. PR 609 must land WITH OR AFTER ADR 0172: it replaces a stale understatement of the TLS posture with an overstatement that is false on main, and links an ADR file main does not have
+
+> 🔢 **FILED 2026-08-29 (builder 2).** PR 609 deletes two strings saying remote TLS exposure is
+> still to come -- `CLAUDE.md:120` and `messagefoundry/api/app.py:19` -- and replaces them with text
+> asserting the engine **always serves TLS**, minting a self-signed certificate on first run, citing
+> **ADR 0172**. ***BOTH THE OLD TEXT AND THE NEW TEXT ARE WRONG ABOUT MAIN, IN OPPOSITE DIRECTIONS.***
+
+> **THE OLD TEXT UNDERSTATES, so PR 609 is right that it must go.** TLS shipped: main carries
+> `messagefoundry/config/tls_policy.py`, `TlsSettings`, `[api].tls_cert_file` / `tls_key_file`, a
+> read-only cert inventory and a `cert self-signed` subcommand, and `__main__.py` says in-process TLS is
+> *"allowed off-loopback without this flag"*.
+
+> ***THE NEW TEXT OVERSTATES, AND THAT IS THE HAZARD -- A SECURITY CLAIM ASSERTING MORE THAN THE
+> MECHANISM DELIVERS.*** Measured at `origin/main`:
+
+| claim in PR 609's replacement text | what main actually does |
+|---|---|
+| "always serves TLS" | `--allow-insecure-bind` is present and permits a non-loopback bind **without** TLS |
+| "mints ... on first run" | **no auto-mint in the serve path.** Minting is the explicit `cert self-signed` subcommand, whose own help says **"for NON-PROD TLS bring-up ONLY"** |
+| `[ADR 0172](docs/adr/0172-...md)` | **not on main.** 167 files under `docs/adr/`, **zero** named 0172, and **no index row** |
+
+> Controls for both scans: `0171` returns 1 as a file and 1 as an index row, so the pattern sees ADRs.
+
+> ***THE CONSTRAINT: PR 609 MUST LAND WITH OR AFTER ADR 0172, NEVER BEFORE.*** Landed first it trades a
+> stale understatement for a false claim of a TLS posture the engine does not have, and it puts a
+> **broken relative link** into `CLAUDE.md`, the file every session reads first. Landed with 0172, every
+> sentence in it becomes true. **The change is correct; only its ORDER is the defect.**
+
+> **DO NOT "FIX" THIS BY REWORDING 609 TO MATCH TODAY'S MAIN** -- that is a third posture to re-review
+> when 0172 lands. Hold 609 behind 0172.
+
+> **PROVENANCE, because the finding changed shape.** The DISPATCHER found the sequencing hazard and
+> reported the old strings as **true**. They are not, they are stale, which weakens the case for holding
+> 609. ***THE HOLD SURVIVES ON THE OPPOSITE EVIDENCE: not "609 would delete something true" but "609
+> would assert something false."*** Right conclusion, wrong reason, and the corrected reason is stronger.
+> Filed as a row because a cross-session message dies with its session and this constraint must outlive it.
+
+**Cluster:** Documentation / security posture. **Priority:** P2. **Verdict:** build (ordering only).
+**Severity:** no engine effect and no PHI axis (sec. 0, zero deployments). It would ship a **false
+security claim** in the two files a new reader trusts first, plus a broken link.
+
+---
+
+## 1388. docs/SECURITY.md cites 9 config keys the loader now refuses, and two of the citations are instructions a reader cannot follow
+
+> 🔢 **FILED 2026-08-29 (builder 2).** ADR 0118 relocated fifteen settings under `[security]`, and
+> `_reject_relocated_keys` now **raises** on the old spellings (`settings.py`, `_RELOCATED_TO_SECURITY`).
+> `docs/SECURITY.md` still cites **9 of those 15 keys on 14 lines**. The lines are not equivalent and
+> the item is the SPLIT, not a find-and-replace.
+
+> **MEASURED, and the classification is the whole item.** Every line read; no regex made the call.
+>
+> | class | count | lines |
+> |---|---|---|
+> | **INSTRUCTION** — a reader following it writes config the loader refuses | **2** | 811, 1378 |
+> | **DESCRIBE** — accurate mechanism, stale spelling | **10** | 21, 35, 42, 806, 856, 886, 1190, 1191, 1204, 1241 |
+> | **ALREADY CORRECT** — names the refusal itself, change nothing | **2** | 186, 1181 |
+>
+> **L811 is the only unambiguous one:** *"The documented org opt-out is `[auth].require_mfa = false`."*
+> That tells a reader the documented way to do a thing, in a spelling that fails at load. **L1378** is
+> second — *"raising `[auth].session_absolute_hours` or `[auth].session_idle_timeout_minutes` beyond
+> those bounds is a documented risk deviation"* names an action on two refused keys.
+
+> **THE TWO ALREADY-CORRECT LINES ARE THE REASON THIS IS NOT A SWEEP.** L186 reads "the old
+> `[diagnostics].audit_all_authz` TOML spelling is **refused at load**"; L1181 gives
+> `[security].sign_out_after_idle_minutes` / `max_session_hours` as "the ADR 0118 homes" and calls the
+> `[auth].*` pair "**the retired aliases**". ***A builder told "fix 14 lines" edits two lines that are
+> already right.***
+
+> **THREE INSTRUMENT FAILURES, RECORDED BECAUSE THEY WILL RECUR IN THIS FILE.** An
+> instruction-vs-description regex called **6** instructions against a true **2** — a 3x over-count.
+> An already-names-refusal regex flagged L1190, L1191 and L1241, all three FALSE: they use
+> "refusing"/"refusal" in an unrelated sense (arms that refuse; an empty list being a refusal). And a
+> key-table regex using `"[a-z_.]+"` for the replacement value **silently dropped `[api].host`**, whose
+> value is `local_access_only / listen_address` — a space and a slash. L42 and L1191 only appeared once
+> that was fixed. ***The miss was invisible; the count simply read 14 keys instead of 15.***
+
+**Cluster:** documentation accuracy / secure-by-default. **Priority:** P3. **Verdict:** build.
+**Severity:** no engine effect, no PHI axis, no deployment axis (sec. 0). A deploying site following
+L811 **would** write a key the loader refuses and get a load failure — loud, not silent, so the
+posture is not weakened. The cost is a documented opt-out that does not work as documented.
+
+---
+
 ## 1397. the Bash tool unescapes backslashes inside a QUOTED heredoc, so a Windows path or a doubled-backslash regex silently changes meaning
 
 > 🔢 **Filed 2026-08-29 - measured, not fixable here.** In the Claude Code Bash tool a quoted heredoc
