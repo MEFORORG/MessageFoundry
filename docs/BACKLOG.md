@@ -17407,3 +17407,41 @@ check is exactly where an uninformative green is most expensive, because it is t
 
 ---
 
+## 1390. cla.yml persists the job token into .git/config on pull_request_target while holding contents: write, and the checkout that does it arrived with the fix for the archived action
+
+> 🔢 **FILED 2026-08-29 (builder 2).** `.github/workflows/cla.yml` checks out at
+> `actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1` (v7.0.1, L59) with **no
+> `persist-credentials` setting anywhere in the file**. The action's default is `true`, so the job's
+> `GITHUB_TOKEN` is written into `.git/config` on the runner. zizmor names this pattern `artipacked`.
+
+> **THE PERMISSIONS AND TRIGGER ARE WHAT MAKE IT WORTH A ROW, not the checkout alone.** The workflow
+> runs on `pull_request_target` (L23) and declares `contents: write`, `pull-requests: write`,
+> `statuses: write` (L35-39). ***`pull_request_target` runs in the BASE repository's context with
+> those permissions available, which is precisely the trigger where a persisted write-capable token
+> is worth the most to anything that can read the runner's filesystem.***
+
+> ***THE PART THAT MAKES THIS INSTRUCTIVE RATHER THAN ROUTINE: THE CHECKOUT ARRIVED WITH THE FIX FOR
+> A DIFFERENT DEFECT.*** cla.yml previously had **zero** checkout steps — measured on origin/main
+> earlier the same day. #1381 vendored the CLA action from a remote reference to a local
+> `uses: ./.github/actions/cla-assistant-lite`, and a local action cannot resolve without a checkout,
+> so PR 678 added one. **The remedy for "the action is archived" introduced the credential
+> persistence. Neither change was wrong on its own terms.**
+
+> **THE FIX IS ONE LINE:** `persist-credentials: false` on that checkout step. The job does not push;
+> it needs the tree only so the local action resolves. **Nothing in the workflow reads the persisted
+> credential, so removing it costs nothing.**
+
+> **CONTROLS RUN BEFORE FILING, on origin/main:** the file reads back 4,853 bytes (a nonzero read, so
+> a zero below is a real absence); `actions/checkout` occurs twice — once in a comment at L48 and once
+> as the step at L59; `persist-credentials` occurs **0** times; `pull_request_target` present at L23.
+> Absence probes on the live and closed ledgers: `persist-credentials` 0 hits, `artipacked` 0 hits —
+> **this defect had no row.**
+
+**Cluster:** CI supply chain / secrets. **Priority:** P2. **Verdict:** build (small).
+**Severity per sec. 0 — CONDITIONAL, and the distinction is load-bearing.** There are ZERO
+deployments and this is a CI workflow, so nothing is exposed today. ***A compromised or malicious
+step in that job WOULD find a write-capable token on disk*** — that is the harm, and it is
+prospective. **Do not write this row up as a live credential exposure; it is not one.**
+
+---
+
