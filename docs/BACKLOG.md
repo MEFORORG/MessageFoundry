@@ -17378,3 +17378,76 @@ flaky required check. Options, at least: a non-blocking scheduled job that opens
 opt-in `verify`-style check a seat runs deliberately; or accepting the gap and rewording the register's
 guarantee so it stops implying coverage it cannot confirm. **Adding the two lines and moving on fixes
 today's instance and leaves the instrument exactly as blind.**
+
+## 1385. three merge-queue attempts on one PR failed three DIFFERENT unrelated tests, and the PR gate cannot see any of it
+
+> 🔢 **Filed 2026-08-29 -- OPEN.** PR #669 was added to the merge queue three times and
+> removed three times without merging. Its 15 required contexts are green **on the PR**. It fails the
+> `CI` workflow in the **`merge_group`** context, which runs against the branch merged with `main` and
+> is a different set of runs the PR page does not surface.
+
+**Cluster:** CI / merge queue. **Priority:** P2. **Verdict:** build.
+**Severity:** a PR whose every required check is green cannot land, and nothing on the PR says why.
+Three full CI cycles were spent to learn that. On a day when the fleet's budget is the binding
+constraint, an invisible retry loop is expensive as well as confusing.
+
+**The queue events, from the PR timeline:**
+
+```
+11:14:42Z  added_to_merge_queue      11:15:32Z  removed_from_merge_queue
+11:36:54Z  added_to_merge_queue      12:03:00Z  removed_from_merge_queue
+12:42:33Z  added_to_merge_queue      12:50:21Z  removed_from_merge_queue
+```
+
+**THE DISCRIMINATOR, and it is the whole finding: the three `merge_group` CI runs failed for three
+DIFFERENT reasons, with no overlap.**
+
+| `merge_group` CI run | How it failed |
+|---|---|
+| 11:15:01Z | `Tests (pytest)` on `windows-2025` **timed out after 55 minutes** -- no test reported FAILED |
+| 11:37:13Z | `test_api_request_timeout.py::test_a_fast_handler_is_untouched` -- wall-clock timing |
+| 12:42:51Z | `test_multipart.py::test_hostile_disposition_header_parses_in_linear_time` -- wall-clock timing, **and** `test_sqlserver_store.py::test_cipher_invocations_upsert_is_atomic_and_additive` -- infra |
+
+**A real defect in the change fails the SAME test every time.** Non-overlapping failures across
+attempts is the signature of the environment, not the diff. And the diff cannot reach any of them:
+#669 touches an ADR, `docs/adr/README.md`, `harness/load/connscale/probe.py`, and two
+`test_connscale_*` files. **Zero overlap** with multipart parsing, the API request-timeout path, or
+the SQL Server store.
+
+**WHAT I CANNOT ATTRIBUTE, stated rather than smoothed over.** The three removals do not map cleanly
+onto the three runs. The first entry was removed at 11:15:32Z, **fifty seconds** after being added and
+long before its own run timed out at roughly 12:10Z -- so that removal was not caused by that run.
+PR #677 merged through the queue in that window, which re-forms the group and is ordinary churn. **So
+the honest claim is three failing `merge_group` runs and three removals, not a one-to-one causal
+chain.** Anyone building on this row should establish the mapping rather than inherit it from here.
+
+**The SQL Server one is already on the record as environmental.** The 641 row of the CI failure log
+(now in the vault) records `test_cipher_invocations_upsert_is_atomic_and_additive` failing as a
+`StoreAcquireTimeout`, diagnoses it as `infra`, and closes with the author retracting their own
+pre-registered discriminator after PRs #644 and #645 landed the same work clean. So this test has a
+written history of failing for reasons unrelated to the PR under it.
+
+**The queue itself is not broken -- positive control.** PR #677 went through the same queue at
+11:15:35Z with `CI`, `CLA Assistant`, `backlog-hygiene`, `CodeQL` and `Security` all green in
+`merge_group`, and merged. Whatever this is, it is not "the queue never merges anything".
+
+**Why the PR gate cannot see it.** `merge_group` runs are a separate event against a separate
+`gh-readonly-queue/...` ref. The PR's own `statusCheckRollup` reports the `pull_request` runs and
+says nothing about them. **A PR can therefore show 15 of 15 required contexts green and still be
+unmergeable, with the reason recorded only in a run list nobody looks at.** Reading it takes
+`gh run list --event=merge_group`.
+
+**At least three separable questions, and they have different owners:**
+
+1. **The timing tests.** `test_a_fast_handler_is_untouched` and
+   `test_hostile_disposition_header_parses_in_linear_time` both assert against wall clock on a shared
+   runner. Whether they should is a real question; a linear-time assertion in particular can be
+   restated as a ratio between two input sizes rather than an absolute bound.
+2. **The SQL Server upsert.** Already characterised in the 641 row; a retry past transient acquire
+   failures was noted there as an open vault PR.
+3. **The visibility gap, which is the durable half.** Nothing surfaces a `merge_group` failure onto
+   the PR. A dequeue looks identical to never having been queued -- and `autoMergeRequest` reads
+   `null` in both states, so the obvious field cannot distinguish them either (Instruments 4.15c).
+
+**Do not close this by re-running the queue until it passes.** That is what happened three times
+already, and it produces a green that means "this attempt got lucky", not "the change is sound".
