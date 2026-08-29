@@ -17815,3 +17815,65 @@ reaching it. The exposure is to the REPOSITORY, not to a deployment.
 
 ---
 
+## 1396. anchor-guided remediation fixes only what the evidence quotes, so an error earlier in the document survives every pass and the reader reaches it first
+
+> 🔢 **FILED 2026-08-29 (builder 2). Found by the ASVS-TRACKER, relayed by the LIAISON,
+> and I am the worked example.** An ASVS cell cites specific lines as evidence. When a defect is
+> repaired, ***THE REPAIR LANDS WHERE THE ANCHORS POINT.*** Anything wrong **earlier** in the same
+> document, where no anchor looked, survives -- **and a reader meets it first.**
+
+> **THE MEASURED INSTANCE, in `docs/SECURITY.md`.** The tracker's words: *"Every correction to this
+> document landed at a line the ASVS cell's evidence anchors cited. Both surviving errors sit 370
+> lines earlier, where no anchor looked."*
+
+    :806   "[auth].require_mfa on ... the Administrator role must satisfy MFA before any
+            step-up operation ... other users may opt in by enrolling"
+    :811   the opt-out sentence -- ANCHORED, and FIXED under #1388
+    :1178  the same document: scope is `every_local_account` by default and it is an ACCESS gate
+           on every authorized route -- then, in the row itself:
+           *** "An earlier revision of this row said Administrator-only and
+               step-up-boundary-only; BOTH WERE WRONG" ***
+
+> ***SO THE DOCUMENT CARRIED ITS OWN REFUTATION, 370 LINES BELOW THE CLAIM, FOR AS LONG AS IT TOOK
+> SOMEONE TO READ PAST THE ANCHORS.*** #1388 fixed `:811` and left `:806`, **and `:806` comes first.**
+> (Both are now repaired -- `:811` under #1388, `:806` as its remainder. **This row is the CLASS, not
+> those two lines.**)
+
+> ***WHY IT IS NOT A CARELESSNESS FINDING, WHICH IS WHY IT NEEDS A ROW RATHER THAN A REMINDER.***
+> Each individual call was defensible. #1388's pass sorted every line INSTRUCTION versus DESCRIBE and
+> fixed the instructions; `:806` was classed DESCRIBE, on the sound ground that a description says
+> what the system READS rather than what an operator should WRITE. **The method was right, applied
+> honestly, and still left a wrong description standing four lines from its own correction.**
+
+> **THE MECHANISM IS THAT THE ANCHOR SET IS THE SEARCH SPACE.** A cell's anchors record *where the
+> evidence was found*, never *where the claim is repeated*. Remediation inherits that boundary
+> silently. ***AND IT GETS WORSE WITH TIME: each pass adds anchors at the lines it just fixed, so the
+> anchored region grows around the places already correct*** -- exactly what happened here, where the
+> repair added anchors at `:806`, `:807` and `:811`.
+
+> ***THE READING-ORDER HALF IS THE DANGEROUS ONE. A DOCUMENT THAT IS RIGHT LATE AND WRONG EARLY IS
+> WORSE THAN ONE THAT IS WRONG THROUGHOUT***, because the reader who stops early is confidently
+> misinformed, and the reader who continues finds a contradiction and cannot tell which half is
+> current. Here the early text also named a config key **refused at load**, so following it produced
+> a `serve` that exits 2.
+
+> **WHAT WOULD ACTUALLY HELP, none of it verified here.** ***A repair pass should search the WHOLE
+> document for the CLAIM, not visit the anchor lines*** -- grep the assertion, not the citation.
+> Where a document states a rule twice, a check that the statements agree is worth more than either
+> being individually correct. **And when a correction lands, look EARLIER as well as at the anchor:
+> the anchors mark where somebody already looked, which is precisely where the defect is least
+> likely to still be.**
+
+> ***WHAT THIS ROW DOES NOT CLAIM: that any other cell has this defect today.*** One instance is
+> measured; the mechanism is general and applies to every cell with anchors, **but no census was
+> run** -- that is the first task of whoever takes it, and it is a cheap one: for each cell, grep its
+> claim across the whole file and compare against its anchor lines. Nor that anchors are wrong to
+> exist; they are evidence, and **the defect is treating an evidence list as a work list.**
+
+**Cluster:** Documentation / security assurance. **Priority:** P2. **Verdict:** build (a census
+first, then a method change). **Severity:** no engine effect and no PHI axis (sec. 0, zero
+deployments). It leaves security documentation that is correct late and wrong early, which is the
+shape a reader is least able to detect.
+
+---
+
