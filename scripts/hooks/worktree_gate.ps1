@@ -161,10 +161,55 @@ function Get-FullPathRaw([string]$Path, [string]$Base) {
     } catch { return "" }
 }
 
+#: Host spellings that mean THIS MACHINE. An admin share through any of these reaches the local disk, so
+#: `//localhost/c$/x` and `c:/x` are the same file and must compare equal. Deliberately NOT `[^/]+`: a
+#: share on ANOTHER box is a different machine's C: drive, and folding it would let a remote path match a
+#: local governed root -- a refusal naming a repository the write never touches, which is the BACKLOG
+#: #1085 shape this file has already been fixed for once.
+$script:LocalHostSpellings = @('localhost', '127.0.0.1', '::1', $env:COMPUTERNAME) |
+    Where-Object { $_ } | ForEach-Object { $_.ToLowerInvariant() }
+
 function Get-ComparablePath([string]$Path, [string]$Base) {
+    <#
+    THE COMPARISON IS LEXICAL AND THAT IS THE WHOLE DEFECT (BACKLOG #1071). ``GetFullPath`` never touches
+    the filesystem, so it canonicalises the drive-letter spelling and nothing else. Two spellings of the
+    SAME local path therefore compared UNEQUAL to a governed root and rule 3c allowed a disarm through
+    them.
+
+    MEASURED, with the consequence read back from the governed config rather than inferred from a verdict:
+
+        \\?\C:\<governed>            git rc=0, the write LANDED in the governed config. UNCONDITIONAL.
+        \\localhost\C$\<governed>     git rc=128 "dubious ownership" -- blocked TODAY, and rc=0 with the
+                                    write landing the moment an operator adds one safe.directory entry.
+
+    THE ITEM FILES THE UNC SPELLING AND THAT IS THE CONDITIONAL ONE. The extended-length prefix needs no
+    setup at all -- no share, no junction, no configuration -- which also answers the objection recorded
+    on this rule that these spellings "need a SHELL command to set up" and are therefore out of reach.
+    One of them does not.
+
+    THE FOLD IS ADDITIVE AND CANNOT OPEN A HOLE: it makes MORE spellings resolve onto a governed root, so
+    every verdict it changes moves ALLOW to DENY. It runs at the single shared comparison point, so rules
+    3, 3b, 3c and 3d inherit it together rather than drifting apart.
+
+    WHAT IT STILL DOES NOT COVER, STATED RATHER THAN IMPLIED: a JUNCTION or other reparse point is not
+    de-aliased, because a lexical resolver cannot follow one; and an admin share reaching this machine by
+    a name not in the list above -- an FQDN, a second IP -- is not folded. Both remain open, and the
+    second is an enumeration, which CLAUDE.md is right to distrust.
+    #>
     $full = Get-FullPathRaw $Path $Base
     if (-not $full) { return "" }
-    ($full -replace '\\', '/').TrimEnd('/').ToLowerInvariant()
+    $cmp = ($full -replace '\\', '/').TrimEnd('/').ToLowerInvariant()
+
+    # ORDER MATTERS: the extended-UNC form carries BOTH prefixes, so the `//?/unc/` case must reduce to a
+    # plain UNC path before the admin-share fold below can see it.
+    $cmp = $cmp -replace '^//\?/unc/', '//'
+    $cmp = $cmp -replace '^//\?/', ''
+    if ($cmp -match '^//([^/]+)/([a-z])\$(?=/|$)') {
+        if ($script:LocalHostSpellings -contains $Matches[1]) {
+            $cmp = $Matches[2] + ':' + $cmp.Substring($Matches[0].Length)
+        }
+    }
+    $cmp
 }
 
 # Fold a CALLER-SUPPLIED value before it goes into a deny REASON. Write-Deny already does exactly this for
