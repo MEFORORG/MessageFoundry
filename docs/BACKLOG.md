@@ -18029,3 +18029,60 @@ in this repo can close it. It is filed so the next session that meets the `trunc
 stops rewriting its Python and reaches for a workaround above. **The owner's call is whether to report
 it upstream via `/bug`** -- no feedback tool was available to the session that measured it, and
 `/bug` needs an interactive terminal.
+
+## 1383. docs/SECURITY.md quotes config keys the loader refuses, so a reader who copies them gets a load failure
+
+> 🔢 **Filed 2026-08-29 (builder1) - SECURITY.md half BUILT in the filing commit; the wider corpus is ratcheted, not fixed.**
+> Verdict: build
+> Closing-act: code
+
+**Cluster:** Documentation correctness. **Priority:** P3. **Verdict:** build (small).
+**Severity:** no engine effect and no PHI axis (sec. 0). Nothing is deployed, so nobody has hit this.
+**What is NOT conditional: the defect is in the shipped doc today.** The engine refuses these keys
+and the security document quotes them.
+
+**THE MECHANISM, read from source rather than relayed.** `_RELOCATED_TO_SECURITY`
+([settings.py](../messagefoundry/config/settings.py)) maps 15 legacy `[section] key` spellings to
+their `[security]` replacements. `_reject_relocated_keys` **raises `ValueError`** and is called at
+`:4588`, **before** `_desugar_security` at `:4592` - so a legacy spelling never reaches the
+desugarer. Refusing is the whole behaviour, not a fallback. ADR 0118 is described as *desugaring*,
+which is why this needed checking rather than assuming.
+
+**THE SEVERITY IS LOWER THAN THE ORIGINATING HANDOFF ASSERTED, AND THE ORIGINATOR WITHDREW THE
+CLAIM.** The handoff said at least one line *instructs* an operator, causing a load refusal on
+first start. Measured, with the key list imported from the table itself: **0** refused keys inside
+any fenced code block, **0** imperative instructions, **3** TOML-shaped prose citations, 19
+descriptive mentions, against a positive control of 4 new-spelling hits. The line meant was `:811`,
+`` `[auth].require_mfa = false` ``, which read with `:810` is declarative - *"The documented org
+opt-out **is** X"*. Its own diagnosis: it saw the assignment syntax and never read the previous
+line for the verb.
+
+**SO THE RESIDUAL RISK IS NARROWER AND STILL REAL:** nobody hits a load refusal, because nothing
+tells them to set the key. But a reader told *"the documented org opt-out is X"* may well write X,
+and X is refused.
+
+**THREE FALSE-POSITIVE CLASSES ANY RE-SCAN MUST EXCLUDE, recorded so they are not re-derived.** A
+first pass returned 40, looser than either earlier estimate. `create_app(serve_ui=True)` is a
+**Python keyword argument, not a TOML key**; `[approvals].enabled` and `[auth].oidc_enabled` are
+**different keys**; and lines that **correctly document the refusal** are not defects.
+**`SECURITY.md:186` says the `[diagnostics].audit_all_authz` spelling "is refused at load" - the one
+place the document is already right, and the originating scan counted it as a defect.** In its own
+words, the item *"would have had a builder fix it into being wrong."* The discriminator that
+separates config from API surface is one character: **TOML booleans are lowercase.**
+
+**BUILT IN THE FILING COMMIT:** the three citations rewritten to the `[security]` spelling, with
+the claims verified rather than transcribed - `require_sign_in` defaults `True` and
+`require_mfa_scope` defaults `"every_local_account"` in source, so the sentences stay true after the
+respelling. Plus `tests/test_docs_cite_no_refused_config_keys.py`, which imports
+`_RELOCATED_TO_SECURITY` so it cannot drift from the table, and carries a positive control plus two
+negative controls (the documented-refusal line, and the Python kwarg).
+
+**REMAINING, AND IT IS THE LARGER HALF: 26 other documents carry 56 more citations.** Scope was
+deliberately held to `docs/SECURITY.md` - the originating recommendation, endorsed unaltered - so
+the gate ships as a **ratchet** rather than a clean check: every affected file is pinned at its
+measured count, a file absent from the table must be at zero, and new files or new citations fail
+immediately. **The baseline self-prunes**: fixing a file below its number fails until the number is
+lowered, and fixing it entirely fails until the row is deleted, so the list can only shrink and
+cannot rot into a suppression list. **Both directions were proved by making the gate fail on
+purpose.** The heaviest are `docs/testing/master-test-plan/03-store-and-data-lifecycle.md` (11) and
+`docs/CONNECTIONS.md` (9). Clearing the rest is a separate item and is not filed here.
