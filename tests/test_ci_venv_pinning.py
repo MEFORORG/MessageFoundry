@@ -202,7 +202,13 @@ _REMOTE_SCHEMES = ("git+", "hg+", "svn+", "bzr+")
 #: Tools whose release-path pin must EXIST — the non-vacuity backstop for the scan above. Deleting a
 #: step would otherwise make the scan pass by finding nothing left to check.
 RELEASE_PINNED_TOOLS = (
-    ("release.yml", "sigstore"),
+    # `sigstore` IS NOT HERE ANY MORE, and it was not dropped -- it MOVED. BACKLOG #332 routed it
+    # through `ci/locks/release-tools.lock`, so there is no longer an inline `pip install sigstore==`
+    # target for the scan above to find. The backstop that entry provided is preserved, and
+    # strengthened, by `test_the_release_signing_toolchain_is_installed_from_a_hashed_lock` below:
+    # deleting the lock install fails there instead. Removing an entry from this tuple WITHOUT a
+    # replacement guard is the exact regression the comment above warns about, so the two changes
+    # belong in one commit and this note is what makes that reviewable.
     ("release.yml", "build"),
     ("release.yml", "pip"),
     ("release.yml", "cyclonedx-bom"),
@@ -979,4 +985,63 @@ def test_constraints_lock_still_carries_the_packaging_pin() -> None:
         f"expected exactly one `packaging==` line in constraints.lock, found {pins}. release.yml "
         f"resolves its pin with `sed … | head -1`, so zero lines hard-fail the next tag push and "
         f"two would silently pick the first."
+    )
+
+
+# --- the release SIGNING toolchain, moved from an inline pin into a hashed lock (BACKLOG #332) -----
+
+
+def test_the_release_signing_toolchain_is_installed_from_a_hashed_lock() -> None:
+    """The replacement for ``sigstore``'s entry in ``RELEASE_PINNED_TOOLS``, and it is stronger.
+
+    The inline pin it replaces covered the TOP package only -- ~30 transitive dependencies still
+    floated, unhashed, and resolved at signing time, inside the job holding ``id-token: write``. So
+    the old guard could pass while the thing it was protecting was wide open.
+
+    THREE ASSERTIONS, EACH CLOSING A DIFFERENT WAY THIS GOES BACK:
+
+    1. the lock EXISTS and pins ``sigstore`` exactly -- not a floor, not a range;
+    2. every requirement in it carries a hash -- a lock without hashes is a version pin wearing a
+       lock's filename, and ``--require-hashes`` would reject it at install time rather than here;
+    3. ``release.yml`` actually installs FROM it WITH ``--require-hashes`` -- a lock nothing installs
+       from is decoration, which is the vacuity the tuple's own comment warns about.
+    """
+    lock = _REPO / "ci" / "locks" / "release-tools.lock"
+    assert lock.is_file(), (
+        "ci/locks/release-tools.lock is missing -- the signing toolchain is unpinned"
+    )
+
+    body = lock.read_text(encoding="utf-8")
+    assert re.search(r"(?mi)^sigstore==", body), (
+        "release-tools.lock does not pin `sigstore` with `==` -- a range at the signing step is what "
+        "this lock exists to remove"
+    )
+    # JOIN CONTINUATIONS FIRST. `uv export` writes a requirement as `name==version \` followed by its
+    # own `--hash=` lines, so a per-LINE check reports EVERY requirement as unhashed -- the hash is
+    # never on the line that names the package. Measured while writing this: the line-local form
+    # reported 31 of 31 unhashed against a lock carrying 193 hashes. Only the logical requirement
+    # answers "pinned AND hashed".
+    blocks = [b.strip() for b in re.split(r"\n(?=\S)", body) if b.strip()]
+    requirements = [b for b in blocks if re.match(r"^[A-Za-z0-9._-]+==", b)]
+    assert requirements, "no requirement blocks found -- the lock is empty or its format changed"
+
+    def _without_hash(items: list[str]) -> list[str]:
+        return [b for b in items if "--hash=" not in b]
+
+    # CONTROL: a detector that cannot SEE an unhashed requirement makes "0 unhashed" meaningless.
+    assert _without_hash(["fakepkg==1.0.0"]) == ["fakepkg==1.0.0"], (
+        "the hash detector cannot identify an unhashed requirement, so its verdict on the real lock "
+        "would be indistinguishable from a blind pass"
+    )
+    unhashed = [b.splitlines()[0][:60] for b in _without_hash(requirements)]
+    assert not unhashed, (
+        f"{len(unhashed)} requirement(s) in release-tools.lock carry no hash, e.g. {unhashed[:3]} -- "
+        f"`--require-hashes` would fail the release rather than this test, which is far later"
+    )
+
+    release = (_WORKFLOWS / "release.yml").read_text(encoding="utf-8")
+    assert "--require-hashes -r ci/locks/release-tools.lock" in release, (
+        "release.yml no longer installs the signing toolchain from the hashed lock. If that was "
+        "deliberate, restore an equivalent guard in the same commit -- otherwise the lock is inert "
+        "and the signing step is back to resolving unhashed dependencies at tag time."
     )
