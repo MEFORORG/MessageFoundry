@@ -17504,3 +17504,46 @@ an affected seat is alive, working, and unreachable by the channel that leaves a
 
 ---
 
+## 1392. PR 609 must land WITH OR AFTER ADR 0172: it replaces a stale understatement of the TLS posture with an overstatement that is false on main, and links an ADR file main does not have
+
+> 🔢 **FILED 2026-08-29 (builder 2).** PR 609 deletes two strings saying remote TLS exposure is
+> still to come -- `CLAUDE.md:120` and `messagefoundry/api/app.py:19` -- and replaces them with text
+> asserting the engine **always serves TLS**, minting a self-signed certificate on first run, citing
+> **ADR 0172**. ***BOTH THE OLD TEXT AND THE NEW TEXT ARE WRONG ABOUT MAIN, IN OPPOSITE DIRECTIONS.***
+
+> **THE OLD TEXT UNDERSTATES, so PR 609 is right that it must go.** TLS shipped: main carries
+> `messagefoundry/config/tls_policy.py`, `TlsSettings`, `[api].tls_cert_file` / `tls_key_file`, a
+> read-only cert inventory and a `cert self-signed` subcommand, and `__main__.py` says in-process TLS is
+> *"allowed off-loopback without this flag"*.
+
+> ***THE NEW TEXT OVERSTATES, AND THAT IS THE HAZARD -- A SECURITY CLAIM ASSERTING MORE THAN THE
+> MECHANISM DELIVERS.*** Measured at `origin/main`:
+
+| claim in PR 609's replacement text | what main actually does |
+|---|---|
+| "always serves TLS" | `--allow-insecure-bind` is present and permits a non-loopback bind **without** TLS |
+| "mints ... on first run" | **no auto-mint in the serve path.** Minting is the explicit `cert self-signed` subcommand, whose own help says **"for NON-PROD TLS bring-up ONLY"** |
+| `[ADR 0172](docs/adr/0172-...md)` | **not on main.** 167 files under `docs/adr/`, **zero** named 0172, and **no index row** |
+
+> Controls for both scans: `0171` returns 1 as a file and 1 as an index row, so the pattern sees ADRs.
+
+> ***THE CONSTRAINT: PR 609 MUST LAND WITH OR AFTER ADR 0172, NEVER BEFORE.*** Landed first it trades a
+> stale understatement for a false claim of a TLS posture the engine does not have, and it puts a
+> **broken relative link** into `CLAUDE.md`, the file every session reads first. Landed with 0172, every
+> sentence in it becomes true. **The change is correct; only its ORDER is the defect.**
+
+> **DO NOT "FIX" THIS BY REWORDING 609 TO MATCH TODAY'S MAIN** -- that is a third posture to re-review
+> when 0172 lands. Hold 609 behind 0172.
+
+> **PROVENANCE, because the finding changed shape.** The DISPATCHER found the sequencing hazard and
+> reported the old strings as **true**. They are not, they are stale, which weakens the case for holding
+> 609. ***THE HOLD SURVIVES ON THE OPPOSITE EVIDENCE: not "609 would delete something true" but "609
+> would assert something false."*** Right conclusion, wrong reason, and the corrected reason is stronger.
+> Filed as a row because a cross-session message dies with its session and this constraint must outlive it.
+
+**Cluster:** Documentation / security posture. **Priority:** P2. **Verdict:** build (ordering only).
+**Severity:** no engine effect and no PHI axis (sec. 0, zero deployments). It would ship a **false
+security claim** in the two files a new reader trusts first, plus a broken link.
+
+---
+
