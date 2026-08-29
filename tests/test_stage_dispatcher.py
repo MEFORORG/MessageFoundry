@@ -30,6 +30,7 @@ wall-clock reliance. Seeded values are therefore chosen relative to the test's M
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 import random
 import warnings
@@ -314,14 +315,25 @@ class _ClaimShim:
     """Wraps the real store, delegating everything (``list_fifo_lanes`` / ``release_claimed`` /
     ``mark_failed`` / ``enqueue_ingress`` / …) EXCEPT ``claim_fifo_heads``, which it intercepts ONCE for
     ``lane`` to unit-test a dispatcher claim-outcome branch the real store only reaches via the intricate
-    OUTBOUND H2 path (T10 ``rearm``) or a genuine wake/claim race (T11 EMPTY+dirty)."""
+    OUTBOUND H2 path (T10 ``rearm``), a genuine wake/claim race (T11 EMPTY+dirty), or a live SQL Server
+    lock timeout (BACKLOG #1270 ``contended``).
+
+    ``extra_lanes`` widens the intercept to SEVERAL lanes so one round-trip can carry more than one
+    outcome. It defaults empty, which leaves every existing mode's intercept condition unchanged."""
 
     def __init__(
-        self, real: Any, lane: str, *, mode: str, block: asyncio.Event | None = None
+        self,
+        real: Any,
+        lane: str,
+        *,
+        mode: str,
+        block: asyncio.Event | None = None,
+        extra_lanes: frozenset[str] = frozenset(),
     ) -> None:
         self._real = real
         self._lane = lane
-        self._mode = mode  # "rearm_once" | "empty_block_once"
+        self._targets = frozenset({lane}) | extra_lanes
+        self._mode = mode  # "rearm_once" | "empty_block_once" | "contended_once"
         self._block = block
         self._fired = False
 
@@ -331,10 +343,17 @@ class _ClaimShim:
     async def claim_fifo_heads(
         self, stage: str, lanes: Any, now: float | None = None, *, per_lane_limit: int = 1
     ) -> ClaimedHeads:
-        if not self._fired and self._lane in lanes:
+        hit = self._targets & set(lanes)
+        if not self._fired and hit:
             self._fired = True
             if self._mode == "rearm_once":  # T10: head consumed in-store → lane in rearm, no items
                 return ClaimedHeads(by_lane={}, rearm=frozenset({self._lane}))
+            if self._mode == "contended_once":
+                # BACKLOG #1270: EMPTY *because* something else held the head, not because the lane
+                # was empty. by_lane/rearm stay empty — the EMPTY-all contract is unchanged and no
+                # row moves; only the attribution rides out. This is the shape SqlServerStore returns
+                # on a 1222 lock timeout.
+                return ClaimedHeads(by_lane={}, rearm=frozenset(), contended=frozenset(hit))
             if self._block is not None:
                 await (
                     self._block.wait()
@@ -1030,6 +1049,87 @@ async def test_t10_rearm_reready_then_reclaim(store: Any) -> None:
         assert d.busy_violations == 0
     finally:
         await d.stop()
+
+
+async def test_contended_empty_claim_is_reported_while_a_genuinely_empty_one_stays_quiet(
+    store: Any, caplog: pytest.LogCaptureFixture
+) -> None:
+    """BACKLOG #1270. An empty claim the store attributed to CONTENTION must become visible; an empty
+    claim caused by an empty lane must stay quiet. **Both arms are required and neither is worth
+    anything alone** — a detector that fires on everything discriminates nothing.
+
+    THE DEFECT THIS PINS. Both causes reach the same T12 branch — release the slot, record an empty
+    claim, drop to IDLE with no timer armed — so from outside, a lane that has silently stopped
+    claiming is indistinguishable from a system with nothing to do. There was no counter, no log line
+    and no other observable that could tell them apart; the only signal was a number that had not
+    moved, which is what a healthy idle lane also looks like.
+
+    THE SWEEP IS OFF, AND THAT IS THE POINT. ``_make`` passes ``sweep_interval=_HUGE_SWEEP`` and an
+    EMPTY lane provider, so nothing re-readies these lanes. The lane must be diagnosable **from its own
+    output** while stranded — a detector sited on the sweep would go silent exactly here, which is the
+    same defect class as the one being fixed (an instrument that reports green because it cannot see).
+
+    WHAT IS DELIBERATELY *NOT* ASSERTED: any change of behaviour. The lane still drops to IDLE and in
+    production the sweep still re-readies it. The bar is that the SILENT case becomes LOUD, explicitly
+    not that the lane recovers — it already did, which is exactly why this went unnoticed.
+
+    TWO LANES IN ONE ROUND-TRIP, on purpose. ``mark_ready`` is sync and ``_assemble_chunk`` is
+    await-free, so two back-to-back marks land in ONE claim. That makes "one line per round-trip" and
+    "one line per lane" produce DIFFERENT output (one record, not two) — with a single lane the two
+    rules would be one case wearing two names, and the log-volume scoping would be untested.
+
+    THE LANE-NAME ASSERTION IS A PHI GUARD, not tidiness: a lane is a ``destination_name``, so the
+    line carries counts only and this fails if a name ever rides along."""
+    mc = ManualClock(1000.0)
+    stub = RecordingStub(store, mc.time)
+    lane_a, lane_b = "IB_CONTENDED_A", "IB_CONTENDED_B"
+    await _seed(store, lane_a, [100.0])
+    await _seed(store, lane_b, [100.0])
+
+    # ARM 1 — the store says CONTENDED for both lanes of one round-trip.
+    shim = _ClaimShim(store, lane_a, mode="contended_once", extra_lanes=frozenset({lane_b}))
+    d = _make(shim, stub, set(), clock=mc)
+    await d.start()
+    try:
+        with caplog.at_level(logging.INFO, logger="messagefoundry.pipeline.stage_dispatcher"):
+            d.mark_ready(lane_a)  # sync + await-free assembly → both lanes in ONE claim
+            d.mark_ready(lane_b)
+            assert await _wait_until(lambda: getattr(d._empty, "contended", 0) >= 2)
+        assert d.empty_claims[0] >= 2, "a contended claim must still count as an EMPTY claim"
+        lines = [r.getMessage() for r in caplog.records if "CONTENDED" in r.getMessage()]
+        assert len(lines) == 1, (
+            f"expected ONE line for the round-trip, got {len(lines)}: {lines!r} — one line per LANE"
+            " makes log volume scale with the contention it reports (the monitor becoming the load)"
+        )
+        assert " 2 of 2 " in lines[0], f"the line must carry the COUNTS: {lines[0]!r}"
+        assert lane_a not in lines[0] and lane_b not in lines[0], (
+            f"a lane NAME reached the log — a lane is a destination_name (PHI): {lines[0]!r}"
+        )
+        # The negative control the sweep-sited shortcut would fail: still stranded, still diagnosed.
+        assert d.phase(lane_a) is _LanePhase.IDLE and d.phase(lane_b) is _LanePhase.IDLE
+        assert d.busy_violations == 0
+    finally:
+        await d.stop()
+
+    # ARM 2, THE DISCRIMINATOR — a genuinely empty lane. Counted as EMPTY, never as contended, silent.
+    mc2 = ManualClock(1000.0)
+    stub2 = RecordingStub(store, mc2.time)
+    d2 = _make(store, stub2, set(), clock=mc2)
+    await d2.start()
+    try:
+        with caplog.at_level(logging.INFO, logger="messagefoundry.pipeline.stage_dispatcher"):
+            caplog.clear()
+            d2.mark_ready("IB_NOTHING_HERE")
+            assert await _wait_until(lambda: d2.empty_claims[0] > 0)
+        assert getattr(d2._empty, "contended", 0) == 0, (
+            "an empty LANE was reported as contention — the counter no longer discriminates, so a"
+            " non-zero value would stop meaning anything"
+        )
+        assert not [r for r in caplog.records if "CONTENDED" in r.getMessage()], (
+            "an empty lane emitted the contention line — every empty claim would then look contended"
+        )
+    finally:
+        await d2.stop()
 
 
 async def test_t11_wake_during_claiming_empty_dirty_rereadies(store: Any) -> None:

@@ -553,10 +553,29 @@ class ClaimedHeads:
     ``attempts`` — the G6 ceiling reads them); lanes that yielded nothing are simply absent (EMPTY).
     ``rearm`` names lanes whose claimed head was consumed **in-store** by this call (the H2
     skip-and-complete, or an undecryptable head dead-lettered post-commit) — the dispatcher re-queues
-    them immediately so the lane advances to its next head without waiting for a wake or sweep."""
+    them immediately so the lane advances to its next head without waiting for a wake or sweep.
+
+    ``contended`` names lanes this call yielded on because something ELSE held the row it wanted — not
+    because the lane was empty (BACKLOG #1270). **An absent lane and a contended lane are both "nothing
+    claimed", and until this field existed nothing downstream could tell them apart**: the dispatcher
+    counted the empty claim, dropped the lane to IDLE with no timer armed, and every observable said
+    "there is no work". A lane that has silently stopped claiming reads exactly like an idle system.
+
+    **It is REPORTING, never control flow.** A contended lane is still absent from ``by_lane`` and is
+    still handled as EMPTY; the recovery path (the sweep re-readying it) is unchanged. Populating it
+    can only add a signal, never move a row — which is why it defaults empty and why a backend that
+    cannot cheaply tell the two apart is allowed to leave it so.
+
+    **A backend reports here ONLY what it knows for free.** Empty from a backend that does not
+    distinguish the cases means "not established", NOT "no contention" — the same absence-of-a-veto
+    reading the occupancy fence carries. Do not write a consumer that treats an empty ``contended`` as
+    proof the lanes were genuinely idle. Concretely, today only the SQL Server 1222 lock-timeout yield
+    populates it; the head-of-line SKIP LOCKED / READPAST route reports nothing on either backend,
+    because naming it needs a restructured claim statement on the hottest path (#1270's open half)."""
 
     by_lane: dict[str, list[OutboxItem]]
     rearm: frozenset[str]
+    contended: frozenset[str] = frozenset()
 
 
 @dataclass(frozen=True)

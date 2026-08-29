@@ -423,7 +423,12 @@ async def test_fold_clean_path_with_claimed_row() -> None:
 @pytest.mark.parametrize("fold", [False, True])
 async def test_ac3_1222_yields_empty_all_and_guard_runs(fold: bool) -> None:
     ops, store, result = await _drive("ingress", 4, fold=fold, fail_batch=_lock_timeout_error())
-    assert result == ClaimedHeads(by_lane={}, rearm=frozenset())
+    # BACKLOG #1270: the EMPTY-all contract is unchanged — `by_lane` and `rearm` are still empty and
+    # no row moves. What is new is that the yield is ATTRIBUTED: the lanes ride out on `contended`, so
+    # a caller can tell this apart from a genuinely empty lane. Asserting the EXACT set rather than
+    # truthiness — a bare `if result.contended` would pass on any non-empty set, including a wrong one.
+    assert result.by_lane == {} and result.rearm == frozenset()
+    assert result.contended == frozenset(f"lane-{n:03d}" for n in range(4))
     kinds = _op_kinds(ops)
     assert "rollback" in kinds
     assert _guard_ran(ops), "the shielded guard must run on the 1222 exit (reset_committed False)"
@@ -530,7 +535,11 @@ async def test_guard_reset_failure_swallowed_on_1222_exit() -> None:
         fail_batch=_lock_timeout_error(),
         fail_reset=RuntimeError("reset boom"),
     )
-    assert result == ClaimedHeads(by_lane={}, rearm=frozenset())
+    # BACKLOG #1270: EMPTY-all is unchanged; the yield is now ATTRIBUTED. A failing guard reset must
+    # not cost the attribution either — the lanes still ride out on `contended`. Exact set, not
+    # truthiness: a bare `if result.contended` would pass on any non-empty set, including a wrong one.
+    assert result.by_lane == {} and result.rearm == frozenset()
+    assert result.contended == frozenset(f"lane-{n:03d}" for n in range(2))
     assert _op_kinds(ops) == ["execute-batch", "rollback", "execute-reset"]
 
 

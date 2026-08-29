@@ -192,7 +192,7 @@ class _EmptyClaimObserver(Protocol):
     the dispatcher never imports ``EmptyClaimCounters`` (no PR4 import cycle). When ``None`` is passed
     the dispatcher uses a private :class:`_LocalEmptyCounter`, so PR3 stays self-contained."""
 
-    def record_empty(self, *, woken: bool) -> None: ...
+    def record_empty(self, *, woken: bool, contended: bool = False) -> None: ...
 
 
 @dataclass
@@ -204,13 +204,18 @@ class _LocalEmptyCounter:
     total: int = 0
     idle_poll: int = 0
     wake_fanout: int = 0
+    #: BACKLOG #1270. Empty claims the STORE attributed to contention. A separate axis, not a third
+    #: bucket — a contended empty claim increments ``total`` and one of the two above, AND this.
+    contended: int = 0
 
-    def record_empty(self, *, woken: bool) -> None:
+    def record_empty(self, *, woken: bool, contended: bool = False) -> None:
         self.total += 1
         if woken:
             self.wake_fanout += 1
         else:
             self.idle_poll += 1
+        if contended:
+            self.contended += 1
 
 
 class StageDispatcher:
@@ -709,6 +714,10 @@ class StageDispatcher:
         # ONE clock read for every non-service release this dispatch pass books (they all end at the same
         # instant — the claim has returned and this loop is await-free). Zero when the lever is off.
         rel_ns = time.perf_counter_ns() if self._claim_phase_timing else 0
+        # Contended-empty lanes in THIS round-trip (BACKLOG #1270). A local, not instance state: it
+        # never outlives this call, so there is nothing for a sibling claimer at K>1 to contaminate and
+        # nothing a reader can mistake for a cumulative gauge — that is the counter's job.
+        contended_lanes = 0
         for lane in lanes:
             st = self._states[lane]
             items = result.by_lane.get(lane)
@@ -746,11 +755,38 @@ class StageDispatcher:
                 self._drop_lane_episode(
                     st, rel_ns
                 )  # S_lane DROP: same as rearm — occupancy, not service
-                self._record_empty(woken=st.ready_woken)
+                # BACKLOG #1270: an empty claim the store attributed to CONTENTION is not the same
+                # event as an empty lane, and T12 below treats them identically — IDLE, no timer
+                # armed. Recording the distinction is the whole fix: the recovery path is unchanged
+                # (the sweep re-readies it either way), but a lane that stopped claiming because
+                # something else held its head is no longer indistinguishable, from outside, from a
+                # system with nothing to do.
+                contended = lane in result.contended
+                self._record_empty(woken=st.ready_woken, contended=contended)
+                if contended:
+                    contended_lanes += 1
                 if st.dirty:  # T11: a wake raced the claim -> re-claim now, no sweep wait
                     self._to_ready(lane, woken=True)
                 else:  # T12
                     st.phase = _LanePhase.IDLE
+        # BACKLOG #1270: ONE line per round-trip, at INFO, and COUNTS ONLY. Three deliberate scopings.
+        # (1) INFO, not DEBUG: the proof bar is that the silent case becomes visible without raising
+        # the whole service to DEBUG, which the PHI rule forbids in production anyway.
+        # (2) Counts, never lane NAMES — a lane is a destination_name (the same PHI rule the claim
+        # timer above already states), so the number of contended lanes rides out and nothing else.
+        # (3) Per round-trip, not per lane: a contended chunk would otherwise emit one line per lane
+        # and the log volume would scale with the contention it is reporting, which is how a monitor
+        # becomes the load. Silence here means no contention was REPORTED, which on a backend that
+        # cannot distinguish the cases is not the same as none having occurred.
+        if contended_lanes:
+            log.info(
+                "StageDispatcher %s: %d of %d lane(s) claimed EMPTY because the store reported the "
+                "head CONTENDED, not because the lane was empty; they drop to IDLE and the sweep "
+                "re-readies them (BACKLOG #1270)",
+                self._stage.value,
+                contended_lanes,
+                len(lanes),
+            )
         # Flush the episode window on EVERY claim round-trip, exactly as the claim line already does. A
         # stage that has gone quiet still CLAIMS (empty claims keep firing while the sweep re-readies
         # lanes), so this is what guarantees a draining rung's FINAL window — the tail, where S_lane is
@@ -1157,8 +1193,8 @@ class StageDispatcher:
         st.episode_start_ns = 0
         self._book_lane_episode(start_ns, end_ns, rows=0, service=False)
 
-    def _record_empty(self, *, woken: bool) -> None:
-        self._empty.record_empty(woken=woken)
+    def _record_empty(self, *, woken: bool, contended: bool = False) -> None:
+        self._empty.record_empty(woken=woken, contended=contended)
 
     async def _sleep_or_stop(self, seconds: float) -> None:
         try:  # noqa: SIM105

@@ -550,6 +550,19 @@ class StatsResponse(BaseModel):
     empty_claims: int = 0
     empty_claims_idle_poll: int = 0
     empty_claims_wake_fanout: int = 0
+    # BACKLOG #1270: of those empty claims, how many the STORE attributed to CONTENTION — something
+    # else held the row the claim wanted. A SEPARATE AXIS from the split above, which classifies why
+    # the WORKER was awake and is structurally blind to why the STORE returned nothing. This is the
+    # operator-visible half of that item: without it, a lane that has stopped claiming reads from
+    # outside exactly like an idle system with no work.
+    #
+    # ZERO IS NOT A CLEAN BILL, for two independent reasons. It is POOLED-MODE ONLY — the per-lane
+    # workers never call claim_fifo_heads, so they cannot observe contention and a per-lane engine
+    # reports zero forever. And a backend that cannot cheaply distinguish a contended lane from an
+    # empty one reports nothing either (today only the SQL Server 1222 yield populates it). Zero
+    # therefore means NOT ESTABLISHED; do not render it as "no contention" — that is the empty-scan-
+    # versus-clean-scan conflation this repo keeps meeting.
+    empty_claims_contended: int = 0
     # B11 wall #1 (executor saturation): the default ThreadPoolExecutor's submit-queue depth + in-flight
     # ("busy") count — observable ONLY when the connection-scale harness installs its default-sized boot
     # shim (loop.set_default_executor); ``None`` on a normal engine (no shim), so production /stats is

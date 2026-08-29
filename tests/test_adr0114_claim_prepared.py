@@ -441,7 +441,12 @@ async def test_1222_yields_empty_guard_runs_on_retained_cursor_holder_kept() -> 
     store = _prepared_store()
     rig = _Rig(store, fail_batch=_lock_timeout_error())
     result = await rig.claim()
-    assert result == ClaimedHeads(by_lane={}, rearm=frozenset())
+    # BACKLOG #1270: the EMPTY-all contract is unchanged — `by_lane` and `rearm` are still empty and
+    # no row moves. What is new is that the yield is ATTRIBUTED: the lane rides out on `contended`, so
+    # a caller can tell this apart from a genuinely empty lane. Asserting the EXACT set rather than
+    # truthiness — a bare `if result.contended` would pass on any non-empty set, including a wrong one.
+    assert result.by_lane == {} and result.rearm == frozenset()
+    assert result.contended == frozenset({"lane-0"})
     # The shielded guard ran ON THE RETAINED CURSOR — the @ded tags prove the reset+commit hit
     # the DEDICATED session (the one that set LOCK_TIMEOUT 0), not a pooled connection (which
     # would leave the holder poisoned with spurious 1222s for every later claim — B1/M-6).
