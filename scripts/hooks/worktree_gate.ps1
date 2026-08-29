@@ -482,7 +482,34 @@ function Get-GitTargetCandidatesRaw([string]$Line, [string]$Prefix, [string]$Cwd
     # prefix cannot be composed and $cd stays null, which falls back to exactly the old behaviour.
     $cd = $null
     if ($Prefix -notmatch '(?:^|\s)(?:popd|cd\s+-(?:\s|$))' -and $Prefix -notmatch '[({]') {
-        $cds = [regex]::Matches($Prefix, '(?:^|\s)(?:cd|pushd)\s+"?([^"&|;]+?)"?\s*(?:&&|;|\||$)')
+        # THE VERB LIST MATCHES RULE 3c's CHDIR GUARD, and it did not until now. This composer knew
+        # only `cd` and `pushd`, so a PowerShell chdir verb never resolved its target and the command
+        # after it was judged against the SESSION cwd instead. Measured on the shipped gate, with the
+        # consequence read back from the governed working tree rather than inferred from a verdict:
+        #
+        #     Push-Location <governed>; git reset --hard      ALLOWED, and it DESTROYED uncommitted work
+        #
+        # run from an ungoverned cwd. That is precisely the hijack rule 3 exists to prevent, reached by
+        # spelling one verb differently.
+        #
+        # THE ABSOLUTE AND RELATIVE CASES FAILED DIFFERENTLY, which is why the fix is here rather than at
+        # a call site. With an ABSOLUTE governed path `sl` and `Set-Location` already denied -- caught
+        # downstream by the path itself -- while `Push-Location` did not. With a RELATIVE target every
+        # uncomposed verb failed open, because nothing resolved `../../..` against the chdir at all.
+        #
+        # IGNORECASE IS REQUIRED AND IS THE ONE RISKY CHARACTER HERE. [regex]::Matches is case-SENSITIVE
+        # by default, and PowerShell verbs are conventionally written `Set-Location`, so a case-sensitive
+        # alternation of lowercase spellings would match none of them and this fix would silently do
+        # nothing. The shells being matched are themselves case-insensitive, so this widens nothing that
+        # was not already reachable.
+        #
+        # ADDITIVE BY CONSTRUCTION: composing a chdir can only make a target RESOLVE where it previously
+        # did not, so every verdict it changes moves ALLOW to DENY.
+        $chdirComposeVerbs = 'cd|chdir|pushd|sl|set-location|push-location'
+        $cds = [regex]::Matches(
+            $Prefix,
+            "(?:^|\s)(?:$chdirComposeVerbs)\s+`"?([^`"&|;]+?)`"?\s*(?:&&|;|\||`$)",
+            [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)
         if ($cds.Count -eq 1) { $cd = $cds[0].Groups[1].Value.Trim() }
     }
 
