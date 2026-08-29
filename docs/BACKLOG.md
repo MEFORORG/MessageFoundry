@@ -13732,6 +13732,24 @@ runway or give it to nobody.*
 > Verdict: build
 > Closing-act: code
 
+> **AMENDMENT 2026-08-29 (lander) -- A STANDING OWNER-DELEGATED DECISION FORBIDS THIS ITEM AS WRITTEN. DO NOT DISPATCH IT WITHOUT READING THAT DECISION FIRST.**
+>
+> **This row was filed 2026-08-16. The decision that reverses it is dated 2026-08-17 -- one day younger than the row, and recorded in the vault where nothing in this repository points at it.** The row was dispatched on 2026-08-28 in good faith and returned with nothing written, because the builder found the decision. **The next dispatcher hits the same trap, and the failure mode is publishing to a public history that cannot be unpublished.**
+>
+> **THE RECORD, READ DIRECTLY BY THE FILER RATHER THAN RELAYED** -- `docs/security/PUBLICATION-DECISION-2026-08-17.md` on the vault's `origin/main`, quoted verbatim:
+>
+> - line 8: **"Publish none of the four vault-sourced documents in this pass."**
+> - line 57: "Publish these ONE AT A TIME, lowest risk first, each one read in full by whoever publishes it"
+> - line 63: **"Do not do them as a batch. A batch is how the first attempt grew from three to ten."**
+>
+> **It forbids this item twice over: by NAMING documents this row would publish, and by forbidding the row's SHAPE.** This row asks for three documents at once. It is the batch.
+>
+> **ON THE ROW'S SECOND JUSTIFICATION -- CORRECTED, AND NOT IN THE DIRECTION IT WAS REPORTED TO ME.** It was put to the filer that publishing would not activate `tests/test_threat_model_doc_drift.py`, because the row publishes to a path the accessor never reads. **Measured, that claim does not stand: the row names NO destination path at all.** Its body is 30 lines and contains zero `docs/` paths (parsed with `parse_items`, against a control of four "threat model" mentions in the same body). The accessor is `_doc_path()` at `tests/test_threat_model_doc_drift.py:75-78`, which reads `MEFOR_THREAT_MODEL_DOC` if set and otherwise `_ROOT/docs/security/THREAT-MODEL.md`. **So whether publishing activates the suite depends entirely on a destination this row never specifies.** The justification is **unverifiable as written**, not false -- and that is a reason to make the row say where the documents go, not a reason to strike the sentence.
+>
+> **WHAT THIS AMENDMENT DOES NOT DO: it does not close the item and it does not decide the question.** The gap the row describes is real and unchanged -- none of the three documents is tracked where a deploying site can read it. **Only the owner can lift the publication decision**, and the row's own text already says each published text needs their sign-off before it lands.
+>
+> **AN AMENDMENT IS NECESSARY AND NOT SUFFICIENT, AND THERE IS A MEASURED PRECEDENT AGAINST RELYING ON IT.** #1234 already carries a predecessor dispatcher's "DO NOT DISPATCH" amendment **in its own body**, and it was dispatched anyway five days later by a dispatcher who had read the item. **A warning inside the thing being dispatched is read at the moment it is least likely to change the decision.** If this needs to hold, it wants a gate, not a paragraph.
+
 **Cluster:** Documentation / adopter-facing. **Priority:** P3. **Verdict:** build.
 **Severity:** no deployment axis (sec. 0). The cost today is that someone evaluating the project cannot see how its authors think about the threat surface, or what responsibility their own Handler code would carry.
 
