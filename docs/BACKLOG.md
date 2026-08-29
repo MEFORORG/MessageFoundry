@@ -17524,3 +17524,63 @@ unmergeable, with the reason recorded only in a run list nobody looks at.** Read
 
 **Do not close this by re-running the queue until it passes.** That is what happened three times
 already, and it produces a green that means "this attempt got lucky", not "the change is sound".
+
+## 1386. the mail drain's byte cap is below the fleet's broadcast rate, so live seats accumulate backlogs that expire unread
+
+> 🔢 **Filed 2026-08-29 -- OPEN.** `scripts/hooks/mail-drain.ps1` caps one injection at
+> `MAX_MESSAGES = 5` **and** `MAX_TOTAL_BYTES = 8000`. At today's broadcast size the BYTE cap binds
+> first, so a seat clears **3 to 4 messages per turn** while the fleet sends faster than that. The
+> send-side TTL default is `TtlMinutes = 4320` -- **three days** -- so a backlog that outlives it is
+> discarded.
+
+**Cluster:** Coordination / session mail. **Priority:** P2. **Verdict:** build.
+**Severity:** **34 messages have already expired unread across 17 boxes.** This is not a projection;
+it is a count of mail that was sent, never rendered, and is now gone.
+
+**Measured 2026-08-29, 88 boxes walked under an assertion that the walk found more than 10:**
+
+```
+189 unread across 12 LIVE boxes (touched within 2h)
+145 unread across 31 dead boxes
+ 34 EXPIRED unread across 17 boxes    <- already lost
+
+largest live backlogs
+  hungry-wu-6c8ac2       43   the LIAISON -- the owner's channel
+  wonderful-elion-257e1e 36   Builder 1
+  cleaner-51d2b4         34
+  respawn-fleet-008093   27
+  messagefoundry-096b5d29 20
+```
+
+**THE ARITHMETIC IS THE FINDING, and it is why nobody noticed.** Every drain prints
+`box: 3 shown, N deferred (caps)` and says *"Deferred mail stays in the inbox and is shown at the
+next drain -- nothing was discarded."* **That sentence is true per drain and misleading in
+aggregate.** Nothing is discarded *at that moment*; the TTL discards it later. A seat reading its own
+drain footer sees an orderly queue, not a queue growing faster than it drains.
+
+**Today's broadcasts run about 1,900 bytes**, so three of them are 5,700 and a fourth exceeds 8,000.
+That is exactly the `3 shown` every seat has been seeing and reading as normal.
+
+**Why the backlog is arithmetic rather than inattention.** The drain runs only when the receiving
+seat takes a turn, and clears at most ~4. A seat taking one turn every few minutes cannot keep up
+with a fleet broadcasting more often than that, and an IDLE seat drains nothing at all -- which is
+the same property recorded separately as *mail is a mailbox, not a doorbell*.
+
+**The consequence that matters most: the Liaison is the owner's channel and holds the largest
+backlog.** An owner item routed there can sit tens of positions deep, and over a long weekend can
+expire instead of arriving. **Anything time-sensitive should not be assumed delivered because the
+send succeeded.**
+
+**At least four separable fixes, and they are not equivalent:**
+
+1. **Raise or decouple the caps.** The byte cap binding before the message cap is probably
+   unintentional -- a 5-message allowance that only ever delivers 3 is not the stated policy.
+2. **Report the BACKLOG, not just this pass.** The footer should say the inbox depth and the oldest
+   message's age, so a growing queue is visible in the place a seat already looks.
+3. **Warn before expiry** rather than discarding silently. An expired message currently leaves only a
+   file in `expired/`; nothing tells the sender or the receiver it was never read.
+4. **Broadcast discipline.** Six broadcasts about one shell idiom in ninety minutes is itself part of
+   the input rate, and no cap change fixes that.
+
+**Do not close this by draining the current backlog.** The backlog is the symptom; the cap and the
+silent expiry are the defect.
