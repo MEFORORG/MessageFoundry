@@ -17364,6 +17364,39 @@ git merge-file  ->  exit 0 | conflict markers 0 | '## 1379.' in the result: 2
 
 **A CANDIDATE FIX, NOT A DESIGN:** walk the branch's own history for renamed headings rather than only `head - base`, or assert that every `## N.` in head whose number is in base is byte-identical to base's row of that number. The second is cheaper and answers the question directly.
 
+**AMENDMENT 2026-08-29 (lander) -- THE FREEZE IS INVISIBLE UNTIL SOMEBODY TOUCHES THE LEDGER.** The
+same `base = origin/main` comparison is re-evaluated on **every** commit that touches the ledger, over
+`head - base` rather than against the commit's own parent. So once a branch's allocating worktree is
+gone, a **one-line typo fix inside a row that branch already carries is refused identically to adding a
+brand-new one** -- the refusal is about the SET the branch adds relative to `main`, not about what the
+commit changed.
+
+**But `check_backlog` returns early at `ledger_check.py:346` unless the change set contains
+`docs/BACKLOG.md` or a path under the archive directory.** So a **test-only commit on that same frozen
+branch passes cleanly**. The branch is not uniformly frozen: it is frozen along the one path nobody
+exercises until they need it, and it reports perfect health until that moment. **A seat can work such a
+branch for hours and meet the refusal at the worst possible time** -- the shape this whole row is about,
+a gate whose failure is silent until the expensive moment.
+
+**MEASURED against `origin/main`, not inferred:** `:169` `base: str = "origin/main"`; `:203`
+`git diff --name-only <base> HEAD` (the base, never the parent); `:345` `changed = self.changed_files()`;
+`:346` the early return; the `head - base` loop at ~`:370`; and both ownership arms reading
+`elif not self.ci and not self.owns(...)` at `:296` and `:385`. **CI passes `--ci`, so the ownership arm
+never runs there** -- this is a local-commit constraint only and the branch can still merge on GitHub,
+the same local-versus-CI divergence #1395 records.
+
+**NOT A SEPARATE ROW, DELIBERATELY.** The consequence that an existing row is refused like a new one is
+the intersection of this row's mechanism with **#1293** (removing a worktree orphans every unlanded
+number it allocated), which is CLOSED -- shipped 2026-08-23 at `937e83da`, remedy recorded as doctrine
+in [`docs/LEDGER-GATE.md`](LEDGER-GATE.md): recreate a worktree at the recorded path, owner-ruled route
+1. That remedy already resolves it operationally. **The invisibility above is the part neither row
+states**, and it is recorded here rather than as a third row because splitting it files half a story
+twice.
+
+**PROVENANCE:** mechanism found by builder-2 reading the source, composed by the dispatcher, line
+citations re-verified against `origin/main` by the lander before writing. A builder is relying on the
+test-only asymmetry right now, which is what makes it worth recording rather than theoretical.
+
 ## 1384. two required contexts were never mirrored into required-contexts.txt, so they have no negative control and no test can notice
 
 > 🔢 **Filed 2026-08-29 -- OPEN.** Branch protection on `main` enforces **15** contexts.
