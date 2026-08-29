@@ -364,14 +364,31 @@ jobs:
         run: |
           # PINNED — the sharpest of these installs: this step is unconditional (every tag AND every
           # dispatch) and the very next command signs the release artifacts with the job's OIDC identity,
-          # the same identity that publishes to PyPI below. 4.4.0, not the newer 4.5.0: .github/
-          # dependabot.yml sets a 5-day supply-chain cooldown to dodge a package compromised shortly
-          # after publish, and 4.5.0 is <48h old — hard-pinning the SIGNING toolchain to a fresher
-          # artifact than the repo's own routine-update policy allows inverts that policy at the highest-
-          # privilege point in the pipeline. Re-evaluate to 4.5.0 once it has aged past the window.
-          # NOTE: this pins the TOP only; sigstore's ~30 transitive deps still float at signing time.
-          # Closing the Scorecard alert outright needs the hashed release-tools lock (ADR 0034 option B).
-          python -m pip install "sigstore==4.4.0"
+          # the same identity that publishes to PyPI below — so ANY code that executes here runs with
+          # the credential that signs the artifacts. A backdoored wheel produced at this point carries a
+          # VALID Sigstore bundle and VALID SLSA provenance, and every downstream verifier reports
+          # success: the compromise defeats the controls it is standing next to.
+          #
+          # HASHED LOCK, not an inline pin (BACKLOG #332). The previous form was
+          # `pip install "sigstore==4.4.0"`, which had TWO defects that a version bump does not fix:
+          #   1. It pinned the TOP package only. ~30 transitive dependencies still floated, unhashed,
+          #      resolved at signing time.
+          #   2. NO Dependabot ecosystem parses an inline `pip install X==Y` inside a workflow `run:`
+          #      block (.github/dependabot.yml registers uv, github-actions, npm). So the pin had no
+          #      updater, no trigger and no owner — its own comment said "re-evaluate once it has aged
+          #      past the window" and nothing would ever have prompted that. It was 19 days overdue when
+          #      this landed. tests/test_ci_venv_pinning.py words the class: "a stale pin rots invisibly
+          #      and a DELETED pin is invisible twice over."
+          # Routing it through `uv.lock` fixes both: the transitives are hash-pinned, and the group is
+          # under the `uv` ecosystem Dependabot already watches.
+          #
+          # ON THE VERSION: the lock resolves sigstore 4.5.0, which the old inline pin deliberately
+          # avoided. That choice was CORRECT when made — dependabot.yml sets a 5-day supply-chain
+          # cooldown and 4.5.0 was then <48h old, so pinning the SIGNING toolchain to a fresher artifact
+          # than the repo's own update policy allows would have inverted that policy at its
+          # highest-privilege point. MEASURED: 4.5.0 published 2026-07-28T07:34:00Z, so the window
+          # closed 2026-08-02. The objection is SPENT, not overridden.
+          python -m pip install --require-hashes -r ci/locks/release-tools.lock
           # Sign the wheel + sdist AND the SBOM + VEX, so an operator can verify the provenance of the
           # bill-of-materials and the exploitability assessment too — not just the code artifacts (ADR 0149).
           python -m sigstore sign dist/*.tar.gz dist/*.whl \

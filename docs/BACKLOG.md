@@ -16663,6 +16663,12 @@ catch.
 > and `Decision == "SKIP"`, so any remedy that short-circuited the verdict would pass while testing
 > nothing.
 
+> **FOLDED IN FROM #1303, 2026-08-29 (lander). THE SAME WORK WAS ALLOCATED TWICE -- #1303 on 2026-08-21 and this row on 2026-08-26, with character-identical titles -- and this one shipped.**
+> **#1303 IS RETIRED AS A PERMANENT HOLE AND NOT AS A ROW.** `alloc.ps1` has no release verb by design, on the stated principle that *holes are free, collisions are not*: a stranded number is invisible, while two open headings for one shipped fix read to every future screener as two pieces of work, one of them already done.
+> **THE PARAGRAPH BELOW IS WHY THE FOLD HAPPENED RATHER THAN A CLEAN DROP.** Retiring the row would have lost it, and it is the mechanism -- not commentary. Reported by the seat holding #1303, which declined to pick between the numbers itself. Quoted verbatim:
+>
+> **THE PATH TO THE FAILURE, traced through the real fence.** `Test-RecordLiveness` ([`scripts/coord/session-registry.ps1:181`](../scripts/coord/session-registry.ps1)) reports **DEAD** when `Get-Process -Id` finds nothing -- and DEAD vetoes nothing. A REUSED pid **is** running, and a test record carries no `startedAt` for the reuse fence to consult, so the verdict becomes **UNVERIFIED** -- which **does** veto (`occupancy.ps1:75`). The occupant list then comes back non-empty and an assertion that a dead record is "not a veto" fires. `cmd /c exit` is Windows-only, matching where it was seen; pid reuse needs pid churn, and that tier spawns pwsh/git children constantly on a runner whose pid space recycles far faster than a developer box.
+
 **Cluster:** CI reliability / test determinism. **Priority:** P2. **Verdict:** build.
 **Severity:** no product effect, no PHI effect, no deployment axis (sec. 0) -- test-suite determinism
 only. The cost was a required context redding on a race whose failure looked like a real occupancy
@@ -17317,3 +17323,310 @@ committed alongside the fix rather than filed separately, since neither makes se
 
 **Not done:** pushing, opening a PR, or anything that would exercise this in real CI. Committed and
 handed to the Lander.
+## 1382. the ledger gate compares head against origin/main, so RENAMING a row onto a number already on main passes -- and that merge produces a silent duplicate
+
+> 🔢 **Filed 2026-08-29 (lander) - found by builder-2, composed by the dispatcher, and the unproven half measured by the filer before filing.**
+> Verdict: build
+> Closing-act: code
+
+**Cluster:** Repo governance / ledger. **Priority:** P2. **Verdict:** build (small).
+**Severity:** no engine, PHI or deployment axis (sec. 0). It governs the ledger, not the product. **The severity is that the duplicate is silent -- git reports success and no gate reports anything.**
+
+**THE GATE'S BEHAVIOUR IS DELIBERATE AND DOCUMENTED. THIS ROW IS ABOUT A SIDE EFFECT ITS COMMENT DOES NOT NAME.** `scripts/hooks/ledger_check.py:169` takes `base: str = "origin/main"`, and the check at `:370` walks `head - base`. The comment at `:368-369` states the reason in its own words:
+
+> *"Only `head - base` is examined, so everything already on origin/main -- including the pre-partition overlap -- is grandfathered by construction. No allowlist, nothing to maintain."*
+
+**That is a good design and the row does not propose scrapping it.** Grandfathering by set-subtraction is why there is no allowlist to rot.
+
+**THE SIDE EFFECT: the gate stops you INTRODUCING an unowned number. It does not stop you RENAMING a row onto one that is already on main.** If the number is in `base`, it is not in `head - base`, so `owns()` is never consulted and there is nothing to reject. A commit renaming a branch's row onto `#1379` -- allocated to another worktree, already landed -- **passes cleanly**, and the pass is correct under the rule as written.
+
+**THE CONSEQUENCE WAS REPORTED AS REASONED-NOT-MEASURED AND IS NOW MEASURED.** The reporting seat marked it explicitly as not having completed a merge, and the composing seat carried that marking forward rather than laundering it. Settled here by three-way merge over temp files, mutating no repository:
+
+```
+control  '## 1379.' on origin/main = 1   (unique, so the test is about the real number)
+base     0 headings   (a branch cut before #1379 landed)
+ours     1 heading    (main, at its real offset)
+theirs   1 heading    (the same branch with a DIFFERENT row renamed to #1379)
+the two rows sit ~11,828 lines apart
+
+git merge-file  ->  exit 0 | conflict markers 0 | '## 1379.' in the result: 2
+```
+
+**Exit 0, no markers, two rows. The duplicate merges silently.**
+
+**PLACEMENT IS LOAD-BEARING AND A FIRST ATTEMPT GOT IT WRONG.** Running the same simulation with the renamed row placed at the **tail**, adjacent to main's newest items, produces `exit 1` and three conflict markers -- git catches it. **That version would have refuted the finding, and it would have been the wrong test**: the gate's own message cites the hazard as *"two sessions adding #N land ~1,600 lines apart, merge CLEAN, and both ship (cf. 5b7d046 / #598)"*. Adjacency manufactures a conflict the real scenario does not have. **The far-apart placement is the one that matches the documented failure, and it is the one that reproduces.**
+
+**SO THIS IS THE GATE'S OWN STATED FAILURE MODE, REACHED BY A ROUTE IT DOES NOT CHECK.** The union-diff design that makes the move-commit case correct (`:47-50`) is the same design that makes this invisible.
+
+**NOT CLAIMED:** that anyone has done this, that it is exploitable, or that it was reached other than by a builder noticing it mid-repair. No instance is alleged.
+
+**UNTESTED:** whether a real `git merge` through the merge queue behaves as `git merge-file` does here -- the simulation is a three-way content merge and does not model the queue. Also untested: whether the ADR arm at `:267` has the same shape, though it reads the same way.
+
+**A CANDIDATE FIX, NOT A DESIGN:** walk the branch's own history for renamed headings rather than only `head - base`, or assert that every `## N.` in head whose number is in base is byte-identical to base's row of that number. The second is cheaper and answers the question directly.
+
+## 1384. two required contexts were never mirrored into required-contexts.txt, so they have no negative control and no test can notice
+
+> 🔢 **Filed 2026-08-29 -- OPEN.** Branch protection on `main` enforces **15** contexts.
+> [`.github/required-contexts.txt`](../.github/required-contexts.txt) declares **13**. The two it does
+> not name are `CodeQL (javascript-typescript)` and `CodeQL (python)`. Found while intersecting a PR's
+> `statusCheckRollup` against the live required set to decide what actually blocked six queued PRs.
+
+**Cluster:** CI / required-set claims. **Priority:** P2. **Verdict:** build (small).
+**Severity:** two contexts that BLOCK A MERGE today carry **zero registered negative controls**, and
+the register built to guarantee otherwise cannot see them. The file itself under-reports, which is the
+safe direction -- nobody is relying on a check that is not on -- but the consequence below is not
+cosmetic.
+
+**The doc gap is the small half. This is the real one.**
+[`tests/negative_controls.toml`](../tests/negative_controls.toml) registers, per required context,
+what a planted defect breaks and which pytest nodes must go red without it. Measured: it contains
+**zero** CodeQL entries. #1000's shipped banner states *"All 13 required contexts now carry a
+registered negative control"*, and that sentence was true when written and is now true of 13 of 15.
+
+**Why no test caught it, and the authors were explicit about the precondition.**
+`tests/_workflow_contexts.py::required_contexts()` reads
+[`.github/required-contexts.txt`](../.github/required-contexts.txt) off disk. Its docstring says so
+plainly. `tests/test_negative_controls.py` then reconciles the register against that list, and its own
+docstring states the design honestly:
+
+> `.github/required-contexts.txt` IS READ-ONLY TO THIS FILE. It mirrors the live server, and its own
+> header states the ordering rule -- branch protection first, then the file.
+
+and describes the decay mode it targets as *"a context arriving in branch protection **and being
+mirrored into** `.github/required-contexts.txt`"*. **The guarantee is conditional on a human
+performing the mirror step, and nothing enforces that step.** Step one was done -- CodeQL is enforced.
+Step two was not. Every downstream test then agreed with every other, because they all read the mirror.
+
+**This is ADR 0158 Class 2**, by the ADR's own one-line test -- *if this control were broken, what
+would tell me?* If the mirror is skipped, the thing that would tell me is the register, and the
+register reads the mirror. See
+[ADR 0158](adr/0158-silent-controls-green-signals-that-mean-nothing-and-shape-over-detection.md).
+
+**Measured 2026-08-29:**
+
+```
+gh api repos/MEFORORG/MessageFoundry/branches/main/protection --jq '.required_status_checks.contexts[]'
+  -> 15
+mapfile -t ctx < <(grep -vE '^\s*(#|$)' .github/required-contexts.txt); echo "${#ctx[@]}"
+  -> 13
+
+in API but not in file : CodeQL (javascript-typescript), CodeQL (python)
+in file but not in API : none
+grep -ci codeql tests/negative_controls.toml -> 0
+```
+
+**A note on that second command, because this row is about instruments and it would be poor
+form to leave a copyable one that can lie.** A `grep file | grep` chain reports the LAST stage's
+status, so a missing or unreadable file yields ZERO lines and a clean exit from the tail -- read as
+*"the file declares 0 contexts"*, which is indistinguishable from a genuinely empty file. The form
+above keeps the read and the filter in one stage with no pipe. **Either way the 13 is trustworthy
+only because it is compared against the API, which is this row's entire point.**
+
+**The count 13 is restated in at least five other places**, each of which is now stale by the same two:
+`docs/adr/0158-...md` twice, and three rows in this file. That is a symptom, not the bug -- do not fix
+it by editing the numbers.
+
+**Open question for whoever takes this, because the obvious fix has a worse failure mode.** A test that
+calls the GitHub API needs a token and fails closed on a network blip, turning a silent gap into a
+flaky required check. Options, at least: a non-blocking scheduled job that opens an issue on drift; an
+opt-in `verify`-style check a seat runs deliberately; or accepting the gap and rewording the register's
+guarantee so it stops implying coverage it cannot confirm. **Adding the two lines and moving on fixes
+today's instance and leaves the instrument exactly as blind.**
+
+## 1385. three merge-queue attempts on one PR failed three DIFFERENT unrelated tests, and the PR gate cannot see any of it
+
+> 🔢 **Filed 2026-08-29 -- OPEN.** PR #669 was added to the merge queue three times and
+> removed three times without merging. Its 15 required contexts are green **on the PR**. It fails the
+> `CI` workflow in the **`merge_group`** context, which runs against the branch merged with `main` and
+> is a different set of runs the PR page does not surface.
+
+**Cluster:** CI / merge queue. **Priority:** P2. **Verdict:** build.
+**Severity:** a PR whose every required check is green cannot land, and nothing on the PR says why.
+Three full CI cycles were spent to learn that. On a day when the fleet's budget is the binding
+constraint, an invisible retry loop is expensive as well as confusing.
+
+**The queue events, from the PR timeline:**
+
+```
+11:14:42Z  added_to_merge_queue      11:15:32Z  removed_from_merge_queue
+11:36:54Z  added_to_merge_queue      12:03:00Z  removed_from_merge_queue
+12:42:33Z  added_to_merge_queue      12:50:21Z  removed_from_merge_queue
+```
+
+**THE DISCRIMINATOR, and it is the whole finding: the three `merge_group` CI runs failed for three
+DIFFERENT reasons, with no overlap.**
+
+| `merge_group` CI run | How it failed |
+|---|---|
+| 11:15:01Z | `Tests (pytest)` on `windows-2025` **timed out after 55 minutes** -- no test reported FAILED |
+| 11:37:13Z | `test_api_request_timeout.py::test_a_fast_handler_is_untouched` -- wall-clock timing |
+| 12:42:51Z | `test_multipart.py::test_hostile_disposition_header_parses_in_linear_time` -- wall-clock timing, **and** `test_sqlserver_store.py::test_cipher_invocations_upsert_is_atomic_and_additive` -- infra |
+
+**A real defect in the change fails the SAME test every time.** Non-overlapping failures across
+attempts is the signature of the environment, not the diff. And the diff cannot reach any of them:
+#669 touches an ADR, `docs/adr/README.md`, `harness/load/connscale/probe.py`, and two
+`test_connscale_*` files. **Zero overlap** with multipart parsing, the API request-timeout path, or
+the SQL Server store.
+
+**AMENDED 2026-08-29, and it splits the three failures into TWO different problems. The 11:15 run
+did not fail a test -- it HUNG, and it is an 8x outlier against its own leg.**
+
+Measured across 18 recent `ci.yml` runs, the `Tests (pytest)` step on `test (windows-2025, py3.14)`:
+
+```
+usable samples 13   (5 excluded: skipped, or still running with no completion time)
+min 0.2   median 7.8   max 55.1  minutes
+excluding the outlier: n=12, range 0.2-8.8, mean 6.8
+the outlier is 8.1x the normal mean
+```
+
+**The cap is not marginal, so this is not the ADR 0158 Class 1 shape.** `ci.yml`'s matrix sets
+`step_timeout: 55` for `windows-2025` against a 6.8-minute normal mean -- roughly seven times
+headroom. The run consumed all 55 minutes. **A step that normally takes under nine minutes ran until
+a generous ceiling stopped it, which is a hang, not a slow run.**
+
+**And it tells us WHERE the hang was.** `ci.yml` documents three nested watchdogs at increasing
+scope: `pytest_timeout` (120s per test on Windows, via `--timeout=`), `fault_timeout` (150s,
+`PYTHONFAULTHANDLER` plus `faulthandler_timeout`), and `step_timeout` as the outer backstop -- whose
+comment says it exists "so a process-level deadlock **below pytest**" is still bounded. **The inner
+two did not fire and the outermost did, which is exactly the case the outer one was built for.** So
+the 11:15 failure is a process-level deadlock beneath pytest, not a flaky assertion.
+
+**Corrected characterisation of the three runs:**
+
+| Run | Duration | Kind |
+|---|---|---|
+| 11:15:01Z | **55.1 min**, hit the cap | **process-level hang below pytest** -- no test reported FAILED |
+| 11:37:13Z | 7.7 min, normal | test failure -- `test_a_fast_handler_is_untouched` |
+| 12:42:51Z | 7.6 min, normal | test failures -- `test_hostile_disposition_header...` and the SQL Server upsert |
+
+**So this row covers two problems, not one**, and they should probably separate: a hang that the
+outer watchdog caught once, and wall-clock-sensitive tests failing under load. The visibility gap
+below is common to both.
+
+**A NOTE ON MY OWN INSTRUMENT, because it produced a wrong number first.** My initial pass computed
+`mean = -62670193.3` minutes. A job still RUNNING has no completion time, and subtracting it yields a
+nonsense duration that then poisons min and mean. **The tell was that the value was absurd rather
+than merely surprising; a subtler skew would have passed.** The numbers above exclude incomplete
+steps and say how many were excluded, so the denominator is visible rather than implied.
+
+**FOURTH ATTEMPT, 13:01:54Z -- I re-queued once deliberately and it failed a FOURTH distinct way.
+Failing job: `sql server (store + connector) 2025`.** The 12:42 attempt failed the **2022** leg of
+the same suite. So the SQL Server failure alternates between OS legs across attempts, which is the
+signature the 641 row already described in its own words: the same test failing *"twice, on TWO
+DIFFERENT OS legs"*. Test-level detail for this run was not retrievable at the time of writing
+(`gh run view --log-failed` returned rc=1 while the run was still finalising), so this entry records
+the **job-level** fact only and does not claim which test failed.
+
+**Running tally: four queue attempts, four different failure profiles, zero merges.**
+
+```
+11:15  windows-2025 pytest HANG, 55.1 min, hit the cap    process-level, below pytest
+11:37  test_a_fast_handler_is_untouched                    wall-clock timing
+12:42  test_hostile_disposition_header... + SQL Server 2022  timing + infra
+13:01  SQL Server 2025                                     infra, the OTHER OS leg
+```
+
+**I re-queued knowing the row says not to, and the row still says not to.** The reason was that a
+queue attempt costs runner time rather than the fleet's token budget, and the queue was empty so it
+blocked nobody. **It did not land, and that is the point: the fourth attempt produced more evidence
+rather than a merge, which is what "do not re-run until it passes" predicts.** One deliberate
+re-queue to test the prediction is not the same act as re-running until a green appears.
+
+**WHAT I CANNOT ATTRIBUTE, stated rather than smoothed over.** The three removals do not map cleanly
+onto the three runs. The first entry was removed at 11:15:32Z, **fifty seconds** after being added and
+long before its own run timed out at roughly 12:10Z -- so that removal was not caused by that run.
+PR #677 merged through the queue in that window, which re-forms the group and is ordinary churn. **So
+the honest claim is three failing `merge_group` runs and three removals, not a one-to-one causal
+chain.** Anyone building on this row should establish the mapping rather than inherit it from here.
+
+**The SQL Server one is already on the record as environmental.** The 641 row of the CI failure log
+(now in the vault) records `test_cipher_invocations_upsert_is_atomic_and_additive` failing as a
+`StoreAcquireTimeout`, diagnoses it as `infra`, and closes with the author retracting their own
+pre-registered discriminator after PRs #644 and #645 landed the same work clean. So this test has a
+written history of failing for reasons unrelated to the PR under it.
+
+**The queue itself is not broken -- positive control.** PR #677 went through the same queue at
+11:15:35Z with `CI`, `CLA Assistant`, `backlog-hygiene`, `CodeQL` and `Security` all green in
+`merge_group`, and merged. Whatever this is, it is not "the queue never merges anything".
+
+**Why the PR gate cannot see it.** `merge_group` runs are a separate event against a separate
+`gh-readonly-queue/...` ref. The PR's own `statusCheckRollup` reports the `pull_request` runs and
+says nothing about them. **A PR can therefore show 15 of 15 required contexts green and still be
+unmergeable, with the reason recorded only in a run list nobody looks at.** Reading it takes
+`gh run list --event=merge_group`.
+
+**At least three separable questions, and they have different owners:**
+
+1. **The timing tests.** `test_a_fast_handler_is_untouched` and
+   `test_hostile_disposition_header_parses_in_linear_time` both assert against wall clock on a shared
+   runner. Whether they should is a real question; a linear-time assertion in particular can be
+   restated as a ratio between two input sizes rather than an absolute bound.
+2. **The SQL Server upsert.** Already characterised in the 641 row; a retry past transient acquire
+   failures was noted there as an open vault PR.
+3. **The visibility gap, which is the durable half.** Nothing surfaces a `merge_group` failure onto
+   the PR. A dequeue looks identical to never having been queued -- and `autoMergeRequest` reads
+   `null` in both states, so the obvious field cannot distinguish them either (Instruments 4.15c).
+
+**Do not close this by re-running the queue until it passes.** That is what happened three times
+already, and it produces a green that means "this attempt got lucky", not "the change is sound".
+
+## 1386. the mail drain's byte cap is below the fleet's broadcast rate, so live seats accumulate backlogs that expire unread
+
+> 🔢 **Filed 2026-08-29 -- OPEN.** `scripts/hooks/mail-drain.ps1` caps one injection at
+> `MAX_MESSAGES = 5` **and** `MAX_TOTAL_BYTES = 8000`. At today's broadcast size the BYTE cap binds
+> first, so a seat clears **3 to 4 messages per turn** while the fleet sends faster than that. The
+> send-side TTL default is `TtlMinutes = 4320` -- **three days** -- so a backlog that outlives it is
+> discarded.
+
+**Cluster:** Coordination / session mail. **Priority:** P2. **Verdict:** build.
+**Severity:** **34 messages have already expired unread across 17 boxes.** This is not a projection;
+it is a count of mail that was sent, never rendered, and is now gone.
+
+**Measured 2026-08-29, 88 boxes walked under an assertion that the walk found more than 10:**
+
+```
+189 unread across 12 LIVE boxes (touched within 2h)
+145 unread across 31 dead boxes
+ 34 EXPIRED unread across 17 boxes    <- already lost
+
+largest live backlogs
+  hungry-wu-6c8ac2       43   the LIAISON -- the owner's channel
+  wonderful-elion-257e1e 36   Builder 1
+  cleaner-51d2b4         34
+  respawn-fleet-008093   27
+  messagefoundry-096b5d29 20
+```
+
+**THE ARITHMETIC IS THE FINDING, and it is why nobody noticed.** Every drain prints
+`box: 3 shown, N deferred (caps)` and says *"Deferred mail stays in the inbox and is shown at the
+next drain -- nothing was discarded."* **That sentence is true per drain and misleading in
+aggregate.** Nothing is discarded *at that moment*; the TTL discards it later. A seat reading its own
+drain footer sees an orderly queue, not a queue growing faster than it drains.
+
+**Today's broadcasts run about 1,900 bytes**, so three of them are 5,700 and a fourth exceeds 8,000.
+That is exactly the `3 shown` every seat has been seeing and reading as normal.
+
+**Why the backlog is arithmetic rather than inattention.** The drain runs only when the receiving
+seat takes a turn, and clears at most ~4. A seat taking one turn every few minutes cannot keep up
+with a fleet broadcasting more often than that, and an IDLE seat drains nothing at all -- which is
+the same property recorded separately as *mail is a mailbox, not a doorbell*.
+
+**The consequence that matters most: the Liaison is the owner's channel and holds the largest
+backlog.** An owner item routed there can sit tens of positions deep, and over a long weekend can
+expire instead of arriving. **Anything time-sensitive should not be assumed delivered because the
+send succeeded.**
+
+**At least four separable fixes, and they are not equivalent:**
+
+1. **Raise or decouple the caps.** The byte cap binding before the message cap is probably
+   unintentional -- a 5-message allowance that only ever delivers 3 is not the stated policy.
+2. **Report the BACKLOG, not just this pass.** The footer should say the inbox depth and the oldest
+   message's age, so a growing queue is visible in the place a seat already looks.
+3. **Warn before expiry** rather than discarding silently. An expired message currently leaves only a
+   file in `expired/`; nothing tells the sender or the receiver it was never read.
+4. **Broadcast discipline.** Six broadcasts about one shell idiom in ninety minutes is itself part of
+   the input rate, and no cap change fixes that.
+
+**Do not close this by draining the current backlog.** The backlog is the symptom; the cap and the
+silent expiry are the defect.
