@@ -377,6 +377,17 @@ jobs:
         if: runner.os == 'Linux'
         run: python scripts/quality/control_char_check.py
 
+      # DELIBERATELY ON `pull_request`, WHICH IS THE ONLY REASON IT CAN CATCH ANYTHING. The defect
+      # it exists to stop lives in workflows that run on `pull_request_target` -- and those execute
+      # the workflow FROM THE DEFAULT BRANCH, so a pull request editing one is tested with the OLD
+      # copy of it. Measured 2026-08-29: PR #621 rewrote cla.yml to call a LOCAL action with no
+      # checkout, its own `cla` check went green three times on the remote action it was deleting,
+      # and on landing it blocked 7 of 21 open pull requests behind a required context whose repair
+      # was itself gated by the broken check. This step runs on the branch's own file.
+      - name: Workflow local-action references resolve
+        if: runner.os == 'Linux'
+        run: python scripts/quality/workflow_local_action_check.py
+
       # BACKLOG #1226. The screen shipped and NOTHING RAN IT, so it read as coverage and produced
       # none -- a username reaching a WHERE clause was found three times by accident and zero times
       # on purpose. --baseline is what makes this step able to FAIL without turning the screen into
