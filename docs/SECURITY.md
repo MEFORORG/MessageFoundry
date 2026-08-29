@@ -808,7 +808,7 @@ bind)** — the **Administrator** role must satisfy MFA before any step-up opera
 `403` + `X-MFA-Required` until verified); other users may opt in by enrolling. A required-but-unenrolled
 admin is never locked out — the enroll/confirm routes sit behind an action-bound **password** step-up,
 not the MFA gate, so the bootstrap admin enrolls then satisfies it. The documented org opt-out is
-`[auth].require_mfa = false`. **AD/Kerberos MFA is delegated to the directory** (Entra Conditional Access
+`[security].require_mfa = false` (the retired `[auth].require_mfa` spelling is refused at load). **AD/Kerberos MFA is delegated to the directory** (Entra Conditional Access
 / an MFA proxy) — a directory login is never prompted for an engine TOTP and is MFA-satisfied at issuance.
 The TOTP secret is stored **encrypted at rest** (the store cipher) and recovery codes are
 **argon2id-hashed**; verification uses the server clock and a constant-time compare over a **configurable
@@ -1375,7 +1375,7 @@ timeout** (default 30 min) and an **absolute lifetime** (default 12 h); changing
 disabling a user, or an **AD-group/role change on re-login** revokes that user's sessions. These two
 defaults align the session controls with **NIST SP 800-63B §7.2** reauthentication at **AAL2** — a
 **12-hour** maximum session length enforced regardless of activity, plus reauthentication after **30
-minutes** of inactivity; raising `[auth].session_absolute_hours` or `[auth].session_idle_timeout_minutes`
+minutes** of inactivity; raising `[security].max_session_hours` or `[security].sign_out_after_idle_minutes`
 beyond those bounds is a **documented risk deviation** from AAL2, not a supported hardening knob, and
 any such increase should be recorded as an accepted risk. Session
 validation **fails closed on a backward wall-clock step** (NTP step-back / VM snapshot revert) rather
