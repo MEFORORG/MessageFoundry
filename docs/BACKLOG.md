@@ -17364,16 +17364,17 @@ gh api repos/MEFORORG/MessageFoundry/branches/main/protection --jq '.required_st
 mapfile -t ctx < <(grep -vE '^\s*(#|$)' .github/required-contexts.txt); echo "${#ctx[@]}"
   -> 13
 
-NOTE ON THAT SECOND COMMAND, because this row is about instruments and it would be poor form
-to leave a copyable one that can lie. A `grep file | grep` chain reports the LAST stage's status,
-so a missing or unreadable file yields ZERO lines and exit 0 from the tail -- read as "the file
-declares 0 contexts", which is indistinguishable from a real empty file. The form above keeps the
-read and the filter in one stage with no pipe. Either way the number below is only trustworthy
-because it is compared against the API, which is the row's entire point
 in API but not in file : CodeQL (javascript-typescript), CodeQL (python)
 in file but not in API : none
 grep -ci codeql tests/negative_controls.toml -> 0
 ```
+
+**A note on that second command, because this row is about instruments and it would be poor
+form to leave a copyable one that can lie.** A `grep file | grep` chain reports the LAST stage's
+status, so a missing or unreadable file yields ZERO lines and a clean exit from the tail -- read as
+*"the file declares 0 contexts"*, which is indistinguishable from a genuinely empty file. The form
+above keeps the read and the filter in one stage with no pipe. **Either way the 13 is trustworthy
+only because it is compared against the API, which is this row's entire point.**
 
 **The count 13 is restated in at least five other places**, each of which is now stale by the same two:
 `docs/adr/0158-...md` twice, and three rows in this file. That is a symptom, not the bug -- do not fix
