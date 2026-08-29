@@ -16577,3 +16577,64 @@ Its open question 2 asks whether `_SECTIONS` should be asserted set-equal and wh
 `partition("_")` split should change. This change answers only the first half, and answers it
 *pragmatically* -- a set difference with reasons -- because set-equality would red on three sections
 that no entry can rescue. **The `partition` half is untouched and still needs a decision.**
+
+## 1384. two required contexts were never mirrored into required-contexts.txt, so they have no negative control and no test can notice
+
+> 🔢 **Filed 2026-08-29 -- OPEN.** Branch protection on `main` enforces **15** contexts.
+> [`.github/required-contexts.txt`](../.github/required-contexts.txt) declares **13**. The two it does
+> not name are `CodeQL (javascript-typescript)` and `CodeQL (python)`. Found while intersecting a PR's
+> `statusCheckRollup` against the live required set to decide what actually blocked six queued PRs.
+
+**Cluster:** CI / required-set claims. **Priority:** P2. **Verdict:** build (small).
+**Severity:** two contexts that BLOCK A MERGE today carry **zero registered negative controls**, and
+the register built to guarantee otherwise cannot see them. The file itself under-reports, which is the
+safe direction -- nobody is relying on a check that is not on -- but the consequence below is not
+cosmetic.
+
+**The doc gap is the small half. This is the real one.**
+[`tests/negative_controls.toml`](../tests/negative_controls.toml) registers, per required context,
+what a planted defect breaks and which pytest nodes must go red without it. Measured: it contains
+**zero** CodeQL entries. #1000's shipped banner states *"All 13 required contexts now carry a
+registered negative control"*, and that sentence was true when written and is now true of 13 of 15.
+
+**Why no test caught it, and the authors were explicit about the precondition.**
+`tests/_workflow_contexts.py::required_contexts()` reads
+[`.github/required-contexts.txt`](../.github/required-contexts.txt) off disk. Its docstring says so
+plainly. `tests/test_negative_controls.py` then reconciles the register against that list, and its own
+docstring states the design honestly:
+
+> `.github/required-contexts.txt` IS READ-ONLY TO THIS FILE. It mirrors the live server, and its own
+> header states the ordering rule -- branch protection first, then the file.
+
+and describes the decay mode it targets as *"a context arriving in branch protection **and being
+mirrored into** `.github/required-contexts.txt`"*. **The guarantee is conditional on a human
+performing the mirror step, and nothing enforces that step.** Step one was done -- CodeQL is enforced.
+Step two was not. Every downstream test then agreed with every other, because they all read the mirror.
+
+**This is ADR 0158 Class 2**, by the ADR's own one-line test -- *if this control were broken, what
+would tell me?* If the mirror is skipped, the thing that would tell me is the register, and the
+register reads the mirror. See
+[ADR 0158](adr/0158-silent-controls-green-signals-that-mean-nothing-and-shape-over-detection.md).
+
+**Measured 2026-08-29:**
+
+```
+gh api repos/MEFORORG/MessageFoundry/branches/main/protection --jq '.required_status_checks.contexts[]'
+  -> 15
+grep -v '^#' .github/required-contexts.txt | grep -v '^$'
+  -> 13
+in API but not in file : CodeQL (javascript-typescript), CodeQL (python)
+in file but not in API : none
+grep -ci codeql tests/negative_controls.toml -> 0
+```
+
+**The count 13 is restated in at least five other places**, each of which is now stale by the same two:
+`docs/adr/0158-...md` twice, and three rows in this file. That is a symptom, not the bug -- do not fix
+it by editing the numbers.
+
+**Open question for whoever takes this, because the obvious fix has a worse failure mode.** A test that
+calls the GitHub API needs a token and fails closed on a network blip, turning a silent gap into a
+flaky required check. Options, at least: a non-blocking scheduled job that opens an issue on drift; an
+opt-in `verify`-style check a seat runs deliberately; or accepting the gap and rewording the register's
+guarantee so it stops implying coverage it cannot confirm. **Adding the two lines and moving on fixes
+today's instance and leaves the instrument exactly as blind.**
