@@ -17363,3 +17363,45 @@ git merge-file  ->  exit 0 | conflict markers 0 | '## 1379.' in the result: 2
 **UNTESTED:** whether a real `git merge` through the merge queue behaves as `git merge-file` does here -- the simulation is a three-way content merge and does not model the queue. Also untested: whether the ADR arm at `:267` has the same shape, though it reads the same way.
 
 **A CANDIDATE FIX, NOT A DESIGN:** walk the branch's own history for renamed headings rather than only `head - base`, or assert that every `## N.` in head whose number is in base is byte-identical to base's row of that number. The second is cheaper and answers the question directly.
+
+## 1388. docs/SECURITY.md cites 9 config keys the loader now refuses, and two of the citations are instructions a reader cannot follow
+
+> 🔢 **FILED 2026-08-29 (builder 2).** ADR 0118 relocated fifteen settings under `[security]`, and
+> `_reject_relocated_keys` now **raises** on the old spellings (`settings.py`, `_RELOCATED_TO_SECURITY`).
+> `docs/SECURITY.md` still cites **9 of those 15 keys on 14 lines**. The lines are not equivalent and
+> the item is the SPLIT, not a find-and-replace.
+
+> **MEASURED, and the classification is the whole item.** Every line read; no regex made the call.
+>
+> | class | count | lines |
+> |---|---|---|
+> | **INSTRUCTION** — a reader following it writes config the loader refuses | **2** | 811, 1378 |
+> | **DESCRIBE** — accurate mechanism, stale spelling | **10** | 21, 35, 42, 806, 856, 886, 1190, 1191, 1204, 1241 |
+> | **ALREADY CORRECT** — names the refusal itself, change nothing | **2** | 186, 1181 |
+>
+> **L811 is the only unambiguous one:** *"The documented org opt-out is `[auth].require_mfa = false`."*
+> That tells a reader the documented way to do a thing, in a spelling that fails at load. **L1378** is
+> second — *"raising `[auth].session_absolute_hours` or `[auth].session_idle_timeout_minutes` beyond
+> those bounds is a documented risk deviation"* names an action on two refused keys.
+
+> **THE TWO ALREADY-CORRECT LINES ARE THE REASON THIS IS NOT A SWEEP.** L186 reads "the old
+> `[diagnostics].audit_all_authz` TOML spelling is **refused at load**"; L1181 gives
+> `[security].sign_out_after_idle_minutes` / `max_session_hours` as "the ADR 0118 homes" and calls the
+> `[auth].*` pair "**the retired aliases**". ***A builder told "fix 14 lines" edits two lines that are
+> already right.***
+
+> **THREE INSTRUMENT FAILURES, RECORDED BECAUSE THEY WILL RECUR IN THIS FILE.** An
+> instruction-vs-description regex called **6** instructions against a true **2** — a 3x over-count.
+> An already-names-refusal regex flagged L1190, L1191 and L1241, all three FALSE: they use
+> "refusing"/"refusal" in an unrelated sense (arms that refuse; an empty list being a refusal). And a
+> key-table regex using `"[a-z_.]+"` for the replacement value **silently dropped `[api].host`**, whose
+> value is `local_access_only / listen_address` — a space and a slash. L42 and L1191 only appeared once
+> that was fixed. ***The miss was invisible; the count simply read 14 keys instead of 15.***
+
+**Cluster:** documentation accuracy / secure-by-default. **Priority:** P3. **Verdict:** build.
+**Severity:** no engine effect, no PHI axis, no deployment axis (sec. 0). A deploying site following
+L811 **would** write a key the loader refuses and get a load failure — loud, not silent, so the
+posture is not weakened. The cost is a documented opt-out that does not work as documented.
+
+---
+
