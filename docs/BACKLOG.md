@@ -17376,12 +17376,12 @@ git merge-file  ->  exit 0 | conflict markers 0 | '## 1379.' in the result: 2
 >
 > ***EXACTLY ONE LINE IN ci.yml MATCHES, AND IT IS THE TOOLING STEP:*** L1122,
 > `run: pytest -q -n 4 --dist loadfile -m tooling --ignore-glob='*messagefoundry-webconsole*' ...`.
-> The engine step (`name: Tests (pytest)`, L747) uses a multi-line `run: |` block, so its pytest line
+> The engine step's run line is L813 and it is WRAPPED: `run: bash scripts/ci/retry-native-crash.sh pytest -q ...`, so it
 > never starts with `run: pytest -q` and is never examined. **The guard binds a step it was not
 > written for, that step happens to carry `--ignore-glob`, and every assertion passes.**
 
 > **NOTHING IS BROKEN TODAY AND THAT IS THE POINT.** The engine step still carries the subtraction
-> (measured: 2 occurrences of `ignore-glob` within L747-L800, against 1 in the tooling step). ***So
+> (verified AT L813 itself, which carries `--ignore-glob='*messagefoundry-webconsole*'`). ***So
 > there is no live double-run. What is missing is the PROTECTION: if someone "simplified" the engine
 > flag back to `--ignore` — the exact regression this file's own docstring says it exists to catch,
 > and which was MEASURED not to prune — the guard would still be green.***
