@@ -17630,3 +17630,61 @@ send succeeded.**
 
 **Do not close this by draining the current backlog.** The backlog is the symptom; the cap and the
 silent expiry are the defect.
+## 1393. four open rows say their work ALREADY SHIPPED and must not be rebuilt, and every dispatch screen passes them as buildable because the verb is REBUILD not BUILD
+
+> 🔢 **FILED 2026-08-29 (builder 2).** Four open rows state plainly that their work is done
+> and must not be built again. ***EVERY DISPATCH SCREEN IN THIS REPO PASSES ALL FOUR AS
+> DISPATCHABLE.*** Cost if one is dispatched: **a whole lane-window spent rebuilding shipped code.**
+
+| row | the sentence in it |
+|---|---|
+| #1107 | "SHIPPED IN `#488` AT `cf38e16a`, AND STILL OPEN ON PURPOSE. **DO NOT REBUILD IT.**" |
+| #1130 | "SHIPPED IN `#488` AT `cf38e16a`, AND STILL OPEN ON PURPOSE. **DO NOT REBUILD IT.**" |
+| #1183 | "SHIPPED IN `#491` AT `083f97fd`, BANNER STILL OPEN. **DO NOT REBUILD IT.**" |
+| #1242 | "**THE CORRECTION IS ALREADY BUILT AND PUSHED. Do not rebuild it.**" |
+
+> ***THE MECHANISM IS ONE WORD. A blocker screen matches a verb list -- `BUILD`, `START`, `DISPATCH`,
+> `IMPLEMENT`, `LAND`. NONE OF THEM MATCHES `REBUILD`.*** So the row reads as carrying no bar. Two
+> independently-written screens were measured against this population on 2026-08-29 and **both missed
+> all four**, which is what makes this a property of the vocabulary rather than of one tool.
+
+> ***THE STRUCTURAL HALF, AND IT IS WHY THE SET GROWS RATHER THAN STAYING AT FOUR: each row is open
+> ONLY because CLOSING it is a judgement the building seat cannot make.*** The build landed; the
+> banner cannot move without an authority the builder does not hold. **So the ledger accumulates
+> done-but-open rows by construction, and nothing prunes them.** Every one is a live trap.
+
+> ***THE MIRROR DEFECT, FOUND IN THE SAME PASS AND EQUALLY INVISIBLE: A BAR THAT HAS ALREADY
+> EXPIRED.*** #1020 contains the string "DO NOT BUILD THE GATE YET" **and also** contains *"THE
+> STANDING 'DO NOT BUILD THE GATE YET' PARK HAS EXPIRED BY ITS OWN TERMS"* and *"**UNCHANGED:** build
+> now"*. **A screen matching the literal string blocks a row that explicitly instructs the reader to
+> build it.**
+
+    REBUILD  a real bar the screen MISSES   -> a lane-window rebuilding shipped work
+    EXPIRED  a dead bar the screen HONOURS  -> the row is lost while reading as handled
+
+> **BOTH DIRECTIONS ARE UNREACHABLE BY ANY VERB LIST.** A screen decides from tokens; both of these
+> turn on whether a sentence is still in force, which only reading the row can answer.
+
+> **WHAT WOULD ACTUALLY HELP, and it is not a bigger verb list.** A screen can be made to *stop
+> claiming to know*: flag `REBUILD`/`RE-DO`/`RE-IMPLEMENT`/`ALREADY SHIPPED`/`ALREADY BUILT` and any
+> "EXPIRED"/"NO LONGER"/"HAS BEEN CLEARED" near a bar as ***MUST BE READ***, never as a verdict.
+> ***A SCREEN THAT PASSES A ROW HAS NOT READ IT, AND THE FIX IS TO MAKE IT SAY SO.***
+
+> **EVIDENCE.** All 115 open rows containing "DO NOT" were read across two passes on 2026-08-29 --
+> the 79 no verb list could classify, then the 36 they could. Full working, per-row verdicts and the
+> five-way taxonomy are anchored at `refs/builder2/dup-hunt-2026-08-29`
+> (`BUILDER2-2026-08-29-DONOT-CLASSIFICATION.md` and `BUILDER2-2026-08-29-DONOT-36-REREAD.md`), read
+> back through the ref against a control phrase. **Ref rather than mail: mail's default TTL is 72
+> hours and the gap to the next working session is 108.**
+
+> ***WHAT THIS ROW DOES NOT CLAIM.*** That the four are the whole population -- they are the four
+> found in rows containing the words "DO NOT", and **a row that says the same thing in other words
+> was never in the search space.** Nor that any of the four is safe to close: closing them is the
+> judgement their own banners say the building seat cannot make.
+
+**Cluster:** Fleet coordination / dispatch. **Priority:** P2. **Verdict:** build (small).
+**Severity:** no engine effect, no PHI axis, no deployment axis (sec. 0). It wastes a lane-window
+per occurrence and silently strands rows whose bar has lapsed.
+
+---
+
