@@ -17363,3 +17363,47 @@ git merge-file  ->  exit 0 | conflict markers 0 | '## 1379.' in the result: 2
 **UNTESTED:** whether a real `git merge` through the merge queue behaves as `git merge-file` does here -- the simulation is a three-way content merge and does not model the queue. Also untested: whether the ADR arm at `:267` has the same shape, though it reads the same way.
 
 **A CANDIDATE FIX, NOT A DESIGN:** walk the branch's own history for renamed headings rather than only `head - base`, or assert that every `## N.` in head whose number is in base is byte-identical to base's row of that number. The second is cheaper and answers the question directly.
+
+## 1389. a REQUIRED CI guard is green while asserting against the wrong step: its locator binds the tooling pytest line, not the engine one it names
+
+> 🔢 **FILED 2026-08-29 (builder 2).** `tests/test_ci_engine_step_excludes_webconsole.py` exists to
+> stop the engine pytest step double-running the ~356 web-console tests that `testpaths` includes
+> (BACKLOG #1027). ***IT PASSES. IT IS A REQUIRED CHECK. AND IT IS NOT LOOKING AT THE ENGINE STEP.***
+
+> **THE MECHANISM, AND IT IS NOT "THE LOCATOR STOPPED MATCHING".** `_engine_step_run_line()` scans
+> `ci.yml` for a line whose stripped form starts `run: pytest -q`, and calls `pytest.fail` if it finds
+> none — **so a stopped match would go RED, loudly.** That is not what happens.
+>
+> ***EXACTLY ONE LINE IN ci.yml MATCHES, AND IT IS THE TOOLING STEP:*** L1122,
+> `run: pytest -q -n 4 --dist loadfile -m tooling --ignore-glob='*messagefoundry-webconsole*' ...`.
+> The engine step (`name: Tests (pytest)`, L747) uses a multi-line `run: |` block, so its pytest line
+> never starts with `run: pytest -q` and is never examined. **The guard binds a step it was not
+> written for, that step happens to carry `--ignore-glob`, and every assertion passes.**
+
+> **NOTHING IS BROKEN TODAY AND THAT IS THE POINT.** The engine step still carries the subtraction
+> (measured: 2 occurrences of `ignore-glob` within L747-L800, against 1 in the tooling step). ***So
+> there is no live double-run. What is missing is the PROTECTION: if someone "simplified" the engine
+> flag back to `--ignore` — the exact regression this file's own docstring says it exists to catch,
+> and which was MEASURED not to prune — the guard would still be green.***
+
+> **THE DOCSTRING STATES THE HAZARD IT NO LONGER COVERS:** *"A future edit 'simplifying' the flag back
+> to `--ignore` would restore the double-run silently, with every check still green, which is the same
+> shape as the defect #1027 fixed."* ***It now describes itself.***
+
+> **THE FIX IS THE LOCATOR, NOT THE ASSERTIONS.** Bind the step by its `name:` / `id:` (`id: tests`)
+> and read the whole `run:` block, rather than pattern-matching a one-line spelling that a formatting
+> change can move. **A test that identifies its subject by a coincidence of layout will re-break the
+> next time the layout changes.**
+
+> **CONTROLS RUN BEFORE FILING:** the three tests pass on main's files (3 passed); `run: pytest -q`
+> occurs exactly once in `ci.yml`; that occurrence is `-m tooling`; `name: Tests (pytest)` occurs once
+> at L747. Absence probes on origin/main's live and closed ledgers: `test_ci_engine_step` 0 hits,
+> `excludes_webconsole` 0 hits — **this defect had no row.**
+
+**Cluster:** CI reliability / dead controls. **Priority:** P2. **Verdict:** build (small).
+**Severity:** no engine effect, no PHI axis, no deployment axis (sec. 0). Nothing is mis-running now.
+The cost is a REQUIRED check whose green is uninformative about the thing it names — and a required
+check is exactly where an uninformative green is most expensive, because it is the one nobody re-reads.
+
+---
+
