@@ -17795,9 +17795,37 @@ against a ledger that has work in it, and it does so by discarding the best-writ
 > ***WHAT THIS DOES NOT CLAIM.*** Not that anything has actually bypassed a gate this way -- nobody
 > looked, and the finding is the reachability, not an incident. Not that CI is equally blind: the
 > repo's required CI checks run against the PR head and are a real second line, **which is why this is
-> a P2 and not a P1** -- but `bandit`, the leak guard and the SPDX check are pre-commit-only as far as
-> this measurement went, **and confirming which of the eleven have a CI twin is the first task of
-> whoever takes this row.**
+> a P2 and not a P1.**
+
+> ***AMENDED SAME DAY -- THE CI-TWIN QUESTION THIS ROW LEFT OPEN IS NOW MEASURED, AND IT CORRECTED
+> THIS ROW TWICE.*** The original text said *"`bandit`, the leak guard and the SPDX check are
+> pre-commit-only as far as this measurement went"*. ***THAT WAS WRONG. ALL ELEVEN GATES HAVE A CI
+> MIRROR***, including those three -- `bandit -r . --skip ...` in `security.yml`,
+> `scan_forbidden.py --path .` in `security.yml` and `branch-leak-scan.yml`, and
+> `licence_header_check.py` at `ci.yml:360`.
+
+> ***AND THE SECOND CORRECTION IS THE ONE THAT MATTERS: "CI IS A REAL SECOND LINE" HOLDS FOR TEN OF
+> ELEVEN, NOT ALL ELEVEN.*** `scripts/hooks/ledger_check.py` guards its ownership check as
+> `elif not self.ci and not self.owns(...)` at **both** `:296` (ADR) and `:385` (BACKLOG), and CI
+> invokes it as `ledger_check.py --ci`. **So CI never checks allocation ownership.** The
+> duplicate-number half still runs in CI; only ownership is skipped, **and that is unavoidable rather
+> than an oversight -- the allocation registry lives in `.git/mefor-coord/` and never reaches a
+> runner.**
+
+> ***PUT THAT TOGETHER WITH THIS ROW'S OWN FINDING AND THE OWNERSHIP CHECK HAS NO ENFORCEMENT PATH AT
+> ALL ON A REPLAYED COMMIT. Not a weakened one -- none. The hook is skipped by the rebase, and CI is
+> told to skip it too.*** **The P2 still stands** -- a duplicate number IS caught by CI, and ownership
+> is a coordination aid rather than a security control -- but the row must not imply blanket coverage.
+
+> **PARITY BETWEEN HOOK AND CI IS ITSELF ENFORCED FOR ONLY 3 OF THE 11**, by
+> `tests/test_lint_scope_parity.py` (14 tests): `ruff-format`, `ruff-check` and `bandit`. **The other
+> eight mirrors are hand-maintained with nothing comparing them** -- all eight MATCH today, checked
+> individually rather than assumed. ***A PARITY TEST FOR THOSE EIGHT IS THE DURABLE FIX AND IS NOT
+> BUILT.***
+
+> **Full working, per-gate, is anchored at `refs/builder2/dup-hunt-2026-08-29`
+> (`BUILDER2-2026-08-29-CI-TWIN-CENSUS.md`), including the census's own correction: it first claimed
+> nothing checks the mirrors, which the parity test disproves for three of them.**
 
 > **CANDIDATE FIXES, none verified here.** A `pre-merge-commit` and `post-rewrite` hook pair; or a
 > CI-side re-run of the same `pre-commit` config over the PR's full diff (`pre-commit run --from-ref
