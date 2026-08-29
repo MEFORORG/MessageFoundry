@@ -287,3 +287,82 @@ def test_a_crafted_path_cannot_forge_extra_log_records(primary: Path, repos_file
     lines = [ln for ln in log.read_text(encoding="utf-8").splitlines() if ln.strip()]
     assert len(lines) == 1, f"one deny must write exactly one record, got {len(lines)}: {lines}"
     assert lines[0].startswith("2"), "the record must still begin with its timestamp"
+
+
+# ------------------------------------------------- cd composes with a RELATIVE -C (BACKLOG #1085)
+#
+# A GIT VERB, NOT A CONFIG-DISARM WRITE, AND THE CHOICE IS MEASURED. Both reach the same resolver, but in
+# this module's fixtures the `primary` directory is never created, and a disarm-key payload ALLOWS against
+# a path that is not a repository while a verb DENIES on path governance alone:
+#
+#     git -C . checkout main                     -> DENY
+#     git -C . checkout main                    -> ALLOW      <- proves nothing about resolution
+#     git checkout main                          -> DENY
+#
+# The first draft of these tests used the disarm payload and three of them failed. They failed IDENTICALLY
+# against the UNFIXED gate, which is what showed the fault was in the test and not in the fix -- an
+# expectation the fixtures could never satisfy, not a regression.
+_WRITE = "checkout main"
+
+
+def test_a_relative_dash_C_composes_with_a_preceding_cd(
+    tmp_path: Path, primary: Path, repos_file: Path
+) -> None:
+    """BACKLOG #1085, and it is the exact mirror of #1061: the gate resolved against the wrong base and
+    DENIED, where #1061 resolved against the wrong base and ALLOWED.
+
+    ``Get-GitTargetCandidatesRaw`` preferred ``-C`` and DISCARDED the ``cd`` prefix. A real shell resolves
+    a RELATIVE ``-C`` against the post-``cd`` directory, so from a governed primary
+
+        cd ../Unrelated && git -C . checkout main
+
+    denied and NAMED THE PRIMARY, while the write landed in the ungoverned ``../Unrelated``. A deny that
+    names a repository the command does not touch actively misinforms the session reading it, and its only
+    workaround is a human overriding a message that is wrong.
+    """
+    (tmp_path / "Unrelated").mkdir(parents=True, exist_ok=True)
+    verdict = run_gate(shell(f"cd ../Unrelated && git -C . {_WRITE}", cwd=primary), repos_file)
+    assert verdict is None, (
+        "the gate denied a write aimed at an UNGOVERNED repo. `-C .` resolves against the cd'd "
+        f"directory, not the session cwd, so this command never touches {primary}. Verdict: {verdict!r}"
+    )
+
+
+def test_an_absolute_dash_C_still_ignores_a_preceding_cd(
+    tmp_path: Path, primary: Path, repos_file: Path
+) -> None:
+    """THE NEGATIVE CONTROL FOR THE COMPOSITION ABOVE, and the reason it is a GUARDED join.
+
+    An absolute ``-C`` genuinely ignores the base. Composing it would be worse than merely wrong: joining
+    a governed absolute ``-C`` onto some other ``cd`` would point the gate away from the repository the
+    command really writes to, turning a correct DENY into a FAIL-OPEN. The join is guarded on
+    ``IsPathRooted`` for this case specifically.
+
+    ``test_a_dash_C_beats_a_preceding_cd`` above covers the same rule -- but every case it drives uses an
+    ABSOLUTE ``-C``, so its name and its "never" claim are broader than its evidence. This is the case
+    that would actually notice if the guard were dropped.
+    """
+    assert_denied(
+        run_gate(shell(f'cd {tmp_path} && git -C "{primary}" {_WRITE}', cwd=tmp_path), repos_file)
+    )
+
+
+def test_a_relative_dash_C_with_no_cd_still_resolves_against_the_session_cwd(
+    primary: Path, repos_file: Path
+) -> None:
+    """The un-prefixed case must be untouched. With no ``cd``, ``-C .`` IS the session cwd -- so from a
+    governed primary this is a real write to a governed repo and must still deny. Had the fix made
+    composition unconditional, or defaulted the base to anything but the cwd, this would have silently
+    stopped denying: a fail-open produced by a fix for a false deny."""
+    assert_denied(run_gate(shell(f"git -C . {_WRITE}", cwd=primary), repos_file))
+
+
+def test_a_cd_inside_a_subshell_does_not_compose(primary: Path, repos_file: Path) -> None:
+    """The three bail-outs (``popd``, ``cd -``, and a ``(``/``{`` subshell) guard BOTH branches after
+    #1085, not just the else. A subshell's ``cd`` does not change the parent's directory, so composing it
+    would move the gate's attention off the repository the command actually writes to. When a bail-out
+    fires the behaviour is byte-identical to before the fix, which is why this asserts the ORIGINAL
+    verdict rather than a new one."""
+    assert_denied(
+        run_gate(shell(f"( cd ../Elsewhere ) && git -C . {_WRITE}", cwd=primary), repos_file)
+    )

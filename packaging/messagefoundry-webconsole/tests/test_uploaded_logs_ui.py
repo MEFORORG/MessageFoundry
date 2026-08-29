@@ -272,7 +272,7 @@ async def test_uploaded_logs_ui_resend_is_owner_scoped(engine: Engine, tmp_path:
         # and the SUCCESS response is a bare 303 carrying no outcome flag.
         mine = await c.post(
             f"/ui/uploaded-logs/file/{fid}/resend",
-            data={"index": "0", "to": "in1"},
+            params={"index": "0", "to": "in1"},
             follow_redirects=False,
         )
         assert mine.status_code == 303, mine.text
@@ -282,7 +282,7 @@ async def test_uploaded_logs_ui_resend_is_owner_scoped(engine: Engine, tmp_path:
         await _login(c2, "op2")
         denied = await c2.post(
             f"/ui/uploaded-logs/file/{fid}/resend",
-            data={"index": "0", "to": "in1"},
+            params={"index": "0", "to": "in1"},
             follow_redirects=False,
         )
         # In the HTML plane — never a JSON error body.
@@ -356,7 +356,7 @@ async def test_failed_resend_is_not_shaped_like_a_successful_one(
         # above. What this asserts is that the failure is NOT that shape.
         failed = await c.post(
             f"/ui/uploaded-logs/file/{fid}/resend",
-            data={"index": "0", "to": bogus},
+            params={"index": "0", "to": bogus},
             follow_redirects=False,
         )
         assert failed.status_code == 303, failed.text
@@ -380,18 +380,19 @@ async def test_failed_resend_is_not_shaped_like_a_successful_one(
         assert bare.status_code == 200 and "did not run" not in bare.text
 
 
-async def test_refused_resend_signal_survives_a_stale_step_up_window(
-    engine: Engine, tmp_path: Path
-) -> None:
+async def test_refused_resend_signal_is_legible_on_arrival(engine: Engine, tmp_path: Path) -> None:
     # The flag used to be aimed at the browse DETAIL page, which is step-up-gated AND registered as an
     # unlock action. Once the step-up window goes stale that page 303s to /ui/reauth, which deliberately
     # does not carry the query string back (the browse filter is a GET query that can hold PHI-shaped
     # search terms) — so the flag was dropped and the operator landed on a plain detail page, the exact
-    # shape a SUCCESSFUL resend produces. The refusal now reports on the ungated list page instead.
+    # shape a SUCCESSFUL resend produces. The refusal reports on the ungated list page instead.
     #
-    # step_up_max_age_seconds=-1 is the console suite's idiom for a window that is stale on arrival
-    # (test_webui.py test_stale_stepup_bounces_body_less_action_via_reauth and friends).
-    service = await _service(engine, ("op", Role.OPERATOR), step_up_max_age=-1)
+    # THE WINDOW IS FRESH HERE, and that is the honest premise since BACKLOG #1227: the resend POST is
+    # now step-up-gated itself, so a STALE window can no longer reach the refusal path at all — it is
+    # refused ahead of the handler. The property this test owns is unchanged and is about the TARGET,
+    # not the window: wherever a refusal sends the operator, it must be legible when they land.
+    # The stale-window half moved to test_a_stale_window_strips_a_flag_aimed_at_the_detail_page.
+    service = await _service(engine, ("op", Role.OPERATOR))
     transport = httpx.ASGITransport(app=_app(engine, service, tmp_path))
     async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
         await _login(c, "op")
@@ -404,7 +405,7 @@ async def test_refused_resend_signal_survives_a_stale_step_up_window(
         # Nothing was injected, so a second identical POST is safe.
         chased = await c.post(
             f"/ui/uploaded-logs/file/{fid}/resend",
-            data={"index": "0", "to": "IB_NOPEZQX"},
+            params={"index": "0", "to": "IB_NOPEZQX"},
             follow_redirects=True,
         )
         assert chased.status_code == 200, chased.text
@@ -413,7 +414,7 @@ async def test_refused_resend_signal_survives_a_stale_step_up_window(
         # ...and THE CHOICE that makes it hold: an ungated target, so no re-auth bounce intervenes.
         refused = await c.post(
             f"/ui/uploaded-logs/file/{fid}/resend",
-            data={"index": "0", "to": "IB_NOPEZQX"},
+            params={"index": "0", "to": "IB_NOPEZQX"},
             follow_redirects=False,
         )
         assert refused.status_code == 303, refused.text
@@ -421,8 +422,25 @@ async def test_refused_resend_signal_survives_a_stale_step_up_window(
         landed = await c.get(refused.headers["location"], follow_redirects=False)
         assert landed.status_code == 200, landed.headers.get("location", landed.text)
 
-        # Positive control for the premise: the window really IS stale, and the OLD target really does
-        # lose the flag. The detail page bounces to /ui/reauth and the query string does not survive.
+
+async def test_a_stale_window_strips_a_flag_aimed_at_the_detail_page(
+    engine: Engine, tmp_path: Path
+) -> None:
+    # The standing justification for _FAILED_TARGET pointing at the LIST page rather than the detail
+    # page, split out of the test above when BACKLOG #1227 gated the resend POST. It asserts a
+    # property of the DETAIL page, which is unaffected by that change, so it keeps the stale window.
+    #
+    # step_up_max_age_seconds=-1 is the console suite's idiom for a window that is stale on arrival
+    # (test_webui.py test_stale_stepup_bounces_body_less_action_via_reauth and friends).
+    service = await _service(engine, ("op", Role.OPERATOR), step_up_max_age=-1)
+    transport = httpx.ASGITransport(app=_app(engine, service, tmp_path))
+    async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
+        await _login(c, "op")
+        fid = await _upload(c)
+
+        # The window really IS stale, and the OLD target really does lose the flag. The detail page
+        # bounces to /ui/reauth and the query string does not survive — which is why a refusal aimed
+        # there would be indistinguishable from a success.
         stale = await c.get(f"/ui/uploaded-logs/file/{fid}?e=resend_failed", follow_redirects=False)
         assert stale.status_code == 303, stale.text
         assert stale.headers["location"] == f"/ui/reauth?next=/ui/uploaded-logs/file/{fid}"
@@ -472,7 +490,7 @@ async def test_resend_refusal_names_a_distinct_cause_per_status(
         fid = await _upload(c)
         stopped = await c.post(
             f"/ui/uploaded-logs/file/{fid}/resend",
-            data={"index": "0", "to": "in1"},
+            params={"index": "0", "to": "in1"},
             follow_redirects=False,
         )
         assert stopped.status_code == 303, stopped.text
@@ -487,7 +505,7 @@ async def test_resend_refusal_names_a_distinct_cause_per_status(
         own = await _upload(sc, "scoped.hl7")  # its own file, so ONLY the target is wrong
         denied = await sc.post(
             f"/ui/uploaded-logs/file/{own}/resend",
-            data={"index": "0", "to": "in1"},
+            params={"index": "0", "to": "in1"},
             follow_redirects=False,
         )
         assert denied.status_code == 303, denied.text
@@ -559,7 +577,7 @@ async def test_refusals_are_recorded_server_side(
                 await _login(c, "op")
                 r = await c.post(
                     f"/ui/uploaded-logs/file/{fid}/resend",
-                    data={"index": "0", "to": bogus},
+                    params={"index": "0", "to": bogus},
                     follow_redirects=False,
                 )
                 assert r.status_code == 303
@@ -569,7 +587,7 @@ async def test_refusals_are_recorded_server_side(
                 # second log line.
                 forged = await c.post(
                     f"/ui/uploaded-logs/file/{'0' * 32}%0AWARNING-forged-line/resend",
-                    data={"index": "0", "to": bogus},
+                    params={"index": "0", "to": bogus},
                     follow_redirects=False,
                 )
                 assert forged.status_code == 303
@@ -703,3 +721,125 @@ async def test_browse_filter_refuses_an_over_long_criterion_instead_of_listing_e
         assert 'value="ADT^A01"' in r.text, "a valid criterion was discarded with the invalid one"
         # And the needle never reached the URL even on the refusal path.
         assert "M" * 600 not in str(r.request.url)
+
+
+async def test_a_stale_step_up_window_injects_nothing(engine: Engine, tmp_path: Path) -> None:
+    """BACKLOG #1227 -- the console resend POST must be refused when the step-up window is stale.
+
+    The console invokes the engine handler BY REFERENCE across the CoreHandlers seam, so the engine's
+    own ``require_step_up`` Depends never runs; the gate has to be re-asserted on the /ui route. The
+    proof obligation is the item's own: a test that only checks a FRESH operator can resend passes on
+    the defective code, so the assertion that matters is that nothing was injected -- read from the
+    STORE, not from the redirect. A 303 to /ui/reauth proves where the browser was sent; only the
+    store proves the message never landed."""
+    # A REGISTERED, RUNNING, owned inbound, exactly as test_uploaded_logs_ui_resend_is_owner_scoped
+    # builds one. Load-bearing rather than scenery: the engine handler 404s an unknown target and
+    # 409s a stopped one BEFORE any gate, so against an unregistered target the store would read zero
+    # for a reason that has nothing to do with the step-up and the test would prove nothing.
+    for d in ("in", "o1"):
+        (tmp_path / d).mkdir(exist_ok=True)
+    reg = Registry()
+    reg.add_inbound(
+        InboundConnection(
+            "in1",
+            ConnectionSpec(
+                ConnectorType.FILE,
+                {"directory": str(tmp_path / "in"), "pattern": "*.hl7", "poll_seconds": 0.05},
+            ),
+            router="r",
+        )
+    )
+    reg.add_outbound(
+        OutboundConnection(
+            "OB1", ConnectionSpec(ConnectorType.FILE, {"directory": str(tmp_path / "o1")})
+        )
+    )
+    reg.add_router("r", lambda m: ["h"])
+    reg.add_handler("h", lambda m: Send("OB1", m))
+    engine.add_registry(reg)
+    await engine.start()
+
+    service = await _service(engine, ("op", Role.OPERATOR), step_up_max_age=-1)
+    transport = httpx.ASGITransport(app=_app(engine, service, tmp_path))
+    async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
+        await _login(c, "op")
+        await c.post(
+            "/ui/uploaded-logs/upload",
+            files={"file": ("acme.hl7", BATCH, "application/octet-stream")},
+        )
+        listing = await c.get("/ui/uploaded-logs")
+        marker = "/ui/uploaded-logs/file/"
+        fid = listing.text.split(marker, 1)[1].split('"', 1)[0].split("/")[0]
+
+        # PREMISE, asserted rather than assumed: the window really IS stale in THIS session. The
+        # browse GET is a route already known to be step-up-gated, so if it does not bounce, the
+        # zeros below would be measuring a dead fixture instead of the gate.
+        browse = await c.get(f"/ui/uploaded-logs/file/{fid}", follow_redirects=False)
+        assert browse.status_code == 303, browse.text
+        assert browse.headers["location"] == f"/ui/reauth?next=/ui/uploaded-logs/file/{fid}"
+
+        blocked = await c.post(
+            f"/ui/uploaded-logs/file/{fid}/resend?index=0&to=in1", follow_redirects=False
+        )
+        assert blocked.status_code == 303, blocked.text
+        location = blocked.headers["location"]
+        assert location.startswith("/ui/reauth?next="), location
+        # The continuation must point at the CONFIRM page carrying both parameters, not at the POST
+        # path -- a body-less POST is re-issuable, but only if the re-auth knows where to send it.
+        assert "resend-confirm" in location, location
+        # ...and it must not be the SUCCESS shape, which is a bare 303 to the detail page. Answering
+        # a refusal with the success response tells the operator a message was injected.
+        assert location != f"/ui/uploaded-logs/file/{fid}"
+
+        # THE ASSERTION THE ITEM ACTUALLY ASKS FOR. These are the two direct products of the handler
+        # this route reaches -- the ingress enqueue and the audit row -- so a zero on both is the
+        # only evidence that the refusal happened BEFORE the injection rather than after it.
+        assert await engine.store.count_messages(channel_id="in1") == 0
+        assert list(await engine.store.list_audit(action="upload.resend", limit=200)) == []
+
+    # POSITIVE CONTROL, same store, same inbound, same POST -- a FRESH window. Without this the two
+    # zeros above are indistinguishable from instruments that cannot see an injection at all.
+    fresh = await _service(engine, ("fresh", Role.OPERATOR))
+    transport2 = httpx.ASGITransport(app=_app(engine, fresh, tmp_path))
+    async with httpx.AsyncClient(transport=transport2, base_url="http://t") as c2:
+        await _login(c2, "fresh")
+        await c2.post(
+            "/ui/uploaded-logs/upload",
+            files={"file": ("fresh.hl7", BATCH, "application/octet-stream")},
+        )
+        listing2 = await c2.get("/ui/uploaded-logs")
+        own = listing2.text.split(marker, 1)[1].split('"', 1)[0].split("/")[0]
+        allowed = await c2.post(
+            f"/ui/uploaded-logs/file/{own}/resend?index=0&to=in1", follow_redirects=False
+        )
+        assert allowed.status_code == 303, allowed.text
+        assert allowed.headers["location"] == f"/ui/uploaded-logs/file/{own}"
+        assert await engine.store.count_messages(channel_id="in1") == 1
+        assert len(await engine.store.list_audit(action="upload.resend", limit=200)) == 1
+
+
+async def test_resend_confirm_does_not_reflect_hostile_markup(
+    engine: Engine, tmp_path: Path
+) -> None:
+    """The confirm page is the FIRST place ``to`` is rendered back to the operator (BACKLOG #1227).
+
+    ``to`` is an operator-authored connection name and ``Registry._add`` checks only for a duplicate,
+    so it is unconstrained free text arriving from the query. The route module already names this
+    reflection as the thing to avoid for the refusal path; the confirm page is the same sink."""
+    service = await _service(engine, ("op", Role.OPERATOR))
+    transport = httpx.ASGITransport(app=_app(engine, service, tmp_path))
+    async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
+        await _login(c, "op")
+        fid = await _upload(c)
+        hostile = "<script>alert(1)</script>"
+        r = await c.get(
+            f"/ui/uploaded-logs/file/{fid}/resend-confirm",
+            params={"index": "0", "to": hostile},
+            follow_redirects=False,
+        )
+        assert r.status_code == 200, r.text
+        # The raw tag never appears; the escaped form does, which proves the value REACHED the page
+        # rather than being dropped somewhere upstream — a page that rendered nothing would also
+        # satisfy a bare "not in" assertion.
+        assert hostile not in r.text
+        assert "&lt;script&gt;" in r.text

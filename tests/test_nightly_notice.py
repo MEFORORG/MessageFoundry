@@ -10,7 +10,7 @@ because those legs do not run on PRs at all. So the server-DB store, load/throug
 suites (exactly what the three required ``test`` legs SKIP) could break invisibly.
 
 ``.github/workflows/nightly-notice.yml`` turns that silence into one deduplicated issue. This module
-pins the three ways it could quietly stop working.
+pins the structural ways it could quietly stop working -- at least the ones checkable before it ships.
 
 WHAT CANNOT BE TESTED HERE, stated rather than papered over. A ``workflow_run`` workflow only triggers
 from the **default branch**, so this one cannot fire on the PR that adds it — its end-to-end behaviour
@@ -67,6 +67,79 @@ def test_it_also_watches_the_security_workflow() -> None:
     assert sec_name in watched, (
         f"nightly-notice.yml watches {watched} but security.yml is named {sec_name!r}. Its "
         "schedule-only jobs — released-line-audit above all — would then fail into silence."
+    )
+
+
+def test_it_also_watches_the_dast_workflow() -> None:
+    """DAST needs this more than either of the others (BACKLOG #318).
+
+    ``dast.yml`` has NO ``pull_request`` trigger at all -- deliberately -- so before this widening a
+    genuine authorization finding surfaced in the Actions tab and nowhere else. An authenticated
+    security sweep reporting into the void is the exact shape this notice exists to end.
+    """
+    watched = _on(_load(_NOTICE))["workflow_run"]["workflows"]
+    dast_name = _load(_WORKFLOWS / "dast.yml").get("name")
+    assert dast_name, "dast.yml has no `name:` -- workflow_run has nothing to key on"
+    assert dast_name in watched, (
+        f"nightly-notice.yml watches {watched} but dast.yml is named {dast_name!r}. Its findings "
+        "would then reach nobody, which is the gap BACKLOG #318 recorded."
+    )
+
+
+def test_every_watched_workflow_exists_and_can_actually_fire() -> None:
+    """A watched name that no workflow answers to, or that has no cron, is dead config reading as
+    coverage.
+
+    The notice job gates on ``workflow_run.event == 'schedule'``, so a watched workflow with no
+    ``schedule:`` trigger can never satisfy it -- the name sits in the list looking like protection
+    and matches nothing, forever, silently. That is the same failure the notice exists to fix, one
+    level up, so it is asserted for EVERY watched name rather than per workflow.
+    """
+    watched = _on(_load(_NOTICE))["workflow_run"]["workflows"]
+    assert watched, "the watch list is empty"
+
+    by_name: dict[str, Path] = {}
+    for path in sorted(_WORKFLOWS.glob("*.yml")):
+        name = _load(path).get("name")
+        if isinstance(name, str):
+            by_name.setdefault(name, path)
+    # Positive control: the scan must actually be reading workflows, or every assertion below would
+    # be vacuous against an empty map.
+    assert len(by_name) > 5, f"the workflow scan found only {len(by_name)} named files"
+
+    for name in watched:
+        path = by_name.get(name)
+        assert path is not None, (
+            f"nightly-notice.yml watches {name!r} but no workflow in {_WORKFLOWS.name}/ is named that. "
+            f"A workflow_run trigger matches on the NAME, so this entry can never fire. "
+            f"Names present: {sorted(by_name)}"
+        )
+        triggers = _on(_load(path))
+        assert "schedule" in triggers, (
+            f"nightly-notice.yml watches {name!r} ({path.name}) but that workflow has no `schedule:` "
+            "trigger. The notice job only fires when the completed run's event was `schedule`, so "
+            "this entry can never match -- dead config that reads as coverage."
+        )
+
+
+def test_the_issue_body_names_the_workflow_that_failed() -> None:
+    """The TITLE was always derived from the completed workflow; the BODY was not.
+
+    It opened with a hardcoded "CI failed" whatever had run, so a red Security run produced an issue
+    whose first line named the wrong workflow. Harmless-looking, and exactly the kind of thing a
+    reader uses to decide what broke. Widening the watch list to a third workflow made it worse
+    rather than introducing it.
+    """
+    body = "\n".join(
+        str(s.get("run", "")) for s in _load(_NOTICE)["jobs"]["notice"]["steps"] if "run" in s
+    )
+    assert body, "the notice job has no `run:` step to inspect"
+    assert "Nightly (scheduled) $WF_NAME failed." in body, (
+        "the issue body does not name the workflow that actually failed. It must read from $WF_NAME, "
+        "the same value the title is derived from, or it will assert the wrong workflow broke."
+    )
+    assert "Nightly (scheduled) CI failed." not in body, (
+        "the body still hardcodes CI, so a Security or DAST failure opens an issue naming CI."
     )
 
 

@@ -48,6 +48,8 @@ from typing import Any
 
 import pytest
 
+from tests._dead_pid import never_live_pid
+
 SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "worktree" / "prune-merged.ps1"
 
 # TWO marks, and the timeout one is load-bearing on CI. Every subprocess wait in this file outlives
@@ -761,7 +763,7 @@ def test_a_record_with_no_cwd_is_unplaceable_and_refuses_too(fx: Fixture, sleepe
 
 def test_dead_record_is_not_a_veto_and_not_a_permission(fx: Fixture, sleeper: int) -> None:
     """Liveness may only VETO. A DEAD verdict must not authorise the removal by itself."""
-    dead = _find_free_pid()
+    dead = never_live_pid()
     fx.write_session(pid=dead, cwd=fx.sibling("clean"), session_id="eeeeeeee-5555")
     live_record(fx, sleeper, fx.primary)  # keeps the fence available
 
@@ -1633,15 +1635,6 @@ def test_a_name_that_matches_nothing_does_not_exit_green(fx: Fixture, sleeper: i
     assert (
         "matched no PRUNABLE sibling" in run_text(fx, "-Apply", "-Name", "no-such-worktree").stdout
     )
-
-
-def _find_free_pid() -> int:
-    proc = subprocess.Popen(
-        ["cmd", "/c", "exit"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
-    )
-    proc.wait(timeout=30)
-    time.sleep(0.3)
-    return proc.pid
 
 
 # --------------------------------------------------------------------------------------------------

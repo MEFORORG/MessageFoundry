@@ -1443,7 +1443,10 @@ def test_phi_behind_a_declared_terminator_refuses_without_public_origin_console_
     _posture_probe_toml(tmp_path, public_origin=None, serve_ui=False)
     assert _run_posture_b(tmp_path, monkeypatch, env="prod") == 2
     err = capsys.readouterr().err
-    assert "public_origin" in err
+    # The remediation names the OPERATOR-FACING key, not the internal field. It used to say
+    # `[api].public_origin`, which ADR 0118 relocated and the loader REJECTS -- see the pinning
+    # test below (BACKLOG #1026).
+    assert "web_console_public_address" in err
     assert "12.1.1" in err, "the refusal must name the control it protects, not just the setting"
 
 
@@ -1454,7 +1457,7 @@ def test_the_refusal_does_not_depend_on_the_console(
     property of the POSTURE rather than of an unrelated console setting."""
     _posture_probe_toml(tmp_path, public_origin=None, serve_ui=True)
     assert _run_posture_b(tmp_path, monkeypatch, env="prod") == 2
-    assert "public_origin" in capsys.readouterr().err
+    assert "web_console_public_address" in capsys.readouterr().err
 
 
 def test_a_non_phi_instance_is_not_refused(
@@ -1466,3 +1469,40 @@ def test_a_non_phi_instance_is_not_refused(
     _posture_probe_toml(tmp_path, public_origin=None, serve_ui=False, synthetic=True)
     rc = _run_posture_b(tmp_path, monkeypatch, env="prod")
     assert rc != 2 or "public_origin" not in capsys.readouterr().err
+
+
+def test_the_refusal_names_a_key_the_loader_actually_accepts() -> None:
+    """BACKLOG #1026: the refusal handed the operator a remediation that fails at load.
+
+    `[api].public_origin` is the INTERNAL field this code reads. ADR 0118 relocated the
+    operator-facing key to `[security].web_console_public_address` and REJECTS the old spelling as
+    file or env input, so an operator who did what the refusal said got "unrecognized config key(s)"
+    on the next start. A hard refusal naming an unusable fix is worse than one naming none: it costs
+    a restart cycle to discover and it reads as authoritative, because it comes from the gate itself.
+
+    PINNED AGAINST THE RELOCATION MAP RATHER THAN AGAINST A STRING LITERAL. Asserting the message
+    contains some remembered spelling would pass just as well after a future relocation moved the key
+    again -- the two would drift apart silently, which is the defect this test exists to stop. So the
+    expected key is READ FROM `_RELOCATED_TO_SECURITY`, and a relocation that is not mirrored in the
+    message reds here.
+    """
+    from messagefoundry.config.settings import _RELOCATED_TO_SECURITY
+
+    expected = _RELOCATED_TO_SECURITY[("api", "public_origin")]
+    src = (Path(__file__).resolve().parents[1] / "messagefoundry" / "__main__.py").read_text(
+        encoding="utf-8"
+    )
+    # The 12.1.1 refusal block, located by the control it names rather than by a line number.
+    marker = "the ASVS 12.1.1 TLS-floor "
+    assert marker in src, "the 12.1.1 refusal moved; re-anchor this test on the control it names"
+    start = src.index(marker)
+    block = src[max(0, start - 600) : start + 600]
+    assert expected in block, (
+        f"the ASVS 12.1.1 refusal does not name {expected!r}, the key the loader accepts. "
+        "_RELOCATED_TO_SECURITY says that is where [api].public_origin moved, so a message naming "
+        "the old spelling tells an operator to write a key that is REFUSED at load."
+    )
+    assert "[api].public_origin" not in block, (
+        "the refusal still names the relocated spelling, which the loader rejects as file or env "
+        "input. Name the [security] key instead."
+    )

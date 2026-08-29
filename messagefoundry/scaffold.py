@@ -338,7 +338,9 @@ hardening steps (recommended for any PHI-handling adopter):
 ## Environments & posture
 The active environment is **required** and **free-form** — name instances `dev`/`staging`/`test`/`prod`/`poc`/…
 Built-in names `dev`/`staging`/`prod` carry a default security posture; a **custom** name must set
-`[ai].data_class` (`synthetic`|`phi`) and `[ai].production` in `messagefoundry.toml`. One reviewed config
+`[security].handles_real_patient_data` (does this instance carry REAL PHI?) and
+`[security].production_instance` in `messagefoundry.toml` -- the `[ai]` spellings these replaced are
+REFUSED by the loader (ADR 0118), as the generated config file itself says. One reviewed config
 commit is deployed to every instance; each instance picks its environment at runtime (`--env` or
 `[ai].environment`), so a Test instance never resolves Prod values.
 

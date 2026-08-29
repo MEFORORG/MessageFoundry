@@ -685,11 +685,17 @@ five WIN2025 repetitions, `aad_bind` in ADR 0019 vs `settings.py`, the `SECURITY
 
 Two scoping notes on B6, both about not manufacturing false drift:
 
-- A `BACKLOG` citation is drift **only at or below the published #231 baseline**. `docs/BACKLOG.md` in
-  this repo is a *published baseline* that stops at `## 231.` and says so itself
-  (`docs/BACKLOG.md:6041`); numbers **above** it are valid evidence from the fuller ledger, not dangling
-  references. A drift-pinning test must therefore bound its check at #231, or it will fail on sound
-  citations.
+- **THE #231 BOUND THIS NOTE PRESCRIBED IS VOID. DO NOT BUILD A TEST TO IT (BACKLOG #1100).** It read:
+  a `BACKLOG` citation is drift only at or below a published #231 baseline, because `docs/BACKLOG.md`
+  stops at `## 231.` and "says so itself". **Both halves are false as measured:** that file carries
+  **373 item headings, #3 to #1372, with 320 above #231**, and the quoted sentence returns **zero**
+  occurrences in it — it lives under **#185** in the closed-backlog archive. The line anchor pointed
+  at unrelated text. **This mattered more here than in a narrative chapter, because it was an
+  INSTRUCTION**: a drift-pinning test built to it would have bounded at a number with nothing behind
+  it and reported confidently on the wrong population. **No replacement bound is given here on
+  purpose** — `PUBLIC_BACKLOG_FLOOR = 1000` (`scripts/hooks/ledger_check.py`) constrains ALLOCATION
+  rather than readability, so adopting it as the bound is a decision this correction does not make.
+  Anyone writing that test must settle the bound first and record why.
 - A document under `docs/security/`, `docs/reviews/` or `docs/marketing/` is **withheld from the public
   repo**, not missing (`.gitignore:144-146`). A pinning test cannot assert on a file it cannot read, and
   its unreadability is never itself a B6 item.

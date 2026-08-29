@@ -1269,9 +1269,34 @@ class AuthService:
             # First federated login for this account (or an unbound AD account's first): record the
             # (issuer, sub) binding so a later reassigned-username login carrying a different subject is
             # refused by the guard above. A matching binding is left untouched (no updated_at churn).
-            await self._store.set_user_federated_subject(
-                user.id, federated_subject[0], federated_subject[1]
-            )
+            try:
+                await self._store.set_user_federated_subject(
+                    user.id, federated_subject[0], federated_subject[1]
+                )
+            except Exception as exc:
+                # BACKLOG #1256. THE GUARD ABOVE IS CHECK-THEN-ACT: its read and this write are
+                # separate awaits, so two concurrent FIRST logins for one subject can both see
+                # `holder is None` and both reach here. `ux_users_federated_subject` refuses the
+                # loser on all three backends, and this renders that refusal as the SAME outcome the
+                # sequential path returns -- otherwise the race loser gets a 500 for a condition the
+                # gate handles cleanly one microsecond earlier.
+                #
+                # MRO BY NAME, matching the duplicate-label race at `_enroll_webauthn` (ADR 0068 4):
+                # each backend raises its own integrity class -- sqlite3.IntegrityError, asyncpg's
+                # UniqueViolationError, pyodbc's IntegrityError -- and naming them here would make
+                # this module import-aware of every driver and silently stop covering a backend added
+                # later. Anything that is NOT an integrity violation re-raises untouched.
+                mro = "".join(t.__name__ for t in type(exc).__mro__)
+                if "Integrity" not in mro and "UniqueViolation" not in mro:
+                    raise
+                await self._directory_reject_audit(
+                    principal.username, "oidc", "federated_subject_already_bound"
+                )
+                return LoginOutcome(
+                    ok=False,
+                    error="federated sign-in failed",
+                    reason="federated_subject_already_bound",
+                )
             # BACKLOG #1248. Binding an external identity decides WHO MAY SIGN IN as this account
             # from now on, so it is a privilege change and gets the same two records the role
             # resync below emits: an audit row, and an out-of-band notice to the account holder
@@ -2807,9 +2832,24 @@ class AuthService:
                 await self._store.revoke_user_sessions(user_id)
         await self._audit("user.updated", actor=actor, detail=_json({"user_id": user_id}))
         if before is not None:
-            if email is not None and email != before.email:
+            if email != before.email:
                 # Notify the OLD address — so the legitimate owner is alerted even if an attacker (or a
                 # mistaken admin) repointed the account's email to one they control (ASVS 6.3.7).
+                #
+                # BACKLOG #1139: this guard used to also require `email is not None`, which silently
+                # skipped the CLEAR. update_user_profile's write is unconditional, so a null removes
+                # the stored address — and that is the ONE update to an account's authentication
+                # details that must be announced, because it is the last moment the old address is
+                # reachable. After it, SecurityEventNotifier.notify returns early on the empty address
+                # and the account is structurally excluded from every later notice.
+                #
+                # `email` is the intended FINAL state here, not a patch fragment: PATCH /users/{id}
+                # resolves an omitted field to the account's current value before calling (see
+                # api/auth_routes.py's admin_user_update), and the console form posts the whole
+                # profile with a blanked field as None (messagefoundry_webconsole/routes/admin.py).
+                # So `email != before.email` is exactly "the stored address changed", with no
+                # partial-update ambiguity to inherit — which is why dropping the conjunct is safe
+                # rather than merely wider.
                 await self._notify_security(
                     EMAIL_CHANGED,
                     username=before.username,

@@ -51,6 +51,7 @@ import {
   ADD_MENU_BY_ID,
   EditLoopGuard,
   REDACTED_LIVE_VALUE,
+  LiveValueArming,
   RerenderDebouncer,
   TOOLBAR_INSERT_DEFAULTS,
   addMenuGroups,
@@ -299,10 +300,29 @@ export class StepsEditorProvider implements vscode.CustomTextEditorProvider {
       (fn, ms) => setTimeout(fn, ms),
       (handle) => clearTimeout(handle),
     );
+    // Which trigger armed the pending re-projection, and therefore whether live values may attach
+    // (BACKLOG #234). The rule, its direction, and why a conjunction cannot reintroduce #225 are
+    // stated once on `LiveValueArming` rather than restated here.
+    const arming = new LiveValueArming();
+
+    // The SAVE-flavoured schedule. Every pre-existing caller routes here, so their behaviour is
+    // byte-for-byte what it was: all of them are save-origin (a real save, or a save the guard
+    // deferred mid-drain and still owes).
     const scheduleRerender = (): void => {
       if (disposed) {
         return;
       }
+      arming.armSave();
+      rerender.schedule();
+    };
+
+    // The CHANGE-flavoured schedule (BACKLOG #234). SAME debounced channel -- deliberately not a
+    // second timer -- and it never arms live values.
+    const scheduleRowsOnlyRerender = (): void => {
+      if (disposed) {
+        return;
+      }
+      arming.armRowsOnly();
       rerender.schedule();
     };
 
@@ -325,6 +345,9 @@ export class StepsEditorProvider implements vscode.CustomTextEditorProvider {
       //     drain, and its `finally` would otherwise arm a redundant second pass on the way out.
       rerender.cancel();
       guard.takeSuppressedChange();
+      // Consume the trigger flavour alongside the other two discharges, for the same reason they are
+      // taken here: this render SATISFIES whatever was pending, so the next one starts from nothing.
+      const wantsLiveValues = arming.consume();
       const ws = workspaceDir();
       // Fetch the op-param schema ONCE (BACKLOG #235) — it drives each editable param's input widget and
       // is config-independent signature data, so a single shell suffices for the panel's life. A failure
@@ -379,7 +402,7 @@ export class StepsEditorProvider implements vscode.CustomTextEditorProvider {
       // the WRONG row (BACKLOG #225). A dry-run can't reflect an unsaved buffer, so SKIP the trace
       // entirely until the next save realigns disk == buffer — the toolbar's redacted placeholder stands
       // meanwhile. (This is the same "sync on save" reason the projection itself refreshes on save only.)
-      const inline = shouldAttachLiveValues(document.isDirty)
+      const inline = wantsLiveValues && shouldAttachLiveValues(document.isDirty)
         ? await this.liveValuesFor(document.uri.fsPath, ws)
         : [];
       if (disposed) {
@@ -943,9 +966,46 @@ export class StepsEditorProvider implements vscode.CustomTextEditorProvider {
       }
       scheduleRerender();
     });
+    // BACKLOG #234: RE-PROJECT ON CHANGE, NOT ONLY ON SAVE. ADR 0076 section 5 adopted "sync on save
+    // only" wholesale from the verified InterSystems set; the owner ruled that acceptance criterion
+    // OPEN and a lane free to relax it. This is the bounded relaxation, and it is bounded in three
+    // ways rather than by a timer:
+    //
+    //   * ROWS ONLY. Live values stay save-gated (#225's dirty-buffer misalignment is a real
+    //     correctness hazard and the item's own non-goal says leave it alone). See
+    //     `scheduleRowsOnlyRerender`.
+    //   * NOT WHILE THE WEBVIEW HOLDS FOCUS. A re-projection replaces the ENTIRE webview HTML, which
+    //     would destroy focus, selection and a half-typed param input mid-word -- the cost the save
+    //     gate's own comment names. Typing in the SPLIT TEXT EDITOR costs nothing to re-project;
+    //     typing in a webview input is the case the guardrail was adopted for. `panel.active`
+    //     distinguishes them from panel state, with no heuristic and no threshold to defend.
+    //   * THROUGH THE EXISTING DEBOUNCED CHANNEL, so rapid typing coalesces exactly as rapid saves
+    //     already do. No second timer, and `render()` still cancels it on entry.
+    //
+    // The update-loop guard is unchanged and still runs first: our own `lens rewrite` WorkspaceEdit
+    // must not re-trigger a projection.
+    const changeSub = vscode.workspace.onDidChangeTextDocument((e) => {
+      if (e.document.uri.toString() !== document.uri.toString()) {
+        return;
+      }
+      // A zero-change event is a metadata flip (dirty state, language id), not an edit. Re-projecting
+      // on one would re-render on SAVE TWICE -- once here, once from the save subscription.
+      if (e.contentChanges.length === 0) {
+        return;
+      }
+      if (!guard.shouldReactToDocumentChange()) {
+        guard.noteSuppressedChange();
+        return;
+      }
+      if (panel.active) {
+        return;
+      }
+      scheduleRowsOnlyRerender();
+    });
     panel.onDidDispose(() => {
       disposed = true;
       sub.dispose();
+      changeSub.dispose();
       rerender.cancel();
     });
 

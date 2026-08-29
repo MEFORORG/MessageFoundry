@@ -516,3 +516,107 @@ def test_the_record_detector_reports_no_value(sf, tmp_path: Path) -> None:
         assert verdict not in h.split("security-record content")[0], (
             f"reason leaked the verdict: {h!r}"
         )
+
+
+# --------------------------------------------------------------------------------------------------
+# BACKLOG #1368 / SEC-04 -- is the FLOOR still tracking the list it guards?
+#
+# `token_floor_failure` asks whether the LIST fell below the FLOOR. This asks the opposite: whether the
+# floor fell behind the list. A floor of 7 against a list of 40 is satisfied by any 7 detectors
+# surviving, so the gate goes green while constraining almost nothing -- and nothing anywhere noticed,
+# because the counts print and nothing compares them.
+#
+# EVERY TEST HERE INJECTS COUNTS. No token source is loaded, so these run identically on a fork with no
+# secret, and this file continues to carry no real token.
+# --------------------------------------------------------------------------------------------------
+
+#: The shape measured against the LIVE list on 2026-08-26, recorded so the tests below are anchored to a
+#: real observation rather than to invented numbers. Counts only; the list itself is a secret.
+_LIVE_2026_08_26 = {"names": 8, "estate": 14, "site_prefixes": 2}
+_FLOOR_IN_CI = {"names": 7, "estate": 13, "site_prefixes": 1}
+
+
+def test_the_floor_CI_pins_today_is_still_fresh_against_the_live_shape(sf) -> None:
+    """The rule must not fail on the day it lands. If this reds, the floor needs raising and that is a
+    decision for a human, not a test to be relaxed."""
+    assert sf.floor_freshness_failure(_FLOOR_IN_CI, _LIVE_2026_08_26) is None
+
+
+def test_THE_80_PERCENT_RATIO_ALONE_WOULD_HAVE_FAILED_site_prefixes(sf) -> None:
+    """WHY THE RULE IS SPLIT, pinned as a test rather than left in a comment.
+
+    site_prefixes is floor 1 against 2 loaded. As a ratio that is 50% and always will be -- ANY growth
+    from 1 to 2 scores 50%, however healthy. At that size a ratio measures the SECTION'S SIZE, not the
+    floor's staleness, so a flat 80% rule would red the gate on its first real run while nothing is
+    wrong.
+    """
+    floor, loaded = _FLOOR_IN_CI["site_prefixes"], _LIVE_2026_08_26["site_prefixes"]
+    assert floor / loaded < sf._MIN_FLOOR_RATIO, "the premise of the split rule stopped holding"
+    # ...and the shipped rule passes it anyway, via the absolute arm.
+    assert sf.floor_freshness_failure({"site_prefixes": floor}, {"site_prefixes": loaded}) is None
+
+
+def test_a_small_section_fails_on_an_ABSOLUTE_lag(sf) -> None:
+    """1 against 3 is drift; 1 against 2 is not. The rule has to separate them."""
+    assert sf.floor_freshness_failure({"site_prefixes": 1}, {"site_prefixes": 2}) is None
+    why = sf.floor_freshness_failure({"site_prefixes": 1}, {"site_prefixes": 3})
+    assert why and "site_prefixes" in why and "lags" in why, why
+
+
+def test_a_large_section_fails_on_the_RATIO(sf) -> None:
+    why = sf.floor_freshness_failure({"names": 2}, {"names": 8})
+    assert why and "names" in why and "25%" in why, why
+    assert sf.floor_freshness_failure({"names": 7}, {"names": 8}) is None
+
+
+def test_the_message_names_the_section_AND_BOTH_NUMBERS(sf) -> None:
+    """A drift warning that does not say which section, and by how much, sends the reader to grep."""
+    why = sf.floor_freshness_failure({"estate": 6}, {"estate": 14})
+    assert why is not None
+    for fragment in ("estate", "6", "14"):
+        assert fragment in why, f"{fragment!r} missing from: {why}"
+
+
+def test_a_section_AT_OR_BELOW_its_floor_is_not_this_function_s_question(sf) -> None:
+    """That is `token_floor_failure`'s job -- the list falling below the floor. Answering it here too
+    would double-report one defect and, worse, imply this check covers it when it does not."""
+    assert sf.floor_freshness_failure({"names": 9}, {"names": 8}) is None
+    assert sf.floor_freshness_failure({"names": 8}, {"names": 8}) is None
+
+
+def test_no_floor_configured_is_not_a_freshness_failure(sf) -> None:
+    """Absence of a floor is `MEFOR_REQUIRE_TOKENS`'s question. Failing here would make the gate fire
+    on every contributor machine, and a gate that fires on everyone gets switched off."""
+    assert sf.floor_freshness_failure(None, _LIVE_2026_08_26) is None
+    assert sf.floor_freshness_failure({}, _LIVE_2026_08_26) is None
+
+
+def test_THE_COUNTS_CANNOT_DISCRIMINATE_SYNTHETIC_FROM_REAL_BUT_THE_MODE_CAN(
+    sf, monkeypatch
+) -> None:
+    """THE FINDING THAT SHAPED THIS ITEM, pinned so nobody verifies a floor from counts alone.
+
+    On 2026-08-26 the SYNTHETIC example set and the REAL list both reported 8/14/2. Three identical
+    numbers from two tables, one of which matches nothing real. A caller checking counts would assert a
+    floor against a set that cannot fire, and read the pass as evidence.
+
+    `mode` is the only field that separates them, so the report must carry it.
+    """
+    counts = dict(_LIVE_2026_08_26)
+    monkeypatch.setattr(sf, "TOKENS_PRESENT", True)
+    monkeypatch.setattr(sf, "is_synthetic_token_set", lambda: True)
+    synthetic = sf._detector_count_report(counts)
+    monkeypatch.setattr(sf, "is_synthetic_token_set", lambda: False)
+    real = sf._detector_count_report(counts)
+
+    assert "mode=synthetic" in synthetic and "mode=real" in real
+    # ...and the COUNT lines are byte-identical between them, which is the whole point.
+    assert [x for x in synthetic if not x.startswith("mode=")] == [
+        x for x in real if not x.startswith("mode=")
+    ], "if the counts ever differ here, this test has stopped demonstrating the hazard"
+
+
+def test_no_token_source_reports_mode_none_rather_than_a_clean_zero(sf, monkeypatch) -> None:
+    """ "loaded nothing" and "loaded a real list that happens to be small" must not render alike."""
+    monkeypatch.setattr(sf, "TOKENS_PRESENT", False)
+    assert "mode=none" in sf._detector_count_report({"names": 0})
