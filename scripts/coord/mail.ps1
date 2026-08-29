@@ -440,6 +440,40 @@ if ($Send) {
         }
     }
 
+    # BACKLOG #1302 -- FAIL THE SENDER, WHO CAN FIX IT, RATHER THAN THE RECIPIENT, WHO CANNOT.
+    #
+    # A `-ToSessionId` from the wrong namespace is compared literally against the reading session's
+    # harness id (`mail-drain.ps1`: `[string]$m.to.sessionId -ne $sessionId`), never matches, and the
+    # message sits in the inbox until it is swept to expired/. MEASURED: six messages from one seat --
+    # a level report, a CI mechanism diagnosis, two unprompted self-retractions and a request to pull
+    # two items -- stranded for a whole session while the recipient read that lane as silent. The send
+    # path printed `Queued 1 message(s)` for every one of them.
+    #
+    # THE ASYMMETRY IS THE DEFECT, and it is why this check goes HERE. The drain ALREADY reports its
+    # side ("N message(s) are addressed to a different session id and were left in the inbox"), so the
+    # recipient is told. The SENDER is told nothing, and the sender is the only party who can correct
+    # the id.
+    #
+    # THE SHAPE: a harness session id is a bare UUID (the drain reads `$hook.session_id`). The MCP
+    # namespace prefixes its own (`local_<uuid>`), and that is exactly the shape that stranded them --
+    # two id spaces for one session, compared with `-ne`.
+    #
+    # PARTIAL CONTROL, AND RECORDING THAT IS PART OF THE FIX. This catches a wrong-NAMESPACE id. It
+    # does NOT catch a correctly-shaped but STALE one -- an id belonging to a session that has since
+    # ended fails identically and just as silently. A pass here is not a promise of delivery.
+    #
+    # MUST NOT TRIP ON THE ORDINARY CASE: no `-ToSessionId` at all is the normal broadcast, and it has
+    # to keep delivering untouched. The guard is scoped to a value the caller actually supplied.
+    if ($ToSessionId -and $ToSessionId -notmatch '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$') {
+        throw (
+            "-ToSessionId '$ToSessionId' is not a harness session id, so the drain would compare it " +
+            "against the reading session's id, never match, and leave the message in the inbox until " +
+            "it expired -- with neither end told. A harness session id is a bare UUID; an id carrying " +
+            "a namespace prefix such as 'local_' belongs to a different id space. Send with -To " +
+            "<worktree path> and omit -ToSessionId unless you have the harness id."
+        )
+    }
+
     # PER-TARGET, NOT ALL-OR-NOTHING. Now that a publish can genuinely fail -- the verify is real, so a
     # move that did not happen is reported instead of assumed -- a broadcast that aborted on target 1
     # would hide targets 2..N, and one that swallowed the failure would put the defect back at the

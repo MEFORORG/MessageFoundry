@@ -6102,6 +6102,15 @@ Reach proven with a harmless key, no disarm key executed: `git -C '../../..' con
 
 **Source:** found 2026-08-06 by the adversarial verification pass on #1061's own fix, tasked with refuting the claim that the patch closed the hole. It did not find a defect in the patch; it found that the rule the patch corrected was bypassable by a route the patch did not touch and the item's banner would have implied was closed.
 
+
+**AMENDMENT 2026-08-28 (lander), and it WIDENS the mechanism rather than adding an instance.** The rule-3c half also admits a `--git-dir` inside a **quoted VALUE** -- `git config alias.zz "log --git-dir=<ungoverned>"` -- read as the target, so an ungoverned repository wins the chain while the write lands in the governed one.
+
+**The root cause is this item's own defect, unported to its siblings:** promoted tokens were read off the **RAW line** instead of the **blanked scan string**. This item solved exactly that for the `-C` flag; the treatment was not carried across when the same promotion was applied to the repository-naming tokens.
+
+Fixed in the rule-3c follow-on work. **The rule-3 and rule-3d half is NOT this item** -- it is filed separately as #1377, because a row naming only the enumeration half produces "add the missing spellings", which closes an instance and leaves the class open.
+
+**Two further classes found in the same pass are INHERITED rather than introduced and are filed as #1379**, both consequence-proven against the governed shared config: `-C` precedence composition, and the PowerShell environment-assignment spelling.
+
 ## 1066. Rule 3c strips double quotes only, so a single-quoted -C target bypasses it -- including an absolute one
 
 > ✅ **DECLINED-BY-DESIGN 2026-08-25, OWNER RULING extending the 2026-08-23 tokeniser ruling to the family (#1066/#1070/#1086/#1305/#1336).** Confirmed one-hop: the Liaison put it to the owner directly and read the answer, rather than relaying a third party's account. **#1336 already established this row cannot be fixed alone** -- it and `#1086` are "the same design error pulling in opposite directions," and closing this row's fail-open without widening `#1086`'s false-deny needs exactly the block-tracking shell tokeniser the ruling declines. The banked second fix below remains open evidence of why a narrower attempt still fails: it is MINIMAL-FROM-COMMITTED rather than a parser, and it was REJECTED by four independent verifiers finding at least five new fail-opens and two new false-deny classes -- the same failure shape #1336's own history shows four separate candidates hitting. **The gate governing this machine is unchanged and this row's bypass is real and remains live**; the ruling accepts that risk rather than building a fifth tokeniser-shaped candidate to close it. 🔢 **Re-scored 2026-08-20 -> P2.** Value **7/10** · Difficulty **6/10** · _big bet_. Both halves are live on the repo blob and on the installed hook that actually governs this machine: the -C reader is the unchanged double-quote-only regex and the disarm-key match still reads the quote-blanked scan text, so a single-quoted absolute -C and every quoted -c alias override remain reachable by ordinary spellings. Value 7 because this governs agent behaviour in development with no product or PHI effect, which is above the rubric's parity rungs but below the production and ASVS rungs; difficulty 6 because two written fixes have been rejected by adversarial verification, the second yielding at least five new fail-opens with residuals filed as #1067, #1069, #1070, #1071 and #1072. _(was 9/10 · 3/10.)_
@@ -12625,6 +12634,35 @@ BUILDS it.*
 **Provenance.** Diagnosed by the lane whose own commit tripped it: seven tests in one file failed in a full run and **passed in isolation, twice**. It reported the negative control alongside the fix -- restoring the bare import reproduced exactly those seven failures -- which is what makes the green meaningful. Recorded here rather than left in session mail because the collision outlives the commit that revealed it. It is the same shape as the rest of this cluster: **the name resolved to the neighbouring module, and nothing said so.**
 
 ## 1256. the federated binding guards account-continuity but never subject-exclusivity, so two accounts can bind one identity
+> **THE ATOMICITY HALF IS BUILT 2026-08-27; banner left open for the archive pass.** A partial/filtered
+> unique index `ux_users_federated_subject` on `(oidc_issuer, oidc_subject)` now exists on all three
+> backends, and the race loser is rendered as the SAME `federated_subject_already_bound` outcome the
+> sequential path returns rather than a 500.
+>
+> **THE ACCEPTANCE DEMONSTRATES THE RACE, as this row's correction demands.** Two concurrent first
+> logins for one subject, interleave FORCED by an `asyncio.Barrier` so both reads complete before
+> either write. Removing the index reds it: both bind. **A second test asserts both logins observed
+> NO holder** -- without that, a future refactor that quietly serialises them would leave the first
+> test green while the index was never consulted, which is this row's own failure mode one level up.
+>
+> **THREE CORRECTIONS MADE WHILE BUILDING, each found by asking what the codebase already does:**
+> 1. The SQLite index CANNOT live in `_SCHEMA`: it runs at `store.py:2087`, `_migrate` at `:2088`, so
+>    on a users table predating the federated columns it references a column that does not exist yet.
+>    It sits in `_migrate` beside `ix_queue_body_ref`, which records that same reasoning.
+> 2. SQL Server needed a RE-TYPE migration, not just a declaration change. The `ALTER TABLE ... ADD`
+>    guards are `COL_LENGTH(...) IS NULL` and fire only when a column is ABSENT, so an existing table
+>    keeps `NVARCHAR(MAX)` -- which cannot be an index key. `COL_LENGTH` returns **-1** for MAX, which
+>    is the discriminator. NVARCHAR(256), not 450: 2x256x2 = 1024 bytes, inside the 1700-byte limit.
+> 3. **A contract exception was added and REVERTED.** `FederatedSubjectConflict` in `store/base.py`
+>    existed so `auth/` would not import three drivers -- but `auth/service.py:2558` already solves
+>    that without one, joining the class MRO names and testing for `Integrity`/`UniqueViolation`
+>    (ADR 0068 4's duplicate-label race, the same check-then-act shape). Sound reasoning, wrong
+>    mechanism, because the constraint it designed around had already been dissolved. Do not re-add.
+>
+> **The `WHERE ... IS NOT NULL` filter is stylistic on SQLite and Postgres and REQUIRED on SQL Server**,
+> where NULLs compare EQUAL in a unique index -- unfiltered, it would admit exactly ONE unfederated
+> user in the table. A reader who learned the rule from the SQLite file would delete it as redundant.
+>
 
 > 🔢 **Re-scored 2026-08-20 -> P2.** Value **5/10** · Difficulty **4/10** · _fill-in_. The behavioural half is closed in shipped code -- auth/service.py:1219-1232 refuses a second account binding one (issuer, subject), with the lookup on all three backends and a sequential test at tests/test_auth_oidc_service.py:456 -- so the remainder is only the database constraint that makes the read-then-write at :1219/:1232 atomic, which is worth a 5 as auth hardening with the app guard covering every non-concurrent case. Difficulty drops to 4 because the amendment moved the design half (refuse rather than re-point) into shipped code and comment, leaving a well-precedented seam: all three backends already declare unique indexes (ux_webauthn_label, ux_search_presets_owner_name), so the novel cost is one first-of-kind SQL Server ALTER COLUMN off NVARCHAR(MAX) (store/sqlserver.py:1358; the file contains zero ALTER COLUMN today), a filtered index for SQL Server NULL semantics, and a CI-only concurrent-bind test on the two server backends. _(was 7/10 · 5/10.)_
 >
@@ -13694,6 +13732,24 @@ runway or give it to nobody.*
 > Verdict: build
 > Closing-act: code
 
+> **AMENDMENT 2026-08-29 (lander) -- A STANDING OWNER-DELEGATED DECISION FORBIDS THIS ITEM AS WRITTEN. DO NOT DISPATCH IT WITHOUT READING THAT DECISION FIRST.**
+>
+> **This row was filed 2026-08-16. The decision that reverses it is dated 2026-08-17 -- one day younger than the row, and recorded in the vault where nothing in this repository points at it.** The row was dispatched on 2026-08-28 in good faith and returned with nothing written, because the builder found the decision. **The next dispatcher hits the same trap, and the failure mode is publishing to a public history that cannot be unpublished.**
+>
+> **THE RECORD, READ DIRECTLY BY THE FILER RATHER THAN RELAYED** -- `docs/security/PUBLICATION-DECISION-2026-08-17.md` on the vault's `origin/main`, quoted verbatim:
+>
+> - line 8: **"Publish none of the four vault-sourced documents in this pass."**
+> - line 57: "Publish these ONE AT A TIME, lowest risk first, each one read in full by whoever publishes it"
+> - line 63: **"Do not do them as a batch. A batch is how the first attempt grew from three to ten."**
+>
+> **It forbids this item twice over: by NAMING documents this row would publish, and by forbidding the row's SHAPE.** This row asks for three documents at once. It is the batch.
+>
+> **ON THE ROW'S SECOND JUSTIFICATION -- CORRECTED, AND NOT IN THE DIRECTION IT WAS REPORTED TO ME.** It was put to the filer that publishing would not activate `tests/test_threat_model_doc_drift.py`, because the row publishes to a path the accessor never reads. **Measured, that claim does not stand: the row names NO destination path at all.** Its body is 30 lines and contains zero `docs/` paths (parsed with `parse_items`, against a control of four "threat model" mentions in the same body). The accessor is `_doc_path()` at `tests/test_threat_model_doc_drift.py:75-78`, which reads `MEFOR_THREAT_MODEL_DOC` if set and otherwise `_ROOT/docs/security/THREAT-MODEL.md`. **So whether publishing activates the suite depends entirely on a destination this row never specifies.** The justification is **unverifiable as written**, not false -- and that is a reason to make the row say where the documents go, not a reason to strike the sentence.
+>
+> **WHAT THIS AMENDMENT DOES NOT DO: it does not close the item and it does not decide the question.** The gap the row describes is real and unchanged -- none of the three documents is tracked where a deploying site can read it. **Only the owner can lift the publication decision**, and the row's own text already says each published text needs their sign-off before it lands.
+>
+> **AN AMENDMENT IS NECESSARY AND NOT SUFFICIENT, AND THERE IS A MEASURED PRECEDENT AGAINST RELYING ON IT.** #1234 already carries a predecessor dispatcher's "DO NOT DISPATCH" amendment **in its own body**, and it was dispatched anyway five days later by a dispatcher who had read the item. **A warning inside the thing being dispatched is read at the moment it is least likely to change the decision.** If this needs to hold, it wants a gate, not a paragraph.
+
 **Cluster:** Documentation / adopter-facing. **Priority:** P3. **Verdict:** build.
 **Severity:** no deployment axis (sec. 0). The cost today is that someone evaluating the project cannot see how its authors think about the threat surface, or what responsibility their own Handler code would carry.
 
@@ -13991,7 +14047,18 @@ point, which are the parts that must survive it.**
 
 ## 1302. mail.ps1 accepts an MCP-namespace session id in -ToSessionId and the message becomes silently undeliverable, expiring with neither sender nor recipient told
 
-> 🔢 **Re-scored 2026-08-20 -> P2.** Value **5/10** · Difficulty **2/10** · _fill-in_. The validation gap stands -- mail.ps1:106 takes -ToSessionId unvalidated, :240 stores it, and mail-drain.ps1:852 string-compares it against the harness id read at :490, so a wrong-namespace id is filtered on every pass -- but the item's reporting claim does not: mail-drain.ps1:825-836 writes an 'expired-unshown' receipt on the sweep, mail.ps1:484-487 already tells the sender to read exactly that file and what the disposition means, and mail-drain.ps1:1014 reports the filtered count to the recipient on every drain. Value 5 rather than the filed 7 or the scorer's 6 because the item's value argument was built on those instruments being absent and all three ship, leaving a detection DELAY and an ambiguous no-receipt reading rather than a silent loss, on developer coordination with no product or PHI axis. Difficulty 2 and arguably generous: mail.ps1:153 already dot-sources mail-claim.ps1, whose Test-SessionId at :209 is the exact UUID shape check the fix needs, so the remainder is a post-binding refusal plus a must-not-trip arm for the no-sessionId broadcast case. _(was 7/10 · 2/10.)_
+> ✅ **SHIPPED 2026-08-21 -- `mail.ps1` now REFUSES a `-ToSessionId` that is not a harness session id, at SEND, before any message is written. The sender is the only party who can correct the id, and was the only party never told.** The drain already reported its half (*"N message(s) are addressed to a different session id and were left in the inbox"*); the send path printed `Queued 1 message(s)` and nothing else. **That asymmetry was the defect, and it is why the guard sits on the send side rather than in the drain -- the drain's filter is CORRECT: a worktree outlives its occupant, so an id-addressed note must not reach a stranger.**
+
+> **THE SHAPE.** A harness session id is a bare UUID (the drain reads `$hook.session_id`); the MCP namespace prefixes its own as `local_<uuid>`. Two id spaces for one session, compared with `-ne` at [`mail-drain.ps1:852`](../scripts/hooks/mail-drain.ps1), so a wrong-namespace id never matches and the message waits in the inbox until it is swept to `expired/` -- silently in both directions.
+
+> **MEASURED, NOT HYPOTHETICAL.** Six messages from one seat -- a level report, a CI mechanism diagnosis, two unprompted self-retractions and a request to pull two never-started items -- stranded for a whole session while the recipient read that lane as silent and wrote "level unreported" three times. They were found only by opening the box by hand.
+
+> **PARTIAL CONTROL, RECORDED RATHER THAN DISCOVERED LATER.** This catches a wrong-NAMESPACE id. It does **not** catch a correctly-shaped but **STALE** one -- an id belonging to a session that has ended fails identically and just as silently. A pass at send is not a promise of delivery, and nothing here should be read as one.
+
+> **THE MUST-NOT-TRIP ARM IS ASSERTED IN THE SAME TEST AS THE REFUSAL**, so a guard that rejected everything could not pass by satisfying one half: a message with NO `-ToSessionId` is the ordinary broadcast and still sends, and a genuine bare-UUID id still sends. **RED-FIRST IN BOTH DIRECTIONS:** disabling the guard reddens the refusal test, and widening it to reject everything reddens the must-not-trip test.
+
+> **Re-scored 2026-08-20 -> P2.** Value **5/10** · Difficulty **2/10** · _fill-in_. The validation gap stands -- mail.ps1:106 takes -ToSessionId unvalidated, :240 stores it, and mail-drain.ps1:852 string-compares it against the harness id read at :490, so a wrong-namespace id is filtered on every pass -- but the item's reporting claim does not: mail-drain.ps1:825-836 writes an 'expired-unshown' receipt on the sweep, mail.ps1:484-487 already tells the sender to read exactly that file and what the disposition means, and mail-drain.ps1:1014 reports the filtered count to the recipient on every drain. Value 5 rather than the filed 7 or the scorer's 6 because the item's value argument was built on those instruments being absent and all three ship, leaving a detection DELAY and an ambiguous no-receipt reading rather than a silent loss, on developer coordination with no product or PHI axis. Difficulty 2 and arguably generous: mail.ps1:153 already dot-sources mail-claim.ps1, whose Test-SessionId at :209 is the exact UUID shape check the fix needs, so the remainder is a post-binding refusal plus a must-not-trip arm for the no-sessionId broadcast case. _(was 7/10 · 2/10.)_
+
 >
 > **Filed 2026-08-21 -- not started. The one place in this transport where a message is genuinely LOST rather than late, and both ends read it as delivered.** `scripts/coord/mail.ps1:106` declares `-ToSessionId` as a bare `[string]` with **no validation**, and `:240` writes it into the message as `sessionId`. The drain then compares that value against the **harness** session id -- `scripts/hooks/mail-drain.ps1:852`, against `$sessionId` sourced at `:490` from `$hook.session_id`. **Three id namespaces exist for one session -- registry, MCP and harness -- and only one of them can ever match.**
 > **THE MECHANISM, verified in code rather than inferred from the symptom.** An MCP id is `local_`-prefixed; a harness id is a bare UUID. The comparison at `:852` is a string inequality, so a `local_` id can never equal the value it is tested against, on any drain, ever. The message is skipped every pass, stays in `inbox/`, and expires. **Nothing errors at send time, nothing errors at drain time, and nothing reports the expiry to either party.** `docs/WORKTREES.md` already records that a registry id and an MCP id for one session **shared no characters** -- so the namespaces are known to be disjoint, and nothing acts on that knowledge at the point where it matters.
@@ -16530,6 +16597,8 @@ declared serialised write order on that file. Building this alongside those with
 first risks the exact same-file collision this project's own collision-detection conventions exist to
 catch.
 
+---
+
 ## 1357. The connscale FD probe cannot see a multi-process engine: PID-set re-resolution never runs
 
 > 🔢 **Filed 2026-08-25 - not started.** ***A single probe tick costs LONGER THAN THE ENTIRE MEASUREMENT WINDOW, so the PID set is resolved once per sweep step and never re-resolved -- and a multi-process engine's worker children are invisible to the FD gauge.*** **Measured: one tick costs 1419-1848 ms against `hold_seconds = 1.5`.** So `_RESOLVE_EVERY_TICKS = 8` ([`probe.py:60`](../harness/load/connscale/probe.py)) is **unreachable by construction** -- not a badly-chosen constant, a constant the window cannot afford at any cadence. Its own comment reasons at "the runner's poll cadence", which this profile does not have.
@@ -16564,6 +16633,42 @@ catch.
 **A FIGURE THIS ITEM DELIBERATELY DOES NOT CARRY.** Forcing `resolve_every=1` produced readings of ~3745 handles against a ~385 baseline, which would be ~312 handles per worker child. **That number is WITHDRAWN and must not be quoted from here:** the trace above shows the denominator is not stable enough to divide by. The resource question is real and open; this item is the reason nobody can answer it yet.
 
 **Reproducer:** the per-tick trace and the A/B harness live in the filing session's scratchpad (`fdprobe_ab.py`); it reuses `test_connscale_smoke`'s own fixture setup and takes ~25 s a run. Rebuilding it is a few lines against `run_connscale`.
+
+---
+
+## 1360. three test files pick a free pid and rely on it staying free, so a loaded runner reuses it and a DEAD record reads as a veto
+
+> ✅ **SHIPPED 2026-08-26 (lander, authored per ADR 0165 -- the underlying fix is the builder's own
+> verified work, landed unmodified; this banner is mine).** Three copies of a `_find_free_pid` helper
+> (`test_worktree_prune_merged.py`, `test_coord_presence.py`, `test_session_registry.py`) each spawned
+> `cmd /c exit`, waited for it to exit, slept, and returned its pid as "free" -- free at the moment it
+> returns, and nothing keeps it free afterward. Replaced by one `tests/_dead_pid.py`, returning
+> `2147483647` (`Int32.MaxValue`): within the `[int]` cast `Test-RecordLiveness` performs, non-zero so
+> it takes the liveness path rather than the `UNREADABLE` shortcut, and structurally unassignable on
+> either platform (Linux caps pids at ~2^22, Windows pids are multiples of 4 far below 2^31) -- dead by
+> construction rather than by timing. Verified independently against the landed diff before writing
+> this banner: `tests/_dead_pid.py` exists, defines `NEVER_LIVE_PID: Final = 2147483647`, and all
+> three test files import it.
+>
+> **Diagnosed from a real failure**, not from inspection alone: `windows-2025` run `32268545492`,
+> `tests/test_worktree_prune_merged.py:753`, `assert d["Occupants"] == []`, an ordinary exit-1
+> assertion beside an unrelated crash in the same run. The comment on the original helper --
+> `time.sleep(0.3)  # let the OS reap it before we claim the pid is gone` -- states the intended
+> guard and the mechanism does the opposite: reaping RELEASES a pid for reuse rather than reserving
+> it, so the sleep widens the window it appears to close.
+>
+> **The fix does not stub, mock, or force the liveness verdict** -- the real `Get-Process` call still
+> runs and still returns "not running" on its own; only the pid handed to it is now unassignable. The
+> constraint that shaped this over the obvious alternative: the tests assert both `Occupants == []`
+> and `Decision == "SKIP"`, so any remedy that short-circuited the verdict would pass while testing
+> nothing.
+
+**Cluster:** CI reliability / test determinism. **Priority:** P2. **Verdict:** build.
+**Severity:** no product effect, no PHI effect, no deployment axis (sec. 0) -- test-suite determinism
+only. The cost was a required context redding on a race whose failure looked like a real occupancy
+veto.
+
+---
 
 ---
 
@@ -16949,3 +17054,198 @@ site_prefixes   1      2       50.0%   <- would FAIL a flat 80% rule
 **Related:** #1080 (the setup script reporting a loaded set as if it were the installed one -- the same family of "the gate reported something adjacent to what you asked"), SEC-05.
 
 **Source:** SEC-04 in the master test plan, routed by the Liaison; scoped down by this lane after measuring that half the brief's build already existed.
+
+## 1374. fleet.ps1 originMainAgeMinutes reports fetch recency but measures when origin/main last MOVED, and on the packed-refs path it is null so the stop condition cannot fire
+
+> 🔢 **Filed 2026-08-28 (lander) - reported by the dispatcher and the cleaner; corroborated independently before filing.**
+> Verdict: build
+> Closing-act: code
+
+**Cluster:** Fleet coordination. **Priority:** P3. **Verdict:** build (small).
+**Severity:** no engine effect, no PHI axis, no deployment axis (sec. 0). It degrades a roster seats read to decide whether the board in front of them is complete.
+
+**THE FIELD IS NAMED FOR ONE QUESTION AND ANSWERS ANOTHER.** `originMainAgeMinutes` reads the `origin/main` ref file's mtime, which moves when the ref MOVES, not when it was FETCHED. A fleet that fetched seconds ago but whose `main` has been quiet for an hour reports an hour of staleness and fires the stop condition that prints DO NOT TREAT THE ROSTER BELOW AS COMPLETE.
+
+**CORROBORATED DIRECTLY RATHER THAN ARGUED, and this reading settles it:** taken read-only before any fetch, `.git/FETCH_HEAD` mtime `18:02:16.769` against the loose-ref mtime `18:01:24.059`. A fetch landed **52 seconds after** the ref last moved and left the ref untouched. The two clocks are separate and the field reads the wrong one.
+
+**THE SECOND HALF IS WORSE THAN THE FIRST AND WAS FOUND BY A DIFFERENT SEAT.** On the packed-refs path there is no loose ref to stat, so the value is null, the stop-condition test never fires, and **an absent warning renders identically to a healthy one**. The failing case and the passing case are indistinguishable on screen.
+
+**Related:** #1372 (fleet pointer health) is adjacent and **not a duplicate** -- that item is about pointer state, this one about a time field.
+
+**PROVENANCE:** diagnosed by the cleaner on 2026-08-24 and routed to the dispatcher seat. The board tool was fixed; `fleet.ps1` was not; and no ledger item existed -- a grep over both ledger files returned zero against a working control of 4 hits for `fleet.ps1`. **It fell out because nothing tracked it.**
+
+## 1375. install-gate.ps1 REPLACES the machine-wide gate allowlist on every run rather than merging, with no backup and no warning, and a dropped root fails open silently
+
+> 🔢 **Filed 2026-08-28 (lander) - third version of this item; the two earlier framings were refuted before filing and one is recorded below.**
+> Verdict: build
+> Closing-act: code
+
+**Cluster:** Development harness. **Priority:** P2. **Verdict:** build (small).
+**Severity:** no engine effect, no PHI axis, no deployment axis (sec. 0). It governs agent behaviour on a developer box. **The severity is that the failure is SILENT, not that it is large.**
+
+**THE DEFECT.** `install-gate.ps1` rewrites the machine-wide governance allowlist on every install run rather than merging into it -- **with no backup, no log line, and no warning that a currently governed root has just become ungoverned** -- while `docs/WORKTREE-GATE.md` documents the bare run as "govern this repo" and reads additive.
+
+**CONFIRMED FROM SOURCE, quoted not inferred:** the `Set-Content` REPLACES, and nothing between the branch entry and that write reads the existing file; the only `Get-Content` sits inside the `-Status` branch, which returns before the install path; a bare run writes exactly ONE repo; and the installer never backs up the allowlist -- its `Copy-Item` calls cover `settings.json` and the gate script only.
+
+**LEAD WITH THIS: A DROPPED ROOT FAILS OPEN SILENTLY.** The gate exits zero when the root count is zero, and the comment beside it says why -- the allowlist doubles as the kill switch, so no file and no entries means nothing is governed. Zero protection, no warning, no log line.
+
+**THE PRECONDITION IS LIVE ON THIS BOX, NOT HYPOTHETICAL.** The allowlist currently carries two roots, so a bare run would drop one. **And the two allowlists measurably disagree**, which is the state this defect produces and nothing reports.
+
+**DO NOT WORD THIS AROUND VISIBILITY.** `-Status` already prints the governed list, so "the operator cannot see the scope" is FALSE and would sink the item. **The defect is the missing announcement at the moment scope NARROWS.**
+
+**TWO DECOYS, neither of which covers it:** #1247 covers the gate SCRIPT copy, not the allowlist write. #1367 covers the parity MESSAGE from the same incident and has already landed.
+
+**UNTESTED, AND THE ITEM MUST NOT READ OTHERWISE: nobody has executed the installer in any mode.** Every mechanism claim above is source-reading. Two questions are genuinely open: whether `-Repo a,b` actually governs two repos, and whether a second gate installer exists on this box that nobody has identified.
+
+**A REFUTED FRAMING, KEPT SO IT IS NOT RE-DERIVED:** an earlier version claimed the engine was ungoverned for four days. **Refuted by 70 engine denial proof points across 2026-08-22 to 08-26** against an all-time control of 211. Real engine exposure was at most 72 minutes, both collapses were on 2026-08-26 ten minutes apart, and **the victim is inverted** -- the repository that was ungoverned, for about 24 days, was the vault.
+
+## 1376. the vault ships all three privileged installers and none of the three installed-vs-source parity instruments
+
+> 🔢 **Filed 2026-08-28 (lander) - found by builder 1 while screening before claiming.**
+> Verdict: build
+> Closing-act: code
+
+**Cluster:** Development harness. **Priority:** P3. **Verdict:** build (small).
+**Severity:** no engine effect, no PHI axis, no deployment axis (sec. 0).
+
+**THE MEASUREMENT, with its control:**
+
+```
+                                          vault     engine
+tests/test_selfheal_installed_parity.py   ABSENT    present
+tests/test_gate_installed_parity.py       ABSENT    present
+tests/test_installed_coord_hooks.py       ABSENT    present
+
+CONTROL: the vault tests/ tree holds 527 entries, so this is not a repo-shape artifact.
+AND IT SHIPS THE SUBJECT: install-selfheal.ps1 and worktree-selfheal.ps1 are both present there.
+```
+
+**So the vault carries the same privileged installers and none of the instruments that would tell anyone they had drifted.**
+
+**CORROBORATING, AND LABELLED UNDIAGNOSED BECAUSE THAT IS HOW IT WAS REPORTED:** the vault's installed commit-msg hook is far smaller than the engine's `claim_check.py` source. Vault source and installed are the same blob as each other; the engine's differs. **Nobody chased what the difference is, and this row does not claim to know.**
+
+**NOT A DUPLICATE OF #1019, and the check is specific:** #1019's body mentions the vault **zero** times across all 53 of its lines. **#1019 stays OPEN for its own deliberately-unbuilt installer-side half and must NOT be closed on this item** -- they are different halves of different repositories.
+
+**AND READ #1019's BANNER BLOCK RATHER THAN ITS HEADING:** its title overstates, its banner already says PARTLY LANDED and names the unbuilt half. A seat correcting the banner from the heading would flip a correct banner to wrong.
+
+## 1377. rule 3 and rule 3d walk a promoted token list that GIT_DIR leaks into, so a governed path named only in the environment produces a false deny
+
+> 🔢 **Filed 2026-08-28 (lander) - split out of #1065's rule-3c half, which is amended rather than duplicated.**
+> Verdict: build
+> Closing-act: code
+
+**Cluster:** Development harness. **Priority:** P3. **Verdict:** build (small).
+**Severity:** no product effect and no PHI effect -- this governs agent behaviour in development. *(Clause carried verbatim from #1065, because without it this row reads as a product-severity claim and it is not.)*
+
+**THE MECHANISM.** `GIT_DIR=<governed> git clean -fd` denies. The promoted token list is emitted in the non-opt-in branch on the reasoning that it "sits behind the base where it cannot win" -- **but rules 3 and 3d walk the whole list, so it wins.**
+
+**ALSO IN SCOPE:** a governed path merely MENTIONED in a comment, a commit message or an alias body denies.
+
+**MEASURED, NOT ASSERTED:** the seven defects in this family were re-measured against the COMMITTED gate rather than a handed copy; all 20 rows correct and ten original closures held.
+
+**NOT THIS ROW:** the rule-3c half belongs to #1065, and that item is amended in this same commit rather than duplicated here.
+
+## 1378. rescue refs drift from the branch they were taken for, so a recovery reaches a commit strictly behind the work it was meant to protect
+
+> 🔢 **Filed 2026-08-28 (lander) - a visibility framing of this was refuted before filing; the surviving harm is VALUE drift.**
+> Verdict: build
+> Closing-act: code
+
+**Cluster:** Fleet coordination. **Priority:** P3. **Verdict:** build (small).
+**Severity:** no engine effect, no PHI axis, no deployment axis (sec. 0). It degrades a recovery path seats rely on in order not to lose work.
+
+**THE MEASUREMENT:** 34 of 219 rescue refs have drifted, **29 of them strictly behind** the branch they were taken for. Zero twin refs. Four are gc-droppable.
+
+**THE FAILURE IS SILENT AND SUCCESSFUL-LOOKING, which is why it needs a row rather than a habit.** An older snapshot **opens cleanly**. No error, no dangling ref, no signal. It is the wrongly-resolving reference rather than the broken one -- and a broken reference advertises itself while this one does not.
+
+**DEMONSTRATED IN PRACTICE THE DAY IT WAS FILED:** a seat cited anchor refs in its own handoff that had gone stale between writing and reading -- one anchor held four files while the tree it named had five, six minutes later. **It needs no race, only a person writing a ref name down and time passing.**
+
+**DO NOT FILE THE VISIBILITY STORY, and this is the part that was nearly wrong.** An earlier framing held that a seat checking "is this work backed up?" from a vault checkout gets a false negative because the vault maps no `rescue/auto/*` refspec. **Refuted:** the two repositories are symmetrically blind because they are DIFFERENT REPOSITORIES, so that reduces to asking the wrong repo, not a refspec defect. **A name-only comparison cannot see the real defect, which is value drift.**
+
+**WHAT SURVIVES FROM THE REFUTED VERSION, and it is worth keeping:** one server-side tag can carry different local names per clone, because the engine rewrites `refs/tags/rescue/*` into a remote-tracking namespace. **Name the clone when you name a ref.** That is a naming lesson, not this defect.
+
+## 1379. the -C precedence and PowerShell environment-assignment classes reach the governed shared config on both gates, and no rule models either
+
+> 🔢 **Filed 2026-08-28 (lander) - INHERITED, not introduced; both are allowed on the pre-fix gate too.**
+> Verdict: build
+> Closing-act: code
+
+**Cluster:** Development harness. **Priority:** P2. **Verdict:** build (medium).
+**Severity:** no product effect and no PHI effect -- this governs agent behaviour in development. **Both classes are CONSEQUENCE-PROVEN: the write really reaches the governed shared config, verified by reading the config back.**
+
+**CLASS ONE, `-C` PRECEDENCE.** `git -C X --git-dir=<governed>/.git config <key>` writes the GOVERNED config and is ALLOWED on both the pre-fix and post-fix gates. Real git applies `-C` and then lets `--git-dir` decide; the rule does not model that composition.
+
+**CLASS TWO, THE POWERSHELL ENVIRONMENT SPELLING.** The gate's `GIT_DIR` enumeration matches the POSIX prefix form only. **A pattern cannot reach the PowerShell form, and this was proven by attempting it:** a regex was written, it parsed, it emitted correctly, and three rows were still wrong. In PowerShell the assignment is a separate statement before the separator, so it lands in a **different scan segment** than the git invocation it configures. The gate has no cross-segment environment tracking. **The attempt was reverted rather than shipped, because a regex that looks like coverage and is not is worse than a known gap.**
+
+**SO THIS IS A DESIGN CHANGE, NOT A PATTERN.** Filing it as "add the missing spellings" would ship a fix that closes an instance and leaves the class open.
+
+**PROVENANCE:** both surfaced by a completeness critic during #1065's follow-on work and were explicitly attributed as inherited rather than introduced, after being measured against the pre-fix gate. **Neither is caused by the branch that found them.**
+
+## 1380. the ASVS scorecard gate is path-gated to the one file it validates, so its green history is a history of not running -- and it carries at least two defects that only surface when it does
+
+> 🔢 **Filed 2026-08-29 (lander) - found while holding a scorecard PR; the gate is broken, the PR's content is not.**
+> Verdict: build
+> Closing-act: code
+
+> **RETRACTED IN FULL 2026-08-29 BY ITS OWN FILER. EVERY LOAD-BEARING CLAIM IN THIS ROW IS WRONG, AND THE GATE IT ACCUSES WAS WORKING CORRECTLY THE WHOLE TIME.**
+>
+> **The row is kept rather than deleted because the reasoning failure is worth more than the row was, and because a deleted row cannot be found by whoever repeats it.**
+>
+> **DEFECT 1 -- `accepts at most 1 arg(s), received 4` -- WAS NOT CI. IT WAS THE FILER'S OWN `gh` COMMAND.** Measured: that string appears **0 times** in the 592-line job log, against a positive control of 37 hits for `anchor`/`scorecard` in the same log through the same pipe. `gh pr checks` emits four tab-separated fields per row -- name, state, elapsed, url -- and an unquoted row splatted into a `gh` subcommand taking one positional argument produces exactly that error, once per row. **The thing that read as corroboration was the tell:** *"received 4"* identical across two differently-named checks. The 4 is the row's field count, not a property of either check. Two checks failing identically read as a systemic fault; it was one command failing twice.
+>
+> **DEFECT 2 -- `[scorecard].anchor_commit is missing` -- NEVER FIRED. The filer read the workflow's own shell source as an emitted error.** The log line is `test -n "$sha" || { echo "::error::[scorecard].anchor_commit is missing"; exit 1; }` -- the guard's *text*, echoed as the step runs. The only emitted error in the whole job is `##[error]Process completed with exit code 1`. The row's own evidence for this half -- that `anchor_commit` is present and unchanged on all three refs -- was correct and proved the opposite of what it was cited for: **the value was fine because the guard never ran.**
+>
+> **THE HEADLINE -- "its green history is a history of not running" -- IS REFUTED BY DOCUMENTED DESIGN.** The skips are deliberate, visible, and engineered against the exact hazard this row claimed to discover. `.github/workflows/asvs-scorecard.yml:65-77` states it:
+>
+> > *"WHY THIS JOB EXISTS, AND WHY IT IS NOT A `paths:` FILTER ... workflow `paths:` filter -> no check reported -> ABSENCE, which reads as success; job-level `if:` -> check reported as SKIPPED -> visibly not run"*
+>
+> and at `:118-119` it records having already hit and fixed the near-miss version: *"Leaving it out set relevant=false and reported SKIPPED, which is not green but is read as green by anyone glancing at the checks list."* **A SKIP IS NOT AN ABSENCE, AND THE DIFFERENCE IS THE WHOLE POINT OF THE DESIGN.** The row treated a reported SKIPPED as a silent non-run.
+>
+> **AND THE TWO CHECKS ARE ADVISORY, SO NOTHING WAS EVER GATED ON THEM.** `required_status_checks.contexts` on the vault's `main` is `["verified-at", "every cited requirement identifier resolves"]`. The row's stated stakes -- that landing would mean landing over the only checks that validate a scorecard change -- were false about *gating*, though the change genuinely was the only one exercising them.
+>
+> **WHAT WAS ACTUALLY WRONG, and it is the gate working rather than failing:** `verify` reported real findings (absence claims already with the owner) and `render-drift` reported a real `git diff` -- the committed rendered view was stale against the data. **The cron leg had been failing daily for nine days. The gate was shouting, not sleeping.**
+>
+> **THE PROCESS FAILURE IS THE PART WORTH KEEPING.** The filer stated plainly what had not been established -- named the two jobs, said the logs were read and no further, declined to guess which CLI or when it broke. **That honesty did not prevent the error, because the unexamined premise was not in the uncertain part.** It was in the part that felt measured: an error string copied out of a terminal was assumed to have come from the thing being examined. **A quoted error message is evidence about whichever process emitted it, and identifying that process is a separate measurement nobody made.**
+>
+> **DO NOT DRAW THE LESSON THAT THE RED SHOULD HAVE BEEN WAVED THROUGH.** Refusing to land a scorecard change over the only two checks that exercise scorecard changes was right on the information available, and would have been worth days had the gate genuinely been blind. **The error was the diagnosis, not the caution.**
+>
+> **DISPOSITION: this row describes no defect. It is superseded by nothing and should be closed by whoever dispositions it, not rebuilt.**
+
+**Cluster:** CI workflow. **Priority:** P2. **Verdict:** build (small).
+**Severity:** no engine effect, no PHI axis, no deployment axis (sec. 0). It governs the vault's security record, not the product. **The severity is that the gate reads as passing while never executing, not that any verdict is wrong.**
+
+**THE SHAPE, AND IT IS THE POINT: A PATH FILTER PLUS A BROKEN INVOCATION IS INDISTINGUISHABLE FROM A HEALTHY GATE.** The `verify` and `render-drift` checks are path-gated to `docs/security/asvs-scorecard.toml`. Nothing else in the repository touches that file. So on every pull request that does not change the scorecard, both checks report **SKIPPED**, the workflow reports **success**, and the rollup is green.
+
+**MEASURED, and the control is what makes it a finding rather than a suspicion.** A first pass compared the scorecard branch against three others and found the workflow succeeding everywhere else and failing only on the scorecard branch -- which reads as a defect in that branch. Checking what those successes were made of inverted it:
+
+```
+vault/lane-gauge-homefix          verify = SKIPPED    render-drift = SKIPPED
+vault/lane-gauge-20260828         verify = SKIPPED    render-drift = SKIPPED
+steward-burn-history              verify = SKIPPED    render-drift = SKIPPED
+asvs-advisory-line-repair-22      verify = FAILURE    render-drift = FAILURE
+```
+
+**Every green was a skip.** The first change in the observable window to actually exercise these checks fails immediately.
+
+**TWO DISTINCT DEFECTS, ON TWO DIFFERENT TIPS OF THE SAME BRANCH. Neither is the branch's content.**
+
+1. **Tip `3e7c02619` -- an argument-arity error.** `accepts at most 1 arg(s), received 4`. A `.toml` content change cannot cause a workflow to pass four arguments to a command that takes one, so the mismatch is between the workflow's command line and whatever CLI actually runs. **Which side moved is UNESTABLISHED and this row does not claim to know.**
+
+2. **Tip `ce3ad71f6` -- a false claim about the data.** The job exits on `::error::[scorecard].anchor_commit is missing`. **It is not missing.** Measured on all three refs:
+
+```
+origin/main                    anchor_commit present, 1 occurrence
+asvs-advisory-line-repair-22   anchor_commit present, 1 occurrence, byte-identical value
+3e7c02619                      anchor_commit present, 1 occurrence
+diff of the second commit against the first, filtered to that key:  EMPTY
+```
+
+**The value exists, is unchanged, and the second commit never touched it.** So the gate's extraction of it is wrong, and it reports a defect in the record when the fault is in its own reading. **That is the third instrument this fleet has nearly filed as a broken subject when the failure was in the instrument's own message.**
+
+**THE MEASURED NEGATIVE, so nobody spends a cycle on the obvious hypothesis.** The natural guess is that the vault's mirrored `scripts/asvs/scorecard.py` is stale against a workflow written for a newer CLI. **It is not the cause.** The whole difference between the vault copy and the engine's is one hunk, 15 lines added and 0 removed, 14 of them comments, and the single executable line is a `newline=""` keyword inside the render path. Both copies produce byte-identical verdict streams. **Landing the mirror is still worth doing for parity; it will not clear this red, and it must not be reported as the fix.**
+
+**WHY THIS BLOCKS SOMETHING TODAY.** A scorecard change is held on it. Its required contexts are green and its content was independently verified, but landing it would mean landing a scorecard change over **the only two checks that would ever validate a scorecard change** -- a compensating control resting on a false premise. The change's author declined to authorise that, correctly: deciding a red gate is acceptable is not the branch author's call.
+
+**Related:** the `verified-at` and `every cited requirement identifier resolves` checks are NOT path-gated and pass normally. They are a different, working pair, and this row is not about them.
+
+**UNTESTED:** nobody has run either check locally, and the workflow's own invocation was read but not executed. Whether the two failures share a root cause, or are two independent breakages that surfaced together because nothing exercised either, is **open**.

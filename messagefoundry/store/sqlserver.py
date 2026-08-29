@@ -1376,7 +1376,12 @@ _SCHEMA: list[str] = [
         channel_scope NVARCHAR(MAX) NULL, totp_secret NVARCHAR(MAX) NULL,
         totp_enabled BIT NOT NULL DEFAULT 0, totp_enrolled_at FLOAT NULL,
         totp_recovery_codes NVARCHAR(MAX) NULL, last_totp_step INT NULL,
-        oidc_issuer NVARCHAR(MAX) NULL, oidc_subject NVARCHAR(MAX) NULL,
+        -- BACKLOG #1256: SIZED, NOT MAX, BECAUSE A MAX COLUMN CANNOT BE AN INDEX KEY on SQL
+        -- Server, and ux_users_federated_subject below is what makes the application guard's
+        -- read-then-write atomic. 256 is this file's dominant width (55 uses); the composite
+        -- key is then 2 x 256 x 2 bytes = 1024, inside the 1700-byte nonclustered limit.
+        -- NVARCHAR(450), the other precedent here, would be 1800 across two columns and fail.
+        oidc_issuer NVARCHAR(256) NULL, oidc_subject NVARCHAR(256) NULL,
         password_claimed_at FLOAT NULL)""",
     """IF COL_LENGTH('users','channel_scope') IS NULL
         ALTER TABLE users ADD channel_scope NVARCHAR(MAX) NULL""",
@@ -1395,9 +1400,28 @@ _SCHEMA: list[str] = [
     # Federated (issuer, sub) identity keying (BACKLOG #1015): COL_LENGTH-gated ADD on a pre-existing
     # users table. NULL on existing rows = "not yet federated" (username stays the sole key). Idempotent.
     """IF COL_LENGTH('users','oidc_issuer') IS NULL
-        ALTER TABLE users ADD oidc_issuer NVARCHAR(MAX) NULL""",
+        ALTER TABLE users ADD oidc_issuer NVARCHAR(256) NULL""",
     """IF COL_LENGTH('users','oidc_subject') IS NULL
-        ALTER TABLE users ADD oidc_subject NVARCHAR(MAX) NULL""",
+        ALTER TABLE users ADD oidc_subject NVARCHAR(256) NULL""",
+    # BACKLOG #1256: RE-TYPE A PRE-EXISTING MAX COLUMN, WHICH THE COL_LENGTH-GATED ADDs ABOVE CANNOT
+    # REACH. They fire only when the column is ABSENT, so a users table created before this change
+    # keeps NVARCHAR(MAX) -- and a MAX column CANNOT BE AN INDEX KEY, so the index below would fail
+    # against exactly the databases that already exist. COL_LENGTH returns -1 for a MAX column, which
+    # is how this tells "already sized" from "needs re-typing" without reading catalogue views.
+    #
+    # MUST RUN BEFORE the index. _SCHEMA is applied in order, so position here is load-bearing.
+    """IF COL_LENGTH('users','oidc_issuer') = -1
+        ALTER TABLE users ALTER COLUMN oidc_issuer NVARCHAR(256) NULL""",
+    """IF COL_LENGTH('users','oidc_subject') = -1
+        ALTER TABLE users ALTER COLUMN oidc_subject NVARCHAR(256) NULL""",
+    # The atomicity the application guard cannot provide: auth/service.py reads the current holder and
+    # writes the binding in two separate awaits, so two concurrent FIRST logins for one subject can
+    # both observe "no holder" and both bind. FILTERED so unfederated rows coexist -- and on SQL Server
+    # the filter is REQUIRED, not stylistic: unlike SQLite and Postgres it treats NULLs as EQUAL in a
+    # unique index, so an unfiltered index would permit exactly ONE unfederated user in the table.
+    """IF INDEXPROPERTY(OBJECT_ID('users'),'ux_users_federated_subject','IndexID') IS NULL
+        CREATE UNIQUE INDEX ux_users_federated_subject ON users(oidc_issuer, oidc_subject)
+        WHERE oidc_issuer IS NOT NULL AND oidc_subject IS NOT NULL""",
     # Claimed-ness of the bootstrap admin (BACKLOG #1245): NULL on an existing row would read as
     # "never claimed", which is what would retire an account whose holder claimed it long ago — this
     # defect, re-introduced by its own fix. So the ADD is paired with a one-time backfill: a local
