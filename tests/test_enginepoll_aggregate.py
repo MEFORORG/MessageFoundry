@@ -22,6 +22,13 @@ import pytest
 
 from harness.load import enginepoll
 from harness.load.enginepoll import EnginePoller, _ShardSample
+from messagefoundry.api.models import (
+    DbInfo,
+    EngineInfo,
+    EngineKpis,
+    StatsResponse,
+    SystemStatus,
+)
 
 
 def _shard(
@@ -136,9 +143,11 @@ def test_committed_txns_sums_across_shards(monkeypatch: pytest.MonkeyPatch) -> N
 def test_claim_lock_timeouts_sums_across_shards(monkeypatch: pytest.MonkeyPatch) -> None:
     """BACKLOG #1270: the lock-timeout counter aggregates like the other live counters.
 
-    It is the harness's only consumer of the /stats field, and a field nothing reads is a field
-    nothing catches when it breaks — the shipped first attempt had two source lines, no test and no
-    reader. Distinct per-shard values so a dropped shard cannot be masked by a coincidental sum.
+    THIS COVERS THE SUM, AND ONLY THE SUM. ``_poller_over`` monkeypatches ``_sample_shard`` away, so
+    this arm starts from a ``_ShardSample`` that ALREADY carries the value and never executes the
+    line that reads it off ``/stats``. The sibling test below drives that line; the two are kept
+    separate because they fail separately. Distinct per-shard values so a dropped shard cannot be
+    masked by a coincidental sum.
 
     THE UNIT SURVIVES THE SUM. These are ROUND-TRIPS, not lanes: summing shards is right (each shard
     runs its own claimers), dividing by ``empty_claims`` would not be.
@@ -154,6 +163,96 @@ def test_claim_lock_timeouts_sums_across_shards(monkeypatch: pytest.MonkeyPatch)
     sample = asyncio.run(poller.sample_once())
     assert sample is not None
     assert sample.claim_lock_timeouts == 9  # 7 + 2 + 0
+
+
+def _stats(*, claim_lock_timeouts: int, in_pipeline: int, committed_txns: int) -> StatsResponse:
+    """A real ``/stats`` body. The REAL model, not a stand-in: the reader under test is a
+    ``getattr(stats, "<name>", 0)``, so the field NAME is the contract, and only the real model can
+    fail this test when that name moves. Named parameters rather than a ``**kwargs`` splat for the
+    same reason — a typo'd field name here would be silently accepted by the splat."""
+    return StatsResponse(
+        outbox_by_status={"pending": 3, "inflight": 2, "done": 40, "dead": 1},
+        claim_lock_timeouts=claim_lock_timeouts,
+        in_pipeline=in_pipeline,
+        committed_txns=committed_txns,
+    )
+
+
+def _status() -> SystemStatus:
+    return SystemStatus(
+        engine=EngineInfo(
+            version="0",
+            uptime_seconds=12.5,
+            pid=1,
+            channels_total=1,
+            channels_running=1,
+            channels_stopped=0,
+            outbox_by_status={},
+        ),
+        kpis=EngineKpis(),
+        db=DbInfo(
+            path=":memory:",
+            size_bytes=4096,
+            disk_free_bytes=1,
+            journal_mode="wal",
+            messages=0,
+            events=0,
+            audit=0,
+        ),
+    )
+
+
+class _StatsClient:
+    """A stand-in for an opened ``EngineClient``: the three reads ``_sample_shard`` performs."""
+
+    def __init__(self, stats: StatsResponse) -> None:
+        self._stats = stats
+
+    def stats(self) -> StatsResponse:
+        return self._stats
+
+    def connections(self) -> list[object]:
+        return []
+
+    def status(self) -> SystemStatus:
+        return _status()
+
+
+def test_sample_shard_reads_claim_lock_timeouts_off_the_stats_body() -> None:
+    """BACKLOG #1270: the ONE line in the repo that reads the ``/stats`` field actually runs.
+
+    THE DEFECT THIS PINS, and it is a coverage hole rather than a wrong answer. Every other test in
+    this file monkeypatches ``_sample_shard`` away, so ``enginepoll.py``'s
+    ``getattr(stats, "claim_lock_timeouts", 0)`` — the field's only reader anywhere — never executed.
+    Measured: misspelling that key to ``"claim_lock_timeout"`` left this suite at 7 passed, byte for
+    byte, while the harness would have reported 0 lock timeouts forever.
+
+    A ``getattr``-WITH-DEFAULT IS THE SHAPE THAT CANNOT FAIL LOUDLY, which is exactly why it is the
+    line that most needed a test. It is there for a real reason — an older engine's ``/stats`` has no
+    such field and must read as 0, not raise — so it cannot be replaced with a plain attribute read.
+    That makes a test the only way the name is checked at all.
+
+    NO MONKEYPATCH, deliberately: ``_sample_shard`` runs as shipped, over the REAL ``StatsResponse``.
+    A stand-in object with the field spelled by hand would pass just as well against a renamed model,
+    which would make this test agree with the defect instead of catching it.
+
+    THE OTHER FIELDS ARE ASSERTED TOO, as a non-vacuousness control: if the read were failing wholesale
+    the lock-timeout zero would be indistinguishable from a correctly-read zero."""
+    poller = EnginePoller(["http://shard-a"], None, origin=time.perf_counter())
+    client = _StatsClient(_stats(claim_lock_timeouts=7, in_pipeline=5, committed_txns=88))
+    poller._clients = [client]  # type: ignore[list-item]
+
+    sample = asyncio.run(poller.sample_once())
+
+    assert sample is not None
+    assert sample.claim_lock_timeouts == 7, (
+        "the /stats lock-timeout field did not reach the sample — the harness's only reader of it"
+        " looked up a name the engine does not publish, and the getattr default made that silent"
+    )
+    assert (sample.in_pipeline, sample.committed_txns) == (5, 88), (
+        "control: the shard read is working generally, so the assertion above is about THIS field"
+    )
+    assert (sample.pending, sample.inflight, sample.done, sample.dead) == (3, 2, 40, 1)
 
 
 def test_one_unreachable_shard_skips_the_whole_sample(monkeypatch: pytest.MonkeyPatch) -> None:

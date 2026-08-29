@@ -324,12 +324,20 @@ class StageDispatcher:
         # None -> a private _LocalEmptyCounter, so PR3 / tests stay self-contained.
         self._empty: _EmptyClaimObserver = empty_counter or _LocalEmptyCounter()
         # BACKLOG #1270: the lock-timeout INFO line's windowed throttle (the claim/delivery phase
-        # summaries' convention, same interval). `-inf` so the FIRST abort of a process emits at once
-        # — a five-second silence at the start is exactly the silence this line exists to break.
-        # Aborts are counted into the window even when the line is suppressed, so the emitted number
-        # is the window's true total and not a sample.
+        # summaries' convention, same interval), read off `self._clock` — the ONE base this class's
+        # claim due-ness, park deadlines, `_call_later` and sweep already share. `-inf` so the FIRST
+        # abort of a process emits at once — a five-second silence at the start is exactly the
+        # silence this line exists to break. Aborts are counted into the window even when the line
+        # is suppressed AND the window is flushed on any later round-trip, so the emitted number is
+        # that window's true total and not a sample of it.
         self._lock_timeout_last_emit = float("-inf")
         self._lock_timeouts_since_emit = 0
+        # The last-seen abort's attempt-scoped detail, for the emitted line's "most recent abort"
+        # clause. Held here because the flush may land on a round-trip that did NOT abort, which has
+        # no `lock_timeout` of its own to read. Only ever read when the window is non-empty, which
+        # means an abort has set them; the initial values are never printed.
+        self._lock_timeout_last_phase = ""
+        self._lock_timeout_last_lanes = 0
         # Debug tripwire: the one-consumer-per-lane invariant. Must stay 0 (the 200-lane soak asserts).
         self._busy_violations = 0
 
@@ -682,12 +690,20 @@ class StageDispatcher:
         # and its timeout-capped duration would distort the very claim-latency figure this measures.
         # The tempdb signature is slow-but-SUCCESSFUL claims, which are recorded.
         _claim_t0 = time.perf_counter_ns() if self._claim_phase_timing else 0
+        # ONE clock read for this whole round-trip, on the dispatcher's injected base — the claim's
+        # due-ness AND the lock-timeout throttle window below both read it. Hoisted rather than read
+        # twice so "the throttle is on the same clock as the claim" is literal, not merely equal.
+        # Deliberately NOT `time.monotonic()` like the three `phase_timing` throttles: those live on
+        # objects with no injected clock, this one lives on a class whose every other time decision
+        # (claim due-ness, park deadlines, `_call_later`, the sweep) is `self._clock` — so a monotonic
+        # read here is the one that cannot be advanced by a test, not the one that is consistent.
+        now = self._clock()
         try:
             # Pass the dispatcher's clock so claim due-ness uses the SAME time base as the sweep +
             # park timers (one coherent clock). In production clock is time.time(), so this is
             # identical to now=None; it only matters under an injected clock (deterministic tests).
             result: ClaimedHeads = await self._store.claim_fifo_heads(
-                self._stage.value, lanes, now=self._clock(), per_lane_limit=self._per_lane_limit
+                self._stage.value, lanes, now=now, per_lane_limit=self._per_lane_limit
             )
         except Exception:  # noqa: BLE001 — a store error must not kill the claimer loop
             # Return the whole chunk to READY, release the reserved slots, back off this partition.
@@ -792,24 +808,41 @@ class StageDispatcher:
         # window is per STAGE, not per claimer — like `_claim_phase_stats`, and for the same reason:
         # sibling claimers at K>1 write the same operator's log. Safe to share because this whole
         # block is await-free, so a sibling can never interleave a partial update.
+        # (5) BOOKING AND EMITTING ARE SEPARATE STEPS. An abort BOOKS into the open window; the
+        # window is evaluated on EVERY round-trip, aborted or not — the discipline
+        # `_emit_lane_episode()` states six lines below, for the same reason. Gated behind the abort
+        # branch the printed number was not the window's number, in either direction: a burst
+        # under-reported (its suppressed aborts were counted and then flushed by nothing) and the
+        # next isolated abort over-reported (inheriting a total from a window long closed).
+        # `phase`/`lanes_in_claim` are ATTEMPT-scoped, so the clause below carries the LAST-SEEN
+        # abort's values: a flush can now land on a round-trip that did not abort, and such a
+        # round-trip has no phase of its own to print.
         if lock_timeout is not None:
             self._empty.record_claim_lock_timeout()
             self._lock_timeouts_since_emit += 1
-            now = time.monotonic()
-            if now - self._lock_timeout_last_emit >= _DELIVERY_PHASE_EMIT_INTERVAL:
-                self._lock_timeout_last_emit = now
-                log.info(
-                    "StageDispatcher %s: %d claim round-trip(s) in the last window aborted on a "
-                    "store lock timeout (most recent: %s phase, %d lane(s) in the claim); nothing "
-                    "was claimed, every lane in the chunk drops to IDLE and the sweep re-readies "
-                    "them. At least one row the claim needed was held — the claim rolled back "
-                    "before reading a row, so the store cannot say which (BACKLOG #1270)",
-                    self._stage.value,
-                    self._lock_timeouts_since_emit,
-                    lock_timeout.phase.value,
-                    lock_timeout.lanes_in_claim,
-                )
-                self._lock_timeouts_since_emit = 0
+            self._lock_timeout_last_phase = lock_timeout.phase.value
+            self._lock_timeout_last_lanes = lock_timeout.lanes_in_claim
+        # An EMPTY window returns WITHOUT touching `_lock_timeout_last_emit` — the same rule, for the
+        # same reason, that `LaneEpisodeTiming.maybe_emit` states in full (phase_timing.py): this runs
+        # on every round-trip, so stamping the clock on a nothing-to-say tick would throttle the next
+        # REAL sample for a whole window. Here it would also consume the `-inf` start and delay the
+        # first abort of a process by five seconds — the exact silence this line exists to break.
+        if self._lock_timeouts_since_emit and (
+            now - self._lock_timeout_last_emit >= _DELIVERY_PHASE_EMIT_INTERVAL
+        ):
+            self._lock_timeout_last_emit = now
+            log.info(
+                "StageDispatcher %s: %d claim round-trip(s) in the last window aborted on a "
+                "store lock timeout (most recent abort: %s phase, %d lane(s) in the claim); "
+                "nothing was claimed, every lane in the chunk drops to IDLE and the sweep "
+                "re-readies them. At least one row the claim needed was held — the claim rolled "
+                "back before reading a row, so the store cannot say which (BACKLOG #1270)",
+                self._stage.value,
+                self._lock_timeouts_since_emit,
+                self._lock_timeout_last_phase,
+                self._lock_timeout_last_lanes,
+            )
+            self._lock_timeouts_since_emit = 0
         # Flush the episode window on EVERY claim round-trip, exactly as the claim line already does. A
         # stage that has gone quiet still CLAIMS (empty claims keep firing while the sweep re-readies
         # lanes), so this is what guarantees a draining rung's FINAL window — the tail, where S_lane is

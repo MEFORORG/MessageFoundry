@@ -207,9 +207,21 @@ class _FakeCursor:
 
 
 class _FakeConn:
-    def __init__(self, ops: _Ops, *, fail_first_commit: bool = False, tag: str = "") -> None:
+    def __init__(
+        self,
+        ops: _Ops,
+        *,
+        fail_first_commit: bool = False,
+        first_commit_error: BaseException | None = None,
+        tag: str = "",
+    ) -> None:
         self.ops = ops
-        self._fail_first_commit = fail_first_commit
+        # BACKLOG #1270: `first_commit_error` fails commit#1 with a CHOSEN exception, so a 1222 can
+        # be raised there — the ordinary path where the H2 probe MISSED and no finalize DML ran.
+        # `fail_first_commit=True` keeps its shipped RuntimeError, so every existing driver is
+        # unchanged; passing an error implies the failure, so the two knobs cannot disagree.
+        self._fail_first_commit = fail_first_commit or first_commit_error is not None
+        self._first_commit_error = first_commit_error or RuntimeError("injected commit#1 failure")
         self._tag = tag
 
     def _kind(self, kind: str) -> str:
@@ -219,7 +231,7 @@ class _FakeConn:
         if self._fail_first_commit:
             self._fail_first_commit = False
             self.ops.append((self._kind("commit-failed"),))
-            raise RuntimeError("injected commit#1 failure")
+            raise self._first_commit_error
         self.ops.append((self._kind("commit"),))
 
     async def rollback(self) -> None:
@@ -297,6 +309,7 @@ async def _drive(
     fail_h2_update: BaseException | None = None,
     h2_already_delivered: bool = False,
     fail_first_commit: bool = False,
+    first_commit_error: BaseException | None = None,
     per_lane_limit: int = 1,
     store: SqlServerStore | None = None,
 ) -> tuple[_Ops, SqlServerStore, ClaimedHeads]:
@@ -310,7 +323,9 @@ async def _drive(
         fail_h2_update=fail_h2_update,
         h2_already_delivered=h2_already_delivered,
     )
-    conn = _FakeConn(ops, fail_first_commit=fail_first_commit)
+    conn = _FakeConn(
+        ops, fail_first_commit=fail_first_commit, first_commit_error=first_commit_error
+    )
     _wire(store, cur, conn)
     lanes = [f"lane-{i:03d}" for i in range(n_lanes)]
     result = await store.claim_fifo_heads(stage, lanes, now=_NOW, per_lane_limit=per_lane_limit)
@@ -471,6 +486,36 @@ async def test_ac3_1222_yields_empty_all_and_guard_runs(fold: bool) -> None:
 # --- BACKLOG #1270: what a lock-timeout yield is allowed to CLAIM to know -------------------------
 
 
+def _lanes_named_at(value: Any, requested: set[str], path: str) -> dict[str, list[str]]:
+    """Every place in ``value`` that names a requested lane, keyed by DOTTED path.
+
+    Recurses through dataclasses and through containers' elements, so a lane name is found wherever
+    it is sited — ``rearm`` at the top level, ``lock_timeout.contended_lanes`` one level down, or a
+    bare ``str`` field. A walk that stops at the top level reports the same clean result for a
+    structure that hides the fabrication in a nested field, which is the shape #1270 itself
+    introduced (``ClaimedHeads.lock_timeout`` is a dataclass, so the original walk skipped it)."""
+    if dataclasses.is_dataclass(value) and not isinstance(value, type):
+        found: dict[str, list[str]] = {}
+        for f in dataclasses.fields(value):
+            child = f"{path}.{f.name}" if path else f.name
+            found |= _lanes_named_at(getattr(value, f.name), requested, child)
+        return found
+    if isinstance(value, str):  # BEFORE the container check — a str is iterable, by CHARACTER
+        return {path: [value]} if value in requested else {}
+    if isinstance(value, frozenset | set | list | tuple | dict):
+        # `set(dict)` is its KEYS, which is where by_lane sites a lane name.
+        found = {path: sorted(requested & set(value))} if requested & set(value) else {}
+        elements = value.values() if isinstance(value, dict) else value
+        for i, element in enumerate(elements):
+            # Strings are already covered by the intersection above; recursing into them too would
+            # report the same 256 names once as a container and 256 times again as elements, and
+            # bury the ONE path a reader needs under its own restatement.
+            if not isinstance(element, str):
+                found |= _lanes_named_at(element, requested, f"{path}[{i}]")
+        return found
+    return {}
+
+
 async def test_a_lock_timeout_never_names_a_lane_the_claim_never_observed() -> None:
     """The regression test for BACKLOG #1270's first shipped attempt.
 
@@ -483,24 +528,59 @@ async def test_a_lock_timeout_never_names_a_lane_the_claim_never_observed() -> N
 
     THE PROPERTY, and why it is stated over the WHOLE object rather than one field. Nothing was
     claimed here, so a lane name appearing ANYWHERE in the result is a fabrication by construction —
-    ``by_lane`` is the only field entitled to carry one and it is empty. Walking every field keeps
-    this pinned against a future field that re-introduces the same claim under a new name, which a
-    single-field assertion would not.
+    ``by_lane`` is the only field entitled to carry one and it is empty. Walking the whole object
+    keeps this pinned against a future field that re-introduces the same claim under a new name,
+    which a single-field assertion would not.
+
+    THE WALK GOES ALL THE WAY DOWN, and it has to. The version this replaces walked
+    ``dataclasses.fields(result)`` and kept only TOP-LEVEL containers — so ``lock_timeout``, a
+    dataclass, was skipped entirely, and the guard was blind to every field inside the very object
+    #1270 added. Measured: a ``ClaimLockTimeout.contended_lanes`` populated from the caller's request
+    at widths above 8 sent 256 fabricated lane names out of the store at the production-default
+    chunk with the whole 223-test set green — including this guard. Sited one level up, the
+    identical field fails here loudly, which is the proof that what moved was the guard's REACH and
+    not the property it states.
 
     256 IS THE POINT, not decoration. ``wiring_runner`` computes the pooled chunk as
     ``min(pooled_claim_lane_chunk, backend_chunk)`` = ``min(256, 500)`` on SQL Server, and pooled is
     the default claim mode — so this is the default path at its default width. At 1 or 4 lanes (what
-    the pre-existing arms use) naming every requested lane is indistinguishable from correct."""
+    the pre-existing arms use) naming every requested lane is indistinguishable from correct — and a
+    width-gated fabrication that only arms above those widths is invisible to every equality
+    assertion in this file, which all drive 1 or 4 lanes."""
     chunk = 256
     requested = {f"lane-{n:03d}" for n in range(chunk)}
+
+    # POSITIVE CONTROL, first, because a walk that finds nothing ANYWHERE is indistinguishable from a
+    # clean result — the guard's green would then be an artefact of the instrument, not a reading.
+    # This is the exact failure the version it replaces had: it walked only top-level fields and so
+    # reported clean for a nested siting, silently. Each of the three shapes below is a real
+    # regression shape, and the walk must name each by its dotted path.
+    @dataclasses.dataclass(frozen=True)
+    class _Inner:
+        lanes: frozenset[str]
+
+    @dataclasses.dataclass(frozen=True)
+    class _Probe:
+        top: frozenset[str]
+        inner: _Inner
+        bare: str
+
+    probe = _lanes_named_at(
+        _Probe(top=frozenset({"lane-000"}), inner=_Inner(frozenset({"lane-001"})), bare="lane-002"),
+        requested,
+        "",
+    )
+    assert probe == {
+        "top": ["lane-000"],
+        "inner.lanes": ["lane-001"],
+        "bare": ["lane-002"],
+    }, (
+        f"the walk cannot see the sitings it exists to catch, so its clean result proves nothing: {probe}"
+    )
+
     _ops, _store, result = await _drive("ingress", chunk, fail_batch=_lock_timeout_error())
     assert result.by_lane == {} and result.rearm == frozenset(), "sanity: nothing was claimed"
-    named = {
-        f.name: sorted(requested & set(getattr(result, f.name)))
-        for f in dataclasses.fields(result)
-        if isinstance(getattr(result, f.name), frozenset | set | list | tuple | dict)
-        and requested & set(getattr(result, f.name))
-    }
+    named = _lanes_named_at(result, requested, "")
     assert not named, (
         f"the claim named lane(s) it never observed: { {k: len(v) for k, v in named.items()} } of"
         f" {chunk} requested. The batch raised before fetchall ran, so the store read no row and"
@@ -544,6 +624,50 @@ async def test_a_lock_timeout_reports_which_population_aborted() -> None:
     # The EMPTY-all contract is identical on both — only the REPORTING differs, never a row.
     assert head.by_lane == {} and head.rearm == frozenset()
     assert finalize.by_lane == {} and finalize.rearm == frozenset()
+
+
+async def test_an_h2_probe_that_misses_is_never_labelled_finalize() -> None:
+    """BACKLOG #1270 finding 2, the case its own test did not cover.
+
+    THE DEFECT. ``abort_phase = ClaimAbortPhase.FINALIZE`` was assigned on ENTERING the H2 branch —
+    before the ``delivered_keys`` probe, and therefore before it is known whether any finalize DML
+    will run at all. The probe MISSES on the ordinary outbound path (the row has not been delivered
+    yet, which is why it is being claimed), so no finalize statement executes; a 1222 raised by the
+    claim's own COMMIT after that point was nevertheless reported as ``finalize``. The comment
+    justifying the single assignment — "once finalize DML has run in it, the finalize row locks are
+    held" — states a premise that is false on exactly this path.
+
+    WHY THIS IS THE COMMON CASE, not a corner. Every outbound claim of a not-yet-delivered row takes
+    it. The one shape the suite asserted, ``h2_already_delivered=True`` with a failing UPDATE, is the
+    one shape that makes the label true — so a deploying site WOULD read "a contended finalize row"
+    for a contended queue head, and go looking in the wrong table.
+
+    THE WIRE OPS ARE THE EVIDENCE, not the label. Asserting ``phase == "head"`` alone would pass on
+    a build that simply never set FINALIZE anywhere; requiring that the H2 branch WAS entered and
+    that no finalize statement ran makes this discriminate the fix from its absence."""
+    ops, _store, result = await _drive(
+        "outbound",
+        1,
+        rows=[_row("r1", destination_name="OB_ACME")],
+        h2_already_delivered=False,  # the probe MISSES -> the finalize DML is never reached
+        first_commit_error=_lock_timeout_error(),
+    )
+    kinds = _op_kinds(ops)
+    assert "execute-h2-probe" in kinds, (
+        "non-vacuousness: the H2 branch must have been ENTERED (destination_name is set), or this"
+        f" asserts nothing about where the label is assigned — got {kinds}"
+    )
+    assert "execute-h2-update" not in kinds, (
+        f"no finalize DML may have run on a probe MISS — got {kinds}"
+    )
+    assert result.lock_timeout is not None, "the abort must still be reported"
+    assert result.lock_timeout.phase == "head", (
+        "a 1222 with no finalize statement in the transaction was labelled FINALIZE. The label is"
+        " per-transaction by design — a later row's abort after an earlier row's finalize IS"
+        " finalize — but here nothing was finalized at all, so the report names the wrong table."
+    )
+    # The EMPTY-all contract is untouched on this path too: reporting changed, no row moved.
+    assert result.by_lane == {} and result.rearm == frozenset()
 
 
 @pytest.mark.parametrize("fold", [False, True])

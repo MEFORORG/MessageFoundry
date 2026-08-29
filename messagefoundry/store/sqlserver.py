@@ -7074,15 +7074,20 @@ class SqlServerStore:
                     # SAFE: no partial finalize, the heads stay PENDING for the next tick. (The
                     # per-message finalize applock uses its own @LockTimeout and is unaffected.)
                     if d["destination_name"] is not None:
-                        # BACKLOG #1270: from here on, a 1222 reaching the handler below came from
-                        # the FINALIZE population described above, not from a queue head. One
-                        # assignment, no restructuring — it stays FINALIZE for the rest of the txn
-                        # because once finalize DML has run in it, the finalize row locks are held.
-                        abort_phase = ClaimAbortPhase.FINALIZE
                         await cur.execute(
                             "SELECT 1 FROM delivered_keys WHERE outbox_id=?", (d["id"],)
                         )
                         if await cur.fetchone() is not None:
+                            # BACKLOG #1270: from here on, a 1222 reaching the handler below came
+                            # from the FINALIZE population described above, not from a queue head.
+                            # SITED AFTER THE PROBE, and that placement is the claim's whole
+                            # warrant: the probe MISSES on every ordinary outbound claim (the row
+                            # has not been delivered yet, which is why it is being claimed), and
+                            # assigning above it labelled that common path FINALIZE with no
+                            # finalize statement anywhere in the transaction. It still stays
+                            # FINALIZE for the REST of the txn — once the DML below has run, its
+                            # row locks are held, so a later row's abort really is finalize-caused.
+                            abort_phase = ClaimAbortPhase.FINALIZE
                             await cur.execute(
                                 "UPDATE queue SET status=?, last_error=NULL, updated_at=?,"
                                 " owner=NULL, lease_expires_at=NULL WHERE id=?",

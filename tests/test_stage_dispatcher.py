@@ -43,6 +43,7 @@ import pytest
 
 from messagefoundry.config.models import RetryPolicy
 from messagefoundry.pipeline.alerts import LoggingAlertSink
+from messagefoundry.pipeline.phase_timing import _DELIVERY_PHASE_EMIT_INTERVAL
 from messagefoundry.pipeline.stage_dispatcher import (
     LaneItemResult,
     LaneResultKind,
@@ -1070,6 +1071,28 @@ async def test_t10_rearm_reready_then_reclaim(store: Any) -> None:
         await d.stop()
 
 
+# --- BACKLOG #1270: the lock-timeout report ------------------------------------------------------
+
+
+def _timeout_lines(caplog: pytest.LogCaptureFixture) -> list[str]:
+    """Every emitted lock-timeout line, in order. One definition of the filter, so an arm asserting
+    a line APPEARED and an arm asserting one did NOT cannot drift into two different questions."""
+    return [r.getMessage() for r in caplog.records if "lock timeout" in r.getMessage()]
+
+
+def _round_trips_in(line: str) -> int:
+    """The number the line PRINTS, in its own stated unit."""
+    head, _, _ = line.partition(" claim round-trip(s)")
+    return int(head.rsplit(" ", 1)[1])
+
+
+def _aborts_reached(d: StageDispatcher, n: int) -> Callable[[], bool]:
+    """A predicate bound to THIS ``n``. A factory rather than a lambda written inside the loop: that
+    lambda closes over the loop variable and re-reads it at call time (ruff B023), so every
+    iteration's wait would test the LAST target and the early ones would pass for the wrong reason."""
+    return lambda: d.claim_lock_timeouts >= n
+
+
 async def test_a_lock_timeout_is_reported_once_while_a_genuinely_empty_claim_stays_quiet(
     store: Any, caplog: pytest.LogCaptureFixture
 ) -> None:
@@ -1128,7 +1151,7 @@ async def test_a_lock_timeout_is_reported_once_while_a_genuinely_empty_claim_sta
         assert d.empty_claims[0] >= 2, (
             "an aborted claim must still count as an EMPTY claim per lane"
         )
-        lines = [r.getMessage() for r in caplog.records if "lock timeout" in r.getMessage()]
+        lines = _timeout_lines(caplog)
         assert len(lines) == 1, (
             f"expected ONE line for the round-trip, got {len(lines)}: {lines!r} — one line per LANE"
             " makes log volume scale with the contention it reports (the monitor becoming the load)"
@@ -1159,7 +1182,7 @@ async def test_a_lock_timeout_is_reported_once_while_a_genuinely_empty_claim_sta
             "an empty CLAIM was reported as a lock timeout — the counter no longer discriminates, so"
             " a non-zero value would stop meaning anything"
         )
-        assert not [r for r in caplog.records if "lock timeout" in r.getMessage()], (
+        assert not _timeout_lines(caplog), (
             "an empty claim emitted the abort line — every empty claim would then look aborted"
         )
     finally:
@@ -1198,7 +1221,7 @@ async def test_repeated_lock_timeouts_stay_one_line_while_the_counter_keeps_ever
             assert await _wait_until(lambda: d.claim_lock_timeouts >= 1)
             d.mark_ready(lane)  # the lane went IDLE (sweep off), so drive round-trip 2 by hand
             assert await _wait_until(lambda: d.claim_lock_timeouts >= 2)
-        lines = [r.getMessage() for r in caplog.records if "lock timeout" in r.getMessage()]
+        lines = _timeout_lines(caplog)
         assert d.claim_lock_timeouts == 2, (
             "the COUNTER must keep every abort — it is the rate signal, and throttling it would"
             f" leave nothing that reports how often this happens (got {d.claim_lock_timeouts})"
@@ -1207,6 +1230,100 @@ async def test_repeated_lock_timeouts_stay_one_line_while_the_counter_keeps_ever
             f"expected the second abort to be throttled inside the window, got {len(lines)} lines:"
             f" {lines!r}"
         )
+    finally:
+        await d.stop()
+
+
+async def test_each_window_reports_its_own_aborts_and_never_a_neighbours(
+    store: Any, caplog: pytest.LogCaptureFixture
+) -> None:
+    """BACKLOG #1270: the number a window PRINTS must be the number of aborts IN that window.
+
+    THE DEFECT, in the sibling test's blind spot. The test above proves the throttle suppresses; it
+    stops there, because it never crosses a window boundary. Crossing one is where the arithmetic
+    goes wrong, in two directions at once:
+
+    * a BURST under-reports — 4 aborts in one window printed ``1``, because the suppressed 3 were
+      counted into ``_lock_timeouts_since_emit`` and then never flushed by anything;
+    * an ISOLATED abort over-reports — the next abort, an hour later, printed ``4``, inheriting a
+      total accumulated in a window that had closed long before.
+
+    So a deploying site WOULD read a quarter of the true lock-timeout rate during a burst, and four
+    times it an hour later. Nothing about recovery changes — the sweep re-readies the lane either
+    way; what is wrong is the REPORT, which is the whole of what #1270 builds.
+
+    WHY THE WINDOW IS EVALUATED ON EVERY ROUND-TRIP, not only on an abort. ARM 3 is the arm that
+    forces it: the aborts stop, the stage keeps claiming, and the pending 3 must still reach the log.
+    Gated behind ``if lock_timeout is not None`` they never do — "an abort with no successor in its
+    window is never logged at all" is the same defect stated from the other end. This is the
+    discipline ``_emit_lane_episode`` already states six lines below the block, for the same reason.
+
+    THE SUM IS THE INVARIANT. Every abort is printed exactly once across the windows, so the printed
+    numbers must total the counter. That single equality is what both halves of the lie break: the
+    burst makes the sum too small, the stale inheritance makes it too large.
+
+    THIS TEST REQUIRES THE INJECTED CLOCK, and that is the second fix it pins. The throttle read
+    ``time.monotonic()`` — the module's only such call, off the base every other time decision here
+    uses — so ``mc.advance`` could not move it and this boundary was uncrossable in a unit test. The
+    same coupling made the sibling test above race a real 5.0 s window inside an 8.0 s ``_wait_until``
+    budget: a 5-to-8 s stall passed both waits and failed its assertion, reading as a regression in
+    the throttle."""
+    mc = ManualClock(1000.0)
+    stub = RecordingStub(store, mc.time)
+    abort_lane, quiet_lane = "IB_WINDOW_ABORT", "IB_WINDOW_QUIET"
+    await _seed(store, abort_lane, [100.0])
+    # `times=5` so every round-trip the shim intercepts aborts; `quiet_lane` is NOT a target, so a
+    # round-trip driven on it alone falls through to the real store and is a genuine CLEAN claim.
+    shim = _ClaimShim(store, abort_lane, mode="lock_timeout_once", times=5)
+    d = _make(shim, stub, set(), clock=mc)
+    await d.start()
+    try:
+        with caplog.at_level(logging.INFO, logger="messagefoundry.pipeline.stage_dispatcher"):
+            # ARM 1 — abort #1 arms the window and emits AT ONCE (the `-inf` start).
+            d.mark_ready(abort_lane)
+            assert await _wait_until(lambda: d.claim_lock_timeouts >= 1)
+            assert await _wait_until(lambda: len(_timeout_lines(caplog)) == 1)
+
+            # ARM 2 — THE BURST: three more aborts INSIDE that same window, all suppressed. The lane
+            # went IDLE (the sweep is off), so each round-trip is driven by hand.
+            for want in (2, 3, 4):
+                d.mark_ready(abort_lane)
+                assert await _wait_until(_aborts_reached(d, want))
+            assert len(_timeout_lines(caplog)) == 1, (
+                "the burst must stay one line INSIDE the window"
+            )
+
+            # ARM 3 — THE WINDOW RE-OPENS, with no further abort. Only CLEAN round-trips from here:
+            # the three suppressed aborts must still reach the log.
+            mc.advance(_DELIVERY_PHASE_EMIT_INTERVAL + 1.0)
+            d.mark_ready(quiet_lane)
+            assert await _wait_until(lambda: len(_timeout_lines(caplog)) == 2), (
+                "the aborts suppressed inside the closed window were never flushed — a burst that"
+                " stops reports a quarter of itself and the remainder is simply lost"
+            )
+
+            # ARM 4 — a LATER abort reports ITSELF, never the closed window's total.
+            mc.advance(_DELIVERY_PHASE_EMIT_INTERVAL + 1.0)
+            d.mark_ready(abort_lane)
+            assert await _wait_until(lambda: d.claim_lock_timeouts >= 5)
+            assert await _wait_until(lambda: len(_timeout_lines(caplog)) == 3)
+
+        lines = _timeout_lines(caplog)
+        printed = [_round_trips_in(line) for line in lines]
+        assert printed == [1, 3, 1], (
+            f"each window must print ITS OWN abort count; got {printed} from {lines!r}. [1, 4, 1]"
+            " is the flush working but the burst still under-reported; [1, 1] is the flush missing"
+            " entirely; a trailing 4 is the stale total inherited by an isolated abort."
+        )
+        assert sum(printed) == d.claim_lock_timeouts == 5, (
+            f"every abort must be printed exactly ONCE across the windows: the lines total"
+            f" {sum(printed)} against a counter of {d.claim_lock_timeouts}. The counter is the rate"
+            " signal and is known-good, so a mismatch is the LOG double-counting or dropping."
+        )
+        assert all(abort_lane not in line and quiet_lane not in line for line in lines), (
+            f"a lane NAME reached the log — a lane is a destination_name (PHI): {lines!r}"
+        )
+        assert d.busy_violations == 0
     finally:
         await d.stop()
 
