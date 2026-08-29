@@ -17414,6 +17414,48 @@ attempts is the signature of the environment, not the diff. And the diff cannot 
 `test_connscale_*` files. **Zero overlap** with multipart parsing, the API request-timeout path, or
 the SQL Server store.
 
+**AMENDED 2026-08-29, and it splits the three failures into TWO different problems. The 11:15 run
+did not fail a test -- it HUNG, and it is an 8x outlier against its own leg.**
+
+Measured across 18 recent `ci.yml` runs, the `Tests (pytest)` step on `test (windows-2025, py3.14)`:
+
+```
+usable samples 13   (5 excluded: skipped, or still running with no completion time)
+min 0.2   median 7.8   max 55.1  minutes
+excluding the outlier: n=12, range 0.2-8.8, mean 6.8
+the outlier is 8.1x the normal mean
+```
+
+**The cap is not marginal, so this is not the ADR 0158 Class 1 shape.** `ci.yml`'s matrix sets
+`step_timeout: 55` for `windows-2025` against a 6.8-minute normal mean -- roughly seven times
+headroom. The run consumed all 55 minutes. **A step that normally takes under nine minutes ran until
+a generous ceiling stopped it, which is a hang, not a slow run.**
+
+**And it tells us WHERE the hang was.** `ci.yml` documents three nested watchdogs at increasing
+scope: `pytest_timeout` (120s per test on Windows, via `--timeout=`), `fault_timeout` (150s,
+`PYTHONFAULTHANDLER` plus `faulthandler_timeout`), and `step_timeout` as the outer backstop -- whose
+comment says it exists "so a process-level deadlock **below pytest**" is still bounded. **The inner
+two did not fire and the outermost did, which is exactly the case the outer one was built for.** So
+the 11:15 failure is a process-level deadlock beneath pytest, not a flaky assertion.
+
+**Corrected characterisation of the three runs:**
+
+| Run | Duration | Kind |
+|---|---|---|
+| 11:15:01Z | **55.1 min**, hit the cap | **process-level hang below pytest** -- no test reported FAILED |
+| 11:37:13Z | 7.7 min, normal | test failure -- `test_a_fast_handler_is_untouched` |
+| 12:42:51Z | 7.6 min, normal | test failures -- `test_hostile_disposition_header...` and the SQL Server upsert |
+
+**So this row covers two problems, not one**, and they should probably separate: a hang that the
+outer watchdog caught once, and wall-clock-sensitive tests failing under load. The visibility gap
+below is common to both.
+
+**A NOTE ON MY OWN INSTRUMENT, because it produced a wrong number first.** My initial pass computed
+`mean = -62670193.3` minutes. A job still RUNNING has no completion time, and subtracting it yields a
+nonsense duration that then poisons min and mean. **The tell was that the value was absurd rather
+than merely surprising; a subtler skew would have passed.** The numbers above exclude incomplete
+steps and say how many were excluded, so the denominator is visible rather than implied.
+
 **WHAT I CANNOT ATTRIBUTE, stated rather than smoothed over.** The three removals do not map cleanly
 onto the three runs. The first entry was removed at 11:15:32Z, **fifty seconds** after being added and
 long before its own run timed out at roughly 12:10Z -- so that removal was not caused by that run.
