@@ -16348,7 +16348,7 @@ The control is what makes the subject mean anything: it holds the flag, the decl
 **Related:** #1307 (the flag itself -- shipped, partial shapes only); #1242 (the sibling blindness in the same guard, value corruption rather than key loss).
 
 **Source:** routed by the Liaison from a false-closed-row sweep, verified to the line by the Dispatcher, and reproduced with a two-arm control by the Lander before filing, 2026-08-26.
-## 1364. cla.yml pins an archived GitHub Action
+## 1381. cla.yml pins an archived GitHub Action
 
 > 🔢 **Filed 2026-08-26 - fix built.** `contributor-assistant/github-action`, pinned in
 > `.github/workflows/cla.yml:50` at `ca4a40a7d1004f18d9960b404b97e5f30a505a08` (v2.6.1), was archived
