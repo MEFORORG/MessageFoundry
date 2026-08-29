@@ -17445,3 +17445,49 @@ prospective. **Do not write this row up as a live credential exposure; it is not
 
 ---
 
+## 1391. the respawn brief points relative commands at the PREDECESSOR checkout, so a replacement seat can declare into a dead box -- but it does not always fire, and the exception is the useful half
+
+> 🔢 **FILED 2026-08-29 (builder 2, who IS a replacement seat and is the counter-example).**
+
+> **THE MECHANISM, VERIFIED IN THE GENERATOR:**
+> `respawn.ps1:1339` emits `"RUN EVERY RELATIVE COMMAND BELOW FROM: $runFrom"`, where `$runFrom` is
+> the **predecessor's** checkout. `:1426` then gives the declare command as a **relative** path,
+> `pwsh -NoProfile -File scripts\coord\seat.ps1 -Declare ...`. And `seat.ps1` derives its box key
+> from the invoking tree — `:241` `$start = if ($Hint) { $Hint } else { (Get-Location).Path }`,
+> `:545` `$boxKey = ConvertTo-BoxKey -Path $wt`. ***Follow the brief literally and the declaration is
+> keyed to a worktree that is not yours.***
+
+> ***AND IT DID NOT HAPPEN TO ME, WHICH IS WHY THIS ROW IS NOT "EVERY REPLACEMENT SEAT".*** My brief
+> carried the predecessor path (the predecessor worktree, named in full) and my declaration still landed in
+> **my own** box: `my own seat record` holds `seat=BUILDER2`,
+> `seatSource=declared`, a real goal, `declaredAt 2026-08-28T17:51:44Z`. **A universal claim was
+> available and is false.**
+
+> ***SO THE OPEN QUESTION IS THE ITEM: WHAT MAKES IT FIRE?*** The plausible discriminator is whether
+> the seat runs the declare with the brief's cwd or from its own tree — but that is UNMEASURED and I
+> am not asserting it. **Establish the discriminator before choosing a fix, because a fix aimed at the
+> wrong half will look like it worked on the seats that were never affected.**
+
+> **THE REPORTED CONSEQUENCE, attributed rather than claimed:** the ASVS-TRACKER found this on itself
+> at 06:34Z and PROCESS-IMPROVEMENT reported the generator still live at ~16:2xZ; the affected seat
+> is reported still reading `seat=ASVS-TRACKER declared 17:50Z` although that seat re-declared at
+> 11:33Z. ***I did not verify that record myself and it is second-hand here.*** The consequence when
+> it does fire: the declaration lands in a dead box, the Stop hook writes an undeclared record under
+> the live one, and mail — addressed by box — goes to the dead one.
+
+> ***THE REASON THIS SURVIVED A DAY OF FOUR SEATS LOOKING AT IT: IT PRESENTS AS THREE UNRELATED
+> THINGS.*** The DISPATCHER reports diagnosing all three wrongly before connecting them — "two seats
+> answering to LIAISON", "mail -To all reaches 11 of 16", and "a seat can be alive and
+> mail-unreachable" published as a **channel** property. **If one root cause can wear three costumes,
+> the first two diagnoses will each look complete.**
+
+> **TWO CANDIDATE FIXES, different sizes:** an ABSOLUTE path in the brief (small, and it only fixes
+> new briefs), or `seat.ps1` keying on the SESSION rather than the invoking tree (larger, and it is
+> the shared root — `lane.ps1` derives its key the same way).
+
+**Cluster:** Fleet coordination. **Priority:** P2. **Verdict:** build (small, pending the discriminator).
+**Severity:** no engine effect, no PHI axis, no deployment axis (sec. 0). It degrades seat addressing:
+an affected seat is alive, working, and unreachable by the channel that leaves a receipt.
+
+---
+
