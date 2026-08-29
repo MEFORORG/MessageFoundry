@@ -331,8 +331,8 @@ cross-session message (faster, no receipt, dies with the session).**
    states the grant and adds that you should not go looking for a separate one; ratified by the owner
    2026-08-22.
 2. **EVERY SEAT PUSHES ITS OWN BRANCH AND OPENS ITS OWN PR, WITHOUT ASKING.** Owner ruling
-   2026-08-29, in their words: *"Sessions push their own."* No per-action approval is needed for
-   your own push or your own PR.
+   2026-08-29, anchored at `refs/liaison/owner-ruling-20260829-push` (`987705dfb`), in their words:
+   *"Sessions push their own."* No per-action approval is needed for your own push or your own PR.
 3. **THE MERGE IS STILL THE LANDER'S**, and a PR reaches it THROUGH THE REVIEWER: open the PR, notify
    the Reviewer seat, and it either returns the PR to you with findings or passes it to the Lander,
    which merges. If no Reviewer is running, route to the Lander as before.
