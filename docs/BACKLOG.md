@@ -17855,3 +17855,42 @@ posture is not weakened. The cost is a documented opt-out that does not work as 
 
 ---
 
+## 1399. the CI-mirror parity test matched bare tool names by substring, so the secret scan could vanish with the test still green
+
+> 🔢 **Filed 2026-08-29 -- FIXED IN PR #685 at df49dd3be; banner left OPEN so the archive pass
+> owns the flip.** `tests/test_gate_ci_mirror_parity.py` asserted each of eight pre-commit hooks has a
+> CI mirror. Six matched on a script path and were sound. The two matched on a **bare tool name** --
+> `gitleaks` and `actionlint` -- were asserted by substring, so neither could see its mirror disappear.
+
+**Cluster:** CI / gate parity. **Priority:** P2. **Verdict:** build (small), done.
+**Severity:** a vacuous green on the **secret scan**, and per #1395 the CI mirror is the only
+enforcement left on a rebase-created commit.
+
+**Measured at origin/main:** `security.yml` carries **17** `gitleaks` mentions against **one** real
+invocation. Delete that one line and sixteen substring hits survive -- job keys, name labels, a release
+URL, checksums, tar, an install command, a version flag. **The mirror could have been deleted entirely,
+leaving only the install block, and the test would have stayed green.**
+
+**The author's docstring said the match required an executable line rather than a mention in a comment.
+That was necessary and NOT sufficient:** an install command is an executable line and is not a scan.
+
+**THE SAME TRAP WAS ALREADY FIXED ONE ARM OVER IN THE SAME FILE.** A rename to a longer name survived
+as a substring of the original, was caught by mutation, and that arm was anchored on the assignment.
+**Solved once in the file and not generalised** -- nothing prompts a second look at arms that are
+already passing.
+
+**Fixed by anchoring on the invocation.** Mutation-proven both ways: deleting the real `gitleaks`
+invocation leaves 11 mentions and now reds; deleting the `actionlint` one leaves 8 and reds. **Both
+mutations passed before the change.**
+
+**STILL OPEN AND NAMED RATHER THAN FIXED:** nothing links this file to `test_lint_scope_parity.py`, so
+its covered-elsewhere set is a **hand-maintained claim** that the sibling still pins ruff and bandit.
+If the sibling drops one, the exhaustiveness arm still passes and that hook is pinned by neither.
+**That is the hand-maintained-mirror defect one level up**, and it wants its own row.
+
+**Found by the Reviewer seat on PR #685, routed here because that seat does not allocate numbers, and
+verified independently before filing.** Three of my own instruments failed while writing it, all three
+caught: a dot-path read returned 0 mentions (a read failure, not a finding); a first commit carried a
+literal control byte where a word-boundary escape collapsed, in a row about escape traps; and a repair
+attempt used `git checkout -- <file>`, **which restores from the INDEX rather than from HEAD**, so it
+kept restoring the very byte it was meant to remove. The backslash here is built from a codepoint: \b
