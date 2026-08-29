@@ -1447,9 +1447,11 @@ hypothetical: it is exactly the hijack that happened here. A session with no wor
 `git checkout` inside somebody else's worktree; git allowed it because '$destMsg' was not checked out anywhere.
 
 What to do instead:
-  * To BUILD on '$destMsg', give it its OWN worktree -- git then refuses to check that branch out twice,
-    which is the protection you actually want. The branch already EXISTS, so this REUSES it rather than
-    forking. -Branch is the git ref; -Name is only the DIRECTORY, which cannot contain '/':
+  * To BUILD on '$destMsg', give it its OWN worktree -- git then refuses an ORDINARY second checkout of
+    that branch, which is the protection you actually want. That refusal is a DEFAULT, not a guarantee:
+    measured, `worktree add --force` (and `-f`) check the same branch out again and succeed, and
+    `checkout --ignore-other-worktrees` switches. It stops the ACCIDENT, not a determined bypass. The
+    branch already EXISTS, so this REUSES it rather than forking. -Branch is the git ref; -Name is only the DIRECTORY, which cannot contain '/':
         pwsh -NoProfile -File $newHintQ -Branch $(Get-SafeForCommand $dest) -Name $(Get-SafeForCommand $destSlug)
   * To READ '$destMsg' without touching any working tree, use the plumbing:
         git -C $selfTopQ show $(Get-SafeForCommand $dest -Suffix ':<path>')        git -C $selfTopQ diff $(Get-SafeForCommand $dest -Prefix 'HEAD..')
