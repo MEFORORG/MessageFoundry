@@ -26,8 +26,10 @@ tests/test_adr0071_crossing_count.py
 tests/test_ai_provenance_claims.py
 tests/test_announce_hook.py
 tests/test_announce_wiring.py
+tests/test_asvs_anchor_provenance.py
 tests/test_asvs_file_surface_doc_drift.py
 tests/test_asvs_prove_absences_wiring.py
+tests/test_asvs_rescore_handoff.py
 tests/test_asvs_scorecard.py
 tests/test_asvs_tally_lint.py
 tests/test_asvs_verifier_vault_contract.py
@@ -70,6 +72,7 @@ tests/test_coord_dispatch_gate.py
 tests/test_coord_seat_clock_alarm.py
 tests/test_coord_throughput.py
 tests/test_doc_guards_lane.py
+tests/test_install_gate_records_the_install.py
 tests/test_quality_expiry_audit.py
 tests/test_coord_seat_prompt.py
 tests/test_coord_seat_session_key.py
