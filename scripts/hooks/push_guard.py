@@ -173,6 +173,33 @@ def _private_paths_in_tip(local_sha: str) -> list[str] | None:
     return [ln.strip() for ln in proc.stdout.splitlines() if ln.strip()]
 
 
+def _safe_for_message(value: object, limit: int = 400) -> str:
+    """Fold a value about to be INTERPOLATED INTO PROSE AN AGENT IS TOLD TO ACT ON (BACKLOG #1040).
+
+    This gate's deny text is read by a model that then does what it says, so a value carrying a line
+    break can forge a SECOND remedy block -- and a forged block placed FIRST is the one a reader going
+    top-down obeys. Proven on ``worktree_gate.ps1``, where a ``Write`` whose ``file_path`` held embedded
+    line breaks produced a reason with two ``Do this instead:`` blocks, the injected one first. It needed
+    nothing on disk -- only the JSON field -- so no other gate saw it.
+
+    A LOCAL COPY RATHER THAN AN IMPORT, and the reason is mechanical rather than stylistic:
+    ``install-git-hooks.ps1`` COPIES this file into the git hooks directory and runs it from there, so an
+    import of anything under ``scripts/hooks/`` resolves at development time and fails at the moment the
+    gate actually runs. ``claim_check.py`` carries the same helper for the same reason.
+
+    Folds line breaks to spaces, collapses whitespace runs, strips control characters and truncates --
+    the value stays READABLE and can no longer add a line.
+    """
+    text = "" if value is None else str(value)
+    # EVERY control character, not only the line breaks: a lone ESC can rewrite a terminal line and a
+    # backspace can erase what precedes it, so a value that "contains no newline" is not therefore inert.
+    text = "".join(" " if ch < " " or ch == chr(127) else ch for ch in text)
+    text = " ".join(text.split())
+    if len(text) > limit:
+        text = text[: limit - 3] + "..."
+    return text
+
+
 def _describe(paths: list[str]) -> str:
     shown = ", ".join(paths[:_MAX_PATHS_SHOWN])
     extra = len(paths) - _MAX_PATHS_SHOWN
@@ -207,12 +234,16 @@ def main(argv: list[str]) -> int:
 
         if remote_ref in PROTECTED and not allow_direct:
             what = "DELETE" if deleting else "direct push"
-            refusals.append(Refusal("protected", f"{what} to {remote_ref}"))
+            refusals.append(Refusal("protected", f"{what} to {_safe_for_message(remote_ref)}"))
 
         # GUARD A. Independent of PROTECTED on purpose: a mirror push is refused because of the
         # namespace it names, not because local main happens to present as a forced update.
         if not remote_ref.startswith(PUSHABLE_NAMESPACES):
-            refusals.append(Refusal("namespace", f"push to a non-branch/tag ref: {remote_ref}"))
+            refusals.append(
+                Refusal(
+                    "namespace", f"push to a non-branch/tag ref: {_safe_for_message(remote_ref)}"
+                )
+            )
 
         # GUARD B. A deletion has no local tip to inspect, and removing a ref cannot publish anything.
         if not deleting:
@@ -221,7 +252,8 @@ def main(argv: list[str]) -> int:
                 refusals.append(
                     Refusal(
                         "content",
-                        f"could not inspect the tip tree of {remote_ref} ({local_sha[:12]}) -- "
+                        f"could not inspect the tip tree of {_safe_for_message(remote_ref)} "
+                        f"({local_sha[:12]}) -- "
                         f"git was unusable or the object did not resolve, so this ref is UNJUDGED "
                         f"rather than clean",
                     )
@@ -230,7 +262,8 @@ def main(argv: list[str]) -> int:
                 refusals.append(
                     Refusal(
                         "content",
-                        f"private docs in the tip tree of {remote_ref}: {_describe(hits)}",
+                        f"private docs in the tip tree of {_safe_for_message(remote_ref)}: "
+                        f"{_safe_for_message(_describe(hits))}",
                     )
                 )
 

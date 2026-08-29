@@ -138,6 +138,33 @@ def _obj_exists(spec: str) -> bool:
     return probe.returncode == 0
 
 
+def _safe_for_message(value: object, limit: int = 400) -> str:
+    """Fold a value about to be INTERPOLATED INTO PROSE AN AGENT IS TOLD TO ACT ON (BACKLOG #1040).
+
+    This gate's deny text is read by a model that then does what it says, so a value carrying a line
+    break can forge a SECOND remedy block -- and a forged block placed FIRST is the one a reader going
+    top-down obeys. Proven on ``worktree_gate.ps1``, where a ``Write`` whose ``file_path`` held embedded
+    line breaks produced a reason with two ``Do this instead:`` blocks, the injected one first. It needed
+    nothing on disk -- only the JSON field -- so no other gate saw it.
+
+    A LOCAL COPY RATHER THAN AN IMPORT, and the reason is mechanical rather than stylistic:
+    ``install-git-hooks.ps1`` COPIES this file into the git hooks directory and runs it from there, so an
+    import of anything under ``scripts/hooks/`` resolves at development time and fails at the moment the
+    gate actually runs. ``claim_check.py`` carries the same helper for the same reason.
+
+    Folds line breaks to spaces, collapses whitespace runs, strips control characters and truncates --
+    the value stays READABLE and can no longer add a line.
+    """
+    text = "" if value is None else str(value)
+    # EVERY control character, not only the line breaks: a lone ESC can rewrite a terminal line and a
+    # backspace can erase what precedes it, so a value that "contains no newline" is not therefore inert.
+    text = "".join(" " if ch < " " or ch == chr(127) else ch for ch in text)
+    text = " ".join(text.split())
+    if len(text) > limit:
+        text = text[: limit - 3] + "..."
+    return text
+
+
 class Ledger:
     def __init__(self, *, ci: bool, base: str = "origin/main") -> None:
         self.ci = ci
@@ -259,7 +286,8 @@ class Ledger:
                 )
                 if basename.removesuffix(".md") not in row:
                     self.fail(
-                        f"ADR {number} already exists on {self.base} as {base_adrs[number]}",
+                        f"ADR {number} already exists on {self.base} as "
+                        f"{_safe_for_message(base_adrs[number])}",
                         "Two sessions picking the same number create DIFFERENT filenames, merge CLEAN, and "
                         "silently corrupt the ledger. This has happened 3x (d1d0a5a, 5b7d046, 9f3483d).",
                         'pwsh -NoProfile -File scripts\\coord\\alloc.ps1 -Kind adr -Title "<title>"'
@@ -277,7 +305,7 @@ class Ledger:
             # without one, and failing every unrelated commit over old debt is how a gate gets uninstalled.
             if number not in rows:
                 self.fail(
-                    f"ADR {number} ({basename}) has no row in docs/adr/README.md",
+                    f"ADR {number} ({_safe_for_message(basename)}) has no row in docs/adr/README.md",
                     "An ADR that is not in the index is invisible — the tail-append hazard shows up as a "
                     "DROPPED ROW, not as a conflict. Three ADRs were already lost this way.",
                     "add its row to docs/adr/README.md in THIS commit",

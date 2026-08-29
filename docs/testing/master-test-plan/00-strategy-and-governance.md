@@ -642,14 +642,20 @@ repo, and two classes of valid citation are deliberately not readable from it. A
 does not know this will flag sound evidence as broken, and a reviewer who does not know it will read
 "absent" as "does not exist":
 
-- **BACKLOG items above #231.** The committed [`docs/BACKLOG.md`](../../BACKLOG.md) is a **published
-  baseline that stops at `## 231.`**; the programme continued past it. The file says so itself at
-  [`docs/BACKLOG.md:6041`](../../BACKLOG.md) — *"the file you are reading ends at #231, while #242–#246
-  and their successors do not appear in it at all … their absence here is a publishing boundary, not
-  evidence of completion."* Citations above the baseline (e.g. #233, #275, #310) are **sound
-  evidence**; the resolver treats them as valid and never disclaims them. Where a reader may be
-  helped, the only permitted annotation is neutral — *"(above the published #231 baseline)"* — used
-  sparingly.
+- **BACKLOG items above #231.** **THE #231 BOUNDARY DESCRIBED HERE NO LONGER EXISTS, AND THE
+  SUPPORTING QUOTATION IS NOT IN THE FILE IT CITES (BACKLOG #1100).** Measured against the committed
+  [`docs/BACKLOG.md`](../../BACKLOG.md): **373 item headings, numbered #3 to #1372, of which 320 are
+  above #231.** The sentence this passage quoted — *"the file you are reading ends at #231 … their
+  absence here is a publishing boundary, not evidence of completion"* — returns **zero** occurrences
+  in that file (control: an unrelated phrase in the same file returns one, so the search is not
+  blind). It now lives under **#185** in
+  [`docs/archive/backlog/BACKLOG-CLOSED.md`](../../archive/backlog/BACKLOG-CLOSED.md). The former
+  line anchor resolved to unrelated text and has been dropped; cite by item, never by line number.
+  **What survives is only the general caution**: absence of an item from a file you can read is a
+  publishing boundary rather than evidence of completion, so do not read "absent" as "does not
+  exist". **No replacement NUMBER is asserted here on purpose.** `PUBLIC_BACKLOG_FLOOR = 1000` in
+  `scripts/hooks/ledger_check.py` governs which numbers may be ALLOCATED, not which are readable, so
+  substituting it for #231 would swap one false bound for another.
 - **`docs/security/`, `docs/reviews/`, `docs/marketing/`** are **gitignored post-cutover**
   (`.gitignore:144-146`) — ~32 files of posture, assessment, risk-register and runbook detail withheld
   because published in full they are an attacker roadmap. A document such as

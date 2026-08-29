@@ -29,6 +29,8 @@ from typing import Any
 
 import pytest
 
+from tests._dead_pid import never_live_pid
+
 PRESENCE = Path(__file__).resolve().parents[1] / "scripts" / "coord" / "presence.ps1"
 
 pytestmark = pytest.mark.skipif(
@@ -159,7 +161,7 @@ def test_pid_reuse_is_not_reported_live(repo: Path, config_root: Path) -> None:
 
 
 def test_dead_pid_is_excluded_by_default_and_shown_with_all(repo: Path, config_root: Path) -> None:
-    dead = _find_free_pid()
+    dead = never_live_pid()
     write_session(config_root, pid=dead, cwd=repo, session_id="dddddddd-4444")
     assert run_presence(repo, config_root) == []
 
@@ -271,16 +273,6 @@ def test_the_human_table_names_its_columns_so_the_id_cannot_read_as_a_sha(
         f"header and row are not aligned, so the label points at the wrong cell:\n"
         f"{header!r}\n{row!r}"
     )
-
-
-def _find_free_pid() -> int:
-    """A pid that is not currently running -- start a process, note its pid, wait for it to exit."""
-    proc = subprocess.Popen(
-        ["cmd", "/c", "exit"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
-    )
-    proc.wait(timeout=30)
-    time.sleep(0.3)  # let the OS reap it before we claim the pid is gone
-    return proc.pid
 
 
 def test_outside_a_repo_the_json_roster_carries_an_unavailable_receipt(tmp_path: Path) -> None:
