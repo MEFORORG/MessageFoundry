@@ -16663,6 +16663,12 @@ catch.
 > and `Decision == "SKIP"`, so any remedy that short-circuited the verdict would pass while testing
 > nothing.
 
+> **FOLDED IN FROM #1303, 2026-08-29 (lander). THE SAME WORK WAS ALLOCATED TWICE -- #1303 on 2026-08-21 and this row on 2026-08-26, with character-identical titles -- and this one shipped.**
+> **#1303 IS RETIRED AS A PERMANENT HOLE AND NOT AS A ROW.** `alloc.ps1` has no release verb by design, on the stated principle that *holes are free, collisions are not*: a stranded number is invisible, while two open headings for one shipped fix read to every future screener as two pieces of work, one of them already done.
+> **THE PARAGRAPH BELOW IS WHY THE FOLD HAPPENED RATHER THAN A CLEAN DROP.** Retiring the row would have lost it, and it is the mechanism -- not commentary. Reported by the seat holding #1303, which declined to pick between the numbers itself. Quoted verbatim:
+>
+> **THE PATH TO THE FAILURE, traced through the real fence.** `Test-RecordLiveness` ([`scripts/coord/session-registry.ps1:181`](../scripts/coord/session-registry.ps1)) reports **DEAD** when `Get-Process -Id` finds nothing -- and DEAD vetoes nothing. A REUSED pid **is** running, and a test record carries no `startedAt` for the reuse fence to consult, so the verdict becomes **UNVERIFIED** -- which **does** veto (`occupancy.ps1:75`). The occupant list then comes back non-empty and an assertion that a dead record is "not a veto" fires. `cmd /c exit` is Windows-only, matching where it was seen; pid reuse needs pid churn, and that tier spawns pwsh/git children constantly on a runner whose pid space recycles far faster than a developer box.
+
 **Cluster:** CI reliability / test determinism. **Priority:** P2. **Verdict:** build.
 **Severity:** no product effect, no PHI effect, no deployment axis (sec. 0) -- test-suite determinism
 only. The cost was a required context redding on a race whose failure looked like a real occupancy
