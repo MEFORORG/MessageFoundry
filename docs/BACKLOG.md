@@ -17370,6 +17370,14 @@ git merge-file  ->  exit 0 | conflict markers 0 | '## 1379.' in the result: 2
 > stop the engine pytest step double-running the ~356 web-console tests that `testpaths` includes
 > (BACKLOG #1027). ***IT PASSES. IT IS A REQUIRED CHECK. AND IT IS NOT LOOKING AT THE ENGINE STEP.***
 
+> **IN FLIGHT WHEN FILED: PR 613 ALREADY REPAIRS THIS, AND IT IS DIRTY.** Verified 2026-08-29, not
+> taken on report: `gh pr diff 613 --name-only` matches
+> `tests/test_ci_engine_step_excludes_webconsole.py`, and `gh pr view 613` reads OPEN, not draft,
+> `mergeStateStatus=DIRTY`. **The row stands because the PR may not land** -- if 613 is ever closed
+> unmerged the defect still needs a home, and this row names the mechanism more precisely than 613's
+> body does. ***DO NOT START A SECOND FIX. Read 613 first.*** Overlap found by the DISPATCHER after
+> dispatch, not before -- it screened its bench rows for an open PR and did not screen the filing job
+> it handed out.
 > **THE MECHANISM, AND IT IS NOT "THE LOCATOR STOPPED MATCHING".** `_engine_step_run_line()` scans
 > `ci.yml` for a line whose stripped form starts `run: pytest -q`, and calls `pytest.fail` if it finds
 > none — **so a stopped match would go RED, loudly.** That is not what happens.
@@ -17414,6 +17422,11 @@ check is exactly where an uninformative green is most expensive, because it is t
 > `persist-credentials` setting anywhere in the file**. The action's default is `true`, so the job's
 > `GITHUB_TOKEN` is written into `.git/config` on the runner. zizmor names this pattern `artipacked`.
 
+> **IN FLIGHT WHEN FILED: PR 681 ALREADY REPAIRS THIS, AND IT IS BLOCKED.** Verified 2026-08-29, not
+> taken on report: `gh pr diff 681 --name-only` matches `.github/workflows/cla.yml` and the diff adds
+> 3 `persist-credentials` lines; `gh pr view 681` reads OPEN, not draft, `mergeStateStatus=BLOCKED`.
+> **The row stands because the PR may not land.** ***DO NOT START A SECOND FIX. Read 681 first.***
+> Same screening miss as #1389, same source, disclosed by the DISPATCHER unprompted.
 > **THE PERMISSIONS AND TRIGGER ARE WHAT MAKE IT WORTH A ROW, not the checkout alone.** The workflow
 > runs on `pull_request_target` (L23) and declares `contents: write`, `pull-requests: write`,
 > `statuses: write` (L35-39). ***`pull_request_target` runs in the BASE repository's context with
