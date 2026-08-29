@@ -17162,3 +17162,44 @@ AND IT SHIPS THE SUBJECT: install-selfheal.ps1 and worktree-selfheal.ps1 are bot
 **SO THIS IS A DESIGN CHANGE, NOT A PATTERN.** Filing it as "add the missing spellings" would ship a fix that closes an instance and leaves the class open.
 
 **PROVENANCE:** both surfaced by a completeness critic during #1065's follow-on work and were explicitly attributed as inherited rather than introduced, after being measured against the pre-fix gate. **Neither is caused by the branch that found them.**
+
+## 1382. the ledger gate compares head against origin/main, so RENAMING a row onto a number already on main passes -- and that merge produces a silent duplicate
+
+> 🔢 **Filed 2026-08-29 (lander) - found by builder-2, composed by the dispatcher, and the unproven half measured by the filer before filing.**
+> Verdict: build
+> Closing-act: code
+
+**Cluster:** Repo governance / ledger. **Priority:** P2. **Verdict:** build (small).
+**Severity:** no engine, PHI or deployment axis (sec. 0). It governs the ledger, not the product. **The severity is that the duplicate is silent -- git reports success and no gate reports anything.**
+
+**THE GATE'S BEHAVIOUR IS DELIBERATE AND DOCUMENTED. THIS ROW IS ABOUT A SIDE EFFECT ITS COMMENT DOES NOT NAME.** `scripts/hooks/ledger_check.py:169` takes `base: str = "origin/main"`, and the check at `:370` walks `head - base`. The comment at `:368-369` states the reason in its own words:
+
+> *"Only `head - base` is examined, so everything already on origin/main -- including the pre-partition overlap -- is grandfathered by construction. No allowlist, nothing to maintain."*
+
+**That is a good design and the row does not propose scrapping it.** Grandfathering by set-subtraction is why there is no allowlist to rot.
+
+**THE SIDE EFFECT: the gate stops you INTRODUCING an unowned number. It does not stop you RENAMING a row onto one that is already on main.** If the number is in `base`, it is not in `head - base`, so `owns()` is never consulted and there is nothing to reject. A commit renaming a branch's row onto `#1379` -- allocated to another worktree, already landed -- **passes cleanly**, and the pass is correct under the rule as written.
+
+**THE CONSEQUENCE WAS REPORTED AS REASONED-NOT-MEASURED AND IS NOW MEASURED.** The reporting seat marked it explicitly as not having completed a merge, and the composing seat carried that marking forward rather than laundering it. Settled here by three-way merge over temp files, mutating no repository:
+
+```
+control  '## 1379.' on origin/main = 1   (unique, so the test is about the real number)
+base     0 headings   (a branch cut before #1379 landed)
+ours     1 heading    (main, at its real offset)
+theirs   1 heading    (the same branch with a DIFFERENT row renamed to #1379)
+the two rows sit ~11,828 lines apart
+
+git merge-file  ->  exit 0 | conflict markers 0 | '## 1379.' in the result: 2
+```
+
+**Exit 0, no markers, two rows. The duplicate merges silently.**
+
+**PLACEMENT IS LOAD-BEARING AND A FIRST ATTEMPT GOT IT WRONG.** Running the same simulation with the renamed row placed at the **tail**, adjacent to main's newest items, produces `exit 1` and three conflict markers -- git catches it. **That version would have refuted the finding, and it would have been the wrong test**: the gate's own message cites the hazard as *"two sessions adding #N land ~1,600 lines apart, merge CLEAN, and both ship (cf. 5b7d046 / #598)"*. Adjacency manufactures a conflict the real scenario does not have. **The far-apart placement is the one that matches the documented failure, and it is the one that reproduces.**
+
+**SO THIS IS THE GATE'S OWN STATED FAILURE MODE, REACHED BY A ROUTE IT DOES NOT CHECK.** The union-diff design that makes the move-commit case correct (`:47-50`) is the same design that makes this invisible.
+
+**NOT CLAIMED:** that anyone has done this, that it is exploitable, or that it was reached other than by a builder noticing it mid-repair. No instance is alleged.
+
+**UNTESTED:** whether a real `git merge` through the merge queue behaves as `git merge-file` does here -- the simulation is a three-way content merge and does not model the queue. Also untested: whether the ADR arm at `:267` has the same shape, though it reads the same way.
+
+**A CANDIDATE FIX, NOT A DESIGN:** walk the branch's own history for renamed headings rather than only `head - base`, or assert that every `## N.` in head whose number is in base is byte-identical to base's row of that number. The second is cheaper and answers the question directly.
