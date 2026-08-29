@@ -17187,6 +17187,30 @@ AND IT SHIPS THE SUBJECT: install-selfheal.ps1 and worktree-selfheal.ps1 are bot
 > Verdict: build
 > Closing-act: code
 
+> **RETRACTED IN FULL 2026-08-29 BY ITS OWN FILER. EVERY LOAD-BEARING CLAIM IN THIS ROW IS WRONG, AND THE GATE IT ACCUSES WAS WORKING CORRECTLY THE WHOLE TIME.**
+>
+> **The row is kept rather than deleted because the reasoning failure is worth more than the row was, and because a deleted row cannot be found by whoever repeats it.**
+>
+> **DEFECT 1 -- `accepts at most 1 arg(s), received 4` -- WAS NOT CI. IT WAS THE FILER'S OWN `gh` COMMAND.** Measured: that string appears **0 times** in the 592-line job log, against a positive control of 37 hits for `anchor`/`scorecard` in the same log through the same pipe. `gh pr checks` emits four tab-separated fields per row -- name, state, elapsed, url -- and an unquoted row splatted into a `gh` subcommand taking one positional argument produces exactly that error, once per row. **The thing that read as corroboration was the tell:** *"received 4"* identical across two differently-named checks. The 4 is the row's field count, not a property of either check. Two checks failing identically read as a systemic fault; it was one command failing twice.
+>
+> **DEFECT 2 -- `[scorecard].anchor_commit is missing` -- NEVER FIRED. The filer read the workflow's own shell source as an emitted error.** The log line is `test -n "$sha" || { echo "::error::[scorecard].anchor_commit is missing"; exit 1; }` -- the guard's *text*, echoed as the step runs. The only emitted error in the whole job is `##[error]Process completed with exit code 1`. The row's own evidence for this half -- that `anchor_commit` is present and unchanged on all three refs -- was correct and proved the opposite of what it was cited for: **the value was fine because the guard never ran.**
+>
+> **THE HEADLINE -- "its green history is a history of not running" -- IS REFUTED BY DOCUMENTED DESIGN.** The skips are deliberate, visible, and engineered against the exact hazard this row claimed to discover. `.github/workflows/asvs-scorecard.yml:65-77` states it:
+>
+> > *"WHY THIS JOB EXISTS, AND WHY IT IS NOT A `paths:` FILTER ... workflow `paths:` filter -> no check reported -> ABSENCE, which reads as success; job-level `if:` -> check reported as SKIPPED -> visibly not run"*
+>
+> and at `:118-119` it records having already hit and fixed the near-miss version: *"Leaving it out set relevant=false and reported SKIPPED, which is not green but is read as green by anyone glancing at the checks list."* **A SKIP IS NOT AN ABSENCE, AND THE DIFFERENCE IS THE WHOLE POINT OF THE DESIGN.** The row treated a reported SKIPPED as a silent non-run.
+>
+> **AND THE TWO CHECKS ARE ADVISORY, SO NOTHING WAS EVER GATED ON THEM.** `required_status_checks.contexts` on the vault's `main` is `["verified-at", "every cited requirement identifier resolves"]`. The row's stated stakes -- that landing would mean landing over the only checks that validate a scorecard change -- were false about *gating*, though the change genuinely was the only one exercising them.
+>
+> **WHAT WAS ACTUALLY WRONG, and it is the gate working rather than failing:** `verify` reported real findings (absence claims already with the owner) and `render-drift` reported a real `git diff` -- the committed rendered view was stale against the data. **The cron leg had been failing daily for nine days. The gate was shouting, not sleeping.**
+>
+> **THE PROCESS FAILURE IS THE PART WORTH KEEPING.** The filer stated plainly what had not been established -- named the two jobs, said the logs were read and no further, declined to guess which CLI or when it broke. **That honesty did not prevent the error, because the unexamined premise was not in the uncertain part.** It was in the part that felt measured: an error string copied out of a terminal was assumed to have come from the thing being examined. **A quoted error message is evidence about whichever process emitted it, and identifying that process is a separate measurement nobody made.**
+>
+> **DO NOT DRAW THE LESSON THAT THE RED SHOULD HAVE BEEN WAVED THROUGH.** Refusing to land a scorecard change over the only two checks that exercise scorecard changes was right on the information available, and would have been worth days had the gate genuinely been blind. **The error was the diagnosis, not the caution.**
+>
+> **DISPOSITION: this row describes no defect. It is superseded by nothing and should be closed by whoever dispositions it, not rebuilt.**
+
 **Cluster:** CI workflow. **Priority:** P2. **Verdict:** build (small).
 **Severity:** no engine effect, no PHI axis, no deployment axis (sec. 0). It governs the vault's security record, not the product. **The severity is that the gate reads as passing while never executing, not that any verdict is wrong.**
 
