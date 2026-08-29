@@ -803,9 +803,12 @@ returns a setup key + `otpauth://` URI for an authenticator app, `POST /me/mfa/c
 returns the **single-use recovery codes** (shown once), and `POST /auth/mfa-verify` satisfies a session's
 second factor with a TOTP code or a recovery code. `DELETE /me/mfa` disables it; an administrator clears a
 lost authenticator via `POST /users/{id}/reset-mfa` (which also revokes the user's sessions). With
-`[auth].require_mfa` on — **the default since BACKLOG #187 (secure-by-default, including the loopback
-bind)** — the **Administrator** role must satisfy MFA before any step-up operation (the gate returns
-`403` + `X-MFA-Required` until verified); other users may opt in by enrolling. A required-but-unenrolled
+`[security].require_mfa` on — **the default since BACKLOG #187 (secure-by-default, including the
+loopback bind)** — **every local account** must satisfy MFA: the scope is `every_local_account` by
+default, and `administrators` narrows it to the **Administrator** role. It is an **access gate, not
+only a step-up gate** — the gate returns `403` + `X-MFA-Required: 1` on **every** authorized route
+until verified (console twin: a 303 to `/ui/mfa`), with the account and factor-enrolment routes
+exempt so an un-enrolled user is not stranded. A required-but-unenrolled
 admin is never locked out — the enroll/confirm routes sit behind an action-bound **password** step-up,
 not the MFA gate, so the bootstrap admin enrolls then satisfies it. The documented org opt-out is
 `[security].require_mfa = false` (the retired `[auth].require_mfa` spelling is refused at load). **AD/Kerberos MFA is delegated to the directory** (Entra Conditional Access
