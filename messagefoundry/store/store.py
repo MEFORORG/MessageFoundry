@@ -3169,6 +3169,25 @@ class MessageStore:
         # The body_ref deref index lives here (not _SCHEMA) so it is created only AFTER the column is
         # guaranteed present — on a Step-A queue it'd otherwise reference a not-yet-added column.
         await db.execute("CREATE INDEX IF NOT EXISTS ix_queue_body_ref ON queue(body_ref)")
+        # BACKLOG #1256: the federated guard in auth/service.py is CHECK-THEN-ACT -- it reads the
+        # current holder and writes the binding in two separate awaits, so two concurrent FIRST
+        # logins for one subject can both observe "no holder" and both bind. This index is the
+        # atomicity that guard cannot give itself. Same shape as ux_webauthn_label and ADR 0068 4's
+        # concurrent-enroll race: the loser's driver error is rendered by the caller as the same
+        # refusal its pre-check returns.
+        #
+        # HERE RATHER THAN _SCHEMA, for the reason ix_queue_body_ref states one line up: _SCHEMA runs
+        # BEFORE this migration, and on a users table predating the federated columns the index would
+        # reference a column that does not exist yet.
+        #
+        # PARTIAL so unfederated rows coexist. SQLite treats NULLs as distinct here so the WHERE is
+        # not strictly required -- it is written anyway because on SQL Server the same filter IS
+        # required (NULLs compare EQUAL there, so an unfiltered index admits ONE unfederated user).
+        await db.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS ux_users_federated_subject"
+            " ON users(oidc_issuer, oidc_subject)"
+            " WHERE oidc_issuer IS NOT NULL AND oidc_subject IS NOT NULL"
+        )
         # BACKLOG #154: a DB whose `response` table predates resp_headers gains it here (NULL on existing
         # rows = "no captured headers", byte-identical). The table itself is created by _SCHEMA.
         cur = await db.execute("PRAGMA table_info(response)")

@@ -104,6 +104,7 @@ tests/test_quality_record_scope_claims.py
 tests/test_required_contexts.py
 tests/test_required_workflow_state.py
 tests/test_rescue_ref_provenance.py
+tests/test_scan_forbidden_loaded_set.py
 tests/test_sbom_finalize.py
 tests/test_script_root_anchoring.py
 tests/test_security_posture.py

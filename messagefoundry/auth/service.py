@@ -1269,9 +1269,34 @@ class AuthService:
             # First federated login for this account (or an unbound AD account's first): record the
             # (issuer, sub) binding so a later reassigned-username login carrying a different subject is
             # refused by the guard above. A matching binding is left untouched (no updated_at churn).
-            await self._store.set_user_federated_subject(
-                user.id, federated_subject[0], federated_subject[1]
-            )
+            try:
+                await self._store.set_user_federated_subject(
+                    user.id, federated_subject[0], federated_subject[1]
+                )
+            except Exception as exc:
+                # BACKLOG #1256. THE GUARD ABOVE IS CHECK-THEN-ACT: its read and this write are
+                # separate awaits, so two concurrent FIRST logins for one subject can both see
+                # `holder is None` and both reach here. `ux_users_federated_subject` refuses the
+                # loser on all three backends, and this renders that refusal as the SAME outcome the
+                # sequential path returns -- otherwise the race loser gets a 500 for a condition the
+                # gate handles cleanly one microsecond earlier.
+                #
+                # MRO BY NAME, matching the duplicate-label race at `_enroll_webauthn` (ADR 0068 4):
+                # each backend raises its own integrity class -- sqlite3.IntegrityError, asyncpg's
+                # UniqueViolationError, pyodbc's IntegrityError -- and naming them here would make
+                # this module import-aware of every driver and silently stop covering a backend added
+                # later. Anything that is NOT an integrity violation re-raises untouched.
+                mro = "".join(t.__name__ for t in type(exc).__mro__)
+                if "Integrity" not in mro and "UniqueViolation" not in mro:
+                    raise
+                await self._directory_reject_audit(
+                    principal.username, "oidc", "federated_subject_already_bound"
+                )
+                return LoginOutcome(
+                    ok=False,
+                    error="federated sign-in failed",
+                    reason="federated_subject_already_bound",
+                )
             # BACKLOG #1248. Binding an external identity decides WHO MAY SIGN IN as this account
             # from now on, so it is a privilege change and gets the same two records the role
             # resync below emits: an audit row, and an out-of-band notice to the account holder
