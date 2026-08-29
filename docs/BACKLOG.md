@@ -17753,3 +17753,65 @@ against a ledger that has work in it, and it does so by discarding the best-writ
 
 ---
 
+## 1395. every pre-commit gate is silently bypassed by a rebase or cherry-pick, including the PHI leak guard and the secret detector, because git never invokes pre-commit for a replayed commit
+
+> 🔢 **FILED 2026-08-29 (builder 2), MEASURED with a positive control.** `git` does not run
+> the `pre-commit` hook for a commit created by the sequencer. ***SO A REBASE OR A CHERRY-PICK PUTS A
+> COMMIT ON A BRANCH WITH NONE OF THE ELEVEN GATES HAVING RUN -- and nothing anywhere reports it.***
+
+> **THE EXPERIMENT. Four arms in a throwaway worktree that owns no allocation, all against the same
+> content -- the commit adding row #1393, whose number is allocated to a DIFFERENT worktree.**
+
+| arm | what was done | gates that ran | commit created | outcome |
+|---|---|---|---|---|
+| 1 | ordinary `git commit` | **11** | no | ***REFUSED*** -- "BACKLOG item #1393 was not allocated to this worktree" |
+| control | ordinary commit, unrelated edit | **11** | -- | proves hooks DO run in this worktree |
+| 2 | `git cherry-pick` of that commit | **0** | **YES** (`e1fac8556`) | ***ALLOWED*** |
+| 3 | `git rebase --onto` + conflict + `--continue` | **0** | **YES** (`bec1188bd`) | ***ALLOWED*** |
+
+> **Arm 3 is the one that matters and it was run TWICE.** *The first attempt was INCONCLUSIVE and is
+> recorded rather than dropped: the base already contained #1393, so the replay went empty, no commit
+> was created, and "0 gates ran" proved nothing.* **Re-run against a base WITHOUT #1393 the replay was
+> non-empty, a real commit was created, and the gates still did not run.**
+
+> ***THE LEDGER GATE IS THE LEAST OF IT. ALL ELEVEN ARE SKIPPED*** -- `.pre-commit-config.yaml`
+> declares 11 hook ids and an ordinary commit prints exactly 11 result lines. **Among them:**
+>
+>     forbidden-content (customer/PHI leak guard)
+>     Detect hardcoded secrets
+>     control characters (invisible bytes)
+>     licence header (SPDX)
+>     ledger gate (ADR/BACKLOG number reuse)
+>     bandit
+>
+> **A rebase is an ordinary, daily, entirely innocent operation in this repo** -- every branch behind
+> `main` needs one. ***SO THE LEAK GUARD AND THE SECRET DETECTOR ARE ABSENT FROM THE MOST ROUTINE
+> PATH BY WHICH COMMITS REACH A BRANCH, AND THE COMMIT LOOKS IDENTICAL TO A GATED ONE AFTERWARDS.***
+
+> **WHY THIS IS WORSE THAN A GAP: IT IS A GAP THAT REPAIRS ITSELF INTO INVISIBILITY.** A commit that
+> was refused, then rebased through, carries no mark. `git log` cannot show which commits were gated.
+> **The only evidence is the terminal output of the run that created it, which nobody keeps.**
+
+> ***WHAT THIS DOES NOT CLAIM.*** Not that anything has actually bypassed a gate this way -- nobody
+> looked, and the finding is the reachability, not an incident. Not that CI is equally blind: the
+> repo's required CI checks run against the PR head and are a real second line, **which is why this is
+> a P2 and not a P1** -- but `bandit`, the leak guard and the SPDX check are pre-commit-only as far as
+> this measurement went, **and confirming which of the eleven have a CI twin is the first task of
+> whoever takes this row.**
+
+> **CANDIDATE FIXES, none verified here.** A `pre-merge-commit` and `post-rewrite` hook pair; or a
+> CI-side re-run of the same `pre-commit` config over the PR's full diff (`pre-commit run --from-ref
+> --to-ref`), which is the one that cannot be skipped by a local workflow. ***PREFER THE CI-SIDE
+> RE-RUN: a local hook is advisory by construction and this row is the proof.***
+
+> **Found while settling a different question** -- why an allocation-keyed refusal in one worktree did
+> not reproduce in another. **The allocation answer is "replay versus fresh authorship". THE REASON IS
+> THAT NO GATE RUNS AT ALL, which is a larger finding than the question that produced it.**
+
+**Cluster:** Quality gates / CI. **Priority:** P2. **Verdict:** build.
+**Severity:** no engine effect and no PHI axis today (sec. 0, zero deployments) -- **but this repo is
+public**, and the bypassed set includes the guard whose job is to stop customer or PHI content
+reaching it. The exposure is to the REPOSITORY, not to a deployment.
+
+---
+
