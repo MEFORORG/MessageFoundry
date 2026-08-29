@@ -296,12 +296,33 @@ function Get-HandledTools([string]$Path) {
 #
 # The omission is ONE-DIRECTIONAL, and that is the whole safety argument. Skipping GetFullPath can only
 # make this key FINER than the gate's, never coarser. Finer writes a harmless duplicate line; COARSER
-# silently drops a root, which is the defect above. Measured: `C:\A\..\B` folds to `c:/b` under the gate
-# and stays `c:/a/../b` here. tests/test_install_gate_allowlist_merge.py pins that direction by
-# EXTRACTING both normalizers and asserting installer-same implies gate-same -- extraction, not
+# silently drops a root, which is the defect above -- and in -Remove mode it un-governs a root THE
+# OPERATOR DID NOT NAME, which is that same defect through a different door. Measured: `C:\A\..\B` folds
+# to `c:/b` under the gate and stays `c:/a/../b` here.
+#
+# THAT IS TRUE OF THE OMISSION, AND IT WAS NOT TRUE OF THE FUNCTION -- which is a different sentence, and
+# the difference cost a measured counterexample. Coarseness can enter at any step, not only at the one
+# being argued about, and it entered at the TrimEnd, which is why the TrimEnd below is conditional. Bare,
+# it erases the separator that tells a drive ROOT from a drive-RELATIVE path, so `C:\` and `C:` both keyed
+# `c:` -- installer-COARSER, the direction the paragraph above rules out. They are not the same place:
+# the gate resolves `C:\` to the root of drive C and `C:` to the CURRENT DIRECTORY on drive C (measured
+# 2026-08-29: `c:` against `c:/users/<you>/...`). So the separator goes back on when trimming it would
+# leave a bare drive spec, and `C:` keeps a key of its own.
+#
+# THE DOMAIN IS TRIMMED LINES. Every caller trims before it compares -- Merge-GovernedRoots trims each
+# existing line and each incoming value, Write-GovernedRoots trims each line it reads back, and the gate
+# trims each line before Get-ComparablePath -- so a leading-space spelling is not a pair either
+# normalizer is ever asked about, and the corpus below says so rather than leaving it implied.
+#
+# tests/test_install_gate_allowlist_merge.py pins the direction by EXTRACTING both normalizers and
+# asserting installer-same implies gate-same, over a corpus that CARRIES the drive-root pair -- so the
+# exception above is a counterexample the corpus contains, not a sentence beside it. Extraction, not
 # restatement, because a restated predicate is a third predicate.
 function Get-RootKey([string]$Value) {
-    (($Value.Trim().Replace('\', '/')).TrimEnd('/')).ToLowerInvariant()
+    $v = $Value.Trim().Replace('\', '/')
+    $k = $v.TrimEnd('/')
+    if ($k.Length -lt $v.Length -and $k -match '\A[A-Za-z]:\z') { $k = "$k/" }
+    $k.ToLowerInvariant()
 }
 
 # Fold the roots this run names INTO the list already on the box, and report what changed.
@@ -425,9 +446,20 @@ function Show-AllowlistResult {
     $addedKeys = [System.Collections.Generic.HashSet[string]]::new()
     foreach ($a in @($Result.Added)) { $null = $addedKeys.Add((Get-RootKey $a)) }
 
+    # COUNT DISTINCT ROOTS, NOT LINES. Two lines naming one root are both kept on purpose (see
+    # Merge-GovernedRoots), so a line count over-reports -- "2 root(s)" for one governed tree. This is
+    # the one line an operator reads to confirm nothing was lost, so it must not claim more governance
+    # than the box has. It could never hide a DROP in either direction; it could only overstate.
+    $distinct = {
+        param($values)
+        $keys = [System.Collections.Generic.HashSet[string]]::new()
+        foreach ($v in @($values)) { $null = $keys.Add((Get-RootKey $v)) }
+        $keys.Count
+    }
+
     if ($Narrowed) {
-        $n = @($Result.Dropped).Count
-        $m = @($Result.Roots).Count
+        $n = & $distinct $Result.Dropped
+        $m = & $distinct $Result.Roots
         Write-Host "Worktree gate: allowlist NARROWED -- $n root(s) REMOVED, $m still governed." -ForegroundColor Yellow
         foreach ($d in @($Result.Dropped)) { Write-Host "  removed   : $d" }
         Write-Host "              This root is UNGOVERNED the instant the file is written: writes into it stop being"
@@ -446,7 +478,7 @@ function Show-AllowlistResult {
     # No per-run MERGED/UNCHANGED banner. A line that appears on every run is one readers learn to skip
     # -- this script already makes that argument about its own output, up in the -Status block -- so the
     # count rides on the allowlist line that was going to be printed anyway.
-    $counts = "$(@($Result.Roots).Count) root(s); $(@($Result.Added).Count) added by this run"
+    $counts = "$(& $distinct $Result.Roots) root(s); $(& $distinct $Result.Added) added by this run"
     $suffix = if ($Created) { " -- allowlist CREATED" } else { "" }
     Write-Host "  allowlist : $Path  ($counts)$suffix"
     foreach ($r in @($Result.Roots)) {
@@ -470,14 +502,30 @@ function Show-AllowlistResult {
 # 2. Build the whole file in memory, write it to a temp file, then Move-Item over the target. That also
 #    closes a corruption path a naive Add-Content would open: a file whose last line lacks a trailing
 #    newline would get the next root concatenated onto it.
-# 3. Read it back and assert every intended root is there. This NARROWS the concurrent-installer race --
-#    it does not close it -- and turns a lost update from silent into loud.
+# 3. Read it back and assert every intended root is there. WHAT THAT CATCHES, EXACTLY: a write that did
+#    not land. The file on disk does not carry the roots this run intended, so the run refuses instead of
+#    printing them as governed.
+#
+#    WHAT IT DOES NOT CATCH, and an earlier wording here claimed it did: two installers that both READ
+#    before either WRITES. Each merge is right about the content it read, each write lands, and each
+#    read-back passes -- and the second write silently drops the root the first one added. Nothing here
+#    compares the file against the content the merge was computed from, so that lost update is invisible
+#    to this check. It NARROWS the race; it does not close it, and it does not make every lost update
+#    loud. tests/test_install_gate_allowlist_merge.py RUNS the surviving case rather than describing it.
 #
 # WRITE-ONLY, AND THAT IS A SECURITY PROPERTY. Nothing reads the .bak back: not this installer, not the
 # gate. Gate rule 1a protects the allowlist and the gate script by EXACT FILENAME and explicitly refuses
 # to key on the parent directory, so a sibling worktree-gate.repos.txt.bak is NOT protected and a session
 # could write to it. That is harmless only while it is inert; the moment anything reads it, it becomes a
-# route around rule 1a. tests/test_install_gate_allowlist_merge.py pins that it stays unread.
+# route around rule 1a. tests/test_install_gate_allowlist_merge.py pins that it stays unread -- by
+# following the VALUE through the variables that carry it, not by looking for the string ".bak", which
+# one local alias defeats.
+#
+# THE .bak OUTLIVES THE ALLOWLIST, on purpose. A full -Uninstall backs the file up and then deletes it,
+# so the sibling stays behind in a directory the gate no longer protects -- it is the only recovery from
+# the largest data loss this script performs. It also means a .bak can be OLDER than the allowlist beside
+# it: a later install creates a fresh file and takes no backup, having had nothing to back up. Read it as
+# a recovery copy, never as a record of the previous run.
 #
 # Returns the backup path, or $null when there was no file to back up.
 function Write-GovernedRoots {
@@ -503,11 +551,19 @@ function Write-GovernedRoots {
         if (-not $t -or $t.StartsWith('#')) { continue }
         $null = $seen.Add((Get-RootKey $t))
     }
+    # THE REFUSAL SPEAKS FOR THE WHOLE RUN, so its claim about the rest of the box has to be kept true by
+    # the CALL SITES rather than asserted here. It used to say "Nothing else was changed", which was
+    # false on the install path: the gate copy ran FIRST, so a refusal left this box carrying a refreshed
+    # machine-global gate -- and, on a first install, no hook wiring at all -- while the operator read
+    # that nothing had changed. The install path now writes the allowlist BEFORE it copies the gate and
+    # before it wires any config dir, and tests/test_install_gate_allowlist_merge.py pins that order.
     foreach ($l in @($Lines)) {
         $t = "$l".Trim()
         if (-not $t -or $t.StartsWith('#')) { continue }
         if (-not $seen.Contains((Get-RootKey $t))) {
-            throw "WROTE $Path but reading it back does not show $t. Another install probably ran at the same time. Nothing else was changed; re-run this command."
+            $recover = if ($bak) { "The allowlist as it was immediately before this write is in $bak." }
+                       else { "There was no allowlist before this write, so there is no backup." }
+            throw "WROTE $Path but reading it back does not show $t. Another install probably ran at the same time, so this run's roots may be missing from the file. Neither the gate script nor the hook wiring has been written yet. $recover Read $Path, then re-run this command."
         }
     }
     return $bak
@@ -552,10 +608,24 @@ if ($Status) {
         }
     }
 
+    # ONE reading of "what is a root", borrowed from the merge rather than spelled again here: a line
+    # that is non-blank after Trim() and does not start with '#'. This block used to carry a THIRD,
+    # disagreeing definition -- it tested StartsWith('#') on the UNTRIMMED line, so an INDENTED comment
+    # printed as a governed root. That was unreachable only while the installer regenerated the file on
+    # every run; the merge now PRESERVES an operator's indented comment by design, which made a latent
+    # disagreement live. -Status is also the only allowlist audit a session is allowed to run, so it is
+    # the one reader that must not say a comment is being governed.
     if (Test-Path -LiteralPath $ReposFile) {
-        Write-Host "governing   :"
-        Get-Content -LiteralPath $ReposFile | Where-Object { $_ -and -not $_.StartsWith('#') } |
-            ForEach-Object { Write-Host "              $_" }
+        $governed = @((Merge-GovernedRoots -Existing @(Get-Content -LiteralPath $ReposFile)).Roots)
+        if ($governed.Count -gt 0) {
+            Write-Host "governing   :"
+            foreach ($g in $governed) { Write-Host "              $g" }
+        } else {
+            # An allowlist that exists and names no root is the gate switched OFF, and it printed as a
+            # bare "governing   :" with nothing under it -- which reads as a rendering glitch, not as a
+            # box with no governance.
+            Write-Host "governing   : nothing (the allowlist names no root -> gate is OFF)"
+        }
     } else {
         Write-Host "governing   : nothing (no allowlist -> gate is OFF)"
     }
@@ -755,6 +825,14 @@ $existing = if ($allowlistExisted) { @(Get-Content -LiteralPath $ReposFile -Erro
 $wasOff = $allowlistExisted -and ((Merge-GovernedRoots -Existing $existing).Roots.Count -eq 0)
 $result = Merge-GovernedRoots -Existing $existing -Incoming $resolved
 
+# WRITE THE ALLOWLIST BEFORE ANYTHING MACHINE-GLOBAL CHANGES -- the same argument as the read above, one
+# step later. Write-GovernedRoots can REFUSE (its read-back), and its refusal tells the operator that
+# neither the gate script nor the hook wiring has been written yet. Copying the gate first made that
+# sentence false: a refusal left this box carrying a refreshed machine-global gate and, on a first
+# install, no matchers at all. Nothing between here and the copy needs the installed gate to exist --
+# $command below is a string.
+$bak = Write-GovernedRoots -Path $ReposFile -Lines $result.Lines
+
 # BACK UP THE GATE BEFORE OVERWRITING IT. The allowlist writer has done this since #1375; the GATE
 # SCRIPT never did, and the near-miss is why: `Write-Settings` backs up settings.json, and reading
 # `Copy-Item ... .bak` in this file makes the absence here easy to read as presence. It is not the
@@ -803,8 +881,6 @@ $receipt = [ordered]@{
     note           = 'Convenience record written by install-gate.ps1. NOT protected by the gate and NOT attestation.'
 } | ConvertTo-Json -Depth 4
 Set-Content -LiteralPath "$GateDst.receipt.json" -Value $receipt -Encoding utf8
-
-$bak = Write-GovernedRoots -Path $ReposFile -Lines $result.Lines
 
 $command = "pwsh -NoProfile -File `"$GateDst`""
 

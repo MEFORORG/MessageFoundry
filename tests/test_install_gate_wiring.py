@@ -364,6 +364,73 @@ def test_an_empty_audit_population_says_nothing_was_examined(tmp_path: Path) -> 
     assert "no unjudged dir carries gate wiring" not in out
 
 
+def _governing(out: str) -> list[str]:
+    """The roots ``-Status`` reports as governed, or [] when it says the gate is off."""
+    lines = out.splitlines()
+    for i, ln in enumerate(lines):
+        if not ln.startswith("governing   :"):
+            continue
+        if ln.split(":", 1)[1].strip():
+            return []  # "nothing (...)" -- no list follows
+        # Stop at the first line outside this block. -Status prints several indented blocks and a
+        # whole-output filter would collect the next one's lines as roots.
+        roots = []
+        for body in lines[i + 1 :]:
+            if not body.startswith("              "):
+                break
+            roots.append(body.strip())
+        return roots
+    raise AssertionError(f"-Status printed no governing line:\n{out}")
+
+
+def _plant_allowlist(home: Path, lines: list[str]) -> Path:
+    dst = home / ".claude" / "hooks" / "worktree-gate.repos.txt"
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    dst.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return dst
+
+
+def test_status_reads_a_root_the_same_way_the_gate_and_the_merge_do(tmp_path: Path) -> None:
+    """BACKLOG #1375. ``-Status`` carried a THIRD, disagreeing definition of what a root is.
+
+    The gate and the merge both Trim() a line and then ask whether it starts with '#'. ``-Status`` asked
+    the untrimmed line, so an INDENTED comment printed as a governed root -- and it is the only
+    allowlist audit a session is allowed to run, so it is the reader most likely to be believed.
+
+    This was unreachable while the installer regenerated the file on every run, because a regenerated
+    file has no indented comments in it. The merge PRESERVES an operator's comment verbatim by design,
+    which is what made a latent disagreement live: the shape the fixture below plants is the shape the
+    merge is now required to keep.
+    """
+    home = _fake_home(tmp_path, [".claude"])
+    indented = "  # ops: retired 2026-08, keep the line"
+    mf = r"C:\Repos\Code\MessageFoundry"
+    _plant_allowlist(home, ["# Primary checkouts governed by the worktree gate.", indented, mf, ""])
+
+    governed = _governing(_status_against(home))
+    assert governed == [mf], (
+        "-Status disagrees with the gate about which lines are roots. An indented comment is a "
+        f"comment to both the gate and the merge, and a governed root only here.\n  reported: {governed}"
+    )
+
+
+def test_status_says_the_gate_is_off_when_the_allowlist_names_no_root(tmp_path: Path) -> None:
+    """NEGATIVE CONTROL, and a state of its own. An allowlist holding only comments IS the kill switch.
+
+    It used to print a bare ``governing   :`` with nothing under it, which reads as a rendering glitch
+    rather than as a box governing nothing -- the same collapse of "I found nothing" into "everything is
+    fine" that the audit below refuses.
+    """
+    home = _fake_home(tmp_path, [".claude"])
+    _plant_allowlist(home, ["# every root was removed one at a time", "   ", ""])
+
+    out = _status_against(home)
+    assert _governing(out) == []
+    assert "governing   : nothing (the allowlist names no root -> gate is OFF)" in out, (
+        f"an allowlist naming no root must say the gate is off:\n{out}"
+    )
+
+
 def test_status_prints_a_sha_beside_each_version() -> None:
     """`-Status` is the only way to see whether the RUNNING gate matches this checkout, and nothing
     exercised it. It also shipped a defect worth pinning: `$GateVersion` is bumped by hand, and rules 1a,
