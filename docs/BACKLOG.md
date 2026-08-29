@@ -17905,3 +17905,65 @@ shape a reader is least able to detect.
 
 ---
 
+## 1398. a row can be fully built with nothing in its text saying so, and no ledger-reading screen can detect it -- ask the tree, not the banner
+
+> 🔢 **FILED 2026-08-29 (builder 2), found by starting the work.** A dispatcher screened
+> **#1300** as open, unclaimed, in no PR title or body, and carrying no bar -- *"P1, quick win, not
+> started"*. ***IT WAS ALREADY BUILT AND SHIPPED ON `main`.*** I only found out because I began it.
+
+    tests/test_required_contexts.py:235
+      test_the_ci_gate_rollup_comment_names_every_job_the_job_actually_needs()
+      its docstring opens: "BACKLOG #1300."
+    .github/required-contexts.txt now names all EIGHT legs and says
+      "THE SECOND GROUP WAS ABSENT FROM THIS FILE UNTIL BACKLOG #1300"
+    and #1300 still reads OPEN.
+
+> ***THIS IS NOT #1393's CLASS, AND THE DIFFERENCE IS THE WHOLE POINT.*** #1393 covers rows that
+> **say** their work shipped, where the screen misses the word `REBUILD`. **#1300 says nothing at
+> all** -- no bar, no `DO NOT`, no "shipped" sentence. ***THERE IS NOTHING IN THE TEXT TO MISS. The
+> row is silent and the code is done.*** No amount of reading the ledger finds it, however carefully;
+> **a banner is a hand-maintained claim ABOUT the code, and it goes stale in the direction nothing
+> detects.**
+
+> **THE CHECK, AND IT COSTS FOUR MINUTES FOR NINE ROWS:**
+>
+>     git grep -l -E "BACKLOG #<N>\b" origin/main -- tests/ scripts/ messagefoundry/ .github/
+>
+> ***RUN IT WITH BOTH CONTROLS OR IT PROVES NOTHING: a number known to be UNBUILT must return 0, and
+> one known to be BUILT must return nonzero.*** Without both, a broken pattern returns zero everywhere
+> and reads as *"nothing is built"* -- a false zero that has fired twice in one session.
+
+> **MEASURED ACROSS NINE ROWS a dispatcher had screened as startable (four dispatched, five held in
+> reserve) at `origin/main`:**
+
+| result | rows |
+|---|---|
+| **code on main cites the row number** | **7 of 9** -- #1300, #1337, #1348, #1291, #1254, #1255, #1290 |
+| no citation | 2 -- #1384, #1385 |
+| controls | #1396 (filed that night, unbuilt) returns **0**; #1027 (landed) returns **4** |
+
+> ***WHAT THIS ROW CLAIMS AND WHAT IT DOES NOT. IT DOES NOT CLAIM SEVEN ROWS ARE DONE.*** A citation
+> is not completion: a builder may cite a row while doing PART of it, or the reference may be
+> incidental. **Exactly one was verified end to end (#1300).** ***WHAT IT DOES ESTABLISH IS THAT SEVEN
+> OF NINE WARRANT A READ NOBODY WAS DOING, and that the cost of that read is minutes against a
+> lane-window.***
+
+> **THE FIX IS NOT A BETTER SCREEN.** The dispatcher's screen was good and had just been improved to
+> read banners **by sentence** rather than by token -- that improvement correctly caught three other
+> rows whose banners said the fix was already with the Lander. ***IT STILL PASSED #1300, BECAUSE THE
+> LEDGER IS NOT WHERE THE ANSWER LIVES.*** Add the tree check to the dispatch path, or accept that
+> some fraction of every dispatch is rework.
+
+> ***THE DEEPER ASYMMETRY, WHICH IS WHY THIS KEEPS HAPPENING: a builder's commit reliably cites the
+> row number in the code and the commit message, because gates require it. The ROW is the one artefact
+> in the loop that nothing forces anyone to update*** -- closing it is a judgement the building seat
+> often cannot make (see #1393), so it stays open by default. **The incentive structure produces
+> silently-stale banners as its normal output, not as an error.**
+
+**Cluster:** Fleet coordination / dispatch. **Priority:** P2. **Verdict:** build (small -- add the
+check to the dispatch path). **Severity:** no engine effect, no PHI axis, no deployment axis (sec. 0).
+It spends a lane-window rebuilding shipped work, and unlike #1393 there is no textual signal that
+could have warned anyone.
+
+---
+
