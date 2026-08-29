@@ -324,32 +324,44 @@ is slow must say so and tell you to go direct.
 **Reach them with `mail.ps1` (leaves a receipt, reaches an idle or different-login peer) or a
 cross-session message (faster, no receipt, dies with the session).**
 
-**WHO MAY DO WHAT. Three rules, and the first two only look contradictory.**
+**WHO MAY DO WHAT. Three rules, and they divide one act into three: PUSHING, REVIEWING, MERGING.**
 
 1. **The LANDER holds STANDING authority to push, PR and merge, on the engine repo AND the vault, and
    needs no per-action owner approval.** Source: `roles/LANDER.md` line 87 **on `origin/main`**, which
    states the grant and adds that you should not go looking for a separate one; ratified by the owner
    2026-08-22.
-2. **Every OTHER seat still needs the owner's approval to PERFORM an outward-facing action itself** --
-   your own push, your own PR, your own merge. The Lander's grant covers the LANDER'S act of landing.
-   It does not cover yours.
-3. **HANDING YOUR BRANCH TO THE LANDER IS THE DEFAULT ACTION, NOT A QUESTION.** It needs no approval
-   and you do not ask for one.
+2. **EVERY SEAT PUSHES ITS OWN BRANCH AND OPENS ITS OWN PR, WITHOUT ASKING.** Owner ruling
+   2026-08-29, in their words: *"Sessions push their own."* No per-action approval is needed for
+   your own push or your own PR.
+3. **THE MERGE IS STILL THE LANDER'S**, and a PR reaches it THROUGH THE REVIEWER: open the PR, notify
+   the Reviewer seat, and it either returns the PR to you with findings or passes it to the Lander,
+   which merges. If no Reviewer is running, route to the Lander as before.
 
-**Rules 2 and 3 govern different acts: PERFORMING a push versus ROUTING one.** The version of this
-paragraph they replace collapsed the two, so it read as forbidding the handover as well, and seats sat
-on finished work waiting for an approval nobody owed them. **The Liaison half is unchanged: it
-compresses and presents your question, and it does not answer it.**
+**Direct pushes to `main` remain blocked by the harness, so branch and PR is still the path.** What
+rule 2 removes is the approval hop on your OWN branch, not the protection on `main`.
 
-**READ A ROLE PLAYBOOK WITH `git show origin/main:roles/<FILE>.md`, NEVER FROM THE
-`MessageFoundry-vault` WORKING TREE.** That checkout sits on a branch `git merge-base --is-ancestor`
-reports is **not** an ancestor of `origin/main`, so every file in it can be stale in a way a directory
-listing cannot show. Measured 2026-08-22, independently by several seats within about twenty minutes,
-three of which broadcast confident wrong conclusions drawn from it -- including on the authority
-question this section states, where the correcting text was among the lines a stale copy was missing.
-**And two playbooks do not exist in that checkout at all**, so the folder looks complete while the
-document about instruments that lie is absent entirely. **An `ls` of that directory is not evidence
-that you have the file.**
+**This section previously said the opposite** -- that every seat but the Lander needed the owner's
+approval to push, and that handing the branch over was the default. Both halves are superseded by the
+ruling above. It is recorded rather than deleted because the stale text was live long enough that
+seats still quote it, and a reader who remembers the old rule needs to see it named as retired rather
+than silently absent. **The Liaison half is unchanged: it compresses and presents your question, and
+it does not answer it.**
+
+**READ A ROLE PLAYBOOK FROM THE `MessageFoundry-vault` PRIMARY'S `roles/` FOLDER.** Owner ruling,
+vault commit `5e361756`, restated 2026-08-28: *"the files in the vault primary's roles/ folder are the
+authority."*
+
+**THAT EXCEPTION COVERS `roles/` AND NOTHING ELSE IN THAT TREE. Do not widen it.** The rest of that
+checkout sits on a branch `git merge-base --is-ancestor` reports is **not** an ancestor of
+`origin/main`, so every other file in it can be stale in a way a directory listing cannot show.
+Measured 2026-08-22, independently by several seats within about twenty minutes, three of which
+broadcast confident wrong conclusions drawn from it. **An `ls` of that directory is not evidence that
+you have the file** -- a folder can look complete while a document is absent entirely.
+
+**This section previously said to read playbooks with `git show origin/main:roles/<FILE>.md` and NEVER
+from that working tree.** The ruling above reverses which copy is authoritative for `roles/`. The
+warning it replaces was measured and correct about the rest of the tree, which is why the caution
+survives with a narrower subject rather than being deleted.
 
 ### Git discipline
 - Work on a **feature branch and open a PR**; commit at logical stops, **one coherent layer per
@@ -357,10 +369,9 @@ that you have the file.**
   branch + PR is the path.)
 - **Commits at logical stops are Claude's own judgment** — proactively commit coherent, tested,
   one-layer-per-commit changes and narrate each (respect the ledger gate — never `--no-verify` or a
-  rename workaround). **A push, PR or merge YOU perform needs the owner's approval**: it is
-  outward-facing and, with auto-merge on, a PR effectively merges to `main`. **Handing the branch to
-  the Lander instead needs no approval and is the default** -- its standing grant is stated above, and
-  waiting on an approval for the handover is the failure that rule exists to stop.
+  rename workaround). **Your own push and your own PR need no approval** -- owner ruling 2026-08-29,
+  *"Sessions push their own"*, stated in full above. **Notify the Reviewer when the PR is open**; the
+  merge stays the Lander's. Auto-merge is why the MERGE is still gated and yours is not.
 - **Whoever executes a push or merge announces it** — one `mail.ps1 -Send -To all` line, before
   (heads-up: `"pushing #N now, touches X"`) and/or after (`"landed #N at <sha>, touches X, rebase if
   BEHIND"`). Worded around the *action*, not a fixed identity — no gate enforces *who* may push a
