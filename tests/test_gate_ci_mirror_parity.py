@@ -46,17 +46,31 @@ _ROOT = Path(__file__).resolve().parents[1]
 _PRECOMMIT = _ROOT / ".pre-commit-config.yaml"
 _WORKFLOWS = _ROOT / ".github" / "workflows"
 
-#: The eight hooks this file owns, and the token that must appear in a NON-COMMENT workflow line.
+#: The eight hooks this file owns, mapped to a regex that must match a NON-COMMENT workflow line.
 #: ruff-format, ruff-check and bandit are deliberately absent -- see the module docstring.
+#:
+#: ***ANCHORED ON THE INVOCATION, NOT THE TOOL NAME, AND FOR gitleaks AND actionlint THAT IS
+#: LOAD-BEARING.*** The first version of this file matched the bare names. Review measured the corpus:
+#: `gitleaks` appears on TEN non-invocation lines and `actionlint` on EIGHT -- job keys, `name:`
+#: labels, a release URL, checksum lines, a tar call, `sudo install`, `--version`. ***DELETING THE REAL
+#: RUN LINE LEFT THOSE HITS BEHIND AND THE ASSERTION STILL PASSED, so the CI mirror could be removed
+#: entirely and this test would stay green -- on exactly the rebase-created commit #1395 describes.***
+#: The docstring's "an executable line, not a comment" was necessary and not sufficient:
+#: `sudo install ... gitleaks` IS an executable line and is not an invocation.
+#:
+#: The six script-path patterns were measured safe (1-3 hits each, all run lines) -- but safe BY THE
+#: CURRENT CORPUS, not by construction, which is why they are regexes too rather than substrings.
 _MIRRORS: dict[str, str] = {
-    "ledger-gate": "scripts/hooks/ledger_check.py",
-    "backlog-parses": "scripts/docs/backlog_status_check.py",
-    "forbidden-content": "scripts/security/scan_forbidden.py",
-    "licence-header": "scripts/quality/licence_header_check.py",
-    "control-char": "scripts/quality/control_char_check.py",
-    "username-access-key": "scripts/quality/username_access_key_screen.py",
-    "gitleaks": "gitleaks",
-    "actionlint": "actionlint",
+    "ledger-gate": r"python\s+scripts/hooks/ledger_check\.py",
+    "backlog-parses": r"python\s+scripts/docs/backlog_status_check\.py",
+    "forbidden-content": r"python\s+scripts/security/scan_forbidden\.py",
+    "licence-header": r"python\s+scripts/quality/licence_header_check\.py",
+    "control-char": r"python\s+scripts/quality/control_char_check\.py",
+    "username-access-key": r"python\s+scripts/quality/username_access_key_screen\.py",
+    # `detect` is gitleaks' scan subcommand; `version`, `install` and the download URL are not.
+    "gitleaks": r"\bgitleaks\s+detect\b",
+    # the hook passes `-shellcheck=`; `--version` and `sudo install ... actionlint` must not satisfy it.
+    "actionlint": r"\bactionlint\s+-shellcheck=",
 }
 
 #: Already pinned by tests/test_lint_scope_parity.py. Named so the split is visibly deliberate and so
@@ -126,11 +140,15 @@ def test_this_file_and_its_sibling_together_cover_every_hook() -> None:
 
 @pytest.mark.parametrize("hook_id", sorted(_MIRRORS))
 def test_each_hook_has_a_real_ci_invocation(hook_id: str) -> None:
-    """Not a mention in a comment -- an executable line."""
-    token = _MIRRORS[hook_id]
-    hits = [(f, n) for f, n, s in _workflow_lines() if token in s]
+    """Not a mention in a comment, and not an install line either -- an INVOCATION.
+
+    ***"NOT A COMMENT" IS NECESSARY AND NOT SUFFICIENT.*** `sudo install -m 0755 gitleaks
+    /usr/local/bin/gitleaks` is an executable line and is not a scan. See `_MIRRORS`.
+    """
+    pattern = _MIRRORS[hook_id]
+    hits = [(f, n) for f, n, s in _workflow_lines() if re.search(pattern, s)]
     assert hits, (
-        f"hook {hook_id!r} has no non-comment workflow line containing {token!r}. Its CI mirror is "
+        f"hook {hook_id!r} has no non-comment workflow line matching {pattern!r}. Its CI mirror is "
         f"gone, so on a rebase-created commit (BACKLOG #1395) this rule is enforced NOWHERE."
     )
 
