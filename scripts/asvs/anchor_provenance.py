@@ -257,15 +257,28 @@ def main(argv: list[str] | None = None) -> int:
     except (OSError, ValueError):
         pass
 
+    # THE REF PAIR IS PART OF THE MEASUREMENT, SO AN UNRESOLVABLE HEAD IS A REFUSAL. On a repo with
+    # no commits ``git rev-parse HEAD`` exits 128 and still ECHOES THE LITERAL ``HEAD`` ON STDOUT, so
+    # an unchecked read stamps ``engine=HEAD`` -- which reads as a deliberate value rather than as a
+    # failure, and passes review forever. An empty string would at least have invited a second look.
+    rev = subprocess.run(  # nosec B603 B607 - fixed argv, no shell; rev-parse takes no input
+        ["git", "-C", str(args.root), "rev-parse", "HEAD"], capture_output=True, text=True
+    )
+    if rev.returncode != 0:
+        sys.stderr.write(
+            f"REFUSING: cannot resolve HEAD in {args.root} (exit {rev.returncode}). The engine ref "
+            "is part of this measurement, and git echoes the literal 'HEAD' on this failure, so an "
+            "unchecked read would stamp engine=HEAD and look deliberate.\n"
+        )
+        return 3
+    head = rev.stdout.strip()
+
     cells = load_scorecard(args.scorecard)
     verdicts = audit(cells, args.root, args.at)
     if not verdicts:
         sys.stderr.write("REFUSING to report a clean run over zero anchors\n")
         return 3
 
-    head = subprocess.run(  # nosec B603 B607 - fixed argv, no shell; rev-parse takes no input
-        ["git", "-C", str(args.root), "rev-parse", "HEAD"], capture_output=True, text=True
-    ).stdout.strip()
     # NO NUMBER HERE IS A FACT WITHOUT THE PAIR IT WAS MEASURED AGAINST -- the same rule the scorecard's
     # own verify header states. Printed as part of the measurement, not as decoration.
     print(

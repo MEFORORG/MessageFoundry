@@ -219,3 +219,77 @@ def test_a_root_that_is_not_a_checkout_is_refused(tmp_path: Path) -> None:
     card = tmp_path / "card.toml"
     card.write_text('[[cell]]\nlast_verified = "2026-01-01"\n', encoding="utf-8")
     assert main(["--scorecard", str(card), "--root", str(tmp_path)]) == 2
+
+
+# ------------------------------------------------- the instrument reporting its own failed read
+#
+# EVERY ROW BELOW PINS A GUARD THAT DOES NOT EXIST YET, AND EACH PINS A DIFFERENT ONE. The shared
+# defect is an all-clear printed over a read that never happened -- the most reassuring possible
+# wrong answer, and the one this file's own docstring says both original defects wore.
+
+
+def test_a_root_whose_HEAD_cannot_be_resolved_is_refused_not_stamped_HEAD(
+    tmp_path: Path, capsys
+) -> None:
+    """``git rev-parse HEAD`` on a commitless repo exits 128 AND ECHOES THE LITERAL ``HEAD`` ON
+    STDOUT, so the header renders ``engine=HEAD``.
+
+    That is worse than an empty value and it is the whole point: ``engine=`` invites a second look,
+    ``engine=HEAD`` reads as a deliberate measurement and passes review forever. This file declares
+    the ref pair part of the measurement, so an unresolvable HEAD is a refusal, not a footnote.
+    """
+    repo = tmp_path / "commitless"
+    git("init", "-b", "main", str(repo), cwd=tmp_path)
+    card = tmp_path / "card.toml"
+    card.write_text(
+        '[[cell]]\nlast_verified = "2026-01-01"\nresidual = "BACKLOG #10"\n', encoding="utf-8"
+    )
+    assert main(["--scorecard", str(card), "--root", str(repo)]) == 3
+    captured = capsys.readouterr()
+    # NOT a bare ``"HEAD" in err``. That assertion passed with this guard REMOVED, because pytest
+    # names ``tmp_path`` after the test and this test's name contains HEAD -- so the directory path
+    # echoed in a DIFFERENT refusal satisfied it. Caught by mutation, not by re-reading. The phrase
+    # below is emitted by the rev-parse guard and by nothing else in either tool.
+    assert "cannot resolve HEAD" in captured.err
+    assert "engine=HEAD" not in captured.out
+
+
+def test_a_failed_ledger_walk_raises_rather_than_reading_as_no_history(tmp_path: Path) -> None:
+    """A ``git log`` that fails yields no lines, and no lines is indistinguishable from a ledger
+    whose banners were never touched.
+
+    Pinned at the unit rather than through ``main`` deliberately: the walk is also the half that can
+    fail on ONE of the two ledgers while the other succeeds, and a partial walk is non-empty, so the
+    emptiness guard below cannot see it.
+    """
+    repo = tmp_path / "commitless"
+    git("init", "-b", "main", str(repo), cwd=tmp_path)
+    with pytest.raises(RuntimeError):
+        banner_last_touched(repo, [LIVE], None)
+
+
+def test_a_walk_that_found_no_banner_history_is_refused_not_reported_clean(
+    tmp_path: Path, capsys
+) -> None:
+    """A ledger path absent from a real history makes ``git log`` exit ZERO with no output.
+
+    So the walk succeeds, returns nothing, every pair falls to ``unknown``, and the tool prints the
+    all-clear. The correct guard was already written thirty lines earlier for the OTHER input --
+    ``if not pairs`` -- and the same reasoning transfers verbatim.
+    """
+    repo = tmp_path / "engine"
+    git("init", "-b", "main", str(repo), cwd=tmp_path)
+    git("config", "user.email", "t@example.com", cwd=repo)
+    git("config", "user.name", "t", cwd=repo)
+    (repo / "unrelated.txt").write_text("x\n", encoding="utf-8")
+    git("add", "-A", cwd=repo)
+    git("commit", "-m", "one", cwd=repo)
+
+    card = tmp_path / "card.toml"
+    card.write_text(
+        '[[cell]]\nlast_verified = "2026-01-01"\nresidual = "BACKLOG #10"\n', encoding="utf-8"
+    )
+    assert main(["--scorecard", str(card), "--root", str(repo)]) == 3
+    captured = capsys.readouterr()
+    assert "REFUSING" in captured.err
+    assert "no item was re-scored" not in captured.out

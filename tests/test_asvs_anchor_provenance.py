@@ -249,3 +249,32 @@ def test_detail_is_written_only_when_asked(tmp_path: Path, history) -> None:
     assert main(["--scorecard", str(card), "--root", str(repo), "--detail", str(detail)]) == 0
     rows = json.loads(detail.read_text(encoding="utf-8"))
     assert rows and rows[0]["verdict"] == BORN_WRONG
+
+
+def test_a_root_whose_HEAD_cannot_be_resolved_is_refused_not_stamped_HEAD(
+    tmp_path: Path, capsys
+) -> None:
+    """The comment above this tool's own header says NO NUMBER HERE IS A FACT WITHOUT THE PAIR IT
+    WAS MEASURED AGAINST -- and the pair is exactly what degrades silently.
+
+    ``git rev-parse HEAD`` on a commitless repo exits 128 and echoes the literal ``HEAD`` on stdout,
+    so the header stamps ``engine=HEAD``. Measured on that arm: rc=0, every anchor unreadable, and a
+    closing line reading ``NOT verifiable at the cell's own recorded commit: 0``. A reassuring zero
+    over a run where nothing was verifiable at all.
+    """
+    repo = tmp_path / "commitless"
+    git("init", "-b", "main", str(repo), cwd=tmp_path)
+    card = tmp_path / "card.toml"
+    card.write_text(
+        '[[cell]]\nid = "X.1.1"\nlevel = 1\nverdict = "pass"\nverified_at = "deadbeef"\n'
+        '[[cell.evidence]]\npath = "mod.py"\nline = 2\nexpect = "NEEDLE"\n',
+        encoding="utf-8",
+    )
+    assert main(["--scorecard", str(card), "--root", str(repo)]) == 3
+    captured = capsys.readouterr()
+    # NOT a bare ``"HEAD" in err``. That assertion passed with this guard REMOVED, because pytest
+    # names ``tmp_path`` after the test and this test's name contains HEAD -- so the directory path
+    # echoed in a DIFFERENT refusal satisfied it. Caught by mutation, not by re-reading. The phrase
+    # below is emitted by the rev-parse guard and by nothing else in either tool.
+    assert "cannot resolve HEAD" in captured.err
+    assert "engine=HEAD" not in captured.out

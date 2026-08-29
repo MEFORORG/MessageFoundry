@@ -139,12 +139,22 @@ def banner_last_touched(root: Path, backlog_paths: list[str], limit: int | None)
     """
     touched: dict[int, str] = {}
     for backlog_path in backlog_paths:
-        revs = subprocess.run(  # nosec B603 B607 - fixed argv, no shell; read-only git log
+        walk = subprocess.run(  # nosec B603 B607 - fixed argv, no shell; read-only git log
             ["git", "-C", str(root), "log", "--format=%H %cs", "--reverse", "--", backlog_path],
             capture_output=True,
             text=True,
             encoding="utf-8",
-        ).stdout.splitlines()
+        )
+        # A FAILED WALK YIELDS NO LINES, AND NO LINES IS EXACTLY WHAT A LEDGER WHOSE BANNERS NEVER
+        # MOVED ALSO YIELDS. Raising is the only thing that keeps the two apart, and the caller's
+        # emptiness guard is not a substitute: a walk that fails over ONE of the two ledgers while
+        # the other succeeds leaves a PARTIAL result, which is non-empty and reads as complete.
+        if walk.returncode != 0:
+            raise RuntimeError(
+                f"git log failed over {backlog_path} in {root} "
+                f"(exit {walk.returncode}): {walk.stderr.strip()}"
+            )
+        revs = walk.stdout.splitlines()
         if limit is not None:
             revs = revs[-limit:]
 
@@ -227,6 +237,22 @@ def main(argv: list[str] | None = None) -> int:
         sys.stderr.write(f"--root is not a git checkout: {args.root}\n")
         return 2
 
+    # THE REF PAIR IS PART OF THE MEASUREMENT, SO AN UNRESOLVABLE HEAD IS A REFUSAL. On a repo with
+    # no commits ``git rev-parse HEAD`` exits 128 and still ECHOES THE LITERAL ``HEAD`` ON STDOUT, so
+    # an unchecked read stamps ``engine=HEAD`` -- which reads as a deliberate value rather than as a
+    # failure, and passes review forever. An empty string would at least have invited a second look.
+    rev = subprocess.run(  # nosec B603 B607 - fixed argv, no shell; rev-parse takes no input
+        ["git", "-C", str(args.root), "rev-parse", "HEAD"], capture_output=True, text=True
+    )
+    if rev.returncode != 0:
+        sys.stderr.write(
+            f"REFUSING: cannot resolve HEAD in {args.root} (exit {rev.returncode}). The engine ref "
+            "is part of this measurement, and git echoes the literal 'HEAD' on this failure, so an "
+            "unchecked read would stamp engine=HEAD and look deliberate.\n"
+        )
+        return 3
+    head = rev.stdout.strip()
+
     pairs, ambiguous = read_pairs(args.scorecard.read_text(encoding="utf-8", errors="replace"))
     if not pairs:
         sys.stderr.write(
@@ -236,12 +262,23 @@ def main(argv: list[str] | None = None) -> int:
         return 3
 
     ledgers = args.backlog or ["docs/BACKLOG.md", "docs/archive/backlog/BACKLOG-CLOSED.md"]
-    touched = banner_last_touched(args.root, ledgers, args.limit)
+    try:
+        touched = banner_last_touched(args.root, ledgers, args.limit)
+    except RuntimeError as exc:
+        sys.stderr.write(f"REFUSING: {exc}\n")
+        return 3
+    # THE GUARD THIRTY LINES ABOVE, FOR THE OTHER INPUT, AND THE REASONING TRANSFERS VERBATIM. With
+    # no history every pair falls to ``unknown``, ``flags`` is empty, and the tool prints the
+    # all-clear -- the most reassuring possible answer to a question it never got to ask.
+    if not touched:
+        sys.stderr.write(
+            "REFUSING: the ledger walk found no banner history at all. An empty result here is "
+            "indistinguishable from a ledger this tool could not read, and every pair would fall "
+            f"to 'unknown' while the verdict still printed the all-clear. Walked: {ledgers}\n"
+        )
+        return 3
     flags, unknown = evaluate(pairs, touched)
 
-    head = subprocess.run(  # nosec B603 B607 - fixed argv, no shell; rev-parse takes no input
-        ["git", "-C", str(args.root), "rev-parse", "HEAD"], capture_output=True, text=True
-    ).stdout.strip()
     print(f"# rescore-handoff scorecard={args.scorecard} engine={head[:12]}")
     print(
         f"pairs read (literal 'BACKLOG #N' only): {len(pairs)} over {len({p.item for p in pairs})} items"
