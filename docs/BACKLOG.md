@@ -17456,6 +17456,29 @@ nonsense duration that then poisons min and mean. **The tell was that the value 
 than merely surprising; a subtler skew would have passed.** The numbers above exclude incomplete
 steps and say how many were excluded, so the denominator is visible rather than implied.
 
+**FOURTH ATTEMPT, 13:01:54Z -- I re-queued once deliberately and it failed a FOURTH distinct way.
+Failing job: `sql server (store + connector) 2025`.** The 12:42 attempt failed the **2022** leg of
+the same suite. So the SQL Server failure alternates between OS legs across attempts, which is the
+signature the 641 row already described in its own words: the same test failing *"twice, on TWO
+DIFFERENT OS legs"*. Test-level detail for this run was not retrievable at the time of writing
+(`gh run view --log-failed` returned rc=1 while the run was still finalising), so this entry records
+the **job-level** fact only and does not claim which test failed.
+
+**Running tally: four queue attempts, four different failure profiles, zero merges.**
+
+```
+11:15  windows-2025 pytest HANG, 55.1 min, hit the cap    process-level, below pytest
+11:37  test_a_fast_handler_is_untouched                    wall-clock timing
+12:42  test_hostile_disposition_header... + SQL Server 2022  timing + infra
+13:01  SQL Server 2025                                     infra, the OTHER OS leg
+```
+
+**I re-queued knowing the row says not to, and the row still says not to.** The reason was that a
+queue attempt costs runner time rather than the fleet's token budget, and the queue was empty so it
+blocked nobody. **It did not land, and that is the point: the fourth attempt produced more evidence
+rather than a merge, which is what "do not re-run until it passes" predicts.** One deliberate
+re-queue to test the prediction is not the same act as re-running until a green appears.
+
 **WHAT I CANNOT ATTRIBUTE, stated rather than smoothed over.** The three removals do not map cleanly
 onto the three runs. The first entry was removed at 11:15:32Z, **fifty seconds** after being added and
 long before its own run timed out at roughly 12:10Z -- so that removal was not caused by that run.
