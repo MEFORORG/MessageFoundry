@@ -217,6 +217,83 @@ def test_claim_records_the_checkout_it_lives_in_not_the_cwd(tmp_path: Path) -> N
     )
 
 
+def _run_claim(script_tree: Path, cwd: Path, *args: str) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [
+            "pwsh",
+            "-NoProfile",
+            "-NonInteractive",
+            "-File",
+            str(script_tree / "scripts" / "coord" / "claim.ps1"),
+            *args,
+        ],
+        cwd=str(cwd),
+        capture_output=True,
+        text=True,
+        timeout=180,
+    )
+
+
+#: The divergence note's own load-bearing sentence, asserted as a SUBSTRING of the rendered line.
+#:
+#: Not the whole line: it interpolates two absolute paths and PowerShell hard-wraps host output at the
+#: console width, so an equality assertion would fail on formatting rather than on behaviour. This
+#: fragment carries the instruction a reader has to act on and nothing that varies.
+_DIVERGENCE = "but this script lives in"
+
+
+def test_the_divergence_note_FIRES_on_take_from_a_foreign_cwd(tmp_path: Path) -> None:
+    """POSITIVE CONTROL for the test below, and it must be read as one.
+
+    Asserting only that ``-Release`` prints nothing cannot distinguish "this path is silent" from "the
+    note never fires anywhere" -- an absent feature and a broken assertion print the same empty string.
+    So this pins that the mechanism WORKS on the path that has it, in the same fixture, with the same
+    divergence, before its sibling asserts the path that does not.
+    """
+    named = _coord_checkout(tmp_path / "Named", drafted=4242, boundary=1200)
+    caller = _coord_checkout(tmp_path / "Caller", drafted=7777, boundary=1900)
+
+    proc = _run_claim(named, caller, "-Take", "note-probe", "-Note", "divergence fixture")
+
+    assert proc.returncode == 0, proc.stderr or proc.stdout
+    assert _DIVERGENCE in proc.stdout, (
+        "the -Take divergence note did not fire, so this control cannot support its sibling:\n"
+        f"{proc.stdout}"
+    )
+
+
+def test_the_divergence_note_ALSO_fires_on_release_from_a_foreign_cwd(tmp_path: Path) -> None:
+    """BACKLOG #1358 -- the note names the release rule and was printed only at CLAIM time.
+
+    ``-Release`` resolves ownership and records ``released_by`` from ``$repo``, which is anchored on
+    ``$PSScriptRoot`` and NOT on the caller's cwd. That is correct and deliberate; the defect is that the
+    warning about it was unreachable from this path. The note lives at the end of the script, after the
+    ``-Take`` success block, and ``-Release`` exits some 170 lines earlier -- so the one message that
+    states *"-Release must be run against that same worktree"* was shown to the operator at claim time
+    and withheld at the moment they actually did it.
+
+    Its absence is silent in the worst way: the release SUCCEEDS, and the history records a tree the
+    operator was never standing in.
+    """
+    named = _coord_checkout(tmp_path / "Named", drafted=4242, boundary=1200)
+    caller = _coord_checkout(tmp_path / "Caller", drafted=7777, boundary=1900)
+
+    # Claim from INSIDE the named tree, so the take is the ordinary same-tree case and this test turns
+    # only on the release. A divergent take would print the note here and confuse which call emitted it.
+    taken = _run_claim(named, named, "-Take", "release-note-probe", "-Note", "fixture")
+    assert taken.returncode == 0, taken.stderr or taken.stdout
+    assert _DIVERGENCE not in taken.stdout, "the same-tree take must stay silent"
+
+    released = _run_claim(named, caller, "-Release", "release-note-probe")
+
+    assert released.returncode == 0, released.stderr or released.stdout
+    assert "Released claim" in released.stdout, released.stdout
+    assert _DIVERGENCE in released.stdout, (
+        "-Release recorded the claim against the SCRIPT's tree and said nothing about it:\n"
+        f"{released.stdout}"
+    )
+
+
 def test_setup_leak_gate_does_not_reintroduce_an_unanchored_toplevel(tmp_path: Path) -> None:
     """A spelling guard for the regression, paired with the behavioural test above.
 

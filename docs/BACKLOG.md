@@ -6102,6 +6102,15 @@ Reach proven with a harmless key, no disarm key executed: `git -C '../../..' con
 
 **Source:** found 2026-08-06 by the adversarial verification pass on #1061's own fix, tasked with refuting the claim that the patch closed the hole. It did not find a defect in the patch; it found that the rule the patch corrected was bypassable by a route the patch did not touch and the item's banner would have implied was closed.
 
+
+**AMENDMENT 2026-08-28 (lander), and it WIDENS the mechanism rather than adding an instance.** The rule-3c half also admits a `--git-dir` inside a **quoted VALUE** -- `git config alias.zz "log --git-dir=<ungoverned>"` -- read as the target, so an ungoverned repository wins the chain while the write lands in the governed one.
+
+**The root cause is this item's own defect, unported to its siblings:** promoted tokens were read off the **RAW line** instead of the **blanked scan string**. This item solved exactly that for the `-C` flag; the treatment was not carried across when the same promotion was applied to the repository-naming tokens.
+
+Fixed in the rule-3c follow-on work. **The rule-3 and rule-3d half is NOT this item** -- it is filed separately as #1377, because a row naming only the enumeration half produces "add the missing spellings", which closes an instance and leaves the class open.
+
+**Two further classes found in the same pass are INHERITED rather than introduced and are filed as #1379**, both consequence-proven against the governed shared config: `-C` precedence composition, and the PowerShell environment-assignment spelling.
+
 ## 1066. Rule 3c strips double quotes only, so a single-quoted -C target bypasses it -- including an absolute one
 
 > ✅ **DECLINED-BY-DESIGN 2026-08-25, OWNER RULING extending the 2026-08-23 tokeniser ruling to the family (#1066/#1070/#1086/#1305/#1336).** Confirmed one-hop: the Liaison put it to the owner directly and read the answer, rather than relaying a third party's account. **#1336 already established this row cannot be fixed alone** -- it and `#1086` are "the same design error pulling in opposite directions," and closing this row's fail-open without widening `#1086`'s false-deny needs exactly the block-tracking shell tokeniser the ruling declines. The banked second fix below remains open evidence of why a narrower attempt still fails: it is MINIMAL-FROM-COMMITTED rather than a parser, and it was REJECTED by four independent verifiers finding at least five new fail-opens and two new false-deny classes -- the same failure shape #1336's own history shows four separate candidates hitting. **The gate governing this machine is unchanged and this row's bypass is real and remains live**; the ruling accepts that risk rather than building a fifth tokeniser-shaped candidate to close it. 🔢 **Re-scored 2026-08-20 -> P2.** Value **7/10** · Difficulty **6/10** · _big bet_. Both halves are live on the repo blob and on the installed hook that actually governs this machine: the -C reader is the unchanged double-quote-only regex and the disarm-key match still reads the quote-blanked scan text, so a single-quoted absolute -C and every quoted -c alias override remain reachable by ordinary spellings. Value 7 because this governs agent behaviour in development with no product or PHI effect, which is above the rubric's parity rungs but below the production and ASVS rungs; difficulty 6 because two written fixes have been rejected by adversarial verification, the second yielding at least five new fail-opens with residuals filed as #1067, #1069, #1070, #1071 and #1072. _(was 9/10 · 3/10.)_
@@ -12652,6 +12661,35 @@ BUILDS it.*
 **Provenance.** Diagnosed by the lane whose own commit tripped it: seven tests in one file failed in a full run and **passed in isolation, twice**. It reported the negative control alongside the fix -- restoring the bare import reproduced exactly those seven failures -- which is what makes the green meaningful. Recorded here rather than left in session mail because the collision outlives the commit that revealed it. It is the same shape as the rest of this cluster: **the name resolved to the neighbouring module, and nothing said so.**
 
 ## 1256. the federated binding guards account-continuity but never subject-exclusivity, so two accounts can bind one identity
+> **THE ATOMICITY HALF IS BUILT 2026-08-27; banner left open for the archive pass.** A partial/filtered
+> unique index `ux_users_federated_subject` on `(oidc_issuer, oidc_subject)` now exists on all three
+> backends, and the race loser is rendered as the SAME `federated_subject_already_bound` outcome the
+> sequential path returns rather than a 500.
+>
+> **THE ACCEPTANCE DEMONSTRATES THE RACE, as this row's correction demands.** Two concurrent first
+> logins for one subject, interleave FORCED by an `asyncio.Barrier` so both reads complete before
+> either write. Removing the index reds it: both bind. **A second test asserts both logins observed
+> NO holder** -- without that, a future refactor that quietly serialises them would leave the first
+> test green while the index was never consulted, which is this row's own failure mode one level up.
+>
+> **THREE CORRECTIONS MADE WHILE BUILDING, each found by asking what the codebase already does:**
+> 1. The SQLite index CANNOT live in `_SCHEMA`: it runs at `store.py:2087`, `_migrate` at `:2088`, so
+>    on a users table predating the federated columns it references a column that does not exist yet.
+>    It sits in `_migrate` beside `ix_queue_body_ref`, which records that same reasoning.
+> 2. SQL Server needed a RE-TYPE migration, not just a declaration change. The `ALTER TABLE ... ADD`
+>    guards are `COL_LENGTH(...) IS NULL` and fire only when a column is ABSENT, so an existing table
+>    keeps `NVARCHAR(MAX)` -- which cannot be an index key. `COL_LENGTH` returns **-1** for MAX, which
+>    is the discriminator. NVARCHAR(256), not 450: 2x256x2 = 1024 bytes, inside the 1700-byte limit.
+> 3. **A contract exception was added and REVERTED.** `FederatedSubjectConflict` in `store/base.py`
+>    existed so `auth/` would not import three drivers -- but `auth/service.py:2558` already solves
+>    that without one, joining the class MRO names and testing for `Integrity`/`UniqueViolation`
+>    (ADR 0068 4's duplicate-label race, the same check-then-act shape). Sound reasoning, wrong
+>    mechanism, because the constraint it designed around had already been dissolved. Do not re-add.
+>
+> **The `WHERE ... IS NOT NULL` filter is stylistic on SQLite and Postgres and REQUIRED on SQL Server**,
+> where NULLs compare EQUAL in a unique index -- unfiltered, it would admit exactly ONE unfederated
+> user in the table. A reader who learned the rule from the SQLite file would delete it as redundant.
+>
 
 > 🔢 **Re-scored 2026-08-20 -> P2.** Value **5/10** · Difficulty **4/10** · _fill-in_. The behavioural half is closed in shipped code -- auth/service.py:1219-1232 refuses a second account binding one (issuer, subject), with the lookup on all three backends and a sequential test at tests/test_auth_oidc_service.py:456 -- so the remainder is only the database constraint that makes the read-then-write at :1219/:1232 atomic, which is worth a 5 as auth hardening with the app guard covering every non-concurrent case. Difficulty drops to 4 because the amendment moved the design half (refuse rather than re-point) into shipped code and comment, leaving a well-precedented seam: all three backends already declare unique indexes (ux_webauthn_label, ux_search_presets_owner_name), so the novel cost is one first-of-kind SQL Server ALTER COLUMN off NVARCHAR(MAX) (store/sqlserver.py:1358; the file contains zero ALTER COLUMN today), a filtered index for SQL Server NULL semantics, and a CI-only concurrent-bind test on the two server backends. _(was 7/10 · 5/10.)_
 >
@@ -13413,7 +13451,7 @@ measurement from this row's subject and it is named here rather than performed.*
 
 ## 1269. the seat clock has no external alarm, and the obvious implementation reads healthy at the moment it should fire
 
-> 🔢 **Re-scored 2026-08-20 -> P2.** Value **5/10** · Difficulty **4/10** · _fill-in_. The serial re-arm chain has no independent observer inside anything this repository ships, so its death stays silent by construction. Value is moderate because this is fleet tooling with no product axis and peer messaging partly substitutes; difficulty reflects that the naive implementation is wrong in two measured ways, so the build must carry tick-identity dedupe, the suppression exclusion, a pinned absolute path, the throttle-age consistency check, and the discriminating test that fires on a fresh file missing the watched seat. _(previously unscored.)_
+> ✅ **SHIPPED -- verified on main 2026-08-29 at f6c96b3b1: the row's own discriminating measurement re-run, where the shipped alarm reports ABSENT on a watched worktree missing from a fresh state file while the freshness-only build it replaces reds only that single arm of 21.** Landed at 0ba326a12, PR #557, 2026-08-24. _Original filing follows._ **Re-scored 2026-08-20 -> P2.** Value **5/10** · Difficulty **4/10** · _fill-in_. The serial re-arm chain has no independent observer inside anything this repository ships, so its death stays silent by construction. Value is moderate because this is fleet tooling with no product axis and peer messaging partly substitutes; difficulty reflects that the naive implementation is wrong in two measured ways, so the build must carry tick-identity dedupe, the suppression exclusion, a pinned absolute path, the throttle-age consistency check, and the discriminating test that fires on a fresh file missing the watched seat. _(previously unscored.)_
 >
 > **Filed 2026-08-14 - not started. A WATCHDOG CANNOT WATCH ITS OWN DEATH.** The seat clock (Windows task `MEFOR-Seat-Clock`, `PT10M`, 600s ticks against a ~900s mail doorbell, so a 300s margin) is what makes a session's "keep going" duty physically possible -- a turn ends and the session goes idle regardless of intent, and nothing else fires on a timer. **The chain is SERIAL: each tick re-arms the next watcher, so it has ONE LIFE, not many.** One missed re-arm and it is gone, silently, and every seat whose only wake source is the clock goes quiet with it. **Nothing outside the chain currently notices.**
 > **THE ALARM MUST ASSERT BOTH CONDITIONS, AND A FRESHNESS-ONLY CHECK IS THE TRAP THAT MAKES IT WORSE THAN NOTHING:**
@@ -13721,12 +13759,30 @@ runway or give it to nobody.*
 > Verdict: build
 > Closing-act: code
 
+> **AMENDMENT 2026-08-29 (lander) -- A STANDING OWNER-DELEGATED DECISION FORBIDS THIS ITEM AS WRITTEN. DO NOT DISPATCH IT WITHOUT READING THAT DECISION FIRST.**
+>
+> **This row was filed 2026-08-16. The decision that reverses it is dated 2026-08-17 -- one day younger than the row, and recorded in the vault where nothing in this repository points at it.** The row was dispatched on 2026-08-28 in good faith and returned with nothing written, because the builder found the decision. **The next dispatcher hits the same trap, and the failure mode is publishing to a public history that cannot be unpublished.**
+>
+> **THE RECORD, READ DIRECTLY BY THE FILER RATHER THAN RELAYED** -- `docs/security/PUBLICATION-DECISION-2026-08-17.md` on the vault's `origin/main`, quoted verbatim:
+>
+> - line 8: **"Publish none of the four vault-sourced documents in this pass."**
+> - line 57: "Publish these ONE AT A TIME, lowest risk first, each one read in full by whoever publishes it"
+> - line 63: **"Do not do them as a batch. A batch is how the first attempt grew from three to ten."**
+>
+> **It forbids this item twice over: by NAMING documents this row would publish, and by forbidding the row's SHAPE.** This row asks for three documents at once. It is the batch.
+>
+> **ON THE ROW'S SECOND JUSTIFICATION -- CORRECTED, AND NOT IN THE DIRECTION IT WAS REPORTED TO ME.** It was put to the filer that publishing would not activate `tests/test_threat_model_doc_drift.py`, because the row publishes to a path the accessor never reads. **Measured, that claim does not stand: the row names NO destination path at all.** Its body is 30 lines and contains zero `docs/` paths (parsed with `parse_items`, against a control of four "threat model" mentions in the same body). The accessor is `_doc_path()` at `tests/test_threat_model_doc_drift.py:75-78`, which reads `MEFOR_THREAT_MODEL_DOC` if set and otherwise `_ROOT/docs/security/THREAT-MODEL.md`. **So whether publishing activates the suite depends entirely on a destination this row never specifies.** The justification is **unverifiable as written**, not false -- and that is a reason to make the row say where the documents go, not a reason to strike the sentence.
+>
+> **WHAT THIS AMENDMENT DOES NOT DO: it does not close the item and it does not decide the question.** The gap the row describes is real and unchanged -- none of the three documents is tracked where a deploying site can read it. **Only the owner can lift the publication decision**, and the row's own text already says each published text needs their sign-off before it lands.
+>
+> **AN AMENDMENT IS NECESSARY AND NOT SUFFICIENT, AND THERE IS A MEASURED PRECEDENT AGAINST RELYING ON IT.** #1234 already carries a predecessor dispatcher's "DO NOT DISPATCH" amendment **in its own body**, and it was dispatched anyway five days later by a dispatcher who had read the item. **A warning inside the thing being dispatched is read at the moment it is least likely to change the decision.** If this needs to hold, it wants a gate, not a paragraph.
+
 **Cluster:** Documentation / adopter-facing. **Priority:** P3. **Verdict:** build.
 **Severity:** no deployment axis (sec. 0). The cost today is that someone evaluating the project cannot see how its authors think about the threat surface, or what responsibility their own Handler code would carry.
 
 ## 1290. connscale CPU-probe process-table walk times out on hosted Windows runners, reddening a required context on main
 
-> 🔢 **Re-scored 2026-08-20 -> P2.** Value **6/10** · Difficulty **3/10** · _quick win_. The deadline and the two-assertion split are unchanged at HEAD, so a loaded hosted runner still reddens a required context and, when it does, the re-resolution assertion below never runs. Value 6 because a required leg that randomly blocks the merge queue is a real gap with only the rerun-the-failed-job workaround the item itself demonstrated, and this is test infrastructure with no engine path; difficulty 3 because the edit is confined to one test file, though its effect can only be confirmed on hosted Windows CI and the walk's failure rate under runner load was never measured. _(previously unscored.)_
+> ✅ **SHIPPED -- verified on main 2026-08-29 at f6c96b3b1: the row's own filed failure mode, re-run against main, now SKIPS with ENUMERATION TIMEOUT after 6 walks spending their whole 5s budget plus a bounded extension to 15s per walk, where at filing it failed the `walked_ok` assertion at test_connscale_cpu_probe.py:309, and the controls still redden -- a walk that fails without spending its budget FAILS, and a walk that succeeds but misses the live child still trips the re-resolution assertion.** Landed at ad6c1b9d7 (PR #598), 2026-08-26. _Original filing follows._ **Re-scored 2026-08-20 -> P2.** Value **6/10** · Difficulty **3/10** · _quick win_. The deadline and the two-assertion split are unchanged at HEAD, so a loaded hosted runner still reddens a required context and, when it does, the re-resolution assertion below never runs. Value 6 because a required leg that randomly blocks the merge queue is a real gap with only the rerun-the-failed-job workaround the item itself demonstrated, and this is test infrastructure with no engine path; difficulty 3 because the edit is confined to one test file, though its effect can only be confirmed on hosted Windows CI and the walk's failure rate under runner load was never measured. _(previously unscored.)_
 >
 > **Filed 2026-08-19 -- not started. A REQUIRED STATUS CHECK IS INTERMITTENTLY RED ON `main`, AND THE TEST THAT FAILS CANNOT ASSESS THE REGRESSION IT EXISTS TO CATCH WHEN IT DOES.** `tests/test_connscale_cpu_probe.py::test_subtree_re_resolution_picks_up_a_late_spawned_child` fails on the `walked_ok` assertion ([`test_connscale_cpu_probe.py:309`](../tests/test_connscale_cpu_probe.py)): the process-table walk returned `None` on **every one of 6 attempts in 30s**, the Windows path allowing 5s per walk. **THE CHANGE: make the walk's deadline survive a loaded hosted runner, or degrade a walk-level timeout to a skip rather than a failure.**
 > **IT IS ON `main`, NOT ON A BRANCH -- that is what makes it a queue problem rather than one PR's problem.** CI run `32255231838`, head `de896e0f`, event `push`, failing job **`test (windows-2022, py3.14)`** -- which is one of the 13 REQUIRED contexts. Every PR that follows inherits the same exposure.
@@ -13785,7 +13841,7 @@ scan-agreement and wiring tests; 22 pass on the reverted baseline.**
 point, which are the parts that must survive it.**
 ## 1292. connscale smoke reports a message acked but not observed at intake, and nothing discriminates harness race from real intake loss
 
-> 🔢 **Re-scored 2026-08-20 -> P2.** Value **7/10** · Difficulty **3/10** · _quick win_. The harness-race branch has been substantially absorbed by the excusal and intake floor at runner.py:869-905, whose comment names this exact flake, but the discriminator the item asks for does not exist -- nothing checks whether an ingress row was written for the message counted lost, so the count-and-log branch is still not ruled out and no other instrument can rule it out. Difficulty is a store lookup wired into the record-building seam plus a test, with both ends of that seam already present (per-send control_id at sender.py:186, per-backend store access at runner.py:373-377). _(previously unscored.)_
+> ✅ **SHIPPED -- verified on main 2026-08-29 at f6c96b3b1: the per-message discriminator the row measured as absent now exists and runs, with sweep_store going from 0 hits at the pre-fix parent 58e710ad4 to 9 on main, the audit verdict appended to the row's own quoted "lost N on intake" failure text at runner.py:877, and tests/test_connscale_smoke.py asserting on every step that no accept-ACKed send is missing from the stopped engine's committed store.** Landed at f8597f4db (full f8597f4dbb3690c7be673e3cd21dc718a0ee6b73), 2026-08-27, PR #599, "fix(test): the intake audit could clear intake over an empty comparison (BACKLOG #1292)"; confirmed an ancestor of origin/main, verified today at f6c96b3b1. _Original filing follows._ **Re-scored 2026-08-20 -> P2.** Value **7/10** · Difficulty **3/10** · _quick win_. The harness-race branch has been substantially absorbed by the excusal and intake floor at runner.py:869-905, whose comment names this exact flake, but the discriminator the item asks for does not exist -- nothing checks whether an ingress row was written for the message counted lost, so the count-and-log branch is still not ruled out and no other instrument can rule it out. Difficulty is a store lookup wired into the record-building seam plus a test, with both ends of that seam already present (per-send control_id at sender.py:186, per-backend store access at runner.py:373-377). _(previously unscored.)_
 >
 > **Filed 2026-08-19 -- not started. THE ASSERTION THAT FIRES NAMES AN ACKED-BUT-UNREAD MESSAGE, AND THAT IS EITHER A HARNESS RECONCILIATION RACE OR A COUNT-AND-LOG VIOLATION. NOBODY HAS SEPARATED THE TWO, AND THEY HAVE VERY DIFFERENT SEVERITIES.** `tests/test_connscale_smoke.py::test_connscale_smoke_end_to_end` trips `assert r.no_loss.ok` with:
 >     ('fixed_aggregate', 24, 'engine_read 34 < confirmed sent 35 (lost 1 on intake);
@@ -13918,6 +13974,31 @@ point, which are the parts that must survive it.**
 
 > 🔢 **Re-scored 2026-08-20 -> P2.** Value **5/10** · Difficulty **3/10** · _fill-in_. Unchanged at HEAD: line 66 pipes the PR title and body through a raw grep for the claim token with no inline-code-span blanking, so a backticked mention is indistinguishable from a claim, and the head -1 secondary defect is intact on the same line. A required status check that can red a compliant pull request is a false deny, the direction that gets acted on, and both obvious remedies damage the record. Difficulty 3 because the sibling precedent exists (Get-ScannableSegments blanking quoted spans) but its measured lesson forces a paired must-trip and must-not-trip arm, and the inline bash step has no testable seam today. _(was 5/10 · 2/10.)_
 >
+> **AMENDED 2026-08-27 -- THE DEFECT IS LIVE AND THE PARAGRAPH ABOVE DESCRIBES IT AT THE WRONG
+> ADDRESS.** Both halves of that sentence went stale when BACKLOG #1347 reworked the extraction,
+> and a reader following it would look at a line that no longer exists and a mechanism that no
+> longer applies. Corrected here rather than below, because a correction placed after the claim
+> is read after the reader has acted on it.
+>
+> * **It is line 109, not 66**, and the pipeline is no longer a single `grep -oiE`. It splits on
+>   close-paren to scope to the parenthetical and takes every `#N` after the token.
+> * **The defect survives that rework intact and untouched**: nothing in the pipeline strips
+>   inline code spans or fenced blocks, so a quoted mention is still indistinguishable from a
+>   claim. The rework changed the address, not the behaviour.
+> * **The second defect is already closed and must not be 'fixed' again.** The row says `head -1`
+>   takes the first match in reading order and so the error message names the wrong item. There
+>   is now a `sort -un` before it, so it takes the LOWEST NUMBER -- and more to the point the
+>   error at line 148 already names `$count` items and lists `$all_items`, so the harm the row
+>   describes is gone. `$claim` survives only in two PASS messages, where nobody is being sent
+>   anywhere. **Left alone deliberately.**
+>
+> **HOW THE STALENESS WAS FOUND, because the screen that dispatched this row passed on every axis
+> it checked** -- open banner, verdict build, closing-act code, no refusal language, body does not
+> retract its title. The row named a specific artifact, and asking whether that artifact still
+> exists is one command. Two rows dispatched the same morning (#1040 and #1229) turned out to be
+> already built, caught the same way: **a row is a claim about the world, and the code is the
+> world.**
+>
 > **Filed 2026-08-20 -- not started. A REQUIRED status check enforces against a PR that made no claim, and the two tempting fixes both destroy something.** `.github/workflows/backlog-hygiene.yml:66` extracts the claim with a raw grep over the pull request's title and body:
 >     claim="$(printf '%s
 > Verdict: build
@@ -14000,7 +14081,7 @@ point, which are the parts that must survive it.**
 
 ## 1300. required-contexts.txt describes the CI gate roll-up as six legs when it gates eight, so the file that exists to answer 'does this block a merge' answers it wrong for the two most-run legs
 
-> 🔢 **Re-scored 2026-08-20 -> P1.** Value **6/10** · Difficulty **2/10** · _quick win_. Gap stands: ci.yml:2596-2616 names eight needs while .github/required-contexts.txt still says six, and the two omitted legs are the ones that actually report -- webconsole has no if: gate (ci.yml:841-843) and tooling's PR filter includes docs/ (ci.yml:1379). Value 6 survives attack because the workaround is available but not reachable from where a reader stands: the correct answer is written out in ci.yml:2603-2616, yet a session asking 'does a red repo harness tests block me' reads required-contexts.txt, finds no such context, and stops. Difficulty 2 because the remainder is a prose edit plus one additive test on a seam that already exists in both directions -- tests/test_merge_gate_controls.py:186 already reads ci-gate's needs, and test_required_contexts.py:136 already reconciles one checked-in claim against another. _(was 6/10 · 2/10.)_
+> ✅ **SHIPPED -- verified on main 2026-08-29 at `995de69b`** (PR #549). `.github/required-contexts.txt` now names all eight legs in two labelled groups, and `tests/test_required_contexts.py::test_the_ci_gate_rollup_comment_names_every_job_the_job_actually_needs` reconciles against ci.yml's live `needs:` list rather than pinning a count. **DO NOT "fix" the surviving six references** -- they name the six PATH-GATED legs, a different set from the eight the gate needs, so a reader who greps the numbers sees a contradiction the sentences do not contain. Lander re-ran the suite 2026-08-29: **9 passed**, and the named test passes in isolation. _Original filing follows._ **Re-scored 2026-08-20 -> P1.** Value **6/10** · Difficulty **2/10** · _quick win_. Gap stands: ci.yml:2596-2616 names eight needs while .github/required-contexts.txt still says six, and the two omitted legs are the ones that actually report -- webconsole has no if: gate (ci.yml:841-843) and tooling's PR filter includes docs/ (ci.yml:1379). Value 6 survives attack because the workaround is available but not reachable from where a reader stands: the correct answer is written out in ci.yml:2603-2616, yet a session asking 'does a red repo harness tests block me' reads required-contexts.txt, finds no such context, and stops. Difficulty 2 because the remainder is a prose edit plus one additive test on a seam that already exists in both directions -- tests/test_merge_gate_controls.py:186 already reads ci-gate's needs, and test_required_contexts.py:136 already reconciles one checked-in claim against another. _(was 6/10 · 2/10.)_
 >
 > **Filed 2026-08-21 -- not started. The file's whole purpose is to be the checked-in answer to "is this check blocking", and it under-describes the roll-up by the two legs that run most often.** `.github/required-contexts.txt` states that `CI gate` is *"`if: always()` over six legs that are PATH-GATED or nightly"* and enumerates them: `sqlserver-store`, `postgres-store`, `load-test`, `load-test-sqlserver`, `windows-service-smoke`, `changes`. **`ci.yml`'s `ci-gate` job lists eight in `needs:`** -- those six plus **`webconsole`** and **`tooling`**.
 > **MEASURED 2026-08-21.** `webconsole`, `tooling` and `harness` appear **zero** times in `.github/required-contexts.txt`. The census used a positive control -- `sqlserver-store` returns 1 in the same pass -- so the zero is a real absence and not a broken predicate.
@@ -14018,7 +14099,18 @@ point, which are the parts that must survive it.**
 
 ## 1302. mail.ps1 accepts an MCP-namespace session id in -ToSessionId and the message becomes silently undeliverable, expiring with neither sender nor recipient told
 
-> 🔢 **Re-scored 2026-08-20 -> P2.** Value **5/10** · Difficulty **2/10** · _fill-in_. The validation gap stands -- mail.ps1:106 takes -ToSessionId unvalidated, :240 stores it, and mail-drain.ps1:852 string-compares it against the harness id read at :490, so a wrong-namespace id is filtered on every pass -- but the item's reporting claim does not: mail-drain.ps1:825-836 writes an 'expired-unshown' receipt on the sweep, mail.ps1:484-487 already tells the sender to read exactly that file and what the disposition means, and mail-drain.ps1:1014 reports the filtered count to the recipient on every drain. Value 5 rather than the filed 7 or the scorer's 6 because the item's value argument was built on those instruments being absent and all three ship, leaving a detection DELAY and an ambiguous no-receipt reading rather than a silent loss, on developer coordination with no product or PHI axis. Difficulty 2 and arguably generous: mail.ps1:153 already dot-sources mail-claim.ps1, whose Test-SessionId at :209 is the exact UUID shape check the fix needs, so the remainder is a post-binding refusal plus a must-not-trip arm for the no-sessionId broadcast case. _(was 7/10 · 2/10.)_
+> ✅ **SHIPPED 2026-08-21 -- `mail.ps1` now REFUSES a `-ToSessionId` that is not a harness session id, at SEND, before any message is written. The sender is the only party who can correct the id, and was the only party never told.** The drain already reported its half (*"N message(s) are addressed to a different session id and were left in the inbox"*); the send path printed `Queued 1 message(s)` and nothing else. **That asymmetry was the defect, and it is why the guard sits on the send side rather than in the drain -- the drain's filter is CORRECT: a worktree outlives its occupant, so an id-addressed note must not reach a stranger.**
+
+> **THE SHAPE.** A harness session id is a bare UUID (the drain reads `$hook.session_id`); the MCP namespace prefixes its own as `local_<uuid>`. Two id spaces for one session, compared with `-ne` at [`mail-drain.ps1:852`](../scripts/hooks/mail-drain.ps1), so a wrong-namespace id never matches and the message waits in the inbox until it is swept to `expired/` -- silently in both directions.
+
+> **MEASURED, NOT HYPOTHETICAL.** Six messages from one seat -- a level report, a CI mechanism diagnosis, two unprompted self-retractions and a request to pull two never-started items -- stranded for a whole session while the recipient read that lane as silent and wrote "level unreported" three times. They were found only by opening the box by hand.
+
+> **PARTIAL CONTROL, RECORDED RATHER THAN DISCOVERED LATER.** This catches a wrong-NAMESPACE id. It does **not** catch a correctly-shaped but **STALE** one -- an id belonging to a session that has ended fails identically and just as silently. A pass at send is not a promise of delivery, and nothing here should be read as one.
+
+> **THE MUST-NOT-TRIP ARM IS ASSERTED IN THE SAME TEST AS THE REFUSAL**, so a guard that rejected everything could not pass by satisfying one half: a message with NO `-ToSessionId` is the ordinary broadcast and still sends, and a genuine bare-UUID id still sends. **RED-FIRST IN BOTH DIRECTIONS:** disabling the guard reddens the refusal test, and widening it to reject everything reddens the must-not-trip test.
+
+> **Re-scored 2026-08-20 -> P2.** Value **5/10** · Difficulty **2/10** · _fill-in_. The validation gap stands -- mail.ps1:106 takes -ToSessionId unvalidated, :240 stores it, and mail-drain.ps1:852 string-compares it against the harness id read at :490, so a wrong-namespace id is filtered on every pass -- but the item's reporting claim does not: mail-drain.ps1:825-836 writes an 'expired-unshown' receipt on the sweep, mail.ps1:484-487 already tells the sender to read exactly that file and what the disposition means, and mail-drain.ps1:1014 reports the filtered count to the recipient on every drain. Value 5 rather than the filed 7 or the scorer's 6 because the item's value argument was built on those instruments being absent and all three ship, leaving a detection DELAY and an ambiguous no-receipt reading rather than a silent loss, on developer coordination with no product or PHI axis. Difficulty 2 and arguably generous: mail.ps1:153 already dot-sources mail-claim.ps1, whose Test-SessionId at :209 is the exact UUID shape check the fix needs, so the remainder is a post-binding refusal plus a must-not-trip arm for the no-sessionId broadcast case. _(was 7/10 · 2/10.)_
+
 >
 > **Filed 2026-08-21 -- not started. The one place in this transport where a message is genuinely LOST rather than late, and both ends read it as delivered.** `scripts/coord/mail.ps1:106` declares `-ToSessionId` as a bare `[string]` with **no validation**, and `:240` writes it into the message as `sessionId`. The drain then compares that value against the **harness** session id -- `scripts/hooks/mail-drain.ps1:852`, against `$sessionId` sourced at `:490` from `$hook.session_id`. **Three id namespaces exist for one session -- registry, MCP and harness -- and only one of them can ever match.**
 > **THE MECHANISM, verified in code rather than inferred from the symptom.** An MCP id is `local_`-prefixed; a harness id is a bare UUID. The comparison at `:852` is a string inequality, so a `local_` id can never equal the value it is tested against, on any drain, ever. The message is skipped every pass, stays in `inbox/`, and expires. **Nothing errors at send time, nothing errors at drain time, and nothing reports the expiry to either party.** `docs/WORKTREES.md` already records that a registry id and an MCP id for one session **shared no characters** -- so the namespaces are known to be disjoint, and nothing acts on that knowledge at the point where it matters.
@@ -14324,7 +14416,7 @@ class as the release gate `a92ab10f` fixed, and it is why (b) is not cosmetic.
 **Not urgent, and the direction matters:** in the blocked instance the stale residual **overstates** the case against the engine, which is the safe direction to be wrong in. The residual rewrite is assessor work and routes to the owner.
 ## 1308. vault scorecard records are unwritable by the safe writer when their pre-existing prose trips its character ban
 
-> 🔢 **Filed 2026-08-22 - not started.** Value **5/10** · Difficulty **3/10** · _fill-in_. **A population of records cannot be edited by the safe writer at all** -- a sanctioned edit is refused before it starts, for a character the writer did not author. Difficulty 3 because the correct scope (author versus pre-existing text) is a design call, not a regex change.
+> ✅ **SHIPPED -- verified on main 2026-08-29 at f6c96b3b1: a mechanical edit carrying a record's own pre-existing banned character forward, refused rc=1 at filing, now applies rc=0, while introducing a new or a duplicate character still refuses rc=1.** Landed at c654c38b4, PR #584. _Original filing follows._ **Filed 2026-08-22 - not started.** Value **5/10** · Difficulty **3/10** · _fill-in_. **A population of records cannot be edited by the safe writer at all** -- a sanctioned edit is refused before it starts, for a character the writer did not author. Difficulty 3 because the correct scope (author versus pre-existing text) is a design call, not a regex change.
 > Verdict: build
 > Closing-act: code
 
@@ -14523,6 +14615,25 @@ DELIBERATELY LEFT ALONE -- the security level is load-bearing there, because wit
 would measure the engine's own refusal to offer rather than a peer's refusal to accept, turning a
 real finding into a false pass. That cell's own ruling is a separate question about allowlist width; this item is the build
 which both readings of the cell now require.
+
+**AMENDMENT 2026-08-30 (lander) -- ONE CALL SITE GAINED ITS ASSERTION; THE ROW STAYS PARTIAL.** The AD
+LDAPS hop now asserts its TLS cipher suites, against a context proved equivalent to the one the hop
+actually builds (ADR 0180). Touches `messagefoundry/auth/ldap.py`, `messagefoundry/config/tls_policy.py`
+and `tests/test_tls_cipher_assertion_sites.py`.
+
+**WHY THE EQUIVALENCE ARGUMENT IS THE LOAD-BEARING PART.** `ldap3` exposes no `SSLContext`, so the
+suites in force cannot be read from the object that negotiates them. **What is verified is therefore
+the CONFIGURATION the site is built from, not the connection it makes** -- and that is a weaker claim
+than a wire test, deliberately so. The tests close the usual gap in that shape: a fixture makes every
+suite report non-forward-secret, and each site's test then requires a `ValueError` naming that site,
+so a decoy call cannot satisfy it. Deleting the call from any one site reds that site alone.
+
+**STILL OPEN, AND THIS IS WHY THE BANNER DOES NOT FLIP:** the strict positive allowlist this row asks
+for -- admitting only suites present on every current candidate list, rejecting anything unnamed -- is
+not built. This records a call site gaining an assertion, not the allowlist changing shape.
+
+*Recorded by the lander, not the author: the PR carried the code without the row, and a required check
+exists to catch exactly that. The row's status is unchanged; only its record of what has shipped is.*
 
 ## 1315. prose path:line citations carry no token, so nothing can verify them
 
@@ -15638,7 +15749,7 @@ ANYONE BEING CARELESS.*** **A suite written against the shapes you know is a REG
 CORRECTNESS test, and it is structurally incapable of the thing everyone assumed it was doing.**
 ## 1337. The leak gate has no pattern for a security-record citation, and a bare-identifier screen would be switched off within a day
 
-> 🔢 **Filed 2026-08-23 - not started.** `scripts/security/scan_forbidden.py` screens routable IPs, worktree slugs, home paths, customer and vendor names, and site codes. **It has no pattern for a security-record identifier at all.** The obvious screen -- match the identifier shape -- is **measurably unusable**, and this row carries the working specification instead.
+> ✅ **SHIPPED -- verified on main 2026-08-29 at `402d13a9`** (PR #588). The shipped code implements this row's own working specification rather than the identifier-shape screen it rejects: it pairs a requirement identifier WITH ITS VERDICT (`scan_forbidden.py:197`) and reports reason-only, never the value (`:951`), because the pair is itself the disclosure. Lander re-ran `tests/test_scan_forbidden.py` 2026-08-29: **50 passed**. _Original filing follows._ **Filed 2026-08-23.** `scripts/security/scan_forbidden.py` screens routable IPs, worktree slugs, home paths, customer and vendor names, and site codes. **It has no pattern for a security-record identifier at all.** The obvious screen -- match the identifier shape -- is **measurably unusable**, and this row carries the working specification instead.
 > Verdict: build
 > Research: none
 > Closing-act: code
@@ -16092,7 +16203,7 @@ checks (`git log -S` on a symbol the fix must touch) rather than citation greps.
 
 ## 1348. claim.ps1 reads directory existence as occupancy, so a worktree that outlives its session holds claims no sanctioned verb can move
 
-> 🔢 **Filed 2026-08-23 - not started.** `claim.ps1` refuses a `-Take` with **`HOLDER IS STILL THERE -- that worktree exists and last committed 23h ago.`** ***Its occupancy test is DIRECTORY EXISTENCE PLUS COMMIT RECENCY. It is not asking whether anyone is there.*** **Measured 2026-08-23: `ListAgents` returned seven live peers and the holding worktree was not among them, while its directory sat on disk and the tool reported it occupied in a confident sentence.**
+> ✅ **SHIPPED -- verified on main 2026-08-29 at `08496200`** (PR #585). `claim.ps1` now distinguishes three states -- `occupied`, `unoccupied`, `present` -- which is what this row asked for: that the two be DISTINGUISHABLE, **not** that `unoccupied` become releasable. It still REFUSES, and recognition may only ever SUPPRESS, so a missing answer costs a refusal and never a licence. The fix also closed a hazard this row never raised: `present` was returned both when the probe found an occupant and when it could not look, so on any machine with no Claude config root -- **every CI runner** -- the tool asserted a live session it had never observed. Lander re-ran `tests/test_coord_claim_liveness.py` 2026-08-29: **15 passed**. _Original filing follows._ **Filed 2026-08-23.** `claim.ps1` refuses a `-Take` with **`HOLDER IS STILL THERE -- that worktree exists and last committed 23h ago.`** ***Its occupancy test is DIRECTORY EXISTENCE PLUS COMMIT RECENCY. It is not asking whether anyone is there.*** **Measured 2026-08-23: `ListAgents` returned seven live peers and the holding worktree was not among them, while its directory sat on disk and the tool reported it occupied in a confident sentence.**
 > Verdict: build
 > Research: none
 > Closing-act: code
@@ -16150,7 +16261,7 @@ removed with their sessions.
 
 ## 1340. the blanket-stage guard enumerates part of the add vocabulary, so git stage -A and six other forms stage everything unblocked
 
-> 🔢 **Filed 2026-08-23 -- not started. SEVEN COMMAND FORMS PERFORM A REAL BLANKET STAGE AND THE GUARD ALLOWS EVERY ONE.** Verified against real git 2.53.0.windows.2, each form first confirmed to actually stage the whole tree, then driven through the committed hook as a subprocess: `git stage -A`, `git stage .`, `git add --update`, `git add :/`, `git add ./`, `git.exe add -A`, `git add -Av`. Discriminating controls in the same run: `git add -A`, `git add -u`, `git add .` and `git commit -am` all DENY.
+> ✅ **SHIPPED -- verified on main 2026-08-29 at f6c96b3b1: all seven filed blanket-stage forms (git stage -A, git stage ., git add --update, git add :/, git add ./, git.exe add -A, git add -Av) now DENY when driven through the committed hook, while the same harness run against the pre-fix guard at 786ac8b49^ ALLOWS all seven.** Landed at 786ac8b49 (PR #579), 2026-08-26, "fix(hooks): blanket-stage guard closes the add-vocabulary and quote-argv gaps (BACKLOG #1339/#1340/#1341)"; confirmed an ancestor of origin/main f6c96b3b1. _Original filing follows._ **Filed 2026-08-23 -- not started. SEVEN COMMAND FORMS PERFORM A REAL BLANKET STAGE AND THE GUARD ALLOWS EVERY ONE.** Verified against real git 2.53.0.windows.2, each form first confirmed to actually stage the whole tree, then driven through the committed hook as a subprocess: `git stage -A`, `git stage .`, `git add --update`, `git add :/`, `git add ./`, `git.exe add -A`, `git add -Av`. Discriminating controls in the same run: `git add -A`, `git add -u`, `git add .` and `git commit -am` all DENY.
 
 > **`git stage` NEEDS NO TRICKERY AT ALL.** `stage` is a documented git synonym for `add`. The rule tests `\badd\b`, so the synonym defeats the flag rows **and** the bare-dot row together.
 
@@ -16557,6 +16668,8 @@ declared serialised write order on that file. Building this alongside those with
 first risks the exact same-file collision this project's own collision-detection conventions exist to
 catch.
 
+---
+
 ## 1357. The connscale FD probe cannot see a multi-process engine: PID-set re-resolution never runs
 
 > 🔢 **Filed 2026-08-25 - not started.** ***A single probe tick costs LONGER THAN THE ENTIRE MEASUREMENT WINDOW, so the PID set is resolved once per sweep step and never re-resolved -- and a multi-process engine's worker children are invisible to the FD gauge.*** **Measured: one tick costs 1419-1848 ms against `hold_seconds = 1.5`.** So `_RESOLVE_EVERY_TICKS = 8` ([`probe.py:60`](../harness/load/connscale/probe.py)) is **unreachable by construction** -- not a badly-chosen constant, a constant the window cannot afford at any cadence. Its own comment reasons at "the runner's poll cadence", which this profile does not have.
@@ -16593,6 +16706,48 @@ catch.
 **A FIGURE THIS ITEM DELIBERATELY DOES NOT CARRY.** Forcing `resolve_every=1` produced readings of ~3745 handles against a ~385 baseline, which would be ~312 handles per worker child. **That number is WITHDRAWN and must not be quoted from here:** the trace above shows the denominator is not stable enough to divide by. The resource question is real and open; this item is the reason nobody can answer it yet.
 
 **Reproducer:** the per-tick trace and the A/B harness live in the filing session's scratchpad (`fdprobe_ab.py`); it reuses `test_connscale_smoke`'s own fixture setup and takes ~25 s a run. Rebuilding it is a few lines against `run_connscale`.
+
+---
+
+## 1360. three test files pick a free pid and rely on it staying free, so a loaded runner reuses it and a DEAD record reads as a veto
+
+> ✅ **SHIPPED 2026-08-26 (lander, authored per ADR 0165 -- the underlying fix is the builder's own
+> verified work, landed unmodified; this banner is mine).** Three copies of a `_find_free_pid` helper
+> (`test_worktree_prune_merged.py`, `test_coord_presence.py`, `test_session_registry.py`) each spawned
+> `cmd /c exit`, waited for it to exit, slept, and returned its pid as "free" -- free at the moment it
+> returns, and nothing keeps it free afterward. Replaced by one `tests/_dead_pid.py`, returning
+> `2147483647` (`Int32.MaxValue`): within the `[int]` cast `Test-RecordLiveness` performs, non-zero so
+> it takes the liveness path rather than the `UNREADABLE` shortcut, and structurally unassignable on
+> either platform (Linux caps pids at ~2^22, Windows pids are multiples of 4 far below 2^31) -- dead by
+> construction rather than by timing. Verified independently against the landed diff before writing
+> this banner: `tests/_dead_pid.py` exists, defines `NEVER_LIVE_PID: Final = 2147483647`, and all
+> three test files import it.
+>
+> **Diagnosed from a real failure**, not from inspection alone: `windows-2025` run `32268545492`,
+> `tests/test_worktree_prune_merged.py:753`, `assert d["Occupants"] == []`, an ordinary exit-1
+> assertion beside an unrelated crash in the same run. The comment on the original helper --
+> `time.sleep(0.3)  # let the OS reap it before we claim the pid is gone` -- states the intended
+> guard and the mechanism does the opposite: reaping RELEASES a pid for reuse rather than reserving
+> it, so the sleep widens the window it appears to close.
+>
+> **The fix does not stub, mock, or force the liveness verdict** -- the real `Get-Process` call still
+> runs and still returns "not running" on its own; only the pid handed to it is now unassignable. The
+> constraint that shaped this over the obvious alternative: the tests assert both `Occupants == []`
+> and `Decision == "SKIP"`, so any remedy that short-circuited the verdict would pass while testing
+> nothing.
+
+> **FOLDED IN FROM #1303, 2026-08-29 (lander). THE SAME WORK WAS ALLOCATED TWICE -- #1303 on 2026-08-21 and this row on 2026-08-26, with character-identical titles -- and this one shipped.**
+> **#1303 IS RETIRED AS A PERMANENT HOLE AND NOT AS A ROW.** `alloc.ps1` has no release verb by design, on the stated principle that *holes are free, collisions are not*: a stranded number is invisible, while two open headings for one shipped fix read to every future screener as two pieces of work, one of them already done.
+> **THE PARAGRAPH BELOW IS WHY THE FOLD HAPPENED RATHER THAN A CLEAN DROP.** Retiring the row would have lost it, and it is the mechanism -- not commentary. Reported by the seat holding #1303, which declined to pick between the numbers itself. Quoted verbatim:
+>
+> **THE PATH TO THE FAILURE, traced through the real fence.** `Test-RecordLiveness` ([`scripts/coord/session-registry.ps1:181`](../scripts/coord/session-registry.ps1)) reports **DEAD** when `Get-Process -Id` finds nothing -- and DEAD vetoes nothing. A REUSED pid **is** running, and a test record carries no `startedAt` for the reuse fence to consult, so the verdict becomes **UNVERIFIED** -- which **does** veto (`occupancy.ps1:75`). The occupant list then comes back non-empty and an assertion that a dead record is "not a veto" fires. `cmd /c exit` is Windows-only, matching where it was seen; pid reuse needs pid churn, and that tier spawns pwsh/git children constantly on a runner whose pid space recycles far faster than a developer box.
+
+**Cluster:** CI reliability / test determinism. **Priority:** P2. **Verdict:** build.
+**Severity:** no product effect, no PHI effect, no deployment axis (sec. 0) -- test-suite determinism
+only. The cost was a required context redding on a race whose failure looked like a real occupancy
+veto.
+
+---
 
 ---
 
@@ -16948,3 +17103,1043 @@ cpu_util_cores_mean      0
 **Related:** #1211 (limb one shipped the channel this reuses; limb two blocked), #1101 (the per-message form these annotate), #320 (windows-2025 leg timing, one of the explanations these fields separate).
 
 **Source:** scoped by the Dispatcher, corrected by this lane's scouting -- the original scoping described artifact-upload work already done and a selection bias already fixed by #1211 limb one; what remained was the band-less fields and the constraint above.
+
+## 1368. the leak-gate detector floor is never checked against the real token list, so it can silently stop meaning anything
+
+> 🔢 **Filed 2026-08-26 (builder 2) - BUILT IN THIS COMMIT, not yet landed.** Implements **SEC-04** from [`16-security-phi-and-supply-chain`](testing/master-test-plan/16-security-phi-and-supply-chain.md), which had no ledger row.
+> Verdict: build
+> Closing-act: code
+
+**Cluster:** Security testing. **Priority:** P0 (per the spec row). **Verdict:** build.
+**Severity:** no engine effect and no deployment axis (sec. 0). The cost is that the leak gate's fail-closed floor can drift into meaninglessness with nothing reporting it -- a control resting on a number nobody re-checks.
+
+**What:** `MEFOR_MIN_DETECTORS` is a per-section FLOOR, and `token_floor_failure` fails when the token list drops below it. **Nothing asked the opposite question.** A floor of 7 against a list of 40 is satisfied by any 7 detectors surviving, so the gate stays green while constraining almost nothing. The counts are printed on every run and **nothing has ever compared them to the floor**, which is why the drift is silent rather than merely unfixed.
+
+**Measured against the live list, 2026-08-26** (counts only -- the list is a secret and appears nowhere):
+
+```
+section         floor  live   floor/live
+names           7      8       87.5%
+estate          13     14      92.9%
+site_prefixes   1      2       50.0%   <- would FAIL a flat 80% rule
+```
+
+**THE SPEC'S 80% RATIO IS THE WRONG SHAPE AT SMALL N, and the item found that by building it.** Growth from 1 to 2 scores 50% however healthy it is, so at that size a ratio measures the SECTION'S SIZE rather than the floor's staleness, and the rule as written would red the gate on its first real run while nothing was wrong. Shipped instead: **a ratio above four loaded detectors, an absolute lag of at most one at or below four.** Both arms fire on their own section and name both numbers. Deviation from the spec routed to the owner via the Liaison rather than shipped quietly.
+
+**AND THE COUNTS CANNOT TELL YOU WHICH TABLE YOU MEASURED.** On 2026-08-26 the SYNTHETIC example set and the REAL list both reported **8/14/2** -- three identical numbers from two tables, one of which matches nothing real. Anyone verifying a floor from counts alone would assert it against a set that cannot fire and read the pass as evidence. `scan_forbidden` already distinguishes three load states, and only the MODE marker discriminates them, so `--print-detector-counts` emits `mode=` first and a test pins that the count lines are byte-identical between the two.
+
+**Not in scope:** raising any floor. The live list is within the shipped rule today, so no threshold moves in this change; if it later drifts, the gate says so and a human decides. `branch-leak-scan.yml` pins the same floor and is NOT wired here -- same rule, different job, and it deserves its own decision rather than being swept in.
+
+**Related:** #1080 (the setup script reporting a loaded set as if it were the installed one -- the same family of "the gate reported something adjacent to what you asked"), SEC-05.
+
+**Source:** SEC-04 in the master test plan, routed by the Liaison; scoped down by this lane after measuring that half the brief's build already existed.
+
+## 1374. fleet.ps1 originMainAgeMinutes reports fetch recency but measures when origin/main last MOVED, and on the packed-refs path it is null so the stop condition cannot fire
+
+> 🔢 **Filed 2026-08-28 (lander) - reported by the dispatcher and the cleaner; corroborated independently before filing.**
+> Verdict: build
+> Closing-act: code
+
+**Cluster:** Fleet coordination. **Priority:** P3. **Verdict:** build (small).
+**Severity:** no engine effect, no PHI axis, no deployment axis (sec. 0). It degrades a roster seats read to decide whether the board in front of them is complete.
+
+**THE FIELD IS NAMED FOR ONE QUESTION AND ANSWERS ANOTHER.** `originMainAgeMinutes` reads the `origin/main` ref file's mtime, which moves when the ref MOVES, not when it was FETCHED. A fleet that fetched seconds ago but whose `main` has been quiet for an hour reports an hour of staleness and fires the stop condition that prints DO NOT TREAT THE ROSTER BELOW AS COMPLETE.
+
+**CORROBORATED DIRECTLY RATHER THAN ARGUED, and this reading settles it:** taken read-only before any fetch, `.git/FETCH_HEAD` mtime `18:02:16.769` against the loose-ref mtime `18:01:24.059`. A fetch landed **52 seconds after** the ref last moved and left the ref untouched. The two clocks are separate and the field reads the wrong one.
+
+**THE SECOND HALF IS WORSE THAN THE FIRST AND WAS FOUND BY A DIFFERENT SEAT.** On the packed-refs path there is no loose ref to stat, so the value is null, the stop-condition test never fires, and **an absent warning renders identically to a healthy one**. The failing case and the passing case are indistinguishable on screen.
+
+**Related:** #1372 (fleet pointer health) is adjacent and **not a duplicate** -- that item is about pointer state, this one about a time field.
+
+**PROVENANCE:** diagnosed by the cleaner on 2026-08-24 and routed to the dispatcher seat. The board tool was fixed; `fleet.ps1` was not; and no ledger item existed -- a grep over both ledger files returned zero against a working control of 4 hits for `fleet.ps1`. **It fell out because nothing tracked it.**
+
+## 1375. install-gate.ps1 REPLACES the machine-wide gate allowlist on every run rather than merging, with no backup and no warning, and a dropped root fails open silently
+
+> 🔢 **Filed 2026-08-28 (lander) - third version of this item; the two earlier framings were refuted before filing and one is recorded below.**
+> Verdict: build
+> Closing-act: code
+
+**Cluster:** Development harness. **Priority:** P2. **Verdict:** build (small).
+**Severity:** no engine effect, no PHI axis, no deployment axis (sec. 0). It governs agent behaviour on a developer box. **The severity is that the failure is SILENT, not that it is large.**
+
+**THE DEFECT.** `install-gate.ps1` rewrites the machine-wide governance allowlist on every install run rather than merging into it -- **with no backup, no log line, and no warning that a currently governed root has just become ungoverned** -- while `docs/WORKTREE-GATE.md` documents the bare run as "govern this repo" and reads additive.
+
+**CONFIRMED FROM SOURCE, quoted not inferred:** the `Set-Content` REPLACES, and nothing between the branch entry and that write reads the existing file; the only `Get-Content` sits inside the `-Status` branch, which returns before the install path; a bare run writes exactly ONE repo; and the installer never backs up the allowlist -- its `Copy-Item` calls cover `settings.json` and the gate script only.
+
+**LEAD WITH THIS: A DROPPED ROOT FAILS OPEN SILENTLY.** The gate exits zero when the root count is zero, and the comment beside it says why -- the allowlist doubles as the kill switch, so no file and no entries means nothing is governed. Zero protection, no warning, no log line.
+
+**THE PRECONDITION IS LIVE ON THIS BOX, NOT HYPOTHETICAL.** The allowlist currently carries two roots, so a bare run would drop one. **And the two allowlists measurably disagree**, which is the state this defect produces and nothing reports.
+
+**DO NOT WORD THIS AROUND VISIBILITY.** `-Status` already prints the governed list, so "the operator cannot see the scope" is FALSE and would sink the item. **The defect is the missing announcement at the moment scope NARROWS.**
+
+**TWO DECOYS, neither of which covers it:** #1247 covers the gate SCRIPT copy, not the allowlist write. #1367 covers the parity MESSAGE from the same incident and has already landed.
+
+**UNTESTED, AND THE ITEM MUST NOT READ OTHERWISE: nobody has executed the installer in any mode.** Every mechanism claim above is source-reading. Two questions are genuinely open: whether `-Repo a,b` actually governs two repos, and whether a second gate installer exists on this box that nobody has identified.
+
+**A REFUTED FRAMING, KEPT SO IT IS NOT RE-DERIVED:** an earlier version claimed the engine was ungoverned for four days. **Refuted by 70 engine denial proof points across 2026-08-22 to 08-26** against an all-time control of 211. Real engine exposure was at most 72 minutes, both collapses were on 2026-08-26 ten minutes apart, and **the victim is inverted** -- the repository that was ungoverned, for about 24 days, was the vault.
+
+## 1376. the vault ships all three privileged installers and none of the three installed-vs-source parity instruments
+
+> 🔢 **Filed 2026-08-28 (lander) - found by builder 1 while screening before claiming.**
+> Verdict: build
+> Closing-act: code
+
+**Cluster:** Development harness. **Priority:** P3. **Verdict:** build (small).
+**Severity:** no engine effect, no PHI axis, no deployment axis (sec. 0).
+
+**THE MEASUREMENT, with its control:**
+
+```
+                                          vault     engine
+tests/test_selfheal_installed_parity.py   ABSENT    present
+tests/test_gate_installed_parity.py       ABSENT    present
+tests/test_installed_coord_hooks.py       ABSENT    present
+
+CONTROL: the vault tests/ tree holds 527 entries, so this is not a repo-shape artifact.
+AND IT SHIPS THE SUBJECT: install-selfheal.ps1 and worktree-selfheal.ps1 are both present there.
+```
+
+**So the vault carries the same privileged installers and none of the instruments that would tell anyone they had drifted.**
+
+**CORROBORATING, AND LABELLED UNDIAGNOSED BECAUSE THAT IS HOW IT WAS REPORTED:** the vault's installed commit-msg hook is far smaller than the engine's `claim_check.py` source. Vault source and installed are the same blob as each other; the engine's differs. **Nobody chased what the difference is, and this row does not claim to know.**
+
+**NOT A DUPLICATE OF #1019, and the check is specific:** #1019's body mentions the vault **zero** times across all 53 of its lines. **#1019 stays OPEN for its own deliberately-unbuilt installer-side half and must NOT be closed on this item** -- they are different halves of different repositories.
+
+**AND READ #1019's BANNER BLOCK RATHER THAN ITS HEADING:** its title overstates, its banner already says PARTLY LANDED and names the unbuilt half. A seat correcting the banner from the heading would flip a correct banner to wrong.
+
+## 1377. rule 3 and rule 3d walk a promoted token list that GIT_DIR leaks into, so a governed path named only in the environment produces a false deny
+
+> 🔢 **Filed 2026-08-28 (lander) - split out of #1065's rule-3c half, which is amended rather than duplicated.**
+> Verdict: build
+> Closing-act: code
+
+**Cluster:** Development harness. **Priority:** P3. **Verdict:** build (small).
+**Severity:** no product effect and no PHI effect -- this governs agent behaviour in development. *(Clause carried verbatim from #1065, because without it this row reads as a product-severity claim and it is not.)*
+
+**THE MECHANISM.** `GIT_DIR=<governed> git clean -fd` denies. The promoted token list is emitted in the non-opt-in branch on the reasoning that it "sits behind the base where it cannot win" -- **but rules 3 and 3d walk the whole list, so it wins.**
+
+**ALSO IN SCOPE:** a governed path merely MENTIONED in a comment, a commit message or an alias body denies.
+
+**MEASURED, NOT ASSERTED:** the seven defects in this family were re-measured against the COMMITTED gate rather than a handed copy; all 20 rows correct and ten original closures held.
+
+**NOT THIS ROW:** the rule-3c half belongs to #1065, and that item is amended in this same commit rather than duplicated here.
+
+## 1378. rescue refs drift from the branch they were taken for, so a recovery reaches a commit strictly behind the work it was meant to protect
+
+> 🔢 **Filed 2026-08-28 (lander) - a visibility framing of this was refuted before filing; the surviving harm is VALUE drift.**
+> Verdict: build
+> Closing-act: code
+
+**Cluster:** Fleet coordination. **Priority:** P3. **Verdict:** build (small).
+**Severity:** no engine effect, no PHI axis, no deployment axis (sec. 0). It degrades a recovery path seats rely on in order not to lose work.
+
+**THE MEASUREMENT:** 34 of 219 rescue refs have drifted, **29 of them strictly behind** the branch they were taken for. Zero twin refs. Four are gc-droppable.
+
+**THE FAILURE IS SILENT AND SUCCESSFUL-LOOKING, which is why it needs a row rather than a habit.** An older snapshot **opens cleanly**. No error, no dangling ref, no signal. It is the wrongly-resolving reference rather than the broken one -- and a broken reference advertises itself while this one does not.
+
+**DEMONSTRATED IN PRACTICE THE DAY IT WAS FILED:** a seat cited anchor refs in its own handoff that had gone stale between writing and reading -- one anchor held four files while the tree it named had five, six minutes later. **It needs no race, only a person writing a ref name down and time passing.**
+
+**DO NOT FILE THE VISIBILITY STORY, and this is the part that was nearly wrong.** An earlier framing held that a seat checking "is this work backed up?" from a vault checkout gets a false negative because the vault maps no `rescue/auto/*` refspec. **Refuted:** the two repositories are symmetrically blind because they are DIFFERENT REPOSITORIES, so that reduces to asking the wrong repo, not a refspec defect. **A name-only comparison cannot see the real defect, which is value drift.**
+
+**WHAT SURVIVES FROM THE REFUTED VERSION, and it is worth keeping:** one server-side tag can carry different local names per clone, because the engine rewrites `refs/tags/rescue/*` into a remote-tracking namespace. **Name the clone when you name a ref.** That is a naming lesson, not this defect.
+
+## 1379. the -C precedence and PowerShell environment-assignment classes reach the governed shared config on both gates, and no rule models either
+
+> 🔢 **Filed 2026-08-28 (lander) - INHERITED, not introduced; both are allowed on the pre-fix gate too.**
+> Verdict: build
+> Closing-act: code
+
+**Cluster:** Development harness. **Priority:** P2. **Verdict:** build (medium).
+**Severity:** no product effect and no PHI effect -- this governs agent behaviour in development. **Both classes are CONSEQUENCE-PROVEN: the write really reaches the governed shared config, verified by reading the config back.**
+
+**CLASS ONE, `-C` PRECEDENCE.** `git -C X --git-dir=<governed>/.git config <key>` writes the GOVERNED config and is ALLOWED on both the pre-fix and post-fix gates. Real git applies `-C` and then lets `--git-dir` decide; the rule does not model that composition.
+
+**CLASS TWO, THE POWERSHELL ENVIRONMENT SPELLING.** The gate's `GIT_DIR` enumeration matches the POSIX prefix form only. **A pattern cannot reach the PowerShell form, and this was proven by attempting it:** a regex was written, it parsed, it emitted correctly, and three rows were still wrong. In PowerShell the assignment is a separate statement before the separator, so it lands in a **different scan segment** than the git invocation it configures. The gate has no cross-segment environment tracking. **The attempt was reverted rather than shipped, because a regex that looks like coverage and is not is worse than a known gap.**
+
+**SO THIS IS A DESIGN CHANGE, NOT A PATTERN.** Filing it as "add the missing spellings" would ship a fix that closes an instance and leaves the class open.
+
+**PROVENANCE:** both surfaced by a completeness critic during #1065's follow-on work and were explicitly attributed as inherited rather than introduced, after being measured against the pre-fix gate. **Neither is caused by the branch that found them.**
+
+## 1380. the ASVS scorecard gate is path-gated to the one file it validates, so its green history is a history of not running -- and it carries at least two defects that only surface when it does
+
+> 🔢 **Filed 2026-08-29 (lander) - found while holding a scorecard PR; the gate is broken, the PR's content is not.**
+> Verdict: build
+> Closing-act: code
+
+> **RETRACTED IN FULL 2026-08-29 BY ITS OWN FILER. EVERY LOAD-BEARING CLAIM IN THIS ROW IS WRONG, AND THE GATE IT ACCUSES WAS WORKING CORRECTLY THE WHOLE TIME.**
+>
+> **The row is kept rather than deleted because the reasoning failure is worth more than the row was, and because a deleted row cannot be found by whoever repeats it.**
+>
+> **DEFECT 1 -- `accepts at most 1 arg(s), received 4` -- WAS NOT CI. IT WAS THE FILER'S OWN `gh` COMMAND.** Measured: that string appears **0 times** in the 592-line job log, against a positive control of 37 hits for `anchor`/`scorecard` in the same log through the same pipe. `gh pr checks` emits four tab-separated fields per row -- name, state, elapsed, url -- and an unquoted row splatted into a `gh` subcommand taking one positional argument produces exactly that error, once per row. **The thing that read as corroboration was the tell:** *"received 4"* identical across two differently-named checks. The 4 is the row's field count, not a property of either check. Two checks failing identically read as a systemic fault; it was one command failing twice.
+>
+> **DEFECT 2 -- `[scorecard].anchor_commit is missing` -- NEVER FIRED. The filer read the workflow's own shell source as an emitted error.** The log line is `test -n "$sha" || { echo "::error::[scorecard].anchor_commit is missing"; exit 1; }` -- the guard's *text*, echoed as the step runs. The only emitted error in the whole job is `##[error]Process completed with exit code 1`. The row's own evidence for this half -- that `anchor_commit` is present and unchanged on all three refs -- was correct and proved the opposite of what it was cited for: **the value was fine because the guard never ran.**
+>
+> **THE HEADLINE -- "its green history is a history of not running" -- IS REFUTED BY DOCUMENTED DESIGN.** The skips are deliberate, visible, and engineered against the exact hazard this row claimed to discover. `.github/workflows/asvs-scorecard.yml:65-77` states it:
+>
+> > *"WHY THIS JOB EXISTS, AND WHY IT IS NOT A `paths:` FILTER ... workflow `paths:` filter -> no check reported -> ABSENCE, which reads as success; job-level `if:` -> check reported as SKIPPED -> visibly not run"*
+>
+> and at `:118-119` it records having already hit and fixed the near-miss version: *"Leaving it out set relevant=false and reported SKIPPED, which is not green but is read as green by anyone glancing at the checks list."* **A SKIP IS NOT AN ABSENCE, AND THE DIFFERENCE IS THE WHOLE POINT OF THE DESIGN.** The row treated a reported SKIPPED as a silent non-run.
+>
+> **AND THE TWO CHECKS ARE ADVISORY, SO NOTHING WAS EVER GATED ON THEM.** `required_status_checks.contexts` on the vault's `main` is `["verified-at", "every cited requirement identifier resolves"]`. The row's stated stakes -- that landing would mean landing over the only checks that validate a scorecard change -- were false about *gating*, though the change genuinely was the only one exercising them.
+>
+> **WHAT WAS ACTUALLY WRONG, and it is the gate working rather than failing:** `verify` reported real findings (absence claims already with the owner) and `render-drift` reported a real `git diff` -- the committed rendered view was stale against the data. **The cron leg had been failing daily for nine days. The gate was shouting, not sleeping.**
+>
+> **THE PROCESS FAILURE IS THE PART WORTH KEEPING.** The filer stated plainly what had not been established -- named the two jobs, said the logs were read and no further, declined to guess which CLI or when it broke. **That honesty did not prevent the error, because the unexamined premise was not in the uncertain part.** It was in the part that felt measured: an error string copied out of a terminal was assumed to have come from the thing being examined. **A quoted error message is evidence about whichever process emitted it, and identifying that process is a separate measurement nobody made.**
+>
+> **DO NOT DRAW THE LESSON THAT THE RED SHOULD HAVE BEEN WAVED THROUGH.** Refusing to land a scorecard change over the only two checks that exercise scorecard changes was right on the information available, and would have been worth days had the gate genuinely been blind. **The error was the diagnosis, not the caution.**
+>
+> **DISPOSITION: this row describes no defect. It is superseded by nothing and should be closed by whoever dispositions it, not rebuilt.**
+
+**Cluster:** CI workflow. **Priority:** P2. **Verdict:** build (small).
+**Severity:** no engine effect, no PHI axis, no deployment axis (sec. 0). It governs the vault's security record, not the product. **The severity is that the gate reads as passing while never executing, not that any verdict is wrong.**
+
+**THE SHAPE, AND IT IS THE POINT: A PATH FILTER PLUS A BROKEN INVOCATION IS INDISTINGUISHABLE FROM A HEALTHY GATE.** The `verify` and `render-drift` checks are path-gated to `docs/security/asvs-scorecard.toml`. Nothing else in the repository touches that file. So on every pull request that does not change the scorecard, both checks report **SKIPPED**, the workflow reports **success**, and the rollup is green.
+
+**MEASURED, and the control is what makes it a finding rather than a suspicion.** A first pass compared the scorecard branch against three others and found the workflow succeeding everywhere else and failing only on the scorecard branch -- which reads as a defect in that branch. Checking what those successes were made of inverted it:
+
+```
+vault/lane-gauge-homefix          verify = SKIPPED    render-drift = SKIPPED
+vault/lane-gauge-20260828         verify = SKIPPED    render-drift = SKIPPED
+steward-burn-history              verify = SKIPPED    render-drift = SKIPPED
+asvs-advisory-line-repair-22      verify = FAILURE    render-drift = FAILURE
+```
+
+**Every green was a skip.** The first change in the observable window to actually exercise these checks fails immediately.
+
+**TWO DISTINCT DEFECTS, ON TWO DIFFERENT TIPS OF THE SAME BRANCH. Neither is the branch's content.**
+
+1. **Tip `3e7c02619` -- an argument-arity error.** `accepts at most 1 arg(s), received 4`. A `.toml` content change cannot cause a workflow to pass four arguments to a command that takes one, so the mismatch is between the workflow's command line and whatever CLI actually runs. **Which side moved is UNESTABLISHED and this row does not claim to know.**
+
+2. **Tip `ce3ad71f6` -- a false claim about the data.** The job exits on `::error::[scorecard].anchor_commit is missing`. **It is not missing.** Measured on all three refs:
+
+```
+origin/main                    anchor_commit present, 1 occurrence
+asvs-advisory-line-repair-22   anchor_commit present, 1 occurrence, byte-identical value
+3e7c02619                      anchor_commit present, 1 occurrence
+diff of the second commit against the first, filtered to that key:  EMPTY
+```
+
+**The value exists, is unchanged, and the second commit never touched it.** So the gate's extraction of it is wrong, and it reports a defect in the record when the fault is in its own reading. **That is the third instrument this fleet has nearly filed as a broken subject when the failure was in the instrument's own message.**
+
+**THE MEASURED NEGATIVE, so nobody spends a cycle on the obvious hypothesis.** The natural guess is that the vault's mirrored `scripts/asvs/scorecard.py` is stale against a workflow written for a newer CLI. **It is not the cause.** The whole difference between the vault copy and the engine's is one hunk, 15 lines added and 0 removed, 14 of them comments, and the single executable line is a `newline=""` keyword inside the render path. Both copies produce byte-identical verdict streams. **Landing the mirror is still worth doing for parity; it will not clear this red, and it must not be reported as the fix.**
+
+**WHY THIS BLOCKS SOMETHING TODAY.** A scorecard change is held on it. Its required contexts are green and its content was independently verified, but landing it would mean landing a scorecard change over **the only two checks that would ever validate a scorecard change** -- a compensating control resting on a false premise. The change's author declined to authorise that, correctly: deciding a red gate is acceptable is not the branch author's call.
+
+**Related:** the `verified-at` and `every cited requirement identifier resolves` checks are NOT path-gated and pass normally. They are a different, working pair, and this row is not about them.
+
+**UNTESTED:** nobody has run either check locally, and the workflow's own invocation was read but not executed. Whether the two failures share a root cause, or are two independent breakages that surfaced together because nothing exercised either, is **open**.
+## 1381. cla.yml pins an archived GitHub Action
+
+> 🔢 **Filed 2026-08-26 - fix built.** `contributor-assistant/github-action`, pinned in
+> `.github/workflows/cla.yml:50` at `ca4a40a7d1004f18d9960b404b97e5f30a505a08` (v2.6.1), was archived
+> by its maintainer (SAP ran out of bandwidth). zizmor's `archived-uses` rule flags it; zizmor is
+> advisory-only here (paths-filtered, not in `.github/required-contexts.txt`), so nothing is blocked
+> today. The fix -- vendoring the action's own code into this repo -- is committed and handed to the
+> Lander to open the PR.
+> Verdict: build
+> Research: none
+> Closing-act: code
+
+**Cluster:** CI workflow supply chain. **Priority:** P3. **Severity:** no deployment axis (sec. 0) --
+CI tooling, not shipped in the wheel. The cost is a frozen, unpatchable dependency sitting on the
+required `cla` status-check context that gates every external PR merge -- real, but not urgent while
+zizmor stays advisory.
+
+**What was checked before deciding to vendor.** All 138 forks of the archived repo were surveyed for
+one with real adoption or a patch record; none qualified (the most active, `iainmcgin/cla-github-action`,
+has 4 stars and one maintainer; the rest have 0 stars or are stale since 2020). The one non-fork
+alternative, the hosted `cla-assistant.io` service, needs a GitHub App install and stores signatures on
+its own server -- `cla.yml`'s own comments call out in-repo signature storage specifically so no extra
+secret is needed, and a hosted service gives that up. Neither is a drop-in.
+
+**The fix.** The action is small and self-contained: 15 TypeScript files compiled to one
+`dist/index.js` (~1.2MB), Apache-2.0 licensed, and it only calls the GitHub API -- no third-party
+server. Vendored as `.github/actions/cla-assistant-lite/` (`action.yml`, `dist/index.js`, `LICENSE`,
+a short `README.md` naming the upstream commit), with `cla.yml`'s `uses:` repointed at the local path.
+Every `with:` input, the `if:` condition, the `on:` trigger set (`merge_group` / `issue_comment` /
+`pull_request_target: [opened, synchronize]`, deliberately no `closed`), `permissions:`, and the job
+key `cla` itself (the required-status-check context, per `docs/CI.md` and
+`.github/required-contexts.txt`) are unchanged -- confirmed by six independent verification passes,
+five PASS outright: job key/triggers/permissions/`if:` unchanged; `with:` block byte-for-byte
+unchanged bar the `uses:` line; every input `cla.yml` sets exists in the vendored `action.yml`; the
+vendored files checksum-match an independent fresh fetch of the same pinned commit; the Apache-2.0
+LICENSE and attribution are preserved. The sixth check split into two sub-results: zizmor itself
+isn't installed in this sandbox so it could not be re-run locally (CI will exercise it on push), but
+the no-new-glyphs / comments-explain-why check it also carried did PASS.
+
+**What auditing the vendored code actually amounts to.** Nobody has read all 1.2MB of the compiled
+bundle line by line -- a build sandbox's own safety monitor flagged exactly this during the build,
+since only its shape and checksum had been confirmed at that point. A follow-up pattern scan (every
+`http(s)://` literal, `child_process`, `eval(`, `new Function(`, `exec(`) found nothing outside
+`api.github.com`/`github.com`/`uploads.github.com` calls and documentation-comment URLs pulled in from
+bundled open-source libraries; the one `eval(` is the well-known `eval("require")("encoding")` idiom
+node-fetch uses to dodge bundler static analysis, not dynamic code execution; every `exec(` hit is
+`RegExp.exec()`, not a shell call. That is a pattern scan, not a full audit, and the vendored bytes are
+checksum-identical to what has already been running in this exact workflow under the pinned SHA --
+vendoring relocates an already-trusted dependency, it does not introduce a new one.
+
+**Two gates caught real problems on the first commit attempt, before anything landed.** `.gitignore`'s
+blanket `dist/` rule (a Python build-artifact convention) was silently dropping
+`dist/index.js` from every `git add` -- fixed with a narrow negation plus a `-text` `.gitattributes`
+entry for this one path (`text eol=lf` was tried first and re-encoded roughly 1,300 bytes on staging,
+which would have committed a file that no longer matched its own recorded checksum). Separately, the
+licence-header gate had no way to accept a file that legitimately isn't AGPL-3.0 -- this repo's own
+licence, forced onto someone else's Apache-2.0 code, is exactly the "affirmative misstatement of
+licence" that gate exists to catch. Fixed by adding a narrow, named `VENDORED_LICENCES` override to
+`scripts/quality/licence_header_check.py` (one file, one entry, still asserting an exact value) and a
+two-line `// SPDX-License-Identifier: Apache-2.0` + provenance comment at the top of the vendored
+file. That comment is the only byte difference from the pure upstream copy: stripping the first 176
+bytes reproduces the original verified checksum exactly
+(`a44111084c0d4782206c04b4276292f7fec6d1f7a33525512fbeef3242079dfb`); the as-committed file's own
+checksum is `2f8271c83b98e86b8b203205c0dda08415fa49c8c300921e481aabf5c9b989f8`. Both changes are
+committed alongside the fix rather than filed separately, since neither makes sense without it.
+
+**Not done:** pushing, opening a PR, or anything that would exercise this in real CI. Committed and
+handed to the Lander.
+## 1382. the ledger gate compares head against origin/main, so RENAMING a row onto a number already on main passes -- and that merge produces a silent duplicate
+
+> 🔢 **Filed 2026-08-29 (lander) - found by builder-2, composed by the dispatcher, and the unproven half measured by the filer before filing.**
+> Verdict: build
+> Closing-act: code
+
+**Cluster:** Repo governance / ledger. **Priority:** P2. **Verdict:** build (small).
+**Severity:** no engine, PHI or deployment axis (sec. 0). It governs the ledger, not the product. **The severity is that the duplicate is silent -- git reports success and no gate reports anything.**
+
+**THE GATE'S BEHAVIOUR IS DELIBERATE AND DOCUMENTED. THIS ROW IS ABOUT A SIDE EFFECT ITS COMMENT DOES NOT NAME.** `scripts/hooks/ledger_check.py:169` takes `base: str = "origin/main"`, and the check at `:370` walks `head - base`. The comment at `:368-369` states the reason in its own words:
+
+> *"Only `head - base` is examined, so everything already on origin/main -- including the pre-partition overlap -- is grandfathered by construction. No allowlist, nothing to maintain."*
+
+**That is a good design and the row does not propose scrapping it.** Grandfathering by set-subtraction is why there is no allowlist to rot.
+
+**THE SIDE EFFECT: the gate stops you INTRODUCING an unowned number. It does not stop you RENAMING a row onto one that is already on main.** If the number is in `base`, it is not in `head - base`, so `owns()` is never consulted and there is nothing to reject. A commit renaming a branch's row onto `#1379` -- allocated to another worktree, already landed -- **passes cleanly**, and the pass is correct under the rule as written.
+
+**THE CONSEQUENCE WAS REPORTED AS REASONED-NOT-MEASURED AND IS NOW MEASURED.** The reporting seat marked it explicitly as not having completed a merge, and the composing seat carried that marking forward rather than laundering it. Settled here by three-way merge over temp files, mutating no repository:
+
+```
+control  '## 1379.' on origin/main = 1   (unique, so the test is about the real number)
+base     0 headings   (a branch cut before #1379 landed)
+ours     1 heading    (main, at its real offset)
+theirs   1 heading    (the same branch with a DIFFERENT row renamed to #1379)
+the two rows sit ~11,828 lines apart
+
+git merge-file  ->  exit 0 | conflict markers 0 | '## 1379.' in the result: 2
+```
+
+**Exit 0, no markers, two rows. The duplicate merges silently.**
+
+**PLACEMENT IS LOAD-BEARING AND A FIRST ATTEMPT GOT IT WRONG.** Running the same simulation with the renamed row placed at the **tail**, adjacent to main's newest items, produces `exit 1` and three conflict markers -- git catches it. **That version would have refuted the finding, and it would have been the wrong test**: the gate's own message cites the hazard as *"two sessions adding #N land ~1,600 lines apart, merge CLEAN, and both ship (cf. 5b7d046 / #598)"*. Adjacency manufactures a conflict the real scenario does not have. **The far-apart placement is the one that matches the documented failure, and it is the one that reproduces.**
+
+**SO THIS IS THE GATE'S OWN STATED FAILURE MODE, REACHED BY A ROUTE IT DOES NOT CHECK.** The union-diff design that makes the move-commit case correct (`:47-50`) is the same design that makes this invisible.
+
+**NOT CLAIMED:** that anyone has done this, that it is exploitable, or that it was reached other than by a builder noticing it mid-repair. No instance is alleged.
+
+**UNTESTED:** whether a real `git merge` through the merge queue behaves as `git merge-file` does here -- the simulation is a three-way content merge and does not model the queue. Also untested: whether the ADR arm at `:267` has the same shape, though it reads the same way.
+
+**A CANDIDATE FIX, NOT A DESIGN:** walk the branch's own history for renamed headings rather than only `head - base`, or assert that every `## N.` in head whose number is in base is byte-identical to base's row of that number. The second is cheaper and answers the question directly.
+
+**AMENDMENT 2026-08-29 (lander) -- THE FREEZE IS INVISIBLE UNTIL SOMEBODY TOUCHES THE LEDGER.** The
+same `base = origin/main` comparison is re-evaluated on **every** commit that touches the ledger, over
+`head - base` rather than against the commit's own parent. So once a branch's allocating worktree is
+gone, a **one-line typo fix inside a row that branch already carries is refused identically to adding a
+brand-new one** -- the refusal is about the SET the branch adds relative to `main`, not about what the
+commit changed.
+
+**But `check_backlog` returns early at `ledger_check.py:346` unless the change set contains
+`docs/BACKLOG.md` or a path under the archive directory.** So a **test-only commit on that same frozen
+branch passes cleanly**. The branch is not uniformly frozen: it is frozen along the one path nobody
+exercises until they need it, and it reports perfect health until that moment. **A seat can work such a
+branch for hours and meet the refusal at the worst possible time** -- the shape this whole row is about,
+a gate whose failure is silent until the expensive moment.
+
+**MEASURED against `origin/main`, not inferred:** `:169` `base: str = "origin/main"`; `:203`
+`git diff --name-only <base> HEAD` (the base, never the parent); `:345` `changed = self.changed_files()`;
+`:346` the early return; the `head - base` loop at ~`:370`; and both ownership arms reading
+`elif not self.ci and not self.owns(...)` at `:296` and `:385`. **CI passes `--ci`, so the ownership arm
+never runs there** -- this is a local-commit constraint only and the branch can still merge on GitHub,
+the same local-versus-CI divergence recorded by the unlanded row on the ungated sequencer -- **named by subject rather than by number, because that row is allocated but not yet on `main`, and a citation to a still-issuable number resolves to nothing today and to unrelated work the day it is issued.**
+
+**NOT A SEPARATE ROW, DELIBERATELY.** The consequence that an existing row is refused like a new one is
+the intersection of this row's mechanism with **#1293** (removing a worktree orphans every unlanded
+number it allocated), which is CLOSED -- shipped 2026-08-23 at `937e83da`, remedy recorded as doctrine
+in [`docs/LEDGER-GATE.md`](LEDGER-GATE.md): recreate a worktree at the recorded path, owner-ruled route
+1. That remedy already resolves it operationally. **The invisibility above is the part neither row
+states**, and it is recorded here rather than as a third row because splitting it files half a story
+twice.
+
+**PROVENANCE:** mechanism found by builder-2 reading the source, composed by the dispatcher, line
+citations re-verified against `origin/main` by the lander before writing. A builder is relying on the
+test-only asymmetry right now, which is what makes it worth recording rather than theoretical.
+
+## 1384. two required contexts were never mirrored into required-contexts.txt, so they have no negative control and no test can notice
+
+> 🔢 **Filed 2026-08-29 -- OPEN.** Branch protection on `main` enforces **15** contexts.
+> [`.github/required-contexts.txt`](../.github/required-contexts.txt) declares **13**. The two it does
+> not name are `CodeQL (javascript-typescript)` and `CodeQL (python)`. Found while intersecting a PR's
+> `statusCheckRollup` against the live required set to decide what actually blocked six queued PRs.
+
+**Cluster:** CI / required-set claims. **Priority:** P2. **Verdict:** build (small).
+**Severity:** two contexts that BLOCK A MERGE today carry **zero registered negative controls**, and
+the register built to guarantee otherwise cannot see them. The file itself under-reports, which is the
+safe direction -- nobody is relying on a check that is not on -- but the consequence below is not
+cosmetic.
+
+**The doc gap is the small half. This is the real one.**
+[`tests/negative_controls.toml`](../tests/negative_controls.toml) registers, per required context,
+what a planted defect breaks and which pytest nodes must go red without it. Measured: it contains
+**zero** CodeQL entries. #1000's shipped banner states *"All 13 required contexts now carry a
+registered negative control"*, and that sentence was true when written and is now true of 13 of 15.
+
+**Why no test caught it, and the authors were explicit about the precondition.**
+`tests/_workflow_contexts.py::required_contexts()` reads
+[`.github/required-contexts.txt`](../.github/required-contexts.txt) off disk. Its docstring says so
+plainly. `tests/test_negative_controls.py` then reconciles the register against that list, and its own
+docstring states the design honestly:
+
+> `.github/required-contexts.txt` IS READ-ONLY TO THIS FILE. It mirrors the live server, and its own
+> header states the ordering rule -- branch protection first, then the file.
+
+and describes the decay mode it targets as *"a context arriving in branch protection **and being
+mirrored into** `.github/required-contexts.txt`"*. **The guarantee is conditional on a human
+performing the mirror step, and nothing enforces that step.** Step one was done -- CodeQL is enforced.
+Step two was not. Every downstream test then agreed with every other, because they all read the mirror.
+
+**This is ADR 0158 Class 2**, by the ADR's own one-line test -- *if this control were broken, what
+would tell me?* If the mirror is skipped, the thing that would tell me is the register, and the
+register reads the mirror. See
+[ADR 0158](adr/0158-silent-controls-green-signals-that-mean-nothing-and-shape-over-detection.md).
+
+**Measured 2026-08-29:**
+
+```
+gh api repos/MEFORORG/MessageFoundry/branches/main/protection --jq '.required_status_checks.contexts[]'
+  -> 15
+mapfile -t ctx < <(grep -vE '^\s*(#|$)' .github/required-contexts.txt); echo "${#ctx[@]}"
+  -> 13
+
+in API but not in file : CodeQL (javascript-typescript), CodeQL (python)
+in file but not in API : none
+grep -ci codeql tests/negative_controls.toml -> 0
+```
+
+**A note on that second command, because this row is about instruments and it would be poor
+form to leave a copyable one that can lie.** A `grep file | grep` chain reports the LAST stage's
+status, so a missing or unreadable file yields ZERO lines and a clean exit from the tail -- read as
+*"the file declares 0 contexts"*, which is indistinguishable from a genuinely empty file. The form
+above keeps the read and the filter in one stage with no pipe. **Either way the 13 is trustworthy
+only because it is compared against the API, which is this row's entire point.**
+
+**The count 13 is restated in at least five other places**, each of which is now stale by the same two:
+`docs/adr/0158-...md` twice, and three rows in this file. That is a symptom, not the bug -- do not fix
+it by editing the numbers.
+
+**Open question for whoever takes this, because the obvious fix has a worse failure mode.** A test that
+calls the GitHub API needs a token and fails closed on a network blip, turning a silent gap into a
+flaky required check. Options, at least: a non-blocking scheduled job that opens an issue on drift; an
+opt-in `verify`-style check a seat runs deliberately; or accepting the gap and rewording the register's
+guarantee so it stops implying coverage it cannot confirm. **Adding the two lines and moving on fixes
+today's instance and leaves the instrument exactly as blind.**
+
+## 1385. three merge-queue attempts on one PR failed three DIFFERENT unrelated tests, and the PR gate cannot see any of it
+
+> 🔢 **Filed 2026-08-29 -- OPEN.** PR #669 was added to the merge queue three times and
+> removed three times without merging. Its 15 required contexts are green **on the PR**. It fails the
+> `CI` workflow in the **`merge_group`** context, which runs against the branch merged with `main` and
+> is a different set of runs the PR page does not surface.
+
+**Cluster:** CI / merge queue. **Priority:** P2. **Verdict:** build.
+**Severity:** a PR whose every required check is green cannot land, and nothing on the PR says why.
+Three full CI cycles were spent to learn that. On a day when the fleet's budget is the binding
+constraint, an invisible retry loop is expensive as well as confusing.
+
+**The queue events, from the PR timeline:**
+
+```
+11:14:42Z  added_to_merge_queue      11:15:32Z  removed_from_merge_queue
+11:36:54Z  added_to_merge_queue      12:03:00Z  removed_from_merge_queue
+12:42:33Z  added_to_merge_queue      12:50:21Z  removed_from_merge_queue
+```
+
+**THE DISCRIMINATOR, and it is the whole finding: the three `merge_group` CI runs failed for three
+DIFFERENT reasons, with no overlap.**
+
+| `merge_group` CI run | How it failed |
+|---|---|
+| 11:15:01Z | `Tests (pytest)` on `windows-2025` **timed out after 55 minutes** -- no test reported FAILED |
+| 11:37:13Z | `test_api_request_timeout.py::test_a_fast_handler_is_untouched` -- wall-clock timing |
+| 12:42:51Z | `test_multipart.py::test_hostile_disposition_header_parses_in_linear_time` -- wall-clock timing, **and** `test_sqlserver_store.py::test_cipher_invocations_upsert_is_atomic_and_additive` -- infra |
+
+**A real defect in the change fails the SAME test every time.** Non-overlapping failures across
+attempts is the signature of the environment, not the diff. And the diff cannot reach any of them:
+#669 touches an ADR, `docs/adr/README.md`, `harness/load/connscale/probe.py`, and two
+`test_connscale_*` files. **Zero overlap** with multipart parsing, the API request-timeout path, or
+the SQL Server store.
+
+**AMENDED 2026-08-29, and it splits the three failures into TWO different problems. The 11:15 run
+did not fail a test -- it HUNG, and it is an 8x outlier against its own leg.**
+
+Measured across 18 recent `ci.yml` runs, the `Tests (pytest)` step on `test (windows-2025, py3.14)`:
+
+```
+usable samples 13   (5 excluded: skipped, or still running with no completion time)
+min 0.2   median 7.8   max 55.1  minutes
+excluding the outlier: n=12, range 0.2-8.8, mean 6.8
+the outlier is 8.1x the normal mean
+```
+
+**The cap is not marginal, so this is not the ADR 0158 Class 1 shape.** `ci.yml`'s matrix sets
+`step_timeout: 55` for `windows-2025` against a 6.8-minute normal mean -- roughly seven times
+headroom. The run consumed all 55 minutes. **A step that normally takes under nine minutes ran until
+a generous ceiling stopped it, which is a hang, not a slow run.**
+
+**And it tells us WHERE the hang was.** `ci.yml` documents three nested watchdogs at increasing
+scope: `pytest_timeout` (120s per test on Windows, via `--timeout=`), `fault_timeout` (150s,
+`PYTHONFAULTHANDLER` plus `faulthandler_timeout`), and `step_timeout` as the outer backstop -- whose
+comment says it exists "so a process-level deadlock **below pytest**" is still bounded. **The inner
+two did not fire and the outermost did, which is exactly the case the outer one was built for.** So
+the 11:15 failure is a process-level deadlock beneath pytest, not a flaky assertion.
+
+**Corrected characterisation of the three runs:**
+
+| Run | Duration | Kind |
+|---|---|---|
+| 11:15:01Z | **55.1 min**, hit the cap | **process-level hang below pytest** -- no test reported FAILED |
+| 11:37:13Z | 7.7 min, normal | test failure -- `test_a_fast_handler_is_untouched` |
+| 12:42:51Z | 7.6 min, normal | test failures -- `test_hostile_disposition_header...` and the SQL Server upsert |
+
+**So this row covers two problems, not one**, and they should probably separate: a hang that the
+outer watchdog caught once, and wall-clock-sensitive tests failing under load. The visibility gap
+below is common to both.
+
+**A NOTE ON MY OWN INSTRUMENT, because it produced a wrong number first.** My initial pass computed
+`mean = -62670193.3` minutes. A job still RUNNING has no completion time, and subtracting it yields a
+nonsense duration that then poisons min and mean. **The tell was that the value was absurd rather
+than merely surprising; a subtler skew would have passed.** The numbers above exclude incomplete
+steps and say how many were excluded, so the denominator is visible rather than implied.
+
+**FOURTH ATTEMPT, 13:01:54Z -- I re-queued once deliberately and it failed a FOURTH distinct way.
+Failing job: `sql server (store + connector) 2025`.** The 12:42 attempt failed the **2022** leg of
+the same suite. So the SQL Server failure alternates between OS legs across attempts, which is the
+signature the 641 row already described in its own words: the same test failing *"twice, on TWO
+DIFFERENT OS legs"*. Test-level detail for this run was not retrievable at the time of writing
+(`gh run view --log-failed` returned rc=1 while the run was still finalising), so this entry records
+the **job-level** fact only and does not claim which test failed.
+
+**Running tally: four queue attempts, four different failure profiles, zero merges.**
+
+```
+11:15  windows-2025 pytest HANG, 55.1 min, hit the cap    process-level, below pytest
+11:37  test_a_fast_handler_is_untouched                    wall-clock timing
+12:42  test_hostile_disposition_header... + SQL Server 2022  timing + infra
+13:01  SQL Server 2025                                     infra, the OTHER OS leg
+```
+
+**I re-queued knowing the row says not to, and the row still says not to.** The reason was that a
+queue attempt costs runner time rather than the fleet's token budget, and the queue was empty so it
+blocked nobody. **It did not land, and that is the point: the fourth attempt produced more evidence
+rather than a merge, which is what "do not re-run until it passes" predicts.** One deliberate
+re-queue to test the prediction is not the same act as re-running until a green appears.
+
+**WHAT I CANNOT ATTRIBUTE, stated rather than smoothed over.** The three removals do not map cleanly
+onto the three runs. The first entry was removed at 11:15:32Z, **fifty seconds** after being added and
+long before its own run timed out at roughly 12:10Z -- so that removal was not caused by that run.
+PR #677 merged through the queue in that window, which re-forms the group and is ordinary churn. **So
+the honest claim is three failing `merge_group` runs and three removals, not a one-to-one causal
+chain.** Anyone building on this row should establish the mapping rather than inherit it from here.
+
+**The SQL Server one is already on the record as environmental.** The 641 row of the CI failure log
+(now in the vault) records `test_cipher_invocations_upsert_is_atomic_and_additive` failing as a
+`StoreAcquireTimeout`, diagnoses it as `infra`, and closes with the author retracting their own
+pre-registered discriminator after PRs #644 and #645 landed the same work clean. So this test has a
+written history of failing for reasons unrelated to the PR under it.
+
+**The queue itself is not broken -- positive control.** PR #677 went through the same queue at
+11:15:35Z with `CI`, `CLA Assistant`, `backlog-hygiene`, `CodeQL` and `Security` all green in
+`merge_group`, and merged. Whatever this is, it is not "the queue never merges anything".
+
+**Why the PR gate cannot see it.** `merge_group` runs are a separate event against a separate
+`gh-readonly-queue/...` ref. The PR's own `statusCheckRollup` reports the `pull_request` runs and
+says nothing about them. **A PR can therefore show 15 of 15 required contexts green and still be
+unmergeable, with the reason recorded only in a run list nobody looks at.** Reading it takes
+`gh run list --event=merge_group`.
+
+**At least three separable questions, and they have different owners:**
+
+1. **The timing tests.** `test_a_fast_handler_is_untouched` and
+   `test_hostile_disposition_header_parses_in_linear_time` both assert against wall clock on a shared
+   runner. Whether they should is a real question; a linear-time assertion in particular can be
+   restated as a ratio between two input sizes rather than an absolute bound.
+2. **The SQL Server upsert.** Already characterised in the 641 row; a retry past transient acquire
+   failures was noted there as an open vault PR.
+3. **The visibility gap, which is the durable half.** Nothing surfaces a `merge_group` failure onto
+   the PR. A dequeue looks identical to never having been queued -- and `autoMergeRequest` reads
+   `null` in both states, so the obvious field cannot distinguish them either (Instruments 4.15c).
+
+**Do not close this by re-running the queue until it passes.** That is what happened three times
+already, and it produces a green that means "this attempt got lucky", not "the change is sound".
+
+## 1386. the mail drain's byte cap is below the fleet's broadcast rate, so live seats accumulate backlogs that expire unread
+
+> 🔢 **Filed 2026-08-29 -- OPEN.** `scripts/hooks/mail-drain.ps1` caps one injection at
+> `MAX_MESSAGES = 5` **and** `MAX_TOTAL_BYTES = 8000`. At today's broadcast size the BYTE cap binds
+> first, so a seat clears **3 to 4 messages per turn** while the fleet sends faster than that. The
+> send-side TTL default is `TtlMinutes = 4320` -- **three days** -- so a backlog that outlives it is
+> discarded.
+
+**Cluster:** Coordination / session mail. **Priority:** P2. **Verdict:** build.
+**Severity:** **34 messages have already expired unread across 17 boxes.** This is not a projection;
+it is a count of mail that was sent, never rendered, and is now gone.
+
+**Measured 2026-08-29, 88 boxes walked under an assertion that the walk found more than 10:**
+
+```
+189 unread across 12 LIVE boxes (touched within 2h)
+145 unread across 31 dead boxes
+ 34 EXPIRED unread across 17 boxes    <- already lost
+
+largest live backlogs
+  hungry-wu-6c8ac2       43   the LIAISON -- the owner's channel
+  wonderful-elion-257e1e 36   Builder 1
+  cleaner-51d2b4         34
+  respawn-fleet-008093   27
+  messagefoundry-096b5d29 20
+```
+
+**THE ARITHMETIC IS THE FINDING, and it is why nobody noticed.** Every drain prints
+`box: 3 shown, N deferred (caps)` and says *"Deferred mail stays in the inbox and is shown at the
+next drain -- nothing was discarded."* **That sentence is true per drain and misleading in
+aggregate.** Nothing is discarded *at that moment*; the TTL discards it later. A seat reading its own
+drain footer sees an orderly queue, not a queue growing faster than it drains.
+
+**Today's broadcasts run about 1,900 bytes**, so three of them are 5,700 and a fourth exceeds 8,000.
+That is exactly the `3 shown` every seat has been seeing and reading as normal.
+
+**Why the backlog is arithmetic rather than inattention.** The drain runs only when the receiving
+seat takes a turn, and clears at most ~4. A seat taking one turn every few minutes cannot keep up
+with a fleet broadcasting more often than that, and an IDLE seat drains nothing at all -- which is
+the same property recorded separately as *mail is a mailbox, not a doorbell*.
+
+**The consequence that matters most: the Liaison is the owner's channel and holds the largest
+backlog.** An owner item routed there can sit tens of positions deep, and over a long weekend can
+expire instead of arriving. **Anything time-sensitive should not be assumed delivered because the
+send succeeded.**
+
+**At least four separable fixes, and they are not equivalent:**
+
+1. **Raise or decouple the caps.** The byte cap binding before the message cap is probably
+   unintentional -- a 5-message allowance that only ever delivers 3 is not the stated policy.
+2. **Report the BACKLOG, not just this pass.** The footer should say the inbox depth and the oldest
+   message's age, so a growing queue is visible in the place a seat already looks.
+3. **Warn before expiry** rather than discarding silently. An expired message currently leaves only a
+   file in `expired/`; nothing tells the sender or the receiver it was never read.
+4. **Broadcast discipline.** Six broadcasts about one shell idiom in ninety minutes is itself part of
+   the input rate, and no cap change fixes that.
+
+**Do not close this by draining the current backlog.** The backlog is the symptom; the cap and the
+silent expiry are the defect.
+
+## 1389. a REQUIRED CI guard is green while asserting against the wrong step: its locator binds the tooling pytest line, not the engine one it names
+
+> 🔢 **FILED 2026-08-29 (builder 2).** `tests/test_ci_engine_step_excludes_webconsole.py` exists to
+> stop the engine pytest step double-running the ~356 web-console tests that `testpaths` includes
+> (BACKLOG #1027). ***IT PASSES. IT IS A REQUIRED CHECK. AND IT IS NOT LOOKING AT THE ENGINE STEP.***
+
+> **IN FLIGHT WHEN FILED: PR 613 ALREADY REPAIRS THIS, AND IT IS DIRTY.** Verified 2026-08-29, not
+> taken on report: `gh pr diff 613 --name-only` matches
+> `tests/test_ci_engine_step_excludes_webconsole.py`, and `gh pr view 613` reads OPEN, not draft,
+> `mergeStateStatus=DIRTY`. **The row stands because the PR may not land** -- if 613 is ever closed
+> unmerged the defect still needs a home, and this row names the mechanism more precisely than 613's
+> body does. ***DO NOT START A SECOND FIX. Read 613 first.*** Overlap found by the DISPATCHER after
+> dispatch, not before -- it screened its bench rows for an open PR and did not screen the filing job
+> it handed out.
+> **THE MECHANISM, AND IT IS NOT "THE LOCATOR STOPPED MATCHING".** `_engine_step_run_line()` scans
+> `ci.yml` for a line whose stripped form starts `run: pytest -q`, and calls `pytest.fail` if it finds
+> none — **so a stopped match would go RED, loudly.** That is not what happens.
+>
+> ***EXACTLY ONE LINE IN ci.yml MATCHES, AND IT IS THE TOOLING STEP:*** L1122,
+> `run: pytest -q -n 4 --dist loadfile -m tooling --ignore-glob='*messagefoundry-webconsole*' ...`.
+> The engine step's run line is L813 and it is WRAPPED: `run: bash scripts/ci/retry-native-crash.sh pytest -q ...`, so it
+> never starts with `run: pytest -q` and is never examined. **The guard binds a step it was not
+> written for, that step happens to carry `--ignore-glob`, and every assertion passes.**
+
+> **NOTHING IS BROKEN TODAY AND THAT IS THE POINT.** The engine step still carries the subtraction
+> (verified AT L813 itself, which carries `--ignore-glob='*messagefoundry-webconsole*'`). ***So
+> there is no live double-run. What is missing is the PROTECTION: if someone "simplified" the engine
+> flag back to `--ignore` — the exact regression this file's own docstring says it exists to catch,
+> and which was MEASURED not to prune — the guard would still be green.***
+
+> **THE DOCSTRING STATES THE HAZARD IT NO LONGER COVERS:** *"A future edit 'simplifying' the flag back
+> to `--ignore` would restore the double-run silently, with every check still green, which is the same
+> shape as the defect #1027 fixed."* ***It now describes itself.***
+
+> **THE FIX IS THE LOCATOR, NOT THE ASSERTIONS.** Bind the step by its `name:` / `id:` (`id: tests`)
+> and read the whole `run:` block, rather than pattern-matching a one-line spelling that a formatting
+> change can move. **A test that identifies its subject by a coincidence of layout will re-break the
+> next time the layout changes.**
+
+> **CONTROLS RUN BEFORE FILING:** the three tests pass on main's files (3 passed); `run: pytest -q`
+> occurs exactly once in `ci.yml`; that occurrence is `-m tooling`; `name: Tests (pytest)` occurs once
+> at L747. Absence probes on origin/main's live and closed ledgers: `test_ci_engine_step` 0 hits,
+> `excludes_webconsole` 0 hits — **this defect had no row.**
+
+**Cluster:** CI reliability / dead controls. **Priority:** P2. **Verdict:** build (small).
+**Severity:** no engine effect, no PHI axis, no deployment axis (sec. 0). Nothing is mis-running now.
+The cost is a REQUIRED check whose green is uninformative about the thing it names — and a required
+check is exactly where an uninformative green is most expensive, because it is the one nobody re-reads.
+
+---
+
+## 1390. cla.yml persists the job token into .git/config on pull_request_target while holding contents: write, and the checkout that does it arrived with the fix for the archived action
+
+> 🔢 **FILED 2026-08-29 (builder 2).** `.github/workflows/cla.yml` checks out at
+> `actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1` (v7.0.1, L59) with **no
+> `persist-credentials` setting anywhere in the file**. The action's default is `true`, so the job's
+> `GITHUB_TOKEN` is written into `.git/config` on the runner. zizmor names this pattern `artipacked`.
+
+> **IN FLIGHT WHEN FILED: PR 681 ALREADY REPAIRS THIS, AND IT IS BLOCKED.** Verified 2026-08-29, not
+> taken on report: `gh pr diff 681 --name-only` matches `.github/workflows/cla.yml` and the diff adds
+> 3 `persist-credentials` lines; `gh pr view 681` reads OPEN, not draft, `mergeStateStatus=BLOCKED`.
+> **The row stands because the PR may not land.** ***DO NOT START A SECOND FIX. Read 681 first.***
+> Same screening miss as #1389, same source, disclosed by the DISPATCHER unprompted.
+> **THE PERMISSIONS AND TRIGGER ARE WHAT MAKE IT WORTH A ROW, not the checkout alone.** The workflow
+> runs on `pull_request_target` (L23) and declares `contents: write`, `pull-requests: write`,
+> `statuses: write` (L35-39). ***`pull_request_target` runs in the BASE repository's context with
+> those permissions available, which is precisely the trigger where a persisted write-capable token
+> is worth the most to anything that can read the runner's filesystem.***
+
+> ***THE PART THAT MAKES THIS INSTRUCTIVE RATHER THAN ROUTINE: THE CHECKOUT ARRIVED WITH THE FIX FOR
+> A DIFFERENT DEFECT.*** cla.yml previously had **zero** checkout steps — measured on origin/main
+> earlier the same day. #1381 vendored the CLA action from a remote reference to a local
+> `uses: ./.github/actions/cla-assistant-lite`, and a local action cannot resolve without a checkout,
+> so PR 678 added one. **The remedy for "the action is archived" introduced the credential
+> persistence. Neither change was wrong on its own terms.**
+
+> **THE FIX IS ONE LINE:** `persist-credentials: false` on that checkout step. The job does not push;
+> it needs the tree only so the local action resolves. **Nothing in the workflow reads the persisted
+> credential, so removing it costs nothing.**
+
+> **CONTROLS RUN BEFORE FILING, on origin/main:** the file reads back 4,853 bytes (a nonzero read, so
+> a zero below is a real absence); `actions/checkout` occurs twice — once in a comment at L48 and once
+> as the step at L59; `persist-credentials` occurs **0** times; `pull_request_target` present at L23.
+> Absence probes on the live and closed ledgers: `persist-credentials` 0 hits, `artipacked` 0 hits —
+> **this defect had no row.**
+
+**Cluster:** CI supply chain / secrets. **Priority:** P2. **Verdict:** build (small).
+**Severity per sec. 0 — CONDITIONAL, and the distinction is load-bearing.** There are ZERO
+deployments and this is a CI workflow, so nothing is exposed today. ***A compromised or malicious
+step in that job WOULD find a write-capable token on disk*** — that is the harm, and it is
+prospective. **Do not write this row up as a live credential exposure; it is not one.**
+
+---
+
+## 1391. the respawn brief points relative commands at the PREDECESSOR checkout, so a replacement seat can declare into a dead box -- but it does not always fire, and the exception is the useful half
+
+> 🔢 **FILED 2026-08-29 (builder 2, who IS a replacement seat and is the counter-example).**
+
+> **THE MECHANISM, VERIFIED IN THE GENERATOR:**
+> `respawn.ps1:1339` emits `"RUN EVERY RELATIVE COMMAND BELOW FROM: $runFrom"`, where `$runFrom` is
+> the **predecessor's** checkout. `:1426` then gives the declare command as a **relative** path,
+> `pwsh -NoProfile -File scripts\coord\seat.ps1 -Declare ...`. And `seat.ps1` derives its box key
+> from the invoking tree — `:241` `$start = if ($Hint) { $Hint } else { (Get-Location).Path }`,
+> `:545` `$boxKey = ConvertTo-BoxKey -Path $wt`. ***Follow the brief literally and the declaration is
+> keyed to a worktree that is not yours.***
+
+> ***AND IT DID NOT HAPPEN TO ME, WHICH IS WHY THIS ROW IS NOT "EVERY REPLACEMENT SEAT".*** My brief
+> carried the predecessor path (the predecessor worktree, named in full) and my declaration still landed in
+> **my own** box: `my own seat record` holds `seat=BUILDER2`,
+> `seatSource=declared`, a real goal, `declaredAt 2026-08-28T17:51:44Z`. **A universal claim was
+> available and is false.**
+
+> ***SO THE OPEN QUESTION IS THE ITEM: WHAT MAKES IT FIRE?*** The plausible discriminator is whether
+> the seat runs the declare with the brief's cwd or from its own tree — but that is UNMEASURED and I
+> am not asserting it. **Establish the discriminator before choosing a fix, because a fix aimed at the
+> wrong half will look like it worked on the seats that were never affected.**
+
+> **THE REPORTED CONSEQUENCE, attributed rather than claimed:** the ASVS-TRACKER found this on itself
+> at 06:34Z and PROCESS-IMPROVEMENT reported the generator still live at ~16:2xZ; the affected seat
+> is reported still reading `seat=ASVS-TRACKER declared 17:50Z` although that seat re-declared at
+> 11:33Z. ***I did not verify that record myself and it is second-hand here.*** The consequence when
+> it does fire: the declaration lands in a dead box, the Stop hook writes an undeclared record under
+> the live one, and mail — addressed by box — goes to the dead one.
+
+> ***THE REASON THIS SURVIVED A DAY OF FOUR SEATS LOOKING AT IT: IT PRESENTS AS THREE UNRELATED
+> THINGS.*** The DISPATCHER reports diagnosing all three wrongly before connecting them — "two seats
+> answering to LIAISON", "mail -To all reaches 11 of 16", and "a seat can be alive and
+> mail-unreachable" published as a **channel** property. **If one root cause can wear three costumes,
+> the first two diagnoses will each look complete.**
+
+> **TWO CANDIDATE FIXES, different sizes:** an ABSOLUTE path in the brief (small, and it only fixes
+> new briefs), or `seat.ps1` keying on the SESSION rather than the invoking tree (larger, and it is
+> the shared root — `lane.ps1` derives its key the same way).
+
+**Cluster:** Fleet coordination. **Priority:** P2. **Verdict:** build (small, pending the discriminator).
+**Severity:** no engine effect, no PHI axis, no deployment axis (sec. 0). It degrades seat addressing:
+an affected seat is alive, working, and unreachable by the channel that leaves a receipt.
+
+---
+
+## 1392. PR 609 must land WITH OR AFTER ADR 0172: it replaces a stale understatement of the TLS posture with an overstatement that is false on main, and links an ADR file main does not have
+
+> 🔢 **FILED 2026-08-29 (builder 2).** PR 609 deletes two strings saying remote TLS exposure is
+> still to come -- `CLAUDE.md:120` and `messagefoundry/api/app.py:19` -- and replaces them with text
+> asserting the engine **always serves TLS**, minting a self-signed certificate on first run, citing
+> **ADR 0172**. ***BOTH THE OLD TEXT AND THE NEW TEXT ARE WRONG ABOUT MAIN, IN OPPOSITE DIRECTIONS.***
+
+> **THE OLD TEXT UNDERSTATES, so PR 609 is right that it must go.** TLS shipped: main carries
+> `messagefoundry/config/tls_policy.py`, `TlsSettings`, `[api].tls_cert_file` / `tls_key_file`, a
+> read-only cert inventory and a `cert self-signed` subcommand, and `__main__.py` says in-process TLS is
+> *"allowed off-loopback without this flag"*.
+
+> ***THE NEW TEXT OVERSTATES, AND THAT IS THE HAZARD -- A SECURITY CLAIM ASSERTING MORE THAN THE
+> MECHANISM DELIVERS.*** Measured at `origin/main`:
+
+| claim in PR 609's replacement text | what main actually does |
+|---|---|
+| "always serves TLS" | `--allow-insecure-bind` is present and permits a non-loopback bind **without** TLS |
+| "mints ... on first run" | **no auto-mint in the serve path.** Minting is the explicit `cert self-signed` subcommand, whose own help says **"for NON-PROD TLS bring-up ONLY"** |
+| `[ADR 0172](docs/adr/0172-...md)` | **not on main.** 167 files under `docs/adr/`, **zero** named 0172, and **no index row** |
+
+> Controls for both scans: `0171` returns 1 as a file and 1 as an index row, so the pattern sees ADRs.
+
+> ***THE CONSTRAINT: PR 609 MUST LAND WITH OR AFTER ADR 0172, NEVER BEFORE.*** Landed first it trades a
+> stale understatement for a false claim of a TLS posture the engine does not have, and it puts a
+> **broken relative link** into `CLAUDE.md`, the file every session reads first. Landed with 0172, every
+> sentence in it becomes true. **The change is correct; only its ORDER is the defect.**
+
+> **DO NOT "FIX" THIS BY REWORDING 609 TO MATCH TODAY'S MAIN** -- that is a third posture to re-review
+> when 0172 lands. Hold 609 behind 0172.
+
+> **PROVENANCE, because the finding changed shape.** The DISPATCHER found the sequencing hazard and
+> reported the old strings as **true**. They are not, they are stale, which weakens the case for holding
+> 609. ***THE HOLD SURVIVES ON THE OPPOSITE EVIDENCE: not "609 would delete something true" but "609
+> would assert something false."*** Right conclusion, wrong reason, and the corrected reason is stronger.
+> Filed as a row because a cross-session message dies with its session and this constraint must outlive it.
+
+**Cluster:** Documentation / security posture. **Priority:** P2. **Verdict:** build (ordering only).
+**Severity:** no engine effect and no PHI axis (sec. 0, zero deployments). It would ship a **false
+security claim** in the two files a new reader trusts first, plus a broken link.
+
+---
+
+## 1388. docs/SECURITY.md cites 9 config keys the loader now refuses, and two of the citations are instructions a reader cannot follow
+
+> 🔢 **FILED 2026-08-29 (builder 2).** ADR 0118 relocated fifteen settings under `[security]`, and
+> `_reject_relocated_keys` now **raises** on the old spellings (`settings.py`, `_RELOCATED_TO_SECURITY`).
+> `docs/SECURITY.md` still cites **9 of those 15 keys on 14 lines**. The lines are not equivalent and
+> the item is the SPLIT, not a find-and-replace.
+
+> **MEASURED, and the classification is the whole item.** Every line read; no regex made the call.
+>
+> | class | count | lines |
+> |---|---|---|
+> | **INSTRUCTION** — a reader following it writes config the loader refuses | **2** | 811, 1378 |
+> | **DESCRIBE** — accurate mechanism, stale spelling | **10** | 21, 35, 42, 806, 856, 886, 1190, 1191, 1204, 1241 |
+> | **ALREADY CORRECT** — names the refusal itself, change nothing | **2** | 186, 1181 |
+>
+> **L811 is the only unambiguous one:** *"The documented org opt-out is `[auth].require_mfa = false`."*
+> That tells a reader the documented way to do a thing, in a spelling that fails at load. **L1378** is
+> second — *"raising `[auth].session_absolute_hours` or `[auth].session_idle_timeout_minutes` beyond
+> those bounds is a documented risk deviation"* names an action on two refused keys.
+
+> **THE TWO ALREADY-CORRECT LINES ARE THE REASON THIS IS NOT A SWEEP.** L186 reads "the old
+> `[diagnostics].audit_all_authz` TOML spelling is **refused at load**"; L1181 gives
+> `[security].sign_out_after_idle_minutes` / `max_session_hours` as "the ADR 0118 homes" and calls the
+> `[auth].*` pair "**the retired aliases**". ***A builder told "fix 14 lines" edits two lines that are
+> already right.***
+
+> **THREE INSTRUMENT FAILURES, RECORDED BECAUSE THEY WILL RECUR IN THIS FILE.** An
+> instruction-vs-description regex called **6** instructions against a true **2** — a 3x over-count.
+> An already-names-refusal regex flagged L1190, L1191 and L1241, all three FALSE: they use
+> "refusing"/"refusal" in an unrelated sense (arms that refuse; an empty list being a refusal). And a
+> key-table regex using `"[a-z_.]+"` for the replacement value **silently dropped `[api].host`**, whose
+> value is `local_access_only / listen_address` — a space and a slash. L42 and L1191 only appeared once
+> that was fixed. ***The miss was invisible; the count simply read 14 keys instead of 15.***
+
+**Cluster:** documentation accuracy / secure-by-default. **Priority:** P3. **Verdict:** build.
+**Severity:** no engine effect, no PHI axis, no deployment axis (sec. 0). A deploying site following
+L811 **would** write a key the loader refuses and get a load failure — loud, not silent, so the
+posture is not weakened. The cost is a documented opt-out that does not work as documented.
+
+---
+
+## 1400. the 90 percent Workflow gate is a per-launch question, so its margin does not scale with concurrent launchers or with a fan-out's own later phases
+
+> 🔢 **Filed 2026-08-29 (lander) - not started.** The gate prints `max(5-hour, weekly)` at the
+> instant one session asks, and refuses a new Workflow above `WORKFLOW_GATE_AT`. It answers *"is the
+> pool low enough for MY launch"* correctly every time, and that is the defect: **N launchers each get a
+> correct yes, and the sum is wrong.**
+> Verdict: build
+> Research: none
+> Closing-act: code
+
+**Cluster:** coordination tooling / usage clock. **Priority:** P2. **Verdict:** build.
+**Severity:** no engine, PHI or deployment axis (sec. 0). It governs fleet spend, not the product. **The
+cost is a usage window dying hours early while every seat followed the rule**, which is also why it does
+not present as anyone's error.
+
+**THE MITIGATION THAT EXISTS IS A MARGIN, AND THE MARGIN IS SIZED FOR ONE.** This row does **not** claim
+concurrency was overlooked -- `watch.py` says the opposite in its own header: the owner **lowered**
+`WORKFLOW_GATE_AT` from 92.0 to 90.0 on 2026-08-05 *"because the threshold is a function of
+CONCURRENCY"*, reasoning at `:612` that *"a Workflow moves a pool 5-7 points, so at 92 a single in-flight
+Workflow could cross the ceiling."* **That is a margin for ONE in-flight Workflow. Nothing in the check
+scales it with how many are already running, because the gate has no denominator.**
+
+**LIMB 1 -- AGGREGATE BLINDNESS. Measured 2026-08-29.** Five fan-outs launched between 23:37Z and
+23:45Z, roughly 49 agents. **Every one read the gate and passed honestly at 2-6 percent**, because the
+other launches' costs had not landed yet. The pool went **2 percent at 23:36:53Z to 43 percent at
+23:56:48Z**. Nobody was careless and no seat could have seen it from where it stood.
+
+**LIMB 2 -- IT IS SELF-SYNCHRONISING, WHICH IS WHY THIS IS NOT RARE.** A window reset is the single
+instant when every seat is simultaneously unblocked, holding queued work, and reading the lowest number
+it will see all window. **So the gate is most permissive exactly when demand peaks.** Two consecutive
+windows took this shape; the earlier one ran 5 to 98 percent in about seventy minutes.
+
+**LIMB 3 -- IT IS ALSO BLIND TO THE LAUNCHER'S OWN LATER PHASES.** A per-launch gate reads the launch
+instant; a multi-phase fan-out spends most of its cost later. Reported by the PM against itself: it
+cleared the gate on a workflow whose expensive stage -- a 37-refuter phase -- appeared in no number the
+gate checked, **including the PM's own agent count**. It killed that run at 4 agents spent.
+
+**AND THE OBVIOUS SELF-COUNT UNDER-REPORTS, MEASURED ON THIS FILER'S OWN RUN.** Counting `agent(` call
+sites is the natural way to size your own fan-out and it is wrong, because **fan width lives in the
+array, not at the call site**:
+
+```
+verify-six-rows-by-their-own-instrument
+  grep -c 'agent('        ->  3   call sites, at lines 83, 100 and 130
+  const ROWS = [...]      ->  6   at line 76, nowhere near any of them
+  agents actually started -> 13
+```
+
+**A 4.3x under-report from the instrument a launcher would reach for first.** Read every `parallel()`
+and `.map()`, multiply by the array length, and sum across phases: **a phase's cost is fan width times
+depth and neither appears at the `agent()` call.**
+
+**WHAT WOULD ACTUALLY CLOSE IT, AS OPTIONS RATHER THAN A DESIGN.** A denominator the gate does not have
+today: fan-outs in flight fleet-wide, and agents REMAINING rather than launched. `lane.ps1` is
+first-person by construction and deliberately has no `-Lane` parameter, so this is not that -- it is
+closer to a live census a launcher must read before calling, rather than a broadcast after the fact.
+**Lowering the threshold again is the one thing that will not work**, because it buys margin per
+launcher and the failure is in the sum.
+
+**NOT CLAIMED:** that any seat launched carelessly, that the gate is wrong about the question it asks,
+or that a fix is obvious. Every measured launch cleared it honestly.
+
+**PROVENANCE:** limbs 1 and 2 are the PM's, relayed and measured by the steward; limb 3 is the PM
+reporting its own failure case; the dispatcher screened it against the ledger and the alloc titles and
+routed it as content with no number. **The filer re-ran the screen over `origin/main` and over all 460
+backlog alloc records before allocating** -- `workflow` 0, `concurren` 0, `fan-out` 0 in titles;
+`fanout` 3 all seat-clock (#1264, #1266, #1267); `aggregate` 1 (#1250). Controls: `gate` 72 titles,
+`workflow` 191 lines in the ledger, an impossible string 0. **The `watch.py` margin history above is the
+filer's own read**, and it is the part that changes the row's ask.
+
+## 1397. the Bash tool unescapes backslashes inside a QUOTED heredoc, so a Windows path or a doubled-backslash regex silently changes meaning
+
+> 🔢 **Filed 2026-08-29 - measured, not fixable here.** In the Claude Code Bash tool a quoted heredoc
+> (`<<'EOF'`) applies one level of backslash-unescaping to the body. POSIX requires a quoted delimiter
+> to suppress all expansion and processing, so the body must reach the shell verbatim. It does not: a
+> line written `C:\\Users` arrives as `C:\Users`. Hit twice in one session while editing
+> `~/.claude/mefor-usage/accounts.json`, and both times the symptom was a Python `SyntaxError` that
+> reads as the model having written bad code.
+> Verdict: owner-ruling
+> Research: done 2026-08-29
+> Closing-act: owner-ruling
+
+**Cluster:** agent tooling / harness. **Priority:** P3. **Severity:** no deployment axis (sec. 0) --
+this is the Claude Code harness, not engine code. Nothing ships in the wheel and no MessageFoundry
+behaviour changes. The cost is at authoring time: a session writing a script through a heredoc can
+emit something subtly different from what it composed.
+
+**The measurement.** Both rows below were written inside `cat <<'EOF' ... EOF` in one tool call:
+
+| written in the tool call | arrived at the shell |
+|---|---|
+| `C:\Users` | `C:\Users` |
+| `C:\\Users` | `C:\Users` |
+
+One backslash survives; two collapse to one. That is a single unescape pass in which `\\` is a
+recognised escape and `\U` is not.
+
+**Why it presents as a model error rather than a tooling one.** Piped into `python - <<'EOF'`, the
+collapsed form raises `SyntaxError: (unicode error) 'unicodeescape' codec can't decode bytes in
+position 2-3: truncated \UXXXXXXXX escape`, and the traceback points at a source line the model never
+wrote. The failure is attributed to the code rather than to the transport, so the natural response is
+to rewrite the Python, which cannot help. On a Windows box this is not an edge case: every absolute
+path carries backslashes.
+
+**Workarounds that do hold.**
+1. Build the separator at runtime -- `BS = chr(92)`, then concatenate. This is what landed the
+   `accounts.json` row on 2026-08-29 after the direct form failed twice.
+2. Use the PowerShell tool with a single-quoted here-string (`@'` ... `'@`). Measured unaffected in
+   the same session, including for a multi-line body containing backslash paths.
+3. Forward slashes, where the consumer accepts them.
+
+**Why this is filed here rather than fixed here.** The defect is upstream in the harness and no change
+in this repo can close it. It is filed so the next session that meets the `truncated \UXXXXXXXX` error
+stops rewriting its Python and reaches for a workaround above. **The owner's call is whether to report
+it upstream via `/bug`** -- no feedback tool was available to the session that measured it, and
+`/bug` needs an interactive terminal.
+
+## 1282. an allocation whose worktree is deleted can never be filed, and alloc.ps1 has no transfer path
+
+> 🔢 **Filed 2026-08-30 (lander) -- allocated 2026-08-17, and the row could not be written until today
+> BECAUSE OF THE DEFECT IT DESCRIBES.** The number was issued to a worktree that no longer exists, so
+> `Checker.owns` returned false for every session from that day on and the heading was unlandable by
+> anyone. It is filed now only because [`docs/LEDGER-GATE.md`](LEDGER-GATE.md) carries an owner-ruled
+> recovery -- recreate a worktree at the recorded path -- which restores the condition the gate tests
+> rather than bypassing it.
+> Verdict: build
+> Research: none
+> Closing-act: code
+
+**Cluster:** coordination tooling / ledger integrity. **Priority:** P2. **Verdict:** build.
+**Severity:** no engine, PHI or deployment axis (sec. 0). Nothing ships in the wheel. **The cost is a
+subject that deserved filing and silently cannot be**, which is invisible to every screen that reads
+the ledger.
+
+**MECHANISM.** `Checker.owns` compares the recorded worktree path to the committing one by casefolded
+string equality, with no fallback. `alloc.ps1` exposes `-List`, `-ShowFloor`, `-Kind` and `-Title` and
+**no release, reassign, revoke or transfer verb.** A *claim* rehomes -- release from the holder, take
+in the new tree. **An allocation cannot, because there is no verb at either end.** So a number whose
+worktree is removed is uncommittable by every seat, permanently, with nothing reporting it.
+
+**THE POPULATION, measured by the cleaner 2026-08-30 with four controls stated, and the split is the
+part that matters:**
+
+| | |
+|---|---|
+| alloc records carrying a `worktree` field | 489 of 489 |
+| registered worktrees | 257, of which 23 are named in an alloc record |
+| **hold allocations and have no live session** | **22 of those 23** |
+| backlog allocations naming an unregistered path | 411 |
+| of those, **already filed** -- allocation spent, path irrelevant | **368, NO LOSS** |
+| of those, **no filed row** -- already permanently uncommittable | **43** |
+
+**THE RAW 411 IS NOT THE LOSS AND MUST NOT BE QUOTED AS ONE.** An allocation whose row is already on
+`main` has done its whole job; that its worktree later vanished costs nothing. The cleaner refused to
+publish the alarming figure without the split, which is the right call and is why the number here is
+43 rather than 411. The dispatcher independently confirmed the split on one path it had warned about:
+ten numbers, five filed and safe, five not.
+
+**WHAT THIS ROW DOES NOT ASK FOR, ruled by the dispatcher and worth stating so a builder does not
+build the wrong thing: DO NOT ADD A RELEASE VERB TO RESCUE THE EXISTING 43.** A burned number costs
+nothing -- the allocator moves on and a gap in the sequence is cosmetic. **What costs something is a
+subject that deserved a row and never got one.** The remedy for the 43 is ordinary triage: read their
+alloc titles, re-file the subjects that still matter under fresh numbers, leave the old numbers burned.
+
+**SO THE ASK IS ABOUT THE FUTURE, and it names an outcome rather than a mechanism** -- the builder
+judges which. Make an allocation recoverable or transferable when its worktree dies; **or** stop the
+gate keying entitlement on a path that can vanish; **or** have the allocator warn at allocation time
+that the number is bound to a mortal path. Prevention already exists in one direction:
+`scripts/worktree/remove.ps1` refuses a removal while the worktree owns an unlanded number, and a
+cannot-tell reads as at-risk. **That guard does not cover a worktree removed by any other means**,
+which is how these 43 arose.
+
+**A STANDING CONSEQUENCE THAT IS NOT PART OF THE FIX, and it is the dangerous half.** Those 22
+worktrees are a **do-not-remove set**. Every signal a residue sweep reads says *safe* -- no live
+session, clean tree, dead occupant -- and **all of them are blind to the allocations inside.** Nobody
+is proposing removing them; this is recorded because the next cleanup will not know to ask.
+
+**PROVENANCE.** Allocated 2026-08-17 to a worktree at `MessageFoundry-gate-status-null`, now absent
+from disk and unregistered. Population measured by the cleaner; the spent-versus-at-risk split and the
+ruling on the 43 are the dispatcher's, which verified the split independently on one path; filed by
+the lander from a worktree recreated at the recorded path under the owner-ruled recovery. **The row
+describing this defect spent thirteen days inside the population it describes.**

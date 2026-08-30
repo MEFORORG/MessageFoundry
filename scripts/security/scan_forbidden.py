@@ -1026,8 +1026,115 @@ def _parse_require_flag(argv: list[str]) -> tuple[bool, int | dict[str, int] | N
 _TRUTHY = frozenset({"1", "true", "yes", "on"})
 
 
+#: A section small enough that a RATIO cannot express drift. Growth from 1 to 2 is 50% however
+#: healthy it is, so at these sizes a ratio measures the section's SIZE rather than the floor's
+#: staleness. Measured 2026-08-26 against the live list: site_prefixes floor 1 / loaded 2 scores 50%
+#: and would fail an 80% rule on its first run while nothing is actually wrong.
+_SMALL_SECTION_MAX = 4
+#: For a small section, the floor may lag the loaded count by at most this many detectors. One is
+#: deliberate: it admits today's 1-against-2 and refuses 1-against-3.
+_MAX_ABSOLUTE_LAG = 1
+#: For every other section, the floor must be at least this share of what actually loaded.
+_MIN_FLOOR_RATIO = 0.8
+
+
+def floor_freshness_failure(
+    min_detectors: dict[str, int] | None, counts: dict[str, int] | None = None
+) -> str | None:
+    """Has the FLOOR fallen behind the token list it is supposed to guard? (BACKLOG #1368, SEC-04)
+
+    ``token_floor_failure`` answers the opposite question -- did the LIST fall below the FLOOR -- and
+    catches a token source that is truncated or misconfigured. It cannot see the other direction: a
+    list that grows while the floor stays put still passes, and the floor quietly stops meaning
+    anything. A floor of 7 against a list of 40 is satisfied by any 7 detectors surviving.
+
+    TWO RULES, BECAUSE ONE SHAPE DOES NOT FIT BOTH SIZES. Above ``_SMALL_SECTION_MAX`` a ratio is the
+    honest measure. At or below it a ratio is dominated by the section's size -- see the constant --
+    so the rule is an absolute lag instead.
+
+    Returns None when the floor is still fresh, else a sentence naming the section and both numbers.
+    NEVER returns or logs token CONTENT: every value here is a count.
+    """
+    if not min_detectors:
+        return None
+    counts = loaded_token_counts() if counts is None else counts
+    stale: list[str] = []
+    for section, floor in sorted(min_detectors.items()):
+        loaded = counts.get(section, 0)
+        if loaded <= floor:
+            continue  # at or below the floor is token_floor_failure's question, not this one
+        if loaded <= _SMALL_SECTION_MAX:
+            if loaded - floor > _MAX_ABSOLUTE_LAG:
+                stale.append(f"{section} floor {floor} lags {loaded} loaded by {loaded - floor}")
+        elif floor < _MIN_FLOOR_RATIO * loaded:
+            stale.append(
+                f"{section} floor {floor} is {floor / loaded:.0%} of {loaded} loaded "
+                f"(needs {_MIN_FLOOR_RATIO:.0%})"
+            )
+    if not stale:
+        return None
+    return (
+        f"detector floor has fallen behind the token list ({'; '.join(stale)}). The floor still "
+        "passes, which is the problem: it no longer constrains the list it guards. Raise "
+        "MEFOR_MIN_DETECTORS in .github/workflows/security.yml and branch-leak-scan.yml to match "
+        "what actually loads, in the same change that grew the list."
+    )
+
+
+def _detector_count_report(counts: dict[str, int]) -> list[str]:
+    """Machine-readable counts AND the load MODE, one ``key=value`` per line.
+
+    THE MODE IS THE POINT AND THE COUNTS ARE NOT SUFFICIENT. The synthetic example set and the real
+    list can report the SAME three numbers -- measured 2026-08-26, both 8/14/2 -- so a caller checking
+    counts alone cannot tell which table it just measured, and would happily assert a floor against a
+    set that matches nothing real. `mode` is the only field that discriminates.
+    """
+    if not TOKENS_PRESENT:
+        mode = "none"
+    elif is_synthetic_token_set():
+        mode = "synthetic"
+    else:
+        mode = "real"
+    return [f"mode={mode}"] + [f"{k}={v}" for k, v in sorted(counts.items())]
+
+
 def main(argv: list[str]) -> int:
     reload_tokens()
+    # SEC-04 / BACKLOG #1368. Both are read BEFORE the require/floor parsing below, because each is a
+    # terminal mode that reports and exits rather than scanning.
+    if "--print-detector-counts" in argv:
+        for line in _detector_count_report(loaded_token_counts()):
+            print(line)
+        return 0
+    if "--assert-floor-fresh" in argv:
+        spec = os.environ.get("MEFOR_MIN_DETECTORS", "").strip()
+        if not spec:
+            print(
+                "scan_forbidden: --assert-floor-fresh needs MEFOR_MIN_DETECTORS set; refusing rather "
+                "than passing vacuously.",
+                file=sys.stderr,
+            )
+            return 2
+        try:
+            parsed = parse_min_spec(spec)
+        except ValueError as exc:
+            print(f"scan_forbidden: MEFOR_MIN_DETECTORS: {exc}", file=sys.stderr)
+            return 2
+        if not isinstance(parsed, dict):
+            print(
+                "scan_forbidden: --assert-floor-fresh needs a PER-SECTION floor "
+                "(names=N,estate=N,site_prefixes=N); a single total cannot say which section drifted.",
+                file=sys.stderr,
+            )
+            return 2
+        for line in _detector_count_report(loaded_token_counts()):
+            print(line)
+        why = floor_freshness_failure(parsed)
+        if why is not None:
+            print(f"scan_forbidden: {why}", file=sys.stderr)
+            return 1
+        return 0
+
     show_context = "--show-context" in argv
     rest = [a for a in argv if a != "--show-context"]
     try:

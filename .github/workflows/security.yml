@@ -100,7 +100,12 @@ jobs:
           # stay out of the four exports above (and out of the SBOM / image locks / audited runtime).
           uv export --only-group ci-scanners --format requirements.txt -o ci/locks/ci-scanners.lock
           uv export --only-group ci-quality --format requirements.txt -o ci/locks/ci-quality.lock
-          git diff --exit-code -- requirements.lock docker/locks/requirements-core.lock docker/locks/requirements-sqlserver.lock constraints.lock ci/locks/ci-scanners.lock ci/locks/ci-quality.lock
+          # The RELEASE SIGNING toolchain (BACKLOG #332). Same mechanism as the two above, and it is
+          # here rather than inline in release.yml because release.yml runs ONLY on a tag push -- so a
+          # drift that lived there would first be observed during a release. Exported on every
+          # security run instead, where it is cheap to catch.
+          uv export --only-group release-tools --format requirements.txt -o ci/locks/release-tools.lock
+          git diff --exit-code -- requirements.lock docker/locks/requirements-core.lock docker/locks/requirements-sqlserver.lock constraints.lock ci/locks/ci-scanners.lock ci/locks/ci-quality.lock ci/locks/release-tools.lock
       - name: Install from the hashed lockfile (DEP-1)
         run: |
           # --require-hashes enforces a hash for every requirement (the lockfile carries them): a
@@ -663,7 +668,15 @@ jobs:
         # passed with a green tick, and losing just the final line silently disabled every site-code
         # detector. The floor is PER-SECTION, not a bare total -- a total is a SUM, so growth in a cheap
         # section masks collapse in an expensive one (names 7->1 alongside estate 13->19 still totals 21).
-        # It is a FLOOR: adding tokens needs no CI change, losing them fails the build.
+        # It is a FLOOR: losing tokens fails the build.
+        #
+        # ADDING them USED TO need no CI change, and that is no longer quite true (BACKLOG #1368,
+        # SEC-04). A floor only constrains the list while it stays near it: 7 against a list of 40 is
+        # satisfied by any 7 detectors surviving, so the gate goes green while guarding almost nothing,
+        # and NOTHING NOTICED because the counts print and nothing compared them. The step below now
+        # fails when the floor falls behind, so growth is free until it outruns the floor and then asks
+        # for one line. That is a deliberate trade of convenience for a floor that keeps meaning
+        # something.
         #
         # zizmor: the secret is never interpolated into this run: body. It arrives as the step-level env
         # var (an opaque value, not an Actions-expression sink).
@@ -677,7 +690,7 @@ jobs:
             # the env var first, so that file would never be read -- it would only drop the full real
             # token list into the job workspace for every later step to see.
             export MEFOR_REQUIRE_TOKENS=1
-            export MEFOR_MIN_DETECTORS=names=7,estate=13,site_prefixes=1
+            export MEFOR_MIN_DETECTORS=names=8,estate=14,site_prefixes=2
             echo "token list loaded from the MEFOR_FORBIDDEN_TOKENS secret (fail-closed, per-section floor)."
           elif [ "$IS_FORK_PR" = "true" ]; then
             echo "fork PR -- the secret is unavailable BY DESIGN; structural-only scan."
@@ -689,3 +702,15 @@ jobs:
             exit 2
           fi
           python scripts/security/scan_forbidden.py --path .
+
+          # SEC-04 / BACKLOG #1368 -- is the FLOOR still tracking the list? The scan above asks whether
+          # the LIST fell below the FLOOR; this asks the opposite, which nothing did before.
+          #
+          # GUARDED ON THE FLOOR VARIABLE, NOT ON THE SECRET, and only the secret-present branch above
+          # exports it -- so a fork PR and a structural-only run skip this entirely. It must NOT run
+          # against the synthetic example set: that set populates every section and would fail the
+          # freshness rule on a contributor's machine, and a gate that fires on everyone gets switched
+          # off by the third person who hits it.
+          if [ -n "$MEFOR_MIN_DETECTORS" ]; then
+            python scripts/security/scan_forbidden.py --assert-floor-fresh
+          fi

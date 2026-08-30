@@ -706,8 +706,18 @@ def test_the_cla_allowlist_is_an_enumeration_and_not_a_glob() -> None:
     """THE ASYMMETRY, and a recorded finding rather than a hypothetical: a `bot*` glob would let any
     human whose username begins with "bot" skip signing (review low-28). The allowlist is legitimate
     and must keep working -- so this asserts its SHAPE, not its absence."""
-    step = next(s for s in jobs_of("cla.yml")["cla"]["steps"] if "with" in s)
-    allowlist = str(step["with"]["allowlist"])
+    # SELECT THE STEP BY WHAT IT IS, NOT BY "it happens to have a with block". The original
+    # selector took the FIRST step carrying `with`, which was the CLA action only because no
+    # earlier step had one. Adding `persist-credentials: false` to the checkout step above it
+    # made the checkout match first and this test died on KeyError: 'allowlist' -- reading a
+    # step it was never meant to read. It had been passing on step ORDER, not identity.
+    steps = jobs_of("cla.yml")["cla"]["steps"]
+    candidates = [s for s in steps if "allowlist" in (s.get("with") or {})]
+    assert len(candidates) == 1, (
+        f"expected exactly ONE step in cla.yml carrying an `allowlist`, found {len(candidates)}; "
+        "this test asserts the shape of THAT allowlist and cannot pick between several"
+    )
+    allowlist = str(candidates[0]["with"]["allowlist"])
     assert allowlist.strip(), (
         "the CLA allowlist emptied; every maintainer push would need a signature"
     )
