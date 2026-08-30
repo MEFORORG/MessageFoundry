@@ -61,6 +61,14 @@ def shallow_ledger(ledger: Path, tmp_path: Path) -> Path:
         str(dest),
         cwd=tmp_path,
     )
+    # A CLONE INHERITS NO IDENTITY. user.email and user.name are per-repo, live in .git/config, and
+    # clone copies none of them -- so a fixture that COMMITS into this clone succeeds on a developer
+    # box off the GLOBAL identity and exits 128 on a runner that has none. That is exactly how this
+    # reached CI: green locally, `git commit` 128 there. The two fixtures that `git init` set identity
+    # explicitly; this one had nothing to inherit and nobody noticed, because the machine that ran it
+    # supplied the missing value invisibly.
+    git("config", "user.email", "t@example.com", cwd=dest)
+    git("config", "user.name", "t", cwd=dest)
     return dest
 
 
