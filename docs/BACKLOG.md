@@ -17383,7 +17383,7 @@ a gate whose failure is silent until the expensive moment.
 `:346` the early return; the `head - base` loop at ~`:370`; and both ownership arms reading
 `elif not self.ci and not self.owns(...)` at `:296` and `:385`. **CI passes `--ci`, so the ownership arm
 never runs there** -- this is a local-commit constraint only and the branch can still merge on GitHub,
-the same local-versus-CI divergence #1395 records.
+the same local-versus-CI divergence recorded by the unlanded row on the ungated sequencer -- **named by subject rather than by number, because that row is allocated but not yet on `main`, and a citation to a still-issuable number resolves to nothing today and to unrelated work the day it is issued.**
 
 **NOT A SEPARATE ROW, DELIBERATELY.** The consequence that an existing row is refused like a new one is
 the intersection of this row's mechanism with **#1293** (removing a worktree orphans every unlanded
