@@ -453,20 +453,37 @@ function Get-GitTargetCandidatesRaw([string]$Line, [string]$Prefix, [string]$Cwd
     } elseif ($Line -cmatch $dashCPattern) {
         $dashCs = @($Matches[1])
     }
+    # COLLECTED SEPARATELY RATHER THAN PUSHED STRAIGHT INTO $out (BACKLOG #1379 class one). These
+    # used to land in $out here, ahead of everything, and the caller takes the first candidate git
+    # ANSWERS on -- so a `-C` naming any real directory always answered and the `--git-dir` that
+    # actually decides the repository was never asked. Ranking them needs both lists in hand, so the
+    # assembly moved to the bottom and this branch only gathers.
+    $dashCOut = @()
     if ($dashCs.Count -gt 0) {
         foreach ($dashC in $dashCs) {
             if ($cd -and -not [System.IO.Path]::IsPathRooted($dashC)) {
                 # Join, never replace. The result stays RAW and possibly relative (`../Unrelated/.`); the
                 # caller roots it with Get-FullPathRaw against the session cwd, which is the same base the
                 # shell would use for the `cd` itself, so a relative `cd` composes correctly too.
-                $out += (Join-Path $cd $dashC)
+                $dashCOut += (Join-Path $cd $dashC)
             } else {
-                $out += $dashC
+                $dashCOut += $dashC
             }
         }
         $emitBase = [bool]$BaseFallback
     } else {
         $emitBase = $true
+    }
+
+    # THE POST-`-C` DIRECTORY, which is what a RELATIVE `--git-dir` resolves against. MEASURED, not
+    # reasoned, against real git: `git -C A --git-dir=.git config k v` writes to A's config, and the
+    # session cwd has no `.git` at all. Composing a relative `--git-dir` against the `cd` prefix alone
+    # -- which is what the promotion below did -- names a repository the command never touches.
+    # `-C` options are CUMULATIVE in git, so the effective directory is the fold of them in order over
+    # the `cd` base; the last element of the walk is that directory.
+    $postC = $cd
+    foreach ($dashC in $dashCs) {
+        $postC = $(if ($postC -and -not [System.IO.Path]::IsPathRooted($dashC)) { Join-Path $postC $dashC } else { $dashC })
     }
 
     # ===================================================================================================
@@ -526,7 +543,9 @@ function Get-GitTargetCandidatesRaw([string]$Line, [string]$Prefix, [string]$Cwd
         $hits = @([regex]::Matches($Line, $pat) | ForEach-Object { $_.Groups[1].Value })
         [array]::Reverse($hits)
         foreach ($hit in $hits) {
-            $rooted = $(if ($cd -and -not [System.IO.Path]::IsPathRooted($hit)) { Join-Path $cd $hit } else { $hit })
+            # $postC, NOT $cd: a relative `--git-dir` resolves against the post-`-C` directory. With no
+            # `-C` on the line $postC IS $cd, so a line without one is unchanged.
+            $rooted = $(if ($postC -and -not [System.IO.Path]::IsPathRooted($hit)) { Join-Path $postC $hit } else { $hit })
             $promoted += $rooted
             $promoted += (Join-Path $rooted "..")
         }
@@ -541,7 +560,22 @@ function Get-GitTargetCandidatesRaw([string]$Line, [string]$Prefix, [string]$Cwd
     # control as -AllTargets, and for the same reason: two earlier attempts at this rule were rejected
     # for changing behaviour a caller did not ask for.
     if ($ExplicitFirst) {
+        # PROMOTED FIRST, AHEAD OF `-C` (BACKLOG #1379 class one). `--git-dir` DECIDES which repository
+        # is written, regardless of where it sits relative to `-C` -- measured against real git twice,
+        # reading the value back rather than trusting a verdict:
+        #     git -C A --git-dir=B/.git config k v   -> lands in B
+        #     git -C A --git-dir=.git   config k v   -> lands in A
+        # ONE ROOT CAUSE, SYMPTOMS IN BOTH DIRECTIONS, which is why this is a reorder and not a
+        # widening -- the same shape as the base-versus-explicit defect this block already documents:
+        #   FAIL-OPEN   ungoverned `-C`, governed `--git-dir` -> ALLOWED, and the write really lands
+        #               in the governed shared config.
+        #   FALSE DENY  governed `-C`, ungoverned `--git-dir` -> DENIED, naming a repository the write
+        #               never touches. Both were live; a fix that only added denials would close the
+        #               first and deepen the second.
+        # `-C` STILL EMITS, behind the promoted tokens, because with no `--git-dir` on the line it is
+        # the right answer and $promoted is empty -- so such a line is byte-identical to before.
         $out += $promoted
+        $out += $dashCOut
         if ($emitBase) { $out += $(if ($cd) { $cd } else { $CwdRaw }) }
         $out += $explicit
     } else {
@@ -549,6 +583,9 @@ function Get-GitTargetCandidatesRaw([string]$Line, [string]$Prefix, [string]$Cwd
         # base, where it cannot win" was wrong: rules 3 and 3d walk the whole list, so GIT_DIR reached
         # callers that never opted in and turned `GIT_DIR=<governed> git clean -fd` from ALLOW into
         # DENY. Byte-identical to the pre-change list is the only safe meaning of opt-in.
+        # The `-C` candidates lead here exactly as they always did -- #1379's reorder is opt-in too,
+        # for the same blast-radius reason, so rules 3 and 3d see the list they saw before.
+        $out += $dashCOut
         if ($emitBase) { $out += $(if ($cd) { $cd } else { $CwdRaw }) }
         $out += $explicit
     }
