@@ -7,6 +7,12 @@ venv/
 build/
 dist/
 
+# Exception: a vendored GitHub Action's compiled output belongs in the repo, not a build artifact.
+# Without this, `dist/` above silently drops .github/actions/cla-assistant-lite/dist/index.js from
+# every `git add`, which would ship a workflow that references a file that was never committed.
+!/.github/actions/**/dist/
+!/.github/actions/**/dist/**
+
 # Engine runtime data (PHI may live here — never commit)
 *.db
 *.db-wal

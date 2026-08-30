@@ -803,12 +803,15 @@ returns a setup key + `otpauth://` URI for an authenticator app, `POST /me/mfa/c
 returns the **single-use recovery codes** (shown once), and `POST /auth/mfa-verify` satisfies a session's
 second factor with a TOTP code or a recovery code. `DELETE /me/mfa` disables it; an administrator clears a
 lost authenticator via `POST /users/{id}/reset-mfa` (which also revokes the user's sessions). With
-`[auth].require_mfa` on — **the default since BACKLOG #187 (secure-by-default, including the loopback
-bind)** — the **Administrator** role must satisfy MFA before any step-up operation (the gate returns
-`403` + `X-MFA-Required` until verified); other users may opt in by enrolling. A required-but-unenrolled
+`[security].require_mfa` on — **the default since BACKLOG #187 (secure-by-default, including the
+loopback bind)** — **every local account** must satisfy MFA: the scope is `every_local_account` by
+default, and `administrators` narrows it to the **Administrator** role. It is an **access gate, not
+only a step-up gate** — the gate returns `403` + `X-MFA-Required: 1` on **every** authorized route
+until verified (console twin: a 303 to `/ui/mfa`), with the account and factor-enrolment routes
+exempt so an un-enrolled user is not stranded. A required-but-unenrolled
 admin is never locked out — the enroll/confirm routes sit behind an action-bound **password** step-up,
 not the MFA gate, so the bootstrap admin enrolls then satisfies it. The documented org opt-out is
-`[auth].require_mfa = false`. **AD/Kerberos MFA is delegated to the directory** (Entra Conditional Access
+`[security].require_mfa = false` (the retired `[auth].require_mfa` spelling is refused at load). **AD/Kerberos MFA is delegated to the directory** (Entra Conditional Access
 / an MFA proxy) — a directory login is never prompted for an engine TOTP and is MFA-satisfied at issuance.
 The TOTP secret is stored **encrypted at rest** (the store cipher) and recovery codes are
 **argon2id-hashed**; verification uses the server clock and a constant-time compare over a **configurable
@@ -1375,7 +1378,7 @@ timeout** (default 30 min) and an **absolute lifetime** (default 12 h); changing
 disabling a user, or an **AD-group/role change on re-login** revokes that user's sessions. These two
 defaults align the session controls with **NIST SP 800-63B §7.2** reauthentication at **AAL2** — a
 **12-hour** maximum session length enforced regardless of activity, plus reauthentication after **30
-minutes** of inactivity; raising `[auth].session_absolute_hours` or `[auth].session_idle_timeout_minutes`
+minutes** of inactivity; raising `[security].max_session_hours` or `[security].sign_out_after_idle_minutes`
 beyond those bounds is a **documented risk deviation** from AAL2, not a supported hardening knob, and
 any such increase should be recorded as an accepted risk. Session
 validation **fails closed on a backward wall-clock step** (NTP step-back / VM snapshot revert) rather
