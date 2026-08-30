@@ -73,8 +73,12 @@ _MIRRORS: dict[str, str] = {
     "actionlint": r"\bactionlint\s+-shellcheck=",
 }
 
-#: Already pinned by tests/test_lint_scope_parity.py. Named so the split is visibly deliberate and so
-#: the exhaustiveness arm below can account for all eleven.
+#: The file the three hooks below are pinned by. Kept as a PATH, not just named in prose, so the
+#: deferral can be CHECKED -- see test_the_sibling_this_file_defers_to_still_exists.
+_SIBLING = _ROOT / "tests" / "test_lint_scope_parity.py"
+
+#: Already pinned by _SIBLING. Named so the split is visibly deliberate and so the exhaustiveness arm
+#: below can account for all eleven.
 _COVERED_ELSEWHERE = frozenset({"ruff-format", "ruff-check", "bandit"})
 
 
@@ -87,8 +91,15 @@ def _workflow_lines() -> list[tuple[str, int, str]]:
     """Every workflow line that is NOT a YAML comment, as (file, lineno, stripped).
 
     Comment lines are dropped because a mirror mentioned only in a comment is not a mirror. That
-    distinction is not hypothetical: BACKLOG #1389 was filed against a CI guard whose supporting
-    evidence cited two COMMENT lines as though they were the run line.
+    distinction is not hypothetical, and the live instance is in this repo, not in a ledger row:
+    ``.github/workflows/ci.yml`` carries a COMMENT reading "--baseline is what makes this step able
+    to FAIL", and ``tests/test_username_access_key_screen.py`` asserts ``"--baseline" in ci`` over
+    the raw file text -- so THAT assertion is satisfied by the comment and would stay green with the
+    run line deleted.
+
+    ***THE RULE IS PROPHYLACTIC FOR THE EIGHT ARMS, NOT LOAD-BEARING, AND SAYING SO IS THE POINT.***
+    Measured 2026-08-29 over the workflows: ZERO comment lines match ANY pattern in ``_MIRRORS``
+    (control: a fabricated pattern also returns zero, so the search can return no).
     """
     out: list[tuple[str, int, str]] = []
     for path in sorted(_WORKFLOWS.glob("*.yml")):
@@ -104,6 +115,36 @@ def _workflow_body() -> str:
     return "\n".join(s for _f, _n, s in _workflow_lines())
 
 
+def _run_blocks() -> list[tuple[str, str]]:
+    """Every ``run:`` step's RESOLVED command, as (file, the string the shell actually receives).
+
+    A SECOND corpus beside ``_workflow_lines()``, and the reason is narrow: the ``--baseline`` arm
+    below is a CONJUNCTION over ONE command -- this script, with this flag, with this value -- and a
+    LINE corpus cannot express "the same command" once the command is a folded block scalar. The
+    real invocation is ``run: >-`` with the script on one line and ``--baseline <path>`` alone on the
+    next, so the only line carrying the flag carries no tool name. A per-line regex there would pin a
+    bare fragment, and would red on a re-wrap that changes nothing about what runs. ``yaml.safe_load``
+    hands back the joined string, so a re-wrap is invisible and a decoy in a DIFFERENT step cannot
+    satisfy the conjunction.
+    """
+    out: list[tuple[str, str]] = []
+
+    def walk(node: object, name: str) -> None:
+        if isinstance(node, dict):
+            run = node.get("run")
+            if isinstance(run, str):
+                out.append((name, run))
+            for value in node.values():
+                walk(value, name)
+        elif isinstance(node, list):
+            for value in node:
+                walk(value, name)
+
+    for path in sorted(_WORKFLOWS.glob("*.yml")):
+        walk(yaml.safe_load(path.read_text(encoding="utf-8")), path.name)
+    return out
+
+
 def test_the_fixtures_are_not_empty() -> None:
     """CONTROL. Every assertion below has the shape "X appears in the workflows", and an empty corpus
     satisfies none of them honestly -- it fails them for the wrong reason or, worse, a mistyped path
@@ -117,6 +158,9 @@ def test_the_fixtures_are_not_empty() -> None:
         "workflow directory looks empty or misresolved"
     )
     assert len(_workflow_lines()) > 500, "workflow corpus did not load"
+    # The run-block corpus needs the same control as the line corpus: a walk that quietly returns
+    # nothing makes every `all(...)` over it vacuously true, which is the failure this arm exists for.
+    assert len(_run_blocks()) > 50, "workflow run-step corpus did not load (measured 180)"
     assert len(_hook_ids()) >= 10, "pre-commit config parsed to too few hooks"
 
 
@@ -136,6 +180,32 @@ def test_this_file_and_its_sibling_together_cover_every_hook() -> None:
     )
     stale = accounted - declared
     assert not stale, f"{sorted(stale)} are named by these tests but no longer exist as hooks"
+
+
+def test_the_sibling_this_file_defers_to_still_exists() -> None:
+    """``_COVERED_ELSEWHERE`` is a claim about ANOTHER FILE, and nothing here used to open it.
+
+    Measured: move ``tests/test_lint_scope_parity.py`` away entirely and this file stayed at 13
+    passed, with three of the eleven hooks still reported covered by a file the repo no longer had.
+    An assertion that cannot fail is the defect this whole family of tests exists to catch, and it
+    was sitting one level up, inside the catcher.
+
+    ***WHAT THIS ARM DOES NOT DO, STATED HERE RATHER THAN DISCOVERED LATER: it checks that the file
+    EXISTS and still NAMES each id. It cannot tell an assertion from a mention.*** Measured on the
+    same file: delete every arm that binds ``bandit`` to its CI mirror and several lines still say
+    "bandit", so that mutation stays green here. Closing it needs the sibling to publish what its
+    arms actually exercise -- a change to the sibling, not to this file.
+    """
+    assert _SIBLING.is_file(), (
+        f"{_SIBLING} does not exist, so _COVERED_ELSEWHERE defers {sorted(_COVERED_ELSEWHERE)} to a "
+        f"file this repo no longer has and the exhaustiveness arm above is vacuous for all three."
+    )
+    text = _SIBLING.read_text(encoding="utf-8")
+    unnamed = sorted(h for h in _COVERED_ELSEWHERE if h not in text)
+    assert not unnamed, (
+        f"{_SIBLING.name} no longer names {unnamed}, so their CI mirror is pinned by NEITHER file -- "
+        f"not here (deliberately) and not there. Add them to _MIRRORS here, or restore the arms there."
+    )
 
 
 @pytest.mark.parametrize("hook_id", sorted(_MIRRORS))
@@ -174,23 +244,61 @@ def test_the_discriminating_flags_still_match() -> None:
     body = _workflow_body()
 
     # username-access-key -- the baseline path decides which sites are exempt.
+    #
+    # ***ANCHORED ON THE STEP'S RESOLVED COMMAND, NOT ON A BARE PATH AND NOT ON ONE LINE.*** This was
+    # `assert baseline in body` -- a substring over every non-comment line of all the workflows, the
+    # exact shape _MIRRORS was fixed to abandon further up. Two mutations left it GREEN: renaming the
+    # flag on the real run line, and deleting the flag while the path appears in some `paths:` filter.
+    # The screen makes that silent by design: `username_access_key_screen.py` hand-parses argv and
+    # returns 0 when no --baseline was given, so a mirror that loses the flag CANNOT FAIL.
+    #
+    # A per-line regex was REJECTED, not overlooked. The real invocation is a folded scalar, so the
+    # one line carrying the flag carries no tool name -- and the per-line form reds on ordinary
+    # spellings this corpus already uses: `--flag=value`, a quoted value, a re-wrap, a hoisted var.
+    # Requiring the three tokens in ONE resolved command tolerates all four and still refuses a decoy
+    # sitting in a different step.
+    #
+    # `all`, not `any`: baseline-less means cannot-fail, so a SECOND invocation without the flag is a
+    # step that reads as coverage and produces none.
     entry = str(hooks["username-access-key"].get("entry", ""))
     match = re.search(r"--baseline\s+(\S+)", entry)
     assert match, "the username-access-key hook no longer passes --baseline; update this test"
     baseline = match.group(1)
-    assert baseline in body, (
-        f"CI does not pass the hook's baseline {baseline!r}, so the two screens now exempt different "
-        f"sites while both report green."
+    invocations = [
+        (f, run) for f, run in _run_blocks() if re.search(_MIRRORS["username-access-key"], run)
+    ]
+    assert invocations, (
+        "no workflow `run:` step invokes username_access_key_screen.py at all, so its CI mirror is "
+        "gone and on a rebase-created commit this screen runs NOWHERE."
+    )
+    unbaselined = sorted(
+        f"{f}: {run[:70].strip()!r}"
+        for f, run in invocations
+        if not (re.search(r"--baseline\b", run) and baseline in run)
+    )
+    assert not unbaselined, (
+        f"a workflow step runs username_access_key_screen.py without --baseline {baseline!r}: "
+        f"{unbaselined}. EITHER the CI mirror lost the flag or its value -- the screen then returns 0 "
+        f"for every input, so the two screens exempt different sites while both report green -- OR a "
+        f"second, deliberately advisory invocation was added, which is a step that cannot fail. The "
+        f"blocking one is the 'Username-as-access-key screen' step in .github/workflows/ci.yml."
     )
 
     # actionlint -- "-shellcheck=" disables the shellcheck integration. If only one side sets it the
     # two disagree about what counts as a finding.
+    #
+    # ***THE GUARD IS GONE AND THE CI HALF IS NOT RESTATED HERE.*** `if hook sets it: assert CI sets
+    # it` could see CI drop the flag and NOT the hook dropping it while CI kept it -- the same
+    # divergence, in the direction nothing watched. And the CI half was a substring COPY of
+    # _MIRRORS["actionlint"], which already REQUIRES `-shellcheck=` on the invocation, so
+    # test_each_hook_has_a_real_ci_invocation[actionlint] IS the CI half. One rule, one definition.
     args = [str(a) for a in (hooks["actionlint"].get("args") or [])]
-    if any("-shellcheck=" in a for a in args):
-        assert "actionlint -shellcheck=" in body, (
-            "the hook disables actionlint's shellcheck integration and CI does not; they will "
-            "disagree on findings."
-        )
+    assert any("-shellcheck=" in a for a in args), (
+        "the actionlint hook no longer disables shellcheck while the CI step still does (pinned by "
+        "_MIRRORS['actionlint']), so the two now disagree about what counts as a finding. Restore the "
+        "arg -- or, if enabling shellcheck on BOTH sides is the intent, change _MIRRORS['actionlint'] "
+        "in the same commit so the mirror arm still describes what CI runs."
+    )
 
     # forbidden-content -- the hook fails closed via --require-tokens. pre-commit can pass args to a
     # hook but cannot set env for one, so CI uses the env form instead; the script's own docstring
