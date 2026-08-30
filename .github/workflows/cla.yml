@@ -57,6 +57,20 @@ jobs:
       # action needs only its own vendored source, which the base already carries.
       - name: Check out the base, so the vendored local action resolves
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # The step above deliberately checks out the BASE, not the head, so fork code never runs
+          # with this workflow's write scope. `persist-credentials: false` closes the other half:
+          # without it, checkout writes the job's token into .git/config, where any later step --
+          # or anything that can read the workspace -- could use it against the signature branch.
+          # Zizmor calls this `artipacked`. It is a low finding in general and worth more here,
+          # because this job holds `contents: write` on a `pull_request_target` trigger.
+          #
+          # SAFE, AND MEASURED RATHER THAN ASSUMED. The vendored action is a node20 action that
+          # takes GITHUB_TOKEN through `env:` and talks to the REST API; it never shells out to
+          # git, so it does not read these credentials. Against dist/index.js: ZERO matches for
+          # child_process|execSync|spawnSync|simple-git, against 357 for octokit/api.github.com.
+          # It needs the action's FILES on disk, which this checkout still provides.
+          persist-credentials: false
 
       - name: CLA Assistant
         if: >-

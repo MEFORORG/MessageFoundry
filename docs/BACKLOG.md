@@ -13424,7 +13424,7 @@ measurement from this row's subject and it is named here rather than performed.*
 
 ## 1269. the seat clock has no external alarm, and the obvious implementation reads healthy at the moment it should fire
 
-> 🔢 **Re-scored 2026-08-20 -> P2.** Value **5/10** · Difficulty **4/10** · _fill-in_. The serial re-arm chain has no independent observer inside anything this repository ships, so its death stays silent by construction. Value is moderate because this is fleet tooling with no product axis and peer messaging partly substitutes; difficulty reflects that the naive implementation is wrong in two measured ways, so the build must carry tick-identity dedupe, the suppression exclusion, a pinned absolute path, the throttle-age consistency check, and the discriminating test that fires on a fresh file missing the watched seat. _(previously unscored.)_
+> ✅ **SHIPPED -- verified on main 2026-08-29 at f6c96b3b1: the row's own discriminating measurement re-run, where the shipped alarm reports ABSENT on a watched worktree missing from a fresh state file while the freshness-only build it replaces reds only that single arm of 21.** Landed at 0ba326a12, PR #557, 2026-08-24. _Original filing follows._ **Re-scored 2026-08-20 -> P2.** Value **5/10** · Difficulty **4/10** · _fill-in_. The serial re-arm chain has no independent observer inside anything this repository ships, so its death stays silent by construction. Value is moderate because this is fleet tooling with no product axis and peer messaging partly substitutes; difficulty reflects that the naive implementation is wrong in two measured ways, so the build must carry tick-identity dedupe, the suppression exclusion, a pinned absolute path, the throttle-age consistency check, and the discriminating test that fires on a fresh file missing the watched seat. _(previously unscored.)_
 >
 > **Filed 2026-08-14 - not started. A WATCHDOG CANNOT WATCH ITS OWN DEATH.** The seat clock (Windows task `MEFOR-Seat-Clock`, `PT10M`, 600s ticks against a ~900s mail doorbell, so a 300s margin) is what makes a session's "keep going" duty physically possible -- a turn ends and the session goes idle regardless of intent, and nothing else fires on a timer. **The chain is SERIAL: each tick re-arms the next watcher, so it has ONE LIFE, not many.** One missed re-arm and it is gone, silently, and every seat whose only wake source is the clock goes quiet with it. **Nothing outside the chain currently notices.**
 > **THE ALARM MUST ASSERT BOTH CONDITIONS, AND A FRESHNESS-ONLY CHECK IS THE TRAP THAT MAKES IT WORSE THAN NOTHING:**
@@ -13755,7 +13755,7 @@ runway or give it to nobody.*
 
 ## 1290. connscale CPU-probe process-table walk times out on hosted Windows runners, reddening a required context on main
 
-> 🔢 **Re-scored 2026-08-20 -> P2.** Value **6/10** · Difficulty **3/10** · _quick win_. The deadline and the two-assertion split are unchanged at HEAD, so a loaded hosted runner still reddens a required context and, when it does, the re-resolution assertion below never runs. Value 6 because a required leg that randomly blocks the merge queue is a real gap with only the rerun-the-failed-job workaround the item itself demonstrated, and this is test infrastructure with no engine path; difficulty 3 because the edit is confined to one test file, though its effect can only be confirmed on hosted Windows CI and the walk's failure rate under runner load was never measured. _(previously unscored.)_
+> ✅ **SHIPPED -- verified on main 2026-08-29 at f6c96b3b1: the row's own filed failure mode, re-run against main, now SKIPS with ENUMERATION TIMEOUT after 6 walks spending their whole 5s budget plus a bounded extension to 15s per walk, where at filing it failed the `walked_ok` assertion at test_connscale_cpu_probe.py:309, and the controls still redden -- a walk that fails without spending its budget FAILS, and a walk that succeeds but misses the live child still trips the re-resolution assertion.** Landed at ad6c1b9d7 (PR #598), 2026-08-26. _Original filing follows._ **Re-scored 2026-08-20 -> P2.** Value **6/10** · Difficulty **3/10** · _quick win_. The deadline and the two-assertion split are unchanged at HEAD, so a loaded hosted runner still reddens a required context and, when it does, the re-resolution assertion below never runs. Value 6 because a required leg that randomly blocks the merge queue is a real gap with only the rerun-the-failed-job workaround the item itself demonstrated, and this is test infrastructure with no engine path; difficulty 3 because the edit is confined to one test file, though its effect can only be confirmed on hosted Windows CI and the walk's failure rate under runner load was never measured. _(previously unscored.)_
 >
 > **Filed 2026-08-19 -- not started. A REQUIRED STATUS CHECK IS INTERMITTENTLY RED ON `main`, AND THE TEST THAT FAILS CANNOT ASSESS THE REGRESSION IT EXISTS TO CATCH WHEN IT DOES.** `tests/test_connscale_cpu_probe.py::test_subtree_re_resolution_picks_up_a_late_spawned_child` fails on the `walked_ok` assertion ([`test_connscale_cpu_probe.py:309`](../tests/test_connscale_cpu_probe.py)): the process-table walk returned `None` on **every one of 6 attempts in 30s**, the Windows path allowing 5s per walk. **THE CHANGE: make the walk's deadline survive a loaded hosted runner, or degrade a walk-level timeout to a skip rather than a failure.**
 > **IT IS ON `main`, NOT ON A BRANCH -- that is what makes it a queue problem rather than one PR's problem.** CI run `32255231838`, head `de896e0f`, event `push`, failing job **`test (windows-2022, py3.14)`** -- which is one of the 13 REQUIRED contexts. Every PR that follows inherits the same exposure.
@@ -13814,7 +13814,7 @@ scan-agreement and wiring tests; 22 pass on the reverted baseline.**
 point, which are the parts that must survive it.**
 ## 1292. connscale smoke reports a message acked but not observed at intake, and nothing discriminates harness race from real intake loss
 
-> 🔢 **Re-scored 2026-08-20 -> P2.** Value **7/10** · Difficulty **3/10** · _quick win_. The harness-race branch has been substantially absorbed by the excusal and intake floor at runner.py:869-905, whose comment names this exact flake, but the discriminator the item asks for does not exist -- nothing checks whether an ingress row was written for the message counted lost, so the count-and-log branch is still not ruled out and no other instrument can rule it out. Difficulty is a store lookup wired into the record-building seam plus a test, with both ends of that seam already present (per-send control_id at sender.py:186, per-backend store access at runner.py:373-377). _(previously unscored.)_
+> ✅ **SHIPPED -- verified on main 2026-08-29 at f6c96b3b1: the per-message discriminator the row measured as absent now exists and runs, with sweep_store going from 0 hits at the pre-fix parent 58e710ad4 to 9 on main, the audit verdict appended to the row's own quoted "lost N on intake" failure text at runner.py:877, and tests/test_connscale_smoke.py asserting on every step that no accept-ACKed send is missing from the stopped engine's committed store.** Landed at f8597f4db (full f8597f4dbb3690c7be673e3cd21dc718a0ee6b73), 2026-08-27, PR #599, "fix(test): the intake audit could clear intake over an empty comparison (BACKLOG #1292)"; confirmed an ancestor of origin/main, verified today at f6c96b3b1. _Original filing follows._ **Re-scored 2026-08-20 -> P2.** Value **7/10** · Difficulty **3/10** · _quick win_. The harness-race branch has been substantially absorbed by the excusal and intake floor at runner.py:869-905, whose comment names this exact flake, but the discriminator the item asks for does not exist -- nothing checks whether an ingress row was written for the message counted lost, so the count-and-log branch is still not ruled out and no other instrument can rule it out. Difficulty is a store lookup wired into the record-building seam plus a test, with both ends of that seam already present (per-send control_id at sender.py:186, per-backend store access at runner.py:373-377). _(previously unscored.)_
 >
 > **Filed 2026-08-19 -- not started. THE ASSERTION THAT FIRES NAMES AN ACKED-BUT-UNREAD MESSAGE, AND THAT IS EITHER A HARNESS RECONCILIATION RACE OR A COUNT-AND-LOG VIOLATION. NOBODY HAS SEPARATED THE TWO, AND THEY HAVE VERY DIFFERENT SEVERITIES.** `tests/test_connscale_smoke.py::test_connscale_smoke_end_to_end` trips `assert r.no_loss.ok` with:
 >     ('fixed_aggregate', 24, 'engine_read 34 < confirmed sent 35 (lost 1 on intake);
@@ -13947,6 +13947,31 @@ point, which are the parts that must survive it.**
 
 > 🔢 **Re-scored 2026-08-20 -> P2.** Value **5/10** · Difficulty **3/10** · _fill-in_. Unchanged at HEAD: line 66 pipes the PR title and body through a raw grep for the claim token with no inline-code-span blanking, so a backticked mention is indistinguishable from a claim, and the head -1 secondary defect is intact on the same line. A required status check that can red a compliant pull request is a false deny, the direction that gets acted on, and both obvious remedies damage the record. Difficulty 3 because the sibling precedent exists (Get-ScannableSegments blanking quoted spans) but its measured lesson forces a paired must-trip and must-not-trip arm, and the inline bash step has no testable seam today. _(was 5/10 · 2/10.)_
 >
+> **AMENDED 2026-08-27 -- THE DEFECT IS LIVE AND THE PARAGRAPH ABOVE DESCRIBES IT AT THE WRONG
+> ADDRESS.** Both halves of that sentence went stale when BACKLOG #1347 reworked the extraction,
+> and a reader following it would look at a line that no longer exists and a mechanism that no
+> longer applies. Corrected here rather than below, because a correction placed after the claim
+> is read after the reader has acted on it.
+>
+> * **It is line 109, not 66**, and the pipeline is no longer a single `grep -oiE`. It splits on
+>   close-paren to scope to the parenthetical and takes every `#N` after the token.
+> * **The defect survives that rework intact and untouched**: nothing in the pipeline strips
+>   inline code spans or fenced blocks, so a quoted mention is still indistinguishable from a
+>   claim. The rework changed the address, not the behaviour.
+> * **The second defect is already closed and must not be 'fixed' again.** The row says `head -1`
+>   takes the first match in reading order and so the error message names the wrong item. There
+>   is now a `sort -un` before it, so it takes the LOWEST NUMBER -- and more to the point the
+>   error at line 148 already names `$count` items and lists `$all_items`, so the harm the row
+>   describes is gone. `$claim` survives only in two PASS messages, where nobody is being sent
+>   anywhere. **Left alone deliberately.**
+>
+> **HOW THE STALENESS WAS FOUND, because the screen that dispatched this row passed on every axis
+> it checked** -- open banner, verdict build, closing-act code, no refusal language, body does not
+> retract its title. The row named a specific artifact, and asking whether that artifact still
+> exists is one command. Two rows dispatched the same morning (#1040 and #1229) turned out to be
+> already built, caught the same way: **a row is a claim about the world, and the code is the
+> world.**
+>
 > **Filed 2026-08-20 -- not started. A REQUIRED status check enforces against a PR that made no claim, and the two tempting fixes both destroy something.** `.github/workflows/backlog-hygiene.yml:66` extracts the claim with a raw grep over the pull request's title and body:
 >     claim="$(printf '%s
 > Verdict: build
@@ -14029,7 +14054,7 @@ point, which are the parts that must survive it.**
 
 ## 1300. required-contexts.txt describes the CI gate roll-up as six legs when it gates eight, so the file that exists to answer 'does this block a merge' answers it wrong for the two most-run legs
 
-> 🔢 **Re-scored 2026-08-20 -> P1.** Value **6/10** · Difficulty **2/10** · _quick win_. Gap stands: ci.yml:2596-2616 names eight needs while .github/required-contexts.txt still says six, and the two omitted legs are the ones that actually report -- webconsole has no if: gate (ci.yml:841-843) and tooling's PR filter includes docs/ (ci.yml:1379). Value 6 survives attack because the workaround is available but not reachable from where a reader stands: the correct answer is written out in ci.yml:2603-2616, yet a session asking 'does a red repo harness tests block me' reads required-contexts.txt, finds no such context, and stops. Difficulty 2 because the remainder is a prose edit plus one additive test on a seam that already exists in both directions -- tests/test_merge_gate_controls.py:186 already reads ci-gate's needs, and test_required_contexts.py:136 already reconciles one checked-in claim against another. _(was 6/10 · 2/10.)_
+> ✅ **SHIPPED -- verified on main 2026-08-29 at `995de69b`** (PR #549). `.github/required-contexts.txt` now names all eight legs in two labelled groups, and `tests/test_required_contexts.py::test_the_ci_gate_rollup_comment_names_every_job_the_job_actually_needs` reconciles against ci.yml's live `needs:` list rather than pinning a count. **DO NOT "fix" the surviving six references** -- they name the six PATH-GATED legs, a different set from the eight the gate needs, so a reader who greps the numbers sees a contradiction the sentences do not contain. Lander re-ran the suite 2026-08-29: **9 passed**, and the named test passes in isolation. _Original filing follows._ **Re-scored 2026-08-20 -> P1.** Value **6/10** · Difficulty **2/10** · _quick win_. Gap stands: ci.yml:2596-2616 names eight needs while .github/required-contexts.txt still says six, and the two omitted legs are the ones that actually report -- webconsole has no if: gate (ci.yml:841-843) and tooling's PR filter includes docs/ (ci.yml:1379). Value 6 survives attack because the workaround is available but not reachable from where a reader stands: the correct answer is written out in ci.yml:2603-2616, yet a session asking 'does a red repo harness tests block me' reads required-contexts.txt, finds no such context, and stops. Difficulty 2 because the remainder is a prose edit plus one additive test on a seam that already exists in both directions -- tests/test_merge_gate_controls.py:186 already reads ci-gate's needs, and test_required_contexts.py:136 already reconciles one checked-in claim against another. _(was 6/10 · 2/10.)_
 >
 > **Filed 2026-08-21 -- not started. The file's whole purpose is to be the checked-in answer to "is this check blocking", and it under-describes the roll-up by the two legs that run most often.** `.github/required-contexts.txt` states that `CI gate` is *"`if: always()` over six legs that are PATH-GATED or nightly"* and enumerates them: `sqlserver-store`, `postgres-store`, `load-test`, `load-test-sqlserver`, `windows-service-smoke`, `changes`. **`ci.yml`'s `ci-gate` job lists eight in `needs:`** -- those six plus **`webconsole`** and **`tooling`**.
 > **MEASURED 2026-08-21.** `webconsole`, `tooling` and `harness` appear **zero** times in `.github/required-contexts.txt`. The census used a positive control -- `sqlserver-store` returns 1 in the same pass -- so the zero is a real absence and not a broken predicate.
@@ -14364,7 +14389,7 @@ class as the release gate `a92ab10f` fixed, and it is why (b) is not cosmetic.
 **Not urgent, and the direction matters:** in the blocked instance the stale residual **overstates** the case against the engine, which is the safe direction to be wrong in. The residual rewrite is assessor work and routes to the owner.
 ## 1308. vault scorecard records are unwritable by the safe writer when their pre-existing prose trips its character ban
 
-> 🔢 **Filed 2026-08-22 - not started.** Value **5/10** · Difficulty **3/10** · _fill-in_. **A population of records cannot be edited by the safe writer at all** -- a sanctioned edit is refused before it starts, for a character the writer did not author. Difficulty 3 because the correct scope (author versus pre-existing text) is a design call, not a regex change.
+> ✅ **SHIPPED -- verified on main 2026-08-29 at f6c96b3b1: a mechanical edit carrying a record's own pre-existing banned character forward, refused rc=1 at filing, now applies rc=0, while introducing a new or a duplicate character still refuses rc=1.** Landed at c654c38b4, PR #584. _Original filing follows._ **Filed 2026-08-22 - not started.** Value **5/10** · Difficulty **3/10** · _fill-in_. **A population of records cannot be edited by the safe writer at all** -- a sanctioned edit is refused before it starts, for a character the writer did not author. Difficulty 3 because the correct scope (author versus pre-existing text) is a design call, not a regex change.
 > Verdict: build
 > Closing-act: code
 
@@ -15678,7 +15703,7 @@ ANYONE BEING CARELESS.*** **A suite written against the shapes you know is a REG
 CORRECTNESS test, and it is structurally incapable of the thing everyone assumed it was doing.**
 ## 1337. The leak gate has no pattern for a security-record citation, and a bare-identifier screen would be switched off within a day
 
-> 🔢 **Filed 2026-08-23 - not started.** `scripts/security/scan_forbidden.py` screens routable IPs, worktree slugs, home paths, customer and vendor names, and site codes. **It has no pattern for a security-record identifier at all.** The obvious screen -- match the identifier shape -- is **measurably unusable**, and this row carries the working specification instead.
+> ✅ **SHIPPED -- verified on main 2026-08-29 at `402d13a9`** (PR #588). The shipped code implements this row's own working specification rather than the identifier-shape screen it rejects: it pairs a requirement identifier WITH ITS VERDICT (`scan_forbidden.py:197`) and reports reason-only, never the value (`:951`), because the pair is itself the disclosure. Lander re-ran `tests/test_scan_forbidden.py` 2026-08-29: **50 passed**. _Original filing follows._ **Filed 2026-08-23.** `scripts/security/scan_forbidden.py` screens routable IPs, worktree slugs, home paths, customer and vendor names, and site codes. **It has no pattern for a security-record identifier at all.** The obvious screen -- match the identifier shape -- is **measurably unusable**, and this row carries the working specification instead.
 > Verdict: build
 > Research: none
 > Closing-act: code
@@ -16132,7 +16157,7 @@ checks (`git log -S` on a symbol the fix must touch) rather than citation greps.
 
 ## 1348. claim.ps1 reads directory existence as occupancy, so a worktree that outlives its session holds claims no sanctioned verb can move
 
-> 🔢 **Filed 2026-08-23 - not started.** `claim.ps1` refuses a `-Take` with **`HOLDER IS STILL THERE -- that worktree exists and last committed 23h ago.`** ***Its occupancy test is DIRECTORY EXISTENCE PLUS COMMIT RECENCY. It is not asking whether anyone is there.*** **Measured 2026-08-23: `ListAgents` returned seven live peers and the holding worktree was not among them, while its directory sat on disk and the tool reported it occupied in a confident sentence.**
+> ✅ **SHIPPED -- verified on main 2026-08-29 at `08496200`** (PR #585). `claim.ps1` now distinguishes three states -- `occupied`, `unoccupied`, `present` -- which is what this row asked for: that the two be DISTINGUISHABLE, **not** that `unoccupied` become releasable. It still REFUSES, and recognition may only ever SUPPRESS, so a missing answer costs a refusal and never a licence. The fix also closed a hazard this row never raised: `present` was returned both when the probe found an occupant and when it could not look, so on any machine with no Claude config root -- **every CI runner** -- the tool asserted a live session it had never observed. Lander re-ran `tests/test_coord_claim_liveness.py` 2026-08-29: **15 passed**. _Original filing follows._ **Filed 2026-08-23.** `claim.ps1` refuses a `-Take` with **`HOLDER IS STILL THERE -- that worktree exists and last committed 23h ago.`** ***Its occupancy test is DIRECTORY EXISTENCE PLUS COMMIT RECENCY. It is not asking whether anyone is there.*** **Measured 2026-08-23: `ListAgents` returned seven live peers and the holding worktree was not among them, while its directory sat on disk and the tool reported it occupied in a confident sentence.**
 > Verdict: build
 > Research: none
 > Closing-act: code
@@ -16190,7 +16215,7 @@ removed with their sessions.
 
 ## 1340. the blanket-stage guard enumerates part of the add vocabulary, so git stage -A and six other forms stage everything unblocked
 
-> 🔢 **Filed 2026-08-23 -- not started. SEVEN COMMAND FORMS PERFORM A REAL BLANKET STAGE AND THE GUARD ALLOWS EVERY ONE.** Verified against real git 2.53.0.windows.2, each form first confirmed to actually stage the whole tree, then driven through the committed hook as a subprocess: `git stage -A`, `git stage .`, `git add --update`, `git add :/`, `git add ./`, `git.exe add -A`, `git add -Av`. Discriminating controls in the same run: `git add -A`, `git add -u`, `git add .` and `git commit -am` all DENY.
+> ✅ **SHIPPED -- verified on main 2026-08-29 at f6c96b3b1: all seven filed blanket-stage forms (git stage -A, git stage ., git add --update, git add :/, git add ./, git.exe add -A, git add -Av) now DENY when driven through the committed hook, while the same harness run against the pre-fix guard at 786ac8b49^ ALLOWS all seven.** Landed at 786ac8b49 (PR #579), 2026-08-26, "fix(hooks): blanket-stage guard closes the add-vocabulary and quote-argv gaps (BACKLOG #1339/#1340/#1341)"; confirmed an ancestor of origin/main f6c96b3b1. _Original filing follows._ **Filed 2026-08-23 -- not started. SEVEN COMMAND FORMS PERFORM A REAL BLANKET STAGE AND THE GUARD ALLOWS EVERY ONE.** Verified against real git 2.53.0.windows.2, each form first confirmed to actually stage the whole tree, then driven through the committed hook as a subprocess: `git stage -A`, `git stage .`, `git add --update`, `git add :/`, `git add ./`, `git.exe add -A`, `git add -Av`. Discriminating controls in the same run: `git add -A`, `git add -u`, `git add .` and `git commit -am` all DENY.
 
 > **`git stage` NEEDS NO TRICKERY AT ALL.** `stage` is a documented git synonym for `add`. The rule tests `\badd\b`, so the synonym defeats the flag rows **and** the bare-dot row together.
 
@@ -16662,6 +16687,12 @@ catch.
 > constraint that shaped this over the obvious alternative: the tests assert both `Occupants == []`
 > and `Decision == "SKIP"`, so any remedy that short-circuited the verdict would pass while testing
 > nothing.
+
+> **FOLDED IN FROM #1303, 2026-08-29 (lander). THE SAME WORK WAS ALLOCATED TWICE -- #1303 on 2026-08-21 and this row on 2026-08-26, with character-identical titles -- and this one shipped.**
+> **#1303 IS RETIRED AS A PERMANENT HOLE AND NOT AS A ROW.** `alloc.ps1` has no release verb by design, on the stated principle that *holes are free, collisions are not*: a stranded number is invisible, while two open headings for one shipped fix read to every future screener as two pieces of work, one of them already done.
+> **THE PARAGRAPH BELOW IS WHY THE FOLD HAPPENED RATHER THAN A CLEAN DROP.** Retiring the row would have lost it, and it is the mechanism -- not commentary. Reported by the seat holding #1303, which declined to pick between the numbers itself. Quoted verbatim:
+>
+> **THE PATH TO THE FAILURE, traced through the real fence.** `Test-RecordLiveness` ([`scripts/coord/session-registry.ps1:181`](../scripts/coord/session-registry.ps1)) reports **DEAD** when `Get-Process -Id` finds nothing -- and DEAD vetoes nothing. A REUSED pid **is** running, and a test record carries no `startedAt` for the reuse fence to consult, so the verdict becomes **UNVERIFIED** -- which **does** veto (`occupancy.ps1:75`). The occupant list then comes back non-empty and an assertion that a dead record is "not a veto" fires. `cmd /c exit` is Windows-only, matching where it was seen; pid reuse needs pid churn, and that tier spawns pwsh/git children constantly on a runner whose pid space recycles far faster than a developer box.
 
 **Cluster:** CI reliability / test determinism. **Priority:** P2. **Verdict:** build.
 **Severity:** no product effect, no PHI effect, no deployment axis (sec. 0) -- test-suite determinism
@@ -17317,6 +17348,688 @@ committed alongside the fix rather than filed separately, since neither makes se
 
 **Not done:** pushing, opening a PR, or anything that would exercise this in real CI. Committed and
 handed to the Lander.
+## 1382. the ledger gate compares head against origin/main, so RENAMING a row onto a number already on main passes -- and that merge produces a silent duplicate
+
+> 🔢 **Filed 2026-08-29 (lander) - found by builder-2, composed by the dispatcher, and the unproven half measured by the filer before filing.**
+> Verdict: build
+> Closing-act: code
+
+**Cluster:** Repo governance / ledger. **Priority:** P2. **Verdict:** build (small).
+**Severity:** no engine, PHI or deployment axis (sec. 0). It governs the ledger, not the product. **The severity is that the duplicate is silent -- git reports success and no gate reports anything.**
+
+**THE GATE'S BEHAVIOUR IS DELIBERATE AND DOCUMENTED. THIS ROW IS ABOUT A SIDE EFFECT ITS COMMENT DOES NOT NAME.** `scripts/hooks/ledger_check.py:169` takes `base: str = "origin/main"`, and the check at `:370` walks `head - base`. The comment at `:368-369` states the reason in its own words:
+
+> *"Only `head - base` is examined, so everything already on origin/main -- including the pre-partition overlap -- is grandfathered by construction. No allowlist, nothing to maintain."*
+
+**That is a good design and the row does not propose scrapping it.** Grandfathering by set-subtraction is why there is no allowlist to rot.
+
+**THE SIDE EFFECT: the gate stops you INTRODUCING an unowned number. It does not stop you RENAMING a row onto one that is already on main.** If the number is in `base`, it is not in `head - base`, so `owns()` is never consulted and there is nothing to reject. A commit renaming a branch's row onto `#1379` -- allocated to another worktree, already landed -- **passes cleanly**, and the pass is correct under the rule as written.
+
+**THE CONSEQUENCE WAS REPORTED AS REASONED-NOT-MEASURED AND IS NOW MEASURED.** The reporting seat marked it explicitly as not having completed a merge, and the composing seat carried that marking forward rather than laundering it. Settled here by three-way merge over temp files, mutating no repository:
+
+```
+control  '## 1379.' on origin/main = 1   (unique, so the test is about the real number)
+base     0 headings   (a branch cut before #1379 landed)
+ours     1 heading    (main, at its real offset)
+theirs   1 heading    (the same branch with a DIFFERENT row renamed to #1379)
+the two rows sit ~11,828 lines apart
+
+git merge-file  ->  exit 0 | conflict markers 0 | '## 1379.' in the result: 2
+```
+
+**Exit 0, no markers, two rows. The duplicate merges silently.**
+
+**PLACEMENT IS LOAD-BEARING AND A FIRST ATTEMPT GOT IT WRONG.** Running the same simulation with the renamed row placed at the **tail**, adjacent to main's newest items, produces `exit 1` and three conflict markers -- git catches it. **That version would have refuted the finding, and it would have been the wrong test**: the gate's own message cites the hazard as *"two sessions adding #N land ~1,600 lines apart, merge CLEAN, and both ship (cf. 5b7d046 / #598)"*. Adjacency manufactures a conflict the real scenario does not have. **The far-apart placement is the one that matches the documented failure, and it is the one that reproduces.**
+
+**SO THIS IS THE GATE'S OWN STATED FAILURE MODE, REACHED BY A ROUTE IT DOES NOT CHECK.** The union-diff design that makes the move-commit case correct (`:47-50`) is the same design that makes this invisible.
+
+**NOT CLAIMED:** that anyone has done this, that it is exploitable, or that it was reached other than by a builder noticing it mid-repair. No instance is alleged.
+
+**UNTESTED:** whether a real `git merge` through the merge queue behaves as `git merge-file` does here -- the simulation is a three-way content merge and does not model the queue. Also untested: whether the ADR arm at `:267` has the same shape, though it reads the same way.
+
+**A CANDIDATE FIX, NOT A DESIGN:** walk the branch's own history for renamed headings rather than only `head - base`, or assert that every `## N.` in head whose number is in base is byte-identical to base's row of that number. The second is cheaper and answers the question directly.
+
+**AMENDMENT 2026-08-29 (lander) -- THE FREEZE IS INVISIBLE UNTIL SOMEBODY TOUCHES THE LEDGER.** The
+same `base = origin/main` comparison is re-evaluated on **every** commit that touches the ledger, over
+`head - base` rather than against the commit's own parent. So once a branch's allocating worktree is
+gone, a **one-line typo fix inside a row that branch already carries is refused identically to adding a
+brand-new one** -- the refusal is about the SET the branch adds relative to `main`, not about what the
+commit changed.
+
+**But `check_backlog` returns early at `ledger_check.py:346` unless the change set contains
+`docs/BACKLOG.md` or a path under the archive directory.** So a **test-only commit on that same frozen
+branch passes cleanly**. The branch is not uniformly frozen: it is frozen along the one path nobody
+exercises until they need it, and it reports perfect health until that moment. **A seat can work such a
+branch for hours and meet the refusal at the worst possible time** -- the shape this whole row is about,
+a gate whose failure is silent until the expensive moment.
+
+**MEASURED against `origin/main`, not inferred:** `:169` `base: str = "origin/main"`; `:203`
+`git diff --name-only <base> HEAD` (the base, never the parent); `:345` `changed = self.changed_files()`;
+`:346` the early return; the `head - base` loop at ~`:370`; and both ownership arms reading
+`elif not self.ci and not self.owns(...)` at `:296` and `:385`. **CI passes `--ci`, so the ownership arm
+never runs there** -- this is a local-commit constraint only and the branch can still merge on GitHub,
+the same local-versus-CI divergence recorded by the unlanded row on the ungated sequencer -- **named by subject rather than by number, because that row is allocated but not yet on `main`, and a citation to a still-issuable number resolves to nothing today and to unrelated work the day it is issued.**
+
+**NOT A SEPARATE ROW, DELIBERATELY.** The consequence that an existing row is refused like a new one is
+the intersection of this row's mechanism with **#1293** (removing a worktree orphans every unlanded
+number it allocated), which is CLOSED -- shipped 2026-08-23 at `937e83da`, remedy recorded as doctrine
+in [`docs/LEDGER-GATE.md`](LEDGER-GATE.md): recreate a worktree at the recorded path, owner-ruled route
+1. That remedy already resolves it operationally. **The invisibility above is the part neither row
+states**, and it is recorded here rather than as a third row because splitting it files half a story
+twice.
+
+**PROVENANCE:** mechanism found by builder-2 reading the source, composed by the dispatcher, line
+citations re-verified against `origin/main` by the lander before writing. A builder is relying on the
+test-only asymmetry right now, which is what makes it worth recording rather than theoretical.
+
+## 1384. two required contexts were never mirrored into required-contexts.txt, so they have no negative control and no test can notice
+
+> 🔢 **Filed 2026-08-29 -- OPEN.** Branch protection on `main` enforces **15** contexts.
+> [`.github/required-contexts.txt`](../.github/required-contexts.txt) declares **13**. The two it does
+> not name are `CodeQL (javascript-typescript)` and `CodeQL (python)`. Found while intersecting a PR's
+> `statusCheckRollup` against the live required set to decide what actually blocked six queued PRs.
+
+**Cluster:** CI / required-set claims. **Priority:** P2. **Verdict:** build (small).
+**Severity:** two contexts that BLOCK A MERGE today carry **zero registered negative controls**, and
+the register built to guarantee otherwise cannot see them. The file itself under-reports, which is the
+safe direction -- nobody is relying on a check that is not on -- but the consequence below is not
+cosmetic.
+
+**The doc gap is the small half. This is the real one.**
+[`tests/negative_controls.toml`](../tests/negative_controls.toml) registers, per required context,
+what a planted defect breaks and which pytest nodes must go red without it. Measured: it contains
+**zero** CodeQL entries. #1000's shipped banner states *"All 13 required contexts now carry a
+registered negative control"*, and that sentence was true when written and is now true of 13 of 15.
+
+**Why no test caught it, and the authors were explicit about the precondition.**
+`tests/_workflow_contexts.py::required_contexts()` reads
+[`.github/required-contexts.txt`](../.github/required-contexts.txt) off disk. Its docstring says so
+plainly. `tests/test_negative_controls.py` then reconciles the register against that list, and its own
+docstring states the design honestly:
+
+> `.github/required-contexts.txt` IS READ-ONLY TO THIS FILE. It mirrors the live server, and its own
+> header states the ordering rule -- branch protection first, then the file.
+
+and describes the decay mode it targets as *"a context arriving in branch protection **and being
+mirrored into** `.github/required-contexts.txt`"*. **The guarantee is conditional on a human
+performing the mirror step, and nothing enforces that step.** Step one was done -- CodeQL is enforced.
+Step two was not. Every downstream test then agreed with every other, because they all read the mirror.
+
+**This is ADR 0158 Class 2**, by the ADR's own one-line test -- *if this control were broken, what
+would tell me?* If the mirror is skipped, the thing that would tell me is the register, and the
+register reads the mirror. See
+[ADR 0158](adr/0158-silent-controls-green-signals-that-mean-nothing-and-shape-over-detection.md).
+
+**Measured 2026-08-29:**
+
+```
+gh api repos/MEFORORG/MessageFoundry/branches/main/protection --jq '.required_status_checks.contexts[]'
+  -> 15
+mapfile -t ctx < <(grep -vE '^\s*(#|$)' .github/required-contexts.txt); echo "${#ctx[@]}"
+  -> 13
+
+in API but not in file : CodeQL (javascript-typescript), CodeQL (python)
+in file but not in API : none
+grep -ci codeql tests/negative_controls.toml -> 0
+```
+
+**A note on that second command, because this row is about instruments and it would be poor
+form to leave a copyable one that can lie.** A `grep file | grep` chain reports the LAST stage's
+status, so a missing or unreadable file yields ZERO lines and a clean exit from the tail -- read as
+*"the file declares 0 contexts"*, which is indistinguishable from a genuinely empty file. The form
+above keeps the read and the filter in one stage with no pipe. **Either way the 13 is trustworthy
+only because it is compared against the API, which is this row's entire point.**
+
+**The count 13 is restated in at least five other places**, each of which is now stale by the same two:
+`docs/adr/0158-...md` twice, and three rows in this file. That is a symptom, not the bug -- do not fix
+it by editing the numbers.
+
+**Open question for whoever takes this, because the obvious fix has a worse failure mode.** A test that
+calls the GitHub API needs a token and fails closed on a network blip, turning a silent gap into a
+flaky required check. Options, at least: a non-blocking scheduled job that opens an issue on drift; an
+opt-in `verify`-style check a seat runs deliberately; or accepting the gap and rewording the register's
+guarantee so it stops implying coverage it cannot confirm. **Adding the two lines and moving on fixes
+today's instance and leaves the instrument exactly as blind.**
+
+## 1385. three merge-queue attempts on one PR failed three DIFFERENT unrelated tests, and the PR gate cannot see any of it
+
+> 🔢 **Filed 2026-08-29 -- OPEN.** PR #669 was added to the merge queue three times and
+> removed three times without merging. Its 15 required contexts are green **on the PR**. It fails the
+> `CI` workflow in the **`merge_group`** context, which runs against the branch merged with `main` and
+> is a different set of runs the PR page does not surface.
+
+**Cluster:** CI / merge queue. **Priority:** P2. **Verdict:** build.
+**Severity:** a PR whose every required check is green cannot land, and nothing on the PR says why.
+Three full CI cycles were spent to learn that. On a day when the fleet's budget is the binding
+constraint, an invisible retry loop is expensive as well as confusing.
+
+**The queue events, from the PR timeline:**
+
+```
+11:14:42Z  added_to_merge_queue      11:15:32Z  removed_from_merge_queue
+11:36:54Z  added_to_merge_queue      12:03:00Z  removed_from_merge_queue
+12:42:33Z  added_to_merge_queue      12:50:21Z  removed_from_merge_queue
+```
+
+**THE DISCRIMINATOR, and it is the whole finding: the three `merge_group` CI runs failed for three
+DIFFERENT reasons, with no overlap.**
+
+| `merge_group` CI run | How it failed |
+|---|---|
+| 11:15:01Z | `Tests (pytest)` on `windows-2025` **timed out after 55 minutes** -- no test reported FAILED |
+| 11:37:13Z | `test_api_request_timeout.py::test_a_fast_handler_is_untouched` -- wall-clock timing |
+| 12:42:51Z | `test_multipart.py::test_hostile_disposition_header_parses_in_linear_time` -- wall-clock timing, **and** `test_sqlserver_store.py::test_cipher_invocations_upsert_is_atomic_and_additive` -- infra |
+
+**A real defect in the change fails the SAME test every time.** Non-overlapping failures across
+attempts is the signature of the environment, not the diff. And the diff cannot reach any of them:
+#669 touches an ADR, `docs/adr/README.md`, `harness/load/connscale/probe.py`, and two
+`test_connscale_*` files. **Zero overlap** with multipart parsing, the API request-timeout path, or
+the SQL Server store.
+
+**AMENDED 2026-08-29, and it splits the three failures into TWO different problems. The 11:15 run
+did not fail a test -- it HUNG, and it is an 8x outlier against its own leg.**
+
+Measured across 18 recent `ci.yml` runs, the `Tests (pytest)` step on `test (windows-2025, py3.14)`:
+
+```
+usable samples 13   (5 excluded: skipped, or still running with no completion time)
+min 0.2   median 7.8   max 55.1  minutes
+excluding the outlier: n=12, range 0.2-8.8, mean 6.8
+the outlier is 8.1x the normal mean
+```
+
+**The cap is not marginal, so this is not the ADR 0158 Class 1 shape.** `ci.yml`'s matrix sets
+`step_timeout: 55` for `windows-2025` against a 6.8-minute normal mean -- roughly seven times
+headroom. The run consumed all 55 minutes. **A step that normally takes under nine minutes ran until
+a generous ceiling stopped it, which is a hang, not a slow run.**
+
+**And it tells us WHERE the hang was.** `ci.yml` documents three nested watchdogs at increasing
+scope: `pytest_timeout` (120s per test on Windows, via `--timeout=`), `fault_timeout` (150s,
+`PYTHONFAULTHANDLER` plus `faulthandler_timeout`), and `step_timeout` as the outer backstop -- whose
+comment says it exists "so a process-level deadlock **below pytest**" is still bounded. **The inner
+two did not fire and the outermost did, which is exactly the case the outer one was built for.** So
+the 11:15 failure is a process-level deadlock beneath pytest, not a flaky assertion.
+
+**Corrected characterisation of the three runs:**
+
+| Run | Duration | Kind |
+|---|---|---|
+| 11:15:01Z | **55.1 min**, hit the cap | **process-level hang below pytest** -- no test reported FAILED |
+| 11:37:13Z | 7.7 min, normal | test failure -- `test_a_fast_handler_is_untouched` |
+| 12:42:51Z | 7.6 min, normal | test failures -- `test_hostile_disposition_header...` and the SQL Server upsert |
+
+**So this row covers two problems, not one**, and they should probably separate: a hang that the
+outer watchdog caught once, and wall-clock-sensitive tests failing under load. The visibility gap
+below is common to both.
+
+**A NOTE ON MY OWN INSTRUMENT, because it produced a wrong number first.** My initial pass computed
+`mean = -62670193.3` minutes. A job still RUNNING has no completion time, and subtracting it yields a
+nonsense duration that then poisons min and mean. **The tell was that the value was absurd rather
+than merely surprising; a subtler skew would have passed.** The numbers above exclude incomplete
+steps and say how many were excluded, so the denominator is visible rather than implied.
+
+**FOURTH ATTEMPT, 13:01:54Z -- I re-queued once deliberately and it failed a FOURTH distinct way.
+Failing job: `sql server (store + connector) 2025`.** The 12:42 attempt failed the **2022** leg of
+the same suite. So the SQL Server failure alternates between OS legs across attempts, which is the
+signature the 641 row already described in its own words: the same test failing *"twice, on TWO
+DIFFERENT OS legs"*. Test-level detail for this run was not retrievable at the time of writing
+(`gh run view --log-failed` returned rc=1 while the run was still finalising), so this entry records
+the **job-level** fact only and does not claim which test failed.
+
+**Running tally: four queue attempts, four different failure profiles, zero merges.**
+
+```
+11:15  windows-2025 pytest HANG, 55.1 min, hit the cap    process-level, below pytest
+11:37  test_a_fast_handler_is_untouched                    wall-clock timing
+12:42  test_hostile_disposition_header... + SQL Server 2022  timing + infra
+13:01  SQL Server 2025                                     infra, the OTHER OS leg
+```
+
+**I re-queued knowing the row says not to, and the row still says not to.** The reason was that a
+queue attempt costs runner time rather than the fleet's token budget, and the queue was empty so it
+blocked nobody. **It did not land, and that is the point: the fourth attempt produced more evidence
+rather than a merge, which is what "do not re-run until it passes" predicts.** One deliberate
+re-queue to test the prediction is not the same act as re-running until a green appears.
+
+**WHAT I CANNOT ATTRIBUTE, stated rather than smoothed over.** The three removals do not map cleanly
+onto the three runs. The first entry was removed at 11:15:32Z, **fifty seconds** after being added and
+long before its own run timed out at roughly 12:10Z -- so that removal was not caused by that run.
+PR #677 merged through the queue in that window, which re-forms the group and is ordinary churn. **So
+the honest claim is three failing `merge_group` runs and three removals, not a one-to-one causal
+chain.** Anyone building on this row should establish the mapping rather than inherit it from here.
+
+**The SQL Server one is already on the record as environmental.** The 641 row of the CI failure log
+(now in the vault) records `test_cipher_invocations_upsert_is_atomic_and_additive` failing as a
+`StoreAcquireTimeout`, diagnoses it as `infra`, and closes with the author retracting their own
+pre-registered discriminator after PRs #644 and #645 landed the same work clean. So this test has a
+written history of failing for reasons unrelated to the PR under it.
+
+**The queue itself is not broken -- positive control.** PR #677 went through the same queue at
+11:15:35Z with `CI`, `CLA Assistant`, `backlog-hygiene`, `CodeQL` and `Security` all green in
+`merge_group`, and merged. Whatever this is, it is not "the queue never merges anything".
+
+**Why the PR gate cannot see it.** `merge_group` runs are a separate event against a separate
+`gh-readonly-queue/...` ref. The PR's own `statusCheckRollup` reports the `pull_request` runs and
+says nothing about them. **A PR can therefore show 15 of 15 required contexts green and still be
+unmergeable, with the reason recorded only in a run list nobody looks at.** Reading it takes
+`gh run list --event=merge_group`.
+
+**At least three separable questions, and they have different owners:**
+
+1. **The timing tests.** `test_a_fast_handler_is_untouched` and
+   `test_hostile_disposition_header_parses_in_linear_time` both assert against wall clock on a shared
+   runner. Whether they should is a real question; a linear-time assertion in particular can be
+   restated as a ratio between two input sizes rather than an absolute bound.
+2. **The SQL Server upsert.** Already characterised in the 641 row; a retry past transient acquire
+   failures was noted there as an open vault PR.
+3. **The visibility gap, which is the durable half.** Nothing surfaces a `merge_group` failure onto
+   the PR. A dequeue looks identical to never having been queued -- and `autoMergeRequest` reads
+   `null` in both states, so the obvious field cannot distinguish them either (Instruments 4.15c).
+
+**Do not close this by re-running the queue until it passes.** That is what happened three times
+already, and it produces a green that means "this attempt got lucky", not "the change is sound".
+
+## 1386. the mail drain's byte cap is below the fleet's broadcast rate, so live seats accumulate backlogs that expire unread
+
+> 🔢 **Filed 2026-08-29 -- OPEN.** `scripts/hooks/mail-drain.ps1` caps one injection at
+> `MAX_MESSAGES = 5` **and** `MAX_TOTAL_BYTES = 8000`. At today's broadcast size the BYTE cap binds
+> first, so a seat clears **3 to 4 messages per turn** while the fleet sends faster than that. The
+> send-side TTL default is `TtlMinutes = 4320` -- **three days** -- so a backlog that outlives it is
+> discarded.
+
+**Cluster:** Coordination / session mail. **Priority:** P2. **Verdict:** build.
+**Severity:** **34 messages have already expired unread across 17 boxes.** This is not a projection;
+it is a count of mail that was sent, never rendered, and is now gone.
+
+**Measured 2026-08-29, 88 boxes walked under an assertion that the walk found more than 10:**
+
+```
+189 unread across 12 LIVE boxes (touched within 2h)
+145 unread across 31 dead boxes
+ 34 EXPIRED unread across 17 boxes    <- already lost
+
+largest live backlogs
+  hungry-wu-6c8ac2       43   the LIAISON -- the owner's channel
+  wonderful-elion-257e1e 36   Builder 1
+  cleaner-51d2b4         34
+  respawn-fleet-008093   27
+  messagefoundry-096b5d29 20
+```
+
+**THE ARITHMETIC IS THE FINDING, and it is why nobody noticed.** Every drain prints
+`box: 3 shown, N deferred (caps)` and says *"Deferred mail stays in the inbox and is shown at the
+next drain -- nothing was discarded."* **That sentence is true per drain and misleading in
+aggregate.** Nothing is discarded *at that moment*; the TTL discards it later. A seat reading its own
+drain footer sees an orderly queue, not a queue growing faster than it drains.
+
+**Today's broadcasts run about 1,900 bytes**, so three of them are 5,700 and a fourth exceeds 8,000.
+That is exactly the `3 shown` every seat has been seeing and reading as normal.
+
+**Why the backlog is arithmetic rather than inattention.** The drain runs only when the receiving
+seat takes a turn, and clears at most ~4. A seat taking one turn every few minutes cannot keep up
+with a fleet broadcasting more often than that, and an IDLE seat drains nothing at all -- which is
+the same property recorded separately as *mail is a mailbox, not a doorbell*.
+
+**The consequence that matters most: the Liaison is the owner's channel and holds the largest
+backlog.** An owner item routed there can sit tens of positions deep, and over a long weekend can
+expire instead of arriving. **Anything time-sensitive should not be assumed delivered because the
+send succeeded.**
+
+**At least four separable fixes, and they are not equivalent:**
+
+1. **Raise or decouple the caps.** The byte cap binding before the message cap is probably
+   unintentional -- a 5-message allowance that only ever delivers 3 is not the stated policy.
+2. **Report the BACKLOG, not just this pass.** The footer should say the inbox depth and the oldest
+   message's age, so a growing queue is visible in the place a seat already looks.
+3. **Warn before expiry** rather than discarding silently. An expired message currently leaves only a
+   file in `expired/`; nothing tells the sender or the receiver it was never read.
+4. **Broadcast discipline.** Six broadcasts about one shell idiom in ninety minutes is itself part of
+   the input rate, and no cap change fixes that.
+
+**Do not close this by draining the current backlog.** The backlog is the symptom; the cap and the
+silent expiry are the defect.
+
+## 1389. a REQUIRED CI guard is green while asserting against the wrong step: its locator binds the tooling pytest line, not the engine one it names
+
+> 🔢 **FILED 2026-08-29 (builder 2).** `tests/test_ci_engine_step_excludes_webconsole.py` exists to
+> stop the engine pytest step double-running the ~356 web-console tests that `testpaths` includes
+> (BACKLOG #1027). ***IT PASSES. IT IS A REQUIRED CHECK. AND IT IS NOT LOOKING AT THE ENGINE STEP.***
+
+> **IN FLIGHT WHEN FILED: PR 613 ALREADY REPAIRS THIS, AND IT IS DIRTY.** Verified 2026-08-29, not
+> taken on report: `gh pr diff 613 --name-only` matches
+> `tests/test_ci_engine_step_excludes_webconsole.py`, and `gh pr view 613` reads OPEN, not draft,
+> `mergeStateStatus=DIRTY`. **The row stands because the PR may not land** -- if 613 is ever closed
+> unmerged the defect still needs a home, and this row names the mechanism more precisely than 613's
+> body does. ***DO NOT START A SECOND FIX. Read 613 first.*** Overlap found by the DISPATCHER after
+> dispatch, not before -- it screened its bench rows for an open PR and did not screen the filing job
+> it handed out.
+> **THE MECHANISM, AND IT IS NOT "THE LOCATOR STOPPED MATCHING".** `_engine_step_run_line()` scans
+> `ci.yml` for a line whose stripped form starts `run: pytest -q`, and calls `pytest.fail` if it finds
+> none — **so a stopped match would go RED, loudly.** That is not what happens.
+>
+> ***EXACTLY ONE LINE IN ci.yml MATCHES, AND IT IS THE TOOLING STEP:*** L1122,
+> `run: pytest -q -n 4 --dist loadfile -m tooling --ignore-glob='*messagefoundry-webconsole*' ...`.
+> The engine step's run line is L813 and it is WRAPPED: `run: bash scripts/ci/retry-native-crash.sh pytest -q ...`, so it
+> never starts with `run: pytest -q` and is never examined. **The guard binds a step it was not
+> written for, that step happens to carry `--ignore-glob`, and every assertion passes.**
+
+> **NOTHING IS BROKEN TODAY AND THAT IS THE POINT.** The engine step still carries the subtraction
+> (verified AT L813 itself, which carries `--ignore-glob='*messagefoundry-webconsole*'`). ***So
+> there is no live double-run. What is missing is the PROTECTION: if someone "simplified" the engine
+> flag back to `--ignore` — the exact regression this file's own docstring says it exists to catch,
+> and which was MEASURED not to prune — the guard would still be green.***
+
+> **THE DOCSTRING STATES THE HAZARD IT NO LONGER COVERS:** *"A future edit 'simplifying' the flag back
+> to `--ignore` would restore the double-run silently, with every check still green, which is the same
+> shape as the defect #1027 fixed."* ***It now describes itself.***
+
+> **THE FIX IS THE LOCATOR, NOT THE ASSERTIONS.** Bind the step by its `name:` / `id:` (`id: tests`)
+> and read the whole `run:` block, rather than pattern-matching a one-line spelling that a formatting
+> change can move. **A test that identifies its subject by a coincidence of layout will re-break the
+> next time the layout changes.**
+
+> **CONTROLS RUN BEFORE FILING:** the three tests pass on main's files (3 passed); `run: pytest -q`
+> occurs exactly once in `ci.yml`; that occurrence is `-m tooling`; `name: Tests (pytest)` occurs once
+> at L747. Absence probes on origin/main's live and closed ledgers: `test_ci_engine_step` 0 hits,
+> `excludes_webconsole` 0 hits — **this defect had no row.**
+
+**Cluster:** CI reliability / dead controls. **Priority:** P2. **Verdict:** build (small).
+**Severity:** no engine effect, no PHI axis, no deployment axis (sec. 0). Nothing is mis-running now.
+The cost is a REQUIRED check whose green is uninformative about the thing it names — and a required
+check is exactly where an uninformative green is most expensive, because it is the one nobody re-reads.
+
+---
+
+## 1390. cla.yml persists the job token into .git/config on pull_request_target while holding contents: write, and the checkout that does it arrived with the fix for the archived action
+
+> 🔢 **FILED 2026-08-29 (builder 2).** `.github/workflows/cla.yml` checks out at
+> `actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1` (v7.0.1, L59) with **no
+> `persist-credentials` setting anywhere in the file**. The action's default is `true`, so the job's
+> `GITHUB_TOKEN` is written into `.git/config` on the runner. zizmor names this pattern `artipacked`.
+
+> **IN FLIGHT WHEN FILED: PR 681 ALREADY REPAIRS THIS, AND IT IS BLOCKED.** Verified 2026-08-29, not
+> taken on report: `gh pr diff 681 --name-only` matches `.github/workflows/cla.yml` and the diff adds
+> 3 `persist-credentials` lines; `gh pr view 681` reads OPEN, not draft, `mergeStateStatus=BLOCKED`.
+> **The row stands because the PR may not land.** ***DO NOT START A SECOND FIX. Read 681 first.***
+> Same screening miss as #1389, same source, disclosed by the DISPATCHER unprompted.
+> **THE PERMISSIONS AND TRIGGER ARE WHAT MAKE IT WORTH A ROW, not the checkout alone.** The workflow
+> runs on `pull_request_target` (L23) and declares `contents: write`, `pull-requests: write`,
+> `statuses: write` (L35-39). ***`pull_request_target` runs in the BASE repository's context with
+> those permissions available, which is precisely the trigger where a persisted write-capable token
+> is worth the most to anything that can read the runner's filesystem.***
+
+> ***THE PART THAT MAKES THIS INSTRUCTIVE RATHER THAN ROUTINE: THE CHECKOUT ARRIVED WITH THE FIX FOR
+> A DIFFERENT DEFECT.*** cla.yml previously had **zero** checkout steps — measured on origin/main
+> earlier the same day. #1381 vendored the CLA action from a remote reference to a local
+> `uses: ./.github/actions/cla-assistant-lite`, and a local action cannot resolve without a checkout,
+> so PR 678 added one. **The remedy for "the action is archived" introduced the credential
+> persistence. Neither change was wrong on its own terms.**
+
+> **THE FIX IS ONE LINE:** `persist-credentials: false` on that checkout step. The job does not push;
+> it needs the tree only so the local action resolves. **Nothing in the workflow reads the persisted
+> credential, so removing it costs nothing.**
+
+> **CONTROLS RUN BEFORE FILING, on origin/main:** the file reads back 4,853 bytes (a nonzero read, so
+> a zero below is a real absence); `actions/checkout` occurs twice — once in a comment at L48 and once
+> as the step at L59; `persist-credentials` occurs **0** times; `pull_request_target` present at L23.
+> Absence probes on the live and closed ledgers: `persist-credentials` 0 hits, `artipacked` 0 hits —
+> **this defect had no row.**
+
+**Cluster:** CI supply chain / secrets. **Priority:** P2. **Verdict:** build (small).
+**Severity per sec. 0 — CONDITIONAL, and the distinction is load-bearing.** There are ZERO
+deployments and this is a CI workflow, so nothing is exposed today. ***A compromised or malicious
+step in that job WOULD find a write-capable token on disk*** — that is the harm, and it is
+prospective. **Do not write this row up as a live credential exposure; it is not one.**
+
+---
+
+## 1391. the respawn brief points relative commands at the PREDECESSOR checkout, so a replacement seat can declare into a dead box -- but it does not always fire, and the exception is the useful half
+
+> 🔢 **FILED 2026-08-29 (builder 2, who IS a replacement seat and is the counter-example).**
+
+> **THE MECHANISM, VERIFIED IN THE GENERATOR:**
+> `respawn.ps1:1339` emits `"RUN EVERY RELATIVE COMMAND BELOW FROM: $runFrom"`, where `$runFrom` is
+> the **predecessor's** checkout. `:1426` then gives the declare command as a **relative** path,
+> `pwsh -NoProfile -File scripts\coord\seat.ps1 -Declare ...`. And `seat.ps1` derives its box key
+> from the invoking tree — `:241` `$start = if ($Hint) { $Hint } else { (Get-Location).Path }`,
+> `:545` `$boxKey = ConvertTo-BoxKey -Path $wt`. ***Follow the brief literally and the declaration is
+> keyed to a worktree that is not yours.***
+
+> ***AND IT DID NOT HAPPEN TO ME, WHICH IS WHY THIS ROW IS NOT "EVERY REPLACEMENT SEAT".*** My brief
+> carried the predecessor path (the predecessor worktree, named in full) and my declaration still landed in
+> **my own** box: `my own seat record` holds `seat=BUILDER2`,
+> `seatSource=declared`, a real goal, `declaredAt 2026-08-28T17:51:44Z`. **A universal claim was
+> available and is false.**
+
+> ***SO THE OPEN QUESTION IS THE ITEM: WHAT MAKES IT FIRE?*** The plausible discriminator is whether
+> the seat runs the declare with the brief's cwd or from its own tree — but that is UNMEASURED and I
+> am not asserting it. **Establish the discriminator before choosing a fix, because a fix aimed at the
+> wrong half will look like it worked on the seats that were never affected.**
+
+> **THE REPORTED CONSEQUENCE, attributed rather than claimed:** the ASVS-TRACKER found this on itself
+> at 06:34Z and PROCESS-IMPROVEMENT reported the generator still live at ~16:2xZ; the affected seat
+> is reported still reading `seat=ASVS-TRACKER declared 17:50Z` although that seat re-declared at
+> 11:33Z. ***I did not verify that record myself and it is second-hand here.*** The consequence when
+> it does fire: the declaration lands in a dead box, the Stop hook writes an undeclared record under
+> the live one, and mail — addressed by box — goes to the dead one.
+
+> ***THE REASON THIS SURVIVED A DAY OF FOUR SEATS LOOKING AT IT: IT PRESENTS AS THREE UNRELATED
+> THINGS.*** The DISPATCHER reports diagnosing all three wrongly before connecting them — "two seats
+> answering to LIAISON", "mail -To all reaches 11 of 16", and "a seat can be alive and
+> mail-unreachable" published as a **channel** property. **If one root cause can wear three costumes,
+> the first two diagnoses will each look complete.**
+
+> **TWO CANDIDATE FIXES, different sizes:** an ABSOLUTE path in the brief (small, and it only fixes
+> new briefs), or `seat.ps1` keying on the SESSION rather than the invoking tree (larger, and it is
+> the shared root — `lane.ps1` derives its key the same way).
+
+**Cluster:** Fleet coordination. **Priority:** P2. **Verdict:** build (small, pending the discriminator).
+**Severity:** no engine effect, no PHI axis, no deployment axis (sec. 0). It degrades seat addressing:
+an affected seat is alive, working, and unreachable by the channel that leaves a receipt.
+
+---
+
+## 1392. PR 609 must land WITH OR AFTER ADR 0172: it replaces a stale understatement of the TLS posture with an overstatement that is false on main, and links an ADR file main does not have
+
+> 🔢 **FILED 2026-08-29 (builder 2).** PR 609 deletes two strings saying remote TLS exposure is
+> still to come -- `CLAUDE.md:120` and `messagefoundry/api/app.py:19` -- and replaces them with text
+> asserting the engine **always serves TLS**, minting a self-signed certificate on first run, citing
+> **ADR 0172**. ***BOTH THE OLD TEXT AND THE NEW TEXT ARE WRONG ABOUT MAIN, IN OPPOSITE DIRECTIONS.***
+
+> **THE OLD TEXT UNDERSTATES, so PR 609 is right that it must go.** TLS shipped: main carries
+> `messagefoundry/config/tls_policy.py`, `TlsSettings`, `[api].tls_cert_file` / `tls_key_file`, a
+> read-only cert inventory and a `cert self-signed` subcommand, and `__main__.py` says in-process TLS is
+> *"allowed off-loopback without this flag"*.
+
+> ***THE NEW TEXT OVERSTATES, AND THAT IS THE HAZARD -- A SECURITY CLAIM ASSERTING MORE THAN THE
+> MECHANISM DELIVERS.*** Measured at `origin/main`:
+
+| claim in PR 609's replacement text | what main actually does |
+|---|---|
+| "always serves TLS" | `--allow-insecure-bind` is present and permits a non-loopback bind **without** TLS |
+| "mints ... on first run" | **no auto-mint in the serve path.** Minting is the explicit `cert self-signed` subcommand, whose own help says **"for NON-PROD TLS bring-up ONLY"** |
+| `[ADR 0172](docs/adr/0172-...md)` | **not on main.** 167 files under `docs/adr/`, **zero** named 0172, and **no index row** |
+
+> Controls for both scans: `0171` returns 1 as a file and 1 as an index row, so the pattern sees ADRs.
+
+> ***THE CONSTRAINT: PR 609 MUST LAND WITH OR AFTER ADR 0172, NEVER BEFORE.*** Landed first it trades a
+> stale understatement for a false claim of a TLS posture the engine does not have, and it puts a
+> **broken relative link** into `CLAUDE.md`, the file every session reads first. Landed with 0172, every
+> sentence in it becomes true. **The change is correct; only its ORDER is the defect.**
+
+> **DO NOT "FIX" THIS BY REWORDING 609 TO MATCH TODAY'S MAIN** -- that is a third posture to re-review
+> when 0172 lands. Hold 609 behind 0172.
+
+> **PROVENANCE, because the finding changed shape.** The DISPATCHER found the sequencing hazard and
+> reported the old strings as **true**. They are not, they are stale, which weakens the case for holding
+> 609. ***THE HOLD SURVIVES ON THE OPPOSITE EVIDENCE: not "609 would delete something true" but "609
+> would assert something false."*** Right conclusion, wrong reason, and the corrected reason is stronger.
+> Filed as a row because a cross-session message dies with its session and this constraint must outlive it.
+
+**Cluster:** Documentation / security posture. **Priority:** P2. **Verdict:** build (ordering only).
+**Severity:** no engine effect and no PHI axis (sec. 0, zero deployments). It would ship a **false
+security claim** in the two files a new reader trusts first, plus a broken link.
+
+---
+
+## 1388. docs/SECURITY.md cites 9 config keys the loader now refuses, and two of the citations are instructions a reader cannot follow
+
+> 🔢 **FILED 2026-08-29 (builder 2).** ADR 0118 relocated fifteen settings under `[security]`, and
+> `_reject_relocated_keys` now **raises** on the old spellings (`settings.py`, `_RELOCATED_TO_SECURITY`).
+> `docs/SECURITY.md` still cites **9 of those 15 keys on 14 lines**. The lines are not equivalent and
+> the item is the SPLIT, not a find-and-replace.
+
+> **MEASURED, and the classification is the whole item.** Every line read; no regex made the call.
+>
+> | class | count | lines |
+> |---|---|---|
+> | **INSTRUCTION** — a reader following it writes config the loader refuses | **2** | 811, 1378 |
+> | **DESCRIBE** — accurate mechanism, stale spelling | **10** | 21, 35, 42, 806, 856, 886, 1190, 1191, 1204, 1241 |
+> | **ALREADY CORRECT** — names the refusal itself, change nothing | **2** | 186, 1181 |
+>
+> **L811 is the only unambiguous one:** *"The documented org opt-out is `[auth].require_mfa = false`."*
+> That tells a reader the documented way to do a thing, in a spelling that fails at load. **L1378** is
+> second — *"raising `[auth].session_absolute_hours` or `[auth].session_idle_timeout_minutes` beyond
+> those bounds is a documented risk deviation"* names an action on two refused keys.
+
+> **THE TWO ALREADY-CORRECT LINES ARE THE REASON THIS IS NOT A SWEEP.** L186 reads "the old
+> `[diagnostics].audit_all_authz` TOML spelling is **refused at load**"; L1181 gives
+> `[security].sign_out_after_idle_minutes` / `max_session_hours` as "the ADR 0118 homes" and calls the
+> `[auth].*` pair "**the retired aliases**". ***A builder told "fix 14 lines" edits two lines that are
+> already right.***
+
+> **THREE INSTRUMENT FAILURES, RECORDED BECAUSE THEY WILL RECUR IN THIS FILE.** An
+> instruction-vs-description regex called **6** instructions against a true **2** — a 3x over-count.
+> An already-names-refusal regex flagged L1190, L1191 and L1241, all three FALSE: they use
+> "refusing"/"refusal" in an unrelated sense (arms that refuse; an empty list being a refusal). And a
+> key-table regex using `"[a-z_.]+"` for the replacement value **silently dropped `[api].host`**, whose
+> value is `local_access_only / listen_address` — a space and a slash. L42 and L1191 only appeared once
+> that was fixed. ***The miss was invisible; the count simply read 14 keys instead of 15.***
+
+**Cluster:** documentation accuracy / secure-by-default. **Priority:** P3. **Verdict:** build.
+**Severity:** no engine effect, no PHI axis, no deployment axis (sec. 0). A deploying site following
+L811 **would** write a key the loader refuses and get a load failure — loud, not silent, so the
+posture is not weakened. The cost is a documented opt-out that does not work as documented.
+
+---
+
+## 1400. the 90 percent Workflow gate is a per-launch question, so its margin does not scale with concurrent launchers or with a fan-out's own later phases
+
+> 🔢 **Filed 2026-08-29 (lander) - not started.** The gate prints `max(5-hour, weekly)` at the
+> instant one session asks, and refuses a new Workflow above `WORKFLOW_GATE_AT`. It answers *"is the
+> pool low enough for MY launch"* correctly every time, and that is the defect: **N launchers each get a
+> correct yes, and the sum is wrong.**
+> Verdict: build
+> Research: none
+> Closing-act: code
+
+**Cluster:** coordination tooling / usage clock. **Priority:** P2. **Verdict:** build.
+**Severity:** no engine, PHI or deployment axis (sec. 0). It governs fleet spend, not the product. **The
+cost is a usage window dying hours early while every seat followed the rule**, which is also why it does
+not present as anyone's error.
+
+**THE MITIGATION THAT EXISTS IS A MARGIN, AND THE MARGIN IS SIZED FOR ONE.** This row does **not** claim
+concurrency was overlooked -- `watch.py` says the opposite in its own header: the owner **lowered**
+`WORKFLOW_GATE_AT` from 92.0 to 90.0 on 2026-08-05 *"because the threshold is a function of
+CONCURRENCY"*, reasoning at `:612` that *"a Workflow moves a pool 5-7 points, so at 92 a single in-flight
+Workflow could cross the ceiling."* **That is a margin for ONE in-flight Workflow. Nothing in the check
+scales it with how many are already running, because the gate has no denominator.**
+
+**LIMB 1 -- AGGREGATE BLINDNESS. Measured 2026-08-29.** Five fan-outs launched between 23:37Z and
+23:45Z, roughly 49 agents. **Every one read the gate and passed honestly at 2-6 percent**, because the
+other launches' costs had not landed yet. The pool went **2 percent at 23:36:53Z to 43 percent at
+23:56:48Z**. Nobody was careless and no seat could have seen it from where it stood.
+
+**LIMB 2 -- IT IS SELF-SYNCHRONISING, WHICH IS WHY THIS IS NOT RARE.** A window reset is the single
+instant when every seat is simultaneously unblocked, holding queued work, and reading the lowest number
+it will see all window. **So the gate is most permissive exactly when demand peaks.** Two consecutive
+windows took this shape; the earlier one ran 5 to 98 percent in about seventy minutes.
+
+**LIMB 3 -- IT IS ALSO BLIND TO THE LAUNCHER'S OWN LATER PHASES.** A per-launch gate reads the launch
+instant; a multi-phase fan-out spends most of its cost later. Reported by the PM against itself: it
+cleared the gate on a workflow whose expensive stage -- a 37-refuter phase -- appeared in no number the
+gate checked, **including the PM's own agent count**. It killed that run at 4 agents spent.
+
+**AND THE OBVIOUS SELF-COUNT UNDER-REPORTS, MEASURED ON THIS FILER'S OWN RUN.** Counting `agent(` call
+sites is the natural way to size your own fan-out and it is wrong, because **fan width lives in the
+array, not at the call site**:
+
+```
+verify-six-rows-by-their-own-instrument
+  grep -c 'agent('        ->  3   call sites, at lines 83, 100 and 130
+  const ROWS = [...]      ->  6   at line 76, nowhere near any of them
+  agents actually started -> 13
+```
+
+**A 4.3x under-report from the instrument a launcher would reach for first.** Read every `parallel()`
+and `.map()`, multiply by the array length, and sum across phases: **a phase's cost is fan width times
+depth and neither appears at the `agent()` call.**
+
+**WHAT WOULD ACTUALLY CLOSE IT, AS OPTIONS RATHER THAN A DESIGN.** A denominator the gate does not have
+today: fan-outs in flight fleet-wide, and agents REMAINING rather than launched. `lane.ps1` is
+first-person by construction and deliberately has no `-Lane` parameter, so this is not that -- it is
+closer to a live census a launcher must read before calling, rather than a broadcast after the fact.
+**Lowering the threshold again is the one thing that will not work**, because it buys margin per
+launcher and the failure is in the sum.
+
+**NOT CLAIMED:** that any seat launched carelessly, that the gate is wrong about the question it asks,
+or that a fix is obvious. Every measured launch cleared it honestly.
+
+**PROVENANCE:** limbs 1 and 2 are the PM's, relayed and measured by the steward; limb 3 is the PM
+reporting its own failure case; the dispatcher screened it against the ledger and the alloc titles and
+routed it as content with no number. **The filer re-ran the screen over `origin/main` and over all 460
+backlog alloc records before allocating** -- `workflow` 0, `concurren` 0, `fan-out` 0 in titles;
+`fanout` 3 all seat-clock (#1264, #1266, #1267); `aggregate` 1 (#1250). Controls: `gate` 72 titles,
+`workflow` 191 lines in the ledger, an impossible string 0. **The `watch.py` margin history above is the
+filer's own read**, and it is the part that changes the row's ask.
+
+## 1397. the Bash tool unescapes backslashes inside a QUOTED heredoc, so a Windows path or a doubled-backslash regex silently changes meaning
+
+> 🔢 **Filed 2026-08-29 - measured, not fixable here.** In the Claude Code Bash tool a quoted heredoc
+> (`<<'EOF'`) applies one level of backslash-unescaping to the body. POSIX requires a quoted delimiter
+> to suppress all expansion and processing, so the body must reach the shell verbatim. It does not: a
+> line written `C:\\Users` arrives as `C:\Users`. Hit twice in one session while editing
+> `~/.claude/mefor-usage/accounts.json`, and both times the symptom was a Python `SyntaxError` that
+> reads as the model having written bad code.
+> Verdict: owner-ruling
+> Research: done 2026-08-29
+> Closing-act: owner-ruling
+
+**Cluster:** agent tooling / harness. **Priority:** P3. **Severity:** no deployment axis (sec. 0) --
+this is the Claude Code harness, not engine code. Nothing ships in the wheel and no MessageFoundry
+behaviour changes. The cost is at authoring time: a session writing a script through a heredoc can
+emit something subtly different from what it composed.
+
+**The measurement.** Both rows below were written inside `cat <<'EOF' ... EOF` in one tool call:
+
+| written in the tool call | arrived at the shell |
+|---|---|
+| `C:\Users` | `C:\Users` |
+| `C:\\Users` | `C:\Users` |
+
+One backslash survives; two collapse to one. That is a single unescape pass in which `\\` is a
+recognised escape and `\U` is not.
+
+**Why it presents as a model error rather than a tooling one.** Piped into `python - <<'EOF'`, the
+collapsed form raises `SyntaxError: (unicode error) 'unicodeescape' codec can't decode bytes in
+position 2-3: truncated \UXXXXXXXX escape`, and the traceback points at a source line the model never
+wrote. The failure is attributed to the code rather than to the transport, so the natural response is
+to rewrite the Python, which cannot help. On a Windows box this is not an edge case: every absolute
+path carries backslashes.
+
+**Workarounds that do hold.**
+1. Build the separator at runtime -- `BS = chr(92)`, then concatenate. This is what landed the
+   `accounts.json` row on 2026-08-29 after the direct form failed twice.
+2. Use the PowerShell tool with a single-quoted here-string (`@'` ... `'@`). Measured unaffected in
+   the same session, including for a multi-line body containing backslash paths.
+3. Forward slashes, where the consumer accepts them.
+
+**Why this is filed here rather than fixed here.** The defect is upstream in the harness and no change
+in this repo can close it. It is filed so the next session that meets the `truncated \UXXXXXXXX` error
+stops rewriting its Python and reaches for a workaround above. **The owner's call is whether to report
+it upstream via `/bug`** -- no feedback tool was available to the session that measured it, and
+`/bug` needs an interactive terminal.
+
 
 ## 1373. the bash resolver rejects a working interpreter when coreutils is absent from PATH, conflating a harness fault with a namespace verdict
 
