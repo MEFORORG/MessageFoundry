@@ -34,6 +34,7 @@ tests/test_asvs_scorecard.py
 tests/test_asvs_tally_lint.py
 tests/test_asvs_verifier_vault_contract.py
 tests/test_backlog_citation_check.py
+tests/test_backlog_hygiene_claim_extraction.py
 tests/test_backlog_status_check.py
 tests/test_banner_sha_check.py
 tests/test_bash_resolver.py
@@ -108,6 +109,7 @@ tests/test_quality_advisory_invariants.py
 tests/test_quality_record_scope_claims.py
 tests/test_required_contexts.py
 tests/test_required_workflow_state.py
+tests/test_rescue_ref_provenance.py
 tests/test_scan_forbidden_loaded_set.py
 tests/test_sbom_finalize.py
 tests/test_script_root_anchoring.py
@@ -122,6 +124,7 @@ tests/test_setup_leak_gate_reports_source.py
 tests/test_stalled_prs.py
 tests/test_testpaths_webconsole_coverage.py
 tests/test_verdict_divergence_check.py
+tests/test_workflow_local_action_check.py
 tests/test_workflow_shell_syntax.py
 tests/test_worktree_gate_command_parsing.py
 tests/test_worktree_gate_control_plane.py
