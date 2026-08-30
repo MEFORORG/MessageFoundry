@@ -30,6 +30,7 @@ import os
 import subprocess
 import sys
 import time
+from pathlib import Path
 
 import pytest
 
@@ -280,7 +281,7 @@ def test_sampler_measures_a_descendant_that_actually_burns_cpu() -> None:
         time.sleep(
             1.0
         )  # let the redirector's real interpreter appear before the subtree is resolved
-        sampler = FdSampler(os.getpid(), resolve_every=1)
+        sampler = FdSampler(os.getpid(), resolve_interval_s=0.0)
         first = sampler.sample_proc()
         if first.cpu_seconds is None:
             pytest.skip("OS CPU probe unavailable on this runner")
@@ -335,9 +336,9 @@ def _walk_succeeded(sampler: FdSampler) -> bool:
     to read. ``_pids`` retains the last GOOD resolution across a subsequent FAILED walk (that is the
     point of the cache), so ``_pids is not None`` scores every later walk a success once any earlier one
     has succeeded, and then reports the stale cache as that walk's result. ``_resolve_errored`` is set
-    per walk, so it answers the question actually being asked. With ``resolve_every=1`` the cached-serve
-    branch of ``_resolve_pids`` (which clears the flag without walking) is never taken, so the flag here
-    is exactly this walk's outcome."""
+    per walk, so it answers the question actually being asked. With ``resolve_interval_s=0.0`` every
+    tick is immediately due, so the cached-serve branch of ``_resolve_pids`` (which clears the flag
+    without walking) is never taken and the flag here is exactly this walk's outcome."""
     sampler.sample_proc()
     return not sampler._resolve_errored
 
@@ -349,7 +350,7 @@ def test_subtree_re_resolution_picks_up_a_late_spawned_child(
 ) -> None:
     # A3: the subtree used to be resolved exactly ONCE. A sharded engine's `serve --shard` workers appear
     # AFTER the supervisor, so a one-shot walk pins the sampler to an idle parent for the whole run.
-    sampler = FdSampler(os.getpid(), resolve_every=1)
+    sampler = FdSampler(os.getpid(), resolve_interval_s=0.0)
     sampler.sample_proc()  # walk 1 — before the child exists
     resolved_before = list(sampler._pids or [])
 
@@ -494,10 +495,9 @@ def test_subtree_re_resolution_picks_up_a_late_spawned_child(
     )
 
 
-def test_resolve_every_serves_from_cache_between_walks(monkeypatch: pytest.MonkeyPatch) -> None:
-    # The cache still amortises the process-table walk: with resolve_every=3, three consecutive calls
-    # walk once. (Guards against a fix that re-walks every tick and blows up the probe's cost.)
-    sampler = FdSampler(os.getpid(), resolve_every=3)
+def _count_walks(sampler: FdSampler, monkeypatch: pytest.MonkeyPatch) -> dict[str, int]:
+    """Replace the process-table walk with a counter, so a test can pin the TRIGGER without paying for
+    a real enumeration (or depending on what this host's process table happens to contain)."""
     walks = {"n": 0}
 
     def _fake_descendants() -> list[int]:
@@ -506,12 +506,53 @@ def test_resolve_every_serves_from_cache_between_walks(monkeypatch: pytest.Monke
 
     monkeypatch.setattr(sampler, "_descendants_windows", _fake_descendants)
     monkeypatch.setattr(sampler, "_descendants_posix", _fake_descendants)
+    return walks
 
-    # resolve_every=3 ⇒ a walk every 3 calls: call 1 walks, calls 2-3 are served from the cache.
+
+def test_the_front_loaded_walks_run_on_consecutive_ticks(monkeypatch: pytest.MonkeyPatch) -> None:
+    # BACKLOG #1357. The first `frontload_walks` ticks each re-walk, no matter how little time has
+    # passed — which is the half of the trigger a purely time-based one cannot supply. A sweep step
+    # gets a FRESH sampler and the workers spawn during its ramp, so the interval that serves a long
+    # profile well is longer than the entire window a short one has.
+    sampler = FdSampler(os.getpid(), frontload_walks=3, resolve_interval_s=60.0)
+    walks = _count_walks(sampler, monkeypatch)
+
+    for _ in range(3):
+        sampler._resolve_pids()
+    assert walks["n"] == 3  # every front-loaded tick walked, inside a 60 s interval
+    sampler._resolve_pids()  # front-load spent: now the interval governs, and it has not elapsed
+    assert walks["n"] == 3
+
+
+def test_the_subtree_is_served_from_cache_between_amortised_re_walks(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Past the front-load the cache still amortises the process-table walk: three consecutive ticks
+    # inside one interval walk once. (Guards against a fix that re-walks every tick and blows up the
+    # probe's cost — a walk measured 0.9-1.2 s against a 0.25 s poll interval, so paying it per tick
+    # would let the probe rather than the profile set the sampling cadence.)
+    sampler = FdSampler(os.getpid(), frontload_walks=1, resolve_interval_s=60.0)
+    walks = _count_walks(sampler, monkeypatch)
+
     for _ in range(3):
         sampler._resolve_pids()
     assert walks["n"] == 1
-    sampler._resolve_pids()  # the 4th call crosses the TTL and re-walks
+
+
+def test_an_elapsed_interval_re_walks_however_few_ticks_have_passed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The other half of BACKLOG #1357, and the falsifier for the test above: the steady-state trigger
+    # must be SECONDS. A tick-counted one cannot fire in a window that affords fewer ticks than it
+    # counts, which is what made the retired `_RESOLVE_EVERY_TICKS = 8` unreachable on every shipped
+    # short profile. Two ticks are enough here because the interval, not the count, is what is due.
+    sampler = FdSampler(os.getpid(), frontload_walks=1, resolve_interval_s=0.05)
+    walks = _count_walks(sampler, monkeypatch)
+
+    sampler._resolve_pids()  # the front-loaded walk
+    assert walks["n"] == 1
+    time.sleep(0.06)  # sleeps AT LEAST this long, so the interval is certainly elapsed
+    sampler._resolve_pids()
     assert walks["n"] == 2
 
 
@@ -520,7 +561,11 @@ def test_a_transient_resolve_error_does_not_blackout_the_rest_of_the_run(
 ) -> None:
     # A failed re-walk degrades THAT tick only. Without this, one enumeration timeout under load would
     # pin _resolve_errored=True and every later cached tick would emit a gap for the whole run.
-    sampler = FdSampler(os.getpid(), resolve_every=3)
+    #
+    # Driven off the FRONT-LOAD (two walks, then a 60 s interval nothing here can cross) rather than off
+    # a short interval and a sleep: the failure this covers is not a timing one, and a rig that needs a
+    # tick to land inside a 50 ms window would red on a loaded runner for a reason unrelated to it.
+    sampler = FdSampler(os.getpid(), frontload_walks=2, resolve_interval_s=60.0)
     outcomes: list[list[int] | None] = [[], None]
 
     def _fake_descendants() -> list[int] | None:
@@ -529,13 +574,11 @@ def test_a_transient_resolve_error_does_not_blackout_the_rest_of_the_run(
     monkeypatch.setattr(sampler, "_descendants_windows", _fake_descendants)
     monkeypatch.setattr(sampler, "_descendants_posix", _fake_descendants)
 
-    sampler._resolve_pids()  # call 1: walk -> success, caches
+    sampler._resolve_pids()  # call 1: front-loaded walk -> success, caches
     assert sampler._resolve_errored is False
-    sampler._resolve_pids()  # call 2: cached
-    sampler._resolve_pids()  # call 3: cached
-    sampler._resolve_pids()  # call 4: TTL expired -> walk -> ERRORS; this tick degrades
+    sampler._resolve_pids()  # call 2: front-loaded walk -> ERRORS; this tick degrades
     assert sampler._resolve_errored is True
-    sampler._resolve_pids()  # call 5: served from the still-valid cache -> the run recovers
+    sampler._resolve_pids()  # call 3: served from the still-valid cache -> the run recovers
     assert sampler._resolve_errored is False
 
 
@@ -728,7 +771,7 @@ def test_the_reported_peak_excludes_a_stale_ppid_adopted_subtree(
         root = subprocess.Popen([sys.executable, "-c", _IDLE])  # noqa: S603 - fixed argv
         time.sleep(1.0)  # let both settle (and any launcher shim re-exec its base interpreter)
 
-        sampler = FdSampler(root.pid, resolve_every=1)
+        sampler = FdSampler(root.pid, resolve_interval_s=0.0)
         real_rows = _enumerate(sampler)
         if not real_rows:
             pytest.skip("process-table enumeration unavailable on this runner")
@@ -766,3 +809,189 @@ def test_the_reported_peak_excludes_a_stale_ppid_adopted_subtree(
             if proc is not None:
                 proc.kill()
                 proc.wait(timeout=10)
+
+
+# --- the acceptance test: workers that spawn AFTER the sampler resolved (BACKLOG #1357) ------------
+
+#: How many workers the stand-in root spawns AFTER the sampler has already resolved its subtree.
+#: Three is enough that the handle block they hold is unmistakable in a SUM, and few enough to spawn
+#: inside a sweep step's tick budget on a loaded runner.
+_LATE_WORKERS = 3
+
+#: The tick budget ONE connscale sweep step affords the FD probe -- deliberately the TIGHTEST shipped
+#: one, because that is the binding case: a trigger that fires within two ticks fires within every
+#: larger budget too.
+#:
+#: MEASURED, NOT CHOSEN. A real ``run_connscale`` sweep at the CI cell's cadence
+#: (``tests/test_connscale_smoke.py``: ``hold_seconds = 1.5``, ``poll_interval_s = 0.25``) reported
+#: ``fd_probe_ticks = 2`` on all four of its steps, because one probe tick costs 0.2-1.2 s of
+#: process-table walk plus per-PID read ON TOP of the 0.25 s interval. That is the whole of BACKLOG
+#: #1357: the retired ``_RESOLVE_EVERY_TICKS = 8`` encoded a TIME intent ("every few seconds") in a
+#: TICK unit, and a tick is not the poll interval -- it is several times longer.
+_CI_STEP_TICK_BUDGET = 2
+
+#: The shipped poll cadence the ticks below are spaced at (``poll_interval_s``, the same on the CI
+#: cell and on ``harness/load/profiles/connscale-smoke.toml``).
+_CI_POLL_INTERVAL_S = 0.25
+
+#: How long to wait for the spawned workers to reach the process table AND open their handle block.
+#: Generous on purpose: this is FIXTURE SETUP, not the property. A runner too starved to spawn three
+#: processes in this long has disproved nothing, so the wait must not be the thing that decides.
+_GROWTH_TIMEOUT_S = 30.0
+
+#: A stand-in for the subprocess sandbox's per-inbound worker child, which
+#: ``messagefoundry/pipeline/sandbox.py`` spawns LAZILY ON FIRST DISPATCH -- i.e. after the runner has
+#: already built the sampler, which is when a resolve-once cache is at its most wrong. It waits on a
+#: flag FILE rather than on stdin so no launcher shim in the middle can swallow the signal, and it
+#: exits on a second flag so the test can clean up processes it does not own (they are the root's
+#: children, not this process's, so killing the root does not reap them).
+_TREE_ROOT = (
+    "import os, subprocess, sys, time\n"
+    "go, stop, k, src = sys.argv[1], sys.argv[2], int(sys.argv[3]), sys.argv[4]\n"
+    "while not os.path.exists(go) and not os.path.exists(stop): time.sleep(0.02)\n"
+    "kids = [subprocess.Popen([sys.executable, '-c', src, stop]) for _ in range(k)]\n"
+    "deadline = time.monotonic() + 45\n"
+    "while time.monotonic() < deadline and not os.path.exists(stop): time.sleep(0.05)\n"
+)
+
+#: One late worker. It opens the same countable block of sockets the adoptee above does, so its
+#: contribution to a handle/fd SUM is a magnitude rather than a set-membership technicality.
+_LATE_WORKER = (
+    "import os, socket, sys, time\n"
+    f"s = [socket.socket() for _ in range({_ADOPTEE_HANDLES})]\n"
+    "deadline = time.monotonic() + 45\n"
+    "while time.monotonic() < deadline and not os.path.exists(sys.argv[1]): time.sleep(0.05)\n"
+)
+
+
+def _subtree_truth(root_pid: int) -> list[int] | None:
+    """A FRESH process-table walk over ``root_pid``'s subtree -- the GROUND TRUTH the sampler under
+    test is judged against.
+
+    Taken through a THROWAWAY sampler so nothing here touches the cache, the walk counter or the
+    degraded cause of the one being measured. ``None`` means the enumeration was unavailable."""
+    rows = _enumerate(FdSampler(root_pid))
+    if rows is None:
+        return None
+    return _validated_descendants(rows, root_pid)
+
+
+def _handles_summed_over(root_pid: int, pids: list[int]) -> int | None:
+    """A real per-PID handle read summed over ``pids``, through a throwaway sampler."""
+    scratch = FdSampler(root_pid)
+    raw = scratch._sample_windows(pids) if sys.platform == "win32" else scratch._sample_posix(pids)
+    return raw.handles
+
+
+def _peak_of(readings: list[ProcSample]) -> int | None:
+    """Push REAL probe readings through the SHIPPED derivation, so what the test asserts is
+    ``handles_peak`` -- the gauge the connscale FD SLO judges -- and never an intermediate."""
+    samples = []
+    for i, raw in enumerate(readings):
+        s = _sample(float(i))
+        _PROC_BY_SAMPLE[id(s)] = raw
+        samples.append(s)
+    return _drain_proc(samples).handles_peak
+
+
+@pytest.mark.skipif(sys.platform not in ("win32", "linux"), reason="OS process-table probe path")
+def test_the_probe_covers_workers_spawned_after_it_resolved_within_one_steps_tick_budget(
+    tmp_path: Path,
+) -> None:
+    """BACKLOG #1357 acceptance -- the probe must report the tree the step ENDS with, not the one it
+    started with, inside the tick budget a real step affords.
+
+    THREE THINGS THIS TEST DELIBERATELY DOES, each because the obvious version of it passes against
+    the defect:
+
+    * It builds the sampler the way PRODUCTION does -- ``FdSampler(pid)``, no trigger override
+      (``harness/load/connscale/runner.py`` and ``harness/load/estate/runner.py`` both construct it
+      bare). The pre-existing A3 guard above forces the trigger on explicitly, which proves
+      re-resolution works WHEN ASKED. Production never asks, and that is the defect.
+    * It asserts the COVERING PID SET and the reported ``handles_peak``, never "a re-resolution
+      happened". A walk always happens at tick 1 under every possible trigger, so a walk-counter
+      assertion is true by construction and discriminates nothing.
+    * It is bounded by ``_CI_STEP_TICK_BUDGET`` ticks, not by wall time. Given ticks enough the old
+      tick-counted trigger DOES fire (measured: the second walk lands at tick 9), so an unbounded
+      drive passes against the very defect it is meant to catch.
+
+    The growth is triggered between ticks by the test rather than at a wall-clock moment the fixture
+    would have to guess, and it is confirmed against a ground-truth walk BEFORE the sampler is judged --
+    so a slow spawn fails the positive control by name instead of failing the property.
+    """
+    go, stop = tmp_path / "go", tmp_path / "stop"
+    root = subprocess.Popen(  # noqa: S603 - fixed argv, no shell
+        [sys.executable, "-c", _TREE_ROOT, str(go), str(stop), str(_LATE_WORKERS), _LATE_WORKER]
+    )
+    try:
+        time.sleep(1.0)  # let the root settle (and any Windows launcher shim re-exec its base)
+
+        sampler = FdSampler(root.pid)  # PRODUCTION construction -- no trigger override
+        readings = [sampler.sample_proc()]  # tick 1: mid-ramp, before the workers exist
+        first = readings[0]
+        if first.handles is None:
+            pytest.skip(f"OS handle probe unavailable on this runner ({first.degraded})")
+        before = _subtree_truth(root.pid)
+        if before is None:
+            pytest.skip("process-table enumeration unavailable on this runner")
+        handles_before = first.handles
+
+        go.write_text("go", encoding="utf-8")
+
+        # Judge the sampler only once the growth is REAL: the workers in the process table AND holding
+        # their sockets. Judging earlier would red the sampler for the fixture's timing.
+        deadline = time.monotonic() + _GROWTH_TIMEOUT_S
+        after: list[int] = before
+        grown_handles: int | None = None
+        while time.monotonic() < deadline:
+            walked = _subtree_truth(root.pid)
+            if walked is None:
+                continue
+            summed = _handles_summed_over(root.pid, [root.pid, *walked])
+            if (
+                len(walked) - len(before) >= _LATE_WORKERS
+                and summed is not None
+                and summed - handles_before >= _LATE_WORKERS * _ADOPTEE_HANDLES
+            ):
+                after, grown_handles = walked, summed
+                break
+
+        assert grown_handles is not None, (
+            f"POSITIVE CONTROL FAILED -- the stand-in tree did not grow by {_LATE_WORKERS} worker(s) "
+            f"holding {_ADOPTEE_HANDLES} handle(s) each within {_GROWTH_TIMEOUT_S:.0f}s. Descendants "
+            f"went {before} -> {after}. Nothing below is evidence about the probe until this holds: a "
+            f"sampler asked to see a tree that never grew would pass for the wrong reason."
+        )
+
+        # The remaining ticks of ONE step's budget, at the shipped poll cadence.
+        for _ in range(_CI_STEP_TICK_BUDGET - 1):
+            time.sleep(_CI_POLL_INTERVAL_S)
+            readings.append(sampler.sample_proc())
+
+        stalled = [r.degraded for r in readings[1:] if r.degraded is not None]
+        if stalled and all(c.is_budget_exhausted for c in stalled):
+            pytest.skip(f"the probe spent its whole budget on a later tick ({stalled})")
+
+        covered = set(sampler._pids or [])
+        missed = sorted(set(after) - covered)
+        assert not missed, (
+            f"THE FD PROBE CANNOT SEE A MULTI-PROCESS ENGINE (BACKLOG #1357). Within the "
+            f"{_CI_STEP_TICK_BUDGET} tick(s) a sweep step affords, the sampler's covering PID set "
+            f"{sorted(covered)} omits {len(missed)} of the {len(after)} live descendant(s) {after} -- "
+            f"and every omitted one spawned AFTER the sampler resolved, which is exactly when a "
+            f"subprocess-sandbox worker child appears. The subtree is walked once at tick 1, mid-ramp, "
+            f"and then frozen for the rest of the step."
+        )
+
+        peak = _peak_of(readings)
+        assert peak is not None and peak - handles_before >= _LATE_WORKERS * _ADOPTEE_HANDLES, (
+            f"`handles_peak` DOES NOT REFLECT THE GROWN TREE (BACKLOG #1357). Reported peak {peak} "
+            f"against a first tick of {handles_before} and a ground-truth read of {grown_handles} over "
+            f"the {len(after)}-descendant tree the step ended with. `handles_peak` is a plain max over "
+            f"whatever the one walk happened to catch, so a frozen PID set does not degrade it to a "
+            f"gap -- it reports a plausible number for the wrong process set."
+        )
+    finally:
+        stop.write_text("stop", encoding="utf-8")
+        root.kill()
+        root.wait(timeout=10)

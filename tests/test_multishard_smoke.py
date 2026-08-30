@@ -141,7 +141,33 @@ async def test_multishard_two_engines_shared_sqlite() -> None:
     for e in rec.per_engine:
         assert e.inbound_rows == _COUNT_PER_ENGINE, e  # exactly its own C lanes, no more
         assert e.foreign_rows == 0, e  # none of a peer's lanes bled in
-        assert e.reads > 0, e  # this engine independently received traffic on its own lanes
+        # This engine independently received traffic on its own lanes.
+        #
+        # THE MESSAGE CARRIES THE ENGINE'S OWN REASON, because the two assertions above CANNOT supply
+        # one. `inbound_rows` and `foreign_rows` are CONFIG-derived, not traffic-derived -- the API
+        # emits a source row for every registry inbound and `read` is always an int -- so both pass
+        # unchanged on an engine that received NOTHING, including one whose listeners never bound.
+        # The docstring above already concedes this ("config-derived so it holds regardless of the
+        # write lock"); the consequence for THIS line is that a bare `assert 0 > 0` names a number and
+        # no cause, which is what made the CI red undiagnosable.
+        #
+        # The engine knows: it reports the lane as not-listening with a reason (ADR 0031, surfaced as
+        # `/connections`.error), and the harness was fetching that response and discarding the field.
+        # Reproduced deterministically with a control -- a listen-never-accept squatter on one engine's
+        # inbound ports gives exactly inbound_rows PASS / foreign_rows PASS / reads 0 FAIL, with the
+        # engine reporting failed lanes throughout.
+        assert e.reads > 0, (
+            f"engine {e.name_tag} read 0 messages on its own lanes. "
+            + (
+                f"IT REPORTS THESE LANES AS NOT LISTENING: {e.failed_lanes}. That is the cause -- the "
+                f"engine never received traffic, rather than receiving it and miscounting."
+                if e.failed_lanes
+                else "It reports NO failed lanes, so the listeners bound and the traffic did not "
+                "arrive or did not commit -- a different cause from a bind failure, and one this "
+                "assertion cannot narrow further on its own."
+            )
+            + f" Full attribution: {e}"
+        )
 
     # (c) Zero-loss end-to-end is NOT required on shared SQLite (the single writer can strand a row on a
     # SQLITE_LOCKED delivery commit — the server-DB bench is the real zero-loss gate). A clean drain is a

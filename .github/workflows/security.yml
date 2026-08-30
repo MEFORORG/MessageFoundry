@@ -100,7 +100,12 @@ jobs:
           # stay out of the four exports above (and out of the SBOM / image locks / audited runtime).
           uv export --only-group ci-scanners --format requirements.txt -o ci/locks/ci-scanners.lock
           uv export --only-group ci-quality --format requirements.txt -o ci/locks/ci-quality.lock
-          git diff --exit-code -- requirements.lock docker/locks/requirements-core.lock docker/locks/requirements-sqlserver.lock constraints.lock ci/locks/ci-scanners.lock ci/locks/ci-quality.lock
+          # The RELEASE SIGNING toolchain (BACKLOG #332). Same mechanism as the two above, and it is
+          # here rather than inline in release.yml because release.yml runs ONLY on a tag push -- so a
+          # drift that lived there would first be observed during a release. Exported on every
+          # security run instead, where it is cheap to catch.
+          uv export --only-group release-tools --format requirements.txt -o ci/locks/release-tools.lock
+          git diff --exit-code -- requirements.lock docker/locks/requirements-core.lock docker/locks/requirements-sqlserver.lock constraints.lock ci/locks/ci-scanners.lock ci/locks/ci-quality.lock ci/locks/release-tools.lock
       - name: Install from the hashed lockfile (DEP-1)
         run: |
           # --require-hashes enforces a hash for every requirement (the lockfile carries them): a
@@ -685,7 +690,7 @@ jobs:
             # the env var first, so that file would never be read -- it would only drop the full real
             # token list into the job workspace for every later step to see.
             export MEFOR_REQUIRE_TOKENS=1
-            export MEFOR_MIN_DETECTORS=names=7,estate=13,site_prefixes=1
+            export MEFOR_MIN_DETECTORS=names=8,estate=14,site_prefixes=2
             echo "token list loaded from the MEFOR_FORBIDDEN_TOKENS secret (fail-closed, per-section floor)."
           elif [ "$IS_FORK_PR" = "true" ]; then
             echo "fork PR -- the secret is unavailable BY DESIGN; structural-only scan."

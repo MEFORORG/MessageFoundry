@@ -379,10 +379,19 @@ def test_the_ci_toolchain_groups_actually_raise_the_examined_count() -> None:
     """The count must MOVE, not merely be plausible — a parser that silently reads nothing new passes
     every floor above.
 
-    Measured: 41 distributions before `[dependency-groups]` was swept, 47 after. The six added names
-    are the CI toolchain (`bandit`, `pip-audit`, `zizmor`, `diff-cover`, `mutmut`, `pytest-cov`);
+    Measured on this branch: 42 distributions before `[dependency-groups]` was swept, 49 after. Six of
+    the seven added names are the CI toolchain (`bandit`, `pip-audit`, `zizmor`, `diff-cover`,
+    `mutmut`, `pytest-cov`). The seventh, `sigstore`, is the RELEASE SIGNING toolchain that BACKLOG
+    #332 routes through `uv.lock` — a different group doing a different job, listed here because this
+    test asserts what the SWEEP finds, not what any one group holds.
     `pytest-timeout` is declared in BOTH the `dev` extra and `ci-quality` and so adds nothing, which is
     itself deliberate — the identical spec in both places is what stops uv resolving two versions.
+
+    **The 41/47 this docstring carried was ALREADY STALE before #332 touched it** — `main` measures
+    42/48 today, so the prose had drifted from the assertion beside it while the test still passed.
+    Re-pointing the SET is what the failure message asks for; the counts are prose, and prose that
+    disagrees with the assertion next to it is how a reader learns to trust neither. Both are now
+    measured rather than remembered.
 
     Asserted as a SET DELTA rather than a magic total, so adding an ordinary dependency tomorrow does
     not red this, but the group table falling out of the parser does.
@@ -397,9 +406,18 @@ def test_the_ci_toolchain_groups_actually_raise_the_examined_count() -> None:
 
     added = with_groups - without
     print(f"examined: {len(without)} -> {len(with_groups)} (+{len(added)}): {sorted(added)}")
-    assert added == {"bandit", "pip-audit", "zizmor", "diff-cover", "mutmut", "pytest-cov"}, (
-        f"the [dependency-groups] sweep added {sorted(added)}; expected the six CI toolchain names. "
-        "If a tool was deliberately added or removed, re-point this set in the same commit."
+    assert added == {
+        "bandit",
+        "pip-audit",
+        "zizmor",
+        "diff-cover",
+        "mutmut",
+        "pytest-cov",
+        "sigstore",
+    }, (
+        f"the [dependency-groups] sweep added {sorted(added)}; expected the six CI toolchain names "
+        "plus sigstore, the release-signing toolchain. If a tool was deliberately added or removed, "
+        "re-point this set in the same commit."
     )
     assert "pytest-timeout" in without, (
         "pytest-timeout must remain declared in the [dev] extra too — the ci-quality group deliberately "
