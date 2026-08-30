@@ -22,6 +22,18 @@ name: CodeQL
 # Settings -> Security -> Code scanning (one toggle, auto-pinned, auto-updated). Default setup and this
 # advanced workflow are mutually exclusive — if you turn default setup ON, delete this file.
 on:
+  # BACKLOG #340. THE QUEUE IS LIVE AND THESE THREE CONTEXTS ARE REQUIRED, so without this
+  # trigger CodeQL never reports on a merge_group event and NOTHING MERGES. Measured
+  # 2026-08-27 on the first entry the queue ever held: PR 619 sat AWAITING_CHECKS with 32
+  # check-runs green on gh-readonly-queue/main/pr-619-bca93ee1 and exactly three contexts
+  # absent -- CodeQL, CodeQL (python), CodeQL (javascript-typescript).
+  #
+  # security.yml's own on: block predicted this in the PR that added merge_group to the other
+  # four workflows: "the failure mode of the reverse order is total -- enable a queue while a
+  # required context's workflow has no merge_group trigger and that check never reports in the
+  # queue, so NOTHING MERGES." codeql.yml was not among those four, and the contexts were made
+  # required afterwards.
+  merge_group:
   push:
     branches: [main]
   pull_request:
@@ -59,12 +71,12 @@ jobs:
         with:
           persist-credentials: false # CodeQL uploads via the job token, not a persisted git credential
       - name: Initialize CodeQL
-        uses: github/codeql-action/init@ff2f1c621b7f889edc0d3c761ac2e6a3f8cdb0dd # v4.37.7
+        uses: github/codeql-action/init@db488ddef3bf6cb639b32c2e9a7c0a7ea8271d28 # v4.37.8
         with:
           languages: ${{ matrix.language }}
           # security-extended adds higher-recall security queries on top of the default suite.
           queries: security-extended
       - name: Analyze
-        uses: github/codeql-action/analyze@ff2f1c621b7f889edc0d3c761ac2e6a3f8cdb0dd # v4.37.7
+        uses: github/codeql-action/analyze@db488ddef3bf6cb639b32c2e9a7c0a7ea8271d28 # v4.37.8
         with:
           category: "/language:${{ matrix.language }}"

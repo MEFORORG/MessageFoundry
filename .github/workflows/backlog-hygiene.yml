@@ -28,6 +28,12 @@
 name: backlog-hygiene
 
 on:
+  # BACKLOG #340 step 1. INERT UNTIL A MERGE QUEUE EXISTS: with no queue configured GitHub never
+  # emits merge_group, so this workflow behaves identically today. It is added FIRST and separately
+  # because the failure mode of the reverse order is total -- enable a queue while a required
+  # context's workflow has no merge_group trigger and that check never reports in the queue, so
+  # NOTHING MERGES.
+  merge_group:
   pull_request:
     branches: [main]
 
@@ -100,7 +106,32 @@ jobs:
           #
           # It also removes the need for a no-parenthetical fallback: a subject with no parens at all
           # is one line, and it still carries its BACKLOG token.
-          items="$(printf '%s\n%s\n' "$PR_TITLE" "$PR_BODY" | tr '\051' '\n' | grep -i BACKLOG | grep -oE '#[0-9]+' | tr -d '#' | sort -un || true)"
+          # A MENTION IS NOT A CLAIM, so strip code before extracting (BACKLOG #1296). A token
+          # written in backticks to DISCUSS this gate, or quoted inside a fenced block to show
+          # this job's own error output, was indistinguishable from one written to CLAIM an item.
+          # This is a REQUIRED check, so that direction is a false DENY on a compliant pull
+          # request -- the direction that gets acted on, where a false pass is merely believed.
+          # It fired for real on PR #428: the paragraph explaining this gate is what tripped it.
+          #
+          # THE RULE IS NOT INVENTED HERE. `backlog_citation_check.py`, a LATER STEP OF THIS SAME
+          # JOB, already draws this line for citations -- fenced blocks by toggle, inline spans by
+          # position -- and its own record says a same-line rule was tried first and read generic
+          # prose as a citation. That lesson never moved upward inside this file. This is that
+          # rule one stage earlier, so the two halves of one job stop disagreeing about what
+          # counts as text.
+          #
+          # STRIPPING MUST PRECEDE THE OCTAL-ESCAPED SPLIT, not follow it: a fence marker is a
+          # whole LINE, and splitting on close-paren first can cut one in half. A close-paren
+          # inside a code span is dropped WITH the span, which is correct -- it never delimited a
+          # group. The scoping this preserves is BACKLOG #1347's and must not be disturbed.
+          #
+          # NO CLOSE-PAREN APPEARS INSIDE THE STRIP SUBSTITUTION, deliberately. See the zizmor
+          # note above: one appearing before a substitution's own closer orphans a trailing
+          # '|| true' and reds a required gate on a correct script. Neither expression needs one,
+          # which is why the strip is its own line rather than another stage on the pipeline that
+          # carries the guard.
+          prose="$(printf '%s\n%s\n' "$PR_TITLE" "$PR_BODY" | awk '/^[[:space:]]*```/ { f = 1 - f; next } f { next } { print }' | sed 's/`[^`]*`/ /g')"
+          items="$(printf '%s' "$prose" | tr '\051' '\n' | grep -i BACKLOG | grep -oE '#[0-9]+' | tr -d '#' | sort -un || true)"
           claim="$(printf '%s' "$items" | head -1 | sed 's/^/BACKLOG #/')"
           if [ -z "$items" ]; then
             echo "No 'BACKLOG #N' claim in this PR — nothing to enforce."

@@ -1884,13 +1884,17 @@ def _serve(args: argparse.Namespace) -> int:
             # DECLARED reverse proxy the request Host header is client-forwardable — without the
             # exact origin, the /ui same-origin CSRF check degrades to Host comparison and the
             # WebAuthn rp_id would have anchored to attacker-influenceable input.
+            # Names the OPERATOR-FACING key (BACKLOG #1026), for the same reason as the ASVS 12.1.1
+            # refusal further down: ADR 0118 relocated `[api].public_origin` to
+            # `[security].web_console_public_address` and REJECTS the old spelling as file or env
+            # input, so an instruction to set it fails at load.
             print(
-                "error: [api].serve_ui with [api].tls_terminated_upstream requires "
-                '[api].public_origin (e.g. "https://mefor.example.org") — behind a declared '
+                "error: serving the web console behind a declared TLS terminator requires an "
+                'external origin (e.g. "https://mefor.example.org") — behind a declared '
                 "reverse proxy the Host header is client-forwardable, so the browser console's "
                 "same-origin CSRF check and the WebAuthn passkey origin binding need the exact "
-                "external origin. Set [api].public_origin to the origin the browser uses. See "
-                "docs/security/OFF-LOOPBACK-DEPLOYMENT.md (ADR 0068).",
+                "external origin. Set [security].web_console_public_address to the origin the "
+                "browser uses. See docs/security/OFF-LOOPBACK-DEPLOYMENT.md (ADR 0068).",
                 file=sys.stderr,
             )
             return 2
@@ -2153,12 +2157,23 @@ def _serve(args: argparse.Namespace) -> int:
         and enforcing
         and not settings.api.public_origin
     ):
+        # THE REMEDIATION NAMES THE KEY THE LOADER ACCEPTS, NOT THE FIELD THIS CODE READS
+        # (BACKLOG #1026). `[api].public_origin` is the INTERNAL field; ADR 0118 relocated the
+        # operator-facing key to `[security].web_console_public_address` and REJECTS the old
+        # spelling as file or env input (`_RELOCATED_TO_SECURITY` in config/settings.py). So the
+        # refusal this block shipped with handed an operator a remediation that fails at load: do
+        # what it says and the next start dies on "unrecognized config key(s)".
+        #
+        # A hard refusal that names an unusable fix is worse than one that names none -- it costs a
+        # restart cycle to discover, and it reads as authoritative because it is coming from the
+        # gate itself. tests/test_api_tls.py pins the remediation string AGAINST the relocation map
+        # so the two cannot drift apart again.
         print(
             f"error: refusing to serve on a PHI instance ({env_name!r}) behind a declared TLS "
-            "terminator under `enforce` without [api].public_origin — the ASVS 12.1.1 TLS-floor "
+            "terminator under `enforce` without an external origin — the ASVS 12.1.1 TLS-floor "
             "probe dials that origin, so leaving it unset silently disables the check rather than "
-            'failing it. Set [api].public_origin to the origin the browser uses (e.g. "https://'
-            'mefor.example.org"). See docs/security/OFF-LOOPBACK-DEPLOYMENT.md.',
+            "failing it. Set [security].web_console_public_address to the origin the browser uses "
+            '(e.g. "https://mefor.example.org"). See docs/security/OFF-LOOPBACK-DEPLOYMENT.md.',
             file=sys.stderr,
         )
         return 2

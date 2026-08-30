@@ -812,6 +812,32 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
     ) -> SimpleMessage:
         """Admin MFA reset (lost authenticator + no recovery codes): clear the user's TOTP enrollment
         and revoke their sessions so they re-enroll. The acting admin is itself step-up + MFA gated."""
+        # SELF-EXCLUSION, AND IT BELONGS HERE RATHER THAN IN THE SERVICE (BACKLOG #1022).
+        #
+        # `AuthService.admin_reset_mfa` is the ALWAYS-AVAILABLE RECOVERY for a locked-out passkey
+        # user and is deliberately unguarded (its own docstring, and ADR 0068 §2 via
+        # auth/webauthn.py). An actor check inside it would narrow the one path that exists when a
+        # user has lost every factor. This route is the only caller today, so the distinction is
+        # about WHICH CASE is refused, not about which function holds the line: cross-user recovery
+        # still reaches the service untouched, and only self-targeting is refused here.
+        #
+        # SELF-TARGETING IS NEVER RECOVERY, which is what makes the refusal safe. Reaching this
+        # route at all requires passing `require_step_up_action(... ADMIN_RESET_MFA ...)`, which is
+        # itself MFA-gated -- so a genuinely locked-out operator cannot call it in the first place.
+        # What the refusal removes is a THIRD ROUTE TO ZERO FACTORS: `disable_totp` and
+        # `delete_webauthn_credential` both refuse when they would drop the caller to zero factors
+        # while MFA is required (ADR 0068 decision 5), and using the ADMIN reset on yourself skipped
+        # that check entirely. `AuthService.disable_totp`'s docstring names this item for exactly
+        # that reason: two self-service routes to zero factors behind one step-up gate, and only one
+        # of them asked.
+        #
+        # Copied in shape from reset_user_password above, which has carried the same guard since
+        # ASVS 6.4.6 -- the two admin routes now refuse the same case the same way.
+        if user_id == identity.user_id:
+            raise HTTPException(
+                status.HTTP_400_BAD_REQUEST,
+                "use the self-service MFA settings for your own account",
+            )
         try:
             await service.admin_reset_mfa(user_id, actor=identity.username)
         except ValueError as exc:

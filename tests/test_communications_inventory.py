@@ -302,6 +302,10 @@ REQUIRED_TRUTHS: tuple[str, ...] = (
     "per encrypted CELL",
     # 13.1.2/13.1.3: the SMB impersonation worker's real bound — its own single-worker executor.
     "mefor-filecred",
+    # 13.1.3 (#1195): the compensating claim that makes the unbounded SMB hold acceptable. It was
+    # false on the RELEASE path until wincred.close() stopped joining the worker from the shared
+    # default executor, so it must not go back to being an unsupported assertion.
+    "cannot starve the shared pool",
     # 13.1.3: the two off-loop pools with a knob, and the one class of off-loop work with NO bound.
     "pooled_fusing_workers",
     "no timeout at all",
@@ -347,6 +351,7 @@ def _import_code_defaults() -> list[tuple[str, float | int, str]]:
         http_listener,
         mllp,
         smart,
+        wincred,
     )
 
     def _default(model: type, field: str) -> float | int:
@@ -408,6 +413,9 @@ def _import_code_defaults() -> list[tuple[str, float | int, str]]:
             _default(PipelineSettings, "pooled_fusing_workers"),
             "config.settings",
         ),
+        # The only bound on the alternate-credential worker's RELEASE path (#1195). The share I/O
+        # itself still has none, which is exactly why the doc has to state what close() does instead.
+        ("_CLOSE_DRAIN_TIMEOUT_S", wincred._CLOSE_DRAIN_TIMEOUT_S, "transports.wincred"),
         (
             "max_body_bytes",
             http_listener.DEFAULT_MAX_BODY_BYTES // (1024 * 1024),

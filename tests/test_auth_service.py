@@ -1133,9 +1133,57 @@ async def test_notifier_fires_on_admin_email_role_and_disable_changes() -> None:
         # Role change → ROLES_CHANGED.
         await service.set_roles("u1", ["viewer"], actor="admin")
         assert any(e.event_type == ROLES_CHANGED for e in notifier.events)
-        # Disable → ACCOUNT_DISABLED (no email change this call).
+        # Disable → ACCOUNT_DISABLED. This call ALSO clears the address: update_user_profile's write
+        # is unconditional and `email` is the intended final state, so email=None is a real clear.
+        # The comment here used to read "no email change this call", which was false in exactly the
+        # direction BACKLOG #1139 found — the transition was walked under a comment denying it.
+        before_clear = len(notifier.events)
         await service.update_user("u1", display_name=None, email=None, disabled=True, actor="admin")
         assert any(e.event_type == ACCOUNT_DISABLED for e in notifier.events)
+        cleared = await store.get_user("u1")
+        assert cleared is not None and cleared.email is None  # the write really did clear it
+        assert any(
+            e.event_type == EMAIL_CHANGED for e in notifier.events[before_clear:]
+        )  # and the clear is announced
+    finally:
+        await store.close()
+
+
+async def test_notifier_fires_when_the_admin_clears_the_address() -> None:
+    """BACKLOG #1139 (ASVS 6.3.7): removing an account's address is an update to its authentication
+    details, and it is the LAST moment the old address is reachable — after it,
+    ``SecurityEventNotifier.notify`` returns early and the account is excluded from every later
+    notice. Reachable from ``PATCH /users/{id}`` with an explicit null and from the console form,
+    which posts a blanked field as ``None``."""
+    store = await _store()
+    try:
+        notifier = _FakeNotifier()
+        service = AuthService(store, AuthSettings(), security_notifier=notifier)
+        await _local_user(store, email="old@example.org")
+        await service.update_user("u1", display_name=None, email=None, disabled=None, actor="admin")
+        cleared = [e for e in notifier.events if e.event_type == EMAIL_CHANGED]
+        assert len(cleared) == 1
+        # Addressed to the address being removed — the only one the engine can still reach.
+        assert cleared[0].email == "old@example.org"
+        assert cleared[0].detail.get("new_email") is None  # a removal, not a repoint
+        stored = await store.get_user("u1")
+        assert stored is not None and stored.email is None
+    finally:
+        await store.close()
+
+
+async def test_notifier_silent_when_the_address_did_not_change() -> None:
+    """Negative control for the test above: the emission is keyed on the address actually changing,
+    not on ``update_user`` being called. Without this, widening the guard to ``True`` would pass."""
+    store = await _store()
+    try:
+        notifier = _FakeNotifier()
+        service = AuthService(store, AuthSettings(), security_notifier=notifier)
+        await _local_user(store, email="same@example.org")
+        await service.update_user(
+            "u1", display_name="Renamed", email="same@example.org", disabled=None, actor="admin"
+        )
+        assert [e for e in notifier.events if e.event_type == EMAIL_CHANGED] == []
     finally:
         await store.close()
 

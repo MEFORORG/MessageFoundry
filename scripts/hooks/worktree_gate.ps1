@@ -389,30 +389,168 @@ function Resolve-ShellIndirection([string]$Token, [string]$Prefix) {
     $out
 }
 
-function Get-GitTargetCandidatesRaw([string]$Line, [string]$Prefix, [string]$CwdRaw) {
+function Get-GitTargetCandidatesRaw([string]$Line, [string]$Prefix, [string]$CwdRaw,
+                                   [switch]$AllTargets, [switch]$BaseFallback,
+                                   [switch]$ExplicitFirst) {
+    <#
+    THREE OPT-IN SWITCHES, ALL DEFAULT OFF. Rules 3 and 3d call this with three positional arguments
+    and are therefore byte-identical to before; only rule 3c opts in. That is deliberate blast-radius
+    control: #1065 has already killed two rewrites, and both died the same way -- the replacement turned
+    out NARROWER than the regex it displaced, and every place it was narrower became a hole.
+
+    *** THIS DOCSTRING PREVIOUSLY SAID "TWO SWITCHES" AND CLAIMED THAT "each only ADDS candidates, so
+    neither can turn a caller's current DENY into an ALLOW". BOTH WERE FALSE AND THE SECOND WAS
+    DANGEROUS. *** -ExplicitFirst REORDERS rather than adds, and reordering moves a candidate that used
+    to decide out of first place, which turns DENY into ALLOW by construction -- measured at roughly
+    fifty rows. The false sentence sat directly above the code that violated it, which is the worst
+    place for a wrong claim: a reviewer reads the reassurance instead of the ordering.
+
+    THE STANDING RULE THIS LEAVES BEHIND: a switch is only "additive" if its OFF state is byte-identical
+    AND its ON state appends. -ExplicitFirst satisfies the first and not the second, so it is an
+    ORDERING switch and is documented as one.
+
+    ``-AllTargets`` -- return EVERY `-C` on the line, in order, instead of the first alone. The pattern is
+    the same string and [regex]::Matches is case-SENSITIVE by default, exactly as the `-cmatch` it
+    replaces, so it re-reads nothing; it only stops discarding the second and later matches. The FIRST
+    element is unchanged, which is what lets rule 3c keep deciding its unresolvable-target refusal on the
+    same token it decides it on today.
+
+    ``-BaseFallback`` -- append the cd-or-cwd base LAST, so a `-C` that git rejects does not end the
+    question. The append sits INSIDE the `-C` branch, so on a line with no `-C` the candidate list is
+    byte-identical with the switch on or off.
+    #>
     $out = @()
+
+    # THE `cd` PREFIX IS COMPUTED FOR BOTH BRANCHES, NOT ONLY THE ELSE (BACKLOG #1085). It used to sit
+    # inside the else, so a `-C` value was PREFERRED and the `cd` DISCARDED -- but a real shell resolves a
+    # RELATIVE `-C` against the post-`cd` directory, not against the session cwd. From a governed primary,
+    #     cd ../Unrelated && git -C . config core.hooksPath /dev/null
+    # therefore DENIED and named the primary, while the write landed in the ungoverned ../Unrelated. A deny
+    # that names a repository the command does not touch actively misinforms the session reading it.
+    #
+    # THE FIX IS COMPOSITION, NOT PREFERENCE. The two are not alternatives: `cd` sets the base and a
+    # relative `-C` is resolved against it. An ABSOLUTE `-C` ignores the base, which is why the join below
+    # is guarded on IsPathRooted rather than applied unconditionally.
+    #
+    # The bail-outs are unchanged and still guard both branches: `popd` and `cd -` restore an unknown
+    # directory, and `(`/`{` mean a subshell whose `cd` does not affect the parent -- in all three the
+    # prefix cannot be composed and $cd stays null, which falls back to exactly the old behaviour.
+    $cd = $null
+    if ($Prefix -notmatch '(?:^|\s)(?:popd|cd\s+-(?:\s|$))' -and $Prefix -notmatch '[({]') {
+        $cds = [regex]::Matches($Prefix, '(?:^|\s)(?:cd|pushd)\s+"?([^"&|;]+?)"?\s*(?:&&|;|\||$)')
+        if ($cds.Count -eq 1) { $cd = $cds[0].Groups[1].Value.Trim() }
+    }
 
     # git's global `-C <path>`, read CASE-SENSITIVELY. `-match` is case-INsensitive in PowerShell, so
     # git's lowercase `-c name=value` config override was captured as if it were a path -- and being the
     # first match it also shadowed a real `-C` later in the same command.
-    if ($Line -cmatch '(?:^|\s)-C\s+"?([^"\s]+)"?') {
-        $out += $Matches[1]
-    } else {
-        $cd = $null
-        if ($Prefix -notmatch '(?:^|\s)(?:popd|cd\s+-(?:\s|$))' -and $Prefix -notmatch '[({]') {
-            $cds = [regex]::Matches($Prefix, '(?:^|\s)(?:cd|pushd)\s+"?([^"&|;]+?)"?\s*(?:&&|;|\||$)')
-            if ($cds.Count -eq 1) { $cd = $cds[0].Groups[1].Value.Trim() }
+    $dashCPattern = '(?:^|\s)-C\s+"?([^"\s]+)"?'
+    $dashCs = @()
+    if ($AllTargets) {
+        # [regex]::Matches is case-SENSITIVE by default, which is the same reading `-cmatch` gives, so
+        # this changes WHICH MATCHES ARE KEPT and nothing about which text matches.
+        $dashCs = @([regex]::Matches($Line, $dashCPattern) | ForEach-Object { $_.Groups[1].Value })
+    } elseif ($Line -cmatch $dashCPattern) {
+        $dashCs = @($Matches[1])
+    }
+    if ($dashCs.Count -gt 0) {
+        foreach ($dashC in $dashCs) {
+            if ($cd -and -not [System.IO.Path]::IsPathRooted($dashC)) {
+                # Join, never replace. The result stays RAW and possibly relative (`../Unrelated/.`); the
+                # caller roots it with Get-FullPathRaw against the session cwd, which is the same base the
+                # shell would use for the `cd` itself, so a relative `cd` composes correctly too.
+                $out += (Join-Path $cd $dashC)
+            } else {
+                $out += $dashC
+            }
         }
-        $out += $(if ($cd) { $cd } else { $CwdRaw })
+        $emitBase = [bool]$BaseFallback
+    } else {
+        $emitBase = $true
     }
 
-    # ADDITIONAL, never instead of: see the note above.
-    if ($Line -cmatch '(?:^|\s)--work-tree[=\s]+"?([^"\s]+)"?') { $out += $Matches[1]; $out += $CwdRaw }
-    if ($Line -cmatch '(?:^|\s)GIT_WORK_TREE="?([^"\s]+)"?')    { $out += $Matches[1]; $out += $CwdRaw }
-    # --git-dir names the repo; the tree is its parent. Add both rather than reason about which.
-    if ($Line -cmatch '(?:^|\s)--git-dir[=\s]+"?([^"\s]+)"?') {
-        $out += $Matches[1]
-        $out += (Join-Path $Matches[1] "..")
+    # ===================================================================================================
+    # THE EXPLICITLY NAMED REPOSITORY, COLLECTED SEPARATELY SO IT CAN OUTRANK THE IMPLICIT cwd.
+    #
+    # THE DEFECT THIS FIXES. These tokens used to be APPENDED AFTER the base, and the caller walks the
+    # list taking the first candidate git ANSWERS on. The cwd ALWAYS answers, because it is always a
+    # real directory -- so a `--git-dir` naming a different repository could never win, and the token
+    # the operator actually TYPED was the one that never decided.
+    #
+    # ONE ROOT CAUSE, SYMPTOMS IN BOTH DIRECTIONS, which is why the fix is a reorder and not a widening:
+    #   FAIL-OPEN   cwd ungoverned, `--git-dir` at the governed repo -> ALLOWED, and the write really
+    #               lands in the governed config. Proven by reading the value back, not by verdict.
+    #   FALSE DENY  cwd governed, `--git-dir` at an unrelated repo   -> DENIED, naming a repository the
+    #               write never touches. That is the BACKLOG #1085 shape.
+    # Putting the explicit token first fixes both at once. Neither is reachable by adding candidates.
+    #
+    # GIT_DIR IS ENUMERATED HERE FOR THE FIRST TIME, and its absence was visible in the asymmetry: the
+    # line above it has always matched GIT_WORK_TREE. The pair should have travelled together.
+    # ===================================================================================================
+    # ONLY --git-dir AND GIT_DIR ARE PROMOTED, AND --work-tree IS DELIBERATELY NOT. That distinction is
+    # MEASURED, not reasoned: run from an ungoverned repo with --work-tree naming the GOVERNED one, a
+    # `git config` write lands in the UNGOVERNED repo you are standing in; the same shape with --git-dir
+    # lands in the governed one. So --work-tree names the TREE and does not decide WHICH REPOSITORY'S
+    # CONFIG is written, which is the only question rule 3c asks.
+    #
+    # PROMOTING IT ANYWAY COST ONE HOLE AND FOUR FALSE DENIES, in both directions at once, which is the
+    # signature of ranking a token that does not determine the answer. Those five rows are why the
+    # promotion below is a two-token list rather than the four it started as.
+    #
+    # --work-tree and GIT_WORK_TREE STILL EMIT, unpromoted, exactly where they always did: rule 3 asks
+    # about the WORKING TREE, where they are precisely the right token, and this list is shared.
+    # ===================================================================================================
+    # THE PROMOTED TOKENS GET EVERY TREATMENT THE `-C` BRANCH ABOVE APPLIES. THIS BLOCK IS A PARITY
+    # AUDIT, NOT A FEATURE, and it exists because three separate rounds of defects all had one shape:
+    # the `-C` branch had already solved the problem and this block did not inherit the solution.
+    #
+    #   TREATMENT                       `-C` branch      here
+    #   read off the blanked scan       (caller-side)    yes, via $ownGitDir gating -ExplicitFirst
+    #   every match, not just the first yes              YES, and it was missing -- see LAST-WINS below
+    #   compose a `cd` prefix           yes              YES, and it was missing -- see COMPOSE below
+    #
+    # LAST-WINS, AND IT IS THE OPPOSITE OF THE `-C` BRANCH'S ORDER, DELIBERATELY. Repeated `-C` options
+    # are CUMULATIVE in git, so first-to-last is the right walk there. A repeated `--git-dir` is not
+    # cumulative: THE LAST ONE WINS, and `-cmatch` keeps the FIRST. So a line naming an ungoverned repo
+    # and then the governed one really wrote to the GOVERNED config while this rule read the ungoverned
+    # token and allowed it. Reversing the match order makes the candidate git will actually use the
+    # first one tried.
+    #
+    # COMPOSE, NEVER REPLACE -- the same rule the `-C` branch states, and its absence here was the
+    # BACKLOG #1085 defect reintroduced on a new path: `cd <governed> && git --git-dir=.git config <key>`
+    # writes to the GOVERNED repo while an uncomposed `.git` resolves against the session cwd and misses
+    # it entirely. Guarded on IsPathRooted exactly as above, so an absolute token is untouched.
+    # ===================================================================================================
+    $promoted = @()
+    foreach ($pat in @('(?:^|\s)--git-dir[=\s]+"?([^"\s]+)"?', '(?:^|\s)GIT_DIR="?([^"\s]+)"?')) {
+        $hits = @([regex]::Matches($Line, $pat) | ForEach-Object { $_.Groups[1].Value })
+        [array]::Reverse($hits)
+        foreach ($hit in $hits) {
+            $rooted = $(if ($cd -and -not [System.IO.Path]::IsPathRooted($hit)) { Join-Path $cd $hit } else { $hit })
+            $promoted += $rooted
+            $promoted += (Join-Path $rooted "..")
+        }
+    }
+    $explicit = @()
+    if ($Line -cmatch '(?:^|\s)--work-tree[=\s]+"?([^"\s]+)"?') { $explicit += $Matches[1]; $explicit += $CwdRaw }
+    if ($Line -cmatch '(?:^|\s)GIT_WORK_TREE="?([^"\s]+)"?')    { $explicit += $Matches[1]; $explicit += $CwdRaw }
+
+    # THE SWITCH IS OPT-IN AND DEFAULT-OFF, so rules 3 and 3d keep the exact list they had: explicit
+    # tokens after the base, in the same order, with GIT_DIR appended at the end where -- being behind
+    # the base -- it cannot change any verdict they reach. Only rule 3c opts in. Same blast-radius
+    # control as -AllTargets, and for the same reason: two earlier attempts at this rule were rejected
+    # for changing behaviour a caller did not ask for.
+    if ($ExplicitFirst) {
+        $out += $promoted
+        if ($emitBase) { $out += $(if ($cd) { $cd } else { $CwdRaw }) }
+        $out += $explicit
+    } else {
+        # $promoted IS NOT EMITTED AT ALL HERE, and that is the correction. Appending it "behind the
+        # base, where it cannot win" was wrong: rules 3 and 3d walk the whole list, so GIT_DIR reached
+        # callers that never opted in and turned `GIT_DIR=<governed> git clean -fd` from ALLOW into
+        # DENY. Byte-identical to the pre-change list is the only safe meaning of opt-in.
+        if ($emitBase) { $out += $(if ($cd) { $cd } else { $CwdRaw }) }
+        $out += $explicit
     }
     $out | Where-Object { $_ }
 }
@@ -531,7 +669,31 @@ function Remove-QuotedSpans([string]$s, [bool]$PosixEscapes = $false) {
             # main denies, so it was reverted. Do NOT re-add the lowercase emit without that
             # discriminator, and do not add the discriminator without re-measuring those two.
             $span = $s.Substring($openAt + 1, $i - $openAt - 1)
-            if ($span -cmatch '[\\/](git(?:\.exe)?)$') {
+            # BACKLOG #1069: A QUOTED SPAN HOLDING ONE BARE WORD IS UNMASKED, because quoting an argument
+            # is ORDINARY and blanking it erased the disarm key before rule 3c ever ran. Measured on the
+            # shipped gate, all ALLOW where the unquoted spelling DENIES:
+            #     git -c "core.hooksPath=/dev/null" commit -m x
+            #     git config 'core.hooksPath' '/dev/null'
+            #     git config --add "core.hooksPath" /dev/null
+            #
+            # WHY NOT MATCH THE RAW TEXT INSTEAD: a commit message quoting the rule's own name would then
+            # refuse, and this workstream writes such messages constantly. The discriminator is WHITESPACE
+            # -- prose has it and stays masked; a config key does not and becomes visible.
+            #
+            # DELIBERATELY NOT LENGTH-PRESERVING, against this item's own prose. That rationale is "the same
+            # offsets read paths back out of the raw text afterwards", and NO RULE DOES THAT: every path
+            # site re-runs [regex]::Match($seg.Raw, ...) and computes offsets inside Raw from scratch.
+            # Length-preserving masking would change what every other rule sees for zero benefit, and
+            # widening scope is exactly how the earlier attempt at this item acquired five new fail-opens.
+            #
+            # ONE SPELLING STAYS OPEN BY DESIGN: a quoted MULTI-WORD value such as
+            # -c 'alias.ci=commit --no-verify'. Its value contains a space, so quoting is its only writable
+            # spelling and this carve-out cannot reach it without re-admitting the prose false-deny. Pinned
+            # as an ALLOW test so a later change cannot close it silently or claim it was never there.
+            if ($span.Length -gt 0 -and $span -cnotmatch '[\s''"$(){};&|`]') {
+                [void]$out.Append($span)
+            }
+            elseif ($span -cmatch '[\\/](git(?:\.exe)?)$') {
                 [void]$out.Append($Matches[1])
             }
             else {
@@ -1098,6 +1260,31 @@ function Test-Governed([string]$Candidate) {
     return $null
 }
 
+# The COMMON DIR of a governed root, as a comparable path -- the object rule 3c actually governs
+# (BACKLOG #1067). Empty when the root is not a repository, or is not a repository's TOP LEVEL: an
+# allowlist entry may legitimately name a directory that merely CONTAINS checkouts, and a root that is a
+# SUBDIRECTORY of some repo would otherwise report THAT repo's git dir and quietly govern all of it.
+#
+# Cached because the roots cannot change within one invocation and each answer costs two git calls. Rule
+# 3c reaches here only once a disarm key is already present, so this is never on the ordinary path.
+$rootCommonCache = @{}
+function Get-RootCommonDirCmp($Root) {
+    $key = $Root.Compare
+    if ($rootCommonCache.ContainsKey($key)) { return $rootCommonCache[$key] }
+    $value = ""
+    # The RAW spelling, never the Compare form: that one is lowercased, and this file warns twice that a
+    # lowercased path handed to `git -C` passes on Windows and misses the real directory on a
+    # case-sensitive filesystem. Any git failure just means "no answer", which is the empty string.
+    $where = $Root.Display
+    $top = "$(& git -C $where rev-parse --path-format=absolute --show-toplevel 2>$null)".Trim()
+    if ($LASTEXITCODE -eq 0 -and $top -and (Get-ComparablePath $top) -eq $key) {
+        $common = "$(& git -C $where rev-parse --path-format=absolute --git-common-dir 2>$null)".Trim()
+        if ($LASTEXITCODE -eq 0 -and $common) { $value = Get-ComparablePath $common }
+    }
+    $rootCommonCache[$key] = $value
+    return $value
+}
+
 # ---------------------------------------------------------------------------------------------------
 # Rule 3b -- hijacking a LINKED WORKTREE by switching it onto an ALREADY-EXISTING branch. Rule 3 below
 # protects only the shared PRIMARY; this protects every OTHER governed worktree from the one move that
@@ -1250,6 +1437,25 @@ re-dispatch. If you were only going to READ, do it directly -- reads are never b
     exit 0
 }
 
+# HOW A git INVOCATION IS RECOGNISED, IN ONE PLACE (BACKLOG #1072). Rules 3, 3c and 3d each carried
+# a byte-identical copy of this expression -- FIVE literals across THREE rules -- so a gap in the
+# leading character class was a gap in all three at once, and closing it at one site would have left
+# the other two open while looking fixed.
+#
+# THE LEADING CLASS INCLUDES A BACKTICK. A disarm write or a tree swap wrapped in backtick command
+# substitution was ALLOWED, because the character immediately before git was not in the class and the
+# token was never seen at all. Measured on the shipped gate at 58e710ad4: all three rules fail open on
+# it while each rule's bare control denies. Thirteen other wrapper spellings already denied, so the
+# wrapper story was thirteen of fourteen measured shapes and never "wrappers no longer hide git".
+#
+# WIDENING A CHARACTER CLASS CAN ONLY ADD MATCHES, SO THE RISK IS A FALSE DENY AND NEVER A NEW FAIL-
+# OPEN. That is the opposite of the failure that got two earlier attempts at this file rejected: each
+# replaced matching with something NARROWER than the regex it displaced, and every place the
+# replacement was narrower became a hole. The narrowness that must survive here is pinned rather than
+# argued -- a backticked ORDINARY config key, and a backticked git inside a single- or double-quoted
+# commit message, all stay ALLOW.
+$gitInvocation = '(^|[\s;&|(''"\\/`])git(\.exe)?["'']?(\s|$)'
+
 # ---------------------------------------------------------------------------------------------------
 # Rule 3 -- a git command that SWAPS THE PRIMARY'S WORKING TREE out from under the sessions standing
 # in it. This is not a hypothetical: a sibling session ran `git checkout <its-branch>` in the shared
@@ -1287,16 +1493,26 @@ if ($tool -in @("Bash", "PowerShell")) {
     # -----------------------------------------------------------------------------------------------
     $dangerKeys = 'core\.hookspath|core\.worktree|alias\.[\w.-]+|include\.path|includeif\.'
     foreach ($seg in (Get-ScannableSegments $cmd ($tool -eq "Bash"))) {
-        if ($seg.Scan -cnotmatch '(^|[\s;&|(''"\\/])git(\.exe)?["'']?(\s|$)') { continue }
-        if ($seg.Scan -notmatch "(?<via>\bconfig\b[^|;&]*?\s|-c\s+)(?<key>$dangerKeys)(?<rest>[^|;&]*)") { continue }
-        # READ EVERY GROUP OUT OF $Matches BEFORE RUNNING ANOTHER -match. `-match` REPLACES $Matches
-        # wholesale, so computing $viaConfig first left $rest reading the SECOND match's groups, where
-        # no 'rest' exists -- it came back $null, satisfied the no-value test below, and the rule FAILED
-        # OPEN on its own positive control: `git config core.hooksPath /dev/null` was ALLOWED. Caught by
-        # keeping the must-deny rows in the fix's test table rather than only the row being fixed.
-        $badKey = $Matches['key']
-        $rest = $Matches['rest']
-        $via = $Matches['via']
+        if ($seg.Scan -cnotmatch $gitInvocation) { continue }
+        # [regex]::Match RATHER THAN `-notmatch`, FOR ITS INDEX (BACKLOG #1065). The pattern STRING is
+        # unchanged; what is new is that the rule can now ask WHERE on the line the disarm sits, which is
+        # the whole basis of the owning-invocation test below.
+        #
+        # IGNORECASE IS PASSED EXPLICITLY AND IT IS THE ONE GENUINELY RISKY CHARACTER IN THIS CHANGE.
+        # PowerShell's `-match` is case-INsensitive; [regex]::Match is case-SENSITIVE by default, and
+        # every key in $dangerKeys is spelled lowercase -- so dropping this option would silently stop
+        # matching `core.hooksPath` altogether. That is exactly the SILENT NARROWING that got the two
+        # previous attempts at this rule rejected, and it would fail the rule's own positive control.
+        #
+        # It also removes a hazard rather than adding one: the note this replaces recorded that reading
+        # $Matches after a second `-match` had already FAILED THIS RULE OPEN on its own positive control,
+        # because `-match` replaces $Matches wholesale. A Match object cannot be clobbered that way.
+        $dis = [regex]::Match($seg.Scan, "(?<via>\bconfig\b[^|;&]*?\s|-c\s+)(?<key>$dangerKeys)(?<rest>[^|;&]*)",
+                              [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)
+        if (-not $dis.Success) { continue }
+        $badKey = $dis.Groups['key'].Value
+        $rest = $dis.Groups['rest'].Value
+        $via = $dis.Groups['via'].Value
         $viaConfig = $via -match '\bconfig\b'
         # A read is not a write -- the EXPLICIT read flags.
         if ($seg.Scan -match '(?:^|\s)--(get|get-all|get-regexp|list|show-origin)(\s|$)') { continue }
@@ -1316,9 +1532,122 @@ if ($tool -in @("Bash", "PowerShell")) {
         # cannot be mistaken for a value.
         if ($viaConfig -and $rest -notmatch '\S') { continue }
 
-        $at = [regex]::Match($seg.Raw, '(^|[\s;&|(''"\\/])git(\.exe)?["'']?(\s|$)')
+        $at = [regex]::Match($seg.Raw, $gitInvocation)
         $pfx = $(if ($at.Success) { $seg.Raw.Substring(0, $at.Index) } else { "" })
-        $where = @(Get-GitTargetCandidatesRaw $seg.Raw $pfx $cwdRaw)
+
+        # ===============================================================================================
+        # DOES THE DISARMING INVOCATION CARRY ITS OWN `-C`? (BACKLOG #1065)
+        #
+        # THE DEFECT. Get-GitTargetCandidatesRaw reads `-C` off the WHOLE line. This rule then took the
+        # first candidate ALONE and treated "git exited non-zero on it" as ALLOW. So a `-C` belonging to a
+        # quoted config VALUE, to a commit MESSAGE, or to a DIFFERENT git command in the same chain
+        # silently became "the repository being configured", git rejected that token, and the rule fell
+        # through. Five measured spellings, every one of which really disarms the shared config:
+        #     git commit -C HEAD && git config <key> /nope
+        #     git config <key> /nope && git commit -C HEAD
+        #     git config <key> "/nope -C HEAD"
+        #     git config alias.x "commit -C HEAD"
+        #     git commit -m "use -C HEAD" && git config <key> /nope
+        #
+        # TWO MECHANISMS, NOT ONE, WHICH IS WHY THERE ARE TWO PARTS. Rows 3-5 are a `-C` read off the
+        # UNBLANKED line; rows 1-2 are a `-C` that is genuinely on the line but belongs to another
+        # command. The first needs the window test here; the second needs the candidate chain below.
+        #
+        # THE WINDOW IS AN ANCHOR, NOT A PARSE, and $seg.Scan is what makes it work. The owning git token
+        # is the LAST one at or before the disarm; the span between them is the disarming invocation's own
+        # flags. Scan has every QUOTED span blanked, so a `-C` inside a config value or a `-m` message is
+        # not in that span at all, while `git -C "C:/Program Files/x" config ...` still shows its `-C`
+        # because only the VALUE was blanked. NO INDEX EVER CROSSES BETWEEN Scan AND Raw: Remove-QuotedSpans
+        # does not preserve length. $pfx above is still sliced from RAW; everything here lives in SCAN.
+        #
+        # WHAT IT CANNOT DO, stated because an anchor invites being read as a parser: it cannot tell which
+        # of two `-C` tokens inside one span belongs to the config command. `git -C <bogus> -C <governed>
+        # config <key> v` is decided by whichever ANSWERS first -- and both are tried, so that failure mode
+        # is a DENY on the governed one, never an ALLOW.
+        # ===============================================================================================
+        $own = $null
+        $gitTokens = @([regex]::Matches($seg.Scan, $gitInvocation))
+        foreach ($g in $gitTokens) { if ($g.Index -le $dis.Index) { $own = $g } else { break } }
+        $ownEnd = $(if ($own) { [Math]::Min($own.Index + $own.Length, $dis.Index) } else { 0 })
+        $ownWin = $(if ($ownEnd -lt $dis.Index) { $seg.Scan.Substring($ownEnd, $dis.Index - $ownEnd) } else { "" })
+        # `-cmatch`: case-SENSITIVE, the same reading the resolver gives. git's lowercase `-c name=value`
+        # is a config override and not a path, and reading it as one is how a real `-C` got shadowed once.
+        $ownDashC = ($ownWin -cmatch '(?:^|\s)-C\s')
+
+        # DOES THE DISARMING INVOCATION CARRY ITS OWN REPOSITORY TOKEN? Same question -AllTargets asks
+        # about `-C`, and it has to be asked for the same reason: a `--git-dir` that is not this
+        # command's is not this command's target.
+        #
+        # THE WINDOW STARTS AT THE SEPARATOR, NOT AT THE git TOKEN, because an environment assignment
+        # PRECEDES the command: `GIT_DIR=<x> git config ...` puts the token BEFORE `git`, where $ownWin
+        # cannot see it. So this window is [after the last separator at or before the owning git token,
+        # the disarm) and it therefore covers both spellings.
+        #
+        # READ OFF $seg.Scan, WHICH IS WHAT MAKES IT CORRECT. Quoted spans are blanked there, so a
+        # --git-dir inside an alias VALUE or a commit MESSAGE is not in the window at all. Reading the
+        # RAW line instead is exactly the defect this replaces: it opened two holes
+        # (`git config alias.zz "log --git-dir=<ungoverned>"` ALLOWED while the write landed in the
+        # governed repo) and three false denies (a governed path merely MENTIONED in a comment, a
+        # message, or an alias body). Both directions from one cause, which is the tell.
+        $ownStart = 0
+        if ($own) {
+            $sepBefore = [regex]::Matches($seg.Scan.Substring(0, $own.Index), '[;&|(){}]')
+            if ($sepBefore.Count -gt 0) {
+                $last = $sepBefore[$sepBefore.Count - 1]
+                $ownStart = $last.Index + $last.Length
+            }
+        }
+        if ($ownStart -gt $dis.Index) { $ownStart = $dis.Index }
+        $ownCmdWin = $seg.Scan.Substring($ownStart, $dis.Index - $ownStart)
+        $ownGitDir = ($ownCmdWin -match '(?:^|\s)(--git-dir[=\s]|GIT_DIR=)')
+
+        # THE CHDIR GUARD, AND ITS POSITION BOUND IS THE LOAD-BEARING HALF. $pfx is sliced at the FIRST git
+        # token, so the resolver's own `cd` composer cannot see a chdir that appears AFTER it. Without this
+        # guard `git commit -C HEAD && cd <ungoverned> && git config <key> v` denied and NAMED THE GOVERNED
+        # PRIMARY while the write lands in the sibling -- a refusal that misdescribes what it blocked, which
+        # is the #1085 defect over again.
+        #
+        # THE WINDOW ENDS AT THE DISARM, AND THE FIRST DRAFT OF THIS GUARD DID NOT. That draft searched
+        # $seg.Raw from the first git token to the END OF THE SEGMENT, and adversarial measurement showed a
+        # trailing `&& cd ..` -- a token that provably cannot change which repository the write already
+        # landed in -- reverting EVERY closure this rule claims: 21 of 21 closed shapes back to ALLOW, and
+        # `git config <key> "/nope cd -C HEAD"` too, because Raw shows the two letters inside the VALUE.
+        # Bounded here to [first git token, disarm) and read off SCAN, both halves are answered: a chdir
+        # after the write is out of the window, and a chdir inside a quoted value is blanked.
+        #
+        # THE VERB LIST IS AN ENUMERATION and CLAUDE.md section 11 is right about those. It is deliberately
+        # WIDER than the resolver's own `cd|pushd`, because every extra verb only suppresses a FALLBACK
+        # that did not exist before -- so a verb this list is missing costs an unclosed shape, never a new
+        # hole, and a verb it has too many of costs nothing at all.
+        $chdirVerbs = 'cd|chdir|pushd|popd|sl|set-location|push-location|pop-location'
+        $firstGit = $(if ($gitTokens.Count -gt 0) { $gitTokens[0].Index + $gitTokens[0].Length } else { 0 })
+        if ($firstGit -gt $dis.Index) { $firstGit = $dis.Index }
+        $chdirWin = $seg.Scan.Substring($firstGit, $dis.Index - $firstGit)
+        # Command position only: a separator (or a group opener) then the verb then whitespace. The window
+        # never STARTS at a command -- position 0 is git's own first argument -- so `^` is not an anchor here.
+        $chdirBefore = ($chdirWin -match "(?:[;&|(){}])\s*(?:$chdirVerbs)(?:\s|$)")
+
+        # THE FALLBACK IS THE ONLY SUBTRACTIVE PIECE IN THIS CHANGE, and it subtracts from something that
+        # did not exist before, so getting either guard wrong leaves a shape unclosed and cannot open one.
+        $fallbackOk = (-not $ownDashC) -and (-not $chdirBefore)
+        # -AllTargets IS GATED ON $ownDashC, and the gate is the whole point (BACKLOG #1065).
+        #
+        # Sweeping EVERY `-C` on the line was too wide, and adversarial measurement caught it: from an
+        # ungoverned clone, `git commit -C HEAD --amend && git -C <governed> status && git config
+        # alias.lg "..."` was REFUSED, naming the governed repository -- while the alias write lands in
+        # the clone the session is standing in. The refusal misdescribes what it blocked, which is the
+        # #1085 defect this rule has already been fixed for once.
+        #
+        # If the DISARMING invocation carries no `-C` of its own, then no `-C` anywhere on the line names
+        # ITS target, and the base is the only honest answer. That is the old single-token reading plus
+        # the fallback, which is why this cannot reopen anything: measured over 335 corpus rows against
+        # the pre-fix gate, gating this switch keeps all 31 closures and zero rows move DENY to ALLOW.
+        #
+        # WHEN the disarming invocation DOES carry a `-C`, the sweep stays on, because a bogus first
+        # token must not end the question. The residual is stated rather than hidden: two `-C` tokens
+        # inside one owning span are decided by whichever ANSWERS first, so a governed one can still win
+        # over an ungoverned one. That errs CLOSED and is narrower than before this change.
+        $where = @(Get-GitTargetCandidatesRaw $seg.Raw $pfx $cwdRaw -AllTargets:$ownDashC -BaseFallback:$fallbackOk -ExplicitFirst:$ownGitDir)
         if ($where.Count -eq 0) { continue }
 
         # ROOT THE TARGET AGAINST THE SESSION CWD BEFORE ASKING GIT ANYTHING (BACKLOG #1061). This block
@@ -1385,22 +1714,132 @@ What to do instead:
 "@
         }
 
-        $common = "$(& git -C $whereRaw rev-parse --git-common-dir 2>$null)".Trim()
-        if ($LASTEXITCODE -ne 0 -or -not $common) { continue }
-        $commonCmp = Get-ComparablePath $common $whereRaw
+        # ===============================================================================================
+        # THE TARGET IS AN ORDERED CHAIN, NOT $where[0] ALONE (BACKLOG #1065, second half).
+        #
+        # Try the candidates in order; the FIRST one git ANSWERS on decides, governed or not. Only one
+        # thing changes meaning: "git failed on THIS token" now moves to the next candidate instead of
+        # ending the rule. Every ALLOW whose named target is a real repository is reached identically,
+        # because that target still answers first and still decides.
+        #
+        # THE CHAIN CANNOT TURN A CURRENT DENY INTO AN ALLOW. If $where[0] resolves and git answers on it,
+        # the verdict is computed from exactly the values it was computed from before. The chain is only
+        # ever consulted where the old code had already given up and allowed.
+        #
+        # AND THE UNRESOLVABLE-TARGET REFUSAL STAYS FIRST AND STAYS DECIDED ON $where[0], immediately above,
+        # before any candidate is tried. A draft of this fix DEFERRED that refusal behind "did any candidate
+        # answer", and adversarial measurement showed the cost: from a nested worktree with a non-absolute
+        # payload cwd, `git -C ../../.. config <key> /v ; git -C <any real repo> log` went DENY -> ALLOW,
+        # because the unrelated second command answered first and ended the rule while the governed,
+        # unresolvable target was never refused at all. `../../..` from <primary>/.claude/worktrees/<x> is
+        # the primary's own root -- the exact spelling #1061 was filed about. "Unresolvable means not
+        # governed" is how this whole defect shipped; it is not reinstated here in any form.
+        # ===============================================================================================
         $govCfg = $null
+        foreach ($cand in $where) {
+            $candRaw = Get-FullPathRaw $cand $cwdRaw
+            if (-not $candRaw) { continue }
+            $common = "$(& git -C $candRaw rev-parse --git-common-dir 2>$null)".Trim()
+            if ($LASTEXITCODE -ne 0 -or -not $common) { continue }
+            $commonCmp = Get-ComparablePath $common $candRaw
+            # GOVERNANCE IS REPOSITORY IDENTITY, NOT A PATH PREFIX (BACKLOG #1067). This compared the
+        # TARGET's common dir against the root's WORKING TREE path, so any repository living anywhere
+        # UNDER a governed root inherited its governance -- including an independent clone vendored
+        # there, which shares nothing with it but its path. The refusal then went on to assert a shared
+        # .git directory that such a clone does not have, and a refusal which misdescribes what it
+        # blocked is exactly what teaches people to route around the gate; rule 3's own comment in this
+        # file records that having happened.
+        #
+        # Comparing against the ROOT'S OWN common dir keeps every case that must keep denying: the
+        # primary and each of its worktrees -- sibling, or nested under .claude/worktrees -- all answer
+        # the SAME common dir, so path shape stops being what decides it.
+        #
+        # EQUALITY-OR-UNDER, not equality alone, and that is the load-bearing half: a SUBMODULE's git
+        # dir is <root>/.git/modules/<name>, so the identity-only predicate the item warned about would
+        # have flipped submodules from DENY to ALLOW as a silent side effect of fixing the vendored
+        # case. Under-the-common-dir leaves them exactly where they were. Whether a submodule SHOULD be
+        # governed is its own decision, pinned by a test so that answering it has to be one.
+        #
+        # $govCfg IS NOT RE-INITIALISED HERE. It is set once above the candidate loop, because clearing
+        # it per candidate would make the chain's answer depend on the LAST candidate walked instead of
+        # the first that answered -- the opposite of what the chain is for.
         foreach ($r in $roots) {
-            if ($commonCmp -eq $r.Compare -or $commonCmp.StartsWith("$($r.Compare)/")) { $govCfg = $r; break }
+            $rootCommon = Get-RootCommonDirCmp $r
+            if (-not $rootCommon) {
+                # The root is not a repository's top level, so there is no identity to compare and the
+                # path test remains the only answer available. Unchanged deliberately: a root that
+                # merely contains checkouts must not start failing OPEN on a shape it used to catch.
+                if ($commonCmp -eq $r.Compare -or
+                    $commonCmp.StartsWith("$($r.Compare)/", [System.StringComparison]::Ordinal)) { $govCfg = $r; break }
+                continue
+            }
+            if ($commonCmp -eq $rootCommon -or
+                $commonCmp.StartsWith("$rootCommon/", [System.StringComparison]::Ordinal)) { $govCfg = $r; break }
+            }
+            # THE FIRST CANDIDATE GIT ANSWERS ON DECIDES, GOVERNED OR NOT -- so this break is
+            # UNCONDITIONAL, and that is the load-bearing half. Reaching this line means `rev-parse`
+            # succeeded on $cand, so $cand IS a repository and the roots walk above has just given the
+            # final verdict for it. Breaking only on a hit would turn the chain into a SEARCH for a
+            # governed target: a later candidate -- a `-C` belonging to a different command in the same
+            # chain, or the cwd fallback -- could then manufacture a DENY the real target never earned,
+            # and the refusal would name a repository the write was never going to touch. That is the
+            # #1085 defect (a refusal that misdescribes what it blocked) reintroduced through a new door.
+            #
+            # The candidates that DID NOT answer are skipped by the `continue`s above and never reach
+            # here, which is the whole point: "git failed on this token" now moves to the next candidate
+            # instead of ending the rule, and that is the only behaviour this change adds.
+            break
         }
         if (-not $govCfg) { continue }
 
+        # BACKLOG #1082: SAY WHAT IS TRUE OF THE SCOPE ACTUALLY BEING WRITTEN. A --global or --system
+        # write does NOT land in this repository's config -- it lands in the per-user or machine-wide
+        # file -- so the sentence below was false for those scopes. THE VERDICT DOES NOT MOVE: git
+        # falls back to those scopes when the repository does not set the key, so the write can still
+        # disarm this checkout by inheritance, and whether it does is NOT knowable from the command.
+        #
+        # Measured 2026-08-27 and it depends on WHERE YOU READ FROM, which the row does not say:
+        #   from a worktree   core.hooksPath IS set at worktree scope (75 of 76 config.worktree files)
+        #                     -> a --global write of that key loses to the more specific scope
+        #   from the primary  UNSET at every scope (exit 1; control core.bare exit 0)
+        #                     -> a --global write of that key WOULD take effect
+        # Denying is the correct conservative default for both.
+        #
+        # NOTHING HERE MAY REASSURE. A round-4 candidate printed "This does NOT change the shared
+        # configuration" and three verifiers graded it BLOCKING: segments are judged one at a time and
+        # Write-Deny exits on the first hit, so on a multi-line command whose LATER segment does a
+        # local write, that sentence would print over a real disarm.
+        $scopeFlag = if ($seg.Scan -cmatch '(?:^|\s)--(?<sc>global|system)(?:\s|$)') { $Matches['sc'] } else { $null }
+        $opening = if ($scopeFlag) {
+            "BLOCKED: '$badKey' is on the disarm list, and --$scopeFlag writes your " +
+            $(if ($scopeFlag -eq 'global') { 'per-user' } else { 'machine-wide' }) +
+            " git configuration rather than this repository's.`n`nGit falls back to that scope when " +
+            "$($govCfg.Display) does not set the key itself, so the write can still disarm this " +
+            "checkout's hooks. Which case applies is not knowable from the command alone, so it is refused."
+        }
+        else {
+            "BLOCKED: setting '$badKey' would change the SHARED git configuration of $($govCfg.Display)."
+        }
+        # The mechanism paragraph is scope-aware for the same reason the opening is: the shared-.git
+        # sentence is TRUE of a repository-scope write and FALSE of --global/--system.
+        $mechanism = if ($scopeFlag) {
+            "This is refused on the REACH, not on where the file lands: a key inherited from the " +
+            "$(if ($scopeFlag -eq 'global') { 'per-user' } else { 'machine-wide' }) scope applies to " +
+            "every repository on this machine that does not override it, including every worktree of " +
+            "$($govCfg.Display)."
+        }
+        else {
+            "Every worktree of this repository shares one .git directory, so this is not a local " +
+            "change: it takes effect for all of them at once."
+        }
         Write-Deny -Rule "3c" -Detail "git config $badKey" -Reason @"
-BLOCKED: setting '$badKey' would change the SHARED git configuration of $($govCfg.Display).
+$opening
 
-Every worktree of this repository shares one .git directory, so this is not a local change: it takes
-effect for all of them at once. Repointing core.hooksPath (or aliasing a command, or redirecting
-core.worktree) disables the commit-time ledger, claim and secret-leak gates for every session on this
-machine, and nothing would report that they had stopped running.
+$mechanism
+
+Repointing core.hooksPath (or aliasing a command, or redirecting core.worktree) disables the
+commit-time ledger, claim and secret-leak gates, and nothing would report that they had stopped
+running.
 
 What to do instead:
   * If a commit hook is failing, FIX THE CAUSE -- the hook output names it. Never route around a gate;
@@ -1438,7 +1877,7 @@ What to do instead:
     # failure -- a path that is not a worktree, or does not exist -- falls through to ALLOW.
     # -----------------------------------------------------------------------------------------------
     foreach ($seg in (Get-ScannableSegments $cmd ($tool -eq "Bash"))) {
-        if ($seg.Scan -cnotmatch '(^|[\s;&|(''"\\/])git(\.exe)?["'']?(\s|$)') { continue }
+        if ($seg.Scan -cnotmatch $gitInvocation) { continue }
         if ($seg.Scan -cnotmatch '\bworktree\s+(?<wtverb>remove|move)(?=\s|$)') { continue }
         $wtVerb = $Matches['wtverb']
 
@@ -1535,16 +1974,20 @@ What to do instead:
         #     `C:\git` directory is ordinary on a developer's box, so this is the most reachable of
         #     the set.
         #   * A FAILED `cd`, and a SUBSHELL prefix `( cd x && git ... )`.
-        #   * COMPOSE vs PREFER: the resolver PREFERS `-C` and discards a `cd` prefix, where a shell
-        #     COMPOSES them and resolves a relative `-C` against the post-`cd` directory. That is
-        #     BACKLOG #1085.
+        #   * COMPOSE vs PREFER -- FIXED 2026-08-26 (BACKLOG #1085), and listed here rather than
+        #     deleted so this inventory is not read as still complete. The resolver used to PREFER
+        #     `-C` and discard a `cd` prefix; it now COMPOSES them, joining a RELATIVE `-C` onto the
+        #     `cd` target and leaving an ABSOLUTE one alone. The fix is in the resolver, which is
+        #     where this note said it belonged. The three bail-outs (`popd`, `cd -`, a subshell
+        #     prefix) now guard both branches, so the FAILED-`cd` and SUBSHELL entries above are
+        #     unchanged by it.
         #   * THE PRE-SPLITTER ONE LINE ABOVE, `-split '(?:&&|\|\||;|\|)'`, is NOT quote-aware. A
         #     quoted victim path containing `;` or `&&` is truncated before the quote-aware scan ever
         #     runs, so the awareness gained above does not extend to that character class.
         #
         # All of these belong to the RESOLVER rather than to this rule; fixing them here would be the
         # fourth resolution rule in one file, which is what calling the shared helper exists to avoid.
-        $at = [regex]::Match($seg.Raw, '(^|[\s;&|(''"\\/])git(\.exe)?["'']?(\s|$)')
+        $at = [regex]::Match($seg.Raw, $gitInvocation)
         $pfx = $(if ($at.Success) { $seg.Raw.Substring(0, $at.Index) } else { "" })
         $where = @(Get-GitTargetCandidatesRaw $seg.Raw $pfx $cwdRaw)
         $base = $(if ($where.Count -gt 0) { Get-FullPathRaw $where[0] $cwdRaw } else { "" })
@@ -1722,16 +2165,15 @@ $cleanupBullet
     # must not second-guess it -- `cd <primary> && git -C <sibling> rebase` acts on the sibling, and
     # denying it because the primary's path appears in the `cd` is a false positive.
     $anyInferredTarget = $false
-    $gitToken = '(^|[\s;&|(''"\\/])git(\.exe)?["'']?(\s|$)'
     foreach ($seg in (Get-ScannableSegments $cmd ($tool -eq "Bash"))) {
         # Match a git invocation however it is spelled: git, git.exe, or an absolute path to either.
-        if ($seg.Scan -cnotmatch $gitToken) { continue }
+        if ($seg.Scan -cnotmatch $gitInvocation) { continue }
         if ($seg.Scan -cnotmatch "\bgit(\.exe)?\b[^|;&]*?\s(?<verb>$verbs)(?=\s|$)") { continue }
         $segVerb = $Matches['verb']
 
         # Everything BEFORE the git invocation on this line. A `cd` is honoured only from here -- reading
         # it from the whole command made the resolver order-blind (see Get-GitTargetCandidatesRaw).
-        $at = [regex]::Match($seg.Raw, $gitToken)
+        $at = [regex]::Match($seg.Raw, $gitInvocation)
         $segPrefix = $(if ($at.Success) { $seg.Raw.Substring(0, $at.Index) } else { "" })
 
         if ($seg.Raw -cnotmatch '(?:^|\s)-C\s+"?([^"\s]+)"?') { $anyInferredTarget = $true }

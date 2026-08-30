@@ -12,6 +12,12 @@ name: CLA Assistant
 # See .github/required-contexts.txt.
 
 on:
+  # BACKLOG #340 step 1. INERT UNTIL A MERGE QUEUE EXISTS: with no queue configured GitHub never
+  # emits merge_group, so this workflow behaves identically today. It is added FIRST and separately
+  # because the failure mode of the reverse order is total -- enable a queue while a required
+  # context's workflow has no merge_group trigger and that check never reports in the queue, so
+  # NOTHING MERGES.
+  merge_group:
   issue_comment:
     types: [created]
   pull_request_target:
@@ -36,12 +42,42 @@ jobs:
   cla:
     runs-on: ubuntu-latest
     steps:
+      # REQUIRED BECAUSE THE ACTION BELOW IS LOCAL (BACKLOG #1381 vendored it from a remote one).
+      # A remote `uses:` needs no working copy; a LOCAL `uses: ./...` resolves against
+      # GITHUB_WORKSPACE, so without a checkout the runner cannot find action.yml and the job dies
+      # with "Did you forget to run actions/checkout before running your local action?". The
+      # vendoring swapped remote for local and did not add this step, which broke the required `cla`
+      # context once GitHub began serving the new default-branch workflow -- measured live between
+      # 05:18Z (last passing run, which still downloaded the REMOTE action) and 11:13Z.
+      #
+      # NO `ref:` HERE, DELIBERATELY. Under `pull_request_target` the default checkout is the BASE
+      # commit, which is what this job wants and is the safe form. Setting `ref:` to the pull
+      # request's head would run FORK-AUTHORED code with this workflow's write-scoped token and its
+      # access to the signature branch -- the classic pull_request_target privilege escalation. The
+      # action needs only its own vendored source, which the base already carries.
+      - name: Check out the base, so the vendored local action resolves
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # The step above deliberately checks out the BASE, not the head, so fork code never runs
+          # with this workflow's write scope. `persist-credentials: false` closes the other half:
+          # without it, checkout writes the job's token into .git/config, where any later step --
+          # or anything that can read the workspace -- could use it against the signature branch.
+          # Zizmor calls this `artipacked`. It is a low finding in general and worth more here,
+          # because this job holds `contents: write` on a `pull_request_target` trigger.
+          #
+          # SAFE, AND MEASURED RATHER THAN ASSUMED. The vendored action is a node20 action that
+          # takes GITHUB_TOKEN through `env:` and talks to the REST API; it never shells out to
+          # git, so it does not read these credentials. Against dist/index.js: ZERO matches for
+          # child_process|execSync|spawnSync|simple-git, against 357 for octokit/api.github.com.
+          # It needs the action's FILES on disk, which this checkout still provides.
+          persist-credentials: false
+
       - name: CLA Assistant
         if: >-
           (github.event.comment.body == 'recheck' ||
            github.event.comment.body == 'I have read the CLA and I agree to its terms.') ||
           github.event_name == 'pull_request_target'
-        uses: contributor-assistant/github-action@ca4a40a7d1004f18d9960b404b97e5f30a505a08 # v2.6.1
+        uses: ./.github/actions/cla-assistant-lite # vendored ca4a40a7d1004f18d9960b404b97e5f30a505a08 (v2.6.1); upstream archived, see .github/actions/cla-assistant-lite/README.md
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:

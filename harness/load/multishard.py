@@ -91,6 +91,22 @@ class EngineAttribution:
     inbound_rows: int  # number of inbound (source) connection rows this engine reports
     foreign_rows: int  # inbound rows whose name does NOT carry this engine's tag (a steal ⇒ > 0)
     reads: int  # Σ inbound read across this engine's own rows
+    #: The engine's OWN reason for each lane it reports as not-listening, verbatim from `/connections`
+    #: (`error`, which the API sets from `connection_failed()` per ADR 0031). Empty on a clean run.
+    #:
+    #: CARRIED BECAUSE `reads == 0` CANNOT DIAGNOSE ITSELF WITHOUT IT, and the engine already knows.
+    #: `inbound_rows` and `foreign_rows` are CONFIG-derived, not traffic-derived -- the API appends a
+    #: source row for every registry inbound unconditionally and `read` is always an int, never None
+    #: (`api/app.py`, the `/connections` builder), so both pass unchanged on an engine that received
+    #: NOTHING, including one whose listeners never bound. The test's own docstring says as much: the
+    #: isolation proof "is config-derived so it holds regardless of the write lock". So when `reads`
+    #: reads 0 the other two counters say nothing about why, and the failure message was left naming a
+    #: number with no cause attached.
+    #:
+    #: Measured: occupying one engine's inbound ports with a listen-never-accept squatter reproduces
+    #: the exact CI triple -- inbound_rows PASS, foreign_rows PASS, reads 0 FAIL -- and the engine
+    #: reported `status: "failed"` on both lanes throughout. The information was present and discarded.
+    failed_lanes: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -195,6 +211,9 @@ class MultiShardRecord:
                     "inbound_rows": e.inbound_rows,
                     "foreign_rows": e.foreign_rows,
                     "reads": e.reads,
+                    # In the artifact as well as the assertion: a CI reader who has only the uploaded
+                    # JSON must be able to attribute a zero-read engine without re-running anything.
+                    "failed_lanes": list(e.failed_lanes),
                 }
                 for e in self.per_engine
             ],
@@ -693,6 +712,7 @@ def _attribute_engines_sync(
             # empty attribution — the smoke asserts positive rows, so it won't silently pass.
             out.append(EngineAttribution(node.node_id, tag, 0, 0, 0))
             continue
+        failed: list[str] = []
         for row in rows:
             if row.read is None:  # inbound (source) rows carry a read counter; skip outbound rows
                 continue
@@ -701,7 +721,19 @@ def _attribute_engines_sync(
                 reads += row.read
             else:
                 foreign_rows += 1
-        out.append(EngineAttribution(node.node_id, tag, inbound_rows, foreign_rows, reads))
+            # Collected for EVERY inbound row, not only this engine's own: a lane that failed to bind
+            # under a peer's tag is exactly as diagnostic, and filtering by tag here would drop the
+            # cross-engine case the isolation assertion above exists to catch.
+            # DIRECT ATTRIBUTE ACCESS, NOT `getattr(row, "error", None)`. `EngineClient.connections()`
+            # is typed `list[ConnectionRow]` and that model declares `error`, so the field is
+            # guaranteed and a default would only ever mask a RENAME -- after which this would report
+            # "no failed lanes" forever, silently, on exactly the runs it exists to explain. A
+            # diagnostic field that fails closed to "nothing to report" is worse than no field.
+            if row.error:
+                failed.append(f"{row.name}: {row.error}")
+        out.append(
+            EngineAttribution(node.node_id, tag, inbound_rows, foreign_rows, reads, tuple(failed))
+        )
     return out
 
 

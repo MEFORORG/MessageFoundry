@@ -14,10 +14,16 @@ from typing import Any
 
 import pytest
 
-from messagefoundry.auth.notifications import ACCOUNT_LOCKED, PASSWORD_CHANGED, SecurityEvent
+from messagefoundry.auth.notifications import (
+    ACCOUNT_LOCKED,
+    EMAIL_CHANGED,
+    PASSWORD_CHANGED,
+    SecurityEvent,
+)
 from messagefoundry.config.settings import AlertsSettings
 from messagefoundry.pipeline.security_notify import (
     SecurityEventNotifier,
+    _build_body,
     security_notifier_from_settings,
 )
 
@@ -86,3 +92,31 @@ async def test_notify_send_failure_is_swallowed(monkeypatch: pytest.MonkeyPatch)
     await notifier.notify(SecurityEvent(ACCOUNT_LOCKED, username="bob", email="bob@example.org"))
     # A failing SMTP send must not propagate or wedge the background task — aclose still completes.
     await notifier.aclose()
+
+
+def test_body_says_the_address_was_removed_when_there_is_no_new_one() -> None:
+    """BACKLOG #1139 (ASVS 6.3.7): an EMAIL_CHANGED carrying no ``new_email`` is a REMOVAL. Saying
+    only "was changed" and then omitting the new value reads as a truncated notice. THE SCOPE OF THE
+    CLAIM IS THE POINT: an earlier version promised this was the LAST notice the address would ever
+    get and asserted it, pinning a claim two shipped paths falsify -- ``users.email`` has no
+    UNIQUE constraint, and ``admin_user_update`` has no ``_externally_managed`` guard."""
+    body = _build_body(SecurityEvent(EMAIL_CHANGED, username="bob", email="old@example.org"))
+    assert "removed" in body.lower()
+    assert "about this account" in body.lower()
+    # The negative half: it must not promise anything about the address BEYOND this account.
+    assert "last security notice" not in body.lower()
+
+
+def test_body_names_the_new_address_on_a_repoint_and_does_not_say_removed() -> None:
+    """Positive control for the test above: the repoint arm must keep naming the new address and
+    must NOT claim a removal — otherwise the removal wording could be emitted unconditionally."""
+    body = _build_body(
+        SecurityEvent(
+            EMAIL_CHANGED,
+            username="bob",
+            email="old@example.org",
+            detail={"new_email": "new@example.org"},
+        )
+    )
+    assert "New email on file: new@example.org" in body
+    assert "removed" not in body.lower()

@@ -8,7 +8,8 @@ reference and re-asserts the equivalent permission/step-up via ``require_ui*``. 
 decrypts PHI) is step-up-gated + registered as an UNLOCK action (like content search); delete is a
 step-up, body-less, auto-retryable POST behind a confirm step; upload is a same-origin multipart POST
 (no step-up — a body-carrying POST can't survive the re-auth redirect, and browsing PHI is the gated
-surface). Resend is a same-origin POST on top of the already-stepped-up browse page.
+surface). Resend is a step-up POST behind a body-less confirm step, its message index and target inbound
+carried in the query so the confirm URL is a valid re-auth continuation (BACKLOG #1227).
 """
 
 from __future__ import annotations
@@ -36,12 +37,29 @@ from ._common import _form_pairs
 # The browse GET decrypts PHI (step-up), so register it as an UNLOCK form — a stale step-up 303s to
 # /ui/reauth and GET-redirects back to the browse page. The PHI-shaped filter now travels in the POST
 # body of .../filter (BACKLOG #1184) and so cannot cross the redirect at all. The delete POST is
-# body-less + step-up, so it may be auto-retried after re-auth. Upload/resend/filter are same-origin
-# POSTs (not registered).
+# body-less + step-up, so it may be auto-retried after re-auth. Upload/filter are same-origin POSTs
+# (not registered); the resend POST is not registered either — its ``reauth_next`` maps it to the
+# confirm page below, the same shape the /filter POST and messages' edit-resend use.
 register_ui_action(
     r"^/ui/uploaded-logs/file/[^/?#]+$", Permission.FILES_BROWSE, auto_retry=False, unlock=True
 )
 register_ui_action(r"^/ui/uploaded-logs/file/[^/?#]+/delete$", Permission.FILES_DELETE)
+# The resend confirm page (BACKLOG #1227). QUERY-TOLERANT ON PURPOSE, and the only such pattern in
+# this registry — every other one forbids ``?`` by construction via ``[^/?#]+``. It has to be:
+# ``reauth_next`` puts ``?index=N&to=NAME`` into ``next``, and ``lookup_ui_action`` /
+# ``is_unlock_action`` fullmatch the RAW value, so a path-only pattern matches nothing and dead-ends
+# the whole flow at /ui with both parameters silently gone. ``auto_retry=False`` because it is a GET;
+# ``unlock=True`` so re-auth 303-GET-redirects back here with the parameters intact.
+# KEEP THE OPTIONAL GROUP rather than pinning ``\?index=\d+&to=...``: this form also fullmatches the
+# bare route TEMPLATE, which is what keeps the R1 coverage guard in test_webui.py able to see this
+# entry. A stricter pattern would not match the template and would make that guard silently vacuous
+# here — green, and covering nothing.
+register_ui_action(
+    r"^/ui/uploaded-logs/file/[^/?#]+/resend-confirm(\?[^#]*)?$",
+    Permission.FILES_BROWSE,
+    auto_retry=False,
+    unlock=True,
+)
 
 _log = logging.getLogger(__name__)
 
@@ -337,16 +355,36 @@ def register(app: FastAPI, deps: UiDeps) -> None:
     async def ui_uploaded_log_resend(
         file_id: str,
         request: Request,
+        index: int = Query(..., ge=0),
+        to: str = Query(..., min_length=1, max_length=256),
         engine: Any = Depends(deps.get_engine),
-        identity: Identity = Depends(require_ui(Permission.FILES_BROWSE)),
+        identity: Identity = Depends(
+            require_ui_step_up(
+                Permission.FILES_BROWSE,
+                reauth_next=lambda r: (
+                    f"/ui/uploaded-logs/file/{r.path_params['file_id']}/resend-confirm"
+                    f"?{r.url.query}"
+                ),
+            )
+        ),
     ) -> Response:
-        # Same-origin; the browse page it posts from is already step-up-gated, so the operator is fresh.
+        # BACKLOG #1227. The old premise here was "the browse page it posts from is already
+        # step-up-gated, so the operator is fresh" — and NOTHING enforced that arrival path, so a form
+        # left open past the window still posted. The freshness is now re-asserted ON THIS ROUTE,
+        # because the console calls the engine handler BY REFERENCE across the CoreHandlers seam and
+        # the engine's own ``require_step_up`` Depends never runs for a /ui caller.
+        #
+        # The two parameters ride the QUERY, not the body, so this POST is body-less and therefore
+        # auto-retryable across the re-auth redirect — the same property that lets delete work. That
+        # is the OPPOSITE choice from connection_writes.py's purge, which deliberately drops its
+        # query: losing ``index``/``to`` here strands an operator mid-task, and neither value is
+        # destructive or PHI-shaped. ``to`` is a connection name, i.e. a structural locator, which the
+        # engine already writes to the audit store by name on every resend.
+        #
+        # Bounds live on the Query params now: the request body no longer passes through
+        # UploadResendRequest's own Field(ge=0) / max_length=256 before reaching us.
         assert_same_origin(request)
-        form = dict(await _form_pairs(request))
-        try:
-            body = UploadResendRequest(index=int(form.get("index", "")), to=form.get("to", ""))
-        except (ValueError, TypeError):
-            raise HTTPException(400, "index and to are required") from None
+        body = UploadResendRequest(index=index, to=to)
         try:
             await core.resend_uploaded_message(
                 request, file_id=file_id, body=body, engine=engine, identity=identity
@@ -373,6 +411,32 @@ def register(app: FastAPI, deps: UiDeps) -> None:
             )
             return _refused(code)
         return RedirectResponse(f"/ui/uploaded-logs/file/{file_id}", status_code=303)
+
+    @app.get("/ui/uploaded-logs/file/{file_id}/resend-confirm", response_class=HTMLResponse)
+    async def ui_uploaded_log_resend_confirm(
+        file_id: str,
+        request: Request,
+        index: int = Query(..., ge=0),
+        to: str = Query(..., min_length=1, max_length=256),
+        engine: Any = Depends(deps.get_engine),
+        identity: Identity = Depends(require_ui(Permission.FILES_BROWSE)),
+    ) -> Response:
+        # The confirm step for resend (BACKLOG #1227), mirroring the delete confirm below. It is
+        # PLAIN require_ui, not step-up: this page is the re-auth CONTINUATION, so gating it with
+        # step-up would bounce the operator straight back to /ui/reauth in a loop.
+        #
+        # It exists so the POST can be body-less. The selection lives in THIS page's own URL rather
+        # than in server-side state, which is why the shape beats stashing the message body across
+        # re-auth: nothing is stored, so no message body gains a new lifetime or a new deletion
+        # question (CLAUDE.md section 9).
+        #
+        # Metadata read via list, exactly as delete-confirm does — a bad or absent id 404s at the
+        # browse handler, and this route must not disclose one file's existence to a non-owner.
+        data = await core.list_uploaded_files(request, engine=engine, identity=identity)
+        match = next((f for f in data.files if f.file_id == file_id), None)
+        if match is None:
+            return RedirectResponse("/ui/uploaded-logs", status_code=303)
+        return HTMLResponse(pages.uploaded_log_resend_confirm(file_id, match.filename, index, to))
 
     @app.get("/ui/uploaded-logs/file/{file_id}/delete-confirm", response_class=HTMLResponse)
     async def ui_uploaded_log_delete_confirm(

@@ -20,14 +20,23 @@ name: Nightly failure notice
 # SCOPE: schedule-only, deliberately. A push/PR failure is already visible on the PR itself; alerting
 # there would be pure noise, and `workflow_run` fires for every CI completion regardless of trigger.
 #
-# TWO WORKFLOWS, ONE ISSUE PER WORKFLOW. `Security` was added because its daily cron carries jobs that
-# do not run on a PR -- `released-line-audit` most of all, whose whole subject (the LATEST RELEASE) no
-# PR can change. The issue title is DERIVED from the completed workflow's name, so a green nightly CI
-# cannot close an issue opened by a red Security run: a single shared title would let one signal close
-# the other, which is the same silence this workflow exists to end.
+# THREE WORKFLOWS, ONE ISSUE PER WORKFLOW. `Security` was added because its daily cron carries jobs
+# that do not run on a PR -- `released-line-audit` most of all, whose whole subject (the LATEST
+# RELEASE) no PR can change. `DAST` was added for a stronger version of the same reason (BACKLOG
+# #318): it has NO `pull_request` trigger AT ALL, deliberately, so before this every DAST finding
+# surfaced in the Actions tab and nowhere else -- an authenticated authorization sweep reporting into
+# the void, which is precisely the shape this workflow exists to end.
+#
+# A WATCHED WORKFLOW MUST HAVE A `schedule:` TRIGGER. The job below fires only when the completed
+# run's event was `schedule`, so watching a workflow with no cron adds a name that can never match:
+# dead config that reads as coverage. `tests/test_nightly_notice.py` pins this for every watched name.
+#
+# The issue title is DERIVED from the completed workflow's name, so a green nightly CI cannot close an
+# issue opened by a red Security or DAST run: a single shared title would let one signal close
+# another, which is the same silence this workflow exists to end.
 on:
   workflow_run:
-    workflows: ["CI", "Security"]
+    workflows: ["CI", "Security", "DAST"]
     types: [completed]
 
 # Read-only by default; the one job that writes escalates to `issues: write` and nothing else.
@@ -93,7 +102,7 @@ jobs:
             exit 0
           fi
 
-          BODY="Nightly (scheduled) CI failed.
+          BODY="Nightly (scheduled) $WF_NAME failed.
 
           - run: $RUN_URL
           - commit: \`$HEAD_SHA\`
@@ -102,7 +111,8 @@ jobs:
           A scheduled run is not a PR context, so this failure appears nowhere else. For CI that is the
           server-DB store, load/throughput and service-smoke legs the three required \`test\` legs skip;
           for Security it is the daily dependency audits and the released-line audit, whose subject is a
-          published release that no pull request can change.
+          published release that no pull request can change; for DAST it is the entire workflow, which
+          carries no \`pull_request\` trigger by design.
 
           This issue is opened once and commented on each subsequent failure; it closes itself when a
           nightly goes green again."
