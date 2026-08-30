@@ -18029,3 +18029,69 @@ in this repo can close it. It is filed so the next session that meets the `trunc
 stops rewriting its Python and reaches for a workaround above. **The owner's call is whether to report
 it upstream via `/bug`** -- no feedback tool was available to the session that measured it, and
 `/bug` needs an interactive terminal.
+
+## 1282. an allocation whose worktree is deleted can never be filed, and alloc.ps1 has no transfer path
+
+> 🔢 **Filed 2026-08-30 (lander) -- allocated 2026-08-17, and the row could not be written until today
+> BECAUSE OF THE DEFECT IT DESCRIBES.** The number was issued to a worktree that no longer exists, so
+> `Checker.owns` returned false for every session from that day on and the heading was unlandable by
+> anyone. It is filed now only because [`docs/LEDGER-GATE.md`](LEDGER-GATE.md) carries an owner-ruled
+> recovery -- recreate a worktree at the recorded path -- which restores the condition the gate tests
+> rather than bypassing it.
+> Verdict: build
+> Research: none
+> Closing-act: code
+
+**Cluster:** coordination tooling / ledger integrity. **Priority:** P2. **Verdict:** build.
+**Severity:** no engine, PHI or deployment axis (sec. 0). Nothing ships in the wheel. **The cost is a
+subject that deserved filing and silently cannot be**, which is invisible to every screen that reads
+the ledger.
+
+**MECHANISM.** `Checker.owns` compares the recorded worktree path to the committing one by casefolded
+string equality, with no fallback. `alloc.ps1` exposes `-List`, `-ShowFloor`, `-Kind` and `-Title` and
+**no release, reassign, revoke or transfer verb.** A *claim* rehomes -- release from the holder, take
+in the new tree. **An allocation cannot, because there is no verb at either end.** So a number whose
+worktree is removed is uncommittable by every seat, permanently, with nothing reporting it.
+
+**THE POPULATION, measured by the cleaner 2026-08-30 with four controls stated, and the split is the
+part that matters:**
+
+| | |
+|---|---|
+| alloc records carrying a `worktree` field | 489 of 489 |
+| registered worktrees | 257, of which 23 are named in an alloc record |
+| **hold allocations and have no live session** | **22 of those 23** |
+| backlog allocations naming an unregistered path | 411 |
+| of those, **already filed** -- allocation spent, path irrelevant | **368, NO LOSS** |
+| of those, **no filed row** -- already permanently uncommittable | **43** |
+
+**THE RAW 411 IS NOT THE LOSS AND MUST NOT BE QUOTED AS ONE.** An allocation whose row is already on
+`main` has done its whole job; that its worktree later vanished costs nothing. The cleaner refused to
+publish the alarming figure without the split, which is the right call and is why the number here is
+43 rather than 411. The dispatcher independently confirmed the split on one path it had warned about:
+ten numbers, five filed and safe, five not.
+
+**WHAT THIS ROW DOES NOT ASK FOR, ruled by the dispatcher and worth stating so a builder does not
+build the wrong thing: DO NOT ADD A RELEASE VERB TO RESCUE THE EXISTING 43.** A burned number costs
+nothing -- the allocator moves on and a gap in the sequence is cosmetic. **What costs something is a
+subject that deserved a row and never got one.** The remedy for the 43 is ordinary triage: read their
+alloc titles, re-file the subjects that still matter under fresh numbers, leave the old numbers burned.
+
+**SO THE ASK IS ABOUT THE FUTURE, and it names an outcome rather than a mechanism** -- the builder
+judges which. Make an allocation recoverable or transferable when its worktree dies; **or** stop the
+gate keying entitlement on a path that can vanish; **or** have the allocator warn at allocation time
+that the number is bound to a mortal path. Prevention already exists in one direction:
+`scripts/worktree/remove.ps1` refuses a removal while the worktree owns an unlanded number, and a
+cannot-tell reads as at-risk. **That guard does not cover a worktree removed by any other means**,
+which is how these 43 arose.
+
+**A STANDING CONSEQUENCE THAT IS NOT PART OF THE FIX, and it is the dangerous half.** Those 22
+worktrees are a **do-not-remove set**. Every signal a residue sweep reads says *safe* -- no live
+session, clean tree, dead occupant -- and **all of them are blind to the allocations inside.** Nobody
+is proposing removing them; this is recorded because the next cleanup will not know to ask.
+
+**PROVENANCE.** Allocated 2026-08-17 to a worktree at `MessageFoundry-gate-status-null`, now absent
+from disk and unregistered. Population measured by the cleaner; the spent-versus-at-risk split and the
+ruling on the 43 are the dispatcher's, which verified the split independently on one path; filed by
+the lander from a worktree recreated at the recorded path under the owner-ruled recovery. **The row
+describing this defect spent thirteen days inside the population it describes.**
