@@ -450,3 +450,47 @@ def test_revisions_the_walk_could_not_read_are_counted_and_reported(
     )
     assert main(["--scorecard", str(card), "--root", str(ledger)]) == 0
     assert "revisions the walk could not read" in capsys.readouterr().out
+
+
+@pytest.fixture
+def shallow_with_a_true_root(shallow_ledger: Path) -> Path:
+    """A SHALLOW repo containing a parentless commit that is NOT a graft boundary.
+
+    That combination is not exotic -- it is this repository. Measured 2026-08-29: the engine is
+    shallow with three graft points, and the one parentless commit reachable from HEAD is
+    ``5fa6db9f4``, a deliberate 2026-07-06 history reset that appears in NONE of them. Every file
+    present in that commit has a parentless oldest revision and a COMPLETE history.
+
+    Built here by adding an orphan-rooted ledger inside an already-shallow clone.
+    """
+    git("checkout", "--orphan", "orphaned", cwd=shallow_ledger)
+    git("rm", "-rf", "--cached", ".", cwd=shallow_ledger)
+    (shallow_ledger / "docs").mkdir(parents=True, exist_ok=True)
+    (shallow_ledger / LIVE).write_text(item_block(10, "\U0001f6a7"), encoding="utf-8")
+    git("add", LIVE, cwd=shallow_ledger)
+    git("commit", "-m", "an orphan root, parentless and not a graft", cwd=shallow_ledger)
+    return shallow_ledger
+
+
+def test_a_parentless_revision_that_is_NOT_a_graft_boundary_is_not_a_truncation(
+    shallow_with_a_true_root: Path, tmp_path: Path, capsys
+) -> None:
+    """THE FALSE REFUSAL MY OWN TRUNCATION GUARD SHIPPED, and it fires on this very repository.
+
+    The first version asked "is the repo shallow AND does the oldest revision lack a parent". A TRUE
+    ROOT also lacks a parent, so any path whose history reaches the beginning of the project was
+    reported as truncated. Measured against the real engine checkout: every file present in the
+    2026-07-06 history-reset root -- .gitattributes, .gitignore, .github and the rest -- refused, on
+    a history that is complete, with remediation advice (``git fetch --unshallow``) that cannot help
+    because those commits are not on the remote either.
+
+    The right question is not "does it have a parent" but "is it one of the graft points git itself
+    recorded", which ``.git/shallow`` answers exactly.
+    """
+    card = tmp_path / "card.toml"
+    card.write_text(
+        '[[cell]]\nlast_verified = "2026-01-01"\nresidual = "BACKLOG #10"\n', encoding="utf-8"
+    )
+    rc = main(["--scorecard", str(card), "--root", str(shallow_with_a_true_root)])
+    assert rc == 0
+    assert "TRUNCATED" not in capsys.readouterr().err

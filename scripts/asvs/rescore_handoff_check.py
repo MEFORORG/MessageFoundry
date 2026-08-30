@@ -162,14 +162,27 @@ def banner_last_touched(root: Path, backlog_paths: list[str], limit: int | None)
     # 2026-08-29: the primary and every worktree report true, over 856 commits with 3 graft points.
     # So refusing on shallowness ALONE would refuse every real run on this machine -- which is why
     # the discriminator below is per-path rather than per-repository.
-    shallow = (
-        subprocess.run(  # nosec B603 B607 - fixed argv, no shell; read-only
-            ["git", "-C", str(root), "rev-parse", "--is-shallow-repository"],
-            capture_output=True,
-            text=True,
-        ).stdout.strip()
-        == "true"
+    #
+    # THE GRAFT POINTS ARE READ BY NAME RATHER THAN INFERRED FROM "HAS NO PARENT", AND THE
+    # DIFFERENCE IS A FALSE REFUSAL THIS CHECK ALREADY SHIPPED ONCE. A TRUE ROOT also has no parent.
+    # This repository carries a deliberate 2026-07-06 history reset whose root commit appears in NONE
+    # of the three graft points, so every file present in it -- .gitattributes, .gitignore, .github --
+    # was reported as truncated on a COMPLETE history, with remediation advice that cannot help,
+    # because a reset root's ancestors are not on the remote either.
+    grafts: set[str] = set()
+    common = subprocess.run(  # nosec B603 B607 - fixed argv, no shell; read-only
+        ["git", "-C", str(root), "rev-parse", "--path-format=absolute", "--git-common-dir"],
+        capture_output=True,
+        text=True,
     )
+    if common.returncode == 0:
+        shallow_file = Path(common.stdout.strip()) / "shallow"
+        if shallow_file.is_file():
+            grafts = {
+                line.strip()
+                for line in shallow_file.read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            }
     for backlog_path in backlog_paths:
         walk = subprocess.run(  # nosec B603 B607 - fixed argv, no shell; read-only git log
             ["git", "-C", str(root), "log", "--format=%H %cs", "--reverse", "--", backlog_path],
@@ -194,21 +207,12 @@ def banner_last_touched(root: Path, backlog_paths: list[str], limit: int | None)
         # it was -- and ``evaluate`` fires only on a re-score strictly later than the touch, so real
         # hits are SUPPRESSED. That is the under-fire direction the module docstring rules out.
         #
-        # THE TEST IS WHETHER THIS PATH'S OWN HISTORY IS COMPLETE, not whether the repo is shallow.
-        # If the oldest revision touching the ledger has a parent, the walk saw the commit before the
-        # file existed, so nothing about it is missing however shallow the clone is.
-        if shallow and revs:
-            oldest = revs[0].partition(" ")[0]
-            has_parent = (
-                subprocess.run(  # nosec B603 B607 - fixed argv, no shell; read-only
-                    ["git", "-C", str(root), "rev-parse", "--verify", "--quiet", oldest + "^"],
-                    capture_output=True,
-                    text=True,
-                ).returncode
-                == 0
-            )
-            if not has_parent:
-                truncated.append(backlog_path)
+        # THE TEST IS WHETHER THIS PATH'S WALK STOPPED AT A GRAFT, not whether the repo is shallow
+        # and not whether the oldest revision has a parent. Only a commit git itself recorded in
+        # ``.git/shallow`` marks history it cannot see; a parentless commit that is not in that list
+        # is a real beginning, and the walk that reached it saw everything there is.
+        if grafts and revs and revs[0].partition(" ")[0] in grafts:
+            truncated.append(backlog_path)
 
         if limit is not None:
             revs = revs[-limit:]
