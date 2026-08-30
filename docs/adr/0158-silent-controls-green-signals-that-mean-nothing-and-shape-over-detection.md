@@ -224,7 +224,7 @@ been killed" is a counterfactual about a run that never faced them.
   *found by: an independent verifier for the missing else; the mis-citation by an adversarial
   reviewer who opened the test.*
 - **A non-required check on a repository that permits auto-merge fails toward landing.** `main` has
-  13 required status contexts; zizmor's context is not among them, and is not required transitively
+  15 required status contexts; zizmor's context is not among them, and is not required transitively
   (the `CI gate` roll-up names six jobs, none of them zizmor's, and zizmor is a separate workflow).
   Repository settings report `allow_auto_merge: true` -- auto-merge is *permitted*; whether it is
   enabled on any given PR was not measured. The same fact is written in-tree at
@@ -301,7 +301,7 @@ instances were corrected, not made unrepresentable, and saying otherwise would b
 ### A. Enforced -- each names its gate and reds a PR
 
 Verified: the tests below skip only on `pwsh missing or os.name != "nt"`, and both Windows legs are
-among `main`'s 13 required contexts, so they run on the merge path.
+among `main`'s 15 required contexts, so they run on the merge path.
 
 1. **Emit signals separately; a union is a lossy encoding the caller cannot invert.**
    Gate: AC-3, `tests/test_coord_overlap_signals.py`.

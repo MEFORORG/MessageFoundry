@@ -94,6 +94,27 @@ forbidden-content (customer/PHI leak guard)
 # --- cla.yml --------------------------------------------------------------------------------------
 cla
 
+# --- codeql.yml -----------------------------------------------------------------------------------
+# RECORDED 2026-08-30 (BACKLOG #1384). These were required on the server and this file said the
+# opposite: the block below listed codeql.yml under DELIBERATELY NOT REQUIRED, with a recorded reason
+# -- that its SARIF upload needs `security-events: write`, which fork-PR tokens lack -- while branch
+# protection returned both contexts. Verified against
+# `gh api repos/MEFORORG/MessageFoundry/branches/main/protection`, which reports 15 contexts including
+# these two. security.yml:16 already called CodeQL "a required context", and ccdd557b3 fixed a total
+# merge blockage caused by it being required, so the server side is not new -- only this file's
+# account of it was wrong.
+#
+# THIS RECORDS THE SERVER; IT DOES NOT DECIDE POLICY. Whether CodeQL SHOULD be required, and what the
+# fork-PR reason above implies now that it demonstrably is, is a separate question and an owner's.
+# Removing the stale claim is not an argument for keeping the requirement.
+#
+# BOTH LANGUAGES ARE SEPARATE CONTEXTS because the job name is a matrix template,
+# `CodeQL (${{ matrix.language }})` over `[python, javascript-typescript]`. Dropping a language from
+# that matrix RETIRES A REQUIRED CONTEXT and wedges every PR -- the required-but-absent trap -- so the
+# matrix and this list move together or not at all.
+CodeQL (python)
+CodeQL (javascript-typescript)
+
 # --- backlog-hygiene.yml ---------------------------------------------------------------------------
 # PROMOTED 2026-07-29 (verified against the live API the same day). Before that it hard-failed and
 # nothing waited for it, so it was decoration -- auto-merge blocks only on REQUIRED contexts. It exists
@@ -126,8 +147,15 @@ a PR that implements BACKLOG #N must update BACKLOG.md
 # context in the request is already required, and then adds NONE of them, so send only the missing ones.
 
 # DELIBERATELY NOT REQUIRED (do not add without the owner's decision; each has a recorded reason):
-#   codeql.yml, scorecard.yml  -- their SARIF upload needs `security-events: write`, which fork-PR
-#                                 tokens lack, so requiring them would block every fork PR.
+#   scorecard.yml              -- its SARIF upload needs `security-events: write`, which fork-PR
+#                                 tokens lack, so requiring it would block every fork PR.
+#                                 codeql.yml SHARED THIS ENTRY AND IS NOW LISTED ABOVE AS REQUIRED
+#                                 (BACKLOG #1384): the server has required both its contexts for some
+#                                 time and this block was asserting the reverse. The fork-PR reasoning
+#                                 is left standing for scorecard.yml, where nothing has refuted it --
+#                                 but note it was written as a shared justification and only half of
+#                                 it has been tested against reality, so treat it as unverified for
+#                                 scorecard.yml rather than as confirmed by codeql.yml's removal.
 #   zizmor.yml                 -- paths-filtered, so it does not report on most PRs.
 #   quality-advisory.yml       -- advisory BY DESIGN and must never be promoted; the invariant is
 #                                 pinned by tests/test_quality_advisory_invariants.py.

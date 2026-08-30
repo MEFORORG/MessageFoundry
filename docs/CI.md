@@ -49,6 +49,8 @@ The stable contexts required on `main` are — mirroring
 - `forbidden-content (customer/PHI leak guard)`
 - `a PR that implements BACKLOG #N must update BACKLOG.md`
 - `cla`
+- `CodeQL (python)`
+- `CodeQL (javascript-typescript)`
 
 That last string is the **job key** in `cla.yml`, whose job declares no `name:`. Branch protection
 matches the job name, never the workflow name — so the context is `cla`, not "CLA Assistant". Every
@@ -58,10 +60,19 @@ is advisory by *placement*, being schedule/dispatch-only so it can never report 
 goes red on a finding (the `dast.yml` posture). `tests/test_security_posture.py` pins which of the
 three buckets each job is in.
 
-CodeQL is **advisory** (not in the required set) — its SARIF upload needs `security-events: write`,
-which fork-PR tokens do not have, so requiring it would block PRs from forks. Scorecard is advisory for
-the same reason and additionally **does not run on PRs at all** (`scorecard.yml` has no `pull_request`
-trigger — it runs on push-to-main, a schedule, and branch-protection changes). Nightly / path-gated
+CodeQL is **required** — both matrix contexts, `CodeQL (python)` and `CodeQL (javascript-typescript)`.
+This paragraph said the opposite until 2026-08-30 (BACKLOG #1384): it read "advisory (not in the
+required set)", while branch protection had been returning both contexts. `security.yml` already
+called CodeQL a required context, and `ccdd557b3` fixed a total merge blockage caused by it being
+required, so the server side was not new — only this account of it. **The stale reason given here was
+that its SARIF upload needs `security-events: write`, which fork-PR tokens lack.** That reason is left
+standing for Scorecard below, where nothing has refuted it, but it was written as a *shared*
+justification and only half of it has been tested against reality — so treat it as unverified there
+rather than as confirmed by CodeQL's promotion. Whether CodeQL *should* be required is an owner's
+question; this records what is.
+
+Scorecard is advisory. It additionally **can never report on a pull request**: `scorecard.yml` has no
+`pull_request` trigger — it fires on push-to-main, a schedule, and branch-protection changes. Nightly / path-gated
 legs (service-smoke, load, SQL/Postgres store) are deliberately **not** required.
 
 The `quality-advisory.yml` jobs create **no code-scanning category** and **no _required_ check context** —

@@ -394,3 +394,91 @@ script path; 126/127 are a hard failure rather than a gate verdict. Re-measured 
 deliberately hostile ambient (PYTHONIOENCODING=cp1252, PYTHONUTF8=0, LC_ALL=tr_TR.UTF-8, a global
 core.autocrlf, and PATH ordered so the WSL bash comes first).
 """
+
+[[control]]
+context = "CodeQL (python)"
+plants = """
+The context STRING, which is the only part of this gate the repository controls -- its detection lives
+entirely in GitHub's hosted analysis, exactly as `cla`'s does in a third-party action. Planted
+HISTORICALLY rather than synthetically, and the plant is this file's own former state: until 2026-08-30
+`.github/required-contexts.txt` listed codeql.yml under DELIBERATELY NOT REQUIRED and docs/CI.md called
+CodeQL "advisory (not in the required set)", while branch protection returned both contexts. A reader
+ranking which gates were safe to touch got the answer backwards from two documents at once.
+
+The live shape of the plant is narrower and mechanical: the job name is a MATRIX TEMPLATE,
+`CodeQL (${{ matrix.language }})` over `[python, javascript-typescript]`. Dropping a language from that
+matrix -- a one-word edit that reads like narrowing scope, and codeql.yml's own comment invites it
+("Drop a language to narrow scope") -- RETIRES A REQUIRED CONTEXT. The check then never reports, and
+branch protection waits for it forever: the required-but-absent trap, which wedges every PR.
+"""
+red = [
+  "tests/test_required_contexts.py::test_every_required_context_matches_a_real_job",
+  "tests/test_required_contexts.py::test_the_canonical_file_parses_and_names_the_live_set",
+  "tests/test_required_contexts.py::test_ci_doc_required_list_matches_the_canonical_file",
+]
+holds = """
+CodeQL's FINDINGS are not asserted on and must not be. What this control covers is the naming contract
+between the matrix and the register; whether the analysis reports a true or false alert is GitHub's,
+unreachable from a clone, and no test here should pretend otherwise.
+
+Nor does it cover whether CodeQL SHOULD be required. The register's former entry gave a reason -- the
+SARIF upload needs `security-events: write`, which fork-PR tokens lack -- and the server has been
+requiring it regardless. THAT TENSION IS UNRESOLVED AND IS AN OWNER'S, not this control's: it asserts
+that the documents match the server, never that the server is right.
+"""
+green = [
+  "tests/test_required_contexts.py::test_advisory_and_path_gated_jobs_are_not_required",
+]
+observed = """
+MEASURED 2026-08-30 BEFORE THE EDIT, which is what makes this evidence rather than a claim.
+`gh api repos/MEFORORG/MessageFoundry/branches/main/protection` returned 15 required contexts including
+both CodeQL strings, while `tests/test_required_contexts.py` asserted 13 and the register named neither.
+
+The resolver half was measured directly rather than assumed, with controls both ways:
+  resolve("CodeQL (python)")               -> ('codeql.yml', 'analyze')
+  resolve("CodeQL (javascript-typescript)") -> ('codeql.yml', 'analyze')
+  resolve("CI gate")                        -> ('ci.yml', 'ci-gate')   positive control, must not be None
+  resolve("zzz-not-a-job")                  -> None                    negative control, must be None
+So the matrix template does expand, and a dropped language would resolve to None and red the first
+test listed above.
+
+AND THE REGISTER ADDITION WAS MADE FIRST AND WATCHED FAIL: adding the two contexts with no control
+reddened five tests across both suites, including the both-ways reconciliation that demands this entry.
+That is the coverage requirement going red on demand rather than being taken on trust.
+"""
+
+[[control]]
+context = "CodeQL (javascript-typescript)"
+plants = """
+The same plant as `CodeQL (python)` and deliberately a SEPARATE entry rather than a shared one, because
+the two contexts fail INDEPENDENTLY: they are one job over a two-element matrix, so dropping one
+language retires exactly one required context and leaves the other reporting green. A single control
+covering "CodeQL" would go red for either and could not tell you WHICH language stopped gating.
+
+This half also carries the less obvious risk. `javascript-typescript` covers `ide/` and the web
+console; a change that narrows the matrix while Python analysis keeps passing looks entirely healthy on
+a Python-only PR, and the gap only surfaces on a PR touching the TypeScript surface -- by which time
+the register would say the context is required and nothing would be reporting it.
+"""
+red = [
+  "tests/test_required_contexts.py::test_every_required_context_matches_a_real_job",
+  "tests/test_required_contexts.py::test_the_canonical_file_parses_and_names_the_live_set",
+]
+holds = """
+Dropping the PYTHON language must NOT red this entry's own arms for the wrong reason -- the two are
+asserted separately so each names its own language. And as above, CodeQL's findings are out of scope:
+this is a naming contract, not an assertion about static analysis quality.
+"""
+green = [
+  "tests/test_required_contexts.py::test_advisory_and_path_gated_jobs_are_not_required",
+]
+observed = """
+Same measurement as the python entry, taken in the same pass on 2026-08-30: the protection API returned
+both strings, `resolve()` resolved both to ('codeql.yml', 'analyze'), and both controls fired -- a real
+context resolving and a fabricated one returning None.
+
+STATED AS A LIMIT RATHER THAN LEFT TO BE DISCOVERED: no test here proves the two contexts are
+INDEPENDENT in the live matrix. That they must be is read from codeql.yml's `language:` list, not from
+an observed one-language run. If a future change collapses the matrix to a single job reporting one
+context, these two entries would both resolve against it and neither would notice.
+"""
