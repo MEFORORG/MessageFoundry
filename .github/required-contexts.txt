@@ -19,10 +19,28 @@
 # state it settled on, read from the API and unchanged for six minutes before being written down. Two
 # non-context settings moved with it and are recorded because they change merge semantics:
 #
-#   strict = TRUE  -- a PR must be up to date with `main` before it can merge. This closes the
-#                     stale-green hole: previously a PR validated against an older base could merge
-#                     without revalidation, so a semantic conflict with a newer `main` (a test that
-#                     reads a file the other PR changed) could land red on main.
+#   strict = FALSE -- CORRECTED 2026-08-30, read from the API. It was TRUE when the paragraph above
+#                     was written and this file went on asserting TRUE for weeks after the server
+#                     changed. TRUE means a PR must be up to date with `main` before it can merge,
+#                     which closes the stale-green hole: a PR validated against an older base could
+#                     otherwise merge without revalidation, so a semantic conflict with a newer `main`
+#                     (a test that reads a file the other PR changed) could land red on main.
+#                     THE MERGE QUEUE NOW CLOSES THAT HOLE INSTEAD, which is why FALSE is the right
+#                     state and not a regression: the queue re-runs the checks on a `gh-readonly-queue`
+#                     ref built on current `main`, so nothing merges against a stale base whether or
+#                     not the branch itself was up to date. BACKLOG #340 proposed exactly this decision
+#                     as its step 3 ("a queue makes it largely redundant"), and its half B shipped in
+#                     080fb235b and ccdd557b3, which added `merge_group:` to the five workflows
+#                     carrying required contexts. The queue is live and heavily used.
+#                     *** BEWARE THE NUMBER COLLISION: #340's own prose cites "#132" as a PULL REQUEST
+#                     number. BACKLOG #132 is an unrelated frozen-clock item. The merge-race item is
+#                     #340. ***
+#                     NOT COVERED BY ANY GATE. `strict` lives only on
+#                     `/repos/{owner}/{repo}/branches/{branch}/protection`, which 401s without admin
+#                     scope, so scripts/ci/check_required_contexts_drift.py cannot see it -- that
+#                     script reconciles the CONTEXT SET only, from the public branch endpoint. This
+#                     line is a hand-maintained claim with nothing checking it, which is exactly how
+#                     it went stale the first time.
 #   enforce_admins = FALSE -- the documented escape hatch in scripts/hooks/push_guard.py, for when a
 #                     permanently red required check blocks every merge. It was ON from 2026-07-28.
 #
