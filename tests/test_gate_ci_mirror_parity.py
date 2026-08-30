@@ -31,6 +31,21 @@ from the rule they mirror with nothing failing.**
   self.owns(...)`` and CI passes ``--ci``: the allocation registry lives under ``.git/`` and never
   reaches a runner. The arm below pins the DUPLICATE-NUMBER half, which CI does enforce, and records
   the ownership gap rather than asserting it away.
+* ***THE HOOK-TO-PATTERN MAP IS ITSELF HAND-WRITTEN, WHICH IS THE DEFECT THIS FILE EXISTS TO CATCH,
+  ONE LEVEL UP.*** ``_MIRRORS`` says what a mirror LOOKS like, and nothing checks that a pattern
+  matches the step that actually enforces the rule. A pattern matching the wrong line -- another
+  job's, or an advisory copy -- satisfies its arm. Each arm asserts only that SOME non-comment line
+  matches, never that it is the BLOCKING step: measured, ``ledger-gate`` matches exactly one line
+  today, but one is a property of this corpus and not of the assertion.
+* **It does not verify that the sibling ASSERTS anything.** ``test_the_sibling_this_file_defers_to
+  _still_exists`` checks that ``tests/test_lint_scope_parity.py`` exists and still NAMES each of the
+  three ids. **It cannot tell an assertion from a mention**, so gutting that file's bandit arms while
+  leaving the word in place stays green here. Closing it needs the sibling to publish what its arms
+  exercise -- a change there, not here.
+* **The six script-path patterns are safe BY THE CURRENT CORPUS, not by construction.** They were
+  measured at 1-3 hits each, all run lines. Nothing stops a future workflow from mentioning one of
+  those paths on a non-comment line that is not an invocation, which is exactly how ``gitleaks`` and
+  ``actionlint`` failed before they were anchored on their invocations.
 """
 
 from __future__ import annotations
