@@ -24,7 +24,7 @@ from fastapi import FastAPI
 from messagefoundry.api._ui_seam import UiDeps
 
 from . import STATIC_DIR, _auth, assert_engine_seam, pages
-from ._security import UiSecurityHeadersMiddleware
+from ._security import UiFetchMetadataMiddleware, UiSecurityHeadersMiddleware
 from ._static import AllowlistedStaticFiles
 from .routes import (
     account,
@@ -101,3 +101,8 @@ def mount_ui(app: FastAPI, deps: UiDeps) -> None:
     # See :mod:`._security`.
     if not any(getattr(m, "cls", None) is UiSecurityHeadersMiddleware for m in app.user_middleware):
         app.add_middleware(UiSecurityHeadersMiddleware)
+    # Fetch-metadata (BACKLOG #1371). Registered the same idempotent way, and separately from the
+    # headers middleware because its SCOPE is deliberately wider -- it must reach the /ui/static Mount,
+    # which no route dependency can see.
+    if not any(getattr(m, "cls", None) is UiFetchMetadataMiddleware for m in app.user_middleware):
+        app.add_middleware(UiFetchMetadataMiddleware)

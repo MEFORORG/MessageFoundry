@@ -18448,3 +18448,60 @@ from disk and unregistered. Population measured by the cleaner; the spent-versus
 ruling on the 43 are the dispatcher's, which verified the split independently on one path; filed by
 the lander from a worktree recreated at the recorded path under the owner-ruled recovery. **The row
 describing this defect spent thirteen days inside the population it describes.**
+
+
+## 1370. operator-supplied names reach /ui URL paths unencoded or half-encoded, so a name carrying a slash addresses a different route
+
+> 🔢 **Filed 2026-08-27 (builder 2) - BUILT IN THIS COMMIT, not yet landed.** Gap 2 of the two the Lander scoped on **PR 530**, this seat's own abandoned lane, re-implemented against current `main` rather than cherry-picked.
+> Verdict: build
+> Closing-act: code
+
+**Cluster:** Web console security. **Priority:** P2. **Verdict:** build.
+**Severity:** no engine effect, no PHI axis, and **no deployment axis (sec. 0)** -- with zero deployments this is a condition a FIRST deployment would meet, not an exposure anyone has today.
+
+**What:** connection names and channel ids are interpolated into `/ui` URL paths. They are **unconstrained free text** -- the registry checks only for a duplicate and no charset gate exists -- so a name carrying `/` splits into two path segments and addresses a different route.
+
+**MAIN WAS IN TWO DIFFERENT STATES, AND THE HALF-PROTECTED ONE IS THE MORE INTERESTING:**
+
+```
+connections.py:64   quote(r.name)     PARTIAL -- quote's default is safe="/", so the separator passes
+connections.py:200  quote(name)       PARTIAL -- same
+admin.py:363,381    {role.id}         RAW
+messages.py:618,628 {ch}/{dest}       RAW
+```
+
+**A bare `quote()` reads as protection and provides none against the one character that matters.** Measured, not reasoned: `quote("IB/ACME")` returns it **unchanged**, while `quote("a?b")` and `quote("a#b")` are encoded -- so the call looks like it works everywhere it is tested by hand. `safe=""` is the whole fix.
+
+**The fix:** `_seg()` in `pages/_common.py`, and the six sites routed through it.
+
+**NOT A BLANKET SWEEP, AND THE EXCLUSION IS THE LOAD-BEARING PART.** `_auth`'s re-auth `next` carries a whole PATH inside a QUERY parameter, where `safe="/"` is **correct**; routing it through `_seg` would break every re-auth redirect. `connections.py:59` and `:384` keep a bare `quote()` for the same reason -- they build `?channel_id=` query values, not path segments. **A sweep of "every `quote()` call" would ship a broken login**, so a test pins the re-auth encoding against exactly that.
+
+**Verification:** the seven tests come from the abandoned branch and **pass unmodified against this re-implementation** -- written for a different implementation of the same contract, so they corroborate rather than restate. Five mutants, all killed, each by a distinct red set: `_seg` reverted to the default `safe`; `_seg` over-encoding (the negative control fires); one site reverted to raw; **one site reverted to a bare `quote()` -- caught by the structural scan alone**; the custom-role site reverted.
+
+**Related:** the sibling gap from the same PR 530 dispatch -- fetch-metadata does not cover the `/ui/static` mount (`_is_ui_fetch_scope` absent from main) -- is **NOT in this commit** and still wants building.
+
+**Source:** dispatched by the Lander off PR 530 with a per-file measurement. Three searches in that scouting returned false zeros on SPELLING alone: `def test` missing 8 `async def test` functions, `def seg` matching `segment_ids` as a prefix, and `\bseg\(` unable to match `_seg(` because underscore is a word character.
+## 1371. fetch-metadata never reaches the /ui/static mount, because a route dependency cannot run for a Mount
+
+> 🔢 **Filed 2026-08-27 (builder 2) - BUILT IN THIS COMMIT, not yet landed.** Gap 1 of the two the Lander scoped on **PR 530**, re-implemented against current `main` rather than cherry-picked.
+> Verdict: build
+> Closing-act: code
+
+**Cluster:** Web console security. **Priority:** P2. **Verdict:** build.
+**Severity:** no engine effect, no PHI axis, and **no deployment axis (sec. 0)** -- a condition a FIRST deployment would meet, not an exposure anyone has today.
+
+**What:** `main` DOES check fetch-metadata -- `_auth`'s per-route helper refuses any request whose `Sec-Fetch-Site` says cross-site. **But `/ui/static` is a Starlette `Mount`, not an `APIRoute`, so no route dependency ever runs for it.** The asset tier is the one `/ui` surface the per-route check cannot reach, and at a glance the console looks covered because the helper exists and is used across five modules.
+
+**The fix is MIDDLEWARE, which is the only tier that sees a Mount.** `UiFetchMetadataMiddleware` plus `_is_ui_fetch_scope`, deliberately WIDER than the existing `_is_ui_html_path`: that predicate excludes `/ui/static` correctly, because CSP headers only apply to HTML. **Collapsing the two would remove this check's only purpose.**
+
+**THREE CARVE-OUTS, EACH OF WHICH LOOKS LIKE A WEAKNESS AND IS NOT.** Every one is pinned by a test, and every corresponding mutant is a plausible hardening pass:
+
+- **A cross-site top-level NAVIGATION passes.** An intranet link into the console is one; so is the OIDC callback, cross-site by construction. Without reading `Sec-Fetch-Mode`, **every real SSO login would 403 while every hermetic test still passed**. Method is part of safe -- a cross-site navigation carrying a POST is a CSRF submission -- and `object`/`embed` are refused because that is framing, not navigation.
+- **An ABSENT header passes.** `Sec-Fetch-Site` is browser-populated; old browsers, reporting agents and every non-browser client omit it. Failing closed would refuse **the shipped Windows tray's own `GET /ui` probe**, which builds its client with no headers at all.
+- **403, NEVER 404.** The tray classifies 404 as DISABLED and every other status as ENABLED, so a "do not disclose the route" pass would make a healthy console report as switched off.
+
+**Verification:** the eight tests come from the abandoned branch and **pass unmodified against this re-implementation** -- written for a different implementation of the same contract. Five mutants, all killed, each by a distinct red set, and each is a change someone would plausibly propose as an improvement: narrow the scope to the HTML predicate; fail closed on absence; return 404; drop the navigation carve-out; admit framing. Full webconsole suite 393 passed, 3 skipped.
+
+**Related:** #1370, the sibling gap from the same PR 530 dispatch. Both are now built; PR 530's branch itself remains superseded and should not be cherry-picked.
+
+**Source:** dispatched by the Lander off PR 530. Its brief called this file a possible silent-green test file -- 180 lines with zero `def test`. It collects **8**; they are `async def test`, and a pattern anchored on `def test` cannot match one.
