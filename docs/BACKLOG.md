@@ -13947,6 +13947,31 @@ point, which are the parts that must survive it.**
 
 > 🔢 **Re-scored 2026-08-20 -> P2.** Value **5/10** · Difficulty **3/10** · _fill-in_. Unchanged at HEAD: line 66 pipes the PR title and body through a raw grep for the claim token with no inline-code-span blanking, so a backticked mention is indistinguishable from a claim, and the head -1 secondary defect is intact on the same line. A required status check that can red a compliant pull request is a false deny, the direction that gets acted on, and both obvious remedies damage the record. Difficulty 3 because the sibling precedent exists (Get-ScannableSegments blanking quoted spans) but its measured lesson forces a paired must-trip and must-not-trip arm, and the inline bash step has no testable seam today. _(was 5/10 · 2/10.)_
 >
+> **AMENDED 2026-08-27 -- THE DEFECT IS LIVE AND THE PARAGRAPH ABOVE DESCRIBES IT AT THE WRONG
+> ADDRESS.** Both halves of that sentence went stale when BACKLOG #1347 reworked the extraction,
+> and a reader following it would look at a line that no longer exists and a mechanism that no
+> longer applies. Corrected here rather than below, because a correction placed after the claim
+> is read after the reader has acted on it.
+>
+> * **It is line 109, not 66**, and the pipeline is no longer a single `grep -oiE`. It splits on
+>   close-paren to scope to the parenthetical and takes every `#N` after the token.
+> * **The defect survives that rework intact and untouched**: nothing in the pipeline strips
+>   inline code spans or fenced blocks, so a quoted mention is still indistinguishable from a
+>   claim. The rework changed the address, not the behaviour.
+> * **The second defect is already closed and must not be 'fixed' again.** The row says `head -1`
+>   takes the first match in reading order and so the error message names the wrong item. There
+>   is now a `sort -un` before it, so it takes the LOWEST NUMBER -- and more to the point the
+>   error at line 148 already names `$count` items and lists `$all_items`, so the harm the row
+>   describes is gone. `$claim` survives only in two PASS messages, where nobody is being sent
+>   anywhere. **Left alone deliberately.**
+>
+> **HOW THE STALENESS WAS FOUND, because the screen that dispatched this row passed on every axis
+> it checked** -- open banner, verdict build, closing-act code, no refusal language, body does not
+> retract its title. The row named a specific artifact, and asking whether that artifact still
+> exists is one command. Two rows dispatched the same morning (#1040 and #1229) turned out to be
+> already built, caught the same way: **a row is a claim about the world, and the code is the
+> world.**
+>
 > **Filed 2026-08-20 -- not started. A REQUIRED status check enforces against a PR that made no claim, and the two tempting fixes both destroy something.** `.github/workflows/backlog-hygiene.yml:66` extracts the claim with a raw grep over the pull request's title and body:
 >     claim="$(printf '%s
 > Verdict: build
