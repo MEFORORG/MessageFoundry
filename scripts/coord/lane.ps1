@@ -102,7 +102,24 @@ if ($Asked) {
     # statedUtc only ever advances.
     if ($rec.statedUtc) {
         try {
-            if (([datetime]::Parse($rec.statedUtc)).ToUniversalTime() -gt [datetime]::UtcNow) {
+            # COMPARE THE VALUE, DO NOT RE-PARSE IT. ConvertFrom-Json already returns this as a
+            # [datetime] with Kind=Utc. [datetime]::Parse() on a DateTime stringifies it to reach the
+            # string overload, THE STRING CARRIES NO KIND, and the result comes back Unspecified --
+            # so ToUniversalTime() then applies the local offset a SECOND time and a stamp minutes
+            # old reads as hours in the future. This guard exists to stop a stamp moving BACKWARDS
+            # and instead moved it FORWARD by the offset, which made every restate throw:
+            # measured 2026-08-29, a lane could not restate its level for the whole window.
+            # A CONVERSION THAT LOOKS LIKE A NO-OP AND DESTROYS THE ONE PROPERTY THAT MADE THE VALUE
+            # CORRECT. The string branch is kept for records written before Kind was preserved.
+            $existing = if ($rec.statedUtc -is [datetime]) {
+                if ($rec.statedUtc.Kind -eq 'Local') { $rec.statedUtc.ToUniversalTime() }
+                else { [datetime]::SpecifyKind($rec.statedUtc, [System.DateTimeKind]::Utc) }
+            } else {
+                [datetime]::Parse([string]$rec.statedUtc, [cultureinfo]::InvariantCulture,
+                    [System.Globalization.DateTimeStyles]::AdjustToUniversal -bor
+                    [System.Globalization.DateTimeStyles]::AssumeUniversal)
+            }
+            if ($existing -gt [datetime]::UtcNow) {
                 throw "existing statedUtc $($rec.statedUtc) is in the future; refusing to move it backwards"
             }
         } catch [System.FormatException] { }
