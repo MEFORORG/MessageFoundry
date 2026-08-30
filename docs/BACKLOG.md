@@ -17949,3 +17949,50 @@ backlog alloc records before allocating** -- `workflow` 0, `concurren` 0, `fan-o
 `fanout` 3 all seat-clock (#1264, #1266, #1267); `aggregate` 1 (#1250). Controls: `gate` 72 titles,
 `workflow` 191 lines in the ledger, an impossible string 0. **The `watch.py` margin history above is the
 filer's own read**, and it is the part that changes the row's ask.
+
+## 1397. the Bash tool unescapes backslashes inside a QUOTED heredoc, so a Windows path or a doubled-backslash regex silently changes meaning
+
+> 🔢 **Filed 2026-08-29 - measured, not fixable here.** In the Claude Code Bash tool a quoted heredoc
+> (`<<'EOF'`) applies one level of backslash-unescaping to the body. POSIX requires a quoted delimiter
+> to suppress all expansion and processing, so the body must reach the shell verbatim. It does not: a
+> line written `C:\\Users` arrives as `C:\Users`. Hit twice in one session while editing
+> `~/.claude/mefor-usage/accounts.json`, and both times the symptom was a Python `SyntaxError` that
+> reads as the model having written bad code.
+> Verdict: owner-ruling
+> Research: done 2026-08-29
+> Closing-act: owner-ruling
+
+**Cluster:** agent tooling / harness. **Priority:** P3. **Severity:** no deployment axis (sec. 0) --
+this is the Claude Code harness, not engine code. Nothing ships in the wheel and no MessageFoundry
+behaviour changes. The cost is at authoring time: a session writing a script through a heredoc can
+emit something subtly different from what it composed.
+
+**The measurement.** Both rows below were written inside `cat <<'EOF' ... EOF` in one tool call:
+
+| written in the tool call | arrived at the shell |
+|---|---|
+| `C:\Users` | `C:\Users` |
+| `C:\\Users` | `C:\Users` |
+
+One backslash survives; two collapse to one. That is a single unescape pass in which `\\` is a
+recognised escape and `\U` is not.
+
+**Why it presents as a model error rather than a tooling one.** Piped into `python - <<'EOF'`, the
+collapsed form raises `SyntaxError: (unicode error) 'unicodeescape' codec can't decode bytes in
+position 2-3: truncated \UXXXXXXXX escape`, and the traceback points at a source line the model never
+wrote. The failure is attributed to the code rather than to the transport, so the natural response is
+to rewrite the Python, which cannot help. On a Windows box this is not an edge case: every absolute
+path carries backslashes.
+
+**Workarounds that do hold.**
+1. Build the separator at runtime -- `BS = chr(92)`, then concatenate. This is what landed the
+   `accounts.json` row on 2026-08-29 after the direct form failed twice.
+2. Use the PowerShell tool with a single-quoted here-string (`@'` ... `'@`). Measured unaffected in
+   the same session, including for a multi-line body containing backslash paths.
+3. Forward slashes, where the consumer accepts them.
+
+**Why this is filed here rather than fixed here.** The defect is upstream in the harness and no change
+in this repo can close it. It is filed so the next session that meets the `truncated \UXXXXXXXX` error
+stops rewriting its Python and reaches for a workaround above. **The owner's call is whether to report
+it upstream via `/bug`** -- no feedback tool was available to the session that measured it, and
+`/bug` needs an interactive terminal.
