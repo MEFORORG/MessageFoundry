@@ -111,6 +111,24 @@ def read_pairs(scorecard_text: str) -> tuple[list[Pair], int]:
     return pairs, ambiguous
 
 
+@dataclass(frozen=True)
+class Walk:
+    """The walk's answer AND the two ways it can be incomplete, returned together on purpose.
+
+    Round one returned a bare dict. Both caveats below then had to be discovered by a caller that
+    knew to ask, and neither was asked for -- so a truncated walk and a walk with unreadable
+    revisions both rendered as a complete one. Bundling them makes the incomplete case impossible
+    to take without seeing it.
+    """
+
+    touched: dict[int, str]
+    #: Revisions whose blob ``git show`` could not read. A revision that DELETED the path fails
+    #: legitimately, so this is reported rather than refused.
+    unreadable_revisions: int
+    #: Ledger paths whose walk began at a shallow graft boundary, so history before it is invisible.
+    truncated: tuple[str, ...]
+
+
 def banner_fingerprint(text: str) -> dict[int, str]:
     """Per item, a fingerprint of the banner state ``parse_items`` exposes.
 
@@ -124,7 +142,7 @@ def banner_fingerprint(text: str) -> dict[int, str]:
     return out
 
 
-def banner_last_touched(root: Path, backlog_paths: list[str], limit: int | None) -> dict[int, str]:
+def banner_last_touched(root: Path, backlog_paths: list[str], limit: int | None) -> Walk:
     """The date each item's banner state last CHANGED, walking the ledger's own history.
 
     Oldest-first, so a change is attributed to the commit that introduced it. An item absent from the
@@ -138,6 +156,20 @@ def banner_last_touched(root: Path, backlog_paths: list[str], limit: int | None)
     then touched in the other.
     """
     touched: dict[int, str] = {}
+    unreadable = 0
+    truncated: list[str] = []
+    # A SHALLOW CLONE IS THE ORDINARY STATE OF THIS REPOSITORY, NOT AN EDGE CASE. Measured
+    # 2026-08-29: the primary and every worktree report true, over 856 commits with 3 graft points.
+    # So refusing on shallowness ALONE would refuse every real run on this machine -- which is why
+    # the discriminator below is per-path rather than per-repository.
+    shallow = (
+        subprocess.run(  # nosec B603 B607 - fixed argv, no shell; read-only
+            ["git", "-C", str(root), "rev-parse", "--is-shallow-repository"],
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        == "true"
+    )
     for backlog_path in backlog_paths:
         walk = subprocess.run(  # nosec B603 B607 - fixed argv, no shell; read-only git log
             ["git", "-C", str(root), "log", "--format=%H %cs", "--reverse", "--", backlog_path],
@@ -155,6 +187,29 @@ def banner_last_touched(root: Path, backlog_paths: list[str], limit: int | None)
                 f"(exit {walk.returncode}): {walk.stderr.strip()}"
             )
         revs = walk.stdout.splitlines()
+
+        # TRUNCATION IS A DIFFERENT FAILURE FROM AN ERROR, AND IT EXITS ZERO. On a shallow clone
+        # ``git log`` succeeds over the visible window, so no returncode guard can see it. Every
+        # banner date then floors at the clone boundary, which makes the last touch look LATER than
+        # it was -- and ``evaluate`` fires only on a re-score strictly later than the touch, so real
+        # hits are SUPPRESSED. That is the under-fire direction the module docstring rules out.
+        #
+        # THE TEST IS WHETHER THIS PATH'S OWN HISTORY IS COMPLETE, not whether the repo is shallow.
+        # If the oldest revision touching the ledger has a parent, the walk saw the commit before the
+        # file existed, so nothing about it is missing however shallow the clone is.
+        if shallow and revs:
+            oldest = revs[0].partition(" ")[0]
+            has_parent = (
+                subprocess.run(  # nosec B603 B607 - fixed argv, no shell; read-only
+                    ["git", "-C", str(root), "rev-parse", "--verify", "--quiet", oldest + "^"],
+                    capture_output=True,
+                    text=True,
+                ).returncode
+                == 0
+            )
+            if not has_parent:
+                truncated.append(backlog_path)
+
         if limit is not None:
             revs = revs[-limit:]
 
@@ -174,6 +229,11 @@ def banner_last_touched(root: Path, backlog_paths: list[str], limit: int | None)
                 errors="replace",
             )
             if blob.returncode != 0:
+                # A revision that DELETED the path fails here legitimately, so this is counted and
+                # reported rather than refused. It is NOT harmless: the skip leaves ``previous``
+                # untouched, so the next readable revision is diffed against a stale fingerprint and
+                # its change is dated LATER than it happened -- the hit-suppressing direction again.
+                unreadable += 1
                 continue
             try:
                 current = banner_fingerprint(blob.stdout)
@@ -190,7 +250,7 @@ def banner_last_touched(root: Path, backlog_paths: list[str], limit: int | None)
                     if stamp > touched.get(num, ""):
                         touched[num] = stamp
             previous = current
-    return touched
+    return Walk(touched=touched, unreadable_revisions=unreadable, truncated=tuple(truncated))
 
 
 def evaluate(pairs: list[Pair], touched: dict[int, str]) -> tuple[list[Flag], list[int]]:
@@ -263,9 +323,19 @@ def main(argv: list[str] | None = None) -> int:
 
     ledgers = args.backlog or ["docs/BACKLOG.md", "docs/archive/backlog/BACKLOG-CLOSED.md"]
     try:
-        touched = banner_last_touched(args.root, ledgers, args.limit)
+        walk = banner_last_touched(args.root, ledgers, args.limit)
     except RuntimeError as exc:
         sys.stderr.write(f"REFUSING: {exc}\n")
+        return 3
+    touched = walk.touched
+    if walk.truncated:
+        sys.stderr.write(
+            "REFUSING: the ledger history is TRUNCATED at a shallow graft boundary for "
+            f"{list(walk.truncated)}, so every banner date floors at that boundary. A floored date "
+            "reads as a LATER touch, which SUPPRESSES real hits rather than inventing them -- the "
+            "one direction this check exists to rule out. Deepen the clone (git fetch --unshallow) "
+            "and re-run.\n"
+        )
         return 3
     # THE GUARD THIRTY LINES ABOVE, FOR THE OTHER INPUT, AND THE REASONING TRANSFERS VERBATIM. With
     # no history every pair falls to ``unknown``, ``flags`` is empty, and the tool prints the
@@ -285,6 +355,8 @@ def main(argv: list[str] | None = None) -> int:
     )
     print(f"bare '#N' references NOT resolved (ambiguous with PR numbers): {ambiguous}")
     print(f"items whose banner history was found: {len(touched)}")
+    # STATED EVEN WHEN ZERO. An absent line cannot be checked; a printed zero can.
+    print(f"revisions the walk could not read: {walk.unreadable_revisions}")
     if unknown:
         print(f"items referenced but absent from every ledger walked: {sorted(unknown)}")
     print()

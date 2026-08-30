@@ -44,6 +44,26 @@ def git(*args: str, cwd: Path) -> str:
     ).stdout.strip()
 
 
+@pytest.fixture
+def shallow_ledger(ledger: Path, tmp_path: Path) -> Path:
+    """A depth-1 clone of the ledger fixture, so the walk's oldest revision IS the graft boundary.
+
+    Cloned over file:// with --no-local, because a local clone hardlinks the object store and is not
+    actually shallow.
+    """
+    dest = tmp_path / "shallow"
+    git(
+        "clone",
+        "--depth",
+        "1",
+        "--no-local",
+        ledger.as_uri(),
+        str(dest),
+        cwd=tmp_path,
+    )
+    return dest
+
+
 def item_block(num: int, banner: str) -> str:
     return f"## {num}. a row\n\n> {banner} **Filed.** body\n\nCluster: x\n\n"
 
@@ -163,8 +183,8 @@ def test_the_archive_is_walked_so_a_CLOSED_item_is_not_reported_absent(ledger: P
     live ledger, which is older than the flip -- so a later re-score reads as a missing flip when the
     flip is exactly what happened.
     """
-    live_only = banner_last_touched(ledger, [LIVE], None)
-    both = banner_last_touched(ledger, [LIVE, ARCHIVE], None)
+    live_only = banner_last_touched(ledger, [LIVE], None).touched
+    both = banner_last_touched(ledger, [LIVE, ARCHIVE], None).touched
 
     assert live_only[20] == "2026-01-01"
     assert both[20] == "2026-03-01"
@@ -178,8 +198,8 @@ def test_the_archive_is_walked_so_a_CLOSED_item_is_not_reported_absent(ledger: P
 def test_an_in_place_flip_is_dated_at_the_flip(ledger: Path) -> None:
     """The control for the row above: #10 never moved, so both walks must agree about it. Without this
     the archive fix could have shifted every date and still passed."""
-    live_only = banner_last_touched(ledger, [LIVE], None)
-    both = banner_last_touched(ledger, [LIVE, ARCHIVE], None)
+    live_only = banner_last_touched(ledger, [LIVE], None).touched
+    both = banner_last_touched(ledger, [LIVE, ARCHIVE], None).touched
     assert live_only[10] == both[10] == "2026-02-01"
 
 
@@ -293,3 +313,140 @@ def test_a_walk_that_found_no_banner_history_is_refused_not_reported_clean(
     captured = capsys.readouterr()
     assert "REFUSING" in captured.err
     assert "no item was re-scored" not in captured.out
+
+
+# ----------------------------------------------- round two: the guards covered entrances, not the class
+#
+# EVERY ROW HERE PINS SOMETHING ROUND ONE CLAIMED AND DID NOT DELIVER. Round one's commit message said
+# "four guards, each with a test that fails when only that guard is removed". THREE WERE. Guard 2 was
+# executed by no test at all -- deleting it outright left 31 of 31 green. Found by an adversarial pass
+# and confirmed by hand, not by re-reading.
+
+
+def test_a_walk_that_fails_on_a_repo_WITH_commits_is_refused_at_the_call_site(
+    ledger: Path, tmp_path: Path, capsys
+) -> None:
+    """Guard 2, the call-site catch, reached through main() for the first time.
+
+    Round one made it unreachable by construction: the only input that made the walk raise was a
+    commitless repo, and the rev-parse guard returns 3 before the walk ever runs. So the guard that
+    turns a raised walk into a refusal was pinned by nothing, and deleting it changed no test.
+
+    A ledger path git refuses to walk -- one outside the repository -- fails the walk while HEAD still
+    resolves, which is the only way through to this guard.
+    """
+    card = tmp_path / "card.toml"
+    card.write_text(
+        '[[cell]]\nlast_verified = "2026-01-01"\nresidual = "BACKLOG #10"\n', encoding="utf-8"
+    )
+    rc = main(["--scorecard", str(card), "--root", str(ledger), "--backlog", "../outside.md"])
+    assert rc == 3
+    captured = capsys.readouterr()
+    # A phrase only guard 1's raise produces, arriving through guard 2's catch.
+    assert "git log failed over" in captured.err
+    assert "no item was re-scored" not in captured.out
+
+
+def test_a_PARTIAL_walk_is_refused_even_though_the_result_is_not_empty(
+    ledger: Path, tmp_path: Path, capsys
+) -> None:
+    """Guard 1's whole stated reason to exist, which round one asserted in capitals and never tested.
+
+    The guard's comment argues the emptiness guard is not a substitute because "a walk that fails over
+    ONE of the two ledgers while the other succeeds leaves a PARTIAL result, which is non-empty and
+    reads as complete". That sentence describes exactly this test, and round one's only guard-1 test
+    used a single ledger on a commitless repo -- so the failure always happened while touched was
+    still empty, and `if walk.returncode != 0 and not touched` would have kept every test green while
+    making the guard inert for the case it was written for.
+
+    Here the first ledger walks fine and fills touched; the second fails. The refusal must still fire.
+    """
+    card = tmp_path / "card.toml"
+    card.write_text(
+        '[[cell]]\nlast_verified = "2026-01-01"\nresidual = "BACKLOG #10"\n', encoding="utf-8"
+    )
+    rc = main(
+        [
+            "--scorecard",
+            str(card),
+            "--root",
+            str(ledger),
+            # --backlog is action="append", so the two ledgers are two flags, not one list.
+            "--backlog",
+            LIVE,
+            "--backlog",
+            "../outside.md",
+        ]
+    )
+    assert rc == 3
+    captured = capsys.readouterr()
+    assert "git log failed over" in captured.err
+    assert "no item was re-scored" not in captured.out
+
+
+def test_a_truncated_history_is_refused_rather_than_answered_from_the_visible_window(
+    shallow_ledger: Path, tmp_path: Path, capsys
+) -> None:
+    """A shallow clone makes git log exit ZERO over a truncated window, so no guard round one added
+    can see it -- the walk does not raise and touched is full.
+
+    The distortion runs in the under-fire direction: every banner date floors at the clone boundary,
+    which makes the last touch look LATER than it was, and evaluate() only fires when the re-score is
+    strictly later. So real hits are SUPPRESSED and the tool prints the all-clear.
+
+    The tool already refuses to print a verdict under --limit for exactly this reason. The same
+    truncation arriving through a shallow clone got a full unsuppressed verdict.
+    """
+    card = tmp_path / "card.toml"
+    card.write_text(
+        '[[cell]]\nlast_verified = "2026-12-01"\nresidual = "BACKLOG #10"\n', encoding="utf-8"
+    )
+    rc = main(["--scorecard", str(card), "--root", str(shallow_ledger)])
+    assert rc == 3
+    captured = capsys.readouterr()
+    assert "TRUNCATED" in captured.err
+    assert "RE-SCORED AFTER" not in captured.out
+
+
+def test_a_shallow_clone_whose_ledger_history_is_COMPLETE_is_answered_normally(
+    ledger: Path, tmp_path: Path, capsys
+) -> None:
+    """THE CONTROL THAT KEEPS THE ROW ABOVE FROM BEING A FALSE REFUSAL, and it is not hypothetical:
+    THIS REPOSITORY IS ITSELF A SHALLOW CLONE.
+
+    Measured 2026-08-29: `git rev-parse --is-shallow-repository` returns true in the primary and in
+    every worktree, over 856 commits with 3 graft points. But docs/BACKLOG.md was CREATED after the
+    graft boundary, so the oldest revision touching it HAS a parent and the walk sees the file's whole
+    history. Refusing on shallowness alone would therefore refuse every real run on this machine.
+
+    So the discriminator is not "is the repo shallow" but "did this path's walk reach past its own
+    beginning": a walk is truncated only when its oldest revision has no parent AND the repo is
+    shallow. Here the ledger fixture is a normal clone, so nothing is truncated and nothing refuses.
+    """
+    card = tmp_path / "card.toml"
+    card.write_text(
+        '[[cell]]\nlast_verified = "2026-12-01"\nresidual = "BACKLOG #10"\n', encoding="utf-8"
+    )
+    assert main(["--scorecard", str(card), "--root", str(ledger)]) == 0
+    assert "TRUNCATED" not in capsys.readouterr().err
+
+
+def test_revisions_the_walk_could_not_read_are_counted_and_reported(
+    ledger: Path, tmp_path: Path, capsys
+) -> None:
+    """`git show` inside the walk still swallows its returncode with a bare `continue`.
+
+    Round one guarded `git log` and `git rev-parse` and left the third git call in the same loop
+    unreported, which is the same partial-walk hazard the new comment claims to have closed. Neither
+    skip updates `previous` either, so the next readable revision is diffed against a stale
+    fingerprint and the change is attributed to a LATER commit -- suppressing the flag.
+
+    Refusing here would be wrong: a revision that DELETED the path makes `git show` fail legitimately.
+    So the count is reported instead, and a zero is stated rather than left to be assumed.
+    """
+    card = tmp_path / "card.toml"
+    card.write_text(
+        '[[cell]]\nlast_verified = "2026-01-01"\nresidual = "BACKLOG #10"\n', encoding="utf-8"
+    )
+    assert main(["--scorecard", str(card), "--root", str(ledger)]) == 0
+    assert "revisions the walk could not read" in capsys.readouterr().out

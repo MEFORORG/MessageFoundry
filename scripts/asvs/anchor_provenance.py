@@ -207,8 +207,18 @@ def summarise(verdicts: list[AnchorVerdict]) -> str:
             f"  |delta| min {deltas[0]}, median {deltas[len(deltas) // 2]}, max {deltas[-1]}"
         )
     never = sum(counts.get(k, 0) for k in NEVER_VERIFIED)
+    unread = counts.get(UNREADABLE, 0) + counts.get(NO_COMMIT, 0)
     lines.append("")
     lines.append(f"anchors that were NOT verifiable at the cell's own recorded commit: {never}")
+    # THE NUMBER ABOVE IS THE ONE A READER CARRIES AWAY, AND IT SUMS ONLY BUCKETS THAT REQUIRED A
+    # SUCCESSFUL READ. Excluding UNREADABLE from NEVER_VERIFIED is right -- an unresolvable stamp is
+    # a different fact from a born-wrong anchor -- but it means a run that read NOTHING closes with a
+    # reassuring zero. Printing the denominator it did not examine, always and including when it is
+    # zero, is what stops that line being taken as a verdict over the whole population.
+    lines.append(
+        f"anchors whose recorded commit could not be read, so the line above did not "
+        f"examine them: {unread}"
+    )
     return "\n".join(lines)
 
 
@@ -277,6 +287,20 @@ def main(argv: list[str] | None = None) -> int:
     verdicts = audit(cells, args.root, args.at)
     if not verdicts:
         sys.stderr.write("REFUSING to report a clean run over zero anchors\n")
+        return 3
+
+    # A RUN THAT READ NOTHING IS NOT A CLEAN RUN, AND IT LOOKED EXACTLY LIKE ONE. With every anchor
+    # unreadable the summary closed on "NOT verifiable ...: 0" at exit 0, with a REAL sha in the
+    # header, because the ref pair resolves fine in a checkout whose history simply lacks the stamped
+    # commits -- a shallow clone, a rewritten history, or the wrong sibling checkout.
+    unread = sum(1 for v in verdicts if v.verdict in (UNREADABLE, NO_COMMIT))
+    if unread == len(verdicts):
+        sys.stderr.write(
+            f"REFUSING: all {unread} anchors' recorded commits could not be read in {args.root}. "
+            "The summary would close on a zero that examined nothing, and the engine ref in the "
+            "header resolves either way, so the header cannot tell the two runs apart. Check the "
+            "root is the engine checkout and that its history reaches the recorded commits.\n"
+        )
         return 3
 
     # NO NUMBER HERE IS A FACT WITHOUT THE PAIR IT WAS MEASURED AGAINST -- the same rule the scorecard's
