@@ -14589,6 +14589,25 @@ would measure the engine's own refusal to offer rather than a peer's refusal to 
 real finding into a false pass. That cell's own ruling is a separate question about allowlist width; this item is the build
 which both readings of the cell now require.
 
+**AMENDMENT 2026-08-30 (lander) -- ONE CALL SITE GAINED ITS ASSERTION; THE ROW STAYS PARTIAL.** The AD
+LDAPS hop now asserts its TLS cipher suites, against a context proved equivalent to the one the hop
+actually builds (ADR 0180). Touches `messagefoundry/auth/ldap.py`, `messagefoundry/config/tls_policy.py`
+and `tests/test_tls_cipher_assertion_sites.py`.
+
+**WHY THE EQUIVALENCE ARGUMENT IS THE LOAD-BEARING PART.** `ldap3` exposes no `SSLContext`, so the
+suites in force cannot be read from the object that negotiates them. **What is verified is therefore
+the CONFIGURATION the site is built from, not the connection it makes** -- and that is a weaker claim
+than a wire test, deliberately so. The tests close the usual gap in that shape: a fixture makes every
+suite report non-forward-secret, and each site's test then requires a `ValueError` naming that site,
+so a decoy call cannot satisfy it. Deleting the call from any one site reds that site alone.
+
+**STILL OPEN, AND THIS IS WHY THE BANNER DOES NOT FLIP:** the strict positive allowlist this row asks
+for -- admitting only suites present on every current candidate list, rejecting anything unnamed -- is
+not built. This records a call site gaining an assertion, not the allowlist changing shape.
+
+*Recorded by the lander, not the author: the PR carried the code without the row, and a required check
+exists to catch exactly that. The row's status is unchanged; only its record of what has shipped is.*
+
 ## 1315. prose path:line citations carry no token, so nothing can verify them
 
 > 🔢 **Filed 2026-08-22 by the researcher, contributed jointly with the ASVS Tracker.** Value **6/10** -- Difficulty **5/10**. The security record and the #1107-#1199 research items together carry **3,543 bare `path:line` citations** (occurrences; 2,871 distinct) that assert nothing an independent reference could check. Against them the scorecard holds **2,090 evidence anchors** carrying an `expect` token the tree confirms -- roughly **1.7 uncheckable prose citations for every checkable anchor**. Ownership splits cleanly: the Tracker owns the security-record half, this seat wrote all 1,313 occurrences in #1107-#1199. One item, because both halves share one cause and one fix.
