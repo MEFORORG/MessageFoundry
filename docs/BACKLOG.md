@@ -18517,7 +18517,11 @@ messages.py:618,628 {ch}/{dest}       RAW
 
 **What:** `scripts/coord` (30 files) and `scripts/hooks` (15 files) are multi-session working tools. They coordinate sessions across accounts: mail, seat records, usage polling, claims, worktree gates. None of it helps someone install the engine or judge whether it fits their site, and all of it describes how this project is worked rather than what it does.
 
-**THE MOVE MUST SPARE FOUR FILES, and this is the whole difficulty.** The public repo's own gates call into those two directories:
+**THE CONSTRAINT IS A RULE, NOT A FILE LIST.** A path called by `.pre-commit-config.yaml`, or by any workflow under `.github/workflows/`, STAYS IN THE PUBLIC REPO. An outside contributor has to be able to pass the gates on their own clone, and a gate that points at an absent file does not fail with a useful message.
+
+**Measured 2026-08-31 by the sweeping session, at `origin/main` ab6e40f7e: 25 workflows reference `scripts/` at 37 DISTINCT PATHS, and `.pre-commit-config.yaml` binds 6 local hooks to `scripts/`.** The heaviest are `quality/liveness.py` (16 references), `ci/retry-native-crash.sh` (10), `ci/step_margin.py` (5), `security/scan_forbidden.py` (4). So the protected set reaches `scripts/ci`, `scripts/quality`, `scripts/security` and `scripts/docs`, not only the two directories this item is about.
+
+Within `scripts/coord` and `scripts/hooks` specifically, four files are caught by the rule:
 
 | File | Called by |
 |---|---|
@@ -18526,7 +18530,9 @@ messages.py:618,628 {ch}/{dest}       RAW
 | `scripts/hooks/claim_check.py` | CI |
 | `scripts/hooks/push_guard.py` | CI |
 
-Move those and an outside contributor cannot pass the gates on their own clone. They stay, and they stay reachable at a stable path.
+`push_guard.py` deserves its own line: it is what blocks a direct push to a protected ref. Moving it does not fail loudly. It silently stops protecting.
+
+**This item first stated the constraint AS those four files.** That was too narrow, and it is recorded rather than edited away because a reader who saw the earlier form needs it named as superseded rather than silently absent. Four files is what a search of two directories finds. The rule above is what a search of the gates finds, and the gates are the thing that binds.
 
 **Do not create a third copy.** The vault should CONSUME `claude-multisession` rather than hold its own fork of the same scripts. Measured 2026-08-31, comparing this repo's coordination scripts against the ones already in `claude-multisession`: **0 identical, 16 differing, 28 absent.** Two independent copies with no defined direction of flow produced that in a few weeks; a third would be worse, and the drift is invisible because both sides keep working.
 
