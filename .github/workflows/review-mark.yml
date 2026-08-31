@@ -1,0 +1,100 @@
+name: review mark
+
+# A pull request that is ready to look at announces itself to NOBODY.
+#
+# THE GAP THIS EXISTS FOR. GitHub cannot start a session on this machine, and the live
+# session-to-session channel reads one config directory with no glob, so it stops at an account
+# boundary. Work is done by builders bound to different accounts. So when a builder opens a pull
+# request, the only thing that can notice is something choosing to look. Autofix covers the CI half
+# by waking a LIVE session on a failed check; it says nothing about "this is green and unread", and
+# it cannot reach a builder that has exited.
+#
+# The result is that an unreviewed pull request and a pull request under review are indistinguishable
+# until someone opens the list by hand. This workflow writes the missing state.
+#
+# WHY A LABEL, and not the three things that look better first:
+#
+#   reviewDecision   DEAD HERE. Null on all 706 pull requests this repository has ever had (638
+#                    merged, 51 closed, 17 open). Two causes, and neither is the zero review
+#                    requirement: all 7 reviews ever left here are state COMMENTED, which is
+#                    non-opinionated by construction and never populates the field, and an approval
+#                    from an account without push access does not populate it either. A null tells
+#                    you nothing, so it cannot be the mark.
+#   a check run      PER-COMMIT, so a push wipes it. Absence is then ambiguous: it may mean reviewed,
+#                    or it may mean the commit is new. The thing being tracked outlives a commit.
+#   a review request CODEOWNERS assigns every path, including `*`, to the account that authors almost
+#                    every pull request here, and GitHub never requests review from the author. It is
+#                    empty on 17 of 17 open pull requests.
+#
+# A label is per-pull-request, survives pushes, is server-side state that outlives the session that
+# caused it, and is readable in one conditional REST call that returns 304 unbilled when nothing has
+# changed.
+#
+# WHY NOT `needs-review`. That string is a load-bearing ASVS verdict token, 24 hits across 6 files on
+# main including `VERDICTS = {"pass", "partial", "fail", "na", "needs-review", "unverified"}` in
+# scripts/asvs/scorecard.py. Anyone auditing this mark by grep would land in the scorecard's
+# vocabulary. `review-requested` returns zero hits repository-wide.
+#
+# WHAT READS IT. Nothing in CI. The mark is for a poller outside GitHub:
+#
+#   gh api 'repos/OWNER/REPO/issues?state=open&labels=review-requested&per_page=100'
+#
+# ONE CAUTION FOR WHOEVER WIRES THAT POLL: the ETag changes when the labelled SET changes. It does
+# NOT change when a check goes red on a pull request that was already labelled. So a 304 means "no
+# new pull request", never "nothing to do". CI state needs its own, slower read.
+#
+# THIS WORKFLOW NEVER REMOVES THE LABEL. Removal is a human act -- it means somebody picked the pull
+# request up. An automatic removal would have to guess at that, and guessing wrong loses the only
+# signal there is. `synchronize` deliberately re-marks: new commits nobody has looked at are unread
+# again, even if the label was cleared an hour ago.
+#
+# NOT A REQUIRED CONTEXT, and it must never become one. It reports on the state of human attention,
+# which no branch protection should be able to block a merge on. Review is advisory here
+# (`required_approving_review_count` is 0); this workflow does not change that and is not a step
+# toward changing it. Making review required is a branch-protection decision and the owner's alone.
+
+on:
+  pull_request:
+    # `synchronize` is in the list on purpose. See the re-marking note above.
+    types: [opened, reopened, ready_for_review, synchronize]
+
+# The only elevated scope here, and the narrowest that can write a label. Precedent in this
+# repository twice: cla.yml and dependabot-auto-merge.yml, the second on this same trigger.
+#
+# `pull_request` rather than `pull_request_target`: every open pull request here is a same-repo
+# branch, so the token is elevatable and none of cla.yml's fork caution applies. IF A FORK PULL
+# REQUEST EVER ARRIVES, this job's token is read-only and the label write fails. That is the correct
+# failure -- a fork must not get a write token to earn a mark -- and it fails loudly rather than
+# marking nothing silently.
+permissions:
+  pull-requests: write
+
+concurrency:
+  # Keyed on github.ref, which is unique per queue entry and stable per pull request. The sibling
+  # lesson is recorded in backlog-hygiene.yml: a key naming `github.event.pull_request.number`
+  # collapses to one group on any event that has no pull request, and entries then cancel each other.
+  group: review-mark-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  mark:
+    name: mark unread for review
+    # A draft is the author saying it is not ready. Marking it would make the label mean "open"
+    # rather than "ready", and a mark that means everything is read by nobody.
+    if: github.event.pull_request.draft == false
+    runs-on: ubuntu-latest
+    steps:
+      # No checkout. Nothing here reads the repository, so there is no tree to fetch and no
+      # opportunity to execute anything from the pull request's own branch under an elevated token.
+      - name: Add the review-requested label
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          # Self-healing: create the label if somebody deleted it, then add it. `|| true` on the
+          # create because "already exists" is the normal case and is not an error here.
+          gh label create review-requested \
+            --color 1e5f74 \
+            --description "Opened or updated and not yet looked at." 2>/dev/null || true
+          gh pr edit "$NUMBER" --add-label review-requested
