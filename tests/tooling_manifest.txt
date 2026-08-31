@@ -27,6 +27,7 @@ tests/test_ai_provenance_claims.py
 tests/test_announce_hook.py
 tests/test_announce_wiring.py
 tests/test_asvs_anchor_provenance.py
+tests/test_asvs_anchor_report.py
 tests/test_asvs_file_surface_doc_drift.py
 tests/test_asvs_prove_absences_wiring.py
 tests/test_asvs_rescore_handoff.py

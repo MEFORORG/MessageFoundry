@@ -75,7 +75,13 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from scorecard import Cell, load_scorecard  # noqa: E402
+from scorecard import (  # noqa: E402
+    ANCHOR_AMBIGUOUS,
+    ANCHOR_GONE,
+    Cell,
+    load_scorecard,
+    locate_anchor,
+)
 
 #: A born-wrong anchor is one whose token is UNIQUE at the recorded commit and sits at a DIFFERENT line.
 #: Uniqueness is what makes the line number load-bearing; without it the anchor resolves from anywhere
@@ -141,18 +147,23 @@ def _ref_exists(root: Path, ref: str, cache: dict[str, bool]) -> bool:
 
 
 def classify(text: str, expect: str, recorded_line: int) -> tuple[str, int | None]:
-    """Mirror of ``check_anchors``'s locator, applied to whichever tree the caller opened.
+    """``scorecard.locate_anchor`` applied to whichever tree the caller opened, then NAMED for here.
 
-    Substring count for the uniqueness rule; the line derived from the character offset rather than by
-    scanning lines, because tokens spanning a newline are real and a per-line scan misses every one.
+    This used to be a hand-copied mirror of ``check_anchors``'s locator, and the copy was deliberate:
+    a second, silently different definition of "does this token resolve" would produce a born-wrong
+    population that is really a disagreement between two matchers. It now CALLS the one definition
+    instead of mirroring it, which is the same intent with the drift removed rather than watched.
+
+    What stays local is the naming. This tool's verdicts answer a different question -- was the line
+    right at the commit the cell stamps -- so ``at_line`` and ``born_wrong`` have no counterpart in
+    the locator, and the locator must not learn them.
     """
-    occurrences = text.count(expect)
-    if occurrences == 0:
+    found = locate_anchor(text, expect)
+    if found.status == ANCHOR_GONE:
         return ABSENT, None
-    if occurrences > 1:
+    if found.status == ANCHOR_AMBIGUOUS:
         return AMBIGUOUS, None
-    actual = text.count("\n", 0, text.index(expect)) + 1
-    return (AT_LINE if actual == recorded_line else BORN_WRONG), actual
+    return (AT_LINE if found.line == recorded_line else BORN_WRONG), found.line
 
 
 def audit(cells: list[Cell], root: Path, override_ref: str | None = None) -> list[AnchorVerdict]:
