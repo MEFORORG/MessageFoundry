@@ -1,6 +1,6 @@
 # ADR 0160 — Public-repo content policy: operator and security-review material only
 
-- **Status:** **Accepted (2026-08-06). Phase 1 EXECUTED; Phase 2 DECLINED; Phase 3 still Proposed.**
+- **Status:** **Accepted (2026-08-06). Phase 1 EXECUTED; Phase 2 ACCEPTED 2026-08-31 WITH PRECONDITIONS, reversing the 2026-08-06 decline; Phase 3 still Proposed.**
   The owner ratified the D1 test and Phase 1 on 2026-08-05, chose the vault as the destination
   (resolving open question 3), and set a governing rule for the work: **do not break anything**,
   applied per item as *prove the mechanism or leave the item alone*. On 2026-08-06 the owner
@@ -8,6 +8,15 @@
   cost measurement in D5. That is a decision, not a deferral: nothing is pending that would reopen
   it. Phase 3 (stripping process prose from documents that stay) is untouched by this and remains
   proposed.
+  
+  **REVERSED 2026-08-31 (owner).** Asked to choose between this ADR and a restated content policy,
+  the owner ruled: *"use today's decision, but add what's needed to the vault to address whatever was
+  behind 0160."* So Phase 2 proceeds and the process tooling moves. **D5 is overridden, not
+  discarded** — its three measurements were correct and become PRECONDITIONS, listed in D5 below.
+  Each must be satisfied before anything is removed from this repository. The 2026-08-06 decline is
+  left in place rather than deleted, because it was live for three weeks and a reader who remembers
+  it needs to see it named as reversed rather than silently absent.
+
   <!-- Proposed (no code yet) → Accepted (build may start) → Superseded by NNNN / Rejected -->
 - **Date:** 2026-08-04
 - **Supersedes nothing.** Records a policy that has been in force, and enforced, while being written
@@ -156,10 +165,10 @@ export, which is a two-command check:
 any future guard that tests *existence* rather than *trackedness* — after this decision, presence on
 disk and presence in the repository are different facts.
 
-⛔ **Phase 2 — DECLINED 2026-08-06 (owner). The process tooling and its documentation stay tracked.**
+**Phase 2 — REVERSED. DECLINED 2026-08-06, then ACCEPTED 2026-08-31 (owner), subject to the preconditions in D5. The process tooling and its documentation MOVE.**
 The proposed set was `docs/WORKTREES.md`, `docs/SESSION-DRIFT-CONTROLS.md`, `docs/LEDGER-GATE.md`
 and `docs/STEERING.md`, plus — added during Phase 1 planning — the tooling those documents describe.
-**None of it moves.** The reasoning is in D5, and it is a cost decision resting on a measurement, not
+**It moves, once D5's preconditions are met.** The paragraph below is the 2026-08-06 reasoning, kept as the record of why this was declined for three weeks. The reasoning is in D5, and it is a cost decision resting on a measurement, not
 a deferral waiting on someone. Keeping the documents with the tooling they describe is the coherent
 half: relocating the rationale for a control that stays is the defect the Consequences section below
 already names.
@@ -193,7 +202,27 @@ so it is refuted where it will next be proposed: the two locations that matter a
 and an unanchored pattern would fail closed on `docs/benchmarks/`, where handoffs are tracked on
 purpose.
 
-### D5 — the process TOOLING stays tracked: DECLINED on measured cost, not blocked on someone
+### D5 — the process TOOLING moves, and these are the PRECONDITIONS
+
+**Superseded 2026-08-31.** The measurements below stood and still stand; the decision they supported
+did not. They are now the conditions the move must satisfy, and each has a failing reading that looks
+like success, which is why they are conditions rather than advice.
+
+**P1. The vault's CI must actually run the moved tests before anything is removed here.** Every vault
+workflow except the ASVS scorecard is `disabled_manually` today. A repository holding a `ci.yml` that
+never runs is indistinguishable, at a glance, from one whose tests pass.
+
+**P2. That CI must run on WINDOWS.** A Linux-only leg reports GREEN across half the suite, because 13
+of 26 files skip on `os.name != "nt"`. A green Linux leg would read as proof and would not be one.
+
+**P3. Copy, prove green, THEN remove.** Never `git rm --cached` first: it removes the file from every
+working tree including the machine running it, and no restore step exists.
+
+**Unchanged by the reversal:** any path called by `.pre-commit-config.yaml` or by a workflow stays in
+this repository. That is about an outside contributor passing the gates on their own clone, which is
+independent of where the tooling lives.
+
+### D5 (2026-08-06, superseded) — the original decline, on measured cost
 
 The obvious next step after Phase 1 is `scripts/coord/` (9), `scripts/worktree/` (11) and
 `scripts/hooks/` (8, excluding `ledger_check.py`), with the four Phase 2 docs that describe them.

@@ -35,6 +35,42 @@ rules:
       #     attacker-influenceable field (a branch name reaching a run title) cannot break out.
       # The most its token can do is open, comment on, or close one issue.
       - nightly-notice.yml
+      # A red check can only be observed by something that runs AFTER the failing workflow finishes,
+      # and the checks this watches live in four separate workflows. No other trigger sees another
+      # workflow's conclusion, so `workflow_run` is the mechanism here rather than a convenience --
+      # the same argument as nightly-notice.yml above.
+      #
+      # zizmor's objection is the "pwn request" class: `workflow_run` runs from the DEFAULT BRANCH
+      # with a privileged token, so a workflow that checks out and EXECUTES the triggering pull
+      # request's code hands any fork pull request a write token. Every precondition for that is
+      # absent, and each is pinned by tests/test_failure_signal.py rather than merely asserted here:
+      #   * NO checkout, and no `uses:` at all -- `test_it_pulls_in_no_third_party_actions` fails the
+      #     moment one appears. Nothing from the triggering ref is fetched, let alone run.
+      #   * Least privilege: file default `contents: read`; the single job takes `pull-requests:
+      #     write` and `issues: write` (`test_it_is_least_privilege_and_cannot_modify_code`). It
+      #     cannot push, tag, or modify code. The most its token does is add a label to a pull
+      #     request or comment on an issue.
+      #   * Every `github.event` value reaches a script through `env` and is never interpolated into
+      #     a `run:` body (`test_every_event_value_reaches_a_script_through_env`), so a branch name
+      #     chosen by an attacker cannot break out of the shell it lands in.
+      #   * The one attacker-influenceable field it reads, `head_branch`, is parsed ONLY to recover a
+      #     pull-request number from a merge-queue ref, and only when the triggering run's event was
+      #     `merge_group` -- which a fork pull request cannot produce
+      #     (`test_the_merge_queue_parse_is_gated_on_an_event_a_fork_cannot_produce`).
+      #
+      # ONE DIFFERENCE FROM nightly-notice.yml, AND IT IS STATED RATHER THAN GLOSSED. That workflow
+      # gates on `workflow_run.event == 'schedule'`, so no pull request reaches it at all -- its fork
+      # path is CLOSED. This one MUST react to pull-request runs, because labelling the pull request
+      # is the entire point, so its fork path is OPEN. The four properties above are what bound the
+      # cost of that: nothing from the head is fetched or executed, and the token cannot touch code.
+      # This entry is therefore a WEAKER claim than the one above it, and a reader comparing the two
+      # should see that rather than infer symmetry.
+      #
+      # EXPECT THIS RATHER THAN BE SURPRISED BY IT: GitHub leaves `workflow_run.pull_requests` empty
+      # for a fork pull request, so a fork red resolves to no number and falls through to the
+      # standing-issue branch instead of labelling anything. Benign, and it is why a fork's red
+      # arrives as a comment on the tracker rather than as a `ci-red` label.
+      - failure-signal.yml
 
   artipacked:
     ignore:
