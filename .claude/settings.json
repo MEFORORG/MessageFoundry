@@ -54,6 +54,25 @@
           }
         ]
       }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "Task|Agent|Workflow|spawn_task",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "pwsh",
+            "args": [
+              "-NoProfile",
+              "-NonInteractive",
+              "-File",
+              "${CLAUDE_PROJECT_DIR}/scripts/hooks/usage-headroom-inject.ps1"
+            ],
+            "timeout": 20,
+            "statusMessage": "Reading this account's pool headroom"
+          }
+        ]
+      }
     ]
   }
 }
