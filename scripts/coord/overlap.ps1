@@ -24,14 +24,43 @@
                 "files this peer changed beyond mine", never "files this peer changed". The
                 uncommitted half is absolute -- see the third intersect term in Build-Map for why the
                 narrowing stops there.
-      WORK   -- per session: the subjects of its task list (~/.claude/tasks/<sessionId>/*.json).
-                Catches duplicate EFFORT on different files. Free: sessions write these anyway, so
-                nobody has to remember to declare anything.
+      WORK   -- per session: the subjects of its task list, plus the goal its seat record declares.
+                Catches duplicate EFFORT on different files.
 
-    NOBODY HAS TO OPT IN. Every input here is a by-product of working normally -- git state and a task
-    list a session already keeps. That is deliberate: claim.ps1 has existed for a while and has been
-    used exactly zero times, because a coordination step you must remember is a coordination step you
-    will skip. Anything built on voluntary declaration decays to nothing.
+                TWO SOURCES, BECAUSE THE FIRST ONE DIED AND NOBODY NOTICED. This read only
+                ~/.claude/tasks/<sessionId>/*.json, which failed three ways at once, all measured
+                2026-08-30 on this box:
+
+                  1. ONE ROOT OF SIX. A box runs several Claude config roots (~/.claude plus one
+                     ~/.claude-account-<N> per account), and a session's task list lives under the root
+                     it BOOTED from. Both live sessions were on .claude-account-2. Reading a hardcoded
+                     ~/.claude saw none of them, and would have seen at best a sixth of the fleet.
+                  2. THE DIRECTORY NAME CHANGED. Task directories used to be the full session UUID;
+                     they are now `session-<first 8 of the id>`. The `<SessionId>*` glob cannot match
+                     that shape, so no directory written after the change is reachable at all.
+                  3. THE STORE IS DEAD. 209 task files exist across all six roots and the newest is
+                     dated 2026-08-22. Every one of the 21 directories created since carries zero task
+                     files. Nothing writes them any more.
+
+                Legs 1 and 2 are repaired below, because a store that comes back must be read
+                correctly. Leg 3 is why there is a second source: the SEAT RECORD written to
+                <git-common-dir>/mefor-coord/seats/ by seat.ps1's Stop hook, which is keyed by session
+                id, carries the seat's declared goal, and was being written seconds before this was
+                measured.
+
+    THE COST OF ALL THIS WAS SILENCE, so the census below is not decoration. A live run over 136 rows
+    returned a work signal on ZERO of them, for over a week, and looked exactly like a fleet with
+    nothing to say. Every run now prints what it read -- stores, files, seat records, and the age of
+    the newest task file measured against the newest seat record -- so "the store I read is empty"
+    cannot render as "nobody is working". The seat store is the positive control: if it is being
+    written and the task store is not, the fleet is demonstrably not quiet.
+
+    NOBODY HAS TO OPT IN for the FILES signal, which is a by-product of working normally. The task half
+    of WORK was free the same way and is now dead; the seat half needs a declaration, which CLAUDE.md
+    requires and a SessionStart hook prompts for. That is a real weakness -- claim.ps1 has existed for
+    a while and has been used exactly zero times, because a coordination step you must remember is a
+    coordination step you will skip -- so an undeclared seat contributes nothing here and the census
+    says how many sessions answered out of how many were asked.
 
     LIVE vs DORMANT. A worktree whose session is live is a CONCURRENT collision -- someone is editing
     it now. A worktree with changes but no live session is still worth knowing about (the work may
@@ -71,8 +100,15 @@ param(
     [string]$Repo,
     # Config roots for the session registry (tests point this at a fixture).
     [string[]]$ConfigRoot,
-    # Where task lists live. Separate param so tests can supply their own.
-    [string]$TasksDir = (Join-Path $env:USERPROFILE ".claude\tasks"),
+    # Where task lists live. ONE PER CONFIG ROOT, and unset means "derive them", which is the whole
+    # repair: the old default was the single literal ~/.claude\tasks, so a session booted from any
+    # ~/.claude-account-<N> could not be seen at all. Derived from Get-ClaudeConfigRoots below rather
+    # than from a second enumerator here -- two copies of "what is a config root" drift, and this
+    # directory has paid for that mistake more than once (see config-roots.ps1's header).
+    #
+    # Still a parameter, and now an ARRAY, so a test can point it at a fixture store. A single string
+    # binds to a one-element array, which is why the existing callers that pass one path still work.
+    [string[]]$TasksDir,
     # ABANDON THE WALK AND EXIT 3 if it has not finished within this many seconds. 0 = unbounded,
     # which is the right default for a human at a prompt: a slow answer beats no answer.
     #
@@ -126,6 +162,32 @@ if ($LASTEXITCODE -ne 0 -or -not $common) {
 $common = $common.Trim()
 $myRoot = (& git @gitArgs rev-parse --path-format=absolute --show-toplevel 2>$null)
 $myRootNorm = ConvertTo-Norm $myRoot
+
+# --- where the WORK signal reads from ------------------------------------------------------------
+# One tasks store per config root, derived from the SAME enumerator the session registry uses, so the
+# two cannot disagree about which roots exist. -TasksDir overrides for tests.
+$script:TaskStores = @(
+    if ($TasksDir) { $TasksDir }
+    else { @(Get-ClaudeConfigRoots -ConfigRoot $ConfigRoot) | ForEach-Object { Join-Path $_ 'tasks' } }
+)
+# The seat layer, spelled the way fleet.ps1, handoff.ps1 and lane-level.ps1 already spell it.
+$script:SeatsDir = Join-Path $common 'mefor-coord\seats'
+
+# EVERY COUNT THIS SCRIPT PRINTS ABOUT THE WORK SIGNAL, in one place, so no line can claim a number
+# the walk did not produce. Carried through the cache too -- a cached map that re-derived these would
+# report a survey it never ran.
+$script:Census = [ordered]@{
+    Surveyed         = $false
+    StoresConfigured = @($script:TaskStores).Count
+    StoresPresent    = 0
+    TaskFiles        = 0
+    TaskNewest       = $null
+    SeatRecords      = 0
+    SeatNewest       = $null
+    Asked            = 0
+    AnsweredTasks    = 0
+    AnsweredSeat     = 0
+}
 
 # THE QUERYING WORKTREE'S OWN HEAD, used below to stop crediting a peer with a commit the caller wrote.
 # Empty when it cannot be resolved, and every use is guarded on that -- see the note at the third
@@ -188,25 +250,153 @@ function Get-WorktreeList {
     return $out
 }
 
-# The subjects a session has declared it is working on. Free signal: TaskCreate writes these anyway.
-# in_progress first -- that is what it is doing NOW, which is what a sibling needs to know.
+# Another session's free text reaches our JSON, a hook's deny message and this console. Sanitise once,
+# here, so no caller has to remember. Control characters are usually a mangled Unicode arrow rather
+# than anything hostile, but they corrupt the JSON a consumer has to parse, and it is untrusted input
+# either way.
+function Format-Subject([string]$Text) {
+    $s = ($Text -replace '[\p{C}]', ' ')
+    $s = ($s -replace '\s+', ' ').Trim()
+    if ($s.Length -gt 100) { $s = $s.Substring(0, 97) + "..." }
+    return $s
+}
+
+# WHAT THE STORES HOLD, irrespective of any session -- the measurement that separates "this store is
+# empty" from "the fleet is quiet". Run once, and only when a live session has actually been asked,
+# because the walk it hangs off is already close to the collision gate's budget.
+#
+# BOTH HALVES, ALWAYS, even when the first one answers. Surveying the seat layer only on a task-list
+# miss was the obvious saving and it broke the census: a fleet whose sessions all kept task lists got
+# "0 seat record(s)" printed at it, which is a false statement about a store that was never opened,
+# and it disarmed the staleness control below in exactly the case where the two ages must be compared.
+# Caught by tests/test_coord_overlap_work_signal.py, not by reading this code.
+function Get-StoreSurvey {
+    if ($script:Census.Surveyed) { return }
+    $script:Census.Surveyed = $true
+    foreach ($store in $script:TaskStores) {
+        if (-not (Test-Path -LiteralPath $store)) { continue }
+        $script:Census.StoresPresent++
+        foreach ($f in @(Get-ChildItem -LiteralPath $store -Recurse -Filter *.json -EA SilentlyContinue)) {
+            $script:Census.TaskFiles++
+            if ($null -eq $script:Census.TaskNewest -or $f.LastWriteTime -gt $script:Census.TaskNewest) {
+                $script:Census.TaskNewest = $f.LastWriteTime
+            }
+        }
+    }
+    Get-SeatIndex | Out-Null
+}
+
+# The seat records, indexed by session id. Built once per walk, from Get-StoreSurvey above, so it is
+# paid only when a live session was actually asked.
+#
+# A FULL SCAN AND NOT A LOOKUP, because the file is named by the session KEY, not the session id, and
+# deriving that key here would be a second copy of seat.ps1's rule. Measured 2026-08-30: 692 records
+# in 0.57s, which is affordable against a walk that costs tens of seconds and is paid once.
+$script:SeatIndex = $null
+function Get-SeatIndex {
+    if ($null -ne $script:SeatIndex) { return $script:SeatIndex }
+    $script:SeatIndex = @{}
+    foreach ($f in @(Get-ChildItem -LiteralPath $script:SeatsDir -Recurse -Filter *.json -EA SilentlyContinue)) {
+        # One malformed record must never take the walk down; a record caught mid-write has this shape.
+        try { $r = Get-Content $f.FullName -Raw -EA Stop | ConvertFrom-Json -EA Stop } catch { continue }
+        if (-not $r.sessionId) { continue }
+        $script:Census.SeatRecords++
+        if ($null -eq $script:Census.SeatNewest -or $f.LastWriteTime -gt $script:Census.SeatNewest) {
+            $script:Census.SeatNewest = $f.LastWriteTime
+        }
+        # Last write wins on a duplicate id: the newer record is the one describing this run.
+        $k = [string]$r.sessionId
+        if (-not $script:SeatIndex.ContainsKey($k) -or $f.LastWriteTime -gt $script:SeatIndex[$k].At) {
+            $script:SeatIndex[$k] = [pscustomobject]@{ Record = $r; At = $f.LastWriteTime }
+        }
+    }
+    return $script:SeatIndex
+}
+
+# What a session says it is working on. in_progress first -- that is what it is doing NOW, which is
+# what a sibling needs to know -- then the declared goal, which is a whole-session statement rather
+# than a step.
 function Get-SessionWork([string]$SessionId) {
     if (-not $SessionId) { return @() }
-    $dir = @(Get-ChildItem $TasksDir -Directory -Filter "$SessionId*" -EA SilentlyContinue | Select-Object -First 1)
-    if (-not $dir) { return @() }
+    $script:Census.Asked++
+    Get-StoreSurvey
     $items = @()
-    foreach ($f in @(Get-ChildItem $dir[0].FullName -Filter *.json -EA SilentlyContinue)) {
-        try { $t = Get-Content $f.FullName -Raw -EA Stop | ConvertFrom-Json -EA Stop } catch { continue }
-        if ($t.status -eq "completed") { continue }
-        # Another session's free text: sanitise before it reaches our JSON or a hook's deny message.
-        # Control characters here are usually a mangled Unicode arrow rather than anything hostile,
-        # but they corrupt the JSON a consumer has to parse, and this is untrusted input either way.
-        $subject = ([string]$t.subject) -replace '[\p{C}]', ' '
-        $subject = ($subject -replace '\s+', ' ').Trim()
-        if ($subject.Length -gt 100) { $subject = $subject.Substring(0, 97) + "..." }
-        $items += [pscustomobject]@{ Subject = $subject; Status = [string]$t.status }
+
+    # BOTH DIRECTORY SHAPES. The full id was the old name; `session-<first 8>` is what the writer uses
+    # now. Neither pattern can match the other's directories, so there is no double count.
+    $short = $SessionId.Substring(0, [Math]::Min(8, $SessionId.Length))
+    foreach ($store in $script:TaskStores) {
+        foreach ($pattern in @("$SessionId*", "session-$short")) {
+            foreach ($dir in @(Get-ChildItem -LiteralPath $store -Directory -Filter $pattern -EA SilentlyContinue)) {
+                foreach ($f in @(Get-ChildItem -LiteralPath $dir.FullName -Filter *.json -EA SilentlyContinue)) {
+                    try { $t = Get-Content $f.FullName -Raw -EA Stop | ConvertFrom-Json -EA Stop } catch { continue }
+                    if ($t.status -eq "completed") { continue }
+                    $items += [pscustomobject]@{
+                        Subject = (Format-Subject ([string]$t.subject))
+                        Status  = [string]$t.status
+                        Source  = "task"
+                    }
+                }
+            }
+        }
+    }
+    if ($items.Count -gt 0) { $script:Census.AnsweredTasks++ }
+
+    # The seat declaration. Only consulted when the task list said nothing, so a session keeping a live
+    # task list still reports the finer-grained answer.
+    if ($items.Count -eq 0) {
+        $seat = (Get-SeatIndex)[$SessionId]
+        if ($seat -and $seat.Record.goal) {
+            $goal = Format-Subject ([string]$seat.Record.goal)
+            if ($goal) {
+                $script:Census.AnsweredSeat++
+                $items += [pscustomobject]@{ Subject = $goal; Status = "declared"; Source = "seat" }
+            }
+        }
     }
     return @($items | Sort-Object @{ E = { if ($_.Status -eq "in_progress") { 0 } else { 1 } } })
+}
+
+# THE LINE THAT MAKES A DEAD STORE LOOK DIFFERENT FROM A QUIET FLEET. Every branch names what was read
+# and where; none of them can print a bare zero and stop.
+function Format-Census($C) {
+    if (-not $C.Surveyed) {
+        return "work signal: no live session to ask, so the task stores and the seat layer were not read."
+    }
+    # "task(s)", never "task file(s)". tests/test_coord_overlap_attribution.py selects the changed-file
+    # line by searching every line for the substring "file(s)", so a census that spelled the unit out
+    # would be picked up as a file count and asserted against a rule written for a different sentence.
+    $ages = "newest task " + $(if ($C.TaskNewest) { ([datetime]$C.TaskNewest).ToString("yyyy-MM-dd HH:mm") } else { "none" }) +
+            ", newest seat record " + $(if ($C.SeatNewest) { ([datetime]$C.SeatNewest).ToString("yyyy-MM-dd HH:mm") } else { "none" })
+    $lines = @(
+        "work signal: read $($C.TaskFiles) task(s) across $($C.StoresPresent) of $($C.StoresConfigured) task store(s) " +
+        "and $($C.SeatRecords) seat record(s); $ages."
+        "  asked $($C.Asked) live session(s): $($C.AnsweredTasks) answered from a task list, $($C.AnsweredSeat) from a seat declaration."
+    )
+    if ($C.StoresPresent -eq 0) {
+        $lines += "  NO TASK STORE EXISTS under any config root, so the task half of this signal read nothing at all."
+    }
+    elseif ($C.TaskFiles -eq 0) {
+        $lines += "  THE TASK STORE IS EMPTY. It holds no task for anyone, which is not the same fact as nobody working."
+    }
+    # THE POSITIVE CONTROL. The seat layer is written by a Stop hook on every session, so a seat record
+    # newer than the newest task file by more than a day proves the fleet is active and this store is
+    # not being written. Without the comparison an old task store and an idle box read identically.
+    elseif ($C.SeatNewest -and $C.TaskNewest -and (([datetime]$C.SeatNewest) - ([datetime]$C.TaskNewest)).TotalDays -gt 1) {
+        $days = [int]((([datetime]$C.SeatNewest) - ([datetime]$C.TaskNewest)).TotalDays)
+        $lines += "  THE TASK STORE IS STALE: its newest task is $days day(s) older than the newest seat record, " +
+                  "so sessions are running and nothing is writing task lists."
+    }
+    return ($lines -join "`n")
+}
+
+# STDERR UNDER -Json, and that is the only channel available. stdout under -Json is a JSON array with
+# exactly one consumer contract -- collision_gate.ps1 treats anything that is not parseable as "the
+# check did not happen" -- so a census line on stdout would break the gate outright, and a census
+# object appended to the array would be a phantom row for anything that counts. The gate discards our
+# stderr (`2>$null`), so this costs it nothing and still reaches a human running the same command.
+function Write-CensusToStderr {
+    [System.Console]::Error.WriteLine((Format-Census $script:Census))
 }
 
 function Build-Map {
@@ -360,6 +550,11 @@ function Build-Map {
         $sess = if ($ownerByWorktree.ContainsKey($norm)) { $ownerByWorktree[$norm].Record } else { $null }
         if ($files.Count -eq 0 -and -not $sess) { continue }
 
+        # Resolved ONCE per row, not twice inside the object literal. Get-SessionWork counts what it
+        # read into the census, so calling it a second time for the source column would double every
+        # number the census reports.
+        $work = @(Get-SessionWork $(if ($sess) { [string]$sess.sessionId } else { "" }))
+
         $rows += [pscustomobject]@{
             Worktree  = Split-Path $w.Path -Leaf
             Path      = $w.Path
@@ -379,7 +574,12 @@ function Build-Map {
             # it was finished still blocked every other session from that file, because a committed
             # file stays in Files until the branch lands -- and while PRs cannot merge, that is forever.
             Dirty     = $dirty
-            Work      = @(Get-SessionWork $(if ($sess) { [string]$sess.sessionId } else { "" }) | ForEach-Object { $_.Subject })
+            # Work stays a plain string array: collision_gate.ps1 renders it straight into a deny
+            # message, and a shape change there would be a silent break in the one consumer that
+            # matters. WorkSource is the parallel array saying where each entry came from, added
+            # rather than folded into the text so the strings themselves are unchanged.
+            Work       = @($work | ForEach-Object { $_.Subject })
+            WorkSource = @($work | ForEach-Object { $_.Source })
         }
     }
     return $rows
@@ -404,7 +604,14 @@ if (-not $Refresh -and (Test-Path -LiteralPath $cacheFile)) {
         # input its key does not name is a cache that lies, and the fix is one field. A cache written
         # before this field existed reads back as $null, misses, and re-walks once.
         if ($age -ge 0 -and $age -lt $CacheSeconds -and $c.root -eq $myRootNorm -and
-            [string]$c.head -eq $myHead) { $map = @($c.rows) }
+            [string]$c.head -eq $myHead) {
+            $map = @($c.rows)
+            # CARRIED, NEVER RE-DERIVED. The census counts what the WALK read, and a cache hit does no
+            # reading at all -- so recomputing it here would print zeros beside rows that do carry work,
+            # which is the exact "empty store reads as quiet fleet" confusion this census exists to end.
+            # A cache written before this field existed reads back null and the census says so.
+            if ($c.census) { foreach ($k in @($script:Census.Keys)) { if ($null -ne $c.census.$k) { $script:Census[$k] = $c.census.$k } } }
+        }
     } catch { $map = $null }
 }
 if ($null -eq $map) {
@@ -426,7 +633,8 @@ if ($null -eq $map) {
         New-Item -ItemType Directory -Force -Path (Split-Path $cacheFile) | Out-Null
         # Last-write-wins on purpose: a duplicate walk is the only cost of a race, and a lock on the
         # hot path of every edit would be worse than the thing it protects.
-        @{ at = (Get-Date).ToString("o"); root = $myRootNorm; head = $myHead; rows = $map } |
+        @{ at = (Get-Date).ToString("o"); root = $myRootNorm; head = $myHead; rows = $map
+           census = $script:Census } |
             ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $cacheFile -Encoding UTF8
     } catch { }   # a cache we cannot write is a slow hook, not a broken one
 }
@@ -457,7 +665,8 @@ if ($File) {
     # script died before it could answer", and a consumer had no way to tell an all-clear from a
     # failure. (-InputObject is not the fix: with -AsArray it double-wraps to [[]].) Measured
     # 2026-08-02 against the real script.
-    if ($Json) { (Write-JsonArray $hits); exit 0 }
+    if ($Json) { Write-CensusToStderr; (Write-JsonArray $hits); exit 0 }
+    Write-Host (Format-Census $script:Census)
     foreach ($h in $hits) {
         $state = if ($h.Live) { "LIVE $($h.Surface) session $($h.Short)" } else { "dormant worktree" }
         Write-Host "  $File is also changed by $state in $($h.Worktree) [$($h.Branch)]"
@@ -465,10 +674,18 @@ if ($File) {
     exit 0
 }
 
-if ($Json) { (Write-JsonArray $map); exit 0 }
+if ($Json) { Write-CensusToStderr; (Write-JsonArray $map); exit 0 }
 
-if (@($map).Count -eq 0) { Write-Host "No other worktree has changes."; exit 0 }
+if (@($map).Count -eq 0) {
+    # The census goes ABOVE the all-clear, because this is exactly the line a dead work signal hides
+    # behind: "no other worktree has changes" is a claim about git, and a reader takes it as a claim
+    # about the fleet unless the sentence before it says what was actually read.
+    Write-Host (Format-Census $script:Census)
+    Write-Host "No other worktree has changes."
+    exit 0
+}
 Write-Host ""
+Write-Host (Format-Census $script:Census)
 foreach ($r in $map) {
     # "session" here too (BACKLOG #1310). Unlabelled, this column ends in an 8-hex token and the column
     # beside it is a branch name -- the shape of an abbreviated commit hash, and read as one on
@@ -480,7 +697,13 @@ foreach ($r in $map) {
     # Both are right for their own table; neither is the general rule.
     $who = if ($r.Live) { "LIVE $($r.Surface) session $($r.Short)" } else { "dormant" }
     Write-Host ("{0,-38} {1,-38} {2}" -f $r.Worktree, $r.Branch, $who)
-    foreach ($w in @($r.Work | Select-Object -First 3)) { Write-Host "    building: $w" }
+    # The SOURCE is named on every line. "building: X" from a live task list and "building: X" from a
+    # goal declared hours ago are different claims about how current X is, and a reader deciding
+    # whether to interrupt someone needs to know which one they are looking at.
+    for ($i = 0; $i -lt [Math]::Min(3, @($r.Work).Count); $i++) {
+        $src = if (@($r.WorkSource)[$i]) { @($r.WorkSource)[$i] } else { "task" }
+        Write-Host ("    building ({0}): {1}" -f $src, @($r.Work)[$i])
+    }
     # "beyond yours", not "changed": the committed half of Files is narrowed by the querying HEAD, so
     # this count is relative to the caller. See the FILES entry in the header.
     Write-Host ("    {0} changed file(s) beyond yours" -f @($r.Files).Count)
