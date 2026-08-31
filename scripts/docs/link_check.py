@@ -74,6 +74,27 @@ WITHHELD = (
     "docs/reviews/",
     "docs/marketing/",
     "docs/releases/",
+    # ADR 0160 D1, owner-authorised 2026-08-31. Business material and internal engineering records,
+    # untracked in the same pass that added these entries. Custody is in the vault (96b8feec,
+    # branch lander/adr0160-custody); the paths are cited here for provenance and do not resolve.
+    "docs/BRAND.md",
+    "docs/CONTRIBUTOR-FIRST-ISSUES.md",
+    "docs/CONTRIBUTOR-PROGRAM-PLAN.md",
+    "docs/COUNSEL-ENGAGEMENT-BRIEF.md",
+    "docs/DUAL_LICENSING_PLAN.md",
+    "docs/POSITIONING.md",
+    "docs/research/",
+    "docs/archive/throughput/",
+    # WARNING: not a wholly unpublished tree, and the exception is deliberate. docs/testing/VERIFY.md is
+    # OPERATOR material and stays tracked (docs/README.md links it as step 6 of the new-operator
+    # path). That does not weaken this entry, because the withheld branch is only ever reached for a
+    # target that is MISSING -- a link to VERIFY.md resolves and never consults this tuple.
+    #
+    # The failure this could mask is VERIFY.md going missing, after which its inbound links would be
+    # silenced here instead of flagged. That case is covered loudly elsewhere rather than assumed
+    # away: tests/test_private_paths_stay_ignored.py pins VERIFY.md in _TRACKED_EXCEPTIONS as an
+    # exact set, so its disappearance fails a test that names it, in a required leg.
+    "docs/testing/",
 )
 
 _LINK = re.compile(r"\]\((?P<href>[^)\s]+?)(?P<frag>#[^)\s]*)?\)")

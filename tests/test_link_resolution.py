@@ -105,12 +105,31 @@ def test_withheld_prefixes_are_the_gitignored_ones(checker) -> None:
         "docs/reviews/",
         "docs/marketing/",
         "docs/releases/",
+        # ADR 0160 D1, owner-authorised 2026-08-31. Business material and internal engineering
+        # records, untracked in the same commit that added these prefixes.
+        "docs/BRAND.md",
+        "docs/CONTRIBUTOR-FIRST-ISSUES.md",
+        "docs/CONTRIBUTOR-PROGRAM-PLAN.md",
+        "docs/COUNSEL-ENGAGEMENT-BRIEF.md",
+        "docs/DUAL_LICENSING_PLAN.md",
+        "docs/POSITIONING.md",
+        "docs/research/",
+        "docs/archive/throughput/",
+        "docs/testing/",
     }
 
 
 @pytest.mark.parametrize(
     "prefix",
-    ["docs/security/", "docs/reviews/", "docs/marketing/", "docs/releases/"],
+    [
+        "docs/security/",
+        "docs/reviews/",
+        "docs/marketing/",
+        "docs/releases/",
+        "docs/research/",
+        "docs/archive/throughput/",
+        "docs/testing/",
+    ],
 )
 def test_withheld_directories_are_not_flagged(tmp_path, checker, prefix: str) -> None:
     """A gitignored target is a publishing boundary, not a defect; flagging it trains people to
@@ -126,6 +145,34 @@ def test_withheld_directories_are_not_flagged(tmp_path, checker, prefix: str) ->
     repo = _plant(tmp_path, "A.md", f"[withheld]({href})\n")
     failures, _checked, _files = checker.check(repo, _PLANTED_SUBTREE, include_line_cites=False)
     assert not failures, f"withheld prefix {prefix} should be exempt, got: {failures}"
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "docs/BRAND.md",
+        "docs/CONTRIBUTOR-FIRST-ISSUES.md",
+        "docs/CONTRIBUTOR-PROGRAM-PLAN.md",
+        "docs/COUNSEL-ENGAGEMENT-BRIEF.md",
+        "docs/DUAL_LICENSING_PLAN.md",
+        "docs/POSITIONING.md",
+    ],
+)
+def test_withheld_single_files_are_not_flagged(tmp_path, checker, path: str) -> None:
+    """The six file-shaped entries, exercised at the path they actually name.
+
+    They need their own case because the directory test above appends a filename to its prefix. That
+    is meaningful for ``docs/security/`` and meaningless for ``docs/BRAND.md`` -- it would assert
+    something about ``docs/BRAND.mdGONE.md``, which passes for the uninteresting reason that
+    ``startswith`` is prefix matching. Planting a link to the real path is the assertion worth having.
+
+    These six are business and legal working documents untracked under ADR 0160 D1 on 2026-08-31.
+    Their custody is in the vault; the citations that remain are provenance, not navigation.
+    """
+    href = "../../../" + path  # docs/archive/backlog/A.md is three levels down
+    repo = _plant(tmp_path, "A.md", f"[withheld]({href})\n")
+    failures, _checked, _files = checker.check(repo, _PLANTED_SUBTREE, include_line_cites=False)
+    assert not failures, f"withheld path {path} should be exempt, got: {failures}"
 
 
 def test_resolution_ignores_the_filesystem(tmp_path, checker) -> None:
