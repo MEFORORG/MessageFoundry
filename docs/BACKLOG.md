@@ -18506,6 +18506,43 @@ messages.py:618,628 {ch}/{dest}       RAW
 
 **Source:** dispatched by the Lander off PR 530. Its brief called this file a possible silent-green test file -- 180 lines with zero `def test`. It collects **8**; they are `async def test`, and a pattern anchored on `def test` cannot match one.
 
+## 1401. the multi-session tooling sits in the public engine repo, where an implementer has no use for it
+
+> 🔢 **Filed 2026-08-31.** Owner content policy, stated the same day: the public repo carries only what an implementer needs to RUN or EVALUATE MessageFoundry. Tooling, private information and security items belong in the vault. The generic coordination layer is published separately as `claude-multisession`.
+> Verdict: build
+> Closing-act: code
+
+**THIS ITEM CONFLICTS WITH AN ACCEPTED ADR AND MUST NOT BE EXECUTED UNTIL THE OWNER RESOLVES IT.** [ADR 0160](adr/0160-public-repo-content-policy-operator-and-security-review-material-only.md) is **Accepted**, and its status line reads *"Phase 1 EXECUTED; Phase 2 DECLINED; Phase 3 still Proposed."* Phase 2 is this move. D5 declined it on measured cost, and the ADR says so in terms that leave no opening: *"the process tooling and the documents describing it stay tracked ... That is a decision, not a deferral: nothing is pending that would reopen it."*
+
+The owner restated the content policy on 2026-08-31 in words that read the other way. Both cannot hold. **That is the owner's to settle, not a session's**, and this item is filed rather than actioned until they do. Filing it is still right: the measurements below stand whichever way the decision falls, and the conflict itself needed a written home.
+
+**What D5 measured, which is the case against moving:** the vault's CI is off -- every workflow but the ASVS scorecard is `disabled_manually` -- so "move it where its tests keep running" is false, and false in a way that survives inspection because a `ci.yml` sits right there. A Linux-only leg would cover half the suite and report green, since 13 of 26 files skip on `os.name != "nt"`. And `git rm --cached` removes the file from every working tree including the machine that runs it, with no restore step.
+
+**Cluster:** Repository hygiene. **Priority:** P3. **Verdict:** build.
+**Severity:** no engine effect, no PHI axis, and **no deployment axis (sec. 0)** -- nothing here changes what a first deployment does.
+
+**What:** `scripts/coord` (30 files) and `scripts/hooks` (15 files) are multi-session working tools. They coordinate sessions across accounts: mail, seat records, usage polling, claims, worktree gates. None of it helps someone install the engine or judge whether it fits their site, and all of it describes how this project is worked rather than what it does.
+
+**THE CONSTRAINT IS A RULE, NOT A FILE LIST.** A path called by `.pre-commit-config.yaml`, or by any workflow under `.github/workflows/`, STAYS IN THE PUBLIC REPO. An outside contributor has to be able to pass the gates on their own clone, and a gate that points at an absent file does not fail with a useful message.
+
+**Measured 2026-08-31 by the sweeping session, at `origin/main` ab6e40f7e: 25 workflows reference `scripts/` at 37 DISTINCT PATHS, and `.pre-commit-config.yaml` binds 6 local hooks to `scripts/`.** The heaviest are `quality/liveness.py` (16 references), `ci/retry-native-crash.sh` (10), `ci/step_margin.py` (5), `security/scan_forbidden.py` (4). So the protected set reaches `scripts/ci`, `scripts/quality`, `scripts/security` and `scripts/docs`, not only the two directories this item is about.
+
+Within `scripts/coord` and `scripts/hooks` specifically, four files are caught by the rule:
+
+| File | Called by |
+|---|---|
+| `scripts/coord/install-git-hooks.ps1` | `.pre-commit-config.yaml` and CI |
+| `scripts/hooks/ledger_check.py` | `.pre-commit-config.yaml` and CI |
+| `scripts/hooks/claim_check.py` | CI |
+| `scripts/hooks/push_guard.py` | CI |
+
+`push_guard.py` deserves its own line: it is what blocks a direct push to a protected ref. Moving it does not fail loudly. It silently stops protecting.
+
+**This item first stated the constraint AS those four files.** That was too narrow, and it is recorded rather than edited away because a reader who saw the earlier form needs it named as superseded rather than silently absent. Four files is what a search of two directories finds. The rule above is what a search of the gates finds, and the gates are the thing that binds.
+
+**Do not create a third copy.** The vault should CONSUME `claude-multisession` rather than hold its own fork of the same scripts. Measured 2026-08-31, comparing this repo's coordination scripts against the ones already in `claude-multisession`: **0 identical, 16 differing, 28 absent.** Two independent copies with no defined direction of flow produced that in a few weeks; a third would be worse, and the drift is invisible because both sides keep working.
+
+**Related:** the porting and de-drifting work is filed in that repository's own tracker, issues 99 to 105, deliberately outside this number space.
 ## 1402. a required check that goes red signals nobody, so only a seat polling can find it
 
 > 🔢 **Filed 2026-08-31.** One of three failure-signal gaps filed together; see also #1403 and #1405.
