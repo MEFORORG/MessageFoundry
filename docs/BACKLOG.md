@@ -18505,3 +18505,29 @@ messages.py:618,628 {ch}/{dest}       RAW
 **Related:** #1370, the sibling gap from the same PR 530 dispatch. Both are now built; PR 530's branch itself remains superseded and should not be cherry-picked.
 
 **Source:** dispatched by the Lander off PR 530. Its brief called this file a possible silent-green test file -- 180 lines with zero `def test`. It collects **8**; they are `async def test`, and a pattern anchored on `def test` cannot match one.
+
+## 1401. the multi-session tooling sits in the public engine repo, where an implementer has no use for it
+
+> 🔢 **Filed 2026-08-31.** Owner content policy, stated the same day: the public repo carries only what an implementer needs to RUN or EVALUATE MessageFoundry. Tooling, private information and security items belong in the vault. The generic coordination layer is published separately as `claude-multisession`.
+> Verdict: build
+> Closing-act: code
+
+**Cluster:** Repository hygiene. **Priority:** P3. **Verdict:** build.
+**Severity:** no engine effect, no PHI axis, and **no deployment axis (sec. 0)** -- nothing here changes what a first deployment does.
+
+**What:** `scripts/coord` (30 files) and `scripts/hooks` (15 files) are multi-session working tools. They coordinate sessions across accounts: mail, seat records, usage polling, claims, worktree gates. None of it helps someone install the engine or judge whether it fits their site, and all of it describes how this project is worked rather than what it does.
+
+**THE MOVE MUST SPARE FOUR FILES, and this is the whole difficulty.** The public repo's own gates call into those two directories:
+
+| File | Called by |
+|---|---|
+| `scripts/coord/install-git-hooks.ps1` | `.pre-commit-config.yaml` and CI |
+| `scripts/hooks/ledger_check.py` | `.pre-commit-config.yaml` and CI |
+| `scripts/hooks/claim_check.py` | CI |
+| `scripts/hooks/push_guard.py` | CI |
+
+Move those and an outside contributor cannot pass the gates on their own clone. They stay, and they stay reachable at a stable path.
+
+**Do not create a third copy.** The vault should CONSUME `claude-multisession` rather than hold its own fork of the same scripts. Measured 2026-08-31, comparing this repo's coordination scripts against the ones already in `claude-multisession`: **0 identical, 16 differing, 28 absent.** Two independent copies with no defined direction of flow produced that in a few weeks; a third would be worse, and the drift is invisible because both sides keep working.
+
+**Related:** the porting and de-drifting work is filed in that repository's own tracker, issues 99 to 105, deliberately outside this number space.
