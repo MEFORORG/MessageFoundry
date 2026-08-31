@@ -232,10 +232,18 @@ scripts/security/scan-tokens.local.txt
 # inventory and the Secure_* standards are all reviewer material and remain tracked.
 #
 # Custody moved to the vault BEFORE these left the tracked tree, same ordering and same reason as
-# Phase 1: 96b8feec on wshallwshall/MessageFoundry, branch lander/adr0160-custody. 20 of the 51 files
-# already existed there and 9 of those were DIVERGENT stale forks predating the 2026-07-27 cutover,
-# so the vault copies were overwritten with the maintained public ones. A bare untrack would have
-# left the vault holding the older text and nothing holding the newer.
+# Phase 1: 96b8feec on wshallwshall/MessageFoundry, branch lander/adr0160-custody. This block
+# untracks 46 files. Of those 46, 15 already existed in the vault and 7 of the 15 were DIVERGENT
+# stale forks predating the 2026-07-27 cutover, so the vault copies were overwritten with the
+# maintained public ones. A bare untrack would have left the vault holding the older text and
+# nothing holding the newer.
+#
+# An earlier draft of this block said "20 of the 51 files ... and 9 of those". Those figures are
+# measured over the CUSTODY set, which is larger: 96b8feec also took custody of docs/design and of
+# docs/testing/VERIFY.md, and all of those stay tracked here for the reasons recorded below. 46 is
+# the number that left, and 15/7 are its figures. The 20/9 pair is recorded rather than deleted
+# because it also reached the pull request description, so a reader who remembers it needs to see
+# it named as describing a different set rather than silently replaced.
 #
 # NOT a confidentiality control, and must never be described as one. `git log` still contains all of
 # it and none of it was ever secret; the owner ruled explicitly against a history rewrite on
