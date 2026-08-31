@@ -36,9 +36,9 @@ rules:
       # The most its token can do is open, comment on, or close one issue.
       - nightly-notice.yml
       # A red check can only be observed by something that runs AFTER the failing workflow finishes,
-      # and the required contexts span five workflows. No other trigger sees another workflow's
-      # conclusion, so `workflow_run` is the mechanism here rather than a convenience -- the same
-      # argument as nightly-notice.yml above.
+      # and the checks this watches live in four separate workflows. No other trigger sees another
+      # workflow's conclusion, so `workflow_run` is the mechanism here rather than a convenience --
+      # the same argument as nightly-notice.yml above.
       #
       # zizmor's objection is the "pwn request" class: `workflow_run` runs from the DEFAULT BRANCH
       # with a privileged token, so a workflow that checks out and EXECUTES the triggering pull
