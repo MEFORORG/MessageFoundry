@@ -18556,13 +18556,13 @@ Within `scripts/coord` and `scripts/hooks` specifically, four files are caught b
 
 So the only path from a red to somebody acting on it is a seat polling every open pull request's check rollup. That is expensive enough that it will not be run often, and it makes whichever seat does the polling a single point of failure.
 
-**Autofix does not close this.** It wakes only a **live** session, and a worker that finishes its turn exits -- measured the same day, 740 session records against 2 live sessions. And when it does fire it reaches a BUILDER and reports WHAT broke, never WHOSE failure it is, which is the question that decides what to do. A red belongs to the pull request, to `main`, to a flake, or to the queue, and only the first is a builder's to fix.
+**Autofix does not close this.** It wakes only a **live** session, and a worker that finishes its turn exits -- measured the same day with `scripts/coord/session-registry.ps1` in `wshallwshall/claude-multisession`, 740 session records against 2 live sessions. That instrument is not in this repository, so the figure cannot be re-derived from this clone. And when it does fire it reaches a BUILDER and reports WHAT broke, never WHOSE failure it is, which is the question that decides what to do. A red belongs to the pull request, to `main`, to a flake, or to the queue, and only the first is a builder's to fix.
 
 **The fix is small and the pattern is already here.** A `workflow_run` job, triggered on completion with a failure conclusion, that adds a label to the pull request. `nightly-notice.yml` already uses `workflow_run`. Noticing then costs one `gh pr list --label` call across all pull requests rather than a rollup fetch per pull request -- the difference between a poll you can afford to run often and one you cannot. Runner cost is seconds; there is no model cost at all.
 
 **This is not a push, and should not be described as one.** GitHub still cannot reach into a session. It makes the poll cheap, which is the achievable version.
 
-**Related:** the watcher half -- a cron that reads the label and spawns the attributing seat -- is filed in the tooling repository's own tracker as issue 108, deliberately outside this number space.
+**Related:** the watcher half -- a cron that reads the label and spawns the attributing seat -- is filed as `wshallwshall/claude-multisession#108`, deliberately outside this number space.
 
 ## 1403. a merge-queue ejection tells nobody, and `merge_group` carries no pull-request context
 
@@ -18583,24 +18583,62 @@ Identifying the ejected pull request therefore means reading `github.event.merge
 
 **The fix:** a `merge_group` job with a failure condition that resolves the pull request from `head_ref` and applies the same label #1402 introduces, so one watcher covers both.
 
-## 1404. the review gate reports but does not gate, and nothing else enforces review either
+## 1404. the checked-in record of what gates a merge disagrees with the server three ways, and no test can see it
 
-> 🔢 **Filed 2026-08-31.** The workflow landed in PR 712; arming it did not.
+> 🔢 **Filed 2026-08-31. REWRITTEN the same day, after review.** The first version said the review
+> gate "reports but does not gate". That was true when it was written and false a few hours later:
+> the context was armed the same day. The reviewer caught it before merge. Re-measuring to correct
+> it turned up two further drifts the first version never looked for.
 > Verdict: build
-> Closing-act: config
+> Closing-act: code
 
-**Cluster:** Merge controls. **Priority:** P1. **Verdict:** build.
-**Severity:** no engine effect, no PHI axis, and **no deployment axis (sec. 0)** -- but it is the only review control that exists, so nothing is behind it.
+**Cluster:** Merge controls. **Priority:** P2. **Verdict:** build.
+**Severity:** no engine effect, no PHI axis, and **no deployment axis (sec. 0)**. It was P1 while no
+review control existed. One exists now, so what is left is a stale mirror, which is the same class of
+defect as #1300 and is graded the same way.
 
-**What:** `review-gate.yml` is on `main` and reports. **Verified 2026-08-31 on PR 713, which does NOT carry the workflow on its branch and receives the check anyway**, because GitHub runs `pull_request` workflows from the MERGE commit rather than from the head. So every open pull request already reports the context.
+**What changed, and it closes the original item.** `a reviewer has read this` is now a required status
+context on `main`. Measured 2026-08-31: **16 contexts, `strict` true, `required_approving_review_count`
+0**. The gate is live, and PRs 715, 716 and 717 all reported it red until a reviewer labelled them.
 
-**It gates nothing.** `a reviewer has read this` is not in `required_status_checks.contexts`, and `required_approving_review_count` is **0**. Measured the same day. So no review is enforced anywhere: not by the gate, and not by GitHub's own review rule.
+**Why approvals are zero and must stay zero:** every session pushes as one GitHub identity, so a
+human-approval requirement would wedge every pull request. **That makes this one check the entire
+review requirement. There is no second line behind it.** That reasoning is unchanged and is why the
+rest of this item matters.
 
-**Why approvals are zero and must stay zero:** every session pushes as one GitHub identity, so a human-approval requirement would wedge every pull request. **That makes this one check the entire review requirement. There is no second line behind it.**
+**THE REMAINING DEFECT.** `.github/required-contexts.txt` is not the enforcement. It is the
+**checked-in claim** that every in-repo statement must agree with, and its own header says a wrong
+answer here "mis-ranks which gates a change can safely touch". It now disagrees with the server three
+ways.
 
-**Arming, in the order this repo's own `.github/required-contexts.txt` documents:** add the context to branch protection FIRST, then add the line to that file and update the count pinned in `tests/test_required_contexts.py`, in the same pull request. That order because the file mirrors the live server, and a line added first is exactly the lie it exists to prevent.
+| The file says | The server says | Why it is not just a missing line |
+|---|---|---|
+| 13 contexts, no `a reviewer has read this` | 16 contexts, including it | A reader asking "is review enforced?" gets NO from the file and YES from the server |
+| `codeql.yml` is DELIBERATELY NOT REQUIRED, because a fork-PR token lacks `security-events: write` and requiring it "would block every fork PR" | `CodeQL (javascript-typescript)` and `CodeQL (python)` are both required | The file asserts a **false negative** and names a concrete harm. Either the harm is real and two contexts should come off, or the reasoning is stale. Both are decisions, and neither has been made |
+| `enforce_admins = FALSE`, called "the documented escape hatch in `scripts/hooks/push_guard.py`" | `enforce_admins` is **true** | The escape hatch is closed. Anyone reaching for it during a permanently-red required check finds it gone, at the moment they need it |
 
-**What arming costs, stated accurately because an earlier reading of this was wrong:** every open pull request goes red on that one check until a reviewer labels it. They are **not stranded**. The required-but-absent trap -- a required check that can never report -- does not apply here, because it bites a workflow that is not on `main` or does not trigger on `pull_request`, and both of those now hold. A red clears with a label, not a rebase.
+**When `enforce_admins` changed is not recoverable.** The API reports the current value and keeps no
+history, so this item does not claim a date for it. That is itself part of the finding: the file was
+the only record, and it is wrong.
+
+**NOTHING IN CI CAN SEE ANY OF THIS.** `tests/test_required_contexts.py` pins the count at 13 and
+reconciles prose against the file. It never reads the server. Every mention of the protection API in
+that suite is a comment or a failure message. So the file and the server can drift without limit and
+every required check stays green, which is precisely the state the file was written to end.
+
+**Closing act, in this order, because the file mirrors the server and a line added first is the lie it
+exists to prevent:**
+
+1. Decide the CodeQL question with the owner. Either accept the two contexts as required and delete
+   the fork-PR reasoning, or remove them from protection. Do not simply transcribe the server.
+2. Add `a reviewer has read this` to the file, with its reasoning, and record the CodeQL decision.
+3. Correct the `enforce_admins` line to `TRUE` and say what replaces the escape hatch it described.
+4. Update the count pinned in `tests/test_required_contexts.py`, in the same pull request.
+
+**What this item does NOT propose.** It does not propose a test that calls the GitHub API. A required
+test that reaches the network fails on a fork PR and on any run without a token, which is the
+required-but-absent trap the file's own header warns about. Closing the drift is a config-and-file
+change; keeping it closed is a separate question and is not settled here.
 
 ## 1405. nothing writes the security scorecard, so its anchors go stale exactly when the code improves
 
