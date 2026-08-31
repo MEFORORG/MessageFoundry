@@ -25,6 +25,8 @@ links accumulated across 19 files before anyone counted them.
   deliberate publishing boundary, not a defect, so flagging them would train readers to ignore the
   gate. ``.claude/`` was a fifth entry until ``.claude/settings.json`` became tracked; every link
   the exemption covered pointed at that one file, so they are now checked like any other.
+  ``WITHHELD`` below is the list itself, and it also carries two entries marked TEMPORARY with
+  their removal condition -- read the tuple, not this paragraph, for what is currently exempt.
 * **Fenced code.** A path inside ``` is sample output being shown, not a link to follow.
 * **Inline code.** A link inside backticks is being *displayed*, not offered -- the same argument as
   fenced code, at smaller scale. Four real sites turn on it: a regex whose character class contains
@@ -74,27 +76,28 @@ WITHHELD = (
     "docs/reviews/",
     "docs/marketing/",
     "docs/releases/",
-    # ADR 0160 D1, owner-authorised 2026-08-31. Business material and internal engineering records,
-    # untracked in the same pass that added these entries. Custody is in the vault (96b8feec,
-    # branch lander/adr0160-custody); the paths are cited here for provenance and do not resolve.
-    "docs/BRAND.md",
-    "docs/CONTRIBUTOR-FIRST-ISSUES.md",
-    "docs/CONTRIBUTOR-PROGRAM-PLAN.md",
-    "docs/COUNSEL-ENGAGEMENT-BRIEF.md",
-    "docs/DUAL_LICENSING_PLAN.md",
-    "docs/POSITIONING.md",
-    "docs/research/",
-    "docs/archive/throughput/",
-    # WARNING: not a wholly unpublished tree, and the exception is deliberate. docs/testing/VERIFY.md is
-    # OPERATOR material and stays tracked (docs/README.md links it as step 6 of the new-operator
-    # path). That does not weaken this entry, because the withheld branch is only ever reached for a
-    # target that is MISSING -- a link to VERIFY.md resolves and never consults this tuple.
+    # --- TEMPORARY. Remove both entries below once PR 713 lands. ------------------------------
     #
-    # The failure this could mask is VERIFY.md going missing, after which its inbound links would be
-    # silenced here instead of flagged. That case is covered loudly elsewhere rather than assumed
-    # away: tests/test_private_paths_stay_ignored.py pins VERIFY.md in _TRACKED_EXCEPTIONS as an
-    # exact set, so its disappearance fails a test that names it, in a required leg.
-    "docs/testing/",
+    # ADR 0160 D1 untracked 46 documents on 2026-08-31 and, in the same pass, exempted every path
+    # they were linked from. That was the wrong call: it turned 59 reader-visible 404s green
+    # instead of repairing them, which is the compensating-control-on-a-false-premise shape the
+    # comment above warns about. The 49 links outside docs/BACKLOG.md were repaired -- repointed
+    # where a tracked successor genuinely covers the sentence, otherwise unlinked to the
+    # document's plain name so the citation survives as provenance (the ADR 0160 Phase 1
+    # precedent). The exemptions those 49 rested on are gone with them.
+    #
+    # These two remain because 10 links in docs/BACKLOG.md cannot be repaired right now: open
+    # PR 713 holds that file mid-rebase, and editing it would break that work. They are scoped to
+    # exactly the targets those 10 name -- ONE file and ONE subdirectory, not the parent trees --
+    # so nothing else goes unchecked while they stand. Repair the 10 links in docs/BACKLOG.md when
+    # PR 713 has merged, then delete these two entries and the matching cases in
+    # tests/test_link_resolution.py.
+    #
+    # Both paths stay gitignored either way; this tuple is about what the LINK GATE reads, and the
+    # .gitignore rules are pinned separately by tests/test_private_paths_stay_ignored.py.
+    "docs/archive/throughput/THROUGHPUT-IMPROVEMENTS.md",
+    "docs/testing/master-test-plan/",
+    # --- end TEMPORARY -------------------------------------------------------------------------
 )
 
 _LINK = re.compile(r"\]\((?P<href>[^)\s]+?)(?P<frag>#[^)\s]*)?\)")
