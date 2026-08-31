@@ -87,6 +87,7 @@ tests/test_defaulted_credential_lint.py
 tests/test_dep1_lock_resync_lockstep.py
 tests/test_dependabot_automerge_guardrails.py
 tests/test_docs_runbooks.py
+tests/test_failure_signal.py
 tests/test_feature_map_claims.py
 tests/test_freethread_smoke_liveness.py
 tests/test_gate_installed_parity.py
