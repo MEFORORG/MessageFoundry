@@ -18505,3 +18505,61 @@ messages.py:618,628 {ch}/{dest}       RAW
 **Related:** #1370, the sibling gap from the same PR 530 dispatch. Both are now built; PR 530's branch itself remains superseded and should not be cherry-picked.
 
 **Source:** dispatched by the Lander off PR 530. Its brief called this file a possible silent-green test file -- 180 lines with zero `def test`. It collects **8**; they are `async def test`, and a pattern anchored on `def test` cannot match one.
+
+## 1406. the usage watcher can find a problem but has no way to tell anyone, so a warning never lands
+
+> 🔢 **Filed 2026-08-31.** Fourth of the signalling gaps; see #1402, #1403 and #1405, filed in a
+> sibling pull request. Same shape as #1402 one layer down: something computes a fact and nothing
+> can deliver it.
+> Verdict: build
+> Closing-act: code
+
+**Cluster:** Coordination signalling. **Priority:** P3. **Verdict:** build.
+**Severity:** no engine effect, no PHI axis, and **no deployment axis (sec. 0)**.
+
+**What:** the usage watcher is a cron. **Measured 2026-08-31: `usage-collect.ps1` and `usage.ps1` make ZERO model calls**, and `usage.ps1` says so in its own comment, because a headless coordinator has to be able to read it. It writes `latest.json`, the current snapshot per account, and appends to `history.jsonl`. There are two files because a RATE needs two samples: one snapshot can only say where you are, never how fast you are getting there.
+
+Four things read those files, and none can interrupt anything: `usage.ps1` on demand, the usage statusline continuously and at zero token cost because a statusline runs outside the model, a `SessionStart` hook that injects into a starting session, and `seat_clock_alarm.py`, which PRINTS.
+
+**THE TWO HALVES OF ITS JOB COME OUT DIFFERENTLY, and the difference generalises.**
+
+**Naming the account with headroom WORKS.** The console needs that fact at exactly one moment, just before it spawns, and it CONTROLS that moment. So pulling the file at the point of use is not a compromise; it is the right design, and no delivery is needed.
+
+**Warning that a pool is nearly spent DOES NOT.** A warning has to arrive at a moment nobody controls, and nothing here can interrupt a running session. The finding sits in a file and reaches nobody until somebody happens to look, which for a warning is the same as not having it.
+
+**The fix must not be a poll.** A session that waits and checks is the most expensive state in the system: 2,108 metered tokens per waiting minute on a three-minute heartbeat, 22,275 on a ten-minute sleep loop, against 10,041 per minute actually working and ZERO once a turn ends. Buying delivery with a poll costs more than the warning saves.
+
+**What fits instead:** inject at the decision point. A `PreToolUse` hook on the spawn command puts current headroom into context exactly when the console is about to spend it, at effectively no cost. The repo already proves the pattern, since a `PreToolUse` collision gate fires on file writes today.
+
+**Not in scope:** giving the watcher an account. It makes no model calls, so it cannot be exhausted by what it watches. The hazard runs the other way: the usage endpoint returns 429 PER ENDPOINT rather than per caller, proven inside a single process, so the design wants ONE reader and a dedicated account would add one.
+
+## 1408. five palette tokens are assigned to roles they cannot meet at the contrast their own rule demands
+
+> 🔢 **Filed 2026-08-31.** Found by measurement while restyling the working-model diagram twice,
+> against two different supplied palettes. Both passes hit the same class of defect.
+> Verdict: build
+> Closing-act: docs
+
+**Cluster:** Design system. **Priority:** P3. **Verdict:** build.
+**Severity:** no engine effect, no PHI axis, and **no deployment axis (sec. 0)**. It is a readability
+defect in reference material, which propagates quietly because a palette gets reused unchecked.
+
+**What:** two supplied palettes each carry a role table mapping a token to a job, and each DEMANDS WCAG AA at 4.5 to 1 in its own accessibility section. **Five of those assignments cannot meet it.** Each figure below was measured against the palette's own backgrounds rather than estimated.
+
+| Token | Assigned to | Measured | Why it fails |
+|---|---|---|---|
+| Gray 70 `#737373` | secondary text | **3.48:1** on Brand Tint 20, 4.24 on Gray 8 | fails on the palette's own tints |
+| Gray 36 `#C2C2C2` | optional-path strokes | **1.35:1** on the Gray 4 ground | invisible as a hairline |
+| Gray 20 `#DEDEDE` | note connectors | **1.27:1** on the Gray 4 ground | invisible as a hairline |
+| Gray 32 `#C8C8C8` | panel behind text | drops secondary text to **4.19:1** | usable as a fill, not behind text |
+| neutral foreground on brand background | text on every process step | **3.60:1** | dark ink on mid-blue |
+
+**The second palette repeats the shape three more times.** Its hard-failure, allocation and ledger roles each pair the on-brand foreground, which is white, with a PALE background such as `#F4D6D7` or `#FFF3D6`. The obvious repair fails too: using the role's foreground token as the fill instead puts white on `#B8860B` at **3.17:1**. Its secondary foreground fails against EVERY supplied light background, at 4.07 and 3.55, so it can carry no text at all.
+
+**One non-text ratio also misses WCAG 1.4.11**, which wants 3 to 1 for graphics that carry meaning: the optional-path stroke measures **1.81:1** in light. It passes in dark at 3.39.
+
+**WHY THIS IS A LEDGER ITEM RATHER THAN A NOTE.** A palette is reference material. It gets applied by whoever picks it up next, and an AA claim in its own header reads as already verified. Both restyles cleared AA only because every assignment was measured against the surface actually behind it, and several were then overridden. A third application that trusts the table reintroduces all of these.
+
+**The corrections that held:** secondary text one step darker; hairline strokes at a mid grey near 3:1 rather than the near-invisible light greys; light greys used as panel FILLS and never behind text; and text on any brand-filled shape taking the on-brand token, never the neutral foreground.
+
+**Method note worth keeping.** Both passes measured the LOWEST ratio across every foreground and background pair that actually occurs, in BOTH themes, rather than spot-checking. That is what turned an assertion into a finding: the light minima landed at 4.74 and 4.53, the dark at 4.52 and 5.38, and each of those came from a failure that had to be fixed first.
