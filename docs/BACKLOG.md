@@ -18570,33 +18570,60 @@ Four things read those files, and none can interrupt anything: `usage.ps1` on de
 
 **Not in scope:** giving the watcher an account. It makes no model calls, so it cannot be exhausted by what it watches. The hazard runs the other way: the usage endpoint returns 429 PER ENDPOINT rather than per caller, proven inside a single process, so the design wants ONE reader and a dedicated account would add one.
 
-## 1408. five palette tokens are assigned to roles they cannot meet at the contrast their own rule demands
+## 1408. a supplied palette assigns tokens to roles they cannot meet at its own contrast target
 
-> 🔢 **Filed 2026-08-31.** Found by measurement while restyling the working-model diagram twice,
-> against two different supplied palettes. Both passes hit the same class of defect.
+> 🔢 **Filed 2026-08-31. REWRITTEN the same day after review.** The first version stated seven
+> ratios without naming the background each was measured against, and four of the seven did not
+> reproduce. The conclusion survived recomputation and is stronger; the figures did not.
 > Verdict: build
 > Closing-act: docs
 
 **Cluster:** Design system. **Priority:** P3. **Verdict:** build.
-**Severity:** no engine effect, no PHI axis, and **no deployment axis (sec. 0)**. It is a readability
-defect in reference material, which propagates quietly because a palette gets reused unchecked.
+**Severity:** no engine effect, no PHI axis, and **no deployment axis (sec. 0)**.
 
-**What:** two supplied palettes each carry a role table mapping a token to a job, and each DEMANDS WCAG AA at 4.5 to 1 in its own accessibility section. **Five of those assignments cannot meet it.** Each figure below was measured against the palette's own backgrounds rather than estimated.
+**WHAT THE SOURCE IS, because the first version never said and that made it unusable.** Two colour
+palettes were supplied to this project on 2026-08-31 for restyling a working-model diagram: Microsoft
+**Fluent** (a hex palette with a role table) and Microsoft **Fluent 2** (alias tokens with a role
+map). Neither is checked into this repository, and none of their tokens appear in
+[`docs/BRAND.md`](BRAND.md). A reader holding a palette can now at least tell whether it is one of
+these, which the earlier version made impossible.
 
-| Token | Assigned to | Measured | Why it fails |
-|---|---|---|---|
-| Gray 70 `#737373` | secondary text | **3.48:1** on Brand Tint 20, 4.24 on Gray 8 | fails on the palette's own tints |
-| Gray 36 `#C2C2C2` | optional-path strokes | **1.35:1** on the Gray 4 ground | invisible as a hairline |
-| Gray 20 `#DEDEDE` | note connectors | **1.27:1** on the Gray 4 ground | invisible as a hairline |
-| Gray 32 `#C8C8C8` | panel behind text | drops secondary text to **4.19:1** | usable as a fill, not behind text |
-| neutral foreground on brand background | text on every process step | **3.60:1** | dark ink on mid-blue |
+**What is wrong with them.** Each palette carries a role table mapping a token to a job, and each
+demands WCAG AA at 4.5 to 1 in its own accessibility section. **Several assignments cannot meet it.**
 
-**The second palette repeats the shape three more times.** Its hard-failure, allocation and ledger roles each pair the on-brand foreground, which is white, with a PALE background such as `#F4D6D7` or `#FFF3D6`. The obvious repair fails too: using the role's foreground token as the fill instead puts white on `#B8860B` at **3.17:1**. Its secondary foreground fails against EVERY supplied light background, at 4.07 and 3.55, so it can carry no text at all.
+| Foreground | Background | Ratio | Target | Assigned role |
+|---|---|---|---|---|
+| Gray 70 `#737373` | Brand Tint 20 `#C7E0F4` | **3.48** | 4.5 | secondary text |
+| Gray 70 `#737373` | Gray 8 `#F2F2F2` | **4.24** | 4.5 | secondary text |
+| Gray 70 `#737373` | Gray 32 `#C8C8C8` | **2.83** | 4.5 | secondary text on a panel |
+| Gray 100 `#1F1F1F` | Brand `#0078D4` | **3.64** | 4.5 | text on every process step |
+| White `#FFFFFF` | Shared Orange fg `#B8860B` | **3.25** | 4.5 | the obvious repair for a pale fill |
+| Gray 36 `#C2C2C2` | Gray 4 `#F8F8F8` | **1.68** | 3.0 | optional-path strokes |
+| Gray 20 `#DEDEDE` | Gray 4 `#F8F8F8` | **1.27** | 3.0 | note connectors |
 
-**One non-text ratio also misses WCAG 1.4.11**, which wants 3 to 1 for graphics that carry meaning: the optional-path stroke measures **1.81:1** in light. It passes in dark at 3.39.
+Every ratio is computed with the WCAG relative-luminance formula, and **every row names both sides**,
+which is the whole point of the rewrite. The last two are graphics rather than text, so their target
+is the 3 to 1 of WCAG 1.4.11.
 
-**WHY THIS IS A LEDGER ITEM RATHER THAN A NOTE.** A palette is reference material. It gets applied by whoever picks it up next, and an AA claim in its own header reads as already verified. Both restyles cleared AA only because every assignment was measured against the surface actually behind it, and several were then overridden. A third application that trusts the table reintroduces all of these.
+**FOUR OF THE ORIGINAL SEVEN FIGURES DID NOT REPRODUCE**, and they are recorded here rather than
+quietly replaced: `1.35` for Gray 36 (actually 1.68), `4.19` for Gray 70 on Gray 32 (actually 2.83),
+`3.60` for dark ink on brand (actually 3.64), and `3.17` for white on `#B8860B` (actually 3.25; 3.17
+reproduces only against an off-white near `#FCFCFC`, which the item never stated). Whether those
+figures were wrong or merely measured against unstated backgrounds cannot now be determined, and
+that ambiguity is itself the defect: a number without its background is not a measurement.
 
-**The corrections that held:** secondary text one step darker; hairline strokes at a mid grey near 3:1 rather than the near-invisible light greys; light greys used as panel FILLS and never behind text; and text on any brand-filled shape taking the on-brand token, never the neutral foreground.
+**The conclusion survives and is stronger.** Every assignment above still misses its target, and the
+worst case is worse than first claimed. The corrections that held when the palettes were applied:
 
-**Method note worth keeping.** Both passes measured the LOWEST ratio across every foreground and background pair that actually occurs, in BOTH themes, rather than spot-checking. That is what turned an assertion into a finding: the light minima landed at 4.74 and 4.53, the dark at 4.52 and 5.38, and each of those came from a failure that had to be fixed first.
+- secondary text one step darker than the palette assigns
+- hairline strokes at a mid grey near 3 to 1, not the near-invisible light greys
+- light greys used as panel FILLS, never behind text
+- text on any brand-filled shape takes the on-brand token, never the neutral foreground
+
+**Why this is filed rather than noted.** A palette is reference material. It gets applied by whoever
+picks it up next, and an AA claim in its own header reads as already verified. Two restyles cleared
+AA only because every assignment was re-measured against the surface actually behind it.
+
+**An open question the reviewer raised and this item does not settle.** This grades external design
+material, touches no MessageFoundry artifact, and shares no token with the engine's brand file. It
+may belong somewhere other than this ledger. It is filed here because the work happened here.
