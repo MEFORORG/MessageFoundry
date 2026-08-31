@@ -30,8 +30,10 @@ import json
 import os
 import shutil
 import subprocess
+import sys
 import time
 import uuid
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
@@ -55,13 +57,26 @@ def git(repo: Path, *args: str) -> str:
 
 
 @pytest.fixture
-def fleet(tmp_path: Path) -> dict[str, Any]:
+def fleet(tmp_path: Path) -> Iterator[dict[str, Any]]:
     """A primary, a peer worktree, and a LIVE session registered against the peer.
 
-    The registry record names this pytest process, whose pid is by definition alive and whose start
-    time precedes ``startedAt`` -- the two things ``Test-RecordLiveness`` checks. Without a live
-    session the row carries no session id and the work signal is never consulted at all, so the
-    liveness is load-bearing rather than scene-setting.
+    Without a live session the row carries no session id and the work signal is never consulted at
+    all, so the liveness here is load-bearing rather than scene-setting.
+
+    THE RECORD NAMES A FRESHLY SPAWNED CHILD, NOT THIS PYTEST PROCESS, AND THE DIFFERENCE IS A
+    FAILURE THIS FIXTURE ALREADY CAUSED. ``Test-RecordLiveness`` rejects a record whose process
+    started more than ``StartSkewMinutes`` (15) BEFORE the session registered, reading that as a
+    recycled pid. Naming ``os.getpid()`` while stamping ``startedAt`` as *now* therefore encodes an
+    assumption about how long this pytest worker has been alive -- and an xdist worker outlives that
+    threshold on any leg that runs longer than fifteen minutes.
+
+    Measured 2026-08-31: green on ubuntu, where the repo-harness tier finishes in about 10m49s, and
+    red on windows-2025, where it takes 18m43s. Six tests in this file failed with ``expected
+    exactly one live row, got []`` on a leg whose only difference was duration. A local run of two
+    minutes cannot reproduce it, which is why it reached main.
+
+    A child spawned here has a start time of *now* by construction, so the delta is about zero
+    however long the worker has been running. The fixture no longer measures the test session.
     """
     origin = tmp_path / "origin.git"
     subprocess.run(
@@ -88,10 +103,20 @@ def fleet(tmp_path: Path) -> dict[str, Any]:
     config_root = tmp_path / ".claude-account-9"
     (config_root / "sessions").mkdir(parents=True)
     session_id = str(uuid.uuid4())
+
+    # A stand-in for the session's host process. It only has to exist and be YOUNG; nothing reads
+    # what it does. `-I` keeps it out of any sitecustomize on the runner, and the sleep is far longer
+    # than the survey it has to outlast.
+    stand_in = subprocess.Popen(  # noqa: S603  # nosec B603 - fixed argv, no shell, our interpreter
+        [sys.executable, "-I", "-c", "import time; time.sleep(600)"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
     (config_root / "sessions" / "1.json").write_text(
         json.dumps(
             {
-                "pid": os.getpid(),
+                "pid": stand_in.pid,
                 "sessionId": session_id,
                 "cwd": str(peer),
                 "startedAt": int(time.time() * 1000),
@@ -100,7 +125,7 @@ def fleet(tmp_path: Path) -> dict[str, Any]:
         ),
         encoding="utf-8",
     )
-    return {
+    yield {
         "primary": primary,
         "peer": peer,
         "config_root": config_root,
@@ -111,6 +136,15 @@ def fleet(tmp_path: Path) -> dict[str, Any]:
         / "mefor-coord"
         / "seats",
     }
+
+    # Reap unconditionally. A leaked sleeper would outlive the run and, worse, its pid could later
+    # be recycled onto something real while a stale record still names it.
+    stand_in.terminate()
+    try:
+        stand_in.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        stand_in.kill()
+        stand_in.wait(timeout=10)
 
 
 def survey(fleet: dict[str, Any]) -> subprocess.CompletedProcess[str]:
