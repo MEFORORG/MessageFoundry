@@ -1398,6 +1398,30 @@ jobs:
             echo "tooling_matrix=$TOOLING_FULL" >> "$GITHUB_OUTPUT"
             exit 0
           fi
+          # MERGE QUEUE. The ref GitHub builds for a queue entry is the merge RESULT, so it wants
+          # exactly what push-to-main wants: re-run the functional matrix and the harness safety net,
+          # and leave the container legs alone because the PR path-gated them minutes earlier.
+          #
+          # WITHOUT THIS ARM THE EVENT FALLS THROUGH TO THE pull_request BRANCH AT THE BOTTOM, WHERE
+          # `github.event.pull_request.base.sha` IS EMPTY ON A merge_group EVENT. The diff then covers
+          # the whole tree, every path gate reads true, and the queue re-runs the entire heavy suite
+          # on every entry. Measured 2026-08-31 on the queue ref for #709, a one-test-file change:
+          # sql server 2022 and 2025, postgres, three load smokes and both windows service smokes all
+          # ran. `sql server (store + connector) 2022` flaked, `CI gate` went red, and the entry was
+          # ejected. The same shape ejected #704 earlier the same night.
+          #
+          # So the cost was not one slow run. It was that EVERY merge inherited the flakiness of the
+          # rate-limited container legs, intermittently, in a way that looks like the queue misbehaving
+          # rather than like a gate that was never wired for this event.
+          if [ "$EVENT_NAME" = "merge_group" ]; then
+            echo "serverdb=false" >> "$GITHUB_OUTPUT"
+            echo "docker=false" >> "$GITHUB_OUTPUT"
+            echo "code=true" >> "$GITHUB_OUTPUT"
+            echo "ide=true" >> "$GITHUB_OUTPUT"
+            echo "tooling=true" >> "$GITHUB_OUTPUT"
+            echo "tooling_matrix=$TOOLING_FULL" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
           # Push-to-main: the FUNCTIONAL gate (code) stays true — the required test legs re-run on
           # the merge commit — but serverdb/docker are FALSE: the container legs (sqlserver-store,
           # postgres-store, docker-smoke) run nightly + on dispatch + via the PR path-gates, so a

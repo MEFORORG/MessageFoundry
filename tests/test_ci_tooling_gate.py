@@ -250,7 +250,7 @@ def test_the_tooling_job_reads_the_matrix_and_does_not_carry_a_literal() -> None
     )
 
 
-@pytest.mark.parametrize("event", ["workflow_dispatch", "push", "schedule"])
+@pytest.mark.parametrize("event", ["workflow_dispatch", "merge_group", "push", "schedule"])
 def test_every_non_pr_arm_emits_a_matrix(tmp_path: Path, event: str) -> None:
     """An arm that exits without emitting KILLS the tooling job on fromJSON. It does not skip it."""
     bash = require_bash(tmp_path)
@@ -312,4 +312,42 @@ def test_a_fork_never_pays_for_the_windows_leg(tmp_path: Path) -> None:
     assert legs == ["ubuntu-latest"], (
         f"a fork should build this tier on ubuntu only, got {legs} -- the 2x-billed Windows leg "
         "would be spending a contributor's own minutes"
+    )
+
+
+def test_the_merge_queue_arm_does_not_drag_the_container_legs_in(tmp_path: Path) -> None:
+    """A queue entry must gate like a push, not like a pull request with no base.
+
+    THIS IS A REGRESSION TEST FOR A LIVE OUTAGE, not a hypothetical. `ci.yml` has had a
+    `merge_group` trigger since the queue was enabled, and several jobs carry
+    `|| github.event_name == 'merge_group'` arms -- but this step had none, so the event fell
+    through to the pull_request branch at the bottom, where
+    `github.event.pull_request.base.sha` is EMPTY on a merge_group event. Every path gate then
+    read true.
+
+    Measured 2026-08-31 on the queue ref for a one-test-file pull request: sql server 2022 and
+    2025, postgres, three load smokes and both windows service smokes all ran. One of them
+    flaked, `CI gate` went red, and the entry was ejected from the queue. The same shape ejected
+    an earlier entry the same night. The cost was never one slow run -- it was that every merge
+    inherited the flakiness of the rate-limited container legs, intermittently.
+
+    `serverdb` and `docker` are the assertions that matter. `code` and `tooling` stay true for
+    the same reason they do on push: the merge result is what is about to become main.
+    """
+    bash = require_bash(tmp_path)
+    out = _run_detector(bash, tmp_path, "merge_group")
+
+    assert out.get("serverdb") == "false", (
+        "the merge queue would re-run the server-DB legs on every entry. They were path-gated on "
+        f"the pull request minutes earlier. Got serverdb={out.get('serverdb')!r}"
+    )
+    assert out.get("docker") == "false", (
+        f"the merge queue would re-run the docker legs on every entry. Got docker={out.get('docker')!r}"
+    )
+    assert out.get("code") == "true", (
+        "the functional matrix must still run on the merge result, which is what becomes main"
+    )
+    assert out.get("tooling") == "true", (
+        "the harness tier is the safety net for an engine change that breaks a harness test, and a "
+        "queue entry is the last point before it lands"
     )
