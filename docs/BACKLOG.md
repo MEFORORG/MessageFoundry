@@ -18512,6 +18512,12 @@ messages.py:618,628 {ch}/{dest}       RAW
 > Verdict: build
 > Closing-act: code
 
+**THIS ITEM CONFLICTS WITH AN ACCEPTED ADR AND MUST NOT BE EXECUTED UNTIL THE OWNER RESOLVES IT.** [ADR 0160](adr/0160-public-repo-content-policy-operator-and-security-review-material-only.md) is **Accepted**, and its status line reads *"Phase 1 EXECUTED; Phase 2 DECLINED; Phase 3 still Proposed."* Phase 2 is this move. D5 declined it on measured cost, and the ADR says so in terms that leave no opening: *"the process tooling and the documents describing it stay tracked ... That is a decision, not a deferral: nothing is pending that would reopen it."*
+
+The owner restated the content policy on 2026-08-31 in words that read the other way. Both cannot hold. **That is the owner's to settle, not a session's**, and this item is filed rather than actioned until they do. Filing it is still right: the measurements below stand whichever way the decision falls, and the conflict itself needed a written home.
+
+**What D5 measured, which is the case against moving:** the vault's CI is off -- every workflow but the ASVS scorecard is `disabled_manually` -- so "move it where its tests keep running" is false, and false in a way that survives inspection because a `ci.yml` sits right there. A Linux-only leg would cover half the suite and report green, since 13 of 26 files skip on `os.name != "nt"`. And `git rm --cached` removes the file from every working tree including the machine that runs it, with no restore step.
+
 **Cluster:** Repository hygiene. **Priority:** P3. **Verdict:** build.
 **Severity:** no engine effect, no PHI axis, and **no deployment axis (sec. 0)** -- nothing here changes what a first deployment does.
 
