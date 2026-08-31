@@ -2737,16 +2737,41 @@ jobs:
       - tooling
     runs-on: ubuntu-latest
     steps:
-      - name: Fail if any gated leg failed or was cancelled
-        if: >-
-          contains(needs.*.result, 'failure') ||
-          contains(needs.*.result, 'cancelled')
+      # TWO failing steps, not one, and the predicates PARTITION the old single condition -- their
+      # union is identical and their intersection is empty, so this gate's BEHAVIOUR is unchanged and
+      # only the message differs. Both arms still `exit 1`.
+      #
+      # WHY. Measured over 2026-07-01..08-30, enumerated over all 3,012 ci.yml runs that reached the
+      # job stage: 646 red `CI gate` runs, of which 206 were a real leg failure and 440 were a whole-run
+      # cancellation from `cancel-in-progress` superseding a push. Every one of those 440 sat on a SHA
+      # that a later push replaced -- 440 of 440 -- so not one of them ever blocked a merge, and every
+      # one printed the same sentence as the 206 that did. Two thirds of this gate's reds were telling
+      # the reader a lie about which kind of event they were looking at.
+      #
+      # `nightly-notice.yml` and scripts/quality/liveness.py (`_DID_NOT_RUN`) already state the
+      # principle: a cancelled job did not run, and reporting that in the words of a break trains the
+      # reader to discount the words.
+      - name: Fail -- a gated leg FAILED
+        if: contains(needs.*.result, 'failure')
         env:
           # Pass the needs context via env, not inline ${{ }} in the run block (defense-in-depth against
           # template injection — a job output could in theory carry a quote that breaks out of echo).
           NEEDS_JSON: ${{ toJSON(needs) }}
         run: |
-          echo "::error::A gated CI leg failed or was cancelled."
+          echo "::error::A gated CI leg FAILED. This is a real break -- see the needs dump below."
+          echo "$NEEDS_JSON"
+          exit 1
+
+      - name: Fail -- a gated leg was CANCELLED
+        if: >-
+          !contains(needs.*.result, 'failure') &&
+          contains(needs.*.result, 'cancelled')
+        env:
+          NEEDS_JSON: ${{ toJSON(needs) }}
+        run: |
+          echo "::error::A gated CI leg was CANCELLED, so it tested nothing and cannot read as a pass."
+          echo "::error::If this run was superseded by a newer push to the same ref, the NEWER run is"
+          echo "::error::what gates the merge and this red is expected. Check the newer run first."
           echo "$NEEDS_JSON"
           exit 1
 

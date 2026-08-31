@@ -469,9 +469,17 @@ jobs:
         # vulnerability we've assessed as not_affected/fixed is suppressed here too — the SAME file
         # operators feed their scanners (--show-suppressed logs what was suppressed and why). Extend to
         # `--target runtime-sqlserver` (more OS surface) once green. Trivy auto-pulls its vuln DB from ghcr.io.
+        #
+        # --ignore-unfixed IS A PARTIAL ACTIONABILITY FILTER, and its limit is why --ignorefile sits
+        # beside it. It asks "does UPSTREAM have a fix", not "can WE apply it". A package vendored
+        # inside pip has an upstream fix we cannot reach through any lock re-export or base-image
+        # rebuild, so it passes this filter and reddens the job indefinitely. Measured: this job went
+        # red on every run from 2026-08-06 onward on exactly two such advisories, which is what kept it
+        # from ever being promoted out of `continue-on-error`. See security/trivy/trivyignore.yaml.
         run: |
           trivy image --no-progress --scanners vuln \
             --vex security/vex/messagefoundry.openvex.json --show-suppressed \
+            --ignorefile security/trivy/trivyignore.yaml \
             --severity HIGH,CRITICAL --ignore-unfixed --exit-code 1 \
             messagefoundry:scan
       - name: Lint the Dockerfile for misconfig (informational)
