@@ -41,7 +41,25 @@ permissions:
   contents: read
 
 concurrency:
-  group: backlog-hygiene-${{ github.event.pull_request.number }}
+  # KEYED ON github.ref, NOT ON THE PR NUMBER, AND THAT IS THE WHOLE FIX. This workflow also runs on
+  # `merge_group`, where `github.event.pull_request` DOES NOT EXIST -- so the old key evaluated to the
+  # bare string "backlog-hygiene-" for EVERY queue entry, and `cancel-in-progress` then made each new
+  # entry cancel the previous entry's run.
+  #
+  # This job's name is a REQUIRED status context ("a PR that implements BACKLOG #N must update
+  # BACKLOG.md"), and a cancelled required check can never go green, so the cancelled entry was
+  # EVICTED from the merge queue. It never failed. It was cancelled by its successor.
+  #
+  # MEASURED over 754 `merge_group` runs: 151 backlog-hygiene runs, 102 success, 49 CANCELLED
+  # (32.5 percent), ZERO failures. Every other workflow on that event cancels at 0.0 percent except
+  # CI at 4.0. Two evictions were chased by hand the night this was found, one of them 50 seconds
+  # after the entry was queued -- far too fast for any check to have run, which is the tell.
+  #
+  # `github.ref` is unique per queue entry (`refs/heads/gh-readonly-queue/main/pr-N-<sha>`) and stable
+  # per pull request (`refs/pull/N/merge`), so supersede-on-push is preserved and entries stop
+  # cancelling each other. It is also what asvs-prove-absences, asvs-tally-lint, freethread-smoke and
+  # manifest-lint already use; this workflow was the only merge_group one keyed on the PR number.
+  group: backlog-hygiene-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
