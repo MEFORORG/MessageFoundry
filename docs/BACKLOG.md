@@ -18505,3 +18505,81 @@ messages.py:618,628 {ch}/{dest}       RAW
 **Related:** #1370, the sibling gap from the same PR 530 dispatch. Both are now built; PR 530's branch itself remains superseded and should not be cherry-picked.
 
 **Source:** dispatched by the Lander off PR 530. Its brief called this file a possible silent-green test file -- 180 lines with zero `def test`. It collects **8**; they are `async def test`, and a pattern anchored on `def test` cannot match one.
+
+## 1402. a required check that goes red signals nobody, so only a seat polling can find it
+
+> 🔢 **Filed 2026-08-31.** One of three failure-signal gaps filed together; see also #1403 and #1405.
+> Verdict: build
+> Closing-act: code
+
+**Cluster:** CI signalling. **Priority:** P2. **Verdict:** build.
+**Severity:** no engine effect, no PHI axis, and **no deployment axis (sec. 0)**.
+
+**What:** when a required check fails, nothing tells anyone. **Measured 2026-08-31: exactly two workflows carry an `if: failure()` step -- `branch-leak-scan.yml` and `security.yml` -- and both only FAIL THE JOB.** Nothing labels a pull request, comments on one, or opens an issue. No `ci-red`-style label exists in the repository.
+
+So the only path from a red to somebody acting on it is a seat polling every open pull request's check rollup. That is expensive enough that it will not be run often, and it makes whichever seat does the polling a single point of failure.
+
+**Autofix does not close this.** It wakes only a **live** session, and a worker that finishes its turn exits -- measured the same day, 740 session records against 2 live sessions. And when it does fire it reaches a BUILDER and reports WHAT broke, never WHOSE failure it is, which is the question that decides what to do. A red belongs to the pull request, to `main`, to a flake, or to the queue, and only the first is a builder's to fix.
+
+**The fix is small and the pattern is already here.** A `workflow_run` job, triggered on completion with a failure conclusion, that adds a label to the pull request. `nightly-notice.yml` already uses `workflow_run`. Noticing then costs one `gh pr list --label` call across all pull requests rather than a rollup fetch per pull request -- the difference between a poll you can afford to run often and one you cannot. Runner cost is seconds; there is no model cost at all.
+
+**This is not a push, and should not be described as one.** GitHub still cannot reach into a session. It makes the poll cheap, which is the achievable version.
+
+**Related:** the watcher half -- a cron that reads the label and spawns the attributing seat -- is filed in the tooling repository's own tracker as issue 108, deliberately outside this number space.
+
+## 1403. a merge-queue ejection tells nobody, and `merge_group` carries no pull-request context
+
+> 🔢 **Filed 2026-08-31.** Sibling of #1402: same missing signal, harder to address.
+> Verdict: build
+> Closing-act: code
+
+**Cluster:** CI signalling. **Priority:** P2. **Verdict:** build.
+**Severity:** no engine effect, no PHI axis, and **no deployment axis (sec. 0)**.
+
+**What:** when the merge queue revalidates an entry and it fails, the entry is ejected and nothing reports it. The pull request was green; the *combination* is not. This is the failure mode the queue exists to catch, and it is the one nobody hears about.
+
+It also lands in a blind spot the rest of the machinery shares: the queue revalidates against a **different job set** than the pull request ran, because the path gates come off on `merge_group`. So the ejecting job may be one the pull request never ran.
+
+**THE WRINKLE THAT MAKES THIS HARDER THAN #1402: on `merge_group` there is no `github.event.pull_request`.** That is the same fact that collapsed `backlog-hygiene.yml`'s concurrency key to a single group -- the key named the pull request number, which is empty in the queue, so every entry shared one group and cancelled its predecessor. Fixed by #711; the key on `main` is now `github.ref`.
+
+Identifying the ejected pull request therefore means reading `github.event.merge_group.head_ref`, which encodes the number. **Measured 2026-08-31: nothing on `origin/main` reads that field.**
+
+**The fix:** a `merge_group` job with a failure condition that resolves the pull request from `head_ref` and applies the same label #1402 introduces, so one watcher covers both.
+
+## 1404. the review gate reports but does not gate, and nothing else enforces review either
+
+> 🔢 **Filed 2026-08-31.** The workflow landed in PR 712; arming it did not.
+> Verdict: build
+> Closing-act: config
+
+**Cluster:** Merge controls. **Priority:** P1. **Verdict:** build.
+**Severity:** no engine effect, no PHI axis, and **no deployment axis (sec. 0)** -- but it is the only review control that exists, so nothing is behind it.
+
+**What:** `review-gate.yml` is on `main` and reports. **Verified 2026-08-31 on PR 713, which does NOT carry the workflow on its branch and receives the check anyway**, because GitHub runs `pull_request` workflows from the MERGE commit rather than from the head. So every open pull request already reports the context.
+
+**It gates nothing.** `a reviewer has read this` is not in `required_status_checks.contexts`, and `required_approving_review_count` is **0**. Measured the same day. So no review is enforced anywhere: not by the gate, and not by GitHub's own review rule.
+
+**Why approvals are zero and must stay zero:** every session pushes as one GitHub identity, so a human-approval requirement would wedge every pull request. **That makes this one check the entire review requirement. There is no second line behind it.**
+
+**Arming, in the order this repo's own `.github/required-contexts.txt` documents:** add the context to branch protection FIRST, then add the line to that file and update the count pinned in `tests/test_required_contexts.py`, in the same pull request. That order because the file mirrors the live server, and a line added first is exactly the lie it exists to prevent.
+
+**What arming costs, stated accurately because an earlier reading of this was wrong:** every open pull request goes red on that one check until a reviewer labels it. They are **not stranded**. The required-but-absent trap -- a required check that can never report -- does not apply here, because it bites a workflow that is not on `main` or does not trigger on `pull_request`, and both of those now hold. A red clears with a label, not a rebase.
+
+## 1405. nothing writes the security scorecard, so its anchors go stale exactly when the code improves
+
+> 🔢 **Filed 2026-08-31.** Third of the failure-signal gaps; the other two are #1402 and #1403.
+> Verdict: build
+> Closing-act: code
+
+**Cluster:** Security records. **Priority:** P2. **Verdict:** build.
+**Severity:** no engine effect, no PHI axis, and **no deployment axis (sec. 0)**. The engine is not less secure because a citation moved.
+
+**What:** **measured 2026-08-31, no workflow commits or pushes a change to the scorecard.** Two reference it -- `asvs-prove-absences.yml` and `ci.yml` -- but only as INPUT to the verifier, which reads the record and does not maintain it. The record itself is not tracked in this repository.
+
+So there is no writer anywhere in the merge path. An **anchor** -- a citation from a graded cell to a line of engine code -- breaks silently, and it breaks most often **because the code got better and the fix deleted the line the anchor quoted**. The engine is not insecure and the record is not broken; the evidence went stale, and nothing notices.
+
+**Keep the vocabulary exact, because two of these terms get fused and the fused version sends readers to the wrong repository.** The **scorecard** is the record. An **anchor** is a citation from a cell into code. The **verifier** (`scripts/asvs/scorecard.py`) is the INSTRUMENT, not the record, and a cell exists whether or not any job is running.
+
+**What a fix looks like:** something that runs when engine code changes and reports anchors that no longer resolve. It reports; it does not silently rewrite them, because an anchor that moved and an anchor that was wrong need different responses.
+
+**Scope note:** the vocabulary is public and the content is not. This item names the mechanism only. Cell identifiers, coverage and gaps stay where they are.
