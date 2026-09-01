@@ -48,6 +48,7 @@ tests/test_ci_tooling_gate.py
 tests/test_ci_venv_pinning.py
 tests/test_citation_line_check.py
 tests/test_claim_check.py
+tests/test_gate_ci_mirror_parity.py
 tests/test_hook_prose_folding.py
 tests/test_hook_prose_folding_push_ledger.py
 tests/test_claude_section_citations.py
@@ -66,6 +67,7 @@ tests/test_coord_lock.py
 tests/test_coord_overlap_attribution.py
 tests/test_coord_overlap_cache.py
 tests/test_coord_overlap_signals.py
+tests/test_coord_overlap_work_signal.py
 tests/test_coord_presence.py
 tests/test_coord_recoverable.py
 tests/test_coord_dispatch_gate.py
@@ -85,6 +87,7 @@ tests/test_defaulted_credential_lint.py
 tests/test_dep1_lock_resync_lockstep.py
 tests/test_dependabot_automerge_guardrails.py
 tests/test_docs_runbooks.py
+tests/test_failure_signal.py
 tests/test_feature_map_claims.py
 tests/test_freethread_smoke_liveness.py
 tests/test_gate_installed_parity.py

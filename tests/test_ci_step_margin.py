@@ -519,15 +519,36 @@ def _job(name: str) -> dict:
 
 
 def _matrix_legs() -> list[dict]:
-    """The per-leg matrix entries, parsed out of the shell that BUILDS the matrix in `changes`.
+    """The `test` job's per-leg matrix entries, parsed out of the shell that BUILDS them in `changes`.
 
-    The matrix is assembled at runtime (per-repo), so it is not readable as YAML data -- it is three
+    The matrix is assembled at runtime (per-repo), so it is not readable as YAML data -- it is
     single-quoted JSON literals in a `run:` body. Reading them here is deliberate: the alternative is
     a second copy of the leg list in this file, and two copies of a rule drift.
+
+    THE NAMES COME FROM THE `test` JOB'S OWN EMISSION, not from a pattern over the whole step, and
+    that is the fix for a real miss. This used to match any shell variable holding a JSON object with
+    an `os` key. That was an accurate description of the file on the day it was written and not a
+    description of the QUESTION -- which is "what legs does the `test` job run". Measured 2026-08-30,
+    when `changes` gained a `tooling_matrix` for a DIFFERENT job: this helper returned six legs for a
+    three-leg job, and the two callers reported a leg-count break and six missing baseline rows for
+    legs that do not exist. Resolving the interpolated names first cannot pick up another job's
+    matrix, because another job's matrix is not in this job's include list.
     """
     text = _CI.read_text(encoding="utf-8")
-    legs = [json.loads(m) for m in re.findall(r"^\s*\w+='(\{\"os\".*?\})'$", text, re.MULTILINE)]
-    assert legs, "no matrix legs found in ci.yml -- the extraction has rotted, not the workflow"
+    include = re.search(r'echo "matrix=\{\\"include\\":\[([^]]*)\]\}"', text)
+    assert include, (
+        'the `test` job\'s `matrix={"include":[...]}` emission is gone from ci.yml -- this '
+        "extraction has rotted, not the workflow"
+    )
+    names = [n.strip().lstrip("$") for n in include.group(1).split(",") if n.strip()]
+    assert names, "the test matrix include list is empty"
+    legs = []
+    for name in names:
+        found = re.search(rf"^\s*{re.escape(name)}='(\{{\"os\".*?\}})'$", text, re.MULTILINE)
+        assert found, (
+            f"the include list names ${name}, but no such leg literal is assigned in ci.yml"
+        )
+        legs.append(json.loads(found.group(1)))
     return legs
 
 

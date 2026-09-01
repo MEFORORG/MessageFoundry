@@ -17929,6 +17929,340 @@ security claim** in the two files a new reader trusts first, plus a broken link.
 **Severity:** no engine effect, no PHI axis, no deployment axis (sec. 0). A deploying site following
 L811 **would** write a key the loader refuses and get a load failure — loud, not silent, so the
 posture is not weakened. The cost is a documented opt-out that does not work as documented.
+## 1393. four open rows say their work ALREADY SHIPPED and must not be rebuilt, and every dispatch screen passes them as buildable because the verb is REBUILD not BUILD
+
+> 🔢 **FILED 2026-08-29 (builder 2).** Four open rows state plainly that their work is done
+> and must not be built again. ***EVERY DISPATCH SCREEN IN THIS REPO PASSES ALL FOUR AS
+> DISPATCHABLE.*** Cost if one is dispatched: **a whole lane-window spent rebuilding shipped code.**
+
+| row | the sentence in it |
+|---|---|
+| #1107 | "SHIPPED IN `#488` AT `cf38e16a`, AND STILL OPEN ON PURPOSE. **DO NOT REBUILD IT.**" |
+| #1130 | "SHIPPED IN `#488` AT `cf38e16a`, AND STILL OPEN ON PURPOSE. **DO NOT REBUILD IT.**" |
+| #1183 | "SHIPPED IN `#491` AT `083f97fd`, BANNER STILL OPEN. **DO NOT REBUILD IT.**" |
+| #1242 | "**THE CORRECTION IS ALREADY BUILT AND PUSHED. Do not rebuild it.**" |
+
+> ***THE MECHANISM IS ONE WORD. A blocker screen matches a verb list -- `BUILD`, `START`, `DISPATCH`,
+> `IMPLEMENT`, `LAND`. NONE OF THEM MATCHES `REBUILD`.*** So the row reads as carrying no bar. Two
+> independently-written screens were measured against this population on 2026-08-29 and **both missed
+> all four**, which is what makes this a property of the vocabulary rather than of one tool.
+
+> ***THE STRUCTURAL HALF, AND IT IS WHY THE SET GROWS RATHER THAN STAYING AT FOUR: each row is open
+> ONLY because CLOSING it is a judgement the building seat cannot make.*** The build landed; the
+> banner cannot move without an authority the builder does not hold. **So the ledger accumulates
+> done-but-open rows by construction, and nothing prunes them.** Every one is a live trap.
+
+> ***THE MIRROR DEFECT, FOUND IN THE SAME PASS AND EQUALLY INVISIBLE: A BAR THAT HAS ALREADY
+> EXPIRED.*** #1020 contains the string "DO NOT BUILD THE GATE YET" **and also** contains *"THE
+> STANDING 'DO NOT BUILD THE GATE YET' PARK HAS EXPIRED BY ITS OWN TERMS"* and *"**UNCHANGED:** build
+> now"*. **A screen matching the literal string blocks a row that explicitly instructs the reader to
+> build it.**
+
+    REBUILD  a real bar the screen MISSES   -> a lane-window rebuilding shipped work
+    EXPIRED  a dead bar the screen HONOURS  -> the row is lost while reading as handled
+
+> **BOTH DIRECTIONS ARE UNREACHABLE BY ANY VERB LIST.** A screen decides from tokens; both of these
+> turn on whether a sentence is still in force, which only reading the row can answer.
+
+> **WHAT WOULD ACTUALLY HELP, and it is not a bigger verb list.** A screen can be made to *stop
+> claiming to know*: flag `REBUILD`/`RE-DO`/`RE-IMPLEMENT`/`ALREADY SHIPPED`/`ALREADY BUILT` and any
+> "EXPIRED"/"NO LONGER"/"HAS BEEN CLEARED" near a bar as ***MUST BE READ***, never as a verdict.
+> ***A SCREEN THAT PASSES A ROW HAS NOT READ IT, AND THE FIX IS TO MAKE IT SAY SO.***
+
+> **EVIDENCE.** All 115 open rows containing "DO NOT" were read across two passes on 2026-08-29 --
+> the 79 no verb list could classify, then the 36 they could. Full working, per-row verdicts and the
+> five-way taxonomy are anchored at `refs/builder2/dup-hunt-2026-08-29`
+> (`BUILDER2-2026-08-29-DONOT-CLASSIFICATION.md` and `BUILDER2-2026-08-29-DONOT-36-REREAD.md`), read
+> back through the ref against a control phrase. **Ref rather than mail: mail's default TTL is 72
+> hours and the gap to the next working session is 108.**
+
+> ***WHAT THIS ROW DOES NOT CLAIM.*** That the four are the whole population -- they are the four
+> found in rows containing the words "DO NOT", and **a row that says the same thing in other words
+> was never in the search space.** Nor that any of the four is safe to close: closing them is the
+> judgement their own banners say the building seat cannot make.
+
+**Cluster:** Fleet coordination / dispatch. **Priority:** P2. **Verdict:** build (small).
+**Severity:** no engine effect, no PHI axis, no deployment axis (sec. 0). It wastes a lane-window
+per occurrence and silently strands rows whose bar has lapsed.
+
+---
+
+## 1394. a dispatch blocker-screen discards 46 percent of the open ledger on a token match, and it preferentially kills the best-documented rows
+
+> 🔢 **FILED 2026-08-29 (builder 2), on a defect the DISPATCHER found in its own instrument
+> and disclosed unprompted.** A dispatcher screened open rows for blockers by matching the token
+> "DO NOT". ***115 OF 251 OPEN ROWS CONTAIN IT -- 46 PERCENT OF THE LIVE LEDGER. ABOUT 24 ACTUALLY
+> BAR WORK.*** An overnight "nothing is dispatchable" finding was published off that screen and has
+> since been withdrawn.
+
+> **ALL 115 WERE THEN READ, in two passes, and the population is mostly ordinary language:**
+
+| class | count | what it is |
+|---|---|---|
+| **REAL BAR** | **~24** | do not build / ship / schedule / dispatch this work |
+| FENCE | ~27 | constrains FILING, CLOSING or SCOPE -- not whether to build |
+| ADVICE | ~34 | design and method guidance inside the row |
+| NOT-A-DIRECTIVE | ~19 | ordinary prose that happens to contain the words |
+| HISTORICAL / QUOTED | ~11 | quotes a directive being reported or overturned |
+
+> ***THE PERVERSE SELECTION IS THE REAL DEFECT, NOT THE FALSE-POSITIVE RATE.*** A row saying *"do not
+> invert it silently"* or *"do not assert structural silence from a three-file sample"* is a row whose
+> author thought carefully about how the work could go wrong. **THE SCREEN KILLS THOSE FIRST.** A
+> thin, under-documented row containing no cautions sails through. **The instrument is
+> anti-correlated with row quality.**
+
+> **THREE FAILURE SHAPES, EACH MEASURED, EACH INVISIBLE TO A TOKEN MATCH:**
+>
+> 1. ***FIRST-HIT CLASSIFICATION.*** A row can carry several "DO NOT"s of different classes. #352
+>    reads as prose on hit one and carries a real fence on hit two; #1242 has three harmless hits and
+>    a fourth that is a real bar. **Classify by the STRONGEST directive, never the first.**
+> 2. ***THE `REBUILD` GAP*** -- see the sibling row filed alongside this one. Four rows say the work
+>    already shipped; no BUILD-verb list matches `REBUILD`, so all four pass as buildable.
+> 3. ***THE EXPIRED BAR.*** #1020 contains "DO NOT BUILD THE GATE YET" **and** "THE STANDING ... PARK
+>    HAS EXPIRED BY ITS OWN TERMS" **and** "UNCHANGED: build now". The screen honours a dead bar.
+
+> ***AND THE BUCKET THAT EXISTS TO STOP DISPATCH IS THE LEAST RELIABLE ONE: of 19 rows a verb-list
+> screen called BAR, 8 DO NOT BAR THE ROW'S WORK -- 42 percent false.*** Five of those eight contain
+> the literal words "DO NOT BUILD", where the phrase means *not that way*, *not there*, *not yet and
+> yet is over*, or is a **quotation**. **#1334's "DO NOT"s are quoted definitions of what
+> `demand-gate` and `owner-ruling` MEAN -- so screening on the words blocks the row that would fix the
+> screening problem.**
+
+> **THE FIX IS NOT A LONGER VERB LIST.** Every shape above turns on whether a sentence is still in
+> force and whom it addresses, which a token match cannot see. ***MAKE THE SCREEN RETURN `MUST BE
+> READ` INSTEAD OF A VERDICT*** -- surface the sentence and its neighbours to a human or a reading
+> pass, and **never let "the screen passed it" stand in for "somebody read it"**. A screen that
+> passes a row has not read it; the DISPATCHER's own #1372 example proves the passing direction fails
+> too (a row its corrected screen passed turned out to be substantively done).
+
+> **EVIDENCE** is anchored at `refs/builder2/dup-hunt-2026-08-29` --
+> `BUILDER2-2026-08-29-DONOT-CLASSIFICATION.md` (the 79 no verb list could classify) and
+> `BUILDER2-2026-08-29-DONOT-36-REREAD.md` (the 36 they could), each read back through the ref
+> against a control phrase. **A ref rather than mail: mail's default TTL is 72 hours and the gap to
+> the next working session is 108.**
+
+> ***WHAT THIS ROW DOES NOT CLAIM: that ~86 dispatchable rows exist.*** An unbarred row is a
+> **candidate**, not a finding. Nor that the class counts are exact -- they are one reader's
+> judgement on 115 rows, recorded per-row on the ref so the next reader can disagree with a specific
+> call rather than the total.
+
+**Cluster:** Fleet coordination / dispatch. **Priority:** P2. **Verdict:** build (small).
+**Severity:** no engine effect, no PHI axis, no deployment axis (sec. 0). It idles build lanes
+against a ledger that has work in it, and it does so by discarding the best-written rows first.
+
+---
+
+## 1395. every pre-commit gate is silently bypassed by a rebase or cherry-pick, including the PHI leak guard and the secret detector, because git never invokes pre-commit for a replayed commit
+
+> 🔢 **FILED 2026-08-29 (builder 2), MEASURED with a positive control.** `git` does not run
+> the `pre-commit` hook for a commit created by the sequencer. ***SO A REBASE OR A CHERRY-PICK PUTS A
+> COMMIT ON A BRANCH WITH NONE OF THE ELEVEN GATES HAVING RUN -- and nothing anywhere reports it.***
+
+> **THE EXPERIMENT. Four arms in a throwaway worktree that owns no allocation, all against the same
+> content -- the commit adding row #1393, whose number is allocated to a DIFFERENT worktree.**
+
+| arm | what was done | gates that ran | commit created | outcome |
+|---|---|---|---|---|
+| 1 | ordinary `git commit` | **11** | no | ***REFUSED*** -- "BACKLOG item #1393 was not allocated to this worktree" |
+| control | ordinary commit, unrelated edit | **11** | -- | proves hooks DO run in this worktree |
+| 2 | `git cherry-pick` of that commit | **0** | **YES** (`e1fac8556`) | ***ALLOWED*** |
+| 3 | `git rebase --onto` + conflict + `--continue` | **0** | **YES** (`bec1188bd`) | ***ALLOWED*** |
+
+> **Arm 3 is the one that matters and it was run TWICE.** *The first attempt was INCONCLUSIVE and is
+> recorded rather than dropped: the base already contained #1393, so the replay went empty, no commit
+> was created, and "0 gates ran" proved nothing.* **Re-run against a base WITHOUT #1393 the replay was
+> non-empty, a real commit was created, and the gates still did not run.**
+
+> ***THE LEDGER GATE IS THE LEAST OF IT. ALL ELEVEN ARE SKIPPED*** -- `.pre-commit-config.yaml`
+> declares 11 hook ids and an ordinary commit prints exactly 11 result lines. **Among them:**
+>
+>     forbidden-content (customer/PHI leak guard)
+>     Detect hardcoded secrets
+>     control characters (invisible bytes)
+>     licence header (SPDX)
+>     ledger gate (ADR/BACKLOG number reuse)
+>     bandit
+>
+> **A rebase is an ordinary, daily, entirely innocent operation in this repo** -- every branch behind
+> `main` needs one. ***SO THE LEAK GUARD AND THE SECRET DETECTOR ARE ABSENT FROM THE MOST ROUTINE
+> PATH BY WHICH COMMITS REACH A BRANCH, AND THE COMMIT LOOKS IDENTICAL TO A GATED ONE AFTERWARDS.***
+
+> **WHY THIS IS WORSE THAN A GAP: IT IS A GAP THAT REPAIRS ITSELF INTO INVISIBILITY.** A commit that
+> was refused, then rebased through, carries no mark. `git log` cannot show which commits were gated.
+> **The only evidence is the terminal output of the run that created it, which nobody keeps.**
+
+> ***WHAT THIS DOES NOT CLAIM.*** Not that anything has actually bypassed a gate this way -- nobody
+> looked, and the finding is the reachability, not an incident. Not that CI is equally blind: the
+> repo's required CI checks run against the PR head and are a real second line, **which is why this is
+> a P2 and not a P1.**
+
+> ***AMENDED SAME DAY -- THE CI-TWIN QUESTION THIS ROW LEFT OPEN IS NOW MEASURED, AND IT CORRECTED
+> THIS ROW TWICE.*** The original text said *"`bandit`, the leak guard and the SPDX check are
+> pre-commit-only as far as this measurement went"*. ***THAT WAS WRONG. ALL ELEVEN GATES HAVE A CI
+> MIRROR***, including those three -- `bandit -r . --skip ...` in `security.yml`,
+> `scan_forbidden.py --path .` in `security.yml` and `branch-leak-scan.yml`, and
+> `licence_header_check.py` at `ci.yml:360`.
+
+> ***AND THE SECOND CORRECTION IS THE ONE THAT MATTERS: "CI IS A REAL SECOND LINE" HOLDS FOR TEN OF
+> ELEVEN, NOT ALL ELEVEN.*** `scripts/hooks/ledger_check.py` guards its ownership check as
+> `elif not self.ci and not self.owns(...)` at **both** `:296` (ADR) and `:385` (BACKLOG), and CI
+> invokes it as `ledger_check.py --ci`. **So CI never checks allocation ownership.** The
+> duplicate-number half still runs in CI; only ownership is skipped, **and that is unavoidable rather
+> than an oversight -- the allocation registry lives in `.git/mefor-coord/` and never reaches a
+> runner.**
+
+> ***PUT THAT TOGETHER WITH THIS ROW'S OWN FINDING AND THE OWNERSHIP CHECK HAS NO ENFORCEMENT PATH AT
+> ALL ON A REPLAYED COMMIT. Not a weakened one -- none. The hook is skipped by the rebase, and CI is
+> told to skip it too.*** **The P2 still stands** -- a duplicate number IS caught by CI, and ownership
+> is a coordination aid rather than a security control -- but the row must not imply blanket coverage.
+
+> **PARITY BETWEEN HOOK AND CI IS ITSELF ENFORCED FOR ONLY 3 OF THE 11**, by
+> `tests/test_lint_scope_parity.py` (14 tests): `ruff-format`, `ruff-check` and `bandit`. **The other
+> eight mirrors are hand-maintained with nothing comparing them** -- all eight MATCH today, checked
+> individually rather than assumed. ***A PARITY TEST FOR THOSE EIGHT IS THE DURABLE FIX AND IS NOT
+> BUILT.***
+
+> **Full working, per-gate, is anchored at `refs/builder2/dup-hunt-2026-08-29`
+> (`BUILDER2-2026-08-29-CI-TWIN-CENSUS.md`), including the census's own correction: it first claimed
+> nothing checks the mirrors, which the parity test disproves for three of them.**
+
+> **CANDIDATE FIXES, none verified here.** A `pre-merge-commit` and `post-rewrite` hook pair; or a
+> CI-side re-run of the same `pre-commit` config over the PR's full diff (`pre-commit run --from-ref
+> --to-ref`), which is the one that cannot be skipped by a local workflow. ***PREFER THE CI-SIDE
+> RE-RUN: a local hook is advisory by construction and this row is the proof.***
+
+> **Found while settling a different question** -- why an allocation-keyed refusal in one worktree did
+> not reproduce in another. **The allocation answer is "replay versus fresh authorship". THE REASON IS
+> THAT NO GATE RUNS AT ALL, which is a larger finding than the question that produced it.**
+
+**Cluster:** Quality gates / CI. **Priority:** P2. **Verdict:** build.
+**Severity:** no engine effect and no PHI axis today (sec. 0, zero deployments) -- **but this repo is
+public**, and the bypassed set includes the guard whose job is to stop customer or PHI content
+reaching it. The exposure is to the REPOSITORY, not to a deployment.
+
+---
+
+## 1396. anchor-guided remediation fixes only what the evidence quotes, so an error earlier in the document survives every pass and the reader reaches it first
+
+> 🔢 **FILED 2026-08-29 (builder 2). Found by the ASVS-TRACKER, relayed by the LIAISON,
+> and I am the worked example.** An ASVS cell cites specific lines as evidence. When a defect is
+> repaired, ***THE REPAIR LANDS WHERE THE ANCHORS POINT.*** Anything wrong **earlier** in the same
+> document, where no anchor looked, survives -- **and a reader meets it first.**
+
+> **THE MEASURED INSTANCE, in `docs/SECURITY.md`.** The tracker's words: *"Every correction to this
+> document landed at a line the ASVS cell's evidence anchors cited. Both surviving errors sit 370
+> lines earlier, where no anchor looked."*
+
+    :806   "[auth].require_mfa on ... the Administrator role must satisfy MFA before any
+            step-up operation ... other users may opt in by enrolling"
+    :811   the opt-out sentence -- ANCHORED, and FIXED under #1388
+    :1178  the same document: scope is `every_local_account` by default and it is an ACCESS gate
+           on every authorized route -- then, in the row itself:
+           *** "An earlier revision of this row said Administrator-only and
+               step-up-boundary-only; BOTH WERE WRONG" ***
+
+> ***SO THE DOCUMENT CARRIED ITS OWN REFUTATION, 370 LINES BELOW THE CLAIM, FOR AS LONG AS IT TOOK
+> SOMEONE TO READ PAST THE ANCHORS.*** #1388 fixed `:811` and left `:806`, **and `:806` comes first.**
+> (Both are now repaired -- `:811` under #1388, `:806` as its remainder. **This row is the CLASS, not
+> those two lines.**)
+
+> ***WHY IT IS NOT A CARELESSNESS FINDING, WHICH IS WHY IT NEEDS A ROW RATHER THAN A REMINDER.***
+> Each individual call was defensible. #1388's pass sorted every line INSTRUCTION versus DESCRIBE and
+> fixed the instructions; `:806` was classed DESCRIBE, on the sound ground that a description says
+> what the system READS rather than what an operator should WRITE. **The method was right, applied
+> honestly, and still left a wrong description standing four lines from its own correction.**
+
+> **THE MECHANISM IS THAT THE ANCHOR SET IS THE SEARCH SPACE.** A cell's anchors record *where the
+> evidence was found*, never *where the claim is repeated*. Remediation inherits that boundary
+> silently. ***AND IT GETS WORSE WITH TIME: each pass adds anchors at the lines it just fixed, so the
+> anchored region grows around the places already correct*** -- exactly what happened here, where the
+> repair added anchors at `:806`, `:807` and `:811`.
+
+> ***THE READING-ORDER HALF IS THE DANGEROUS ONE. A DOCUMENT THAT IS RIGHT LATE AND WRONG EARLY IS
+> WORSE THAN ONE THAT IS WRONG THROUGHOUT***, because the reader who stops early is confidently
+> misinformed, and the reader who continues finds a contradiction and cannot tell which half is
+> current. Here the early text also named a config key **refused at load**, so following it produced
+> a `serve` that exits 2.
+
+> **WHAT WOULD ACTUALLY HELP, none of it verified here.** ***A repair pass should search the WHOLE
+> document for the CLAIM, not visit the anchor lines*** -- grep the assertion, not the citation.
+> Where a document states a rule twice, a check that the statements agree is worth more than either
+> being individually correct. **And when a correction lands, look EARLIER as well as at the anchor:
+> the anchors mark where somebody already looked, which is precisely where the defect is least
+> likely to still be.**
+
+> ***WHAT THIS ROW DOES NOT CLAIM: that any other cell has this defect today.*** One instance is
+> measured; the mechanism is general and applies to every cell with anchors, **but no census was
+> run** -- that is the first task of whoever takes it, and it is a cheap one: for each cell, grep its
+> claim across the whole file and compare against its anchor lines. Nor that anchors are wrong to
+> exist; they are evidence, and **the defect is treating an evidence list as a work list.**
+
+**Cluster:** Documentation / security assurance. **Priority:** P2. **Verdict:** build (a census
+first, then a method change). **Severity:** no engine effect and no PHI axis (sec. 0, zero
+deployments). It leaves security documentation that is correct late and wrong early, which is the
+shape a reader is least able to detect.
+
+---
+
+## 1398. a row can be fully built with nothing in its text saying so, and no ledger-reading screen can detect it -- ask the tree, not the banner
+
+> 🔢 **FILED 2026-08-29 (builder 2), found by starting the work.** A dispatcher screened
+> **#1300** as open, unclaimed, in no PR title or body, and carrying no bar -- *"P1, quick win, not
+> started"*. ***IT WAS ALREADY BUILT AND SHIPPED ON `main`.*** I only found out because I began it.
+
+    tests/test_required_contexts.py:235
+      test_the_ci_gate_rollup_comment_names_every_job_the_job_actually_needs()
+      its docstring opens: "BACKLOG #1300."
+    .github/required-contexts.txt now names all EIGHT legs and says
+      "THE SECOND GROUP WAS ABSENT FROM THIS FILE UNTIL BACKLOG #1300"
+    and #1300 still reads OPEN.
+
+> ***THIS IS NOT #1393's CLASS, AND THE DIFFERENCE IS THE WHOLE POINT.*** #1393 covers rows that
+> **say** their work shipped, where the screen misses the word `REBUILD`. **#1300 says nothing at
+> all** -- no bar, no `DO NOT`, no "shipped" sentence. ***THERE IS NOTHING IN THE TEXT TO MISS. The
+> row is silent and the code is done.*** No amount of reading the ledger finds it, however carefully;
+> **a banner is a hand-maintained claim ABOUT the code, and it goes stale in the direction nothing
+> detects.**
+
+> **THE CHECK, AND IT COSTS FOUR MINUTES FOR NINE ROWS:**
+>
+>     git grep -l -E "BACKLOG #<N>\b" origin/main -- tests/ scripts/ messagefoundry/ .github/
+>
+> ***RUN IT WITH BOTH CONTROLS OR IT PROVES NOTHING: a number known to be UNBUILT must return 0, and
+> one known to be BUILT must return nonzero.*** Without both, a broken pattern returns zero everywhere
+> and reads as *"nothing is built"* -- a false zero that has fired twice in one session.
+
+> **MEASURED ACROSS NINE ROWS a dispatcher had screened as startable (four dispatched, five held in
+> reserve) at `origin/main`:**
+
+| result | rows |
+|---|---|
+| **code on main cites the row number** | **7 of 9** -- #1300, #1337, #1348, #1291, #1254, #1255, #1290 |
+| no citation | 2 -- #1384, #1385 |
+| controls | #1396 (filed that night, unbuilt) returns **0**; #1027 (landed) returns **4** |
+
+> ***WHAT THIS ROW CLAIMS AND WHAT IT DOES NOT. IT DOES NOT CLAIM SEVEN ROWS ARE DONE.*** A citation
+> is not completion: a builder may cite a row while doing PART of it, or the reference may be
+> incidental. **Exactly one was verified end to end (#1300).** ***WHAT IT DOES ESTABLISH IS THAT SEVEN
+> OF NINE WARRANT A READ NOBODY WAS DOING, and that the cost of that read is minutes against a
+> lane-window.***
+
+> **THE FIX IS NOT A BETTER SCREEN.** The dispatcher's screen was good and had just been improved to
+> read banners **by sentence** rather than by token -- that improvement correctly caught three other
+> rows whose banners said the fix was already with the Lander. ***IT STILL PASSED #1300, BECAUSE THE
+> LEDGER IS NOT WHERE THE ANSWER LIVES.*** Add the tree check to the dispatch path, or accept that
+> some fraction of every dispatch is rework.
+
+> ***THE DEEPER ASYMMETRY, WHICH IS WHY THIS KEEPS HAPPENING: a builder's commit reliably cites the
+> row number in the code and the commit message, because gates require it. The ROW is the one artefact
+> in the loop that nothing forces anyone to update*** -- closing it is a judgement the building seat
+> often cannot make (see #1393), so it stays open by default. **The incentive structure produces
+> silently-stale banners as its normal output, not as an error.**
+
+**Cluster:** Fleet coordination / dispatch. **Priority:** P2. **Verdict:** build (small -- add the
+check to the dispatch path). **Severity:** no engine effect, no PHI axis, no deployment axis (sec. 0).
+It spends a lane-window rebuilding shipped work, and unlike #1393 there is no textual signal that
+could have warned anyone.
 
 ---
 
@@ -18114,3 +18448,98 @@ from disk and unregistered. Population measured by the cleaner; the spent-versus
 ruling on the 43 are the dispatcher's, which verified the split independently on one path; filed by
 the lander from a worktree recreated at the recorded path under the owner-ruled recovery. **The row
 describing this defect spent thirteen days inside the population it describes.**
+
+
+## 1370. operator-supplied names reach /ui URL paths unencoded or half-encoded, so a name carrying a slash addresses a different route
+
+> 🔢 **Filed 2026-08-27 (builder 2) - BUILT IN THIS COMMIT, not yet landed.** Gap 2 of the two the Lander scoped on **PR 530**, this seat's own abandoned lane, re-implemented against current `main` rather than cherry-picked.
+> Verdict: build
+> Closing-act: code
+
+**Cluster:** Web console security. **Priority:** P2. **Verdict:** build.
+**Severity:** no engine effect, no PHI axis, and **no deployment axis (sec. 0)** -- with zero deployments this is a condition a FIRST deployment would meet, not an exposure anyone has today.
+
+**What:** connection names and channel ids are interpolated into `/ui` URL paths. They are **unconstrained free text** -- the registry checks only for a duplicate and no charset gate exists -- so a name carrying `/` splits into two path segments and addresses a different route.
+
+**MAIN WAS IN TWO DIFFERENT STATES, AND THE HALF-PROTECTED ONE IS THE MORE INTERESTING:**
+
+```
+connections.py:64   quote(r.name)     PARTIAL -- quote's default is safe="/", so the separator passes
+connections.py:200  quote(name)       PARTIAL -- same
+admin.py:363,381    {role.id}         RAW
+messages.py:618,628 {ch}/{dest}       RAW
+```
+
+**A bare `quote()` reads as protection and provides none against the one character that matters.** Measured, not reasoned: `quote("IB/ACME")` returns it **unchanged**, while `quote("a?b")` and `quote("a#b")` are encoded -- so the call looks like it works everywhere it is tested by hand. `safe=""` is the whole fix.
+
+**The fix:** `_seg()` in `pages/_common.py`, and the six sites routed through it.
+
+**NOT A BLANKET SWEEP, AND THE EXCLUSION IS THE LOAD-BEARING PART.** `_auth`'s re-auth `next` carries a whole PATH inside a QUERY parameter, where `safe="/"` is **correct**; routing it through `_seg` would break every re-auth redirect. `connections.py:59` and `:384` keep a bare `quote()` for the same reason -- they build `?channel_id=` query values, not path segments. **A sweep of "every `quote()` call" would ship a broken login**, so a test pins the re-auth encoding against exactly that.
+
+**Verification:** the seven tests come from the abandoned branch and **pass unmodified against this re-implementation** -- written for a different implementation of the same contract, so they corroborate rather than restate. Five mutants, all killed, each by a distinct red set: `_seg` reverted to the default `safe`; `_seg` over-encoding (the negative control fires); one site reverted to raw; **one site reverted to a bare `quote()` -- caught by the structural scan alone**; the custom-role site reverted.
+
+**Related:** the sibling gap from the same PR 530 dispatch -- fetch-metadata does not cover the `/ui/static` mount (`_is_ui_fetch_scope` absent from main) -- is **NOT in this commit** and still wants building.
+
+**Source:** dispatched by the Lander off PR 530 with a per-file measurement. Three searches in that scouting returned false zeros on SPELLING alone: `def test` missing 8 `async def test` functions, `def seg` matching `segment_ids` as a prefix, and `\bseg\(` unable to match `_seg(` because underscore is a word character.
+## 1371. fetch-metadata never reaches the /ui/static mount, because a route dependency cannot run for a Mount
+
+> 🔢 **Filed 2026-08-27 (builder 2) - BUILT IN THIS COMMIT, not yet landed.** Gap 1 of the two the Lander scoped on **PR 530**, re-implemented against current `main` rather than cherry-picked.
+> Verdict: build
+> Closing-act: code
+
+**Cluster:** Web console security. **Priority:** P2. **Verdict:** build.
+**Severity:** no engine effect, no PHI axis, and **no deployment axis (sec. 0)** -- a condition a FIRST deployment would meet, not an exposure anyone has today.
+
+**What:** `main` DOES check fetch-metadata -- `_auth`'s per-route helper refuses any request whose `Sec-Fetch-Site` says cross-site. **But `/ui/static` is a Starlette `Mount`, not an `APIRoute`, so no route dependency ever runs for it.** The asset tier is the one `/ui` surface the per-route check cannot reach, and at a glance the console looks covered because the helper exists and is used across five modules.
+
+**The fix is MIDDLEWARE, which is the only tier that sees a Mount.** `UiFetchMetadataMiddleware` plus `_is_ui_fetch_scope`, deliberately WIDER than the existing `_is_ui_html_path`: that predicate excludes `/ui/static` correctly, because CSP headers only apply to HTML. **Collapsing the two would remove this check's only purpose.**
+
+**THREE CARVE-OUTS, EACH OF WHICH LOOKS LIKE A WEAKNESS AND IS NOT.** Every one is pinned by a test, and every corresponding mutant is a plausible hardening pass:
+
+- **A cross-site top-level NAVIGATION passes.** An intranet link into the console is one; so is the OIDC callback, cross-site by construction. Without reading `Sec-Fetch-Mode`, **every real SSO login would 403 while every hermetic test still passed**. Method is part of safe -- a cross-site navigation carrying a POST is a CSRF submission -- and `object`/`embed` are refused because that is framing, not navigation.
+- **An ABSENT header passes.** `Sec-Fetch-Site` is browser-populated; old browsers, reporting agents and every non-browser client omit it. Failing closed would refuse **the shipped Windows tray's own `GET /ui` probe**, which builds its client with no headers at all.
+- **403, NEVER 404.** The tray classifies 404 as DISABLED and every other status as ENABLED, so a "do not disclose the route" pass would make a healthy console report as switched off.
+
+**Verification:** the eight tests come from the abandoned branch and **pass unmodified against this re-implementation** -- written for a different implementation of the same contract. Five mutants, all killed, each by a distinct red set, and each is a change someone would plausibly propose as an improvement: narrow the scope to the HTML predicate; fail closed on absence; return 404; drop the navigation carve-out; admit framing. Full webconsole suite 393 passed, 3 skipped.
+
+**Related:** #1370, the sibling gap from the same PR 530 dispatch. Both are now built; PR 530's branch itself remains superseded and should not be cherry-picked.
+
+**Source:** dispatched by the Lander off PR 530. Its brief called this file a possible silent-green test file -- 180 lines with zero `def test`. It collects **8**; they are `async def test`, and a pattern anchored on `def test` cannot match one.
+
+## 1401. the multi-session tooling sits in the public engine repo, where an implementer has no use for it
+
+> 🔢 **Filed 2026-08-31.** Owner content policy, stated the same day: the public repo carries only what an implementer needs to RUN or EVALUATE MessageFoundry. Tooling, private information and security items belong in the vault. The generic coordination layer is published separately as `claude-multisession`.
+> Verdict: build
+> Closing-act: code
+
+**THIS ITEM CONFLICTS WITH AN ACCEPTED ADR AND MUST NOT BE EXECUTED UNTIL THE OWNER RESOLVES IT.** [ADR 0160](adr/0160-public-repo-content-policy-operator-and-security-review-material-only.md) is **Accepted**, and its status line reads *"Phase 1 EXECUTED; Phase 2 DECLINED; Phase 3 still Proposed."* Phase 2 is this move. D5 declined it on measured cost, and the ADR says so in terms that leave no opening: *"the process tooling and the documents describing it stay tracked ... That is a decision, not a deferral: nothing is pending that would reopen it."*
+
+The owner restated the content policy on 2026-08-31 in words that read the other way. Both cannot hold. **That is the owner's to settle, not a session's**, and this item is filed rather than actioned until they do. Filing it is still right: the measurements below stand whichever way the decision falls, and the conflict itself needed a written home.
+
+**What D5 measured, which is the case against moving:** the vault's CI is off -- every workflow but the ASVS scorecard is `disabled_manually` -- so "move it where its tests keep running" is false, and false in a way that survives inspection because a `ci.yml` sits right there. A Linux-only leg would cover half the suite and report green, since 13 of 26 files skip on `os.name != "nt"`. And `git rm --cached` removes the file from every working tree including the machine that runs it, with no restore step.
+
+**Cluster:** Repository hygiene. **Priority:** P3. **Verdict:** build.
+**Severity:** no engine effect, no PHI axis, and **no deployment axis (sec. 0)** -- nothing here changes what a first deployment does.
+
+**What:** `scripts/coord` (30 files) and `scripts/hooks` (15 files) are multi-session working tools. They coordinate sessions across accounts: mail, seat records, usage polling, claims, worktree gates. None of it helps someone install the engine or judge whether it fits their site, and all of it describes how this project is worked rather than what it does.
+
+**THE CONSTRAINT IS A RULE, NOT A FILE LIST.** A path called by `.pre-commit-config.yaml`, or by any workflow under `.github/workflows/`, STAYS IN THE PUBLIC REPO. An outside contributor has to be able to pass the gates on their own clone, and a gate that points at an absent file does not fail with a useful message.
+
+**Measured 2026-08-31 by the sweeping session, at `origin/main` ab6e40f7e: 25 workflows reference `scripts/` at 37 DISTINCT PATHS, and `.pre-commit-config.yaml` binds 6 local hooks to `scripts/`.** The heaviest are `quality/liveness.py` (16 references), `ci/retry-native-crash.sh` (10), `ci/step_margin.py` (5), `security/scan_forbidden.py` (4). So the protected set reaches `scripts/ci`, `scripts/quality`, `scripts/security` and `scripts/docs`, not only the two directories this item is about.
+
+Within `scripts/coord` and `scripts/hooks` specifically, four files are caught by the rule:
+
+| File | Called by |
+|---|---|
+| `scripts/coord/install-git-hooks.ps1` | `.pre-commit-config.yaml` and CI |
+| `scripts/hooks/ledger_check.py` | `.pre-commit-config.yaml` and CI |
+| `scripts/hooks/claim_check.py` | CI |
+| `scripts/hooks/push_guard.py` | CI |
+
+`push_guard.py` deserves its own line: it is what blocks a direct push to a protected ref. Moving it does not fail loudly. It silently stops protecting.
+
+**This item first stated the constraint AS those four files.** That was too narrow, and it is recorded rather than edited away because a reader who saw the earlier form needs it named as superseded rather than silently absent. Four files is what a search of two directories finds. The rule above is what a search of the gates finds, and the gates are the thing that binds.
+
+**Do not create a third copy.** The vault should CONSUME `claude-multisession` rather than hold its own fork of the same scripts. Measured 2026-08-31, comparing this repo's coordination scripts against the ones already in `claude-multisession`: **0 identical, 16 differing, 28 absent.** Two independent copies with no defined direction of flow produced that in a few weeks; a third would be worse, and the drift is invisible because both sides keep working.
+
+**Related:** the porting and de-drifting work is filed in that repository's own tracker, issues 99 to 105, deliberately outside this number space.

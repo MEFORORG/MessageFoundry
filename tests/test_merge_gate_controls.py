@@ -105,25 +105,90 @@ def _ci_gate_job() -> dict[str, Any]:
     return jobs_of("ci.yml")["ci-gate"]
 
 
-def _rollup_fail_condition() -> str:
-    for step in _ci_gate_job().get("steps", []):
-        if "if" in step and "needs" in str(step.get("if", "")):
-            return str(step["if"])
-    raise AssertionError(
-        "ci.yml's `ci-gate` job has no step conditioned on `needs.*.result`. The roll-up is the only "
-        "path by which six path-gated legs reach branch protection; without that condition it reports "
-        "success unconditionally."
+#: The `needs.*.result` values a leg can report. The roll-up must fire on the first two and stay
+#: quiet on the last two -- see the two tests below, which are opposite halves of one property.
+_LEG_RESULTS = ("failure", "cancelled", "skipped", "success")
+
+
+def _rollup_fail_conditions() -> list[tuple[str, str]]:
+    """Every FAILING step in `ci-gate`, as (step name, condition).
+
+    THE ROLL-UP IS ALLOWED TO BE MORE THAN ONE STEP, and reading only the first is how this file
+    went wrong. The gate was split so that a real leg failure and a whole-run cancellation print
+    different messages -- 440 of 646 red runs were cancellations wearing the words of a break. A
+    reader that returns the first condition then sees only `contains(..., 'failure')` and reports
+    that the gate has stopped covering cancelled legs, which is false and which is exactly the
+    regression the tests here exist to catch. Collect them all; assert on what they do together.
+
+    A step counts as a failing step only if it `exit 1`s. The job's final "gated legs OK" step is
+    conditioned on nothing and reports success, and must not be read as part of the gate.
+    """
+    found = [
+        (str(step.get("name", "(unnamed)")), str(step["if"]))
+        for step in _ci_gate_job().get("steps", [])
+        if "needs" in str(step.get("if", "")) and "exit 1" in str(step.get("run", ""))
+    ]
+    if not found:
+        raise AssertionError(
+            "ci.yml's `ci-gate` job has no failing step conditioned on `needs.*.result`. The roll-up "
+            "is the only path by which six path-gated legs reach branch protection; without that "
+            "condition it reports success unconditionally."
+        )
+    return found
+
+
+def _evaluate(condition: str, results: list[str]) -> bool:
+    """Evaluate one step's `if` against a synthetic results vector.
+
+    EVALUATED, NOT PATTERN-MATCHED, AND THE DIFFERENCE IS LOAD-BEARING. The previous reader pulled
+    state names out with a regex over `contains(needs.*.result, 'X')`. That regex cannot see a
+    NEGATION, so the cancelled arm's guard -- `!contains(needs.*.result, 'failure') && contains(...,
+    'cancelled')` -- would have reported `failure` as covered by a step that fires only when failure
+    is ABSENT. The union would then have looked correct for the wrong reason: a green proving the
+    opposite of what it claims. Asking what the condition DOES cannot make that mistake.
+
+    The translated subset is deliberately tiny. Anything outside it raises rather than being
+    silently mis-evaluated, because a condition this reader cannot parse is a condition it must not
+    grade.
+    """
+    expr = re.sub(
+        r"contains\(\s*needs\.\*\.result\s*,\s*'([a-z]+)'\s*\)",
+        lambda m: repr(m.group(1)) + " in results",
+        condition,
     )
-
-
-def _terminal_states(condition: str) -> set[str]:
-    """The `needs.*.result` values the roll-up's condition fires on, read off the workflow."""
-    return set(re.findall(r"contains\(\s*needs\.\*\.result\s*,\s*'([a-z]+)'\s*\)", condition))
+    expr = expr.replace("&&", " and ").replace("||", " or ").replace("!", " not ")
+    # Whitelist BEFORE evaluating. The input is this repository's own workflow, so this is not a
+    # trust boundary -- it is a guard against grading an expression that grew syntax this function
+    # does not model.
+    if not re.fullmatch(r"[\s()'a-z_]+", expr):
+        raise AssertionError(
+            f"the roll-up condition uses syntax this reader does not model: {condition!r}. Teach "
+            "_evaluate the new form rather than loosening this check -- an unmodelled operator "
+            "silently changes what the gate is graded against."
+        )
+    return bool(eval(expr, {"__builtins__": {}}, {"results": results}))  # noqa: S307
 
 
 def _rollup_fires(condition: str, results: list[str]) -> bool:
-    """`contains(needs.*.result, X) || contains(needs.*.result, Y)` over a synthetic results vector."""
-    return any(r in _terminal_states(condition) for r in results)
+    """Does this one condition fire on this results vector?"""
+    return _evaluate(condition, results)
+
+
+def _gate_fires(results: list[str]) -> bool:
+    """Does the gate as a WHOLE fail on this results vector? Any failing step firing is enough."""
+    return any(_evaluate(cond, results) for _, cond in _rollup_fail_conditions())
+
+
+def _states_the_gate_fires_on() -> set[str]:
+    """The leg results that make the gate red, derived by asking it rather than by reading it.
+
+    One planted state against five successes, per state. That is the shape the gate actually meets.
+    """
+    fires = set()
+    for planted in _LEG_RESULTS:
+        if _gate_fires(["success", "success", "skipped", "success", "skipped", planted]):
+            fires.add(planted)
+    return fires
 
 
 def test_the_ci_gate_rollup_fires_on_a_failed_or_cancelled_leg() -> None:
@@ -134,22 +199,20 @@ def test_the_ci_gate_rollup_fires_on_a_failed_or_cancelled_leg() -> None:
     thing that turns a red sqlserver-store, postgres-store, load-test, load-test-sqlserver or
     windows-service-smoke into a blocked merge.
     """
-    condition = _rollup_fail_condition()
-    states = _terminal_states(condition)
+    conditions = _rollup_fail_conditions()
+    states = _states_the_gate_fires_on()
     assert states == {"failure", "cancelled"}, (
-        f"the roll-up fires on {sorted(states)}. `failure` alone lets a CANCELLED leg -- which is what a "
-        f"timed-out or infrastructure-killed run reports -- pass the merge gate. Condition: {condition!r}"
+        f"the gate fires on {sorted(states)}. `failure` alone lets a CANCELLED leg -- which is what a "
+        f"timed-out or infrastructure-killed run reports -- pass the merge gate. Steps: "
+        f"{[name for name, _ in conditions]}"
     )
+    # ASSERTED ACROSS THE WHOLE GATE, not one step. The gate may be split so that a break and a
+    # supersede print different messages; what must hold is that neither state escapes it.
     for planted in ("failure", "cancelled"):
         results = ["success", "success", "skipped", "success", "skipped", planted]
-        assert _rollup_fires(condition, results), (
-            f"a gated leg reporting {planted!r} does not fire the roll-up: {condition!r}"
+        assert _gate_fires(results), (
+            f"a gated leg reporting {planted!r} fires no step of the roll-up. Steps: {conditions}"
         )
-    step = next(s for s in _ci_gate_job()["steps"] if s.get("if") == condition)
-    assert "exit 1" in str(step.get("run", "")), (
-        "the roll-up's failing step does not `exit 1`, so the condition fires and the job still "
-        "reports success"
-    )
 
 
 def test_the_ci_gate_rollup_stays_green_when_every_gated_leg_skipped() -> None:
@@ -160,23 +223,81 @@ def test_the_ci_gate_rollup_stays_green_when_every_gated_leg_skipped() -> None:
     six skipped and `CI gate` still returned success, which is what made requiring it safe. A control
     that reddened on everything would have destroyed that property while looking stronger.
     """
-    condition = _rollup_fail_condition()
-    assert not _rollup_fires(condition, ["skipped"] * 6)
-    assert not _rollup_fires(condition, ["success"] * 6)
-    assert not _rollup_fires(condition, ["success", "skipped", "skipped", "success", "skipped"])
+    assert not _gate_fires(["skipped"] * 6)
+    assert not _gate_fires(["success"] * 6)
+    assert not _gate_fires(["success", "skipped", "skipped", "success", "skipped"])
 
 
 def test_the_rollup_reader_reports_a_condition_that_dropped_cancelled() -> None:
     """NEGATIVE CONTROL OF THE CONTROL. Without it, "the shipped condition is fine" and "the reader
     matches nothing" are the same green."""
     neutered = "contains(needs.*.result, 'failure')"
-    assert _terminal_states(neutered) == {"failure"}
+    assert _rollup_fires(neutered, ["failure"])
     assert not _rollup_fires(neutered, ["cancelled"]), (
         "the reader cannot see a dropped terminal state"
     )
-    assert _rollup_fires(_rollup_fail_condition(), ["cancelled"]), (
-        "...and it does see the shipped one, so the assertion above is about the workflow rather than "
-        "about the reader"
+    assert _gate_fires(["cancelled"]), (
+        "...and it does see the shipped gate, so the assertion above is about the workflow rather "
+        "than about the reader"
+    )
+    # SECOND CONTROL, for the failure mode the first one cannot reach. A reader that pattern-matched
+    # state names would grade a NEGATED term as covered, so a step firing only when failure is ABSENT
+    # would look like it covers failure. Evaluating cannot, and this planted condition proves the
+    # reader is evaluating: it mentions 'failure' and must still not fire on it.
+    inverted = "!contains(needs.*.result, 'failure') && contains(needs.*.result, 'cancelled')"
+    assert not _rollup_fires(inverted, ["failure"]), (
+        "the reader treats a NEGATED contains() as coverage, so a condition that fires only when a "
+        "state is absent reads as covering it"
+    )
+    assert _rollup_fires(inverted, ["cancelled"])
+
+
+def test_the_rollup_steps_partition_and_each_one_exits_nonzero() -> None:
+    """Two properties the SPLIT gate rests on, and neither is implied by the coverage test above.
+
+    PARTITION: no results vector may fire two steps. The split exists so a reader learns which kind
+    of event they are looking at; two steps firing at once prints both messages and takes that back.
+
+    EXIT: every failing step must `exit 1`. A step whose condition fires and whose body returns zero
+    is a gate that reports its own failure and passes anyway.
+    """
+    conditions = _rollup_fail_conditions()
+    steps = {str(s.get("name", "(unnamed)")): s for s in _ci_gate_job()["steps"]}
+
+    for name, _ in conditions:
+        assert "exit 1" in str(steps[name].get("run", "")), (
+            f"the roll-up step {name!r} does not `exit 1`, so its condition fires and the job still "
+            "reports success"
+        )
+
+    # Every vector a real run can produce, over the four results a leg can report.
+    for planted in _LEG_RESULTS:
+        results = ["success", "success", "skipped", "success", "skipped", planted]
+        fired = [name for name, cond in conditions if _evaluate(cond, results)]
+        assert len(fired) <= 1, (
+            f"a leg reporting {planted!r} fires {len(fired)} steps at once ({fired}). The split exists "
+            "so the message names the event; overlapping conditions print two and name neither."
+        )
+    # The mixed case, which is the one that actually overlaps if a guard is dropped: a run holding
+    # BOTH a real failure and a cancellation. The failure arm must win and the cancelled arm stay
+    # quiet, or a genuine break gets reported as a supersede and read as expected noise.
+    both = ["success", "failure", "cancelled", "skipped", "success", "success"]
+    fired = [name for name, cond in conditions if _evaluate(cond, both)]
+    assert len(fired) == 1, (
+        f"a run holding a failure AND a cancellation fires {fired}. Exactly one message must win, and "
+        "it must be the failure -- a real break reported in the words of a supersede is read as noise."
+    )
+    # WHICH step wins is asserted BEHAVIOURALLY, never by reading its name. A name match would pass
+    # or fail on wording -- and the pre-split step was called "Fail if any gated leg failed or was
+    # cancelled", which contains both words and would grade as either arm. The failure arm is the
+    # step that fires on a failure with no cancellation anywhere; that is a property of the
+    # condition, and renaming the step cannot move it.
+    failure_only = ["success", "failure", "skipped", "success", "success", "success"]
+    winner_on_failure = [name for name, cond in conditions if _evaluate(cond, failure_only)]
+    assert winner_on_failure == fired, (
+        f"a mixed run fires {fired} but a failure-only run fires {winner_on_failure}. The step that "
+        "wins when both are present must be the same one that reports a plain failure, or a real "
+        "break gets announced in the words of a supersede and read as expected noise."
     )
 
 

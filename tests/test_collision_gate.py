@@ -902,3 +902,83 @@ def test_installed_shim_is_inert_outside_a_git_repo(settings: Path, tmp_path: Pa
     )
     assert proc.returncode == 0
     assert proc.stdout.strip() == "", "shim produced output outside a repo"
+
+
+# ------------------------------------------------ a PARTIAL map is USED, and can only ADD a deny
+#
+# overlap.ps1 used to answer a budget overrun with exit 3 and nothing else, on the reasoning that half a
+# walk under-reports. The first half of that is true and the conclusion did not follow: throwing the
+# rows away does not finish the walk, it only discards the peers the walk already found. Measured
+# 2026-08-30 at 162 worktrees, the walk took 26.1s against a 16s budget and bailed on five runs of five,
+# so this gate spent that period allowing every edit against a map it had been handed and dropped.
+#
+# The rule the gate follows now is one sentence: a partial map may ADD a deny, never remove one. A
+# collision found in the walked half is real whatever went unchecked; "nobody is in this file" is a
+# claim about the WHOLE map, which a short walk has not earned.
+
+
+def make_partial_stub(tmp_path: Path, rows: list[dict[str, Any]], name: str) -> Path:
+    """An overlap stub that emits rows AND exits 3 -- the shape of a real budget overrun."""
+    stub = tmp_path / name
+    payload = json.dumps(rows).replace("'", "''")
+    stub.write_text(
+        "param([string]$File,[switch]$Json,[switch]$Refresh,[int]$CacheSeconds,"
+        "[string]$Repo,[string[]]$ConfigRoot,[string]$TasksDir,[double]$TimeBudgetSeconds)\n"
+        f"Write-Output '{payload}'\n"
+        "exit 3\n",
+        encoding="utf-8",
+    )
+    return stub
+
+
+PARTIAL_MARKS = {"Partial": True, "Walked": 26, "Total": 163}
+
+
+def test_a_partial_map_still_denies_on_a_live_uncommitted_edit(tmp_path: Path) -> None:
+    """THE COLLISION THAT USED TO BE DROPPED. It was sitting in rows the old gate refused to read."""
+    row = {**EDITING_ROW, **PARTIAL_MARKS}
+    got = run_gate(make_partial_stub(tmp_path, [row], "hit.ps1"), state_dir=tmp_path / "s")
+    assert got is not None, "a partial map with a live dirty hit was allowed through"
+    out = got["hookSpecificOutput"]
+    assert out["permissionDecision"] == "deny", f"expected a deny, got {out}"
+    reason = out["permissionDecisionReason"]
+    assert "deadbeef" in reason, f"the deny did not name the peer:\n{reason}"
+    # The reader must know which kind of deny they hold: more peers may be in this file.
+    assert "PARTIAL" in reason, f"a deny off a partial walk did not say so:\n{reason}"
+
+
+def test_a_partial_map_that_found_nobody_is_never_an_all_clear(tmp_path: Path) -> None:
+    """THE HALF THAT MUST NOT BE TRUSTED. Absence in a short walk is unknown, not clear."""
+    ctx = unresolved(
+        run_gate(make_partial_stub(tmp_path, [], "clear.ps1"), state_dir=tmp_path / "s")
+    )
+    assert "budget" in ctx, f"a partial walk finding nothing was not reported as partial:\n{ctx}"
+
+
+def test_a_partial_map_reports_how_much_of_it_was_walked(tmp_path: Path) -> None:
+    """Coverage is actionable; a bare "partial" invites the reader to assume it was nearly done."""
+    row = {**COMMITTED_ROW, **PARTIAL_MARKS}
+    ctx = unresolved(
+        run_gate(make_partial_stub(tmp_path, [row], "count.ps1"), state_dir=tmp_path / "s")
+    )
+    assert "26" in ctx and "163" in ctx, f"the notice hid the coverage it was handed:\n{ctx}"
+
+
+def test_a_partial_map_of_dormant_peers_reports_rather_than_exiting_quietly(
+    tmp_path: Path,
+) -> None:
+    """NON-VACUITY on the allow paths.
+
+    A dormant-only map exits 0 silently when the walk COMPLETED, and that same silence after a short
+    walk is the all-clear this gate exists to eliminate.
+    """
+    dormant = {**DORMANT_ROW, "Dirty": [], "MatchedDirty": False, **PARTIAL_MARKS}
+    ctx = unresolved(
+        run_gate(make_partial_stub(tmp_path, [dormant], "dorm.ps1"), state_dir=tmp_path / "s")
+    )
+    assert "budget" in ctx, f"a partial dormant-only map exited quietly:\n{ctx}"
+
+    # CONTROL: the identical map from a COMPLETE walk must stay silent, or the assertion above is
+    # satisfied by a gate that has simply started reporting everything.
+    complete = {**DORMANT_ROW, "Dirty": [], "MatchedDirty": False}
+    assert run_gate(make_overlap_stub(tmp_path, [complete]), state_dir=tmp_path / "s2") is None

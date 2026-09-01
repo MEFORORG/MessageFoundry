@@ -23,10 +23,19 @@ reproduces the defect this file exists to prevent one level up.
 
 from __future__ import annotations
 
+import json
+import os
 import re
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
+import yaml
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from _bash_resolver import explain_returncode, require_bash  # noqa: E402
 
 _ROOT = Path(__file__).resolve().parents[1]
 _CI = _ROOT / ".github" / "workflows" / "ci.yml"
@@ -137,4 +146,170 @@ def test_the_regex_is_read_not_copied() -> None:
     assert "gitignore" in _gate_regex(), (
         "the extracted pattern does not mention .gitignore -- either the wrong grep was picked up, or "
         "the BACKLOG #327 arm was removed"
+    )
+
+
+# ---------------------------------------------------------------------------------------------
+# The MATRIX half of the gate. The tests above ask "does this tier RUN"; these ask "on how many
+# LEGS", which is a separate decision with a separate failure mode.
+#
+# `tooling_matrix` narrows the tier to ubuntu on a docs-only PR. That is safe only because the tier
+# still RUNS -- the 22 document-reading files in the manifest keep their coverage, on one leg instead
+# of two. If a future edit ever narrows the FILTER instead, the tests above go red. That is the
+# division of labour between the two blocks, and neither can cover for the other.
+#
+# WHY THESE EXECUTE THE STEP RATHER THAN READING IT. The narrowing lives in shell inside a `run:`
+# block, and the value has to be emitted on FIVE arms -- dispatch, push, schedule, docs-only PR, code
+# PR. An arm added later without the emission is invisible in review and fatal at run time: fromJSON
+# on an unset output kills the job rather than falling back to the full matrix. A text assertion
+# would confirm the lines exist; only running the thing confirms every path through it emits one.
+# ---------------------------------------------------------------------------------------------
+
+_SOURCE_REPO = "MEFORORG/MessageFoundry"
+
+
+def _changes_step_script() -> str:
+    """The `changes` job's detector step, read out of the workflow rather than restated here."""
+    doc = yaml.safe_load(_CI.read_text(encoding="utf-8"))
+    steps = doc["jobs"]["changes"]["steps"]
+    run = next((st["run"] for st in steps if st.get("id") == "f"), None)
+    assert run, "the `changes` job has no step with id `f`; this gate was restructured"
+    return str(run)
+
+
+def _run_detector(
+    bash: str, cwd: Path, event: str, *, repo: str = _SOURCE_REPO, base_sha: str = ""
+) -> dict[str, str]:
+    """Execute the real step and return the outputs it wrote, parsed."""
+    script = cwd / "detector.sh"
+    script.write_text(_changes_step_script(), encoding="utf-8", newline="\n")
+    out_file = cwd / "gh_output"
+    out_file.write_text("", encoding="utf-8")
+    env = dict(os.environ)
+    env.update(
+        {
+            "EVENT_NAME": event,
+            "BASE_SHA": base_sha,
+            "GITHUB_REPOSITORY": repo,
+            "GITHUB_OUTPUT": str(out_file),
+        }
+    )
+    proc = subprocess.run(  # noqa: S603  # nosec B603 - resolved interpreter, fixed argv, tmp paths
+        [bash, str(script)],
+        cwd=str(cwd),
+        env=env,
+        capture_output=True,
+        timeout=180,
+        check=False,
+    )
+    assert proc.returncode == 0, (
+        explain_returncode(proc.returncode, "the `changes` detector step")
+        + "\n"
+        + proc.stderr.decode("utf-8", "replace")
+    )
+    parsed: dict[str, str] = {}
+    for line in out_file.read_text(encoding="utf-8").splitlines():
+        if "=" in line:
+            key, _, value = line.partition("=")
+            parsed[key] = value
+    return parsed
+
+
+def _git(cwd: Path, *args: str) -> str:
+    out = subprocess.run(  # noqa: S603  # nosec B603 - fixed argv, no shell, test-local paths
+        ["git", *args], cwd=str(cwd), capture_output=True, check=True, timeout=120
+    )
+    return out.stdout.decode("utf-8", "replace").strip()
+
+
+def _pr_repo(cwd: Path, changed: list[str]) -> str:
+    """A two-commit repo, so the step's own `git diff BASE...HEAD` has something real to read."""
+    _git(cwd, "init", "-q", "-b", "main")
+    _git(cwd, "config", "user.email", "t@example.invalid")
+    _git(cwd, "config", "user.name", "t")
+    (cwd / "seed.txt").write_text("seed\n", encoding="utf-8")
+    _git(cwd, "add", "seed.txt")
+    _git(cwd, "commit", "-qm", "base")
+    base = _git(cwd, "rev-parse", "HEAD")
+    for rel in changed:
+        target = cwd / rel
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text("x\n", encoding="utf-8")
+        _git(cwd, "add", rel)
+    _git(cwd, "commit", "-qm", "head")
+    return base
+
+
+def test_the_tooling_job_reads_the_matrix_and_does_not_carry_a_literal() -> None:
+    """A literal `os: [...]` here would silently undo the narrowing and still look correct."""
+    doc = yaml.safe_load(_CI.read_text(encoding="utf-8"))
+    matrix = doc["jobs"]["tooling"]["strategy"]["matrix"]
+    assert isinstance(matrix, str) and "tooling_matrix" in matrix, (
+        "the tooling job's matrix is no longer the `changes` output -- a literal list here restores "
+        "the full two-leg tier on every docs-only PR, with nothing to say so"
+    )
+
+
+@pytest.mark.parametrize("event", ["workflow_dispatch", "push", "schedule"])
+def test_every_non_pr_arm_emits_a_matrix(tmp_path: Path, event: str) -> None:
+    """An arm that exits without emitting KILLS the tooling job on fromJSON. It does not skip it."""
+    bash = require_bash(tmp_path)
+    outputs = _run_detector(bash, tmp_path, event)
+    assert "tooling_matrix" in outputs, (
+        f"the `{event}` arm exits without writing tooling_matrix. fromJSON on an unset output FAILS "
+        "the job -- it does not fall back to a full matrix"
+    )
+    assert json.loads(outputs["tooling_matrix"])["os"], (
+        f"the `{event}` arm emitted an empty os list"
+    )
+
+
+def test_a_docs_only_pr_gets_one_leg_and_a_code_pr_gets_both(tmp_path: Path) -> None:
+    """The narrowing itself, end to end, through the step's own git diff.
+
+    Both halves in one test on purpose: the property worth asserting is the DIFFERENCE. A docs-only
+    assertion that passed because the full matrix had also collapsed to one leg would be a green
+    proving nothing.
+    """
+    bash = require_bash(tmp_path)
+
+    docs = tmp_path / "docs_pr"
+    docs.mkdir()
+    base = _pr_repo(docs, ["docs/ARCHITECTURE.md"])
+    docs_out = _run_detector(bash, docs, "pull_request", base_sha=base)
+    assert docs_out["code"] == "false", "a docs-only PR should short-circuit; the fixture is wrong"
+    assert docs_out["tooling"] == "true", (
+        "THE FILTER MUST NOT NARROW. 22 manifest files read documents, so a docs PR still runs this "
+        "tier -- the change here narrows the MATRIX only"
+    )
+    docs_legs = json.loads(docs_out["tooling_matrix"])["os"]
+
+    code = tmp_path / "code_pr"
+    code.mkdir()
+    base = _pr_repo(code, ["messagefoundry/api/app.py"])
+    code_out = _run_detector(bash, code, "pull_request", base_sha=base)
+    assert code_out["code"] == "true"
+    code_legs = json.loads(code_out["tooling_matrix"])["os"]
+
+    assert docs_legs == ["ubuntu-latest"], (
+        f"docs-only PR should run one ubuntu leg, got {docs_legs}"
+    )
+    assert len(code_legs) > len(docs_legs), (
+        f"a code PR must run MORE legs than a docs-only one ({code_legs} vs {docs_legs}); equal "
+        "lists mean the narrowing is inert and this test would pass forever"
+    )
+    assert any("windows" in leg for leg in code_legs), (
+        "the windows leg is the only one that runs the 337 platform-gated tests, so a code PR that "
+        "loses it removes their only coverage"
+    )
+
+
+def test_a_fork_never_pays_for_the_windows_leg(tmp_path: Path) -> None:
+    """The rule the `matrix` and `ide_matrix` outputs already follow, asserted for this one too."""
+    bash = require_bash(tmp_path)
+    outputs = _run_detector(bash, tmp_path, "push", repo="someone/MessageFoundry")
+    legs = json.loads(outputs["tooling_matrix"])["os"]
+    assert legs == ["ubuntu-latest"], (
+        f"a fork should build this tier on ubuntu only, got {legs} -- the 2x-billed Windows leg "
+        "would be spending a contributor's own minutes"
     )
