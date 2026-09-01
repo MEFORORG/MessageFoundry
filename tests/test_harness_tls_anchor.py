@@ -34,6 +34,24 @@ def test_the_anchor_is_minted_once_and_reused() -> None:
     assert Path(key).stat().st_size > 0
 
 
+def test_the_context_is_cached_and_always_verifies() -> None:
+    """Everything this returns goes straight to ``httpx``'s ``verify=``, where a falsy value means
+    *verification off* -- so the one thing this function must never do is hand back something other
+    than a verifying context. It previously cached into ``_CONTEXT: ssl.SSLContext | None = None``,
+    which made the literal ``None`` a provable return value and put a high-severity
+    ``py/request-without-cert-validation`` finding on all four load-harness httpx clients.
+
+    This pins the runtime half (a real, verifying, reused context). The static half -- that ``None``
+    is not even expressible here -- is what the decorator-based cache buys, and only CodeQL sees it.
+    """
+    ctx = harness_ssl_context()
+    assert isinstance(ctx, ssl.SSLContext)
+    assert ctx.verify_mode is ssl.CERT_REQUIRED
+    assert ctx.check_hostname is True
+    # Reused, not minted per call: eleven poller call sites hit this on every tick.
+    assert harness_ssl_context() is ctx
+
+
 def test_the_context_completes_a_handshake_a_default_context_rejects() -> None:
     """The anchor is proved by an actual handshake, not by inspecting the context.
 

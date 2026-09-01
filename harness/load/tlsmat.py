@@ -23,6 +23,7 @@ covers loopback names alone.
 
 from __future__ import annotations
 
+import functools
 import os
 import ssl
 import tempfile
@@ -45,7 +46,6 @@ _ENV_KEY = "MEFOR_HARNESS_TLS_KEY_FILE"
 
 _LOCK = threading.Lock()
 _MATERIAL: tuple[str, str] | None = None
-_CONTEXT: ssl.SSLContext | None = None
 
 
 def harness_tls_material() -> tuple[str, str]:
@@ -81,16 +81,28 @@ def harness_tls_material() -> tuple[str, str]:
         return _MATERIAL
 
 
+@functools.cache
 def harness_ssl_context() -> ssl.SSLContext:
     """A client context whose ONLY trust anchor is :func:`harness_tls_material`'s certificate.
 
     Pinning rather than disabling verification: the harness minted this certificate itself, so
     verifying against it costs nothing and keeps the ad-hoc ``httpx`` probes and the shared
     ``EngineClient`` (which offers pinning and no way to switch verification off) on one posture.
+
+    **Cached by decorator, never by a nullable module global.** The obvious lazy singleton --
+    ``_CONTEXT: ssl.SSLContext | None = None`` plus an ``if _CONTEXT is None`` guard -- makes the
+    literal ``None`` a value this function can return as far as any caller or any analyser can prove.
+    Every call site feeds the result straight to ``httpx``'s ``verify=``, where a falsy value means
+    *verification off*, so that shape puts a "may run without certificate validation" finding on all
+    four httpx clients in the load harness (CodeQL ``py/request-without-cert-validation``, high). The
+    runtime never actually returned ``None``; the point is that nothing made it provable, and an
+    unprovable claim about TLS verification is the kind that rots silently. Returning
+    ``ssl.create_default_context(...)`` directly mirrors ``apiclient.client._build_verify_context``,
+    which has the same job and has never carried a nullable cache.
+
+    Thread-safety is unchanged in the way that matters: the single ANCHOR is still serialised by
+    :func:`harness_tls_material`'s lock. A race here can build two contexts over that one anchor,
+    which are interchangeable -- nothing compares context identity.
     """
-    global _CONTEXT
     cert_path, _ = harness_tls_material()
-    with _LOCK:
-        if _CONTEXT is None:
-            _CONTEXT = ssl.create_default_context(cafile=cert_path)
-        return _CONTEXT
+    return ssl.create_default_context(cafile=cert_path)
