@@ -356,14 +356,23 @@ def main(argv: list[str] | None = None) -> int:
     # nowhere. Neither carries record content, so neither is this item's disclosure defect; they are
     # recorded at the guard that strengthens the contract rather than left for a reader to discover
     # that the paragraph above describes an invariant the function does not yet hold.
+    # THE WITHHOLDING IS UNCONDITIONAL, AND ITS REASON IS DELIBERATELY NOT A CLAIM ABOUT THE
+    # DESTINATION. An earlier wording asserted flatly that this stream reaches a public log.
+    # Measured 2026-09-01: NO workflow invokes this tool -- .github/ does not mention it, and the
+    # only tracked references are two sibling scripts' prose, its own tests and the tooling
+    # manifest. That sentence was false while the behaviour it justified was correct, which is the
+    # SDS-3.7 shape: a reader who checks the premise finds it false, and the apparent remedy is to
+    # stop withholding. The durable reason is that this is a CLI and its stderr goes wherever the
+    # caller sends it -- a redirect, a paste, or a future workflow, which the sibling
+    # anchor_report.py already has in .github/workflows/asvs-anchor-report.yml.
     try:
         cells = load_scorecard(args.scorecard)
     except Exception as exc:
         sys.stderr.write(
             f"REFUSING: the scorecard at {args.scorecard} would not load "
             f"({type(exc).__name__}). The reader's own message is WITHHELD: it CAN name the graded "
-            "row it rejected and CAN list the grading vocabulary in full, and this stream reaches a "
-            "public log. Read the detail where the record lives, with the verifier there.\n"
+            "row it rejected and CAN list the grading vocabulary in full, and nothing here can "
+            "know where this stream ends up. Read the detail where the record lives, with the verifier there.\n"
         )
         return 3
 
