@@ -18,7 +18,7 @@ claims move with it.
 |---|---|
 | `ci.yml` | Lint (`ruff check` + `ruff format --check`), types (`mypy --strict`, plus a `--platform win32` pass on Linux so Windows type-branches are checked), and the `pytest` suite across **ubuntu-latest**, **windows-2022**, and **windows-2025** (Python 3.14). Also builds the VS Code extension (`ide/`). A `CI gate` job rolls the legs up. |
 | `security.yml` | Static and supply-chain security: `bandit` (Python SAST), `semgrep`, `pip-audit` and `npm-audit` against the hash-locked tree, `gitleaks` (secret scan), `forbidden-content` (customer/PHI leak guard), a crypto-inventory check, an SBOM build, and a `trivy` scan. A **daily cron** re-runs the dependency audits so a CVE filed against an unchanged pin is caught within ~24h. A separate `released-line-audit` job runs on the same cron and audits the **latest release tag's** pinned core runtime, which the daily audits do not cover — they read the checked-out tree, so between a fix landing on `main` and a release carrying it the two answers differ. Hard-failing but **not** a required check (schedule/dispatch only), the same posture as `dast.yml`. |
-| `codeql.yml` | GitHub CodeQL analysis (python / javascript-typescript). Both matrix contexts are **required checks** as of 2026-08-31. |
+| `codeql.yml` | GitHub CodeQL analysis (python / javascript-typescript). Advisory — **not** required checks. |
 | `review-gate.yml` | Blocks a merge until a reviewer marks the PR read with the `reviewed` label. A **required check**, and — with approvals pinned at 0 — the repository's only review control. It removes the label on `synchronize`, so new commits are unread again; that is the one thing it writes, and it only ever writes toward blocked. |
 | `scorecard.yml` | OpenSSF Scorecard analysis. |
 | `cla.yml` | CLA Assistant — records the Contributor License Agreement signature on each PR. |
@@ -60,17 +60,13 @@ is advisory by *placement*, being schedule/dispatch-only so it can never report 
 goes red on a finding (the `dast.yml` posture). `tests/test_security_posture.py` pins which of the
 three buckets each job is in.
 
-CodeQL is **required on the server and not listed above**, and that gap is deliberate. Branch
-protection enforces `CodeQL (python)` and `CodeQL (javascript-typescript)` (read from the live API,
-2026-08-31) while `.github/required-contexts.txt` still records codeql.yml as deliberately *not*
-required, on a rationale nobody has retracted: the SARIF upload needs `security-events: write`, which
-fork-PR tokens lack, so a fork PR cannot make these go green. Either the rationale is stale and the
-contexts should be recorded, or it holds and they should come off protection — **both are decisions,
-and neither has been made.** They block a merge today; see that file's codeql.yml block. Scorecard
-*is* still advisory, for
-the same token reason and additionally because it **does not run on PRs at all** (`scorecard.yml` has no
-`pull_request` trigger — it runs on push-to-main, a schedule, and branch-protection changes). Nightly /
-path-gated legs (service-smoke, load, SQL/Postgres store) are deliberately **not** required.
+CodeQL is **advisory** (not in the required set) — its SARIF upload needs `security-events: write`,
+which fork-PR tokens do not have, so requiring it would block PRs from forks. Both matrix contexts
+were seen on branch protection earlier on 2026-08-31 and were off again by 20:57 CDT that day; the
+rationale is unchanged, and `.github/required-contexts.txt` records it. Scorecard is advisory for
+the same reason and additionally **does not run on PRs at all** (`scorecard.yml` has no `pull_request`
+trigger — it runs on push-to-main, a schedule, and branch-protection changes). Nightly / path-gated
+legs (service-smoke, load, SQL/Postgres store) are deliberately **not** required.
 
 `a reviewer has read this` (`review-gate.yml`) is the required check that is **not a test of the code**,
 and the one with nothing behind it. `required_approving_review_count` is 0 and stays 0 — every session

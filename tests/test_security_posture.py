@@ -80,21 +80,6 @@ _ADVISORY_BY_PLACEMENT_SECURITY_JOBS = frozenset({"released-line-audit"})
 # Anything else on a required job is a way for the context to silently not report.
 _JOB_IF_ALLOWLIST = {
     ("ci.yml", "ci-gate"): "always()",  # the roll-up must run even when a gated leg failed
-    # REVIEWED 2026-08-31, when the two CodeQL matrix contexts were recorded as required. The guard is
-    # an equality on `github.repository`, which names the repository the workflow RUNS IN -- for a
-    # `pull_request` event that is always the BASE repo, a pull request opened from a fork included.
-    # Every pull request the required set applies to targets MEFORORG/MessageFoundry, so the
-    # expression cannot be false on one and the job cannot skip.
-    #
-    # What it does skip is a fork's own clone or the retired private archive, where the SARIF upload
-    # would need paid Advanced Security. Nothing requires the context there.
-    #
-    # NARROWING IT IS THE HAZARD, not the guard itself. A fork-sensitive term -- anything reading
-    # `github.event.pull_request.head.repo` -- would read as a fix for the fork-token cost that
-    # .github/required-contexts.txt records, and would instead skip the job on every fork pull request,
-    # leaving a required context that never reports. tests/test_merge_gate_controls.py plants that
-    # exact shape and watches this rule name it.
-    ("codeql.yml", "analyze"): "github.repository == 'MEFORORG/MessageFoundry'",
 }
 
 # Idioms that discard a non-zero exit, i.e. neuter the step without touching continue-on-error.
@@ -281,13 +266,10 @@ def test_required_jobs_carry_no_continue_on_error() -> None:
     # 14/12 since 2026-08-31 (BACKLOG #1404), when `a reviewer has read this` was recorded. One
     # collapse: ci.yml's `test` matrix reports 3 contexts from 1 job, so 14 - 2 = 12.
     #
-    # THIS MODULE READS THE CANONICAL FILE, NOT THE SERVER, AND THEY DIFFER ON PURPOSE RIGHT NOW. The
-    # server also requires `CodeQL (python)` and `CodeQL (javascript-typescript)`, which that file
-    # does not list while an owner decision about them is open. So codeql.yml:analyze is not examined
-    # here — and the moment those lines are added this becomes 16/13, because that job is a second
-    # matrix collapse reporting two contexts from one job. The allowlist entry for its job-level `if:`
-    # is already in place for that: it is inert while the job is unexamined, and it is the reviewed
-    # REASONING rather than the switch.
+    # THIS MODULE READS THE CANONICAL FILE, NOT THE SERVER, so a context that reaches protection and
+    # not the file is not examined here. That file's own header states the ordering rule — protection
+    # first, the file in the same pull request — and this pin is only as live as that discipline. Read
+    # at 2026-08-31 20:57 CDT the two were SET-EQUAL, so nothing is currently unexamined.
     #
     # Recording a context drags its job under every rule in this module for the first time, exactly as
     # backlog-hygiene did on 2026-07-29 — and it paid immediately here: the review-gate job's

@@ -15,9 +15,13 @@
 # "nothing pending" would have reported green without ever waiting for a test leg, because with one
 # required context there was nothing to wait for. Count what SHOULD gate the merge, not what does.
 #
-# The set then moved four more times the same day (1 -> 13 -> 12 -> 15 -> 12). This snapshot is the
-# state it settled on, read from the API and unchanged for six minutes before being written down. Two
-# non-context settings moved with it and are recorded because they change merge semantics:
+# The set then moved four more times the same day (1 -> 13 -> 12 -> 15 -> 12), and it moved again on
+# 2026-08-31: `a reviewer has read this` was armed, and the two CodeQL matrix contexts were seen
+# required earlier that day and are no longer. THE LIST BELOW IS SET-EQUAL TO THE SERVER -- fourteen
+# contexts, nothing extra on either side -- read from the API at 2026-08-31 20:57 CDT. A set-equal
+# read is the only one worth writing down: a count alone cannot tell a matching set from two
+# offsetting errors. Two non-context settings also moved and are recorded because they change merge
+# semantics:
 #
 #   strict = TRUE  -- a PR must be up to date with `main` before it can merge. This closes the
 #                     stale-green hole: previously a PR validated against an older base could merge
@@ -28,14 +32,26 @@
 #                     escape hatch in scripts/hooks/push_guard.py (for when a permanently red required
 #                     check blocks every merge), and READ BACK AS TRUE on 2026-08-31.
 #
-#                     THREE PLACES STILL CARRY THE OFF VALUE AND ARE NOW STALE: push_guard.py's module
-#                     docstring, its user-facing warning ("Do NOT expect the server to stop it:
-#                     enforce_admins is OFF"), and tests/test_push_guard.py's header. They are left
-#                     alone here rather than swept in, because that guard's warning text is a security
+#                     THE HOOK ITSELF IS ALREADY CORRECTED. scripts/hooks/push_guard.py's module
+#                     docstring and its user-facing warning were rewritten in this same change, and
+#                     the string that told a pusher "enforce_admins is OFF" no longer exists anywhere
+#                     in the tree.
+#
+#                     THREE OTHER PLACES STILL CARRY THE OFF VALUE AND ARE STALE:
+#                       * tests/test_push_guard.py's header -- "OFF again as of 2026-07-29".
+#                       * scripts/coord/install-git-hooks.ps1's push-guard comment -- "enforce_admins
+#                         is false, so the owner bypasses all of it".
+#                       * .github/workflows/branch-leak-scan.yml's header, which lists re-enabling
+#                         enforce_admins as the outstanding half of BACKLOG #1034 and so reads as work
+#                         to do rather than work already done. The point it supports survives: the
+#                         setting governs PROTECTED BRANCHES, so it still does nothing about a leak
+#                         riding an ordinary feature branch.
+#                     They are left alone here rather than swept in, because each sits in a security
 #                     control's own prose and deserves its own review -- and because they err toward
 #                     over-warning, telling a pusher the server will not stop them when it now will.
 #                     Naming them is not the fix; it is the pointer, so the next reader does not have
-#                     to re-measure to find out which copy is true.
+#                     to re-measure to find out which copy is true. `git grep -n enforce_admins` is
+#                     the whole census.
 #
 # This file is not the enforcement -- the server is. It is the CHECKED-IN CLAIM that every in-repo
 # statement must agree with, which is what `tests/test_required_contexts.py` asserts. When branch
@@ -176,56 +192,30 @@ a PR that implements BACKLOG #N must update BACKLOG.md
 # re-runs the job and clears it. That distinction is the one worth keeping: a reader who assumes a
 # stranded check needs a rebase will rebase, which on `synchronize` STRIPS the label and moves the pull
 # request further from green.
+#
+# THAT SENTENCE IS ONLY TRUE WHILE `labeled` IS IN THE WORKFLOW'S `types:` LIST, so it is held by a
+# test rather than by this paragraph:
+#
+#   tests/test_merge_gate_controls.py::test_the_review_gate_reruns_when_a_reviewer_adds_the_label
+#
+# Deleting that action reddens nothing on its own and leaves a gate no reviewer action can clear: the
+# label fires no run, and the only trigger that still re-runs the job is `synchronize`, whose first
+# step REMOVES the label. Measured 2026-08-31 -- before the test above existed, dropping `labeled`
+# passed 65 tests.
 a reviewer has read this
 
-# --- codeql.yml: TWO CONTEXTS ARE REQUIRED ON THE SERVER AND DELIBERATELY NOT LISTED BELOW ---------
-#
-#   CodeQL (python)
-#   CodeQL (javascript-typescript)
-#
-# THEY BLOCK A MERGE TODAY. Read from the live API 2026-08-31, branch protection enforces SIXTEEN
-# contexts; the list in this file names FOURTEEN. That gap is these two, it is deliberate, and it is
-# the ONE place this file knowingly does not mirror the server -- recorded here in full so no reader
-# can reach the usual conclusion that a context this file omits is not blocking.
-#
-# WHY THEY ARE NOT SIMPLY TRANSCRIBED. This file's own "DELIBERATELY NOT REQUIRED" block lists
-# codeql.yml with a concrete rationale and the instruction "do not add without the owner's decision".
-# The server now contradicts that entry. Only two readings are available and BOTH are decisions:
-#
-#   * the fork-PR rationale is STALE -- then it should be deleted and these two lines added; or
-#   * the rationale still holds -- then the two contexts should come OFF branch protection.
-#
-# The rationale, unretracted: the SARIF upload needs `security-events: write`, which a fork-PR token
-# does not carry, so a fork pull request cannot make these go green. Nothing observed has addressed
-# that. Whoever armed them left no rationale anywhere, so transcribing the server here would silently
-# resolve an owner-gated question by writing down whichever answer the server happens to hold --
-# which is exactly the move this block's instruction forbids.
-#
-# STATUS: PUT TO THE OWNER 2026-08-31 AND UNANSWERED. Until it is answered this file states the
-# measurement and leaves the list short. That is the smaller of the two available errors: an omission
-# documented this loudly cannot mislead, whereas transcribing would launder a decision nobody made.
-#
-# WHOEVER ANSWERS IT: the change is three lines and two files, not a migration. If the contexts stay,
-# add them below, delete codeql.yml from the DELIBERATELY NOT REQUIRED block, move the count pinned in
-# tests/test_required_contexts.py from 14 to 16, and register a negative control for each in
-# tests/negative_controls.toml -- the controls are already written
-# (tests/test_merge_gate_controls.py, the codeql section) and only need registering. If they come off
-# protection instead, nothing in this file changes and this block is deleted.
-
 # DELIBERATELY NOT REQUIRED (do not add without the owner's decision; each has a recorded reason):
-#   scorecard.yml              -- its SARIF upload needs `security-events: write`, which fork-PR tokens
-#                                 lack, so requiring it would block every fork PR. It additionally has
-#                                 no `pull_request` trigger at all (`push`, `schedule`,
-#                                 `branch_protection_rule`, `workflow_dispatch`), so it can never
-#                                 report on one -- the required-but-absent trap, on top of the token
-#                                 problem. Either reason alone is enough.
-#   codeql.yml                 -- SAME FORK-TOKEN REASON, AND THE SERVER NOW CONTRADICTS IT: both of
-#                                 its matrix contexts ARE required on branch protection as of
-#                                 2026-08-31. The entry stays because retracting it is the owner's
-#                                 decision rather than a transcription; the measurement and the open
-#                                 question are in the codeql.yml block above. DO NOT act on this line
-#                                 alone in either direction -- taking the two contexts OFF protection
-#                                 on the strength of it is as much a decision as leaving them on.
+#   codeql.yml, scorecard.yml  -- their SARIF upload needs `security-events: write`, which fork-PR
+#                                 tokens lack, so requiring them would block every fork PR.
+#                                 `CodeQL (python)` and `CodeQL (javascript-typescript)` were read as
+#                                 required earlier on 2026-08-31 and are NOT required at 20:57 CDT
+#                                 that day. This entry is the reason that reading is the settled one,
+#                                 so do not transcribe a future sighting over it -- reinstating them
+#                                 is an owner decision that has to retract the fork-PR cost first.
+#                                 scorecard.yml additionally has no `pull_request` trigger at all
+#                                 (`push`, `schedule`, `branch_protection_rule`, `workflow_dispatch`),
+#                                 so it can never report on one -- the required-but-absent trap, on
+#                                 top of the token problem.
 #   zizmor.yml                 -- paths-filtered, so it does not report on most PRs.
 #   quality-advisory.yml       -- advisory BY DESIGN and must never be promoted; the invariant is
 #                                 pinned by tests/test_quality_advisory_invariants.py.

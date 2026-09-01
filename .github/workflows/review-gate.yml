@@ -46,6 +46,14 @@ name: review gate
 
 on:
   pull_request:
+    # THE LIST IS LOAD-BEARING AND FAILS SILENTLY. `labeled` is what lets a reviewer clear the check:
+    # without it the label emits no run, the red check-run stands, and the only trigger left that
+    # re-runs this job is `synchronize` -- whose first step REMOVES the label. The pull request then
+    # cannot be merged by any action at all, and `strict = true` means it cannot even be brought up to
+    # date past the block. `unlabeled` is the opposite half: without it, withdrawing the label leaves a
+    # GREEN context behind. Both are pinned by
+    # tests/test_merge_gate_controls.py::test_the_review_gate_reruns_when_a_reviewer_adds_the_label,
+    # because dropping `labeled` reddened nothing before that test existed.
     types: [opened, reopened, ready_for_review, synchronize, labeled, unlabeled]
   merge_group:
 
