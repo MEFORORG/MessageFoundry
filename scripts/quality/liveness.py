@@ -198,7 +198,13 @@ def verify(needs: dict[str, Any]) -> tuple[list[dict[str, str]], list[dict[str, 
             )
             continue
 
-        raw = (job.get("outputs") or {}).get("receipt", "")
+        # `outputs` is normally a mapping, but this reads a JSON blob GitHub interpolates, so a
+        # malformed or truncated payload can hand us a string. Before #1410 the _DID_NOT_RUN check
+        # ran FIRST and short-circuited such a job; moving this read above it put an unguarded
+        # .get() on that path, where a string `outputs` raised AttributeError and took the whole
+        # gate down with a stack trace instead of a verdict. isinstance keeps the read total.
+        outputs = job.get("outputs")
+        raw = outputs.get("receipt", "") if isinstance(outputs, dict) else ""
 
         result = str(job.get("result", "")).lower()
         if result in _DID_NOT_RUN and not str(raw).strip():
@@ -222,8 +228,23 @@ def verify(needs: dict[str, Any]) -> tuple[list[dict[str, str]], list[dict[str, 
         #
         # NOT SOLVED BY DROPPING "cancelled" FROM _DID_NOT_RUN. This job carries `if: always()`,
         # which GitHub evaluates true under cancellation, so on a genuine run-level cancel it would
-        # still run and would then go red for something nobody caused. Keying on the receipt cannot
-        # fire in that case, because a job that never started cannot have written one.
+        # still run and would then go red for something nobody caused. Keying on the receipt is
+        # strictly better, because a job that never STARTED cannot have written one.
+        #
+        # WHAT THE RECEIPT SEPARATES, STATED EXACTLY -- an earlier draft of this comment overstated
+        # it, and the overstatement is the same defect class the item is about. The receipt
+        # distinguishes "the job never started" from "the job ran". It does NOT distinguish a
+        # timeout kill from a mid-flight cancel. A run cancelled while this job is inside pytest
+        # DOES reach the `always()` record step, DOES leave a receipt, and WILL now go red. That is
+        # reachable in this repo: ci.yml sets `concurrency: cancel-in-progress`, so a fast second
+        # push cancels the first run mid-flight. The cost is a spurious red on an ADVISORY gate,
+        # which is the right side to err on -- a false red is visible and gets investigated, while
+        # the false green this fix removes hid a dead gate for eight days. Recorded so the next
+        # reader who sees that red knows it is a known edge and not a regression.
+        #
+        # RESIDUAL, also not covered: `cancelled` with NO receipt is still excused. The fix rests
+        # on the `always()` step winning the race against teardown. It won on all four measured
+        # kills, but a kill that loses that race is indistinguishable from a job that never ran.
         if not str(raw).strip():
             violations.append(
                 _fail(

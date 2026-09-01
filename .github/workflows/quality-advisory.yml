@@ -278,8 +278,12 @@ jobs:
     # 2026-07-26 publish snapshot until 2026-09-01, and it was never edited. The SUITE grew into
     # it: the job took 9.7 minutes on 2026-07-26, 14.8 on 2026-08-06, and 19m36s on its LAST GREEN
     # run (job 97249962177, 2026-08-23 15:18 CDT) -- 24 seconds of margin. Every PR run after that
-    # was killed at the cap, over 700 of them across 8 days, with `The operation was canceled` and
-    # no diff-cover verdict. That is the failure this file's `liveness` job exists to catch, and it
+    # was killed at the cap, with `The operation was canceled` and no diff-cover verdict. 714
+    # pull_request runs of this workflow were created between that green job and the fix; in a
+    # 30-run sample, 28 of 28 COMPLETED coverage jobs were cancelled and none succeeded. (An
+    # earlier draft said "over 700 of them across 8 days" as though every run were a confirmed
+    # kill. 714 is the RUN population; the all-kills half is a sample and is now written as one.)
+    # That is the failure this file's `liveness` job exists to catch, and it
     # could not see it (BACKLOG #1410, fixed in scripts/quality/liveness.py in the same change).
     #
     # WHERE THE TIME WENT, measured across four jobs (99554977847, 99578445996, 99580323074,
@@ -289,11 +293,30 @@ jobs:
     # job buys nothing; the measurement is the whole cost, and the fix is the `-m 'not tooling'`
     # selection on the pytest line below, not a bigger box.
     #
-    # RE-DERIVE THIS FROM THE FIRST GREEN RUN. The number below is 30 against an ESTIMATED 18 to 20
-    # minutes for the narrowed serial run -- about 1.5x, matching the sizing convention ci.yml uses.
-    # It is an estimate because no coverage run has ever finished: the honest measured floor is
-    # 21m35s for the UNNARROWED suite, scaled from the 91 percent that ran. Once a green run exists,
-    # read its actual duration and re-derive.
+    # THE CAP IS NOW SIZED ON A REAL GREEN RUN, and it replaces every estimate that stood here.
+    # Job 99720329464 on PR 724 (2026-09-01 02:52:25Z to 03:06:58Z) finished SUCCESSFULLY in
+    # 14m33s: `11510 passed, 839 skipped, 2731 deselected in 823.75s (0:13:43)`, and step 8 emitted
+    # a diff-cover verdict -- the first this gate had produced in eight days. Against 30 minutes
+    # that is 15m27s of headroom, about 2.1x.
+    #
+    # 2.1x IS DELIBERATE, NOT LEFTOVER SLACK. The convention elsewhere is ~1.5x, which here would
+    # be 22 minutes. The defect this comment documents WAS a cap with thin margin that the suite
+    # silently grew into, so the margin is the mitigation and shrinking it to convention would
+    # rebuild the trap. Re-derive if the measured run approaches 20 minutes, not before.
+    #
+    # THREE ESTIMATES THAT STOOD HERE WERE WRONG, and they are named rather than deleted because
+    # this block's whole authority is that its numbers were measured.
+    #   "no coverage run has ever finished" -- FALSE, and it contradicted this same comment two
+    #     paragraphs up. Job 97249962177, named above as the last green run, reached [100%] with
+    #     `13046 passed, 1380 skipped in 1130.96s (0:18:50)`. A completed run existed all along.
+    #   "the honest measured floor is 21m35s for the UNNARROWED suite" -- WRONG, and wrong in the
+    #     UNSAFE direction. 21m35s is 19m40s/0.91, which assumes the last 9 percent costs the same
+    #     per test as the first 91. That run's own curve refutes it: in job 97249962177, 91 percent
+    #     was reached at 602.9s of a 1110.3s span, so the final 9 percent took 507.3s -- 45 percent
+    #     of the run. Carried onto the grown suite the unnarrowed figure is roughly 33 minutes,
+    #     ABOVE this cap. The narrowing is what brings it to 14m33s; the bigger box alone would not
+    #     have been enough, which is the opposite of what the 21m35s figure implied.
+    #   "ESTIMATED 18 to 20 minutes for the narrowed serial run" -- superseded by the 14m33s above.
     #
     # NEXT LEVER IF IT DRIFTS AGAIN: pytest-xdist. ci.yml's engine leg runs `-n 4 --dist loadfile`
     # and this job does not. Adding it here needs `[tool.coverage.run] parallel = true` plus a
@@ -374,9 +397,19 @@ jobs:
         # instrument, the _ENGINE_IMPORT regex in tests/test_tooling_partition.py, against a
         # positive control of 508 files under tests/ that the same pattern DOES match -- so the
         # zero is a real absence and not a broken pattern. A test that never imports the measured
-        # package cannot contribute a covered line, so this drops wall clock that was never buying
-        # any coverage. The tier is the run's hard tail: the suite reaches 89 percent in 15.2
-        # minutes, then the next two points cost 3.4 minutes.
+        # package cannot contribute a covered line through its OWN test bodies. The tier is the
+        # run's hard tail: the suite reaches 89 percent at 15.17 minutes, then the next two points
+        # cost 2.83 minutes (job 99712135527, progress lines at 910.4s and 1080.4s). An earlier
+        # draft said 3.4 minutes for that gap; 2.83 is what the run it cites actually shows.
+        #
+        # ONE QUALIFICATION, because "costs this gate NOTHING" is stronger than the grep supports.
+        # The zero counts DIRECT imports. Reach is not the same thing: tests/test_dast_claims.py is
+        # in the manifest and imports scripts.security.dast_auth_sweep, which pulls messagefoundry
+        # modules transitively, and every import-time line of those counts as covered under --cov.
+        # So deselecting the tier can drop some IMPORT-TIME coverage even though no tooling test
+        # exercises the package directly. The measured effect is small and the trade is still
+        # plainly worth it -- 14m33s against a job that produced no number at all -- but the honest
+        # claim is "costs this gate almost nothing", not "nothing".
         #
         # THAT CONTROL WAS FIRST WRITTEN AS 510, and the correction is recorded rather than quietly
         # applied. 510 is the same pattern with the trailing word boundary dropped, which also
