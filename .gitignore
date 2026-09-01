@@ -271,8 +271,13 @@ scripts/security/scan-tokens.local.txt
 # pinned exception to save moving three exploratory documents. Not worth it. The tree stays.
 #
 # docs/testing is maintainer QA planning -- draft plans awaiting owner approval, and a matrix and
-# plan scoped to ONE specific maintainer box (WIN2025-TEST-PLAN.md names the host and its identity).
-# An operator reads none of it.
+# plan written against ONE specific maintainer build box. An operator reads none of it.
+#
+# An earlier draft of this line said WIN2025-TEST-PLAN.md "names the host and its identity". It does
+# NOT: the file uses <box-hostname>, <box-ip>, <server>, <u> and <p> placeholders throughout. The
+# removal is right on the D1 subject test -- maintainer QA planning for one build box is neither
+# operator nor security-reviewer material -- and it never needed a disclosure claim to justify it.
+# Overstating the reason is how a correct decision acquires a wrong rationale that outlives it.
 #
 # ONE EXCEPTION, and it is why this is a contents-glob rather than a directory rule.
 # docs/testing/VERIFY.md is OPERATOR material and stays tracked: it documents `messagefoundry verify`,

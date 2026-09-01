@@ -76,7 +76,7 @@ WITHHELD = (
     "docs/reviews/",
     "docs/marketing/",
     "docs/releases/",
-    # --- TEMPORARY. Remove both entries below once PR 713 lands. ------------------------------
+    # --- TEMPORARY. Remove both entries below once docs/BACKLOG.md is free. --------------------
     #
     # ADR 0160 D1 untracked 46 documents on 2026-08-31 and, in the same pass, exempted every path
     # they were linked from. That was the wrong call: it turned 59 reader-visible 404s green
@@ -86,12 +86,22 @@ WITHHELD = (
     # document's plain name so the citation survives as provenance (the ADR 0160 Phase 1
     # precedent). The exemptions those 49 rested on are gone with them.
     #
-    # These two remain because 10 links in docs/BACKLOG.md cannot be repaired right now: open
-    # PR 713 holds that file mid-rebase, and editing it would break that work. They are scoped to
+    # These two remain because 10 links in docs/BACKLOG.md cannot be repaired right now: that file
+    # is held by open pull requests, and editing it would break their rebase. They are scoped to
     # exactly the targets those 10 name -- ONE file and ONE subdirectory, not the parent trees --
-    # so nothing else goes unchecked while they stand. Repair the 10 links in docs/BACKLOG.md when
-    # PR 713 has merged, then delete these two entries and the matching cases in
-    # tests/test_link_resolution.py.
+    # so nothing else goes unchecked while they stand.
+    #
+    # THE REMOVAL CONDITION IS "NO OPEN PR TOUCHES docs/BACKLOG.md", NOT ANY PARTICULAR PR NUMBER,
+    # and that wording is a repair of this comment rather than its first draft. It originally said
+    # "once PR 713 lands". 713 merged at 2026-08-31T23:31Z and is already an ancestor of this
+    # branch, so the condition had fired, nothing had noticed, and the entries stood on a premise
+    # that was no longer true -- the SDS-3.7 shape the paragraph above this one warns about, in the
+    # comment that warns about it. A number goes stale silently; a condition does not.
+    #
+    # Holders when this was written, and they will change: PR 715 and PR 717, each touching only
+    # docs/BACKLOG.md. Check with `gh pr list --state open --json number,files` and look for the
+    # path rather than trusting this list. When nothing holds it, repair those 10 links, then
+    # delete these two entries and the matching cases in tests/test_link_resolution.py.
     #
     # Both paths stay gitignored either way; this tuple is about what the LINK GATE reads, and the
     # .gitignore rules are pinned separately by tests/test_private_paths_stay_ignored.py.
