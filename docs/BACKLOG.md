@@ -19111,7 +19111,7 @@ enough to warrant a documented manual recovery, is exactly what is missing.
 
 ## 1419. two records on main disagree about whether CI runs the connscale sweep, and the test docstring is the wrong one
 
-> 🔢 **Filed 2026-09-01 - not started.** `harness/load/profiles/connscale-smoke.toml` says *"No workflow runs it"* (line 26; the measurement behind it is at lines 6-12, dated 2026-08-31). `tests/test_connscale_smoke.py:45` says the same shipped profile is *"run via the ``--connscale`` CLI in CI"*. **Both sentences are on `origin/main` and they contradict each other. The toml is right; the docstring is wrong.** A reader who opens the test file to decide whether the N=50/100 regime is regression-covered gets the wrong answer, and the test file is the natural place to look. **That docstring carries a SECOND false clause three lines above, so the fix is two.** Line 42 reads *"The Postgres CI leg (pool_size forced to 1-2)"*. MEASURED: `ci.yml:2092` sets `MEFOR_STORE_POOL_SIZE: "4"`, and 1-2 appears nowhere in that job. An earlier draft of this row said "one clause" and was wrong; the miss is recorded because a fixer who trusts the count stops early. Wiring a real sweep leg up is a different question and is already owned -- see PERF-36 below.
+> 🔢 **Filed 2026-09-01 - not started.** `harness/load/profiles/connscale-smoke.toml` says *"No workflow runs it"* (line 26; the measurement behind it is at lines 6-12, dated 2026-08-31). `tests/test_connscale_smoke.py:45` says the same shipped profile is *"run via the ``--connscale`` CLI in CI"*. **Both sentences are on `origin/main` and they contradict each other. The toml is right; the docstring is wrong.** A reader who opens the test file to decide whether the N=50/100 regime is regression-covered gets the wrong answer, and the test file is the natural place to look. **That docstring carries a SECOND false clause three lines above, so the fix is two.** Line 42 reads *"The Postgres CI leg (pool_size forced to 1-2)"*. MEASURED: `ci.yml:2092` sets `MEFOR_STORE_POOL_SIZE: "4"`, and the job never SETS 1-2. It does NAME it, one line above at `ci.yml:2086`, in the comment that chose the value: *"default pool (40) would mask the wall. 4 (not 1-2) is deliberate"*. An earlier revision of this line said 1-2 "appears nowhere in that job", which is false and threw away the best evidence there is -- somebody considered 1-2 for this leg, rejected it, and wrote down why. The doc line is wrong about the VALUE, not about the leg being tuned. An earlier draft of this row said "one clause" and was wrong; the miss is recorded because a fixer who trusts the count stops early. Wiring a real sweep leg up is a different question and is already owned -- see PERF-36 below.
 > Verdict: build
 > Closing-act: code
 
@@ -19153,10 +19153,10 @@ enough to warrant a documented manual recovery, is exactly what is missing.
 git grep -n -e '--connscale' origin/main -- .github/                    # expect exit 1, no output
 git grep -n -e 'connscale'   origin/main -- .github/                    # positive control: exit 0, 10 lines, all ci.yml
 git grep -n -e 'connscale'   origin/main -- tests/tooling_manifest.txt  # expect exit 1: the module is NOT partitioned out
-git grep -c -e 'tests/'      origin/main -- tests/tooling_manifest.txt  # positive control for the line above: exit 0, 135
+git grep -c -e 'tests/'      origin/main -- tests/tooling_manifest.txt  # positive control for the line above: exit 0, 138 at 2e949398b
 ```
 
-**Related:** [#1420](#1420-the-connscale-final-sample-is-taken-after-stop-and-drain-while-three-sites-call-it-in-hold) is the sibling finding from the same pull request. [#1211](#1211-empty_claims_per_msg-is-not-contention-immune-the-ratio-form-excursions-past-its-own-slo-band-on-a-hosted-runner) is the single home for the empty-claims harvest -- read it there.
+**Related:** [#1420](#1420-the-connscale-final-sample-is-taken-after-stop-and-drain-while-its-docstrings-call-it-in-hold) is the sibling finding from the same pull request. [#1211](#1211-empty_claims_per_msg-is-not-contention-immune-the-ratio-form-excursions-past-its-own-slo-band-on-a-hosted-runner) is the single home for the empty-claims harvest -- read it there.
 
 ## 1420. the connscale final sample is taken after stop and drain while its docstrings call it in-hold
 
