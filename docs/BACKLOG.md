@@ -18606,15 +18606,34 @@ human-approval requirement would wedge every pull request. **That makes this one
 review requirement. There is no second line behind it.** That reasoning is unchanged and is why the
 rest of this item matters.
 
-**THE REMAINING DEFECT.** `.github/required-contexts.txt` is not the enforcement. It is the
-**checked-in claim** that every in-repo statement must agree with, and its own header says a wrong
-answer here "mis-ranks which gates a change can safely touch". It now disagrees with the server three
-ways.
+**THE REQUIRED SET MOVED FOUR TIMES ON 2026-08-31, AND THAT IS THE REAL FINDING.** This item has now
+been overtaken three times while being written and reviewed. Every version stated a live value in the
+present tense, and every one went stale within hours:
 
-| The file says | The server says | Why it is not just a missing line |
-|---|---|---|
-| 13 contexts, no `a reviewer has read this` | 16 contexts, including it | A reader asking "is review enforced?" gets NO from the file and YES from the server |
-| `codeql.yml` is DELIBERATELY NOT REQUIRED, because a fork-PR token lacks `security-events: write` and requiring it "would block every fork PR" | `CodeQL (javascript-typescript)` and `CodeQL (python)` are both required, read 2026-08-31 | The file asserts a **false negative** and names a concrete harm. Either the harm is real and two contexts should come off, or the reasoning is stale. Both are decisions, and neither has been made |
+| When | contexts | `strict` | `enforce_admins` | What moved |
+|---|---|---|---|---|
+| 2026-08-30, PR #701's captured fixture | 15 | false | off | the baseline that PR still proposes to write down |
+| 2026-08-31, first draft of this item | 15 | -- | off | "the gate is not armed" |
+| 2026-08-31, after arming | 16 | true | on | three settings at once |
+| 2026-09-01, measured for this revision | **14** | true | on | both CodeQL contexts removed, owner-authorised |
+
+**So the fix is not to correct the file by hand.** A hand-corrected file is right until the next
+change and carries no way to notice. The durable answer is the drift detector in PR #701,
+`scripts/ci/check_required_contexts_drift.py`, which is the only thing in this repository that reads
+the server at all. That PR should re-measure before it lands, for exactly the reason this table
+shows, and its fixture needs refreshing.
+
+**WHAT REMAINS, measured 2026-09-01 and true only as of that reading.** The file lists 13 contexts;
+the server enforces 14. **The gap is one context: `a reviewer has read this`.**
+
+**THE CODEQL FINDING IS RETRACTED, and the file was right.** Earlier revisions of this item made a
+centrepiece of `codeql.yml` sitting under `DELIBERATELY NOT REQUIRED` while the server required both
+its contexts, and called that a false negative naming a concrete harm. The owner has since removed
+both from protection, separately from the documentation question. **The file's stated rationale --
+that a fork-PR token lacks `security-events: write`, so requiring it would block every fork PR -- is
+the reasoning that now holds, and its entry needs no change.** CodeQL still runs and still reports;
+it no longer blocks a merge. That half is #1384 and PR #700, which this item should not have been
+carrying at all.
 | `enforce_admins = FALSE`, pointing at `scripts/hooks/push_guard.py` for the reasoning | `enforce_admins` is **true**, read 2026-08-31 | The value is wrong, and this file is not the only place carrying it wrong. See below |
 
 **When `enforce_admins` changed is not recoverable.** The API reports the current value and keeps no
@@ -18690,11 +18709,11 @@ every required check stays green, which is precisely the state the file was writ
 **Closing act, in this order, because the file mirrors the server and a line added first is the lie it
 exists to prevent:**
 
-1. **The CodeQL half is already filed as #1384 and in flight, so do not re-decide it here.** That
-   item and its pull request record the server's answer and say in their own words that whether
-   CodeQL *should* be required stays an owner's question. This item should cite them rather than
-   duplicate them. Found only by reading the open pull requests, which is its own small lesson: this
-   item asserted the drift was unclaimed without checking.
+1. **The CodeQL half is DONE and was never this item's to carry.** The owner removed both contexts
+   from protection on 2026-09-01. The file's `DELIBERATELY NOT REQUIRED` entry is correct as written
+   and must not be edited. That question was already filed as #1384 with PR #700 open against it,
+   which this item duplicated for four review passes because it asserted the drift was unclaimed
+   without checking the open pull requests.
 2. Add `a reviewer has read this` to the file, with its reasoning, and record the CodeQL decision.
 3. Correct the `enforce_admins` line to `TRUE`. Do not say the relaxation is gone: the one `push_guard.py` names at line 82, the `DELETE` on the protection endpoint, still works. **In this item "escape hatch" means that call and nothing else.**
 4. Correct every statement of the value **across all six files**, not only the four lines this item
