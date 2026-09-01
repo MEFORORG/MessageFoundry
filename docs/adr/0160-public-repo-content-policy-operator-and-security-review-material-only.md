@@ -225,6 +225,37 @@ touches `docs/BACKLOG.md`"* rather than a PR number, because a number goes stale
 wording said "once PR 713 lands"; 713 merged while that sentence was being written and nothing
 noticed, which is the same defect one level down.
 
+**A LIMIT OF D1 THAT PHASE 4 FOUND BY WALKING INTO IT, AND IT IS THE MOST REUSABLE THING HERE.
+D1 CLASSIFIES A DOCUMENT BY ITS SUBJECT. IT NEVER ASKS WHETHER THE DOCUMENT CARRIES AN OBLIGATION
+BINDING IT TO ENGINE CODE.** A document that merely DESCRIBES code goes stale quietly, and a reader
+can tell. A document that says *edit me in the same change* cannot be honoured once it is one
+repository away: the commit that triggers the obligation cannot reach it, and nothing in either
+repository reports the breach.
+
+Found by a peer session, not by this pass, and it found it by TRIGGERING it.
+`docs/testing/master-test-plan/17-performance-and-scale.md` carried a pin added 2026-08-28: *"the
+empty-claim monotonicity assertion in `test_connscale_smoke.py` is under active review as a known-
+noisy leg. IT IS CORRECT TODAY. IF IT IS DISARMED, SKIPPED OR DELETED, THIS ROW MUST BE EDITED IN THE
+SAME CHANGE."* That session's branch is the change that disarms the assertion. It had discharged the
+pin correctly; Phase 4 merged mid-build and took the row out of reach. **The pin's own predicted
+failure then occurred by a route it did not anticipate: the disarm ships, and the false claim
+survives -- in the vault, where the triggering change cannot edit it in the same commit, which is the
+one thing the pin demanded.**
+
+**Censused after the fact rather than left at one instance: 10 of the 46 files carry a same-change
+obligation**, measured at `72bfddfad` over the removed set. Besides the pin above, they include
+`19-execution-phasing-and-sign-off.md` (*"the chapter matrix must gain that row in the same commit"*),
+`00-strategy-and-governance.md`, `16-security-phi-and-supply-chain.md`, `09-engine-api.md`, and
+`docs/research/ad-step-up-after-simple-bind-retirement.md` (*"`_reauth_ad` may therefore not be
+deleted in the same change that removes `_login_ad`"*).
+
+**NOTHING IS PROPOSED HERE AND NOTHING IS FIXED.** The ten obligations are now unsatisfiable as
+written. Whether the answer is to keep an obligation-carrying document tracked regardless of subject,
+to rewrite the obligation as a CI check before moving it, or to accept the breach and say so where it
+can be read, is not decided. What is recorded is that **D1's subject test is insufficient on its own,
+and a future phase should screen for `in the same change` and `in the same commit` before moving
+anything** -- a cheap grep that this pass did not run and should have.
+
 **Custody first, as Phase 1 requires.** The 46 files were committed to the vault and pushed BEFORE
 leaving the tracked tree, at `wshallwshall/MessageFoundry` branch `lander/adr0160-custody`, verified
 byte-identical. That ordering mattered more than Phase 1 knew: measured across both repositories,
