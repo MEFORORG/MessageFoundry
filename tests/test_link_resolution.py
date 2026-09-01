@@ -99,18 +99,32 @@ def test_checker_detects_a_planted_break(tmp_path, checker) -> None:
 
 def test_withheld_prefixes_are_the_gitignored_ones(checker) -> None:
     """Pin the exemption list as a SET, so adding a prefix to the checker is a deliberate act with a
-    failing test attached rather than a silent widening of what goes unchecked."""
+    failing test attached rather than a silent widening of what goes unchecked.
+
+    The two ADR 0160 D1 entries are TEMPORARY and the checker says so beside them. They cover the
+    10 links in ``docs/BACKLOG.md`` that could not be repaired while PR 713 held that file. When
+    those are repaired, both entries and the two cases below come out in the same change -- and
+    this assertion is what makes forgetting fail loudly.
+    """
     assert set(checker.WITHHELD) == {
         "docs/security/",
         "docs/reviews/",
         "docs/marketing/",
         "docs/releases/",
+        "docs/archive/throughput/THROUGHPUT-IMPROVEMENTS.md",
+        "docs/testing/master-test-plan/",
     }
 
 
 @pytest.mark.parametrize(
     "prefix",
-    ["docs/security/", "docs/reviews/", "docs/marketing/", "docs/releases/"],
+    [
+        "docs/security/",
+        "docs/reviews/",
+        "docs/marketing/",
+        "docs/releases/",
+        "docs/testing/master-test-plan/",
+    ],
 )
 def test_withheld_directories_are_not_flagged(tmp_path, checker, prefix: str) -> None:
     """A gitignored target is a publishing boundary, not a defect; flagging it trains people to
@@ -126,6 +140,57 @@ def test_withheld_directories_are_not_flagged(tmp_path, checker, prefix: str) ->
     repo = _plant(tmp_path, "A.md", f"[withheld]({href})\n")
     failures, _checked, _files = checker.check(repo, _PLANTED_SUBTREE, include_line_cites=False)
     assert not failures, f"withheld prefix {prefix} should be exempt, got: {failures}"
+
+
+def test_the_one_file_shaped_prefix_is_exercised_at_its_real_path(tmp_path, checker) -> None:
+    """``docs/archive/throughput/THROUGHPUT-IMPROVEMENTS.md`` names a FILE, not a directory.
+
+    It needs its own case because the directory test above appends a filename to its prefix. That is
+    meaningful for ``docs/security/`` and meaningless here -- it would assert something about
+    ``...THROUGHPUT-IMPROVEMENTS.mdGONE.md``, which passes for the uninteresting reason that
+    ``startswith`` is prefix matching. Planting a link to the real path is the assertion worth having.
+
+    TEMPORARY, with the tuple entry it exercises: it covers 4 of the 10 unrepaired
+    ``docs/BACKLOG.md`` links and comes out when they do.
+    """
+    path = "docs/archive/throughput/THROUGHPUT-IMPROVEMENTS.md"
+    href = "../../../" + path  # docs/archive/backlog/A.md is three levels down
+    repo = _plant(tmp_path, "A.md", f"[withheld]({href})\n")
+    failures, _checked, _files = checker.check(repo, _PLANTED_SUBTREE, include_line_cites=False)
+    assert not failures, f"withheld path {path} should be exempt, got: {failures}"
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "docs/BRAND.md",
+        "docs/CONTRIBUTOR-PROGRAM-PLAN.md",
+        "docs/COUNSEL-ENGAGEMENT-BRIEF.md",
+        "docs/DUAL_LICENSING_PLAN.md",
+        "docs/POSITIONING.md",
+        "docs/research/config-ux-review.md",
+        "docs/testing/FEATURE-COVERAGE-PLAN.md",
+        "docs/archive/throughput/throughput-roadmap.md",
+    ],
+)
+def test_untracked_adr_0160_paths_are_checked_not_exempted(tmp_path, checker, path: str) -> None:
+    """The must-FAIL arm, and the reason this file gained a test rather than lost one.
+
+    ADR 0160 D1 untracked these paths and the same pass added them to ``WITHHELD``, which made the
+    gate report every link into them as resolving while 59 of them 404'd for a reader. An
+    exemption-shaped fix and a repair are indistinguishable from a green run, which is exactly why
+    the exemptions needed a test that fails when they come back.
+
+    So: a link to one of these must be a FAILURE. Paired with the exempt-arm tests above, that
+    bounds the exemption from both sides -- neither a narrowing nor a widening can pass silently.
+    Note ``docs/archive/throughput/`` and ``docs/testing/`` appear here as parent trees whose ONE
+    withheld member is asserted separately; a re-widened prefix turns these red.
+    """
+    href = "../../../" + path  # docs/archive/backlog/A.md is three levels down
+    repo = _plant(tmp_path, "A.md", f"[cited]({href})\n")
+    failures, checked, _files = checker.check(repo, _PLANTED_SUBTREE, include_line_cites=False)
+    assert checked == 1, f"{path} was skipped before it was ever counted -- checked={checked}"
+    assert len(failures) == 1, f"{path} must be CHECKED and fail, not exempted; got: {failures}"
 
 
 def test_resolution_ignores_the_filesystem(tmp_path, checker) -> None:
