@@ -2167,16 +2167,62 @@ jobs:
           # Mint a throwaway AES-256 store key at runtime (PHI-at-rest must never be plaintext); never a
           # committed literal (gitleaks). 32 random bytes, base64 — the MEFOR_STORE_ENCRYPTION_KEY format.
           export MEFOR_STORE_ENCRYPTION_KEY="$(python -c 'import base64, os; print(base64.b64encode(os.urandom(32)).decode())')"
+          # THIS LEG REACHES THE ENGINE OVER https AND PINS THE PAIR THE ENGINE MINTS (BACKLOG #1276
+          # part A, ADR 0172). The engine always serves TLS now and mints a self-signed pair on first
+          # run when no operator certificate is configured, so the plaintext probes this step used to
+          # make were talking cleartext at a TLS socket. The visible symptom was NOT a curl error --
+          # the readiness loop below could never fail the step -- but the harness's own preflight:
+          #     preflight failed: engine is not reachable for metrics
+          #     ##[error]Process completed with exit code 2
+          #
+          # WHY IT SURVIVED THE PULL REQUEST. This job is `if: schedule || workflow_dispatch ||
+          # merge_group`, so a pull_request event skips it entirely. The breakage first appeared in the
+          # MERGE QUEUE, and it is what evicted PR #575.
+          #
+          # `-k` / `--insecure` would also turn this green and is the wrong repair, for the same reason
+          # the docker-smoke step below states: after the always-TLS change, "the engine came up" now
+          # includes "presenting a certificate a client can VERIFY", and disabling verification is
+          # precisely what stops looking at that.
+          #
+          # WHERE THE PAIR IS -- MEASURED, not derived. Run 33511381948 logged:
+          #     minted a SELF-SIGNED certificate for 127.0.0.1 at
+          #     /home/runner/work/MessageFoundry/MessageFoundry/api-generated-cert.pem
+          # ensure_api_tls_material writes beside [store].path, and the relative --db below is anchored
+          # under the project root, which on a hosted runner is $GITHUB_WORKSPACE.
+          cert="$GITHUB_WORKSPACE/api-generated-cert.pem"
+          key="$GITHUB_WORKSPACE/api-generated-key.pem"
+          # THE HARNESS PINS THAT SAME ONE ANCHOR, with no harness-code change. EnginePoller._cacert_for
+          # resolves a LOOPBACK https URL to harness_tls_material()[0]; harness_tls_material reuses an
+          # INHERITED pair when these two variables are both set and the certificate exists
+          # (harness/load/tlsmat.py). Pointing them at the engine's own pair is what makes the poller
+          # verify against the certificate this engine actually serves -- rather than against one the
+          # harness process would otherwise mint for itself, which this engine never served.
+          # The readiness gate below runs FIRST and proves the file exists and verifies, so the
+          # wait-for-a-file race tlsmat.py warns about cannot arise on this path.
+          export MEFOR_HARNESS_TLS_CERT_FILE="$cert"
+          export MEFOR_HARNESS_TLS_KEY_FILE="$key"
           python -m messagefoundry serve --config harness/config/load --env dev --db ./load-ci.db \
             --host 127.0.0.1 --port 8765 > engine.log 2>&1 &
           engine_pid=$!
+          # The certificate is minted during startup, so a miss on the first turns is ordinary --
+          # `--cacert` on a file that does not exist yet just fails that turn.
+          ready=
           for _ in $(seq 1 60); do
-            curl -sf http://127.0.0.1:8765/health > /dev/null && break || sleep 0.5
+            curl -fsS --cacert "$cert" https://127.0.0.1:8765/health > /dev/null 2>&1 && { ready=1; break; } || sleep 0.5
           done
           set +e
-          python -m harness --load smoke --engine http://127.0.0.1:8765 --sink-port 2700 \
-            --report-json out/load/smoke-ci.json --report-csv out/load/smoke-ci.csv
-          rc=$?
+          if [ -n "$ready" ]; then
+            python -m harness --load smoke --engine https://127.0.0.1:8765 --sink-port 2700 \
+              --report-json out/load/smoke-ci.json --report-csv out/load/smoke-ci.csv
+            rc=$?
+          else
+            # FAIL ON THE REAL CONDITION RATHER THAN 30s LATER ON A DERIVED ONE. The loop above used to
+            # end in `|| sleep 0.5`, which made it incapable of failing the step: a never-ready engine
+            # burned ~30s and fell through to the harness, where it surfaced as an opaque preflight
+            # exit 2. This is a check gained, not a check relaxed.
+            echo "::error::engine /health never answered over https verified against the pinned certificate $cert"
+            rc=1
+          fi
           set -e
           kill "$engine_pid" 2>/dev/null || true
           echo "===== engine log (tail) ====="; tail -50 engine.log || true
@@ -2336,16 +2382,41 @@ jobs:
           mkdir -p out/load
           # Mint a throwaway AES-256 store key at runtime (never a committed literal — gitleaks).
           export MEFOR_STORE_ENCRYPTION_KEY="$(python -c 'import base64, os; print(base64.b64encode(os.urandom(32)).decode())')"
+          # https + PINNED, exactly as the sqlite load leg above -- the same always-TLS cause, the same
+          # merge_group-only gate that hid it from the pull request, and the same measured location for
+          # the minted pair. Run 33511381948 logged it at
+          #     /home/runner/work/MessageFoundry/MessageFoundry/api-generated-cert.pem
+          # on BOTH sqlserver legs as well: this step passes no --db, so [store].path keeps its default
+          # relative "messagefoundry.db" and is anchored under the project root the same way.
+          #
+          # MEFOR_ALLOW_INSECURE_TLS ABOVE IS NOT THE FIX AND WAS NOT MISCONFIGURED. It is the ENGINE's
+          # escape for a hop the engine DIALS -- here the engine-to-mssql hop, paired with
+          # MEFOR_STORE_TRUST_SERVER_CERTIFICATE. Nothing in messagefoundry/api/ or
+          # messagefoundry/apiclient/ reads it, so it has no reach over this hop, which runs the other
+          # way: a CI-side client reaching the engine's API listener. Do not widen it to cover this --
+          # that would turn a scoped outbound escape into a listener-verification off switch.
+          cert="$GITHUB_WORKSPACE/api-generated-cert.pem"
+          key="$GITHUB_WORKSPACE/api-generated-key.pem"
+          # One anchor for the readiness curl AND the harness poller; see the sqlite leg for why these
+          # two variables are the lever (harness/load/tlsmat.py inherited branch).
+          export MEFOR_HARNESS_TLS_CERT_FILE="$cert"
+          export MEFOR_HARNESS_TLS_KEY_FILE="$key"
           python -m messagefoundry serve --config harness/config/load --env dev \
             --host 127.0.0.1 --port 8765 > engine.log 2>&1 &
           engine_pid=$!
+          ready=
           for _ in $(seq 1 60); do
-            curl -sf http://127.0.0.1:8765/health > /dev/null && break || sleep 0.5
+            curl -fsS --cacert "$cert" https://127.0.0.1:8765/health > /dev/null 2>&1 && { ready=1; break; } || sleep 0.5
           done
           set +e
-          python -m harness --load smoke-sqlserver --engine http://127.0.0.1:8765 --sink-port 2700 \
-            --report-json out/load/smoke-sqlserver-ci.json --report-csv out/load/smoke-sqlserver-ci.csv
-          rc=$?
+          if [ -n "$ready" ]; then
+            python -m harness --load smoke-sqlserver --engine https://127.0.0.1:8765 --sink-port 2700 \
+              --report-json out/load/smoke-sqlserver-ci.json --report-csv out/load/smoke-sqlserver-ci.csv
+            rc=$?
+          else
+            echo "::error::engine /health never answered over https verified against the pinned certificate $cert"
+            rc=1
+          fi
           set -e
           kill "$engine_pid" 2>/dev/null || true
           echo "===== engine log (tail) ====="; tail -50 engine.log || true
@@ -2501,26 +2572,69 @@ jobs:
 
       - name: Start and verify /health
         run: |
+          # THIS PROBE SPEAKS https AND PINS THE CERTIFICATE THE SERVICE MINTS (BACKLOG #1276 part A,
+          # ADR 0172). The engine always serves TLS now and mints a self-signed pair on first run when
+          # no operator certificate is configured, so the plaintext Invoke-RestMethod this step used to
+          # make never got an answer and the leg died on `throw "engine /health never came up"` while
+          # the service was in fact healthy. From the same run's service log, verbatim:
+          #     WARNING messagefoundry.api.tls: no [api].tls_cert_file configured - minted a SELF-SIGNED
+          #       certificate for 127.0.0.1 at C:\ProgramData\MessageFoundry\api-generated-cert.pem
+          #     INFO uvicorn.error: Uvicorn running on https://127.0.0.1:8765
+          #
+          # WHY IT SURVIVED THE PULL REQUEST: this job is `if: schedule || workflow_dispatch ||
+          # merge_group`, so a pull_request event skips it and the breakage first surfaced in the merge
+          # queue, where it evicted PR #575.
+          #
+          # WHERE THE PAIR IS: install-service.ps1 defaults -DataDir to C:\ProgramData\MessageFoundry and
+          # derives -DbPath under it, and ensure_api_tls_material writes beside [store].path. The path
+          # below is the one the run above LOGGED, not one derived here. It is readable: the installer's
+          # Set-SecureDataDirAcl grants *S-1-5-32-544 (BUILTIN\Administrators) (OI)(CI)F, inherited by
+          # files created beneath, and this job already runs elevated (it installs a service).
+          $cert = "C:\ProgramData\MessageFoundry\api-generated-cert.pem"
+          # PowerShell 7's Invoke-RestMethod HAS NO CA-PINNING PARAMETER. Its only certificate flag is
+          # -SkipCertificateCheck, which is exactly the "stop verifying" repair this change exists to
+          # avoid: after the always-TLS flip, "the service came up" now includes "presenting a
+          # certificate a client can VERIFY". So the probe runs through python's stdlib ssl with the
+          # engine's own certificate as its ONLY trust anchor -- the same approach the docker-smoke step
+          # uses, on an interpreter this job already requires.
+          $probe = 'import json,ssl,sys,urllib.request;ctx=ssl.create_default_context(cafile=sys.argv[1]);print(json.dumps(json.load(urllib.request.urlopen(sys.argv[2],context=ctx,timeout=5))))'
           nssm start MessageFoundry
           $ok = $null
           foreach ($i in 1..30) {
-            try { $ok = Invoke-RestMethod http://127.0.0.1:8765/health -TimeoutSec 2; break }
-            catch { Start-Sleep -Milliseconds 500 }
+            $out = $null
+            # try/catch AND an explicit $LASTEXITCODE test. Whether a non-zero native exit becomes a
+            # terminating error depends on the runner's pwsh ($PSNativeCommandUseErrorActionPreference,
+            # default true only since 7.3), and this loop must retry identically either way. The
+            # certificate is minted during startup, so early misses are ordinary.
+            try { $out = & python -c $probe $cert "https://127.0.0.1:8765/health" 2>$null } catch { $out = $null }
+            if ($LASTEXITCODE -eq 0 -and $out) { $ok = $out; break }
+            Start-Sleep -Milliseconds 500
           }
-          if (-not $ok) { throw "engine /health never came up" }
-          "health: $($ok | ConvertTo-Json -Compress)"
+          if (-not $ok) {
+            # Re-run UNGUARDED so the actual TLS / connection error reaches the log instead of a bare
+            # "never came up", which is the message that made this failure look like a service defect.
+            & python -c $probe $cert "https://127.0.0.1:8765/health"
+            throw "engine /health never answered over https verified against $cert"
+          }
+          "health: $ok"
 
       - name: Send an MLLP message and confirm it was recorded
         run: |
+          # send_mllp.py is a raw MLLP socket send to the inbound listener -- it makes no HTTP call, so
+          # the always-TLS change does not touch it. The /messages poll below IS an API call and does;
+          # it is the same pinned python probe as the previous step, against the same minted certificate.
+          $cert = "C:\ProgramData\MessageFoundry\api-generated-cert.pem"
+          $probe = 'import json,ssl,sys,urllib.request;ctx=ssl.create_default_context(cafile=sys.argv[1]);print(json.dumps(json.load(urllib.request.urlopen(sys.argv[2],context=ctx,timeout=5))))'
           python samples\send_mllp.py samples\messages\adt_a01.hl7
-          $msgs = $null
+          $total = 0
           foreach ($i in 1..20) {
-            $msgs = Invoke-RestMethod http://127.0.0.1:8765/messages
-            if ($msgs.total -ge 1) { break }
+            $msgs = & python -c $probe $cert "https://127.0.0.1:8765/messages" | ConvertFrom-Json
+            $total = [int]$msgs.total
+            if ($total -ge 1) { break }
             Start-Sleep -Milliseconds 500
           }
-          if ($msgs.total -lt 1) { throw "message was not recorded by the engine" }
-          "messages.total = $($msgs.total)"
+          if ($total -lt 1) { throw "message was not recorded by the engine" }
+          "messages.total = $total"
 
       - name: Stop the service (graceful)
         if: always()
