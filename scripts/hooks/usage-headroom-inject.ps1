@@ -64,11 +64,23 @@
     exits 0.
 
     WIRING. PreToolUse in the tracked `.claude/settings.json`, matcher
-    `Task|Agent|Workflow|spawn_task` -- the dispatch tools and nothing else. The cost is one pwsh
+    `^(Task|Agent|Workflow)$|spawn_task` -- the dispatch tools and nothing else. The cost is one pwsh
     spawn plus one child, roughly 0.7 s, which is nothing beside a dispatch and a standing tax if it
     were ever wired on `*`: measured 19.0 tool calls per turn on this repo's transcripts. The
     tool-name test below is a second, narrower filter, so a matcher widened later cannot quietly turn
     this into that tax.
+
+    THE MATCHER MUST CARRY A REGEX CHARACTER, AND THAT IS NOT A STYLE CHOICE. Claude Code reads a
+    matcher of only letters, digits, `_`, `-`, spaces, `,` and `|` as a list of EXACT tool names, and
+    anything else as an unanchored JavaScript regex. This row shipped as
+    `Task|Agent|Workflow|spawn_task`, which is the first form: it selected three tools and never
+    `mcp__ccd_session__spawn_task`, because MCP names reach a matcher fully qualified and a bare
+    `spawn_task` is not one. Nothing reported it -- a matcher that selects nothing looks exactly like
+    a hook that ran and had nothing to say. The `^...$` anchors keep the three bare names exact so an
+    unanchored `Task` cannot also take `TaskOutput`, and the trailing alternative stays unanchored on
+    purpose, because it has to match a qualified name it does not spell out.
+    `tests/test_claude_settings_contract.py` reads that row and evaluates it the way the client does,
+    against the guard below, so the two cannot part again.
 
 .EXAMPLE
     Drive it by hand the way the harness drives it:

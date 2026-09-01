@@ -304,6 +304,69 @@ def test_a_reader_that_prints_nothing_is_unknown_rather_than_an_all_clear(tmp_pa
     assert "produced no output at all" in ctx, ctx
 
 
+_PERCENTAGE = re.compile(r"\d+(\.\d+)?%")
+
+
+def _every_unknown_context(tmp_path: Path) -> list[tuple[str, str]]:
+    """Drive every UNKNOWN the hook can reach, and return each with the fault that produced it.
+
+    Two shapes hide behind one verdict, which is why they are collected together. A dead reader
+    short-circuits to a four-line refusal that has no window rows at all; a stale or refused
+    document goes through the normal render path and reports UNKNOWN per window. Only the second
+    could ever print a number, and it is the one the individual assertions kept missing.
+    """
+    published = tmp_path / "published"
+    collect(published, reading())
+
+    stale = tmp_path / "stale"
+    collect(stale, reading())
+    age_document(stale, minutes=180)
+
+    unreadable = tmp_path / "unreadable"
+    unreadable.mkdir()
+    (unreadable / "latest.json").write_text("{ this is not json", encoding="utf-8")
+
+    foreign = tmp_path / "foreign"
+    collect(foreign, reading())
+    doc = json.loads((foreign / "latest.json").read_text(encoding="utf-8"))
+    doc["published_by"]["config_root_env"] = str(tmp_path / "another-account")
+    doc["five_hour"]["config_root_env"] = str(tmp_path / "another-account")
+    (foreign / "latest.json").write_text(json.dumps(doc), encoding="utf-8")
+
+    return [
+        ("nothing ever published", context_of(tmp_path / "never-published")),
+        ("the reading is stale", context_of(stale)),
+        ("the document is unreadable", context_of(unreadable)),
+        ("the document belongs to another account", context_of(foreign)),
+        ("the reader is missing", context_of(published, usage_script=tmp_path / "no-reader.ps1")),
+        ("the reader printed nothing", context_of(published, usage_script=silent_reader(tmp_path))),
+    ]
+
+
+def test_no_unknown_path_ever_prints_a_percentage(tmp_path: Path) -> None:
+    """A number printed beside UNKNOWN is the one output worse than having no tool at all.
+
+    THIS IS ASSERTED AS A CLASS BECAUSE CASE BY CASE IS HOW IT ROTS. Three of the six paths below
+    carry the assertion individually and three do not, so the property holds on the stale path and
+    on both broken-reader paths by coincidence -- checked by hand once and pinned by nothing. Stale
+    is exactly where a last-known number is tempting, because the file HAS a percentage in it and
+    the hook has just finished condemning it. Printing that number turns "I should check" into "I
+    already know" using data the tool itself ruled out.
+    """
+    good = tmp_path / "good"
+    collect(good, reading())
+    assert _PERCENTAGE.search(context_of(good)), (
+        "positive control: the detector must fire on a reading that does carry a percentage, or "
+        "every assertion below is passing over a scan that cannot see one"
+    )
+
+    for fault, ctx in _every_unknown_context(tmp_path):
+        assert "verdict: UNKNOWN" in ctx, f"{fault}, and the verdict was not UNKNOWN: {ctx}"
+        assert _PERCENTAGE.search(ctx) is None, (
+            f"{fault}, and a percentage was printed anyway: {ctx}"
+        )
+
+
 def test_a_hostile_value_in_the_state_file_cannot_forge_a_line(tmp_path: Path) -> None:
     """The prose interpolates a field any process on the box can write. A value carrying newlines would
     render a second block inside the notice, and a model reading top-down reaches the forged one first

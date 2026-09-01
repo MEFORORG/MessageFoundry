@@ -57,7 +57,7 @@
     ],
     "PreToolUse": [
       {
-        "matcher": "Task|Agent|Workflow|spawn_task",
+        "matcher": "^(Task|Agent|Workflow)$|spawn_task",
         "hooks": [
           {
             "type": "command",
