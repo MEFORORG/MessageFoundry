@@ -369,13 +369,24 @@ def monotonic_pairs(
 CONNSCALE_WORKERS_PER_CONNECTION = 3
 
 #: The engine's clock-driven claim backstop, in seconds -- how often an idle worker re-SELECTs when no
-#: commit has woken it. MIRRORS an engine value this harness does not import: ``pooled_sweep_interval``
-#: defaults to 0.25 in ``messagefoundry/config/settings.py``, whose comment records "0.25s =
-#: poll_interval parity" and "The 0.25s poll_interval lost-wakeup backstop is unchanged in both arms".
-#: A drift between that default and this mirror is caught by the model-vs-recorded test in
-#: tests/test_connscale_empty_claims_per_msg.py, not by anything at runtime. The floor's sensitivity to
-#: it is sub-linear -- it enters ``idle``, and ``idle`` enters the floor under a square root -- so a 2x
-#: error in this constant moves the floor by at most 1.41x.
+#: commit has woken it. MIRRORS an engine value this harness does not import.
+#:
+#: WHICH ENGINE VALUE, EXACTLY. The connscale sweep pins ``claim_mode=per_lane`` (runner.py injects
+#: MEFOR_PIPELINE_CLAIM_MODE), and in per_lane mode the backstop is ``RegistryRunner``'s
+#: ``poll_interval`` -- default 0.25 the whole way down (pipeline/wiring_runner.py, pipeline/engine.py,
+#: api/app.py), with no config key or env override. It is NOT ``pooled_sweep_interval``, which an
+#: earlier version of this comment cited: that knob also defaults to 0.25, so the NUMBER was right and
+#: the reference was wrong -- the shape that survives review longest.
+#:
+#: THE MIRROR IS ENFORCED BY NOTHING AT RUNTIME, and an earlier version of this comment claimed a test
+#: caught drift that did not exist. If either default moves, this constant must be moved by hand. The
+#: floor's sensitivity is sub-linear -- the interval enters ``idle``, and ``idle`` enters the floor
+#: under a square root -- so a 2x error here moves the floor by at most 1.41x.
+#:
+#: IT ALSO ASSUMES ``per_lane_wake`` IS OFF. With that flag on, this backstop is not 0.25 at all: it
+#: steps to ``_PER_LANE_IDLE_BACKSTOP_SECONDS`` (30.0). The runner PINS the flag off in the engine env
+#: rather than inheriting the default, so a recorded floor cannot silently become a number about a
+#: different engine (BACKLOG #1211; the floor is armed as a gate under BACKLOG #1415).
 ENGINE_IDLE_POLL_INTERVAL_S = 0.25
 
 
@@ -386,8 +397,9 @@ class HerdPrediction:
     Every field is derived from ``(count, offered rate)`` plus the two structural constants above.
     NOTHING here is chosen against an observed reading, which is the property BACKLOG #1211 exists to
     restore: the band it retired was fitted to the failures on hand, and a floor picked that way is
-    breached by the next sample (measured -- an 88-run pass put the worst ratio at 0.539, a 153-run
-    pass found 0.383).
+    breached by the next sample (measured -- an 88-run pass put the worst OBSERVED ratio at 0.539, and
+    a later, larger pass found 0.383). Both are worst-observed over the runs that uploaded an
+    artifact, never over all runs; the ones that uploaded nothing could only push those values lower.
     """
 
     wake: float  # empty claims per message from the engine-wide singleton wake
@@ -412,10 +424,16 @@ def predict_herd_levels(count: int, offered_aggregate_rate: float) -> HerdPredic
       ``1 / offered_aggregate_rate`` seconds between messages, ``W * count`` workers each poll
       ``1 / (interval * rate)`` times per message.
 
-    ``floor`` is the GEOMETRIC MEAN of ``total`` (the herd present) and ``idle`` (the herd gone
-    entirely, which is what flipping ``MEFOR_PIPELINE_PER_LANE_WAKE`` off produces). The log-midpoint
-    is the one point equidistant from both predicted states, so it separates them without any free
-    parameter to tune -- and it stays a prediction, not a percentile of anything observed.
+    ``floor`` is the GEOMETRIC MEAN of ``total`` (the herd present) and ``idle`` (the herd gone, with
+    the 0.25s backstop still polling). The log-midpoint is the one point equidistant from both
+    predicted states, so it separates them without any free parameter to tune -- and it stays a
+    prediction, not a percentile of anything observed.
+
+    ``idle`` IS A CONSERVATIVE FLOOR FOR "HERD GONE", not the only such state. Turning
+    ``MEFOR_PIPELINE_PER_LANE_WAKE`` ON is the engine's own way of killing the herd, and it lands
+    BELOW ``idle``: it removes the wake fan-out AND backs the idle poll off from 0.25s to 30s, so both
+    terms fall. Both terms of this model assume that flag is OFF, which is why the runner pins it in
+    the engine env rather than inheriting the default.
 
     Returns ``None`` when ``count < 2`` (no siblings, so no herd to predict) or the offered rate is
     non-positive. A folded batch-box record sums the offered rate across processes, so a prediction
@@ -459,10 +477,15 @@ def herd_floor_readings(
 ) -> list[HerdFloorReading]:
     """Grade each lane's reading AT ``base_count`` against the level its own configuration predicts.
 
-    THE BASE READING, NOT THE RATIO, AND NOT THE LARGEST N. BACKLOG #1211's harvest found the whole
-    left tail on the larger-N side: across the 25 deepest episodes in 894 transitions the base reading
-    sat at 0.76 to 1.18 of its lane median while the larger-N reading fell as far as 0.33. The base
-    reading is the stable half of the pair in every one of the six measured cells.
+    THE BASE READING, NOT THE RATIO, AND NOT THE LARGEST N. The reason is structural, and it has to
+    be. An earlier draft of this docstring justified the choice with a left-tail statistic comparing
+    base readings against larger-N ones. That statistic has NO record in this repository and none in
+    BACKLOG #1211 either, so it is withdrawn here rather than quietly restated, and nothing below
+    rests on it. What holds without a measurement: a ratio needs two readings and grades a LEVEL
+    against a fitted band, which is the shape #1211 retired -- it could not tell a collapse from a
+    wide healthy spread. A sign test needs one reading, so the only open question is which one, and
+    the base reading is the sweep's lowest N -- the first step every lane runs, hence the one reading
+    a lane that ran at all is certain to have produced.
 
     THE COUNT IS MATCHED EXACTLY, never "the lowest count present". Promoting a larger-N reading when
     the base one is missing grades a value worth roughly twice the floor, so it passes with near
@@ -737,7 +760,7 @@ class ConnScaleReport:
     ) -> list[str]:
         """The base-count reading against the level its own configuration predicts.
 
-        RECORDED, NOT GATED (BACKLOG #1411). This table is what a later harvest reads to decide whether
+        RECORDED, NOT GATED (BACKLOG #1415). This table is what a later harvest reads to decide whether
         the predicted floor can become a merge gate, and it is written from the emitter that already
         runs on every pass and every failure -- so that decision will rest on a distribution rather
         than on excursions, which is the whole lesson of #1211 limb one.
@@ -749,7 +772,7 @@ class ConnScaleReport:
         readings = herd_floor_readings(self.records, key, base_count=base_count)
         out = [
             "",
-            f"### predicted herd floor at N={base_count} (recorded, not enforced -- BACKLOG #1411)",
+            f"### predicted herd floor at N={base_count} (recorded, not enforced -- BACKLOG #1415)",
             "",
             f"Predicted from the sweep's own configuration: "
             f"{CONNSCALE_WORKERS_PER_CONNECTION} workers per connection, "
@@ -832,7 +855,7 @@ class ConnScaleReport:
                 }
             )
         payload: dict[str, object] = {
-            # 2 adds the `herd_floor` block below. The RATIO rows above are byte-unchanged, so the 454
+            # 2 adds the `herd_floor` block below. The RATIO rows above are byte-unchanged, so the
             # version-1 payloads already harvested for BACKLOG #1211 stay directly comparable with
             # everything written after this -- which is the point of not touching the recorded band.
             # NOT the module-level `SCHEMA_VERSION`, which governs `to_json_dict`: two payloads, two
@@ -847,7 +870,7 @@ class ConnScaleReport:
             "readings": readings,
         }
         if base_count is not None:
-            # RECORDED, NOT ENFORCED (BACKLOG #1411). This block is what a later harvest reads to decide
+            # RECORDED, NOT ENFORCED (BACKLOG #1415). This block is what a later harvest reads to decide
             # whether the predicted floor can become a gate; writing it from the same emitter that
             # already runs on every pass and every failure is why that decision will rest on a
             # distribution rather than on excursions, which is the whole lesson of #1211 limb one.
@@ -888,8 +911,10 @@ class ConnScaleReport:
         """The band-less diagnostic table, emitted on every run (BACKLOG #1366).
 
         NOT a variant of :meth:`render_readings_markdown`, and the separation is the point. That one
-        renders `prior`, `band floor` and `margin` because its metric has an SLO band. ONLY
-        ``empty_claims_monotonic`` and ``fd_count_monotonic`` have one; every field here has none, so
+        renders `prior`, `band floor` and `margin` because its metric has a vs-N band to render.
+        ``fd_count_monotonic`` is the only metric whose band is still ENFORCED; the empty-claims ratio
+        keeps a RECORDED, unenforced one, at a width held fixed for comparability (BACKLOG #1211,
+        which retired ``empty_claims_monotonic``). Every field HERE has no band in either sense, so
         those columns would be a floor computed from whichever reading happened to precede it --
         false precision manufactured by the renderer rather than measured by anything.
 

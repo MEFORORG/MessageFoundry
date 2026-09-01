@@ -4,9 +4,38 @@
 
 The harness OWNS a fresh engine subprocess per sweep step (EngineNode), serving ``harness/config/
 connscale`` with ``MEFOR_CONNSCALE_COUNT`` env-set, and drives a tiny connection-count sweep. It
-proves the harness SPINS N connections, NO-LOSS reconcile holds, the FD + empty-claim counters move
-MONOTONICALLY with N (the wall exists and scales), the additive engine fields are present (back-compat
-shim works), and the executor boot-shim populates wall #1 / the reload probe returns a finite number.
+proves the harness SPINS N connections, NO-LOSS reconcile holds, the FD counter moves MONOTONICALLY
+with N (wall #4 exists and scales), the additive engine fields are present (back-compat shim works),
+and the executor boot-shim populates wall #1 / the reload probe returns a finite number.
+
+THE EMPTY-CLAIM COUNTER (WALL #3) IS NO LONGER GATED FOR MONOTONICITY, AND THE SENTENCE ABOVE
+USED TO SAY IT WAS (BACKLOG #1211). The vs-N gate was DELETED rather than widened: a harvest of
+894 lane transitions found it broken five ways at once, so nothing in CI now asserts that the
+empty-claims curve rises with N at all. That is a real reduction in coverage, named here rather
+than left for a later reader to discover by accident. What the run DOES assert about wall #3, in
+``test_the_empty_claim_counter_moved_at_the_base_connection_count``, is a sign test at the BASE
+connection count only: every ``per_lane`` lane that produced a reading at the sweep's lowest N
+produced a STRICTLY POSITIVE one, plus a run-level bound that at least one lane was graded at all.
+Pooled lanes are never graded, because the prediction behind the reading assumes one worker set per
+lane per stage.
+
+WHAT IS STILL MEASURED IS UNCHANGED; ONLY THE VERDICT SHRANK. ``empty_claims_per_msg`` is computed
+on every record and RECORDED on every run, pass or fail, to the job summary and to the readings
+JSON (``_record_ratio_readings``, which runs in the fixture so a green run is recorded as fully as
+a red one). The PREDICTED HERD FLOOR for the base reading rides along in both emitters. That floor
+is RECORDED, NOT GATED, by owner ruling: it reproduces four harvested medians closely and still
+missed its own pre-landing counterfactual on a leg that passed, so gating on it would have reddened
+a green leg. Arming it from its own distribution is BACKLOG #1415.
+
+THE MASTER TEST PLAN'S COVERAGE ROW FOR THIS MODULE IS STALE, AND IT IS NOT IN THIS REPOSITORY ANY
+MORE. It lived in ``docs/testing/master-test-plan/17-performance-and-scale.md``; commit 921db74a1
+(PR #714) untracked that whole directory under ADR 0160's D1 test, and only
+``docs/testing/VERIFY.md`` survives here. The row therefore now lives in the separate vault
+repository and cannot be edited from an engine checkout. Be precise about what that means: that the
+file LEFT this repository is measured; the vault copy's CURRENT TEXT has not been read from here,
+so the row is unverified rather than known to be wrong. Until someone reconciles it there, THIS
+DOCSTRING is the nearest in-repo statement of what the run actually covers, which is why the
+paragraphs above spell out the loss and not only the replacement.
 
 It does NOT regression-cover wall #1 (executor) or wall #2 (pool) as REAL curves: at small N on
 SQLite the pool wall is a documented no-op and the executor is under-threshold — stated honestly here.
@@ -285,6 +314,14 @@ def _record_ratio_readings(report: ConnScaleReport) -> None:
 
     The tolerance is IMPORTED, not typed in. A second copy of 0.25 here would be a second definition
     of the band, and the emitted floor could then drift away from the one the SLO actually enforces.
+
+    THAT LAST CLAUSE NO LONGER HOLDS FOR THIS METRIC, AND THE IMPORT SURVIVES ANYWAY. Since the
+    empty-claims band was retired (BACKLOG #1211) no SLO grades ``empty_claims_per_msg`` against
+    ``_MONOTONIC_TOLERANCE``; the renderer says so on the table it prints, and an OUTSIDE BAND row
+    there fails nothing. The width is still imported rather than retyped for a different reason:
+    holding it at the value the harvested readings were measured under is what keeps new rows
+    directly comparable with those already harvested. ``fd_count_monotonic`` does still enforce the
+    same constant, so a second copy here would remain a second definition regardless.
     """
     _append_step_summary(
         report.render_readings_markdown(

@@ -109,10 +109,16 @@ class ConnScaleSlo:
     # TWO DIFFERENT SHAPES, and they stopped being one family in BACKLOG #1211. `fd_monotonic` is the
     # loose vs-N slope smoke on FD count: at a larger N it must be >= a smaller N minus a jitter band.
     # `empty_claims_base_reading` is NOT a slope -- it asserts that each per_lane lane produced a
-    # positive empty-claims-per-message reading at the BASE connection count. The vs-N form it replaced
-    # asserted something false about the healthy population (on one measured leg the healthy median
-    # ratio is 0.962, i.e. most healthy runs DECREASE), and the predicted floor that would restore a
-    # real expectation is recorded but not enforced pending BACKLOG #1411.
+    # STRICTLY POSITIVE empty-claims-per-message reading at the BASE connection count. The vs-N form it
+    # replaced asserted a rise the healthy population does not have. The harvest that measured that is
+    # recorded ONCE, in BACKLOG #1211, and is deliberately not restated here. The predicted herd floor
+    # that would restore a real expectation is computed and recorded on every run but is NOT enforced,
+    # pending BACKLOG #1415.
+    #
+    # `empty_claims_base_reading` GRADES ONLY `per_lane` LANES: the herd prediction behind it assumes
+    # one worker set per lane per stage, which a pooled dispatcher does not satisfy. So a profile that
+    # arms it without `per_lane` in `claim_modes` is REJECTED by `_validate` below rather than running a
+    # check that grades nothing and passes every time.
     fd_monotonic: bool = False
     empty_claims_base_reading: bool = False
 
@@ -375,6 +381,21 @@ def _validate(profile: ConnScaleProfile, where: str) -> None:
             f"only and don't compose, ADR 0075: use claim_modes = ['pooled'] with exactly ONE of "
             f"fuse_modes / batch_modes = [false, true]); got claim_modes={list(profile.claim_modes)}, "
             f"fuse_modes={list(profile.fuse_modes)}, batch_modes={list(profile.batch_modes)}"
+        )
+    # `empty_claims_base_reading` grades ONLY per_lane lanes (BACKLOG #1211): the herd prediction it
+    # reads assumes one router/transform/delivery worker set per lane per stage, which a pooled
+    # dispatcher does not satisfy, so `herd_floor_readings` reports every pooled lane as NOT GRADED.
+    # Zero graded lanes is a PASS -- deliberately, and it says so in words, mirroring `intake_audit`.
+    # Those two rules compose into a gate that CANNOT FAIL: a pooled-only profile that armed this check
+    # would report a green wall #3 on every run while measuring nothing, and nothing downstream would
+    # report a problem. Reject it at PARSE time instead. This is structural, decided from the profile
+    # alone before any engine is spawned, so it cannot flake on a runner.
+    if profile.slo.empty_claims_base_reading and PER_LANE not in profile.claim_modes:
+        raise ConnScaleProfileError(
+            f"{where}: slo.empty_claims_base_reading = true needs {PER_LANE!r} in claim_modes -- the "
+            f"check grades only per_lane lanes, so with claim_modes={list(profile.claim_modes)} it "
+            f"would grade zero lanes and pass on every run; add {PER_LANE!r} to claim_modes, or set "
+            f"empty_claims_base_reading = false"
         )
 
 
