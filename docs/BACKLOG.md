@@ -18620,10 +18620,28 @@ ways.
 **When `enforce_admins` changed is not recoverable.** The API reports the current value and keeps no
 history, so this item does not claim a date for it.
 
-**THERE IS A SECOND RECORD, AND IT IS THE WORSE ONE.** `scripts/hooks/push_guard.py` states the
-setting in **at least four** places -- lines 20, 72, 284 and 300 as of 2026-08-31 -- and every one of
-them says OFF while the server says on. "At least" is deliberate: an earlier draft of this item said
-three, having missed line 72, and a fixer working from that enumeration would have left it wrong.
+**THE FILE IS NOT THE ONLY RECORD, AND `push_guard.py` IS NOT THE ONLY OTHER ONE.**
+`git grep -n enforce_admins origin/main` finds the claim asserted as OFF across **at least six
+files**, measured 2026-08-31:
+
+| File | What it asserts |
+|---|---|
+| `scripts/hooks/push_guard.py` | at least four times, lines 20, 72, 284 and 300. Line 300 is PRINTED |
+| `.github/required-contexts.txt` | line 26, the row above |
+| `tests/test_push_guard.py` | line 12, so the suite's own record agrees with the wrong value |
+| `scripts/coord/install-git-hooks.ps1` | line 361, "enforce_admins is false, so the owner bypasses all of it" |
+| `.github/workflows/branch-leak-scan.yml` | line 24, treats re-enabling as outstanding work |
+| **`docs/BACKLOG.md` itself** | line 5818, inside **open item #1056** |
+
+**#1056 is the one that bites, because it is in this same file.** It is an open P1 whose text says
+"Re-enabling it would refuse an admin's direct push to `main` -- worth doing on its own merits". Once
+this item merges, `docs/BACKLOG.md` will simultaneously record that the setting is on and propose
+turning it on. Nothing detects that; the two items are thousands of lines apart.
+
+**"At least" is doing real work here and is not hedging.** This item has undercounted twice. It said
+three lines, missed line 72, and was corrected to four. It then said four lines in one file, and the
+undercount had simply moved up a level to six files. Both times an enumeration read as a complete
+list. SDS-3.6, twice, on the same claim.
 
 Two of the four matter more than the others:
 
@@ -18631,18 +18649,34 @@ Two of the four matter more than the others:
   the server to stop it: enforce_admins is OFF, so branch protection does not apply to an admin's
   direct push". A compensating control resting on a false premise, which is what SDS-3.7 forbids,
   delivered exactly when somebody acts on it.
-- **line 72 inverts an instruction.** It reasons that a fresh clone has "nothing but the server-side
-  rule -- which, with `enforce_admins` OFF, is nothing at all when the pusher is an admin", and then
-  says: "Do not read 'the server would have caught it' into any of those gaps." With the setting on,
-  the server *would* have caught it, so the instruction now tells a reader to discount the one
-  control that is actually there.
+- **line 72's clause is false, and its instruction is wrong in one case only.** It reasons that a
+  fresh clone has "nothing but the server-side rule -- which, with `enforce_admins` OFF, is nothing
+  at all when the pusher is an admin", then says: "Do not read 'the server would have caught it'
+  into any of those gaps." The clause is now false. **The instruction is not, except for an admin's
+  direct push to `main`.** The hook has three guards and branch protection touches one of them, on
+  one ref. For the namespace and content guards there is no server-side control at all, measured:
+  a push ruleset returns `422 Source public repos cannot have push rules`, recorded in both
+  `branch-leak-scan.yml` and #1056. So for most of what that paragraph covers the instruction stays
+  right, and an earlier draft of this item overstated it as a flat inversion.
 
 **The harm is a wrong sentence, not a lost way out, and an earlier draft of this item got that
 wrong.** It claimed `gh pr merge --admin` was the documented way out of a permanently-red required
 check and that the way out had therefore closed. Both halves fail. The file names its relaxation
 explicitly at line 82, and it is not `--admin`: it is `gh api -X DELETE
-repos/MEFORORG/MessageFoundry/branches/main/protection/enforce_admins`. **An admin can run that
-today and it works.** What survives is narrower: line 20 misdescribes `--admin` as the relaxation.
+repos/MEFORORG/MessageFoundry/branches/main/protection/enforce_admins`.
+
+**Nobody has run that call, and this item does not claim it succeeds.** Running it would relax
+protection on `main`, so the claim stays at what was actually checked, read-only: the file names it
+as the relaxation, the actor holds `admin: true`, and the one active ruleset (`protect-main`, rules
+`deletion` and `non_fast_forward`, zero bypass actors) carries no required-status-checks rule that
+would defeat it. That is evidence about the path, not a witness to the effect, and the distinction
+is the point -- an earlier draft asserted the outcome flatly. Note also that `deletion` and
+`non_fast_forward` still apply with no bypass, so the relaxation would not restore the earlier state
+wholesale.
+
+The retraction survives either way, because it needs only line 82 to show `--admin` is not the
+documented relaxation. What survives is narrower still: line 20 misdescribes `--admin` as that
+relaxation.
 
 **The file contradicts itself, and the correct half is the one nobody reads.** Its HISTORY note at
 line 75 says the premise "dissolved and the setting was flipped", which matches the server. The four
@@ -18656,15 +18690,19 @@ every required check stays green, which is precisely the state the file was writ
 **Closing act, in this order, because the file mirrors the server and a line added first is the lie it
 exists to prevent:**
 
-1. Decide the CodeQL question with the owner. Either accept the two contexts as required and delete
-   the fork-PR reasoning, or remove them from protection. Do not simply transcribe the server.
+1. **The CodeQL half is already filed as #1384 and in flight, so do not re-decide it here.** That
+   item and its pull request record the server's answer and say in their own words that whether
+   CodeQL *should* be required stays an owner's question. This item should cite them rather than
+   duplicate them. Found only by reading the open pull requests, which is its own small lesson: this
+   item asserted the drift was unclaimed without checking.
 2. Add `a reviewer has read this` to the file, with its reasoning, and record the CodeQL decision.
 3. Correct the `enforce_admins` line to `TRUE`. Do not say the relaxation is gone: the one `push_guard.py` names at line 82, the `DELETE` on the protection endpoint, still works. **In this item "escape hatch" means that call and nothing else.**
-4. Correct every statement of the value in `scripts/hooks/push_guard.py` -- at least lines 20, 72,
-   284 and 300 -- rather than the four this item happens to name. Re-grep before declaring it done.
-   Line 300 is printed to an operator and line 72 carries an instruction that inverts, so neither is
-   a comment tidy-up. Fixing only `required-contexts.txt` leaves the wrong value in the place an
-   operator actually reads it.
+4. Correct every statement of the value **across all six files**, not only the four lines this item
+   names in `push_guard.py`. **Re-grep the whole tree before declaring it done**, because this item
+   has undercounted twice. Line 300 is printed to an operator, line 12 of `tests/test_push_guard.py`
+   is the suite's own record, and #1056 needs a note rather than an edit, since its proposal is now
+   satisfied and that is a separate decision. Fixing only `required-contexts.txt` leaves the wrong
+   value in the place an operator actually reads it.
 5. Update the count pinned in `tests/test_required_contexts.py`, in the same pull request.
 
 **What this item does NOT propose.** It does not propose a test that calls the GitHub API. A required
