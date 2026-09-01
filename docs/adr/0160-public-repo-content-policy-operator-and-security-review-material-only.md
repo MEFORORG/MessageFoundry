@@ -160,10 +160,12 @@ a `releases/` link re-introduced into `docs/FEATURE-MAP.md` **passed** in the wo
 
 The gate is not broken and needs no change; its scope is now narrower than it looks. **Do not read a
 local green on this test as evidence.** Verify a link-affecting change against a tracked-files-only
-export, which is a two-command check:
-`git archive $(git write-tree) | tar -x -C <tmp>` then run the test there. The same caveat applies to
-any future guard that tests *existence* rather than *trackedness* — after this decision, presence on
-disk and presence in the repository are different facts.
+checkout — **`git clone --no-hardlinks . <tmp>`, and NOT the `git archive $(git write-tree)` export
+this paragraph originally prescribed.** An archive carries no `.git`, which is fine for a guard that
+tests the filesystem (this one) and wrong for any guard that shells out to `git`; P4 below records
+what that cost a later reviewer. Use the clone for both and the distinction stops mattering. The same
+caveat applies to any future guard that tests *existence* rather than *trackedness* — after this
+decision, presence on disk and presence in the repository are different facts.
 
 **Phase 2 — REVERSED. DECLINED 2026-08-06, then ACCEPTED 2026-08-31 (owner), subject to the preconditions in D5. The process tooling and its documentation MOVE.**
 The proposed set was `docs/WORKTREES.md`, `docs/SESSION-DRIFT-CONTROLS.md`, `docs/LEDGER-GATE.md`
@@ -249,11 +251,27 @@ obligation**, measured at `72bfddfad` over the removed set. Besides the pin abov
 `docs/research/ad-step-up-after-simple-bind-retirement.md` (*"`_reauth_ad` may therefore not be
 deleted in the same change that removes `_login_ad`"*).
 
-**IF YOU TAKE ONE THING FROM THIS PARAGRAPH, TAKE THIS: GREP FOR `in the same change` AND `in the
-same commit` BEFORE MOVING ANYTHING.** One command, it catches all ten, and it costs nothing. This
-pass did not run it and should have. Everything below is the reasoning; that line is the remedy.
+**IF YOU TAKE ONE THING FROM THIS PARAGRAPH, TAKE THIS: GREP FOR `in the same
+(change|commit|PR|pull request)` BEFORE MOVING ANYTHING.** It costs nothing, and this pass did not
+run it and should have. Everything below is the reasoning; that line is the remedy.
 
-**NOTHING IS PROPOSED HERE AND NOTHING IS FIXED.** The ten obligations are now unsatisfiable as
+**THE NEEDLE IS WRITTEN WITH FOUR SPELLINGS BECAUSE AN EARLIER DRAFT HAD TWO AND SAID "it catches
+all ten".** Both halves of that were wrong, and a non-author review measured it over the 46 removed
+paths at `921db74a1^`:
+
+| needle | files |
+|---|--:|
+| `in the same (change\|commit)` — the earlier draft's | **9** |
+| adding `in the same (PR\|pull request)` | **2 more** — `12-vs-code-ide-extension.md`, `13-steps-editor.md` |
+| negative control, a nonexistent string | **0** |
+
+So the old needle caught 9 of at least 11, and the count in the prose was 10. **The two-spelling
+needle was generalised from the single pin phrased "in the same change" — a screen built from one
+case finds one shape, and it reported clean on the two documents that spell the same obligation
+"PR".** Write it as **at least**: this is an enumeration over prose written by many hands, and a
+fifth spelling is likelier than not.
+
+**NOTHING IS PROPOSED HERE AND NOTHING IS FIXED.** The at-least-eleven obligations are now unsatisfiable as
 written, and the three candidate answers are genuinely different with different owners: keep an
 obligation-carrying document tracked regardless of subject; rewrite the obligation as a CI check
 BEFORE moving it; or accept the breach and say so somewhere it can be read.
@@ -325,10 +343,19 @@ Phase 4 found it is the general case, and it is worse for Phase 2 than for eithe
 
 Three parts, and the second is the one that bites:
 
-* **Use `git clone --no-hardlinks`, NOT `git archive`.** An archive export has no `.git`, so every
-  guard that calls `git ls-files` scans zero files and goes green. A reviewer hit exactly this and
-  produced 25 red tests that were all instrument artifact; the opposite error, a silent all-green,
-  is the one that ships.
+* **Use `git clone --no-hardlinks`, NOT `git archive`.** An archive export has no `.git`, so a guard
+  that shells out to `git` is running outside a repository. **It fails BOTH ways, and an earlier
+  draft of this bullet stated only one of them and stated it as universal.** Measured: `git ls-files`
+  in an exported tree exits **128** with `fatal: not a git repository` and empty stdout, against a
+  positive control of 452 paths in a real checkout. So a guard that CHECKS the exit code goes red --
+  a reviewer hit exactly that and produced 25 red tests that were all instrument artifact -- while a
+  guard that IGNORES it parses zero lines and **passes vacuously**, asserting over an empty list.
+  Which one you get depends on the guard, not on the export.
+
+  **The silent green is the one that ships**, which is why the conclusion stands either way; but a
+  precondition that names only the green half sends a reader looking for the wrong symptom, and the
+  earlier draft contradicted itself inside two sentences by then citing 25 RED tests as the evidence
+  for it.
 * **Grep the SEGMENT-JOINED path form as well as the slash form.** Phase 4's first sweep for inbound
   references missed a test that builds its path as `_REPO / "docs" / "testing" / "FILE.md"`. The
   string `docs/testing/` never appears in that source, so a slash-form grep cannot see it, and the
