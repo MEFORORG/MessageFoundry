@@ -335,7 +335,16 @@ cross-session message (faster, no receipt, dies with the session).**
    *"Sessions push their own."* No per-action approval is needed for your own push or your own PR.
 3. **THE MERGE IS STILL THE LANDER'S**, and a PR reaches it THROUGH THE REVIEWER: open the PR, notify
    the Reviewer seat, and it either returns the PR to you with findings or passes it to the Lander,
-   which merges. If no Reviewer is running, route to the Lander as before.
+   which merges.
+   **RETIRED 2026-08-31: this line previously read** "If no Reviewer is running, route to the
+   Lander as before." **That fallback no longer exists** -- since `a reviewer has read this`
+   became a required context, the Lander cannot merge an unlabelled PR either.
+   **WHAT BLOCKS A MERGE IS THE `reviewed` LABEL, NOT THE REVIEWER SEAT, AND ANY SEAT CAN APPLY
+   IT** -- `gh pr edit <N> --add-label reviewed`. Measured 2026-08-31: PRs 713, 716 and 714 all
+   merged with no Reviewer seat running. Nothing automated ever adds the label and a push STRIPS
+   it, so label after your last push. **The gate records that a step HAPPENED, not that an
+   independent party looked**, so labelling your own PR unread satisfies the machine and defeats
+   the point.
 
 **Direct pushes to `main` remain blocked by the harness, so branch and PR is still the path.** What
 rule 2 removes is the approval hop on your OWN branch, not the protection on `main`.
