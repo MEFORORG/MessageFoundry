@@ -14,9 +14,10 @@ constraint the tool was built under gets an arm here that goes RED if the constr
   scorecard file is byte-identical after a run;
 * **the scorecard path is an argument** -- it is required, and a root CONTAINING the record is refused;
 * **no requirement identifiers** -- a sentinel row id planted in the fixture must appear nowhere in
-  the output, in the failing case as well as the clean one;
+  the output, in the failing case as well as the clean one, AND NOWHERE IN A REFUSAL: the reader's
+  own diagnostics name the row they rejected, and an error path is where output stops being reviewed;
 * **unknown is not zero** -- a missing, unparseable or empty record exits non-zero and never prints a
-  reassuring total;
+  reassuring total, and it exits 2 rather than 1 so "I could not measure" never renders as a finding;
 * **one locator, not two** -- the report, the gate and the provenance tool must agree by construction.
 """
 
@@ -60,6 +61,12 @@ SENTINEL_ID = "ZZ.SENTINEL.9"
 #: The line a "fix" deletes. Written to read like the real case the item describes -- the code got
 #: better and the improvement removed the statement the citation quoted.
 QUOTED = 'ssl_context.minimum_version = "TLSv1.2"'
+
+#: Assessment CONTENT, as against the public vocabulary (anchor, scorecard, verifier, stale). Stated
+#: ONCE and scanned by every arm that captures output. It used to be spelled out in the one happy-path
+#: arm, which is precisely why the leak on the refusal path reached review: a list only one caller
+#: reads is a list that only covers one caller.
+BANNED_CONTENT = ("verdict", "coverage", "partial", " pass ", "unverified")
 
 SOURCE = f"""\
 def connect() -> None:
@@ -276,7 +283,7 @@ def test_assessment_content_is_absent_from_the_report(
     """
     root, record = tree
     _, out = _run(["--scorecard", str(record), "--root", str(root)], capsys)
-    for banned in ("verdict", "coverage", "partial", " pass ", "unverified"):
+    for banned in BANNED_CONTENT:
         assert banned not in out.lower(), (
             f"the report leaked assessment content ({banned!r}):\n{out}"
         )
@@ -315,6 +322,84 @@ def test_a_record_it_could_not_read_is_never_a_clean_zero(
     assert code == EXIT_INSTRUMENT, f"{name!r} did not fail closed:\n{out}"
     assert "NOT RESOLVING      : 0" not in out, f"{name!r} printed a clean total:\n{out}"
     assert "REFUSING" in out, out
+
+
+#: Records that PARSE as TOML and are then REJECTED by the reader, one per fault it raises
+#: differently, paired with the exception class each fault produces. Every identifier here is
+#: invented -- ``ZZ.SENTINEL.9`` and ``bogus`` cannot collide with a real requirement -- so a hit in
+#: captured output is proof of disclosure rather than a coincidence.
+#:
+#: THE THREE ``KeyError`` ROWS ARE THE SECOND DEFECT. ``load_scorecard`` subscripts the record
+#: directly in a dozen places, so these never reached the reporter's refusal at all: they escaped as a
+#: traceback and exit 1, which is :data:`EXIT_FINDINGS` -- "I could not measure this" rendered as "I
+#: measured it, and citations are broken".
+_UNREADABLE: dict[str, tuple[str, str]] = {
+    "unknown_state": ('[[cell]]\nid = "{id}"\nlevel = 1\nverdict = "bogus"\n', "ScorecardError"),
+    "na_without_rationale": (
+        '[[cell]]\nid = "{id}"\nlevel = 1\nverdict = "na"\n',
+        "ScorecardError",
+    ),
+    "closed_without_a_pin": (
+        '[[cell]]\nid = "{id}"\nlevel = 1\nverdict = "pass"\ndecision_closed = true\n',
+        "ScorecardError",
+    ),
+    "row_without_id": ('[[cell]]\nlevel = 1\nverdict = "pass"\n', "KeyError"),
+    "row_without_level": ('[[cell]]\nid = "{id}"\nverdict = "pass"\n', "KeyError"),
+    "citation_without_a_token": (
+        '[[cell]]\nid = "{id}"\nlevel = 1\nverdict = "pass"\n\n'
+        '[[cell.evidence]]\npath = "engine_module.py"\nline = 2\n',
+        "KeyError",
+    ),
+}
+
+
+@pytest.mark.parametrize("fault", sorted(_UNREADABLE))
+def test_a_refusal_names_no_row_and_no_grading_words(
+    tree: tuple[Path, Path],
+    capsys: pytest.CaptureFixture[str],
+    tmp_path: Path,
+    fault: str,
+) -> None:
+    """THE REFUSAL PATH ITSELF, which the happy-path scan above cannot reach.
+
+    Nine of the ten refusals in `load_scorecard` open by naming the graded row they rejected, and
+    several quote the grading words in full. So interpolating that exception into this tool's own
+    refusal disclosed a requirement identifier the first time a record went malformed -- onto stderr,
+    which the workflow shipped beside the tool sends to a public run log. The suppression held only
+    while every record loaded, which is not a control.
+
+    THIS FUNCTION'S NAME AND EVERY PARAMETER NAME ARE PART OF THE FIXTURE: pytest builds `tmp_path`
+    from them and the refusal prints the path it was given, so both must stay clear of
+    :data:`BANNED_CONTENT` -- the same trap the clean-run arm above records.
+    """
+    root, _ = tree
+    body, exc_name = _UNREADABLE[fault]
+    record = tmp_path / f"{fault}.toml"
+    record.write_text(
+        '[scorecard]\nanchor_commit = "0000000"\n\n' + body.format(id=SENTINEL_ID),
+        encoding="utf-8",
+    )
+
+    code, out = _run(["--scorecard", str(record), "--root", str(root)], capsys)
+
+    assert code == EXIT_INSTRUMENT, (
+        f"{fault!r} exited {code}, not {EXIT_INSTRUMENT}. Exit {EXIT_FINDINGS} would render "
+        f"'I could not measure this' as 'I measured it, and citations are broken':\n{out}"
+    )
+    assert "REFUSING" in out, out
+    assert SENTINEL_ID not in out, f"the refusal disclosed a requirement identifier:\n{out}"
+    for banned in BANNED_CONTENT:
+        assert banned not in out.lower(), (
+            f"the refusal leaked assessment content ({banned!r}):\n{out}"
+        )
+    # A refusal read nothing, so it prints no total: "nothing was found" and "nothing was looked at"
+    # must never render identically, and that is the property this whole tool exists to hold.
+    assert "anchors examined" not in out, f"{fault!r} printed a total off an unread record:\n{out}"
+    assert "NOT RESOLVING" not in out, out
+    # Withholding the diagnostic must not withhold the TRIAGE. The exception CLASS carries nothing
+    # from the record and is the whole difference between "the file is unreadable" and "the file
+    # parsed and a row is malformed", so it is the one part that crosses.
+    assert exc_name in out, f"{fault!r} gave the reader no failure class to act on:\n{out}"
 
 
 def test_a_git_range_that_will_not_resolve_is_unknown_not_empty(tree: tuple[Path, Path]) -> None:

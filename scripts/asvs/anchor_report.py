@@ -34,10 +34,15 @@ GONE branch, and only two of them are re-anchors. Silently re-pointing one hides
 ``anchor_provenance.py`` is the tool that separates moved from born-wrong, and it also proposes
 nothing.
 
-**AN EMPTY RESULT FROM A SOURCE THIS COULD NOT READ IS UNKNOWN, NOT ZERO.** A missing scorecard, an
-unparseable one, a record carrying no anchors, or a git range that would not resolve are all
-:data:`EXIT_INSTRUMENT`. None of them may print "nothing stale": a clean-looking zero off a broken
-read is the exact failure this item exists to prevent.
+**AN EMPTY RESULT FROM A SOURCE THIS COULD NOT READ IS UNKNOWN, NOT ZERO.** EVERY failure to read the
+record is :data:`EXIT_INSTRUMENT` -- at least a missing scorecard, an unparseable one, a row the
+reader rejects, and a record carrying no anchors. None of them may print "nothing stale": a
+clean-looking zero off a broken read is the exact failure this item exists to prevent, and exit
+:data:`EXIT_FINDINGS` off one is worse, because that code asserts a measurement that never happened.
+
+A git range that would not resolve is NOT in that class and does not exit 2. The anchor population
+was read, so the main answer stands; only the narrowing is unavailable, and it says UNKNOWN in its
+own row rather than printing a zero.
 
 Usage::
 
@@ -66,7 +71,6 @@ from scorecard import (  # noqa: E402
     ANCHOR_GONE,
     ANCHOR_LOCATED,
     Cell,
-    ScorecardError,
     load_scorecard,
     locate_anchor,
 )
@@ -109,6 +113,9 @@ class AnchorOutcome:
 #: therefore reports COUNTS and FILE PATHS and never a requirement identifier, a verdict, or a
 #: coverage figure -- and there is deliberately no flag to opt back in, because the safe place to read
 #: per-row detail is the verifier, run where the record lives.
+#:
+#: THE RULE COVERS ERROR PATHS, which is where output stops being reviewed and where this module has
+#: already lost it once. See :func:`_refuse_unreadable`.
 
 
 def audit(cells: list[Cell], root: Path) -> list[AnchorOutcome]:
@@ -243,6 +250,28 @@ def _refuse(message: str) -> int:
     return EXIT_INSTRUMENT
 
 
+def _refuse_unreadable(scorecard: Path, exc: BaseException) -> int:
+    """Refuse a record that would not load, WITHOUT quoting the reader's own diagnostic.
+
+    THE READER'S MESSAGE IS ASSESSMENT CONTENT. Nine of the ten refusals in
+    ``scorecard.load_scorecard`` open by naming the graded row they rejected, and several quote the
+    grading words in full. Interpolating the exception here therefore published a requirement
+    identifier the first time a record went malformed -- onto stderr, which the workflow shipped
+    beside this file sends to a public run log. The suppression above held only while every record
+    loaded, and a property that holds only on the happy path is not a control.
+
+    The exception's TYPE crosses and its MESSAGE does not. A class name carries nothing from the
+    record, and it is the whole difference between "the file is unreadable" and "the file parsed and
+    a row is malformed" -- so withholding the diagnostic costs the reader no triage. The detail stays
+    where the record is, readable by the verifier run there.
+    """
+    return _refuse(
+        f"the scorecard at {scorecard} could not be read ({type(exc).__name__}). The reader's own "
+        "message is WITHHELD: it names the graded row it rejected, and this output goes to a public "
+        "log. Read the detail where the record lives, with the verifier there."
+    )
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     # REQUIRED, with no default. The record is not in this repository, so a default would name a path
@@ -296,10 +325,20 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         cells = load_scorecard(args.scorecard)
-    except (ScorecardError, OSError, ValueError) as exc:
-        # ValueError covers tomllib.TOMLDecodeError, which subclasses it. A record this could not
-        # parse is an instrument failure, never an empty record.
-        return _refuse(f"the scorecard at {args.scorecard} could not be read: {exc}")
+    except Exception as exc:
+        # BROAD ON PURPOSE, and the narrow clause it replaces is why. That clause enumerated
+        # `(ScorecardError, OSError, ValueError)`, which reads as complete and is not:
+        # `load_scorecard` subscripts the record directly in a dozen places, so a row missing `id`
+        # raised KeyError straight past it -- a traceback, and exit 1, which is EXIT_FINDINGS. "I
+        # could not measure this" then rendered as "I measured it, and citations are broken", which
+        # inverts the one answer this tool exists to give. A longer list here would only be a fresher
+        # incomplete one (SDS-3.6): the ways a record can fail to load are a property of the RECORD,
+        # which lives in another repository and is not this module's to enumerate.
+        #
+        # This is the READ boundary and nothing else -- one call, whose only job is to turn the
+        # record into cells. Every failure of it is an instrument failure, so every one of them is
+        # EXIT_INSTRUMENT and none of them prints a total.
+        return _refuse_unreadable(args.scorecard, exc)
 
     outcomes = audit(cells, args.root)
     if not outcomes:
