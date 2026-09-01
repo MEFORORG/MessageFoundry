@@ -1,6 +1,6 @@
 # ADR 0160 — Public-repo content policy: operator and security-review material only
 
-- **Status:** **Accepted (2026-08-06). Phase 1 EXECUTED; Phase 2 ACCEPTED 2026-08-31 WITH PRECONDITIONS, reversing the 2026-08-06 decline; Phase 3 still Proposed.**
+- **Status:** **Accepted (2026-08-06). Phase 1 EXECUTED; Phase 2 ACCEPTED 2026-08-31 WITH PRECONDITIONS, reversing the 2026-08-06 decline; Phase 3 still Proposed; Phase 4 EXECUTED 2026-08-31, merged 2026-09-01.**
   The owner ratified the D1 test and Phase 1 on 2026-08-05, chose the vault as the destination
   (resolving open question 3), and set a governing rule for the work: **do not break anything**,
   applied per item as *prove the mechanism or leave the item alone*. On 2026-08-06 the owner
@@ -176,6 +176,63 @@ already names.
 **Phase 3 — in-file references.** Strip Claude-Code process prose from documents that otherwise stay
 (`docs/AI.md`, `docs/ARCHITECTURE.md`, `docs/Code_Quality_Standards.md`). Surgical edits, not removals.
 
+**Phase 4 — business material and internal engineering records (46 files). EXECUTED 2026-08-31,
+merged 2026-09-01 as PR 714; `main` at `921db74a1`.** Verified by CONTENT rather than by the pull
+request reporting merged: on `main` afterwards, `docs/research` holds 0 files, `docs/testing` holds
+exactly 1 (`VERIFY.md`), `docs/design` holds 4, and `docs/BRAND.md` is absent. Two sets Phase 1 did not reach, on an owner ruling the same day. Six business and legal
+working documents (brand, positioning, the dual-licensing plan, the counsel engagement brief, the
+contributor program and its first-issues list), 25 files of `docs/testing` maintainer QA planning,
+nine `docs/research` exploratory notes, and six superseded `docs/archive/throughput` plans. All fail
+D1 both ways: the audience is a maintainer deciding project direction or planning QA, not an operator
+running the engine or a reviewer assessing it.
+
+**D1 CATEGORY 2 GOVERNS OVER A WIDER READING OF "SECURITY MATERIAL COMES OUT", and the question was
+put and answered rather than left implicit.** The owner was asked directly whether a restated policy
+sending all security material to the vault should override D1's second limb. It does not.
+`SECURITY.md`, `PHI.md`, `SUPPLY-CHAIN.md`, `SECURITY-LOOSENING.md`, the ASVS phase inventory and the
+`Secure_*` standards are what a reviewer reads to assess the engine, so they stay.
+`docs/SECURITY-DOCS-POLICY.md` continues to state that boundary publicly and was not touched.
+
+**Two carve-outs, both found by measurement AFTER the set was drafted**, which is the argument for
+measuring rather than reasoning from a directory name:
+
+* `docs/testing/VERIFY.md` STAYS. It documents `messagefoundry verify`, the wheel-only on-box
+  acceptance check a real deployment runs, and `docs/README.md` lists it as step 6 of the
+  new-operator path while warning in terms that it "is an operator tool, not a test plan". It passes
+  D1 category 1 outright. This is why its rule is `/docs/testing/*` and not `/docs/testing/`: git
+  does not descend into an excluded directory, so a directory rule makes the negation a silent no-op.
+* `docs/design/` STAYS, and was in an earlier draft of the set. `docs/design/freethread.md` is a
+  CLAIM FILE for the required-status-check drift guard, and `tests/test_required_contexts.py` treats
+  a missing claim file as an ERROR rather than a skip — deliberately, because silently dropping a
+  claim file is how a drift guard comes to guard nothing. Untracking it turns that guard's own
+  anti-narrowing assertion red.
+
+**THE INBOUND-LINK SURFACE WAS THE DEFECT, AND EXEMPTING IT WAS THE WRONG FIX.** The first draft
+untracked the 46 files and added their paths to `link_check.py`'s `WITHHELD` tuple, which turned **59
+reader-visible 404s green** instead of repairing them — the compensating-control-on-a-false-premise
+shape D2's Phase 1 record already warns about, committed by the session that had just quoted it.
+Phase 1's precedent is explicit and was not followed: *"Only the links were rewritten."* An
+independent review caught it and withheld its approval. The 49 links outside `docs/BACKLOG.md` were
+then repaired — repointed where a tracked successor genuinely covers the sentence, otherwise unlinked
+to the document's plain name so the citation survives as provenance. Measured both ways with
+`WITHHELD` forced back to its four long-standing prefixes: `origin/main` 0 failures, the first draft
+59, the repaired branch 10.
+
+The residual 10 are in `docs/BACKLOG.md` and could not be repaired in the same change: eight open
+pull requests held that file. Two narrowly scoped `WITHHELD` entries cover exactly those targets —
+ONE file and ONE subdirectory, not the parent trees — and their removal condition is *"no open PR
+touches `docs/BACKLOG.md`"* rather than a PR number, because a number goes stale silently. An earlier
+wording said "once PR 713 lands"; 713 merged while that sentence was being written and nothing
+noticed, which is the same defect one level down.
+
+**Custody first, as Phase 1 requires.** The 46 files were committed to the vault and pushed BEFORE
+leaving the tracked tree, at `wshallwshall/MessageFoundry` branch `lander/adr0160-custody`, verified
+byte-identical. That ordering mattered more than Phase 1 knew: measured across both repositories,
+**1702 paths are shared and 760 of them DIVERGE**. The vault is a stale fork, not a mirror — the
+publish pipeline that synced them was retired at the 2026-07-27 cutover. 15 of these 46 already
+existed there and 7 were divergent, so a bare untrack would have left the vault holding the older
+text and nothing holding the newer.
+
 ### D6 — considered and LEFT, so the next sweep does not re-derive them
 
 Three sets were found while executing Phase 1 and deliberately not acted on. They are recorded
@@ -217,6 +274,29 @@ of 26 files skip on `os.name != "nt"`. A green Linux leg would read as proof and
 
 **P3. Copy, prove green, THEN remove.** Never `git rm --cached` first: it removes the file from every
 working tree including the machine running it, and no restore step exists.
+
+**P4. Verify on a CLONE that carries only tracked files, never on the working tree.** Added
+2026-08-31 from Phase 4's execution, where it caught a real break that every local run reported
+green. Untracking leaves the files **on disk** under a gitignore rule, so any guard that tests
+whether a path EXISTS passes locally and fails on the runner. Phase 1 recorded this for one test;
+Phase 4 found it is the general case, and it is worse for Phase 2 than for either, because
+`scripts/` holds more existence-testing guards than `docs/` does.
+
+Three parts, and the second is the one that bites:
+
+* **Use `git clone --no-hardlinks`, NOT `git archive`.** An archive export has no `.git`, so every
+  guard that calls `git ls-files` scans zero files and goes green. A reviewer hit exactly this and
+  produced 25 red tests that were all instrument artifact; the opposite error, a silent all-green,
+  is the one that ships.
+* **Grep the SEGMENT-JOINED path form as well as the slash form.** Phase 4's first sweep for inbound
+  references missed a test that builds its path as `_REPO / "docs" / "testing" / "FILE.md"`. The
+  string `docs/testing/` never appears in that source, so a slash-form grep cannot see it, and the
+  test failed on CI after the branch was declared clean. Search for `"docs", "testing"` and
+  `"docs" / "testing"` and the bare basenames too.
+* **Prefer an announced skip to a deleted assertion** when a guard reads a document that has left.
+  `tests/test_threat_model_doc_drift.py` is the idiom: warn loudly, skip that one test, keep the
+  code-only assertions in the same module running, and offer an environment variable that makes the
+  absence a hard failure. Phase 4 reused it verbatim for the CRIT-2 coverage-plan drift check.
 
 **Unchanged by the reversal:** any path called by `.pre-commit-config.yaml` or by a workflow stays in
 this repository. That is about an outside contributor passing the gates on their own clone, which is
