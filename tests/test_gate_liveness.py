@@ -243,6 +243,67 @@ def test_a_skipped_job_owes_no_receipt() -> None:
     assert violations == []
 
 
+def test_a_cancelled_job_with_no_receipt_owes_nothing() -> None:
+    """A run-level cancel never started the job, so there is nothing to account for.
+
+    This is the arm that must stay green. `gate liveness` carries `if: always()`, which GitHub
+    evaluates true under cancellation, so it runs during a genuine run-level cancel. Reddening
+    there would blame a session for something nobody caused.
+    """
+    needs = _all_healthy()
+    needs["coverage"] = {"result": "cancelled", "outputs": {}}
+
+    violations, _ = liveness.verify(needs)
+    assert violations == []
+
+
+def test_a_timeout_killed_job_is_caught_not_excused() -> None:
+    """BACKLOG #1410. A `timeout-minutes` kill lands as `cancelled`, and the job DID run.
+
+    The receipt below is the real payload, copied from the `toJSON(needs)` dump in the liveness
+    job logs of PRs 708, 711, 712 and 719 (jobs 99561662542, 99584522330, 99586438353,
+    99689286541), where `diff-coverage (advisory)` was killed at its cap on every one. The gate
+    reported itself dead, correctly, and `verify` discarded it unread because the result string
+    said `cancelled`. Every one of those four runs reported `gate liveness (advisory)` as SUCCESS.
+    """
+    needs = _all_healthy()
+    needs["coverage"] = _job(
+        result="cancelled",
+        receipt={
+            "signal": "coverage",
+            "status": "failed",
+            "reason": "coverage.xml was not produced; the measurement never happened",
+        },
+    )
+
+    violations, _ = liveness.verify(needs)
+
+    assert [v["signal"] for v in violations] == ["coverage"]
+    assert "reported ITSELF dead" in violations[0]["message"]
+
+
+def test_a_cancelled_job_cannot_launder_itself_as_not_applicable() -> None:
+    """The rider on #1410. Making `cancelled` examinable reopens the laundering hole.
+
+    A job killed mid-measurement has no more standing to declare itself inapplicable than a
+    crashed one does, and the `failure` arm already blocks that route.
+    """
+    needs = _all_healthy()
+    needs["coverage"] = _job(
+        result="cancelled",
+        receipt={
+            "signal": "coverage",
+            "status": "not-applicable",
+            "reason": "no lines with coverage information in this diff",
+        },
+    )
+
+    violations, _ = liveness.verify(needs)
+
+    assert [v["signal"] for v in violations] == ["coverage"]
+    assert "did not finish is dead" in violations[0]["message"]
+
+
 def test_a_failed_job_still_owes_a_receipt() -> None:
     """A crashed job must be visible as a dead gate, not quietly excused."""
     needs = _all_healthy()
@@ -413,3 +474,22 @@ def test_annotation_escapes_workflow_command_metacharacters() -> None:
     line = liveness._annotation({"signal": "clone", "message": "100% broken\nsecond line"})
     assert "100%25 broken%0Asecond line" in line
     assert line.count("\n") == 0
+
+
+def test_non_mapping_outputs_does_not_crash_verify() -> None:
+    """A job whose ``outputs`` is a string, not a mapping, must not take the gate down.
+
+    THIS TEST EXISTS BECAUSE NOTHING ELSE DEFENDS THAT LINE. `verify` reads a JSON blob
+    GitHub interpolates, so a malformed or truncated payload can hand it a string. The
+    `isinstance(outputs, dict)` guard in liveness.py keeps the read total; reverting it to
+    `(job.get("outputs") or {}).get("receipt", "")` leaves EVERY OTHER TEST IN THIS FILE
+    GREEN -- measured, all 30 -- so without this test the guard is undefended and the next
+    tidying pass silently restores an AttributeError that replaces the gate's verdict with
+    a stack trace. A guard no test can miss is the only kind that survives.
+    """
+    needs = _all_healthy()
+    needs["coverage"] = {"result": "skipped", "outputs": "receipt"}
+
+    violations, _oks = liveness.verify(needs)
+
+    assert not [v for v in violations if v.get("signal") == "coverage"]
