@@ -56,8 +56,12 @@ that turns the record into cells refuses by NAMING the graded row it rejected, s
 would publish that identifier -- and, on one branch, the whole grading vocabulary -- to stderr on the
 first malformed record. Neither half of the split above reaches it, which is the point: a reader
 auditing this tool against a two-part enumeration ticks both halves and never looks for a third
-(SDS-3.6). So every refusal here quotes an exception's CLASS and never its message, and a property
-that held only while every record loaded is now a property of the tool (SDS-3.7).
+(SDS-3.6). So the one refusal that has an exception in hand quotes its CLASS and never its message,
+and a property that held only while every record loaded is now a property of the tool (SDS-3.7).
+*Not "every refusal here", which is the shape this very paragraph warns against:* of the seven refusals
+in ``main`` the other six have no exception to quote, and a reader auditing that universal against the
+first one they reach finds a path and a git exit code instead, and cannot tell a scoped claim from a
+broken one.
 
 THE HYPOTHESIS THIS EXISTS TO TEST CHEAPLY. The item offers one explanation for the whole population --
 that the numbers were read from a LATER tree than the commit the cell stamps -- and states it as a
@@ -323,13 +327,31 @@ def main(argv: list[str] | None = None) -> int:
     # started and will not publish a number, which is exactly what 3 says at its other three sites.
     # The counter-argument is real and is recorded rather than suppressed: you cannot fix a malformed
     # record by re-typing the command, which is a property the other 3s do not share.
+    #
+    # TWO SIBLINGS IN THIS DIRECTORY ANSWER 2 TO THE SAME QUESTION, and they are named here because an
+    # argument that dismisses only the far precedent reads as complete while the near ones sit one
+    # `ls` away. ``scorecard.py``'s ``_run_status`` returns 2 when the record will not load and its
+    # docstring says so; ``prove_report.py`` calls its 2 ``EXIT_INSTRUMENT``. NEITHER BINDS, and for a
+    # reason that is checkable rather than stylistic: both define 0/1/2 and NO 3, so 2 is the only
+    # refusal code either of them has and their choice carries no information about a vocabulary that
+    # has a third. This tool does have one, and it already means "started and will not publish a
+    # number" at three other sites. Fusing a malformed record into 2 would merge a caller's mistake
+    # with a record defect under a code no poller can split, which is the cost the siblings pay and
+    # this tool does not have to.
+    #
+    # EXIT 1 REMAINS REACHABLE IN THIS FUNCTION AND THAT IS NOT CLOSED HERE. The ``git`` subprocess
+    # above raises FileNotFoundError when git is off PATH, and ``--detail``'s ``write_text`` below
+    # raises OSError AFTER the summary has printed -- both exit 1, which this contract defines
+    # nowhere. Neither carries record content, so neither is this item's disclosure defect; they are
+    # recorded at the guard that strengthens the contract rather than left for a reader to discover
+    # that the paragraph above describes an invariant the function does not yet hold.
     try:
         cells = load_scorecard(args.scorecard)
     except Exception as exc:
         sys.stderr.write(
             f"REFUSING: the scorecard at {args.scorecard} would not load "
-            f"({type(exc).__name__}). The reader's own message is WITHHELD: it names the graded row "
-            "it rejected and can list the grading vocabulary in full, and this stream reaches a "
+            f"({type(exc).__name__}). The reader's own message is WITHHELD: it CAN name the graded "
+            "row it rejected and CAN list the grading vocabulary in full, and this stream reaches a "
             "public log. Read the detail where the record lives, with the verifier there.\n"
         )
         return 3

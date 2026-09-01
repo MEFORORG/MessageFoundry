@@ -27,6 +27,7 @@ import pytest
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts" / "asvs"))
 
+import anchor_provenance  # noqa: E402
 from anchor_provenance import (  # noqa: E402
     ABSENT,
     AMBIGUOUS,
@@ -55,6 +56,16 @@ REFUSED = 3
 #: accident, so a hit is PROOF of disclosure rather than a coincidence.
 SENTINEL_ID = "ZZ.SENTINEL.9"
 SECOND_SENTINEL_ID = "ZZ.SENTINEL.8"
+
+#: A sentinel for a FIELD VALUE rather than a row id, because the two leak by different routes and an
+#: id-only scan cannot see the second. ``load_scorecard`` coerces ``line`` and ``level`` with ``int()``,
+#: whose ValueError quotes the offending value verbatim and never mentions the row -- so a record whose
+#: id never leaks can still publish a field of itself. Planted as the bad numeric in the ValueError row.
+VALUE_SENTINEL = "ZZ.SENTINEL.7"
+
+#: Every planted token, scanned together. Kept as one tuple so a new sentinel is covered by every arm
+#: the moment it is added, rather than by the arm whose author remembered to name it.
+SENTINELS = (SENTINEL_ID, SECOND_SENTINEL_ID, VALUE_SENTINEL)
 
 #: Assessment CONTENT, as against the public vocabulary (anchor, scorecard, verifier, stale, born
 #: wrong). Stated ONCE and scanned by EVERY arm that captures a stream, which is the whole reason it
@@ -89,8 +100,8 @@ def _assert_no_assessment_content(stream: str) -> None:
     TOOL rather than about one code path. Asserting it in a single arm would make it hold exactly
     where it was already obvious.
     """
-    for sentinel in (SENTINEL_ID, SECOND_SENTINEL_ID):
-        assert sentinel not in stream, f"the output disclosed a graded row's identifier:\n{stream}"
+    for sentinel in SENTINELS:
+        assert sentinel not in stream, f"the output disclosed part of a graded row:\n{stream}"
     for banned in BANNED_CONTENT:
         assert banned not in stream.lower(), (
             f"the output leaked assessment content ({banned!r}):\n{stream}"
@@ -267,16 +278,23 @@ def test_the_summary_reports_direction_because_direction_is_the_evidence(
     assert "recorded HIGHER than actual 0, LOWER 1" in text
 
 
-def test_it_refuses_a_root_that_contains_the_scorecard(tmp_path: Path, history) -> None:
+def test_it_refuses_a_root_that_contains_the_scorecard(tmp_path: Path, history, capsys) -> None:
     """Resolving anchors against the repository that STORES the record is self-consistent and wrong.
 
     ``scorecard.py`` refuses the same pairing in verify mode, and the vault carries its own copy of the
     engine sources for exactly that trap to fall into.
+
+    THIS ARM WROTE TO A STREAM AND SCANNED NOTHING. It was the one refusal outside the invariant the
+    banned-token constant states -- outside it by not capturing at all, which is the form that leaves
+    no trace in the file. Nothing leaks here, because the refusal fires before the record is read; the
+    point is that "every arm that produces output scans it" is only a property if it has no exceptions.
     """
     repo, early, _later = history
     card = repo / "card.toml"
-    card.write_text("", encoding="utf-8")
-    assert main(["--scorecard", str(card), "--root", str(repo)]) == 2
+    card.write_text(f'[[cell]]\nid = "{SENTINEL_ID}"\n', encoding="utf-8")
+    code, out = _run(["--scorecard", str(card), "--root", str(repo)], capsys)
+    assert code == 2
+    _assert_no_assessment_content(out)
 
 
 def test_detail_is_written_only_when_asked(tmp_path: Path, history, capsys) -> None:
@@ -406,7 +424,16 @@ def test_the_closing_line_never_stands_alone_when_some_anchor_could_not_be_read(
 #: THE THREE ``KeyError`` ROWS ARE THE SECOND HALF OF THE DEFECT. ``load_scorecard`` subscripts the
 #: record directly in a dozen places, so these reached no refusal at all: they escaped as a traceback
 #: and exit 1, a code this tool's own contract never defines and no ``return`` in it produces.
-_UNREADABLE: dict[str, tuple[str, str]] = {
+#:
+#: ***THE ``ValueError`` AND ``UnicodeDecodeError`` ROWS EXIST TO FAIL A LIST THAT LOOKS COMPLETE.***
+#: Written from the three classes above, the obvious narrowing is
+#: ``except (ScorecardError, KeyError, tomllib.TOMLDecodeError)`` -- and it is GREEN against every
+#: other arm in this file while reintroducing both limbs of the defect. Measured against that clause:
+#: ``ValueError: invalid literal for int() with base 10: 'ZZ.SENTINEL.7'`` at exit 1, which is a field
+#: of the record on stderr under a code the contract does not define. These two rows are the reason a
+#: reader cannot repair a lint finding on the ``except`` line by enumerating what the suite happens to
+#: raise; the breadth itself is pinned separately, by the paired arms below.
+_UNREADABLE: dict[str, tuple[str | bytes, str]] = {
     "unknown_state": ('[[cell]]\nid = "{id}"\nlevel = 1\nverdict = "bogus"\n', "ScorecardError"),
     "na_without_rationale": (
         '[[cell]]\nid = "{id}"\nlevel = 1\nverdict = "na"\n',
@@ -424,6 +451,19 @@ _UNREADABLE: dict[str, tuple[str, str]] = {
         "KeyError",
     ),
     "not_toml_at_all": ('[[cell]\nid = "{id}"\n', "TOMLDecodeError"),
+    "line_that_is_not_a_number": (
+        '[[cell]]\nid = "{id}"\nlevel = 1\nverdict = "pass"\n'
+        '[[cell.evidence]]\npath = "mod.py"\nline = "' + VALUE_SENTINEL + '"\nexpect = "NEEDLE"\n',
+        "ValueError",
+    ),
+    # Bytes, not text: the fault is that the file never decodes, so it cannot be authored as a str and
+    # cannot take the ``{id}`` substitution the rows above use. The sentinel is spliced in from the
+    # same constant anyway -- writing the literal here would let the two drift apart silently, leaving
+    # a row that still passes while planting nothing for the scanner to find.
+    "bytes_that_are_not_utf8": (
+        b'[[cell]]\nid = "' + SENTINEL_ID.encode() + b'"\nverd\xff\xfeict = "pass"\n',
+        "UnicodeDecodeError",
+    ),
 }
 
 
@@ -452,7 +492,10 @@ def test_a_record_that_will_not_load_is_refused_without_naming_the_row(
     repo, _early, _later = history
     body, exc_name = _UNREADABLE[fault]
     record = tmp_path / f"{fault}.toml"
-    record.write_text(body.format(id=SENTINEL_ID), encoding="utf-8")
+    if isinstance(body, bytes):
+        record.write_bytes(body)
+    else:
+        record.write_text(body.format(id=SENTINEL_ID), encoding="utf-8")
 
     code, out = _run(["--scorecard", str(record), "--root", str(repo)], capsys)
 
@@ -509,3 +552,99 @@ def test_the_class_name_alone_separates_a_bad_file_from_a_bad_row(
     assert "ScorecardError" in row_out and "ScorecardError" not in file_out
     _assert_no_assessment_content(file_out)
     _assert_no_assessment_content(row_out)
+
+
+class _AnUnlistedFailure(Exception):
+    """A failure class that no enumeration of ``load_scorecard``'s raises could ever contain.
+
+    It is declared HERE, in the suite, which is the whole mechanism: a clause written by listing what
+    the reader is known to raise cannot name a class that does not exist in the reader. Standing in
+    for the next one somebody adds to a record parser living in another repository.
+    """
+
+
+def _loadable(tmp_path: Path, repo: Path) -> Path:
+    """A record and a root good enough to reach the load, since only the load is under test here."""
+    card = tmp_path / "reaches_the_load.toml"
+    card.write_text(
+        f'[[cell]]\nid = "{SENTINEL_ID}"\nlevel = 1\nverdict = "pass"\n', encoding="utf-8"
+    )
+    assert not card.resolve().is_relative_to(repo.resolve()), (
+        "the record must sit outside the root or an earlier guard refuses first, and this arm would "
+        "then pass without ever reaching the clause it exists to measure"
+    )
+    return card
+
+
+def test_the_guard_is_wide_enough_for_a_class_no_enumeration_could_have_named(
+    history: tuple[Path, str, str],
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """THE BREADTH OF THE CLAUSE IS THE PROPERTY, AND A FIXTURE TABLE CANNOT MEASURE IT.
+
+    Every other arm here raises a class the suite itself chose, so all of them stay green against a
+    clause narrowed to exactly the classes the suite raises -- measured: substituting
+    ``except (ScorecardError, KeyError, tomllib.TOMLDecodeError)`` leaves the whole file passing while
+    a non-numeric ``line`` again exits 1 with the record's own value on stderr. A list written from
+    observed failures is the trap the tool's own comment argues against, and it is the repair somebody
+    reaches for the day a lint rule flags the bare ``except Exception``.
+
+    So this arm raises a class that CANNOT appear in any list, and it carries a message shaped like
+    the real disclosure, so a guard that widened the catch but started printing the message fails here
+    too rather than passing on breadth alone.
+
+    Paired with the interrupt arm below. The two must fail for different reasons: narrowing reds this
+    one and leaves that one green, over-broadening does the reverse. A single arm cannot see both.
+    """
+    repo, _early, _later = history
+    card = _loadable(tmp_path, repo)
+
+    def _refuse(_path: Path) -> list[Cell]:
+        raise _AnUnlistedFailure(
+            f"cell {SENTINEL_ID!r}: verdict 'bogus' not one of "
+            "['fail', 'na', 'needs-review', 'partial', 'pass', 'unverified']"
+        )
+
+    monkeypatch.setattr(anchor_provenance, "load_scorecard", _refuse)
+    code = main(["--scorecard", str(card), "--root", str(repo)])
+    captured = capsys.readouterr()
+
+    assert code == REFUSED, f"an unlisted failure class escaped the guard and exited {code}"
+    assert "would not load" in captured.err
+    assert "_AnUnlistedFailure" in captured.err, "the reader was given no failure class to act on"
+    # THE STREAM IS PART OF THE CONTRACT, not an implementation detail. The module docstring's claim
+    # is about STDOUT -- "the summary is counts only and is safe to paste anywhere" -- so a refusal
+    # that moved to stdout would break the property this tool exists to hold while every arm reading
+    # the joined streams stayed green. Measured: that mutant passed all 26 arms before this line.
+    assert "REFUSING" not in captured.out, f"the refusal was written to stdout:\n{captured.out}"
+    _assert_no_assessment_content(captured.out + captured.err)
+
+
+def test_the_guard_is_not_so_wide_that_it_swallows_an_interrupt(
+    history: tuple[Path, str, str],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """THE OTHER DIRECTION, and the arm above is blind to it.
+
+    ``except Exception`` and ``except BaseException`` are one word apart and the second is what a
+    reader reaches for when the lesson taken from this item is "catch everything". It is wrong in a
+    way no green suite would report: the scorecard has thousands of rows, so an operator interrupting
+    a slow load would have the interrupt rendered as ``would not load (KeyboardInterrupt)`` at exit 3
+    -- a refusal that blames the record for the operator's own keystroke, on a tool that has quietly
+    become impossible to interrupt at its slowest step.
+
+    Asserting the interrupt PROPAGATES is what makes the pair complete. Over-broadening cannot be
+    caught by any arm that only checks the guard caught something.
+    """
+    repo, _early, _later = history
+    card = _loadable(tmp_path, repo)
+
+    def _interrupt(_path: Path) -> list[Cell]:
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(anchor_provenance, "load_scorecard", _interrupt)
+    with pytest.raises(KeyboardInterrupt):
+        main(["--scorecard", str(card), "--root", str(repo)])
