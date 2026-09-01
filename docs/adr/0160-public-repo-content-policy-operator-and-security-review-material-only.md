@@ -339,6 +339,18 @@ Three parts, and the second is the one that bites:
   code-only assertions in the same module running, and offer an environment variable that makes the
   absence a hard failure. Phase 4 reused it verbatim for the CRIT-2 coverage-plan drift check.
 
+  **BUT THE ANNOUNCEMENT FIRES WHERE NOBODY IS WATCHING, AND THAT IS THE HALF PHASE 4 DID NOT SEE.**
+  The removed files stay ON DISK under the gitignore rule in any tree that held them before the
+  removal landed. There the document still exists, the accessor finds it, and the assertion runs
+  ENFORCED AND GREEN with no warning at all. The skip -- and therefore the warning -- is reachable
+  only where the file is genuinely absent, which is CI and a fresh clone. **A maintainer running
+  pytest locally will never see the warning; only the runner will.** So the loud announcement is
+  loud in the one place no human is reading, and silent in the place they are.
+  Raised by a peer session verifying Phase 4's deletions for silently-disabled guards; it found none,
+  and found this instead. It does not make the idiom wrong -- an inert test that says so is still
+  better than one that does not -- but "warn loudly" overstates what the reader actually gets, and a
+  future phase should not count on the warning reaching a person.
+
 **Unchanged by the reversal:** any path called by `.pre-commit-config.yaml` or by a workflow stays in
 this repository. That is about an outside contributor passing the gates on their own clone, which is
 independent of where the tooling lives.
