@@ -453,37 +453,79 @@ def test_overlap_does_not_rewrite_a_peers_git_index(
 # empty stdout from a PreToolUse hook is byte-identical to "checked, nobody else is touching this file".
 # That is the one failure the gate cannot narrate, because it is no longer running when it happens.
 #
-# -TimeBudgetSeconds moves the bail INSIDE the walk, where it can still be reported. The property under
-# test is not the timing -- it is that an overrun yields NO map, NO cache and a non-zero exit, never a
-# partial map. A partial map is an under-report, and an under-report from this script is a silent
-# collision.
+# -TimeBudgetSeconds moves the bail INSIDE the walk, where it can still be reported. The properties
+# under test are not the timing. They are:
+#
+#   1. an overrun exits 3 and writes NO cache -- a stored under-report would answer every query for the
+#      whole window as though the walk had finished;
+#   2. the rows the walk DID reach are returned, every one of them stamped Partial/Walked/Total;
+#   3. a walk that reached NOTHING prints nothing, never "[]", so "[]" keeps meaning exactly one thing:
+#      a COMPLETE walk that found nobody.
+#
+# The rows used to be withheld too, on the reasoning that half a walk under-reports. It does, and the
+# conclusion still did not follow: discarding them does not finish the walk, it only loses the peers
+# already found. Measured 2026-08-30 at 162 worktrees, the walk took 26.1s against the gate's 16s budget
+# and bailed on five runs of five, so the gate spent that period allowing edits against a map it had
+# been handed and dropped. A partial map may ADD a warning and never remove one; property 3 and the
+# exit code are what stop it being read as an all-clear.
 
 
-def _budgeted(primary: Path, tmp_path: Path, budget: str) -> subprocess.CompletedProcess[str]:
+def _budgeted(
+    primary: Path, tmp_path: Path, budget: str, parallel: str | None = None
+) -> subprocess.CompletedProcess[str]:
     """The whole-map query with a walk budget, WITHOUT asserting the exit code -- that is the subject."""
-    return subprocess.run(
-        [
-            "pwsh",
-            "-NoProfile",
-            "-NonInteractive",
-            "-File",
-            str(OVERLAP),
-            "-Repo",
-            str(primary),
-            "-Json",
-            "-Refresh",
-            "-TimeBudgetSeconds",
-            budget,
-            "-ConfigRoot",
-            str(tmp_path / "no-such-config"),
-            "-TasksDir",
-            str(tmp_path / "no-such-tasks"),
-        ],
-        capture_output=True,
-        text=True,
-        timeout=TIMEOUT,
-        check=False,
+    args = [
+        "pwsh",
+        "-NoProfile",
+        "-NonInteractive",
+        "-File",
+        str(OVERLAP),
+        "-Repo",
+        str(primary),
+        "-Json",
+        "-Refresh",
+        "-TimeBudgetSeconds",
+        budget,
+        "-ConfigRoot",
+        str(tmp_path / "no-such-config"),
+        "-TasksDir",
+        str(tmp_path / "no-such-tasks"),
+    ]
+    if parallel is not None:
+        args += ["-ParallelLimit", parallel]
+    return subprocess.run(args, capture_output=True, text=True, timeout=TIMEOUT, check=False)
+
+
+@pytest.fixture
+def many_peers(tmp_path: Path) -> Path:
+    """A dozen peers, so a budget has somewhere to stop that is neither the start nor the end.
+
+    ``three_peers`` cannot serve here: with three worktrees a walk either bails before the first or
+    finishes, and the interesting state -- some reached, some not -- has almost no window to land in.
+    """
+    origin = tmp_path / "origin-many.git"
+    subprocess.run(
+        ["git", "init", "-q", "--bare", "-b", "main", str(origin)], check=True, capture_output=True
     )
+    primary = tmp_path / "primary-many"
+    primary.mkdir()
+    subprocess.run(
+        ["git", "init", "-q", "-b", "main", str(primary)], check=True, capture_output=True
+    )
+    git(primary, "config", "user.email", "t@example.invalid")
+    git(primary, "config", "user.name", "t")
+    (primary / "alpha.txt").write_text("base\n", encoding="utf-8")
+    git(primary, "add", "-A")
+    git(primary, "commit", "-qm", "base")
+    git(primary, "remote", "add", "origin", str(origin))
+    git(primary, "push", "-q", "origin", "main")
+    for n in range(12):
+        peer = tmp_path / f"many-{n}"
+        git(primary, "worktree", "add", "-q", "-b", f"many-{n}", str(peer))
+        (peer / f"file-{n}.txt").write_text("theirs\n", encoding="utf-8")
+        git(peer, "add", "-A")
+        git(peer, "commit", "-qm", f"peer {n} work")
+    return primary
 
 
 @pytest.fixture
@@ -522,26 +564,114 @@ def test_a_generous_budget_still_returns_the_whole_map(three_peers: Path, tmp_pa
     assert len(rows) == 3, f"expected all three peers, got {[r['Worktree'] for r in rows]}"
 
 
-def test_a_walk_that_blows_its_budget_returns_no_map_at_all(
+def _cache_path(primary: Path) -> Path:
+    common = git(primary, "rev-parse", "--path-format=absolute", "--git-common-dir").strip()
+    return Path(common) / "mefor-coord" / "overlap-cache.json"
+
+
+def test_a_walk_that_reaches_nothing_prints_nothing_rather_than_an_empty_array(
     three_peers: Path, tmp_path: Path
 ) -> None:
-    """AND SAYS SO WITH AN EXIT CODE. Silence here is indistinguishable from an all-clear.
+    """THE INVARIANT EVERY OTHER PARTIAL-MAP RULE RESTS ON.
 
-    ``[]`` would be the literal all-clear, and a partial array would be a quieter version of the same
-    lie. The only honest answer is no answer plus a non-zero exit, which is the channel the gate
-    already treats as "this check did not happen".
+    ``[]`` is the literal all-clear, so a walk that checked nobody must never be able to render as one.
+    A budget this small bails before the first worktree, leaving no rows to stamp -- and an unstamped
+    empty array is indistinguishable from a complete walk that found nobody.
     """
-    cache = (
-        Path(git(three_peers, "rev-parse", "--path-format=absolute", "--git-common-dir").strip())
-        / "mefor-coord"
-        / "overlap-cache.json"
-    )
+    cache = _cache_path(three_peers)
     assert not cache.exists(), (
         "the fixture must start with no cache, or the assertion below is blind"
     )
     proc = _budgeted(three_peers, tmp_path, "0.01")
     assert proc.returncode == 3, f"expected the budget exit, got {proc.returncode}: {proc.stderr}"
-    assert proc.stdout.strip() == "", f"a partial or empty map was printed anyway:\n{proc.stdout}"
+    assert proc.stdout.strip() == "", f"an unstamped map was printed anyway:\n{proc.stdout}"
     assert not cache.exists(), (
         "an abandoned walk was cached, pinning the under-report for the window"
     )
+
+
+def test_a_partial_walk_returns_what_it_reached_and_stamps_every_row(
+    many_peers: Path, tmp_path: Path
+) -> None:
+    """THE ROWS THAT USED TO BE THROWN AWAY, and the label that stops them reading as the whole map.
+
+    The budget is SEARCHED FOR rather than hardcoded, because it cannot be derived from the wall clock:
+    the budget covers the walk only, while the measurable time also carries a pwsh start and the session
+    registry, which together outweigh a twelve-peer walk. So the test steps the budget down until the
+    walk lands part-way, and fails if no budget ever does -- which is the honest failure, since a script
+    that could never return a partial map is exactly what this asserts against.
+    """
+    full = _budgeted(many_peers, tmp_path, "0")
+    assert full.returncode == 0, f"the control walk failed: {full.stderr}"
+    total = len(json.loads(full.stdout.strip()))
+    assert total >= 8, f"the fixture must give the budget something to run out of, got {total}"
+
+    # CONTROL: a COMPLETE walk carries no stamp at all. Without this the assertions below are satisfied
+    # by a script that marks every map partial, which would be a different lie in the same field.
+    for row in json.loads(full.stdout.strip()):
+        assert "Partial" not in row, f"a complete walk stamped itself partial: {row}"
+
+    # SERIAL, so the budget divides the work in a straight line. Under a parallel walk the same budget
+    # can still let every worktree through, because they are not being done in sequence.
+    proc = None
+    for budget in ("0.40", "0.25", "0.15", "0.10", "0.06", "0.04", "0.025"):
+        _cache_path(many_peers).unlink(missing_ok=True)
+        candidate = _budgeted(many_peers, tmp_path, budget, parallel="1")
+        if candidate.returncode == 3 and candidate.stdout.strip():
+            proc = candidate
+            break
+    assert proc is not None, (
+        "no budget produced a partial map with rows in it -- either the walk never bails part-way, "
+        "or it still discards the peers it reached"
+    )
+    rows = json.loads(proc.stdout.strip())
+    for row in rows:
+        assert row.get("Partial") is True, f"a partial row was not stamped: {row}"
+        assert row["Total"] > row["Walked"], (
+            f"a partial walk claimed full coverage: walked {row['Walked']} of {row['Total']}"
+        )
+    assert not _cache_path(many_peers).exists(), (
+        "an abandoned walk was cached, pinning the under-report for the window"
+    )
+
+
+def test_the_serial_and_parallel_walks_produce_the_same_map(
+    many_peers: Path, tmp_path: Path
+) -> None:
+    """THE PARALLEL WALK IS AN OPTIMISATION, so it has to be invisible in the answer.
+
+    Runspaces return in completion order, and rows that shuffle between runs read as churn to anyone
+    diffing two maps -- so the comparison is on the ORDERED text, not on a set.
+    """
+    _cache_path(many_peers).unlink(missing_ok=True)
+    one = _budgeted(many_peers, tmp_path, "0", parallel="1")
+    _cache_path(many_peers).unlink(missing_ok=True)
+    many = _budgeted(many_peers, tmp_path, "0", parallel="8")
+    assert one.returncode == 0 and many.returncode == 0, f"{one.stderr}\n{many.stderr}"
+    assert one.stdout.strip() == many.stdout.strip(), (
+        "the parallel walk changed the map it was supposed to only speed up"
+    )
+
+
+def test_the_term_memo_does_not_change_the_answer(many_peers: Path, tmp_path: Path) -> None:
+    """A COLD AND A WARM WALK MUST AGREE, or the memo is answering a question it was not asked.
+
+    The memo skips three of the four git spawns per worktree on a hit, keyed on the commit ids those
+    diffs read. A key that omitted an input would show up here as a second walk disagreeing with the
+    first -- which is the only failure mode a content-addressed cache has.
+    """
+    common = Path(
+        git(many_peers, "rev-parse", "--path-format=absolute", "--git-common-dir").strip()
+    )
+    memo = common / "mefor-coord" / "overlap-terms.json"
+    memo.unlink(missing_ok=True)
+    _cache_path(many_peers).unlink(missing_ok=True)
+
+    cold = _budgeted(many_peers, tmp_path, "0")
+    assert cold.returncode == 0, f"the cold walk failed: {cold.stderr}"
+    assert memo.exists(), "the walk never wrote a term memo, so the warm run below proves nothing"
+
+    _cache_path(many_peers).unlink(missing_ok=True)
+    warm = _budgeted(many_peers, tmp_path, "0")
+    assert warm.returncode == 0, f"the warm walk failed: {warm.stderr}"
+    assert cold.stdout.strip() == warm.stdout.strip(), "the memo changed the map it replayed"
