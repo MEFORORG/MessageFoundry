@@ -1417,3 +1417,121 @@ def test_the_ordering_switch_did_not_leak_into_rules_3_and_3d(
         )
     )
     assert "working tree of the SHARED PRIMARY checkout" not in removal
+
+
+# ------------------------------------------------- BACKLOG #1379 class one: -C shadows --git-dir
+#
+# ZERO EXISTING TESTS PUT `-C` AND `--git-dir` ON ONE COMMAND LINE, verified before writing these, so
+# nothing here can be disturbing behaviour another row depends on.
+#
+# THE MODEL IS MEASURED, NOT ARGUED. Run against real git, twice, reading the config back:
+#   git -C A --git-dir=B/.git config k v   ->  the value lands in B. --git-dir DECIDES the
+#                                              repository regardless of its position next to -C.
+#   git -C A --git-dir=.git   config k v   ->  the value lands in A, and the session cwd has no
+#                                              .git at all. A RELATIVE --git-dir resolves against
+#                                              the POST-`-C` directory.
+# The gate collects `-C` candidates first and appends the promoted `--git-dir` behind them, and the
+# caller takes the first candidate git answers on -- so a real `-C` directory always answers and the
+# token that actually decides never gets asked.
+
+
+def test_a_dash_C_must_not_shadow_the_git_dir_that_actually_decides(
+    tmp_path: Path, repo: SimpleNamespace
+) -> None:
+    """FAIL-OPEN, and proven by CONSEQUENCE rather than by verdict.
+
+    From an ungoverned cwd, naming an ungoverned directory with `-C` and the GOVERNED repository
+    with `--git-dir`, the write really lands in the governed shared config. A verdict-only test
+    would pass just as well against a rule that could not reach the victim at all, which is why
+    this reads the value back out of the governed repo.
+    """
+    other = tmp_path / "Unrelated"
+    other.mkdir()
+    subprocess.run(["git", "init", "-b", "main", str(other)], check=True, capture_output=True)
+
+    command = f'git -C "{other}" --git-dir="{repo.primary}/.git" config core.hooksPath /dev/null'
+
+    # THE CONSEQUENCE, established first so the verdict below is judged against a real hazard.
+    subprocess.run(command, cwd=str(other), shell=True, capture_output=True, text=True)
+    landed = subprocess.run(
+        ["git", "config", "--local", "--get", "core.hooksPath"],
+        cwd=str(repo.primary),
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    assert landed == "/dev/null", (
+        "fixture does not reproduce the hazard: the write did not reach the governed config, so a "
+        "verdict assertion below would prove nothing"
+    )
+
+    reason = assert_denied(run_gate(shell(command, cwd=other), repo.repos))
+    assert "SHARED git configuration" in reason
+
+
+def test_a_RELATIVE_git_dir_resolves_against_the_post_dash_C_directory(
+    tmp_path: Path, repo: SimpleNamespace
+) -> None:
+    """The composition half. `--git-dir=.git` is relative, so it roots at the `-C` target.
+
+    THE `-C` HERE MUST NAME AN UNGOVERNED DIRECTORY, and the first draft of this test got that
+    wrong. It passed `-C <governed primary>`, which the gate denies off the `-C` candidate ALONE --
+    so the relative `--git-dir` was never consulted and the row passed identically with the
+    composition reverted. Mutation caught it; reading it did not. A test whose subject is never
+    reached is not a weaker test, it is a different one.
+
+    So: stand in an ungoverned repo, point `-C` at a SECOND ungoverned directory, and let a
+    RELATIVE `--git-dir` climb back to the governed repo. Every absolute path on the line is
+    ungoverned, and the only thing that can produce a deny is resolving `../Primary/.git` against
+    the post-`-C` directory -- which is what real git does.
+    """
+    other = tmp_path / "Sibling"
+    other.mkdir()
+    subprocess.run(["git", "init", "-b", "main", str(other)], check=True, capture_output=True)
+    relative = f"../{repo.primary.name}/.git"
+
+    command = f'git -C "{other}" --git-dir={relative} config core.hooksPath /dev/null'
+
+    # CONSEQUENCE FIRST: prove the relative token really reaches the governed config, or the verdict
+    # below is judged against a hazard that does not exist.
+    subprocess.run(command, cwd=str(other), shell=True, capture_output=True, text=True)
+    landed = subprocess.run(
+        ["git", "config", "--local", "--get", "core.hooksPath"],
+        cwd=str(repo.primary),
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    assert landed == "/dev/null", (
+        "fixture does not reproduce the hazard: the relative --git-dir did not reach the governed "
+        "config, so the verdict assertion below would prove nothing"
+    )
+
+    reason = assert_denied(run_gate(shell(command, cwd=other), repo.repos))
+    assert "SHARED git configuration" in reason
+
+
+def test_an_ungoverned_git_dir_still_passes_even_with_a_governed_dash_C(
+    tmp_path: Path, repo: SimpleNamespace
+) -> None:
+    """THE OTHER DIRECTION, and it is why this is a REORDER rather than a widening.
+
+    `--git-dir` deciding means it decides BOTH ways: a governed `-C` with an ungoverned
+    `--git-dir` writes to the UNGOVERNED repo, so denying it would name a repository the write
+    never touches -- the BACKLOG #1085 false-deny shape. A fix that only ever adds denials would
+    pass the two rows above and fail this one.
+    """
+    other = tmp_path / "Unrelated2"
+    other.mkdir()
+    subprocess.run(["git", "init", "-b", "main", str(other)], check=True, capture_output=True)
+
+    command = f'git -C "{repo.primary}" --git-dir="{other}/.git" config core.hooksPath /dev/null'
+
+    subprocess.run(command, cwd=str(repo.other), shell=True, capture_output=True, text=True)
+    governed = subprocess.run(
+        ["git", "config", "--local", "--get", "core.hooksPath"],
+        cwd=str(repo.primary),
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    assert governed != "/dev/null", "fixture wrong: the write reached the governed repo after all"
+
+    assert run_gate(shell(command, cwd=repo.other), repo.repos) is None
