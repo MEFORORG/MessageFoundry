@@ -2,10 +2,17 @@
 # Copyright (C) 2026 MessageFoundry Organization and contributors
 """Negative controls for the required merge contexts that had none (BACKLOG #1000).
 
-A GATE NOBODY HAS WATCHED FAIL IS AN ASSUMPTION WEARING A GREEN TICK. Thirteen contexts are the entire
-merge gate, and several of them were guarded only by the property that they exist. This file supplies
-the missing plant-and-observe controls; ``tests/negative_controls.toml`` records which control belongs
-to which context and ``tests/test_negative_controls.py`` fails when a context has none.
+A GATE NOBODY HAS WATCHED FAIL IS AN ASSUMPTION WEARING A GREEN TICK. Sixteen contexts are the entire
+merge gate as of 2026-08-31, and several of them were guarded only by the property that they exist.
+This file supplies the missing plant-and-observe controls; ``tests/negative_controls.toml`` records
+which control belongs to which context and ``tests/test_negative_controls.py`` fails when a context has
+none.
+
+THE COUNT IS RECORDED HERE, NEVER DERIVED HERE. ``.github/required-contexts.txt`` is the checked-in
+claim and the only thing this file reads. It said thirteen until the review gate and both CodeQL matrix
+contexts were reconciled onto it (BACKLOG #1404), and that is exactly how a context arrives here
+unproven: the reconciliation is driven by the LIVE required set, so a newly-required context lands with
+zero controls and SAYS SO, rather than quietly not being looked at.
 
 EVERY CONTROL HERE IS ASYMMETRIC, and that is the part most likely to be skipped. It is not enough that
 neutering a rule turns a control red -- the control must fail for exactly the shapes that rule covers
@@ -39,9 +46,9 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from _bash_resolver import bash_sees, require_bash
+from _bash_resolver import bash_sees, explain_returncode, require_bash
 
-from tests._workflow_contexts import ROOT, jobs_of, load_workflow
+from tests._workflow_contexts import ROOT, jobs_of, load_workflow, required_contexts
 
 _TIMEOUT = 300
 
@@ -927,3 +934,498 @@ def test_the_hygiene_gate_does_not_read_a_squash_suffix_as_an_item(
         "the gate read the squash-merge pull-request suffix as a backlog item. A banner would be "
         f"demanded for a PR number that has no ledger row.\n{_ascii(out)}"
     )
+
+
+# ===================================================================================================
+# CONTEXTS THAT CAN GO ABSENT -- the shared half of the review-gate and CodeQL controls below.
+# ===================================================================================================
+#
+# A required check that never REPORTS blocks every pull request forever, and it is the failure with
+# the least warning attached: nothing turns red, pull requests simply stop becoming mergeable.
+# codeql.yml's header records the measured case. On 2026-08-27 the first entry this repository's merge
+# queue ever held sat AWAITING_CHECKS with 32 check-runs green and three CodeQL contexts absent,
+# because that workflow declared no `merge_group:` trigger (BACKLOG #340).
+#
+# Both gates armed on 2026-08-31 are exposed to it, so the detector is written once and each control
+# points at it rather than growing a second copy free to disagree.
+
+
+def _triggers_of(workflow: str) -> dict[str, Any]:
+    """A workflow's `on:` block.
+
+    PyYAML reads YAML 1.1, in which the bare key ``on`` is the BOOLEAN True -- so the fallback is not
+    defensive padding, it is the ordinary path for a file whose key is unquoted.
+    """
+    parsed = load_workflow(workflow)
+    block = parsed.get("on", parsed.get(True))
+    assert isinstance(block, dict), f"{workflow}'s `on:` did not parse to a mapping: {block!r}"
+    return block
+
+
+def _absence_risks(triggers: dict[str, Any]) -> list[str]:
+    """Ways this trigger set lets a REQUIRED context fail to report at all."""
+    risks: list[str] = []
+    if "pull_request" not in triggers and "pull_request_target" not in triggers:
+        risks.append("no pull-request trigger: the context can never report on a pull request")
+    if "merge_group" not in triggers:
+        risks.append(
+            "no `merge_group:` trigger: the context never reports on a queue entry, so nothing "
+            "merges once the queue is enabled (BACKLOG #340, measured on PR 619)"
+        )
+    block = triggers.get("pull_request") or triggers.get("pull_request_target") or {}
+    if isinstance(block, dict):
+        risks.extend(
+            f"`pull_request.{key}` filter: the workflow skips a pull request touching none of those "
+            "paths, and a skipped required context never reports"
+            for key in ("paths", "paths-ignore")
+            if key in block
+        )
+    return risks
+
+
+def test_the_absence_detector_fires_on_a_trigger_set_that_can_go_quiet() -> None:
+    """NEGATIVE CONTROL OF THE DETECTOR, and the asymmetry the two controls below rest on.
+
+    "The shipped triggers are safe" and "the detector matches nothing" are the same green, which is
+    the pair this registry exists to separate. Three planted trigger sets must each be named -- and a
+    set carrying EXTRA events must stay clean, because widening when a workflow reports is legitimate
+    and a detector that flagged it would be "fixed" by deleting a cron nobody wanted removed.
+    """
+    assert _absence_risks({"push": None}), "the detector cannot see a missing pull-request trigger"
+    assert _absence_risks({"pull_request": None}), "the detector cannot see a missing merge_group"
+    assert _absence_risks({"pull_request": {"paths": ["ide/**"]}, "merge_group": None}), (
+        "the detector cannot see a paths filter, which is how a required context goes absent without "
+        "any trigger being removed at all"
+    )
+    assert (
+        _absence_risks(
+            {
+                "pull_request": {"branches": ["main"]},
+                "merge_group": None,
+                "push": {"branches": ["main"]},
+                "schedule": [{"cron": "0 7 * * 1"}],
+                "workflow_dispatch": None,
+            }
+        )
+        == []
+    ), "the detector flagged a trigger set that only ADDS events; widening is not the hazard"
+
+
+# ===================================================================================================
+# `a reviewer has read this` -- run as the SHIPPED SHELL against planted label sets.
+# ===================================================================================================
+#
+# ARMED 2026-08-31 (BACKLOG #1404). With `required_approving_review_count` pinned at 0 -- every
+# session on this machine pushes as one GitHub identity, so a human-approval rule would wedge every
+# pull request rather than review any -- this single context is the repository's ENTIRE review
+# requirement. Nothing else anywhere reports that a green pull request was never read, so a gate that
+# could not go red here would not be a weakened control, it would be the absence of one.
+#
+# The gate's OWN shell is lifted out of the workflow and run, never re-implemented: a second copy of
+# that `case` would be free to agree with itself.
+_REVIEW_GATE = "review-gate.yml"
+_REVIEW_GATE_JOB = "reviewed"
+_REVIEW_GATE_CONTEXT = "a reviewer has read this"
+_LABEL_STEP = "Require the reviewed label"
+
+
+def _review_gate_script() -> str:
+    """The label-reading step's shell, with the shape this control depends on asserted first."""
+    steps = jobs_of(_REVIEW_GATE)[_REVIEW_GATE_JOB]["steps"]
+    matches = [s for s in steps if _LABEL_STEP in str(s.get("name", ""))]
+    assert len(matches) == 1, (
+        f"expected exactly ONE step named like {_LABEL_STEP!r} in {_REVIEW_GATE}, found "
+        f"{len(matches)}; this control runs THAT step's shell and cannot pick between several"
+    )
+    script = str(matches[0]["run"])
+    assert "$LABELS" in script and "$ACTION" in script, (
+        "the label-reading step no longer reads $LABELS and $ACTION, so this control would be feeding "
+        f"input to a script that ignores it and every verdict below would be about nothing: {script!r}"
+    )
+    return script
+
+
+def _run_review_gate(
+    bash: str, script: str, workdir: Path, env: dict[str, str], *, labels: str, action: str
+) -> tuple[int, str]:
+    """Run the step's shell UNDER THE FLAGS ACTIONS USES, and validate the invocation.
+
+    GitHub runs a `run:` block as `bash --noprofile --norc -e -o pipefail {0}`. Reproducing those
+    flags is not decoration: `-e` changes which line can end the script, and a control run under a
+    friendlier shell would be measuring a step CI never executes.
+
+    126/127 are a HARNESS fault, never a gate verdict. A caller comparing `code != 0` would otherwise
+    read a broken invocation as "the gate refused this pull request" -- the shape BACKLOG #1216
+    records, where a mangled script path made six assertions vacuously green.
+    """
+    (workdir / "review_gate.sh").write_text(script, encoding="utf-8", newline="\n")
+    proc = _run(
+        [bash, "--noprofile", "--norc", "-e", "-o", "pipefail", "review_gate.sh"],
+        workdir,
+        {**env, "LABELS": labels, "ACTION": action},
+    )
+    out = _text(proc)
+    assert proc.returncode not in (126, 127), (
+        f"{explain_returncode(proc.returncode, 'the review-gate step')} Output: {out.strip()[:300]}"
+    )
+    return proc.returncode, out
+
+
+@pytest.fixture
+def review_gate(tmp_path: Path) -> tuple[str, str, Path, dict[str, str]]:
+    return _require_bash(tmp_path), _review_gate_script(), tmp_path, _child_env()
+
+
+#: Label sets that must be REFUSED. The near-misses are the interesting half: the gate matches
+#: `,reviewed,` against the comma-joined list, so it is an EXACT-ELEMENT test, and a substring rule
+#: -- the obvious way to write this -- would pass every one of them.
+_UNREAD = (
+    ("", "opened", "a brand-new pull request carries no labels; the default state must be blocked"),
+    ("bug,enhancement", "opened", "unrelated labels are not a review"),
+    ("reviewed-by-bot", "labeled", "a label CONTAINING the token is not the token"),
+    ("not-reviewed", "reopened", "a label carrying it as a suffix, which reads as the opposite"),
+    ("Reviewed", "labeled", "the wrong case; the repository's label is lowercase `reviewed`"),
+    ("re,viewed", "labeled", "the token split across two labels"),
+)
+
+#: Label sets that must PASS. The position cases are the asymmetry: a rule anchored to the start or
+#: the end of the joined list would refuse a correctly-labelled pull request that carries others too.
+_READ = (
+    ("reviewed", "labeled", "the ordinary case: one label, added by a reviewer"),
+    ("reviewed,bug", "opened", "the token FIRST among several"),
+    ("bug,reviewed", "reopened", "the token LAST among several"),
+    ("bug,reviewed,enhancement", "ready_for_review", "the token in the middle"),
+)
+
+
+def test_the_review_gate_refuses_a_pull_request_nobody_has_marked_read(
+    review_gate: tuple[str, str, Path, dict[str, str]],
+) -> None:
+    """PLANTED: six label sets that are not a review, run through the shipped shell.
+
+    This is the gate going RED, which is the whole property. Until the context was armed nothing in
+    this repository had watched it do so, and it backs the only review control there is.
+    """
+    bash, script, workdir, env = review_gate
+    for labels, action, why in _UNREAD:
+        code, out = _run_review_gate(bash, script, workdir, env, labels=labels, action=action)
+        print(f"[#1000] review gate labels={labels!r} action={action} exit={code}")
+        assert code != 0, (
+            f"the review gate PASSED a pull request nobody has read ({why}). labels={labels!r} "
+            f"action={action!r}\n{_ascii(out)}"
+        )
+        assert "add-label reviewed" in out, (
+            "the gate refused but did not name the remedy. It is a LABEL, and a reader who guesses at "
+            f"a rebase fires `synchronize`, which strips one.\n{_ascii(out)}"
+        )
+
+
+def test_the_review_gate_refuses_a_synchronize_even_when_the_payload_shows_the_label(
+    review_gate: tuple[str, str, Path, dict[str, str]],
+) -> None:
+    """PLANTED: the STALE PAYLOAD, and the single most load-bearing line in this gate.
+
+    On `synchronize` the previous step has just removed the label, so the event payload is one step
+    out of date. Reading it would pass a pull request that was invalidated moments earlier. This is
+    the one case where the gate must refuse a payload that says `reviewed`, and it is the whole
+    difference between "a reviewer read THESE commits" and "a reviewer read some earlier ones".
+    """
+    bash, script, workdir, env = review_gate
+    code, out = _run_review_gate(
+        bash, script, workdir, env, labels="reviewed", action="synchronize"
+    )
+    assert code != 0, (
+        "the gate accepted a `synchronize` on the strength of a label the step before it had already "
+        f"removed. Commits nobody has read would merge as reviewed.\n{_ascii(out)}"
+    )
+
+
+def test_the_review_gate_passes_a_pull_request_a_reviewer_has_marked_read(
+    review_gate: tuple[str, str, Path, dict[str, str]],
+) -> None:
+    """THE ASYMMETRY. A gate that refused everything would satisfy both tests above while wedging every
+    pull request in the repository -- and with `strict = true` on branch protection, permanently.
+
+    The position cases are deliberate rather than padding: a reviewed pull request routinely carries
+    other labels, so the token has to be found first, last and in the middle of the joined list.
+    """
+    bash, script, workdir, env = review_gate
+    for labels, action, why in _READ:
+        code, out = _run_review_gate(bash, script, workdir, env, labels=labels, action=action)
+        print(f"[#1000] review gate labels={labels!r} action={action} exit={code}")
+        assert code == 0, (
+            f"the gate refused a pull request a reviewer HAD marked read ({why}). labels={labels!r} "
+            f"action={action!r}\n{_ascii(out)}"
+        )
+
+
+def test_the_review_gate_still_reports_under_the_required_context_string() -> None:
+    """The other way this gate dies, and the quieter one: the context stops arriving at all.
+
+    Three surfaces, every one of them in-repo. The job NAME is the context string; a job-level `if:`
+    would let the job skip, and a skipped required check reports nothing; the trigger set decides
+    whether it reports on a pull request and in the merge queue. The `cla` control is this same shape
+    for the same reason -- where the context string is the surface, the string is what to pin.
+    """
+    job = jobs_of(_REVIEW_GATE)[_REVIEW_GATE_JOB]
+    assert _REVIEW_GATE_CONTEXT in required_contexts(), (
+        f"{_REVIEW_GATE_CONTEXT!r} left .github/required-contexts.txt. With approvals pinned at 0 "
+        "that does not weaken review, it removes it."
+    )
+    assert str(job.get("name")) == _REVIEW_GATE_CONTEXT, (
+        f"the job name is {job.get('name')!r}, so it reports under a different context string than "
+        f"branch protection requires. {_REVIEW_GATE_CONTEXT!r} would never report and every pull "
+        "request would wedge."
+    )
+    assert "if" not in job, (
+        f"the {_REVIEW_GATE_JOB!r} job grew a job-level `if:` ({job.get('if')!r}). Gate the STEPS "
+        "instead, which is what this workflow already does -- a skipped job reports nothing at all."
+    )
+    risks = _absence_risks(_triggers_of(_REVIEW_GATE))
+    assert not risks, f"{_REVIEW_GATE} can leave a required context absent:\n  " + "\n  ".join(
+        risks
+    )
+
+
+#: A line that INVOKES gh with `--add-label`, as distinct from one that PRINTS the phrase.
+#:
+#: That distinction is the whole detector, and the obvious spelling got it wrong first: a plain
+#: `"--add-label" in body` fires on the gate's own error text, which tells a reviewer to run
+#: `gh pr edit <N> --add-label reviewed`. A detector counting itself, and the "fix" it invites is
+#: deleting the one line that tells an author how to clear the check. The identical trap is recorded
+#: one module over, in tests/test_security_posture.py's `_gating_text`.
+_GH_ADD_LABEL = re.compile(r"(?m)^\s*(?:[A-Za-z_]\w*=\S*\s+)*gh\b[^\n]*--add-label")
+
+
+def _adds_its_own_label(body: str) -> list[str]:
+    return [m.group(0).strip() for m in _GH_ADD_LABEL.finditer(body)]
+
+
+def test_nothing_in_the_review_gate_adds_the_label_it_checks_for() -> None:
+    """A gate that can satisfy itself is not a gate.
+
+    The whole protocol is a human running `gh pr edit <N> --add-label reviewed`; the workflow's only
+    write is the REMOVAL on `synchronize`, which moves toward blocked. One real `--add-label reviewed`
+    call anywhere in this file -- added in good faith to "re-arm" the gate after a failed run -- would
+    turn the required context into a formality that reports success on work nobody has read.
+
+    THE ASYMMETRY IS INSIDE THE DETECTOR here, so it is asserted in the same call: a planted
+    invocation must be caught, and the gate's printed INSTRUCTION carrying the same flag must not be.
+    """
+    body = "\n".join(
+        str(step.get("run", "")) for step in jobs_of(_REVIEW_GATE)[_REVIEW_GATE_JOB]["steps"]
+    )
+    assert "--remove-label reviewed" in body, (
+        "the review gate no longer removes the label on a new commit, so a pull request stays marked "
+        "read across commits nobody has read"
+    )
+    assert _adds_its_own_label('gh pr edit "$NUMBER" --add-label reviewed'), (
+        "the detector cannot see a real `gh ... --add-label` invocation"
+    )
+    assert (
+        _adds_its_own_label(
+            'echo "::error::Not yet read. When you have: gh pr edit <N> --add-label reviewed"'
+        )
+        == []
+    ), "the detector flagged the gate's own instruction text rather than a call"
+    found = _adds_its_own_label(body)
+    assert not found, (
+        f"{_REVIEW_GATE} writes the label it gates on, so the gate satisfies itself: {found}"
+    )
+
+
+def test_the_review_gate_lets_a_merge_queue_entry_through() -> None:
+    """THE ASYMMETRY ON THE OTHER AXIS, and the one whose failure would be total.
+
+    A merge_group event carries no pull request and therefore no labels. A gate that read them there
+    would refuse every queue entry, and a required context that can never go green in the queue means
+    NOTHING MERGES -- measured on this repository's first queue entry, recorded in codeql.yml's
+    header. So the label-reading step has to stay confined to pull_request events.
+    """
+    steps = jobs_of(_REVIEW_GATE)[_REVIEW_GATE_JOB]["steps"]
+    reading = [s for s in steps if _LABEL_STEP in str(s.get("name", ""))]
+    assert len(reading) == 1
+    expr = str(reading[0].get("if", ""))
+    assert "github.event_name == 'pull_request'" in expr, (
+        f"the label-reading step's `if:` is {expr!r}. It must stay confined to pull_request events: "
+        "on a queue entry there are no labels to read and it would refuse every merge."
+    )
+    queue = [s for s in steps if "merge_group" in str(s.get("if", ""))]
+    assert queue, (
+        "no step handles the merge_group event, so a queue entry would run a job with every step "
+        "skipped. Keep the explicit no-op -- it is what records the decision."
+    )
+
+
+# ===================================================================================================
+# `CodeQL (python)` / `CodeQL (javascript-typescript)` -- an EXTERNAL detector on in-repo surfaces.
+# ===================================================================================================
+#
+# Recorded as required from the live API on 2026-08-31. The scanning is github/codeql-action's and
+# this suite does not run it, so what is controlled here is what the `cla` control settles on for the
+# same reason: the part the repository owns. For CodeQL that is bigger than a job key. The context
+# string is a MATRIX TEMPLATE, and codeql.yml's own header invites the edit that breaks it -- "Drop a
+# language to narrow scope". Dropping one removes a REQUIRED context, which wedges every pull request
+# rather than narrowing anything.
+_CODEQL = "codeql.yml"
+_CODEQL_JOB = "analyze"
+
+#: The matrix expression inside the job's `name:`. Matched as a pattern rather than compared as a
+#: literal, because the whitespace inside `${{ ... }}` is free.
+_MATRIX_LANGUAGE = re.compile(r"\$\{\{\s*matrix\.language\s*\}\}")
+
+#: Terms in a job-level `if:` whose value DIFFERS on a fork pull request or between contributors.
+#: `github.repository` is deliberately not among them: on a `pull_request` event it names the BASE
+#: repository, so it is constant for every pull request the required set applies to.
+_GUARD_HAZARDS = (
+    (
+        re.compile(r"github\.event\.pull_request\.head\.repo"),
+        "reads the HEAD repository, which is the fork on a fork pull request -- the job would skip "
+        "there and a required context would never report",
+    ),
+    (
+        re.compile(r"github\.event\.pull_request\.head\.label"),
+        "reads the head label, which carries the fork owner's login",
+    ),
+    (
+        re.compile(r"github\.(triggering_)?actor"),
+        "reads the acting user, so the job skips for some contributors and not others",
+    ),
+    (
+        re.compile(r"github\.event_name\s*==\s*'(?!pull_request')"),
+        "pins the job to a single non-pull_request event",
+    ),
+)
+
+
+def _guard_risks(expr: str) -> list[str]:
+    """Ways a job-level `if:` can evaluate FALSE on a pull request into this repository."""
+    return [why for pattern, why in _GUARD_HAZARDS if pattern.search(expr)]
+
+
+def _codeql_job() -> dict[str, Any]:
+    return jobs_of(_CODEQL)[_CODEQL_JOB]
+
+
+def _codeql_contexts(languages: list[str], template: str) -> set[str]:
+    """The context strings a `CodeQL (<language>)` matrix reports, expanded from the job's name."""
+    assert _MATRIX_LANGUAGE.search(template), (
+        f"the {_CODEQL_JOB!r} job's name {template!r} no longer templates on matrix.language, so this "
+        "expansion would collapse every language onto one string and prove nothing"
+    )
+    return {_MATRIX_LANGUAGE.sub(lang, template) for lang in languages}
+
+
+#: The CodeQL contexts branch protection ENFORCES, read from the live API 2026-08-31.
+#:
+#: LITERAL, NOT READ FROM `.github/required-contexts.txt`, and that is the whole subtlety. These two
+#: are required on the server while that file deliberately does not list them: it records codeql.yml
+#: as NOT required, on a fork-PR rationale nobody has retracted, and resolving that contradiction is
+#: an owner decision either way (BACKLOG #1404). So the file is short ON PURPOSE, and a control that
+#: derived this set from it would quietly compare NOTHING -- passing while the matrix could drop a
+#: language that still blocks every pull request.
+#:
+#: This is the one place in this module that does not defer to the canonical file, so it is the one
+#: place that can go stale against the server without a test noticing. When the decision lands it
+#: should go away rather than be updated: if the contexts are recorded, replace this with the file
+#: lookup; if they come off protection, delete it and the two controls it feeds.
+_LIVE_CODEQL_CONTEXTS = frozenset({"CodeQL (python)", "CodeQL (javascript-typescript)"})
+
+
+def _required_codeql_contexts() -> set[str]:
+    from_file = {c for c in required_contexts() if c.startswith("CodeQL")}
+    return from_file or set(_LIVE_CODEQL_CONTEXTS)
+
+
+def _shipped_codeql_matrix() -> tuple[list[str], str]:
+    job = _codeql_job()
+    return [str(x) for x in job["strategy"]["matrix"]["language"]], str(job["name"])
+
+
+def test_the_codeql_matrix_still_reports_both_required_contexts() -> None:
+    """PLANTED by the file's own instructions: "Drop a language to narrow scope".
+
+    That sentence is a fair note about SCOPE and a trap about CONTEXTS. Both matrix combinations are
+    named in branch protection, so removing one does not narrow the scan -- it deletes a required
+    status check, and a required check that never reports blocks every pull request forever. Nothing
+    goes red; pull requests just stop becoming mergeable.
+    """
+    languages, template = _shipped_codeql_matrix()
+    required = _required_codeql_contexts()
+    reported = _codeql_contexts(languages, template)
+    print(f"[#1000] codeql matrix {languages} reports {sorted(reported)}")
+    assert required, (
+        "no CodeQL context is in .github/required-contexts.txt, so this control compared nothing. "
+        "That is a broken check, not a clean sweep."
+    )
+    missing = sorted(required - reported)
+    assert not missing, (
+        f"branch protection requires {missing}, which codeql.yml's matrix no longer reports. Every "
+        "pull request would wait on a check that never arrives. Restore the language -- or remove the "
+        "context from branch protection FIRST and mirror that into .github/required-contexts.txt."
+    )
+
+
+def test_the_codeql_context_detector_fires_on_a_narrowed_matrix() -> None:
+    """NEGATIVE CONTROL OF THE CONTROL, plus the asymmetry.
+
+    "The shipped matrix covers both" and "the comparison matches nothing" are the same green. A
+    one-language matrix must be reported as missing the other context -- and a WIDER matrix must not
+    be reported at all, because adding a language is a legitimate edit and a control demanding exact
+    equality would be "fixed" by reverting it.
+    """
+    _, template = _shipped_codeql_matrix()
+    required = _required_codeql_contexts()
+    narrowed = _codeql_contexts(["python"], template)
+    assert sorted(required - narrowed) == ["CodeQL (javascript-typescript)"], (
+        "dropping a language from the matrix was not reported as a missing required context"
+    )
+    widened = _codeql_contexts(["python", "javascript-typescript", "go"], template)
+    assert required - widened == set(), "the detector flagged a matrix that only ADDS a language"
+
+
+def test_the_codeql_guard_cannot_skip_a_pull_request_to_this_repository() -> None:
+    """PLANTED as the plausible repair, not as sabotage.
+
+    .github/required-contexts.txt records the open cost of requiring these two: the SARIF upload needs
+    `security-events: write`, which a fork-PR token does not carry, so a fork pull request cannot make
+    them green. The obvious-looking fix is to skip the job on fork pull requests -- which replaces a
+    check that goes RED on a fork with one that never reports at all, so the fork pull request waits
+    forever instead of failing visibly.
+
+    The shipped guard is an equality on `github.repository`. On a `pull_request` event that names the
+    BASE repository, fork pull requests included, so it cannot be false on any pull request the
+    required set applies to. tests/test_security_posture.py pins the exact string; this pins WHY that
+    string is the safe one, which is the half that survives a rewording.
+    """
+    expr = str(_codeql_job().get("if", ""))
+    assert "github.repository" in expr, (
+        f"the {_CODEQL_JOB!r} guard is {expr!r}. It no longer keys on the base repository, which is "
+        "the only term in that expression constant across every pull request."
+    )
+    risks = _guard_risks(expr)
+    assert not risks, (
+        f"the {_CODEQL_JOB!r} job's `if:` can be false on a pull request:\n  " + "\n  ".join(risks)
+    )
+    absent = _absence_risks(_triggers_of(_CODEQL))
+    assert not absent, f"{_CODEQL} can leave a required context absent:\n  " + "\n  ".join(absent)
+
+
+def test_the_guard_detector_fires_on_a_fork_skipping_expression() -> None:
+    """NEGATIVE CONTROL OF THE DETECTOR, and the asymmetry that keeps the shipped guard alive.
+
+    The guard is legitimate and load-bearing: a fork's own clone and the retired private archive would
+    need paid Advanced Security for the SARIF upload, and nothing requires the context there. So this
+    has to fire on the fork-sensitive spellings and stay silent on the repository equality -- a
+    detector that refused every job-level `if:` would be satisfied by deleting a correct guard.
+    """
+    planted = (
+        "github.event.pull_request.head.repo.full_name == github.repository",
+        "github.event.pull_request.head.label == 'MEFORORG:main'",
+        "github.actor != 'dependabot[bot]'",
+        "github.event_name == 'push'",
+    )
+    for expr in planted:
+        assert _guard_risks(expr), f"the detector cannot see {expr!r}"
+    for safe in ("github.repository == 'MEFORORG/MessageFoundry'", "always()"):
+        assert _guard_risks(safe) == [], f"the detector flagged the safe expression {safe!r}"

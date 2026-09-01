@@ -80,6 +80,21 @@ _ADVISORY_BY_PLACEMENT_SECURITY_JOBS = frozenset({"released-line-audit"})
 # Anything else on a required job is a way for the context to silently not report.
 _JOB_IF_ALLOWLIST = {
     ("ci.yml", "ci-gate"): "always()",  # the roll-up must run even when a gated leg failed
+    # REVIEWED 2026-08-31, when the two CodeQL matrix contexts were recorded as required. The guard is
+    # an equality on `github.repository`, which names the repository the workflow RUNS IN -- for a
+    # `pull_request` event that is always the BASE repo, a pull request opened from a fork included.
+    # Every pull request the required set applies to targets MEFORORG/MessageFoundry, so the
+    # expression cannot be false on one and the job cannot skip.
+    #
+    # What it does skip is a fork's own clone or the retired private archive, where the SARIF upload
+    # would need paid Advanced Security. Nothing requires the context there.
+    #
+    # NARROWING IT IS THE HAZARD, not the guard itself. A fork-sensitive term -- anything reading
+    # `github.event.pull_request.head.repo` -- would read as a fix for the fork-token cost that
+    # .github/required-contexts.txt records, and would instead skip the job on every fork pull request,
+    # leaving a required context that never reports. tests/test_merge_gate_controls.py plants that
+    # exact shape and watches this rule name it.
+    ("codeql.yml", "analyze"): "github.repository == 'MEFORORG/MessageFoundry'",
 }
 
 # Idioms that discard a non-zero exit, i.e. neuter the step without touching continue-on-error.
@@ -258,22 +273,33 @@ def test_required_jobs_carry_no_continue_on_error() -> None:
             if (step or {}).get("continue-on-error") not in (None, False):
                 name = (step or {}).get("name") or (step or {}).get("uses") or "<unnamed step>"
                 offenders.append(f"{wf}:{key} — step {name!r} has continue-on-error")
-    # Liveness receipt. NOT `examined == len(required_contexts())`: the three `test (<os>, py3.14)`
-    # contexts are ONE matrix job, so 13 contexts collapse to 11 jobs. Pinned rather than derived so
-    # that a change in the collapse — a matrix split, or a context that quietly stops resolving —
-    # forces a look here instead of passing on a self-consistent count.
+    # Liveness receipt. NOT `examined == len(required_contexts())`: a MATRIX job reports one context
+    # per combination while being one job, so the count collapses. Pinned rather than derived so that a
+    # change in the collapse — a matrix split, or a context that quietly stops resolving — forces a
+    # look here instead of passing on a self-consistent count.
     #
-    # 13/11 since 2026-07-29, when backlog-hygiene was promoted to a required context. Promoting one
-    # brings its job under every rule in this module for the first time, which is the point: it
-    # immediately surfaced a `|| true` in that job (a false positive, as it turned out — see
-    # _gating_text — but the review it forced is exactly what promotion should trigger).
+    # 14/12 since 2026-08-31 (BACKLOG #1404), when `a reviewer has read this` was recorded. One
+    # collapse: ci.yml's `test` matrix reports 3 contexts from 1 job, so 14 - 2 = 12.
+    #
+    # THIS MODULE READS THE CANONICAL FILE, NOT THE SERVER, AND THEY DIFFER ON PURPOSE RIGHT NOW. The
+    # server also requires `CodeQL (python)` and `CodeQL (javascript-typescript)`, which that file
+    # does not list while an owner decision about them is open. So codeql.yml:analyze is not examined
+    # here — and the moment those lines are added this becomes 16/13, because that job is a second
+    # matrix collapse reporting two contexts from one job. The allowlist entry for its job-level `if:`
+    # is already in place for that: it is inert while the job is unexamined, and it is the reviewed
+    # REASONING rather than the switch.
+    #
+    # Recording a context drags its job under every rule in this module for the first time, exactly as
+    # backlog-hygiene did on 2026-07-29 — and it paid immediately here: the review-gate job's
+    # `|| true` surfaced on the first CI run after that context was recorded.
     print(
         f"[security-posture] examined {examined} distinct jobs backing "
         f"{len(required_contexts())} required contexts"
     )
-    assert examined == 11, (
-        f"expected the 13 required contexts to resolve to 11 distinct jobs (the 3 `test` legs share one "
-        f"matrix job); got {examined}. If the workflow layout genuinely changed, update this count."
+    assert examined == 12, (
+        f"expected the 14 required contexts to resolve to 12 distinct jobs (the 3 `test` legs share "
+        f"one matrix job); got {examined}. If the workflow layout genuinely changed, update this "
+        "count."
     )
     assert not offenders, (
         "a REQUIRED status check cannot fail, so it gates nothing:\n  "

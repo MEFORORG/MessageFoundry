@@ -75,7 +75,21 @@ jobs:
           GH_REPO: ${{ github.repository }}
           NUMBER: ${{ github.event.pull_request.number }}
         # The only write this workflow performs, and it only ever moves toward blocked.
-        run: gh pr edit "$NUMBER" --remove-label reviewed 2>/dev/null || true
+        #
+        # ITS EXIT CODE IS NOT DISCARDED, and that became load-bearing on 2026-08-31 when this job's
+        # context entered branch protection. The line read `... 2>/dev/null || true` until then: a
+        # REQUIRED job swallowing a failure, which is the shape tests/test_security_posture.py refuses
+        # and caught here on the first run after the context was recorded.
+        #
+        # THERE WAS NOTHING TO SWALLOW. This step runs on `synchronize` only, and `synchronize` means
+        # commits nobody has read, so the run ends RED regardless -- the next step returns that verdict
+        # from `$ACTION` without consulting the API at all. Letting the removal's own failure through
+        # changes no outcome; it only stops hiding the reason.
+        #
+        # A SILENTLY FAILED REMOVAL IS ITS OWN TRAP, which is why hiding it cost something. If the
+        # label survives, re-adding it emits no `labeled` event, so nothing re-runs this job and the
+        # pull request sits red with nothing a reviewer can do. Printed, it names itself.
+        run: gh pr edit "$NUMBER" --remove-label reviewed
 
       - name: Require the reviewed label
         if: github.event_name == 'pull_request'

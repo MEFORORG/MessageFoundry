@@ -394,3 +394,70 @@ script path; 126/127 are a hard failure rather than a gate verdict. Re-measured 
 deliberately hostile ambient (PYTHONIOENCODING=cp1252, PYTHONUTF8=0, LC_ALL=tr_TR.UTF-8, a global
 core.autocrlf, and PATH ordered so the WSL bash comes first).
 """
+
+# --- review-gate.yml -------------------------------------------------------------------------------
+
+[[control]]
+context = "a reviewer has read this"
+plants = """
+Six label sets that are not a review -- none at all, unrelated ones, and four NEAR-MISSES
+(`reviewed-by-bot`, `not-reviewed`, `Reviewed`, `re,viewed`) -- plus the stale payload: a `synchronize`
+whose event still carries `reviewed` because the removal step ran one step ago. The gate's OWN shell is
+lifted out of the workflow and run under the flags Actions uses, not re-implemented; a second copy of
+that `case` would be free to agree with itself. Three structural plants sit beside them, because the
+quieter death of this gate is the context never arriving: a renamed job, a job-level `if:`, and a
+trigger set that cannot report on a pull request or in the merge queue.
+"""
+red = [
+  "tests/test_merge_gate_controls.py::test_the_review_gate_refuses_a_pull_request_nobody_has_marked_read",
+  "tests/test_merge_gate_controls.py::test_the_review_gate_refuses_a_synchronize_even_when_the_payload_shows_the_label",
+  "tests/test_merge_gate_controls.py::test_the_review_gate_still_reports_under_the_required_context_string",
+  "tests/test_merge_gate_controls.py::test_nothing_in_the_review_gate_adds_the_label_it_checks_for",
+]
+holds = """
+A labelled pull request must PASS, in every position the token can occupy in the joined label list --
+first, last, middle and alone. A gate that refused uniformly would satisfy every planted case above
+while wedging every pull request in the repository, permanently, because `strict = true` means a
+blocked pull request cannot even be brought up to date past it. The merge queue is the other half: a
+merge_group entry carries no pull request and therefore no labels, so the label-reading step must stay
+confined to pull_request events -- a required context that can never go green in the queue means
+NOTHING MERGES, which codeql.yml's header records happening here.
+"""
+green = [
+  "tests/test_merge_gate_controls.py::test_the_review_gate_passes_a_pull_request_a_reviewer_has_marked_read",
+  "tests/test_merge_gate_controls.py::test_the_review_gate_lets_a_merge_queue_entry_through",
+  "tests/test_merge_gate_controls.py::test_the_absence_detector_fires_on_a_trigger_set_that_can_go_quiet",
+]
+observed = """
+RUN AGAINST A NEUTERED GATE, 2026-08-31, and the result is SPECIFIC rather than uniform, which is the
+part that makes it evidence. Two separate neuterings of review-gate.yml, each reverted from the same
+run:
+
+  * the `*,reviewed,*)` case arm widened to `*)`, so the gate can never refuse -- 1 of the 11 selected
+    controls red, 10 green.
+  * the synchronize comparison changed to a value that never occurs
+    (`[ "$ACTION" = "never-happens" ]`), which leaves the gate reading a payload that is stale by one
+    step -- 1 red, 10 green, and the one that reddened is the stale-payload control specifically.
+
+A THIRD SPELLING OF THE SAME NEUTERING IS REPORTED AS A HARNESS FAULT, DELIBERATELY. Replacing the
+test with `if false` removes `$ACTION` from the script, and the fixture refuses to run a script that
+ignores the input it is being fed -- three ERRORS rather than three passes. A control that fed input to
+a script which cannot read it would be green about nothing (BACKLOG #1216).
+
+The gate has also been seen red in ordinary use: arming the context on 2026-08-31 turned every open
+pull request red on this one check until a reviewer labelled it.
+"""
+
+# --- codeql.yml: NO ENTRY YET, AND THAT IS NOT AN OVERSIGHT ----------------------------------------
+#
+# `CodeQL (python)` and `CodeQL (javascript-typescript)` are required on the SERVER but are not in
+# .github/required-contexts.txt, because whether they should be is an owner decision that has been put
+# and not answered -- that file's codeql.yml block carries it. This registry reconciles against that
+# file, so registering a control here for a context the file does not list would fail
+# `every registered context is required` and would also pre-empt the decision from the side that is
+# supposed to be READ-ONLY to it.
+#
+# THE CONTROLS THEMSELVES ARE ALREADY WRITTEN, in tests/test_merge_gate_controls.py: a matrix check
+# reading the required set both ways, a repository-guard check, and a must-fire detector for each.
+# They run today and guard codeql.yml regardless of this registry. If the decision lands on "keep them
+# required", the entry here is a transcription of node ids that already exist -- not new work.
