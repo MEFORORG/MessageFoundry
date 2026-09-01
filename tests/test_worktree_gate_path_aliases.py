@@ -33,6 +33,7 @@ inherit it together instead of drifting apart.
 
 from __future__ import annotations
 
+import os
 import shutil
 import subprocess
 from pathlib import Path
@@ -43,9 +44,25 @@ ROOT = Path(__file__).resolve().parents[1]
 GATE_SOURCE = ROOT / "scripts" / "hooks" / "worktree_gate.ps1"
 B = chr(92)
 
-pytestmark = pytest.mark.skipif(
-    shutil.which("pwsh") is None, reason="pwsh (PowerShell 7) not on PATH"
-)
+# TWO gates rather than one combined condition, so a skip reports the reason that actually applied.
+#
+# THE PLATFORM GATE IS NOT A CONVENIENCE. The resolver under test is `[System.IO.Path]::GetFullPath`,
+# and that API applies the rules of the HOST, not of the path it is handed. On POSIX, `C:\Repo` is a
+# RELATIVE path -- the drive letter is an ordinary filename character and so is the backslash -- so
+# every row resolves against the process cwd and comes back as `<cwd>/c:/repo`. The aliases this fold
+# exists to collapse do not exist there to be collapsed, and neither do the two control rows: the
+# assertions would be measuring POSIX path joining, not the fold. Same gate, for a sibling reason, as
+# tests/test_worktree_gate_hijack.py. Both Windows CI legs run these assertions.
+pytestmark = [
+    pytest.mark.skipif(shutil.which("pwsh") is None, reason="pwsh (PowerShell 7) not on PATH"),
+    pytest.mark.skipif(
+        os.name != "nt",
+        reason=(
+            "[System.IO.Path]::GetFullPath applies HOST path rules, so on POSIX 'C:\\Repo' is a "
+            "relative path and every spelling resolves against the cwd instead of folding"
+        ),
+    ),
+]
 
 
 def _brace_block(src: str, name: str) -> str:
