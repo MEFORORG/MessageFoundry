@@ -18552,17 +18552,17 @@ Within `scripts/coord` and `scripts/hooks` specifically, four files are caught b
 **Cluster:** CI signalling. **Priority:** P2. **Verdict:** build.
 **Severity:** no engine effect, no PHI axis, and **no deployment axis (sec. 0)**.
 
-**What:** when a required check fails, nothing tells anyone. **Measured 2026-08-31: exactly two workflows carry an `if: failure()` step -- `branch-leak-scan.yml` and `security.yml` -- and both only FAIL THE JOB.** Nothing labels a pull request, comments on one, or opens an issue. No `ci-red`-style label exists in the repository.
+**What:** when a required check fails, nothing tells anyone. **Measured 2026-08-31: exactly two workflows carry an `if: failure()` step -- `branch-leak-scan.yml` and `security.yml` -- and both only FAIL THE JOB.** Nothing labelled a pull request, commented on one, or opened an issue, and no `ci-red`-style label existed. **THAT HALF HAS SINCE SHIPPED**, so the paragraph above describes the state at filing, not now.
 
 So the only path from a red to somebody acting on it is a seat polling every open pull request's check rollup. That is expensive enough that it will not be run often, and it makes whichever seat does the polling a single point of failure.
 
 **Autofix does not close this.** It wakes only a **live** session, and a worker that finishes its turn exits -- measured the same day with `scripts/coord/session-registry.ps1` in `wshallwshall/claude-multisession`, 740 session records against 2 live sessions. That instrument is not in this repository, so the figure cannot be re-derived from this clone. And when it does fire it reaches a BUILDER and reports WHAT broke, never WHOSE failure it is, which is the question that decides what to do. A red belongs to the pull request, to `main`, to a flake, or to the queue, and only the first is a builder's to fix.
 
-**The fix is small and the pattern is already here.** A `workflow_run` job, triggered on completion with a failure conclusion, that adds a label to the pull request. `nightly-notice.yml` already uses `workflow_run`. Noticing then costs one `gh pr list --label` call across all pull requests rather than a rollup fetch per pull request -- the difference between a poll you can afford to run often and one you cannot. Runner cost is seconds; there is no model cost at all.
+**THE SIGNAL HALF IS BUILT AND MERGED.** `.github/workflows/failure-signal.yml` landed in PR #716 on 2026-08-31 and is on `main` and in this branch's own tree. It is a `workflow_run` job, triggered on completion with a failure conclusion, that adds `ci-red` to the pull request. **Verified firing:** `github-actions[bot]` labelled PRs 718, 719 and 721, with correct skips on green runs. `nightly-notice.yml` was the pattern it followed. Noticing then costs one `gh pr list --label` call across all pull requests rather than a rollup fetch per pull request -- the difference between a poll you can afford to run often and one you cannot. Runner cost is seconds; there is no model cost at all.
 
 **This is not a push, and should not be described as one.** GitHub still cannot reach into a session. It makes the poll cheap, which is the achievable version.
 
-**Related:** the watcher half -- a cron that reads the label and spawns the attributing seat -- is filed as `wshallwshall/claude-multisession#108`, deliberately outside this number space.
+**WHAT REMAINS IS THE WATCHER, AND IT IS THE WHOLE REMAINDER.** Nothing reads `ci-red` and spawns the attributing seat, so a red still waits for the console to poll. What changed is what the console polls FOR: one `gh pr list --label ci-red` across every pull request, instead of a rollup fetch per pull request. The watcher is filed as `wshallwshall/claude-multisession#108`, deliberately outside this number space. **This item should not close until that lands**, and its banner stays open for that reason rather than because the signal is missing.
 
 ## 1403. a merge-queue ejection tells nobody, and `merge_group` carries no pull-request context
 
@@ -18579,9 +18579,11 @@ It also lands in a blind spot the rest of the machinery shares: the queue revali
 
 **THE WRINKLE THAT MAKES THIS HARDER THAN #1402: on `merge_group` there is no `github.event.pull_request`.** That is the same fact that collapsed `backlog-hygiene.yml`'s concurrency key to a single group -- the key named the pull request number, which is empty in the queue, so every entry shared one group and cancelled its predecessor. Fixed by #711; the key on `main` is now `github.ref`.
 
-Identifying the ejected pull request therefore means reading `github.event.merge_group.head_ref`, which encodes the number. **Measured 2026-08-31: nothing on `origin/main` reads that field.**
+Identifying the ejected pull request therefore means recovering the number from the queue ref, which encodes it as `gh-readonly-queue/<base>/pr-<N>-<sha>`. **Measured 2026-08-31: nothing on `origin/main` read it. THAT HAS SINCE SHIPPED.**
 
-**The fix:** a `merge_group` job with a failure condition that resolves the pull request from `head_ref` and applies the same label #1402 introduces, so one watcher covers both.
+**THIS IS BUILT AND MERGED, in the same workflow as #1402's half.** `.github/workflows/failure-signal.yml` landed in PR #716 on 2026-08-31, is on `main` and in this branch's own tree, and names this item in its header: *"THE MERGE-QUEUE CASE IS WHY head_branch IS PARSED (#1403)"*. It resolves the pull request from `pull_requests[0]` where GitHub supplies one, and otherwise parses `pr-[0-9]+` out of `head_branch` **only when the triggering run's event was `merge_group`** -- gated that way because a branch name is chosen by whoever opened it, and a fork cannot produce that event. One label, `ci-red`, covers this case and #1402's, so one watcher covers both.
+
+**WHAT REMAINS is the same remainder as #1402: nothing reads the label.** An ejection is now recorded rather than silent, and still nobody is told. This item should not close until `wshallwshall/claude-multisession#108` lands.
 
 ## 1404. the checked-in record of what gates a merge disagrees with the server three ways, and no test can see it
 
@@ -18634,7 +18636,6 @@ that a fork-PR token lacks `security-events: write`, so requiring it would block
 the reasoning that now holds, and its entry needs no change.** CodeQL still runs and still reports;
 it no longer blocks a merge. That half is #1384 and PR #700, which this item should not have been
 carrying at all.
-| `enforce_admins = FALSE`, pointing at `scripts/hooks/push_guard.py` for the reasoning | `enforce_admins` is **true**, read 2026-08-31 | The value is wrong, and this file is not the only place carrying it wrong. See below |
 
 **When `enforce_admins` changed is not recoverable.** The API reports the current value and keeps no
 history, so this item does not claim a date for it.
@@ -18722,8 +18723,14 @@ reason as much as its own.
    **PR #700 and PR #718 both edit `.github/required-contexts.txt` and disagree about the CodeQL
    lines; #700's premise -- "record CodeQL as required, which it already was" -- is void as of
    2026-09-01.** Whoever lands second must reconcile, and that is not settled here.
-2. **DONE in PR #718:** add `a reviewer has read this` to the file, with its reasoning. Do not also
-   record a CodeQL decision; per step 1 that entry stays untouched.
+2. **PARTLY DONE in PR #718, AND #718 NEEDS CORRECTING FIRST.** It adds `a reviewer has read this`
+   with its reasoning, which is right and lands 13 to 14. But it also **rewrites the
+   `DELIBERATELY NOT REQUIRED` entry step 1 says must not be edited**, adds a block asserting
+   "THEY BLOCK A MERGE TODAY ... branch protection enforces SIXTEEN", and adds a
+   `_LIVE_CODEQL_CONTEXTS` constant naming both CodeQL contexts. **All of that is false against a
+   14-context server.** #718 measured 16 before the owner removed them, and this item voided PR
+   #700's premise for exactly that reason without applying the same test to #718. Since #718 is
+   stacked on the branch carrying this item, the two land together and would contradict each other.
 3. **DONE in PR #718:** correct the `enforce_admins` line to `TRUE`. Do not say the relaxation is gone: the one `push_guard.py` names at line 82, the `DELETE` on the protection endpoint, still works. **In this item "escape hatch" means that call and nothing else.**
 4. **PARTLY DONE in PR #718**, which fixes `push_guard.py` and `required-contexts.txt` and names the rest as a deliberate scope choice. Correct every statement of the value **across all six files**, not only the four lines this item
    names in `push_guard.py`. **Re-grep the whole tree before declaring it done**, because this item
