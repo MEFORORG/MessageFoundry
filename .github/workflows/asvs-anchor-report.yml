@@ -1,0 +1,137 @@
+name: ASVS anchor report
+
+# BACKLOG #1405. An ANCHOR is a citation from one graded requirement to a line of engine code. The
+# SCORECARD is the record those requirements live in; it is not tracked in this repository. The
+# VERIFIER (scripts/asvs/scorecard.py) is the instrument that reads the record.
+#
+# MEASURED 2026-08-31: no workflow in this repository commits or pushes a change to the scorecard.
+# Two reference it -- asvs-prove-absences.yml and ci.yml -- and both only as INPUT to the verifier.
+# So an anchor breaks silently, and it breaks most often BECAUSE THE CODE GOT BETTER and the fix
+# deleted the line the anchor quoted. This workflow is the reader that fires on engine movement.
+#
+# WHAT RUNS WHERE, because the halves answer different questions and only one of them needs a
+# credential:
+#
+#   the INSTRUMENT   tests/test_asvs_anchor_report.py, in the `tooling` tier of ci.yml. Runs on every
+#                    push to main and on any pull request touching scripts/. Needs no record: it
+#                    proves the checker can detect a stale anchor, refuses a missing one, and never
+#                    prints a requirement identifier. That arm is live today.
+#   the RECORD       this workflow. Needs the scorecard, which is in the private vault.
+#
+# ---------------------------------------------------------------------------------------------------
+# THE INPUT PROBLEM IS THE SAME ONE asvs-prove-absences.yml RECORDS AT LENGTH, AND SO IS THE ANSWER.
+#
+# The scorecard lives in the vault, which is private; this repository is public. The vault reads the
+# engine freely -- public, no token -- and the reverse direction has no free version. A read
+# credential for the vault held in the public repository's secret store collapses the boundary the
+# vault exists to create, so `vars.ASVS_VAULT_REPO` and `secrets.ASVS_VAULT_READ_TOKEN` DO NOT EXIST
+# and this file does not create them. Read that workflow's decision block before proposing to.
+#
+# The consequence is stated rather than papered over: with no input configured the `report` job below
+# is SKIPPED, and the anchors on the record are read by the vault's own daily `asvs-scorecard.yml`
+# cron rather than at engine-merge time. Wiring it here while adoption is zero is the first half of a
+# two-step -- the same posture, for the same reason, as the prove-absences `prove` job.
+#
+# WHY A JOB-LEVEL `if:` AND NOT A SECOND `paths:` FILTER. The two fail differently:
+#     workflow paths: filter  -> no check reported at all -> ABSENCE, which reads as success
+#     job-level if:           -> reported as SKIPPED      -> visibly not run
+# This project has already been bitten by the first (the vault's own ASVS gate ran on no matching
+# pull request for eight days and nobody noticed, because absence looks like success).
+#
+# NOT A REQUIRED CHECK, and it must not become one. It is paths-filtered, so it does not report on a
+# pull request touching no engine code, and a required check that never reports blocks that pull
+# request forever. .github/required-contexts.txt is the record of what is required; this is not in it.
+#
+# ADVISORY BY DEFAULT, and the distinction is the point: `--strict` is not passed, so anchors that no
+# longer resolve are REPORTED and do not fail the job. They name a record this repository cannot
+# edit, so failing an engine pull request on one would block work its author cannot unblock. An
+# INSTRUMENT failure -- no record, an unreadable record, a record carrying zero anchors -- is fatal
+# unconditionally, because a run that read nothing is not evidence about any anchor.
+
+on:
+  pull_request:
+    # The filter MUST include this file and the tool, or the gate cannot observe changes to itself:
+    # a broken reporter would merge green and be found later by an unrelated engine edit.
+    paths: &anchor_paths
+      - 'messagefoundry/**'
+      - 'messagefoundry_webconsole/**'
+      - 'scripts/asvs/**'
+      - 'tests/test_asvs_anchor_report.py'
+      - '.github/workflows/asvs-anchor-report.yml'
+  push:
+    branches: [main]
+    paths: *anchor_paths
+  workflow_dispatch:
+
+# Deny by default; the one job grants only `contents: read`. Nothing here writes.
+permissions: {}
+
+concurrency:
+  group: asvs-anchor-report-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  report:
+    name: anchors that no longer resolve (advisory)
+    # SKIPPED, not absent, when there is no record to read. See the block above on why those differ.
+    if: vars.ASVS_VAULT_REPO != ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - name: Check out the engine
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: engine
+          # Full history: the report narrows unresolved anchors to files THIS range touched, and a
+          # shallow clone cannot resolve the base commit that range starts from.
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Check out ONLY the scorecard from the vault
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ vars.ASVS_VAULT_REPO }}
+          token: ${{ secrets.ASVS_VAULT_READ_TOKEN }}
+          path: vault
+          persist-credentials: false
+          fetch-depth: 1
+          # ONE FILE. docs/security is the maintainer-internal corpus. A cone-mode-off sparse
+          # checkout of the single path means a credential that can read all of it materialises none
+          # of the rest on a runner whose logs are public.
+          sparse-checkout: docs/security/asvs-scorecard.toml
+          sparse-checkout-cone-mode: false
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.14'
+
+      # No install step and no dependency: the reporter is stdlib-only, which is what lets it run on
+      # a bare interpreter here and in the vault alike. tests/test_asvs_anchor_report.py holds that
+      # property with an `-I -S` execution, so it cannot be lost quietly.
+      - name: Report anchors that no longer resolve
+        working-directory: engine
+        env:
+          SCORECARD: ${{ github.workspace }}/vault/docs/security/asvs-scorecard.toml
+          # The base of the range to attribute breakage to. Empty on workflow_dispatch, where there
+          # is no range and the whole-record totals are the answer.
+          SINCE: ${{ github.event.pull_request.base.sha || github.event.before }}
+        run: |
+          set -euo pipefail
+          # An ARRAY, not a string: an unquoted expansion would rely on word splitting (SC2086, and
+          # actionlint runs shellcheck over every run body). The `if` is an explicit block because
+          # under `bash -e` a false test at the end of an `&&` chain aborts the step.
+          flags=()
+          if [ -n "${SINCE:-}" ]; then
+            flags+=(--changed-since "${SINCE}")
+          fi
+          echo "range: ${SINCE:-none (whole-record totals only)}"
+          # No pipe, so the exit code reaching the runner is this command's own (SDS-3.8). Two
+          # outcomes matter and they are not the same event: 0 read the record and reported it,
+          # 2 could not measure. `--strict` is deliberately absent -- see the advisory note above.
+          python scripts/asvs/anchor_report.py \
+            --scorecard "${SCORECARD}" \
+            --root . \
+            "${flags[@]}"

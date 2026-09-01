@@ -18627,44 +18627,197 @@ Within `scripts/coord` and `scripts/hooks` specifically, four files are caught b
 
 **Related:** the porting and de-drifting work is filed in that repository's own tracker, issues 99 to 105, deliberately outside this number space.
 
-## 1415. Enable the empty-claims herd floor once its own base-reading distribution is harvested
+## 1413. nothing triggers a reviewer, so a required context waits on a label only a person applies
+> 🔢 **Filed 2026-09-01 (korus-palette-fluent2) -- not started.** `a reviewer has read this` became a required status check on `main` on the afternoon of 2026-08-31. **Nothing anywhere notifies a reviewer that a pull request exists.** The gate is correct and fail-closed by design; the missing half is the trigger.
+> Verdict: build
+> Research: none
+> Closing-act: code
+**Cluster:** CI signalling / fleet routing. **Priority:** P2. **Verdict:** build.
+**Severity:** no engine effect, no PHI axis, and **no deployment axis (sec. 0)** -- nothing here reaches shipped code. The cost is throughput: a pull request that is finished, green and unread sits until a person happens to look at it.
+**What:** [`.github/workflows/review-gate.yml`](../.github/workflows/review-gate.yml) states the whole protocol in its own comments -- `gh pr edit <N> --add-label reviewed`, and *"Nothing automated ever adds it."* That is a design choice and it is the right one: the workflow is **fail-closed**, so a brand-new pull request starts blocked, and its header explains that an earlier draft using a label written automatically and removed by a human failed **open**. **This item does not ask for that to change.**
+**THE GAP IS THE OTHER SIDE. Nothing tells anyone a pull request is waiting.** Measured across the 26 files in `.github/workflows/`, with the needle printed beside every zero:
+| needle | hits |
+|---|---|
+| `requested_reviewers` | 0 |
+| `review_requested` | 0 |
+| `pull_request_review` | 0 |
+| `reviewers:` | 0 |
+| `--reviewer` | 0 |
+| `gh pr review` | 0 |
+| `request-review` | 0 |
+| **positive control** `runs-on` | **56** |
+| **wide control** `review` | **54** case-sensitive, **60** with `-i` |
 
+**`runs-on` is the load-bearing control and `review` is not**, which is the reverse of what an earlier draft of this row claimed. `runs-on` appears in **26 of 26 files**, so it proves the search reached every workflow; a zero from a search that never opened the files would have looked identical. `review` has 60 hits but in only **4 of 26 files**, and 31 of those hits sit on comment lines -- it is concentrated, not saturated, and it demonstrates far less than its raw count suggests. Corrected after a non-author review; the original claim inverted which control did the work.
+
+**`.github/CODEOWNERS` EXISTS, ROUTES, AND IS INERT ONLY ON SELF-AUTHORED PULL REQUESTS.** It is on `main` at blob `29aedb575`, 950 bytes, 10 rules, with a catch-all `*` assigning every path to `@wshallwshall`. **IT HAS ALREADY FIRED, AND AN EARLIER DRAFT OF THIS ROW SAID IT COULD NOT.** GitHub never requests review from the author, and 98 of the last 100 pull requests are self-authored -- but the other 2 are `app/dependabot`, and on those the catch-all routes normally: PRs 676 and 677 both recorded `review_requested` to `@wshallwshall` about one second after creation on 2026-08-29. So the correct statement is narrower: **it is inert on self-authored pull requests, which is nearly all of them, and live on every other kind.** The evidence that produced the wrong version was a four-PR sample (725 to 728) that was entirely self-authored and therefore could not contain the counterexample. **AN EARLIER DRAFT CALLED THIS "measured four ways" AND THE PHRASE WAS DOING MORE WORK THAN THE MEASUREMENTS.** Two of the four -- `require_code_owner_reviews` false and `required_approving_review_count` 0 -- are about whether a code-owner review **BLOCKS** a merge. The claim was about whether one is **REQUESTED**. They are different quantities, so those two were never evidence for this at all, and putting them in the count made one blind reading look like four independent confirmations. The remaining direct observation, `reviewRequests` empty on 725 to 728, is the structurally blind one described above. **The honest version is one observation, correctly scoped: on a self-authored pull request GitHub does not request review from the author, so the catch-all notifies nobody about ours.** **The expiry is the point: add a second maintainer, which `GOVERNANCE.md` and `MAINTAINERS.md` both anticipate, and the routing it ALREADY DOES widens to cover self-authored pull requests -- the one case exempt today -- with nothing anywhere reporting that this paragraph went false. It does not start routing; its SCOPE grows to include ours.** The gate's own header records why an approval-based gate cannot work: every session on this machine pushes as one GitHub identity, `gh` auth is machine-wide rather than per config root, and GitHub does not let an author approve their own pull request. So `required_approving_review_count: 1` would wedge every pull request permanently. **The label is a PROCESS gate, not an IDENTITY gate** -- it enforces that a step happened, and must never be described as establishing that an independent party looked.
+
+**AND THE OBVIOUS AUTOMATION IS BLOCKED, which is why this is an item rather than a five-line workflow.** The same header records it: GitHub cannot start a session on this machine, and the live session channel reads one config directory with no glob, so it stops at an account boundary. Builders run as background sessions bound to different accounts; they open pull requests and cannot be reached. Autofix covers the CI half by waking a live session on a failed check, but it is a per-session checkbox in a desktop window, so a background session can never have it.
+
+**WHAT IS NOT THE PROBLEM, recorded because it was got wrong twice in one night.** A missing Reviewer *seat* does not block anything. **The gate is the label, and any seat can apply it.** Measured: **at least two** pull requests merged into `main` after the gate was armed with no Reviewer seat running. **713 and 716 are clean; 714 is not, and the row previously overstated it.** A seat declared `seat=reviewer` at 2026-09-01T01:17:42Z with its record last written 02:13:06Z, and 714 merged 03:05:47Z -- 52 minutes later, inside the freshness window. 713 and 716 merged 2026-08-31T23:31:17Z and 23:00:04Z, both before that seat existed. The conclusion is unchanged and the weakest case has been removed from it --
+
+| PR | labelled | merged |
+|---|---|---|
+| 713 | 16:48 | 18:31 |
+| 716 | 17:41 | 18:00 |
+| 714 | 19:40 | 22:05 |
+An earlier correction to the fleet playbooks read *"if no Reviewer seat is running, the PR does not move"*. That is false, and it is the more expensive error of the two, because it sends a reader to stand up a seat that is not required.
+**A SECOND-ORDER TRAP THAT WILL COST A ROUND TRIP, and it is why the label goes on last.** On `synchronize` the workflow **removes** the label, so any push un-reviews the pull request. Branch protection is `strict`, so a branch that is behind must be updated first -- and that update is a push. Worse, **`mergeStateStatus` hides this gate on most open pull requests**: GitHub returns one value with precedence, so `BEHIND`, `DIRTY` and `UNSTABLE` all mask the missing check. A seat triaging by that field sees `BEHIND`, runs `gh pr update-branch`, fires `synchronize`, strips any label, and only then does the pull request flip to `BLOCKED`. **The requirement is invisible until you act on something else.**
+**THE ASK NAMES AN OUTCOME RATHER THAN A MECHANISM**, because the builder is better placed to judge which. Make the existence of an unread, otherwise-mergeable pull request **reach a person or a running seat without anyone polling for it** -- reusing the `ci-red` label pattern that `failure-signal.yml` already ships is one route, a mail drop through `scripts/coord/mail.ps1` is another, and the merge-queue ejection signal is a third consumer of whatever gets built. **Do not build a workflow that applies the label.** That is the fail-open design the gate's author already rejected, and its reasoning is in the file.
+**Related:** #1402 and #1403 are the same shape one layer down -- a signal ships and fires, and nothing reads it. `.github/required-contexts.txt` listing 13 while the server requires 14, with a test that compares the file against itself, is a separate defect and PR 701 already proposes the server-reading drift detector.
+
+## 1415. Enable the empty-claims herd floor once its own base-reading distribution is harvested
 > 🔢 **Filed 2026-08-31 - not started.** Successor to [#1211](#1211-empty_claims_per_msg-is-not-contention-immune-the-ratio-form-excursions-past-its-own-slo-band-on-a-hosted-runner), which retired `empty_claims_monotonic` and shipped `empty_claims_base_reading` -- a strictly-positive sign test on the base reading -- in its place. #1211 also derived a **predicted herd floor** on that base reading, found it reproduces four harvested medians to within 5.1 percent, and then **recorded it rather than gating on it, by owner ruling on 2026-08-31**. This item is the decision to arm it. It is a separate item because arming it needs a distribution that does not exist yet.
 > Verdict: build
 > Closing-act: code
-
 **Cluster:** Developer Experience & CI. **Priority:** P3. **Verdict:** build.
 **Severity:** no engine effect, no PHI axis, **no deployment axis (sec. 0)** -- this is a measurement instrument in the test harness, not shipped engine behaviour. The cost is that the vs-N slope of `empty_claims_per_msg` is now asserted nowhere, so a real collapse in the empty-claim curve would pass CI as long as the base reading stays above zero.
-
 **WHY IT IS NOT ARMED TODAY. EVERY CRITERION BELOW EXISTS TO ANSWER THIS ONE RUN.** On run **33448760672** -- a push to `main` whose `test (windows-2022, py3.14)` job **PASSED** -- the recorded base reading was **13.12** against a predicted floor of **15.30**. Arming that floor would have reddened a green leg on a change that could not reach the subsystem, which is exactly the defect #1211 exists to remove. **The decision rule was written down before that number was read**, so the miss is a result and not a rationalisation. A model that reproduces four medians to 5.1 percent and still fails its own counterfactual is an accurate model that is not yet a safe gate.
-
 **PREREQUISITE, and it is a precondition rather than a criterion -- nothing below means anything without it. `MEFOR_PIPELINE_PER_LANE_WAKE` must be pinned for every run counted in the harvest.** The prediction assumes the engine-wide **singleton** wake. That flag moves both terms of the model at once: with it on, a commit wakes only its own lane, so the `wake` term collapses toward zero, and the idle backstop steps from the 0.25 s poll interval to the 30 s per-lane idle backstop, so the `idle` term falls by two orders of magnitude. **An unpinned flip of the engine default would therefore rewrite every floor recorded after it, with no connscale change and nothing anywhere reporting a problem.** The connscale runner pins it to `false` in the engine environment it builds. The criterion is that the pin is **in force for every run counted**, and a harvest that spans a change to it is **void rather than merely noisy** -- it would be two distributions of two different engines wearing one name.
-
 **ENABLE CRITERION 1 -- THE HARVEST MUST CLEAR THE CENSORING BAR THAT #1211'S OWN HARVEST DOES NOT.** Three tests, all three required:
-
 1. **A stated window with no known failure outside it**, or the outside failures named and counted. #1211's harvest fails this: it scanned 2026-08-29T14:25:47Z to 2026-09-01T00:33:19Z, and at least one known failing run predates that window entirely.
 2. **Artifact-less runs reported with their conclusions, and either recovered or counted as unknown-and-adverse.** #1211's harvest fails this too: 47 of 200 scanned runs (23.5 percent) produced zero connscale artifacts -- 19 success, 26 cancelled, 2 failure. **A cancelled or hung run is exactly where a degenerate base reading would live**, so the mechanism that removes runs from the corpus is correlated with the condition a floor would grade. That is not noise and it cannot be averaged away.
 3. **Provenance a reader can act on:** the scan script committed to this tree, and the readings committed or regenerable from it. #1211's harvest fails this as well -- it was drawn by a script that is not in the tree, against artifacts that expire, into a session scratchpad under `AppData\Local\Temp`, with nothing committed. No reader of this file can check a figure or re-run the measurement.
-
 **A harvest that does not clear all three is not evidence for arming a gate, however many readings it contains.** Volume is not the missing ingredient; auditability and known missingness are.
-
 **ENABLE CRITERION 2 -- THE DISTRIBUTION MUST BE PER `(leg, lane)`, NEVER POOLED.** #1211's table carries six `(leg, lane)` cells whose minima span 0.383 to 1.231 on the retired ratio, and the two ubuntu lanes cross between their median and their minimum. A pooled floor would be set by the worst cell and would grade nothing in the other five. Record `min`, `p1`, `p5`, `median` and `n` of the recorded base reading **per cell**, over runs whose connscale-carrying job **passed**.
-
 **ENABLE CRITERION 3 -- THE ARMING RULE, PRE-COMMITTED HERE BEFORE THE NUMBERS ARE READ.** For each `(leg, lane)` cell, a candidate floor `F` may be armed only if all four hold:
-
 * **(a) Margin.** `min(passing base readings in that cell) / F >= 1.25`. The margin is the whole point: the pre-landing counterfactual missed by a factor of 0.858, so a rule with no margin simply re-runs that failure on a larger sample.
 * **(b) It must grade more than the shipped sign test does.** `F` has to exclude a herd-gone reading, not merely a zero. A floor that only rejects zero duplicates `empty_claims_base_reading` and buys nothing while adding a threshold that can drift.
 * **(c) The known-answer case passes by name.** Run **33448760672**'s recorded **13.12** must not fall below the candidate `F` for its cell. **This is redundant against (a) on purpose** -- if 13.12 is in that cell's passing sample then (a) already excludes it -- because a known-answer case is worth nothing if it is inferred rather than run. Print the comparison against that run id and its recorded value, every time.
 * **(d) A demonstrated true positive.** The cell needs at least one recorded reading below `F` on a run independently established as bad, **or** a deliberate negative control that trips `F` on purpose. Without one, arming `F` repeats the weakness #1211 names about the sign test: a check whose only evidence is that it has never fired.
-
 **ENABLE CRITERION 4 -- "DO NOT ARM" IS A VALID OUTCOME AND CLOSES THIS ITEM.** If no `F` satisfies (a) through (d) in a cell, that cell stays recorded-only and the finding is written here. That is a result, not an unfinished job, and the pre-committed rule is shaped to allow it. **Widening a candidate floor until it passes is the fitted-threshold defect #1211 measured** as defect 4, where an 88-run pass put the worst ratio at 0.539 and a 153-run pass found 0.383. Do not do it here.
-
 **#1411 IS A PERMANENT HOLE. IT WAS THIS ITEM, AND IT MUST NEVER BE CITED AGAIN.** #1411 was allocated for exactly this follow-up, to a worktree whose session ended before the item could be filed. `alloc.ps1` records a claim against the tree it runs in and carries **no transfer verb by design** -- its own header states that numbers are never reclaimed because "holes are free, collisions are not" -- so #1411 cannot be filed from any other worktree, and the ledger gate would correctly refuse a commit that tried. **#1411 is superseded by #1415.** Do not file there, do not cite it, and repoint any citation of it to this item. While it stays unfiled a citation of #1411 resolves to nothing, which is honest; the day somebody legitimately allocates it, that citation begins resolving to unrelated work with nothing anywhere reporting a problem. **The missing allocation-transfer path is filed as #1414.**
-
 **Nearest existing mechanism:** the floor is already computed and recorded on every run, pass or fail, into the readings artifact and the step summary, and `harness/load/profiles/connscale-smoke.toml` already carries the `[slo]` table an armed check would key off. So the build is a threshold plus a negative control on an existing seam. **The harvest is the cost, and criterion 1 is most of it.**
-
 **Related:** [#1211](#1211-empty_claims_per_msg-is-not-contention-immune-the-ratio-form-excursions-past-its-own-slo-band-on-a-hosted-runner) is the single home for the harvest table, the five measured defects and the owner ruling -- read it there, and do not restate the table here. #1357 covers the FD arm of the test #1211 split. #1366's design premise that two metrics carry a band is now one, corrected in place there. #1414 is the allocation-transfer path this item's number history is an instance of.
 
+## 1409. diff-coverage (advisory) is killed by its 20-minute timeout on every pull request, so the coverage signal is never measured
+
+> 🔢 **Filed 2026-08-31 (ci-diagnostics) - BUILT IN THIS COMMIT, not yet landed.** Found while asking why `gate liveness (advisory)` reported healthy on a pull request whose coverage job had been cancelled. The defect that hid it is #1410, fixed in the same change.
+> Verdict: build
+> Closing-act: code
+
+**Cluster:** CI signal integrity. **Priority:** P2. **Verdict:** build.
+**Severity:** no engine effect, no PHI axis, and **no deployment axis (sec. 0)** -- a defect in this repository's own CI, not in anything a deployment runs.
+
+**What:** `diff-coverage (advisory)` in `.github/workflows/quality-advisory.yml` carried `timeout-minutes: 20` and hit it on every pull request. Each run ended with `The operation was canceled` and no diff-cover verdict, so the gate reported no coverage number at all.
+
+**THE POPULATION, measured 2026-09-01 against the GitHub API, with the instrument named beside each figure.** `quality-advisory.yml` has **714** `pull_request` runs created after the last green coverage job, plus 8 `schedule` runs, which do not run this job at all -- it is `if: github.event_name == 'pull_request'`. In a **30-run sample** of those 714, every run carries exactly one `diff-coverage (advisory)` job: **28 had completed and all 28 were cancelled; 2 were still in flight.** No success appears in the sample. The 714 is exact; the all-kills claim is a sample, and is written as one.
+
+**A SECOND BRANCH, MEASURED BY A DIFFERENT SESSION, and that is what makes this more than one measurement repeated.** The Lander seat reported the same kill on the branch behind **PR 714**, before reading any of the above. Verified here: job `99693651474`, 00:33:23Z to 00:53:39Z, cancelled. Walking that branch's last five runs, **all five were cancelled at 20m15s to 20m19s** (`99693651474`, `99689224141`, `99684895265`, `99666633134`, `99654951125`). The consistency of that window across two unrelated branches is what identifies a hard cap rather than a variable hang -- a distinction that would have pointed at a different fix.
+
+**The kill is the cap, confirmed at the source.** `timeout-minutes: 20` sits on this job at line 277 of `.github/workflows/quality-advisory.yml` on `origin/main`, and there is no step-level timeout inside the block. Job wall times run 20m15s to 20m22s, with 13 to 18 seconds of kill and teardown past the cap. **Queue time is excluded** -- these jobs queued 4 to 81 seconds, and measuring from `created_at` instead would give 20m21s to 21m43s, which no fixed cap explains. Anyone re-sizing the cap is budgeting wall time after pickup.
+
+**THE CAP WAS NEVER EDITED -- THE SUITE GREW INTO IT.** The job took 9.7 minutes on 2026-07-26, 14.8 on 2026-08-06, and **19m36s on its last green run** (job `97249962177`, run `32662197304`, 2026-08-23 19:58:26Z to 20:18:02Z). That is **24 seconds of margin**. The next push across that line began an eight-day blackout, and nothing announced it.
+
+**2026-08-23 IS THE LAST-GREEN BOUNDARY, NOT THE FIRST-KILL ONE, and the gap between them is the interesting part.** The first cap kill was **2026-08-08** (job `93153178205`, cancelled at 20m16s), a fortnight before the blackout. The job then sat **on** the boundary -- sometimes finishing, sometimes killed -- and 2026-08-23 is simply the last time it made it. **A cap is not crossed cleanly; it is crossed intermittently first**, and that window is the dangerous one: the signal is already unreliable while still looking healthy often enough that nobody asks.
+
+**WHERE THE TIME GOES, and it disposes of the obvious fix.** Measured across jobs `99554977847`, `99578445996`, `99580323074` and `99685011404`: setup -- checkout, setup-python, setup-uv, the Qt apt install, the editable install -- totals **23 to 36 SECONDS**, 2 to 3 percent of the budget. The pytest step took **19m37s to 19m49s** and reached exactly `[ 91%]` every time. So splitting the install into its own job buys nothing measurable, and a bigger box alone would only move the wall.
+
+**The cause is the selection, not the box.** This job ran the suite **serially and unfiltered**. `ci.yml` splits the same suite three ways and runs `-n 4 --dist loadfile -m 'not tooling'`. This job was the only place in CI running the tooling tier unfiltered and serial.
+
+**THE FIX:** `-m 'not tooling'` on the coverage pytest line, and the cap re-sized from 20 to 30 with the measurement recorded in the file beside it.
+
+**DESELECTING THE TOOLING TIER COSTS THIS GATE ALMOST NOTHING, and that is measured rather than argued.** The report is scoped to `--cov=messagefoundry`, and **no file in `tests/tooling_manifest.txt` imports that package directly** -- zero of 132, against a positive control of **507** files under `tests/` that do. A test that never imports the measured package cannot contribute a covered line through its own body. The tier is also the run's hard tail: across the four killed jobs the suite reaches 89 percent at **14.1 to 15.6 minutes**, and the next two percentage points then cost **3.5 to 4.7 minutes**. Those percentages count **tests, not time**, which is exactly why the tail is so much more expensive per point.
+
+**THAT CONTROL NUMBER WENT 510 to 508 to 507, AND THE LAST STEP IS THE ONE WORTH READING.** 510 came from the same regex with the trailing word boundary dropped, so it also matched `messagefoundry_webconsole`, a different package. Adding `\b` gives 508. But 508 is still one too many: `tests/test_lifespan_startup_unwinds.py` matches at lines 48 to 50, and those lines sit **inside a 1256-character string literal** beginning at line 42, holding child-process source written to a temp file. It is not an import this process executes. An AST census over all 729 `.py` files under `tests/` (zero unparseable) returns **507**, and the regex-minus-AST difference is exactly that one file, with nothing missed in the other direction.
+
+**508 WAS REPORTED BY TWO SEPARATE VERIFICATION PASSES THAT AGREED WITH EACH OTHER, AND BOTH WERE WRONG THE SAME WAY.** Both ran the same line-anchored regex. Agreement between runs of one instrument is one measurement, not two, and no amount of repeating it can see a string literal -- only a different **method** can. The zero this controls holds under every spelling tried, so no conclusion moved; the control's own size moved twice.
+
+The mark is applied at runtime by `tests/conftest.py` from that manifest, **not by decorators**, so grepping for `pytest.mark.tooling` finds 2 hits and badly under-reads the tier's size.
+
+**THE WEB CONSOLE TIER STAYS, AND THIS IS THE ONE PLACE THIS JOB MUST NOT COPY `ci.yml`.** Both `ci.yml` legs carry `--ignore-glob='*messagefoundry-webconsole*'` (lines 824 and 1134) because that package has its own job there. Copying it here would **delete real coverage**: **16 of the tier's 17 Python files import `messagefoundry`** -- the 15 test modules plus `conftest.py`, every file except a WebAuthn test double. They stand up a live `Engine` via `Engine.create()`, and 13 build `create_app` and `AuthService`, exercising **at least** `api/`, `auth/`, `pipeline/`, `config/`, `store/` and `transports/signing`. The obvious move is the wrong one.
+
+**Two corrections to that sentence's earlier form, both noun rather than number.** It said "16 of those TEST FILES", but the tier holds only 15 `test_*.py` modules; the 16th importer is `conftest.py`. And it closed its package list as an enumeration -- `store/` and `__main__` are imported too, so it now reads "at least" per SDS-3.6. Searching for the constructor `Engine(` returns **zero**, because the tier uses the async factory `Engine.create()`; that zero is printed here with its needle so nobody rediscovers it as "no Engine is ever built".
+
+**The premise was tested directly, not just argued.** Collecting the web console tier alone loads **174 `messagefoundry.*` modules**, every import-time line of which `--cov=messagefoundry` records as covered. This job is the only place in CI where that tier reaches a coverage number.
+
+**THE FIRST GREEN RUN EXISTS, AND THE CAP IS NOW SIZED ON IT.** Job `99720329464` on PR 724 finished **successfully in 14m33s** (2026-09-01 02:52:25Z to 03:06:58Z): `11510 passed, 839 skipped, 2731 deselected in 823.75s`, and its diff-cover step emitted a verdict -- **the first this gate had produced in eight days**. Against the 30-minute cap that is 15m27s of headroom, about **2.1x**. The 2731 deselected is the tooling tier, matching the partition exactly.
+
+**2.1x IS DELIBERATE, NOT LEFTOVER SLACK.** The convention elsewhere is about 1.5x, which would be 22 minutes here. The defect this item records **was** a cap with thin margin that the suite grew into silently, so the margin is the mitigation; shrinking it to convention would rebuild the trap. Re-derive if a measured run approaches 20 minutes, not before.
+
+**THREE ESTIMATES IN THE FIRST DRAFT OF THIS ITEM WERE WRONG, and one was wrong in the UNSAFE direction.** They are named rather than deleted, because this item's authority is that its numbers were measured.
+
+- *"No coverage run has ever finished"* -- **false**, and it contradicted this same item two paragraphs earlier. Job `97249962177`, named here as the last green run, reached `[100%]` with `13046 passed, 1380 skipped in 1130.96s (0:18:50)`.
+- *"The honest measured floor is 21m35s for the unnarrowed suite"* -- **wrong, unsafe, and not a measurement at all**. 21m35s is 19m40s/0.91, which assumes the last 9 percent costs what the first 91 did. pytest's percentage counts **tests, not time**, and the tail runs 15 to 26 times more expensive per point than the average, so that division is invalid. Two extrapolations by **different routes** both land well above it: applying the observed tail rate (0.35 to 0.45 s/test, from the four killed jobs' own logs) to the unreached tests gives **26 to 28 minutes**; scaling from the last green run's curve (91 percent at 602.9s of a 1110.3s span, so the final 9 percent took 45 percent of the run) gives about **33**. Call it **26 to 33 minutes, extrapolated** -- and note the whole range sits at or above the 30-minute cap. So a bigger box alone would **not** have fixed this. The narrowing is what brings it to a measured 14m33s, the opposite of what 21m35s implied.
+- *"Estimated 18 to 20 minutes for the narrowed run"* -- superseded by the measured 14m33s.
+
+**NEXT LEVER IF IT DRIFTS AGAIN:** pytest-xdist. `-n 4 --dist loadfile` needs `[tool.coverage.run] parallel = true` and a combine before `--cov-report=xml`, so it is a separate change with its own verification. Deliberately not bundled here, or a shifted coverage number would have two possible causes.
+
+**NOT ESTABLISHED.** Coverage tracing's own cost is not isolated -- no run exists with and without `--cov` over one selection. The xdist gain on a 4-vCPU runner is a guess.
+
+**ONE QUALIFICATION ON "COSTS THIS GATE NOTHING", because the grep supports a narrower claim than the sentence made.** The zero counts **direct** imports. Reach is a different question: `tests/test_dast_claims.py` is in the manifest and imports `scripts.security.dast_auth_sweep`, which imports `messagefoundry.auth.permissions` at its line 63, and every import-time line of that counts as covered under `--cov`. So deselecting the tier can drop some **import-time** coverage even though no tooling test exercises the package through its own body.
+
+**Two measurements close that gap rather than leaving it open.** The **retained** tier imports the same module -- `tests/test_dast_auth_sweep.py` is *not* in the manifest and reaches it, and all 9 files under `tests/` touching `messagefoundry.auth.permissions` are non-tooling. And coverage does **not** follow subprocesses here: there is no `[tool.coverage]` section in `pyproject.toml`, no `.coveragerc`, and no `COVERAGE_PROCESS_START` anywhere (grep exit 1 against a positive control of 3 files matching `COVERAGE`), which is the failure mode that would have made the tier matter. So the honest claim is **"costs almost nothing"**, and the trade is plainly right: 14m33s with a verdict, against a job that produced no number at all.
+
+**TWO GAPS THIS ITEM DOES NOT CLOSE, found while verifying it and left for their own numbers.** `scripts/ci/step_margin.py` is the repo's purpose-built watchdog for exactly this failure -- a step growing into its cap -- and it is wired only into `ci.yml`, so the new 30-minute cap here has **no automated guard** and rests on the re-derive instruction above, which nothing enforces. The sibling `mutation` job in this same file carries the identical 30-minute cap with the same absence of a margin check.
+
+**Related:** #1410, the liveness blindness that let this run unseen for eight days. Both were found in one pass and fixed in one commit.
+
+**Source:** the `ci-diagnostics` seat, from a 13-agent workflow with every finding adversarially verified; filed by the seat that picked up its handoff, after a second verification pass over every figure the handoff carried.
+
+**RE-MEASURED before filing, over two passes, and SIX figures did not survive.** Confirmed: the four job ids and conclusions, the per-step setup total and pytest step durations, the `[ 91%]` stop point (91 on all four), the 9.7 and 14.8 minute historical durations, the 714-run population, the 30-run sample, the manifest's 132 files, the zero direct engine imports inside it, the runtime marking in `conftest.py`, both `ci.yml` ignore-globs, and that `-m 'not tooling'` deselects **zero** web console tests (396 collected with and without the flag).
+
+**Corrected:** the positive control 510 to 508 to **507**; *"16 of those test files"* to 16 of 17 **Python** files, only 15 being test modules; the web console leg 114-134s to **130-140s** on ubuntu; *"no coverage run has ever finished"* to **false**; the 21m35s "floor" to an extrapolated **26 to 33 minutes**; and the 89-percent tail from one job's pair to a **range across four**.
+
+**A NOTE ON HOW THE WORST ONE WAS FOUND, because it generalises.** The 508 survived a full verification pass that agreed with itself. It fell only when someone parsed instead of matched. Where a number here is load-bearing, the question worth asking is not "did another pass confirm it" but "did another **method**".
+
+## 1410. gate liveness treats a timeout-cancelled job as did-not-run, so a gate killed mid-measurement reports healthy
+
+> 🔢 **Filed 2026-08-31 (ci-diagnostics) - BUILT IN THIS COMMIT, not yet landed.** The reason #1409 ran eight days unseen. Fixed in the same change.
+> Verdict: build
+> Closing-act: code
+
+**Cluster:** CI signal integrity. **Priority:** P2. **Verdict:** build.
+**Severity:** no engine effect, no PHI axis, and **no deployment axis (sec. 0)**. The cost falls entirely on what this repository can believe about its own gates.
+
+**What:** `scripts/quality/liveness.py` is the meta-gate, the check that exists so a dead gate cannot pass as a healthy one. `verify()` read each job's **result string before its receipt**, and `_DID_NOT_RUN = ("skipped", "cancelled")` excused anything that matched. A `timeout-minutes` kill lands as `cancelled`, so the one failure this file was written to catch was the one it waved through.
+
+**THE RECEIPT WAS THERE AND WAS DISCARDED UNREAD.** The coverage job's record step carries `if: always()`, so it wrote a correct verdict on every kill. Measured 2026-08-31 on PRs 708, 711, 712 and 719, in these exact words:
+
+```
+"coverage": {"result": "cancelled", "outputs": {"receipt":
+  "{\"signal\":\"coverage\",\"status\":\"failed\",
+    \"reason\":\"coverage.xml was not produced; the measurement never happened\"}"}}
+```
+
+The `FAILED` branch downstream was already correct. It was simply **unreachable**. `gate liveness (advisory)` reported SUCCESS on all four of those pull requests while the coverage signal was unmeasured -- a green meta-gate sitting on a dead gate, which is precisely the state this file exists to make impossible.
+
+**`cancelled` NAMES TWO OPPOSITE SITUATIONS, and that is the whole defect.** A run-level cancel or a superseded run never starts the job. A `timeout-minutes` kill means the job **ran and died mid-measurement**. Only the first is a legitimate absence, and the result string cannot tell them apart.
+
+**THE FIX KEYS THE EXCUSE ON THE RECEIPT BEING ABSENT, NOT ON THE RESULT STRING.** A job that never started cannot have written a receipt, so a genuine run-level cancel still takes the `continue`. A timeout-killed job has one, so it is examined and goes red.
+
+**DROPPING `cancelled` FROM `_DID_NOT_RUN` WOULD HAVE BEEN WRONG, and it is the fix most readers reach for first.** The liveness job carries `if: always()`, which GitHub evaluates true under cancellation. On a genuine run-level cancel it would therefore still run, and would then go red for something nobody caused. The receipt-conditional test cannot fire in that case.
+
+**RIDER: `cancelled` JOINS `failure` IN THE ANTI-LAUNDERING BRANCH.** A job that did not finish has no standing to declare itself `not-applicable`. Before this change a cancelled job never reached that branch, so the hole could not open; now that a timeout-killed job **is** examined, a `not-applicable` receipt would launder the kill into a pass by exactly the route the `failure` arm already blocks. Every step in these jobs is `continue-on-error`, so nothing else would be red either. The message is reworded to cover both: *"A gate that did not finish is dead, not inapplicable."*
+
+**NO `negative_controls.toml` ENTRY, DELIBERATELY.** That file is scoped to **required** merge contexts and is checked against `.github/required-contexts.txt` in both directions. `gate liveness (advisory)` is not required and must not become required. An entry would break `tests/test_negative_controls.py`.
+
+**Verification, and the strongest arm is not the unit tests.** Three tests in `tests/test_gate_liveness.py` cover a timeout **with** a receipt going red, a cancel with **no** receipt staying green, and a cancelled job failing to launder itself as not-applicable. The first two matter more as a pair than singly: they are the must-trip and must-not-trip arms of one edit, so a fix that over-corrected in either direction fails one of them.
+
+**THE REAL PROOF IS A REPLAY OF THE FOUR PRODUCTION PAYLOADS.** The `NEEDS_JSON` dump is recoverable from the API -- `gh api repos/:owner/:repo/actions/jobs/<ID>/logs` on the four liveness jobs returns about 18 KB each, carrying the coverage receipt verbatim. Extracted and fed to both versions of the file:
+
+- **`origin/main`'s `liveness.py` exits 0 on all four**, printing `PASS` and reproducing the recorded CI stdout exactly, line for line. That match validates the replay harness against the real run rather than only against a construction of it.
+- **The patched `liveness.py` fails all four.**
+
+So the defect and its fix are demonstrated on the actual bytes CI produced, not on a fixture written to agree with the diagnosis.
+
+**The signal was dropped, not mis-graded, and that is visible in the logs.** Searching the four liveness logs for `ok: ` returns exactly three matches each -- `ok: clone`, `ok: complexity`, `ok: mutation`. `ok: coverage` returns **zero** in all four, with the three siblings serving as the positive control that the search reached the corpus and discriminates by signal name. Coverage produced no verdict line of any kind: not a pass, not a violation. It hit the `continue` and was discarded.
+
+**The unit tests could not be run in the verifying worktree** -- no virtualenv, and the system interpreter lacks `pydantic`, so collection fails in `conftest.py`. That gap is named rather than assumed green; the replay above is what carries the claim.
+
+**WHAT THE RECEIPT ACTUALLY SEPARATES, stated exactly, because the first draft of this item overstated it -- and an overstated guarantee is the same defect class the item is about.** The receipt distinguishes **"the job never started"** from **"the job ran"**. It does **not** distinguish a timeout kill from a **mid-flight cancel**. A run cancelled while this job is inside pytest does reach the `always()` record step, does leave a receipt, and **will now go red**. That is reachable here: `ci.yml` sets `concurrency: cancel-in-progress`, so a fast second push cancels the first run mid-flight.
+
+The first draft said instead that a real cancel "stays green", and called that branch merely unobserved. It is not unobserved-and-safe; it is **reachable and red**. The cost is a spurious red on an **advisory** gate, which is the right side to err on: a false red is visible and gets investigated, while the false green this fix removes hid a dead gate for eight days. Recorded so the next reader who meets that red knows it is a known edge, not a regression.
+
+**NOT ESTABLISHED.** Whether a genuinely skipped coverage job leaves `outputs: {}` was not confirmed from a nightly `NEEDS_JSON` dump. And `cancelled` with **no** receipt is still excused, so the fix rests on the `always()` step winning the race against teardown -- it won on all four measured kills, but a kill that loses that race is indistinguishable from a job that never ran.
+
+**A SECOND HOLE, PRE-EXISTING AND NOT CLOSED HERE.** `verify()` never checks that a receipt's `signal` field matches the job it came from; the field is consulted in exactly one place, the mutation reconciliation. So a receipt can be mislabelled and skip that mandatory check. Untouched by this change and wants its own number.
+
+**Related:** #1409, the timeout this blindness concealed.
+
+**Source:** the `ci-diagnostics` seat, from a 13-agent workflow with every finding adversarially verified; filed by the seat that picked up its handoff, after a second verification pass.
+
+**RE-MEASURED before filing, and nothing here was refuted.** Confirmed independently: all four `gate liveness (advisory)` jobs concluded `success` (`99561662542`, `99584522330`, `99586438353`, `99689286541`); all four coverage jobs are `diff-coverage (advisory)` / `cancelled` in the **same four runs**, which pairs each dead gate to the green meta-gate that sat over it; the receipt payload, verbatim, from the liveness logs; the `if: always()` and `receipt` output wiring on disk and on `origin/main`; and the replay of both file versions against the real payloads. The step arrays also rule out a run-level cancel: in every one of the four, step 7 is `cancelled`, step 8 `skipped`, and step 9 `Record gate liveness` **succeeded** -- which is how the receipt came to exist.
 ## 1419. two records on main disagree about whether CI runs the connscale sweep, and the test docstring is the wrong one
 
 > 🔢 **Filed 2026-09-01 - not started.** `harness/load/profiles/connscale-smoke.toml` says *"No workflow runs it"* (line 26; the measurement behind it is at lines 6-12, dated 2026-08-31). `tests/test_connscale_smoke.py:45` says the same shipped profile is *"run via the ``--connscale`` CLI in CI"*. **Both sentences are on `origin/main` and they contradict each other. The toml is right; the docstring is wrong.** A reader who opens the test file to decide whether the N=50/100 regime is regression-covered gets the wrong answer, and the test file is the natural place to look. **That docstring carries a SECOND false clause three lines above, so the fix is two.** Line 42 reads *"The Postgres CI leg (pool_size forced to 1-2)"*. MEASURED: `ci.yml:2092` sets `MEFOR_STORE_POOL_SIZE: "4"`, and 1-2 appears nowhere in that job. An earlier draft of this row said "one clause" and was wrong; the miss is recorded because a fixer who trusts the count stops early. Wiring a real sweep leg up is a different question and is already owned -- see PERF-36 below.
