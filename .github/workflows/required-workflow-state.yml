@@ -56,3 +56,35 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: python scripts/ci/check_required_workflow_state.py --repo "$GITHUB_REPOSITORY"
+
+  # A SECOND JOB, NOT A SECOND STEP IN THE FIRST. The job above asks REACHABILITY -- can a required
+  # context ever report? This one asks ACCURACY -- does the checked-in file match the server? They fail
+  # for different reasons and a reader needs to know which, so they get separate names and separate exit
+  # codes. Measured 2026-08-30: the server required 15 contexts while the file named 13, and the two it
+  # omitted were listed in its own header as "DELIBERATELY NOT REQUIRED" -- the file asserted the
+  # opposite of the server, and every in-repo test still passed because they only compare documents to
+  # documents.
+  accurate:
+    name: the required-contexts file matches the server
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      # NO extra scope. The context list comes from `GET /repos/{owner}/{repo}/branches/{branch}`, which
+      # answers UNAUTHENTICATED -- verified 2026-08-30, all 15 contexts with no token. `strict` is the
+      # field that would need admin scope, and this job deliberately does not check it (see the script's
+      # docstring); a green run here says nothing about `strict`, which drifted the same day.
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.14"
+      - name: Install PyYAML (the shared context parser imports it)
+        run: |
+          # Hash-pinned from the CI toolchain lock, like every other scanner install (ADR 0034 section 3).
+          python -m pip install --require-hashes -r ci/locks/ci-scanners.lock
+      - name: Reconcile the required-contexts file against branch protection
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python scripts/ci/check_required_contexts_drift.py --repo "$GITHUB_REPOSITORY"
