@@ -370,18 +370,39 @@ jobs:
         # its own parallel job; this job was the only place in CI running it unfiltered AND serial.
         #
         # WHY DESELECTING IT REMOVES NO SIGNAL: the report is scoped to `--cov=messagefoundry`, and
-        # ZERO of the 132 manifest files import that package. Measured with the same pattern that
-        # matches 510 files under tests/, so the zero is a real absence and not a broken pattern.
-        # A test that never imports the measured package cannot contribute a covered line, so this
-        # drops wall clock that was never buying any coverage. The tier is the run's hard tail:
-        # the suite reaches 89 percent in 15.2 minutes, then the next two points cost 3.4 minutes.
+        # ZERO of the 132 manifest files import that package. Measured with the repo's OWN
+        # instrument, the _ENGINE_IMPORT regex in tests/test_tooling_partition.py, against a
+        # positive control of 508 files under tests/ that the same pattern DOES match -- so the
+        # zero is a real absence and not a broken pattern. A test that never imports the measured
+        # package cannot contribute a covered line, so this drops wall clock that was never buying
+        # any coverage. The tier is the run's hard tail: the suite reaches 89 percent in 15.2
+        # minutes, then the next two points cost 3.4 minutes.
+        #
+        # THAT CONTROL WAS FIRST WRITTEN AS 510, and the correction is recorded rather than quietly
+        # applied. 510 is the same pattern with the trailing word boundary dropped, which also
+        # matches messagefoundry_webconsole -- a DIFFERENT package. The zero holds under BOTH
+        # spellings, so the conclusion never depended on it; only the control's own size was
+        # overstated, by two.
         #
         # THE WEB CONSOLE TIER STAYS, and that is the one place this job must NOT copy ci.yml.
-        # Both ci.yml legs carry `--ignore-glob='*messagefoundry-webconsole*'` because that package
-        # has its own job over there. Here it would DELETE REAL COVERAGE: 16 of those test files
-        # import `messagefoundry`, building a live `Engine`, `create_app` and `AuthService`, so
-        # they exercise api/, auth/, pipeline/, config/ and transports/signing. Measured 114 to
-        # 134 seconds in its own ci.yml leg, which is a cheap price for coverage this gate reports.
+        # Both ci.yml legs carry `--ignore-glob='*messagefoundry-webconsole*'` (lines 824 and 1134)
+        # because that package has its own job over there. Here it would DELETE REAL COVERAGE: 16 of
+        # the tier's 17 PYTHON files import `messagefoundry` -- the 15 test modules plus conftest.py,
+        # i.e. every file except a WebAuthn test double. They stand up a live `Engine` via
+        # `Engine.create()` (searching for the constructor `Engine(` returns ZERO, so that needle is
+        # recorded here beside its zero), and 13 of them build `create_app` and `AuthService`. They
+        # exercise AT LEAST api/, auth/, pipeline/, config/, store/ and transports/signing -- "at
+        # least" because a closed enumeration is a liability (SDS-3.6), and __main__ is imported too.
+        # Collecting the tier alone loads 174 messagefoundry.* modules, every import-time line of
+        # which --cov records as covered, which is what makes this the ONLY place in CI where the
+        # tier reaches a coverage number. Measured 130 to 140 seconds in its own ubuntu ci.yml leg
+        # (177 to 237 on Windows), which is a cheap price for coverage this gate reports.
+        #
+        # THIS PARAGRAPH PREVIOUSLY SAID "16 of those TEST FILES" AND "114 to 134 seconds"; neither
+        # reproduced, and both are named rather than silently edited. The tier holds 15 test modules,
+        # so a reader who asks the tree for 16 test files does not find them. The web console leg
+        # measures 130-140s on ubuntu across the last 10 green ci.yml runs on main, and 114 is below
+        # every sample taken. The conclusion "a cheap price" survives at 140s.
         run: pytest -q -m 'not tooling' --cov=messagefoundry --cov-report=xml --cov-report=term-missing:skip-covered || true
       - name: Diff-coverage vs the PR base (advisory - never fails)
         continue-on-error: true
