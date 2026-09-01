@@ -18664,3 +18664,61 @@ Within `scripts/coord` and `scripts/hooks` specifically, four files are caught b
 **Nearest existing mechanism:** the floor is already computed and recorded on every run, pass or fail, into the readings artifact and the step summary, and `harness/load/profiles/connscale-smoke.toml` already carries the `[slo]` table an armed check would key off. So the build is a threshold plus a negative control on an existing seam. **The harvest is the cost, and criterion 1 is most of it.**
 
 **Related:** [#1211](#1211-empty_claims_per_msg-is-not-contention-immune-the-ratio-form-excursions-past-its-own-slo-band-on-a-hosted-runner) is the single home for the harvest table, the five measured defects and the owner ruling -- read it there, and do not restate the table here. #1357 covers the FD arm of the test #1211 split. #1366's design premise that two metrics carry a band is now one, corrected in place there. #1414 is the allocation-transfer path this item's number history is an instance of.
+
+## 1418. review-gate reads a snapshotted event payload, so a stale run can report the required context SUCCESS with no reviewed label
+
+> 🔢 **Filed 2026-09-01.** Found while watching a `reviewed` label fail to strip for 27 minutes on PR 724. Reproducible, mechanism identified at source, and **nothing was exposed at filing time** -- the one affected pull request healed when its author's reviewer re-labelled it, without anyone realising that is what closed it.
+> Verdict: build
+> Closing-act: code
+
+**Cluster:** CI signal integrity. **Priority:** P1. **Verdict:** build.
+**Severity:** no engine effect, no PHI axis, and **no deployment axis (sec. 0)**. The exposure is entirely to what this repository can believe about whether a human read a pull request before it merged.
+
+**What:** `a reviewer has read this` is one of 14 **required** merge contexts, with `enforce_admins` true. It can report **SUCCESS on a head that carries no `reviewed` label at all**, because the workflow reads the label list from the *event payload* rather than from the API.
+
+**THE MECHANISM IS ONE LINE, AND IT IS NOT A BUG IN THE LOGIC.** `.github/workflows/review-gate.yml:83` reads:
+
+```
+LABELS: ${{ join(github.event.pull_request.labels.*.name, ',') }}
+```
+
+That is the webhook payload, frozen when the event fired. Measured at the same ref: the file contains **zero** live label reads (no `gh api ... labels`, no `listLabelsOnIssue`), against a control of 2 total `labels` occurrences, so the payload is the only source. The workflow triggers on `labeled` and `unlabeled` as well as `synchronize`, so **every label change spawns its own run carrying its own snapshot**.
+
+**THE INVERSION: RECENCY IS BY EXECUTION TIME, SEMANTICS ARE FIXED AT CREATION TIME.** Branch protection reads the newest check-run. A run's verdict describes the world as it was when the run was *created*. Under queue latency those two orderings come apart, and a late-executing early run is overwritten by an early-created later one.
+
+**MEASURED ON PR 724, three check-runs for one context on one head, each with its originating run's creation time:**
+
+| Executed | From a run created | Verdict | |
+|---|---|---|---|
+| 13:43:11Z | 13:16:57Z | **failure** | correct, executing 26 minutes late |
+| 13:43:46Z | 13:24:25Z | **success** | **stale payload; overwrote the correct failure** |
+| 13:55:54Z | 13:54:08Z | success | legitimate, created after a real label |
+
+The middle run was created by a `ci-red` **unlabel** at 13:24:25Z, at which moment `reviewed` was genuinely present. By the time it executed, the label had been stripped 31 seconds earlier by the run above it. It reported the 13:24 world and won on recency.
+
+**Exposure window on 724: 13:43:46Z to 13:54:08Z, about ten minutes**, during which the required context read SUCCESS and the pull request carried no `reviewed` label.
+
+**WHAT PREVENTED HARM WAS `strict: true`, NOT THIS GATE -- and that distinction is the reason this is P1 rather than P3.** PR 724 was BEHIND for the whole window, so branch protection refused it on staleness. A pull request in the identical state that happened to be **current** would have satisfied the review gate with nobody having read the head. The mitigation in place is unrelated to the defect and does not generalise, which is exactly the compensating-control-on-a-false-premise shape **SDS-3.7** names.
+
+**"READ THE CONTEXT, NOT THE LABEL" IS REFUTED, and it is recorded because two sessions gave that advice and it circulated.** The reasoning was that a label is a human-readable proxy and the context is the gate itself. The context is not the gate either: it inherits the same staleness through the same snapshot. Both signals go stale, by different routes, at different times. **A lower-level proxy is not a live reading**, and substituting one for the other is the same error one layer down.
+
+**THE DISCRIMINATOR THAT HOLDS IS A COMPARISON, NOT A SIGNAL.** No single field answers this, which is precisely why the first two attempts reached for one:
+
+1. Take the newest check-run for `a reviewer has read this` on the head.
+2. Find its **originating workflow run's** `createdAt`.
+3. Compare against the pull request's latest `reviewed` **labeled/unlabeled** event.
+4. A run created **before** the last `reviewed` change carries a stale verdict, whatever it reports.
+
+Two dangerous states follow: context SUCCESS with no label, and context SUCCESS from a run created before the last `reviewed` change.
+
+**THE DETECTOR WAS VALIDATED WITH BOTH CONTROLS, because a detector reporting zero is worthless untested.** Positive: replaying PR 724 at 13:50Z, a known-bad state, fires both arms. Negative: PR 724 after 13:54:08Z, a known-good state, is clean. Live across all open pull requests at filing time: **zero dangerous states**.
+
+**THE FIRST VERSION OVER-FIRED AND IS RECORDED RATHER THAN DELETED.** It compared against *any* label event, so an unrelated `ci-red` change flagged four pull requests that were fine. Narrowing to `reviewed` events specifically is what makes it a detector rather than a noise source. A screen built to catch one shape will report every other shape as that shape.
+
+**FIX DIRECTION, not prescribed here because the trade-offs are the builder's.** The obvious move is to read the labels live in the job rather than from the payload. That closes the inversion, at the cost of an API call and a token scope. A second option is to make the gate refuse rather than pass when its payload is older than the head it is judging. Whichever is chosen, the acceptance test is the positive control above: a replay of the 13:50Z state must go red.
+
+**NOT ESTABLISHED.** The queue latency that opens the window is not characterised: three observations of the strip firing gave roughly 2 minutes, over 7 minutes, and 27 minutes, so the window is variable and its distribution is unknown. Whether any pull request has ever **merged** through this state was not checked -- the live scan covers currently-open pull requests only, and answering it for merged ones needs a walk of historical check-runs against label timelines. That walk is worth doing and has not been done.
+
+**Related:** #1410, the same class one layer down: a gate that reported healthy because it read a result string before the receipt that contradicted it. Both are a control trusting a cheaper signal that usually agrees with the expensive one.
+
+**Source:** the mechanism, the payload line and the validated two-arm detector are the Lander seat's, including catching its own over-firing first version before publishing. The comparison form of the discriminator came from the session whose own "read the context" rule had just failed, and that failure is recorded above rather than presented as advice that worked. The three check-run timings, the payload line and the absence of any live label read were each re-measured independently before filing.
