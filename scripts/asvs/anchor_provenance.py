@@ -207,8 +207,18 @@ def summarise(verdicts: list[AnchorVerdict]) -> str:
             f"  |delta| min {deltas[0]}, median {deltas[len(deltas) // 2]}, max {deltas[-1]}"
         )
     never = sum(counts.get(k, 0) for k in NEVER_VERIFIED)
+    unread = counts.get(UNREADABLE, 0) + counts.get(NO_COMMIT, 0)
     lines.append("")
     lines.append(f"anchors that were NOT verifiable at the cell's own recorded commit: {never}")
+    # THE NUMBER ABOVE IS THE ONE A READER CARRIES AWAY, AND IT SUMS ONLY BUCKETS THAT REQUIRED A
+    # SUCCESSFUL READ. Excluding UNREADABLE from NEVER_VERIFIED is right -- an unresolvable stamp is
+    # a different fact from a born-wrong anchor -- but it means a run that read NOTHING closes with a
+    # reassuring zero. Printing the denominator it did not examine, always and including when it is
+    # zero, is what stops that line being taken as a verdict over the whole population.
+    lines.append(
+        f"anchors whose recorded commit could not be read, so the line above did not "
+        f"examine them: {unread}"
+    )
     return "\n".join(lines)
 
 
@@ -257,15 +267,42 @@ def main(argv: list[str] | None = None) -> int:
     except (OSError, ValueError):
         pass
 
+    # THE REF PAIR IS PART OF THE MEASUREMENT, SO AN UNRESOLVABLE HEAD IS A REFUSAL. On a repo with
+    # no commits ``git rev-parse HEAD`` exits 128 and still ECHOES THE LITERAL ``HEAD`` ON STDOUT, so
+    # an unchecked read stamps ``engine=HEAD`` -- which reads as a deliberate value rather than as a
+    # failure, and passes review forever. An empty string would at least have invited a second look.
+    rev = subprocess.run(  # nosec B603 B607 - fixed argv, no shell; rev-parse takes no input
+        ["git", "-C", str(args.root), "rev-parse", "HEAD"], capture_output=True, text=True
+    )
+    if rev.returncode != 0:
+        sys.stderr.write(
+            f"REFUSING: cannot resolve HEAD in {args.root} (exit {rev.returncode}). The engine ref "
+            "is part of this measurement, and git echoes the literal 'HEAD' on this failure, so an "
+            "unchecked read would stamp engine=HEAD and look deliberate.\n"
+        )
+        return 3
+    head = rev.stdout.strip()
+
     cells = load_scorecard(args.scorecard)
     verdicts = audit(cells, args.root, args.at)
     if not verdicts:
         sys.stderr.write("REFUSING to report a clean run over zero anchors\n")
         return 3
 
-    head = subprocess.run(  # nosec B603 B607 - fixed argv, no shell; rev-parse takes no input
-        ["git", "-C", str(args.root), "rev-parse", "HEAD"], capture_output=True, text=True
-    ).stdout.strip()
+    # A RUN THAT READ NOTHING IS NOT A CLEAN RUN, AND IT LOOKED EXACTLY LIKE ONE. With every anchor
+    # unreadable the summary closed on "NOT verifiable ...: 0" at exit 0, with a REAL sha in the
+    # header, because the ref pair resolves fine in a checkout whose history simply lacks the stamped
+    # commits -- a shallow clone, a rewritten history, or the wrong sibling checkout.
+    unread = sum(1 for v in verdicts if v.verdict in (UNREADABLE, NO_COMMIT))
+    if unread == len(verdicts):
+        sys.stderr.write(
+            f"REFUSING: all {unread} anchors' recorded commits could not be read in {args.root}. "
+            "The summary would close on a zero that examined nothing, and the engine ref in the "
+            "header resolves either way, so the header cannot tell the two runs apart. Check the "
+            "root is the engine checkout and that its history reaches the recorded commits.\n"
+        )
+        return 3
+
     # NO NUMBER HERE IS A FACT WITHOUT THE PAIR IT WAS MEASURED AGAINST -- the same rule the scorecard's
     # own verify header states. Printed as part of the measurement, not as decoration.
     print(

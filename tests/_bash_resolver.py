@@ -33,12 +33,18 @@ import shutil
 import subprocess
 from pathlib import Path
 
-#: ``bash`` exits **127** when it cannot find or execute the thing it was asked to run, and **2** on a
+#: ``bash`` exits **127** when it cannot FIND the thing it was asked to run and **126** when it found
+#: it and could not EXECUTE it (a directory, a bad shebang, no execute bit); it exits **2** on a
 #: syntax error in the script. Those are different worlds: 2 is a finding about the CONTENT under
-#: test, 127 is a finding about the HARNESS. Conflating them lets a broken harness impersonate a
-#: syntax error -- a red that sends a reader to edit a workflow that was never wrong.
+#: test, 126 and 127 are findings about the HARNESS. Conflating them lets a broken harness
+#: impersonate a syntax error -- a red that sends a reader to edit a workflow that was never wrong.
 BASH_HARNESS_FAILURE = 127
+BASH_CANNOT_EXECUTE = 126
 BASH_SYNTAX_ERROR = 2
+
+#: The full "bash could not run this at all" set, so a caller asking `returncode not in ...` states
+#: the rule ONCE. ``BASH_HARNESS_FAILURE`` is kept beside it because existing callers name it.
+CANNOT_RUN_CODES = frozenset({BASH_CANNOT_EXECUTE, BASH_HARNESS_FAILURE})
 
 _PROBE_NAME = "mf_bash_probe.txt"
 _PROBE_TOKEN = "MFPROBE-OK"
@@ -229,6 +235,17 @@ def explain_returncode(returncode: int, what: str = "the script") -> str:
             f"bash exited {BASH_HARNESS_FAILURE} (command not found) running {what}. That is a "
             "HARNESS fault -- an interpreter or a dependency is missing -- NOT a syntax error in the "
             "content under test. Do not edit the content on the strength of this (BACKLOG #1216)."
+        )
+    if returncode == BASH_CANNOT_EXECUTE:
+        # The VERDICT and the warning-off sentence are word-for-word 127's, because the reader's next
+        # action is identical and wording them differently would invite reading one as the milder
+        # case. Only the CAUSE clause differs, and it has to: 127 means bash could not find the
+        # thing, 126 means it found it and could not run it. Saying "missing" here would be false.
+        return (
+            f"bash exited {BASH_CANNOT_EXECUTE} (found it, could not execute it) running {what}. "
+            "That is a HARNESS fault -- a directory, a bad shebang or a missing execute bit -- NOT "
+            "a syntax error in the content under test. Do not edit the content on the strength of "
+            "this (BACKLOG #1272)."
         )
     if returncode == BASH_SYNTAX_ERROR:
         return f"bash exited {BASH_SYNTAX_ERROR} (syntax error) in {what} -- a real finding."

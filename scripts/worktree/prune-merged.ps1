@@ -1268,7 +1268,8 @@ if ($Apply -and $prunable.Count -gt 0) {
                 }
                 else {
                     Write-Note "    'git worktree repair' cannot fix it (the .git file it needs is gone) and" 'Red'
-                    Write-Note "    'git worktree add --force' refuses (the directory already exists). Recover it:" 'Red'
+                    Write-Note "    'git worktree add --force' refuses (the directory is NOT EMPTY -- an" 'Red'
+                    Write-Note "    empty one it would accept, so it is the leftover files that block it). Recover it:" 'Red'
                 }
                 Write-Note "      1. close anything holding files open in it (an editor, a shell sitting in it)" 'Red'
                 Write-Note "      2. Move-Item '$($d.Path)' '$($d.Path).salvage'" 'Red'

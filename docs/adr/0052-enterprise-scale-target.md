@@ -8,14 +8,14 @@
   the fallback scale path) · [0039](0039-database-tier-sharding-l5.md) (L5 DB-tier sharding) ·
   [CLAUDE.md](../../CLAUDE.md) §2 (asyncio concurrency model; reliability + count-and-log invariants) ·
   BACKLOG #28/#29 (load/throughput harness), #40 (enterprise-hardware CI leg), #64 (parity roadmap) ·
-  [DUAL_LICENSING_PLAN.md](../DUAL_LICENSING_PLAN.md)
+  `DUAL_LICENSING_PLAN.md`
 
 ---
 
 ## Context
 
 The commercial model is an **open-source AGPL engine + a commercial dual-license** whose maintenance
-funding base is **one large or two medium customers** ([DUAL_LICENSING_PLAN.md](../DUAL_LICENSING_PLAN.md)).
+funding base is **one large or two medium customers** (`DUAL_LICENSING_PLAN.md`).
 Those customers sit at the **enterprise scale tier** — large IDNs / consolidated health systems — not the
 single-community-hospital tier. A product that cannot demonstrate enterprise capability cannot win the
 customers that fund the project. **Owner decision (2026-06-29): the enterprise market is in-scope and is no

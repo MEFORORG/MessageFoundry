@@ -399,6 +399,12 @@ survives with a narrower subject rather than being deleted.
   worktree** (`scripts/worktree/new.ps1 -Name <x>`, cleanup with `remove.ps1`). Each gets an isolated
   checkout + branch + `.venv`; same remote, same PR flow. See [`docs/WORKTREES.md`](docs/WORKTREES.md).
   (The AI project memory is shared across sessions — coordinate memory writes.)
+- **Launching a background session? PUT THE PROMPT FIRST, or close the flags with `--`.** At least
+  `--allowedTools`, `--disallowedTools`, `--tools`, `--add-dir`, `--mcp-config`, `--betas` and `--file`
+  take **lists**, so `claude --bg --allowedTools Bash Edit "do the work"` swallows the prompt as a third
+  tool name. The session starts with nothing to do, exits 0, and then lists as `state=blocked` — which
+  is also what a real permission block looks like, so the lane reads as alive and does nothing. Measured
+  list and the reasoning: [`docs/WORKTREES.md`](docs/WORKTREES.md).
 
 ### Before you verify
 - Run `/simplify` on the changed code before the verification quartet below. See
