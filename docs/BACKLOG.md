@@ -18697,6 +18697,16 @@ The stale SUCCESS overwrote the correct FAILURE. **For 10 minutes -- 13:43:46Z t
 
 **WHAT PREVENTED HARM WAS `strict: true`, NOT THIS GATE.** 724 was BEHIND and could not merge regardless. A pull request in the same state that was *current* would have satisfied the review gate unread. That is the whole finding: the control did not fail closed, it failed **stale**, and something else happened to be holding the door.
 
+**THE FILE ALREADY CONCEDES THE PREMISE, WHICH MAKES THIS A GENERALISATION RATHER THAN A NEW CLAIM.** Directly under the offending line, the workflow's own comment reads:
+
+> On `synchronize` the label was just removed above, so the event payload is stale by one step. Treat that action as unreviewed by definition rather than reading a value that is already wrong -- **reading the payload here would pass a pull request that was just invalidated, which is the exact failure this step exists to prevent.**
+
+The author identified this failure mode precisely, named its consequence exactly, and then **hard-coded a fix for the one action they had an instance of** -- `if [ "$ACTION" = "synchronize" ]` -- leaving every other action reading the same stale payload. **A screen built from one case finds one shape.** The remedy is not to convince anyone the staleness is real; the file says so. It is to stop special-casing one action and read the labels live.
+
+**A SECOND ROUTE PRODUCES THE SAME SIGNATURE WITH THE OPPOSITE TRUTH VALUE, and a reader must not conflate them.** Observed on PR 726: green context, no `reviewed` label, check-run roughly twelve hours older than the label removal -- the detection rule fires, correctly. But the cause was a **force-push restoring a previously-reviewed sha**. Check-runs attach to the commit, so restoring that commit restored its genuine green, while the push fired `synchronize` and stripped the label. **The check-run is truthful about that sha; nobody is being told a review happened that did not.** That is the inverse of the PR 724 case, where a stale payload reported success for a state nobody had read.
+
+**That the same rule fires on both is a strength, not an over-fit.** It flags *"you cannot tell from the signals alone"*, which is true in both, rather than detecting one mechanism. Resolving which requires the commit history, not the gate's output.
+
 **THE OBVIOUS FIX IS THE WRONG ONE, AND THIS IS WHERE THE ITEM EARNS ITS KEEP.** "Read the context instead of the label" was proposed and adopted by two sessions before being refuted: **the context inherits the same staleness through the same snapshot.** A lower-level proxy is not a live reading. The remedy is either to read the labels live inside the job (`gh pr view --json labels` at run time, not `github.event...`), or to make the verdict self-invalidating when the payload is older than the newest `reviewed` event.
 
 **THE DETECTION RULE IS A COMPARISON, NOT A SIGNAL.** Neither the label nor the context is trustworthy alone:
