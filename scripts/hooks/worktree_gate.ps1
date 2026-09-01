@@ -1465,8 +1465,25 @@ $gitInvocation = '(^|[\s;&|(''"\\/`])git(\.exe)?["'']?(\s|$)'
 #
 # Scoped tightly: only verbs that change WHICH COMMIT the primary's tree reflects, or that DISCARD work.
 # Reads (status/log/diff/show/fetch/branch/worktree/rev-parse/...) are untouched, and so are commit/push/
-# add and `pull` (a fast-forward of a clean tree is ordinary maintenance). A worktree may switch its own
-# branch freely -- only the SHARED primary is protected.
+# add and `pull` (a fast-forward of a clean tree is ordinary maintenance).
+#
+# THIS PARAGRAPH USED TO END "A worktree may switch its own branch freely -- only the SHARED primary
+# is protected." THAT WAS TRUE WHEN WRITTEN, AND RULE 3b MADE IT FALSE. `Test-WorktreeHijack` also
+# protects every OTHER governed worktree, against a narrower verb set: switching a LINKED worktree
+# onto an ALREADY-EXISTING branch is denied. Creating a new branch there is not.
+#
+# THE FULL ACCOUNT IS docs/WORKTREE-GATE.md RULE 3b -- what is denied, what stays allowed, and the
+# rightful owner's escape hatch. That document has been correct the whole time and even names this
+# gap in as many words ("This closes the gap the old rule left open"). Only this header was stale,
+# which is the worst place for it: a reader checking the code's own description of its scope.
+#
+# THE STALE SENTENCE IS QUOTED RATHER THAN DELETED because it did its damage, and a reader who
+# remembers it needs to see it named as retired rather than silently absent. A session read it,
+# told two peers only the primary was gated, and was corrected from source.
+#
+# CITED BY NAME, NEVER BY LINE. The report that surfaced this gave a line number for rule 3b and one
+# for the dispatcher; both were accurate and neither survived the edit you are reading, because
+# adding these paragraphs moved everything below them.
 #
 # NB this hook only exists INSIDE Claude Code. The operator's own terminal is never gated: this
 # constrains agents, not the human, who remains the owner of the primary's HEAD.
