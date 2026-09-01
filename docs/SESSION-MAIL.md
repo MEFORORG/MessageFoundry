@@ -308,10 +308,13 @@ unbounded body would.
 per-injection **total** is not one of them: it is derived from the other caps, `5 * (2000 + 560)`, so
 that the message cap is the one that binds. That derivation is the correction BACKLOG #1386 records.
 
-- `CLAUDE.md` is **40,102 bytes**, and is this project's deliberate per-session context cost. The
-  derived total of 12,800 bytes is about **32 percent** of that arriving unbidden, potentially at
-  **every** `Stop`. That is what the 5-message allowance costs. The total was 8,000 -- a cheaper 20
-  percent -- but it bound before the message cap and delivered 3 of the promised 5.
+- `CLAUDE.md` was **55,542 bytes** measured 2026-09-01, and is this project's deliberate per-session
+  context cost. The derived total of 12,800 bytes is about **23 percent** of that arriving unbidden,
+  potentially at **every** `Stop`. That is what the 5-message allowance costs. The total was 8,000 --
+  a cheaper 14 percent -- but it bound before the message cap and delivered 3 of the promised 5.
+  THE DENOMINATOR MOVES, so re-measure it rather than quoting this line. It read 40,102 bytes when
+  ADR 0161 recorded it and 55,542 at `e04136453` on 2026-09-01 -- a 38 percent rise -- and 830 of
+  those bytes arrived in that one commit. The percentage is an order of magnitude, not a constant.
 - `announce-session.ps1` folds and caps every peer-supplied field through its `Get-Clean` helper, at
   caps of 16, 24, 40, 60, 80, 160 and 200 characters. 2,000 bytes is ten times the largest
   peer-authored string this repo renders anywhere else.
