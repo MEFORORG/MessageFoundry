@@ -18664,3 +18664,64 @@ Within `scripts/coord` and `scripts/hooks` specifically, four files are caught b
 **Nearest existing mechanism:** the floor is already computed and recorded on every run, pass or fail, into the readings artifact and the step summary, and `harness/load/profiles/connscale-smoke.toml` already carries the `[slo]` table an armed check would key off. So the build is a threshold plus a negative control on an existing seam. **The harvest is the cost, and criterion 1 is most of it.**
 
 **Related:** [#1211](#1211-empty_claims_per_msg-is-not-contention-immune-the-ratio-form-excursions-past-its-own-slo-band-on-a-hosted-runner) is the single home for the harvest table, the five measured defects and the owner ruling -- read it there, and do not restate the table here. #1357 covers the FD arm of the test #1211 split. #1366's design premise that two metrics carry a band is now one, corrected in place there. #1414 is the allocation-transfer path this item's number history is an instance of.
+
+## 1417. the review gate can report success on a head nobody reviewed: it reads the label from a snapshotted event payload
+
+> 🔢 **Filed 2026-09-01 (lander-5eaa4e) -- not started.** `a reviewer has read this` is a required status check on `main` with `enforce_admins: true`, so it is the control that stands between an unread diff and `main`. **It can be satisfied by a pull request carrying no `reviewed` label at all.** Reproduced on PR 724, with the window measured end to end.
+> Verdict: build
+> Research: none
+> Closing-act: code
+
+**Cluster:** CI gates / merge protection. **Priority:** P2. **Verdict:** build.
+**Severity:** no engine effect, no PHI axis, and **no deployment axis (sec. 0)** -- nothing here reaches shipped code. What it reaches is the repository's own merge control, so the cost is an unreviewed change landing on `main` rather than anything an adopter would run.
+
+**THE CAUSE IS ONE LINE.** [`.github/workflows/review-gate.yml`](../.github/workflows/review-gate.yml) reads the label out of the webhook payload:
+
+```yaml
+LABELS: ${{ join(github.event.pull_request.labels.*.name, ',') }}
+```
+
+**The payload is frozen when the event fires.** A queued run therefore reports the label state from its own *creation* time, however long ago that was. Branch protection then picks the **newest check-run by execution time**. Those two clocks are different, and when they disagree the gate reports the older truth.
+
+**THE RACE, MEASURED ON PR 724 ON 2026-09-01.** Every timestamp from the issue timeline and the runs API:
+
+| time | event |
+|---|---|
+| 13:16:57Z | run A created (`synchronize`) |
+| 13:24:22Z | run B created -- **its payload still contains `reviewed`** |
+| 13:43:11Z | run A executes, **26 minutes late**: strips the label, reports FAILURE |
+| 13:43:15Z | `github-actions[bot]` removes `reviewed` |
+| 13:43:46Z | run B executes on its 13:24 payload, reports **SUCCESS** |
+
+The stale SUCCESS overwrote the correct FAILURE. **For 10 minutes -- 13:43:46Z to 13:54:08Z -- PR 724 carried `a reviewer has read this` = success with no `reviewed` label on it.** The window closed only because the label was re-applied, which created a run whose payload was honest.
+
+**WHAT PREVENTED HARM WAS `strict: true`, NOT THIS GATE.** 724 was BEHIND and could not merge regardless. A pull request in the same state that was *current* would have satisfied the review gate unread. That is the whole finding: the control did not fail closed, it failed **stale**, and something else happened to be holding the door.
+
+**THE OBVIOUS FIX IS THE WRONG ONE, AND THIS IS WHERE THE ITEM EARNS ITS KEEP.** "Read the context instead of the label" was proposed and adopted by two sessions before being refuted: **the context inherits the same staleness through the same snapshot.** A lower-level proxy is not a live reading. The remedy is either to read the labels live inside the job (`gh pr view --json labels` at run time, not `github.event...`), or to make the verdict self-invalidating when the payload is older than the newest `reviewed` event.
+
+**THE DETECTION RULE IS A COMPARISON, NOT A SIGNAL.** Neither the label nor the context is trustworthy alone:
+
+1. take the newest check-run for `a reviewer has read this`
+2. resolve its **originating workflow run's `created_at`** -- not the check-run's `started_at`, which is the execution clock and reports the stale run as fresh
+3. compare against the pull request's latest `reviewed` labeled/unlabeled event
+4. **created before the last `reviewed` change means the verdict is stale, whatever it says**
+
+**SIGN CONVENTION, AND IT IS LOAD-BEARING: only a stale SUCCESS is dangerous.** A stale FAILURE is conservative and blocks correctly. Two sessions independently misread a negative margin on PRs 715 and 575 as "a valid label not being honoured" before checking that neither carried the label at all.
+
+**MEASURED STATE AT FILING, with both controls, because a detector that has never fired is indistinguishable from a clean repository:**
+
+| arm | result |
+|---|---|
+| positive control -- PR 724 replayed at its 13:24-vs-13:43 state | **fires both arms** |
+| negative control -- PR 724 after re-labelling (run 13:54:08 > event 13:54:03) | clean |
+| live scan, all open pull requests | **zero dangerous states** |
+
+**THE CURRENT CLEAN STATE IS NOT COMFORTABLE.** Freshness margins measured across the 13 open pull requests carrying a gate result: **seven pass by five seconds or less** (one by a single second). Any few-second delay in run creation during a label change flips one of them.
+
+**A SECOND, SIMPLER GAP FOUND WHILE SCANNING: 8 open pull requests have no gate check-run on their head at all** -- 530, 531, 609, 613, 667, 670, 686, 700. Absent, not failed. A required context that never reports blocks a merge exactly as hard as one that fails, so on those the label alone will not move them; the workflow has to run.
+
+**TWO INSTRUMENT DEFECTS FOUND WHILE BUILDING THE DETECTOR, recorded because both produced clean-looking output.** A first draft compared against **any** label event, so a `ci-red` change flagged four pull requests that were fine -- narrowed to `reviewed` events only. And a parallel scan used the **unpaginated** check-runs endpoint, which returns 30 where heads here carry 39 to 48, so it silently could not see a third of its own corpus and reported zero. Maximum `total_count` observed is 48; `per_page=100` covers it today and is not a permanent guarantee.
+
+**Nearest existing mechanism:** `tests/test_merge_gate_controls.py` already pins this workflow's trigger list, including that dropping `labeled` reddened nothing before that test existed. A staleness assertion belongs beside it.
+
+**Related:** #1413 covers the absence of any trigger that notifies a reviewer; this is the complementary defect in what the gate *reports* once a label exists.
