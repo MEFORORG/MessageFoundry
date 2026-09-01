@@ -22,12 +22,74 @@ Synthetic only; no store, no I/O beyond reading the shipped source/doc files.
 from __future__ import annotations
 
 import inspect
+import os
+import warnings
 from pathlib import Path
+
+import pytest
 
 from messagefoundry.config.models import ConnectorType
 from messagefoundry.config.wiring import ConnectionSpec, InboundConnection, inbound
 
 _REPO = Path(__file__).resolve().parents[1]
+
+#: The coverage plan moved out of this repository under ADR 0160 D1 on 2026-08-31 (maintainer QA
+#: planning: a draft that says on its face it awaits owner approval). Custody is in the vault. Only
+#: ONE test below reads it; the other three assert about CODE and about ADR 0057, which stays.
+_PLAN = _REPO / "docs" / "testing" / "FEATURE-COVERAGE-PLAN.md"
+_DOC_ENV = "MEFOR_COVERAGE_PLAN_DOC"
+_REQUIRE_ENV = "MEFOR_REQUIRE_COVERAGE_PLAN_DOC"
+
+
+class CoveragePlanUnenforced(UserWarning):
+    """The coverage plan is absent from this checkout, so its doc-drift assertion is inert.
+
+    A warning rather than a bare skip, for the reason
+    ``tests/test_threat_model_doc_drift.py::ThreatModelDocUnenforced`` gives and this module adopts
+    verbatim: a skip prints as one ``s`` among thousands and the run still reads as clean. A warning
+    lands in pytest's warnings summary, which is printed even under ``-q``.
+    """
+
+
+def _plan_path() -> Path:
+    override = os.environ.get(_DOC_ENV, "").strip()
+    return Path(override) if override else _PLAN
+
+
+def _plan_text() -> str:
+    """The coverage-plan text, or an ANNOUNCED skip where the document is not published here.
+
+    The skip sits at this accessor rather than at module level on purpose. A module-level skip would
+    take the three CODE assertions down with the doc one -- including the config-default gate that is
+    the single knob keeping the ADR 0057 fast-path dormant on every default deployment. Those assert
+    about shipped code and are exactly as valid in a checkout that does not carry the plan.
+    """
+    path = _plan_path()
+    if not path.exists():
+        if os.environ.get(_REQUIRE_ENV, "").strip().lower() in {"1", "true", "yes", "on"}:
+            pytest.fail(
+                f"{_REQUIRE_ENV} is set, so this run is expected to enforce the coverage plan's "
+                f"content — but {path} does not exist. Point {_DOC_ENV} at the document, or unset "
+                f"{_REQUIRE_ENV} to run in the announced, non-enforcing posture."
+            )
+        warnings.warn(
+            CoveragePlanUnenforced(
+                f"{path} is absent from this checkout (docs/testing/** is withheld under ADR 0160 "
+                "D1 and vaulted), so the CRIT-2 doc-drift assertion in "
+                "tests/test_crit2_inline_doc_drift.py is INERT in this run: nothing here stops the "
+                'plan reverting to the stale "wired into nothing" framing. Still enforced: the '
+                "config-default gate on `InboundConnection.inline` and the `inbound()` factory, the "
+                "live-wiring check that `_router_worker` really calls `store.handoff(`, and the ADR "
+                f"0057 text. Set {_DOC_ENV}=<path to the plan> to enforce the doc half from this "
+                f"checkout, or {_REQUIRE_ENV}=1 to make its absence a hard failure."
+            ),
+            stacklevel=3,
+        )
+        pytest.skip(
+            f"{path} is absent — the coverage-plan drift half is NOT enforced in this run; see the "
+            "CoveragePlanUnenforced entry in the warnings summary for what that costs"
+        )
+    return path.read_text(encoding="utf-8")
 
 
 def test_inline_config_default_is_off() -> None:
@@ -69,7 +131,7 @@ def test_adr_0057_does_not_claim_unwired() -> None:
 def test_coverage_plan_reflects_wired_default_off() -> None:
     """The FEATURE-COVERAGE-PLAN CRIT-2 rows must reflect WIRED-but-DEFAULT-OFF, not the stale
     "unwired / wired into nothing" framing. Guards the plan against reverting to the false claim."""
-    plan = (_REPO / "docs" / "testing" / "FEATURE-COVERAGE-PLAN.md").read_text(encoding="utf-8")
+    plan = _plan_text()
     # The stale claims as they stood (bold feature cell / disposition cell) must be gone. The
     # corrected narrative may still QUOTE the old phrase when explaining the fix, so match the exact
     # struck forms rather than a bare substring.

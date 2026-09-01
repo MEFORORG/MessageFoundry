@@ -143,8 +143,9 @@ def test_every_shell_run_block_parses(tmp_path: Path) -> None:
             )
             continue
         if proc.returncode != 0:
-            # 127 is "command not found" -- a HARNESS fault -- and 2 is a real syntax error. Naming
-            # which one keeps a broken harness from impersonating a finding about the content.
+            # 127 ("not found") and 126 ("found it, cannot run it") are HARNESS faults; 2 is a real
+            # syntax error. Naming which one keeps a broken harness from impersonating a finding
+            # about the content. 126 arrived here neutrally described until BACKLOG #1272.
             detail = explain_returncode(proc.returncode, f"{wf} :: {step}")
             failures.append(f"{wf} :: job {job} :: {step}\n    {detail}\n    {proc.stderr.strip()}")
     print(f"syntax-checked {len(blocks)} shell blocks with {bash}; {len(failures)} failed")
