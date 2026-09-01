@@ -9,7 +9,7 @@
   health check — it does **not** build an engine that *manipulates* a VIP. Any future engine-managed VIP
   is a distinct, deferred item (see *Out of scope* and *To resolve on acceptance*).
 - **Related:** [BACKLOG #41](../archive/backlog/BACKLOG-CLOSED.md#41-cloud--kubernetes-ha-deployment-packaging-container-fast-follow-follow-ons) (this) · the ratifying research
-  [`research/cloud-deployment-research-2026-06.md`](../research/cloud-deployment-research-2026-06.md) ·
+  `research/cloud-deployment-research-2026-06.md` ·
   [ADR 0017](0017-consumer-deployment-model.md) (consumer deployment model, container fast-follow, PR #480) ·
   [ADR 0037](0037-multi-process-sharding-l3.md) (L3 process sharding — the CPU-scaling lever, **not** an HA
   lever) · [ADR 0039](0039-database-tier-sharding-l5.md) (L5 DB-tier sharding — the DB-write lever) ·
@@ -28,7 +28,7 @@
 
 The engine container shipped in PR #480 (ADR 0017 fast-follow): a non-root, OCI-compliant Linux image
 (slim + `-sqlserver`), a Topology-A `compose.yaml`, and a **single-node** k8s `StatefulSet`. The
-cloud-readiness research ([`research/cloud-deployment-research-2026-06.md`](../research/cloud-deployment-research-2026-06.md))
+cloud-readiness research (`research/cloud-deployment-research-2026-06.md`)
 graded three tiers: **(a)** run-on-any-platform (ECS/Fargate/AKS/GKE) and **(b)** single-node-with-PVC
 are **done and shipped**; **(c)** multi-node HA is *"code-complete, no assembly kit."* The active-passive
 HA mechanism is fully built in the engine — externalized Postgres/SQL Server stores, a self-fencing

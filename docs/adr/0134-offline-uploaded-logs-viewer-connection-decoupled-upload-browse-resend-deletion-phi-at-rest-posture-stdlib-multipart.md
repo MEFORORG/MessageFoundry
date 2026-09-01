@@ -214,7 +214,7 @@ Pinned in `tests/test_upload_api.py` (including a recreated-username regression)
 `packaging/messagefoundry-webconsole/tests/test_uploaded_logs_ui.py` for the `/ui` plane.
 
 This satisfies the **second clause only** of exit criterion 12 in
-[the engine-API master test plan](../testing/master-test-plan/09-engine-api.md) — *"`GET /uploads`
+the engine-API master test plan (`docs/testing/master-test-plan/09-engine-api.md`) — *"`GET /uploads`
 visibility is pinned as a reviewed decision naming ADR 0134 (Q6)"*. Criterion 12 is a two-clause
 conjunction, and **its first clause is untouched by this amendment**: every pageless list route must
 still either page or appear on the drift-guarded `_UNPAGED_EXEMPT` constant with a one-line reason.

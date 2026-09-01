@@ -4,7 +4,7 @@
 - **Date:** 2026-06-28
 - **Related:** [ADR 0017](0017-consumer-deployment-model.md) (consumer deployment model — names the
   "Path-root caveat" §80-92 + the open **Major** engine-work row §161 this resolves) · [ADR 0007](0007-gui-manageable-connections-toml.md)
-  (connections-as-data, resolved relative to `--config`) · [`docs/research/config-ux-review.md`](../research/config-ux-review.md)
+  (connections-as-data, resolved relative to `--config`) · `docs/research/config-ux-review.md`
   (the config-UX review — 31 confirmed findings — this ADR implements its **candidate A**, the split-anchor
   fix; covers F3/C1/C3/DD1) · [BACKLOG #33](../archive/backlog/BACKLOG-CLOSED.md#33-review-the-end-to-end-configuration-method-across-every-surface-config-ux-consolidation) (config-UX consolidation, the review's parent;
   this is **#33-A**) · [`docs/CONFIGURATION.md`](../CONFIGURATION.md) (the settings catalog) ·

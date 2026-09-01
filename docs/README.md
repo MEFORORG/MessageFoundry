@@ -113,8 +113,21 @@ describe plans that were superseded, and several state "next steps" that shipped
 | Directory | Size | What it is |
 |---|---|---|
 | [benchmarks/](benchmarks/) | ~42 files | Measurement records and inter-session review notes. The numbers are dated; the *method* is the reusable part. |
-| [research/](research/) · [design/](design/) · [archive/](archive/) | ~15 files | Exploratory and superseded material. |
+| [design/](design/) | 4 files | Engineering design notes behind the threading and sharding ADRs. |
+| [archive/backlog/](archive/backlog/) | 1 file | Closed backlog items, moved here verbatim when an item closes. |
 | [quality-gates/](quality-gates/) | 1 file | A single gate record. |
+
+`research/` and `archive/throughput/` were here until 2026-08-31, along with the maintainer
+test-planning tree and the business and legal working documents. ADR 0160's D1 test keeps them out of
+this repository: a tracked file has to be something an operator running MessageFoundry needs, or
+something a security reviewer assessing it needs, and exploratory notes, superseded plans, QA planning
+and commercial working papers are none of those. They are kept privately for provenance, so a citation
+naming one of them still tells you where something was decided even though the link will not resolve
+here. The one file in the test tree an operator actually runs stayed:
+[testing/VERIFY.md](testing/VERIFY.md), listed above.
+
+Security material is decided by a different rule and mostly stays —
+[SECURITY-DOCS-POLICY.md](SECURITY-DOCS-POLICY.md) states it, and says how to ask for what is withheld.
 
 Individually dated documents worth knowing are historical rather than current:
 
