@@ -2602,15 +2602,33 @@ jobs:
             -e MEFOR_EGRESS_ALLOWED_FILE_DIRS=/var/lib/mefor \
             messagefoundry:smoke \
             serve --config /config --env dev --host 127.0.0.1 --port 8765
-          # Readiness: /health is tokenless and always 200 once the listener is up.
+          # THESE PROBES SPEAK https AND PIN THE ENGINE'S OWN CERTIFICATE (BACKLOG #1276 part A, ADR
+          # 0172). The engine always serves TLS now and mints a self-signed pair on first run when no
+          # operator certificate is configured, so the plaintext probes this step used to make were
+          # answered by a TLS socket: `curl: (52) Empty reply from server`, measured on this leg.
+          #
+          # `-k` would also have turned the step green, and is the wrong repair. What this leg exists
+          # to observe is that a container comes up serving something a client can talk to; after the
+          # always-TLS change that includes presenting a certificate the client can VERIFY, and `-k`
+          # is precisely the flag that stops looking at it.
+          #
+          # WHERE THE PAIR IS. `ensure_api_tls_material` writes it beside the store database, and the
+          # image sets MEFOR_STORE_PATH=/var/lib/mefor/messagefoundry.db. `pki.make_self_signed` puts
+          # the bind address in the SAN as an iPAddress entry (BACKLOG #1179), which is what lets a
+          # https://127.0.0.1 URL verify rather than fail hostname matching.
+          cert=/var/lib/mefor/api-generated-cert.pem
+          # Readiness: /health is tokenless and always 200 once the listener is up. The certificate is
+          # minted during that same startup, so a miss on the first turns of this loop is ordinary.
           for _ in $(seq 1 60); do
-            docker exec mefor curl -fsS http://127.0.0.1:8765/health >/dev/null 2>&1 && break || sleep 0.5
+            docker exec mefor curl -fsS --cacert "$cert" https://127.0.0.1:8765/health >/dev/null 2>&1 && break || sleep 0.5
           done
-          docker exec mefor curl -fsS http://127.0.0.1:8765/health
+          docker exec mefor curl -fsS --cacert "$cert" https://127.0.0.1:8765/health
           # Send one synthetic ADT^A01 over the in-container MLLP listener (loopback:2575); fails on a non-AA ACK.
           docker exec mefor python /smoke/send_adt.py 127.0.0.1 2575
           # Poll the disposition via the container's own python (stdlib urllib — no host python/jq needed).
-          total() { docker exec mefor python -c "import urllib.request,json;print(json.load(urllib.request.urlopen('http://127.0.0.1:8765/messages?status=$1'))['total'])"; }
+          # Same pin as the curl above: a default context would reject the self-signed certificate, and
+          # an unverified one would stop checking it.
+          total() { docker exec mefor python -c "import ssl,urllib.request,json;ctx=ssl.create_default_context(cafile='$cert');print(json.load(urllib.request.urlopen('https://127.0.0.1:8765/messages?status=$1',context=ctx))['total'])"; }
           processed=0
           for _ in $(seq 1 60); do
             # `|| processed=0`: a transient non-zero before the row finalizes must NOT abort the loop under set -e.
