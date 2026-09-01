@@ -274,7 +274,32 @@ jobs:
     name: diff-coverage (advisory)
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    # SIZED FROM A MEASUREMENT, NOT FROM A GUESS (BACKLOG #1409). This cap was 20 from the
+    # 2026-07-26 publish snapshot until 2026-09-01, and it was never edited. The SUITE grew into
+    # it: the job took 9.7 minutes on 2026-07-26, 14.8 on 2026-08-06, and 19m36s on its LAST GREEN
+    # run (job 97249962177, 2026-08-23 15:18 CDT) -- 24 seconds of margin. Every PR run after that
+    # was killed at the cap, over 700 of them across 8 days, with `The operation was canceled` and
+    # no diff-cover verdict. That is the failure this file's `liveness` job exists to catch, and it
+    # could not see it (BACKLOG #1410, fixed in scripts/quality/liveness.py in the same change).
+    #
+    # WHERE THE TIME WENT, measured across four jobs (99554977847, 99578445996, 99580323074,
+    # 99685011404): setup -- checkout, setup-python, setup-uv, the Qt apt install and the editable
+    # install -- totals 23 to 36 SECONDS, 2 to 3 percent of the budget. The pytest step took
+    # 19m37s to 19m49s and reached exactly [ 91%] every time. So splitting the install out of this
+    # job buys nothing; the measurement is the whole cost, and the fix is the `-m 'not tooling'`
+    # selection on the pytest line below, not a bigger box.
+    #
+    # RE-DERIVE THIS FROM THE FIRST GREEN RUN. The number below is 30 against an ESTIMATED 18 to 20
+    # minutes for the narrowed serial run -- about 1.5x, matching the sizing convention ci.yml uses.
+    # It is an estimate because no coverage run has ever finished: the honest measured floor is
+    # 21m35s for the UNNARROWED suite, scaled from the 91 percent that ran. Once a green run exists,
+    # read its actual duration and re-derive.
+    #
+    # NEXT LEVER IF IT DRIFTS AGAIN: pytest-xdist. ci.yml's engine leg runs `-n 4 --dist loadfile`
+    # and this job does not. Adding it here needs `[tool.coverage.run] parallel = true` plus a
+    # combine before --cov-report=xml, so it is a separate change with its own verification --
+    # deliberately NOT bundled here, or a shifted coverage number would have two possible causes.
+    timeout-minutes: 30
     permissions:
       contents: read
     outputs:
@@ -338,7 +363,26 @@ jobs:
         continue-on-error: true
         env:
           QT_QPA_PLATFORM: offscreen
-        run: pytest -q --cov=messagefoundry --cov-report=xml --cov-report=term-missing:skip-covered || true
+        # `-m 'not tooling'` DESELECTS THE TOOLING TIER, AND IT COSTS THIS GATE NOTHING (#1409).
+        # The mark is applied at runtime by tests/conftest.py from tests/tooling_manifest.txt (132
+        # files), not by decorators, so grepping for `pytest.mark.tooling` finds 2 hits and badly
+        # under-reads its size. ci.yml carries the same flag on its engine leg and runs the tier as
+        # its own parallel job; this job was the only place in CI running it unfiltered AND serial.
+        #
+        # WHY DESELECTING IT REMOVES NO SIGNAL: the report is scoped to `--cov=messagefoundry`, and
+        # ZERO of the 132 manifest files import that package. Measured with the same pattern that
+        # matches 510 files under tests/, so the zero is a real absence and not a broken pattern.
+        # A test that never imports the measured package cannot contribute a covered line, so this
+        # drops wall clock that was never buying any coverage. The tier is the run's hard tail:
+        # the suite reaches 89 percent in 15.2 minutes, then the next two points cost 3.4 minutes.
+        #
+        # THE WEB CONSOLE TIER STAYS, and that is the one place this job must NOT copy ci.yml.
+        # Both ci.yml legs carry `--ignore-glob='*messagefoundry-webconsole*'` because that package
+        # has its own job over there. Here it would DELETE REAL COVERAGE: 16 of those test files
+        # import `messagefoundry`, building a live `Engine`, `create_app` and `AuthService`, so
+        # they exercise api/, auth/, pipeline/, config/ and transports/signing. Measured 114 to
+        # 134 seconds in its own ci.yml leg, which is a cheap price for coverage this gate reports.
+        run: pytest -q -m 'not tooling' --cov=messagefoundry --cov-report=xml --cov-report=term-missing:skip-covered || true
       - name: Diff-coverage vs the PR base (advisory - never fails)
         continue-on-error: true
         env:
