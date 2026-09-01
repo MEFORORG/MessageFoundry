@@ -17,7 +17,7 @@ from urllib.parse import quote
 from messagefoundry.api.models import ConnectionEventInfo, ConnectionRow
 
 from .._html import Markup, el, page, rows_table, text
-from ._common import _num, _secs
+from ._common import _num, _secs, _seg
 
 __all__ = [
     "bulk_control_result",
@@ -61,7 +61,7 @@ def _name_cell(r: ConnectionRow) -> Markup:
         el(
             "a",
             "ⓘ",
-            href=f"/ui/connection/{quote(r.name)}",
+            href=f"/ui/connection/{_seg(r.name)}",
             class_="detail-link",
             title="Connection details",
             aria_label=f"Details for {_display_name(r.name)}",
@@ -197,7 +197,7 @@ def _flag_cell(r: ConnectionRow) -> Markup:
             aria_label=("Unflag " if r.flagged else "Flag ") + name,
         ),
         method="post",
-        action=f"/ui/connections/{quote(name)}/flag",
+        action=f"/ui/connections/{_seg(name)}/flag",
         class_="ctl flagform",
     )
 

@@ -111,6 +111,24 @@ def read_pairs(scorecard_text: str) -> tuple[list[Pair], int]:
     return pairs, ambiguous
 
 
+@dataclass(frozen=True)
+class Walk:
+    """The walk's answer AND the two ways it can be incomplete, returned together on purpose.
+
+    Round one returned a bare dict. Both caveats below then had to be discovered by a caller that
+    knew to ask, and neither was asked for -- so a truncated walk and a walk with unreadable
+    revisions both rendered as a complete one. Bundling them makes the incomplete case impossible
+    to take without seeing it.
+    """
+
+    touched: dict[int, str]
+    #: Revisions whose blob ``git show`` could not read. A revision that DELETED the path fails
+    #: legitimately, so this is reported rather than refused.
+    unreadable_revisions: int
+    #: Ledger paths whose walk began at a shallow graft boundary, so history before it is invisible.
+    truncated: tuple[str, ...]
+
+
 def banner_fingerprint(text: str) -> dict[int, str]:
     """Per item, a fingerprint of the banner state ``parse_items`` exposes.
 
@@ -124,7 +142,7 @@ def banner_fingerprint(text: str) -> dict[int, str]:
     return out
 
 
-def banner_last_touched(root: Path, backlog_paths: list[str], limit: int | None) -> dict[int, str]:
+def banner_last_touched(root: Path, backlog_paths: list[str], limit: int | None) -> Walk:
     """The date each item's banner state last CHANGED, walking the ledger's own history.
 
     Oldest-first, so a change is attributed to the commit that introduced it. An item absent from the
@@ -138,13 +156,64 @@ def banner_last_touched(root: Path, backlog_paths: list[str], limit: int | None)
     then touched in the other.
     """
     touched: dict[int, str] = {}
+    unreadable = 0
+    truncated: list[str] = []
+    # A SHALLOW CLONE IS THE ORDINARY STATE OF THIS REPOSITORY, NOT AN EDGE CASE. Measured
+    # 2026-08-29: the primary and every worktree report true, over 856 commits with 3 graft points.
+    # So refusing on shallowness ALONE would refuse every real run on this machine -- which is why
+    # the discriminator below is per-path rather than per-repository.
+    #
+    # THE GRAFT POINTS ARE READ BY NAME RATHER THAN INFERRED FROM "HAS NO PARENT", AND THE
+    # DIFFERENCE IS A FALSE REFUSAL THIS CHECK ALREADY SHIPPED ONCE. A TRUE ROOT also has no parent.
+    # This repository carries a deliberate 2026-07-06 history reset whose root commit appears in NONE
+    # of the three graft points, so every file present in it -- .gitattributes, .gitignore, .github --
+    # was reported as truncated on a COMPLETE history, with remediation advice that cannot help,
+    # because a reset root's ancestors are not on the remote either.
+    grafts: set[str] = set()
+    common = subprocess.run(  # nosec B603 B607 - fixed argv, no shell; read-only
+        ["git", "-C", str(root), "rev-parse", "--path-format=absolute", "--git-common-dir"],
+        capture_output=True,
+        text=True,
+    )
+    if common.returncode == 0:
+        shallow_file = Path(common.stdout.strip()) / "shallow"
+        if shallow_file.is_file():
+            grafts = {
+                line.strip()
+                for line in shallow_file.read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            }
     for backlog_path in backlog_paths:
-        revs = subprocess.run(  # nosec B603 B607 - fixed argv, no shell; read-only git log
+        walk = subprocess.run(  # nosec B603 B607 - fixed argv, no shell; read-only git log
             ["git", "-C", str(root), "log", "--format=%H %cs", "--reverse", "--", backlog_path],
             capture_output=True,
             text=True,
             encoding="utf-8",
-        ).stdout.splitlines()
+        )
+        # A FAILED WALK YIELDS NO LINES, AND NO LINES IS EXACTLY WHAT A LEDGER WHOSE BANNERS NEVER
+        # MOVED ALSO YIELDS. Raising is the only thing that keeps the two apart, and the caller's
+        # emptiness guard is not a substitute: a walk that fails over ONE of the two ledgers while
+        # the other succeeds leaves a PARTIAL result, which is non-empty and reads as complete.
+        if walk.returncode != 0:
+            raise RuntimeError(
+                f"git log failed over {backlog_path} in {root} "
+                f"(exit {walk.returncode}): {walk.stderr.strip()}"
+            )
+        revs = walk.stdout.splitlines()
+
+        # TRUNCATION IS A DIFFERENT FAILURE FROM AN ERROR, AND IT EXITS ZERO. On a shallow clone
+        # ``git log`` succeeds over the visible window, so no returncode guard can see it. Every
+        # banner date then floors at the clone boundary, which makes the last touch look LATER than
+        # it was -- and ``evaluate`` fires only on a re-score strictly later than the touch, so real
+        # hits are SUPPRESSED. That is the under-fire direction the module docstring rules out.
+        #
+        # THE TEST IS WHETHER THIS PATH'S WALK STOPPED AT A GRAFT, not whether the repo is shallow
+        # and not whether the oldest revision has a parent. Only a commit git itself recorded in
+        # ``.git/shallow`` marks history it cannot see; a parentless commit that is not in that list
+        # is a real beginning, and the walk that reached it saw everything there is.
+        if grafts and revs and revs[0].partition(" ")[0] in grafts:
+            truncated.append(backlog_path)
+
         if limit is not None:
             revs = revs[-limit:]
 
@@ -164,6 +233,11 @@ def banner_last_touched(root: Path, backlog_paths: list[str], limit: int | None)
                 errors="replace",
             )
             if blob.returncode != 0:
+                # A revision that DELETED the path fails here legitimately, so this is counted and
+                # reported rather than refused. It is NOT harmless: the skip leaves ``previous``
+                # untouched, so the next readable revision is diffed against a stale fingerprint and
+                # its change is dated LATER than it happened -- the hit-suppressing direction again.
+                unreadable += 1
                 continue
             try:
                 current = banner_fingerprint(blob.stdout)
@@ -180,7 +254,7 @@ def banner_last_touched(root: Path, backlog_paths: list[str], limit: int | None)
                     if stamp > touched.get(num, ""):
                         touched[num] = stamp
             previous = current
-    return touched
+    return Walk(touched=touched, unreadable_revisions=unreadable, truncated=tuple(truncated))
 
 
 def evaluate(pairs: list[Pair], touched: dict[int, str]) -> tuple[list[Flag], list[int]]:
@@ -227,6 +301,22 @@ def main(argv: list[str] | None = None) -> int:
         sys.stderr.write(f"--root is not a git checkout: {args.root}\n")
         return 2
 
+    # THE REF PAIR IS PART OF THE MEASUREMENT, SO AN UNRESOLVABLE HEAD IS A REFUSAL. On a repo with
+    # no commits ``git rev-parse HEAD`` exits 128 and still ECHOES THE LITERAL ``HEAD`` ON STDOUT, so
+    # an unchecked read stamps ``engine=HEAD`` -- which reads as a deliberate value rather than as a
+    # failure, and passes review forever. An empty string would at least have invited a second look.
+    rev = subprocess.run(  # nosec B603 B607 - fixed argv, no shell; rev-parse takes no input
+        ["git", "-C", str(args.root), "rev-parse", "HEAD"], capture_output=True, text=True
+    )
+    if rev.returncode != 0:
+        sys.stderr.write(
+            f"REFUSING: cannot resolve HEAD in {args.root} (exit {rev.returncode}). The engine ref "
+            "is part of this measurement, and git echoes the literal 'HEAD' on this failure, so an "
+            "unchecked read would stamp engine=HEAD and look deliberate.\n"
+        )
+        return 3
+    head = rev.stdout.strip()
+
     pairs, ambiguous = read_pairs(args.scorecard.read_text(encoding="utf-8", errors="replace"))
     if not pairs:
         sys.stderr.write(
@@ -236,18 +326,41 @@ def main(argv: list[str] | None = None) -> int:
         return 3
 
     ledgers = args.backlog or ["docs/BACKLOG.md", "docs/archive/backlog/BACKLOG-CLOSED.md"]
-    touched = banner_last_touched(args.root, ledgers, args.limit)
+    try:
+        walk = banner_last_touched(args.root, ledgers, args.limit)
+    except RuntimeError as exc:
+        sys.stderr.write(f"REFUSING: {exc}\n")
+        return 3
+    touched = walk.touched
+    if walk.truncated:
+        sys.stderr.write(
+            "REFUSING: the ledger history is TRUNCATED at a shallow graft boundary for "
+            f"{list(walk.truncated)}, so every banner date floors at that boundary. A floored date "
+            "reads as a LATER touch, which SUPPRESSES real hits rather than inventing them -- the "
+            "one direction this check exists to rule out. Deepen the clone (git fetch --unshallow) "
+            "and re-run.\n"
+        )
+        return 3
+    # THE GUARD THIRTY LINES ABOVE, FOR THE OTHER INPUT, AND THE REASONING TRANSFERS VERBATIM. With
+    # no history every pair falls to ``unknown``, ``flags`` is empty, and the tool prints the
+    # all-clear -- the most reassuring possible answer to a question it never got to ask.
+    if not touched:
+        sys.stderr.write(
+            "REFUSING: the ledger walk found no banner history at all. An empty result here is "
+            "indistinguishable from a ledger this tool could not read, and every pair would fall "
+            f"to 'unknown' while the verdict still printed the all-clear. Walked: {ledgers}\n"
+        )
+        return 3
     flags, unknown = evaluate(pairs, touched)
 
-    head = subprocess.run(  # nosec B603 B607 - fixed argv, no shell; rev-parse takes no input
-        ["git", "-C", str(args.root), "rev-parse", "HEAD"], capture_output=True, text=True
-    ).stdout.strip()
     print(f"# rescore-handoff scorecard={args.scorecard} engine={head[:12]}")
     print(
         f"pairs read (literal 'BACKLOG #N' only): {len(pairs)} over {len({p.item for p in pairs})} items"
     )
     print(f"bare '#N' references NOT resolved (ambiguous with PR numbers): {ambiguous}")
     print(f"items whose banner history was found: {len(touched)}")
+    # STATED EVEN WHEN ZERO. An absent line cannot be checked; a printed zero can.
+    print(f"revisions the walk could not read: {walk.unreadable_revisions}")
     if unknown:
         print(f"items referenced but absent from every ledger walked: {sorted(unknown)}")
     print()

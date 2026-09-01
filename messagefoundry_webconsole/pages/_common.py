@@ -8,6 +8,8 @@ Small, escape-neutral formatters imported by the per-area page modules (``connec
 
 from __future__ import annotations
 
+from urllib.parse import quote
+
 
 def _num(value: object) -> str:
     """Render a count/None as text ('—' for None)."""
@@ -19,3 +21,23 @@ def _secs(value: float | None) -> str:
     if value is None:
         return "—"
     return f"{value:.0f}s"
+
+
+def _seg(value: object) -> str:
+    """Percent-encode ONE path segment, INCLUDING ``/`` (BACKLOG #1370).
+
+    ``quote`` DEFAULTS TO ``safe="/"``, which leaves alone the single character a path segment turns
+    on. Measured rather than reasoned: ``quote("IB/ACME")`` returns it UNCHANGED, so a name carrying a
+    slash silently becomes two segments and addresses a different route. ``safe=""`` is the whole fix,
+    and it is why a bare ``quote`` call at one of these sites reads as protection while providing none
+    against the one character that matters.
+
+    CONNECTION NAMES ARE WHY THIS IS NOT THEORETICAL. They are unconstrained free text -- the registry
+    checks only for a duplicate and no charset gate exists -- so the "every interpolated id is a
+    ``uuid4().hex``" argument that covers most /ui interpolations is FALSE for them.
+
+    NOT FOR A PATH LEGITIMATELY CARRIED IN A QUERY PARAMETER. ``_auth``'s re-auth ``next`` uses
+    ``safe="/"`` deliberately, and routing it through here would break it. These sites are partitioned
+    by READING each one, never by a blanket builder.
+    """
+    return quote(str(value), safe="")

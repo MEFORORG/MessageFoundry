@@ -75,7 +75,13 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from scorecard import Cell, load_scorecard  # noqa: E402
+from scorecard import (  # noqa: E402
+    ANCHOR_AMBIGUOUS,
+    ANCHOR_GONE,
+    Cell,
+    load_scorecard,
+    locate_anchor,
+)
 
 #: A born-wrong anchor is one whose token is UNIQUE at the recorded commit and sits at a DIFFERENT line.
 #: Uniqueness is what makes the line number load-bearing; without it the anchor resolves from anywhere
@@ -141,18 +147,23 @@ def _ref_exists(root: Path, ref: str, cache: dict[str, bool]) -> bool:
 
 
 def classify(text: str, expect: str, recorded_line: int) -> tuple[str, int | None]:
-    """Mirror of ``check_anchors``'s locator, applied to whichever tree the caller opened.
+    """``scorecard.locate_anchor`` applied to whichever tree the caller opened, then NAMED for here.
 
-    Substring count for the uniqueness rule; the line derived from the character offset rather than by
-    scanning lines, because tokens spanning a newline are real and a per-line scan misses every one.
+    This used to be a hand-copied mirror of ``check_anchors``'s locator, and the copy was deliberate:
+    a second, silently different definition of "does this token resolve" would produce a born-wrong
+    population that is really a disagreement between two matchers. It now CALLS the one definition
+    instead of mirroring it, which is the same intent with the drift removed rather than watched.
+
+    What stays local is the naming. This tool's verdicts answer a different question -- was the line
+    right at the commit the cell stamps -- so ``at_line`` and ``born_wrong`` have no counterpart in
+    the locator, and the locator must not learn them.
     """
-    occurrences = text.count(expect)
-    if occurrences == 0:
+    found = locate_anchor(text, expect)
+    if found.status == ANCHOR_GONE:
         return ABSENT, None
-    if occurrences > 1:
+    if found.status == ANCHOR_AMBIGUOUS:
         return AMBIGUOUS, None
-    actual = text.count("\n", 0, text.index(expect)) + 1
-    return (AT_LINE if actual == recorded_line else BORN_WRONG), actual
+    return (AT_LINE if found.line == recorded_line else BORN_WRONG), found.line
 
 
 def audit(cells: list[Cell], root: Path, override_ref: str | None = None) -> list[AnchorVerdict]:
@@ -207,8 +218,18 @@ def summarise(verdicts: list[AnchorVerdict]) -> str:
             f"  |delta| min {deltas[0]}, median {deltas[len(deltas) // 2]}, max {deltas[-1]}"
         )
     never = sum(counts.get(k, 0) for k in NEVER_VERIFIED)
+    unread = counts.get(UNREADABLE, 0) + counts.get(NO_COMMIT, 0)
     lines.append("")
     lines.append(f"anchors that were NOT verifiable at the cell's own recorded commit: {never}")
+    # THE NUMBER ABOVE IS THE ONE A READER CARRIES AWAY, AND IT SUMS ONLY BUCKETS THAT REQUIRED A
+    # SUCCESSFUL READ. Excluding UNREADABLE from NEVER_VERIFIED is right -- an unresolvable stamp is
+    # a different fact from a born-wrong anchor -- but it means a run that read NOTHING closes with a
+    # reassuring zero. Printing the denominator it did not examine, always and including when it is
+    # zero, is what stops that line being taken as a verdict over the whole population.
+    lines.append(
+        f"anchors whose recorded commit could not be read, so the line above did not "
+        f"examine them: {unread}"
+    )
     return "\n".join(lines)
 
 
@@ -257,15 +278,42 @@ def main(argv: list[str] | None = None) -> int:
     except (OSError, ValueError):
         pass
 
+    # THE REF PAIR IS PART OF THE MEASUREMENT, SO AN UNRESOLVABLE HEAD IS A REFUSAL. On a repo with
+    # no commits ``git rev-parse HEAD`` exits 128 and still ECHOES THE LITERAL ``HEAD`` ON STDOUT, so
+    # an unchecked read stamps ``engine=HEAD`` -- which reads as a deliberate value rather than as a
+    # failure, and passes review forever. An empty string would at least have invited a second look.
+    rev = subprocess.run(  # nosec B603 B607 - fixed argv, no shell; rev-parse takes no input
+        ["git", "-C", str(args.root), "rev-parse", "HEAD"], capture_output=True, text=True
+    )
+    if rev.returncode != 0:
+        sys.stderr.write(
+            f"REFUSING: cannot resolve HEAD in {args.root} (exit {rev.returncode}). The engine ref "
+            "is part of this measurement, and git echoes the literal 'HEAD' on this failure, so an "
+            "unchecked read would stamp engine=HEAD and look deliberate.\n"
+        )
+        return 3
+    head = rev.stdout.strip()
+
     cells = load_scorecard(args.scorecard)
     verdicts = audit(cells, args.root, args.at)
     if not verdicts:
         sys.stderr.write("REFUSING to report a clean run over zero anchors\n")
         return 3
 
-    head = subprocess.run(  # nosec B603 B607 - fixed argv, no shell; rev-parse takes no input
-        ["git", "-C", str(args.root), "rev-parse", "HEAD"], capture_output=True, text=True
-    ).stdout.strip()
+    # A RUN THAT READ NOTHING IS NOT A CLEAN RUN, AND IT LOOKED EXACTLY LIKE ONE. With every anchor
+    # unreadable the summary closed on "NOT verifiable ...: 0" at exit 0, with a REAL sha in the
+    # header, because the ref pair resolves fine in a checkout whose history simply lacks the stamped
+    # commits -- a shallow clone, a rewritten history, or the wrong sibling checkout.
+    unread = sum(1 for v in verdicts if v.verdict in (UNREADABLE, NO_COMMIT))
+    if unread == len(verdicts):
+        sys.stderr.write(
+            f"REFUSING: all {unread} anchors' recorded commits could not be read in {args.root}. "
+            "The summary would close on a zero that examined nothing, and the engine ref in the "
+            "header resolves either way, so the header cannot tell the two runs apart. Check the "
+            "root is the engine checkout and that its history reaches the recorded commits.\n"
+        )
+        return 3
+
     # NO NUMBER HERE IS A FACT WITHOUT THE PAIR IT WAS MEASURED AGAINST -- the same rule the scorecard's
     # own verify header states. Printed as part of the measurement, not as decoration.
     print(

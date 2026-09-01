@@ -129,6 +129,51 @@ class ScorecardError(Exception):
     """A defect in the scorecard itself — malformed, incomplete, or contradicting the corpus."""
 
 
+#: The three outcomes of asking "does this anchor's token resolve in this text". Named constants
+#: rather than bare strings, so a caller cannot invent a fourth by typing one wrong.
+ANCHOR_GONE: Final[str] = "gone"
+ANCHOR_AMBIGUOUS: Final[str] = "ambiguous"
+ANCHOR_LOCATED: Final[str] = "located"
+
+
+@dataclass(frozen=True)
+class AnchorLocation:
+    """Where an anchor's token sits in one file's text, or why it sits nowhere.
+
+    ``start`` and ``line`` are populated only for :data:`ANCHOR_LOCATED`. A GONE or AMBIGUOUS token
+    has no single landing site, so inventing a plausible-looking number for one is how a made-up
+    position enters a record whose whole purpose is to not overstate itself.
+    """
+
+    status: str
+    occurrences: int
+    start: int | None = None
+    line: int | None = None
+
+
+def locate_anchor(text: str, expect: str) -> AnchorLocation:
+    """THE one definition of "does this anchor resolve", shared by every tool that asks.
+
+    Three callers ask this question and they must not answer it differently: :func:`check_anchors`
+    (the gate), ``anchor_provenance.classify`` (was the line right at the recorded commit), and
+    ``anchor_report`` (what did this engine change break). Before this function existed the second
+    was a hand-copied mirror of the first, and its own docstring says why that is dangerous — a
+    population produced by two matchers is a disagreement between the matchers, not a finding about
+    the record. One function makes that failure unavailable rather than merely discouraged.
+
+    Substring count for the uniqueness rule, and the line derived from the CHARACTER OFFSET rather
+    than by scanning lines: 42 of the roughly 1,980 recorded tokens span a newline, and a per-line
+    scan finds none of them.
+    """
+    occurrences = text.count(expect)
+    if occurrences == 0:
+        return AnchorLocation(ANCHOR_GONE, 0)
+    if occurrences > 1:
+        return AnchorLocation(ANCHOR_AMBIGUOUS, occurrences)
+    start = text.index(expect)
+    return AnchorLocation(ANCHOR_LOCATED, 1, start, text.count("\n", 0, start) + 1)
+
+
 @dataclass(frozen=True)
 class Anchor:
     """A claim that some token exists in the tree, at roughly a known place.
@@ -991,15 +1036,19 @@ def check_anchors(cells: list[Cell], root: Path, findings: Findings) -> None:
                 text_cache[target] = target.read_text(encoding="utf-8", errors="replace")
             text = text_cache[target]
             findings.checked_anchors += 1
-            occurrences = text.count(a.expect)
-            if occurrences > 1:
+            # The locator itself is :func:`locate_anchor`, shared with every other tool that asks the
+            # same question. What stays here is the POLICY -- which outcome is fatal, which is
+            # advisory, and what the operator is told -- because that differs per caller and merging
+            # it into the locator is what would make a reporter accidentally into a gate.
+            found = locate_anchor(text, a.expect)
+            if found.status == ANCHOR_AMBIGUOUS:
                 findings.problems.append(
                     f"{c.id}: {a.path}:{a.line} anchor is AMBIGUOUS — {a.expect!r} occurs "
-                    f"{occurrences} times in the file, so the line number is not load-bearing and a "
-                    "re-anchor cannot be checked. Cite a longer token that appears exactly once"
+                    f"{found.occurrences} times in the file, so the line number is not load-bearing "
+                    "and a re-anchor cannot be checked. Cite a longer token that appears exactly once"
                 )
                 continue
-            if occurrences == 0:
+            if found.status == ANCHOR_GONE:
                 # DELIBERATE NON-AFFORDANCE: this branch does NOT propose a replacement anchor, and
                 # must not be "improved" to fuzzy-match a nearby similar line and suggest one. That
                 # single affordance is what manufactures silent corruption, because a GONE token has
@@ -1030,15 +1079,18 @@ def check_anchors(cells: list[Cell], root: Path, findings: Findings) -> None:
                     "had its control removed (re-score). Do not re-anchor by default"
                 )
                 continue
-            # Unique, and therefore LOCATED: past the guard above, the token occurs exactly once in
+            # Unique, and therefore LOCATED: past the guards above, the token occurs exactly once in
             # this file, so its presence alone pins the evidence and the line number proves nothing
-            # extra. Derive where it actually is and report any disagreement with the record.
+            # extra. Report any disagreement with the record.
             #
-            # DERIVED FROM THE CHARACTER OFFSET, NOT BY SCANNING LINES. 42 of the ~1,980 ``expect``
-            # tokens span a newline, because the old check matched against joined text and nothing
-            # forbade it. A per-line scan finds none of those and raises on the lookup; counting
-            # newlines before the match handles a multi-line token as naturally as a single-line one.
-            start = text.index(a.expect)
+            # `start` and `line` are non-None for exactly this status. Narrowed with a branch rather
+            # than an `assert`, which `python -O` strips: this is the only place the invariant is
+            # relied on, so losing it silently under an optimised interpreter would be free.
+            if found.start is None or found.line is None:
+                raise ScorecardError(
+                    f"{c.id}: the anchor locator reported LOCATED for {a.path} without a position"
+                )
+            start, actual = found.start, found.line
             # Derived form of the landing site. Only anchors that reached here are classified: a GONE
             # or AMBIGUOUS token has no single landing site, so inventing a form for it would be a
             # made-up number in a split whose whole purpose is to stop the record overstating itself.
@@ -1049,7 +1101,6 @@ def check_anchors(cells: list[Cell], root: Path, findings: Findings) -> None:
             findings.anchor_forms[
                 _form_from_spans(a.path, spans_cache[target], start) or "undetermined"
             ] += 1
-            actual = text.count("\n", 0, start) + 1
             if actual != a.line:
                 # The ONLY producer the summary's "carry a stale line number" sentence describes.
                 findings.advise(

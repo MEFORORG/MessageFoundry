@@ -30,24 +30,55 @@ pytestmark = pytest.mark.skipif(
 )
 
 
+#: Seconds allowed for ONE ``pwsh`` launch plus the gate's own work. Named so the diagnostic below can
+#: quote it, rather than repeating the literal in a message that then drifts from the argument.
+GATE_TIMEOUT_S = 60
+
+
 def run_gate(payload: dict[str, Any] | str, repos_file: Path) -> dict[str, Any] | None:
-    """Invoke the hook exactly as Claude Code does. Returns the deny object, or None for 'allow'."""
+    """Invoke the hook exactly as Claude Code does. Returns the deny object, or None for 'allow'.
+
+    **A LAUNCH THAT NEVER RETURNS IS REPORTED AS ITS OWN EVENT, NOT AS A GATE FAILURE (BACKLOG #1304).**
+    The ``windows-2025`` harness leg intermittently times out STARTING ``pwsh`` -- not on any assertion --
+    and it reds the required ``CI gate`` roll-up. The item's operational cost is that nothing
+    distinguishes that from a real regression at the moment it fires, so a lander must choose between
+    rerunning until green and reporting the queue blocked.
+
+    **THIS DOES NOT RETRY, DELIBERATELY.** The item names rerun-until-green as *manufacturing* a green
+    rather than earning one. A retry inside the harness is the same act one level down, with the
+    evidence hidden inside a passing test. Labelling costs nothing and hides nothing.
+    """
     raw = payload if isinstance(payload, str) else json.dumps(payload)
-    proc = subprocess.run(
-        [
-            "pwsh",
-            "-NoProfile",
-            "-NonInteractive",
-            "-File",
-            str(GATE),
-            "-ReposFile",
-            str(repos_file),
-        ],
-        input=raw,
-        capture_output=True,
-        text=True,
-        timeout=60,
-    )
+    try:
+        proc = subprocess.run(
+            [
+                "pwsh",
+                "-NoProfile",
+                "-NonInteractive",
+                "-File",
+                str(GATE),
+                "-ReposFile",
+                str(repos_file),
+            ],
+            input=raw,
+            capture_output=True,
+            text=True,
+            timeout=GATE_TIMEOUT_S,
+        )
+    except subprocess.TimeoutExpired as exc:
+        # RAISED, NOT SWALLOWED, and the wording is the whole deliverable: it says what this IS, what it
+        # is NOT, and what to do -- so the reader does not have to know the item number to act.
+        raise AssertionError(
+            f"PWSH LAUNCH TIMED OUT after {GATE_TIMEOUT_S}s (BACKLOG #1304).\n"
+            "This is a PROCESS LAUNCH that never returned. It is NOT an assertion failure and NOT "
+            "evidence that the gate's behaviour changed: no gate logic ran.\n"
+            "The observed correlation is with TIME rather than with repository content -- runner "
+            "contention, xdist worker pressure and a pwsh startup regression are all consistent with "
+            "it and NONE is evidenced.\n"
+            "DO NOT read this as a regression in the change under test, and DO NOT rerun until green "
+            "without recording that you did: a manufactured green and an earned one are "
+            "indistinguishable afterwards."
+        ) from exc
     # A hook must never crash the tool call: a non-zero exit that is not 2 is silently ignored by the
     # harness, which would leave the gate off with nobody the wiser.
     assert proc.returncode == 0, f"gate exited {proc.returncode}: {proc.stderr}"
