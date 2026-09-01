@@ -51,13 +51,34 @@ def write(repo: Path, rel: str, text: str) -> None:
     p.write_text(text, encoding="utf-8")
 
 
-def allocate(repo: Path, kind: str, number: str, *, worktree: Path | None = None) -> None:
-    """Mimic what scripts/coord/alloc.ps1 writes, so the hook's ownership check has something to read."""
+def allocate(
+    repo: Path,
+    kind: str,
+    number: str,
+    *,
+    worktree: Path | None = None,
+    branch: str | None = None,
+    omit_branch: bool = False,
+) -> None:
+    """Mimic what scripts/coord/alloc.ps1 writes, so the hook's ownership check has something to read.
+
+    ***THE `branch` FIELD IS NOT DECORATION AND THIS HELPER USED TO OMIT IT.*** The real allocator
+    records `number`, `kind`, `title`, `branch`, `worktree` and `claimed`; this fixture wrote only the
+    first two and the worktree. That made it a SECOND, SILENTLY DIFFERENT definition of the record --
+    the defect this repo's test families exist to catch -- and it mattered the moment ownership grew a
+    branch fallback (BACKLOG #1282): every arm below would have passed for the wrong reason, because
+    the fallback short-circuits on a missing branch.
+
+    `omit_branch` reproduces a LEGACY record written before the allocator recorded one, so the
+    path-only behaviour stays pinned.
+    """
     common = git(repo, "rev-parse", "--path-format=absolute", "--git-common-dir").strip()
     top = git(repo, "rev-parse", "--path-format=absolute", "--show-toplevel").strip()
     d = Path(common) / "mefor-coord" / "alloc" / kind
     d.mkdir(parents=True, exist_ok=True)
-    claim = {"number": number, "kind": kind, "worktree": str(worktree or top)}
+    claim: dict[str, str] = {"number": number, "kind": kind, "worktree": str(worktree or top)}
+    if not omit_branch:
+        claim["branch"] = branch or git(repo, "rev-parse", "--abbrev-ref", "HEAD").strip()
     (d / f"{number}.json").write_text(json.dumps(claim), encoding="utf-8")
 
 
@@ -148,14 +169,79 @@ def test_an_allocated_and_indexed_adr_passes(repo: Path) -> None:
 
 
 def test_a_number_allocated_to_a_DIFFERENT_worktree_is_blocked(repo: Path, tmp_path: Path) -> None:
-    """A sibling session holds 0002. Hand-writing it here must not slip through."""
+    """A sibling session holds 0002. Hand-writing it here must not slip through.
+
+    ***THE OTHER BRANCH IS LOAD-BEARING AND USED TO BE IMPLICIT.*** A sibling SESSION is in another
+    worktree AND on another branch -- git refuses one branch in two worktrees, so that pairing is not
+    a coincidence, it is the only shape a live sibling can have. Once ownership grew a branch fallback
+    (BACKLOG #1282) this arm had to name the branch or it would have been asserting the weaker
+    "different path" and passing for a reason unrelated to sibling-ness.
+    """
     write(repo, "docs/adr/0002-new.md", "# 0002 — New\n")
     write(
         repo,
         "docs/adr/README.md",
         README_HEAD + ROW.format(n="0002", slug="new", title="New") + "\n",
     )
-    allocate(repo, "adr", "0002", worktree=tmp_path / "some-other-worktree")
+    allocate(
+        repo,
+        "adr",
+        "0002",
+        worktree=tmp_path / "some-other-worktree",
+        branch="claude/some-other-session",
+    )
+    git(repo, "add", "-A")
+
+    code, out = run_check(repo)
+    assert code == 1
+    assert "not allocated to this worktree" in out
+
+
+def test_a_number_whose_worktree_IS_GONE_is_committable_from_the_SAME_BRANCH(
+    repo: Path, tmp_path: Path
+) -> None:
+    """BACKLOG #1282. The recorded path is dead; the branch is alive and is THIS one.
+
+    ***THIS IS THE ARM THE CHANGE EXISTS FOR, AND IT IS A DELIBERATE LOOSENING.*** Before it, a
+    worktree removed by anything other than scripts/worktree/remove.ps1 stranded its numbers
+    permanently -- 43 of them by 2026-08-30 -- because `owns` compared a path and nothing else, and
+    nothing anywhere reported the loss.
+
+    ***IT IS SAFE ONLY BECAUSE GIT REFUSES ONE BRANCH IN TWO WORKTREES.*** The gate exists to stop two
+    sessions filing one number, and two sessions cannot hold one branch -- so "the session on this
+    branch" is exactly as single-valued as "the session in this worktree" was, while outliving it. A
+    branch that is free to check out is one nobody is working in.
+    """
+    write(repo, "docs/adr/0002-new.md", "# 0002 — New\n")
+    write(
+        repo,
+        "docs/adr/README.md",
+        README_HEAD + ROW.format(n="0002", slug="new", title="New") + "\n",
+    )
+    here = git(repo, "rev-parse", "--abbrev-ref", "HEAD").strip()
+    allocate(repo, "adr", "0002", worktree=tmp_path / "worktree-that-was-deleted", branch=here)
+    git(repo, "add", "-A")
+
+    code, out = run_check(repo)
+    assert code == 0, out
+
+
+def test_a_LEGACY_record_with_no_branch_still_falls_back_to_the_path_alone(
+    repo: Path, tmp_path: Path
+) -> None:
+    """A record written before the allocator recorded a branch must not become a free pass.
+
+    ***THE FALLBACK SHORT-CIRCUITS ON A MISSING BRANCH, AND THAT IS THE DIRECTION THAT MATTERS.***
+    An absent field must refuse, never allow -- otherwise every pre-branch allocation in the registry
+    would be committable from anywhere, which is the opposite of the gate's purpose.
+    """
+    write(repo, "docs/adr/0002-new.md", "# 0002 — New\n")
+    write(
+        repo,
+        "docs/adr/README.md",
+        README_HEAD + ROW.format(n="0002", slug="new", title="New") + "\n",
+    )
+    allocate(repo, "adr", "0002", worktree=tmp_path / "some-other-worktree", omit_branch=True)
     git(repo, "add", "-A")
 
     code, out = run_check(repo)

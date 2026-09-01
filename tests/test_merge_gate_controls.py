@@ -46,7 +46,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from _bash_resolver import bash_sees, explain_returncode, require_bash
+from _bash_resolver import CANNOT_RUN_CODES, bash_sees, explain_returncode, require_bash
 
 from tests._workflow_contexts import ROOT, jobs_of, load_workflow, required_contexts
 
@@ -485,6 +485,10 @@ def _run_hygiene(
     So 126/127 are a hard failure here rather than a verdict. That is the generalisable half of the
     probe defect recorded in BACKLOG #1000: a probe must validate its own output rather than treating
     a broken invocation as an answer.
+
+    Read from ``CANNOT_RUN_CODES`` rather than spelled out again (BACKLOG #1272). A local copy of the
+    rule is free to drift from the shared one, and the copy that drifts is the one still reading a
+    broken invocation as a verdict.
     """
     (repo / "gate.sh").write_text(script, encoding="utf-8", newline="\n")
     proc = _run(
@@ -493,7 +497,7 @@ def _run_hygiene(
         {**env, "PR_TITLE": title, "PR_BODY": body, "BASE_SHA": base, "HEAD_SHA": head},
     )
     out = _text(proc)
-    assert proc.returncode not in (126, 127), (
+    assert proc.returncode not in CANNOT_RUN_CODES, (
         f"bash could not execute the gate script (exit {proc.returncode}): {out.strip()[:300]}. That "
         "is not a gate verdict -- it is a broken invocation, and reading it as one would make every "
         "assertion here vacuous."

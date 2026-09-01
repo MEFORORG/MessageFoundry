@@ -142,14 +142,14 @@ per-lane msg/s  ≈  1000 / (commit_chain_depth × per-commit round-trip ms)
 ```
 
 The documented anchor works out to ~7 × 2.84 ms ≈ 20 ms/message ≈ **50 msg/s per ordered
-lane** on a LAN-attached SQL Server ([`throughput-roadmap.md`](archive/throughput/throughput-roadmap.md)). Three
+lane** on a LAN-attached SQL Server (`throughput-roadmap.md`). Three
 distinct ceilings apply, and you should not conflate them:
 
 - **Per ordered lane:** the commit round-trip chain binds (measured; the box sits ~96% idle at
   the single-lane plateau). Every millisecond added to the commit path lands **~7× in every
   message**.
 - **Per engine box (aggregate, many lanes):** engine CPU binds
-  ([`throughput-build-plan.md`](archive/throughput/throughput-build-plan.md)).
+  (`throughput-build-plan.md`).
 - **Commit-tier IOPS:** headroom on decent hardware (~23,600 commits/s measured on local NVMe —
   11–36× above what the engine drove).
 
@@ -915,7 +915,6 @@ licensed, which is also why this guide never routes reads at the secondaries. Br
 [`DEPLOYMENT.md`](DEPLOYMENT.md) · [`CLOUD-DEPLOYMENT.md`](CLOUD-DEPLOYMENT.md) §2.3 ·
 [`CONFIGURATION.md`](CONFIGURATION.md) · [`SERVICE.md`](SERVICE.md) ·
 [`SYSTEM-REQUIREMENTS.md`](SYSTEM-REQUIREMENTS.md) · [`THROUGHPUT.md`](THROUGHPUT.md) ·
-[`throughput-roadmap.md`](archive/throughput/throughput-roadmap.md) ·
 [`benchmarks/step-b-write-amplification.md`](benchmarks/step-b-write-amplification.md) ·
 [`benchmarks/TUNING-BASELINE.md`](benchmarks/TUNING-BASELINE.md) ·
 [`EARLY-ADOPTER-GUIDE.md`](EARLY-ADOPTER-GUIDE.md) §14 · ADRs

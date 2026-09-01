@@ -55,7 +55,7 @@ three guards above.** If this ever must be split, add each new filename to `allo
 ## Known-dead references
 
 Eleven bare `#N` anchors inside these items point at numbers that never existed in the published
-sequence, and two links in [`docs/COUNSEL-ENGAGEMENT-BRIEF.md`](../../COUNSEL-ENGAGEMENT-BRIEF.md)
+sequence, and two links in `docs/COUNSEL-ENGAGEMENT-BRIEF.md`
 target `#13`, which does not exist here either. **They were already dead before this move** and are
 left as-is rather than silently repointed at a plausible-looking neighbour — resolving a citation to
 the wrong item is the failure mode the erratum exists to prevent, and it looks like success.
@@ -793,7 +793,7 @@ riding payload-agnostic ingress (ADR 0004) as a first-class content type; a FHIR
 the inbound-listener work (#7). HL7 v2 ↔ FHIR *mapping* is a separate, larger effort — leave it to
 handlers initially. Build the codec before the server facade.
 
-**Components (research 2026-06-19 — [`research/non-hl7-transform-components.md`](../../research/non-hl7-transform-components.md)):**
+**Components (research 2026-06-19 — `research/non-hl7-transform-components.md`):**
 the resource codec can be **adopted, not hand-rolled** — FHIR is the *one* non-HL7 format with a mature,
 offline, permissively-licensed model. Pair **`fhir.resources`** (BSD-3, pydantic-v2 — the typed
 `FhirResource` model: construct/read/set/validate/encode; offline, zero terminology calls) with
@@ -809,7 +809,7 @@ note above). The FHIR **REST transport** half is a separate `transports/` connec
 **Why P1:** high effort, but it is the standout gap. Pull into v0.2 if any target customer needs FHIR.
 
 **Source:** Mirth brochure gap analysis (2026-06-18); component picks from the 2026-06-19 non-HL7
-transform-support research ([`research/non-hl7-transform-components.md`](../../research/non-hl7-transform-components.md)).
+transform-support research (`research/non-hl7-transform-components.md`).
 
 ---
 
@@ -972,7 +972,7 @@ more demand than JMS alone.
 > Routers/Handlers *are* the differentiator; no visual/template/drag-drop authoring is built, by design.
 
 > 🔁 **AMENDMENT — narrowed, not reversed (2026-07-10, owner-directed re-evaluation).** Findings:
-> [`docs/research/ide-low-code-options.md`](../../research/ide-low-code-options.md). Still declined: drag-drop /
+> `docs/research/ide-low-code-options.md`. Still declined: drag-drop /
 > canvas *logic* authoring, declarative field-mapping, and any declarative logic **execution** layer.
 > **Carved out:** a **structured action-list *lens*** — a VS Code custom editor that renders/edits real
 > Python Handlers expressed in a typed action vocabulary (**#222**, ADR-gated) — because the artifact and
@@ -1150,7 +1150,7 @@ follow. (A generic JSON/XML *model* is otherwise low-value — `RawMessage.json(
 navigable tree, and XML has no fixed domain to model outside SOAP/CDA.)
 
 **Source:** non-HL7 transform-support research (2026-06-19),
-[`research/non-hl7-transform-components.md`](../../research/non-hl7-transform-components.md); ADR 0004 §"To
+`research/non-hl7-transform-components.md`; ADR 0004 §"To
 resolve" (the flagged `.xml()` accessor).
 
 ---
@@ -1184,14 +1184,14 @@ validation is a slow path few feeds need at MVP — pull forward when a partner 
 conformance checking (or 997/999 acks).
 
 **Source:** non-HL7 transform-support research (2026-06-19),
-[`research/non-hl7-transform-components.md`](../../research/non-hl7-transform-components.md); ADR 0012 §5 + §"Out
+`research/non-hl7-transform-components.md`; ADR 0012 §5 + §"Out
 of scope (deferred / known limitations)".
 
 ---
 
 ## 33. Review the end-to-end configuration method across every surface (config-UX consolidation)
 
-> ✅ **SHIPPED — verified on `origin/main` (2026-07-10).** #33's deliverable was a findings doc, not a PR: [`docs/research/config-ux-review.md`](../../research/config-ux-review.md) (31 findings, follow-ups A–E as separate items) merged in #421 (`9e9ffc6`). Re-scored to value 1 (ships a document, blocks nobody), then flipped: an already-delivered review is closed, not open buildable work.
+> ✅ **SHIPPED — verified on `origin/main` (2026-07-10).** #33's deliverable was a findings doc, not a PR: `docs/research/config-ux-review.md` (31 findings, follow-ups A–E as separate items) merged in #421 (`9e9ffc6`). Re-scored to value 1 (ships a document, blocks nobody), then flipped: an already-delivered review is closed, not open buildable work.
 
 **Type:** review / design — a holistic pass over *how* an operator or analyst actually configures a
 deployment, before the surfaces multiply further in v0.2+. Not a single bug; a consolidation/usability
@@ -1226,7 +1226,7 @@ the price of entry" goal) before more knobs land in v0.2+.
 catalog), ADR 0007 (`connections.toml`), ADR 0017 (config repo), and #18 (bundled git offering).
 
 > **Review delivered (2026-06-19, Lane L / Plan-3 §B).** Findings doc:
-> [`docs/research/config-ux-review.md`](../../research/config-ux-review.md) (date-stamped, time-boxed; 4-surface
+> `docs/research/config-ux-review.md` (date-stamped, time-boxed; 4-surface
 > sweep → adversarial verification, 31 findings confirmed). **#33 identifies + circulates only — no code or
 > config was changed.** Headline: the **split-anchor inconsistency** — one logical bundle resolves against
 > three filesystem roots (`--config` vs CWD-for-`environments/` vs bare-CWD-for-`messagefoundry.toml`/the
@@ -1680,7 +1680,7 @@ StatefulSet shipped in PR #480. Cloud tiers **(a)** run-on-any-platform and **(b
 staged backends + self-fencing leader election (`DbCoordinator` / `SqlServerCoordinator`, `/cluster/*`)
 exist, but there is no example manifest, load balancer, or managed-DB wiring to copy. Full analysis +
 competitor comparison (Mirth / IRIS / Corepoint / Rhapsody) + confidence caveats:
-[`research/cloud-deployment-research-2026-06.md`](../../research/cloud-deployment-research-2026-06.md).
+`research/cloud-deployment-research-2026-06.md`.
 
 **What (ranked, when picked up):**
 1. **Multi-replica HA reference manifest** — Postgres-backed `replicas: 3`, `[cluster].enabled=true`,
@@ -1712,7 +1712,7 @@ adopter yet, and building the HA assembly kit before a real cloud feed validates
 exact speculative-build trap the connector/codec backlog is demand-gated to avoid.
 
 **Source:** cloud-containerization research + codebase assessment (2026-06-22,
-[`research/cloud-deployment-research-2026-06.md`](../../research/cloud-deployment-research-2026-06.md)); ADR 0017
+`research/cloud-deployment-research-2026-06.md`); ADR 0017
 container fast-follow (PR #480); [`CONTAINER-EXPOSURE-EVALUATION.md`](../../CONTAINER-EXPOSURE-EVALUATION.md).
 
 ---
@@ -2785,7 +2785,7 @@ integration engine whose architecture most closely mirrors MessageFoundry's mode
 with an embedded scripting language as the transform surface). **Its identity is deliberately not named
 in-repo** — it is a low-profile competitor and naming it in a public/mirrored doc only gives it
 exposure/SEO; the name and findings live in **private strategy notes only**. (Public positioning names
-only the well-known incumbents — Mirth Connect, Corepoint — per [POSITIONING.md](../../POSITIONING.md).)
+only the well-known incumbents — Mirth Connect, Corepoint — per `POSITIONING.md`.)
 Study: its scripting/authoring ergonomics, deployment + ops model, throughput claims and how they are
 substantiated, licensing/pricing, target customers, and docs/marketing — for what MEFOR can learn and
 where it most sharply differentiates.
@@ -4761,7 +4761,7 @@ phases 2–3. **Composes with:** #92 (shipped), #84, #33, #48, the AI participan
 
 **Cluster:** DX / IDE. **Priority:** P2. **Verdict:** build. **Severity:** low.
 
-**What:** the action-list lens (ADR 0076 phase 2b/3, shipped in #893/#903) renders each recognized row and reserves a slot for the shipped #92 live-debug value beside it, but the **acquisition is stubbed** — `ide/src/actionLens.ts` `liveValuesFor` returns `[]` with a documented TODO. Wire it so the lens shows the actual per-row values flowing through the open Handler against the selected sample (**PHI-redacted by default; never auto-`--show-phi`** — the redacted-merge logic already exists and is tested). This completes the "Corepoint-familiar action rows **+** live values + real Python underneath" combination — the differentiator the IDE deep-research identified ([`docs/research/ide-low-code-options.md`](../../research/ide-low-code-options.md)).
+**What:** the action-list lens (ADR 0076 phase 2b/3, shipped in #893/#903) renders each recognized row and reserves a slot for the shipped #92 live-debug value beside it, but the **acquisition is stubbed** — `ide/src/actionLens.ts` `liveValuesFor` returns `[]` with a documented TODO. Wire it so the lens shows the actual per-row values flowing through the open Handler against the selected sample (**PHI-redacted by default; never auto-`--show-phi`** — the redacted-merge logic already exists and is tested). This completes the "Corepoint-familiar action rows **+** live values + real Python underneath" combination — the differentiator the IDE deep-research identified (`docs/research/ide-low-code-options.md`).
 
 **Why (needs a design decision, not just a wire-up):** the review of #893 found the only two acquisition paths are (a) reach into the shipped `LiveDebugController`'s private last-trace + reveal-gate state, or (b) run a **second** traced dry-run from the lens (a new invocation of the ADR 0072 trace path). (b) is cleaner but is a PHI-carrying path that must reuse the ADR 0072 redaction gate exactly — so pick the approach in a short design note / ADR-0076 addendum before building. Line-addressed trace rows already map to lens row line ranges (the `mergeLiveValues` seam).
 
@@ -5734,7 +5734,7 @@ Either way: add `phi=True` equivalence for this route (a `phi` parameter threade
 
 ## 238. OpenFlow step-attribute completeness pass over the engine vocabulary
 
-> ✅ **CLOSED 2026-08-06 — findings note delivered.** Value **1/10** · Difficulty **1/10**. The gap-map lives at [docs/research/openflow-step-attributes.md](../../research/openflow-step-attributes.md); OpenFlow remains explicitly **not** a compatibility target — the note is a vocabulary map, not a gap-to-close list.
+> ✅ **CLOSED 2026-08-06 — findings note delivered.** Value **1/10** · Difficulty **1/10**. The gap-map lives at `docs/research/openflow-step-attributes.md`; OpenFlow remains explicitly **not** a compatibility target — the note is a vocabulary map, not a gap-to-close list.
 
 **Cluster:** IDE & Authoring / Engine. **Priority:** P3. **Verdict:** build (a review, not a feature). **Severity:** none — this is a gap-analysis task whose output is findings.
 

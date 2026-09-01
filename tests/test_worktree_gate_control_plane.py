@@ -1347,6 +1347,52 @@ def test_a_RELATIVE_repository_token_composes_the_cd_prefix(
     assert run_gate(shell(into_ungoverned, cwd=repo.primary), repo.repos) is None
 
 
+def test_a_pwsh_LAUNCH_timeout_is_reported_as_its_own_event(
+    repo: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #1304. A launch that never returns must not read as a gate regression.
+
+    The item's operational cost is that nothing distinguishes the two at the moment they fire, so a
+    lander must choose between rerunning until green and reporting the queue blocked. This row drives
+    the timeout deliberately -- a diagnostic nobody has ever seen fire is not a diagnostic.
+
+    IT ASSERTS THE THREE THINGS A READER NEEDS, not merely that something was raised: that no gate
+    logic ran, that the correlation is with time rather than content, and that rerunning silently is
+    not a sanctioned fix.
+    """
+    import tests.test_worktree_gate as harness
+
+    def never_returns(*args: object, **kwargs: object) -> None:
+        raise subprocess.TimeoutExpired(cmd="pwsh", timeout=harness.GATE_TIMEOUT_S)
+
+    monkeypatch.setattr(harness.subprocess, "run", never_returns)
+    with pytest.raises(AssertionError) as caught:
+        run_gate(shell("git config core.hooksPath /nope", cwd=repo.wt), repo.repos)
+
+    message = str(caught.value)
+    assert "PWSH LAUNCH TIMED OUT" in message
+    assert "BACKLOG #1304" in message
+    assert "NOT an assertion failure" in message
+    assert "no gate logic ran" in message
+    assert "TIME rather than with repository content" in message
+    assert "rerun until green" in message
+
+
+def test_the_launch_timeout_diagnostic_does_not_fire_on_an_ordinary_denial(
+    repo: SimpleNamespace,
+) -> None:
+    """The control that stops the row above passing against a harness that labelled EVERYTHING.
+
+    An ordinary governed disarm must still produce the rule's own refusal, with no launch-timeout
+    wording anywhere near it.
+    """
+    reason = assert_denied(
+        run_gate(shell("git config core.hooksPath /nope", cwd=repo.wt), repo.repos)
+    )
+    assert "PWSH LAUNCH TIMED OUT" not in reason
+    assert "setting 'core.hooksPath'" in reason
+
+
 def test_the_ordering_switch_did_not_leak_into_rules_3_and_3d(
     repo: SimpleNamespace, unrelated: Path
 ) -> None:
@@ -1371,3 +1417,121 @@ def test_the_ordering_switch_did_not_leak_into_rules_3_and_3d(
         )
     )
     assert "working tree of the SHARED PRIMARY checkout" not in removal
+
+
+# ------------------------------------------------- BACKLOG #1379 class one: -C shadows --git-dir
+#
+# ZERO EXISTING TESTS PUT `-C` AND `--git-dir` ON ONE COMMAND LINE, verified before writing these, so
+# nothing here can be disturbing behaviour another row depends on.
+#
+# THE MODEL IS MEASURED, NOT ARGUED. Run against real git, twice, reading the config back:
+#   git -C A --git-dir=B/.git config k v   ->  the value lands in B. --git-dir DECIDES the
+#                                              repository regardless of its position next to -C.
+#   git -C A --git-dir=.git   config k v   ->  the value lands in A, and the session cwd has no
+#                                              .git at all. A RELATIVE --git-dir resolves against
+#                                              the POST-`-C` directory.
+# The gate collects `-C` candidates first and appends the promoted `--git-dir` behind them, and the
+# caller takes the first candidate git answers on -- so a real `-C` directory always answers and the
+# token that actually decides never gets asked.
+
+
+def test_a_dash_C_must_not_shadow_the_git_dir_that_actually_decides(
+    tmp_path: Path, repo: SimpleNamespace
+) -> None:
+    """FAIL-OPEN, and proven by CONSEQUENCE rather than by verdict.
+
+    From an ungoverned cwd, naming an ungoverned directory with `-C` and the GOVERNED repository
+    with `--git-dir`, the write really lands in the governed shared config. A verdict-only test
+    would pass just as well against a rule that could not reach the victim at all, which is why
+    this reads the value back out of the governed repo.
+    """
+    other = tmp_path / "Unrelated"
+    other.mkdir()
+    subprocess.run(["git", "init", "-b", "main", str(other)], check=True, capture_output=True)
+
+    command = f'git -C "{other}" --git-dir="{repo.primary}/.git" config core.hooksPath /dev/null'
+
+    # THE CONSEQUENCE, established first so the verdict below is judged against a real hazard.
+    subprocess.run(command, cwd=str(other), shell=True, capture_output=True, text=True)
+    landed = subprocess.run(
+        ["git", "config", "--local", "--get", "core.hooksPath"],
+        cwd=str(repo.primary),
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    assert landed == "/dev/null", (
+        "fixture does not reproduce the hazard: the write did not reach the governed config, so a "
+        "verdict assertion below would prove nothing"
+    )
+
+    reason = assert_denied(run_gate(shell(command, cwd=other), repo.repos))
+    assert "SHARED git configuration" in reason
+
+
+def test_a_RELATIVE_git_dir_resolves_against_the_post_dash_C_directory(
+    tmp_path: Path, repo: SimpleNamespace
+) -> None:
+    """The composition half. `--git-dir=.git` is relative, so it roots at the `-C` target.
+
+    THE `-C` HERE MUST NAME AN UNGOVERNED DIRECTORY, and the first draft of this test got that
+    wrong. It passed `-C <governed primary>`, which the gate denies off the `-C` candidate ALONE --
+    so the relative `--git-dir` was never consulted and the row passed identically with the
+    composition reverted. Mutation caught it; reading it did not. A test whose subject is never
+    reached is not a weaker test, it is a different one.
+
+    So: stand in an ungoverned repo, point `-C` at a SECOND ungoverned directory, and let a
+    RELATIVE `--git-dir` climb back to the governed repo. Every absolute path on the line is
+    ungoverned, and the only thing that can produce a deny is resolving `../Primary/.git` against
+    the post-`-C` directory -- which is what real git does.
+    """
+    other = tmp_path / "Sibling"
+    other.mkdir()
+    subprocess.run(["git", "init", "-b", "main", str(other)], check=True, capture_output=True)
+    relative = f"../{repo.primary.name}/.git"
+
+    command = f'git -C "{other}" --git-dir={relative} config core.hooksPath /dev/null'
+
+    # CONSEQUENCE FIRST: prove the relative token really reaches the governed config, or the verdict
+    # below is judged against a hazard that does not exist.
+    subprocess.run(command, cwd=str(other), shell=True, capture_output=True, text=True)
+    landed = subprocess.run(
+        ["git", "config", "--local", "--get", "core.hooksPath"],
+        cwd=str(repo.primary),
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    assert landed == "/dev/null", (
+        "fixture does not reproduce the hazard: the relative --git-dir did not reach the governed "
+        "config, so the verdict assertion below would prove nothing"
+    )
+
+    reason = assert_denied(run_gate(shell(command, cwd=other), repo.repos))
+    assert "SHARED git configuration" in reason
+
+
+def test_an_ungoverned_git_dir_still_passes_even_with_a_governed_dash_C(
+    tmp_path: Path, repo: SimpleNamespace
+) -> None:
+    """THE OTHER DIRECTION, and it is why this is a REORDER rather than a widening.
+
+    `--git-dir` deciding means it decides BOTH ways: a governed `-C` with an ungoverned
+    `--git-dir` writes to the UNGOVERNED repo, so denying it would name a repository the write
+    never touches -- the BACKLOG #1085 false-deny shape. A fix that only ever adds denials would
+    pass the two rows above and fail this one.
+    """
+    other = tmp_path / "Unrelated2"
+    other.mkdir()
+    subprocess.run(["git", "init", "-b", "main", str(other)], check=True, capture_output=True)
+
+    command = f'git -C "{repo.primary}" --git-dir="{other}/.git" config core.hooksPath /dev/null'
+
+    subprocess.run(command, cwd=str(repo.other), shell=True, capture_output=True, text=True)
+    governed = subprocess.run(
+        ["git", "config", "--local", "--get", "core.hooksPath"],
+        cwd=str(repo.primary),
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    assert governed != "/dev/null", "fixture wrong: the write reached the governed repo after all"
+
+    assert run_gate(shell(command, cwd=repo.other), repo.repos) is None
