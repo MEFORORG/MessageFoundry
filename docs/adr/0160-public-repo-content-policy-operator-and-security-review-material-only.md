@@ -343,10 +343,29 @@ holding a `ci.yml` that never runs is indistinguishable, at a glance, from one w
 > **P2's "13 of 26 files" is a FILE-COUNT denominator and it overstates the gap by two orders of
 > magnitude.** The move-set is **70 test files, not 26**. Run on Windows in this worktree:
 > **1767 passed, 1 skipped, 0 failed, in 26m47s** — so the suite is green on the platform that
-> matters. The ubuntu exposure is **27 test functions** carrying an `os.name != "nt"` gate, out of
-> 1768. Not "half the suite". **P2 still stands** — those 27 are precisely the Windows-specific
-> assertions, which is the whole point of testing Windows tooling — but it should be argued on
-> *which* tests are lost, never on how many. Every active vault workflow is `ubuntu-latest`; there
+> matters. The ubuntu exposure is **NOT 27 test functions**, and the figure is WITHDRAWN. An earlier
+> revision of this line said 27, which reproduces under no reading of the tree and errs in the
+> direction that makes this precondition look easier to satisfy than it is. Measured 2026-09-01 at
+> `bdffd6479` by walking every `tests/**/*.py` with `ast` and asking which `test_` functions sit
+> under a gate whose own source contains `os.name`: **6** carry a per-function decorator, **606**
+> sit in **34 files** under a MODULE-level gate, so **612** in all. The gate is
+> `shutil.which("pwsh") is None or os.name != "nt"` -- it skips on NON-Windows, so every one of
+> those 612 is lost on an ubuntu-only leg. Three readings, three different numbers -- 6, 35 gate
+> lines, 612 functions -- and 27 is none of them; the table below counts 13 FILES for the same
+> predicate where this walk finds 34, so the old figure appears to have conflated files with
+> functions and then undercounted the files as well.
+>
+> **THE DENOMINATOR IS NOT RECONCILED AND IS DELIBERATELY NOT RESTATED.** 1768 comes from a
+> Windows run of the 70-file move-set; 612 is measured over the WHOLE of `tests/`, which collects
+> 11,158 test functions here. The two have different corpora, so 612/11158 is not a drop-in
+> replacement for 27/1768 and no ratio should be computed across them. What IS established is
+> that the 34 module-gated files are exactly the coord, worktree, session, announce and collision
+> suites -- the PowerShell tooling this move is about -- so the ubuntu loss is in the hundreds of
+> functions rather than in the tens. Whoever closes this must re-measure against the enumerated
+> move-set; nobody has enumerated it here.
+>
+> **P2 still stands, and it now stands for a bigger reason than it claimed.** It should still be
+> argued on *which* tests are lost, never on how many. Every active vault workflow is `ubuntu-latest`; there
 > is **no Windows leg at all**, and `selfhosted-win2025-sql.yml` is disabled.
 >
 > **THE COST IS NOW KNOWN RATHER THAN ESTIMATED.** The vault is **private**, so a ~27-minute Windows
