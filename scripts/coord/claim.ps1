@@ -184,8 +184,32 @@ function Add-HistoryLine([string]$Line) {
 # `present` meant "the path exists". It never asked whether a SESSION was in it, so a worktree that
 # outlived its session -- the directory still on disk, nobody in it -- rendered identically to a
 # lane that is actively building. That is a THIRD state the tool could not represent, and it is the
-# one that produces work that is done, correct, and held by nobody: the sanctioned verbs refuse,
-# `-Force` is forbidden by CLAUDE.md, and the claim cannot be regularised by anything.
+# one that produces work that is done, correct, and held by nobody: the sanctioned verbs refuse, and
+# the holder is not present to release it.
+#
+# THAT SENTENCE USED TO END "`-Force` is forbidden by CLAUDE.md, and the claim cannot be regularised
+# by anything." BOTH HALVES WERE FALSE, and the first was falsifiable in one grep. CLAUDE.md contains
+# no prohibition on this or any `-Force` switch: its only force-related rules are about `git push
+# --force` and `reset --hard` (section 5, "Ask before irreversible or outward-facing actions").
+# Measured with `no-verify` as a positive control so a broken search could not read as a clean one.
+#
+# The second half was refuted by THIS FILE, 100 lines down: the `gone` branch prints
+# "[HOLDER GONE -- worktree no longer exists; release with -Force]", and the header at the top states
+# that every release is recorded, `-Force` included, with whether it was used. `docs/WORKTREES.md`
+# describes `-Release <key> -Force` as the ordinary by-hand remedy for exactly this stranded claim.
+#
+# WHY A WRONG COMMENT HERE COSTS MORE THAN A WRONG COMMENT USUALLY DOES. It does not merely misinform;
+# it tells a reader that the documented remedy for the state they are standing in is BANNED, and it
+# cites the project's own conventions file as the authority. A session that believes it will not run
+# the verb, will not look for the rule, and will leave real work stranded -- which is the exact
+# outcome this block was written to prevent. It was found by a session whose commit was blocked by a
+# dead seat's claim and who went to check the rule rather than trust the comment.
+#
+# WHAT IS ACTUALLY TRUE, and it is a constraint on EVIDENCE rather than on the verb: a release must
+# rest on proof that the holder is gone, never on a timer or a guess. `occupancy.ps1` states the rule
+# this file inherits -- a DEAD/STALE/absent verdict may VETO an action and must never by itself
+# authorise one. So `-Force` is available, audited, and sometimes correct; what is forbidden is
+# reaching for it without the evidence, which is a different sentence entirely.
 #
 # ***THE NEW STATE REPORTS. IT DOES NOT PERMIT.*** `unoccupied` still REFUSES, exactly as `present`
 # does, and this is not timidity -- `occupancy.ps1` states the rule it inherits: "there is no
