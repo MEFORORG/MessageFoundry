@@ -249,12 +249,22 @@ obligation**, measured at `72bfddfad` over the removed set. Besides the pin abov
 `docs/research/ad-step-up-after-simple-bind-retirement.md` (*"`_reauth_ad` may therefore not be
 deleted in the same change that removes `_login_ad`"*).
 
+**IF YOU TAKE ONE THING FROM THIS PARAGRAPH, TAKE THIS: GREP FOR `in the same change` AND `in the
+same commit` BEFORE MOVING ANYTHING.** One command, it catches all ten, and it costs nothing. This
+pass did not run it and should have. Everything below is the reasoning; that line is the remedy.
+
 **NOTHING IS PROPOSED HERE AND NOTHING IS FIXED.** The ten obligations are now unsatisfiable as
-written. Whether the answer is to keep an obligation-carrying document tracked regardless of subject,
-to rewrite the obligation as a CI check before moving it, or to accept the breach and say so where it
-can be read, is not decided. What is recorded is that **D1's subject test is insufficient on its own,
-and a future phase should screen for `in the same change` and `in the same commit` before moving
-anything** -- a cheap grep that this pass did not run and should have.
+written, and the three candidate answers are genuinely different with different owners: keep an
+obligation-carrying document tracked regardless of subject; rewrite the obligation as a CI check
+BEFORE moving it; or accept the breach and say so somewhere it can be read.
+
+Worth noting without deciding it: **only the middle one survives the document being in EITHER
+repository.** Keeping the document tracked works only while it stays; accepting the breach depends on
+a reader finding the note. A check that fails when the assertion and the row disagree holds wherever
+the row lives, because it is anchored to the code rather than to the prose. That is an observation
+about the remedy space, not a decision, and the decision is not a session's to make.
+
+What is recorded is that **D1's subject test is insufficient on its own.**
 
 **Custody first, as Phase 1 requires.** The 46 files were committed to the vault and pushed BEFORE
 leaving the tracked tree, at `wshallwshall/MessageFoundry` branch `lander/adr0160-custody`, verified
