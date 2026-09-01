@@ -18664,3 +18664,36 @@ Within `scripts/coord` and `scripts/hooks` specifically, four files are caught b
 **Nearest existing mechanism:** the floor is already computed and recorded on every run, pass or fail, into the readings artifact and the step summary, and `harness/load/profiles/connscale-smoke.toml` already carries the `[slo]` table an armed check would key off. So the build is a threshold plus a negative control on an existing seam. **The harvest is the cost, and criterion 1 is most of it.**
 
 **Related:** [#1211](#1211-empty_claims_per_msg-is-not-contention-immune-the-ratio-form-excursions-past-its-own-slo-band-on-a-hosted-runner) is the single home for the harvest table, the five measured defects and the owner ruling -- read it there, and do not restate the table here. #1357 covers the FD arm of the test #1211 split. #1366's design premise that two metrics carry a band is now one, corrected in place there. #1414 is the allocation-transfer path this item's number history is an instance of.
+
+## 1419. the connscale-smoke profile is documented as CI-run and no workflow invokes it
+
+> 🔢 **Filed 2026-09-01 - not started.** `tests/test_connscale_smoke.py` line 45 tells a reader that the shipped `connscale-smoke` profile (N=50/100) is *"run via the ``--connscale`` CLI in CI"*. **No workflow invokes it.** MEASURED on `origin/main` at `85516d100`: `git grep -e '--connscale' origin/main -- .github/` exits 1, no match, against a positive control of `connscale` which exits 0 and finds `.github/workflows/ci.yml`. So the larger-N point that sentence describes as covered is **predicted and unexercised**, and the module docstring that sets a reader's expectations for the whole file is wrong about it.
+> Verdict: build
+> Closing-act: docs
+
+**Cluster:** Developer Experience & CI. **Priority:** P3. **Verdict:** build.
+**Severity:** no engine effect, no PHI axis, **no deployment axis (sec. 0)** -- this is a measurement instrument in the test harness and a false sentence about it, not shipped engine behaviour. The cost is that a reader deciding whether the N=50/100 regime is regression-covered gets the wrong answer from the file's own docstring, and the docstring is the natural place to look.
+
+**THE FLAG IS REAL. THE CI CLAIM IS NOT.** `--connscale` exists and works: `harness/__main__.py:152` declares it, its own docstring at line 20 documents `python -m harness --connscale NAME`, and it is referenced from `docs/LOAD-TESTING.md`, `harness/load/profiles/README.md` and several benchmark records. **Nothing under `.github/` calls it.** That distinction matters for the fix: this is not a broken flag, it is a sentence asserting a CI behaviour that no workflow performs.
+
+**WHAT CI ACTUALLY DOES WITH CONNSCALE, so the replacement sentence can be true.** MEASURED, every `connscale` occurrence under `.github/`:
+
+* `ci.yml:2093` runs `pytest tests/test_connscale_postgres.py -v`.
+* `ci.yml:866-871` uploads `out/connscale/` as the `connscale-readings-<os>-<py>` artifact, on every run, pass or fail (BACKLOG #1211).
+* `ci.yml:1469` lists `test_connscale` among the paths that trigger the server-DB legs.
+* `ci.yml:1315` and `:1351` are comments about runner headroom and the three heaviest multi-process tests.
+
+So the **pytest** tests run in CI at the small-N sizes the same docstring describes (12 to 24, chosen to fit the pytest-timeout budget). The **profile sweep** does not run at all.
+
+**WHY IT IS WORTH A ROW RATHER THAN A SILENT EDIT.** The sentence is load-bearing for a reader's model of coverage. The docstring's surrounding paragraph is careful and honest -- it states in terms which walls the small-N run does NOT regression-cover, and names the Postgres leg as what gives the acquire-wait wall real small-N coverage. A reader who trusts that carefulness has no reason to doubt the next clause. **An accurate paragraph is what makes the one false clause inside it dangerous.**
+
+**PROVENANCE.** This was one of two findings surfaced by PR #656 (closed 2026-09-01 as superseded by #729). Its diagnosis was correct and outlives the pull request it arrived in; the remedy that PR proposed is not what is wanted here. Its sibling finding -- that `runner.py` appends the final sample after `driver.stop()`, `await_drain()` and a settle, while three sites describe the metric as spanning *"first->last in-hold samples"* -- belongs to **#1211** as an amendment rather than a new number, because #1211 already records that same docstring claim as measured false for a different reason. **That is deliberately not filed here.**
+
+**Candidate fixes, not yet decided.** Either correct the sentence to describe what CI does, naming the profile as a local or on-demand instrument rather than a CI-run one; or make it true by invoking the sweep from a workflow. The second is a real cost decision, not a docs edit -- `harness/load/profiles/connscale-smoke.toml` at N=50/100 is far heavier than the pytest sizes, and `ci.yml:1315`'s own comment reserves runner headroom for exactly this class of work. **Do not "fix" this by deleting the clause and leaving the coverage question unanswered** -- the whole value of the surrounding paragraph is that it states what is not covered.
+
+**How to re-measure, and print the needle beside the zero.** A bare zero here is indistinguishable from a search that never ran:
+
+```
+git grep -c -e '--connscale' origin/main -- .github/    # expect exit 1, no match
+git grep -c -e 'connscale'   origin/main -- .github/    # positive control, expect exit 0
+```
