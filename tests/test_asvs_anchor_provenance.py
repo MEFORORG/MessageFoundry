@@ -43,11 +43,58 @@ from anchor_provenance import (  # noqa: E402
 )
 from scorecard import Anchor, Cell  # noqa: E402
 
+#: The refusal code for a run that started and will not publish a number. This tool splits its two
+#: refusals: 2 says the INVOCATION is unusable and is decidable from the arguments alone, 3 says the
+#: arguments were good and the measurement came out void. Spelled here rather than as a bare literal
+#: at each site, because an arm that pins the wrong family passes for the wrong reason.
+REFUSED = 3
+
+#: Planted in every record the CLI arms drive, and searched for in every captured stream. A real
+#: requirement id collides with ordinary numbers in this tool's own output -- it prints line numbers,
+#: counts and percentages -- so an absence assertion against one proves nothing. This cannot occur by
+#: accident, so a hit is PROOF of disclosure rather than a coincidence.
+SENTINEL_ID = "ZZ.SENTINEL.9"
+SECOND_SENTINEL_ID = "ZZ.SENTINEL.8"
+
+#: Assessment CONTENT, as against the public vocabulary (anchor, scorecard, verifier, stale, born
+#: wrong). Stated ONCE and scanned by EVERY arm that captures a stream, which is the whole reason it
+#: is a module constant: the sibling tool put its equivalent list inside the one happy-path arm that
+#: used it, so the refusal path was never scanned and shipped a leak. A list only one caller reads is
+#: a list that only covers one caller.
+BANNED_CONTENT = ("verdict", "coverage", "partial", " pass ", "unverified")
+
 
 def git(*args: str, cwd: Path) -> str:
     return subprocess.run(
         ["git", *args], cwd=str(cwd), check=True, capture_output=True, text=True
     ).stdout.strip()
+
+
+def _run(args: list[str], capsys: pytest.CaptureFixture[str]) -> tuple[int, str]:
+    """Run the CLI and return its code plus BOTH streams joined, so a leak cannot hide on stderr.
+
+    Every refusal in this tool writes to stderr and every summary to stdout, so an arm reading one
+    stream is blind to half the output it is asserting about -- and blind in the direction that
+    passes.
+    """
+    code = main(args)
+    captured = capsys.readouterr()
+    return code, captured.out + captured.err
+
+
+def _assert_no_assessment_content(stream: str) -> None:
+    """Nothing a reader could paste from this stream may name a graded row or a grading word.
+
+    The module docstring calls the summary "safe to paste anywhere", and that is a claim about the
+    TOOL rather than about one code path. Asserting it in a single arm would make it hold exactly
+    where it was already obvious.
+    """
+    for sentinel in (SENTINEL_ID, SECOND_SENTINEL_ID):
+        assert sentinel not in stream, f"the output disclosed a graded row's identifier:\n{stream}"
+    for banned in BANNED_CONTENT:
+        assert banned not in stream.lower(), (
+            f"the output leaked assessment content ({banned!r}):\n{stream}"
+        )
 
 
 @pytest.fixture
@@ -232,23 +279,36 @@ def test_it_refuses_a_root_that_contains_the_scorecard(tmp_path: Path, history) 
     assert main(["--scorecard", str(card), "--root", str(repo)]) == 2
 
 
-def test_detail_is_written_only_when_asked(tmp_path: Path, history) -> None:
+def test_detail_is_written_only_when_asked(tmp_path: Path, history, capsys) -> None:
     """Cell identifiers paired with file paths are the enumeration CLAUDE.md section 12 keeps vaulted,
-    so the per-cell record must never be a side effect of running the tool."""
+    so the per-cell record must never be a side effect of running the tool.
+
+    THE SPLIT IS ASSERTED IN BOTH DIRECTIONS HERE, which is what makes it a property rather than a
+    habit: the identifier reaches the file ``--detail`` names, and it reaches nothing else. An arm
+    that only checked the file was absent would pass just as well against a tool that printed the
+    identifier to stdout as well.
+    """
     repo, _early, later = history
     card = tmp_path / "card.toml"
     card.write_text(
-        f'[[cell]]\nid = "X.1.1"\nlevel = 1\nverdict = "pass"\nverified_at = "{later}"\n'
+        f'[[cell]]\nid = "{SENTINEL_ID}"\nlevel = 1\nverdict = "pass"\nverified_at = "{later}"\n'
         '[[cell.evidence]]\npath = "mod.py"\nline = 2\nexpect = "NEEDLE"\n',
         encoding="utf-8",
     )
     detail = tmp_path / "detail.json"
-    assert main(["--scorecard", str(card), "--root", str(repo)]) == 0
+    code, out = _run(["--scorecard", str(card), "--root", str(repo)], capsys)
+    assert code == 0
     assert not detail.exists()
+    _assert_no_assessment_content(out)
 
-    assert main(["--scorecard", str(card), "--root", str(repo), "--detail", str(detail)]) == 0
+    code, out = _run(
+        ["--scorecard", str(card), "--root", str(repo), "--detail", str(detail)], capsys
+    )
+    assert code == 0
+    _assert_no_assessment_content(out)
     rows = json.loads(detail.read_text(encoding="utf-8"))
     assert rows and rows[0]["verdict"] == BORN_WRONG
+    assert rows[0]["cell"] == SENTINEL_ID
 
 
 def test_a_root_whose_HEAD_cannot_be_resolved_is_refused_not_stamped_HEAD(
@@ -266,12 +326,13 @@ def test_a_root_whose_HEAD_cannot_be_resolved_is_refused_not_stamped_HEAD(
     git("init", "-b", "main", str(repo), cwd=tmp_path)
     card = tmp_path / "card.toml"
     card.write_text(
-        '[[cell]]\nid = "X.1.1"\nlevel = 1\nverdict = "pass"\nverified_at = "deadbeef"\n'
+        f'[[cell]]\nid = "{SENTINEL_ID}"\nlevel = 1\nverdict = "pass"\nverified_at = "deadbeef"\n'
         '[[cell.evidence]]\npath = "mod.py"\nline = 2\nexpect = "NEEDLE"\n',
         encoding="utf-8",
     )
-    assert main(["--scorecard", str(card), "--root", str(repo)]) == 3
+    assert main(["--scorecard", str(card), "--root", str(repo)]) == REFUSED
     captured = capsys.readouterr()
+    _assert_no_assessment_content(captured.out + captured.err)
     # NOT a bare ``"HEAD" in err``. That assertion passed with this guard REMOVED, because pytest
     # names ``tmp_path`` after the test and this test's name contains HEAD -- so the directory path
     # echoed in a DIFFERENT refusal satisfied it. Caught by mutation, not by re-reading. The phrase
@@ -298,16 +359,17 @@ def test_a_run_where_NOTHING_could_be_read_is_refused_not_closed_with_a_zero(
     repo, _early, _later = history
     card = tmp_path / "card.toml"
     card.write_text(
-        '[[cell]]\nid = "X.1.1"\nlevel = 1\nverdict = "pass"\n'
+        f'[[cell]]\nid = "{SENTINEL_ID}"\nlevel = 1\nverdict = "pass"\n'
         'verified_at = "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef"\n'
         '[[cell.evidence]]\npath = "mod.py"\nline = 2\nexpect = "NEEDLE"\n',
         encoding="utf-8",
     )
     rc = main(["--scorecard", str(card), "--root", str(repo)])
-    assert rc == 3
+    assert rc == REFUSED
     captured = capsys.readouterr()
     assert "REFUSING" in captured.err
     assert "could not be read" in captured.err
+    _assert_no_assessment_content(captured.out + captured.err)
 
 
 def test_the_closing_line_never_stands_alone_when_some_anchor_could_not_be_read(
@@ -323,13 +385,127 @@ def test_the_closing_line_never_stands_alone_when_some_anchor_could_not_be_read(
     repo, _early, later = history
     card = tmp_path / "card.toml"
     card.write_text(
-        f'[[cell]]\nid = "X.1.1"\nlevel = 1\nverdict = "pass"\nverified_at = "{later}"\n'
+        f'[[cell]]\nid = "{SENTINEL_ID}"\nlevel = 1\nverdict = "pass"\nverified_at = "{later}"\n'
         '[[cell.evidence]]\npath = "mod.py"\nline = 2\nexpect = "NEEDLE"\n'
-        '[[cell]]\nid = "X.1.2"\nlevel = 1\nverdict = "pass"\n'
+        f'[[cell]]\nid = "{SECOND_SENTINEL_ID}"\nlevel = 1\nverdict = "pass"\n'
         'verified_at = "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef"\n'
         '[[cell.evidence]]\npath = "mod.py"\nline = 2\nexpect = "NEEDLE"\n',
         encoding="utf-8",
     )
-    assert main(["--scorecard", str(card), "--root", str(repo)]) == 0
-    out = capsys.readouterr().out
+    code, out = _run(["--scorecard", str(card), "--root", str(repo)], capsys)
+    assert code == 0
     assert "could not be read" in out
+    _assert_no_assessment_content(out)
+
+
+#: Records that reach ``load_scorecard`` and do not come back as cells, one per fault it fails
+#: differently, paired with the exception CLASS each produces. Every identifier here is invented --
+#: ``ZZ.SENTINEL.9`` and ``bogus`` cannot collide with a real requirement -- so a hit in a captured
+#: stream is proof of disclosure rather than a coincidence.
+#:
+#: THE THREE ``KeyError`` ROWS ARE THE SECOND HALF OF THE DEFECT. ``load_scorecard`` subscripts the
+#: record directly in a dozen places, so these reached no refusal at all: they escaped as a traceback
+#: and exit 1, a code this tool's own contract never defines and no ``return`` in it produces.
+_UNREADABLE: dict[str, tuple[str, str]] = {
+    "unknown_state": ('[[cell]]\nid = "{id}"\nlevel = 1\nverdict = "bogus"\n', "ScorecardError"),
+    "na_without_rationale": (
+        '[[cell]]\nid = "{id}"\nlevel = 1\nverdict = "na"\n',
+        "ScorecardError",
+    ),
+    "closed_without_a_pin": (
+        '[[cell]]\nid = "{id}"\nlevel = 1\nverdict = "pass"\ndecision_closed = true\n',
+        "ScorecardError",
+    ),
+    "row_without_id": ('[[cell]]\nlevel = 1\nverdict = "pass"\n', "KeyError"),
+    "row_without_level": ('[[cell]]\nid = "{id}"\nverdict = "pass"\n', "KeyError"),
+    "citation_without_a_token": (
+        '[[cell]]\nid = "{id}"\nlevel = 1\nverdict = "pass"\n'
+        '[[cell.evidence]]\npath = "mod.py"\nline = 2\n',
+        "KeyError",
+    ),
+    "not_toml_at_all": ('[[cell]\nid = "{id}"\n', "TOMLDecodeError"),
+}
+
+
+@pytest.mark.parametrize("fault", sorted(_UNREADABLE))
+def test_a_record_that_will_not_load_is_refused_without_naming_the_row(
+    history: tuple[Path, str, str],
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    fault: str,
+) -> None:
+    """THE LOAD BOUNDARY, which no arm above reaches in either direction.
+
+    ``load_scorecard`` refuses in ten places and nine of them open by naming the graded row they
+    rejected; one lists the whole grading vocabulary. So an unguarded call would print a graded row's
+    identifier to stderr the first time a record went malformed -- as a traceback, which is also
+    exit 1, outside the 0/2/3 this tool returns anywhere else.
+
+    Both halves are asserted here because they arrive together and are fixed together. The exit code
+    is the one a poller reads; the stream is the one a person pastes.
+
+    THIS FUNCTION'S NAME, ITS PARAMETER NAMES AND EVERY KEY IN ``_UNREADABLE`` ARE PART OF THE
+    FIXTURE: pytest builds ``tmp_path`` from the first two, the parametrize id lands in it as well,
+    and the refusal prints the path it was handed. All of them must stay clear of
+    :data:`BANNED_CONTENT`, or the arm fails against its own name.
+    """
+    repo, _early, _later = history
+    body, exc_name = _UNREADABLE[fault]
+    record = tmp_path / f"{fault}.toml"
+    record.write_text(body.format(id=SENTINEL_ID), encoding="utf-8")
+
+    code, out = _run(["--scorecard", str(record), "--root", str(repo)], capsys)
+
+    # Reaching this line at all is half the arm. An unguarded call raises out of ``main`` instead of
+    # returning, so before the guard existed every row here died in ``_run`` with the traceback
+    # itself as the failure -- which is exactly the output the tool would have printed.
+    assert code == REFUSED, (
+        f"{fault!r} exited {code}, not {REFUSED}. Exit 1 is what an escaping exception produces and "
+        f"this tool defines no meaning for it, so a caller cannot tell it from a crash:\n{out}"
+    )
+    assert "REFUSING" in out, out
+    # Exit 3 is shared with the unresolvable-HEAD and nothing-readable refusals, so the code alone
+    # cannot pin THIS guard. A bare "REFUSING" cannot either. This phrase is emitted here and
+    # nowhere else in the tool.
+    assert "would not load" in out, f"{fault!r} was refused by some other guard:\n{out}"
+    _assert_no_assessment_content(out)
+    # A refusal read nothing, so it prints no total: "nothing was found" and "nothing was looked at"
+    # must never render identically, which is the property this whole tool exists to hold.
+    assert "anchors examined" not in out, f"{fault!r} printed a total off an unread record:\n{out}"
+    # WITHHOLDING THE DIAGNOSTIC MUST NOT WITHHOLD THE TRIAGE. The class carries nothing from the
+    # record and is the one part that crosses.
+    assert exc_name in out, f"{fault!r} gave the reader no failure class to act on:\n{out}"
+
+
+def test_the_class_name_alone_separates_a_bad_file_from_a_bad_row(
+    history: tuple[Path, str, str],
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The argument for withholding the reader's message, written as a test rather than a comment.
+
+    Two records fail, and a reader acts on them differently. One never became a record at all, so the
+    repair is to the file's syntax. The other parsed and carries a row the reader rejected, so the
+    repair is to that row, found by running the verifier where the record lives.
+
+    That split is the entire triage cost of suppressing the message, and the exception CLASS pays it
+    in full. Asserting each name is present is not enough on its own -- a guard that printed both, or
+    a constant string containing both, would satisfy it -- so each is also asserted ABSENT from the
+    other run.
+    """
+    repo, _early, _later = history
+    bad_file = tmp_path / "not_a_document.toml"
+    bad_file.write_text(f'[[cell]\nid = "{SENTINEL_ID}"\n', encoding="utf-8")
+    bad_row = tmp_path / "a_rejected_row.toml"
+    bad_row.write_text(
+        f'[[cell]]\nid = "{SENTINEL_ID}"\nlevel = 1\nverdict = "bogus"\n', encoding="utf-8"
+    )
+
+    file_code, file_out = _run(["--scorecard", str(bad_file), "--root", str(repo)], capsys)
+    row_code, row_out = _run(["--scorecard", str(bad_row), "--root", str(repo)], capsys)
+
+    assert file_code == REFUSED and row_code == REFUSED
+    assert "TOMLDecodeError" in file_out and "TOMLDecodeError" not in row_out
+    assert "ScorecardError" in row_out and "ScorecardError" not in file_out
+    _assert_no_assessment_content(file_out)
+    _assert_no_assessment_content(row_out)

@@ -18543,3 +18543,43 @@ Within `scripts/coord` and `scripts/hooks` specifically, four files are caught b
 **Do not create a third copy.** The vault should CONSUME `claude-multisession` rather than hold its own fork of the same scripts. Measured 2026-08-31, comparing this repo's coordination scripts against the ones already in `claude-multisession`: **0 identical, 16 differing, 28 absent.** Two independent copies with no defined direction of flow produced that in a few weeks; a third would be worse, and the drift is invisible because both sides keep working.
 
 **Related:** the porting and de-drifting work is filed in that repository's own tracker, issues 99 to 105, deliberately outside this number space.
+
+## 1412. anchor_provenance's load_scorecard call is unguarded, so a malformed record prints a cell id to stderr
+
+> 🔢 **Filed 2026-08-31 - BUILT IN THIS COMMIT, not yet landed.** The same class **PR 719** closed in `anchor_report.py`, in the sibling tool that reads the same record. Found by reading that fix, not by a sweep.
+> Verdict: build
+> Closing-act: code
+
+**Cluster:** ASVS tooling. **Priority:** P2. **Verdict:** build.
+**Severity:** no engine effect, no PHI axis, and **no deployment axis (sec. 0)** -- this is a repository tool and nothing here reaches shipped code. Written conditionally because it is conditional: **the first malformed record handed to this tool WOULD print a graded row's identifier**, and on one branch the whole grading vocabulary, to stderr. Nothing has been disclosed, and the reason is that nobody has yet run it against a record that will not load -- which is a fact about usage, not a control.
+
+**What:** `main()` called `cells = load_scorecard(args.scorecard)` with no exception handling. It was the only unguarded call in that function; the other five failure paths all refuse deliberately, write a reason, and return 2 or 3.
+
+**LIMB 1 -- DISCLOSURE.** `load_scorecard` raises `ScorecardError` in ten places and **nine of them open by naming the graded row they rejected**; one lists the entire grading vocabulary. Measured against a record whose only fault was an unknown grade, with an invented identifier so a hit cannot be a coincidence:
+
+```
+scorecard.ScorecardError: cell 'ZZ.SENTINEL.9': verdict 'bogus' not one of
+  ['fail', 'na', 'needs-review', 'partial', 'pass', 'unverified']
+```
+
+That is the row identifier and all six grading words, on stderr, as a traceback. Cell ids and grading content are what CLAUDE.md section 12 keeps vaulted, and `--detail` exists precisely so the identifier-plus-path pairing never reaches a stream a reader pastes.
+
+**LIMB 2 -- EXIT CODE.** `load_scorecard` subscripts the record directly in a dozen places, so a row missing `id` escaped as `KeyError` and a non-numeric `line` as `ValueError` **quoting the offending value**. A traceback exits **1**, which this tool defines nowhere: no `return` in it produces 1, and its contract is 0 for a measurement, 2 for an unusable invocation, 3 for a run that started and will not publish a number.
+
+**THE MODULE'S OWN DOCSTRING ASSERTED THE PROPERTY THIS BREAKS.** It reads *"OUTPUT IS SPLIT BY DISCLOSURE, NOT BY CONVENIENCE"* and calls the summary *"safe to paste anywhere"*. The split it then describes has two halves, summary and `--detail`, and a refusal is a third stream neither reaches. A reader auditing against a two-part enumeration ticks both halves and never looks for a third (SDS-3.6), and a property that holds only while every record loads is not a control (SDS-3.7). The docstring is amended in the same commit rather than left to be quoted.
+
+**THE FIX IS ONE `except Exception` AROUND ONE CALL, AND THE NARROWER CLAUSE IS THE TRAP.** PR 719's clause enumerated `(ScorecardError, OSError, ValueError)`, which reads as complete and had already missed `KeyError`. A longer list would only be a fresher incomplete one, over a record that lives in another repository. The wrapped statement's only job is turning the record into cells, so every failure of it is an instrument failure and there is no second input inside it whose triage would differ.
+
+**THE REFUSAL PRINTS THE EXCEPTION'S CLASS NAME AND NOTHING ELSE. A guard that catches and then logs has MOVED the disclosure, not closed it** -- and further than the message-versus-class rule alone suggests: `TOMLDecodeError.doc` and `UnicodeDecodeError.args[1]` each hold the **whole document**, so anything that walks an exception's attributes dumps the record even where `str(exc)` is clean.
+
+**Withholding the message costs the reader no triage, and that is asserted rather than argued.** The class is the whole difference between "the file never became a record" and "the record parsed and a row is malformed", so a test drives both and pins each class name present in its own run and **absent from the other**.
+
+**EXIT 3, NOT 2, AND THE TWO ARE NOT INTERCHANGEABLE.** This tool's 2 is argparse's own code, shared with three checks decidable from the arguments alone before any work runs. Here the `is_file` guard already passed, a git subprocess already ran, and what failed is the first act of the measurement. Folding "the record in the vault is malformed" into 2 would fuse a caller's mistake with a record defect under a code no poller can separate. The counter-argument is recorded rather than suppressed: you cannot fix a malformed record by re-typing the command, which is a property the other 3s do not share. **PR 719's `2` is not evidence either way** -- its contract is 0/1/2 with 1 meaning findings, so 2 is its only refusal code and it has no third.
+
+**Verification:** seven malformed records plus a class-discrimination arm, all eight **observed red against the unguarded code** before the fix -- the `ScorecardError` rows failing with the disclosure above in the traceback. Two mutants, killed by **different assertions**: a guard printing `{exc}` trips the disclosure scan (the catch-and-log trap, caught); a guard printing neither class nor message trips the triage assertion. 26 passed after, 18 before.
+
+**The banned-token list is ONE module constant every output-capturing arm reads, and the existing arms were retrofitted to read it.** PR 719's leak reached review because its equivalent list lived inside the one happy-path function that used it, so the refusal path was never scanned. Adding a constant and wiring only the new arm would have repeated that exactly, one file over. The fixtures now plant an invented identifier for the same reason: this tool prints line numbers, counts and percentages, so an absence assertion against a realistic id proves nothing.
+
+**Exit 3 is shared with two other refusals and `REFUSING` with three, so neither pins this guard.** The new arms assert on `would not load`, measured to occur nowhere else in the tree -- with `could not be read` as the positive control, at 8 hits, so a zero is a fact about the needle and not about a search that failed to run.
+
+**NOT CLAIMED AND NOT FIXED HERE:** two further uncaught paths in the same `main()` that would also exit 1 against the same contract -- `subprocess.run(["git", ...])` raises `FileNotFoundError` when git is off PATH, and `--detail`'s `write_text` raises `OSError` **after** the summary has already printed. Neither discloses record content, both are decisions to take explicitly rather than by omission, and neither has a number yet.

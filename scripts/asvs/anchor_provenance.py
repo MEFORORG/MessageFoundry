@@ -51,6 +51,14 @@ anywhere. Per-cell detail names cell identifiers and file paths, whose pairing i
 enumeration CLAUDE.md section 12 keeps vaulted, so it is written only where ``--detail`` points and
 never to stdout.
 
+***A REFUSAL IS THE THIRD STREAM, AND THE CLAIM ABOVE WAS FALSE UNTIL IT WAS COVERED TOO.*** The reader
+that turns the record into cells refuses by NAMING the graded row it rejected, so an unguarded call
+would publish that identifier -- and, on one branch, the whole grading vocabulary -- to stderr on the
+first malformed record. Neither half of the split above reaches it, which is the point: a reader
+auditing this tool against a two-part enumeration ticks both halves and never looks for a third
+(SDS-3.6). So every refusal here quotes an exception's CLASS and never its message, and a property
+that held only while every record loaded is now a property of the tool (SDS-3.7).
+
 THE HYPOTHESIS THIS EXISTS TO TEST CHEAPLY. The item offers one explanation for the whole population --
 that the numbers were read from a LATER tree than the commit the cell stamps -- and states it as a
 hypothesis rather than a finding. Its falsifiable form is "find a single later ref at which the recorded
@@ -283,7 +291,49 @@ def main(argv: list[str] | None = None) -> int:
         return 3
     head = rev.stdout.strip()
 
-    cells = load_scorecard(args.scorecard)
+    # THE READER'S OWN DIAGNOSTIC IS ASSESSMENT CONTENT, so this refusal quotes the exception's CLASS
+    # and nothing else. Nine of the ten refusals in ``load_scorecard`` open by naming the graded row
+    # they rejected and one lists the entire grading vocabulary, so an unguarded call would have
+    # printed a graded row's identifier on the first malformed record -- to stderr, which is where a
+    # run log and a pasted terminal both come from. That is the enumeration CLAUDE.md section 12 keeps
+    # vaulted, arriving by the one path ``--detail`` does not gate. Measured before the guard:
+    # ``cell 'ZZ.SENTINEL.9': verdict 'bogus' not one of [...]``, the row and all six grading words.
+    #
+    # ``except Exception`` IS BROAD ON PURPOSE and the narrower clause is the trap, not the safer
+    # option. ``load_scorecard`` subscripts the record directly in a dozen places, so a row missing
+    # ``id`` raises KeyError, a non-numeric ``line`` raises ValueError QUOTING THE VALUE, and a
+    # document that is not TOML raises from tomllib -- none of which an enumeration written from the
+    # ScorecardError raises would have named. A longer list would only be a fresher incomplete one
+    # (SDS-3.6), over a record that lives in another repository and is not this module's to enumerate.
+    # This wraps ONE call whose only job is turning the record into cells, and there is no second
+    # input inside it whose triage would differ.
+    #
+    # THE CLASS IS ENOUGH, AND WITHHOLDING THE MESSAGE THEREFORE COSTS THE READER NO TRIAGE. It is
+    # the whole difference between "the file never became a record" (fix the syntax, the permissions,
+    # the path) and "the record parsed and a row is malformed" (fix the row) -- and it carries nothing
+    # FROM the record, which the message does. The detail stays where the record lives, readable by
+    # the verifier run there. Print the exception any other way -- interpolated, logged, or handed to
+    # anything that walks its attributes -- and the disclosure has MOVED rather than closed:
+    # ``TOMLDecodeError.doc`` and ``UnicodeDecodeError.args[1]`` each hold the WHOLE document.
+    #
+    # 3 RATHER THAN 2, and the two are not interchangeable here. This tool's 2 means the invocation
+    # is unusable and is decidable from the arguments alone -- it is argparse's own code, shared with
+    # three checks that run before any work. The ``is_file`` guard above already passed, a git
+    # subprocess has already run, and what failed is the first act of the measurement: the tool
+    # started and will not publish a number, which is exactly what 3 says at its other three sites.
+    # The counter-argument is real and is recorded rather than suppressed: you cannot fix a malformed
+    # record by re-typing the command, which is a property the other 3s do not share.
+    try:
+        cells = load_scorecard(args.scorecard)
+    except Exception as exc:
+        sys.stderr.write(
+            f"REFUSING: the scorecard at {args.scorecard} would not load "
+            f"({type(exc).__name__}). The reader's own message is WITHHELD: it names the graded row "
+            "it rejected and can list the grading vocabulary in full, and this stream reaches a "
+            "public log. Read the detail where the record lives, with the verifier there.\n"
+        )
+        return 3
+
     verdicts = audit(cells, args.root, args.at)
     if not verdicts:
         sys.stderr.write("REFUSING to report a clean run over zero anchors\n")
