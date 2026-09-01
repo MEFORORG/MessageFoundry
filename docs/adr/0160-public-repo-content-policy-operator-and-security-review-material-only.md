@@ -1,6 +1,6 @@
 # ADR 0160 — Public-repo content policy: operator and security-review material only
 
-- **Status:** **Accepted (2026-08-06). Phase 1 EXECUTED; Phase 2 DECLINED; Phase 3 still Proposed.**
+- **Status:** **Accepted (2026-08-06). Phase 1 EXECUTED; Phase 2 ACCEPTED 2026-08-31 WITH PRECONDITIONS, reversing the 2026-08-06 decline; Phase 3 still Proposed; Phase 4 EXECUTED 2026-08-31, merged 2026-09-01.**
   The owner ratified the D1 test and Phase 1 on 2026-08-05, chose the vault as the destination
   (resolving open question 3), and set a governing rule for the work: **do not break anything**,
   applied per item as *prove the mechanism or leave the item alone*. On 2026-08-06 the owner
@@ -8,6 +8,15 @@
   cost measurement in D5. That is a decision, not a deferral: nothing is pending that would reopen
   it. Phase 3 (stripping process prose from documents that stay) is untouched by this and remains
   proposed.
+  
+  **REVERSED 2026-08-31 (owner).** Asked to choose between this ADR and a restated content policy,
+  the owner ruled: *"use today's decision, but add what's needed to the vault to address whatever was
+  behind 0160."* So Phase 2 proceeds and the process tooling moves. **D5 is overridden, not
+  discarded** — its three measurements were correct and become PRECONDITIONS, listed in D5 below.
+  Each must be satisfied before anything is removed from this repository. The 2026-08-06 decline is
+  left in place rather than deleted, because it was live for three weeks and a reader who remembers
+  it needs to see it named as reversed rather than silently absent.
+
   <!-- Proposed (no code yet) → Accepted (build may start) → Superseded by NNNN / Rejected -->
 - **Date:** 2026-08-04
 - **Supersedes nothing.** Records a policy that has been in force, and enforced, while being written
@@ -151,21 +160,137 @@ a `releases/` link re-introduced into `docs/FEATURE-MAP.md` **passed** in the wo
 
 The gate is not broken and needs no change; its scope is now narrower than it looks. **Do not read a
 local green on this test as evidence.** Verify a link-affecting change against a tracked-files-only
-export, which is a two-command check:
-`git archive $(git write-tree) | tar -x -C <tmp>` then run the test there. The same caveat applies to
-any future guard that tests *existence* rather than *trackedness* — after this decision, presence on
-disk and presence in the repository are different facts.
+checkout — **`git clone --no-hardlinks . <tmp>`, and NOT the `git archive $(git write-tree)` export
+this paragraph originally prescribed.** An archive carries no `.git`, which is fine for a guard that
+tests the filesystem (this one) and wrong for any guard that shells out to `git`; P4 below records
+what that cost a later reviewer. Use the clone for both and the distinction stops mattering. The same
+caveat applies to any future guard that tests *existence* rather than *trackedness* — after this
+decision, presence on disk and presence in the repository are different facts.
 
-⛔ **Phase 2 — DECLINED 2026-08-06 (owner). The process tooling and its documentation stay tracked.**
+**Phase 2 — REVERSED. DECLINED 2026-08-06, then ACCEPTED 2026-08-31 (owner), subject to the preconditions in D5. The process tooling and its documentation MOVE.**
 The proposed set was `docs/WORKTREES.md`, `docs/SESSION-DRIFT-CONTROLS.md`, `docs/LEDGER-GATE.md`
 and `docs/STEERING.md`, plus — added during Phase 1 planning — the tooling those documents describe.
-**None of it moves.** The reasoning is in D5, and it is a cost decision resting on a measurement, not
+**It moves, once D5's preconditions are met.** The paragraph below is the 2026-08-06 reasoning, kept as the record of why this was declined for three weeks. The reasoning is in D5, and it is a cost decision resting on a measurement, not
 a deferral waiting on someone. Keeping the documents with the tooling they describe is the coherent
 half: relocating the rationale for a control that stays is the defect the Consequences section below
 already names.
 
 **Phase 3 — in-file references.** Strip Claude-Code process prose from documents that otherwise stay
 (`docs/AI.md`, `docs/ARCHITECTURE.md`, `docs/Code_Quality_Standards.md`). Surgical edits, not removals.
+
+**Phase 4 — business material and internal engineering records (46 files). EXECUTED 2026-08-31,
+merged 2026-09-01 as PR 714; `main` at `921db74a1`.** Verified by CONTENT rather than by the pull
+request reporting merged: on `main` afterwards, `docs/research` holds 0 files, `docs/testing` holds
+exactly 1 (`VERIFY.md`), `docs/design` holds 4, and `docs/BRAND.md` is absent. Two sets Phase 1 did not reach, on an owner ruling the same day. Six business and legal
+working documents (brand, positioning, the dual-licensing plan, the counsel engagement brief, the
+contributor program and its first-issues list), 25 files of `docs/testing` maintainer QA planning,
+nine `docs/research` exploratory notes, and six superseded `docs/archive/throughput` plans. All fail
+D1 both ways: the audience is a maintainer deciding project direction or planning QA, not an operator
+running the engine or a reviewer assessing it.
+
+**D1 CATEGORY 2 GOVERNS OVER A WIDER READING OF "SECURITY MATERIAL COMES OUT", and the question was
+put and answered rather than left implicit.** The owner was asked directly whether a restated policy
+sending all security material to the vault should override D1's second limb. It does not.
+`SECURITY.md`, `PHI.md`, `SUPPLY-CHAIN.md`, `SECURITY-LOOSENING.md`, the ASVS phase inventory and the
+`Secure_*` standards are what a reviewer reads to assess the engine, so they stay.
+`docs/SECURITY-DOCS-POLICY.md` continues to state that boundary publicly and was not touched.
+
+**Two carve-outs, both found by measurement AFTER the set was drafted**, which is the argument for
+measuring rather than reasoning from a directory name:
+
+* `docs/testing/VERIFY.md` STAYS. It documents `messagefoundry verify`, the wheel-only on-box
+  acceptance check a real deployment runs, and `docs/README.md` lists it as step 6 of the
+  new-operator path while warning in terms that it "is an operator tool, not a test plan". It passes
+  D1 category 1 outright. This is why its rule is `/docs/testing/*` and not `/docs/testing/`: git
+  does not descend into an excluded directory, so a directory rule makes the negation a silent no-op.
+* `docs/design/` STAYS, and was in an earlier draft of the set. `docs/design/freethread.md` is a
+  CLAIM FILE for the required-status-check drift guard, and `tests/test_required_contexts.py` treats
+  a missing claim file as an ERROR rather than a skip — deliberately, because silently dropping a
+  claim file is how a drift guard comes to guard nothing. Untracking it turns that guard's own
+  anti-narrowing assertion red.
+
+**THE INBOUND-LINK SURFACE WAS THE DEFECT, AND EXEMPTING IT WAS THE WRONG FIX.** The first draft
+untracked the 46 files and added their paths to `link_check.py`'s `WITHHELD` tuple, which turned **59
+reader-visible 404s green** instead of repairing them — the compensating-control-on-a-false-premise
+shape D2's Phase 1 record already warns about, committed by the session that had just quoted it.
+Phase 1's precedent is explicit and was not followed: *"Only the links were rewritten."* An
+independent review caught it and withheld its approval. The 49 links outside `docs/BACKLOG.md` were
+then repaired — repointed where a tracked successor genuinely covers the sentence, otherwise unlinked
+to the document's plain name so the citation survives as provenance. Measured both ways with
+`WITHHELD` forced back to its four long-standing prefixes: `origin/main` 0 failures, the first draft
+59, the repaired branch 10.
+
+The residual 10 are in `docs/BACKLOG.md` and could not be repaired in the same change: eight open
+pull requests held that file. Two narrowly scoped `WITHHELD` entries cover exactly those targets —
+ONE file and ONE subdirectory, not the parent trees — and their removal condition is *"no open PR
+touches `docs/BACKLOG.md`"* rather than a PR number, because a number goes stale silently. An earlier
+wording said "once PR 713 lands"; 713 merged while that sentence was being written and nothing
+noticed, which is the same defect one level down.
+
+**A LIMIT OF D1 THAT PHASE 4 FOUND BY WALKING INTO IT, AND IT IS THE MOST REUSABLE THING HERE.
+D1 CLASSIFIES A DOCUMENT BY ITS SUBJECT. IT NEVER ASKS WHETHER THE DOCUMENT CARRIES AN OBLIGATION
+BINDING IT TO ENGINE CODE.** A document that merely DESCRIBES code goes stale quietly, and a reader
+can tell. A document that says *edit me in the same change* cannot be honoured once it is one
+repository away: the commit that triggers the obligation cannot reach it, and nothing in either
+repository reports the breach.
+
+Found by a peer session, not by this pass, and it found it by TRIGGERING it.
+`docs/testing/master-test-plan/17-performance-and-scale.md` carried a pin added 2026-08-28: *"the
+empty-claim monotonicity assertion in `test_connscale_smoke.py` is under active review as a known-
+noisy leg. IT IS CORRECT TODAY. IF IT IS DISARMED, SKIPPED OR DELETED, THIS ROW MUST BE EDITED IN THE
+SAME CHANGE."* That session's branch is the change that disarms the assertion. It had discharged the
+pin correctly; Phase 4 merged mid-build and took the row out of reach. **The pin's own predicted
+failure then occurred by a route it did not anticipate: the disarm ships, and the false claim
+survives -- in the vault, where the triggering change cannot edit it in the same commit, which is the
+one thing the pin demanded.**
+
+**Censused after the fact rather than left at one instance: 10 of the 46 files carry a same-change
+obligation**, measured at `72bfddfad` over the removed set. Besides the pin above, they include
+`19-execution-phasing-and-sign-off.md` (*"the chapter matrix must gain that row in the same commit"*),
+`00-strategy-and-governance.md`, `16-security-phi-and-supply-chain.md`, `09-engine-api.md`, and
+`docs/research/ad-step-up-after-simple-bind-retirement.md` (*"`_reauth_ad` may therefore not be
+deleted in the same change that removes `_login_ad`"*).
+
+**IF YOU TAKE ONE THING FROM THIS PARAGRAPH, TAKE THIS: GREP FOR `in the same
+(change|commit|PR|pull request)` BEFORE MOVING ANYTHING.** It costs nothing, and this pass did not
+run it and should have. Everything below is the reasoning; that line is the remedy.
+
+**THE NEEDLE IS WRITTEN WITH FOUR SPELLINGS BECAUSE AN EARLIER DRAFT HAD TWO AND SAID "it catches
+all ten".** Both halves of that were wrong, and a non-author review measured it over the 46 removed
+paths at `921db74a1^`:
+
+| needle | files |
+|---|--:|
+| `in the same (change\|commit)` — the earlier draft's | **9** |
+| adding `in the same (PR\|pull request)` | **2 more** — `12-vs-code-ide-extension.md`, `13-steps-editor.md` |
+| negative control, a nonexistent string | **0** |
+
+So the old needle caught 9 of at least 11, and the count in the prose was 10. **The two-spelling
+needle was generalised from the single pin phrased "in the same change" — a screen built from one
+case finds one shape, and it reported clean on the two documents that spell the same obligation
+"PR".** Write it as **at least**: this is an enumeration over prose written by many hands, and a
+fifth spelling is likelier than not.
+
+**NOTHING IS PROPOSED HERE AND NOTHING IS FIXED.** The at-least-eleven obligations are now unsatisfiable as
+written, and the three candidate answers are genuinely different with different owners: keep an
+obligation-carrying document tracked regardless of subject; rewrite the obligation as a CI check
+BEFORE moving it; or accept the breach and say so somewhere it can be read.
+
+Worth noting without deciding it: **only the middle one survives the document being in EITHER
+repository.** Keeping the document tracked works only while it stays; accepting the breach depends on
+a reader finding the note. A check that fails when the assertion and the row disagree holds wherever
+the row lives, because it is anchored to the code rather than to the prose. That is an observation
+about the remedy space, not a decision, and the decision is not a session's to make.
+
+What is recorded is that **D1's subject test is insufficient on its own.**
+
+**Custody first, as Phase 1 requires.** The 46 files were committed to the vault and pushed BEFORE
+leaving the tracked tree, at `wshallwshall/MessageFoundry` branch `lander/adr0160-custody`, verified
+byte-identical. That ordering mattered more than Phase 1 knew: measured across both repositories,
+**1702 paths are shared and 760 of them DIVERGE**. The vault is a stale fork, not a mirror — the
+publish pipeline that synced them was retired at the 2026-07-27 cutover. 15 of these 46 already
+existed there and 7 were divergent, so a bare untrack would have left the vault holding the older
+text and nothing holding the newer.
 
 ### D6 — considered and LEFT, so the next sweep does not re-derive them
 
@@ -193,7 +318,71 @@ so it is refuted where it will next be proposed: the two locations that matter a
 and an unanchored pattern would fail closed on `docs/benchmarks/`, where handoffs are tracked on
 purpose.
 
-### D5 — the process TOOLING stays tracked: DECLINED on measured cost, not blocked on someone
+### D5 — the process TOOLING moves, and these are the PRECONDITIONS
+
+**Superseded 2026-08-31.** The measurements below stood and still stand; the decision they supported
+did not. They are now the conditions the move must satisfy, and each has a failing reading that looks
+like success, which is why they are conditions rather than advice.
+
+**P1. The vault's CI must actually run the moved tests before anything is removed here.** Every vault
+workflow except the ASVS scorecard is `disabled_manually` today. A repository holding a `ci.yml` that
+never runs is indistinguishable, at a glance, from one whose tests pass.
+
+**P2. That CI must run on WINDOWS.** A Linux-only leg reports GREEN across half the suite, because 13
+of 26 files skip on `os.name != "nt"`. A green Linux leg would read as proof and would not be one.
+
+**P3. Copy, prove green, THEN remove.** Never `git rm --cached` first: it removes the file from every
+working tree including the machine running it, and no restore step exists.
+
+**P4. Verify on a CLONE that carries only tracked files, never on the working tree.** Added
+2026-08-31 from Phase 4's execution, where it caught a real break that every local run reported
+green. Untracking leaves the files **on disk** under a gitignore rule, so any guard that tests
+whether a path EXISTS passes locally and fails on the runner. Phase 1 recorded this for one test;
+Phase 4 found it is the general case, and it is worse for Phase 2 than for either, because
+`scripts/` holds more existence-testing guards than `docs/` does.
+
+Three parts, and the second is the one that bites:
+
+* **Use `git clone --no-hardlinks`, NOT `git archive`.** An archive export has no `.git`, so a guard
+  that shells out to `git` is running outside a repository. **It fails BOTH ways, and an earlier
+  draft of this bullet stated only one of them and stated it as universal.** Measured: `git ls-files`
+  in an exported tree exits **128** with `fatal: not a git repository` and empty stdout, against a
+  positive control of 452 paths in a real checkout. So a guard that CHECKS the exit code goes red --
+  a reviewer hit exactly that and produced 25 red tests that were all instrument artifact -- while a
+  guard that IGNORES it parses zero lines and **passes vacuously**, asserting over an empty list.
+  Which one you get depends on the guard, not on the export.
+
+  **The silent green is the one that ships**, which is why the conclusion stands either way; but a
+  precondition that names only the green half sends a reader looking for the wrong symptom, and the
+  earlier draft contradicted itself inside two sentences by then citing 25 RED tests as the evidence
+  for it.
+* **Grep the SEGMENT-JOINED path form as well as the slash form.** Phase 4's first sweep for inbound
+  references missed a test that builds its path as `_REPO / "docs" / "testing" / "FILE.md"`. The
+  string `docs/testing/` never appears in that source, so a slash-form grep cannot see it, and the
+  test failed on CI after the branch was declared clean. Search for `"docs", "testing"` and
+  `"docs" / "testing"` and the bare basenames too.
+* **Prefer an announced skip to a deleted assertion** when a guard reads a document that has left.
+  `tests/test_threat_model_doc_drift.py` is the idiom: warn loudly, skip that one test, keep the
+  code-only assertions in the same module running, and offer an environment variable that makes the
+  absence a hard failure. Phase 4 reused it verbatim for the CRIT-2 coverage-plan drift check.
+
+  **BUT THE ANNOUNCEMENT FIRES WHERE NOBODY IS WATCHING, AND THAT IS THE HALF PHASE 4 DID NOT SEE.**
+  The removed files stay ON DISK under the gitignore rule in any tree that held them before the
+  removal landed. There the document still exists, the accessor finds it, and the assertion runs
+  ENFORCED AND GREEN with no warning at all. The skip -- and therefore the warning -- is reachable
+  only where the file is genuinely absent, which is CI and a fresh clone. **A maintainer running
+  pytest locally will never see the warning; only the runner will.** So the loud announcement is
+  loud in the one place no human is reading, and silent in the place they are.
+  Raised by a peer session verifying Phase 4's deletions for silently-disabled guards; it found none,
+  and found this instead. It does not make the idiom wrong -- an inert test that says so is still
+  better than one that does not -- but "warn loudly" overstates what the reader actually gets, and a
+  future phase should not count on the warning reaching a person.
+
+**Unchanged by the reversal:** any path called by `.pre-commit-config.yaml` or by a workflow stays in
+this repository. That is about an outside contributor passing the gates on their own clone, which is
+independent of where the tooling lives.
+
+### D5 (2026-08-06, superseded) — the original decline, on measured cost
 
 The obvious next step after Phase 1 is `scripts/coord/` (9), `scripts/worktree/` (11) and
 `scripts/hooks/` (8, excluding `ledger_check.py`), with the four Phase 2 docs that describe them.

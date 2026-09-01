@@ -2,8 +2,9 @@
 # Copyright (C) 2026 MessageFoundry Organization and contributors
 """Every required merge context must have a negative control (BACKLOG #1000).
 
-THE DEFECT THIS EXISTS FOR. Thirteen contexts are the entire merge gate and, before this, not one of
-them was proven able to go red. The class has fired at least four times here with no CI signal, each
+THE DEFECT THIS EXISTS FOR. The required contexts ARE the entire merge gate -- thirteen when this
+was written, fourteen since 2026-08-31 (BACKLOG #1404) -- and, before this, not one of them was
+proven able to go red. The class has fired at least four times here with no CI signal, each
 found by hand: a required backlog gate computing a two-dot diff and crediting every PR with an older
 base; a required SAST gate scanning a two-directory allow-list; a leak gate exiting 0 on content
 carrying a real site code; the same gate matching one of four spellings of a Windows path. Each was

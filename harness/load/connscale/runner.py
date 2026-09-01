@@ -53,6 +53,7 @@ from harness.load.connscale.report import (
     ConnScaleReport,
     NoLoss,
     SloCheck,
+    herd_floor_readings,
     monotonic_pairs,
 )
 from harness.load.corpus import Corpus, build_corpus
@@ -600,6 +601,21 @@ def _node_env(
     # which threads __main__ -> api/app -> engine -> RegistryRunner.start() (pooled builds
     # StageDispatchers). "per_lane" is the engine default, so a per_lane arm is behaviorally unchanged.
     env["MEFOR_PIPELINE_CLAIM_MODE"] = claim_mode
+    # ADR 0061 seam, PINNED rather than inherited (BACKLOG #1211). settings.py parses
+    # MEFOR_PIPELINE_PER_LANE_WAKE into PipelineSettings.per_lane_wake, whose default is already False,
+    # so injecting "false" is behaviorally identical to what this rig ran before -- same as the two B0
+    # flags below.
+    #
+    # IT IS PINNED BECAUSE A RECORDED NUMBER'S MEANING MUST NOT DEPEND ON AN UNPINNED ENV VAR. The
+    # predicted herd floor (report.predict_herd_levels) is now RECORDED on every run so BACKLOG #1415
+    # can arm a gate from its distribution, and that whole plan needs every recorded floor to be about
+    # the same engine. This flag moves BOTH terms of the prediction at once: with it on, a commit wakes
+    # only its own lane, so the `wake` term collapses toward zero, AND the idle backstop steps from
+    # poll_interval (0.25s) to _PER_LANE_IDLE_BACKSTOP_SECONDS (30.0s, pipeline/wiring_runner.py), so
+    # the `idle` term falls by two orders of magnitude. An unrelated flip of the engine default would
+    # therefore rewrite every floor recorded after it, with no connscale change and nothing anywhere
+    # reporting a problem -- exactly the silent-subject-swap the harvest exists to avoid.
+    env["MEFOR_PIPELINE_PER_LANE_WAKE"] = "false"
     # ADR 0071 B5 A/B seam: settings.py parses MEFOR_PIPELINE_FUSE_THREAD_HOPS into
     # PipelineSettings.fuse_thread_hops. Fusion only ACTIVATES on SQL Server + claim_mode=pooled + this
     # flag on (it fails OPEN to the async path elsewhere), so injecting "false" (the engine default) on
@@ -1164,20 +1180,35 @@ def _empty_claims_per_msg(total_per_s: float, achieved_read_per_s: float) -> flo
     #355         34.9                          48.2 * 0.75 = 36.15    1.25
     ===========  ============================  =====================  ==========
 
-    **The margin is widening across independent runs** (0.30 then 1.25) against a ``prior`` that
-    barely moved, which is a different signal from a single excursion.
-
     WHY THE ALGEBRA DOES NOT DELIVER WHAT IT LOOKS LIKE IT DELIVERS: ``span`` cancelling makes the
     ratio free of WALL CLOCK, not free of CONTENTION. The two counters do not respond to load
     identically — empty claims are produced by POLLING, which continues on its own cadence, while
     reads are produced by WORK ARRIVING. Under contention those two decouple, so their ratio moves
     even though neither is divided by time. Cancelling ``span`` was necessary and is not sufficient.
 
-    **The SLO band is NOT widened here, deliberately.** ``_MONOTONIC_TOLERANCE`` is 0.25 and the row's
-    own re-score says the true distribution needs several deliberate samples at one N on a hosted
-    runner before anything is widened. Picking a wider number from these three points would be
-    choosing a constant to fit the failures I happen to have, which is how the 0.25 came to be
-    trusted in the first place. That half needs a seat that can iterate against the runner.
+    **THOSE ROWS ARE NOW THE TAIL OF A SAMPLED DISTRIBUTION.** The readings are real and the
+    correction above still holds. What has changed is that the population they came from has since
+    been sampled, and it is recorded ONCE, in BACKLOG #1211 -- the numbers live there, along with what
+    the sample does not cover, and are deliberately not restated at this line. Read against that
+    sample, these rows sit in a wide left tail that healthy hosted-runner legs occupy routinely, with
+    no connscale change anywhere near them.
+
+    An earlier reading of those same excursions is SUPERSEDED by that harvest: this docstring used to
+    argue that the margin was WIDENING across independent runs (0.30 then 1.25) against a ``prior``
+    that barely moved, and so was a trend rather than noise. A handful of points cannot separate a
+    trend from a wide spread. The harvest measured the spread.
+
+    **THE HOLD ON THE BAND IS DISCHARGED (BACKLOG #1211).** This docstring used to say the band must
+    not be touched until several deliberate samples at one N on a hosted runner existed, because
+    picking a wider number from the failures on hand is how the 0.25 came to be trusted in the first
+    place. THE SAMPLES NOW EXIST, and they retired the band rather than widening it: the vs-N SLO on
+    this metric is gone, ``_empty_claims_base_reading_slo`` replaced it with a strictly-positive
+    base-count sign test, and nothing in CI now grades this ratio against a threshold. The ratio is
+    still computed and RECORDED on every run, so BACKLOG #1415 can arm the predicted herd floor from a
+    distribution instead of from excursions.
+
+    Do not re-open the hold from the rows above. A sample selected on having excursioned cannot
+    measure the distribution it excursioned from -- which is exactly why the harvest was run.
 
     Returns ``None`` when no messages were absorbed in the window. The ratio is genuinely undefined
     there and returning 0.0 would be a fabricated reading that then chains through the monotonicity
@@ -1402,21 +1433,96 @@ def _evaluate_slos(profile: ConnScaleProfile, records: list[ConnScaleRecord]) ->
         )
     if slo.fd_monotonic:
         out.append(_monotonic_slo("fd_count_monotonic", records, lambda r: r.fd_count_peak))
-    if slo.empty_claims_monotonic:
-        out.append(
-            # PER MESSAGE, not per second (BACKLOG #1101). The per-second form put wall clock in the
-            # denominator, so CPU contention alone flipped this red with no engine change — measured
-            # 0.451 to 2.49 across four replicates of one commit on one box.
-            _monotonic_slo("empty_claims_monotonic", records, lambda r: r.empty_claims_per_msg)
-        )
+    if slo.empty_claims_base_reading:
+        out.append(_empty_claims_base_reading_slo(profile, records))
     return out
 
 
+def _empty_claims_base_reading_slo(
+    profile: ConnScaleProfile, records: list[ConnScaleRecord]
+) -> SloCheck:
+    """Wall #3, asserted only as far as a hosted runner can actually measure it (BACKLOG #1211).
+
+    THIS REPLACED A vs-N MONOTONICITY GATE THAT WAS MEASURABLY BROKEN IN FIVE WAYS. The evidence is
+    recorded ONCE, in BACKLOG #1211 -- the counts live there and are deliberately not restated at this
+    line, and so does what the harvest does NOT cover: it read a bounded scan window, and a run that
+    was cancelled or killed uploaded no artifact and contributed no legs at all. So a low observed
+    false-positive rate there is weak evidence about flake and is NOT evidence this check cannot fire.
+    What matters at this line is what is now asserted and what is not.
+
+    ASSERTED: every ``per_lane`` lane that produced a base-count reading produced a STRICTLY POSITIVE
+    one. That is narrow on purpose. It is the one thing about this metric a 4-vCPU hosted runner
+    measures without ambiguity, it fires on a dead counter -- the case the retired gate PASSED, since
+    ``not (0.0 < 0.0)`` is true -- and it cannot flake on level noise, because it is a sign test rather
+    than a threshold.
+
+    NOT ASSERTED: the predicted herd floor. ``herd_floor_readings`` computes it and both emitters
+    RECORD it on every run, pass or fail, but no verdict here rides on it. Its own pre-landing check
+    failed: on run 33448760672, a push to ``main`` whose ``test (windows-2022, py3.14)`` job PASSED,
+    the base reading was 13.12 against a floor of 15.30. Gating on it would have reddened a green leg,
+    which is the defect this item exists to remove. Enabling it once its own distribution is harvested
+    is BACKLOG #1415.
+
+    NOT ASSERTED EITHER: the vs-N slope, in any form. Nothing in CI now claims the curve rises. That
+    is a real loss and BACKLOG #1211 names it as one.
+
+    ZERO GRADED LANES REPORTS ``ok=True`` and says so in words, following the ``intake_audit`` shape a
+    few lines above. The run-level bound -- that SOME lane was graded -- belongs in the smoke test,
+    where the metric genuinely runs; that is exactly where wall #4 already puts its equivalent.
+    """
+    readings = herd_floor_readings(
+        records, lambda r: r.empty_claims_per_msg, base_count=min(profile.counts)
+    )
+    graded = [r for r in readings if r.ok is not None]
+    dead = [r for r in graded if r.value is not None and r.value <= 0.0]
+    expectation = "a positive empty-claims-per-message reading at the base connection count"
+    if dead:
+        observed = "; ".join(
+            f"{r.label}@N={r.count}: {r.value} -- the empty-claim counter did not move"
+            for r in dead
+        )
+        return SloCheck("empty_claims_base_reading", expectation, observed, False)
+    if not graded:
+        reasons = "; ".join(f"{r.label}: {r.not_graded}" for r in readings) or "no lanes"
+        return SloCheck(
+            "empty_claims_base_reading",
+            expectation,
+            f"NOT GRADED -- 0 of {len(readings)} lane(s) produced a base reading at "
+            f"N={min(profile.counts)} ({reasons}), so this says nothing about wall #3",
+            True,
+        )
+    return SloCheck(
+        "empty_claims_base_reading",
+        expectation,
+        f"present ({len(graded)} of {len(readings)} lane(s) graded)",
+        True,
+    )
+
+
 #: Noise tolerance for the loose monotonicity smoke: a larger-N metric may dip up to this fraction below a
-#: smaller-N reading without failing. These are timing-derived counters (empty-claims/sec especially) and CI
-#: runners are noisy (mf-ci-test-flakes), so only a REAL regression (a drop past the band) should fail — a
-#: strict `>=` flaked on ~10% jitter (empty_claims 398.7 < 442.9 on windows-2022). 0.25 absorbs runner jitter
-#: while still catching a genuine collapse (a halving).
+#: smaller-N reading without failing. These are timing-derived counters and CI runners are noisy
+#: (mf-ci-test-flakes), so only a drop past the band should fail.
+#:
+#: THIS COMMENT USED TO CLAIM 0.25 "catches a genuine collapse (a halving)". THAT IS FALSIFIED (BACKLOG
+#: #1211). A reading at half its prior does trip the band, but so do healthy runs: the measured
+#: empty-claims population on at least one CI leg reaches well below half the prior with nothing wrong.
+#: The band therefore does not SEPARATE a collapse from health, which is what "catches" implied. The
+#: distribution behind that is recorded once, in BACKLOG #1211, and is not restated here.
+#:
+#: WHO STILL GRADES AGAINST THIS VALUE: `fd_count_monotonic`, and nothing else. `empty_claims_monotonic`
+#: was retired by #1211, so every number in this comment's own history -- the strict `>=` that flaked on
+#: ~10% jitter (empty_claims 398.7 < 442.9 on windows-2022) included -- is evidence about a metric this
+#: constant no longer gates. **DO NOT RETUNE 0.25 ON EMPTY-CLAIMS EVIDENCE.** It would be tuning the FD
+#: gate against a distribution the FD gate never reads.
+#:
+#: AND THE FD RATIO DISTRIBUTION HAS NEVER BEEN HARVESTED. So 0.25 is inherited, not validated, for its
+#: one remaining consumer. Harvest FD ratios before moving it; the same fitted-to-the-failures-on-hand
+#: mistake is available here and would look exactly as reasonable as it did the first time.
+#:
+#: The empty-claims emitters still PASS this value as their recorded band width (`render_readings_markdown`
+#: / `readings_payload`), but nothing grades against it there -- the rows are recorded, and the width is
+#: held fixed so they stay comparable with the payloads already harvested for #1211. Changing it would
+#: break that comparability silently, on top of retuning the FD gate.
 _MONOTONIC_TOLERANCE = 0.25
 
 
@@ -1427,7 +1533,21 @@ def _monotonic_slo(  # type: ignore[no-untyped-def]
     smaller N **minus a noise ``tolerance``** (default 25%) — the wall exists and scales, but these are
     timing-derived counters on noisy CI runners (mf-ci-test-flakes), so a small dip is jitter, not a
     regression. Fails only on a real drop (``v < prior * (1 - tolerance)``). Missing readings (None) are
-    skipped, not failed."""
+    skipped, not failed.
+
+    **SCOPE: FD COUNT, AND NOTHING ELSE (BACKLOG #1211).** ``fd_count_monotonic`` over
+    ``fd_count_peak`` is the only caller. ``empty_claims_monotonic`` was the other one and was retired:
+    a harvest recorded in #1211 sampled the healthy empty-claims spread and found it wide enough that
+    this shape could not tell a collapse from a normal hosted-runner leg, and it passed a curve
+    flattened to half its healthy value. That harvest is a sample, not a census -- read its own
+    coverage limits beside it in #1211, not the counts alone. Do not point this function back at ``empty_claims_per_msg``, and do not read a
+    green here as evidence about wall #3 -- that is ``_empty_claims_base_reading_slo``'s subject now.
+
+    THE "SKIPPED, NOT FAILED" RULE ABOVE IS A HOLE THIS FUNCTION CANNOT CLOSE ALONE. Skip every
+    reading in a group and it returns ok=True observed='monotonic' having compared no pairs at all.
+    The run-level bound that some group actually had a pair to compare lives in
+    ``tests/test_connscale_smoke.py`` (WALL #4 NEVER COMPARED), because only a real run knows whether
+    the metric was measurable. Any new caller needs its own such bound or it inherits the hole."""
     # The pairing itself — including the group-by-(sweep_mode, claim_mode) rule BACKLOG #1101 records
     # as load-bearing — lives in `monotonic_pairs`. The emitter that records EVERY reading reads the
     # same function, so a passing run and a failing run cannot describe the sequence differently.

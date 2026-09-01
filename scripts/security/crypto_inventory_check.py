@@ -417,6 +417,12 @@ INVENTORY: dict[str, frozenset[str]] = {
     # an identifier in a log line. It covers the record itself rather than a build input, which is
     # the only way it differs from the entry above.
     "scripts/asvs/prove_report.py": frozenset({"hashlib"}),
+    # BACKLOG #1405, the SAME class again: SHA-256 over the SCORECARD FILE, truncated into the anchor
+    # report's header so a run states WHICH revision of the record it read. A digest rather than a
+    # commit ref because the record lives in a DIFFERENT repository, so a ref printed here names a
+    # commit the reader cannot resolve from this one. No secret, no key, no message authentication,
+    # nothing user- or PHI-derived: it is an identifier in a log line.
+    "scripts/asvs/anchor_report.py": frozenset({"hashlib"}),
     "scripts/security/dast_target.py": frozenset({"secrets"}),
     # BACKLOG #1220: SHA-256 over the DISCOVERED engine/console seam surface, truncated to 16 hex
     # characters, to give ENGINE_UI_SEAM an identity nobody chooses by hand. A CHANGE DETECTOR, not a

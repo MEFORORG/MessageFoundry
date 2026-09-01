@@ -249,3 +249,87 @@ def test_detail_is_written_only_when_asked(tmp_path: Path, history) -> None:
     assert main(["--scorecard", str(card), "--root", str(repo), "--detail", str(detail)]) == 0
     rows = json.loads(detail.read_text(encoding="utf-8"))
     assert rows and rows[0]["verdict"] == BORN_WRONG
+
+
+def test_a_root_whose_HEAD_cannot_be_resolved_is_refused_not_stamped_HEAD(
+    tmp_path: Path, capsys
+) -> None:
+    """The comment above this tool's own header says NO NUMBER HERE IS A FACT WITHOUT THE PAIR IT
+    WAS MEASURED AGAINST -- and the pair is exactly what degrades silently.
+
+    ``git rev-parse HEAD`` on a commitless repo exits 128 and echoes the literal ``HEAD`` on stdout,
+    so the header stamps ``engine=HEAD``. Measured on that arm: rc=0, every anchor unreadable, and a
+    closing line reading ``NOT verifiable at the cell's own recorded commit: 0``. A reassuring zero
+    over a run where nothing was verifiable at all.
+    """
+    repo = tmp_path / "commitless"
+    git("init", "-b", "main", str(repo), cwd=tmp_path)
+    card = tmp_path / "card.toml"
+    card.write_text(
+        '[[cell]]\nid = "X.1.1"\nlevel = 1\nverdict = "pass"\nverified_at = "deadbeef"\n'
+        '[[cell.evidence]]\npath = "mod.py"\nline = 2\nexpect = "NEEDLE"\n',
+        encoding="utf-8",
+    )
+    assert main(["--scorecard", str(card), "--root", str(repo)]) == 3
+    captured = capsys.readouterr()
+    # NOT a bare ``"HEAD" in err``. That assertion passed with this guard REMOVED, because pytest
+    # names ``tmp_path`` after the test and this test's name contains HEAD -- so the directory path
+    # echoed in a DIFFERENT refusal satisfied it. Caught by mutation, not by re-reading. The phrase
+    # below is emitted by the rev-parse guard and by nothing else in either tool.
+    assert "cannot resolve HEAD" in captured.err
+    assert "engine=HEAD" not in captured.out
+
+
+def test_a_run_where_NOTHING_could_be_read_is_refused_not_closed_with_a_zero(
+    history: tuple[Path, str, str], tmp_path: Path, capsys
+) -> None:
+    """The reassuring zero this tool's own test docstring names as the harm, still shipping.
+
+    NEVER_VERIFIED is frozenset({BORN_WRONG, ABSENT, PATH_GONE}). UNREADABLE and NO_COMMIT are not in
+    it -- correctly, because an unresolvable stamp is a different fact from a born-wrong anchor. But
+    the closing line sums only that set, so a run where every anchor was unreadable closes with
+    "anchors that were NOT verifiable at the cell's own recorded commit: 0" and exits 0, WITH A REAL
+    SHA IN THE HEADER. Round one's rev-parse guard closed only the commitless doorway to this.
+
+    Reachable by a shallow clone, a fresh clone of a rewritten history, or simply the wrong sibling
+    checkout -- and the header cannot separate the good run from the bad one, because the engine ref
+    is identical in both.
+    """
+    repo, _early, _later = history
+    card = tmp_path / "card.toml"
+    card.write_text(
+        '[[cell]]\nid = "X.1.1"\nlevel = 1\nverdict = "pass"\n'
+        'verified_at = "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef"\n'
+        '[[cell.evidence]]\npath = "mod.py"\nline = 2\nexpect = "NEEDLE"\n',
+        encoding="utf-8",
+    )
+    rc = main(["--scorecard", str(card), "--root", str(repo)])
+    assert rc == 3
+    captured = capsys.readouterr()
+    assert "REFUSING" in captured.err
+    assert "could not be read" in captured.err
+
+
+def test_the_closing_line_never_stands_alone_when_some_anchor_could_not_be_read(
+    history: tuple[Path, str, str], tmp_path: Path, capsys
+) -> None:
+    """A PARTIALLY unreadable run still answers, but the takeaway number may not be printed naked.
+
+    One anchor resolves and one does not. The "NOT verifiable" line is legitimate, and on its own it
+    invites the reader to carry a number that did not examine half the population. So the count of
+    anchors that could not be read is printed beside it, always, including when it is zero -- a stated
+    zero is checkable and an absent line is not.
+    """
+    repo, _early, later = history
+    card = tmp_path / "card.toml"
+    card.write_text(
+        f'[[cell]]\nid = "X.1.1"\nlevel = 1\nverdict = "pass"\nverified_at = "{later}"\n'
+        '[[cell.evidence]]\npath = "mod.py"\nline = 2\nexpect = "NEEDLE"\n'
+        '[[cell]]\nid = "X.1.2"\nlevel = 1\nverdict = "pass"\n'
+        'verified_at = "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef"\n'
+        '[[cell.evidence]]\npath = "mod.py"\nline = 2\nexpect = "NEEDLE"\n',
+        encoding="utf-8",
+    )
+    assert main(["--scorecard", str(card), "--root", str(repo)]) == 0
+    out = capsys.readouterr().out
+    assert "could not be read" in out

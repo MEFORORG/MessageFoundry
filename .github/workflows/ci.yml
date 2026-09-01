@@ -1033,8 +1033,9 @@ jobs:
     needs: changes
     strategy:
       fail-fast: false
-      matrix:
-        os: [ubuntu-latest, windows-2025]
+      # Both legs on a code PR, ubuntu only on a docs-only one. Computed in `changes` -- see the
+      # `tooling_matrix` output there for the measurement, and for why the path FILTER is untouched.
+      matrix: ${{ fromJSON(needs.changes.outputs.tooling_matrix) }}
     # The push arm is the safety net, not redundancy: the PR arm only fires when the harness itself
     # changed, so an ENGINE change that breaks a harness test is invisible on its own PR by
     # construction, and push-to-main is where it surfaces. See the `tooling` output on `changes`.
@@ -1262,6 +1263,21 @@ jobs:
       # 2x-billed VS Code electron leg runs free; ubuntu-only on a fork. Consumed as
       # `matrix: ${{ fromJSON(needs.changes.outputs.ide_matrix) }}` in `ide`.
       ide_matrix: ${{ steps.f.outputs.ide_matrix }}
+      # `tooling_matrix`: the `tooling` job's os matrix. Per-repo like the two above, AND narrowed to
+      # ubuntu on a docs-only PR -- it is a function of `code`, so it is emitted on every arm beside it
+      # rather than once with the others. The windows-2025 leg exists because it is the ONLY leg that
+      # executes the 337 platform-gated tests; a PR that changes no executable file cannot reach them,
+      # so paying 2x-billed minutes for that leg buys a re-run of a result nothing in the diff could
+      # have moved. Measured 2026-08-30 over the 252 PRs merged since the tier was split out on
+      # 2026-08-17: 98 of them, 39 percent, were docs-only and pulled the full tier anyway, at about
+      # 7.1 minutes of wall clock each -- 14.2 hours across 13 days.
+      #
+      # NARROWING THE MATRIX, NOT THE FILTER, AND THE DIFFERENCE IS THE WHOLE POINT. The `tooling`
+      # output above is untouched: `docs/` is a GENUINE trigger for this tier, because 22 of the 130
+      # files in tests/tooling_manifest.txt read documents and tests/test_ci_tooling_gate.py asserts
+      # `docs/security/THREAT-MODEL.md -> True` outright. Skip the tier on docs and those 22 files stop
+      # guarding anything. This keeps every one of them running, on one leg.
+      tooling_matrix: ${{ steps.f.outputs.tooling_matrix }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -1362,6 +1378,16 @@ jobs:
           else
             echo 'ide_matrix={"os":["ubuntu-latest"]}' >> "$GITHUB_OUTPUT"
           fi
+          # tooling matrix, computed here as two SHELL VARIABLES rather than emitted here as an output,
+          # because unlike the two matrices above it depends on `code`, which is not known until the PR
+          # arm at the bottom of this step. Every arm that writes `code` also writes this. A fork gets
+          # ubuntu only either way, for the same reason the other two matrices do.
+          if [ "${GITHUB_REPOSITORY:-}" = "MEFORORG/MessageFoundry" ]; then
+            TOOLING_FULL='{"os":["ubuntu-latest","windows-2025"]}'
+          else
+            TOOLING_FULL='{"os":["ubuntu-latest"]}'
+          fi
+          TOOLING_DOCS='{"os":["ubuntu-latest"]}'
           # Manual dispatch = full coverage: force every gate true so the whole workflow runs.
           if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
             echo "serverdb=true" >> "$GITHUB_OUTPUT"
@@ -1369,6 +1395,7 @@ jobs:
             echo "code=true" >> "$GITHUB_OUTPUT"
             echo "ide=true" >> "$GITHUB_OUTPUT"
             echo "tooling=true" >> "$GITHUB_OUTPUT"
+            echo "tooling_matrix=$TOOLING_FULL" >> "$GITHUB_OUTPUT"
             exit 0
           fi
           # Push-to-main: the FUNCTIONAL gate (code) stays true — the required test legs re-run on
@@ -1389,6 +1416,7 @@ jobs:
             # construction. Push-to-main is where that gets caught. Set this false and the tier is
             # effectively unguarded against everything except its own edits.
             echo "tooling=true" >> "$GITHUB_OUTPUT"
+            echo "tooling_matrix=$TOOLING_FULL" >> "$GITHUB_OUTPUT"
             exit 0
           fi
           if [ "$EVENT_NAME" = "schedule" ]; then
@@ -1399,6 +1427,9 @@ jobs:
             echo "code=false" >> "$GITHUB_OUTPUT"
             echo "ide=false" >> "$GITHUB_OUTPUT"
             echo "tooling=false" >> "$GITHUB_OUTPUT"
+            # Emitted even though the job is off on this arm: fromJSON on an unset output fails the
+            # whole job rather than falling back, so no arm may leave it blank.
+            echo "tooling_matrix=$TOOLING_DOCS" >> "$GITHUB_OUTPUT"
             exit 0
           fi
           # Remaining case: pull_request. Compute the path-based filters from the PR diff.
@@ -1567,20 +1598,30 @@ jobs:
           # `^docs/` outright would run the full suite on every prose edit, which is the cost this
           # short-circuit exists to avoid. Order matters: this is checked BEFORE `noncode`.
           alwayscode='\.(py|ps1|sh|ts|js|yml|yaml|toml|lock|cfg|ini)$'
+          # The chain now assigns `code` and emits ONCE below, rather than echoing in each arm. Five
+          # copies would be five chances for a future arm to be added without the matching
+          # `tooling_matrix` line, and that failure is silent at authoring time and fatal at run time:
+          # fromJSON on an unset output kills the job rather than falling back to a full matrix.
           if [ -z "$changed" ]; then
-            echo "code=true" >> "$GITHUB_OUTPUT"
+            code=true
           elif echo "$changed" | grep -qE "$alwayscode"; then
             # An executable/config file changed, wherever it lives -> run the full suite.
-            echo "code=true" >> "$GITHUB_OUTPUT"
+            code=true
           elif echo "$changed" | grep -qE "$alwayscodepath"; then
             # Extensionless config the extension rule cannot see -> run the full suite.
-            echo "code=true" >> "$GITHUB_OUTPUT"
+            code=true
           elif echo "$changed" | grep -qvE "$noncode"; then
             # At least one changed path is NOT docs-only -> run the full suite.
-            echo "code=true" >> "$GITHUB_OUTPUT"
+            code=true
           else
             # Every changed path is docs-only -> short-circuit the expensive steps.
-            echo "code=false" >> "$GITHUB_OUTPUT"
+            code=false
+          fi
+          echo "code=$code" >> "$GITHUB_OUTPUT"
+          if [ "$code" = "true" ]; then
+            echo "tooling_matrix=$TOOLING_FULL" >> "$GITHUB_OUTPUT"
+          else
+            echo "tooling_matrix=$TOOLING_DOCS" >> "$GITHUB_OUTPUT"
           fi
 
   # SQL Server service-container leg: runs the gated suites that need a real SQL Server (Linux, so 1x
@@ -2828,16 +2869,41 @@ jobs:
       - tooling
     runs-on: ubuntu-latest
     steps:
-      - name: Fail if any gated leg failed or was cancelled
-        if: >-
-          contains(needs.*.result, 'failure') ||
-          contains(needs.*.result, 'cancelled')
+      # TWO failing steps, not one, and the predicates PARTITION the old single condition -- their
+      # union is identical and their intersection is empty, so this gate's BEHAVIOUR is unchanged and
+      # only the message differs. Both arms still `exit 1`.
+      #
+      # WHY. Measured over 2026-07-01..08-30, enumerated over all 3,012 ci.yml runs that reached the
+      # job stage: 646 red `CI gate` runs, of which 206 were a real leg failure and 440 were a whole-run
+      # cancellation from `cancel-in-progress` superseding a push. Every one of those 440 sat on a SHA
+      # that a later push replaced -- 440 of 440 -- so not one of them ever blocked a merge, and every
+      # one printed the same sentence as the 206 that did. Two thirds of this gate's reds were telling
+      # the reader a lie about which kind of event they were looking at.
+      #
+      # `nightly-notice.yml` and scripts/quality/liveness.py (`_DID_NOT_RUN`) already state the
+      # principle: a cancelled job did not run, and reporting that in the words of a break trains the
+      # reader to discount the words.
+      - name: Fail -- a gated leg FAILED
+        if: contains(needs.*.result, 'failure')
         env:
           # Pass the needs context via env, not inline ${{ }} in the run block (defense-in-depth against
           # template injection — a job output could in theory carry a quote that breaks out of echo).
           NEEDS_JSON: ${{ toJSON(needs) }}
         run: |
-          echo "::error::A gated CI leg failed or was cancelled."
+          echo "::error::A gated CI leg FAILED. This is a real break -- see the needs dump below."
+          echo "$NEEDS_JSON"
+          exit 1
+
+      - name: Fail -- a gated leg was CANCELLED
+        if: >-
+          !contains(needs.*.result, 'failure') &&
+          contains(needs.*.result, 'cancelled')
+        env:
+          NEEDS_JSON: ${{ toJSON(needs) }}
+        run: |
+          echo "::error::A gated CI leg was CANCELLED, so it tested nothing and cannot read as a pass."
+          echo "::error::If this run was superseded by a newer push to the same ref, the NEWER run is"
+          echo "::error::what gates the merge and this red is expected. Check the newer run first."
           echo "$NEEDS_JSON"
           exit 1
 

@@ -1038,6 +1038,10 @@ _CRYPTO_SITES_OUTSIDE_THE_PACKAGE = {
     # ADR 0156: SHA-256 over the ASVS SCORECARD file, printed truncated so a --prove-absences run
     # states which revision of the record it read. No key.
     "scripts/asvs/prove_report.py": frozenset({"hashlib"}),
+    # BACKLOG #1405: SHA-256 over the ASVS SCORECARD file, printed truncated so an anchor report
+    # states which revision of the record it read. The record is in another repository, so a commit
+    # ref would name something the reader cannot resolve. No key.
+    "scripts/asvs/anchor_report.py": frozenset({"hashlib"}),
     "messagefoundry_webconsole/_security.py": frozenset({"secrets"}),
     # BACKLOG #1276 part A: the harness supplies its own TLS certificate for a spawned engine rather
     # than chasing the one the engine mints -- see crypto_inventory_check.py's INVENTORY entry for

@@ -1,0 +1,120 @@
+# Turn a red check into something a poller can find in ONE call.
+#
+# WHY THIS EXISTS (BACKLOG #1402 and #1403). When a required check fails, GitHub tells no session.
+# Measured 2026-08-31: exactly two workflows carried an `if: failure()` step, and both only failed
+# the job -- no label, no comment, no issue. So the only route from a red to somebody acting on it
+# was a seat fetching the check rollup of every open pull request, one at a time. That is expensive
+# enough that it does not get run often, which is the same as not having it.
+#
+# This does not make anything a PUSH, and must not be described as one. GitHub still cannot reach
+# into a session. What it does is collapse "fetch a rollup per pull request" into "list pull requests
+# carrying one label", which is the difference between a poll you can afford to run every few minutes
+# and one you cannot.
+#
+# WHY `workflow_run` AND NOT `if: failure()` INSIDE EACH WORKFLOW. A failure step inside a workflow
+# cannot see the runs of OTHER workflows, and the required contexts span five of them. `workflow_run`
+# observes any of them from one place, runs from the default branch with its own permissions, and --
+# unlike `pull_request_target` -- never executes code from the head. `nightly-notice.yml` already uses
+# this trigger, so the pattern is not new here.
+#
+# THE MERGE-QUEUE CASE IS WHY head_branch IS PARSED (#1403). A run triggered by `merge_group` has NO
+# `github.event.pull_request`: that is the same fact that collapsed backlog-hygiene's concurrency key
+# to a single group, where every queue entry cancelled its predecessor until #711 keyed it on
+# `github.ref`. The queue's ref does carry the number, in the form
+# `gh-readonly-queue/<base>/pr-<N>-<sha>`, so an ejection can still be attributed to the pull request
+# it ejected.
+#
+# CLA Assistant is deliberately NOT watched. A CLA failure is the contributor's to resolve and needs
+# no attribution; labelling it would train readers to ignore the label.
+
+name: failure signal
+
+on:
+  workflow_run:
+    workflows: [CI, Security, CodeQL, backlog-hygiene]
+    types: [completed]
+
+# Least privilege at the top; the one job that needs to write says so for itself.
+permissions:
+  contents: read
+
+concurrency:
+  # Keyed on the RUN, not on a branch. Two different workflows failing on the same head are two
+  # separate facts, and collapsing them would drop one -- the mistake #711 had to undo.
+  group: failure-signal-${{ github.event.workflow_run.id }}
+  cancel-in-progress: false
+
+jobs:
+  signal:
+    # Only a real failure. A cancelled run is not a red: branch protection gates on the latest head,
+    # so a cancelled predecessor says nothing about the current one.
+    if: github.event.workflow_run.conclusion == 'failure'
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write
+      issues: write
+    steps:
+      - name: Find the pull request behind this run, if there is one
+        id: resolve
+        env:
+          # EVERY value below is attacker-influenceable -- a branch name is chosen by whoever opened
+          # the branch. They go through the environment and are matched against a strict pattern.
+          # Interpolating them into the script body would be a template-injection hole.
+          PR_FROM_EVENT: ${{ toJSON(github.event.workflow_run.pull_requests) }}
+          HEAD_BRANCH: ${{ github.event.workflow_run.head_branch }}
+          RUN_EVENT: ${{ github.event.workflow_run.event }}
+        run: |
+          set -euo pipefail
+          pr="$(printf '%s' "$PR_FROM_EVENT" | jq -r 'if length > 0 then .[0].number else "" end')"
+
+          # A merge-queue run has no pull_requests entry. Its ref carries the number instead.
+          if [ -z "$pr" ] && [ "$RUN_EVENT" = "merge_group" ]; then
+            pr="$(printf '%s' "$HEAD_BRANCH" | grep -oE 'pr-[0-9]+' | head -1 | cut -d- -f2 || true)"
+          fi
+
+          if [ -n "$pr" ]; then
+            echo "pr=$pr" >> "$GITHUB_OUTPUT"
+            echo "Resolved to pull request $pr"
+          else
+            echo "pr=" >> "$GITHUB_OUTPUT"
+            echo "No pull request behind this run; event was $RUN_EVENT"
+          fi
+
+      - name: Label the pull request
+        if: steps.resolve.outputs.pr != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ steps.resolve.outputs.pr }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          gh label create ci-red --repo "$REPO" --color B60205 --description "A required check went red. Attribute it before retrying." 2>/dev/null || true
+          gh pr edit "$PR" --repo "$REPO" --add-label ci-red
+
+      - name: Otherwise record it against the standing tracker
+        if: steps.resolve.outputs.pr == ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          RUN_EVENT: ${{ github.event.workflow_run.event }}
+          RUN_NAME: ${{ github.event.workflow_run.name }}
+          RUN_URL: ${{ github.event.workflow_run.html_url }}
+        run: |
+          set -euo pipefail
+          # A red with no pull request behind it -- a push to the trunk, or a scheduled run -- has
+          # nowhere to attach. Measured 2026-08-31: 4 of the 9 failures in the last 200 runs were of
+          # this kind, so this is not the rare branch. One standing issue collects them, because a new
+          # issue per failure is noise nobody reads.
+          title="Reds with no pull request behind them"
+          # Matched on the exact title rather than a search relevance ranking, so a second tracker
+          # cannot be created just because search ordering changed.
+          num="$(gh issue list --repo "$REPO" --state open --limit 200 --json number,title --jq '.[] | select(.title == "Reds with no pull request behind them") | .number' | head -1)"
+          printf '%s failed on a %s run. Nothing else reports this.\n\n%s\n' "$RUN_NAME" "$RUN_EVENT" "$RUN_URL" > signal-body.md
+
+          if [ -n "$num" ]; then
+            gh issue comment "$num" --repo "$REPO" --body-file signal-body.md
+          else
+            printf 'Standing tracker. A required check can fail on a push to the trunk, in the merge queue, or on a schedule, and none of those has a pull request to carry a label. Each such failure is added here as a comment.\n\n' > intro.md
+            cat intro.md signal-body.md > new-issue.md
+            gh issue create --repo "$REPO" --title "$title" --body-file new-issue.md
+          fi

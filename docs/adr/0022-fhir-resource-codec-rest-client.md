@@ -45,7 +45,7 @@
   queue + at-least-once invariant FHIR feeds), [CLAUDE.md](../../CLAUDE.md) §1/§4/§8/§9
   (no-grouping-unit graph, code-first logic, the pure `parsing/` library + console carve-out, two-tier parsing,
   PHI rules), [CONNECTIONS.md](../CONNECTIONS.md), and the research that vetted the dependency picks,
-  [docs/research/non-hl7-transform-components.md](../research/non-hl7-transform-components.md).
+  `docs/research/non-hl7-transform-components.md`.
 
 ## Context
 
@@ -73,7 +73,7 @@ Two further facts shape the design and make it a near-clone of [ADR 0012](0012-x
 - **A real, vetted library exists.** X12's MVP was hand-rolled and dependency-free because X12 tokenization is
   trivial once delimiters are known; FHIR's resource model is large and version-specific, so a **typed library is
   the right call** — and unlike X12, one was already verified. Project research
-  ([docs/research/non-hl7-transform-components.md](../research/non-hl7-transform-components.md), the FHIR section
+  (`docs/research/non-hl7-transform-components.md`, the FHIR section
   and the verification snapshot) ran the CLAUDE.md §5 "verify-before-add" gate (PyPI existence to catch
   hallucinated/typosquat packages, license, maintenance, 3.11+ support, dependency weight, offline/PHI-safety) and
   selected **`fhir.resources`** (BSD-3, pydantic-v2 via the transitive `fhir-core`, **local schema validation with
@@ -396,7 +396,7 @@ Mirroring [tests/test_x12_parsing.py](../../tests/test_x12_parsing.py)'s "consol
 
 Per CLAUDE.md §5/§7 (verify a dependency exists / is reputable / correctly named **before** adding; AI-suggested
 packages are often hallucinated) — the picks were **already vetted** by
-[docs/research/non-hl7-transform-components.md](../research/non-hl7-transform-components.md) (multi-agent research →
+`docs/research/non-hl7-transform-components.md` (multi-agent research →
 adversarial verifiers; both confirmed real on PyPI, permissively licensed, pure-Python/offline, actively
 maintained as of 2026-06-19; the GPLv3 `fhirpath` typosquat explicitly caught):
 
