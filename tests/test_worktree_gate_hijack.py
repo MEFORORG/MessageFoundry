@@ -427,6 +427,79 @@ def test_checkout_of_a_nonexistent_branch_is_allowed(repo: SimpleNamespace) -> N
     assert run_gate(shell("git checkout does-not-exist", cwd=repo.wt), repo.repos) is None
 
 
+def test_the_3b_remediation_does_not_promise_a_refusal_git_does_not_make(
+    repo: SimpleNamespace,
+) -> None:
+    """BACKLOG #1039. The remediation offered a guarantee, and git only offers a default.
+
+    The rule's own COMMENT at the deferring decision already says "git already refuses this" is a claim
+    about a CONFIGURATION rather than about git, and spells out the bypass flags. **The DENY MESSAGE did
+    not**, and that is the higher-consequence half: a comment is read by whoever edits the rule, while a
+    refusal is an instruction its reader acts on immediately.
+
+    MEASURED against a branch already checked out in another worktree -- ``worktree add --force``, ``-f``
+    and ``--force --force`` all check it out AGAIN and exit 0, leaving the branch live in four worktrees
+    at once. So "git then refuses to check that branch out twice" was false as written.
+
+    The row credits the gate with being conditional here and names two other files. It is conditional in
+    the COMMENT and was not in the MESSAGE, which is why this row exists rather than only those two.
+    """
+    reason = assert_denied(run_gate(shell(f"git checkout {repo.other}", cwd=repo.wt), repo.repos))
+    assert "give it its OWN worktree" in reason, reason
+
+    # The qualifier must be present AND name what defeats it. A hedge with no mechanism ("may refuse")
+    # would satisfy a looser assertion while telling the reader nothing they can act on.
+    assert "DEFAULT, not a guarantee" in reason
+    assert "--force" in reason
+    assert "ignore-other-worktrees" in reason
+
+    # And the unconditional form must be GONE, not merely softened elsewhere in the same text.
+    assert "refuses to check that branch out twice" not in reason
+
+
+@pytest.mark.parametrize("verb", ["cd", "chdir", "pushd", "sl", "Set-Location", "Push-Location"])
+def test_every_chdir_verb_composes_its_target(repo: SimpleNamespace, verb: str) -> None:
+    """The resolver knew only ``cd`` and ``pushd``, so the other spellings never resolved a target.
+
+    MEASURED on the shipped gate, with the consequence read back from the governed working tree rather
+    than inferred from a verdict: ``Push-Location <governed>; git reset --hard`` run from an ungoverned
+    cwd was ALLOWED, and it DESTROYED uncommitted work in the primary. That is the hijack rule 3 exists
+    to prevent, reached by spelling one verb differently.
+
+    THE RELATIVE TARGET IS THE ONE THAT DISCRIMINATES, so it is what this row uses. With an ABSOLUTE
+    governed path most of these already denied -- caught downstream by the path itself -- so an
+    absolute-only test would have passed against the broken resolver for four of the six verbs and
+    reported coverage it did not have.
+    """
+    nested = repo.primary / ".claude" / "worktrees" / f"wt-{verb.lower().replace('-', '')}"
+    nested.parent.mkdir(parents=True, exist_ok=True)
+    subprocess.run(
+        ["git", "worktree", "add", "-b", f"br-{verb.lower().replace('-', '')}", str(nested)],
+        cwd=str(repo.primary),
+        check=True,
+        capture_output=True,
+    )
+    reason = assert_denied(
+        run_gate(shell(f"{verb} ../../.. ; git reset --hard", cwd=nested), repo.repos)
+    )
+    assert "working tree of the SHARED PRIMARY checkout" in reason
+
+
+def test_an_ungoverned_chdir_target_is_still_allowed(repo: SimpleNamespace, tmp_path: Path) -> None:
+    """The control that stops the row above being satisfied by a resolver that denies everything.
+
+    Composing a chdir must resolve the target, not assume it is governed. This one walks somewhere
+    ungoverned and must stay ALLOW.
+    """
+    outside = tmp_path / "Outside"
+    outside.mkdir()
+    subprocess.run(["git", "init", "-b", "main", str(outside)], check=True, capture_output=True)
+    assert (
+        run_gate(shell(f'Push-Location "{outside}" ; git reset --hard', cwd=repo.wt), repo.repos)
+        is None
+    )
+
+
 def test_reads_are_allowed_in_a_linked_worktree(repo: SimpleNamespace) -> None:
     assert run_gate(shell(f"git show {repo.other}:seed.txt", cwd=repo.wt), repo.repos) is None
     assert run_gate(shell(f"git diff HEAD..{repo.other}", cwd=repo.wt), repo.repos) is None

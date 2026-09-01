@@ -1347,6 +1347,52 @@ def test_a_RELATIVE_repository_token_composes_the_cd_prefix(
     assert run_gate(shell(into_ungoverned, cwd=repo.primary), repo.repos) is None
 
 
+def test_a_pwsh_LAUNCH_timeout_is_reported_as_its_own_event(
+    repo: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #1304. A launch that never returns must not read as a gate regression.
+
+    The item's operational cost is that nothing distinguishes the two at the moment they fire, so a
+    lander must choose between rerunning until green and reporting the queue blocked. This row drives
+    the timeout deliberately -- a diagnostic nobody has ever seen fire is not a diagnostic.
+
+    IT ASSERTS THE THREE THINGS A READER NEEDS, not merely that something was raised: that no gate
+    logic ran, that the correlation is with time rather than content, and that rerunning silently is
+    not a sanctioned fix.
+    """
+    import tests.test_worktree_gate as harness
+
+    def never_returns(*args: object, **kwargs: object) -> None:
+        raise subprocess.TimeoutExpired(cmd="pwsh", timeout=harness.GATE_TIMEOUT_S)
+
+    monkeypatch.setattr(harness.subprocess, "run", never_returns)
+    with pytest.raises(AssertionError) as caught:
+        run_gate(shell("git config core.hooksPath /nope", cwd=repo.wt), repo.repos)
+
+    message = str(caught.value)
+    assert "PWSH LAUNCH TIMED OUT" in message
+    assert "BACKLOG #1304" in message
+    assert "NOT an assertion failure" in message
+    assert "no gate logic ran" in message
+    assert "TIME rather than with repository content" in message
+    assert "rerun until green" in message
+
+
+def test_the_launch_timeout_diagnostic_does_not_fire_on_an_ordinary_denial(
+    repo: SimpleNamespace,
+) -> None:
+    """The control that stops the row above passing against a harness that labelled EVERYTHING.
+
+    An ordinary governed disarm must still produce the rule's own refusal, with no launch-timeout
+    wording anywhere near it.
+    """
+    reason = assert_denied(
+        run_gate(shell("git config core.hooksPath /nope", cwd=repo.wt), repo.repos)
+    )
+    assert "PWSH LAUNCH TIMED OUT" not in reason
+    assert "setting 'core.hooksPath'" in reason
+
+
 def test_the_ordering_switch_did_not_leak_into_rules_3_and_3d(
     repo: SimpleNamespace, unrelated: Path
 ) -> None:

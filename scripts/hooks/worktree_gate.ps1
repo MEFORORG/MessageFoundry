@@ -161,10 +161,55 @@ function Get-FullPathRaw([string]$Path, [string]$Base) {
     } catch { return "" }
 }
 
+#: Host spellings that mean THIS MACHINE. An admin share through any of these reaches the local disk, so
+#: `//localhost/c$/x` and `c:/x` are the same file and must compare equal. Deliberately NOT `[^/]+`: a
+#: share on ANOTHER box is a different machine's C: drive, and folding it would let a remote path match a
+#: local governed root -- a refusal naming a repository the write never touches, which is the BACKLOG
+#: #1085 shape this file has already been fixed for once.
+$script:LocalHostSpellings = @('localhost', '127.0.0.1', '::1', $env:COMPUTERNAME) |
+    Where-Object { $_ } | ForEach-Object { $_.ToLowerInvariant() }
+
 function Get-ComparablePath([string]$Path, [string]$Base) {
+    <#
+    THE COMPARISON IS LEXICAL AND THAT IS THE WHOLE DEFECT (BACKLOG #1071). ``GetFullPath`` never touches
+    the filesystem, so it canonicalises the drive-letter spelling and nothing else. Two spellings of the
+    SAME local path therefore compared UNEQUAL to a governed root and rule 3c allowed a disarm through
+    them.
+
+    MEASURED, with the consequence read back from the governed config rather than inferred from a verdict:
+
+        \\?\C:\<governed>            git rc=0, the write LANDED in the governed config. UNCONDITIONAL.
+        \\localhost\C$\<governed>     git rc=128 "dubious ownership" -- blocked TODAY, and rc=0 with the
+                                    write landing the moment an operator adds one safe.directory entry.
+
+    THE ITEM FILES THE UNC SPELLING AND THAT IS THE CONDITIONAL ONE. The extended-length prefix needs no
+    setup at all -- no share, no junction, no configuration -- which also answers the objection recorded
+    on this rule that these spellings "need a SHELL command to set up" and are therefore out of reach.
+    One of them does not.
+
+    THE FOLD IS ADDITIVE AND CANNOT OPEN A HOLE: it makes MORE spellings resolve onto a governed root, so
+    every verdict it changes moves ALLOW to DENY. It runs at the single shared comparison point, so rules
+    3, 3b, 3c and 3d inherit it together rather than drifting apart.
+
+    WHAT IT STILL DOES NOT COVER, STATED RATHER THAN IMPLIED: a JUNCTION or other reparse point is not
+    de-aliased, because a lexical resolver cannot follow one; and an admin share reaching this machine by
+    a name not in the list above -- an FQDN, a second IP -- is not folded. Both remain open, and the
+    second is an enumeration, which CLAUDE.md is right to distrust.
+    #>
     $full = Get-FullPathRaw $Path $Base
     if (-not $full) { return "" }
-    ($full -replace '\\', '/').TrimEnd('/').ToLowerInvariant()
+    $cmp = ($full -replace '\\', '/').TrimEnd('/').ToLowerInvariant()
+
+    # ORDER MATTERS: the extended-UNC form carries BOTH prefixes, so the `//?/unc/` case must reduce to a
+    # plain UNC path before the admin-share fold below can see it.
+    $cmp = $cmp -replace '^//\?/unc/', '//'
+    $cmp = $cmp -replace '^//\?/', ''
+    if ($cmp -match '^//([^/]+)/([a-z])\$(?=/|$)') {
+        if ($script:LocalHostSpellings -contains $Matches[1]) {
+            $cmp = $Matches[2] + ':' + $cmp.Substring($Matches[0].Length)
+        }
+    }
+    $cmp
 }
 
 # Fold a CALLER-SUPPLIED value before it goes into a deny REASON. Write-Deny already does exactly this for
@@ -437,7 +482,34 @@ function Get-GitTargetCandidatesRaw([string]$Line, [string]$Prefix, [string]$Cwd
     # prefix cannot be composed and $cd stays null, which falls back to exactly the old behaviour.
     $cd = $null
     if ($Prefix -notmatch '(?:^|\s)(?:popd|cd\s+-(?:\s|$))' -and $Prefix -notmatch '[({]') {
-        $cds = [regex]::Matches($Prefix, '(?:^|\s)(?:cd|pushd)\s+"?([^"&|;]+?)"?\s*(?:&&|;|\||$)')
+        # THE VERB LIST MATCHES RULE 3c's CHDIR GUARD, and it did not until now. This composer knew
+        # only `cd` and `pushd`, so a PowerShell chdir verb never resolved its target and the command
+        # after it was judged against the SESSION cwd instead. Measured on the shipped gate, with the
+        # consequence read back from the governed working tree rather than inferred from a verdict:
+        #
+        #     Push-Location <governed>; git reset --hard      ALLOWED, and it DESTROYED uncommitted work
+        #
+        # run from an ungoverned cwd. That is precisely the hijack rule 3 exists to prevent, reached by
+        # spelling one verb differently.
+        #
+        # THE ABSOLUTE AND RELATIVE CASES FAILED DIFFERENTLY, which is why the fix is here rather than at
+        # a call site. With an ABSOLUTE governed path `sl` and `Set-Location` already denied -- caught
+        # downstream by the path itself -- while `Push-Location` did not. With a RELATIVE target every
+        # uncomposed verb failed open, because nothing resolved `../../..` against the chdir at all.
+        #
+        # IGNORECASE IS REQUIRED AND IS THE ONE RISKY CHARACTER HERE. [regex]::Matches is case-SENSITIVE
+        # by default, and PowerShell verbs are conventionally written `Set-Location`, so a case-sensitive
+        # alternation of lowercase spellings would match none of them and this fix would silently do
+        # nothing. The shells being matched are themselves case-insensitive, so this widens nothing that
+        # was not already reachable.
+        #
+        # ADDITIVE BY CONSTRUCTION: composing a chdir can only make a target RESOLVE where it previously
+        # did not, so every verdict it changes moves ALLOW to DENY.
+        $chdirComposeVerbs = 'cd|chdir|pushd|sl|set-location|push-location'
+        $cds = [regex]::Matches(
+            $Prefix,
+            "(?:^|\s)(?:$chdirComposeVerbs)\s+`"?([^`"&|;]+?)`"?\s*(?:&&|;|\||`$)",
+            [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)
         if ($cds.Count -eq 1) { $cd = $cds[0].Groups[1].Value.Trim() }
     }
 
@@ -1402,9 +1474,11 @@ hypothetical: it is exactly the hijack that happened here. A session with no wor
 `git checkout` inside somebody else's worktree; git allowed it because '$destMsg' was not checked out anywhere.
 
 What to do instead:
-  * To BUILD on '$destMsg', give it its OWN worktree -- git then refuses to check that branch out twice,
-    which is the protection you actually want. The branch already EXISTS, so this REUSES it rather than
-    forking. -Branch is the git ref; -Name is only the DIRECTORY, which cannot contain '/':
+  * To BUILD on '$destMsg', give it its OWN worktree -- git then refuses an ORDINARY second checkout of
+    that branch, which is the protection you actually want. That refusal is a DEFAULT, not a guarantee:
+    measured, `worktree add --force` (and `-f`) check the same branch out again and succeed, and
+    `checkout --ignore-other-worktrees` switches. It stops the ACCIDENT, not a determined bypass. The
+    branch already EXISTS, so this REUSES it rather than forking. -Branch is the git ref; -Name is only the DIRECTORY, which cannot contain '/':
         pwsh -NoProfile -File $newHintQ -Branch $(Get-SafeForCommand $dest) -Name $(Get-SafeForCommand $destSlug)
   * To READ '$destMsg' without touching any working tree, use the plumbing:
         git -C $selfTopQ show $(Get-SafeForCommand $dest -Suffix ':<path>')        git -C $selfTopQ diff $(Get-SafeForCommand $dest -Prefix 'HEAD..')
