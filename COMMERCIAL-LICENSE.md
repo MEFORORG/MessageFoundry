@@ -29,8 +29,8 @@ situation — you do **not** need a commercial license to:
   service) to integrate your own systems.
 - Author your own Connections / Routers / Handlers in a separate `--config` repo. The project's
   position is that adopter config loaded via `--config` is a **separate work**, not a derivative of
-  the AGPL engine — see [docs/DUAL_LICENSING_PLAN.md](docs/DUAL_LICENSING_PLAN.md). (This position is
-  itself pending legal review.)
+  the AGPL engine. That position is recorded in the project's dual-licensing plan, a maintainer
+  document that is not published in this repository. (The position is itself pending legal review.)
 
 You may need one if you intend to:
 
@@ -62,6 +62,6 @@ A dedicated commercial-licensing contact address will be published when the offe
 
 - [LICENSE](LICENSE) — the AGPL-3.0-or-later text (your rights today).
 - [CLA.md](CLA.md) — the contributor relicensing grant that enables dual-licensing.
-- [docs/DUAL_LICENSING_PLAN.md](docs/DUAL_LICENSING_PLAN.md) — the dual-licensing posture and the open
-  legal questions it depends on.
+- The project's dual-licensing plan — the dual-licensing posture and the open legal questions it
+  depends on. A maintainer document; it is not published in this repository.
 - [GOVERNANCE.md](GOVERNANCE.md) — how the project is governed.
