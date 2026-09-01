@@ -89,7 +89,8 @@ def test_the_scanner_does_not_flag_a_python_keyword_argument() -> None:
 
 # THE MEASURED BASELINE, AND WHY THIS IS A RATCHET RATHER THAN A CLEAN GATE.
 #
-# 27 documents carry 58 of these citations. BACKLOG #1383's agreed scope is docs/SECURITY.md ONLY
+# 27 documents carry 59 of these citations -- the sum of the table below, which is the only
+# authority for that number; an earlier draft of this line said 58 and was one behind its own dict. BACKLOG #1383's agreed scope is docs/SECURITY.md ONLY
 # -- the ASVS tracker recommended that scope, the Liaison endorsed it unaltered, and widening it
 # here would be a scope decision nobody made. SECURITY.md is now 0 and is absent from this table.
 #
