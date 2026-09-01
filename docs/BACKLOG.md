@@ -18614,32 +18614,39 @@ ways.
 | The file says | The server says | Why it is not just a missing line |
 |---|---|---|
 | 13 contexts, no `a reviewer has read this` | 16 contexts, including it | A reader asking "is review enforced?" gets NO from the file and YES from the server |
-| `codeql.yml` is DELIBERATELY NOT REQUIRED, because a fork-PR token lacks `security-events: write` and requiring it "would block every fork PR" | `CodeQL (javascript-typescript)` and `CodeQL (python)` are both required | The file asserts a **false negative** and names a concrete harm. Either the harm is real and two contexts should come off, or the reasoning is stale. Both are decisions, and neither has been made |
-| `enforce_admins = FALSE`, called "the documented escape hatch in `scripts/hooks/push_guard.py`" | `enforce_admins` is **true**, read 2026-08-31 | The escape hatch is closed. Anyone reaching for it during a permanently-red required check finds it gone, at the moment they need it |
+| `codeql.yml` is DELIBERATELY NOT REQUIRED, because a fork-PR token lacks `security-events: write` and requiring it "would block every fork PR" | `CodeQL (javascript-typescript)` and `CodeQL (python)` are both required, read 2026-08-31 | The file asserts a **false negative** and names a concrete harm. Either the harm is real and two contexts should come off, or the reasoning is stale. Both are decisions, and neither has been made |
+| `enforce_admins = FALSE`, pointing at `scripts/hooks/push_guard.py` for the reasoning | `enforce_admins` is **true**, read 2026-08-31 | The value is wrong, and this file is not the only place carrying it wrong. See below |
 
 **When `enforce_admins` changed is not recoverable.** The API reports the current value and keeps no
 history, so this item does not claim a date for it.
 
-**THERE IS A SECOND RECORD, AND IT IS THE WORSE ONE.** `scripts/hooks/push_guard.py` also states the
-setting, in three places, and all three say OFF while the server says on. Two are prose. The third is
-not:
+**THERE IS A SECOND RECORD, AND IT IS THE WORSE ONE.** `scripts/hooks/push_guard.py` states the
+setting in **at least four** places -- lines 20, 72, 284 and 300 as of 2026-08-31 -- and every one of
+them says OFF while the server says on. "At least" is deliberate: an earlier draft of this item said
+three, having missed line 72, and a fixer working from that enumeration would have left it wrong.
 
-- its module docstring says `enforce_admins` was "DISABLED again on 2026-07-29", so `gh pr merge
-  --admin` "works once more" and "for an admin, protection does not apply";
-- an inline comment repeats it as a correction to an earlier stale note;
-- **the hook PRINTS it to an operator, at the moment it refuses their push**: "Do NOT expect the
-  server to stop it: enforce_admins is OFF, so branch protection does not apply to an admin's direct
-  push, and this hook is the only" thing left.
+Two of the four matter more than the others:
 
-That last one is a compensating control resting on a false premise, which is what SDS-3.7 forbids,
-and it is delivered at exactly the moment somebody acts on it. The harm has two directions and they
-are not symmetric. Telling an operator the server will not stop them, when it will, is a false alarm.
-But the docstring's other half promises `gh pr merge --admin` as the way out of a permanently-red
-required check, and with `enforce_admins` on that command does not work. A documented escape hatch
-that fails is discovered only by the person already stuck.
+- **line 300 is PRINTED to an operator, at the moment the hook refuses their push**: "Do NOT expect
+  the server to stop it: enforce_admins is OFF, so branch protection does not apply to an admin's
+  direct push". A compensating control resting on a false premise, which is what SDS-3.7 forbids,
+  delivered exactly when somebody acts on it.
+- **line 72 inverts an instruction.** It reasons that a fresh clone has "nothing but the server-side
+  rule -- which, with `enforce_admins` OFF, is nothing at all when the pusher is an admin", and then
+  says: "Do not read 'the server would have caught it' into any of those gaps." With the setting on,
+  the server *would* have caught it, so the instruction now tells a reader to discount the one
+  control that is actually there.
 
-The same file's own HISTORY note says the setting "was flipped", which matches the server. So the
-file contradicts itself, and the half a reader is most likely to act on is the wrong half.
+**The harm is a wrong sentence, not a lost way out, and an earlier draft of this item got that
+wrong.** It claimed `gh pr merge --admin` was the documented way out of a permanently-red required
+check and that the way out had therefore closed. Both halves fail. The file names its relaxation
+explicitly at line 82, and it is not `--admin`: it is `gh api -X DELETE
+repos/MEFORORG/MessageFoundry/branches/main/protection/enforce_admins`. **An admin can run that
+today and it works.** What survives is narrower: line 20 misdescribes `--admin` as the relaxation.
+
+**The file contradicts itself, and the correct half is the one nobody reads.** Its HISTORY note at
+line 75 says the premise "dissolved and the setting was flipped", which matches the server. The four
+statements above do not.
 
 **NOTHING IN CI CAN SEE ANY OF THIS.** `tests/test_required_contexts.py` pins the count at 13 and
 reconciles prose against the file. It never reads the server. Every mention of the protection API in
@@ -18652,9 +18659,12 @@ exists to prevent:**
 1. Decide the CodeQL question with the owner. Either accept the two contexts as required and delete
    the fork-PR reasoning, or remove them from protection. Do not simply transcribe the server.
 2. Add `a reviewer has read this` to the file, with its reasoning, and record the CodeQL decision.
-3. Correct the `enforce_admins` line to `TRUE` and say what replaces the escape hatch it described.
-4. Correct all three statements in `scripts/hooks/push_guard.py`, including the one it PRINTS. Fixing
-   only `required-contexts.txt` leaves the wrong value in the place an operator actually reads it.
+3. Correct the `enforce_admins` line to `TRUE`. Do not say the relaxation is gone: the one `push_guard.py` names at line 82, the `DELETE` on the protection endpoint, still works. **In this item "escape hatch" means that call and nothing else.**
+4. Correct every statement of the value in `scripts/hooks/push_guard.py` -- at least lines 20, 72,
+   284 and 300 -- rather than the four this item happens to name. Re-grep before declaring it done.
+   Line 300 is printed to an operator and line 72 carries an instruction that inverts, so neither is
+   a comment tidy-up. Fixing only `required-contexts.txt` leaves the wrong value in the place an
+   operator actually reads it.
 5. Update the count pinned in `tests/test_required_contexts.py`, in the same pull request.
 
 **What this item does NOT propose.** It does not propose a test that calls the GitHub API. A required
