@@ -1867,15 +1867,18 @@ def test_the_Status_TEXT_render_says_nobody_was_told(repo: Path) -> None:
 def test_the_message_cap_is_the_binding_one_at_a_REALISTIC_broadcast_size(
     repo: Path, tmp_path: Path
 ) -> None:
-    """MAX_MESSAGES promises 5 per injection. At real broadcast sizes the byte cap delivers 3.
+    """MAX_MESSAGES promises 5 per injection. At real broadcast sizes the byte cap delivered 3.
 
     The arithmetic, and it is the finding rather than a projection: a message is charged
     ``len(body) + FRAME_OVERHEAD_BYTES`` by the selection pass, the frame is 560 bytes, and
-    MAX_TOTAL_BYTES is 8000. A fleet broadcast runs about 1900 bytes, so each costs ~2460 and
-    only three fit. Every seat has been reading ``3 shown`` as normal.
+    MAX_TOTAL_BYTES was 8000. A fleet broadcast runs about 1900 bytes, so each cost ~2460 and
+    only three fit. Every seat had been reading ``3 shown`` as normal.
 
     A 5-message allowance that can only ever deliver 3 is not the stated policy, and the two
-    constants disagreeing silently is what makes this a defect rather than a tuning choice.
+    constants disagreeing silently is what made this a defect rather than a tuning choice. The
+    past tense is the fix: this test asserts all 5 render at that size, and its assertions read
+    the caps out of the script rather than restating them, so they cannot go stale the way the
+    8000 in this docstring did.
     """
     # SHAPE MATTERS AS MUCH AS SIZE, AND GETTING IT WRONG MADE THE FIRST DRAFT OF THIS TEST PASS.
     # A single 1900-character line is cut to MAX_LINE_CHARS (240) before it is ever measured, so it

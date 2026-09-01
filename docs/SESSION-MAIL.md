@@ -281,7 +281,7 @@ ever disagree the script is right and this section is stale.
 |---|---|---|
 | Messages rendered per injection | 5 | the whole injection |
 | Body bytes per message | 2,000 | measured **after** the sanitiser has scrubbed to ASCII, and **as rendered** -- the `    \| ` prefix on every line is charged |
-| Bytes per injection | 8,000 | summed over rendered bodies **plus** each message's frame |
+| Bytes per injection | 12,800 | summed over rendered bodies **plus** each message's frame |
 | Per-message frame | 560 | the id delimiter, the two `[UNVERIFIED]` metadata lines and the closing delimiter |
 | Line length | 240 chars | per rendered body line |
 | `from.cwd` | 200 chars | rendered metadata |
@@ -293,21 +293,25 @@ There is deliberately **no** cap on the message id: it is the validated filename
 already strictly narrower than any cap would be, and adding one would tell the next reader the id is
 untrusted at that point.
 
-Worst-case injection is therefore roughly **8,000 bytes of messages** plus the preamble and counter
+Worst-case injection is therefore roughly **12,800 bytes of messages** plus the preamble and counter
 lines. **Both halves of that arithmetic were wrong once and the error was invisible:** the cap charged
 the *measured* body while the renderer added six bytes of `    | ` prefix to every line, so five bodies
 of a thousand short lines each passed a 2,000-byte-per-message check and rendered a **34,539-byte**
-injection against an 8,000-byte total, reported as "0 truncated". A bound stated independently of the
-thing it bounds is not a bound; `Measure-BodyBytes` now measures what is rendered.
+injection against the 8,000-byte total **of the time**, reported as "0 truncated". A bound stated
+independently of the thing it bounds is not a bound; `Measure-BodyBytes` now measures what is rendered.
 
 The metadata caps are not decoration: a cap on the body alone is a cap with an obvious bypass, since an
 unbounded `from.branch` pushes the preamble off the top of the injection just as effectively as an
 unbounded body would.
 
-**Where the numbers come from.** All four anchors were measured in this repo on 2026-08-05:
+**Where the numbers come from.** These anchors were measured in this repo on 2026-08-05. The
+per-injection **total** is not one of them: it is derived from the other caps, `5 * (2000 + 560)`, so
+that the message cap is the one that binds. That derivation is the correction BACKLOG #1386 records.
 
-- `CLAUDE.md` is **40,102 bytes**, and is this project's deliberate per-session context cost. 8,000
-  bytes is 20 percent of that arriving unbidden, potentially at **every** `Stop`.
+- `CLAUDE.md` is **40,102 bytes**, and is this project's deliberate per-session context cost. The
+  derived total of 12,800 bytes is about **32 percent** of that arriving unbidden, potentially at
+  **every** `Stop`. That is what the 5-message allowance costs. The total was 8,000 -- a cheaper 20
+  percent -- but it bound before the message cap and delivered 3 of the promised 5.
 - `announce-session.ps1` folds and caps every peer-supplied field through its `Get-Clean` helper, at
   caps of 16, 24, 40, 60, 80, 160 and 200 characters. 2,000 bytes is ten times the largest
   peer-authored string this repo renders anywhere else.
