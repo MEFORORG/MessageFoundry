@@ -340,8 +340,9 @@ cross-session message (faster, no receipt, dies with the session).**
    Lander as before." **That fallback no longer exists** -- since `a reviewer has read this`
    became a required context, the Lander cannot merge an unlabelled PR either.
    **WHAT BLOCKS A MERGE IS THE `reviewed` LABEL, NOT THE REVIEWER SEAT, AND ANY SEAT CAN APPLY
-   IT** -- `gh pr edit <N> --add-label reviewed`. Measured 2026-08-31: PRs 713, 716 and 714 all
-   merged with no Reviewer seat running. Nothing automated ever adds the label and a push STRIPS
+   IT** -- `gh pr edit <N> --add-label reviewed`. Measured 2026-08-31: **at least two of** PRs 713,
+   716 and 714 merged with no Reviewer seat running -- 713 and 716 are clean; 714 merged 52
+   minutes inside a reviewer seat's freshness window and cannot be counted. Nothing automated ever adds the label and a push STRIPS
    it, so label after your last push. **The gate records that a step HAPPENED, not that an
    independent party looked**, so labelling your own PR unread satisfies the machine and defeats
    the point.
