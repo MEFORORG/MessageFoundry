@@ -27,6 +27,7 @@ tests/test_ai_provenance_claims.py
 tests/test_announce_hook.py
 tests/test_announce_wiring.py
 tests/test_asvs_anchor_provenance.py
+tests/test_asvs_anchor_report.py
 tests/test_asvs_file_surface_doc_drift.py
 tests/test_asvs_prove_absences_wiring.py
 tests/test_asvs_rescore_handoff.py
@@ -111,6 +112,7 @@ tests/test_push_guard.py
 tests/test_quality_advisory_invariants.py
 tests/test_quality_record_scope_claims.py
 tests/test_required_contexts.py
+tests/test_required_contexts_drift.py
 tests/test_required_workflow_state.py
 tests/test_rescue_ref_provenance.py
 tests/test_scan_forbidden_loaded_set.py
@@ -140,6 +142,7 @@ tests/test_worktree_gate_interpreter_flags.py
 tests/test_worktree_gate_interpreter_sigils.py
 tests/test_worktree_gate_path_aliases.py
 tests/test_worktree_gate_quote_straddle.py
+tests/test_usage_headroom_inject.py
 tests/test_worktree_gate_quoted_key.py
 tests/test_worktree_gate_receipts.py
 tests/test_worktree_gate_remedy_families.py
