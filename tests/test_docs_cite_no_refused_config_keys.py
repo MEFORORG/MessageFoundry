@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import pathlib
 import re
+import warnings
 
 import pytest
 
@@ -129,24 +130,78 @@ _BASELINE: dict[str, int] = {
     "docs/TRAY.md": 1,
 }
 
+# THE ONLY ROWS A CLONE MAY LEGITIMATELY LACK, and naming them is the point: an exemption that
+# said "any missing file is fine" would delete the self-pruning property this baseline exists to
+# have. Both of these are UNTRACKED -- `git ls-files` does not report them, they sit on a
+# maintainer's disk, and no checkout anywhere carries them. They were measured where they exist,
+# so their counts are right; CI simply cannot see the documents. Failing on that made this test
+# unpassable on every runner while the baseline was correct about the corpus it describes.
+# tests/test_threat_model_doc_drift.py and tests/test_crit2_inline_doc_drift.py make the same
+# call for their own withheld documents: warn that the assertion is inert, do not fail.
+# A row here that IS present on disk is still enforced exactly, so the ratchet holds locally.
+_WITHHELD_FROM_PUBLIC_CHECKOUTS = frozenset(
+    {
+        "docs/testing/master-test-plan/03-store-and-data-lifecycle.md",
+        "docs/testing/master-test-plan/16-security-phi-and-supply-chain.md",
+    }
+)
+
+
+class BaselineRowUnenforced(UserWarning):
+    """A baseline row names a document this checkout does not carry."""
+
+
+def test_every_withheld_row_is_still_a_baseline_row() -> None:
+    """The exemption must not outlive the rows it exempts.
+
+    Delete a row from _BASELINE and leave its name here, and this file starts carrying a
+    permanent licence for a path nothing measures -- a suppression list growing in the one place
+    the ratchet cannot see. Tie the two together so that cannot happen quietly.
+    """
+    orphans = sorted(_WITHHELD_FROM_PUBLIC_CHECKOUTS - set(_BASELINE))
+    assert not orphans, f"exempted paths that are no longer baseline rows: {orphans}"
+
 
 def test_the_baseline_is_exact_and_self_pruning() -> None:
     """A baseline row that no longer matches is a lie about the corpus, so fail on it.
 
     This is the half that stops a ratchet decaying into a permanent allowlist: you cannot fix a
     document and leave its old number behind, and you cannot list a file that is already clean.
+
+    ABSENT IS NOT STALE. A row whose document this checkout does not carry is UNENFORCED, not
+    wrong, and only the paths named in _WITHHELD_FROM_PUBLIC_CHECKOUTS get that reading. Any
+    other missing file is still a hard failure -- deleting or renaming a document you have not
+    de-listed is exactly the drift this test is for.
     """
     stale = []
+    enforced = 0
     for rel, expected in _BASELINE.items():
         path = REPO / rel
         if not path.exists():
+            if rel in _WITHHELD_FROM_PUBLIC_CHECKOUTS:
+                warnings.warn(
+                    f"{rel} is absent from this checkout, so its baseline of {expected} is "
+                    f"INERT in this run. It is enforced wherever the document exists.",
+                    BaselineRowUnenforced,
+                    stacklevel=2,
+                )
+                continue
             stale.append(f"{rel}: listed but missing")
             continue
+        enforced += 1
         actual = len(_citations(path.read_text(encoding="utf-8")))
         if actual != expected:
             verb = "now clean -- delete this row" if actual == 0 else f"now {actual} -- lower it"
             stale.append(f"{rel}: baseline says {expected}, {verb}")
     assert not stale, "the baseline no longer matches the corpus:\n    " + "\n    ".join(stale)
+    # A baseline whose every row was absent would clear the loop above having read nothing -- the
+    # vacuous green that test_the_relocated_table_is_populated already guards against upstream.
+    # Only the withheld rows may ever be skipped, so the floor is exact rather than a fraction.
+    floor = len(_BASELINE) - len(_WITHHELD_FROM_PUBLIC_CHECKOUTS)
+    assert enforced >= floor, (
+        f"only {enforced} of {len(_BASELINE)} baseline rows were read in this checkout, "
+        f"expected at least {floor}; the baseline is measuring almost nothing"
+    )
 
 
 @pytest.mark.parametrize(
