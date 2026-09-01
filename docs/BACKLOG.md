@@ -18665,35 +18665,101 @@ Within `scripts/coord` and `scripts/hooks` specifically, four files are caught b
 
 **Related:** [#1211](#1211-empty_claims_per_msg-is-not-contention-immune-the-ratio-form-excursions-past-its-own-slo-band-on-a-hosted-runner) is the single home for the harvest table, the five measured defects and the owner ruling -- read it there, and do not restate the table here. #1357 covers the FD arm of the test #1211 split. #1366's design premise that two metrics carry a band is now one, corrected in place there. #1414 is the allocation-transfer path this item's number history is an instance of.
 
-## 1419. the connscale-smoke profile is documented as CI-run and no workflow invokes it
+## 1419. two records on main disagree about whether CI runs the connscale sweep, and the test docstring is the wrong one
 
-> 🔢 **Filed 2026-09-01 - not started.** `tests/test_connscale_smoke.py` line 45 tells a reader that the shipped `connscale-smoke` profile (N=50/100) is *"run via the ``--connscale`` CLI in CI"*. **No workflow invokes it.** MEASURED on `origin/main` at `85516d100`: `git grep -e '--connscale' origin/main -- .github/` exits 1, no match, against a positive control of `connscale` which exits 0 and finds `.github/workflows/ci.yml`. So the larger-N point that sentence describes as covered is **predicted and unexercised**, and the module docstring that sets a reader's expectations for the whole file is wrong about it.
+> 🔢 **Filed 2026-09-01 - not started.** `harness/load/profiles/connscale-smoke.toml` says *"No workflow runs it"* (line 26; the measurement behind it is at lines 6-12, dated 2026-08-31). `tests/test_connscale_smoke.py:45` says the same shipped profile is *"run via the ``--connscale`` CLI in CI"*. **Both sentences are on `origin/main` and they contradict each other. The toml is right; the docstring is wrong.** A reader who opens the test file to decide whether the N=50/100 regime is regression-covered gets the wrong answer, and the test file is the natural place to look. **The fix is that one clause at `tests/test_connscale_smoke.py:45`.** Wiring a real sweep leg up is a different question and is already owned -- see PERF-36 below.
 > Verdict: build
-> Closing-act: docs
+> Closing-act: code
 
 **Cluster:** Developer Experience & CI. **Priority:** P3. **Verdict:** build.
-**Severity:** no engine effect, no PHI axis, **no deployment axis (sec. 0)** -- this is a measurement instrument in the test harness and a false sentence about it, not shipped engine behaviour. The cost is that a reader deciding whether the N=50/100 regime is regression-covered gets the wrong answer from the file's own docstring, and the docstring is the natural place to look.
+**Severity:** no engine effect, no PHI axis, **no deployment axis (sec. 0)** -- this is a measurement instrument in the test harness and a false sentence about it, not shipped engine behaviour. The cost is a reader's model of coverage.
 
-**THE FLAG IS REAL. THE CI CLAIM IS NOT.** `--connscale` exists and works: `harness/__main__.py:152` declares it, its own docstring at line 20 documents `python -m harness --connscale NAME`, and it is referenced from `docs/LOAD-TESTING.md`, `harness/load/profiles/README.md` and several benchmark records. **Nothing under `.github/` calls it.** That distinction matters for the fix: this is not a broken flag, it is a sentence asserting a CI behaviour that no workflow performs.
+**Allocated under the title *"the connscale-smoke profile is documented as CI-run and no workflow invokes it"*, and retitled here on 2026-09-01.** That original title names a finding that was already on `origin/main` before this number was allocated. The heading now names what is actually new.
 
-**WHAT CI ACTUALLY DOES WITH CONNSCALE, so the replacement sentence can be true.** MEASURED, every `connscale` occurrence under `.github/`:
+**WHAT IS NEW IS THE CONTRADICTION, NOT THE MEASUREMENT. The measurement already exists on `origin/main`, in three places, all agreeing -- read it there, and do not copy it here:**
 
-* `ci.yml:2093` runs `pytest tests/test_connscale_postgres.py -v`.
-* `ci.yml:866-871` uploads `out/connscale/` as the `connscale-readings-<os>-<py>` artifact, on every run, pass or fail (BACKLOG #1211).
-* `ci.yml:1469` lists `test_connscale` among the paths that trigger the server-DB legs.
-* `ci.yml:1315` and `:1351` are comments about runner headroom and the three heaviest multi-process tests.
+* `harness/load/profiles/connscale-smoke.toml:6-12` -- the needle, the positive control, the line count, and the date (2026-08-31, the day before this number was allocated).
+* the same file's `description` field, line 26 -- *"No workflow runs it."*
+* `tests/test_connscale_empty_claims_per_msg.py:84` -- *"but no workflow invokes it; PERF-36."*
 
-So the **pytest** tests run in CI at the small-N sizes the same docstring describes (12 to 24, chosen to fit the pytest-timeout budget). The **profile sweep** does not run at all.
+**None of those three says that a fourth record contradicts them.** That is the whole of this item, and it is why a fixer reading only the toml would not find the false sentence.
 
-**WHY IT IS WORTH A ROW RATHER THAN A SILENT EDIT.** The sentence is load-bearing for a reader's model of coverage. The docstring's surrounding paragraph is careful and honest -- it states in terms which walls the small-N run does NOT regression-cover, and names the Postgres leg as what gives the acquire-wait wall real small-N coverage. A reader who trusts that carefulness has no reason to doubt the next clause. **An accurate paragraph is what makes the one false clause inside it dangerous.**
+**THE RUNNER-COST DECISION IS ALREADY OWNED. DO NOT RE-OPEN IT HERE.** `connscale-smoke.toml:11-12` names **PERF-36** in `docs/testing/master-test-plan/17-performance-and-scale.md` as the item that owns wiring a real leg up. A fixer who treats this row as a cost decision duplicates PERF-36.
 
-**PROVENANCE.** This was one of two findings surfaced by PR #656 (closed 2026-09-01 as superseded by #729). Its diagnosis was correct and outlives the pull request it arrived in; the remedy that PR proposed is not what is wanted here. Its sibling finding -- that `runner.py` appends the final sample after `driver.stop()`, `await_drain()` and a settle, while three sites describe the metric as spanning *"first->last in-hold samples"* -- belongs to **#1211** as an amendment rather than a new number, because #1211 already records that same docstring claim as measured false for a different reason. **That is deliberately not filed here.**
+**That pointer is unreachable from an engine checkout, so the ownership it asserts cannot be acted on here.** Commit `921db74a1` (PR #714) untracked `docs/testing/master-test-plan/` under ADR 0160's D1 test; only `docs/testing/VERIFY.md` survives in this repository. On `origin/main` the string `PERF-36` occurs in exactly two places -- the two pointers named above -- and in no file that defines it. `tests/test_connscale_smoke.py:30-38` already records that stranding for its own coverage row; read the reasoning there. It is restated here only in the one respect that row does not cover: it makes *"PERF-36 owns the leg"* un-actionable from an engine checkout without a vault clone.
 
-**Candidate fixes, not yet decided.** Either correct the sentence to describe what CI does, naming the profile as a local or on-demand instrument rather than a CI-run one; or make it true by invoking the sweep from a workflow. The second is a real cost decision, not a docs edit -- `harness/load/profiles/connscale-smoke.toml` at N=50/100 is far heavier than the pytest sizes, and `ci.yml:1315`'s own comment reserves runner headroom for exactly this class of work. **Do not "fix" this by deleting the clause and leaving the coverage question unanswered** -- the whole value of the surrounding paragraph is that it states what is not covered.
+**WHAT CI ACTUALLY RUNS, so a replacement sentence can be true.** The load-bearing step is a whole-suite run, and **no string census under `.github/` can see it** -- that is the instrument error an earlier draft of this row made:
 
-**How to re-measure, and print the needle beside the zero.** A bare zero here is indistinguishable from a search that never ran:
+* `.github/workflows/ci.yml:824`, inside the step **"Tests (pytest)"** (`id: tests`, declared at `:758`), runs `bash scripts/ci/retry-native-crash.sh pytest -q -n "$PYTEST_WORKERS" --dist loadfile -m 'not tooling' --ignore-glob='*messagefoundry-webconsole*' ...` -- the whole engine suite. `tests/test_connscale_smoke.py` is **not** in `tests/tooling_manifest.txt`, and `tests/conftest.py:424-433` derives the `tooling` mark from that manifest by basename, so the module is collected and run on **every** `test` leg. **That is CI's connection-scale coverage**, at the module's own inline N=12/24 sweep, and it is what a replacement sentence should name.
+* `ci.yml:2093` additionally runs `pytest tests/test_connscale_postgres.py -v`, which is what gives the pool-acquire-wait wall real small-N coverage.
+
+**THE CENTRAL CLAIM SURVIVES: the `--connscale` sweep runs nowhere.** Needle `--connscale`, corpus `.github/` on `origin/main`: exit 1, no output. Positive control, needle `connscale`, same corpus: exit 0, **10 lines, all in `ci.yml`** -- `860, 864, 866, 870, 871, 1315, 1351, 1469, 2091, 2093`. That list is the tool's entire output rather than a selection from it, and the command that reproduces it is below. **An earlier draft of this row claimed to enumerate "every" occurrence and covered seven of the ten** (860, 864 and 2091 fell outside every range it gave), which is recorded here because a false completeness claim reads as measured.
+
+**`ci.yml:1315` DOES NOT RESERVE RUNNER HEADROOM FOR A SWEEP LEG, and an earlier draft of this row said it did.** The comment reads *"IF TIMING-SENSITIVE TESTS START FLAKING, 2 IS THE CONSERVATIVE RUNG -- it leaves 2 vCPU of headroom for the dispatcher and connscale assertions that measure elapsed time"*. Two things are wrong with reading that as a reservation. It is a **contingency not taken**: `pytest_workers` is `4` on all three legs (`ci.yml:1363-1365`), so no headroom is set aside today. And the headroom it describes is for **the connscale pytest assertions already in the suite**, which measure elapsed time, not for a separate sweep leg. `ci.yml:1351` is likewise a record of the `-n 8` trial that lost `connscale_smoke` on windows-2025, not a reservation. The retraction is written here rather than deleted because the argument it supported -- that CI has room set aside for the sweep -- reads as measured and is not.
+
+**THE FLAG EXISTS. Whether the CLI path is exercised is a separate question, and the answer is no.** `harness/__main__.py:152` declares `--connscale` and `:253` dispatches to `_run_connscale`, which calls `harness.load.connscale.runner.run_connscale` at `:467`. Needle `_run_connscale`, corpus `origin/main`: the only hits are in `harness/__main__.py` itself, so **no test drives the argparse path**. The **runner function** is exercised directly, by at least `tests/test_connscale_smoke.py:440`, `tests/test_connscale_ports.py:208`, `tests/test_connscale_batch.py:547` and `tests/test_connscale_postgres.py:83`. So this is a declared-and-untested CLI seam over a tested function -- not a broken flag, and not an exercised one either.
+
+**WHY IT IS WORTH A ROW RATHER THAN A SILENT EDIT.** The docstring's surrounding paragraph is careful and honest -- it states in terms which walls the small-N run does NOT regression-cover, and names the Postgres leg as what gives the acquire-wait wall real small-N coverage. A reader who trusts that carefulness has no reason to doubt the next clause. **An accurate paragraph is what makes the one false clause inside it dangerous.** **Do not "fix" this by deleting the clause** and leaving the coverage question unanswered; replace it with what CI does run, named above.
+
+**PROVENANCE.** Surfaced by **PR #656** (closed 2026-09-01, superseded by **PR #729**). The diagnosis outlives the pull request; the remedy that PR proposed is not what is wanted here. Its sibling finding -- the final sample taken after stop and drain, while several sites call the window in-hold -- is filed as **#1420**. An earlier draft of this row said that sibling *"belongs to #1211 as an amendment rather than a new number"*; **that reasoning is withdrawn**, and the reasons are recorded in #1420 rather than restated here.
+
+**How to re-measure, and print the needle beside every zero.** A bare zero is indistinguishable from a search that never ran:
 
 ```
-git grep -c -e '--connscale' origin/main -- .github/    # expect exit 1, no match
-git grep -c -e 'connscale'   origin/main -- .github/    # positive control, expect exit 0
+git grep -n -e '--connscale' origin/main -- .github/                    # expect exit 1, no output
+git grep -n -e 'connscale'   origin/main -- .github/                    # positive control: exit 0, 10 lines, all ci.yml
+git grep -n -e 'connscale'   origin/main -- tests/tooling_manifest.txt  # expect exit 1: the module is NOT partitioned out
+git grep -c -e 'tests/'      origin/main -- tests/tooling_manifest.txt  # positive control for the line above: exit 0, 135
 ```
+
+**Related:** [#1420](#1420-the-connscale-final-sample-is-taken-after-stop-and-drain-while-three-sites-call-it-in-hold) is the sibling finding from the same pull request. [#1211](#1211-empty_claims_per_msg-is-not-contention-immune-the-ratio-form-excursions-past-its-own-slo-band-on-a-hosted-runner) is the single home for the empty-claims harvest -- read it there.
+
+## 1420. the connscale final sample is taken after stop and drain while three sites call it in-hold
+
+> 🔢 **Filed 2026-09-01 - not started.** `harness/load/connscale/runner.py` appends each sweep step's FINAL engine sample **after** the driver has stopped, the pipeline has drained and a settle has elapsed: `await driver.stop(_STOP_GRACE)` at `:450`, `await poller.await_drain(...)` at `:451`, `await asyncio.sleep(_SETTLE)` at `:454` with `_SETTLE = 0.5` at `:92`, then `samples.append(final)` at `:474`. `_empty_claim_rates` reads `samples[0]` and `samples[-1]` (`:1148`), so the window every empty-claim rate is computed over **ends at that post-drain sample**. Four source sites and one test docstring describe that window as *"first to last in-hold samples"*. **The last sample is not in-hold, so the described window and the computed window are not the same window.**
+> Verdict: build
+> Closing-act: code
+
+**Cluster:** Developer Experience & CI. **Priority:** P3. **Verdict:** build.
+**Severity:** no engine effect, no PHI axis, **no deployment axis (sec. 0)** -- a measurement instrument in the test harness, not shipped engine behaviour.
+
+**THE MECHANISM, in the order the code runs it.** All line numbers are `harness/load/connscale/runner.py` on `origin/main` unless named otherwise:
+
+1. `:441` `sampler_stop.set()` stops the in-hold sampler. At this point `samples` holds only in-hold readings, appended by `_sample_loop` (started at `:421`).
+2. `:450` `await driver.stop(_STOP_GRACE)` -- stop offering, flush the send queue, grace the in-flight ACKs. `_STOP_GRACE = 5.0` at `:91`.
+3. `:451` `drain_seconds = await poller.await_drain(timeout=profile.drain_timeout_s, interval=profile.poll_interval_s)` -- wait for the pipeline to empty.
+4. `:454` `await asyncio.sleep(_SETTLE)`, with `_SETTLE = 0.5` at `:92` and its own comment: *"let final ACKs/arrivals settle before the truly-final engine sample"*.
+5. One more engine sample -- `sample_until_reconciled(...)` at `:462`, or `poller.sample_once()` at `:472` when the drain already timed out -- appended at `:474`.
+
+So `samples[-1].elapsed_s - samples[0].elapsed_s` spans the hold **plus** the stop grace, the whole drain and the settle. Under the shipped profile's own knobs that tail is bounded by 5.0 s plus `drain_timeout_s = 30.0` plus 0.5 s, against `hold_seconds = 3.0` (`harness/load/profiles/connscale-smoke.toml:31,35`). **The tail is not a rounding error against the hold**, and the same ordering holds for the inline profile the suite runs.
+
+**WHY IT MATTERS FOR THE METRIC, and what is NOT claimed.** Through that tail the engine keeps polling an emptying queue, so `empty_claims` can keep rising while `read` stops. `_empty_claims_per_msg` (`:1158`) is the ratio of two rates taken over that span. **Its docstring's algebra is not disputed here:** the span does cancel, exactly as `:1161` says. What does not cancel is that both deltas now cover a regime the metric does not intend -- an idle drain contributes empty claims and no messages absorbed. **NO EFFECT SIZE IS CLAIMED.** Establishing one means one run recorded with the final sample included and excluded, per `(sweep_mode, count)` cell, and that measurement is the work this row asks for. Until it exists the defect is that the code and its five descriptions disagree, which is provable from the source alone.
+
+**THE SITES THAT CALL THE WINDOW IN-HOLD. Scope stated because the count depends on it:** needle `in-hold`, corpus `harness/load/connscale/` plus `tests/test_connscale_empty_claims_per_msg.py`, on `origin/main`. Five hits, all five listed:
+
+* `harness/load/connscale/report.py:119` -- *"over the same first->last in-hold window as the rates above"*.
+* `harness/load/connscale/runner.py:917` -- *"are delta/span over the same first->last in-hold samples"*.
+* `harness/load/connscale/runner.py:1145` -- *"from the FIRST to LAST in-hold sample"*.
+* `harness/load/connscale/runner.py:1161` -- *"Both inputs are delta/span over the SAME first->last in-hold samples"*.
+* `tests/test_connscale_empty_claims_per_msg.py:12` -- the same sentence, in the module docstring.
+
+**The heading says "three sites" and that number is scope-dependent.** Three is the count in `runner.py` alone. The corpus above gives five. Widen it to the whole tree and `docs/BACKLOG.md:11032` and `docs/archive/backlog/BACKLOG-CLOSED.md:6981` quote the sentence as well, as history rather than as live description. **State the scope with any count you publish here.**
+
+**THIS IS NOT #1211, AND IT MUST NOT BE FILED THERE.** #1211 attacks the CONTENTION-IMMUNITY conclusion of the same docstring, from recorded hosted-runner excursions; it never examines which samples the window spans. Different defect, different mechanism, different fix. #1211 is also marked **SUPERSEDED 2026-08-31**, so an amendment parked there would likely be closed with its parent. An earlier draft of #1419 said this finding *"belongs to #1211 as an amendment rather than a new number"*; that reasoning is withdrawn and #1419 now points here.
+
+**CANDIDATE FIXES, not yet decided.**
+
+* **(a) Narrow the rate window.** Exclude the post-drain sample from `_empty_claim_rates` and `_throughput_rates` while keeping it for the no-loss reconcile, which is what it was added for -- `_build_record` would have to separate the two purposes. **This changes what the number MEANS**, so readings taken before and after are not comparable, the same caution ADR 0179 records for `handles_peak`.
+* **(b) Keep the sample and correct all five sentences** to say what the window actually spans. A docs edit; it leaves the tail inside the metric.
+
+**Do not do (b) and describe it as (a).** Either the tail is in the number or it is not, and the sentences must match whichever is chosen.
+
+**How to re-measure:**
+
+```
+git grep -n -e 'in-hold' origin/main -- harness/load/connscale/ tests/test_connscale_empty_claims_per_msg.py
+git show origin/main:harness/load/connscale/runner.py | sed -n '441,475p'   # the ordering, stop -> drain -> settle -> append
+git show origin/main:harness/load/connscale/runner.py | sed -n '1143,1156p' # samples[0] and samples[-1]
+```
+
+**Related:** [#1419](#1419-two-records-on-main-disagree-about-whether-ci-runs-the-connscale-sweep-and-the-test-docstring-is-the-wrong-one) is the sibling finding from PR #656. [#1211](#1211-empty_claims_per_msg-is-not-contention-immune-the-ratio-form-excursions-past-its-own-slo-band-on-a-hosted-runner) is the single home for the empty-claims harvest and for the contention-immunity retraction -- read it there, and do not restate it.
