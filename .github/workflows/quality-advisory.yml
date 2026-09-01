@@ -277,8 +277,16 @@ jobs:
     # SIZED FROM A MEASUREMENT, NOT FROM A GUESS (BACKLOG #1409). This cap was 20 from the
     # 2026-07-26 publish snapshot until 2026-09-01, and it was never edited. The SUITE grew into
     # it: the job took 9.7 minutes on 2026-07-26, 14.8 on 2026-08-06, and 19m36s on its LAST GREEN
-    # run (job 97249962177, 2026-08-23 15:18 CDT) -- 24 seconds of margin. Every PR run after that
-    # was killed at the cap, with `The operation was canceled` and no diff-cover verdict. 714
+    # run (job 97249962177, 2026-08-23 15:18 CDT) -- 24 seconds of margin.
+    #
+    # 2026-08-23 IS THE LAST-GREEN BOUNDARY, NOT THE FIRST-KILL ONE, and the difference matters for
+    # anyone reconstructing this. The first cap kill was 2026-08-08 (job 93153178205, cancelled at
+    # 20m16s), a fortnight earlier. The job then sat ON the boundary, sometimes finishing and
+    # sometimes not, until 2026-08-23 was simply the last time it made it. A cap is not crossed
+    # cleanly; it is crossed intermittently first, and that window is the one where the signal is
+    # already unreliable while still looking occasionally healthy.
+    #
+    # After 2026-08-23 the kill was consistent: `The operation was canceled` and no verdict. 714
     # pull_request runs of this workflow were created between that green job and the fix; in a
     # 30-run sample, 28 of 28 COMPLETED coverage jobs were cancelled and none succeeded. (An
     # earlier draft said "over 700 of them across 8 days" as though every run were a confirmed
@@ -309,13 +317,18 @@ jobs:
     #   "no coverage run has ever finished" -- FALSE, and it contradicted this same comment two
     #     paragraphs up. Job 97249962177, named above as the last green run, reached [100%] with
     #     `13046 passed, 1380 skipped in 1130.96s (0:18:50)`. A completed run existed all along.
-    #   "the honest measured floor is 21m35s for the UNNARROWED suite" -- WRONG, and wrong in the
-    #     UNSAFE direction. 21m35s is 19m40s/0.91, which assumes the last 9 percent costs the same
-    #     per test as the first 91. That run's own curve refutes it: in job 97249962177, 91 percent
-    #     was reached at 602.9s of a 1110.3s span, so the final 9 percent took 507.3s -- 45 percent
-    #     of the run. Carried onto the grown suite the unnarrowed figure is roughly 33 minutes,
-    #     ABOVE this cap. The narrowing is what brings it to 14m33s; the bigger box alone would not
-    #     have been enough, which is the opposite of what the 21m35s figure implied.
+    #   "the honest measured floor is 21m35s for the UNNARROWED suite" -- WRONG, wrong in the
+    #     UNSAFE direction, and not a measurement at all. 21m35s is 19m40s/0.91, which assumes the
+    #     last 9 percent costs what the first 91 did. pytest's percentage counts TESTS, not time,
+    #     and the tail is 15 to 26 times more expensive per point than the average, so that
+    #     division is invalid. Two independent extrapolations, by different routes, both land well
+    #     above it: applying the observed tail rate (0.35-0.45 s/test, from the four killed jobs'
+    #     own logs) to the unreached tests gives 26 to 28 minutes, and scaling from the last green
+    #     run's curve (91 percent at 602.9s of a 1110.3s span, so the final 9 percent took 45
+    #     percent of the run) gives about 33. Call it 26 to 33 MINUTES, extrapolated -- and note
+    #     that the whole range sits at or above this 30-minute cap. So a bigger box alone would NOT
+    #     have fixed this. The narrowing is what brings it to a measured 14m33s, which is the
+    #     opposite of what 21m35s implied.
     #   "ESTIMATED 18 to 20 minutes for the narrowed serial run" -- superseded by the 14m33s above.
     #
     # NEXT LEVER IF IT DRIFTS AGAIN: pytest-xdist. ci.yml's engine leg runs `-n 4 --dist loadfile`
@@ -395,12 +408,16 @@ jobs:
         # WHY DESELECTING IT REMOVES NO SIGNAL: the report is scoped to `--cov=messagefoundry`, and
         # ZERO of the 132 manifest files import that package. Measured with the repo's OWN
         # instrument, the _ENGINE_IMPORT regex in tests/test_tooling_partition.py, against a
-        # positive control of 508 files under tests/ that the same pattern DOES match -- so the
-        # zero is a real absence and not a broken pattern. A test that never imports the measured
+        # positive control of 507 files under tests/ that DO import it -- so the zero is a real
+        # absence and not a broken pattern. A test that never imports the measured
         # package cannot contribute a covered line through its OWN test bodies. The tier is the
-        # run's hard tail: the suite reaches 89 percent at 15.17 minutes, then the next two points
-        # cost 2.83 minutes (job 99712135527, progress lines at 910.4s and 1080.4s). An earlier
-        # draft said 3.4 minutes for that gap; 2.83 is what the run it cites actually shows.
+        # run's hard tail, and the honest form of that is a RANGE, not one job's pair of numbers:
+        # across the four killed jobs the suite reaches 89 percent at 14.1 to 15.6 minutes, and the
+        # next two percentage points then cost 3.5 to 4.7 minutes. An earlier draft said "89
+        # percent in 15.2 minutes, then the next two points cost 3.4 minutes", which is one job's
+        # figures presented as the suite's -- and even for that job the second number is 3.47.
+        # Note the percentages count TESTS, not time, which is exactly why the tail is so much
+        # more expensive per point than the average.
         #
         # ONE QUALIFICATION, because "costs this gate NOTHING" is stronger than the grep supports.
         # The zero counts DIRECT imports. Reach is not the same thing: tests/test_dast_claims.py is
@@ -411,11 +428,22 @@ jobs:
         # plainly worth it -- 14m33s against a job that produced no number at all -- but the honest
         # claim is "costs this gate almost nothing", not "nothing".
         #
-        # THAT CONTROL WAS FIRST WRITTEN AS 510, and the correction is recorded rather than quietly
-        # applied. 510 is the same pattern with the trailing word boundary dropped, which also
-        # matches messagefoundry_webconsole -- a DIFFERENT package. The zero holds under BOTH
-        # spellings, so the conclusion never depended on it; only the control's own size was
-        # overstated, by two.
+        # THAT CONTROL WENT 510 -> 508 -> 507, AND THE LAST STEP IS THE INTERESTING ONE.
+        # 510 is the same regex with the trailing word boundary dropped, so it also matched
+        # messagefoundry_webconsole -- a DIFFERENT package. Adding \b gives 508. But 508 is still
+        # one too many: tests/test_lifespan_startup_unwinds.py matches at lines 48-50, and those
+        # lines sit INSIDE a 1256-character string literal beginning at line 42, which holds
+        # child-process source written to a temp file. It is not an import this process executes.
+        # An AST census (ast.Import / ast.ImportFrom over all 729 .py files under tests/, 0
+        # unparseable) returns 507, and the regex-minus-AST difference is exactly that one file,
+        # with no files the regex missed in the other direction.
+        #
+        # WHY THIS IS RECORDED AND NOT JUST FIXED: 508 was reported by two separate verification
+        # passes that agreed with each other, and both were wrong the same way, because both ran
+        # the SAME line-anchored regex. Agreement between runs of one instrument is one
+        # measurement, not two. Only a different METHOD -- parsing instead of matching -- could see
+        # a string literal. The ZERO this controls holds under every spelling tried, so no
+        # conclusion moved; the control's own size did, twice.
         #
         # THE WEB CONSOLE TIER STAYS, and that is the one place this job must NOT copy ci.yml.
         # Both ci.yml legs carry `--ignore-glob='*messagefoundry-webconsole*'` (lines 824 and 1134)
