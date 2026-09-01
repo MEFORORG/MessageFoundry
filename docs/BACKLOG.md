@@ -18664,3 +18664,52 @@ Within `scripts/coord` and `scripts/hooks` specifically, four files are caught b
 **Nearest existing mechanism:** the floor is already computed and recorded on every run, pass or fail, into the readings artifact and the step summary, and `harness/load/profiles/connscale-smoke.toml` already carries the `[slo]` table an armed check would key off. So the build is a threshold plus a negative control on an existing seam. **The harvest is the cost, and criterion 1 is most of it.**
 
 **Related:** [#1211](#1211-empty_claims_per_msg-is-not-contention-immune-the-ratio-form-excursions-past-its-own-slo-band-on-a-hosted-runner) is the single home for the harvest table, the five measured defects and the owner ruling -- read it there, and do not restate the table here. #1357 covers the FD arm of the test #1211 split. #1366's design premise that two metrics carry a band is now one, corrected in place there. #1414 is the allocation-transfer path this item's number history is an instance of.
+
+## 1416. review-gate reads a stale label payload, so a queued run can report success unread
+
+> 🔢 **Filed 2026-09-01 - not started.** `.github/workflows/review-gate.yml` line 83 reads the label set from the **event payload** (`join(github.event.pull_request.labels.*.name, ',')`), which is frozen when the event fires. Branch protection honours the newest check-run by **execution** time while the gate's semantics are fixed at **creation** time. Enough run-queue latency inverts them, and a stale success overwrites a correct failure -- so a pull request can carry `a reviewer has read this` = SUCCESS with no `reviewed` label and nobody having read it. Reproduced on PR #724; **nothing is exposed at the time of filing**.
+> Verdict: build
+> Closing-act: code
+
+**Cluster:** Developer Experience & CI. **Priority:** P2. **Verdict:** build.
+**Severity:** no engine effect, no PHI axis, **no deployment axis (sec. 0)** -- this is merge governance, not shipped behaviour. The cost is that the only control separating "green" from "green and read" can report satisfied when it is not, and it is a **required** context (14 of 14 on the live server), so nothing downstream re-checks it.
+
+**THE MECHANISM IS ONE LINE.** `review-gate.yml:83`:
+
+```
+LABELS: ${{ join(github.event.pull_request.labels.*.name, ',') }}
+```
+
+That is the payload snapshot, not a live read. Lines 94-100 gate on it. **The file's own comment at lines 86-89 proves the authors knew payloads go stale** -- they special-case `synchronize` for exactly this reason, treating it as unreviewed by definition rather than reading a value that is already wrong. The `labeled`/`unlabeled` race is the same class and is not covered.
+
+**THE RACE, MEASURED ON PR #724 ON 2026-09-01.** All times UTC:
+
+```
+13:16:57  run A created (synchronize)
+13:24:22  `reviewed` removed -> run B created; its payload STILL CONTAINS `reviewed`
+13:43:11  run A EXECUTES 26 minutes late: strips the label, reports FAILURE
+13:43:15  bot removes `reviewed`
+13:43:46  run B EXECUTES: reads its 13:24 payload, reports SUCCESS
+```
+
+Result: context SUCCESS, label absent, for about ten minutes until a re-label at 13:54:03Z closed it. **What prevented harm was `strict=true`** -- #724 was BEHIND and could not merge. That is not a control anyone chose for this purpose, and a PR in the same state that is up to date would satisfy the gate unread.
+
+**THE DISCRIMINATOR IS A COMPARISON, NOT A SIGNAL.** Reading the context instead of the label does **not** work: the context inherits the label's staleness through the same snapshot. Both go stale, by different routes, at different times. The test that holds:
+
+> newest check-run for `a reviewer has read this` -> its **originating run's `created_at`** -> compare against the pull request's most recent `reviewed` labelled/unlabelled event. Created **before** that event means the verdict is stale, whatever it says.
+
+**`created_at`, NOT `started_at`, AND THE DIFFERENCE IS THE WHOLE BUG.** On #724, run `33513178313` was created at 13:24:25Z and its check-run started at 13:43:46Z -- a nineteen-minute gap. Against the 13:43:15Z removal: `started_at` says fresh, which is wrong; `created_at` says stale, which is right. The payload freezes at creation, so creation is the only honest field.
+
+**SIGN CONVENTION -- ONLY A STALE SUCCESS IS DANGEROUS.** A stale *failure* is conservative and blocks correctly. PR #575 currently shows a run created 33 seconds **before** its last `reviewed` event, which looks alarming and is not: its conclusion is `failure`. A detector must gate on `conclusion == success`, and a margin listing that omits the sign will mislead its own author -- that happened during this investigation.
+
+**BOTH CONTROLS RUN, because a detector reporting zero is worthless untested.** POSITIVE: #724 replayed at its 13:24:25-versus-13:43:15 state, known bad -- fires. NEGATIVE: #724 after the 13:54:03Z re-label, known good -- clean. LIVE: every open pull request -- zero dangerous states. Two sessions built the detector separately and agree; **one under-fired by construction and the other over-fired on first draft**, and neither defect was visible from a clean output.
+
+**THE MARGINS ARE THIN AND THAT IS THE ARGUMENT FOR FIXING IT RATHER THAN WATCHING IT.** Of the pull requests carrying a live gate result, several pass the freshness test by two or three seconds between the label event and the run's creation -- #699 at 13:04:33 against 13:04:31, #702 at 13:04:40 against 13:04:38, #723 by one second. A few seconds of run-creation delay during a label change flips any of them.
+
+**SIBLING CONDITION FOUND BY THE SAME SCAN, and it is not this bug.** Eight open pull requests report **no check-run at all** for this context on their current head -- #700, #667, #670, #686, #609, #613, #530, #531. Absent, not failed. A required context that never reports blocks a merge exactly as hard as a red one, so on those, applying the label is not sufficient; the check has to run. Worth its own row if it proves to be more than stale heads.
+
+**REPRODUCING ANY OF THIS NEEDS `per_page=100`.** These heads carry 39 to 48 check-runs and the API pages at 30, reporting the true figure only in `total_count`. An unpaginated query silently omits the gate run and its absence is indistinguishable from it never having run -- that produced a wrong count during this investigation.
+
+**Candidate fixes, not yet decided:** read the labels live at run time (`gh pr view --json labels`) instead of from the payload; or have the job refuse to report when its own `created_at` predates the head's most recent `reviewed` event. The second is fail-closed and matches the existing `synchronize` treatment.
+
+**Credit:** the `created_at` discriminator was proposed by the diff-coverage-report session after its own first rule failed; the race was reproduced and the controls validated by the lander-5eaa4e session; the absent-context arm and the pagination defect came from this session's scan.
