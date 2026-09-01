@@ -89,31 +89,43 @@ def test_herd_is_reported_separately_from_idle_poll() -> None:
 
 
 def test_monotonic_slo_tolerates_jitter_but_catches_regression() -> None:
-    # mf-ci-test-flakes: a strict >= flaked on windows-2022 when empty_claims/sec dipped ~10%
-    # (398.7 < prior 442.9). The loose SLO now allows a noise band (default 25%): jitter passes, a real
-    # collapse still fails.
-    def _empty(rs: list[ConnScaleRecord]) -> bool:
-        return _monotonic_slo("empty_claims_monotonic", rs, lambda r: r.empty_claims_per_s).ok
+    # The subject is the band arithmetic in `_monotonic_slo`, driven through the ONLY caller it still
+    # has: `fd_count_monotonic` over `fd_count_peak`. BACKLOG #1211 retired the empty-claims caller.
+    # This test is REPOINTED, not retuned: the three verdicts below are the three it already asserted,
+    # so a red here says the FD path moved rather than that the band was resized.
+    #
+    # WHERE THE SHAPE COMES FROM, AND IT IS NOT FROM FD. The 25 percent tolerance was set from an
+    # empty-claims/sec flake on windows-2022 (mf-ci-test-flakes: a strict `>=` failed on 398.7 against
+    # a prior 442.9, a 9.98 percent dip). The FD ratio's own distribution has never been harvested. So
+    # these readings probe the band's arithmetic at a known dip; they are not FD evidence and must not
+    # be read as grounds for retuning `_MONOTONIC_TOLERANCE`.
+    #
+    # `fd_count_peak` is a descriptor COUNT, so that recorded dip is restated in whole descriptors,
+    # rounded so it cannot come out smaller than the one on record: 442.9 -> 443 and 398.7 -> 398 give
+    # a 10.16 percent dip, which makes the "jitter passes" assertion marginally harder to satisfy,
+    # never easier. The other two pairs were already integral and are unchanged.
+    def _fd(rs: list[ConnScaleRecord]) -> bool:
+        return _monotonic_slo("fd_count_monotonic", rs, lambda r: r.fd_count_peak).ok
 
-    # the observed ~10% dip is jitter -> ok
-    assert _empty(
+    # the recorded ~10% dip is jitter -> ok
+    assert _fd(
         [
-            _record(mode="fixed_aggregate", count=12, empty_per_s=442.9),
-            _record(mode="fixed_aggregate", count=24, empty_per_s=398.7),
+            _record(mode="fixed_aggregate", count=12, fd=443),
+            _record(mode="fixed_aggregate", count=24, fd=398),
         ]
     )
-    # a genuine collapse (halving, well past the band) -> fail
-    assert not _empty(
+    # a genuine collapse (to 0.375 of the prior, well past the band) -> fail
+    assert not _fd(
         [
-            _record(mode="fixed_aggregate", count=12, empty_per_s=400.0),
-            _record(mode="fixed_aggregate", count=24, empty_per_s=150.0),
+            _record(mode="fixed_aggregate", count=12, fd=400),
+            _record(mode="fixed_aggregate", count=24, fd=150),
         ]
     )
     # a clean increase -> ok
-    assert _empty(
+    assert _fd(
         [
-            _record(mode="fixed_per_conn", count=12, empty_per_s=100.0),
-            _record(mode="fixed_per_conn", count=24, empty_per_s=200.0),
+            _record(mode="fixed_per_conn", count=12, fd=100),
+            _record(mode="fixed_per_conn", count=24, fd=200),
         ]
     )
 
