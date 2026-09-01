@@ -18706,6 +18706,16 @@ The stale SUCCESS overwrote the correct FAILURE. **For 10 minutes -- 13:43:46Z t
 3. compare against the pull request's latest `reviewed` labeled/unlabeled event
 4. **created before the last `reviewed` change means the verdict is stale, whatever it says**
 
+**THAT IS NECESSARY AND NOT SUFFICIENT, AND THE FIRST DRAFT OF THIS ITEM SHIPPED IT AS SUFFICIENT.** The comparison above catches a verdict decided before a label moved. It does **not** catch a label applied before the head existed. Both are stale-label states and only one was written down. **A SECOND COMPARISON IS REQUIRED:**
+
+5. **the last `reviewed` event must post-date the HEAD COMMIT.** A label older than the commit it sits on never covered that head, whatever the gate says.
+
+**Found by running the rule against this author's own pull request, [#723](https://github.com/MEFORORG/MessageFoundry/pull/723), where it returned the wrong answer.** Measured: label event `03:22:44Z`, head commit `15:30:17Z`, deciding run created `15:30:44Z`. Rule (4) compares 15:30:44 against 03:22:44, finds the run newer, and reports **fresh** -- while the label predates the head it is sitting on by twelve hours and cannot have covered it. The strip had not yet fired.
+
+**So a reader applying only (4) gets a false clean on the commonest shape of all**: label a pull request, push to it, and read the state before the synchronize strip lands. That is the routine case, not the exotic one -- rule (4) was derived from the payload race, which is rarer.
+
+
+
 **SIGN CONVENTION, AND IT IS LOAD-BEARING: only a stale SUCCESS is dangerous.** A stale FAILURE is conservative and blocks correctly. Two sessions independently misread a negative margin on PRs 715 and 575 as "a valid label not being honoured" before checking that neither carried the label at all.
 
 **MEASURED STATE AT FILING, with both controls, because a detector that has never fired is indistinguishable from a clean repository:**
