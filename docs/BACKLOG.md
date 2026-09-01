@@ -18706,23 +18706,32 @@ reconciles prose against the file. It never reads the server. Every mention of t
 that suite is a comment or a failure message. So the file and the server can drift without limit and
 every required check stays green, which is precisely the state the file was written to end.
 
-**Closing act, in this order, because the file mirrors the server and a line added first is the lie it
-exists to prevent:**
+**MOST OF THIS CLOSING ACT IS ALREADY BUILT.** PR #718 is stacked on the branch that carries this
+item and closes steps 2 through 5. Read it before doing any of them again. **The order below still
+governs -- the file mirrors the server, so a line added to the file first is the lie it exists to
+prevent -- and the standing instruction it carries is DO NOT SIMPLY TRANSCRIBE THE SERVER**, which is
+the sentence PR #718 quotes when it explains backing out a transcription. It stays here for that
+reason as much as its own.
 
 1. **The CodeQL half is DONE and was never this item's to carry.** The owner removed both contexts
-   from protection on 2026-09-01. The file's `DELIBERATELY NOT REQUIRED` entry is correct as written
-   and must not be edited. That question was already filed as #1384 with PR #700 open against it,
-   which this item duplicated for four review passes because it asserted the drift was unclaimed
-   without checking the open pull requests.
-2. Add `a reviewer has read this` to the file, with its reasoning, and record the CodeQL decision.
-3. Correct the `enforce_admins` line to `TRUE`. Do not say the relaxation is gone: the one `push_guard.py` names at line 82, the `DELETE` on the protection endpoint, still works. **In this item "escape hatch" means that call and nothing else.**
-4. Correct every statement of the value **across all six files**, not only the four lines this item
+   from protection on 2026-09-01, which is why *do not simply transcribe the server* was the right
+   instruction: a session that had transcribed the 16 would now be wrong twice. The file's
+   `DELIBERATELY NOT REQUIRED` entry is correct as written and **must not be edited**. That question
+   was already filed as #1384 with PR #700 open against it, which this item duplicated for four
+   review passes because it asserted the drift was unclaimed without checking the open pull requests.
+   **PR #700 and PR #718 both edit `.github/required-contexts.txt` and disagree about the CodeQL
+   lines; #700's premise -- "record CodeQL as required, which it already was" -- is void as of
+   2026-09-01.** Whoever lands second must reconcile, and that is not settled here.
+2. **DONE in PR #718:** add `a reviewer has read this` to the file, with its reasoning. Do not also
+   record a CodeQL decision; per step 1 that entry stays untouched.
+3. **DONE in PR #718:** correct the `enforce_admins` line to `TRUE`. Do not say the relaxation is gone: the one `push_guard.py` names at line 82, the `DELETE` on the protection endpoint, still works. **In this item "escape hatch" means that call and nothing else.**
+4. **PARTLY DONE in PR #718**, which fixes `push_guard.py` and `required-contexts.txt` and names the rest as a deliberate scope choice. Correct every statement of the value **across all six files**, not only the four lines this item
    names in `push_guard.py`. **Re-grep the whole tree before declaring it done**, because this item
    has undercounted twice. Line 300 is printed to an operator, line 12 of `tests/test_push_guard.py`
    is the suite's own record, and #1056 needs a note rather than an edit, since its proposal is now
    satisfied and that is a separate decision. Fixing only `required-contexts.txt` leaves the wrong
    value in the place an operator actually reads it.
-5. Update the count pinned in `tests/test_required_contexts.py`, in the same pull request.
+5. **DONE in PR #718:** update the count pinned in `tests/test_required_contexts.py`, in the same pull request. It lands 13 to 14, which is right for a 14-context server.
 
 **What this item does NOT propose.** It does not propose a test that calls the GitHub API. A required
 test that reaches the network fails on a fork PR and on any run without a token, which is the
