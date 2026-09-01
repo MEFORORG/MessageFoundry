@@ -18722,6 +18722,14 @@ The stale SUCCESS overwrote the correct FAILURE. **For 10 minutes -- 13:43:46Z t
 
 **TWO INSTRUMENT DEFECTS FOUND WHILE BUILDING THE DETECTOR, recorded because both produced clean-looking output.** A first draft compared against **any** label event, so a `ci-red` change flagged four pull requests that were fine -- narrowed to `reviewed` events only. And a parallel scan used the **unpaginated** check-runs endpoint, which returns 30 where heads here carry 39 to 48, so it silently could not see a third of its own corpus and reported zero. Maximum `total_count` observed is 48; `per_page=100` covers it today and is not a permanent guarantee.
 
+**HAS ANYTHING ALREADY MERGED THROUGH IT? NO -- SCANNED, NOT ASSUMED.** The live scan above covers only OPEN pull requests, which is a real limit and was flagged by a reviewer rather than noticed by the author. Answered by replaying the same comparison over the **last 25 merged** pull requests:
+
+* **Eight merged carrying a gate verdict** -- 702, 703, 713, 714, 716, 722, 725, 729 -- and in every one the deciding run was created **after** the last `reviewed` event. All fresh. **Margins of 2 to 3 seconds**, which is the same uncomfortable thinness the open set shows.
+* **Sixteen have no gate run at all**, all merged 2026-08-30 or earlier, i.e. before this workflow existed.
+* **One anomaly, PR 712:** gate `failure` at 17:33:18Z, merged at 20:26:24Z with no `reviewed` label. The likely explanation is that the context was **not yet required** at that moment -- #1413 dates the arming to the afternoon of 2026-08-31, and PR 713 merged with a label at 23:31Z the same day. **This is NOT provable from the API**: GitHub exposes no history for branch-protection settings, so the required-set at a past instant cannot be read back. Recorded as unresolved rather than explained away.
+
+**That last point is a gap in the repository's own auditability and is worth its own consideration:** `.github/required-contexts.txt` exists precisely because the live set is not historically queryable, but it records only the present. No artifact anywhere answers "what was required when this merged".
+
 **Nearest existing mechanism:** `tests/test_merge_gate_controls.py` already pins this workflow's trigger list, including that dropping `labeled` reddened nothing before that test existed. A staleness assertion belongs beside it.
 
 **Related:** #1413 covers the absence of any trigger that notifies a reviewer; this is the complementary defect in what the gate *reports* once a label exists.
