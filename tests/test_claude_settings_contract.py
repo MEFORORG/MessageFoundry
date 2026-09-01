@@ -25,8 +25,15 @@ an instrument.
     and match at any depth; `Read(./.env)` matches `<cwd>/.env` and nothing below it. The `./` form
     looks equivalent and is strictly narrower, which is the worst combination for a control whose
     whole job is to be broad.
+  * **A matcher that reads as a regex may not be one.** Claude Code evaluates a matcher whose
+    characters are only letters, digits, `_`, `-`, spaces, `,` and `|` as a list of EXACT tool
+    names. `Task|Agent|Workflow|spawn_task` therefore selects three tools and never the fourth,
+    because the real name is `mcp__ccd_session__spawn_task` and an exact-name list cannot see it.
+    The row looks like an alternation, behaves like an enumeration, and the hook simply never fires
+    on the tool it was written for (BACKLOG #1406).
 
-Neither is caught by JSON validity, by `pre-commit`, or by reading the diff. Both are caught here.
+None of the three is caught by JSON validity, by `pre-commit`, or by reading the diff. All three are
+caught here.
 
 The deny-list is also the only half of this file that auto mode cannot touch: permission deny rules
 are evaluated before the classifier, and unlike `allow` rules they are not gated on the workspace
@@ -36,6 +43,7 @@ trust dialog. That is why the pinned subset below is the deny rules and not the 
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 from typing import Any
 
@@ -93,6 +101,106 @@ def _unanchored_refs(settings: dict[str, Any]) -> list[str]:
 
 def _dot_anchored_denies(settings: dict[str, Any]) -> list[str]:
     return [r for r in settings["permissions"]["deny"] if "(./" in r]
+
+
+# ------------------------------------------------ does a matcher select the tools it appears to?
+
+# HOW CLAUDE CODE READS A MATCHER, TRANSCRIBED FROM THE HOOKS REFERENCE
+# (https://code.claude.com/docs/en/hooks.md, read against the 2.1.251 client):
+#
+#   "Matchers containing only letters, digits, `_`, `-`, spaces, `,`, and `|` are evaluated as
+#    exact string matches (or lists of exact strings separated by `|` or `,`). Matchers containing
+#    any other character (like `.`, `*`, `^`, `$`, etc.) are evaluated as JavaScript regular
+#    expressions."
+#   "Regex matching is unanchored search (uses `RegExp.prototype.test()`), not fullmatch."
+#   "All matching is case-sensitive."
+#
+# THE TRAP IS THAT THE TWO FORMS READ IDENTICALLY, AND ONLY ONE OF THEM IS WHAT REVIEW ASSUMES. An
+# author writing `A|B|C` means "any of these", which is what an exact list gives; the same author
+# writing `A|B|substring` means "any of these OR anything containing that", which it does not. The
+# miss is invisible from both ends: a matcher that selects nothing produces no error, no log line
+# and no output, so a hook that never fires and a hook that fired and had nothing to say are the
+# same observation.
+#
+# `re.search` stands in for `RegExp.prototype.test`. The two agree on every pattern this repo wires;
+# they part company on constructs neither form uses here (JS `$` never matches before a trailing
+# newline, Python's does), and a tool name contains no newline.
+_SIMPLE_MATCHER_CHARS = re.compile(r"^[A-Za-z0-9_\- ,|]*$")
+
+
+def matcher_selects(matcher: str, tool: str) -> bool:
+    """Would Claude Code run a handler wired under `matcher` for a tool call named `tool`?"""
+    if matcher in ("", "*"):
+        return True
+    if _SIMPLE_MATCHER_CHARS.match(matcher):
+        return tool in {name.strip() for name in re.split(r"[|,]", matcher) if name.strip()}
+    return re.search(matcher, tool) is not None
+
+
+_HOOK_SCRIPT = _ROOT / "scripts" / "hooks" / "usage-headroom-inject.ps1"
+
+# MCP tools reach a matcher FULLY QUALIFIED, as `mcp__<server>__<tool>`; the bare tool name never
+# appears. That prefix is the one fact here that lives outside this repo, so it is written down
+# once. The tool half is measured from the hook's own guard rather than repeated beside it -- the
+# whole point of this check is that the settings row and the guard cannot drift apart.
+_MCP_SPAWN_PREFIX = "mcp__ccd_session__"
+
+# Names one edit away from a name that MUST be selected. An alternation that lost its anchors takes
+# the first three, and a matcher that reached an ordinary tool would pay a process spawn on every
+# tool call in the session -- measured at 19.0 tool calls per turn on this repo's transcripts.
+_NEAR_MISS_TOOLS = ("TaskOutput", "AgentTool", "Workflows", "SubAgent", "TodoWrite", "Edit", "Bash")
+
+
+def _guarded_exact_names(script_text: str) -> list[str]:
+    """The tool names the hook's own `$SPAWN_TOOLS` guard accepts."""
+    block = re.search(r"\$SPAWN_TOOLS\s*=\s*@\(([^)]*)\)", script_text)
+    assert block, (
+        f"{_HOOK_SCRIPT.name} no longer declares $SPAWN_TOOLS, so this check has lost its subject. "
+        "Point it at whatever replaced the guard; do not delete it."
+    )
+    return re.findall(r'"([^"]+)"', block.group(1))
+
+
+def _guarded_wildcard_names(script_text: str) -> list[str]:
+    """The `-like "*x*"` substrings of the same guard, as the qualified names they were written for.
+
+    The guard says `*spawn_task*` because it expects a fully-qualified MCP name. A matcher has to
+    agree with that expectation, so the witness is built from the guard's own substring.
+    """
+    return [
+        _MCP_SPAWN_PREFIX + s for s in re.findall(r'-like\s+"\*([A-Za-z0-9_]+)\*"', script_text)
+    ]
+
+
+def _tools_the_hook_guards() -> list[str]:
+    """Every tool name the hook script itself would act on. Measured from it, never hand-listed."""
+    text = _HOOK_SCRIPT.read_text(encoding="utf-8")
+    return [*_guarded_exact_names(text), *_guarded_wildcard_names(text)]
+
+
+def _matchers_wiring(settings: dict[str, Any], script: str) -> list[str]:
+    """Every matcher whose handler group runs `script`.
+
+    An absent `matcher` key is the documented match-all, so it is read as one rather than as a
+    miss: this detector hunts a matcher that is too narrow, and must not invent a finding against
+    one that is not there at all.
+    """
+    return [
+        group.get("matcher", "")
+        for groups in settings.get("hooks", {}).values()
+        for group in groups
+        if any(script in ref for h in group.get("hooks", []) for ref in _repo_script_refs(h))
+    ]
+
+
+def _spawn_tools_the_matcher_misses(settings: dict[str, Any]) -> list[str]:
+    """Tools the hook guards against that no matcher wiring the hook would ever select."""
+    matchers = _matchers_wiring(settings, _HOOK_SCRIPT.name)
+    return [
+        tool
+        for tool in _tools_the_hook_guards()
+        if not any(matcher_selects(m, tool) for m in matchers)
+    ]
 
 
 # --------------------------------------------------------- is every hook script wired AT ALL?
@@ -215,6 +323,63 @@ def test_every_hook_script_actually_exists() -> None:
     )
 
 
+@pytest.mark.parametrize(
+    ("matcher", "tool", "selected", "rule"),
+    [
+        ("Edit|Write", "Edit", True, "an exact name in a `|` list"),
+        ("Edit|Write", "NotebookEdit", False, "an exact list is not a substring search"),
+        ("Edit.*", "NotebookEdit", True, "a regex matcher is an UNANCHORED search"),
+        ("^Edit$", "NotebookEdit", False, "anchors are what make a regex exact"),
+        ("mcp__memory__.*", "mcp__memory__create_entities", True, "the documented MCP form"),
+        ("Bash", "bash", False, "matching is case-sensitive"),
+        ("*", "AnythingAtAll", True, "the documented match-all"),
+    ],
+)
+def test_the_matcher_evaluator_agrees_with_the_documented_rule(
+    matcher: str, tool: str, selected: bool, rule: str
+) -> None:
+    """The instrument gets its own control, against the hooks reference's own worked examples.
+
+    Every assertion below rests on `matcher_selects` being right about the exact-list/regex split
+    and about search-versus-fullmatch. An evaluator that quietly agreed with the author's intent
+    rather than with the client would pass this module and pin nothing, which is the same shape of
+    defect it exists to catch one layer down.
+    """
+    assert matcher_selects(matcher, tool) is selected, (
+        f"{matcher!r} against {tool!r}: expected {selected} because {rule}"
+    )
+
+
+def test_the_headroom_matcher_selects_every_tool_the_hook_guards() -> None:
+    """The settings row and the hook's own guard must name the same set of tools.
+
+    They are two halves of one control written in two languages, and only one of them is exercised
+    by driving the script. `tests/test_usage_headroom_inject.py` pipes a tool name straight into the
+    hook, so it proves the GUARD handles the qualified MCP name -- and says nothing about whether
+    the matcher ever delivers that call. That gap shipped a green suite over a hook that could not
+    fire on one of the four tools it names (BACKLOG #1406).
+    """
+    missed = _spawn_tools_the_matcher_misses(_load())
+    assert not missed, (
+        f"the hook guards {len(missed)} tool(s) that its matcher never selects: {missed}.\n"
+        "The hook will not run on them at all. A matcher of only letters, digits, `_`, `-`, "
+        "spaces, `,` and `|` is a list of EXACT tool names, so a bare `spawn_task` never matches "
+        f"the real `{_MCP_SPAWN_PREFIX}spawn_task`. Give the matcher a regex character and anchor "
+        "the exact names: `^(Task|Agent|Workflow)$|spawn_task`."
+    )
+
+
+def test_the_headroom_matcher_selects_nothing_it_was_not_meant_to() -> None:
+    """Anchors are the whole difference between the fix and a hook wired on half the toolbox."""
+    matchers = _matchers_wiring(_load(), _HOOK_SCRIPT.name)
+    over = [t for t in _NEAR_MISS_TOOLS if any(matcher_selects(m, t) for m in matchers)]
+    assert not over, (
+        f"the matcher also selects {len(over)} tool(s) the hook does not guard: {over}.\n"
+        "Unanchored alternatives match anywhere in a tool name, so `Task` alone would take "
+        "`TaskOutput` too. Keep the bare names inside `^(...)$`."
+    )
+
+
 def test_every_hook_script_is_wired_or_explicitly_named_as_unwired() -> None:
     """A hook script in none of the three states is an UNRECORDED absence, which is the defect.
 
@@ -303,8 +468,38 @@ def _unclassified_for_planted(settings: dict[str, Any]) -> list[str]:
             _unclassified_for_planted,
             "hook script wired nowhere",
         ),
+        (
+            # THE DEFECT THIS ROW PLANTS IS THE ONE THAT SHIPPED (BACKLOG #1406). The matcher below
+            # is verbatim what `.claude/settings.json` carried, and it selects `Task`, `Agent` and
+            # `Workflow` and not `mcp__ccd_session__spawn_task`. The detector must return that one
+            # name. If it returns nothing, it cannot see the exact bug it was written for and the
+            # assertion above is passing because the matcher is now correct rather than because the
+            # check works -- which would leave the next narrowing of that row unguarded.
+            {
+                "permissions": {"deny": []},
+                "hooks": {
+                    "PreToolUse": [
+                        {
+                            "matcher": "Task|Agent|Workflow|spawn_task",
+                            "hooks": [
+                                {
+                                    "command": "pwsh",
+                                    "args": [
+                                        "-File",
+                                        "${CLAUDE_PROJECT_DIR}/scripts/hooks/"
+                                        "usage-headroom-inject.ps1",
+                                    ],
+                                }
+                            ],
+                        }
+                    ]
+                },
+            },
+            _spawn_tools_the_matcher_misses,
+            "matcher that is an exact-name list rather than the regex it resembles",
+        ),
     ],
-    ids=["unanchored-hook", "dot-anchored-deny", "unwired-hook-script"],
+    ids=["unanchored-hook", "dot-anchored-deny", "unwired-hook-script", "exact-list-matcher"],
 )
 def test_the_checks_can_actually_fail(planted: dict[str, Any], checker: Any, label: str) -> None:
     """A guard that cannot be shown to fail is not a guard.
