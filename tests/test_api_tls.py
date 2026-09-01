@@ -71,6 +71,22 @@ def _self_signed(tmp_path: Path, *, password: str | None = None) -> tuple[Path, 
     return cert_path, key_path
 
 
+def _self_signed_combined(tmp_path: Path) -> Path:
+    """Write ONE PEM carrying both the cert and its unencrypted key; return its path.
+
+    This is the shape `[api].tls_cert_file` set WITHOUT `tls_key_file` refers to -- documented as
+    supported by ApiSettings ("the key may be in the cert PEM (tls_key_file optional)") and by
+    build_api_ssl_context's own docstring. `ssl.load_cert_chain` reads the key out of the certfile
+    only when `keyfile` is None.
+    """
+    cert_path, key_path = _self_signed(tmp_path)
+    combined = tmp_path / "combined.pem"
+    combined.write_bytes(cert_path.read_bytes() + key_path.read_bytes())
+    cert_path.unlink()  # leave only the combined PEM, so a stray two-file path cannot pass by luck
+    key_path.unlink()
+    return combined
+
+
 # --- build_api_ssl_context ---------------------------------------------------
 
 
@@ -1532,6 +1548,32 @@ def test_an_operator_certificate_always_wins_and_nothing_is_minted(tmp_path: Pat
     cert, key = ensure_api_tls_material(api, state_dir=tmp_path)
     assert (cert, key) == ("operator-cert.pem", "operator-key.pem")
     assert list(tmp_path.iterdir()) == []  # nothing minted
+
+
+def test_an_operator_combined_cert_pem_still_builds_a_serving_context(tmp_path: Path) -> None:
+    # THE CERT-ONLY BRANCH, END TO END. The test above sets BOTH tls_cert_file and tls_key_file, so
+    # it never reaches the case where tls_key_file is None -- which is a SUPPORTED configuration
+    # (ApiSettings: "the key may be in the cert PEM (tls_key_file optional)").
+    #
+    # The None must survive ensure_api_tls_material AND the serve path's model_copy, because
+    # model_copy does not re-validate: whatever it carries reaches ssl.load_cert_chain(keyfile=...)
+    # raw, and that reads a combined PEM only for None. Substituting "" raises
+    # OSError [Errno 22] Invalid argument, so an operator with a combined PEM could not start the
+    # engine at all. Driving the real pair of calls is what makes that reachable here.
+    combined = _self_signed_combined(tmp_path)
+    api = ApiSettings(tls_cert_file=str(combined))
+    assert api.tls_key_file is None  # the configuration under test, before anything touches it
+
+    material = ensure_api_tls_material(api, state_dir=tmp_path)
+    assert material is not None
+    cert, key = material
+    assert cert == str(combined)
+    serving = api.model_copy(update={"tls_cert_file": cert, "tls_key_file": key})
+    ctx = build_api_ssl_context(serving)  # the regression raised OSError [Errno 22] right here
+    assert ctx.minimum_version is ssl.TLSVersion.TLSv1_2
+    # Pin the contract the line above depends on, so a future "or ''" cannot creep back silently.
+    assert key is None
+    assert serving.tls_key_file is None
 
 
 def test_a_first_run_mints_a_usable_self_signed_pair(tmp_path: Path) -> None:

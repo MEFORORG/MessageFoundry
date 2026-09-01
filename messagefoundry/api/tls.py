@@ -84,8 +84,16 @@ _GENERATED_CERT_NAME = "api-generated-cert.pem"
 _GENERATED_KEY_NAME = "api-generated-key.pem"
 
 
-def ensure_api_tls_material(api: ApiSettings, *, state_dir: Path) -> tuple[str, str] | None:
+def ensure_api_tls_material(api: ApiSettings, *, state_dir: Path) -> tuple[str, str | None] | None:
     """Return the ``(cert_path, key_path)`` the API should serve with, minting on first run.
+
+    **``key_path`` is ``None`` when the operator embedded the key in the cert PEM.** That is a
+    supported configuration (``[api].tls_key_file`` is optional -- see :class:`ApiSettings` and
+    :func:`build_api_ssl_context`), and the ``None`` must survive all the way to
+    ``ssl.load_cert_chain(keyfile=...)``, which reads a combined PEM only when keyfile is ``None``.
+    Substituting ``""`` for it raises ``OSError: [Errno 22] Invalid argument`` instead, so an
+    operator with a combined PEM could not start the engine at all. A minted pair is always two
+    files, so that branch returns a real path.
 
     **The engine always serves TLS (owner ruling 2026-08-22, superseding ADR 0143's cleartext
     loopback premise).** An operator-supplied ``[api].tls_cert_file`` always wins -- this is a
@@ -109,7 +117,8 @@ def ensure_api_tls_material(api: ApiSettings, *, state_dir: Path) -> tuple[str, 
     on #1276; until it lands, ``CertExpiryRunner`` alarms on this path like any other served cert.
     """
     if api.tls_cert_file:  # operator-supplied material always wins
-        return api.tls_cert_file, api.tls_key_file or ""
+        # Pass tls_key_file through UNCHANGED, None included -- see the key_path note above.
+        return api.tls_cert_file, api.tls_key_file
 
     # A DECLARED UPSTREAM TERMINATOR IS NOT AN UNPROTECTED HOP, AND MINTING HERE WOULD BREAK IT.
     # `tls_terminated_upstream` (+ trusted_proxies) says a reverse proxy terminates TLS in FRONT of

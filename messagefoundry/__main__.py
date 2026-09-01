@@ -2887,6 +2887,10 @@ def _serve(args: argparse.Namespace) -> int:
     )
     if _material is not None:
         _cert, _key = _material
+        # _key is None when the operator embedded the private key in the cert PEM (tls_key_file is
+        # optional). WRITE IT THROUGH AS None: model_copy does NOT re-validate, so whatever lands
+        # here reaches ssl.load_cert_chain(keyfile=...) raw, and it reads a combined PEM only for
+        # None -- "" raises OSError [Errno 22] and the engine would refuse to start.
         _api_tls = settings.api.model_copy(update={"tls_cert_file": _cert, "tls_key_file": _key})
         # WP-13a: terminate TLS in-process. Build the context now so a bad cert/key/passphrase fails
         # fast (before uvicorn opens the socket); pass it via uvicorn's ssl_context_factory so the
