@@ -361,6 +361,188 @@ def monotonic_pairs(
     return pairs
 
 
+#: Queue-draining workers the connscale graph runs PER CONNECTION, under ``claim_mode = per_lane``.
+#: Read from the graph, not fitted: ``harness/config/connscale/graph.py`` registers one ``outbound()``
+#: and one ``inbound()`` per index inside ``for _i in range(_SHAPE.count)``, and the engine runs a
+#: router worker plus a transform worker per inbound and a delivery worker per outbound
+#: (CLAUDE.md section 2, "Concurrency = asyncio"). So three per connection.
+CONNSCALE_WORKERS_PER_CONNECTION = 3
+
+#: The engine's clock-driven claim backstop, in seconds -- how often an idle worker re-SELECTs when no
+#: commit has woken it. MIRRORS an engine value this harness does not import: ``pooled_sweep_interval``
+#: defaults to 0.25 in ``messagefoundry/config/settings.py``, whose comment records "0.25s =
+#: poll_interval parity" and "The 0.25s poll_interval lost-wakeup backstop is unchanged in both arms".
+#: A drift between that default and this mirror is caught by the model-vs-recorded test in
+#: tests/test_connscale_empty_claims_per_msg.py, not by anything at runtime. The floor's sensitivity to
+#: it is sub-linear -- it enters ``idle``, and ``idle`` enters the floor under a square root -- so a 2x
+#: error in this constant moves the floor by at most 1.41x.
+ENGINE_IDLE_POLL_INTERVAL_S = 0.25
+
+
+@dataclass(frozen=True)
+class HerdPrediction:
+    """The empty-claims-per-message levels a sweep step's own configuration predicts.
+
+    Every field is derived from ``(count, offered rate)`` plus the two structural constants above.
+    NOTHING here is chosen against an observed reading, which is the property BACKLOG #1211 exists to
+    restore: the band it retired was fitted to the failures on hand, and a floor picked that way is
+    breached by the next sample (measured -- an 88-run pass put the worst ratio at 0.539, a 153-run
+    pass found 0.383).
+    """
+
+    wake: float  # empty claims per message from the engine-wide singleton wake
+    idle: (
+        float  # ... and from the clock-driven re-SELECT floor, the level that SURVIVES a herd kill
+    )
+    total: float  # wake + idle -- the healthy level
+    floor: (
+        float  # the geometric mean of total and idle: the log-midpoint of the two predicted states
+    )
+
+
+def predict_herd_levels(count: int, offered_aggregate_rate: float) -> HerdPrediction | None:
+    """Predict the healthy empty-claims-per-message level at one sweep step, and a floor beneath it.
+
+    THE DERIVATION, in two terms, because the counter has two sources and they scale differently.
+
+    * ``wake``: one committed row wakes every worker of that stage, and all but the one that takes the
+      row book an empty claim. With ``W`` workers per connection over ``count`` connections that is
+      ``W * (count - 1)`` empty claims per message.
+    * ``idle``: a worker with nothing to do re-SELECTs once per backstop interval. Over the
+      ``1 / offered_aggregate_rate`` seconds between messages, ``W * count`` workers each poll
+      ``1 / (interval * rate)`` times per message.
+
+    ``floor`` is the GEOMETRIC MEAN of ``total`` (the herd present) and ``idle`` (the herd gone
+    entirely, which is what flipping ``MEFOR_PIPELINE_PER_LANE_WAKE`` off produces). The log-midpoint
+    is the one point equidistant from both predicted states, so it separates them without any free
+    parameter to tune -- and it stays a prediction, not a percentile of anything observed.
+
+    Returns ``None`` when ``count < 2`` (no siblings, so no herd to predict) or the offered rate is
+    non-positive. A folded batch-box record sums the offered rate across processes, so a prediction
+    built from it would grade a number that means something else; ``None`` means RECORDED BUT NOT
+    GRADED and must never be softened into a default.
+    """
+    if count < 2 or offered_aggregate_rate <= 0.0:
+        return None
+    workers = CONNSCALE_WORKERS_PER_CONNECTION
+    wake = float(workers * (count - 1))
+    idle = workers * count / (ENGINE_IDLE_POLL_INTERVAL_S * offered_aggregate_rate)
+    total = wake + idle
+    return HerdPrediction(wake=wake, idle=idle, total=total, floor=(total * idle) ** 0.5)
+
+
+@dataclass(frozen=True)
+class HerdFloorReading:
+    """One lane's base-count reading, with the level its configuration predicts.
+
+    ``ok`` is ``bool | None`` and the third state is load-bearing: ``None`` means the lane produced no
+    gradeable reading, which is NOT a pass. Test it with ``is False`` / ``is None``, never for
+    truthiness -- ``None`` is falsy, so a two-way test renders an ungraded lane as a breach and mypy
+    cannot catch it.
+    """
+
+    label: (
+        str  # through `lane_label`, so this and `MonotonicPair` cannot spell one lane differently
+    )
+    count: int
+    value: float | None
+    prediction: HerdPrediction | None
+    ok: bool | None
+    not_graded: str | None  # why, in words, whenever `ok` is None
+
+
+def herd_floor_readings(
+    records: list[ConnScaleRecord],
+    key: Callable[[ConnScaleRecord], float | int | None],
+    *,
+    base_count: int,
+) -> list[HerdFloorReading]:
+    """Grade each lane's reading AT ``base_count`` against the level its own configuration predicts.
+
+    THE BASE READING, NOT THE RATIO, AND NOT THE LARGEST N. BACKLOG #1211's harvest found the whole
+    left tail on the larger-N side: across the 25 deepest episodes in 894 transitions the base reading
+    sat at 0.76 to 1.18 of its lane median while the larger-N reading fell as far as 0.33. The base
+    reading is the stable half of the pair in every one of the six measured cells.
+
+    THE COUNT IS MATCHED EXACTLY, never "the lowest count present". Promoting a larger-N reading when
+    the base one is missing grades a value worth roughly twice the floor, so it passes with near
+    certainty -- under precisely the episode that removed the subject. That is a gate that cannot
+    fail, and this repo already records one of those as a defect (the FD "never compared" guard in
+    tests/test_connscale_smoke.py).
+
+    Lanes are grouped on ``(sweep_mode, claim_mode)`` -- the same key :func:`monotonic_pairs` uses.
+    Only ``per_lane`` lanes are graded: the prediction's premise is one worker set per lane per stage,
+    which a pooled dispatcher does not satisfy.
+    """
+    by_lane: dict[tuple[str, str], list[ConnScaleRecord]] = {}
+    for r in records:
+        by_lane.setdefault((r.sweep_mode, r.claim_mode), []).append(r)
+
+    out: list[HerdFloorReading] = []
+    for (mode, claim_mode), rs in sorted(by_lane.items()):
+        label = lane_label(mode, claim_mode)
+        if claim_mode != "per_lane":
+            out.append(
+                HerdFloorReading(
+                    label=label,
+                    count=base_count,
+                    value=None,
+                    prediction=None,
+                    ok=None,
+                    not_graded=(
+                        f"claim_mode={claim_mode}: the prediction assumes one worker set per lane "
+                        f"per stage, which a pooled dispatcher does not satisfy"
+                    ),
+                )
+            )
+            continue
+        at_base = [r for r in rs if r.count == base_count]
+        if not at_base:
+            out.append(
+                HerdFloorReading(
+                    label=label,
+                    count=base_count,
+                    value=None,
+                    prediction=None,
+                    ok=None,
+                    not_graded=f"no record at N={base_count}",
+                )
+            )
+            continue
+        record = at_base[0]
+        raw = key(record)
+        prediction = predict_herd_levels(record.count, record.offered_aggregate_rate)
+        if raw is None or prediction is None:
+            out.append(
+                HerdFloorReading(
+                    label=label,
+                    count=record.count,
+                    value=None if raw is None else float(raw),
+                    prediction=prediction,
+                    ok=None,
+                    not_graded=(
+                        "no reading (no messages absorbed in the window)"
+                        if raw is None
+                        else f"no prediction for N={record.count} at offered "
+                        f"{record.offered_aggregate_rate:.4g}/s"
+                    ),
+                )
+            )
+            continue
+        value = float(raw)
+        out.append(
+            HerdFloorReading(
+                label=label,
+                count=record.count,
+                value=value,
+                prediction=prediction,
+                ok=value >= prediction.floor,
+                not_graded=None,
+            )
+        )
+    return out
+
+
 @dataclass(frozen=True)
 class DiagnosticField:
     """One reading emitted for DIAGNOSIS, with no band and therefore no verdict.
@@ -481,6 +663,7 @@ class ConnScaleReport:
         tolerance: float,
         context: dict[str, str] | None = None,
         max_rows: int = _MAX_SUMMARY_ROWS,
+        base_count: int | None = None,
     ) -> str:
         """Every reading of one monotonic metric as a markdown table — the passing ones included.
 
@@ -526,8 +709,11 @@ class ConnScaleReport:
         head.append(" | ".join(f"{k}: {v}" for k, v in ctx.items()))
         head.append("")
         head.append(
-            f"Recorded on every run, pass or fail (BACKLOG #1211). Band is prior * "
-            f"{1.0 - tolerance:.2f}; a positive margin is inside it."
+            f"Recorded on every run, pass or fail (BACKLOG #1211). The band below is prior * "
+            f"{1.0 - tolerance:.2f}. For this metric it is RECORDED AND NO LONGER ENFORCED -- an "
+            f"OUTSIDE BAND row here fails nothing. The width is left untouched so these rows stay "
+            f"directly comparable with the readings already harvested. What IS asserted, and the "
+            f"predicted floor that is not, are below."
         )
         head.append("")
         if not rows:
@@ -539,7 +725,50 @@ class ConnScaleReport:
         if dropped:
             out.append("")
             out.append(f"{dropped} further row(s) not shown: capped at {max_rows}.")
+        if base_count is not None:
+            out.extend(self._render_herd_floor_rows(key, base_count=base_count))
         return "\n".join(out) + "\n"
+
+    def _render_herd_floor_rows(
+        self,
+        key: Callable[[ConnScaleRecord], float | int | None],
+        *,
+        base_count: int,
+    ) -> list[str]:
+        """The base-count reading against the level its own configuration predicts.
+
+        RECORDED, NOT GATED (BACKLOG #1411). This table is what a later harvest reads to decide whether
+        the predicted floor can become a merge gate, and it is written from the emitter that already
+        runs on every pass and every failure -- so that decision will rest on a distribution rather
+        than on excursions, which is the whole lesson of #1211 limb one.
+
+        The verdict column renders THREE ways because :attr:`HerdFloorReading.ok` has three states.
+        ``None`` is falsy, so a two-way truthiness test would print an ungraded lane as a breach and
+        mypy strict would not catch it.
+        """
+        readings = herd_floor_readings(self.records, key, base_count=base_count)
+        out = [
+            "",
+            f"### predicted herd floor at N={base_count} (recorded, not enforced -- BACKLOG #1411)",
+            "",
+            f"Predicted from the sweep's own configuration: "
+            f"{CONNSCALE_WORKERS_PER_CONNECTION} workers per connection, "
+            f"{ENGINE_IDLE_POLL_INTERVAL_S}s engine idle-poll backstop. No number here was chosen "
+            f"against an observed reading, and no merge gate rides on it.",
+            "",
+            "| lane | N | reading | predicted total | floor | margin | verdict |",
+            "|---|---|---|---|---|---|---|",
+        ]
+        for r in readings:
+            if r.ok is None or r.prediction is None or r.value is None:
+                out.append(f"| {r.label} | {r.count} | n/a | n/a | n/a | n/a | {r.not_graded} |")
+                continue
+            verdict = "above floor" if r.ok else "BELOW FLOOR"
+            out.append(
+                f"| {r.label} | {r.count} | {r.value:.3g} | {r.prediction.total:.3g} | "
+                f"{r.prediction.floor:.3g} | {r.value - r.prediction.floor:+.3g} | {verdict} |"
+            )
+        return out
 
     def readings_payload(
         self,
@@ -548,6 +777,7 @@ class ConnScaleReport:
         *,
         tolerance: float,
         context: dict[str, str] | None = None,
+        base_count: int | None = None,
     ) -> dict[str, object]:
         """The same readings as :meth:`render_readings_markdown`, machine-readable.
 
@@ -601,8 +831,13 @@ class ConnScaleReport:
                     "first_in_lane": False,
                 }
             )
-        return {
-            "schema_version": 1,
+        payload: dict[str, object] = {
+            # 2 adds the `herd_floor` block below. The RATIO rows above are byte-unchanged, so the 454
+            # version-1 payloads already harvested for BACKLOG #1211 stay directly comparable with
+            # everything written after this -- which is the point of not touching the recorded band.
+            # NOT the module-level `SCHEMA_VERSION`, which governs `to_json_dict`: two payloads, two
+            # versions, and conflating them would silently rev the other artifact.
+            "schema_version": 2,
             "metric": metric,
             "profile": self.profile,
             "db_backend": self.db_backend or "sqlite",
@@ -611,6 +846,37 @@ class ConnScaleReport:
             "context": dict(context or {}),
             "readings": readings,
         }
+        if base_count is not None:
+            # RECORDED, NOT ENFORCED (BACKLOG #1411). This block is what a later harvest reads to decide
+            # whether the predicted floor can become a gate; writing it from the same emitter that
+            # already runs on every pass and every failure is why that decision will rest on a
+            # distribution rather than on excursions, which is the whole lesson of #1211 limb one.
+            payload["herd_floor"] = {
+                "base_count": base_count,
+                "workers_per_connection": CONNSCALE_WORKERS_PER_CONNECTION,
+                "idle_poll_interval_s": ENGINE_IDLE_POLL_INTERVAL_S,
+                "enforced": False,
+                "readings": [
+                    {
+                        "lane": r.label,
+                        "count": r.count,
+                        "value": r.value,
+                        "predicted_wake": None if r.prediction is None else r.prediction.wake,
+                        "predicted_idle": None if r.prediction is None else r.prediction.idle,
+                        "predicted_total": None if r.prediction is None else r.prediction.total,
+                        "floor": None if r.prediction is None else r.prediction.floor,
+                        "margin": (
+                            None
+                            if r.prediction is None or r.value is None
+                            else r.value - r.prediction.floor
+                        ),
+                        "ok": r.ok,
+                        "not_graded": r.not_graded,
+                    }
+                    for r in herd_floor_readings(self.records, key, base_count=base_count)
+                ],
+            }
+        return payload
 
     def render_diagnostics_markdown(
         self,

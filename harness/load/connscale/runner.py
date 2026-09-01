@@ -53,6 +53,7 @@ from harness.load.connscale.report import (
     ConnScaleReport,
     NoLoss,
     SloCheck,
+    herd_floor_readings,
     monotonic_pairs,
 )
 from harness.load.corpus import Corpus, build_corpus
@@ -1397,14 +1398,67 @@ def _evaluate_slos(profile: ConnScaleProfile, records: list[ConnScaleRecord]) ->
         )
     if slo.fd_monotonic:
         out.append(_monotonic_slo("fd_count_monotonic", records, lambda r: r.fd_count_peak))
-    if slo.empty_claims_monotonic:
-        out.append(
-            # PER MESSAGE, not per second (BACKLOG #1101). The per-second form put wall clock in the
-            # denominator, so CPU contention alone flipped this red with no engine change — measured
-            # 0.451 to 2.49 across four replicates of one commit on one box.
-            _monotonic_slo("empty_claims_monotonic", records, lambda r: r.empty_claims_per_msg)
-        )
+    if slo.empty_claims_base_reading:
+        out.append(_empty_claims_base_reading_slo(profile, records))
     return out
+
+
+def _empty_claims_base_reading_slo(
+    profile: ConnScaleProfile, records: list[ConnScaleRecord]
+) -> SloCheck:
+    """Wall #3, asserted only as far as a hosted runner can actually measure it (BACKLOG #1211).
+
+    THIS REPLACED A vs-N MONOTONICITY GATE THAT WAS MEASURABLY BROKEN IN FIVE WAYS. The evidence --
+    894 lane transitions harvested from 153 CI runs -- is recorded ONCE, in BACKLOG #1211; it is not
+    restated here. What matters at this line is what is now asserted and what is not.
+
+    ASSERTED: every ``per_lane`` lane that produced a base-count reading produced a STRICTLY POSITIVE
+    one. That is narrow on purpose. It is the one thing about this metric a 4-vCPU hosted runner
+    measures without ambiguity, it fires on a dead counter -- the case the retired gate PASSED, since
+    ``not (0.0 < 0.0)`` is true -- and it cannot flake on level noise, because it is a sign test rather
+    than a threshold.
+
+    NOT ASSERTED: the predicted herd floor. ``herd_floor_readings`` computes it and both emitters
+    RECORD it on every run, pass or fail, but no verdict here rides on it. Its own pre-landing check
+    failed: on run 33448760672, a push to ``main`` whose ``test (windows-2022, py3.14)`` job PASSED,
+    the base reading was 13.12 against a floor of 15.30. Gating on it would have reddened a green leg,
+    which is the defect this item exists to remove. Enabling it once its own distribution is harvested
+    is BACKLOG #1411.
+
+    NOT ASSERTED EITHER: the vs-N slope, in any form. Nothing in CI now claims the curve rises. That
+    is a real loss and BACKLOG #1211 names it as one.
+
+    ZERO GRADED LANES REPORTS ``ok=True`` and says so in words, following the ``intake_audit`` shape a
+    few lines above. The run-level bound -- that SOME lane was graded -- belongs in the smoke test,
+    where the metric genuinely runs; that is exactly where wall #4 already puts its equivalent.
+    """
+    readings = herd_floor_readings(
+        records, lambda r: r.empty_claims_per_msg, base_count=min(profile.counts)
+    )
+    graded = [r for r in readings if r.ok is not None]
+    dead = [r for r in graded if r.value is not None and r.value <= 0.0]
+    expectation = "a positive empty-claims-per-message reading at the base connection count"
+    if dead:
+        observed = "; ".join(
+            f"{r.label}@N={r.count}: {r.value} -- the empty-claim counter did not move"
+            for r in dead
+        )
+        return SloCheck("empty_claims_base_reading", expectation, observed, False)
+    if not graded:
+        reasons = "; ".join(f"{r.label}: {r.not_graded}" for r in readings) or "no lanes"
+        return SloCheck(
+            "empty_claims_base_reading",
+            expectation,
+            f"NOT GRADED -- 0 of {len(readings)} lane(s) produced a base reading at "
+            f"N={min(profile.counts)} ({reasons}), so this says nothing about wall #3",
+            True,
+        )
+    return SloCheck(
+        "empty_claims_base_reading",
+        expectation,
+        f"present ({len(graded)} of {len(readings)} lane(s) graded)",
+        True,
+    )
 
 
 #: Noise tolerance for the loose monotonicity smoke: a larger-N metric may dip up to this fraction below a

@@ -91,7 +91,7 @@ _SLO_KEYS = frozenset(
         "zero_loss",
         "max_drain_seconds",
         "fd_monotonic",
-        "empty_claims_monotonic",
+        "empty_claims_base_reading",
     }
 )
 
@@ -106,10 +106,15 @@ class ConnScaleSlo:
 
     zero_loss: bool = True  # every sent message must be received + delivered, backlog drained
     max_drain_seconds: float | None = None
-    # Loose monotonicity smokes (CI): FD count and empty-claims/sec at a larger N must be >= a smaller
-    # N (the wall exists and scales). A `>=` check, not a tight threshold (CI runners are noisy).
+    # TWO DIFFERENT SHAPES, and they stopped being one family in BACKLOG #1211. `fd_monotonic` is the
+    # loose vs-N slope smoke on FD count: at a larger N it must be >= a smaller N minus a jitter band.
+    # `empty_claims_base_reading` is NOT a slope -- it asserts that each per_lane lane produced a
+    # positive empty-claims-per-message reading at the BASE connection count. The vs-N form it replaced
+    # asserted something false about the healthy population (on one measured leg the healthy median
+    # ratio is 0.962, i.e. most healthy runs DECREASE), and the predicted floor that would restore a
+    # real expectation is recorded but not enforced pending BACKLOG #1411.
     fd_monotonic: bool = False
-    empty_claims_monotonic: bool = False
+    empty_claims_base_reading: bool = False
 
 
 @dataclass(frozen=True)
@@ -465,7 +470,7 @@ def _slo_from(raw: Any, where: str) -> ConnScaleSlo:
         zero_loss=_opt_bool(raw, "zero_loss", where, default=True),
         max_drain_seconds=_opt_float_or_none(raw, "max_drain_seconds", where, minimum=0.0),
         fd_monotonic=_opt_bool(raw, "fd_monotonic", where, default=False),
-        empty_claims_monotonic=_opt_bool(raw, "empty_claims_monotonic", where, default=False),
+        empty_claims_base_reading=_opt_bool(raw, "empty_claims_base_reading", where, default=False),
     )
 
 

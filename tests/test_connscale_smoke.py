@@ -31,7 +31,11 @@ import pytest
 from harness.load.connscale.intake_audit import MOMENT_POST_MORTEM
 from harness.load.connscale.probe import ProbeDegraded
 from harness.load.connscale.profile import load_connscale_profile_text
-from harness.load.connscale.report import ConnScaleRecord, ConnScaleReport
+from harness.load.connscale.report import (
+    ConnScaleRecord,
+    ConnScaleReport,
+    herd_floor_readings,
+)
 from harness.load.connscale.runner import _MONOTONIC_TOLERANCE, run_connscale
 from tests._connscale_ports import (
     INBOUND_PORT_HI,
@@ -74,7 +78,7 @@ corpus_count_per_trigger = 5
 [connscale.slo]
 zero_loss = true
 fd_monotonic = true
-empty_claims_monotonic = true
+empty_claims_base_reading = true
 """)
 
 
@@ -288,6 +292,7 @@ def _record_ratio_readings(report: ConnScaleReport) -> None:
             lambda r: r.empty_claims_per_msg,
             tolerance=_MONOTONIC_TOLERANCE,
             context=_run_context(),
+            base_count=min(_SMOKE_COUNTS),
         )
     )
     _write_readings_json(
@@ -296,6 +301,7 @@ def _record_ratio_readings(report: ConnScaleReport) -> None:
             lambda r: r.empty_claims_per_msg,
             tolerance=_MONOTONIC_TOLERANCE,
             context=_run_context(),
+            base_count=min(_SMOKE_COUNTS),
         )
     )
 
@@ -459,17 +465,52 @@ def test_no_accept_acked_message_is_absent_from_the_stopped_engines_store(
     _assert_intake_audit(smoke_report.records)
 
 
-def test_the_fd_and_empty_claim_curves_are_monotonic_in_n(smoke_report: ConnScaleReport) -> None:
-    """Curve monotonicity smoke (a LOOSE >= per mode; CI runners are noisy): FD count + empty-claims
-    at N=24 >= N=12. Asserted via the report's monotonicity SLOs.
+def test_the_fd_curve_is_monotonic_in_n(smoke_report: ConnScaleReport) -> None:
+    """Curve monotonicity smoke for wall #4 (a LOOSE >= per mode; CI runners are noisy): FD count at
+    N=24 >= N=12 minus the jitter band. Asserted via the report's monotonicity SLO.
 
     THIS IS THE THROUGHPUT-SLO ARM the item names, distinct from the intake arm above. Nothing
     measured shows the two share a root cause; separate names keep that question open instead of
     quietly answering it.
+
+    THE EMPTY-CLAIMS ARM USED TO BE WELDED INTO THIS TEST AND IS NOW ITS OWN, BECAUSE THE TWO STOPPED
+    ASSERTING THE SAME SHAPE (BACKLOG #1211). One name per property is this module's own doctrine
+    (#1331), and it matters more here than usual: while the two shared a name, a red said only that
+    one of two unrelated propositions failed.
     """
     slo_by_name = {c.name: c for c in smoke_report.slos}
     assert slo_by_name["fd_count_monotonic"].ok, slo_by_name["fd_count_monotonic"].observed
-    assert slo_by_name["empty_claims_monotonic"].ok, slo_by_name["empty_claims_monotonic"].observed
+
+
+def test_the_empty_claim_counter_moved_at_the_base_connection_count(
+    smoke_report: ConnScaleReport,
+) -> None:
+    """Wall #3, asserted only as far as a hosted runner can measure it (BACKLOG #1211).
+
+    TWO ASSERTIONS, AND THE SECOND IS REQUIRED RATHER THAN BELT-AND-BRACES. The SLO reports ok=True
+    over a run that graded NOTHING -- deliberately, following ``intake_audit``, so a profile the gate
+    cannot apply to does not manufacture a red. That makes the SLO alone satisfiable by an empty set,
+    which this module already records as a real defect for wall #4: forcing every FD probe to time out
+    left PAIRS ACTUALLY COMPARED=0 while ``fd_count_monotonic`` still reported monotonic. So the
+    run-level bound lives here, where the metric genuinely runs.
+
+    It is not a hypothetical hole. Across the 454 CI legs harvested for #1211, 14 (3.1 percent) lost a
+    whole lane to unreadable readings and the old SLO reported ``monotonic`` having compared only the
+    other one. No leg lost BOTH, which is why this bound is a bound and not a flake.
+    """
+    slo_by_name = {c.name: c for c in smoke_report.slos}
+    check = slo_by_name["empty_claims_base_reading"]
+    assert check.ok, check.observed
+
+    readings = herd_floor_readings(
+        smoke_report.records, lambda r: r.empty_claims_per_msg, base_count=min(_SMOKE_COUNTS)
+    )
+    graded = [r for r in readings if r.ok is not None]
+    assert graded, (
+        f"WALL #3 NEVER GRADED -- no lane produced a readable empty-claims-per-message reading at "
+        f"N={min(_SMOKE_COUNTS)}, so the SLO's green says nothing. Lanes and why each was skipped: "
+        f"{[(r.label, r.not_graded) for r in readings] or 'no lanes at all'}."
+    )
 
 
 def test_the_additive_engine_fields_are_populated(smoke_report: ConnScaleReport) -> None:
