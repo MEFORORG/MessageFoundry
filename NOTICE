@@ -18,8 +18,9 @@ owner and steward. Under the Contributor License Agreement (CLA.md) it is intend
 to hold a relicensing grant that would let it offer MessageFoundry under separate
 commercial terms in addition to the AGPL (the open-core / dual-licensing model).
 The CLA, the commercial terms, and this posture are pending legal review; see
-COMMERCIAL-LICENSE.md for commercial-license inquiries and
-docs/DUAL_LICENSING_PLAN.md for the dual-licensing posture.
+COMMERCIAL-LICENSE.md for commercial-license inquiries. The dual-licensing
+posture itself is recorded in the project's dual-licensing plan, a maintainer
+document that is not published in this repository.
 
 Per-file copyright and license notices use SPDX identifiers; see the header of
 each source file (SPDX-License-Identifier: AGPL-3.0-or-later). Third-party

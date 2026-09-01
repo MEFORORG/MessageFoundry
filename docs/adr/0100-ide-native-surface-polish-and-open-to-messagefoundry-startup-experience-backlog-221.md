@@ -7,7 +7,7 @@
   ADR 0076 (the Steps action-list lens this chrome surrounds),
   [ADR 0091](0091-element-centric-connections-view.md) (the CONNECTIONS view + Wiring Map),
   [ADR 0007](0007-gui-manageable-connections-toml.md) (the connections.toml custom editor); brand
-  rules in [`docs/BRAND.md`](../BRAND.md)
+  rules in `docs/BRAND.md`
 
 ## Context
 

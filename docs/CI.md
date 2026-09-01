@@ -18,13 +18,15 @@ claims move with it.
 |---|---|
 | `ci.yml` | Lint (`ruff check` + `ruff format --check`), types (`mypy --strict`, plus a `--platform win32` pass on Linux so Windows type-branches are checked), and the `pytest` suite across **ubuntu-latest**, **windows-2022**, and **windows-2025** (Python 3.14). Also builds the VS Code extension (`ide/`). A `CI gate` job rolls the legs up. |
 | `security.yml` | Static and supply-chain security: `bandit` (Python SAST), `semgrep`, `pip-audit` and `npm-audit` against the hash-locked tree, `gitleaks` (secret scan), `forbidden-content` (customer/PHI leak guard), a crypto-inventory check, an SBOM build, and a `trivy` scan. A **daily cron** re-runs the dependency audits so a CVE filed against an unchanged pin is caught within ~24h. A separate `released-line-audit` job runs on the same cron and audits the **latest release tag's** pinned core runtime, which the daily audits do not cover — they read the checked-out tree, so between a fix landing on `main` and a release carrying it the two answers differ. Hard-failing but **not** a required check (schedule/dispatch only), the same posture as `dast.yml`. |
-| `codeql.yml` | GitHub CodeQL analysis (python / javascript-typescript). |
+| `codeql.yml` | GitHub CodeQL analysis (python / javascript-typescript). Advisory — **not** required checks. |
+| `review-gate.yml` | Blocks a merge until a reviewer marks the PR read with the `reviewed` label. A **required check**, and — with approvals pinned at 0 — the repository's only review control. It removes the label on `synchronize`, so new commits are unread again; that is the one thing it writes, and it only ever writes toward blocked. |
 | `scorecard.yml` | OpenSSF Scorecard analysis. |
 | `cla.yml` | CLA Assistant — records the Contributor License Agreement signature on each PR. |
 | `zizmor.yml` | Lints the workflow files themselves for insecure patterns (template injection, over-broad tokens), and runs `actionlint` on the workflow syntax. Hard-fails, but **not a required check** — it is paths-filtered, so it does not report on a PR that touches no workflow, and requiring it would wedge every such PR. The `actionlint` pre-commit hook is the local half. |
 | `dast.yml` | Authenticated authorization sweep against a live loopback listener in front of a real engine. **Not a required check** — nightly / release-tag / manual dispatch only, with no `pull_request` trigger, so it never reports on a PR and cannot wedge one. It is NOT `continue-on-error`: it goes red on a finding. See [ADR 0155](adr/0155-dast-dynamic-security-testing-of-the-running-engine.md). |
 | `quality-advisory.yml` | Advisory quality measurement — complexity (ruff `C901`), duplication (`jscpd`), diff-coverage (`diff-cover`) and mutation testing (`mutmut`). **Every job is advisory and none is in branch protection.** See below for how each signal reaches a reviewer. |
 | `asvs-prove-absences.yml` | Runs `scripts/asvs/scorecard.py --prove-absences`: applies each absence claim's stated reintroduction to a scratch tree and requires its named observable to go red. **Advisory and not in branch protection.** Two jobs. `selftest` runs on any PR touching the wiring, needs no credential, and is what stops the tool rotting in the repo that develops it. `prove` is **`workflow_dispatch` only** — the scheduled pass runs in the vault, the only repo holding the scorecard, per the 2026-08-09 location decision recorded in that workflow's own header block. A dispatch here still fails closed with exit 2 when no input is configured, because a run that scanned nothing must not report success; it is simply not *scheduled* to obtain nothing. `scripts/asvs/prove_report.py` ships here and `MIRRORED_TOOLS` in `tests/test_asvs_verifier_vault_contract.py` holds it to that list's **contract** — stdlib-only, so a vault copy would run on the bare interpreter there. That contract is in force *before* any mirror exists, deliberately, because the cheap moment to hold a tool to it is before it acquires a dependency. **Do not read that entry as evidence a vault copy exists: it does not.** The vault's mirror automation is scoped to `scorecard.py` alone, and `MIRRORED_TOOLS` asserts the stdlib property, never that a vault copy exists — so widening the vault's automation is the open half, tracked with the vault-side scheduled pass. |
+| `asvs-anchor-report.yml` | Runs `scripts/asvs/anchor_report.py`: reads the ASVS scorecard and reports which **anchors** — citations from a graded requirement to a line of engine code — no longer resolve in this tree, narrowed to the files the triggering range touched. **Advisory and not in branch protection.** It **reports and never rewrites**: a citation that moved and one that was wrong when written need different human responses, so proposing a repair is what would manufacture silent corruption. Output is **counts and file paths only** — never a requirement identifier, because pairing those enumerates coverage over a closed set and hands out the gaps by subtraction, and this repository's run logs are public. Its one job is **skipped** unless `vars.ASVS_VAULT_REPO` is configured, which it is not: the record lives in the private vault and this repository holds no read credential for it (the boundary decision is recorded in `asvs-prove-absences.yml`). The half that runs today is the instrument: `tests/test_asvs_anchor_report.py`, in the `tooling` tier, proves the checker detects a stale anchor, fails closed on a record it could not read, and prints no identifier. |
 
 Several heavier legs (server-DB store tests, load/throughput, service-smoke, DICOM/FHIR breadth) run
 **nightly on a schedule** and/or only when a PR touches their paths, so an ordinary PR does not pay for
@@ -49,8 +51,9 @@ The stable contexts required on `main` are — mirroring
 - `forbidden-content (customer/PHI leak guard)`
 - `a PR that implements BACKLOG #N must update BACKLOG.md`
 - `cla`
+- `a reviewer has read this`
 
-That last string is the **job key** in `cla.yml`, whose job declares no `name:`. Branch protection
+`cla` is the **job key** in `cla.yml`, whose job declares no `name:`. Branch protection
 matches the job name, never the workflow name — so the context is `cla`, not "CLA Assistant". Every
 non-advisory job in `security.yml` is in the set. Three are not, in two different ways: `sbom` and
 `trivy` declare `continue-on-error: true`, while `released-line-audit` deliberately does **not** — it
@@ -59,10 +62,19 @@ goes red on a finding (the `dast.yml` posture). `tests/test_security_posture.py`
 three buckets each job is in.
 
 CodeQL is **advisory** (not in the required set) — its SARIF upload needs `security-events: write`,
-which fork-PR tokens do not have, so requiring it would block PRs from forks. Scorecard is advisory for
+which fork-PR tokens do not have, so requiring it would block PRs from forks. Both matrix contexts
+were seen on branch protection earlier on 2026-08-31 and were off again by 20:57 CDT that day; the
+rationale is unchanged, and `.github/required-contexts.txt` records it. Scorecard is advisory for
 the same reason and additionally **does not run on PRs at all** (`scorecard.yml` has no `pull_request`
 trigger — it runs on push-to-main, a schedule, and branch-protection changes). Nightly / path-gated
 legs (service-smoke, load, SQL/Postgres store) are deliberately **not** required.
+
+`a reviewer has read this` (`review-gate.yml`) is the required check that is **not a test of the code**,
+and the one with nothing behind it. `required_approving_review_count` is 0 and stays 0 — every session
+pushes as one GitHub identity, so a human-approval rule would wedge every PR rather than review any —
+which makes this single context the repository's whole review requirement. A PR clears it with
+`gh pr edit <N> --add-label reviewed`; a new commit removes the label, so re-review is automatic. It
+proves a **step happened**, not that an independent party looked.
 
 The `quality-advisory.yml` jobs create **no code-scanning category** and **no _required_ check context** —
 they do report as ordinary advisory checks, and they **must never be added to the required list**. Two
