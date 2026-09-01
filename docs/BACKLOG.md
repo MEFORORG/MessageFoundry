@@ -18818,3 +18818,224 @@ The first draft said instead that a real cancel "stays green", and called that b
 **Source:** the `ci-diagnostics` seat, from a 13-agent workflow with every finding adversarially verified; filed by the seat that picked up its handoff, after a second verification pass.
 
 **RE-MEASURED before filing, and nothing here was refuted.** Confirmed independently: all four `gate liveness (advisory)` jobs concluded `success` (`99561662542`, `99584522330`, `99586438353`, `99689286541`); all four coverage jobs are `diff-coverage (advisory)` / `cancelled` in the **same four runs**, which pairs each dead gate to the green meta-gate that sat over it; the receipt payload, verbatim, from the liveness logs; the `if: always()` and `receipt` output wiring on disk and on `origin/main`; and the replay of both file versions against the real payloads. The step arrays also rule out a run-level cancel: in every one of the four, step 7 is `cancelled`, step 8 `skipped`, and step 9 `Record gate liveness` **succeeded** -- which is how the receipt came to exist.
+
+## 1402. a required check that goes red signals nobody, so only a seat polling can find it
+
+> 🔢 **Filed 2026-08-31.** One of three failure-signal gaps filed together; see also #1403 and #1405.
+> Verdict: build
+> Closing-act: code
+
+**Cluster:** CI signalling. **Priority:** P2. **Verdict:** build.
+**Severity:** no engine effect, no PHI axis, and **no deployment axis (sec. 0)**.
+
+**What:** when a required check fails, nothing tells anyone. **Measured 2026-08-31: exactly two workflows carry an `if: failure()` step -- `branch-leak-scan.yml` and `security.yml` -- and both only FAIL THE JOB.** Nothing labelled a pull request, commented on one, or opened an issue, and no `ci-red`-style label existed. **THAT HALF HAS SINCE SHIPPED**, so the paragraph above describes the state at filing, not now.
+
+So the only path from a red to somebody acting on it is a seat polling every open pull request's check rollup. That is expensive enough that it will not be run often, and it makes whichever seat does the polling a single point of failure.
+
+**Autofix does not close this.** It wakes only a **live** session, and a worker that finishes its turn exits -- measured the same day with `scripts/coord/session-registry.ps1` in `wshallwshall/claude-multisession`, 740 session records against 2 live sessions. That instrument is not in this repository, so the figure cannot be re-derived from this clone. And when it does fire it reaches a BUILDER and reports WHAT broke, never WHOSE failure it is, which is the question that decides what to do. A red belongs to the pull request, to `main`, to a flake, or to the queue, and only the first is a builder's to fix.
+
+**THE SIGNAL HALF IS BUILT AND MERGED.** `.github/workflows/failure-signal.yml` landed in PR #716 on 2026-08-31 and is on `main` and in this branch's own tree. It is a `workflow_run` job, triggered on completion with a failure conclusion, that adds `ci-red` to the pull request. **Verified firing:** `github-actions[bot]` labelled PRs 718, 719 and 721, with correct skips on green runs. `nightly-notice.yml` was the pattern it followed. Noticing then costs one `gh pr list --label` call across all pull requests rather than a rollup fetch per pull request -- the difference between a poll you can afford to run often and one you cannot. Runner cost is seconds; there is no model cost at all.
+
+**This is not a push, and should not be described as one.** GitHub still cannot reach into a session. It makes the poll cheap, which is the achievable version.
+
+**WHAT REMAINS IS THE WATCHER, AND IT IS THE WHOLE REMAINDER.** Nothing reads `ci-red` and spawns the attributing seat, so a red still waits for the console to poll. What changed is what the console polls FOR: one `gh pr list --label ci-red` across every pull request, instead of a rollup fetch per pull request. The watcher is filed as `wshallwshall/claude-multisession#108`, deliberately outside this number space. **This item should not close until that lands**, and its banner stays open for that reason rather than because the signal is missing.
+
+## 1403. a merge-queue ejection tells nobody, and `merge_group` carries no pull-request context
+
+> 🔢 **Filed 2026-08-31.** Sibling of #1402: same missing signal, harder to address.
+> Verdict: build
+> Closing-act: code
+
+**Cluster:** CI signalling. **Priority:** P2. **Verdict:** build.
+**Severity:** no engine effect, no PHI axis, and **no deployment axis (sec. 0)**.
+
+**What:** when the merge queue revalidates an entry and it fails, the entry is ejected and nothing reports it. The pull request was green; the *combination* is not. This is the failure mode the queue exists to catch, and it is the one nobody hears about.
+
+It also lands in a blind spot the rest of the machinery shares: the queue revalidates against a **different job set** than the pull request ran, because the path gates come off on `merge_group`. So the ejecting job may be one the pull request never ran.
+
+**THE WRINKLE THAT MAKES THIS HARDER THAN #1402: on `merge_group` there is no `github.event.pull_request`.** That is the same fact that collapsed `backlog-hygiene.yml`'s concurrency key to a single group -- the key named the pull request number, which is empty in the queue, so every entry shared one group and cancelled its predecessor. Fixed by #711; the key on `main` is now `github.ref`.
+
+Identifying the ejected pull request therefore means recovering the number from the queue ref, which encodes it as `gh-readonly-queue/<base>/pr-<N>-<sha>`. **Measured 2026-08-31: nothing on `origin/main` read it. THAT HAS SINCE SHIPPED.**
+
+**THIS IS BUILT AND MERGED, in the same workflow as #1402's half.** `.github/workflows/failure-signal.yml` landed in PR #716 on 2026-08-31, is on `main` and in this branch's own tree, and names this item in its header: *"THE MERGE-QUEUE CASE IS WHY head_branch IS PARSED (#1403)"*. It resolves the pull request from `pull_requests[0]` where GitHub supplies one, and otherwise parses `pr-[0-9]+` out of `head_branch` **only when the triggering run's event was `merge_group`** -- gated that way because a branch name is chosen by whoever opened it, and a fork cannot produce that event. One label, `ci-red`, covers this case and #1402's, so one watcher covers both.
+
+**WHAT REMAINS is the same remainder as #1402: nothing reads the label.** An ejection is now recorded rather than silent, and still nobody is told. This item should not close until `wshallwshall/claude-multisession#108` lands.
+
+## 1404. the checked-in record of what gates a merge disagrees with the server three ways, and no test can see it
+
+> 🔢 **Filed 2026-08-31. REWRITTEN the same day, after review.** The first version said the review
+> gate "reports but does not gate". That was true when it was written and false a few hours later:
+> the context was armed the same day. The reviewer caught it before merge. Re-measuring to correct
+> it turned up two further drifts the first version never looked for.
+> Verdict: build
+> Closing-act: code
+
+**Cluster:** Merge controls. **Priority:** P2. **Verdict:** build.
+**Severity:** no engine effect, no PHI axis, and **no deployment axis (sec. 0)**. It was P1 while no
+review control existed. One exists now, so what is left is a stale mirror, which is the same class of
+defect as #1300 and is graded the same way.
+
+**What changed, and it closes the original item.** `a reviewer has read this` is now a required status
+context on `main`. Measured 2026-08-31: **16 contexts, `strict` true, `required_approving_review_count`
+0**. The gate is live and it holds pull requests: as of 2026-08-31 the only `reviewed` label event on any of 715, 716 and 717 is one on 716, at 17:41 CDT. 715 and 717 have never carried the label and both still report the check red. An earlier draft of this sentence said all three had been labelled. That was false when written, about this very pull request, and it survived because it was welded to a true conclusion the API proves on its own.
+
+**Why approvals are zero and must stay zero:** every session pushes as one GitHub identity, so a
+human-approval requirement would wedge every pull request. **That makes this one check the entire
+review requirement. There is no second line behind it.** That reasoning is unchanged and is why the
+rest of this item matters.
+
+**THE REQUIRED SET MOVED FOUR TIMES ON 2026-08-31, AND THAT IS THE REAL FINDING.** This item has now
+been overtaken three times while being written and reviewed. Every version stated a live value in the
+present tense, and every one went stale within hours:
+
+| When | contexts | `strict` | `enforce_admins` | What moved |
+|---|---|---|---|---|
+| 2026-08-30, PR #701's captured fixture | 15 | false | off | the baseline that PR still proposes to write down |
+| 2026-08-31, first draft of this item | 15 | -- | off | "the gate is not armed" |
+| 2026-08-31, after arming | 16 | true | on | three settings at once |
+| 2026-09-01, measured for this revision | **14** | true | on | both CodeQL contexts removed, owner-authorised |
+
+**So the fix is not to correct the file by hand.** A hand-corrected file is right until the next
+change and carries no way to notice. The durable answer is the drift detector in PR #701,
+`scripts/ci/check_required_contexts_drift.py`, which is the only thing in this repository that reads
+the server at all. That PR should re-measure before it lands, for exactly the reason this table
+shows, and its fixture needs refreshing.
+
+**WHAT REMAINS, measured 2026-09-01 and true only as of that reading.** The file lists 13 contexts;
+the server enforces 14. **The gap is one context: `a reviewer has read this`.**
+
+**THE CODEQL FINDING IS RETRACTED, and the file was right.** Earlier revisions of this item made a
+centrepiece of `codeql.yml` sitting under `DELIBERATELY NOT REQUIRED` while the server required both
+its contexts, and called that a false negative naming a concrete harm. The owner has since removed
+both from protection, separately from the documentation question. **The file's stated rationale --
+that a fork-PR token lacks `security-events: write`, so requiring it would block every fork PR -- is
+the reasoning that now holds, and its entry needs no change.** CodeQL still runs and still reports;
+it no longer blocks a merge. That half is #1384 and PR #700, which this item should not have been
+carrying at all.
+
+**When `enforce_admins` changed is not recoverable.** The API reports the current value and keeps no
+history, so this item does not claim a date for it.
+
+**THE FILE IS NOT THE ONLY RECORD, AND `push_guard.py` IS NOT THE ONLY OTHER ONE.**
+`git grep -n enforce_admins origin/main` finds the claim asserted as OFF across **at least six
+files**, measured 2026-08-31:
+
+| File | What it asserts |
+|---|---|
+| `scripts/hooks/push_guard.py` | at least four times, lines 20, 72, 284 and 300. Line 300 is PRINTED |
+| `.github/required-contexts.txt` | line 26, the row above |
+| `tests/test_push_guard.py` | line 12, so the suite's own record agrees with the wrong value |
+| `scripts/coord/install-git-hooks.ps1` | line 361, "enforce_admins is false, so the owner bypasses all of it" |
+| `.github/workflows/branch-leak-scan.yml` | line 24, treats re-enabling as outstanding work |
+| **`docs/BACKLOG.md` itself** | line 5818, inside **open item #1056** |
+
+**#1056 is the one that bites, because it is in this same file.** It is an open P1 whose text says
+"Re-enabling it would refuse an admin's direct push to `main` -- worth doing on its own merits". Once
+this item merges, `docs/BACKLOG.md` will simultaneously record that the setting is on and propose
+turning it on. Nothing detects that; the two items are thousands of lines apart.
+
+**"At least" is doing real work here and is not hedging.** This item has undercounted twice. It said
+three lines, missed line 72, and was corrected to four. It then said four lines in one file, and the
+undercount had simply moved up a level to six files. Both times an enumeration read as a complete
+list. SDS-3.6, twice, on the same claim.
+
+Two of the four matter more than the others:
+
+- **line 300 is PRINTED to an operator, at the moment the hook refuses their push**: "Do NOT expect
+  the server to stop it: enforce_admins is OFF, so branch protection does not apply to an admin's
+  direct push". A compensating control resting on a false premise, which is what SDS-3.7 forbids,
+  delivered exactly when somebody acts on it.
+- **line 72's clause is false, and its instruction is wrong in one case only.** It reasons that a
+  fresh clone has "nothing but the server-side rule -- which, with `enforce_admins` OFF, is nothing
+  at all when the pusher is an admin", then says: "Do not read 'the server would have caught it'
+  into any of those gaps." The clause is now false. **The instruction is not, except for an admin's
+  direct push to `main`.** The hook has three guards and branch protection touches one of them, on
+  one ref. For the namespace and content guards there is no server-side control at all, measured:
+  a push ruleset returns `422 Source public repos cannot have push rules`, recorded in both
+  `branch-leak-scan.yml` and #1056. So for most of what that paragraph covers the instruction stays
+  right, and an earlier draft of this item overstated it as a flat inversion.
+
+**The harm is a wrong sentence, not a lost way out, and an earlier draft of this item got that
+wrong.** It claimed `gh pr merge --admin` was the documented way out of a permanently-red required
+check and that the way out had therefore closed. Both halves fail. The file names its relaxation
+explicitly at line 82, and it is not `--admin`: it is `gh api -X DELETE
+repos/MEFORORG/MessageFoundry/branches/main/protection/enforce_admins`.
+
+**Nobody has run that call, and this item does not claim it succeeds.** Running it would relax
+protection on `main`, so the claim stays at what was actually checked, read-only: the file names it
+as the relaxation, the actor holds `admin: true`, and the one active ruleset (`protect-main`, rules
+`deletion` and `non_fast_forward`, zero bypass actors) carries no required-status-checks rule that
+would defeat it. That is evidence about the path, not a witness to the effect, and the distinction
+is the point -- an earlier draft asserted the outcome flatly. Note also that `deletion` and
+`non_fast_forward` still apply with no bypass, so the relaxation would not restore the earlier state
+wholesale.
+
+The retraction survives either way, because it needs only line 82 to show `--admin` is not the
+documented relaxation. What survives is narrower still: line 20 misdescribes `--admin` as that
+relaxation.
+
+**The file contradicts itself, and the correct half is the one nobody reads.** Its HISTORY note at
+line 75 says the premise "dissolved and the setting was flipped", which matches the server. The four
+statements above do not.
+
+**NOTHING IN CI CAN SEE ANY OF THIS.** `tests/test_required_contexts.py` pins the count at 13 and
+reconciles prose against the file. It never reads the server. Every mention of the protection API in
+that suite is a comment or a failure message. So the file and the server can drift without limit and
+every required check stays green, which is precisely the state the file was written to end.
+
+**MOST OF THIS CLOSING ACT IS ALREADY BUILT.** PR #718 is stacked on the branch that carries this
+item and closes steps 2 through 5. Read it before doing any of them again. **The order below still
+governs -- the file mirrors the server, so a line added to the file first is the lie it exists to
+prevent -- and the standing instruction it carries is DO NOT SIMPLY TRANSCRIBE THE SERVER**, which is
+the sentence PR #718 quotes when it explains backing out a transcription. It stays here for that
+reason as much as its own.
+
+1. **The CodeQL half is DONE and was never this item's to carry.** The owner removed both contexts
+   from protection on 2026-09-01, which is why *do not simply transcribe the server* was the right
+   instruction: a session that had transcribed the 16 would now be wrong twice. The file's
+   `DELIBERATELY NOT REQUIRED` entry is correct as written and **must not be edited**. That question
+   was already filed as #1384 with PR #700 open against it, which this item duplicated for four
+   review passes because it asserted the drift was unclaimed without checking the open pull requests.
+   **PR #700 and PR #718 both edit `.github/required-contexts.txt` and disagree about the CodeQL
+   lines; #700's premise -- "record CodeQL as required, which it already was" -- is void as of
+   2026-09-01.** Whoever lands second must reconcile, and that is not settled here.
+2. **PARTLY DONE in PR #718, AND #718 NEEDS CORRECTING FIRST.** It adds `a reviewer has read this`
+   with its reasoning, which is right and lands 13 to 14. But it also **rewrites the
+   `DELIBERATELY NOT REQUIRED` entry step 1 says must not be edited**, adds a block asserting
+   "THEY BLOCK A MERGE TODAY ... branch protection enforces SIXTEEN", and adds a
+   `_LIVE_CODEQL_CONTEXTS` constant naming both CodeQL contexts. **All of that is false against a
+   14-context server.** #718 measured 16 before the owner removed them, and this item voided PR
+   #700's premise for exactly that reason without applying the same test to #718. Since #718 is
+   stacked on the branch carrying this item, the two land together and would contradict each other.
+3. **DONE in PR #718:** correct the `enforce_admins` line to `TRUE`. Do not say the relaxation is gone: the one `push_guard.py` names at line 82, the `DELETE` on the protection endpoint, still works. **In this item "escape hatch" means that call and nothing else.**
+4. **PARTLY DONE in PR #718**, which fixes `push_guard.py` and `required-contexts.txt` and names the rest as a deliberate scope choice. Correct every statement of the value **across all six files**, not only the four lines this item
+   names in `push_guard.py`. **Re-grep the whole tree before declaring it done**, because this item
+   has undercounted twice. Line 300 is printed to an operator, line 12 of `tests/test_push_guard.py`
+   is the suite's own record, and #1056 needs a note rather than an edit, since its proposal is now
+   satisfied and that is a separate decision. Fixing only `required-contexts.txt` leaves the wrong
+   value in the place an operator actually reads it.
+5. **DONE in PR #718:** update the count pinned in `tests/test_required_contexts.py`, in the same pull request. It lands 13 to 14, which is right for a 14-context server.
+
+**What this item does NOT propose.** It does not propose a test that calls the GitHub API. A required
+test that reaches the network fails on a fork PR and on any run without a token, which is the
+required-but-absent trap the file's own header warns about. Closing the drift is a config-and-file
+change; keeping it closed is a separate question and is not settled here.
+
+## 1405. nothing writes the security scorecard, so its anchors go stale exactly when the code improves
+
+> 🔢 **Filed 2026-08-31.** Third of the failure-signal gaps; the other two are #1402 and #1403.
+> Verdict: build
+> Closing-act: code
+
+**Cluster:** Security records. **Priority:** P2. **Verdict:** build.
+**Severity:** no engine effect, no PHI axis, and **no deployment axis (sec. 0)**. The engine is not less secure because a citation moved.
+
+**What:** **measured 2026-08-31, no workflow commits or pushes a change to the scorecard.** Two reference it -- `asvs-prove-absences.yml` and `ci.yml` -- but only as INPUT to the verifier, which reads the record and does not maintain it. The record itself is not tracked in this repository.
+
+So there is no writer anywhere in the merge path. An **anchor** -- a citation from a graded cell to a line of engine code -- breaks silently, and it breaks most often **because the code got better and the fix deleted the line the anchor quoted**. The engine is not insecure and the record is not broken; the evidence went stale, and nothing notices.
+
+**Keep the vocabulary exact, because two of these terms get fused and the fused version sends readers to the wrong repository.** The **scorecard** is the record. An **anchor** is a citation from a cell into code. The **verifier** (`scripts/asvs/scorecard.py`) is the INSTRUMENT, not the record, and a cell exists whether or not any job is running.
+
+**What a fix looks like:** something that runs when engine code changes and reports anchors that no longer resolve. It reports; it does not silently rewrite them, because an anchor that moved and an anchor that was wrong need different responses.
+
+**Scope note:** the vocabulary is public and the content is not. This item names the mechanism only. Cell identifiers, coverage and gaps stay where they are.
