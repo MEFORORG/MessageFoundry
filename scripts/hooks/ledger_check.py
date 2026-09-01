@@ -248,6 +248,29 @@ class Ledger:
 
         Keying ownership on the worktree only works because the worktree gate now forces each session into
         its own worktree; before that, every session shared the primary checkout and this key collapsed.
+
+        ***THE PATH IS MORTAL AND THE BRANCH IS NOT, SO THE BRANCH IS A SECOND KEY (BACKLOG #1282).***
+        A worktree can be removed by `rm -rf`, by `git worktree remove`, or by any cleanup that never
+        consults `scripts/worktree/remove.ps1` -- whose guard is real but sits on ONE door. When that
+        happens the recorded path stops matching for EVERY session, the number is uncommittable by
+        anyone, and nothing reports it. Measured 2026-08-30: 43 numbers were already in that state.
+
+        ***THE FALLBACK PRESERVES THE EXCLUSIVITY THE PATH WAS PROVIDING, WHICH IS THE ONLY REASON IT
+        IS SAFE: GIT REFUSES TO CHECK ONE BRANCH OUT IN TWO WORKTREES.*** So "the session on this
+        branch" is as single-valued as "the session in this worktree" ever was -- the gate exists to
+        stop two sessions filing one number, and two sessions cannot hold one branch. What changes is
+        that the key now survives its worktree.
+
+        WHY THIS AND NOT A TRANSFER VERB: a transfer verb would let a seat take a number another
+        session is actively holding, which is the collision the gate exists to prevent. The branch
+        fallback only becomes reachable once the original worktree is GONE -- and a branch that is
+        free to check out is one nobody is working in.
+
+        ***THE LIMIT, STATED RATHER THAN DISCOVERED: A DELETED BRANCH STRANDS THE NUMBER AGAIN.***
+        That is a smaller hole (a branch is cheap to recreate at any commit, and a branch deleted
+        with its work unlanded has lost more than a number) and it is not closed here. The
+        owner-ruled recovery in docs/LEDGER-GATE.md -- recreate a worktree at the recorded path --
+        remains valid and is now the second resort rather than the only one.
         """
         try:
             claim = json.loads((self.alloc / kind / f"{number}.json").read_text(encoding="utf-8"))
@@ -255,7 +278,21 @@ class Ledger:
             return False
         mine = str(self.repo).replace("\\", "/").casefold()
         theirs = str(claim.get("worktree", "")).replace("\\", "/").casefold()
-        return mine == theirs.rstrip("/")
+        if mine == theirs.rstrip("/"):
+            return True
+        # Branch fallback. Deliberately NOT reached when the path matches, so the ordinary case is
+        # unchanged and this cannot mask a path comparison that is merely wrong.
+        recorded_branch = str(claim.get("branch", "")).strip()
+        if not recorded_branch:
+            return False
+        try:
+            current = git("rev-parse", "--abbrev-ref", "HEAD").strip()
+        except (
+            Exception
+        ):  # pragma: no cover - defensive; a detached or broken HEAD is not ownership
+            return False
+        # A detached HEAD reports "HEAD" and names no branch, so it can never match a recorded one.
+        return current != "HEAD" and current.casefold() == recorded_branch.casefold()
 
     def fail(self, what: str, why: str, fix: str) -> None:
         self.failures.append(f"  BLOCKED: {what}\n  {why}\n\n  Do this:\n      {fix}\n")

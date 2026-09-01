@@ -32,7 +32,7 @@
   engine + a separate org-owned config repo.
 - **Related:** [ADR 0007](0007-gui-manageable-connections-toml.md) (connections-as-data, the
   analyst-editable transport layer), [ADR 0002](0002-phase2-transport-security-and-strong-auth.md)
-  (off-loopback transport security per instance), [DUAL_LICENSING_PLAN.md](../DUAL_LICENSING_PLAN.md) (the
+  (off-loopback transport security per instance), `DUAL_LICENSING_PLAN.md` (the
   AGPL §13 / commercial-edition lever this ADR's licensing question feeds),
   [CONFIGURATION.md](../CONFIGURATION.md) (the two configuration surfaces),
   [SERVICE.md](../SERVICE.md) (NSSM service deployment), and the `[ai].environment` /
@@ -137,7 +137,7 @@ AGPL-3.0-or-later: running the **unmodified** engine internally triggers no §13
 parties; a **modified**, network-exposed engine does. Whether HC's own Routers/Handlers loaded via
 `--config` are separate works vs. a derivative work is **legally undefined** and is a real adoption
 question for an org wanting to keep its integration logic private — see
-[DUAL_LICENSING_PLAN.md](../DUAL_LICENSING_PLAN.md).
+`DUAL_LICENSING_PLAN.md`.
 
 ### First instance of the pattern
 
@@ -188,7 +188,7 @@ installs use the pinned wheel. That migration already had to repurpose the built
 6. **Licensing → "config is a separate work" + commercial edition.** Adopt a written position that
    Routers/Handlers loaded via `--config` are a separate work (not a derivative of the AGPL engine), and
    route orgs wanting to modify+redistribute the engine itself to the planned dual-license/commercial
-   edition ([DUAL_LICENSING_PLAN.md](../DUAL_LICENSING_PLAN.md)). **Status 2026-06-17 (owner accepted-risk):**
+   edition (`DUAL_LICENSING_PLAN.md`). **Status 2026-06-17 (owner accepted-risk):**
    the legal review is **deferred to v0.2** — `v0.1.0` ships publicly on the drafted AGPL-3.0-or-later +
    `NOTICE`/`CLA`/`COMMERCIAL-LICENSE` posture **without** prior counsel sign-off (the original "pending legal
    review before the statement is published" stance is superseded; see backlog #13). Config-repo hosting is per-adopter.

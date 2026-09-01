@@ -54,9 +54,16 @@ NOT_APPLICABLE = "not-applicable"
 FAILED = "failed"
 _STATUSES = (MEASURED, NOT_APPLICABLE, FAILED)
 
-# Job results that mean "this job did not run", so no receipt is owed. Anything else -- including
-# `failure` -- owes one: a job that crashed still has to be visible as a dead gate rather than
-# quietly absent.
+# Job results that CAN mean "this job did not run". Anything else -- including `failure` -- owes a
+# receipt outright: a job that crashed still has to be visible as a dead gate rather than quietly
+# absent.
+#
+# THIS TUPLE IS NECESSARY BUT NOT SUFFICIENT, AND THAT IS THE POINT (#1410). `verify` excuses a
+# job only when its result is in here AND it produced no receipt. `cancelled` names two opposite
+# situations -- a run-level cancel that never started the job, and a `timeout-minutes` kill of a
+# job that ran and died mid-measurement -- and only the first is a legitimate absence. The receipt
+# is what separates them, because a job that never started cannot have written one. Keying on this
+# tuple alone excused both for weeks; see the comment at the check itself.
 _DID_NOT_RUN = ("skipped", "cancelled")
 
 
@@ -191,11 +198,53 @@ def verify(needs: dict[str, Any]) -> tuple[list[dict[str, str]], list[dict[str, 
             )
             continue
 
+        # `outputs` is normally a mapping, but this reads a JSON blob GitHub interpolates, so a
+        # malformed or truncated payload can hand us a string. Before #1410 the _DID_NOT_RUN check
+        # ran FIRST and short-circuited such a job; moving this read above it put an unguarded
+        # .get() on that path, where a string `outputs` raised AttributeError and took the whole
+        # gate down with a stack trace instead of a verdict. isinstance keeps the read total.
+        outputs = job.get("outputs")
+        raw = outputs.get("receipt", "") if isinstance(outputs, dict) else ""
+
         result = str(job.get("result", "")).lower()
-        if result in _DID_NOT_RUN:
+        if result in _DID_NOT_RUN and not str(raw).strip():
             continue  # legitimately did not run (e.g. coverage is PR-only)
 
-        raw = (job.get("outputs") or {}).get("receipt", "")
+        # THE EXCUSE IS CONDITIONAL ON THE RECEIPT BEING ABSENT, NOT ON THE RESULT STRING (#1410).
+        # `cancelled` covers two OPPOSITE things and this check used to excuse both. A run-level
+        # cancel or a superseded run never started the job, so no receipt exists and the `continue`
+        # above still fires. A `timeout-minutes` kill is the other one: the job RAN, died
+        # mid-measurement, and its record step (which carries `if: always()`) still wrote a
+        # receipt. Measured 2026-08-31 on PRs 708/711/712/719 -- the coverage gate reported itself
+        # dead on every one of them, in these exact words, and this function threw it away unread:
+        #
+        #   "coverage": {"result": "cancelled", "outputs": {"receipt":
+        #     "{\"signal\":\"coverage\",\"status\":\"failed\",
+        #       \"reason\":\"coverage.xml was not produced; the measurement never happened\"}"}}
+        #
+        # So the FAILED branch below was already correct and simply unreachable. `gate liveness`
+        # passed on all four while the coverage signal was unmeasured -- a green meta-gate over a
+        # dead gate, which is the precise thing this file was written to make impossible.
+        #
+        # NOT SOLVED BY DROPPING "cancelled" FROM _DID_NOT_RUN. This job carries `if: always()`,
+        # which GitHub evaluates true under cancellation, so on a genuine run-level cancel it would
+        # still run and would then go red for something nobody caused. Keying on the receipt is
+        # strictly better, because a job that never STARTED cannot have written one.
+        #
+        # WHAT THE RECEIPT SEPARATES, STATED EXACTLY -- an earlier draft of this comment overstated
+        # it, and the overstatement is the same defect class the item is about. The receipt
+        # distinguishes "the job never started" from "the job ran". It does NOT distinguish a
+        # timeout kill from a mid-flight cancel. A run cancelled while this job is inside pytest
+        # DOES reach the `always()` record step, DOES leave a receipt, and WILL now go red. That is
+        # reachable in this repo: ci.yml sets `concurrency: cancel-in-progress`, so a fast second
+        # push cancels the first run mid-flight. The cost is a spurious red on an ADVISORY gate,
+        # which is the right side to err on -- a false red is visible and gets investigated, while
+        # the false green this fix removes hid a dead gate for eight days. Recorded so the next
+        # reader who sees that red knows it is a known edge and not a regression.
+        #
+        # RESIDUAL, also not covered: `cancelled` with NO receipt is still excused. The fix rests
+        # on the `always()` step winning the race against teardown. It won on all four measured
+        # kills, but a kill that loses that race is indistinguishable from a job that never ran.
         if not str(raw).strip():
             violations.append(
                 _fail(
@@ -233,15 +282,23 @@ def verify(needs: dict[str, Any]) -> tuple[list[dict[str, str]], list[dict[str, 
             if not str(receipt.get("reason", "")).strip():
                 violations.append(_fail(signal, f"status={NOT_APPLICABLE} with no reason given"))
                 continue
-            if result == "failure":
+            if result in ("failure", "cancelled"):
                 # A job that DIED has no standing to declare itself inapplicable. Without this, the
                 # softest possible receipt launders a hard failure into a pass -- and every step in
                 # these jobs is continue-on-error, so nothing else would be red either.
+                #
+                # `cancelled` joined `failure` here with the receipt-conditional skip above
+                # (#1410). Before that change a cancelled job never reached this branch, so the
+                # hole could not open; now that a timeout-killed job IS examined, a receipt reading
+                # `not-applicable` would launder the kill into a pass by exactly the route the
+                # `failure` arm already blocks. Both are "the job did not finish", so both are
+                # disqualified from claiming there was nothing to measure.
                 violations.append(
                     _fail(
                         signal,
                         f"job result={result!r} but the receipt claims {NOT_APPLICABLE} "
-                        f"({receipt.get('reason')!r}). A failed gate is dead, not inapplicable.",
+                        f"({receipt.get('reason')!r}). A gate that did not finish is dead, not "
+                        "inapplicable.",
                     )
                 )
                 continue

@@ -335,7 +335,17 @@ cross-session message (faster, no receipt, dies with the session).**
    *"Sessions push their own."* No per-action approval is needed for your own push or your own PR.
 3. **THE MERGE IS STILL THE LANDER'S**, and a PR reaches it THROUGH THE REVIEWER: open the PR, notify
    the Reviewer seat, and it either returns the PR to you with findings or passes it to the Lander,
-   which merges. If no Reviewer is running, route to the Lander as before.
+   which merges.
+   **RETIRED 2026-08-31: this line previously read** "If no Reviewer is running, route to the
+   Lander as before." **That fallback no longer exists** -- since `a reviewer has read this`
+   became a required context, the Lander cannot merge an unlabelled PR either.
+   **WHAT BLOCKS A MERGE IS THE `reviewed` LABEL, NOT THE REVIEWER SEAT, AND ANY SEAT CAN APPLY
+   IT** -- `gh pr edit <N> --add-label reviewed`. Measured 2026-08-31: **at least two of** PRs 713,
+   716 and 714 merged with no Reviewer seat running -- 713 and 716 are clean; 714 merged 52
+   minutes inside a reviewer seat's freshness window and cannot be counted. Nothing automated ever adds the label and a push STRIPS
+   it, so label after your last push. **The gate records that a step HAPPENED, not that an
+   independent party looked**, so labelling your own PR unread satisfies the machine and defeats
+   the point.
 
 **Direct pushes to `main` remain blocked by the harness, so branch and PR is still the path.** What
 rule 2 removes is the approval hop on your OWN branch, not the protection on `main`.
@@ -399,6 +409,12 @@ survives with a narrower subject rather than being deleted.
   worktree** (`scripts/worktree/new.ps1 -Name <x>`, cleanup with `remove.ps1`). Each gets an isolated
   checkout + branch + `.venv`; same remote, same PR flow. See [`docs/WORKTREES.md`](docs/WORKTREES.md).
   (The AI project memory is shared across sessions — coordinate memory writes.)
+- **Launching a background session? PUT THE PROMPT FIRST, or close the flags with `--`.** At least
+  `--allowedTools`, `--disallowedTools`, `--tools`, `--add-dir`, `--mcp-config`, `--betas` and `--file`
+  take **lists**, so `claude --bg --allowedTools Bash Edit "do the work"` swallows the prompt as a third
+  tool name. The session starts with nothing to do, exits 0, and then lists as `state=blocked` — which
+  is also what a real permission block looks like, so the lane reads as alive and does nothing. Measured
+  list and the reasoning: [`docs/WORKTREES.md`](docs/WORKTREES.md).
 
 ### Before you verify
 - Run `/simplify` on the changed code before the verification quartet below. See
