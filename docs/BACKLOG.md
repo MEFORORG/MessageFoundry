@@ -18543,3 +18543,72 @@ Within `scripts/coord` and `scripts/hooks` specifically, four files are caught b
 **Do not create a third copy.** The vault should CONSUME `claude-multisession` rather than hold its own fork of the same scripts. Measured 2026-08-31, comparing this repo's coordination scripts against the ones already in `claude-multisession`: **0 identical, 16 differing, 28 absent.** Two independent copies with no defined direction of flow produced that in a few weeks; a third would be worse, and the drift is invisible because both sides keep working.
 
 **Related:** the porting and de-drifting work is filed in that repository's own tracker, issues 99 to 105, deliberately outside this number space.
+
+## 1414. an allocation can be stranded in a worktree that EXISTS but cannot reach the branch its work is on
+
+> 🔢 **Filed 2026-09-01 (lander).** Two independent instances in one night, from two sessions
+> that reached it by different routes. Distinct from [#1282](#1282-an-allocation-whose-worktree-is-deleted-can-never-be-filed-and-allocps1-has-no-transfer-path)
+> and NOT closed by the fix open for it: verified by reading that fix's own mechanism, not by
+> assuming.
+> Verdict: build
+> Research: none
+> Closing-act: code
+
+**Cluster:** coordination tooling / ledger integrity. **Priority:** P2. **Verdict:** build.
+**Severity:** no engine, PHI or deployment axis (sec. 0). Nothing ships in the wheel. The cost is real
+work that is finished, correct, and cannot be committed by anybody.
+
+**HOW THIS DIFFERS FROM #1282, WHICH IS THE FIRST THING TO CHECK BEFORE READING FURTHER.** #1282 is the
+worktree DELETED case, and its owner-ruled recovery in [`LEDGER-GATE.md`](LEDGER-GATE.md) is *recreate a
+worktree at the recorded path*. Here the recorded path **already exists**, so that recovery is satisfied
+and buys nothing. The worktree is alive, occupied, and sitting on a different branch.
+
+**MECHANISM.** `Checker.owns` (`scripts/hooks/ledger_check.py:246`) keys entitlement on the recorded
+worktree path. To commit an item you must be IN the worktree it was allocated to. But the work may be on
+a branch that worktree is not on and cannot get to, because **git refuses to check out a branch a second
+worktree already holds**. So the entitlement and the branch can come to rest in different worktrees, and
+neither can be moved to the other.
+
+**MEASURED INSTANCE A -- BACKLOG #1406, 2026-09-01.**
+
+| | |
+|---|---|
+| entitlement recorded to | worktree X (a live session's tree) |
+| worktree X is on branch | a DIFFERENT branch from the work |
+| the work targets PR 717, on | the branch Y holds |
+| that branch is already checked out at | worktree Y (a different tree) |
+
+Worktree X cannot switch to the branch (git refuses, because Y holds it). Y has the branch and is not the
+entitled worktree, so `owns` rejects it. A correcting patch has been sitting undeliverable on the
+owner's desktop since 21:14 as a result. **A human hits the same wall**, which is worth stating because
+the first account of this case concluded "a human must run it from that worktree" -- that remedy does not
+work either, in its stated form.
+
+**MEASURED INSTANCE B -- BACKLOG #1211.** The allocation names a worktree that is gone, the build sits in
+a new one, and `alloc.ps1` has no transfer switch. Reported independently by the session holding it.
+
+**THE TWO INSTANCES FAIL THROUGH DIFFERENT LIMBS, AND THAT IS THE POINT OF FILING ONE ITEM RATHER THAN
+TWO.** B fails because there is no transfer path. A fails because the destination cannot be reached at
+all. **A fix that adds a transfer verb closes B and leaves A exactly as stuck** -- and anyone filing this
+from one instance alone will scope it to that limb and it will look complete.
+
+**PR 703 DOES NOT CLOSE THIS, AND I CHECKED THE MECHANISM RATHER THAN THE TITLE.** #703 adds a branch
+fallback to `owns`: if the path does not match, compare the RECORDED branch to the CURRENT branch. For instance A the recorded branch is not the branch the work is on, so **both keys miss** and the number stays uncommittable. #703 states its own limit as *"a deleted branch
+strands the number again"*; this is a second, different limit -- **a live branch the recorded worktree
+cannot reach, whose name is not the recorded one.**
+
+**AND THE SAFETY ARGUMENT FOR #703 IS THE SAME RULE THAT CREATES THIS DEADLOCK.** #703 is safe precisely
+because *"git refuses to check one branch out in two worktrees"*, which makes "the session on this branch"
+single-valued. That identical rule is what stops the entitled worktree in instance A from reaching its
+work. The property is load-bearing in both directions, so a fix must not simply relax it.
+
+**`alloc.ps1 -Reassign` WAS CONSIDERED AND DECLINED -- DO NOT RE-PROPOSE IT AS NOVEL.**
+[`LEDGER-GATE.md`](LEDGER-GATE.md) records it: *"honest, but it puts a hole in the non-transferable rule
+the gate rests on"*, written down expressly so it is not reopened. #703's author gives the sharper form:
+a transfer verb would let a seat take a number another session is actively holding, which is the
+collision the gate exists to prevent. Any proposal here has to survive that objection rather than ignore it.
+
+**WHAT IS NOT ESTABLISHED.** No fix is proposed. The population is two, both from one night, and no sweep
+has counted how many allocations are currently in this state -- #1282 measured 43 in ITS state, and the
+comparable number for this one is unknown. Whether this is common enough to warrant a mechanism, or rare
+enough to warrant a documented manual recovery, is exactly what is missing.
