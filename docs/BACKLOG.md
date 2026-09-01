@@ -18599,7 +18599,7 @@ defect as #1300 and is graded the same way.
 
 **What changed, and it closes the original item.** `a reviewer has read this` is now a required status
 context on `main`. Measured 2026-08-31: **16 contexts, `strict` true, `required_approving_review_count`
-0**. The gate is live, and PRs 715, 716 and 717 all reported it red until a reviewer labelled them.
+0**. The gate is live and it holds pull requests: as of 2026-08-31 the only `reviewed` label event on any of 715, 716 and 717 is one on 716, at 17:41 CDT. 715 and 717 have never carried the label and both still report the check red. An earlier draft of this sentence said all three had been labelled. That was false when written, about this very pull request, and it survived because it was welded to a true conclusion the API proves on its own.
 
 **Why approvals are zero and must stay zero:** every session pushes as one GitHub identity, so a
 human-approval requirement would wedge every pull request. **That makes this one check the entire
@@ -18615,11 +18615,31 @@ ways.
 |---|---|---|
 | 13 contexts, no `a reviewer has read this` | 16 contexts, including it | A reader asking "is review enforced?" gets NO from the file and YES from the server |
 | `codeql.yml` is DELIBERATELY NOT REQUIRED, because a fork-PR token lacks `security-events: write` and requiring it "would block every fork PR" | `CodeQL (javascript-typescript)` and `CodeQL (python)` are both required | The file asserts a **false negative** and names a concrete harm. Either the harm is real and two contexts should come off, or the reasoning is stale. Both are decisions, and neither has been made |
-| `enforce_admins = FALSE`, called "the documented escape hatch in `scripts/hooks/push_guard.py`" | `enforce_admins` is **true** | The escape hatch is closed. Anyone reaching for it during a permanently-red required check finds it gone, at the moment they need it |
+| `enforce_admins = FALSE`, called "the documented escape hatch in `scripts/hooks/push_guard.py`" | `enforce_admins` is **true**, read 2026-08-31 | The escape hatch is closed. Anyone reaching for it during a permanently-red required check finds it gone, at the moment they need it |
 
 **When `enforce_admins` changed is not recoverable.** The API reports the current value and keeps no
-history, so this item does not claim a date for it. That is itself part of the finding: the file was
-the only record, and it is wrong.
+history, so this item does not claim a date for it.
+
+**THERE IS A SECOND RECORD, AND IT IS THE WORSE ONE.** `scripts/hooks/push_guard.py` also states the
+setting, in three places, and all three say OFF while the server says on. Two are prose. The third is
+not:
+
+- its module docstring says `enforce_admins` was "DISABLED again on 2026-07-29", so `gh pr merge
+  --admin` "works once more" and "for an admin, protection does not apply";
+- an inline comment repeats it as a correction to an earlier stale note;
+- **the hook PRINTS it to an operator, at the moment it refuses their push**: "Do NOT expect the
+  server to stop it: enforce_admins is OFF, so branch protection does not apply to an admin's direct
+  push, and this hook is the only" thing left.
+
+That last one is a compensating control resting on a false premise, which is what SDS-3.7 forbids,
+and it is delivered at exactly the moment somebody acts on it. The harm has two directions and they
+are not symmetric. Telling an operator the server will not stop them, when it will, is a false alarm.
+But the docstring's other half promises `gh pr merge --admin` as the way out of a permanently-red
+required check, and with `enforce_admins` on that command does not work. A documented escape hatch
+that fails is discovered only by the person already stuck.
+
+The same file's own HISTORY note says the setting "was flipped", which matches the server. So the
+file contradicts itself, and the half a reader is most likely to act on is the wrong half.
 
 **NOTHING IN CI CAN SEE ANY OF THIS.** `tests/test_required_contexts.py` pins the count at 13 and
 reconciles prose against the file. It never reads the server. Every mention of the protection API in
@@ -18633,7 +18653,9 @@ exists to prevent:**
    the fork-PR reasoning, or remove them from protection. Do not simply transcribe the server.
 2. Add `a reviewer has read this` to the file, with its reasoning, and record the CodeQL decision.
 3. Correct the `enforce_admins` line to `TRUE` and say what replaces the escape hatch it described.
-4. Update the count pinned in `tests/test_required_contexts.py`, in the same pull request.
+4. Correct all three statements in `scripts/hooks/push_guard.py`, including the one it PRINTS. Fixing
+   only `required-contexts.txt` leaves the wrong value in the place an operator actually reads it.
+5. Update the count pinned in `tests/test_required_contexts.py`, in the same pull request.
 
 **What this item does NOT propose.** It does not propose a test that calls the GitHub API. A required
 test that reaches the network fails on a fork PR and on any run without a token, which is the
