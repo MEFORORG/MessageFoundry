@@ -79,7 +79,8 @@ const FIELDS: Field[] = [
     desc: "Audited escape: unbounded PHI retention.",
     insecure: true, risk: "unbounded PHI retention is permitted" },
   { key: "audit_all_authorization_decisions", label: "Audit all authorization decisions", type: "bool", group: "Data handling",
-    desc: "PHI access is ALWAYS audited; this adds full authz tracing (off by default — forcing it on risks flooding the audit log)." },
+    desc: "PHI access is ALWAYS audited; this records the grant for every authorization decision on top. On by default (BACKLOG #1277).",
+    insecure: false, risk: "every authenticated READ is authorized but NOT recorded — what an account reached cannot be reconstructed afterwards" },
   // ── What this instance handles ──────────────────────────────────
   { key: "handles_real_patient_data", label: "Handles real patient data", type: "tristate", group: "What this instance handles",
     desc: "The master posture lever. Derived from the environment name when unset (dev → no, staging/prod → yes)." },

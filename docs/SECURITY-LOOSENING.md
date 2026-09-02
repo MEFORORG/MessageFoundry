@@ -59,7 +59,7 @@ section reference.
 | Data handling | `block_unlisted_outbound` | `true` |
 | | `delete_message_bodies_after_days` | `30` (`0` = keep forever) |
 | | `allow_keeping_phi_indefinitely` | `false` |
-| | `audit_all_authorization_decisions` | `false` (see note) |
+| | `audit_all_authorization_decisions` | `true` (see note) |
 | Enforcement dial | `enforcement` | `enforce` (refuse; `warn` = loud audited loosening) |
 | Posture lever | `handles_real_patient_data` | *derived from environment* |
 | | `production_instance` | *derived from environment* |
@@ -99,11 +99,14 @@ a custom-named environment must declare them or `serve` fails closed. `handles_r
 *master data-class lever* — the PHI-only gates below key on it — and now defaults to PHI on every built-in
 env (a genuinely-synthetic box must set it `false` explicitly; see its deviation below).
 
-`audit_all_authorization_decisions = false` is a deliberate **secure-and-usable** default, not a loosening
-(ADR 0118 §5, owner-confirmed): ePHI access is already always audited, and forcing full authz tracing on
-would flood the hash-chained audit log (console polling + the `/ws/stats` feed), which itself degrades
-security monitoring. Turn it **on** for an off-loopback deployment that wants the full L3 authorization
-trail.
+`audit_all_authorization_decisions` **changed sides on 2026-09-02** (BACKLOG #1277). It used to default
+`false` and this page called that "a deliberate secure-and-usable default, not a loosening", on the
+ground that full authz tracing would flood the hash-chained audit log through console polling and the
+`/ws/stats` feed. **That named a surface the switch cannot reach:** the web console is server-rendered
+in-process and never traverses `require()`, and `authorize_ws` fires once per *connection*. The default
+is now `true`, turning it **off** is a deviation, and it has its own entry below. The owner delegated
+the call to the Console on 2026-09-02; the Console decided ([ADR 0118](adr/0118-secure-by-default-security-configuration-section.md)
+§5, amended).
 
 ---
 
@@ -222,6 +225,22 @@ trail.
   an *unset* window happened only at `enforcement = warn`. It happens on **both** dials, so the refusal above
   is reached only by an explicit `0` — or by the opt-out itself, which suppresses the auto-bound and therefore
   leaves an unset window unbounded.
+
+### `audit_all_authorization_decisions = false` — narrow the authorization trail to the sensitive surface
+- **What you lose:** every authenticated **read** is authorized and **not recorded**. Only the fixed
+  state-changing / configuration / user-management set leaves an `auth.permission_granted` row, so the
+  trail can no longer answer *what did this account actually reach*. The loss is silent and cannot be
+  repaired afterwards: the rows were never written, and nothing anywhere reports the gap.
+- **When acceptable:** a measured audit-volume problem on a busy JSON-API deployment, taken as an interim
+  step. The volume this switch adds is one row per authenticated request per `require()`-gated route,
+  bounded by your API clients' polling cadence — the browser console contributes none of it, because it
+  never traverses `require()`.
+- **Compensating controls:** ePHI access stays audited either way (the tamper-evident chain and the
+  message-event compliance floor are unconditional), and `auth.permission_denied` is still written on
+  every refusal at either value. Prefer slowing the polling client, or ask for the rate/sampling bound on
+  read grants, over turning the trail off.
+- **Still refused:** nothing. This switch is advisory-only — it changes what is recorded, never what is
+  permitted, so no serve gate keys on it at any posture.
 
 ### `allow_single_factor_admin_when_exposed = true` — lift the strict-enforcement single-factor-admin refusal
 - **What you lose:** on a **PHI** instance under **strict enforcement** (`enforcement = enforce`, the default)

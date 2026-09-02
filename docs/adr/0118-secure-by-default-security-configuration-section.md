@@ -99,7 +99,7 @@ max_session_hours            = 12
 block_unlisted_outbound      = true          # deny-by-default egress; only allow-listed destinations send
 delete_message_bodies_after_days = 30        # 0 = keep indefinitely (audited)
 allow_keeping_phi_indefinitely   = false
-audit_all_authorization_decisions = false    # PHI access is ALWAYS audited; this adds full authz tracing
+audit_all_authorization_decisions = true     # PHI access is ALWAYS audited; this adds full authz tracing
 
 # ── What this instance handles (the master posture lever) ────────
 handles_real_patient_data    = true          # was [ai].data_class = "phi"
@@ -159,6 +159,31 @@ acceptable / compensating controls* — the inverted-hardening-guide CISA prescr
   ones — defense-in-depth, not a HIPAA requirement — and forcing it on by default risks **flooding the
   audit log**, which itself degrades security monitoring. So the secure-and-usable default is scoped, with
   the friendly name/description making the always-on PHI auditing explicit.
+
+  > **AMENDMENT 2026-09-02 — this default is now `true`, and the paragraph above is superseded.**
+  > It is kept, not deleted: a deleted decision gets re-derived, and the reasoning below only makes sense
+  > beside the reasoning it replaces. **Who decided:** the owner **delegated** the call to the Console on
+  > 2026-09-02, in their words *"Do as you judge best"*; the **Console decided** to reverse it. This
+  > reverses a judgment §5 records as an owner veto point confirmed 2026-07-17, so a delegated decision
+  > reversed an owner-confirmed one. It was **not** owner-ratified. Filed as BACKLOG #1277.
+  >
+  > **Why.** The flooding claim named the wrong surface. The web console never traverses `require()` — it
+  > is server-rendered in-process, calls engine functions directly, and gates on its own cookie-world
+  > `require_ui`, which records denials only — so no console page view can write a grant row, and
+  > `authorize_ws` fires once per **connection** rather than per message. **That does not make the volume
+  > zero.** The JSON API is a different surface and it does change: 33 `require()`-gated GET routes in
+  > `api/app.py` (30 of them writing a row; 3 ask only for a PHI-view permission and stay silent) plus 9
+  > in `api/auth_routes.py` go from no grant row to **one row per authenticated request**, bounded by
+  > JSON-API client polling cadence rather than by page views. The measurement lives once, on the
+  > `audit_all_authz` field in [`config/settings.py`](../../messagefoundry/config/settings.py).
+  >
+  > **What it buys.** A trail that records only the decisions somebody already judged sensitive cannot
+  > answer the question a trail exists to answer — *what did this account actually reach* — and a site
+  > cannot reconstruct a read history afterwards, because the rows were never written. Turning it off is
+  > now a **loosening** and `security_loosenings()` names it. PHI-view grants stay excluded at either
+  > value; the dedicated PHI-access audit path already records those. **The second §5 judgment below,
+  > the PHI-vs-synthetic split, is untouched by this amendment.** If the volume proves too high, the
+  > answer is a rate or sampling bound on read grants, not an off switch on the whole trail.
 - **Preserve the PHI-vs-synthetic split, made visible.** A synthetic/dev instance carries no ePHI, so the
   strict PHI-only gates (at-rest-encryption refusal, deny-by-default egress, bounded retention) staying
   relaxed there is defensible risk-based tailoring and preserves dev ergonomics — it is what the engine
@@ -237,6 +262,14 @@ acceptable / compensating controls* — the inverted-hardening-guide CISA prescr
       authz decision, and forcing it on risks flooding the audit log). The **PHI-vs-synthetic split is
       preserved and surfaced**: a synthetic instance keeps the PHI-only gates relaxed exactly as today, and
       the posture view **states** the relaxation so it is never silent.
+
+      > **AMENDMENT 2026-09-02 — the first of the two no longer holds.** The retraction sits **here**, at
+      > the claim, rather than only in §5, because this checklist is what a reader consults to learn what
+      > was settled on acceptance. `audit_all_authorization_decisions` now defaults **`true`** (BACKLOG
+      > #1277): the owner **delegated** the call to the Console on 2026-09-02 and the **Console decided**,
+      > so a delegated decision reversed an owner-confirmed one — this line is no longer evidence that the
+      > owner confirmed the current value. **The second judgment, the PHI-vs-synthetic split, still
+      > stands exactly as written.** Full reasoning in §5.
 - [x] **Move-vs-stay boundary — owner delegated to the author; §1/§2 adopted verbatim** with these
       implementation judgments:
   - **Desugar, don't re-point (ADR 0007 precedent).** `[security]` is a thin **input layer**: the loader

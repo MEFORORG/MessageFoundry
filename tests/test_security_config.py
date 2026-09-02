@@ -161,7 +161,10 @@ def test_secure_defaults_applied(tmp_path: Path) -> None:
     assert d.block_unlisted_outbound is True
     assert d.delete_message_bodies_after_days == 30
     assert d.allow_keeping_phi_indefinitely is False
-    assert d.audit_all_authorization_decisions is False  # owner-confirmed scoped default (§5)
+    # BACKLOG #1277 reversed the ADR 0118 §5 `false` (delegated by the owner to the Console on
+    # 2026-09-02; decided by the Console). The full-trail assertions live in
+    # test_authz_grant_trail_defaults_on below.
+    assert d.audit_all_authorization_decisions is True
     # Two production-PHI acknowledgment switches (ADR 0140 No-loosen carve-out): default false = byte-identical.
     assert d.allow_single_factor_admin_when_exposed is False
     assert d.allow_unencrypted_phi_under_strict_enforcement is False
@@ -172,6 +175,34 @@ def test_secure_defaults_applied(tmp_path: Path) -> None:
     assert s.auth.enabled is True and s.auth.require_mfa is True
     assert s.api.host == "127.0.0.1" and s.api.is_loopback is True
     assert s.security.local_access_only is True
+
+
+def test_authz_grant_trail_defaults_on(tmp_path: Path) -> None:
+    """BACKLOG #1277: both spellings default ON, they agree, and turning it off is a loosening.
+
+    The default is read back through ``load_settings`` on an EMPTY file rather than off the model, and
+    that is the whole point of the test. The ``[security]`` desugar is presence-gated, so a
+    ``[security]`` default that the ``[diagnostics]`` field does not match would be cosmetic: the
+    section is absent, nothing is written through, and the internal field decides. Asserting
+    ``SecuritySettings().audit_all_authorization_decisions`` alone cannot see that.
+    """
+    s = _load(tmp_path, "")
+    assert s.diagnostics.audit_all_authz is True  # the field the grant sites actually read
+    assert s.security.audit_all_authorization_decisions is True  # the operator-facing spelling
+    assert s.diagnostics.audit_all_authz is s.security.audit_all_authorization_decisions
+
+    # The alias carries the OFF direction too. Only this direction is asserted here:
+    # test_security_section_is_canonical above already pins the `true` write-through and the refusal of
+    # the retired `[diagnostics]` spelling, and a second copy of either would just break in pairs.
+    off = _load(tmp_path, "security.audit_all_authorization_decisions = false\n")
+    assert off.diagnostics.audit_all_authz is False
+    assert off.security.audit_all_authorization_decisions is False
+
+    # Turning the trail off is now a LOOSENING. That it is REPORTED is pinned by the completeness floor
+    # in tests/test_security_posture_defaults.py; what that floor cannot check is whether the entry says
+    # anything a reader can act on, so the message itself is asserted here.
+    named = dict(_loosenings(SecuritySettings(audit_all_authorization_decisions=False)))
+    assert "NOT recorded" in named["audit_all_authorization_decisions"]
 
 
 # --- AC-3: local_access_only=true + non-loopback listen_address refuses ---------------------------
@@ -206,7 +237,8 @@ def test_loosening_warns_and_prod_phi_refuses(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     # security_loosenings() names each opt-out in plain language (the serve warning + the posture view
-    # both consume it) — audit_all_authorization_decisions=false is NOT a loosening (secure default).
+    # both consume it). Since BACKLOG #1277, audit_all_authorization_decisions=false IS one of them —
+    # asserted in test_authz_grant_trail_defaults_on below.
     loos = dict(_loosenings(SecuritySettings(require_mfa=False, block_unlisted_outbound=False)))
     assert "require_mfa" in loos and "single-factor" in loos["require_mfa"]
     assert (
