@@ -2366,8 +2366,12 @@ store, and only one of the pools carries a knob.
 3. **One dedicated single-worker `ThreadPoolExecutor` per alternate-credential File endpoint**
    (`transports/wincred.py`, `mefor-filecred`). Impersonation must never leak onto a shared pool, so
    this work is deliberately **not** on the default executor — and it carries **no engine-owned
-   timeout**: a wedged share pins that endpoint's one thread indefinitely. It cannot starve the shared
-   pool, which is the mitigating half.
+   timeout**: a wedged share pins that endpoint's one thread indefinitely.
+   It cannot starve the shared pool, which is the mitigating half, and that now holds on the
+   **release** path too, which is where it did not: `close()` shuts the worker down without joining
+   it and waits out an in-flight call on the event loop for `_CLOSE_DRAIN_TIMEOUT_S` (**5** s), then
+   logs a WARNING and returns (BACKLOG #1195). A blocking join is the natural spelling, and it would
+   have run on the shared default executor, inheriting the wedged share's unbounded hold.
 
 At saturation further `to_thread` calls **queue on the executor rather than failing**. So the release
 mechanism differs per class: a timeout for the bounded hops, the 5 s strict-validate backstop and

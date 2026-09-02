@@ -12,10 +12,19 @@ not be answered from a clone -- and five places in this repo answered it differe
                                           and under a different string than its own line 18 gives
     tests/test_push_guard.py              12
 
-The live API says 12. That question is not trivia here: ``required_approving_review_count`` is 0 and
-auto-merge is armed, so required-set membership is the ONLY thing separating "reviewed" from "merged
-unread". A session reasoning from docs/CI.md would conclude that gitleaks, semgrep, npm-audit and
-crypto-inventory are advisory -- i.e. that four blocking security gates were safe to weaken.
+The live API said 12 when those five were counted. It says 14 at 2026-08-31 20:57 CDT. That question
+is not trivia here: ``required_approving_review_count`` is 0 and auto-merge is armed, so required-set
+membership is the ONLY thing separating "reviewed" from "merged unread". A session reasoning from
+docs/CI.md would conclude that gitleaks, semgrep, npm-audit and crypto-inventory are advisory -- i.e.
+that four blocking security gates were safe to weaken.
+
+THE SET NOW HOLDS A CONTEXT THAT DOES NOT TEST THE CODE, and it is the one with the least behind it.
+``a reviewer has read this`` (review-gate.yml, armed 2026-08-31, BACKLOG #1404) is this repository's
+ENTIRE review requirement. It is load-bearing BECAUSE approvals are pinned at 0 rather than in spite of
+it: every session pushes as one GitHub identity, so a human-approval rule would wedge every pull
+request instead of reviewing any. Drop that context from protection and review is not weakened, it is
+gone -- nothing else anywhere reports that a green pull request was never read. The count below is what
+makes removing it a deliberate edit rather than a quiet one.
 
 WHAT THIS PINS. ``.github/required-contexts.txt`` is the checked-in claim; these tests assert every
 in-repo statement agrees with it. The file is NOT the enforcement -- the server is -- so when branch
@@ -97,8 +106,17 @@ def test_the_canonical_file_parses_and_names_the_live_set() -> None:
         f"duplicate context in {_CANONICAL.name}: {contexts}"
     )
     # Pinned so that ADDING or REMOVING a required check is a deliberate, reviewed edit here rather
-    # than a silent one. Verified against `gh api repos/MEFORORG/MessageFoundry/branches/main/protection`.
-    assert len(contexts) == 13, (
+    # than a silent one. Verified against `gh api repos/MEFORORG/MessageFoundry/branches/main/protection`
+    # at 2026-08-31 20:57 CDT: 14 contexts, SET-EQUAL to the file with nothing extra on either side.
+    # Set-equal is the reading worth recording -- a count alone cannot tell a matching set from two
+    # errors that cancel.
+    #
+    # THE PIN GOES STALE IN THE DIRECTION THAT LOOKS FINE. It read 13 while the server held more, and
+    # a context this file omits reads as NOT BLOCKING -- the reassuring answer rather than the true
+    # one. A count that only ever fails when someone edits the FILE cannot notice the server moving
+    # underneath it, so reconcile against the API, never against this number. The server moved four
+    # times on 2026-07-29 and twice more on 2026-08-31.
+    assert len(contexts) == 14, (
         f"the canonical required set changed to {len(contexts)} contexts. If branch protection really "
         "changed, update this count AND every claim this suite checks; if it did not, revert the file."
     )

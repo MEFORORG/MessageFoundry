@@ -1246,6 +1246,26 @@ def _l5b_serve(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, toml: str, env: 
     return main(["serve", "--config", str(SAMPLES_CONFIG), "--env", env])
 
 
+def _relocated_public_origin_key() -> str:
+    """The operator-facing key the loader ACCEPTS for what `[api].public_origin` used to spell.
+
+    BACKLOG #1026. Read from the relocation map rather than written as a literal: ADR 0118 moved the
+    key and the loader REJECTS the old spelling as file or env input, so a refusal naming the old one
+    hands an operator a remediation that dies at load. A test hard-coding either spelling would keep
+    passing after the NEXT relocation while the message drifted away from it -- silently, which is the
+    whole defect. Mirrors the pin in tests/test_api_tls.py for the ASVS 12.1.1 refusal.
+    """
+    from messagefoundry.config.settings import _RELOCATED_TO_SECURITY
+
+    return _RELOCATED_TO_SECURITY[("api", "public_origin")]
+
+
+# The anchor for "did THIS refusal fire", and deliberately NOT the key name. The ADR 0143 degrade
+# notice names `web_console_public_address` too, so a negative assertion on the key would trip on a
+# message that is not a refusal at all -- and one test below asserts that degrade notice IS present.
+_UI_TERMINATOR_REFUSAL = "declared TLS terminator requires"
+
+
 def test_serve_ui_upstream_requires_public_origin(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -1259,7 +1279,10 @@ def test_serve_ui_upstream_requires_public_origin(
         '[api]\ntls_terminated_upstream = true\ntrusted_proxies = ["10.0.0.2"]\n',
     )
     assert rc == 2
-    assert "requires [api].public_origin" in capsys.readouterr().err
+    err = capsys.readouterr().err
+    assert _UI_TERMINATOR_REFUSAL in err
+    # The remediation must name the key the loader accepts, not the relocated spelling.
+    assert _relocated_public_origin_key() in err
 
 
 def test_serve_ui_upstream_with_public_origin_starts(
@@ -1278,7 +1301,7 @@ def test_serve_ui_upstream_with_public_origin_starts(
         '[api]\ntls_terminated_upstream = true\ntrusted_proxies = ["10.0.0.2"]\n',
     )
     assert rc == 0
-    assert "requires [api].public_origin" not in capsys.readouterr().err
+    assert _UI_TERMINATOR_REFUSAL not in capsys.readouterr().err
 
 
 def test_serve_ui_http_public_origin_refused_with_declared_tls(
@@ -1605,7 +1628,10 @@ def test_serve_ui_explicit_offloopback_still_refuses(
         '[api]\ntls_terminated_upstream = true\ntrusted_proxies = ["10.0.0.2"]\n',
     )
     assert rc == 2
-    assert "requires [api].public_origin" in capsys.readouterr().err
+    err = capsys.readouterr().err
+    assert _UI_TERMINATOR_REFUSAL in err
+    # The remediation must name the key the loader accepts, not the relocated spelling.
+    assert _relocated_public_origin_key() in err
 
 
 def test_serve_ui_default_on_offloopback_degrades_json_only(
@@ -1625,7 +1651,7 @@ def test_serve_ui_default_on_offloopback_degrades_json_only(
     assert rc == 0
     err = capsys.readouterr().err
     assert "on by default (ADR 0143) for LOCAL loopback binds only" in err
-    assert "requires [api].public_origin" not in err  # the /ui refusal did NOT fire
+    assert _UI_TERMINATOR_REFUSAL not in err  # the /ui refusal did NOT fire
 
 
 def test_serve_ui_default_on_public_origin_degrades_json_only(

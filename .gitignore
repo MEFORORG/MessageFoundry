@@ -7,6 +7,12 @@ venv/
 build/
 dist/
 
+# Exception: a vendored GitHub Action's compiled output belongs in the repo, not a build artifact.
+# Without this, `dist/` above silently drops .github/actions/cla-assistant-lite/dist/index.js from
+# every `git add`, which would ship a workflow that references a file that was never committed.
+!/.github/actions/**/dist/
+!/.github/actions/**/dist/**
+
 # Engine runtime data (PHI may live here — never commit)
 *.db
 *.db-wal
@@ -217,3 +223,74 @@ scripts/security/scan-tokens.local.txt
 #     would break working practice to close a gap that is already shut.
 /docs/releases/
 /HANDOFF-*.md
+
+# --- Business material and internal engineering records (ADR 0160 D1, 2026-08-31) -----------------
+# Same D1 subject test as the block above, applied to two sets Phase 1 did not reach. Owner ruling
+# 2026-08-31 authorised this pass and settled the boundary question that came with it: D1 category 2
+# GOVERNS, so anything a security reviewer needs STAYS PUBLIC. That is why no security document is
+# in this block -- SECURITY.md, PHI.md, SUPPLY-CHAIN.md, SECURITY-LOOSENING.md, the ASVS phase
+# inventory and the Secure_* standards are all reviewer material and remain tracked.
+#
+# Custody moved to the vault BEFORE these left the tracked tree, same ordering and same reason as
+# Phase 1: 96b8feec on wshallwshall/MessageFoundry, branch lander/adr0160-custody. This block
+# untracks 46 files. Of those 46, 15 already existed in the vault and 7 of the 15 were DIVERGENT
+# stale forks predating the 2026-07-27 cutover, so the vault copies were overwritten with the
+# maintained public ones. A bare untrack would have left the vault holding the older text and
+# nothing holding the newer.
+#
+# An earlier draft of this block said "20 of the 51 files ... and 9 of those". Those figures are
+# measured over the CUSTODY set, which is larger: 96b8feec also took custody of docs/design and of
+# docs/testing/VERIFY.md, and all of those stay tracked here for the reasons recorded below. 46 is
+# the number that left, and 15/7 are its figures. The 20/9 pair is recorded rather than deleted
+# because it also reached the pull request description, so a reader who remembers it needs to see
+# it named as describing a different set rather than silently replaced.
+#
+# NOT a confidentiality control, and must never be described as one. `git log` still contains all of
+# it and none of it was ever secret; the owner ruled explicitly against a history rewrite on
+# 2026-08-31. This is subject-matter tidying, not withholding.
+#
+# Business and legal working documents -- audience is the maintainer deciding project direction, not
+# an operator running the engine or a reviewer assessing it.
+/docs/BRAND.md
+/docs/CONTRIBUTOR-FIRST-ISSUES.md
+/docs/CONTRIBUTOR-PROGRAM-PLAN.md
+/docs/COUNSEL-ENGAGEMENT-BRIEF.md
+/docs/DUAL_LICENSING_PLAN.md
+/docs/POSITIONING.md
+# Internal engineering records. research is exploratory; archive/throughput is superseded plans whose
+# shipped outcome is docs/THROUGHPUT.md.
+/docs/research/
+/docs/archive/throughput/
+#
+# docs/design/ IS NOT HERE, and it was in an earlier draft of this block. Measured before removing it:
+# docs/design/freethread.md is a CLAIM FILE for the required-status-check drift guard
+# (tests/test_required_contexts.py reads it, and treats a missing claim file as an ERROR rather than a
+# skip -- deliberately, because silently dropping a claim file is how a drift guard comes to guard
+# nothing). Untracking it turns that guard's own anti-narrowing assertion red. The other three design
+# notes have no such reference, but carving one file out of four costs a second negation and a second
+# pinned exception to save moving three exploratory documents. Not worth it. The tree stays.
+#
+# docs/testing is maintainer QA planning -- draft plans awaiting owner approval, and a matrix and
+# plan written against ONE specific maintainer build box. An operator reads none of it.
+#
+# An earlier draft of this line said WIN2025-TEST-PLAN.md "names the host and its identity". It does
+# NOT: the file uses <box-hostname>, <box-ip>, <server>, <u> and <p> placeholders throughout. The
+# removal is right on the D1 subject test -- maintainer QA planning for one build box is neither
+# operator nor security-reviewer material -- and it never needed a disclosure claim to justify it.
+# Overstating the reason is how a correct decision acquires a wrong rationale that outlives it.
+#
+# ONE EXCEPTION, and it is why this is a contents-glob rather than a directory rule.
+# docs/testing/VERIFY.md is OPERATOR material and stays tracked: it documents `messagefoundry verify`,
+# the wheel-only on-box acceptance check a real deployment runs, and docs/README.md lists it as step 6
+# of "Start here -- a new operator, in order" while line 8 warns in terms that it "is an operator tool,
+# not a test plan". docs/SECURITY.md cites it too. It passes D1 category 1 outright.
+#
+# `/docs/testing/` as a DIRECTORY rule would make the negation below inert -- git does not descend
+# into an excluded directory, so a file inside one cannot be re-included. The trailing `*` keeps the
+# directory itself readable so the negation binds. Do not "simplify" it back.
+/docs/testing/*
+!/docs/testing/VERIFY.md
+# DO NOT ADD docs/benchmarks/ OR docs/quality-gates/ HERE. Both are DELIBERATELY ABSENT. ADR 0160 D6.2
+# considered both and left them: the 21 bench handoffs carry the measurement narrative for the ~133
+# data files beside them, so untracking either half strips the rationale from records that stay.
+# Re-proposing this is re-deriving a decision that is already written down.

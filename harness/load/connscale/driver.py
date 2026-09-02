@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import asyncio
 
+from harness.load.connscale.intake_audit import IntakeLedger
 from harness.load.corpus import Corpus, Outgoing
 from harness.load.correlator import Correlator
 from harness.load.metrics import LiveMetrics
@@ -50,6 +51,7 @@ class ConnScaleDriver:
         correlator: Correlator,
         metrics: LiveMetrics,
         queue_max: int = 256,
+        ledger: IntakeLedger | None = None,
     ) -> None:
         if count < 1:
             raise ValueError("connection count must be >= 1")
@@ -57,6 +59,10 @@ class ConnScaleDriver:
         self._base_port = base_port
         self._count = count
         self._m = metrics
+        # BACKLOG #1292: ONE ledger SHARED across the N connections, exactly as the correlator and
+        # LiveMetrics are. The reconcile it discriminates aggregates across all N, so a per-connection
+        # ledger would answer a narrower question than the assertion it has to explain.
+        self._ledger = ledger
         # One persistent, pipelined connection per inbound port; expect_ack so each send→ACK is timed.
         self._conns = [
             PersistentConnection(
@@ -66,6 +72,7 @@ class ConnScaleDriver:
                 metrics,
                 expect_ack=True,
                 queue_max=queue_max,
+                ledger=ledger,
             )
             for i in range(count)
         ]

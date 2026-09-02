@@ -143,6 +143,11 @@ _SECTIONS = (
     "dr",
     "pipeline",  # enables MEFOR_PIPELINE_* env overrides (e.g. MEFOR_PIPELINE_PER_LANE_WAKE, ADR 0061)
     "security",  # ADR 0118: the plain-language posture switches (MEFOR_SECURITY_* env overrides)
+    # ADR 0087 subprocess isolation. ABSENT UNTIL BACKLOG #1365, which made MEFOR_SANDBOX_MODE parse
+    # to a section that did not exist and be DROPPED -- so an operator who set it by environment got
+    # in-process execution and no warning, while the identical key in the config FILE worked. A
+    # missing entry here does not fail; it disappears, which is why nothing caught it.
+    "sandbox",
 )
 _ENV_PREFIX = "MEFOR_"
 _DEFAULT_FILE = "messagefoundry.toml"
@@ -3895,12 +3900,17 @@ class ServiceSettings(BaseModel):
     def _oidc_requires_public_origin(self) -> ServiceSettings:
         """A federated redirect URI is built from ``[api].public_origin`` — refuse ``oidc_enabled``
         without a resolvable one, rather than silently constructing a wrong URI the IdP rejects at
-        runtime. This spans ``[auth]`` and ``[api]``, so it lives here (ADR 0142)."""
+        runtime. This spans ``[auth]`` and ``[api]``, so it lives here (ADR 0142).
+
+        ``[api].public_origin`` is the INTERNAL field. The operator-facing key is
+        ``[security].web_console_public_address``, which desugars into it; the old spelling is REFUSED
+        as file/env input (ADR 0118), so the refusal below must name the [security] one or it hands out
+        a remediation that dies at load (BACKLOG #1361)."""
         if self.auth.oidc_enabled and not self.api.public_origin:
             raise ValueError(
-                "[auth].oidc_enabled requires [api].public_origin (the federated redirect URI is "
-                "derived from it); set it to the browser-reachable origin, e.g. "
-                "'https://ops.example.com' or 'http://localhost:8765' for a loopback lab"
+                "[auth].oidc_enabled requires an external origin (the federated redirect URI is "
+                "derived from it); set [security].web_console_public_address to the browser-reachable "
+                "origin, e.g. 'https://ops.example.com' or 'http://localhost:8765' for a loopback lab"
             )
         return self
 

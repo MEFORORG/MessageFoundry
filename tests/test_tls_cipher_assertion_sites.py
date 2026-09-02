@@ -30,12 +30,14 @@ so a test that saw no raise would be reporting a missing call rather than an ine
 from __future__ import annotations
 
 import datetime
+import socket
 import ssl
 import urllib.request
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from pathlib import Path
 from typing import Any
 
+import ldap3
 import pytest
 from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
@@ -43,10 +45,16 @@ from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.x509.oid import NameOID
 
 from messagefoundry import logging_setup
+from messagefoundry.auth import ldap as ldap_auth
 from messagefoundry.auth import oidc_http
 from messagefoundry.config import tls_policy, tls_probe
 from messagefoundry.config.models import ConnectorType, Destination
-from messagefoundry.config.settings import INSECURE_TLS_ESCAPE_ENV, StoreBackend, StoreSettings
+from messagefoundry.config.settings import (
+    INSECURE_TLS_ESCAPE_ENV,
+    AuthSettings,
+    StoreBackend,
+    StoreSettings,
+)
 from messagefoundry.config.wiring import FHIR, Rest, Soap
 from messagefoundry.pipeline import alert_sinks
 from messagefoundry.store import postgres
@@ -418,6 +426,205 @@ def test_postgres_default_arm_still_hands_asyncpg_the_job() -> None:
     assert postgres._build_ssl(_pg_settings()) is True
 
 
+# --- the AD LDAPS bind: auth/ldap.py --------------------------------------------------------------
+#
+# BACKLOG #1317 remainder. The one site in this file where the IDENTITY instrument above cannot be
+# used at all. `ldap3.Tls` holds no SSLContext (measured: zero SSLContext attributes on the object) and
+# exposes no `ssl_context=` parameter -- it stores the arguments and builds the context inside
+# `Tls.wrap_socket` at connect time. So the engine can never hold the object this hop will use, and
+# "is this the same object?" has no answer here.
+#
+# Two measurements stand in for it, and together they cover both halves of the drift risk:
+#   * CONTEXT half -- `test_the_ldaps_replica_matches_the_context_ldap3_actually_builds` drives ldap3's
+#     REAL wrap_socket over a socketpair and compares the captured context to the replica.
+#   * ARGUMENT half -- `test_the_asserted_ldaps_arguments_are_the_ones_the_bind_uses` requires the
+#     kwargs the assertion ran on to be the kwargs `_server()` hands `ldap3.Tls`.
+
+
+def _ad_settings(**overrides: Any) -> AuthSettings:
+    """A minimally-valid AD block whose bind is LDAPS, so the TLS arm is reachable at all."""
+    fields: dict[str, Any] = {
+        "ad_enabled": True,
+        "ad_server": "ldaps://dc1.example.test:636",
+        "ad_user_search_base": "DC=example,DC=test",
+        "ad_bind_dn": "CN=svc,DC=example,DC=test",
+        "ad_bind_password": "not-a-real-password",
+        "ad_tls_verify": True,
+    }
+    fields.update(
+        overrides
+    )  # merged, not splatted: an override must REPLACE a default, not collide
+    return AuthSettings(**fields)
+
+
+def _context_ldap3_builds(tls: Any) -> ssl.SSLContext:
+    """The ``SSLContext`` ldap3's OWN ``wrap_socket`` builds for ``tls`` — CAPTURED, not reconstructed.
+
+    This is what keeps the replica honest. ``wrap_socket`` needs a real socket, so it gets one end of a
+    ``socketpair`` and ``do_handshake=False``; the context is then readable off the returned
+    ``SSLSocket``. No peer, no handshake, no network — but ldap3's own construction code really ran.
+    """
+
+    class _Server:
+        host = "dc1.example.test"
+
+    class _Connection:
+        def __init__(self, sock: socket.socket) -> None:
+            self.socket: Any = sock
+            self.server = _Server()
+
+    left, right = socket.socketpair()
+    conn = _Connection(left)
+    try:
+        tls.wrap_socket(conn, do_handshake=False)
+        ctx = conn.socket.context
+        assert isinstance(ctx, ssl.SSLContext), "ldap3 did not leave an SSLContext on the socket"
+        return ctx
+    finally:
+        conn.socket.close()
+        left.close()
+        right.close()
+
+
+def test_ad_ldaps_bind_asserts(every_suite_looks_weak: None) -> None:
+    """``LdapAuthenticator.__init__`` — the service-account and user binds to Active Directory.
+
+    Asserted at construction rather than inside ``_server()``: the suite list is fixed by configuration
+    and cannot change between calls, ``AuthService`` builds this eagerly at app construction, and
+    ``_server()`` runs up to three times per login (so a per-call replica would reload the OS trust
+    store on the login path to re-derive an answer that cannot have changed).
+    """
+
+    with pytest.raises(ValueError, match="AD LDAPS bind"):
+        ldap_auth.LdapAuthenticator(_ad_settings())
+
+
+def test_a_plaintext_ldap_bind_has_no_tls_context_to_assert(every_suite_looks_weak: None) -> None:
+    """The discriminating negative: same fixture, same constructor, DIFFERENT input, no raise.
+
+    ``ldap://`` builds no ``Tls`` at all, so there is no context to assert and the assertion must not
+    fire. Under a fixture that makes every reachable assertion raise, constructing this cleanly is what
+    proves the LDAPS test above is keyed on the scheme and not merely on the constructor running.
+
+    ``ad_allow_insecure_ldap`` is required to reach this arm at all — ``AuthSettings`` refuses a
+    non-``ldaps://`` bind without it — so this also records that the cleartext-LDAP path is reachable
+    only behind that documented dev override.
+    """
+
+    auth = ldap_auth.LdapAuthenticator(
+        _ad_settings(ad_server="ldap://dc1.example.test:389", ad_allow_insecure_ldap=True)
+    )
+    assert auth._server().tls is None
+
+
+@pytest.mark.parametrize("validate", [ssl.CERT_REQUIRED, ssl.CERT_NONE])
+def test_the_ldaps_replica_matches_the_context_ldap3_actually_builds(
+    validate: ssl.VerifyMode,
+    tmp_path: Path,
+    asserted_contexts: list[tuple[str, ssl.SSLContext]],
+) -> None:
+    """The replica must resolve to the same suite list as the context ldap3 really builds.
+
+    This is the substitute for the identity check every other site in this file gets, and it compares
+    against ldap3's OWN construction rather than a second reading of its source. The replica is not
+    re-derived here either — it is taken off the ``asserted_contexts`` spy, so this compares the exact
+    object the shipped control checked against the exact object the hop will use.
+
+    Both verification modes, because ``validate`` is the one replicated argument that differs between
+    deployments. A CA file is supplied so the ``ca_certs_file`` arm is exercised: the replica
+    deliberately does not load it, and this is the measurement that says doing so would change nothing
+    about the suite list.
+    """
+
+    ca, _key = _self_signed(tmp_path)
+    kwargs: dict[str, object] = {"validate": validate, "ca_certs_file": str(ca)}
+
+    tls_policy.assert_ldap3_tls_suites(kwargs, connector="ldaps equivalence probe")
+    replicas = [ctx for label, ctx in asserted_contexts if label == "ldaps equivalence probe"]
+    assert len(replicas) == 1, "the assertion did not run exactly once on its own replica"
+    replica = replicas[0]
+
+    real = _context_ldap3_builds(ldap3.Tls(**kwargs))
+    assert [c["name"] for c in real.get_ciphers()] == [c["name"] for c in replica.get_ciphers()], (
+        "the replica no longer resolves to the suite list ldap3's own wrap_socket produces, so the "
+        "AD LDAPS assertion is now checking a context this hop will not use"
+    )
+    assert real.verify_mode == replica.verify_mode
+    assert real.check_hostname == replica.check_hostname
+
+
+def test_the_asserted_ldaps_arguments_are_the_ones_the_bind_uses(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """What was ASSERTED must be what ``_server()`` hands ``ldap3.Tls`` — the other half of the drift.
+
+    An equivalent context is worthless if the bind is built from different arguments, and the two live
+    in different methods. ``_tls_kwargs()`` is the single definition both read; this measures that they
+    really do agree, so a future edit to ``_server()`` alone cannot silently leave the assertion
+    checking a stale shape.
+    """
+
+    ca, _key = _self_signed(tmp_path)
+    seen: list[Mapping[str, object]] = []
+    real = tls_policy.assert_ldap3_tls_suites
+
+    def spy(tls_kwargs: Mapping[str, object], *, connector: str) -> None:
+        seen.append(dict(tls_kwargs))
+        real(tls_kwargs, connector=connector)
+
+    monkeypatch.setattr(ldap_auth, "assert_ldap3_tls_suites", spy)
+    auth = ldap_auth.LdapAuthenticator(_ad_settings(ad_tls_ca_cert_file=str(ca)))
+    assert len(seen) == 1, "the AD LDAPS bind did not assert its TLS suites exactly once"
+
+    tls = auth._server().tls
+    assert seen[0] == {"validate": tls.validate, "ca_certs_file": tls.ca_certs_file}
+
+
+def test_the_ldaps_assertion_refuses_a_tls_argument_it_cannot_replicate() -> None:
+    """An unreplicable ``Tls`` argument must REFUSE, not be replicated wrongly or ignored.
+
+    Deliberately without ``every_suite_looks_weak``: this raise has to stand on its own, so a reader
+    can tell the refusal apart from a suite-list failure.
+    """
+
+    with pytest.raises(ValueError, match="ciphers"):
+        tls_policy.assert_ldap3_tls_suites(
+            {"validate": ssl.CERT_REQUIRED, "ciphers": "ECDHE-RSA-AES256-GCM-SHA384"},
+            connector="AD LDAPS bind",
+        )
+
+
+def test_the_ldaps_assertion_refuses_when_the_verify_mode_is_unknown() -> None:
+    """No ``validate`` means the peer-verification mode ldap3 will apply is unknown — refuse it."""
+
+    with pytest.raises(ValueError, match="no `validate` given"):
+        tls_policy.assert_ldap3_tls_suites({"ca_certs_file": None}, connector="AD LDAPS bind")
+
+
+def test_ldap3_swallows_a_rejected_cipher_string_and_strips_every_tls12_suite() -> None:
+    """The measurement the refusal above exists for — and it is why ``ciphers=`` is not the fix here.
+
+    ``ldap3/core/tls.py`` wraps ``set_ciphers`` in ``except ssl.SSLError: pass``. A cipher string
+    OpenSSL rejects therefore vanishes without a log line, and the hop silently loses its ENTIRE TLS 1.2
+    suite list while still reporting a configured cipher policy — a control that cannot report its own
+    failure (SDS-3.7). If ldap3 ever stops swallowing it, this test goes red and the refusal's rationale
+    should be re-derived rather than assumed.
+    """
+
+    def tls12(ctx: ssl.SSLContext) -> list[str]:
+        return [c["name"] for c in ctx.get_ciphers() if not str(c["name"]).startswith("TLS_")]
+
+    baseline = _context_ldap3_builds(ldap3.Tls(validate=ssl.CERT_REQUIRED))
+    poisoned = _context_ldap3_builds(
+        ldap3.Tls(validate=ssl.CERT_REQUIRED, ciphers="THIS-IS-NOT-A-SUITE")
+    )
+    assert tls12(baseline), "the baseline offered no TLS 1.2 suites, so this test proves nothing"
+    assert not tls12(poisoned), (
+        "ldap3 no longer strips the TLS 1.2 suites on a rejected cipher string; re-derive why "
+        "assert_ldap3_tls_suites refuses `ciphers=` before relying on that refusal's stated reason"
+    )
+
+
 # --- the preserved exemption: config/tls_probe.py -------------------------------------------------
 
 
@@ -486,6 +693,7 @@ def _covered_files() -> list[tuple[str, str]]:
         ("messagefoundry/auth/oidc_http.py", "OIDC identity provider"),
         ("messagefoundry/logging_setup.py", "syslog TLS forwarder"),
         ("messagefoundry/store/postgres.py", "Postgres store"),
+        ("messagefoundry/auth/ldap.py", "AD LDAPS bind"),
     ]
 
 

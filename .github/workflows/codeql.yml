@@ -13,15 +13,36 @@ name: CodeQL
 # ran "once publish.ps1 mirrors this file". Both premises are gone: MEFORORG is the source, and the
 # publish machinery was deleted. The GUARD was already right — only its rationale had rotted.)
 #
-# PINNING CAVEAT: this repo SHA-pins every Action for supply-chain integrity. actions/checkout below
-# reuses the repo's existing v7.0.0 pin; the github/codeql-action steps are on the v3 tag for now
-# because the live commit SHA must be looked up at authoring — SHA-pin them before treating this as a
-# hardened gate (OSSF Scorecard / zizmor would flag the unpinned tags).
+# PINNING: this repo SHA-pins every Action for supply-chain integrity, and every step below is
+# pinned -- actions/checkout at v7.0.1, both github/codeql-action steps at v4.37.8. An earlier
+# version of this note said the codeql-action steps were "on the v3 tag for now" and asked a reader
+# to SHA-pin them "before treating this as a hardened gate". That was true when written and has been
+# false since they were pinned; it was corrected 2026-09-01. Bumping a pin can change action
+# behaviour, so re-read the action's inputs at the new SHA rather than trusting the notes below.
 #
 # ALTERNATIVE (no file): you can instead enable CodeQL "default setup" from
 # Settings -> Security -> Code scanning (one toggle, auto-pinned, auto-updated). Default setup and this
 # advanced workflow are mutually exclusive — if you turn default setup ON, delete this file.
 on:
+  # BACKLOG #340. Without this trigger CodeQL never reports on a merge_group event, so any CodeQL
+  # context that is required would leave a queued pull request waiting forever on a check that
+  # cannot arrive. Measured 2026-08-27 on the first entry the queue ever held: PR 619 sat
+  # AWAITING_CHECKS with 32 check-runs green on gh-readonly-queue/main/pr-619-bca93ee1 and exactly
+  # three contexts absent -- CodeQL, CodeQL (python), CodeQL (javascript-typescript).
+  #
+  # WHETHER THOSE CONTEXTS ARE REQUIRED IS DELIBERATELY NOT RECORDED HERE.
+  # .github/required-contexts.txt mirrors the server and is the single authority; restating the
+  # required set in a second file is how the two drift. An earlier version of this comment asserted
+  # "THE QUEUE IS LIVE AND THESE THREE CONTEXTS ARE REQUIRED". That was true when written and is
+  # false as of 2026-09-01, when the required set is 14 contexts and none of them is CodeQL
+  # (BACKLOG #1404 records the removal). The trigger stays either way: it costs nothing while they
+  # are not required, and it is the prerequisite that has to be in place BEFORE they ever are.
+  #
+  # security.yml's own on: block predicted this in the PR that added merge_group to the other
+  # four workflows: "the failure mode of the reverse order is total -- enable a queue while a
+  # required context's workflow has no merge_group trigger and that check never reports in the
+  # queue, so NOTHING MERGES." codeql.yml was not among those four.
+  merge_group:
   push:
     branches: [main]
   pull_request:
@@ -38,9 +59,16 @@ permissions:
 jobs:
   analyze:
     name: CodeQL (${{ matrix.language }})
-    # ONLY on this repo — it is public, so code scanning is free; anywhere else (a fork, or the retired
-    # private archive) it would need paid GHAS, so this stays a skipped no-op there. (GitHub Actions
-    # string == is case-insensitive.)
+    # ONLY on this repo -- it is public, so code scanning is free; anywhere else (a fork's own
+    # pushes, or the retired private archive) it would need paid GHAS, so this stays a skipped no-op
+    # there. (GitHub Actions string == is case-insensitive.)
+    #
+    # THIS GUARD DOES NOT SKIP A FORK PULL REQUEST OPENED AGAINST THIS REPO. A pull_request run
+    # executes in the BASE repository's context, so github.repository is 'MEFORORG/MessageFoundry'
+    # and the guard is true. What it excludes is a fork pushing to its OWN branches, which gates
+    # nothing here. ci.yml relies on exactly this reasoning for its required `test` contexts. So the
+    # guard is not a fork problem and needs no change; see the Analyze step below for the measured
+    # fork-upload finding.
     if: github.repository == 'MEFORORG/MessageFoundry'
     runs-on: ubuntu-latest
     permissions:
@@ -59,12 +87,44 @@ jobs:
         with:
           persist-credentials: false # CodeQL uploads via the job token, not a persisted git credential
       - name: Initialize CodeQL
-        uses: github/codeql-action/init@ff2f1c621b7f889edc0d3c761ac2e6a3f8cdb0dd # v4.37.7
+        uses: github/codeql-action/init@db488ddef3bf6cb639b32c2e9a7c0a7ea8271d28 # v4.37.8
         with:
           languages: ${{ matrix.language }}
           # security-extended adds higher-recall security queries on top of the default suite.
           queries: security-extended
       - name: Analyze
-        uses: github/codeql-action/analyze@ff2f1c621b7f889edc0d3c761ac2e6a3f8cdb0dd # v4.37.7
+        # THERE IS NO FORK CARVE-OUT ON THIS STEP, AND THAT IS DELIBERATE. The natural assumption is
+        # that a fork pull request cannot upload SARIF, because a fork-PR token is read-only and
+        # lacks `security-events: write`. The token half is true and the conclusion does not follow:
+        # code scanning special-cases the event, and GitHub documents that it "always allows the
+        # uploading of results when the `pull_request` event triggers the action run".
+        #
+        # Measured 2026-09-01 on two genuine fork pull requests to ossf/scorecard -- advanced setup
+        # like this file, no repository guard at all, head.repo.fork true. PRs 5159 and 5129 each
+        # carry a `CodeQL` check run from app `github-advanced-security` with conclusion success,
+        # and that check run exists ONLY because the upload succeeded and was processed.
+        #
+        # DO NOT ADD A CARVE-OUT. Skipping the upload on forks would delete that `CodeQL` results
+        # check, which is the only context that goes red on a real finding: the per-language
+        # `CodeQL (<language>)` contexts are the Actions job check runs and fail on build or
+        # configuration problems, and github/codeql-action/analyze has no fail-on-findings input.
+        # So a carve-out costs the security value outright, and if `CodeQL` were ever required it
+        # would also wedge every fork PR forever on a required context that never reports.
+        #
+        # IF A FUTURE CHANGE ADDS ONE ANYWAY, two traps sit in the obvious spelling of it:
+        #
+        #   1. `upload: false` does NOT mean "do not upload". getUploadValue in src/actions-util.ts
+        #      at the pinned SHA maps both "false" and "failure-only" to "failure-only", a DEBUGGING
+        #      mode that still uploads when the run fails. Only "never" suppresses the upload.
+        #
+        #   2. The fork test MUST lead with the event name. A bare
+        #      `github.event.pull_request.head.repo.full_name != github.repository` is TRUE on
+        #      merge_group, push, schedule and workflow_dispatch, because there is no pull_request
+        #      object and a property read on null yields null. That classifies every non-PR run as a
+        #      fork, silently disabling the upload on main itself, so code scanning stops receiving
+        #      results while every check stays green. The correct form leads with
+        #      `github.event_name == 'pull_request' &&`, which short-circuits before the null read.
+        #      Do not "simplify" that conjunct away.
+        uses: github/codeql-action/analyze@db488ddef3bf6cb639b32c2e9a7c0a7ea8271d28 # v4.37.8
         with:
           category: "/language:${{ matrix.language }}"

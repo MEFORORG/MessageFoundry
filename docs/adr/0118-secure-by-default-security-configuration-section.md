@@ -2,7 +2,7 @@
 
 - **Status:** Accepted (2026-07-17) — owner signed off; implemented under BACKLOG [#270](../BACKLOG.md)
 - **Date:** 2026-07-17
-- **Related:** [CLAUDE.md](../../CLAUDE.md) §2 (auth/RBAC), §9 (PHI/HIPAA), §12 (prefer TOML) · [ADR 0007](0007-gui-manageable-connections-toml.md) (GUI-manageable config-as-data) · [ADR 0017](0017-consumer-deployment-model.md) (org-owned config repo) · [ADR 0065](0065-web-ops-dashboard.md) (web console) · [ADR 0092](0092-posture-keyed-transport-hop-refusal-refuse-the-insecure-phi-hop.md) (posture-keyed refusal + escape clamp) · [ADR 0002](0002-phase2-transport-security-and-strong-auth.md) (transport security) · [docs/research/config-ux-review.md](../research/config-ux-review.md) defect **DD2** · ASVS drive-to-pass (WP242–246, SHIPPED)
+- **Related:** [CLAUDE.md](../../CLAUDE.md) §2 (auth/RBAC), §9 (PHI/HIPAA), §12 (prefer TOML) · [ADR 0007](0007-gui-manageable-connections-toml.md) (GUI-manageable config-as-data) · [ADR 0017](0017-consumer-deployment-model.md) (org-owned config repo) · [ADR 0065](0065-web-ops-dashboard.md) (web console) · [ADR 0092](0092-posture-keyed-transport-hop-refusal-refuse-the-insecure-phi-hop.md) (posture-keyed refusal + escape clamp) · [ADR 0002](0002-phase2-transport-security-and-strong-auth.md) (transport security) · `docs/research/config-ux-review.md` defect **DD2** · ASVS drive-to-pass (WP242–246, SHIPPED)
 
 > **Amended by [ADR 0143](0143-web-console-on-by-default-disableable-with-loopback-secure-context-browser-hardening.md) (2026-07-21):**
 > `serve_web_console` defaults **`true`** (the console is on by default) and is reframed as a

@@ -20,7 +20,14 @@ from pathlib import Path
 
 import pytest
 
-from scripts.asvs.apply import _BANNED, _introduced_banned, main, render
+from scripts.asvs.apply import (
+    _BANNED,
+    _SUBTABLES,
+    _control_keys,
+    _introduced_banned,
+    main,
+    render,
+)
 
 #: A two-cell record. `5.4.3` is owner-CLOSED, mirroring the real one, because the closed-cell guards
 #: are the ones with the worst failure mode: an un-closing is invisible to every downstream check.
@@ -611,6 +618,117 @@ def test_the_TYPE_guard_does_NOT_refuse_a_payload_that_intentionally_retypes(
     assert cell["note"] == {"now": "a table"}
 
 
+def test_the_TYPE_guard_sees_a_corruption_the_payload_ALSO_MENTIONS(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """THE SCOPING HOLE, found by the ASVS Tracker against a scoping this author wrote and could not
+    check (BACKLOG #1242).
+
+    ``k not in c`` skipped every key the payload carries, so the guard covered the WRITER-only case
+    and stopped looking at the exact moment a cell is being rewritten. **That is the case that
+    matters rather than a corner:** measured on the real record, exactly ONE cell of 345 holds a
+    top-level non-scalar, and the natural payload for rewriting that cell ECHOES the key. So the
+    guard covered every cell that cannot be hurt and skipped the one that can.
+
+    THE THREE ARMS, and the third is what makes the second attributable:
+
+    ==========  =====================================  ==================================
+    arm         setup                                  required
+    ==========  =====================================  ==================================
+    control     payload OMITS the key, writer broken   refuse (the sibling test above)
+    subject     payload CARRIES the key, writer broken refuse -- THIS test
+    sanity      payload CARRIES the key, writer sound  allow (the retype test above)
+    ==========  =====================================  ==================================
+
+    Carrying the key is not what corrupts the value; the writer regression is. Without the sanity
+    arm a refusal here would be equally consistent with "the guard now refuses any carried key",
+    which is the unscoped version this scoping exists to avoid.
+
+    THE FIX COMPARES AGAINST WHAT THE PAYLOAD STATED rather than declining to look. The payload IS
+    the record of the type the author asked for, so an intentional retype still agrees with its own
+    payload and passes, while a writer corruption disagrees in BOTH zones.
+    """
+    import scripts.asvs.apply as mod
+
+    rec = _record(tmp_path)
+    assert (
+        main(
+            [
+                str(_payload(tmp_path, [_cell_111(sym_table={"a": 1})])),
+                "--scorecard",
+                str(rec),
+                "--apply",
+            ]
+        )
+        == 0
+    )
+
+    real_render = mod.render
+
+    def mangling_render(cell: dict, live: dict | None = None) -> str:
+        text = real_render(cell, live)
+        return text.replace("sym_table = { a = 1 }", "sym_table = \"{'a': 1}\"")
+
+    monkeypatch.setattr(mod, "render", mangling_render)
+    before = rec.read_bytes()
+    # The payload DOES carry sym_table, and carries it as the same dict it already is. Under the
+    # old scoping this is the silent-corruption path: the key is skipped, the guard never looks,
+    # and the file comes back holding a Python repr inside a TOML string.
+    rc = main(
+        [
+            str(_payload(tmp_path, [_cell_111(sym_table={"a": 1})])),
+            "--scorecard",
+            str(rec),
+            "--apply",
+        ]
+    )
+
+    assert rc == 1, "a writer corruption is invisible whenever the payload happens to carry the key"
+    assert rec.read_bytes() == before, "refused, but wrote anyway"
+    out = capsys.readouterr().out
+    assert "would CHANGE the TYPE" in out and "sym_table" in out, out
+
+
+def test_the_TYPE_guard_does_NOT_refuse_a_field_the_writer_COERCES_BY_DESIGN(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """THE FALSE-REFUSAL ARM for the corrected scoping (BACKLOG #1242).
+
+    Comparing the payload's stated type against the output would be wrong for the keys ``render()``
+    deliberately NORMALISES: ``level`` goes through ``int()``, and verdict / last_verified /
+    verified_at are emitted quoted. A payload stating ``level`` as the string ``"1"`` therefore
+    produces an int in the file **by design**, and refusing that is precisely the cry-wolf failure
+    the scoping exists to avoid -- a guard that refuses legitimate writes is a guard someone
+    disables.
+
+    WITHOUT THIS TEST THE ``_ORDERED`` EXCLUSION IS UNPINNED. Measured while writing it: dropping
+    that clause left all 23 other tests green, so the suite was silent about exactly the region the
+    clause occupies -- which is this item's own defect one level up (COMMON 4.5.1).
+
+    Its sibling ``_SUBTABLES`` clause is deliberately NOT pinned here and is belt-and-braces rather
+    than load-bearing: ``evidence`` and ``absence`` render as arrays of tables on both sides, so the
+    comparison cannot fire for them today. It is kept because that is a property of the current
+    writer rather than an invariant, and the sub-table entries have their own key check below.
+    """
+    rec = _record(tmp_path)
+    rc = main(
+        [
+            str(_payload(tmp_path, [_cell_111(level="1")])),
+            "--scorecard",
+            str(rec),
+            "--apply",
+        ]
+    )
+
+    out = capsys.readouterr().out
+    assert rc == 0, f"a by-design coercion must not read as corruption: {out}"
+    assert "would CHANGE the TYPE" not in out, out
+    cell = next(
+        c for c in tomllib.loads(rec.read_text(encoding="utf-8"))["cell"] if c["id"] == "1.1.1"
+    )
+    assert cell["level"] == 1, "the writer's own int() normalisation still happened"
+
+
 # --- BACKLOG #1307: a retirement is a SANCTIONED outcome the writer could not express -------------
 #
 # The shrink guard refuses any payload where an evidence or absence list gets shorter, and it took no
@@ -811,3 +929,136 @@ def test_a_glyph_in_a_cell_with_no_live_record_is_refused(tmp_path: Path) -> Non
     """
     assert _introduced_banned(f"brand new {_GLYPH} text", "") is not None
     assert _introduced_banned("brand new text", "") is None
+
+
+# --- BACKLOG #1369: the writer persisted its own control declarations into the record --------------
+#
+# `--allow-retirement` requires the payload to DECLARE what it retires, and apply.py reads that
+# declaration off the cell dict. The carry-through then wrote it straight back out, because ONE DICT
+# CARRIED BOTH CHANNELS and a control is indistinguishable from a data field once it does. A run that
+# retired two anchors left `retired_absence = [...]` in the record, where `scorecard.py` has no reader
+# for it and never will -- the instruction outliving the operation it instructed.
+#
+# The fix must NOT be a name list. `_carried`'s docstring rejects one in terms -- "a name-keyed fix
+# satisfies the symptom and drops the next field anyone adds, which is the defect itself with a longer
+# list" -- and that objection is about DATA LOSS, which is the more expensive direction. So the control
+# names are DERIVED from `_SUBTABLES`.
+
+
+def test_a_control_declaration_is_consumed_but_never_stored() -> None:
+    """The defect, at its narrowest: the writer must read the instruction and not keep it."""
+    rendered = render(
+        {
+            "id": "1.2.3",
+            "level": 1,
+            "verdict": "met",
+            "last_verified": "2026-08-27",
+            "verified_at": "0" * 40,
+            "retired_absence": ["a pattern retired by this very run"],
+        }
+    )
+    assert "retired_absence" not in rendered, rendered
+
+
+def test_AND_AN_UNKNOWN_DATA_KEY_STILL_SURVIVES_beside_it() -> None:
+    """THE HALF THAT MAKES THE OTHER HALF SAFE, and the direction #1242 was filed for.
+
+    Dropping controls is only correct while unknown DATA is still carried. A fix that suppressed both
+    would satisfy the test above and silently re-introduce the 7818991d incident -- and an absent field
+    reads as a valid default, so nothing downstream could tell PRESERVED from DROPPED.
+    """
+    rendered = render(
+        {
+            "id": "1.2.3",
+            "level": 1,
+            "verdict": "met",
+            "last_verified": "2026-08-27",
+            "verified_at": "0" * 40,
+            "retired_absence": ["retired by this run"],
+            "a_field_this_writer_has_never_heard_of": "must survive",
+        }
+    )
+    assert "retired_absence" not in rendered, "the control leaked"
+    assert "a_field_this_writer_has_never_heard_of" in rendered, "unknown DATA was dropped"
+
+
+def test_a_NEW_subtable_brings_its_control_automatically(monkeypatch: pytest.MonkeyPatch) -> None:
+    """THE PROPERTY, AND MY FIRST VERSION OF THIS TEST COULD NOT SEE IT.
+
+    It asserted `_CONTROL_KEYS == tuple(f"retired_{n}" for n in _SUBTABLES)` -- VALUE EQUALITY. A
+    hand-written literal matching today's value satisfies that, and a mutation run proved it: the
+    literal passed all 38 tests. There was no behaviour to differ on, because the constant was computed
+    once at import, so a snapshot and a derivation are indistinguishable until someone edits
+    `_SUBTABLES` -- which is the exact moment the rot arrives and the exact moment no test is watching.
+
+    The derivation is now computed per call, so it can be OBSERVED following a change rather than
+    asserted to match. This adds a sub-table and checks the control follows IN BEHAVIOUR, not just in
+    the tuple: render must drop the new control too.
+    """
+    import scripts.asvs.apply as apply_mod
+
+    monkeypatch.setattr(apply_mod, "_SUBTABLES", (*_SUBTABLES, "mitigation"))
+    assert "retired_mitigation" in _control_keys(), "the derivation did not follow _SUBTABLES"
+
+    rendered = render(
+        {
+            "id": "1.2.3",
+            "level": 1,
+            "verdict": "met",
+            "last_verified": "2026-08-27",
+            "verified_at": "0" * 40,
+            "retired_mitigation": ["x"],
+        }
+    )
+    assert "retired_mitigation" not in rendered, (
+        "a control for a NEWLY ADDED sub-table was persisted -- the derivation is not live: "
+        + rendered
+    )
+
+
+def test_every_subtable_has_its_control_covered() -> None:
+    """Both arms, so a fix that covered only the one in the incident would red here."""
+    for name in _SUBTABLES:
+        rendered = render(
+            {
+                "id": "1.2.3",
+                "level": 1,
+                "verdict": "met",
+                "last_verified": "2026-08-27",
+                "verified_at": "0" * 40,
+                f"retired_{name}": ["x"],
+            }
+        )
+        assert f"retired_{name}" not in rendered, f"{name}'s control leaked: {rendered}"
+
+
+def test_END_TO_END_a_successful_retirement_leaves_no_declaration_behind(tmp_path: Path) -> None:
+    """The whole chain, on the arm that ACTUALLY WRITES -- which is where the leak happened.
+
+    This mirrors `test_a_declared_retirement_whose_arithmetic_agrees_is_applied` deliberately: that
+    test drives the same successful retirement and asserts what the record SHOULD contain, but never
+    asked what it should NOT. The declaration was sitting in its output the whole time.
+
+    It also proves the control is still READ. If the fix had hidden the key from the reader as well as
+    the writer, the retirement would refuse and `rc` would be 1.
+    """
+    rec = _record(tmp_path)
+    rc = main(
+        [
+            str(_payload(tmp_path, [_shrunk_111(retired_evidence=["messagefoundry/m.py:20"])])),
+            "--scorecard",
+            str(rec),
+            "--apply",
+            "--allow-retirement",
+        ]
+    )
+    assert rc == 0, (
+        "the control must still be READ -- a refusal here means the fix broke the feature"
+    )
+    after = rec.read_text(encoding="utf-8")
+    assert "retired_evidence" not in after, (
+        f"the declaration was persisted into the record:\n{after}"
+    )
+    # ...and the retirement itself still happened, so this is not passing by doing nothing.
+    assert "verify_mode" not in after, "the retired anchor should be gone"
+    assert "tls_cert_file" in after, "the surviving anchor must remain"

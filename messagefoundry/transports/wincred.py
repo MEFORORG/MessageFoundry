@@ -43,6 +43,7 @@ import functools
 import logging
 import sys
 import threading
+import time
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from ctypes import wintypes
@@ -65,6 +66,30 @@ _T = TypeVar("_T")
 # network hops only and requires NO privilege; WINNT50 is its mandated provider.
 _LOGON32_LOGON_NEW_CREDENTIALS = 9
 _LOGON32_PROVIDER_WINNT50 = 3
+
+#: How long :meth:`CredentialContext.close` waits for an in-flight impersonated call to finish before
+#: it stops waiting, logs, and returns. It does NOT abort the call and it is NOT an I/O timeout: the
+#: share operation has none (only the OS redirector bounds it), so the worker thread runs to its own
+#: completion either way.
+#:
+#: WHAT THE BOUND BUYS, AND ON WHICH PATH. On the DESTINATION side it is real: ``aclose`` can be
+#: called with a delivery in flight, so the drain runs and a wedged share can no longer make that
+#: teardown wait on it.
+#:
+#: IT DOES NOT COVER AN INBOUND SOURCE, AND AN INBOUND SOURCE'S STOP IS STILL UNBOUNDED.
+#: ``FileSource.stop`` awaits ``asyncio.gather(self._task, ...)`` with no cancel and no timeout
+#: (``file.py:520``) and only reaches ``close`` afterwards (``:525``). The poll task is inside
+#: ``_run_fs``, which is this context's ``run``, so on a wedged share that gather never returns,
+#: ``close`` is never reached, and ``_inflight`` is therefore always zero by the time it is. The
+#: drain below and its warning are UNREACHABLE on that path. Making them reachable means
+#: cancelling the poll task or bounding the gather, which is a behaviour change and not this one.
+#:
+#: See :meth:`CredentialContext.close` for why the wait cannot simply be blocking.
+_CLOSE_DRAIN_TIMEOUT_S = 5.0
+
+#: Poll interval for that drain. Small enough that the ordinary case (a call that finishes in
+#: milliseconds) still reads as immediate, and it costs nothing when nothing is in flight.
+_CLOSE_DRAIN_POLL_S = 0.02
 
 _UNSUPPORTED_MSG = (
     "alternate Windows/network-share credentials for a File endpoint require Windows (win32); "
@@ -125,6 +150,7 @@ class CredentialContext:
         self._lock = threading.Lock()
         self._executor: ThreadPoolExecutor | None = None
         self._closed = False
+        self._inflight = 0
 
     async def run(self, fn: Callable[..., _T], *args: Any, **kwargs: Any) -> _T:
         """Run ``fn(*args, **kwargs)`` on the dedicated impersonated thread and return its result.
@@ -133,12 +159,23 @@ class CredentialContext:
         this context owns and impersonates — never the shared pool. Raises :class:`CredentialLogonError`
         (an :class:`OSError`) if the alt-credential logon/impersonation fails; any exception ``fn`` raises
         propagates unchanged (the credential is always reverted first)."""
-        executor = self._ensure_executor()
+        executor = self._begin_call()
         loop = asyncio.get_running_loop()
         call = functools.partial(self._impersonated_call, fn, args, kwargs)
-        return await loop.run_in_executor(executor, call)
+        try:
+            future = loop.run_in_executor(executor, call)
+        except BaseException:
+            # The submit itself failed (a close that raced past _begin_call's guard), so
+            # _impersonated_call — which owns the matching decrement — will never run. Back the
+            # in-flight count out here or close() would drain against a call that never started.
+            self._end_call()
+            raise
+        return await future
 
-    def _ensure_executor(self) -> ThreadPoolExecutor:
+    def _begin_call(self) -> ThreadPoolExecutor:
+        """Reserve the dedicated worker for one call: refuse when closed, build the executor on first
+        use, and count the call in flight so :meth:`close` knows whether the worker is busy. Taken
+        under the lock as one step — the count must not be able to land after a concurrent close."""
         with self._lock:
             if self._closed:
                 raise CredentialError("alternate-credential context is closed")
@@ -146,7 +183,19 @@ class CredentialContext:
                 self._executor = ThreadPoolExecutor(
                     max_workers=1, thread_name_prefix="mefor-filecred"
                 )
+            self._inflight += 1
             return self._executor
+
+    def _end_call(self) -> None:
+        with self._lock:
+            self._inflight -= 1
+
+    def _inflight_calls(self) -> int:
+        """Calls submitted to the worker that have not returned. Counted DOWN on the worker thread, so
+        an awaiting task that is cancelled does not make a still-running share operation invisible to
+        :meth:`close`."""
+        with self._lock:
+            return self._inflight
 
     def _impersonated_call(
         self, fn: Callable[..., _T], args: tuple[Any, ...], kwargs: dict[str, Any]
@@ -154,26 +203,57 @@ class CredentialContext:
         """On the dedicated thread: log the alt credential on, impersonate, run ``fn``, then revert and
         close the token — all bracketed so the thread never lingers impersonated and the token never
         outlives the call."""
-        token = _logon(self._username, self._domain, self._password)
         try:
-            _impersonate(token)
+            token = _logon(self._username, self._domain, self._password)
             try:
-                return fn(*args, **kwargs)
+                _impersonate(token)
+                try:
+                    return fn(*args, **kwargs)
+                finally:
+                    _revert()
             finally:
-                _revert()
+                _close_handle(token)
         finally:
-            _close_handle(token)
+            self._end_call()
 
     async def close(self) -> None:
-        """Release the context: shut the dedicated worker thread down (its impersonation, if any, dies
-        with it). Idempotent. Run on stop/reload so no thread or identity leaks across a reconfigure."""
+        """Release the context: stop the dedicated worker taking work and let it exit. Idempotent. Run
+        on stop/reload so no thread or identity leaks across a reconfigure.
+
+        **Nothing here touches the event loop's shared default executor** (BACKLOG #1195, ASVS 15.4.4).
+        The obvious spelling — hand ``executor.shutdown(wait=True)`` to ``run_in_executor(None, ...)``
+        so the join does not block the loop — parks a thread of the process-wide default pool for the
+        whole join. That join has no bound: this worker may be inside a UNC/SMB read on a wedged share,
+        which no engine-owned timeout covers (the module's whole point is that this work is off the
+        shared pool). The default pool is the same FIFO that argon2 password verification queues on, so
+        a stop/reload against a dead share would have held a share of it for as long as the share stayed
+        dead — the one way this module could starve the pool it is built to stay off.
+
+        Instead: ``shutdown(wait=False)`` returns at once (it queues the worker's exit sentinel and
+        joins nothing), and the drain is awaited **on the loop**, bounded by
+        :data:`_CLOSE_DRAIN_TIMEOUT_S`. Overrunning it is logged, never silent. Giving up costs nothing
+        the blocking join was buying: the worker exits on its own the moment its call returns, and
+        :meth:`_impersonated_call` reverts the credential and closes the token in ``finally`` blocks on
+        that same thread, so no identity outlives the call whether or not anyone waited for it."""
         with self._lock:
             executor, self._executor = self._executor, None
             self._closed = True
         if executor is None:
             return
-        # Shut down OFF the event loop — join the worker without blocking the loop.
-        await asyncio.get_running_loop().run_in_executor(None, executor.shutdown, True)
+        executor.shutdown(wait=False)  # non-blocking: no join, no thread parked anywhere
+        deadline = time.monotonic() + _CLOSE_DRAIN_TIMEOUT_S
+        while self._inflight_calls() and time.monotonic() < deadline:
+            await asyncio.sleep(_CLOSE_DRAIN_POLL_S)
+        stuck = self._inflight_calls()
+        if stuck:
+            logger.warning(
+                "alternate-credential worker still running %d filesystem call(s) after %.1fs; "
+                "closing without waiting. The share is likely wedged; the thread exits by itself "
+                "when the call returns, and the credential is reverted and the token closed on that "
+                "same thread, so nothing outlives it.",
+                stuck,
+                _CLOSE_DRAIN_TIMEOUT_S,
+            )
 
 
 # --- ctypes primitives (win32-only; each guards sys.platform first so mypy narrows) --------------
