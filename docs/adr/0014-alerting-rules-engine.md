@@ -219,6 +219,12 @@ install. All three shipped defaults are unchanged and byte-identical.
   `audit_all_authz = true` for the full authorization trail off-loopback. Default **off is
   byte-identical**; PHI-view grants stay excluded even under `true` (the PHI-access audit path already
   records them).
+  **Amended 2026-09-02 (BACKLOG #1277): the default is now ON, so "default off is byte-identical" is
+  no longer true of the shipped engine** — the full trail is what every deployment runs, and narrowing
+  it is the opt-out. Two spellings in this bullet are stale on top of that: the key relocated to
+  `[security].audit_all_authorization_decisions` under ADR 0118 (the old `[diagnostics]` spelling is
+  refused at load, see BACKLOG #1383), and the runbook section it cites is vaulted rather than in this
+  repository. PHI-view exclusion is unchanged.
 - **16.4.2 — tamper-evident audit chain.** Two levers, both instructed (§"Tamper-evident audit chain"):
   (A) `[integrity].audit_verify_on_start = true` re-walks the chain at startup — **alert-only, never
   crashes** (a broken chain WARNs + fires `integrity_drift`); (B) keying the chain against forgery

@@ -55,8 +55,10 @@ async def _service(engine: Engine, settings: AuthSettings | None = None) -> Auth
     return service
 
 
-def _client(engine: Engine, service: AuthService) -> httpx.AsyncClient:
-    transport = httpx.ASGITransport(app=create_app(engine, auth=service))
+def _client(engine: Engine, service: AuthService, **app_kwargs: object) -> httpx.AsyncClient:
+    """The shared authenticated client. ``app_kwargs`` pass straight through to ``create_app``, so a
+    test that needs one non-default app setting does not have to re-implement the transport wiring."""
+    transport = httpx.ASGITransport(app=create_app(engine, auth=service, **app_kwargs))  # type: ignore[arg-type]
     return httpx.AsyncClient(transport=transport, base_url="http://t")
 
 
@@ -695,9 +697,10 @@ async def test_ws_permission_denied_is_audited(engine: Engine) -> None:
 
 
 async def test_ws_permission_granted_is_audited_for_sensitive_only(engine: Engine) -> None:
-    # BACKLOG #195a (ASVS 16.3.2): an authorization GRANT is audited for the sensitive surface, and a
-    # read-feed grant (the shipped /ws/stats MONITORING_READ) is NOT — so console polling can't flood
-    # the hash-chained audit log (the documented 16.3.2 read-polling deviation).
+    # BACKLOG #195a (ASVS 16.3.2): with the trail NARROWED (audit_all_authz off — this app.state is
+    # hand-built and carries no attribute, so the getattr fallback applies), an authorization GRANT is
+    # audited for the sensitive surface and a /ws/stats MONITORING_READ grant is not. BACKLOG #1277
+    # made the WIDE trail the shipped default, so this pins the narrowed configuration, not the ship.
     from messagefoundry.api.security import authorize_ws
     from messagefoundry.auth import Permission
 
@@ -750,10 +753,15 @@ class _FakeRequest:
 
 
 async def _assert_http_grant_deny_precision(store: object) -> None:
-    """RBAC-4 (ASVS 16.3.2): the HTTP ``require()`` grant/deny audit set is EXACT and the ``method !=
-    "GET"`` guard REFUSES to audit a sensitive-permission READ. Driven against any Store so the SS/PG
-    legs prove the deny/grant row is actually written on the server backend (``record_audit`` /
-    ``list_audit``), not merely on SQLite. The assertions are negative: each proves a guard refuses."""
+    """RBAC-4 (ASVS 16.3.2): with the trail NARROWED, the HTTP ``require()`` grant/deny audit set is
+    EXACT and the ``method != "GET"`` guard REFUSES to audit a sensitive-permission READ. Driven against
+    any Store so the SS/PG legs prove the deny/grant row is actually written on the server backend
+    (``record_audit`` / ``list_audit``), not merely on SQLite. The assertions are negative: each proves a
+    guard refuses.
+
+    NARROWED, not shipped: every request below rides a ``_FakeRequest`` whose ``app.state`` carries no
+    ``audit_all_authz`` attribute, so ``_audit_all_authz``'s ``False`` fallback applies. BACKLOG #1277
+    made the wide trail the default an app built through ``create_app`` runs."""
     from fastapi import HTTPException
 
     from messagefoundry.api.security import require
@@ -778,9 +786,10 @@ async def _assert_http_grant_deny_precision(store: object) -> None:
             if a["action"] == action and permission in str(a["detail"] or "")
         ]
 
-    # (1) NEGATIVE method guard (the 16.3.2 read-polling deviation): a sensitive-permission READ — GET
-    # /approvals, carrying APPROVALS_APPROVE — must leave ZERO grant rows. require()'s `method != "GET"`
-    # guard REFUSES to audit it, so console polling of the sensitive read surface can't flood the chain.
+    # (1) NEGATIVE method guard, which applies only while the trail is NARROWED (this app.state carries
+    # no audit_all_authz attribute; BACKLOG #1277 made the wide trail the shipped default): a
+    # sensitive-permission READ — GET /approvals, carrying APPROVALS_APPROVE — must leave ZERO grant
+    # rows, because require()'s `method != "GET"` guard refuses to audit it.
     ident = await require(Permission.APPROVALS_APPROVE)(
         _FakeRequest(service, adm, method="GET", path="/approvals")  # type: ignore[arg-type]
     )
@@ -826,11 +835,15 @@ async def test_http_grant_deny_audit_precision(engine: Engine) -> None:
 
 
 async def test_audit_all_authz_audits_every_grant_but_never_phi_view(engine: Engine) -> None:
-    # BACKLOG #244 (ASVS 16.3.2): with [diagnostics].audit_all_authz ON (threaded onto app.state),
-    # require()/authorize_ws audit EVERY authorization grant — including a read-permission GET that the
-    # shipped deviation withholds — but the PHI-view grants stay excluded even under 'all' (the PHI-access
-    # audit path already records those; no double row). Default OFF is byte-identical (the precision test
-    # above proves the withheld read grants).
+    # BACKLOG #244 (ASVS 16.3.2): with [diagnostics].audit_all_authz ON, require()/authorize_ws audit
+    # EVERY authorization grant — including a read-permission GET the narrow set withholds — but the
+    # PHI-view grants stay excluded even under 'all' (the PHI-access audit path already records those;
+    # no double row).
+    #
+    # THE SWITCH IS DRIVEN ON app.state HERE, NOT LEFT TO A DEFAULT, and that is what keeps this test
+    # about the MECHANISM. BACKLOG #1277 made ON the shipped default; the default itself is pinned by
+    # test_a_plain_authenticated_get_leaves_a_grant_row_on_the_shipped_default below, which goes through
+    # create_app because a hand-built app.state cannot testify about a factory's default.
     from messagefoundry.api.security import authorize_ws, require
     from messagefoundry.auth import Permission
 
@@ -853,8 +866,9 @@ async def test_audit_all_authz_audits_every_grant_but_never_phi_view(engine: Eng
         r.app.state.audit_all_authz = True  # gate ON
         return r
 
-    # (1) OFF (default app.state has no audit_all_authz attr → getattr default False): a read-permission
-    # GET leaves NO grant row — the shipped 16.3.2 read-polling deviation is unchanged when the gate is off.
+    # (1) OFF (this hand-built app.state carries no audit_all_authz attr, so _audit_all_authz's getattr
+    # fallback of False applies): a read-permission GET leaves NO grant row. That fallback is a property
+    # of a state nobody set, NOT the shipped posture — create_app always writes the attribute.
     await require(Permission.MONITORING_READ)(
         _FakeRequest(service, adm, method="GET", path="/stats")  # type: ignore[arg-type]
     )
@@ -880,6 +894,46 @@ async def test_audit_all_authz_audits_every_grant_but_never_phi_view(engine: Eng
     ok = await authorize_ws(ws, Permission.MONITORING_READ)  # type: ignore[arg-type]
     assert ok is not None and ok.username == "adm"
     assert len(await _grants("monitoring:read")) == 2
+
+
+async def test_a_plain_authenticated_get_leaves_a_grant_row_on_the_shipped_default(
+    engine: Engine,
+) -> None:
+    """BACKLOG #1277: the full authorization trail is what a stock app runs.
+
+    Driven through ``create_app`` and real HTTP rather than :class:`_FakeRequest`, because the claim
+    under test is about the DEFAULT, and a hand-built ``app.state`` supplies its own — the double
+    would pass whatever the factory does. ``GET /stats`` is the plainest case there is: an
+    authenticated read on ``monitoring:read``, the permission the old narrow set deliberately withheld.
+
+    The second half is the POSITIVE CONTROL and it is not optional. Without it, an implementation that
+    audited unconditionally — ignoring the switch entirely — would satisfy the first half and be
+    indistinguishable from the real change.
+    """
+    service = await _service(engine)
+    await _add(service, "adm", Role.ADMINISTRATOR)
+
+    async def _grants() -> list[dict[str, object]]:
+        return [
+            a
+            for a in await engine.store.list_audit()
+            if a["action"] == "auth.permission_granted"
+            and "monitoring:read" in str(a["detail"] or "")
+        ]
+
+    # The shipped app: no audit_all_authz argument, so create_app's own default governs.
+    async with _client(engine, service) as c:
+        headers = _auth((await _login(c, "adm")).json()["token"])
+        assert await _grants() == []  # login is not a require()-gated route, so nothing yet
+        assert (await c.get("/stats", headers=headers)).status_code == 200
+        rows = await _grants()
+        assert len(rows) == 1, "a plain authenticated GET must leave exactly one grant row"
+        assert rows[0]["actor"] == "adm" and "/stats" in str(rows[0]["detail"] or "")
+
+    # POSITIVE CONTROL: the same request on an app that set the switch false writes NOTHING more.
+    async with _client(engine, service, audit_all_authz=False) as c:
+        assert (await c.get("/stats", headers=headers)).status_code == 200
+    assert len(await _grants()) == 1, "audit_all_authz=false must still suppress a read grant"
 
 
 # --- AUTHN-6: LDAP connectivity failures map to LdapError; empty pw is fail-closed ---

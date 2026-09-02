@@ -214,9 +214,10 @@ def test_every_security_bool_at_its_insecure_value_is_reported() -> None:
     as exemptions so the exemption itself is visible rather than an accident of the loop."""
     #: Bools this floor deliberately does NOT require, each with the reason it is exempt.
     exempt = {
-        # Owner-confirmed secure-and-usable default; turning it ON is the hardening move, not the
-        # loosening (ADR 0118 §5) — it is documented as "not a loosening" in SECURITY-LOOSENING.md.
-        "audit_all_authorization_decisions",
+        # `audit_all_authorization_decisions` USED TO SIT HERE, and its removal is the point of BACKLOG
+        # #1277 rather than a tidy-up. The reason it carried was "turning it ON is the hardening move,
+        # not the loosening" — true only while the default was `false`. The default is `true` now, so
+        # `false` is the insecure value and the loop below requires the registry to name it.
         # ADR 0152: these ASSERT / REQUIRE a host property rather than giving one up. Neither is a
         # loosening at either value; both are documented as such.
         "memory_encryption_operator_declared",

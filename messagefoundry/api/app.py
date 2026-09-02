@@ -1093,7 +1093,9 @@ def create_app(
     service_settings: ServiceStatusSettings | None = None,
     expose_docs: bool = False,
     allow_no_auth: bool = False,
-    audit_all_authz: bool = False,
+    # ON by default (BACKLOG #1277), matching [diagnostics].audit_all_authz. Two defaults for one
+    # posture is how drift starts, so an app built here without the argument runs what `serve` runs.
+    audit_all_authz: bool = True,
     ws_allowed_origins: Sequence[str] = (),
     serve_ui: bool = False,
     public_origin: str | None = None,
@@ -1187,7 +1189,8 @@ def create_app(
     app.state.client_address_monoculture = False
     # Fail-closed when no auth is attached unless explicitly opted out (embedding/dev) — SYS-1.
     app.state.allow_no_auth = allow_no_auth
-    # ASVS 16.3.2 (#244): audit every authorization grant, not just the sensitive set (off by default).
+    # ASVS 16.3.2 (#244): audit every authorization grant, not just the sensitive set. ON by default
+    # since BACKLOG #1277; `serve` passes the resolved [diagnostics].audit_all_authz over the top.
     app.state.audit_all_authz = audit_all_authz
     # Loaded [alerts] config for the read-only /alerts/rules view (independent of engine; may be None,
     # in which case the route falls back to all-off defaults). The lifespan path sets the live value.
@@ -5804,7 +5807,7 @@ def create_managed_app(
     connection_events: bool = True,
     response_sent_default: bool = True,
     message_events: str = "all",  # #63 [diagnostics].message_events verbosity → open_store
-    audit_all_authz: bool = False,  # #244 [diagnostics].audit_all_authz (ASVS 16.3.2) → app.state
+    audit_all_authz: bool = True,  # #244/#1277 [diagnostics].audit_all_authz (ASVS 16.3.2) → app.state
     env_values: Mapping[str, Any] | None = None,
     env_values_provider: Callable[[], Mapping[str, Any]] | None = None,
     auth_settings: AuthSettings | None = None,

@@ -28,6 +28,30 @@ All notable changes to MessageFoundry are documented here. The format follows
   to a truncated tail. ([BACKLOG #328](docs/BACKLOG.md))
 
 ### Changed
+- **The authorization-grant audit trail now defaults ON, so a deployment records every authorization
+  grant rather than only the state-changing ones.** `[security].audit_all_authorization_decisions` and
+  the internal `[diagnostics].audit_all_authz` it desugars to both default `true`. Until now only a
+  fixed set of state-change / configuration / user-management permissions wrote an
+  `auth.permission_granted` row, so every authenticated **read** was authorized and never recorded — and
+  a site could not reconstruct a read history afterwards, because the rows did not exist.
+  **What the old default guarded against was measured, and it named the wrong surface.** The reason on
+  record was that full tracing would flood the hash-chained audit log through console polling and the
+  `/ws/stats` feed. The web console never traverses `require()` — it is server-rendered in-process and
+  gates on its own cookie-world check, which records denials only — and WebSocket authorization fires
+  once per *connection*, not per message.
+  **The volume moves rather than vanishing, so size it.** The JSON API is the surface that changes: 33
+  `require()`-gated GET routes in `api/app.py` and 9 more in `api/auth_routes.py` go from no grant row
+  to **one row per authenticated request** (a per-request ceiling of one, whatever a route's permission
+  count), bounded by your API clients' polling cadence. **Nothing prunes `audit_log`** —
+  `[retention].audit_days` is reserved and unenforced by design — so `[retention].max_db_mb` is the
+  signal to watch. **The per-request cost is a commit, not just a row:** the grant write is awaited
+  before the route body runs, takes the store write lock, and commits standalone (audit is excluded
+  from the group committer), so a busy JSON-API deployment pays one extra commit per authenticated
+  request on the same lock the pipeline handoffs use.
+  Set `[security].audit_all_authorization_decisions = false` to restore the previous
+  narrow trail; that is now reported as a loosening at `serve` and on `GET /security/posture`. PHI-view
+  grants stay excluded at either value, because the PHI-access audit path already records them.
+  ([BACKLOG #1277](docs/BACKLOG.md), [ADR 0118](docs/adr/0118-secure-by-default-security-configuration-section.md) §5 amended)
 - **A PHI instance reached through a declared reverse proxy with `[security].require_mfa` explicitly
   off would refuse to start on first deployment, where it previously would not have.** The
   MFA-at-exposure gate derived "is this instance exposed?" from `[api].serve_ui`, a field the ADR 0143

@@ -128,14 +128,19 @@ pre-auth `[security].allowed_client_networks` gate — the full set is inventori
 so N engine shards multiply every budget by N): an off-loopback deployment must additionally front the
 API with a proxy/WAF limiter. Disable with `[auth].admin_write_rate_limit_enabled = false`.
 
-**Authorization-decision audit (ASVS 16.3.2).** Authorization **grants** on the sensitive surface are
-audited (`auth.permission_granted`), the twin of the existing `auth.permission_denied` (BACKLOG #195a).
-Because `require()` / `authorize_ws` fire on *every* protected request (including console polling and
-the `/ws/stats` feed), auditing every read grant would flood the hash-chained audit log — so the grant
-audit is deliberately **scoped** to the sensitive / state-changing / config / user-mgmt permission set
-(`_GRANT_AUDIT_PERMISSIONS` in `api/security.py`), on non-GET requests only. Read/monitoring grants are
-a **documented read-polling deviation** (not audited), and PHI-view grants are excluded because the
-PHI-access audit path already records those accesses (no double-audit).
+**Authorization-decision audit (ASVS 16.3.2).** **Every** authorization grant is audited
+(`auth.permission_granted`), the twin of the existing `auth.permission_denied` (BACKLOG #195a). PHI-view
+grants are the one standing exclusion, because the PHI-access audit path already records those accesses
+(no double-audit).
+
+That is the shipped default as of BACKLOG #1277 (2026-09-02). Until then the grant audit was **scoped**
+to the sensitive / state-changing / config / user-mgmt permission set (`_GRANT_AUDIT_PERMISSIONS` in
+`api/security.py`) on non-GET requests only, on the ground that console polling and the `/ws/stats` feed
+would flood the hash-chained audit log. **The console never traverses `require()`** — it is
+server-rendered in-process and gates on its own cookie-world check — and `authorize_ws` fires once per
+*connection*. Setting `[security].audit_all_authorization_decisions = false` restores the scoped
+behaviour and is reported as a loosening; the volume it trades away is one row per authenticated request
+per `require()`-gated route, on the JSON API.
 
 **Delegated identity & admin device posture (#193 sibling; ASVS 13.2.1 / 13.3.2 / 8.4.2 — the delegation
 boundary).** Three controls whose enforcement is largely the deploying organization's to provide.
@@ -180,10 +185,12 @@ route handler only when all of them pass.
    guard, SYS-1) → **401** when the bearer token resolves to no identity → **403** `password change
    required` when the identity is flagged `must_change_password` and the path is not one of the three
    exempt paths (`/auth/logout`, `/auth/me`, `/me/password`) → **403** `missing permission: <value>`
-   plus an `auth.permission_denied` audit row for the first unheld permission. On success it may write
-   one `auth.permission_granted` row (sensitive permission set, non-GET only, unless
-   `[security].audit_all_authorization_decisions` is on — ADR 0118 relocated the knob, and the old
-   `[diagnostics].audit_all_authz` TOML spelling is **refused at load**).
+   plus an `auth.permission_denied` audit row for the first unheld permission. On success it writes one
+   `auth.permission_granted` row — **every satisfied route, GETs included**, since
+   `[security].audit_all_authorization_decisions` defaults **on** (BACKLOG #1277). PHI-view grants are
+   the standing exclusion: the PHI-access path records those. Turning the switch off narrows it to the
+   sensitive permission set on non-GET requests only. ADR 0118 relocated the knob, and the old
+   `[diagnostics].audit_all_authz` TOML spelling is **refused at load**.
 4. **A second axis: per-channel scope** — `users.channel_scope` narrows operational routes to a set of
    connections. Out-of-scope *message* access returns **404** (existence-hiding); connection control and
    inbound injection return **403**. Denials are audited `auth.channel_denied`.
