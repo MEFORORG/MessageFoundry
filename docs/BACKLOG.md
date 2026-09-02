@@ -19362,3 +19362,30 @@ git show origin/main:harness/load/connscale/runner.py | sed -n '1143,1156p' # sa
 **Do not overclaim the result.** 7 ids stay SKIPPED on any box without `jq`. The honest sentence is *"every row that can execute here passes"*, never *"every row passes"*.
 
 **Source:** dispatched from the Cleaner's retraction of an earlier shim-backslash filing, which correctly re-diagnosed the symptom as a coreutils-less PATH rather than a path-handling defect. Reproduced here from the shipped source before building.
+
+## 1406. the usage watcher can find a problem but has no way to tell anyone, so a warning never lands
+
+> 🔢 **Filed 2026-08-31.** Fourth of the signalling gaps; see #1402, #1403 and #1405, filed in a
+> sibling pull request. Same shape as #1402 one layer down: something computes a fact and nothing
+> can deliver it.
+> Verdict: build
+> Closing-act: code
+
+**Cluster:** Coordination signalling. **Priority:** P3. **Verdict:** build.
+**Severity:** no engine effect, no PHI axis, and **no deployment axis (sec. 0)**.
+
+**What:** the usage watcher is a cron. **Measured 2026-08-31: `usage-collect.ps1` and `usage.ps1` make ZERO model calls**, and `usage.ps1` says so in its own comment, because a headless coordinator has to be able to read it. It writes `latest.json`, the current snapshot per account, and appends to `history.jsonl`. There are two files because a RATE needs two samples: one snapshot can only say where you are, never how fast you are getting there.
+
+Four things read those files, and none can interrupt anything: `usage.ps1` on demand, the usage statusline continuously and at zero token cost because a statusline runs outside the model, a `SessionStart` hook that injects into a starting session, and `seat_clock_alarm.py`, which PRINTS.
+
+**THE TWO HALVES OF ITS JOB COME OUT DIFFERENTLY, and the difference generalises.**
+
+**Naming the account with headroom WORKS.** The console needs that fact at exactly one moment, just before it spawns, and it CONTROLS that moment. So pulling the file at the point of use is not a compromise; it is the right design, and no delivery is needed.
+
+**Warning that a pool is nearly spent DOES NOT.** A warning has to arrive at a moment nobody controls, and nothing here can interrupt a running session. The finding sits in a file and reaches nobody until somebody happens to look, which for a warning is the same as not having it.
+
+**The fix must not be a poll.** A session that waits and checks is the most expensive state in the system: 2,108 metered tokens per waiting minute on a three-minute heartbeat, 22,275 on a ten-minute sleep loop, against 10,041 per minute actually working and ZERO once a turn ends. Buying delivery with a poll costs more than the warning saves.
+
+**What fits instead:** inject at the decision point. A `PreToolUse` hook on the spawn command puts current headroom into context exactly when the console is about to spend it, at effectively no cost. The repo already proves the pattern, since a `PreToolUse` collision gate fires on file writes today.
+
+**Not in scope:** giving the watcher an account. It makes no model calls, so it cannot be exhausted by what it watches. The hazard runs the other way: the usage endpoint returns 429 PER ENDPOINT rather than per caller, proven inside a single process, so the design wants ONE reader and a dedicated account would add one.
