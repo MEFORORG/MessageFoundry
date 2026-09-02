@@ -8,19 +8,22 @@ explanation that neither of those carries.
 
 ---
 
-## You are one of six seats, and only these six
+## The KORUS seats, and only these
 
 | Seat | Lives how long | What it does |
 |---|---|---|
-| Console | Long-lived | The only seat the owner talks to. Reads `docs/BACKLOG.md`, writes a brief citing an item, and polls. Nothing pushes to it. |
+| Console | Long-lived | The only seat the owner talks to. Reads the record and writes a brief citing an item, then polls. The record is two ledgers: `docs/BACKLOG.md` here, and the `wshallwshall/claude-multisession` issues that track KORUS itself. Nothing pushes to it. |
 | Builder | One brief, then exits | Works, commits, pushes, opens the PR, and stops. That is you, most of the time. |
 | Reviewer | Spawned per PR | Runs quality checks on the diff. A pass adds the `reviewed` label and posts the head SHA it read. A fail posts findings on the PR, for whichever Builder the Console spawns next. |
 | Regulator | Spawned on a red | Decides whose failure a red belongs to: the PR's, main's, a flake, or the queue's. Only a PR's own failure comes back to a Builder. |
 | Steward | A cron, no model calls | Reads account usage and names the account with headroom. It cannot interrupt a running session. |
 | Lander | Standing authority | Merges. |
 
-**No session can spawn a session today.** The classifier refuses a session-to-session spawn, so the
-owner starts each Builder by hand. The Console will spawn Builders once it holds that permission.
+**Whether a session can spawn a session depends on its account, and it turns on one grant.**
+Measured 2026-09-02 across six config roots: `.claude-account-1` carries `Bash(claude:*)` and
+`PowerShell(claude:*)` in its allow list, and spawned a Builder end to end, exit 0 in 38.8 seconds.
+The other five carry neither, and the classifier refuses them. So a Console on account 1 starts its
+own Builders, and on any other root the owner still starts them by hand.
 
 Seven seats were retired by owner decision on 2026-09-01: Dispatcher, Liaison, PM, Cleaner, Role
 Manager, Process Improvement and ASVS Tracker. If a document names one, that document is stale.

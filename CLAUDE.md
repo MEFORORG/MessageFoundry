@@ -275,19 +275,21 @@ Seven seats went with them: Dispatcher, Liaison, PM, Cleaner, Role Manager, Proc
 ASVS Tracker. If a document you are reading names a retired seat or a retired rule, treat that
 document as stale and follow this section.
 
-### The roster is six seats, and only these six
+### The KORUS roster, and only these seats
 
 | Seat | Life | Owns | Must not |
 |---|---|---|---|
 | **Console** | long-lived, one | The only seat the owner talks to. Reads `docs/BACKLOG.md`, writes a disposable brief citing an item, spawns a Builder bound to an account via `CLAUDE_CONFIG_DIR`, polls for state, enqueues PRs, spawns a Regulator on a red. | Build. Wait on inbound messages; it polls instead. |
-| **Builder** | ephemeral, one per brief | The change, the commit, the push, and the PR carrying the `BACKLOG.md` update. | Ask a question and wait. Plan and wait for a "go". Declare its own seat. Spawn another session. |
+| **Builder** | ephemeral, one per brief | The change, the commit, the push, and the PR carrying the `BACKLOG.md` update. | Guess at something the brief left open, or wait for an answer; it writes the question to the Console, comments it on the PR, and stops. Plan and wait for a "go". Declare its own seat. Spawn another session. |
 | **Reviewer** | spawned per PR by the owner today, by the Console once it holds the spawn permission | Quality checks on the diff. A pass applies the `reviewed` label and posts the head SHA it read. A fail posts findings ON THE PR, for whichever Builder the Console spawns next. | Merge. Label a PR it did not read. |
 | **Regulator** | spawned on a red | Deciding whose failure it is: the PR's, `main`'s, a flake's, or the queue's. Keeps a log. | Assume it remembers an earlier red; it starts with none. Send anything but the PR's own failure back to a Builder. |
 | **Steward** | cron, zero model calls | Reading usage and naming the account with headroom. | Warn a running session. Nothing can interrupt one. |
 | **Lander** | as needed | Merging. Standing authority on the engine repo and the vault, with no per-action owner approval. | Merge a PR with no `reviewed` label. |
 
-The Console spawns a Builder where it holds the spawn permission. Today a session-to-session spawn
-is refused, so the owner starts each Builder. Nothing else in the roster can spawn one either.
+The Console spawns a Builder where it holds the spawn permission, and that is per config root.
+Measured 2026-09-02: `.claude-account-1` carries `Bash(claude:*)` and `PowerShell(claude:*)` and
+spawned one end to end, exit 0 in 38.8 seconds; the other five roots carry neither and are refused.
+On a root without the grant the owner starts each Builder. Nothing else in the roster spawns one.
 
 The brief is disposable. The BACKLOG item is the record.
 
