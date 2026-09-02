@@ -51,6 +51,18 @@ anywhere. Per-cell detail names cell identifiers and file paths, whose pairing i
 enumeration CLAUDE.md section 12 keeps vaulted, so it is written only where ``--detail`` points and
 never to stdout.
 
+***A REFUSAL IS THE THIRD STREAM, AND THE CLAIM ABOVE WAS FALSE UNTIL IT WAS COVERED TOO.*** The reader
+that turns the record into cells refuses by NAMING the graded row it rejected, so an unguarded call
+would publish that identifier -- and, on one branch, the whole grading vocabulary -- to stderr on the
+first malformed record. Neither half of the split above reaches it, which is the point: a reader
+auditing this tool against a two-part enumeration ticks both halves and never looks for a third
+(SDS-3.6). So the one refusal that has an exception in hand quotes its CLASS and never its message,
+and a property that held only while every record loaded is now a property of the tool (SDS-3.7).
+*Not "every refusal here", which is the shape this very paragraph warns against:* of the seven refusals
+in ``main`` the other six have no exception to quote, and a reader auditing that universal against the
+first one they reach finds a path and a git exit code instead, and cannot tell a scoped claim from a
+broken one.
+
 THE HYPOTHESIS THIS EXISTS TO TEST CHEAPLY. The item offers one explanation for the whole population --
 that the numbers were read from a LATER tree than the commit the cell stamps -- and states it as a
 hypothesis rather than a finding. Its falsifiable form is "find a single later ref at which the recorded
@@ -294,7 +306,76 @@ def main(argv: list[str] | None = None) -> int:
         return 3
     head = rev.stdout.strip()
 
-    cells = load_scorecard(args.scorecard)
+    # THE READER'S OWN DIAGNOSTIC IS ASSESSMENT CONTENT, so this refusal quotes the exception's CLASS
+    # and nothing else. Nine of the ten refusals in ``load_scorecard`` open by naming the graded row
+    # they rejected and one lists the entire grading vocabulary, so an unguarded call would have
+    # printed a graded row's identifier on the first malformed record -- to stderr, which is where a
+    # run log and a pasted terminal both come from. That is the enumeration CLAUDE.md section 12 keeps
+    # vaulted, arriving by the one path ``--detail`` does not gate. Measured before the guard:
+    # ``cell 'ZZ.SENTINEL.9': verdict 'bogus' not one of [...]``, the row and all six grading words.
+    #
+    # ``except Exception`` IS BROAD ON PURPOSE and the narrower clause is the trap, not the safer
+    # option. ``load_scorecard`` subscripts the record directly in a dozen places, so a row missing
+    # ``id`` raises KeyError, a non-numeric ``line`` raises ValueError QUOTING THE VALUE, and a
+    # document that is not TOML raises from tomllib -- none of which an enumeration written from the
+    # ScorecardError raises would have named. A longer list would only be a fresher incomplete one
+    # (SDS-3.6), over a record that lives in another repository and is not this module's to enumerate.
+    # This wraps ONE call whose only job is turning the record into cells, and there is no second
+    # input inside it whose triage would differ.
+    #
+    # THE CLASS IS ENOUGH, AND WITHHOLDING THE MESSAGE THEREFORE COSTS THE READER NO TRIAGE. It is
+    # the whole difference between "the file never became a record" (fix the syntax, the permissions,
+    # the path) and "the record parsed and a row is malformed" (fix the row) -- and it carries nothing
+    # FROM the record, which the message does. The detail stays where the record lives, readable by
+    # the verifier run there. Print the exception any other way -- interpolated, logged, or handed to
+    # anything that walks its attributes -- and the disclosure has MOVED rather than closed:
+    # ``TOMLDecodeError.doc`` and ``UnicodeDecodeError.args[1]`` each hold the WHOLE document.
+    #
+    # 3 RATHER THAN 2, and the two are not interchangeable here. This tool's 2 means the invocation
+    # is unusable and is decidable from the arguments alone -- it is argparse's own code, shared with
+    # three checks that run before any work. The ``is_file`` guard above already passed, a git
+    # subprocess has already run, and what failed is the first act of the measurement: the tool
+    # started and will not publish a number, which is exactly what 3 says at its other three sites.
+    # The counter-argument is real and is recorded rather than suppressed: you cannot fix a malformed
+    # record by re-typing the command, which is a property the other 3s do not share.
+    #
+    # TWO SIBLINGS IN THIS DIRECTORY ANSWER 2 TO THE SAME QUESTION, and they are named here because an
+    # argument that dismisses only the far precedent reads as complete while the near ones sit one
+    # `ls` away. ``scorecard.py``'s ``_run_status`` returns 2 when the record will not load and its
+    # docstring says so; ``prove_report.py`` calls its 2 ``EXIT_INSTRUMENT``. NEITHER BINDS, and for a
+    # reason that is checkable rather than stylistic: both define 0/1/2 and NO 3, so 2 is the only
+    # refusal code either of them has and their choice carries no information about a vocabulary that
+    # has a third. This tool does have one, and it already means "started and will not publish a
+    # number" at three other sites. Fusing a malformed record into 2 would merge a caller's mistake
+    # with a record defect under a code no poller can split, which is the cost the siblings pay and
+    # this tool does not have to.
+    #
+    # EXIT 1 REMAINS REACHABLE IN THIS FUNCTION AND THAT IS NOT CLOSED HERE. The ``git`` subprocess
+    # above raises FileNotFoundError when git is off PATH, and ``--detail``'s ``write_text`` below
+    # raises OSError AFTER the summary has printed -- both exit 1, which this contract defines
+    # nowhere. Neither carries record content, so neither is this item's disclosure defect; they are
+    # recorded at the guard that strengthens the contract rather than left for a reader to discover
+    # that the paragraph above describes an invariant the function does not yet hold.
+    # THE WITHHOLDING IS UNCONDITIONAL, AND ITS REASON IS DELIBERATELY NOT A CLAIM ABOUT THE
+    # DESTINATION. An earlier wording asserted flatly that this stream reaches a public log.
+    # Measured 2026-09-01: NO workflow invokes this tool -- .github/ does not mention it, and the
+    # only tracked references are two sibling scripts' prose, its own tests and the tooling
+    # manifest. That sentence was false while the behaviour it justified was correct, which is the
+    # SDS-3.7 shape: a reader who checks the premise finds it false, and the apparent remedy is to
+    # stop withholding. The durable reason is that this is a CLI and its stderr goes wherever the
+    # caller sends it -- a redirect, a paste, or a future workflow, which the sibling
+    # anchor_report.py already has in .github/workflows/asvs-anchor-report.yml.
+    try:
+        cells = load_scorecard(args.scorecard)
+    except Exception as exc:
+        sys.stderr.write(
+            f"REFUSING: the scorecard at {args.scorecard} would not load "
+            f"({type(exc).__name__}). The reader's own message is WITHHELD: it CAN name the graded "
+            "row it rejected and CAN list the grading vocabulary in full, and nothing here can "
+            "know where this stream ends up. Read the detail where the record lives, with the verifier there.\n"
+        )
+        return 3
+
     verdicts = audit(cells, args.root, args.at)
     if not verdicts:
         sys.stderr.write("REFUSING to report a clean run over zero anchors\n")

@@ -38,6 +38,7 @@ tests/test_backlog_citation_check.py
 tests/test_backlog_hygiene_claim_extraction.py
 tests/test_backlog_status_check.py
 tests/test_banner_sha_check.py
+tests/test_bash_probe_path.py
 tests/test_bash_resolver.py
 tests/test_blanket_stage_guard.py
 tests/test_ci_docs_only_detector.py
