@@ -15,8 +15,14 @@ be driven two ways:
 Authentication + RBAC are enforced whenever an enabled :class:`AuthService` is attached (the
 ``serve`` path always attaches one). With **no** auth attached the routes are **fail-closed** (403)
 unless the app explicitly opts out via ``allow_no_auth=True`` (embedding / dev), in which case
-requests run as the full-access system identity (SYS-1). The API still binds localhost by default;
-remote exposure (TLS) is later.
+requests run as the full-access system identity (SYS-1). The API binds localhost by default and
+always serves TLS (ADR 0172): an operator-supplied certificate wins if configured, otherwise the
+engine mints and reuses a self-signed pair on first run. ONE TOPOLOGY IS EXCLUDED --
+``[api].tls_terminated_upstream`` declares a reverse proxy terminating TLS in front and speaking
+plaintext to the engine, and :func:`messagefoundry.api.tls.ensure_api_tls_material` returns
+``None`` there, so nothing is minted. *Always serves TLS* means the engine never leaves a hop
+unprotected, NOT that it terminates TLS in every topology. Remote network exposure (opening the
+bind beyond loopback) is a separate, later question from whether the hop is encrypted.
 """
 
 from __future__ import annotations

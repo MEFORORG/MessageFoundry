@@ -116,8 +116,16 @@ an identity rule binding transport config.
   web console — see [`docs/SECURITY.md`](docs/SECURITY.md)): local + AD (LDAP/Kerberos) users, fixed
   built-in roles, deny-by-default per-route permissions, opaque sessions, native TOTP MFA + browser
   WebAuthn passkeys (WP-14/WP-14b, ADR 0068 — `[webauthn]` extra) for local
-  accounts (AD MFA delegated), full audit. The API still
-  binds `127.0.0.1` by default; remote **TLS** exposure is later.
+  accounts (AD MFA delegated), full audit. The API binds `127.0.0.1` by default and **always
+  serves TLS** ([ADR 0172](docs/adr/0172-the-engine-always-serves-tls-minting-a-self-signed-certificate-on-first-run.md)):
+  an operator-supplied `[api].tls_cert_file` wins if set, otherwise the engine mints and reuses a
+  self-signed pair on first run. **One topology is deliberately excluded:**
+  `[api].tls_terminated_upstream` declares a reverse proxy terminating TLS in front and speaking
+  plaintext to the engine, so the engine mints nothing there -- serving https underneath that
+  proxy would break the proxy's own hop. *Always serves TLS* therefore means the engine never
+  leaves a hop unprotected, **not** that it terminates TLS everywhere. Remote network exposure
+  (opening the bind beyond loopback) is still a separate, later question from whether the hop
+  itself is encrypted.
 
 **Staged pipeline (ADR 0001, Step B).** The store is a **generic staged queue** on SQLite (WAL)
 with a `stage` discriminator. A received message flows through three persisted stages: **`ingress`**
