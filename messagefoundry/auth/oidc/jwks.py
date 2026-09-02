@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import base64
 import json
+import threading
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -185,6 +186,18 @@ class JwksCache:
         self._clock = clock
         self._state: _CacheState | None = None
         self._last_fetch_attempt: float | None = None
+        #: GUARDS THE WHOLE OF ``get_key``, INCLUDING ITS FAST PATH, AND THE FAST PATH IS THE
+        #: NON-OBVIOUS HALF. ``_refresh`` arms the refetch floor BEFORE it publishes the parsed
+        #: keys, so between those two writes the cache advertises "already fetching" while still
+        #: holding nothing. A concurrent reader in that window finds no keys AND is refused a
+        #: fetch, and raises. Locking only the miss path would not close it: the hazard is the
+        #: ORDER the two attributes become visible in, not a torn read of either.
+        #:
+        #: A blocking lock is safe here because ``get_key`` never runs on the event loop. Its one
+        #: caller outside this module is ``claims.py`` ``get_key(kid)``, reached from
+        #: ``service.py``'s ``_exchange_and_validate``, which the caller runs under
+        #: ``asyncio.to_thread``. Verified by search, not assumed.
+        self._gate = threading.Lock()
 
     def _may_fetch(self, now: float) -> bool:
         return (
@@ -204,22 +217,23 @@ class JwksCache:
         Raises :class:`JwksError` if the key is unknown and the min-refetch floor has not elapsed, or
         if a forced refetch still does not yield the ``kid``.
         """
-        now = self._clock()
-        state = self._state
-        fresh = state is not None and now - state.fetched_at < self._ttl
-        if state is not None and fresh and kid in state.keys:
-            return state.keys[kid]
-
-        if not self._may_fetch(now):
-            # Serve a still-cached key even past the soft TTL rather than fail while throttled...
-            if state is not None and kid in state.keys:
+        with self._gate:
+            now = self._clock()
+            state = self._state
+            fresh = state is not None and now - state.fetched_at < self._ttl
+            if state is not None and fresh and kid in state.keys:
                 return state.keys[kid]
-            raise JwksError(
-                f"no key for kid {kid!r}; JWKS refetch is throttled "
-                f"(min {self._min_refetch:.0f}s between fetches)"
-            )
-        self._refresh(now)
-        assert self._state is not None  # _refresh sets it or raises
-        if kid not in self._state.keys:
-            raise JwksError(f"kid {kid!r} not present in the JWKS after refetch")
-        return self._state.keys[kid]
+
+            if not self._may_fetch(now):
+                # Serve a still-cached key even past the soft TTL rather than fail while throttled...
+                if state is not None and kid in state.keys:
+                    return state.keys[kid]
+                raise JwksError(
+                    f"no key for kid {kid!r}; JWKS refetch is throttled "
+                    f"(min {self._min_refetch:.0f}s between fetches)"
+                )
+            self._refresh(now)
+            assert self._state is not None  # _refresh sets it or raises
+            if kid not in self._state.keys:
+                raise JwksError(f"kid {kid!r} not present in the JWKS after refetch")
+            return self._state.keys[kid]

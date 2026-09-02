@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import base64
 import json
+import threading
 from collections.abc import Mapping
 from typing import Any
 
@@ -717,3 +718,83 @@ def test_non_ascii_state_is_a_plain_non_match_not_a_crash() -> None:
     # The ASCII path is unchanged — still a real constant-time comparison, not a weakened one.
     assert oidc.state_matches("abc123", "abc123") is True
     assert oidc.state_matches("abc123", "abc124") is False
+
+
+# --- jwks cache: THREAD SAFETY (BACKLOG: the OIDC concurrent-bind worker crash) ---------------------
+
+
+class _BlockingFetch:
+    """A fetch that parks INSIDE the refresh window, so the race is forced rather than hoped for.
+
+    ``_refresh`` arms the refetch floor, then calls this, then publishes the parsed keys. Parking here
+    holds the cache in exactly the state a concurrent reader must survive: floor armed, keys absent.
+    """
+
+    def __init__(self, body: bytes) -> None:
+        self.body = body
+        self.calls = 0
+        self.entered = threading.Event()
+        self.release = threading.Event()
+
+    def __call__(self) -> bytes:
+        self.calls += 1
+        self.entered.set()
+        # Bounded. A missed release must fail the assertion below, never hang the worker: an
+        # unbounded wait here is the exact shape that got a pytest-xdist worker killed by the
+        # per-test timeout and reported as "worker crashed" with no stack.
+        assert self.release.wait(timeout=10), "the test never released the parked fetch"
+        return self.body
+
+
+def test_a_concurrent_reader_is_not_refused_while_the_first_fetch_is_in_flight(
+    rsa_key: rsa.RSAPrivateKey,
+) -> None:
+    """Two threads, one COLD cache: the second must get the key, not a throttle refusal.
+
+    REDS WITHOUT THE LOCK, and this is the whole point. ``_refresh`` writes
+    ``_last_fetch_attempt`` BEFORE it writes ``_state``. A reader arriving between those two writes
+    finds ``_state is None`` (so no cached key to serve) and ``_may_fetch`` False (so no fetch
+    allowed), and falls through to ``JwksError``. Nothing is torn; the two attributes simply become
+    visible in an order that describes a state the cache is never supposed to present.
+
+    WHY THIS IS NOT MERELY A TEST CONCERN. ``get_key`` is reached from ``_exchange_and_validate``
+    under ``asyncio.to_thread``, so two concurrent first logins really do arrive on two OS threads.
+    Per CLAUDE.md section 0 there are zero deployments, so this is written in the conditional: a
+    deploying site WOULD see one of two simultaneous first sign-ins refused ``unknown_kid``.
+    """
+    body = _jwks_bytes(_rsa_jwk(rsa_key, "k1"))
+    fetch = _BlockingFetch(body)
+    cache = oidc.JwksCache(fetch, min_refetch_seconds=300.0)
+
+    results: dict[str, object] = {}
+
+    def call(tag: str) -> None:
+        try:
+            results[tag] = cache.get_key("k1")
+        except BaseException as exc:  # noqa: BLE001 - the failure IS the subject; re-raised below
+            results[tag] = exc
+
+    first = threading.Thread(target=call, args=("first",), daemon=True)
+    first.start()
+    assert fetch.entered.wait(timeout=10), "the first caller never reached the fetch"
+
+    # The second caller now arrives with the floor armed and the keys still unpublished. Under the
+    # lock it blocks here; without it, it raises immediately.
+    second = threading.Thread(target=call, args=("second",), daemon=True)
+    second.start()
+    second.join(timeout=0.5)  # long enough for the unlocked path to have already raised
+
+    fetch.release.set()
+    first.join(timeout=10)
+    second.join(timeout=10)
+    assert not first.is_alive() and not second.is_alive(), "a caller never finished"
+
+    for tag in ("first", "second"):
+        got = results.get(tag)
+        assert not isinstance(got, BaseException), f"{tag} caller was refused: {got!r}"
+
+    assert results["first"] is results["second"], "both callers must get the same cached key object"
+    # ONE fetch, not two: the loser must wait for the winner rather than re-fetch. Without this the
+    # lock could be "fixed" by simply letting both fetch, which reopens the amplification bound that
+    # test_unknown_kid_is_throttled_by_the_min_refetch_floor exists to hold.
+    assert fetch.calls == 1, f"expected exactly one fetch, got {fetch.calls}"
