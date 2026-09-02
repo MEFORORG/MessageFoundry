@@ -13574,6 +13574,27 @@ measurement from this row's subject and it is named here rather than performed.*
 > **ON THE "instance 2" LABEL, because it will be read as a regression and should not be.** The dump self-labels this **"BACKLOG #344 instance 2"** and the test docstring credits *"#344 proposal 6"* for the dump mechanism. **#344 is CLOSED**, and its subject is *fixed wall-clock bounds drifting out of proportion to the work they bound* -- whereas this is a **lost wakeup**. **Different failures. "Instance 2" is the DIAGNOSTIC's lineage, not the defect's.** Whether that closure needs revisiting belongs to whoever owns it; **this item does not assert a regression against it.**
 > Verdict: build
 > Closing-act: code
+>
+> **PARTIAL 2026-09-02 (lander), NOT A CLOSURE -- this item stays OPEN, and the LARGER half is the
+> half still missing.** PR #670 makes the **SQL Server 1222 lock-timeout** route say what it
+> measures: a `ClaimLockTimeout` reason threads from the store to the dispatcher, a
+> `claim_lock_timeouts` counter reaches `/stats`, and one throttled INFO line names the phase and
+> the lane count. Six reporting defects in that path were fixed with it, each pinned by a test
+> shown to fail without its fix -- including a printed number that was not the window's number
+> (four aborts in one window printed `1`, and the next abort an hour later printed `4`).
+>
+> **WHAT IS STILL UNBUILT IS THE ROUTE THIS ITEM CALLS WORSE.** The **READPAST / `FOR UPDATE SKIP
+> LOCKED` head-of-line skip** has, in this item's own words, **no log line at all**, against the
+> 1222 route which at least logged at DEBUG. Measured on the PR's own diff before writing this
+> note: **zero** lines containing `READPAST`, against a positive control of 18 lines containing
+> `ClaimLockTimeout`, so the zero is a fact about the diff and not a broken search. And
+> `messagefoundry/store/postgres.py` is **not among the changed files**, so the backend this item
+> names as structurally identical is untouched. This item says **"Do not scope a fix to one
+> backend"**; that instruction is not yet satisfied.
+>
+> **READ THE NEW COUNTER CORRECTLY: zero means NOT ESTABLISHED, never "no contention".** It counts
+> only the 1222 route on one backend. A lane silently dropped by the head-of-line skip still
+> increments nothing, on either backend, and still reads healthy from outside.
 
 **Cluster:** Store / dispatcher observability. **Priority:** P2. **Verdict:** build.
 **Severity:** no live exposure -- zero deployments (§0), and the production sweep recovers the lane. Would cost a deploying site stalled lanes recovered only on a sweep interval, with **no log line at all** on one route and **DEBUG-only** on the other, on **both** server backends.

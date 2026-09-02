@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 from pathlib import Path
+from types import SimpleNamespace
 
 import httpx
 import pytest
@@ -25,6 +26,7 @@ from messagefoundry.config.wiring import (
     Send,
 )
 from messagefoundry.pipeline import Engine
+from messagefoundry.pipeline.wiring_runner import EmptyClaimCounters
 from messagefoundry.store import MessageStatus, OutboxStatus
 
 ADT = (
@@ -408,6 +410,39 @@ async def test_stats(engine: Engine, client: httpx.AsyncClient) -> None:
     assert r.status_code == 200
     assert r.json()["outbox_by_status"][OutboxStatus.PENDING.value] == 1
     assert r.json()["in_pipeline"] == 1  # whole-pipeline gauge (one outbound row, pending)
+
+
+async def test_stats_reads_the_runners_claim_counters_rather_than_constants(
+    engine: Engine, client: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #1270: /stats must be WIRED to the runner's counters, not hard-coded.
+
+    Every one of these four fields was replaceable with a literal ``0`` in ``app.py`` without a
+    single test noticing — which is what an operator-facing number emitted into a vacuum looks like,
+    and is how #1270's first attempt shipped its ``/stats`` half with two source lines and no reader.
+
+    A DISTINCT VALUE PER FIELD, on purpose. Equal values would let a crossed wiring (idle_poll read
+    into wake_fanout, say) pass; these cannot be permuted without failing.
+
+    THE LAST ONE IS A DIFFERENT UNIT and the numbers say so: eight LANES were booked empty while
+    THREE claim ROUND-TRIPS aborted. Nothing here divides them.
+    """
+    ec = EmptyClaimCounters()
+    for _ in range(3):
+        ec.record_empty(woken=False)  # idle_poll
+    for _ in range(5):
+        ec.record_empty(woken=True)  # wake_fanout
+    for _ in range(3):
+        ec.record_claim_lock_timeout()
+    # monkeypatch, not a bare assignment: the engine fixture's teardown calls runner.stop(), so the
+    # stub must be off the engine again before this test returns.
+    monkeypatch.setattr(engine, "_registry_runner", SimpleNamespace(empty_claims=ec))
+
+    body = (await client.get("/stats")).json()
+    assert body["empty_claims"] == 8
+    assert body["empty_claims_idle_poll"] == 3
+    assert body["empty_claims_wake_fanout"] == 5
+    assert body["claim_lock_timeouts"] == 3
 
 
 # --- connections -------------------------------------------------------------

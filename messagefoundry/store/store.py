@@ -55,7 +55,7 @@ from collections.abc import (
 )
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
-from enum import Enum
+from enum import Enum, StrEnum
 from pathlib import Path
 from types import MappingProxyType
 from typing import Any, Final, Protocol, runtime_checkable
@@ -545,6 +545,51 @@ class OutboxItem:
         )
 
 
+class ClaimAbortPhase(StrEnum):
+    """WHICH statement of a claim transaction hit the lock timeout (BACKLOG #1270).
+
+    The lock-timeout handler spans two populations, and they are different rows in different tables.
+    Labelling both "the head" was the first fix's second defect: a report that is wrong for one of
+    the two cases whichever single label it picks."""
+
+    #: The claim batch itself — the probe/UPDATE over the lanes' queue heads.
+    HEAD = "head"
+    #: The H2 skip-and-complete's in-store finalize DML, which runs in the SAME transaction, under
+    #: the same ``LOCK_TIMEOUT 0``, AFTER heads were already claimed. Not a queue head at all.
+    FINALIZE = "finalize"
+
+
+@dataclass(frozen=True)
+class ClaimLockTimeout:
+    """One claim ATTEMPT that aborted on a store lock timeout (BACKLOG #1270).
+
+    **What this is evidence of, exactly: "this claim attempt aborted on a lock timeout".** Nothing
+    more. The transaction rolled back, so at the point of report the store has read no row — on the
+    :attr:`ClaimAbortPhase.HEAD` path the abort precedes the fetch entirely. **At least one** row
+    this claim needed was held by something else; the store cannot say which, cannot say how many,
+    and must not name a lane (SDS-3.6 — prefer "at least" to an enumeration you cannot support).
+
+    This is deliberately COARSER than per-lane. A chunk-wide TRUE signal still does the job the
+    per-lane one was reached for: an operator sees a lock-timeout event instead of silence, which is
+    what stops a stalled lane reading as an idle system. A per-lane signal would need a restructured
+    claim statement on the hottest path, and the previous attempt's per-lane field was not that — it
+    was a copy of the caller's own request list, which at the default chunk of 256 asserted 256
+    findings from zero observations.
+
+    **REPORTING, never control flow.** The EMPTY-all contract is untouched: no row moved, every lane
+    in the chunk is still absent from ``by_lane``, still handled as EMPTY, still recovered by the
+    sweep. Populating this can only add a signal.
+
+    :attr:`lanes_in_claim` is the width of the aborted attempt (the requested lane count) — the
+    blast radius, not a count of contended lanes. It is what makes "one abort cost a 256-lane chunk
+    a round-trip" readable without naming a lane (a lane is a ``destination_name``: PHI)."""
+
+    #: Which statement aborted. See :class:`ClaimAbortPhase` — the two populations are distinct.
+    phase: ClaimAbortPhase
+    #: How many lanes this one attempt asked for. NOT how many were contended (unknowable here).
+    lanes_in_claim: int
+
+
 @dataclass(frozen=True)
 class ClaimedHeads:
     """Result of :meth:`~messagefoundry.store.base.QueueStore.claim_fifo_heads` (ADR 0066 §3.1).
@@ -553,10 +598,27 @@ class ClaimedHeads:
     ``attempts`` — the G6 ceiling reads them); lanes that yielded nothing are simply absent (EMPTY).
     ``rearm`` names lanes whose claimed head was consumed **in-store** by this call (the H2
     skip-and-complete, or an undecryptable head dead-lettered post-commit) — the dispatcher re-queues
-    them immediately so the lane advances to its next head without waiting for a wake or sweep."""
+    them immediately so the lane advances to its next head without waiting for a wake or sweep.
+
+    ``lock_timeout`` is set when this claim ATTEMPT aborted on a store lock timeout instead of
+    finding nothing (BACKLOG #1270). **An empty claim and an aborted claim are both "nothing
+    claimed", and nothing downstream could tell them apart**: the dispatcher counted the empty claim,
+    dropped every lane to IDLE with no timer armed, and every observable said "there is no work". A
+    lane that has silently stopped claiming reads exactly like an idle system. It is a property of
+    the ATTEMPT, chunk-wide, and it names no lane — see :class:`ClaimLockTimeout` for what the store
+    is and is not entitled to assert here.
+
+    **``None`` means NOT ESTABLISHED, never "no contention".** A backend reports here only what it
+    knows for free. Today only the SQL Server 1222 lock-timeout yield sets it. Postgres uses ``FOR
+    UPDATE SKIP LOCKED``, which does not abort — a skipped lane is simply absent from the
+    ``RETURNING``, so there is no attempt-level event to report and there structurally cannot be one;
+    SQLite's single-writer lock makes the case unobservable. Do not write a consumer that reads
+    ``None`` as proof the lanes were genuinely idle — the same absence-of-a-veto reading the
+    occupancy fence carries."""
 
     by_lane: dict[str, list[OutboxItem]]
     rearm: frozenset[str]
+    lock_timeout: ClaimLockTimeout | None = None
 
 
 @dataclass(frozen=True)

@@ -101,7 +101,9 @@ from messagefoundry.store.store import (
     REINGRESS_TARGET_PREFIX,
     AlertInstance,
     CapturedResponse,
+    ClaimAbortPhase,
     ClaimedHeads,
+    ClaimLockTimeout,
     ClaimProcStatus,
     ConnectionEvent,
     ConnectionMetrics,
@@ -7008,6 +7010,12 @@ class SqlServerStore:
         # point is client-side unknowable (statement- vs batch-abort semantics), and on kept≠claimed
         # the guard runs anyway (a doubled reset is idempotent).
         reset_committed = False
+        # BACKLOG #1270: WHICH population a lock timeout aborted on. The try below spans two of them
+        # — the claim batch over the lanes' queue heads, and the H2 skip-and-complete's finalize DML,
+        # which runs in the SAME transaction under the same LOCK_TIMEOUT 0 and is not a queue head at
+        # all. Both reach one handler, so without this marker any single label it prints is wrong for
+        # one of the two. Reassigned at exactly one place: entering the H2 branch.
+        abort_phase = ClaimAbortPhase.HEAD
         async with AsyncExitStack() as stack:
             if use_prepared:
                 # §5: the dedicated holder — retained cursor, deliberately NOT closed per call
@@ -7118,6 +7126,16 @@ class SqlServerStore:
                             "SELECT 1 FROM delivered_keys WHERE outbox_id=?", (d["id"],)
                         )
                         if await cur.fetchone() is not None:
+                            # BACKLOG #1270: from here on, a 1222 reaching the handler below came
+                            # from the FINALIZE population described above, not from a queue head.
+                            # SITED AFTER THE PROBE, and that placement is the claim's whole
+                            # warrant: the probe MISSES on every ordinary outbound claim (the row
+                            # has not been delivered yet, which is why it is being claimed), and
+                            # assigning above it labelled that common path FINALIZE with no
+                            # finalize statement anywhere in the transaction. It still stays
+                            # FINALIZE for the REST of the txn — once the DML below has run, its
+                            # row locks are held, so a later row's abort really is finalize-caused.
+                            abort_phase = ClaimAbortPhase.FINALIZE
                             await cur.execute(
                                 "UPDATE queue SET status=?, last_error=NULL, updated_at=?,"
                                 " owner=NULL, lease_expires_at=NULL WHERE id=?",
@@ -7149,13 +7167,32 @@ class SqlServerStore:
                     # contended, so YIELD: return EMPTY-all (exactly the EMPTY-on-locked-head
                     # semantics; the head stays PENDING, attempts untouched, the sweep re-tries it).
                     # Contention is normal at scale, so log at DEBUG, not WARNING.
+                    # BACKLOG #1270: the DEBUG line stays — it carries the mechanism, and contention
+                    # at scale is normal and must not fill an operator's log. What changes is that the
+                    # yield is no longer INDISTINGUISHABLE from "there was nothing to claim": the
+                    # ATTEMPT rides out on `lock_timeout`, so the dispatcher can say WHY its claim was
+                    # empty instead of dropping to IDLE with every observable reading "no work".
+                    #
+                    # ATTEMPT-LEVEL, AND THAT IS THE CEILING OF WHAT IS KNOWN. The rollback above just
+                    # discarded the transaction and on the HEAD path the abort precedes `fetchall`, so
+                    # NO ROW WAS EVER READ. `lane_list` is the caller's own request — returning it as
+                    # a set of contended lanes (which #1270's first fix did) manufactures up to 256
+                    # findings, at the default chunk, out of zero observations. What is true is "at
+                    # least one row this claim needed was held", and which one is not knowable here.
                     log.debug(
-                        "claim_fifo_heads: lock-timeout (1222) at stage %s on %d lane(s) — head"
+                        "claim_fifo_heads: lock-timeout (1222) at stage %s on %d lane(s) — %s"
                         " contended, yielding EMPTY (never-block guarantee)",
                         stage,
                         len(lane_list),
+                        abort_phase.value,
                     )
-                    return ClaimedHeads(by_lane={}, rearm=frozenset())
+                    return ClaimedHeads(
+                        by_lane={},
+                        rearm=frozenset(),
+                        lock_timeout=ClaimLockTimeout(
+                            phase=abort_phase, lanes_in_claim=len(lane_list)
+                        ),
+                    )
                 raise
             finally:
                 # ADR 0114 sub-lever C: on the folded clean path (reset_committed True ⇔ commit#1
