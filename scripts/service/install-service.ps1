@@ -569,6 +569,14 @@ Write-Host "           $StderrLog"
 Write-Host ""
 Write-Host "Next steps:"
 Write-Host "  $NssmPath start $ServiceName"
-Write-Host "  curl http://${ListenHost}:${Port}/health"
+# The engine ALWAYS serves TLS (BACKLOG #1276 part A, ADR 0172): with no [api].tls_cert_file
+# configured it mints a self-signed pair beside the store database on first start. So the health
+# probe is https, and it must trust that certificate - printing the old plaintext `curl http://...`
+# line told an operator to do the exact thing that no longer answers.
+$GeneratedCert = Join-Path (Split-Path -Parent $DbPath) "api-generated-cert.pem"
+Write-Host "  curl.exe --cacert `"$GeneratedCert`" https://${ListenHost}:${Port}/health"
+Write-Host ("           (that PEM is the placeholder pair the engine mints on first start. With your " +
+    "own [api].tls_cert_file configured, verify against THAT chain instead - the generated pair is " +
+    "never created.)")
 Write-Host "  Stop:      $NssmPath stop $ServiceName"
 Write-Host "  Uninstall: .\uninstall-service.ps1"

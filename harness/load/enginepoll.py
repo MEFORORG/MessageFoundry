@@ -26,9 +26,14 @@ import time
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, TypeVar
+from urllib.parse import urlsplit
 
 from harness.load.metrics import Counters
 from messagefoundry.apiclient import ApiError, EngineClient
+
+#: Hosts whose engine this harness could have spawned itself. Mirrors apiclient's own loopback set;
+#: kept local rather than importing a private name from that package.
+_LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1", "[::1]"})
 
 _T = TypeVar("_T")
 
@@ -583,10 +588,35 @@ class EnginePoller:
 
     # --- sync helpers (run in the executor) ----------------------------------
 
+    @staticmethod
+    def _cacert_for(url: str) -> str | None:
+        """The PEM that verifies ``url``, or None to leave the client's default trust in place.
+
+        Every engine this harness SPAWNS is served with the run's own certificate
+        (:mod:`harness.load.tlsmat`), which is handed to the node as operator-supplied ``[api]``
+        material -- so a loopback ``https`` URL always pins to that one anchor. Resolving it here
+        rather than threading a parameter is what keeps the eleven EnginePoller call sites unchanged:
+        minting once per run means there is only ever ONE anchor to resolve.
+
+        A NON-loopback ``https`` URL is an engine on another box (shardcert's two-box rig) whose
+        certificate this process has never seen. Returning None there is deliberate: it leaves the
+        remote posture exactly as it was rather than pinning it to a cert that cannot match.
+        """
+        parts = urlsplit(url)
+        if parts.scheme != "https":
+            return None
+        if (parts.hostname or "").lower() not in _LOOPBACK_HOSTS:
+            return None
+        from harness.load.tlsmat import harness_tls_material
+
+        return harness_tls_material()[0]
+
     def _open_sync(self) -> None:
         clients: list[EngineClient] = []
         for url in self._urls:
-            client = EngineClient(url, allow_insecure=self._allow_insecure)
+            client = EngineClient(
+                url, allow_insecure=self._allow_insecure, cacert=self._cacert_for(url)
+            )
             if self._token:
                 client.set_token(self._token)  # does a /me request to validate
             clients.append(client)
