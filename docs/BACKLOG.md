@@ -19040,6 +19040,296 @@ So there is no writer anywhere in the merge path. An **anchor** -- a citation fr
 
 **Scope note:** the vocabulary is public and the content is not. This item names the mechanism only. Cell identifiers, coverage and gaps stay where they are.
 
+## 1414. an allocation can be stranded in a worktree that EXISTS but cannot reach the branch its work is on
+
+> 🔢 **Filed 2026-09-01 (lander).** Two independent instances in one night, from two sessions
+> that reached it by different routes. Distinct from [#1282](#1282-an-allocation-whose-worktree-is-deleted-can-never-be-filed-and-allocps1-has-no-transfer-path)
+> and NOT closed by the fix open for it: verified by reading that fix's own mechanism, not by
+> assuming.
+> Verdict: build
+> Research: none
+> Closing-act: code
+
+**Cluster:** coordination tooling / ledger integrity. **Priority:** P2. **Verdict:** build.
+**Severity:** no engine, PHI or deployment axis (sec. 0). Nothing ships in the wheel. The cost is real
+work that is finished, correct, and cannot be committed by anybody.
+
+**HOW THIS DIFFERS FROM #1282, WHICH IS THE FIRST THING TO CHECK BEFORE READING FURTHER.** #1282 is the
+worktree DELETED case, and its owner-ruled recovery in [`LEDGER-GATE.md`](LEDGER-GATE.md) is *recreate a
+worktree at the recorded path*. Here the recorded path **already exists**, so that recovery is satisfied
+and buys nothing. The worktree is alive, occupied, and sitting on a different branch.
+
+**MECHANISM.** `Checker.owns` (`scripts/hooks/ledger_check.py:246`) keys entitlement on the recorded
+worktree path. To commit an item you must be IN the worktree it was allocated to. But the work may be on
+a branch that worktree is not on and cannot get to, because **git refuses to check out a branch a second
+worktree already holds**. So the entitlement and the branch can come to rest in different worktrees, and
+neither can be moved to the other.
+
+**MEASURED INSTANCE A -- BACKLOG #1406, 2026-09-01.**
+
+| | |
+|---|---|
+| entitlement recorded to | worktree X (a live session's tree) |
+| worktree X is on branch | a DIFFERENT branch from the work |
+| the work targets PR 717, on | the branch Y holds |
+| that branch is already checked out at | worktree Y (a different tree) |
+
+Worktree X cannot switch to the branch (git refuses, because Y holds it). Y has the branch and is not the
+entitled worktree, so `owns` rejects it. A correcting patch has been sitting undeliverable on the
+owner's desktop since 21:14 as a result. **A human hits the same wall**, which is worth stating because
+the first account of this case concluded "a human must run it from that worktree" -- that remedy does not
+work either, in its stated form.
+
+**MEASURED INSTANCE B -- BACKLOG #1211.** The allocation names a worktree that is gone, the build sits in
+a new one, and `alloc.ps1` has no transfer switch. Reported independently by the session holding it.
+
+**THE TWO INSTANCES FAIL THROUGH DIFFERENT LIMBS, AND THAT IS THE POINT OF FILING ONE ITEM RATHER THAN
+TWO.** B fails because there is no transfer path. A fails because the destination cannot be reached at
+all. **A fix that adds a transfer verb closes B and leaves A exactly as stuck** -- and anyone filing this
+from one instance alone will scope it to that limb and it will look complete.
+
+**PR 703 DOES NOT CLOSE THIS, AND I CHECKED THE MECHANISM RATHER THAN THE TITLE.** #703 adds a branch
+fallback to `owns`: if the path does not match, compare the RECORDED branch to the CURRENT branch. For instance A the recorded branch is not the branch the work is on, so **both keys miss** and the number stays uncommittable. #703 states its own limit as *"a deleted branch
+strands the number again"*; this is a second, different limit -- **a live branch the recorded worktree
+cannot reach, whose name is not the recorded one.**
+
+**AND THE SAFETY ARGUMENT FOR #703 IS THE SAME RULE THAT CREATES THIS DEADLOCK.** #703 is safe precisely
+because *"git refuses to check one branch out in two worktrees"*, which makes "the session on this branch"
+single-valued. That identical rule is what stops the entitled worktree in instance A from reaching its
+work. The property is load-bearing in both directions, so a fix must not simply relax it.
+
+**`alloc.ps1 -Reassign` WAS CONSIDERED AND DECLINED -- DO NOT RE-PROPOSE IT AS NOVEL.**
+[`LEDGER-GATE.md`](LEDGER-GATE.md) records it: *"honest, but it puts a hole in the non-transferable rule
+the gate rests on"*, written down expressly so it is not reopened. #703's author gives the sharper form:
+a transfer verb would let a seat take a number another session is actively holding, which is the
+collision the gate exists to prevent. Any proposal here has to survive that objection rather than ignore it.
+
+**WHAT IS NOT ESTABLISHED.** No fix is proposed. The population is two, both from one night, and no sweep
+has counted how many allocations are currently in this state -- #1282 measured 43 in ITS state, and the
+comparable number for this one is unknown. Whether this is common enough to warrant a mechanism, or rare
+enough to warrant a documented manual recovery, is exactly what is missing.
+
+## 1412. anchor_provenance's load_scorecard call is unguarded, so a malformed record prints a cell id to stderr
+
+> 🔢 **Filed 2026-08-31 - BUILT IN THIS COMMIT, not yet landed.** The same class **PR 719** closed in `anchor_report.py`, in the sibling tool that reads the same record. Found by reading that fix, not by a sweep.
+> Verdict: build
+> Closing-act: code
+
+**Cluster:** ASVS tooling. **Priority:** P2. **Verdict:** build.
+**Severity:** no engine effect, no PHI axis, and **no deployment axis (sec. 0)** -- this is a repository tool and nothing here reaches shipped code. Written conditionally because it is conditional: **the first malformed record handed to this tool WOULD print a graded row's identifier**, and on one branch the whole grading vocabulary, to stderr. Nothing has been disclosed, and the reason is that nobody has yet run it against a record that will not load -- which is a fact about usage, not a control.
+
+**What:** `main()` called `cells = load_scorecard(args.scorecard)` with no exception handling. It was the only unguarded call in that function **that reads the record**; the other six failure paths all refuse deliberately, write a reason, and return 2 or 3.
+
+> **The scope words in that sentence are load-bearing and were added after review.** It first read *"the only unguarded call in that function"*, which this item then contradicts thirty lines down by naming two more (`subprocess.run` and `write_text`). Both statements cannot hold, and the completeness claim is the false one -- exactly the SDS-3.6 liability this item invokes twice against the docstring. The count was `five`; measured by AST over `main()` at the parent commit, `return 2` has three sites and `return 3` has three, so it is **six**.
+
+**LIMB 1 -- DISCLOSURE.** `load_scorecard` raises `ScorecardError` in ten places and **nine of them open by naming the graded row they rejected**; one lists the entire grading vocabulary. Measured against a record whose only fault was an unknown grade, with an invented identifier so a hit cannot be a coincidence:
+
+```
+scorecard.ScorecardError: cell 'ZZ.SENTINEL.9': verdict 'bogus' not one of
+  ['fail', 'na', 'needs-review', 'partial', 'pass', 'unverified']
+```
+
+That is the row identifier and all six grading words, on stderr, as a traceback. Cell ids and grading content are what CLAUDE.md section 12 keeps vaulted, and `--detail` exists precisely so the identifier-plus-path pairing never reaches a stream a reader pastes.
+
+**LIMB 2 -- EXIT CODE.** `load_scorecard` subscripts the record directly in a dozen places, so a row missing `id` escaped as `KeyError` and a non-numeric `line` as `ValueError` **quoting the offending value**. A traceback exits **1**, which this tool defines nowhere: no `return` in it produces 1, and its contract is 0 for a measurement, 2 for an unusable invocation, 3 for a run that started and will not publish a number.
+
+**THE MODULE'S OWN DOCSTRING ASSERTED THE PROPERTY THIS BREAKS.** It reads *"OUTPUT IS SPLIT BY DISCLOSURE, NOT BY CONVENIENCE"* and calls the summary *"safe to paste anywhere"*. The split it then describes has two halves, summary and `--detail`, and a refusal is a third stream neither reaches. A reader auditing against a two-part enumeration ticks both halves and never looks for a third (SDS-3.6), and a property that holds only while every record loads is not a control (SDS-3.7). The docstring is amended in the same commit rather than left to be quoted.
+
+**THE FIX IS ONE `except Exception` AROUND ONE CALL, AND THE NARROWER CLAUSE IS THE TRAP.** PR 719's clause enumerated `(ScorecardError, OSError, ValueError)`, which reads as complete and had already missed `KeyError`. A longer list would only be a fresher incomplete one, over a record that lives in another repository. The wrapped statement's only job is turning the record into cells, so every failure of it is an instrument failure and there is no second input inside it whose triage would differ.
+
+**THE REFUSAL PRINTS THE EXCEPTION'S CLASS NAME AND NOTHING ELSE. A guard that catches and then logs has MOVED the disclosure, not closed it** -- and further than the message-versus-class rule alone suggests: `TOMLDecodeError.doc` and `UnicodeDecodeError.args[1]` each hold the **whole document**, so anything that walks an exception's attributes dumps the record even where `str(exc)` is clean.
+
+**Withholding the message costs the reader no triage, and that is asserted rather than argued.** The class is the whole difference between "the file never became a record" and "the record parsed and a row is malformed", so a test drives both and pins each class name present in its own run and **absent from the other**.
+
+**EXIT 3, NOT 2, AND THE TWO ARE NOT INTERCHANGEABLE.** This tool's 2 is argparse's own code, shared with three checks decidable from the arguments alone before any work runs. Here the `is_file` guard already passed, a git subprocess already ran, and what failed is the first act of the measurement. Folding "the record in the vault is malformed" into 2 would fuse a caller's mistake with a record defect under a code no poller can separate. The counter-argument is recorded rather than suppressed: you cannot fix a malformed record by re-typing the command, which is a property the other 3s do not share. **PR 719's `2` is not evidence either way** -- its contract is 0/1/2 with 1 meaning findings, so 2 is its only refusal code and it has no third.
+
+**Verification:** nine malformed records plus a class-discrimination arm and a paired breadth pair, **observed red against the unguarded code** before the fix -- the `ScorecardError` rows failing with the disclosure above in the traceback. Mutants killed by **different assertions**: a guard printing `{exc}` trips the disclosure scan (the catch-and-log trap, caught); a guard printing neither class nor message trips the triage assertion; a refusal moved to stdout trips the stream assertion. 30 passed after, 18 before.
+
+**THE FIRST SUITE PASSED A CLAUSE THAT REINTRODUCED THE DEFECT, AND THAT IS WHY THE BREADTH IS NOW ITS OWN PAIR OF ARMS.** Every fixture raised a class the suite itself chose -- `ScorecardError`, `KeyError`, `TOMLDecodeError` -- so the narrowing written from those three, `except (ScorecardError, KeyError, tomllib.TOMLDecodeError)`, left all 26 arms green, `ruff check` clean and `ruff format --check` clean. Measured against that clause at the real CLI, on a record whose `line` is not a number:
+
+```
+ValueError: invalid literal for int() with base 10: 'ZZ.SENTINEL.7'
+EXIT=1
+```
+
+Both limbs back: a field of the record on stderr, under a code the contract does not define. **A fixture table cannot measure the breadth of an `except` clause, because the table IS the enumeration the argument rejects** -- and this is a near-term edit, not a hypothesis: `pyproject.toml` caps `ruff<0.16` with a note that 0.16 turns on `BLE001`, which flags `except Exception`, and the mechanical remedy for that finding on this line is the surviving mutant. Two arms now pin it **from both sides**, which is what makes them a pair rather than a repetition: one raises a class declared in the suite itself, which no enumeration can ever contain, and reds on any narrowing; the other asserts `KeyboardInterrupt` **propagates**, and reds on `except BaseException` -- the one-word over-correction a reader takes from this very item. Measured, the two reds are **disjoint**: narrowing reds the first and leaves the second green, over-broadening does the reverse.
+
+**The banned-token list is ONE module constant every output-capturing arm reads, and the existing arms were retrofitted to read it.** PR 719's leak reached review because its equivalent list lived inside the one happy-path function that used it, so the refusal path was never scanned. Adding a constant and wiring only the new arm would have repeated that exactly, one file over. The fixtures now plant an invented identifier for the same reason: this tool prints line numbers, counts and percentages, so an absence assertion against a realistic id proves nothing.
+
+**Exit 3 is shared with three other refusals and `REFUSING` with four, so neither pins this guard.** The new arms assert on `would not load`, which `git grep -c "would not load"` finds in exactly FOUR tracked files -- this tool, this test, this item, and `scripts/asvs/anchor_report.py`, whose hit is a DOCSTRING at line 254 and not an emission -- with `scripts/asvs/anchor_provenance.py` the only emitter. An earlier revision of this line said three and omitted the sibling: the emitter half was and remains correct, so the arms do pin this guard, but the census itself was one short. Positive control on the same corpus and the same command: `git grep -c "could not be read"` returns **13 files, 17 lines**, so the needle above is a fact about the needle and not about a search that failed to run.
+
+> **Three counts in this item were wrong and are corrected above rather than quietly restated.** It read *"two other refusals"* and *"`REFUSING` with three"*, and gave the positive control as *"8 hits"* with no command or corpus beside it. Measured by AST over the post-fix `main()`: `return 3` has four sites, so this guard shares it with **three**; the literal `REFUSING` appears on five lines, so this guard shares it with **four**. The code comment at the guard already said *"its other three sites"* and was correct, so the item contradicted the source it describes. The `8` is not reproducible by any spelling of the search I could construct -- publishing a control's number without the command that produced it is what let it stand, which is why the command is now in the sentence.
+
+**NOT CLAIMED AND NOT FIXED HERE:** two further uncaught paths in the same `main()` that would also exit 1 against the same contract -- `subprocess.run(["git", ...])` raises `FileNotFoundError` when git is off PATH, and `--detail`'s `write_text` raises `OSError` **after** the summary has already printed. Neither discloses record content, both are decisions to take explicitly rather than by omission, and neither has a number yet. They are now named at the guard in the source as well, because the comment there argues the 0/2/3 contract and a reader auditing that argument against the function would otherwise find 1 reachable three lines below it.
+
+**ALSO NOT FIXED HERE, AND IT IS THE SAME DEFECT ONE FILE OVER.** `scripts/asvs/scorecard.py` catches only `ScorecardError` around its own `load_scorecard` calls and prints `f"error: {exc}"` -- the reader's full message -- at four sites, and `KeyError`/`ValueError`/`TOMLDecodeError` escape as tracebacks. Measured against `--status`, the command CLAUDE.md tells every session to run, in a function whose docstring says **NEVER 1**:
+
+```
+$ python scripts/asvs/scorecard.py --scorecard <row with a non-numeric level> --status --root .
+ValueError: invalid literal for int() with base 10: 'TIER_SECRET'
+EXIT=1
+```
+
+`scripts/asvs/prove_report.py` then relays a prover child's whole stderr on its instrument-failure branch, and `.github/workflows/asvs-prove-absences.yml` runs it in this public repository -- so the same class **would** reach a world-readable Actions log once that job is given a scorecard input (it has none today: the vault-fetch option is implemented and off). `scripts/docs/asvs_residual_lint.py` escapes the same way against its own 0/2 contract, though its disclosure limb does not carry over since it prints cell keys by design. **Unallocated, and deliberately cited by subject rather than by number** -- naming a `#N` nobody has allocated makes a citation that resolves to nothing today and to unrelated work the day it is issued.
+
+## 1383. docs/SECURITY.md quotes config keys the loader refuses, so a reader who copies them gets a load failure
+
+> 🔢 **Filed 2026-08-29 (builder1) - SECURITY.md half BUILT in the filing commit; the wider corpus is ratcheted, not fixed.**
+> Verdict: build
+> Closing-act: code
+
+**Cluster:** Documentation correctness. **Priority:** P3. **Verdict:** build (small).
+**Severity:** no engine effect and no PHI axis (sec. 0). Nothing is deployed, so nobody has hit this.
+**What is NOT conditional: the defect is in the shipped doc today.** The engine refuses these keys
+and the security document quotes them.
+
+**THE MECHANISM, read from source rather than relayed.** `_RELOCATED_TO_SECURITY`
+([settings.py](../messagefoundry/config/settings.py)) maps 15 legacy `[section] key` spellings to
+their `[security]` replacements. `_reject_relocated_keys` **raises `ValueError`** and is called at
+`:4588`, **before** `_desugar_security` at `:4592` - so a legacy spelling never reaches the
+desugarer. Refusing is the whole behaviour, not a fallback. ADR 0118 is described as *desugaring*,
+which is why this needed checking rather than assuming.
+
+**THE SEVERITY IS LOWER THAN THE ORIGINATING HANDOFF ASSERTED, AND THE ORIGINATOR WITHDREW THE
+CLAIM.** The handoff said at least one line *instructs* an operator, causing a load refusal on
+first start. Measured, with the key list imported from the table itself: **0** refused keys inside
+any fenced code block, **0** imperative instructions, **3** TOML-shaped prose citations, 19
+descriptive mentions, against a positive control of 4 new-spelling hits. The line meant was `:811`,
+`` `[auth].require_mfa = false` ``, which read with `:810` is declarative - *"The documented org
+opt-out **is** X"*. Its own diagnosis: it saw the assignment syntax and never read the previous
+line for the verb.
+
+**SO THE RESIDUAL RISK IS NARROWER AND STILL REAL:** nobody hits a load refusal, because nothing
+tells them to set the key. But a reader told *"the documented org opt-out is X"* may well write X,
+and X is refused.
+
+**THREE FALSE-POSITIVE CLASSES ANY RE-SCAN MUST EXCLUDE, recorded so they are not re-derived.** A
+first pass returned 40, looser than either earlier estimate. `create_app(serve_ui=True)` is a
+**Python keyword argument, not a TOML key**; `[approvals].enabled` and `[auth].oidc_enabled` are
+**different keys**; and lines that **correctly document the refusal** are not defects.
+**`SECURITY.md:186` says the `[diagnostics].audit_all_authz` spelling "is refused at load" - the one
+place the document is already right, and the originating scan counted it as a defect.** In its own
+words, the item *"would have had a builder fix it into being wrong."* The discriminator that
+separates config from API surface is one character: **TOML booleans are lowercase.**
+
+**BUILT IN THE FILING COMMIT:** the three citations rewritten to the `[security]` spelling, with
+the claims verified rather than transcribed - `require_sign_in` defaults `True` and
+`require_mfa_scope` defaults `"every_local_account"` in source, so the sentences stay true after the
+respelling. Plus `tests/test_docs_cite_no_refused_config_keys.py`, which imports
+`_RELOCATED_TO_SECURITY` so it cannot drift from the table, and carries a positive control plus two
+negative controls (the documented-refusal line, and the Python kwarg).
+
+**REMAINING, AND IT IS THE LARGER HALF: 26 other documents carry 56 more citations.** Scope was
+deliberately held to `docs/SECURITY.md` - the originating recommendation, endorsed unaltered - so
+the gate ships as a **ratchet** rather than a clean check: every affected file is pinned at its
+measured count, a file absent from the table must be at zero, and new files or new citations fail
+immediately. **The baseline self-prunes**: fixing a file below its number fails until the number is
+lowered, and fixing it entirely fails until the row is deleted, so the list can only shrink and
+cannot rot into a suppression list. **Both directions were proved by making the gate fail on
+purpose.** The heaviest are `docs/testing/master-test-plan/03-store-and-data-lifecycle.md` (11) and
+`docs/CONNECTIONS.md` (9). Clearing the rest is a separate item and is not filed here.
+
+## 1419. two records on main disagree about whether CI runs the connscale sweep, and the test docstring is the wrong one
+
+> 🔢 **Filed 2026-09-01 - not started.** `harness/load/profiles/connscale-smoke.toml` says *"No workflow runs it"* (line 26; the measurement behind it is at lines 6-12, dated 2026-08-31). `tests/test_connscale_smoke.py:45` says the same shipped profile is *"run via the ``--connscale`` CLI in CI"*. **Both sentences are on `origin/main` and they contradict each other. The toml is right; the docstring is wrong.** A reader who opens the test file to decide whether the N=50/100 regime is regression-covered gets the wrong answer, and the test file is the natural place to look. **That docstring carries a SECOND false clause three lines above, so the fix is two.** Line 42 reads *"The Postgres CI leg (pool_size forced to 1-2)"*. MEASURED: `ci.yml:2092` sets `MEFOR_STORE_POOL_SIZE: "4"`, and the job never SETS 1-2. It does NAME it, one line above at `ci.yml:2086`, in the comment that chose the value: *"default pool (40) would mask the wall. 4 (not 1-2) is deliberate"*. An earlier revision of this line said 1-2 "appears nowhere in that job", which is false and threw away the best evidence there is -- somebody considered 1-2 for this leg, rejected it, and wrote down why. The doc line is wrong about the VALUE, not about the leg being tuned. An earlier draft of this row said "one clause" and was wrong; the miss is recorded because a fixer who trusts the count stops early. Wiring a real sweep leg up is a different question and is already owned -- see PERF-36 below.
+> Verdict: build
+> Closing-act: code
+
+**Cluster:** Developer Experience & CI. **Priority:** P3. **Verdict:** build.
+**Severity:** no engine effect, no PHI axis, **no deployment axis (sec. 0)** -- this is a measurement instrument in the test harness and a false sentence about it, not shipped engine behaviour. The cost is a reader's model of coverage.
+
+**Allocated under the title *"the connscale-smoke profile is documented as CI-run and no workflow invokes it"*, and retitled here on 2026-09-01.** That original title names a finding that was already on `origin/main` before this number was allocated. The heading now names what is actually new.
+
+**WHAT IS NEW IS THE CONTRADICTION, NOT THE MEASUREMENT. The measurement already exists on `origin/main`, in three places, all agreeing -- read it there, and do not copy it here:**
+
+* `harness/load/profiles/connscale-smoke.toml:6-12` -- the needle, the positive control, the line count, and the date (2026-08-31, the day before this number was allocated).
+* the same file's `description` field, line 26 -- *"No workflow runs it."*
+* `tests/test_connscale_empty_claims_per_msg.py:84` -- *"but no workflow invokes it; PERF-36."*
+
+**None of those three says that a fourth record contradicts them.** That is the whole of this item, and it is why a fixer reading only the toml would not find the false sentence.
+
+**THE RUNNER-COST DECISION IS ALREADY OWNED. DO NOT RE-OPEN IT HERE.** `connscale-smoke.toml:11-12` names **PERF-36** in `docs/testing/master-test-plan/17-performance-and-scale.md` as the item that owns wiring a real leg up. A fixer who treats this row as a cost decision duplicates PERF-36.
+
+**That pointer is unreachable from an engine checkout, so the ownership it asserts cannot be acted on here.** Commit `921db74a1` (PR #714) untracked `docs/testing/master-test-plan/` under ADR 0160's D1 test; only `docs/testing/VERIFY.md` survives in this repository. On `origin/main` the string `PERF-36` occurs in exactly two places -- the two pointers named above -- and in no file that defines it. `tests/test_connscale_smoke.py:30-38` already records that stranding for its own coverage row; read the reasoning there. It is restated here only in the one respect that row does not cover: it makes *"PERF-36 owns the leg"* un-actionable from an engine checkout without a vault clone.
+
+**WHAT CI ACTUALLY RUNS, so a replacement sentence can be true.** The load-bearing step is a whole-suite run, and **no string census under `.github/` can see it** -- that is the instrument error an earlier draft of this row made:
+
+* `.github/workflows/ci.yml:824`, inside the step **"Tests (pytest)"** (`id: tests`, declared at `:758`), runs `bash scripts/ci/retry-native-crash.sh pytest -q -n "$PYTEST_WORKERS" --dist loadfile -m 'not tooling' --ignore-glob='*messagefoundry-webconsole*' ...` -- the whole engine suite. `tests/test_connscale_smoke.py` is **not** in `tests/tooling_manifest.txt`, and `tests/conftest.py:424-433` derives the `tooling` mark from that manifest by basename, so the module is collected and run on every `test` leg **that runs the step at all**: `ci.yml:760` gates it on `needs.changes.outputs.code == 'true' || push || workflow_dispatch || merge_group`, so on a pull request touching no code the step is skipped and this coverage does not happen. **That is CI's connection-scale coverage**, at the module's own inline N=12/24 sweep, and it is what a replacement sentence should name.
+* `ci.yml:2093` additionally runs `pytest tests/test_connscale_postgres.py -v`, which is what gives the pool-acquire-wait wall real small-N coverage -- **on the `postgres-store` job (`:1972`), which does NOT run on `push`**: its `if` at `:1976` is `schedule || workflow_dispatch || merge_group || needs.changes.outputs.serverdb == 'true'`. So this leg is absent from an ordinary push build.
+
+**THE CENTRAL CLAIM SURVIVES: the `--connscale` sweep runs nowhere.** Needle `--connscale`, corpus `.github/` on `origin/main`: exit 1, no output. Positive control, needle `connscale`, same corpus: exit 0, **10 lines, all in `ci.yml`** -- `860, 864, 866, 870, 871, 1315, 1351, 1469, 2091, 2093`. That list is the tool's entire output rather than a selection from it, and the command that reproduces it is below. **This is a re-run on 2026-09-01, not a copy of the 2026-08-31 record cited above** -- the enumeration is this row's own contribution and had to be measured here; the underlying absence is cited, not restated. **An earlier draft of this row claimed to enumerate "every" occurrence and covered seven of the ten** (860, 864 and 2091 fell outside every range it gave), which is recorded here because a false completeness claim reads as measured.
+
+**`ci.yml:1315` DOES NOT RESERVE RUNNER HEADROOM FOR A SWEEP LEG, and an earlier draft of this row said it did.** The comment reads *"IF TIMING-SENSITIVE TESTS START FLAKING, 2 IS THE CONSERVATIVE RUNG -- it leaves 2 vCPU of headroom for the dispatcher and connscale assertions that measure elapsed time"*. Two things are wrong with reading that as a reservation. It is a **contingency not taken**: `pytest_workers` is `4` on all three legs (`ci.yml:1363-1365`), so no headroom is set aside today. And the headroom it describes is for **the connscale pytest assertions already in the suite**, which measure elapsed time, not for a separate sweep leg. `ci.yml:1351` is likewise a record of the `-n 8` trial that lost `connscale_smoke` on windows-2025, not a reservation. The retraction is written here rather than deleted because the argument it supported -- that CI has room set aside for the sweep -- reads as measured and is not.
+
+**THE FLAG EXISTS. Whether the CLI path is exercised is a separate question, and the answer is no.** `harness/__main__.py:152` declares `--connscale` and `:253` dispatches to `_run_connscale`, which calls `harness.load.connscale.runner.run_connscale` at `:467`. Needle `_run_connscale`, corpus `origin/main`: two files, `harness/__main__.py` and `tests/test_bench_connscale_remote.py`. That second file drives the `connscale-remote` subcommand, not the `--connscale` sweep, so **no test drives the sweep's argparse path** -- but an earlier draft of this row said the only hits were in `__main__.py`, which is false as an evidence sentence even though the conclusion survives. The **runner function** is exercised directly, by at least `tests/test_connscale_smoke.py:440`, `tests/test_connscale_ports.py:208`, `tests/test_connscale_batch.py:547` and `tests/test_connscale_postgres.py:83`. So this is a declared-and-untested CLI seam over a tested function -- not a broken flag, and not an exercised one either.
+
+**WHY IT IS WORTH A ROW RATHER THAN A SILENT EDIT.** The docstring's surrounding paragraph is careful and honest -- it states in terms which walls the small-N run does NOT regression-cover, and names the Postgres leg as what gives the acquire-wait wall real small-N coverage. A reader who trusts that carefulness has no reason to doubt the next clause. **An accurate paragraph is what makes the one false clause inside it dangerous.** **Do not "fix" this by deleting the clause** and leaving the coverage question unanswered; replace it with what CI does run, named above.
+
+**PROVENANCE.** Surfaced by **PR #656** (closed 2026-09-01, superseded by **PR #729**). The diagnosis outlives the pull request; the remedy that PR proposed is not what is wanted here. Its sibling finding -- the final sample taken after stop and drain, while several sites call the window in-hold -- is filed as **#1420**. An earlier draft of this row said that sibling *"belongs to #1211 as an amendment rather than a new number"*; **that reasoning is withdrawn**, and the reasons are recorded in #1420 rather than restated here.
+
+**How to re-measure, and print the needle beside every zero.** A bare zero is indistinguishable from a search that never ran:
+
+```
+git grep -n -e '--connscale' origin/main -- .github/                    # expect exit 1, no output
+git grep -n -e 'connscale'   origin/main -- .github/                    # positive control: exit 0, 10 lines, all ci.yml
+git grep -n -e 'connscale'   origin/main -- tests/tooling_manifest.txt  # expect exit 1: the module is NOT partitioned out
+git grep -c -e 'tests/'      origin/main -- tests/tooling_manifest.txt  # positive control for the line above: exit 0, 138 at 2e949398b
+```
+
+**Related:** [#1420](#1420-the-connscale-final-sample-is-taken-after-stop-and-drain-while-its-docstrings-call-it-in-hold) is the sibling finding from the same pull request. [#1211](#1211-empty_claims_per_msg-is-not-contention-immune-the-ratio-form-excursions-past-its-own-slo-band-on-a-hosted-runner) is the single home for the empty-claims harvest -- read it there.
+
+## 1420. the connscale final sample is taken after stop and drain while its docstrings call it in-hold
+
+> 🔢 **Filed 2026-09-01 - not started.** `harness/load/connscale/runner.py` appends each sweep step's FINAL engine sample **after** the driver has stopped, the pipeline has drained and a settle has elapsed: `await driver.stop(_STOP_GRACE)` at `:450`, `await poller.await_drain(...)` at `:451`, `await asyncio.sleep(_SETTLE)` at `:454` with `_SETTLE = 0.5` at `:92`, then `samples.append(final)` at `:474`. `_empty_claim_rates` reads `samples[0]` and `samples[-1]` (`:1148`), so the window every empty-claim rate is computed over **ends at that post-drain sample**. Four source sites and one test docstring describe that window as *"first to last in-hold samples"*. **The last sample is not in-hold, so the described window and the computed window are not the same window.**
+> Verdict: build
+> Closing-act: code
+
+**Cluster:** Developer Experience & CI. **Priority:** P3. **Verdict:** build.
+**Severity:** no engine effect, no PHI axis, **no deployment axis (sec. 0)** -- a measurement instrument in the test harness, not shipped engine behaviour.
+
+**THE MECHANISM, in the order the code runs it.** All line numbers are `harness/load/connscale/runner.py` on `origin/main` unless named otherwise:
+
+1. `:441` `sampler_stop.set()` stops the in-hold sampler. At this point `samples` holds only in-hold readings, appended by `_sample_loop` (started at `:421`).
+2. `:450` `await driver.stop(_STOP_GRACE)` -- stop offering, flush the send queue, grace the in-flight ACKs. `_STOP_GRACE = 5.0` at `:91`.
+3. `:451` `drain_seconds = await poller.await_drain(timeout=profile.drain_timeout_s, interval=profile.poll_interval_s)` -- wait for the pipeline to empty.
+4. `:454` `await asyncio.sleep(_SETTLE)`, with `_SETTLE = 0.5` at `:92` and its own comment: *"let final ACKs/arrivals settle before the truly-final engine sample"*.
+5. One more engine sample -- `sample_until_reconciled(...)` at `:462`, or `poller.sample_once()` at `:472` when the drain already timed out -- appended at `:474`.
+
+So `samples[-1].elapsed_s - samples[0].elapsed_s` spans the hold **plus** the stop grace, the whole drain and the settle. Under the shipped profile's own knobs that tail is bounded by 5.0 s plus `drain_timeout_s = 30.0` **twice** plus 0.5 s -- 65.5 s, not 35.5 s. The second `drain_timeout_s` is easy to miss and an earlier draft of this row did miss it: `:462` `sample_until_reconciled(..., timeout=profile.drain_timeout_s, ...)` burns its own full budget AFTER `await_drain` has already spent one. `:470` names that second spend in its own comment ("burning a second drain_timeout_s"), against `hold_seconds = 3.0` (`harness/load/profiles/connscale-smoke.toml:31,35`). **The tail is not a rounding error against the hold**, and the same ordering holds for the inline profile the suite runs.
+
+**WHY IT MATTERS FOR THE METRIC, and what is NOT claimed.** Through that tail the engine keeps polling an emptying queue, so `empty_claims` can keep rising while `read` stops. `_empty_claims_per_msg` (`:1158`) is the ratio of two rates taken over that span. **Its docstring's algebra is not disputed here:** the span does cancel, exactly as `:1161` says. What does not cancel is that both deltas now cover a regime the metric does not intend -- an idle drain contributes empty claims and no messages absorbed. **NO EFFECT SIZE IS CLAIMED.** Establishing one means one run recorded with the final sample included and excluded, per `(sweep_mode, count)` cell, and that measurement is the work this row asks for. Until it exists the defect is that the code and its five descriptions disagree, which is provable from the source alone.
+
+**THE SITES THAT CALL THE WINDOW IN-HOLD. Scope stated because the count depends on it:** needle `in-hold`, corpus `harness/load/connscale/` plus `tests/test_connscale_empty_claims_per_msg.py`, on `origin/main`. Five hits, all five listed:
+
+* `harness/load/connscale/report.py:119` -- *"over the same first->last in-hold window as the rates above"*.
+* `harness/load/connscale/runner.py:917` -- *"are delta/span over the same first->last in-hold samples"*.
+* `harness/load/connscale/runner.py:1145` -- *"from the FIRST to LAST in-hold sample"*.
+* `harness/load/connscale/runner.py:1161` -- *"Both inputs are delta/span over the SAME first->last in-hold samples"*.
+* `tests/test_connscale_empty_claims_per_msg.py:12` -- the same sentence, in the module docstring.
+
+**The heading was retitled after allocation.** `alloc.ps1` recorded it as *"... while three sites call it in-hold"*; the heading now reads *"while its docstrings call it in-hold"*, because three was scope-dependent and read as measured. The number is unchanged and this note exists so nobody reads the difference as a mismatch.
+
+**Any count published here needs its scope stated.** Three is the count in `runner.py` alone. The corpus above gives five. Widen it to the whole tree and `docs/BACKLOG.md:11032` and `docs/archive/backlog/BACKLOG-CLOSED.md:6981` quote the sentence as well, as history rather than as live description. **State the scope with any count you publish here.**
+
+**THIS IS NOT #1211, AND IT MUST NOT BE FILED THERE.** #1211 attacks the CONTENTION-IMMUNITY conclusion of the same docstring, from recorded hosted-runner excursions; it never examines which samples the window spans. Different defect, different mechanism, different fix. #1211 is also marked **SUPERSEDED 2026-08-31**, so an amendment parked there would likely be closed with its parent. An earlier draft of #1419 said this finding *"belongs to #1211 as an amendment rather than a new number"*; that reasoning is withdrawn and #1419 now points here.
+
+**CANDIDATE FIXES, not yet decided.**
+
+* **(a) Narrow the rate window.** Exclude the post-drain sample from `_empty_claim_rates` and `_throughput_rates` while keeping it for the no-loss reconcile, which is what it was added for -- `_build_record` would have to separate the two purposes. **This changes what the number MEANS**, so readings taken before and after are not comparable, the same caution ADR 0179 records for `handles_peak`.
+* **(b) Keep the sample and correct all five sentences** to say what the window actually spans. A docs edit; it leaves the tail inside the metric.
+
+**Do not do (b) and describe it as (a).** Either the tail is in the number or it is not, and the sentences must match whichever is chosen.
+
+**How to re-measure:**
+
+```
+git grep -n -e 'in-hold' origin/main -- harness/load/connscale/ tests/test_connscale_empty_claims_per_msg.py
+git show origin/main:harness/load/connscale/runner.py | sed -n '441,475p'   # the ordering, stop -> drain -> settle -> append
+git show origin/main:harness/load/connscale/runner.py | sed -n '1143,1156p' # samples[0] and samples[-1]
+```
+
+**Related:** [#1419](#1419-two-records-on-main-disagree-about-whether-ci-runs-the-connscale-sweep-and-the-test-docstring-is-the-wrong-one) is the sibling finding from PR #656. [#1211](#1211-empty_claims_per_msg-is-not-contention-immune-the-ratio-form-excursions-past-its-own-slo-band-on-a-hosted-runner) is the single home for the empty-claims harvest and for the contention-immunity retraction -- read it there, and do not restate it.
+
 ## 1373. the bash resolver rejects a working interpreter when coreutils is absent from PATH, conflating a harness fault with a namespace verdict
 
 > 🔢 **Filed 2026-08-27 -- REPRODUCED ON ONE VARIABLE, and the file already carried the distinction it drops.** `tests/_bash_resolver.py` defines `BASH_HARNESS_FAILURE = 127` at :40 under a comment saying 127 is *"a finding about the HARNESS"* and that conflating it *"lets a broken harness impersonate a failing test"*, and `explain_returncode` implements exactly that split at :177. `bash_sees` at :87 runs `cat mf_bash_probe.txt` and returns a bare bool, so a PATH without coreutils -- what PowerShell and cmd supply -- makes bash exit 127 and the probe reports it as a FILESYSTEM NAMESPACE failure. The distinction is built deliberately and then dropped at one call, 77 lines away.

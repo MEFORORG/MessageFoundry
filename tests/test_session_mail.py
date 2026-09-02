@@ -1854,3 +1854,93 @@ def test_the_Status_TEXT_render_says_nobody_was_told(repo: Path) -> None:
     assert proc.returncode == 0, proc.stderr
     assert "Expired:" in proc.stdout
     assert "NOBODY WAS TOLD" in proc.stdout
+
+
+# --------------------------------------------------------- BACKLOG #1386, limbs 1 and 2
+#
+# THE EXISTING CAP TEST ABOVE PASSES AND DID NOT CATCH EITHER OF THESE, WHICH IS THE WHOLE POINT.
+# It seeds bodies of about seventeen bytes ("message number 1"), so MAX_TOTAL_BYTES never binds and
+# the message cap is free to be the limit it claims to be. At the size the fleet actually broadcasts
+# the byte cap binds first, and a test that never approaches the real size cannot see it.
+
+
+def test_the_message_cap_is_the_binding_one_at_a_REALISTIC_broadcast_size(
+    repo: Path, tmp_path: Path
+) -> None:
+    """MAX_MESSAGES promises 5 per injection. At real broadcast sizes the byte cap delivered 3.
+
+    The arithmetic, and it is the finding rather than a projection: a message is charged
+    ``len(body) + FRAME_OVERHEAD_BYTES`` by the selection pass, the frame is 560 bytes, and
+    MAX_TOTAL_BYTES was 8000. A fleet broadcast runs about 1900 bytes, so each cost ~2460 and
+    only three fit. Every seat had been reading ``3 shown`` as normal.
+
+    A 5-message allowance that can only ever deliver 3 is not the stated policy, and the two
+    constants disagreeing silently is what made this a defect rather than a tuning choice. The
+    past tense is the fix: this test asserts all 5 render at that size, and its assertions read
+    the caps out of the script rather than restating them, so they cannot go stale the way the
+    8000 in this docstring did.
+    """
+    # SHAPE MATTERS AS MUCH AS SIZE, AND GETTING IT WRONG MADE THE FIRST DRAFT OF THIS TEST PASS.
+    # A single 1900-character line is cut to MAX_LINE_CHARS (240) before it is ever measured, so it
+    # costs ~800 bytes and five fit inside MAX_TOTAL_BYTES with room to spare. A real fleet broadcast
+    # is ~1900 bytes spread over many SHORT lines, none of which the line cap touches, so the full
+    # weight reaches the byte cap. Build it that way or this measures the LINE cap, not the BYTE cap.
+    line = "the quick brown fox jumps over the lazy dog and keeps on running for a while"
+    body = "\n".join([line] * 25)  # ~1900 bytes, every line well under MAX_LINE_CHARS
+    assert len(body) < MAX_BODY_BYTES, (
+        "fixture must stay under the per-body cap to isolate the total"
+    )
+    specs = [
+        {"stem": f"20260101T{i:09d}-aaaaaa", "body": f"{i}\n{body}"}
+        for i in range(1, MAX_MESSAGES + 1)
+    ]
+    seed(repo, tmp_path, specs)
+    text = injection(run_drain(repo))
+
+    assert len(frames(text)) == MAX_MESSAGES, (
+        f"only {len(frames(text))} of {MAX_MESSAGES} rendered at a realistic size -- "
+        "the byte cap is binding before the message cap"
+    )
+    assert f"{MAX_MESSAGES} shown" in text
+    assert "0 deferred (caps)" in text
+
+
+def test_the_caps_cannot_silently_disagree_again() -> None:
+    """Pin the RELATIONSHIP, not the numbers, so a later edit to either one cannot re-open this.
+
+    Raising MAX_MESSAGES or MAX_BODY_BYTES without raising MAX_TOTAL_BYTES silently restores the
+    defect: the constant a reader trusts stops being the one that binds. Asserting the two chosen
+    values would pass just as well after that edit, which is the shape this repo keeps finding.
+    """
+    frame = _const("FRAME_OVERHEAD_BYTES")
+    need = MAX_MESSAGES * (MAX_BODY_BYTES + frame)
+    assert need <= MAX_TOTAL_BYTES, (
+        f"MAX_TOTAL_BYTES={MAX_TOTAL_BYTES} cannot hold MAX_MESSAGES={MAX_MESSAGES} messages of "
+        f"MAX_BODY_BYTES={MAX_BODY_BYTES} plus a {frame}-byte frame (needs {need}); the byte cap "
+        "binds first and the message cap is decorative"
+    )
+
+
+def test_the_footer_reports_the_BACKLOG_and_not_only_this_pass(repo: Path, tmp_path: Path) -> None:
+    """A drain that clears 5 of 40 prints ``5 shown, 35 deferred`` and reads as an orderly queue.
+
+    Per pass that is true; in aggregate it is how 34 messages expired unread across 17 boxes. The
+    footer already tells a seat what happened THIS TURN, and a seat has no reason to look anywhere
+    else -- so the depth and the oldest age belong in the place it already reads.
+    """
+    over = MAX_MESSAGES + 7
+    specs = [
+        {"stem": f"20260101T{i:09d}-aaaaaa", "body": f"message number {i}"}
+        for i in range(1, over + 1)
+    ]
+    seed(repo, tmp_path, specs)
+    text = injection(run_drain(repo))
+
+    remaining = over - MAX_MESSAGES
+    assert f"{remaining} still in the inbox" in text, (
+        "the footer reports only this pass; a backlog growing faster than it drains is invisible "
+        f"in the one place a seat looks. Expected the remaining depth ({remaining}) to be stated."
+    )
+    assert "oldest" in text, (
+        "the depth alone does not say whether the queue is aging toward its TTL"
+    )

@@ -88,6 +88,48 @@ def _run(repo: Path, message: str) -> subprocess.CompletedProcess[str]:
     )
 
 
+# ------------------------------------------------------------------- what it must not fail OPEN on
+
+
+def test_a_git_read_failure_refuses_instead_of_passing_unchecked(
+    repo: Path, tmp_path: Path
+) -> None:
+    """The gate must not be disarmed by the one condition it cannot detect.
+
+    `_git` returned `.stdout` and never checked `returncode`, so a failed read returned "" --
+    indistinguishable from a genuinely empty diff. That flowed to `_touches_code([])`, which is
+    False BY DESIGN so a message-only `--amend` is never blocked, and the gate took its docs-only
+    exit and PASSED a commit citing an unclaimed item, PRINTING NOTHING.
+
+    Driven the way the defect actually arrives: the hook runs somewhere git cannot answer. Before
+    the fix this returned 0.
+    """
+    msg = tmp_path / "COMMIT_MSG.tmp"
+    msg.write_text("feat(x): build it (BACKLOG #42)", encoding="utf-8")
+    outside = tmp_path / "not-a-repo"
+    outside.mkdir()
+    r = subprocess.run(
+        [sys.executable, str(_CHECK), str(msg)], cwd=outside, capture_output=True, text=True
+    )
+    assert r.returncode == 1, f"the gate PASSED a commit it could not check: {r.stdout} {r.stderr}"
+    assert "could not be read" in r.stderr
+    assert "NOT checked" in r.stderr
+
+
+def test_the_git_read_failure_test_has_a_working_control(repo: Path) -> None:
+    """The negative above proves nothing unless the SAME command succeeds where git can answer.
+
+    Without this, deleting the staged-diff read entirely would satisfy the test above while
+    breaking every real check -- a refusal for the wrong reason reads identically to a refusal
+    for the right one.
+    """
+    _git(repo, "add", "code.py")
+    r = _run(repo, "feat(x): build it (BACKLOG #42)")
+    assert r.returncode == 1
+    assert "NOT CLAIMED" in r.stderr, "inside a real repo the refusal must be the CLAIM one"
+    assert "could not be read" not in r.stderr, "git read fine here; the wrong refusal fired"
+
+
 # --------------------------------------------------------------------------- what it must BLOCK
 
 
