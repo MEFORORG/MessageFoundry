@@ -3128,10 +3128,15 @@ class AuthService:
         self, identity: Identity, permission: Permission, path: str
     ) -> None:
         """Twin of :meth:`audit_permission_denied` for the authorization-GRANT side (BACKLOG #195a,
-        ASVS 16.3.2). The API layer emits this ONLY for the sensitive / state-changing surface (never on
-        a read or a poll — see the ``_GRANT_AUDIT_PERMISSIONS`` scope in ``api/security.py``), so the
-        hash-chained audit log records who was allowed to perform a sensitive op without being flooded by
-        console polling or the /ws/stats feed."""
+        ASVS 16.3.2). Writes one hash-chained audit row naming who was allowed to reach a route.
+
+        WHICH grants arrive here is the API layer's call, and ``[diagnostics].audit_all_authz``
+        governs it. On the shipped default that is the authenticated surface at large, reads and
+        polls included; with the switch false it narrows to the sensitive
+        ``_GRANT_AUDIT_PERMISSIONS`` set in ``api/security.py``, which was the only audited scope
+        before BACKLOG #1277. That set and its exclusions are documented there, and the reasoning
+        for the default is written once on the ``audit_all_authz`` field in ``config/settings.py``.
+        Do not restate either here."""
         await self._audit(
             "auth.permission_granted",
             actor=identity.username,
