@@ -100,7 +100,23 @@ async def _run_race(
     async def read_then_wait(*args: Any, **kwargs: Any) -> Any:
         holder = await real_read(*args, **kwargs)
         observed.append(holder is None)
-        await barrier.wait()  # neither proceeds to the write until both have read
+        # BOUNDED, AND THE BOUND IS NOT ABOUT THIS TEST'S OWN LOGIC. If either login returns before
+        # reaching this point -- ANY early exit in `authenticate_oidc`, of which there are several --
+        # then only one party ever arrives and an unbounded `wait()` hangs the whole worker. That is
+        # not a slow test: pytest-timeout's `thread` method calls `os._exit(1)`, so the WORKER PROCESS
+        # dies and xdist reports `worker 'gwN' crashed` with no stack and no failing assertion. It has
+        # happened twice, on unrelated pull requests, and cost a merge-queue eviction each time.
+        #
+        # 10s is far above the microseconds a healthy interleave needs and far below both per-test
+        # caps (60s on ubuntu, 120s on the windows legs), so a real hang fails here, named, rather
+        # than being killed upstream anonymously. Measured: with one party skipped, this fails in
+        # 10.6s with `a login raised rather than returning: TimeoutError()`.
+        #
+        # A TRAP FOR WHOEVER EDITS `authenticate_oidc`: `TimeoutError` IS a subclass of `OSError` on
+        # 3.11+. Today the patched read sits outside every `except` in that chain, so this propagates
+        # cleanly -- but widen an `except OSError` across that region and this bound goes SILENT,
+        # restoring the very hang it exists to prevent.
+        await asyncio.wait_for(barrier.wait(), timeout=10)
         return holder
 
     monkeypatch.setattr(store, "get_user_by_federated_subject", read_then_wait)
