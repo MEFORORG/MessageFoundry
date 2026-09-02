@@ -253,12 +253,12 @@ diverge enough to warrant it; keep this root file general.
 
 ---
 
-## 5. Six seats run this repo, and each one has a different contract
+## 5. Every seat that runs this repo has a different contract
 
 **Console with a capital C is a seat. The web console is the product's operator UI at `/ui`** (§10).
-Never write a bare "console". The long form of the method is
-[`docs/METHOD.md`](docs/METHOD.md), landing in the same change as this section; this section is the
-short form and it binds.
+Never write a bare "console". The method is named KORUS, and
+[`docs/METHOD.md`](docs/METHOD.md) defines that name once; read it there rather than restating it
+here. That page is the long form; this section is the short form and it binds.
 
 This section replaced the pre-2026-09-01 method. The retired rules are not repeated here as
 retractions. At least these went:
@@ -286,10 +286,14 @@ document as stale and follow this section.
 | **Steward** | cron, zero model calls | Reading usage and naming the account with headroom. | Warn a running session. Nothing can interrupt one. |
 | **Lander** | as needed | Merging. Standing authority on the engine repo and the vault, with no per-action owner approval. | Merge a PR with no `reviewed` label. |
 
-The Console spawns a Builder where it holds the spawn permission, and that is per config root.
-Measured 2026-09-02: `.claude-account-1` carries `Bash(claude:*)` and `PowerShell(claude:*)` and
-spawned one end to end, exit 0 in 38.8 seconds; the other five roots carry neither and are refused.
-On a root without the grant the owner starts each Builder. Nothing else in the roster spawns one.
+The Console spawns a Builder where it holds the spawn permission, and that is per config root. The
+grant is a rule matching `Bash(claude:*)` or `PowerShell(claude:*)` under `permissions.allow` in the
+`settings.json` of the config root named by `CLAUDE_CONFIG_DIR`. Measured 2026-09-02:
+`.claude-account-1` carries both and spawned one, exit 0 in 38.8 seconds; every root measured that
+day without them was refused. Exit 0 alone does not prove the spawn worked, because a prompt
+swallowed by a list-taking flag exits 0 too (see the spawn bullet below), so check what the child
+did. On a root without the grant the owner starts each Builder. Nothing else in the roster spawns
+one.
 
 The brief is disposable. The BACKLOG item is the record.
 

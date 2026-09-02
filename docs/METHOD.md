@@ -10,6 +10,9 @@ explanation that neither of those carries.
 
 ## The KORUS seats, and only these
 
+KORUS stands for Keep One Repo, Unblock Sessions, and it is the name of this method. That expansion
+is defined here and nowhere else, so other pages point at this line rather than repeat it.
+
 | Seat | Lives how long | What it does |
 |---|---|---|
 | Console | Long-lived | The only seat the owner talks to. Reads the record and writes a brief citing an item, then polls. The record is two ledgers: `docs/BACKLOG.md` here, and the `wshallwshall/claude-multisession` issues that track KORUS itself. Nothing pushes to it. |
@@ -19,11 +22,22 @@ explanation that neither of those carries.
 | Steward | A cron, no model calls | Reads account usage and names the account with headroom. It cannot interrupt a running session. |
 | Lander | Standing authority | Merges. |
 
-**Whether a session can spawn a session depends on its account, and it turns on one grant.**
-Measured 2026-09-02 across six config roots: `.claude-account-1` carries `Bash(claude:*)` and
-`PowerShell(claude:*)` in its allow list, and spawned a Builder end to end, exit 0 in 38.8 seconds.
-The other five carry neither, and the classifier refuses them. So a Console on account 1 starts its
-own Builders, and on any other root the owner still starts them by hand.
+**Whether a session can spawn a session depends on its account, and it turns on one grant.** Check
+your own root: in the `settings.json` of the config root named by `CLAUDE_CONFIG_DIR`, look under
+`permissions.allow` for a rule matching `Bash(claude:*)` or `PowerShell(claude:*)`. A root that
+carries the grant starts its own Builders. A root without it leaves every Builder for the owner to
+start by hand. Key this on the grant, not on which account you are: a root that gains the grant
+later is served wrongly by a rule written about identity.
+
+Measured 2026-09-02: `.claude-account-1` carries both rules and spawned a Builder, exit 0 in 38.8
+seconds. Every root measured that day without them was refused by the classifier. Read that exit
+code as weak evidence rather than proof. A prompt swallowed by a list-taking flag also exits 0, so
+confirm the child did the work instead of trusting the code.
+
+Do not write a count of config roots into this page. Roots get added, and a count goes stale without
+saying so. `pwsh -NoProfile -File scripts\coord\install-coordination.ps1 -Status` discovers roots by
+name pattern and prints `Roots examined: <n>` with a line per root, so enumerate them there and read
+each root's own `settings.json` for the grant.
 
 Seven seats were retired by owner decision on 2026-09-01: Dispatcher, Liaison, PM, Cleaner, Role
 Manager, Process Improvement and ASVS Tracker. If a document names one, that document is stale.
@@ -238,7 +252,10 @@ Never announce a hold, a freeze, or a promise about future state. A 2026-08-01 r
 shape stayed "in force" for hours after its condition had cleared. `main` moved four times underneath
 it.
 
-Never spawn another session. Nothing here can, and starting a Builder is the owner's job today.
+Never spawn a session from a root that does not carry the spawn grant. The classifier refuses it
+there, and on that root the owner starts each Builder. Where the grant is present, spawning belongs
+to the Console and to nothing else in the roster. The grant, and how to check your own root for it,
+are in "The KORUS seats" above.
 
 ---
 
@@ -269,7 +286,7 @@ Two habits that cost this project real time, so they are worth naming.
 
 ---
 
-## Never wait for CI, because waiting costs more than working
+## Never wait for CI, because the worst way to wait costs more than working
 
 **End your turn. Waiting is the single most expensive thing a session can do, and the worst way to
 wait costs more than working does.**
@@ -286,8 +303,9 @@ A session spends metered tokens only while the model runs. Measured on this flee
 **Read the third row against the first.** A sleep loop costs more per minute than doing the work.
 That is not a frequency effect: the more frequent heartbeat is ten times cheaper per minute than the
 less frequent sleep loop. The mechanism is what costs. A sleep loop re-enters the model each
-iteration and pays for the whole context again. A heartbeat that runs in a hook does not run the
-model at all.
+iteration and pays for the whole context again. A heartbeat does not start a turn of its own, so its
+cost rides turns the session was already taking. It is still billed, as the table shows. Only the
+ended turn is free.
 
 CI legs here take 6 to 19 minutes. Against one 19-minute run:
 
@@ -311,8 +329,15 @@ must not wait for the answer either. Write the question to the Console, comment 
 request, and stop. The answer arrives as the next spawn, not as a reply to a session that is still
 burning tokens to hear it. Stopping costs nothing; waiting for a reply is the 22,275 row.
 
-**Idle is not free in every sense.** An ended session still holds a worktree, a branch, and possibly
-a claim, and a held claim blocks other work. Release what you hold before you go.
+**Ending your turn does not release a claim.** A claim you still hold blocks other work until
+somebody releases it, so release yours before you go:
+
+```powershell
+pwsh -NoProfile -File scripts\coord\claim.ps1 -Release <key>
+```
+
+Leave the worktree and the branch where they are. Both are meant to outlive you, and where there is
+no commit and no PR the worktree is the only record of what you saw.
 
 ---
 
