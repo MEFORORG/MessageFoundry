@@ -266,6 +266,53 @@ Two habits that cost this project real time, so they are worth naming.
 
 ---
 
+## Never wait for CI, because waiting costs more than working
+
+**End your turn. Waiting is the single most expensive thing a session can do, and the worst way to
+wait costs more than working does.**
+
+A session spends metered tokens only while the model runs. Measured on this fleet:
+
+| What the session is doing | Tokens a minute |
+|---|---|
+| Actively working | 10,041 |
+| Waiting on a 3-minute heartbeat | 2,108 |
+| Waiting on a 10-minute sleep loop | 22,275 |
+| Turn over, idle | 0 |
+
+**Read the third row against the first.** A sleep loop costs more per minute than doing the work.
+That is not a frequency effect: the more frequent heartbeat is ten times cheaper per minute than the
+less frequent sleep loop. The mechanism is what costs. A sleep loop re-enters the model each
+iteration and pays for the whole context again. A heartbeat that runs in a hook does not run the
+model at all.
+
+CI legs here take 6 to 19 minutes. Against one 19-minute run:
+
+| What the session does | Metered tokens |
+|---|---|
+| Waits on a 10-minute sleep loop | about 423,000 |
+| Waits on a 3-minute heartbeat | about 40,000 |
+| Ends its turn, respawned when there is work | a few thousand |
+
+**So the rule has two halves and you need both.**
+
+Poll at a checkpoint the work already produces, and never in a loop that exists only to wait.
+Reading your mailbox between two steps you were taking anyway is a tool call and nearly free.
+Sitting in a timer to see whether something changed is the 22,275 row.
+
+And end the turn rather than watching for a result you cannot act on. Respawning a session when
+there is actually something to do costs a small fraction of the wait.
+
+**The same arithmetic governs a question.** A worker that hits something its brief does not answer
+must not wait for the answer either. Write the question to the Console, comment it on the pull
+request, and stop. The answer arrives as the next spawn, not as a reply to a session that is still
+burning tokens to hear it. Stopping costs nothing; waiting for a reply is the 22,275 row.
+
+**Idle is not free in every sense.** An ended session still holds a worktree, a branch, and possibly
+a claim, and a held claim blocks other work. Release what you hold before you go.
+
+---
+
 ## Nothing tells a Reviewer your PR is waiting
 
 No workflow notifies a reviewer that a PR needs reading. That gap is BACKLOG #1413, which is filed
