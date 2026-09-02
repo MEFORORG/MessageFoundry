@@ -8,19 +8,22 @@ explanation that neither of those carries.
 
 ---
 
-## You are one of six seats, and only these six
+## The KORUS seats, and only these
 
 | Seat | Lives how long | What it does |
 |---|---|---|
-| Console | Long-lived | The only seat the owner talks to. Reads `docs/BACKLOG.md`, writes a brief citing an item, and polls. Nothing pushes to it. |
+| Console | Long-lived | The only seat the owner talks to. Reads the record and writes a brief citing an item, then polls. The record is two ledgers: `docs/BACKLOG.md` here, and the `wshallwshall/claude-multisession` issues that track KORUS itself. Nothing pushes to it. |
 | Builder | One brief, then exits | Works, commits, pushes, opens the PR, and stops. That is you, most of the time. |
 | Reviewer | Spawned per PR | Runs quality checks on the diff. A pass adds the `reviewed` label and posts the head SHA it read. A fail posts findings on the PR, for whichever Builder the Console spawns next. |
 | Regulator | Spawned on a red | Decides whose failure a red belongs to: the PR's, main's, a flake, or the queue's. Only a PR's own failure comes back to a Builder. |
 | Steward | A cron, no model calls | Reads account usage and names the account with headroom. It cannot interrupt a running session. |
 | Lander | Standing authority | Merges. |
 
-**No session can spawn a session today.** The classifier refuses a session-to-session spawn, so the
-owner starts each Builder by hand. The Console will spawn Builders once it holds that permission.
+**Whether a session can spawn a session depends on its account, and it turns on one grant.**
+Measured 2026-09-02 across six config roots: `.claude-account-1` carries `Bash(claude:*)` and
+`PowerShell(claude:*)` in its allow list, and spawned a Builder end to end, exit 0 in 38.8 seconds.
+The other five carry neither, and the classifier refuses them. So a Console on account 1 starts its
+own Builders, and on any other root the owner still starts them by hand.
 
 Seven seats were retired by owner decision on 2026-09-01: Dispatcher, Liaison, PM, Cleaner, Role
 Manager, Process Improvement and ASVS Tracker. If a document names one, that document is stale.
@@ -263,6 +266,53 @@ Two habits that cost this project real time, so they are worth naming.
   the zero.
 - A zero is a fact about the spelling you searched. One search for `already-checked-out` returned
   zero while `already checked out` sat in the same file.
+
+---
+
+## Never wait for CI, because waiting costs more than working
+
+**End your turn. Waiting is the single most expensive thing a session can do, and the worst way to
+wait costs more than working does.**
+
+A session spends metered tokens only while the model runs. Measured on this fleet:
+
+| What the session is doing | Tokens a minute |
+|---|---|
+| Actively working | 10,041 |
+| Waiting on a 3-minute heartbeat | 2,108 |
+| Waiting on a 10-minute sleep loop | 22,275 |
+| Turn over, idle | 0 |
+
+**Read the third row against the first.** A sleep loop costs more per minute than doing the work.
+That is not a frequency effect: the more frequent heartbeat is ten times cheaper per minute than the
+less frequent sleep loop. The mechanism is what costs. A sleep loop re-enters the model each
+iteration and pays for the whole context again. A heartbeat that runs in a hook does not run the
+model at all.
+
+CI legs here take 6 to 19 minutes. Against one 19-minute run:
+
+| What the session does | Metered tokens |
+|---|---|
+| Waits on a 10-minute sleep loop | about 423,000 |
+| Waits on a 3-minute heartbeat | about 40,000 |
+| Ends its turn, respawned when there is work | a few thousand |
+
+**So the rule has two halves and you need both.**
+
+Poll at a checkpoint the work already produces, and never in a loop that exists only to wait.
+Reading your mailbox between two steps you were taking anyway is a tool call and nearly free.
+Sitting in a timer to see whether something changed is the 22,275 row.
+
+And end the turn rather than watching for a result you cannot act on. Respawning a session when
+there is actually something to do costs a small fraction of the wait.
+
+**The same arithmetic governs a question.** A worker that hits something its brief does not answer
+must not wait for the answer either. Write the question to the Console, comment it on the pull
+request, and stop. The answer arrives as the next spawn, not as a reply to a session that is still
+burning tokens to hear it. Stopping costs nothing; waiting for a reply is the 22,275 row.
+
+**Idle is not free in every sense.** An ended session still holds a worktree, a branch, and possibly
+a claim, and a held claim blocks other work. Release what you hold before you go.
 
 ---
 
