@@ -34,6 +34,13 @@ seconds. Every root measured that day without them was refused by the classifier
 code as weak evidence rather than proof. A prompt swallowed by a list-taking flag also exits 0, so
 confirm the child did the work instead of trusting the code.
 
+**Confirmed by a second run, because the first could not tell the two apart.** The child was given
+a one-time token and told to write it to a named file. It never wrote the file, because the path
+sat outside its own scratchpad and it lacked the grant. But its reply quoted the token and the
+path back. A swallowed prompt cannot echo a token it never received, so the spawn reached the
+child, and the failed write is a separate and smaller problem. **Prove a spawn by something the
+child produced, never by its exit code.**
+
 Do not write a count of config roots into this page. Roots get added, and a count goes stale without
 saying so. `pwsh -NoProfile -File scripts\coord\install-coordination.ps1 -Status` discovers roots by
 name pattern and prints `Roots examined: <n>` with a line per root, so enumerate them there and read
