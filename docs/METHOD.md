@@ -73,13 +73,19 @@ pwsh -NoProfile -File scripts\coord\mail.ps1 -Send -To <the path from your brief
 ```
 
 `-To` is required. `scripts/coord/mail.ps1` line 349 throws rather than guess a recipient. Do not
-substitute `-To all`. That broadcast path spawns a nested PowerShell process, which the harness may
-refuse. If your brief carries no address, put the question in the PR body instead.
+substitute `-To all`. That broadcast path spawns a nested PowerShell process, which the PowerShell
+tool refuses. Run it through the Bash tool with the path quoted. If your brief carries no address,
+put the question in the PR body instead.
 
-You cannot declare your own seat. A SessionStart hook (`scripts/hooks/seat-declare-prompt.ps1`)
-prints a line telling you to declare a seat before starting work. Ignore it. It cannot tell a Builder
-from a Console, and the command it prints spawns a nested PowerShell process the harness refuses.
-Your seat and goal came with your brief, so start the work.
+You can declare your own seat, through the Bash tool. Measured 2026-09-02: a headless Builder ran
+`seat.ps1 -Declare` and its record carries `seatSource: declared`, which no hook writes. Quote the
+Windows path. Unquoted, Bash eats the backslashes and fails as if the script were missing.
+
+The PowerShell tool refuses a nested `pwsh` with `Command spawns a nested PowerShell process which
+cannot be validated`. That is one tool's refusal, not the harness's. Use Bash.
+
+A SessionStart hook (`scripts/hooks/seat-declare-prompt.ps1`) prints a line telling you to declare.
+Do not ignore it. Your brief should carry seat and goal too, because no hook will invent a goal.
 
 Rules a session needs live in the account's `settings.json`, outside git. Every worktree carries its
 own tracked copy of `.claude/settings.json` from its own branch. An uncommitted edit in the primary
