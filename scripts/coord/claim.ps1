@@ -75,6 +75,25 @@ if (-not $repo) { throw "scripts/coord/ is not inside a git repository: $PSScrip
 # because functions sourced inside a function do not survive it.
 try { . "$PSScriptRoot/occupancy.ps1" } catch { }
 $repo = $repo.Trim()
+
+# ONE divergence test, three call sites (BACKLOG #1358). The note used to be written inline at the very
+# end of the script, which put it after the `-Take` success block and therefore made it UNREACHABLE from
+# `-Release` -- the script stated the release rule at claim time and went silent at the moment the
+# operator applied it. `$Subject` is the only part that varies, because the true sentence differs: a take
+# is recorded to $repo, whereas a release is BOTH recorded to it and adjudicated against it.
+#
+# Deliberately reads $repo at CALL time from script scope rather than taking it as a parameter: a second
+# copy of "which tree is this" is exactly the drift this note exists to report.
+function Write-DivergenceNote([Parameter(Mandatory)][string]$Subject) {
+    $cwdTop = (& git rev-parse --path-format=absolute --show-toplevel 2>$null)
+    if (-not $cwdTop) { return }
+    $a = ($cwdTop.Trim() -replace '\\', '/').TrimEnd('/')
+    $b = ($repo -replace '\\', '/').TrimEnd('/')
+    if ($a -ieq $b) { return }
+    Write-Host "  NOTE: your shell is in $a, but this script lives in $b," -ForegroundColor Yellow
+    Write-Host "        so the $Subject" -ForegroundColor Yellow
+}
+
 $common = (& git -C $repo rev-parse --path-format=absolute --git-common-dir).Trim()
 $claims = Join-Path $common "mefor-coord/claims"
 New-Item -ItemType Directory -Force -Path $claims | Out-Null
@@ -165,8 +184,48 @@ function Add-HistoryLine([string]$Line) {
 # `present` meant "the path exists". It never asked whether a SESSION was in it, so a worktree that
 # outlived its session -- the directory still on disk, nobody in it -- rendered identically to a
 # lane that is actively building. That is a THIRD state the tool could not represent, and it is the
-# one that produces work that is done, correct, and held by nobody: the sanctioned verbs refuse,
-# `-Force` is forbidden by CLAUDE.md, and the claim cannot be regularised by anything.
+# one that produces work that is done, correct, and held by nobody: the sanctioned verbs refuse, and
+# the holder is not present to release it.
+#
+# THAT SENTENCE USED TO END "`-Force` is forbidden by CLAUDE.md, and the claim cannot be regularised
+# by anything." BOTH HALVES WERE FALSE, and the first was falsifiable in one grep. CLAUDE.md contains
+# no prohibition on this or any `-Force` switch: its only force-related rules are about `git push
+# --force` and `reset --hard` (section 5, "Ask before irreversible or outward-facing actions").
+# Measured with `no-verify` as a positive control so a broken search could not read as a clean one.
+#
+# The second half was refuted by THIS FILE, 100 lines down: the `gone` branch prints
+# "[HOLDER GONE -- worktree no longer exists; release with -Force]", and the header at the top states
+# that every release is recorded, `-Force` included, with whether it was used. `docs/WORKTREES.md`
+# describes `-Release <key> -Force` as the ordinary by-hand remedy for exactly this stranded claim.
+#
+# WHY A WRONG COMMENT HERE COSTS MORE THAN A WRONG COMMENT USUALLY DOES. It does not merely misinform;
+# it tells a reader that the documented remedy for the state they are standing in is BANNED, and it
+# cites the project's own conventions file as the authority. A session that believes it will not run
+# the verb, will not look for the rule, and will leave real work stranded -- which is the exact
+# outcome this block was written to prevent.
+#
+# WHAT IS ACTUALLY TRUE: `-Force` is available, audited, and sometimes correct. That is all this
+# paragraph is entitled to say.
+#
+# NO RULE ANYWHERE PROHIBITS `-Force` ON A JUDGEMENT THIS FILE HAS NOT MADE, and the first draft of
+# this replacement quietly invented one. It asserted that "what is forbidden is reaching for it
+# without the evidence" and grounded that in `occupancy.ps1`. Read what occupancy.ps1 actually says:
+# "Occupancy may therefore only ever VETO an action; a DEAD/STALE/absent verdict must never by itself
+# authorise one." That governs what an OCCUPANCY VERDICT may authorise. It says nothing about this
+# verb. Treating it as a prohibition on `-Force` is a defensible ANALOGY and it is not a stated rule,
+# so the honest form is: this file extends that reasoning by analogy, and the extension is this
+# comment's, not occupancy.ps1's. Caught in review. It is the SAME DEFECT CLASS the paragraph above
+# is fixing -- asserting a prohibition and citing a source that does not contain it -- in a milder
+# form, written by the change that was fixing it. That is how durable this failure mode is.
+#
+# AND THIS BLOCK STILL DOES NOT ANSWER THE QUESTION A READER IN THIS STATE IS ASKING. `unoccupied`
+# is precisely NOT `gone`: that distinction is the whole reason the third state exists. The `gone`
+# branch can recommend `-Force` because the worktree is provably absent. `unoccupied` means the
+# directory is there and nobody is in it, which this host cannot distinguish from a session that is
+# merely quiet -- so the evidence that would justify a release is exactly what is missing. A reader
+# standing in `unoccupied` gets an accurate description here and no remedy, and that gap is REAL and
+# currently unresolved rather than an oversight in the wording. Do not read this block as resolving
+# it. If you are stuck there, the question is a live one and belongs in the ledger, not in a guess.
 #
 # ***THE NEW STATE REPORTS. IT DOES NOT PERMIT.*** `unoccupied` still REFUSES, exactly as `present`
 # does, and this is not timidity -- `occupancy.ps1` states the rule it inherits: "there is no
@@ -349,6 +408,12 @@ if ($Release) {
                 Write-Host "  Confirm with that session before using -Force."
             }
         }
+        # BACKLOG #1358, and this is the placement that earns the most. The refusal above says the claim
+        # is "held by another worktree" -- but under divergence the ownership test ran against the SCRIPT's
+        # tree, so "another worktree" can be the operator's OWN, with the foreign thing being the copy of
+        # this script they invoked. Without the note that reads as a genuine cross-session collision and
+        # invites a -Force, which is the one action the whole block exists to talk them out of.
+        Write-DivergenceNote "ownership was judged against it, NOT against your shell's tree -- re-run this from $repo before concluding anyone else holds it."
         exit 1
     }
     # RECORD FIRST, then act. Both orders can lie once and only one lie is recoverable: removing first
@@ -403,6 +468,9 @@ if ($Release) {
         Write-Host "  TOOK OVER a claim held by $($info.Claim.worktree) [$($info.Claim.branch)]." -ForegroundColor Yellow
     }
     Write-Host "  recorded in $history"
+    # BACKLOG #1358. The release SUCCEEDS either way, so without this the history records a tree the
+    # operator was never standing in and nothing anywhere says so.
+    Write-DivergenceNote "release was recorded there, and ownership was judged against it rather than against your shell's tree."
     exit 0
 }
 
@@ -571,13 +639,5 @@ Write-Host "  release when done:  pwsh -NoProfile -File scripts\coord\claim.ps1 
 # Same note alloc.ps1 prints, for the same reason (BACKLOG #1060): anchoring is correct but surprising,
 # and a claim recorded to a worktree the caller is not standing in otherwise surfaces only as a refused
 # commit later. Silent on the ordinary same-tree invocation.
-$cwdTop = (& git rev-parse --path-format=absolute --show-toplevel 2>$null)
-if ($cwdTop) {
-    $a = ($cwdTop.Trim() -replace '\\', '/').TrimEnd('/')
-    $b = ($repo -replace '\\', '/').TrimEnd('/')
-    if ($a -ine $b) {
-        Write-Host "  NOTE: your shell is in $a, but this script lives in $b, so the claim is" -ForegroundColor Yellow
-        Write-Host "        recorded to $b. -Release must be run against that same worktree." -ForegroundColor Yellow
-    }
-}
+Write-DivergenceNote 'claim is recorded there. -Release must be run against that same worktree.'
 exit 0

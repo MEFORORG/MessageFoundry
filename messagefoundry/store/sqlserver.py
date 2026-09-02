@@ -47,6 +47,7 @@ from collections.abc import (
     Mapping,
     Sequence,
 )
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import AsyncExitStack, asynccontextmanager, contextmanager
 from time import perf_counter
 from types import MappingProxyType
@@ -1377,7 +1378,12 @@ _SCHEMA: list[str] = [
         channel_scope NVARCHAR(MAX) NULL, totp_secret NVARCHAR(MAX) NULL,
         totp_enabled BIT NOT NULL DEFAULT 0, totp_enrolled_at FLOAT NULL,
         totp_recovery_codes NVARCHAR(MAX) NULL, last_totp_step INT NULL,
-        oidc_issuer NVARCHAR(MAX) NULL, oidc_subject NVARCHAR(MAX) NULL,
+        -- BACKLOG #1256: SIZED, NOT MAX, BECAUSE A MAX COLUMN CANNOT BE AN INDEX KEY on SQL
+        -- Server, and ux_users_federated_subject below is what makes the application guard's
+        -- read-then-write atomic. 256 is this file's dominant width (55 uses); the composite
+        -- key is then 2 x 256 x 2 bytes = 1024, inside the 1700-byte nonclustered limit.
+        -- NVARCHAR(450), the other precedent here, would be 1800 across two columns and fail.
+        oidc_issuer NVARCHAR(256) NULL, oidc_subject NVARCHAR(256) NULL,
         password_claimed_at FLOAT NULL)""",
     """IF COL_LENGTH('users','channel_scope') IS NULL
         ALTER TABLE users ADD channel_scope NVARCHAR(MAX) NULL""",
@@ -1396,9 +1402,28 @@ _SCHEMA: list[str] = [
     # Federated (issuer, sub) identity keying (BACKLOG #1015): COL_LENGTH-gated ADD on a pre-existing
     # users table. NULL on existing rows = "not yet federated" (username stays the sole key). Idempotent.
     """IF COL_LENGTH('users','oidc_issuer') IS NULL
-        ALTER TABLE users ADD oidc_issuer NVARCHAR(MAX) NULL""",
+        ALTER TABLE users ADD oidc_issuer NVARCHAR(256) NULL""",
     """IF COL_LENGTH('users','oidc_subject') IS NULL
-        ALTER TABLE users ADD oidc_subject NVARCHAR(MAX) NULL""",
+        ALTER TABLE users ADD oidc_subject NVARCHAR(256) NULL""",
+    # BACKLOG #1256: RE-TYPE A PRE-EXISTING MAX COLUMN, WHICH THE COL_LENGTH-GATED ADDs ABOVE CANNOT
+    # REACH. They fire only when the column is ABSENT, so a users table created before this change
+    # keeps NVARCHAR(MAX) -- and a MAX column CANNOT BE AN INDEX KEY, so the index below would fail
+    # against exactly the databases that already exist. COL_LENGTH returns -1 for a MAX column, which
+    # is how this tells "already sized" from "needs re-typing" without reading catalogue views.
+    #
+    # MUST RUN BEFORE the index. _SCHEMA is applied in order, so position here is load-bearing.
+    """IF COL_LENGTH('users','oidc_issuer') = -1
+        ALTER TABLE users ALTER COLUMN oidc_issuer NVARCHAR(256) NULL""",
+    """IF COL_LENGTH('users','oidc_subject') = -1
+        ALTER TABLE users ALTER COLUMN oidc_subject NVARCHAR(256) NULL""",
+    # The atomicity the application guard cannot provide: auth/service.py reads the current holder and
+    # writes the binding in two separate awaits, so two concurrent FIRST logins for one subject can
+    # both observe "no holder" and both bind. FILTERED so unfederated rows coexist -- and on SQL Server
+    # the filter is REQUIRED, not stylistic: unlike SQLite and Postgres it treats NULLs as EQUAL in a
+    # unique index, so an unfiltered index would permit exactly ONE unfederated user in the table.
+    """IF INDEXPROPERTY(OBJECT_ID('users'),'ux_users_federated_subject','IndexID') IS NULL
+        CREATE UNIQUE INDEX ux_users_federated_subject ON users(oidc_issuer, oidc_subject)
+        WHERE oidc_issuer IS NOT NULL AND oidc_subject IS NOT NULL""",
     # Claimed-ness of the bootstrap admin (BACKLOG #1245): NULL on an existing row would read as
     # "never claimed", which is what would retire an account whose holder claimed it long ago — this
     # defect, re-introduced by its own fix. So the ADD is paired with a one-time backfill: a local
@@ -1636,6 +1661,35 @@ def connection_string(settings: StoreSettings, *, posture: HopPosture | None = N
     return ";".join(parts) + ";"
 
 
+def _build_pool_executor(settings: StoreSettings) -> ThreadPoolExecutor:
+    """A thread pool wide enough that every pooled connection can hold a worker at once.
+
+    WHY THE STORE NEEDS ITS OWN. aioodbc runs EVERY pyodbc call through
+    ``loop.run_in_executor(self._executor, ...)`` and passes ``executor=None`` unless told otherwise, so
+    by default every connection in this pool shares the event loop's DEFAULT ThreadPoolExecutor. CPython
+    sizes that at ``min(32, cpu_count + 4)`` -- eight threads on a four-vCPU runner -- and that width is
+    INDEPENDENT of ``[store].pool_size``. So the configured pool silently cannot exceed the loop default.
+
+    WHY THAT DEADLOCKS RATHER THAN MERELY THROTTLING, which is the part worth keeping. A write like
+    ``add_cipher_invocations`` needs FOUR sequential executor dispatches -- ``cursor()``, ``execute()``,
+    ``fetchone()``, ``commit()`` -- and the pool is opened ``autocommit=False``, so the row locks taken by
+    the MERGE in dispatch 2 are released only by the commit in dispatch 4. Once as many tasks as there
+    are threads are parked inside a blocked ``execute``, the lock holder's own ``commit`` sits behind
+    them in the executor's FIFO queue with no worker left to run it. Nothing progresses until an ODBC
+    query timeout or the pool acquire bound breaks the tie, which surfaces as HYT00 or StoreAcquireTimeout
+    rather than as a deadlock.
+
+    HEADROOM, NOT AN EXACT BOUNDARY. ``maxsize + 4`` rather than ``maxsize``: threads spawn lazily, so
+    unused headroom costs nothing, and the margin absorbs the pool's own in-flight ``connect()`` during
+    growth and the window where a closing connection still holds a worker.
+    """
+    maxsize = max(1, settings.pool_size)
+    return ThreadPoolExecutor(
+        max_workers=maxsize + 4,
+        thread_name_prefix="mefor-sqlserver",
+    )
+
+
 class SqlServerStore:
     """SQL Server-backed durable queue (the :class:`Store` protocol). Open with :meth:`open`."""
 
@@ -1693,6 +1747,9 @@ class SqlServerStore:
         posture: HopPosture | None = None,
     ) -> None:
         self._pool = pool
+        # Set by open() when this store owns the pool. Stays None when a caller supplies a pool it
+        # built itself, so close() never shuts down an executor it did not create.
+        self._pool_executor: ThreadPoolExecutor | None = None
         self._settings = settings
         # #200 (ADR 0092): the deriving instance posture, so reconnect / sync-handoff-pool rebuilds re-run
         # the weakened-TLS clamp against the real production-PHI posture (not the unclamped escape).
@@ -2348,11 +2405,15 @@ class SqlServerStore:
         # takes momentary exclusivity, and with no MEFOR pool session open yet it has nothing of ours
         # to terminate (concurrency_fixes (a)).
         await cls._ensure_database_options(settings, posture=posture)
+        # A DEDICATED EXECUTOR, sized to this pool -- see _build_pool_executor for why sharing the
+        # event loop's default one deadlocks rather than merely throttling.
+        executor = _build_pool_executor(settings)
         pool = await aioodbc.create_pool(
             dsn=connection_string(settings, posture=posture),
             minsize=1,
             maxsize=max(1, settings.pool_size),
             autocommit=False,
+            executor=executor,
         )
         store = cls(
             pool,
@@ -2363,6 +2424,7 @@ class SqlServerStore:
             message_events=message_events,
             posture=posture,
         )
+        store._pool_executor = executor
         try:
             await store._ensure_schema()
             if store._fifo_claim_proc:
@@ -2926,8 +2988,18 @@ class SqlServerStore:
         # ADR 0114 sub-lever B: close the store-owned dedicated claim holders (a no-op when the
         # prepared path never opened one).
         await self._close_claim_holders()
-        self._pool.close()
-        await self._pool.wait_closed()
+        # THE EXECUTOR IS RELEASED IN A finally, and that ordering is the point. wait_closed() cannot
+        # complete while the pool is wedged -- which is precisely the state these threads are stuck in --
+        # so releasing them only on the success path would leak the whole pool's worth of threads in the
+        # one case that matters. shutdown(wait=False) does not join: a wedged ODBC call is not
+        # interruptible, and the process is going away regardless.
+        try:
+            self._pool.close()
+            await self._pool.wait_closed()
+        finally:
+            if self._pool_executor is not None:
+                self._pool_executor.shutdown(wait=False)
+                self._pool_executor = None
 
     # --- ADR 0071 B5: synchronous fused-handoff connection source ------------
     def open_sync_handoff_pool(self, stage: str, size: int) -> _SyncHandoffPool:

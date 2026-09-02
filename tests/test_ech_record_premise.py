@@ -293,8 +293,15 @@ def test_the_premise_check_fires_on_the_paragraph_that_actually_shipped(expected
 # docs/BACKLOG.md and the closed-item archive are deliberately OUT of scope: a ledger's job is to
 # QUOTE a defect as evidence, so an asserting phrase there is correct usage, not a live claim.
 
+# `docs/testing/master-test-plan/` WAS a fourth root, for chapter 19's standing-risk-acceptance
+# table. ADR 0160 D1 untracked that whole tree on 2026-08-31, so `_tracked()` no longer returns a
+# single path under it and the root matched nothing. Dropping it is a stale anchor coming out, not a
+# guard being weakened -- but say the narrowing out loud rather than let a green run imply coverage:
+# the chapter-19 carrier of this premise now lives only in the vault and NOTHING in this repository
+# checks it. If that tree ever returns, this root returns with it.
+#
 #: Records where a risk acceptance's premise is load-bearing.
-_RECORD_ROOTS = ("docs/SECURITY.md", "docs/PHI.md", "docs/adr/", "docs/testing/master-test-plan/")
+_RECORD_ROOTS = ("docs/SECURITY.md", "docs/PHI.md", "docs/adr/")
 
 #: The refuted claim in ASSERTING form. "infeasible" alone is absent for the reason given above.
 _ASSERTING = ("not buildable", "third-party TLS stack", "documented infeasibility")

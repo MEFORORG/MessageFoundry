@@ -3339,3 +3339,56 @@ def test_render_without_a_spread_still_renders_the_old_single_commit_form(tmp_pa
     cells = [Cell(id="1.1.1", level=1, verdict="pass", last_verified="2026-08-01")]
     doc = render_current(cells, anchor_sha="deadbeef")
     assert "**Anchor commit:** `deadbeef`" in doc
+
+
+def test_the_rendered_file_is_LF_on_every_platform(tmp_path: Path) -> None:
+    """The committed render is LF, so the writer must not translate to `os.linesep`.
+
+    WHY THIS IS WORTH A TEST AND NOT A CONVENTION. `write_text` without `newline=""` emits
+    `os.linesep`, which is `\n` on the CI runner and `\r\n` on Windows. The bug is therefore
+    INVISIBLE to CI by construction -- every assertion here passes on Linux whether or not the
+    fix is present. What it costs is paid by a maintainer re-rendering on Windows: all 163 lines
+    of the committed file are rewritten, and the real change hides inside a diff that reads like
+    a legitimate large edit rather than like corruption. Measured before the fix: 163 CRLF.
+
+    It also gates a decision. `render-drift` re-renders and fails on any diff, so promoting it to
+    a REQUIRED context -- the obvious fix for the published view going stale -- would make this
+    re-render mandatory on every verdict-moving PR and march every Windows contributor into the
+    corruption. The tool has to be right first.
+
+    Falsified by dropping `newline=""` from `main`'s render write: this goes RED on Windows and
+    stays green on Linux, which is exactly why the assertion is on BYTES rather than on text.
+    """
+    corpus = _corpus_file(tmp_path, {"1.1.1": 1})
+    engine = tmp_path / "engine"
+    (engine / "messagefoundry").mkdir(parents=True)
+    (engine / "messagefoundry" / "m.py").write_text("SIZE = 64\n", encoding="utf-8")
+    sc = _scorecard_file(
+        tmp_path,
+        f'[scorecard]\nasvs_version = "5.0.0"\ncorpus_sha256 = "{corpus_digest(corpus)}"\n'
+        '[[cell]]\nid = "1.1.1"\nlevel = 1\nverdict = "pass"\n'
+        "  [[cell.evidence]]\n"
+        '  path = "messagefoundry/m.py"\n  line = 1\n  expect = "SIZE = 64"\n',
+    )
+    out = tmp_path / "ASVS-CURRENT.md"
+    rc = main(
+        [
+            "--scorecard",
+            str(sc),
+            "--corpus",
+            str(corpus),
+            "--root",
+            str(engine),
+            "--render",
+            str(out),
+        ]
+    )
+    assert rc == 0
+
+    raw = out.read_bytes()
+    assert raw, "the renderer wrote nothing, so the assertions below would pass vacuously"
+    assert b"\r\n" not in raw, (
+        f"the rendered file carries {raw.count(bytes([13, 10]))} CRLF line ending(s); the committed "
+        "blob is LF, so this rewrites every line of it. Pass newline='' to write_text."
+    )
+    assert bytes([13]) not in raw, "the rendered file carries a lone CR"

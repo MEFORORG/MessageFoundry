@@ -14,3 +14,10 @@ ci/locks/*.lock text eol=lf
 # Shell scripts are executed on the Linux CI runners; force LF so a contributor's
 # core.autocrlf=true can never commit CRLF (which breaks `#!/usr/bin/env bash\r`).
 *.sh text eol=lf
+
+# The vendored CLA Action's compiled bundle (BACKLOG #1364): its SHA256 was checked against the
+# exact upstream commit and that checksum is recorded as evidence in the ledger entry. `-text`
+# disables ALL line-ending conversion so the stored and checked-out bytes never drift from what
+# was verified -- `eol=lf` was tried first and silently re-encoded ~1,300 bytes, which would have
+# committed a file that no longer matches its own recorded checksum.
+.github/actions/**/dist/** -text

@@ -21,6 +21,7 @@ from messagefoundry.api.models import (
 from messagefoundry.parsing.tree import TreeNode
 
 from .._html import Markup, el, page, rows_table, text
+from ._common import _seg
 
 __all__ = [
     "dead_letter_pending",
@@ -615,7 +616,7 @@ def dead_letters(data: DeadLetterList) -> Markup:
             "form",
             el("button", f"Replay all dead — {ch}", type="submit"),
             method="post",
-            action=f"/ui/dead-letters/{ch}/replay",
+            action=f"/ui/dead-letters/{_seg(ch)}/replay",
             class_="ctl",
         )
         for ch in channels
@@ -625,7 +626,7 @@ def dead_letters(data: DeadLetterList) -> Markup:
             "form",
             el("button", f"Replay {ch} → {dest}", type="submit"),
             method="post",
-            action=f"/ui/dead-letters/{ch}/{dest}/replay",
+            action=f"/ui/dead-letters/{_seg(ch)}/{_seg(dest)}/replay",
             class_="ctl",
         )
         for ch, dest in pairs

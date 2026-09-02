@@ -50,11 +50,6 @@ param(
     [string[]]$Repo,
     [switch]$Uninstall,
     [switch]$Status,
-    # Proceed even when the installed gate's content does not match its own install receipt (BACKLOG
-    # #1247). A mismatch means something wrote this machine-global file outside this installer, so the
-    # default is to STOP and ask rather than overwrite the evidence. Required only for that one case:
-    # a gate with no receipt at all is the normal pre-#1247 state and installs without this.
-    [switch]$OverwriteUnverifiedGate,
     # Do not gate Task/Agent/Workflow dispatch from the primary (writes are still gated).
     [switch]$NoDispatchGate,
     # Gate the EnterWorktree tool (rule 4), which relocates a LIVE session into a worktree.
@@ -86,10 +81,6 @@ $RepoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..\..")).Path
 $HomeDir   = if ($env:USERPROFILE) { $env:USERPROFILE } else { [Environment]::GetFolderPath('UserProfile') }
 $HooksDir  = Join-Path $HomeDir ".claude/hooks"
 $GateDst   = Join-Path $HooksDir "worktree_gate.ps1"
-
-# Install-receipt helpers (BACKLOG #1247). A separate file because it must be dot-sourceable by a
-# test; this script cannot be, since loading it performs a machine-global install.
-. (Join-Path $PSScriptRoot "_gate_receipt.ps1")
 $ReposFile = Join-Path $HooksDir "worktree-gate.repos.txt"
 
 # Marker so we can find (and remove) exactly the entries we added, without disturbing other hooks.
@@ -447,41 +438,54 @@ $resolved = foreach ($r in $Repo) {
 }
 
 New-Item -ItemType Directory -Force -Path $HooksDir | Out-Null
-
-# BACKLOG #1247 -- this write used to be a bare Copy-Item over a MACHINE-GLOBAL safety control, with
-# no backup, no receipt and no log line. When the installed gate's content changed on this box while
-# three sessions ran against it, nothing could say who wrote it. The four steps below exist so that
-# question is answerable next time, and so an unexpected change STOPS the install instead of being
-# silently overwritten -- an overwrite destroys the only evidence that anything happened.
-$srcGateFile = Join-Path $RepoRoot "scripts\hooks\worktree_gate.ps1"
-$provenance  = Get-GateProvenance $GateDst ${function:Get-GateHash}
-$replacedSha = if (Test-Path -LiteralPath $GateDst) { Get-GateHash $GateDst } else { $null }
-
-if ($provenance -eq "MODIFIED" -and -not $OverwriteUnverifiedGate) {
-    $r = Read-GateReceipt $GateDst
-    throw @"
-REFUSING TO OVERWRITE: the installed gate does not match its own install receipt.
-
-  gate            : $GateDst
-  installed now   : $replacedSha
-  receipt records : $($r.installed_content_sha256)
-  receipt written : $($r.written_at_utc) by $($r.installed_by_repo)
-
-Something wrote this file outside this installer. Overwriting would destroy the only evidence of
-what it was. Inspect it first; then re-run with -OverwriteUnverifiedGate to proceed deliberately.
-
-DO NOT trust the file's timestamp to decide -- Copy-Item carries the SOURCE's LastWriteTime, so the
-installed gate's mtime reflects whichever checkout installed it and not when it was written here.
-"@
-}
-if ($provenance -eq "UNRECORDED") {
-    Write-Warning "installed gate has no install receipt (installed before BACKLOG #1247, or written by something else). Recording its hash as replaced: $replacedSha"
+# BACK UP THE GATE BEFORE OVERWRITING IT. The allowlist writer has done this since #1375; the GATE
+# SCRIPT never did, and the near-miss is why: `Write-Settings` backs up settings.json, and reading
+# `Copy-Item ... .bak` in this file makes the absence here easy to read as presence. It is not the
+# same file.
+$GateSrc = Join-Path $RepoRoot "scripts\hooks\worktree_gate.ps1"
+$gateBak = $null
+if (Test-Path -LiteralPath $GateDst) {
+    $gateBak = "$GateDst.bak"
+    Copy-Item -LiteralPath $GateDst -Destination $gateBak -Force
 }
 
-$backup = Backup-GateBeforeWrite $GateDst
-Copy-Item -LiteralPath $srcGateFile -Destination $GateDst -Force
-$receiptPath = Write-GateReceipt -GatePath $GateDst -SourcePath $srcGateFile -RepoRoot $RepoRoot `
-    -HashFn ${function:Get-GateHash} -ReplacedSha $replacedSha -ReplacedProvenance $provenance -BackupPath $backup
+Copy-Item -LiteralPath $GateSrc -Destination $GateDst -Force
+
+# STAMP THE INSTALLED COPY WITH THE INSTALL TIME, AND THIS IS THE LOAD-BEARING HALF OF #1247.
+#
+# Copy-Item carries the SOURCE file's LastWriteTime, so the installed gate inherited a timestamp from
+# whichever checkout it was copied from -- routinely days old, and older still on a fresh clone.
+# Measured 2026-08-29: a source back-dated six days produced an installed copy reporting the same
+# six-day-old time, seconds after the copy ran.
+#
+# AN INHERITED MTIME IS WORSE THAN A MISSING ONE BECAUSE IT READS AS EVIDENCE. A correct stale-gate
+# report was retracted on the strength of this timestamp -- "nothing wrote it today" -- and the
+# retraction propagated. A file with no mtime would have been questioned; a file with a confident
+# wrong one was believed.
+#
+# The mtime now answers the question people actually ask it: WHEN WAS THIS INSTALLED. It deliberately
+# does NOT answer "is this current", which is a content question -- `-Status` compares hashes for that,
+# and the two must not be conflated.
+$installedAtUtc = [DateTime]::UtcNow
+(Get-Item -LiteralPath $GateDst).LastWriteTimeUtc = $installedAtUtc
+
+# A RECEIPT, AND AN HONEST NOTE ABOUT WHAT IT IS WORTH. Nothing recorded that an install happened, so
+# there was no way to ask who installed this gate, from which tree, or at which commit.
+#
+# TRUST LEVEL, STATED BECAUSE THE ALTERNATIVE IS ANOTHER CONFIDENT WRONG ANSWER: gate rule 1a protects
+# ~/.claude/hooks/ by EXACT FILENAME and refuses to key on the parent directory, so this sibling is NOT
+# protected and a session can write it. Read it as a convenience record, never as attestation. The hash
+# it carries is checkable against the file; the rest is a claim by whoever last ran the installer.
+$receipt = [ordered]@{
+    installedAtUtc = $installedAtUtc.ToString('o')
+    sourcePath     = $GateSrc
+    sourceRepo     = $RepoRoot
+    gateVersion    = (Get-GateVersion $GateDst)
+    gateSha256     = (Get-GateHash $GateDst)
+    configDirs     = @($ConfigDir)
+    note           = 'Convenience record written by install-gate.ps1. NOT protected by the gate and NOT attestation.'
+} | ConvertTo-Json -Depth 4
+Set-Content -LiteralPath "$GateDst.receipt.json" -Value $receipt -Encoding utf8
 
 @(
     "# Primary checkouts governed by the worktree gate (scripts\hooks\worktree_gate.ps1)."
@@ -536,6 +540,7 @@ Write-Host ""
 Write-Host "Worktree gate INSTALLED into $($ConfigDir.Count) config dir(s) (every session, no restart)." -ForegroundColor Green
 Write-Host "  gate      : $GateDst"
 Write-Host "  allowlist : $ReposFile"
+Write-Host "  installed : $($installedAtUtc.ToString('yyyy-MM-dd HH:mm:ss')) UTC  (receipt: $GateDst.receipt.json)"
 $resolved | ForEach-Object { Write-Host "  governing : $_" }
 Write-Host "  matchers  : $($matchers -join '  +  ')"
 Write-Host ""

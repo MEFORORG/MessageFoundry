@@ -2,7 +2,7 @@
 # Copyright (C) 2026 MessageFoundry Organization and contributors
 """BACKLOG #327 — the private-path `.gitignore` rules are a control, so they get a test.
 
-Since the publish deny-list was retired, **six `.gitignore` rules are the sole mechanism** keeping
+Since the publish deny-list was retired, **the `.gitignore` rules are the sole mechanism** keeping
 maintainer-internal material out of a public commit. Nothing asserted they still match anything: a
 repo-wide search for `check-ignore` found one hand-run script covering a different file, and the two
 nearest-looking guards (`test_scaffold.py`, `test_leak_gate_docs.py`) are about a scaffolded config
@@ -41,6 +41,22 @@ _PRIVATE_PATHS: list[tuple[str, str]] = [
     ("/docs/reviews/", "docs/reviews/probe-327.md"),
     ("/docs/marketing/", "docs/marketing/probe-327.md"),
     ("/docs/CI-TOPOLOGY.md", "docs/CI-TOPOLOGY.md"),
+    # ADR 0160 D1, owner-authorised 2026-08-31. Business material and internal engineering records.
+    # Unlike the rules above these were never confidential and are not being withheld as secrets --
+    # `git log` still holds every one of them, and the owner ruled explicitly against a history
+    # rewrite. They are pinned here for the same reason as the rest: the .gitignore rule is the only
+    # thing keeping them out of the next commit, and a rule nothing asserts is a rule that can be
+    # narrowed by accident.
+    ("/docs/BRAND.md", "docs/BRAND.md"),
+    ("/docs/CONTRIBUTOR-FIRST-ISSUES.md", "docs/CONTRIBUTOR-FIRST-ISSUES.md"),
+    ("/docs/CONTRIBUTOR-PROGRAM-PLAN.md", "docs/CONTRIBUTOR-PROGRAM-PLAN.md"),
+    ("/docs/COUNSEL-ENGAGEMENT-BRIEF.md", "docs/COUNSEL-ENGAGEMENT-BRIEF.md"),
+    ("/docs/DUAL_LICENSING_PLAN.md", "docs/DUAL_LICENSING_PLAN.md"),
+    ("/docs/POSITIONING.md", "docs/POSITIONING.md"),
+    ("/docs/research/", "docs/research/probe-0160.md"),
+    ("/docs/archive/throughput/", "docs/archive/throughput/probe-0160.md"),
+    # Contents-glob, not a directory rule, so the VERIFY.md negation below can bind. See .gitignore.
+    ("/docs/testing/*", "docs/testing/probe-0160.md"),
 ]
 
 # The ONE negated path in the block, and the only tracked file any private rule may cover.
@@ -60,6 +76,12 @@ _PRIVATE_PATHS: list[tuple[str, str]] = [
 # `.claude/worktrees/` reaching this set would publish full nested checkouts.
 _TRACKED_EXCEPTIONS: dict[str, frozenset[str]] = {
     "/.claude/*": frozenset({".claude/settings.json"}),
+    # docs/testing/VERIFY.md is OPERATOR material and stays tracked while the rest of the tree does
+    # not. It documents `messagefoundry verify`, the wheel-only on-box acceptance check a deployment
+    # runs, and docs/README.md lists it as step 6 of "Start here -- a new operator, in order" while
+    # line 8 warns that it "is an operator tool, not a test plan". Its siblings are maintainer QA:
+    # two drafts awaiting owner approval, and a matrix and plan scoped to one specific build box.
+    "/docs/testing/*": frozenset({"docs/testing/VERIFY.md"}),
 }
 
 
@@ -79,7 +101,7 @@ def test_private_path_is_still_ignored(rule: str, probe: str) -> None:
     res = _git("check-ignore", "-q", "--no-index", probe)
     assert res.returncode == 0, (
         f"{probe!r} is NOT ignored — the .gitignore rule {rule!r} no longer covers it.\n"
-        "Six rules are the only thing keeping maintainer-internal material out of a public commit. "
+        "These rules are the only thing keeping maintainer-internal material out of a public commit. "
         "If this rule moved, update _PRIVATE_PATHS here in the SAME commit; if it was removed, that "
         "is the publishing boundary coming down and it needs an explicit decision, not a green test."
     )
@@ -118,8 +140,8 @@ def test_the_pinned_list_has_not_silently_shrunk() -> None:
     is the same shape as the defect it guards. The count is asserted so that removal has to be
     deliberate and reviewed rather than incidental.
     """
-    assert len(_PRIVATE_PATHS) == 6, (
-        f"_PRIVATE_PATHS holds {len(_PRIVATE_PATHS)} rules, expected 6. Adding a private path is "
+    assert len(_PRIVATE_PATHS) == 15, (
+        f"_PRIVATE_PATHS holds {len(_PRIVATE_PATHS)} rules, expected 15. Adding a private path is "
         "fine — raise this number in the same commit. Removing one means the publishing boundary "
         "narrowed, which is a decision, not a cleanup."
     )
@@ -156,4 +178,38 @@ def test_the_negation_re_includes_exactly_one_file() -> None:
             f"{sibling!r} is NOT ignored. The negation is meant to cover `settings.json` alone; a "
             "second `!` line publishes session state or machine-local config. If this path is now "
             "meant to travel, pin it in _TRACKED_EXCEPTIONS and say why in .gitignore."
+        )
+
+
+def test_the_testing_negation_re_includes_exactly_verify_md() -> None:
+    """The second negation, asserted in both directions for the same reason as the first.
+
+    `/docs/testing/*` carries the identical one-character hazard: written `/docs/testing/` the
+    directory is excluded, git never descends into it, and `!/docs/testing/VERIFY.md` parses fine
+    while applying to nothing. The failure is silent -- the operator's step 6 link would simply stop
+    resolving for anyone who cloned, with no error at commit, push or CI.
+
+    The siblings are asserted too, because the risk here is the opposite of the `.claude/` one. There
+    the danger was publishing session state; here it is publishing maintainer QA that names a specific
+    build box (`WIN2025-TEST-PLAN.md` carries the host and its service identity), plus two drafts that
+    say on their face they are awaiting owner approval.
+    """
+    negated = _git("check-ignore", "-q", "--no-index", "docs/testing/VERIFY.md")
+    assert negated.returncode != 0, (
+        "`docs/testing/VERIFY.md` is IGNORED — the `!/docs/testing/VERIFY.md` negation is not taking "
+        "effect. Check that the rule above it is `/docs/testing/*` and not `/docs/testing/`: a "
+        "negation cannot re-include a file whose parent directory is excluded, and it fails silently. "
+        "This file is an OPERATOR tool and docs/README.md links it as step 6 of the new-operator path."
+    )
+
+    for sibling in (
+        "docs/testing/MASTER-TEST-PLAN.md",
+        "docs/testing/WIN2025-TEST-PLAN.md",
+        "docs/testing/master-test-plan/00-strategy-and-governance.md",
+        "docs/testing/probe-0160.md",
+    ):
+        res = _git("check-ignore", "-q", "--no-index", sibling)
+        assert res.returncode == 0, (
+            f"{sibling!r} is NOT ignored. The negation is meant to cover `VERIFY.md` alone. If this "
+            "path is now meant to travel, pin it in _TRACKED_EXCEPTIONS and say why in .gitignore."
         )

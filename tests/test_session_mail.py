@@ -437,6 +437,57 @@ def _send(repo: Path, body: str) -> subprocess.CompletedProcess[str]:
     )  # fmt: skip
 
 
+def _send_addressed(repo: Path, session_id: str | None) -> subprocess.CompletedProcess[str]:
+    """Send with an optional ``-ToSessionId``. ``None`` omits the flag entirely (the ordinary case)."""
+    args = [
+        "pwsh", "-NoProfile", "-NonInteractive", "-File", str(MAIL),
+        "-Send", "-MailRoot", str(mail_root(repo)), "-To", str(repo), "-Body", "probe",
+    ]  # fmt: skip
+    if session_id is not None:
+        args += ["-ToSessionId", session_id]
+    return subprocess.run(
+        args, cwd=str(repo), capture_output=True, text=True, timeout=TIMEOUT, check=False
+    )
+
+
+def test_a_wrong_namespace_session_id_is_refused_at_SEND(repo: Path) -> None:
+    """BACKLOG #1302 -- the sender is the only party who can fix the id, so the sender is told.
+
+    An id from the wrong namespace is compared literally against the reading session's harness id
+    (`mail-drain.ps1`), never matches, and the message sits in the inbox until it is swept to
+    `expired/`. MEASURED: six messages from one seat stranded for a whole session while the send path
+    printed `Queued 1 message(s)` for every one of them, and the recipient read that lane as silent.
+
+    The drain already reports ITS side. This asserts the half that was missing.
+    """
+    bad = _send_addressed(repo, "local_2b3b416c-1d0c-4e81-987c-bb19e590045d")
+
+    assert bad.returncode != 0, f"a wrong-namespace id must be refused at send: {bad.stdout}"
+    # The refusal has to name the REMEDY, not merely the rejection -- the sender's next move is to drop
+    # the flag, and a message that only says "invalid" leaves them guessing at which id to hunt for.
+    assert "-ToSessionId" in bad.stderr
+    assert "omit -ToSessionId" in bad.stderr
+
+
+def test_the_ordinary_broadcast_and_a_real_harness_id_both_still_send(repo: Path) -> None:
+    """THE MUST-NOT-TRIP ARM, and the reason the guard is scoped to a supplied value.
+
+    Two ways this fix could have been worse than the defect. Refusing a message with NO
+    ``-ToSessionId`` would break the ORDINARY broadcast, which is most traffic on this channel. And
+    refusing a genuine harness id would make the flag unusable for the case it exists to serve -- mail
+    that is only meaningful to one session, where a worktree outliving its occupant would otherwise
+    hand a note to a stranger.
+
+    Asserted in the SAME test as a pair, so a guard that accidentally rejected everything cannot pass
+    by satisfying one half.
+    """
+    broadcast = _send_addressed(repo, None)
+    assert broadcast.returncode == 0, f"no -ToSessionId is the ordinary case: {broadcast.stderr}"
+
+    real = _send_addressed(repo, "177a513c-60f4-49af-8cd4-465ff4f9118d")
+    assert real.returncode == 0, f"a bare-UUID harness id must send: {real.stderr}"
+
+
 def test_the_send_line_arm_refuses_at_the_boundary_and_passes_one_below(repo: Path) -> None:
     """The adjacent pair, not a 300-char probe.
 
@@ -1803,3 +1854,93 @@ def test_the_Status_TEXT_render_says_nobody_was_told(repo: Path) -> None:
     assert proc.returncode == 0, proc.stderr
     assert "Expired:" in proc.stdout
     assert "NOBODY WAS TOLD" in proc.stdout
+
+
+# --------------------------------------------------------- BACKLOG #1386, limbs 1 and 2
+#
+# THE EXISTING CAP TEST ABOVE PASSES AND DID NOT CATCH EITHER OF THESE, WHICH IS THE WHOLE POINT.
+# It seeds bodies of about seventeen bytes ("message number 1"), so MAX_TOTAL_BYTES never binds and
+# the message cap is free to be the limit it claims to be. At the size the fleet actually broadcasts
+# the byte cap binds first, and a test that never approaches the real size cannot see it.
+
+
+def test_the_message_cap_is_the_binding_one_at_a_REALISTIC_broadcast_size(
+    repo: Path, tmp_path: Path
+) -> None:
+    """MAX_MESSAGES promises 5 per injection. At real broadcast sizes the byte cap delivered 3.
+
+    The arithmetic, and it is the finding rather than a projection: a message is charged
+    ``len(body) + FRAME_OVERHEAD_BYTES`` by the selection pass, the frame is 560 bytes, and
+    MAX_TOTAL_BYTES was 8000. A fleet broadcast runs about 1900 bytes, so each cost ~2460 and
+    only three fit. Every seat had been reading ``3 shown`` as normal.
+
+    A 5-message allowance that can only ever deliver 3 is not the stated policy, and the two
+    constants disagreeing silently is what made this a defect rather than a tuning choice. The
+    past tense is the fix: this test asserts all 5 render at that size, and its assertions read
+    the caps out of the script rather than restating them, so they cannot go stale the way the
+    8000 in this docstring did.
+    """
+    # SHAPE MATTERS AS MUCH AS SIZE, AND GETTING IT WRONG MADE THE FIRST DRAFT OF THIS TEST PASS.
+    # A single 1900-character line is cut to MAX_LINE_CHARS (240) before it is ever measured, so it
+    # costs ~800 bytes and five fit inside MAX_TOTAL_BYTES with room to spare. A real fleet broadcast
+    # is ~1900 bytes spread over many SHORT lines, none of which the line cap touches, so the full
+    # weight reaches the byte cap. Build it that way or this measures the LINE cap, not the BYTE cap.
+    line = "the quick brown fox jumps over the lazy dog and keeps on running for a while"
+    body = "\n".join([line] * 25)  # ~1900 bytes, every line well under MAX_LINE_CHARS
+    assert len(body) < MAX_BODY_BYTES, (
+        "fixture must stay under the per-body cap to isolate the total"
+    )
+    specs = [
+        {"stem": f"20260101T{i:09d}-aaaaaa", "body": f"{i}\n{body}"}
+        for i in range(1, MAX_MESSAGES + 1)
+    ]
+    seed(repo, tmp_path, specs)
+    text = injection(run_drain(repo))
+
+    assert len(frames(text)) == MAX_MESSAGES, (
+        f"only {len(frames(text))} of {MAX_MESSAGES} rendered at a realistic size -- "
+        "the byte cap is binding before the message cap"
+    )
+    assert f"{MAX_MESSAGES} shown" in text
+    assert "0 deferred (caps)" in text
+
+
+def test_the_caps_cannot_silently_disagree_again() -> None:
+    """Pin the RELATIONSHIP, not the numbers, so a later edit to either one cannot re-open this.
+
+    Raising MAX_MESSAGES or MAX_BODY_BYTES without raising MAX_TOTAL_BYTES silently restores the
+    defect: the constant a reader trusts stops being the one that binds. Asserting the two chosen
+    values would pass just as well after that edit, which is the shape this repo keeps finding.
+    """
+    frame = _const("FRAME_OVERHEAD_BYTES")
+    need = MAX_MESSAGES * (MAX_BODY_BYTES + frame)
+    assert need <= MAX_TOTAL_BYTES, (
+        f"MAX_TOTAL_BYTES={MAX_TOTAL_BYTES} cannot hold MAX_MESSAGES={MAX_MESSAGES} messages of "
+        f"MAX_BODY_BYTES={MAX_BODY_BYTES} plus a {frame}-byte frame (needs {need}); the byte cap "
+        "binds first and the message cap is decorative"
+    )
+
+
+def test_the_footer_reports_the_BACKLOG_and_not_only_this_pass(repo: Path, tmp_path: Path) -> None:
+    """A drain that clears 5 of 40 prints ``5 shown, 35 deferred`` and reads as an orderly queue.
+
+    Per pass that is true; in aggregate it is how 34 messages expired unread across 17 boxes. The
+    footer already tells a seat what happened THIS TURN, and a seat has no reason to look anywhere
+    else -- so the depth and the oldest age belong in the place it already reads.
+    """
+    over = MAX_MESSAGES + 7
+    specs = [
+        {"stem": f"20260101T{i:09d}-aaaaaa", "body": f"message number {i}"}
+        for i in range(1, over + 1)
+    ]
+    seed(repo, tmp_path, specs)
+    text = injection(run_drain(repo))
+
+    remaining = over - MAX_MESSAGES
+    assert f"{remaining} still in the inbox" in text, (
+        "the footer reports only this pass; a backlog growing faster than it drains is invisible "
+        f"in the one place a seat looks. Expected the remaining depth ({remaining}) to be stated."
+    )
+    assert "oldest" in text, (
+        "the depth alone does not say whether the queue is aging toward its TTL"
+    )

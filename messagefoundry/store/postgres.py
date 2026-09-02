@@ -546,6 +546,14 @@ _SCHEMA: list[str] = [
         oidc_subject         TEXT,
         password_claimed_at  DOUBLE PRECISION
     )""",
+    # BACKLOG #1256: the atomicity the CHECK-THEN-ACT guard in auth/service.py cannot give itself --
+    # its read and its write are separate awaits, so two concurrent FIRST logins for one subject can
+    # both observe "no holder" and both bind. Same shape as ux_webauthn_label (ADR 0068 4).
+    # PARTIAL so unfederated rows coexist; Postgres treats NULLs as distinct, so the WHERE states
+    # intent here and is REQUIRED on SQL Server, where NULLs compare equal.
+    """CREATE UNIQUE INDEX IF NOT EXISTS ux_users_federated_subject
+        ON users(oidc_issuer, oidc_subject)
+        WHERE oidc_issuer IS NOT NULL AND oidc_subject IS NOT NULL""",
     """CREATE TABLE IF NOT EXISTS roles (
         id           TEXT PRIMARY KEY,
         display_name TEXT NOT NULL,

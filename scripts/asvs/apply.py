@@ -92,6 +92,28 @@ _PROSE_FIELDS = (
 )
 _SUBTABLES = ("evidence", "absence")
 
+
+#: Keys the WRITER CONSUMES AS INSTRUCTIONS rather than storing as record fields (BACKLOG #1369).
+#:
+#: `--allow-retirement` requires the payload to DECLARE what it is retiring, and `:468` reads that
+#: declaration off the cell dict. The carry loop below then wrote it straight back out, because a
+#: control and a data field are indistinguishable once they share one dict -- so a run that retired
+#: two anchors left `retired_absence = [...]` sitting in the record, where `scorecard.py` has no
+#: reader for it and never will. The instruction outlived the operation it instructed.
+#:
+#: DERIVED FROM _SUBTABLES, NOT ENUMERATED. `_carried`'s docstring rejects a name-keyed fix -- "a
+#: name-keyed fix satisfies the symptom and drops the next field anyone adds" -- and that objection
+#: is right and applies here too. Deriving means a new sub-table brings its own control with it and
+#: this line never changes, while a hand list would rot exactly as the docstring predicts.
+def _control_keys() -> tuple[str, ...]:
+    """Computed on EVERY call, deliberately, so the derivation is a live property rather than a
+    snapshot. A module-level constant holding the same tuple is byte-identical in behaviour today and
+    silently stops tracking `_SUBTABLES` the moment anyone edits it -- which is precisely the rot
+    `_carried`'s docstring warns a name list invites. A mutation run proved that: a hand-written
+    literal matching today's value passed every test, because there was no behaviour to differ on."""
+    return tuple(f"retired_{name}" for name in _SUBTABLES)
+
+
 #: The keys each sub-table entry is ORDERED by. Exactly the same distinction as `_ORDERED` one level
 #: down: these fix the emission order, they do NOT define the set that survives. #1242 limb 4 -- the
 #: entries were re-emitted as precisely these keys and nothing else, so a field inside an evidence or
@@ -177,11 +199,18 @@ def render(cell: dict[str, Any], live: dict[str, Any] | None = None) -> str:
     # direction over, and equally invisible downstream because an absent field reads as a valid
     # default. `cell` wins on a collision: the payload is the update.
     #
-    # Skipping ONLY _ORDERED and _SUBTABLES keeps the rule the header states -- enumerate what you
-    # ORDER, never what you KEEP. The old `key in cell` clause was an enumeration of the second kind
-    # wearing a de-duplication's clothes: every key it legitimately suppressed is already in _ORDERED.
+    # Skipping _ORDERED, _SUBTABLES and _CONTROL_KEYS keeps the rule the header states -- enumerate
+    # what you ORDER, never what you KEEP. The old `key in cell` clause was an enumeration of the
+    # second kind wearing a de-duplication's clothes: every key it legitimately suppressed is already
+    # in _ORDERED.
+    #
+    # _CONTROL_KEYS is not a fourth enumeration of things to KEEP OUT: those keys are not record data
+    # at all, they are instructions to this writer, and they are DERIVED from _SUBTABLES rather than
+    # listed (BACKLOG #1369). Without it a retirement declaration is consumed at :468 and then written
+    # back into the record, where nothing reads it -- the instruction outliving the operation.
+    _controls = _control_keys()
     for key, value in {**(live or {}), **cell}.items():
-        if key in _ORDERED or key in _SUBTABLES:
+        if key in _ORDERED or key in _SUBTABLES or key in _controls:
             continue
         out.append(_scalar(key, value))
     # The three explicit emissions in each loop below are an ORDERING, not a membership test, and the

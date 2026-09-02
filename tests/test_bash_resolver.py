@@ -16,8 +16,10 @@ from pathlib import Path
 
 import pytest
 from _bash_resolver import (
+    BASH_CANNOT_EXECUTE,
     BASH_HARNESS_FAILURE,
     BASH_SYNTAX_ERROR,
+    CANNOT_RUN_CODES,
     bash_candidates,
     bash_preserves_path_order,
     bash_sees,
@@ -119,6 +121,65 @@ def test_a_harness_failure_is_never_reported_as_a_syntax_error() -> None:
     # And an unknown code is described rather than silently classified as either.
     other = explain_returncode(3, "a workflow block")
     assert "HARNESS" not in other and "3" in other
+
+
+def test_a_cannot_run_exit_is_named_a_harness_fault_and_a_real_finding_is_not(
+    tmp_path: Path,
+) -> None:
+    """126 is the OTHER "cannot run" code, and it was reading as a finding about the content.
+
+    bash exits 127 when it could not FIND the thing and 126 when it found it and COULD NOT EXECUTE it
+    -- a directory, a bad shebang, a file with no execute bit. Both are facts about the harness. Only
+    2 is a fact about the content under test, so a neutral message on 126 lets a broken invocation
+    reach a reader as a syntax error and send them to edit a workflow that was never wrong.
+
+    The 126 is MANUFACTURED LIVE rather than asserted from the table, which keeps this measuring bash
+    rather than measuring my own constant. The negative arm is the load-bearing half: widening the
+    harness set must not swallow a real syntax error, so 0, 1 and 2 are pinned as NOT harness faults.
+    """
+    resolved = require_bash(tmp_path)
+    (tmp_path / "adir").mkdir()
+    proc = subprocess.run(  # noqa: S603  # nosec B603 - fixed argv, no shell, test-local paths
+        [resolved, "-c", "./adir"],
+        cwd=str(tmp_path),
+        capture_output=True,
+        timeout=60,
+        check=False,
+    )
+    assert proc.returncode == BASH_CANNOT_EXECUTE, (
+        f"asking {resolved} to execute a DIRECTORY returned {proc.returncode}, not "
+        f"{BASH_CANNOT_EXECUTE}. This control is meant to measure bash; if the code moved, the "
+        f"constant is what needs revisiting, not the message text. stderr={proc.stderr!r}"
+    )
+
+    cannot_execute = explain_returncode(BASH_CANNOT_EXECUTE, "a workflow block")
+    assert "HARNESS" in cannot_execute and "126" in cannot_execute, (
+        f"exit {BASH_CANNOT_EXECUTE} is described neutrally: {cannot_execute!r}. A reader takes that "
+        "as a finding about the content, which is the impersonation 127 already has a branch for."
+    )
+    for real in (0, 1, BASH_SYNTAX_ERROR):
+        assert "HARNESS" not in explain_returncode(real, "a workflow block"), (
+            f"exit {real} is now labelled a HARNESS fault. Widening the cannot-run set must not "
+            "swallow a real finding -- a predicate that says HARNESS to everything says nothing."
+        )
+
+
+def test_the_cannot_run_set_is_exactly_the_two_codes_bash_uses_for_it() -> None:
+    """One definition of "cannot run", so a caller cannot hold a second that disagrees.
+
+    ``test_merge_gate_controls`` carried its own ``(126, 127)`` tuple. Two copies of a rule are free
+    to drift, and the copy that drifts is the one still reading a broken invocation as a verdict.
+    Pinned as an EXACT set: a later widening that quietly admitted 1 or 2 would turn a real finding
+    into a harness excuse, which is the direction this whole item guards.
+    """
+    assert sorted(CANNOT_RUN_CODES) == [BASH_CANNOT_EXECUTE, BASH_HARNESS_FAILURE]
+    assert sorted(CANNOT_RUN_CODES) == [126, 127], (
+        f"the cannot-run set is {sorted(CANNOT_RUN_CODES)}; callers assert `returncode not in` it to "
+        "tell a broken invocation from a verdict"
+    )
+    assert BASH_SYNTAX_ERROR not in CANNOT_RUN_CODES, (
+        "a syntax error is a finding about the CONTENT and must never be excused as a harness fault"
+    )
 
 
 def test_the_resolved_bash_keeps_a_prepended_path_entry_first(tmp_path: Path) -> None:

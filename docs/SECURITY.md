@@ -18,7 +18,7 @@ with secure defaults, and AD-group→role mapping is automatic.
 ## Enforcement model
 
 Authentication is **required** for the running service. The engine `serve` command always attaches an
-auth layer (`[auth] enabled = true` by default). Of the **108** engine route objects, **90 demand a
+auth layer (`[security] require_sign_in = true` by default). Of the **108** engine route objects, **90 demand a
 specific permission** and 18 do not — 3 are deliberately unauthenticated (`GET /auth/providers`, an
 unbounded capability advertisement that carries no account state and charges **no** limiter;
 `POST /auth/login` and `POST /auth/negotiate`, bounded by the per-IP **and** global login sliding
@@ -32,7 +32,7 @@ implicit.
 The in-process embedding factory `create_app(engine)` is **fail-closed**: with no `AuthService`
 attached it denies every protected route (503) unless the caller explicitly opts out with
 `create_app(..., allow_no_auth=True)` — the deliberate embedding/local-dev escape hatch. The `serve`
-path runs auth-enabled by default; if `[auth] enabled = false` it sets that opt-in itself, and
+path runs auth-enabled by default; if `[security] require_sign_in = false` it sets that opt-in itself, and
 `__main__` refuses to serve auth-off on an exposed instance — a non-loopback host, or a loopback host
 behind a declared TLS terminator — and, even with auth enabled, a
 non-loopback bind requires **TLS**: in-process (`[api].tls_cert_file`, WP-13a) or terminated at a
@@ -341,7 +341,7 @@ tuple: they act only on the caller's own account.
 | `GET` | `/me/mfa` | `require` | |
 | `POST` | `/me/mfa/enroll` | `require_reauth_only_action` (action `mfa_enroll`) | password-only step-up — the MFA gate is skipped so a required-but-unenrolled user cannot deadlock |
 | `POST` | `/me/mfa/confirm` | `require_reauth_only_action` (action `mfa_confirm`) | per-actor ceremony limiter; password-only step-up |
-| `DELETE` | `/me/mfa` | `require_step_up_action` (action `mfa_disable`) | step-up bound to the disable action (current factor + a fresh password). ⚠️ **No last-factor guard** — this is the TOTP path (`disable_mfa`), and it does **not** refuse when it would leave the account with zero enrolled factors. The passkey removal path does refuse; see BACKLOG #1022 for the asymmetry |
+| `DELETE` | `/me/mfa` | `require_step_up_action` (action `mfa_disable`) | step-up bound to the disable action (current factor + a fresh password). **Refuses (400) when TOTP is your last second factor and MFA is required for your account** — the same refusal, on the same condition, as the passkey removal path (`AuthService.disable_mfa`, ADR 0068 decision 5). The asymmetry this row used to record is closed (BACKLOG #1022) |
 | `GET` | `/me/sessions` | `require` | |
 | `GET` | `/me/security-events` | `require` | |
 | `DELETE` | `/me/sessions/{session_id}` | `require_reauth_only_action` (action `session_terminate`) | password-only step-up, bound to the action (ASVS 7.5.2): a login-seeded window does not unlock a terminate |
@@ -364,7 +364,7 @@ tuple: they act only on the caller's own account.
 | `DELETE` | `/users/{user_id}/sessions` | `users:manage` | `require_step_up` |
 | `PUT` | `/users/{user_id}/roles` | `users:manage` | `require_step_up` |
 | `POST` | `/users/{user_id}/reset-password` | `users:manage` | `require_step_up_action` (action `admin_reset_password`) |
-| `POST` | `/users/{user_id}/reset-mfa` | `users:manage` | `require_step_up_action` (action `admin_reset_mfa`) |
+| `POST` | `/users/{user_id}/reset-mfa` | `users:manage` | `require_step_up_action` (action `admin_reset_mfa`); **refuses (400) when `user_id` is the caller's own** — use the self-service MFA settings instead. Targeting yourself here was a third route to zero factors that skipped the last-factor refusal both self-service paths make (BACKLOG #1022). Cross-user reset is untouched: it is the always-available recovery for a locked-out passkey user (ADR 0068 §2) |
 | `GET` | `/users/{user_id}/channel-scope` | `users:manage` | `require` (a read on the `users:manage` tier, not `users:read`) |
 | `PUT` | `/users/{user_id}/channel-scope` | `users:manage` | `require_step_up` |
 | `GET` | `/ad-group-map` | `users:manage` | `require` |
@@ -627,7 +627,8 @@ inferred — `POST /ui/connections/bulk-control`, `POST /ui/connections/purge-bu
 | `POST` | `/ui/uploaded-logs/file/{file_id}/filter` | `files:browse` | `require_ui_step_up` |
 | `POST` | `/ui/uploaded-logs/file/{file_id}/delete` | `files:delete` | `require_ui_step_up` |
 | `GET` | `/ui/uploaded-logs/file/{file_id}/delete-confirm` | `files:delete` | `require_ui` |
-| `POST` | `/ui/uploaded-logs/file/{file_id}/resend` | `files:browse` | `require_ui` |
+| `POST` | `/ui/uploaded-logs/file/{file_id}/resend` | `files:browse` | `require_ui_step_up` |
+| `GET` | `/ui/uploaded-logs/file/{file_id}/resend-confirm` | `files:browse` | `require_ui` |
 | `GET` | `/ui/uploaded-logs/upload` | `files:upload` | `require_ui` |
 | `POST` | `/ui/uploaded-logs/upload` | `files:upload` | `require_ui` |
 | `GET` | `/ui/users` | `users:read` | `require_ui` |
@@ -680,11 +681,20 @@ else would need its own authorization rule stated here.
    browser cannot act on.
 2. **No `/ui` route charges the per-actor admin-write pacing floor** (see the interim note under
    [Anti-automation](#admin-password-reset-wp-l3-12-asvs-646)).
-3. **Two console routes lose a step-up their JSON counterparts have**:
-   `POST /ui/uploaded-logs/upload` and `POST /ui/uploaded-logs/file/{file_id}/resend` are plain
-   `require_ui`, while `POST /uploads` and `POST /uploads/{file_id}/resend` are `require_step_up` —
-   a multipart body cannot survive the re-auth redirect. So a PHI-at-rest write and a PHI
-   re-injection are gated on `files:upload` / `files:browse` alone on this plane.
+3. **One console route loses a step-up its JSON counterpart has**: `POST /ui/uploaded-logs/upload`
+   is plain `require_ui`, while `POST /uploads` is `require_step_up` — a multipart body cannot
+   survive the re-auth redirect. So a PHI-at-rest write is gated on `files:upload` alone on this
+   plane. **The resend half of this divergence is CLOSED (BACKLOG #1227):**
+   `POST /ui/uploaded-logs/file/{file_id}/resend` is now `require_ui_step_up`, reached through a
+   body-less confirm step that carries its two parameters in the query, so it survives the re-auth
+   redirect the way `delete` does. The premise that used to stand in for the gate — that the POST
+   arrives from an already-stepped-up browse page — was never enforced by anything.
+   That step introduces one *new*, narrower divergence, disclosed here rather than left to be
+   discovered: `GET /ui/uploaded-logs/file/{file_id}/resend-confirm` is plain `require_ui` while the
+   permission-equivalent JSON browse route carries a step-up. It **cannot** carry one, because it is
+   the re-auth continuation itself — gating it would bounce the operator back to `/ui/reauth`
+   indefinitely. It is accepted because the page renders **no message body**: a filename, an ordinal
+   and a connection name, all three of which the operator supplied on the previous screen.
 4. **The ADR 0092 PHI-read hop refusal does not apply on the `/ui` browse routes.**
    `enforce_phi_read_hop` appears nowhere in `messagefoundry_webconsole/`; the console's own gates —
    `require_ui(..., phi=True)` and `require_ui_step_up(..., phi=True)` — apply only the per-actor
@@ -793,12 +803,15 @@ returns a setup key + `otpauth://` URI for an authenticator app, `POST /me/mfa/c
 returns the **single-use recovery codes** (shown once), and `POST /auth/mfa-verify` satisfies a session's
 second factor with a TOTP code or a recovery code. `DELETE /me/mfa` disables it; an administrator clears a
 lost authenticator via `POST /users/{id}/reset-mfa` (which also revokes the user's sessions). With
-`[auth].require_mfa` on — **the default since BACKLOG #187 (secure-by-default, including the loopback
-bind)** — the **Administrator** role must satisfy MFA before any step-up operation (the gate returns
-`403` + `X-MFA-Required` until verified); other users may opt in by enrolling. A required-but-unenrolled
+`[security].require_mfa` on — **the default since BACKLOG #187 (secure-by-default, including the
+loopback bind)** — **every local account** must satisfy MFA: the scope is `every_local_account` by
+default, and `administrators` narrows it to the **Administrator** role. It is an **access gate, not
+only a step-up gate** — the gate returns `403` + `X-MFA-Required: 1` on **every** authorized route
+until verified (console twin: a 303 to `/ui/mfa`), with the account and factor-enrolment routes
+exempt so an un-enrolled user is not stranded. A required-but-unenrolled
 admin is never locked out — the enroll/confirm routes sit behind an action-bound **password** step-up,
 not the MFA gate, so the bootstrap admin enrolls then satisfies it. The documented org opt-out is
-`[auth].require_mfa = false`. **AD/Kerberos MFA is delegated to the directory** (Entra Conditional Access
+`[security].require_mfa = false` (the retired `[auth].require_mfa` spelling is refused at load). **AD/Kerberos MFA is delegated to the directory** (Entra Conditional Access
 / an MFA proxy) — a directory login is never prompted for an engine TOTP and is MFA-satisfied at issuance.
 The TOTP secret is stored **encrypted at rest** (the store cipher) and recovery codes are
 **argon2id-hashed**; verification uses the server clock and a constant-time compare over a **configurable
@@ -901,7 +914,7 @@ open-egress startup gates. So an exposed PHI deployment can't silently run the A
 single-factor. `require_mfa` is safe to keep on for an **AD-only** deployment's *directory* users:
 AD/Kerberos identities are exempt under either `require_mfa_scope` value, their factor delegated to the
 directory. An earlier revision of this sentence said it "gates only **local** Administrator accounts";
-that was wrong. Under the shipped `require_mfa_scope = "every_local_account"` it covers **every** local
+that was wrong. Under the shipped `[security] require_mfa_scope = "every_local_account"` it covers **every** local
 account, which on an AD-only deployment still means the local bootstrap admin and any local service
 accounts — a non-interactive local bearer-token account becomes MFA-pending and cannot enrol
 unattended. **That is a decision a deploying site must make before first start:** either such an
@@ -1365,7 +1378,7 @@ timeout** (default 30 min) and an **absolute lifetime** (default 12 h); changing
 disabling a user, or an **AD-group/role change on re-login** revokes that user's sessions. These two
 defaults align the session controls with **NIST SP 800-63B §7.2** reauthentication at **AAL2** — a
 **12-hour** maximum session length enforced regardless of activity, plus reauthentication after **30
-minutes** of inactivity; raising `[auth].session_absolute_hours` or `[auth].session_idle_timeout_minutes`
+minutes** of inactivity; raising `[security].max_session_hours` or `[security].sign_out_after_idle_minutes`
 beyond those bounds is a **documented risk deviation** from AAL2, not a supported hardening knob, and
 any such increase should be recorded as an accepted risk. Session
 validation **fails closed on a backward wall-clock step** (NTP step-back / VM snapshot revert) rather

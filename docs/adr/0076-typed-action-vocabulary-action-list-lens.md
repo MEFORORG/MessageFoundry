@@ -2,7 +2,7 @@
 
 **Status:** Accepted (2026-07-10) — ratified by the owner 2026-07-10; the PLAN-8 lanes may build. Gating rule: **phase 1 (the vocabulary) requires only the #26-amendment merge; phases 2–3 require this ADR Accepted.** In practice phase 1 builds after Acceptance anyway — its v1 roster is fixed by §2 and MULTISESSION-PLAN-8 bundles it with phase 2a in one lane. **Amendment A — ACCEPTED, ratified by the owner 2026-07-30 and IN FORCE:** a `note` row kind so comment-only rows stop projecting as opaque `code`, superseding ADR 0106 §5 (L); §3's enum and §4's ladder read as amended, and BACKLOG #248 is the build. **Amendment B — ⛔ DECLINED by owner ruling 2026-07-30 (too risky):** ADR 0089 Phase D "helper descent" is **not adopted and not to be built** — aliasing across duplicate call sites has no solution in any ADR, and the yield is unmeasured and may be negative. The specification is retained so the decline is auditable, not as a plan; reopening needs a **new** amendment. The better lever, explicitly not declined, is teaching Phase A the `msg["X"] = v` subscript form — it widens what is editable without touching the row shape.
 **Deciders:** owner + IDE/DX working group
-**Related:** BACKLOG **#222** (this build), **#26 amendment** (the narrow carve-out this ADR operates under), **#221** (sibling IDE-polish lane), the deep-research findings ([`docs/research/ide-low-code-options.md`](../research/ide-low-code-options.md) — verified precedents: InterSystems low-code custom editors, Kaoto/Karavan/AWS Workflow Studio, Iguana annotations, Corepoint action-lists), ADR 0007/0033/0014 (the sanctioned config-as-data GUIs), ADR 0072 (traced dry-run — the live values rendered beside action rows), ADR 0010/0043 (`db_lookup`/`fhir_lookup` — the sanctioned read-only lookups the lens renders as DBSelect-style rows), ADR 0035 (IDE workspace-trust — `lens` CLI calls are exec-gated like every CLI call), CLAUDE.md §9 (PHI), §12 (the amended bright line).
+**Related:** BACKLOG **#222** (this build), **#26 amendment** (the narrow carve-out this ADR operates under), **#221** (sibling IDE-polish lane), the deep-research findings (`docs/research/ide-low-code-options.md` — verified precedents: InterSystems low-code custom editors, Kaoto/Karavan/AWS Workflow Studio, Iguana annotations, Corepoint action-lists), ADR 0007/0033/0014 (the sanctioned config-as-data GUIs), ADR 0072 (traced dry-run — the live values rendered beside action rows), ADR 0010/0043 (`db_lookup`/`fhir_lookup` — the sanctioned read-only lookups the lens renders as DBSelect-style rows), ADR 0035 (IDE workspace-trust — `lens` CLI calls are exec-gated like every CLI call), CLAUDE.md §9 (PHI), §12 (the amended bright line).
 Plan: `docs/releases/MULTISESSION-PLAN-8.md` (L2 builds phases 1+2a; L3 builds phase 2b; L4 = phase 3, owner-gated).
 **Code references** are `origin/main @ 954bd22`; line numbers drift — locate exactly at implementation time.
 
@@ -79,7 +79,7 @@ Recognized rows are deliberately **bounded** (the structural subset that round-t
 ## 5. Rewrite semantics + PHI (the load-bearing correctness section)
 
 - **Row-scoped splice, never reformat.** `lens rewrite` regenerates only the edited/inserted row's line range from its template; untouched rows/blank lines/comments are byte-preserved (test gate §6.2). No AST unparse of the whole file (stdlib `ast.unparse` discards formatting/comments — rejected); no `libcst` in v1 (new runtime dep, DEP-1 — revisit only if splicing proves brittle, as an ADR amendment).
-- **Sync on save only; one editor at a time; update-loop guard; Reopen With: Python always available** — the verified InterSystems/VS Code guardrail set, adopted wholesale.
+- **Sync on save only; one editor at a time; update-loop guard; Reopen With: Python always available** — the verified InterSystems/VS Code guardrail set, adopted wholesale. **The first clause is RELAXED for the PROJECTION only by Amendment F (BACKLOG #234); the other three stand unchanged, and live values remain save-gated.**
 - **Static analysis only.** `lens parse`/`rewrite` never import or execute config modules — a module whose top level would raise still parses. No message content is involved at all in parse/rewrite; **PHI enters only via the live-value annotations, which reuse the ADR 0072 stream and its `--show-phi` gate unchanged** — the lens adds no second PHI gate and no persisted artifact.
 - **IDE trust:** the lens shells the CLI, so it inherits the ADR 0035 workspace-trust exec gate like every other extension CLI call.
 
@@ -90,7 +90,7 @@ Recognized rows are deliberately **bounded** (the structural subset that round-t
 3. **Emitted code is first-class:** rewritten files pass `ruff check`, `ruff format --check`, `mypy` (strict), and `messagefoundry check` on the samples corpus.
 4. **Static-only:** a config module with a top-level `raise` parses successfully (proves no import/execution).
 5. **Vocabulary purity:** `actions.py` helpers do no I/O (enforced by review + a no-new-imports test); SPDX header present; **no new runtime dependency** in phases 1–2 (stdlib `ast` only); crypto-inventory gate not tripped (no crypto imports).
-6. **IDE:** lens editor degrades to the text editor on parse failure with a notice; edits sync on save only; live values render redacted unless the existing show-PHI opt-in is set (never auto-enabled).
+6. **IDE:** lens editor degrades to the text editor on parse failure with a notice; edits sync on save only (**the projection half is relaxed by Amendment F — BACKLOG #234; live values still sync on save only**); live values render redacted unless the existing show-PHI opt-in is set (never auto-enabled).
 
 Two-way door: if the lens disappoints, phase 1's vocabulary remains independently valuable and nothing else in the product depends on the lens.
 
@@ -633,6 +633,9 @@ document it.
 
 - **"Sync on save only" stands.** No keystroke, `onDidChangeTextDocument`, or timer path is added. The
   deferred refresh is a *save* that already happened; it is being honoured late, not invented.
+  **(Accurate about Amendment C and unchanged as a record of it. It is NOT a statement about the ADR's
+  current state: Amendment F later adds exactly an `onDidChangeTextDocument` path, for the projection
+  only. Read C's accounting as scoped to C.)**
 - **"One editor at a time" stands.** The slot semantics are untouched; `releaseEdit` releases exactly
   when `endEdit()` did.
 - **The update-loop guard stands.** `shouldReactToDocumentChange()` still returns `false` in flight, so
@@ -1080,3 +1083,77 @@ question before it is checked against these sets.
 - [ ] **AC-M7** — WHERE a consumer requests the pre-Amendment-E contract version, THE SYSTEM SHALL emit
   no `param_modes` key, and the rest of the payload SHALL be byte-identical to today's across the whole
   samples corpus.
+
+
+## Amendment F (2026-08-26) — the §5 "sync on save only" guardrail is relaxed for the PROJECTION only (BACKLOG #234)
+
+**Status: accepted.** The owner ruled AC 6's "edits sync on save only" **open, and a lane free to relax
+it**. That is permission, not a specification of how; this amendment is the how, and it is deliberately
+narrower than the permission granted.
+
+### F.1 What changes
+
+**The projection trigger, and nothing else.** The Steps view re-projects its rows on a debounced buffer
+**change** as well as on save.
+
+| Path | Before | After | Why it moves, or does not |
+|---|---|---|---|
+| Row projection | save only | save **or** debounced change | already reads the LIVE buffer |
+| Live values | save only | **save only, unchanged** | reads DISK; #225's misalignment is real |
+
+**The premise that licenses moving the first is already recorded in this ADR and in the code.**
+`render()` pipes `document.getText()` to `lens parse -` over stdin, so rows are projected from the
+buffer, not from disk — §5's addendum says so, and the save gate's own comment carried the opposite
+claim until it was corrected on 2026-08-04. **The disk read belongs only to the live-value trace**,
+which is why that half does not move. BACKLOG #234's own non-goal says the same.
+
+### F.2 The bound is three conditions, not a timer
+
+1. **Rows only.** A change-triggered projection attaches **no live values at all**. It does not consult
+   `document.isDirty`, so it cannot act on a stale reading of it. `LiveValueArming` carries this.
+2. **Not while the webview holds focus.** A re-projection replaces the **entire** webview HTML, which
+   would destroy focus, selection and a half-typed param input mid-word — the cost the save gate's own
+   comment names, and the objection the obvious design never answered. Typing in the split **text
+   editor** costs nothing to re-project; typing in a **webview input** is the case the guardrail was
+   adopted for. `panel.active` separates them from panel state, with no heuristic. **A condition, not a
+   threshold** — a threshold has to be chosen and then defended.
+3. **Through the existing debounced channel.** `RERENDER_DEBOUNCE_MS` is unchanged and no second timer
+   is introduced, so rapid typing coalesces exactly as rapid saves already do, and `render()` still
+   cancels the pending fire on entry (Amendment C, AC-C2).
+
+### F.3 Guardrail accounting (what is NOT changed)
+
+- **"One editor at a time" stands.** Slot semantics untouched.
+- **The update-loop guard stands, and still runs first.** `shouldReactToDocumentChange()` gates the
+  change path exactly as it gates the save path, so our own `lens rewrite` `WorkspaceEdit` still cannot
+  trigger a projection.
+- **"Reopen With: Python" stands.** Untouched.
+- **The live-value save gate (#225) stands.** `shouldAttachLiveValues(document.isDirty)` is unchanged as
+  an expression.
+
+**DISCLOSED, because it touches a line another row also wants:** the implementation adds one conjunct
+at the live-value gate — `wantsLiveValues && shouldAttachLiveValues(document.isDirty)`. **A conjunction
+can only NARROW**, so live values now attach on a strict subset of the cases the dirty-state gate alone
+would allow, and #225's hazard cannot be reintroduced by it. A **disjunction** could, which is why the
+test now pins the operator rather than the presence of a term.
+
+**NOT FIXED HERE, AND DELIBERATELY SO:** `stepsView.ts` snapshots the buffer, awaits the parse, and
+reads `document.isDirty` afterwards — the gate is sampled at a different instant than the snapshot it
+protects. That is an independent defect with its own row. **This amendment makes it no more reachable
+than before**, because the change path never consults `isDirty` at all; the only path that does is the
+save path, exactly as before.
+
+### Acceptance Criteria (Amendment F)
+
+- [ ] **AC-F1** — WHEN the open document changes and the webview does NOT hold focus, THE SYSTEM SHALL
+  re-project the rows after the existing debounce, without attaching live values.
+- [ ] **AC-F2** — WHEN the open document changes and the webview DOES hold focus, THE SYSTEM SHALL NOT
+  re-project, so a half-typed param input cannot be destroyed under the author.
+- [ ] **AC-F3** — WHEN a save is pending and a change arrives before the debounce fires, THE SYSTEM
+  SHALL still attach live values on that projection (a save is never downgraded by a later keystroke).
+- [ ] **AC-F4** — WHERE any additional condition is placed on the live-value gate, THE SYSTEM SHALL
+  join it as a conjunct, never a disjunct, so the gate can only ever narrow (#225).
+- [ ] **AC-F5** — THE SYSTEM SHALL introduce no second re-projection channel: exactly one
+  `RerenderDebouncer`, and the change path SHALL feed it rather than hold a timer of its own.
+- [ ] **AC-F6** — WHEN our own `lens rewrite` is applying, THE SYSTEM SHALL NOT re-project on the
+  resulting document change (the update-loop guard, unchanged).

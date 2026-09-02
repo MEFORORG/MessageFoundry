@@ -686,14 +686,33 @@ whole shape:
 
 | | |
 |---|---|
-| [`usage-collect.ps1`](../scripts/coord/usage-collect.ps1) | the statusLine. Publishes to `~/.claude/mefor-usage/latest.json` |
-| [`usage.ps1`](../scripts/coord/usage.ps1) | reads it, adds burn rate, answers *will this run out before it resets* |
-| [`install-usage-statusline.ps1`](../scripts/coord/install-usage-statusline.ps1) | wires it (owner, plain terminal) |
+| [`usage-collect.ps1`](../scripts/coord/usage-collect.ps1) | the statusLine. Publishes to `<config root>/mefor-usage/latest.json` — one per account root |
+| [`usage.ps1`](../scripts/coord/usage.ps1) | reads it, adds burn rate, answers *will this run out before it resets*. `-AllRoots` surveys every root |
+| [`install-usage-statusline.ps1`](../scripts/coord/install-usage-statusline.ps1) | wires it (owner, plain terminal). Defaults to this session's pinned root; `-ConfigDir <dir>` names one, `-AllRoots` does every account root |
+| [`config-roots.ps1`](../scripts/coord/config-roots.ps1) | definitions the other three share: what a config root is, which one am I in, where does its state live |
 
-**One publisher, N readers.** The quota is **account-wide** — every session in every repo draws down the
-same 5-hour and 7-day pools — so any one session's reading is the truth for all of them. Do not run a
-collector per session expecting to sum them; that double-counts a shared pool. The publish path is
-user-level for the same reason: the data is a property of the account, not of a checkout.
+**One publisher, N readers — per account.** The quota is **account-wide**: every session in every repo
+draws down the same 5-hour and 7-day pools, so any one session's reading is the truth for all sessions
+*on that account*. Do not run a collector per session expecting to sum them; that double-counts a shared
+pool.
+
+**It is not machine-wide, and an earlier version of this section said it was.** A box can run several
+config roots at once, and **a config root holds one credential set and therefore one Anthropic account**
+— measured on this box, five account roots carrying five different account emails and five separate
+pools. Publishing them all to one user-level file is last-writer-wins across unrelated quotas, and the
+damage compounds: the percentage flaps, the carry-forward can leave `five_hour` from one account beside
+`seven_day` from another in one document, and `usage.ps1`'s staleness guard **never fires** because some
+other account keeps the file warm. That last one is the worst — the guard looks present and is disarmed.
+So the publish path is per config root, derived by one shared function that the collector, the reader and
+the installer all call. The full statement of the rule lives in
+[`usage-collect.ps1`](../scripts/coord/usage-collect.ps1)'s header; everything else links to it.
+
+**The installer writes the root a session actually reads.** It used to write `~/.claude/settings.json`
+unconditionally and report *"INSTALLED (user level — every session on this machine)"*. Claude Code reads
+settings from the root named by `CLAUDE_CONFIG_DIR`, which every launcher here pins, so the statusLine
+never fired, nothing ever published, and `usage.ps1` correctly said the collector was not installed — an
+install success followed by a reader saying it was never installed. The success message now names each
+file it wrote and nothing else.
 
 **It only runs in an interactive session.** The statusLine is part of the TUI's render tree and never
 executes under `claude -p` or the SDK. A headless coordinator can *read* what this publishes and can
@@ -713,14 +732,23 @@ blind spot is its own defect**, and a worse one than an omission: a session told
 unknowable stops trusting a reading that was accurate. Corrected against the actual panel, 2026-08-02.
 
 ```powershell
-pwsh -NoProfile -File scripts\coord\usage.ps1          # human
-pwsh -NoProfile -File scripts\coord\usage.ps1 -Json    # coordinator
+pwsh -NoProfile -File scripts\coord\usage.ps1             # human -- THIS session's account
+pwsh -NoProfile -File scripts\coord\usage.ps1 -Json       # coordinator
+pwsh -NoProfile -File scripts\coord\usage.ps1 -AllRoots   # every config root, side by side
 ```
+
+The bare invocation still works and now means **this session's account**, not the box. `-AllRoots` is a
+**survey, never a merge**: the roots are different accounts with different pools, so nothing is summed,
+averaged or worst-of'd across them, and the exit code stays this session's verdict.
 
 Exit codes so a coordinator can branch without parsing prose: **0** ok, **10** warn, **11** critical,
 **20** unknown. `UNKNOWN` is a real answer here and is returned whenever the reading is stale, undateable
 or future-dated — a percentage is never extrapolated from a dead publisher, and every number is printed
-with its own age. **Do not read a missing bucket as an empty one.**
+with its own age. **Do not read a missing bucket as an empty one.** Two more states return it: a document
+stamped with a config root other than the one it sits under is **refused** rather than reported as this
+session's headroom, and when there is no data at all the message diagnoses *which* state this root is in
+— not wired, wired to publish somewhere else, wired but naming a collector that is gone, someone else's
+statusLine, and so on — each with a different fix, instead of saying "not installed or has not run yet".
 
 > **`ccusage` does not do this**, despite being the tool everyone recommends and despite several
 > summaries claiming it "fetches real rate limit data". It parses transcripts for tokens and dollars; its
@@ -728,6 +756,60 @@ with its own age. **Do not read a missing bucket as an empty one.**
 > `claude-usage-tracker` is the same mistake in cruder form — real token parsing compared against a
 > hardcoded limit table. Anything reading plan state from either is confidently wrong at exactly the
 > moment it matters. Tokens and plan-limit consumption are different quantities.
+
+## Put the prompt first, or a list-valued flag eats it and the lane dies quietly
+
+Several `claude` options take a **list**, so they keep swallowing words until the next `-`-prefixed
+token. A prompt written after one is absorbed as another list item. This launches a session with **no
+prompt at all**:
+
+```powershell
+claude --bg --allowedTools Bash Edit "do the work"    # WRONG -- the prompt becomes a third tool name
+```
+
+Write it one of these two ways:
+
+```powershell
+claude --bg "do the work" --allowedTools Bash Edit    # prompt first
+claude --bg --allowedTools Bash Edit -- "do the work" # or close the list with --
+```
+
+**Why this earns a section: the failure is silent and the symptom lies.** The session starts, finds
+nothing to do, and exits 0. `claude agents --json` then reports it as `state=blocked` — the same
+thing it reports for a session genuinely waiting on a permission decision. So a background lane
+launched this way looks alive and pending, and does nothing. Nobody re-reads the command that started
+a session they believe is merely blocked. Seen on this box 2026-08-30: a session named `loadprobe`
+sat at an empty prompt in manual mode until someone killed it by hand.
+
+**The list-valued options, read from `claude --help` at CLI version 2.1.251 on 2026-08-30.** These
+are the ones whose help text spells the value with a trailing `...`:
+
+| Option | Value in `--help` |
+|---|---|
+| `--add-dir` | `<directories...>` |
+| `--allowedTools`, `--allowed-tools` | `<tools...>` |
+| `--betas` | `<betas...>` |
+| `--disallowedTools`, `--disallowed-tools` | `<tools...>` |
+| `--file` | `<specs...>` |
+| `--mcp-config` | `<configs...>` |
+| `--tools` | `<tools...>` |
+
+**Three options that look like they belong on that list and do not.** `--plugin-dir <path>` and
+`--plugin-url <url>` each take one value and are **repeatable**: you pass the flag again rather than
+adding a second word. `--agents <json>` takes a single JSON string. Repeatable is not list-valued,
+and only a list-valued option reaches past its own value to eat the prompt.
+
+Re-read `--help` before trusting this table against a newer CLI. It measures one version, not a
+contract.
+
+**No hook guards this, and that is a decision.** The obvious guard is a `PreToolUse` matcher on
+`Bash` that refuses the bad shape. This repo already has one Bash guard written and tested that way,
+[`../scripts/hooks/block-blanket-git-stage.ps1`](../scripts/hooks/block-blanket-git-stage.ps1), and
+it is referenced by **no** matcher in any settings file on this machine — measured 2026-08-23 at 0 of
+110, while several tracked pages described it as a live control. A second unwired guard would add
+another control that reads as running and never runs. A static scan of tracked files is no better: it
+answers "does a committed script contain the bad shape" when the question is "did a session just type
+it", and no tracked file has ever contained one. So this stays a rule you read, not a gate.
 
 ## Announcing yourself (UserPromptSubmit hook)
 
