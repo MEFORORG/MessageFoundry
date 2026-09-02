@@ -15,23 +15,42 @@ hook.
 
 ---
 
-## Status: LIVE on all five config roots, and verified end to end through the installed hook
+## Status: LIVE on every config root, and verified end to end through the installed hook
 
 **Read the config, not this line, before relying on it** -- a status sentence in a document is exactly
-the observation that goes stale without saying so. As last verified 2026-08-06 against every config
-root: the drain is registered on **both `SessionStart` and `Stop`**, on **all five roots** (`~/.claude`
-plus `.claude-account-1` through `-4`). All four numbered roots are in active use, so a drain on the
-default root alone would have left the cross-login case -- half the reason this channel exists --
-unreachable.
+the observation that goes stale without saying so. The drain is registered on **both `SessionStart` and
+`Stop`**, in **every config root on this machine**. Measure that rather than trusting this paragraph:
+
+```powershell
+pwsh -NoProfile -File scripts\coord\install-coordination.ps1 -Status
+```
+
+It finds the roots itself, by a name pattern (`~/.claude` and each `~/.claude-account-<n>`) rather than
+a list somebody maintains, then prints `Roots examined: <n>`, a UTC as-of time, and `INSTALLED` or
+`MISSING` per root per event. A root created tomorrow shows up in that output tomorrow.
+
+Wiring every root rather than only the default one is the whole point. The numbered roots are in active
+use, so a drain on `~/.claude` alone would leave the cross-login case -- half the reason this channel
+exists -- unreachable.
+
+> **THE COUNT WENT STALE, NOTHING REPORTED IT, AND THAT IS WHY IT IS NOW A COMMAND.** Three lines
+> here read "all five roots (`~/.claude` plus `.claude-account-1` through `-4`)", verified 2026-08-06.
+> Measured 2026-09-02 by grepping each root's `settings.json` for the `mefor-mail` hook tag: **six**.
+> `.claude-account-5` was created after that verification and wires the drain exactly like its
+> siblings. The count is **deleted rather than bumped to six**, because six goes stale the way five
+> did -- a root is created by a person on a whim and counted by a tool on demand. Bumping it would buy
+> one correct sentence and leave the next reader the same trap.
 
 The coordination banner (`scripts/worktree/session-context.ps1`) is a *different* hook that shares the
 `SessionStart` event and is deliberately still absent. **Install one tier at a time with
 `-Only <event> -Script mail-drain`**: `-Only SessionStart` alone would wire the banner too.
 
 The urgent tier ([`scripts/hooks/mail-watch.ps1`](../scripts/hooks/mail-watch.ps1)) **is registered on
-`Stop`, on all five roots** -- re-measured 2026-08-17 by two independent instruments that agree:
-`install-coordination.ps1 -Status` reports it INSTALLED in every root, and a direct read of each
-`settings.json` finds the `mefor-wake` shim resolving `scripts/hooks/mail-watch.ps1`. This line
+`Stop` as well** -- measured 2026-08-17 by two independent instruments that agreed:
+`install-coordination.ps1 -Status` reported it INSTALLED in every root, and a direct read of each
+`settings.json` found the `mefor-wake` shim resolving `scripts/hooks/mail-watch.ps1`. **That reading
+predates `.claude-account-5`**, and the 2026-09-02 re-measurement covered the drain tag only, so run
+the status command above before treating the urgent tier as covering every root today. This line
 previously read "armed in code and registered nowhere, by decision", which was true when written on
 2026-08-06 and is not true now. It is recorded rather than silently overwritten because the direction
 of the drift is the instructive part: **a doc that understates what is armed is the safer of the two
