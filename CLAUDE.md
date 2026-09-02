@@ -318,14 +318,18 @@ went red, and no workflow reads that label back. So the Console finds both by as
 4. Its process exits when the PR opens. The worktree stays behind.
 5. **It CAN declare its own seat, through the Bash tool.** Measured 2026-09-02: a headless `-p`
    Builder ran `seat.ps1 -Declare` and its record carries `seatSource: declared` with a real goal,
-   which no hook can write. **Quote the Windows path.** Unquoted, Bash eats the backslashes and
-   fails with a message that looks like a missing script rather than a quoting bug.
+   which no hook can write. **Quote the Windows path.** Unquoted, the SHELL eats the backslashes:
+   `echo C:\Temp\demo` prints `C:Tempdemo`, so `pwsh` reports the argument is not a
+   script file, which reads as a missing script rather than a quoting bug. Measured 2026-09-02. This
+   is ordinary POSIX quoting and is **not** BACKLOG #1397, which is the Bash tool unescaping inside
+   a QUOTED heredoc.
    The **PowerShell tool** does refuse a nested `pwsh`, with `Command spawns a nested PowerShell
    process which cannot be validated`. That refusal belongs to one tool, not to the harness, and
    the Bash tool has no such check. **This line previously said a seat cannot declare itself.**
    That was wrong, and it was self-confirming: a Builder told it cannot declare does not try,
-   renders undeclared, and confirms the rule. Two Builders on one root, 33 minutes apart, differed
-   only in what their brief said, and only the second declared.
+   renders undeclared, and confirms the rule. Two Builders on one root, 33 minutes apart: the
+   second's brief asked it to declare and the first's did not, and only the second declared. They
+   also differed in task, worktree and grant list, so that is the cause and not a controlled arm.
    A SessionStart hook (`scripts/hooks/seat-declare-prompt.ps1`) prints a line telling every
    starting session to declare. **Do not ignore it.** The Console should still supply seat and goal
    at spawn, because no hook will invent a goal, by design: a machine that invents one writes a
@@ -351,15 +355,23 @@ went red, and no workflow reads that label back. So the Console finds both by as
   `claude --bg --allowedTools Bash Edit "do the work"` swallows the prompt as a third tool name. The
   session starts with nothing to do, exits 0, then lists as `state=blocked`, which is also what a
   real permission block looks like. The lane reads as alive and does nothing.
-- **Grant tools by BARE NAME, never scoped to a command.** `--allowedTools Bash PowerShell` works.
+- **In the `--allowedTools` FLAG, grant tools by BARE NAME, never scoped to a command.**
+  `--allowedTools Bash PowerShell` works.
   `--allowedTools "PowerShell(pwsh:*)"` silently disables the PowerShell tool: every command it
   sends comes back `Command contains malformed syntax that cannot be parsed: pwsh exited with code
-  1: The command line is too long.` The tool has to parse a command to test it against a scoped
-  pattern, and that parse spawns `pwsh`, which fails when the inherited environment is near the
-  8191-byte command-line limit. This box sits at about 8100. A bare grant needs no parse.
+  1: The command line is too long.` Consistent with the tool spawning `pwsh` to test a command
+  against a scoped pattern, and that spawn failing when the inherited environment is near the
+  8191-byte command-line limit. Nobody has read the tool's source, so the mechanism is inferred;
+  the paired test establishes only that the GRANT FORM is causal. An environment block is
+  per-PROCESS, not per-machine: one session measured 8105 bytes, and the size varies with config
+  root, worktree path and inherited `PATH`. A bare grant needs no parse.
   **The careful spelling is the broken one**, which is why this cost four Builder launches before
-  anyone looked. Measured 2026-09-02, one variable, environment held constant. It kills a matching
-  `settings.json` rule too, not only a flag. Bash is unaffected.
+  anyone looked. Measured 2026-09-02, one variable, environment held constant. Bash is unaffected.
+  **The two rule sources are known asymmetrically, so do not generalise:** command-scoping is
+  measured to break BOTH the flag and a `settings.json` rule (a matching `Bash(git add:*)` executed
+  while its `PowerShell` twin died at the parse). A BARE name is measured to work **in the flag
+  only** -- nobody has put a bare tool name in a `settings.json` `permissions.allow` and spawned
+  without a flag. Do not "fix" a config root by bare-naming its rules on the strength of this line.
   Three refusals that must not be conflated: `malformed syntax ... too long` is the parse dying and
   says nothing about your rules; `This command requires approval` is a real permission decision;
   `The term 'X' is not recognized` means the command RAN and the PATH is wrong.
