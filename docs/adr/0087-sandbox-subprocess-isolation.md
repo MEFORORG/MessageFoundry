@@ -345,9 +345,19 @@ exotic object now reports a *codec* rejection rather than the pickle error text 
   not change that — `mode=off` shares an address space too — and any claim that the pipe protects
   handler-to-handler integrity is false. The boundary drawn here is between admin code and the
   **engine**. Per-Handler confinement would need a worker per Handler.
-- **The child's stderr is inherited by the engine** (`stderr=None`), unframed and unparsed: a
-  sandboxed Handler that prints writes straight into the engine's log. That is a log-injection /
-  PHI-to-log surface, not a frame surface.
+- **The child's stderr is captured and relayed, no longer inherited** — closed by
+  [ADR 0176](0176-sandbox-child-stderr-is-captured-and-relayed-content-below-info.md)
+  (BACKLOG #343). It was `stderr=None`, so a sandboxed Handler that printed wrote unframed and
+  unattributed straight into the engine's log: a log-injection / PHI-to-log surface, not a frame
+  surface. It is now `stderr=PIPE` drained by a per-worker thread, attributed to the inbound and
+  worker generation, with content confined to `DEBUG` and a counted notice above it. **New residuals
+  include at least:**
+  fd 1 is still reachable by a raw writer (the codec plus the unsolicited-frame check remain the
+  control, not the `sys.stdout` rebind); an embedded host that never called `configure_logging` gets
+  relayed `DEBUG` content on whatever handlers it built, exactly as it does for any engine record; the
+  relay is the sole drainer, so a slow log handler becomes back-pressure on a `DEBUG`-level child; and
+  attribution is per worker generation, not per Handler — one worker serves all of an inbound's
+  Handlers.
 - **ADR 0072 tracing does not compose with `mode=subprocess`.** In `_accepted`/`route_only`/
   `transform_one` the sandbox branch precedes the tracer branch, so a traced dry-run produces no
   Router/Handler trace when the sandbox is on. It composes with `mode=off` as stated above.

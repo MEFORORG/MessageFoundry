@@ -12,12 +12,14 @@ answer a later dispatch, and the engine's code-set tables — not the child's ow
 
 from __future__ import annotations
 
+import logging
 import math
 import os
 import queue
 import signal
 import sys
 import time
+from collections.abc import Callable
 from pathlib import Path
 from types import MappingProxyType
 from typing import Any
@@ -29,6 +31,7 @@ from messagefoundry.config.response import CapturedResponse
 from messagefoundry.config.run_context import RunContext, run_contexts
 from messagefoundry.config.wiring import Registry, load_config
 from messagefoundry.pipeline import _sandbox_codec as codec
+from messagefoundry.pipeline import sandbox as sandbox_mod
 from messagefoundry.pipeline._sandbox_codec import (
     _Blobs,
     _Reader,
@@ -43,6 +46,7 @@ from messagefoundry.pipeline.sandbox import (
     SandboxMode,
     SandboxPolicy,
     SandboxSession,
+    _StderrRelay,
 )
 from messagefoundry.store.store import MessageStore
 
@@ -232,7 +236,9 @@ def _deliveries(registry: Registry, hname: str, **kw: object) -> list[tuple[str,
 def test_mode_off_session_is_byte_identical_and_never_spawns(graph: tuple[Registry, str]) -> None:
     registry, config_dir = graph
     ic = registry.inbound["IB_T"]
-    off = SandboxSession(SandboxPolicy(mode=SandboxMode.OFF), config_dir=config_dir, env=None)
+    off = SandboxSession(
+        SandboxPolicy(mode=SandboxMode.OFF), inbound="IB_T", config_dir=config_dir, env=None
+    )
     # Router + Handler go through the OFF branch (in-process) — identical to sandbox=None.
     assert route_only(registry, ic, RAW, sandbox=off, run_context=RunContext()) == route_only(
         registry, ic, RAW
@@ -253,6 +259,7 @@ def test_subprocess_parity_router_and_handler(graph: tuple[Registry, str]) -> No
 
     session = SandboxSession(
         SandboxPolicy(mode=SandboxMode.SUBPROCESS, wall_seconds=15.0),
+        inbound="IB_T",
         config_dir=config_dir,
         env=None,
     )
@@ -272,6 +279,7 @@ def test_forbidden_import_is_denied_and_worker_survives(graph: tuple[Registry, s
     registry, config_dir = graph
     session = SandboxSession(
         SandboxPolicy(mode=SandboxMode.SUBPROCESS, wall_seconds=15.0),
+        inbound="IB_T",
         config_dir=config_dir,
         env=None,
     )
@@ -294,6 +302,7 @@ def test_busy_loop_is_wall_capped_and_recovers(graph: tuple[Registry, str]) -> N
     registry, config_dir = graph
     session = SandboxSession(
         SandboxPolicy(mode=SandboxMode.SUBPROCESS, wall_seconds=1.0),
+        inbound="IB_T",
         config_dir=config_dir,
         env=None,
     )
@@ -319,6 +328,7 @@ def test_db_lookup_in_sandbox_fails_closed(graph: tuple[Registry, str]) -> None:
     registry, config_dir = graph
     session = SandboxSession(
         SandboxPolicy(mode=SandboxMode.SUBPROCESS, wall_seconds=15.0),
+        inbound="IB_T",
         config_dir=config_dir,
         env=None,
     )
@@ -336,6 +346,7 @@ def test_run_context_reaches_the_worker(graph: tuple[Registry, str]) -> None:
     registry, config_dir = graph
     session = SandboxSession(
         SandboxPolicy(mode=SandboxMode.SUBPROCESS, wall_seconds=15.0),
+        inbound="IB_T",
         config_dir=config_dir,
         env=None,
     )
@@ -387,6 +398,7 @@ async def test_subprocess_marshals_live_store_run_context(
         assert isinstance(transform_rc.state_view, MappingProxyType)
         session = SandboxSession(
             SandboxPolicy(mode=SandboxMode.SUBPROCESS, wall_seconds=15.0),
+            inbound="IB_T",
             config_dir=config_dir,
             env=None,
         )
@@ -435,9 +447,12 @@ def test_run_context_codec_snapshots_mappingproxy_views() -> None:
 # --- the IPC boundary itself (MFW2 codec) -------------------------------------
 
 
-def _session(config_dir: str, **kw: object) -> SandboxSession:
+def _session(config_dir: str, inbound: str = "IB_T", **kw: object) -> SandboxSession:
+    # The default lives in this TEST helper only, never in the production constructor, where a default
+    # would silently reinstate the unattributable relay ADR 0176 exists to close.
     return SandboxSession(
         SandboxPolicy(mode=SandboxMode.SUBPROCESS, wall_seconds=15.0),
+        inbound=inbound,
         config_dir=config_dir,
         env=None,
         **kw,  # type: ignore[arg-type]
@@ -1095,3 +1110,383 @@ def test_worker_kill_reaps_the_whole_process_tree(tmp_path: Path) -> None:
         if grandchild_pid is not None:
             _best_effort_kill_pid(grandchild_pid)
         session.close()
+
+
+# --- (e) child stderr is captured and relayed, content confined below INFO -----
+# BACKLOG #343 / ADR 0176. Two problems share one root: (a) a sandboxed Handler's line was
+# byte-indistinguishable from an engine line, and (b) a Handler that printed a message body wrote a
+# full payload into the general log. (b) is the one CLAUDE.md section 9 forbids, and the tests below
+# pin the property that closes it BY CONSTRUCTION: no call site above DEBUG carries child content.
+
+_STDERR_GRAPH = """
+import sys
+
+from messagefoundry import inbound, outbound, router, handler, MLLP, Send
+
+inbound("IB_ERR", MLLP(port=19341), router="r_err")
+outbound("OB_ERR", MLLP(host="127.0.0.1", port=19342))
+
+
+@router("r_err")
+def r_err(msg):
+    return "h_body"
+
+
+@handler("h_body")
+def h_body(msg):
+    # ADR 0176 (b): a Handler writing a full message body to stderr. Synthetic HL7 only.
+    print(str(msg), file=sys.stderr)
+    return Send("OB_ERR", "OK")
+
+
+@handler("h_ctrl")
+def h_ctrl(msg):
+    # A CR and an ANSI escape. Both must be neutralised, or one child write is not one log record.
+    sys.stderr.write("MEFOR_RELAY_MARKER\\x1b[31m\\rtail\\n")
+    sys.stderr.flush()
+    return Send("OB_ERR", "OK")
+
+
+@handler("h_raw_stdout")
+def h_raw_stdout(msg):
+    # A RAW write past the text layer the bootstrap rebind moves. WITH the rebind sys.stdout IS
+    # stderr, so this lands on fd 2 and the dispatch is unaffected. WITHOUT it, a COMPLETE forged
+    # frame reaches fd 1 ahead of the real answer and the parent decodes it as this dispatch's reply.
+    sys.stdout.buffer.write(b"\\x00\\x00\\x00\\x07garbage")
+    sys.stdout.buffer.flush()
+    return Send("OB_ERR", "OK")
+"""
+
+#: Writes 1 MiB to stderr at MODULE scope, i.e. inside ``load_config()`` -- before the child can write
+#: its boot reply. This is the deadlock ADR 0176 says the decision CREATES: a PIPE nobody drains blocks
+#: its writer once the OS buffer fills (order 64 KiB).
+_FLOOD_GRAPH = """
+import sys
+
+from messagefoundry import inbound, outbound, router, handler, MLLP, Send
+
+sys.stderr.write("x" * (1024 * 1024) + "\\n")
+sys.stderr.flush()
+
+inbound("IB_FLOOD", MLLP(port=19343), router="r_flood")
+outbound("OB_FLOOD", MLLP(host="127.0.0.1", port=19344))
+
+
+@router("r_flood")
+def r_flood(msg):
+    return "h_flood_ok"
+
+
+@handler("h_flood_ok")
+def h_flood_ok(msg):
+    return Send("OB_FLOOD", "OK")
+"""
+
+
+def _stderr_graph(tmp_path: Path) -> tuple[Registry, str]:
+    (tmp_path / "graph.py").write_text(_STDERR_GRAPH, encoding="utf-8")
+    return load_config(tmp_path), str(tmp_path)
+
+
+def _notices(caplog: pytest.LogCaptureFixture) -> list[logging.LogRecord]:
+    """The relay's attributed count records -- identity and counts, never content."""
+    return [
+        r
+        for r in list(caplog.records)
+        if r.levelno == logging.WARNING and "wrote to stderr" in r.getMessage()
+    ]
+
+
+def _content_records(caplog: pytest.LogCaptureFixture) -> list[logging.LogRecord]:
+    return [r for r in list(caplog.records) if r.getMessage().startswith("sandbox stderr [")]
+
+
+def _await(predicate: Callable[[], bool], timeout: float = 10.0) -> bool:
+    """Poll ``predicate`` to a deadline. The relay is a THREAD, so a record it emits is not ordered
+    against the dispatch that provoked it; and polling inside the test body keeps the assertion clear
+    of conftest's teardown quiescing of the ``messagefoundry`` logger."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        time.sleep(0.05)
+    return False
+
+
+def test_at_info_a_printed_message_body_never_reaches_a_log_record(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """THE section 9 property, end to end through a real spawned worker.
+
+    A Handler prints the whole message to stderr. At INFO the operator must learn THAT the inbound's
+    Handler wrote to stderr -- attributed, with a count -- and must not receive one byte of the body.
+
+    FALSIFICATION, and it is worth recording precisely because it took two edits rather than one: the
+    property is held by two INDEPENDENT mechanisms, and breaking either alone leaves it standing.
+    Deleting the ``log.isEnabledFor(logging.DEBUG)`` guard changes nothing while the only content call
+    site is ``log.debug``; raising that call site to ``log.info`` changes nothing while the guard
+    stands. Break BOTH and this goes red with ``DOE^JANE`` in a record at INFO (measured)."""
+    registry, config_dir = _stderr_graph(tmp_path)
+    caplog.set_level(logging.INFO)
+    session = _session(config_dir, inbound="IB_ERR")
+    try:
+        assert _deliveries(registry, "h_body", sandbox=session, run_context=RunContext()) == [
+            ("OB_ERR", "OK")
+        ]
+        assert _await(lambda: bool(_notices(caplog))), "no attributed stderr notice was emitted"
+    finally:
+        session.close()
+
+    notice = _notices(caplog)[0]
+    assert "IB_ERR" in notice.getMessage(), "the notice does not attribute the line to its inbound"
+    assert not _content_records(caplog), "child stderr CONTENT was relayed at INFO"
+    joined = "\n".join(r.getMessage() for r in caplog.records)
+    for token in ("DOE", "JANE", "900001", "ADT^A01"):
+        assert token not in joined, f"{token!r} from a printed message body reached a log at INFO"
+
+
+def test_at_debug_content_is_relayed_attributed_and_control_scrubbed(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The diagnosability half: at DEBUG the operator does get the content, attributed to the inbound,
+    the child pid and the worker generation, with control bytes neutralised so one child write cannot
+    become two log lines or drive a terminal.
+
+    ``caplog``'s handler carries NO filters, so what this measures is the relay's OWN scrub -- which is
+    the point: that scrub is the relay's framing contract and must not depend on how the host process
+    configured logging. Redaction is deliberately NOT asserted here; it is a property of the engine's
+    handlers, which ``caplog`` does not install.
+
+    FALSIFICATION: remove the ``scrub_control_chars`` call in ``_StderrRelay._line`` and the raw ESC/CR
+    assertions below fail."""
+    registry, config_dir = _stderr_graph(tmp_path)
+    caplog.set_level(logging.DEBUG)
+    session = _session(config_dir, inbound="IB_ERR")
+    try:
+        assert _deliveries(registry, "h_ctrl", sandbox=session, run_context=RunContext()) == [
+            ("OB_ERR", "OK")
+        ]
+        assert _await(
+            lambda: any("MEFOR_RELAY_MARKER" in r.getMessage() for r in _content_records(caplog))
+        ), "the child's stderr line was not relayed at DEBUG"
+    finally:
+        session.close()
+
+    line = next(r for r in _content_records(caplog) if "MEFOR_RELAY_MARKER" in r.getMessage())
+    message = line.getMessage()
+    assert "IB_ERR" in message and "pid " in message and "gen " in message, message
+    assert "\x1b" not in message and "\r" not in message, "a raw control byte survived the relay"
+    assert "\\x1b" in message and "\\r" in message, "the control bytes were dropped, not escaped"
+    assert "tail" in message, "the text after the CR was lost instead of being kept on one record"
+
+
+def test_a_raw_write_to_fd_1_cannot_forge_a_frame_because_stdout_is_rebound(
+    tmp_path: Path,
+) -> None:
+    """ADR 0176 D3, the adjacent defect closed with the same fd discipline.
+
+    The Handler writes a COMPLETE forged frame through ``sys.stdout.buffer``. With the bootstrap rebind
+    ``sys.stdout`` is stderr, so those bytes go to fd 2 and the dispatch answers normally. Without it
+    they reach fd 1 ahead of the real reply and the parent decodes garbage as this dispatch's answer --
+    deterministic, unlike a bare ``print()``, whose survival today is the buffering luck the item names.
+
+    FALSIFICATION: delete the ``_redirect_stdout_to_stderr()`` call in ``_sandbox_worker.main`` and this
+    raises ``SandboxError`` instead of delivering."""
+    registry, config_dir = _stderr_graph(tmp_path)
+    session = _session(config_dir, inbound="IB_ERR")
+    try:
+        assert _deliveries(registry, "h_raw_stdout", sandbox=session, run_context=RunContext()) == [
+            ("OB_ERR", "OK")
+        ]
+    finally:
+        session.close()
+
+
+def test_a_bootstrap_stderr_flood_does_not_wedge_the_spawn(tmp_path: Path) -> None:
+    """The deadlock this change CREATES, and the ordering that closes it.
+
+    Config module scope writes 1 MiB to stderr, so the flood happens inside ``load_config()`` -- before
+    the boot reply. ``startup_seconds`` is deliberately short so a regression fails fast instead of
+    eating the 60s pytest-timeout budget.
+
+    FALSIFICATION: move the drain-thread start below the point where the boot **reply** is read in
+    ``_spawn`` and this hangs to ``startup_seconds`` and raises ``SandboxError``.
+
+    NOT below the boot-frame WRITE, which is what this said first and is measurably wrong: starting
+    the drain immediately after the write does NOT wedge, because the parent then blocks on the reply
+    while the drain is already running (ADR 0176 records the measurement). A falsification that does
+    not falsify is worse than none -- it reads as a checked escape hatch, and the one person who
+    follows it concludes the guard is untestable rather than that the instruction was wrong."""
+    (tmp_path / "graph.py").write_text(_FLOOD_GRAPH, encoding="utf-8")
+    session = SandboxSession(
+        SandboxPolicy(mode=SandboxMode.SUBPROCESS, wall_seconds=15.0, startup_seconds=10.0),
+        inbound="IB_FLOOD",
+        config_dir=str(tmp_path),
+        env=None,
+    )
+    try:
+        started = time.monotonic()
+        session._spawn()  # the whole bootstrap: boot frame -> load_config() -> ready reply
+        assert time.monotonic() - started < 10.0
+        assert session._proc is not None
+    finally:
+        session.close()
+
+
+def test_the_relay_thread_ends_when_the_worker_tree_is_reaped(tmp_path: Path) -> None:
+    """A second drain thread is a second teardown obligation (ADR 0176), and it is EOF-driven.
+
+    Reuses the orphan graph so a GRANDCHILD also holds fd 2 -- which is the case the EOF argument
+    actually rests on, since the immediate worker dying is not enough to close a pipe another process
+    still holds. Nothing signals the thread and nothing closes the pipe: the tree reap EOFs fd 2 and the
+    drain returns.
+
+    FALSIFICATION: force ``_assign_kill_on_close_job`` to return ``None`` (the BACKLOG #342
+    falsification) and the grandchild survives, fd 2 never EOFs, and this thread stays alive."""
+    registry, config_dir, pidfile = _orphan_graph(tmp_path)
+    session = _session(config_dir, inbound="IB_ORPH")
+    grandchild_pid: int | None = None
+    try:
+        assert _deliveries(registry, "h_orphan", sandbox=session, run_context=RunContext()) == [
+            ("OB_O", "SPAWNED")
+        ]
+        grandchild_pid = int(pidfile.read_text())
+        relay = next(t for t in session._threads if t.name.startswith("mf-sandbox-stderr-"))
+        assert relay.name == "mf-sandbox-stderr-IB_ORPH-1", relay.name
+        assert relay.is_alive()
+
+        session._kill(session._proc)
+        assert _await(lambda: not relay.is_alive()), (
+            "the stderr relay thread outlived the worker tree reap -- fd 2 never reached EOF"
+        )
+    finally:
+        if grandchild_pid is not None:
+            _best_effort_kill_pid(grandchild_pid)
+        session.close()
+
+
+def test_notices_carry_a_generation_so_a_recycled_pid_cannot_confuse_two_workers(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Attribution is per worker GENERATION, not per pid.
+
+    A stale generation's relay can still be draining a killed child while the live one runs, and an OS
+    recycles pids -- so ``(inbound, pid)`` alone can make two generations' records byte-identical, which
+    is the very defect this change exists to fix. Also pins that the second generation's counters start
+    clean rather than inheriting the first's.
+
+    FALSIFICATION: hoist the relay's counters onto the session and generation 2's running total is
+    inflated by generation 1's lines."""
+    registry, config_dir = _stderr_graph(tmp_path)
+    caplog.set_level(logging.INFO)
+    session = _session(config_dir, inbound="IB_ERR")
+    try:
+        _deliveries(registry, "h_ctrl", sandbox=session, run_context=RunContext())
+        assert _await(lambda: len(_notices(caplog)) >= 1)
+        session._kill(session._proc)  # forces a fresh generation on the next dispatch
+        _deliveries(registry, "h_ctrl", sandbox=session, run_context=RunContext())
+        assert _await(lambda: len(_notices(caplog)) >= 2)
+    finally:
+        session.close()
+
+    generations = [_arg(r, 2) for r in _notices(caplog)]
+    assert generations[:2] == [1, 2], generations
+    second = next(r for r in _notices(caplog) if _arg(r, 2) == 2)
+    assert _arg(second, 4) == 1, (
+        "generation 2's running total inherited generation 1's lines -- the counters are shared"
+    )
+
+
+# --- the relay in isolation (no spawn) ----------------------------------------
+
+
+def _arg(record: logging.LogRecord, index: int) -> int:
+    """One positional ``%``-arg off a relay record, as an int. The notice reports identity and counts
+    as discrete args precisely so a test can read them without parsing prose."""
+    assert isinstance(record.args, tuple)
+    value = record.args[index]
+    assert isinstance(value, int)
+    return value
+
+
+def _relay() -> _StderrRelay:
+    return _StderrRelay("IB_U", 4242, 7)
+
+
+def test_the_notice_is_rate_limited_and_reports_every_suppressed_line(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The notice is what an operator at INFO gets INSTEAD of content, so it must not become the flood
+    it reports -- and a throttled line must be COUNTED, never silently dropped (the count-and-log
+    invariant applied to the relay's own records).
+
+    FALSIFICATION: remove the window check in ``_notice`` and 500 lines produce 500 notices."""
+    monkeypatch.setattr(sandbox_mod, "_STDERR_NOTICE_SECONDS", 3600.0)
+    caplog.set_level(logging.INFO)
+    relay = _relay()
+    relay.feed(b"line\n" * 500)
+    relay.close()
+
+    notices = _notices(caplog)
+    assert 1 <= len(notices) <= 2, f"{len(notices)} notices for one throttle window"
+    counted = sum(_arg(r, 3) for r in notices)
+    assert counted == 500, f"{counted} lines reported, 500 written -- suppressed lines were dropped"
+
+
+def test_the_line_cap_bounds_a_record_without_discarding_a_byte(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The cap is a MEMORY bound on the parent, never a redaction -- which is what distinguishes it
+    from the per-line byte cap ADR 0176 rejected. Reaching it splits one write across several records
+    and discards nothing. (The rejected cap would have kept MSH and PID and thrown the rest away: the
+    worst available redaction for an HL7 v2 payload, since that is precisely the identifying part.)"""
+    caplog.set_level(logging.DEBUG)
+    cap = sandbox_mod._STDERR_LINE_CAP
+    relay = _relay()
+    relay.feed(b"X" * (3 * cap))
+    relay.close()
+
+    records = _content_records(caplog)
+    assert records, "nothing was relayed at DEBUG"
+    for record in records:
+        assert isinstance(record.args, tuple)
+        text = record.args[3]
+        assert isinstance(text, str) and len(text) <= cap
+    total = sum(r.getMessage().count("X") for r in records)
+    assert total == 3 * cap, f"{total} bytes relayed of {3 * cap} written -- the cap DISCARDED"
+
+    # A terminator landing exactly ON the bound is a complete cap-length line, not an over-length run:
+    # one record, and no spurious empty one behind it.
+    caplog.clear()
+    boundary = _relay()
+    boundary.feed(b"Y" * cap + b"\n")
+    boundary.close()
+    exact = _content_records(caplog)
+    assert len(exact) == 1, [r.getMessage()[:60] for r in exact]
+    assert exact[0].getMessage().count("Y") == cap
+
+
+def test_the_relay_survives_hostile_bytes_and_a_dead_pipe(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The relay is the sole drainer, so it must never raise out of ``run()``: an escaping exception
+    ends the drain, and an undrained pipe blocks the child. Covers a multi-byte character split across
+    two reads, invalid UTF-8, an embedded NUL, and an ``OSError`` mid-read."""
+    caplog.set_level(logging.DEBUG)
+    relay = _relay()
+    relay.feed(b"caf\xc3")  # a UTF-8 sequence split across the read boundary
+    relay.feed(b"\xa9\n")
+    relay.feed(b"\xff\xfe bad utf-8\n")
+    relay.feed(b"nul\x00here\n")
+    relay.close()
+
+    joined = "\n".join(r.getMessage() for r in _content_records(caplog))
+    assert "café" in joined, "a character split across two reads was corrupted"
+    assert "bad utf-8" in joined  # decoded with replacement rather than raising
+    assert "\x00" not in joined and "\\x00" in joined, "a raw NUL survived the relay"
+
+    class _Exploding:
+        def read(self, _n: int) -> bytes:
+            raise OSError("pipe died with the worker")
+
+    _StderrRelay("IB_U", 1, 1).run(_Exploding())  # type: ignore[arg-type]

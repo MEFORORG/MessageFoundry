@@ -856,8 +856,19 @@ now reaps its whole process tree (a Windows kill-on-close job object / a POSIX p
 a grandchild no longer outlives the kill (BACKLOG #342). That reap is best-effort process hygiene: what
 makes a stray frame *harmless* is still the codec plus the request-answer binding (a live grandchild can
 force a respawn, i.e. dead-letter messages on that inbound, but nothing more), not the process teardown.
-The child's **stderr is inherited by the engine**, so a
-Handler that prints goes into the engine's log unparsed and un-redacted. ADR 0072 Router/Handler
+The child's **stderr is captured by the engine, not inherited** (ADR 0176): a Handler that prints is
+relayed into the engine's log attributed to the inbound, the child pid and the worker generation, with
+**the content itself only at `DEBUG`**. At `INFO` and above you get a rate-limited `WARNING` naming the
+inbound and counting the lines, and no content — that is deliberate, and it is how the never-log-bodies
+rule is kept when a Handler prints a message body. To read what a Handler actually wrote, set
+`[logging].level = "DEBUG"`, and treat that log as PHI-bearing while you do. Two things that will
+surprise you otherwise: raising the level shows every `print` and raw write **plus** the child's own
+`WARNING`+ records, but never the child's own `DEBUG`/`INFO` records — the worker's root logger is
+pinned at `WARNING` when it starts and no knob plumbs a level into it (an unfiled follow-up, named by
+subject rather than by a number that does not exist yet). And because that one relay thread is also
+what keeps the child's stderr pipe from filling, a slow log handler — an off-box `[logging].forward_*`
+collector that has stalled, say — becomes back-pressure on a `DEBUG`-level child rather than lost
+output. ADR 0072 Router/Handler
 tracing does not compose with `mode=subprocess` (the sandbox branch precedes the tracer branch), and a
 `mode=subprocess` graph cannot use the ADR-0071 fused thread-hop path (it is hard-disabled).
 

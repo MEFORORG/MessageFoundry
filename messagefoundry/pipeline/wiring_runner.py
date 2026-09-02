@@ -2646,7 +2646,11 @@ class RegistryRunner:
             # The engine's code-set tables travel once per spawn in the boot frame (not per dispatch),
             # so the child serves exactly what mode=off would rather than its own re-read of codesets/.
             session = SandboxSession(
-                policy, config_dir=cfg_dir, env=env, code_sets=self.registry.code_sets
+                policy,
+                inbound=name,  # attributes the child's relayed stderr to this feed (ADR 0176)
+                config_dir=cfg_dir,
+                env=env,
+                code_sets=self.registry.code_sets,
             )
             self._sandbox_sessions[name] = session
         return session

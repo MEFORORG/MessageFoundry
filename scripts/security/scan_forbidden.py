@@ -11,17 +11,21 @@ Why a custom scanner in addition to gitleaks: gitleaks finds *secrets* (keys/tok
 *customer-identifying* strings -- a partner/vendor name, a real site-estate's site-code prefix, a
 routable host IP -- which are not credentials but must never reach the open-source repo.
 
-Token authority is EXTERNALIZED. The committed source carries only STRUCTURAL detectors (a routable-
-IPv4 detector and the generic site-code *shape*); the real customer/vendor name patterns, estate
-substrings, and the site-code numeric prefix are loaded at runtime from, in order of precedence:
+Token authority is EXTERNALIZED. The committed source carries only STRUCTURAL detectors -- at least a
+routable-IPv4 detector, a worktree/branch slug detector, an absolute-home-path detector and the
+prefix-free estate-identifier *shape*; the real customer/vendor name patterns, estate substrings, and
+the site-code numeric prefix are loaded at runtime from, in order of precedence:
 
   1. ``MEFOR_FORBIDDEN_TOKENS`` -- either a path to a token file OR the token content inline
      (newline-separated, same format). Used in CI via the Actions secret of the same name.
   2. ``scripts/security/scan-tokens.local.txt`` -- a git-ignored local file (pre-commit). A synthetic
      template ships as ``scan-tokens.local.txt.example``.
 
-With no source present the scanner degrades to STRUCTURAL-ONLY (routable-IPv4 only); the name /
-estate / site-code detectors are simply empty -- appropriate for a fork with no access to the secret.
+With no source present the scanner degrades to STRUCTURAL-ONLY (the shape detectors above stay live);
+the name / estate / site-code detectors are simply empty -- appropriate for a fork with no access to
+the secret. STRUCTURAL-ONLY IS NOT A CLASS-LEVEL CLEAN: the shape detectors catch a *shape*, so a
+green structural-only run says nothing about a partner/vendor name, or about a site code carried in
+prose, in a hyphenated name, or in an HL7 field. Only a loaded token source covers those.
 Set ``MEFOR_REQUIRE_TOKENS=1`` to fail closed (exit 2) instead when the source is absent, so a
 misconfigured owner/CI run refuses rather than silently under-scanning.
 
@@ -188,6 +192,60 @@ _HOME_PATH = re.compile(
     r"[A-Za-z][A-Za-z0-9._-]*"
 )
 
+# Ported-estate identifier SHAPE. The site-code detectors below are keyed on a numeric PREFIX loaded
+# from the token source, so they are _NEVER until the owner adds that estate's prefix -- and an estate
+# whose prefix nobody has added yet is exactly the one that leaks. Measured on this repo's own history:
+# a required merge context exited 0 on a tracked file carrying a real site code, because the file WAS
+# scanned and the loaded detectors simply did not cover that prefix (BACKLOG #321). This one is keyed
+# on STRUCTURE, so like the two detectors above it fires with no token source at all -- a backstop
+# rather than a second thing waiting on the owner.
+#
+# The UNDERSCORE ANCHOR is the entire design, and it is what keeps a required gate from crying wolf.
+# A bare delimited six-digit run matches 1,414 lines across 152 tracked files (HL7 samples, DMV soak
+# rows, benchmark artifacts, lock files) -- counted over EVERY scanned file, which is the population
+# this detector actually sees, since unlike the site-code detectors below it is not skip-gated. (The
+# skip-gated population is 638/145; quoting that number for an ungated detector would be an
+# instrument that answers the adjacent question.) Requiring the run to join a LETTER-BEARING
+# identifier segment takes that to 5, every one of them this gate's own illustration of the shape,
+# and to 0 once those five adopt the house placeholder. That is the
+# form the class actually takes here -- the [TYPE]_[PARTNER]_[MESSAGE] connection convention
+# (docs/CONNECTIONS.md) and the Corepoint PT_* pattern both produce it, and so did both identifiers
+# the #321 audit found -- replayed against the content that got through, this fires on it and on no
+# other line of that file.
+#
+# WIDTH IS PINNED AT SIX because that is what the format yields -- a site code is a numeric prefix
+# plus four digits (see _SITE_CODE_FILE below) over the two-digit prefix space the anonymizer models
+# (anon/surrogates.py builds non-site prefixes from range(10, 100)). Measured either side: five digits
+# collides with the harness's zero-padded connection names (IB_CS_00000 and siblings, three files),
+# seven matches nothing at all. A leading-zero carve-out would buy the width-5 band back, and is
+# deliberately NOT taken: it is a silent under-detection hole in a gate whose filed defect is an
+# unnoticed blind spot, and the one line it would have rescued is a docstring example that the house
+# placeholder convention fixes instead.
+#
+# HYPHEN IS EXCLUDED, measured: the same shape joined by "-" re-admits 11 hits across 6 files, every
+# one a false positive (a dated OASIS namespace quoted in security-critical code, a CFR citation, a
+# sandbox depth constant, a synthetic MRN).
+#
+# NOT gated on the _SITE_SKIP_* sets, unlike the site-code detectors. Their skip exists because BARE
+# digit runs storm in lock/SVG/password files; the anchor already removes that storm (measured: zero
+# matches across those files), so the skip would only open a hole -- a flame-graph SVG's frame labels
+# are function names, and a transform function name is one of the two forms this exists for.
+_ESTATE_ID_SHAPE = re.compile(
+    r"(?<![A-Za-z0-9.])"
+    # Arm 1, code-trailing: `PT_<code>_ADT`, `IB_FEED_<code>.py`. The trailing lookahead permits `.`
+    # so a module filename written in prose is not waved through, but still pins the run at exactly
+    # six digits.
+    r"(?:[A-Za-z][A-Za-z0-9]*_\d{6}(?![A-Za-z0-9])"
+    # Arm 2, code-leading: `<code>_router.py`. It also rescues a segment arm 1 cannot reach, because
+    # the segment before the code starts with a digit (`IB_2ND_<code>_MFN`). No trailing lookahead:
+    # the following segment must merely CONTAIN a letter, which is what rejects `1_000000_2`.
+    r"|\d{6}_[A-Za-z0-9]*[A-Za-z])"
+)
+#: Shared so the content hit and the file-name hit are one grep, and so the reason describes the SHAPE
+#: rather than asserting the class: this cannot tell a site code from a coincidental six-digit segment,
+#: and a reason reading "site code" would make a green run read as "no site codes here".
+_ESTATE_ID_REASON = "six-digit run inside an underscore-joined identifier"
+
 # A pattern that can never match -- the "detector off" sentinel used for the site-code regexes when no
 # numeric prefix is loaded (structural-only / fork context). ``(?!)`` is an always-failing assertion,
 # so ``.search``/``.finditer``/``.fullmatch`` never fire and ``.pattern`` stays a valid string.
@@ -334,9 +392,12 @@ FORBIDDEN: list[tuple[re.Pattern[str], str]] = []
 ESTATE_TOKENS: tuple[str, ...] = ()
 SITE_CODE_RE: re.Pattern[str] = _NEVER
 #: Boundary-aware site-code FILE detector: fires on a code delimited by non-alphanumerics
-#: (``PT_990123_ADT`` -> matches) but NOT on the prefix embedded in a longer alphanumeric run
+#: (``PT_<site>_ADT`` -> matches) but NOT on the prefix embedded in a longer alphanumeric run
 #: (a SHA, a DOB, a dotted version), so the broad-substring false-positive storm does not happen on
-#: source files. ``.`` is a boundary exclusion too (a real site code is never dot-adjacent).
+#: source files. ``.`` is a boundary exclusion too (a real site code is never dot-adjacent). The
+#: example above uses the house ``<site>`` placeholder rather than a digit run, because a concrete one
+#: written here trips ``_ESTATE_ID_SHAPE``; the digit-level contrast is demonstrated instead by
+#: ``tests/test_scan_forbidden.py::test_scan_file_site_code_ignores_embedded_digit_runs``.
 _SITE_CODE_FILE: re.Pattern[str] = _NEVER
 #: The site-code detectors above match a prefix followed by four LITERAL digits. But the SECRET IS THE
 #: PREFIX, not any particular code, so a doc or comment that writes the PATTERN itself -- the prefix
@@ -766,12 +827,19 @@ def token_floor_failure(min_detectors: int | dict[str, int] | None = None) -> st
 #: Benign strings an allowlist entry must NOT match. An entry that matches any of these is broad
 #: enough to veto ordinary source lines, and therefore broad enough to switch the gate off wholesale.
 #: The empty string is included so a pattern that can match nothing-in-particular is caught too.
+#: The last entry is the canary for ``_ESTATE_ID_SHAPE``. ``0123456789`` rejects a bare ``\d{6}``, but
+#: it carries no underscore, so it ACCEPTED ``_\d{6}`` / ``\d{6}_`` -- an entry that narrow-looking
+#: would veto every line joining a digit run to an identifier segment, switching the whole gate off on
+#: those lines while the loaded-counts diagnostic still read healthy. This canary is a dated release
+#: tag: an eight-digit run, so no six-digit window has a boundary on both sides and it can therefore
+#: never be a site code under ANY prefix list -- it tests allowlist BREADTH without becoming a hit.
 _ALLOWLIST_CANARIES: tuple[str, ...] = (
     "",
     "the quick brown fox jumps over the lazy dog",
     "def handler(message: Message) -> list[Send]:",
     "# a perfectly ordinary comment",
     "0123456789",
+    "v_20260814_rc",
 )
 
 
@@ -909,12 +977,26 @@ def scan_file(path: Path, rel_posix: str | None = None, *, show_context: bool = 
     # inside it. Scanning stops here; content hits on a file that must not exist add nothing.
     if reason := forbidden_path_reason(posix):
         return [f"{path}:0: {reason}"]
+    hits: list[str] = []
+    # The NAME is half of what #321 found: one of the two leaked identifiers was a feed module's
+    # filename, and a module need not repeat its own name in its text. Placed before the binary
+    # early-return for the same reason the location rule above is -- a DICOM or PDF sample named with
+    # a site code is exactly as much of a leak as the .py beside it, and _read_text drops binaries
+    # unread. Line 0 because the finding is the file, not a location inside it. Unlike a location-rule
+    # hit this does NOT stop the scan: the content still has to be judged.
+    #
+    # This one hit necessarily carries the offending string, because the string is the path and every
+    # hit names its path. That is not a new disclosure -- by the time CI scans it the file is already
+    # in the public tree and in the PR's file list, and at pre-commit time nothing is public yet -- but
+    # it is why the remedy is renaming the file, not an ALLOWLIST line: the allowlist is a per-line
+    # content veto and cannot reach this, exactly as it cannot reach the location rule.
+    if _ESTATE_ID_SHAPE.search(posix):
+        hits.append(f"{posix}:0: {_ESTATE_ID_REASON}, in the file NAME")
     text = _read_text(path)
     if text is None:
-        return []
+        return hits
     ip_scan = path.suffix not in _IP_SKIP_SUFFIXES and path.name not in _IP_SKIP_NAMES
     site_scan = path.suffix not in _SITE_SKIP_SUFFIXES and path.name not in _SITE_SKIP_NAMES
-    hits: list[str] = []
     for lineno, line in enumerate(text.splitlines(), 1):
         if any(a.search(line) for a in ALLOWLIST):
             continue
@@ -954,6 +1036,12 @@ def scan_file(path: Path, rel_posix: str | None = None, *, show_context: bool = 
         if any(p.search(line) for p in _RECORD_PAIR):
             hits.append(
                 f"{posix}:{lineno}: security-record content (requirement id beside a verdict)"
+            )
+        # Reason-only for the same reason as the two above, and NOT ``ctx``-appended even under
+        # show_context: the identifier IS the disclosure.
+        if _ESTATE_ID_SHAPE.search(line):
+            hits.append(
+                f"{posix}:{lineno}: {_ESTATE_ID_REASON} (the ported-estate site-code shape)"
             )
         # Estate substrings run LAST and only on a line nothing else flagged: the sets overlap (the
         # customer name is typically in [names] AND [estate]), and double-reporting one line adds noise

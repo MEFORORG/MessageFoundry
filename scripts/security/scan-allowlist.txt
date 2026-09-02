@@ -8,7 +8,7 @@
 # print "<WAIT_TYPE>  <wait_time_ms> ms  <waiting_tasks_count> tasks". A task count that lands in the
 # site-code range (e.g. WRITELOG ... 993496 tasks) collides with the site-code guard (99\d{4}) despite
 # being a pure engine perf counter with no customer-data path. This row shape is unambiguous DMV output,
-# so a real site code embedded in a path/HL7 field/prose (PT_990700_ADT, ^993496^) does NOT match it.
+# so a real site code embedded in a path/HL7 field/prose (PT_<site>_ADT, ^<site>^) does NOT match it.
 ^\s*[A-Z0-9_]+\s+\d+ ms\s+\d+ tasks\s*$
 
 # OIDC Core spec-section citations in the federated-SSO claim ladder (ADR 0142) read as dotted
@@ -17,3 +17,17 @@
 # reworded. Anchored to the literal 'OIDC core <section>/<rule>' shape, so a real routable IP
 # elsewhere in claims.py (or anywhere else) still trips the scan.
 OIDC core \d+(?:\.\d+)+/\d+
+
+# Generated password-wordlist entries in messagefoundry/auth/data/common_passwords.txt that collide
+# with the estate-identifier SHAPE (a six-digit run joined to a letter-bearing segment). Nine lines
+# on main at 6e758a87; none is a site code. Seven are the wordlist's own ABUSE_<digits>_ABUSE
+# abuse-report markers, two are ordinary user passwords of the form word_word_<6 digits>.
+#
+# ALLOWLISTED RATHER THAN SKIPPING THE FILE, deliberately. tests/test_scan_tokens_source.py::
+# test_estate_identifier_shape_is_not_gated_by_the_site_skip_suffixes pins that this detector DOES
+# scan lock/SVG/password files, because a transform function name (`xform_<code>_to_erp_mfn`) inside
+# one is exactly as much of a leak as anywhere else. A file-level skip would buy the same green and
+# blind that case; these entries excuse only the shapes actually present.
+^ABUSE_\d{6}_ABUSE$
+^lky_vipnyc_\d{6}$
+^dungklose_\d{6}$

@@ -3131,6 +3131,13 @@ Wall time (the cleaner signal — all three still ingest everything up to 300/s)
 
 ## 321. Leak gate is blind to the ported-estate site-code and partner-product token class
 
+> **PARTIAL 2026-08-26 (lander), NOT A CLOSURE -- this item stays OPEN.** Ships Proposed 3, the
+> prefix-free estate-identifier shape backstop (`_ESTATE_ID_SHAPE` in `scan_forbidden.py`), scanning
+> for the six-digit-run-inside-an-identifier shape independent of any loaded prefix. **What is NOT
+> done: Proposed 1, the owner-run token data** across the private file and the Actions + Dependabot
+> secret stores -- that half is owner-only and cannot be verified from any checkout. Proposed 2
+> (detector coverage against the loaded token set, not a monkeypatched one) is a separate PR.
+
 > 🔢 **Re-scored 2026-08-20 -> P2.** Value **7/10** · Difficulty **3/10** · _quick win_. Both halves the 2026-08-03 amendment left standing are still standing: no prefix-free shape backstop exists (scan_forbidden.py:568-570 derives every site-code detector from loaded prefixes and degrades to _NEVER at :574-576), and the token data is owner-run and unverifiable from this checkout. A required merge context that is blind to a live token class is a real gap, and the remainder is one structural regex plus a negative test plus an owner data edit. _(was 7/10 · 3/10.)_
 >
 > **Filed 2026-08-01 — not started.** A required merge context exited 0 on content carrying a real site code and a partner product name, with no compensating control (`scan_forbidden.py:10-12` is explicit that gitleaks finds secrets, not this class) and nothing stopping the next estate-derived identifier landing the same way; `.md` is not in `_SITE_SKIP_SUFFIXES` (`scan_forbidden.py:119`, `{".lock", ".svg"}`) so the file was scanned — the fix is owner-run token data across the private file plus the Actions *and* Dependabot secret stores, a negative test per class, and optionally a structural shape backstop.
@@ -3173,6 +3180,15 @@ Note the item is **not** "the scanner is broken" — it is that the token *sourc
 ---
 
 ## 328. `audit-verify` cannot detect a truncated audit tail
+
+> **PARTIAL 2026-08-26 (lander), NOT A CLOSURE -- this item stays OPEN.** Ships the monotonic-prefix
+> comparator this item names as the prerequisite ("a seal-on-stop / check-on-start design (or a
+> monotonic-prefix comparator) before it is worth wiring"), on all three store backends -- SQLite,
+> Postgres and SQL Server -- plus the Store protocol. **What is NOT done: the three-file startup
+> wiring** (`config/settings.py`, `pipeline/engine.py`, `api/app.py`'s `create_managed_app`) that
+> would actually consume it as an `[integrity]` anchor key. Verified before this note: `store.py`,
+> `base.py`, `postgres.py` and `sqlserver.py` all carry the comparator; none of the three named
+> wiring files is touched by the commits this note rides with.
 
 > 🚧 **Re-scored 2026-08-20 -> P2.** Value **5/10** · Difficulty **4/10** · _fill-in_. The operator-runnable half landed, so a compliance job can snapshot and compare an anchor, but the automatic startup check at pipeline/engine.py:860 remains truncation-blind because no [integrity] anchor key exists at config/settings.py:3285-3309. Value 5 because the CLI path is a workable substitute for the automatic one; difficulty 4 because the exact point-in-time seal has to be replaced by a seal-on-stop or monotonic-prefix comparator before the three-file plumb through settings, engine and create_managed_app is worth wiring, and a prefix comparator lands on all three store backends. _(previously unscored.)_
 >
@@ -3462,9 +3478,24 @@ What is NOT settled is the mechanism. Two independent passes reached different a
 
 ## 343. Sandbox child stderr is inherited unframed into the engine log stream
 
-> 🚧 **Re-scored 2026-08-20 -> P3.** Value **4/10** · Difficulty **3/10** · _fill-in_. Both named problems survive: attribution, because stderr=None (sandbox.py:446) leaves child lines indistinguishable from engine lines, and the print() PHI path, because the #1054 filter installed at _sandbox_worker.py:49 is a property of the logging handler only. Value 4 given the same-admin threat model and no product-facing surface; difficulty 3 because the fix is stderr=subprocess.PIPE plus a relay thread mirroring the existing stdout reader, plus a bootstrap redirect of the child's sys.stdout away from the frame fd. _(was 4/10 · 3/10.)_
->
-> **Status OPEN (filed 2026-08-01).** The worker is spawned with `stderr=None` ([pipeline/sandbox.py:266](../messagefoundry/pipeline/sandbox.py)), so the child's stderr is the **engine's own stderr**, unframed and unattributed. fd 1 is the IPC channel and is strictly framed; fd 2 has no such discipline. Admin-authored Handler code can therefore write arbitrary bytes straight into the engine's log stream — including forged log lines, ANSI control sequences, or content that breaks whatever consumes those logs (NSSM captures stdout/stderr to files; see [docs/SERVICE.md](SERVICE.md)).
+> ✅ **SHIPPED 2026-08-26 (lander).** Matches the item's own "Fix direction" exactly: `stderr=PIPE`
+> plus a dedicated reader thread relaying through the engine's stdlib logger, attributed to the
+> inbound + worker generation and rate-limited; content at DEBUG only, an attributed rate-limited
+> NOTICE at INFO+ with no content, satisfying CLAUDE.md section 9 by construction rather than
+> operator discipline. The adjacent stdout-landmine the item names is closed in the same change:
+> the worker rebinds `sys.stdout` to fd 2 at bootstrap, after the frame writer captures its raw
+> handle and before `load_config()` runs untrusted code. ADR 0176 records the decision and the
+> rejected alternatives (a per-line byte cap -- rejected because it preserves precisely the most
+> identifying part of an HL7 message, MSH and PID). Verified before this note: `pipeline/sandbox.py`
+> carries `stderr=subprocess.PIPE` and the reader thread; `tests/test_sandbox.py` passes.
+
+Filed 2026-08-01, re-scored 2026-08-20 (value 4/10, difficulty 3/10) while open. The worker was
+spawned with `stderr=None` ([pipeline/sandbox.py:266](../messagefoundry/pipeline/sandbox.py)), so
+the child's stderr was the **engine's own stderr**, unframed and unattributed. fd 1 is the IPC
+channel and is strictly framed; fd 2 had no such discipline. Admin-authored Handler code could
+therefore write arbitrary bytes straight into the engine's log stream — including forged log lines,
+ANSI control sequences, or content that breaks whatever consumes those logs (NSSM captures
+stdout/stderr to files; see [docs/SERVICE.md](SERVICE.md)).
 > Verdict: build
 > Closing-act: code
 
@@ -11217,6 +11248,20 @@ All three inputs were read out of the code rather than taken on trust. **The mod
 
 ## 1215. ADR 0161 and `mail-drain.ps1` describe the pre-wiring channel, and the script contradicts itself about markers
 
+> **PARTIAL 2026-08-26 (lander), NOT A CLOSURE -- this item stays OPEN, one limb of at least four.**
+> The item names four defects. **Two land here**, in `mail-drain.ps1`: the "THIS DOES NOT WIRE
+> ANYTHING" paragraph (the same commit that added it also introduced the
+> `install-coordination.ps1` rows wiring both events, so the claim was false in the commit that made
+> it) and the marker-gates-a-consume paragraph (inverted twice; the shipped guard skips the marker
+> check entirely when consuming, so a marker suppresses a re-display and nothing else). **A third
+> already landed separately, on `main` before this PR**: PR #604 (`871f146ae`) fixed ADR 0161's own
+> status line, its "Status and what gates wiring" section, and the line-258 inline comment --
+> coordinated live with the builder holding that half, confirmed disjoint before either landed.
+> **A fourth is still open and neither PR touches it**: `docs/adr/0161-*.md` still carries one
+> warning-glyph (⚠️) at the line the item cites, verified present on `main` directly before writing
+> this note. Do not read the item as closed once this PR and #604 are both counted -- one named
+> defect survives both.
+
 > 🔢 **Re-scored 2026-08-20 -> P3.** Value **4/10** · Difficulty **1/10** · _fill-in_. The inverted marker model is rewritten, leaving two false status claims and one glyph. Value stays 4 because the remainder is the same trap class rather than a milder one: ADR 0161's Status line and its Status section agree with mail-drain.ps1's header that nothing is wired, so a reader who re-reads either document has the error confirmed, and only reading install-coordination.ps1:278-279 or the ADR's own contradicting checklist at :405-408 falsifies it. Difficulty 1 because the remainder is edits to two documentation surfaces with no code and no test. _(was 4/10 · 2/10.)_
 >
 > **Filed 2026-08-11 -- found by Session C at HEAD while verifying #1028; reported, not fixed.** Three defects in one record. (1) ADR 0161's Status line and its "Status and what gates wiring" section still call the code an **unwired prototype** with *"nothing live in any session"* -- **false at HEAD on both counts**. (2) `scripts/hooks/mail-drain.ps1:71-73` still says *"THIS DOES NOT WIRE ANYTHING"*, but commit `fdec72ca` introduced both hook rows itself, so **the sentence was false in the commit that added it**. (3) The same file **CONTRADICTS ITSELF ABOUT MARKERS**: `:37-42` and `:57-64` assert a marker gates a consume; the shipped code at `:802`, `:809` and `:875-886` says the opposite.
@@ -12484,6 +12529,21 @@ SAYS is not.** *A dispatcher screening on the directory alone fences off both, w
 location rather than on subject -- the same shape as a commit that CITES an item being read as one that
 BUILDS it.*
 ## 1247. installing the machine-global worktree gate leaves no record: no backup, no receipt, no log line, and Copy-Item preserves the source mtime
+
+> **NOTE 2026-09-02 (lander), NOT A CLOSURE -- this item stays OPEN.** Most of this item shipped on
+> `main` in `31b01712f` (PR #682). `scripts/worktree/install-gate.ps1` now copies the old gate to
+> `worktree_gate.ps1.bak` before it writes, stamps the installed file with the INSTALL time rather
+> than inheriting the source's mtime, and leaves a `worktree_gate.ps1.receipt.json` carrying the
+> installed hash plus a note that it is a convenience record and not attestation.
+> **ONE NAMED LIMB IS STILL UNBUILT: refusing to overwrite a gate whose content does not match its
+> own receipt.** PR #613 carried that refusal behind an explicit override flag. It no longer does --
+> the limb was dropped as redundant against PR #682, and the refusal went with it, so this note is
+> the only place that fact is now recorded.
+> Measured on `origin/main` before writing this note: the copy at `install-gate.ps1:452` is
+> unconditional and nothing compares content before it, so an unexplained change to the
+> machine-global gate would still be overwritten without anyone being asked, and the `.bak` is the
+> only evidence left afterwards. The three `refuse` matches in that file are an environment check
+> and two comments, not a guard. PR #607, the fail-open alternative, is closed unmerged.
 
 > 🔢 **Re-scored 2026-08-20 -> P2.** Value **5/10** · Difficulty **3/10** · _fill-in_. A write to a shared machine-global safety control leaves no attributable record, and the inherited mtime is worse than absent because it once carried a true finding into retraction; the only workaround is a hash baseline captured in advance by luck. Difficulty 3: a receipt file plus a refuse-on-mismatch flag at one install site, with tests, and no product code touched. _(was 6/10 · 3/10.)_
 >

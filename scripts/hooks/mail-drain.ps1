@@ -56,23 +56,48 @@
     receipt written by session A satisfied both probes, so B's Stop consumed, unshown, a message only A
     had been shown. Reproduced end to end against this file on 2026-08-05.
 
-    A MARKER THEREFORE DOES GATE A CONSUME, and the previous claim that "marker state can only ever
-    suppress a re-display" was false in the shipped code. What is true, and is the property worth
-    stating, is that a marker cannot cause a consume AT A NON-Stop EVENT: consuming is gated by the
-    EVENT allowlist below, and no marker outcome reaches that decision. A marker planted by any other
-    local process will suppress one display and let the next Stop consume the message -- which is inside
-    this channel's stated trust boundary, where the same process could simply delete the message
-    (mail.ps1, "WHO CAN WRITE TO A BOX"). It is not a defence against a local writer and must not be
-    cited as one.
+    A MARKER GATES A DISPLAY, NOT A CONSUME -- AND THIS PARAGRAPH HAS NOW BEEN WRONG IN BOTH
+    DIRECTIONS, WHICH IS THE REASON IT IS WRITTEN OUT RATHER THAN SIMPLY CORRECTED (BACKLOG #1215).
+
+    It first claimed "marker state can only ever suppress a re-display". That was false against the
+    code of the day, so it was corrected to "A MARKER THEREFORE DOES GATE A CONSUME". THEN THE
+    CONSUMING PATH CHANGED UNDERNEATH THE CORRECTION and re-inverted it: the shipped guard is
+
+        if ($markerPath -and -not $consuming -and (Test-FilePresent -Path $markerPath))
+
+    so the marker check is SKIPPED ENTIRELY when consuming. The code's own comment at that site says
+    it outright -- "A CONSUMING DRAIN THEREFORE IGNORES MARKERS ENTIRELY and renders what it is about
+    to consume" -- because consumption now depends only on what THIS INVOCATION rendered, which is a
+    property no other session can forge, rather than on an identity two sessions can share.
+
+    SO THE ORIGINAL CLAIM IS NOW THE TRUE ONE. A marker suppresses a re-display and nothing else.
+
+    WHY THIS MATTERS MORE THAN AN ORDINARY STALE COMMENT: the wrong version sat inside a paragraph
+    whose whole subject was correcting a previous falsehood, so it read as the CHECKED statement --
+    the most convincing form a wrong sentence can take. A reader who doubted it and re-read the header
+    got the inversion confirmed. Only the running code disagreed, and only at a different site.
+
+    What remains true either way: a marker cannot cause a consume at a NON-Stop event, because
+    consuming is gated by the EVENT allowlist below and no marker outcome reaches that decision. A
+    marker planted by any other local process suppresses one display -- inside this channel's stated
+    trust boundary, where the same process could simply delete the message (mail.ps1, "WHO CAN WRITE
+    TO A BOX"). It is not a defence against a local writer and must not be cited as one.
 
     THE MARKER IS NOT A CLAIM AND MUST NEVER BE CITED AS ONE. Its exclusion is an exclusive CreateNew,
     adequate precisely because it runs AFTER the display it records: losing it costs a duplicate
     display, never a suppressed one. The claim primitive's exclusive-open verdict exists because a false
     win THERE is a double delivery.
 
-    THIS DOES NOT WIRE ANYTHING. The drain is wired Stop-only on the default config root, and
-    scripts/coord/install-coordination.ps1's rows are untouched. What changed is that wiring SessionStart
-    would now be SAFE; whether to wire it is the owner's decision.
+    THIS IS WIRED AT BOTH EVENTS, AND THE SENTENCE THAT USED TO STAND HERE WAS FALSE IN THE COMMIT
+    THAT ADDED IT (BACKLOG #1215). It read "THIS DOES NOT WIRE ANYTHING ... install-coordination.ps1's
+    rows are untouched", while the same commit (fdec72ca, #210) introduced those rows itself.
+    scripts/coord/install-coordination.ps1:278-279 carries a SessionStart row AND a Stop row, both
+    pointing at this script. Whether to wire SessionStart was described here as the owner's open
+    decision; it had already been made in the same change.
+
+    A "this changes nothing" sentence is worth exactly as much as the diff it ships beside, and this is
+    the shape to distrust: the claim is about the commit's own blast radius, so the only thing that can
+    refute it is the commit, and a reader who trusts the comment never opens it.
 
     WHY THESE TWO EVENTS AND NOT PreToolUse. Measured on this repo's recent transcripts: 19.0 tool calls
     per turn at the mean. A PreToolUse hook on '*' therefore pays its process-spawn cost ~19 times per

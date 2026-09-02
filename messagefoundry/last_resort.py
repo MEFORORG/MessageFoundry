@@ -68,11 +68,14 @@ def _thread_excepthook(args: threading.ExceptHookArgs) -> None:
     ``threading.excepthook`` and nowhere else — so the redaction guarantee already in force on the main
     thread must be installed a second time to reach the others (BACKLOG #1055).
 
-    The concrete engine thread is the sandbox session's raw stdout-reader daemon
-    (``SandboxSession._reader_loop``), whose ``except`` clause catches only ``OSError`` by design;
-    anything else escapes ``run()`` and lands here, and the frame bytes it was mid-read on are
-    message-derived. ``SystemExit`` is ignored exactly as the stdlib default ignores it — a thread
-    calling ``sys.exit()`` is a clean exit, not an error to report.
+    The concrete engine threads include **at least** the sandbox session's two per-worker daemon
+    drains — the raw stdout frame reader (``SandboxSession._reader_loop``) and the stderr relay
+    (``_StderrRelay.run``, ADR 0176) — each of whose ``except`` clauses catches only ``OSError`` by
+    design; anything else escapes ``run()`` and lands here, and the bytes either one was mid-read on
+    are message-derived. Both threads are named for their pipe, their inbound and their worker
+    generation, so ``args.thread.name`` below identifies which one died. ``SystemExit`` is ignored as the
+    stdlib default ignores it — a thread calling ``sys.exit()`` is a clean exit, not an error to
+    report.
     """
     if args.exc_value is None or issubclass(args.exc_type, SystemExit):
         return
