@@ -29,11 +29,15 @@ from messagefoundry.config.settings import (
     AuthSettings,
     weakened_tls_escape_permitted,
 )
-from messagefoundry.config.tls_policy import HopPosture
+from messagefoundry.config.tls_policy import HopPosture, assert_ldap3_tls_suites
 
 logger = logging.getLogger(__name__)
 
 _MATCHING_RULE_IN_CHAIN = "1.2.840.113556.1.4.1941"  # AD nested-group ("member in chain")
+
+#: Operator-recognisable label for this hop in a TLS suite-assertion error (BACKLOG #1317). Pinned to
+#: this file by ``test_every_covered_file_still_names_its_connector_label``.
+_LDAPS_CONNECTOR = "AD LDAPS bind"
 
 
 @dataclass(frozen=True)
@@ -110,6 +114,9 @@ class LdapAuthenticator:
         if not settings.ad_bind_dn or not self._bind_password:
             raise LdapError("AD is enabled but the service-account bind is not configured")
         self._s = settings
+        # One definition of "is this bind LDAPS", read by the verify-off refusal below, the suite
+        # assertion, and _server(). The assertion would have been its third open-coded spelling.
+        self._ldaps = str(settings.ad_server).lower().startswith("ldaps")
         # #329: the instance hop posture (threaded by AuthService from create_app's derived posture).
         # LDAPS is built OUT of the connector-construction gate (AuthService, not build_check_registry),
         # so current_hop_posture() would be None here; the posture must be passed explicitly or the
@@ -123,7 +130,7 @@ class LdapAuthenticator:
         # posture the escape is INERT, so it can never silence this refusal on such an instance — the
         # blunt env var no longer buys verify-off there. With the escape permitted (non-enforcing/non-PHI
         # or unstamped posture), we still warn loudly once at startup.
-        if str(settings.ad_server).lower().startswith("ldaps") and not settings.ad_tls_verify:
+        if self._ldaps and not settings.ad_tls_verify:
             if not weakened_tls_escape_permitted(self._posture):
                 raise LdapError(
                     "ad_tls_verify=false disables LDAPS certificate verification (MITM risk). Use a "
@@ -137,14 +144,36 @@ class LdapAuthenticator:
                 "production.",
                 INSECURE_TLS_ESCAPE_ENV,
             )
+        # BACKLOG #1317. Assert the suite list this hop will negotiate (ASVS 12.1.2). Verification-off
+        # is refused/warned above; this is the separate question of whether the traffic is ENCRYPTED and
+        # the peer AUTHENTICATED at all, which was inherited from the interpreter default and unchecked.
+        # Measured: the inherited list is clean today, so this raises on no supported configuration --
+        # it converts an inherited property into a checked one, the same move harden_cipher_suites
+        # documents. Done ONCE here rather than in _server() because the answer is fixed by config and
+        # _server() runs up to three times per login; AuthService builds this eagerly, so a bad suite
+        # list fails app startup rather than the first bind.
+        if self._ldaps:
+            assert_ldap3_tls_suites(self._tls_kwargs(), connector=_LDAPS_CONNECTOR)
+
+    def _tls_kwargs(self) -> dict[str, Any]:
+        """The ``ldap3.Tls`` arguments for this bind — the SINGLE definition, read by both consumers.
+
+        ``__init__`` asserts the suite list these resolve to and ``_server()`` builds the real ``Tls``
+        from them, so the two cannot drift onto different shapes. Keep it that way: the assertion runs
+        against a REBUILT context (``ldap3.Tls`` holds no ``SSLContext`` to check directly), and a
+        rebuilt context is only evidence about this hop while it is built from the hop's own arguments.
+        """
+        return {
+            "validate": ssl.CERT_REQUIRED if self._s.ad_tls_verify else ssl.CERT_NONE,
+            "ca_certs_file": self._s.ad_tls_ca_cert_file,
+        }
 
     def _server(self) -> Any:
         import ldap3
 
         tls = None
-        if str(self._s.ad_server).lower().startswith("ldaps"):
-            validate = ssl.CERT_REQUIRED if self._s.ad_tls_verify else ssl.CERT_NONE
-            tls = ldap3.Tls(validate=validate, ca_certs_file=self._s.ad_tls_ca_cert_file)
+        if self._ldaps:
+            tls = ldap3.Tls(**self._tls_kwargs())
         # ASVS 13.1.3: ldap3's Server.connect_timeout defaults to None (wait forever) and the engine
         # never sets a process-wide socket default, so this is the ONLY bound on the TCP connect to the
         # domain controller. Every Server in this module is built here, so threading it here covers the

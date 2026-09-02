@@ -1,13 +1,29 @@
-# Connection-scale CI smoke (B11) — small N (50 → 100) on SQLite, hermetic + fast (~15-25s). Proves
-# the harness SPINS N connections, NO-LOSS reconcile holds, and the FD + empty-claim counters move
-# MONOTONICALLY (the wall exists and scales). It does NOT regression-cover wall #1 (executor) or wall
-# #2 (pool): both are no-ops/under-threshold at small N on SQLite (the pool wall needs a server DB —
-# see the connscale-smoke-pg CI leg, which forces pool_size to 1-2). Stated honestly so the smoke is
-# not over-read. Synthetic + generic.
+# Connection-scale CI smoke (B11): small N (50 to 100) on SQLite, hermetic, synthetic + generic. It
+# exercises that the harness SPINS N connections, that the NO-LOSS reconcile holds, and that the FD
+# and empty-claim counters produce readings their SLOs can grade. Those two SLOs are no longer one
+# monotonicity family; the [connscale.slo] comments below say what each one now asserts.
+#
+# NOTHING RUNS THIS FILE, so its own N=50/100 point is predicted and unexercised. The only entry
+# point is `python -m harness --connscale connscale-smoke`, and `--connscale` occurs ZERO times
+# under .github/ (measured 2026-08-31: `grep -rn -- '--connscale' .github/` exits 1 with no output;
+# the positive control, bare `connscale`, returns 10 lines, so the search did run). CI's
+# connection-scale coverage comes from the INLINE profile in tests/test_connscale_smoke.py, which
+# sweeps N=12/24 at aggregate_rate 24.0. Wiring a real leg up is PERF-36 in
+# docs/testing/master-test-plan/17-performance-and-scale.md.
+#
+# THAT MAKES THIS FILE AND THE INLINE PROFILE TWO COPIES OF ONE METRIC'S CONFIGURATION, WITH NOTHING
+# PINNING THEM TOGETHER. The flags below are set to the same answers as that inline block on
+# purpose, so a leg wired up later grades what the suite already grades. No check enforces that.
+#
+# It does NOT regression-cover wall #1 (executor) or wall #2 (pool): both are no-ops or
+# under-threshold at small N on SQLite. Real pool-acquire-wait coverage needs a server DB and lives
+# in tests/test_connscale_postgres.py, which ci.yml runs at MEFOR_STORE_POOL_SIZE=4 under the step
+# "Run the connection-scale pool-wait smoke on real Postgres (B11 wall #2, tiny pool)". Stated
+# honestly so the smoke is not over-read.
 
 [connscale]
 name = "connscale-smoke"
-description = "CI smoke: N=50/100 on SQLite — harness spins + no-loss + FD/empty-claim monotonicity"
+description = "N=50/100 on SQLite; spins + no-loss + FD monotonicity + empty-claim base reading. No workflow runs it."
 counts = [50, 100]
 sweep_mode = "both"
 aggregate_rate = 35.0
@@ -25,7 +41,38 @@ corpus_count_per_trigger = 10
 
 [connscale.slo]
 zero_loss = true
-# Loose `>=` monotonicity smokes (CI runners are noisy — mf-ci-test-flakes): FD count + total
-# empty-claims/sec at N=100 must be >= N=50 within each sweep mode.
+
+# THE ONLY vs-N SLOPE LEFT IN THIS FILE, and it is a LOOSE one. Within each lane (records group on
+# sweep_mode paired with claim_mode) the peak FD count at the larger N must be >= the smaller-N
+# reading minus a 25 percent jitter band. Hosted runners are noisy (mf-ci-test-flakes), so a small
+# dip is jitter, not a regression. The band is `_MONOTONIC_TOLERANCE` in
+# harness/load/connscale/runner.py and is not settable from here.
 fd_monotonic = true
-empty_claims_monotonic = true
+
+# NOT A SLOPE, AND NOT THE SAME SHAPE AS `fd_monotonic` ABOVE. It asserts one thing: every
+# `per_lane` lane that produced a reading at the BASE connection count (N=50 here, min(counts))
+# produced a STRICTLY POSITIVE one. A sign test, so it cannot flake on level noise, and it fires on
+# a dead counter -- the case the vs-N gate it replaced PASSED, because `not (0.0 < 0.0)` is true.
+#
+# THE METRIC IS PER-MESSAGE, NOT PER-SECOND. It reads `empty_claims_per_msg`, empty claims per
+# message absorbed. BACKLOG #1101 retired the per-second form because keeping wall clock in the
+# denominator let a slow arm read as an improvement. `empty_claims_per_s` survives as a REPORTED
+# field; no SLO reads it.
+#
+# NOTHING IN CI NOW ASSERTS THE CURVE RISES WITH N, in any form. That is a deliberate loss, not an
+# oversight. BACKLOG #1211 measured the retired vs-N gate against a large CI harvest and found it
+# broken five ways at once; the harvest is recorded there, once, and is not restated here.
+#
+# THE PREDICTED HERD FLOOR IS RECORDED, NOT GRADED. Both emitters compute it and write it to
+# out/connscale/ and the CI step summary on every run, pass or fail, and no verdict rides on it.
+# Arming this flag does not arm the floor. Turning the floor into a threshold waits on its own
+# harvested distribution, and is a filed follow-up item linked from #1211.
+#
+# WHETHER ANY OF THIS CARRIES TO N=50/100 IS UNMEASURED. Every reading behind #1211 came from the
+# N=12/24 inline profile named at the top of this file, not from this one. Read fresh readings at
+# THIS N before treating any of it as established here.
+#
+# `claim_modes` is unset above, so it defaults to ("per_lane",) and both sweep-mode lanes are
+# graded. This check REQUIRES per_lane: the reading's premise is one worker set per lane per stage,
+# which a pooled dispatcher does not satisfy.
+empty_claims_base_reading = true

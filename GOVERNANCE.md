@@ -56,8 +56,8 @@ Trust is earned incrementally:
 
 The project currently has **one** maintainer, a single point of failure for releases and for the
 private security-advisory process. Growing to a **second trusted maintainer** is an explicit goal,
-sequenced in the [contributor program plan](docs/CONTRIBUTOR-PROGRAM-PLAN.md). Until then, response
-times reflect one person's bandwidth.
+sequenced in the project's contributor program plan, a maintainer document that is not published
+in this repository. Until then, response times reflect one person's bandwidth.
 
 ## License & the CLA
 

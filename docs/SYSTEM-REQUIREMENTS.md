@@ -167,10 +167,12 @@ A single engine process runs **all** message work — decode → peek → route 
 on **one CPU core** (one asyncio event loop; the GIL prevents pure-Python parallelism across threads).
 So per-process throughput is governed, in order, by:
 
-1. **Transform cost per message** — usually the binding constraint. The project's own
-   [throughput research](archive/throughput/THROUGHPUT-IMPROVEMENTS.md) cites a comparable vendor
-   benchmark where real transformation cut pass-through throughput by ~60% (≈1000 msg/s → ≈400 msg/s).
-   A light/pass-through feed sits near the top of a tier; a heavy transform sits near the bottom.
+1. **Transform cost per message** — usually the binding constraint. A comparable vendor benchmark
+   the project reviewed showed real transformation cutting pass-through throughput by ~60%
+   (≈1000 msg/s → ≈400 msg/s). That review is a maintainer record and is not published in this
+   repository, so treat the figure as indicative rather than reproducible from here;
+   [THROUGHPUT.md](THROUGHPUT.md) §5 states the same effect without a number. A light/pass-through
+   feed sits near the top of a tier; a heavy transform sits near the bottom.
 2. **Durable-write cost** — every stage handoff (ingress → routed → outbound → delivered) is a
    committed transaction. In-process **SQLite is fastest per write**; a **server DB is slower per
    single write** (network + MVCC) but is the concurrency substrate (next point).

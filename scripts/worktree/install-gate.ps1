@@ -438,7 +438,54 @@ $resolved = foreach ($r in $Repo) {
 }
 
 New-Item -ItemType Directory -Force -Path $HooksDir | Out-Null
-Copy-Item -LiteralPath (Join-Path $RepoRoot "scripts\hooks\worktree_gate.ps1") -Destination $GateDst -Force
+# BACK UP THE GATE BEFORE OVERWRITING IT. The allowlist writer has done this since #1375; the GATE
+# SCRIPT never did, and the near-miss is why: `Write-Settings` backs up settings.json, and reading
+# `Copy-Item ... .bak` in this file makes the absence here easy to read as presence. It is not the
+# same file.
+$GateSrc = Join-Path $RepoRoot "scripts\hooks\worktree_gate.ps1"
+$gateBak = $null
+if (Test-Path -LiteralPath $GateDst) {
+    $gateBak = "$GateDst.bak"
+    Copy-Item -LiteralPath $GateDst -Destination $gateBak -Force
+}
+
+Copy-Item -LiteralPath $GateSrc -Destination $GateDst -Force
+
+# STAMP THE INSTALLED COPY WITH THE INSTALL TIME, AND THIS IS THE LOAD-BEARING HALF OF #1247.
+#
+# Copy-Item carries the SOURCE file's LastWriteTime, so the installed gate inherited a timestamp from
+# whichever checkout it was copied from -- routinely days old, and older still on a fresh clone.
+# Measured 2026-08-29: a source back-dated six days produced an installed copy reporting the same
+# six-day-old time, seconds after the copy ran.
+#
+# AN INHERITED MTIME IS WORSE THAN A MISSING ONE BECAUSE IT READS AS EVIDENCE. A correct stale-gate
+# report was retracted on the strength of this timestamp -- "nothing wrote it today" -- and the
+# retraction propagated. A file with no mtime would have been questioned; a file with a confident
+# wrong one was believed.
+#
+# The mtime now answers the question people actually ask it: WHEN WAS THIS INSTALLED. It deliberately
+# does NOT answer "is this current", which is a content question -- `-Status` compares hashes for that,
+# and the two must not be conflated.
+$installedAtUtc = [DateTime]::UtcNow
+(Get-Item -LiteralPath $GateDst).LastWriteTimeUtc = $installedAtUtc
+
+# A RECEIPT, AND AN HONEST NOTE ABOUT WHAT IT IS WORTH. Nothing recorded that an install happened, so
+# there was no way to ask who installed this gate, from which tree, or at which commit.
+#
+# TRUST LEVEL, STATED BECAUSE THE ALTERNATIVE IS ANOTHER CONFIDENT WRONG ANSWER: gate rule 1a protects
+# ~/.claude/hooks/ by EXACT FILENAME and refuses to key on the parent directory, so this sibling is NOT
+# protected and a session can write it. Read it as a convenience record, never as attestation. The hash
+# it carries is checkable against the file; the rest is a claim by whoever last ran the installer.
+$receipt = [ordered]@{
+    installedAtUtc = $installedAtUtc.ToString('o')
+    sourcePath     = $GateSrc
+    sourceRepo     = $RepoRoot
+    gateVersion    = (Get-GateVersion $GateDst)
+    gateSha256     = (Get-GateHash $GateDst)
+    configDirs     = @($ConfigDir)
+    note           = 'Convenience record written by install-gate.ps1. NOT protected by the gate and NOT attestation.'
+} | ConvertTo-Json -Depth 4
+Set-Content -LiteralPath "$GateDst.receipt.json" -Value $receipt -Encoding utf8
 
 @(
     "# Primary checkouts governed by the worktree gate (scripts\hooks\worktree_gate.ps1)."
@@ -493,6 +540,7 @@ Write-Host ""
 Write-Host "Worktree gate INSTALLED into $($ConfigDir.Count) config dir(s) (every session, no restart)." -ForegroundColor Green
 Write-Host "  gate      : $GateDst"
 Write-Host "  allowlist : $ReposFile"
+Write-Host "  installed : $($installedAtUtc.ToString('yyyy-MM-dd HH:mm:ss')) UTC  (receipt: $GateDst.receipt.json)"
 $resolved | ForEach-Object { Write-Host "  governing : $_" }
 Write-Host "  matchers  : $($matchers -join '  +  ')"
 Write-Host ""

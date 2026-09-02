@@ -216,26 +216,34 @@ try {
 } catch {
     Write-Unresolved "overlap-threw" "invoking the overlap script raised: $($_.Exception.Message)"
 }
-# EXIT 3 IS THE BUDGET, and it gets its own sentence because it is the one failure this gate could not
-# previously report AT ALL. Measured 2026-08-22 on this box: the walk costs ~12 s across 73 worktrees,
-# under a harness timeout of 20 s that kills THIS process when it fires -- and a killed PreToolUse hook
-# writes nothing, which on stdout is byte-identical to "checked, nobody else is touching this file".
-# overlap.ps1 bailing out under its own budget converts that silence into an exit code, which is the
-# channel below. If the budget is ever hit routinely the answer is to make the walk cheaper, not to
-# raise the number past the harness's.
-if ($code -eq 3) {
-    Write-Unresolved "overlap-slow" `
-        "the overlap walk did not finish within its ${OverlapTimeBudgetSeconds}s budget, so it returned no map rather than a partial one"
-}
-if ($code -ne 0) {
+# EXIT 3 IS THE BUDGET. Measured 2026-08-22: the walk cost ~12 s across 73 worktrees, under a harness
+# timeout of 20 s that kills THIS process when it fires -- and a killed PreToolUse hook writes nothing,
+# which on stdout is byte-identical to "checked, nobody else is touching this file". overlap.ps1 bailing
+# out under its own budget converts that silence into an exit code. If the budget is hit routinely the
+# answer is to make the walk cheaper, not to raise the number past the harness's.
+#
+# A PARTIAL MAP IS NOW USED, NOT DISCARDED, and the rule governing it is one sentence: it may only ADD
+# a deny, never remove one. Measured 2026-08-30 at 162 worktrees, the walk took 26.1 s and bailed on
+# five runs of five -- so this gate spent that period allowing every edit against a map it threw away,
+# including the peers overlap.ps1 had already found. Reading the walked half costs nothing and can only
+# catch collisions that were previously dropped; every path below that would ALLOW on a partial map
+# still goes through the unresolved notice, so a short walk can never render as an all-clear.
+$partial = ($code -eq 3)
+if ($code -ne 0 -and -not $partial) {
     Write-Unresolved "overlap-failed" "the overlap script exited $code"
 }
 
 # EMPTY OUTPUT IS NOT AN ANSWER. Under -Json a resolved "nobody else is in this file" is the two bytes
 # `[]`; nothing at all is a script that never produced a verdict. Folding those together is precisely
 # how this gate came to report all-clear while checking nothing.
+$slowDetail = "the overlap walk did not finish within its ${OverlapTimeBudgetSeconds}s budget, so the map below covers only the worktrees it reached and the rest were never looked at"
+
 $text = (@($raw) -join "`n").Trim()
 if (-not $text) {
+    # A PARTIAL WALK THAT REACHED NOTHING prints nothing rather than "[]" -- overlap.ps1 reserves "[]"
+    # for a COMPLETE walk that found nobody, so the two cannot be confused here. Order matters: test
+    # the budget first, or a short walk gets reported as a broken script.
+    if ($partial) { Write-Unresolved "overlap-slow" $slowDetail }
     Write-Unresolved "overlap-empty" "the overlap script produced no output at all (a resolved 'nobody else' is '[]', not nothing)"
 }
 
@@ -243,10 +251,18 @@ $rows = @()
 try { $rows = @($text | ConvertFrom-Json -ErrorAction Stop) } catch {
     Write-Unresolved "overlap-unparseable" "the overlap script's output was not JSON"
 }
-if (-not $rows -or $rows.Count -eq 0) { exit 0 }   # RESOLVED, and nobody else is touching it
+
+# COVERAGE, IF THE MAP CARRIES IT. Every row of a partial map is stamped with the same Walked/Total, so
+# any one of them answers "how much of the map is this". Naming the numbers matters more than naming the
+# condition: "covering 26 of 163" tells a reader how much is unknown, where a bare "partial" invites
+# them to assume it was nearly done -- and on the measured runs it was not.
+if ($partial -and $rows.Count -gt 0 -and $null -ne $rows[0].PSObject.Properties['Total']) {
+    $slowDetail = "the overlap walk did not finish within its ${OverlapTimeBudgetSeconds}s budget, " +
+        "covering $(Get-SafeForMessage $rows[0].Walked) of $(Get-SafeForMessage $rows[0].Total) worktrees. " +
+        "Those were checked; the rest were never looked at"
+}
 
 $live = @($rows | Where-Object { $_.Live })
-if ($live.Count -eq 0) { exit 0 }   # dormant only: worth knowing, not worth blocking
 
 # DENY ONLY ON AN UNCOMMITTED EDIT IN A LIVE WORKTREE. `Files` is the union of what a branch COMMITTED
 # and what is dirty in its tree, so a session that committed a file, went clean and finished still
@@ -261,6 +277,14 @@ if ($live.Count -eq 0) { exit 0 }   # dormant only: worth knowing, not worth blo
 # permitting a real collision -- over-block is safe, under-block is a silent collision.
 $editing = @($live | Where-Object { $null -eq $_.PSObject.Properties['MatchedDirty'] -or $_.MatchedDirty })
 if ($editing.Count -eq 0) {
+    # EVERY OUTCOME BELOW THIS POINT ALLOWS THE EDIT, which is exactly the set of outcomes a partial map
+    # is not entitled to reach quietly. The deny above stands on the walked half alone -- a collision
+    # found is a collision, however little else was checked -- but "nobody is in this file" is a claim
+    # about the WHOLE map, and a short walk has not earned it. So say so instead of exiting silently.
+    if ($partial) { Write-Unresolved "overlap-slow" $slowDetail }
+    # Nobody live at all, or the only rows are dormant worktrees: worth knowing, not worth blocking.
+    if ($live.Count -eq 0) { exit 0 }
+
     # Committed-and-clean in every live worktree: report it, do not block. The peer may well have
     # already done what you are about to do, which is worth knowing and not worth refusing over.
     #
@@ -336,6 +360,12 @@ foreach ($r in $editing) {
     }
 }
 $lines += ""
+# A DENY OFF A PARTIAL WALK IS STILL A DENY, and the reader is told which kind they are holding. It
+# cuts one way only: what was found is real, and the unwalked worktrees may hold more of the same.
+if ($partial) {
+    $lines += "This was found in a PARTIAL check -- $(Get-SafeForMessage $slowDetail). More peers may be in this file."
+    $lines += ""
+}
 $lines += "Before overriding: that session may already be doing what you are about to do."
 $lines += "  see everything in flight :  pwsh -NoProfile -File scripts\coord\overlap.ps1"
 $lines += "  who is live              :  pwsh -NoProfile -File scripts\coord\presence.ps1"

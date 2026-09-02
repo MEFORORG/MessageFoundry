@@ -105,10 +105,39 @@ def _safe_for_message(value: object, limit: int = 400) -> str:
     return text
 
 
+class GitReadError(RuntimeError):
+    """git could not answer, so nothing downstream may treat its silence as an answer."""
+
+
 def _git(*args: str) -> str:
-    return subprocess.run(  # nosec B603 B607 - fixed argv, no shell, no caller-supplied executable
+    """Run a git read and REFUSE TO RETURN ITS SILENCE AS DATA.
+
+    This used to return `.stdout` and never look at `returncode`. A failed read therefore
+    returned "" -- indistinguishable from a genuinely empty diff -- and that emptiness flowed
+    straight through `_staged_paths()` to `_touches_code([])`, which is False BY DESIGN so an
+    `--amend` of a message is never blocked. The gate then took its docs-only exit and PASSED a
+    commit citing an unclaimed item, printing nothing.
+
+    MEASURED, with a control on the same box: outside a repository this read exits 129 with
+    empty stdout, while inside the repository it exits 0 -- so the emptiness IS the failure and
+    not the normal case, and the old code could not tell the two apart.
+
+    Low odds, and that is the point rather than a reason to shrug: git normally invokes this hook
+    from inside a repository. It fails on `index.lock` contention, a corrupt index, git missing
+    from the hook's PATH, or GIT_DIR oddities in a worktree -- rare states that arrive exactly
+    when several sessions are committing at once, which is when a duplicate-work gate matters
+    most. A gate disarmed by the one condition it cannot detect is worse than no gate, because
+    its silence reads as approval.
+    """
+    proc = subprocess.run(  # nosec B603 B607 - fixed argv, no shell, no caller-supplied executable
         ["git", *args], capture_output=True, text=True, encoding="utf-8", errors="replace"
-    ).stdout
+    )
+    if proc.returncode != 0:
+        detail = (proc.stderr or "").strip().splitlines()
+        raise GitReadError(
+            f"git {' '.join(args)} exited {proc.returncode}: {detail[0] if detail else 'no output'}"
+        )
+    return proc.stdout
 
 
 def _staged_paths() -> list[str]:
@@ -179,11 +208,34 @@ def main() -> int:
     if not items:
         return 0
 
-    paths = _staged_paths()
+    # FAIL CLOSED FROM HERE, because from here a wrong answer is a SILENT PASS.
+    #
+    # Every exit above this line is reached WITHOUT calling git, so a commit that does not cite a
+    # BACKLOG number is untouched by this. Only a commit that DOES cite one, on a box where git
+    # cannot answer, is refused -- and refusing it costs a re-run, while passing it costs the
+    # duplicate build this gate exists to stop.
+    #
+    # Fail-closed is the right choice HERE specifically because _git has three callers and all of
+    # them are in this file. The sibling case that argued for care -- a board tool with sixty
+    # callers written against a function that could not fail -- would trade a silent wrong number
+    # for a dead board. A commit hook has no such surface.
+    try:
+        paths = _staged_paths()
+        me = _norm(_repo())
+    except GitReadError as exc:
+        sys.stderr.write(
+            f"\nCLAIM GATE: git could not be read, so this commit was NOT checked.\n"
+            f"  {exc}\n"
+            f"  The subject cites BACKLOG #{items[0]}, and the gate cannot tell whether this commit\n"
+            f"  touches code -- so it refuses rather than pass unchecked. Its usual causes are an\n"
+            f"  index.lock held by another session, a corrupt index, or git missing from the hook's\n"
+            f"  PATH. Fix that and commit again; the check itself has not failed you.\n"
+        )
+        return 1
+
     if not _touches_code(paths):
         return 0  # docs/ledger-only: cites the item, does not build it
 
-    me = _norm(_repo())
     problems: list[str] = []
     for item in dict.fromkeys(items):  # de-dupe, keep order
         claim = _holder(item)

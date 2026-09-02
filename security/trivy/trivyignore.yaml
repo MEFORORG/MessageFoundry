@@ -1,0 +1,45 @@
+# Trivy ignore list for the CONTAINER-IMAGE scan (.github/workflows/security.yml, job `trivy`).
+#
+# THIS IS NOT VEX, and the distinction is load-bearing. security/vex/messagefoundry.openvex.json is
+# an operator-facing exploitability assertion about the MessageFoundry PRODUCT, shipped with every
+# release. This file suppresses a finding in OUR OWN SCAN of OUR OWN IMAGE and ships nowhere.
+#
+# A vendored copy inside pip is not part of the wheel an operator installs, so asserting anything
+# about it in VEX would be over-broad. VEX product identifiers carry no version qualifier, so such a
+# statement would apply to every release forever -- BACKLOG #1081 refuted exactly that shape when it
+# was proposed for the released-line-audit gate, and the reasoning holds here.
+#
+# WHY THIS FILE EXISTS. `--ignore-unfixed` filters on "does UPSTREAM have a fix", not "can WE apply
+# it". Both entries below are pip's VENDORED copies: pip 26.2.1 pins msgpack==1.1.2 and
+# setuptools==70.3.0 in pip/_vendor/vendor.txt and publishes them in pip/_vendor/bom.cdx.json, which
+# Trivy ingests. Neither package is in docker/locks/requirements-core.lock, neither appears in the
+# image's /opt/venv site-packages, nothing in the engine imports them, and the image entrypoint is
+# `tini -- messagefoundry`, which never runs pip.
+#
+# MEASURED, enumerated over every failed run of this job in 2026-07-01..08-30: 30 failures in two
+# contiguous episodes. The July episode (CVE-2026-59885, CVE-2026-59886 on pyasn1 0.6.3) was a REAL
+# finding in our own lock and was fixed -- the lock now pins 0.6.4. The August episode is these two,
+# on 25 consecutive days, unreachable by any change to this repository. The Debian base layer reports
+# zero vulnerabilities on every run, so the usual "unfixable base-image CVE" story does not apply.
+#
+# EVERY ENTRY CARRIES `expired_at`. An ignore that never expires is indistinguishable from a gate
+# somebody quietly switched off. On expiry, re-measure: if pip has re-vendored, delete the entry
+# rather than extending the date.
+#
+# STRONGER ALTERNATIVE, deliberately not taken here. Stripping pip from the runtime image removes
+# these components rather than ignoring them, and removes real attack surface with them. It is not
+# in this change because the base image carries a second pip under /usr/local/lib, and the scan log
+# does not say which copy Trivy read. That wants one build experiment of its own.
+vulnerabilities:
+  - id: GHSA-6v7p-g79w-8964
+    statement: >-
+      msgpack 1.1.2 vendored inside pip (pip/_vendor/msgpack), reachable only through pip's own HTTP
+      cache. Not a MessageFoundry dependency; absent from docker/locks/requirements-core.lock and
+      from the image's installed site-packages.
+    expired_at: 2026-11-30
+  - id: CVE-2025-47273
+    statement: >-
+      setuptools 70.3.0 vendored inside pip (pip/_vendor). The vulnerable path is
+      setuptools.package_index.PackageIndex fetching from an index; pip's vendored copy is not used
+      for that and the image never runs pip. Not a MessageFoundry dependency.
+    expired_at: 2026-11-30

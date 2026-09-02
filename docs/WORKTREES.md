@@ -757,6 +757,60 @@ statusLine, and so on — each with a different fix, instead of saying "not inst
 > hardcoded limit table. Anything reading plan state from either is confidently wrong at exactly the
 > moment it matters. Tokens and plan-limit consumption are different quantities.
 
+## Put the prompt first, or a list-valued flag eats it and the lane dies quietly
+
+Several `claude` options take a **list**, so they keep swallowing words until the next `-`-prefixed
+token. A prompt written after one is absorbed as another list item. This launches a session with **no
+prompt at all**:
+
+```powershell
+claude --bg --allowedTools Bash Edit "do the work"    # WRONG -- the prompt becomes a third tool name
+```
+
+Write it one of these two ways:
+
+```powershell
+claude --bg "do the work" --allowedTools Bash Edit    # prompt first
+claude --bg --allowedTools Bash Edit -- "do the work" # or close the list with --
+```
+
+**Why this earns a section: the failure is silent and the symptom lies.** The session starts, finds
+nothing to do, and exits 0. `claude agents --json` then reports it as `state=blocked` — the same
+thing it reports for a session genuinely waiting on a permission decision. So a background lane
+launched this way looks alive and pending, and does nothing. Nobody re-reads the command that started
+a session they believe is merely blocked. Seen on this box 2026-08-30: a session named `loadprobe`
+sat at an empty prompt in manual mode until someone killed it by hand.
+
+**The list-valued options, read from `claude --help` at CLI version 2.1.251 on 2026-08-30.** These
+are the ones whose help text spells the value with a trailing `...`:
+
+| Option | Value in `--help` |
+|---|---|
+| `--add-dir` | `<directories...>` |
+| `--allowedTools`, `--allowed-tools` | `<tools...>` |
+| `--betas` | `<betas...>` |
+| `--disallowedTools`, `--disallowed-tools` | `<tools...>` |
+| `--file` | `<specs...>` |
+| `--mcp-config` | `<configs...>` |
+| `--tools` | `<tools...>` |
+
+**Three options that look like they belong on that list and do not.** `--plugin-dir <path>` and
+`--plugin-url <url>` each take one value and are **repeatable**: you pass the flag again rather than
+adding a second word. `--agents <json>` takes a single JSON string. Repeatable is not list-valued,
+and only a list-valued option reaches past its own value to eat the prompt.
+
+Re-read `--help` before trusting this table against a newer CLI. It measures one version, not a
+contract.
+
+**No hook guards this, and that is a decision.** The obvious guard is a `PreToolUse` matcher on
+`Bash` that refuses the bad shape. This repo already has one Bash guard written and tested that way,
+[`../scripts/hooks/block-blanket-git-stage.ps1`](../scripts/hooks/block-blanket-git-stage.ps1), and
+it is referenced by **no** matcher in any settings file on this machine — measured 2026-08-23 at 0 of
+110, while several tracked pages described it as a live control. A second unwired guard would add
+another control that reads as running and never runs. A static scan of tracked files is no better: it
+answers "does a committed script contain the bad shape" when the question is "did a session just type
+it", and no tracked file has ever contained one. So this stays a rule you read, not a gate.
+
 ## Announcing yourself (UserPromptSubmit hook)
 
 **What it fixes.** Everything above is **pull**-based: a new session discovers its peers and the peers

@@ -17,12 +17,19 @@ the sequence), so a number written down here rots. That file is the checked-in c
 tuple, this file among them, against it. Note what those checks gate: MERGING a pull request, never
 the push this hook sees.
 
-``enforce_admins`` was enabled 2026-07-28 and DISABLED again on 2026-07-29 via the escape hatch in
-the HISTORY note below, so ``gh pr merge --admin`` works once more and, for an admin, protection does
-not apply to a direct push at all. This hook is therefore the ONLY thing refusing that one path, not
-merely defence-in-depth. Where the server WOULD refuse -- a non-admin, or if the setting is flipped
-back -- it still earns its place by failing FAST and LOCALLY, with an explanation, instead of after a
-round-trip; and it covers ``cla-signatures``, which branch protection does not cover either way.
+``enforce_admins`` is ON -- read from the live API 2026-08-31, ``enabled: true``. It was enabled
+2026-07-28 and disabled 2026-07-29; the API reports only the current value and keeps no history, so
+WHEN it came back on is not recoverable and is not claimed here. The server therefore DOES refuse an
+admin's direct push to ``main``, and this hook is defence-in-depth on that path rather than the only
+control. It still earns its place: it fails FAST and LOCALLY, with an explanation, instead of after a
+round-trip, and it covers ``cla-signatures``, which branch protection does not cover either way.
+
+**``gh pr merge --admin`` IS NOT AN ESCAPE HATCH WHILE THIS SETTING IS ON, and this docstring used to
+say it was.** That is the correction worth making first, because it is the one that fails a reader who
+has already run out of options: it was written here as the documented way out of a permanently-red
+required check, and with ``enforce_admins`` on it does not work. The hatch that does work is the one
+in the HISTORY note below -- ``gh api -X DELETE`` on the ``enforce_admins`` endpoint -- which turns
+the setting OFF deliberately and visibly, rather than merging around it for one pull request.
 
 The realistic trigger was never malice, it is one click: VS Code's Sync/Push button does not
 distinguish "my feature branch" from "main", and the editor is where most pushes originate.
@@ -69,8 +76,10 @@ reads like "allow one direct push to main" and in fact returns 0 before any guar
 the installed shim's own fail-open -- where python does not resolve, ``.git/hooks/pre-push`` prints
 "THE PUSH GUARD IS OFF for this push" and exits 0, so the loudest failure mode here is the silent
 one. It is local-only, so a different machine or a fresh clone has nothing but the server-side rule --
-which, with ``enforce_admins`` OFF, is nothing at all when the pusher is an admin. Do not read "the
-server would have caught it" into any of those gaps.
+which, with ``enforce_admins`` currently ON, does refuse a direct push to ``main`` even from an admin.
+That is a real backstop and it is deliberately not leaned on: it is one API call away from being off,
+it says nothing about ``cla-signatures``, and it cannot see the private-document check at all. Do not
+read "the server would have caught it" into any of those gaps.
 
 HISTORY, because the reasoning inverted. This note used to say ``enforce_admins=true`` was deliberately
 NOT enabled, because an intermittent harness-monitor failure was blocking consecutive PRs and removing
@@ -279,12 +288,22 @@ def main(argv: list[str]) -> int:
 
     if "protected" in fired:
         # This paragraph is a COMPENSATING-CONTROL claim, read at the one moment it can still change
-        # what the operator does, so it has to be true THEN. It used to say protection would refuse the
-        # push server-side anyway -- "a PR + 12 checks, enforce_admins ON" -- which the live API
-        # contradicts on both halves: the count was stale, and enforce_admins is FALSE, so for an admin
-        # there is no server-side refusal to fall back on and this hook is the whole control.
-        # Reassurance about a guard that is switched off is worse than saying nothing: it invites
-        # --no-verify on the belief that something downstream still catches it.
+        # what the operator does, so it has to be true THEN -- SDS-3.7, and this string has now been
+        # wrong in BOTH directions, which is why it says as little as it can get away with.
+        #
+        # It once claimed protection would refuse the push anyway ("a PR + 12 checks, enforce_admins
+        # ON") when the setting was OFF: reassurance about a guard that is switched off, which invites
+        # --no-verify on the belief that something downstream still catches it. It was then corrected
+        # to "enforce_admins is OFF", and the setting was turned back ON without this line following.
+        # So it spent that period UNDER-stating protection instead -- the safer direction, but still a
+        # false statement delivered at the moment of action, and still a reason to distrust the rest of
+        # the paragraph.
+        #
+        # THE FIX IS TO STOP RESTATING THE SETTING HERE AT ALL. Its value is not this file's to know:
+        # it lives on the server, it has moved at least three times, and every in-repo copy of it has
+        # been stale at some point. What the operator needs is true under either value -- the push is
+        # publication and cannot be taken back -- so that is what this says. The live value is one
+        # command away and is named rather than quoted.
         #
         # It points at .github/required-contexts.txt instead of quoting a count, because the set has
         # moved repeatedly inside one day and a number here would be a future lie -- that file's own
@@ -297,10 +316,12 @@ def main(argv: list[str]) -> int:
         # control.
         print(
             "  This repo IS the published artifact -- a push to main is publication, immediately, and\n"
-            "  cannot be taken back. Do NOT expect the server to stop it: enforce_admins is OFF, so\n"
-            "  branch protection does not apply to an admin's direct push, and this hook is the only\n"
-            "  thing refusing it. Required checks gate MERGING a PR (see .github/required-contexts.txt),\n"
-            "  not this push -- and cla-signatures is not covered by protection at all.\n"
+            "  cannot be taken back. Do not count on the server to stop it: whether branch protection\n"
+            "  refuses an admin's direct push depends on enforce_admins, which is a server setting this\n"
+            "  hook cannot read and which has changed more than once. Check it if it matters:\n"
+            "      gh api repos/MEFORORG/MessageFoundry/branches/main/protection/enforce_admins\n"
+            "  Either way, required checks gate MERGING a PR (see .github/required-contexts.txt), not\n"
+            "  this push -- and cla-signatures is not covered by protection at all.\n"
             "\n"
             "  Push a branch and open a PR instead:\n"
             "      git switch -c <branch> && git push -u origin <branch>",
