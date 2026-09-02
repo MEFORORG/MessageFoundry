@@ -24,10 +24,15 @@ secure cookie + HSTS) engages — is an **XL**: it means moving the whole API to
 and migrating every client (harness, `apiclient`, tray, IDE) in lockstep. Out of scope here."*
 It shipped an http-safe hardening subset over the loopback secure-context **without** auto-TLS.
 
-That decline was reasonable on the information it had. **The sizing claim it rests on is
-measurably false**, which is why this ADR supersedes the decision rather than merely amending it.
+That decline was reasonable, and **its sizing was broadly right**. The client migration is real,
+and the measurement below puts it at **more** work than 0143 estimated, not less.
 
-## The measurement that overturns the sizing
+What 0143 missed is that the two halves are **separable**. The engine can serve TLS before every
+client has been migrated. So this ADR supersedes the decision on **separability plus the
+zero-deployment argument** in Consequences, and **not** on any claim that the client work is
+small. It is not small.
+
+## What the client migration actually costs
 
 0143 sized the client migration as four clients moving in lockstep. Measured on `origin/main`:
 
@@ -38,9 +43,44 @@ measurably false**, which is why this ADR supersedes the decision rather than me
 | IDE | **Does not.** Its `tls_cert_file` hits are MLLP *connector* schema — the same name for a different setting |
 | harness | **Does not infer — it assumes.** Hardcoded `http://127.0.0.1:8765` |
 
-So it is **one inference site plus a set of hardcoded defaults**, not a four-way lockstep
-migration. Each default is a one-line flip. The XL that justified declining the full fix does
-not exist.
+That table counts how each client **infers** the scheme, and inference is the smaller half. The
+**defaults** are the larger half, and they are not one-line flips.
+
+**The client-side scheme defaults are at least 14** (BACKLOG #1276, measured 2026-08-23). A strict
+`= "http://` predicate over engine-URL defaults, non-test and with XML namespaces excluded against
+a working control, returns **11 sites**, and it provably misses at least three more. It is stated
+as a **floor** because the predicate is known to under-count. A figure of **8** circulated in
+session mail and was never measured; it is recorded here so it is not quoted again.
+
+**A scheme flip alone would not work, because no first-party client can verify the minted pair.**
+Nothing installs it into a trust store, so flipping a default alone trades a wrong-scheme error
+for a certificate-verification error.
+
+- **The tray needs a certificate pin seam, not a flip.** `messagefoundry/tray/probe.py` verifies
+  against the OS trust store, and its own module docstring says verification is *never* disabled
+  and there is no `verify=False` path by design. That is correct and stays. What is missing is a
+  way to point it at the generated PEM.
+- **The IDE has no certificate-authority seam at all.** Searching `ide/src` for
+  `rejectUnauthorized`, `NODE_EXTRA_CA_CERTS`, `createSecureContext` or a `ca:` option returns
+  **zero** files, against a positive control on `minVersion` that fires in 2 files across a
+  108-file corpus. The seam has to be built.
+
+**This change migrated one client family, and the cost is the evidence.** `harness/load/` moved to
+https here: **4 one-line scheme flips, and 200 inserted lines** across 8 files. The difference is
+a new 108-line `harness/load/tlsmat.py`, absent from `origin/main`, plus `cacert` threading
+through `enginepoll.py`, `multishard.py`, `shardcert.py` and `failover.py`. The CI legs tell the
+same story: every caller had to **pin** the generated PEM, with `curl --cacert` on the load legs
+and a Python `ssl` `cafile` probe on `windows-service-smoke`, because PowerShell's
+`Invoke-RestMethod` has no CA-pinning parameter.
+
+So one-line flips do occur. **What does not occur is a flip standing alone** -- each one needs a
+pin beside it, and that is the work 0143 sized as an XL.
+
+**The XL is real and this ADR does not claim otherwise.** What makes the decision correct is that
+the halves separate cleanly, and BACKLOG #1276 anticipated this and authorised the split in its
+own words: *"This item is the mint-and-serve half plus whatever minimum makes those four agree on
+the scheme. If the client work turns out to be the bulk, split it rather than letting this item
+quietly become ADR 0143's XL."* The client work is the bulk. It is **part B** under that item.
 
 ## Decision
 
@@ -93,7 +133,14 @@ reaches the engine over plaintext, and 0143's http-safe subset is what covers it
 
 - An operator reaching the console for the first time gets a **trust interstitial** until the
   generated certificate is imported. `docs/TRAY.md` already documents that import.
-- Every first-party client default becomes `https`. `service_toml_uses_tls` becomes vestigial.
+- **The operator-facing client defaults do not change here.** `messagefoundry/tray/`,
+  `messagefoundry/apiclient/`, `ide/`, `harness/__main__.py` and `harness/monitor.py` are all
+  **zero files changed** by this ADR's implementation. They still default to `http` and move under
+  BACKLOG #1276 **part B**. Only `harness/load/` migrated here, and it needed a pin seam to do it.
+- **`service_toml_uses_tls` does not become vestigial. It becomes wrong**, and that is worse. It
+  reads `[api].tls_cert_file`, which a minting engine deliberately never writes, so it returns
+  `False` while the engine serves https, and one caller turns that `False` into an `http` URL.
+  Repairing it is part B's first job.
 - **No deployment axis** ([§0](../../CLAUDE.md)) — zero instances, so nothing is served in the
   clear today and no upgrade breaks anyone. The change is cheap now and gets dearer with every
   client that learns the scheme its own way.
