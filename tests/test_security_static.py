@@ -1018,12 +1018,20 @@ def test_xml_import_scanner_sees_indented_imports() -> None:
 
 # --- WP-L3-02 (ASVS 11.1.3): cryptographic-discovery gate --------------------
 
-#: Crypto call sites in :data:`_CRYPTO_ROOTS` that live OUTSIDE ``messagefoundry/`` — i.e. the ones
-#: ``crypto_inventory_check.py``'s own ``INVENTORY`` does not cover, because the shipped CLI still
-#: defaults to that single package. Recorded here so the walk-roots comment's claim ("walked anyway so
-#: a new one cannot appear outside the inventory") is enforced today rather than promised. When
-#: BACKLOG #282 widens the gate itself to these roots this pin becomes redundant and should be deleted
-#: in favour of the gate's inventory.
+#: Crypto call sites in :data:`_CRYPTO_ROOTS` that live OUTSIDE ``messagefoundry/``, kept as a
+#: hand-maintained duplicate of the corresponding slice of ``crypto_inventory_check.py``'s own
+#: ``INVENTORY`` so drift between the two is caught rather than assumed.
+#:
+#: STALE CLAIM CORRECTED (measured 2026-08-25): this docstring used to say the gate's own INVENTORY
+#: "does not cover" these paths "because the shipped CLI still defaults to" messagefoundry/ alone,
+#: and that BACKLOG #282 widening the walk would make this set redundant. #282 already landed --
+#: WALK_ROOTS is ``("messagefoundry", "messagefoundry_webconsole", "harness", "tee", "scripts")``
+#: today, and every entry below already has a matching entry in the gate's own INVENTORY (confirmed
+#: by grep, not assumed). So this set is not filling a gap the gate misses; it is a second,
+#: independently-maintained copy of one slice of it -- the same redundant-check shape #1301's and
+#: #1338's banner guards use elsewhere in this ledger. Left as a TODO rather than deleted here: doing
+#: that properly means confirming every remaining entry really is duplicated (not just the one this
+#: commit is adding) and is a separate, larger cleanup from the fix this commit is landing.
 _CRYPTO_SITES_OUTSIDE_THE_PACKAGE = {
     # ADR 0156: SHA-256 over the ASVS corpus FILE to pin it to the tagged release. No key.
     "scripts/asvs/scorecard.py": frozenset({"hashlib"}),
@@ -1035,6 +1043,10 @@ _CRYPTO_SITES_OUTSIDE_THE_PACKAGE = {
     # ref would name something the reader cannot resolve. No key.
     "scripts/asvs/anchor_report.py": frozenset({"hashlib"}),
     "messagefoundry_webconsole/_security.py": frozenset({"secrets"}),
+    # BACKLOG #1276 part A: the harness supplies its own TLS certificate for a spawned engine rather
+    # than chasing the one the engine mints -- see crypto_inventory_check.py's INVENTORY entry for
+    # the same file, which this duplicates.
+    "harness/load/tlsmat.py": frozenset({"ssl"}),
     "tee/__main__.py": frozenset({"ssl"}),
     "tee/anon/keying.py": frozenset({"hashlib"}),
     "tee/mefor_api.py": frozenset({"ssl"}),

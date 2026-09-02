@@ -2871,15 +2871,33 @@ def _serve(args: argparse.Namespace) -> int:
         # server implementation/version to an unauthenticated caller.
         "server_header": False,
     }
-    if settings.api.tls_enabled:
+    # BACKLOG #1276: THE ENGINE ALWAYS SERVES TLS. Owner ruling 2026-08-22 (option 3), which
+    # SUPERSEDES ADR 0143's premise that the console is hardened "over a cleartext loopback
+    # secure-context WITHOUT auto-TLS". An operator certificate always wins; with none configured
+    # the engine mints a self-signed placeholder rather than opening a cleartext socket.
+    #
+    # Unconditional on purpose: a CONDITIONAL scheme is what let the tray, the harness and the
+    # DAST target each decide it their own way, which is the defect this item exists to remove.
+    from pathlib import Path as _Path
+
+    from messagefoundry.api.tls import build_api_ssl_context, ensure_api_tls_material
+
+    _material = ensure_api_tls_material(
+        settings.api, state_dir=_Path(settings.store.path).resolve().parent
+    )
+    if _material is not None:
+        _cert, _key = _material
+        # _key is None when the operator embedded the private key in the cert PEM (tls_key_file is
+        # optional). WRITE IT THROUGH AS None: model_copy does NOT re-validate, so whatever lands
+        # here reaches ssl.load_cert_chain(keyfile=...) raw, and it reads a combined PEM only for
+        # None -- "" raises OSError [Errno 22] and the engine would refuse to start.
+        _api_tls = settings.api.model_copy(update={"tls_cert_file": _cert, "tls_key_file": _key})
         # WP-13a: terminate TLS in-process. Build the context now so a bad cert/key/passphrase fails
         # fast (before uvicorn opens the socket); pass it via uvicorn's ssl_context_factory so the
         # tls_min_version floor is enforced exactly.
-        from messagefoundry.api.tls import build_api_ssl_context
-
         # #285: build_api_ssl_context preflights [api].tls_client_ca_file (pin + owner-only DACL) at
         # construction; enforcing is the [security].enforcement refuse/warn dial.
-        ctx = build_api_ssl_context(settings.api, enforcing=enforcing)
+        ctx = build_api_ssl_context(_api_tls, enforcing=enforcing)
         run_kwargs["ssl_context_factory"] = lambda config, default_factory: ctx
         # ADR 0083 activation: only when in-process mTLS (client CA) AND a cert-identity map are BOTH
         # configured, swap in the scope-populating HTTP protocol so a verified peer cert reaches

@@ -3,9 +3,9 @@
 
 # ADR 0143 — Web console on by default (disableable), with loopback secure-context browser hardening
 
-- **Status:** Accepted (2026-07-21)
+- **Status:** **Superseded in part (decision only) — 2026-08-22 by [ADR 0172](0172-the-engine-always-serves-tls-minting-a-self-signed-certificate-on-first-run.md).** 0172 overturns this ADR's DECISION and keeps its ANALYSIS, in its own words: *“Its analysis stands; only its decision is superseded.”* The diagnosis below — that `effective_https` gated two coupled concerns on one signal, and that a secure cookie over cleartext http is dropped by Chrome and Safari and *breaks login* — is what 0172 cites as the reason its own change is the better end state. **The `app.state.loopback` mechanism is vestigial only where the engine terminates TLS**: the `tls_terminated_upstream` topology still reaches the engine over plaintext, and this ADR's http-safe subset is what covers it. See 0172's “What of ADR 0143 survives”. (Original status: *Accepted (2026-07-21)*.)
 - **Date:** 2026-07-21
-- **Related:** [ADR 0065](0065-web-ops-dashboard.md) (the web ops console — amended: default flipped on) · [ADR 0118](0118-secure-by-default-security-configuration-section.md) (the `[security]` secure-by-default section — `serve_web_console` default flipped; reframed as surface-reducing, not a loosening) · [ADR 0068](0068-browser-webauthn-passkeys-offloopback.md) (the off-loopback exposure ladder — now runs for an explicitly-enabled console) · [docs/SECURITY-LOOSENING.md](../SECURITY-LOOSENING.md) · docs/security/OFF-LOOPBACK-DEPLOYMENT.md
+- **Related:** [ADR 0172](0172-the-engine-always-serves-tls-minting-a-self-signed-certificate-on-first-run.md) (supersedes the decision above) · [ADR 0065](0065-web-ops-dashboard.md) (the web ops console — amended: default flipped on) · [ADR 0118](0118-secure-by-default-security-configuration-section.md) (the `[security]` secure-by-default section — `serve_web_console` default flipped; reframed as surface-reducing, not a loosening) · [ADR 0068](0068-browser-webauthn-passkeys-offloopback.md) (the off-loopback exposure ladder — now runs for an explicitly-enabled console) · [docs/SECURITY-LOOSENING.md](../SECURITY-LOOSENING.md) · docs/security/OFF-LOOPBACK-DEPLOYMENT.md
 
 ---
 

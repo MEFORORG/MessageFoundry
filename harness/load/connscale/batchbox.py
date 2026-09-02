@@ -197,7 +197,7 @@ def build_remote_argv(
         "harness",
         "connscale-remote",
         "--engine-url",
-        f"http://{engine_host}:{api_port}",
+        f"https://{engine_host}:{api_port}",
         "--engine-host",
         engine_host,
         "--inbound-base",

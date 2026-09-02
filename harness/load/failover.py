@@ -58,6 +58,7 @@ from harness.load.profile import Failover, LoadProfile, Phase
 from harness.load.report import EXIT_OK, EXIT_SLO_VIOLATION, SloCheck
 from harness.load.sender import ConnectionPool, Dispatcher
 from harness.load.sink import CorrelationSink
+from harness.load.tlsmat import harness_ssl_context, harness_tls_material
 
 _STOP_GRACE = 5.0
 _SETTLE = 0.5  # let the final ACKs/arrivals settle before the truly-final engine sample
@@ -118,8 +119,20 @@ class EngineNode:
     ) -> None:
         self.node_id = node_id
         self.api_port = api_port
-        self.url = f"http://127.0.0.1:{api_port}"
+        # The engine always serves TLS (BACKLOG #1276 part A). This harness SUPPLIES the certificate
+        # (below) rather than letting the node mint its own placeholder, so the anchor is known before
+        # the process starts -- see harness.load.tlsmat for why that ordering matters.
+        self.url = f"https://127.0.0.1:{api_port}"
         self._env = dict(env)
+        # Hand this node the run's certificate as operator-supplied [api] material.
+        # ensure_api_tls_material returns tls_cert_file on its FIRST branch and never mints over it,
+        # so the generated-placeholder path is unreachable for a harness node. setdefault, so a
+        # scenario that wants to exercise the minting path itself can still override.
+        _cert, _key = harness_tls_material()
+        self._env.setdefault("MEFOR_API_TLS_CERT_FILE", _cert)
+        self._env.setdefault("MEFOR_API_TLS_KEY_FILE", _key)
+        #: The PEM a client must pin to reach THIS node (EngineClient(cacert=...)).
+        self.cacert = self._env["MEFOR_API_TLS_CERT_FILE"]
         # GIVEN 1 (ADR 0148): the default env `dev` now derives PHI, so a bare `serve --env dev` runs the
         # secure PHI posture (keyless/egress/retention/notify refusals). This harness node serves the
         # SYNTHETIC load graph (no real PHI), so declare the loud opt-out — matching the `--env dev`
@@ -480,7 +493,12 @@ async def run_failover_load(
         for tag, api in (("a", ports.api_a), ("b", ports.api_b))
     ]
 
-    async with httpx.AsyncClient(timeout=4.0) as client:
+    # Pin to the run's own certificate. The harness minted it, so verifying costs nothing and keeps
+    # these ad-hoc probes on the same posture as EngineClient, which offers pinning and no way to
+    # switch verification off. (Chasing the cert the ENGINE mints was the alternative and was
+    # declined: it does not exist until the engine writes it, so every client would wait on a file
+    # whose timeout presents identically to the bug this fixes.)
+    async with httpx.AsyncClient(timeout=4.0, verify=harness_ssl_context()) as client:
         try:
             await sink.start()
             for node in nodes:
