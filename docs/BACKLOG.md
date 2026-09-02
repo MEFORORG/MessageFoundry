@@ -19567,3 +19567,73 @@ The author identified this failure mode precisely, named its consequence exactly
 **Nearest existing mechanism:** `tests/test_merge_gate_controls.py` already pins this workflow's trigger list, including that dropping `labeled` reddened nothing before that test existed. A staleness assertion belongs beside it.
 
 **Related:** #1413 covers the absence of any trigger that notifies a reviewer; this is the complementary defect in what the gate *reports* once a label exists.
+
+## 1421. Record what the #1277 grant-trail default costs: unbounded audit_log growth, a standalone commit per authenticated read, and a decision record outside the ADR
+
+> 🔢 **Filed 2026-09-02 -- not started. THIS ROW RECORDS COSTS AND DOES NOT PICK A FIX.** PR 749 landed #1277, so on the shipped default `[security].audit_all_authorization_decisions` and the `[diagnostics].audit_all_authz` field it desugars to are both `true`, and every authenticated request on a `require()`-gated route writes one `auth.permission_granted` row. **At least four costs came with it**, none of which changes #1277's verdict. They are filed here so they are tracked work rather than prose in a merged discussion. **The levers named so far -- a retention bound, a rate or sampling bound on read grants, or enrolling audit in the ADR 0055 group committer -- are NOT chosen here.** One of them turns on whether deleting an audit row breaks the tamper-evident chain, and cost 1 below records that two files on `main` give different answers to that question.
+> Verdict: owner-ruling
+> Research: none
+> Closing-act: owner-ruling
+
+**Cluster:** Audit completeness / secure defaults. **Priority:** P2 -- inherited from #1277's band, not separately scored. **Verdict:** owner-ruling.
+**Severity:** no deployment axis (sec. 0). Zero instances run, so nothing is growing, contending for a lock, or mis-recorded today. Every cost below is written as what a **first** deployment would meet.
+
+**#1212 IS ADJACENT AND IS NOT THE SAME SUBJECT.** #1212 is about PHI-**body** retention -- `messages_days` and `dead_letter_days`, the windows over message bodies and dead-letter rows -- and it closed on a corrected premise (a default, not a floor). This row is about `audit_log`, a different table whose keep-forever posture #1212's own first trap insists on in terms: *"`audit_days` MUST STAY `0`"*. Do not merge the two. #1212 argues a body window should be bounded; this row records that nothing bounds the audit table and that the repository disagrees with itself about why.
+
+**WHAT THIS ROW DOES NOT REPEAT.** #1277 carries the route counts, the per-request row ceiling and the `authorize_ws` frequency, and PR 749's body carries the sweep that produced them. Read them there. Everything below was re-measured on this branch's base, `efe061a3f`, rather than inherited.
+
+### Cost 1 -- nothing bounds `audit_log`, and the two records on `main` disagree about why
+
+Measured at `efe061a3f`:
+
+- `[retention].audit_days` defaults `0` and is accepted at load but never enforced ([`config/settings.py`](../messagefoundry/config/settings.py), the `audit_days` field and the comment block above it).
+- The Store protocol carries **no audit purge**. [`store/base.py`](../messagefoundry/store/base.py) declares `purge_alert_instances`, `purge_message_bodies`, `purge_dead_letters`, `purge_state`, `purge_connection_events`, `purge_search_presets`, `purge_reference_snapshots` and `purge_expired_sessions` -- eight purge entry points, none of them for `audit_log`. Those eight are the **positive control** on the sweep: a pattern that found nothing anywhere would be indistinguishable from a protocol with no purge methods at all.
+- `[retention].max_db_mb` is advisory. Its own comment says it never auto-deletes.
+
+So on a first deployment the table would grow for the life of the instance, one row per authenticated request on each affected route, with no configured window able to stop it.
+
+**THE PART THAT IS NEW HERE: two files give DIFFERENT reasons for keep-forever, and the reason decides which levers exist at all.**
+
+| source | the reason it gives |
+|---|---|
+| [`config/settings.py`](../messagefoundry/config/settings.py), above `audit_days` | both -- the table is a tamper-evident hash chain, **and** HIPAA expects about six-year retention |
+| [`docs/PHI.md`](PHI.md) section 2, the `audit_log.detail` row | both -- *"45 CFR 164.316(b)(2)(i) six-year documentation retention; deleting rows would break the tamper-evident hash chain"* |
+| [`config/retention_classification.py`](../messagefoundry/config/retention_classification.py), its header | **one, and it excludes the other in terms** -- the rationale *"rests on the audit-retention requirement itself (see `docs/PHI.md` section 8), **not on chain-breakage**"* |
+
+**The section that third file cites states no rationale at all.** `docs/PHI.md` section 8 lists `audit_log` among the keep-forever tiers and says `audit_days` is reserved and not enforced. It gives no reason, so it cannot be the authority for the narrower one.
+
+This is load-bearing rather than cosmetic. If chain-breakage holds, in-place deletion is closed and only an archive-then-verify path is open. If it does not, an ordinary age window is available and the only bar is the retention requirement. **Nothing on `main` settles it, and it should be settled before anyone sizes a bound.**
+
+### Cost 2 -- the per-request cost is a standalone COMMIT on the store's write lock, not merely a row
+
+#1277 and PR 749 both state this. It is re-traced here rather than inherited, at `efe061a3f`:
+
+1. [`api/security.py`](../messagefoundry/api/security.py) -- `require()` awaits `auth.audit_permission_granted(...)` **after** the permission loop and **before** it returns the identity, so the write completes before the route body runs.
+2. [`auth/service.py`](../messagefoundry/auth/service.py) -- `audit_permission_granted` calls `_audit`, which calls `Store.record_audit`.
+3. [`store/store.py`](../messagefoundry/store/store.py) -- `record_audit` takes `self._lock`, SELECTs the chain head, computes the row hash, INSERTs, and calls `self._commit()` **inside** the lock.
+4. Same file -- `_commit` is a bare `self._db.commit()` wrapper whose own docstring says it *"moves NO commit boundary"*.
+5. Same file -- the ADR 0055 group committer excludes audit by name: *"claim\*/reference-snapshot/audit stay STANDALONE"*.
+
+That is the same `self._lock` the staged-pipeline handoffs take. On a first deployment each authenticated GET on an affected route would contend with ingest for it, and no batching lever applies.
+
+**ONE ADDITION TO WHAT PR 749 RECORDED.** `record_audit` also calls `emit_audit_tee` after the commit, a **synchronous** emit to the `messagefoundry.audit` logger. It sits outside the lock deliberately, so it cannot hold the writer -- but it is not awaited and therefore runs on the event loop, so on an instance with off-box syslog forwarding configured it is per-request work too, and how much depends on the handler. This is a **frequency** change and not a new path: the tee already ran for the narrow set.
+
+### Cost 3 -- the `False` fallback in `_audit_all_authz` is defensible, and the reason its docstring gives is not the reason
+
+[`api/security.py`](../messagefoundry/api/security.py), `_audit_all_authz`, returns `getattr(app_state, "audit_all_authz", False)`. Its docstring says the fallback *"stays False deliberately"* because *"inventing a grant row for an app whose auth wiring is unknown is not a safer guess than declining to."*
+
+**The word "inventing" does not survive the call sites.** Both are reached only **after** authorization has already succeeded -- in `require()` the read sits below the permission loop, and `authorize_ws` has the same shape. A row written there would record a grant that really happened, so nothing is invented. The real argument is *"do not change behaviour for an app that never went through the factory"*, which is a different and weaker claim than the one written down.
+
+**The behaviour itself is not in question, and this row does not ask for it to change.** It preserves prior behaviour for a hand-built `app.state` -- a test double or an embedder -- and both sides are pinned in [`tests/test_auth_hardening.py`](../tests/test_auth_hardening.py): the fallback for a hand-built state, and the shipped default through the factory. Recorded so that whoever next touches that fallback revisits the argument instead of inheriting it.
+
+### Cost 4 -- the decision procedure kept no durable record of its own inputs
+
+#1277 reversed a default that [ADR 0118](adr/0118-secure-by-default-security-configuration-section.md) section 5 records as an **owner veto point confirmed 2026-07-17**. The owner delegated the call to the Console on 2026-09-02 and the Console decided.
+
+**What the ADR records now**, in its section 5 amendment and in the matching amendment on the "Resolved on acceptance (2026-07-17)" checklist: that the call was delegated, the owner's words on the first question, who decided, and why.
+
+**What it does not record: what was asked, or what the alternatives were.** Two questions went to the owner, four options each. The ADR mentions the second question nowhere, so eight options resolve to one outcome with none of the seven others written down anywhere durable. **A future reader consulting the ADR sees an outcome with no alternatives, which reads as inevitability.** It was not.
+
+**PARTLY CLOSED ALREADY, AND THE CLOSURE SITS IN THE WRONG ARTIFACT.** The full record -- both questions, all eight options, both answers quoted -- is [comment 5515263760 on PR 749](https://github.com/MEFORORG/MessageFoundry/pull/749#issuecomment-5515263760), written 2026-09-02. A pull-request comment is a real improvement on a session transcript, which does not survive its session. It is still not the ADR, and the ADR is what a reader consults. **This limb differs from the first two in shape:** closing it needs no decision about the engine, only the record moved into the artifact people actually read.
+
+**THE GENERAL PROBLEM, stated once so it is not re-derived per incident.** A decision recorded as an outcome plus a delegation is not reviewable. The inputs -- the question, the options, the answer -- are what let a later reader tell a considered call from an arbitrary one, and they are exactly the part that lives in the least durable place.
