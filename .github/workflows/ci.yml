@@ -822,7 +822,34 @@ jobs:
         # pyodbc py3.14 class, which is ESTABLISHED for the database legs and is NOT established for
         # this one -- the item filing this refuses to conclude it. An empty value makes the annotation
         # say CAUSE NOT ESTABLISHED rather than assert a mechanism nobody has measured on this leg.
-        run: bash scripts/ci/retry-native-crash.sh pytest -q -n "$PYTEST_WORKERS" --dist loadfile -m 'not tooling' --ignore-glob='*messagefoundry-webconsole*' -o faulthandler_timeout="$FAULT_TIMEOUT" --timeout="$PYTEST_TIMEOUT"
+        #
+        # `--max-worker-restart=0` IS WHAT STOPS A DEAD WORKER HANGING THIS STEP FOR THE FULL CAP, and it
+        # is here rather than in a watchdog because it removes the state the hang needs instead of bounding
+        # the wait inside it.
+        #
+        # THE MECHANISM, read from the pinned pytest-xdist 3.8.0 on disk rather than inferred. When a
+        # worker's execnet channel closes with no `workerfinished`, `workermanage.py:407` calls it "Not
+        # properly terminated" and `dsession.worker_errordown` runs. With restarts allowed it takes the
+        # else branch at `dsession.py:265-267`: `_clone_node(node)`, which ADDS the replacement to
+        # `_active_nodes`. The controller's `while 1:` loop at `dsession.py:148-157` exits only on an event
+        # or on `_active_nodes` emptying, so if that replacement never reports ready, line 154's
+        # `self.queue.get(timeout=2.0)` polls a silent queue until the step cap fires. With the flag at 0,
+        # `maximum_reached` is true on the first death and `triggershutdown()` ends the session instead.
+        #
+        # THE THREE WATCHDOGS ABOVE CANNOT COVER THIS, and it is not a tuning problem. `--timeout` and
+        # `faulthandler_timeout` are armed inside `pytest_runtest_protocol(item)` and cancelled in its
+        # finally, so they are per-ITEM. Under `-n` the CONTROLLER runs no items, so neither is ever armed
+        # in the one process that is stuck. Measured: four hangs of 25, 25, 26 and 46 minutes of total
+        # silence with `--timeout=60` or `120` in force, each starting at 98-99 percent progress with
+        # `[gwN] node down` as the last content line.
+        #
+        # THE COST IS MEASURED AT ZERO, which is the only reason this is safe. Disabling restarts means a
+        # worker death fails the run rather than being survived. Sampled 33 completed `test (...)` jobs
+        # across 12 runs: 32 carried no `node down` at all, 1 carried one and hung, and ZERO carried one
+        # and still passed. The recovery path this disables has not saved a single run in that window.
+        # `retry-native-crash.sh` cannot help here either: under `-n` a worker segfault surfaces as a
+        # controller-side node-down, not as exit 139, so the wrapper never sees it.
+        run: bash scripts/ci/retry-native-crash.sh pytest -q -n "$PYTEST_WORKERS" --dist loadfile --max-worker-restart=0 -m 'not tooling' --ignore-glob='*messagefoundry-webconsole*' -o faulthandler_timeout="$FAULT_TIMEOUT" --timeout="$PYTEST_TIMEOUT"
 
       # THE MARGIN CHECK (BACKLOG #344 proposal 1). Last in the job so a LOW margin cannot skip a suite
       # that has not run yet -- a step `if:` with no status function carries an implicit `success()`,

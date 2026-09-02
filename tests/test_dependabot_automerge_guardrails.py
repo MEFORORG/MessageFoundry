@@ -43,7 +43,7 @@ from typing import NamedTuple
 
 import pytest
 import yaml
-from _bash_resolver import bash_candidates, require_bash
+from _bash_resolver import bash_candidates, probe_env, require_bash
 
 _ROOT = Path(__file__).resolve().parent.parent
 _WORKFLOW = _ROOT / ".github" / "workflows" / "dependabot-auto-merge.yml"
@@ -221,7 +221,12 @@ def _run_step_body(
     out_file = tmp_path / f"{step_id}.githuboutput"
     out_file.write_text("", encoding="utf-8")
 
-    full_env = dict(os.environ)
+    # THE SCRIPT UNDER TEST NEEDS REAL UTILITIES, NOT JUST THE INTERPRETER (BACKLOG #1373). These
+    # steps run `tr`, `grep` and `sort`; inheriting a PATH that lacks them -- which is what PowerShell
+    # and cmd supply -- fails the CHILD at 127 even once `require_bash` has found a working bash. So
+    # the same directory the resolver probes with is appended here. It is APPENDED, so the stub
+    # directory prepended below still wins and `_assert_stubs_win` keeps measuring what it measures.
+    full_env = probe_env(Path(bash), dict(os.environ))
     for key, value in (step.get("env") or {}).items():
         if "${{" not in str(value):
             full_env[str(key)] = str(value)
