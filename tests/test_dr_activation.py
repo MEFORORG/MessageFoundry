@@ -108,12 +108,31 @@ async def test_acquire_vip_or_abort_records_audit(tmp_path: Path) -> None:
 
 async def test_vip_hook_timeout_aborts(tmp_path: Path) -> None:
     # A hook that exceeds takeover_timeout_seconds = "not acquired" → abort (no hang).
+    #
+    # THE BUDGET IS 3.0s AND NOT 0.3s, AND THAT IS THE WHOLE POINT OF THIS COMMENT.
+    # `takeover_timeout_seconds` bounds TWO things, not one: the VIP takeover hook this test is
+    # about, and -- earlier in `activate()` -- the cold-seed restore-verify. At 0.3s the second one
+    # lost the race intermittently and aborted with kind="key" ("the cold-seed key could not be
+    # resolved within 0.3s", ADR 0048 AC-14), so the test failed asserting "vip" against a real
+    # timeout of the WRONG step. It reads as a key-resolution defect and is not one.
+    #
+    # MEASURED before this change: it reds `main`, not just a feature branch -- run 33570805647 at
+    # adf8d5905 on 2026-09-01, same assertion, same abort message. Across the 120 most recent CI
+    # runs, 2 of the 5 failures of the `test (windows-2022, py3.14)` leg were this one test.
+    # Restore-verify decrypts a ~370 KB archive, opens the tar twice and runs a sqlite
+    # integrity_check plus two COUNT(*)s -- inside 300 ms, on a 4-vCPU Windows runner under
+    # `pytest -n 4`. The median sits close enough to the budget that contention crosses it.
+    #
+    # 3.0s KEEPS THE TEST HONEST. The hook sleeps 30s, so it still exceeds the budget by 10x and
+    # the VIP abort is still what this asserts; only the unrelated step stops being marginal.
+    # Every other test in this file uses the 30.0s default (config/settings.py), which is why this
+    # one was the only one exposed.
     store, archive, ss = await _seed(tmp_path)
     try:
         # A portable "sleep a while": python is always present in this environment.
         slow = f'"{sys.executable}" -c "import time; time.sleep(30)"'
         coord, state = _coord(
-            store, ss, seed_archive=archive, takeover_hook=slow, takeover_timeout_seconds=0.3
+            store, ss, seed_archive=archive, takeover_hook=slow, takeover_timeout_seconds=3.0
         )
         with pytest.raises(DrActivationError) as exc:
             await coord.activate(actor="alice")
