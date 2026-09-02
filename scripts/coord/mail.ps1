@@ -161,7 +161,7 @@ function Get-MailRoot {
 # the copy that binds.
 $MAIL_CAP_MESSAGES = 5
 $MAIL_CAP_BODY_BYTES = 2000
-$MAIL_CAP_TOTAL_BYTES = 8000
+$MAIL_CAP_TOTAL_BYTES = 12800
 $MAIL_CAP_LINE_CHARS = 240
 
 function Initialize-Box {
