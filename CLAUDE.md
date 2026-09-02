@@ -257,7 +257,8 @@ retractions. At least these went:
 
 - plan, then wait for the owner's "go" before writing code, as a rule binding a Builder. It still
   binds the Console;
-- the ultracode warn-and-offer gate, as a rule binding every session;
+- the ultracode warn-and-offer gate, as a rule binding a Builder. It still binds the Console, for
+  the same reason the planning gate does: the Console is the seat that can warn somebody and wait;
 - `/clear` and `/compact` as the fix for a stuck session;
 - declaring your own seat with `seat.ps1 -Declare`;
 - routing owner questions through a Liaison.
