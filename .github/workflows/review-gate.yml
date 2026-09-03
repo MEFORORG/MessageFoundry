@@ -34,6 +34,25 @@ name: review gate
 # are unread again, even if the pull request was marked an hour ago. That is the one thing the
 # workflow writes, and it only ever writes in the blocking direction.
 #
+# THE LABEL IS READ LIVE, FROM INSIDE THE JOB (BACKLOG #1417). This step used to read
+# `join(github.event.pull_request.labels.*.name, ',')` -- the label set as it stood when the WEBHOOK
+# FIRED. A queued run therefore reported the truth of its own CREATION time, while branch protection
+# picks the newest check-run by EXECUTION time. Two clocks, and when they disagree the older one is
+# what gets reported. Measured end to end on PR 724 on 2026-09-01: a run created 13:24 executed at
+# 13:43:46, twenty-odd seconds after the label was removed, and reported SUCCESS from its 13:24
+# payload; that success stood for ten minutes on a pull request carrying no `reviewed` label. Nothing
+# but `strict = true` -- an unrelated control -- kept it from merging.
+#
+# READING THE STATUS CONTEXT INSTEAD IS NOT A FIX, and was adopted by two sessions before being
+# refuted: the context inherits the same staleness through the same snapshot. A lower-level proxy of
+# a snapshotted value is still the snapshot. The only live reading is an API call made while the job
+# is running, which is what the label step now does.
+#
+# AND THE LABEL HAS TO POST-DATE THE HEAD IT SITS ON. A live read answers "is the label there now";
+# it does not answer "did it ever cover THESE commits". Label a pull request, push to it, and read
+# the state before the `synchronize` strip lands, and the label is live-present on a head nobody has
+# read. So the step makes a second comparison, and refuses a label older than the head.
+#
 # NO CONCURRENCY BLOCK, DELIBERATELY. This job's name is intended to become a required status
 # context, and a cancelled required check can never go green. backlog-hygiene.yml carried
 # `cancel-in-progress` on a key that collapsed to one group on `merge_group`, and entries cancelled
@@ -58,6 +77,15 @@ on:
   merge_group:
 
 permissions:
+  # `pull-requests: write` is the label REMOVAL on `synchronize`, and the only write here.
+  #
+  # THE TWO READS ARE WHAT THE LIVE CHECK COSTS. Declaring any permission sets every undeclared one
+  # to `none`, so the label step's API calls would 403 without them: `contents: read` for the head
+  # commit's date, `issues: read` for the pull request's label events -- label history lives on the
+  # issue side of a pull request, not the pulls side. A 403 would fail the gate CLOSED, which is the
+  # right direction but would wedge every pull request, so both are named rather than assumed.
+  contents: read
+  issues: read
   pull-requests: write
 
 jobs:
@@ -102,21 +130,72 @@ jobs:
       - name: Require the reviewed label
         if: github.event_name == 'pull_request'
         env:
-          LABELS: ${{ join(github.event.pull_request.labels.*.name, ',') }}
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          NUMBER: ${{ github.event.pull_request.number }}
+          # THESE THREE ARE FACTS ABOUT THE EVENT, NOT STATE READ THROUGH IT, and the distinction is
+          # the whole of #1417. `ACTION` and `LABEL_NAME` describe what happened; an event cannot go
+          # stale about itself. `HEAD_SHA` is the commit this job's check-run ATTACHES to, so it is
+          # the subject of the verdict rather than a mutable property of it. Everything the verdict
+          # DEPENDS on -- whether the label is on the pull request, and when it was applied -- is
+          # fetched below, at execution time, and never taken from the payload.
           ACTION: ${{ github.event.action }}
+          LABEL_NAME: ${{ github.event.label.name }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
-          # On `synchronize` the label was just removed above, so the event payload is stale by one
-          # step. Treat that action as unreviewed by definition rather than reading a value that is
-          # already wrong -- reading the payload here would pass a pull request that was just
-          # invalidated, which is the exact failure this step exists to prevent.
+          # A NEW COMMIT IS UNREAD BY DEFINITION, and this arm is kept as a belt over the live read
+          # rather than as the fix for staleness -- it used to be the fix, applied to the one action
+          # anyone had an instance of. Two reasons it stays. The step above has just removed the
+          # label, and the labels endpoint is not guaranteed to have caught up by the time this step
+          # reads it. And the head-date comparison at the bottom rests on a commit's COMMITTER DATE,
+          # which is client-supplied: a commit authored before the label and pushed after it would
+          # clear that comparison while being genuinely unread.
           if [ "$ACTION" = "synchronize" ]; then
             echo "::error::New commits have not been read. Re-review, then: gh pr edit <N> --add-label reviewed"
             exit 1
           fi
+
+          # LIVE. Not `github.event.pull_request.labels`, which is the snapshot #1417 records.
+          LABELS="$(gh pr view "$NUMBER" --json labels --jq '[.labels[].name] | join(",")')"
+          echo "labels, read at execution time: ${LABELS:-(none)}"
+
+          # EXACT ELEMENT, not substring: `reviewed-by-bot` and `not-reviewed` are not a review.
           case ",$LABELS," in
-            *,reviewed,*)
-              echo "reviewed label present. Gate satisfied." ;;
+            *,reviewed,*) ;;
             *)
               echo "::error::Not yet read by a reviewer. When you have read it: gh pr edit <N> --add-label reviewed"
               exit 1 ;;
           esac
+
+          # THE SECOND COMPARISON: the label must post-date the head it sits on.
+          #
+          # THE CHEAP ANSWER FIRST, and it is also the better-founded one. If a reviewer applied
+          # `reviewed` in the very event that started this run, the label was applied while this head
+          # already existed -- that is a GitHub clock, needs no API call, and cannot lag behind a
+          # write made moments earlier.
+          if [ "$ACTION" = "labeled" ] && [ "$LABEL_NAME" = "reviewed" ]; then
+            echo "the reviewed label was applied by the event that started this run. Gate satisfied."
+            exit 0
+          fi
+
+          # Otherwise ask when it was last applied. `per_page=100` AND `--paginate`: every `gh api`
+          # list route defaults to 30, and a label history read 30 at a time answers a question about
+          # a population it cannot see. `sort | tail -n 1` rather than trusting the page order.
+          LAST_ADD="$(gh api "repos/$GH_REPO/issues/$NUMBER/events?per_page=100" --paginate \
+            --jq '.[] | select(.event == "labeled" and .label.name == "reviewed") | .created_at' \
+            | sort | tail -n 1)"
+          HEAD_AT="$(gh api "repos/$GH_REPO/commits/$HEAD_SHA" --jq '.commit.committer.date')"
+          echo "reviewed last applied ${LAST_ADD:-(no recorded event)}; head $HEAD_SHA dated $HEAD_AT"
+
+          if [ -z "$LAST_ADD" ]; then
+            echo "::error::The reviewed label is on this pull request but no labeled event records when it was applied, so it cannot be shown to cover this head. Re-apply it: gh pr edit <N> --remove-label reviewed && gh pr edit <N> --add-label reviewed"
+            exit 1
+          fi
+
+          # Both timestamps are fixed-width ISO-8601 in UTC, so a string compare is a time compare.
+          if [[ "$LAST_ADD" < "$HEAD_AT" ]]; then
+            echo "::error::The reviewed label was applied at $LAST_ADD, before this head was dated $HEAD_AT, so it never covered these commits. Re-review, then: gh pr edit <N> --remove-label reviewed && gh pr edit <N> --add-label reviewed"
+            exit 1
+          fi
+
+          echo "reviewed label present at execution time and applied after this head. Gate satisfied."

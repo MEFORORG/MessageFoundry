@@ -409,17 +409,25 @@ core.autocrlf, and PATH ordered so the WSL bash comes first).
 context = "a reviewer has read this"
 plants = """
 Six label sets that are not a review -- none at all, unrelated ones, and four NEAR-MISSES
-(`reviewed-by-bot`, `not-reviewed`, `Reviewed`, `re,viewed`) -- plus the stale payload: a `synchronize`
-whose event still carries `reviewed` because the removal step ran one step ago. The gate's OWN shell is
-lifted out of the workflow and run under the flags Actions uses, not re-implemented; a second copy of
-that `case` would be free to agree with itself. Four structural plants sit beside them, because the
-quieter death of this gate is the context never arriving or never clearing: a renamed job, a job-level
-`if:`, a trigger set that cannot report on a pull request or in the merge queue, and a `types:` list
-that does not re-run the job when the reviewer adds the label.
+(`reviewed-by-bot`, `not-reviewed`, `Reviewed`, `re,viewed`) -- plus a `synchronize` whose label is
+still present, because a new commit is unread whatever the label says. The gate's OWN shell is lifted
+out of the workflow and run under the flags Actions uses, not re-implemented; a second copy of that
+`case` would be free to agree with itself, and the `gh` calls it now makes are answered by a shim
+rather than mocked away, so an unanswered call is a loud harness fault instead of a silent refusal.
+Three plants sit on the SNAPSHOT defect (BACKLOG #1417): an event payload that still says `reviewed`
+while the live read says nothing, a label applied twelve hours before the head it sits on, and a
+label whose application nothing records. Four structural plants sit beside them, because the quieter
+death of this gate is the context never arriving or never clearing: a renamed job, a job-level `if:`,
+a trigger set that cannot report on a pull request or in the merge queue, and a `types:` list that
+does not re-run the job when the reviewer adds the label.
 """
 red = [
   "tests/test_merge_gate_controls.py::test_the_review_gate_refuses_a_pull_request_nobody_has_marked_read",
-  "tests/test_merge_gate_controls.py::test_the_review_gate_refuses_a_synchronize_even_when_the_payload_shows_the_label",
+  "tests/test_merge_gate_controls.py::test_the_review_gate_refuses_a_synchronize_even_when_the_label_is_still_present",
+  "tests/test_merge_gate_controls.py::test_the_review_gate_ignores_the_label_set_frozen_in_the_event_payload",
+  "tests/test_merge_gate_controls.py::test_the_review_gate_reads_the_label_live_rather_than_from_the_event_payload",
+  "tests/test_merge_gate_controls.py::test_the_review_gate_refuses_a_label_applied_before_the_head_it_sits_on",
+  "tests/test_merge_gate_controls.py::test_the_review_gate_refuses_when_nothing_records_the_label_being_applied",
   "tests/test_merge_gate_controls.py::test_the_review_gate_still_reports_under_the_required_context_string",
   "tests/test_merge_gate_controls.py::test_nothing_in_the_review_gate_adds_the_label_it_checks_for",
   "tests/test_merge_gate_controls.py::test_the_review_gate_reruns_when_a_reviewer_adds_the_label",
@@ -433,10 +441,19 @@ merge_group entry carries no pull request and therefore no labels, so the label-
 confined to pull_request events -- a required context that can never go green in the queue means
 NOTHING MERGES, which codeql.yml's header records happening here. The trigger list has the same shape
 of asymmetry: every action the gate depends on must be named individually when it is dropped, while a
-list that only ADDS actions must stay clean.
+list that only ADDS actions must stay clean. The BACKLOG #1417 arms carry the same obligation and it
+is sharper there, because each of them is a new way to refuse: a head-date comparison written the
+wrong way round would refuse every correctly-reviewed pull request, and a history read that could not
+see a label a reviewer applied moments ago would refuse the very event that exists to clear the
+check. Reading live also cuts the OTHER way -- a run queued before the label existed now passes on the
+live reading rather than refusing on a snapshot that was already wrong -- and that direction is
+pinned too, because it is the one place this fix makes the gate pass more often.
 """
 green = [
   "tests/test_merge_gate_controls.py::test_the_review_gate_passes_a_pull_request_a_reviewer_has_marked_read",
+  "tests/test_merge_gate_controls.py::test_the_review_gate_passes_a_label_applied_after_the_head_it_sits_on",
+  "tests/test_merge_gate_controls.py::test_the_review_gate_accepts_the_label_event_that_started_the_run",
+  "tests/test_merge_gate_controls.py::test_the_review_gate_clears_a_pull_request_labelled_after_the_run_was_queued",
   "tests/test_merge_gate_controls.py::test_the_review_gate_lets_a_merge_queue_entry_through",
   "tests/test_merge_gate_controls.py::test_the_absence_detector_fires_on_a_trigger_set_that_can_go_quiet",
   "tests/test_merge_gate_controls.py::test_the_label_rerun_detector_fires_on_a_types_list_that_ignores_the_label",
@@ -451,6 +468,15 @@ run:
   * the synchronize comparison changed to a value that never occurs
     (`[ "$ACTION" = "never-happens" ]`), which leaves the gate reading a payload that is stale by one
     step -- 1 red, 10 green, and the one that reddened is the stale-payload control specifically.
+
+THE SNAPSHOT DEFECT WAS MEASURED BEFORE AND AFTER, 2026-09-03 (BACKLOG #1417), by running the PRE-fix
+shell -- lifted from `git show HEAD:.github/workflows/review-gate.yml`, not retyped -- through the
+post-fix control. One arm, one input: the event payload carries `reviewed` and the live read returns
+nothing, which is PR 724's 13:24-vs-13:43 state.
+
+  * BEFORE: exit 0, printing `reviewed label present. Gate satisfied.` -- the gate passing a pull
+    request that carried no `reviewed` label at execution time.
+  * AFTER: exit 1, printing `labels, read at execution time: (none)` and the remedy.
 
 A THIRD SPELLING OF THE SAME NEUTERING IS REPORTED AS A HARNESS FAULT, DELIBERATELY. Replacing the
 test with `if false` removes `$ACTION` from the script, and the fixture refuses to run a script that

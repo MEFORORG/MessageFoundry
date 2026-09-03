@@ -226,9 +226,10 @@ Settle it this way instead.
 4. If no run at all is newer than the label event, the state is unknown and the Console keeps
    polling.
 
-Never inherit the last verdict when the state is unknown. The gate's own version of this staleness is
-BACKLOG #1417. That item is open in PR 731 and not yet on `main`, so it does not resolve on
-`origin/main` today.
+Never inherit the last verdict when the state is unknown. The gate's own version of this staleness
+was BACKLOG #1417, and it is fixed: `review-gate.yml` reads the label live inside the running job
+rather than from the snapshotted event payload. The steps above still bind, because they answer a
+different question -- whether a verdict exists for this head yet, not whether the verdict is honest.
 
 Two more measured facts about PR state, so you do not re-derive them:
 

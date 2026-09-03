@@ -411,7 +411,10 @@ went red, and no workflow reads that label back. So the Console finds both by as
   queued synchronize run has not stripped the label yet, so the label can be present and invalid at
   the same time. When no run is newer than the label event at all, the state is unknown: the Console
   keeps polling, and nobody inherits the last verdict. A Builder never evaluates this, because its
-  process exits before any run reports. Filed as BACKLOG #1417, open in PR 731 and not yet on main.
+  process exits before any run reports. BACKLOG #1417 was the gate's own half of the same staleness
+  and it is fixed: the gate reads the label live inside the job, so a SUCCESS is no longer a
+  snapshot. The join above still binds, because a run that has not reported yet is still not a
+  verdict.
 - Never write the required-context count into a document. `.github/required-contexts.txt` is a
   checked-in claim that can lag the server, so read branch protection for the live set. When the set
   moves, move that file and the pinned count in `tests/test_required_contexts.py` in the same PR, or

@@ -1033,24 +1033,78 @@ _REVIEW_GATE_CONTEXT = "a reviewer has read this"
 _LABEL_STEP = "Require the reviewed label"
 
 
-def _review_gate_script() -> str:
-    """The label-reading step's shell, with the shape this control depends on asserted first."""
+def _label_step() -> dict[str, Any]:
+    """The one step that decides the verdict, located by name rather than by position."""
     steps = jobs_of(_REVIEW_GATE)[_REVIEW_GATE_JOB]["steps"]
     matches = [s for s in steps if _LABEL_STEP in str(s.get("name", ""))]
     assert len(matches) == 1, (
         f"expected exactly ONE step named like {_LABEL_STEP!r} in {_REVIEW_GATE}, found "
         f"{len(matches)}; this control runs THAT step's shell and cannot pick between several"
     )
-    script = str(matches[0]["run"])
-    assert "$LABELS" in script and "$ACTION" in script, (
-        "the label-reading step no longer reads $LABELS and $ACTION, so this control would be feeding "
-        f"input to a script that ignores it and every verdict below would be about nothing: {script!r}"
+    return dict(matches[0])
+
+
+def _review_gate_script() -> str:
+    """The label-reading step's shell, with the shape this control depends on asserted first."""
+    script = str(_label_step()["run"])
+    assert "gh pr view" in script and "$ACTION" in script, (
+        "the label-reading step no longer reads the label with `gh pr view` or no longer reads "
+        "$ACTION, so this control would be feeding input to a script that ignores it and every "
+        f"verdict below would be about nothing: {script!r}"
     )
     return script
 
 
+#: A `gh` shim, defined AHEAD of the shipped shell so the live reads can be answered without a
+#: network, a token, or a pull request.
+#:
+#: THIS IS WHAT MAKES THE FIX TESTABLE AT ALL. Before BACKLOG #1417 the gate's inputs arrived as
+#: environment variables, so a control could set them; now the gate FETCHES them, so a control has to
+#: answer the fetch. The three answers come from `STUB_LABELS`, `STUB_EVENTS` and `STUB_HEAD_AT`.
+#:
+#: AN UNRECOGNISED CALL EXITS NONZERO AND SAYS SO, rather than printing nothing. A shim that answered
+#: everything with silence would let a gate pass on a call it never really made -- and empty output
+#: reads, at every point below, as "no label" or "no event", which is a REFUSAL. The failure would
+#: therefore look like the gate working.
+_GH_SHIM = """gh() {
+  case "$1" in
+    pr) printf '%s\\n' "$STUB_LABELS"; return 0 ;;
+    api)
+      for arg in "$@"; do
+        case "$arg" in
+          */events*) printf '%s' "$STUB_EVENTS"; return 0 ;;
+          */commits/*) printf '%s\\n' "$STUB_HEAD_AT"; return 0 ;;
+        esac
+      done
+      ;;
+  esac
+  echo "gh shim: unhandled call: $*" >&2
+  return 90
+}
+"""
+
+#: The shim's own exit code, kept clear of the gate's `exit 1` so a broken control cannot be read as
+#: a refusal. Same reason 126/127 are separated out below.
+_SHIM_FAULT = 90
+
+#: Defaults that satisfy the head-date comparison, so the label-token cases below stay about the
+#: token. A `reviewed` label applied an hour AFTER the head it sits on is the ordinary shape.
+_HEAD_AT = "2026-09-01T11:00:00Z"
+_LABEL_AT = "2026-09-01T12:00:00Z"
+
+
 def _run_review_gate(
-    bash: str, script: str, workdir: Path, env: dict[str, str], *, labels: str, action: str
+    bash: str,
+    script: str,
+    workdir: Path,
+    env: dict[str, str],
+    *,
+    labels: str,
+    action: str,
+    label_name: str = "",
+    payload_labels: str = "",
+    events: str | None = None,
+    head_at: str = _HEAD_AT,
 ) -> tuple[int, str]:
     """Run the step's shell UNDER THE FLAGS ACTIONS USES, and validate the invocation.
 
@@ -1058,19 +1112,43 @@ def _run_review_gate(
     flags is not decoration: `-e` changes which line can end the script, and a control run under a
     friendlier shell would be measuring a step CI never executes.
 
-    126/127 are a HARNESS fault, never a gate verdict. A caller comparing `code != 0` would otherwise
-    read a broken invocation as "the gate refused this pull request" -- the shape BACKLOG #1216
-    records, where a mangled script path made six assertions vacuously green.
+    `labels` is what the LIVE read returns; `payload_labels` is what the frozen event payload would
+    have said. They are separate arguments because the whole of BACKLOG #1417 is that they can
+    differ, and the gate must follow the first.
+
+    126/127 are a HARNESS fault, never a gate verdict, and `_SHIM_FAULT` is the same class one level
+    in. A caller comparing `code != 0` would otherwise read a broken invocation as "the gate refused
+    this pull request" -- the shape BACKLOG #1216 records, where a mangled script path made six
+    assertions vacuously green.
     """
-    (workdir / "review_gate.sh").write_text(script, encoding="utf-8", newline="\n")
+    (workdir / "review_gate.sh").write_text(_GH_SHIM + script, encoding="utf-8", newline="\n")
     proc = _run(
         [bash, "--noprofile", "--norc", "-e", "-o", "pipefail", "review_gate.sh"],
         workdir,
-        {**env, "LABELS": labels, "ACTION": action},
+        {
+            **env,
+            # The gate's own inputs. `LABELS` is set DELIBERATELY: it is the variable the pre-#1417
+            # step read out of the frozen payload, and leaving it populated is how the control below
+            # can tell a live read from a snapshot.
+            "LABELS": payload_labels,
+            "ACTION": action,
+            "LABEL_NAME": label_name,
+            "NUMBER": "724",
+            "GH_REPO": "MEFORORG/MessageFoundry",
+            "HEAD_SHA": "0" * 40,
+            # The shim's answers.
+            "STUB_LABELS": labels,
+            "STUB_EVENTS": _LABEL_AT if events is None else events,
+            "STUB_HEAD_AT": head_at,
+        },
     )
     out = _text(proc)
     assert proc.returncode not in (126, 127), (
         f"{explain_returncode(proc.returncode, 'the review-gate step')} Output: {out.strip()[:300]}"
+    )
+    assert proc.returncode != _SHIM_FAULT, (
+        "the review-gate step made a `gh` call this control's shim does not answer, so the verdict "
+        f"below would be about a harness fault rather than the gate. Output: {out.strip()[:300]}"
     )
     return proc.returncode, out
 
@@ -1124,19 +1202,30 @@ def test_the_review_gate_refuses_a_pull_request_nobody_has_marked_read(
         )
 
 
-def test_the_review_gate_refuses_a_synchronize_even_when_the_payload_shows_the_label(
+def test_the_review_gate_refuses_a_synchronize_even_when_the_label_is_still_present(
     review_gate: tuple[str, str, Path, dict[str, str]],
 ) -> None:
-    """PLANTED: the STALE PAYLOAD, and the single most load-bearing line in this gate.
+    """PLANTED: a new commit, with the label still readable both ways.
 
-    On `synchronize` the previous step has just removed the label, so the event payload is one step
-    out of date. Reading it would pass a pull request that was invalidated moments earlier. This is
-    the one case where the gate must refuse a payload that says `reviewed`, and it is the whole
-    difference between "a reviewer read THESE commits" and "a reviewer read some earlier ones".
+    The label set is planted as `reviewed` in the live read AND in the frozen payload, and the label
+    event is planted newer than the head, so every other arm of the gate would pass this. On
+    `synchronize` it must refuse anyway: new commits are unread by definition, and the removal step
+    that ran one step earlier is not guaranteed to be visible to the labels endpoint yet.
+
+    This arm survived BACKLOG #1417 rather than being replaced by it. The live read is the general
+    fix; this stays as the belt, because the head-date comparison rests on a commit's committer date,
+    which a client supplies -- a commit authored before the label and pushed after it would clear
+    that comparison while being genuinely unread.
     """
     bash, script, workdir, env = review_gate
     code, out = _run_review_gate(
-        bash, script, workdir, env, labels="reviewed", action="synchronize"
+        bash,
+        script,
+        workdir,
+        env,
+        labels="reviewed",
+        payload_labels="reviewed",
+        action="synchronize",
     )
     assert code != 0, (
         "the gate accepted a `synchronize` on the strength of a label the step before it had already "
@@ -1161,6 +1250,237 @@ def test_the_review_gate_passes_a_pull_request_a_reviewer_has_marked_read(
             f"the gate refused a pull request a reviewer HAD marked read ({why}). labels={labels!r} "
             f"action={action!r}\n{_ascii(out)}"
         )
+
+
+# ---------------------------------------------------------------------------------------------------
+# THE SNAPSHOTTED PAYLOAD. BACKLOG #1417, measured on PR 724 on 2026-09-01.
+# ---------------------------------------------------------------------------------------------------
+#
+# The gate read `join(github.event.pull_request.labels.*.name, ',')`, which is the label set as it
+# stood when the WEBHOOK FIRED. Branch protection picks the newest check-run by EXECUTION time. Two
+# clocks: a run created 13:24 executed at 13:43:46, twenty-odd seconds after the label was removed,
+# and reported SUCCESS from its 13:24 payload. That success stood for ten minutes on a pull request
+# carrying no `reviewed` label, and only `strict = true` -- an unrelated control -- kept it from
+# merging.
+#
+# THE SIGN CONVENTION IS LOAD-BEARING: only a stale SUCCESS is dangerous. A stale FAILURE blocks, which
+# is the safe direction. Two sessions misread a stale failure as a valid label going unhonoured before
+# checking whether the label was there at all.
+
+
+def test_the_review_gate_ignores_the_label_set_frozen_in_the_event_payload(
+    review_gate: tuple[str, str, Path, dict[str, str]],
+) -> None:
+    """PLANTED: the two clocks disagreeing, which is the whole defect.
+
+    `LABELS` is populated with `reviewed` -- exactly what the pre-#1417 step read out of the frozen
+    payload -- while the LIVE read returns nothing, because the label was withdrawn between the event
+    firing and this run executing. The gate must follow the live read and refuse.
+
+    THIS IS THE ARM THAT FAILED BEFORE THE FIX. Run against the pre-#1417 shell the planted `LABELS`
+    is the only input the step consults, so it exits 0 and this assertion reddens.
+    """
+    bash, script, workdir, env = review_gate
+    code, out = _run_review_gate(
+        bash,
+        script,
+        workdir,
+        env,
+        labels="",
+        payload_labels="reviewed",
+        action="labeled",
+        label_name="ci-red",
+    )
+    assert code != 0, (
+        "the gate reported success from the label set frozen in its event payload, on a pull request "
+        f"carrying no `reviewed` label at execution time. BACKLOG #1417.\n{_ascii(out)}"
+    )
+
+
+#: Every place an Actions EXPRESSION can enter a step: its `env:` values, and any `${{ }}` written
+#: inline in the shell. Prose is deliberately not one of them.
+#:
+#: THE OBVIOUS SPELLING IS WRONG HERE, in the same way `_GH_ADD_LABEL` above is. A plain
+#: `"github.event.pull_request.labels" in step` fires on the workflow's own comment, which names the
+#: expression precisely because it is explaining why the step must not use it -- and the "fix" that
+#: invites is deleting the sentence that records BACKLOG #1417.
+def _payload_label_reads(step: dict[str, Any]) -> list[str]:
+    exprs = [str(v) for v in dict(step.get("env", {})).values()]
+    exprs += re.findall(r"\$\{\{.*?\}\}", str(step.get("run", "")), flags=re.DOTALL)
+    return [e for e in exprs if "github.event.pull_request.labels" in e]
+
+
+def test_the_review_gate_reads_the_label_live_rather_than_from_the_event_payload() -> None:
+    """The static half, and the one that cannot be satisfied by luck.
+
+    A behavioural control can be passed by a step that happens to agree with the shim. The property
+    is narrower than that: no EXPRESSION in this step may carry the LABEL SET out of the event
+    payload, because the payload is the snapshot. The head sha and the action are different -- they
+    are facts about the event rather than state read through it -- so they stay allowed by name.
+
+    THE DETECTOR'S OWN ASYMMETRY IS ASSERTED IN THE SAME CALL, because a detector that matches
+    nothing would pass this test on any workflow at all.
+    """
+    step = _label_step()
+    assert _payload_label_reads(
+        {"env": {"LABELS": "${{ join(github.event.pull_request.labels.*.name, ',') }}"}}
+    ), "the detector cannot see the pre-#1417 mapping it exists to catch"
+    assert (
+        _payload_label_reads(
+            {"run": "# not github.event.pull_request.labels, which is the snapshot"}
+        )
+        == []
+    ), "the detector flagged a comment naming the expression rather than an expression using it"
+    found = _payload_label_reads(step)
+    assert not found, (
+        "the label-reading step is back on the frozen webhook payload. A queued run then reports the "
+        "label state of its own creation time while branch protection picks the newest run by "
+        f"execution time, which is BACKLOG #1417 exactly: {found}"
+    )
+    assert "gh pr view" in str(step.get("run", "")), (
+        "the step no longer reads the label with a live API call, so whatever it reads instead is a "
+        "snapshot. Reading the status context is not a fix either -- it inherits the same staleness "
+        "through the same snapshot, which two sessions adopted before it was refuted."
+    )
+
+
+def test_the_review_gate_refuses_a_label_applied_before_the_head_it_sits_on(
+    review_gate: tuple[str, str, Path, dict[str, str]],
+) -> None:
+    """PLANTED: a live-present label that never covered these commits.
+
+    A live read answers "is the label there now". It does not answer "did anyone read THIS head".
+    Label a pull request, push to it, and read the state before the `synchronize` strip lands, and
+    the label is genuinely present on commits nobody has seen. Measured on PR 723: label event
+    03:22:44Z, head commit 15:30:17Z, deciding run created 15:30:44Z -- a comparison against the RUN
+    reports fresh while the label predates the head by twelve hours.
+    """
+    bash, script, workdir, env = review_gate
+    code, out = _run_review_gate(
+        bash,
+        script,
+        workdir,
+        env,
+        labels="reviewed",
+        action="reopened",
+        events="2026-09-01T03:22:44Z",
+        head_at="2026-09-01T15:30:17Z",
+    )
+    assert code != 0, (
+        "the gate accepted a `reviewed` label applied twelve hours before the head it sits on. The "
+        f"label is real; it just never covered these commits.\n{_ascii(out)}"
+    )
+
+
+def test_the_review_gate_refuses_when_nothing_records_the_label_being_applied(
+    review_gate: tuple[str, str, Path, dict[str, str]],
+) -> None:
+    """PLANTED: the label is present and its history is empty, so it cannot be shown to cover the head.
+
+    The safe reading of "I cannot tell" is a refusal, and the remedy is cheap -- re-applying the label
+    writes an event and fires a fresh run. Passing here instead would turn every unreadable history
+    into a green.
+    """
+    bash, script, workdir, env = review_gate
+    code, out = _run_review_gate(
+        bash,
+        script,
+        workdir,
+        env,
+        labels="reviewed",
+        action="opened",
+        events="",
+    )
+    assert code != 0, (
+        "the gate passed a label whose application it could not date, so it could not know the label "
+        f"covered this head.\n{_ascii(out)}"
+    )
+    assert "add-label reviewed" in out, (
+        f"the gate refused but did not name the remedy, which is to re-apply the label.\n{_ascii(out)}"
+    )
+
+
+def test_the_review_gate_passes_a_label_applied_after_the_head_it_sits_on(
+    review_gate: tuple[str, str, Path, dict[str, str]],
+) -> None:
+    """THE ASYMMETRY for the head-date comparison, and it is not decoration.
+
+    A comparison written the wrong way round, or one that refused whenever it had two timestamps,
+    would satisfy the planted case above while wedging every correctly-reviewed pull request. Same
+    inputs as that case with the two timestamps swapped into their ordinary order.
+    """
+    bash, script, workdir, env = review_gate
+    code, out = _run_review_gate(
+        bash,
+        script,
+        workdir,
+        env,
+        labels="reviewed",
+        action="reopened",
+        events="2026-09-01T15:31:02Z",
+        head_at="2026-09-01T15:30:17Z",
+    )
+    assert code == 0, (
+        "the gate refused a pull request whose `reviewed` label was applied 45 seconds AFTER the head "
+        f"it sits on, which is the ordinary shape of a reviewed pull request.\n{_ascii(out)}"
+    )
+
+
+def test_the_review_gate_accepts_the_label_event_that_started_the_run(
+    review_gate: tuple[str, str, Path, dict[str, str]],
+) -> None:
+    """THE ASYMMETRY for the history read, on a GitHub clock rather than a client-supplied one.
+
+    When the run was started by a reviewer applying `reviewed`, the label was applied while this head
+    already existed, so the head-date comparison is answered by construction and no history read is
+    needed. That matters beyond tidiness: the label event a reviewer just wrote is the one most
+    likely not to have reached the events endpoint yet, and refusing there would leave the pull
+    request red with nothing further to re-run it.
+
+    Planted with an EMPTY history and a head dated in the far future, so the fallback path could only
+    refuse. A gate that reached it would redden here.
+    """
+    bash, script, workdir, env = review_gate
+    code, out = _run_review_gate(
+        bash,
+        script,
+        workdir,
+        env,
+        labels="reviewed",
+        action="labeled",
+        label_name="reviewed",
+        events="",
+        head_at="2099-01-01T00:00:00Z",
+    )
+    assert code == 0, (
+        "the gate refused the very event a reviewer creates by marking a pull request read, so the "
+        f"label could never clear the check that the label exists to clear.\n{_ascii(out)}"
+    )
+
+
+def test_the_review_gate_clears_a_pull_request_labelled_after_the_run_was_queued(
+    review_gate: tuple[str, str, Path, dict[str, str]],
+) -> None:
+    """THE OTHER DIRECTION OF THE LIVE READ, recorded because it is a real behaviour change.
+
+    Reading live cuts both ways: where the payload is stale-POSITIVE the gate now refuses, and where
+    it is stale-NEGATIVE the gate now passes. This is the second case -- a run queued before the
+    label existed, executing after it was applied. The old step would have refused it on a snapshot
+    that was already wrong.
+
+    That is the gate passing more often than it used to, and it is the correct verdict rather than a
+    relaxation: the label is on the pull request at execution time and it post-dates the head. A
+    stale refusal is safe but it is still wrong, and here it wedges a pull request that nothing else
+    will re-run.
+    """
+    bash, script, workdir, env = review_gate
+    code, out = _run_review_gate(
+        bash, script, workdir, env, labels="reviewed", payload_labels="", action="ready_for_review"
+    )
+    assert code == 0, (
+        "the gate refused a pull request that carries the `reviewed` label at execution time, on the "
+        f"strength of a payload snapshotted before the reviewer applied it.\n{_ascii(out)}"
+    )
 
 
 def test_the_review_gate_still_reports_under_the_required_context_string() -> None:
