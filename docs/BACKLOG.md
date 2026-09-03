@@ -3362,18 +3362,42 @@ This is **wider than the disclosure describes.** [`CONFIGURATION.md:718`](CONFIG
 
 ## 332. Release signing toolchain is unhashed
 
+> 🚧 **Status 2026-09-03 — THE MECHANISM IS BUILT AND ON `main`. The "not started" line below is stale; read this banner first.** Landed in commit `a9354808e` (2026-08-29), *"the clean half of PR 531"*, which cited this item. **Verified independently at `46ea10a7` (= `origin/main`) on a clean tree, reading the working tree rather than piping `git show`:** the PEP 735 group is at `pyproject.toml:294-296`; `ci/locks/release-tools.lock` is **tracked** (`git ls-tree HEAD ci/locks/` lists three locks, not two) and carries 193 `--hash=` lines; the seventh export and its `git diff --exit-code` gate are at `security.yml:107-108`; the resync's export, `--quiet` short-circuit and `git add` are at `dependabot-lock-resync.yml:140,152,156`; and `release.yml:391` installs it with `python -m pip install --require-hashes -r ci/locks/release-tools.lock`. The guard was re-pointed, not deleted, exactly as this item's step 5 required: `sigstore` left `RELEASE_PINNED_TOOLS` (`tests/test_ci_venv_pinning.py:204`) with a comment saying it MOVED, and `test_the_release_signing_toolchain_is_installed_from_a_hashed_lock` (`:994`) replaced it with three stronger assertions. **So steps 2, 3 and 5 are done.**
+>
+> **ONE OPEN QUESTION, AND IT NEEDS AN OWNER RULING — do not resolve it by editing either side.** This row records **OWNER RULING 2026-08-22: pin `sigstore==4.4.0` … NOT 4.5.0**. The shipped code pins **`sigstore==4.5.0`** (`pyproject.toml:295`, `ci/locks/release-tools.lock:238`) and `release.yml:385-390` argues the case for it: the 5-day `dependabot.yml` cooldown that motivated the original 4.4.0 choice closed 2026-08-02, so *"the objection is SPENT, not overridden."* **Both citations are live and they disagree.** Two facts a ruling should have, neither of which decides it: (1) the landing commit is dated **2026-08-29, seven days AFTER the ruling**, and the ruling itself was made **twenty days after** the cooldown closed — so a spent cooldown is not new information relative to the ruling; (2) **the revert is measurably cheap.** Measured 2026-09-03 with the CI-pinned `uv==0.12.0`, control-first (re-export of the unchanged tree gave DIFFS=0, so the instrument matches CI's): setting the group to `sigstore==4.4.0` moves `uv lock` by one line (`sigstore v4.5.0 -> v4.4.0`), leaves **all six** pre-existing DEP-1 artifacts byte-identical, and moves `release-tools.lock` by three lines, because 4.4.0 and 4.5.0 share a transitive closure. **The step-4 contamination risk did not materialise in either direction, so the `semgrep`-style excluded-by-decision call is not reached and is not the reason this is open.** The question is purely which version the owner wants.
+>
 > 🔢 **Re-scored 2026-08-20 -> P2.** Value **6/10** · Difficulty **5/10** · _quick win_. Build-time only with no engine, store or PHI surface and no pull-request reachability, which holds value below the defect band; what keeps it at 6 is that code executing at :255 holds the OIDC identity that signs at :258, so a compromise yields a backdoored wheel carrying valid Sigstore and SLSA evidence. Difficulty 5 is the proven ADR 0034 mechanism repeated as a seventh lock across a six-place lockstep, with a real chance the re-resolve contaminates the existing locks and forces the excluded-by-decision call semgrep got. _(was 6/10 · 5/10.)_
 >
-> **Filed 2026-08-01 — not started.** Arbitrary code from any of ~30 floating transitives at `.github/workflows/release.yml:255` runs with the OIDC identity that then signs the wheel, writes the SLSA attestation and publishes to PyPI — a backdoored artifact carrying a *valid* Sigstore bundle and valid provenance — and no Dependabot ecosystem parses an inline `pip install X==Y`, so the pin rots with no trigger and no owner (the two siblings at `:104` and `:207`, the latter a `~=` range, float identically); the ADR 0034 hashed-lock mechanism is proven and running for `ci-scanners`/`ci-quality`, but `sigstore` is absent from every lock (`grep -c sigstore uv.lock` → 0), adding a seventh is a six-place lockstep edit, the resolve contamination may force the same excluded-by-decision call semgrep got, and no PR leg ever executes this path.
+> **Filed 2026-08-01 — SUPERSEDED, see the status banner above; the fix has since shipped and the line numbers in this paragraph are pre-fix.** Arbitrary code from any of ~30 floating transitives at `.github/workflows/release.yml:255` runs with the OIDC identity that then signs the wheel, writes the SLSA attestation and publishes to PyPI — a backdoored artifact carrying a *valid* Sigstore bundle and valid provenance — and no Dependabot ecosystem parses an inline `pip install X==Y`, so the pin rots with no trigger and no owner (the two siblings at `:104` and `:207`, the latter a `~=` range, float identically); the ADR 0034 hashed-lock mechanism is proven and running for `ci-scanners`/`ci-quality`, but `sigstore` is absent from every lock (`grep -c sigstore uv.lock` → 0), adding a seventh is a six-place lockstep edit, the resolve contamination may force the same excluded-by-decision call semgrep got, and no PR leg ever executes this path.
 > Verdict: build
 > Closing-act: code
 > **OWNER RULING 2026-08-22: pin `sigstore==4.4.0` and hash-lock it. NOT 4.5.0.**
 > *The ruling was made today and lived only in the owner queue record; this row is the surface that
 > governs `release.yml:255`, so it belongs here.*
+>
+> **WHY THIS ITEM IS STILL OPEN, in one place:** the version question above, and **step 6** (`build` and
+> `cyclonedx-bom` into the same group), which was never started. Step 6's constraint is unchanged and
+> load-bearing: `cyclonedx-bom` is half of a byte-identical pair — `release.yml:326` and
+> `security.yml:367` both read `python -m pip install "pip==26.1.2" "cyclonedx-bom~=7.3.1"`, and
+> `test_sbom_install_is_byte_identical_in_release_and_security` (`tests/test_ci_venv_pinning.py:943`)
+> requires them to stay identical, so **both halves must move in one commit or that test reds**.
+> `build` remains inline at `release.yml:104`, `:521` and `:647`. **One smaller residual found while
+> verifying:** nothing pins `ci/locks/release-tools.lock` *into* the DEP-1 set.
+> `tests/test_dep1_lock_resync_lockstep.py` derives the export set dynamically and compares the gate to
+> the resync, so it is satisfied by set **equality** — drop the lock from both workflows and every test
+> there stays green while the lock silently stops being re-derived, diffed and re-synced.
+> `test_constraints_lock_is_in_the_set` exists for exactly that class after the #1193 incident; the
+> signing lock has no equivalent pin, and `test_the_release_signing_toolchain_is_installed_from_a_hashed_lock`
+> does not cover it (a lock unrefreshed for a year still exists, still pins, still hashes, still
+> installs). That is the *"hash-pinned toolchain rotting into a pinned-but-unpatched one"* posture ADR
+> 0034 calls worse than floating.
 
 **Cluster:** Security / Supply chain. **Priority:** P2. **Verdict:** build. **Severity:** medium.
 
-**What:** `.github/workflows/release.yml:253-255` says so in its own comment and then does it:
+**What** *(this section describes the PRE-FIX state and is kept as the filing record; every negative
+claim in it — no lock, two lock files, two groups, no `release-tools` group — was made false by
+`a9354808e`. See the status banner for what is on `main` now.)*: `.github/workflows/release.yml:253-255`
+says so in its own comment and then does it:
 
 ```
 # NOTE: this pins the TOP only; sigstore's ~30 transitive deps still float at signing time.
@@ -3406,7 +3430,11 @@ What makes it worth fixing anyway is the **blast radius if it lands**: arbitrary
 
 Honestly bounded: **this is build-time only.** No PHI path, no running-engine surface, no operator-reachable behaviour. It does not touch the store, the API, or any connector. And per ADR 0034 §3 (`:162-170`) the fix moves the OPEN Scorecard count only for the lines it actually converts to `--require-hashes`; the two genuinely-open `PinnedDependenciesID` alerts named at `:336-341` are the SBOM scratch-venv pair, not this one.
 
-**Proposed:** repeat the mechanism ADR 0034's 2026-07-29 amendment already proved, and handle the version question the residual row raises rather than stepping over it.
+**Proposed** *(step status as of 2026-09-03: **2, 3, 5 DONE** in `a9354808e`; **4 measured, no
+contamination, both ways**; **1 OPEN — the owner ruling and the shipped pin disagree**; **6 NOT
+STARTED**. Step 1's own warning — "this is a recorded owner decision; do not invert it silently" — is
+the one that was not honoured, so it is restated in the banner rather than left here to be re-read
+after the fact.)*: repeat the mechanism ADR 0034's 2026-07-29 amendment already proved, and handle the version question the residual row raises rather than stepping over it.
 
 1. **Resolve the 4.4.0-vs-4.5.0 decision first, explicitly.** ADR 0034:350 keeps `sigstore` out of the lock *because* routing it through would resolve **4.5.0**, which was `<48 h` old against `.github/dependabot.yml`'s `cooldown: default-days: 5` (:26-30). That was written 2026-07-29. By the ADR's own arithmetic the window closes around 2026-08-01/02 — i.e. now — but **confirm the actual PyPI publish date before acting**; this item does not verify it, and the whole rationale hangs on it. If the window has closed, the objection is spent and the residual row should be amended, not quietly contradicted. This is a recorded owner decision; do not invert it silently.
 2. **Add a PEP 735 `release-tools` group** to `pyproject.toml` alongside `ci-scanners`/`ci-quality`, non-default (ADR 0034:283-287, decision 2 — an extra becomes a real install target; a default group lands in the release SBOM and in what `pip-audit` audits as runtime).
