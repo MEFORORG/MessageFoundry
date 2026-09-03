@@ -4301,6 +4301,22 @@ BUILDS it.*
 
 > 🔢 **Re-scored 2026-08-20 -> DEMAND-GATE.** Value **6/10** · Difficulty **4/10** · _quick win_. Gap stands in shipped code: no privilege probe exists in the four scanned packages beyond the two conditional-DDL guard hits at sqlserver.py:924/:931, and settings.py:514 gates credential kind only, so a sysadmin login would go unobserved on first deployment (value 6). The remainder is a probe across SQL Server plus Postgres with SQLite exempt, a settings plus serve gate, the still-underived Postgres grant set, and a paired out-of-repo scorecard edit, which is the difficulty-4 anchor of a feature across a seam exercised on all three backends. _(was 6/10 · 4/10.)_
 >
+> **OWNER RULING 2026-09-03 -- KEEP THE PREFLIGHT DEFERRED. This is the ruling ON THE SUBSTANCE that
+> this item has spent three passes asking for, and it is recorded here so a fourth does not re-derive
+> it.** Put by the Contractor seat with the three live options stated -- keep it deferred, lift the gate
+> and build the preflight, or fix only the ungated probe defect -- the owner chose **keep it deferred**.
+> **This is a ruling and not a delegation**, which is the distinction the 2026-08-12 entry below draws:
+> that entry records the owner answering *do what you judge best*, and the coordinator was right to
+> refuse to read it as a decision. This one names an outcome. **THE GATE STANDS and the banner does not
+> flip.** Grounds as put to the owner: the runbook fix removed the CAUSE and has landed, the preflight
+> detects a SYMPTOM whose cause is gone, and at zero deployments demand for the detector is weak.
+> **WHAT THIS RULING DOES NOT DECIDE.** The correctness defect on the held branch -- the SQL Server probe
+> returning OBSERVED unconditionally while NULL role results fold to `False`, i.e. a clean bill of health
+> from a probe that read nothing -- is untouched by this. It is filed as **#1234**, it is not gated by
+> this item, and it stays worth fixing whichever way the gate ever goes. Nor does this rule on Blocker B,
+> the delivered refusal being narrower than this item's stated Scope; that question is moot while the
+> gate stands and returns if it is ever lifted.
+>
 > **Filed 2026-08-04 — not started. Scored 2026-08-04 → DEMAND-GATE.** The engine documents a least-privilege store grant it can
 > **never observe**: there is no fixed-server-role probe and no database-role-membership probe in
 > any of the four packages the scorecard scans, and `[store].require_managed_identity` constrains
