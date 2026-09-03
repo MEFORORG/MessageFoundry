@@ -21,3 +21,19 @@ ci/locks/*.lock text eol=lf
 # was verified -- `eol=lf` was tried first and silently re-encoded ~1,300 bytes, which would have
 # committed a file that no longer matches its own recorded checksum.
 .github/actions/**/dist/** -text
+
+# The offline password-screening corpus (BACKLOG #1433). Its SHA-256 is recorded in the generated
+# block of `common_passwords.NOTICE` and recomputed by `scripts/security/build_password_corpus.py`,
+# so the checked-out bytes must not depend on the platform. `-text` (not `eol=lf`) for the same
+# reason as the stanza above: it disables ALL conversion, so stored and checked-out bytes are equal.
+# THE ATTRIBUTE WAS MISSING BEFORE #1433 -- `git check-attr text` reported `unspecified`, so under
+# `core.autocrlf=true` the file checked out CRLF while the blob held LF. An existing Windows
+# checkout still holds CRLF until the file is re-checked-out (`git checkout -- <path>`); changing an
+# attribute does not rewrite a working tree. The generator normalizes CRLF to LF before digesting
+# so such a checkout still verifies, rather than failing with a hex mismatch that names nothing.
+messagefoundry/auth/data/common_passwords.txt -text
+# Its notice carries the generated block, which the same script writes with an explicit LF newline.
+# `text eol=lf` (not `-text`): nothing digests this file, so the forgiving form is right -- git's
+# clean filter normalizes an older CRLF working copy, so neither the attribute landing nor a
+# regeneration shows up as a whole-file diff.
+messagefoundry/auth/data/common_passwords.NOTICE text eol=lf

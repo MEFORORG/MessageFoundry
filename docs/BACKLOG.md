@@ -19940,3 +19940,41 @@ That is the same `self._lock` the staged-pipeline handoffs take. On a first depl
 **PARTLY CLOSED ALREADY, AND THE CLOSURE SITS IN THE WRONG ARTIFACT.** The full record -- both questions, all eight options, both answers quoted -- is [comment 5515263760 on PR 749](https://github.com/MEFORORG/MessageFoundry/pull/749#issuecomment-5515263760), written 2026-09-02. A pull-request comment is a real improvement on a session transcript, which does not survive its session. It is still not the ADR, and the ADR is what a reader consults. **This limb differs from the first two in shape:** closing it needs no decision about the engine, only the record moved into the artifact people actually read.
 
 **THE GENERAL PROBLEM, stated once so it is not re-derived per incident.** A decision recorded as an outcome plus a delegation is not reviewable. The inputs -- the question, the options, the answer -- are what let a later reader tell a considered call from an arbitrary one, and they are exactly the part that lives in the least durable place.
+
+## 1433. regenerate the password screening corpus from a committed script instead of by hand
+
+> ✅ **Shipped 2026-09-03.** `scripts/security/build_password_corpus.py` (`--check` / `--write`, plus `--seclists DIR` for the source arm) rebuilds or verifies `messagefoundry/auth/data/common_passwords.txt`, and writes a delimited generated block into `common_passwords.NOTICE` carrying the digest, the line and distinct counts, the two-run split and the whole by-floor table. `tests/test_auth_core.py` fails when the block stops describing the corpus. **TWO PREMISES THIS ITEM WAS CUT FROM WERE FALSE AT HEAD AND ARE CORRECTED BELOW** -- neither changes what was built.
+> Verdict: build
+> Research: none
+> Closing-act: none
+
+**Cluster:** Security / offline password screening (from #1134). **Priority:** P2. **Verdict:** build.
+**Severity:** no deployment axis (sec. 0). Zero instances run. The defect was a record that could drift from the file it described, which would first cost a reader on the way to a **first** deployment.
+
+### What was wrong
+
+`common_passwords.txt` was assembled by hand under #1134 and no regeneration script was committed with it. Every number in its `.NOTICE` was therefore a hand-copied measurement with nothing behind it, and the only remedy for a corpus change was to re-derive each count by hand. A count re-derived by hand is a count that eventually is not.
+
+### What shipped
+
+The tree's generator-plus-golden pattern (`scripts/webconsole_seam_snapshot.py --write` and its golden) applied to a data file. The golden here is a block **inside the notice**, between markers, so the hand-written prose and the generated numbers live in one file without the tool touching the prose.
+
+- **The filter is the shipped policy object, not a length test.** `selection_policy()` builds a real `PasswordPolicy` from `AuthSettings` defaults the way `AuthService` builds it, then turns off `check_breached` (every candidate would reject itself against the corpus it is being added to) and `check_username` (a corpus entry has no user context). That applies the length clause **and** the context deny-list, which is what makes the count "the top N which match the application's password policy" rather than "the top N that are long enough".
+- **The hygiene filter imports the gates' own definitions** rather than restating them: `ALLOWED` from `scripts/quality/control_char_check.py` for the C0 arm, and only the `routable IP address` reason out of `scan_forbidden.scan_text` for the IP arm. It reads that one reason deliberately -- the rest of that function's reasons come from a site-local, git-ignored token file, so consuming them would make the corpus a function of who ran the rebuild.
+- **The sub-minimum entries stay**, and a named test now says why. They are unreachable at the shipped floor, which makes them look like dead weight; `password_min_length` is an operator setting, so a site that lowers it makes every one of them operative again.
+
+### Correction 1: there were no per-number pytest gates to collapse
+
+The brief this item was cut from said `tests/test_auth_core.py` pinned eight numbers from the notice against live measurement -- a headline count and seven by-floor rows -- plus the corpus sha256. **Measured on `main` at `46ea10a78`: it pinned none of them, and the notice carried no by-floor table at all.** The two corpus tests there assert a floor (`>= 3000` clearing entries, the ASVS 6.2.4 bar) and three behavioural arms; both survive untouched, because a floor is not a hand-copied number. So the fixed-point gate is the **first** machine check on those counts, not a replacement for several. Recorded because the difference decides what a reader should expect to find in the diff.
+
+### Correction 2: the `-text` attribute was missing, so the digest would not have been platform-independent
+
+The brief listed keeping the corpus's `-text` pin in `.gitattributes` as a constraint. **`git check-attr text` reported `unspecified` at `46ea10a78`**, and under `core.autocrlf=true` the working tree held CRLF while the blob held LF -- two different sha256 values for one committed file. The attribute is added by this item. Two belts, because one of them fails on an existing checkout: the attribute keeps a **fresh** checkout equal to the blob on every platform, and the generator digests **LF-normalized** bytes so an **older** Windows checkout still verifies instead of failing with a hex mismatch that names nothing. Changing an attribute does not rewrite a working tree; `git checkout -- <path>` does.
+
+### What the gate does NOT verify, and why that is stated in its own output
+
+Without `--seclists` it does not verify that the corpus reproduces from upstream. SecLists is an 8 MB third-party checkout this repository deliberately does not vendor, so a bare run says so on stdout rather than reporting a green that means less than it looks like. The upstream member digests are recorded as `not recorded` until someone runs `--write --seclists <checkout>`, and a source-less `--write` carries forward whatever digests the notice already holds rather than destroying provenance while regenerating counts. **Recording those two digests is the one piece of #1134's honest path still open here.**
+
+### Re-score trigger for ASVS 6.2.4
+
+The selection depends on `password_min_length` **and** `password_check_context`. Both are printed in the generated block, and moving either shipped default changes the corpus the script produces and every count it records.

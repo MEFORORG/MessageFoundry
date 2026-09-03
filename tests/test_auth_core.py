@@ -5,7 +5,12 @@
 from __future__ import annotations
 
 import hashlib
+import importlib.util
+import sys
 from pathlib import Path
+from typing import Any
+
+import pytest
 
 from messagefoundry.auth import (
     AuthProvider,
@@ -193,3 +198,80 @@ def test_breach_corpus_growth_did_not_over_block_or_regress() -> None:
     assert "not be a common or breached password" in policy.violations("1234567891234567")
     # OVER-BLOCK arm: a strong passphrase that is not in the corpus is still accepted.
     assert policy.violations("correct-horse-battery-staple-xyz") == []
+
+
+# --- BACKLOG #1433: the notice's numbers are GENERATED, so one gate replaces every hand-copied one --
+
+
+def _corpus_generator() -> Any:
+    """Load the corpus generator by path. ``scripts/`` is not an importable package."""
+    script = (
+        Path(__file__).resolve().parents[1] / "scripts" / "security" / "build_password_corpus.py"
+    )
+    spec = importlib.util.spec_from_file_location("_build_password_corpus", script)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules["_build_password_corpus"] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_the_corpus_notice_is_a_fixed_point_of_its_generator(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """THE GATE. Every count and the digest in ``common_passwords.NOTICE`` is recomputed from the
+    shipped corpus and must match what the notice records.
+
+    This is ONE assertion covering what would otherwise be a pinned number per line -- the headline
+    policy-clearing count, each row of the by-floor table, the line and distinct counts, the two-run
+    split, and the digest. A per-number gate has to be written before it can catch anything, so it
+    can only ever pin the numbers whoever wrote it thought of; this one catches a change to any
+    recorded number including ones nobody has added yet.
+
+    The remedy is a command, not arithmetic. Before #1433 there was no tool, so a red here told you
+    to re-derive each count by hand -- which is how a wrong number survives a corpus change.
+    """
+    module = _corpus_generator()
+    assert module.check(None) == 0, capsys.readouterr().err
+
+
+def test_the_gate_sees_a_corpus_that_gained_one_entry(tmp_path: Path) -> None:
+    """MADE TO FAIL ON PURPOSE. The gate is evidence only if it can see the change class it exists
+    to catch.
+
+    A fixed-point assertion is exactly as good as its ability to move, and a generator that read the
+    notice instead of the corpus would pass the test above forever while measuring nothing. Adding
+    one policy-clearing entry must change the block."""
+    module = _corpus_generator()
+    before = module.render_block(module.measure())
+
+    planted = tmp_path / "common_passwords.txt"
+    planted.write_bytes(module.CORPUS_PATH.read_bytes() + b"a-planted-passphrase-entry\n")
+    original = module.CORPUS_PATH
+    try:
+        module.CORPUS_PATH = planted
+        assert module.render_block(module.measure()) != before
+    finally:
+        module.CORPUS_PATH = original
+
+    assert module.render_block(module.measure()) == before  # and it restores exactly
+
+
+def test_the_corpus_keeps_its_sub_minimum_entries() -> None:
+    """The entries BELOW the shipped floor are load-bearing and must not be tidied away.
+
+    They are unreachable at ``password_min_length = 15`` -- the length clause rejects them first --
+    which makes them look like 90 KB of dead weight to anyone reading the file at the shipped
+    default. But the floor is an OPERATOR SETTING. A site that lowers it makes every short entry
+    operative again, so deleting them would remove protection from exactly the configuration that
+    needs it most. Asserted as a floor rather than a count so it survives a corpus refresh.
+    """
+    from messagefoundry.auth.policy import _common_passwords
+
+    shipped = PasswordPolicy()
+    short = [e for e in _common_passwords() if len(e) < shipped.min_length]
+    assert len(short) > 3000, (
+        f"only {len(short)} corpus entries sit below the shipped {shipped.min_length}-character "
+        "floor; a swap that dropped the short entries would silently weaken every deployment that "
+        "has LOWERED password_min_length"
+    )

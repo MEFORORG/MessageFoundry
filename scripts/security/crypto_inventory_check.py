@@ -435,6 +435,15 @@ INVENTORY: dict[str, frozenset[str]] = {
     # SHA-256 rather than BLAKE2 or a non-approved digest only because the engine renders a fips_mode
     # attestation, and a non-approved hash in the shipped surface invites a FIPS question for no gain.
     "scripts/webconsole_seam_snapshot.py": frozenset({"hashlib"}),
+    # BACKLOG #1433, the SAME class as the three entries above: SHA-256 over the shipped
+    # common-password CORPUS FILE, recorded in the generated block of its .NOTICE so the notice's
+    # counts and the file they describe cannot drift apart unnoticed. A CHANGE DETECTOR, not a
+    # security control -- no secret, no key, no message authentication, and nothing user- or
+    # PHI-derived: the input is a published third-party wordlist committed beside the digest. It is
+    # taken over LF-NORMALIZED bytes so the recorded value does not depend on the platform a
+    # checkout was made on. SHA-256 rather than a cheaper non-cryptographic digest only because it
+    # is already this tree's convention for pinning a file, and a second convention buys nothing.
+    "scripts/security/build_password_corpus.py": frozenset({"hashlib"}),
     # BACKLOG #1323 -- ELEVEN SITES THE GATE COULD NOT SEE AT ALL until the TLS-policy seam was
     # added above. Each imports messagefoundry.config.tls_policy and NONE of the six stdlib crypto
     # modules, so before the seam widened there was no token that could match them and no row was
