@@ -470,6 +470,69 @@ async def test_asset_drift_alerts_and_records(
         await store.close()
 
 
+@pytest.mark.parametrize(
+    ("label", "corpus"),
+    [("lf", b"password\nqwerty\nhunter2\n"), ("crlf", b"password\r\nqwerty\r\nhunter2\r\n")],
+)
+def test_line_endings_alone_never_report_tampering(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, label: str, corpus: bytes
+) -> None:
+    """A line-ending difference in a declared asset must NOT read as tampering.
+
+    ``messagefoundry/auth/data/common_passwords.txt`` has no ``.gitattributes`` byte policy, so under
+    ``core.autocrlf=true`` a Windows checkout holds CRLF where the committed blob holds LF. Four
+    sessions independently read that as a false-alarm hazard for this tripwire. **It is not**, and the
+    reason is worth pinning rather than re-deriving: ``RECORD`` is written by the *installer* from the
+    bytes it unpacked, so the baseline and the installed file are the same bytes on the same host
+    whatever git did upstream. A CRLF wheel carries CRLF content AND a CRLF-derived digest.
+
+    Both arms attest clean, which is the property. The missing ``-text`` pin is a real
+    reproducible-builds defect -- two platforms build byte-different wheels from one commit -- but it
+    is a separate one, and this tripwire cannot be the thing that reports it.
+    """
+    pkg = "mfengine"
+    asset = f"{pkg}/auth/data/common_passwords.txt"
+    dist, loaded = _build_wheel_install(
+        tmp_path,
+        pkg=pkg,
+        files={f"{pkg}/__init__.py": b"VERSION = '1.0'\n"},
+        assets={asset: corpus},
+    )
+    _patch(monkeypatch, dist, loaded, pkg, assets=((tmp_path / asset).resolve(),))
+
+    result = attest_engine()
+    assert result.ok and result.drift == [], f"{label} install must attest clean"
+    assert result.checked == 2
+
+
+def test_a_swap_of_line_endings_AFTER_install_is_still_drift(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The control on the test above, and the arm that keeps it from being vacuous.
+
+    The pair only means something if the digest is genuinely byte-exact. Here the RECORD baseline is
+    sealed over LF and the on-disk file is then rewritten as CRLF -- a state ``pip`` cannot produce,
+    since it writes RECORD from what it unpacked, but one an in-place editor can. That MUST drift.
+
+    So both readings are pinned at once: identical-by-construction line endings are clean, and a
+    post-install rewrite is caught even when it changes nothing a human would call content.
+    """
+    pkg = "mfengine"
+    asset = f"{pkg}/auth/data/common_passwords.txt"
+    dist, loaded = _build_wheel_install(
+        tmp_path,
+        pkg=pkg,
+        files={f"{pkg}/__init__.py": b"VERSION = '1.0'\n"},
+        assets={asset: b"password\nqwerty\nhunter2\n"},
+    )
+    path = (tmp_path / asset).resolve()
+    _patch(monkeypatch, dist, loaded, pkg, assets=(path,))
+    path.write_bytes(b"password\r\nqwerty\r\nhunter2\r\n")
+
+    result = attest_engine()
+    assert [(d.path, d.reason) for d in result.drift] == [(asset, "hash_mismatch")]
+
+
 def test_declared_assets_exist_in_the_shipped_package() -> None:
     """THE ROT GUARD, and the one test here that runs against the REAL package.
 
