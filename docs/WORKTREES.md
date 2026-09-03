@@ -1060,3 +1060,67 @@ A fresh worktree has no `.venv` (it's git-ignored, exists only in the checkout i
 checkout's code no matter which worktree you run from — silently testing the wrong code. A
 per-worktree venv keeps each session honest. The cost is disk + ~a minute of install (pip's cache
 makes repeats fast).
+
+### Build it with `python -m venv`, because `uv venv` picks the free-threaded interpreter
+
+`scripts/worktree/new.ps1` runs `python -m venv`, which takes the PATH interpreter. Measured
+2026-09-03 on the shared Windows box, that is standard CPython 3.14.6, ABI tag `cp314`. `uv venv
+--python 3.14` resolves instead to `cpython-3.14.6+freethreaded`, ABI tag `cp314t`. Several pinned
+wheels do not exist for that tag.
+
+Same command, two interpreters, nothing else changed:
+
+| Interpreter | `uv pip install --only-binary :all: --no-cache watchfiles==1.2.0` |
+|---|---|
+| `cp314t` free-threaded | `watchfiles==1.2.0 has no usable wheels` |
+| `cp314` standard | `+ watchfiles==1.2.0` |
+
+Drop `--only-binary` and the free-threaded venv falls back to the sdist, which needs a Rust
+toolchain to build. That is the install failure sessions have been reporting.
+
+**The cause is the interpreter, not the package.** `watchfiles` does ship a cp314 wheel: the
+documented install ran here to exit 0 and used `watchfiles-1.2.0-cp314-cp314-win_amd64.whl`. Two
+sessions reporting opposite results were each right about their own interpreter, which is why the
+question stayed open. Check `.venv/Scripts/python.exe -VV` for the words `free-threading build`
+before you blame a dependency.
+
+## The full suite takes hours here, and a wrapper timeout reads as exit 0
+
+Measured 2026-09-03, fresh worktree, documented install.
+
+Local collection is **15597 items**. That is `tests` plus `packaging/messagefoundry-webconsole/tests`
+with the tooling tier included, and CI never runs that set in one call: `ci.yml` splits it into an
+engine leg and a separate web console job. Its measured leg times, their pool and their provenance
+are recorded above the `Tests (pytest)` step in
+[`.github/workflows/ci.yml`](../.github/workflows/ci.yml). Read them there.
+
+Serially, on this box, the rate measured 269 tests in 250 seconds. That projects to about four hours
+for the whole set. The box was at 100 percent CPU with 2.2 GB of 31.7 GB free, all from other
+sessions, so contention is part of the number. Run the suite in the background and expect tens of
+minutes at best.
+
+### A run with no summary line establishes nothing
+
+A foreground tool call cannot hold the suite. The Claude Code Bash tool caps a foreground `timeout`
+at ten minutes.
+
+When a caller's `subprocess.communicate(timeout=...)` gives up it raises `TimeoutExpired` in the
+**calling** process. The captured output is then that traceback, with no `N passed` or `N failed`
+line, and the caller can still exit 0. Read that shape as the wrapper giving up. It is not pytest
+hanging, and the exit code is answering a different question than the one you asked.
+
+Pytest itself never raises `TimeoutExpired`, and no test here lets one escape. All three
+`communicate(timeout=...)` sites in `tests/` catch it and call `pytest.fail`, so a test that tripped
+one would show as a named failure inside a normal summary. The wrapper that produced the reported
+traceback was not identified, so treat the ten-minute cap as the fitting mechanism rather than a
+measured one.
+
+### This is not the xdist controller hang, and merging the two would lose both
+
+`042ef7ff5` (PR #737) diagnosed a real hang. Under `-n`, a dead worker's replacement never reports
+ready, so the controller polls a silent queue until the step cap. Its signature is a `[gwN] node
+down: Not properly terminated` line at 98-99 percent progress, and the job dies red at
+`timeout-minutes`.
+
+A local run carrying no summary line, no `node down` line and exit 0 shares none of that. It also
+cannot share the mechanism, which needs `-n` to exist at all.
