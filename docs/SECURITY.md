@@ -1487,8 +1487,8 @@ MFA step-up is now built (WP-14 native TOTP); a web console banner for the feed 
 
 Local passwords follow an **ASVS 5.0-aligned** policy (WP-3): **min length 15**, **no mandatory
 character-class composition** (the `require_*` class flags are opt-in, default off — ASVS forbids
-mandatory composition), plus **offline breached/common-password screening** (a bundled top-10k list,
-no live HIBP call) and a fixed **context-word deny-list**, enumerated in full below. Enforced
+mandatory composition), plus **offline breached/common-password screening** (a bundled offline
+corpus, no live HIBP call) and a fixed **context-word deny-list**, enumerated in full below. Enforced
 identically on create-user and change-password; tune via `[auth]` (see
 [CONFIGURATION.md](CONFIGURATION.md)). AD passwords are governed by Active Directory.
 
@@ -1521,7 +1521,7 @@ Two further screens (ASVS 6.2.11 / 6.2.12), both on by default and fully offline
   user's own username (case-insensitive, for usernames ≥ 4 chars) is rejected, catching the common
   `jsmith2026`-style choice that the corpus can't.
 - **Larger operator breach corpus** (`password_breach_corpus_file`) — point this at an offline list to
-  augment the bundled top-10k: a **plaintext** file *or* an **HIBP-style SHA-1-hash export**
+  augment the bundled corpus: a **plaintext** file *or* an **HIBP-style SHA-1-hash export**
   (`HASH[:count]` lines, auto-detected), checked locally with no network call. Use a curated subset
   (it's loaded into memory), not the full ~40 GB HIBP set; a configured-but-unreadable path is warned
   at startup and falls back to the bundled list.

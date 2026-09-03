@@ -1865,9 +1865,10 @@ class AuthSettings(_Section):
     password_check_username: bool = (
         True  # reject passwords containing the user's own username (6.2.11)
     )
-    # Optional path to a larger offline breach corpus that augments the bundled top-10k list (6.2.12):
-    # a plaintext list OR an HIBP-style SHA-1-hash export (HASH[:count] lines, auto-detected). Fully
-    # offline — no live HIBP call. Use a curated subset, not the full ~40 GB HIBP set (loaded into memory).
+    # Optional path to a larger offline breach corpus that augments the bundled one (6.2.12): a
+    # plaintext list OR an HIBP-style SHA-1-hash export (HASH[:count] lines, auto-detected). Fully
+    # offline — no live HIBP call. Use a curated subset, not the full ~40 GB HIBP set (loaded into
+    # memory). Only entries at or above password_min_length add coverage — see docs/CONFIGURATION.md.
     password_breach_corpus_file: str | None = None
     lockout_threshold: int = 5  # consecutive failed logins before the account locks
     lockout_minutes: int = 15

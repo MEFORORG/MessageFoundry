@@ -223,8 +223,10 @@ messagefoundry-tray = "messagefoundry.tray.__main__:main"
 # The offline common-password screening corpus (messagefoundry/auth/data/, loaded via
 # importlib.resources) ships in the wheel automatically: hatchling packages every file under the
 # messagefoundry/ package, data included. (A previous force-include of that dir double-added the files
-# and broke `build --wheel`.) tests/test_password_*.py load the corpus via importlib.resources, so a
-# build-config change that dropped it would fail the suite — that's the guard, not a force-include.
+# and broke `build --wheel`.) The guard is tests/test_auth_core.py, whose #1134 corpus gates load the
+# list via importlib.resources, so a build-config change that dropped it fails the suite -- not a
+# force-include. (This named tests/test_password_*.py until 2026-09-03; no such file has ever
+# existed, so the stated guard pointed at nothing while the real one sat one name away.)
 
 # --- CI TOOLCHAIN — PEP 735 dependency groups (ADR 0034 §3) ----------------------------------------
 #
