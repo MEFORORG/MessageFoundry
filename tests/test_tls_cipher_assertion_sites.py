@@ -29,9 +29,11 @@ so a test that saw no raise would be reporting a missing call rather than an ine
 
 from __future__ import annotations
 
+import contextlib
 import datetime
 import socket
 import ssl
+import threading
 import urllib.request
 from collections.abc import Iterator, Mapping
 from pathlib import Path
@@ -47,7 +49,7 @@ from cryptography.x509.oid import NameOID
 from messagefoundry import logging_setup
 from messagefoundry.auth import ldap as ldap_auth
 from messagefoundry.auth import oidc_http
-from messagefoundry.config import tls_policy, tls_probe
+from messagefoundry.config import secretprovider_vault, tls_policy, tls_probe
 from messagefoundry.config.models import ConnectorType, Destination
 from messagefoundry.config.settings import (
     INSECURE_TLS_ESCAPE_ENV,
@@ -57,9 +59,10 @@ from messagefoundry.config.settings import (
 )
 from messagefoundry.config.wiring import FHIR, Rest, Soap
 from messagefoundry.pipeline import alert_sinks
-from messagefoundry.store import postgres
+from messagefoundry.store import crypto_transit, keyprovider_vault, postgres
 from messagefoundry.transports import build_destination, rest, soap
 from messagefoundry.transports.http_auth import with_http_digest
+from tests._extras_probe import OPTIONAL_EXTRAS, extra_is_installed
 
 # Imported at module scope ON PURPOSE. `rest` and `alert_sinks` build their shared opener AT IMPORT,
 # so a first import inside the every_suite_looks_weak fixture would raise during module execution and
@@ -622,6 +625,208 @@ def test_ldap3_swallows_a_rejected_cipher_string_and_strips_every_tls12_suite() 
     assert not tls12(poisoned), (
         "ldap3 no longer strips the TLS 1.2 suites on a rejected cipher string; re-derive why "
         "assert_ldap3_tls_suites refuses `ciphers=` before relying on that refusal's stated reason"
+    )
+
+
+# --- the Vault hops: a replica again, and this one is pinned to urllib3's own constructor ---------
+#
+# ADR 0180 DECLINED to build this assertion, and its stated reason was not that the hop was fine — it
+# was that "no CI leg installs the [vault] extra", so the control could never be executed. That is the
+# silent-control shape, and shipping into it would have been worse than the gap. The extra is now on
+# the `test` leg (.github/workflows/ci.yml), which is what makes these tests, and therefore the
+# assertion, real. Without the extra every test below SKIPS — and `tests/_extras_probe.py` now lists
+# `vault`, so such a run announces itself as INCOMPLETE rather than reporting a quiet green.
+
+
+_vault_extra = pytest.mark.skipif(
+    not extra_is_installed(OPTIONAL_EXTRAS["vault"]),
+    reason="the [vault] extra (hvac + requests + urllib3) is not installed in this interpreter",
+)
+
+
+def _context_urllib3_builds_for(client: Any) -> ssl.SSLContext:
+    """The ``SSLContext`` urllib3's OWN connect path builds for ``client`` — CAPTURED, not rebuilt.
+
+    The Vault twin of :func:`_context_ldap3_builds`, and it keeps this replica honest the same way.
+    urllib3 constructs the context inside ``_ssl_wrap_socket_and_match_hostname``, but only AFTER the
+    TCP connect succeeds — so the client is pointed at a real listener that accepts and immediately
+    closes. The handshake then fails at once (EOF), which is fine: the context was already built, and
+    the spy holds it. No peer certificate, no TLS, no off-box network — but urllib3's own construction
+    code really ran, with the arguments the shipped client really produces.
+    """
+    import urllib3.connection  # noqa: PLC0415  (optional [vault] extra; module-scope would break base)
+
+    captured: list[ssl.SSLContext] = []
+    real = urllib3.connection.create_urllib3_context
+
+    def spy(**kwargs: Any) -> ssl.SSLContext:
+        ctx = real(**kwargs)
+        captured.append(ctx)
+        return ctx
+
+    listener = socket.socket()
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(1)
+    port = listener.getsockname()[1]
+
+    def accept_then_close() -> None:
+        try:
+            conn, _ = listener.accept()
+            conn.close()
+        except OSError:  # the listener was closed from under us; the client already has its EOF
+            pass
+
+    server = threading.Thread(target=accept_then_close, daemon=True)
+    server.start()
+    monkey = pytest.MonkeyPatch()
+    try:
+        monkey.setattr(urllib3.connection, "create_urllib3_context", spy)
+        monkey.setattr(client, "url", f"https://127.0.0.1:{port}")
+        with contextlib.suppress(Exception):  # the handshake MUST fail; only the context matters
+            client.sys.read_health_status()
+    finally:
+        monkey.undo()
+        listener.close()
+        server.join(timeout=5)
+
+    assert len(captured) == 1, (
+        f"urllib3 built {len(captured)} contexts on one Vault request, not 1 — the replica in "
+        f"assert_hvac_tls_suites can no longer stand for 'the context this hop uses'"
+    )
+    return captured[0]
+
+
+@_vault_extra
+def test_the_vault_kv_secret_provider_asserts_its_tls_suites(every_suite_looks_weak: None) -> None:
+    """``config/secretprovider_vault._build_client`` — the connector-credential KV read.
+
+    Asserted inside ``_build_client`` rather than at the caller, because that function is the single
+    construction point and the assertion reads the SAME kwargs dict the client is built from.
+    """
+
+    with pytest.raises(ValueError, match=secretprovider_vault._VAULT_KV_CONNECTOR):
+        secretprovider_vault._build_client("https://vault.example.test:8200", "s.token")
+
+
+@_vault_extra
+def test_the_vault_transit_key_provider_asserts_its_tls_suites(
+    every_suite_looks_weak: None,
+) -> None:
+    """``store/keyprovider_vault._build_client`` — the store-DEK unwrap, and the Transit cipher.
+
+    ``store/crypto_transit.py`` imports THIS ``_build_client``, so the engine's third hvac client is
+    covered by this one site. That is why two construction points cover three clients.
+    """
+
+    with pytest.raises(ValueError, match=keyprovider_vault._VAULT_TRANSIT_CONNECTOR):
+        keyprovider_vault._build_client("https://vault.example.test:8200", "s.token")
+
+
+@_vault_extra
+def test_the_transit_cipher_client_is_the_asserted_one(
+    asserted_contexts: list[tuple[str, ssl.SSLContext]],
+) -> None:
+    """The third hvac client must reach the assertion, and by IDENTITY of the function, not by prose.
+
+    ADR 0180's scope note records that ``crypto_transit`` shares ``keyprovider_vault._build_client``.
+    A shared function is only shared while nobody copies it, so this pins the object rather than the
+    claim: rebind one and this goes red.
+    """
+
+    assert crypto_transit._build_client is keyprovider_vault._build_client
+
+
+@_vault_extra
+def test_the_vault_replica_matches_the_context_urllib3_actually_builds(
+    asserted_contexts: list[tuple[str, ssl.SSLContext]],
+) -> None:
+    """The replica must resolve to the same suite list as the context urllib3 really builds.
+
+    This is the substitute for the identity check the urllib openers get, and — like the LDAPS twin —
+    it compares against the library's OWN construction rather than a second reading of its source. The
+    replica is taken off the ``asserted_contexts`` spy, so this compares the exact object the shipped
+    control checked against the exact object the hop will use.
+
+    If urllib3 ever changes how it builds that context (its own defaults, or the arguments requests
+    hands it), this goes red and ``assert_hvac_tls_suites`` must be re-derived rather than trusted.
+    """
+
+    client = secretprovider_vault._build_client("https://vault.example.test:8200", "s.token")
+    replicas = [
+        ctx for label, ctx in asserted_contexts if label == secretprovider_vault._VAULT_KV_CONNECTOR
+    ]
+    assert len(replicas) == 1, "the assertion did not run exactly once on its own replica"
+    replica = replicas[0]
+
+    real = _context_urllib3_builds_for(client)
+    assert [c["name"] for c in real.get_ciphers()] == [c["name"] for c in replica.get_ciphers()], (
+        "the replica no longer resolves to the suite list urllib3's own connect path produces, so "
+        "the Vault assertion is now checking a context this hop will not use"
+    )
+
+
+@_vault_extra
+def test_the_shipped_vault_hop_offers_no_weak_suite() -> None:
+    """The POSITIVE control, and it is the half a reverted fix would still pass without.
+
+    Deliberately WITHOUT ``every_suite_looks_weak``: this measures the real suite list the Vault hops
+    negotiate over and requires it to be non-empty and clean on all three properties the shipped
+    predicates test. A refusal pinned alone cannot tell a working control from one that refuses
+    everything; a clean list pinned alone cannot fail when the call is deleted. Both are needed.
+    """
+
+    client = secretprovider_vault._build_client("https://vault.example.test:8200", "s.token")
+    ciphers = _context_urllib3_builds_for(client).get_ciphers()
+    assert ciphers, "the Vault hop offered no suites at all, so this test proves nothing"
+    for cipher in ciphers:
+        assert tls_policy._is_forward_secret(cipher), f"{cipher['name']} is not forward-secret"
+        assert tls_policy._is_encrypting(cipher), f"{cipher['name']} offers no confidentiality"
+        assert tls_policy._is_peer_authenticated(cipher), f"{cipher['name']} authenticates no peer"
+
+
+@_vault_extra
+def test_the_vault_assertion_refuses_a_client_argument_it_cannot_replicate() -> None:
+    """An unreplicable ``hvac.Client`` argument must REFUSE, not be replicated wrongly or ignored.
+
+    ``session=`` is the one that matters: it is the documented way to give this hop a different TLS
+    context, and a replica that accepted it would keep reporting a clean suite list for a context the
+    hop had stopped using. Deliberately without ``every_suite_looks_weak``, so this raise stands on
+    its own and a reader can tell the refusal apart from a suite-list failure.
+    """
+
+    with pytest.raises(ValueError, match="session"):
+        tls_policy.assert_hvac_tls_suites(
+            {"url": "https://vault.example.test:8200", "session": object()},
+            connector="Vault KV secret provider",
+        )
+
+
+@_vault_extra
+def test_hvac_holds_no_ssl_context_of_its_own_at_any_layer() -> None:
+    """The measurement the whole replica rests on — re-run rather than quoted.
+
+    ADR 0180 concluded a replica was the only instrument because no layer of the hvac stack exposes a
+    context the engine could assert directly. That is a property of three third-party libraries, not
+    of this repo, so it is pinned here: if any layer ever starts carrying an ``ssl_context``, this
+    goes RED and the replica should be REPLACED by the identity check the urllib openers get, which
+    is strictly stronger. A red here is good news, not a regression.
+    """
+
+    client = secretprovider_vault._build_client("https://vault.example.test:8200", "s.token")
+    assert not [a for a in dir(client) if "ssl" in a.lower() or "context" in a.lower()]
+
+    session = client.adapter.session
+    adapter = session.get_adapter("https://vault.example.test:8200")
+    assert "ssl_context" not in adapter.poolmanager.connection_pool_kw, (
+        "requests now seeds the pool with its own SSLContext — the engine can reach that object, so "
+        "assert it by identity instead of replicating urllib3's construction"
+    )
+
+    import requests.adapters  # noqa: PLC0415  (optional [vault] extra)
+
+    assert getattr(requests.adapters, "_preloaded_ssl_context", None) is None, (
+        "requests has reinstated the module-level preloaded SSLContext it carried in 2.32 — that is "
+        "a reachable object and the Vault assertion should hold it rather than rebuild it"
     )
 
 

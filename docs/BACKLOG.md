@@ -5802,7 +5802,7 @@ complete result, not a stall.
 
 ## 1042. The `[vault]` key/secret/transit providers build a redirect-following HTTP client, so a diverted 3xx could carry `X-Vault-Token` off-path
 
-> ✅ **SHIPPED 2026-08-10 — all three `[vault]` clients now refuse redirects.** Value **4/10** · Difficulty **2/10** · _fill-in_. `allow_redirects=False` at both `hvac.Client` construction points (`store/keyprovider_vault.py` and `config/secretprovider_vault.py` `_build_client`); `store/crypto_transit.py` already reuses the first, so the Transit cipher inherits the policy rather than growing a second construction point. Verified against the library rather than assumed: hvac 2.4.0's `Client.__init__` takes `allow_redirects` (default `True`), stores it on the adapter, and the adapter passes `allow_redirects=self.allow_redirects` to `requests.Session.request` — recorded in the test module's docstring because CI never installs the `[vault]` extra and no test can reach it there. Four tests in `tests/test_vault_client_redirect_policy.py`: three watched RED (each reported the constructed kwargs as `dict_keys(['url', 'token'])`), and the fourth is a live positive control that the recording stand-in reports an absent policy rather than swallowing an unrecognised kwarg. The Transit client is driven end to end through `build_transit_cipher`, so a private client construction there would red rather than pass an identity check.
+> ✅ **SHIPPED 2026-08-10 — all three `[vault]` clients now refuse redirects.** Value **4/10** · Difficulty **2/10** · _fill-in_. `allow_redirects=False` at both `hvac.Client` construction points (`store/keyprovider_vault.py` and `config/secretprovider_vault.py` `_build_client`); `store/crypto_transit.py` already reuses the first, so the Transit cipher inherits the policy rather than growing a second construction point. Verified against the library rather than assumed: hvac 2.4.0's `Client.__init__` takes `allow_redirects` (default `True`), stores it on the adapter, and the adapter passes `allow_redirects=self.allow_redirects` to `requests.Session.request` — recorded in the test module's docstring because CI installed the `[vault]` extra nowhere and no test could reach it there. **That premise expired on 2026-09-03** ([#1317](#1317)): the `test` leg installs `[vault]` now, so a live assertion against hvac's real construction IS reachable in CI and a future revision of this policy should make one rather than inherit the docstring. Four tests in `tests/test_vault_client_redirect_policy.py`: three watched RED (each reported the constructed kwargs as `dict_keys(['url', 'token'])`), and the fourth is a live positive control that the recording stand-in reports an absent policy rather than swallowing an unrecognised kwarg. The Transit client is driven end to end through `build_transit_cipher`, so a private client construction there would red rather than pass an identity check.
 
 **Cluster:** Egress / secret handling. **Priority:** P3. **Verdict:** build (small). **Severity:** conditional, not an exposure on the shipping config. The vault provider is behind an optional pip extra and off by default; when selected it points at operator-trusted infrastructure. On first deployment, an on-path 3xx (absent TLS integrity) or a spoofed Vault could divert the bearer token, while every default egress refuses redirects.
 
@@ -14935,6 +14935,64 @@ not built. This records a call site gaining an assertion, not the allowlist chan
 
 *Recorded by the lander, not the author: the PR carried the code without the row, and a required check
 exists to catch exactly that. The row's status is unchanged; only its record of what has shipped is.*
+
+**AMENDMENT 2026-09-03 -- THE VAULT ARM IS BUILT, AND THE CI LEG IS WHAT MAKES IT HONEST.** Owner-ruled
+the same day: install the `[vault]` extra on a CI job, *then* build the hvac assertion. A Builder
+earlier that day had refused to build it alone and was right to -- hvac is absent from every local
+interpreter and no CI leg installed the extra, so the assertion could have shipped without ever being
+executed once. See [ADR 0180](adr/0180-asserting-tls-suites-on-a-library-that-exposes-no-sslcontext.md)
+Amendment A for the full measurement; what this row records is what it now measures.
+
+**The order is the deliverable, not a preamble.** `[vault]` now installs on `ci.yml`'s `test` leg --
+the only leg that runs `tests/`, so the only install line that can exercise the control. Six small
+pure-Python wheels, every one already pinned in `requirements.lock` and `constraints.lock`, so **no
+re-lock was needed**. `tests/_extras_probe.py` gained a `vault` row, so an interpreter without the
+extra now announces the run as INCOMPLETE rather than reporting a quiet green over skipped security
+tests.
+
+**IT IS ASSERTABLE, AND THE MEASUREMENT SAYS WHY A REPLICA IS THE ONLY INSTRUMENT.** Measured against
+the locked pins (hvac 2.4.0, requests 2.34.2, urllib3 2.7.0) by driving a real client at a real socket,
+not by reading source: `hvac.Client` carries zero `SSLContext` attributes, its `requests.Session`
+carries none, its `PoolManager` has `connection_pool_kw == {'maxsize': 10, 'block': False}` with no
+`ssl_context` key, and the module-level `requests.adapters._preloaded_ssl_context` that requests 2.32
+carried is **gone in 2.34**. urllib3 builds the context lazily, per connection, calling
+`create_urllib3_context` **once** and yielding **17 suites -- zero NULL, zero anonymous, zero
+non-forward-secret**. So `assert_hvac_tls_suites` replicates that construction with urllib3's OWN
+public constructor and refuses any `hvac.Client` argument it cannot replicate -- `session=` above all,
+since that is the documented way to hand this hop a different context.
+
+**ONE GUESS THIS ROW WOULD OTHERWISE HAVE INHERITED, corrected by measurement.**
+`create_urllib3_context()` and stdlib `create_default_context()` produce the **identical** 17 suites on
+the current OpenSSL. The reason to use urllib3's own constructor is therefore *not* that a stdlib
+look-alike is measurably wrong today -- it is that only the real function tracks urllib3 if urllib3
+narrows its own defaults. The satisfying version of that argument would have been false.
+
+**THE PROOF IT CARRIES, which is the shape this row demanded of its own first half.** Seven tests
+pinning the refusal AND a positive control -- the real 17-suite list is required to be non-empty and
+clean on all three shipped predicates, because a refusal pinned alone cannot tell a working control
+from one that refuses everything. Five mutations, each applied alone with the tree restored between,
+**every one RED**: delete the assertion from either construction point, make the unreplicable-argument
+refusal inert, drop `harden_cipher_suites` from the replica, and make the replica build a context that
+*differs* from urllib3's. The last is the one that matters for a replica -- it proves the equivalence
+test detects drift rather than merely passing.
+
+**TWO CONSTRUCTION POINTS COVER THREE CLIENTS, and that is now pinned by identity rather than prose:**
+a test asserts `crypto_transit._build_client is keyprovider_vault._build_client`. `_build_client` also
+moved OUT of its callers' `try` blocks in all three callers, whose `except Exception` would have
+relabelled this configuration refusal as a connectivity failure -- the same mistake ADR 0180 records
+for the LDAPS site. Fail-closed is unchanged: both paths propagate and the subsystem refuses to start.
+
+**WHERE THE ROW NOW STANDS. Every library named in the residual is closed or recorded with evidence:**
+`ldap3` asserts (2026-08-30), `hvac` asserts (this amendment), and **ODBC Driver 18 is
+un-assertable with the reason in ADR 0180** -- TLS is terminated inside the native driver, the suite
+list belongs to the driver and the OS TLS stack rather than to the interpreter's OpenSSL, and no
+Python-side context exists to hold or replicate. That is a finding, not a deferral.
+**THE BANNER STILL DOES NOT FLIP, and the reason is unchanged since 2026-08-30:** the strict positive
+allowlist this row asks for -- admitting only suites present on every current candidate list -- governs
+the operator KNOB and is still not applied to an inherited default context. That is the row's own
+remaining ask. **Closure is proposed, not taken:** the library half this row declared open is now
+fully accounted for, so the only open question left is the allowlist's scope. A seat with the authority
+should rule on whether that survives as this row or as a new one.
 
 ## 1315. prose path:line citations carry no token, so nothing can verify them
 

@@ -65,6 +65,7 @@ __all__ = [
     "TrustAnchorPolicy",
     "active_hop_posture",
     "APPROVED_SMTP_AUTH_MECHANISMS",
+    "assert_hvac_tls_suites",
     "assert_ldap3_tls_suites",
     "build_asserted_https_handler",
     "build_smtp_tls_context",
@@ -688,6 +689,88 @@ def assert_ldap3_tls_suites(tls_kwargs: Mapping[str, object], *, connector: str)
     ctx.check_hostname = False
     ctx.verify_mode = ssl.VerifyMode(validate)
     harden_cipher_suites(ctx, connector=connector)
+
+
+#: The ``hvac.Client`` keyword arguments :func:`assert_hvac_tls_suites` can faithfully replicate.
+#:
+#: These are the three the engine passes, and not one of them reaches the TLS context: ``url`` becomes
+#: the request URL, ``token`` an ``X-Vault-Token`` header, and ``allow_redirects`` is a requests-level
+#: policy the adapter applies after the handshake. Every OTHER ``Client`` argument is REFUSED rather
+#: than ignored — ``session``, ``adapter``, ``verify``, ``cert`` and ``proxies`` each redirect where
+#: the context comes from, and the function's docstring says why ``session=`` in particular must never
+#: be quietly accepted.
+_HVAC_CLIENT_REPLICABLE_KWARGS = frozenset({"url", "token", "allow_redirects"})
+
+
+def assert_hvac_tls_suites(client_kwargs: Mapping[str, object], *, connector: str) -> None:
+    """Assert the suite list of the context ``urllib3`` will build for an ``hvac`` (requests) hop.
+
+    The Vault sibling of :func:`assert_ldap3_tls_suites`, and the second site where
+    :func:`build_asserted_https_handler`'s method — hold the library's OWN context and check it — is
+    **not available**. Measured against the locked pins (hvac 2.4.0, requests 2.34.2, urllib3 2.7.0):
+    an ``hvac.Client`` carries zero ``SSLContext`` attributes, its ``requests.Session`` carries none,
+    and the ``PoolManager`` it builds has ``connection_pool_kw == {'maxsize': 10, 'block': False}`` —
+    no ``ssl_context`` key. requests' own ``_urllib3_request_context`` never sets one either (the
+    module-level preloaded context that requests 2.32 carried is **gone** in 2.34; its
+    ``build_connection_pool_key_attributes`` docstring still claims otherwise and is stale). The
+    context is therefore constructed lazily, per connection, inside urllib3's
+    ``_ssl_wrap_socket_and_match_hostname``. The engine can never hold it.
+
+    So this rebuilds urllib3's construction and asserts THAT, and the instrument is urllib3's **own
+    public constructor** — ``urllib3.util.ssl_.create_urllib3_context``, the very function
+    ``urllib3.connection`` imports and calls — never a hand-rolled look-alike. Substituting a
+    stdlib ``create_default_context`` would be a second, silently different policy: the two agree on
+    today's OpenSSL by coincidence, not by construction, and only the real function tracks urllib3 if
+    it ever narrows its own defaults.
+
+    It is a weaker guarantee than identity, and it is only honest because the gap is closed by
+    measurement rather than by argument:
+    ``test_the_vault_replica_matches_the_context_urllib3_actually_builds`` drives a **real**
+    ``hvac.Client`` at a real socket, captures the ``SSLContext`` urllib3 builds on the way to the
+    handshake, and requires its suite list to equal this one's. If urllib3 changes how it builds that
+    context, the replica stops matching and that test goes red.
+
+    **It REFUSES any ``Client`` argument it cannot replicate, and that refusal is load-bearing.**
+    ``session=`` is the documented way to reach this hop's TLS — hand hvac a ``requests.Session``
+    whose HTTPS adapter carries an ``ssl_context`` — and it is exactly what would make this replica
+    assert a context the hop does not use. A control that keeps reporting success after the thing it
+    checks has moved is the false-premise shape SDS-3.7 forbids, so an argument outside
+    :data:`_HVAC_CLIENT_REPLICABLE_KWARGS` raises here instead.
+
+    ``verify`` is refused for the same reason and NOT because it changes the suite list — measured, it
+    does not: ``cert_reqs=CERT_NONE`` yields the identical 17 suites. It is refused because it is the
+    knob that turns peer verification off, and a replica that quietly accepted it would report a clean
+    suite list for a hop that authenticates nobody. The engine passes it never, so the default
+    (``verify=True`` → ``CERT_REQUIRED``, measured on the shipped construction) is what this replicates.
+
+    Raises :class:`ValueError` at construction, like every other assertion site.
+    """
+    unreplicable = sorted(set(client_kwargs) - _HVAC_CLIENT_REPLICABLE_KWARGS)
+    if unreplicable:
+        raise ValueError(
+            f"{connector}: cannot assert this hop's TLS suites — hvac.Client argument(s) "
+            f"{', '.join(unreplicable)} change where the TLS context comes from in a way this check "
+            f"does not replicate, so it would be asserting a context the hop will not use. Note a "
+            f"`session=` whose HTTPS adapter carries an `ssl_context` bypasses urllib3's own "
+            f"construction entirely — route suite policy through this assertion, not through hvac."
+        )
+    try:
+        # Lazy, and INSIDE the function on purpose: this module is imported by the settings validator
+        # on every start, and urllib3 arrives only with the optional [vault] extra. A module-scope
+        # import would make the base install depend on it.
+        from urllib3.util.ssl_ import (  # noqa: PLC0415
+            create_urllib3_context,
+        )
+    except ImportError as exc:
+        # Fails CLOSED, and this arm is not dead code by accident: hvac depends on requests, which
+        # depends on urllib3, so an importable hvac with an unimportable urllib3 is a broken install.
+        # Refusing beats crossing an unchecked hop on the guess that it is fine.
+        raise ValueError(
+            f"{connector}: cannot assert this hop's TLS suites — urllib3 is not importable, so the "
+            f"context this hop will negotiate with cannot be reconstructed (ASVS 12.1.2). Refusing "
+            f"rather than crossing unchecked."
+        ) from exc
+    harden_cipher_suites(create_urllib3_context(), connector=connector)
 
 
 def _is_forward_secret(cipher: Mapping[str, object]) -> bool:

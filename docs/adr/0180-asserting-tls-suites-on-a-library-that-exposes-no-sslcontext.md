@@ -1,8 +1,8 @@
 # 0180 — Asserting TLS suites on a library that exposes no SSLContext
 
-- **Status:** Accepted
+- **Status:** Accepted (amended 2026-09-03 — see Amendment A)
 - **Date:** 2026-08-28
-- **Related:** BACKLOG #1317 · `messagefoundry/config/tls_policy.py` (`harden_cipher_suites`, `build_asserted_https_handler`, `assert_ldap3_tls_suites`) · `messagefoundry/auth/ldap.py` · `tests/test_tls_cipher_assertion_sites.py`
+- **Related:** BACKLOG #1317 · `messagefoundry/config/tls_policy.py` (`harden_cipher_suites`, `build_asserted_https_handler`, `assert_ldap3_tls_suites`, `assert_hvac_tls_suites`) · `messagefoundry/auth/ldap.py` · `messagefoundry/config/secretprovider_vault.py` · `messagefoundry/store/keyprovider_vault.py` · `messagefoundry/store/crypto_transit.py` · `tests/test_tls_cipher_assertion_sites.py` · `.github/workflows/ci.yml`
 
 ---
 
@@ -92,7 +92,10 @@ change nothing about the connection.
 
 ## Scope: the other two libraries the row names
 
-**Vault (hvac) — NOT BUILT, concluded as research.** The row implies these are assertable from
+**Vault (hvac) — NOT BUILT, concluded as research.** *Superseded 2026-09-03 by Amendment A below,
+which built it. The paragraph is preserved because its reasoning is why the CI leg had to come first,
+but its present-tense claims about CI and testability are no longer true — read the amendment.* The
+row implies these are assertable from
 `config/secretprovider_vault.py` and `store/keyprovider_vault.py`. They are not, today:
 
 - Both do exactly one thing: `hvac.Client(url=, token=, allow_redirects=False)`. Zero `ssl`, zero
@@ -139,3 +142,75 @@ interpreter's OpenSSL. The posture that *is* reachable there — refusing `Trust
   manufacturing a control.
 - The `store/postgres.py` default arm stays an unasserted residual, unchanged and still pinned by its
   own test. This ADR does not touch it.
+
+---
+
+## Amendment A (2026-09-03) — the precondition was met, so the Vault arm is BUILT
+
+This ADR named exactly one thing that would change the Vault verdict: *"the `[vault]` extra installed
+on a CI leg. Then the honest instrument is urllib3's **own** public constructor,
+`urllib3.util.ssl_.create_urllib3_context()`."* Owner-authorised 2026-09-03. Both halves shipped
+together, and **the order is the point** — the leg came first, so the control has been executed.
+
+**1. `[vault]` is installed on the `test` leg of `.github/workflows/ci.yml`.** That leg, and no other,
+runs `tests/`, so it is the only install line that can exercise the assertion. Six small pure-Python
+wheels, all already pinned in `requirements.lock` / `constraints.lock` — no re-lock was needed.
+`tests/_extras_probe.py` now lists `vault`, so an interpreter without it announces the run as
+INCOMPLETE instead of reporting a quiet green over skipped security tests.
+
+**2. `assert_hvac_tls_suites` asserts a REBUILT context, pinned to urllib3's own constructor.** Same
+shape as `assert_ldap3_tls_suites` and for the same reason, re-measured against the locked pins rather
+than assumed:
+
+| layer | holds an `SSLContext`? |
+|---|---|
+| `hvac.Client` | no — zero `ssl`/`context` attributes |
+| its `requests.Session` | no |
+| the `PoolManager` it builds | no — `connection_pool_kw == {'maxsize': 10, 'block': False}` |
+| `requests.adapters._preloaded_ssl_context` | **gone in requests 2.34** (2.32 had it) |
+
+So the context is built lazily per connection inside urllib3's
+`_ssl_wrap_socket_and_match_hostname`, and the engine can never hold it. Driving a real `hvac.Client`
+at a real socket shows urllib3 calling `create_urllib3_context` **once**, with
+`{ssl_version: PROTOCOL_TLS, ssl_minimum_version: None, ssl_maximum_version: None, cert_reqs:
+CERT_REQUIRED}`, yielding **17 suites — 14 TLS 1.2 + 3 TLS 1.3, zero NULL, zero anonymous, zero
+non-forward-secret**. The bare replica matches that list exactly.
+
+**One measurement corrects a guess this ADR came close to making.** `create_urllib3_context()` and
+stdlib `create_default_context()` produce the **identical** 17 suites on the current OpenSSL. So the
+reason to use urllib3's own constructor is *not* that a stdlib look-alike would differ today — it is
+that only the real function tracks urllib3 if urllib3 ever narrows its own defaults. Stated because
+"the look-alike is measurably wrong" would have been a satisfying and false argument.
+
+**3. It REFUSES any `hvac.Client` argument it cannot replicate** (`_HVAC_CLIENT_REPLICABLE_KWARGS =
+{url, token, allow_redirects}`). `session=` is the one that matters: it is the documented way to give
+this hop a different TLS context, and a replica that accepted it would keep reporting a clean suite
+list for a context the hop had stopped using. `verify=` is refused too, and **not** because it changes
+the suite list — measured, `cert_reqs=CERT_NONE` yields the identical 17 — but because it is the knob
+that turns peer verification off.
+
+**4. Two construction points, three clients, and the sharing is now pinned by identity.**
+`config/secretprovider_vault._build_client` and `store/keyprovider_vault._build_client` both assert;
+`store/crypto_transit.py` imports the latter, and a test asserts `crypto_transit._build_client is
+keyprovider_vault._build_client` rather than restating the claim in prose.
+
+**5. The assertion and the construction read ONE kwargs dict.** The LDAPS site needed a second test
+(`test_the_asserted_ldaps_arguments_are_the_ones_the_bind_uses`) because its asserted arguments and
+its bind arguments lived in different methods. Here they cannot drift, because they are the same
+object, so that whole failure mode is removed rather than tested for.
+
+**6. `_build_client` moved OUT of its callers' `try` blocks**, in all three callers. Each had an
+`except Exception` that relabels — *"could not read secret ... from Vault KV"*, *"could not
+envelope-decrypt the store DEK"*, *"could not reach a Vault Transit key"* — which would have turned
+this configuration refusal into what reads as a connectivity failure. That is the same mistake this
+ADR records for the LDAPS site when it chose `ValueError` over `LdapError`. Fail-closed is unchanged:
+both paths propagate and the subsystem refuses to come up.
+
+**Mutation-proof, run rather than claimed.** Seven tests, five mutations, each applied alone with the
+tree restored between: deleting the assertion from either construction point, making the
+unreplicable-argument refusal inert, dropping `harden_cipher_suites` from the replica, and making the
+replica build a context that *differs* from urllib3's — every one turns the suite RED, and the
+restored tree returns green. The last is the one that matters for a replica: it proves the equivalence
+test can detect drift rather than merely passing.
+
+**ODBC Driver 18 is unchanged and stays OUT, permanently.** Nothing in this amendment bears on it.
