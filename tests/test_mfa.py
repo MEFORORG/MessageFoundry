@@ -386,6 +386,12 @@ async def test_spending_a_recovery_code_is_audited_distinguishably_and_notified(
         assert '"remaining": 1' in rows[0]["detail"]
         # The code itself and its hash never reach the audit row or the notice.
         assert codes[0] not in rows[0]["detail"]
+
+        # The mailbox is the arm that can be absent; the pull feed is the arm that cannot. It selects
+        # ``auth.%`` rows whose ACTOR is the user, so an action named or attributed any other way
+        # would be invisible to exactly the accounts the address gate already excludes.
+        feed = await service.security_events_for("admin")
+        assert [e for e in feed if e["action"] == "auth.mfa_recovery_code_used"]
     finally:
         await store.close()
 

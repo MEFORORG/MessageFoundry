@@ -1468,3 +1468,21 @@ async def test_a_first_directory_address_notifies_the_only_reachable_party() -> 
         assert changed[0].email == "first@x" and changed[0].detail["new_email"] == "first@x"
     finally:
         await store.close()
+
+
+async def test_the_directory_repoint_reaches_the_users_own_pull_feed() -> None:
+    # The mailbox is the arm that can be absent; ``GET /me/security-events`` is the arm that cannot.
+    # It selects ``auth.%`` rows whose ACTOR is the user, so an action named or attributed any other
+    # way would be invisible to exactly the accounts the address gate already excludes.
+    store = await _store()
+    try:
+        service = AuthService(store, _ad_settings())
+        await service.initialize()
+
+        assert (await service._complete_ad_login(_principal("old@x"), None, mfa_verified=True)).ok
+        assert (await service._complete_ad_login(_principal("new@x"), None, mfa_verified=True)).ok
+
+        feed = await service.security_events_for("jdoe")
+        assert [e for e in feed if e["action"] == "auth.ad_profile_email_changed"]
+    finally:
+        await store.close()
