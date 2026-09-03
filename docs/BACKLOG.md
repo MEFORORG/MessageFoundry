@@ -19424,10 +19424,55 @@ So there is no writer anywhere in the merge path. An **anchor** -- a citation fr
 > Verdict: build
 > Research: none
 > Closing-act: code
+>
+> **BUILT 2026-09-03, not yet landed.** The sweep this item asks for is
+> `scripts/coord/alloc_strand_sweep.py` -- read-only, and keyed on the gate's own `owns` semantics
+> rather than on a second definition of ownership. **Census over the allocation registry (the state
+> of record; the published ledger lags it): 523 allocations, 449 landed and inert, 74 unlanded, and
+> ZERO in the drift shape this item describes.** Only 2 are keyless, and both recover by the
+> owner-ruled #1282 remedy, which this branch **measures** rather than assumes -- so the count of
+> permanently lost numbers is **zero**. The number therefore chose DOCUMENTED RECOVERY over a
+> mechanism for the keys. The one code defect the census exposes is the refusal TEXT: it named only
+> `alloc.ps1`, which issues a NEW number, and none of the recoveries that work, so a correctly-refused
+> seat was steered into burning an allocation. `--titles` reports 19 titles already holding more than
+> one number. **Three claims in the item below do not survive measurement; each is corrected in
+> place rather than left to be quoted.**
 
 **Cluster:** coordination tooling / ledger integrity. **Priority:** P2. **Verdict:** build.
 **Severity:** no engine, PHI or deployment axis (sec. 0). Nothing ships in the wheel. The cost is real
 work that is finished, correct, and cannot be committed by anybody.
+
+**CORRECTIONS MEASURED 2026-09-03, IN THE ORDER THEY MATTER.**
+
+1. **`Checker.owns` does not exist.** `grep -nE "^class " scripts/hooks/ledger_check.py` returns one
+   line, `168:class Ledger:`. The method is `Ledger.owns`. A reader searching for the cited name finds
+   nothing, which is how this cost two sessions a probe apiece.
+2. **Instance A does not reproduce, and it is this item's central worked example.** `#1406`'s heading
+   is on `origin/main`, so the gate never asks about its ownership again -- `check_backlog` examines
+   `head - base` only. Its recorded worktree is also still live, so the path key would answer True
+   regardless. Instance B (`#1211`) is likewise landed.
+3. **"Two, both from one night" understates it, and the third limb is neither of the two named.** A
+   claim can be recorded to a tree that was never going to commit it -- one seat allocating on
+   another's behalf, or a pre-anchoring shell in the wrong directory. It is stranded at birth, not by
+   drift, and it looks perfectly healthy in the registry: the recorded worktree is live and on the
+   recorded branch. [#1297](#1297)/[#1298](#1298) is one such pair, and the registry holds two more at
+   backlog 1422/1423 and 1425/1426 -- written without the citation sigil deliberately, because those
+   four are allocated but their items are still in an unmerged pull request, so a live cross-reference
+   would dangle today. All three pairs are confirmed from the registry itself, by identical titles.
+   `alloc.ps1 -For` closes this limb at birth.
+
+**THE ESCAPE THE ITEM RECORDED AS UNVERIFIED IS NOW MEASURED, INCLUDING THE PUSH.** In a throwaway
+repo: `git checkout <held-branch>` refused with exit 128; `git checkout -b <alias> <held-branch>`
+succeeded; the real `ledger_check.py` **refused** from the branch-holding worktree and **passed** from
+the aliased entitled one; `git push origin <alias>:<held-branch>` fast-forwarded the PR branch. The
+worked steps are in [`LEDGER-GATE.md`](LEDGER-GATE.md) and every step is pinned by
+`tests/test_coord_alloc_strand_sweep.py`.
+
+**WHAT IS STILL NOT ESTABLISHED.** The sweep reads committed state, so **uncommitted** work is
+invisible to it -- and instance A was precisely a patch the gate had stopped anyone committing. The
+census is therefore a floor on strandedness, not a total, and `--titles` is a lower bound in one
+direction and an over-report in the other (`#240`-`#247` pair because the allocator was run twice, not
+because anything stranded).
 
 **HOW THIS DIFFERS FROM #1282, WHICH IS THE FIRST THING TO CHECK BEFORE READING FURTHER.** #1282 is the
 worktree DELETED case, and its owner-ruled recovery in [`LEDGER-GATE.md`](LEDGER-GATE.md) is *recreate a
