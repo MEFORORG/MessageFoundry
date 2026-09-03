@@ -16,7 +16,7 @@ on:
   # `cla` is a REQUIRED context, and branch protection evaluates required contexts on the
   # MERGE-GROUP commit, so removing this trigger means `cla` never reports in the queue and NOTHING
   # MERGES. That is not hypothetical: codeql.yml's header records PR 619 sitting AWAITING_CHECKS on
-  # the queue's first entry with three contexts simply absent.
+  # the queue's first entry with its CodeQL contexts simply absent.
   #
   # THIS JOB'S GREEN MEANS TWO DIFFERENT THINGS UNDER ONE CONTEXT NAME, AND THE NAME CANNOT SHOW
   # THE DIFFERENCE. The `CLA Assistant` step below is gated to the comment triggers and to

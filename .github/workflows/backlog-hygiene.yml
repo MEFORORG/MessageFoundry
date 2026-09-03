@@ -32,7 +32,7 @@ on:
   # This job's name is a REQUIRED context, and branch protection evaluates required contexts on the
   # MERGE-GROUP commit, so removing this trigger means the context never reports in the queue and
   # NOTHING MERGES. That is not hypothetical: codeql.yml's header records PR 619 sitting
-  # AWAITING_CHECKS on the queue's first entry with three contexts simply absent.
+  # AWAITING_CHECKS on the queue's first entry with its CodeQL contexts simply absent.
   #
   # WHAT THIS JOB CHECKS ON merge_group IS NOT WHAT IT CHECKS ON A PULL REQUEST. Its question --
   # "does THIS pull request update BACKLOG.md" -- has no subject in a merge group, where every
