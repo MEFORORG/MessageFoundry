@@ -80,6 +80,12 @@ def test_a_QUOTED_MULTI_WORD_alias_value_is_still_invisible(repo: SimpleNamespac
     builds a real argument tokeniser, this test SHOULD fail, and the correct response is to invert it
     together with BACKLOG #1069's banner -- not to delete it. The one pass that attempted that tokeniser
     acquired five new fail-opens, which is why the narrow carve-out shipped instead.
+
+    A DENY HERE IS A BEHAVIOUR CHANGE TO BE REVIEWED, NEVER A BUG FIX TO BE WAVED THROUGH, and that
+    holds however the DENY arrived. A tokeniser is only the INTENDED route to it; a widened regex or a
+    changed carve-out elsewhere reaches the same red without anyone deciding to. Whoever sees it owes a
+    reading of what else that change now denies -- the prose rows above are the first place to look,
+    since re-admitting their false deny is the known cost of reaching this one.
     """
     assert (
         run_gate(
