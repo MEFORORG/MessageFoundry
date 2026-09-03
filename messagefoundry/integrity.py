@@ -91,6 +91,14 @@ _ATTESTED_SUFFIX = ".py"
 #: absence becomes a false tamper alarm against a clean install. Five sessions re-derived this in one
 #: day; ``test_line_endings_alone_never_report_tampering`` and its after-install control pin it.
 #:
+#: **The near-neighbour is not a counter-example, and it is what a future editor will find first.**
+#: ``common_passwords.NOTICE`` records a sha256 of the corpus. That is a *provenance* record -- it
+#: names the bytes that were built and shipped, nothing compares against it at runtime, and it is
+#: explicit that it holds only under a ``.gitattributes`` pin. A **baseline** is the other kind: it is
+#: compared, at startup, against a file on an operator's disk, and it must therefore come from the
+#: same install as that file. Recording provenance beside the data is right; carrying that habit into
+#: this module is the mistake.
+#:
 #: **An explicit list rather than every RECORD row under the package**, which is the stronger design
 #: and the one actually weighed. It would make a forgotten asset impossible rather than guarded; it
 #: was declined because attestation scope would then follow whatever packaging ships, and the day a
