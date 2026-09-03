@@ -15859,6 +15859,36 @@ gate on `#1332` today is told `ok` about an item whose first body line says it m
 retirement marker in the body**. The retirement text is prose rather than a field, so this one needs a
 body read rather than a `fields` lookup -- **or a fourth banner key, which is the cleaner answer if
 anyone is already editing the schema.**
+
+***LANDED 2026-09-03 -- ALL THREE PARTS ARE NOW ON A PULL REQUEST, AND THE THIRD ARRIVED WITH A
+DEFECT THIS ROW CAUSED.*** The first two parts (`GATED_VERDICTS`, and the `advise` branch for
+`demand-gate` and `owner-ruling`) were already on `main`. The third part was written on
+`claude/builder-2-1334-retirement-limb` at `eaf6d0940` and never merged; it is cherry-picked here.
+`judge()` takes the item's heading and prose, `load_ledger` returns them beside the fields from one
+read, and the note leads with the marker it quotes, so a reader can check the claim.
+
+**The level is `advise`, never `refuse`**, for the reason this row already argues: a gated item can
+legitimately be scoped or researched, and the seat still decides.
+
+**Measured against the live ledger, both directions.** Before: `#1332` and `#1086` came back with
+byte-identical notes. After: `#1332` comes back `workable` and names its marker, while `#1086` (the
+row `#1332` sends builders to) and this row still come back `ok`.
+
+***THE DEFECT: THIS ROW'S OWN BANNER BROKE THE NEEDLE.*** The limb was written against `main` at
+`3760a93b`. The 2026-09-03 scoring pass then added a summary blockquote to every unscored row, and
+the one above quotes the wording of the three rows it describes -- inside the 160-character window
+the prose needle allows. So the limb flagged **this row**, the worst available false positive: a
+reader stopped here never reaches the rows this row is about. The fix reads an item's heading and
+prose and skips its banner block, which is where a machine writes *about* a row rather than the row
+writing about itself. `Item.body_line` in `scripts/docs/backlog_status_check.py` publishes that
+boundary so the gate does not re-derive it beside the parser that owns it.
+
+**What remains after this merges:** the fourth banner key this row offers as the cleaner answer is
+still unbuilt, and nothing in the ledger yet declares a retirement in a field rather than in prose.
+Both needles therefore stay wording-sensitive, and `tests/test_coord_dispatch_gate.py` carries the
+live-ledger arm that goes red when the wording drifts. This row closes by `code`, so the LANDER
+flips the banner on merge.
+
 ## 1335. Lane virtualenvs install five fewer extras than CI, so a lane can pass locally and fail on the runner
 
 > 🔢 **Filed 2026-08-23 - not started.** `scripts/worktree/new.ps1:234` builds every lane virtualenv with `dev,harness` (plus `sqlserver` on a switch). CI installs `dev,harness,fhir,dicom,x12,xml,webauthn` **and** the web console package. So a lane's green suite is a strictly weaker signal than the runner's, and the gap is silent.
