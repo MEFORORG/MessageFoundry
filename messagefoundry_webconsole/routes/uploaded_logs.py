@@ -143,8 +143,41 @@ def _refused(code: str) -> RedirectResponse:
     return RedirectResponse(f"{_FAILED_TARGET}?e={code}", status_code=303)
 
 
+#: Page size the confirm pages walk the listing in. They need ONE file's metadata, not a page, so
+#: they scan every page rather than the first — see :func:`_visible_file`. The engine's own ceiling.
+_SCAN_PAGE = 500
+
+
 def register(app: FastAPI, deps: UiDeps) -> None:
     core = deps.core
+
+    async def _visible_file(
+        request: Request, *, engine: Any, identity: Identity, file_id: str
+    ) -> Any:
+        """One visible file's metadata by id, or ``None`` — walked across the PAGED listing.
+
+        The confirm pages read metadata through the listing rather than by id on purpose: the listing
+        is owner-scoped, so a file the caller may not see is simply absent and the page 303s instead
+        of disclosing that it exists. BACKLOG #1152 paged that listing, which silently broke the
+        shape — a first-page-only scan would have redirected an operator away from their OWN file the
+        moment they had more than a page of uploads, and reported it as "not found".
+
+        Called with every parameter spelled out. These handlers are invoked BY REFERENCE across the
+        seam, never over HTTP, so a FastAPI ``Query(...)`` default left unfilled arrives as a Query
+        OBJECT rather than an int — which is exactly how this broke first: the object reached a list
+        slice and raised TypeError inside the route.
+        """
+        offset = 0
+        while True:
+            data = await core.list_uploaded_files(
+                request, engine=engine, identity=identity, limit=_SCAN_PAGE, offset=offset
+            )
+            match = next((f for f in data.files if f.file_id == file_id), None)
+            if match is not None:
+                return match
+            offset += _SCAN_PAGE
+            if offset >= data.total or not data.files:
+                return None
 
     @app.get("/ui/uploaded-logs", response_class=HTMLResponse)
     async def ui_uploaded_logs(
@@ -439,8 +472,7 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         #
         # Metadata read via list, exactly as delete-confirm does — a bad or absent id 404s at the
         # browse handler, and this route must not disclose one file's existence to a non-owner.
-        data = await core.list_uploaded_files(request, engine=engine, identity=identity)
-        match = next((f for f in data.files if f.file_id == file_id), None)
+        match = await _visible_file(request, engine=engine, identity=identity, file_id=file_id)
         if match is None:
             return RedirectResponse("/ui/uploaded-logs", status_code=303)
         return HTMLResponse(pages.uploaded_log_resend_confirm(file_id, match.filename, index, to))
@@ -454,8 +486,7 @@ def register(app: FastAPI, deps: UiDeps) -> None:
     ) -> Response:
         # The confirm step (BACKLOG #126). Show the filename so the operator confirms the right file; a
         # bad/absent id (path-traversal) 404s at the browse handler, so read metadata via list here.
-        data = await core.list_uploaded_files(request, engine=engine, identity=identity)
-        match = next((f for f in data.files if f.file_id == file_id), None)
+        match = await _visible_file(request, engine=engine, identity=identity, file_id=file_id)
         if match is None:
             return RedirectResponse("/ui/uploaded-logs", status_code=303)
         return HTMLResponse(pages.uploaded_log_delete_confirm(file_id, match.filename))

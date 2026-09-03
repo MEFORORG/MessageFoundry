@@ -180,6 +180,38 @@ async def test_uploaded_logs_list_is_paged(engine: Engine, tmp_path: Path) -> No
         assert (await c.get("/ui/uploaded-logs", params={"offset": -1})).status_code == 422
 
 
+async def test_confirm_pages_find_a_file_beyond_the_first_page(
+    engine: Engine, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #1152 regression: paging the listing must not hide a file from its OWN confirm page.
+
+    The delete/resend confirm pages read one file's metadata THROUGH the owner-scoped listing, so a
+    file the caller may not see is simply absent and the page 303s rather than disclosing it. Paging
+    that listing silently broke the shape: a first-page-only scan would redirect an operator away
+    from their own file the moment they had more than a page of uploads, and report it as not found
+    — a denial indistinguishable from the real one.
+
+    The scan page size is monkeypatched down rather than uploading 500 files, which would make this
+    test minutes long to assert something that is about the LOOP, not about the number."""
+    from messagefoundry_webconsole.routes import uploaded_logs as ul_routes
+
+    monkeypatch.setattr(ul_routes, "_SCAN_PAGE", 1)
+    service = await _service(engine, ("op", Role.OPERATOR))
+    transport = httpx.ASGITransport(app=_app(engine, service, tmp_path))
+    async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
+        await _login(c, "op")
+        ids = [await _upload(c, f"deep{n}.hl7") for n in range(3)]
+        # The OLDEST upload sorts last (newest first), so it is off page one by construction.
+        oldest = ids[0]
+        confirm = await c.get(f"/ui/uploaded-logs/file/{oldest}/delete-confirm")
+        assert confirm.status_code == 200, confirm.text
+        assert "deep0.hl7" in confirm.text
+
+        # An id nobody uploaded still 303s away rather than 200-ing on an empty page.
+        missing = await c.get(f"/ui/uploaded-logs/file/{'0' * 32}/delete-confirm")
+        assert missing.status_code == 303
+
+
 def test_upload_form_states_consent_affordance() -> None:
     # ASVS 14.2.8: the upload form states, above the submit button, what non-body metadata is retained and
     # who sees it — submitting the form IS the consent (no separate stored flag). Pure page-render check.

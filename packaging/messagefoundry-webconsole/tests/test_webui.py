@@ -2214,6 +2214,34 @@ async def test_users_page_lists_accounts(engine: Engine) -> None:
         assert 'href="/ui/users"' in (await c.get("/ui")).text
 
 
+def test_users_page_scope_column_shows_what_the_account_reaches() -> None:
+    """BACKLOG #1152: the Channel scope column resolves BOTH inputs, not just the stored one.
+
+    A stored ``None`` denies now, so it must not read "all". But an ADMINISTRATOR is all-channels by
+    role whatever is stored, and printing "(none)" beside an account that holds the whole estate
+    hides real access from the person whose job is to review it — the worse of the two errors."""
+    from messagefoundry.api.auth_models import UserSummary
+    from messagefoundry_webconsole.pages.admin import _scope_cell
+
+    def _u(roles: list[str], scope: list[str] | None) -> UserSummary:
+        return UserSummary(
+            id="u",
+            username="u",
+            auth_provider="local",
+            disabled=False,
+            roles=roles,
+            channel_scope=scope,
+        )
+
+    assert _scope_cell(_u(["operator"], None)) == "(none)"  # never granted -> denies
+    assert _scope_cell(_u(["operator"], [])) == "(none)"  # explicitly denied
+    assert _scope_cell(_u(["operator"], [ALL_CHANNELS])) == "all"  # the typed grant
+    assert _scope_cell(_u(["operator"], ["IB_A", "IB_B"])) == "IB_A, IB_B"
+    # By role, and the stored scope is irrelevant in BOTH directions.
+    assert _scope_cell(_u(["administrator"], None)) == "all (administrator)"
+    assert _scope_cell(_u(["administrator"], ["IB_A"])) == "all (administrator)"
+
+
 async def test_l4a_actions_registered_in_correct_allowlists(engine: Engine) -> None:
     # Form pages are unlock targets; body-less path actions are auto-retry; body-carrying POST paths
     # are in NEITHER list (they can only be reached by a fresh same-origin form submit).

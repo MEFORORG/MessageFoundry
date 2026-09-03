@@ -22,6 +22,7 @@ from messagefoundry.api.auth_models import (
     UserSummary,
 )
 from messagefoundry.auth.identity import ALL_CHANNELS
+from messagefoundry.auth.permissions import Role
 
 from .._html import Markup, el, page, register_nav, rows_table
 from ._common import _seg
@@ -57,14 +58,24 @@ def _admin_links(active_page: str) -> Markup:
 # --- users --------------------------------------------------------------------
 
 
-def _scope_cell(stored: Sequence[str] | None) -> str:
-    """The Channel scope column for one user, read from the STORED scope.
+def _scope_cell(user: UserSummary) -> str:
+    """The Channel scope column for one user: what that account can actually REACH.
 
-    ``None`` used to render "all"; since BACKLOG #1152 an unset scope denies, so it renders
-    "(none)" alongside an explicit empty list. All-channels is the ``*`` grant. Getting this
-    backwards would tell an administrator an account is wide open when it reaches nothing —
-    the direction of the error that makes someone widen a grant to fix a symptom that is not there.
+    Two things decide it and this column has to show the resolved answer, not one input. The stored
+    scope is the grant; ``None`` used to render "all" and, since BACKLOG #1152, an unset scope denies
+    — so it renders "(none)" alongside an explicit empty list, and all-channels is the ``*`` grant.
+    But an ADMINISTRATOR is all-channels BY ROLE whatever is stored (``_allowed_channels`` returns
+    before it reads the column), so rendering their stored scope would print "(none)" beside an
+    account holding the whole estate.
+
+    Both directions of that error are worth naming, because they fail differently. Showing "all" for
+    an account that reaches nothing sends an administrator hunting a permission bug that is not
+    there. Showing "(none)" for an account that reaches everything hides real access from the person
+    whose job is to review it, which is the worse of the two.
     """
+    if Role.ADMINISTRATOR.value in user.roles:
+        return "all (administrator)"
+    stored = user.channel_scope
     if stored is None:
         return "(none)"
     if ALL_CHANNELS in stored:
@@ -83,7 +94,7 @@ def users_page(users: Sequence[UserSummary]) -> Markup:
                 u.display_name or "",
                 u.email or "",
                 ", ".join(u.roles),
-                _scope_cell(u.channel_scope),
+                _scope_cell(u),
                 "disabled" if u.disabled else "active",
             ]
         )
