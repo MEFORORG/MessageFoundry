@@ -81,6 +81,16 @@ _ATTESTED_SUFFIX = ".py"
 #: Version skew is impossible by construction: this list and the ``RECORD`` it is compared against
 #: ship in the *same* wheel, so a declared asset always has a baseline row.
 #:
+#: **DO NOT RECORD A DIGEST HERE.** This module holds *paths*; every expected hash is sourced from the
+#: installed distribution's own ``RECORD``, so the baseline travels with the install and a wheel's
+#: content and its digests are produced by one build. That is the whole reason a checkout's line
+#: endings cannot make this cry tamper on a clean host, and it is why none of these assets needs a
+#: ``.gitattributes`` byte pin *for attestation* (they may well want one for reproducible builds --
+#: a different question). Pin a hash in source and you invert it: a repo-recorded digest is
+#: platform-independent while an unpinned working tree is not, so the pin becomes load-bearing and its
+#: absence becomes a false tamper alarm against a clean install. Five sessions re-derived this in one
+#: day; ``test_line_endings_alone_never_report_tampering`` and its after-install control pin it.
+#:
 #: **An explicit list rather than every RECORD row under the package**, which is the stronger design
 #: and the one actually weighed. It would make a forgotten asset impossible rather than guarded; it
 #: was declined because attestation scope would then follow whatever packaging ships, and the day a
