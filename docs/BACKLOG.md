@@ -130,12 +130,21 @@ the **ASVS 5.0 research set** -- **#1117** (a session cookie carrying `Secure` a
 startable configuration), **#1136** (a first-run bootstrap leaving no enabled default account), **#1139**
 (notifying a user whose directory authentication details changed), **#1146** (session-token rotation on
 re-authentication), **#1184** (the PHI search needle off the query string) and **#1194** (isolation
-around Router/Handler code) -- beside three defects in shipped code: **#1268** (the SQL Server
-`users.username` collation against a case-sensitive bootstrap-retirement gate), **#1005** (CRL checking
-on the mTLS-terminating listeners) and **#1004** (the store DEK's calendar expiry alerting and never
-refusing). The cheapest high-value work is **#1248** at value 7 difficulty 2 (a federated identity
-binding written with no audit row), then **#1056**, **#1216**, **#1234**, **#1260** and **#1300** at
-value 6 difficulty 2.
+around Router/Handler code), joined at the same value by **#1143** (cross-IdP identity assumption where
+one username namespace serves every provider) and **#1168** (retiring PKCS#1 v1.5 where the direct
+key-transport half has no padding parameter) -- beside two defects in shipped code: **#1317** (the TLS
+cipher allowlist testing a name prefix, so NULL-encryption and anonymous suites pass every gate; already
+in progress, and the cheapest thing in the value-8 band at difficulty 3) and **#1004** (the store DEK's
+calendar expiry alerting and never refusing). The cheapest high-value work is now the value 6 difficulty
+2 set -- **#1056**, **#1234**, **#1328**, **#1334**, **#1374**, **#1375** and **#1421** -- every one of
+them `P1` on the difficulty-2 rule.
+
+**Six of the fifteen items the previous edition of this paragraph named were closed, and it is corrected
+here rather than quietly.** It called **#1268** and **#1005** live defects in shipped code, and
+headlined the cheapest work as **#1248** at value 7 difficulty 2 with **#1216**, **#1260** and **#1300**
+beside it. All six are closed, and **no value-7 item at difficulty 2 remains anywhere in the ledger**,
+so that sentence could not be repaired by swapping names. This is the same decay the note below records
+one edition earlier, which is the point of recording it twice.
 
 **That table is no longer the whole ranking, and reading it alone now understates the corpus.** The
 [first-score table](#first-score-2026-09-03--the-73-open-items-that-carried-no-value-or-difficulty)
@@ -14557,12 +14566,13 @@ difficulty-2 fill-in without its own adversarial pass.** #1306 closes when `0c17
 
 ## 1312. the release-age guardrail test reaches live PyPI, so its declared discriminating row proves nothing
 
-> 🔢 **Filed 2026-08-22 by the lander, from PR #487's CI.** Value **6/10** -- Difficulty **3/10** -- _fill-in_. `tests/test_dependabot_automerge_guardrails.py::test_release_age_passes_an_aged_release_and_holds_a_fresh_one` stubs `curl` on PATH so the dependabot release-age guardrail is exercised against a FIXTURE. On `windows-2025` the stub is not interposing and the step body queries **live PyPI**. Three of its four rows fail; the fourth passes off the network.
+> 🔢 **Filed 2026-08-22 by the lander, from PR #487's CI.** Value **6/10** · Difficulty **3/10** · _quick win_. `tests/test_dependabot_automerge_guardrails.py::test_release_age_passes_an_aged_release_and_holds_a_fresh_one` stubs `curl` on PATH so the dependabot release-age guardrail is exercised against a FIXTURE. On `windows-2025` the stub is not interposing and the step body queries **live PyPI**. Three of its four rows fail; the fourth passes off the network.
 > **THE PASSING ROW IS THE FINDING, not the three failing ones.** The test's own comment calls `aged 30 days` *"The discriminating PASS -- without this row the whole release-age suite would be satisfied by a step that denies unconditionally."* It is currently green because `requests==2.32.3` really is old, which is a fact about PyPI and not about the guardrail. An assertion that cannot fail for the reason it names is not a control.
 > **THE READING IS FORCED BY THE WORKFLOW BEING FAIL-CLOSED, which is what makes it evidence rather than a guess.** Every branch of the `age` step in `.github/workflows/dependabot-auto-merge.yml` routes to `age_ok=false`: non-security track, unwired ecosystem, `pairs` empty or `ERR`, blank `newVersion`, a name or version failing shape validation, `body=ERR` or empty, no or `null` upload timestamp, unparseable date, future date, under-age. `age_ok=true` survives to `echo "age_ok=$age_ok"` ONLY if a real, aged upload timestamp came back. So `true` on a row whose fixture is `{"urls":[]}`, a one-hour-old timestamp, or a `curl` that exits 1 is positive evidence the body reached the network. **The workflow is not the defect and must not be "fixed" here.**
 > **IT IS NOT THE `cwd`/`script.name` CHANGE, measured rather than assumed.** Both invocation forms -- the old `[bash, "-e", script.as_posix()]` with no `cwd`, and the new `[bash, "-e", script.name]` with `cwd=tmp_path` -- were replicated against Git Bash with `full_env` built the same way and the same `chmod(0o755)` stub. The stub interposed under BOTH (`RESULT=STUB`). The open question is which interpreter `require_shell` resolves on that runner image, and that cannot be measured off the runner.
 > **THE TEST DISCARDS THE ONE OUTPUT THAT WOULD DIAGNOSE IT, and fixing that is step one.** `_run_step_body` runs the child with `capture_output=True` and returns `(rc, parsed)`, where `parsed` comes from `GITHUB_OUTPUT` alone. The child's stdout is dropped, so the step's own `::notice::'<name>==<ver>' was published Nh ago` and its `::warning::` lines never reach the CI log -- the failure reports a wrong boolean and withholds the sentence naming the age it computed. Whoever takes this should surface the child's stdout in the assertion message BEFORE theorising about PATH.
 > **WHY 6 AND NOT 3.** The subject is the supply-chain guardrail that decides whether a security-track dependabot PR auto-merges without a human. The guardrail is sound; its evidence is not. A hollow test on a fail-closed control is the exact shape that survives review, because everything is green and the green is real -- it is just about something else.
+> **QUADRANT CORRECTED 2026-09-03 -- it read `_fill-in_`, and the rubric makes value 6 at difficulty 3 a `_quick win_`.** The separators were `--` where every other score banner in this file uses a middot, so this line appears to have been written by hand rather than through the mechanical pass. **The whole ledger was checked, not just this row:** across all 275 open items this was the only banner whose printed quadrant disagreed with its own value and difficulty. The numbers themselves are unchanged and were not re-scored.
 > **A NEGATIVE CONTROL BELONGS IN THE FIX, not only a repair.** Point the stub at a package/version that is genuinely fresh or nonexistent and confirm the row goes red when the stub is bypassed; a repair that makes the four rows pass without proving the stub was consulted reproduces this item one layer down.
 > **PROVENANCE:** found by the lander while triaging PR #487, whose `require_shell` change (items #1216/#1272) is what made these rows RUN -- before it they failed under the WSL launcher for a reason unrelated to their subject, and this was invisible underneath that. The change is correct and this item is downstream of it, not an objection to it. **Nobody holds #1216 or #1272**: the Builder 1 seat measured zero claim rows and zero commits for either and declined the hand-off, so this needs an assignment rather than an owner by default.
 > Verdict: build
