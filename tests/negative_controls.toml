@@ -409,17 +409,26 @@ core.autocrlf, and PATH ordered so the WSL bash comes first).
 context = "a reviewer has read this"
 plants = """
 Six label sets that are not a review -- none at all, unrelated ones, and four NEAR-MISSES
-(`reviewed-by-bot`, `not-reviewed`, `Reviewed`, `re,viewed`) -- plus the stale payload: a `synchronize`
-whose event still carries `reviewed` because the removal step ran one step ago. The gate's OWN shell is
-lifted out of the workflow and run under the flags Actions uses, not re-implemented; a second copy of
-that `case` would be free to agree with itself. Four structural plants sit beside them, because the
-quieter death of this gate is the context never arriving or never clearing: a renamed job, a job-level
-`if:`, a trigger set that cannot report on a pull request or in the merge queue, and a `types:` list
-that does not re-run the job when the reviewer adds the label.
+(`reviewed-by-bot`, `not-reviewed`, `Reviewed`, `re,viewed`) -- plus `synchronize`, which must be
+refused even with the label still in place, because commits nobody has read are unread by definition.
+THE STALE PAYLOAD IS PLANTED SEPARATELY AND IS THE MEASURED ONE (BACKLOG #1423): the webhook snapshot
+says `reviewed` while the live label set is empty, which is PR 765 replayed at 20:49:37Z on
+2026-09-03. It is planted on every action the gate can see, because the pre-fix form screened one
+action and let the rest read the snapshot. Two more plants guard the read itself: `gh` exiting
+non-zero must BLOCK, and the stand-in records its own argv so a gate that stopped calling the API
+cannot be graded as though it had. The gate's OWN shell is lifted out of the workflow and run under
+the flags Actions uses, not re-implemented; a second copy of that `case` would be free to agree with
+itself. Four structural plants sit beside them, because the quieter death of this gate is the context
+never arriving or never clearing: a renamed job, a job-level `if:`, a trigger set that cannot report
+on a pull request or in the merge queue, and a `types:` list that does not re-run the job when the
+reviewer adds the label.
 """
 red = [
   "tests/test_merge_gate_controls.py::test_the_review_gate_refuses_a_pull_request_nobody_has_marked_read",
-  "tests/test_merge_gate_controls.py::test_the_review_gate_refuses_a_synchronize_even_when_the_payload_shows_the_label",
+  "tests/test_merge_gate_controls.py::test_the_review_gate_refuses_a_synchronize_even_when_the_label_is_still_there",
+  "tests/test_merge_gate_controls.py::test_the_review_gate_refuses_a_stale_payload_that_still_shows_the_label",
+  "tests/test_merge_gate_controls.py::test_the_review_gate_reads_the_live_labels_for_every_action_not_just_one",
+  "tests/test_merge_gate_controls.py::test_the_review_gate_fails_closed_when_the_live_label_read_fails",
   "tests/test_merge_gate_controls.py::test_the_review_gate_still_reports_under_the_required_context_string",
   "tests/test_merge_gate_controls.py::test_nothing_in_the_review_gate_adds_the_label_it_checks_for",
   "tests/test_merge_gate_controls.py::test_the_review_gate_reruns_when_a_reviewer_adds_the_label",
@@ -428,15 +437,21 @@ holds = """
 A labelled pull request must PASS, in every position the token can occupy in the joined label list --
 first, last, middle and alone. A gate that refused uniformly would satisfy every planted case above
 while wedging every pull request in the repository, permanently, because `strict = true` means a
-blocked pull request cannot even be brought up to date past it. The merge queue is the other half: a
-merge_group entry carries no pull request and therefore no labels, so the label-reading step must stay
-confined to pull_request events -- a required context that can never go green in the queue means
-NOTHING MERGES, which codeql.yml's header records happening here. The trigger list has the same shape
-of asymmetry: every action the gate depends on must be named individually when it is dropped, while a
-list that only ADDS actions must stay clean.
+blocked pull request cannot even be brought up to date past it. The live read has its own asymmetry
+and it runs the OTHER way: a payload that UNDERSTATES the labels -- a run created before the reviewer
+labelled -- must now clear, where the pre-fix form left it red until something re-ran the job. And the
+pre-fix form itself is run against the identical planted fixture and must go GREEN; if both forms
+refused, the fixture would be proving something other than the recorded defect. The merge queue is the
+other half: a merge_group entry carries no pull request and therefore no labels, so the label-reading
+step must stay confined to pull_request events -- a required context that can never go green in the
+queue means NOTHING MERGES, which codeql.yml's header records happening here. The trigger list has the
+same shape of asymmetry: every action the gate depends on must be named individually when it is
+dropped, while a list that only ADDS actions must stay clean.
 """
 green = [
   "tests/test_merge_gate_controls.py::test_the_review_gate_passes_a_pull_request_a_reviewer_has_marked_read",
+  "tests/test_merge_gate_controls.py::test_the_review_gate_clears_when_the_stale_payload_understates_the_live_label",
+  "tests/test_merge_gate_controls.py::test_the_payload_reading_form_of_the_gate_passes_the_same_planted_pull_request",
   "tests/test_merge_gate_controls.py::test_the_review_gate_lets_a_merge_queue_entry_through",
   "tests/test_merge_gate_controls.py::test_the_absence_detector_fires_on_a_trigger_set_that_can_go_quiet",
   "tests/test_merge_gate_controls.py::test_the_label_rerun_detector_fires_on_a_types_list_that_ignores_the_label",
@@ -468,6 +483,16 @@ ONE test by name -- test_the_review_gate_reruns_when_a_reviewer_adds_the_label -
 one, not two: the detector's own control uses literal trigger lists rather than subtracting from the
 shipped file, so it does not move with the workflow it judges and cannot bury the naming red under a
 second one that is only bookkeeping.
+
+A FOURTH NEUTERING WAS FOUND IN PRODUCTION USE, 2026-09-03, and it was the gate itself rather than an
+edit to it (BACKLOG #1423). Run 33803911587 on pull request 765 reported SUCCESS while the pull
+request carried ZERO labels, because it read a webhook payload snapshotted six minutes before its own
+job started and four minutes before `github-actions[bot]` deleted the label it was reading. Nothing
+corrected the green: the removal is raised under GITHUB_TOKEN, GitHub dispatches no workflow run from
+such an event, and the runs API confirms exactly two review-gate runs on that head with neither being
+the removal. The fix reads the labels live; the control that proves it is the pre-fix form, run
+against the identical planted fixture and observed PASSING, so the shipped refusal is measured
+against a form known to accept -- not merely asserted.
 """
 
 # --- codeql.yml: NO ENTRY, BECAUSE ITS CONTEXTS ARE NOT REQUIRED -----------------------------------

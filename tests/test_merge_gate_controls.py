@@ -1033,6 +1033,11 @@ _REVIEW_GATE_CONTEXT = "a reviewer has read this"
 _LABEL_STEP = "Require the reviewed label"
 
 
+#: The live read the step must perform, verbatim. Substituted away by the pre-fix control below, so it
+#: is written once here rather than twice.
+_LIVE_READ = 'gh pr view "$NUMBER" --json labels --jq \'[.labels[].name] | join(",")\''
+
+
 def _review_gate_script() -> str:
     """The label-reading step's shell, with the shape this control depends on asserted first."""
     steps = jobs_of(_REVIEW_GATE)[_REVIEW_GATE_JOB]["steps"]
@@ -1042,16 +1047,56 @@ def _review_gate_script() -> str:
         f"{len(matches)}; this control runs THAT step's shell and cannot pick between several"
     )
     script = str(matches[0]["run"])
-    assert "$LABELS" in script and "$ACTION" in script, (
-        "the label-reading step no longer reads $LABELS and $ACTION, so this control would be feeding "
-        f"input to a script that ignores it and every verdict below would be about nothing: {script!r}"
+    assert _LIVE_READ in script, (
+        "the label-reading step no longer reads the labels LIVE from the API, so this control would "
+        "be feeding a stub to a script that never calls it and every verdict below would be about "
+        f"nothing. Expected {_LIVE_READ!r} in: {script!r}"
+    )
+    assert "$ACTION" in script, (
+        f"the label-reading step no longer reads $ACTION, so the synchronize arm is gone: {script!r}"
     )
     return script
 
 
+#: A stand-in `gh` placed FIRST on PATH. It records its own argv, so a script that stopped calling the
+#: API cannot be graded as though it had -- the instrument reports what it was actually asked.
+_FAKE_GH = """#!/usr/bin/env bash
+printf '%s\\n' "$*" >> "$FAKE_GH_LOG"
+if [ "${FAKE_GH_EXIT:-0}" != "0" ]; then
+  echo "gh: could not resolve to a PullRequest" >&2
+  exit "${FAKE_GH_EXIT}"
+fi
+printf '%s\\n' "$FAKE_GH_OUT"
+"""
+
+
+def _install_fake_gh(workdir: Path) -> Path:
+    """Write the stand-in and return the directory to prepend to PATH.
+
+    STUBBED THROUGH PATH RATHER THAN THROUGH A HOOK IN THE WORKFLOW. The alternative -- teaching the
+    shipped step to call `${GH:-gh}` -- would put a test seam in the gate itself, and a seam that can
+    redirect the read is a seam that can disable it. The step keeps the literal command CI runs; only
+    what `gh` resolves to changes.
+    """
+    bindir = workdir / "fakebin"
+    bindir.mkdir(exist_ok=True)
+    target = bindir / "gh"
+    target.write_text(_FAKE_GH, encoding="utf-8", newline="\n")
+    target.chmod(0o755)
+    return bindir
+
+
 def _run_review_gate(
-    bash: str, script: str, workdir: Path, env: dict[str, str], *, labels: str, action: str
-) -> tuple[int, str]:
+    bash: str,
+    script: str,
+    workdir: Path,
+    env: dict[str, str],
+    *,
+    live_labels: str,
+    action: str,
+    payload_labels: str | None = None,
+    gh_exit: int = 0,
+) -> tuple[int, str, list[str]]:
     """Run the step's shell UNDER THE FLAGS ACTIONS USES, and validate the invocation.
 
     GitHub runs a `run:` block as `bash --noprofile --norc -e -o pipefail {0}`. Reproducing those
@@ -1061,18 +1106,38 @@ def _run_review_gate(
     126/127 are a HARNESS fault, never a gate verdict. A caller comparing `code != 0` would otherwise
     read a broken invocation as "the gate refused this pull request" -- the shape BACKLOG #1216
     records, where a mangled script path made six assertions vacuously green.
+
+    ``live_labels`` is what the API answers; ``payload_labels`` is the frozen webhook snapshot and
+    defaults to the same thing. Passing them DIFFERENTLY is the whole point of BACKLOG #1423: the
+    verdict has to follow the first and ignore the second. Returns the gh argv log as a third value so
+    a caller can assert the read happened at all.
     """
     (workdir / "review_gate.sh").write_text(script, encoding="utf-8", newline="\n")
+    bindir = _install_fake_gh(workdir)
+    log = workdir / "gh_argv.log"
+    log.write_text("", encoding="utf-8")
     proc = _run(
         [bash, "--noprofile", "--norc", "-e", "-o", "pipefail", "review_gate.sh"],
         workdir,
-        {**env, "LABELS": labels, "ACTION": action},
+        {
+            **env,
+            "PATH": str(bindir) + os.pathsep + env.get("PATH", ""),
+            "ACTION": action,
+            "NUMBER": "765",
+            "GH_TOKEN": "not-a-real-token",
+            "GH_REPO": "MEFORORG/MessageFoundry",
+            "PAYLOAD_LABELS": live_labels if payload_labels is None else payload_labels,
+            "FAKE_GH_LOG": str(log),
+            "FAKE_GH_OUT": live_labels,
+            "FAKE_GH_EXIT": str(gh_exit),
+        },
     )
     out = _text(proc)
     assert proc.returncode not in (126, 127), (
         f"{explain_returncode(proc.returncode, 'the review-gate step')} Output: {out.strip()[:300]}"
     )
-    return proc.returncode, out
+    calls = [ln for ln in log.read_text(encoding="utf-8").splitlines() if ln.strip()]
+    return proc.returncode, out, calls
 
 
 @pytest.fixture
@@ -1112,8 +1177,10 @@ def test_the_review_gate_refuses_a_pull_request_nobody_has_marked_read(
     """
     bash, script, workdir, env = review_gate
     for labels, action, why in _UNREAD:
-        code, out = _run_review_gate(bash, script, workdir, env, labels=labels, action=action)
-        print(f"[#1000] review gate labels={labels!r} action={action} exit={code}")
+        code, out, calls = _run_review_gate(
+            bash, script, workdir, env, live_labels=labels, action=action
+        )
+        print(f"[#1000] review gate live={labels!r} action={action} exit={code} gh={calls}")
         assert code != 0, (
             f"the review gate PASSED a pull request nobody has read ({why}). labels={labels!r} "
             f"action={action!r}\n{_ascii(out)}"
@@ -1124,19 +1191,19 @@ def test_the_review_gate_refuses_a_pull_request_nobody_has_marked_read(
         )
 
 
-def test_the_review_gate_refuses_a_synchronize_even_when_the_payload_shows_the_label(
+def test_the_review_gate_refuses_a_synchronize_even_when_the_label_is_still_there(
     review_gate: tuple[str, str, Path, dict[str, str]],
 ) -> None:
-    """PLANTED: the STALE PAYLOAD, and the single most load-bearing line in this gate.
+    """PLANTED: `synchronize` must be unread BY DEFINITION, decided before any read.
 
-    On `synchronize` the previous step has just removed the label, so the event payload is one step
-    out of date. Reading it would pass a pull request that was invalidated moments earlier. This is
-    the one case where the gate must refuse a payload that says `reviewed`, and it is the whole
-    difference between "a reviewer read THESE commits" and "a reviewer read some earlier ones".
+    The previous step has just removed the label, so both the payload and a live read are racing the
+    removal. Answering from the action instead of from a value it could race is the whole difference
+    between "a reviewer read THESE commits" and "a reviewer read some earlier ones". Both sources are
+    fed `reviewed` here, so nothing but the action can be producing the refusal.
     """
     bash, script, workdir, env = review_gate
-    code, out = _run_review_gate(
-        bash, script, workdir, env, labels="reviewed", action="synchronize"
+    code, out, _ = _run_review_gate(
+        bash, script, workdir, env, live_labels="reviewed", action="synchronize"
     )
     assert code != 0, (
         "the gate accepted a `synchronize` on the strength of a label the step before it had already "
@@ -1155,11 +1222,158 @@ def test_the_review_gate_passes_a_pull_request_a_reviewer_has_marked_read(
     """
     bash, script, workdir, env = review_gate
     for labels, action, why in _READ:
-        code, out = _run_review_gate(bash, script, workdir, env, labels=labels, action=action)
-        print(f"[#1000] review gate labels={labels!r} action={action} exit={code}")
+        code, out, calls = _run_review_gate(
+            bash, script, workdir, env, live_labels=labels, action=action
+        )
+        print(f"[#1000] review gate live={labels!r} action={action} exit={code} gh={calls}")
         assert code == 0, (
             f"the gate refused a pull request a reviewer HAD marked read ({why}). labels={labels!r} "
             f"action={action!r}\n{_ascii(out)}"
+        )
+        assert calls, (
+            "the gate passed without calling `gh` at all, so it cannot have read the live label set. "
+            f"labels={labels!r}\n{_ascii(out)}"
+        )
+
+
+# ---------------------------------------------------------------------------------------------------
+# THE STALE PAYLOAD THAT REPORTED SUCCESS ON AN UNLABELLED PULL REQUEST (BACKLOG #1423).
+# ---------------------------------------------------------------------------------------------------
+#
+# MEASURED ON PULL REQUEST 765, 2026-09-03, head ee2e7ec. A reviewer labelled at 20:43:19Z; the
+# `labeled` run 33803911587 was created five seconds later and its payload recorded the label as
+# PRESENT; the earlier `synchronize` run 33803677823 sat queued four minutes, executed at 20:45:10Z
+# and removed that label at 20:45:14Z; then the `labeled` run's own job started at 20:49:34Z and
+# reported SUCCESS at 20:49:37Z from its six-minute-old payload. `a reviewer has read this` was green
+# on a pull request carrying zero labels until 20:52:55Z.
+#
+# NOTHING CORRECTED IT, and that is why the payload read had to go rather than be narrowed. The
+# removal is performed by `github-actions[bot]` under GITHUB_TOKEN, and GitHub does not dispatch a
+# workflow run from an event raised by that token, so no `unlabeled` run ever fired. Verified against
+# the workflow-runs API: exactly two review-gate runs exist on that head, and neither is the removal.
+#
+# THE OLD SHAPE WAS A ONE-ACTION SCREEN. The workflow already knew the payload went stale and
+# hard-coded the single case its author had an instance of (`if [ "$ACTION" = "synchronize" ]`),
+# leaving every other action reading the same snapshot. A screen built from one case finds one shape.
+
+
+def test_the_review_gate_refuses_a_stale_payload_that_still_shows_the_label(
+    review_gate: tuple[str, str, Path, dict[str, str]],
+) -> None:
+    """PLANTED: the measured defect. The payload says `reviewed`; the live label set is EMPTY.
+
+    This is PR 765 replayed at 20:49:37Z. Without this control the fix is unproven -- the shipped
+    gate and a gate that never looks at the payload are the same green on every other input here.
+    """
+    bash, script, workdir, env = review_gate
+    code, out, calls = _run_review_gate(
+        bash, script, workdir, env, live_labels="", payload_labels="reviewed", action="labeled"
+    )
+    print(f"[#1423] stale-payload replay exit={code} gh={calls}\n{_ascii(out)}")
+    assert code != 0, (
+        "the gate reported SUCCESS from a frozen payload while the pull request carried no `reviewed` "
+        f"label. That is the measured PR 765 false green.\n{_ascii(out)}"
+    )
+    assert calls, "the gate refused without calling `gh`, so it did not read the live set either"
+    assert "STALE PAYLOAD" in out, (
+        "the gate refused correctly but never said WHY, leaving the next reader to reconstruct the "
+        f"race from three API endpoints and two clocks.\n{_ascii(out)}"
+    )
+
+
+def test_the_payload_reading_form_of_the_gate_passes_the_same_planted_pull_request(
+    review_gate: tuple[str, str, Path, dict[str, str]],
+) -> None:
+    """RUN AGAINST THE PRE-FIX GATE, which is what makes the control above evidence rather than a
+    claim. The identical fixture, with only the live read reverted to the payload, must go GREEN.
+
+    If both forms refused, the fixture would be proving something else and the recorded defect would
+    be unreproduced -- the same reasoning as the two-dot control on the hygiene gate above.
+    """
+    bash, script, workdir, env = review_gate
+    pre_fix = script.replace(_LIVE_READ, 'echo "$PAYLOAD_LABELS"')
+    assert pre_fix != script, (
+        "the live-read substitution matched nothing, so this test compares the shipped gate with "
+        "itself and can only ever pass"
+    )
+    code, out, _ = _run_review_gate(
+        bash, pre_fix, workdir, env, live_labels="", payload_labels="reviewed", action="labeled"
+    )
+    print(f"[#1423] pre-fix payload-reading gate exit={code}\n{_ascii(out)}")
+    assert code == 0, (
+        "the payload-reading form no longer reproduces the recorded defect, so the assertion above is "
+        f"not measuring what it says. exit={code}\n{_ascii(out)}"
+    )
+
+
+def test_the_review_gate_clears_when_the_stale_payload_understates_the_live_label(
+    review_gate: tuple[str, str, Path, dict[str, str]],
+) -> None:
+    """THE OTHER DIRECTION, and it is not padding: the race runs both ways.
+
+    A run created before the label was applied carries a payload with no `reviewed` in it. Under the
+    old form that pull request stayed red until something else re-ran the job. Reading live means the
+    verdict follows the label rather than the order two runs happened to be scheduled in.
+    """
+    bash, script, workdir, env = review_gate
+    code, out, calls = _run_review_gate(
+        bash, script, workdir, env, live_labels="reviewed", payload_labels="", action="labeled"
+    )
+    print(f"[#1423] understating payload exit={code} gh={calls}\n{_ascii(out)}")
+    assert code == 0, f"the gate refused a pull request that IS labelled right now\n{_ascii(out)}"
+    assert "STALE PAYLOAD" in out, "the disagreement went unreported"
+
+
+def test_the_review_gate_fails_closed_when_the_live_label_read_fails(
+    review_gate: tuple[str, str, Path, dict[str, str]],
+) -> None:
+    """PLANTED: `gh` exits non-zero. The gate must BLOCK, never pass.
+
+    A gate whose safe state depends on a network call succeeding is not a gate, and this is the shape
+    to avoid rather than a hypothetical: a sibling checker in this repository ignores a child's return
+    code and reports clean, which is filed separately. Reading live buys nothing if an unreadable
+    answer is treated as an empty one -- or worse, as a green.
+
+    THE PAYLOAD SAYS `reviewed` HERE ON PURPOSE. A fail-closed arm that only ever ran with an empty
+    payload could be satisfied by a script that had silently fallen back to the snapshot.
+    """
+    bash, script, workdir, env = review_gate
+    code, out, calls = _run_review_gate(
+        bash,
+        script,
+        workdir,
+        env,
+        live_labels="reviewed",
+        payload_labels="reviewed",
+        action="labeled",
+        gh_exit=1,
+    )
+    print(f"[#1423] unreadable label set exit={code} gh={calls}\n{_ascii(out)}")
+    assert calls, "the read never happened, so this says nothing about how a failed read is handled"
+    assert code != 0, (
+        "the gate PASSED while it could not read the label set at all. It cannot know whether anybody "
+        f"read the pull request, so the only safe verdict is to block.\n{_ascii(out)}"
+    )
+
+
+def test_the_review_gate_reads_the_live_labels_for_every_action_not_just_one(
+    review_gate: tuple[str, str, Path, dict[str, str]],
+) -> None:
+    """THE GENERALISATION, asserted rather than described.
+
+    The pre-fix gate special-cased `synchronize` and let every other action read the snapshot. So the
+    stale payload has to be refused on each action that can carry one -- `synchronize` is excluded
+    because it is answered before any read, which the control above already pins.
+    """
+    bash, script, workdir, env = review_gate
+    for action in ("opened", "reopened", "ready_for_review", "labeled", "unlabeled"):
+        code, out, calls = _run_review_gate(
+            bash, script, workdir, env, live_labels="", payload_labels="reviewed", action=action
+        )
+        print(f"[#1423] action={action} exit={code} gh={calls}")
+        assert code != 0, (
+            f"the gate passed a stale payload on action {action!r}. A screen built from one case "
+            f"finds one shape.\n{_ascii(out)}"
         )
 
 

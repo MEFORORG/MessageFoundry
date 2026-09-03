@@ -34,6 +34,32 @@ name: review gate
 # are unread again, even if the pull request was marked an hour ago. That is the one thing the
 # workflow writes, and it only ever writes in the blocking direction.
 #
+# THE LABEL IS READ LIVE, NEVER FROM THE EVENT PAYLOAD (BACKLOG #1423, generalising #1417). A webhook
+# payload is a SNAPSHOT taken when the event fired, and a run can sit queued for minutes before it
+# executes. Measured on pull request 765, 2026-09-03, from the runs and timeline APIs: a reviewer
+# labelled at 20:43:19Z; run 33803911587 was created by that `labeled` event at 20:43:24Z; the earlier
+# `synchronize` run 33803677823, created 20:40:58Z and queued four minutes, finally executed and
+# removed the label at 20:45:14Z; then the `labeled` run's job started at 20:49:34Z and reported
+# SUCCESS at 20:49:37Z out of its own 20:43:24 payload -- six minutes stale, and four minutes after
+# the label it was reading had been deleted. The pull request carried this context GREEN with zero
+# labels until a human re-labelled at 20:52:55Z. So the step below asks the API what the labels ARE.
+#
+# AND NOTHING CORRECTS THAT GREEN, WHICH IS WHY READING LIVE IS THE FIX RATHER THAN AN IMPROVEMENT.
+# GitHub does not dispatch a workflow run from an event raised by the repository's own GITHUB_TOKEN --
+# `workflow_dispatch` and `repository_dispatch` are the documented exceptions, and neither is a label
+# event. The removal above runs `gh` under `github.token`, so its `unlabeled` event emits no run.
+# Verified on the same head: the workflow-runs API reports exactly TWO review-gate runs on
+# ee2e7ec2423a73fd385d2afa27733ca050058cba, the two named above, and none for the 20:45:14Z removal.
+#
+# THE LIVE READ NARROWS THE WINDOW, IT DOES NOT CLOSE IT TO ZERO, and saying otherwise would be the
+# compensating control resting on a false premise. A `labeled` run can still read a label that a
+# `synchronize` run removes moments later, and its green then stands on a state that has just changed.
+# What the payload read cost was MINUTES of queue delay; what remains is the gap between this step's
+# API call and the job finishing, which is seconds. So the operational rule survives the fix rather
+# than expiring with it: for a BEHIND pull request, update-branch, WAIT for the resulting
+# `synchronize` review-gate run to COMPLETE, then label, then merge. Labelling while that run is still
+# queued is what produced the false green above, and it is still the shape to avoid.
+#
 # NO CONCURRENCY BLOCK, DELIBERATELY. This job's name is intended to become a required status
 # context, and a cancelled required check can never go green. backlog-hygiene.yml carried
 # `cancel-in-progress` on a key that collapsed to one group on `merge_group`, and entries cancelled
@@ -50,8 +76,11 @@ on:
     # without it the label emits no run, the red check-run stands, and the only trigger left that
     # re-runs this job is `synchronize` -- whose first step REMOVES the label. The pull request then
     # cannot be merged by any action at all, and `strict = true` means it cannot even be brought up to
-    # date past the block. `unlabeled` is the opposite half: without it, withdrawing the label leaves a
-    # GREEN context behind. Both are pinned by
+    # date past the block. `unlabeled` is the opposite half FOR A HUMAN WITHDRAWAL: without it, a
+    # reviewer taking the label back would leave a GREEN context behind. It does NOT cover the removal
+    # this workflow performs on `synchronize` -- that one is raised by GITHUB_TOKEN and emits no run at
+    # all, measured above -- so `unlabeled` is not what protects against a stale green; the live read
+    # in the last step is. Both are pinned by
     # tests/test_merge_gate_controls.py::test_the_review_gate_reruns_when_a_reviewer_adds_the_label,
     # because dropping `labeled` reddened nothing before that test existed.
     types: [opened, reopened, ready_for_review, synchronize, labeled, unlabeled]
@@ -102,21 +131,43 @@ jobs:
       - name: Require the reviewed label
         if: github.event_name == 'pull_request'
         env:
-          LABELS: ${{ join(github.event.pull_request.labels.*.name, ',') }}
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          NUMBER: ${{ github.event.pull_request.number }}
           ACTION: ${{ github.event.action }}
+          # DIAGNOSTIC ONLY, AND NEVER THE VERDICT. This is the snapshot that produced the measured
+          # false green, kept so the log can SAY it went stale instead of leaving a reader to infer it
+          # from three API endpoints and two clocks. Nothing below branches on it.
+          PAYLOAD_LABELS: ${{ join(github.event.pull_request.labels.*.name, ',') }}
         run: |
-          # On `synchronize` the label was just removed above, so the event payload is stale by one
-          # step. Treat that action as unreviewed by definition rather than reading a value that is
-          # already wrong -- reading the payload here would pass a pull request that was just
-          # invalidated, which is the exact failure this step exists to prevent.
+          # `synchronize` IS UNREAD BY DEFINITION, and it is answered BEFORE any read. The step above
+          # has just removed the label, so a live read would usually agree -- but "usually" is what the
+          # payload race already cost. Commits nobody has read are unread whatever any label says, so
+          # this arm is decided by the action and consults nothing it could race against.
           if [ "$ACTION" = "synchronize" ]; then
             echo "::error::New commits have not been read. Re-review, then: gh pr edit <N> --add-label reviewed"
             exit 1
           fi
-          case ",$LABELS," in
-            *,reviewed,*)
-              echo "reviewed label present. Gate satisfied." ;;
-            *)
-              echo "::error::Not yet read by a reviewer. When you have read it: gh pr edit <N> --add-label reviewed"
-              exit 1 ;;
-          esac
+          # READ LIVE, AND FAIL CLOSED ON A FAILED READ. A gate whose safe state depends on a network
+          # call succeeding is not a gate, so the read is tested rather than trusted: `gh` absent,
+          # unauthenticated, rate-limited, or answering with an error all land here and BLOCK. The
+          # sibling shape to avoid is a checker that ignores a child's return code and reports clean.
+          if ! LABELS=$(gh pr view "$NUMBER" --json labels --jq '[.labels[].name] | join(",")'); then
+            echo "::error::Could not read the labels on pull request #$NUMBER, so this gate cannot say whether anybody has read it. Blocking rather than guessing -- re-run this job."
+            exit 1
+          fi
+          # EXACT-ELEMENT MATCH against the comma-joined list, not a substring: `reviewed-by-bot` and
+          # `not-reviewed` are different labels, and one of them reads as the opposite.
+          case ",$PAYLOAD_LABELS," in *,reviewed,*) WAS=yes ;; *) WAS=no ;; esac
+          case ",$LABELS," in *,reviewed,*) NOW=yes ;; *) NOW=no ;; esac
+          # Printed only when the two DISAGREE ON THIS LABEL, so ordering differences between the two
+          # sources never make noise. A diagnostic that fires on every run is one nobody reads.
+          if [ "$WAS" != "$NOW" ]; then
+            echo "STALE PAYLOAD: the event payload recorded reviewed=$WAS, the live label set says reviewed=$NOW. The verdict below uses the LIVE set. Payload [$PAYLOAD_LABELS], live [$LABELS]."
+          fi
+          if [ "$NOW" = yes ]; then
+            echo "reviewed label present in the live label set [$LABELS]. Gate satisfied."
+            exit 0
+          fi
+          echo "::error::Not yet read by a reviewer. When you have read it: gh pr edit <N> --add-label reviewed"
+          exit 1
