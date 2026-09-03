@@ -56,7 +56,12 @@ from messagefoundry.auth.permissions import (
     is_custom_role_id,
     validate_custom_role_permissions,
 )
-from messagefoundry.auth.policy import PasswordPolicy, _operator_corpus
+from messagefoundry.auth.policy import (
+    BreachCorpusUnavailable,
+    PasswordPolicy,
+    _common_passwords,
+    _operator_corpus,
+)
 from messagefoundry.auth.ratelimit import SlidingWindowRateLimiter
 from messagefoundry.auth.tokens import hash_bytes, hash_token, mint_token
 from messagefoundry.config.models import SignatureAlgorithm
@@ -93,6 +98,35 @@ def _warn_if_corpus_unreadable(path: str | None) -> None:
         len(entries),
         "hashed" if hashed else "plaintext",
     )
+
+
+def _error_if_bundled_corpus_unusable(check_breached: bool) -> None:
+    """Eagerly load (and cache) the BUNDLED breach corpus at startup, so a truncated or missing file
+    surfaces in the log at boot rather than as a 500 on somebody's first password change (BACKLOG
+    #1438). The twin of ``_warn_if_corpus_unreadable`` above, at a higher level for a reason.
+
+    The OPERATOR corpus degrades to a warning because it is optional and the bundled list still screens
+    underneath it. Nothing screens underneath the BUNDLED list, so its loss is an ERROR: ``check_breached``
+    ships ``True``, and a corpus that cannot load means the shipped configuration asserts a check that is
+    not running. ``PasswordPolicy.violations`` refuses passwords in that state; this is only the loud
+    half. It deliberately does NOT stop the engine -- HL7 flow does not depend on password screening, and
+    bricking a message engine over an auth data asset would trade a contained failure for an outage.
+
+    Skipped when the operator has turned screening off: a corpus nobody consults is not a defect.
+    """
+    if not check_breached:
+        return
+    try:
+        entries = _common_passwords()
+    except BreachCorpusUnavailable as exc:
+        _log.error(
+            "%s; local password creation and change will be REFUSED until it is repaired "
+            "(ASVS 6.2.4). Reinstall the messagefoundry wheel, or set [auth].password_check_breached "
+            "= false to accept unscreened passwords deliberately",
+            exc,
+        )
+        return
+    _log.debug("loaded the bundled breach corpus (%d entries)", len(entries))
 
 
 #: A fixed argon2 hash used to equalize login timing for unknown/disabled accounts (anti-enumeration).
@@ -288,6 +322,7 @@ class AuthService:
             lockout_minutes=settings.lockout_minutes,
         )
         _warn_if_corpus_unreadable(settings.password_breach_corpus_file)
+        _error_if_bundled_corpus_unusable(settings.password_check_breached)
         if ldap is not None:
             self._ldap: LdapAuthenticator | None = ldap
         elif settings.ad_enabled:

@@ -19940,3 +19940,94 @@ That is the same `self._lock` the staged-pipeline handoffs take. On a first depl
 **PARTLY CLOSED ALREADY, AND THE CLOSURE SITS IN THE WRONG ARTIFACT.** The full record -- both questions, all eight options, both answers quoted -- is [comment 5515263760 on PR 749](https://github.com/MEFORORG/MessageFoundry/pull/749#issuecomment-5515263760), written 2026-09-02. A pull-request comment is a real improvement on a session transcript, which does not survive its session. It is still not the ADR, and the ADR is what a reader consults. **This limb differs from the first two in shape:** closing it needs no decision about the engine, only the record moved into the artifact people actually read.
 
 **THE GENERAL PROBLEM, stated once so it is not re-derived per incident.** A decision recorded as an outcome plus a delegation is not reviewable. The inputs -- the question, the options, the answer -- are what let a later reader tell a considered call from an arbitrary one, and they are exactly the part that lives in the least durable place.
+
+## 1438. Fail closed when the bundled breach corpus is unusable, instead of silently disabling password screening
+
+> 🚧 **Filed 2026-09-03. Implemented and committed on a feature branch, not merged.** `_common_passwords()` read `messagefoundry/auth/data/common_passwords.txt` and returned a `frozenset` of its lines. An empty or truncated file produced an **empty set**, `PasswordPolicy.violations` stopped emitting the `"not be a common or breached password"` clause, and breach screening became a no-op. Nothing logged. `password_check_breached` ships `true`, so the shipped configuration would assert a check that was not running.
+>
+> **Severity is conditional (sec. 0).** Zero instances run, so nothing is unscreened today. The defect is in the shipped code: a **first** deployment whose corpus file had been truncated, emptied or replaced would accept every weak password that cleared the length clause, and no log line, metric or audit row would say so.
+
+**Cluster:** Auth / password policy (ASVS 6.2.4). **Priority:** P2. **Verdict:** fix, shipped on the branch above.
+
+### The failure was silent in both directions, which is what made it worth a row
+
+A screen that rejects nothing looks exactly like a screen that found nothing to reject. `violations` returned `[]` either way, and `[]` is the success value. There was no runtime assertion anywhere: `tests/test_auth_core.py::test_breach_corpus_meets_the_asvs_6_2_4_policy_matching_bar` pins the corpus at **build** time (BACKLOG #1134) and nothing checked it again after the wheel was installed.
+
+The decode is where the silence enters. `data.decode("utf-8", "ignore")` swallows a corrupt, truncated or mis-encoded file and yields a short-or-empty set with no exception, so there is no explicit early-out to find by reading: the empty set is **produced by the comprehension**, not returned by a guard clause. The fix therefore grades the parsed **result**, which covers every cause at once.
+
+The bundled corpus is the only screen underneath. `password_breach_corpus_file` is optional and unset by default, so on the shipped configuration the bundled file is the whole check.
+
+### What #1432 covers, and the four reasons it does not close this
+
+#1432 is the detection half. `messagefoundry/integrity.py` on `main` hashes loaded first-party `.py` files against the wheel's `dist-info/RECORD`; #1432 widens that ADR 0041 D3 startup tripwire to cover shipped security **data** assets, including this corpus. That work sits on its own unmerged branch and is **not on `main`**, so the widening is claimed rather than measured here. Four gaps stand either way, recorded in #1432's own residual:
+
+1. The tripwire is **alert-only by default**. `[integrity].fail_closed_on_drift` is opt-in, so on the shipped configuration the alert fires and screening still does nothing for the life of the process.
+2. It is a **no-op on editable installs and source-tree runs**, which is every developer checkout.
+3. It runs **once at startup**, while `_common_passwords()` is `lru_cache`d and read lazily on the first password check. There is a window between the two.
+4. It is **detection, not containment**. It never stops a weak password being accepted.
+
+Detection and containment are different jobs, and this row is the containment one. **There is a case each one misses, which is the argument for having both.** A wheel BUILT with an already-truncated corpus passes attestation: `RECORD` carries the hash of whatever shipped, so a present-but-truncated file matches its own baseline and drifts from nothing. The tripwire is correct to stay silent there, and this guard still fires because it grades the parsed result rather than the bytes. The inverse also holds. Post-install tampering drifts the hash while possibly leaving enough entries to clear this floor, and there the alert is the only signal.
+
+### The fix
+
+Two halves, deliberately at different levels.
+
+**Contained, in `messagefoundry/auth/policy.py`.** `_common_passwords()` now raises `BreachCorpusUnavailable` when the file cannot be read, or when it holds fewer than `ASVS_6_2_4_MIN_CORPUS_ENTRIES` entries. `PasswordPolicy.violations` therefore refuses a password rather than accepting every password. Only the password *create* and *change* paths screen a password, so this never touches login, never invalidates a session, and never stops message flow.
+
+**Loud, in `messagefoundry/auth/service.py`.** `_error_if_bundled_corpus_unusable` loads the corpus eagerly in `AuthService.__init__`, beside the existing `_warn_if_corpus_unreadable`, and logs the defect at `ERROR`. That closes gap 3 above: the operator learns at boot instead of at somebody's first password change. It does **not** stop the engine. HL7 flow does not depend on password screening, and bricking a message engine over an auth data asset trades a contained failure for an outage.
+
+The two halves sit at different levels on purpose. The operator corpus degrades to a `WARNING` because the bundled list still screens underneath it. Nothing screens underneath the bundled list.
+
+### Why the floor is 3000 and not a non-empty check
+
+`ASVS_6_2_4_MIN_CORPUS_ENTRIES = 3000` is the ASVS 6.2.4 bar, re-used against a **different quantity** than the build-time test measures, and that difference is the reason it is safe.
+
+The build-time test counts entries that **clear the shipped policy**. The runtime guard counts the **whole corpus**. The clearing subset is a subset of the corpus, so a corpus holding fewer than 3000 entries in total cannot hold 3000 that clear the policy. The runtime check is therefore a **necessary condition** for the pinned bar, never a stricter one, and it cannot fail an install the build-time test would have passed.
+
+It costs one `len()` on an already-cached `frozenset`. A bare non-empty check would have caught truncation to zero and missed partial corruption.
+
+**Keying the guard on the clearing subset instead would be wrong, not merely more expensive, and this is the load-bearing reason for the choice.** The clearing count tracks `min_length` hard. Measured on the shipped corpus, independently by two sessions:
+
+| `min_length` | entries clearing the policy | against the 3000 bar |
+|---|---|---|
+| 8 | 9,135 | over |
+| 10 | 6,020 | over |
+| 12 | 5,367 | over |
+| 15 (shipped) | 5,274 | over |
+| 16 | 3,173 | over, by 173 |
+| 17 | 1,735 | **under** |
+| 20 | 512 | **under** |
+
+The margin at the shipped floor is one increment. A runtime guard keyed to clearing would start refusing every password on a site that raised its minimum to 17, with a corpus that is unchanged and sound, punishing an operator for making the policy stronger. The total is invariant to `min_length`; the clearing subset is not. Measured here: the total reads 15,045 at every floor in that table.
+
+**Read the table as measured-at-this-corpus, not as constants.** Every number in it moves together if the corpus is regenerated, and a regeneration script is in flight on another branch. The argument does not depend on the values: it needs only that the clearing subset shrinks with `min_length` while the total does not, which holds for any corpus. The invariance arm was measured; the rest of the table was produced in one worktree and reproduced in another before being written down.
+
+Measured 2026-09-03 on this branch: the shipped corpus is **15,256 lines** and parses to **15,045 unique entries** (the difference is case-duplicates, which lower-casing folds), **5,274** of which clear the shipped policy. The guard counts the parsed set, not the lines. Headroom over the floor is about 5x, so ordinary corpus curation cannot trip it.
+
+### An operator corpus does not excuse a broken bundled one
+
+Python's `or` evaluates `_common_passwords()` first, so the bundled floor is checked before any operator corpus is consulted. That is deliberate and it is the one judgment call in this row a reviewer should push on. An operator corpus is additive under 6.2.12 and has **no floor of its own**, and a bundled file that has been truncated or replaced is evidence about the **install**, not about the screen. The repair is to reinstall the wheel.
+
+### The tests, and the positive control
+
+A guard against a silent failure needs a reading that would have proved it absent, or it is untestable by construction. Seven cases land in a new `tests/test_password_corpus_guard.py` rather than in `tests/test_auth_core.py`, which concurrent work is restructuring; the build-time bar stays where it is and this file holds the runtime guard the same number implies. Measured on this branch by removing the guard and re-running: **four fail, and the two negative-control arms still pass.**
+
+| arm | what it pins | fails with the guard removed |
+|---|---|---|
+| truncated corpus refuses | the positive control: a five-entry corpus, and a passphrase the existing tests assert is ACCEPTED against the real corpus | yes |
+| empty corpus refuses | truncation to zero bytes, the cheapest way to disable the screen | yes |
+| missing corpus refuses | a distinct cause and a distinct message: the read failed rather than returning too little | yes |
+| startup reports it at ERROR | the loud half | yes |
+| shipped corpus clears the floor | keeps the three above honest: a guard wired to fire unconditionally would pass all of them | no, by design |
+| `check_breached=False` stays silent | the deliberate opt-out still works, and the guard did not become an import-time assertion | no, by design |
+| startup silent when screening is off | a corpus nobody consults is not a defect | no, by design |
+
+### Residual
+
+- **The API answer is a generic 500.** `app.py`'s catch-all handler logs the exception type and returns `{"detail": "internal error"}`. `BreachCorpusUnavailable` is a server fault, not a client one, so 500 is honest, but 503 with a specific message would be better. Mapping it means touching the API layer and both `/ui` twins, which is wider than this row.
+- **First-run bootstrap and admin password reset both raise.** `_generate_policy_password` screens its own output, so a broken corpus fails those too. That is fail-closed and correct, and both are recoverable by repairing the file, but it means a broken corpus blocks minting the first admin account. Worth an owner ruling if anyone disagrees.
+- **`lru_cache` does not cache exceptions**, so a broken install re-reads the file on each password attempt. That is one file read on an install already refusing them, and it means a repaired file recovers without a restart. Recorded as a deliberate trade, not an oversight.
+- **A regenerated corpus cannot trip the floor.** Concurrent work adds a build script that rewrites this file. The floor is 3000 TOTAL entries while the pre-existing build-time test pins 3000 POLICY-CLEARING entries, and clearing is a subset of total, so any corpus passing that test passes this guard. A corpus that did fall under 3000 total could not satisfy ASVS 6.2.4 on its own terms either.
+- **The floor is line-ending independent, so a `.gitattributes` pin cannot affect it.** Measured: the loader's `splitlines()` plus `strip()` return **15,045 entries under LF, CRLF and bare CR alike**, against a positive control (a five-line corpus) that correctly reports 5. Byte-level line-ending policy is a **wheel reproducibility** question, not an attestation one, and it changes nothing this guard reads. The startup attestation cannot be split by it on any host: [`integrity.py`](../messagefoundry/integrity.py) takes its baseline from `dist.read_text("RECORD")` and hashes the file in the same install root, and pip writes that RECORD from the bytes it unpacked, so baseline and file come from one install and move together. What the byte policy really costs is that two builds of one commit on different platforms produce different artifacts. An earlier draft of this row said the attestation was affected; that was wrong, and four sessions held that version before anyone read `integrity.py`.
+- **The number 3000 now has three independent homes** and no shared constant can join them: `ASVS_6_2_4_MIN_CORPUS_ENTRIES` here, the literal in the build-time test, and a third in the corpus-regeneration script under `scripts/`, which runtime code in `messagefoundry/auth/` must not import. Consolidating them is somebody's later cleanup, not a coupling worth inventing now.
+- **#1134's own banner is stale**, unrelated to this fix and not touched here. Its scoring note says the bundled corpus "supplies far fewer than 3000 policy-matching entries", which the 5,274 measured above contradicts. Its pinning test exists and passes. Someone should re-score it.

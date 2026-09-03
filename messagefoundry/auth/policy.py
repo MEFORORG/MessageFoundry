@@ -13,6 +13,10 @@ The breach corpus is a bundled offline top-10k common-password list (see ``data/
 Operators can widen it with an offline ``breach_corpus_file`` (6.2.12) — a plaintext list **or** an
 HIBP-style SHA-1-hash export (``HASH[:count]`` lines, auto-detected), still fully offline. (True HIBP
 k-anonymity needs a live range query, which this on-prem engine deliberately doesn't make.)
+The bundled corpus is **load-bearing, so its loss is loud**: an unreadable, empty or truncated file
+raises :class:`BreachCorpusUnavailable` out of :meth:`PasswordPolicy.violations` rather than loading as
+an empty set that silently stops screening while ``check_breached`` still reports ``True``
+(BACKLOG #1438). ``AuthService`` loads it once at startup and logs the same defect as an error.
 """
 
 from __future__ import annotations
@@ -53,12 +57,73 @@ CONTEXT_WORDS: frozenset[str] = frozenset(
 )
 
 
+#: ASVS 6.2.4 asks for at least the top 3000 breached passwords **that clear the application's own
+#: policy**, and ``tests/test_auth_core.py::test_breach_corpus_meets_the_asvs_6_2_4_policy_matching_bar``
+#: pins that policy-clearing subset at build time (BACKLOG #1134).
+#:
+#: The runtime guard below re-uses the same number against a DIFFERENT quantity -- the whole corpus,
+#: not the clearing subset -- because that is a **necessary condition** for the pinned bar rather than
+#: a restatement of it: the clearing subset is a subset of the corpus, so a corpus holding fewer than
+#: 3000 entries in total cannot possibly hold 3000 that clear the policy. Deliberately the weaker of
+#: the two checks. It costs one ``len()`` on an already-cached frozenset and can never be stricter
+#: than the build-time test, so it cannot fail an install the test would have passed.
+#:
+#: **Keying on the clearing subset instead would be WRONG, not merely more expensive**, and this is
+#: the load-bearing reason for the choice. The clearing count tracks ``min_length`` hard -- measured
+#: on the shipped corpus: 5,274 entries clear at 15, 3,173 at 16, and 1,735 at 17. So a runtime guard
+#: keyed to clearing would start refusing every password on a site that had just raised its minimum
+#: to 17, with a sound corpus, punishing the operator for making the policy STRONGER. The total is
+#: invariant to ``min_length``; the clearing subset is not.
+#:
+#: Those three counts are measured against THE CORPUS AS IT SHIPS TODAY and move together if it is
+#: ever regenerated -- read them as an illustration of the shape, not as constants. The ARGUMENT does
+#: not depend on them: it needs only that the clearing subset shrinks with ``min_length`` while the
+#: total does not, which is true of any corpus.
+ASVS_6_2_4_MIN_CORPUS_ENTRIES = 3000
+
+
+class BreachCorpusUnavailable(RuntimeError):
+    """The **bundled** common/breached-password corpus is missing, empty, or truncated.
+
+    Raised from :meth:`PasswordPolicy.violations` when ``check_breached`` is on, so a screen that
+    cannot run **refuses** the password instead of accepting every password. ``check_breached`` ships
+    ``True``; before this, an empty or truncated file loaded as an empty ``frozenset``, the
+    "not be a common or breached password" clause stopped being emitted, and nothing logged -- the
+    shipped configuration would assert a check that was not happening on a first deployment.
+
+    Blast radius is narrow by construction: only the password *create* and *change* paths screen a
+    password, so this never touches login, never invalidates a session, and never stops message flow.
+    ``AuthService`` also loads the corpus eagerly at startup and logs the same defect as an error, so
+    an operator learns about it from the log rather than from a user's failed password change.
+    """
+
+
 @functools.lru_cache(maxsize=1)
 def _common_passwords() -> frozenset[str]:
-    """The bundled offline common/breached-password set (lower-cased), loaded once and cached."""
-    data = (files("messagefoundry.auth") / "data" / "common_passwords.txt").read_bytes()
-    text = data.decode("utf-8", "ignore")
-    return frozenset(line.strip().lower() for line in text.splitlines() if line.strip())
+    """The bundled offline common/breached-password set (lower-cased), loaded once and cached.
+
+    Raises :class:`BreachCorpusUnavailable` when the file cannot be read or holds fewer than
+    ``ASVS_6_2_4_MIN_CORPUS_ENTRIES`` entries, rather than returning the empty set that silently
+    disabled screening. ``lru_cache`` does not cache exceptions, so a broken install re-reads the file
+    on each attempt and recovers the moment the file is repaired -- one file read per password attempt
+    on an install that is already refusing them, which is the cheaper side of the trade.
+    """
+    resource = files("messagefoundry.auth") / "data" / "common_passwords.txt"
+    try:
+        data = resource.read_bytes()
+    except OSError as exc:
+        raise BreachCorpusUnavailable(
+            f"the bundled breach corpus at {resource} could not be read: {exc}"
+        ) from exc
+    entries = frozenset(
+        line.strip().lower() for line in data.decode("utf-8", "ignore").splitlines() if line.strip()
+    )
+    if len(entries) < ASVS_6_2_4_MIN_CORPUS_ENTRIES:
+        raise BreachCorpusUnavailable(
+            f"the bundled breach corpus at {resource} holds {len(entries)} entries, below the floor "
+            f"of {ASVS_6_2_4_MIN_CORPUS_ENTRIES} (ASVS 6.2.4) -- breach screening cannot run"
+        )
+    return entries
 
 
 @functools.lru_cache(maxsize=4)
@@ -107,7 +172,11 @@ class PasswordPolicy:
         acceptable. Order: length → opt-in character classes → breach → username → context.
 
         ``username`` enables the 6.2.11 own-username check (omit it where there is no user context,
-        e.g. generating the bootstrap password)."""
+        e.g. generating the bootstrap password).
+
+        Raises :class:`BreachCorpusUnavailable` when ``check_breached`` is on and the bundled corpus is
+        unusable (BACKLOG #1438) -- a refusal, not a silent pass. Callers get a list or an exception,
+        never a list that quietly stopped screening."""
         problems: list[str] = []
         if len(password) < self.min_length:
             problems.append(f"be at least {self.min_length} characters")
@@ -120,6 +189,13 @@ class PasswordPolicy:
         if self.require_symbol and all(c.isalnum() for c in password):
             problems.append("contain a symbol")
         lowered = password.lower()
+        # `_common_passwords()` RAISES on an unusable bundled corpus (BACKLOG #1438), and Python's `or`
+        # evaluates it first, so the bundled floor is checked before any operator corpus is consulted.
+        # That is deliberate: an operator corpus is ADDITIVE (6.2.12), it has no floor of its own, and a
+        # bundled file that has been truncated or replaced is evidence about the INSTALL, not about the
+        # screen. A large operator export therefore does not excuse it -- the repair is to reinstall the
+        # wheel, which is cheap, and the alternative is honouring `check_breached=True` with a screen
+        # nobody has validated.
         if self.check_breached and (
             lowered in _common_passwords() or self._in_operator_corpus(password)
         ):
