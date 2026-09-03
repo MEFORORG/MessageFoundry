@@ -1094,10 +1094,27 @@ engine leg and a separate web console job. Its measured leg times, their pool an
 are recorded above the `Tests (pytest)` step in
 [`.github/workflows/ci.yml`](../.github/workflows/ci.yml). Read them there.
 
-Serially, on this box, the rate measured 269 tests in 250 seconds. That projects to about four hours
-for the whole set. The box was at 100 percent CPU with 2.2 GB of 31.7 GB free, all from other
-sessions, so contention is part of the number. Run the suite in the background and expect tens of
-minutes at best.
+**Use workers, and run it in the background.** CI's engine-leg selection, under `-n 8` on this box,
+finished in twelve minutes:
+
+```
+1 failed, 11480 passed, 833 skipped, 55 warnings in 717.92s (0:11:57)
+```
+
+Serially it is hours. The rate measured 269 tests in 250 seconds over the first few hundred, which
+is a rough figure and a lower bound on throughput: that arm ran `-v` with unbuffered per-line
+writes, and the same box completed 12313 tests in twelve minutes once it had eight workers. Take
+"hours serially, minutes parallel" as the shape and do not quote the projection as a measurement.
+
+Contention is part of every number here. The box sat at 100 percent CPU with 2.2 GB of 31.7 GB free,
+all from other sessions. That one failure is the cost: `test_accepts_seam.py` gives its sandbox
+child a 15-second wall budget, which a saturated box misses, and the file re-ran alone to `25 passed
+in 31.61s`. **A red under contention is worth re-running alone before you believe it.**
+
+### Nothing is close to hanging, and the durations say so
+
+The slowest item in that run was 48.96s of setup, and the slowest call 21.70s, against a `--timeout`
+of 120. Slow tests exist. A test near the per-item cap does not.
 
 ### A run with no summary line establishes nothing
 
@@ -1114,6 +1131,12 @@ Pytest itself never raises `TimeoutExpired`, and no test here lets one escape. A
 one would show as a named failure inside a normal summary. The wrapper that produced the reported
 traceback was not identified, so treat the ten-minute cap as the fitting mechanism rather than a
 measured one.
+
+**The reporting layer really does lose the exit code, and that reproduced here by accident.** The
+run quoted above ended `... && echo "ENGINE_RC=$?"`. Pytest returned 1 for its one failure, the
+`echo` returned 0, and the background task notification therefore announced `exit code 0` over a red
+suite. A trailing command replaces the exit status you were asking about. Read the summary line, not
+the status.
 
 ### This is not the xdist controller hang, and merging the two would lose both
 
