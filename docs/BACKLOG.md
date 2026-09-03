@@ -18543,8 +18543,17 @@ against a ledger that has work in it, and it does so by discarding the best-writ
 > **PARITY BETWEEN HOOK AND CI IS ITSELF ENFORCED FOR ONLY 3 OF THE 11**, by
 > `tests/test_lint_scope_parity.py` (14 tests): `ruff-format`, `ruff-check` and `bandit`. **The other
 > eight mirrors are hand-maintained with nothing comparing them** -- all eight MATCH today, checked
-> individually rather than assumed. ***A PARITY TEST FOR THOSE EIGHT IS THE DURABLE FIX AND IS NOT
-> BUILT.***
+> individually rather than assumed. ***A PARITY TEST FOR THOSE EIGHT IS THE DURABLE FIX.***
+
+> ***CORRECTION 2026-09-03: THE PRECEDING PARAGRAPH ENDED "AND IS NOT BUILT", AND THAT WAS ALREADY
+> FALSE WHEN IT WAS WRITTEN.*** `tests/test_gate_ci_mirror_parity.py` covers exactly those eight and
+> **landed in `389168a79`, the very commit that filed this row** -- so the claim has been wrong for
+> the whole life of the item, and the 2026-09-03 scoring note above repeats it ("the durable half is
+> a parity module for the eight ... plus a CI leg"). **The sentence is corrected in place rather than
+> annotated, because a reader who reaches it decides whether to BUILD that module**, and two of them
+> would then exist: a second, silently different definition of one rule, which is the defect that
+> family of tests exists to prevent. Recorded here rather than deleted so the next reader knows the
+> scoring note over-counted the remaining work rather than wondering which half is real.
 
 > **Full working, per-gate, is anchored at `refs/builder2/dup-hunt-2026-08-29`
 > (`BUILDER2-2026-08-29-CI-TWIN-CENSUS.md`), including the census's own correction: it first claimed
@@ -18558,6 +18567,41 @@ against a ledger that has work in it, and it does so by discarding the best-writ
 > **Found while settling a different question** -- why an allocation-keyed refusal in one worktree did
 > not reproduce in another. **The allocation answer is "replay versus fresh authorship". THE REASON IS
 > THAT NO GATE RUNS AT ALL, which is a larger finding than the question that produced it.**
+
+> ***SHIPPED 2026-09-03 -- THE PREFERRED FIX, PLUS THE VERSION AXIS NOTHING HELD.***
+> `.github/workflows/precommit-replay.yml` runs `pre-commit run --from-ref --to-ref` over the pull
+> request's diff, which is the CI-side re-run this row prefers over a second local hook. **It skips
+> exactly two of the eleven, and both would give a WRONG answer on a runner rather than merely an
+> inconvenient one:** `ledger-gate`, whose hook entry omits `--ci` and whose ownership arm reads a
+> registry living in `.git/mefor-coord/` that no runner has, and `forbidden-content`, which fails
+> closed on a git-ignored token file -- reproducing `security.yml`'s fork/secret branching in a
+> NON-REQUIRED leg would either red every fork pull request or hand back a structural-only green
+> reading as a leak-gate pass. Each keeps the mirror CI can actually run (`ledger_check.py --ci`;
+> the REQUIRED `forbidden-content` job). **The skip list is pinned as a SET**, because its failure
+> mode is growth until the leg runs nothing and still reports green.
+>
+> **NOT A REQUIRED CONTEXT, deliberately** -- it builds every pinned hook environment per run, and
+> promoting it needs branch protection moved first, then `.github/required-contexts.txt`, then the
+> count in `tests/test_required_contexts.py`, and a `merge_group:` trigger before any of that.
+>
+> ***AND THE GAP THE EXISTING PARITY MODULE DID NOT REACH: VERSION.*** `_MIRRORS` anchors on the
+> INVOCATION, so it proved a mirror still ran the right tool with the right discriminating flag and
+> said nothing about WHICH BUILD ran. For the three third-party hooks whose CI half is a downloaded
+> release or a lock pin, that was held **only by prose** -- `.pre-commit-config.yaml`'s "Keep the
+> version in step" and `zizmor.yml`'s matching line. **A comment cannot fail.** `gitleaks` (rev
+> `v8.18.4` / `security.yml`) and `actionlint` (rev `v1.7.12` / `zizmor.yml`) are now held by
+> `test_the_hook_rev_matches_the_version_ci_installs`, anchored on each repo's OWN download URL so a
+> stray `VER=` elsewhere cannot satisfy it; `bandit` (rev `1.9.4` versus the `ci-scanners` group) by
+> `test_bandit_hook_rev_matches_the_version_ci_installs` in the sibling, beside its scope arms.
+> **All four halves matched already** -- this closes the axis, it did not find a live drift.
+>
+> **WHAT IT DOES NOT BUY, so the row is not read as closure of the whole finding.** The leg is **LATE
+> in exactly the way the scoring note says** -- a push to this public repo publishes before any runner
+> starts -- and `--from-ref/--to-ref` resolves a CHANGED-FILE set against the checked-out tree, so
+> **content living only in an intermediate commit is still out of reach**, as it is for every
+> tip-tree mirror. What it does buy is that the nine hooks it runs **cannot drift from CI**, because
+> they ARE the hooks. **The ownership arm still has no enforcement path on a replayed commit and
+> cannot be given one** -- unchanged, and unavoidable, per the amendment above.
 
 **Cluster:** Quality gates / CI. **Priority:** P2. **Verdict:** build.
 **Severity:** no engine effect and no PHI axis today (sec. 0, zero deployments) -- **but this repo is
