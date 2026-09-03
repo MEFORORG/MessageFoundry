@@ -309,6 +309,33 @@ def test_an_unresolvable_pointer_refuses_rather_than_falling_back(
     )
 
 
+def test_as_worktree_refuses_a_path_that_is_not_a_repository(pair: tuple[Path, Path]) -> None:
+    """``-AsWorktree`` names the OWNER of a claim, so an unverified value would be a forged one.
+
+    The gate compares the record's ``worktree`` against ``git rev-parse --show-toplevel`` in the
+    committing tree. A holder that no repository can produce therefore matches nothing, and the claim it
+    creates blocks the key for every session while granting it to none -- the stranded-claim state the
+    registry's own cleanup tooling exists to unpick. So the flag resolves to a real TOPLEVEL or refuses,
+    and the refusal must leave NOTHING behind: a tool that fails loudly and writes anyway is a tool that
+    failed quietly.
+    """
+    engine, _other = pair
+
+    proc = _claim(
+        engine,
+        engine,
+        "-Take",
+        "1346",
+        "-AsWorktree",
+        str(engine / "not-a-repository"),
+        "-Note",
+        "should never land",
+    )
+    assert proc.returncode != 0, f"a bogus holder was accepted:\n{proc.stdout}"
+    assert "-AsWorktree" in (proc.stderr + proc.stdout), proc.stderr or proc.stdout
+    assert not _records(engine), "the refusal still wrote a claim"
+
+
 def test_a_repository_with_no_pointer_behaves_exactly_as_before(
     pair: tuple[Path, Path],
 ) -> None:
