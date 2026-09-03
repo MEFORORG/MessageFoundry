@@ -1787,6 +1787,15 @@ def test_a_COMPUTED_value_carries_nothing(repo: SimpleNamespace, unrelated: Path
 
     A value assembled at runtime is a runtime fact; "" is the honest answer and the caller keeps the
     behaviour it had. Half-resolving would be worse than not resolving, because it looks decided.
+
+    WHAT THIS ROW DOES NOT PIN, stated because a row that cannot fail is the defect this whole item
+    exists to prevent. Deleting the resolver's computed-value guard leaves it GREEN, measured by
+    running that mutation. The reason is structural rather than lucky: without the guard the literal
+    text `$root/.git` becomes a candidate, git is asked about it, no such directory exists, and the
+    candidate chain falls through to exactly the answer the guard would have produced. So the guard
+    is defence in depth here, not what produces this ALLOW, and the row pins the VERDICT a session
+    experiences rather than the guard's own contribution. No shape reachable from this fixture
+    separates the two.
     """
     interpolated = (
         f'$root="{repo.primary}"; $env:GIT_DIR="$root/.git"; git config core.hooksPath /nope'
@@ -1843,6 +1852,13 @@ def test_the_carried_environment_does_not_reach_rules_3_and_3d(
     Only rule 3c passes the carried value. An earlier version of the GIT_DIR work reached every
     caller and flipped `GIT_DIR=<governed> git clean -fd` from ALLOW to DENY; a parameter whose off
     state is not byte-identical to the previous behaviour is not opt-in.
+
+    THE TWO HALVES ARE NOT EQUALLY STRONG, and saying so is the point. Making rule 3 pass the
+    carried value reddens the verb rows above -- measured, so they really are what keeps it out of
+    rule 3. Making rule 3d pass it changes NOTHING here, because 3d's refusal keys on the worktree
+    being REMOVED rather than on the session's candidate list, so the removal row below is a
+    regression control on 3d's refusal TEXT and not evidence about the parameter. The existing
+    ordering-switch row has the same limitation for the flag spelling.
     """
     for verb in ("clean -fd", "reset --hard"):
         command = f'$env:GIT_DIR="{repo.primary}/.git"; git {verb}'

@@ -512,6 +512,14 @@ function Resolve-CarriedGitDir([string]$ScanPrefix) {
     $v = $last.Groups['v'].Value.Trim('"', "'")
     if (-not $v) { return "" }
     # \x24 = $, \x25 = %, \x60 = backtick. Same class, same reason, as Get-LiteralAssignments.
+    #
+    # DEFENCE IN DEPTH, NOT A LOAD-BEARING GUARD, and the difference is measured rather than assumed:
+    # deleting this line leaves the whole corpus green. Without it the unresolved literal (`$root/.git`)
+    # becomes a candidate, git is asked about it, no such directory exists, and the candidate chain
+    # falls through to the same answer. It is kept because "" is the HONEST answer -- a half-resolved
+    # value looks decided -- and because a literal that happens to name a real directory would
+    # otherwise decide on text the shell never meant literally. Do not read its presence as the reason
+    # any current ALLOW is an ALLOW.
     if ($v -match '[\x24\x25\x60]') { return "" }
     $v
 }
