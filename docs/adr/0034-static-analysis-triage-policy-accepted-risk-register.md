@@ -203,7 +203,7 @@ make them PR-visible instead. The `dependabot-auto-merge.yml` scope row is still
 
 | Where | Recommendation | Status | Why it matters |
 |---|---|---|---|
-| `release.yml` `pip install sigstore` | Pin `sigstore==<version>` | **Done** — `sigstore==4.4.0`. Deliberately *not* the newer 4.5.0: `.github/dependabot.yml` sets `cooldown.default-days: 5`, 4.5.0 was <48 h old, and pinning the *signing* toolchain fresher than the repo's own update policy allows would invert that policy at the highest-privilege point. Re-evaluate once it ages out. | The **highest residual in the group**: a completely unpinned install inside the job holding `contents: write` + `id-token: write` + `attestations: write`, resolved immediately before it signs the wheel, sdist, SBOM and VEX. A malicious release fetched at that moment runs with the OIDC identity used to publish. |
+| `release.yml` `pip install sigstore` | Pin `sigstore==<version>` | **Done, and SUPERSEDED TWICE — read the 2026-09-03 amendment at the foot of this ADR before acting on this cell.** As written it says: `sigstore==4.4.0`, deliberately *not* 4.5.0, because `.github/dependabot.yml` sets `cooldown.default-days: 5` and 4.5.0 was <48 h old; *"Re-evaluate once it ages out."* **The version is still 4.4.0** — that half is correct and is now an owner ruling (2026-08-22, re-affirmed 2026-09-03), not an inference from the cooldown. **Two things here are now wrong.** (1) It is no longer an inline `pip install` pin at all: `sigstore` flows through the PEP 735 `release-tools` group into `ci/locks/release-tools.lock`, installed with `--require-hashes`. (2) **"Re-evaluate once it ages out" is DISCHARGED, and must not be actioned again.** The cooldown expired 2026-08-02; both rulings postdate that, so re-deriving it does not reopen the version. It was re-derived once anyway, and shipped 4.5.0 in `a9354808e`. `.github/dependabot.yml` now carries a matching `ignore` entry so a bot cannot repeat it. | The **highest residual in the group**: a completely unpinned install inside the job holding `contents: write` + `id-token: write` + `attestations: write`, resolved immediately before it signs the wheel, sdist, SBOM and VEX. A malicious release fetched at that moment runs with the OIDC identity used to publish. |
 | `release.yml` `pip install --upgrade pip build` | Pin `build==<version>` | **Done** — `pip==26.1.2 build==1.5.0`, in **both** the engine and harness build steps. | Unpinned PEP 517 frontend that produces the published wheel/sdist. |
 | `release.yml` `pip install --quiet packaging` (harness job) | Pin `packaging==<version>`; install into a throwaway venv as the engine job already does | **Done, both halves** — pin *derived from `constraints.lock`* (it is a DEP-1 transitive, so a literal would rot), and moved into `/tmp/harnesssmoke` mirroring `/tmp/relsmoke`. | Resolved into the **publishing** job's main interpreter rather than a scratch venv. |
 | `release.yml` `pip install --quiet packaging` (`/tmp/relsmoke`) | Pin `packaging==<version>` | **Done** — same `constraints.lock`-derived pin. | Contained (disposable venv, version-compare only), but free to pin. |
@@ -355,7 +355,7 @@ implied:
 
 | Residual | Why it is not fixed here |
 |---|---|
-| **`release.yml`'s `sigstore==4.4.0`** | **SUPERSEDED BY THE SHIPPED CODE — do not act on this row; its factual premise is false as written. Row kept rather than deleted because a reader arrives here by grep, and a missing row reads as "never considered".** It said `sigstore` was deliberately **absent** from `uv.lock` and from all six exports (0 hits). **Verified false 2026-09-03 at `46ea10a7`:** `sigstore` is in `uv.lock`, `ci/locks/release-tools.lock` is a tracked seventh export, and `release.yml:391` installs it with `--require-hashes`. The mechanism half of this row is spent. **The version half is now an OPEN QUESTION and is NOT resolved here:** this row and BACKLOG #332 record an **owner ruling of 2026-08-22 pinning `sigstore==4.4.0`, "NOT 4.5.0"**, while the shipped `pyproject.toml:295` pins **4.5.0** and `release.yml:385-390` argues the cooldown objection is spent. Both citations are live and they disagree. **It needs an owner ruling; do not resolve it by editing either side.** See BACKLOG #332. |
+| **`release.yml`'s `sigstore==4.4.0`** | **RETIRED as a residual 2026-09-03 (BACKLOG #332) — see the amendment of that date at the foot of this ADR. Row kept rather than deleted, per this table's own opening rule that a `won't fix` made invisible is worse than one stated with its reason.** Its factual premise is false as written: it said `sigstore` was deliberately **absent** from `uv.lock` and from all six exports (0 hits). **Verified false at `46ea10a7`** — `sigstore` is in `uv.lock`, `ci/locks/release-tools.lock` is a tracked seventh export, and the install is `--require-hashes`. **The counterfactual is what made it wrong.** The row assumed routing `sigstore` through the lock *would* force 4.5.0, so it treated "hash-lock it" and "keep 4.4.0" as mutually exclusive. A dependency group carries an explicit specifier, so `sigstore==4.4.0` hash-locks 4.4.0. They were never in tension, and that false coupling is what held a real supply-chain gap open. **Both halves now hold at once, and both are settled:** hash-locked, at 4.4.0, by owner ruling. |
 | **The `uv` bootstrap** (`security.yml`, `python -m pip install --upgrade pip "uv==0.12.0"`) | **Permanently circular: you cannot hash-lock `uv` with `uv`.** That install produces every lock this repo commits. `uv` stays an inline `==` pin, and `pip` remains the sole registered *name* in `SECURITY_YML_ACCEPTED_UNPINNED`. Note it is also the pip that runs the **six exports and the diff gate** — the `--require-hashes` install two steps later *downgrades* pip to the locked version afterwards, so the DEP-1 step's own posture is unchanged by this work. *Cheap out-of-band fix that removes it entirely:* `astral-sh/setup-uv@c771a70e…` is already SHA-pinned and used in 9 places (`ci.yml` ×6, `quality-advisory.yml` ×2, the resync ×1); swapping it in deletes the install. Separate change. |
 | **`security.yml`'s unpinned `pip` in the `semgrep` step** — `python -m pip install --upgrade pip "semgrep==1.172.0"` | **The SECOND surviving bootstrap, named because an undercounted inventory is how a real finding goes invisible.** The semgrep row below explains only the `[otel]` conflict that keeps *semgrep* inline; this row records that the same line is also an **unpinned `pip` fetch**. So two `--upgrade pip` bootstraps remain in the file, not one — now asserted as an exact count by `test_security_yml_pip_bootstrap_count_is_exact`, since `SECURITY_YML_ACCEPTED_UNPINNED` registers the *name* `pip` and cannot tell two accepted bootstraps from twenty. **Mitigation WITHDRAWN 2026-08-04 (BACKLOG #334) — it rested on a false premise.** This row previously read *"Mitigating: `semgrep` is not a required context (`tests/test_required_contexts.py`), so this one does not sit on the merge path."* That is false in the repo's own records: `semgrep (project SAST rules)` is at `.github/required-contexts.txt:78`, and `tests/test_security_posture.py`'s `_BLOCKING_SECURITY_JOBS` names `semgrep` and asserts that membership. `tests/test_required_contexts.py` never claimed the opposite — it pins the required *set*, which contains it; the citation was to a file that says the reverse of what it was cited for. So this bootstrap **does** sit on the merge path, and #334 widened that same step's scan from a two-directory allow-list to the whole repo, which *increases* what rides on it. Re-accepted with that known, on the `uv` row's grounds (a bootstrap `pip` cannot hash-lock itself). It disappears whenever the semgrep row's `[tool.uv] conflicts` recipe is taken. |
 | **`quality-advisory.yml`'s `pipx install ruff`** | **Outside the guard's regex and outside Scorecard's.** `test_ci_venv_pinning.py`'s `_PIP_INSTALL` matches `pip`/`pip3`/`python -m pip` only, so the unpinned fallback branch is invisible to every existing guard — and because it is not a `pip install`, **no alert exists to close**. `pipx` has no `--require-hashes`, so fixing it means changing the install mechanism, not the pin. Recorded, not done. |
@@ -474,3 +474,67 @@ one is an accepted residual.
   exist with the same semantics; a decision on `require-opener-as-author`, which defaults to true and
   fails the check; and a rehearsal in a scratch repo. Land in a low-traffic window with a revert
   prepared.
+
+## Amendment — 2026-09-03: the `sigstore` residual is retired, and the version it protected is restored
+
+BACKLOG #332 routed the release signing toolchain through the hashed-lock mechanism this ADR's
+2026-07-29 amendment built. Two cells above are superseded by it: the `release.yml pip install
+sigstore` row in the §3 register, and the `sigstore` row in the residuals table. Both are marked in
+place rather than deleted.
+
+* **What is enforced now.** A non-default PEP 735 `release-tools` group in `pyproject.toml`;
+  `ci/locks/release-tools.lock` as its hashed export, the seventh in the DEP-1 set; and
+  `release.yml` installing the toolchain with `pip install --require-hashes -r
+  ci/locks/release-tools.lock`. The ~30 transitives that previously floated unhashed at signing
+  time, inside the job holding `id-token: write`, are pinned by hash.
+* **The residual's reasoning contained a false counterfactual, and that is the transferable lesson.**
+  It asserted that routing `sigstore` through the lock *would* resolve 4.5.0, and so treated
+  "hash-lock it" and "keep 4.4.0" as mutually exclusive. A dependency group carries an explicit
+  specifier, so a group reading `sigstore==4.4.0` resolves 4.4.0. The two questions were never
+  coupled. That false coupling held a real supply-chain weakness open for five weeks, and it is the
+  same shape this ADR's own Decision warns about: a dismissal whose stated reason does not survive
+  being tested. **When a residual rests on a counterfactual about a mechanism nobody has run, say so
+  in the row, and treat running it as cheap.**
+* **The version is 4.4.0 by owner ruling** — given 2026-08-22, re-affirmed 2026-09-03 once the full
+  history below was put to the owner. **The cooldown clause at the §3 register row is DISCHARGED and
+  must not be actioned again.** 4.5.0 published 2026-07-28T07:34:00Z, so the 5-day window closed
+  2026-08-02; both rulings postdate that. A spent cooldown is therefore not evidence the pin is
+  stale — it is the argument the rulings were made in spite of.
+* **This was inverted once, by a re-derivation of exactly that clause, and the record is the point.**
+  The 4.5.0 case was published on PR 531 at 2026-08-26T23:46:18Z, arguing the re-evaluation clause at
+  this ADR's two rows had come due. **Its own author retracted it at 2026-08-27T02:45:36Z**, in these
+  words: *"I checked whether the ADR's premise had expired. I never checked whether the question had
+  since been answered."* Commit `a9354808e` then shipped 4.5.0 on 2026-08-29, **two days after the
+  retraction**. Corrected under #332.
+* **The clause now has a machine backstop.** `.github/dependabot.yml` carries `ignore: sigstore
+  >=4.5.0`, so a routine bot PR cannot re-propose the declined version. That entry is a deliberate
+  carve-out from the file's "the `==` pins in `[dependency-groups]` are NOT ignored" policy, whose
+  reason is about versions nobody has decided; the carve-out and its lifting condition are recorded
+  at the policy itself.
+* **A gap this work found and closed.** `a9354808e` added `ci/locks/release-tools.lock` to the export
+  set and the byte-diff gate but **not** to `security.yml`'s audit step, leaving the release signing
+  closure the only committed lock nothing audited — hash-pinned, therefore sticky, therefore exactly
+  the *"pinned, stale, unpatched is worse than floating"* case §3 names. `pip-audit -r
+  ci/locks/release-tools.lock` now runs beside the other two. It is also what makes the `ignore`
+  entry acceptable, since an `ignore` suppresses the security track for its range; each side's
+  comment names the other.
+* **Patch availability does not discriminate between the two versions.** Measured against PyPI
+  2026-09-03: sigstore 4.x is 4.0.0, 4.1.0, 4.2.0, 4.3.0, 4.4.0, 4.5.0 and nothing else — zero patch
+  releases across the series, so neither 4.4.0 nor 4.5.0 has a patch line. The 3.x series did ship
+  patches (3.5.1, 3.6.7), so a 4.4.1 remains possible and the `ignore` is scoped `>=4.5.0` to leave
+  that track open.
+* **Contamination: measured, none.** The acceptance criterion this ADR used at its own convergence —
+  re-export every committed lock and require `git diff --exit-code` to return 0 — was run with the
+  CI-pinned `uv==0.12.0`, control first (the unchanged tree re-exported byte-identically, so the
+  instrument matches CI's). All six pre-existing DEP-1 artifacts stay byte-identical; `uv lock` moves
+  one line and `release-tools.lock` three. The `semgrep`-style excluded-by-decision call was never
+  reached.
+* **Still open, deliberately.** `build` and `cyclonedx-bom` remain inline installs in the same
+  privileged job. Per the "2 genuinely open `PinnedDependenciesID` alerts" paragraph above,
+  `cyclonedx-bom` is half of a pair `test_sbom_install_is_byte_identical_in_release_and_security`
+  requires to stay byte-identical, so both halves must move in one commit. Tracked at BACKLOG #332.
+* **No PR CI leg executes the signing path.** `release.yml` runs only on a tag push or
+  `workflow_dispatch` (see "What no test can see"). The guards assert the lock exists, pins
+  `sigstore` exactly, is fully hashed and is installed with `--require-hashes`; they cannot assert it
+  installs. **The first real run of this change is a release** — dry-run via `workflow_dispatch` and
+  read the log before the next tag.
