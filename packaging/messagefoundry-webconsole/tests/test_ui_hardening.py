@@ -8,15 +8,25 @@ reverts to the pre-#192 posture without downgrading transport security."""
 from __future__ import annotations
 
 import re
+from types import SimpleNamespace
 
 import httpx
 import pytest
+from starlette.requests import Request as StarletteRequest
+from starlette.responses import Response as StarletteResponse
 
 from messagefoundry.api import create_app
 from messagefoundry.auth import Role
 from messagefoundry.auth.service import AuthService
 from messagefoundry.config.settings import AuthSettings
 from messagefoundry.pipeline import Engine
+from messagefoundry_webconsole._auth import (
+    BROWSER_HARDENING_OPT_OUT_ENV,
+    clear_oidc_flow_cookie,
+    clear_session_cookie,
+    set_oidc_flow_cookie,
+    set_session_cookie,
+)
 
 PW = "a-strong-test-passphrase"  # >=15, no app/vendor terms — satisfies the ASVS policy (WP-3)
 _NONCE_RE = re.compile(r"script-src 'nonce-([A-Za-z0-9_-]+)' 'strict-dynamic'")
@@ -335,3 +345,146 @@ async def test_opt_out_reverts_to_legacy_over_https(
         assert "window.isSecureContext" not in page.text  # opt-out reverts -> banner not emitted
         # the reverted plain cookie still authenticates (name resolver agrees on read)
         assert (await c.get("/ui")).status_code == 200
+
+
+# --- BACKLOG #1117: the CLEAR site consults the same conjuncts as the SET site --------------------
+#
+# The set site keys Secure on ``effective_https`` ALONE and the name on ``effective_https AND
+# browser_hardening_enabled()``. The clear site used to infer Secure from the resolved NAME, so under
+# the org opt-out over https it took the unprefixed branch and reached Starlette's ``delete_cookie``
+# defaults (``secure=False, httponly=False, samesite="lax"``) -- dropping three attributes the set
+# had just written. These pin the two sites to one expression.
+
+
+def _cookie_request(scheme: str, *, exposure_protected: bool = False) -> StarletteRequest:
+    """A bare Request carrying only what the cookie helpers read: the scheme and ``app.state``."""
+    return StarletteRequest(
+        {
+            "type": "http",
+            "http_version": "1.1",
+            "method": "POST",
+            "scheme": scheme,
+            "path": "/ui/logout",
+            "raw_path": b"/ui/logout",
+            "query_string": b"",
+            "root_path": "",
+            "headers": [(b"host", b"t")],
+            "client": ("127.0.0.1", 1234),
+            "server": ("t", 443 if scheme == "https" else 80),
+            "app": SimpleNamespace(
+                state=SimpleNamespace(exposure_protected=exposure_protected, loopback=False)
+            ),
+        }
+    )
+
+
+#: The attributes a browser reads as security posture. Deliberately NOT the whole attribute set: a
+#: deletion also carries ``max-age``/``expires``, which the set legitimately does not.
+_GUARD_ATTRS = ("secure", "httponly", "samesite")
+
+
+def _guards(response: StarletteResponse) -> tuple[str, dict[str, str]]:
+    """The cookie NAME plus its security attributes, from the one ``Set-Cookie`` on the response."""
+    lines = [v.decode() for k, v in response.raw_headers if k == b"set-cookie"]
+    assert len(lines) == 1, lines
+    head, _, rest = lines[0].partition(";")
+    attrs: dict[str, str] = {}
+    for part in rest.split(";"):
+        if not part.strip():
+            continue
+        key, _, value = part.strip().partition("=")
+        if key.strip().lower() in _GUARD_ATTRS:
+            attrs[key.strip().lower()] = value.strip().lower()
+    return head.split("=", 1)[0], attrs
+
+
+_POSTURES = [
+    pytest.param("https", True, id="https-hardened"),
+    pytest.param("https", False, id="https-org-opt-out"),
+    pytest.param("http", True, id="cleartext-hardened"),
+    pytest.param("http", False, id="cleartext-org-opt-out"),
+]
+
+
+@pytest.mark.parametrize(("scheme", "hardening"), _POSTURES)
+def test_session_clear_carries_the_same_guards_as_the_set(
+    scheme: str, hardening: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """On EVERY posture the session deletion carries the same name, Secure, HttpOnly and SameSite as
+    the emission it revokes. A deletion that drops Secure is a cookie written without Secure, which is
+    what ASVS 3.3.1 grades -- and one that drops HttpOnly hands script a name the set had hidden."""
+    if hardening:
+        monkeypatch.delenv(BROWSER_HARDENING_OPT_OUT_ENV, raising=False)
+    else:
+        monkeypatch.setenv(BROWSER_HARDENING_OPT_OUT_ENV, "1")
+    request = _cookie_request(scheme)
+
+    written = StarletteResponse()
+    set_session_cookie(written, "a-token", request=request)
+    cleared = StarletteResponse()
+    clear_session_cookie(cleared, request)
+
+    set_name, set_attrs = _guards(written)
+    clear_name, clear_attrs = _guards(cleared)
+    # the positive control: the instrument DOES see Secure move with the scheme, so an all-passing
+    # comparison below cannot be two empty dicts agreeing with each other.
+    assert ("secure" in set_attrs) is (scheme == "https"), set_attrs
+    assert clear_name == set_name
+    assert clear_attrs == set_attrs
+
+
+@pytest.mark.parametrize(("scheme", "hardening"), _POSTURES)
+def test_oidc_flow_clear_carries_the_same_guards_as_the_set(
+    scheme: str, hardening: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The same symmetry for the ADR 0142 flow cookie, whose clear runs on EVERY terminal callback --
+    so it is the more frequently emitted of the two deletions, not the rarer one."""
+    if hardening:
+        monkeypatch.delenv(BROWSER_HARDENING_OPT_OUT_ENV, raising=False)
+    else:
+        monkeypatch.setenv(BROWSER_HARDENING_OPT_OUT_ENV, "1")
+    request = _cookie_request(scheme)
+
+    written = StarletteResponse()
+    set_oidc_flow_cookie(written, "a-flow-id", request=request, max_age=300)
+    cleared = StarletteResponse()
+    clear_oidc_flow_cookie(cleared, request)
+
+    set_name, set_attrs = _guards(written)
+    clear_name, clear_attrs = _guards(cleared)
+    assert ("secure" in set_attrs) is (scheme == "https"), set_attrs
+    assert clear_name == set_name
+    assert clear_attrs == set_attrs
+
+
+def test_session_clear_follows_exposure_protected_not_only_the_wire_scheme() -> None:
+    """The ``tls_terminated_upstream`` topology ADR 0172 deliberately excludes: the engine speaks
+    plaintext to a declared proxy, so the wire scheme is http while the BROWSER's origin is https and
+    ``exposure_protected`` is true. The set writes Secure there; so must the clear."""
+    request = _cookie_request("http", exposure_protected=True)
+    written = StarletteResponse()
+    set_session_cookie(written, "a-token", request=request)
+    cleared = StarletteResponse()
+    clear_session_cookie(cleared, request)
+    assert "secure" in _guards(written)[1]  # control: the set really does key on the declaration
+    assert _guards(cleared) == _guards(written)
+
+
+async def test_opt_out_logout_over_https_still_deletes_with_secure(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """End to end through the real logout route, on the posture that used to lose three attributes:
+    the org opt-out over https."""
+    monkeypatch.setenv(BROWSER_HARDENING_OPT_OUT_ENV, "1")
+    service = await _service(engine)
+    await _add(service, "op", Role.OPERATOR)
+    async with _client(engine, service, scheme="https") as c:
+        await _login(c, "op")
+        out = await c.post("/ui/logout")
+        assert out.status_code == 303
+        set_cookie = out.headers["set-cookie"]
+        low = set_cookie.lower()
+        assert set_cookie.split("=", 1)[0] == "mf_session"  # opt-out keeps the bare name
+        assert "secure" in low and "httponly" in low and "samesite=strict" in low
+        # and the deletion really ended the session
+        assert (await c.get("/ui")).status_code in (302, 303, 401)
