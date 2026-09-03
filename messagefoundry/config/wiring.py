@@ -137,6 +137,7 @@ __all__ = [
     "accepted_cleartext_hops",
     "expiry_relaxed_hops",
     "unverified_generic_db_hops",
+    "overbroad_smart_scopes",
 ]
 
 _logger = logging.getLogger(__name__)
@@ -528,7 +529,7 @@ def FhirLookup(
         with_smart_backend(                                           # SMART Backend Services bearer
             FhirLookup("epic", url=env("epic_fhir_base")),
             token_url=env("epic_token_url"), client_id=env("epic_client_id"),
-            private_key=env("epic_smart_key"), scope="system/*.rs",
+            private_key=env("epic_smart_key"), scope="system/Patient.rs",  # read+search only
         )
 
     The read is **GET-only** (structurally read-only — a Handler cannot mutate the FHIR server through it;
@@ -3730,6 +3731,102 @@ def unverified_generic_db_hops(registry: Registry) -> list[tuple[str, str]]:
             reason = unenforced(conn.spec.settings)
             if reason is not None:
                 out.append((f"{label}{conn.name}", f"{reason} ({_peer_label(conn.spec.settings)})"))
+    return sorted(out)
+
+
+def overbroad_smart_scopes(registry: Registry) -> list[tuple[str, str]]:
+    """Every SMART-authenticated connection whose requested ``smart_scope`` asks for permission letters
+    its DECLARED shape cannot spend, as ``(name, detail)`` (#1159, ASVS 10.2.3).
+
+    The SINGLE reader of the over-grant set, on the same contract as :func:`accepted_cleartext_hops` and
+    :func:`expiry_relaxed_hops`, so ``messagefoundry check`` and any later surface cannot disagree.
+    Sorted by connection name for a stable, diffable list. Lookup names are prefixed ``fhir_lookup:``
+    because they live in a separate namespace and could otherwise collide with an outbound's name.
+
+    Three predicates arrive by lazy import from ``transports``, on the precedent
+    :func:`unverified_generic_db_hops` states for ``generic_odbc_tls_unenforced`` — restating any of
+    them here would be a second definition that can silently disagree with the code that acts on it,
+    and ``config`` must not take a module-import dependency on ``transports``:
+
+    * ``smart_auth_configured`` — whether SMART auth is ON, shared with the code that builds the
+      provider and with the mutual-exclusion screen. Three spellings of this test had already drifted.
+    * ``smart_scope_letters`` — the scope grammar, beside the code that puts ``scope`` on the wire.
+    * ``scope_letters_for_shape`` — the letters a declared shape can spend, beside the
+      interaction/conditional dispatch it mirrors, which is what makes it read ``conditional`` FIRST.
+
+    A ``FhirLookup`` is not passed through that last one: it has no ``ConnectionSpec``, no interaction,
+    and is structurally GET-only (ADR 0043 — the read executor cannot mutate), so it spends ``r`` and
+    ``s`` and nothing else. Stated here so that giving a lookup a write path later cannot silently
+    escape this reader, exactly as ``accepted_cleartext_hops`` had to grow its ``fhir_lookups`` arm.
+
+    **Over-grant only, never under-grant.** ASVS 10.2.3 asks that the client request only the scopes it
+    requires; asking for MORE authority than the connection can spend is the thing that verb names. A
+    connection that requests too LITTLE is a correctness defect and it is not this verb, so this reader
+    stays silent on it: telling an operator to ADD a letter would tell them to request authority their
+    authorization server may never have registered, which a conformant server refuses outright.
+    Narrowing a request to a subset of what IS registered always succeeds, which is what makes the
+    over-grant direction safe to advise.
+
+    **Quiet wherever the shape does not determine the answer**, because an advisory that fires on a
+    valid clinical configuration teaches operators to ignore it: SMART auth off; no ``smart_scope``
+    set, so the server applies its registered default; ``transaction``/``batch``, a plain ``Rest()``
+    composed with SMART auth, or any connector declaring no interaction; a scope string carrying no
+    parseable FHIR resource scope; and the RESOURCE half, always.
+
+    The generic OAuth2 leg (``oauth2_scope``) is deliberately NOT covered, and that is a finding rather
+    than an omission: its scope vocabulary belongs to the partner (the shipped worked example is
+    ``claims.write``), so there is no declared shape to compute a requirement from and any screen over
+    it would be guessing at someone else's namespace.
+
+    Pure — it reads the loaded graph and touches nothing else."""
+    from messagefoundry.transports.fhir import scope_letters_for_shape
+    from messagefoundry.transports.smart import smart_auth_configured, smart_scope_letters
+
+    def one(
+        name: str, settings: Mapping[str, Any], conn_type: ConnectorType | None
+    ) -> tuple[str, str] | None:
+        if not smart_auth_configured(settings):
+            return None
+        scope = settings.get("smart_scope")
+        requested = smart_scope_letters(scope) if isinstance(scope, str) else None
+        allowed: frozenset[str] | None
+        if conn_type is None:  # a FhirLookup: structurally GET-only, so read and search
+            allowed, shape = frozenset("rs"), "GET-only lookup"
+        elif conn_type is ConnectorType.FHIR:
+            allowed = scope_letters_for_shape(
+                str(settings.get("interaction") or ""), settings.get("conditional")
+            )
+            shape = f"interaction={settings.get('interaction')!r}"
+            if settings.get("conditional"):
+                shape += f"/conditional={settings.get('conditional')!r}"
+        else:
+            return None  # a plain Rest() composed with SMART auth declares no interaction
+        if requested is None or allowed is None:
+            return None
+        extra = requested - allowed
+        if not extra:
+            return None
+        return (
+            name,
+            f"requests {'/'.join(sorted(extra))} which a {shape} connection cannot use "
+            f"(scope={scope!r}, usable={'/'.join(sorted(allowed))})",
+        )
+
+    # Two loops rather than the one table-driven loop `unverified_generic_db_hops` uses, because its two
+    # tables both hold connections carrying a `ConnectionSpec` and these two do not: an
+    # `OutboundConnection` has `.spec.settings` and a typed connector, a `FhirLookupSpec` has bare
+    # `.settings` and no connector type at all. Folding them costs a `getattr` that defeats the type
+    # checker to save two lines.
+    out = [
+        hit
+        for oc in registry.outbound.values()
+        if (hit := one(oc.name, oc.spec.settings, oc.spec.type)) is not None
+    ]
+    out += [
+        hit
+        for spec in registry.fhir_lookups.values()
+        if (hit := one(f"fhir_lookup:{spec.name}", spec.settings, None)) is not None
+    ]
     return sorted(out)
 
 
