@@ -427,6 +427,28 @@ def enforce_store_key_expiry(
     ts = time.time() if now is None else now
     today = datetime.datetime.fromtimestamp(ts, tz=_UTC).date()
 
+    # An EMPTY stamp map means the reconcile did not complete (the engine assigns the stamps only on
+    # its success path), so `_maybe_escalate_dek` — which runs at the END of a successful reconcile —
+    # never fired and NOTHING has alerted about this key yet. That is the flag the alerting below reads,
+    # and it is why an alert here is not a duplicate: on the normal path the escalation alert has
+    # already gone out on this exact condition, and sending a second one would train operators to
+    # ignore it.
+    reconcile_alerted = bool(stamps)
+
+    def _alert(last_rotated: str, days_overdue: int) -> None:
+        """Emit the enforced rotation alert, CONTAINED. A broken notifier must never swallow the stop,
+        so this is called before the raise and its failure is logged rather than propagated."""
+        try:
+            sink.secret_rotation_due(
+                _DEK_LABEL,
+                secret=_DEK_SECRET_ID,  # nosec B106 — the secret's env-var NAME, never its value
+                last_rotated=last_rotated,
+                days_overdue=days_overdue,
+                enforced=True,
+            )
+        except Exception:
+            log.warning("secret_rotation expiry-refusal sink failed", exc_info=True)
+
     dek_stamp = stamps.get(_DEK_SECRET_ID)
     if settings.store_key_last_rotated:
         eff_last = datetime.date.fromisoformat(settings.store_key_last_rotated)
@@ -436,22 +458,13 @@ def enforce_store_key_expiry(
         # UNDETERMINED age, and the store IS keyed and DOES track rotation meta — so this is not the
         # keyless case, it is a reconcile that failed and was swallowed upstream. Ruled to REFUSE: an
         # undetermined age is not a young one, and the empty-scan-reads-as-clean-scan failure is exactly
-        # what this item exists to remove. The alert is emitted IN ADDITION, never instead, and its
-        # sink is contained so a broken notifier cannot swallow the stop.
-        try:
-            sink.secret_rotation_due(
-                _DEK_LABEL,
-                secret=_DEK_SECRET_ID,  # nosec B106 — the secret's env-var NAME, never its value
-                last_rotated="unknown",
-                # NOT a measurement — there is no date to measure from. This is the DECISION expressed
-                # in the field's own units: the smallest value that satisfies the refusal predicate, so
-                # a rule keyed on `days_overdue` routes it like any other enforced expiry. The truth is
-                # carried by `last_rotated="unknown"`, which every sink renders.
-                days_overdue=settings.enforce_grace_days + 1,
-                enforced=True,
-            )
-        except Exception:
-            log.warning("secret_rotation expiry-refusal sink failed", exc_info=True)
+        # what this item exists to remove. The alert is emitted IN ADDITION, never instead.
+        #
+        # `days_overdue` here is NOT a measurement — there is no date to measure from. It is the
+        # DECISION expressed in the field's own units: the smallest value satisfying the refusal
+        # predicate, so a rule keyed on `days_overdue` routes it like any other enforced expiry. The
+        # truth is carried by `last_rotated="unknown"`, which every sink renders.
+        _alert("unknown", settings.enforce_grace_days + 1)
         if not settings.enforce_store_key_expiry:
             log.error(
                 "store DEK rotation age is UNDETERMINED and the calendar expiry is DISABLED "
@@ -469,7 +482,12 @@ def enforce_store_key_expiry(
     days_overdue = (today - eff_last).days - settings.store_key_max_age_days
     if days_overdue <= settings.enforce_grace_days:
         return
-    # The alert already fired from `_maybe_escalate_dek` on this same condition — do not double-send.
+    if not reconcile_alerted:
+        # The narrow path where the overdue branch is reached with NOTHING having alerted: the reconcile
+        # failed AND the operator set `store_key_last_rotated`, so there is an effective date to judge
+        # but no escalation alert went out. Without this the opt-out would start on a knowably expired
+        # key in silence — which is the exact shape this item exists to remove.
+        _alert(eff_last.isoformat(), days_overdue)
     if not settings.enforce_store_key_expiry:
         log.error(
             "store DEK is %d day(s) past its max age (last_rotated=%s) and the calendar expiry is "

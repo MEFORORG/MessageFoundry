@@ -200,6 +200,32 @@ def test_opt_out_suppresses_the_overdue_refusal() -> None:
     _enforce(settings=SecretRotationSettings(enforce_store_key_expiry=False))  # must not raise
 
 
+def test_the_overdue_branch_does_not_double_alert_on_the_normal_path() -> None:
+    """A populated stamp map means the reconcile completed, so `_maybe_escalate_dek` has ALREADY sent
+    the enforced alert on this exact condition. A second one here would train operators to ignore it."""
+    sink = _RecordingSink()
+    with pytest.raises(StoreKeyRotationOverdueError):
+        _enforce(alert_sink=sink)  # default stamps: 420 days old, reconcile succeeded
+    assert sink.calls == []
+
+
+def test_the_overdue_branch_DOES_alert_when_nothing_else_has() -> None:
+    """The narrow silent path: the reconcile failed (no stamps) AND the operator set
+    `store_key_last_rotated`, so there is a date to judge but no escalation alert went out. With the
+    opt-out ON the raise is loud enough; with it OFF this alert is the only remaining signal."""
+    sink = _RecordingSink()
+    _enforce(
+        settings=SecretRotationSettings(
+            store_key_last_rotated="2025-01-01", enforce_store_key_expiry=False
+        ),
+        stamps={},
+        alert_sink=sink,
+    )
+    assert len(sink.calls) == 1, "an overdue key with the opt-out on must not start in silence"
+    assert sink.calls[0]["last_rotated"] == "2025-01-01"  # a real date, not "unknown"
+    assert sink.calls[0]["enforced"] is True
+
+
 def test_the_opt_out_is_a_NAMED_security_loosening() -> None:
     """A silent opt-out from a refusal is indistinguishable from the refusal never having been built."""
     named = dict(
