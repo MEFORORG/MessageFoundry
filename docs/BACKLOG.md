@@ -11885,6 +11885,48 @@ preflight is re-implemented against current `main` as its own item. **Neither is
 **AND THE SCREEN THAT MISSED IT CANNOT SEE THIS BY CONSTRUCTION.** Verdict, closing-act, claim state,
 build commits and retirement markers all read the LEDGER. ***"Does the subject exist on main" is the
 only check that reads the CODE, and it is the one that decides startability.***
+
+**AMENDMENT 2026-09-03, builder seat. THE CLEARING CONDITION IS MET -- THIS ITEM IS STARTABLE. IT IS
+NOT CLOSED.** The amendment above named the exact condition: *"that branch is rebased onto `main`
+with a PR opened"*. That has now happened, on the owner's ruling of 2026-09-03. **PR #764** carries
+the preflight onto current `origin/main`, so the subject this item reports a defect in now exists
+where a builder would branch from.
+
+***THE DEFECT IS UNCHANGED AND UNFIXED, WHICH IS WHY THIS ROW STAYS OPEN.*** PR #764 is a carry, not
+a fix, and deliberately so: the two-arm test this item specifies is its own reviewable change, and
+folding a behaviour fix into a 530-commit catch-up would make both unreviewable. **What moved is
+startability, and only that.**
+
+**WHERE THE DEFECT SITS ON THAT BRANCH,** so the next builder does not re-find it. In
+`messagefoundry/store/sqlserver.py`, inside `probe_principal_privileges` at `:2917`: `:2980` returns
+`status=StorePrivilegeStatus.OBSERVED` unconditionally once the row is non-NULL, and `:2954`/`:2957`
+fold a NULL role result to False via `== 1`, which reads as *"not a member"* and therefore as clean.
+`:2988` and `:2989` fold `HAS_PERMS_BY_NAME` the same way -- **a limb this item's original scope did
+not name**, so a fix that repairs only the role columns would leave a direct `GRANT CONTROL SERVER`
+mis-read exactly as before. Sibling arms for comparison: `postgres.py:1245`, `store.py:4672`.
+`[store].require_least_privilege` remains `False` at `config/settings.py:569`, so the WARN-is-the-
+only-reachable-arm reading above still holds unchanged.
+
+**THE 328-BEHIND FIGURE ABOVE IS CORRECTED TO 530, AND THE DRIFT IS THE POINT.** Measured 2026-09-03
+at `origin/main`: `w3-store-privilege-preflight`, tip `94cb72e6`, dated 2026-08-11, is 4 ahead and
+**530 behind**. It was 328 behind when the amendment above was written and kept moving for the
+eleven days this row sat in the pool, which is the cost that amendment was warning about. The
+absence measurement was re-run and still held at carry time: `require_least_privilege` and
+`least_privilege` both return **zero** hits in any `.py` on `origin/main`. **Positive control,
+same instrument and ref: `require_managed_identity` returns hits across four `.py` files** -- a
+stronger control than the 2026-08-23 reading used, which established only that the instrument could
+find the word `store`.
+
+**THE ORIGINAL BRANCH WAS NOT REBASED IN PLACE AND WAS NOT FORCE-PUSHED.** PR #764 cherry-picks onto
+a NEW branch cut from current `main`. Three of the four commits were carried; the fourth is an empty
+coordination record correcting a false claim in the second, and that correction was applied to the
+carried commit message rather than carried as a commit of its own.
+`w3-store-privilege-preflight` is untouched and remains the only copy of the pre-carry history.
+
+**PROVENANCE.** Written by a builder, which `CLAUDE.md` section 5 assigns: the Builder owns *"the PR
+carrying the `BACKLOG.md` update"*. That supersedes the 2026-08-13 ruling cited at **#1235** that
+builders may not author ledger content -- the pre-2026-09-01 method it belonged to was replaced.
+
 ## 1235. a citation to an unallocated backlog number is a trap that arms itself the day the number is issued
 
 > ✅ **SHIPPED -- verified on main 2026-08-25.** The wiring limb landed at `b47c9fd9` (PR #560, sibling gate `backlog_citation_check.py` run in CI on documentation-only PRs). The header-falsification that kept this row must-not-close (2026-08-24 marker, below) is now corrected: `scripts/docs/dangling_citation_check.py`'s docstring on main states plainly, in its own words, "THIS SCRIPT IS RUN BY NO WORKFLOW AND NO PRE-COMMIT HOOK," distinguishes itself from the CI-wired sibling by name, and carries the wiring measurement with a positive control (this script: zero hits across `.github/` and `.pre-commit-config.yaml`; `backlog_status_check`/`ledger_check`/`scan_forbidden`: 3/2/3). That content is on main by a non-ancestor commit (`06427921`) whose CONTENT matches exactly -- confirmed by direct read, not cited as an ancestor. The marker's stated condition ("the closing PR falsified the detector's own header and left it uncorrected") has cleared; retiring it below rather than leaving a cleared condition standing as a live blocker. 🚧 **Re-scored 2026-08-20 -> P3.** Value **4/10** · Difficulty **2/10** · _fill-in_. The rule and both coverage residuals landed, leaving one gap: the detector runs only inside pytest, which is skipped on documentation-only pull requests, and a citation is introduced by editing prose. Wiring it as a workflow step with a paired must-trip and must-not-trip arm is a small additive change on an existing gate seam, and the coverage bound stands regardless since the detector cannot see the private companion repository where the filed instances live. _(was 6/10 · 2/10.)_
