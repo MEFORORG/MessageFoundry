@@ -55,6 +55,29 @@
     for a reason that has nothing to do with staleness. Every commit id here comes from
     `%(*objectname)` where it exists and `%(objectname)` otherwise.
 
+    AND THE AUDIT READS THREE KINDS OF NAMESPACE, NOT TWO, BECAUSE THE LARGEST ONE WAS MISSING.
+    Measured 2026-09-03: this checkout holds 266 refs under `refs/rescue`, 1405 under
+    `refs/tags/rescue` -- and 1505 under `refs/remotes/private/rescuetags`, which the first version
+    of this script never looked at. That namespace exists because `remote.private.fetch` carries
+    `+refs/tags/rescue/*:refs/remotes/private/rescuetags/*`, so ONE server-side tag arrives under a
+    SECOND local name. `git tag -l 'rescue/*'` cannot see it, which is how two readers each verified
+    a real object with an instrument structurally blind to the other's.
+
+    THE TWO KINDS ARE DIFFERENT MECHANISMS AND ARE REPORTED AS SUCH. A `refs/tags/rescue/*` ref is a
+    SNAPSHOT: nothing re-takes it, so a ref behind its branch is behind it forever. A
+    `refs/remotes/<remote>/rescuetags/*` ref is PUSH-UPDATED: the durability hook force-moves it on
+    every commit, so a ref behind its branch may merely be LAGGING and the next commit fixes it. One
+    reflog on such a ref shows six updates. Grading those two at one severity is the naming collapse
+    this whole item is about, so `mechanism` is a first-class field here and the report splits on it.
+
+    THE SOFTENING APPLIES ONLY WHILE THE BRANCH IS ALIVE. A push-updated ref whose branch is GONE
+    gets no further pushes, so its staleness is as permanent as a tag's. Mechanism therefore changes
+    the wording of BEHIND and DIVERGED and deliberately changes nothing about the branch-gone arms.
+
+    THE COUNTS OVERLAP ON PURPOSE. A tag and its remote-tracking mirror are two names for what may or
+    may not be one object, and 15 percent of the pairs measured for this item DISAGREED. Deduplicating
+    them would delete the finding.
+
 .EXAMPLE
     pwsh -NoProfile -File scripts\coord\rescue.ps1 -Anchor my-lane-before-rebase
     pwsh -NoProfile -File scripts\coord\rescue.ps1 -Check
@@ -87,6 +110,38 @@ $PROVENANCE = 'mefor-rescue-v1'
 $FS = [char]0x1F
 $RS = [char]0x1E
 
+#: The two mechanisms a rescue ref can be written by, and the difference decides how loudly a
+#: behind-its-branch ref should read. Named once here so no call site spells them differently.
+$SNAPSHOT = 'snapshot'
+$PUSH_UPDATED = 'push-updated'
+
+function Get-RescueNamespaces {
+    <#
+    EVERY NAMESPACE A RESCUE REF LANDS IN, WITH THE MECHANISM THAT WRITES IT.
+
+    The remote-tracking prefixes are derived from `git remote` rather than hardcoded, because the
+    remote's NAME is an operator's choice: this checkout calls it `private`, and nothing makes that
+    universal. Enumerating remotes costs one spawn and removes the guess.
+
+    A prefix that matches nothing is kept and reported as zero. That is the coverage rule this
+    directory already sets: a run that examined nothing and a run that examined everything must not
+    print the same reassuring line, and a namespace silently dropped for being empty is exactly how
+    a reader loses the ability to tell.
+    #>
+    $ns = [ordered]@{}
+    $ns['refs/rescue'] = $SNAPSHOT
+    $ns['refs/tags/rescue'] = $SNAPSHOT
+    foreach ($remote in (& git -C $repo remote)) {
+        $r = "$remote".Trim()
+        if (-not $r) { continue }
+        # `rescuetags` is what remote.<r>.fetch remaps refs/tags/rescue/* into here; `rescue` covers
+        # a mirror of the refs/rescue subtree under the same remote.
+        $ns["refs/remotes/$r/rescuetags"] = $PUSH_UPDATED
+        $ns["refs/remotes/$r/rescue"] = $PUSH_UPDATED
+    }
+    return $ns
+}
+
 function Get-RescueRecords {
     <#
     ONE `for-each-ref` FOR THE WHOLE AUDIT, AND THE REASON IS MEASURED. The first version of this
@@ -107,17 +162,30 @@ function Get-RescueRecords {
     `%(objectname)` is already the commit. Taking both and picking is why an annotated tag does not
     silently compare its TAG OBJECT against a branch tip.
     #>
+    param([System.Collections.Specialized.OrderedDictionary]$Namespaces)
+
+    $prefixes = @($Namespaces.Keys)
     $fmt = "%(refname)$FS%(objectname)$FS%(*objectname)$FS%(contents)$RS"
-    $raw = (& git -C $repo for-each-ref --format=$fmt refs/rescue refs/tags/rescue) -join "`n"
+    $raw = (& git -C $repo for-each-ref --format=$fmt $prefixes) -join "`n"
     foreach ($rec in ($raw -split [regex]::Escape($RS))) {
         if (-not $rec.Trim()) { continue }
         $f = $rec -split [regex]::Escape($FS)
         if ($f.Count -lt 3) { continue }
         $commit = if ($f[2].Trim()) { $f[2].Trim() } else { $f[1].Trim() }
+        $ref = $f[0].Trim()
+        # Longest match is not needed: no prefix here is a prefix of another. `refs/rescue` and
+        # `refs/remotes/<r>/rescue` are disjoint subtrees, and git's own prefix rule stops at a
+        # slash, so `refs/rescue` never claims `refs/rescuetags`.
+        $namespace = $null
+        foreach ($p in $prefixes) {
+            if ($ref -eq $p -or $ref.StartsWith("$p/")) { $namespace = $p; break }
+        }
         [pscustomobject]@{
-            ref      = $f[0].Trim()
-            commit   = $commit
-            contents = if ($f.Count -ge 4) { $f[3] } else { '' }
+            ref       = $ref
+            commit    = $commit
+            contents  = if ($f.Count -ge 4) { $f[3] } else { '' }
+            namespace = $namespace
+            mechanism = if ($namespace) { $Namespaces[$namespace] } else { 'unknown' }
         }
     }
 }
@@ -180,7 +248,8 @@ if ($PSCmdlet.ParameterSetName -eq 'Anchor') {
 # ---------------------------------------------------------------------------------------------
 # -Check
 # ---------------------------------------------------------------------------------------------
-$records = @(Get-RescueRecords)
+$namespaces = Get-RescueNamespaces
+$records = @(Get-RescueRecords -Namespaces $namespaces)
 $tips = Get-LocalBranchTips
 $rows = @()
 
@@ -188,6 +257,7 @@ foreach ($rec in $records) {
     $r = $rec.ref
     $commit = $rec.commit
     $body = $rec.contents
+    $mechanism = $rec.mechanism
     $selfDescribing = $body -match [regex]::Escape($PROVENANCE)
 
     $recordedBranch = $null
@@ -256,11 +326,25 @@ foreach ($rec in $records) {
             }
             elseif ($ahead -eq '0') {
                 $verdict = 'BEHIND'
-                $detail = "$behind commit(s) short of $branchName -- a snapshot older than its branch, NOT a defect"
+                # MECHANISM CHANGES THE SENTENCE, NEVER THE VERDICT. A snapshot behind its branch is
+                # behind it forever, because nothing re-takes it. A push-updated ref behind its
+                # branch is a different fact -- the hook force-moves it on the next commit -- and
+                # reporting the two in identical words is the collapse this item exists to name.
+                $detail = if ($mechanism -eq $PUSH_UPDATED) {
+                    "$behind commit(s) short of $branchName -- re-pushed as the branch moves, so this may merely be LAGGING"
+                }
+                else {
+                    "$behind commit(s) short of $branchName -- a snapshot older than its branch, NOT a defect"
+                }
             }
             else {
                 $verdict = 'DIVERGED'
-                $detail = "$behind behind / $ahead ahead of $branchName"
+                $detail = if ($mechanism -eq $PUSH_UPDATED) {
+                    "$behind behind / $ahead ahead of $branchName -- re-pushed, so the behind half may merely be LAGGING"
+                }
+                else {
+                    "$behind behind / $ahead ahead of $branchName"
+                }
             }
         }
     }
@@ -284,15 +368,28 @@ foreach ($rec in $records) {
 
     $rows += [pscustomobject]@{
         ref = $r; commit = $commit; verdict = $verdict
+        namespace = $rec.namespace; mechanism = $mechanism
         selfDescribing = [bool]$selfDescribing; wasTipAtCapture = $recordedWasTip; detail = $detail
+    }
+}
+
+#: Coverage, per namespace, including the ones that matched nothing. Built before the JSON branch so
+#: both outputs report the same thing.
+$coverage = @()
+foreach ($p in $namespaces.Keys) {
+    $coverage += [pscustomobject]@{
+        namespace = $p
+        mechanism = $namespaces[$p]
+        count     = @($rows | Where-Object namespace -eq $p).Count
     }
 }
 
 if ($Json) {
     [pscustomobject]@{
-        examined = $rows.Count
-        repo     = $repo
-        rows     = $rows
+        examined   = $rows.Count
+        repo       = $repo
+        namespaces = $coverage
+        rows       = $rows
     } | ConvertTo-Json -Depth 5
     exit 0
 }
@@ -301,11 +398,22 @@ $byVerdict = $rows | Group-Object verdict | Sort-Object Name
 
 Write-Host ""
 Write-Host "RESCUE REF AUDIT -- $repo"
-Write-Host "EXAMINED $($rows.Count) ref(s) across refs/rescue/ and refs/tags/rescue/."
+Write-Host "EXAMINED $($rows.Count) ref(s) across $($coverage.Count) namespace(s):"
+foreach ($c in $coverage) {
+    Write-Host ("  {0,6}  {1,-13} {2}" -f $c.count, $c.mechanism, $c.namespace)
+}
+Write-Host "  $SNAPSHOT      = a one-time capture. Nothing re-takes it, so staleness here is PERMANENT."
+Write-Host "  $PUSH_UPDATED  = force-moved by the durability hook, so a ref behind a LIVE branch may"
+Write-Host "                 merely be lagging. Once that branch is gone, nothing pushes again and"
+Write-Host "                 the two mechanisms are equally final."
+Write-Host "  The counts OVERLAP by construction: remote.<remote>.fetch remaps refs/tags/rescue/*"
+Write-Host "  into refs/remotes/<remote>/rescuetags/*, so one server-side object arrives under a"
+Write-Host "  second local name. They are not deduplicated -- the two names disagreeing is the"
+Write-Host "  finding, and folding them together would delete it."
 if ($rows.Count -eq 0) {
     Write-Host "  Zero refs examined. That is a fact about this repository, not a clean bill." -ForegroundColor Yellow
 }
-Write-Host ""
+Write-Host ("{0,-16} {1,10} {2,13}" -f 'verdict', $SNAPSHOT, $PUSH_UPDATED)
 foreach ($g in $byVerdict) {
     # SHORT-AT-CAPTURE is Gray with BEHIND, not Green with TIP: both are snapshots older than their
     # branch and neither is a defect, but neither is the outcome a reader hopes for either. Bare
@@ -318,7 +426,26 @@ foreach ($g in $byVerdict) {
         'ALTERED' { 'Red' }
         default { 'Yellow' }
     }
-    Write-Host ("{0,-16} {1}" -f $g.Name, $g.Count) -ForegroundColor $colour
+    $snap = @($g.Group | Where-Object mechanism -eq $SNAPSHOT).Count
+    $pushed = @($g.Group | Where-Object mechanism -eq $PUSH_UPDATED).Count
+    Write-Host ("{0,-16} {1,10} {2,13}" -f $g.Name, $snap, $pushed) -ForegroundColor $colour
+}
+
+$unknown = @($rows | Where-Object mechanism -eq 'unknown').Count
+if ($unknown -gt 0) {
+    # Cannot happen while every ref comes from an enumerated prefix, and is printed anyway: a row
+    # whose mechanism is unclassified would otherwise render as 0 and 0 and read as nothing at all.
+    Write-Host ""
+    Write-Host "$unknown ref(s) matched no known namespace and are MISSING from the split above." -ForegroundColor Red
+}
+
+$laggingBehind = @($rows | Where-Object { $_.verdict -eq 'BEHIND' -and $_.mechanism -eq $PUSH_UPDATED }).Count
+if ($laggingBehind -gt 0) {
+    Write-Host ""
+    Write-Host "$laggingBehind push-updated ref(s) sit behind a branch that still exists." -ForegroundColor Gray
+    Write-Host "  Read this one QUIETLY. The durability hook force-moves these on the next commit, so" -ForegroundColor Gray
+    Write-Host "  behind here is usually lag, not loss -- one such ref's reflog shows six updates. It is" -ForegroundColor Gray
+    Write-Host "  NOT the same finding as a snapshot behind its branch, which never catches up." -ForegroundColor Gray
 }
 
 $short = @($rows | Where-Object verdict -eq 'SHORT-AT-CAPTURE').Count
@@ -330,13 +457,20 @@ if ($short -gt 0) {
     Write-Host "  Nothing can compare them against anything now, so the recorded answer is the only one." -ForegroundColor Yellow
 }
 
-$unverifiable = @($rows | Where-Object verdict -eq 'UNVERIFIABLE').Count
-if ($unverifiable -gt 0) {
+$unverifiable = @($rows | Where-Object verdict -eq 'UNVERIFIABLE')
+if ($unverifiable.Count -gt 0) {
+    $uSnap = @($unverifiable | Where-Object mechanism -eq $SNAPSHOT).Count
+    $uPush = @($unverifiable | Where-Object mechanism -eq $PUSH_UPDATED).Count
     Write-Host ""
-    Write-Host "$unverifiable ref(s) are UNVERIFIABLE, which is NOT the same as healthy." -ForegroundColor Yellow
+    Write-Host "$($unverifiable.Count) ref(s) are UNVERIFIABLE, which is NOT the same as healthy." -ForegroundColor Yellow
     Write-Host "  They carry no recorded provenance and name no branch that still exists, so nothing" -ForegroundColor Yellow
-    Write-Host "  here can say what they hold. They predate -Anchor and cannot be retrofitted: the" -ForegroundColor Yellow
-    Write-Host "  information was never captured. Refs written by -Anchor stay verifiable after their" -ForegroundColor Yellow
-    Write-Host "  branch is deleted, which is the case a rescue ref exists for." -ForegroundColor Yellow
+    Write-Host "  here can say what they hold." -ForegroundColor Yellow
+    Write-Host "  $uSnap of them are $SNAPSHOT refs. Those CANNOT be retrofitted -- the information was" -ForegroundColor Yellow
+    Write-Host "    never captured and nothing re-takes a snapshot. Write new ones with -Anchor." -ForegroundColor Yellow
+    Write-Host "  $uPush of them are $PUSH_UPDATED refs, and this half HEALS ITSELF. The durability hook" -ForegroundColor Yellow
+    Write-Host "    now pushes an annotated tag object carrying the same provenance, so each of these" -ForegroundColor Yellow
+    Write-Host "    becomes readable on the next commit to the branch it tracks. A branch with no" -ForegroundColor Yellow
+    Write-Host "    further commits keeps its unverifiable ref, so the count falls with activity, not" -ForegroundColor Yellow
+    Write-Host "    with time." -ForegroundColor Yellow
 }
 exit 0
