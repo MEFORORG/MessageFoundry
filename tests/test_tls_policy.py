@@ -10,6 +10,7 @@ import ssl
 import types
 from itertools import product
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -26,6 +27,7 @@ from messagefoundry.config.tls_policy import (
     _is_forward_secret,
     _is_peer_authenticated,
     _is_strong_enough,
+    _weak_suite_labels,
     active_hop_posture,
     build_smtp_tls_context,
     current_hop_posture,
@@ -973,11 +975,12 @@ def test_harden_cipher_suites_raises_on_a_null_cipher_context() -> None:
 
 # --- BACKLOG #1166: the three properties above are still not enough ------------------------------
 #
-# What *-CCM8 is and why the earlier checks cannot see it is stated once, on _is_strong_enough, with
-# the suite census it was measured from. Recorded HERE and nowhere else:
+# What a truncated-tag suite is, and why the earlier checks cannot see it, is stated once on
+# _is_strong_enough -- along with the fact that WHICH suites carry that shape differs per OpenSSL
+# build. Recorded HERE and nowhere else:
 #
-# MEASURED at engine commit 2b8bccb43, BEFORE this gate: validate_tls_ciphers(
-# require_approved_suites=False) ACCEPTED a string naming all six sub-floor suites, and
+# MEASURED at engine commit 2b8bccb43 on Windows, BEFORE this gate: validate_tls_ciphers(
+# require_approved_suites=False) ACCEPTED a string naming the sub-floor suites that build offers, and
 # harden_cipher_suites ACCEPTED the resulting context. So both were live and neither asked.
 #
 # THE ITEM'S OWN REPRO IS STALE AND WAS RE-MEASURED FALSE. #1166 records that
@@ -985,42 +988,166 @@ def test_harden_cipher_suites_raises_on_a_null_cipher_context() -> None:
 # REFUSE it, because BACKLOG #1317 landed the NULL check after that measurement was taken. The gap
 # that survives is narrower and different, and it is the one pinned here.
 
-_WEAK_CIPHER = "ECDHE-ECDSA-AES256-CCM8"  # forward-secret, encrypting, authenticated, 64 bits
+# WHICH REAL SUITES ARE SUB-FLOOR IS A PROPERTY OF THE LINKED OPENSSL, NOT OF THIS GATE, AND THE
+# FIRST CUT OF THESE TESTS GOT THAT WRONG. It hardcoded ECDHE-ECDSA-AES256-CCM8 as a 64-bit suite,
+# which holds on the Windows build and NOT on ubuntu-latest, where the same name rates 256. Four
+# tests went red there, and the sharpest was the approved-list arm: it had been PASSING on Windows
+# because _APPROVED_TLS_SUITES refused the suite, not because this gate did. That is the same defect
+# class #1166 is about -- an assertion that passes for a reason other than the control it names.
+#
+# So the real-suite rows below DISCOVER a sub-floor suite on the build they are running on, and skip
+# with a reason naming that build when there is none. They never assert that one exists. The
+# synthesised rows after them carry the discrimination on EVERY platform, so a skip here cannot
+# quietly gut the proof.
 
 
-def test_the_weak_suite_defeats_all_three_earlier_predicates() -> None:
-    """The premise. If this ever stops holding, the strength check below is passing for the wrong
-    reason and the rows after it prove nothing."""
-    if not _ciphers_available(_WEAK_CIPHER):
-        pytest.skip(f"this OpenSSL build cannot resolve {_WEAK_CIPHER}")
-    probe = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-    probe.set_ciphers(f"{_WEAK_CIPHER}:@SECLEVEL=0")
-    entry = next(c for c in probe.get_ciphers() if c.get("name") == _WEAK_CIPHER)
+def _a_sub_floor_suite() -> str | None:
+    """A real suite on THIS OpenSSL that clears the three earlier checks and still rates below the
+    floor, or ``None`` if this build offers none. The gate's whole point is the gap between those
+    three predicates and the rating, so this looks for exactly that shape."""
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    try:
+        ctx.set_ciphers("ALL:COMPLEMENTOFALL:@SECLEVEL=0")
+    except ssl.SSLError:
+        return None
+    for c in ctx.get_ciphers():
+        if (
+            _is_forward_secret(c)
+            and _is_encrypting(c)
+            and _is_peer_authenticated(c)
+            and not _is_strong_enough(c)
+        ):
+            return str(c["name"])
+    return None
+
+
+def _weak_entry(name: str = "FAKE-ECDHE-WEAK", bits: int = 64) -> dict[str, object]:
+    """A synthesised cipher entry that clears all three earlier predicates and is sub-floor. Lets the
+    gate be tested where no real OpenSSL suite has this shape."""
+    return {
+        "name": name,
+        "description": f"{name} TLSv1.2 Kx=ECDH Au=RSA Enc=AESCCM8(256) Mac=AEAD",
+        "strength_bits": bits,
+        "alg_bits": 256,
+    }
+
+
+class _FixedSuiteContext(ssl.SSLContext):
+    """A real ``SSLContext`` whose resolved suite list is ours. Subclassed rather than duck-typed so
+    it satisfies ``harden_cipher_suites``' annotation and exercises the true call path."""
+
+    suites: list[dict[str, object]]
+
+    def get_ciphers(self) -> list[dict[str, object]]:  # type: ignore[override]
+        return self.suites
+
+
+def test_the_synthesised_weak_entry_defeats_all_three_earlier_predicates() -> None:
+    """The premise, asserted on an entry we control so it holds on every build. If this stops
+    holding, the strength gate is redundant and the rows below prove nothing."""
+    entry = _weak_entry()
     assert _is_forward_secret(entry) and _is_encrypting(entry) and _is_peer_authenticated(entry)
-    assert int(entry["strength_bits"]) < _MIN_TLS_STRENGTH_BITS
-    assert int(entry["alg_bits"]) >= _MIN_TLS_STRENGTH_BITS  # alg_bits would MISS this
+    assert not _is_strong_enough(entry)
+    assert int(entry["alg_bits"]) >= _MIN_TLS_STRENGTH_BITS  # type: ignore[arg-type]
+
+
+def test_harden_cipher_suites_raises_on_a_sub_floor_context_every_build() -> None:
+    """THE DISCRIMINATING ROW, and it runs everywhere. Drives the real function over a context whose
+    only suite is sub-floor."""
+    ctx = _FixedSuiteContext(ssl.PROTOCOL_TLS_SERVER)
+    ctx.suites = [_weak_entry()]
+    with pytest.raises(ValueError, match="bits of security"):
+        harden_cipher_suites(ctx, connector="test-weak")
+
+    # POSITIVE CONTROL in the same test: a strong synthesised suite passes, so the raise above is
+    # about the rating and not about the fake being rejected wholesale.
+    ctx.suites = [_weak_entry(bits=256)]
+    harden_cipher_suites(ctx, connector="test-strong")
+
+
+class _ShimmedSSL:
+    """Just enough of the ``ssl`` module for ``validate_tls_ciphers``' internal probe, with the
+    resolved suite list under our control.
+
+    Needed because that function builds its own context, so unlike ``harden_cipher_suites`` it takes
+    no injectable seam. Without this the strength branch of ``validate_tls_ciphers`` is covered ONLY
+    by the real-suite rows, and on a build that skips them a mutation deleting that branch goes
+    unnoticed -- measured vacuous before this was added."""
+
+    SSLError = ssl.SSLError
+    PROTOCOL_TLS_SERVER = ssl.PROTOCOL_TLS_SERVER
+
+    def __init__(self, suites: list[dict[str, object]]) -> None:
+        self._suites = suites
+
+    def SSLContext(self, _protocol: object) -> Any:  # noqa: N802 — mirrors the stdlib name
+        suites = self._suites
+
+        class _Probe:
+            def set_ciphers(self, value: str) -> None:
+                return None
+
+            def get_ciphers(self) -> list[dict[str, object]]:
+                return suites
+
+        return _Probe()
 
 
 @pytest.mark.parametrize("require_approved", [True, False])
-def test_validate_tls_ciphers_rejects_a_sub_128_bit_suite(require_approved: bool) -> None:
-    """Both call shapes, and the ``False`` one is the point: it is the ``proxy_tls_ciphers``
-    declaration path, where the allow-list deliberately does not run and this gate is the only thing
-    left between an operator and a declared 64-bit floor."""
-    if not _ciphers_available(_WEAK_CIPHER):
-        pytest.skip(f"this OpenSSL build cannot resolve {_WEAK_CIPHER}")
+def test_validate_tls_ciphers_rejects_a_sub_floor_suite_every_build(
+    monkeypatch: pytest.MonkeyPatch, require_approved: bool
+) -> None:
+    """THE DISCRIMINATING ROW for the other gate, and it runs everywhere.
+
+    The ``True`` shape also pins the ORDER, which is the part that bit: on Windows the first cut
+    passed because ``_APPROVED_TLS_SUITES`` refused the suite, and the ubuntu run proved it by
+    showing the allow-list message where the strength message was expected. The strength check runs
+    FIRST, so an operator is told the real reason rather than a bare 'not on the list'."""
+    monkeypatch.setattr(tls_policy, "ssl", _ShimmedSSL([_weak_entry()]))
     with pytest.raises(ValueError, match="bits of security"):
-        validate_tls_ciphers(
-            f"{_WEAK_CIPHER}:@SECLEVEL=0", require_approved_suites=require_approved
+        validate_tls_ciphers("anything", require_approved_suites=require_approved)
+
+
+def test_validate_tls_ciphers_accepts_a_strong_synthesised_suite(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """POSITIVE CONTROL for the row above: with the same shim and a strong entry it returns, so the
+    raise there is about the rating and not about the shim."""
+    strong = _weak_entry(name="ECDHE-RSA-AES256-GCM-SHA384", bits=256)
+    monkeypatch.setattr(tls_policy, "ssl", _ShimmedSSL([strong]))
+    assert validate_tls_ciphers("anything", require_approved_suites=False) == "anything"
+
+
+def test_weak_suite_labels_reports_the_offenders_with_their_ratings() -> None:
+    """The collector both gates share. Names and ratings, strong entries omitted."""
+    resolved = [_weak_entry("A", 64), _weak_entry("B", 256), _weak_entry("C", 112)]
+    assert _weak_suite_labels(resolved) == ["A (64 bits)", "C (112 bits)"]
+
+
+@pytest.mark.parametrize("require_approved", [True, False])
+def test_validate_tls_ciphers_rejects_a_real_sub_floor_suite(require_approved: bool) -> None:
+    """Both call shapes over a REAL suite, when this build has one. The ``False`` shape is the point:
+    it is the ``proxy_tls_ciphers`` declaration path, where the allow-list deliberately does not run
+    and this gate is the only thing left. On a build with no sub-floor suite this skips rather than
+    asserting the inventory -- the row above carries the proof there."""
+    name = _a_sub_floor_suite()
+    if name is None:
+        pytest.skip(
+            f"this OpenSSL ({ssl.OPENSSL_VERSION}) offers no suite that clears forward secrecy, "
+            f"encryption and peer authentication while rating below {_MIN_TLS_STRENGTH_BITS} bits"
         )
-
-
-def test_harden_cipher_suites_raises_on_a_sub_128_bit_context() -> None:
-    if not _ciphers_available(_WEAK_CIPHER):
-        pytest.skip(f"this OpenSSL build cannot resolve {_WEAK_CIPHER}")
-    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-    ctx.set_ciphers(f"{_WEAK_CIPHER}:@SECLEVEL=0")
     with pytest.raises(ValueError, match="bits of security"):
-        harden_cipher_suites(ctx, connector="test-weak")
+        validate_tls_ciphers(f"{name}:@SECLEVEL=0", require_approved_suites=require_approved)
+
+
+def test_harden_cipher_suites_raises_on_a_real_sub_floor_context() -> None:
+    name = _a_sub_floor_suite()
+    if name is None:
+        pytest.skip(f"this OpenSSL ({ssl.OPENSSL_VERSION}) offers no sub-floor suite")
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    ctx.set_ciphers(f"{name}:@SECLEVEL=0")
+    with pytest.raises(ValueError, match="bits of security"):
+        harden_cipher_suites(ctx, connector="test-weak-real")
 
 
 def test_is_strong_enough_fails_closed_on_an_ungradeable_entry() -> None:

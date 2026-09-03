@@ -617,14 +617,22 @@ def _is_strong_enough(cipher: Mapping[str, object]) -> bool:
     """Whether OpenSSL rates the suite at or above :data:`_MIN_TLS_STRENGTH_BITS`.
 
     **The property the three predicates above cannot see, and the one place it is explained.** Reads
-    ``strength_bits``, which is OpenSSL's own rating and is NOT ``alg_bits``: the six ``*-CCM8``
-    suites report ``alg_bits`` 128 or 256 with ``strength_bits`` **64**, because an 8-octet
-    authentication tag caps the integrity strength whatever the cipher key is. They are
-    forward-secret, encrypting and peer-authenticating, so every earlier check passes them. Measured
-    at engine commit 2b8bccb43 on CPython 3.14.6 / OpenSSL 3.5.7: of the 158 suites offerable at
-    ``@SECLEVEL=0``, 80 survive those three checks, and exactly those six of the 80 sit below 128
-    bits. The rest are 128 or 256, so this refuses nothing any supported configuration selects --
-    the shipped default resolves to 128 and 256 only.
+    ``strength_bits``, which is OpenSSL's own rating and is NOT ``alg_bits``: a ``*-CCM8`` suite can
+    report ``alg_bits`` 128 or 256 with ``strength_bits`` **64**, because an 8-octet authentication
+    tag caps the integrity strength whatever the cipher key is. Such a suite is forward-secret,
+    encrypting and peer-authenticating, so every earlier check passes it.
+
+    **WHICH suites this catches is a property of the linked OpenSSL, not of TLS, and the two builds
+    in CI disagree.** Measured at engine commit 3004b10e5: on Windows (CPython 3.14.6 / OpenSSL
+    3.5.7) all ten visible ``*-CCM8`` suites rate 64, and six of the 80 suites surviving the three
+    checks above sit below 128. On the ubuntu-latest runner the same
+    ``ECDHE-ECDSA-AES256-CCM8`` rates **256**, so the sub-floor population there is different and may
+    be empty. Do NOT restate either census as a fact about the product: this gate is a floor on
+    whatever the local OpenSSL reports, and the set it bites on varies. A first cut of the tests
+    asserted the Windows census and went red on ubuntu for exactly that reason.
+
+    It refuses nothing any supported configuration selects on either build -- every default context
+    shape resolves to 128 and 256 only, which is asserted rather than assumed.
 
     Fails closed on a missing or non-integer rating. A cipher dict we cannot grade must not pass; a
     predicate that shrugged would report success on precisely the shapes it was added to catch."""
