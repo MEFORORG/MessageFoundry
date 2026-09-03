@@ -19940,3 +19940,63 @@ That is the same `self._lock` the staged-pipeline handoffs take. On a first depl
 **PARTLY CLOSED ALREADY, AND THE CLOSURE SITS IN THE WRONG ARTIFACT.** The full record -- both questions, all eight options, both answers quoted -- is [comment 5515263760 on PR 749](https://github.com/MEFORORG/MessageFoundry/pull/749#issuecomment-5515263760), written 2026-09-02. A pull-request comment is a real improvement on a session transcript, which does not survive its session. It is still not the ADR, and the ADR is what a reader consults. **This limb differs from the first two in shape:** closing it needs no decision about the engine, only the record moved into the artifact people actually read.
 
 **THE GENERAL PROBLEM, stated once so it is not re-derived per incident.** A decision recorded as an outcome plus a delegation is not reviewable. The inputs -- the question, the options, the answer -- are what let a later reader tell a considered call from an arbitrary one, and they are exactly the part that lives in the least durable place.
+
+## 1435. docs/testing has no checkout-side marker, so a vaulted path reads as unstarted work
+
+> 🚧 **Filed 2026-09-03. The marker is built; the gate is researched and deliberately NOT built.** Value **5/10** · Difficulty **2/10** for what shipped, **6/10** for what is left. A documentation and process defect, not a product exposure: MessageFoundry has zero deployments, nothing here reaches an operator, and no impact claim below is present-tense about a running site.
+
+**The defect, in one sentence: from an engine checkout, work that is UNREADABLE is indistinguishable from work that is UNSTARTED.**
+
+`git ls-files docs/testing` returns one file, and `/docs/security/` is blanket-ignored at `.gitignore:177`. The real documents live in the vault clone. So a reader who greps a cited path, finds nothing, and concludes the work was never done is reasoning correctly from everything the tree shows them, and reaching a false conclusion.
+
+**The measured instance, and it carries its own proof.** #1011 step 6 told a reader to mark SEC-71 discharged in a path under `docs/testing/`, and called that file *"currently the only place in the repo that records the true state"*. That sentence is false from any engine checkout, because the file is not in the repo at all. A builder acting on it would have claimed a criterion it could never read. Corrected in the same change that filed this item; both citations in #1011 now name the unreadability in the same breath as the path.
+
+Two peer fleets hit the same wall independently on 2026-09-03, on #1152 and on #1193, and a third case put half an availability strategy in a vaulted document under #1191. Three sessions worked it out unaided. The next one may not, and a better brief does not fix it, because the brief author hits the same blind spot.
+
+### What shipped here
+
+`docs/testing/README.md`, tracked through a second negation under `/docs/testing/*`. A reader standing in the directory, or browsing to it on GitHub, is told the material moved and told not to read absence as evidence. `docs/README.md` carries the same warning at the front door.
+
+**It is a POINTER and never an index.** It names no vaulted document. A path-to-document map over a closed set discloses what is NOT covered by subtraction, which is the disclosure the gitignore exists to prevent. Keep it that way. The `docs/security/` half already has its rule in [`SECURITY-DOCS-POLICY.md`](SECURITY-DOCS-POLICY.md) and the marker links there rather than restating it.
+
+`tests/test_private_paths_stay_ignored.py` pins the pair as an exact set, so a third negation fails until someone writes down why, and the marker cannot be silently dropped from fresh clones.
+
+### The gate: researched, measured, and NOT built. This is the finding, not a shortfall.
+
+A test that reds when a ledger body cites a vaulted path without flagging it is the most durable shape and was the first choice. It does not survive contact with the corpus. All figures measured 2026-09-03 against `46ea10a78`, and they are measurements rather than targets.
+
+| Granularity | Detection | Result on the corpus |
+|---|---|---|
+| Per line | path pattern | 55 lines cite, 23 carry no flag on the same line |
+| Per line, about three lines of context | path pattern plus `THREAT-MODEL` and `asvs-scorecard` | 75 lines cite, 22 carry no signal (measured independently, two readers agreeing to the line) |
+| Per item body | path pattern | 27 items cite, 2 unflagged |
+| Per item body | path pattern plus `master-test-plan` | 32 items cite, 5 unflagged |
+| Per citation, plus or minus 300 to 1200 characters | path plus name | 15 to 21 items carry at least one unflagged citation |
+
+**Three findings, each independently enough to stop the build.**
+
+1. **An unscoped gate reds about 22 times on day one**, against a corpus nobody repairs in one pull request. It needs a grandfather baseline or a changed-lines-only scope before it is shippable at all.
+2. **The item-granularity gate is quiet and measures the wrong thing.** At 2 unflagged it would ship comfortably, and it MISSES #1152 — the case that motivated this item. #1152's body flags a different vaulted document (the scorecard) while leaving its master-test-plan clause unflagged, so the item passes while the defect stands. A gate that is quiet because it is aimed slightly wrong is worse than no gate.
+3. **"Cites a vaulted path" overfires, and the real predicate may not be expressible as a pattern.** Line 22 is prose ABOUT the arrangement, not a citation anyone must follow. A table row giving a cell count is permitted vocabulary. Neither is a defect. The actual predicate is **a citation a reader must FOLLOW in order to act**, which is a judgement about intent, and no regex tried here expresses it.
+
+**The window parameter is undefended.** Three lines is arbitrary; nobody has a reason for it, and a single-block rule already missed a stale assertion in `docs/SERVICE.md` on a peer's item. Treat 53 against 22 as an order of magnitude, not a threshold.
+
+**IF SOMEONE BUILDS THIS, THE FAILURE MESSAGE IS ALSO A DISCLOSURE SURFACE.** A message naming WHICH paths are vaulted publishes the map into CI logs and into the workflow file, both public. That is the enumerating-marker defect wearing different clothes, and the helpful-error-message instinct walks straight into it. A message of the shape *"this item body cites a maintainer-internal path; state in the body that it is unreadable from an engine checkout"* tells the author exactly what to do and discloses nothing. Do not echo the offending path into the message, the summary, or the annotation.
+
+### The two-sided controls, named, so nobody re-derives them
+
+A gate proven on one side proves nothing: one that fires on everything and one that fires on nothing both look green against a single-sided test.
+
+**Fires side (must red), and it is on `main` today:** `docs/BACKLOG.md` lines 4763 and 4771 before the correction in this change. Both named a `docs/testing/master-test-plan/` chapter, and 4763 instructed the reader to act in it. The cleanest true positive in the corpus, and independent of #1152. Recover the pre-correction text from this item's own commit.
+
+**Quiet side (must pass):** the remedy bodies on PR 804 (#1191) and PR 812 (#1193). **Both were still unmerged on 2026-09-03**, so a builder calibrating against `main` alone sees the UNFLAGGED versions and draws the wrong conclusion about what the remedy looks like. Read them with `gh pr diff 804` and `gh pr diff 812`. #1191 is the sharper of the two: it records that the availability inventory is vaulted AND records that its builder deliberately did not add a read-side anchor to the public `_RESOURCE_ANCHORS` registry, because the registry is public and the document is not, so the anchor would red a tree nobody in an engine checkout can see or repair.
+
+Both are the shape a gate must PERMIT. An unflagged citation is the defect; a flagged one is the remedy the gate exists to produce.
+
+### What is left
+
+- Decide whether the follow-to-act predicate is expressible. If it is not, that is a finding and this item closes on the marker.
+- If it is, scope the gate to changed lines or grandfather the day-one population, and prove it on both controls above.
+- The `docs/security/` half has no marker of its own. `/docs/security/` is a blanket rule, so a placeholder there needs a deliberate gitignore negation. Judged not worth it here: [`SECURITY-DOCS-POLICY.md`](SECURITY-DOCS-POLICY.md) already states that rule in a tracked file and says how to request the material, and a second marker would restate a load-bearing fact instead of linking to it.
+
+**Related:** #1011 (the corrected instance), #1152, #1191 and #1193 (the three peer cases), #1244 (an engine change breaking a vault anchor produces no attribution — the same public-repo-cannot-see-the-vault shape, from the other direction).
