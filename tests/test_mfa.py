@@ -18,7 +18,12 @@ from _totp_clock import fresh_totp, pin_totp_clock
 from messagefoundry.auth import totp
 from messagefoundry.auth.identity import Identity
 from messagefoundry.auth.ldap import AdPrincipal
-from messagefoundry.auth.notifications import MFA_DISABLED, MFA_ENABLED, SecurityEvent
+from messagefoundry.auth.notifications import (
+    MFA_DISABLED,
+    MFA_ENABLED,
+    RECOVERY_CODE_USED,
+    SecurityEvent,
+)
 from messagefoundry.auth.service import AuthService
 from messagefoundry.config.settings import AuthSettings
 from messagefoundry.store.store import MessageStore
@@ -329,6 +334,135 @@ async def test_recovery_code_consume_is_atomic_under_concurrency() -> None:
         results = await asyncio.gather(*(service.verify_mfa(t, codes[0]) for t in tokens))
         assert sum(1 for r in results if r) == 1  # exactly one caller wins the single-use code
         assert (await service.mfa_status(identity)).recovery_codes_remaining == 2  # consumed once
+    finally:
+        await store.close()
+
+
+# --- BACKLOG #1139 / ASVS 6.3.7: spending a recovery code -----------------------
+#
+# Consuming a single-use recovery code permanently DELETES a stored credential. It used to emit only
+# the generic ``auth.mfa_verified`` row the caller writes, which carries no detail -- leaving the burn
+# byte-indistinguishable from an ordinary TOTP verify, on the event that most often means the holder
+# lost their authenticator or somebody else has their codes.
+
+
+async def test_spending_a_recovery_code_is_audited_distinguishably_and_notified() -> None:
+    store = await _store()
+    try:
+        notifier = _FakeNotifier()
+        service = AuthService(
+            store, AuthSettings(mfa_recovery_code_count=2), security_notifier=notifier
+        )
+        identity, token, password = await _bootstrap_login(service)
+        await store.update_user_profile(
+            identity.user_id, display_name=None, email="admin@example.org"
+        )
+        enroll = await service.begin_mfa_enrollment(identity)
+        codes = await service.confirm_mfa_enrollment(
+            identity, fresh_totp(enroll.secret), token=token
+        )
+        assert codes is not None and len(codes) == 2
+
+        out = await service.login("admin", password)
+        assert out.token is not None
+        assert await service.verify_mfa(out.token, codes[0], client="10.0.0.7") is True
+
+        spent = [e for e in notifier.events if e.event_type == RECOVERY_CODE_USED]
+        assert len(spent) == 1
+        ev = spent[0]
+        assert ev.username == "admin"
+        assert ev.email == "admin@example.org"
+        assert ev.client_ip == "10.0.0.7"
+        assert ev.detail["remaining"] == 1
+
+        rows = [
+            r
+            for r in await store.list_audit(limit=50)
+            if r["action"] == "auth.mfa_recovery_code_used"
+        ]
+        assert len(rows) == 1
+        assert rows[0]["actor"] == "admin"
+        assert rows[0]["client"] == "10.0.0.7"
+        assert '"remaining": 1' in rows[0]["detail"]
+        # The code itself and its hash never reach the audit row or the notice.
+        assert codes[0] not in rows[0]["detail"]
+    finally:
+        await store.close()
+
+
+async def test_an_ordinary_totp_verify_spends_no_recovery_code_and_announces_nothing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The control the test above needs: without it, a records-on-every-verify implementation would
+    # pass and the audit log would still not tell the two mechanisms apart.
+    store = await _store()
+    try:
+        notifier = _FakeNotifier()
+        service = AuthService(
+            store, AuthSettings(mfa_recovery_code_count=2), security_notifier=notifier
+        )
+        identity, token, password = await _bootstrap_login(service)
+        enroll = await service.begin_mfa_enrollment(identity)
+        # Enrollment consumes its activating step (BACKLOG #1021), so the login verify has to sit in
+        # a strictly later one.
+        t0 = 1_700_000_000.0
+        pin_totp_clock(monkeypatch, t0)
+        assert (
+            await service.confirm_mfa_enrollment(
+                identity, totp.totp(enroll.secret, now=t0), token=token
+            )
+            is not None
+        )
+
+        out = await service.login("admin", password)
+        assert out.token is not None
+        t1 = t0 + totp.DEFAULT_PERIOD
+        pin_totp_clock(monkeypatch, t1)
+        assert await service.verify_mfa(out.token, totp.totp(enroll.secret, now=t1)) is True
+
+        assert [e for e in notifier.events if e.event_type == RECOVERY_CODE_USED] == []
+        assert [
+            r
+            for r in await store.list_audit(limit=50)
+            if r["action"] == "auth.mfa_recovery_code_used"
+        ] == []
+    finally:
+        await store.close()
+
+
+async def test_the_losing_racer_reports_no_second_consumption() -> None:
+    # One code, five concurrent verifies, one winner. Exactly one set of records must exist -- the
+    # obvious implementation (emit beside the store call, ignoring its return) writes five.
+    store = await _store()
+    try:
+        notifier = _FakeNotifier()
+        service = AuthService(
+            store, AuthSettings(mfa_recovery_code_count=3), security_notifier=notifier
+        )
+        identity, token, password = await _bootstrap_login(service)
+        enroll = await service.begin_mfa_enrollment(identity)
+        codes = await service.confirm_mfa_enrollment(
+            identity, fresh_totp(enroll.secret), token=token
+        )
+        assert codes is not None
+
+        outs = [await service.login("admin", password) for _ in range(5)]
+        tokens = [o.token for o in outs]
+        assert all(tokens)
+        results = await asyncio.gather(*(service.verify_mfa(t, codes[0]) for t in tokens))
+        assert sum(1 for r in results if r) == 1
+
+        assert len([e for e in notifier.events if e.event_type == RECOVERY_CODE_USED]) == 1
+        assert (
+            len(
+                [
+                    r
+                    for r in await store.list_audit(limit=50)
+                    if r["action"] == "auth.mfa_recovery_code_used"
+                ]
+            )
+            == 1
+        )
     finally:
         await store.close()
 

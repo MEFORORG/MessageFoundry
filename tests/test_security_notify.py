@@ -18,6 +18,7 @@ from messagefoundry.auth.notifications import (
     ACCOUNT_LOCKED,
     EMAIL_CHANGED,
     PASSWORD_CHANGED,
+    RECOVERY_CODE_USED,
     SecurityEvent,
 )
 from messagefoundry.config.settings import AlertsSettings
@@ -120,3 +121,51 @@ def test_body_names_the_new_address_on_a_repoint_and_does_not_say_removed() -> N
     )
     assert "New email on file: new@example.org" in body
     assert "removed" not in body.lower()
+
+
+def test_body_says_a_directory_repoint_came_from_the_directory() -> None:
+    """BACKLOG #1139 (ASVS 6.3.7): where the change came from decides what the reader can DO. A
+    directory-driven repoint is not editable in the console, so an unexplained one reads as a
+    compromise the holder cannot find a cause for."""
+    body = _build_body(
+        SecurityEvent(
+            EMAIL_CHANGED,
+            username="jdoe",
+            email="old@example.org",
+            detail={"new_email": "new@example.org", "source": "directory"},
+        )
+    )
+    assert "directory" in body.lower()
+
+
+def test_body_omits_the_directory_line_for_a_console_change() -> None:
+    """Control for the test above: a console-driven repoint carries no source, so the sentence must
+    not appear -- otherwise it would be emitted unconditionally and be false half the time."""
+    body = _build_body(
+        SecurityEvent(
+            EMAIL_CHANGED,
+            username="bob",
+            email="old@example.org",
+            detail={"new_email": "new@example.org"},
+        )
+    )
+    assert "directory" not in body.lower()
+
+
+def test_body_states_the_remaining_recovery_code_count() -> None:
+    """BACKLOG #1139 (ASVS 6.3.7): spending a recovery code permanently deletes a stored credential.
+    The count is what makes the notice actionable; the code and its hash never appear."""
+    body = _build_body(
+        SecurityEvent(RECOVERY_CODE_USED, username="bob", email="bob@x", detail={"remaining": 3})
+    )
+    assert "Recovery codes remaining: 3" in body
+    assert "spent" in body.lower()
+    assert "last recovery code" not in body.lower()  # only the zero arm says that
+
+
+def test_body_warns_when_the_last_recovery_code_is_spent() -> None:
+    body = _build_body(
+        SecurityEvent(RECOVERY_CODE_USED, username="bob", email="bob@x", detail={"remaining": 0})
+    )
+    assert "Recovery codes remaining: 0" in body
+    assert "last recovery code" in body.lower()

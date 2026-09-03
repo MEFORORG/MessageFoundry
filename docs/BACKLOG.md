@@ -8355,6 +8355,57 @@ filing.
 
 ## 1139. research an honest pass for ASVS 6.3.7 -- notifying a user whose authentication details the directory changed
 
+> **PARTIAL 2026-09-03, NOT A CLOSURE -- this item stays OPEN.** Lands the write-path limb: every
+> remaining write that changes an account's authentication details now emits an audit row, and a
+> notice wherever an address exists.
+>
+> **FIRST, A CORRECTION TO THE 2026-08-20 RESEARCH: limb (1) IS ALREADY BUILT and was built by
+> someone else.** The research's own instrument, re-run at `c2237d783` -- a range scan of the target
+> region for `_audit(|_notify_security(` against the live positive control of three in the local
+> sibling `update_user` -- now returns **4** over the federated-subject region, not zero.
+> BACKLOG #1248 landed both records there, under a comment naming this requirement. The control read
+> 3 in the same run, so the scan was live. Nothing was built for that limb here, and the research
+> clause claiming it is silent is **superseded, not still open**.
+>
+> **Limb (2), `_upsert_ad_user`: the instrument still returns ZERO** against the same live control,
+> so the defect stood and is now fixed. It writes an audit row (`auth.ad_profile_email_changed`,
+> carrying the client address) and an `EMAIL_CHANGED` notice whenever the directory-supplied address
+> differs from the stored one. The notice goes to the **old** address where one exists, matching
+> `update_user`; where the account carried none, the new address is the only reachable party and
+> there is no earlier holder to protect, so it is the target rather than nobody. The notice body now
+> names the directory as the source, because a repoint the holder cannot edit in the console and
+> cannot find a cause for reads as a compromise. This method sits on the **shared** directory
+> completion path, so the fix serves the simple-bind, Kerberos and federated legs alike.
+>
+> **An absent directory attribute no longer erases a stored value.** `update_user_profile`'s write is
+> unconditional, so passing `principal.email` straight through let a directory returning no `mail`
+> blank the address -- and "returned no `mail`" covers an unset attribute, one the bind account
+> cannot read, and one trimmed from the search attribute list, none of which is a site asking for a
+> removal. The erase also removed the account from every later notice, since the address gate returns
+> early on an empty address. **The cost, stated:** a site that deliberately clears `mail` in the
+> directory no longer propagates that clear on the next login; an administrator can still clear the
+> address through `PATCH /users/{id}`, which is audited and notified, so only the silent path closed.
+>
+> **Limb (3), recovery-code consumption:** spending a single-use code now writes
+> `auth.mfa_recovery_code_used` with the remaining count and sends a `RECOVERY_CODE_USED` notice,
+> both only for the caller that actually won the atomic compare-and-delete. Before this the only row
+> was the detail-free `auth.mfa_verified` the caller writes, leaving a credential deletion
+> byte-indistinguishable from an ordinary TOTP verify.
+>
+> Nine tests, each verified to fail before the change (three of the four directory tests and both
+> recovery-code behaviour tests fail on unmodified code; the two that pass are deliberate silence
+> controls guarding against over-notification). `ruff` and `mypy --strict` clean.
+>
+> **THE RESIDUAL, and it is the honest-pass core.** Splitting the directory-mirror column from an
+> engine-owned notification address (`messagefoundry/store/store.py:1641` is the one nullable column
+> doing both jobs) is a schema and design change needing an owner ruling, and it is what actually
+> dissolves this item's research question. With it: making the address non-nullable or refusing a
+> clear of it, the first-login set-address step, generalising the startup assertion from "some
+> enabled Administrator" to every enabled account, the silent drop at
+> `messagefoundry/pipeline/security_notify.py:130-131`, and passkey-removal parity at
+> `messagefoundry/auth/service.py:2632`. Line numbers in the research below have all drifted;
+> re-measure before citing one.
+
 > **PARTIAL 2026-08-26 (lander), NOT A CLOSURE -- this item stays OPEN.** Lands the email-CLEAR limb:
 > `update_user_profile`'s notify guard read `if email is not None and email != before.email:`, whose
 > first conjunct silently skipped the clear -- and the clear is the one update that must be announced,
