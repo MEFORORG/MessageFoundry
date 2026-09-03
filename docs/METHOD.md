@@ -79,7 +79,8 @@ put the question in the PR body instead.
 
 You can declare your own seat, through the Bash tool. Measured 2026-09-02: a headless Builder ran
 `seat.ps1 -Declare` and its record carries `seatSource: declared`, which no hook writes. Quote the
-Windows path. Unquoted, Bash eats the backslashes and fails as if the script were missing.
+Windows path. Unquoted, the shell eats the backslashes, so `pwsh` reports the argument is not a
+script file and it reads as a missing script.
 
 The PowerShell tool refuses a nested `pwsh` with `Command spawns a nested PowerShell process which
 cannot be validated`. That is one tool's refusal, not the harness's. Use Bash.
