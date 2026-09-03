@@ -52,7 +52,7 @@ they are holes too. **#1297** is a hole for a different and instructive reason: 
 session's own worktree, so the ledger gate correctly refused the commit ("#1297 was not allocated to this
 worktree") and the item was re-filed at **#1298**. The gate did its job; the lesson is that `alloc.ps1`
 records the claim against **whatever tree it runs in**, so run it from the worktree that will commit.
-Always allocate with `scripts/coord/alloc.ps1`; never pick a number by reading this file.
+**#1424** is a hole for a third reason, and it is the one the branch fallback exists for but does not reach. It was allocated 2026-09-03 for the steer-inject folding work by a Builder in worktree `agent-ae993276907874405` on branch `worktree-agent-ae993276907874405`, and that session ended without filing anything. `ledger_check.py` keys ownership on the allocating worktree and falls back to the recorded BRANCH, but the fallback only matches a session standing ON that branch -- and here the recorded worktree still exists and has since moved to a different branch, so neither key can match a different session however dead the original one is. The gate refused the commit correctly and the item was re-filed at **#1428**. The lesson differs from #1297's: a number is usable only by the session that took it, so allocate when you are ready to file rather than ahead of the work. Always allocate with `scripts/coord/alloc.ps1`; never pick a number by reading this file.
 
 **If you allocated a backlog number before 2026-07-31T00:31Z, re-check it — the trigger is the
 timestamp, not the value.** That is when the floor fix landed. Any number issued before it came from a
@@ -19940,3 +19940,49 @@ That is the same `self._lock` the staged-pipeline handoffs take. On a first depl
 **PARTLY CLOSED ALREADY, AND THE CLOSURE SITS IN THE WRONG ARTIFACT.** The full record -- both questions, all eight options, both answers quoted -- is [comment 5515263760 on PR 749](https://github.com/MEFORORG/MessageFoundry/pull/749#issuecomment-5515263760), written 2026-09-02. A pull-request comment is a real improvement on a session transcript, which does not survive its session. It is still not the ADR, and the ADR is what a reader consults. **This limb differs from the first two in shape:** closing it needs no decision about the engine, only the record moved into the artifact people actually read.
 
 **THE GENERAL PROBLEM, stated once so it is not re-derived per incident.** A decision recorded as an outcome plus a delegation is not reviewable. The inputs -- the question, the options, the answer -- are what let a later reader tell a considered call from an arbitrary one, and they are exactly the part that lives in the least durable place.
+## 1428. steer-inject.ps1 puts an unfolded file value inside a frame asserting the owner typed it
+
+> 🚧 **Filed 2026-09-03 -- fix written, PR pending; the banner flip is the lander's.** `scripts/hooks/steer-inject.ps1` read `<project>\.claude\steer.txt` whole and interpolated it, **unfolded**, into a bracketed frame that tells the reading agent *"the user just typed this via a side channel"*. The value was `.Trim()`ed and otherwise untouched, so **one line break closed that frame and opened whatever the note put next**. What a forged frame carries here is an assertion of **owner authority** -- the one authority that overrides everything else an agent has been told -- which makes it a stronger surface than the hook deny text #1040 treated. **Scored 2026-09-03.** Value **6/10** - Difficulty **2/10** - _quick win_: the remedy already existed twice in this repository and nothing had to be invented.
+> Verdict: build
+> Research: none
+> Closing-act: code
+
+**Cluster:** coordination tooling / gate integrity. **Priority:** P2. **Verdict:** build.
+**Severity:** no product axis (sec. 0). This is a maintainer-workstation surface, not a product one. The engine ships none of these scripts, no deployment is exposed by them, and there is nothing here for a remote party to reach.
+
+**PROVENANCE, AND THE NUMBER THIS ROW IS NOT.** This work was first allocated **#1424** by a Builder that ended without filing. That number is not usable by any other session -- the ledger gate refused a commit citing it -- so it is a permanent hole, recorded in the Ledger erratum at the top of this file. **Do not read a citation of #1424 as a pointer to this row**; there is no item #1424 and there never will be.
+
+**WHO THE ACTOR IS, SAID PLAINLY SO THE ROW IS NEITHER INFLATED NOR DEFLATED.** The note file is written by anything running as this user on this machine, so the realistic writer is a stray process or another agent -- and an agent writing into another agent's context is exactly the traffic this box carries all day. It is a real forged-authority surface. It is not a product exposure.
+
+**The hook is opt-in and unregistered in the shared `.claude/settings.json`**, so it fires only in a worktree whose `.claude/settings.local.json` arms it. That bounds who was reachable; it does not change the shape of the defect, and an occasional-use channel is not a safer one.
+
+### The treatment already existed in two siblings, so this row follows them rather than inventing one
+
+| sibling | what it does |
+|---|---|
+| [`scripts/hooks/mail-drain.ps1`](../scripts/hooks/mail-drain.ps1) | Prefixes every content line `    \| ` in `Format-Body`, the one place a body becomes lines, and **states the rule in its own frame**: message content cannot reach column 0, so a line inside a message that looks like a delimiter is quoting one rather than opening one. |
+| [`scripts/hooks/usage-headroom-inject.ps1`](../scripts/hooks/usage-headroom-inject.ps1) | Folds every file-derived value through `Get-Folded` before it reaches prose, and cites #1040 by number for why. |
+
+The mail-drain treatment is the stronger of the two, because a fold alone still leaves the reader unable to tell the hook's lines from the note's. It is the model this row adopts.
+
+**THERE IS DELIBERATELY NO LIST OF FORBIDDEN STRINGS.** A denylist of framing tokens is a completeness claim (CLAUDE.md section 11) that has to be re-proved every time the harness gains a new frame. A structural prefix defends against framing nobody has invented yet.
+
+### What the PR carrying this row changes
+
+1. Every line of the note is folded -- control characters and newlines to a space, remaining non-ASCII to `?` (substitution, never deletion, so a zero-width character cannot join its neighbours into a delimiter), whitespace runs collapsed -- then prefixed `    | `.
+2. The frame **says what the prefix guarantees**, because a containment rule the reader was never told about protects nobody: the reader is the thing being protected, and it can only act on a rule it has.
+3. The frame states provenance as a **claim rather than evidence**. A file any local process can write is not proof the operator typed anything, so the note may redirect the work and may not stand in for the owner's approval. [`docs/STEERING.md`](STEERING.md) already said this; the hook contradicted it.
+4. Two caps bound one note: 240 characters per line (matching mail-drain) and 4,000 bytes for the whole rendered note, charged **after** the prefix so the cap bounds what actually arrives. A truncated note says how much was queued and how much was shown, and says the remainder is gone.
+5. **Fail-safe behaviour is unchanged.** Missing file, blank file, absent `CLAUDE_PROJECT_DIR`, unreadable queue, any error: exit 0, emit nothing. A `PreToolUse` hook that can deny is worse than no hook. The note file is still consumed and deleted on read, so delivery stays exactly-once.
+
+### The proof is three arms, and the third is what makes the first two worth anything
+
+[`tests/test_steer_inject.py`](../tests/test_steer_inject.py) drives the real script as a subprocess and asserts on the emitted `additionalContext`:
+
+1. **A forged frame renders as inert content.** A note carrying a line break plus a replica of this hook's own frame emits exactly one line that opens a frame -- the hook's own, at index 0 -- and the forged copy survives on a `    | ` line. Both halves are asserted: dropping it would be a silent censor, and rendering it at column 0 would be the defect.
+2. **An ordinary note is untouched.** A single-line note renders as exactly one prefixed line with its text intact; a multi-line note keeps its paragraphs. A fold that mangles legitimate notes has replaced one defect with another.
+3. **Mutation check.** The test reverts the fold call in a scratch copy of the real script and requires arm 1's assertion to **flip**: the unfolded copy must emit a second frame opener at column 0. A test that passes against the fixed and the unfixed hook alike measures nothing -- the "control that cannot fire" shape #1313 found in the sdist leak gate. The substitution asserts it matched exactly once, so a mutation point that moves fails loudly rather than passing by doing nothing.
+
+### Not to be conflated with #1040
+
+#1040 is the general row over **hook deny text** -- prose a gate emits to refuse a tool call, which an agent is then instructed to act on. This is an **injection** surface rather than a refusal: nothing is being denied, and the frame is not a remediation block but an assertion about who is speaking. The lesson transfers; the row does not. Do not fold this into #1040's remaining scope or read #1040's closure as covering it.
