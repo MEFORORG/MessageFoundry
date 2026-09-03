@@ -17610,6 +17610,46 @@ AND IT SHIPS THE SUBJECT: install-selfheal.ps1 and worktree-selfheal.ps1 are bot
 
 ## 1379. the -C precedence and PowerShell environment-assignment classes reach the governed shared config on both gates, and no rule models either
 
+> 🚧 **CLASS TWO BUILT 2026-09-03, NOT YET ON MAIN.** Branch `claude/gate-gitdir-1379`, commit
+> `b08260fad`. Deliberately NOT flipped to closed: a closure banner in this file asserts a verified
+> landing, and this has none. Whoever merges it should flip the banner with a real `main` sha.
+>
+> **WHAT SHIPPED, AND IT IS STATE RATHER THAN A PATTERN, exactly as the filing demands.** Each scan
+> segment now carries `Prior` -- the BLANKED text of everything that ran before it -- and a new
+> `Resolve-CarriedGitDir` folds that plus the current segment up to the write into one literal value.
+> The value becomes one more candidate, ranked where git ranks it: behind a repository token on the
+> disarming invocation itself, ahead of `-C` and the cwd. Reading the BLANKED scan rather than the raw
+> line is what keeps it honest -- an assignment inside a commit message or an alias value is data.
+>
+> **MEASURED BY DRIVING THE COMMITTED GATE, 32 rows, against the same rows on the pre-fix gate.** All
+> three PowerShell spellings now DENY on the same line, across a newline, and through the Bash tool;
+> the POSIX-spelled control still DENIES. Consequences were read back out of the target repository
+> rather than inferred from a verdict, in both directions.
+>
+> **IT CORRECTS A FALSE DENY TOO, and that is the only row that moves DENY to ALLOW.** A carried
+> variable naming an UNGOVERNED repository, from a GOVERNED cwd, was refused while the write really
+> landed in the ungoverned repo -- the #1085 shape. Same root cause as the fail-open, so this is a
+> reorder rather than a widening.
+>
+> **THE POSIX CARRYING SPELLING WENT WITH IT.** `export GIT_DIR=<governed>/.git; git config <key> v`
+> was open for the identical reason -- the rule's window starts after the separator -- and closing the
+> PowerShell spellings alone would have filed the same defect twice.
+>
+> **EVERY CONSTRAINT ROW WAS CONFIRMED ABLE TO FAIL, by mutating the code it constrains.** Ten
+> mutations; the ones that matter: gating the carried value on the existing ordering switch reddens 13
+> rows, folding raw text instead of blanked reddens the mention-in-a-message row, removing the bound at
+> the write reddens the assignment-after row, and leaking the value into rule 3 reddens the
+> `reset --hard` row. **Two rows are recorded as NOT independently falsifiable** rather than left
+> looking like coverage: the computed-value guard is defence in depth (the candidate chain already
+> falls through on a path git rejects), and the rule-3d row keys on the worktree being removed rather
+> than on the candidate list. Both say so in their own docstrings.
+>
+> **KNOWN RESIDUALS, pinned as known rather than asserted as correct:** a repository path CONTAINING A
+> SPACE stays masked by `Remove-QuotedSpans` and carries nothing (inherited from the #1069 carve-out);
+> a computed value carries nothing by design; `[Environment]::SetEnvironmentVariable` is not modelled;
+> and a variable set by a PREVIOUS TOOL CALL is unreachable, because each call is its own process and
+> the gate holds one command. No matcher closes that last one either.
+
 > 🔢 **Filed 2026-08-28 (lander) - INHERITED, not introduced; both are allowed on the pre-fix gate too.**
 >
 > **Scored 2026-09-03 -> P2.** Value **6/10** · Difficulty **4/10** · _quick win_. Partly shipped: class one is closed, class two is live, and I measured both by driving the committed gate. git -C <ungoverned> --git-dir=<governed>/.git config core.hooksPath now DENIES (worktree_gate.ps1:635-650, pinned at tests/test_worktree_gate_control_plane.py:1438), while all three PowerShell spellings of class two ALLOW, same line, same line through the Bash tool, and across a newline, against a POSIX-spelled control on the same command that DENIES. I then proved the consequence rather than the verdict: with $env:GIT_DIR set, git config wrote my probe key into the governed repo's shared config and not into the ungoverned repo I was standing in, so the rule that exists to stop a shared core.hooksPath disarm is reachable by the spelling this fleet's primary shell uses. No matcher can be widened into it, which is the value: worktree_gate.ps1:614 and :1730 both require whitespace or line start before GIT_DIR, Get-LiteralAssignments at :390 resolves only POSIX NAME=VALUE and cmd set, and the rule-3c window at :1720-1729 begins after the separator. Difficulty lowered from 5 to 4 because landing it means threading environment state across statements and lines in a 2840-line PowerShell file and re-measuring the corpus, with no dependency, no mypy-strict surface and no store backends, which sits one band above the single-function remainder in the same gate scored 3 at docs/BACKLOG.md:280.
