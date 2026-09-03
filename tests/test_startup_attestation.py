@@ -533,6 +533,43 @@ def test_a_swap_of_line_endings_AFTER_install_is_still_drift(
     assert [(d.path, d.reason) for d in result.drift] == [(asset, "hash_mismatch")]
 
 
+def test_a_corpus_that_SHIPPED_empty_is_not_drift(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """THE BOUNDARY OF THIS CONTROL, asserted rather than left to be discovered.
+
+    This tripwire compares an installed file to the wheel it came from, so it catches tampering
+    **after** install and nothing else. A wheel BUILT with an already-truncated corpus ships an empty
+    file and a RECORD row describing an empty file. They match. Attestation is silent, and is right to
+    be: nothing drifted.
+
+    So a poisoned *build* is invisible here by construction, and no amount of widening
+    :data:`_ATTESTED_ASSETS` reaches it. That case belongs to the consumer, which grades the parsed
+    result rather than the bytes -- an empty corpus screens nothing however faithfully it was shipped.
+    The two controls are complements: this one sees a post-install edit that leaves a plausible corpus
+    behind, the consumer sees an implausible corpus however it arrived, and neither subsumes the other.
+
+    Asserting ``clean`` here also pins the layering. A future editor who adds "the corpus must be
+    non-empty" to this module fails this test, which is the intended answer: that check belongs where
+    the corpus is read, not where wheels are attested.
+    """
+    pkg = "mfengine"
+    asset = f"{pkg}/auth/data/common_passwords.txt"
+    dist, loaded = _build_wheel_install(
+        tmp_path,
+        pkg=pkg,
+        files={f"{pkg}/__init__.py": b"VERSION = '1.0'\n"},
+        assets={asset: b""},  # the wheel itself carries a neutered corpus
+    )
+    _patch(monkeypatch, dist, loaded, pkg, assets=((tmp_path / asset).resolve(),))
+
+    result = attest_engine()
+    assert result.ok and result.drift == []
+    assert result.checked == 2, (
+        "the empty asset is still HASHED, it simply matches its own baseline"
+    )
+
+
 def test_declared_assets_exist_in_the_shipped_package() -> None:
     """THE ROT GUARD, and the one test here that runs against the REAL package.
 

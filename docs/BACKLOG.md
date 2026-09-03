@@ -20009,7 +20009,11 @@ That is the half this closes: the installed bytes are now compared to the wheel 
 
 ### What this does NOT buy, so the tripwire is not over-read
 
-Detection, not containment. On the shipped configuration the #1432 attack still succeeds; it is merely no longer silent. Four limits, none of them new to this item and all of them inherited from the tripwire's existing posture:
+Detection, not containment. On the shipped configuration the #1432 attack still succeeds; it is merely no longer silent. **Five limits. The fifth is the load-bearing one and is not a posture question at all** -- it is what this control can see in principle, and no amount of widening the attested set reaches it:
+
+0. **A poisoned BUILD is invisible here, by construction.** The comparison is installed-file against the wheel it came from, so a wheel built with an already-truncated corpus ships an empty file **and** a `RECORD` row describing an empty file. They match, and attestation is correctly silent because nothing drifted. Measured, not reasoned: a fabricated install carrying a zero-byte corpus with a matching baseline attests clean over two hashed files. Pinned as `test_a_corpus_that_SHIPPED_empty_is_not_drift`, which asserts the silence deliberately -- an editor who later adds a non-empty check to `integrity.py` fails that test, and should, because grading the corpus belongs where the corpus is read. Credit to the concurrent fail-closed lane, which named this seam before this row did.
+
+The other four are posture, inherited from the tripwire as it already stood:
 
 1. **Alert-only is the default.** With `[integrity].fail_closed_on_drift` unset the corpus is emptied, the alert fires, and breach screening stays a no-op for the life of the process. Only the opt-in refusal actually stops it.
 2. **Editable installs and source-tree runs are a no-op.** Those deployments get nothing from this.
