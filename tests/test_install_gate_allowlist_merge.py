@@ -8,10 +8,13 @@ resolves to exactly ONE repo -- the main worktree, via ``git worktree list`` -- 
 allowlist named two roots (measured live: the engine checkout AND the vault clone) a bare re-install
 DROPPED one.
 
-AND A DROPPED ROOT FAILS OPEN SILENTLY. The gate exits zero when the root count is zero, BY DESIGN,
-because the allowlist doubles as the kill switch. The gate honouring an empty list is correct. The
-installer manufacturing that state without saying so is the defect, and it is the shape this repo keeps
-finding: a clean exit code over a wrong answer.
+AND THE DROPPED ROOT GOES UNGOVERNED SILENTLY -- NOT because the kill switch fired. That mechanism was
+written here first and it is wrong: a bare install writes ONE root, never zero, so the gate's zero-root
+exit never runs on this path and the surviving root stays governed exactly as before. The dropped root
+is simply ABSENT from the list the gate loads, so no rule matches a path inside it, the hook exits 0
+with no output, and writes into that checkout stop being denied. A clean exit code over a wrong answer,
+which is the shape this repo keeps finding -- and worse than the kill switch rather than milder, since
+an emptied allowlist is at least visible and a silently shortened one looks fine.
 
 HOW THIS IS TESTED, AND THE GAP THAT LEAVES. install-gate.ps1 REFUSES to run inside Claude Code -- a
 session that can install its own gate can uninstall it -- so the install path cannot be executed here at
@@ -179,8 +182,9 @@ def test_a_bare_install_keeps_a_root_it_did_not_name(tmp_path: Path) -> None:
     """THE defect. A run that names one root must not remove the roots it said nothing about.
 
     Before the merge this was a bare Set-Content of the run's own resolved repos, so the second root
-    left the file, the gate stopped governing that tree, and nothing anywhere said so -- an empty or
-    shortened allowlist is indistinguishable from the deliberate kill switch.
+    left the file, the gate stopped governing that tree, and nothing anywhere said so. A SHORTENED
+    allowlist is not the kill switch -- the gate stays on for what is left -- it is worse: it reads
+    exactly like an allowlist somebody narrowed on purpose.
     """
     r = _merge(tmp_path, [HEADER, MF, VAULT], [MF])
     assert r["Roots"] == [MF, VAULT], f"a root the run did not name was dropped: {r['Roots']}"
@@ -1107,17 +1111,117 @@ def test_the_gate_copy_and_the_wiring_happen_after_the_allowlist_write(tmp_path:
     path = _install_path(facts)
     write = _one(path, "Write-GovernedRoots", "on the install path")
 
-    gate_copies = [c for c in path if c["name"] == "Copy-Item" and "worktree_gate.ps1" in c["text"]]
+    # FOLLOW THE VALUE, NOT THE FILENAME -- the third guard in this file to be caught doing the latter,
+    # and the first to be caught by a rebase rather than by a mutation. This matched the literal
+    # "worktree_gate.ps1" in the command text, which held only while the source path was spelled inline
+    # at the copy. BACKLOG #1247 hoisted it to `$GateSrc = Join-Path $RepoRoot "...worktree_gate.ps1"`
+    # and the text match then found ZERO gate copies -- a predicate measuring nothing. The `== 1` guard
+    # below is the only reason that surfaced as a failure instead of as a silent pass, which is the
+    # whole argument for keeping a count assertion beside an ordering one.
+    #
+    # The DESTINATION is what makes a copy the gate copy: $GateDst is the machine-global file the
+    # refusal message promises is still untouched. A rename of $GateSrc, or another Join-Path spelling,
+    # changes nothing here; writing the gate from somewhere else still fails.
+    gate_copies = [
+        c for c in path if c["name"] == "Copy-Item" and "GateDst" in _arg_vars(c, "Destination")
+    ]
     assert len(gate_copies) == 1, (
-        f"expected one gate copy on the install path, found {len(gate_copies)}"
+        f"expected one copy INTO the installed gate on the install path, found {len(gate_copies)}"
     )
     assert gate_copies[0]["start"] > write["start"], (
         f"the machine-global gate is copied (line {gate_copies[0]['line']}) BEFORE the allowlist write "
         f"(line {write['line']}), so the write's refusal lies about the state of the box"
     )
+
+    # EVERY write into the hooks directory, not just the gate itself. Each one rides on $GateDst -- the
+    # gate copy, the pre-overwrite `.bak`, the receipt sibling -- so following that value covers files
+    # #1247 added AFTER this ordering rule was written and that the check above says nothing about. A
+    # refusal has to leave the hooks directory as it found it, not merely leave the gate unrefreshed.
+    # Non-vacuous by construction: gate_copies is a subset and is asserted to hold exactly one element.
+    hooks_writes = [
+        c
+        for c in path
+        if c["name"] in {"Copy-Item", "Set-Content"}
+        and "GateDst" in (_arg_vars(c, "Destination") + _arg_vars(c, "LiteralPath"))
+    ]
+    earliest = min(hooks_writes, key=lambda c: int(c["start"]))
+    assert earliest["start"] > write["start"], (
+        f"{earliest['name']} writes into the hooks directory at line {earliest['line']}, BEFORE the "
+        f"allowlist write (line {write['line']}), so a refusal leaves the box changed under a message "
+        "that says it is not"
+    )
+
     wiring = [c for c in path if c["name"] == "Write-Settings"]
     assert wiring and min(c["start"] for c in wiring) > write["start"], (
         "hook wiring is written before the allowlist write, so the refusal's claim is false"
+    )
+
+
+def test_the_narrowing_uninstall_writes_the_removal_result_not_the_lines_it_read(
+    tmp_path: Path,
+) -> None:
+    """``-Uninstall -Repo <path>`` is the deliberate way to narrow scope, and it had the same hole.
+
+    The install path's call site is pinned above because a swap there computes the merge and throws it
+    away. The REMOVAL path takes the identical shape and nothing was watching it: feed the writer the
+    lines it just read instead of the removal's own ``.Lines`` and the file is rewritten unchanged, so
+    the named root stays governed -- while Show-AllowlistResult still prints ``removed : <root>`` off
+    the result object, because the result object is correct and simply never reached the disk.
+
+    That direction is the milder of the two and it is the one that reads worst: the operator is told a
+    root was un-governed, believes the gate no longer covers it, and the gate still does. MEASURED
+    2026-09-03 on a scratch mirror -- substituting ``@($existing)`` for ``$result.Lines`` at this call
+    site left the whole suite green (45 passed) before this test existed, against the same 45-passed
+    control. The install-path twin of that swap reddens three tests.
+    """
+    facts = _ast_facts(tmp_path)
+    uninstall = _if_block(facts, "$Uninstall")
+    scoped = next(
+        b for b in facts["ifs"] if _within(b, uninstall) and b["cond"].strip().startswith("$Repo")
+    )
+    inside = [
+        c
+        for c in facts["commands"]
+        if _within(c, scoped)
+        and not any(f["start"] <= c["start"] < f["end"] for f in facts["functions"])
+    ]
+    write = _one(inside, "Write-GovernedRoots", "on the narrowing -Uninstall -Repo path")
+    show = _one(inside, "Show-AllowlistResult", "on the narrowing -Uninstall -Repo path")
+
+    lines = _arg(write, "Lines")
+    assert lines is not None and lines["baseVar"], (
+        "the narrowing write's -Lines is not a property of a variable, so the removal result never "
+        "reaches the file and -Uninstall -Repo removes nothing while reporting that it did.\n"
+        f"  got: {lines['text'] if lines else None}"
+    )
+    var = str(lines["baseVar"])
+
+    assigns = [a for a in facts["assignments"] if a["lhs"] == var and _within(a, scoped)]
+    assert assigns, (
+        f"nothing inside the narrowing block assigns ${var}, so the writer is handed a value computed "
+        "somewhere else entirely"
+    )
+    for a in assigns:
+        assert a["rhsCmd"] == "Merge-GovernedRoots", (
+            f"${var} reaches the narrowing write but is not the removal's output (line {a['line']}: "
+            f"{a['rhsText'][:120]})"
+        )
+
+    merge = _one(
+        [c for c in inside if assigns[0]["rhsStart"] <= c["start"] < assigns[0]["rhsEnd"]],
+        "Merge-GovernedRoots",
+        "inside the assignment that feeds the narrowing write",
+    )
+    assert _arg(merge, "Remove") is not None, (
+        "the narrowing path's merge is not in -Remove mode, so -Uninstall -Repo ADDS the root it was "
+        f"asked to stop governing: {merge['text']}"
+    )
+    assert _arg_vars(show, "Result") == [var], (
+        "the narrowing announcement describes a different object from the one that was written, so "
+        "what the operator reads and what the file says can disagree"
+    )
+    assert _arg(show, "Narrowed") is not None, (
+        "a run that REMOVES roots is announced as an ordinary merge, so the posture change is silent"
     )
 
 

@@ -36,8 +36,14 @@
 
     THE ALLOWLIST IS MERGED, NEVER REPLACED (BACKLOG #1375). A run ADDS the roots it names and keeps
     every root already there. It used to overwrite the file with just this run's repos, and a bare run
-    resolves to exactly ONE repo -- so on a box governing two checkouts, re-installing dropped one, and
-    a dropped root fails open in silence because an empty allowlist is how the gate is switched off.
+    resolves to exactly ONE repo -- so on a box governing two checkouts, re-installing dropped one.
+
+    AND THE DROPPED ROOT GOES UNGOVERNED IN SILENCE -- NOT by tripping the kill switch. A bare install
+    writes ONE root, never zero, so the gate's zero-root exit never fires on this path and the gate
+    stays fully on for the root that survived. The dropped root is simply ABSENT from the list: no rule
+    matches a path inside it, the hook exits 0 printing nothing, and writes into that checkout quietly
+    stop being denied. There is no empty file to notice and no message anywhere.
+
     To stop governing one root without turning the gate off, name it: -Uninstall -Repo "<path>".
 
     Run from a PLAIN TERMINAL, not from inside Claude Code -- a session that can install its own gate can
@@ -272,10 +278,16 @@ function Get-HandledTools([string]$Path) {
 # `git worktree list` -- so on a box whose allowlist named two roots (measured live on this machine: the
 # engine checkout AND the vault clone) a bare re-install DROPPED one.
 #
-# And a dropped root fails open SILENTLY. The gate exits zero when the root count is zero, BY DESIGN,
-# because the allowlist doubles as the kill switch. The gate honouring an empty list is correct; the
-# installer manufacturing that state without a word is the defect, and it has the shape this repo keeps
-# finding: a clean exit code over a wrong answer.
+# And the dropped root goes UNGOVERNED SILENTLY. Say the mechanism exactly, because the plausible one is
+# wrong and was written here first: this is NOT the zero-root kill switch firing. A bare install writes
+# ONE root, never zero, so `if ($roots.Count -eq 0) { exit 0 }` in the gate never runs on this path, and
+# the gate keeps governing the root that survived just as strictly as before.
+#
+# The dropped root is simply ABSENT from the list the gate loads. Test-Governed answers $null for every
+# path inside it, so no rule matches, the hook exits 0 with no output, and writes into that checkout stop
+# being denied. That is the shape this repo keeps finding -- a clean exit code over a wrong answer -- and
+# it is worse than the kill switch, not milder: the kill switch leaves an empty file somebody can notice,
+# whereas this leaves a plausible-looking allowlist that is quietly one root short.
 #
 # EVERYTHING BELOW IS PARAMETER-FED and reads no script-scope variable ($ReposFile, $HooksDir, $Repo).
 # That is not tidiness, it is the only way any of this gets verified: install-gate.ps1 REFUSES to run
