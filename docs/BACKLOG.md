@@ -12265,6 +12265,47 @@ _FHIR_ID_RE.fullmatch("abc\n")    -> False    the fix
 > of 2026-08-13, on the two limbs.* **A grep for "owner rul" hits that one and returns a reader who
 > then stops looking** -- which is how a builder was nearly handed this item twice in one hour, once
 > by this seat. A second ruling on the same item has no home unless someone writes it in.
+>
+> **PROGRESS 2026-09-03 (builder) -- THE TRUTHFULNESS LIMB ONLY. LIMB B REMAINS BLOCKED AND THIS IS
+> NOT PROGRESS TOWARD IT.** The two SDS-3.7 docstrings this item asks to fix "in the same commit as
+> Limb B" were taken on their own, because they need no FHIR server and no ruling, and a security
+> control described as covering something it does not cover is the defect SDS-3.7 forbids. **No wire
+> output changed**, proved rather than asserted: parsing `transports/fhir.py` at HEAD and after,
+> stripping every docstring and comparing the ASTs returns EQUAL, against a negative control (a
+> one-character `safe="|"` mutant) that returns NOT-EQUAL. The five pinned `%7C` assertions live in
+> `test_search_returns_bundle`, `test_resolve_read_url_params_percent_encodes_each_value`,
+> `test_resolve_read_url_params_multi_and_list`, `test_structured_params_are_the_only_search_form`
+> and `test_executor_params_read_still_works` -- green and unedited. *(Cited by NAME on purpose: the
+> first draft of this note cited line numbers that its own insertions had already moved.)*
+> **MEASURED BY EXECUTION, with the control in the same run, against this item's premise.** The
+> premise HOLDS. Arm 1 (positive control, the CWE-88/URL-layer claim): `{"code":
+> "abc&_count=999&identifier=evil"}` encodes to `code=abc%26_count%3D999%26identifier%3Devil` and
+> `parse_qsl` returns **exactly one** parameter -- no injection, the guarantee is real. Arm 2 (the
+> claim under test): `{"code": "sys|val"}` goes on the wire as `code=sys%7Cval` and percent-decodes
+> back to `sys|val`; `a,b` and `$everything` likewise return their separator. So `,` `|` `$` reach the
+> FHIR value layer with separator meaning intact, and the docstring's *"stays a literal, never a
+> separator"* was false for exactly the one character it named that is a FHIR separator.
+> **CORRECTED.** `_encode_search_params` now states the URL-layer guarantee it does keep, names `,`
+> `|` `$` as the value-layer separators it does **not** neutralise, and records that the remainder is
+> blocked pending a real FHIR server rather than merely unfinished -- so no reader takes a fix as
+> imminent. `FhirLookupExecutor.read()`'s docstring **was** stale as this item recorded (verified, not
+> assumed: it still described the flat query string as *"author-encoded, defense-in-depth-screened"*
+> on a path that has raised since Limb A).
+> **THE FIX WAS INITIALLY TOO SHALLOW, AND THE REVIEW PASS CAUGHT IT.** Correcting one docstring while
+> its neighbours kept asserting the settled framing off the same item number would have left the
+> reader it exists to protect unprotected. Three further surfaces now carry a one-clause pointer to
+> the single statement of the caveat (SDS-3.5): `_resolve_read_url`, `config/fhir_lookup.py`'s public
+> `fhir_lookup()` docstring -- the IDE-hover surface, which taught `{"identifier": "MRN|123"}` beside
+> an unqualified *"never"* -- and `config/wiring.py`'s `FhirLookup()`.
+> **PINNED, AND THE INSTRUMENT MATCHES THE CLAIM.** A behaviour test CANNOT see this prose revert, so
+> claiming one pinned the docstring would have repeated SDS-3.8 inside the item about SDS-3.7. There
+> are two guards. `test_encode_search_params_holds_the_url_layer_not_the_value_layer` pins the
+> BEHAVIOUR, with the URL-layer guarantee as an in-test positive control; a Limb-B-style escaping
+> encoder reds the value-layer arm ONLY and a no-op encoder reds the control ONLY.
+> `test_encode_search_params_docstring_states_the_value_layer_gap` pins the TEXT, and was
+> end-to-end mutation-proved: re-inserting the retired sentence reds it while the behaviour test stays
+> green. **A future Limb B will legitimately red the behaviour arm; that is the intended signal, and
+> the docstring must move in the same commit.**
 
 **Cluster:** Transports / FHIR egress. **Priority:** P2. **Verdict:** build. **Severity:** no deployment axis -- zero instances; on first deployment a Handler passing an unsanitised value into a FHIR search **would** be able to alter the query's meaning.
 
