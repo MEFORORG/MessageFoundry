@@ -1407,8 +1407,11 @@ Optional **dual-control (maker-checker)** approval for high-value actions (ASVS 
 Startup **self-attestation of the installed engine wheel** ([ADR 0041](adr/0041-load-path-attestation-and-change-attribution.md)
 D3) — a runtime in-place-tamper tripwire (`messagefoundry/integrity.py`). At startup (and on demand) the
 engine hashes every **loaded** first-party `messagefoundry` module file against the installed wheel's
-`*.dist-info/RECORD` baseline; on **drift** (a loaded module no longer matching its RECORD hash) it records
-a hash-chained `startup_integrity` audit row and fires the `AlertSink`. It complements ADR 0036 (which guards
+`*.dist-info/RECORD` baseline; on **drift** (an attested file no longer matching its RECORD hash) it records
+a hash-chained `startup_integrity` audit row and fires the `AlertSink`. It also attests a short explicit set
+of shipped security **data** assets (`_ATTESTED_ASSETS` in `messagefoundry/integrity.py`, BACKLOG #1432) --
+the bundled common-password corpus and the packaged Semgrep handler rules -- because emptying one of those
+neuters a control with no engine module edited at all. It complements ADR 0036 (which guards
 the *config dir*) by covering the installed *site-packages* an admin with venv-write + restart rights could
 edit in place. Both keys default **safe**: attestation is on but **alert-only** (it never blocks startup), and
 an **editable** install (`pip install -e .` — no RECORD baseline) is a **no-op**, so dev is never bricked.

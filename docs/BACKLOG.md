@@ -19940,3 +19940,85 @@ That is the same `self._lock` the staged-pipeline handoffs take. On a first depl
 **PARTLY CLOSED ALREADY, AND THE CLOSURE SITS IN THE WRONG ARTIFACT.** The full record -- both questions, all eight options, both answers quoted -- is [comment 5515263760 on PR 749](https://github.com/MEFORORG/MessageFoundry/pull/749#issuecomment-5515263760), written 2026-09-02. A pull-request comment is a real improvement on a session transcript, which does not survive its session. It is still not the ADR, and the ADR is what a reader consults. **This limb differs from the first two in shape:** closing it needs no decision about the engine, only the record moved into the artifact people actually read.
 
 **THE GENERAL PROBLEM, stated once so it is not re-derived per incident.** A decision recorded as an outcome plus a delegation is not reviewable. The inputs -- the question, the options, the answer -- are what let a later reader tell a considered call from an arbitrary one, and they are exactly the part that lives in the least durable place.
+
+## 1432. startup attestation covers only .py, so a shipped security data asset can be neutered undetected
+
+> ✅ **SHIPPED in 0.3.2.** [`messagefoundry/integrity.py`](../messagefoundry/integrity.py) now attests a short explicit set of shipped security **data** assets (`_ATTESTED_ASSETS`) alongside the loaded engine modules: `messagefoundry/auth/data/common_passwords.txt` and `messagefoundry/security/semgrep/handler-security.yml`. Six tests in [`tests/test_startup_attestation.py`](../tests/test_startup_attestation.py) cover it. The control was run by hand and is recorded below, because a tripwire test that cannot fail is the failure mode this item is about.
+
+**Cluster:** Security / runtime tamper evidence. **Priority:** P2. **Verdict:** build.
+**Severity:** no deployment axis (sec. 0). Zero instances run, so nothing is neutered today and nobody is unscreened. Everything below is written as what a **first** deployment would ship.
+
+### The defect
+
+`_ATTESTED_SUFFIX = ".py"` scoped the ADR 0041 D3 tripwire to source. `_loaded_module_files` globbed `*.py` under `messagefoundry.__path__`, so every shipped **data** file was outside the attestation, including two that a security control's behaviour depends on.
+
+**The concrete path, found while working #1134.** An admin with venv-write plus restart rights truncates the installed `messagefoundry/auth/data/common_passwords.txt` to zero bytes. Then:
+
+1. `_common_passwords()` ([`auth/policy.py`](../messagefoundry/auth/policy.py)) decodes an empty file and returns an empty `frozenset`. It is `lru_cache`d, so this is read once and held for the process.
+2. `PasswordPolicy.violations` evaluates `lowered in _common_passwords()` as `False` for every password, so it stops emitting *"not be a common or breached password"*.
+3. Breach screening becomes a no-op. Nothing logs, nothing alerts, and no password is refused that would previously have been refused.
+4. Startup attestation reports **clean**, because no `.py` changed.
+
+`messagefoundry/security/semgrep/handler-security.yml` has the same shape one step removed: emptying the packaged taint rules makes an operator's opt-in CI leg pass every Handler it is pointed at (ADR 0144 Increment 3).
+
+**Why this class is worth its own item rather than a widening of the ADR's AC list.** The tripwire's premise is that neutering a control in place means editing engine code. That premise is false wherever a control reads a shipped file, and the failure is quiet in both directions: the control goes silent, and so does the thing watching the control.
+
+### What shipped
+
+`_ATTESTED_ASSETS` is a package-relative tuple resolved by `_attested_asset_files()` under the same `messagefoundry.__path__` anchor the module walk uses, then folded into the existing comparison loop in `attest_engine`. Drift on an asset runs the same path as drift on a module: a hash-chained `startup_integrity` audit row, the `integrity_drift` AlertSink channel, and the opt-in `[integrity].fail_closed_on_drift` refusal. The tripwire is widened, not forked.
+
+**No new artifact.** `RECORD` already carries a sha256 for every installed file, and `pyproject.toml` packages both assets into the wheel, so the baseline was there the whole time and nothing was being compared against it.
+
+**Version skew is impossible by construction.** The declaration and the `RECORD` it is compared against ship in the same wheel, so a declared asset always has a baseline row. That is why the list can live in code rather than in a manifest that could drift from what was installed.
+
+**A deleted asset is drift, not a pass.** `_attested_asset_files` returns a declared path whether or not it exists; the unreadable file surfaces as `missing`. An implementation that filtered on existence would have reported clean for the one tamper that removes the evidence.
+
+**Three things deliberately NOT done.**
+
+| not done | why |
+|---|---|
+| attest every non-`.py` file in the package | a blanket walk pulls in `__pycache__` leftovers, operator-dropped files, and whatever a future packaging change sweeps in. Each drifts for reasons that are not tampering, and an alert channel that cries wolf is one an operator mutes. |
+| widen `_ATTESTED_SUFFIX` itself | it is also the probe in `_is_editable_install`, where the question is *"does RECORD carry package source at all"*. A data file cannot answer that, so widening it there would break editable detection, which is the no-op that keeps a dev checkout from being bricked. |
+| pin the assets by digest in a second manifest | `RECORD` is the manifest. A second one is a new artifact that can disagree with the first. |
+
+### The evidence, including the control
+
+The four asset tests fail when the widening is reverted. Measured on this branch: replacing the composed loop in `attest_engine` with the original `for file in _loaded_module_files():` and re-running `tests/test_startup_attestation.py` gives **4 failed, 7 passed** -- `test_declared_asset_is_attested_clean`, `test_truncated_security_asset_is_drift`, `test_deleted_security_asset_is_drift` and `test_asset_drift_alerts_and_records`. Restored, 11 pass.
+
+Two of the six tests are there because the other four cannot catch what they cover.
+
+- `test_truncated_asset_is_INVISIBLE_when_not_declared` is the paired arm. Same install, same truncation, one variable changed: the asset is not declared, and attestation reports clean. It establishes that **declaring** the asset is what causes the detection, since the fixture writes and RECORDs the file in both arms. It passes with the widening reverted, by design, and its docstring says so rather than claiming to be the control.
+- `test_declared_assets_exist_in_the_shipped_package` is the rot guard, and the only test here that runs against the real package. Rename or move an asset and the declaration resolves to nothing: attestation goes on reporting clean, forever, over a file it is no longer looking at. That failure is invisible by construction, so it needs a test that must fail when it happens. It also asserts each declared asset is non-empty, which is the state the tripwire exists to catch.
+
+### What this closes for #1134, and what it does not
+
+This is the **operator-side half** of #1134's corpus provenance work. #1134 rebuilt the corpus and recorded its provenance in `common_passwords.NOTICE`; its guards are [`tests/test_auth_core.py`](../tests/test_auth_core.py) `test_breach_corpus_meets_the_asvs_6_2_4_policy_matching_bar` (the depth bar) and `test_breach_corpus_growth_did_not_over_block_or_regress` (the over-block and regression arms).
+
+**Both are build-time checks over the source tree.** They answer *"is the corpus in the repository deep enough and still screening"*. Neither can see the file an operator actually runs against, because both have finished before the wheel is installed. A corpus that passed every gate in CI and was emptied on the host afterwards satisfied all of them.
+
+That is the half this closes: the installed bytes are now compared to the wheel they came from, at startup, on the box. **It does not move #1134's own verdict** -- the ASVS 6.2.4 cell turns on corpus depth against the policy, and nothing here changes the corpus. #1134 stays open on its own terms.
+
+### The alternative that was weighed, so nobody re-derives it
+
+**The real alternative was RECORD-driven, not a filesystem walk**, and the table above states the weaker case against the weaker design. Iterating the `RECORD` rows under `messagefoundry/` bar the `.pyc` rows would make "somebody forgot to declare the new asset" **impossible** rather than merely guarded: an operator's dropped file has no row so it cannot false-positive, and anything a packaging change ships does have a row so it matches. Two of the three hazards in that table do not apply to it.
+
+**The argument that survives is narrower.** A RECORD-driven scope follows whatever packaging ships. The day a wheel carries a file an operator is *expected* to edit in place, that is a standing false positive on an alert channel an operator will then mute. Nothing under `messagefoundry/` is operator-editable today (ADR 0036 puts the config dir elsewhere), so this is a liability rather than an instance. It is why the list is the smaller commitment, not why the walk is wrong.
+
+**What the list costs, stated plainly.** Twenty-one shipped non-`.py` files are not attested: 20 `tray/assets/*.ico`, `py.typed`, `generators/README.md`, and `common_passwords.NOTICE`. The tray icons are the same class of defect one level down -- they are the tray's state signal (`running_*`, `stopped_*`, `wedged_*`, `foreign_*`), so swapping `stopped_dark.ico` onto `running_dark.ico` makes an operator misread engine state with no `.py` touched. The rot guard catches a **renamed declared entry**; nothing catches an asset nobody declared. Whoever revisits this should reopen the RECORD-driven option rather than lengthening the tuple indefinitely.
+
+### What this does NOT buy, so the tripwire is not over-read
+
+Detection, not containment. On the shipped configuration the #1432 attack still succeeds; it is merely no longer silent. Four limits, none of them new to this item and all of them inherited from the tripwire's existing posture:
+
+1. **Alert-only is the default.** With `[integrity].fail_closed_on_drift` unset the corpus is emptied, the alert fires, and breach screening stays a no-op for the life of the process. Only the opt-in refusal actually stops it.
+2. **Editable installs and source-tree runs are a no-op.** Those deployments get nothing from this.
+3. **It is a startup check, so there is a window.** `attest_engine` runs once before listeners bind; `_common_passwords()` is `lru_cache`d and read lazily on the first password check. Emptying the file between the two is undetected until the next restart.
+4. **The consumer still fails open.** `PasswordPolicy.check_breached` ships `True`, and against an empty corpus that assertion is false with nothing logged. `messagefoundry/auth/service.py` already has the precedent one file over -- `_warn_if_corpus_unreadable` eagerly loads the **operator** corpus at startup and warns when it is unusable -- and the **bundled** corpus, the one this attack targets, has no equivalent. A plausibility floor in `_common_passwords()` would defend all three limits above, which is why it is worth doing **in addition to** this, not instead of it. Not filed against a number here; named by subject for whoever owns the password policy. The Semgrep half has no in-process consumer at all, so for that asset the tripwire is the only guard there can be.
+
+### A finding this turned up and did NOT fix
+
+**The brief for this item stated that `messagefoundry/auth/data/common_passwords.txt` is pinned `-text` in `.gitattributes`. It is not.** Measured on this branch: `git check-attr text eol -- messagefoundry/auth/data/common_passwords.txt` returns `unspecified` for both, `.gitattributes` carries no matching pattern, `core.autocrlf` is `true` in this checkout, and the file is 173,380 bytes in the object store against 188,636 on disk -- every one of its 15,256 line endings converted on checkout.
+
+**The fix here is correct anyway, and not for the reason the brief gave.** `RECORD` is written by the installer from the bytes it unpacked, so the baseline and the installed file are the same bytes on the same host whatever git did upstream. A raw-byte digest is the right instrument regardless of line endings.
+
+**The missing pin is a real and separate defect**, and it is a reproducible-builds question rather than an attestation one: a wheel built from a Windows checkout carries a byte-different corpus from one built on Linux, so the two wheels' `RECORD` rows for that file disagree while the content is identical. Not filed against a number here, because allocating one to gesture at unowned work is what the ledger rules forbid; named by subject instead, and left for whoever owns the corpus build.

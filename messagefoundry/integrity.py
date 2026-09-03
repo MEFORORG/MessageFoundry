@@ -11,6 +11,11 @@ all**. This module closes that gap: at startup (and on demand) it hashes every *
 manifest already shipped in the wheel) and, on drift, records a hash-chained ``startup_integrity``
 audit row and fires the :class:`~messagefoundry.pipeline.alerts.AlertSink`.
 
+It also attests a short, explicit list of shipped security **data** assets (:data:`_ATTESTED_ASSETS`,
+BACKLOG #1432) — files that are not ``.py`` but that a control's behaviour depends on. Editing engine
+code is not the only way to neuter a control in place: emptying the bundled common-password corpus
+turns breach screening into a no-op with no ``.py`` touched at all.
+
 Posture (ADR 0017 amendment, 2026-06-27):
 
 - **Default = alert-only.** Drift records + alerts but the engine still starts. A legitimate, reviewed
@@ -56,9 +61,39 @@ log = logging.getLogger(__name__)
 #: The installed distribution whose wheel ``RECORD`` is the integrity baseline.
 _DIST_NAME = "messagefoundry"
 
-#: Only first-party engine *source* is attested. A ``.pyc`` is a build artifact, not reviewed bytes,
-#: and ``RECORD`` lists ``.py`` (not the compiled cache), so attesting ``.py`` is the right anchor.
+#: Only first-party engine *source* is attested by the module walk. A ``.pyc`` is a build artifact,
+#: not reviewed bytes, and ``RECORD`` lists ``.py`` (not the compiled cache), so attesting ``.py`` is
+#: the right anchor. It also stays the right *probe* in :func:`_is_editable_install`: the question
+#: there is "does RECORD carry package source at all", and a data file cannot answer that.
 _ATTESTED_SUFFIX = ".py"
+
+#: Shipped **data** files that a control's behaviour depends on, package-relative to
+#: ``messagefoundry/`` (BACKLOG #1432).
+#:
+#: Attesting ``.py`` alone left a gap the module walk cannot see: an admin with venv-write plus
+#: restart rights could truncate ``auth/data/common_passwords.txt`` to zero bytes, and
+#: :func:`~messagefoundry.auth.policy._common_passwords` would then return an empty set, so
+#: ``PasswordPolicy.violations`` stops emitting "not be a common or breached password" and breach
+#: screening becomes a silent no-op. No engine ``.py`` changed, so attestation reported clean. Same
+#: shape for ``security/semgrep/handler-security.yml``: emptying the rules file makes the operator's
+#: opt-in CI leg pass everything.
+#:
+#: Version skew is impossible by construction: this list and the ``RECORD`` it is compared against
+#: ship in the *same* wheel, so a declared asset always has a baseline row.
+#:
+#: **An explicit list rather than every RECORD row under the package**, which is the stronger design
+#: and the one actually weighed. It would make a forgotten asset impossible rather than guarded; it
+#: was declined because attestation scope would then follow whatever packaging ships, and the day a
+#: wheel carries a file an operator is *expected* to edit in place that is a standing false positive
+#: on a channel an operator will mute. **Not a self-registering registry either** (the
+#: ``transports/base.py`` pattern): that one is read after config load with every transport imported,
+#: while this runs before most of the engine is, so the attested set would vary with import order.
+#: BACKLOG #1432 carries both arguments, what the list leaves unattested, and what this does not buy.
+#: Add an entry when a new shipped data file gates a security decision.
+_ATTESTED_ASSETS: tuple[str, ...] = (
+    "auth/data/common_passwords.txt",
+    "security/semgrep/handler-security.yml",
+)
 
 
 class IntegrityError(RuntimeError):
@@ -68,10 +103,12 @@ class IntegrityError(RuntimeError):
 
 @dataclass(frozen=True)
 class DriftEntry:
-    """One attested module file that does not match its ``RECORD`` baseline.
+    """One attested file (an engine module or a declared security asset) that does not match its
+    ``RECORD`` baseline.
 
     ``reason`` is ``"hash_mismatch"`` (on-disk bytes differ from the recorded sha256) or ``"missing"``
-    (a loaded module file has no ``RECORD`` entry at all — e.g. a file added in place after install).
+    (the file has no ``RECORD`` entry at all — e.g. a module added in place after install — or it
+    could not be read, which is how a *deleted* declared asset surfaces).
     No file content is carried — only the relpath + reason (no PHI, nothing sensitive).
     """
 
@@ -82,8 +119,9 @@ class DriftEntry:
 @dataclass(frozen=True)
 class AttestationResult:
     """Outcome of one attestation pass. ``editable``/``no_record`` mark the no-op posture (an editable
-    or RECORD-less install — attestation is advisory and never drifts). ``checked`` counts the loaded
-    module files compared; ``drift`` is the (possibly empty) list of mismatches."""
+    or RECORD-less install — attestation is advisory and never drifts). ``checked`` counts the files
+    compared (loaded engine modules + declared security assets); ``drift`` is the (possibly empty)
+    list of mismatches."""
 
     attested: bool  # True only when a real RECORD baseline was compared against
     editable: bool
@@ -205,6 +243,27 @@ def _loaded_module_files() -> list[Path]:
     return sorted(files)
 
 
+def _attested_asset_files() -> list[Path]:
+    """The on-disk paths of the shipped security **data** assets in :data:`_ATTESTED_ASSETS`.
+
+    Resolved under ``messagefoundry.__path__``, the same anchor the module walk uses, so both halves
+    attest the install this process actually imported from.
+
+    **A path is returned whether or not it exists.** Deleting a declared asset is tampering too, and a
+    caller that filtered on existence would report clean for it; the attestation loop turns the
+    unreadable file into ``missing`` drift.
+    """
+    import messagefoundry
+
+    return list(
+        dict.fromkeys(
+            (Path(root) / rel).resolve()
+            for root in messagefoundry.__path__
+            for rel in _ATTESTED_ASSETS
+        )
+    )
+
+
 def _record_relpath(file: Path, install_root: Path) -> str | None:
     """The RECORD-relative posix path for ``file`` (relative to the site-packages install root), or
     ``None`` when the file is not under the install root (a defensive guard — a loaded module from an
@@ -232,12 +291,13 @@ def _install_root(dist: metadata.Distribution) -> Path | None:
 
 
 def attest_engine() -> AttestationResult:
-    """Hash every loaded first-party ``messagefoundry`` module file against the installed wheel's
-    ``*.dist-info/RECORD`` baseline. Pure + offline + synchronous (blocking file reads) — callers on
-    the event loop must wrap it in ``asyncio.to_thread``.
+    """Hash every loaded first-party ``messagefoundry`` module file, plus the shipped security data
+    assets in :data:`_ATTESTED_ASSETS`, against the installed wheel's ``*.dist-info/RECORD`` baseline.
+    Pure + offline + synchronous (blocking file reads) — callers on the event loop must wrap it in
+    ``asyncio.to_thread``.
 
     Never raises for a missing/editable install (it returns a no-op result); a true I/O failure
-    reading a module file marks that file as drift (``missing``) rather than crashing startup.
+    reading an attested file marks that file as drift (``missing``) rather than crashing startup.
     """
     try:
         dist = metadata.distribution(_DIST_NAME)
@@ -269,14 +329,15 @@ def attest_engine() -> AttestationResult:
 
     drift: list[DriftEntry] = []
     checked = 0
-    for file in _loaded_module_files():
+    for file in [*_loaded_module_files(), *_attested_asset_files()]:
         rel = _record_relpath(file, install_root)
         if rel is None:
             continue  # loaded from outside the install root — not attestable against this RECORD
         expected = record.get(rel)
         if expected is None:
             # A loaded engine module with no RECORD row — an in-place-added file (a planted backdoor
-            # module is exactly this) is drift, not a silent pass.
+            # module is exactly this) is drift, not a silent pass. A declared asset lands here only if
+            # it was dropped from the wheel it is compared against, which is itself worth an alert.
             drift.append(DriftEntry(path=rel, reason="missing"))
             continue
         checked += 1
@@ -315,12 +376,12 @@ async def run_startup_attestation(
     result = await asyncio.to_thread(attest_engine)
     if not result.drift:
         if result.attested:
-            log.info("startup integrity: %d engine module(s) attested clean", result.checked)
+            log.info("startup integrity: %d engine file(s) attested clean", result.checked)
         return result
 
     drift_count = len(result.drift)
     log.error(
-        "startup integrity DRIFT: %d engine module(s) do not match the installed wheel RECORD "
+        "startup integrity DRIFT: %d engine file(s) do not match the installed wheel RECORD "
         "(fail_closed=%s) — possible in-place engine tampering",
         drift_count,
         fail_closed_on_drift,
@@ -337,7 +398,7 @@ async def run_startup_attestation(
     try:
         alert_sink.integrity_drift(
             "engine-integrity",
-            reason=f"{drift_count} engine module(s) drifted from the installed wheel RECORD",
+            reason=f"{drift_count} engine file(s) drifted from the installed wheel RECORD",
             drift_count=drift_count,
         )
     except Exception:  # noqa: BLE001 — alerting is best-effort and must never break startup
@@ -345,7 +406,7 @@ async def run_startup_attestation(
 
     if fail_closed_on_drift:
         raise IntegrityError(
-            f"engine integrity attestation failed: {drift_count} loaded module(s) do not match the "
+            f"engine integrity attestation failed: {drift_count} attested file(s) do not match the "
             "installed wheel RECORD ([integrity].fail_closed_on_drift=true; refusing to start)"
         )
     return result
