@@ -515,6 +515,12 @@ the call to the Console on 2026-09-02; the Console decided ([ADR 0118](adr/0118-
   ([`CONFIGURATION.md`](CONFIGURATION.md)). The refuse/warn split is `[security].enforcement`.
 - **`require_managed_identity` does NOT cover this.** It constrains the credential's *kind* — a
   `sysadmin` gMSA satisfies it clean. The two are orthogonal and a site needs both.
+- **Before concluding it has misfired**, read [`DEPLOY-SERVER-DB.md` §1.3](DEPLOY-SERVER-DB.md): two
+  entries surprise sites that are trying to do the right thing. A SQL Server **user-defined** database
+  role is named even when it wraps exactly the three prescribed ones (the probe reads membership, not
+  a role's contents), and a PostgreSQL role **attribute** is named when it sits on any role the
+  principal may assume rather than on the principal itself (`CREATEROLE via role site_ops`) — reachable
+  by `SET ROLE`, so held in practice. Both are real deviations from the prescribed grant, not noise.
 
 ### `store_principal_privileges_unobserved` — the privilege posture could not be read
 
