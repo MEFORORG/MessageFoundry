@@ -8510,6 +8510,43 @@ filing.
 
 ## 1139. research an honest pass for ASVS 6.3.7 -- notifying a user whose authentication details the directory changed
 
+> **PARTIAL 2026-09-03 (builder), NOT A CLOSURE -- this item stays OPEN.** Lands the HONEST-PASS CORE
+> the research nominated: the column split, under an owner ruling of the same date, built rather than
+> staged because CLAUDE.md section 0 prices a breaking change at zero on a not-deployed beta. See
+> [ADR 0182](adr/0182-split-the-account-mirror-address-from-the-engine-owned-notification-address.md).
+>
+> `users.email` is now the profile address and, on a directory account, the mirror alone.
+> `users.notify_email` is engine-owned and no directory-sync statement names it, so
+> `update_user_profile` -- the one call `_upsert_ad_user` makes against an existing account -- still
+> writes `display_name` and `email` and nothing else. It is seeded ONCE at account birth from the
+> address `create_user` carried; after that the only writer is `set_user_notify_email`. Every
+> `_notify_security` call site, `has_notifiable_admin` and `_assert_security_notice_is_deliverable`
+> read the new column. **THE ITEM'S OWN QUESTION DISSOLVES rather than being answered**: the notice
+> about a directory repoint now goes to an address that operation is not replacing.
+>
+> **THE DURABILITY LIMB IS MET, and it is the setter's signature rather than a check.**
+> `set_user_notify_email` takes `email: str`, not `str | None`, so a clear is unrepresentable at every
+> call site, and it refuses the whitespace-only string that would mean the same thing -- repointable
+> but not erasable. **The item's NOT NULL alternative was considered and rejected**: accounts may
+> still be created with no address at all (the first-login set-address step is a follow-on below), so
+> the column would need a placeholder the notifier treats as absent anyway.
+>
+> Three backends plus the protocol. Seven tests, each proven red against `origin/main` source; the
+> Postgres and SQL Server legs are hosted-runner only, so **CI is the authority for those two**.
+> **Stacks on PR 759**, which landed the write-path limb (audit + notice on the AD profile upsert and
+> on recovery-code consumption; an absent directory attribute no longer erases a stored value) and was
+> unmerged when this was written -- so that half is done, not outstanding.
+>
+> **STILL OPEN, deliberately out of scope of this build:** the first-login set-address step in the
+> shape of the existing forced-change confinement (`messagefoundry/api/security.py`); generalising the
+> startup assertion from *some enabled Administrator* to EVERY enabled account
+> (`messagefoundry/api/app.py`); passkey-removal notice parity (`messagefoundry/auth/service.py`); and
+> the silent drop in `messagefoundry/pipeline/security_notify.py` when no address is on file. A fifth
+> surfaced from the build rather than the research: `AuthService.update_user` writes the notification
+> address from the same field the profile write uses, so the two cannot be set independently -- an
+> operator cannot point notices somewhere the profile does not say. The scorecard re-score this item's
+> closing act calls for is also still to do.
+
 > **PARTIAL 2026-08-26 (lander), NOT A CLOSURE -- this item stays OPEN.** Lands the email-CLEAR limb:
 > `update_user_profile`'s notify guard read `if email is not None and email != before.email:`, whose
 > first conjunct silently skipped the clear -- and the clear is the one update that must be announced,
