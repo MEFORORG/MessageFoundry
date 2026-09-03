@@ -37,15 +37,29 @@ Stdlib only, so it can be mirrored and run without an install -- the property
 
     python scripts/docs/asvs_residual_lint.py <scorecard.toml> --baseline <baseline.txt>
     python scripts/docs/asvs_residual_lint.py <scorecard.toml> --print-keys > <baseline.txt>
+
+THE SECOND COMMAND REDIRECTS STDOUT, so under ``--print-keys`` stdout carries baseline lines and
+nothing else; the inventory and the verdict go to stderr instead. They are still printed and still
+read by a person -- they are just not swallowed into the artifact. Routed rather than suppressed,
+because an empty-scan refusal that only a redirected file could see would defeat the property this
+tool exists to hold. The generating run still exits 1: against an absent baseline every citation is
+correctly NEW, and the file it just wrote is what makes the next run exit 0.
+
+AN EMPTY BASELINE IS THEREFORE REFUSED LIKE A MISSING ONE. The shell truncates the target before
+this program starts, so a generating run that refuses still leaves a 0-byte file behind -- and a
+baseline carrying zero claims grandfathers nothing while reading, in the inventory, as a baseline
+that loaded. Same "examined nothing" failure as an empty scan, arriving by a different door.
 """
 
 from __future__ import annotations
 
 import argparse
 import re
+import sys
 import tomllib
 from collections.abc import Iterable, Iterator
 from dataclasses import dataclass
+from functools import partial
 from pathlib import Path
 
 # A source reference carrying a line number. The extension list is closed on purpose: an open
@@ -158,6 +172,14 @@ def load_baseline(path: Path | None) -> dict[str, int]:
                 f"malformed baseline line (expected 'cell<TAB>field<TAB>file<TAB>count'): {line!r}"
             )
         out[key] = int(count)
+    if not out:
+        raise EmptyScan(
+            f"baseline {path} carries zero claims. The documented generation command redirects "
+            f"stdout, and the shell truncates the target BEFORE this program runs -- so a "
+            f"generating run that refused leaves exactly this file behind. An empty baseline "
+            f"grandfathers nothing while the inventory reports a baseline that loaded. "
+            f"Pass --no-baseline to scan without one deliberately."
+        )
     return out
 
 
@@ -184,11 +206,17 @@ def main(argv: list[str] | None = None) -> int:
     args = ap.parse_args(argv)
 
     fields = tuple(args.field) if args.field else DEFAULT_FIELDS
+
+    # Everything this run has to SAY goes through `say`; the only bare `print` calls left are the
+    # baseline lines themselves, which is what makes them legible as the deliberate exception. See
+    # the module docstring for why the two streams part under --print-keys.
+    say = partial(print, file=sys.stderr if args.print_keys else sys.stdout)
+
     try:
         cells = load_scorecard(args.scorecard)
         baseline = {} if args.no_baseline else load_baseline(args.baseline)
     except EmptyScan as exc:
-        print(f"FAIL: {exc}")
+        say(f"FAIL: {exc}")
         return 2
 
     cites, n_cells, n_chars = scan_cells(cells, fields)
@@ -196,18 +224,18 @@ def main(argv: list[str] | None = None) -> int:
     # THE INVENTORY COMES FIRST. A run that examined nothing must be visibly different from a run
     # that found nothing, and only the inventory distinguishes them.
     bare = [c for c in cites if c.bare]
-    print(f"SCANNED: {args.scorecard}")
-    print(f"SCANNED: {n_cells} cells, fields {list(fields)}, {n_chars} characters of prose")
-    print(
+    say(f"SCANNED: {args.scorecard}")
+    say(f"SCANNED: {n_cells} cells, fields {list(fields)}, {n_chars} characters of prose")
+    say(
         f"SCANNED: baseline {args.baseline} -> {len(baseline)} claims ({sum(baseline.values())} occurrences)"
     )
-    print(
+    say(
         f"FOUND:   {len(cites)} citations across {len({c.cell for c in cites})} cells; "
         f"{len(bare)} are bare basenames that name no directory"
     )
 
     if n_chars == 0:
-        print(
+        say(
             f"FAIL: examined {n_cells} cells and found ZERO characters of prose in {list(fields)}. "
             f"That is a field name that no longer resolves, not a clean record."
         )
@@ -215,6 +243,18 @@ def main(argv: list[str] | None = None) -> int:
 
     observed = counted(cites)
     if args.print_keys:
+        # A `#` line is skipped by load_baseline, so the artifact can describe itself the way
+        # scripts/docs/asvs_tally_baseline.txt does -- without that header having to be typed back
+        # in by hand every time the file is regenerated. The provenance line spells out the FIELDS
+        # actually scanned rather than assuming the default: a baseline means "these citations, in
+        # these fields", so one generated with --field would otherwise claim a command that does
+        # not reproduce it.
+        scanned_fields = "".join(f" --field {f}" for f in fields)
+        print("# Grandfathered residual citations -- FROZEN, and this list may only SHRINK.")
+        print("# Format:  <cell id> TAB <field> TAB <file> TAB <occurrence count>")
+        print(
+            f"# Produced by:  asvs_residual_lint.py {args.scorecard}{scanned_fields} --print-keys"
+        )
         for key in sorted(observed):
             print(f"{key}\t{observed[key]}")
 
@@ -225,16 +265,16 @@ def main(argv: list[str] | None = None) -> int:
     if new:
         rc = 1
         seen: set[str] = set()
-        print(f"\nFAIL: {len(new)} citation(s) beyond what the frozen baseline grandfathers:")
+        say(f"\nFAIL: {len(new)} citation(s) beyond what the frozen baseline grandfathers:")
         for c in sorted(new, key=lambda c: (c.cell, c.field, c.file, c.line)):
             if c.key() in seen:
                 continue
             seen.add(c.key())
-            print(
+            say(
                 f"  cell {c.cell} [{c.field}] {c.file}:{c.line}"
                 f"{'   (bare basename -- names no location)' if c.bare else ''}"
             )
-        print(
+        say(
             "\nA file:line in prose is checked by nothing and goes stale silently -- measured at "
             "44.9% in a sample, with cell 6.3.3 citing a line in the same file its own gated anchor "
             "gets right. Cite the behaviour, or add a real [[cell.evidence]] anchor, which IS gated. "
@@ -242,12 +282,12 @@ def main(argv: list[str] | None = None) -> int:
         )
     if stale:
         rc = 1
-        print(f"\nFAIL: {len(stale)} baseline entr(ies) over-count the record. The list may only")
-        print("SHRINK -- lower or delete these in the change that removed the citation:")
+        say(f"\nFAIL: {len(stale)} baseline entr(ies) over-count the record. The list may only")
+        say("SHRINK -- lower or delete these in the change that removed the citation:")
         for k in stale:
-            print(f"  have {observed.get(k, 0)}, baseline says {baseline[k]}:  {k}")
+            say(f"  have {observed.get(k, 0)}, baseline says {baseline[k]}:  {k}")
     if rc == 0:
-        print("\nOK: no new file:line citation in scorecard prose.")
+        say("\nOK: no new file:line citation in scorecard prose.")
     return rc
 
 
