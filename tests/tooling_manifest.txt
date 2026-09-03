@@ -83,6 +83,7 @@ tests/test_coord_seat_session_key.py
 tests/test_coord_unbacked_check.py
 tests/test_coord_usage.py
 tests/test_cutover_slug_rot.py
+tests/test_dangling_citation_advisory.py
 tests/test_dangling_citation_check.py
 tests/test_dast_claims.py
 tests/test_defaulted_credential_lint.py
