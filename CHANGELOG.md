@@ -37,9 +37,10 @@ All notable changes to MessageFoundry are documented here. The format follows
   ([BACKLOG #1008](docs/BACKLOG.md))
 
 ### Changed
-- **Web console engine UI seam `18` -> `19`.** `SecurityPosture` gained the additive `store_privilege`
-  object above. Additive with a default, so an older console ignores it; the seam still bumps because
-  the golden seam contract introspects that model's field set.
+- **Web console engine UI seam `93ba1f10b9dccfc8` -> `b93f38d097f97a45`.** `SecurityPosture` gained the
+  additive `store_privilege` object above, and `StorePrivilegeView` joins the discovered surface.
+  Additive with a default, so an older console ignores it; the seam still moves because the golden seam
+  contract introspects that model's field set.
 - **`DEPLOY-SERVER-DB.md` §1.2 posture B now states its prerequisite.** "A DBA pre-creates the objects"
   is not sufficient on its own: the engine skips its DDL batch only when the `schema_meta` marker
   records the current batch, and on PostgreSQL `CREATE TABLE IF NOT EXISTS` against an existing table
