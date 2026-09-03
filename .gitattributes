@@ -21,3 +21,12 @@ ci/locks/*.lock text eol=lf
 # was verified -- `eol=lf` was tried first and silently re-encoded ~1,300 bytes, which would have
 # committed a file that no longer matches its own recorded checksum.
 .github/actions/**/dist/** -text
+
+# The offline password-screening corpus (BACKLOG #1134). Same reasoning as the CLA bundle above: its
+# sha256 is recorded in common_passwords.NOTICE as the file's provenance, so the stored and
+# checked-out bytes must never drift. Without this pin the digest is only true where
+# core.autocrlf happens to match the recorder's -- measured on the same file and commit,
+# `git hash-object` returns 4482f231 under autocrlf=true and 7ca7ef4a under autocrlf=false, and a
+# wheel built on Windows would ship CRLF that no recorded checksum matches. `-text` disables all
+# conversion, so one digest is true for every checkout, every wheel and every reader.
+messagefoundry/auth/data/common_passwords.txt -text

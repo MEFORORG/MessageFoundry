@@ -157,6 +157,25 @@ def test_tokens_are_unique_and_only_the_hash_is_storable() -> None:
 # --- BACKLOG #1134 (ASVS 6.2.4): the corpus must clear the POLICY, not merely be large -----------
 
 
+def _policy_clearing_count(min_length: int | None = None) -> int:
+    """How many bundled entries clear the password policy -- the ONE definition of that measurement.
+
+    Two gates below depend on measuring the same population: the ASVS bar and the check that the
+    NOTICE advertises a true number. Spelled out at each site they can drift apart -- flip
+    ``check_username`` at one of them and both stay green while silently disagreeing -- which is the
+    same class of un-noticed divergence this whole section exists to stop.
+
+    ``check_breached`` is off HERE FOR THE SAME REASON IT WAS OFF WHEN THE CORPUS WAS BUILT: with it
+    on, every entry rejects itself against the corpus it belongs to, and this would measure nothing.
+    ``check_username`` is off because a corpus entry has no user context.
+    """
+    from messagefoundry.auth.policy import _common_passwords
+
+    overrides = {} if min_length is None else {"min_length": min_length}
+    policy = PasswordPolicy(check_breached=False, check_username=False, **overrides)
+    return sum(1 for entry in _common_passwords() if not policy.violations(entry))
+
+
 def test_breach_corpus_meets_the_asvs_6_2_4_policy_matching_bar() -> None:
     """ASVS 6.2.4 asks for at least the top 3000 passwords WHICH MATCH THE APPLICATION'S POLICY.
 
@@ -165,16 +184,32 @@ def test_breach_corpus_meets_the_asvs_6_2_4_policy_matching_bar() -> None:
     what the length clause already rejects, so it added nothing. The bar is on the POLICY-CLEARING
     subset, and this pins it so a future corpus swap cannot quietly drop back under it.
 
-    `check_breached` is off HERE FOR THE SAME REASON IT WAS OFF WHEN THE CORPUS WAS BUILT: with it on,
-    every entry rejects itself against the corpus it belongs to, and this would measure nothing.
+    KNOW WHAT THIS GATE DOES NOT REACH. It builds the policy from the SHIPPED DEFAULTS, so it breaks
+    when the shipped default moves -- NOT when a deploying site raises its own minimum. A site that
+    raises `password_min_length` shrinks its own policy-clearing set and this stays green, because
+    the bundled corpus is a property of the build and the gate measures the build. That is the honest
+    limit of the assurance, not an oversight: CI cannot see a site's settings file.
+
+    ITS RE-SCORE TRIGGER IS BOTH `password_min_length` AND `password_check_context`, because the
+    filter that built the corpus applied both clauses -- so a change to either invalidates the count
+    and calls for regenerating the corpus, not editing this gate. The counts themselves, the
+    by-floor table and the headroom live in `common_passwords.NOTICE`, which is the one place
+    allowed to state them and is itself gated below. Deliberately not repeated here: `tests/` is the
+    one tree the stale-number scan cannot read, so a copy of a count here is a copy nothing checks.
     """
     from messagefoundry.auth.policy import _common_passwords
 
-    matches_policy = PasswordPolicy(check_breached=False, check_username=False)
-    clearing = [e for e in _common_passwords() if not matches_policy.violations(e)]
-    assert len(clearing) >= 3000, (
-        f"only {len(clearing)} corpus entries clear the shipped policy; ASVS 6.2.4 wants at least "
+    clearing = _policy_clearing_count()
+    assert clearing >= 3000, (
+        f"only {clearing} corpus entries clear the shipped policy; ASVS 6.2.4 wants at least "
         "3000. A corpus can grow and still fail this -- the entries must MATCH THE POLICY"
+    )
+    # Positive control. A filter that had silently become a pass-through would clear the WHOLE corpus
+    # and still satisfy the assertion above, so the count would measure nothing. The corpus keeps the
+    # sub-minimum entries on purpose (see the NOTICE), so a live filter must reject some of them.
+    assert clearing < len(_common_passwords()), (
+        "every bundled entry cleared the policy, so the filter is not discriminating and the count "
+        "above measures nothing"
     )
 
 
@@ -221,6 +256,7 @@ _STALE_CORPUS_SIZE_CLAIMS = (
 )
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
+_CORPUS_DIR = _REPO_ROOT / "messagefoundry" / "auth" / "data"
 
 
 def _corpus_prose_sites() -> list[Path]:
@@ -233,7 +269,7 @@ def _corpus_prose_sites() -> list[Path]:
     itself forever.
     """
     sites = sorted((_REPO_ROOT / "messagefoundry").rglob("*.py"))
-    sites.append(_REPO_ROOT / "messagefoundry" / "auth" / "data" / "common_passwords.NOTICE")
+    sites.append(_CORPUS_DIR / "common_passwords.NOTICE")
     sites.append(_REPO_ROOT / "docs" / "CONFIGURATION.md")
     sites.append(_REPO_ROOT / "docs" / "SECURITY.md")
     return sites
@@ -323,4 +359,86 @@ def test_operator_reference_warns_that_a_short_corpus_entry_buys_nothing() -> No
         f"the `{setting}` row must say that an entry shorter than {floor} adds no coverage. "
         "Without it the reference invites sizing a corpus by its line count, which is what left "
         "the bundled list contributing 18 usable entries (BACKLOG #1134)."
+    )
+
+
+# --- BACKLOG #1134: the NOTICE is the single source of the counts, so CHECK it -------------------
+#
+# The gate above moved every size claim out of the prose and into common_passwords.NOTICE. That fixes
+# seven stale copies by creating one authoritative copy -- which is only an improvement if something
+# reads it. Nothing did. These two pin the NOTICE against the data it describes, so the file that now
+# carries the provenance cannot drift from the corpus the way the prose drifted from the rebuild.
+
+
+def _notice_text() -> str:
+    return (_CORPUS_DIR / "common_passwords.NOTICE").read_text(encoding="utf-8")
+
+
+def test_notice_records_the_digest_of_the_corpus_it_describes() -> None:
+    """The NOTICE's provenance digest must be the digest of the shipped file.
+
+    The upstream blob digests were never recorded, so this is the only integrity anchor the corpus
+    has -- and unlike an upstream digest it is re-checkable offline on every CI run.
+
+    RAW bytes, deliberately. The corpus is pinned ``-text`` in ``.gitattributes``, so git performs no
+    line-ending conversion on it and the stored, checked-out and shipped bytes are the same
+    everywhere. Normalizing here instead would re-create the ambiguity that pin exists to remove,
+    and would blind this gate to a line-ending change that really would alter the shipped file.
+    """
+    corpus = (_CORPUS_DIR / "common_passwords.txt").read_bytes()
+    assert b"\r\n" not in corpus, (
+        "the corpus has CRLF line endings, so its digest is no longer platform-independent. The "
+        "`-text` pin in .gitattributes is missing or was overridden."
+    )
+    actual = hashlib.sha256(corpus).hexdigest()
+    assert actual in _notice_text(), (
+        f"common_passwords.NOTICE does not record the corpus's own sha256 ({actual}). The corpus was "
+        "regenerated without updating its provenance, or the digest was copied from another file. "
+        "Re-record it with: sha256sum messagefoundry/auth/data/common_passwords.txt"
+    )
+
+
+def test_notice_counts_match_the_live_measurement_at_every_floor_it_states() -> None:
+    """Every count the NOTICE advertises must be one the shipped loader actually yields.
+
+    This is the failure #1134 is ABOUT, aimed at the one file still allowed to state numbers: a count
+    written down once and never re-measured. Checking only the headline would leave the by-floor
+    table -- from which both the NOTICE and the gate above derive the headroom claim -- as unverified
+    prose, which is the same exposure one level up. Expected values are parsed FROM the NOTICE, so it
+    stays the single source and this stays its checker rather than a second copy.
+    """
+    notice = _notice_text()
+    # The NOTICE is plain text and uses bold for exactly one thing: the headline count. Anchoring on
+    # the markers rather than the sentence lets the prose be reworded without reddening this.
+    headline = re.search(r"\*\*([\d,]+)\*\*", notice)
+    assert headline is not None, "common_passwords.NOTICE no longer states a policy-clearing count"
+    claims = {None: int(headline.group(1).replace(",", ""))}
+
+    # The by-floor table is two aligned rows: a "floor:" line and a "count:" line. The shipped floor
+    # is marked with a trailing asterisk, which is why the floors are read as digit-prefixed tokens.
+    floors = re.search(r"^\s*floor:\s*(.+)$", notice, re.MULTILINE)
+    counts = re.search(r"^\s*count:\s*(.+)$", notice, re.MULTILINE)
+    assert floors is not None and counts is not None, "the NOTICE's by-floor table is gone or moved"
+    parsed_floors = [int(tok.rstrip("*")) for tok in floors.group(1).split()]
+    parsed_counts = [int(tok.replace(",", "")) for tok in counts.group(1).split()]
+    assert len(parsed_floors) == len(parsed_counts), (
+        f"the by-floor table is ragged: {len(parsed_floors)} floors against {len(parsed_counts)} "
+        "counts. The two rows are positional and must stay aligned."
+    )
+    assert parsed_floors, "the by-floor table parsed to zero rows, so this gate would check nothing"
+    claims.update(zip(parsed_floors, parsed_counts, strict=True))
+
+    # One measurement per floor: each is a full pass over the corpus, so re-deriving it inside the
+    # comparison would double the work for no gain.
+    wrong = [
+        f"{'headline' if floor is None else f'floor {floor}'}: says {claimed}, measures {measured}"
+        for floor, claimed in claims.items()
+        if claimed != (measured := _policy_clearing_count(floor))
+    ]
+    assert not wrong, (
+        "common_passwords.NOTICE states counts the shipped loader does not yield -- "
+        + "; ".join(wrong)
+        + ". The corpus changed without its NOTICE. Re-derive each count with "
+        "PasswordPolicy(check_breached=False, check_username=False) over _common_passwords() "
+        "(BACKLOG #1134); there is no generator script."
     )
