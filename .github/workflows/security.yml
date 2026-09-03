@@ -33,7 +33,8 @@ on:
   # Branch protection evaluates required contexts on the MERGE-GROUP commit, so a required context
   # whose workflow has no merge_group trigger never reports in the queue and NOTHING MERGES. That
   # is not hypothetical: codeql.yml's header records PR 619 sitting AWAITING_CHECKS on the queue's
-  # first entry with three contexts simply absent. Seven of this file's jobs are required contexts.
+  # first entry with three contexts simply absent. Jobs in this file are among the required
+  # contexts; read branch protection for the live set, never a count written down here.
   #
   # THIS COMMENT USED TO SAY "INERT UNTIL A MERGE QUEUE EXISTS ... behaves identically today".
   # That was true when the trigger landed on 2026-08-26 and became false once a queue was
