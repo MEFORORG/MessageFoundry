@@ -18,6 +18,7 @@ The field parsing is tested against the SHARED parser, because putting a second 
 from __future__ import annotations
 
 import importlib.util
+import re
 import sys
 from pathlib import Path
 from types import ModuleType
@@ -619,3 +620,307 @@ def test_the_body_keeps_the_heading_and_drops_only_the_banner(
     assert "Cluster:" in body, "the item's own prose must survive"
     assert "Scored 2026-09-03" not in body, "the banner block is still being read"
     assert "Verdict: build" not in body, "the fields belong to parse_items, not to the needles"
+
+
+# ------------------------------------------- already built, MUST BE READ (BACKLOG #1393)
+#
+# FOUR OPEN ROWS SAY THEIR WORK HAS SHIPPED AND MUST NOT BE BUILT AGAIN -- #1107, #1130, #1183 and
+# #1242 -- and every field `judge()` reads still says buildable on all four. They stay open because
+# CLOSING them is a judgement the building seat cannot make, so the ledger accumulates done-but-open
+# rows by construction and nothing prunes them.
+#
+# THE MECHANISM IS ONE WORD, and it is why this is a property of the vocabulary rather than of one
+# tool: a blocker screen matches a verb list -- BUILD, START, DISPATCH, IMPLEMENT, LAND -- and none
+# of those matches REBUILD. #1393 records two independently-written screens run over this population
+# on 2026-08-29, and BOTH missed all four.
+#
+# THE LEVEL DECIDES NOTHING, AND THAT IS THE DESIGN. 35 of the 275 open rows carry the bare words at
+# this branch's base. A gate that refused them would rebuild the screen #1394 records, which
+# discarded 46 percent of the live ledger on a "DO NOT" token match. `read` says MUST BE READ and
+# hands the question back.
+#
+# THE FIXTURES OWN THE PROPERTY UNDER TEST rather than borrowing it from rows other people edit.
+# The live-ledger arm comes last, because a detector proven only on its own fixtures is
+# indistinguishable from one that fires on nothing real.
+
+_ALREADY_BUILT_BODY = (
+    "## 4248. research an honest pass for ASVS 1.2.2\n"
+    "\n"
+    "**SHIPPED IN `#488` AT `cf38e16a`, AND STILL OPEN ON PURPOSE. DO NOT REBUILD IT.** The build\n"
+    "landed; the banner has not moved because closing it is a judgement this seat cannot make.\n"
+)
+
+# #1242's shape, and the ONLY reason `judge()` reads a banner at all. #1242 is written almost
+# entirely as blockquote: its declaration sits at `docs/BACKLOG.md:12345`, inside the banner block,
+# and its prose region is two lines long. A prose-only read loses one of the four rows outright.
+_ALREADY_BUILT_IN_BANNER = (
+    f"{_OPEN} **Filed 2026-08-13.** `asvs-apply-cells.py` is a lossy writer in four ways.\n"
+    "> **THE CORRECTION IS ALREADY BUILT AND PUSHED. Do not rebuild it.**\n"
+    "> Closing-act: code\n"
+)
+
+# THE SELF-REFERENCE TWIN, AND IT IS #1393'S OWN TABLE with the numbers changed. This row DESCRIBES
+# the class the needle detects and QUOTES all four declarations verbatim, so a needle allowed to
+# start mid-line stops the only row that explains the trap. Measured while building this limb: with
+# the table-pipe guard removed the needle fires on #1393 on the live ledger.
+_QUOTES_OTHER_ROWS_DECLARATIONS = (
+    "## 4249. four open rows say their work shipped and every screen passes them as buildable\n"
+    "\n"
+    "| row | the sentence in it |\n"
+    "|---|---|\n"
+    '| #4248 | "SHIPPED IN `#488` AT `cf38e16a`, AND STILL OPEN ON PURPOSE. '
+    '**DO NOT REBUILD IT.**" |\n'
+)
+
+# THE OTHER HALF OF THE SAME TRAP. #1393's TITLE is a perfect instance of the pattern, written as
+# narration: "four open rows say their work ALREADY SHIPPED and must not be rebuilt". The retirement
+# limb reads headings safely because its heading needle is anchored at the title's start; this
+# needle scans free text, so it must refuse to start on a heading line at all.
+_NARRATING_HEADING = (
+    "## 4251. four open rows say their work ALREADY SHIPPED and must not be rebuilt, and every\n"
+    "\n"
+    "**Cluster:** coord. Nothing on the dispatch path reads an item's body for this.\n"
+)
+
+# "Do not REWRITE" is about output, not about work already done. Measured: a bar-only needle fires
+# on #347, #353 and #1007, all of which say exactly this and none of which is built.
+_DO_NOT_REWRITE = (
+    "## 4252. the ledger gate must report rather than correct\n"
+    "\n"
+    "- **Do not auto-correct.** The gate must **report**, never rewrite the file it checked.\n"
+)
+
+
+def test_an_already_built_row_is_not_graded_like_a_live_one(gate: ModuleType) -> None:
+    """THE DISCRIMINATION. Identical fields, identical call -- only the body differs.
+
+    Before this limb both calls returned the same level AND the same note, byte for byte. A
+    dispatcher reading that about #1107 is told to build work that shipped in `#488`.
+    """
+    built_level, built_note = gate.judge(_item(gate, **_BUILDABLE), body=_ALREADY_BUILT_BODY)
+    plain_level, plain_note = gate.judge(_item(gate, **_BUILDABLE), body=_PLAIN_BODY)
+
+    assert built_note != plain_note, (
+        "same fields, different bodies, identical note -- judge() is not reading the body at all"
+    )
+    assert "MUST BE READ" in built_note
+    assert "SHIPPED IN" in built_note, "the note must QUOTE what fired, so a reader can check it"
+    assert built_level == "read"
+    # The opposite direction, asserted rather than trusted: a limb that flagged every row would
+    # satisfy every assertion above it.
+    assert plain_level == "ok"
+    assert "MUST BE READ" not in plain_note
+
+
+def test_a_declaration_in_the_banner_block_still_fires(gate: ModuleType) -> None:
+    """#1242's shape, and the reason this needle reads a region the retirement needle must not.
+
+    Dropping the banner here loses #1242 entirely -- one of the four rows the item names.
+    """
+    level, note = gate.judge(_item(gate, **_BUILDABLE), banner=_ALREADY_BUILT_IN_BANNER)
+    assert level == "read"
+    assert "ALREADY BUILT AND PUSHED" in note
+
+
+def test_a_table_quoting_other_rows_is_not_this_rows_declaration(gate: ModuleType) -> None:
+    """The self-reference trap, in this limb's own vocabulary.
+
+    #1393 documents the class and quotes all four declarations in a markdown table. A detector that
+    flags it is not noisy, it is wrong: a reader stopped by the row that DESCRIBES the trap never
+    reaches the four rows that are the trap.
+    """
+    level, note = gate.judge(_item(gate, **_BUILDABLE), body=_QUOTES_OTHER_ROWS_DECLARATIONS)
+    assert level == "ok"
+    assert "MUST BE READ" not in note
+
+
+def test_a_heading_that_narrates_the_pattern_is_not_a_declaration(gate: ModuleType) -> None:
+    """#1393's own title. The heading is in the body this needle reads, and it must not start one.
+
+    Removing the heading guard passes every other arm in this section and flags #1393 on the live
+    ledger, so this is the arm that carries it.
+    """
+    level, _ = gate.judge(_item(gate, **_BUILDABLE), body=_NARRATING_HEADING)
+    assert level == "ok"
+
+
+def test_do_not_rewrite_is_not_do_not_rebuild(gate: ModuleType) -> None:
+    """A bar with no already-done claim beside it is not a rebuild bar.
+
+    The plausible wrong needle is the imperative alone. It fires on #347, #353 and #1007, which say
+    "do not rewrite" about a tool's OUTPUT, and none of those rows is built.
+    """
+    level, _ = gate.judge(_item(gate, **_BUILDABLE), body=_DO_NOT_REWRITE)
+    assert level == "ok"
+
+
+def test_the_must_be_read_note_leads(gate: ModuleType) -> None:
+    """Ordering is load-bearing, so it is asserted rather than left to a comment.
+
+    The gated-verdict note says scoping and research are legitimate; the closing-act note ends "That
+    is a complete outcome, not a failure". Either one, read first, tells a seat there is work to
+    start here. On a row whose work has already shipped there is none.
+    """
+    _, note = gate.judge(
+        _item(gate, **{"closing-act": "scorecard-rescore", "verdict": "demand-gate"}),
+        body=_ALREADY_BUILT_BODY,
+    )
+    assert "MUST BE READ" in note
+    assert "DO NOT JUST BUILD IT" in note, "precondition: both notes present, or there is no order"
+    assert "complete outcome" in note, "precondition: the closing-act note is present too"
+    assert note.index("MUST BE READ") < note.index("DO NOT JUST BUILD IT")
+    assert note.index("MUST BE READ") < note.index("complete outcome")
+
+
+def test_must_be_read_outranks_advise(gate: ModuleType) -> None:
+    """#1107's real shape: the advise reasons are present too, and must not take the headline.
+
+    The plausible wrong wiring tests `if notes` before the read level. That passes every fixture in
+    this section that carries no advise reason, and makes the level unreachable on the live ledger:
+    three of the four rows this limb exists for close by `scorecard-rescore`.
+    """
+    level, note = gate.judge(
+        _item(
+            gate,
+            **{
+                "closing-act": "scorecard-rescore",
+                "verdict": "research",
+                "research": "done 2026-08-20",
+            },
+        ),
+        body=_ALREADY_BUILT_BODY,
+    )
+    assert level == "read"
+    # Nothing is hidden by the ranking -- the advise reason still rides in the note.
+    assert "ASVS Tracker" in note
+
+
+def test_a_retirement_still_leads_a_must_be_read(gate: ModuleType) -> None:
+    """A retirement is the stronger claim: the row is dead, not merely finished."""
+    _, note = gate.judge(_item(gate, **_BUILDABLE), body=_RETIRED_BODY + _ALREADY_BUILT_BODY)
+    assert "RETIRED IN PLACE" in note
+    assert "MUST BE READ" in note, "precondition: both leads present, or there is no order"
+    assert note.index("RETIRED IN PLACE") < note.index("MUST BE READ")
+
+
+def test_an_undeclared_row_is_still_told_its_work_is_built(gate: ModuleType) -> None:
+    """Refuse still wins the LEVEL, but not the whole message.
+
+    Without the lead, the reader of an already-built undeclared row is told to go and add three
+    banner lines to a row whose work has shipped.
+    """
+    level, note = gate.judge(_item(gate), body=_ALREADY_BUILT_BODY)
+    assert level == "refuse"
+    assert "missing:" in note, "the refusal must still enumerate what to add"
+    assert note.startswith("MUST BE READ")
+
+
+def test_no_banner_returns_todays_answer(gate: ModuleType) -> None:
+    """The default is EMPTY, and that default is the honest failure mode: no text, no claim."""
+    assert gate.judge(_item(gate, **_BUILDABLE), body=_PLAIN_BODY) == gate.judge(
+        _item(gate, **_BUILDABLE), body=_PLAIN_BODY, banner=""
+    )
+    level, note = gate.judge(_item(gate, **_BUILDABLE))
+    assert level == "ok"
+    assert "MUST BE READ" not in note
+
+
+def test_the_loader_carries_the_banner_and_the_body_apart(gate: ModuleType, tmp_path: Path) -> None:
+    """Both regions come off ONE `Item.body_line` read, and neither re-derives the boundary.
+
+    The retirement needle must not see the banner and the already-built needle must. A loader that
+    returned the banner inside `body` would pass every arm above while re-opening the false positive
+    the retirement limb was corrected to remove.
+    """
+    rows = gate.load_ledger(_mini_ledger(tmp_path, _BANNER_QUOTES_A_RETIREMENT))
+    row = rows[4246]
+    assert "Scored 2026-09-03" not in row.body, "the banner leaked into the retirement region"
+    assert "Scored 2026-09-03" in row.banner, "the banner region came back empty"
+    assert row.body.startswith("## 4246."), "the heading belongs to the body, for #1311's needle"
+    assert not row.banner.startswith("## 4246."), "the heading must not be counted twice"
+
+
+# ------------------------------------------------------------- the live-ledger arm (BACKLOG #1393)
+#
+# Measured on this branch's base: 657 items across the two ledger files, 275 of them open. These
+# four are the rows #1393 names, all four still open, and all four dispatched clean before this
+# limb -- #1242 as `ok`, with a note byte-identical to an ordinary build item's.
+#
+# WHEN THIS GOES RED, RE-MEASURE -- do not delete the number. A row moving to the archive is fine:
+# both files are read as one namespace. What this catches is the declaration WORDING drifting out
+# from under the needle, and that is a real miss, not a test fault.
+_ALREADY_BUILT_ROWS = {1107, 1130, 1183, 1242}
+
+# Rows that must NOT fire, each a different trap, each measured on the live ledger:
+#   #1393  this row itself -- its TITLE narrates the pattern and its TABLE quotes all four rows
+#   #1394  the sibling row, which restates the same class in prose
+#   #1398  the third row of that family: a row can be built with nothing in its text saying so
+#   #353   "Do not auto-correct ... never rewrite" -- a bar about OUTPUT, not about work
+#   #1007  the same wording, in a different row
+#   #1020  the mirror defect #1393 names: a bar that has already expired by its own terms
+#   #1334  the row that documents the RETIREMENT convention, whose banner quotes other rows
+_MUST_NOT_FIRE_REBUILD = {353, 1007, 1020, 1334, 1393, 1394, 1398}
+
+
+def test_every_already_built_row_in_the_live_ledger_is_named(gate: ModuleType) -> None:
+    """Non-vacuity. A needle proven only on fixtures fires on nothing real and looks identical."""
+    rows = gate.load_ledger(_ROOT)
+    assert len(rows) >= gate.MIN_ITEMS, (
+        f"instrument: parsed {len(rows)} items from {_ROOT}, below the gate's own floor of "
+        f"{gate.MIN_ITEMS}. The ledger did not resolve, so nothing below is evidence."
+    )
+    absent = _ALREADY_BUILT_ROWS - set(rows)
+    assert not absent, f"the ledger no longer carries {sorted(absent)} -- re-measure this test"
+
+    for num in sorted(_ALREADY_BUILT_ROWS):
+        row = rows[num]
+        level, note = gate.judge(row.item, body=row.body, banner=row.banner)
+        assert "MUST BE READ" in note, f"#{num} dispatches without its own sentence read: {note}"
+        assert level == "read", f"#{num}: {level}"
+
+
+def test_the_needle_does_not_fire_on_rows_that_describe_the_defect(gate: ModuleType) -> None:
+    """The over-fire arm, with the denominator, because a clean run otherwise reads as coverage."""
+    rows = gate.load_ledger(_ROOT)
+    assert len(rows) >= gate.MIN_ITEMS, "instrument: the ledger did not resolve"
+
+    open_rows = {n: r for n, r in rows.items() if r.item.is_open}
+    fired = {
+        n
+        for n, r in open_rows.items()
+        if gate.rebuild_marker("\n".join((r.body, r.banner))) is not None
+    }
+    bare = {
+        n
+        for n, r in open_rows.items()
+        if re.search(r"rebuild|already (?:shipped|built)", r.body + r.banner, re.I)
+    }
+
+    hit = _MUST_NOT_FIRE_REBUILD & fired
+    assert not hit, f"fired on a row that describes the defect rather than declaring one: {hit}"
+    # THE DENOMINATOR IS PART OF THE RESULT. Measured on this branch's base: 35 open rows carry the
+    # bare words and 7 declare their work built. If those numbers converge, the corpus has stopped
+    # containing the landmine and a bare-word screen would pass this file -- the wrong needle.
+    assert len(fired) * 3 < len(bare), (
+        f"the narrowing is not exercised: {len(bare)} open rows carry the bare words and "
+        f"{len(fired)} fired. Close numbers mean this file no longer proves the needle is narrow."
+    )
+
+
+def test_a_must_be_read_row_does_not_block_even_under_refuse(
+    gate: ModuleType, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """MUST BE READ is a level, never a verdict, and --refuse is the place that would betray it.
+
+    Blocking here would rebuild the screen #1394 records, which discarded 46 percent of the live
+    ledger on a token match and produced a withdrawn "nothing is dispatchable" finding.
+    """
+    ledger = _FILLER + (
+        f"## 999997. research an honest pass for ASVS 1.2.2\n{_OPEN}\n> Closing-act: code\n\n"
+        "**SHIPPED IN `#488` AT `cf38e16a`, AND STILL OPEN ON PURPOSE. DO NOT REBUILD IT.**\n"
+    )
+    root = _ledger_root(tmp_path, ledger)
+    assert gate.main(["999997", "--root", str(root), "--refuse"]) == 0
+    out = capsys.readouterr().out
+    assert "MUST BE READ" in out
+    assert "DOES NOT BLOCK" in out
