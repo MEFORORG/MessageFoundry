@@ -1586,6 +1586,11 @@ def create_app(
         # stash-or-default pattern — settings-scoped, so this route reports it completely even with no
         # graph loaded, unlike the connection-scoped cleartext_accepted set below.
         alerts_settings = getattr(request.app.state, "alerts_settings", None) or AlertsSettings()
+        # BACKLOG #1004: [secret_rotation] carries the store DEK's calendar-expiry opt-out. Same
+        # stash-or-default pattern — settings-scoped, so this route reports it completely with no graph.
+        secret_rotation_settings = (
+            getattr(request.app.state, "secret_rotation_settings", None) or SecretRotationSettings()
+        )
         # ADR 0153 + #333: the THREE connection-scoped deviations. Read LIVE off the running graph (so a
         # reload is reflected) — this route is where an operator learns a cleartext hop is being crossed
         # by declaration, an expired certificate is being honoured, or a generic DB hop has no verifying
@@ -1616,6 +1621,7 @@ def create_app(
                 store,
                 auth_settings,
                 alerts_settings,
+                secret_rotation_settings,
                 cleartext_hops,
                 expired_hops,
                 db_hops,
@@ -6143,6 +6149,10 @@ def create_managed_app(
             # window. None (the direct create_app / embedding path) leaves that check inert — deny-by-default
             # for a monitoring signal, and byte-identical to before.
             app.state.cert_monitor_settings = cert_monitor_settings
+            # BACKLOG #1004: back GET /security/posture's enforce_store_key_expiry loosening entry.
+            # None (direct create_app / embedding) leaves the route on shipped defaults, which report
+            # nothing — correct, because an app built without [secret_rotation] has not opted out.
+            app.state.secret_rotation_settings = secret_rotation_settings
             # #118: expose the connector SecretProvider so POST /alerts/test-email can resolve an
             # email_password_secret reference (fail-closed) exactly as notifier_from_settings does. None on
             # the embedded/test path — then only a plain env-sourced email_password can be tested.

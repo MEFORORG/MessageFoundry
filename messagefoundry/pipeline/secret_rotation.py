@@ -15,7 +15,10 @@ keyed start :func:`reconcile_rotation_meta` persists a NON-SECRET stamp (the DEK
 class the engine holds is fingerprinted with a **DEK-derived KEYED MAC** (HMAC — never a salted hash, so
 a low-entropy secret is not offline-guessable) into store meta; when a fingerprint changes the clock is
 reset (rotation **auto-detected**, never operator-attested). Under ``[security].enforcement=ENFORCE`` a
-DEK past ``max_age + grace`` escalates its alert severity at restart.
+DEK past ``max_age + grace`` escalates its alert severity at restart **and the engine refuses to start**
+(:func:`enforce_store_key_expiry`, BACKLOG #1004) — the calendar axis now stops, the way the usage axis
+always has. ``[secret_rotation].enforce_store_key_expiry = false`` is the operator escape, and it is a
+named security loosening rather than a quiet one.
 
 **PHI/secret-safe:** a secret value is read only transiently to compute its keyed MAC; only the MAC +
 the *dates* (plus a static human label + config identifier per secret) are ever persisted, alerted, or
@@ -56,6 +59,8 @@ __all__ = [
     "SecretCheck",
     "SecretRotationRunner",
     "SecretStamp",
+    "StoreKeyRotationOverdueError",
+    "enforce_store_key_expiry",
     "reconcile_rotation_meta",
     "secrets_from_settings",
     "secrets_from_settings_and_stamps",
@@ -349,6 +354,137 @@ def _maybe_escalate_dek(
             )
         except Exception:
             log.warning("secret_rotation ENFORCE escalation sink failed", exc_info=True)
+
+
+class StoreKeyRotationOverdueError(RuntimeError):
+    """The store DEK's **calendar** expiry is past due — or its age cannot be determined at all — under
+    ``[security].enforcement=ENFORCE``, so the engine REFUSES to start (ASVS 13.3.4, BACKLOG #1004).
+
+    The DEK has two expiry axes and, before this, only one of them stopped anything. The **usage** axis
+    refuses unconditionally at ``2**32`` encrypts
+    (:class:`~messagefoundry.store.crypto.AesGcmCipher` raises ``CipherError``); the **calendar** axis
+    computed the same overdue condition and emitted a single alert. An alert an operator can miss is not
+    an expiry, so the documented annual cadence was unenforced. This is the calendar axis's refusal.
+
+    **Deliberately raised OUTSIDE the blanket ``except Exception`` that guards the rotation-meta
+    reconcile in :meth:`Engine.start`.** Sited beneath it, this exception would be logged and stepped
+    over and the engine would start normally — a traceback, not a control. It propagates out of
+    ``Engine.start()`` and aborts the ASGI lifespan.
+
+    **Two distinct causes, and both refuse.** A *known* effective last-rotated date past
+    ``store_key_max_age_days + enforce_grace_days``; or an **undetermined** age (the reconcile failed,
+    leaving no stamp, and no ``store_key_last_rotated`` override is set). An undetermined age is not a
+    young one: rendering it as safe would re-create the very defect this class replaces, one level
+    removed and on shipped defaults.
+
+    The operator escape is ``[secret_rotation].enforce_store_key_expiry = false``, which suppresses the
+    refusal and keeps the alert. It is a LOOSENING and ``security_loosenings()`` names it on every
+    boot."""
+
+    def __init__(self, detail: str, *, last_rotated: str, days_overdue: int | None) -> None:
+        super().__init__(
+            f"{_DEK_LABEL} ({_DEK_SECRET_ID}): {detail}. The engine REFUSES to start under "
+            "[security].enforcement=enforce. Rotate the key (`messagefoundry rotate-key`), or record "
+            "the real rotation date in [secret_rotation].store_key_last_rotated, or set "
+            "[secret_rotation].enforce_store_key_expiry = false to run on a calendar-expired key "
+            "(a LOOSENING — it is named in the boot posture read-out)."
+        )
+        self.last_rotated = last_rotated
+        self.days_overdue = days_overdue
+
+
+def enforce_store_key_expiry(
+    settings: SecretRotationSettings,
+    stamps: Mapping[str, SecretStamp],
+    *,
+    enforcement: SecurityEnforcement,
+    dek_key_id: str | None,
+    alert_sink: AlertSink | None = None,
+    now: float | None = None,
+) -> None:
+    """The store DEK's calendar-expiry **refusal** (ASVS 13.3.4, BACKLOG #1004) — raise
+    :class:`StoreKeyRotationOverdueError` when the key is past
+    ``store_key_max_age_days + enforce_grace_days``, or when its age cannot be determined.
+
+    **Call this OUTSIDE the caller's blanket exception handler.** It is a control, and a control a
+    handler swallows is a log line. :meth:`Engine.start` calls it after the guarded reconcile precisely
+    so the refusal reaches the lifespan.
+
+    Gated exactly as the escalation alert beside it is: ``[security].enforcement=ENFORCE`` and a keyed
+    store (``dek_key_id`` present — a keyless or ``vault_transit`` store has no local DEK to expire). It
+    reuses the SAME arithmetic ``_maybe_escalate_dek`` computes, off the same three shipped knobs, so
+    the alert and the refusal can never disagree about what "overdue" means.
+
+    ``enforce_store_key_expiry = false`` suppresses the **raise** and nothing else: the reminder still
+    fires, because an operator who accepted the risk still needs to be told the key is stale.
+
+    PHI/secret-safe: reads dates and a one-way key-id, never key material."""
+    if enforcement is not SecurityEnforcement.ENFORCE:
+        return
+    if not dek_key_id:
+        return  # keyless / vault_transit store — no local DEK, nothing to expire
+    sink = alert_sink or LoggingAlertSink()
+    ts = time.time() if now is None else now
+    today = datetime.datetime.fromtimestamp(ts, tz=_UTC).date()
+
+    dek_stamp = stamps.get(_DEK_SECRET_ID)
+    if settings.store_key_last_rotated:
+        eff_last = datetime.date.fromisoformat(settings.store_key_last_rotated)
+    elif dek_stamp is not None:
+        eff_last = dek_stamp.last_rotated
+    else:
+        # UNDETERMINED age, and the store IS keyed and DOES track rotation meta — so this is not the
+        # keyless case, it is a reconcile that failed and was swallowed upstream. Ruled to REFUSE: an
+        # undetermined age is not a young one, and the empty-scan-reads-as-clean-scan failure is exactly
+        # what this item exists to remove. The alert is emitted IN ADDITION, never instead, and its
+        # sink is contained so a broken notifier cannot swallow the stop.
+        try:
+            sink.secret_rotation_due(
+                _DEK_LABEL,
+                secret=_DEK_SECRET_ID,  # nosec B106 — the secret's env-var NAME, never its value
+                last_rotated="unknown",
+                # NOT a measurement — there is no date to measure from. This is the DECISION expressed
+                # in the field's own units: the smallest value that satisfies the refusal predicate, so
+                # a rule keyed on `days_overdue` routes it like any other enforced expiry. The truth is
+                # carried by `last_rotated="unknown"`, which every sink renders.
+                days_overdue=settings.enforce_grace_days + 1,
+                enforced=True,
+            )
+        except Exception:
+            log.warning("secret_rotation expiry-refusal sink failed", exc_info=True)
+        if not settings.enforce_store_key_expiry:
+            log.error(
+                "store DEK rotation age is UNDETERMINED and the calendar expiry is DISABLED "
+                "([secret_rotation].enforce_store_key_expiry=false) — starting on an unverified key age"
+            )
+            return
+        raise StoreKeyRotationOverdueError(
+            "its rotation age could not be determined (the rotation-meta reconcile failed and no "
+            "[secret_rotation].store_key_last_rotated is set), and an undetermined age is not a "
+            "young one",
+            last_rotated="unknown",
+            days_overdue=None,
+        )
+
+    days_overdue = (today - eff_last).days - settings.store_key_max_age_days
+    if days_overdue <= settings.enforce_grace_days:
+        return
+    # The alert already fired from `_maybe_escalate_dek` on this same condition — do not double-send.
+    if not settings.enforce_store_key_expiry:
+        log.error(
+            "store DEK is %d day(s) past its max age (last_rotated=%s) and the calendar expiry is "
+            "DISABLED ([secret_rotation].enforce_store_key_expiry=false) — starting on an expired key",
+            days_overdue,
+            eff_last.isoformat(),
+        )
+        return
+    raise StoreKeyRotationOverdueError(
+        f"it is {days_overdue} day(s) past its {settings.store_key_max_age_days}-day max age "
+        f"(last rotated {eff_last.isoformat()}), beyond the "
+        f"{settings.enforce_grace_days}-day enforcement grace",
+        last_rotated=eff_last.isoformat(),
+        days_overdue=days_overdue,
+    )
 
 
 class SecretRotationRunner:

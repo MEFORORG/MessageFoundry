@@ -236,13 +236,25 @@ erasure.
 ### Rotation schedule (ASVS 13.1.4 / 13.3.4)
 
 A rotation cadence per critical secret, justified against the threat model + HIPAA. These are
-**operator-policy defaults** — the engine does **not** force-rotate or hard-expire a secret (rotation
-*execution* stays operator- / secret-manager-driven, by design). It **does** now **monitor** the cadence
+**operator-policy defaults** — the engine does **not** force-rotate a secret (rotation *execution* stays
+operator- / secret-manager-driven, by design). **The store DEK is the one exception, and it is a hard
+expiry**: see the note directly below. The engine **monitors** every cadence
 (ASVS 13.3.4, BACKLOG #282): the store DEK is tracked live-by-default and every configured secret class
 the engine holds is fingerprinted with a **DEK-derived keyed MAC** in store meta, so a **rotation is
 auto-detected** (the fingerprint changes → the clock resets) and a `secret_rotation_due` alert fires
 against the cadence below — never operator-attested, and carrying only dates + a one-way MAC, never a
-value. Under `[security].enforcement=ENFORCE` a DEK past its max-age + grace **escalates** at restart.
+value.
+
+> **The store DEK's calendar cadence is ENFORCED, not suggested** (ASVS 13.3.4, BACKLOG #1004). Under
+> `[security].enforcement=ENFORCE` with a keyed store, a DEK past `store_key_max_age_days +
+> enforce_grace_days` — or one whose age cannot be determined — **aborts engine start**
+> (`StoreKeyRotationOverdueError`), in addition to the escalated alert rather than instead of it. The
+> annual cadence in the table below is therefore a control on this one row, not a recommendation. The
+> same key's **usage** axis has always refused unconditionally at 2^32 encrypts; this brings the calendar
+> axis level with it. `[secret_rotation].enforce_store_key_expiry = false` keeps the alert and drops the
+> refusal, and is reported by `security_loosenings()` on every boot. **This paragraph is a RECORD
+> CORRECTION that FOLLOWS a shipped code change, not a lever:** the sentences it replaces became false
+> when the refusal landed, and an edit that *substituted* for the code would be the forbidden move.
 
 | Secret (env var / connector setting) | Suggested cadence | Trigger / notes |
 |---|---|---|
@@ -282,8 +294,9 @@ value. Under `[security].enforcement=ENFORCE` a DEK past its max-age + grace **e
 > cert (`[logging].forward_tls_client_cert`, a single combined PEM). Each secret **value** is
 > **`env()`-sourced — never the config file (the fixed `MEFOR_*` set is enforced by
 > `settings._FILE_SECRET_KEYS`) — and `/metadata` viewer-redacted**. Rotation *execution* stays operator-
-> / secret-manager-driven — the engine never force-rotates or hard-expires a secret (session tokens are the
-> one engine-expired credential) — but it now **monitors** the cadence and **auto-detects** a rotation
+> / secret-manager-driven — the engine never force-rotates a secret, and the only credentials it
+> hard-expires are session tokens and the **store DEK** (BACKLOG #1004: a calendar-overdue DEK refuses to
+> start under ENFORCE) — but it now **monitors** the cadence and **auto-detects** a rotation
 > (ASVS 13.3.4 — see the rotation-watcher note below). **This enumeration is drift-guarded by
 > `tests/test_secret_rotation_inventory.py`**, which fails the build when a new `MEFOR_*` secret name (`…_TOKEN` / `…_SECRET` / `…_PASSWORD` /
 > `…_KEY`) appears in `messagefoundry/` without a row here — the exact 2026-07-16 regression that put this cell
@@ -312,6 +325,13 @@ value. Under `[security].enforcement=ENFORCE` a DEK past its max-age + grace **e
 > - **ENFORCE escalation (committed).** Under `[security].enforcement=ENFORCE`, a DEK older than
 >   `store_key_max_age_days + enforce_grace_days` escalates its `secret_rotation_due` alert (`enforced`,
 >   logged at ERROR) at restart.
+> - **ENFORCE refusal (BACKLOG #1004).** The same condition, on the same arithmetic, then **stops the
+>   start**: `enforce_store_key_expiry` raises `StoreKeyRotationOverdueError` out of `Engine.start()`,
+>   aborting the ASGI lifespan. It is called **outside** the blanket handler guarding the reconcile above
+>   — beneath it the refusal would be logged and stepped over, which is a traceback rather than a
+>   control. An **undetermined** age (the reconcile failed and no `store_key_last_rotated` override is
+>   set) refuses too: an undetermined age is not a young one. `enforce_store_key_expiry = false` keeps the
+>   alert, drops the refusal, and is named as a security loosening on every boot.
 > - **Review cadence.** This section + the keyed-secret enumeration are reviewed **quarterly** and on any
 >   new `[store].cipher_provider` / `CRITICAL_SECRETS` change, tied to the drift guard above +
 >   `scripts/security/crypto_inventory_check.py` so the definition cannot silently rot.
