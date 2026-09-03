@@ -17922,6 +17922,44 @@ today's instance and leaves the instrument exactly as blind.**
 > is a different set of runs the PR page does not surface.
 >
 > **Scored 2026-09-03 -> P2.** Value **6/10** · Difficulty **3/10** · _quick win_. Partly shipped, and more has landed since filing than the first pass credited. The visibility half is in -- .github/workflows/failure-signal.yml:71 recovers the pull request number from a merge_group ref and :92 applies ci-red, so an ejection is recorded, though nothing in this tree reads that label (grep for ci-red returns the writing workflow plus prose at CLAUDE.md:302 and docs/METHOD.md:365). The windows-2025 hang limb is no longer undiagnosed either: .github/workflows/ci.yml:852 now passes --max-worker-restart=0, landed 2026-09-02 in 042ef7ff5, and the comment from :826 to :850 reads the mechanism out of the pinned pytest-xdist and records four hangs of 25 to 46 minutes with the inner watchdogs armed, which is this row's process-level deadlock below pytest. What is left is two tests -- tests/test_api_request_timeout.py:99 still runs a route against a 0.1 second deadline, and tests/test_sqlserver_store.py:4039 is unchanged and runs at ci.yml:1772 under a wrapper that retries only a native crash (ci.yml:1769), never exit 1; the hostile-disposition test the row names was already a ratio assertion before filing (tests/test_multipart.py:142). Difficulty falls to 3 because the hard limb landed and the seams exist -- pyproject.toml:195 already ships pytest-rerunfailures and tests/test_load_failover_sqlserver.py:71 marks a sibling flaky -- with the SQL Server arm provable only on the gated CI leg.
+>
+> **WORKED 2026-09-03. Two limbs closed, one was already closed by somebody else, and the run
+> census in this item is wrong by one -- there were FOUR failing `merge_group` CI runs, not three.**
+> Read from the Actions API with `--paginate`; an unpaginated `per_page=100` query returns 100 of
+> `total_count` 190 and silently drops half the population, which is the truncation trap #1417's
+> notes already record. The corrected census, each attributed from its own job log:
+>
+> | run | id | failing job | failing test |
+> |---|---|---|---|
+> | 11:15:01Z | 33249679477 | test (windows-2025) | hung 55 min, no FAILED line |
+> | 11:37:13Z | 33250553925 | test (windows-2025) | `test_api_request_timeout.py::test_a_fast_handler_is_untouched` -- `assert 503 == 200` |
+> | 12:42:51Z | 33253197221 | test (windows-2025) + sql server 2022 | `test_multipart.py::test_hostile_disposition_header_parses_in_linear_time`; `test_cipher_invocations_upsert_is_atomic_and_additive` |
+> | 13:01:54Z | 33253973185 | test (windows-2025) + sql server 2025 | `test_dr_activation`, `test_connscale_smoke` x2; `test_cipher_invocations_upsert_is_atomic_and_additive` |
+>
+> **So "three DIFFERENT reasons with no overlap" is not what the logs say.** The SQL Server test
+> failed in BOTH of the last two runs, identically. The no-overlap claim held only across the three
+> runs the original pass sampled.
+>
+> **Closed here.** (1) `tests/test_api_request_timeout.py` -- the 0.1s deadline is gone from the arms
+> that assert a prompt handler is UNTOUCHED, which is the arm that actually ejected #669 at 11:37.
+> The arms asserting the bound FIRES keep 0.1s, because there the margin runs the forgiving way.
+> While in the file, `test_a_disabled_deadline_lets_a_slow_handler_finish` asked the FAST route, so
+> it could not fail for its stated reason; it asks the slow route now. (2) `scripts/ci/report_ci_red.py`
+> reads the `ci-red` label back and names the run, marking `merge_group` runs as invisible on the PR
+> page -- the half that was missing since PR #716 wrote the label.
+>
+> **Already closed by #738, not by this item.** `test_cipher_invocations_upsert_is_atomic_and_additive`
+> failed `StoreAcquireTimeout` after 30s because the aioodbc pool shared the event loop's default
+> executor (8 threads on a 4-vCPU runner) against a `pool_size` of 40, so 20 concurrent upserts
+> deadlocked on the executor queue. `cc5e09e1e` (2026-09-02) gave the store its own executor and names
+> this exact test and error in its message. Nothing was rebuilt here.
+>
+> **STILL OPEN, and it is the one the earlier pass waved through.**
+> `test_multipart.py::test_hostile_disposition_header_parses_in_linear_time` was dismissed as "already
+> a ratio assertion". It is one, and it ejected #669 anyway: it failed at ratio **8.02 against a bound
+> of 8.0**, a 0.25 percent margin. The best-of-3 sampling it relies on landed 2026-07-28 in
+> `db53fd45d`, so the code that failed is the code in the tree today. Being a ratio rather than a
+> wall-clock budget did not save it, and this needs its own read.
 
 **Cluster:** CI / merge queue. **Priority:** P2. **Verdict:** build.
 **Severity:** a PR whose every required check is green cannot land, and nothing on the PR says why.
