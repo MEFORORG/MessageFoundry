@@ -495,12 +495,10 @@ jobs:
     #
     # ASVS 15.2.4 (dependency confusion). `messagefoundry-webconsole` is REGISTERED on PyPI -- the first
     # `webconsole-v*` run of this job created the project on 2026-07-29 -- so this job now republishes a
-    # name the project owns rather than creating one, and shipped text may name it in a bare-name install.
-    # This comment used to describe the pre-claim window (a PENDING Trusted Publisher grants permission to
-    # publish but reserves nothing, so an un-uploaded name stays claimable by anyone while our own docs
-    # reference it). That window is CLOSED; the text is corrected here rather than left to read as current
-    # (BACKLOG #1193). tests/test_install_instruction_provenance.py holds the classification
-    # (`_PUBLISHED_DISTRIBUTIONS`) and fails if any tracked text drifts back to the pre-claim claim.
+    # name the project owns, and shipped text may name it in a bare-name install. The pre-claim wording
+    # that stood here is retired rather than restated as a retraction (BACKLOG #1193).
+    # tests/test_install_instruction_provenance.py holds the classification (`_PUBLISHED_DISTRIBUTIONS`)
+    # and fails if any tracked text drifts back to the pre-claim claim.
     if: github.repository == 'MEFORORG/MessageFoundry' && startsWith(github.ref_name, 'webconsole-')
     runs-on: ubuntu-latest
     permissions:
