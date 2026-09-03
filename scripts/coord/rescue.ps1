@@ -320,17 +320,19 @@ foreach ($rec in $records) {
             $behindOk = ($LASTEXITCODE -eq 0)
             $ahead = (& git -C $repo rev-list --count "$tip..$commit" 2>$null)
             $aheadOk = ($LASTEXITCODE -eq 0)
+            # MECHANISM CHANGES THE SENTENCE, NEVER THE VERDICT, and only where the branch is ALIVE
+            # -- which is the only place this arm runs. A snapshot behind its branch is behind it
+            # forever, because nothing re-takes it. A push-updated ref behind its branch is a
+            # different fact: the hook force-moves it on the next commit. Reporting the two in
+            # identical words is the collapse this item exists to name.
+            $lagging = ($mechanism -eq $PUSH_UPDATED)
             if (-not $behindOk -or -not $aheadOk) {
                 $verdict = 'UNVERIFIABLE'
                 $detail = "git could not compare against $branchName in this clone -- a statement about THIS CLONE, not about the ref"
             }
             elseif ($ahead -eq '0') {
                 $verdict = 'BEHIND'
-                # MECHANISM CHANGES THE SENTENCE, NEVER THE VERDICT. A snapshot behind its branch is
-                # behind it forever, because nothing re-takes it. A push-updated ref behind its
-                # branch is a different fact -- the hook force-moves it on the next commit -- and
-                # reporting the two in identical words is the collapse this item exists to name.
-                $detail = if ($mechanism -eq $PUSH_UPDATED) {
+                $detail = if ($lagging) {
                     "$behind commit(s) short of $branchName -- re-pushed as the branch moves, so this may merely be LAGGING"
                 }
                 else {
@@ -339,7 +341,7 @@ foreach ($rec in $records) {
             }
             else {
                 $verdict = 'DIVERGED'
-                $detail = if ($mechanism -eq $PUSH_UPDATED) {
+                $detail = if ($lagging) {
                     "$behind behind / $ahead ahead of $branchName -- re-pushed, so the behind half may merely be LAGGING"
                 }
                 else {
@@ -374,13 +376,16 @@ foreach ($rec in $records) {
 }
 
 #: Coverage, per namespace, including the ones that matched nothing. Built before the JSON branch so
-#: both outputs report the same thing.
+#: both outputs report the same thing. Grouped in ONE pass rather than filtering $rows per namespace,
+#: which walked 3187 rows six times in the checkout this was measured on.
+$byNamespace = @{}
+foreach ($g in ($rows | Group-Object namespace)) { $byNamespace[[string]$g.Name] = $g.Count }
 $coverage = @()
 foreach ($p in $namespaces.Keys) {
     $coverage += [pscustomobject]@{
         namespace = $p
         mechanism = $namespaces[$p]
-        count     = @($rows | Where-Object namespace -eq $p).Count
+        count     = if ($byNamespace.ContainsKey($p)) { $byNamespace[$p] } else { 0 }
     }
 }
 
@@ -402,8 +407,10 @@ Write-Host "EXAMINED $($rows.Count) ref(s) across $($coverage.Count) namespace(s
 foreach ($c in $coverage) {
     Write-Host ("  {0,6}  {1,-13} {2}" -f $c.count, $c.mechanism, $c.namespace)
 }
-Write-Host "  $SNAPSHOT      = a one-time capture. Nothing re-takes it, so staleness here is PERMANENT."
-Write-Host "  $PUSH_UPDATED  = force-moved by the durability hook, so a ref behind a LIVE branch may"
+# The mechanism names are padded by the format string, not by hand-counted spaces: renaming a
+# constant must not silently shear the legend away from the table above it.
+Write-Host ("  {0,-13}= a one-time capture. Nothing re-takes it, so staleness here is PERMANENT." -f $SNAPSHOT)
+Write-Host ("  {0,-13}= force-moved by the durability hook, so a ref behind a LIVE branch may" -f $PUSH_UPDATED)
 Write-Host "                 merely be lagging. Once that branch is gone, nothing pushes again and"
 Write-Host "                 the two mechanisms are equally final."
 Write-Host "  The counts OVERLAP by construction: remote.<remote>.fetch remaps refs/tags/rescue/*"
