@@ -68,8 +68,8 @@ Scorecard runs on the same mirror and surfaced **48 findings**. These are **repo
   → `tests/test_ci_venv_pinning.py`
 - **AC-6** — WHEN the multipart parser reads an uploaded part, THE SYSTEM SHALL bound that part's header block before parsing it, so the header scan's input size is set by the parser and not by the request-body cap.
   → `tests/test_multipart.py::test_oversized_part_header_is_refused_not_parsed`
-- **AC-7** — WHEN the multipart parser scans a `Content-Disposition` line, THE SYSTEM SHALL do so in time linear in the line's length.
-  → `tests/test_multipart.py::test_hostile_disposition_header_parses_in_linear_time`
+- **AC-7** — WHEN the multipart parser scans a `Content-Disposition` line, THE SYSTEM SHALL do so without super-linear cost: the largest header block the parser admits SHALL be scanned in a small, bounded slice of the asyncio event loop. *(Reworded 2026-09-03 under BACKLOG #1385. The criterion used to say "in time linear in the line's length" and was verified by a growth-ratio assertion, which ejected PR 669 at ratio 8.02 against a bound of 8.0. A budget on the admitted worst case carries ~290x of headroom where that ratio carried 1.9x, and it is paired with a positive control so it cannot pass vacuously.)*
+  → `tests/test_multipart.py::test_a_hostile_disposition_header_stays_inside_the_scan_budget` · `tests/test_multipart.py::test_the_unguarded_pattern_blows_that_same_budget`
 - **AC-8** — WHERE a CI job installs a third-party quality or security tool that this repo routes through a PEP 735 dependency group, THE SYSTEM SHALL install it from a hash-pinned `uv export` with `--require-hashes`, and THAT lock SHALL be regenerated and diff-gated by the DEP-1 step rather than hand-maintained.
   → `tests/test_ci_venv_pinning.py` (`test_lock_installed_toolchain_*`, `test_moved_tools_are_declared_in_a_dependency_group`, `test_no_moved_tool_is_reinstalled_inline`) · `tests/test_dep1_lock_resync_lockstep.py`
 
