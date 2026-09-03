@@ -143,6 +143,21 @@ jobs:
           # the advisory half not block, move the ci-quality line alone to its own step.
           pip-audit -r ci/locks/ci-scanners.lock --desc
           pip-audit -r ci/locks/ci-quality.lock --desc
+          # THE SIGNING TOOLCHAIN, and it is the one that most needs this (BACKLOG #332). a9354808e
+          # added ci/locks/release-tools.lock to the export set and the byte-diff gate above but NOT
+          # here, so from 2026-08-29 until this line landed the release signing closure was the only
+          # committed lock nothing audited -- hash-pinned, therefore sticky, therefore exactly the
+          # "pinned, stale, unpatched is worse than floating" case the two lines above exist to stop.
+          # It is also load-bearing for .github/dependabot.yml's `sigstore` ignore entry: that entry
+          # suppresses the security track for >=4.5.0, and is only acceptable while this audit can
+          # still see an advisory in the pinned closure. REMOVE THIS LINE AND YOU MUST REMOVE THAT
+          # ENTRY -- the comment there says so from the other side.
+          #
+          # Same REQUIRED-context consequence as the two above, and a better-earned one: a CVE in
+          # sigstore's closure reds the merge gate. That closure signs the wheel, the sdist, the SBOM
+          # and the VEX with the job's OIDC identity, so blocking is the wanted behaviour, not a cost
+          # reluctantly accepted for an advisory tool. `--ignore-vuln <ID>` remains the escape hatch.
+          pip-audit -r ci/locks/release-tools.lock --desc
       # ANTI-SLOPSQUAT. Deliberately a STEP in this already-REQUIRED job rather than a new context: it
       # blocks today with no branch-protection change, the same reasoning as the ledger-gate backstop
       # in ci.yml. (A hard-failing job that is NOT a required context does not stop auto-merge — it
