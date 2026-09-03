@@ -13994,6 +13994,105 @@ IS WORSE THAN AN UNSTARTED ONE, BECAUSE IT LANDS LOOKING COMPLETE.***
 
 It also wants the **full engine suite**, which a previous lane measured at **37 minutes**. *Give it
 runway or give it to nobody.*
+
+**PROGRESS 2026-09-03 -- THE FLIP IS STILL UNMADE, AND THE ROW'S NAMED EVIDENCE GAP IS NOW CLOSED.**
+A lane built the flip, could not complete the full engine suite, and reverted it per this row's own
+dispatch note. `[sandbox].mode` is unchanged at `"off"`. What that lane ran, and what it found, is
+below so the next lane does not re-derive any of it.
+
+*Why it did not land.* The suite reached **4 percent in 18 minutes** and was stopped. Measured on the
+box at that moment: **20 logical cores, 28 concurrent pytest processes from peer sessions, CPU pinned
+at 100 percent.** Linear extrapolation is past seven hours. This matches two peers' independent
+reports the same day (one reached ~4 percent in ~85 minutes; one burned ~325 s CPU over ~49 minutes,
+neither producing a summary line). Adding `-n` workers was rejected: it would worsen a box other
+seats are sharing and would measure the flip under saturation anyway. **The full suite is not
+merely slow here, it is unavailable, and that is a scheduling fact about the box rather than
+anything about this change.**
+
+*The row's named gap is closed -- these were EXECUTED, not inspected.*
+
+| Ran | Result |
+|---|---|
+| `tests/test_sandbox.py` + `_codec` + `_import_boundary` + `_worker_logging` | **112 passed** in 58.6 s, at HEAD |
+| `serve` over `samples/config`, `mode=subprocess` | 6 MLLP inbounds all returned **AA**; **7 `_sandbox_worker` children** spawned, one per dispatching inbound; ADT delivered end-to-end to `out/adt/`; **zero** `SandboxError` |
+| Same `serve`, `mode=off` control | Identical AA set, **0** worker children -- so the instrument discriminates |
+| Same `serve`, post-flip, **no `[sandbox]` section at all** | **7** worker children, delivery landed -- the default alone carries it |
+| `ruff check` / `ruff format --check` / `mypy messagefoundry` (strict) | clean, with the flip applied |
+
+So **"the samples still load and run" is now earned** for the six MLLP sample feeds and the X12 one.
+Two pre-existing failures appear in every run including the `mode=off` control and are **not**
+sandbox-related: `OB_IMMUNIZATION_BODYCRED` and `OB_IMMUNIZATION_REGISTRY` fail to build because
+`environments/dev.toml` carries none of the `registry_*` values. Note the smoke needs
+`[security].handles_real_patient_data = false`, or `serve --env dev` refuses to start without a store
+encryption key.
+
+*FOUR CONSEQUENCES THIS ROW DOES NOT NAME, EACH FOUND BY READING THE SHIPPED CODE.* Any of them can
+turn "one default plus a release note" into something a reader would have been misled by.
+
+1. **The flip ARMS A 5-SECOND WALL CAP that nothing enforces today.** At `mode=off`,
+   `run_sandboxed` is literally `fn(payload)` -- **no timeout at all**. At `mode=subprocess` the
+   parent kills a worker exceeding `[sandbox].wall_seconds` (default **5.0**) and dead-letters that
+   message post-ACK (`pipeline/sandbox.py`, the `self._responses.get(timeout=...)` / `queue.Empty`
+   arm). This cuts both ways and both halves belong in the note: a busy-loop can no longer wedge
+   intake, **and** a legitimately slow Handler now dead-letters where it used to finish.
+   `startup_seconds` (30.0) and the POSIX `cpu_seconds`/`mem_mb` arm with it.
+2. **The per-inbound resource multiplier is undisclosed.** Per inbound *with traffic*: 1 child
+   process carrying a full interpreter and a re-executed config dir, **2 parent daemon threads**
+   (frame reader + ADR 0176 stderr relay), **3 parent pipe fds**, and on Windows a job-object handle.
+   The seven-inbound smoke above therefore cost 7 processes, 14 threads and 21 fds. Against the
+   committed 1,500-connection target this is the cost an operator hits first, and **it is not
+   measured** -- ADR 0179 withdrew the per-worker handle figures as unsound.
+3. **The ~0.19 ms / ~6.2 ms figures are PER DISPATCH, and one message is not one dispatch.** A
+   message routed to one handler with an `accepts=` predicate costs **three** (router, predicate,
+   transform); fan-out to K handlers costs 1 + 2K. Each re-marshals the full reference view. Quoting
+   the headline number without the multiplier understates per-message cost roughly threefold.
+4. **Sandbox dispatch rides asyncio's DEFAULT `to_thread` pool and holds a thread for the whole IPC
+   round trip** -- up to `wall_seconds`, or `startup_seconds` on an inbound's first message. That is
+   the same hazard `wiring_runner.py` explicitly builds dedicated pools to avoid for ADR 0071 fusion
+   ("so DB-latency-holding fused hops can't starve that CPU executor"). Related: an inbound's router
+   and transform workers both take the one `SandboxSession._lock`, so that inbound's two pipeline
+   stages lose their overlap entirely -- more than the ADR's "serializes that inbound's calls".
+
+*A FIFTH, which is a gate-fidelity gap rather than a cost.* `dry_run()` takes no `sandbox` argument,
+so `messagefoundry check` and `dryrun` always run in-process. Under the flip a Handler calling
+`db_lookup`/`fhir_lookup` **passes the pre-deploy gate green and then fail-closes at `serve`** --
+while `checks.py` advertises the opposite property for a different default-flip ("the gate previews
+what the default engine actually delivers"). Decide whether the gate learns the setting, or whether
+the note says plainly that it does not.
+
+*WHAT MUST MOVE WITH THE DEFAULT -- the swept list, so the next lane does not rediscover it.* Three
+of these fail the suite if missed, which is how they were found.
+
+- `config/settings.py` `SandboxSettings.mode` -- the default itself, and its docstring.
+- `tests/test_threat_model_doc_drift.py` -- pins `s.sandbox.mode == "off"`, and its row label
+  `"no Router/Handler wall cap"` is *backwards* after the flip (see finding 1). **Coupled edit:** the
+  15.1.3 row in the vault-only `docs/security/THREAT-MODEL.md`, which no checkout can see.
+- `tests/test_phi_logging_inventory.py` -- pins `== "off"` and says "revisit §7". The reason
+  strengthens rather than lapses: the child-stderr relay §7 documents becomes the default path.
+- `tests/test_threat_model_doc_drift.py` `_DANGEROUS_ROW_KEYS` -- the anchor
+  `"**In-process (default) or subprocess-isolated execution"` names vault text that becomes false.
+  Re-picking it blind would trade a stale anchor for an unverifiable one and red the leg for whoever
+  *does* hold the vault, so it is a vault-side edit, not an engine-side one.
+- `pipeline/sandbox.py` -- module docstring, `SandboxMode.OFF`'s "(default)", and `SandboxPolicy.mode`,
+  whose `= SandboxMode.OFF` becomes a **second, contradicting default**. Every one of its 12
+  construction sites already passes `mode=` explicitly, so making the field required is free in-tree.
+- `pipeline/engine.py` and `pipeline/wiring_runner.py` -- "default-OFF" comments, including a second
+  one in the same `__init__` body as the parameter comment.
+- `docs/CONFIGURATION.md`, `docs/DEPLOYMENT.md`, `docs/PHI.md` (§7), `docs/adr/README.md`,
+  `docs/adr/0087` (header, Decision, and a Consequences line still reading "the opt-in isolation
+  mode"), and `docs/adr/0144:157`, whose *rejected-alternatives rationale* -- the stated reason the
+  static lint gate exists -- asserts the sandbox is "opt-in/off-by-default".
+- `docs/ASVS-ASSESSMENT-METHOD.md:115` uses this exact cell as its **worked example of rule 5**
+  ("a working control that ships off"). The flip expires that example's premise. Correct the fact and
+  leave the verdict: re-scoring is the tracking seat's act against the vault, not a Builder's.
+- `PipelineSettings.fuse_thread_hops` says nothing about the interaction, though the runner
+  hard-disables fusion when both are set. An operator reads the knob they set, not the other one.
+
+*RE-SCORING SIGNAL.* Value 6 still looks right. **Difficulty 3 does not.** The change is one default,
+but the verification is a full suite this box cannot currently run, the sweep above is ~14 sites
+across code, tests, four docs and two vault documents, and findings 1 through 4 each need a release
+note the row did not budget for. Suggest **difficulty 5-6**, and dispatch it to a lane with a box that
+can finish a suite rather than merely a lane with hours.
 ## 1279. treat every instance as carrying patient data and retire the synthetic-data declaration
 
 > 🔢 **Re-scored 2026-08-20 -> P2.** Value **6/10** · Difficulty **6/10** · _big bet_. The opt-out still ships at settings.py:3738 and still translates to the enum at :4234-4235, while the comment at :3733-3735 continues to contradict :2318, which has said PHI since ADR 0148. Value is a secure-defaults simplification rather than a shipped-default defect, since only an explicit declaration loses the refusals; difficulty stays high on surface alone -- 77 data_class occurrences across the engine plus 45 in tests, and the api/models.py wire-contract change -- with no migration cost added per section 0. _(previously unscored.)_
