@@ -28,8 +28,8 @@ from messagefoundry.__main__ import (
     WEBCONSOLE_DISTRIBUTION,
     WEBCONSOLE_IMPORT_NAME,
     WEBCONSOLE_PROVENANCE_OPT_OUT,
-    _console_source_checkout,
     _editable_source_roots,
+    _is_console_source_checkout,
     _measure_webconsole_provenance,
     _normalized_distribution,
     _webconsole_provenance_problem,
@@ -169,21 +169,21 @@ def test_a_namespace_package_with_no_module_file_is_REFUSED() -> None:
 
 def test_this_repository_is_recognised_as_a_console_source_checkout() -> None:
     """Liveness. Every checkout arm above is vacuous if this recogniser cannot find the real thing."""
-    assert _console_source_checkout(_ROOT) == _ROOT
+    assert _is_console_source_checkout(_ROOT)
 
 
 def test_a_directory_missing_either_marker_is_not_a_checkout(tmp_path: Path) -> None:
     """NEGATIVE CONTROL for the checkout arm: both markers are required, so a planted package
     directory alone cannot pass itself off as a checkout of this repository."""
     _plant_console_package(tmp_path, tmp_path / "unused-marker")
-    assert _console_source_checkout(tmp_path) is None  # package present, packaging/ absent
+    assert not _is_console_source_checkout(tmp_path)  # package present, packaging/ absent
 
     packaging_only = tmp_path / "packaging-only"
     (packaging_only / "packaging" / WEBCONSOLE_DISTRIBUTION).mkdir(parents=True)
     (packaging_only / "packaging" / WEBCONSOLE_DISTRIBUTION / "pyproject.toml").write_text(
         "", encoding="utf-8"
     )
-    assert _console_source_checkout(packaging_only) is None  # packaging/ present, package absent
+    assert not _is_console_source_checkout(packaging_only)  # packaging/ present, package absent
 
 
 @pytest.mark.parametrize(

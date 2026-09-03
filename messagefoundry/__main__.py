@@ -1089,24 +1089,20 @@ WEBCONSOLE_PROVENANCE_OPT_OUT = "MEFOR_ALLOW_UNVERIFIED_WEBCONSOLE"
 
 
 def _normalized_distribution(name: str) -> str:
-    """PEP 503 name normalization: runs of ``-``, ``_``, ``.`` collapse to one ``-``, lowercased.
+    """PEP 503 distribution-name normalization (``MessageFoundry_WebConsole`` -> the canonical form).
 
-    Hand-rolled rather than ``re``-based to keep this module's fast subcommands free of an import
-    they do not otherwise pay for; the rule is four lines and has one form.
+    Character-identical to ``checks._normalize_dist``, and deliberately not imported from it: that
+    module is the ``messagefoundry check`` gate, and pulling it in would put the whole gate on the
+    serve startup path for a one-line rule. Two copies of one rule is the cost; both are named here
+    so a reader knows the other exists.
     """
-    normalized: list[str] = []
-    for char in name.strip().lower():
-        if char in "-_.":
-            if normalized and normalized[-1] == "-":
-                continue
-            normalized.append("-")
-        else:
-            normalized.append(char)
-    return "".join(normalized)
+    import re
+
+    return re.sub(r"[-_.]+", "-", name).strip().lower()
 
 
-def _console_source_checkout(root: Path) -> Path | None:
-    """``root`` if it is a checkout of THIS repository that builds the console, else ``None``.
+def _is_console_source_checkout(root: Path) -> bool:
+    """Whether ``root`` is a checkout of THIS repository that builds the console.
 
     A source checkout is the one case where the console's provenance is *stronger* than an index
     install rather than weaker: nothing resolved a name against a registry at all, the code sits in
@@ -1119,13 +1115,11 @@ def _console_source_checkout(root: Path) -> Path | None:
     this check runs -- this arm adds no surface that was not already conceded.
     """
     try:
-        if (root / "packaging" / WEBCONSOLE_DISTRIBUTION / "pyproject.toml").is_file() and (
+        return (root / "packaging" / WEBCONSOLE_DISTRIBUTION / "pyproject.toml").is_file() and (
             root / WEBCONSOLE_IMPORT_NAME / "__init__.py"
-        ).is_file():
-            return root
+        ).is_file()
     except OSError:
-        return None
-    return None
+        return False
 
 
 def _editable_source_roots(direct_url_json: str | None) -> list[Path]:
@@ -1245,7 +1239,7 @@ def _measure_webconsole_provenance() -> str | None:
         with contextlib.suppress(OSError, ValueError):
             candidate_roots.extend(_editable_source_roots(dist.read_text("direct_url.json")))
 
-    checkout_roots = [r for r in (_console_source_checkout(c) for c in candidate_roots) if r]
+    checkout_roots = [root for root in candidate_roots if _is_console_source_checkout(root)]
     return _webconsole_provenance_problem(
         origin=origin,
         providers=providers,
