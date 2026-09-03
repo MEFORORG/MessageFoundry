@@ -6365,6 +6365,27 @@ the blanking here without measuring `#1086`'s false-deny rows in the same table.
 >
 > The banked patch remains unshipped and untouched.
 >
+> **THE PIN EXISTS AND PASSES, so the re-score's "absent from tests/" clause below is SUPERSEDED, not
+> wrong when written.** That reading was taken 2026-08-20 and the fix landed 2026-08-27, after it.
+> Re-checked 2026-09-03: `test_a_QUOTED_MULTI_WORD_alias_value_is_still_invisible` lives in
+> [`tests/test_worktree_gate_quoted_key.py`](../tests/test_worktree_gate_quoted_key.py) and the file
+> is 10 passed. It asserts ALLOW deliberately, and its docstring says so: a DENY there is a BEHAVIOUR
+> CHANGE to review, and the response is to invert the test and this banner together, never to delete
+> either.
+>
+> **Re-verified 2026-09-03 on the REPOSITORY copy** of `scripts/hooks/worktree_gate.ps1`, blob
+> `b194d0a0`, by driving the hook with constructed payloads against a throwaway governed repo -- no
+> disarmed git command was ever run. The unquoted spelling is the KNOWN-ANSWER CONTROL and it DENIED,
+> so the ALLOW rows are readings rather than a dead probe: `git config core.hooksPath /dev/null` DENY
+> (control); `git config "core.hooksPath" /dev/null` DENY; `git -c "core.hooksPath=/dev/null" commit
+> -m x` DENY; `git commit -m "do not set core.hooksPath in a worktree"` ALLOW, so the false deny this
+> fix must not admit was not admitted; `git -c 'alias.ci=commit --no-verify' ci -m x` ALLOW, the class
+> that is open by design.
+>
+> **A repo-copy reading is a statement about the SOURCE, not about the live gate on this machine.**
+> The installed user-scope copy at `%USERPROFILE%\.claude\hooks\worktree_gate.ps1` is a DIFFERENT blob
+> (`cd37d320`), so it is not this file. Read-only, it does carry this item's bare-word unmask and names
+> `#1069`, so the two agree on THIS fix and differ somewhere else; nothing here measures where.
 
 > 🔢 **Re-scored 2026-08-20 -> P2.** Value **7/10** · Difficulty **4/10** · _quick win_. Rule 3c still decides on $seg.Scan at worktree_gate.ps1:976-978 while Remove-QuotedSpans at :347-388 blanks every closed quoted span, so a quoted danger key is erased before the disarm regex runs; grep finds no length-preserving mask, no bare-word unmask, and the pinned ALLOW test the item names is absent from tests/. Value 7 because the fail-open needs no unusual spelling and disarms the ledger, claim and leak commit gates for every worktree at once with no compensating detection, but its blast radius is the developer harness rather than a deployment; difficulty 4 because the one written fix was rejected on verification after acquiring five new fail-opens, so the remainder is a scanner rewrite plus an adversarial test round. _(was 8/10 · 3/10.)_
 >
