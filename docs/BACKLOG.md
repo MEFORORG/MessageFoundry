@@ -16960,7 +16960,7 @@ A seat that runs its OWN copy is recorded correctly. A seat that runs another co
 
 ## 1359. the worktree gate hands off branch-switch detection to rule 3b by verb, not by whether the command names a branch
 
-> ✅ **SHIPPED 2026-09-03 (builder).** `Test-WorktreeHijack` now takes its hand-off from TWO verb sets
+> 🚧 **BUILT 2026-09-03 (builder), NOT closed -- the LANDER flips this banner on merge.** `Test-WorktreeHijack` now takes its hand-off from TWO verb sets
 > instead of one literal pair, and the per-verb ruling the filing left open is decided and recorded in
 > the file itself. The premise was re-measured before any edit rather than taken from this banner: the
 > two-verb bail was still the first line of the function at `46ea10a78`.
