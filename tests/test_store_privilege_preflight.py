@@ -22,8 +22,14 @@ Three properties are pinned here, and the third is the one a careless refactor b
 carry directions 1 and 2 end to end: they create a purpose-made least-privilege principal, connect AS
 it, and assert an empty excess list — then over-grant it and assert the probe names the grant. A local
 ``pytest`` silently skips both legs, so a green local run proves the policy and the wiring, never the
-SQL. CI's own store legs connect as ``sa`` / ``postgres``, which are over-granted by construction, so
-the CI leg is itself a standing positive control that the probe fires on a real superuser.
+SQL.
+
+Those legs connect as ``sa`` / ``postgres``, which are over-granted by construction, so each is also a
+standing POSITIVE control that the probe still fires on a real superuser — but that is only true while
+a workflow step actually runs this file, and per-test ``skipif`` gating puts it outside the scope
+``tests/test_serverdb_ci_coverage.py`` polices. So the wiring is asserted here, by
+``test_the_live_legs_of_this_file_are_run_by_a_server_db_ci_step``, which was failed on purpose
+against the unedited workflow before it was trusted.
 """
 
 from __future__ import annotations
@@ -32,6 +38,8 @@ import contextlib
 import json
 import logging
 import os
+import re
+import secrets
 from pathlib import Path
 from typing import Any
 
@@ -65,9 +73,22 @@ from messagefoundry.store.privilege import (
 _SQLSERVER_ON = bool(os.getenv("MEFOR_TEST_SQLSERVER"))
 _POSTGRES_ON = bool(os.getenv("MEFOR_TEST_POSTGRES"))
 
+#: This file's own path as a ci.yml step spells it — read by the wiring guards further down.
+_THIS_FILE = "tests/test_store_privilege_preflight.py"
+
 # The exact grant docs/DEPLOY-SERVER-DB.md §1.1 prescribes, restated here so a change to either side
 # has to be a deliberate two-file edit rather than a silent drift in one.
 _DOCUMENTED_SQLSERVER = ("db_datareader", "db_datawriter", "db_ddladmin")
+
+
+def _throwaway_password() -> str:
+    """A per-run password for the purpose-made live-leg principal, GENERATED rather than written down.
+
+    Not a literal, on purpose. A hardcoded one would be a credential-shaped string in a public repo —
+    it would need a `.gitleaks.toml` allowlist entry, and every allowlist entry is a rule the scanner
+    stops applying. `token_urlsafe` is `[A-Za-z0-9_-]` only, so it never needs quoting inside the
+    fixture's SQL string literals, and the prefix keeps it complex enough for a password policy."""
+    return "Px9_" + secrets.token_urlsafe(24)
 
 
 # --- direction 2 first: the correctly-granted principal must be SILENT ------------------------
@@ -196,7 +217,10 @@ def test_postgres_superuser_does_not_enumerate_every_implied_role() -> None:
 
 def test_postgres_superuser_via_an_assumable_wrapper_role_is_caught() -> None:
     """The principal itself has no attributes; a role it may assume is SUPERUSER. A denylist of role
-    NAMES cannot see this — reading attributes per assumable role can."""
+    NAMES cannot see this — reading attributes per assumable role can.
+
+    The wrapper is NAMED, because that role is the object an operator has to change; ``SUPERUSER``
+    alone would send them looking at a principal whose own attributes are all clean."""
     facts = (
         PostgresRoleFacts("mefor", True, False, False, False, False, False),
         PostgresRoleFacts("site_dba", False, True, False, False, False, False),
@@ -204,7 +228,44 @@ def test_postgres_superuser_via_an_assumable_wrapper_role_is_caught() -> None:
     excess = postgres_excess(
         roles=facts, owns_database=False, create_on_database=False, database="mefor"
     )
-    assert excess == ("SUPERUSER",)
+    assert excess == ("SUPERUSER via role site_dba",)
+
+
+def test_postgres_createrole_via_an_assumable_wrapper_role_is_caught() -> None:
+    """Every role ATTRIBUTE is reachable through membership, not only ``SUPERUSER`` — so every one of
+    them is read across the assumable roles, not just on the principal's own row.
+
+    Measured on PostgreSQL 16.14 rather than assumed: a member of a ``CREATEROLE`` role is refused
+    ``CREATE ROLE`` outright (attributes are never inherited) and succeeds immediately after
+    ``SET ROLE`` to it. ``pg_has_role(current_user, oid, 'MEMBER')`` — the predicate the probe reads
+    with — is exactly "may SET ROLE to it", so a reachable attribute is a held one. Checking these four
+    on the principal's own row alone let a wrapper carrying ``CREATEROLE`` / ``CREATEDB`` /
+    ``REPLICATION`` / ``BYPASSRLS`` read as a clean least-privilege role."""
+    facts = (
+        PostgresRoleFacts("mefor", True, False, False, False, False, False),
+        PostgresRoleFacts("site_ops", False, False, True, True, False, False),
+    )
+    excess = postgres_excess(
+        roles=facts, owns_database=False, create_on_database=False, database="mefor"
+    )
+    assert excess == ("CREATEROLE via role site_ops", "CREATEDB via role site_ops")
+
+
+def test_postgres_membership_in_a_plain_role_is_not_an_attribute_finding() -> None:
+    """The complementary arm of the test above: reading attributes across every assumable role must
+    not turn mere MEMBERSHIP into an attribute finding. A wrapper that carries no attribute and is not
+    a predefined ``pg_*`` role is silent — otherwise every site that groups grants behind a role would
+    get a permanent finding it cannot act on."""
+    facts = (
+        PostgresRoleFacts("mefor", True, False, False, False, False, False),
+        PostgresRoleFacts("app_readers", False, False, False, False, False, False),
+    )
+    assert (
+        postgres_excess(
+            roles=facts, owns_database=False, create_on_database=False, database="mefor"
+        )
+        == ()
+    )
 
 
 def test_postgres_dangerous_predefined_roles_are_named() -> None:
@@ -624,6 +685,117 @@ def test_serve_lifespan_runs_the_preflight_and_stashes_a_real_observation(tmp_pa
     assert resp.json()["store_privilege"]["status"] == "not_applicable"
 
 
+def test_the_preflight_reads_the_PASSED_store_settings_not_the_ambient_environment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A green that depends on the ambient environment is not a green.
+
+    Every non-live test in this file asserts against a SQLite store it constructs explicitly, which is
+    only meaningful if a hostile ``MEFOR_STORE_*`` in the environment cannot reach in and change which
+    backend is probed. This runs the whole managed lifespan with the environment set to a SQL Server
+    the box cannot reach and ``require_least_privilege`` declared, and still expects the SQLite
+    ``not_applicable`` result — an ambient leak would instead try to open ``db.invalid`` and fail, or
+    refuse on an unobservable probe.
+
+    **The second half is what stops this being vacuous.** It asserts the same environment WOULD have
+    produced a SQL Server store through ``load_settings``, so the hostile values are demonstrably ones
+    the code reads. A hostile-ambient test built on a variable nothing consults proves nothing, and
+    that is the shape it is guarding against."""
+    from messagefoundry.api.app import create_managed_app
+    from messagefoundry.config.settings import load_settings
+
+    hostile = {
+        "MEFOR_STORE_BACKEND": "sqlserver",
+        "MEFOR_STORE_SERVER": "db.invalid",
+        "MEFOR_STORE_DATABASE": "Hostile",
+        "MEFOR_STORE_USERNAME": "hostile",
+        "MEFOR_STORE_PASSWORD": "unused-by-this-test",
+        "MEFOR_STORE_REQUIRE_LEAST_PRIVILEGE": "true",
+    }
+    # The pin is load-bearing: these exact keys resolve to a SQL Server store with the refusal armed.
+    would_be = load_settings(environ=hostile).store
+    assert would_be.backend is StoreBackend.SQLSERVER
+    assert would_be.require_least_privilege is True
+
+    from starlette.testclient import TestClient
+
+    for key, value in hostile.items():
+        monkeypatch.setenv(key, value)
+    app = create_managed_app(store_settings=sqlite_settings(tmp_path / "pinned.db"))
+    with TestClient(app) as tc:
+        resp = tc.get("/security/posture")
+    assert resp.status_code == 200
+    assert resp.json()["store_privilege"]["status"] == "not_applicable"
+
+
+# --- the live legs must actually be RUN somewhere, or they are decoration ----------------------
+
+
+def _ci_yml() -> str:
+    return (Path(__file__).resolve().parents[1] / ".github" / "workflows" / "ci.yml").read_text(
+        encoding="utf-8"
+    )
+
+
+def _steps_running_this_file(gate: str) -> list[str]:
+    """ci.yml step names that EXPORT ``gate`` and whose executable lines run this test file.
+
+    Comment lines are stripped first, for the reason ``tests/test_serverdb_ci_coverage.py`` states:
+    a step's prose may name a file it does not run."""
+    out: list[str] = []
+    for block in re.split(r"\n      - name:", _ci_yml()):
+        if f"{gate}: " not in block:
+            continue
+        executable = "\n".join(
+            line for line in block.splitlines() if not line.lstrip().startswith("#")
+        )
+        if _THIS_FILE in executable:
+            out.append(block.splitlines()[0].strip())
+    return out
+
+
+@pytest.mark.parametrize("gate", ["MEFOR_TEST_SQLSERVER", "MEFOR_TEST_POSTGRES"])
+def test_the_live_legs_of_this_file_are_run_by_a_server_db_ci_step(gate: str) -> None:
+    """The live probe SQL executes NOWHERE unless a ci.yml step under ``gate`` names this file.
+
+    ``tests/test_serverdb_ci_coverage.py`` does not cover this file and says so: it asserts the sharp
+    MODULE-gated invariant only, and this file gates its live legs PER TEST so its SQLite cases still
+    run. That leaves the exact hole it was built to close, one class over — the file collects on every
+    plain leg, its live legs report `skipped`, and `skipped` reads identical to `passed` at a glance.
+    Since the probe's SQL is the one thing no local run and no SQLite leg can exercise, a file nobody
+    wires means the statements in ``store/sqlserver.py`` and ``store/postgres.py`` are never once
+    executed.
+
+    Falsified on purpose before it was trusted: with ci.yml unedited this parametrization failed for
+    BOTH gates, naming the file it scanned for. Scope is deliberately this one file — a general
+    version needs an allow-list, which is what keeps the sibling guard sharp."""
+    steps = _steps_running_this_file(gate)
+    assert steps, (
+        f"no ci.yml step exporting {gate} runs {_THIS_FILE}, so its live legs execute nowhere — "
+        f"scanned {len(_ci_yml().splitlines())} lines of .github/workflows/ci.yml. Add the file to "
+        "the sqlserver-store / postgres-store job and extend the `serverdb` change-detection "
+        "alternation so editing it pulls the leg that proves it."
+    )
+
+
+def test_editing_this_file_pulls_the_server_db_legs_that_prove_it() -> None:
+    """A file a leg runs but the change-detection alternation does not match is covered only by the
+    nightly cron — editing it does not pull the leg. Same invariant
+    ``test_serverdb_path_gate_admits_every_file_those_legs_run`` enforces, asserted here because that
+    test derives its file set from module-gated suites and never sees this one."""
+    for line in _ci_yml().splitlines():
+        if "grep -qE" in line and "tests/test_(" in line:
+            match = re.search(r"tests/test_\(([^)]*)\)", line)
+            assert match is not None
+            alternation = re.compile(rf"^test_({match.group(1)})")
+            assert alternation.match(Path(_THIS_FILE).stem), (
+                f"the `serverdb` alternation does not match {_THIS_FILE}; it reads: "
+                f"tests/test_({match.group(1)})"
+            )
+            return
+    pytest.fail("could not locate the `serverdb` change-detection alternation in ci.yml")
+
+
 # --- live server legs (skipped locally; CI's store legs are the standing coverage) -------------
 
 
@@ -633,7 +805,8 @@ async def test_live_sqlserver_probe_observes_the_configured_principal() -> None:
     from messagefoundry.config.settings import load_settings
     from messagefoundry.store.sqlserver import SqlServerStore
 
-    store = await SqlServerStore.open(load_settings(environ=os.environ).store)
+    settings = load_settings(environ=os.environ).store
+    store = await SqlServerStore.open(settings)
     try:
         report = await store.probe_principal_privileges()
     finally:
@@ -641,6 +814,18 @@ async def test_live_sqlserver_probe_observes_the_configured_principal() -> None:
     assert report.status is StorePrivilegeStatus.OBSERVED
     assert report.principal, "the probe must name the login it observed"
     assert report.database
+    # THE STANDING POSITIVE CONTROL, and the reason this leg is worth its runtime. CI connects as
+    # `sa`, which is `sysadmin` by construction, so a probe that has quietly stopped SEEING an
+    # over-grant — a mis-bound parameter, a renamed column, a driver returning True/False where the
+    # comparison expects 1 — reds here instead of reporting a clean bill of health for a superuser.
+    # Gated on the CONFIGURED login name, which comes from the environment and not from the probe, so
+    # a site pointing this leg at a correctly least-privileged login is not failed for being correct.
+    if (settings.username or "").lower() == "sa":
+        assert "server role sysadmin" in report.excess, (
+            "this leg is configured as `sa`, a sysadmin login, so the probe MUST name it; a clean "
+            f"result here means the probe is not observing what it claims to (server roles: "
+            f"{report.server_roles})"
+        )
 
 
 @pytest.mark.skipif(not _SQLSERVER_ON, reason="set MEFOR_TEST_SQLSERVER=1 (+ MEFOR_STORE_* env)")
@@ -656,7 +841,7 @@ async def test_live_sqlserver_probe_sees_both_directions_on_a_purpose_made_princ
 
     base = load_settings(environ=os.environ).store
     login = "mefor_privprobe_test"
-    password = "Pr0be_Synth_2026!x"  # synthetic, throwaway, dropped below — never a real credential
+    password = _throwaway_password()
     admin = await SqlServerStore.open(base)
     try:
         try:
@@ -706,7 +891,8 @@ async def test_live_postgres_probe_observes_the_configured_principal() -> None:
     from messagefoundry.config.settings import load_settings
     from messagefoundry.store.postgres import PostgresStore
 
-    store = await PostgresStore.open(load_settings(environ=os.environ).store)
+    settings = load_settings(environ=os.environ).store
+    store = await PostgresStore.open(settings)
     try:
         report = await store.probe_principal_privileges()
     finally:
@@ -714,44 +900,65 @@ async def test_live_postgres_probe_observes_the_configured_principal() -> None:
     assert report.status is StorePrivilegeStatus.OBSERVED
     assert report.principal
     assert report.database
+    # The Postgres half of the standing POSITIVE control (see the SQL Server twin). This leg is
+    # configured as `postgres`, a SUPERUSER that also owns the database, so the probe must say so;
+    # gated on the configured role name, which comes from the environment and not from the probe.
+    if (settings.username or "").lower() == "postgres":
+        assert "SUPERUSER" in report.excess, (
+            "this leg is configured as the `postgres` superuser, so the probe MUST name it; a clean "
+            f"result means it is not observing what it claims to (roles read: {report.database_roles})"
+        )
 
 
 @pytest.mark.skipif(not _POSTGRES_ON, reason="set MEFOR_TEST_POSTGRES=1 (+ MEFOR_STORE_* env)")
 async def test_live_postgres_probe_sees_both_directions_on_a_purpose_made_role() -> None:
-    """The Postgres twin: a plain LOGIN role must be silent, and one granted ``pg_read_all_data`` must
-    be named. Skips (never fails) when the configured role cannot CREATE ROLE."""
+    """The Postgres twin, and the one leg that carries BOTH directions end to end: a correctly-granted
+    role must be SILENT, and the same role granted ``pg_read_all_data`` must be NAMED.
+
+    The fixture builds ``docs/DEPLOY-SERVER-DB.md`` §1.2 **posture A** — the engine role owns its own
+    schema — and that choice is a measurement, not a preference. Posture B (``USAGE`` on a pre-created
+    schema, no ``CREATE``) cannot open the store on a database whose ``schema_meta`` marker is absent
+    or stale: measured on PostgreSQL 16.14, ``CREATE TABLE IF NOT EXISTS`` on an ALREADY-EXISTING table
+    is refused with *permission denied for schema* — the schema ACL is checked BEFORE the existence
+    skip, so ``IF NOT EXISTS`` does not save it. A posture-B fixture would therefore have failed inside
+    ``PostgresStore.open`` and reported as a probe defect. Posture A is self-contained: the role
+    bootstraps its own schema, so this leg does not depend on any earlier CI step having seeded one.
+
+    Schema ownership is deliberately NOT something ``postgres_excess`` looks at — it is the documented
+    posture, so an empty excess list here is the assertion that matters.
+
+    Skips (never fails) when the configured role cannot CREATE ROLE: that is a limit of the fixture's
+    credential, not a fact about the probe."""
     from messagefoundry.config.settings import load_settings
     from messagefoundry.store.postgres import PostgresStore
 
     base = load_settings(environ=os.environ).store
     role = "mefor_privprobe_test"
-    password = "Pr0be_Synth_2026!x"  # synthetic, throwaway, dropped below
+    schema = "mefor_privprobe_test"
+    password = _throwaway_password()
     admin = await PostgresStore.open(base)
     try:
-        schema = base.db_schema or "public"
         try:
+            await admin._execute(f"DROP SCHEMA IF EXISTS {schema} CASCADE")
             await admin._execute(f"DROP ROLE IF EXISTS {role}")
             await admin._execute(f"CREATE ROLE {role} LOGIN PASSWORD '{password}'")
-            # docs/DEPLOY-SERVER-DB.md §1.2 posture B (pre-created objects, engine role holds CRUD):
-            # CONNECT + USAGE + row CRUD + sequence USAGE, and nothing wider. The role must be able to
-            # OPEN the store, or the negative direction would skip for the wrong reason.
-            for stmt in (
-                f"GRANT CONNECT ON DATABASE {base.database} TO {role}",
-                f"GRANT USAGE ON SCHEMA {schema} TO {role}",
-                f"GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA {schema} TO {role}",
-                f"GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA {schema} TO {role}",
-            ):
-                await admin._execute(stmt)
+            await admin._execute(f"GRANT CONNECT ON DATABASE {base.database} TO {role}")
+            # Posture A, and NOTHING wider: no role attribute, no predefined pg_* membership, no
+            # database ownership. `CREATE SCHEMA ... AUTHORIZATION` is the runbook's own statement.
+            await admin._execute(f"CREATE SCHEMA {schema} AUTHORIZATION {role}")
         except Exception as exc:  # noqa: BLE001 — a fixture-setup limit, not a probe failure
             pytest.skip(f"cannot create a test role with this store principal: {exc}")
 
-        least = base.model_copy(update={"username": role, "password": password})
+        least = base.model_copy(
+            update={"username": role, "password": password, "db_schema": schema}
+        )
         store = await PostgresStore.open(least)
         try:
             clean = await store.probe_principal_privileges()
         finally:
             await store.close()
         assert clean.status is StorePrivilegeStatus.OBSERVED
+        assert clean.principal == role
         assert clean.excess == (), f"a correctly-granted role must be silent, got {clean.excess}"
 
         await admin._execute(f"GRANT pg_read_all_data TO {role}")
@@ -761,13 +968,24 @@ async def test_live_postgres_probe_sees_both_directions_on_a_purpose_made_role()
         finally:
             await store.close()
         assert "role pg_read_all_data" in over.excess
+
+        # The attribute arm, on the SAME role: an attribute carried by a role the principal may merely
+        # assume is reachable via SET ROLE, so the probe must name it AND name the wrapper. This is the
+        # direction that read clean before the comparator was corrected.
+        await admin._execute(f"CREATE ROLE {role}_wrap CREATEROLE NOLOGIN")
+        await admin._execute(f"GRANT {role}_wrap TO {role}")
+        store = await PostgresStore.open(least)
+        try:
+            wrapped = await store.probe_principal_privileges()
+        finally:
+            await store.close()
+        assert f"CREATEROLE via role {role}_wrap" in wrapped.excess
     finally:
         for stmt in (
-            f"REVOKE ALL ON ALL SEQUENCES IN SCHEMA {base.db_schema or 'public'} FROM {role}",
-            f"REVOKE ALL ON ALL TABLES IN SCHEMA {base.db_schema or 'public'} FROM {role}",
-            f"REVOKE ALL ON SCHEMA {base.db_schema or 'public'} FROM {role}",
+            f"DROP SCHEMA IF EXISTS {schema} CASCADE",
             f"REVOKE ALL ON DATABASE {base.database} FROM {role}",
             f"DROP ROLE IF EXISTS {role}",
+            f"DROP ROLE IF EXISTS {role}_wrap",
         ):
             with contextlib.suppress(Exception):  # teardown is best-effort
                 await admin._execute(stmt)
