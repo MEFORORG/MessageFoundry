@@ -55,7 +55,7 @@ class Identity:
     #: role, or the :data:`ALL_CHANNELS` grant in the stored scope, both resolved by
     #: ``auth.service._allowed_channels``. A caller constructing an ``Identity`` DIRECTLY (rather
     #: than through the resolver) and wanting the whole estate must pass ``allowed_channels=None``
-    #: and say why -- ``api.security._SYSTEM_IDENTITY`` is the one such site in the engine.
+    #: and say why; ``api.security._SYSTEM_IDENTITY`` is one such site, and it says why there.
     #:
     #: BACKLOG #1151 (ASVS 8.1.1): this used to end "See docs/security/PHASE-8C-RBAC.md", which a
     #: reader of the public repository CANNOT REACH -- `docs/security/` is gitignored here, so
