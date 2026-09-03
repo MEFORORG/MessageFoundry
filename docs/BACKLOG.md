@@ -18766,6 +18766,113 @@ backlog alloc records before allocating** -- `workflow` 0, `concurren` 0, `fan-o
 `workflow` 191 lines in the ledger, an impossible string 0. **The `watch.py` margin history above is the
 filer's own read**, and it is the part that changes the row's ask.
 
+**PROGRESS 2026-09-03 (builder) -- THE SELF-COUNT INSTRUMENT IS BUILT; THE AGGREGATE LIMB IS MEASURED
+AND STILL OPEN.** Scope taken: the cost estimator this row's worked example demands, plus a measured
+design note on the denominator. Not taken: the gate itself, which is not in this repository, and
+lowering the threshold, which this row rules out by name.
+
+**THE GATE IS NOT IN THIS TREE, AND THE ZERO CARRIES ITS CONTROLS.** `git grep WORKFLOW_GATE_AT --
+':!docs/'` exits 1, and no file named `watch.py` exists anywhere on disk, tracked or untracked. A zero
+from a grep is worthless without a positive control, so two ran on the same instrument over the same
+path exclusion: `PUBLIC_BACKLOG_FLOOR` exits 0, an impossible string exits 1. The instrument can see a
+real match outside `docs/` and does return 1 on a genuine absence, so the gate's absence is a finding
+rather than a broken pattern. **The exit codes were re-taken unpiped after the first attempt read `$?`
+through a `head`,** which reports the pager's status and not the grep's -- the CLAUDE.md section 11
+trap, hit while checking for it.
+
+**BUILT: `scripts/coord/workflow_cost.py`, tested by `tests/test_coord_workflow_cost.py`.** It reads a
+workflow script statically and prices it as **fan width times depth** across every `parallel()`,
+`pipeline()` and `.map()`, summing across phases. `pipeline(items, s1, s2, s3)` is the same arithmetic
+said out loud -- every item runs every stage, so both factors sit outside the `agent()` calls. On this
+row's worked example it returns **13 where the naive instrument returns 3**, reproducing the 4.3x
+under-report from the numbers published above.
+
+**THE ORIGINAL SCRIPT WAS NOT RECOVERABLE, so the fixture is the SHAPE this row's three numbers
+force**, and it is labelled as such in the source: two six-wide fans over a `const ROWS` of six, plus a
+lone synthesis agent, giving 6 + 6 + 1 = 13 behind 3 call sites. Nothing here claims to be the original
+bytes.
+
+**IT DISCRIMINATES, WHICH IS THE PART A BIGGER NUMBER DOES NOT PROVE.** A tool that always inflates
+would satisfy the headline test, so a script with no fan-out is pinned to price at **exactly** the naive
+count, and a script whose `agent(` appears only in a comment and a prompt string prices at 1 where the
+naive grep returns 3. The arithmetic is mutation-proved three ways: delete the `* width` and the worked
+example collapses back to 3 -- this row's own failure, reproduced on demand -- force every literal array
+to one element and an inline fan drops to 1, and disable the honesty residue and an unrecognised
+construct goes quiet. Each mutant also fails the tool's own `--self-test`. **31 tests, all green**,
+alongside the three neighbouring gates the new files enter (tooling partition, cp1252 console safety,
+licence header): 70 more, green.
+
+**FIVE SILENT UNDER-REPORTS WERE FOUND AND FIXED IN THIS BUILD, EVERY ONE OF THIS ROW'S EXACT CLASS,
+and that is the finding worth carrying forward.** Masking string contents made `['a','b','c']`
+indistinguishable from a trailing comma, counting three as two. An inline `[...].map(cb)` fan read as a
+list of thunks and priced at **zero**. `Promise.all(ROWS.map(r => agent(r)))` priced at **1 and reported
+EXACT**, because `.map()` was recognised only as a direct argument of `parallel()` -- the tool
+committing this row's headline failure, in the tool built to refuse it. One space after `parallel(`
+turned a known array into a runtime width, through an offset that double-counted leading whitespace. And
+a `for (const x of ROWS)` fan over a literal array was filed as an unknown loop. **Each passed a read as
+correct before it was measured**, which is the general lesson: this class is not caught by review.
+
+**SO THE HONESTY GUARANTEE IS A RESIDUE, NOT AN ENUMERATION.** After pricing, every `agent` token the
+pricer did not attribute to a site is reported as `unattributed`. Without that catch-all, *unrecognised
+construct* and *costs nothing* are the same state, and the floor would be sound only for the shapes its
+author happened to think of -- `ROWS.map(agent)` passes the hook as a value and matches no call pattern
+anywhere in the scanner. An unbalanced construct is likewise reported rather than skipped, so one mask
+desync cannot truncate the scan while the report still says exact. A computed width, a `while` loop that
+runs until dry, and a nested `workflow()` each print as an UNPRICED TERM with their per-unit cost where
+knowable, and the total reads `known floor` instead of `TOTAL (exact)` whenever any exist. A test pins
+that a floor is never rendered with the words *"the naive count is correct here"*, because a floor of 0
+against a naive 1 would otherwise print exactly that. `--strict` exits 1 on any unpriced term; the
+default does not, since a report that fails on a finding gets muted.
+
+**THE DENOMINATOR, MEASURED RATHER THAN DESIGNED -- and the gap is a UNIT gap, not a reader gap.**
+`lane.ps1` already records `statedInFlight`, and the storage is **already fleet-wide**: one JSON per box
+under `<git-common-dir>/mefor-coord/lanes/`, atomically written through a sibling `.tmp` directory and
+keyed by a derived box key (`lane.ps1:71`). Only the READ is first-person, and deliberately so -- the
+header at `:11` states there is no `-Lane` and no `-BoxKey` parameter and that adding one defeats the
+design, and `-Show` prints the single record for the box derived from `$PWD`. **Every toucher of that
+directory is first-person: exactly two, `scripts/coord/lane.ps1:71` and `scripts/hooks/lane-level.ps1:181`,
+the latter reading `$bk.json` for the current box only to nag its own session.** `fleet.ps1` does not
+read it at all -- it is a pure reader over `seats/` and projects live seats. So a census would add a
+reader, not a store. What it could not do is sum what is there: `statedInFlight` counts **items** for
+one box, human-stated and stale by design (`turnsSinceStated`, `LANE_PROMPT_MIN`), while the gate needs
+**agents remaining** fleet-wide. Those are different units at different granularity, so the existing
+number cannot be added up into the one the gate lacks.
+
+**WHAT SUCH A CENSUS WOULD HAVE TO RECORD, as constraints rather than a design.** It must be written
+**before** the first agent starts, not after, or it is the broadcast-after-the-fact this row already
+rejects -- and it must decrement as agents finish, since the row asks for agents REMAINING. Release has
+to survive a crash: a session that dies mid-fan-out leaves a claim that never releases, and a census
+counting it forever would refuse every later launch, which is worse than no census. `claim.ps1` has
+this problem already and answers it with a liveness fence, and `fleet.ps1`'s own header records why a
+census must reuse that fence rather than grow a second one -- a private `Get-HolderLiveness` accreted
+beside it is how the copy nobody tests becomes the copy in use. `fleet.ps1` also already models the
+right discipline for the missing half: `liveSessionsWithoutRecord` starts from the fence and subtracts,
+so a dead writer shows as a positive count instead of as silence. A census needs that mirror, or a
+launcher that publishes nothing reads as free capacity. **And the ordering is the crux: if the census
+is read to authorise a launch and written after it, two launchers read the same answer and both pass,
+and this row's failure reappears one level up.** That is why this is a claim with release semantics and
+not a gauge, and it is the part left open.
+
+**FIRST-HAND, FROM INSIDE THE FAILURE MODE.** This builder is a subagent of a Console that ran five
+concurrent Builders earlier tonight, and it then ran its own four-agent fan-out for the `/simplify`
+pass. **At each of those four spawn points the usage-headroom hook returned `UNKNOWN -- no data`**,
+because nothing has published to this config root's `mefor-usage/latest.json`; the hook says plainly
+that UNKNOWN is neither zero nor full headroom. That is a third blindness worth separating from the two
+above: limb 1 is a launcher unable to see other launchers and limb 3 is a launcher unable to see its
+own later phases, but here the **per-launch number itself was absent on this root**, so the launcher was
+blind to the aggregate and to its own pool reading at once. The four agents were self-counted as four
+and that was right only because the fan was four flat calls with nothing nested; the same honest
+self-count over a `.map()` would have been wrong by this row's ratio. **No seat is being called
+careless, here or above** -- the reading each seat could take was the reading it took.
+
+**WHAT STAYS OPEN.** The aggregate limb, unbuilt by choice: it needs new shared coordination state with
+claim and release semantics, which is not a one-turn change and which this row deliberately leaves as
+options rather than a design. Limb 3's second half is also only half-served -- the estimator prices a
+script a launcher HAS, and the PM's 37-refuter case was a phase that appeared in no number the gate
+checked; pricing that script would have surfaced it, but nothing yet makes reading the price a step in
+launching. Wiring this into a launch path is a separate ask and is not filed under a number here, since
+citing one this seat has not allocated would resolve to nothing today and to unrelated work later.
+
 ## 1397. the Bash tool unescapes backslashes inside a QUOTED heredoc, so a Windows path or a doubled-backslash regex silently changes meaning
 
 > 🔢 **Filed 2026-08-29 - measured, not fixable here.** In the Claude Code Bash tool a quoted heredoc
