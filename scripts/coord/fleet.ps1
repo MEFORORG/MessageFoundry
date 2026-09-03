@@ -169,15 +169,86 @@ if (Test-Path -LiteralPath $errFile) {
     $writerErrors = @(Get-Content -LiteralPath $errFile -EA SilentlyContinue).Count
 }
 
-# origin/main's own age. Every landed verdict is computed against this ref, and the ref moves ONLY on
-# fetch. A landed verdict against a stale ref is the dangerous direction: this repo carries reverts,
-# and against a stale cached main a reverted change reads as "already landed" -- i.e. deliberately
-# reverted work would be recorded as done.
+# HOW FRESH IS THE origin/main EVERY LANDED VERDICT IS JUDGED AGAINST? A landed verdict against a
+# stale ref is the dangerous direction: this repo carries reverts, and against a stale cached main a
+# reverted change reads as "already landed" -- i.e. deliberately reverted work recorded as done. A
+# remote-tracking ref is only ever refreshed by a fetch, so the age of the ref IS the age of the last
+# fetch, and the fetch is the thing to time.
+#
+# READ THE FETCH CLOCK, NOT THE REF FILE (BACKLOG #1374). This stated fetch recency and stat'ed
+# `refs/remotes/origin/main`, whose mtime moves when the REF MOVES and not when a fetch happened.
+# They are two clocks. Measured on this repo 2026-08-28: `.git/FETCH_HEAD` at 18:02:16.769 against
+# the loose ref at 18:01:24.059 -- a fetch landed 52 seconds AFTER the ref last moved and left the
+# ref untouched. Reproduced from an empty sandbox 2026-09-03: a fetch against an unmoved remote
+# writes FETCH_HEAD and creates no loose ref at all, so a fleet that fetched seconds ago fired the
+# stop and printed DO NOT TREAT THE ROSTER BELOW AS COMPLETE about a fetch that was fresh.
+#
+# AND THE LOOSE REF WAS NOT EVEN THE COMMON CASE, WHICH IS THE HALF THAT RENDERED HEALTHY. Measured
+# 2026-09-03: `git clone` packs `refs/remotes/origin/main` into `packed-refs` and writes NO loose
+# ref, and `git pack-refs --all` puts any clone in that state. With nothing to stat the value stayed
+# null, the old `-ne $null` guard meant the stop could not fire, and an absent warning renders
+# identically to a healthy one. So the unmeasurable case is now a STOP in its own right: this
+# instrument must never be silent about being blind.
+#
+# FETCH_HEAD IS PER-WORKTREE AND THE REMOTE-TRACKING REF IS SHARED, so read the whole clone.
+# Measured 2026-09-03: a fetch run inside a linked worktree writes `<git-dir>/FETCH_HEAD` and leaves
+# `<common>/FETCH_HEAD` untouched, while `refs/remotes/origin/main` is common to the clone. Every
+# seat here works in a linked worktree, so reading only the common dir would report the PRIMARY's
+# last fetch. The question is "when was this clone's shared origin/main last refreshed", and any
+# worktree's fetch refreshes it -- so the answer is the NEWEST clock in the clone.
+#
+# THE SAME CONCLUSION WAS REACHED INDEPENDENTLY IN THIS REPO, and the reasoning lives there rather
+# than being restated here: `_remote_knowledge()` in scripts/asvs/scorecard.py reads FETCH_HEAD,
+# probes more than one git dir, takes the newest, and treats "no clock" as a loud NEVER-FETCHED. It
+# probes only the CURRENT worktree's git dir plus the common one, which is right for a tool judging
+# ONE tree; this renders a roster for the whole clone, so it sweeps every worktree.
+#
+# DO NOT "FIX" THIS BACK TO THE REFLOG. It is the obvious-looking alternative -- it survives
+# `pack-refs` and is not per-worktree -- and it is the SAME WRONG CLOCK, because a reflog records ref
+# MOVEMENTS. Measured on this repo 2026-09-03: the newest `origin/main` reflog entry and
+# `.git/FETCH_HEAD` differ by 1000 seconds, the fetch being the newer. `git for-each-ref` is out for
+# the same reason: it exposes the upstream COMMIT's date, which here preceded the ref update by 11
+# minutes. No git plumbing reports a fetch time, so the file mtime is the only clock on offer.
+#
+# STATED LIMITS, all three in the same direction a reader needs to know about:
+#   1. `git ls-remote origin main` would answer the real question directly ("is my cached ref
+#      current?") in about 0.7 seconds, measured. DECLINED: this script is a PURE READER a stranded
+#      session runs to reconstitute a fleet, so it must work offline and unauthenticated. A network
+#      round-trip per render buys accuracy by adding the failure mode the instrument exists to
+#      survive. The clock is therefore a PROXY, deliberately.
+#   2. FETCH_HEAD says "a fetch happened", not "origin/main was refreshed". `git fetch origin
+#      refs/pull/N/head`, or a fetch of a different remote, bumps this clock while leaving
+#      origin/main untouched -- so this can read FRESH while the ref is stale, which is the
+#      dangerous direction. The file's own first line names the ref and remote fetched, so closing
+#      it is possible and is not attempted here.
+#   3. `git fetch --no-write-fetch-head` refreshes the ref and writes no clock at all, so it reads
+#      as no fetch ever. That one fails LOUD, via the unmeasurable stop, which is the safe direction.
 $originMainSha = Invoke-Git -Dir $repo -GitArgs @('rev-parse', 'origin/main')
-$originMainAgeMinutes = $null
-$fetchHead = Join-Path $common 'refs\remotes\origin\main'
-if (Test-Path -LiteralPath $fetchHead) {
-    $originMainAgeMinutes = [int]((Get-Date).ToUniversalTime() - (Get-Item -LiteralPath $fetchHead).LastWriteTimeUtc).TotalMinutes
+
+# The clone's worktrees, enumerated a SECOND way and on purpose: `$repoWorktrees` above lists WORKING
+# TREE paths from `git worktree list`, and getting a git dir out of one costs a git child process
+# each. The admin directories under `<common>/worktrees` are the git dirs, already.
+$fetchClockPaths = @(Join-Path $common 'FETCH_HEAD')
+$worktreeGitDirs = Join-Path $common 'worktrees'
+if (Test-Path -LiteralPath $worktreeGitDirs) {
+    foreach ($d in @(Get-ChildItem -LiteralPath $worktreeGitDirs -Directory -EA SilentlyContinue)) {
+        $fetchClockPaths += (Join-Path $d.FullName 'FETCH_HEAD')
+    }
+}
+
+$lastFetchAgeMinutes = $null
+# NEVER NULL, because this is the line a reader scans past. A blank value beside a null age is how
+# the blind case passed for a healthy one; a sentence saying it could not be measured cannot.
+$lastFetchClock = 'UNMEASURABLE -- no FETCH_HEAD in this clone (see stop conditions)'
+# -LiteralPath, not a glob: a checkout path may contain [ or ], and -Path would treat it as a
+# wildcard and silently match nothing. Missing and unreadable both fall out as no item.
+$newestFetch = @($fetchClockPaths |
+        ForEach-Object { Get-Item -LiteralPath $_ -EA SilentlyContinue } |
+        Sort-Object LastWriteTimeUtc -Descending |
+        Select-Object -First 1)
+if ($newestFetch.Count -eq 1) {
+    $lastFetchAgeMinutes = [int]((Get-Date).ToUniversalTime() - $newestFetch[0].LastWriteTimeUtc).TotalMinutes
+    $lastFetchClock = $newestFetch[0].FullName
 }
 
 # ---------------------------------------------------------------------------------------------
@@ -272,7 +343,14 @@ $stops = @()
 if (-not $fenceAvailable) { $stops += 'fenceAvailable=false -- no config root with a sessions/ directory was found; every state below would be a guess' }
 if ($liveWithoutRecord.Count -gt 0) { $stops += "liveSessionsWithoutRecord=$($liveWithoutRecord.Count) -- the writer is not running in every live seat, so this roster is INCOMPLETE by that many" }
 if ($records.Count -eq 0 -and $heartbeats.Count -eq 0) { $stops += 'recordsExamined=0 AND writerHeartbeatIn=0 -- indistinguishable from a writer that was never installed' }
-if ($null -ne $originMainAgeMinutes -and $originMainAgeMinutes -gt 60) { $stops += "originMainAgeMinutes=$originMainAgeMinutes -- origin/main has not been fetched recently; landed verdicts would be computed against a stale ref" }
+# BOTH DIRECTIONS FIRE, and the null one is the reason this rung exists (BACKLOG #1374). The old
+# guard was `-ne $null -and -gt 60`, so the one state where the instrument knows nothing was the one
+# state it said nothing about.
+if ($null -eq $lastFetchAgeMinutes) {
+    $stops += 'lastFetchAgeMinutes=UNMEASURABLE -- no FETCH_HEAD exists anywhere in this clone, so this instrument CANNOT tell a fetch made seconds ago from one never made, and every landed verdict below is computed against an origin/main of UNKNOWN age. A fresh clone reads this way on purpose: `git clone` writes no FETCH_HEAD. Run `git fetch origin` -- it both refreshes the ref and makes this field measurable'
+} elseif ($lastFetchAgeMinutes -gt 60) {
+    $stops += "lastFetchAgeMinutes=$lastFetchAgeMinutes -- the last fetch anywhere in this clone was $lastFetchAgeMinutes minutes ago; landed verdicts would be computed against a stale origin/main"
+}
 
 # POINTER CENSUS, resolved here rather than trusted from the records. Printed as a RATIO because the
 # numerator alone cannot be read: "1 dangling" is a crisis at 2 pointers and noise at 200. Measured
@@ -338,7 +416,14 @@ $receipt = [ordered]@{
     writerErrorLines          = $writerErrors
     repoWorktrees             = $repoWorktrees.Count
     originMainSha             = $originMainSha
-    originMainAgeMinutes      = $originMainAgeMinutes
+    # NAMED FOR THE CLOCK IT READS. The predecessor key `originMainAgeMinutes` claimed fetch recency
+    # and timed the ref file instead; nothing outside docs/BACKLOG.md ever read it by name (checked
+    # against this repo and the vault's origin/main, with `fleet.ps1` itself as the positive
+    # control), so it was renamed rather than doubled. A consumer pinned to the old key now finds no
+    # key at all, which is the honest failure -- the alternative was a familiar name that keeps
+    # answering the wrong question.
+    lastFetchAgeMinutes       = $lastFetchAgeMinutes
+    lastFetchClock            = $lastFetchClock
     handoffPointers           = $ptrTotal
     handoffPointerSeats       = $ptrBoxes.Count
     handoffPointersDangling   = $ptrDangling
@@ -484,7 +569,14 @@ exit $code
 "RECEIPT -- what was EXAMINED, not merely what was found:"
 foreach ($k in $receipt.Keys) {
     if ($k -eq 'stopConditions') { continue }
-    "  {0,-26} {1}" -f $k, $receipt[$k]
+    # A NULL MUST NOT RENDER AS WHITESPACE. `-f` formats $null as the empty string, so a field this
+    # instrument could not measure printed as a blank column and read exactly like a quiet, healthy
+    # one -- the same failure BACKLOG #1374 is about, on whichever field happens to be null next.
+    # `originMainSha` is null in any checkout with no `origin` remote and was rendering that way.
+    # This is the generic backstop; a field whose null needs a REMEDY still carries its own sentence
+    # (`lastFetchClock`), because "(null)" cannot tell anyone to run `git fetch origin`.
+    $v = if ($null -eq $receipt[$k]) { '(null)' } else { $receipt[$k] }
+    "  {0,-26} {1}" -f $k, $v
 }
 ""
 if ($stops.Count -gt 0) {
