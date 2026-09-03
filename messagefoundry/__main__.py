@@ -1998,9 +1998,9 @@ def _serve(args: argparse.Namespace) -> int:
     # keyless-store / open-egress posture: refuse on a production PHI instance (the prod fail-closed
     # analogue), warn on a non-production PHI instance, stay quiet on a synthetic instance. Reached only
     # for an otherwise-permitted exposed bind (the TLS gate above ran first); the loopback default (now
-    # require_mfa on) never trips it. AD/Kerberos MFA is delegated to the directory, so require_mfa only
-    # gates LOCAL Administrator accounts (the bootstrap admin is one) — it is safe to leave on even on
-    # an AD-only deployment.
+    # require_mfa on) never trips it. Since BACKLOG #1144 require_mfa gates DIRECTORY accounts too — a
+    # ticket asserts no factor strength the engine can read, so the engine asks for its own factor —
+    # which makes leaving it on correct on an AD-only deployment rather than merely harmless there.
     #
     # L5b review fix (ADR 0068 §8), corrected by BACKLOG #326: the gate keys on the same EXPOSURE signal
     # as the ladder above, not the bind host alone — the runbook's RECOMMENDED topology (loopback bind
@@ -2023,8 +2023,8 @@ def _serve(args: argparse.Namespace) -> int:
                     f"instance ({env_name!r}) with [security].require_mfa off; refusing to start — the "
                     "Administrator role would authenticate with a single factor over the network. "
                     "Enable native TOTP MFA with [security].require_mfa=true (WP-14) before exposing the "
-                    "API (safe even on an AD-only deployment — it gates only local Administrator "
-                    "accounts); or set [security].allow_single_factor_admin_when_exposed=true to "
+                    "API (on an AD-only deployment it binds directory principals too, each enrolling "
+                    "an engine factor); or set [security].allow_single_factor_admin_when_exposed=true to "
                     "deliberately permit single-factor admin at exposure (audited).",
                     file=sys.stderr,
                 )

@@ -221,6 +221,8 @@ def user_detail_page(
     )
     danger: list[object] = []
     if not is_ad:
+        # Reset password stays directory-gated: an engine password is the one credential a directory
+        # account does not have, and admin_reset_password still refuses one.
         danger.append(
             el(
                 "form",
@@ -230,15 +232,18 @@ def user_detail_page(
                 class_="ctl",
             )
         )
-        danger.append(
-            el(
-                "form",
-                el("button", "Reset MFA", type="submit"),
-                method="post",
-                action=f"/ui/users/{user.id}/reset-mfa",
-                class_="ctl",
-            )
+    # Reset MFA is NOT gated (BACKLOG #1144). A directory account can hold an engine factor now, so
+    # this is its only recovery from a lost authenticator -- every route that could otherwise help
+    # stands behind the factor it lost. Hiding the button would make enrollment a one-way door.
+    danger.append(
+        el(
+            "form",
+            el("button", "Reset MFA", type="submit"),
+            method="post",
+            action=f"/ui/users/{user.id}/reset-mfa",
+            class_="ctl",
         )
+    )
     danger.append(
         el(
             "form",

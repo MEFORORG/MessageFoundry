@@ -1794,9 +1794,10 @@ class AuthSettings(_Section):
     require_action_step_up: bool = True
 
     # Multi-factor authentication (WP-14, ADR 0002 §3; ASVS 6.3.3) — a native RFC 6238 TOTP second
-    # factor for LOCAL accounts. AD/Kerberos MFA is delegated to the directory (Entra Conditional
-    # Access / an MFA proxy), so a directory login is never prompted for an engine TOTP. When
-    # require_mfa is on, an in-scope local account (see require_mfa_scope) MUST enroll a factor and
+    # factor. It covers EVERY account, directory ones included (BACKLOG #1144, ASVS 6.8.4): a ticket
+    # or a bind asserts nothing about what the directory enforced, so the engine grants nothing on it
+    # and asks for its own factor instead of exempting the leg. When require_mfa is on, an in-scope
+    # account (see require_mfa_scope) MUST enroll a factor and
     # satisfy it before its session may reach ANY authorized route — MFA is an ACCESS gate, not only
     # a step-up gate (ASVS 6.3.3). A user who has already enrolled a factor is always required to
     # satisfy it, whatever the scope.
@@ -1818,16 +1819,22 @@ class AuthSettings(_Section):
     # session, not merely step-up operations — an MFA-pending session is refused with 403 +
     # ``X-MFA-Required: 1`` (api/security.py:require) and, in the browser, confined to /ui/mfa.
     require_mfa: bool = True
-    # WHICH local accounts an un-enrolled session's access gate covers when require_mfa is on (ASVS
-    # 6.3.3). ``every_local_account`` (default) means any local account must carry a second factor;
+    # WHICH accounts an un-enrolled session's access gate covers when require_mfa is on (ASVS 6.3.3).
+    # ``every_local_account`` (default) means any account must carry a second factor;
     # ``administrators`` is the pre-6.3.3 posture where only the Administrator role must. An account
     # that has ALREADY enrolled a factor is required to satisfy it under either value — this dial only
-    # decides who must enroll in the first place. Directory (AD/Kerberos) identities are out of scope
-    # under either value: their MFA is delegated to the directory (owner-signed relaxation).
+    # decides who must enroll in the first place.
     #
-    # OPERATOR NOTE: under ``every_local_account`` a non-interactive LOCAL bearer-token service account
+    # THE ``every_local_account`` SPELLING IS NOW WIDER THAN ITS NAME (BACKLOG #1144). Directory
+    # identities used to be exempt under either value; they are not, because the directory legs assert
+    # no strength and the engine grants nothing on that. Renaming the Literal reaches this model, the
+    # CONFIGURATION.md table and the tests that pin both -- its own coherent change, not a rider on a
+    # security fix. THIS IS THE SINGLE PLACE that mismatch is explained; do not restate it (SDS-3.5).
+    #
+    # OPERATOR NOTE: under ``every_local_account`` a non-interactive bearer-token service account
     # becomes MFA-pending and cannot enroll unattended — move it to mTLS (api/security.py:
-    # require_service_cert, which is exempt by design) or to AD, or set this to ``administrators``.
+    # require_service_cert, which is exempt by design) or set this to ``administrators``. Moving it to
+    # AD is NO LONGER an escape: a directory account is in scope like any other.
     require_mfa_scope: Literal["administrators", "every_local_account"] = "every_local_account"
     # TOTP clock-skew tolerance, in 30-second time steps, applied when verifying a submitted code
     # (BACKLOG #187; ASVS 6.5.5). Default 0 = STRICT: only the current 30 s step is accepted, so a
@@ -4439,7 +4446,8 @@ def security_loosenings(
         out.append(
             (
                 "require_mfa",
-                "every local account is single-factor — no native TOTP second factor is required",
+                "every account is single-factor — no engine second factor is required, and a "
+                "directory session is admitted on a ticket that asserts no strength",
             )
         )
     elif sec.require_mfa_scope != "every_local_account":
@@ -4448,8 +4456,8 @@ def security_loosenings(
         out.append(
             (
                 "require_mfa_scope",
-                "only Administrators must enroll a second factor — every other local account is "
-                "single-factor until it opts in by enrolling",
+                "only Administrators must enroll a second factor — every other account, local or "
+                "directory, is single-factor until it opts in by enrolling",
             )
         )
     if sec.allow_single_factor_admin_when_exposed:

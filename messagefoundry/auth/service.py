@@ -946,12 +946,20 @@ class AuthService:
         if principal is None:
             await self._directory_reject_audit(username, "kerberos", "not_in_directory")
             return LoginOutcome(ok=False, error="user not found in directory")
-        # The signed delegated-directory relaxation (ASVS 6.3.4): a Kerberos service ticket carries no
-        # factor-strength assertion that pyspnego surfaces, so directory delegation stands. Since the
-        # AD password sign-in was retired (BACKLOG #1137) this is the ONLY leg passing a hard True --
-        # docs/SECURITY.md's Kerberos rows are where that grant is now disclosed.
+        # MINT AT THE MINIMUM (BACKLOG #1144, ASVS 6.8.4). A Kerberos service ticket carries no
+        # factor-strength assertion that pyspnego surfaces, so the engine learns NOTHING about what
+        # the domain enforced. It used to pass a hard True here under the signed delegated-directory
+        # relaxation, which is the inverted fallback: the requirement's clause says an application
+        # that receives no assertion must assume the MINIMUM mechanism was used, and minting verified
+        # assumes the maximum. False is that minimum -- one factor proven, none asserted -- so the
+        # session is MFA-pending and the engine's own second factor decides the rest.
+        #
+        # This is only safe CO-LANDED with directory-account engine-factor enrollment (the same item):
+        # a minimum-minted directory session reaches nothing outside api/security.py's six-entry
+        # MFA-exempt set, so without an enrollment ceremony that accepts a directory account it is a
+        # lockout rather than a control.
         return await self._complete_ad_login(
-            principal, client, mfa_verified=True, seed_reauth=seed_reauth
+            principal, client, mfa_verified=False, seed_reauth=seed_reauth
         )
 
     def _oidc_policy(self, nonce: str) -> oidc.OidcClaimPolicy:
@@ -1354,10 +1362,10 @@ class AuthService:
             allowed_channels=_allowed_channels(user, ad_roles),
             extra_permissions=ad_custom_permissions,
         )
-        # ASVS 6.3.4: the second-factor grant is the CALLER's per-mechanism decision, not a blanket
-        # literal. AD simple-bind and Kerberos pass True under the owner-signed delegated-directory-MFA
-        # relaxation (the bind/ticket teaches the engine nothing about directory-side strength); the
-        # federated leg passes the engine-verified amr/acr result. See the callers for each rationale.
+        # ASVS 6.3.4 / 6.8.4: the second-factor grant is the CALLER's per-mechanism decision, not a
+        # blanket literal. Kerberos passes False -- a ticket asserts nothing about directory-side
+        # strength, so the engine assumes the minimum (BACKLOG #1144); the federated leg passes the
+        # engine-verified amr/acr result. See the callers for each rationale.
         token = await self._issue_session(
             user.id,
             client,
@@ -1687,9 +1695,10 @@ class AuthService:
             seed_reauth=mfa_verified if seed_reauth is None else seed_reauth,
         )
         if mfa_verified:
-            # No second factor pending (MFA not required for this user, or delegated to AD/Kerberos):
-            # mark the session's 2nd factor satisfied at issuance so the step-up gate never blocks it.
-            # An MFA-required local login leaves it NULL until POST /auth/mfa-verify (WP-14).
+            # No second factor pending (MFA is not required for this user, or the federated IdP
+            # asserted one): mark the session's 2nd factor satisfied at issuance so the step-up gate
+            # never blocks it. An MFA-required login leaves it NULL until POST /auth/mfa-verify
+            # (WP-14) -- including the Kerberos leg, which asserts nothing and mints at the minimum.
             await self._store.mark_session_mfa_verified(token_hash)
         cap = self._settings.max_sessions_per_user
         if cap and cap > 0:
@@ -2162,14 +2171,12 @@ class AuthService:
         covers them — ``every_local_account`` (default, ASVS 6.3.3) or, under ``administrators``,
         only the Administrator role.
 
-        **AD is an ALLOW-LIST exemption, not a denylist.** Directory MFA is delegated to the directory
-        (Entra Conditional Access / an MFA proxy) under the owner-signed relaxation, so an ``ad`` user
-        is exempt — but any OTHER provider value falls through to the local rules and is REQUIRED.
-        Failing closed matters because :meth:`_identity_for_user` maps an unrecognized provider back to
-        ``LOCAL`` when building the :class:`Identity`; a denylist (``!= LOCAL``) would let such a row
-        present as local everywhere else while silently skipping the second factor here."""
-        if user.auth_provider == AuthProvider.AD.value:
-            return False
+        **THE RULE READS NO PROVIDER (BACKLOG #1144, ASVS 6.8.4),** which is what keeps it closed
+        against an unrecognized value — :meth:`_identity_for_user` maps one back to ``LOCAL`` when it
+        builds the :class:`Identity`, so a row that skipped the factor here would present as local
+        everywhere else. It used to open with a blanket ``auth_provider == ad -> False`` exemption; a
+        ticket or a bind asserts nothing about what the directory enforced, so that exempted on no
+        evidence, and the enrollment ceremonies now accept a directory account."""
         if second_factor_enrolled:
             return True
         if not self._settings.require_mfa:
@@ -2193,21 +2200,22 @@ class AuthService:
         user = await self._store.get_user(session.user_id)
         if user is None:
             return False
-        if user.auth_provider == AuthProvider.AD.value:
-            # ASVS 6.3.4 — the directory leg, decided per SESSION rather than per user. Reaching here
-            # means the session was minted WITHOUT an engine-verified factor (:_issue_session stamps
-            # mfa_verified_at only when mfa_verified was True). AD simple-bind and Kerberos ALWAYS
-            # mint verified under the owner-signed delegated-MFA relaxation, so the ONLY way to be
-            # here is a FEDERATED (OIDC) session issued while [auth].oidc_require_mfa_claim was off —
-            # i.e. the engine verified nothing about the IdP's factor strength.
+        if user.auth_provider == AuthProvider.AD.value and self._settings.require_mfa:
+            # THE DIRECTORY FLOOR, decided per SESSION rather than per user (ASVS 6.3.4 / 6.8.4).
+            # Reaching here means the session was minted with NO factor asserted at all -- every
+            # Kerberos session, and any federated one issued while oidc_require_mfa_claim was off.
             #
-            # Deciding it here, not in _mfa_required_for, is deliberate: that helper is keyed on the
-            # USER and is also consulted by mfa_status / the last-factor-delete guard, where "is this
-            # person exempt" is the right question. Only the session knows what was actually proven.
-            # Without this, making the OIDC mint conditional would move a timestamp and gate nothing.
-            # [auth].require_mfa remains the global off-switch so an operator who has deliberately
-            # opted out of the claim gate is not left without one.
-            return not self._settings.require_mfa
+            # It decides exactly one case the shared rule below would decide differently:
+            # require_mfa_scope="administrators" + a non-Administrator + no factor enrolled. A LOCAL
+            # non-admin is satisfied there, having at least proven a password to the ENGINE; this
+            # session proved nothing to the engine, so the scope dial does not reach it. Every other
+            # combination is already produced by the shared rule, and when require_mfa is off this
+            # falls through to it -- an enrolled directory account satisfies the factor it enrolled.
+            #
+            # Keyed on the SESSION rather than folded into _mfa_required_for on purpose: that helper
+            # answers "is this person exempt" for mfa_status and the last-factor-delete guard, and
+            # only the session knows what was actually proven at mint time.
+            return False
         roles = _roles_from_ids(await self._store.get_user_role_ids(user.id))
         # The extra store read only executes for sessions not already MFA-verified (the
         # mfa_verified_at early-return above short-circuits the common case).
@@ -2215,12 +2223,20 @@ class AuthService:
         return not self._mfa_required_for(user, roles, second_factor_enrolled=enrolled)
 
     async def begin_mfa_enrollment(self, identity: Identity) -> MfaEnrollment:
-        """Stage a fresh TOTP secret for a local user and return it + the ``otpauth://`` URI for the
-        QR. Not active until proven via :meth:`confirm_mfa_enrollment`. Raises :class:`ValueError` for
-        an AD account or when MFA is already enabled (disable it first to re-enroll)."""
+        """Stage a fresh TOTP secret and return it + the ``otpauth://`` URI for the QR. Not active
+        until proven via :meth:`confirm_mfa_enrollment`. Raises :class:`ValueError` for an unknown
+        account or when MFA is already enabled (disable it first to re-enroll).
+
+        **A DIRECTORY ACCOUNT MAY ENROLL (BACKLOG #1144, ASVS 6.8.4).** This refused anything but
+        ``LOCAL``, which made the delegated-directory relaxation self-sealing: the engine could not
+        assume the minimum on a leg that asserts nothing, because assuming it locked out every
+        directory operator. The secret and its recovery codes are engine-held state on the engine's
+        own user row, which a directory account already has (``_upsert_ad_user``); nothing here reads
+        or writes the directory. The step-up in front of this ceremony re-proves a directory
+        credential by a live bind (:meth:`_reauth_ad`), so the proof is real on both providers."""
         user = await self._store.get_user(identity.user_id)
-        if user is None or user.auth_provider != AuthProvider.LOCAL.value:
-            raise ValueError("only local users can enroll a TOTP authenticator")
+        if user is None:
+            raise ValueError("no such user")
         if user.totp_enabled:
             raise ValueError("MFA is already enabled; disable it before re-enrolling")
         secret = totp.generate_secret()
@@ -2235,10 +2251,11 @@ class AuthService:
         single-use recovery codes (returned **once**, plaintext, for the user to save), mark the
         current session MFA-verified, audit + notify. Returns the recovery codes, or ``None`` when the
         code was wrong or its time-step was already consumed (single-use, BACKLOG #1021). Raises
-        :class:`ValueError` if no enrollment is staged / the user isn't local."""
+        :class:`ValueError` for an unknown account or when no enrollment is staged. Accepts a
+        directory account, for the reason :meth:`begin_mfa_enrollment` states."""
         user = await self._store.get_user(identity.user_id)
-        if user is None or user.auth_provider != AuthProvider.LOCAL.value:
-            raise ValueError("only local users can enroll a TOTP authenticator")
+        if user is None:
+            raise ValueError("no such user")
         secret = await self._store.get_totp_secret(identity.user_id)
         if not secret:
             raise ValueError("no enrollment in progress")
@@ -2423,12 +2440,16 @@ class AuthService:
         """Admin: clear a user's MFA — TOTP **and** every WebAuthn passkey (lost authenticator + no
         recovery path; ADR 0068 extends this to credentials) — and revoke their sessions so they
         re-enroll. The always-available recovery for a locked-out passkey user. Raises
-        :class:`ValueError` for an unknown or non-local user."""
+        :class:`ValueError` for an unknown user.
+
+        **IT COVERS A DIRECTORY ACCOUNT (BACKLOG #1144).** The non-local refusal that stood here was
+        true while no directory account could hold an engine factor. Once one can, keeping it would
+        make enrollment a one-way door: a directory user who lost the authenticator would have no
+        recovery at all, because every route that could help stands behind the factor they lost. This
+        is the widest of the refusals the item names, and it is included for that reason."""
         user = await self._store.get_user(user_id)
         if user is None:
             raise ValueError("no such user")
-        if user.auth_provider != AuthProvider.LOCAL.value:
-            raise ValueError("only local users have MFA to reset")
         await self._store.disable_totp(user_id)
         removed = await self._store.delete_all_webauthn_credentials(user_id)
         await self._store.revoke_user_sessions(user_id)
@@ -2501,11 +2522,12 @@ class AuthService:
         """Stage a passkey registration ceremony; returns the browser creation-options JSON. The
         API gates this behind the password-only re-proof (``require_ui_reauth_only`` — WP-14: a
         stolen pre-MFA cookie must never bind an attacker's passkey). Raises :class:`ValueError`
-        for an AD account (parity with :meth:`begin_mfa_enrollment`); a full challenge cache
-        raises :class:`webauthn.ChallengeCacheFullError` (cause-naming, rendered legibly)."""
+        for an unknown account; a full challenge cache raises
+        :class:`webauthn.ChallengeCacheFullError` (cause-naming, rendered legibly). Accepts a
+        directory account, in parity with :meth:`begin_mfa_enrollment` and for its stated reason."""
         user = await self._store.get_user(identity.user_id)
-        if user is None or user.auth_provider != AuthProvider.LOCAL.value:
-            raise ValueError("only local users can enroll a passkey")
+        if user is None:
+            raise ValueError("no such user")
         existing = await self._store.list_webauthn_credentials(identity.user_id)
         challenge = webauthn.new_challenge()
         options = webauthn.registration_options(
@@ -2533,13 +2555,14 @@ class AuthService:
     ) -> bool:
         """Verify an attestation response and persist the passkey. Returns ``False`` when the
         response fails verification (audited — parity with a wrong TOTP code); raises
-        :class:`ValueError` for flow errors with safe, renderable messages (AD account, bad label,
-        expired ceremony, duplicate label/credential). On success the enrolling session is marked
-        MFA-verified (exact :meth:`confirm_mfa_enrollment` parity) — **no recovery codes are
-        minted** (ADR 0068 decision 5)."""
+        :class:`ValueError` for flow errors with safe, renderable messages (unknown account, bad
+        label, expired ceremony, duplicate label/credential). On success the enrolling session is
+        marked MFA-verified (exact :meth:`confirm_mfa_enrollment` parity) — **no recovery codes are
+        minted** (ADR 0068 decision 5). Accepts a directory account, for the reason
+        :meth:`begin_mfa_enrollment` states."""
         user = await self._store.get_user(identity.user_id)
-        if user is None or user.auth_provider != AuthProvider.LOCAL.value:
-            raise ValueError("only local users can enroll a passkey")
+        if user is None:
+            raise ValueError("no such user")
         label = label.strip()
         if not label or len(label) > self._WEBAUTHN_LABEL_MAX:
             raise ValueError("label must be 1-100 characters")

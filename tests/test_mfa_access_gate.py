@@ -4,7 +4,9 @@
 
 6.3.3 moved the second factor from the step-up boundary to the front door: an MFA-pending session is
 refused on every authorized route, not merely on sensitive ones. 6.3.4 stopped minting every directory
-session MFA-verified regardless of what the directory actually enforced.
+session MFA-verified regardless of what the directory actually enforced. 6.8.4 finished that: the
+Kerberos leg asserts nothing the engine can read, so it grants nothing, and a directory account enrols
+an engine factor like any other (BACKLOG #1144).
 
 Each test names the mutation that must turn it RED, because several of these would pass either way if
 written carelessly — a session's ``mfa_verified_at`` column can be correct while nothing gates on it.
@@ -12,11 +14,13 @@ written carelessly — a session's ``mfa_verified_at`` column can be correct whi
 
 from __future__ import annotations
 
+import ast
 from collections.abc import AsyncIterator
 from pathlib import Path
 
 import httpx
 import pytest
+from _mfa_grant import mfa_grant_values
 
 from messagefoundry.api import create_app
 from messagefoundry.auth import Role, totp
@@ -306,11 +310,11 @@ async def test_a_federated_session_minted_unverified_is_not_mfa_satisfied(
 
 
 async def test_a_directory_session_minted_verified_is_satisfied(engine: Engine) -> None:
-    """RED when: the AD branch starts refusing unconditionally.
+    """RED when: the directory floor starts refusing unconditionally.
 
-    The delegated-directory relaxation must survive: AD simple-bind and Kerberos mint verified, and
-    those sessions have to keep working or every directory operator is locked out with no enrollment
-    path. This is the guard against over-correcting 6.3.4 into a mass lockout.
+    A verified mint has to keep working: it is what the federated leg produces once the claim gate has
+    checked the token's ``amr``/``acr``, and refusing it would strand every directory operator whose
+    IdP did assert a factor. This is the guard against over-correcting into a mass lockout.
     """
     service = await _service(engine)
     out = await service._complete_ad_login(_principal("aduser2"), None, mfa_verified=True)
@@ -321,9 +325,11 @@ async def test_a_directory_session_minted_verified_is_satisfied(engine: Engine) 
 async def test_require_mfa_off_is_still_a_global_escape_for_the_directory_leg(
     engine: Engine,
 ) -> None:
-    """RED when: the AD branch stops honouring require_mfa.
+    """RED when: the directory floor stops honouring require_mfa.
 
     An operator who deliberately turned the claim gate off must not be left without an off-switch.
+    With the knob off and no factor enrolled, the floor falls through to the shared per-user rule,
+    which also says not required — so an un-enrolled directory session is satisfied.
     """
     service = await _service(
         engine, AuthSettings(login_rate_limit_enabled=False, require_mfa=False)
@@ -333,21 +339,72 @@ async def test_require_mfa_off_is_still_a_global_escape_for_the_directory_leg(
     assert await service.mfa_satisfied(out.token) is True
 
 
-def test_an_unknown_auth_provider_fails_closed(engine: Engine) -> None:
-    """RED when: _mfa_required_for reverts to the ``!= LOCAL`` denylist.
+def test_the_per_user_rule_reads_no_provider_at_all(engine: Engine) -> None:
+    """RED when: ``_mfa_required_for`` re-adds ANY provider branch, allow-list or deny-list.
 
-    ``_identity_for_user`` maps an unrecognized provider back to LOCAL when building the Identity, so
-    a denylist would let such a row present as local everywhere else while silently skipping the
-    second factor here. The allowlist (``== AD``) makes it required instead.
+    Two failures the shape guards against at once. A ``!= LOCAL`` denylist would exempt an
+    unrecognized provider, which ``_identity_for_user`` maps back to LOCAL when it builds the
+    Identity — so such a row would present as local everywhere else while silently skipping the second
+    factor here. An ``== AD`` allow-list was the shipped code until BACKLOG #1144 and exempted every
+    directory account on a delegation the directory never asserted. Reading no provider closes both.
     """
     from types import SimpleNamespace
 
     service = AuthService.__new__(AuthService)
     service._settings = AuthSettings()  # type: ignore[attr-defined]
-    rogue = SimpleNamespace(auth_provider="saml-from-the-future")
-    assert (
-        service._mfa_required_for(  # type: ignore[arg-type]
-            rogue, frozenset({Role.VIEWER}), second_factor_enrolled=False
-        )
-        is True
+    for provider in ("saml-from-the-future", "ad", "local"):
+        rogue = SimpleNamespace(auth_provider=provider)
+        assert (
+            service._mfa_required_for(  # type: ignore[arg-type]
+                rogue, frozenset({Role.VIEWER}), second_factor_enrolled=False
+            )
+            is True
+        ), f"provider {provider!r} must not change the answer"
+
+
+# --- 6.8.4: the directory legs assert nothing, so the engine assumes nothing --
+
+
+def test_the_kerberos_leg_mints_at_the_minimum() -> None:
+    """RED when: ``authenticate_kerberos`` goes back to passing ``mfa_verified=True``.
+
+    A Kerberos service ticket carries no factor-strength assertion ``pyspnego`` surfaces, so the leg
+    must grant nothing. The source read lives in ``tests/_mfa_grant.py``, shared with the doc-drift
+    guard that pins ``docs/SECURITY.md``'s Kerberos rows against this same fact. The paired
+    behavioural test is
+    ``test_a_directory_session_minted_at_the_minimum_is_confined_until_it_enrolls``.
+    """
+    grants = mfa_grant_values(AuthService.authenticate_kerberos)
+    assert grants, "the Kerberos leg passes no mfa_verified at all — the seam moved"
+    assert all(isinstance(v, ast.Constant) and v.value is False for v in grants), (
+        "the Kerberos leg mints MFA-satisfied again; docs/SECURITY.md's Kerberos rows say it does "
+        "not, and every engine MFA gate would clear on evidence the engine never received."
     )
+
+
+async def test_a_directory_session_minted_at_the_minimum_is_confined_until_it_enrolls(
+    engine: Engine,
+) -> None:
+    """RED when: minting at the minimum ships WITHOUT directory-account factor enrollment.
+
+    This is the co-landing invariant as one test. A minimum-minted directory session must be refused
+    on an ordinary authorized route (otherwise the mint gates nothing) AND must be able to reach the
+    enrollment ceremony and satisfy the gate (otherwise the mint is a lockout, not a control). Either
+    half alone passes trivially; asserting both is what pins them together.
+    """
+    service = await _service(engine)
+    out = await service._complete_ad_login(_principal("aduser4"), None, mfa_verified=False)
+    assert out.ok and out.token is not None and out.identity is not None
+    async with _client(engine, service) as c:
+        headers = {"Authorization": f"Bearer {out.token}"}
+        refused = await c.get("/connections", headers=headers)
+        assert refused.status_code == 403
+        assert refused.headers.get("X-MFA-Required") == "1"
+
+    # The confinement is survivable: the ceremony accepts the directory account.
+    enroll = await service.begin_mfa_enrollment(out.identity)
+    codes = await service.confirm_mfa_enrollment(
+        out.identity, totp.totp(enroll.secret), token=out.token
+    )
+    assert codes is not None
+    assert await service.mfa_satisfied(out.token) is True

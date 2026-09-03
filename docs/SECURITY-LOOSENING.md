@@ -191,7 +191,8 @@ the call to the Console on 2026-09-02; the Console decided ([ADR 0118](adr/0118-
 
 ### `require_mfa = false` — single-factor admin
 - **What you lose:** the Administrator role authenticates with a password only (no native TOTP second
-  factor). AD/Kerberos MFA is delegated to the directory and is unaffected.
+  factor). Directory accounts lose it too (BACKLOG #1144): a Kerberos session mints MFA-pending, and
+  this knob is the only thing that lets it through the gate without an engine factor.
 - **When acceptable:** a loopback single-operator box where the second factor adds friction without a
   network exposure.
 - **Compensating controls:** keep the bind loopback; enable `admin_new_ip_step_up` if exposed.
