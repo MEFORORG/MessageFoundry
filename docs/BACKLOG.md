@@ -19946,6 +19946,7 @@ That is the same `self._lock` the staged-pipeline handoffs take. On a first depl
 > ✅ **SHIPPED in 0.3.2.** [`messagefoundry/integrity.py`](../messagefoundry/integrity.py) now attests a short explicit set of shipped security **data** assets (`_ATTESTED_ASSETS`) alongside the loaded engine modules: `messagefoundry/auth/data/common_passwords.txt` and `messagefoundry/security/semgrep/handler-security.yml`. Six tests in [`tests/test_startup_attestation.py`](../tests/test_startup_attestation.py) cover it. The control was run by hand and is recorded below, because a tripwire test that cannot fail is the failure mode this item is about.
 
 **Cluster:** Security / runtime tamper evidence. **Priority:** P2. **Verdict:** build.
+**Independently derived twice, which is why this row exists rather than an amendment to #1134.** [PR 810](https://github.com/MEFORORG/MessageFoundry/pull/810) -- open, not merged, so its text is not on `main` -- reached the same finding from the corpus side and wrote that it *"is pre-existing, is not a regression from this work, and needs its own item"*. This is that item. Neither pass saw the other; they were allocated and written independently on 2026-09-03.
 **Severity:** no deployment axis (sec. 0). Zero instances run, so nothing is neutered today and nobody is unscreened. Everything below is written as what a **first** deployment would ship.
 
 ### The defect
