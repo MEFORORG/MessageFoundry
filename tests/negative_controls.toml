@@ -414,9 +414,13 @@ still present, because a new commit is unread whatever the label says. The gate'
 out of the workflow and run under the flags Actions uses, not re-implemented; a second copy of that
 `case` would be free to agree with itself, and the `gh` calls it now makes are answered by a shim
 rather than mocked away, so an unanswered call is a loud harness fault instead of a silent refusal.
-Three plants sit on the SNAPSHOT defect (BACKLOG #1417): an event payload that still says `reviewed`
-while the live read says nothing, a label applied twelve hours before the head it sits on, and a
-label whose application nothing records. Four structural plants sit beside them, because the quieter
+Four plants sit on the SNAPSHOT defect (BACKLOG #1417): an event payload that still says `reviewed`
+while the live read says nothing, a label applied twelve hours before the head it sits on, a label
+whose application nothing records, and a head commit the step CANNOT DATE -- an empty `$HEAD_AT`,
+which made the head-date comparison false and printed `Gate satisfied` on a head nothing had checked.
+The undatable-label plant asserts the guard's OWN wording rather than only the exit code, because the
+two refusals are indistinguishable by verdict and deleting that guard once left every control green.
+Four structural plants sit beside them, because the quieter
 death of this gate is the context never arriving or never clearing: a renamed job, a job-level `if:`,
 a trigger set that cannot report on a pull request or in the merge queue, and a `types:` list that
 does not re-run the job when the reviewer adds the label.
@@ -428,6 +432,7 @@ red = [
   "tests/test_merge_gate_controls.py::test_the_review_gate_reads_the_label_live_rather_than_from_the_event_payload",
   "tests/test_merge_gate_controls.py::test_the_review_gate_refuses_a_label_applied_before_the_head_it_sits_on",
   "tests/test_merge_gate_controls.py::test_the_review_gate_refuses_when_nothing_records_the_label_being_applied",
+  "tests/test_merge_gate_controls.py::test_the_review_gate_refuses_a_head_commit_it_cannot_date",
   "tests/test_merge_gate_controls.py::test_the_review_gate_still_reports_under_the_required_context_string",
   "tests/test_merge_gate_controls.py::test_nothing_in_the_review_gate_adds_the_label_it_checks_for",
   "tests/test_merge_gate_controls.py::test_the_review_gate_reruns_when_a_reviewer_adds_the_label",
@@ -477,6 +482,26 @@ nothing, which is PR 724's 13:24-vs-13:43 state.
   * BEFORE: exit 0, printing `reviewed label present. Gate satisfied.` -- the gate passing a pull
     request that carried no `reviewed` label at execution time.
   * AFTER: exit 1, printing `labels, read at execution time: (none)` and the remedy.
+
+A FAIL-OPEN IN THE #1417 CHANGE ITSELF WAS FOUND BY REVIEW AND MEASURED BOTH WAYS, 2026-09-03. The
+step guarded `$LAST_ADD` for emptiness and left `$HEAD_AT` unguarded, and `gh api --jq` on a path
+that does not resolve prints an EMPTY LINE and exits 0 -- not `null`, not non-zero -- so nothing in
+the shell objects. Nothing sorts before the empty string, so the comparison went FALSE and the step
+passed a head it could not date. Three mutations run against the shipped shell, each reverted from
+the same run:
+
+  * the `-z "$HEAD_AT"` guard removed -- exit 0 printing `Gate satisfied`, and exactly 1 of the 15
+    selected controls red (test_the_review_gate_refuses_a_head_commit_it_cannot_date), 14 green.
+  * the `-z "$LAST_ADD"` guard removed -- 1 red, 14 green, and the red is the undatable-label control
+    reporting that the HEAD-DATE branch answered instead. Before that control asserted the guard's
+    own wording this same edit reddened NOTHING: both refusals exit 1 and both name `add-label
+    reviewed`, so the assertions matched whichever branch ran. That guard changes no verdict on any
+    input; it changes the DIAGNOSIS, and pinning the diagnosis is the only thing that can redden.
+  * `shell: bash` removed from the step -- 10 ERRORS, not 10 passes. The harness lifts the step's
+    shell and runs it under `-e -o pipefail`, which Actions supplies only when the step declares
+    bash; with no `shell:` key CI runs `bash -e {0}` with no pipefail, and one of the two API reads
+    is a pipeline that swallows its own failure there. A control measuring the friendlier shell would
+    be green about a step CI never executes, so `_review_gate_script()` refuses to lift it at all.
 
 A THIRD SPELLING OF THE SAME NEUTERING IS REPORTED AS A HARNESS FAULT, DELIBERATELY. Replacing the
 test with `if false` removes `$ACTION` from the script, and the fixture refuses to run a script that

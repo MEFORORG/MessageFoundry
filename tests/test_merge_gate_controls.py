@@ -1046,11 +1046,25 @@ def _label_step() -> dict[str, Any]:
 
 def _review_gate_script() -> str:
     """The label-reading step's shell, with the shape this control depends on asserted first."""
-    script = str(_label_step()["run"])
+    step = _label_step()
+    script = str(step["run"])
     assert "gh pr view" in script and "$ACTION" in script, (
         "the label-reading step no longer reads the label with `gh pr view` or no longer reads "
         "$ACTION, so this control would be feeding input to a script that ignores it and every "
         f"verdict below would be about nothing: {script!r}"
+    )
+    # THE HARNESS MUST RUN THE SHELL CI RUNS, and this is the line that makes that true rather than
+    # assumed. `_run_review_gate` runs the script under `-e -o pipefail`. Actions gives a `run:`
+    # block those flags ONLY when the step declares `shell: bash`; with no `shell:` key it gets
+    # `bash -e {0}`, which has no `pipefail`. That difference is not cosmetic here -- the step's
+    # label-history read is a pipeline, and without `pipefail` a failed `gh` inside it exits 0 and
+    # the script carries on. So a step that drops the declaration silently turns every behavioural
+    # control below into a measurement of a shell CI never executes, and this assertion is what
+    # stops that from being invisible (the BACKLOG #1216 shape: green about nothing).
+    assert str(step.get("shell", "")) == "bash", (
+        "the label-reading step no longer declares `shell: bash`, so Actions runs it under "
+        f"`bash -e {{0}}` with NO pipefail while this control runs it under `-e -o pipefail`. Every "
+        f"verdict below would then be about a friendlier shell than CI uses. shell={step.get('shell')!r}"
     )
     return script
 
@@ -1092,6 +1106,13 @@ _SHIM_FAULT = 90
 _HEAD_AT = "2026-09-01T11:00:00Z"
 _LABEL_AT = "2026-09-01T12:00:00Z"
 
+#: The `-z "$LAST_ADD"` guard's own diagnosis, quoted so a control can tell WHICH branch refused.
+#:
+#: Needed because the two refusals are not distinguishable by exit code. Both exit 1 and both name
+#: `add-label reviewed`, so a control asserting only those two things passes whichever branch runs --
+#: which is how deleting the guard once left every review-gate test green.
+_NO_HISTORY_REASON = "no labeled event records when it was applied"
+
 
 def _run_review_gate(
     bash: str,
@@ -1108,9 +1129,16 @@ def _run_review_gate(
 ) -> tuple[int, str]:
     """Run the step's shell UNDER THE FLAGS ACTIONS USES, and validate the invocation.
 
-    GitHub runs a `run:` block as `bash --noprofile --norc -e -o pipefail {0}`. Reproducing those
-    flags is not decoration: `-e` changes which line can end the script, and a control run under a
-    friendlier shell would be measuring a step CI never executes.
+    GitHub runs a `run:` block as `bash --noprofile --norc -e -o pipefail {0}` WHEN THE STEP DECLARES
+    `shell: bash`, and the label step does. That qualifier is not pedantry, and this docstring shipped
+    without it: with no `shell:` key Actions runs `bash -e {0}`, which has NO `pipefail`. So the
+    sentence "a friendlier shell would be measuring a step CI never executes" was true of the wrong
+    shell -- these flags were the friendlier ones, and the step CI ran was the stricter question. The
+    sibling harness in tests/test_release_pipeline.py has always said this correctly, because the step
+    IT lifts genuinely declares no shell and it uses `bash -e` to match.
+
+    `_review_gate_script()` is what keeps the two in step now: it refuses to lift a label step that
+    does not declare `shell: bash`, so the flags below cannot silently drift away from CI's.
 
     `labels` is what the LIVE read returns; `payload_labels` is what the frozen event payload would
     have said. They are separate arguments because the whole of BACKLOG #1417 is that they can
@@ -1397,6 +1425,60 @@ def test_the_review_gate_refuses_when_nothing_records_the_label_being_applied(
     )
     assert "add-label reviewed" in out, (
         f"the gate refused but did not name the remedy, which is to re-apply the label.\n{_ascii(out)}"
+    )
+    # PINNED ON THE REASON, BECAUSE THE VERDICT CANNOT PIN IT, and the test above shipped without
+    # this line and was therefore green about nothing. Deleting the step's `-z "$LAST_ADD"` guard
+    # left all fourteen review-gate controls passing: with `LAST_ADD` empty, `[[ "" < "$HEAD_AT" ]]`
+    # is TRUE for every non-empty head date -- nothing sorts before the empty string -- so the
+    # head-date comparison refused instead, and its message names `add-label reviewed` too. Both
+    # assertions above matched the wrong branch.
+    #
+    # So the guard is not verdict-load-bearing; it is DIAGNOSIS-load-bearing, and that is what has to
+    # be asserted. Without it the reader gets `applied at , before this head was dated ...`, which
+    # reads as a clock problem rather than as missing history and points at the wrong remedy.
+    assert _NO_HISTORY_REASON in out, (
+        'the step refused, but not through its `-z "$LAST_ADD"` guard -- the head-date comparison '
+        "caught this input instead and reported it as a stale label rather than as an undatable one. "
+        f"Expected the guard's own diagnosis, {_NO_HISTORY_REASON!r}.\n{_ascii(out)}"
+    )
+
+
+def test_the_review_gate_refuses_a_head_commit_it_cannot_date(
+    review_gate: tuple[str, str, Path, dict[str, str]],
+) -> None:
+    """PLANTED: an empty `$HEAD_AT`, which is the fail-open this step shipped with.
+
+    THE COMPARISON IS THE WHOLE PROBLEM. `[[ "$LAST_ADD" < "$HEAD_AT" ]]` with an empty right-hand
+    side is FALSE for every real timestamp, because nothing sorts before the empty string. The step
+    therefore fell through to `Gate satisfied` on a head it had not managed to date at all, and it
+    did so with a real `reviewed` label present, so nothing else in the step objected.
+
+    AND IT IS REACHABLE, which is the half that reads as impossible. `gh api --jq` on a path that
+    does not resolve prints an EMPTY LINE and exits 0 -- not `null`, and not non-zero -- so neither
+    `-e` nor `pipefail` catches it. Measured 2026-09-03 against this repository: one byte of output,
+    a newline, exit 0. Had it printed `null` the gate would have failed CLOSED, because `null` sorts
+    after any `2026-...` timestamp. The safe-looking failure mode is the one that does not happen.
+
+    Measured against the shipped shell before and after the guard: exit 0, then exit 1.
+    """
+    bash, script, workdir, env = review_gate
+    code, out = _run_review_gate(
+        bash,
+        script,
+        workdir,
+        env,
+        labels="reviewed",
+        action="reopened",
+        events=_LABEL_AT,
+        head_at="",
+    )
+    assert code != 0, (
+        "the gate PASSED a pull request whose head it could not date. An empty `$HEAD_AT` makes the "
+        "head-date comparison false, so the step reports `Gate satisfied` having established nothing "
+        f"about whether the label covers these commits.\n{_ascii(out)}"
+    )
+    assert "add-label reviewed" in out, (
+        f"the gate refused but did not name the remedy.\n{_ascii(out)}"
     )
 
 

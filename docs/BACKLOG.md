@@ -19891,9 +19891,47 @@ commit's **committer date**, which a client supplies: a commit authored before t
 after it clears that comparison while being genuinely unread. What the fix removed is the *other*
 half -- every action except `synchronize` reading the snapshot.
 
-**A SPOOFED OR ODD COMMIT DATE CANNOT OPEN THE GATE.** The head-date comparison only ever adds a
-refusal, so defeating it leaves the live label read standing; it cannot turn a refusal into a pass.
-Every failure of the two API reads exits non-zero under `-e`, which blocks.
+**A SPOOFED OR ODD COMMIT DATE CANNOT OPEN THE GATE.** Defeating the head-date *comparison* leaves
+the live label read standing, so it cannot turn a refusal into a pass.
+
+**A FAIL-OPEN AND TWO FALSE CLAIMS, FOUND BY REVIEW BEFORE THIS MERGED.** They are corrected here
+rather than deleted, because each described a control by a mechanism that was not the one operating,
+which is the defect CLAUDE.md section 11 forbids.
+
+* **THE FAIL-OPEN. `$LAST_ADD` was guarded for emptiness and `$HEAD_AT` was not.** `gh api --jq` on
+  a path that does not resolve prints an **empty line and exits 0** -- not `null`, and not non-zero
+  -- so neither `-e` nor `pipefail` sees anything wrong. Measured 2026-09-03 against this
+  repository: one byte of output, a newline, exit 0. Nothing sorts before the empty string, so
+  `[[ "$LAST_ADD" < "" ]]` is **false** and the step printed `Gate satisfied` on a head it had not
+  managed to date. A `null` would have sorted after any `2026-...` timestamp and refused, so the
+  safe-looking failure mode is the one that does not happen. `$HEAD_AT` now carries the same `-z`
+  guard, measured exit 0 before it and exit 1 after, and it is pinned by
+  `test_the_review_gate_refuses_a_head_commit_it_cannot_date`.
+* ***"The head-date comparison only ever adds a refusal"* -- it does not.** The `labeled`-event
+  shortcut is a **pass** that returns before either API read. It is sound, because a `labeled` event
+  necessarily post-dates the head named in its own payload, and it stays; but it is a new way to
+  exit 0 and must be described as one.
+* ***"Every failure of the two API reads exits non-zero under `-e`, which blocks"* -- false under
+  the shell the step actually ran.** A `run:` block with no `shell:` key gets `bash -e {0}`, which
+  has no `pipefail`. The label-history read is a **pipeline**, and a pipeline's status is its last
+  command's, so `tail` exits 0 over a `gh` that failed and `-e` never sees it. The gate still
+  blocked, but through the `-z "$LAST_ADD"` guard rather than the mechanism claimed. The step now
+  declares `shell: bash`, which supplies `pipefail` and makes the sentence true.
+
+**THE `-z "$LAST_ADD"` GUARD WAS UNPINNED, and that is a separate finding.** Deleting it left all
+fourteen review-gate controls green: with `LAST_ADD` empty the head-date comparison refused instead,
+and its message names `add-label reviewed` too, so both assertions matched the wrong branch. The
+guard is not verdict-load-bearing -- no input makes the step pass without it -- it is
+**diagnosis**-load-bearing, so the control now asserts the guard's own wording. Without it a reader
+gets `applied at , before this head was dated ...`, which reads as a clock problem and points at the
+wrong remedy.
+
+**THE TESTS WERE MEASURING A SHELL CI DOES NOT USE.** Both harnesses run the step under
+`bash --noprofile --norc -e -o pipefail`, and their comments said a friendlier shell "would be
+measuring a step CI never executes" -- while the real shell was the friendlier one. `shell: bash` is
+what makes those runs faithful, so `_review_gate_script()` now refuses to lift a step that does not
+declare it: dropping the declaration turns ten behavioural controls into loud errors rather than
+silent passes.
 
 **IT DOES PASS MORE OFTEN IN ONE DIRECTION, said plainly.** Reading live cuts both ways. Where the
 payload was stale-**positive** the gate now refuses, which is the defect this item filed. Where it

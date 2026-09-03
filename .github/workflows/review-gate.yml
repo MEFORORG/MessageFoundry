@@ -73,6 +73,15 @@ on:
     # GREEN context behind. Both are pinned by
     # tests/test_merge_gate_controls.py::test_the_review_gate_reruns_when_a_reviewer_adds_the_label,
     # because dropping `labeled` reddened nothing before that test existed.
+    #
+    # `unlabeled` COVERS LESS THAN IT LOOKS LIKE IT COVERS, and this comment used to imply otherwise.
+    # It catches a HUMAN withdrawing the label. It does NOT catch the strip step below removing it:
+    # GitHub does not dispatch a run from an event raised by the repository's own `GITHUB_TOKEN`, and
+    # that step runs `gh` under `github.token`. Measured on PR 765: exactly TWO review-gate runs on
+    # that head, and none for the bot's 20:45:14Z removal. Nothing is wedged by that, because the
+    # `synchronize` that caused the strip dispatches its own run and that run ends red -- but the
+    # coverage comes from `synchronize`, not from `unlabeled`, and a reader who believed otherwise
+    # would think deleting the `synchronize` arm was safe.
     types: [opened, reopened, ready_for_review, synchronize, labeled, unlabeled]
   merge_group:
 
@@ -84,6 +93,10 @@ permissions:
   # commit's date, `issues: read` for the pull request's label events -- label history lives on the
   # issue side of a pull request, not the pulls side. A 403 would fail the gate CLOSED, which is the
   # right direction but would wedge every pull request, so both are named rather than assumed.
+  #
+  # THAT "FAILS CLOSED" HOLDS BECAUSE THE STEP DECLARES `shell: bash`, and it did not before. Under
+  # the default shell one of the two reads swallowed its own 403. The mechanism is recorded once, at
+  # that declaration, rather than restated here.
   contents: read
   issues: read
   pull-requests: write
@@ -142,6 +155,21 @@ jobs:
           ACTION: ${{ github.event.action }}
           LABEL_NAME: ${{ github.event.label.name }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        # `shell: bash` IS LOAD-BEARING HERE, NOT TIDINESS. A `run:` block with no `shell:` key runs
+        # under `bash -e {0}`; naming bash gets `bash --noprofile --norc -e -o pipefail {0}`. The
+        # option that goes missing is `pipefail`, and one of this step's two API reads is a PIPELINE
+        # (`gh api ... | sort | tail -n 1`). A pipeline's status is its LAST command's, so `tail`
+        # exits 0 over a `gh` that 403'd, `-e` never sees the failure, and the step carries on with an
+        # empty result. Measured 2026-09-03 under both flag sets: without `pipefail` the script ran
+        # past a failing history read; with it the script ends at the assignment.
+        #
+        # It also settles the bashism. The comparison at the bottom is `[[ ]]`, which the `sh -e {0}`
+        # fallback -- what a runner without bash gets -- would reject outright.
+        #
+        # THE TESTS IN tests/test_merge_gate_controls.py RUN THIS STEP UNDER `-e -o pipefail`, and
+        # before this line that was a friendlier shell than CI used, so they were measuring a step
+        # Actions never executed. The declaration is what makes those runs faithful.
+        shell: bash
         run: |
           # A NEW COMMIT IS UNREAD BY DEFINITION, and this arm is kept as a belt over the live read
           # rather than as the fix for staleness -- it used to be the fix, applied to the one action
@@ -173,6 +201,13 @@ jobs:
           # `reviewed` in the very event that started this run, the label was applied while this head
           # already existed -- that is a GitHub clock, needs no API call, and cannot lag behind a
           # write made moments earlier.
+          #
+          # SAY WHAT THIS ARM IS: a PASS that returns before either API read. So the head-date
+          # machinery does NOT "only ever add a refusal", which is how the first draft of this change
+          # described it. The shortcut is sound -- a `labeled` event necessarily post-dates the head
+          # named in its own payload -- and it stays. But it is a new way to exit 0, and a control
+          # described as refusal-only while it carries a pass path is a compensating control resting
+          # on a false premise.
           if [ "$ACTION" = "labeled" ] && [ "$LABEL_NAME" = "reviewed" ]; then
             echo "the reviewed label was applied by the event that started this run. Gate satisfied."
             exit 0
@@ -189,6 +224,22 @@ jobs:
 
           if [ -z "$LAST_ADD" ]; then
             echo "::error::The reviewed label is on this pull request but no labeled event records when it was applied, so it cannot be shown to cover this head. Re-apply it: gh pr edit <N> --remove-label reviewed && gh pr edit <N> --add-label reviewed"
+            exit 1
+          fi
+
+          # BOTH TIMESTAMPS ARE GUARDED, and the first draft guarded only the one above. An empty
+          # `$HEAD_AT` FAILS OPEN: every string sorts at or after the empty string, so
+          # `[[ "$LAST_ADD" < "" ]]` is FALSE and the comparison below falls straight through to
+          # `Gate satisfied` on a head this step could not date at all.
+          #
+          # AND IT IS REACHABLE, which is the part that reads as impossible until you check what `gh`
+          # actually prints. `gh api --jq` on a path that does not resolve prints an EMPTY LINE and
+          # exits 0 -- not `null`, and not non-zero -- so neither `-e` nor `pipefail` sees anything
+          # wrong. Measured 2026-09-03 against this repository: one byte of output, a newline, exit 0.
+          # A `null` would have sorted AFTER any `2026-...` timestamp and refused, so the safe-looking
+          # failure mode is the one that never happens.
+          if [ -z "$HEAD_AT" ]; then
+            echo "::error::The head commit $HEAD_SHA could not be dated, so the reviewed label cannot be shown to cover it. Re-run this check; if it persists, re-apply the label: gh pr edit <N> --remove-label reviewed && gh pr edit <N> --add-label reviewed"
             exit 1
           fi
 
