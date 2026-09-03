@@ -812,18 +812,14 @@ def test_cram_md5_is_never_chosen_even_when_the_server_offers_it() -> None:
     offer the approved one must win.
     """
     smtp = _FakeSmtp("CRAM-MD5 PLAIN")
-    smtp_login_approved(
-        smtp, "u", "p", channel_encrypted=True, escape_permitted=False, cell="EMAIL"
-    )
+    smtp_login_approved(smtp, "u", "p", channel_encrypted=True, cell="EMAIL")
     assert smtp.used == "PLAIN", f"a disallowed mechanism was chosen: {smtp.used}"
 
 
 def test_a_server_offering_only_a_disallowed_mechanism_is_refused() -> None:
     smtp = _FakeSmtp("CRAM-MD5")
     with pytest.raises(InsecureHopRefused) as ei:
-        smtp_login_approved(
-            smtp, "u", "p", channel_encrypted=True, escape_permitted=False, cell="EMAIL"
-        )
+        smtp_login_approved(smtp, "u", "p", channel_encrypted=True, cell="EMAIL")
     assert "none of which is approved" in str(ei.value)
     assert smtp.used is None, "it authenticated anyway"
 
@@ -837,25 +833,37 @@ def test_auth_over_an_unencrypted_channel_is_refused() -> None:
     """
     smtp = _FakeSmtp("PLAIN LOGIN")
     with pytest.raises(InsecureHopRefused) as ei:
-        smtp_login_approved(
-            smtp, "u", "p", channel_encrypted=False, escape_permitted=False, cell="ALERT"
-        )
+        smtp_login_approved(smtp, "u", "p", channel_encrypted=False, cell="ALERT")
     assert "SEND THE PASSWORD" in str(ei.value)
     assert smtp.used is None, "the password went out over an unencrypted channel"
 
 
-def test_the_clamped_escape_still_crosses_an_unencrypted_hop() -> None:
-    """POSITIVE CONTROL for the refusal above: it must not be "refuse everything".
+def test_no_environment_escape_lifts_the_cleartext_auth_refusal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The refusal is ABSOLUTE, matching the construction gate it backs up.
 
-    Without this, a helper that raised unconditionally would satisfy both refusal tests and the suite
-    would report a working gate over a connector that can never authenticate. The escape is the same
-    clamped one governing the LDAPS bind, the MLLP/FTPS contexts and the webhook sink.
+    All three SMTP cells refuse a username beside use_tls=false at construction even with
+    MEFOR_ALLOW_INSECURE_TLS set (the refuse_cleartext_credentials posture, not the escapable
+    payload-hop posture). A send-time backstop that the env var could lift would be weaker than the
+    gate it backs up. This replaces an escape_permitted=True arm that no shipped call site reached.
+
+    The positive control against "it just refuses everything" is
+    test_cram_md5_is_never_chosen_even_when_the_server_offers_it, which authenticates.
     """
+    monkeypatch.setenv("MEFOR_ALLOW_INSECURE_TLS", "1")
     smtp = _FakeSmtp("PLAIN LOGIN")
-    smtp_login_approved(
-        smtp, "u", "p", channel_encrypted=False, escape_permitted=True, cell="ALERT"
-    )
-    assert smtp.used == "PLAIN"
+    with pytest.raises(InsecureHopRefused) as ei:
+        smtp_login_approved(smtp, "u", "p", channel_encrypted=False, cell="ALERT")
+    assert smtp.used is None, "the escape put a cleartext password on the wire"
+    # The text must not send an operator to a variable that cannot lift this refusal: following it
+    # would weaken every other hop on the instance and still be refused here.
+    assert "MEFOR_ALLOW_INSECURE_TLS" not in str(ei.value)
+
+
+def test_the_helper_takes_no_escape_parameter() -> None:
+    """Pins the deletion. A re-added escape is a hole behind an absolute construction gate."""
+    assert "escape_permitted" not in inspect.signature(smtp_login_approved).parameters
 
 
 # --- BACKLOG #1317: forward secrecy is not sufficient -------------------------------------------
