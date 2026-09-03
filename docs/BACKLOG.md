@@ -4316,6 +4316,11 @@ BUILDS it.*
 > this item, and it stays worth fixing whichever way the gate ever goes. Nor does this rule on Blocker B,
 > the delivered refusal being narrower than this item's stated Scope; that question is moot while the
 > gate stands and returns if it is ever lifted.
+> **ONE SIDE EFFECT OF THIS RULING, recorded because neither item says it.** The defer keeps **#1234**
+> unstartable. That item's defect lives only on `w3-store-privilege-preflight`, which lands only if the
+> preflight lands, so deferring the preflight leaves the defect with nowhere to go. #1234 is correct that
+> it is not hostage to this POLICY question; it is nonetheless blocked by the same branch. Measured
+> 2026-09-03 and recorded there.
 >
 > **Filed 2026-08-04 — not started. Scored 2026-08-04 → DEMAND-GATE.** The engine documents a least-privilege store grant it can
 > **never observe**: there is no fixed-server-role probe and no database-role-membership probe in
@@ -11749,6 +11754,24 @@ commit.**
 ## 1234. the store-privilege probe reports OBSERVED having read nothing: NULL role results fold to False on SQL Server
 
 > 🔢 **Re-scored 2026-08-20 -> P1.** Value **6/10** · Difficulty **2/10** · _quick win_. The defect is real and unfixed on the branch that holds it: the SQL Server arm returns OBSERVED unconditionally and folds NULL role results to False, so a probe that read nothing reports observed-and-clean, and the refusal arm is opt-in so WARN is the only arm a default install reaches. The fix is a NULL-versus-clean distinction on one backend arm plus the two-arm test the item specifies, provable against a fixture row rather than a live server, but it stays unstartable until that branch lands. _(was 6/10 · 2/10.)_
+>
+> **OWNER DECISION 2026-09-03 -- RECORDED AS BLOCKED, NOT DISPATCHED. The measurement below was re-taken
+> today rather than trusted:** the amendment further down is three weeks old, and this seat spent the day
+> finding items whose records had gone stale. It has not. **It has got worse.** On `main`:
+> `require_least_privilege|least_privilege` returns **0** hits across `messagefoundry/**/*.py`, against a
+> POSITIVE CONTROL of **2** files for `require_managed_identity` on the same instrument;
+> `messagefoundry/store/privilege.py` is **absent**; and `w3-store-privilege-preflight` is **4 ahead and
+> 532 behind** -- it was 328 behind on 2026-08-14, so the gap is widening -- with **no pull request, ever**.
+> **THE COUPLING NEITHER ITEM STATES, and it is why this is recorded rather than fixed.** This item is
+> right that a code defect must not be hostage to a POLICY decision, and on policy it is not hostage.
+> On STARTABILITY the two are joined anyway: the defect exists only on that branch, the branch lands only
+> if the preflight lands, and the owner ruled 2026-09-03 that the preflight stays **deferred** (recorded
+> at #1008). **So while that defer stands, this item has nowhere to land** -- not because it is gated,
+> but because its subject is not on `main`. Both clearing paths the amendment names, rebasing the branch
+> with a PR or re-implementing the preflight against current `main`, REVERSE that defer. That is why
+> neither is a builder's call, and why the owner chose to record the block instead of dispatching it.
+> **Do not dispatch this, and do not re-derive the zero** -- a pattern that finds nothing everywhere is
+> indistinguishable from a clean repository, which is why the positive control above is quoted with it.
 >
 > **Filed 2026-08-12 -- reported by the lane that REVIEWED the branch, not by the lane that wrote it, which is why it was found.** On the held `w3-store-privilege-preflight` branch, the SQL Server arm of the store-privilege preflight returns **`OBSERVED` unconditionally**, while a NULL role result folds to **`False`**. So a probe that read nothing reports a clean bill of health, and reports it in the one word an operator would take as proof the check ran.
 > **WHY THIS IS THE WHOLE CONTROL AND NOT AN EDGE CASE.** The refusal arm is keyed on the opt-in `[store].require_least_privilege`, which **defaults to false**. So on a default install the refusal never fires and **WARN is the only arm anybody sees** -- and WARN is exactly what this defect silences. A control whose only reachable arm is the one that mis-reports is not a weakened control; it is an absent one wearing the label of a present one.
