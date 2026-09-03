@@ -1535,3 +1535,368 @@ def test_an_ungoverned_git_dir_still_passes_even_with_a_governed_dash_C(
     assert governed != "/dev/null", "fixture wrong: the write reached the governed repo after all"
 
     assert run_gate(shell(command, cwd=repo.other), repo.repos) is None
+
+
+# ------------------------------------------- BACKLOG #1379 class two: the carried environment
+#
+# THE GATE'S GIT_DIR ENUMERATION MATCHED THE POSIX PREFIX FORM ONLY. Measured on the committed gate,
+# all three PowerShell spellings ALLOWED -- same line, across a newline, and through the Bash tool --
+# while the POSIX-spelled control on the same command DENIED. The consequence was read back rather
+# than inferred: with the variable set, `git config` wrote into the GOVERNED repository's shared
+# config and not into the ungoverned one the session was standing in.
+#
+# NO MATCHER REACHES IT, AND THAT WAS PROVEN BY ATTEMPTING ONE. A regex was written for the PowerShell
+# spelling, it parsed, it emitted correctly, and three rows were still wrong; it was reverted rather
+# than shipped, because a regex that looks like coverage and is not is worse than a known gap. In
+# PowerShell the assignment is a separate STATEMENT -- often on a separate LINE -- so it lands in a
+# different scan segment from the git invocation it configures. The fix is cross-segment state: each
+# segment carries the blanked text that ran before it, and Resolve-CarriedGitDir folds it to a value.
+#
+# HALF THE ROWS BELOW CONSTRAIN THE FIX RATHER THAN THE GAP, and that is deliberate. A suite that only
+# pinned the closures would pass against a rule that denied every command carrying the characters
+# GIT_DIR. Each such row was confirmed to REDDEN under a mutation of the code it constrains.
+
+
+def _pwsh(command: str, cwd: Path) -> None:
+    """Really run it, so a row can assert WHERE the write landed instead of what the gate said."""
+    subprocess.run(
+        ["pwsh", "-NoProfile", "-NonInteractive", "-Command", command],
+        cwd=str(cwd),
+        capture_output=True,
+        text=True,
+    )
+
+
+def _hooks_path(repo_dir: Path) -> str:
+    return subprocess.run(
+        ["git", "config", "--local", "--get", "core.hooksPath"],
+        cwd=str(repo_dir),
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+
+
+@pytest.mark.parametrize(
+    "assignment",
+    [
+        '$env:GIT_DIR="{gitdir}"',
+        '${{env:GIT_DIR}}="{gitdir}"',
+        "Set-Item env:GIT_DIR '{gitdir}'",
+    ],
+    ids=["dollar-env", "braced-env", "set-item"],
+)
+@pytest.mark.parametrize("separator", ["; ", "\n"], ids=["same-line", "across-a-newline"])
+@pytest.mark.parametrize("tool", ["PowerShell", "Bash"])
+def test_a_carried_powershell_environment_reaches_the_governed_config(
+    repo: SimpleNamespace, unrelated: Path, assignment: str, separator: str, tool: str
+) -> None:
+    """THE GAP, in every spelling it was measured open in.
+
+    The tool axis is not padding: this hook scans both tool names through one matcher, and a session
+    on this fleet writes PowerShell through the Bash tool routinely. A fix keyed on the tool name
+    would pass one column and fail the other.
+    """
+    command = assignment.format(gitdir=f"{repo.primary}/.git") + separator
+    command += "git config core.hooksPath /nope"
+    reason = assert_denied(run_gate(shell(command, cwd=unrelated, tool=tool), repo.repos))
+    assert "setting 'core.hooksPath'" in reason
+
+
+def test_the_carried_environment_really_writes_where_it_points(
+    repo: SimpleNamespace, unrelated: Path
+) -> None:
+    """CONSEQUENCE, not verdict, for both directions at once.
+
+    The rows above assert what the gate SAYS. This one establishes that there is a hazard to say it
+    about -- and that the ALLOW direction below is a write the gate would be wrong to refuse. Without
+    it the whole section would pass equally against a rule that could not reach either repository.
+    """
+    _pwsh(f"$env:GIT_DIR='{repo.primary}/.git'; git config core.hooksPath /landed", unrelated)
+    assert _hooks_path(repo.primary) == "/landed", (
+        "fixture does not reproduce the hazard: the carried variable did not reach the governed "
+        "config, so every verdict assertion in this section would prove nothing"
+    )
+
+    # ...AND THE OTHER DIRECTION. From INSIDE the governed worktree, a carried variable naming an
+    # ungoverned repository sends the write there. Refusing that names a repository the write never
+    # touches, which is the BACKLOG #1085 shape this rule has already been fixed for once.
+    _pwsh(f"$env:GIT_DIR='{unrelated}/.git'; git config core.hooksPath /elsewhere", repo.wt)
+    assert _hooks_path(unrelated) == "/elsewhere"
+    assert _hooks_path(repo.primary) == "/landed", "the second write reached the governed repo too"
+
+
+def test_a_POSIX_spelled_control_on_the_same_shape_still_denies(
+    repo: SimpleNamespace, unrelated: Path
+) -> None:
+    """The positive control. It was ALREADY green, and that is exactly why it is here: it is what
+    made the PowerShell columns' ALLOW a spelling defect rather than a rule that never worked."""
+    command = f'GIT_DIR="{repo.primary}/.git" git config core.hooksPath /nope'
+    assert_denied(run_gate(shell(command, cwd=unrelated), repo.repos))
+
+
+def test_the_POSIX_CARRYING_spelling_denies_too(repo: SimpleNamespace, unrelated: Path) -> None:
+    """`export` is the POSIX spelling of the same class -- an assignment in an EARLIER statement --
+    and it was open for the identical reason: the rule's window starts after the separator.
+
+    Measured against real git in Git Bash, reading the value back: `export GIT_DIR=<governed>/.git;
+    git config <key> v` from an ungoverned cwd writes into the governed repository. Closing the
+    PowerShell spellings while leaving this one open would be filing the same defect twice.
+    """
+    command = f'export GIT_DIR="{repo.primary}/.git"; git config core.hooksPath /nope'
+    assert_denied(run_gate(shell(command, cwd=unrelated), repo.repos))
+
+
+def test_a_carried_env_at_an_UNRELATED_repo_allows_from_a_GOVERNED_cwd(
+    repo: SimpleNamespace, unrelated: Path
+) -> None:
+    """THE NEGATIVE CONTROL THIS SECTION CANNOT DO WITHOUT.
+
+    The committed gate DENIES this, and it is wrong to: the write lands in the ungoverned repository
+    (proven above by reading it back). So the fix is a REORDER and not a widening, and this row is
+    what stops the section passing against a rule that simply denied everything with a carried
+    variable on it. It is the only row here that moves DENY to ALLOW.
+    """
+    command = f'$env:GIT_DIR="{unrelated}/.git"; git config core.hooksPath /nope'
+    assert run_gate(shell(command, cwd=repo.wt, tool="PowerShell"), repo.repos) is None
+
+    across_a_line = f'$env:GIT_DIR="{unrelated}/.git"\ngit config core.hooksPath /nope'
+    assert run_gate(shell(across_a_line, cwd=repo.wt, tool="PowerShell"), repo.repos) is None
+
+
+def test_an_assignment_AFTER_the_write_does_not_configure_it(
+    repo: SimpleNamespace, unrelated: Path
+) -> None:
+    """The thread is bounded at the write, because a statement that has not run cannot have set
+    anything. Unbounded, this refuses and names a repository the write had already missed."""
+    command = f'git config core.hooksPath /nope; $env:GIT_DIR="{repo.primary}/.git"'
+    assert run_gate(shell(command, cwd=unrelated, tool="PowerShell"), repo.repos) is None
+
+
+def test_CLEARING_the_variable_restores_the_cwd(repo: SimpleNamespace, unrelated: Path) -> None:
+    """Modelling the removal spellings is not tidiness, it is what keeps the fix from inventing a
+    false deny -- and the reason is measured rather than reasoned."""
+    _pwsh(
+        f"$env:GIT_DIR='{repo.primary}/.git'; Remove-Item env:GIT_DIR; "
+        "git config core.hooksPath /cleared",
+        unrelated,
+    )
+    assert _hooks_path(unrelated) == "/cleared", "fixture wrong: the clear did not restore the cwd"
+    assert _hooks_path(repo.primary) == "", "the write reached the governed repo after the clear"
+
+    command = (
+        f'$env:GIT_DIR="{repo.primary}/.git"; Remove-Item env:GIT_DIR; '
+        "git config core.hooksPath /nope"
+    )
+    assert run_gate(shell(command, cwd=unrelated, tool="PowerShell"), repo.repos) is None
+
+
+def test_the_LAST_assignment_is_the_one_in_force(repo: SimpleNamespace, unrelated: Path) -> None:
+    """A shell runs statements in order, so a first-match read inverts the answer -- the same defect
+    the repeated `--git-dir` row pins for the flag spelling. Both directions."""
+    governed_then_not = (
+        f'$env:GIT_DIR="{repo.primary}/.git"; $env:GIT_DIR="{unrelated}/.git"; '
+        "git config core.hooksPath /nope"
+    )
+    assert run_gate(shell(governed_then_not, cwd=unrelated, tool="PowerShell"), repo.repos) is None
+
+    not_then_governed = (
+        f'$env:GIT_DIR="{unrelated}/.git"; $env:GIT_DIR="{repo.primary}/.git"; '
+        "git config core.hooksPath /nope"
+    )
+    assert_denied(run_gate(shell(not_then_governed, cwd=unrelated, tool="PowerShell"), repo.repos))
+
+
+def test_a_command_line_repository_token_OVERRIDES_the_carried_environment(
+    repo: SimpleNamespace, unrelated: Path
+) -> None:
+    """git ranks `--git-dir` above the environment, so the candidate order has to as well. Both
+    directions, because a fix that merely appended the carried value would pass one of them."""
+    line_wins_ungoverned = (
+        f'$env:GIT_DIR="{repo.primary}/.git"; '
+        f'git --git-dir="{unrelated}/.git" config core.hooksPath /nope'
+    )
+    assert (
+        run_gate(shell(line_wins_ungoverned, cwd=unrelated, tool="PowerShell"), repo.repos) is None
+    )
+
+    line_wins_governed = (
+        f'$env:GIT_DIR="{unrelated}/.git"; '
+        f'git --git-dir="{repo.primary}/.git" config core.hooksPath /nope'
+    )
+    assert_denied(run_gate(shell(line_wins_governed, cwd=unrelated, tool="PowerShell"), repo.repos))
+
+
+def test_a_carried_value_does_not_promote_an_EARLIER_command_s_repository_token(
+    repo: SimpleNamespace, unrelated: Path
+) -> None:
+    """The carried value is its OWN candidate, not a reason to switch on the promotion of every token
+    on the line -- and reusing the existing ordering switch for it really did open this.
+
+    Here an EARLIER command carries an ungoverned `--git-dir` that the owning-window test exists to
+    exclude, while the environment sends the disarm itself to the governed repository. Promoting the
+    earlier token alongside the carried one lets it answer first and ALLOWs a live disarm.
+    """
+    command = (
+        f'git --git-dir="{unrelated}/.git" log -1; '
+        f'$env:GIT_DIR="{repo.primary}/.git"; git config core.hooksPath /nope'
+    )
+    assert_denied(run_gate(shell(command, cwd=unrelated, tool="PowerShell"), repo.repos))
+
+
+def test_an_assignment_inside_a_QUOTED_VALUE_is_data_and_not_code(
+    repo: SimpleNamespace, unrelated: Path
+) -> None:
+    """The thread is folded from the BLANKED scan, which is what makes it correct.
+
+    The alias VALUE here mentions an ungoverned assignment; the write itself sets `alias.zz` in the
+    governed repository the session is standing in. Folding the RAW text instead would let the
+    mention win the candidate chain and ALLOW a real disarm -- the same hole the flag spelling had.
+    """
+    command = f"git config alias.zz \"!pwsh -c '$env:GIT_DIR={unrelated}/.git; git log'\""
+    reason = assert_denied(run_gate(shell(command, cwd=repo.wt, tool="PowerShell"), repo.repos))
+    assert "setting 'alias.zz'" in reason
+
+
+def test_an_assignment_MENTIONED_before_the_write_does_not_earn_a_refusal(
+    repo: SimpleNamespace, unrelated: Path
+) -> None:
+    """The same cause through the other door, and it is a separate row because it is the ONE that
+    can fail.
+
+    The row above is already protected by the bound at the write -- its mention sits AFTER the disarm
+    -- so folding raw text instead of blanked text leaves it green. Here the mention comes BEFORE, in
+    a commit message and then in a comment, while the write itself lands in the ungoverned repository
+    the session is standing in. Fold the raw line and both refuse, naming a repository the write never
+    touches: the BACKLOG #1085 shape, reached on a new path.
+
+    Found by mutation, not by reading. The first version of this section had only the row above, and
+    reverting the blanking left the whole suite green.
+    """
+    in_message = (
+        f'git commit --allow-empty -m "$env:GIT_DIR={repo.primary}/.git"'
+        " && git config core.hooksPath /nope"
+    )
+    assert run_gate(shell(in_message, cwd=unrelated, tool="PowerShell"), repo.repos) is None
+
+    in_comment = f'echo hi # $env:GIT_DIR="{repo.primary}/.git"\ngit config core.hooksPath /nope'
+    assert run_gate(shell(in_comment, cwd=unrelated, tool="PowerShell"), repo.repos) is None
+
+
+def test_a_COMPUTED_value_carries_nothing(repo: SimpleNamespace, unrelated: Path) -> None:
+    """The scope is the statically-knowable subset, exactly as the shell-indirection resolver's is.
+
+    A value assembled at runtime is a runtime fact; "" is the honest answer and the caller keeps the
+    behaviour it had. Half-resolving would be worse than not resolving, because it looks decided.
+    """
+    interpolated = (
+        f'$root="{repo.primary}"; $env:GIT_DIR="$root/.git"; git config core.hooksPath /nope'
+    )
+    assert run_gate(shell(interpolated, cwd=unrelated, tool="PowerShell"), repo.repos) is None
+
+    appended = (
+        f'$env:GIT_DIR="{repo.primary}"; $env:GIT_DIR+="/.git"; git config core.hooksPath /nope'
+    )
+    assert run_gate(shell(appended, cwd=unrelated, tool="PowerShell"), repo.repos) is None
+
+
+def test_a_RELATIVE_carried_value_composes_the_chdir(
+    repo: SimpleNamespace, unrelated: Path, tmp_path: Path
+) -> None:
+    """Compose, never replace -- the rule every other repository token here already follows.
+
+    THE CHDIR MUST NAME AN UNGOVERNED DIRECTORY, and the class-one section records why: point it at
+    the governed repo and the gate denies off the chdir alone, so the relative value is never
+    consulted and the row passes with the composition reverted. Every absolute path on this line is
+    ungoverned; only resolving `../Primary/.git` against the post-chdir directory produces a deny.
+    """
+    sibling = tmp_path / "Sibling"
+    sibling.mkdir()
+    subprocess.run(["git", "init", "-b", "main", str(sibling)], check=True, capture_output=True)
+    relative = f"../{repo.primary.name}/.git"
+
+    _pwsh(
+        f"cd '{sibling}'; $env:GIT_DIR='{relative}'; git config core.hooksPath /relative", sibling
+    )
+    assert _hooks_path(repo.primary) == "/relative", (
+        "fixture does not reproduce the hazard: the relative carried value did not reach the "
+        "governed config, so the verdict assertion below would prove nothing"
+    )
+
+    command = f'cd "{sibling}"; $env:GIT_DIR="{relative}"; git config core.hooksPath /nope'
+    assert_denied(run_gate(shell(command, cwd=unrelated, tool="PowerShell"), repo.repos))
+
+
+def test_an_INTERPRETER_PAYLOAD_inherits_the_carried_environment(
+    repo: SimpleNamespace, unrelated: Path
+) -> None:
+    """A child process inherits its parent's environment, so a payload's thread starts from the
+    outer text that ran before the flag rather than from nothing."""
+    command = f'$env:GIT_DIR="{repo.primary}/.git"; pwsh -c "git config core.hooksPath /nope"'
+    assert_denied(run_gate(shell(command, cwd=unrelated, tool="PowerShell"), repo.repos))
+
+
+def test_the_carried_environment_does_not_reach_rules_3_and_3d(
+    repo: SimpleNamespace, unrelated: Path
+) -> None:
+    """Opt-in asserted rather than claimed, the same way the flag spelling's ordering switch is.
+
+    Only rule 3c passes the carried value. An earlier version of the GIT_DIR work reached every
+    caller and flipped `GIT_DIR=<governed> git clean -fd` from ALLOW to DENY; a parameter whose off
+    state is not byte-identical to the previous behaviour is not opt-in.
+    """
+    for verb in ("clean -fd", "reset --hard"):
+        command = f'$env:GIT_DIR="{repo.primary}/.git"; git {verb}'
+        assert run_gate(shell(command, cwd=repo.other, tool="PowerShell"), repo.repos) is None, verb
+
+    removal = assert_denied(
+        run_gate(
+            shell(
+                f'$env:GIT_DIR="{unrelated}/.git"; git worktree remove "{repo.wt}"',
+                cwd=repo.other,
+                tool="PowerShell",
+            ),
+            repo.repos,
+        )
+    )
+    assert "working tree of the SHARED PRIMARY checkout" not in removal
+
+
+def test_a_carried_GIT_WORK_TREE_does_not_promote_either(
+    repo: SimpleNamespace, unrelated: Path
+) -> None:
+    """Only GIT_DIR is threaded. `--work-tree` names the TREE and does not decide which
+    repository's config is written -- measured, and the reason it stays unpromoted on the line. The
+    environment spelling inherits that answer rather than quietly acquiring a different one."""
+    command = f'$env:GIT_WORK_TREE="{repo.primary}"; git config core.hooksPath /nope'
+    assert run_gate(shell(command, cwd=unrelated, tool="PowerShell"), repo.repos) is None
+
+
+def test_ordinary_and_read_only_config_stays_untouched_with_a_carried_variable(
+    repo: SimpleNamespace, unrelated: Path
+) -> None:
+    """Narrowness is still the feature. A carried variable is not itself a reason to refuse
+    anything: the key has to be on the disarm list and the write has to be a write."""
+    for tail in ("git config user.email me@example.com", "git config --get core.hooksPath"):
+        command = f'$env:GIT_DIR="{repo.primary}/.git"; {tail}'
+        assert run_gate(shell(command, cwd=unrelated, tool="PowerShell"), repo.repos) is None, tail
+
+
+def test_a_MULTI_WORD_carried_value_is_a_KNOWN_residual(
+    repo: SimpleNamespace, unrelated: Path, tmp_path: Path
+) -> None:
+    """A RESIDUAL TRIPWIRE, pinning this ALLOW as KNOWN rather than as correct.
+
+    Remove-QuotedSpans unmasks a quoted span holding one bare word and masks a multi-word one, so a
+    repository path CONTAINING A SPACE arrives at the resolver as an empty value and carries nothing.
+    That is the residual the #1069 carve-out already records for `-c 'alias.ci=commit --no-verify'`,
+    inherited here rather than introduced.
+
+    Asserting it as a requirement would force a later fix to delete a green test, so this row says
+    only that the behaviour is what it is. If a change makes it DENY, that is an improvement: update
+    this row, do not revert the change.
+    """
+    spaced = tmp_path / "Has Space"
+    spaced.mkdir()
+    subprocess.run(["git", "init", "-b", "main", str(spaced)], check=True, capture_output=True)
+    command = f'$env:GIT_DIR="{spaced}/.git"; git config core.hooksPath /nope'
+    assert run_gate(shell(command, cwd=unrelated, tool="PowerShell"), repo.repos) is None
