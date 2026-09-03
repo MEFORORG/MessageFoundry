@@ -1570,7 +1570,7 @@ assertion, exchanges it at the **token endpoint**, caches the bearer with expiry
 | `client_id` | — (required) | the registered client id (`iss`/`sub` of the assertion; `env()`) |
 | `private_key` | — (required) | the assertion signing key as inline PEM (via `env()`) or a PEM file path |
 | `algorithm` | `RS384` | `RS384` (RSA) or `ES384` (ECDSA P-384) — the two SMART **SHALL**-support algorithms |
-| `scope` | `None` | the requested scopes, e.g. `system/*.rs` (SMART v2 system scopes — no human) |
+| `scope` | `None` | the requested scopes, e.g. `system/Patient.c` (SMART v2 system scopes — no human). Request the least the connection can work with — see *Least scope* below |
 | `key_id` | `None` | the JWT `kid` → the public key registered with the server (for rotation) |
 | `audience` | = `token_url` | the assertion `aud`, if the server documents a different audience |
 | `private_key_password` | `None` | passphrase for an encrypted key (secret — use `env()`) |
@@ -1585,12 +1585,39 @@ outbound("FHIR-OUT_EPIC", with_smart_backend(
     FHIR(url=env("epic_fhir_base"), interaction="create"),
     token_url=env("epic_token_url"),     # add this host to [egress].allowed_http too
     client_id=env("epic_client_id"),
-    scope="system/*.rs",
+    scope="system/Patient.c",            # ONLY what this feed writes — see below
     private_key=env("epic_smart_key"),   # inline PEM via env(), or a PEM file path
     algorithm="RS384",
     key_id="epic-2026",
 ))
 ```
+
+**Least scope.** A SMART v2 scope is `system/<ResourceType>.<letters>`, where the letters are `c` create,
+`r` read, `u` update, `d` delete and `s` search. Ask for the ones this connection actually spends and no
+more (ASVS 10.2.3):
+
+A `conditional=` knob **overrides** `interaction` — it decides the HTTP method on its own, so read this
+table top to bottom and take the first row that matches:
+
+| the connection you declared | the letters it can use |
+|---|---|
+| `conditional="conditional-update"` | `u`, `s` — a search-based `PUT` |
+| `conditional="if-none-exist"` | `c`, `s` — a `POST` the server searches for first |
+| `conditional="if-match"` | `u` — a version-aware `PUT`, no search |
+| `interaction="create"` (no conditional) | `c` |
+| `interaction="update"` (no conditional) | `u` |
+| `FhirLookup(...)` (structurally GET-only) | `r`, `s` |
+| `interaction="transaction"`/`"batch"` | the Bundle decides, so no fixed set |
+
+`interaction` defaults to `"create"`, so a connection declaring only `conditional="conditional-update"`
+issues `PUT` and needs `u` — not the `c` the interaction name suggests.
+
+The **resource** half is yours to choose: the outbound reads the resourceType from each outgoing message,
+so name the type the feed writes rather than `*`. `messagefoundry check` prints an advisory `smart-scope`
+line naming any connection that requests letters its declared interaction cannot spend. It **never
+blocks**: your authorization server registers the scopes it will grant, and a refusal computed here could
+take a working feed offline. It also stays quiet when a request is too *narrow* — that is a correctness
+question, and asking for a letter the server never registered fails the token request outright.
 
 Put **every** secret in `env()` (`token_url`/`client_id`/`private_key`/`private_key_password`); the minted
 access token and `client_assertion` are runtime-only — never logged or persisted. (The signing key comes
