@@ -19979,3 +19979,28 @@ That is the same `self._lock` the staged-pipeline handoffs take. On a first depl
 **PARTLY CLOSED ALREADY, AND THE CLOSURE SITS IN THE WRONG ARTIFACT.** The full record -- both questions, all eight options, both answers quoted -- is [comment 5515263760 on PR 749](https://github.com/MEFORORG/MessageFoundry/pull/749#issuecomment-5515263760), written 2026-09-02. A pull-request comment is a real improvement on a session transcript, which does not survive its session. It is still not the ADR, and the ADR is what a reader consults. **This limb differs from the first two in shape:** closing it needs no decision about the engine, only the record moved into the artifact people actually read.
 
 **THE GENERAL PROBLEM, stated once so it is not re-derived per incident.** A decision recorded as an outcome plus a delegation is not reviewable. The inputs -- the question, the options, the answer -- are what let a later reader tell a considered call from an arbitrary one, and they are exactly the part that lives in the least durable place.
+
+## 1430. the connscale in-hold sampler yields one sample per cell, so the in-hold window has zero width
+
+> 🔢 **Filed 2026-09-03 -- not started. Surfaced by the #1420 measurement, which could not have found it by reading.** The in-hold sampler produces **exactly two samples per cell** -- one in-hold, one post-drain -- in **20 of 20 cells** at hold 1.5 and hold 3.0. So `_empty_claim_rates`' window, which five sites describe as *"first to last in-hold samples"*, does not span a slightly-wrong range. **It spans no range at all: there is one in-hold sample.**
+> Verdict: build
+> Closing-act: code
+
+**Cluster:** Developer Experience & CI. **Priority:** P2. **Verdict:** build.
+**Severity:** none on the product. No engine path, no PHI axis, **no deployment axis (sec. 0)** -- this is a measurement instrument in the load harness. What it costs is the trustworthiness of a number the project uses to reason about contention.
+
+**WHY THIS IS ITS OWN ITEM AND NOT PART OF #1420.** #1420 is that the computed window includes a post-drain tail its docstrings exclude, and its fix (b) landed in PR 802. This item is the reason **#1420's fix (a) cannot be built yet**, which is a different defect with a different owner: the first sample's `read` is 0 or 1 every time and the final sample carries the whole intake, so the post-drain sample is not *contaminating* the read delta -- **it supplies all of it.** Narrowing the window while that holds does not produce a smaller number. It produces an undefined one.
+
+**MEASURED, WITH THE ARM THAT MAKES IT ACTIONABLE.** Excluding the final sample trips `_empty_claim_rates`' own `len(samples) < 2` guard, so **the excluded arm is undefined rather than smaller.** A two-sided reading exists only at a longer hold: at hold 12.0 the tail inflates the ratio by **4.9 to 8.2 percent**. Four clean sweeps carry every number; two further sweeps were discarded for contention (both hit the #1014 disk I/O symptom on the post-mortem audit) and are excluded rather than averaged in.
+
+**AND THE OBVIOUS FIX FAILS SILENTLY, WHICH IS THE PART TO READ TWICE.** Fix (a) was run end to end. It **zeroes wall #3 while the live SLO still reports `ok=true`**, with the grader saying *"NOT GRADED ... says nothing about wall #3"*. That is a green that is a statement about the instrument rather than the subject -- the **ADR 0158** shape, arriving inside the tool the project uses to detect that shape. The loud failure comes from the smoke test's `assert graded` instead of from the SLO. **So the build order is: guarantee two in-hold samples FIRST, then narrow the window.** Reversing it ships a silent green.
+
+**THE POSITIVE CONTROL THAT LOCATES THE BLOCKER.** At hold 12.0 the sweep grades **2 of 2** lanes. So the obstacle is the **sampling cadence**, not fix (a) itself, and not the grader.
+
+**WHAT IS NOT MEASURED, stated so nobody quotes it as though it were.** *Why* the sampler yields one sample is **unknown**. The reload probe is **ruled out** at 0.04 to 0.20 s. The leading candidate is the **FD process-table walk on the same tick**, and that is a hypothesis with no measurement behind it. Anyone building this should measure the tick budget before changing the cadence, because a cadence change made against the wrong cause will look like it worked at one hold and fail at another.
+
+**ONE NUMBER FROM #1420 THAT MUST NOT BE RE-QUOTED AS A MEASUREMENT.** That row's 65.5 s is a correct WORST-CASE bound derived from the profile knobs. The **observed** tail, timed directly over 16 steps, is **1.08 to 1.24 s**. Both are true and they answer different questions; the bound is not evidence about a healthy run.
+
+**Related:** [`harness/load/connscale/runner.py`](../harness/load/connscale/runner.py) (`_empty_claim_rates`, `_sample_loop`), [`harness/load/connscale/probe.py`](../harness/load/connscale/probe.py) (the FD walk), `harness/load/profiles/connscale-smoke.toml`, [ADR 0158](adr/0158-silent-controls-green-signals-that-mean-nothing-and-shape-over-detection.md); **#1420** (the window's tail -- fix (b) landed, fix (a) blocked ON THIS ITEM), **#1014** (the fixed 24-port block that makes a contended sweep unusable), **#1211** (superseded; a DIFFERENT defect in the same docstring -- do not merge the two).
+
+**Source:** measured 2026-09-03 by the Builder working #1420, which asked for an effect size and refused to guess one. Filed separately on that Builder's recommendation because the cause is unmeasured and the fix order matters.
