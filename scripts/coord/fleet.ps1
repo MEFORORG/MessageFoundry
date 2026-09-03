@@ -169,15 +169,57 @@ if (Test-Path -LiteralPath $errFile) {
     $writerErrors = @(Get-Content -LiteralPath $errFile -EA SilentlyContinue).Count
 }
 
-# origin/main's own age. Every landed verdict is computed against this ref, and the ref moves ONLY on
-# fetch. A landed verdict against a stale ref is the dangerous direction: this repo carries reverts,
-# and against a stale cached main a reverted change reads as "already landed" -- i.e. deliberately
-# reverted work would be recorded as done.
+# origin/main's own age. Every landed verdict is computed against this ref, and the ref is refreshed
+# ONLY by a fetch. A landed verdict against a stale ref is the dangerous direction: this repo carries
+# reverts, and against a stale cached main a reverted change reads as "already landed" -- i.e.
+# deliberately reverted work would be recorded as done.
+#
+# TWO CLOCKS, AND THIS FIELD MUST READ THE FETCH ONE (BACKLOG #1374). The ref FILE's mtime moves when
+# the ref MOVES, not when it was FETCHED: a fetch that finds nothing new leaves the file untouched.
+# Reading it therefore reported how long main had been QUIET and fired the stop below at a fleet that
+# had just fetched. Measured read-only in this checkout 2026-09-03, no fetch issued: the shipped field
+# read 53 minutes while the newest FETCH_HEAD was 0 minutes old -- seven minutes from printing DO NOT
+# TREAT THE ROSTER BELOW AS COMPLETE about a fetch made seconds earlier.
+#
+# FETCH_HEAD IS PER-WORKTREE, so the newest across the common dir AND every worktree gitdir is the
+# repository's fetch clock -- remote-tracking refs are shared, so any worktree's fetch refreshes the
+# ref every seat reads. Measured on this box the same day: 262 worktree gitdirs, 101 FETCH_HEAD files
+# (162 gitdirs carry none, which is the control saying this is a real reading and not a glob that
+# matches everything), and THIS session's own gitdir is among the ones carrying none -- so reading
+# only `git rev-parse --git-path FETCH_HEAD` would report UNKNOWN for most callers.
+#
+# AND AN UNMEASURABLE CLOCK IS A STOP, NOT A SILENCE. The old code stat()ed a LOOSE ref, so on the
+# packed-refs path there was no file, the value stayed null, the null-guarded stop never fired, and a
+# blind instrument rendered exactly like a healthy one. `.git/packed-refs` in this checkout already
+# carries a stale refs/remotes/origin/main, so that path is live rather than theoretical.
 $originMainSha = Invoke-Git -Dir $repo -GitArgs @('rev-parse', 'origin/main')
+
+$fetchClocks = @()
+$commonFetchHead = Join-Path $common 'FETCH_HEAD'
+if (Test-Path -LiteralPath $commonFetchHead -PathType Leaf) {
+    $fetchClocks += @(Get-Item -LiteralPath $commonFetchHead -EA SilentlyContinue)
+}
+$worktreeGitDirs = @()
+$worktreeGitDirRoot = Join-Path $common 'worktrees'
+if (Test-Path -LiteralPath $worktreeGitDirRoot) {
+    $worktreeGitDirs = @(Get-ChildItem -LiteralPath $worktreeGitDirRoot -Directory -EA SilentlyContinue)
+    foreach ($d in $worktreeGitDirs) {
+        $p = Join-Path $d.FullName 'FETCH_HEAD'
+        if (Test-Path -LiteralPath $p -PathType Leaf) { $fetchClocks += @(Get-Item -LiteralPath $p -EA SilentlyContinue) }
+    }
+}
+$fetchClocks = @($fetchClocks | Where-Object { $null -ne $_ })
+
 $originMainAgeMinutes = $null
-$fetchHead = Join-Path $common 'refs\remotes\origin\main'
-if (Test-Path -LiteralPath $fetchHead) {
-    $originMainAgeMinutes = [int]((Get-Date).ToUniversalTime() - (Get-Item -LiteralPath $fetchHead).LastWriteTimeUtc).TotalMinutes
+# Select-Object, NOT [0]. Under `Set-StrictMode -Version Latest` indexing an empty array THROWS, and
+# the empty array is precisely the unmeasurable case this block exists to report -- so the strict-mode
+# form would have crashed on the one input that matters. Caught by the arm-two test, not by reading.
+$newestFetch = $fetchClocks | Sort-Object LastWriteTimeUtc -Descending | Select-Object -First 1
+if ($null -ne $newestFetch) {
+    $originMainAgeMinutes = [int]((Get-Date).ToUniversalTime() - $newestFetch.LastWriteTimeUtc).TotalMinutes
+    $originMainFetchClock = $newestFetch.FullName
+} else {
+    $originMainFetchClock = "UNKNOWN -- no FETCH_HEAD under $common or any of its $($worktreeGitDirs.Count) worktree gitdir(s), so this repository has no record of ever fetching"
 }
 
 # ---------------------------------------------------------------------------------------------
@@ -272,7 +314,15 @@ $stops = @()
 if (-not $fenceAvailable) { $stops += 'fenceAvailable=false -- no config root with a sessions/ directory was found; every state below would be a guess' }
 if ($liveWithoutRecord.Count -gt 0) { $stops += "liveSessionsWithoutRecord=$($liveWithoutRecord.Count) -- the writer is not running in every live seat, so this roster is INCOMPLETE by that many" }
 if ($records.Count -eq 0 -and $heartbeats.Count -eq 0) { $stops += 'recordsExamined=0 AND writerHeartbeatIn=0 -- indistinguishable from a writer that was never installed' }
-if ($null -ne $originMainAgeMinutes -and $originMainAgeMinutes -gt 60) { $stops += "originMainAgeMinutes=$originMainAgeMinutes -- origin/main has not been fetched recently; landed verdicts would be computed against a stale ref" }
+# BACKLOG #1374: the UNMEASURABLE case fires FIRST and fires LOUDLY. The old guard read
+# `$null -ne $originMainAgeMinutes -and ...`, so a clock that could not be read produced no stop at
+# all -- and an absent warning renders identically to a healthy one. A null is not a fresh fetch; it
+# is the instrument saying it cannot see, which the reader must be told.
+if ($null -eq $originMainAgeMinutes) {
+    $stops += "originMainAgeMinutes=UNKNOWN -- $originMainFetchClock. Fetch recency CANNOT BE MEASURED here, so treat origin/main as UNFETCHED: an unreadable clock is not a fresh one, and landed verdicts computed against this ref cannot be trusted"
+} elseif ($originMainAgeMinutes -gt 60) {
+    $stops += "originMainAgeMinutes=$originMainAgeMinutes -- origin/main has not been fetched recently (clock: $originMainFetchClock); landed verdicts would be computed against a stale ref"
+}
 
 # POINTER CENSUS, resolved here rather than trusted from the records. Printed as a RATIO because the
 # numerator alone cannot be read: "1 dangling" is a crisis at 2 pointers and noise at 200. Measured
@@ -339,6 +389,7 @@ $receipt = [ordered]@{
     repoWorktrees             = $repoWorktrees.Count
     originMainSha             = $originMainSha
     originMainAgeMinutes      = $originMainAgeMinutes
+    originMainFetchClock      = $originMainFetchClock
     handoffPointers           = $ptrTotal
     handoffPointerSeats       = $ptrBoxes.Count
     handoffPointersDangling   = $ptrDangling
@@ -484,7 +535,10 @@ exit $code
 "RECEIPT -- what was EXAMINED, not merely what was found:"
 foreach ($k in $receipt.Keys) {
     if ($k -eq 'stopConditions') { continue }
-    "  {0,-26} {1}" -f $k, $receipt[$k]
+    # BACKLOG #1374: a null prints as an EMPTY COLUMN, which reads like a healthy zero rather than
+    # like a measurement that could not be taken. Say the word instead.
+    $v = if ($null -eq $receipt[$k]) { 'UNKNOWN' } else { $receipt[$k] }
+    "  {0,-26} {1}" -f $k, $v
 }
 ""
 if ($stops.Count -gt 0) {
