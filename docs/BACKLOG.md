@@ -13940,7 +13940,21 @@ measurement from this row's subject and it is named here rather than performed.*
 > **FIVE WRITTEN "DEV ONLY" PROHIBITIONS MUST BE REWRITTEN IN THE SAME CHANGE, or the tree ships a control its own docstring forbids.** `pki.py:141-143` records that the returned key is unencrypted PKCS#8 and that a self-signed certificate *"has no chain of trust and must never front production PHI"*; `__main__.py:578`, `:3642`, `:3677` and `:3689` repeat the restriction in the CLI help, the docstring, the JSON note and the console note. **The owner has authorised the override (2026-08-16).** The honest replacement text is that an untrusted certificate is strictly better than cleartext and strictly worse than an operator-supplied chain, so the generated pair is a **placeholder to be replaced**, not an endorsed production terminator.
 > **WHAT AN OPERATOR NOTICES, and half of it is unpleasant.** A browser reaching the console gets a full-page trust interstitial until the certificate is imported into Local Computer / Trusted Root ([`docs/TRAY.md:133`](TRAY.md) already documents that import). More importantly, **the first-party clients infer the scheme from CONFIGURATION, not from the socket**: the tray reads `[api].tls_cert_file` out of the service TOML to choose `http` or `https` ([`messagefoundry/tray/config.py:207-219`](../messagefoundry/tray/config.py)). A generated certificate that does not surface through that key would leave the tray, the harness, `apiclient` and the IDE dialling `http` at an `https` listener.
 > **SCOPE, AND THE PART DELIBERATELY OUTSIDE IT.** [ADR 0143](adr/0143-web-console-on-by-default-disableable-with-loopback-secure-context-browser-hardening.md) sec. *"Deferred (considered, not built): auto-TLS on loopback"* sized the whole move as **XL**, precisely because it forces a lockstep client migration across the harness, `apiclient`, the tray and the IDE. **This item is the mint-and-serve half plus whatever minimum makes those four agree on the scheme.** If the client work turns out to be the bulk, split it rather than letting this item quietly become ADR 0143's XL.
-> **BUILD STATE, MEASURED ON THE BRANCH AND NOT ON `main` -- so a lane does not rebuild what exists.** *All of it on `claude/builder-1-1245-1276a` at `17c16128` (PR 534), by the builder holding the lane, with controls. `origin/main` carries NONE of it.* **ALREADY BUILT THERE: (a) the superseding ADR.** `docs/adr/0172-the-engine-always-serves-tls-minting-a-self-signed-certificate-on-first-run.md` exists on that head and is **x0 on `origin/main`** -- so it is allocated and written. ***NOBODY ALLOCATES A SECOND NUMBER FOR THIS***; two separate dispatch messages told a lane to allocate one, and both were wrong. **(b) Part A**, `api/tls.py:133` mints on first run, and `make_self_signed` has **3 call sites there against `main`'s 2**. **STILL ABSENT: the audited re-mint.** `cert_expiry.py` carries **0** re-mint references against a control of **9** definitions, and `api/tls.py:106-109` is a docstring *admitting* nothing re-mints an expired pair, so day 366 serves a certificate every client rejects. **AND ONE CITATION IN THIS ROW IS OFF BY SIX LINES:** part B's prose is at **`pki.py:227`**, not the cited `221-222`; `:221` is the DEV ONLY line. *Locate by phrase.* **NOT A TARGET, stated so nobody widens the sweep into a breakage:** the XML namespace constants in `wsdl.py` and `soap.py` are `http://` by specification. **Changing them breaks SOAP.**
+> **SUPERSEDED 2026-09-03 -- THE PARAGRAPH BELOW WAS MEASURED ON A BRANCH AND IS NOW FALSE ABOUT
+> `main`. READ THIS FIRST.** It says `origin/main` carries NONE of part A. It carries **all** of it,
+> as of `6e0a950b6` (PR 575), verified at `46ea10a78`: `docs/adr/0172-the-engine-always-serves-tls-minting-a-self-signed-certificate-on-first-run.md`
+> is on main with its index row at `docs/adr/README.md:197`, `messagefoundry/api/tls.py` is on main,
+> and `ensure_api_tls_material` has call sites in `api/tls.py`, `api/app.py` and `__main__.py`.
+> **THE REMAINDER IS ONE LIMB AND THE SHIPPED CODE NAMES IT ITSELF: nothing re-mints an EXPIRED
+> generated pair.** `messagefoundry/api/tls.py:114-117` says so in terms -- `build_api_ssl_context`
+> performs no expiry check, so a site past day 365 would serve a certificate every client rejects,
+> with `CertExpiryRunner` alarming meanwhile. **Do not rebuild part A.** Left uncorrected, the
+> paragraph below is the exact shape that costs a whole Builder: a branch-scoped measurement read
+> later as a statement about main. Found by `scripts/docs/subject_exists_screen.py`, the subject-exists
+> screen filed as BACKLOG #1426 -- allocated and open in PR 806, **not yet on `main`**, so that number
+> resolves to nothing in this file until it lands.
+>
+> **BUILD STATE, MEASURED ON THE BRANCH AND NOT ON `main` -- so a lane does not rebuild what exists. STALE, see above.** *All of it on `claude/builder-1-1245-1276a` at `17c16128` (PR 534), by the builder holding the lane, with controls. `origin/main` carried NONE of it WHEN THIS WAS WRITTEN; it now carries part A.* **ALREADY BUILT THERE: (a) the superseding ADR.** `docs/adr/0172-the-engine-always-serves-tls-minting-a-self-signed-certificate-on-first-run.md` exists on that head and is **x0 on `origin/main`** -- so it is allocated and written. ***NOBODY ALLOCATES A SECOND NUMBER FOR THIS***; two separate dispatch messages told a lane to allocate one, and both were wrong. **(b) Part A**, `api/tls.py:133` mints on first run, and `make_self_signed` has **3 call sites there against `main`'s 2**. **STILL ABSENT: the audited re-mint.** `cert_expiry.py` carries **0** re-mint references against a control of **9** definitions, and `api/tls.py:106-109` is a docstring *admitting* nothing re-mints an expired pair, so day 366 serves a certificate every client rejects. **AND ONE CITATION IN THIS ROW IS OFF BY SIX LINES:** part B's prose is at **`pki.py:227`**, not the cited `221-222`; `:221` is the DEV ONLY line. *Locate by phrase.* **NOT A TARGET, stated so nobody widens the sweep into a breakage:** the XML namespace constants in `wsdl.py` and `soap.py` are `http://` by specification. **Changing them breaks SOAP.**
 > **THE CLIENT-SIDE SCHEME DEFAULTS ARE AT LEAST 14, AND THE FIGURE TRAVELLING IN SESSION MAIL WAS 8.** *Measured 2026-08-23 by the builder holding the lane, on `claude/builder-1-1245-1276a` at `17c16128`, and written here because a count that lives only in mail is re-derived at full cost by the next reader.* A strict `= "http://` predicate over engine-URL defaults -- non-test, XML namespaces excluded with a working control that correctly dropped 13 namespace lines -- returns **11 sites**. **That predicate provably misses at least three more**: list comprehensions at `harness/load/shardcert.py:3383` and `:4453`, and a positional argument at `harness/load/connscale/batchbox.py:200`. **So the number is AT LEAST 14, stated as a floor rather than a total, because the predicate is known to under-count and no exhaustive form of it has been run.** `apiclient/client.py:237` is confirmed as the public constructor default. *Nothing in this row previously carried a count; the 8 was never in the ledger, which is how it stayed unchecked while being quoted.*
 > Verdict: build
 > Closing-act: code
@@ -18118,9 +18132,31 @@ silent expiry are the defect.
 
 ## 1389. a REQUIRED CI guard is green while asserting against the wrong step: its locator binds the tooling pytest line, not the engine one it names
 
-> 🔢 **FILED 2026-08-29 (builder 2).** `tests/test_ci_engine_step_excludes_webconsole.py` exists to
+> ✅ **CLOSED 2026-09-03 -- fixed on `origin/main` in `e9fa3b440` (PR #733), verified by DRIVING the
+> guard rather than reading it.** `e9fa3b440` is an ancestor of `origin/main`. The locator now binds
+> the step by NAME (`_ENGINE_STEP = "Tests (pytest)"`) and joins backslash continuations before
+> matching, and calling `_engine_step_invocations()` against HEAD returns **exactly one** hit: job
+> `test`, the wrapped `retry-native-crash.sh pytest ... -m 'not tooling'` command at
+> `.github/workflows/ci.yml:852` -- the engine step, **not** the tooling line at `:1162` this row was
+> filed about. **Two mutation controls fired, and the first attempt at them did not**, which is why
+> they are recorded: replacing the glob on the engine step with the broken plain
+> `--ignore=packaging/messagefoundry-webconsole/tests` turns both assertions red, and deleting the
+> subtraction turns the subtraction assertion red, while the unmutated file stays green. An earlier
+> pass of those same mutations changed no bytes -- the replacement string did not match the raw
+> spelling in `ci.yml` -- and reported PASS, which is indistinguishable from a guard that cannot
+> fail. **A mutation control must assert that it mutated something.** Screened by
+> `scripts/docs/subject_exists_screen.py`, the subject-exists screen filed as BACKLOG #1426 --
+> allocated and open in PR 806, **not yet on `main`**.
+>
+> **NOTE ON WHAT WAS NOT RUN HERE.** `pytest` cannot execute in this worktree -- no dependencies are
+> installed, and importing the suite dies at `ModuleNotFoundError: No module named 'pydantic'`. The
+> three assertions were driven by loading the test module directly and calling them, which exercises
+> the same code without the conftest. The full suite legs are unread from here.
+>
+> **FILED 2026-08-29 (builder 2).** `tests/test_ci_engine_step_excludes_webconsole.py` exists to
 > stop the engine pytest step double-running the ~356 web-console tests that `testpaths` includes
-> (BACKLOG #1027). ***IT PASSES. IT IS A REQUIRED CHECK. AND IT IS NOT LOOKING AT THE ENGINE STEP.***
+> (BACKLOG #1027). ***IT PASSED. IT WAS A REQUIRED CHECK. AND IT WAS NOT LOOKING AT THE ENGINE
+> STEP.*** That is fixed; the text below is the record of the defect, not of current state.
 >
 > **Scored 2026-09-03 -> P3.** Value **1/10** · Difficulty **1/10** · _fill-in_. Verified shipped by DRIVING the guard, not reading it: the locator now binds the step structurally by name at tests/test_ci_engine_step_excludes_webconsole.py:40 and joins backslash continuations first at tests/test_ci_engine_step_excludes_webconsole.py:43, and calling _engine_step_invocations() against HEAD returns exactly one hit, job "test", the wrapped retry-native-crash.sh command at .github/workflows/ci.yml:852 -- not the tooling line at ci.yml:1162 this row names. A five-case mutation battery over patched copies of ci.yml confirmed the assertions point the right way: a plain --ignore on the engine step goes red, the same flag hidden on a continuation line goes red, a dropped --ignore-glob goes red, renaming the step fails loudly at tests/test_ci_engine_step_excludes_webconsole.py:126, and a harmless reformat preserving the glob stays green. It is registered and collected, not orphaned: tests/tooling_manifest.txt:45 lists the file, so pytest -m tooling collects all 3 tests, and pytest on the file passes 3 of 3. The fix is on origin/main (e9fa3b440, PR 733), confirmed with git merge-base --is-ancestor. The only residual is bookkeeping -- the row still reads as open with stale present-tense text and drifted coordinates at docs/BACKLOG.md:17883 -- which is a banner flip and a doc edit, so value 1 and difficulty 1 stand.
 
@@ -18264,10 +18300,25 @@ an affected seat is alive, working, and unreachable by the channel that leaves a
 
 ## 1392. PR 609 must land WITH OR AFTER ADR 0172: it replaces a stale understatement of the TLS posture with an overstatement that is false on main, and links an ADR file main does not have
 
-> 🔢 **FILED 2026-08-29 (builder 2).** PR 609 deletes two strings saying remote TLS exposure is
+> ✅ **CLOSED 2026-09-03 -- the ordering held, verified against origin/main at its 2026-09-03 head.**
+> This row asked for one thing: that PR 609's doc edit never land before ADR 0172. It did not. `6e0a950b6`
+> (ADR 0172, 2026-09-02T07:29:46Z) and `671d57501` (PR 609's edit, 08:31:45Z) are **both ancestors of
+> `origin/main`** under `git merge-base --is-ancestor`, an hour apart and in the required order --
+> checked here against a negative control, an invented sha, which the same probe correctly refused.
+> The ADR file is on main with its index row at `docs/adr/README.md:197`, and both corrected files
+> carry the excluded-topology caveat this row demanded: `messagefoundry/api/app.py:19-25` and
+> `CLAUDE.md:119-127`. **A grep for the phrase "always serves TLS" in `CLAUDE.md` returns nothing,
+> and that negative is FALSE** -- the phrase wraps a line break as `**always\n  serves TLS**`. Read
+> the paragraph, not the grep; a confident negative from a line-oriented tool is the reading to
+> distrust. Nothing runnable remained, only this banner. Screened by
+> `scripts/docs/subject_exists_screen.py` -- the subject-exists screen filed as BACKLOG #1426,
+> allocated and open in PR 806, **not yet on `main`** -- and then verified against the code.
+>
+> **FILED 2026-08-29 (builder 2).** PR 609 deletes two strings saying remote TLS exposure is
 > still to come -- `CLAUDE.md:120` and `messagefoundry/api/app.py:19` -- and replaces them with text
 > asserting the engine **always serves TLS**, minting a self-signed certificate on first run, citing
-> **ADR 0172**. ***BOTH THE OLD TEXT AND THE NEW TEXT ARE WRONG ABOUT MAIN, IN OPPOSITE DIRECTIONS.***
+> **ADR 0172**. ***BOTH THE OLD TEXT AND THE NEW TEXT WERE WRONG ABOUT MAIN, IN OPPOSITE
+> DIRECTIONS*** -- both are now corrected on main, which is why this row closes.
 >
 > **Scored 2026-09-03 -> P3.** Value **1/10** · Difficulty **1/10** · _fill-in_. All three limbs of the ordering constraint hold at HEAD, verified by running rather than reading. ADR 0172 landed first (commit 6e0a950b6, 2026-09-02 07:29 UTC) and PR 609's doc edit landed after it (commit 671d57501, 08:31 UTC), and git merge-base --is-ancestor confirms the ancestry, so the hold this row exists to enforce was honored. The ADR file and its index row both exist (docs/adr/README.md:197), and every live relative 0172 link resolves -- the single unresolvable path is the placeholder inside this row's own table, not a shipped link. The replacement text is now true of main: calling ensure_api_tls_material with default ApiSettings minted api-generated-cert.pem plus api-generated-key.pem, returned the identical pair on a second call, and returned None only under tls_terminated_upstream (messagefoundry/api/tls.py:87), while the serve path calls it unconditionally and not behind --allow-insecure-bind (messagefoundry/__main__.py:2885), and both corrected files carry the excluded-topology caveat (CLAUDE.md:120, messagefoundry/api/app.py:19). Nothing runnable remains; the only residue is closing the row, which parse_items still reports open at docs/BACKLOG.md:18023.
 
