@@ -279,20 +279,29 @@ ci-scanners = [
 # The RELEASE SIGNING toolchain (BACKLOG #332). Exact `==`, and the version is the contract for the
 # same reason the scanners' are: this runs in the job holding `id-token: write`, and whatever executes
 # there signs the wheel, writes the SLSA attestation and publishes to PyPI.
-#   sigstore  4.5.0, not the 4.4.0 currently pinned inline at `release.yml:255`. That pin chose the
-#             OLDER release deliberately -- `dependabot.yml`'s 5-day supply-chain cooldown, and 4.5.0
-#             was then <48h old, so hard-pinning the SIGNING toolchain to a fresher artifact than the
-#             repo's own update policy allows would have inverted that policy at the highest-privilege
-#             point in the pipeline. MEASURED: 4.5.0 published 2026-07-28T07:34:00Z, so the cooldown
-#             closed 2026-08-02 -- the objection is SPENT, not overridden, and `release.yml`'s own
-#             comment says "Re-evaluate to 4.5.0 once it has aged past the window."
+#   sigstore  4.4.0, BY OWNER RULING -- given 2026-08-22 and RE-AFFIRMED 2026-09-03 after the full
+#             history below was put to the owner. "NOT 4.5.0." Recorded at BACKLOG #332. This line is
+#             the contract (see the paragraph above); do not move it as a side effect of another
+#             change, and do not let a bot move it -- `.github/dependabot.yml` carries a matching
+#             `ignore` entry whose only purpose is to keep this pin where the owner put it.
+#             DO NOT RE-DERIVE THE COOLDOWN ARGUMENT. It has now been derived twice, and it has never
+#             reached the ruling. `dependabot.yml`'s 5-day cooldown motivated the ORIGINAL 4.4.0
+#             choice and expired 2026-08-02 (4.5.0 published 2026-07-28T07:34:00Z). The first ruling
+#             came twenty days AFTER that expiry, and the 2026-09-03 re-affirmation came with the
+#             expiry stated in the packet. So "the cooldown is spent" is not news to this pin; it is
+#             the argument both rulings were made in spite of.
+#             NEITHER VERSION HAS A PATCH LINE, so patch availability does not discriminate between
+#             them. Measured against PyPI 2026-09-03: sigstore 4.x is 4.0.0, 4.1.0, 4.2.0, 4.3.0,
+#             4.4.0 (2026-07-06), 4.5.0 (2026-07-28) and nothing else -- zero patch releases across
+#             the whole 4.x series. (The 3.x series did ship patches, e.g. 3.5.1 and 3.6.7, so a
+#             future 4.4.1 is possible and the `ignore` entry is scoped NOT to block one.)
 # The point of the group is NOT the version. An inline `pip install X==Y` pins only the TOP package --
 # ~30 transitives still float, unhashed, resolved at signing time -- and NO Dependabot ecosystem parses
 # an inline install inside a workflow `run:` block, so the pin has no updater, no trigger and no owner.
 # Routing it through `uv.lock` hashes the transitives AND puts it under the `uv` ecosystem Dependabot
 # already watches. Non-default, like its siblings, so it stays out of the runtime exports and the SBOM.
 release-tools = [
-    "sigstore==4.5.0",
+    "sigstore==4.4.0",
 ]
 # The ADVISORY measurement tools (quality-advisory.yml). Exact where something PARSES the tool's
 # output, a floor where nothing does:
