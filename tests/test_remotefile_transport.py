@@ -100,7 +100,7 @@ class _FakeClient(_RemoteClient):
         # real budget on the real code path (#1191). Chunked, so a body is refused part-way in.
         sink = _BoundedSink(max_bytes)
         body = self.files[path]
-        for start in range(0, max(len(body), 1), _CHUNK):
+        for start in range(0, len(body), _CHUNK):
             sink.write(body[start : start + _CHUNK])
         return sink.value()
 
