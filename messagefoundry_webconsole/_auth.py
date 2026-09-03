@@ -778,10 +778,18 @@ def clear_session_cookie(response: Response, request: Request) -> None:
     """End this browser's session: delete the session cookie AND stamp
     :data:`CLEAR_SITE_DATA_HEADER` (ASVS 14.3.1). Pairs with a server-side revoke.
 
-    Deletes whichever name this scheme uses (:func:`session_cookie_name`). Over cleartext loopback the
-    DELETION stays byte-identical to the pre-#192 clear (``delete_cookie(COOKIE_NAME, path="/")``); the
-    ``__Host-`` deletion additionally carries Secure so the browser accepts the expiry (a ``__Host-``
-    cookie is only writable — expiry included — over a Secure connection).
+    Deletes whichever name this scheme uses (:func:`session_cookie_name`), carrying **the same guards
+    :func:`set_session_cookie` wrote**: Secure keyed on :func:`effective_https`, plus HttpOnly and
+    SameSite=Strict. A ``__Host-`` cookie is only writable — expiry included — over a Secure
+    connection, so keying the deletion the same way is also what makes the expiry land.
+
+    **Why the deletion reads ``effective_https`` and not the resolved name (BACKLOG #1117).** The two
+    are different conjuncts: the set keys Secure on ``effective_https`` alone and the NAME on
+    ``effective_https AND browser_hardening_enabled()``. Inferring Secure from the name therefore lost
+    it whenever the two disagreed — with the org opt-out set over https, this took the unprefixed
+    branch into Starlette's ``delete_cookie`` defaults (``secure=False, httponly=False,
+    samesite="lax"``) and revoked a Secure + HttpOnly + Strict cookie with a bare one. One expression,
+    no branch, so the two sites cannot drift apart again by an edit to either.
 
     The header is set HERE rather than beside each call site because deleting the session cookie IS
     the browser-visible end of a session: fusing them makes the 14.3.1 control structurally
@@ -792,11 +800,13 @@ def clear_session_cookie(response: Response, request: Request) -> None:
     change) are terminations; a future caller that deletes the cookie without ending the session would
     be the anomaly and must justify itself, not the other way round.
     """
-    name = session_cookie_name(request)
-    if name == COOKIE_NAME:
-        response.delete_cookie(COOKIE_NAME, path="/")
-    else:
-        response.delete_cookie(name, path="/", secure=True, httponly=True, samesite="strict")
+    response.delete_cookie(
+        session_cookie_name(request),
+        path="/",
+        secure=effective_https(request.app.state, request.url.scheme),
+        httponly=True,
+        samesite="strict",
+    )
     response.headers[CLEAR_SITE_DATA_HEADER] = CLEAR_SITE_DATA_VALUE
 
 
@@ -854,12 +864,20 @@ def set_oidc_flow_cookie(
 def clear_oidc_flow_cookie(response: Response, request: Request) -> None:
     """Delete the flow cookie. Called on EVERY terminal callback response, success or failure: the
     server-side flow is single-use, so a surviving cookie would make the next callback present a flow
-    id that no longer resolves — a confusing ``flow_binding_missing`` on an otherwise clean retry."""
-    name = oidc_flow_cookie_name(request)
-    if name == FLOW_COOKIE_NAME:
-        response.delete_cookie(FLOW_COOKIE_NAME, path="/")
-    else:
-        response.delete_cookie(name, path="/", secure=True, httponly=True, samesite="lax")
+    id that no longer resolves — a confusing ``flow_binding_missing`` on an otherwise clean retry.
+
+    Carries the same guards :func:`set_oidc_flow_cookie` wrote, keyed on the same
+    :func:`effective_https` call — see :func:`clear_session_cookie` for why the resolved NAME is the
+    wrong thing to infer Secure from (BACKLOG #1117). ``SameSite=Lax`` mirrors the set for the same
+    reason the set has it: the IdP's redirect back is a top-level cross-site GET.
+    """
+    response.delete_cookie(
+        oidc_flow_cookie_name(request),
+        path="/",
+        secure=effective_https(request.app.state, request.url.scheme),
+        httponly=True,
+        samesite="lax",
+    )
 
 
 # --- L5a: WebAuthn RP identity (ADR 0068 §7) --------------------------------------
