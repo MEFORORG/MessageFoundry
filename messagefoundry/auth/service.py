@@ -82,7 +82,7 @@ def _warn_if_corpus_unreadable(path: str | None) -> None:
     except OSError as exc:
         _log.warning(
             "password_breach_corpus_file %r could not be read (%s); the larger breach corpus is "
-            "disabled (the bundled top-10k list still applies)",
+            "disabled (the bundled corpus still applies)",
             path,
             exc,
         )

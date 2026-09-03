@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import hashlib
+import re
 from pathlib import Path
 
 from messagefoundry.auth import (
@@ -115,7 +116,7 @@ def test_operator_breach_corpus_plaintext(tmp_path: Path) -> None:
     corpus = tmp_path / "extra-plain.txt"
     corpus.write_text("Hunter2-The-Long-One\nanother-leaked-passphrase\n", encoding="utf-8")
     policy = PasswordPolicy(breach_corpus_file=str(corpus))
-    # Case-insensitive membership against the operator corpus (augments the bundled top-10k).
+    # Case-insensitive membership against the operator corpus (augments the bundled corpus).
     assert "not be a common or breached password" in policy.violations("hunter2-the-long-one")
     assert policy.violations("a-totally-novel-passphrase") == []  # in neither corpus
 
@@ -193,3 +194,133 @@ def test_breach_corpus_growth_did_not_over_block_or_regress() -> None:
     assert "not be a common or breached password" in policy.violations("1234567891234567")
     # OVER-BLOCK arm: a strong passphrase that is not in the corpus is still accepted.
     assert policy.violations("correct-horse-battery-staple-xyz") == []
+
+
+# --- BACKLOG #1134: the prose the corpus rebuild falsified, and a gate so it cannot rot again -----
+#
+# The #1134 build grew the bundled list well past the original ten thousand entries. Seven shipped
+# sites still described it as a "top-10k" list afterwards -- a module docstring, an OPERATOR-FACING
+# startup warning, a settings comment, two rows of the configuration reference and two paragraphs of
+# the security narrative. None of them is a control, so none of them broke; they simply asserted a
+# number that had stopped being true, in the places an operator reads to decide whether to configure
+# a larger corpus. That is the failure mode this file's other #1134 gate cannot see: it measures the
+# CORPUS, and prose is not the corpus.
+#
+# The fix is to keep the counts in exactly one place (``common_passwords.NOTICE``, beside the data)
+# and let every other site describe the list without a size. The gate below pins that.
+
+#: Size claims about the BUNDLED list, in the forms the seven falsified sites actually used. The
+#: upstream member is legitimately named ``Pwdb_top-10000.txt`` in the NOTICE -- a filename, not a
+#: claim about what ships -- so the patterns deliberately require the ``k`` or the thousands comma,
+#: and ``test_stale_corpus_size_checker_detects_planted_claims`` proves that allowance is a real
+#: exclusion rather than an accident of the current text.
+_STALE_CORPUS_SIZE_CLAIMS = (
+    re.compile(r"top[-\s]?10\s?k\b", re.IGNORECASE),
+    re.compile(r"top[-\s]?10,000", re.IGNORECASE),
+    re.compile(r"10,?000[-\s]entry", re.IGNORECASE),
+)
+
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+
+
+def _corpus_prose_sites() -> list[Path]:
+    """Where a bundled-corpus size claim can live.
+
+    The engine half is a GLOB, not a list, so the same wording landing in a module written next year
+    is caught rather than missed; the doc half is pinned because these two files are the operator-
+    facing pair. ``tests/`` is deliberately NOT scanned -- the planted-claim self-test below has to
+    contain the banned strings to do its job, and a scanner that reads its own fixtures reports
+    itself forever.
+    """
+    sites = sorted((_REPO_ROOT / "messagefoundry").rglob("*.py"))
+    sites.append(_REPO_ROOT / "messagefoundry" / "auth" / "data" / "common_passwords.NOTICE")
+    sites.append(_REPO_ROOT / "docs" / "CONFIGURATION.md")
+    sites.append(_REPO_ROOT / "docs" / "SECURITY.md")
+    return sites
+
+
+def _stale_size_claims(text: str, label: str) -> list[str]:
+    """``"<label>:<lineno>: <line>"`` for every line asserting a stale bundled-corpus size."""
+    hits: list[str] = []
+    for number, line in enumerate(text.splitlines(), start=1):
+        if any(pattern.search(line) for pattern in _STALE_CORPUS_SIZE_CLAIMS):
+            hits.append(f"{label}:{number}: {line.strip()}")
+    return hits
+
+
+def test_no_shipped_site_asserts_a_stale_bundled_corpus_size() -> None:
+    """No engine module or operator document may describe the bundled list by a size.
+
+    The counts belong to ``common_passwords.NOTICE``, which sits beside the data and is regenerated
+    with it. Anywhere else they are a copy that goes stale silently -- which is exactly what
+    happened, in seven places at once, and what nothing in CI noticed.
+    """
+    hits: list[str] = []
+    for path in _corpus_prose_sites():
+        if not path.exists():  # a source tree may legitimately not carry every doc
+            continue
+        hits += _stale_size_claims(
+            path.read_text(encoding="utf-8"), path.relative_to(_REPO_ROOT).as_posix()
+        )
+    assert not hits, (
+        "these sites still size the bundled breach corpus in prose, and the #1134 rebuild made the "
+        "number wrong: " + "; ".join(hits) + ". Describe the list without a size and let "
+        "messagefoundry/auth/data/common_passwords.NOTICE carry the counts."
+    )
+
+
+def test_stale_corpus_size_checker_detects_planted_claims() -> None:
+    """The positive control for the zero above, in the same checker.
+
+    A scan that finds nothing is indistinguishable from a scan that cannot see. Every wording the
+    seven real sites used is planted here and must be reported -- and the upstream FILENAME must
+    not be, because the NOTICE has to be free to name the member it drew from.
+    """
+    planted = "\n".join(
+        (
+            "the bundled offline top-10k common-password list",
+            "augments the bundled top 10k list",
+            "a bundled offline top-10,000 list",
+            "a bundled 10,000-entry offline corpus",
+        )
+    )
+    reported = _stale_size_claims(planted, "planted")
+    assert len(reported) == 4, f"the checker missed a real wording: {reported}"
+
+    allowed = "1. Pwdb_top-10000.txt      all 10,000 entries (the original bundle)"
+    assert _stale_size_claims(allowed, "notice") == [], (
+        "naming the upstream member file must stay legal, or the NOTICE cannot cite its own source"
+    )
+
+
+def test_operator_reference_warns_that_a_short_corpus_entry_buys_nothing() -> None:
+    """The caveat an operator needs before pointing ``password_breach_corpus_file`` at a big list.
+
+    ``PasswordPolicy.violations`` records the length clause and the corpus clause independently, so
+    a below-minimum entry does not fail the check -- it just cannot reject anything the length rule
+    would have let through. A site that reads only the line count of a general-purpose leaked-
+    password list will therefore over-estimate what it bought, which is the same mistake #1134
+    found in the bundled list. Both setting names come from the live model, so a rename reds this
+    rather than leaving a doc row pointing at a field that no longer exists.
+    """
+    from messagefoundry.config.settings import AuthSettings
+
+    doc = _REPO_ROOT / "docs" / "CONFIGURATION.md"
+    if not doc.exists():  # pragma: no cover - present in every checkout that ships docs
+        return
+    setting = "password_breach_corpus_file"
+    floor = "password_min_length"
+    assert {setting, floor} <= set(AuthSettings.model_fields), "settings renamed; update this guard"
+    # Match the row whose FIRST cell is the setting, not any line that mentions it: neighbouring
+    # rows cross-reference this one, and a substring match silently graded the wrong row.
+    lead = f"| `{setting}` |"
+    row = next(
+        (line for line in doc.read_text(encoding="utf-8").splitlines() if line.startswith(lead)),
+        None,
+    )
+    assert row is not None, f"docs/CONFIGURATION.md no longer has a row starting {lead!r}"
+    assert floor in row, (
+        f"the `{setting}` row must say that an entry shorter than {floor} adds no coverage. "
+        "Without it the reference invites sizing a corpus by its line count, which is what left "
+        "the bundled list contributing 18 usable entries (BACKLOG #1134)."
+    )
