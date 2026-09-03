@@ -16,6 +16,7 @@ import httpx
 import pytest
 
 from messagefoundry.auth import Role
+from messagefoundry.auth.identity import ALL_CHANNELS
 from messagefoundry.auth.permissions import (
     BUILTIN_ROLE_PERMISSIONS,
     CUSTOM_ROLE_FORBIDDEN_PERMISSIONS,
@@ -72,6 +73,11 @@ async def _make_user(engine: Engine, role: Role, *, name: str) -> AuthService:
     await service.store.set_password(
         uid, password_hash=user.password_hash, must_change_password=False
     )
+    # BACKLOG #1152: an unset channel scope now denies. This file exercises the OWNER axis (ASVS
+    # 8.2.2 on uploaded files, which carry no channel), so grant the estate explicitly and leave the
+    # channel axis to tests/test_channel_rbac.py — otherwise upload RESEND, whose target inbound IS
+    # channel-checked, would fail here for a reason the file is not about.
+    await service.set_channel_scope(uid, [ALL_CHANNELS], actor="test")
     return service
 
 
@@ -92,6 +98,11 @@ async def _add_user(service: AuthService, role: Role, *, name: str) -> str:
     await service.store.set_password(
         uid, password_hash=user.password_hash, must_change_password=False
     )
+    # BACKLOG #1152: an unset channel scope now denies. This file exercises the OWNER axis (ASVS
+    # 8.2.2 on uploaded files, which carry no channel), so grant the estate explicitly and leave the
+    # channel axis to tests/test_channel_rbac.py — otherwise upload RESEND, whose target inbound IS
+    # channel-checked, would fail here for a reason the file is not about.
+    await service.set_channel_scope(uid, [ALL_CHANNELS], actor="test")
     return uid
 
 

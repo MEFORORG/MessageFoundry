@@ -192,8 +192,10 @@ route handler only when all of them pass.
    sensitive permission set on non-GET requests only. ADR 0118 relocated the knob, and the old
    `[diagnostics].audit_all_authz` TOML spelling is **refused at load**.
 4. **A second axis: per-channel scope** — `users.channel_scope` narrows operational routes to a set of
-   connections. Out-of-scope *message* access returns **404** (existence-hiding); connection control and
-   inbound injection return **403**. Denials are audited `auth.channel_denied`.
+   connections, and it **denies by default**: a new non-administrator is granted no channel until
+   somebody grants one (BACKLOG #1152; the full rule is *Per-channel scoping (DLQ-SCOPE)* below).
+   Out-of-scope *message* access returns **404** (existence-hiding); connection control and inbound
+   injection return **403**. Denials are audited `auth.channel_denied`.
 
 The table below has **seven** rows. `require` is the ladder itself; five wrappers extend it
 (`require_paced`, `require_phi_read`, `require_step_up`, `require_step_up_action`, and the shared
@@ -498,10 +500,13 @@ tuple: they act only on the caller's own account.
 > **Owner-only** is the whole rule: list, browse, resend and delete reach the caller's own files.
 > `files:access_any` is the explicit cross-operator override, granted to **Administrator** only (it is
 > the whole catalogue), never to Operator, and never mintable onto a custom role
-> (`CUSTOM_ROLE_FORBIDDEN_PERMISSIONS`). The channel axis is deliberately **not** used here —
-> `Identity.allowed_channels` defaults to `null` (= every channel) and an uploaded file carries no
-> channel, so a channel-scoped rule would protect nobody on a default install and would deny every
-> scoped operator their own file. A denied by-id request answers **404** with the same body as a
+> (`CUSTOM_ROLE_FORBIDDEN_PERMISSIONS`). The channel axis is deliberately **not** used here, and one
+> of the two reasons originally given has since expired. The surviving reason decides it on its own:
+> an uploaded file carries no channel, so a channel-scoped rule has nothing to match on and would
+> deny every scoped operator their own file. The expired reason was that `Identity.allowed_channels`
+> defaulted to `null` (= every channel), so such a rule would have protected nobody on a default
+> install — BACKLOG #1152 flipped that default to deny, which changes nothing about the owner-only
+> decision but does retire half of its stated justification. A denied by-id request answers **404** with the same body as a
 > malformed or absent id; what makes the by-id routes non-enumerable is that a `file_id` is 128 bits
 > of `secrets.token_hex(16)` and the listing no longer hands out another operator's — the denial is
 > still distinguishable by timing and by its audit row. That denial is audited as `upload.denied` with
@@ -724,16 +729,26 @@ else would need its own authorization rule stated here.
 Differences 3–5 are derived and pinned: a `/ui` route that is weaker than **any** JSON route holding
 the same permission set on the same method reds CI until it is listed here.
 
-> **Per-channel scoping (DLQ-SCOPE).** Operational permissions can be confined to a set of
-> connections per user via `users.channel_scope` (`PUT /users/{id}/channel-scope`; `null` = all,
-> the default). When a user is scoped, `messages:read/view_raw/replay`, dead-letter list/replay, and
-> `connections:control` are restricted to their channels (out-of-scope message access returns 404 to
-> avoid leaking existence; connection control returns 403; denials are audited `auth.channel_denied`).
-> **Administrators are always all-channels.** Monitoring dashboards stay global. A channel-scoped user
-> **cannot purge** a shared outbound (purge spans every inbound feeding it). **AD users** inherit their
-> scope from the `ad_group_scope_map` (`GET/PUT /ad-group-scope-map`; channel `*` = all): on login the
-> group-derived scope is persisted and stale sessions revoked. It's opt-in — with no matching mapped
-> group, the user's existing scope (all by default) is left untouched.
+> **Per-channel scoping (DLQ-SCOPE), and it DENIES BY DEFAULT (BACKLOG #1152, ASVS 8.2.2).**
+> Operational permissions are confined to a set of connections per user via `users.channel_scope`
+> (`PUT /users/{id}/channel-scope`). A new non-administrator is granted **no channel** — `create_user`
+> writes no scope, and an absent scope denies — so `messages:read/view_raw/replay`, dead-letter
+> list/replay and `connections:control` reach nothing until somebody grants a channel. Out-of-scope
+> message access returns 404 to avoid leaking existence; connection control returns 403; denials are
+> audited `auth.channel_denied`. All-channels survives as a grant somebody typed: the `*` token in the
+> scope list (`{"channels": ["*"]}`). Sending `{"channels": null}` **clears** the scope and therefore
+> denies — it is not the wide value it was before #1152.
+>
+> **Administrators are always all-channels**, by role, which is what keeps the first operator of a
+> fresh install from locking themselves out of their own console. A non-administrator with an empty
+> scope sees an empty console, and the landing page says so in a sentence rather than leaving it to
+> read as broken RBAC; that is deliberately a page banner and not a start-time refusal, which would
+> make a fresh single-operator install unbootable for the same condition. Monitoring dashboards stay
+> global. A channel-scoped user **cannot purge** a shared outbound (purge spans every inbound feeding
+> it). **AD users** inherit their scope from the `ad_group_scope_map` (`GET/PUT /ad-group-scope-map`;
+> channel `*` = all): on login the group-derived scope is persisted — a wildcard row persists the
+> explicit `["*"]` grant — and stale sessions revoked. It's opt-in: with no matching mapped group the
+> user's existing scope is left untouched, which for a never-granted account means it stays denied.
 
 > **`/config/reload` executes Python** from the target directory in-process, so it is constrained
 > beyond the `config:deploy` permission: the directory must resolve **within** an allowed root —

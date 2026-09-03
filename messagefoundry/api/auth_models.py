@@ -57,7 +57,9 @@ class UserSummary(BaseModel):
     email: str | None = None
     disabled: bool
     roles: list[str]
-    channel_scope: list[str] | None = None  # per-channel RBAC: allowed connections; None = all
+    #: Per-channel RBAC, as STORED: the allowed connection names, ``["*"]`` for the explicit
+    #: all-channels grant, or ``None`` when nobody has set a scope — which denies (BACKLOG #1152).
+    channel_scope: list[str] | None = None
 
 
 class UserPermissions(BaseModel):
@@ -74,7 +76,12 @@ class UserPermissions(BaseModel):
 
 
 class ChannelScope(BaseModel):
-    """A user's per-channel RBAC scope. ``None`` = all channels; a list = exactly those connections."""
+    """A user's per-channel RBAC scope: a list of exactly those connections.
+
+    ``["*"]`` is the explicit all-channels grant. ``None`` clears the scope back to unset, and unset
+    DENIES every channel (BACKLOG #1152, ASVS 8.2.2) — it is not the wide value it used to be, so a
+    client that sends null to widen a scope now narrows it to nothing. Administrators are
+    all-channels by role, so a scope set on one has no effect either way."""
 
     channels: list[str] | None = Field(default=None, max_length=512)
 

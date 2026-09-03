@@ -821,11 +821,13 @@ class EngineClient:
         self._request("PUT", f"/users/{_seg(user_id)}/roles", json={"roles": roles})
 
     def get_channel_scope(self, user_id: str) -> list[str] | None:
-        """A user's per-channel RBAC scope (``None`` = all channels)."""
+        """A user's per-channel RBAC scope: the granted connections, ``["*"]`` for every channel, or
+        ``None`` when no scope is stored — which denies (BACKLOG #1152)."""
         return _decode(self._get(f"/users/{_seg(user_id)}/channel-scope"), ChannelScope).channels
 
     def set_channel_scope(self, user_id: str, channels: list[str] | None) -> None:
-        """Set a user's per-channel RBAC scope (``None`` = all channels)."""
+        """Set a user's per-channel RBAC scope. ``["*"]`` grants every channel; ``None`` clears the
+        scope and therefore DENIES every channel — it is not the wide value it used to be."""
         self._request("PUT", f"/users/{_seg(user_id)}/channel-scope", json={"channels": channels})
 
     def delete_user(self, user_id: str) -> None:

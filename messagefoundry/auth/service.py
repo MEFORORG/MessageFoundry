@@ -26,7 +26,7 @@ from typing import Any, TypeVar
 from uuid import uuid4
 
 from messagefoundry.auth import oidc, reconcile, totp, webauthn
-from messagefoundry.auth.identity import AuthProvider, Identity
+from messagefoundry.auth.identity import ALL_CHANNELS, AuthProvider, Identity
 from messagefoundry.auth.ldap import AdPrincipal, LdapAuthenticator, LdapError, kerberos_principal
 from messagefoundry.auth.notifications import (
     ACCOUNT_DISABLED,
@@ -232,18 +232,29 @@ def _json(obj: Any) -> str:
 
 
 def _allowed_channels(user: UserRecord, roles: frozenset[Role]) -> frozenset[str] | None:
-    """Resolve a user's per-channel RBAC scope to a frozenset, or ``None`` for all channels.
+    """Resolve a user's stored per-channel RBAC scope to a frozenset, or ``None`` for all channels.
 
-    Administrators are always all-channels. A NULL ``channel_scope`` is all; a JSON list is exactly
-    those connections; anything malformed is treated as **no** channels (deny-by-default)."""
-    if Role.ADMINISTRATOR in roles or user.channel_scope is None:
+    **An ABSENT scope denies (BACKLOG #1152, ASVS 8.2.2).** ``create_user``'s INSERT does not list
+    ``channel_scope``, so every account is minted with SQL NULL there; NULL used to resolve to
+    ``None`` = every channel, which made every per-channel check in the API narrow nobody on a
+    default install. It now resolves to the empty set, so a freshly minted non-administrator reaches
+    no connection until an administrator grants one.
+
+    Unrestricted is still reachable, and both ways are a deliberate grant: the ADMINISTRATOR role,
+    or :data:`~messagefoundry.auth.identity.ALL_CHANNELS` present in the stored list. A JSON list is
+    otherwise exactly those connections, and anything malformed is no channels."""
+    if Role.ADMINISTRATOR in roles:
         return None
+    if user.channel_scope is None:
+        return frozenset()
     try:
         names = json.loads(user.channel_scope)
     except (ValueError, TypeError):
         return frozenset()
     if not isinstance(names, list):
         return frozenset()
+    if ALL_CHANNELS in names:
+        return None
     return frozenset(str(n) for n in names)
 
 
@@ -1383,15 +1394,21 @@ class AuthService:
     ) -> UserRecord:
         """Persist a user's AD-group-derived per-channel scope (C3) so it's durable for later
         requests (mirrors role sync). Administrators are always all-channels. If no group mapping
-        matches, the per-user scope is left untouched — opt-in, so it never clobbers a manual scope
-        or the all-channels default. Returns the (possibly refreshed) user record."""
+        matches, the per-user scope is left untouched — opt-in, so it never clobbers a manual scope,
+        and since BACKLOG #1152 an untouched scope is a DENY rather than the whole estate. Returns
+        the (possibly refreshed) user record.
+
+        A wildcard group row persists the explicit ``["*"]`` grant. It used to persist SQL NULL and
+        rely on NULL meaning "all"; with an absent scope now denying, that collapse would have
+        inverted a deliberate all-channels mapping into a deny-everything one."""
         if Role.ADMINISTRATOR in roles:
             return user
         channels = await self._store.channels_for_ad_groups(groups)
         if not channels:
             return user
-        specific = sorted(c for c in channels if c != "*")
-        scope_json = None if "*" in channels else _json(specific)
+        wildcard = ALL_CHANNELS in channels
+        specific = sorted(c for c in channels if c != ALL_CHANNELS)
+        scope_json = _json([ALL_CHANNELS]) if wildcard else _json(specific)
         if user.channel_scope == scope_json:
             return user
         await self._store.set_user_channel_scope(user.id, scope_json)
@@ -1401,7 +1418,7 @@ class AuthService:
         await self._audit(
             "auth.ad_scope_resynced",
             actor=user.username,
-            detail=_json({"channels": "*" if scope_json is None else specific}),
+            detail=_json({"channels": ALL_CHANNELS if wildcard else specific}),
         )
         return await self._store.get_user(user.id) or user
 
@@ -3023,8 +3040,14 @@ class AuthService:
     async def set_channel_scope(
         self, user_id: str, channels: Sequence[str] | None, *, actor: str
     ) -> None:
-        """Set a user's per-channel RBAC scope (``None`` = all). Revokes their sessions so the new
-        scope takes effect immediately, and audits the change."""
+        """Set a user's per-channel RBAC scope. Revokes their sessions so the new scope takes effect
+        immediately, and audits the change.
+
+        Three writable states, and ``None`` is no longer the wide one (BACKLOG #1152): ``None``
+        clears the scope back to unset, which now DENIES every channel; ``[]`` denies too, and says
+        somebody chose it; a list containing
+        :data:`~messagefoundry.auth.identity.ALL_CHANNELS` grants the whole estate. Administrators
+        are all-channels by role, so a scope set on one still has no effect."""
         scope_json = None if channels is None else _json(sorted(set(channels)))
         await self._store.set_user_channel_scope(user_id, scope_json)
         await self._store.revoke_user_sessions(user_id)

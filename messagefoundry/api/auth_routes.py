@@ -177,7 +177,11 @@ def _login_response(
 
 
 def _parse_channel_scope(raw: str | None) -> list[str] | None:
-    """Decode the stored ``channel_scope`` JSON to a list (None = all; malformed → empty list)."""
+    """Decode the stored ``channel_scope`` JSON to a list, or ``None`` when no scope is stored.
+
+    This is the STORED shape, not the resolved one: ``auth.service._allowed_channels`` is what turns
+    it into an access decision, and since BACKLOG #1152 a ``None`` here denies rather than widens.
+    Malformed JSON decodes to the empty list, which denies the same way."""
     if raw is None:
         return None
     try:
@@ -868,8 +872,10 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
         service: AuthService = Depends(_service),
         identity: Identity = Depends(require_step_up(Permission.USERS_MANAGE)),
     ) -> SimpleMessage:
-        """Set a user's per-channel RBAC scope (``channels: null`` = all). Administrators are always
-        all-channels, so a scope set on one has no effect."""
+        """Set a user's per-channel RBAC scope. ``channels: ["*"]`` grants every channel;
+        ``channels: null`` clears the scope, which DENIES every channel (BACKLOG #1152 — null used
+        to be the wide value). Administrators are always all-channels, so a scope set on one has no
+        effect."""
         if await service.store.get_user(user_id) is None:
             raise HTTPException(status.HTTP_404_NOT_FOUND, "no such user")
         await service.set_channel_scope(user_id, body.channels, actor=identity.username)

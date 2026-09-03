@@ -21,6 +21,7 @@ from messagefoundry.api.auth_models import (
     RoleInfo,
     UserSummary,
 )
+from messagefoundry.auth.identity import ALL_CHANNELS
 
 from .._html import Markup, el, page, register_nav, rows_table
 from ._common import _seg
@@ -56,6 +57,21 @@ def _admin_links(active_page: str) -> Markup:
 # --- users --------------------------------------------------------------------
 
 
+def _scope_cell(stored: Sequence[str] | None) -> str:
+    """The Channel scope column for one user, read from the STORED scope.
+
+    ``None`` used to render "all"; since BACKLOG #1152 an unset scope denies, so it renders
+    "(none)" alongside an explicit empty list. All-channels is the ``*`` grant. Getting this
+    backwards would tell an administrator an account is wide open when it reaches nothing —
+    the direction of the error that makes someone widen a grant to fix a symptom that is not there.
+    """
+    if stored is None:
+        return "(none)"
+    if ALL_CHANNELS in stored:
+        return "all"
+    return ", ".join(stored) or "(none)"
+
+
 def users_page(users: Sequence[UserSummary]) -> Markup:
     """The user list: every account with provider, roles, scope, and status; links to the admin forms."""
     rows: list[list[object]] = []
@@ -67,7 +83,7 @@ def users_page(users: Sequence[UserSummary]) -> Markup:
                 u.display_name or "",
                 u.email or "",
                 ", ".join(u.roles),
-                "all" if u.channel_scope is None else ", ".join(u.channel_scope) or "(none)",
+                _scope_cell(u.channel_scope),
                 "disabled" if u.disabled else "active",
             ]
         )
@@ -192,12 +208,22 @@ def user_detail_page(
             action=f"/ui/users/{user.id}/roles",
             class_="ctl",
         )
-    # Three explicit scope states so a deny-all ([]) scope ROUND-TRIPS: an empty textarea alone is
-    # ambiguous between "all channels" (None) and "no channels" ([]), and silently widening a stored
-    # deny-all to all-channels on a re-save would be a privilege-widening bug (review PR2-M3).
-    scope_mode = (
-        "all" if user.channel_scope is None else ("none" if user.channel_scope == [] else "list")
-    )
+    # Three explicit scope states so a deny-all scope ROUND-TRIPS: an empty textarea alone cannot
+    # say which of them was meant, and silently widening a stored deny-all to all-channels on a
+    # re-save would be a privilege-widening bug (review PR2-M3).
+    #
+    # BACKLOG #1152 moved which stored value is the wide one. All-channels is now the explicit
+    # ALL_CHANNELS grant; a null scope is "never granted" and denies, the same as []. Both null and
+    # [] therefore land on "none" — they differ only in whether anyone has touched the field, which
+    # is a provenance question the audit log answers and this form must not pretend to.
+    stored = user.channel_scope
+    listed = [c for c in (stored or []) if c != ALL_CHANNELS]
+    if stored is not None and ALL_CHANNELS in stored:
+        scope_mode = "all"
+    elif listed:
+        scope_mode = "list"
+    else:
+        scope_mode = "none"
     mode_options = [
         el("option", label, value=value, selected=value == scope_mode or None)
         for value, label in (
@@ -212,7 +238,13 @@ def user_detail_page(
         el(
             "label",
             "Allowed connections (one per line)",
-            el("textarea", "\n".join(user.channel_scope or []), name="channels", rows=4),
+            el("textarea", "\n".join(listed), name="channels", rows=4),
+        ),
+        el(
+            "p",
+            "A new account starts with no channels and sees an empty console until you grant "
+            "some. Administrators reach every channel regardless of this setting.",
+            class_="muted",
         ),
         el("button", "Save channel scope", type="submit"),
         method="post",

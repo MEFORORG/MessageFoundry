@@ -17,6 +17,7 @@ import pytest
 
 from messagefoundry.api import create_app
 from messagefoundry.auth import Role
+from messagefoundry.auth.identity import ALL_CHANNELS
 from messagefoundry.auth.service import AuthService
 from messagefoundry.config.models import ConnectorType
 from messagefoundry.config.settings import AuthSettings
@@ -241,9 +242,12 @@ async def test_event_info_carries_no_phi_field(engine: Engine) -> None:
         assert closed["reason"] == "eof"
 
 
-async def test_unscoped_operator_sees_full_estate(engine: Engine) -> None:
+async def test_all_channels_operator_sees_full_estate(engine: Engine) -> None:
     service = await _service(engine)
-    await _add(service, "op", Role.OPERATOR)  # no scope → NULL → all channels
+    uid = await _add(service, "op", Role.OPERATOR)
+    # BACKLOG #1152: an unset scope now denies, so the estate-wide operator this test is about is
+    # created by an EXPLICIT '*' grant rather than by saying nothing.
+    await service.set_channel_scope(uid, [ALL_CHANNELS], actor="admin")
     async with _client(engine, service) as c:
         h = await _login(c, "op")
         chans = (await c.get("/channels", headers=h)).json()

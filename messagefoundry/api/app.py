@@ -3944,9 +3944,14 @@ def create_app(
         ``objectSid``. Closing it means binding AD to a directory-immutable id the way OIDC binds
         ``(issuer, sub)`` — tracked as BACKLOG #1143, not solvable inside this function.
 
-        The channel axis is deliberately NOT used: ``Identity.allowed_channels`` defaults to ``None``
-        (= every channel) and an uploaded file carries no channel at all, so a channel-scoped rule
-        would protect nobody on a default install and would deny every scoped operator their own file.
+        The channel axis is deliberately NOT used, and ONE of its two original reasons has since
+        expired. The surviving one is decisive on its own: an uploaded file carries no channel at
+        all — it is decoupled from every connection by construction — so a channel-scoped rule has
+        nothing to match on and would deny every scoped operator their own file. The expired one was
+        that ``Identity.allowed_channels`` defaulted to ``None`` (= every channel), which would have
+        made such a rule protect nobody on a default install; BACKLOG #1152 flipped that default to
+        deny. Recorded rather than deleted, because a reader who remembers only the expired half
+        would think the owner-ratified decision (ADR 0134 Amendment A) had lost its ground.
 
         FAIL CLOSED on a sidecar with no ``uploader_id``. ``save()`` refuses to write one, but the
         tolerant loader yields ``""`` for a sidecar missing the key (a hand-placed one under the no-key
