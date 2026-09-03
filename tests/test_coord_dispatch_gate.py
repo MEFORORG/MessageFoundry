@@ -334,3 +334,288 @@ def test_the_gated_verdicts_are_a_subset_of_the_closed_vocabulary(gate: ModuleTy
         f"GATED_VERDICTS has a value the ledger vocabulary does not know: "
         f"{set(gate.GATED_VERDICTS) - set(checker._VERDICTS)}"
     )
+
+
+# ------------------------------------------ retirement in place (BACKLOG #1334, the third limb)
+#
+# THE LEDGER RETIRES AN ITEM IN PLACE: the number is kept -- commits and mail already cite it -- and
+# the banner and the fields stay exactly as filed. Every field `judge()` reads therefore still says
+# buildable, and the retirement is prose in the body, which nothing was reading.
+#
+# Measured on `origin/main` at 3760a93b, before this limb: #1332 declares "RETIRED THE HOUR IT WAS
+# FILED ... SHOULD NOT BE BUILT" as its first body line and graded `ok`, with a note BYTE-IDENTICAL
+# to the one an ordinary build item gets. #1309 and #1311 graded `advise` for their closing act.
+# Not one of the three notes said the word.
+#
+# THE FIXTURES BELOW OWN THE PROPERTY UNDER TEST rather than borrowing it from a file other people
+# edit -- the correction the undeclared-item fixtures above record. The live-ledger arm is separate
+# and comes last, because a detector proven only against its own fixtures is indistinguishable from
+# one that fires on nothing real.
+
+_RETIRED_BODY = (
+    "## 4242. Scope the widget to the caller's allowed_channels\n"
+    "\n"
+    "**RETIRED THE HOUR IT WAS FILED -- THIS IS A DUPLICATE OF `#1152` AND SHOULD NOT BE BUILT. The\n"
+    "number is kept, retired in place, because commits and mail already cite it.**\n"
+    "\n"
+    "**Everything below is superseded. Read `#1152`.**\n"
+)
+
+_PLAIN_BODY = (
+    "## 4243. Scope the widget to the caller's allowed_channels\n"
+    "\n"
+    "**Cluster:** api. **Priority:** P2. `render_metrics(engine)` takes no identity, so nothing\n"
+    "downstream can scope it. The fix passes the caller's identity in.\n"
+)
+
+_WITHDRAWN_HEADING_BODY = (
+    "## 4244. WITHDRAWN -- duplicate of #1310, same defect, same sites, same fix\n"
+    "\n"
+    "**READ `#1310` INSTEAD.** It carries the same finding and was written first.\n"
+)
+
+# THE FALSE-POSITIVE FIXTURE, and it is a real row rather than an invention. #1334 is the item that
+# DOCUMENTS the retirement convention, and its table lists the retired rows by number. A bare-word
+# detector flags it -- and so does the "retired in place adjacent to a duplicate-of" needle that was
+# proposed for this limb and measured out. Either would stop the row that describes the rule.
+_DOCUMENTS_THE_CONVENTION_BODY = (
+    "## 4245. The dispatch gate green-lights the verdicts that mean do not just build it\n"
+    "\n"
+    "An item retired in place keeps its number, its banner and its fields -- that is the established\n"
+    "convention, so the ledger is right and the gate is not reading enough:\n"
+    "\n"
+    "| item | state | fields | gate says |\n"
+    "| `#1332` | **retired in place**, duplicate of `#1086` | `build` / `code` | ***`ok`*** |\n"
+)
+
+_BUILDABLE = {"closing-act": "code", "verdict": "build", "research": "none"}
+
+
+def test_a_retired_item_is_not_graded_like_a_live_one(gate: ModuleType) -> None:
+    """THE DISCRIMINATION. Identical fields, identical call -- only the body differs.
+
+    Before this limb both calls returned the same level AND the same note, byte for byte: "closes by
+    'code', performed by the builder writes it; the LANDER flips the banner on merge". A dispatcher
+    reading that about #1332 is told to build an item whose first body line says it must not be.
+    """
+    retired_level, retired_note = gate.judge(_item(gate, **_BUILDABLE), body=_RETIRED_BODY)
+    plain_level, plain_note = gate.judge(_item(gate, **_BUILDABLE), body=_PLAIN_BODY)
+
+    assert retired_note != plain_note, (
+        "same fields, different bodies, identical note -- judge() is not reading the body at all"
+    )
+    assert "RETIRED IN PLACE" in retired_note
+    assert "RETIRED" not in plain_note
+    assert retired_level == "advise"
+    # The opposite direction, and it has to be asserted here rather than trusted: a limb that
+    # advised every item would satisfy every assertion above it.
+    assert plain_level == "ok"
+
+
+def test_a_withdrawn_heading_is_a_retirement(gate: ModuleType) -> None:
+    """#1311's shape, which the body needle MISSES -- it never says "should not be built".
+
+    One measured form, one whole retired row. Dropping it loses the item entirely.
+    """
+    level, note = gate.judge(_item(gate, **_BUILDABLE), body=_WITHDRAWN_HEADING_BODY)
+    assert level == "advise"
+    assert "RETIRED IN PLACE" in note
+    assert "WITHDRAWN" in note, "the note must QUOTE what fired, so a reader can check the claim"
+
+
+def test_prose_that_documents_the_convention_is_not_a_retirement(gate: ModuleType) -> None:
+    """The landmine `verdict_divergence_check.py` records, in this limb's own vocabulary.
+
+    Writing the convention into an item body makes that item look governed by it. A detector that
+    flags correct prose is not noisy, it is wrong -- and this particular false positive would stop
+    the row that documents the rule.
+    """
+    level, note = gate.judge(_item(gate, **_BUILDABLE), body=_DOCUMENTS_THE_CONVENTION_BODY)
+    assert level == "ok"
+    assert "RETIRED IN PLACE" not in note
+
+
+def test_the_retirement_note_leads(gate: ModuleType) -> None:
+    """Ordering, pinned rather than left to a comment -- the same reason the gated note is pinned.
+
+    The gated-verdict note says scoping and research are legitimate; the closing-act note ends "That
+    is a complete outcome, not a failure". Either one, read first, tells a seat there is work to
+    start here. On a retired row there is none.
+    """
+    _, note = gate.judge(
+        _item(gate, **{"closing-act": "owner-ruling", "verdict": "demand-gate"}),
+        body=_RETIRED_BODY,
+    )
+    assert "RETIRED IN PLACE" in note
+    assert "DO NOT JUST BUILD IT" in note, "precondition: both notes present, or there is no order"
+    assert "complete outcome" in note, "precondition: the closing-act note is present too"
+    assert note.index("RETIRED IN PLACE") < note.index("DO NOT JUST BUILD IT")
+    assert note.index("RETIRED IN PLACE") < note.index("complete outcome")
+
+
+def test_an_item_that_declares_nothing_is_still_told_it_is_retired(gate: ModuleType) -> None:
+    """Refuse still wins the LEVEL -- the dispatch can name nothing -- but not the whole message.
+
+    Without this the reader of a retired, undeclared row is told to go and add three banner lines to
+    an item that must not be built. The level is unchanged; the first sentence is not.
+    """
+    level, note = gate.judge(_item(gate), body=_RETIRED_BODY)
+    assert level == "refuse"
+    assert "missing:" in note, "the refusal must still enumerate what to add"
+    assert note.startswith("RETIRED IN PLACE")
+
+
+def test_no_body_returns_todays_answer(gate: ModuleType) -> None:
+    """The default is EMPTY, and that default is the honest failure mode: no body, no claim.
+
+    It is also what keeps every test above this section meaningful -- they all call `judge()` with
+    one argument, and so do the nine self-test cases.
+    """
+    assert gate.judge(_item(gate, **_BUILDABLE)) == gate.judge(_item(gate, **_BUILDABLE), body="")
+    level, note = gate.judge(_item(gate, **_BUILDABLE))
+    assert level == "ok"
+    assert "RETIRED" not in note
+
+
+# ---------------------------------------------------------------------------- the live-ledger arm
+#
+# Measured on `origin/main` at 3760a93b: 620 items across the two ledger files, 247 of them open.
+# These three are retired or withdrawn IN PLACE and all three dispatched clean before this limb.
+#
+# WHEN THIS GOES RED, RE-MEASURE -- do not delete the number. A row moving to the archive is fine:
+# both files are read as one namespace, exactly as the dispatch reads them. What this catches is the
+# retirement WORDING drifting out from under the needles, and that is a real miss, not a test fault.
+_RETIRED_ROWS = {1309, 1311, 1332}
+
+# Rows that must NOT fire, each a different trap, each measured:
+#   #1022  "THE 2026-08-15 DO-NOT-BUILD BANNER IS RETIRED" -- a BANNER was retired, not the item
+#   #340   "HALF B MUST NOT BE BUILT SPECULATIVELY" -- a scope carve-out inside a live item
+#   #1334  the row that DOCUMENTS the convention and lists the retired rows by number
+#   #1342  prose about a lane building what the ledger says in prose must not be built
+#   #1343  prose about a fix that must not be built without measurement
+#   #1086  the item #1332 tells builders to build INSTEAD -- stopping it is the worst false positive
+_MUST_NOT_FIRE = {340, 1022, 1086, 1334, 1342, 1343}
+
+
+def test_every_retired_row_in_the_live_ledger_is_named(gate: ModuleType) -> None:
+    """Non-vacuity. A needle proven only on fixtures fires on nothing real and looks identical."""
+    rows = gate.load_ledger(_ROOT)
+    assert len(rows) >= gate.MIN_ITEMS, (
+        f"instrument: parsed {len(rows)} items from {_ROOT}, below the gate's own floor of "
+        f"{gate.MIN_ITEMS}. The ledger did not resolve, so nothing below is evidence."
+    )
+    absent = _RETIRED_ROWS - set(rows)
+    assert not absent, f"the ledger no longer carries {sorted(absent)} -- re-measure this test"
+
+    for num in sorted(_RETIRED_ROWS):
+        level, note = gate.judge(rows[num].item, body=rows[num].body)
+        assert "RETIRED IN PLACE" in note, f"#{num} dispatches without its retirement named: {note}"
+        # #1309 and #1311 already reached `advise` by another route, and that is the point: the
+        # level was right and the REASON was about who closes them, not about not building them.
+        assert level == "advise", f"#{num}: {level}"
+
+
+def test_the_needles_do_not_fire_on_correct_prose(gate: ModuleType) -> None:
+    """The over-fire arm, with the denominator, because a clean run otherwise reads as coverage."""
+    rows = gate.load_ledger(_ROOT)
+    assert len(rows) >= gate.MIN_ITEMS, "instrument: the ledger did not resolve"
+
+    fired = {n for n, row in rows.items() if gate.retirement_marker(row.body) is not None}
+    bare = {n for n, row in rows.items() if "retired" in row.body.lower()}
+
+    hit = _MUST_NOT_FIRE & fired
+    assert not hit, f"fired on correct prose: {sorted(hit)}"
+    # THE DENOMINATOR IS PART OF THE RESULT. Measured at 2b8bccb43: 49 bodies mention the bare word
+    # and 3 declare a retirement. If those two numbers converge, the corpus has stopped containing
+    # the landmine and a bare-word detector would pass this file -- which is the wrong needle.
+    assert len(fired) * 3 < len(bare), (
+        f"the narrowing is not exercised: {len(bare)} bodies carry the bare word and {len(fired)} "
+        f"fired. Close numbers mean this file no longer proves the needle is narrow."
+    )
+
+
+# ----------------------------------------------- the banner block is somebody else's prose
+#
+# THE LIMB SHIPPED LATE AND THE CORPUS MOVED UNDER IT. It was written against `main` at 3760a93b.
+# By 2b8bccb43 the 2026-09-03 scoring pass had added a summary blockquote to every unscored row, and
+# #1334's summary quotes the retirement wording of the rows #1334 documents -- "three open rows are
+# retired in place ... and should not be built", inside the 160-character window the body needle
+# allows. The live arm above went red naming #1334: the worst false positive available, because a
+# reader stopped by the row that DESCRIBES the convention never reaches the rows it describes.
+#
+# The fix reads the item's prose and not its banner block, and the fixtures below OWN that property
+# rather than borrowing it from #1334, whose wording is somebody else's to edit. Narrowing a needle
+# by shrinking that window would have passed the arm above and pinned nothing.
+
+_BANNER_QUOTES_A_RETIREMENT = (
+    "## 4246. The dispatch gate green-lights the verdicts that mean do not just build it\n"
+    "\n"
+    f"{_OPEN} **Filed 2026-08-23 - not started.** The gate names the closing act and says nothing\n"
+    "> about whether the item should be started at all.\n"
+    ">\n"
+    "> **Scored 2026-09-03 -> P1.** I ran the limb's own needles over the ledger at HEAD -- three\n"
+    "> open rows are RETIRED in place (#1309, #1311, #1332) and the gate grades #1332 ok, the row\n"
+    "> whose body says it is a duplicate of #1086 and should not be built.\n"
+    "> Verdict: build\n"
+    "> Closing-act: code\n"
+    "\n"
+    "**Cluster:** coord. The gate reads three banner fields and stops there.\n"
+)
+
+_PROSE_DECLARES_A_RETIREMENT = (
+    "## 4247. Scope the widget to the caller's allowed_channels\n"
+    "\n"
+    f"{_OPEN} **Filed 2026-08-23 - not started.** `render_metrics(engine)` takes no identity.\n"
+    "> Verdict: build\n"
+    "> Closing-act: code\n"
+    "\n"
+    "**RETIRED THE HOUR IT WAS FILED -- THIS IS A DUPLICATE OF `#1152` AND SHOULD NOT BE BUILT. The\n"
+    "number is kept, retired in place, because commits and mail already cite it.**\n"
+)
+
+
+def _mini_ledger(tmp_path: Path, *items: str) -> Path:
+    """A ledger root holding just these items, so the arms below own what they assert."""
+    published = tmp_path / "docs" / "BACKLOG.md"
+    published.parent.mkdir(parents=True, exist_ok=True)
+    published.write_text("# Backlog\n\n" + "\n".join(items), encoding="utf-8")
+    return tmp_path
+
+
+def test_a_scoring_summary_in_the_banner_is_not_this_items_retirement(
+    gate: ModuleType, tmp_path: Path
+) -> None:
+    """A banner is what a machine writes ABOUT a row, and it quotes other rows verbatim.
+
+    Both fixtures carry the same words. Only the one that declares them in its own prose is retired.
+    """
+    rows = gate.load_ledger(
+        _mini_ledger(tmp_path, _BANNER_QUOTES_A_RETIREMENT, _PROSE_DECLARES_A_RETIREMENT)
+    )
+    assert set(rows) == {4246, 4247}, "instrument: the mini ledger did not parse"
+
+    assert gate.retirement_marker(rows[4246].body) is None, (
+        "the row whose BANNER quotes a retirement was graded as retired itself"
+    )
+    # The must-fire half, in the same call, because a loader that returned empty bodies would
+    # satisfy the assertion above and nothing else here would notice.
+    assert gate.retirement_marker(rows[4247].body) is not None
+    assert gate.judge(rows[4246].item, body=rows[4246].body)[0] == "ok"
+    assert gate.judge(rows[4247].item, body=rows[4247].body)[0] == "advise"
+
+
+def test_the_body_keeps_the_heading_and_drops_only_the_banner(
+    gate: ModuleType, tmp_path: Path
+) -> None:
+    """The heading STAYS: #1311 declares its withdrawal there and nowhere else.
+
+    Dropping the banner by taking everything after the first blank line would take the heading too,
+    and #1311 would go undetected while every arm above this one stayed green.
+    """
+    rows = gate.load_ledger(_mini_ledger(tmp_path, _BANNER_QUOTES_A_RETIREMENT))
+    body = rows[4246].body
+
+    assert body.startswith("## 4246."), "the heading is the one line #1311's needle reads"
+    assert "Cluster:" in body, "the item's own prose must survive"
+    assert "Scored 2026-09-03" not in body, "the banner block is still being read"
+    assert "Verdict: build" not in body, "the fields belong to parse_items, not to the needles"

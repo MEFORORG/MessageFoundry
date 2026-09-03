@@ -27,6 +27,12 @@ that defines item status (``backlog_status_check.parse_items``), never a second 
     > Research: none | done <date>
     > Closing-act: code | scorecard-rescore | owner-ruling | banner-only
 
+It also reads the item's **heading and prose** for a retirement declaration, because the ledger
+retires an item **in place**: the number is kept, the banner and the fields stay exactly as filed,
+and the retirement is prose. Every field above therefore still says buildable on a row that must not
+be built. The banner block itself is excluded from that read -- it is where a machine writes ABOUT
+the item, including a scoring summary that quotes the retirement wording of other rows.
+
 **IT NAMES THE CLOSING ACT. IT DOES NOT REFUSE THE ITEM.** That is a correction to this tool's first
 version, and the correction matters more than the tool. That version refused any closing act a
 builder could not perform. Measured against the very range it was built for, it would have blocked
@@ -60,8 +66,10 @@ Exit 0 only when EVERY named item is dispatchable. Exit 1 otherwise, listing eac
 from __future__ import annotations
 
 import argparse
+import re
 import sys
 from pathlib import Path
+from typing import NamedTuple
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "docs"))
 
@@ -119,20 +127,117 @@ GATED_VERDICTS = {
 }
 
 
-def load_items(root: Path) -> dict[int, Item]:
-    """Every item across the ledger namespace, keyed by number."""
-    out: dict[int, Item] = {}
+# RETIREMENT IS PROSE, NOT A FIELD, AND THAT IS WHY NOTHING WAS READING IT (BACKLOG #1334).
+#
+# The ledger retires an item IN PLACE: the number is kept -- commits and mail already cite it -- and
+# the banner and the fields stay exactly as filed. So every field this gate reads still says
+# buildable on a row whose first body line says it must not be built. Measured on `main` at
+# 3760a93b, before this limb: #1332 graded ``ok`` with a note BYTE-IDENTICAL to an ordinary build
+# item's, and #1309 and #1311 graded ``advise`` for their closing act. None of the three notes said
+# the word. Three rows, all dispatchable, all retired.
+#
+# WHICH WAY THIS ERRS, ON PURPOSE. A MISSED retirement green-lights an item the ledger says must not
+# be built -- the whole failure this limb exists to stop, and what happened to #1332. A false STOP
+# costs a reader one minute of reading the body. So the needles match a DECLARATION about this item
+# and never a bare word, and where the two errors trade off, the miss is the expensive one.
+#
+# THE BARE WORD IS NOT A CANDIDATE: it appears in 49 of the 657 bodies read this way, including
+# #1086 -- the item #1332's own body tells builders to build INSTEAD.
+#
+# WHAT THE NEEDLES READ IS THE ITEM'S PROSE, NOT ITS BANNER BLOCK, AND THAT SPLIT IS MEASURED RATHER
+# THAN TIDY. The banner block is where a machine writes ABOUT the item: the status glyph, the three
+# dispatch fields, and since the 2026-09-03 scoring pass a summary paragraph per row. That pass wrote
+# into #1334's banner a sentence quoting the very rows #1334 documents -- "three open rows are
+# retired in place ... and should not be built" -- and the body needle fired on it. So on `main` at
+# 2b8bccb43 the limb flagged #1334, the row that DOCUMENTS the convention and is the worst false
+# positive available, because a reader who stops there never reaches the rows that are actually
+# retired. Reading prose only, the same corpus fires on #1309, #1311 and #1332 and on nothing else,
+# and no row anywhere fires from its banner alone -- so the split costs no detection today.
+#
+#: The declaration, in the body: retired, and therefore not to be built. Newline-tolerant because
+#: the ledger hard-wraps at ~100 columns and #1332's declaration already wraps mid-sentence.
+_RETIRED_DECLARATION = re.compile(
+    r"RETIRED\b[\s\S]{0,160}?(?:SHOULD|MUST)\s+NOT\s+BE\s+BUILT", re.I
+)
+
+#: The declaration, in the heading: `## 1311. WITHDRAWN -- duplicate of #1310`. #1311's body never
+#: says "should not be built", so the needle above MISSES it entirely -- one form, one whole row.
+_RETIRED_HEADING = re.compile(
+    r"^##\s+\d+\.\s*\**\s*(?:WITHDRAWN|RETIRED|SUPERSEDED)\b", re.I | re.M
+)
+
+# A THIRD NEEDLE WAS PROPOSED FOR THIS LIMB AND MEASURED OUT: "retired in place" adjacent to a
+# duplicate-of declaration. Over the ledger namespace it fires on #1309, #1332 -- and #1334, the
+# row that DOCUMENTS the convention and lists the other two by number. That is exactly the landmine
+# `verdict_divergence_check.py` records in its own docstring: the migration that writes a vocabulary
+# into an item body makes that item look governed by it. A detector that flags correct prose is not
+# noisy, it is wrong. The two needles above carry all three retired rows without it.
+
+
+def retirement_marker(body: str) -> str | None:
+    """The declaration text if ``body`` retires this item, else ``None``.
+
+    ``body`` is the item's heading and its own prose. ``load_ledger`` drops the banner block before
+    calling this, because a banner is what a machine writes ABOUT an item and it quotes other rows.
+
+    Returns WHAT FIRED, whitespace-collapsed and clipped, so the note can quote it and a reader can
+    check the claim instead of taking the gate's word for it.
+    """
+    for pattern in (_RETIRED_HEADING, _RETIRED_DECLARATION):
+        found = pattern.search(body)
+        if found is not None:
+            return " ".join(found.group(0).split())[:140]
+    return None
+
+
+class Row(NamedTuple):
+    """One ledger item, and its heading plus its own prose with the banner block removed."""
+
+    item: Item
+    body: str
+
+
+def load_ledger(root: Path) -> dict[int, Row]:
+    """Every item across the ledger namespace, with its body, keyed by number.
+
+    **The body comes from the SAME read as the status, and the pairing is why this replaced a
+    status-only loader.** A second pass for bodies could come back empty -- a renamed file, a
+    narrowed source list -- while the item count, the levels and every printed total stayed exactly
+    right, and the retirement limb would simply be off with nothing reporting it. Here an empty
+    result is an empty result: the MIN_ITEMS floor in ``main`` already refuses to report on one.
+
+    **The banner block is dropped and the heading is kept, which is not a tidy-up.** A banner is
+    what a machine writes ABOUT an item -- the status glyph, the three dispatch fields, and a
+    scoring summary that quotes the rows it describes -- so a needle reading it grades an item on
+    somebody else's prose. The heading stays because #1311 declares its withdrawal there and
+    nowhere else. ``Item.body_line`` supplies the boundary; deriving it here would put a second
+    definition of the banner block beside the parser that owns it.
+    """
+    out: dict[int, Row] = {}
+    heading = re.compile(r"^## \d+\.\s")
     for src in DEFAULT_SOURCES:
         path = root / src
         if not path.is_file():
             continue
-        for item in parse_items(path.read_text(encoding="utf-8", errors="replace")):
-            out[item.num] = item
+        text = path.read_text(encoding="utf-8", errors="replace")
+        lines = text.splitlines()
+        for item in parse_items(text):
+            end = len(lines)
+            for k in range(item.line, len(lines)):
+                if heading.match(lines[k]):
+                    end = k
+                    break
+            prose = lines[min(item.body_line - 1, end) : end]
+            out[item.num] = Row(item, "\n".join([lines[item.line - 1], *prose]))
     return out
 
 
-def judge(item: Item) -> tuple[str, str]:
+def judge(item: Item, body: str = "") -> tuple[str, str]:
     """Return (level, note). Levels: ``ok``, ``advise``, ``refuse``.
+
+    ``body`` is the item's prose, and it DEFAULTS TO EMPTY on purpose: a caller with no body gets
+    exactly the answer this function gave before the retirement limb existed, rather than a
+    retirement claim derived from a body nobody read. No body, no claim.
 
     **This ADVISES by default and refuses almost nothing, which is a correction.** The first version
     returned a boolean and refused any closing act a builder could not perform. Measured against the
@@ -153,14 +258,39 @@ def judge(item: Item) -> tuple[str, str]:
     verdict = item.fields.get("verdict", "").strip().lower()
     research = item.fields.get("research", "").strip().lower()
 
+    # THE ONE CONSULT. Everything below reads this variable, so the mutation that turns this limb off
+    # is a single line and every retirement test dies with it.
+    retired = retirement_marker(body)
+    retired_note = (
+        ""
+        if retired is None
+        else (
+            f'RETIRED IN PLACE -- DO NOT BUILD IT. The body declares: "{retired}". The number is '
+            f"kept, so the banner and every field this gate reads still describe a live item; the "
+            f"retirement is prose. Read the item this one names instead."
+        )
+    )
+
     if not act:
         missing = [k for k in ("verdict", "research", "closing-act") if k not in item.fields]
-        return "refuse", (
+        # REFUSE STILL WINS THE LEVEL -- the dispatch can name nothing here -- but not the whole
+        # message. Without the lead, the reader of a retired undeclared row is sent to add three
+        # banner lines to an item that must not be built at all.
+        undeclared = (
             f"declares no Closing-act (missing: {', '.join(missing)}). The dispatch cannot tell the "
             f"seat what would close this, or who closes it. Add the three lines to the banner."
         )
+        return "refuse", f"{retired_note} {undeclared}" if retired_note else undeclared
 
     notes: list[str] = []
+
+    # THE RETIREMENT LEADS, ahead of the gated-verdict note that leads for the same reason. Both of
+    # the notes below tell a reader there is work to start: the gated one says scoping and research
+    # are legitimate, and the closing-act one ends "That is a complete outcome, not a failure". On a
+    # retired row there is no work to start, and the row it points at is where the work is.
+    # test_the_retirement_note_leads pins the order, because a comment cannot.
+    if retired_note:
+        notes.append(retired_note)
 
     # THIS BRANCH GOES FIRST, and the order is load-bearing rather than cosmetic. The closing-act
     # note below ends "That is a complete outcome, not a failure." Left to lead, it tells the reader
@@ -200,10 +330,25 @@ def _self_test() -> int:
         it.fields.update(fields)
         return it
 
-    cases: list[tuple[dict[str, str], str, str]] = [
-        ({}, "refuse", "an item declaring nothing has nothing to name"),
+    # A RETIRED BODY, WORDED AS THE LEDGER WORDS IT. #1332's declaration, with the number changed.
+    retired_body = (
+        "## 4242. Scope the widget to the caller's allowed_channels\n\n"
+        "**RETIRED THE HOUR IT WAS FILED -- THIS IS A DUPLICATE OF `#1152` AND SHOULD NOT BE BUILT.\n"
+        "The number is kept, retired in place, because commits and mail already cite it.**\n"
+    )
+    withdrawn_body = "## 4244. WITHDRAWN -- duplicate of #1310, same defect, same fix\n"
+    # The row that DOCUMENTS the convention. A bare-word needle stops it; these needles must not.
+    documents_body = (
+        "## 4245. The gate green-lights the verdicts that mean do not just build it\n\n"
+        "An item retired in place keeps its number, its banner and its fields -- the established\n"
+        "convention. | `#1332` | **retired in place**, duplicate of `#1086` | `build` / `code` |\n"
+    )
+
+    cases: list[tuple[dict[str, str], str, str, str]] = [
+        ({}, "", "refuse", "an item declaring nothing has nothing to name"),
         (
             {"closing-act": "code", "verdict": "build", "research": "none"},
+            "",
             "ok",
             "a build item the seat can close itself",
         ),
@@ -213,44 +358,72 @@ def _self_test() -> int:
                 "verdict": "research",
                 "research": "done 2026-08-20",
             },
+            "",
             "advise",
             "THE WAVE SHAPE IS WORKABLE AND MUST BE ADVISED, NEVER REFUSED -- refusing it would "
             "have blocked #1112, #1171 and #1187, all of which reached main",
         ),
         (
             {"closing-act": "code", "verdict": "research", "research": "none"},
+            "",
             "advise",
             "an open research question is a warning to read the body, not a bar to working it",
         ),
         (
             {"closing-act": "code", "verdict": "research", "research": "done 2026-08-20"},
+            "",
             "ok",
             "research done, closing act is code",
         ),
         (
             {"closing-act": "code", "verdict": "demand-gate", "research": "none"},
+            "",
             "advise",
             "a demand gate means the DEMAND is unproven -- shipping the code does not close it",
         ),
         (
             {"closing-act": "code", "verdict": "demand-gate", "research": "done 2026-08-20"},
+            "",
             "advise",
             "THE DISCRIMINATOR: a demand gate is lifted by a RULING, never by finished research, so "
             "mirroring the research branch's guard here would wrongly re-green this",
         ),
         (
             {"closing-act": "code", "verdict": "owner-ruling", "research": "none"},
+            "",
             "advise",
             "an owner-ruling verdict routes the scope question to the owner before anyone builds",
         ),
         (
             {"closing-act": "code", "verdict": "owner-ruling", "research": "done 2026-08-20"},
+            "",
             "advise",
             "DISCRIMINATOR TWIN: research done does not answer a question routed to the owner",
         ),
+        (
+            {"closing-act": "code", "verdict": "build", "research": "none"},
+            retired_body,
+            "advise",
+            "THE RETIREMENT CASE: identical fields to the ok case above, and only the body differs. "
+            "#1332 graded ok here, byte-identical to an ordinary build item",
+        ),
+        (
+            {"closing-act": "code", "verdict": "build", "research": "none"},
+            withdrawn_body,
+            "advise",
+            "#1311's shape: WITHDRAWN in the heading, and its body never says 'not be built', so the "
+            "body needle misses it entirely",
+        ),
+        (
+            {"closing-act": "code", "verdict": "build", "research": "none"},
+            documents_body,
+            "ok",
+            "THE FALSE-POSITIVE TWIN: prose DOCUMENTING the convention is not a retirement, and a "
+            "bare-word needle would stop the row that describes the rule",
+        ),
     ]
-    for fields, want, why in cases:
-        got, reason = judge(mk(fields))
+    for fields, body, want, why in cases:
+        got, reason = judge(mk(fields), body=body)
         if got != want:
             failures.append(f"{why}: wanted {want!r}, got {got!r} ({reason})")
 
@@ -295,7 +468,7 @@ def main(argv: list[str] | None = None) -> int:
     if not wanted:
         ap.error("name at least one item, or a --range, or pass --self-test")
 
-    items = load_items(args.root)
+    items = load_ledger(args.root)
     if len(items) < MIN_ITEMS:
         print(
             f"INSTRUMENT ERROR: parsed {len(items)} items from {args.root}, below the floor of "
@@ -309,11 +482,11 @@ def main(argv: list[str] | None = None) -> int:
     refused: list[tuple[int, str]] = []
     unknown: list[int] = []
     for num in sorted(set(wanted)):
-        item = items.get(num)
-        if item is None:
+        row = items.get(num)
+        if row is None:
             unknown.append(num)
             continue
-        level, note = judge(item)
+        level, note = judge(row.item, body=row.body)
         # Explicit dispatch on the level. The first version did `if good` on judge()'s return, and
         # when judge started returning a LEVEL STRING every level became truthy -- an undeclared
         # item reported as dispatchable. A truthiness test over a widened return type is exactly the
