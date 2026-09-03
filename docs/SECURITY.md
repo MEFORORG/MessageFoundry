@@ -2036,9 +2036,10 @@ gh api -X POST repos/MEFORORG/MessageFoundry/rulesets -f name='block-private-doc
 -> 422  "Source public repos cannot have push rules"
 ```
 
-`enforce_admins` is not a substitute, and it is a separate question with its own merits. It governs
-protected branches, so it never sees an ordinary feature branch, and a feature branch is the ref a
-leak rides on. It is enabled today; `.github/required-contexts.txt` carries the reading.
+`enforce_admins` is not a substitute, whether or not it is enabled. It governs protected branches, so
+it never sees an ordinary feature branch, and a feature branch is the ref a leak rides on. It is a
+separate control with its own merits, and it does not answer this question. Read branch protection
+directly if you need its current state; this document does not track it.
 
 **What stands, and where each layer stops.** Read this as a floor rather than a full list. At least
 these limits hold, and a reader should assume there are others:
