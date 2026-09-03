@@ -21997,3 +21997,94 @@ So `test_the_script_prefers_its_own_repo_over_an_earlier_path_entry` supplies th
 **Verification:** 8 passed in `tests/test_webconsole_seam_snapshot.py`. Mutation check run rather than argued -- with the `sys.path.insert` line deleted, the decoy test reds naming the decoy import, and the by-path digest test **stays green**, which is the luck described above measured rather than predicted. Anchor restored, 8 passed again.
 
 **Adjacent and NOT fixed here, named rather than numbered.** `docs/WEBCONSOLE-PACKAGE.md`'s seam-refresh procedure is stale in three steps left behind by #1220: it says to bump `ENGINE_UI_SEAM` by hand (`1` to `2`) when the value is a derived digest, it says to update curated lists in this script that #1220 retired, and its step 5 prescribes `python scripts/webconsole_seam_snapshot.py > tests/golden/...`, the shell redirect this script's own docstring forbids because PowerShell's `>` writes UTF-16LE with a BOM into a file the test reads as UTF-8. That is doc drift with its own cause and it wants its own item; folding a documentation rewrite into a `sys.path` fix would make both harder to review.
+## 1436. the leak gate's six-digit rule is a site-code prefix match, not a bare-integer rule, and narrowing it is dead on the true positives
+> 🔢 **Filed 2026-09-03 (worktree-agent-a056e3d1358c919f9) -- adversarial review complete; NO detector change recommended.** Value **3/10** · Difficulty **1/10** · _quick win_. A Builder reported in passing that the leak gate "flags any bare six-digit number as a site code", was blocked over a millisecond timeout constant, rephrased the line and moved on. Nobody had decided whether that was a defect. It was reviewed from both sides on 2026-09-03 and the answer is to leave the detectors alone. What remains is one paragraph of documentation, because the wrong mental model is what will reopen this question.
+>
+> Verdict: build (documentation only)
+> Research: none -- the measurement is in the body
+> Closing-act: docs
+
+**Cluster:** Leak gate / developer experience. **Priority:** P3. **Verdict:** build (small).
+**Severity:** no engine effect, no PHI axis, and **no deployment axis (sec. 0)** -- nothing here reaches shipped code. The measured cost of the gate is roughly one rephrased line per few hundred commits. The measured cost of every narrowing considered is a missed site code.
+
+### RECOMMENDATION: leave it, and the asymmetry settles it
+
+Every narrowing tested lets a realistic site code through, and the friction it would buy back is close to zero because the gate as configured **flags nothing on the tracked tree today**. There is no trade to make. The one real defect is a documentation gap: the Builder's model of the rule was wrong in both directions, nothing on the commit path corrects it, and a wrong model is what turns a rare, correct refusal into a standing proposal to weaken a control.
+
+### The rule the Builder described does not exist. There are two rules, and neither is "any bare six-digit number"
+
+| detector | where | fires on a bare six-digit integer? |
+|---|---|---|
+| `_ESTATE_ID_SHAPE` | [`scan_forbidden.py:233`](../scripts/security/scan_forbidden.py), reason at `:247` | **No.** The run must be welded to a letter-bearing segment by an underscore. Structural, always on, no token source needed. |
+| `_SITE_CODE_FILE` | built at [`scan_forbidden.py:679`](../scripts/security/scan_forbidden.py), reason `site code` emitted at `:1018` | **Only when its leading digits are one of the loaded `[site_prefix]` values.** The prefix is the secret and is never committed. |
+
+`_SITE_CODE_FILE` is `(?<![A-Za-z0-9.])(?:PREFIX)\d{4}(?![A-Za-z0-9.])`. A **two-digit** prefix therefore matches a delimited run of exactly six digits -- which is what a reader who cannot see the token list experiences as "any six-digit number". It is not: it is two of the ninety possible two-digit leading pairs. CI's floor in [`security.yml`](../.github/workflows/security.yml) pins `site_prefixes=2`, so two is what loads.
+
+Both paths were separated on one probe file, reasons-only, on 2026-09-03:
+
+```
+MEFOR_FORBIDDEN_TOKENS="" python scripts/security/scan_forbidden.py --path <probe>
+```
+
+With **no token source**, a six-digit millisecond constant written `timeout_ms = <n>` is clean, the same constant in prose is clean, and a byte count in a shell line is clean. Only the four underscore-joined forms hit -- `PT_<code>_ADT`, `IB_ACME_<code>.py`, `MAX_TIMEOUT_<n> = True` and `<n>_ms_budget`. So there **is** a prefix-free false-positive path, and it is narrow: it needs the integer welded into an identifier. With the real list loaded, the plain assignment and the prose line hit as well, because their leading digits happen to match a loaded prefix. That is the block the Builder hit.
+
+### What it protects, from the code rather than from assumption
+
+A site code identifies a real customer site in a ported estate, and the token-keyed detectors are `_NEVER` until the owner adds that estate's prefix -- so the estate nobody has filed yet is exactly the one that leaks. The comment at [`scan_forbidden.py:216`](../scripts/security/scan_forbidden.py) records the case that produced `_ESTATE_ID_SHAPE`: a required merge context exited 0 on a tracked file carrying a real site code, because the file **was** scanned and the loaded detectors simply did not cover that prefix (**#321**). The structural shape is the backstop for that, not a second copy of the same check.
+
+### False positives over the real corpus, at `46ea10a78`
+
+Instrument: the scanner's own `_candidate_files`, `_read_text`, `_is_skipped`, skip sets and allowlist, imported rather than re-derived. **2,038 tracked text files** scanned, 23 binary skipped.
+
+| population | lines | files |
+|---|---|---|
+| bare delimited six-digit runs, ungated | 1,199 | 136 |
+| the same, over the population `_SITE_CODE_FILE` actually sees (site-skip applied) | 379 | 129 |
+| `_ESTATE_ID_SHAPE` | **0** | **0** |
+| **the gate as configured, real token list, whole tracked tree** | **0** | **0** |
+
+That last row is the whole argument, and it is one command: `python scripts/security/scan_forbidden.py` over the tracked tree exits **0** with the real list loaded (`names=8, estate=14, site_prefixes=2`). A gate that flags nothing is not a gate anyone is being trained to route around.
+
+**The two populations are different questions and must not be quoted for each other.** The 1,199 figure is ungated; the 379 figure has the site-skip applied, which is what `_SITE_CODE_FILE` sees and `_ESTATE_ID_SHAPE` deliberately does not. The scanner's own comment at `:204` quotes 1,414 across 152 files for the ungated population at an earlier commit -- same order, drifted down; it is stale rather than wrong.
+
+**Positive control.** The same sweep carried a nonsense token that returned 0 everywhere, while the width-5, width-6 and width-7 arms returned 1,619, 1,199 and 453 lines from the identical loop. A zero from a broken search would have looked like the estate-shape row; it does not, because the instrument that produced that zero produced four non-zero numbers beside it.
+
+**Cost per hypothetical prefix.** Sweeping all 90 two-digit prefixes rather than looking up the real ones -- so this discloses nothing -- one prefix flags **min 0, median 1, p75 5, p90 15, max 32** lines across 2,038 files. 58 of 90 flag at least one.
+
+### Friction is a rate, and the standing corpus only measures survivors
+
+Over the **350 commits** reachable from `46ea10a78` (shallow clone, deepened for this), reading added lines only:
+
+- **21 of 350 commits (6.0%)** added a line carrying a bare delimited six-digit run anywhere.
+- Per hypothetical two-digit prefix: **median 1 commit blocked in 350, p75 2, max 6.**
+- `_ESTATE_ID_SHAPE` matched an added line in **1 of 350 commits** -- `6c963cac3`, the commit that added the detector's own test fixtures.
+
+So one loaded prefix costs roughly one blocked commit in 350, and the pair roughly one in 175. The Builder drew that card. **A rate that low does not train anyone to route around anything**; the case for narrowing rests on friction that was asserted from a single instance and is not there when measured.
+
+### Every narrowing considered is dead on the true positives
+
+Judged against the pair the gate actually runs (`_SITE_CODE_FILE` **or** `_ESTATE_ID_SHAPE`), because judging either alone answers the adjacent question. True positives were built on the **shipped synthetic prefix** from `scan-tokens.local.txt.example`, so no real value appears anywhere in this work.
+
+| narrowing | true positives missed (of 12) | corpus lines it would clear | verdict |
+|---|---|---|---|
+| require an underscore-joined identifier | 8 -- every bare form: HL7 field, prose, quoted config value, CSV cell, a code alone on a line | -- | **dead** |
+| drop runs whose last four digits are zeros | 3 -- a site code that happens to be round | 6.2% | **dead** |
+| drop runs ending in three or more zeros | 3 -- same | 6.5% | **dead** |
+| require an adjacent identifier, HL7 or quoting character | 4 -- bare in prose, bare on a line, both round-bare | -- | **dead** |
+| **shipped pair, unchanged** | **0** | -- | keep |
+
+The first row is the one that looks most reasonable and is the most clearly wrong: **it re-derives `_ESTATE_ID_SHAPE`, which already ships.** The token-loaded detector exists precisely to add the forms the underscore anchor cannot reach -- a code in an HL7 field, in prose, in a quoted config value. Narrowing it to the anchor would delete its entire reason for existing and leave a second copy of a detector that already matched 0 lines of the tree.
+
+The round-number rows are dead on an assumption worth naming: **that an estate can issue a site code ending in four zeros.** Nothing in the format reserves it, and the exclusion would open a hole of one code in ten thousand per prefix. Whether any real estate has actually issued such a code was not checked, and could not be without reading the token list. If someone later shows that band is unissued, these two rows move from "dead" to "buys 6% of nothing", which is still not worth an under-detection hole in a gate whose filed defect is an unnoticed blind spot.
+
+### The third paths, and which of them is displacement
+
+- **A documented allowlist mechanism already exists** and is the right remedy for a vetted false positive: [`scan-allowlist.txt`](../scripts/security/scan-allowlist.txt), guarded against over-broad entries by `_ALLOWLIST_CANARIES`, and already carrying an entry for exactly this class -- a benchmark task counter that collided with the synthetic site-code guard. Proposing it as new work is displacement.
+- **A per-hit reason naming the loaded set was already declined** by lane ruling under **#322**. Do not re-propose it.
+- **The one thing actually missing** is a short paragraph, in the place a blocked committer looks, saying: a plain integer can be a site-code hit when its leading digits match a loaded prefix; the run banner tells you which detector set is live; the remedy is to rephrase or to add a vetted allowlist line, never to weaken the rule. That text exists today only in `scan-tokens.local.txt.example`, under a heading scoped to *running the synthetic set*, which a maintainer on the real list reads as somebody else's problem. **The scope of this item is moving it to [`CONTRIBUTING.md`](../CONTRIBUTING.md)'s leak-gate section.**
+
+### Two notes on how this review was run
+
+**A `--show-context` run echoed a real token value into a session transcript.** The scanner's own docstring says that flag is never used in CI because a hit means the content is already tracked, so echoing it copies the leak into a public log. It was used once here on a scratch probe file outside the repository, the value reached no tracked file, no commit and no pull request, and every later run in this review was reasons-only. Recorded because a control that is bypassed quietly is worse than one that is bypassed loudly.
+
+**No concrete six-digit value appears in this item, deliberately.** Writing one is the trap **#322** documents: a placeholder built from a loaded prefix is a real hit in tracked content, and nothing warns you before the hook fires.
