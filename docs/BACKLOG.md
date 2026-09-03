@@ -54,6 +54,16 @@ worktree") and the item was re-filed at **#1298**. The gate did its job; the les
 records the claim against **whatever tree it runs in**, so run it from the worktree that will commit.
 Always allocate with `scripts/coord/alloc.ps1`; never pick a number by reading this file.
 
+**#1422 and #1425 are holes, and they share #1297's cause in a form worth naming separately.** Both were
+allocated on 2026-09-03 by a **coordinating session, on a Builder's behalf** -- the claim recorded the
+coordinator's worktree, so the Builder that was supposed to file the item could not commit against the
+number and the ledger gate correctly refused it. #1425's subject was re-filed at **#1426** from the
+Builder's own worktree. The variant matters because it does not look like #1297: the allocating shell's
+working directory was not wrong for the session that ran it, it was wrong for the session that would
+commit, and that mismatch is invisible at allocation time. **A number is allocated by the seat that will
+commit it, in that seat's own worktree, and never handed over** -- `alloc.ps1` carries no transfer verb by
+design ("holes are free, collisions are not"), and the missing transfer path is itself filed as **#1414**.
+
 **If you allocated a backlog number before 2026-07-31T00:31Z, re-check it — the trigger is the
 timestamp, not the value.** That is when the floor fix landed. Any number issued before it came from a
 floor that could not see most of the namespace, so it is suspect **regardless of how low or high it
@@ -19940,3 +19950,117 @@ That is the same `self._lock` the staged-pipeline handoffs take. On a first depl
 **PARTLY CLOSED ALREADY, AND THE CLOSURE SITS IN THE WRONG ARTIFACT.** The full record -- both questions, all eight options, both answers quoted -- is [comment 5515263760 on PR 749](https://github.com/MEFORORG/MessageFoundry/pull/749#issuecomment-5515263760), written 2026-09-02. A pull-request comment is a real improvement on a session transcript, which does not survive its session. It is still not the ADR, and the ADR is what a reader consults. **This limb differs from the first two in shape:** closing it needs no decision about the engine, only the record moved into the artifact people actually read.
 
 **THE GENERAL PROBLEM, stated once so it is not re-derived per incident.** A decision recorded as an outcome plus a delegation is not reviewable. The inputs -- the question, the options, the answer -- are what let a later reader tell a considered call from an arbitrary one, and they are exactly the part that lives in the least durable place.
+
+## 1427. Three residual quote-scanner holes in worktree_gate: an uppercase quoted program spelling, an unknown interpreter's -c payload, and a class of shapes inherited from main
+
+> 🔢 **Filed 2026-09-03 -- not started. NO SCORE.** Value and difficulty belong to a scoring pass with its own calibration; nothing in CI requires a score at filing, as the 2026-09-03 first-score pass above records. Three residual fail-opens in the span scanner of `scripts/hooks/worktree_gate.ps1`, disclosed by the Builder that closed **BACKLOG #1229** in the body of **PR 777** and correctly ruled outside that item's scope. They existed only in a pull-request body, which is the one place nobody reads later. **Two of the three reproduce exactly as reported. The third's CLASS reproduces and its COUNT does not** -- PR 777 wrote "twelve further shapes", and this row refuses that number rather than carrying it forward. Every reading below was taken by driving the shipped hook, with positive controls in the same batch that had to DENY.
+>
+> **SCOPE, neither inflated nor deflated.** `worktree_gate.ps1` is a local maintainer-workstation guardrail against the accidental primary edit. Its own `.SYNOPSIS` declines to be a security boundary in terms: it inspects tool arguments, so a file written from a shell command is not seen at all, and the shared `.git/hooks/pre-commit` is the named backstop. There are zero deployments, so nothing here is a live exposure and no present-tense impact claim about one would be true. What these shapes **would** cost is a session's gated git command reaching the shared primary checkout unremarked, on a maintainer's own box.
+
+**Cluster:** Developer Experience & CI. **Priority:** not assigned -- pending a score. **Verdict:** build.
+**Severity:** no engine axis, no PHI axis, **no deployment axis (sec. 0)**. Guardrail tooling on a maintainer workstation, not shipped engine behaviour.
+
+**Provenance.** [PR 777](https://github.com/MEFORORG/MessageFoundry/pull/777) closed **#1229** and listed these three under *"Residuals, named so the closure is not over-read"*. They are disclosed inside shipped work rather than introduced by it. **This row is a filing, not a fix, and it does not reopen #1229.**
+
+### How every reading below was taken
+
+Measured 2026-09-03 against the gate blob `b194d0a0`, which is **byte-identical to `origin/main`** at `46ea10a78` -- so "inherited from main" needed no second blob and no cross-branch comparison. Two instruments per shape:
+
+1. **VERDICT.** The real hook as a subprocess, a real `PreToolUse` payload on stdin, ALLOW or DENY. Same harness contract as `tests/test_worktree_gate.py`'s `run_gate`.
+2. **MARKER.** The shipped `Get-ScannableSegments` run over the same shape with an **inert marker** standing in for the gated command, reporting whether the marker was present in the INPUT before asking whether it survived -- so a "blanked" reading cannot be an artifact of a marker that was never there. Functions are AST-extracted from the real file, the technique `tests/test_worktree_gate_emitter.py` already uses, never pasted.
+
+**No git command was executed at any point.** The gate only parses a JSON tool payload, and the marker probe only calls a scanner function.
+
+**ONE INSTRUMENT CORRECTION, RECORDED BECAUSE IT READ AS A CLEAN RESULT.** The first marker was a single bare word, and it reported SURVIVES for shapes whose whole mechanism is blanking. The cause is the **#1069** carve-out: a quoted span holding one bare word is deliberately emitted rather than blanked, and its discriminator is whitespace. A single-word marker therefore cannot measure blanking anywhere. Every marker below carries whitespace, and the false reading is named here because it agreed with no hypothesis and looked like evidence.
+
+**THE CONTROLS, and they fired.** Seven, in the same batches:
+
+| control | expect | verdict | marker |
+|---|---|---|---|
+| plain gated command | DENY | DENY | survives |
+| `bash -c` payload | DENY | DENY | survives |
+| `sh -c` payload | DENY | DENY | survives |
+| `python -c` payload | DENY | DENY | survives |
+| unterminated quote -- the fail-CLOSED case | DENY | DENY | survives |
+| lowercase quoted `git.exe` program spelling | DENY | DENY | token survives |
+| quoted commit message -- the FALSE-POSITIVE control | ALLOW | ALLOW | BLANKED |
+
+The last row is what makes a BLANKED reading mean anything: the scanner really does blank ordinary quoted prose, so the gate is not simply denying everything, and the six DENY rows are not a scanner that fires on any input.
+
+### Shape 1 -- the uppercase quoted PROGRAM spelling. REPRODUCED.
+
+`Remove-QuotedSpans` mints a `git` token out of a quoted program path, and that emit is **case-SENSITIVE** by an owner ruling of 2026-08-21. An uppercase leaf therefore blanks wholesale, no verb reaches any rule, and the command allows.
+
+| spelling in the quoted program slot | verdict | program token after blanking |
+|---|---|---|
+| `GIT.EXE` | ALLOW | BLANKED |
+| `Git` | ALLOW | BLANKED |
+| `Git.exe` | ALLOW | BLANKED |
+| `git.exe` -- the control, identical slot | DENY | survives |
+
+So the discriminator is the CASE alone, exactly as reported. This is already pinned in `tests/test_worktree_gate_escaped_quote.py` as a tripwire asserting ALLOW; a tripwire records that a hole is KNOWN, and nothing in the ledger recorded that it is OPEN.
+
+### Shape 2 -- an unknown interpreter's `-c` payload. REPRODUCED.
+
+`Get-FlagOwner` answers whether the program owning a matched `-c` executes its argument, from an allowlist of known interpreter names. An unrecognised name returns `none`, the payload gets no recursion, and it falls through to the blanking as ordinary quoted data. The gate discloses this at the call site as an owner-ruled weakening; what it does not do is give the residual a ledger row.
+
+| program before `-c` | verdict | payload after blanking |
+|---|---|---|
+| `myrunner` | ALLOW | BLANKED |
+| `mysh` | ALLOW | BLANKED |
+| `runner.exe` | ALLOW | BLANKED |
+| `mybash.exe` | ALLOW | BLANKED |
+| `bash` / `sh` / `python` -- controls, identical slot | DENY | survives, as its own scan segment |
+
+The discriminator is the program NAME alone. The same hole covers the two identity cases the gate names and does not close: an **alias**, and a **renamed copy** of a real interpreter.
+
+### Shape 3 -- the class reproduces. THE COUNT OF TWELVE DOES NOT, AND IS NOT CARRIED FORWARD.
+
+PR 777 wrote: *"Twelve further shapes (command substitution, backticks, ANSI-C quoting, concatenated quoting, heredocs, bare program names, the per-line split) are named in the suite as inherited from main."* The suite comment it refers to gives the same seven categories and the same bare count.
+
+**What reproduces.** Eighteen spellings were constructed across the seven categories and driven. Twelve allowed:
+
+| category | spellings driven | allowed | note |
+|---|---|---|---|
+| command substitution | 2 | 1 | only the spelling INSIDE a quoted span; the bare one denies |
+| backticks | 2 | 1 | same asymmetry |
+| ANSI-C quoting | 2 | 2 | the `$` between the flag and the quote defeats the payload-extraction pattern |
+| concatenated quoting | 3 | 3 | an empty quoted pair splits the program token, so no `git` token is minted |
+| bare program names and missed interpreter flags | 5 | 5 | includes the no-flag and `-e` families the gate already names as missed |
+| heredocs | 5 | 0 | see below |
+| the per-line split | 6 | 0 | see below |
+
+The concatenated-quoting mechanism was read directly rather than through a marker, because it is a SPLIT TOKEN and not a blanked span: the scanned text keeps the whole command visible while the token `git` is absent from it, and the unsplit control has the token and denies.
+
+**WHY THE COUNT IS REFUSED EVEN THOUGH IT LANDED ON TWELVE.** Twelve of my eighteen allowed. That is a coincidence of a set I invented, and it cannot be the reported twelve:
+
+1. **Two of the seven named categories produced no hole at all.** Heredocs and the per-line split were given eleven distinct spellings between the two passes and every one DENIED, except a heredoc that WRITES a governed file -- and that ALLOW is the shell-write blind spot the gate's own `.SYNOPSIS` already discloses, which would allow with or without a heredoc. **The gate's own docstring agrees**: it records that a quoted argument spanning lines denies today anyway, because every line of such a span reaches the scanner raw. So my twelve contains no member of two categories the reported twelve is said to span. Different sets.
+2. **At least two of my twelve are doubtful as holes.** `ssh <host> "<gated>"` executes on the remote host, and the gate's own docstring names that shape as one that MUST keep allowing; and a bare ANSI-C word is not a git invocation at all. Counting either as a hole would be wrong.
+3. **I measured verdicts, not executability.** #1229 and PR 777 both held themselves to driving the real binary with a payload that COMPUTES, so an echo-back could not be mistaken for a run. I did not do that for any shape-3 spelling. A shape that allows but cannot execute is not a hole.
+4. **The enumeration is recorded nowhere.** A tree-wide search finds no file listing the twelve individually, and the "lens" PR 777 cites left no artifact (`scripts/quality/lens_coverage.py` is the IDE action lens, an unrelated subject). There is nothing to check the number against.
+
+**So the honest statement is: at least five of the seven named categories carry at least one allowing spelling, and the count of twelve is unconfirmed.** Whoever takes this item should re-derive the census with an instrument that records what it scanned, and should verify execution per spelling before counting anything as a hole.
+
+**TWO DIFFERENT TWELVES SIT IN THIS NEIGHBOURHOOD AND MUST NOT BE FUSED.** `worktree_gate.ps1` records a measured **twelve FALSE DENIES** that a case-insensitive program emit would cost (`cp`, `mv`, `ls`, `rsync`, `find -exec`, `7z`, `echo`, `python --src`, `Copy-Item`, `Move-Item`). The suite records a **twelve inherited FAIL-OPENS**. They point in opposite directions, they attach to adjacent parts of the same file, and shape 1's remedy is priced against the first while shape 3 is the second.
+
+### What a fix must prove, in BOTH directions
+
+**A one-arm test passes a change that simply moves the hole.** Every arm below is required, and this is the same standard #1229 set for itself.
+
+**Arm A -- the offending shape must start denying.** Per shape: the uppercase quoted program spelling denies; an unknown program's `-c` payload is scanned; each shape-3 spelling that a fix claims denies.
+
+**Arm B -- every currently-denying control must keep denying.** At least the seven controls tabled above, and the fail-CLOSED unterminated-quote case by name, because a scanner change is the most likely thing to break it and it fails in the safe direction only by accident of a regex that never matched.
+
+**Arm C -- the false denies the current design bought must not come back.** These are what make each hole a deliberate trade rather than an oversight:
+
+- **Shape 1.** The withdrawn program-position predicate moved `cmd /c "<quoted git.exe>"` and PowerShell dot-source from DENY to ALLOW, and both are pinned as must-DENY rows today. The case-insensitive emit costs the twelve false denies named above. A fix must hold all three ends at once, and the gate says so in terms: do not re-add the lowercase emit without a position discriminator, and do not add a discriminator without re-measuring those two.
+- **Shape 2.** `Get-FlagOwner` exists because a flag shape is barely correlated with interpreter-ness: eighteen non-interpreter invocations (`grep -c`, `rg -c`, `curl -c`, `sort -c`, `wc -c`, `tar -c`, `make -C` and the rest) matched the pattern and had their arguments scanned as code. Widening the owner set to catch an unknown name re-opens exactly that class, so a fix must show those still ALLOW.
+- **Shape 3.** Anything that decides span boundaries outside `Remove-QuotedSpans`' single left-to-right pass has been wrong here three times. The suite's own coverage note states the contract a fix must keep: text a rule must judge is never blanked, and text inside a span the shell would quote always is.
+
+**And one standing hazard.** Two of the shipped tripwires assert ALLOW and instruct a reader who reds them to DELETE the row rather than restore the ALLOW. Followed literally on the wrong row, that lands a fail-open green. Read the row's own text before deleting it.
+
+### What this row deliberately does not do
+
+- **It does not publish turnkey payloads for the unfixed shapes.** The mechanisms are described precisely enough to re-derive, and shapes 1 and 2 are already published verbatim in this tree, in the suite tripwire and in the gate's own call-site comment. The unfixed shape-3 spellings are named by mechanism instead, following the standing ruling that a construct is published alongside the fix that makes it inert.
+- **It does not install or modify the gate.** `scripts/worktree/install-gate.ps1` was never run: **#1247** records that the installer overwrites the live gate with no backup and no receipt, which is not a Builder's call. Everything was driven against the repository copy.
+- **It does not score itself, and it does not close, reopen or re-verdict #1229.**
