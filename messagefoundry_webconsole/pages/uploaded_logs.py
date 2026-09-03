@@ -92,10 +92,45 @@ def uploaded_logs(data: UploadedFileList, *, error: str = "") -> Markup:
                 ["File", "Uploaded by", "Format", "Size", "Messages", "When", ""],
                 rows,
             ),
-            el("p", text(f"{data.total} file(s)"), class_="pager"),
+            _list_pager(data),
         ]
     )
     return page("Uploaded logs", *parts, active="uploaded-logs")
+
+
+def _list_pager(data: UploadedFileList) -> Markup:
+    """The page counter plus Previous/Next links for the uploaded-files listing (BACKLOG #1152).
+
+    ``data.total`` is the whole visible set and ``data.files`` is the window, so the line states
+    both rather than a bare count that would now be ambiguous. The links carry only two integers the
+    engine has already clamped, so nothing operator-supplied reaches the URL — the same reason the
+    refusal codes on this page are fixed tokens."""
+    shown = len(data.files)
+    first = data.offset + 1 if shown else 0
+    parts: list[object] = [text(f"{first}-{data.offset + shown} of {data.total} file(s)")]
+    if data.offset > 0:
+        prev = max(data.offset - data.limit, 0)
+        parts.append(Markup(" "))
+        parts.append(
+            el(
+                "a",
+                "← Previous",
+                href=f"/ui/uploaded-logs?{urlencode({'limit': data.limit, 'offset': prev})}",
+                class_="btn-link",
+            )
+        )
+    if data.offset + shown < data.total:
+        nxt = data.offset + data.limit
+        parts.append(Markup(" "))
+        parts.append(
+            el(
+                "a",
+                "Next →",
+                href=f"/ui/uploaded-logs?{urlencode({'limit': data.limit, 'offset': nxt})}",
+                class_="btn-link",
+            )
+        )
+    return el("p", *parts, class_="pager")
 
 
 def uploaded_logs_upload(*, error: str = "") -> Markup:

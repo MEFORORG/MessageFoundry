@@ -188,6 +188,60 @@ async def test_upload_list_browse_roundtrip(engine: Engine, tmp_path: Path) -> N
     assert "digits" in joined or "alnum" in joined  # the needle SHAPE is
 
 
+async def test_uploads_listing_is_paged(engine: Engine, tmp_path: Path) -> None:
+    """BACKLOG #1152: GET /uploads is paged, and ``total`` still counts the whole visible set.
+
+    The route was pageless, so one response carried every file an install had ever accumulated.
+    Asserted here: the window is honoured, ``total`` is NOT the window, the pages partition the set
+    with no overlap and no gap, and a second request for the same window returns the same page --
+    which is what the total sort order in ``UploadStore.list_files`` exists to guarantee, since these
+    five uploads land close enough together to tie on ``uploaded_at``."""
+    pytest.importorskip("psutil")
+    from messagefoundry.api import create_app
+
+    service = await _make_user(engine, Role.OPERATOR, name="op")
+    app = create_app(engine, auth=service, store_settings=_uploads_settings(tmp_path))
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
+        h = await _login(c, "op")
+        for n in range(5):
+            up = await c.post(
+                "/uploads", files={"file": (f"f{n}.hl7", ADT, "text/plain")}, headers=h
+            )
+            assert up.status_code == 200, up.text
+
+        first = (await c.get("/uploads", params={"limit": 2, "offset": 0}, headers=h)).json()
+        assert first["total"] == 5  # the whole visible set, not the page
+        assert len(first["files"]) == 2
+        assert first["limit"] == 2 and first["offset"] == 0  # the window, as applied
+        second = (await c.get("/uploads", params={"limit": 2, "offset": 2}, headers=h)).json()
+        third = (await c.get("/uploads", params={"limit": 2, "offset": 4}, headers=h)).json()
+        assert len(third["files"]) == 1  # the short tail page
+        ids = [f["file_id"] for page in (first, second, third) for f in page["files"]]
+        assert len(ids) == 5 and len(set(ids)) == 5  # partitions: no overlap, no gap
+
+        # Stable: the same window twice is the same page.
+        again = (await c.get("/uploads", params={"limit": 2, "offset": 2}, headers=h)).json()
+        assert [f["file_id"] for f in again["files"]] == [f["file_id"] for f in second["files"]]
+
+        # Past the end is empty, not an error; the bounds are enforced by the route, not the caller.
+        assert (await c.get("/uploads", params={"offset": 500}, headers=h)).json()["files"] == []
+        assert (await c.get("/uploads", params={"limit": 0}, headers=h)).status_code == 422
+        assert (await c.get("/uploads", params={"limit": 501}, headers=h)).status_code == 422
+        assert (await c.get("/uploads", params={"offset": -1}, headers=h)).status_code == 422
+
+    # The audit records the window alongside the unchanged whole-set count -- and no filename.
+    listings = [a for a in await engine.store.list_audit() if a["action"] == "upload.list"]
+    details = [json.loads(str(a["detail"])) for a in listings]
+    # Selected by its window, not by position: list_audit is newest-first, so an index would pin the
+    # LAST request in this test rather than the first page.
+    page_one = [d for d in details if d["limit"] == 2 and d["offset"] == 0]
+    assert page_one, details
+    assert page_one[0]["count"] == 5  # unchanged meaning: the whole visible set
+    assert page_one[0]["returned"] == 2  # the window
+    assert "f0.hl7" not in " ".join(str(a["detail"] or "") for a in listings)
+
+
 async def test_upload_denied_for_viewer(engine: Engine, tmp_path: Path) -> None:
     pytest.importorskip("psutil")
     from messagefoundry.api import create_app
@@ -580,7 +634,9 @@ async def test_uploaded_files_are_owner_only_across_operators(
         h2 = await _login(c, "op2")
         lst = await c.get("/uploads", headers=h2)
         assert lst.status_code == 200
-        assert lst.json() == {"total": 0, "files": [], "scope": "own"}
+        # Whole-response equality on purpose: it says nothing ELSE is in the body either. The window
+        # fields are the caller's own echo (BACKLOG #1152), so they carry no other operator's data.
+        assert lst.json() == {"total": 0, "files": [], "scope": "own", "limit": 50, "offset": 0}
         assert (await c.get(f"/uploads/{fid}/messages", headers=h2)).status_code == 404
         rs = await c.post(f"/uploads/{fid}/resend", json={"index": 0, "to": "in1"}, headers=h2)
         assert rs.status_code == 404, rs.text
@@ -686,6 +742,8 @@ async def test_upload_with_no_owner_id_is_reachable_only_with_the_override(
             "total": 0,
             "files": [],
             "scope": "own",
+            "limit": 50,
+            "offset": 0,
         }
         assert (await c.get(f"/uploads/{fid}/messages", headers=h1)).status_code == 404
         assert (await c.delete(f"/uploads/{fid}", headers=h1)).status_code == 404
@@ -740,6 +798,8 @@ async def test_a_recreated_username_cannot_reach_the_departed_operators_upload(
             "total": 0,
             "files": [],
             "scope": "own",
+            "limit": 50,
+            "offset": 0,
         }
         assert (await c.get(f"/uploads/{fid}/messages", headers=h2)).status_code == 404
         assert (await c.delete(f"/uploads/{fid}", headers=h2)).status_code == 404

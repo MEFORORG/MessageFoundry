@@ -45,7 +45,7 @@ __version__ = "0.2.15"
 # If cross-seam support is ever genuinely wanted, re-widen this set AND add the CI matrix that
 # installs the MIN and MAX supported engine builds — the claim and its test land together, or not
 # at all.
-SUPPORTED_ENGINE_SEAMS: frozenset[str] = frozenset({"93ba1f10b9dccfc8"})
+SUPPORTED_ENGINE_SEAMS: frozenset[str] = frozenset({"d4ae2ce03d5723a7"})
 
 #: The vendored static assets shipped in THIS wheel (mounted at /ui/static by :func:`mount_ui`).
 STATIC_DIR = Path(__file__).parent / "static"

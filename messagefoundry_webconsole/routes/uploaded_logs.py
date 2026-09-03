@@ -152,8 +152,15 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         engine: Any = Depends(deps.get_engine),
         identity: Identity = Depends(require_ui(Permission.FILES_BROWSE)),
         e: str | None = Query(None, max_length=32),
+        # BACKLOG #1152: the listing is paged. Declared with the SAME bounds as the JSON route, so a
+        # hand-typed /ui query answers 422 here rather than reaching the handler with a value the
+        # engine would clamp differently -- the console must not be the looser of the two doors.
+        limit: int = Query(50, ge=1, le=500),
+        offset: int = Query(0, ge=0),
     ) -> HTMLResponse:
-        data = await core.list_uploaded_files(request, engine=engine, identity=identity)
+        data = await core.list_uploaded_files(
+            request, engine=engine, identity=identity, limit=limit, offset=offset
+        )
         # The refused-mutation banner. An EXACT-key lookup in the allow-list, so the rendered string is
         # always one this module wrote — `e` itself is never rendered, echoed, or passed on, and an
         # unrecognized value yields no banner rather than reflected text.

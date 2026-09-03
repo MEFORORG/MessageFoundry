@@ -32,6 +32,7 @@ from messagefoundry.config.wiring import (
     Send,
 )
 from messagefoundry.pipeline import Engine
+from messagefoundry_webconsole.pages.connections import UNPROVISIONED_NOTICE
 
 # The repo root is three levels up from this file (packaging/messagefoundry-webconsole/tests/) — the
 # suite moved out of the engine's tests/ into the package's own suite (Option B Phase 2, ADR 0065).
@@ -182,6 +183,43 @@ async def test_login_sets_confined_cookie_and_logout_revokes(engine: Engine) -> 
         # After logout the (now-revoked) session no longer grants /ui — a fresh request redirects.
         c.cookies.clear()
         assert (await c.get("/ui")).status_code == 303  # → /ui/login
+
+
+async def test_unprovisioned_operator_is_told_why_the_console_is_empty(engine: Engine) -> None:
+    """BACKLOG #1152: the first-run affordance for the deny-by-default channel scope.
+
+    A fresh non-administrator is granted no channel, so every list is legitimately empty for them.
+    The landing page must SAY so — an unexplained empty console reads as broken RBAC on day one,
+    and the reflex fix for that symptom is to widen somebody's grant. It is deliberately a page
+    banner and not a start-time refusal, which would make a fresh single-operator install
+    unbootable for the same condition: asserted here by the page answering 200."""
+    service = await _service(engine)
+    uid = await service.create_local_user(
+        username="fresh",
+        password=PW,
+        display_name=None,
+        email=None,
+        roles=[Role.OPERATOR.value],
+        actor="test",
+    )
+    user = await service.store.get_user(uid)
+    assert user is not None and user.password_hash is not None
+    assert user.channel_scope is None  # nobody has granted anything: the shipped create path
+    await service.store.set_password(
+        uid, password_hash=user.password_hash, must_change_password=False
+    )
+    async with _client(engine, service) as c:
+        await _cookie_login(c, "fresh")
+        r = await c.get("/ui")
+        assert r.status_code == 200  # the console still loads; it explains itself
+        assert UNPROVISIONED_NOTICE in r.text
+        # Grant a channel and the notice goes away — the banner tracks the scope, not the emptiness
+        # of the estate (this engine has no connections configured either way).
+        await service.set_channel_scope(uid, ["IB_A"], actor="admin")
+        await _cookie_login(c, "fresh")  # the scope change revoked the session
+        granted = await c.get("/ui")
+        assert granted.status_code == 200
+        assert UNPROVISIONED_NOTICE not in granted.text
 
 
 async def test_bad_credentials_redirect_without_cookie(engine: Engine) -> None:
@@ -2405,7 +2443,10 @@ async def test_channel_scope_roundtrip(engine: Engine) -> None:
         )
         assert r.status_code == 303
         user = await service.store.get_user(uid)
-        assert user is not None and user.channel_scope is None
+        # BACKLOG #1152: all-channels is the stored ["*"] grant, not a null scope — null now denies,
+        # so posting it for the "all" mode would have silently inverted this form.
+        assert user is not None and json_.loads(user.channel_scope or "null") == [ALL_CHANNELS]
+        assert 'value="all" selected' in (await c.get(f"/ui/users/{uid}")).text
         # "Only these" with an empty list is ambiguous — refused, scope unchanged.
         r = await c.post(
             f"/ui/users/{uid}/channel-scope",
@@ -2414,7 +2455,7 @@ async def test_channel_scope_roundtrip(engine: Engine) -> None:
         )
         assert r.status_code == 400 and "list at least one connection" in r.text
         user = await service.store.get_user(uid)
-        assert user is not None and user.channel_scope is None
+        assert user is not None and json_.loads(user.channel_scope or "null") == [ALL_CHANNELS]
 
 
 async def test_reset_password_shows_temp_once(engine: Engine) -> None:
