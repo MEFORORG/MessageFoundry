@@ -34,18 +34,26 @@ from messagefoundry.transports.base import (
     DestinationStartupError,
     NegativeAckError,
 )
+from messagefoundry.transports.file import DEFAULT_MAX_FILE_BYTES
 from messagefoundry.transports.remotefile import (
     _APPROVED_SFTP_CIPHERS,
     _APPROVED_SFTP_MACS,
+    RETRIEVE_CHUNK_BYTES,
     RemoteFileDestination,
     RemoteFileSource,
+    _BoundedSink,
     _FtpClient,
     _ftps_ssl_context,
     _is_contained_name,
     _RemoteClient,
     _RemoteError,
+    _RemoteOversize,
     _SftpClient,
 )
+
+#: Small chunk for the fake client, so a test body is delivered in several pieces without needing a
+#: multi-MiB fixture. The shipped chunk size is asserted separately, below.
+_CHUNK = 4
 
 # --- a fake remote client ----------------------------------------------------
 
@@ -84,11 +92,17 @@ class _FakeClient(_RemoteClient):
                 out.append((name, self._sizes.get(path, len(data))))
         return out
 
-    def retrieve(self, path: str) -> bytes:
+    def retrieve(self, path: str, *, max_bytes: int | None = None) -> bytes:
         self.ops.append(("retrieve", path))
         if self._retrieve_exc is not None:
             raise self._retrieve_exc
-        return self.files[path]
+        # Stream through the SHIPPED sink rather than a re-implementation, so the fake enforces the
+        # real budget on the real code path (#1191). Chunked, so a body is refused part-way in.
+        sink = _BoundedSink(max_bytes)
+        body = self.files[path]
+        for start in range(0, max(len(body), 1), _CHUNK):
+            sink.write(body[start : start + _CHUNK])
+        return sink.value()
 
     def store(self, path: str, data: bytes) -> None:
         self.ops.append(("store", path))
@@ -373,6 +387,161 @@ async def test_source_oversize_moves_to_error_without_retrieving(
     assert h.bodies == []  # never delivered
     assert not any(op == "retrieve" for op, _ in client.ops)  # never retrieved
     assert "/in/.error/big.hl7" in client.files  # quarantined
+
+
+# --- #1191: the bound is charged against BYTES READ, not against the listed size ----------------
+
+
+class _StubSftpFile:
+    """A paramiko ``SFTPFile`` stand-in. Records how much was ACTUALLY read, which is the only way to
+    tell a bounded chunked read from a whole-file read that is checked afterwards."""
+
+    def __init__(self, body: bytes) -> None:
+        self.body = body
+        self.read_total = 0
+
+    def read(self, size: int) -> bytes:
+        chunk = self.body[self.read_total : self.read_total + size]
+        self.read_total += len(chunk)
+        return chunk
+
+    def __enter__(self) -> _StubSftpFile:
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        return None
+
+
+class _StubSftp:
+    def __init__(self, fh: _StubSftpFile) -> None:
+        self._fh = fh
+
+    def open(self, path: str, mode: str) -> _StubSftpFile:
+        return self._fh
+
+
+class _StubFtp:
+    """An ``ftplib.FTP`` stand-in whose ``retrbinary`` feeds the callback in blocks and records how
+    many bytes it managed to hand over before the callback raised."""
+
+    def __init__(self, body: bytes) -> None:
+        self.body = body
+        self.written = 0
+        self.blocksize: int | None = None
+
+    def retrbinary(self, cmd: str, callback: Any, blocksize: int = 8192) -> None:
+        self.blocksize = blocksize
+        for start in range(0, len(self.body), blocksize):
+            chunk = self.body[start : start + blocksize]
+            self.written += len(chunk)
+            callback(chunk)
+
+
+def test_bounded_sink_charges_the_bytes_it_is_handed() -> None:
+    sink = _BoundedSink(10)
+    sink.write(b"x" * 6)
+    assert sink.value() == b"x" * 6
+    with pytest.raises(_RemoteOversize) as caught:
+        sink.write(b"x" * 5)  # 11 > 10 — refused at the first byte past the budget
+    assert caught.value.limit == 10
+
+
+def test_bounded_sink_with_no_limit_never_refuses() -> None:
+    """``max_file_bytes=0`` is an explicit operator opt-out; the read then stays unbounded."""
+    sink = _BoundedSink(None)
+    sink.write(b"x" * 10_000)
+    assert len(sink.value()) == 10_000
+
+
+def test_the_default_bound_is_the_shipped_non_zero_ceiling(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The bound is the operator's OWN ``max_file_bytes``, not a number invented for this guard — so
+    it ships non-zero without adding a new dead-letter cause (#1191)."""
+    src = _src(monkeypatch, _FakeClient())
+    assert src._max_file_bytes == DEFAULT_MAX_FILE_BYTES
+    assert DEFAULT_MAX_FILE_BYTES > 0
+
+
+async def test_source_refuses_a_body_bigger_than_the_size_the_server_listed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """THE CASE THE PRE-RETRIEVE GATE CANNOT SEE. The share lists 4 bytes and delivers 100. The
+    listing gate passes it; the read-side budget refuses it and quarantines it."""
+    client = _FakeClient(files={"/in/lie.hl7": b"M" * 100}, sizes={"/in/lie.hl7": 4})
+    src = _src(monkeypatch, client, max_file_bytes=10)
+    h = _RecordingHandler()
+    src._handler = h
+    await src._poll_once()
+    assert any(op == "retrieve" for op, _ in client.ops)  # it DID pass the listing gate
+    assert h.bodies == []  # nothing partial reached the pipeline
+    assert "/in/.error/lie.hl7" in client.files  # quarantined with a disposition
+    # NOT the transient arm: leaving it in place would re-pull the same oversized body every poll.
+    assert "/in/lie.hl7" not in client.files
+
+
+async def test_source_logs_the_lying_size_refusal(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Count-and-log: the refusal is logged, never silently swallowed."""
+    client = _FakeClient(files={"/in/lie.hl7": b"M" * 100}, sizes={"/in/lie.hl7": 4})
+    src = _src(monkeypatch, client, max_file_bytes=10)
+    src._handler = _RecordingHandler()
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.transports.remotefile"):
+        await src._poll_once()
+    assert any("delivered more than max_file_bytes" in r.getMessage() for r in caplog.records)
+
+
+async def test_source_zero_max_file_bytes_keeps_the_retrieve_unbounded(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = _FakeClient(files={"/in/big.hl7": b"MSH|^~\\&|" + b"x" * 5_000})
+    src = _src(monkeypatch, client, max_file_bytes=0)
+    h = _RecordingHandler()
+    src._handler = h
+    await src._poll_once()
+    assert len(h.bodies) == 1  # delivered whole — the operator disabled the cap
+
+
+def test_sftp_retrieve_stops_reading_past_the_budget(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The SFTP backend reads in chunks and refuses mid-transfer, so a hostile body is never
+    buffered whole. ``read_total`` proves the bytes were never pulled."""
+    monkeypatch.setattr(remotefile, "RETRIEVE_CHUNK_BYTES", 4)
+    fh = _StubSftpFile(b"x" * 400)
+    monkeypatch.setattr(_SftpClient, "_op", lambda self, fn: fn(_StubSftp(fh)))
+    client = _SftpClient({"host": "sftp.example.com"})
+    with pytest.raises(_RemoteOversize):
+        client.retrieve("/in/big.hl7", max_bytes=10)
+    assert fh.read_total <= 10 + 4  # at most one chunk past the budget
+    assert fh.read_total < len(fh.body)  # and nothing like the whole body
+
+
+def test_sftp_retrieve_returns_a_body_inside_the_budget(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(remotefile, "RETRIEVE_CHUNK_BYTES", 4)
+    fh = _StubSftpFile(b"MSH|^~\\&|A")
+    monkeypatch.setattr(_SftpClient, "_op", lambda self, fn: fn(_StubSftp(fh)))
+    client = _SftpClient({"host": "sftp.example.com"})
+    assert client.retrieve("/in/a.hl7", max_bytes=1024) == b"MSH|^~\\&|A"
+
+
+def test_ftp_retrieve_stops_reading_past_the_budget(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The FTP/FTPS backend has the same shape and the same fix — the sink raises out of the
+    ``retrbinary`` callback, aborting the transfer."""
+    monkeypatch.setattr(remotefile, "RETRIEVE_CHUNK_BYTES", 4)
+    ftp = _StubFtp(b"x" * 400)
+    monkeypatch.setattr(_FtpClient, "_op", lambda self, fn: fn(ftp))
+    client = _FtpClient({"host": "ftp.example.com"}, tls=False)
+    with pytest.raises(_RemoteOversize):
+        client.retrieve("/in/big.hl7", max_bytes=10)
+    assert ftp.blocksize == 4  # streamed, not slurped
+    assert ftp.written <= 10 + 4
+    assert ftp.written < len(ftp.body)
+
+
+def test_ftp_retrieve_returns_a_body_inside_the_budget(monkeypatch: pytest.MonkeyPatch) -> None:
+    ftp = _StubFtp(b"MSH|^~\\&|A")
+    monkeypatch.setattr(_FtpClient, "_op", lambda self, fn: fn(ftp))
+    client = _FtpClient({"host": "ftp.example.com"}, tls=False)
+    assert client.retrieve("/in/a.hl7", max_bytes=1024) == b"MSH|^~\\&|A"
+    assert ftp.blocksize == RETRIEVE_CHUNK_BYTES
 
 
 async def test_source_retrieve_failure_leaves_file(monkeypatch: pytest.MonkeyPatch) -> None:
