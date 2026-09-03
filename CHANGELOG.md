@@ -7,6 +7,31 @@ All notable changes to MessageFoundry are documented here. The format follows
 ## [Unreleased]
 
 ### Added
+- **A startup preflight that reads the store principal's *effective* privileges, so the least-privilege
+  grant the runbooks prescribe stops being a claim the engine cannot check.**
+  [`DEPLOY-SERVER-DB.md`](docs/DEPLOY-SERVER-DB.md) told operators exactly which grant the engine's
+  database login needs, and the engine had no way to see what it had actually been given: no
+  fixed-server-role probe and no database-role probe existed anywhere, and
+  `[store].require_managed_identity` constrains the credential's *kind* rather than its privilege — a
+  `sysadmin` gMSA satisfies it clean. On a first deployment an over-granted store principal would
+  therefore have gone unobserved. `serve` now reads fixed **server**-role and **database**-role
+  membership plus `CONTROL SERVER` / database `CONTROL` on SQL Server, and role attributes
+  (`SUPERUSER`, `CREATEROLE`, `CREATEDB`, `REPLICATION`, `BYPASSRLS`), assumable predefined roles and
+  database ownership on PostgreSQL — before any listener binds.
+  **It observes and warns; it does not refuse by default** — refusing on an over-grant could block a
+  legitimate deployment mid-setup, and the engine does not own the grant. Every start logs what it saw,
+  writes a `store_privilege_preflight` audit row, and names each excess grant in
+  `security_loosenings()` and `GET /security/posture`. Set `[store].require_least_privilege = true` to
+  turn the warning into a refusal (refuse/warn splits on `[security].enforcement`, exactly like
+  `require_managed_identity`).
+  **It does not fail open, and that is the part to know before reading its output.** A probe that
+  cannot run — permission denied, a driver error, a store handle with no probe — reports
+  `unobservable`, which is a *different* result from "observed, and it is fine" in the log line, in the
+  audit row and in the posture response, and which a declared `require_least_privilege` also refuses.
+  SQLite reports `not_applicable` and says why: a local file has no server principal, and the control
+  there is the filesystem ACL. The PostgreSQL least-privilege grant is now documented
+  ([`DEPLOY-SERVER-DB.md`](docs/DEPLOY-SERVER-DB.md) §1.2), which it previously was not.
+  ([BACKLOG #1008](docs/BACKLOG.md))
 - **`messagefoundry audit-anchor`, and `audit-verify --expected-anchor` / `--expected-anchor-file` to
   check one back.** The audit hash chain links each row to its predecessor, so deleting the *newest*
   rows leaves a shorter chain that still walks cleanly — `audit-verify` on its own reports OK after a

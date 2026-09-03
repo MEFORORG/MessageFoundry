@@ -80,6 +80,7 @@ from messagefoundry.api.metrics import (
     render_metrics,
 )
 from messagefoundry.api.models import (
+    STORE_PRIVILEGE_NOT_PROBED,
     AiChatRequest,
     AiChatResponse,
     AiPolicy,
@@ -161,6 +162,7 @@ from messagefoundry.api.models import (
     StatsResetRequest,
     StatsResetResult,
     StatsResponse,
+    StorePrivilegeView,
     SystemStatus,
     UpdateInfo,
     UploadDeleteResult,
@@ -307,6 +309,7 @@ from messagefoundry.store.content_search import (
     make_spec,
 )
 from messagefoundry.store.metadata import user_metadata
+from messagefoundry.store.privilege import run_store_privilege_preflight
 from messagefoundry.store.store import _secure_file
 from messagefoundry.transports.ai_broker import AiBrokerError, ai_broker_from_settings
 from messagefoundry.transports.base import (
@@ -1609,6 +1612,11 @@ def create_app(
                 "NOT included (see `messagefoundry check`)"
             )
         )
+        # #1008: the store-principal privilege OBSERVATION the serve lifespan stashed. `None` means no
+        # preflight ran in this process (an embedding, or an app built without the managed lifespan) —
+        # the registry then reports nothing for it and `store_privilege` below renders the explicit
+        # `not_probed` status, so silence never reads as a clean observation.
+        store_privilege = getattr(request.app.state, "store_privilege", None)
         loosenings = [
             SecurityLoosening(switch=name, risk=risk)
             for name, risk in security_loosenings(
@@ -1619,8 +1627,18 @@ def create_app(
                 cleartext_hops,
                 expired_hops,
                 db_hops,
+                store_privilege,
             )
         ]
+        store_privilege_view = (
+            StorePrivilegeView(status=STORE_PRIVILEGE_NOT_PROBED)
+            if store_privilege is None
+            else StorePrivilegeView(
+                status=store_privilege.status.value,
+                excess=list(store_privilege.excess),
+                detail=store_privilege.detail,
+            )
+        )
         synthetic_relaxation = (
             "strict PHI-only controls (at-rest-encryption refusal, deny-by-default egress, bounded "
             "retention) are relaxed: this instance is marked synthetic "
@@ -1672,6 +1690,7 @@ def create_app(
             security=security.model_dump(),
             loosenings=loosenings,
             loosenings_scope=loosenings_scope,
+            store_privilege=store_privilege_view,
             synthetic_relaxation=synthetic_relaxation,
             fips_mode=fips_mode,  # interpreter ssl/_hashlib OpenSSL FIPS-provider state; None=undeterminable
             openssl_version=openssl_version,  # that OpenSSL's version string (public metadata)
@@ -6000,6 +6019,29 @@ def create_managed_app(
                     await notifier.aclose()
                 await store.close()
                 raise
+        # #1008 (ASVS 13.2.2): read the store principal's EFFECTIVE privileges and report them, BEFORE
+        # any listener binds — the same seam and the same teardown discipline as the two preflights
+        # above. It ALWAYS runs: the WARN arm is the shipped behaviour and cannot block an install (a
+        # log line, an audit row, a GET /security/posture entry), so there is nothing to gate. Only the
+        # REFUSE arm is gated, on [store].require_least_privilege AND [security].enforcement=enforce,
+        # and it refuses on an UNOBSERVABLE probe as well as an over-grant — a declared refusal that
+        # passed a principal it could not read would be the fail-open shape the setting exists to close.
+        # SQLite reports NOT_APPLICABLE (no server principal), so the default single-node path is a log
+        # line and nothing else.
+        try:
+            app.state.store_privilege = (
+                await run_store_privilege_preflight(
+                    store,
+                    require_least_privilege=resolved.require_least_privilege,
+                    enforcing=(security_enforcement or SecurityEnforcement.ENFORCE)
+                    is SecurityEnforcement.ENFORCE,
+                )
+            ).posture()
+        except BaseException:
+            if notifier is not None:
+                await notifier.aclose()
+            await store.close()
+            raise
         # Cluster coordinator (Track B Step 3) — built from the opened store so a Postgres-backed
         # store can reach its pool. Returns the no-op NullCoordinator unless [cluster].enabled on a
         # Postgres store, so single-node is byte-identical. The Engine owns its lifecycle (start/stop
