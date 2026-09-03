@@ -16,6 +16,7 @@ import pytest
 from messagefoundry.config import tls_policy
 from messagefoundry.config.tls_policy import (
     _APPROVED_TLS_SUITES,
+    _MIN_TLS_STRENGTH_BITS,
     APPROVED_KEX_GROUPS,
     TLS_REVOCATION_ATTESTED_ENV,
     HopDisposition,
@@ -24,6 +25,7 @@ from messagefoundry.config.tls_policy import (
     _is_encrypting,
     _is_forward_secret,
     _is_peer_authenticated,
+    _is_strong_enough,
     active_hop_posture,
     build_smtp_tls_context,
     current_hop_posture,
@@ -893,10 +895,14 @@ def test_validate_tls_ciphers_rejects_what_forward_secrecy_cannot_see(spec: str,
         validate_tls_ciphers(spec)
 
 
-def test_validate_tls_ciphers_still_accepts_a_good_suite() -> None:
-    """POSITIVE CONTROL. Without it the rejections above are indistinguishable from a validator that
-    refuses everything, which would pass the two tests above for entirely the wrong reason."""
-    assert validate_tls_ciphers(_GOOD_CIPHER) == _GOOD_CIPHER
+@pytest.mark.parametrize("require_approved", [True, False])
+def test_validate_tls_ciphers_still_accepts_a_good_suite(require_approved: bool) -> None:
+    """POSITIVE CONTROL for every rejection in this file. Without it they are indistinguishable from
+    a validator that refuses everything, which would pass them all for entirely the wrong reason.
+    Both call shapes, because BACKLOG #1166 added a check that runs on the ``False`` one too."""
+    assert (
+        validate_tls_ciphers(_GOOD_CIPHER, require_approved_suites=require_approved) == _GOOD_CIPHER
+    )
 
 
 def test_validate_tls_ciphers_rejects_an_unlisted_suite_that_passes_every_property() -> None:
@@ -931,16 +937,18 @@ def test_the_two_new_predicates_read_the_openssl_description() -> None:
 
 
 def test_harden_cipher_suites_asserts_on_no_shipped_default() -> None:
-    """The safety property the whole change rests on. If any default context shape carried a NULL or
-    anonymous suite, the new assertions in harden_cipher_suites would refuse every deployment. Ships
-    as a test rather than a measurement in a commit message so a future OpenSSL cannot break it
-    silently."""
+    """The safety property the whole change rests on. If any default context shape carried a NULL,
+    anonymous or sub-floor suite, the assertions in harden_cipher_suites would refuse every
+    deployment. Ships as a test rather than a measurement in a commit message so a future OpenSSL
+    cannot break it silently. The strength row is BACKLOG #1166's and rides the same loop."""
     for make in (
         lambda: ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER),
         lambda: ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT),
         ssl.create_default_context,
     ):
-        harden_cipher_suites(make(), connector="test-default-shape")
+        ctx = make()
+        assert {int(c["strength_bits"]) for c in ctx.get_ciphers()} == {128, 256}
+        harden_cipher_suites(ctx, connector="test-default-shape")
 
 
 def test_harden_cipher_suites_does_not_apply_the_operator_allow_list() -> None:
@@ -961,6 +969,80 @@ def test_harden_cipher_suites_raises_on_a_null_cipher_context() -> None:
     ctx.set_ciphers(_NULL_CIPHER)
     with pytest.raises(ValueError, match="NULL-cipher"):
         harden_cipher_suites(ctx, connector="test-null")
+
+
+# --- BACKLOG #1166: the three properties above are still not enough ------------------------------
+#
+# What *-CCM8 is and why the earlier checks cannot see it is stated once, on _is_strong_enough, with
+# the suite census it was measured from. Recorded HERE and nowhere else:
+#
+# MEASURED at engine commit 2b8bccb43, BEFORE this gate: validate_tls_ciphers(
+# require_approved_suites=False) ACCEPTED a string naming all six sub-floor suites, and
+# harden_cipher_suites ACCEPTED the resulting context. So both were live and neither asked.
+#
+# THE ITEM'S OWN REPRO IS STALE AND WAS RE-MEASURED FALSE. #1166 records that
+# `ECDHE-ECDSA-NULL-SHA:ECDHE-RSA-NULL-SHA:@SECLEVEL=0` is accepted; at this commit both functions
+# REFUSE it, because BACKLOG #1317 landed the NULL check after that measurement was taken. The gap
+# that survives is narrower and different, and it is the one pinned here.
+
+_WEAK_CIPHER = "ECDHE-ECDSA-AES256-CCM8"  # forward-secret, encrypting, authenticated, 64 bits
+
+
+def test_the_weak_suite_defeats_all_three_earlier_predicates() -> None:
+    """The premise. If this ever stops holding, the strength check below is passing for the wrong
+    reason and the rows after it prove nothing."""
+    if not _ciphers_available(_WEAK_CIPHER):
+        pytest.skip(f"this OpenSSL build cannot resolve {_WEAK_CIPHER}")
+    probe = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    probe.set_ciphers(f"{_WEAK_CIPHER}:@SECLEVEL=0")
+    entry = next(c for c in probe.get_ciphers() if c.get("name") == _WEAK_CIPHER)
+    assert _is_forward_secret(entry) and _is_encrypting(entry) and _is_peer_authenticated(entry)
+    assert int(entry["strength_bits"]) < _MIN_TLS_STRENGTH_BITS
+    assert int(entry["alg_bits"]) >= _MIN_TLS_STRENGTH_BITS  # alg_bits would MISS this
+
+
+@pytest.mark.parametrize("require_approved", [True, False])
+def test_validate_tls_ciphers_rejects_a_sub_128_bit_suite(require_approved: bool) -> None:
+    """Both call shapes, and the ``False`` one is the point: it is the ``proxy_tls_ciphers``
+    declaration path, where the allow-list deliberately does not run and this gate is the only thing
+    left between an operator and a declared 64-bit floor."""
+    if not _ciphers_available(_WEAK_CIPHER):
+        pytest.skip(f"this OpenSSL build cannot resolve {_WEAK_CIPHER}")
+    with pytest.raises(ValueError, match="bits of security"):
+        validate_tls_ciphers(
+            f"{_WEAK_CIPHER}:@SECLEVEL=0", require_approved_suites=require_approved
+        )
+
+
+def test_harden_cipher_suites_raises_on_a_sub_128_bit_context() -> None:
+    if not _ciphers_available(_WEAK_CIPHER):
+        pytest.skip(f"this OpenSSL build cannot resolve {_WEAK_CIPHER}")
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    ctx.set_ciphers(f"{_WEAK_CIPHER}:@SECLEVEL=0")
+    with pytest.raises(ValueError, match="bits of security"):
+        harden_cipher_suites(ctx, connector="test-weak")
+
+
+def test_is_strong_enough_fails_closed_on_an_ungradeable_entry() -> None:
+    """Pins the fail-closed rule stated on ``_is_strong_enough``: a dict we cannot grade must not
+    pass."""
+    assert _is_strong_enough({"name": "x", "strength_bits": 128})
+    assert not _is_strong_enough({"name": "x", "strength_bits": 64})
+    assert not _is_strong_enough({"name": "x"})  # absent
+    assert not _is_strong_enough({"name": "x", "strength_bits": "256"})  # not an int
+    assert not _is_strong_enough({"name": "x", "strength_bits": None})
+
+
+def test_the_tls_strength_floor_is_not_the_key_material_floor() -> None:
+    """A guard on the confusion #1166 warns about. _MIN_TLS_STRENGTH_BITS grades NEGOTIABLE SUITES.
+    The floor actually in force on operator KEY MATERIAL at the load_cert_chain sites is OpenSSL's
+    security level, which is 2 (roughly 112 bits) and READ-ONLY -- named nowhere else in the tree.
+    Raising that is a counterparty-facing decision this change deliberately does not make."""
+    assert _MIN_TLS_STRENGTH_BITS == 128
+    ctx = ssl.create_default_context()
+    assert ctx.security_level == 2
+    with pytest.raises(AttributeError):
+        ctx.security_level = 3  # type: ignore[misc]
 
 
 # --- BACKLOG #1005: opt-in CRL checking on the verifying server contexts -----------------------------

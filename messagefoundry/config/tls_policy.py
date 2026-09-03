@@ -36,7 +36,7 @@ import os
 import ssl
 import time
 import urllib.request
-from collections.abc import Callable, Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
@@ -411,19 +411,20 @@ def validate_proxy_tls_posture(min_version: str | None, ciphers: str | None) -> 
 def validate_tls_ciphers(value: str, *, require_approved_suites: bool = True) -> str:
     """Validate an operator OpenSSL cipher string, rejecting non-forward-secret key exchange.
 
-    ``require_approved_suites`` gates the :data:`_APPROVED_TLS_SUITES` allow-list only; the three
+    ``require_approved_suites`` gates the :data:`_APPROVED_TLS_SUITES` allow-list only; the four
     property checks always run. Pass ``False`` where the string DESCRIBES A COMPONENT THE ENGINE DOES
     NOT OPERATE -- today that is ``[api].proxy_tls_ciphers``, which declares what an external
     TLS-terminating proxy speaks. A declaration and a configuration are different things: refusing an
     unlisted-but-sound suite there would not harden anything, it would stop an operator describing
     their proxy truthfully, and a gate that punishes accurate declarations gets fed inaccurate ones.
-    The properties still bind, because declaring a NULL or anonymous proxy floor is a real defect
-    whoever operates it.
+    The properties still bind, because declaring a NULL, anonymous or 64-bit proxy floor is a real
+    defect whoever operates it.
 
-    Returns ``value`` unchanged when it parses and every resolved TLS 1.2 suite uses (EC)DHE (TLS 1.3
-    suites are inherently ECDHE + AEAD). Raises ``ValueError`` — surfaced as a config-load error — for
-    an unparseable string or one that would admit a static-RSA/DH key exchange, closing the 11.6.2 gap
-    that a misconfigured ``tls_ciphers`` could widen the key exchange below policy."""
+    Returns ``value`` unchanged when it parses and every resolved suite is forward-secret, encrypting,
+    peer-authenticating and rated at :data:`_MIN_TLS_STRENGTH_BITS` or above. Raises ``ValueError`` —
+    surfaced as a config-load error — for an unparseable string or one failing any of those, closing
+    the 11.6.2 gap that a misconfigured ``tls_ciphers`` could widen the key exchange below policy and
+    the 11.2.3 gap that it could drop the negotiated strength below 128 bits."""
     probe = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     try:
         probe.set_ciphers(value)
@@ -451,6 +452,18 @@ def validate_tls_ciphers(value: str, *, require_approved_suites: bool = True) ->
             "tls_ciphers must resolve to suites that AUTHENTICATE THE PEER (ASVS 12.1.2); these are "
             f"anonymous key exchanges and are trivially intercepted: {', '.join(anonymous)}"
         )
+    # BACKLOG #1166. The fourth property, and the one the other three cannot see (_is_strong_enough
+    # explains why). Placed before the allow-list so the reason an operator gets is the strength, not
+    # a bare "not on the list" -- and OUTSIDE the require_approved_suites guard so it also binds on
+    # the proxy DECLARATION path, where the allow-list deliberately does not run and this is the only
+    # thing left to catch it.
+    weak = _weak_suite_labels(resolved)
+    if weak:
+        raise ValueError(
+            f"tls_ciphers must resolve only to suites of at least {_MIN_TLS_STRENGTH_BITS} bits of "
+            f"security (ASVS 11.2.3); these are rated below it: {', '.join(weak)}. A truncated "
+            "authentication tag weakens a suite whose cipher and key length look fine."
+        )
     if not require_approved_suites:
         return value
     # The allow-list is last so an operator hitting a specific property failure above gets the precise
@@ -473,9 +486,10 @@ def validate_tls_ciphers(value: str, *, require_approved_suites: bool = True) ->
 
 
 def harden_cipher_suites(ctx: ssl.SSLContext, *, connector: str) -> None:
-    """**Assert** that every suite ``ctx`` would negotiate is forward-secret, and raise if not.
+    """**Assert** that every suite ``ctx`` would negotiate is forward-secret, encrypting,
+    peer-authenticating and at least :data:`_MIN_TLS_STRENGTH_BITS` strong, and raise if not.
 
-    ASVS 12.1.2 / 11.6.2. ``validate_tls_ciphers`` already rejects a *configured* ``tls_ciphers`` /
+    ASVS 12.1.2 / 11.6.2 / 11.2.3. ``validate_tls_ciphers`` already rejects a *configured* ``tls_ciphers`` /
     ``proxy_tls_ciphers`` that admits static RSA/DH — but that validator only fires when an operator
     sets the knob. A context built without one **inherits the interpreter's default suite list and
     nothing checked it**, which is the real residual: inheritance without assertion, not (as the
@@ -525,6 +539,18 @@ def harden_cipher_suites(ctx: ssl.SSLContext, *, connector: str) -> None:
             f"{', '.join(anonymous)} (ASVS 12.1.2), which authenticate no peer and are trivially "
             f"intercepted."
         )
+    # BACKLOG #1166, ASVS 11.2.3. Same move again: an inherited property becomes a checked one. The
+    # shipped default resolves to 128 and 256 bits on every context shape this module builds, so this
+    # raises on no supported configuration today; it exists so a context that reaches here carrying a
+    # sub-floor suite is refused at construction instead of negotiated on the wire.
+    weak = _weak_suite_labels(resolved)
+    if weak:
+        raise ValueError(
+            f"{connector}: the TLS context would negotiate suite(s) below "
+            f"{_MIN_TLS_STRENGTH_BITS} bits of security (ASVS 11.2.3): {', '.join(weak)}. Forward "
+            f"secrecy, encryption and peer authentication all hold for these, so none of the checks "
+            f"above can see them."
+        )
 
 
 #: Suites an operator-configured ``tls_ciphers`` string may resolve to (BACKLOG #1317, ASVS 12.1.2).
@@ -570,6 +596,54 @@ def _is_encrypting(cipher: Mapping[str, object]) -> bool:
     BACKLOG #1317.
     """
     return "Enc=None" not in str(cipher.get("description", ""))
+
+
+#: The security strength, in bits, every negotiable suite must carry (ASVS 11.2.3, BACKLOG #1166).
+#:
+#: 128 is the standard's own number: *"all cryptographic primitives utilize a minimum of 128-bits of
+#: security based on the algorithm, key size, and CONFIGURATION"*. The configuration clause is what
+#: this gate reaches -- a truncated authentication tag weakens a suite whose cipher and key are fine.
+#:
+#: **This is NOT the floor in force on operator KEY MATERIAL, and the two must not be conflated.**
+#: The effective floor at the ``load_cert_chain`` sites is OpenSSL's security level, measured on
+#: CPython 3.14.6 / OpenSSL 3.5.7 as **2** on every context this module builds
+#: (``create_default_context()`` and both ``SSLContext`` shapes), i.e. roughly 112 bits, and
+#: ``SSLContext.security_level`` is READ-ONLY there (``AttributeError`` on assignment). Raising that
+#: is a separate, counterparty-facing decision and is deliberately not made here.
+_MIN_TLS_STRENGTH_BITS = 128
+
+
+def _is_strong_enough(cipher: Mapping[str, object]) -> bool:
+    """Whether OpenSSL rates the suite at or above :data:`_MIN_TLS_STRENGTH_BITS`.
+
+    **The property the three predicates above cannot see, and the one place it is explained.** Reads
+    ``strength_bits``, which is OpenSSL's own rating and is NOT ``alg_bits``: the six ``*-CCM8``
+    suites report ``alg_bits`` 128 or 256 with ``strength_bits`` **64**, because an 8-octet
+    authentication tag caps the integrity strength whatever the cipher key is. They are
+    forward-secret, encrypting and peer-authenticating, so every earlier check passes them. Measured
+    at engine commit 2b8bccb43 on CPython 3.14.6 / OpenSSL 3.5.7: of the 158 suites offerable at
+    ``@SECLEVEL=0``, 80 survive those three checks, and exactly those six of the 80 sit below 128
+    bits. The rest are 128 or 256, so this refuses nothing any supported configuration selects --
+    the shipped default resolves to 128 and 256 only.
+
+    Fails closed on a missing or non-integer rating. A cipher dict we cannot grade must not pass; a
+    predicate that shrugged would report success on precisely the shapes it was added to catch."""
+    bits = cipher.get("strength_bits")
+    return isinstance(bits, int) and bits >= _MIN_TLS_STRENGTH_BITS
+
+
+def _weak_suite_labels(resolved: Sequence[Mapping[str, object]]) -> list[str]:
+    """The sub-floor suites in ``resolved``, rendered ``name (N bits)`` for an operator message.
+
+    Shared by the two callers so the offender rendering has ONE home; the three sibling checks each
+    inline a one-line name collector, which this cannot be because it carries the rating too."""
+    return sorted(
+        {
+            f"{c.get('name', '?')} ({c.get('strength_bits', '?')} bits)"
+            for c in resolved
+            if not _is_strong_enough(c)
+        }
+    )
 
 
 def _is_peer_authenticated(cipher: Mapping[str, object]) -> bool:
