@@ -1467,7 +1467,6 @@ function Test-WorktreeHijack([string]$Verb, [string]$Cmd, [string]$WtRaw, [strin
     # narrows a branch switch. Class B has no destination to read -- `git reset --hard` with no argument
     # and `git rebase --abort` both move the target worktree's HEAD -- so running these bails for it
     # would allow exactly the shapes it exists to catch.
-    $after = ""
     $dest = $null
     if ($isSwitch) {
         # Everything AFTER the first verb, up to the next command separator (so `git checkout x && ...`

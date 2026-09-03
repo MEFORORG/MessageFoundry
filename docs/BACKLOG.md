@@ -16960,7 +16960,67 @@ A seat that runs its OWN copy is recorded correctly. A seat that runs another co
 
 ## 1359. the worktree gate hands off branch-switch detection to rule 3b by verb, not by whether the command names a branch
 
-> 🔢 **Filed 2026-08-26 - not started.** `scripts/hooks/worktree_gate.ps1`'s own comment states the
+> ✅ **SHIPPED 2026-09-03 (builder).** `Test-WorktreeHijack` now takes its hand-off from TWO verb sets
+> instead of one literal pair, and the per-verb ruling the filing left open is decided and recorded in
+> the file itself. The premise was re-measured before any edit rather than taken from this banner: the
+> two-verb bail was still the first line of the function at `46ea10a78`.
+>
+> **THE RULING, over rule 3's twelve verbs. The question asked of each: does it move the TARGET
+> worktree's HEAD -- either which ref HEAD names, or which commit that ref names?** Eight do, four do
+> not, and none of the four is covered by an orthogonal check elsewhere in the file.
+>
+> | verb | ruling | why |
+> |---|---|---|
+> | `checkout` | KEPT, class A | repoints HEAD at another branch; the origin case |
+> | `switch` | KEPT, class A | the same move, newer spelling |
+> | `reset` | ADDED, class B | `--hard <ref>` repoints that worktree's branch and rewrites its files |
+> | `rebase` | ADDED, class B | rewrites that worktree's branch onto a new base; every SHA changes |
+> | `merge` | ADDED, class B | a fast-forward moves the branch ref straight onto another branch |
+> | `cherry-pick` | ADDED, class B | commits onto that worktree's branch and edits its files |
+> | `revert` | ADDED, class B | the same shape as cherry-pick: a new commit on that branch |
+> | `am` | ADDED, class B | applies a mailbox as commits, advancing that branch |
+> | `restore` | EXCLUDED | never moves HEAD; it is the pathspec case class A's `--` bail already allows |
+> | `stash` | EXCLUDED | never moves HEAD; it moves UNCOMMITTED work, which rule 3b never governed |
+> | `clean` | EXCLUDED | never moves HEAD; deletes untracked files only |
+> | `apply` | EXCLUDED | never moves HEAD; writes the working tree and index from a patch |
+>
+> **THE TWO CLASSES ARE NOT INTERCHANGEABLE, AND THAT ASYMMETRY IS THE DESIGN.** Class A denies a
+> branch switch wherever the target is a governed linked worktree, INCLUDING the session's own, because
+> the gate cannot tell a worktree's rightful owner from a squatter; it narrows on the DESTINATION
+> instead. Class B denies ONLY when the target tree is not the tree the session is standing in, and
+> reads no destination at all -- `git reset --hard` with no argument moves a HEAD too. Folding class B
+> into class A would deny every session's own `git rebase main`, which is the BACKLOG #308 false
+> positive arriving through a new door; folding class A into class B would reopen the original hijack.
+> A test fails if either class is quietly rewritten in terms of the other.
+>
+> **THE FAIL-OPEN DIRECTION IS MEASURED, NOT ASSERTED (BACKLOG #1229).** `tests/test_worktree_gate.py`
+> rebuilds a PRE-FIX gate from the shipped file by rewriting the `$hijackHeadMoveVerbs` assignment to
+> an empty array, and every one of the six added verbs is pinned ALLOWED there and DENIED against the
+> gate under test, in the same run. The rebuild asserts its own pattern matched, because a control that
+> silently rewrote nothing would be byte-identical to the gate under test and the pair would agree for
+> the wrong reason.
+>
+> **THE FIXTURES ARE REAL REPOSITORIES WITH REAL LINKED WORKTREES, and that is load-bearing.** Rule 3b
+> asks git four questions about the target and ALLOWS when any fails, so against the file's bare
+> `primary` fixture -- a tmp path never created -- the rule is inert and every new assertion would have
+> passed while measuring nothing. That is also why the pinned safe form is re-pinned here against a
+> real ungoverned repository: `test_git_rebase_into_sibling_worktree_extending_the_primary_is_allowed`
+> is green because git fails on a directory that does not exist, so it could not have caught a
+> regression that only appears once git answers. Both rows pass.
+>
+> **STILL OPEN, stated rather than implied.** Two residuals, neither new and neither claimed as
+> coverage. First, `restore`/`stash`/`clean`/`apply` aimed at another session's worktree stay ALLOWED:
+> they destroy that session's UNCOMMITTED work, which is real harm this rule has never guarded, and
+> guarding it is a different decision with a different false-positive profile. It is pinned by a test
+> WITH a control, so widening it stays a deliberate act. Second, class B fails open when the session's
+> own toplevel does not resolve -- no cwd in the payload, a cwd outside every repository, any git
+> failure -- because treating an unresolved cwd as "therefore not the owner" would deny on a transient
+> git failure. What that leaves reachable is narrower than the hole this closed. Rule 3's nested
+> `.claude/worktrees` exemption and `occupancy.ps1` were deliberately not touched.
+>
+> **Filed 2026-08-26. The filing and scoring record is kept verbatim below; only its opening status
+> banner was removed, because an item may carry exactly one and the shipped banner above supersedes it.
+> The line numbers it quotes are the filing's own and have drifted.** `scripts/hooks/worktree_gate.ps1`'s own comment states the
 > gap in its own words (`:295-296`): *"3b only handles checkout/switch, so for the other nine verbs
 > there was no hand-off at all."* The working-tree-TARGET resolver that rules 3 and 3b share was
 > already unified and fixed (same comment block, `:291-307`) -- what remains open is narrower and
