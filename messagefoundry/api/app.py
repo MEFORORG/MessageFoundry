@@ -5615,11 +5615,19 @@ async def _assert_security_notice_is_deliverable(
     place the store and the freshly minted bootstrap admin are both in hand -- which is why the
     owner's ruling (option (b), 2026-08-13) corrected the item's own stated fix location.
 
-    **Why deliverability rather than "require an email at creation".** ``update_user_profile`` issues
-    ``UPDATE users SET display_name=?, email=?`` unconditionally on every directory login, so any
-    address a human sets on an AD or OIDC account is overwritten at that holder's next sign-in. A fix
-    resting on an OPERATOR ACTION cannot cover that population; a startup assertion about the state
-    of the table can.
+    **Why deliverability rather than "require an email at creation".** A fix resting on an OPERATOR
+    ACTION cannot cover the accounts a directory owns; a startup assertion about the state of the
+    table can. This paragraph used to justify that by saying an address a human sets on an AD or OIDC
+    account is overwritten at the holder's next sign-in, and **BACKLOG #1139 made that half false**:
+    ``update_user_profile`` still issues ``UPDATE users SET display_name=?, email=?`` unconditionally
+    on every directory login, but ``email`` is now the mirror only. The address this check reads --
+    ``notify_email`` -- is engine-owned and named by no directory-sync statement, so a directory login
+    no longer moves it. The conclusion stands on the narrower ground: an operator can still forget,
+    and a first-run bootstrap administrator is still minted with no address at all.
+
+    **It reads ``notify_email`` and not ``email`` for the reason the split exists.** They are two
+    columns now, and only one of them is where a notice is addressed. Asking about ``email`` would be
+    the instrument answering the adjacent question (SDS-3.8).
 
     Deliberately narrow: it asks only whether SOME enabled administrator carries an address, not
     whether mail to it would arrive. Proving actual delivery needs an SMTP round trip at startup,
@@ -5635,12 +5643,12 @@ async def _assert_security_notice_is_deliverable(
     if data_class is not DataClass.PHI:
         return
     for user in await store.list_users():
-        if user.disabled or not user.email:
+        if user.disabled or not user.notify_email:
             continue
         if Role.ADMINISTRATOR.value in await store.get_user_role_ids(user.id):
             return
     detail = (
-        "no enabled Administrator has an email address, so every out-of-band security notice about "
+        "no enabled Administrator has a notification address, so every out-of-band security notice about "
         "the most privileged accounts would be silently dropped (SecurityEventNotifier returns "
         "early when the recipient has no address). The [alerts] SMTP transport being configured "
         "does not make a notice deliverable -- on a first run the bootstrap administrator is created "
