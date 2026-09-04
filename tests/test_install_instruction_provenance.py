@@ -57,10 +57,17 @@ _PUBLISHED_DISTRIBUTIONS = frozenset({"messagefoundry-harness", "messagefoundry-
 #: Files whose install commands are shipped to, or executed by, someone other than a maintainer.
 #: CI workflows and internal handoffs are excluded deliberately: they install from the source tree by
 #: path, run only in our own checkout, and are not instructions anyone pastes into a deployment.
+#:
+#: BACKLOG #1193: the set scanned ZERO files of two of the three distributions this repo builds. Both
+#: ship code that raises operator-facing errors, exactly like the ``api/app.py`` RuntimeError this
+#: module exists because of, so the console and harness trees are now scanned too. They are green
+#: today -- the point is that the next install instruction written into either one is covered.
 _SHIPPED_TEXT_GLOBS = (
     "docs/*.md",
     "README.md",
     "messagefoundry/**/*.py",
+    "messagefoundry_webconsole/**/*.py",
+    "harness/**/*.py",
     "packaging/messagefoundry-webconsole/README.md",
 )
 
@@ -85,6 +92,22 @@ _EXTRA_REF = re.compile(r"messagefoundry\[(?P<extras>[^\]{}]+)\]")
 def _declared_extras() -> frozenset[str]:
     data = tomllib.loads((_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
     return frozenset(data.get("project", {}).get("optional-dependencies", {}))
+
+
+def _packaged_import_trees() -> frozenset[str]:
+    """The repo-root import package each `packaging/<dist>/` builds, read from its own build config.
+
+    Derived, not listed: both second distributions force-include a tree from the repo root into the
+    wheel (`../../harness` -> `harness`), and the wheel TARGET is the import package's name. A list
+    here would be a second definition of which trees ship, free to drift from the build.
+    """
+    trees: set[str] = set()
+    for pyproject in sorted((_ROOT / "packaging").glob("*/pyproject.toml")):
+        data = tomllib.loads(pyproject.read_text(encoding="utf-8"))
+        wheel = data.get("tool", {}).get("hatch", {}).get("build", {}).get("targets", {})
+        include = wheel.get("wheel", {}).get("force-include", {})
+        trees.update(str(target).split("/")[0] for target in include.values())
+    return frozenset(trees)
 
 
 #: Not install instructions, and excluded with a reason rather than silently.
@@ -112,6 +135,29 @@ def test_the_scan_actually_examined_something() -> None:
     files = _shipped_files()
     assert len(files) >= 20, f"the shipped-text scan matched only {len(files)} files: {files}"
     assert _declared_extras(), "pyproject declares no optional-dependencies -- the parse broke"
+
+
+def test_every_packaged_distribution_has_its_code_tree_scanned() -> None:
+    """The blind spot BACKLOG #1193 found, pinned so it cannot reopen.
+
+    Each distribution under `packaging/` ships an import package, and each such tree must contribute
+    files to the scan. Stated as a per-tree count rather than a total, because a total stays healthy
+    while one tree silently drops to zero -- which is exactly what happened.
+
+    Mutation: delete `messagefoundry_webconsole/**/*.py` from `_SHIPPED_TEXT_GLOBS`. Red: named below.
+    """
+    scanned = _shipped_files()
+    trees = {"messagefoundry"} | _packaged_import_trees()
+    assert len(trees) >= 3, f"the packaging parse found only {sorted(trees)} -- it broke"
+    empty = sorted(
+        tree
+        for tree in trees
+        if (_ROOT / tree).is_dir() and not any(f.is_relative_to(_ROOT / tree) for f in scanned)
+    )
+    assert not empty, (
+        f"these shipped code trees contribute ZERO files to the scan: {empty}. An install "
+        f"instruction written into one of them is invisible to every assertion in this module."
+    )
 
 
 def test_every_extra_named_in_shipped_text_is_declared() -> None:
@@ -237,6 +283,202 @@ def test_the_synthetic_probe_name_is_not_a_real_distribution() -> None:
     assert _SYNTHETIC_UNPUBLISHED not in packaged, (
         f"{_SYNTHETIC_UNPUBLISHED!r} is now a real distribution — pick another fictional probe name"
     )
+
+
+# --- BACKLOG #1193 (ASVS 15.2.4): no tracked text may assert a CLAIMED name is unclaimed ---------
+#
+# The arm this module was missing. Five shipped artifacts went on asserting `messagefoundry-webconsole`
+# was unpublished for weeks after the first release claimed the name, while every install-command
+# assertion above stayed green -- because none of them reads a factual CLAIM about publication state,
+# only the commands. A reader who trusted those five got the pre-claim world: install by path, the
+# name is claimable by anyone, no publishing job exists.
+#
+# Derived from `_PUBLISHED_DISTRIBUTIONS`, so it inverts on its own if a name is ever reclassified.
+
+
+#: Files the PROSE arm reads that the install-command scan deliberately does not. The install-command
+#: set is "text somebody pastes"; a factual claim about whether a name is claimed is wrong wherever it
+#: is written -- an owner-only release checklist and a workflow comment included, which is where two of
+#: the five lived.
+_PROSE_ONLY_GLOBS = ("packaging/*/*.md", ".github/workflows/release.yml")
+
+#: Ledgers and decision records are excluded for the same reason `BACKLOG.md` is excluded above: they
+#: record what was true when written, and rewriting history to satisfy a lint destroys the record.
+_PROSE_NOT_ASSERTIONS = frozenset({"BACKLOG.md", "CHANGELOG.md"})
+
+#: Phrasings that assert a distribution is not published. Deliberately narrow: each is a claim about
+#: PUBLICATION STATE, not merely a sentence containing "publish". Every alternative here is one that
+#: was measured to fire on one of the five retired sites; none is speculative.
+#:
+#: "unclaimed" is EXCLUDED, on evidence rather than caution. It was tried, and it fired on
+#: `packaging/messagefoundry-webconsole/README.md`, whose sentence says the opposite -- that claiming
+#: the name "forecloses the dependency-confusion substitution an unclaimed name invites". The word
+#: also carries an unrelated sense throughout the bootstrap-admin lifecycle. A detector that flags a
+#: correct sentence is one somebody switches off, and it caught none of the five.
+_UNPUBLISHED_ASSERTION = re.compile(
+    r"""
+      un-?published
+    | not \s+ (?:yet\s+)? published
+    | never \s+ been \s+ published
+    | does \s+ not \s+ reserve \s+ the \s+ name
+    | claimable \s+ by \s+ anyone
+    | until \s+ the \s+ owner \s+ publishes
+    """,
+    re.IGNORECASE | re.VERBOSE,
+)
+
+
+def _published_name_spellings() -> frozenset[str]:
+    """Every spelling a published distribution is referred to by: its name and its import name."""
+    return frozenset(
+        set(_PUBLISHED_DISTRIBUTIONS)
+        | {name.replace("-", "_") for name in _PUBLISHED_DISTRIBUTIONS}
+    )
+
+
+def _prose_blocks(text: str) -> list[tuple[int, str]]:
+    """Blank-line-delimited blocks of ``text``, as ``(first line number, block text)``.
+
+    A claim and the name it is about routinely sit on different lines -- a wrapped Markdown
+    blockquote, a multi-line ``#`` comment. Line-at-a-time matching misses every one of the five
+    sites this arm exists for, and a fixed +/-N window has no principled size. A blank line is where
+    the author already said one thought ended.
+    """
+    blocks: list[tuple[int, str]] = []
+    current: list[str] = []
+    start = 1
+    for lineno, line in enumerate(text.splitlines(), 1):
+        if line.strip():
+            if not current:
+                start = lineno
+            current.append(line)
+        elif current:
+            blocks.append((start, "\n".join(current)))
+            current = []
+    if current:
+        blocks.append((start, "\n".join(current)))
+    return blocks
+
+
+def _prose_files() -> list[Path]:
+    """The shipped-text set plus the prose-only globs, DEDUPLICATED -- the console README is in both,
+    and a file read twice reports the same site twice."""
+    seen = list(_shipped_files())
+    for pattern in _PROSE_ONLY_GLOBS:
+        seen.extend(sorted(_ROOT.glob(pattern)))
+    return sorted({p for p in seen if p.is_file() and p.name not in _PROSE_NOT_ASSERTIONS})
+
+
+def _unpublished_claims(files: list[Path]) -> list[str]:
+    """Blocks that assert a PUBLISHED distribution is unpublished, as ``path:line`` problems.
+
+    The name is looked for in the claim's block AND its two neighbours. Measured, and the reason the
+    window is not one block: `docs/SERVICE.md` said *"The wheel is not published to an index yet, so
+    install it by path:"* and then named the distribution in the fenced command underneath, one blank
+    line away. A single-block rule found four of the five sites and missed that one.
+    """
+    spellings = _published_name_spellings()
+    problems: list[str] = []
+    for path in files:
+        blocks = _prose_blocks(path.read_text(encoding="utf-8"))
+        for index, (lineno, block) in enumerate(blocks):
+            if not _UNPUBLISHED_ASSERTION.search(block):
+                continue
+            window = "\n".join(text for _, text in blocks[max(index - 1, 0) : index + 2])
+            named = sorted(s for s in spellings if s in window)
+            if named:
+                rel = path.name if not path.is_relative_to(_ROOT) else path.relative_to(_ROOT)
+                problems.append(f"{Path(rel).as_posix()}:{lineno} calls {named} unpublished")
+    return problems
+
+
+def test_the_prose_scan_actually_examined_something() -> None:
+    """Liveness receipt, and it must be its own: `_prose_files` adds globs the shipped set has not."""
+    files = _prose_files()
+    assert len(files) >= 25, f"the prose scan matched only {len(files)} files"
+    assert any(p.suffix == ".yml" for p in files), "the workflow glob matched nothing"
+    assert _published_name_spellings(), (
+        "no distribution is classified published -- the derive broke"
+    )
+
+
+def test_no_tracked_text_asserts_a_published_distribution_is_unpublished() -> None:
+    """The arm that would have caught all five (BACKLOG #1193).
+
+    Mutation: restore `release.yml`'s "does NOT reserve the name" comment, or
+    `docs/SERVICE.md`'s "The wheel is not published to an index yet". Red: named below.
+    """
+    problems = _unpublished_claims(_prose_files())
+    assert not problems, (
+        f"tracked text asserts a distribution is unpublished while this module classifies it "
+        f"PUBLISHED: {problems}. Published: {sorted(_PUBLISHED_DISTRIBUTIONS)}. Correct the prose -- "
+        f"do NOT add the name back to _UNPUBLISHED_DISTRIBUTIONS to make this pass, which is the same "
+        f"defect inverted: a classification edited to agree with whichever artifact is convenient."
+    )
+
+
+@pytest.mark.parametrize(
+    ("block", "flagged"),
+    [
+        # The five real shapes, reduced. Each spans lines, which is why blocks and not lines.
+        ("# grants permission to publish but does NOT reserve the\n# name", False),  # names nothing
+        (
+            "# `messagefoundry-webconsole` is registered as PENDING\n"
+            "# ... does NOT reserve the name: claimable by anyone",
+            True,
+        ),
+        ("The messagefoundry-webconsole wheel is\nnot published to an index yet", True),
+        (
+            "an instruction to fetch an UNPUBLISHED distribution\nnamed messagefoundry_webconsole",
+            True,
+        ),
+        # A published name discussed WITHOUT a publication-state claim stays green.
+        ("Install it with pip install messagefoundry-webconsole alongside the engine", False),
+        # The bootstrap-admin sense of "unclaimed" must never fire, even beside a distribution name.
+        (
+            "messagefoundry-harness talks to the API; an unclaimed bootstrap admin\n"
+            "is disabled after 72h",
+            False,
+        ),
+        # The measured false positive that removed "unclaimed" from the pattern: this sentence, in
+        # packaging/messagefoundry-webconsole/README.md, asserts the OPPOSITE of what it was flagged for.
+        (
+            "The messagefoundry-webconsole name is registered on PyPI. Claiming it forecloses\n"
+            "the dependency-confusion substitution an unclaimed name invites.",
+            False,
+        ),
+        # A genuinely unpublished thing that is not one of our distributions stays green.
+        ("The security corpus is not published in this repository", False),
+    ],
+)
+def test_the_prose_detector_needs_both_a_claim_and_a_published_name(
+    block: str, flagged: bool
+) -> None:
+    """Guard-the-guard, both directions. A detector that fired on every "publish" would be turned off;
+    one that needed the claim and the name on the SAME LINE would have caught none of the five."""
+    named = any(s in block for s in _published_name_spellings())
+    hit = bool(_UNPUBLISHED_ASSERTION.search(block)) and named
+    assert hit is flagged, f"{block!r}: expected flagged={flagged}, got {hit}"
+
+
+def test_the_prose_arm_fires_on_the_text_it_was_written_for(tmp_path: Path) -> None:
+    """NEGATIVE CONTROL against a FILE, not a string. The arm's silence over the tree is only
+    evidence if the same function, over the same file machinery, still reports a real site.
+
+    Reconstructs `release.yml`'s retired comment -- the claim and the name on different lines, which
+    is what defeats a line-at-a-time scan -- and asserts `_unpublished_claims` names it with the right
+    line number. Without this, the assertion above is a `not found` never seen to find anything.
+    """
+    staged = tmp_path / "probe.md"
+    staged.write_text(
+        "# heading\n"
+        "\n"
+        "`messagefoundry-webconsole` is registered on PyPI as a PENDING Trusted Publisher,\n"
+        "which does NOT reserve the name.\n",
+        encoding="utf-8",
+    )
+    found = _unpublished_claims([staged])
+    assert found == ["probe.md:3 calls ['messagefoundry-webconsole'] unpublished"], found
 
 
 # --- BACKLOG #1193 (ASVS 15.2.4): the README's signing claim must match the workflow -------------
