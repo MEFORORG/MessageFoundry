@@ -19961,6 +19961,29 @@ shape a reader is least able to detect.
 > #1375, and both assert the allowlist backup already exists, which the row refutes from source. The
 > pair is the whole lesson: **#1300 is a row the tree can see and the ledger cannot; #1375 is a row
 > neither can see, carrying a citation that points the wrong way.** MUST BE READ, never a verdict.
+>
+> **2026-09-04 (builder): the screen is WIRED INTO THE DISPATCH PATH, with both controls.**
+> [`dispatch_gate.py`](../scripts/coord/dispatch_gate.py) now asks the tree before it grades a wave
+> -- one `git grep` over `origin/main` through the screen -- and a joined-form hit raises the row to
+> the gate's existing `read` level. **It is ON by default**, because an opt-in tree check is a tree
+> check nobody runs and the failure it catches is invisible to everyone who does not run it;
+> `--no-tree` is the escape for a checkout with no remote. **Controls at `a2eef0f37`: #1300 comes
+> back cited from three locations and reaches the caller as MUST BE READ, and #1396 comes back clear
+> with its note returned BYTE-IDENTICAL.** The negative arm asserts equality rather than absence, so
+> a fold that elevates everything passes the positive arm and fails this one. Three mutations were
+> run and reverted: a merge that elevates nothing reddens five tests including the module self-test,
+> a widened extractor reaching the bare form reddens its one pinned arm, and swallowing the
+> instrument error reddens the reason arm.
+>
+> **Nothing blocks on a tree hit and `--refuse` does not either**, for the flag-rate reason this row
+> already prices. Only the joined form elevates, because a bare `#N` spells a pull-request number
+> just as well as an item number. A failure to ask returns a REASON and never an empty result -- an
+> unfetched ref returns zero lines, which is byte-identical to a clean tree -- so the header prints
+> `TREE NOT ASKED` with the reason and the footer names the class that went undetected. **This row is
+> now its own worked example of the caveat:** the gate reports #1398 as MUST BE READ, cited from
+> `landed_citation_screen.py`, and that citation is the STANDALONE SCREEN rather than the wiring. A
+> citation is not a completion. What the row asked for is built; closing it is a judgement this seat
+> does not make.
 
     tests/test_required_contexts.py:235
       test_the_ci_gate_rollup_comment_names_every_job_the_job_actually_needs()
