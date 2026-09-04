@@ -420,15 +420,14 @@ class DirectDestination(DestinationConnector):
             with self._connect() as smtp:
                 if self.username is not None:
                     # NOT smtp.login(): it tries CRAM-MD5 FIRST, an HMAC over MD5 (BACKLOG
-                    # #1171, ASVS 11.4.1). escape_permitted=False because this cell's
-                    # cleartext-credential refusal at construction is absolute -- a send-time
-                    # backstop that is weaker than the gate it backs up is a hole.
+                    # #1171, ASVS 11.4.1). The helper's cleartext-AUTH refusal is absolute,
+                    # matching this cell's construction gate -- a send-time backstop that is
+                    # weaker than the gate it backs up is a hole.
                     smtp_login_approved(
                         smtp,
                         self.username,
                         self.password or "",
                         channel_encrypted=self.use_tls,
-                        escape_permitted=False,
                         cell="DIRECT outbound",
                     )
                 smtp.send_message(msg)
@@ -471,7 +470,6 @@ class DirectDestination(DestinationConnector):
                         self.username,
                         self.password or "",
                         channel_encrypted=self.use_tls,
-                        escape_permitted=False,
                         cell="DIRECT outbound probe",
                     )
                 smtp.noop()

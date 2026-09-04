@@ -126,6 +126,12 @@ def fhir_lookup(
     (``urlencode(quote_via=quote, safe="")``), so a value can **never** inject an extra search
     parameter, and a ``list[str]`` value expands to repeated params.
 
+    **That is a URL-layer guarantee, and it is not the whole story: it does not neutralise FHIR's own
+    value-layer separators, so a message-derived value can still change what a search MEANS.** Screen
+    such a value in your Handler. The mechanism, the affected characters and the open item are stated
+    once, on ``messagefoundry.transports.fhir._encode_search_params`` — read it before you pass message
+    data into ``params``.
+
     A ``?``-query inside ``query`` is **refused** (:class:`FhirLookupError`). It used to be supported and
     rode the URL exactly as authored, which made per-value encoding the caller's duty — an
     ``f"Patient?identifier=MRN|{pid}"`` with ``pid="123&_count=99999"`` injected an extra FHIR search
