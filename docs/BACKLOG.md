@@ -19907,6 +19907,45 @@ So on a first deployment the table would grow for the life of the instance, one 
 
 This is load-bearing rather than cosmetic. If chain-breakage holds, in-place deletion is closed and only an archive-then-verify path is open. If it does not, an ordinary age window is available and the only bar is the retention requirement. **Nothing on `main` settles it, and it should be settled before anyone sizes a bound.**
 
+#### Measured 2026-09-03 at `fd44b0f17` -- the answer is BOTH, split by which rows you delete
+
+The three files disagree because each states half of a two-part fact. Driven, not read: a throwaway SQLite store in a temp directory, six rows written through the real `MessageStore.record_audit`, then each deletion shape applied out-of-band with plain SQL and `verify_audit_chain` re-run. The baseline verified clean, and an in-place `UPDATE` of one row's `actor` broke it at that row -- the negative control, without which a walk that always said `False` would look like a finding.
+
+**What is hashed.** `audit_row_hash` ([`store/store.py:979`](../messagefoundry/store/store.py)) JSON-encodes `[prev_hash, ts, actor, action, channel_id, detail]`, appends `client` as a conditional seventh element only when it is not NULL, and digests that with SHA-256 keyless or HMAC-SHA256 when a store key is configured. **The row `id` is not in the payload.** The link is to the previous row's *stored* `row_hash`, and `record_audit` (`:7524`) reads that head under `self._lock` immediately before the INSERT, so chain order is `id` order and nothing else.
+
+**A verifier exists, reachable by three independent routes.** `verify_audit_chain` sits on the `Store` protocol ([`store/base.py:1541`](../messagefoundry/store/base.py)) and is implemented on all three backends; the CLI ships `audit-verify` and `audit-anchor` ([`__main__.py:617`](../messagefoundry/__main__.py) and `:646`); and the engine can re-walk once at start behind `[integrity].audit_verify_on_start`, **which ships `False`** ([`settings.py:3364`](../messagefoundry/config/settings.py)). Those three are the positive control on the search -- a sweep that found none of them would be indistinguishable from a repository with no verifier, and this is not that case. So "breaks the chain" is a claim with a running instrument behind it.
+
+**What each case did.**
+
+| case | what was deleted | `verify_audit_chain()` afterwards |
+|---|---|---|
+| A | one interior row (id 3 of 6) | `(False, 'audit chain broken at row id=4')` |
+| B | the two oldest rows -- the shape an age window would use | `(False, 'audit chain broken at row id=3')` |
+| C1 | the two oldest, then re-inserted with their ORIGINAL `id` and `row_hash` | `(True, 'verified 6 audit row(s)')` |
+| C2 | the two oldest, then re-inserted appended at the tail as new ids | `(False, 'audit chain broken at row id=3')` |
+| D | the two newest -- the blind spot the docstring already documents | `(True, 'verified 4 audit row(s)')` |
+
+Case D is caught by `expected_anchor` and by #328's `expected_prefix` comparator; A and B need neither, because the bare walk already fails. A and B were re-run under the keyed HMAC posture and returned identical verdicts, so the answer does not turn on whether a store key is set.
+
+**Three consequences that only driving it produced.**
+
+1. **A break is permanent, and nothing heals it.** After case B, appending a fresh `record_audit` row still verified `False` at the same row, and so did closing and reopening the store. `_backfill_audit_chain` (`:2384`) fills only rows whose `row_hash` is NULL and skips any row that has one, by design, so a reopen cannot repair a purge.
+2. **One purge reports exactly one break, and it reads identically to a tamper.** Case B deleted two rows and the walk named a single row id, because it chains from the STORED hash rather than the recomputed one. The sentence a purged chain produces and the sentence the `UPDATE` control produced are the same sentence. On a first deployment an operator could not tell a configured retention pass from an attacker from the verifier output alone.
+3. **Restoring archived rows is order-sensitive, not merely content-sensitive.** C1 and C2 restored identical column values and differed only in whether the original `id` came back. An archive format that keeps row content but drops `id` or `row_hash` cannot be restored into a chain that verifies.
+
+**Which file is right: none of the three states the whole fact, and a fourth record already does.** [`docs/CONFIGURATION.md`](CONFIGURATION.md)'s `audit_days` row carries a 2026-07-30 correction saying the chain argument is "true only of deleting the **oldest** rows" and is inverted for the threat, and it declares itself the source of record for that reasoning. **This measurement confirms that row and contradicts nothing in it.** Against it, `config/settings.py` and `docs/PHI.md` state chain-breakage unconditionally -- right about a purge, wrong about the threat -- while `config/retention_classification.py` excludes it in terms, which is right about the threat and wrong about a purge. **The correction is deliberately NOT made here.** Reconciling the artifacts is the act this row already scopes, and folding it into the same commit as the evidence would leave nobody able to check the evidence on its own.
+
+**What this implies for each lever, choosing between none of them.**
+
+| lever | what the measurement does to it |
+|---|---|
+| a retention bound as an in-place age window | **Closed as an ordinary DELETE.** On a first deployment it would break the walk at the first surviving row, permanently, with the same message a tamper produces. What stays open is a purge that RE-SEALS -- re-hashing the surviving prefix from an empty `prev` -- which destroys the pre-purge evidence and would need its own anchor to mean anything. |
+| archive-then-verify | **Open, and C1 gives it a precise contract.** The archive must carry `id` and `row_hash`, not just row content, and a restore must land the rows back at their original ids. |
+| a rate or sampling bound on read grants | **Untouched.** It changes how many rows are written and deletes none, so the chain constrains it not at all. Its cost is completeness of the grant trail, not integrity. |
+| enrolling audit in the ADR 0055 group committer | **Not measured, and the chain sets one constraint on it.** Each hash folds the previous row's stored hash, so the head read and the INSERT must stay serialized in `id` order; the standalone commit inside `self._lock` gets that for free today. Derived from what was measured, not driven -- no group-commit path was exercised. |
+
+**The owner DELEGATED this question; nobody ruled on it.** It was put to the owner on 2026-09-03 and the answer was *"proceed as you judge best"*. That is the same shape as the #1277 delegation [ADR 0118](adr/0118-secure-by-default-security-configuration-section.md) now records, and cost 4 below is about precisely that defect, so it is filed as a delegation rather than written up as a ruling. The measurement above is what a ruling should rest on. **This row stays open and still picks no fix.**
+
 ### Cost 2 -- the per-request cost is a standalone COMMIT on the store's write lock, not merely a row
 
 #1277 and PR 749 both state this. It is re-traced here rather than inherited, at `efe061a3f`:
