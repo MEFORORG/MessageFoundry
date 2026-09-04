@@ -501,7 +501,7 @@ if ($armedRemote) {
     # remote; the bare shape this line used to print still resolves, to that contested fossil. So
     # an operator who built a query from the old wording got a CONFIDENT HIT at a commit belonging
     # to neither repository and concluded their work was backed up. Keep this in step with
-    # scripts/hooks/durability_push.sh:93 and :97.
+    # scripts/hooks/durability_push.sh:122 and :126 -- the two lines that assign $TAG.
     Write-Host "             Every commit now also lands as refs/tags/rescue/auto/<repo>/<branch>"
     Write-Host "             there, or refs/tags/rescue/auto/<repo>/detached/<sha> off a branch."
 } else {
