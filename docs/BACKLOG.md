@@ -21444,3 +21444,75 @@ The other four are posture, inherited from the tripwire as it already stood:
 **FOUR SESSIONS INDEPENDENTLY READ THIS THE OTHER WAY, so it is pinned by test rather than by argument.** The shared reading was that this row pins a digest of the corpus, so a CRLF checkout would make the tripwire accuse a clean install of tampering. It does not pin one: `_ATTESTED_ASSETS` holds two relative path strings and the diff contains no hex literal of 32 characters or more, checked with a positive control that fired. `test_line_endings_alone_never_report_tampering` now covers both arms -- an LF wheel and a CRLF wheel each attest clean, because the content and the baseline move together -- and `test_a_swap_of_line_endings_AFTER_install_is_still_drift` is its control, sealing a baseline over LF and rewriting the file as CRLF, which `pip` cannot produce but an in-place editor can, and which must drift. Only that mixed state fails, and nothing that builds a wheel can create it.
 
 **The missing pin is a real and separate defect**, and it is a reproducible-builds question rather than an attestation one: a wheel built from a Windows checkout carries a byte-different corpus from one built on Linux, so the two wheels' `RECORD` rows for that file disagree while the content is identical. Not filed against a number here, because allocating one to gesture at unowned work is what the ledger rules forbid; named by subject instead, and left for whoever owns the corpus build.
+
+---
+
+## 1439. webconsole_seam_snapshot.py resolves messagefoundry from sys.path, not from its own repo
+
+> 🔢 **Filed 2026-09-03 - BUILT IN THIS COMMIT, not yet landed.** Found while building #1139, by a session that spent its debugging on the gate instead of the generator. The census in LIMB 3 is the reason this is filed as one defect and not a class.
+
+**Cluster:** repository tooling. **Priority:** P3. **Verdict:** build.
+**Severity:** no engine effect, no PHI axis, and **no deployment axis (sec. 0)** -- `scripts/` ships in no wheel and this tool touches no product surface. The cost is real and bounded to a developer's session: **wasted debugging, and a gate a reader would "fix" in the wrong direction.** Nothing was mis-shipped, because CI runs on a hosted runner with exactly one engine tree, where the defect cannot express itself.
+
+**What:** `scripts/webconsole_seam_snapshot.py` derived the seam digest from whichever `messagefoundry` `sys.path` happened to offer, while reading `_CONSOLE_DIR` and `_ENGINE_DIR` out of the repository it lives in. Run from a git worktree with no `.venv` of its own -- the normal state for these sessions -- those are two different trees.
+
+**Python puts the SCRIPT's directory on `sys.path[0]`, never the caller's cwd.** So `scripts/` led the path, no entry offered `messagefoundry`, and the import fell through to site-packages. The interpreter reached for in a `.venv`-less worktree is the primary checkout's, and its site-packages holds `_editable_impl_messagefoundry.pth` containing the **primary checkout's root** -- a path-based editable install, which is why an ordinary `sys.path.insert(0, ...)` is enough to beat it.
+
+**LIMB 1 -- THE SUCCESS OUTPUT IS THE PART THAT MISLEADS.** Measured 2026-09-03 in a worktree with no `.venv` of its own: `python scripts/webconsole_seam_snapshot.py --write` printed the **primary** tree's digest `93ba1f10b9dccfc8`, rewrote `messagefoundry/api/_ui_seam.py` and the golden with that unchanged value, and reported success naming both files it had rewritten -- while `tests/test_webconsole_seam_snapshot.py` kept failing against `266cbfd342b22819`, the digest of the tree the test was reading and the script never had.
+
+This is the **SDS-3.8** shape: the instrument answered a question adjacent to the one asked. It is worse than a plain error because the only loud word in the room was `rewrote`. The remediation on offer to a reader is that the **gate** is broken, and the gate was right the whole time. A tool that fails by printing `--write` twice teaches a repair to the wrong artifact.
+
+**LIMB 2 -- THE MEASUREMENT, AS A CONTROLLED COMPARISON.** Reproduced 2026-09-03 in a second such worktree under the primary checkout's interpreter, four scripts run by path from one cwd, with `sys.path[0]` set to each target's own directory. The **only** variable is whether the script anchors itself:
+
+```
+scripts/bench/stage_residency.py       -> <THIS WORKTREE>/messagefoundry/__init__.py
+scripts/security/dast_auth_sweep.py    -> <THIS WORKTREE>/messagefoundry/__init__.py
+scripts/tray/make_icons.py             -> <THIS WORKTREE>/messagefoundry/__init__.py
+scripts/webconsole_seam_snapshot.py    -> <PRIMARY CHECKOUT>/messagefoundry/__init__.py
+```
+
+**The first instrument tried was the wrong one and is recorded here so it is not tried again.** A `runpy.run_path` probe from the repo root reported all four resolving correctly. It could not have done otherwise: `runpy` in that process left cwd on `sys.path`, so it never reproduced a by-path invocation. Confirming the instrument answers the asked question is the same SDS-3.8 discipline this item is about, and it caught a false clean one step in.
+
+**LIMB 3 -- THE CENSUS BOUNDS IT AT EXACTLY ONE SCRIPT.** Every `.py` under `scripts/` importing an in-repo top-level package (`messagefoundry`, `messagefoundry_webconsole`, `harness`, `tee`, `ide`), including indented and deferred imports:
+
+| Script | Anchors on `__file__` | Runnable by path | Verdict |
+|---|---|---|---|
+| `bench/stage_residency.py` | yes, `parents[2]` | yes | safe |
+| `security/dast_auth_sweep.py` | yes, `parents[2]` | yes (CI + by hand) | safe |
+| `security/dast_target.py` | no | **no** -- library, no `__main__` | not exposed |
+| `security/route_gates.py` | no | **no** -- library, no `__main__`, says so | not exposed |
+| `tray/make_icons.py` | yes, `parents[2]` | yes | safe |
+| `webconsole_seam_snapshot.py` | **no** | yes, and the docs prescribe it | **this item** |
+
+The two unanchored security modules are reached only as `scripts.security.X`, which already requires the root on `sys.path` -- `dast_auth_sweep.py` inserts it before importing them, and pytest supplies it. They inherit a corrected path and are not in the class. `scripts/security/crypto_inventory_check.py` names those packages only in AST-matching string constants, not imports.
+
+**So three siblings already carried this fix and one was missed.** That is the strongest thing the census says: the pattern was settled here, and the shape of a per-script anchor is exactly why a fourth omission was invisible -- there is no list of anchored scripts for an unanchored one to be absent from.
+
+**THE CENSUS IS KEYED ON THE ABSENCE OF AN EXPLICIT ANCHOR, NEVER ON OBSERVED RESOLUTION, AND THE DIFFERENCE IS NOT ACADEMIC.** Three peer sessions raised this independently on 2026-09-03 and they are right: a script can resolve to the correct tree today for a reason that has nothing to do with the script. Measured here, one interpreter, one command, three working directories:
+
+| Invocation | `sys.path[0]` | Resolves to |
+|---|---|---|
+| `python -c "import messagefoundry"` from a worktree root | `''` (cwd) | **the worktree** |
+| the same, from the primary checkout root | `''` (cwd) | the primary |
+| the same, from a neutral cwd | `''` (cwd) | the primary, via the `.pth` |
+| `python scripts/<any>.py` from anywhere | the script's dir | the primary, via the `.pth` |
+
+**That is this defect's mirror image.** A by-path script reads the primary because nothing anchors it; a bare interpreter reads the worktree because cwd happens to win. Both are the same missing anchor, and only one of them looks wrong. **A census keyed on "which tree did it resolve to" would clear every script whose cwd currently rescues it, and each of those flips silently the day it is launched from somewhere else.** The fleet's standard recipe for a `.venv`-less worktree -- the primary checkout's interpreter run from the worktree root -- depends entirely on that rescue.
+
+**THE TABLE ABOVE WAS THEREFORE RE-DERIVED BY AST, NOT BY READING**, on the predicate *imports an in-repo top-level package AND is runnable by path AND puts nothing on `sys.path`*. It agreed with the reading exactly. **Positive control, because a pattern that finds nothing anywhere is indistinguishable from a clean tree:** 53 `.py` files under `scripts/`, 28 deriving a path from `__file__`, 6 importing an in-repo package -- the walk is live. **Control on the instrument itself:** run against the parent commit's source the census flags `scripts/webconsole_seam_snapshot.py` as `EXPOSED` and nothing else; run against the fix it reports none. A census that cannot see the defect it was written for is not evidence of a clean directory.
+
+**The two library modules are structurally safe, not accidentally safe, and the distinction matters given the above.** `dast_target.py` and `route_gates.py` are reached only as `scripts.security.X`. That import form cannot resolve at all unless the repo root is already importable, so the root that supplies the module is necessarily the root that supplies its `messagefoundry` -- one tree by construction, not by cwd. They are not relying on the rescue.
+
+**WHAT THIS CENSUS COULD NOT SEE.** Its scope is `scripts/**/*.py` and nothing else -- `harness/`, `tee/`, `ide/` and the workflow-embedded `python -c` invocations were not examined. Its runnability test is the presence of a `__main__` guard, which would misjudge a module invoked by path despite having none. And it says nothing about the wider class the peers named: any process that resolves the package while cwd is not the worktree root reads the primary instead, which is a property of the fleet's test recipe rather than of any file in this directory.
+
+**THE FIX IS THE INSERT THE SIBLINGS ALREADY HAVE**, above the `from messagefoundry...` imports, citing the rule `scripts/coord/alloc.ps1` states for `git` (#1060): anchor on the script, not on the caller.
+
+**LIMB 4 -- WHY THERE ARE TWO TESTS, AND WHY THE OBVIOUS ONE IS NOT ENOUGH.** `test_the_script_run_by_path_computes_the_same_digest` runs the generator as a subprocess, by path, from a cwd that is not the repo root and with `PYTHONPATH` scrubbed, and requires its digest to equal the one the test derives in-process. Both scrubs are load-bearing: under pytest the root is already on `sys.path`, so **every in-process check in that file is blind to this defect by construction**, and a subprocess inheriting either rescue would pass for a reason unrelated to the script.
+
+**That test cannot fail on a hosted runner, and measured here it did not fail without the fix either.** One engine tree means an unanchored script finds the right one by luck; and on this box the primary and the worktree currently carry the *same* seam, so the wrong tree returned the right number. **A test whose environment cannot produce the failure is not evidence the failure is absent.**
+
+So `test_the_script_prefers_its_own_repo_over_an_earlier_path_entry` supplies the second tree itself: a decoy `messagefoundry` package on `PYTHONPATH`, which for a by-path invocation sits **ahead of site-packages and behind** an explicit `sys.path.insert(0, repo_root)`. The decoy wins if and only if the anchor is gone, on any machine, with no worktree and no second checkout needed.
+
+**Verification:** 8 passed in `tests/test_webconsole_seam_snapshot.py`. Mutation check run rather than argued -- with the `sys.path.insert` line deleted, the decoy test reds naming the decoy import, and the by-path digest test **stays green**, which is the luck described above measured rather than predicted. Anchor restored, 8 passed again.
+
+**Adjacent and NOT fixed here, named rather than numbered.** `docs/WEBCONSOLE-PACKAGE.md`'s seam-refresh procedure is stale in three steps left behind by #1220: it says to bump `ENGINE_UI_SEAM` by hand (`1` to `2`) when the value is a derived digest, it says to update curated lists in this script that #1220 retired, and its step 5 prescribes `python scripts/webconsole_seam_snapshot.py > tests/golden/...`, the shell redirect this script's own docstring forbids because PowerShell's `>` writes UTF-16LE with a BOM into a file the test reads as UTF-8. That is doc drift with its own cause and it wants its own item; folding a documentation rewrite into a `sys.path` fix would make both harder to review.
