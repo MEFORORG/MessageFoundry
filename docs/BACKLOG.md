@@ -20623,3 +20623,94 @@ helper-per-class split and for why each hook carries a local copy), #1339 (a dif
 
 **Source:** measured 2026-09-03 while re-verifying #1040 against `origin/main` at `fd44b0f1`, by
 enumerating every hook that writes text an agent acts on rather than only the ones #1040 named.
+
+## 1431. the dangling-citation detector runs in no workflow and no hook, so its nine unresolved numbers report to nobody
+
+> 🔢 **Filed 2026-09-03. THE WIRING LIMB SHIPPED WITH THIS ROW; THE ENFORCEMENT DECISION AND THE CITATION REPAIRS DID NOT.** `scripts/docs/dangling_citation_check.py` works and its findings are real, but until this row nothing ran the SCRIPT: the filing PR adds an ADVISORY job to `.github/workflows/quality-advisory.yml` that reports on every pull request and cannot fail one. Promoting it to a merge gate is deliberately **available and untaken** -- that is an owner call, not a Builder's, on the #353 precedent -- and so is repairing any of the citations below.
+>
+> **Scored 2026-09-03 -> P3.** Value **4/10** · Difficulty **2/10** · _fill-in_. The remaining limbs are an owner ruling on enforcement plus, if that ruling goes the blocking way, moving the job's context into branch protection and `.github/required-contexts.txt` with the count in `tests/test_required_contexts.py` in the same pull request. No engine code, no dependency, no new CI leg.
+> Verdict: owner-ruling
+> Research: none
+> Closing-act: owner-ruling
+
+**Cluster:** Ledger hygiene / gate wiring. **Priority:** P3. **Verdict:** owner-ruling.
+**Severity:** no deployment axis (sec. 0). Nothing here reaches a running instance; the cost is paid by a future reader of the ledger.
+
+### The measurement, at `46ea10a78`
+
+`python scripts/docs/dangling_citation_check.py docs/BACKLOG.md` reports **53 tokens across 9 distinct numbers** -- #1084, #1203, #1231, #1297, #1303, #1326, #1364, #1411 and the pyodbc one dealt with below -- each naming no item in either ledger.
+
+**FILING THIS ROW RAISES THAT COUNT, AND THAT IS EXPECTED.** Naming eight of the nine as subjects adds tokens the tool reports, all of them below the floor and so permanently unable to arm. The ninth is written only in its qualified `mkleehammer/pyodbc#1459` form throughout this row, because the bare spelling **is** the live shape and a row about the defect must not become an instance of it. The tool caught exactly that during drafting.
+
+**THE JOB THIS ROW WIRES REPORTS A BIGGER NUMBER, AND THE TWO MUST NOT BE READ AS A DISAGREEMENT.** The figures above scan one file, because that is where the row's subject lives. The advisory job scans the tool's default, all of `docs/**/*.md`, and with this row filed that is **83 tokens across 11 distinct numbers** -- driven end to end locally, exit 0. The two extra numbers are the same two kinds already in the table below and neither is new: one is a pull-request number in `docs/adr/README.md` and `docs/adr/0104-*.md`, and one is another allocation made from the wrong worktree, recorded in the closed archive. Both sit below the floor. Anyone reconciling the job's output against this row should expect 11, not 9.
+
+**IT THEN EXITS 0, AND THAT ZERO IS CORRECT.** This is worth stating plainly, because the obvious reading -- a detector that finds nine things and passes anyway -- is wrong and would send someone to "fix" a working exit code. The tool fails closed on the LIVE shape by default; `--advisory` is the opt-out. Today it exits 0 because **zero of the 53 tokens are live-shape**: 50 sit at or below the allocator's high-water mark and can never be issued, and the other 3 are another project's issue number. Measure the exit code directly, not through a pipe -- `$?` after `| tail` reads `tail` (SDS-3.8).
+
+### The wiring gap, verified at HEAD rather than read from the docstring
+
+The script's own module docstring claims it is invoked by no workflow and no pre-commit hook. That claim is **true at `46ea10a78`**, re-measured with controls in the same pass rather than trusted:
+
+| probe over `.github/` + `.pre-commit-config.yaml` | lines |
+|---|---|
+| `scripts/docs/dangling_citation_check.py` (the subject) | 0 |
+| `scripts/docs/backlog_citation_check.py` (positive control -- a real `run:` at `backlog-hygiene.yml:236`) | 1 |
+| `scripts/docs/zzz_nonsense.py` (null control) | 0 |
+
+The one `.github/` line carrying this module's name is `ci.yml:250`, and it names the **test**, not the script -- the `DOC_GUARDS` entry. `.mefor-hooks/pre-commit` execs `messagefoundry check` and nothing else. So a behaviour change in the tool can red a build by way of its test; a FINDING could reach nobody.
+
+### The recognition rule, determined because a control failed
+
+A first attempt to positive-control this tool planted `See BACKLOG #999998 for details.` in a scratch file and got "No unresolved backlog citation" back. **The control did not fire, and the reason is the window, not a path filter and not a file-type filter.** `_LOW = 1000` and `_HIGH = 9000`, so `#999998` is out of range and invisible. A detector nobody can make fire on demand is one nobody can trust when it says clean, so the rule is recorded here in full. A token is recognised when **all** of these hold:
+
+1. It is `#` immediately followed by digits, **ending at a non-alphanumeric boundary**. `#8997abc` does not match -- that boundary is what stops a CSS or Mermaid hex colour reading as a citation.
+2. The number lies in `[1000, 9000)`.
+3. A space between `#` and the digits disqualifies it, so a `## 1431.` item heading cannot report as a citation of itself.
+
+Two further rules decide only whether a recognised token can arm, and neither suppresses reporting: a number **at or below** the ledger high-water mark can never be issued, and a token introduced by `PR`/`pull request`/`commit`/`issue`/`discussion` or glued to an identifier (`pyodbc#1459`) is another namespace's number.
+
+**How to make it fire on demand.** In any file, write the words `See BACKLOG`, then a `#` glued directly to `8999`, then a full stop, and pass that path. Measured 2026-09-03: reported, annotated *This is the live shape*, exit **1**. Introduce the same token with the word `PR` in front instead and it is reported and annotated but does **not** change the exit code, which is the distinction the annotation exists to draw. The file need not be Markdown and need not be inside `docs/` -- only the DEFAULT path list is `docs/**/*.md`, and it is relative to the current working directory.
+
+**That recipe is spelled out rather than shown for a reason worth keeping.** A literal worked example of a live-shape citation, pasted into this ledger, IS a live-shape citation -- it would report forever as a defect in the row explaining the defect, and no reader could tell the demonstration from the disease. So the one artifact that most wants a copy-pasteable example is the one that cannot hold it.
+
+**THAT DEFAULT IS ITSELF A COVERAGE GAP, and #1364 below is the worked instance.** The citations that actually resolve to nothing in the repository today sit in `.gitattributes`, a `scripts/quality/` module and a test file. None of them is Markdown, so the scan as wired reads about them and never reads them.
+
+### The nine are not one thing, and a count that fuses them is wrong
+
+Every one of the 53 tokens is **below the floor** (1421 at the time of measuring, from the ledger headings) except the three foreign-repo ones, so **none can arm**. The kinds differ:
+
+| number | tokens | kind |
+|---|---|---|
+| #1084 | 17 | Allocated, then **dropped** during PR #261's merge resolution on the owner's instruction. Never reached `main` and never will. The ledger says so in terms: the number "stays allocated and burned rather than reused". |
+| #1203 | 8 | **Allocated and never filed.** The allocator record exists; no heading does. Separately MIS-CITED at `.github/workflows/asvs-tally-lint.yml:3`, where the item implemented is #1204. |
+| #1231 | 6 | Allocated 2026-08-12, **released without being filed** because the work duplicated #1229. Cited in a private-repo document this scan cannot see. |
+| #1297 | 5 | Allocated from the **primary checkout** rather than the session's worktree, so the ledger gate correctly refused the commit and the item was re-filed at #1298. A recorded permanent hole. |
+| #1303 | 4 | The same work allocated twice with character-identical titles; the other row shipped and this number was **folded in** as a permanent hole. |
+| #1326 | 1 | The same finding filed 22 seconds earlier by another seat, on a branch that never landed. |
+| #1411 | 5 | Allocated to a worktree whose session ended before the item could be filed; superseded by #1415. The ledger's own text says it "MUST NEVER BE CITED AGAIN". |
+| #1364 | 4 | **Not a hole -- narrative about one.** The BACKLOG tokens describe five real dangling citations that commit `4c8845754` wrote into non-Markdown files. Those five are outside the default scan. |
+| `mkleehammer/pyodbc#1459` | 3 | **Not a backlog citation at all.** See below. |
+
+So the honest split is: **1 number (3 tokens) is a false positive**, **7 numbers (46 tokens) are the ledger deliberately narrating a burned, abandoned or duplicated number** -- prose whose whole subject is that the number resolves to nothing -- and **1 number (4 tokens) points at real dangling citations that live where the scan does not look**. The tool's own summary already refuses to call 53 a defect count; this table is what that refusal was protecting.
+
+**Nothing below is repaired here.** Repairing a citation is a separate act with its own judgment, and #1411's entry in particular instructs a repointing that this row does not perform.
+
+### The pyodbc number is a false positive, and the arithmetic that says otherwise is right about the wrong namespace
+
+That number is above the floor, so the reflex reading is that it is the trap CLAUDE.md forbids: a citation to a number nobody has allocated, which starts resolving to unrelated work the day somebody does. **It is not.** All three tokens are `mkleehammer/pyodbc#1459` -- the upstream pyodbc issue whose fix would license removing `scripts/ci/retry-native-crash.sh` from the database legs. The tool annotates all three as foreign-repo shaped and its exit code passes over them, which is the correct call.
+
+**The only thing standing between that token and a red gate is the one annotation**, so it is worth naming as load-bearing rather than cosmetic: drop the `_FOREIGN_REPO` rule and this repository's ledger reports a live-shape defect that does not exist.
+
+### What the advisory wiring is, and what it deliberately is not
+
+The filing PR adds a `dangling citations (advisory)` job to `.github/workflows/quality-advisory.yml`. That file is advisory by design, holds no required contexts, and `.github/required-contexts.txt` records that it "must never be promoted". Four things keep this job unable to block a merge, and `tests/test_dangling_citation_advisory.py` pins the ones a repository test can see:
+
+1. It lives in a workflow with no required context.
+2. Its analysis step passes `--advisory`, so a live-shape finding exits 0.
+3. Its analysis step carries `continue-on-error: true`, so even the tool's empty-population refusal cannot fail the job.
+4. It is **not** in the `liveness` job's `needs`, so it cannot redden the one job in that file built to go red.
+
+**Why advisory and not blocking.** A new merge-blocking gate is the owner's decision, and #353 sits unbuilt on exactly that reasoning. The reviewer process is suspended to unblock merges as this row is filed, so adding a blocking gate today would push the other way. The job reports; the enforcement decision stays on the table.
+
+**One thing this wiring buys that the existing test leg cannot.** A citation is introduced by editing prose, and `quality-advisory.yml` triggers on `pull_request` with no paths filter -- so it runs on a documentation-only pull request, which is exactly the change shape that introduces the defect and exactly the shape the pytest tier is skipped for.
+
+**Its limit, stated rather than left to be found.** The job scans the tool's default `docs/**/*.md`. It therefore does not read the five #1364 citations in `.gitattributes`, `scripts/quality/licence_header_check.py` and `tests/test_licence_header_gate.py`, and it cannot see the private companion repository at all, which the tool prints on every exit path.
