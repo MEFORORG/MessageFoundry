@@ -4508,6 +4508,27 @@ BUILDS it.*
 
 > 🔢 **Re-scored 2026-08-20 -> DEMAND-GATE.** Value **6/10** · Difficulty **4/10** · _quick win_. Gap stands in shipped code: no privilege probe exists in the four scanned packages beyond the two conditional-DDL guard hits at sqlserver.py:924/:931, and settings.py:514 gates credential kind only, so a sysadmin login would go unobserved on first deployment (value 6). The remainder is a probe across SQL Server plus Postgres with SQLite exempt, a settings plus serve gate, the still-underived Postgres grant set, and a paired out-of-repo scorecard edit, which is the difficulty-4 anchor of a feature across a seam exercised on all three backends. _(was 6/10 · 4/10.)_
 >
+> **OWNER RULING 2026-09-03 -- KEEP THE PREFLIGHT DEFERRED. This is the ruling ON THE SUBSTANCE that
+> this item has spent three passes asking for, and it is recorded here so a fourth does not re-derive
+> it.** Put by the Contractor seat with the three live options stated -- keep it deferred, lift the gate
+> and build the preflight, or fix only the ungated probe defect -- the owner chose **keep it deferred**.
+> **This is a ruling and not a delegation**, which is the distinction the 2026-08-12 entry below draws:
+> that entry records the owner answering *do what you judge best*, and the coordinator was right to
+> refuse to read it as a decision. This one names an outcome. **THE GATE STANDS and the banner does not
+> flip.** Grounds as put to the owner: the runbook fix removed the CAUSE and has landed, the preflight
+> detects a SYMPTOM whose cause is gone, and at zero deployments demand for the detector is weak.
+> **WHAT THIS RULING DOES NOT DECIDE.** The correctness defect on the held branch -- the SQL Server probe
+> returning OBSERVED unconditionally while NULL role results fold to `False`, i.e. a clean bill of health
+> from a probe that read nothing -- is untouched by this. It is filed as **#1234**, it is not gated by
+> this item, and it stays worth fixing whichever way the gate ever goes. Nor does this rule on Blocker B,
+> the delivered refusal being narrower than this item's stated Scope; that question is moot while the
+> gate stands and returns if it is ever lifted.
+> **ONE SIDE EFFECT OF THIS RULING, recorded because neither item says it.** The defer keeps **#1234**
+> unstartable. That item's defect lives only on `w3-store-privilege-preflight`, which lands only if the
+> preflight lands, so deferring the preflight leaves the defect with nowhere to go. #1234 is correct that
+> it is not hostage to this POLICY question; it is nonetheless blocked by the same branch. Measured
+> 2026-09-03 and recorded there.
+>
 > **Filed 2026-08-04 — not started. Scored 2026-08-04 → DEMAND-GATE.** The engine documents a least-privilege store grant it can
 > **never observe**: there is no fixed-server-role probe and no database-role-membership probe in
 > any of the four packages the scorecard scans, and `[store].require_managed_identity` constrains
@@ -12366,6 +12387,24 @@ commit.**
 ## 1234. the store-privilege probe reports OBSERVED having read nothing: NULL role results fold to False on SQL Server
 
 > 🔢 **Re-scored 2026-08-20 -> P1.** Value **6/10** · Difficulty **2/10** · _quick win_. The defect is real and unfixed on the branch that holds it: the SQL Server arm returns OBSERVED unconditionally and folds NULL role results to False, so a probe that read nothing reports observed-and-clean, and the refusal arm is opt-in so WARN is the only arm a default install reaches. The fix is a NULL-versus-clean distinction on one backend arm plus the two-arm test the item specifies, provable against a fixture row rather than a live server, but it stays unstartable until that branch lands. _(was 6/10 · 2/10.)_
+>
+> **OWNER DECISION 2026-09-03 -- RECORDED AS BLOCKED, NOT DISPATCHED. The measurement below was re-taken
+> today rather than trusted:** the amendment further down is three weeks old, and this seat spent the day
+> finding items whose records had gone stale. It has not. **It has got worse.** On `main`:
+> `require_least_privilege|least_privilege` returns **0** hits across `messagefoundry/**/*.py`, against a
+> POSITIVE CONTROL of **2** files for `require_managed_identity` on the same instrument;
+> `messagefoundry/store/privilege.py` is **absent**; and `w3-store-privilege-preflight` is **4 ahead and
+> 532 behind** -- it was 328 behind on 2026-08-14, so the gap is widening -- with **no pull request, ever**.
+> **THE COUPLING NEITHER ITEM STATES, and it is why this is recorded rather than fixed.** This item is
+> right that a code defect must not be hostage to a POLICY decision, and on policy it is not hostage.
+> On STARTABILITY the two are joined anyway: the defect exists only on that branch, the branch lands only
+> if the preflight lands, and the owner ruled 2026-09-03 that the preflight stays **deferred** (recorded
+> at #1008). **So while that defer stands, this item has nowhere to land** -- not because it is gated,
+> but because its subject is not on `main`. Both clearing paths the amendment names, rebasing the branch
+> with a PR or re-implementing the preflight against current `main`, REVERSE that defer. That is why
+> neither is a builder's call, and why the owner chose to record the block instead of dispatching it.
+> **Do not dispatch this, and do not re-derive the zero** -- a pattern that finds nothing everywhere is
+> indistinguishable from a clean repository, which is why the positive control above is quoted with it.
 >
 > **Filed 2026-08-12 -- reported by the lane that REVIEWED the branch, not by the lane that wrote it, which is why it was found.** On the held `w3-store-privilege-preflight` branch, the SQL Server arm of the store-privilege preflight returns **`OBSERVED` unconditionally**, while a NULL role result folds to **`False`**. So a probe that read nothing reports a clean bill of health, and reports it in the one word an operator would take as proof the check ran.
 > **WHY THIS IS THE WHOLE CONTROL AND NOT AN EDGE CASE.** The refusal arm is keyed on the opt-in `[store].require_least_privilege`, which **defaults to false**. So on a default install the refusal never fires and **WARN is the only arm anybody sees** -- and WARN is exactly what this defect silences. A control whose only reachable arm is the one that mis-reports is not a weakened control; it is an absent one wearing the label of a present one.
@@ -21304,6 +21343,31 @@ helper-per-class split and for why each hook carries a local copy), #1339 (a dif
 
 **Source:** measured 2026-09-03 while re-verifying #1040 against `origin/main` at `fd44b0f1`, by
 enumerating every hook that writes text an agent acts on rather than only the ones #1040 named.
+
+## 1430. the connscale in-hold sampler yields one sample per cell, so the in-hold window has zero width
+
+> 🔢 **Filed 2026-09-03 -- not started. Surfaced by the #1420 measurement, which could not have found it by reading.** The in-hold sampler produces **exactly two samples per cell** -- one in-hold, one post-drain -- in **20 of 20 cells** at hold 1.5 and hold 3.0. So `_empty_claim_rates`' window, which five sites describe as *"first to last in-hold samples"*, does not span a slightly-wrong range. **It spans no range at all: there is one in-hold sample.**
+> Verdict: build
+> Closing-act: code
+
+**Cluster:** Developer Experience & CI. **Priority:** P2. **Verdict:** build.
+**Severity:** none on the product. No engine path, no PHI axis, **no deployment axis (sec. 0)** -- this is a measurement instrument in the load harness. What it costs is the trustworthiness of a number the project uses to reason about contention.
+
+**WHY THIS IS ITS OWN ITEM AND NOT PART OF #1420.** #1420 is that the computed window includes a post-drain tail its docstrings exclude, and its fix (b) landed in PR 802. This item is the reason **#1420's fix (a) cannot be built yet**, which is a different defect with a different owner: the first sample's `read` is 0 or 1 every time and the final sample carries the whole intake, so the post-drain sample is not *contaminating* the read delta -- **it supplies all of it.** Narrowing the window while that holds does not produce a smaller number. It produces an undefined one.
+
+**MEASURED, WITH THE ARM THAT MAKES IT ACTIONABLE.** Excluding the final sample trips `_empty_claim_rates`' own `len(samples) < 2` guard, so **the excluded arm is undefined rather than smaller.** A two-sided reading exists only at a longer hold: at hold 12.0 the tail inflates the ratio by **4.9 to 8.2 percent**. Four clean sweeps carry every number; two further sweeps were discarded for contention (both hit the #1014 disk I/O symptom on the post-mortem audit) and are excluded rather than averaged in.
+
+**AND THE OBVIOUS FIX FAILS SILENTLY, WHICH IS THE PART TO READ TWICE.** Fix (a) was run end to end. It **zeroes wall #3 while the live SLO still reports `ok=true`**, with the grader saying *"NOT GRADED ... says nothing about wall #3"*. That is a green that is a statement about the instrument rather than the subject -- the **ADR 0158** shape, arriving inside the tool the project uses to detect that shape. The loud failure comes from the smoke test's `assert graded` instead of from the SLO. **So the build order is: guarantee two in-hold samples FIRST, then narrow the window.** Reversing it ships a silent green.
+
+**THE POSITIVE CONTROL THAT LOCATES THE BLOCKER.** At hold 12.0 the sweep grades **2 of 2** lanes. So the obstacle is the **sampling cadence**, not fix (a) itself, and not the grader.
+
+**WHAT IS NOT MEASURED, stated so nobody quotes it as though it were.** *Why* the sampler yields one sample is **unknown**. The reload probe is **ruled out** at 0.04 to 0.20 s. The leading candidate is the **FD process-table walk on the same tick**, and that is a hypothesis with no measurement behind it. Anyone building this should measure the tick budget before changing the cadence, because a cadence change made against the wrong cause will look like it worked at one hold and fail at another.
+
+**ONE NUMBER FROM #1420 THAT MUST NOT BE RE-QUOTED AS A MEASUREMENT.** That row's 65.5 s is a correct WORST-CASE bound derived from the profile knobs. The **observed** tail, timed directly over 16 steps, is **1.08 to 1.24 s**. Both are true and they answer different questions; the bound is not evidence about a healthy run.
+
+**Related:** [`harness/load/connscale/runner.py`](../harness/load/connscale/runner.py) (`_empty_claim_rates`, `_sample_loop`), [`harness/load/connscale/probe.py`](../harness/load/connscale/probe.py) (the FD walk), `harness/load/profiles/connscale-smoke.toml`, [ADR 0158](adr/0158-silent-controls-green-signals-that-mean-nothing-and-shape-over-detection.md); **#1420** (the window's tail -- fix (b) landed, fix (a) blocked ON THIS ITEM), **#1014** (the fixed 24-port block that makes a contended sweep unusable), **#1211** (superseded; a DIFFERENT defect in the same docstring -- do not merge the two).
+
+**Source:** measured 2026-09-03 by the Builder working #1420, which asked for an effect size and refused to guess one. Filed separately on that Builder's recommendation because the cause is unmeasured and the fix order matters.
 
 ## 1431. the dangling-citation detector runs in no workflow and no hook, so its nine unresolved numbers report to nobody
 
