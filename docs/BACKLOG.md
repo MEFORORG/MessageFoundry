@@ -11706,6 +11706,180 @@ All three inputs were read out of the code rather than taken on trust. **The mod
 **Cluster:** Tooling / session coordination. **Priority:** P3. **Verdict:** build. **Severity:** minor -- coordination infrastructure, no product or PHI effect. It costs a lost hand-off and, worse, an unattributable one.
 ## 1229. the worktree gate blanks double-quoted spans FIRST, so a stray quote inside single-quoted words straddles and deletes the live command between them
 
+> 🚧 **PARTLY SHIPPED, STILL OPEN -- a 2026-09-03 CLOSURE OF THIS ITEM IS REVERTED HERE, and the
+> reason is in this item's own title.** `echo 'say "hi' ; <gated> ; echo 'bye" now'` still ALLOWs,
+> and the middle statement still runs, once **ONE NEWLINE** is inserted into the first quoted word.
+> So the honest record is: the straddle is closed **WITHIN A LINE**, on both hosts, and a quoted span
+> crossing a **NEWLINE** re-opens every pin this item carries, **its titled shape included**. The
+> newline class is filed as **#1429** and that filing is correct as a separate FIX; it is not a
+> separate CLASS, and it does not let this item close.
+>
+> **THE DECISIVE MEASUREMENT, reproduced independently three times** -- by two adversarial reviewers,
+> then again here against gate copies hash-verified byte-identical to `origin/main`
+> (blob `b194d0a0420a6c87b8786994785155c91908d7b6`) and to the branch head
+> (blob `94162a04a6fe51fa7ac2a7f7c6a14de2d3a4e4d8`), cwd inside a governed repo:
+>
+> ```
+> id        main   head    shape
+> POSCTL    DENY   DENY    git -C <governed> checkout main               (positive control)
+> ORIG      DENY   DENY    echo 'say "hi' ; <gated> ; echo 'bye" now'    (THIS ITEM'S TITLED SHAPE)
+> ORIG+NL   ALLOW  ALLOW   the same, with ONE NEWLINE inside the first quoted word
+> NEGCTL    ALLOW  ALLOW   echo hello ; ls -la                           (negative control)
+> ```
+>
+> `ORIG+NL` is pinned to whether it RUNS, not to whether it parses: with the gated command swapped
+> for an inert marker that COMPUTES (`expr 111 \* 3`), bash prints `333`, which an echo-back cannot
+> produce. The two controls are what make the middle row evidence -- only the newline varies between
+> `ORIG` and `ORIG+NL`, so the line split is the cause and not the shape.
+>
+> **THE CLOSING ARGUMENT RESTED ON A CONDITIONAL THAT DOES NOT APPLY, and it is retracted here rather
+> than below.** The closure cited the 2026-08-20 re-score's *"if a reviewer rules the escape hole a
+> separate filing, the remainder text above is the filing."* That antecedent names the **BACKSLASH**
+> escape, which the 2026-09-03 change **fixed** rather than re-filed, so the conditional was never
+> triggered and licenses nothing. What governs is the same sentence's unconditional half: **a
+> wrongly-closed item is invisible forever.**
+>
+> **WHAT DID SHIP, and it is real work that belongs on `main`.** PowerShell's escape is the BACKTICK,
+> and the scanner did not know it. The round-2 fix gave PowerShell no escape rule at all, on a written
+> argument that refusing an escape is always fail-CLOSED because it makes spans SHORTER. **That is
+> true of span LENGTH and false of span POSITION**: refusing an escape the host really honours shifts
+> every pairing after it, and the shifted pair straddles the live command. Four backtick fail-opens
+> close, and every earlier round's pin holds.
+>
+> **BOTH DIRECTIONS COUNTED, and the previously recorded zero was FALSE.** A guard that fails open
+> costs more for a new ALLOW than it gains from a removed DENY, so the count that matters is the one
+> that was wrong. Measured here over a 64-shape sweep (PowerShell tool, eight backtick-bearing side
+> strings paired around a gated command) plus an 8-shape interpreter sweep, with every flip re-tested
+> against whether it RUNS:
+>
+> ```
+> direction                                                    at least   evidence
+> fail-opens CLOSED   (main ALLOW -> head DENY)                       8   64-shape sweep
+> false denies REMOVED (main DENY -> head ALLOW, shape INERT)        12   8 + 4, all inert
+> NEW fail-opens INTRODUCED (main DENY -> head ALLOW, shape RUNS)     5   CLOSED in round 6, below
+> fail-opens REMAINING in the newline class (#1429)                   4   both tools x both quotes
+> ```
+>
+> **THE `2` IN THAT ROW WAS A FLOOR AND THE FLOOR MOVED: IT IS 5.** Corrected here rather than below,
+> because this table is what a reader acts on. Round 5 measured the two rows it already knew about;
+> sweeping the CLASS instead found three more, one of them on a DIFFERENT RULE -- which is what
+> "rule-agnostic" means and is why enumerating by rule under-counts. All carry the same carriage, and
+> it RUNS (`set /a 111*3` -> 333; the negative-control marker `set /a nope*3` prints 0, so an
+> echo-back cannot pass for a run):
+>
+> ```
+> cmd /c "`"git -C <governed> merge feature`""              main DENY  round 5 ALLOW  rule 3
+> cmd /c "`"cd <governed> & git rebase main`""              main DENY  round 5 ALLOW  rule 3
+> cmd /c "`"git -C <gov> config core.hooksPath /dev/null`"" main DENY  round 5 ALLOW  RULE 1
+> cmd /c "git -C <gov> config core.hooksPath /dev/null"     main DENY  round 5 DENY   (control)
+> ```
+
+> **Still a floor.** Rules 1 and 3 are measured; nothing here swept rule 3b, and the count is over the
+> shapes driven rather than over the input space.
+>
+> **"At least" is load-bearing in that table.** None of those four rows is an enumeration of a
+> population; each is a floor established by the sweep named beside it, and no sweep here ranged over
+> the whole input space. The eight false denies all share one left-hand side (an odd trailing
+> backtick), so they are one family enumerated rather than eight independent classes.
+>
+> **THE NEW FAIL-OPENS WERE THIS ITEM'S OWN MECHANISM, RE-CREATED BY THE FIX. ROUND 6 CLOSES THEM.**
+> The record of the defect stays, because the mechanism is the item's own and the next reader needs
+> it. Measured against gate copies hash-verified byte-identical to `origin/main`, to round 5 and to
+> round 6, cwd inside the governed repo, PowerShell tool:
+>
+> ```
+> shape                                          main   round 5   round 6   really runs?
+> cmd /c "`"git -C <governed> reset --hard`""    DENY   ALLOW     DENY      RUNS (333)
+> cmd /k "`"git -C <governed> reset --hard`""    DENY   ALLOW     DENY      RUNS (333)
+> cmd /c "`"git -C <governed> merge feature`""   DENY   ALLOW     DENY      RUNS (333)
+> cmd /c "`"cd <governed> & git rebase main`""   DENY   ALLOW     DENY      RUNS (333)
+> cmd /c "<gated>"          no backtick          DENY   DENY      DENY      (control)
+> git -C <governed> reset --hard                 DENY   DENY      DENY      (positive control)
+> wsl -c "`"<gated>`""                           DENY   ALLOW     DENY      INERT -- see below
+> ```
+>
+> The mechanism: the OUTER line is PowerShell, so the outer scan honours the backticks, treats the
+> whole argument as one span, and reaches **no verdict**. Extraction then hands the payload to
+> `Get-FlagOwner`, which answers `cmd`, whose convention is `none`. The payload text **still carries
+> the outer host's backticks** -- pwsh has not run yet, so nothing has consumed them -- and scanning
+> it with no escape rule pairs the two `` `" `` sequences ACROSS the git command and blanks it. That
+> is span ownership deciding the wrong way, which is exactly what this item is about.
+>
+> **HOW ROUND 6 CLOSES IT, and the two tidier fixes that are MEASURED WRONG.** `Get-ScannableSegments`
+> emits ONE EXTRA SEGMENT for a cmd-owned payload: the same text with the outer host's escaped quotes
+> resolved and cmd's own documented `/c` wrapper quotes removed -- the encoding cmd.exe actually
+> receives. Both steps are needed and neither is enough alone; decoding leaves `"git -C <governed>
+> reset --hard"`, which the scanner blanks as an ordinary quoted span, and unwrapping without decoding
+> finds a backtick in first position and does nothing.
+>
+> * **Folding `cmd` into `$pwshSet`** denies these rows and LOSES a deny the gate has today. See the
+>   probe table below.
+> * **Decoding IN PLACE** -- rewriting the payload rather than adding a view -- re-opens round 3's
+>   `bash -c "bash -c \"<gated>\""` (DENY -> ALLOW), because the function recurses ONE level and that
+>   round-3 deny depends on the escaped text staying visible at this level. Two new fail-opens for a
+>   change that reads as a correction.
+>
+> **AN EXTRA SEGMENT CANNOT INTRODUCE A FAIL-OPEN, AND THAT IS THE SAFETY ARGUMENT RATHER THAN A
+> SWEEP.** Every rule reaches a segment through a continue-or-deny loop, so an added segment can only
+> ADD a deny; it is appended AFTER every existing segment, so rule 3's first-verb-wins bookkeeping
+> sees exactly what it saw. Consistent with that, round 6 measured **zero** new ALLOWs against
+> `origin/main` across both corpora below.
+>
+> **THE COSTS, stated because a one-sided note reads as a clean win.** Round 6 also re-denies shapes
+> round 5 had allowed that are INERT on this host: `wsl -c` is not a valid wsl flag at all (`wsl -c
+> <anything>` prints *"Invalid command line argument: -c"*, while `wsl -- expr 111 \* 3` prints 333,
+> so wsl itself works), and `cmd /c "`"echo git checkout main`""` merely echoes. Both DENY on
+> `origin/main` too, so these are pre-existing false denies restored rather than new ones. Round 6
+> also closes TWO PRE-EXISTING holes as a side effect, both of the same wrapper class: `cmd /c
+> "\"<gated>\""` under the **Bash tool**, and `cmd /c "`"git -C <governed> worktree remove
+> <governed>`""` (rule 2), each ALLOW on `origin/main` and DENY here. The rule-2 row's carriage RUNS;
+> the Bash-tool row **could not be pinned to whether it RUNS**, because `cmd` is not on this
+> environment's Bash PATH (`command -v cmd` -> not found).
+>
+> **THE `cmd` ARM'S STATED REASON WAS FALSE AND IS REPLACED BY A MEASUREMENT -- AND THE FIRST
+> REPLACEMENT WENT STALE THE MOMENT ROUND 6 LANDED.** The record first said no probe can separate
+> `cmd` from PowerShell because the outer line reaches a verdict first. That fails whenever the
+> payload's quotes are ALL backtick-escaped, and round 5 recorded that separating probe. Round 6
+> denies those rows on both builds, so that table no longer separates anything. A DIFFERENT probe
+> replaces it, and it is the better instrument, because it shows the fold **losing** a deny the gate
+> has rather than gaining one. PowerShell tool, cwd inside the governed repo:
+>
+> ```
+> probe                                       round 6   cmdfold   separates?
+> cmd /c 'echo "x`" & <gated> & echo "y"'     DENY      ALLOW     YES   -- and it RUNS (333)
+> cmd /c 'echo "x"  & <gated> & echo "y"'     DENY      DENY      no    (control)
+> ```
+>
+> The control is what makes this a separation rather than a coincidence: only the backtick varies.
+> `&` is used and not `;`, because `;` is not a command separator in cmd. A pwsh single-quoted string
+> is fully literal, which is what carries the backtick through to cmd intact. **Why the fold loses
+> it:** a backtick is an ORDINARY character to cmd.exe, so the quote after it really closes the span
+> and the gated command is left in plain view; reading that quote as escaped holds the span open
+> ACROSS the gated command and blanks it. **The arm's CONCLUSION is unchanged** -- `cmd` must not
+> inherit a backtick -- and it now rests on a behavioural pin
+> (`test_a_LITERAL_backtick_in_a_cmd_payload_does_not_hide_a_gated_command`) rather than on source
+> text alone.
+>
+> **THE SAME BASH SHAPE COULD NOT BE MEASURED, and it is recorded as unmeasured rather than folded in
+> with the pwsh row.** The Bash-tool spelling of that probe is inert twice over on this host: git-bash
+> reports an unterminated backtick even inside single quotes, and `cmd` is not on its PATH.
+>
+> **NO SWEEP CITED HERE IS REPRODUCIBLE FROM THIS BRANCH, and that applies to round 6's as much as to
+> round 5's.** The 22-shape matrix, the 64-shape sweep, and round 6's two corpora (38 shapes covering
+> the reported fail-opens, the fold probes, every earlier round's tripwires and the #1429 newline
+> rows; plus 18 more aimed only at false denies through the new code path) all lived in a session
+> scratchpad with their drivers, so their counts are not re-derivable and must not be cited as
+> standing evidence. What a reader CAN re-derive is every row pinned as a test in
+> `tests/test_worktree_gate_quote_straddle.py` and `tests/test_worktree_gate_escaped_quote.py`, plus
+> the tables in this banner, each of which names its corpus and its controls. **The counts are floors
+> over those corpora and not over the input space** -- round 6's "zero new ALLOWs" means zero across
+> 56 driven shapes, which is weaker than the structural argument beside it and is why that argument
+> carries the claim.
+>
+> **Severity is unchanged and deliberately not inflated (sec. 0).** This is a local
+> maintainer-workstation guardrail whose own synopsis declines to be a security boundary: no product,
+> engine or PHI effect, and nothing deployed.
+>
 > 🔢 **Re-scored 2026-08-20 -> P2.** Value **6/10** · Difficulty **3/10** · _quick win_. Attacked the shipped claim by driving the real hook, then by mutation. The ORDERING limb is genuinely shipped: the two ordered regexes are gone, replaced by Remove-QuotedSpans (worktree_gate.ps1:347-388), and it is CALLED on the scan path at :654 -- the only call site -- not merely present. Landed in c7f0e308 naming #1229. Behaviour measured with a governed repos file and a positive control (plain `git -C <root> checkout main` -> DENY): straddle DENY, mirrored DENY, quoted commit message ALLOW, unterminated quote DENY. Non-vacuity proven by mutation: a scratchpad copy with the two regexes restored at the call site flips ONLY the straddle arm to ALLOW, so the shipped scanner is what closes it. The TEST limbs are shipped too -- tests/test_worktree_gate_quote_straddle.py asserts the straddle DENIES and pins the mirrored, unterminated and false-positive controls, and it is registered in tests/tooling_manifest.txt:109. What is NOT shipped is the fix criterion the item itself wrote down: the scanner respects quote-vs-quote but ignores backslash escaping, so the same straddle class is still reachable. Two shapes ALLOW at HEAD and both really run the middle command in bash (verified with an inert marker); removing the backslashes makes both DENY, and a single-sided escape is harmless, which mirrors the item's own boundary finding one level down. Scoring the remainder only: value 6, a real gap with no clean workaround in the same shipped guardrail, but per section 0 and the item's own scope this is a local maintainer-workstation guardrail whose synopsis declines to be a security boundary -- no product, engine or PHI effect, and nothing deployed. Difficulty 3: one PowerShell function plus test arms, no mypy or store backends, but shell escape semantics differ inside single quotes, double quotes and unquoted text and the fail-closed unterminated case must survive. Verdict is partly_shipped rather than confirmed_shipped because the scope call is the only judgment here and a wrongly-closed item is invisible forever; if a reviewer rules the escape hole a separate filing, the remainder text above is the filing. _(was 6/10 · 2/10.)_
 >
 > **Filed 2026-08-12 -- a LIVE FAIL-OPEN in the shipped gate on `main`, found by the gate-family lane while adjudicating a different item and REPRODUCED INDEPENDENTLY here before filing.** `scripts/hooks/worktree_gate.ps1:382-383` blanks quoted spans per line, **double quotes first**:
@@ -19940,3 +20114,38 @@ That is the same `self._lock` the staged-pipeline handoffs take. On a first depl
 **PARTLY CLOSED ALREADY, AND THE CLOSURE SITS IN THE WRONG ARTIFACT.** The full record -- both questions, all eight options, both answers quoted -- is [comment 5515263760 on PR 749](https://github.com/MEFORORG/MessageFoundry/pull/749#issuecomment-5515263760), written 2026-09-02. A pull-request comment is a real improvement on a session transcript, which does not survive its session. It is still not the ADR, and the ADR is what a reader consults. **This limb differs from the first two in shape:** closing it needs no decision about the engine, only the record moved into the artifact people actually read.
 
 **THE GENERAL PROBLEM, stated once so it is not re-derived per incident.** A decision recorded as an outcome plus a delegation is not reviewable. The inputs -- the question, the options, the answer -- are what let a later reader tell a considered call from an arbitrary one, and they are exactly the part that lives in the least durable place.
+## 1429. the worktree gate scans per line, so a quoted span crossing a newline straddles and deletes the live command between its two lines
+
+> 🔢 **Filed 2026-09-03 alongside a closure of #1229 that has since been REVERTED, and REPRODUCED here before filing rather than taken on report.** `Get-ScannableSegments` splits the command on newlines **before** any quoting is considered, so a quoted span that crosses a newline is never one span to the gate. It is an unterminated quote on the first line and a stray quote on the last -- and the line in the middle carries **one quote from each surrounding span**. Those two pair ACROSS the gated command and blank it, so no rule ever sees it.
+>
+> **THIS CLASS RE-OPENS EVERY SHAPE #1229 CLOSED, ITS TITLED SHAPE INCLUDED, and an earlier draft of this banner got that backwards.** It called the newline case a distinct straddle while conceding in the next breath that it is *"#1229's straddle exactly"*. Those two statements pull opposite ways, and the measured reading is the second one: **this is a separate FIX, not a separate CLASS.** Insert one newline into a quoted word and #1229's own titled shape goes back to ALLOW -- `echo 'say "hi<NL>i' ; <gated> ; echo 'bye" now'` reads ALLOW on `origin/main` and on the branch that closed #1229, and the middle statement runs (`expr 111 \* 3` prints 333). So this item stays open and correctly allocated as its own fix, and it does **NOT** license closing #1229. **#1229 carries the reproduced three-row table and links back here; read the two together.**
+>
+> **THE GATE'S OWN RESIDUAL LIST SAID THIS CLASS DENIED, and that claim is measured FALSE.** It read *"Both multi-line forms deny today anyway: every line of such a span reaches the scanner RAW and the payload line carries the git token and the verb by itself."* The first half is right and the second misses that the payload line carries the two straddling quotes too. The sentence is corrected in place in `scripts/hooks/worktree_gate.ps1` rather than deleted, because a compensating control resting on a false premise is itself the defect -- and because that sentence is why nobody probed the class.
+>
+> **Measured on the shipped gate at `46ea10a78`**, cwd inside the governed repo, with a governed repos file and a positive control (plain `git -C <root> checkout main` -> DENY). Every row is pinned to whether the middle statement really RUNS, using an inert marker that COMPUTES (`expr 111 \* 3` under bash, `111*3` under pwsh, both printing 333) so an echo-back cannot be mistaken for a run:
+>
+> ```
+> shape                                                              runs?   gate
+> echo 'a<NL>b' ; git -C <governed> checkout main ; echo 'c<NL>d'    333     ALLOW
+> echo "a<NL>b" ; git -C <governed> checkout main ; echo "c<NL>d"    333     ALLOW
+> Write-Output 'a<NL>b' ; git -C <governed> reset --hard ; ...       333     ALLOW
+> Write-Output "a<NL>b" ; git -C <governed> reset --hard ; ...       333     ALLOW
+> the same four with the span on ONE line        (control)           333     DENY
+> ```
+>
+> The control is what makes those readings evidence: varying only the newline flips the verdict, so the split is the cause and not the shape.
+>
+> **THE FOURTH ROW WAS MISSING AND THE COUNT WAS WRONG.** This banner and the branch's PR body both said **three** fail-opens remained in this class. The missing corner is `Write-Output "a<NL>b" ; <gated> ; Write-Output "c<NL>d"` -- the PowerShell tool with the DOUBLE quote -- which also ALLOWs and also runs. Both tools times both quote characters is four, so the honest floor is **at least four**, and the number is a floor rather than an enumeration: nothing here ranged over the whole input space. Re-measured 2026-09-03 against gate copies hash-verified byte-identical to `origin/main` and to the branch head, all four rows ALLOW on both blobs and all four print 333.
+>
+> **Pinned, not merely described.** `tests/test_worktree_gate_quote_straddle.py` carries all four rows as a tripwire asserting the current ALLOW, each with its one-line control. **When that test reds, somebody closed this item** -- delete the rows and invert this banner; do not restore the ALLOW.
+>
+> **WHY IT WAS NOT CLOSED IN THE SAME CHANGE, stated so the deferral is reviewable.** Closing it means carrying quote state ACROSS the split, which changes what every rule sees on every multi-line command. #1086's own residual note already treats the per-line split as a fixed property, at least four sibling suites assert behaviour that rests on it in their own words (`tests/test_worktree_gate_hijack.py`, `..._interpreter_flags.py`, `..._interpreter_sigils.py`, `..._scope_wording.py`), and the gate's rule sites read `Raw` and `Scan` as a pair, so a change here is a behaviour change to a security control rather than a scanner repair. It wants its own adversarial pass with a paired must-trip and must-not-trip suite, which is more than the span-ownership fix it travelled beside.
+>
+> **#1086 DOES NOT CLOSE THIS**, and the residual list used to imply it might. #1086's change is message-flag blanking, which decides WHICH spans are blanked; this defect is about where a span BEGINS AND ENDS. Blanking fewer message bodies leaves the straddling pair intact.
+>
+> **How to prove a fix, in both directions.** The four rows above must DENY. Every control in the two quote suites must keep its current verdict -- the quoted commit message must still ALLOW, the unterminated quote must still DENY, and the interpreter-argument recursion must still reach its inner code. And the fail-OPEN axis must be counted, not just the false denies: a change that removes a false deny while adding one new ALLOW is a net loss on a guard that fails open. **Do not fix this by making the scanner swallow everything after a lone quote** -- that turns one stray character into a total bypass, which is the regression the single-line scanner was built to avoid.
+> Verdict: build
+> Closing-act: code
+
+**Cluster:** Tooling / developer guardrail. **Priority:** P3. **Verdict:** build.
+**Severity:** minor -- a local maintainer-workstation guardrail that its own synopsis declines to call a security boundary. **No engine effect, no PHI axis, and no deployment axis (sec. 0).** What it costs is the guardrail's reliability on a multi-line command, which is an ordinary shape rather than an exotic one: a heredoc, a quoted commit body, or any message a session writes across lines.
