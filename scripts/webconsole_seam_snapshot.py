@@ -38,8 +38,17 @@ Usage:
   ``python scripts/webconsole_seam_snapshot.py --digest``  print the derived seam value only
   ``python scripts/webconsole_seam_snapshot.py --write``   rewrite ENGINE_UI_SEAM AND the golden
 
-Use ``--write``, never a shell redirect over the golden: PowerShell's ``>`` emits UTF-16LE with a
-BOM, which corrupts a file the test reads as UTF-8.
+Use ``--write``, never a shell redirect over the golden. A redirect writes the golden and never
+``ENGINE_UI_SEAM``, in EVERY shell, and it fails GREEN rather than red: ``build_snapshot`` prints
+whatever seam is imported, so a redirected golden AGREES with a stale or hand-typed constant and
+``test_webconsole_seam_snapshot_matches_golden`` passes. Measured against a fabricated
+``deadbeefdeadbeef``, only ``test_the_stored_seam_equals_the_derived_digest`` refused it.
+
+The encoding damage is a SECOND hazard layered on that one, and it is shell-specific, so it must not
+be read as the reason: Windows PowerShell 5.1's ``>`` emits UTF-16LE with a BOM, which the test
+cannot decode as UTF-8 at all, while ``pwsh`` 7 and Git Bash write a clean file and still leave the
+constant stale. An earlier version of this note gave only the encoding reason, which licensed the
+redirect for anyone not on 5.1 -- the failure it was warning against.
 """
 
 from __future__ import annotations
@@ -300,8 +309,8 @@ def write_seam_and_golden() -> str:
     # Rebuild with the NEW value in scope. The digest itself does not depend on the seam (see
     # contract_sections), but the snapshot's first section prints it.
     globals()["ENGINE_UI_SEAM"] = digest
-    # Written explicitly rather than via a shell redirect: PowerShell's `>` emits UTF-16LE with a
-    # BOM, which corrupts a golden the test reads as UTF-8.
+    # Written explicitly rather than via a shell redirect, which would write this file and never the
+    # constant rewritten above it. See the module docstring for why that fails green.
     _GOLDEN_FILE.write_text(build_snapshot(), encoding="utf-8", newline="\n")
     return digest
 
