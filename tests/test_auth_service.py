@@ -1490,3 +1490,164 @@ async def test_admin_reset_password_rejects_ad_and_unknown_users() -> None:
             await service.admin_reset_password("nope", actor="admin")
     finally:
         await store.close()
+
+
+# --- BACKLOG #1139 / ASVS 6.3.7: the directory-driven profile write ------------
+#
+# ``_upsert_ad_user`` sits on the SHARED directory completion path, so it serves the simple-bind,
+# Kerberos and federated legs alike. It wrote the account's email from the directory ``mail``
+# attribute on every login with neither an audit row nor a notice, and an ABSENT attribute erased
+# the stored address -- which is also the account's only notification target, so that erase removed
+# the account from every later notice as well.
+
+
+def _ad_settings() -> AuthSettings:
+    return AuthSettings(
+        ad_enabled=True,
+        ad_server="ldaps://x",
+        ad_user_search_base="DC=x",
+        ad_bind_dn="CN=svc,DC=x",
+        ad_bind_password="x",
+    )
+
+
+def _principal(email: str | None, *, display_name: str | None = "J Doe") -> AdPrincipal:
+    return AdPrincipal(
+        username="jdoe",
+        display_name=display_name,
+        email=email,
+        dn="CN=jdoe,DC=x",
+        groups=frozenset(),
+    )
+
+
+async def test_directory_email_repoint_is_audited_and_notified_to_the_old_address() -> None:
+    store = await _store()
+    try:
+        notifier = _FakeNotifier()
+        service = AuthService(store, _ad_settings(), security_notifier=notifier)
+        await service.initialize()
+
+        # The first directory login CREATES the account. Creation is not a change, so it announces
+        # nothing -- without this the assertion below could pass on the wrong event.
+        assert (await service._complete_ad_login(_principal("old@x"), None, mfa_verified=True)).ok
+        assert [e for e in notifier.events if e.event_type == EMAIL_CHANGED] == []
+
+        # The directory now returns a DIFFERENT address for the same principal.
+        out = await service._complete_ad_login(_principal("new@x"), "10.0.0.9", mfa_verified=True)
+        assert out.ok
+
+        changed = [e for e in notifier.events if e.event_type == EMAIL_CHANGED]
+        assert len(changed) == 1
+        ev = changed[0]
+        # Addressed to the OLD address: the holder of the address being replaced is the party who
+        # needs to hear about the replacement.
+        assert ev.email == "old@x"
+        assert ev.username == "jdoe"
+        assert ev.detail["new_email"] == "new@x"
+        assert ev.detail["source"] == "directory"
+        assert ev.client_ip == "10.0.0.9"
+
+        rows = [
+            r
+            for r in await store.list_audit(limit=50)
+            if r["action"] == "auth.ad_profile_email_changed"
+        ]
+        assert len(rows) == 1
+        assert rows[0]["actor"] == "jdoe"
+        assert rows[0]["client"] == "10.0.0.9"
+        assert '"source": "directory"' in rows[0]["detail"]
+
+        user = await store.get_user_by_username("jdoe")
+        assert user is not None and user.email == "new@x"
+    finally:
+        await store.close()
+
+
+async def test_an_absent_directory_attribute_does_not_erase_the_stored_address() -> None:
+    store = await _store()
+    try:
+        notifier = _FakeNotifier()
+        service = AuthService(store, _ad_settings(), security_notifier=notifier)
+        await service.initialize()
+
+        assert (await service._complete_ad_login(_principal("keep@x"), None, mfa_verified=True)).ok
+
+        # A directory returning no ``mail`` is not a site saying "remove this address" -- it covers
+        # an unset attribute, one the bind account cannot read, and one trimmed from the search
+        # attribute list. The stored value survives, and nothing is announced because nothing moved.
+        before = len(notifier.events)
+        assert (
+            await service._complete_ad_login(
+                _principal(None, display_name=None), None, mfa_verified=True
+            )
+        ).ok
+
+        user = await store.get_user_by_username("jdoe")
+        assert user is not None
+        assert user.email == "keep@x"
+        assert user.display_name == "J Doe"
+        assert [e for e in notifier.events[before:] if e.event_type == EMAIL_CHANGED] == []
+        assert [
+            r
+            for r in await store.list_audit(limit=50)
+            if r["action"] == "auth.ad_profile_email_changed"
+        ] == []
+    finally:
+        await store.close()
+
+
+async def test_a_directory_login_that_changes_nothing_announces_nothing() -> None:
+    # The store write is unconditional, so the guard has to be the COMPARISON rather than the write.
+    # Without it the fix would notify on every single directory login.
+    store = await _store()
+    try:
+        notifier = _FakeNotifier()
+        service = AuthService(store, _ad_settings(), security_notifier=notifier)
+        await service.initialize()
+
+        assert (await service._complete_ad_login(_principal("same@x"), None, mfa_verified=True)).ok
+        before = len(notifier.events)
+        assert (await service._complete_ad_login(_principal("same@x"), None, mfa_verified=True)).ok
+
+        assert [e for e in notifier.events[before:] if e.event_type == EMAIL_CHANGED] == []
+    finally:
+        await store.close()
+
+
+async def test_a_first_directory_address_notifies_the_only_reachable_party() -> None:
+    # The account carries no address, so there is no earlier holder to protect and the new address is
+    # the only party the engine can reach. Notifying nobody is the alternative.
+    store = await _store()
+    try:
+        notifier = _FakeNotifier()
+        service = AuthService(store, _ad_settings(), security_notifier=notifier)
+        await service.initialize()
+
+        assert (await service._complete_ad_login(_principal(None), None, mfa_verified=True)).ok
+        assert [e for e in notifier.events if e.event_type == EMAIL_CHANGED] == []
+
+        assert (await service._complete_ad_login(_principal("first@x"), None, mfa_verified=True)).ok
+        changed = [e for e in notifier.events if e.event_type == EMAIL_CHANGED]
+        assert len(changed) == 1
+        assert changed[0].email == "first@x" and changed[0].detail["new_email"] == "first@x"
+    finally:
+        await store.close()
+
+
+async def test_the_directory_repoint_reaches_the_users_own_pull_feed() -> None:
+    # The mailbox is the arm that can be absent; ``GET /me/security-events`` is the arm that cannot.
+    # It selects ``auth.%`` rows whose ACTOR is the user, so an action named or attributed any other
+    # way would be invisible to exactly the accounts the address gate already excludes.
+    store = await _store()
+    try:
+        service = AuthService(store, _ad_settings())
+        await service.initialize()
+
+        assert (await service._complete_ad_login(_principal("old@x"), None, mfa_verified=True)).ok
+        assert (await service._complete_ad_login(_principal("new@x"), None, mfa_verified=True)).ok
+
+        feed = await service.security_events_for("jdoe")
+        assert [e for e in feed if e["action"] == "auth.ad_profile_email_changed"]
+    finally:
+        await store.close()

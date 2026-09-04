@@ -39,6 +39,7 @@ from messagefoundry.auth.notifications import (
     MFA_ENABLED,
     PASSWORD_CHANGED,
     PASSWORD_RESET,
+    RECOVERY_CODE_USED,
     ROLES_CHANGED,
     SUSPICIOUS_LOGIN_FAILURE_THRESHOLD,
     SecurityEvent,
@@ -82,7 +83,7 @@ def _warn_if_corpus_unreadable(path: str | None) -> None:
     except OSError as exc:
         _log.warning(
             "password_breach_corpus_file %r could not be read (%s); the larger breach corpus is "
-            "disabled (the bundled top-10k list still applies)",
+            "disabled (the bundled corpus still applies)",
             path,
             exc,
         )
@@ -1234,7 +1235,7 @@ class AuthService:
                 client=client,
             )
             return LoginOutcome(ok=False, error="account conflict")
-        user = await self._upsert_ad_user(principal)
+        user = await self._upsert_ad_user(principal, client=client)
         if (
             federated_subject is not None
             and (
@@ -1405,7 +1406,9 @@ class AuthService:
         )
         return await self._store.get_user(user.id) or user
 
-    async def _upsert_ad_user(self, principal: AdPrincipal) -> UserRecord:
+    async def _upsert_ad_user(
+        self, principal: AdPrincipal, *, client: str | None = None
+    ) -> UserRecord:
         existing = await self._store.get_user_by_username(principal.username)
         if existing is None:
             user_id = uuid4().hex
@@ -1418,9 +1421,51 @@ class AuthService:
             )
         else:
             user_id = existing.id
-            await self._store.update_user_profile(
-                user_id, display_name=principal.display_name, email=principal.email
-            )
+            # BACKLOG #1139. AN ABSENT DIRECTORY ATTRIBUTE IS NOT AN INSTRUCTION TO ERASE.
+            # ``update_user_profile``'s write is unconditional, so passing ``principal.email``
+            # straight through let a directory that returned no ``mail`` blank the stored address on
+            # the next login -- and "returned no mail" covers an unset attribute, one the bind
+            # account cannot read, and one trimmed from the search attribute list, none of which is
+            # a site saying "remove this address".
+            #
+            # The address is this account's ONLY notification target, so that erase also excluded the
+            # account from every later notice: ``SecurityEventNotifier.notify`` returns early on an
+            # empty address. A directory that has nothing to say now leaves the stored value alone.
+            #
+            # THE COST, STATED: a site that deliberately clears ``mail`` in the directory no longer
+            # propagates that clear on the next login. An administrator can still clear the address
+            # through ``PATCH /users/{id}``, which is audited and notified, so nothing becomes
+            # unreachable -- only the silent path is closed.
+            display_name = principal.display_name or existing.display_name
+            email = principal.email or existing.email
+            await self._store.update_user_profile(user_id, display_name=display_name, email=email)
+            if email != existing.email:
+                # BACKLOG #1139, ASVS 6.3.7. The directory owns the attribute, but repointing it
+                # decides where every later security notice on this account is delivered -- so it is
+                # an update to the account's authentication details, and it gets the same two records
+                # the local sibling ``update_user`` emits: an audit row and an out-of-band notice.
+                #
+                # This method sits on the SHARED directory completion path, so this covers the
+                # simple-bind, Kerberos and federated legs alike, not AD alone.
+                await self._audit(
+                    "auth.ad_profile_email_changed",
+                    actor=principal.username,
+                    detail=_json({"user_id": user_id, "source": "directory"}),
+                    client=client,
+                )
+                # ADDRESSED TO THE OLD ADDRESS WHERE ONE EXISTS, matching ``update_user``: the holder
+                # of the address being replaced is the party who needs to hear about the replacement,
+                # and the new address is whatever the directory now asserts. Where the account
+                # carried NO address, the new one is the only reachable party and there is no earlier
+                # holder to protect, so it is the target -- otherwise the first-set case is announced
+                # to nobody at all.
+                await self._notify_security(
+                    EMAIL_CHANGED,
+                    username=principal.username,
+                    email=existing.email or email,
+                    client=client,
+                    detail={"new_email": email, "source": "directory"},
+                )
         user = await self._store.get_user(user_id)
         assert user is not None  # just upserted
         return user
@@ -2299,7 +2344,7 @@ class AuthService:
                 client=client,
             )
             return False
-        if await self._verify_second_factor(user, code):
+        if await self._verify_second_factor(user, code, client=client):
             # The 2nd factor is now satisfied; also seed the step-up window (the session has completed
             # password + MFA) and clear the failure counter. (Initial enrollment has no factor to verify,
             # so this never fires there — keeping the enrollment step-up gate honest, WP-14.)
@@ -2325,10 +2370,15 @@ class AuthService:
             )
         return False
 
-    async def _verify_second_factor(self, user: UserRecord, code: str) -> bool:
+    async def _verify_second_factor(
+        self, user: UserRecord, code: str, *, client: str | None = None
+    ) -> bool:
         """True iff ``code`` is the user's current TOTP **or** an unused recovery code (consumed on
         match). TOTP is checked first (fast, no argon2); recovery codes are argon2id-hashed and
-        single-use. Codes never collide (TOTP is 6 digits; recovery codes are dashed alphanumerics)."""
+        single-use. Codes never collide (TOTP is 6 digits; recovery codes are dashed alphanumerics).
+
+        ``client`` is the caller's address, carried onto the recovery-code audit row and notice
+        (BACKLOG #1139) so the holder can tell their own use from someone else's."""
         code = code.strip()
         if not code:
             return False
@@ -2378,7 +2428,38 @@ class AuthService:
             return False
         # Atomic compare-and-delete: only the caller that actually removes the hash wins, so a
         # concurrent verify of the same single-use code can't double-spend it (WP-14).
-        return await self._store.consume_recovery_code_hash(user.id, real[matched])
+        if not await self._store.consume_recovery_code_hash(user.id, real[matched]):
+            # Lost the race to a concurrent verify of the SAME code. That caller removed the hash and
+            # writes the records below; writing them here too would report one consumption twice.
+            return False
+        # BACKLOG #1139, ASVS 6.3.7. Spending a recovery code PERMANENTLY DELETES a stored
+        # credential, so it is an update to the account's authentication details and earns its own
+        # records. Before this the only row was the generic ``auth.mfa_verified`` the caller writes,
+        # which carries no detail -- leaving a recovery-code burn byte-indistinguishable from an
+        # ordinary TOTP verify, on precisely the event that usually means either the holder lost
+        # their authenticator or somebody else has their codes.
+        # RE-READ RATHER THAN ``len(real) - 1``. The arithmetic is off by one for every code a
+        # concurrent caller spent between this method's read and its own consume, and this notice
+        # exists to be acted on -- an overstated count tells the holder they have a spare they do
+        # not. One extra store read, on a path that only runs when a code is actually burned.
+        remaining = len(await self._store.get_recovery_code_hashes(user.id))
+        await self._audit(
+            "auth.mfa_recovery_code_used",
+            actor=user.username,
+            detail=_json({"remaining": remaining}),
+            client=client,
+        )
+        # THE REMAINING COUNT, NEVER THE CODE OR ITS HASH. The holder needs to know a code was spent
+        # and how close they are to none left; an operator gets everything else from the audit row,
+        # which is stored somewhere better protected than a mailbox.
+        await self._notify_security(
+            RECOVERY_CODE_USED,
+            username=user.username,
+            email=user.notify_email,
+            client=client,
+            detail={"remaining": remaining},
+        )
+        return True
 
     async def disable_mfa(self, identity: Identity, *, client: str | None = None) -> None:
         """Self-service: turn off the caller's TOTP MFA (the API gates this behind step-up). Audited +

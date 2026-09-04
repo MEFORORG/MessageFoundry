@@ -520,8 +520,9 @@ def FhirLookup(
     "Patient/123")``) or a search whose path is ``query`` and whose fields are the structured ``params``
     mapping (``fhir_lookup(name, "Patient", {"identifier": "MRN|123"})``). ``params`` is the **only**
     search form — each value is percent-encoded by the engine, so a value cannot inject an extra search
-    parameter, and a ``?``-query inside ``query`` is refused (BACKLOG #1243). The parsed resource /
-    searchset ``Bundle`` comes back as a dict.
+    parameter, and a ``?``-query inside ``query`` is refused (BACKLOG #1243). That encoding is a
+    URL-layer control only; see ``transports.fhir._encode_search_params`` for the FHIR value-layer
+    separators it leaves intact. The parsed resource / searchset ``Bundle`` comes back as a dict.
     Side-effecting (it self-registers), like :func:`Reference` / :func:`inbound`, **and** returns the spec
     so SMART auth can be composed onto it::
 

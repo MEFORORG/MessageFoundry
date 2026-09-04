@@ -39,6 +39,8 @@ MFA_ENABLED = "mfa_enabled"  # 6.3.7 — a second factor (TOTP) was enrolled on 
 MFA_DISABLED = (
     "mfa_disabled"  # 6.3.7 — the account's second factor was removed (self-service or admin reset)
 )
+# 6.3.7 — a single-use recovery code was spent, which permanently deletes that stored credential.
+RECOVERY_CODE_USED = "recovery_code_used"  # nosec B105 — event-type label, not a credential
 ADMIN_NEW_IP = (
     "admin_action_new_ip"  # 8.4.2 — a sensitive admin action from a new/unexpected client IP
 )
