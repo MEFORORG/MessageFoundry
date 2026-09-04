@@ -3255,6 +3255,26 @@ Wall time (the cleaner signal — all three still ingest everything up to 300/s)
 
 ## 321. Leak gate is blind to the ported-estate site-code and partner-product token class
 
+> **PARTIAL 2026-09-03 (builder), NOT A CLOSURE -- this item stays OPEN.** Proposed 2 is now done on
+> both halves, and the second half is the one the 2026-08-26 note could not reach. Per-class coverage
+> against the loaded set landed 2026-08-28 (`tests/test_scan_forbidden_loaded_set.py`, PR 615), but
+> **no workflow gives a pytest job the `MEFOR_FORBIDDEN_TOKENS` secret** -- it reaches only the two
+> stdlib steps that run the scanner directly -- so that file's real-set arm skips in CI every time and
+> its proof was only ever about the committed synthetic example. A permanent skip and a pass are the
+> same line in a summary, which is this item's own defect wearing the test's clothes. This change adds
+> `scan_forbidden.py --self-test`, a stdlib entrypoint that probes each loaded class with a string
+> built from that class and prints counts and class names only, and runs it in
+> `.github/workflows/security.yml`'s `forbidden-content` job beside `--assert-floor-fresh`, inside the
+> guard only the secret branch exports. The three checks now ask three different questions of the same
+> tables: did the list fall below the floor, did it outgrow the floor, and can what loaded actually
+> match. Only the third can see a table that is populated, fresh and inert. **Measured 2026-09-03
+> against the real loaded set** (`mode=real`; names 8, estate 14, estate_file_scanned 13,
+> site_prefixes 2): site_prefix fired 2/2, estate_file_scanned fired 13/13, names fired 6/6 probeable
+> of 8 loaded. That is the first time the detector question has been answered about the real table
+> rather than about the example. **What is NOT done remains Proposed 1, the owner-run token data**
+> across the private file and the Actions + Dependabot secret stores -- owner-only, and unverifiable
+> from any checkout.
+
 > **PARTIAL 2026-08-26 (lander), NOT A CLOSURE -- this item stays OPEN.** Ships Proposed 3, the
 > prefix-free estate-identifier shape backstop (`_ESTATE_ID_SHAPE` in `scan_forbidden.py`), scanning
 > for the six-digit-run-inside-an-identifier shape independent of any loaded prefix. **What is NOT
