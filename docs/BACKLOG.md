@@ -21997,3 +21997,67 @@ So `test_the_script_prefers_its_own_repo_over_an_earlier_path_entry` supplies th
 **Verification:** 8 passed in `tests/test_webconsole_seam_snapshot.py`. Mutation check run rather than argued -- with the `sys.path.insert` line deleted, the decoy test reds naming the decoy import, and the by-path digest test **stays green**, which is the luck described above measured rather than predicted. Anchor restored, 8 passed again.
 
 **Adjacent and NOT fixed here, named rather than numbered.** `docs/WEBCONSOLE-PACKAGE.md`'s seam-refresh procedure is stale in three steps left behind by #1220: it says to bump `ENGINE_UI_SEAM` by hand (`1` to `2`) when the value is a derived digest, it says to update curated lists in this script that #1220 retired, and its step 5 prescribes `python scripts/webconsole_seam_snapshot.py > tests/golden/...`, the shell redirect this script's own docstring forbids because PowerShell's `>` writes UTF-16LE with a BOM into a file the test reads as UTF-8. That is doc drift with its own cause and it wants its own item; folding a documentation rewrite into a `sys.path` fix would make both harder to review.
+
+> **It got one: #1443**, filed and fixed 2026-09-04, in the commit that carries this line. Two of the three descriptions above were sharpened by measurement while it was built: the redirect is wrong in every shell rather than only under PowerShell (a redirect can write just one of the two files `--write` writes, so it leaves the constant stale even where the encoding survives), and the drift was not confined to the numbered steps -- the section heading two screens earlier called the seam an integer and typed it `int`. See #1443's LIMB 2 and LIMB 4.
+
+## 1443. WEBCONSOLE-PACKAGE.md's seam-refresh procedure teaches three steps #1220 retired, one of which corrupts the golden
+
+> 🔢 **Filed 2026-09-04 - FIXED IN THIS COMMIT, not yet landed.** Found 2026-09-03 while building #1439, which deliberately left it alone so a `sys.path` fix and a documentation rewrite stayed separately reviewable. The wider census in LIMB 4 is why the fix is not confined to the three steps the finding named.
+
+**Cluster:** repository tooling. **Priority:** P3. **Verdict:** build.
+**Severity:** no engine effect, no PHI axis, and **no deployment axis (sec. 0)** -- this is a developer procedure for a repository gate, and `docs/` and `scripts/` reach no wheel. The cost is bounded to a developer's session and it is the same shape #1439 recorded: **a corrupted golden, then debugging the gate that reported it.** Nothing is mis-shipped, because the seam the engine actually ships is derived by the tool and pinned by the tests either way.
+
+**What:** [`docs/WEBCONSOLE-PACKAGE.md`](WEBCONSOLE-PACKAGE.md)'s "Bumping the seam on an intentional contract change" still described the pre-#1220 world, in which `ENGINE_UI_SEAM` was a hand-picked incrementing integer over five hand-maintained tuples. #1220 made it a **16-hex-character SHA-256 digest of a DISCOVERED surface**. Three of the procedure's seven steps had no meaning left.
+
+| Step | Said | Shipped behaviour |
+|---|---|---|
+| 2 | bump `ENGINE_UI_SEAM` by hand, "e.g. `1` -> `2`" | the value is derived; `test_the_stored_seam_equals_the_derived_digest` fails any hand-written one |
+| 4 | if the change touched the *curated* surface, update the list in `webconsole_seam_snapshot.py` | #1220 retired all five tuples; `scripts/seam_discovery.py` discovers the surface and there is no list |
+| 5 | `python scripts/webconsole_seam_snapshot.py > tests/golden/webconsole_seam.snapshot` | the script's own docstring forbids exactly this; `--write` is the command, and it rewrites the constant AND the golden together |
+
+**LIMB 1 -- THE PROCEDURE IS UNFOLLOWABLE, NOT MERELY MISLABELLED, AND THAT IS THE STRONGEST THING AGAINST IT.** Under a derived seam the value does not exist until the change has been made and regenerated. Old step 2 asked the reader to write it, and old step 3 asked them to copy it into the console before old step 5 ever ran the generator. **There is no order in which the old steps can be executed**, so a reader who follows them faithfully cannot finish, and the first thing they will doubt is the gate rather than the page.
+
+**LIMB 2 -- STEP 5 FAILS IN THE WORST DIRECTION: FOLLOW THE OLD PROCEDURE AND THE HEADLINE GATE GOES GREEN ON A FABRICATED SEAM.** This is the finding that matters, and it is not the one the script's docstring names.
+
+`build_snapshot()` prints whatever `ENGINE_UI_SEAM` is imported, while `contract_digest()` never reads it. So old step 2 (hand-write the value) followed by old step 5 (regenerate the golden by redirect) produces a golden that AGREES with the hand-written value. Reproduced 2026-09-04 in an isolated copy of `messagefoundry/`, `messagefoundry_webconsole/`, `scripts/` and the golden, with the repository untouched and an assertion that the generator read the copy rather than the real tree:
+
+```
+hand-written seam in source   : deadbeefdeadbeef
+seam recorded in the golden   : deadbeefdeadbeef
+test_webconsole_seam_snapshot_matches_golden   : PASS
+test_the_stored_seam_equals_the_derived_digest : FAIL (derived=266cbfd342b22819 stored=deadbeefdeadbeef)
+```
+
+**The gate whose name says it compares the snapshot accepts `deadbeefdeadbeef`.** Exactly one test refuses it. A procedure that walks a developer into that state is worse than one that simply does not work.
+
+**THE ENCODING STORY IS REAL BUT NARROWER THAN THE DOCSTRING CLAIMS, AND I HAD IT WRONG ONCE BEFORE CORRECTING IT.** Measured on this box, one string redirected by each shell, then read back the way `tests/test_webconsole_seam_snapshot.py:94` reads the golden:
+
+| Shell | Bytes written | `read_text(encoding="utf-8")` |
+|---|---|---|
+| Windows PowerShell 5.1 | `ff fe 78 00 0d 00 0a 00` -- UTF-16LE with a BOM | `UnicodeDecodeError: invalid start byte` |
+| `pwsh` 7 | UTF-8, no BOM, CRLF | **decodes, and compares EQUAL** |
+| Git Bash | UTF-8, no BOM, LF | decodes clean |
+
+The `pwsh` 7 row is the correction: an earlier draft of this item and of the page claimed CRLF would diff every line. It does not. `read_text` performs universal-newline translation, so a CRLF golden and an LF golden compare equal, verified directly. The claim was plausible, wrong, and would have sent a reader hunting line endings; an adversarial verification pass caught it before it landed.
+
+So only the 5.1 arm damages the file, and that arm is still the nastiest: the golden is read as UTF-8 with no guard, so the developer gets a decode traceback instead of `_FAILURE_HINT` -- the gate's one mechanism for teaching the repair, bypassed exactly when it is needed. **But the encoding is not the common failure.** The common failure, in every shell including the `bash` the fence advertised, is that a redirect writes one of the two files `--write` writes.
+
+**LIMB 3 -- THE REMAINING BY-HAND EDIT IS STATED BY THE TOOL, SO THE PAGE LINKS TO IT RATHER THAN RESTATING IT (SDS-3.5).** `--write` deliberately does **not** touch `messagefoundry_webconsole.SUPPORTED_ENGINE_SEAMS`; its own docstring gives the reason, that a tool writing both halves would turn the handshake into a self-consistent tautology and remove the one place a human states this console build matches this engine contract. So the console-side edit stays a step, but its **literal text is printed by `--write` with the new value already in it**, and the page now points at that output. The page keeps the *why* -- one value (#279), a test that reds CI on the same commit, and what widening the set would cost -- because none of that is in the tool's output.
+
+**LIMB 4 -- THE DRIFT WAS WIDER THAN THE THREE STEPS, AND THE REST OF IT WAS IN THE SECTION THAT DEFINES THE TERM.** Fixing only the numbered list would have left the page contradicting itself two screens earlier:
+
+- the heading read **"`ENGINE_UI_SEAM` -- the handshake integer"**, and the paragraph under it typed the constant `int` and the console's set `frozenset[int]`. Shipped: `ENGINE_UI_SEAM: str` (`api/_ui_seam.py`) and `SUPPORTED_ENGINE_SEAMS: frozenset[str]` (`messagefoundry_webconsole/__init__.py:48`). A reader who trusted the annotation would write an integer and be refused by mypy before the gate ever spoke.
+- the implementation list said **"Three files implement it"** and described the generator as emitting "a **curated** list" plus "**live-introspected**" DTO fields. `scripts/seam_discovery.py` is a fourth file and the whole surface is discovered. The description also predated two capture classes the generator has carried since #1220: enum member sets and `Literal` value sets. That omission is load-bearing rather than tidy -- the console indexes `_SCOPE_NOTES[data.scope]`, so a renamed literal `KeyError`s at runtime while a field-name-only snapshot stays byte-identical, which is precisely the failure the section claims to be the sole backstop against.
+- three further sites carried "unbumped" / "seam bump" / "seam-bumping", each implying a number somebody types.
+
+**ONE RULE WAS ADDED THAT NO VERSION OF THE PAGE EVER CARRIED: on a merge conflict over the seam, NEITHER SIDE IS CORRECT.** When two branches both move the contract surface, all three files holding the value conflict, and the merged surface derives a **third** digest matching neither. Taking either side ships a value describing a tree that does not exist, and it looks exactly like an ordinary conflict resolution. This is #1220's central property read from the other direction -- `api/_ui_seam.py` states it as the reason a digest cannot collide the way the old integer did, but nothing told a developer standing in the conflict what to do. The page now does: clear the markers to anything, rerun `--write`, then set the console side from its output. Reported by a peer session that hit it live on 2026-09-04 (branch `d4ae2ce03d5723a7`, main `266cbfd342b22819`, merged `767521d4399d1ef4`); the mechanism is deterministic from the digest's own construction, so it is recorded here as design rather than as one session's luck.
+
+**Two things were DELIBERATELY not added.** A `PYTHONPATH` pin before the generator runs, because #1439 anchored the script on `__file__` and that test's `_ANCHOR_HINT` forbids the call-site pin by name, citing this very by-hand procedure as the reason. And the new digest's value, anywhere in prose -- the section's own rule, older than this item, is that a value quoted in prose goes stale silently, which is how it came to say "currently 1" until seam 11.
+
+**Verification:** `python scripts/webconsole_seam_snapshot.py --digest` returns `266cbfd342b22819`, matching both `ENGINE_UI_SEAM` and `SUPPORTED_ENGINE_SEAMS`, so the tree is self-consistent and the rewritten page describes the state it is in. The redirect table above was measured rather than argued, in a scratch directory outside the repository, with the repository untouched.
+
+**ONE SIBLING WAS FIXED, BECAUSE IT IS THE TERMINUS OF THIS PROCEDURE.** The page's last step sends the reader to `packaging/messagefoundry-webconsole/RELEASE.md`, whose opening said to "keep the range and the seam **integers** honest". A reader who follows the corrected procedure to its end would have landed on the retired vocabulary one line after leaving it. That file now says digests, and names #1220. A repo-wide sweep found the shell redirect surviving in exactly ONE place -- the page this item fixes -- so there is no second copy of the procedure anywhere, `.github/` included (checked with a positive control, since a pattern that finds nothing is indistinguishable from a clean tree).
+
+**Adjacent and NOT fixed here, named rather than numbered.** `tests/test_webconsole_seam_snapshot.py:106-127` still says "A seam bump has always required editing BOTH constants" and "on the commit that bumps the engine", and its assertion message opens "Bumping ENGINE_UI_SEAM requires updating...". That prose is not false -- the constant does change -- but it carries the same chosen-number connotation this item removed from the page, and `_FAILURE_HINT` in the same file already teaches the correct repair. It is test prose rather than the procedure a developer follows, so it is left for whoever next edits that file.
+
+Four more, all in the #1220 class and all deliberately out of this diff so the procedure stays separately reviewable: `scripts/webconsole_seam_snapshot.py:41` and `:303` state the redirect's reason as the PowerShell encoding twice, which is true of 5.1, silent about the one-of-two-files failure, and a restatement of a load-bearing fact (SDS-3.5); `messagefoundry_webconsole/__init__.py:29` is a truncated leftover comment ending mid-sentence on the word "the" and naming an integer seam identity, sitting directly above the constant it purports to explain; `packaging/messagefoundry-webconsole/CHANGELOG.md:16` and `:25` make a PRESENT-state claim in `[Unreleased]` that the supported seam is `2, 3`, which is wrong on both the type and on #279's one-value rule; and `docs/adr/0143`'s "curated into the webconsole seam snapshot" names the retired mechanism, though an accepted ADR records what was true when written and is better left dated than edited. Also surfaced and entirely unrelated: `docs/LEDGER-GATE.md:132` credits `install-git-hooks.ps1` with installing the ledger gate, which its own synopsis says it no longer does, and `:164`'s two anchors into `ledger_check.py` have drifted to `:376` and `:465`.
