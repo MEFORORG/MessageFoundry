@@ -1172,9 +1172,21 @@ def test_the_review_gate_still_reports_under_the_required_context_string() -> No
     for the same reason -- where the context string is the surface, the string is what to pin.
     """
     job = jobs_of(_REVIEW_GATE)[_REVIEW_GATE_JOB]
-    assert _REVIEW_GATE_CONTEXT in required_contexts(), (
-        f"{_REVIEW_GATE_CONTEXT!r} left .github/required-contexts.txt. With approvals pinned at 0 "
-        "that does not weaken review, it removes it."
+    # THIS TEST USED TO ASSERT THE CONTEXT WAS REQUIRED, and that assertion has been REMOVED rather
+    # than weakened, because the owner retired the reviewer requirement on 2026-09-04 and the context
+    # left branch protection the same day. Its message was right about the consequence and is kept
+    # here so nobody re-derives it: with `required_approving_review_count` pinned at 0, dropping this
+    # context does not weaken the review requirement, it removes it. That is now the recorded state,
+    # not a regression -- docs/CI.md says so in the same words.
+    #
+    # What remains below still earns its keep while the workflow runs: the job must keep reporting
+    # under its own name, must not grow a job-level `if:`, and must not acquire a trigger set that
+    # goes quiet. Those are the properties that would have to hold on the day anyone re-arms it, and
+    # they rot silently in the meantime.
+    assert _REVIEW_GATE_CONTEXT not in required_contexts(), (
+        f"{_REVIEW_GATE_CONTEXT!r} is back in .github/required-contexts.txt. Re-arming the review "
+        "gate is an owner decision; if that is what happened, restore the assertion this comment "
+        "replaced, its negative control in tests/negative_controls.toml, and the docs/CI.md entry."
     )
     assert str(job.get("name")) == _REVIEW_GATE_CONTEXT, (
         f"the job name is {job.get('name')!r}, so it reports under a different context string than "

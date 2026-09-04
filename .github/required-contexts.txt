@@ -202,9 +202,20 @@ a PR that implements BACKLOG #N must update BACKLOG.md
 # label fires no run, and the only trigger that still re-runs the job is `synchronize`, whose first
 # step REMOVES the label. Measured 2026-08-31 -- before the test above existed, dropping `labeled`
 # passed 65 tests.
-a reviewer has read this
+#
+# RETIRED 2026-09-04 BY THE OWNER, and removed from branch protection the same day. The whole block
+# above is kept as the record of what the gate did while it was armed; it is history, not a claim
+# about the current set. The context now lives in the not-required list below.
 
 # DELIBERATELY NOT REQUIRED (do not add without the owner's decision; each has a recorded reason):
+#   review-gate.yml            -- `a reviewer has read this` was REQUIRED from 2026-08-31 until the
+#                                 owner retired the reviewer requirement on 2026-09-04. Measured
+#                                 against branch protection that day: the required set went 14 -> 13
+#                                 and this context is absent. The workflow still runs and still
+#                                 reports; it simply no longer gates a merge. Reinstating it is an
+#                                 owner decision -- the label it checks for is applied by hand and by
+#                                 the PR's own author, so the gate records that a step happened, not
+#                                 that an independent party looked.
 #   codeql.yml, scorecard.yml  -- their SARIF upload needs `security-events: write`, which fork-PR
 #                                 tokens lack, so requiring them would block every fork PR.
 #                                 `CodeQL (python)` and `CodeQL (javascript-typescript)` were read as

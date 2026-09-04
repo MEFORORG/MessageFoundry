@@ -51,7 +51,6 @@ The stable contexts required on `main` are — mirroring
 - `forbidden-content (customer/PHI leak guard)`
 - `a PR that implements BACKLOG #N must update BACKLOG.md`
 - `cla`
-- `a reviewer has read this`
 
 `cla` is the **job key** in `cla.yml`, whose job declares no `name:`. Branch protection
 matches the job name, never the workflow name — so the context is `cla`, not "CLA Assistant". Every
@@ -69,12 +68,19 @@ the same reason and additionally **does not run on PRs at all** (`scorecard.yml`
 trigger — it runs on push-to-main, a schedule, and branch-protection changes). Nightly / path-gated
 legs (service-smoke, load, SQL/Postgres store) are deliberately **not** required.
 
-`a reviewer has read this` (`review-gate.yml`) is the required check that is **not a test of the code**,
-and the one with nothing behind it. `required_approving_review_count` is 0 and stays 0 — every session
-pushes as one GitHub identity, so a human-approval rule would wedge every PR rather than review any —
-which makes this single context the repository's whole review requirement. A PR clears it with
-`gh pr edit <N> --add-label reviewed`; a new commit removes the label, so re-review is automatic. It
-proves a **step happened**, not that an independent party looked.
+`a reviewer has read this` (`review-gate.yml`) was **retired by the owner on 2026-09-04** and removed
+from branch protection the same day; the required set went 14 to 13. The workflow still runs and still
+reports, but it no longer gates a merge, and a PR needs no `reviewed` label to land.
+
+**Read what that leaves, because the two halves were always separate.** `required_approving_review_count`
+is 0 and stays 0 — every session pushes as one GitHub identity, so a human-approval rule would wedge
+every PR rather than review any. With the label context retired as well, **no automated control now
+requires that any change be read before it merges.** That is a deliberate owner decision, recorded here
+rather than inferred; it is not a gap to be quietly closed by re-arming the context. Re-arming it is an
+owner decision too.
+
+Worth keeping in view if it is ever reconsidered: the label is applied by hand, commonly by the PR's own
+author, so the check proved a **step happened**, not that an independent party looked.
 
 The `quality-advisory.yml` jobs create **no code-scanning category** and **no _required_ check context** —
 they do report as ordinary advisory checks, and they **must never be added to the required list**. Two

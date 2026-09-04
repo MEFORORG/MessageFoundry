@@ -263,8 +263,9 @@ def test_required_jobs_carry_no_continue_on_error() -> None:
     # change in the collapse — a matrix split, or a context that quietly stops resolving — forces a
     # look here instead of passing on a self-consistent count.
     #
-    # 14/12 since 2026-08-31 (BACKLOG #1404), when `a reviewer has read this` was recorded. One
-    # collapse: ci.yml's `test` matrix reports 3 contexts from 1 job, so 14 - 2 = 12.
+    # 13/11 since 2026-09-04, when the owner retired `a reviewer has read this` and it left branch
+    # protection. One collapse: ci.yml's `test` matrix reports 3 contexts from 1 job, so 13 - 2 = 11.
+    # (Was 14/12 from 2026-08-31, BACKLOG #1404, while that context was recorded.)
     #
     # THIS MODULE READS THE CANONICAL FILE, NOT THE SERVER, so a context that reaches protection and
     # not the file is not examined here. That file's own header states the ordering rule — protection
@@ -278,10 +279,10 @@ def test_required_jobs_carry_no_continue_on_error() -> None:
         f"[security-posture] examined {examined} distinct jobs backing "
         f"{len(required_contexts())} required contexts"
     )
-    assert examined == 12, (
-        f"expected the 14 required contexts to resolve to 12 distinct jobs (the 3 `test` legs share "
-        f"one matrix job); got {examined}. If the workflow layout genuinely changed, update this "
-        "count."
+    assert examined == 11, (
+        f"expected {len(required_contexts())} required contexts to resolve to 11 distinct jobs (the 3 "
+        f"`test` legs share one matrix job); got {examined}. If the workflow layout genuinely changed, "
+        "update this count."
     )
     assert not offenders, (
         "a REQUIRED status check cannot fail, so it gates nothing:\n  "

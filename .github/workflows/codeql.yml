@@ -34,8 +34,11 @@ on:
   # .github/required-contexts.txt mirrors the server and is the single authority; restating the
   # required set in a second file is how the two drift. An earlier version of this comment asserted
   # "THE QUEUE IS LIVE AND THESE THREE CONTEXTS ARE REQUIRED". That was true when written and is
-  # false as of 2026-09-01, when the required set is 14 contexts and none of them is CodeQL
-  # (BACKLOG #1404 records the removal). The trigger stays either way: it costs nothing while they
+  # false as of 2026-09-01: none of the required contexts is CodeQL (BACKLOG #1404 records the
+  # removal). The COUNT that stood here has been dropped rather than updated -- restating it was the
+  # very drift the paragraph above warns about, and it went stale on 2026-09-04 when the required set
+  # moved. Read the count from .github/required-contexts.txt, which mirrors the server.
+  # The trigger stays either way: it costs nothing while they
   # are not required, and it is the prerequisite that has to be in place BEFORE they ever are.
   #
   # security.yml's own on: block predicted this in the PR that added merge_group to the other

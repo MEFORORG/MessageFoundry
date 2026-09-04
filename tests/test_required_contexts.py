@@ -107,7 +107,8 @@ def test_the_canonical_file_parses_and_names_the_live_set() -> None:
     )
     # Pinned so that ADDING or REMOVING a required check is a deliberate, reviewed edit here rather
     # than a silent one. Verified against `gh api repos/MEFORORG/MessageFoundry/branches/main/protection`
-    # at 2026-08-31 20:57 CDT: 14 contexts, SET-EQUAL to the file with nothing extra on either side.
+    # at 2026-09-04 18:33 CDT: 13 contexts, SET-EQUAL to the file with nothing extra on either side.
+    # (Was 14 until the owner retired `a reviewer has read this` on 2026-09-04 and it left protection.)
     # Set-equal is the reading worth recording -- a count alone cannot tell a matching set from two
     # errors that cancel.
     #
@@ -116,7 +117,7 @@ def test_the_canonical_file_parses_and_names_the_live_set() -> None:
     # one. A count that only ever fails when someone edits the FILE cannot notice the server moving
     # underneath it, so reconcile against the API, never against this number. The server moved four
     # times on 2026-07-29 and twice more on 2026-08-31.
-    assert len(contexts) == 14, (
+    assert len(contexts) == 13, (
         f"the canonical required set changed to {len(contexts)} contexts. If branch protection really "
         "changed, update this count AND every claim this suite checks; if it did not, revert the file."
     )
