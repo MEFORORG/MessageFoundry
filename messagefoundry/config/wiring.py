@@ -518,11 +518,13 @@ def FhirLookup(
     """Declare a named live-lookup FHIR connection (ADR 0043). A Handler reads it at run time with
     ``fhir_lookup(name, query, params)`` — a **read-only** read-by-id (``fhir_lookup(name,
     "Patient/123")``) or a search whose path is ``query`` and whose fields are the structured ``params``
-    mapping (``fhir_lookup(name, "Patient", {"identifier": "MRN|123"})``). ``params`` is the **only**
-    search form — each value is percent-encoded by the engine, so a value cannot inject an extra search
-    parameter, and a ``?``-query inside ``query`` is refused (BACKLOG #1243). That encoding is a
-    URL-layer control only; see ``transports.fhir._encode_search_params`` for the FHIR value-layer
-    separators it leaves intact. The parsed resource / searchset ``Bundle`` comes back as a dict.
+    mapping (``fhir_lookup(name, "Patient", {"identifier": FhirToken("MRN", mrn)})``). ``params`` is the
+    **only** search form — each value is percent-encoded by the engine, so a value cannot inject an extra
+    search parameter, and a ``?``-query inside ``query`` is refused (BACKLOG #1243). Percent-encoding is
+    a URL-layer control only, so each value also states its **kind** at the FHIR value layer: a plain
+    ``str`` is data and is refused if it carries ``,`` ``|`` or ``$``, a ``FhirToken`` is a
+    ``system|code`` pair, and a ``FhirRaw`` is author-written search syntax — see
+    :mod:`messagefoundry.fhirsearch`. The parsed resource / searchset ``Bundle`` comes back as a dict.
     Side-effecting (it self-registers), like :func:`Reference` / :func:`inbound`, **and** returns the spec
     so SMART auth can be composed onto it::
 

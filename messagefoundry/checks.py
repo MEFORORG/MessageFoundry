@@ -561,12 +561,15 @@ _TIME_WALLCLOCK_NOARG = frozenset({"time.localtime", "time.gmtime", "time.ctime"
 
 # db_lookup/fhir_lookup: this rule inspects the SQL statement / FHIR query-or-path argument ONLY --
 # the 2nd positional or the statement=/query= keyword. The params dict is NOT inspected at all. That is
-# a statement of SCOPE, not a clearance: params values are bound (SQL) or percent-encoded (FHIR,
-# urlencode(quote_via=quote, safe="")), which defeats STRUCTURE injection -- an extra parameter -- and
-# nothing else. It does NOT defeat FHIR VALUE-layer injection: ',' '|' '$' are FHIR search-value
-# separators, not URL delimiters, so they survive percent-decoding with their meaning intact
-# (BACKLOG #1243 limb B). Since #1243 removed the flat '?'-query, the inspected argument on a
-# fhir_lookup is the PATH, and interpolating into it is still flagged.
+# a statement of SCOPE, not a clearance, and what backs the scope differs by lookup. SQL params are
+# BOUND, so an interpolated value there cannot change the statement's structure. FHIR params are
+# percent-encoded (urlencode(quote_via=quote, safe="")), which defeats STRUCTURE injection -- an extra
+# parameter -- and, since BACKLOG #1243 limb B, the FHIR VALUE layer above it is closed at run time by
+# messagefoundry/fhirsearch.py: a plain str value carrying ',' '|' '$' is REFUSED rather than sent, and
+# an author who means the separator says so with FhirToken / FhirRaw. So this rule leaves the params
+# dict to the run-time screen on purpose, rather than because nothing screens it. Since #1243 removed
+# the flat '?'-query, the inspected argument on a fhir_lookup is the PATH, and interpolating into it is
+# still flagged.
 _LOOKUP_NAMES = frozenset({"db_lookup", "fhir_lookup"})
 _LOOKUP_QUERY_KW = frozenset({"statement", "query"})
 

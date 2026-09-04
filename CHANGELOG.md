@@ -28,6 +28,31 @@ All notable changes to MessageFoundry are documented here. The format follows
   to a truncated tail. ([BACKLOG #328](docs/BACKLOG.md))
 
 ### Changed
+- **A `fhir_lookup` search value now states its KIND, and a plain string carrying one of FHIR's
+  value-layer separators is refused rather than sent.** Percent-encoding is a URL-layer control: it
+  stops one value becoming two search parameters, and it cannot help at the FHIR value layer, where
+  `,` `|` and `$` are FHIR's own separators. The FHIR specification is explicit that a server
+  percent-decodes a parameter value first and reads FHIR's syntax second (R4 section 3.1.1.4.19, R5
+  section 3.2.1.5.7), so `%7C` arrives as a live token separator. A message-derived value carrying one
+  could therefore change what the search *means*.
+  **Three kinds, because one string cannot carry two provenances.** A plain `str` is data and raises a
+  PHI-safe error if it carries `,` `|` or `$` — the error names the parameter key and the character,
+  never the value. `FhirToken(system, code)` splits `"MRN|" + mrn` into its two halves: the system is
+  your literal and passes through, the code is data and screens. `FhirRaw("...")` is FHIR search syntax
+  **you** wrote — a composite, a quantity, a comma-separated OR or `_sort` list — percent-encoded only.
+  **Refusal rather than FHIR's backslash escape, deliberately:** the escape is correct only if the far
+  end implements the unescape, and server behaviour there varies, whereas a value that never leaves the
+  process cannot be misread by any server. Escaping stays available as an additive fourth kind for a
+  site that has a real FHIR server and can verify it.
+  **Migration:** `{"identifier": "MRN|" + mrn}` becomes `{"identifier": FhirToken("MRN", mrn)}`, which
+  puts identical bytes on the wire. Import `FhirToken` / `FhirRaw` from `messagefoundry`. A non-string
+  scalar also raises now — it was never in the declared type, but `urlencode` used to coerce it, so
+  `{"_count": 50}` has to become `{"_count": "50"}`.
+  **What is NOT screened:** the backslash. FHIR names it alongside these three because it introduces
+  the escape, so a server that implements the unescape reads a bare `\` as an introducer. Widening a
+  refusal is a behaviour change that should be ruled, so it is recorded on
+  `messagefoundry/fhirsearch.py` rather than folded in here.
+  ([BACKLOG #1243](docs/BACKLOG.md), [ADR 0043](docs/adr/0043-fhir-read-lookup.md))
 - **The authorization-grant audit trail now defaults ON, so a deployment records every authorization
   grant rather than only the state-changing ones.** `[security].audit_all_authorization_decisions` and
   the internal `[diagnostics].audit_all_authz` it desugars to both default `true`. Until now only a

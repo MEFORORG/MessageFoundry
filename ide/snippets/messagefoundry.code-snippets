@@ -126,7 +126,9 @@
     "prefix": "meforfhirlookup",
     "context": "handler",
     "body": [
-      "${1:bundle} = fhir_lookup(\"${2:connection}\", \"${3:Patient}\", {\"${4:identifier}\": \"MRN|\" + (msg[\"${5:PID-3.1}\"] or \"\")})",
+      "# FhirToken keeps the two halves apart: the system is your literal, the code is message data.",
+      "# A plain str value is refused if it carries ',' '|' or '$' -- FHIR reads those as syntax.",
+      "${1:bundle} = fhir_lookup(\"${2:connection}\", \"${3:Patient}\", {\"${4:identifier}\": FhirToken(\"${7:MRN}\", msg[\"${5:PID-3.1}\"] or \"\")})",
       "if ${1:bundle}.get(\"entry\"):",
       "\t${6:resource} = ${1:bundle}[\"entry\"][0][\"resource\"]"
     ],

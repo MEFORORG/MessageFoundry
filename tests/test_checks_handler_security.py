@@ -121,7 +121,11 @@ CASES: list[tuple[str, str, bool, str]] = [
         """
         @handler("h")
         def h(msg):
-            res = fhir_lookup("epic", "Patient", {"identifier": f"MRN|{msg['PID-3.1']}"})
+            # An f-string in a params VALUE is still not flagged (the rule reads the query/path
+            # argument only). The '|' idiom that used to be written here is gone: since BACKLOG
+            # #1243 a plain str value carrying a FHIR separator is refused at run time, and the
+            # system half of a token is stated with FhirToken instead.
+            res = fhir_lookup("epic", "Patient", {"identifier": f"{msg['PID-3.1']}"})
             return Send("OB", msg)
         """,
     ),

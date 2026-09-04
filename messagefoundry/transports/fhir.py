@@ -48,6 +48,7 @@ from typing import Any
 
 from messagefoundry.config.models import ConnectorType, Destination
 from messagefoundry.controlchars import has_control_char
+from messagefoundry.fhirsearch import FhirSearchParams, resolve_search_pairs
 from messagefoundry.parsing.fhir import FhirPeek, FhirPeekError
 from messagefoundry.transports.base import (
     DeliveryError,
@@ -739,38 +740,34 @@ register_destination(ConnectorType.FHIR, FhirDestination)
 # body), so a Handler cannot mutate the FHIR server through it (FHIR writes stay on FhirDestination).
 
 
-def _encode_search_params(params: Mapping[str, str | list[str]]) -> str:
-    """Percent-encode a structured search into a URL query string.
+def _encode_search_params(params: FhirSearchParams) -> str:
+    """Encode a structured search into a URL query string, at **both** layers.
 
-    **What this guarantees.** A **value** can never inject an extra FHIR search *parameter* (CWE-88
-    argument injection, ASVS 1.2.2). ``urlencode(quote_via=quote, safe="")`` encodes **every** reserved
-    char in each key/value, so an ``&``/``=``/``#`` in a value becomes ``%26``/``%3D``/``%23`` and the
-    server parses back exactly the parameters this function was handed — one value stays one value.
-    ``doseq=True`` expands a ``list[str]`` value into repeated params (``identifier=a&identifier=b``); a
-    ``str`` value stays a single param. Returns ``""`` for empty ``params`` (a search of the whole
-    resource type).
+    **The URL layer: percent-encoding.** A value can never inject an extra FHIR search *parameter*
+    (CWE-88 argument injection, ASVS 1.2.2). ``urlencode(quote_via=quote, safe="")`` encodes **every**
+    reserved char in each key/value, so an ``&``/``=``/``#`` in a value becomes ``%26``/``%3D``/``%23``
+    and the server parses back exactly the parameters this function was handed — one value stays one
+    value. A ``list`` value becomes repeated params (``identifier=a&identifier=b``), which FHIR reads as
+    an AND. Returns ``""`` for empty ``params`` (a search of the whole resource type).
 
-    **What this does NOT do: it does not neutralise FHIR's own value-layer separators ``,`` ``|``
-    ``$``.** Percent-encoding protects the **URL** layer only. A server percent-decodes first and
-    *then* reads FHIR's syntax inside the decoded value, so the decode re-forms a ``,`` (OR within one
-    parameter), a ``|`` (a ``system|code`` token) or a ``$`` (an operation sigil) with its separator
-    meaning intact: ``{"code": "sys|val"}`` goes on the wire as ``code=sys%7Cval`` and arrives at the
-    FHIR value layer as ``sys|val``. A message-derived value carrying one therefore still changes what
-    the search *means*, one layer above the URL. Treat any value that may carry message data as
-    untrusted at that layer and screen it in the Handler.
-
-    Closing that gap is **BACKLOG #1243 (Limb B)**, which is **blocked by an owner ruling pending a
-    real FHIR server** rather than merely unfinished: the escape cannot be settled against this
-    repository's own suite, which pins the percent-encoded pipe on the wire in five places and so
-    cannot disagree with itself. Write Handlers against the behaviour described here, not against an
-    assumed future fix."""
-    return urllib.parse.urlencode(params, doseq=True, quote_via=urllib.parse.quote, safe="")
+    **The FHIR value layer: percent-encoding does not neutralise ``,`` ``|`` ``$``, so the value's
+    KIND decides what happens to them** (BACKLOG #1243). A server percent-decodes first and *then*
+    reads FHIR's syntax inside the decoded value, so a decode re-forms those separators with their
+    meaning live. :func:`~messagefoundry.fhirsearch.resolve_search_pairs` therefore resolves each value
+    by kind before it is encoded here, and **refuses** rather than escapes: a plain ``str`` carrying
+    one of the three raises, a :class:`~messagefoundry.fhirsearch.FhirToken` splits the system and code
+    halves, and a :class:`~messagefoundry.fhirsearch.FhirRaw` is author syntax and rides through. The
+    vocabulary, the specification citations and why it refuses live once, on
+    :mod:`messagefoundry.fhirsearch` — read that module before passing message data into ``params``."""
+    return urllib.parse.urlencode(
+        resolve_search_pairs(params), quote_via=urllib.parse.quote, safe=""
+    )
 
 
 def _resolve_read_url(
     base: str,
     query: str,
-    params: Mapping[str, str | list[str]] | None = None,
+    params: FhirSearchParams | None = None,
 ) -> str:
     """Build a read-only ``GET`` URL from a ``FhirLookup`` ``query``: a read-by-id (``"Patient/123"``) or a
     path-only search (``"Patient"``) plus structured ``params``.
@@ -781,12 +778,11 @@ def _resolve_read_url(
     resource/operation — or off the allow-listed host.
 
     **There is exactly one search form, and it is encoded by construction** (ASVS 1.2.2, BACKLOG #1243).
-    Every value goes through :func:`_encode_search_params`, so a value can never inject an extra search
-    parameter — **but that is a URL-layer guarantee only, and #1243 is open on the value layer; see
-    that function's docstring before passing message-derived data.** A ``?``-query in ``query`` is
-    **refused**: the flat author-encoded form was removed rather than gated behind a setting, because a
-    setting leaves the unencoded sink one config edit away and closes the requirement on a default
-    instead of on the absence of the sink.
+    Every value goes through :func:`_encode_search_params`, which holds the URL layer by percent-encoding
+    and the FHIR value layer by resolving each value's kind — see that function's docstring before
+    passing message-derived data. A ``?``-query in ``query`` is **refused**: the flat author-encoded
+    form was removed rather than gated behind a setting, because a setting leaves the unencoded sink one
+    config edit away and closes the requirement on a default instead of on the absence of the sink.
 
     Raises a PHI-safe ``ValueError`` (it names only the offending shape/segment, never the query's
     parameter values)."""
@@ -962,19 +958,20 @@ class FhirLookupExecutor:
         self,
         connection: str,
         query: str,
-        params: Mapping[str, str | list[str]] | None = None,
+        params: FhirSearchParams | None = None,
     ) -> dict[str, Any]:
         """Issue a read-only ``GET`` for ``query`` against ``connection`` and return the parsed result.
 
         ``query`` and ``params`` are resolved by :func:`_resolve_read_url`, which refuses a ``?``-query
         and encodes each value via :func:`_encode_search_params`. **Read that function's docstring
-        before passing message-derived data:** its encoding is a URL-layer control, and it does not
-        neutralise FHIR's own value-layer separators.
+        before passing message-derived data:** percent-encoding is a URL-layer control only, so a plain
+        ``str`` value carrying a FHIR value-layer separator is **refused** here rather than sent.
 
         Runs the blocking GET **off the event loop** (the engine loop awaits this; ``fhir_lookup``
         bridges in from the handler's worker thread via ``run_coroutine_threadsafe``). Raises
         :class:`~messagefoundry.config.fhir_lookup.FhirLookupError` (PHI/secret-safe) on an unknown
-        connection, an invalid query path, a non-2xx, an unparseable body, or a network/timeout error."""
+        connection, an invalid query path, a refused search value, a non-2xx, an unparseable body, or a
+        network/timeout error."""
         # Lazy import keeps transports/ from importing config at module load (config imports transports).
         from messagefoundry.config.fhir_lookup import FhirLookupError
 
@@ -986,7 +983,8 @@ class FhirLookupExecutor:
         try:
             url = _resolve_read_url(self._base[connection], query, params)
         except ValueError as exc:
-            # PHI-safe: _resolve_read_url names only the offending shape/segment, never the query values.
+            # PHI-safe: the raised ValueError names only the offending shape/segment, or a refused
+            # parameter key and separator character -- never a query value (BACKLOG #1243).
             raise FhirLookupError(f"fhir_lookup on {connection!r}: {exc}") from exc
         body, status = await asyncio.to_thread(self._get, connection, url)
         return self._parse(connection, body, status)

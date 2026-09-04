@@ -23,6 +23,7 @@ from typing import Any
 
 import pytest
 
+from messagefoundry.fhirsearch import resolve_search_pairs
 from messagefoundry.transports.fhir import _resolve_read_url
 
 _SNIPPETS = (
@@ -115,3 +116,42 @@ def test_fhir_lookup_snippet_expands_to_the_structured_search_form() -> None:
     call = _fhir_lookup_calls(ast.parse(source))[0]
     assert len(call.args) == 3, "the search form passes structured params as the third argument"
     assert isinstance(call.args[2], ast.Dict)
+
+
+def test_no_snippet_teaches_a_refused_fhir_search_value() -> None:
+    """The params VALUE is checked against the engine too, not only the query (#1243 limb B).
+
+    This file exists because the FHIR snippet once drifted to an API the engine had removed, and its
+    method is to check the body against the ENGINE rather than against itself. Until limb B the only
+    argument that could drift was the query, so only ``args[1]`` was checked. The taught idiom now
+    lives in ``args[2]``: a plain ``str`` value carrying ``,`` ``|`` or ``$`` is refused at run time,
+    and re-teaching ``{"identifier": "MRN|" + ...}`` would otherwise pass every gate in this file."""
+    inspected = 0
+    for name, snippet in _load().items():
+        for call in _fhir_lookup_calls(ast.parse(_body_source(snippet))):
+            if len(call.args) < 3 or not isinstance(call.args[2], ast.Dict):
+                continue
+            for key, value in zip(call.args[2].keys, call.args[2].values, strict=True):
+                inspected += 1
+                assert isinstance(key, ast.Constant), f"{name}: a params key must be a literal"
+                if isinstance(value, ast.Constant) and isinstance(value.value, str):
+                    # A literal value is data by kind, so ask the engine's own resolver.
+                    try:
+                        resolve_search_pairs({str(key.value): value.value})
+                    except ValueError as exc:
+                        pytest.fail(f"{name}: the engine refuses the generated value: {exc}")
+                    continue
+                if isinstance(value, ast.Call) and isinstance(value.func, ast.Name):
+                    assert value.func.id in {"FhirToken", "FhirRaw"}, (
+                        f"{name}: a params value built by a call must be an explicit search-value "
+                        f"kind, not {value.func.id}(...)"
+                    )
+                    continue
+                # A concatenation or f-string is the ONE-STRING-TWO-PROVENANCES idiom #1243 abolished:
+                # an author literal welded to message data, which no encoder can tell apart.
+                assert not isinstance(value, ast.JoinedStr | ast.BinOp), (
+                    f"{name}: a params value must not be concatenated or interpolated -- that welds "
+                    f"author syntax to message data. Say which half is which with FhirToken(...)"
+                )
+    # Positive control: this must not become vacuous if the snippet stops passing structured params.
+    assert inspected >= 1, "no fhir_lookup params value found -- the check scanned nothing"

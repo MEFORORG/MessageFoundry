@@ -31,16 +31,23 @@ free of any transport / pool / event-loop import (one-way dependency, CLAUDE.md 
 
 Declare a connection with :func:`~messagefoundry.config.wiring.FhirLookup`; read it in a Handler::
 
-    patient = fhir_lookup("epic", "Patient/123")                       # read-by-id → a resource dict
-    bundle = fhir_lookup("epic", "Patient", {"identifier": "MRN|123"})  # search → a searchset Bundle
+    patient = fhir_lookup("epic", "Patient/123")                    # read-by-id → a resource dict
+    bundle = fhir_lookup(                                           # search → a searchset Bundle
+        "epic", "Patient", {"identifier": FhirToken("MRN", msg["PID-3.1"] or "")}
+    )
+
+**A search value states its own kind** (BACKLOG #1243) — see :func:`fhir_lookup` below, and
+:mod:`messagefoundry.fhirsearch` for the vocabulary itself.
 """
 
 from __future__ import annotations
 
-from collections.abc import Callable, Iterator, Mapping
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from contextvars import ContextVar
 from typing import Any
+
+from messagefoundry.fhirsearch import FhirSearchParams
 
 __all__ = [
     "FhirLookupError",
@@ -68,9 +75,10 @@ class FhirLookupError(RuntimeError):
 #: ``"Patient"`` paired with structured ``params``) and returns the parsed read result as a plain dict
 #: (a resource, or a searchset ``Bundle``). ``params`` (ADR 0043, BACKLOG #204) is the **safely-encoded**
 #: search form and, since #1243, the only one: each value is percent-encoded by the engine, so an
-#: attacker-influenced value can never inject an extra FHIR search parameter (CWE-88). ``None`` means a
-#: read-by-id (no search); a ``?``-query inside ``query`` is refused.
-FhirLookupRunner = Callable[[str, str, Mapping[str, str | list[str]] | None], dict[str, Any]]
+#: attacker-influenced value can never inject an extra FHIR search parameter (CWE-88), and each value's
+#: KIND settles the FHIR value layer above it (see :func:`fhir_lookup`). ``None`` means a read-by-id
+#: (no search); a ``?``-query inside ``query`` is refused.
+FhirLookupRunner = Callable[[str, str, FhirSearchParams | None], dict[str, Any]]
 
 # Active runner as a ContextVar (mirrors db_lookup._active): the runner is published around the off-loop
 # transform run and copied into the worker thread by asyncio.to_thread, so a call-time fhir_lookup(...)
@@ -110,7 +118,7 @@ def activated(runner: FhirLookupRunner | None) -> Iterator[None]:
 def fhir_lookup(
     connection: str,
     query: str,
-    params: Mapping[str, str | list[str]] | None = None,
+    params: FhirSearchParams | None = None,
 ) -> dict[str, Any]:
     """Run a live, read-only FHIR ``query`` against the named ``FhirLookup`` ``connection`` and return the
     parsed result as a dict — a single resource for a read-by-id, or a searchset ``Bundle`` for a search.
@@ -119,12 +127,28 @@ def fhir_lookup(
 
     * a **read-by-id**: ``fhir_lookup("epic", "Patient/123")`` → ``GET {base}/Patient/123``;
     * a **search**: the path in ``query`` plus the fields in ``params`` —
-      ``fhir_lookup("epic", "Patient", {"identifier": "MRN|123"})`` → ``GET {base}/Patient?...``.
+      ``fhir_lookup("epic", "Patient", {"identifier": FhirToken("MRN", mrn)})`` → ``GET
+      {base}/Patient?...``.
 
     **Encoding of search values (ASVS 1.2.2, BACKLOG #204, #1243).** There is exactly **one** search
-    form and it is encoded by construction: the engine percent-encodes **each value**
-    (``urlencode(quote_via=quote, safe="")``), so a value can **never** inject an extra search
-    parameter, and a ``list[str]`` value expands to repeated params.
+    form and it is encoded by construction, at both layers. At the **URL** layer the engine
+    percent-encodes every value (``urlencode(quote_via=quote, safe="")``), so a value can **never**
+    inject an extra search parameter, and a ``list`` value expands to repeated params (which FHIR ANDs).
+
+    **At the FHIR value layer, percent-encoding does not help, so a value states its own kind:**
+
+    * ``"literal"`` — a plain ``str`` is data. Carrying ``,`` ``|`` or ``$`` **raises**
+      :class:`FhirLookupError`, naming the parameter key and the character but never the value.
+    * :class:`~messagefoundry.fhirsearch.FhirToken` — ``FhirToken("MRN", msg["PID-3.1"] or "")``
+      builds ``MRN|<code>``. The system half is your literal and passes through; the code half is
+      data and screens.
+    * :class:`~messagefoundry.fhirsearch.FhirRaw` — ``FhirRaw("status,-date")`` is FHIR syntax
+      **you** wrote: percent-encoded, never screened. It is how you express an OR (a comma inside one
+      value), a quantity or a composite; never build one out of message data.
+
+    Import both from ``messagefoundry``. Why the engine refuses rather than backslash-escapes, and the
+    normative FHIR citations for it, are stated once on :mod:`messagefoundry.fhirsearch` — read it
+    before you pass message data into ``params``.
 
     **That is a URL-layer guarantee, and it is not the whole story: it does not neutralise FHIR's own
     value-layer separators, so a message-derived value can still change what a search MEANS.** Screen
@@ -144,7 +168,7 @@ def fhir_lookup(
 
     Raises :class:`FhirLookupError` if there is no active runner (called on a Router, in dry-run / Test
     Bench, or in a graph with no ``FhirLookup``), if ``connection`` is unknown, if the ``query`` is not a
-    valid read-by-id / search path, or if the connection/read fails — surfacing as that message's
+    valid read-by-id / search path, if a search value is refused, or if the connection/read fails — surfacing as that message's
     ``ERROR`` / dead-letter. Its result **may differ on a re-run** (accepted by design, read-side only —
     the outbound stays idempotent, so at-least-once is not broken)."""
     runner = _active.get()
