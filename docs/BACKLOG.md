@@ -21685,6 +21685,42 @@ The concatenated-quoting mechanism was read directly rather than through a marke
 - **It does not install or modify the gate.** `scripts/worktree/install-gate.ps1` was never run: **#1247** records that the installer overwrites the live gate with no backup and no receipt, which is not a Builder's call. Everything was driven against the repository copy.
 - **It does not score itself, and it does not close, reopen or re-verdict #1229.**
 
+## 1429. the worktree gate scans per line, so a quoted span crossing a newline straddles and deletes the live command between its two lines
+
+> 🔢 **Filed 2026-09-03, REPRODUCED here before filing rather than taken on report, and it is a COUNTEREXAMPLE TO #1427.** That item records the per-line split as producing no hole -- six spellings tested, zero found, and it cites the gate's own docstring agreeing that a quoted argument spanning lines denies today anyway. The reproduction below says otherwise, so one of the two readings is wrong and this filing is where that gets settled. #1229 is left CLOSED: its closure scoped this class out as an inherited residual, and a class that defeats every rule in the gate is its own item rather than evidence that one item is unfinished. `Get-ScannableSegments` splits the command on newlines **before** any quoting is considered, so a quoted span that crosses a newline is never one span to the gate. It is an unterminated quote on the first line and a stray quote on the last -- and the line in the middle carries **one quote from each surrounding span**. Those two pair ACROSS the gated command and blank it, so no rule ever sees it.
+>
+> **THIS CLASS RE-OPENS EVERY SHAPE #1229 CLOSED, ITS TITLED SHAPE INCLUDED, and an earlier draft of this banner got that backwards.** It called the newline case a distinct straddle while conceding in the next breath that it is *"#1229's straddle exactly"*. Those two statements pull opposite ways, and the measured reading is the second one: **this is a separate FIX, not a separate CLASS.** Insert one newline into a quoted word and #1229's own titled shape goes back to ALLOW -- `echo 'say "hi<NL>i' ; <gated> ; echo 'bye" now'` reads ALLOW on `origin/main` and on the branch that closed #1229, and the middle statement runs (`expr 111 \* 3` prints 333). So this item stays open and correctly allocated as its own fix, and it does **NOT** license closing #1229. **#1229 carries the reproduced three-row table and links back here; read the two together.**
+>
+> **THE GATE'S OWN RESIDUAL LIST SAID THIS CLASS DENIED, and that claim is measured FALSE.** It read *"Both multi-line forms deny today anyway: every line of such a span reaches the scanner RAW and the payload line carries the git token and the verb by itself."* The first half is right and the second misses that the payload line carries the two straddling quotes too. The sentence is corrected in place in `scripts/hooks/worktree_gate.ps1` rather than deleted, because a compensating control resting on a false premise is itself the defect -- and because that sentence is why nobody probed the class.
+>
+> **Measured on the shipped gate at `46ea10a78`**, cwd inside the governed repo, with a governed repos file and a positive control (plain `git -C <root> checkout main` -> DENY). Every row is pinned to whether the middle statement really RUNS, using an inert marker that COMPUTES (`expr 111 \* 3` under bash, `111*3` under pwsh, both printing 333) so an echo-back cannot be mistaken for a run:
+>
+> ```
+> shape                                                              runs?   gate
+> echo 'a<NL>b' ; git -C <governed> checkout main ; echo 'c<NL>d'    333     ALLOW
+> echo "a<NL>b" ; git -C <governed> checkout main ; echo "c<NL>d"    333     ALLOW
+> Write-Output 'a<NL>b' ; git -C <governed> reset --hard ; ...       333     ALLOW
+> Write-Output "a<NL>b" ; git -C <governed> reset --hard ; ...       333     ALLOW
+> the same four with the span on ONE line        (control)           333     DENY
+> ```
+>
+> The control is what makes those readings evidence: varying only the newline flips the verdict, so the split is the cause and not the shape.
+>
+> **THE FOURTH ROW WAS MISSING AND THE COUNT WAS WRONG.** This banner and the branch's PR body both said **three** fail-opens remained in this class. The missing corner is `Write-Output "a<NL>b" ; <gated> ; Write-Output "c<NL>d"` -- the PowerShell tool with the DOUBLE quote -- which also ALLOWs and also runs. Both tools times both quote characters is four, so the honest floor is **at least four**, and the number is a floor rather than an enumeration: nothing here ranged over the whole input space. Re-measured 2026-09-03 against gate copies hash-verified byte-identical to `origin/main` and to the branch head, all four rows ALLOW on both blobs and all four print 333.
+>
+> **Pinned, not merely described.** `tests/test_worktree_gate_quote_straddle.py` carries all four rows as a tripwire asserting the current ALLOW, each with its one-line control. **When that test reds, somebody closed this item** -- delete the rows and invert this banner; do not restore the ALLOW.
+>
+> **WHY IT WAS NOT CLOSED IN THE SAME CHANGE, stated so the deferral is reviewable.** Closing it means carrying quote state ACROSS the split, which changes what every rule sees on every multi-line command. #1086's own residual note already treats the per-line split as a fixed property, at least four sibling suites assert behaviour that rests on it in their own words (`tests/test_worktree_gate_hijack.py`, `..._interpreter_flags.py`, `..._interpreter_sigils.py`, `..._scope_wording.py`), and the gate's rule sites read `Raw` and `Scan` as a pair, so a change here is a behaviour change to a security control rather than a scanner repair. It wants its own adversarial pass with a paired must-trip and must-not-trip suite, which is more than the span-ownership fix it travelled beside.
+>
+> **#1086 DOES NOT CLOSE THIS**, and the residual list used to imply it might. #1086's change is message-flag blanking, which decides WHICH spans are blanked; this defect is about where a span BEGINS AND ENDS. Blanking fewer message bodies leaves the straddling pair intact.
+>
+> **How to prove a fix, in both directions.** The four rows above must DENY. Every control in the two quote suites must keep its current verdict -- the quoted commit message must still ALLOW, the unterminated quote must still DENY, and the interpreter-argument recursion must still reach its inner code. And the fail-OPEN axis must be counted, not just the false denies: a change that removes a false deny while adding one new ALLOW is a net loss on a guard that fails open. **Do not fix this by making the scanner swallow everything after a lone quote** -- that turns one stray character into a total bypass, which is the regression the single-line scanner was built to avoid.
+> Verdict: build
+> Closing-act: code
+
+**Cluster:** Tooling / developer guardrail. **Priority:** P3. **Verdict:** build.
+**Severity:** minor -- a local maintainer-workstation guardrail that its own synopsis declines to call a security boundary. **No engine effect, no PHI axis, and no deployment axis (sec. 0).** What it costs is the guardrail's reliability on a multi-line command, which is an ordinary shape rather than an exotic one: a heredoc, a quoted commit body, or any message a session writes across lines.
+
 ## 1430. the connscale in-hold sampler yields one sample per cell, so the in-hold window has zero width
 
 > 🔢 **Filed 2026-09-03 -- not started. Surfaced by the #1420 measurement, which could not have found it by reading.** The in-hold sampler produces **exactly two samples per cell** -- one in-hold, one post-drain -- in **20 of 20 cells** at hold 1.5 and hold 3.0. So `_empty_claim_rates`' window, which five sites describe as *"first to last in-hold samples"*, does not span a slightly-wrong range. **It spans no range at all: there is one in-hold sample.**
