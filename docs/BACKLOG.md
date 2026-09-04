@@ -19274,6 +19274,33 @@ shape a reader is least able to detect.
 > started"*. ***IT WAS ALREADY BUILT AND SHIPPED ON `main`.*** I only found out because I began it.
 >
 > **Scored 2026-09-03 -> P2.** Value **6/10** · Difficulty **3/10** · _quick win_. Not started, and there is a live instance of the class. Nothing on the dispatch path asks the tree: scripts/coord/dispatch_gate.py:152 reads only banner fields, and a grep across scripts/ finds only scripts/hooks/claim_check.py:44, which matches a commit message rather than the tree, plus the citation checkers. The class is real -- #1328's remaining limb shipped at scripts/asvs/rescore_handoff_check.py:5 and both f6c96b3b1 and the f769316fa hardening are ancestors of main, while its banner still reads Filed 2026-08-22 - not started -- and I sized the population by grepping origin/main for the literal BACKLOG #N form across tests/, scripts/, messagefoundry/ and .github/: 118 of 275 open rows are cited by code that landed. Value is 6 rather than 7 because the row publishes and prices its own workaround, a per-candidate git grep costing four minutes for nine rows, which is awkward rather than absent, and because a 43 percent flag rate means the output has to be MUST BE READ rather than a verdict or it becomes the noise failure #1394 names. The build is that grep wired into the dispatch path with both controls, a known-unbuilt row returning zero and a known-built row returning nonzero.
+>
+> **2026-09-03 (builder): the check is built as a standalone screen, and the numbers are
+> re-measured.** [`scripts/coord/landed_citation_screen.py`](../scripts/coord/landed_citation_screen.py)
+> sweeps a ref once and reports each row as `CITED` (the joined `BACKLOG #N` form), `MENTIONED` (a
+> bare `#N` only, weaker on purpose) or `CLEAR`, with tests beside it. **Wiring it into the dispatch
+> path is deliberately NOT in this change** -- `judge()` in `scripts/coord/dispatch_gate.py` was
+> being rewritten by two other pull requests at the time, so the screen ships importable and
+> runnable on its own and the one-line call is a follow-up.
+>
+> **RE-MEASURED at `fd44b0f17` and again at `46ea10a78`, and the row's own figure held both times:
+> 118 of 275 open rows carry the joined form, 42.9 percent.** Adding the bare form raises it to 130
+> of 275, 47.3 percent, for twelve extra rows. Both controls run on every invocation and nothing prints under a failed one: #1027 comes back
+> cited from four files, #1396 and a sentinel number come back clear, and the one-pass sweep is held
+> against the row's own per-number command on each. Six mutation arms were run and reverted -- a
+> misspelled needle, a sweep pattern matching nothing, a bare needle flooding, a narrowed path list
+> and a tree rewound to before the first #1027 citation all redden, while widening only the
+> Python-side bare extractor correctly does not, because the git pattern already bounds which lines
+> come back.
+>
+> **A SECOND LIVE INSTANCE OF THE CLASS, AND IT TEACHES THE OPPOSITE LESSON TO #1300.** #1375 was
+> fully built on 2026-08-29 in `7af7bb9b6` and `34f29c4f8`, and its row still reads *"not started"*.
+> **This check does NOT catch it, and cannot.** Neither commit is on `origin/main` -- the work sits
+> on a local branch and PR 772 is open -- so BUILT and LANDED come apart, and this instrument only
+> ever answers the second. Worse for a careless reader, the bare form DOES return two files for
+> #1375, and both assert the allowlist backup already exists, which the row refutes from source. The
+> pair is the whole lesson: **#1300 is a row the tree can see and the ledger cannot; #1375 is a row
+> neither can see, carrying a citation that points the wrong way.** MUST BE READ, never a verdict.
 
     tests/test_required_contexts.py:235
       test_the_ci_gate_rollup_comment_names_every_job_the_job_actually_needs()
