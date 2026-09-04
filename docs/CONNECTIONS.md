@@ -1098,6 +1098,21 @@ The DSN is built as `DRIVER={odbc_driver};SERVER=<server>;[DATABASE={database};]
 > line, for `DatabasePoll` inbounds as well as `Database` outbounds (#333). This exemption is
 > recorded in the [ADR 0092 amendment (2026-07-12)](adr/0092-posture-keyed-transport-hop-refusal-refuse-the-insecure-phi-hop.md).
 
+> **A generic hop that says TLS is not required is REFUSED, not merely warned about** (BACKLOG #1178).
+> The warning above used to be the whole control, so a generic connection with no TLS keyword would
+> cross in plaintext with nothing stopping it. That arm now goes through the same cleartext-hop
+> authority every other cleartext transport uses, with the same owner-ratified precedence: an on-box
+> hop is allowed, a per-connection `tls_hop_attested` allows it (audited), `cleartext_accepted` warns
+> and audits, a non-enforcing instance warns, and an **enforcing** instance **refuses** it. The refusal
+> lands at construction, so it fails `messagefoundry check` / dry-run / reload / the `serve` pre-flight
+> before anything starts.
+>
+> What is gated is the case the classifier can judge: **no** ssl/tls/encrypt keyword, or one pinned to
+> a no-TLS value. A keyword set to anything outside that deny-list is still delegated, because the
+> engine cannot tell whether an arbitrary driver's value verifies the certificate — that residual is
+> unchanged. `cleartext_accepted` is an outbound-only declaration, so a `DatabasePoll` inbound's only
+> per-connection relaxation is `tls_hop_attested`.
+
 > **Scope / limitations.** Native async DB drivers (`asyncpg`-as-connector, `oracledb`, `mysqlclient`) are
 > **out of scope** (dep-heavy) — the generic path is ODBC-only. The `test_connection` reachability probe
 > runs `SELECT 1` (works on PostgreSQL / MySQL / SQL Server; Oracle needs `SELECT 1 FROM DUAL`, so its
