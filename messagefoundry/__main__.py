@@ -1963,6 +1963,39 @@ def _serve(args: argparse.Namespace) -> int:
                 file=sys.stderr,
             )
 
+    # BACKLOG #1118: REPORT THE BROWSER-HARDENING OPT-OUT AT START. The #192 hardening defaults ON and
+    # the env below reverts it, and until this arm the reversion was reported NOWHERE — the predicate
+    # was read only from `_auth.py` and `_security.py`, both per-request, so an operator who set it (or
+    # inherited it from a service environment) got a quietly weaker console with no signal at all.
+    #
+    # WHY IT MATTERS MORE SINCE ADR 0172, not less: the engine now always serves TLS, so `effective_https`
+    # holds on the shipped default and both cookies resolve to their `__Host-` twins. This env is
+    # therefore the ONLY remaining way a default deployment loses the browser-enforced host binding.
+    # Before 0172 a cleartext bind lost it too, which made this one signal among several; now it is the
+    # signal.
+    #
+    # A WARNING IS NOT A CONTROL, and this arm is deliberately not offered as one (owner ruling
+    # 2026-08-17: a warning earns nothing by itself). It reports an operator's explicit choice; it does
+    # not gate, refuse, or re-enable anything. Imported from the console package root rather than its
+    # private `_auth` module, and reached only when serve_ui survived the find_spec gate above, so the
+    # wheel is present by construction.
+    if settings.api.serve_ui:
+        from messagefoundry_webconsole import (
+            BROWSER_HARDENING_OPT_OUT_ENV,
+            browser_hardening_enabled,
+        )
+
+        if not browser_hardening_enabled():
+            print(
+                f"warning: {BROWSER_HARDENING_OPT_OUT_ENV} is set — the /ui browser hardening is OFF "
+                "for this run. The session and OIDC flow cookies revert to their unprefixed names "
+                "(mf_session / mf_oidc_flow), losing the browser-enforced '__Host-' host binding, and "
+                "the per-response nonce CSP, COOP and CSP reporting are not emitted. Transport "
+                "security is NOT downgraded: Secure is still set over https. Unset this variable to "
+                "restore the secure-by-default posture.",
+                file=sys.stderr,
+            )
+
     # THE SINGLE DEFINITION OF "this instance is exposed" (BACKLOG #326) is derived above, before the
     # auth-off arm (BACKLOG #1013) that also consumes it, from two fields no earlier arm reassigns —
     # `is_loopback` and `tls_terminated_upstream` are read straight off the loaded config and are never
