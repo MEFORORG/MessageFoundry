@@ -39,6 +39,8 @@ MFA_ENABLED = "mfa_enabled"  # 6.3.7 — a second factor (TOTP) was enrolled on 
 MFA_DISABLED = (
     "mfa_disabled"  # 6.3.7 — the account's second factor was removed (self-service or admin reset)
 )
+# 6.3.7 — a single-use recovery code was spent, which permanently deletes that stored credential.
+RECOVERY_CODE_USED = "recovery_code_used"  # nosec B105 — event-type label, not a credential
 ADMIN_NEW_IP = (
     "admin_action_new_ip"  # 8.4.2 — a sensitive admin action from a new/unexpected client IP
 )
@@ -55,7 +57,11 @@ class SecurityEvent:
 
     event_type: str
     username: str
-    email: str | None = None  # the affected user's address (push target); None = no mailbox on file
+    # The affected account's ENGINE-OWNED notification address (``users.notify_email``, BACKLOG
+    # #1139) -- never the directory-mirrored profile address. None = the account has never carried
+    # one, and the notifier drops the notice; it does NOT mean a directory repoint removed it, which
+    # is a state the split makes unreachable.
+    email: str | None = None
     client_ip: str | None = None  # source IP of the triggering request, when known
     detail: dict[str, Any] = field(
         default_factory=dict

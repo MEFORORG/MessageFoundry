@@ -42,7 +42,7 @@ from pathlib import Path
 
 import pytest
 
-from tests.test_worktree_gate import assert_denied, run_gate  # reuse the subprocess harness
+from tests.test_worktree_gate import GATE, assert_denied, run_gate  # reuse the subprocess harness
 
 # Built by concatenation, matching the sibling straddle suite: a test about quote handling must not
 # depend on how this file's own literals nest. The escape is spelled once, here, for the same reason.
@@ -50,6 +50,7 @@ DQ = '"'
 SQ = "'"
 ESC_DQ = "\\" + DQ  # a BACKSLASH then a quote -- one shell literal, not a span opener
 ESC_SQ = "\\" + SQ
+BT = "`"  # PowerShell's escape character. Spelled once, for the same reason as the two above.
 
 
 @pytest.fixture
@@ -64,9 +65,14 @@ def repos_file(tmp_path: Path, primary: Path) -> Path:
     return f
 
 
-def shell(command: str, cwd: Path) -> dict[str, object]:
-    """A Bash tool payload, matching the sibling suites' harness."""
-    return {"tool_name": "Bash", "tool_input": {"command": command}, "cwd": str(cwd)}
+def shell(command: str, cwd: Path, tool: str = "Bash") -> dict[str, object]:
+    """A tool payload, matching the sibling suites' harness.
+
+    ``tool`` defaults to Bash because most rows here are sh shapes. It is a PARAMETER rather than a
+    second helper: the host is the variable half of this file's fifth round, and spelling the payload
+    dict inline at every PowerShell row is how the ``cwd`` convention drifts between neighbours.
+    """
+    return {"tool_name": tool, "tool_input": {"command": command}, "cwd": str(cwd)}
 
 
 # THE VERB SET IS THE POINT OF THIS PARAMETRISATION, not thoroughness for its own sake. The defect is
@@ -273,6 +279,26 @@ _STRADDLE = 'echo \\" ; {gated} ; echo \\"'
         ("PowerShell", _STRADDLE, False, "no 333: middle did NOT run"),
         # bash printed 333 -> the middle RAN.
         ("Bash", _STRADDLE, True, "333 printed: middle RAN"),
+        # --- FIFTH ROUND, the BACKTICK. These two are the must-ALLOW half of that round and they
+        # --- belong in this table rather than in one of their own: same property, same shape.
+        # An ODD trailing backtick escape with nothing to re-close it. pwsh reports "The string is
+        # missing the terminator" and runs NOTHING, so a deny would refuse a line that cannot execute.
+        # This row is a DENY-to-ALLOW move against the pre-fix gate: a false deny removed, not a hole.
+        (
+            "PowerShell",
+            f"Write-Output {DQ}a{BT}{DQ} ; {{gated}} ; Write-Output {DQ}x{DQ}",
+            False,
+            "ParserError: the string is missing its terminator",
+        ),
+        # The backtick straddle's OWN characters under the Bash tool, where a backtick is command
+        # substitution rather than an escape. bash reports an unexpected EOF and runs nothing, so the
+        # SAME text has opposite right answers on the two hosts -- which is what the convention buys.
+        (
+            "Bash",
+            f"echo {DQ}a{BT}{DQ}b{DQ} ; {{gated}} ; echo {DQ}c{BT}{DQ}d{DQ}",
+            False,
+            "unexpected EOF while looking for a matching quote",
+        ),
     ],
 )
 def test_the_verdict_matches_whether_the_command_RUNS_on_that_host(
@@ -285,10 +311,7 @@ def test_the_verdict_matches_whether_the_command_RUNS_on_that_host(
     A row that only asserted "deny" would be satisfied by a gate that denies everything.
     """
     command = template.format(gated=f"git -C {primary} reset --hard")
-    result = run_gate(
-        {"tool_name": tool, "tool_input": {"command": command}, "cwd": str(primary.parent)},
-        repos_file,
-    )
+    result = run_gate(shell(command, primary.parent, tool), repos_file)
     if expect_deny:
         assert_denied(result), f"{tool}: {measured} -- the gate must see it"
     else:
@@ -296,24 +319,356 @@ def test_the_verdict_matches_whether_the_command_RUNS_on_that_host(
 
 
 def test_an_unknown_host_gets_the_CONSERVATIVE_reading() -> None:
-    """The default is fail-CLOSED, and the direction is the whole reason it is a default.
+    """An unrecognised tool name must get NO escape rule, because guessing one has cost twice.
 
-    Honouring the escape makes spans LONGER, so it blanks MORE and can hide a command -- fail OPEN.
-    Refusing it leaves more text visible to the rules -- fail CLOSED. So `$PosixEscapes` defaults to
-    false and only a host known to use backslash escapes opts in.
+    Refusing an escape is not universally fail-closed -- the fifth round below measures the opposite
+    -- so the reason for this default is narrower and it is the right one: a host nobody has MEASURED
+    gets no rule invented for it. Both regressions in this file's history came from applying one
+    host's escape to another host's text.
 
     Asserted on the SOURCE because the parameter default is the guarantee; a behavioural probe would
     need a third tool name the gate does not currently accept.
     """
-    gate = (
-        Path(__file__).resolve().parents[1] / "scripts" / "hooks" / "worktree_gate.ps1"
-    ).read_text(encoding="utf-8")
-    assert "[bool]$PosixEscapes = $false" in gate, (
-        "the escape rule must default to OFF: an unrecognised host has to get the reading that blanks "
-        "less, or a future tool name silently inherits sh semantics (BACKLOG #1229 residual)"
+    gate = GATE.read_text(encoding="utf-8")
+    assert "[string]$Convention = 'none'" in gate, (
+        "the escape rule must default to 'none': an unmeasured host has to get no escape rule at "
+        "all, or a future tool name silently inherits some other shell's semantics (BACKLOG #1229 "
+        "residual)"
     )
-    assert '($tool -eq "Bash")' in gate, (
-        "the opt-in must be keyed on the host, not left unconditional"
+    assert "Get-HostConvention $tool" in gate, (
+        "the convention must be keyed on the host, not left unconditional"
+    )
+    assert "default { 'none' }" in gate, (
+        "Get-HostConvention must fall through to 'none' for a tool name it does not recognise"
+    )
+
+
+# --- BACKLOG #1229 residual, FIFTH ROUND: refusing the HOST'S OWN escape straddles too ------------
+#
+# Round 2 gave PowerShell NO escape rule and wrote down why: "Honouring the escape makes spans LONGER,
+# so it BLANKS MORE and can hide a command -- fail OPEN. Refusing it makes spans shorter, leaving more
+# text visible to the rules -- fail CLOSED."
+#
+# THAT IS TRUE OF SPAN LENGTH AND FALSE OF SPAN POSITION, and the difference is a live fail-open.
+# Refusing an escape the host really honours does not merely shorten the first span, it SHIFTS every
+# pairing after it -- and the shifted pair straddles the gated command and blanks it. #1229's own
+# mechanism, arriving through the door built to keep it out.
+#
+# PowerShell's escape is the BACKTICK. Measured on pwsh 7.6.4 with a payload that COMPUTES (`111*3`
+# -> 333) rather than echoes, so an echo-back cannot be mistaken for a run:
+#
+#     Write-Output "a`"b" ; 111*3 ; Write-Output "c`"d"      333 printed: the middle RAN
+#     Write-Output "a""b" ; 111*3 ; Write-Output "c""d"      333 printed  (doubled-quote escape)
+#     Write-Output "ab"   ; 111*3 ; Write-Output "cd"        333 printed  (no escape at all)
+#     Write-Output 'a`'   ; 111*3 ; Write-Output 'b`'        333 printed  (single-quoted: LITERAL)
+#     Write-Output "a`"   ; 111*3 ; Write-Output "x"         ParserError: nothing runs
+#     the FIRST line's characters under bash                 unexpected EOF: nothing runs
+#
+# Every row below is pinned to one of those observations, never to a previous verdict. The two
+# must-ALLOW rows live in the host matrix above rather than in a table of their own: they have that
+# test's exact shape, and splitting the deny half from the allow half of one property into two tables
+# is how the two drift.
+
+
+def _pwsh_backtick_straddle(gated: str) -> str:
+    """The straddle: one backtick-escaped quote on each side of the gated command."""
+    return f"Write-Output {DQ}a{BT}{DQ}b{DQ} ; {gated} ; Write-Output {DQ}c{BT}{DQ}d{DQ}"
+
+
+# THE VERB IS ZIPPED INTO THE ROWS, NOT CROSSED WITH THEM. Crossing two verbs over three rows costs
+# six `pwsh` launches for three shapes, and this file already measured why that buys nothing: both
+# verbs reach the SAME rule. The defect is upstream of any rule anyway -- it is in the blanking -- so
+# varying the verb across the rows keeps both spellings present at half the launches.
+@pytest.mark.parametrize(
+    "tool,wrap,verb",
+    [
+        # The OUTER line of a PowerShell tool call really is PowerShell.
+        ("PowerShell", None, "reset --hard"),
+        # ...and an EXTRACTED pwsh payload gets the same convention from Get-FlagOwner, whichever tool
+        # typed the outer line. Without this row the fix could have been keyed on the tool name alone.
+        ("Bash", "pwsh -Command", "checkout main"),
+        ("PowerShell", "pwsh -c", "reset --hard"),
+    ],
+)
+def test_a_powershell_backtick_escaped_quote_does_not_hide_a_gated_command(
+    primary: Path, repos_file: Path, tool: str, wrap: str | None, verb: str
+) -> None:
+    """pwsh printed 333 for this shape, so the middle statement RUNS and the gate must see it."""
+    payload = _pwsh_backtick_straddle(f"git -C {primary} {verb}")
+    command = payload if wrap is None else f"{wrap} {SQ}{payload}{SQ}"
+    assert_denied(run_gate(shell(command, primary.parent, tool), repos_file))
+
+
+@pytest.mark.parametrize(
+    "middle,measured",
+    [
+        # PowerShell's OTHER escape. Naive pairing already covers the same extent for it, so this row
+        # denies before and after the fix -- it is here to show the straddle above is about the
+        # BACKTICK and not about escaped quotes in general.
+        (f"{DQ}a{DQ}{DQ}b{DQ}", "doubled-quote escape: 333 printed"),
+        # No escape at all. Denies on every version of this scanner, so it separates the rows above
+        # from a gate that has simply started denying `Write-Output`.
+        (f"{DQ}ab{DQ}", "no escape at all: 333 printed"),
+    ],
+)
+def test_the_controls_that_deny_either_way_still_deny(
+    primary: Path, repos_file: Path, middle: str, measured: str
+) -> None:
+    """Same shape, same host, no backtick. Both RUN on pwsh and both must be seen."""
+    command = f"Write-Output {middle} ; git -C {primary} reset --hard ; Write-Output {DQ}z{DQ}"
+    result = run_gate(shell(command, primary.parent, "PowerShell"), repos_file)
+    assert result is not None, f"{measured} -- the gate must see it"
+    assert_denied(result)
+
+
+def test_the_backtick_is_LITERAL_inside_a_SINGLE_quoted_powershell_span(
+    primary: Path, repos_file: Path
+) -> None:
+    """THE ASYMMETRY ARM, and without it the fix could be 'honour the backtick everywhere'.
+
+    A PowerShell single-quoted string is fully literal -- the backtick escapes nothing there, so the
+    span really does close at the apostrophe and the middle statement RUNS. Measured: pwsh printed 333
+    for ``Write-Output 'a`' ; 111*3 ; Write-Output 'b`'``.
+
+    Applying the escape inside single-quoted spans would hold the first one open past its real closer,
+    pair it with the next apostrophe, and blank the gated command -- the same fail-open one span type
+    over. This is the PowerShell twin of the sh row that keeps ``'a\\'`` closing at its quote.
+    """
+    command = (
+        f"Write-Output {SQ}a{BT}{SQ} ; git -C {primary} reset --hard ; Write-Output {SQ}b{BT}{SQ}"
+    )
+    assert_denied(run_gate(shell(command, primary.parent, "PowerShell"), repos_file))
+
+
+def test_a_backtick_straddle_AROUND_a_cmd_call_is_seen(primary: Path, repos_file: Path) -> None:
+    """A fourth fail-open the fifth round closes, found while probing the cmd family.
+
+    The straddling quotes sit on the OUTER PowerShell line and the thing between them happens to be a
+    ``cmd /c`` invocation. Nothing about cmd decides this -- the outer line is PowerShell and its
+    backtick is what pairs the spans -- but it is pinned because it measured differently from the
+    shapes above and a class found by accident is the one that goes unrecorded::
+
+        cmd /c "echo a`"b" & git -C <governed> reset --hard & Write-Output "c`"d"
+
+    MEASURED: origin/main ALLOW, this build DENY. The middle really runs -- pwsh started it as
+    background Job3 under ``&`` and printed 333 under ``;``.
+    """
+    gated = f"git -C {primary} reset --hard"
+    command = f"cmd /c {DQ}echo a{BT}{DQ}b{DQ} & {gated} & Write-Output {DQ}c{BT}{DQ}d{DQ}"
+    assert_denied(run_gate(shell(command, primary.parent, "PowerShell"), repos_file))
+
+
+def test_the_cmd_family_keeps_its_NO_ESCAPE_reading() -> None:
+    """cmd.exe escapes with ``^``, not with a backtick, and it must not inherit PowerShell's rule.
+
+    ``Get-FlagOwner`` used to answer a single ``win`` for pwsh, powershell, cmd and wsl. That was
+    harmless while ``win`` meant "no escapes" and became a hazard the moment PowerShell got a rule, so
+    the set is split. Splitting is the NO-CHANGE option: cmd and wsl get exactly the reading they had.
+
+    **THE REASON THIS USED TO GIVE FOR BEING A SOURCE ASSERTION WAS FALSE, AND IT IS REPLACED BY A
+    MEASUREMENT.** It said no probe can separate ``cmd`` from PowerShell because the RAW line is
+    scanned under the OUTER host's convention and carries the git text, so the outer line reaches a
+    verdict before the payload's convention can matter. That holds only while the payload contains an
+    unescaped quote. **It fails whenever the payload's quotes are ALL backtick-escaped**: the outer
+    pwsh scan then treats the whole argument as ONE span, blanks it, and reaches NO verdict -- so the
+    extracted payload's own convention is the only thing left to decide. A justification that told the
+    next reader the probe could not exist is a compensating control resting on a false premise, which
+    is the same defect this file's #1429 tripwire was written for, so it is corrected in place rather
+    than deleted.
+
+    **THE PROBE THAT SEPARATES THEM, built and measured 2026-09-03** against this build and against a
+    mutant folding ``cmd`` and ``wsl`` into the PowerShell set, cwd inside the governed repo::
+
+        probe                                       this   cmdfold   separates?
+        cmd /c "`"<gated>`""    (PowerShell tool)   ALLOW  DENY      YES
+        wsl -c "`"<gated>`""    (PowerShell tool)   ALLOW  DENY      YES
+        cmd /c "`"<gated>`""    (Bash tool)         DENY   DENY      no, outer conv is posix
+        cmd /c "<gated>"        no backtick         DENY   DENY      no   (control)
+        wsl -c "<gated>"        no backtick         DENY   DENY      no   (control)
+
+    The no-backtick controls are what make this a separation rather than a coincidence: only the
+    escape varies between a separating row and its own control.
+
+    **THE CONCLUSION IS UNCHANGED AND STILL CORRECT.** ``cmd`` must not inherit a backtick: cmd.exe
+    escapes with ``^``, and handing it an escape it does not have lengthens its spans and can hide a
+    command inside one. What changed is that the split now rests on a measurement rather than on a
+    claim that no probe exists.
+
+    **IT IS NO LONGER A SOURCE ASSERTION ALONE (residual, SIXTH round).** The separating probe above
+    used to read ALLOW on this build, so pinning DENY would have pinned a verdict the gate did not
+    produce; that ALLOW is closed below and the row now denies either way, which costs the table its
+    separating power. A DIFFERENT probe replaces it, and this one is the better instrument because it
+    separates the two conventions in the direction that MATTERS -- it shows the fold LOSING a deny the
+    gate has today, rather than gaining one::
+
+        cmd /c 'echo "x`" & <gated> & echo "y"'   PowerShell tool   this DENY   cmd-folded ALLOW
+        cmd /c 'echo "x"  & <gated> & echo "y"'   the control       this DENY   cmd-folded DENY
+
+    Measured 2026-09-03 against a mutant that folds ``cmd`` and ``wsl`` into ``$pwshSet``, cwd inside
+    the governed repo, gate copies hash-verified byte-identical to ``origin/main`` and to this build.
+    The middle statement REALLY RUNS: the inert marker ``set /a 111*3`` prints 333 through both rows,
+    so neither is a dead probe, and ``&`` is used rather than ``;`` because ``;`` is not a command
+    separator in cmd.
+
+    **WHY THE FOLD LOSES IT.** A backtick is an ORDINARY CHARACTER to cmd.exe, so the quote after it
+    really closes the span and the gated command is left in plain view. Reading that quote as escaped
+    holds the span open ACROSS the gated command and blanks it -- #1229's own straddle, bought by
+    handing a host an escape it does not have. The PowerShell single-quoted argument is what carries
+    the backtick through to cmd intact, since a pwsh single-quoted string is fully literal.
+    """
+    gate = GATE.read_text(encoding="utf-8")
+    assert "$cmdSet = @('cmd', 'wsl')" in gate, (
+        "cmd and wsl must stay in their own set: folding them in with pwsh hands them a backtick "
+        "escape neither has (BACKLOG #1229 residual, fifth round)"
+    )
+    assert "$pwshSet = @('pwsh', 'powershell')" in gate, (
+        "only the two PowerShell hosts may carry the backtick convention"
+    )
+    assert "'pwsh' { [char]0x60 }" in gate, (
+        "the backtick must be reachable ONLY from the 'pwsh' arm of Get-EscapeChar"
+    )
+
+
+def test_a_LITERAL_backtick_in_a_cmd_payload_does_not_hide_a_gated_command(
+    primary: Path, repos_file: Path
+) -> None:
+    """The BEHAVIOURAL half of the split above, and the arm the cmd-folded mutant fails.
+
+    See ``test_the_cmd_family_keeps_its_NO_ESCAPE_reading`` for the measurement and the mechanism.
+    WHEN THIS REDS, somebody handed ``cmd`` an escape convention it does not have.
+    """
+    gated = f"git -C {primary} reset --hard"
+    probe = f"""cmd /c {SQ}echo {DQ}x{BT}{DQ} & {gated} & echo {DQ}y{DQ}{SQ}"""
+    assert_denied(run_gate(shell(probe, primary.parent, "PowerShell"), repos_file))
+    # THE CONTROL, and it is what makes the row above a separation rather than a coincidence: the
+    # identical shape with the backtick removed. Only the escape varies between the two.
+    control = f"""cmd /c {SQ}echo {DQ}x{DQ} & {gated} & echo {DQ}y{DQ}{SQ}"""
+    assert_denied(run_gate(shell(control, primary.parent, "PowerShell"), repos_file))
+    # THE ANTI-VACUITY ROW. Two DENY assertions go green against a gate that denies everything, and
+    # the evidence that they do not -- the cmd-folded mutant ALLOWS the probe -- lives in a scratchpad
+    # a reader cannot re-run. So the same shape aimed at a NON-governed tree must still ALLOW.
+    ungoverned = f"git -C {primary.parent / 'Elsewhere'} reset --hard"
+    benign = f"""cmd /c {SQ}echo {DQ}x{BT}{DQ} & {ungoverned} & echo {DQ}y{DQ}{SQ}"""
+    assert run_gate(shell(benign, primary.parent, "PowerShell"), repos_file) is None, (
+        "the identical shape aimed at an ungoverned tree must ALLOW -- if it denies, the two rows "
+        "above prove nothing about escape handling"
+    )
+
+
+@pytest.mark.parametrize("flag", ["/c", "/k"])
+def test_a_fully_ESCAPED_cmd_payload_is_read_in_the_encoding_cmd_RECEIVES(
+    primary: Path, repos_file: Path, flag: str
+) -> None:
+    """BACKLOG #1229 residual, SIXTH round -- a fail-open THE FIFTH ROUND'S OWN FIX INTRODUCED.
+
+    **THIS ROW ASSERTED ALLOW UNTIL THE SIXTH ROUND, AS A DELIBERATE TRIPWIRE OVER A LIVE REGRESSION.**
+    The ALLOW is closed; the history stays because the mechanism is the item's own and the next reader
+    needs it. Measured 2026-09-03 against gate copies hash-verified byte-identical to ``origin/main``
+    and to each build, cwd inside the governed repo, every row pinned to whether the middle statement
+    really RUNS (the inert marker ``set /a 111*3`` -> 333, so an echo-back proves nothing)::
+
+        cmd /c "`"git -C <governed> reset --hard`""   main DENY   round 5 ALLOW   here DENY   RUNS
+        cmd /k "`"git -C <governed> reset --hard`""   main DENY   round 5 ALLOW   here DENY   RUNS
+        cmd /c "git -C <governed> reset --hard"       main DENY   round 5 DENY    here DENY   (control)
+        git -C <governed> reset --hard                main DENY   round 5 DENY    here DENY   (POSCTL)
+
+    **THE MECHANISM.** The OUTER line is PowerShell, so the outer scan honours the backticks, sees one
+    span, blanks it and reaches NO verdict. Extraction then asks ``Get-FlagOwner``, which answers
+    ``cmd``, whose convention is ``none``. But the extracted text STILL CARRIES THE OUTER HOST'S
+    BACKTICKS -- pwsh has not run, so nothing has consumed them -- and scanning it with no escape rule
+    pairs the two escaped-quote sequences ACROSS the git command and blanks it. Span ownership
+    deciding the wrong way, one level in.
+
+    **HOW IT IS CLOSED, AND THE TWO WAYS THAT WERE MEASURED AND REJECTED.** ``Get-ScannableSegments``
+    now emits ONE EXTRA SEGMENT for a cmd-owned payload: the same text with the outer host's escaped
+    quotes resolved and cmd's own ``/c`` wrapper quotes removed -- the encoding cmd.exe actually
+    receives. Both steps are needed and neither is enough alone, measured.
+
+      * FOLDING ``cmd`` INTO THE PowerShell SET denies these rows and LOSES a deny the gate has
+        today. See ``test_a_LITERAL_backtick_in_a_cmd_payload_does_not_hide_a_gated_command``.
+      * DECODING IN PLACE -- replacing the payload rather than adding a view -- re-opens round 3's
+        nested ``bash -c "bash -c \\"<gated>\\""`` (DENY -> ALLOW), because this function recurses ONE
+        level and that round-3 deny depends on the escaped text staying visible at this level.
+
+    An EXTRA segment cannot do either: every rule reaches a segment through a continue-or-deny loop,
+    so adding one can only ADD a deny.
+    """
+    gated = f"git -C {primary} reset --hard"
+    # Spelled once, locally: the run of quote and backtick placeholders below is the whole subject of
+    # this test, and `{DQ}{BT}{DQ}{gated}{BT}{DQ}{DQ}` is unreadable as an unbroken sequence.
+    esc_dq = BT + DQ  # PowerShell's escaped quote -- a literal `"` that does NOT close a span
+    command = f"cmd {flag} {DQ}{esc_dq}{gated}{esc_dq}{DQ}"
+    assert_denied(run_gate(shell(command, primary.parent, "PowerShell"), repos_file))
+    # THE CONTROL, and it is what keeps this attached to the ESCAPE rather than to the cmd shape: the
+    # identical command with NO backticks DENIES, on origin/main and on every build since. Without it
+    # the row above would pass against a gate that had simply stopped recognising `cmd` altogether.
+    #
+    # BOTH FLAGS KEEP THEIR OWN ROW DELIBERATELY, against this file's own zip-don't-cross rule. That
+    # rule is for dimensions that reach the SAME rule and buy nothing; here both `cmd /c` and
+    # `cmd /k` were INDEPENDENTLY MEASURED to allow AND to execute (333) before this fix.
+    assert_denied(
+        run_gate(shell(f"cmd {flag} {DQ}{gated}{DQ}", primary.parent, "PowerShell"), repos_file)
+    )
+
+
+def test_the_extra_cmd_view_is_ADDITIVE_and_cannot_remove_a_deny() -> None:
+    """The safety argument of the sixth round, made structural rather than remembered.
+
+    THE FIX IS AN EXTRA SEGMENT, NOT A REPLACED ONE, and that is the whole reason it cannot introduce
+    a fail-open. Rewriting the payload in place is the tidier change and it is MEASURED to re-open
+    round 3 -- see the test above. So the emission the round-3 pin depends on must stay, and the new
+    view must be APPENDED after every existing segment, where rule 3's first-verb-wins bookkeeping
+    cannot see it.
+
+    WHEN THIS REDS, somebody turned the extra view into a rewrite. Re-measure round 3 before agreeing
+    that is safe.
+    """
+    gate = GATE.read_text(encoding="utf-8")
+    assert "$s = Remove-QuotedSpans $item.Text $item.Conv" in gate, (
+        "the ORIGINAL payload view must still be emitted: the round-3 nested-escape deny depends on "
+        "the outer-encoded text staying visible at this level (BACKLOG #1229 residual, sixth round)"
+    )
+    assert (
+        "$unwrapped = Remove-CmdWrapperQuotes (Remove-EscapeChars $item.Text $Convention)" in gate
+    ), (
+        "the extra cmd view must resolve the OUTER host's escaped quotes before applying cmd's own "
+        "wrapper rule -- neither step closes the shape alone"
+    )
+    # The extra view must come after the loop that emits the original, never inside it.
+    original = gate.index("$s = Remove-QuotedSpans $item.Text $item.Conv")
+    extra = gate.index("$unwrapped = Remove-CmdWrapperQuotes")
+    assert original < extra, "the extra view must be APPENDED, so segment order is unchanged"
+
+
+def test_the_scanner_and_the_extractor_READ_THE_SAME_ESCAPE_TABLE() -> None:
+    """The invariant round 3 was a fail-open for, made structural instead of watched.
+
+    THE SCANNER AND THE INTERPRETER-ARGUMENT EXTRACTION MUST NOT DISAGREE ABOUT WHERE A SPAN ENDS.
+    They did once, measurably (see the round-3 test below). The fix at the time made the two AGREE
+    while leaving the escape character spelled TWICE -- once as a ``[char]`` in ``Remove-QuotedSpans``
+    and once inside a hand-written regex in ``Get-ScannableSegments``, some 500 lines apart. A sixth
+    host added to one and not the other re-opens the round-3 hole, and a source assertion on each
+    spelling separately cannot see that gap, because both would still pass.
+
+    So the duplicate is gone rather than watched. ``Get-EscapeChar`` is the only table and the
+    extraction pattern is DERIVED from it through ``[regex]::Escape``, which makes divergence
+    unrepresentable rather than merely absent today. Verified byte-identical to the three literals it
+    replaced, on all four conventions.
+
+    WHEN THIS TEST REDS, somebody re-introduced a second spelling of the escape character. That is
+    the defect; the test is not the thing to fix.
+    """
+    gate = GATE.read_text(encoding="utf-8")
+    assert gate.count("function Get-EscapeChar(") == 1, "the escape table must be defined once"
+    assert "$esc = Get-EscapeChar $Convention" in gate, (
+        "Remove-QuotedSpans must read the shared table rather than spelling the character itself"
+    )
+    assert "$extractEsc = Get-EscapeChar $Convention" in gate, (
+        "the extraction regex must read the SAME table -- see round 3 in this file's history"
+    )
+    assert "[regex]::Escape($extractEsc)" in gate, (
+        "the extraction pattern must be DERIVED from the shared character, not re-spelled as a "
+        "literal: a second literal is what lets the two drift apart silently"
     )
 
 

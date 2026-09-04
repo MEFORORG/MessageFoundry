@@ -28,9 +28,29 @@ from messagefoundry.api.request_timeout import (
     TIMEOUT_STATE_ATTR,
 )
 
-#: Long enough that no scheduling hiccup finishes it inside the deadline, short enough that the RED
-#: run is not a wait: the deadlines below are 0.05-0.2s.
+#: Long enough that no scheduling hiccup finishes it inside either deadline below, short enough that
+#: a RED run (middleware removed) is not a wait.
 _SLOW_SECONDS = 3.0
+
+#: The deadline for the arms asserting the bound FIRES. Tight is safe here because the margin runs the
+#: forgiving way: the handler sleeps ``_SLOW_SECONDS``, so a stalled runner can only delay the refusal,
+#: never turn it into a pass. 30x.
+_TRIPS_DEADLINE = 0.1
+
+#: The deadline for the arms asserting a prompt handler is UNTOUCHED. **The margin runs the other way
+#: here and that is why this number is not ``_TRIPS_DEADLINE``.** A runner stall pushes a trivial
+#: handler PAST the deadline and 503s it, so the value has to absorb the stall rather than merely beat
+#: the handler's ~1ms of real work. These arms used to run at 0.1s, which is inside the range of a GC
+#: pause or a scheduling gap on a shared 32-way-parallel runner -- a wall-clock assertion that fails
+#: differently on each attempt, which is the shape BACKLOG #1385 exists to remove.
+#:
+#: **Raising it costs no discrimination, because tightness was never what these arms measured.** Their
+#: job is to catch a middleware that refuses EVERYTHING -- without them, one that 503'd every request
+#: would pass the bound arms above. A 5s deadline catches that identically. The claim that the
+#: CONFIGURED value is the one in force is carried by the trips arms instead, and carried better: a
+#: 3.0s handler under a 0.1s deadline reds if the middleware ever falls back to the shipped 120s
+#: default, which no fast-path assertion at any deadline can see.
+_PASSES_DEADLINE = 5.0
 
 
 def _app_with_a_slow_route(timeout_seconds: float | None) -> tuple[object, list[str]]:
@@ -64,7 +84,7 @@ def _client(app: object) -> TestClient:
 def test_a_slow_handler_is_refused_with_a_bounded_error() -> None:
     """The bound itself. Mutation: remove the `RequestTimeoutMiddleware` registration from
     `create_app`. Red: 200 with `{"status": "finished"}` after the handler ran to completion."""
-    app, finished = _app_with_a_slow_route(0.1)
+    app, finished = _app_with_a_slow_route(_TRIPS_DEADLINE)
     with _client(app) as client:
         response = client.get("/_test/slow")
     assert response.status_code == 503, (
@@ -79,7 +99,7 @@ def test_the_refusal_carries_the_baseline_security_headers() -> None:
     it did not set them itself the 503 would be the one response in the API with none of them.
 
     Mutation: drop `_TIMEOUT_HEADERS`. Red: the missing header is named."""
-    app, _ = _app_with_a_slow_route(0.1)
+    app, _ = _app_with_a_slow_route(_TRIPS_DEADLINE)
     with _client(app) as client:
         response = client.get("/_test/slow")
     assert response.status_code == 503
@@ -93,10 +113,17 @@ def test_the_refusal_carries_the_baseline_security_headers() -> None:
 
 
 def test_a_fast_handler_is_untouched() -> None:
-    """Live positive control: with the SAME deadline in force, a handler that answers promptly
-    returns its own response. Without this, a middleware that 503'd everything would pass the bound
-    test above."""
-    app, finished = _app_with_a_slow_route(0.1)
+    """Live positive control: with a deadline in force, a handler that answers promptly returns its
+    OWN response. Without this, a middleware that 503'd everything would pass the bound test above.
+
+    Read `_PASSES_DEADLINE` for why the number is 5.0 and not the 0.1 the trips arms use. The three
+    assertions are separate claims, not one restated: the status says it was not refused, the body says
+    the response is the handler's rather than the middleware's, and `finished` says the handler ran to
+    completion rather than being cancelled and answered for.
+
+    Mutation: make `RequestTimeoutMiddleware.__call__` refuse unconditionally (`send` the 503 before
+    `await self.app(...)`). Red: 503, not 200."""
+    app, finished = _app_with_a_slow_route(_PASSES_DEADLINE)
     with _client(app) as client:
         response = client.get("/_test/fast")
     assert response.status_code == 200
@@ -111,7 +138,7 @@ def test_the_deadline_is_on_the_route_not_only_on_unauthenticated_paths() -> Non
     `/status` requires auth and, with no auth service attached, fails closed. What is asserted here
     is only that a real route still answers under a deadline in force: a middleware that swallowed
     or delayed authenticated routes would show up as a 503 instead of the fail-closed status."""
-    app, _ = _app_with_a_slow_route(5.0)
+    app, _ = _app_with_a_slow_route(_PASSES_DEADLINE)
     with _client(app) as client:
         assert client.get("/health").status_code == 200
         assert client.get("/status").status_code in (401, 403, 503)
@@ -119,12 +146,25 @@ def test_the_deadline_is_on_the_route_not_only_on_unauthenticated_paths() -> Non
 
 def test_a_disabled_deadline_lets_a_slow_handler_finish() -> None:
     """`<= 0` disables the deadline. This is the escape hatch a deployment with a genuinely long
-    admin operation uses, and it must actually disable rather than clamp to some floor."""
+    admin operation uses, and it must actually disable rather than clamp to some floor.
+
+    **This asked the FAST route until BACKLOG #1385, which is not what the name claims and could not
+    fail for the stated reason** -- a trivial handler returns 200 whether the deadline is disabled,
+    enabled, or clamped to any floor above a millisecond, so the arm passed identically with the
+    control it exists to test switched on. It now asks the SLOW route, which is the only request that
+    can tell "disabled" from "clamped": `_SLOW_SECONDS` exceeds every deadline in this file, so a 200
+    here means no deadline ran at all.
+
+    Mutation: clamp a `<= 0` override up to `_TRIPS_DEADLINE` instead of passing through. Red: 503 with
+    `finished == []`. Under the old fast-route version that same mutation stayed GREEN."""
     app, finished = _app_with_a_slow_route(0.0)
     with _client(app) as client:
-        response = client.get("/_test/fast")
-    assert response.status_code == 200
-    assert finished == ["fast"]
+        response = client.get("/_test/slow")
+    assert response.status_code == 200, (
+        f"a disabled deadline still refused the handler with {response.status_code}"
+    )
+    assert response.json() == {"status": "finished"}
+    assert finished == ["slow"]
 
 
 def test_the_deadline_sits_inside_the_network_gate_and_outside_everything_else() -> None:

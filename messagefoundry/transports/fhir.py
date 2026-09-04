@@ -92,6 +92,49 @@ logger = logging.getLogger(__name__)
 
 _INTERACTIONS = ("create", "update", "transaction", "batch")
 _CONDITIONALS = ("if-none-exist", "conditional-update", "if-match")
+
+#: The SMART v2 permission letters each declared shape can actually spend, keyed the way
+#: :meth:`FhirDestination._resolve_request` dispatches — ``conditional`` FIRST, then ``interaction``.
+#: That order is the whole point: ``conditional-update`` and ``if-match`` both return PUT even when
+#: ``interaction`` is the default ``"create"``, so keying on ``interaction`` alone would compute ``c``
+#: for a connection that only ever issues PUT. Kept HERE, beside the dispatch it mirrors, so a change
+#: to the method table is visibly a change to the letter table (#1159).
+_CONDITIONAL_SCOPE_LETTERS = {
+    # search-based PUT: the server searches on the client's behalf, then updates
+    "conditional-update": frozenset("us"),
+    # POST with If-None-Exist: the server searches on the client's behalf, then creates
+    "if-none-exist": frozenset("cs"),
+    # version-aware PUT: the ETag comes from the outgoing body's meta.versionId, so no search
+    "if-match": frozenset("u"),
+}
+_INTERACTION_SCOPE_LETTERS = {"create": frozenset("c"), "update": frozenset("u")}
+
+
+def scope_letters_for_shape(interaction: str, conditional: str | None) -> frozenset[str] | None:
+    """The SMART v2 permission letters an outbound FHIR connection's DECLARED shape can spend, or
+    ``None`` when the shape does not determine them (#1159, ASVS 10.2.3).
+
+    ``None`` for ``transaction``/``batch`` — the Bundle carries arbitrary methods over arbitrary
+    types, so no letter set is determinate — and for any interaction word this table does not know.
+    Quiet is the safe failure for the advisory that reads this: whoever adds an interaction to
+    :data:`_INTERACTIONS` or a knob to :data:`_CONDITIONALS` must extend these tables, or a new shape
+    silently stops being graded.
+
+    It reads ``conditional`` first because :meth:`FhirDestination._resolve_request` does. Construction
+    refuses ``conditional`` only against ``transaction``/``batch``, so ``interaction="create"`` (the
+    default) with ``conditional="conditional-update"`` is a legal, shipped shape that issues PUT.
+
+    The RESOURCE half of a scope is deliberately absent: ``_resolve_request`` reads the resourceType
+    from the OUTGOING MESSAGE BODY, so it varies per message and is not derivable at config time.
+
+    Pure — two declared values in, a letter set out."""
+    if interaction in ("transaction", "batch"):
+        return None
+    if conditional:
+        return _CONDITIONAL_SCOPE_LETTERS.get(conditional)
+    return _INTERACTION_SCOPE_LETTERS.get(interaction)
+
+
 # FHIR transient IssueType group (children of `transient`): a retry may succeed.
 # https://www.hl7.org/fhir/valueset-issue-type.html
 _TRANSIENT_ISSUE_CODES = frozenset(

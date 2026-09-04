@@ -16,6 +16,7 @@ manufactured hits at the floor. Both produced confident, wrong, plausible output
 
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -32,6 +33,7 @@ from rescore_handoff_check import (  # noqa: E402
     evaluate,
     main,
     read_pairs,
+    split_by_boundary,
 )
 
 LIVE = "docs/BACKLOG.md"
@@ -44,23 +46,32 @@ def git(*args: str, cwd: Path) -> str:
     ).stdout.strip()
 
 
-@pytest.fixture
-def shallow_ledger(ledger: Path, tmp_path: Path) -> Path:
-    """A depth-1 clone of the ledger fixture, so the walk's oldest revision IS the graft boundary.
+def commit_at(repo: Path, message: str, when: str) -> None:
+    """Stage everything and commit it with a FIXED committer date.
+
+    The date is not decoration: the graft boundary this file tests is identified BY its committer
+    date, and a fixture committed at wall-clock time would put every revision on the same day and
+    make the boundary comparison unfalsifiable.
+    """
+    git("add", "-A", cwd=repo)
+    stamp = f"{when}T12:00:00"
+    subprocess.run(
+        ["git", "commit", "-m", message],
+        cwd=str(repo),
+        check=True,
+        capture_output=True,
+        text=True,
+        env={**os.environ, "GIT_AUTHOR_DATE": stamp, "GIT_COMMITTER_DATE": stamp},
+    )
+
+
+def clone_shallow(source: Path, dest: Path, depth: int) -> Path:
+    """Clone ``source`` to ``dest`` truncated to ``depth`` revisions.
 
     Cloned over file:// with --no-local, because a local clone hardlinks the object store and is not
     actually shallow.
     """
-    dest = tmp_path / "shallow"
-    git(
-        "clone",
-        "--depth",
-        "1",
-        "--no-local",
-        ledger.as_uri(),
-        str(dest),
-        cwd=tmp_path,
-    )
+    git("clone", "--depth", str(depth), "--no-local", source.as_uri(), str(dest), cwd=dest.parent)
     # A CLONE INHERITS NO IDENTITY. user.email and user.name are per-repo, live in .git/config, and
     # clone copies none of them -- so a fixture that COMMITS into this clone succeeds on a developer
     # box off the GLOBAL identity and exits 128 on a runner that has none. That is exactly how this
@@ -70,6 +81,28 @@ def shallow_ledger(ledger: Path, tmp_path: Path) -> Path:
     git("config", "user.email", "t@example.com", cwd=dest)
     git("config", "user.name", "t", cwd=dest)
     return dest
+
+
+@pytest.fixture
+def shallow_ledger(ledger: Path, tmp_path: Path) -> Path:
+    """A depth-1 clone of the ledger fixture, so the walk's oldest revision IS the graft boundary.
+
+    One visible revision means every item's last touch floors to that single date, so a DECIDABLE
+    pair here is necessarily a hit. The fixture below exists because the clean-verdict case needs a
+    window wide enough for a real touch to sit above the boundary.
+    """
+    return clone_shallow(ledger, tmp_path / "shallow", 1)
+
+
+@pytest.fixture
+def shallow_ledger_two_deep(ledger: Path, tmp_path: Path) -> Path:
+    """A depth-2 clone, where the graft is dated 2026-02-01 and a real touch lands after it.
+
+    #10's banner is fingerprinted at the graft and never moves again, so it floors to 2026-02-01.
+    #20 moves to the archive at 2026-03-01, which the window can see, so its touch is TRUE. That
+    split is what makes a decidable-and-clean pair possible at all.
+    """
+    return clone_shallow(ledger, tmp_path / "shallow2", 2)
 
 
 def item_block(num: int, banner: str) -> str:
@@ -90,34 +123,18 @@ def ledger(tmp_path: Path) -> Path:
     live = repo / LIVE
     archive = repo / ARCHIVE
 
-    def commit(message: str, when: str) -> None:
-        git("add", "-A", cwd=repo)
-        env_date = f"{when}T12:00:00"
-        subprocess.run(
-            ["git", "commit", "-m", message],
-            cwd=str(repo),
-            check=True,
-            capture_output=True,
-            text=True,
-            env={
-                **dict(__import__("os").environ),
-                "GIT_AUTHOR_DATE": env_date,
-                "GIT_COMMITTER_DATE": env_date,
-            },
-        )
-
     live.write_text(item_block(10, "\U0001f522") + item_block(20, "\U0001f522"), encoding="utf-8")
     archive.write_text("", encoding="utf-8")
-    commit("both open", "2026-01-01")
+    commit_at(repo, "both open", "2026-01-01")
 
     # #10 is flipped IN PLACE and stays live.
     live.write_text(item_block(10, "✅") + item_block(20, "\U0001f522"), encoding="utf-8")
-    commit("flip 10 in place", "2026-02-01")
+    commit_at(repo, "flip 10 in place", "2026-02-01")
 
     # #20 MOVES to the archive, closed. A live-only walk sees it vanish and calls it absent.
     live.write_text(item_block(10, "✅"), encoding="utf-8")
     archive.write_text(item_block(20, "✅"), encoding="utf-8")
-    commit("archive 20", "2026-03-01")
+    commit_at(repo, "archive 20", "2026-03-01")
     return repo
 
 
@@ -402,18 +419,127 @@ def test_a_truncated_history_is_refused_rather_than_answered_from_the_visible_wi
     which makes the last touch look LATER than it was, and evaluate() only fires when the re-score is
     strictly later. So real hits are SUPPRESSED and the tool prints the all-clear.
 
-    The tool already refuses to print a verdict under --limit for exactly this reason. The same
-    truncation arriving through a shallow clone got a full unsuppressed verdict.
+    THE DATE HERE IS LOAD-BEARING AND WAS NOT, ROUND TWO. The clone's only visible revision is dated
+    2026-03-01, so a re-score on 2026-02-01 sits BELOW the boundary -- squarely inside the window the
+    floor can suppress -- and the refusal must still fire. Round two's version of this row used
+    2026-12-01, which the floor provably cannot reach, so it pinned the refusal on an input that did
+    not need refusing. That is what made the tool refuse the only environment it ships into.
     """
     card = tmp_path / "card.toml"
     card.write_text(
-        '[[cell]]\nlast_verified = "2026-12-01"\nresidual = "BACKLOG #10"\n', encoding="utf-8"
+        '[[cell]]\nlast_verified = "2026-02-01"\nresidual = "BACKLOG #10"\n', encoding="utf-8"
     )
     rc = main(["--scorecard", str(card), "--root", str(shallow_ledger)])
     assert rc == 3
     captured = capsys.readouterr()
     assert "TRUNCATED" in captured.err
     assert "RE-SCORED AFTER" not in captured.out
+    assert "no item was re-scored" not in captured.out
+
+
+def test_a_truncation_the_floor_cannot_reach_is_answered_rather_than_refused(
+    shallow_ledger: Path, tmp_path: Path, capsys
+) -> None:
+    """THE OTHER ARM, AND THE DEFECT THIS PAIR EXISTS TO FIX. Truncation alone is not an unanswerable
+    run.
+
+    The floor sets an affected item's last touch to the boundary date, and the floor is always later
+    than or equal to the truth. So a re-score STRICTLY AFTER the boundary is decided identically
+    either way -- ``re-score > floored >= true`` -- and refusing it discards a sound answer.
+
+    Here #10's banner truly last moved 2026-02-01 and floors to 2026-03-01. A re-score on 2026-12-01
+    clears both, so the hit is real on the visible history and on the hidden history alike.
+
+    Without the arm above this test would pass on a tool that reported "proceed" for every input,
+    which is why neither is allowed to stand alone.
+    """
+    card = tmp_path / "card.toml"
+    card.write_text(
+        '[[cell]]\nlast_verified = "2026-12-01"\nresidual = "BACKLOG #10"\n', encoding="utf-8"
+    )
+    rc = main(["--scorecard", str(card), "--root", str(shallow_ledger)])
+    assert rc == 0
+    captured = capsys.readouterr()
+    assert "REFUSING" not in captured.err
+    assert "RE-SCORED AFTER THE BANNER WAS LAST TOUCHED: 1" in captured.out
+    # The branch is NAMED, so a reader can tell a bounded run from an unbounded one.
+    assert "truncation branch: BOUNDED at 2026-03-01" in captured.out
+    # AND THE TOUCH DATE IS MARKED AS A FLOOR. #10's banner truly moved on 2026-02-01, which this
+    # window cannot see, so printing a bare "2026-03-01" would hand the reader a flip date that
+    # never happened. The flag is sound; the date under it is a bound, and it has to say so.
+    assert "at or before 2026-03-01 (FLOORED at the graft, not measured)" in captured.out
+
+
+def test_a_measured_touch_date_is_printed_bare_even_on_a_truncated_run(
+    shallow_ledger_two_deep: Path, tmp_path: Path, capsys
+) -> None:
+    """THE CONTROL FOR THE FLOOR MARKER, without which "mark everything as floored" would pass.
+
+    On this two-deep window #20's move to the archive is VISIBLE, so its 2026-03-01 touch is a real
+    measurement sitting above the 2026-02-01 boundary. It must print as a date, not as a bound --
+    otherwise the marker stops distinguishing anything and a reader learns to ignore it.
+    """
+    card = tmp_path / "card.toml"
+    card.write_text(
+        '[[cell]]\nlast_verified = "2026-04-01"\nresidual = "BACKLOG #20"\n', encoding="utf-8"
+    )
+    assert main(["--scorecard", str(card), "--root", str(shallow_ledger_two_deep)]) == 0
+    out = capsys.readouterr().out
+    assert "BACKLOG #20: re-scored 2026-04-01, banner last touched 2026-03-01" in out
+    assert "FLOORED" not in out
+
+
+def test_a_mixed_run_answers_what_it_can_and_names_what_it_cannot(
+    shallow_ledger: Path, tmp_path: Path, capsys
+) -> None:
+    """The verdict is per PAIR, so a run holding both kinds must not collapse to either one.
+
+    #10's re-score clears the boundary and is decided; #20's does not and is undecidable. The
+    dangerous output is an all-clear that quietly covers #20, which is the same
+    reassuring-answer-to-an-unasked-question the two REFUSING guards above exist to prevent, arriving
+    one step later. So the clean line has to state its own scope.
+    """
+    card = tmp_path / "card.toml"
+    card.write_text(
+        '[[cell]]\nlast_verified = "2026-12-01"\nresidual = "BACKLOG #10"\n'
+        '[[cell]]\nlast_verified = "2026-01-15"\nresidual = "BACKLOG #20"\n',
+        encoding="utf-8",
+    )
+    rc = main(["--scorecard", str(card), "--root", str(shallow_ledger)])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "1 pairs are decided exactly and 1 are UNDECIDABLE" in out
+    assert "items NOT covered by the verdict below" in out
+    assert "[20]" in out
+    # #10 still gets its real verdict rather than being dragged down by its neighbour.
+    assert "BACKLOG #10" in out
+
+
+def test_a_clean_verdict_over_undecidable_pairs_states_its_own_scope(
+    shallow_ledger_two_deep: Path, tmp_path: Path, capsys
+) -> None:
+    """The all-clear path of the row above, which is the one a reader actually acts on.
+
+    An unqualified "no item was re-scored after its banner was last touched" over a run that could
+    not decide some of its pairs is a false completeness claim, and this file's own docstring says
+    over-firing is tolerable only because it is BOUNDED AND STATED.
+
+    #20's re-score on 2026-03-01 clears the 2026-02-01 boundary AND equals its true banner touch, so
+    it is decidable and in sync -- a clean decidable pair, which a depth-1 window cannot produce.
+    #10's re-score sits below the boundary and stays undecidable.
+    """
+    card = tmp_path / "card.toml"
+    card.write_text(
+        '[[cell]]\nlast_verified = "2026-03-01"\nresidual = "BACKLOG #20"\n'
+        '[[cell]]\nlast_verified = "2026-01-15"\nresidual = "BACKLOG #10"\n',
+        encoding="utf-8",
+    )
+    assert main(["--scorecard", str(card), "--root", str(shallow_ledger_two_deep)]) == 0
+    out = capsys.readouterr().out
+    assert "no DECIDABLE item was re-scored" in out
+    assert "are NOT covered by this line" in out
+    # The unqualified sentence must not appear, because it would claim the undecidable pairs too.
+    assert "no item was re-scored after its banner was last touched" not in out
 
 
 def test_a_shallow_clone_whose_ledger_history_is_COMPLETE_is_answered_normally(
@@ -423,13 +549,19 @@ def test_a_shallow_clone_whose_ledger_history_is_COMPLETE_is_answered_normally(
     THIS REPOSITORY IS ITSELF A SHALLOW CLONE.
 
     Measured 2026-08-29: `git rev-parse --is-shallow-repository` returns true in the primary and in
-    every worktree, over 856 commits with 3 graft points. But docs/BACKLOG.md was CREATED after the
-    graft boundary, so the oldest revision touching it HAS a parent and the walk sees the file's whole
-    history. Refusing on shallowness alone would therefore refuse every real run on this machine.
+    every worktree, over 856 commits with 3 graft points.
 
-    So the discriminator is not "is the repo shallow" but "did this path's walk reach past its own
-    beginning": a walk is truncated only when its oldest revision has no parent AND the repo is
-    shallow. Here the ledger fixture is a normal clone, so nothing is truncated and nothing refuses.
+    ***THE SECOND HALF OF THAT MEASUREMENT WAS WRONG, AND IT IS CORRECTED HERE RATHER THAN QUIETLY
+    DROPPED, BECAUSE BELIEVING IT COST A DIAGNOSIS.*** This docstring said docs/BACKLOG.md was
+    CREATED after the graft boundary, so its oldest revision had a parent and the walk saw the whole
+    file. **Re-measured 2026-09-03: it does not.** The clone now holds 719 commits over 20 graft
+    points, the only parentless commit reachable from HEAD IS a graft (`ca8a7488`, 2026-08-04), and
+    docs/BACKLOG.md exists in it -- so the ledger's own history really is cut, and the refusal that
+    followed was correct rather than false. What was wrong was treating it as fatal to the whole run.
+
+    So the discriminator is not "is the repo shallow" but "did this path's walk begin at a graft
+    point git itself recorded". Here the ledger fixture is a normal clone, so nothing is truncated
+    and nothing refuses.
     """
     card = tmp_path / "card.toml"
     card.write_text(
@@ -464,10 +596,16 @@ def test_revisions_the_walk_could_not_read_are_counted_and_reported(
 def shallow_with_a_true_root(shallow_ledger: Path) -> Path:
     """A SHALLOW repo containing a parentless commit that is NOT a graft boundary.
 
-    That combination is not exotic -- it is this repository. Measured 2026-08-29: the engine is
-    shallow with three graft points, and the one parentless commit reachable from HEAD is
-    ``5fa6db9f4``, a deliberate 2026-07-06 history reset that appears in NONE of them. Every file
-    present in that commit has a parentless oldest revision and a COMPLETE history.
+    That combination WAS this repository. Measured 2026-08-29: the engine was shallow with three
+    graft points, and the one parentless commit reachable from HEAD was ``5fa6db9f4``, a deliberate
+    2026-07-06 history reset appearing in NONE of them, so every file present in it had a parentless
+    oldest revision and a COMPLETE history.
+
+    **Re-measured 2026-09-03: that commit is no longer reachable at all.** A re-fetch left 719
+    commits over 20 graft points, and the only parentless commit reachable from HEAD is now itself a
+    graft. **The fixture stays, and it stays SYNTHETIC on purpose** -- the distinction it pins is
+    real whether or not today's clone happens to exhibit it, and a row that silently stopped
+    exercising anything the day a fetch changed shape would be worse than one built by hand.
 
     Built here by adding an orphan-rooted ledger inside an already-shallow clone.
     """
@@ -502,3 +640,117 @@ def test_a_parentless_revision_that_is_NOT_a_graft_boundary_is_not_a_truncation(
     rc = main(["--scorecard", str(card), "--root", str(shallow_with_a_true_root)])
     assert rc == 0
     assert "TRUNCATED" not in capsys.readouterr().err
+
+
+# ------------------------------------------- round three: a graft that predates the ledger itself
+#
+# THE TOOL REFUSED THE ONLY ENVIRONMENT IT SHIPS INTO. Driving it against the real record exited 3
+# with the truncation refusal, so the date comparison BACKLOG #1328 calls "the open work" had never
+# produced an answer at all. The engine checkout is shallow, its whole visible history begins at a
+# graft, and both ledger files exist at that boundary -- a genuine truncation, correctly detected and
+# wrongly treated as fatal to the entire run.
+
+
+@pytest.fixture
+def shallow_graft_older_than_the_ledger(tmp_path: Path) -> Path:
+    """A SHALLOW repo whose graft boundary is OLDER than the ledger's own first revision.
+
+    Four commits, of which the ledger appears only in the last two, cloned to depth 3. The graft
+    therefore lands on a commit with no ledger in it, so nothing about the ledger's banner history is
+    hidden and the walk saw every revision of it there is.
+
+    This arm holds BY CONSTRUCTION rather than by a separate test in the tool: ``git log -- <path>``
+    lists only revisions where the path CHANGED, so a graft older than the path's creation is never
+    the oldest line. Pinning it matters anyway -- it is the half a future "just refuse whenever the
+    repo is shallow" simplification would silently break, and this repository is always shallow.
+    """
+    repo = tmp_path / "late-ledger"
+    git("init", "-b", "main", str(repo), cwd=tmp_path)
+    git("config", "user.email", "t@example.com", cwd=repo)
+    git("config", "user.name", "t", cwd=repo)
+
+    (repo / "unrelated.txt").write_text("one\n", encoding="utf-8")
+    commit_at(repo, "before the ledger existed", "2026-01-01")
+    (repo / "unrelated.txt").write_text("two\n", encoding="utf-8")
+    commit_at(repo, "still before the ledger existed", "2026-01-15")
+
+    (repo / "docs" / "archive" / "backlog").mkdir(parents=True)
+    (repo / LIVE).write_text(item_block(10, "\U0001f522"), encoding="utf-8")
+    (repo / ARCHIVE).write_text("", encoding="utf-8")
+    commit_at(repo, "the ledger is created here", "2026-02-01")
+
+    (repo / LIVE).write_text(item_block(10, "✅"), encoding="utf-8")
+    commit_at(repo, "flip 10", "2026-03-01")
+
+    # Depth 3 leaves the graft on "still before the ledger existed", which holds no ledger at all.
+    return clone_shallow(repo, tmp_path / "shallow-late", 3)
+
+
+def test_a_graft_older_than_the_ledgers_first_revision_is_not_a_truncation(
+    shallow_graft_older_than_the_ledger: Path, tmp_path: Path, capsys
+) -> None:
+    """The tool must PROCEED here, and the re-score date is chosen so that a wrong answer cannot hide.
+
+    2026-01-10 sits BELOW the graft commit's own date, so a tool that wrongly called this walk
+    truncated would find the single pair undecidable, refuse the whole run, and fail this row. A late
+    date would have passed either way and proved nothing.
+    """
+    card = tmp_path / "card.toml"
+    card.write_text(
+        '[[cell]]\nlast_verified = "2026-01-10"\nresidual = "BACKLOG #10"\n', encoding="utf-8"
+    )
+    rc = main(["--scorecard", str(card), "--root", str(shallow_graft_older_than_the_ledger)])
+    assert rc == 0
+    captured = capsys.readouterr()
+    assert "REFUSING" not in captured.err
+    assert "truncation branch: NONE" in captured.out
+    # The graft IS present and IS read -- the walk simply did not begin at it. Asserting the count
+    # keeps this from passing on a repo that turned out not to be shallow at all.
+    assert "graft points git recorded in .git/shallow: 1" in captured.out
+    assert "not at a graft" in captured.out
+
+
+# ------------------------------------------------------------------ the per-pair boundary decision
+
+
+def test_a_pair_after_the_boundary_is_decidable_and_one_at_or_before_it_is_not() -> None:
+    """The inequality the whole fix rests on, pinned at the unit.
+
+    A floored date is later than or equal to the truth, so ``re-score > floored`` implies
+    ``re-score > true`` and the verdict is the same on both. At or before the boundary that argument
+    is unavailable, and the answer is unknown rather than clean.
+    """
+    pairs = [Pair(1, "2026-05-06"), Pair(2, "2026-05-05"), Pair(3, "2026-05-04")]
+    decidable, undecidable = split_by_boundary(pairs, "2026-05-05")
+    assert [p.item for p in decidable] == [1]
+    assert [p.item for p in undecidable] == [2, 3]
+
+
+def test_with_no_boundary_every_pair_is_decidable() -> None:
+    """The unbounded branch. An empty boundary means no walk began at a graft, so nothing is floored
+    and holding anything back would be a refusal with no cause."""
+    pairs = [Pair(1, "2026-05-06"), Pair(2, "2026-01-01")]
+    decidable, undecidable = split_by_boundary(pairs, "")
+    assert decidable == pairs
+    assert undecidable == []
+
+
+def test_the_run_reports_what_it_actually_scanned(ledger: Path, tmp_path: Path, capsys) -> None:
+    """An empty scan and a clean scan must not render alike, and this tool already shipped one
+    failure of exactly that shape.
+
+    A locale-decoded blob destroyed every banner glyph, so the walk found no change anywhere and
+    reported it in perfectly plausible output. A per-path revision count is the cheapest thing that
+    would have caught it, and a stated zero for the graft count is checkable where an absent line is
+    not.
+    """
+    card = tmp_path / "card.toml"
+    card.write_text(
+        '[[cell]]\nlast_verified = "2026-01-01"\nresidual = "BACKLOG #10"\n', encoding="utf-8"
+    )
+    assert main(["--scorecard", str(card), "--root", str(ledger)]) == 0
+    out = capsys.readouterr().out
+    assert "graft points git recorded in .git/shallow: 0" in out
+    assert f"walked {LIVE}: 3 of 3 revisions" in out
+    assert f"walked {ARCHIVE}: 2 of 2 revisions" in out
+    assert "truncation branch: NONE" in out
