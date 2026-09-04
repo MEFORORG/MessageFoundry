@@ -290,6 +290,25 @@ scripts/security/scan-tokens.local.txt
 # directory itself readable so the negation binds. Do not "simplify" it back.
 /docs/testing/*
 !/docs/testing/VERIFY.md
+# docs/testing/README.md is the SECOND negation, and it is a marker rather than QA material.
+#
+# The rule above works, and its success is the problem: from an engine checkout the directory holds
+# one file, so a path cited under it is INDISTINGUISHABLE from work that was never done. A reader
+# greps a cited path, finds nothing, and concludes the document does not exist -- when it does, in
+# the vault. Measured 2026-09-03: BACKLOG #1011 step 6 instructed a reader to mark a disposition
+# discharged in a path under this tree and called that file "the only place in the repo that records
+# the true state", a sentence that is false from any engine checkout because the file is not in the
+# repo at all. A builder acting on it would have claimed a criterion it could never read.
+#
+# The marker is the checkout-side answer: standing in the directory, or browsing to it on GitHub,
+# you are told the material moved and told not to read absence as evidence. It is a POINTER, never
+# an index -- it names no vaulted document, because a path-to-document map over a closed set
+# discloses what is NOT covered by subtraction. Keep it that way if you edit it.
+#
+# This negation and the VERIFY.md one are the ONLY two permitted here, and
+# tests/test_private_paths_stay_ignored.py pins the pair as an exact set. A third fails there until
+# someone writes down why. See BACKLOG #1435.
+!/docs/testing/README.md
 # DO NOT ADD docs/benchmarks/ OR docs/quality-gates/ HERE. Both are DELIBERATELY ABSENT. ADR 0160 D6.2
 # considered both and left them: the 21 bench handoffs carry the measurement narrative for the ~133
 # data files beside them, so untracking either half strips the rationale from records that stay.
