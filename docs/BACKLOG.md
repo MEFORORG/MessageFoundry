@@ -13544,23 +13544,25 @@ python scripts/docs/backlog_dependency_census.py            # add --verbose for 
 python scripts/docs/backlog_dependency_census.py --ref <sha>  # census a historic commit
 ```
 
-**Measured at `8a2854dd`. These replace the hand counts in the banner and in the priority row -- the score itself is deliberately untouched, per the paragraph above.**
+**Measured at `975c13c1`. These replace the hand counts in the banner and in the priority row -- the score itself is deliberately untouched, per the paragraph above.**
 
 | what | filed 2026-08-13 | re-scored 2026-08-20 | measured now |
 | --- | --- | --- | --- |
-| tracked files depending on this file | 66 | 78 | **101** |
+| tracked files depending on this file | 66 | 78 | **100** |
 | of those, test files | 13 | 15 | **29** |
 | open items with "ASVS" in the heading | 103 | 106 | **107** |
 
 **TWO CLASSES NO HAND COUNT HAS EVER SEEN, and they are the reason the tool exists rather than a better grep.**
-1. **A path spelled as a REGEX is invisible to a literal search.** `.pre-commit-config.yaml` scopes the ledger-parse hook with `files: ^docs/(BACKLOG\.md|archive/backlog/.*\.md)$`. A `grep -F docs/BACKLOG.md` over that file returns exactly one line -- a prose comment -- and misses the functional filter entirely. Four such spellings are live in the tree.
+1. **A path spelled as a REGEX is invisible to a literal search.** `.pre-commit-config.yaml` scopes the ledger-parse hook with `files: ^docs/(BACKLOG\.md|archive/backlog/.*\.md)$`. A `grep -F docs/BACKLOG.md` over that file returns exactly one line -- a prose comment -- and misses the functional filter entirely. `backlog-hygiene.yml` carries the same shape in its own diff check.
 2. **Five dependents name no path at all.** They read the ledger through `backlog_status_check.parse_items`, so a move of the FILE leaves them working and a change to `DEFAULT_SOURCES` breaks them. Re-pointing them as if they were path literals fixes nothing and hides the real edit.
 
-**MECHANISM MATTERS MORE THAN THE TOTAL, because these fail differently.** 64 path literals (behaviour breaks, possibly silently), 4 regex/glob spellings (as above), 31 `parse_items` readers (survive a file move), 95 bare-filename mentions, 30 Markdown links (a dead link a link checker reports), 26 files that also name `docs/archive/backlog/`. A file carries several, so those sum above 101. By surface: 61 executable, 40 document. By role: 35 doc, 29 test, 20 tooling, 4 root, 3 CI workflow, 3 engine, 2 CI config, and one each for the pre-commit gate, the pre-commit config, the status checker, the citation checker and the allocator.
+**MECHANISM MATTERS MORE THAN THE TOTAL, because these fail differently.** 64 path literals (behaviour breaks, possibly silently), 3 regex/glob spellings (as above), 31 `parse_items` readers (survive a file move), 95 filename mentions, 30 Markdown links (a dead link a link checker reports), 26 files that also name `docs/archive/backlog/`. A file carries several and the sets overlap, so those sum above 100. By surface: 61 executable, 39 document. By role: 34 doc, 29 test, 20 tooling, 4 root, 3 CI workflow, 3 engine, 2 CI config, and one each for the pre-commit gate, the pre-commit config, the status checker, the citation checker and the allocator.
 
 **THE ITEM'S OWN 66 CANNOT BE RECONSTRUCTED FROM THE ITEM'S OWN TABLE, which is the drift in miniature.** The eight directory buckets in the filed blast-radius block sum to 57, not 66. Nothing was wrong at the time and nothing reported the gap -- a hand count carries no control, so a number that stops adding up looks exactly like one that does.
 
 **THE CENSUS FIRES, AND THAT IS ASSERTED RATHER THAN ASSUMED.** Seven must-fire controls name a file and the mechanism it must be found under; three must-not-fire controls name ordinary files that must carry none. A control that does not fire exits 2 and prints the counts as untrustworthy. `tests/test_backlog_dependency_census.py` reds when a detector goes dead AND when one goes generic -- either arm alone passes against a broken instrument. Independent evidence it measures the right thing: run at `c2241cfe`, the ref this item was filed on, it returns **103** ASVS headings, the number a human wrote into the banner that night.
+
+**THE FIRST RUN CARRIED A FALSE POSITIVE, AND IT IS RECORDED RATHER THAN QUIETLY FIXED.** The regex/glob detector originally accepted a bare `BACKLOG*`, so `docs/benchmarks/HANDOFF-enginebox-step2-step3.md` -- prose reading "pages scale with **BACKLOG**" -- was reported as a dependency, because a closing bold marker is a star. One wrong hit in a population of four is a quarter of the very class this tool exists to surface, and it was found by **listing the hits, not by reading the count**. That is the only way this class is ever found, and it is why the census prints every file rather than a total.
 
 **WHAT THE CENSUS CANNOT SEE, stated because a boundary left implicit gets read as coverage.** It cannot see the **vault** -- the migration's destination and the whole of the unbuilt precondition. It cannot see anything outside this repository: other clones, the published history, sdists already on PyPI, or branch protection. It cannot see untracked files, a path built at run time, or a dependency that never names the file.
 
