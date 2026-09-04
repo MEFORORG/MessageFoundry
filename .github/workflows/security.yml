@@ -210,7 +210,10 @@ jobs:
               exit 1
             fi
             echo "attempt ${attempt}: no verdict from the advisory database; retrying"
-            head -c 400 audit.err || true
+            # No `|| true` here: tests/test_security_posture.py forbids discarding an exit code
+            # anywhere in a required job, and it is right to -- that one token is how a gate goes
+            # quiet. `2> audit.err` above always creates the file, so this cannot fail anyway.
+            head -c 400 audit.err
             [ "${attempt}" -lt 5 ] && sleep "$((attempt * 15))"
           done
           echo "::error::Could not reach the npm advisory database after 5 attempts, so this run"
