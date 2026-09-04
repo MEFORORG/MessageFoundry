@@ -44,6 +44,7 @@ import json
 import os
 import shutil
 import subprocess
+import sys
 import uuid
 from pathlib import Path
 from typing import Any
@@ -578,31 +579,12 @@ def test_the_writer_backs_up_the_previous_content_before_every_write(tmp_path: P
     )
 
 
-def test_the_writer_refuses_when_the_file_reads_back_wrong(tmp_path: Path) -> None:
-    """A WRITE THAT DID NOT LAND must be loud. That is the case the read-back catches, and all of it.
+def _assert_the_refusal_is_actionable(out: str, target: Path) -> None:
+    """Everything an un-landed write must produce, whatever obstructed the move.
 
-    This holds the target open with FileShare.Read, which is what a competing writer looks like from
-    here: the copy and the temp file succeed, the move over the locked file does not land, and the
-    read-back sees the old content. Without the check the run would report a governed root the file does
-    not carry.
-
-    The case it does NOT catch has its own test directly below -- two installers that both read before
-    either writes, where the write lands, the read-back passes, and a root disappears anyway.
+    Shared by the two arms below so they cannot drift into asserting different things about one
+    refusal -- the writer has no platform branch, so neither should the expectation.
     """
-    target = tmp_path / "worktree-gate.repos.txt"
-    target.write_text(MF + "\n", encoding="utf-8")
-    body = (
-        f"  $p = {_psq(str(target))}\n"
-        "  $fs = [System.IO.File]::Open($p, [System.IO.FileMode]::Open, "
-        "[System.IO.FileAccess]::Read, [System.IO.FileShare]::Read)\n"
-        "  try {\n"
-        f"    try {{ $null = Write-GovernedRoots -Path $p -Lines {_ps_array([MF, VAULT])}\n"
-        "           Write-Output 'NO THROW' }\n"
-        '    catch { Write-Output "THREW: $($_.Exception.Message)" }\n'
-        "  } finally { $fs.Dispose() }"
-    )
-    out = _ok(_harness([(INSTALLER, WRITE_FNS)], body), tmp_path)
-
     assert "NO THROW" not in out, (
         f"the write did not land and the writer said nothing about it:\n{out}"
     )
@@ -625,6 +607,72 @@ def test_the_writer_refuses_when_the_file_reads_back_wrong(tmp_path: Path) -> No
     )
     assert f"{target}.bak" in out, (
         f"the refusal must name the backup the operator can read the old list out of:\n{out}"
+    )
+
+
+def test_the_writer_refuses_when_the_file_reads_back_wrong(tmp_path: Path) -> None:
+    """A WRITE THAT DID NOT LAND must be loud. That is the case the read-back catches, and all of it.
+
+    The read-back is CONTENT-based: it re-reads the file and asks whether every root this run wrote is
+    in it. It does not know, and cannot know, WHY one is missing -- a competing writer, a denied
+    rename, a full volume. So the obstruction here removes the move itself, by defining Move-Item in
+    the scope Write-GovernedRoots is dot-sourced into: a function beats a cmdlet in PowerShell's
+    command precedence, so the writer's own call resolves to the stub. The copy and the temp file
+    succeed, the move does not land, the read-back sees the old content, and the writer must refuse.
+    Nothing in that arm touches an operating-system behaviour that differs by platform.
+
+    IT USED TO HOLD THE TARGET OPEN WITH FileShare.Read, and that is a Windows fact rather than a
+    portable one: on POSIX a share mode does not stop a rename, because renaming is a directory
+    operation that consults no open handle. So the move landed, the read-back agreed, and the ubuntu
+    leg red on "NO THROW" -- the fixture failed to obstruct anything, while the writer behaved
+    correctly throughout. That lock is kept as a Windows-only SECOND arm directly below, because
+    install-gate.ps1 is a Windows installer and a competing writer is the shape it will really meet.
+
+    The case the read-back does NOT catch has its own test further below -- two installers that both
+    read before either writes, where the write lands, the read-back passes, and a root disappears
+    anyway.
+    """
+    target = tmp_path / "worktree-gate.repos.txt"
+    target.write_text(MF + "\n", encoding="utf-8")
+    body = (
+        f"  $p = {_psq(str(target))}\n"
+        # A stub that stopped shadowing would let the real move land and print NO THROW, which reds
+        # this test. It cannot fail quietly into a pass.
+        "  function Move-Item { param([string]$LiteralPath, [string]$Destination, [switch]$Force) }\n"
+        f"  try {{ $null = Write-GovernedRoots -Path $p -Lines {_ps_array([MF, VAULT])}\n"
+        "         Write-Output 'NO THROW' }\n"
+        '  catch { Write-Output "THREW: $($_.Exception.Message)" }'
+    )
+    _assert_the_refusal_is_actionable(
+        _ok(_harness([(INSTALLER, WRITE_FNS)], body), tmp_path), target
+    )
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="mandatory file locking is a Windows behaviour")
+def test_a_real_windows_lock_reaches_the_same_refusal(tmp_path: Path) -> None:
+    """The arm above with the stub taken out: a REAL competing writer, on the platform that has one.
+
+    This is the fixture the branch shipped with, kept rather than deleted and scoped to where it is
+    true. Holding the target open with FileShare.Read is what a competing installer looks like from
+    here: the copy and the temp file succeed, the move over the locked file does not land, and the
+    read-back sees the old content. It asserts the SAME refusal as the portable arm, so the two cannot
+    describe the writer differently -- what it adds is that a real denied rename reaches that refusal,
+    which a stubbed move can only stand in for.
+    """
+    target = tmp_path / "worktree-gate.repos.txt"
+    target.write_text(MF + "\n", encoding="utf-8")
+    body = (
+        f"  $p = {_psq(str(target))}\n"
+        "  $fs = [System.IO.File]::Open($p, [System.IO.FileMode]::Open, "
+        "[System.IO.FileAccess]::Read, [System.IO.FileShare]::Read)\n"
+        "  try {\n"
+        f"    try {{ $null = Write-GovernedRoots -Path $p -Lines {_ps_array([MF, VAULT])}\n"
+        "           Write-Output 'NO THROW' }\n"
+        '    catch { Write-Output "THREW: $($_.Exception.Message)" }\n'
+        "  } finally { $fs.Dispose() }"
+    )
+    _assert_the_refusal_is_actionable(
+        _ok(_harness([(INSTALLER, WRITE_FNS)], body), tmp_path), target
     )
 
 
