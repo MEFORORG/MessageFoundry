@@ -43,11 +43,15 @@ from typing import Any
 from messagefoundry.config.models import ConnectorType, Destination
 from messagefoundry.config.settings import hop_insecure_escape_downgrades
 from messagefoundry.config.tls_policy import (
+    SYSTEM_TRUST_ANCHOR,
     HopDisposition,
     HopPosture,
     InsecureHopRefused,
     RevocationHopGuard,
-    build_asserted_https_handler,
+    TrustAnchor,
+    TrustAnchorPolicy,
+    build_anchored_https_handler,
+    build_verifying_client_context,
     cleartext_acceptance_audit_sink,
     current_hop_posture,
     enforce_insecure_hop,
@@ -55,6 +59,7 @@ from messagefoundry.config.tls_policy import (
     insecure_hop_disposition,
     is_loopback_hop_host,
     relax_verify_expiry,
+    resolve_trust_anchor,
 )
 from messagefoundry.controlchars import strip_control_chars
 from messagefoundry.transports.base import (
@@ -80,6 +85,7 @@ __all__ = [
     "proxy_auth_handler_from_settings",
     "proxy_config_from_settings",
     "enforce_outbound_length_limits",
+    "http_family_trust_anchor",
     "normalize_header_allowlist",
     "outbound_headers_from_metadata",
     "refuse_cleartext_credential_hop",
@@ -228,34 +234,56 @@ class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
         return None
 
 
-def _asserted_https_handler() -> urllib.request.HTTPSHandler:
-    """urllib's own default https handler for this connector family, with its context ASSERTED.
+#: The operator-recognisable connector label the HTTP-family TLS assertions name in their errors. The
+#: default REST / FHIR / DICOMweb / ``fhir_lookup`` opener names its ``HTTPSHandler`` rather than
+#: leaving ``build_opener`` to fill one in, so ``harden_cipher_suites`` can run on the context that
+#: handler carries — see :func:`~messagefoundry.config.tls_policy.build_asserted_https_handler`.
+_HTTP_FAMILY_CELL = "HTTP-family destination (REST/FHIR/DICOMweb)"
 
-    ``build_opener(_NoRedirectHandler)`` alone leaves urllib to fill in the ``HTTPSHandler``, and the
-    context that handler builds is one the engine never names — so the default REST / FHIR /
-    DICOMweb / ``fhir_lookup`` egress path, which every HTTP-family destination falls back to unless
-    it needs a proxy, an escape or an expiry relaxation, had an inherited suite list that nothing
-    checked. Naming the handler here lets
-    :func:`~messagefoundry.config.tls_policy.harden_cipher_suites` run on the context it carries.
 
-    It does NOT substitute a context: urllib's own is asserted in place. See
-    :func:`~messagefoundry.config.tls_policy.build_asserted_https_handler` for the measurement that
-    forced that choice — a hand-built ``ssl.create_default_context()`` differs from urllib's on ALPN
-    and post-handshake auth, so passing one would have changed the handshake."""
-    return build_asserted_https_handler(connector="HTTP-family destination (REST/FHIR/DICOMweb)")
+def http_family_trust_anchor(
+    settings: Mapping[str, Any],
+    *,
+    url: str,
+    trust_anchor_policy: TrustAnchorPolicy | None,
+) -> TrustAnchor:
+    """Resolve the client trust anchor for an https hop in the HTTP egress family (#1180, ADR 0093).
+
+    Shared by ``RestDestination`` / ``SoapDestination`` / ``FhirDestination`` / ``DicomWebDestination``
+    and the ``fhir_lookup`` executor's per-connection opener map, so all five resolve the SAME anchor
+    from the same two inputs, on the precedence :func:`resolve_trust_anchor` defines: the connection's
+    own ``tls_ca_file``, and the instance-wide ``[tls]`` policy behind it.
+
+    Total by construction — a policy-less build (a direct test construction) resolves to
+    :data:`~messagefoundry.config.tls_policy.SYSTEM_TRUST_ANCHOR`, which is the same value the shipped
+    default resolves to, so callers have ONE "nothing configured" value to handle rather than two."""
+    ca = settings.get("tls_ca_file")
+    return resolve_trust_anchor(
+        connection_ca_file=str(ca) if ca else None,
+        host=urllib.parse.urlsplit(url).hostname or "",
+        policy=trust_anchor_policy if trust_anchor_policy is not None else TrustAnchorPolicy(),
+    )
 
 
 def _no_redirect_opener(
     *extra_handlers: urllib.request.BaseHandler,
+    trust_anchor: TrustAnchor = SYSTEM_TRUST_ANCHOR,
 ) -> urllib.request.OpenerDirector:
     """A PER-CONNECTION verifying, no-redirect opener carrying ``extra_handlers`` (a forward-proxy
     ``ProxyHandler``, a reactive ``ProxyDigestAuthHandler``, …) — used in place of the shared
     :data:`_NO_REDIRECT_OPENER` whenever a connection needs a handler the shared one lacks, so the shared
     opener is **never** mutated (ADR 0126). Passing a ``ProxyHandler`` here also suppresses urllib's
     default env-reading ProxyHandler (``build_opener`` skips a default whose class a supplied handler
-    already covers), so there is never a competing double-proxy."""
+    already covers), so there is never a competing double-proxy.
+
+    ``trust_anchor`` (#1180) narrows the client trust store to a resolved internal CA. An anchor that
+    narrows nothing — the default — leaves the opener handler-for-handler what it was, which is why a
+    connection needs one of these openers only when it carries an extra handler OR an anchor that
+    ``narrows``; see :func:`~messagefoundry.config.tls_policy.build_anchored_https_handler`."""
     return urllib.request.build_opener(
-        _NoRedirectHandler, _asserted_https_handler(), *extra_handlers
+        _NoRedirectHandler,
+        build_anchored_https_handler(anchor=trust_anchor, connector=_HTTP_FAMILY_CELL),
+        *extra_handlers,
     )
 
 
@@ -284,7 +312,9 @@ def _insecure_opener(
 
 
 def _expiry_relaxed_opener(
-    host: str, *extra_handlers: urllib.request.BaseHandler
+    host: str,
+    *extra_handlers: urllib.request.BaseHandler,
+    trust_anchor: TrustAnchor = SYSTEM_TRUST_ANCHOR,
 ) -> urllib.request.OpenerDirector:
     """A no-redirect opener that verifies chain + hostname but tolerates an EXPIRED server cert (#129,
     ADR 0094). Built per connection (not the shared module-level verifying opener) only when
@@ -292,8 +322,13 @@ def _expiry_relaxed_opener(
     ``check_hostname=True``) and relaxes ONLY the validity-period check via
     :func:`~messagefoundry.config.tls_policy.relax_verify_expiry`. Verification stays ON, so this is the
     granular alternative to ``verify_tls=false`` — a MITM-able peer (wrong host / untrusted chain) is
-    still rejected. Shared verbatim by the SOAP destination."""
-    ctx = ssl.create_default_context()
+    still rejected. Shared verbatim by the SOAP destination.
+
+    ``trust_anchor`` (#1180) selects the roots that chain is validated against; the default resolves to
+    the OS trust store, which is the ``ssl.create_default_context()`` this line used to be. Expiry
+    tolerance and anchor narrowing are independent — relaxing the validity window never widens the
+    trust store, and vice versa."""
+    ctx = build_verifying_client_context(trust_anchor)
     relax_verify_expiry(ctx, host=host)  # chain + hostname stay enforced; only expiry is relaxed
     harden_cipher_suites(ctx, connector="HTTP-family destination (expired-certificate tolerance)")
     return urllib.request.build_opener(
@@ -1353,14 +1388,22 @@ class RestDestination(DestinationConnector):
             # #129 (ADR 0094): granular expiry-only relaxation — verify chain + hostname but tolerate an
             # expired server cert (opt-in; default off = the shared verifying opener, byte-identical). It
             # keeps verification ON, so it is NOT an insecure hop in the #200 sense (no refusal keys on it).
+            # #1180 (ADR 0093): the client trust anchor for this https hop.
+            anchor = http_family_trust_anchor(
+                s, url=self.url, trust_anchor_policy=config.trust_anchor_policy
+            )
             if bool(s.get("tls_allow_expired", False)):
                 self._opener = _expiry_relaxed_opener(
-                    urllib.parse.urlsplit(self.url).hostname or "", *proxy_handlers
+                    urllib.parse.urlsplit(self.url).hostname or "",
+                    *proxy_handlers,
+                    trust_anchor=anchor,
                 )
-            elif proxy_handlers:
+            elif proxy_handlers or anchor.narrows:
                 # A forward proxy is configured → a PER-CONNECTION verifying opener carrying it (never the
-                # shared one; ADR 0126). No proxy → the shared opener stays (byte-identical).
-                self._opener = _no_redirect_opener(*proxy_handlers)
+                # shared one; ADR 0126). A narrowed trust anchor needs its own opener for the same reason:
+                # the shared one carries the OS trust store and must never be mutated. Neither → the
+                # shared opener stays.
+                self._opener = _no_redirect_opener(*proxy_handlers, trust_anchor=anchor)
             else:
                 self._opener = _NO_REDIRECT_OPENER
         else:

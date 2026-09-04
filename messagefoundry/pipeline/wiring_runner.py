@@ -1564,7 +1564,10 @@ class RegistryRunner:
         # the executor here outside build_check_registry's active_hop_posture scope, so an unstamped build
         # would either fail-closed a legit dev read or (via the send-time re-assertion) mis-key the hop.
         with active_hop_posture(self._hop_posture):
-            return FhirLookupExecutor(resolved)
+            # #1180 (ADR 0093): a FhirLookup connection has no Destination to carry the instance
+            # [tls] anchor policy, so it is threaded explicitly here — the sanctioned live read
+            # against an internal FHIR server could otherwise never name an internal CA.
+            return FhirLookupExecutor(resolved, trust_anchor_policy=self._trust_anchor_policy)
 
     def _run_fhir_lookup(
         self,
@@ -6492,7 +6495,8 @@ def _build_check_connectors(
         resolved_fhir_lookups[fname] = fsettings
     if resolved_fhir_lookups:
         # Construct (and discard): validates each FHIR URL/TLS/SMART-auth without issuing a read.
-        FhirLookupExecutor(resolved_fhir_lookups)
+        # #1180: the same anchor policy the live build uses, so build_check resolves what serve does.
+        FhirLookupExecutor(resolved_fhir_lookups, trust_anchor_policy=trust_anchor_policy)
 
 
 def check_pt_backend_supported(registry: Registry, store: QueueStore) -> None:
