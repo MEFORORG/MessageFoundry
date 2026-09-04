@@ -12255,11 +12255,21 @@ _FHIR_ID_RE.fullmatch("abc\n")    -> False    the fix
 > **The carve-out this item makes IS sound, and I verified it:** `_encode_search_params` has exactly three references in the file (def `:697`, docstring `:721`, call `:756`) and is reached only from `_resolve_read_url`, so `conditional_query` travels a different path and the two tests this item promises to keep green are untouched by any change here.
 > **THE TAIL IS VAULTED AND NO BUILDER IN A PUBLIC CHECKOUT CAN PERFORM IT.** This item's title is to close ASVS 1.2.2 on the merits, and its re-score note makes the cell the terminal state -- but that cell lives in the separate vault clone, and `git ls-files docs/security` returns **0** here. A second vaulted artifact sits on the same tail: the 15.1.5 `fhir_lookup` row in the threat model. **A builder can finish every line of Limb B and still not close 1.2.2.**
 > Verdict: build
-> Closing-act: blocked
-> **BLOCKED 2026-08-22 BY OWNER RULING -- pending a real FHIR server. This is 1107 clause 3.**
-> *Recorded here because a reader cannot see it from anywhere else: the encoding question cannot be
+> Closing-act: code
+> ~~**BLOCKED 2026-08-22 BY OWNER RULING -- pending a real FHIR server. This is 1107 clause 3.**~~
+> ~~*Recorded here because a reader cannot see it from anywhere else: the encoding question cannot be
 > settled against our own suite, which pins `%7C` in five places and therefore cannot disagree with
-> itself.* **`Closing-act` is `blocked`, not `code`, so a dispatch gate refuses this to a builder.**
+> itself.* **`Closing-act` is `blocked`, not `code`, so a dispatch gate refuses this to a builder.**~~
+>
+> **BLOCK LIFTED 2026-09-03 BY OWNER RULING. `Closing-act` moved `blocked` -> `code`.** The reason
+> the block came off is that **the question the FHIR server was wanted for is answered normatively by
+> the FHIR specification itself**: R4 section 3.1.1.4.19 and R5 section 3.2.1.5.7 say, in the same two
+> sentences, that a server percent-decodes a parameter value *first* and reads FHIR's own syntax
+> *second*, and R5 then shows a character-exact pair in which a percent-encoded comma is still the OR
+> separator across three values. So no server was needed to settle it. **The struck paragraph above is
+> still right about our suite** -- a suite that pins `%7C` in five places cannot disagree with itself
+> -- which is why the citations go in the code and **not** into a test assertion. The owner chose the
+> refusal design over an ADR-first route. *(The status glyph is unchanged: that is the lander's act.)*
 >
 > ⚠️ **DO NOT READ THIS ITEM's `OWNER-RULED` BANNER AS COVERING IT.** *That marks a DIFFERENT ruling,
 > of 2026-08-13, on the two limbs.* **A grep for "owner rul" hits that one and returns a reader who
@@ -12306,6 +12316,44 @@ _FHIR_ID_RE.fullmatch("abc\n")    -> False    the fix
 > end-to-end mutation-proved: re-inserting the retired sentence reds it while the behaviour test stays
 > green. **A future Limb B will legitimately red the behaviour arm; that is the intended signal, and
 > the docstring must move in the same commit.**
+>
+> **LIMB B BUILT 2026-09-03 (builder), on top of the note above -- branched from that PR's head, not
+> from `main`, so its docstring corrections are inherited rather than fought.** The sentence it wrote
+> saying the remainder is *"blocked pending a real FHIR server rather than merely unfinished"* is now
+> stale and was rewritten in the same commit; the block came off the same day.
+> **A SEARCH VALUE STATES ITS KIND.** A plain `str` is data, and one carrying `,` `|` or `$` is
+> **refused** with a PHI-safe `ValueError` naming the parameter key and the character, never the
+> value. `FhirToken(system, code)` splits the one string that carried two provenances: the system half
+> is an author literal and passes through, the code half is data and screens. `FhirRaw("...")` is
+> FHIR syntax the author wrote and rides through percent-encoded only. The vocabulary, the
+> specification citations and the rationale live once, on the new leaf module
+> `messagefoundry/fhirsearch.py` (a leaf so `config/` and `transports/` share it without either
+> importing the other, and so `import messagefoundry` still does not need the `[fhir]` extra).
+> **REFUSAL, NOT ESCAPING, AND THAT IS THE LOAD-BEARING CHOICE.** FHIR defines a backslash escape,
+> but it is correct only if the far end implements the unescape, and server behaviour there varies
+> (HAPI FHIR issue #192 reports an escaped comma coming back with the backslash still in it). A value
+> that never leaves the process cannot be misread by any server. Backslash escaping is deliberately
+> **not** built: it is an additive fourth kind for a site that has a server and can verify it, which
+> defers the one unknowable fact to the only party who can know it. **Unallocated and named by
+> subject rather than by a number, per the ledger rule.**
+> **`FhirRaw` IS REQUIRED, NOT OPTIONAL, AND IT DOES NOT REOPEN LIMB A.** FHIR puts separators inside
+> a single value -- a composite `code-value-quantity` carries `$`, three `|` and a `,`, all
+> structural; a quantity is `[prefix][number]|[system]|[code]`; `_sort`/`_elements` take
+> comma-separated lists. And there is an AND/OR trap this item never named: FHIR ANDs repeated
+> parameters, so a `list` value is an AND, and a comma inside one value is the only way to write OR.
+> Refusing commas with no `FhirRaw` would remove OR from the surface. Limb A rejected a sink reachable
+> **by default**; `FhirRaw` carries author-authored syntax, the same line `conditional_query` draws.
+> Operator strings reaching a sink stays **#1241**.
+> **THE AUTHORING SURFACE MOVED IN THE SAME COMMIT**, so the taught idiom never becomes a
+> transform-stage `ValueError` on a documented feature: the IDE snippet, `config/fhir_lookup.py`
+> (module example + `fhir_lookup()`), `config/wiring.py`'s `FhirLookup()`, `wiring_runner`'s
+> `_run_fhir_lookup`, ADR 0043 (two examples + a new 2026-09-03 amendment), and the five pinned `%7C`
+> assertions, which now read `FhirToken("MRN", "123")` and produce byte-identical wire output.
+> **THE NEGATIVE CONTROL IS THE POINT (SDS-3.8).** The refusal property is factored into one helper so
+> the same call runs against a mutated screen: `test_separator_refusal_negative_control` monkeypatches
+> the screen to a pass-through and asserts the property returns **nothing** where the real one returns
+> all three separators. Measured, not asserted. The citations are **not** a test assertion -- our suite
+> cannot arbitrate wire behaviour, and pretending it could is what this item found.
 
 **Cluster:** Transports / FHIR egress. **Priority:** P2. **Verdict:** build. **Severity:** no deployment axis -- zero instances; on first deployment a Handler passing an unsanitised value into a FHIR search **would** be able to alter the query's meaning.
 
