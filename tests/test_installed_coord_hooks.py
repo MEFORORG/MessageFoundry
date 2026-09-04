@@ -1155,15 +1155,24 @@ def test_the_governed_root_audit_reports_an_installer_whose_payload_list_it_cann
 def test_the_allowlist_reader_skips_comments_and_blanks_and_keeps_paths(tmp_path: Path) -> None:
     """The allowlist's real shape carries a comment header, and a reader that kept it would audit a
     root named ``# Primary checkouts governed by...`` -- which is not a directory, so the report would
-    carry a line nobody can act on."""
+    carry a line nobody can act on.
+
+    The kept lines are compared WHOLE, never by ``Path.name``. This allowlist is a Windows file -- it
+    resolves under ``USERPROFILE`` and its lines are drive-letter paths -- but the reader is ordinary
+    ``pathlib``, and a backslash is not a separator on POSIX. Measured on both: the two lines below
+    parse as two paths either way, and the leaf of the first is ``Alpha`` on Windows and the ENTIRE
+    line on Linux, so a ``.name`` assertion means two different things for one input and reds the
+    Linux leg. The whole spelling pins more of each line than the leaf did and reads the same on both.
+    """
+    kept = ["C:\\Users\\X\\Code\\Alpha", "C:\\Users\\X\\Code\\Beta"]
     f = tmp_path / "repos.txt"
-    f.write_text(
-        "# a comment header\n\nC:\\Users\\X\\Code\\Alpha\n   \nC:\\Users\\X\\Code\\Beta\n",
-        encoding="utf-8",
-    )
+    f.write_text(f"# a comment header\n\n{kept[0]}\n   \n{kept[1]}\n", encoding="utf-8")
     roots = read_governed_roots(f)
     print(f"parsed: {[str(r) for r in roots]}")
-    assert [r.name for r in roots] == ["Alpha", "Beta"]
+    assert [str(r) for r in roots] == kept, (
+        "the reader must drop the comment header and both blank-ish lines and keep every remaining "
+        "line exactly as written"
+    )
     assert read_governed_roots(tmp_path / "absent.txt") == [], (
         "an absent allowlist is the documented kill switch and must read as an empty governed set"
     )
