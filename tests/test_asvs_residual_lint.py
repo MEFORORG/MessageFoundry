@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import subprocess
 import sys
+from contextlib import nullcontext
 from pathlib import Path
 
 import pytest
@@ -184,6 +185,57 @@ def test_a_malformed_baseline_line_is_refused_rather_than_ignored(tmp_path: Path
         load_baseline(bad)
 
 
+def test_the_documented_baseline_recipe_round_trips(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Generate a baseline the way the module docstring says to, then require it to load green.
+
+    This is the ONE affordance the four-step wiring of BACKLOG #1205 depends on, and until this test
+    it was the only affordance in the tool that nothing drove.
+
+    REWRITTEN BECAUSE THIS BRANCH RETIRES THE PREMISE THE EARLIER VERSION FROZE. That version pinned
+    a FILTER RULE and used the naive whole-stdout capture as its control, requiring it to be
+    MALFORMED because the scan inventory shared stdout with the keys. Under the stream split this
+    branch adds, stdout carries key lines and nothing else, so the naive capture is now the CORRECT
+    recipe and the old control could never fire again. Kept as-is it would have gone green while
+    asserting the opposite of what the tool now guarantees.
+
+    THE REPLACEMENT CONTROL IS THE ONE THAT CAN STILL CATCH SOMETHING: the inventory must appear on
+    STDERR. "Routed, not suppressed" is the property the split rests on, and a change that simply
+    stopped printing the inventory would satisfy every other assertion here while destroying the
+    empty-scan refusal this tool exists to hold.
+    """
+    sc = write_scorecard(tmp_path, ONE_CELL)
+
+    assert main([str(sc), "--no-baseline", "--print-keys"]) == 1, (
+        "with no baseline every citation is new, so generation exits 1 by design"
+    )
+    captured = capsys.readouterr()
+
+    keys = captured.out.splitlines()
+    assert keys, "the generating run wrote no keys at all"
+    assert all(line.count("	") == 3 or line.startswith("#") for line in keys), (
+        "under --print-keys stdout must carry ONLY baseline lines (and its comment header); "
+        f"something else reached it: {[k for k in keys if k.count(chr(9)) != 3 and not k.startswith('#')]!r}"
+    )
+
+    # POSITIVE CONTROL: routed, NOT suppressed. Without this a tool that printed no inventory at all
+    # would pass everything above, and the empty-scan refusal would be silently gone.
+    assert captured.err.strip(), (
+        "the scan inventory and verdict vanished entirely; they must go to stderr under "
+        "--print-keys, not be suppressed"
+    )
+
+    # The naive whole-stdout capture IS the documented recipe now, so it must load green.
+    base = tmp_path / "b.txt"
+    base.write_text(captured.out, encoding="utf-8")
+
+    assert load_baseline(base) == counted(scan_cells(load_scorecard(sc), ["residual"])[0])
+    assert main([str(sc), "--baseline", str(base)]) == 0, (
+        "a baseline generated from the record it grandfathers must read green on the next run"
+    )
+
+
 # --------------------------------------------------------------------------------------------
 # Empty-scan refusal. This tool runs where nobody is watching it.
 # --------------------------------------------------------------------------------------------
@@ -249,10 +301,177 @@ def test_scan_and_count_report_cells_fields_and_occurrences(tmp_path: Path) -> N
     }
 
 
+def run_lint(
+    tmp_path: Path, *argv: str, stdout_to: Path | None = None
+) -> subprocess.CompletedProcess[str]:
+    """Run the lint as the vault does: bare script, stdlib only, from an unrelated cwd.
+
+    ``stdout_to`` reproduces the shell's ``>`` at the FILE DESCRIPTOR, which is the only way to
+    observe what the documented command actually leaves on disk -- including that the shell creates
+    and truncates the target before this program starts.
+    """
+    cmd = [sys.executable, "-I", "-S", str(REPO_ROOT / LINT_REL), *argv]
+    print(f"SCANNED: {' '.join(cmd)} (cwd={tmp_path}, stdout_to={stdout_to})")
+    with stdout_to.open("w", encoding="utf-8") if stdout_to else nullcontext() as fh:
+        proc = subprocess.run(
+            cmd,
+            cwd=tmp_path,
+            stdout=fh if fh else subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=120,
+        )
+    print(f"FOUND:   rc={proc.returncode}, stderr {len(proc.stderr)} bytes")
+    return proc
+
+
 def test_the_lint_runs_as_a_bare_script(tmp_path: Path) -> None:
     """Same mirror contract as the verifier: stdlib only, no install, from an unrelated cwd."""
-    cmd = [sys.executable, "-I", "-S", str(REPO_ROOT / LINT_REL), "--help"]
-    print(f"SCANNED: {' '.join(cmd)} (cwd={tmp_path})")
-    proc = subprocess.run(cmd, cwd=tmp_path, capture_output=True, text=True, timeout=120)
+    proc = run_lint(tmp_path, "--help")
     assert proc.returncode == 0, f"rc={proc.returncode}\n{proc.stderr}"
     assert "--baseline" in proc.stdout
+
+
+# --------------------------------------------------------------------------------------------
+# Generating the baseline with --print-keys.
+#
+# The docstring documents `--print-keys > <baseline.txt>`, so the artifact under test is a
+# REDIRECTED STDOUT. The end-to-end arm therefore runs a real subprocess with a real fd redirect;
+# the rest read the streams in-process, which is cheaper and answers the same question.
+# --------------------------------------------------------------------------------------------
+
+NO_CELLS = '[scorecard]\nanchor_commit = "deadbeef"\n'
+ONE_CELL_KEYS = {
+    "6.3.3\tresidual\tmessagefoundry/__main__.py": 1,
+    "6.3.3\tresidual\t__main__.py": 1,
+}
+
+
+def test_the_documented_print_keys_command_produces_a_loadable_baseline(tmp_path: Path) -> None:
+    """The step the item's remaining work names, end to end: generate, then gate with it.
+
+    Before the stream split this failed on the FIRST line of the file it had just written -- the
+    inventory shared stdout with the keys, and ``load_baseline`` refuses a line it cannot parse
+    rather than skipping it. So the documented two-command workflow raised ``ValueError`` at the
+    moment somebody first tried to use its own output.
+    """
+    sc = write_scorecard(tmp_path, ONE_CELL)
+    baseline = tmp_path / "baseline.txt"
+    run_lint(tmp_path, str(sc), "--print-keys", stdout_to=baseline)
+
+    # Every line of the artifact must parse. This is the assertion that was failing.
+    loaded = load_baseline(baseline)
+    assert loaded == ONE_CELL_KEYS, (
+        f"the generated baseline does not describe the record it came from: {loaded}"
+    )
+
+    # And the record it came from must then be GREEN against it, with no hand editing.
+    assert main([str(sc), "--baseline", str(baseline)]) == 0, (
+        "a freshly generated baseline must grandfather exactly what the scorecard contains"
+    )
+
+
+@pytest.mark.parametrize(
+    ("why", "body", "baseline_lines", "expected_rc"),
+    [
+        # Every branch that writes a verdict, so the routing is tested as a property of the mode
+        # rather than of one code path. Each of these drove a different block of main().
+        ("new citations", ONE_CELL, None, 1),
+        ("all grandfathered", ONE_CELL, "".join(f"{k}\t1\n" for k in ONE_CELL_KEYS), 0),
+        # Grandfathers everything present PLUS one entry that is not, so the `stale` branch is the
+        # only thing reddening this arm -- and the artifact still carries claims, which the
+        # zero-claim refusal makes a precondition of asserting anything about its contents.
+        (
+            "a stale baseline entry",
+            ONE_CELL,
+            "".join(f"{k}\t1\n" for k in ONE_CELL_KEYS) + "6.3.3\tresidual\tghost.py\t1\n",
+            1,
+        ),
+    ],
+)
+def test_stdout_carries_only_baseline_lines_whatever_the_verdict(
+    tmp_path: Path,
+    capfd: pytest.CaptureFixture[str],
+    why: str,
+    body: str,
+    baseline_lines: str | None,
+    expected_rc: int,
+) -> None:
+    """The invariant is the mode's, not one branch's: under --print-keys stdout is the artifact.
+
+    Asserted by handing stdout back to ``load_baseline`` rather than by re-deriving the grammar
+    here -- a second, silently different definition of the format is the failure CLAUDE.md section
+    11 names for the backlog banner parser.
+    """
+    sc = write_scorecard(tmp_path, body)
+    argv = [str(sc), "--print-keys"]
+    if baseline_lines is None:
+        argv.append("--no-baseline")
+    else:
+        base = tmp_path / "given.txt"
+        base.write_text(baseline_lines, encoding="utf-8")
+        argv += ["--baseline", str(base)]
+
+    assert main(argv) == expected_rc, why
+    out, err = capfd.readouterr()
+
+    written = tmp_path / "captured.txt"
+    written.write_text(out, encoding="utf-8")
+    load_baseline(written)  # raises if any line of the artifact is not a baseline line
+
+    assert "SCANNED:" not in out, f"the inventory leaked into the artifact ({why}): {out!r}"
+    assert "SCANNED:" in err, f"the inventory must still be printed, on stderr ({why})"
+
+
+def test_the_gate_run_still_reports_on_stdout(
+    tmp_path: Path, capfd: pytest.CaptureFixture[str]
+) -> None:
+    """Negative control against an over-broad fix.
+
+    A change that simply moved every message to stderr would pass every test above and silently
+    empty the stdout of the mode that actually gates. Without ``--print-keys`` nothing is being
+    generated and nothing is redirected, so the report belongs on stdout exactly as before.
+    """
+    sc = write_scorecard(tmp_path, ONE_CELL)
+    assert main([str(sc), "--no-baseline"]) == 1
+    out, err = capfd.readouterr()
+    assert "SCANNED:" in out, "gate mode must keep reporting on stdout"
+    assert "FAIL:" in out
+    assert err == "", f"gate mode should write no stderr; got {err!r}"
+
+
+def test_an_empty_scan_writes_no_baseline_and_still_refuses(
+    tmp_path: Path, capfd: pytest.CaptureFixture[str]
+) -> None:
+    """Generation is where an empty scan would go silent, so the refusal is checked in that mode."""
+    sc = write_scorecard(tmp_path, NO_CELLS)
+    assert main([str(sc), "--print-keys", "--no-baseline"]) == 2
+    out, err = capfd.readouterr()
+    assert out == "", f"an empty scan must write no baseline lines; got {out!r}"
+    assert "no [[cell]] entries" in err, "rc 2 is shared, so the message must say WHICH refusal"
+
+
+def test_the_empty_file_a_refused_generation_leaves_behind_is_not_a_baseline(
+    tmp_path: Path,
+) -> None:
+    """The redirect creates and truncates the target BEFORE the program runs.
+
+    So a generating run that exits 2 still leaves a 0-byte file, and the next gate run would load
+    it, report "0 claims" in the inventory, and grandfather nothing -- reddening every citation in
+    the record while the operator debugs the wrong end. A missing baseline is refused; this must be
+    refused the same way, because the shell has already turned the first into the second.
+    """
+    sc = write_scorecard(tmp_path, NO_CELLS)
+    baseline = tmp_path / "baseline.txt"
+    proc = run_lint(tmp_path, str(sc), "--print-keys", "--no-baseline", stdout_to=baseline)
+    assert proc.returncode == 2
+    assert baseline.is_file() and baseline.read_text(encoding="utf-8") == "", (
+        "the premise of this test is that the shell leaves an EMPTY file behind"
+    )
+
+    with pytest.raises(EmptyScan, match="zero claims"):
+        load_baseline(baseline)
+    good = write_scorecard(tmp_path, ONE_CELL)
+    assert main([str(good), "--baseline", str(baseline)]) == 2, (
+        "an empty baseline must refuse like a missing one, not grandfather nothing in silence"
+    )

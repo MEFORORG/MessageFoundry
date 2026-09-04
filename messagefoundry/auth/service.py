@@ -39,6 +39,7 @@ from messagefoundry.auth.notifications import (
     MFA_ENABLED,
     PASSWORD_CHANGED,
     PASSWORD_RESET,
+    RECOVERY_CODE_USED,
     ROLES_CHANGED,
     SUSPICIOUS_LOGIN_FAILURE_THRESHOLD,
     SecurityEvent,
@@ -87,7 +88,7 @@ def _warn_if_corpus_unreadable(path: str | None) -> None:
     except OSError as exc:
         _log.warning(
             "password_breach_corpus_file %r could not be read (%s); the larger breach corpus is "
-            "disabled (the bundled top-10k list still applies)",
+            "disabled (the bundled corpus still applies)",
             path,
             exc,
         )
@@ -852,7 +853,7 @@ class AuthService:
                 await self._notify_security(
                     ACCOUNT_LOCKED,
                     username=user.username,
-                    email=user.email,
+                    email=user.notify_email,
                     client=client,
                     detail={"failed_attempts": attempts},
                 )
@@ -922,7 +923,7 @@ class AuthService:
             await self._notify_security(
                 LOGIN_AFTER_FAILURES,
                 username=user.username,
-                email=user.email,
+                email=user.notify_email,
                 client=client,
                 detail={"failed_attempts": prior_failures},
             )
@@ -1269,7 +1270,7 @@ class AuthService:
                 client=client,
             )
             return LoginOutcome(ok=False, error="account conflict")
-        user = await self._upsert_ad_user(principal)
+        user = await self._upsert_ad_user(principal, client=client)
         if (
             federated_subject is not None
             and (
@@ -1349,7 +1350,7 @@ class AuthService:
             await self._notify_security(
                 FEDERATED_IDENTITY_BOUND,
                 username=user.username,
-                email=user.email,
+                email=user.notify_email,
                 client=client,
                 detail={"issuer": federated_subject[0]},
             )
@@ -1373,7 +1374,7 @@ class AuthService:
             await self._notify_security(
                 ROLES_CHANGED,
                 username=user.username,
-                email=user.email,
+                email=user.notify_email,
                 client=client,
                 detail={"roles": role_ids},
             )
@@ -1440,7 +1441,9 @@ class AuthService:
         )
         return await self._store.get_user(user.id) or user
 
-    async def _upsert_ad_user(self, principal: AdPrincipal) -> UserRecord:
+    async def _upsert_ad_user(
+        self, principal: AdPrincipal, *, client: str | None = None
+    ) -> UserRecord:
         existing = await self._store.get_user_by_username(principal.username)
         if existing is None:
             user_id = uuid4().hex
@@ -1453,9 +1456,51 @@ class AuthService:
             )
         else:
             user_id = existing.id
-            await self._store.update_user_profile(
-                user_id, display_name=principal.display_name, email=principal.email
-            )
+            # BACKLOG #1139. AN ABSENT DIRECTORY ATTRIBUTE IS NOT AN INSTRUCTION TO ERASE.
+            # ``update_user_profile``'s write is unconditional, so passing ``principal.email``
+            # straight through let a directory that returned no ``mail`` blank the stored address on
+            # the next login -- and "returned no mail" covers an unset attribute, one the bind
+            # account cannot read, and one trimmed from the search attribute list, none of which is
+            # a site saying "remove this address".
+            #
+            # The address is this account's ONLY notification target, so that erase also excluded the
+            # account from every later notice: ``SecurityEventNotifier.notify`` returns early on an
+            # empty address. A directory that has nothing to say now leaves the stored value alone.
+            #
+            # THE COST, STATED: a site that deliberately clears ``mail`` in the directory no longer
+            # propagates that clear on the next login. An administrator can still clear the address
+            # through ``PATCH /users/{id}``, which is audited and notified, so nothing becomes
+            # unreachable -- only the silent path is closed.
+            display_name = principal.display_name or existing.display_name
+            email = principal.email or existing.email
+            await self._store.update_user_profile(user_id, display_name=display_name, email=email)
+            if email != existing.email:
+                # BACKLOG #1139, ASVS 6.3.7. The directory owns the attribute, but repointing it
+                # decides where every later security notice on this account is delivered -- so it is
+                # an update to the account's authentication details, and it gets the same two records
+                # the local sibling ``update_user`` emits: an audit row and an out-of-band notice.
+                #
+                # This method sits on the SHARED directory completion path, so this covers the
+                # simple-bind, Kerberos and federated legs alike, not AD alone.
+                await self._audit(
+                    "auth.ad_profile_email_changed",
+                    actor=principal.username,
+                    detail=_json({"user_id": user_id, "source": "directory"}),
+                    client=client,
+                )
+                # ADDRESSED TO THE OLD ADDRESS WHERE ONE EXISTS, matching ``update_user``: the holder
+                # of the address being replaced is the party who needs to hear about the replacement,
+                # and the new address is whatever the directory now asserts. Where the account
+                # carried NO address, the new one is the only reachable party and there is no earlier
+                # holder to protect, so it is the target -- otherwise the first-set case is announced
+                # to nobody at all.
+                await self._notify_security(
+                    EMAIL_CHANGED,
+                    username=principal.username,
+                    email=existing.email or email,
+                    client=client,
+                    detail={"new_email": email, "source": "directory"},
+                )
         user = await self._store.get_user(user_id)
         assert user is not None  # just upserted
         return user
@@ -1684,7 +1729,7 @@ class AuthService:
             await self._notify_security(
                 ACCOUNT_DISABLED if revocation.role_ids is None else ROLES_CHANGED,
                 username=user.username,
-                email=user.email,
+                email=user.notify_email,
                 detail={"reason": revocation.reason},
             )
 
@@ -2142,7 +2187,7 @@ class AuthService:
         await self._notify_security(
             ADMIN_NEW_IP,
             username=username,
-            email=user.email if user is not None else None,
+            email=user.notify_email if user is not None else None,
             client=client_ip,
             detail={"known_ip": session.client},
         )
@@ -2175,7 +2220,7 @@ class AuthService:
         await self._notify_security(
             PASSWORD_CHANGED,
             username=identity.username,
-            email=user.email if user is not None else None,
+            email=user.notify_email if user is not None else None,
             client=client,
         )
         return []
@@ -2306,7 +2351,7 @@ class AuthService:
         await self._store.mark_session_mfa_verified(hash_token(token))
         await self._audit("auth.mfa_enrolled", actor=identity.username, client=client)
         await self._notify_security(
-            MFA_ENABLED, username=user.username, email=user.email, client=client
+            MFA_ENABLED, username=user.username, email=user.notify_email, client=client
         )
         return plain
 
@@ -2334,7 +2379,7 @@ class AuthService:
                 client=client,
             )
             return False
-        if await self._verify_second_factor(user, code):
+        if await self._verify_second_factor(user, code, client=client):
             # The 2nd factor is now satisfied; also seed the step-up window (the session has completed
             # password + MFA) and clear the failure counter. (Initial enrollment has no factor to verify,
             # so this never fires there — keeping the enrollment step-up gate honest, WP-14.)
@@ -2354,16 +2399,21 @@ class AuthService:
             await self._notify_security(
                 ACCOUNT_LOCKED,
                 username=user.username,
-                email=user.email,
+                email=user.notify_email,
                 client=client,
                 detail={"failed_attempts": attempts},
             )
         return False
 
-    async def _verify_second_factor(self, user: UserRecord, code: str) -> bool:
+    async def _verify_second_factor(
+        self, user: UserRecord, code: str, *, client: str | None = None
+    ) -> bool:
         """True iff ``code`` is the user's current TOTP **or** an unused recovery code (consumed on
         match). TOTP is checked first (fast, no argon2); recovery codes are argon2id-hashed and
-        single-use. Codes never collide (TOTP is 6 digits; recovery codes are dashed alphanumerics)."""
+        single-use. Codes never collide (TOTP is 6 digits; recovery codes are dashed alphanumerics).
+
+        ``client`` is the caller's address, carried onto the recovery-code audit row and notice
+        (BACKLOG #1139) so the holder can tell their own use from someone else's."""
         code = code.strip()
         if not code:
             return False
@@ -2413,7 +2463,38 @@ class AuthService:
             return False
         # Atomic compare-and-delete: only the caller that actually removes the hash wins, so a
         # concurrent verify of the same single-use code can't double-spend it (WP-14).
-        return await self._store.consume_recovery_code_hash(user.id, real[matched])
+        if not await self._store.consume_recovery_code_hash(user.id, real[matched]):
+            # Lost the race to a concurrent verify of the SAME code. That caller removed the hash and
+            # writes the records below; writing them here too would report one consumption twice.
+            return False
+        # BACKLOG #1139, ASVS 6.3.7. Spending a recovery code PERMANENTLY DELETES a stored
+        # credential, so it is an update to the account's authentication details and earns its own
+        # records. Before this the only row was the generic ``auth.mfa_verified`` the caller writes,
+        # which carries no detail -- leaving a recovery-code burn byte-indistinguishable from an
+        # ordinary TOTP verify, on precisely the event that usually means either the holder lost
+        # their authenticator or somebody else has their codes.
+        # RE-READ RATHER THAN ``len(real) - 1``. The arithmetic is off by one for every code a
+        # concurrent caller spent between this method's read and its own consume, and this notice
+        # exists to be acted on -- an overstated count tells the holder they have a spare they do
+        # not. One extra store read, on a path that only runs when a code is actually burned.
+        remaining = len(await self._store.get_recovery_code_hashes(user.id))
+        await self._audit(
+            "auth.mfa_recovery_code_used",
+            actor=user.username,
+            detail=_json({"remaining": remaining}),
+            client=client,
+        )
+        # THE REMAINING COUNT, NEVER THE CODE OR ITS HASH. The holder needs to know a code was spent
+        # and how close they are to none left; an operator gets everything else from the audit row,
+        # which is stored somewhere better protected than a mailbox.
+        await self._notify_security(
+            RECOVERY_CODE_USED,
+            username=user.username,
+            email=user.notify_email,
+            client=client,
+            detail={"remaining": remaining},
+        )
+        return True
 
     async def disable_mfa(self, identity: Identity, *, client: str | None = None) -> None:
         """Self-service: turn off the caller's TOTP MFA (the API gates this behind step-up). Audited +
@@ -2450,7 +2531,7 @@ class AuthService:
         await self._notify_security(
             MFA_DISABLED,
             username=identity.username,
-            email=user.email if user is not None else None,
+            email=user.notify_email if user is not None else None,
             client=client,
         )
 
@@ -2479,7 +2560,7 @@ class AuthService:
             ),
         )
         await self._notify_security(
-            MFA_DISABLED, username=user.username, email=user.email, detail={"reset": True}
+            MFA_DISABLED, username=user.username, email=user.notify_email, detail={"reset": True}
         )
 
     async def mfa_status(self, identity: Identity) -> MfaStatus:
@@ -2634,7 +2715,7 @@ class AuthService:
             client=client,
         )
         await self._notify_security(
-            MFA_ENABLED, username=user.username, email=user.email, client=client
+            MFA_ENABLED, username=user.username, email=user.notify_email, client=client
         )
         return True
 
@@ -2798,7 +2879,7 @@ class AuthService:
             await self._notify_security(
                 MFA_DISABLED,
                 username=user.username,
-                email=user.email,
+                email=user.notify_email,
                 client=client,
                 detail={"factor": "webauthn"},
             )
@@ -2861,6 +2942,19 @@ class AuthService:
     ) -> None:
         before = await self._store.get_user(user_id)  # capture old email/disabled for notifications
         await self._store.update_user_profile(user_id, display_name=display_name, email=email)
+        # THE ENGINE-OWNED NOTIFICATION ADDRESS MOVES ONLY HERE, AND ONLY UPWARDS (BACKLOG #1139).
+        # This is an administrator acting on the engine's own surface, so it is the one write allowed
+        # to repoint where notices go — the directory sync above (`update_user_profile`, which
+        # `_upsert_ad_user` also calls) is not.
+        #
+        # A BLANK ADDRESS FALLS THROUGH DELIBERATELY, and that is the durability rule in force: the
+        # profile mirror clears, and the notification address stands. Requiring an address at creation
+        # would not have achieved this on its own, because an explicit null still strips it afterwards
+        # — and an account with no address is excluded from every later notice, which is exactly the
+        # structural exclusion this item was filed against. `set_user_notify_email` takes `str`, so
+        # there is no way to spell the clear even by mistake.
+        if email is not None and email.strip():
+            await self._store.set_user_notify_email(user_id, email=email)
         if disabled is not None:
             await self._store.set_user_disabled(user_id, disabled=disabled)
             if disabled:
@@ -2888,12 +2982,12 @@ class AuthService:
                 await self._notify_security(
                     EMAIL_CHANGED,
                     username=before.username,
-                    email=before.email,
+                    email=before.notify_email,
                     detail={"new_email": email},
                 )
             if disabled and not before.disabled:
                 await self._notify_security(
-                    ACCOUNT_DISABLED, username=before.username, email=before.email
+                    ACCOUNT_DISABLED, username=before.username, email=before.notify_email
                 )
 
     async def delete_user(self, user_id: str, *, actor: str) -> None:
@@ -2913,7 +3007,7 @@ class AuthService:
             await self._notify_security(
                 ROLES_CHANGED,
                 username=user.username,
-                email=user.email,
+                email=user.notify_email,
                 detail={"roles": list(roles)},
             )
 
@@ -3052,7 +3146,7 @@ class AuthService:
             actor=actor,
             detail=_json({"user_id": user_id, "username": user.username}),
         )
-        await self._notify_security(PASSWORD_RESET, username=user.username, email=user.email)
+        await self._notify_security(PASSWORD_RESET, username=user.username, email=user.notify_email)
         return temp
 
     async def set_channel_scope(
@@ -3089,7 +3183,7 @@ class AuthService:
         return admins == {user_id}
 
     async def has_notifiable_admin(self) -> bool:
-        """True iff at least one ENABLED administrator has an email address on file.
+        """True iff at least one ENABLED administrator carries a NOTIFICATION address.
 
         BACKLOG #1020. The PHI startup gate computes notification readiness from the SMTP transport
         alone (``notify_security_events`` + ``email_smtp_host`` + ``email_from``), which answers
@@ -3104,6 +3198,12 @@ class AuthService:
         privileged account has the identical hole. Keying on the bootstrap user alone would close
         the instance this was found on and leave the class open.
 
+        **Reads ``notify_email``, not ``email`` (BACKLOG #1139).** Those are two columns now: ``email``
+        is the profile address and, on a directory account, a mirror the next AD login overwrites,
+        while ``notify_email`` is where the notice is actually addressed. Asking about ``email`` would
+        be the instrument answering the adjacent question (SDS-3.8) -- an administrator whose mirror
+        the directory had just repointed would read as notifiable on an address no notice uses.
+
         Enumerates as :meth:`is_last_enabled_admin` and :meth:`_other_enabled_admin_exists` do --
         same store calls, same disabled-skip, same role test. **That agreement is a convention, not
         a mechanism, and this docstring must not claim otherwise:** these are now THREE independent
@@ -3113,7 +3213,7 @@ class AuthService:
         here, because it would rewrite two guards this change has no business touching.
         """
         for user in await self._store.list_users():
-            if user.disabled or not user.email:
+            if user.disabled or not user.notify_email:
                 continue
             if Role.ADMINISTRATOR.value in await self._store.get_user_role_ids(user.id):
                 return True

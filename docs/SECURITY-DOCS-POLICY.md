@@ -7,6 +7,10 @@ maintained privately and is **not in this repository**. Where these docs cite a 
 and it will not resolve here. This page states the rule that decides which side a document lands on,
 what is public, and what you can ask for.
 
+**Keeping the withheld set out of this repository rests on a client-side hook, not on a server
+control.** [`SECURITY.md`](SECURITY.md) records that posture and its limits, under *Supply-chain &
+CI security*. Read it before assuming the separation is enforced.
+
 ## The rule
 
 A document is withheld only if it does one of two things:

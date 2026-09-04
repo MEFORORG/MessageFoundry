@@ -15,6 +15,12 @@ Those cover the *inventory truth*; this file freezes the *scanner's widened dete
 * the walk-set is the pinned five roots (no ``samples/``); and
 * the ``ide/``-is-TypeScript exclusion is an **enforced** invariant, not a silent drop.
 
+The last group (BACKLOG #1172, ASVS 11.5.1) freezes the **non-Python randomness arm** the Python
+scanner structurally could not provide. Three properties, and a scan missing any one of them proves
+nothing: it must FIND a planted ``Math.random()`` in a ``.ts`` file, it must NOT flag the legitimate
+``randomBytes`` draw in ``ide/src/cspNonce.ts``, and it must REFUSE an empty walk rather than let one
+render as clean.
+
 PHI-free: it reads only code *names/paths*, never a secret value. The gate script is not an importable
 package (``scripts/`` has no ``__init__``), so load it standalone by file path like the doc guard does.
 """
@@ -130,3 +136,217 @@ def test_gate_is_clean_on_the_real_tree() -> None:
     # End-to-end: the widened walk over the five real roots matches the maintained inventory (no drift).
     gate = _gate()
     assert gate.main([]) == 0
+
+
+# --- BACKLOG #1172 / ASVS 11.5.1: the cross-language randomness arm -------------------------------
+#
+# The Python arm is ``import ast`` over ``*.py``, so it cannot see a weak-PRNG draw in another
+# language however its walk-set is spelled. These tests pin the arm that can. Each fixture repo is
+# built on disk rather than mocked, because the property under test is what the WALK reaches.
+
+#: The real anchor, reproduced in miniature. Fixtures carry it by default so the arm's stale
+#: direction (which fires when the inventory's one row is unbacked) does not drown the assertion
+#: under test. The tests that want that direction ask for it explicitly.
+_ANCHOR_REL = "ide/src/cspNonce.ts"
+_ANCHOR_SRC = (
+    'import { randomBytes } from "node:crypto";\n'
+    'export function nonce(): string {\n  return randomBytes(18).toString("base64url");\n}\n'
+)
+
+
+def _ts_repo(tmp_path: Path, files: dict[str, str], *, with_anchor: bool = True) -> Path:
+    """Write ``files`` (repo-relative path -> text) into a throwaway repo root and return it."""
+    written = dict(files)
+    if with_anchor:
+        written.setdefault(_ANCHOR_REL, _ANCHOR_SRC)
+    for rel, text in written.items():
+        path = tmp_path / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text, encoding="utf-8")
+    return tmp_path
+
+
+@pytest.mark.parametrize(
+    "call",
+    [
+        "const n = Math.random();",
+        "const n = Math . random ();",  # spacing must not hide it
+        "const n = window.Math.random();",  # a qualified reference is the same draw
+        "const n = crypto.pseudoRandomBytes(18);",  # node's own non-cryptographic sibling
+    ],
+)
+def test_a_planted_weak_draw_in_a_ts_file_is_flagged(tmp_path: Path, call: str) -> None:
+    # THE ARM'S REASON TO EXIST. Without this assertion its green is worth nothing: a scanner that
+    # cannot be made to fire is indistinguishable from one reading an empty corpus.
+    gate = _gate()
+    repo = _ts_repo(
+        tmp_path, {"ide/src/planted.ts": f"export function bad(): string {{\n  {call}\n"}
+    )
+    violations, scanned = gate.check_non_python_randomness(repo)
+
+    assert scanned == 2, f"the fixture walk should have read both files, it read {scanned}"
+    weak = [v for v in violations if "WEAK randomness source" in v]
+    assert len(weak) == 1, violations
+    assert "ide/src/planted.ts" in weak[0], weak[0]
+
+
+def test_a_weak_draw_in_a_js_webview_asset_is_flagged_too(tmp_path: Path) -> None:
+    # The webview scripts shipped as static assets rather than as .ts are the same kind of code and
+    # the same blind spot; a nonce minted there is as capability-granting as one minted in src/.
+    gate = _gate()
+    repo = _ts_repo(tmp_path, {"ide/media/panel.js": "const nonce = Math.random().toString(36);\n"})
+    violations, _ = gate.check_non_python_randomness(repo)
+    assert any("ide/media/panel.js" in v and "WEAK" in v for v in violations), violations
+
+
+def test_a_weak_draw_cannot_be_registered_away(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # THE DISQUALIFIED MOVE, pinned. #1172 rules out narrowing the declared scope so a weak-PRNG hit
+    # stops being visible. An inventory row is exactly that move in miniature, so the weak check runs
+    # BEFORE the inventory diff and no row can silence it. Mutating the inventory here proves the
+    # ordering rather than asserting it: the gate must still red with the site fully "documented".
+    gate = _gate()
+    monkeypatch.setattr(
+        gate,
+        "NON_PYTHON_INVENTORY",
+        {"ide/src/planted.ts": frozenset({"Math.random", "randomBytes"})},
+    )
+    repo = _ts_repo(
+        tmp_path,
+        {"ide/src/planted.ts": "const n = Math.random();\n"},
+        with_anchor=False,
+    )
+    violations, _ = gate.check_non_python_randomness(repo)
+    assert any("WEAK randomness source" in v and "ide/src/planted.ts" in v for v in violations), (
+        violations
+    )
+
+
+def test_no_weak_token_is_documentable_in_the_shipped_inventory() -> None:
+    # The structural half of the same property: the shipped inventory may not name a weak source.
+    gate = _gate()
+    documented = set().union(*gate.NON_PYTHON_INVENTORY.values())
+    assert documented & set(gate.WEAK_RANDOMNESS_PATTERNS) == set(), documented
+
+
+def test_the_real_cspnonce_draw_is_not_a_false_positive() -> None:
+    # THE OTHER HALF OF A USEFUL SCANNER. One that flags everything is as useless as one that flags
+    # nothing, and cspNonce.ts is the hard case on purpose: its header NAMES Math.random twice in
+    # prose to explain why it is unusable. The tokens must be exactly the sound draw it makes.
+    gate = _gate()
+    tokens = gate.randomness_tokens_in((_ROOT / _ANCHOR_REL).read_text(encoding="utf-8"))
+    assert tokens == {"randomBytes"}, tokens
+
+
+def test_prose_naming_a_weak_source_is_not_a_hit() -> None:
+    gate = _gate()
+    prose = (
+        "// WHY Math.random() cannot be used here: it is xorshift128+.\n"
+        " * A doc comment mentioning Math.random() is not a call.\n"
+        "/* Math.random() in a block comment is not a call either. */\n"
+    )
+    assert gate.randomness_tokens_in(prose) == set()
+
+
+def test_a_trailing_comment_cannot_hide_a_call() -> None:
+    # The conservative direction of _is_comment_only, asserted rather than assumed: only a WHOLLY
+    # commented line is skipped, so putting a // earlier on a code line does not launder the draw.
+    gate = _gate()
+    assert gate.randomness_tokens_in("const n = Math.random(); // harmless, honest\n") == {
+        "Math.random"
+    }
+
+
+def test_an_undocumented_strong_source_is_flagged(tmp_path: Path) -> None:
+    # A sound draw is inventoried, not merely tolerated, so a NEW CSPRNG site is reviewed. This is
+    # the same bidirectional discipline the Python arm applies, reusing the same diff function.
+    gate = _gate()
+    repo = _ts_repo(tmp_path, {"ide/src/other.ts": "const k = randomBytes(32);\n"})
+    violations, _ = gate.check_non_python_randomness(repo)
+    assert any(
+        "ide/src/other.ts" in v and "undocumented randomness use" in v for v in violations
+    ), violations
+    # ...and the anchor itself, which IS documented, must not be flagged in the same run.
+    assert not any(_ANCHOR_REL in v for v in violations), violations
+
+
+def test_an_empty_walk_is_refused_rather_than_reported_clean(tmp_path: Path) -> None:
+    # THE NAMED FAILURE SHAPE. An empty scan and a clean scan must not look alike -- and this whole
+    # item exists because a gate could not see half its corpus while reporting green.
+    gate = _gate()
+    (tmp_path / "ide" / "src").mkdir(parents=True)
+    (tmp_path / "ide" / "README.md").write_text("no sources here\n", encoding="utf-8")
+    violations, scanned = gate.check_non_python_randomness(tmp_path)
+    assert scanned == 0
+    assert any("ZERO" in v and "VACUOUS" in v for v in violations), violations
+
+
+def test_a_missing_walk_root_is_refused(tmp_path: Path) -> None:
+    gate = _gate()
+    violations, scanned = gate.check_non_python_randomness(tmp_path)
+    assert scanned == 0
+    assert any("is not a directory" in v for v in violations), violations
+
+
+def test_a_broken_walk_reds_through_the_stale_anchor(tmp_path: Path) -> None:
+    # THE MUST-FIRE CONTROL, and the reason the inventory carries an anchor row at all. If the walk
+    # ever stops reaching cspNonce.ts -- a moved file, a wrong suffix list, an over-eager prune --
+    # the row is unbacked and the arm reds instead of reporting a clean tree it never read.
+    gate = _gate()
+    repo = _ts_repo(tmp_path, {"ide/src/plain.ts": "export const x = 1;\n"}, with_anchor=False)
+    violations, scanned = gate.check_non_python_randomness(repo)
+    assert scanned == 1, "the walk must have run; this is not the empty-scan case"
+    assert any(_ANCHOR_REL in v and "no longer draws from" in v for v in violations), violations
+
+
+def test_vendor_and_build_trees_are_pruned(tmp_path: Path) -> None:
+    # node_modules is not first-party source, and walking it would bury a real finding under vendor
+    # hits. Pruned here rather than filtered later so the walk stays fast on a developer checkout.
+    gate = _gate()
+    repo = _ts_repo(
+        tmp_path,
+        {
+            "ide/node_modules/pkg/index.js": "const n = Math.random();\n",
+            "ide/out/extension.js": "const n = Math.random();\n",
+            "ide/dist/extension.js": "const n = Math.random();\n",
+        },
+    )
+    violations, scanned = gate.check_non_python_randomness(repo)
+    assert scanned == 1, f"only the anchor is first-party source; scanned {scanned}"
+    assert violations == [], violations
+
+
+def test_the_real_tree_passes_and_the_scan_is_non_trivial() -> None:
+    # END-TO-END on the shipped tree, with the corpus size asserted so a silently-emptied walk can
+    # never satisfy this test by returning no violations.
+    gate = _gate()
+    violations, scanned = gate.check_non_python_randomness(_ROOT)
+    assert violations == [], violations
+    assert scanned > 40, f"the extension's source corpus looks truncated: {scanned} file(s)"
+
+
+def test_the_walk_reaches_both_halves_of_the_extension_corpus() -> None:
+    # Second positive control, for the half of the corpus that does not live under src/: the webview
+    # scripts shipped as static assets. Mirrors the shipped extension-hardening test's own control.
+    gate = _gate()
+    found = {p.relative_to(_ROOT).as_posix() for p in gate.non_python_sources(_ROOT / "ide")}
+    assert _ANCHOR_REL in found
+    assert "ide/media/stepsWebview.js" in found, sorted(found)[:20]
+
+
+def test_the_shipped_anchor_is_both_discovered_and_inventoried() -> None:
+    # Both limbs on purpose (the shape #283 uses for the Python arm): the arm can SEE the site, and
+    # the site is accounted for. Either alone would pass while the other silently rotted.
+    gate = _gate()
+    discovered = gate.discover_non_python(_ROOT / "ide", repo=_ROOT)
+    assert discovered.get(_ANCHOR_REL) == frozenset({"randomBytes"}), discovered.get(_ANCHOR_REL)
+    assert _ANCHOR_REL in gate.NON_PYTHON_INVENTORY
+
+
+def test_non_python_walk_roots_are_declared_and_disjoint_from_the_python_ones() -> None:
+    # The two arms read different file types with different instruments; merging the walk-sets would
+    # let one arm's green stand in for the other's silence.
+    gate = _gate()
+    assert gate.NON_PYTHON_WALK_ROOTS == ("ide",)
+    assert set(gate.NON_PYTHON_WALK_ROOTS).isdisjoint(gate.WALK_ROOTS)
