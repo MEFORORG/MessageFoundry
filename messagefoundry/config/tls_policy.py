@@ -1325,7 +1325,6 @@ def smtp_login_approved(
     password: str,
     *,
     channel_encrypted: bool,
-    escape_permitted: bool,
     cell: str,
 ) -> None:
     """Authenticate over SMTP with an approved hash, and ONLY over an encrypted channel.
@@ -1333,23 +1332,36 @@ def smtp_login_approved(
     TWO HALVES, NEITHER CORRECT ALONE. Restricting the mechanism removes the disallowed hash;
     requiring encryption is what stops that restriction putting a cleartext password on the wire.
 
-    ``escape_permitted`` is the caller's already-clamped
-    ``weakened_tls_escape_permitted`` answer, threaded in rather than read here because this module
-    must not import ``settings`` -- ``settings`` imports THIS one, so the reverse edge is circular.
-    That is the same explicit-posture threading the store hop and the other out-of-gate cells use, and
-    it is the SAME clamped escape governing the LDAPS bind, the MLLP/FTPS contexts, the SFTP host-key
-    acceptance and the webhook sink, so an enforcing-PHI hop is never relaxed by it.
+    **THE CLEARTEXT-AUTH REFUSAL IS ABSOLUTE, and that is the settled posture rather than an
+    omission.** This function shipped with an ``escape_permitted`` parameter documented as the
+    caller's already-clamped ``weakened_tls_escape_permitted`` answer, and the posture threading that
+    would have supplied it was never built: every one of the five shipped call sites passed a literal
+    ``False``, so the escape arm was reachable from the test suite alone. Threading the real posture
+    in would have been the WRONG completion, because all three SMTP cells refuse a
+    username beside ``use_tls=false`` at CONSTRUCTION *even with the escape set* -- the
+    ``refuse_cleartext_credentials`` posture (``transports/rest.py``), which is the shape this repo
+    uses for a CREDENTIAL rather than the escapable shape it uses for a payload hop (the webhook
+    sink, the LDAPS bind, the MLLP/FTPS contexts, the SFTP host-key acceptance). An escapable
+    send-time check behind an absolute construction-time gate is weaker than the gate it backs up,
+    which is how a backstop becomes a hole. So the parameter is gone rather than wired
+    (BACKLOG #1171; zero deployments, so the narrower signature costs nothing).
 
     ``smtplib.SMTP.login`` is deliberately NOT called: its preference order is internal and puts
     CRAM-MD5 first. ``auth()`` is driven directly against the server's advertised list instead.
     """
-    if not channel_encrypted and not escape_permitted:
+    if not channel_encrypted:
+        # NO ESCAPE IS NAMED HERE, deliberately. This text used to end "or set MEFOR_ALLOW_INSECURE_TLS
+        # for a non-PHI hop", which no shipped cell could honour: the construction gate refuses this
+        # combination with that variable set. An operator who followed it would weaken every OTHER hop
+        # on the instance and still be refused here -- remediation advice resting on a false premise.
         raise InsecureHopRefused(
             f"{cell}: refusing SMTP AUTH over an unencrypted channel. The approved mechanisms "
             f"({', '.join(APPROVED_SMTP_AUTH_MECHANISMS)}) SEND THE PASSWORD, so authenticating "
             "without TLS would put it on the wire in clear -- which is why the mechanism restriction "
-            "and this refusal ship together. Enable STARTTLS for this connection, or set "
-            "MEFOR_ALLOW_INSECURE_TLS for a non-PHI hop (BACKLOG #1171, ASVS 11.4.1)."
+            "and this refusal ship together. Enable STARTTLS for this connection, or drop the "
+            "username/password to send unauthenticated. There is no escape for this one: it is the "
+            "same absolute cleartext-credential refusal the connector applies at construction "
+            "(BACKLOG #1171, ASVS 11.4.1)."
         )
     smtp.ehlo_or_helo_if_needed()
     if not smtp.has_extn("auth"):
