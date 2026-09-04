@@ -22066,3 +22066,64 @@ So `test_the_script_prefers_its_own_repo_over_an_earlier_path_entry` supplies th
 **Verification:** 8 passed in `tests/test_webconsole_seam_snapshot.py`. Mutation check run rather than argued -- with the `sys.path.insert` line deleted, the decoy test reds naming the decoy import, and the by-path digest test **stays green**, which is the luck described above measured rather than predicted. Anchor restored, 8 passed again.
 
 **Adjacent and NOT fixed here, named rather than numbered.** `docs/WEBCONSOLE-PACKAGE.md`'s seam-refresh procedure is stale in three steps left behind by #1220: it says to bump `ENGINE_UI_SEAM` by hand (`1` to `2`) when the value is a derived digest, it says to update curated lists in this script that #1220 retired, and its step 5 prescribes `python scripts/webconsole_seam_snapshot.py > tests/golden/...`, the shell redirect this script's own docstring forbids because PowerShell's `>` writes UTF-16LE with a BOM into a file the test reads as UTF-8. That is doc drift with its own cause and it wants its own item; folding a documentation rewrite into a `sys.path` fix would make both harder to review.
+
+---
+
+## 1448. a dispatched brief is frozen at spawn: the chip cannot be corrected and nothing tells the receiver it has drifted
+
+> 🔢 **FILED 2026-09-04 by the session that read the stale brief.** Not started. A **fleet-process** defect with no engine, PHI or deployment axis (sec. 0) -- nothing here reaches a running instance, because there are none. What it would cost is duplicated Builder turns and a prose merge conflict a human then resolves by hand.
+
+**The defect in one sentence: a chip is a snapshot of the tree at spawn, and once the receiver has started it there is no path to correct it and no signal that it needs correcting.**
+
+`CLAUDE.md` sec. 5 already says *"The brief is disposable. The BACKLOG item is the record."* That covers a brief being **thrown away**. It does not cover a brief being **wrong** by the time it is read, and those are different failures with opposite remedies: a disposable brief you may ignore, a stale one you must first detect.
+
+### The measured incident, 2026-09-04
+
+**#1443 and #1445 are allocated and open in PRs 837 and 859; neither is on `main` yet**, so `dangling_citation_check.py` reports both unresolved until they land. #1439 is on main. Cited anyway, per the rule in `CLAUDE.md` sec. 5 that an allocated-but-unlanded number is cited and said so.
+
+A session working **#1443** raised a task chip naming three drift sites. Item 3 was a docstring in `scripts/webconsole_seam_snapshot.py`.
+
+Minutes later the author of that line -- working **#1439**, and declining to open a competing branch over two comment blocks -- handed the same fix to the spawning session directly. It took it and pushed `c2f549f42` on **PR 837**. **That was the correct call**: the session already in the file is the cheapest place for the change.
+
+**The chip was already dispatched, and the spawner then had nowhere to put that fact.** `dismiss_task` withdraws only a chip the user has **not** yet acted on; this one had been started, so it stayed live, frozen, and wrong.
+
+***THE SHARPEST PART OF THIS ROW IS THAT THE RECORD WAS UPDATED AND ONLY THE CHIP WAS NOT.*** #1443's own body carries the handover in the same change, under the heading *"ONE MORE SIBLING WAS TAKEN, ON A HANDOVER"*. So the spawner did exactly what sec. 5 prescribes -- the BACKLOG item is the record, and it corrected the record -- **and the receiver was reading the other artifact, the one with no update path.**
+
+**The receiver -- PR 859, working #1445 -- avoided the duplicate for a reason that does not generalise.** It read PR 837's diff at hunk granularity before touching anything and saw both comment blocks already rewritten. Had it trusted the brief, two PRs would have rewritten the same two hunks and met at merge, with the Lander resolving prose by hand.
+
+### Two more of the same brief's items failed to survive a read of their sources, and they are three different faults
+
+**A brief that drifts once has usually drifted more than once**, because the tree moves and the brief does not, so the count of bad items tracks elapsed time rather than the author's care. But the three faults below have three different causes, and a fix aimed at one will not touch the others.
+
+| item | what the brief said | what the source says | fault |
+|---|---|---|---|
+| 3 | fix the docstring in `scripts/webconsole_seam_snapshot.py` | already fixed and pushed as `c2f549f42` | **stale** -- correct at spawn, overtaken |
+| 1 | delete one line, `messagefoundry_webconsole/__init__.py:29` | the deletion makes the file **worse**. Verified by reading: `:29` is a truncated fragment ending on the word "the"; removing it alone puts the pre-#279 range framing on `:27-28` (*"A pair outside this set"*, *"PEP 508 compat range"*) directly against its contradiction on `:30-31` (*"EXACTLY the engine seam it was built against -- deliberately a single value, not a range"*). The correct fix is a three-line rewrite. | **wrong when written** -- never true, not stale |
+| adjacency | `docs/adr/0143-...md` is "adjacent, probably leave alone" | #1443's carve-out **does** list it, among *"Three more, all in the #1220 class and all deliberately out of this diff"* -- **and the same sentence argues against fixing it**, that *"an accepted ADR records what was true when written and is better left dated than edited"* | **a compression of a source that says two things.** The brief is defensible here; what it is not is a substitute for reading the carve-out |
+
+***THE THIRD ROW IS RECORDED AGAINST THIS ITEM'S OWN INTEREST, AND DELIBERATELY.*** It was reported to this session as a plain staleness -- the brief deferring a site the carve-out wanted fixed -- and the source does not support that reading. A row asserting the brief was wrong there would be a stale citation of exactly the kind this item exists to describe. **It still supports the rule**, because the receiver's recovery is the same in all three cases: go read the source, not the brief's one-line summary of it.
+
+### THE DEFECT IS THE MECHANISM, NOT THE AUTHOR
+
+Handing item 3 to the session already in that file was right, and re-cutting the chip is not an option anyone declined -- **it does not exist**. Read this row as an argument about the channel: **a dispatch artifact with no update path and no staleness signal will eventually be acted on stale, and the only thing standing between that and a hand-resolved merge conflict is a receiver who happens to verify.**
+
+### Family, and why this is NOT folded into #1391
+
+**#1391 is the same family and is cited rather than extended** -- both are a dispatch artifact that is wrong by the time it is used. The mechanisms and the fixes are disjoint:
+
+| | #1391 | this row |
+|---|---|---|
+| when it goes wrong | **at generation.** `respawn.ps1:1339`/`:1426` emit a relative command rooted at the predecessor's checkout, so the brief is wrong the instant it is written | **after dispatch.** The brief was correct at spawn and the tree moved underneath it |
+| candidate fixes | an absolute path in the brief, or `seat.ps1` keying on the session rather than the invoking tree | a chip that cites the record instead of restating it, or a head-SHA stamp the receiver can diff from |
+
+Neither fix does anything for the other row. **#1391's own body warns that "a fix aimed at the wrong half will look like it worked on the seats that were never affected"** -- folding these together would build that trap on purpose.
+
+### What a fix looks like, smallest first
+
+1. **Prose, and it is already written.** `CLAUDE.md` sec. 5 now tells the receiver to verify a brief against the tree before acting, and tells whichever seat dispatched to mail the receiver when it takes an item back. **That is a workaround, not a mechanism.** It costs the receiver a diff read per named PR, and it fails silently the first time somebody skips it.
+2. **A chip that cites the record rather than restating it.** Sec. 5 already names the BACKLOG item as the record, and the incident above shows the record staying accurate while the chip did not. A chip reduced to a citation would let the spawner correct the item and have the receiver read the correction. **Unmeasured:** nobody has checked whether a citation alone carries enough for a cold receiver, which is the whole reason briefs restate.
+3. **A staleness signal.** Stamp the chip with the head SHA of every branch it names, so the receiver can diff from a known point rather than guessing what moved.
+
+**Do not start at 3.** The receiver already recovers by reading diffs, so a signal telling it to do what it already does buys the least of the three. **Measure first how often a chip outlives its own accuracy** -- this row is a population of one, and one incident cannot tell a rare race from a routine one.
+
+**Cluster:** Fleet coordination. **Priority:** unscored -- filed after the 2026-09-03 scoring pass, so it carries no row in the ranking table above. **Verdict:** build (small), pending that measurement. **Severity:** no engine effect, no PHI axis, no deployment axis (sec. 0). It costs duplicated Builder turns and prose conflicts resolved by hand.

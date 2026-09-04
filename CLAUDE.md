@@ -335,6 +335,18 @@ went red, and no workflow reads that label back. So the Console finds both by as
    at spawn, because no hook will invent a goal, by design: a machine that invents one writes a
    record that looks declared and says nothing.
 
+6. **A dispatched brief can go stale between spawn and read, and nothing will tell you.** Verify it
+   against the tree before you act on it: read the diff of **every PR it names**, at hunk
+   granularity, and re-locate every line number by symbol. **Where the brief and the tree disagree,
+   the tree wins.** Measured 2026-09-04: a chip named three drift sites, and minutes later the
+   spawner took item 3 itself and pushed it as `c2f549f42` on PR 837. The receiver read that diff
+   before touching anything, saw both hunks already rewritten, and skipped it. Trusting the brief
+   would have put two PRs on the same two comment blocks, to meet at merge with the Lander
+   resolving prose by hand. **Two of the same brief's other three items also failed to survive a
+   read of their sources**, so one confirmed drift is a reason to re-check the rest, not to correct
+   that line and carry on. ***"The brief is disposable" above says it may be thrown away; it does
+   not say it was true when written.*** BACKLOG #1448, same family as #1391.
+
 ### The Console plans, spawns, and holds the owner's attention
 
 - **Plan first, then spawn.** For anything past a trivial change the Console produces a plan and
@@ -346,6 +358,13 @@ went red, and no workflow reads that label back. So the Console finds both by as
 - One brief per Builder. After about two failed attempts at the same problem, spawn a fresh Builder
   with a better brief rather than reuse a poisoned context. A Builder cannot do this. When you are
   stuck after two attempts, push what is green and say in the PR body that the brief needs re-cutting.
+- **If you take back part of a brief you already dispatched, mail the receiver, because you cannot
+  update the chip.** `dismiss_task` withdraws only a chip the user has **not** acted on, so a
+  started one stays live and frozen around your stale text, and no channel carries the correction.
+  Say which item is already done and where it landed. **This binds whichever seat dispatched, not
+  only the Console:** any seat can raise a chip, and in the 2026-09-04 case above the spawner was
+  the session that then pushed the fix. It corrected its own BACKLOG item in the same change and
+  still could not reach the chip, which is the whole shape of the defect -- BACKLOG #1448.
 - Give each session its own git worktree (`scripts/worktree/new.ps1 -Name <x>`, cleanup with
   `remove.ps1`). Each gets an isolated checkout, branch and `.venv` on the same remote and the same
   PR flow. See [`docs/WORKTREES.md`](docs/WORKTREES.md). The AI project memory is shared across
