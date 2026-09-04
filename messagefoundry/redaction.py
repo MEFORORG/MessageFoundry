@@ -34,11 +34,31 @@ _DEFAULT_LIMIT = 200
 #: exception — the realistic vector. The segment ID is kept (not PHI, useful); the field data is cut.
 _HL7_SEGMENT = re.compile(r"\b([A-Z][A-Z0-9]{2})\|[^\r\n]*")
 #: A run carrying **≥2 HL7 delimiters** (``| ^ ~ &``) — a field/component dump like ``100^^^H^MR`` or
-#: ``DOE^JANE^M`` that may be PHI even without a segment header. The non-delimiter runs use **possessive**
-#: quantifiers (``*+``, Python 3.11+): the char classes are disjoint from the delimiters, so possessive
-#: matching can't change *what* matches, but it makes the scan **linear** — a long delimiter-free run
-#: (e.g. ``"a"*5000`` in a hostile exception string) can't trigger quadratic backtracking.
-_HL7_FIELD_RUN = re.compile(r"[^\s|^~&]*+[|^~&][^\s|^~&]*+(?:[|^~&][^\s|^~&]*+)+")
+#: ``DOE^JANE^M`` that may be PHI even without a segment header.
+#:
+#: **Two guards, and the possessive one alone did not deliver what it claimed (BACKLOG #1437).** The
+#: non-delimiter runs use **possessive** quantifiers (``*+``, Python 3.11+): the char classes are
+#: disjoint from the delimiters, so possessive matching cannot change *what* matches, and it removes
+#: backtracking inside a single match attempt. That saving is real but small, about 2x, and it does
+#: **not** make the scan linear, because the cost here was never backtracking. The leading
+#: ``[^\s|^~&]*+`` can match empty, so the engine RESTARTS the pattern at every offset, and inside one
+#: long delimiter-free run each restart re-scans the rest of the run. That is quadratic either way.
+#: Measured 2026-09-03: a 20,000-character run cost **1.05 s** possessive and **2.09 s** greedy.
+#:
+#: The leading ``(?<![^\s|^~&])`` is what makes it linear. It admits a match only where the previous
+#: character is whitespace, a delimiter, or start-of-string, so a delimiter-free run gets ONE attempt
+#: instead of one per character and every other offset fails the lookbehind in constant time. Same
+#: input, same box: **0.37 ms**, about 2,800x faster. It is the exact complement of the character class
+#: that follows it, so it cannot change what matches — verified against the pre-guard pattern over
+#: 200,000 randomized delimiter-heavy strings with zero disagreements. ``\b`` would NOT do: ``-``,
+#: ``.`` and ``:`` are word boundaries but are also inside ``[^\s|^~&]``, so ``\b`` would drop them
+#: from the front of a redacted span.
+#:
+#: This matters because the input is not bounded. :func:`safe_text` truncates *after* :func:`redact`
+#: has run, and the logging handler filter in :mod:`messagefoundry.logging_setup` redacts whole
+#: rendered tracebacks with no bound at all — on whatever thread emitted the record, which for the
+#: engine is the asyncio event loop.
+_HL7_FIELD_RUN = re.compile(r"(?<![^\s|^~&])[^\s|^~&]*+[|^~&][^\s|^~&]*+(?:[|^~&][^\s|^~&]*+)+")
 
 #: A **date / birthdate run** in free text: an ISO ``YYYY-MM-DD`` / US ``MM-DD-YYYY`` (``-`` or ``/``
 #: separator) or a bare HL7 8-digit ``YYYYMMDD``. A DOB is a direct identifier, and a free-text leak like
