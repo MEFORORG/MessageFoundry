@@ -18777,6 +18777,45 @@ unmergeable, with the reason recorded only in a run list nobody looks at.** Read
    the PR. A dequeue looks identical to never having been queued -- and `autoMergeRequest` reads
    `null` in both states, so the obvious field cannot distinguish them either (Instruments 4.15c).
 
+**2026-09-03 -- the hostile-disposition limb is fixed, and limb 1's own recommendation above is the
+thing that was wrong.** That line says a linear-time assertion "can be restated as a ratio between two
+input sizes rather than an absolute bound". **It already was one**, and the ratio is what ejected PR
+669: **8.02 against a bound of 8.0, a 0.25 percent margin.** Re-run 15 times on an IDLE box, that same
+statistic ranged **3.73 to 6.80** -- 85 percent of the way to its own bound with nothing else competing
+for the core. A ratio is steadier than a wall-clock budget only where the budget would have thin
+headroom, and here it would not. On a 12,000-character hostile header `parse_single_file_upload` costs
+**0.16 ms** with the shipped pattern and **0.7 s** with the pre-guard one, a separation of about
+**3,900x**, so a 0.05 s budget sits **290x** above the shipped cost and **13x** below the quadratic
+one. The ratio compressed that separation into 4-versus-16 and then put the noise in the NUMERATOR,
+where a `min` over reps clamps deflation and nothing clamps inflation.
+
+**The fix is a different measurement, not a wider number.** `tests/test_multipart.py` now times the
+shipping `parse_single_file_upload` against one `_SCAN_BUDGET_SECONDS` line, with the pre-guard pattern
+swapped into that same path as a live positive control that must EXCEED the same line -- so a budget
+nothing could ever breach, or an input that quietly stopped being hostile, reds instead of passing
+quietly. Timing the real entry point also let the size-cap arm stop describing its ordering claim and
+start asserting it, with a sentinel pattern that raises if the header scan reaches it. The arm is
+renamed `test_a_hostile_disposition_header_stays_inside_the_scan_budget`; the run tables above name
+`test_hostile_disposition_header_parses_in_linear_time`, which is a record of what failed on
+2026-08-29 rather than a live path.
+
+**The mutation pair, one variable changed.** The mutation moves the `_MAX_PART_HEADER_BYTES` refusal
+below `_disposition`, which is the regression that hands the header scan a body-sized input again:
+
+| Test body | Result under the SAME mutation |
+|---|---|
+| new | **1 failed, 20 passed** in 1.3 s -- the sentinel names the scan that should not have run |
+| old | **19 passed** in 0.8 s -- completely invisible |
+
+A second mutation, removing the `(?<!\w)` guard itself, reds under both bodies but not comparably. The
+new body reports `0.6031s against a 0.05s budget` in **4.6 s**; the old body needs **101 s** to reach
+its assertion, and under the configured 60 s per-test watchdog it never reaches it at all -- it is
+killed mid-`findall` inside a C call the thread-method watchdog cannot interrupt, which is this row's
+own "process-level deadlock below pytest" shape.
+
+**Still open on this row:** the SQL Server limb, the `merge_group` visibility half, and
+`tests/test_api_request_timeout.py` (open in PR 789, not on `main`).
+
 **Do not close this by re-running the queue until it passes.** That is what happened three times
 already, and it produces a green that means "this attempt got lucky", not "the change is sound".
 
