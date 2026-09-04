@@ -1,0 +1,171 @@
+# Say that a finished, green, UNREAD pull request exists, without anyone going to look.
+#
+# WHY THIS EXISTS (BACKLOG #1413). `a reviewer has read this` became a required context on 2026-08-31.
+# The gate is correct and fail-closed and this workflow does not touch it. The missing half was the
+# other side: nothing anywhere reported that a pull request was sitting green and unread, so it waited
+# until a person happened to look. The item's census is in BACKLOG.md and is not restated here.
+#
+# TWO CHANNELS, AND THEY ARE NOT THE SAME THING. Saying so plainly, because failure-signal.yml had to:
+#
+#   * THE COMMENT IS THE PUSH. It reaches a PERSON. GitHub notifies everyone subscribed to a pull
+#     request when a comment lands, and the mention raises it to the `mention` reason, which survives
+#     a participating-only notification filter. This is the one GitHub route that is NOT suppressed
+#     for a pull request's own author -- and author-suppression is exactly why CODEOWNERS routing,
+#     which works on a dependabot pull request, is inert on the self-authored ones that are nearly all
+#     of ours. The mention is READ FROM `.github/CODEOWNERS`, not hardcoded, so adding a second
+#     maintainer widens it with no edit here.
+#   * THE LABEL IS NOT A PUSH, and must not be described as one. It collapses "fetch a check rollup
+#     per pull request" into `gh pr list --label unread`, which is the difference between a poll a
+#     SEAT can afford to run and one it cannot. Same claim, same limits, as `ci-red`.
+#
+# WHY `workflow_run` AND NOT `pull_request`. The state becomes true when the LAST required check goes
+# green, which is a workflow COMPLETING -- there is no pull_request event at that moment. `workflow_run`
+# also runs from the default branch with its own permissions and, unlike `pull_request_target`, never
+# executes code from the head. failure-signal.yml and nightly-notice.yml already use it.
+#
+# NOT REQUIRED, AND MUST NOT BECOME REQUIRED. It reports a fact ABOUT a pull request from outside that
+# pull request's own event, on the same reasoning stalled-prs.yml records for itself. It also fires on
+# a `workflow_run`, which reports no status context to the head at all.
+#
+# WHAT IT DELIBERATELY DOES NOT DO: apply the `reviewed` label. That is the fail-open design the gate's
+# author already rejected -- a gate whose safe state depends on another workflow having succeeded is
+# not a gate -- and the reasoning is in review-gate.yml's own header. Nothing here writes that label.
+#
+# THE TWO TRAPS IT HAS TO DODGE ARE BOTH IN scripts/ci/check_unread_prs.py's header, in full:
+# `mergeStateStatus` collapses to one value with precedence and is never read (it is not even
+# requested), and the review gate's own conclusion is not evidence in either direction, so the LIVE
+# `reviewed` label is what gets read.
+#
+# THE MERGE-QUEUE SEAM. The PR resolver below is failure-signal.yml's, including the
+# `gh-readonly-queue/<base>/pr-<N>-<sha>` parse, so anything that wants to attribute a merge-queue
+# event to the pull request it ejected has one shape to copy rather than two.
+
+name: unread signal
+
+on:
+  workflow_run:
+    # Every workflow that reports a REQUIRED context. The state becomes true when the last of them
+    # settles, and there is no way to know in advance which that is -- so all of them trigger an
+    # evaluation, and the ones that are too early simply find the rollup unsettled and do nothing.
+    # `review gate` is in the list so that labelling a pull request `reviewed` re-runs that gate,
+    # which re-triggers this, which withdraws the `unread` label. That is what makes it self-clearing.
+    workflows: [CI, Security, backlog-hygiene, review gate, CLA Assistant]
+    types: [completed]
+  workflow_dispatch:
+    inputs:
+      pr:
+        description: "Pull request number to re-evaluate"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  # Keyed on the PULL REQUEST, not on the run -- the opposite of failure-signal.yml, and deliberately.
+  # Two workflows failing on one head are two facts and collapsing them would drop one. Two runs
+  # asking "is this pull request unread" are the SAME fact, and letting them overlap would post the
+  # comment twice. `cancel-in-progress: false` serialises instead of cancelling: the second run then
+  # sees the label the first added and returns `keep`, which is the whole idempotency mechanism.
+  group: unread-signal-${{ github.event.workflow_run.head_branch || inputs.pr }}
+  cancel-in-progress: false
+
+jobs:
+  announce:
+    # UNIQUE, AND FREE OF `${{ }}`. tests/_workflow_contexts.py keys every reportable context by this
+    # string and expands an expression to a `.+` wildcard, so a templated or colliding name here would
+    # silently re-map an existing REQUIRED context onto this job.
+    name: announce an unread pull request
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write # add/remove one label and post one comment; no other write scope
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.14"
+
+      # No pip install: the script is stdlib-only and shells out to `gh`, preinstalled on the runner.
+
+      - name: Find the pull request behind this run, if there is one
+        id: resolve
+        env:
+          # EVERY value below is attacker-influenceable -- a branch name is chosen by whoever opened
+          # the branch. They go through the environment and are matched against a strict pattern.
+          # Interpolating them into the script body would be a template-injection hole.
+          PR_FROM_EVENT: ${{ toJSON(github.event.workflow_run.pull_requests) }}
+          HEAD_BRANCH: ${{ github.event.workflow_run.head_branch }}
+          RUN_EVENT: ${{ github.event.workflow_run.event }}
+          DISPATCH_PR: ${{ inputs.pr }}
+        run: |
+          set -euo pipefail
+          pr=""
+          if [ -n "${DISPATCH_PR:-}" ]; then
+            # Anchored, so a dispatch input can only ever be digits.
+            pr="$(printf '%s' "$DISPATCH_PR" | grep -oE '^[0-9]+$' || true)"
+          else
+            # `type == "array"` guards the null this key holds on a non-workflow_run event.
+            pr="$(printf '%s' "$PR_FROM_EVENT" | jq -r 'if type == "array" and length > 0 then .[0].number else "" end')"
+
+            # A merge-queue run has no pull_requests entry. Its ref carries the number instead.
+            if [ -z "$pr" ] && [ "${RUN_EVENT:-}" = "merge_group" ]; then
+              pr="$(printf '%s' "$HEAD_BRANCH" | grep -oE 'pr-[0-9]+' | head -1 | cut -d- -f2 || true)"
+            fi
+          fi
+
+          if [ -n "$pr" ]; then
+            echo "pr=$pr" >> "$GITHUB_OUTPUT"
+            echo "Resolved to pull request $pr"
+          else
+            echo "pr=" >> "$GITHUB_OUTPUT"
+            echo "No pull request behind this run; event was ${RUN_EVENT:-workflow_dispatch}"
+          fi
+
+      - name: Decide whether it is green and unread
+        id: decide
+        if: steps.resolve.outputs.pr != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ steps.resolve.outputs.pr }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          python scripts/ci/check_unread_prs.py \
+            --repo "$REPO" --pr "$PR" --body-out unread-comment.md
+
+      # THE ONE WRITE THAT ANNOUNCES. Guarded on `flag`, which the script returns only on the
+      # TRANSITION into the state -- the label is its own idempotency token, so a pull request is
+      # announced once per unread episode rather than once per completed workflow.
+      - name: Flag it, and say so where a person will see it
+        if: steps.decide.outputs.action == 'flag'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ steps.resolve.outputs.pr }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          # Idempotent by intent: the label survives between runs, so creation only matters once.
+          # The failure is PRINTED rather than sent to /dev/null, so "it already exists" stays
+          # distinguishable from "the token cannot create labels".
+          gh label create unread --repo "$REPO" --color FBCA04 \
+            --description "Green and mergeable, but not marked read. Read it, then add: reviewed" \
+            || echo "could not create label 'unread' (it most likely exists already); continuing"
+          gh pr edit "$PR" --repo "$REPO" --add-label unread
+          gh pr comment "$PR" --repo "$REPO" --body-file unread-comment.md
+
+      # NO SWALLOWED EXIT CODE HERE, and that is why the script distinguishes `clear` from `none`:
+      # `clear` means the label IS present and should not be, so the removal cannot fail for the
+      # ordinary reason. A `|| true` here would hide a token problem instead.
+      - name: It is no longer unread, so withdraw the flag
+        if: steps.decide.outputs.action == 'clear'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ steps.resolve.outputs.pr }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          gh pr edit "$PR" --repo "$REPO" --remove-label unread

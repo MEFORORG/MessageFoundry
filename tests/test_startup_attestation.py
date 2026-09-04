@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+from collections.abc import Sequence
 from importlib.metadata import PathDistribution
 from pathlib import Path
 
@@ -33,6 +34,7 @@ from messagefoundry.integrity import (
     run_startup_attestation,
 )
 from messagefoundry.pipeline.alerts import AlertSink
+from messagefoundry.security import handler_semgrep_rules
 from messagefoundry.store import open_store, sqlite_settings
 
 
@@ -49,25 +51,31 @@ def _build_wheel_install(
     files: dict[str, bytes],
     editable: bool = False,
     extra_record_rows: tuple[str, ...] = (),
+    assets: dict[str, bytes] | None = None,
 ) -> tuple[PathDistribution, list[Path]]:
     """Lay out a fake site-packages install: the package source + a ``*.dist-info/RECORD`` baseline.
 
     Returns the ``PathDistribution`` for the dist-info and the list of on-disk package ``.py`` paths
     (the "loaded module files"). When ``editable`` the RECORD lists only a ``.pth`` finder (no package
     source rows) and a ``direct_url.json`` with ``dir_info.editable=true`` — exactly what pip writes.
+
+    ``assets`` are shipped **data** files (BACKLOG #1432): written and RECORDed exactly like source,
+    but deliberately kept OUT of the returned ``loaded`` list, because the engine reaches them through
+    the separate :func:`~messagefoundry.integrity._attested_asset_files` seam. A test that wants them
+    attested passes them to ``_patch(..., assets=...)``; that split is what lets a test isolate the
+    asset half from the module half.
     """
     root.mkdir(parents=True, exist_ok=True)
     pkg_dir = root / pkg
     pkg_dir.mkdir(parents=True, exist_ok=True)
-    loaded: list[Path] = []
     record_rows: list[str] = []
-    for rel, data in files.items():
+    for rel, data in {**files, **(assets or {})}.items():
         p = root / rel
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_bytes(data)
-        loaded.append(p.resolve())
         if not editable:
             record_rows.append(f"{rel},{_record_hash(data)},{len(data)}")
+    loaded = [(root / rel).resolve() for rel in files]
 
     dist_info = root / f"{pkg}-1.0.dist-info"
     dist_info.mkdir(parents=True, exist_ok=True)
@@ -85,9 +93,19 @@ def _build_wheel_install(
 
 
 def _patch(
-    monkeypatch: pytest.MonkeyPatch, dist: PathDistribution, loaded: list[Path], pkg: str
+    monkeypatch: pytest.MonkeyPatch,
+    dist: PathDistribution,
+    loaded: list[Path],
+    pkg: str,
+    *,
+    assets: Sequence[Path] = (),
 ) -> None:
-    """Point the integrity module at the fabricated install (dist name + loaded-files lookup)."""
+    """Point the integrity module at the fabricated install (dist name + the two file lookups).
+
+    ``assets`` defaults to **none declared**, so a test that says nothing about assets attests only
+    modules — the pre-#1432 behaviour — and cannot be accidentally passed or failed by the real
+    engine's own shipped assets leaking into a fabricated install root.
+    """
     monkeypatch.setattr(integ, "_DIST_NAME", pkg)
 
     def _fake_distribution(name: str) -> PathDistribution:
@@ -96,6 +114,7 @@ def _patch(
 
     monkeypatch.setattr(integ.metadata, "distribution", _fake_distribution)
     monkeypatch.setattr(integ, "_loaded_module_files", lambda: sorted(loaded))
+    monkeypatch.setattr(integ, "_attested_asset_files", lambda: list(assets))
 
 
 class _RecordingSink(AlertSink):
@@ -337,3 +356,240 @@ def test_added_module_without_record_entry_is_drift(
 
     result = attest_engine()
     assert any(d.reason == "missing" and d.path.endswith("backdoor.py") for d in result.drift)
+
+
+# --- BACKLOG #1432: shipped security DATA assets are attested too --------------
+#
+# Attesting only ``.py`` left a control that a non-``.py`` file decides. Truncating the bundled
+# common-password corpus to zero bytes makes ``_common_passwords()`` an empty set, so
+# ``PasswordPolicy.violations`` stops emitting "not be a common or breached password" — breach
+# screening becomes a silent no-op with no engine module touched, and attestation said clean.
+
+#: The corpus relpath inside the fake install; the same *shape* as the real shipped asset.
+_ASSET = "mfengine/auth/data/common_passwords.txt"
+_CORPUS = b"password\nqwerty\nhunter2\n"
+
+
+def _install_with_asset(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, declare_asset: bool
+) -> Path:
+    """Fake wheel install carrying one data asset. ``declare_asset`` is the single variable under
+    test: it decides whether the asset is in the attested set, and nothing else differs."""
+    pkg = "mfengine"
+    dist, loaded = _build_wheel_install(
+        tmp_path,
+        pkg=pkg,
+        files={f"{pkg}/__init__.py": b"VERSION = '1.0'\n"},
+        assets={_ASSET: _CORPUS},
+    )
+    asset = (tmp_path / _ASSET).resolve()
+    _patch(monkeypatch, dist, loaded, pkg, assets=(asset,) if declare_asset else ())
+    return asset
+
+
+def test_declared_asset_is_attested_clean(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """An untampered declared asset is compared against RECORD and counted — not skipped."""
+    _install_with_asset(tmp_path, monkeypatch, declare_asset=True)
+
+    result = attest_engine()
+    assert result.attested is True and result.ok and result.drift == []
+    # 2 = the one module + the one asset. A skipped asset would leave this at 1, so the count is
+    # what proves the asset was actually hashed rather than merely not drifting.
+    assert result.checked == 2
+
+
+def test_truncated_security_asset_is_drift(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """POSITIVE CONTROL — the #1432 attack itself: the corpus is truncated to zero bytes in place
+    after the RECORD baseline was sealed, and attestation MUST report it."""
+    asset = _install_with_asset(tmp_path, monkeypatch, declare_asset=True)
+    asset.write_bytes(b"")  # neutered: an empty corpus screens nothing
+
+    result = attest_engine()
+    assert not result.ok
+    assert [(d.path, d.reason) for d in result.drift] == [(_ASSET, "hash_mismatch")]
+
+
+def test_truncated_asset_is_INVISIBLE_when_not_declared(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The paired arm. Identical install, identical truncation, one variable changed: the asset is not
+    in the attested set. Attestation reports CLEAN.
+
+    Two things it establishes, and one it does not.
+
+    It shows **declaring** the asset is what causes the detection above: the fixture writes the file
+    and gives it a RECORD row in both arms, so nothing else can account for the difference. It also
+    pins that ``attest_engine`` attests what the two lookups hand it and never walks the install root
+    on its own — the asset has a RECORD row here and is still not compared, which is what stops the
+    tripwire quietly growing into "everything pip installed".
+
+    It is NOT a control on the composition in ``attest_engine``, and it cannot be one: both lookups
+    are monkeypatched, so no production enumeration runs. It passes with the widening reverted. That
+    control is run by hand — reverting the composed loop fails the four tests around this one.
+    """
+    asset = _install_with_asset(tmp_path, monkeypatch, declare_asset=False)
+    asset.write_bytes(b"")
+
+    result = attest_engine()
+    assert result.ok and result.drift == []
+    assert result.checked == 1  # the module only
+
+
+def test_deleted_security_asset_is_drift(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Deleting a declared asset is tampering too. It must not read as clean just because the file
+    the walk would have hashed is no longer there."""
+    asset = _install_with_asset(tmp_path, monkeypatch, declare_asset=True)
+    asset.unlink()
+
+    result = attest_engine()
+    assert not result.ok
+    assert [(d.path, d.reason) for d in result.drift] == [(_ASSET, "missing")]
+
+
+async def test_asset_drift_alerts_and_records(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Asset drift runs the same audit + alert + fail-closed path as module drift — the tripwire is
+    widened, not forked."""
+    import json
+
+    asset = _install_with_asset(tmp_path, monkeypatch, declare_asset=True)
+    asset.write_bytes(b"")
+
+    store = await open_store(sqlite_settings(str(tmp_path / "asset.db")))
+    sink = _RecordingSink()
+    try:
+        with pytest.raises(IntegrityError):
+            await run_startup_attestation(store, sink, fail_closed_on_drift=True)
+        rows = [a for a in await store.list_audit() if a["action"] == "startup_integrity"]
+        assert rows, "asset drift must record the startup_integrity row before refusing to start"
+        detail = json.loads(rows[0]["detail"])
+        assert detail["drift"] == [_ASSET] and detail["drift_reasons"] == ["hash_mismatch"]
+        assert sink.events and sink.events[-1][0] == "engine-integrity"
+    finally:
+        await store.close()
+
+
+@pytest.mark.parametrize(
+    ("label", "corpus"),
+    [("lf", b"password\nqwerty\nhunter2\n"), ("crlf", b"password\r\nqwerty\r\nhunter2\r\n")],
+)
+def test_line_endings_alone_never_report_tampering(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, label: str, corpus: bytes
+) -> None:
+    """A line-ending difference in a declared asset must NOT read as tampering.
+
+    ``messagefoundry/auth/data/common_passwords.txt`` has no ``.gitattributes`` byte policy, so under
+    ``core.autocrlf=true`` a Windows checkout holds CRLF where the committed blob holds LF. Four
+    sessions independently read that as a false-alarm hazard for this tripwire. **It is not**, and the
+    reason is worth pinning rather than re-deriving: ``RECORD`` is written by the *installer* from the
+    bytes it unpacked, so the baseline and the installed file are the same bytes on the same host
+    whatever git did upstream. A CRLF wheel carries CRLF content AND a CRLF-derived digest.
+
+    Both arms attest clean, which is the property. The missing ``-text`` pin is a real
+    reproducible-builds defect -- two platforms build byte-different wheels from one commit -- but it
+    is a separate one, and this tripwire cannot be the thing that reports it.
+    """
+    pkg = "mfengine"
+    asset = f"{pkg}/auth/data/common_passwords.txt"
+    dist, loaded = _build_wheel_install(
+        tmp_path,
+        pkg=pkg,
+        files={f"{pkg}/__init__.py": b"VERSION = '1.0'\n"},
+        assets={asset: corpus},
+    )
+    _patch(monkeypatch, dist, loaded, pkg, assets=((tmp_path / asset).resolve(),))
+
+    result = attest_engine()
+    assert result.ok and result.drift == [], f"{label} install must attest clean"
+    assert result.checked == 2
+
+
+def test_a_swap_of_line_endings_AFTER_install_is_still_drift(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The control on the test above, and the arm that keeps it from being vacuous.
+
+    The pair only means something if the digest is genuinely byte-exact. Here the RECORD baseline is
+    sealed over LF and the on-disk file is then rewritten as CRLF -- a state ``pip`` cannot produce,
+    since it writes RECORD from what it unpacked, but one an in-place editor can. That MUST drift.
+
+    So both readings are pinned at once: identical-by-construction line endings are clean, and a
+    post-install rewrite is caught even when it changes nothing a human would call content.
+    """
+    pkg = "mfengine"
+    asset = f"{pkg}/auth/data/common_passwords.txt"
+    dist, loaded = _build_wheel_install(
+        tmp_path,
+        pkg=pkg,
+        files={f"{pkg}/__init__.py": b"VERSION = '1.0'\n"},
+        assets={asset: b"password\nqwerty\nhunter2\n"},
+    )
+    path = (tmp_path / asset).resolve()
+    _patch(monkeypatch, dist, loaded, pkg, assets=(path,))
+    path.write_bytes(b"password\r\nqwerty\r\nhunter2\r\n")
+
+    result = attest_engine()
+    assert [(d.path, d.reason) for d in result.drift] == [(asset, "hash_mismatch")]
+
+
+def test_a_corpus_that_SHIPPED_empty_is_not_drift(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """THE BOUNDARY OF THIS CONTROL, asserted rather than left to be discovered.
+
+    This tripwire compares an installed file to the wheel it came from, so it catches tampering
+    **after** install and nothing else. A wheel BUILT with an already-truncated corpus ships an empty
+    file and a RECORD row describing an empty file. They match. Attestation is silent, and is right to
+    be: nothing drifted.
+
+    So a poisoned *build* is invisible here by construction, and no amount of widening
+    :data:`_ATTESTED_ASSETS` reaches it. That case belongs to the consumer, which grades the parsed
+    result rather than the bytes -- an empty corpus screens nothing however faithfully it was shipped.
+    The two controls are complements: this one sees a post-install edit that leaves a plausible corpus
+    behind, the consumer sees an implausible corpus however it arrived, and neither subsumes the other.
+
+    Asserting ``clean`` here also pins the layering. A future editor who adds "the corpus must be
+    non-empty" to this module fails this test, which is the intended answer: that check belongs where
+    the corpus is read, not where wheels are attested.
+    """
+    pkg = "mfengine"
+    asset = f"{pkg}/auth/data/common_passwords.txt"
+    dist, loaded = _build_wheel_install(
+        tmp_path,
+        pkg=pkg,
+        files={f"{pkg}/__init__.py": b"VERSION = '1.0'\n"},
+        assets={asset: b""},  # the wheel itself carries a neutered corpus
+    )
+    _patch(monkeypatch, dist, loaded, pkg, assets=((tmp_path / asset).resolve(),))
+
+    result = attest_engine()
+    assert result.ok and result.drift == []
+    assert result.checked == 2, (
+        "the empty asset is still HASHED, it simply matches its own baseline"
+    )
+
+
+def test_declared_assets_exist_in_the_shipped_package() -> None:
+    """THE ROT GUARD, and the one test here that runs against the REAL package.
+
+    Every entry in ``_ATTESTED_ASSETS`` is resolved the way the engine resolves it. A renamed or moved
+    asset would otherwise leave a declaration that resolves to nothing: attestation would keep
+    reporting clean, forever, over a file it is no longer looking at. That failure is invisible by
+    construction, so it needs a test that must fail when it happens.
+    """
+    declared = integ._ATTESTED_ASSETS
+    assert declared, "the attested-asset set must not be empty"
+    # Both assets #1432 names are still declared. Extending the tuple is expected; dropping one is
+    # the regression. The Semgrep entry is checked against its OWNING accessor rather than a second
+    # hand-typed literal, so moving the rules file breaks this here instead of silently in a year.
+    assert "auth/data/common_passwords.txt" in declared
+    rules = handler_semgrep_rules()
+    assert f"security/semgrep/{rules.name}" in declared
+
+    # `strict=True` is what asserts the two sequences are the same length; no separate len() check.
+    for rel, path in zip(declared, integ._attested_asset_files(), strict=True):
+        assert path.as_posix().endswith(rel), f"{rel} resolved to {path}"
+        assert path.is_file(), f"declared attested asset does not exist: {rel} ({path})"
+        # A zero-byte asset in the shipped tree is the very state this tripwire exists to catch.
+        assert path.stat().st_size > 0, f"declared attested asset is empty: {rel}"

@@ -18,6 +18,7 @@ from messagefoundry.auth.notifications import (
     ACCOUNT_LOCKED,
     EMAIL_CHANGED,
     PASSWORD_CHANGED,
+    RECOVERY_CODE_USED,
     SecurityEvent,
 )
 from messagefoundry.config.settings import AlertsSettings
@@ -96,14 +97,25 @@ async def test_notify_send_failure_is_swallowed(monkeypatch: pytest.MonkeyPatch)
 
 def test_body_says_the_address_was_removed_when_there_is_no_new_one() -> None:
     """BACKLOG #1139 (ASVS 6.3.7): an EMAIL_CHANGED carrying no ``new_email`` is a REMOVAL. Saying
-    only "was changed" and then omitting the new value reads as a truncated notice. THE SCOPE OF THE
-    CLAIM IS THE POINT: an earlier version promised this was the LAST notice the address would ever
-    get and asserted it, pinning a claim two shipped paths falsify -- ``users.email`` has no
-    UNIQUE constraint, and ``admin_user_update`` has no ``_externally_managed`` guard."""
+    only "was changed" and then omitting the new value reads as a truncated notice.
+
+    WHAT THE ARM MAY CLAIM HAS NARROWED TWICE, and the second narrowing is the column split. An early
+    version promised this was the LAST notice the address would ever get; that was scoped back to the
+    account, because ``users.email`` carries no UNIQUE constraint and ``admin_user_update`` applies no
+    ``_externally_managed`` guard. **The split falsifies even the scoped claim**: the removal reaches
+    the profile mirror, and this notice went to ``users.notify_email``, which no clear can strip. So
+    the arm now makes NO forward-looking claim at all -- it reports what changed, plus the one thing
+    the schema guarantees. Asserting a promise the schema contradicts is the SDS-3.7 shape, which is
+    why this test pins the absence of one rather than its wording.
+    """
     body = _build_body(SecurityEvent(EMAIL_CHANGED, username="bob", email="old@example.org"))
     assert "removed" in body.lower()
-    assert "about this account" in body.lower()
-    # The negative half: it must not promise anything about the address BEYOND this account.
+    # It says WHICH address was removed -- the profile one -- so the reader is not left to infer that
+    # the address receiving this mail has been stripped.
+    assert "profile" in body.lower()
+    assert "notification address" in body.lower()
+    # The negative half, and the reason the test exists: no forecast about future notices.
+    assert "no further" not in body.lower()
     assert "last security notice" not in body.lower()
 
 
@@ -120,3 +132,51 @@ def test_body_names_the_new_address_on_a_repoint_and_does_not_say_removed() -> N
     )
     assert "New email on file: new@example.org" in body
     assert "removed" not in body.lower()
+
+
+def test_body_says_a_directory_repoint_came_from_the_directory() -> None:
+    """BACKLOG #1139 (ASVS 6.3.7): where the change came from decides what the reader can DO. A
+    directory-driven repoint is not editable in the console, so an unexplained one reads as a
+    compromise the holder cannot find a cause for."""
+    body = _build_body(
+        SecurityEvent(
+            EMAIL_CHANGED,
+            username="jdoe",
+            email="old@example.org",
+            detail={"new_email": "new@example.org", "source": "directory"},
+        )
+    )
+    assert "directory" in body.lower()
+
+
+def test_body_omits_the_directory_line_for_a_console_change() -> None:
+    """Control for the test above: a console-driven repoint carries no source, so the sentence must
+    not appear -- otherwise it would be emitted unconditionally and be false half the time."""
+    body = _build_body(
+        SecurityEvent(
+            EMAIL_CHANGED,
+            username="bob",
+            email="old@example.org",
+            detail={"new_email": "new@example.org"},
+        )
+    )
+    assert "directory" not in body.lower()
+
+
+def test_body_states_the_remaining_recovery_code_count() -> None:
+    """BACKLOG #1139 (ASVS 6.3.7): spending a recovery code permanently deletes a stored credential.
+    The count is what makes the notice actionable; the code and its hash never appear."""
+    body = _build_body(
+        SecurityEvent(RECOVERY_CODE_USED, username="bob", email="bob@x", detail={"remaining": 3})
+    )
+    assert "Recovery codes remaining: 3" in body
+    assert "spent" in body.lower()
+    assert "last recovery code" not in body.lower()  # only the zero arm says that
+
+
+def test_body_warns_when_the_last_recovery_code_is_spent() -> None:
+    body = _build_body(
+        SecurityEvent(RECOVERY_CODE_USED, username="bob", email="bob@x", detail={"remaining": 0})
+    )
+    assert "Recovery codes remaining: 0" in body
+    assert "last recovery code" in body.lower()
