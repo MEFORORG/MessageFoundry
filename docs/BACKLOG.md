@@ -14694,6 +14694,101 @@ measurement from this row's subject and it is named here rather than performed.*
 
 ## 1278. run Routers and Handlers in the subprocess sandbox by default
 
+> **THE FLIP SHIPPED 2026-09-04. `[sandbox].mode` now defaults to `"subprocess"`. THE ITEM STAYS
+> OPEN FOR TWO VAULT-SIDE ROWS AND NOTHING ELSE** -- see the last paragraph of this banner. Read this
+> before the filing text below, which describes the pre-flip state throughout.
+>
+> **The row's named evidence gap is closed a second time, and this time on the flipped default.** The
+> capitalised warning below -- *the shipped samples look compatible on inspection, and that is not the
+> same as having run them* -- was answered by RUNNING them, in a paired A/B against a `mode=off`
+> control on the same tree:
+>
+> | | bare default, **no `[sandbox]` section at all** | `mode=off` control |
+> |---|---|---|
+> | inbounds listening | 9 of 13 (7 MLLP, 2 X12) | same 9 |
+> | MLLP ACKs | **7 of 7 `AA`** | same |
+> | X12 interchanges accepted | 2 of 2 | same |
+> | File pollers (`./in/fhir`, `./dev-inbox/pdf`) | both files **consumed** | same |
+> | end-to-end delivered to live receivers | `OB_ACME_ADT` 2, `OB_EPIC_STREAM_MDM` 1 | **identical** |
+> | `_sandbox_worker` children | **11**, one per inbound with traffic | **0** |
+> | `SandboxError` | **0** | 0 |
+>
+> So the instrument discriminates: same ACKs, same deliveries, isolation on or off. **The default
+> alone carries it** -- the winning arm declared no `[sandbox]` section whatsoever. All 14 modules
+> under `samples/config/` loaded (13 inbound + 12 outbound connections constructed), and 11 inbounds
+> executed Router and Handler bodies inside a worker child. Not exercised: the DICOM C-STORE SCP
+> (needs an SCU) and the `IB_RTE_RESPONSE` loopback.
+>
+> **A counting trap, recorded so the next reader does not report a phantom 2x.** The raw process
+> count was **22, not 11**. On this box `.venv\Scripts\python.exe` is a redirector that re-executes
+> with a byte-identical command line, so every logical Python process appears **twice** in
+> `Win32_Process` under the same `CommandLine`. Proven on the parent: one `serve` launch produced two
+> processes with identical command lines. Read naively that looks like workers spawning workers,
+> which would have contradicted finding 2's "1 child process per inbound". It does not. The figure is
+> one worker per inbound with traffic, exactly as filed.
+>
+> **Two failures appear in BOTH arms and are pre-existing, not sandbox-related.**
+> `OB_IMMUNIZATION_BODYCRED` and `OB_IMMUNIZATION_REGISTRY` fail to start because `environments/dev.toml`
+> carries none of the `registry_*` values; the engine isolates them and continues. The smoke also needs
+> `[security].handles_real_patient_data = false`, or `serve --env dev` refuses to start without a store
+> encryption key.
+>
+> **The five findings this row named were honoured, not re-derived.** Finding 1 (the wall cap the flip
+> arms) is in `[sandbox]`'s docs and in `CONFIGURATION.md`, stated both ways round -- a busy loop can no
+> longer wedge intake, and a legitimately slow Handler now dead-letters where it used to finish. The old
+> `test_threat_model_doc_drift.py` label read `"no Router/Handler wall cap"`, which the flip made
+> **backwards**, and it is corrected. Finding 2's per-inbound multiplier and finding 3's
+> one-message-is-not-one-dispatch multiplier (3 for a single handler with an `accepts=` predicate,
+> 1 + 2K for fan-out to K) are both in the operator docs. Finding 5 was **decided rather than deferred**:
+> the gate does NOT learn the setting, and `dryrun.py` and `checks.py` now say so outright -- a Handler
+> calling `db_lookup`/`fhir_lookup` passes the pre-deploy gate green and then fails closed at `serve`.
+> Teaching `dry_run` to spawn a worker per inbound is its own change with its own cost; `route_only` and
+> `transform_one` already take `sandbox=`, so the seam is there when someone wants it. Separately,
+> `[pipeline].fuse_thread_hops` now carries the warning that the runner hard-disables fusion underneath
+> it whenever the sandbox is on -- an operator reads the knob they set, not the other one.
+>
+> Also swept: `pipeline/sandbox.py` (module docstring, `SandboxMode.OFF`), `pipeline/engine.py`,
+> `pipeline/wiring_runner.py`, `docs/CONFIGURATION.md`, `docs/DEPLOYMENT.md`, `docs/PHI.md`,
+> `docs/adr/README.md`, ADR 0087 (amended, not rewritten), ADR 0144 and ADR 0147.
+> **`SandboxPolicy.mode` lost its `= SandboxMode.OFF`** -- a second default free to contradict the
+> first -- and all 12 construction sites already passed `mode=` explicitly, so requiring it was free.
+> **`mode=off` is retained and supported**, and is the escape for a Handler needing live enrichment.
+> `mode` is still read ONCE at engine construction, so `/config/reload` does not re-read it and
+> changing it needs a **restart**.
+>
+> **ADR 0144 is the one place the old default was doing real work, not description.** Its
+> rejected-alternatives rationale -- the stated reason the static lint gate exists at all -- gave two
+> grounds for refusing to rely on the sandbox alone, and *"it is opt-in/off-by-default"* was one of
+> them. That ground is gone. The rejection survives on the other, which is sufficient by itself: an
+> address-space boundary does not catch a Handler leaking PHI into the store's own log or building SQL
+> inside the sanctioned `db_lookup`, because neither crosses an address space. Written that way so a
+> reader can see the gate still has a reason to exist.
+>
+> **`docs/ASVS-ASSESSMENT-METHOD.md:115` used this exact cell as its worked example of rule 5, "a
+> working control that ships off". That premise expired.** The **fact** is corrected there and the
+> `partial` **verdict is deliberately left standing** -- re-scoring a cell is the tracking seat's act
+> against the vault, not a Builder's. The table now says plainly that no live worked example of rule 5
+> remains, rather than substituting one, which is the choice its own 3.7.3 row already made.
+>
+> **WHAT KEEPS THIS ITEM OPEN: two coupled rows in the vault-only `docs/security/THREAT-MODEL.md`,
+> which no checkout can see.** (a) The 15.1.3 row must be rewritten to say the Router/Handler wall cap
+> is enforced **on** the shipped default, not off it. (b) `_DANGEROUS_ROW_KEYS` in
+> `tests/test_threat_model_doc_drift.py` still anchors on `"**In-process (default) or
+> subprocess-isolated execution"`, which now names false vault text. That anchor was **deliberately not
+> re-picked**: choosing a replacement from a checkout that cannot read the document would trade a stale
+> anchor for an unverifiable one and red the leg for whoever does hold the vault. Both are marked in
+> the test file as coupled vault-side edits, the way the `pickle` anchor beside them already is. The
+> doc-content half of that module is inert in every public checkout and in CI, so nothing there will
+> report either row.
+>
+> **On the re-scoring signal below: difficulty 3 was wrong and 5-6 is right.** The dispatch note's
+> demand for a full-suite lane was met differently rather than ignored -- the box is still shared, so
+> targeted legs ran locally and the full suite is CI's job, named as such in the pull request. Locally
+> green: `test_sandbox.py` (35), `test_sandbox_codec.py` + `test_sandbox_import_boundary.py` (110
+> together with the first), `test_threat_model_doc_drift.py`, `test_phi_logging_inventory.py`,
+> `test_settings.py`, `test_accepts_seam.py` (192 passed, 89 skipped), `test_checks*.py` +
+> `test_dryrun*.py` (96), the docs-guard legs (323), plus `ruff` and `mypy --strict` clean.
+>
 > 🔢 **Re-scored 2026-08-20 -> P2.** Value **6/10** · Difficulty **3/10** · _quick win_. The default is unchanged at config/settings.py:1294, so on the shipped default Router and Handler code runs in the engine's own address space alongside the store and every connection's in-flight data, while the isolation mode itself is built and exercised. Value 6 because the gap is real but an informed operator can already set [sandbox].mode=subprocess, an awkward rather than absent workaround (it costs a restart and fail-closed refusal of live enrichment); difficulty 3 because the change is one default plus a release note, but the samples and tests/test_sandbox.py must actually be RUN under the new default rather than inspected, and the flip changes behaviour on every config-dir serve path. _(previously unscored.)_
 >
 > **Filed 2026-08-16 - not started. THE ISOLATION MODE IS BUILT, EXERCISED, AND OFF.** `[sandbox].mode` is `Literal["off", "subprocess"]` defaulting to `"off"` ([`config/settings.py:1295`](../messagefoundry/config/settings.py); mirrored as `SandboxMode.OFF` at [`pipeline/sandbox.py:131-154`](../messagefoundry/pipeline/sandbox.py)). On the shipped default, Router and Handler code runs in the engine's own address space. **THE CHANGE: default `mode` to `"subprocess"`.**
