@@ -17,6 +17,12 @@ THE NEAR-MISS THIS ROW WAS WRITTEN TO WARN ABOUT, recorded because it caught the
 ALLOWLIST. Reading `Copy-Item ... .bak` in this file therefore makes the absence around the GATE
 SCRIPT easy to read as presence. They are three different files.
 
+AND THIS DOCSTRING WAS ITSELF AN INSTANCE OF IT. The sentence above shipped while #1375 was unbuilt
+and the allowlist writer was a bare `Set-Content` with no backup at all, so it asserted a backup that
+did not exist -- in the very paragraph warning against reading one file's `.bak` as another's. It is
+true now because #1375 landed the code, not because it was ever true when written. Backups for the
+allowlist are covered by tests/test_install_gate_allowlist_merge.py; this file covers the gate script.
+
 WHY THESE TESTS EXECUTE THE REGION RATHER THAN ASSERT ITS SHAPE. The install path cannot be run from
 a session -- install-gate.ps1 refuses inside Claude Code, by design, keyed on the session rather than
 the target -- so a whole-script run is unavailable. The escape hatch that answer invites is a static

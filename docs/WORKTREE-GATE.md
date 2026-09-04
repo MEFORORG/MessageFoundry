@@ -154,14 +154,32 @@ that actually happens.
 
 ```powershell
 # from a PLAIN pwsh terminal -- NOT from inside Claude Code
-pwsh -NoProfile -File scripts\worktree\install-gate.ps1                 # govern this repo
-pwsh -NoProfile -File scripts\worktree\install-gate.ps1 -Repo <path>    # govern some other checkout
+pwsh -NoProfile -File scripts\worktree\install-gate.ps1                 # add this repo
+pwsh -NoProfile -File scripts\worktree\install-gate.ps1 -Repo <path>    # add some other checkout
 pwsh -NoProfile -File scripts\worktree\install-gate.ps1 -Status
 ```
 
 The installer **refuses to run when `$env:CLAUDECODE` is set**: a session that can install its own gate can
 also remove it, so installation stays a human act. After installing, run `install-gate.ps1 -Status` to
 confirm every config dir shows hook entries.
+
+### The allowlist is merged, never replaced
+
+An install **adds** the roots it was given to the roots `worktree-gate.repos.txt` already carries, keeps a
+`.bak` of the previous list beside it, and prints every root it is about to stop governing. To govern
+exactly the roots you name and drop the rest, say so:
+
+```powershell
+pwsh -NoProfile -File scripts\worktree\install-gate.ps1 -Repo <path> -ReplaceAllowlist
+```
+
+**Why the switch, rather than a note telling you to re-name every root each time** (BACKLOG #1375). The
+write used to be a bare replace and `-Repo` defaults to **one** root, so a plain run from either of two
+governed checkouts un-governed the other. Nothing anywhere reported it: a dropped root is simply absent
+from the gate's roots list, so it matches no rule and the gate exits 0 on every tool call into that tree
+with **nothing printed**. This is *not* the instant-off kill switch under [Backing it out](#backing-it-out),
+which fires only when the allowlist holds no roots at all. One root is not zero, so the gate stayed **on**
+and just stopped looking at the checkout you cared about, which reads exactly like the gate working.
 
 Two structural choices worth understanding:
 
@@ -201,7 +219,7 @@ next `Edit` into the primary was denied with no restart. Removing it is the same
 |---|---|---|
 | **Instant off** | delete `~/.claude/hooks/worktree-gate.repos.txt` | Gate stops firing immediately, **including for sessions already running** — the allowlist is re-read on every invocation, so it does not matter whether Claude Code cached `settings.json` at session start. |
 | **Full uninstall** | `install-gate.ps1 -Uninstall` | Removes both hook entries, the installed script, and the allowlist. Verified: `settings.json` returns **byte-for-byte identical** to its pre-install content, with all other hooks and settings intact, and zero leftover files. |
-| **Safety net** | automatic | Every install writes `settings.json.bak` and validates the JSON before moving it into place, so a botched write cannot break hooks across every session at once. |
+| **Safety net** | automatic | Every install writes `settings.json.bak` and validates the JSON before moving it into place, so a botched write cannot break hooks across every session at once. It also writes `worktree-gate.repos.txt.bak` and `worktree_gate.ps1.bak`. Three different files, three different `.bak`s: do not read one as evidence for another. |
 
 Nothing lives in the repo or in `.git`. Merging this branch changes no behaviour by itself — the gate only
 becomes real when someone runs the installer.
