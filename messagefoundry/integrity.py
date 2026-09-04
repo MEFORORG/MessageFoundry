@@ -72,11 +72,20 @@ _ATTESTED_SUFFIX = ".py"
 #:
 #: Attesting ``.py`` alone left a gap the module walk cannot see: an admin with venv-write plus
 #: restart rights could truncate ``auth/data/common_passwords.txt`` to zero bytes, and
-#: :func:`~messagefoundry.auth.policy._common_passwords` would then return an empty set, so
-#: ``PasswordPolicy.violations`` stops emitting "not be a common or breached password" and breach
-#: screening becomes a silent no-op. No engine ``.py`` changed, so attestation reported clean. Same
+#: :func:`~messagefoundry.auth.policy._common_passwords` returned an empty set, so
+#: ``PasswordPolicy.violations`` stopped emitting "not be a common or breached password" and breach
+#: screening became a silent no-op. No engine ``.py`` changed, so attestation reported clean. Same
 #: shape for ``security/semgrep/handler-security.yml``: emptying the rules file makes the operator's
 #: opt-in CI leg pass everything.
+#:
+#: **That consequence is now contained, and this entry is still load-bearing** (BACKLOG #1438). The
+#: loader raises rather than returning an empty set, so the truncation above is refused rather than
+#: silently accepted. What the guard cannot see is a corpus **substituted rather than emptied** -- a
+#: well-formed replacement of ordinary size, minus the one password the attacker intends to use --
+#: because it grades the parsed result and that result looks entirely healthy. Only a hash catches
+#: that one. The two are complementary in both directions: a wheel BUILT with a truncated corpus
+#: matches its own ``RECORD`` and drifts from nothing, and there the loader's guard is the only
+#: signal.
 #:
 #: Version skew is impossible by construction: this list and the ``RECORD`` it is compared against
 #: ship in the *same* wheel, so a declared asset always has a baseline row.

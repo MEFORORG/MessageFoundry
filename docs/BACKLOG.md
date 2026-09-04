@@ -21956,12 +21956,14 @@ The bundled corpus is the only screen underneath. `password_breach_corpus_file` 
 
 ### What #1432 covers, and the four reasons it does not close this
 
-#1432 is the detection half. `messagefoundry/integrity.py` on `main` hashes loaded first-party `.py` files against the wheel's `dist-info/RECORD`; #1432 widens that ADR 0041 D3 startup tripwire to cover shipped security **data** assets, including this corpus. That work sits on its own unmerged branch and is **not on `main`**, so the widening is claimed rather than measured here. Four gaps stand either way, recorded in #1432's own residual:
+#1432 is the detection half, and it **shipped in 0.3.2** while this row was held on a branch. [`integrity.py`](../messagefoundry/integrity.py) now attests an explicit `_ATTESTED_ASSETS` set alongside the loaded engine modules, and `auth/data/common_passwords.txt` is in it. Its rationale comment names this row's exact defect. Four gaps stand anyway, and they are now **measured against the shipped code** rather than claimed against a branch nobody here could read:
 
 1. The tripwire is **alert-only by default**. `[integrity].fail_closed_on_drift` is opt-in, so on the shipped configuration the alert fires and screening still does nothing for the life of the process.
 2. It is a **no-op on editable installs and source-tree runs**, which is every developer checkout.
 3. It runs **once at startup**, while `_common_passwords()` is `lru_cache`d and read lazily on the first password check. There is a window between the two.
 4. It is **detection, not containment**. It never stops a weak password being accepted.
+
+Verified at this merge base: `fail_closed_on_drift` is `False` in `config/settings.py`; the editable-install early-out returns before any hashing; and `run_startup_attestation` is called once from the API lifespan.
 
 Detection and containment are different jobs, and this row is the containment one. **There is a case each one misses, which is the argument for having both.** A wheel BUILT with an already-truncated corpus passes attestation: `RECORD` carries the hash of whatever shipped, so a present-but-truncated file matches its own baseline and drifts from nothing. The tripwire is correct to stay silent there, and this guard still fires because it grades the parsed result rather than the bytes. The inverse also holds. Post-install tampering drifts the hash while possibly leaving enough entries to clear this floor, and there the alert is the only signal.
 
