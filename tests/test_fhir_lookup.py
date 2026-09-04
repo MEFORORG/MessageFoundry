@@ -36,7 +36,11 @@ from messagefoundry.config.wiring import (
 from messagefoundry.pipeline import dryrun
 from messagefoundry.pipeline.wiring_runner import check_fhir_lookup_allowed
 from messagefoundry.store import MessageStatus
-from messagefoundry.transports.fhir import FhirLookupExecutor, _resolve_read_url
+from messagefoundry.transports.fhir import (
+    FhirLookupExecutor,
+    _encode_search_params,
+    _resolve_read_url,
+)
 from messagefoundry.transports.smart import SmartAuthError, with_smart_backend
 
 BASE = "https://fhir.example.org/fhir"
@@ -294,6 +298,99 @@ def test_resolve_read_url_params_multi_and_list() -> None:  # #204 (a)
 def test_resolve_read_url_empty_params_is_bare_search() -> None:  # #204 (a)
     # An empty params mapping = a search of the whole resource type (no trailing '?').
     assert _resolve_read_url(BASE, "Patient", {}) == f"{BASE}/Patient"
+
+
+def test_encode_search_params_holds_the_url_layer_not_the_value_layer() -> None:  # #1243
+    """Pin BOTH halves of _encode_search_params' BEHAVIOUR; the mechanism is on that function.
+
+    Asserting the value-layer survival alone would prove nothing (a no-op encoder passes it too), so
+    the URL-layer guarantee is the positive control in the same function: it must PASS while the
+    value-layer arm shows the gap. Mutation-proved both ways -- a Limb-B-style escaping encoder reds
+    the value-layer arm ONLY, a no-op encoder reds the control ONLY.
+
+    **Whoever builds BACKLOG #1243 Limb B will red the value-layer arm, and that is the intended
+    signal, not an obstacle.** This pins the DOCUMENTED behaviour, so that arm and the docstring it
+    guards must move in the same commit. The docstring TEXT is pinned separately, by
+    ``test_encode_search_params_docstring_states_the_value_layer_gap``.
+    """
+    # CONTROL -- the guarantee that DOES hold: a value cannot inject an extra search PARAMETER.
+    # The exact-list equality pins the count too, so there is no separate len() assertion.
+    hostile = _encode_search_params({"code": "abc&_count=999&identifier=evil"})
+    assert hostile == "code=abc%26_count%3D999%26identifier%3Devil"
+    assert urllib.parse.parse_qsl(hostile) == [("code", "abc&_count=999&identifier=evil")], (
+        "CWE-88 control: one value must stay one parameter"
+    )
+
+    # UNDER TEST -- the FHIR value-layer separators the encoding does NOT neutralise. Each row is
+    # (wire form, what the server has after percent-decoding), so one assertion pins BOTH that the
+    # separator is encoded on the wire and that the decode hands it back with separator meaning.
+    # Collected rather than asserted per row: a Limb B build regresses all three at once, and a
+    # bare `assert` in the loop would report only the first and hide the shape of the change.
+    wire_then_value_layer = {
+        value: (enc, urllib.parse.parse_qsl(enc)[0][1])
+        for value, enc in (
+            (v, _encode_search_params({"code": v})) for v in ("sys|val", "a,b", "$everything")
+        )
+    }
+    assert wire_then_value_layer == {
+        "sys|val": ("code=sys%7Cval", "sys|val"),
+        "a,b": ("code=a%2Cb", "a,b"),
+        "$everything": ("code=%24everything", "$everything"),
+    }, (
+        "the separator is percent-encoded ON THE WIRE but reaches the FHIR value layer intact; "
+        "_encode_search_params' docstring must not claim otherwise. If you are building BACKLOG "
+        "#1243 Limb B, this failure is expected -- update this arm and that docstring in the "
+        "same commit."
+    )
+
+
+# The retired claim, verbatim from the docstring this item corrected. A behaviour test cannot catch
+# it coming back -- reverting the prose alone leaves every assertion above green -- so the text is
+# pinned separately, the way test_secret_rotation_inventory.py pins its own docstring claim.
+_RETIRED_ENCODE_CLAIMS = ("stays a literal, never a separator", "never a separator")
+
+
+def _encode_docstring_lie(doc: str) -> str | None:
+    """The retired claim ``doc`` still makes, else None. Split out so the guard is self-testable."""
+    collapsed = " ".join(doc.split())
+    return next((lie for lie in _RETIRED_ENCODE_CLAIMS if lie in collapsed), None)
+
+
+def test_encode_search_params_docstring_states_the_value_layer_gap() -> None:  # #1243
+    """The docstring is a security contract, so pin its TEXT, not just the behaviour behind it.
+
+    It used to tell an author that a '|' in a value "stays a literal, never a separator", which is
+    false at the FHIR value layer and is the SDS-3.7 defect BACKLOG #1243 records. The behaviour test
+    above cannot see that sentence return; this one can."""
+    doc = _encode_search_params.__doc__ or ""
+    assert doc, "_encode_search_params must keep its docstring -- it is the contract under test"
+
+    lie = _encode_docstring_lie(doc)
+    assert lie is None, (
+        f"_encode_search_params.__doc__ says {lie!r} again. Percent-encoding does NOT make a FHIR "
+        "value-layer separator a literal: the server percent-decodes first, then reads FHIR's own "
+        "syntax in the decoded value. See BACKLOG #1243."
+    )
+
+    collapsed = " ".join(doc.split())
+    assert "does not neutralise" in collapsed, (
+        "the docstring must positively state the limit, not merely omit the false claim"
+    )
+    for separator in (",", "|", "$"):
+        assert f"``{separator}``" in collapsed, (
+            f"the docstring must name {separator!r} as a value-layer separator it does not neutralise"
+        )
+    assert "#1243" in collapsed, "the docstring must cite the open item"
+
+
+def test_encode_docstring_guard_self_test() -> None:  # #1243
+    """Non-vacuity: the guard must FIRE on the retired wording and CLEAR the shipped wording.
+
+    Without this the guard could be silently unable to see its own failure class, which is the
+    green-gate trap SDS-3.8 names."""
+    retired = "an ``&``/``=``/``|``/``#`` in a value becomes ``%26``/``%3D``/``%7C``/``%23`` and\nstays a literal, never a separator."
+    assert _encode_docstring_lie(retired) is not None, "the guard must catch the retired wording"
+    assert _encode_docstring_lie(_encode_search_params.__doc__ or "") is None
 
 
 def test_resolve_read_url_rejects_params_with_query_string() -> None:  # #204, #1243

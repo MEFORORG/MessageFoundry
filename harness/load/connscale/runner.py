@@ -911,7 +911,9 @@ def _build_record(
     pool_idle_min = _min_int([s.pool_idle for s in samples])
     pool_size_max = _peak_int([s.pool_size for s in samples])
 
-    # Wall #3: empty-claim RATES over the hold (Δcount / Δt), SEPARATED into idle-poll vs wake-fanout.
+    # Wall #3: empty-claim RATES over the step's sample window (Δcount / Δt), SEPARATED into
+    # idle-poll vs wake-fanout. That window is the hold PLUS the post-drain tail; `_empty_claim_rates`
+    # defines it once and this comment does not restate it (BACKLOG #1420).
     total_per_s, idle_per_s, wake_per_s = _empty_claim_rates(samples)
 
     # Achieved throughput = engine read/written deltas over the SAME window as the empty-claim rates
@@ -919,10 +921,11 @@ def _build_record(
     achieved_read_per_s, achieved_written_per_s = _throughput_rates(samples)
 
     # Wall #3, the ASSERTED form: empty claims per MESSAGE ABSORBED (BACKLOG #1101). Both rates above
-    # are Δ/span over the same first→last in-hold samples, so dividing them cancels the span exactly and
-    # leaves Δclaims/Δread — no wall clock, and therefore nothing for runner contention or a mid-hold
-    # reload stall to move. This is what the monotonicity SLO reads; the per-second form is retained for
-    # the report because it is the operator-facing number.
+    # are Δ/span over that same window, so dividing them cancels the span exactly and leaves
+    # Δclaims/Δread — no wall clock, and therefore nothing for a mid-hold reload stall to move. (It is
+    # NOT contention-immune; that claim was retracted in `_empty_claims_per_msg`, BACKLOG #1211.) This
+    # is what `_empty_claims_base_reading_slo` reads; the per-second form is retained for the report
+    # because it is the operator-facing number.
     empty_per_msg = _empty_claims_per_msg(total_per_s, achieved_read_per_s)
 
     # Wall #4 + footprint: handle peak + CPU-seconds + working set, drained from the side map (each
@@ -1146,8 +1149,31 @@ def _reconcile(
 
 
 def _empty_claim_rates(samples: list[EngineSample]) -> tuple[float, float, float]:
-    """Empty-claim rates over the hold window: (total/s, idle_poll/s, wake_fanout/s), from the FIRST
-    to LAST in-hold sample. SEPARATED — never summed into one number (critic must-change #3)."""
+    """Empty-claim rates over the sweep step's sample window: (total/s, idle_poll/s, wake_fanout/s),
+    from ``samples[0]`` to ``samples[-1]``. SEPARATED — never summed into one number (critic
+    must-change #3).
+
+    **THE WINDOW IS NOT THE HOLD, AND THIS IS THE ONE PLACE THAT SAYS SO** (BACKLOG #1420). Every
+    other description of it points here rather than restating it. ``samples[0]`` is the first in-hold
+    reading, but ``samples[-1]`` is NOT in-hold: the step appends one final engine sample after
+    ``sampler_stop.set()``, after ``driver.stop(_STOP_GRACE)``, after ``poller.await_drain(...)`` and
+    after ``asyncio.sleep(_SETTLE)`` — and, on the drained path, after ``sample_until_reconciled``
+    has spent up to a second ``drain_timeout_s``. So the span is the hold PLUS that whole tail,
+    bounded under the shipped ``connscale-smoke`` profile by 5.0 + 30.0 + 0.5 + 30.0 = 65.5 s against
+    a 3.0 s hold. **Five sites called this window "first to last in-hold samples"**, and the last
+    sample is not in-hold, so all five described a window the code does not compute. Scope, because
+    the count depends on it: needle ``in-hold``, corpus ``harness/load/connscale/`` plus
+    ``tests/test_connscale_empty_claims_per_msg.py``. Three of the five are in this file. All five
+    now point here instead of restating it.
+
+    **WHAT THAT COSTS THE METRIC.** Through the tail the engine keeps polling an emptying queue, so
+    ``empty_claims`` can keep rising while ``read`` stops — an idle-drain regime the rates do not
+    intend to cover. The algebra in :func:`_empty_claims_per_msg` is unaffected (the span still
+    cancels); what the tail changes is which regime both deltas cover. **The tail is currently INSIDE
+    the number.** Narrowing the window to exclude the final sample would change what the number
+    MEANS, so readings either side of such a change would not be comparable — that is BACKLOG #1420's
+    candidate fix (a), and it is not taken here.
+    """
     if len(samples) < 2:
         return 0.0, 0.0, 0.0
     first, last = samples[0], samples[-1]
@@ -1163,9 +1189,11 @@ def _empty_claim_rates(samples: list[EngineSample]) -> tuple[float, float, float
 def _empty_claims_per_msg(total_per_s: float, achieved_read_per_s: float) -> float | None:
     """Empty claims per message absorbed — the wall-clock-free form of wall #3 (BACKLOG #1101).
 
-    Both inputs are Δ/span over the SAME first→last in-hold samples, so ``span`` cancels and this is
-    exactly ``Δempty_claims / Δread``. That removes the per-SECOND form's defect, which keeps ``span``
-    in the denominator so a slow arm reads as an improvement (#1101).
+    Both inputs are Δ/span over the SAME window — ``samples[0]`` to ``samples[-1]``, defined once in
+    :func:`_empty_claim_rates` — so ``span`` cancels and this is exactly ``Δempty_claims / Δread``.
+    That removes the per-SECOND form's defect, which keeps ``span`` in the denominator so a slow arm
+    reads as an improvement (#1101). **That window is the hold PLUS the post-drain tail, not the hold
+    alone**; read :func:`_empty_claim_rates` for what the tail is and what it costs (BACKLOG #1420).
 
     **IT IS NOT CONTENTION-IMMUNE, AND THIS DOCSTRING USED TO SAY IT WAS** (BACKLOG #1211). The old
     wording — *"that is why it survives runner contention: slowing the run scales numerator and

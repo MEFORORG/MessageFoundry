@@ -27,6 +27,17 @@ after the handler returns — moves the file to ``processed_subdir`` (or deletes
 A handler failure leaves the file in place to re-emit (at-least-once); an over-``max_file_bytes`` file
 is moved to ``error_subdir`` before it's retrieved (a transport-level reject, like the File source).
 
+**``max_file_bytes`` is charged TWICE, and the second charge is the one that binds** (BACKLOG #1191).
+The pre-retrieve gate compares the size the server reported in its own directory listing, so it is
+only as honest as the partner share. The retrieve itself then reads in ``RETRIEVE_CHUNK_BYTES``
+chunks and refuses at the first byte past the same budget — counting **bytes actually read** — so a
+share that lists a small file and then delivers an arbitrarily large body is cut off mid-transfer
+rather than buffered whole. That matters here more than on any other intake: this transport consumes
+the body *before* an ingress row exists, so no admission bound further down the pipeline can see it.
+The refusal is a content refusal, not a transient one — the file is quarantined to ``error_subdir``
+and logged, exactly as an over-listed-size or content-sniff reject is. ``max_file_bytes=0`` disables
+both charges (unbounded), which is the operator's explicit choice.
+
 **Idempotency.** Delivery is at-least-once (an upload may re-send) and a poll may re-emit a file that
 was handled but not yet marked, so downstream consumers **must** tolerate duplicates.
 
@@ -94,6 +105,11 @@ _PROTOCOLS = ("sftp", "ftp", "ftps")
 
 _T = TypeVar("_T")
 
+#: Bytes pulled per chunk while retrieving a remote file. Only the granularity of the budget check —
+#: it does not change how much of the file ends up in memory on a healthy retrieve, and a body is
+#: refused at most this far past ``max_file_bytes``.
+RETRIEVE_CHUNK_BYTES = 1024 * 1024  # 1 MiB
+
 
 def _is_contained_name(name: object) -> bool:
     """True if ``name`` is a single, safe path component — a listing entry we may join onto the
@@ -154,6 +170,48 @@ class _RemoteError(Exception):
         self.credential_fault = credential_fault
 
 
+class _RemoteOversize(Exception):
+    """A retrieve read more bytes than ``max_file_bytes`` allows, and was cut off mid-transfer.
+
+    **Deliberately NOT a** :class:`_RemoteError`. A ``_RemoteError`` on the retrieve path means
+    "transient, leave the file and try again next poll", which is the one disposition an oversize
+    body must never get: the next poll would pull the same oversized body again, forever. This is a
+    content refusal, so the source quarantines the file to its error dir exactly as the listing-size
+    gate and the content-sniff gate do — logged with a disposition, never accepted-and-dropped."""
+
+    def __init__(self, *, limit: int) -> None:
+        super().__init__(f"remote file exceeds max_file_bytes ({limit}) as actually read")
+        self.limit = limit
+
+
+class _BoundedSink:
+    """Accumulates retrieved chunks and refuses at the first byte past ``limit``.
+
+    **The budget is charged against bytes ACTUALLY READ, and that asymmetry is the whole point.**
+    The source's pre-retrieve gate compares the size the SERVER reported in its directory listing,
+    which a hostile or malfunctioning partner share simply lies about; this one counts what arrives.
+    ``limit=None`` (the operator set ``max_file_bytes=0``, explicitly disabling the cap) never
+    refuses, so the disabled posture stays byte-identical to the unbounded read this replaced."""
+
+    __slots__ = ("_buf", "_limit", "_total")
+
+    def __init__(self, limit: int | None) -> None:
+        self._buf = io.BytesIO()
+        self._limit = limit
+        self._total = 0
+
+    def write(self, chunk: bytes) -> None:
+        """Append ``chunk``, raising :class:`_RemoteOversize` the moment the budget is passed. Shaped
+        as a ``write(bytes) -> None`` callback so ``ftplib.retrbinary`` can call it directly."""
+        self._total += len(chunk)
+        if self._limit is not None and self._total > self._limit:
+            raise _RemoteOversize(limit=self._limit)
+        self._buf.write(chunk)
+
+    def value(self) -> bytes:
+        return self._buf.getvalue()
+
+
 class _RemoteClient(abc.ABC):
     """Connect-per-operation remote-file client. Implementations are **synchronous** (blocking I/O);
     the connector calls them via :func:`asyncio.to_thread`. Each method opens its own connection, does
@@ -164,8 +222,13 @@ class _RemoteClient(abc.ABC):
         """``(name, size)`` for each regular file directly in ``remote_dir`` (no recursion)."""
 
     @abc.abstractmethod
-    def retrieve(self, path: str) -> bytes:
-        """The full bytes of the file at ``path``."""
+    def retrieve(self, path: str, *, max_bytes: int | None = None) -> bytes:
+        """The full bytes of the file at ``path``, read in bounded chunks.
+
+        ``max_bytes`` bounds what is pulled into memory. An implementation reads incrementally and
+        raises :class:`_RemoteOversize` as soon as the bytes it has actually read pass the budget,
+        so it never buffers a whole hostile body first. ``None`` = unbounded (the operator set
+        ``max_file_bytes=0``)."""
 
     @abc.abstractmethod
     def store(self, path: str, data: bytes) -> None:
@@ -323,11 +386,15 @@ class _FtpClient(_RemoteClient):
             out.append((base, int(size)))
         return out
 
-    def retrieve(self, path: str) -> bytes:
+    def retrieve(self, path: str, *, max_bytes: int | None = None) -> bytes:
         def run(ftp: ftplib.FTP) -> bytes:
-            buf = io.BytesIO()
-            ftp.retrbinary(f"RETR {path}", buf.write)
-            return buf.getvalue()
+            # retrbinary already streams; the sink is what makes the stream BOUNDED — it raises out
+            # of the callback the moment the bytes read pass the budget, which aborts the transfer
+            # instead of buffering the rest of a hostile body. _op's finally still closes the
+            # connection (its quit() is bounded by the socket timeout set at connect).
+            sink = _BoundedSink(max_bytes)
+            ftp.retrbinary(f"RETR {path}", sink.write, blocksize=RETRIEVE_CHUNK_BYTES)
+            return sink.value()
 
         return self._op(run)
 
@@ -566,11 +633,16 @@ class _SftpClient(_RemoteClient):
 
         return self._op(run)
 
-    def retrieve(self, path: str) -> bytes:
+    def retrieve(self, path: str, *, max_bytes: int | None = None) -> bytes:
         def run(sftp: Any) -> bytes:
+            sink = _BoundedSink(max_bytes)
             with sftp.open(path, "rb") as fh:
-                data: bytes = fh.read()
-                return data
+                while True:
+                    chunk: bytes = fh.read(RETRIEVE_CHUNK_BYTES)
+                    if not chunk:
+                        break
+                    sink.write(chunk)  # raises _RemoteOversize past the budget, closing the handle
+            return sink.value()
 
         return self._op(run)
 
@@ -1079,6 +1151,9 @@ class RemoteFileSource(SourceConnector):
                 # Transport-level reject *before* any bytes are read — parallels the File source's
                 # oversize guard. It never became a "received message", so there's no store
                 # disposition; move it to the error dir and log it (never a silent drop).
+                # THIS GATE TRUSTS THE SERVER. `size` came out of the remote directory listing, so a
+                # hostile or malfunctioning share passes it by under-reporting; the same budget is
+                # therefore charged again below against the bytes actually read.
                 logger.warning(
                     "REMOTEFILE file %s exceeds max_file_bytes (%s); routing to error dir",
                     name,
@@ -1087,7 +1162,22 @@ class RemoteFileSource(SourceConnector):
                 await self._move(path, self._error_dir, name)
                 continue
             try:
-                raw = await asyncio.to_thread(self._client.retrieve, path)
+                raw = await asyncio.to_thread(
+                    self._client.retrieve, path, max_bytes=self._max_file_bytes
+                )
+            except _RemoteOversize:
+                # The share DELIVERED more than it listed. Same disposition as the listing-size gate
+                # above — quarantine + log, never a silent drop — and deliberately NOT the transient
+                # arm below: leaving it in place would re-pull the same oversized body every poll.
+                # The body is already discarded; nothing partial reaches the pipeline.
+                logger.warning(
+                    "REMOTEFILE file %s delivered more than max_file_bytes (%s) despite a smaller "
+                    "listed size; routing to error dir",
+                    name,
+                    self._max_file_bytes,
+                )
+                await self._move(path, self._error_dir, name)
+                continue
             except _RemoteError as exc:
                 # Transient (locked / vanished mid-poll): leave it in place to retry next poll rather
                 # than quarantine a healthy file. Logged, never silently swallowed.
