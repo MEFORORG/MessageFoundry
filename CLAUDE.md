@@ -335,17 +335,28 @@ went red, and no workflow reads that label back. So the Console finds both by as
    at spawn, because no hook will invent a goal, by design: a machine that invents one writes a
    record that looks declared and says nothing.
 
-6. **A dispatched brief can go stale between spawn and read, and nothing will tell you.** Verify it
-   against the tree before you act on it: read the diff of **every PR it names**, at hunk
-   granularity, and re-locate every line number by symbol. **Where the brief and the tree disagree,
-   the tree wins.** Measured 2026-09-04: a chip named three drift sites, and minutes later the
-   spawner took item 3 itself and pushed it as `c2f549f42` on PR 837. The receiver read that diff
-   before touching anything, saw both hunks already rewritten, and skipped it. Trusting the brief
-   would have put two PRs on the same two comment blocks, to meet at merge with the Lander
+6. **A brief can be wrong by the time you read it, and nothing will tell you.** Verify it against
+   the tree before you act on it: read the diff of **every PR it names**, at hunk granularity, and
+   re-locate every line number by symbol. **Where the brief and the tree disagree, the tree wins.**
+   ***Do not scope this check to how recently the brief was written.*** Two windows give the same
+   symptom and **the wider one dominates**: a brief goes stale AFTER dispatch, in minutes, and it is
+   written stale because the ITEM it was cut from is stale, over weeks. A Manager seat reported six
+   of eleven briefed items already answered at spawn on 2026-09-04 -- by an ADR accepted before the
+   brief, by work shipped under a different number, by a PR the item itself says not to rebuild.
+   **Attributed, not verified here.** The structural cause is that an item records its own research
+   and nothing records the work that ANSWERS it, so a settled row still reads as current.
+   **Line numbers are navigation aids and never evidence** -- the same seat measured four anchors
+   adrift by 50, 86, 581 and 593 lines in one day, one item with both of its anchors dead.
+   Measured here 2026-09-04, the after-dispatch window: a chip named three drift sites, and minutes
+   later the spawner took item 3 itself and pushed it as `c2f549f42` on PR 837. The receiver read
+   that diff before touching anything, saw both hunks already rewritten, and skipped it. Trusting
+   the brief would have put two PRs on the same two comment blocks, to meet at merge with the Lander
    resolving prose by hand. **Two of the same brief's other three items also failed to survive a
    read of their sources**, so one confirmed drift is a reason to re-check the rest, not to correct
    that line and carry on. ***"The brief is disposable" above says it may be thrown away; it does
-   not say it was true when written.*** BACKLOG #1448, same family as #1391.
+   not say it was true when written.*** **Finding an item already answered is a GOOD outcome** --
+   record it with evidence and stop, rather than building it again. BACKLOG #1448, same family
+   as #1391.
 
 ### The Console plans, spawns, and holds the owner's attention
 

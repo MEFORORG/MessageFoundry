@@ -22118,6 +22118,81 @@ Handing item 3 to the session already in that file was right, and re-cutting the
 
 Neither fix does anything for the other row. **#1391's own body warns that "a fix aimed at the wrong half will look like it worked on the seats that were never affected"** -- folding these together would build that trap on purpose.
 
+### AMENDED SAME DAY: THE WINDOW THIS ROW FIRST NAMED IS THE SMALLER HALF
+
+**This item was filed scoped to spawn-to-read, and two Manager seats answered within the hour that
+the dominant window is filed-to-dispatch.** Both reports are attributed, not verified here; the
+correction is recorded because **the original scoping was the defect this row exists to describe.**
+A rule reading *"a brief can go stale between spawn and read"* invites a reader to check how fresh
+the brief is and skip -- which is the SDS-3.4 shape the incident's own `c2f549f42` commit was fixing,
+a warning whose stated reason licenses the failure it exists to prevent. `CLAUDE.md` sec. 5 item 6
+was widened accordingly.
+
+**The reported population, from a seat that dispatched fourteen Builders that day: six of eleven
+briefed items were already answered at spawn.** Each by a different mechanism, and none of them a
+race:
+
+| item | how it was already answered |
+|---|---|
+| #1117 | founding premise died when ADR 0172 shipped the change **under a different item number** |
+| #1317 | its open half decided by ADR 0180, **accepted five days before the brief**; the item never recorded it |
+| #1139 | one of three named targets already built under #1248 |
+| #1085 | marked fixed 2026-08-26, banner deliberately left open; the item said so, the ranking table did not |
+| #1107 | shipped in PR 488, and the item's own body says **"DO NOT REBUILD IT"** |
+| #1172 | both brief items shipped, in PR 603 and a 2026-09-03 gate change |
+
+***THE STRUCTURAL CAUSE, AND IT IS BIGGER THAN THE CHIP.*** **An item records its own research, and
+nothing records the work that ANSWERS it.** A ruling or a PR that settles a question never touches
+the row that asked it, so the row keeps pointing at a settled question and every dispatch screen
+reads it as current. The frozen chip is one instance; a row that outlives its own answer is the
+general case, and it is measured in weeks rather than minutes.
+
+**Anchor drift is the second half and is reported worse than the first.** Four anchors adrift by
+**50, 86, 581 and 593 lines** in one day, one item with both of its anchors dead. Hence the flat
+rule now in sec. 5: **line numbers are navigation aids and never evidence.**
+
+### THE CORRECTION PATH EXISTS FOR ONE WORKER TYPE AND NOT THE OTHER
+
+**This row's title says "cannot be corrected", and that is true of a chip and of a `claude -p`
+session. It is NOT true of a subagent.** `MANAGER.md:30` carries the table: a Console's workers are
+separate `claude -p` sessions, a Manager's are **subagents in the Manager's own process**. A Manager
+reported sending mid-flight corrections to four running subagents on 2026-09-04; each landed at the
+worker's next tool round and all four acted on it.
+
+**So "what to do about a stale brief" has two answers by seat, and a single rule that ignores that is
+wrong for one of them.** A fix aimed only at the frozen-chip case would leave the Manager path
+untouched, and a fix assuming corrections are deliverable would not reach a Console Builder at all.
+
+***AND THE OBVIOUS FIX PUSHES IN A DIRECTION ANOTHER RULE ALREADY WARNS ABOUT.*** "Send more
+corrections" collides with `MANAGER.md` sec. 5, which says to hand down **readings, not
+conclusions**, because a worker told your conclusion will apply it and its own correct evidence will
+lose. **A correction must therefore carry the new MEASUREMENT and let the worker re-decide** -- never
+the sender's new conclusion.
+
+### The mitigation that has evidence behind it, and it is two lines
+
+The same seat put two lines at the top of every brief, and reports **six Builders hitting a stale
+item with none wasting its turn**; two produced better findings than the original item asked for:
+
+1. *Check it is not already answered. If it is, record that with evidence and STOP -- that is a good
+   outcome, not a failure.*
+2. *Re-measure every line number this item cites.*
+
+**Line 1 is the load-bearing half**, and it is a permission rather than an instruction: a Builder
+that believes finding-it-done is a failed turn will build it again rather than report it.
+
+### Where the authoritative text lives is itself unresolved, and this row does not settle it
+
+`CLAUDE.md` sec. 5 is no longer the only place seat rules live. The vault's `roles/` folder carries
+`COMMON.md`, `MANAGER.md`, `BUILDER.md` and others, and `MANAGER.md`'s standing rules say a conflict
+between a playbook and `COMMON` goes to the **owner** rather than being resolved by any seat.
+
+**Checked before amending sec. 5, and reported as a null result rather than skipped:** `BUILDER.md`
+carries no rule about verifying a brief against the tree, and `MANAGER.md` carries none the new
+bullets contradict. **So there is no conflict to escalate today** -- but sec. 5's roster does not
+list a Manager seat at all, while `MANAGER.md` exists and is being followed, and **that gap is a
+question for the owner, not for this row.**
+
 ### What a fix looks like, smallest first
 
 1. **Prose, and it is already written.** `CLAUDE.md` sec. 5 now tells the receiver to verify a brief against the tree before acting, and tells whichever seat dispatched to mail the receiver when it takes an item back. **That is a workaround, not a mechanism.** It costs the receiver a diff read per named PR, and it fails silently the first time somebody skips it.
