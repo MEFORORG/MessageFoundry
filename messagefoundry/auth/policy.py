@@ -8,8 +8,11 @@ screening**, a small **context-word deny-list** (app/vendor/HL7 terms), and **us
 rejection** (6.2.11). Defaults remain a direct improvement on Mirth, whose password requirements
 default to zero. Operators tune these via the ``[auth]`` settings section.
 
-The breach corpus is a bundled offline top-10k common-password list (see ``data/common_passwords.txt``
-+ its ``.NOTICE``); the check is a case-insensitive set membership — no network/live-HIBP call.
+The breach corpus is a bundled offline common-password list (see ``data/common_passwords.txt`` and
+its ``.NOTICE``, which carries the entry counts and the policy filter that built the list — BACKLOG
+#1134 grew it, so do not restate a size here); the check is a case-insensitive set membership — no
+network/live-HIBP call. Only entries at or above ``min_length`` add coverage: a shorter one can
+reject only what the length clause already rejects.
 Operators can widen it with an offline ``breach_corpus_file`` (6.2.12) — a plaintext list **or** an
 HIBP-style SHA-1-hash export (``HASH[:count]`` lines, auto-detected), still fully offline. (True HIBP
 k-anonymity needs a live range query, which this on-prem engine deliberately doesn't make.)

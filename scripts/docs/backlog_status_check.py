@@ -148,11 +148,22 @@ DuplicateField = tuple[str, int, str, str]
 class Item:
     """One numbered backlog item and the status banners in its leading blockquote block."""
 
-    __slots__ = ("num", "line", "closed", "open", "fields", "duplicate_fields")
+    __slots__ = ("num", "line", "closed", "open", "fields", "duplicate_fields", "body_line")
 
     def __init__(self, num: int, line: int) -> None:
         self.num = num
         self.line = line
+        # 1-based line where the banner block ENDS and the item's own prose begins. Published
+        # because a reader that needs the prose alone would otherwise re-derive "where does the
+        # banner stop", which is a second definition of the boundary this parser owns -- the same
+        # single-source rule the banner alphabet already carries. `dispatch_gate.py` is the first
+        # such reader: the 2026-09-03 scoring pass wrote a summary blockquote INTO the banner
+        # block of #1334, and that summary quotes the retirement wording of the rows it describes,
+        # so a needle reading the whole item flags the row that documents the convention.
+        #
+        # A hand-built Item has an empty banner block, so prose starts on the line after the
+        # heading. `parse_items` overwrites this with the real boundary.
+        self.body_line = line + 1
         self.closed: list[str] = []
         self.open: list[str] = []
         # Machine-readable state declared INSIDE the banner block, so `parse_items` can see it.
@@ -178,7 +189,8 @@ def parse_items(text: str) -> list[Item]:
     """Extract each item and classify the status banners in its leading blockquote block.
 
     The banner block runs from the heading to the first line that is neither blank nor a blockquote,
-    so a status banner must appear *before* the item's prose (Cluster/Scope/Why...).
+    so a status banner must appear *before* the item's prose (Cluster/Scope/Why...). That boundary
+    is published as ``Item.body_line`` so a reader wanting the prose alone does not re-derive it.
 
     Raises :class:`ValueError` when ``text`` still carries git conflict markers (#1259). The refusal
     lives in the READER, not in a pre-commit hook, because the way this bit was a gate handed a tree
@@ -224,6 +236,7 @@ def parse_items(text: str) -> list[Item]:
                 j += 1
                 continue
             break
+        item.body_line = j + 1
         items.append(item)
         i = j
     return items

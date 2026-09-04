@@ -30,6 +30,8 @@ so a test that saw no raise would be reporting a missing call rather than an ine
 from __future__ import annotations
 
 import datetime
+import importlib.util
+import re
 import socket
 import ssl
 import urllib.request
@@ -58,7 +60,7 @@ from messagefoundry.config.settings import (
 from messagefoundry.config.wiring import FHIR, Rest, Soap
 from messagefoundry.pipeline import alert_sinks
 from messagefoundry.store import postgres
-from messagefoundry.transports import build_destination, rest, soap
+from messagefoundry.transports import build_destination, database, rest, soap
 from messagefoundry.transports.http_auth import with_http_digest
 
 # Imported at module scope ON PURPOSE. `rest` and `alert_sinks` build their shared opener AT IMPORT,
@@ -682,6 +684,166 @@ def test_the_handler_factory_refuses_when_it_cannot_reach_the_context(
     monkeypatch.setattr(urllib.request, "HTTPSHandler", _NoContextHandler)
     with pytest.raises(ValueError, match="cannot reach the TLS context"):
         tls_policy.build_asserted_https_handler(connector="a label")
+
+
+# --- the two libraries ADR 0180 scoped OUT, and the premises that scoped them ---------------------
+#
+# BACKLOG #1317 names three third-party TLS surfaces: ldap3, hvac and ODBC Driver 18. ADR 0180 built
+# the first (above) and ruled the other two out in PROSE, each on a measurement taken once. A
+# scope-out is a compensating control like any other, so SDS-3.7 applies to it: it must not rest on a
+# premise nothing re-checks. Neither premise was checked by anything until the three tests below.
+#
+# Both are TRIGGERS, not guards. A red here does not mean the engine got worse; it means the reason
+# an arm was left unasserted has stopped being true, and the arm is now buildable. The fix is to
+# build it and amend ADR 0180 -- never to delete the test.
+
+#: Ways a module can hold an ``SSLContext`` the engine could assert on. Shared by the ODBC subjects
+#: and by the control below, so a clean result on the subjects is a reading rather than a dead regex.
+_HOLDS_A_CONTEXT_RE = re.compile(
+    r"^\s*import\s+ssl\b|^\s*from\s+ssl\s+import\b|ssl\.SSLContext|ssl\.create_default_context"
+)
+
+#: The two ODBC modules. ADR 0180 measured only the first and generalised to "ODBC Driver 18".
+_ODBC_MODULES = (
+    "messagefoundry/store/sqlserver.py",
+    "messagefoundry/transports/database.py",
+)
+
+#: A module that DOES build a context, so the scan can be shown to find one.
+_ODBC_SCAN_CONTROL = "messagefoundry/store/postgres.py"
+
+
+def _context_lines(path: Path) -> list[str]:
+    """Every non-comment line in ``path`` that reaches for an ``ssl`` context."""
+    return [
+        line.strip()
+        for line in path.read_text(encoding="utf-8").splitlines()
+        if _HOLDS_A_CONTEXT_RE.search(line) and not line.lstrip().startswith("#")
+    ]
+
+
+def test_the_odbc_scope_out_premise_still_holds(request: Any) -> None:
+    """ADR 0180 rules ODBC Driver 18 out PERMANENTLY, and this re-measures why.
+
+    TLS on that hop is connection-string keywords (``Encrypt`` / ``TrustServerCertificate`` /
+    ``ServerCertificate``) terminated inside the native driver, so the suite list belongs to the
+    driver and the OS TLS stack rather than to the interpreter's OpenSSL. No Python-side context
+    exists to assert and no replica is possible.
+
+    **The ADR measured ``store/sqlserver.py`` alone and generalised.** The ODBC *transport* --
+    ``transports/database.py``, the DATABASE destination and the ADR 0010 ``db_lookup`` hop -- carries
+    the same keywords on a hop that moves message content, and was never named. Both are measured
+    here, so the ruling covers the surface it claims.
+    """
+
+    root = Path(request.config.rootpath)
+    control = _context_lines(root / _ODBC_SCAN_CONTROL)
+    assert control, (
+        f"the scan found no ssl context in {_ODBC_SCAN_CONTROL}, which is chosen BECAUSE it builds "
+        f"them -- the scan is broken, so a clean result on the ODBC modules would mean nothing"
+    )
+
+    holding = {rel: _context_lines(root / rel) for rel in _ODBC_MODULES}
+    assert not any(holding.values()), (
+        f"an ODBC module now reaches for an ssl context: {holding}. ADR 0180 ruled this arm out "
+        f"BECAUSE no Python-side context exists there; that premise has changed, so re-derive the "
+        f"ruling and assert the context (BACKLOG #1317) rather than deleting this test"
+    )
+
+
+def test_the_sqlserver_hop_asserts_no_suites_and_pins_what_it_can_control(
+    asserted_contexts: list[tuple[str, ssl.SSLContext]],
+) -> None:
+    """The other half of the same ruling: what the ODBC hop CANNOT do, and what it does instead.
+
+    Building the SQL Server DSN reaches ``harden_cipher_suites`` zero times -- there is nothing to
+    hand it. What the engine *can* express on that hop it does express, and this pins those two
+    keywords so the scope-out never reads as "TLS is unhandled here". ``Encrypt``/
+    ``TrustServerCertificate`` are the posture; the suite list is the driver's.
+
+    The spy is the same one the opener tests use, and its liveness is proved by
+    ``test_rest_shared_opener_context_is_the_one_that_was_asserted`` recording a context under the
+    same fixture -- so an empty list here reports an absent call, not an inert instrument.
+    """
+
+    dsn, weakened = database._build_connection(
+        {
+            "server": "sql.example.test",
+            "database": "mefor",
+            "username": "mefor",
+            "password": "not-a-real-password",
+            "encrypt": True,
+            "trust_server_certificate": False,
+        },
+        connection="OB_TEST_DB",
+    )
+
+    assert not weakened
+    assert "Encrypt=yes;" in dsn and "TrustServerCertificate=no;" in dsn, (
+        f"the SQL Server preset no longer pins the TLS posture it CAN control: {dsn}"
+    )
+    assert not asserted_contexts, (
+        f"the ODBC DSN path asserted a cipher context ({[lbl for lbl, _ in asserted_contexts]}). "
+        f"ADR 0180 says no such context exists on this hop -- re-derive the ruling"
+    )
+
+
+#: Extras installed by a CI workflow, e.g. ``-e ".[dev,harness,fhir]"``.
+_CI_EXTRAS_RE = re.compile(r'-e\s+"\.\[([^\]]+)\]"')
+
+
+def _ci_installed_extras(root: Path) -> set[str]:
+    """Every project extra any workflow under ``.github/workflows/`` installs.
+
+    Comment lines are skipped: several workflows discuss ``-e ".[extras]"`` in their rationale, and a
+    comment naming an extra is not a leg installing it.
+    """
+    extras: set[str] = set()
+    for workflow in sorted((root / ".github" / "workflows").glob("*.yml")):
+        for line in workflow.read_text(encoding="utf-8").splitlines():
+            if line.lstrip().startswith("#"):
+                continue
+            for match in _CI_EXTRAS_RE.finditer(line):
+                extras.update(part.strip() for part in match.group(1).split(","))
+    return extras
+
+
+def test_the_hvac_scope_out_premise_still_holds(request: Any) -> None:
+    """ADR 0180 records the Vault (hvac) arm as UNMEASURED rather than built. This is its trigger.
+
+    hvac delegates to requests, which delegates to urllib3, which builds and owns the context per
+    connection -- so the engine holds no object, exactly as with ldap3. Unlike ldap3 the gap cannot be
+    closed by measurement: ``urllib3`` is absent from this interpreter and **no CI leg installs the
+    ``[vault]`` extra**, so a cipher assertion there would be a security control that no test in this
+    project can execute. The ADR names its own precondition: install the extra on a CI leg, and then
+    the honest instrument is urllib3's OWN ``urllib3.util.ssl_.create_urllib3_context()`` -- the
+    function urllib3 itself calls, not a hand-rolled look-alike.
+
+    Both halves red on the SAME action, so read either failure the same way: the instrument is now
+    executable, so build the assertion into both ``_build_client`` factories
+    (``store/keyprovider_vault.py`` and ``config/secretprovider_vault.py``, which between them cover
+    all three clients -- ``store/crypto_transit.py`` reuses the first) and amend ADR 0180.
+
+    The urllib3 half is keyed on PRESENCE, not on which extra brought it: the ``otel`` extra pulls it
+    transitively too, and it would make the instrument executable just as well.
+    """
+
+    root = Path(request.config.rootpath)
+
+    extras = _ci_installed_extras(root)
+    assert "webauthn" in extras, (
+        f"control: the workflow scan should see the extras CI really installs, but read {extras}"
+    )
+    assert "vault" not in extras, (
+        "a CI leg now installs the [vault] extra, which is ADR 0180's own named trigger: the hvac "
+        "cipher assertion is now writable AND testable, so build it (BACKLOG #1317)"
+    )
+
+    assert importlib.util.find_spec("urllib3") is None, (
+        "urllib3 is importable here, so urllib3.util.ssl_.create_urllib3_context() -- the instrument "
+        "ADR 0180 names -- can now be exercised by a test. The hvac hop's suite list is inherited and "
+        "unchecked; build the assertion (BACKLOG #1317) rather than relaxing this test"
+    )
 
 
 def _covered_files() -> list[tuple[str, str]]:

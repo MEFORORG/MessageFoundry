@@ -83,12 +83,33 @@ USER 10001
 # API (in-process TLS / plaintext-behind-proxy) + MLLP data plane. Documentation only; publish per topology.
 EXPOSE 8443 8765 2575
 # Liveness probe: GET /health is tokenless and always 200 (it answers even before the engine finishes
-# starting — a pure liveness signal, not readiness; there is no unauthenticated readiness endpoint).
-# Try in-process TLS on 8443 (the default shipped posture) — the container presents its OWN, often
-# self-signed, cert on loopback, so -k is MANDATORY here (default verification would fail the probe) —
-# then fall back to plaintext http on 8765 (the reverse-proxy topology). Override if you bind other ports.
+# starting, so it is a pure liveness signal, not readiness; there is no unauthenticated readiness
+# endpoint).
+#
+# ONE ARM, https ONLY. There is deliberately NO cleartext fallback: it would downgrade the probe to
+# http on any TLS failure, so a container with broken TLS still reported healthy. Why that is a
+# defect on a shipped artifact is recorded once, in BACKLOG #1179.
+#
+# PORT: this reads ONE of the four precedence layers. load_settings resolves CLI > env > file >
+# default; the probe reads MEFOR_API_PORT (the env override for [api].port) and falls back to the
+# engine's own default, 8765. compose and docker/k8s/*.yaml both move the port to 8443 that way, so
+# the probe follows them. THE OTHER TWO LAYERS ARE INVISIBLE TO IT: `serve --port 9443` in an
+# overridden command, or [api].port in the mounted /config, leaves a working engine behind a
+# permanently failing probe. Move the port either of those ways and override this HEALTHCHECK too
+# (a compose `healthcheck:` block, or `docker run --health-cmd`). Under `supervise --shards` each
+# shard binds <base>+offset, so this probe covers the base shard only. The k8s manifests declare
+# their own probe and never consult this one.
+#
+# -k IS NOT THE FALLBACK. Since ADR 0172 an engine with no configured certificate mints a
+# self-signed pair and serves https, so the container presents an untrusted cert on its own
+# loopback. -k skips VERIFICATION on a hop that never leaves the container's network namespace; it
+# does not skip encryption and it cannot reach a cleartext socket.
+#
+# NOT COVERED, deliberately: [api].tls_terminated_upstream, where a proxy terminates TLS in front
+# and the engine speaks plaintext to it. ADR 0172 mints nothing there, so that deployment must
+# override this HEALTHCHECK rather than have the image infer a plaintext hop from a TLS failure.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
-  CMD curl -fsS -k https://127.0.0.1:8443/health || curl -fsS http://127.0.0.1:8765/health || exit 1
+  CMD curl -fsS -k "https://127.0.0.1:${MEFOR_API_PORT:-8765}/health" || exit 1
 # tini reaps + forwards signals; `messagefoundry` is the engine CLI. Default prints serve usage; real
 # deployments override the command, e.g.:  serve --config /config --env prod
 ENTRYPOINT ["tini", "--", "messagefoundry"]

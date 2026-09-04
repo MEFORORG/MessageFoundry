@@ -578,8 +578,25 @@ def test_ingest_plane_rate_limit_row_matches_the_code() -> None:
         assert "NO message-RATE bound anywhere on the ingest plane" in block, (
             "and must name the resulting gap outright, not leave it inferred"
         )
-    # True under either ruling: the raw-TCP intake never got the pacer at all.
-    assert "raw-TCP inbound" in block
+    # Which OTHER intakes reach the pacer is read from their signatures too, for the same reason:
+    # BACKLOG #1114 ported it to the raw-TCP, X12 and HTTP intakes, and the row named the raw-TCP one
+    # as never covered. Pinning either state as correct would settle by build what the code decides.
+    for factory, label in (("Tcp", "raw-TCP"), ("X12", "X12"), ("Http", "HTTP")):
+        reaches = pacing_keys <= set(inspect.signature(getattr(wiring, factory)).parameters)
+        if reaches:
+            assert label in block, (
+                f"{factory}() now accepts the pacing keys, so the ingest row must name the "
+                f"{label} intake as covered rather than leave the reader to assume it is not"
+            )
+            assert f"Not covered even when set:** the {label} inbound" not in block, (
+                f"{factory}() now accepts the pacing keys, so the row may no longer list the "
+                f"{label} intake as uncovered"
+            )
+        else:
+            assert f"the {label} inbound" in block, (
+                f"{factory}() accepts neither pacing key, so the row must say the {label} intake "
+                "has no rate control rather than let a reader generalise from MLLP"
+            )
     for cap in ("max_connections", "receive_timeout", "max_frame_bytes", "max_message_bytes"):
         assert cap in block, f"the ingest row must name the {cap} resource cap it DOES have"
 
