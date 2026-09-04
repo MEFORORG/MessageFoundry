@@ -56,10 +56,14 @@ console package, so `import messagefoundry.api.app` still succeeds with the cons
 (`add_auth_routes` runs unconditionally and returns an `AdminHandlers` built from this leaf, so its
 concrete type must live engine-side).
 
-### `ENGINE_UI_SEAM` — the handshake integer
+### `ENGINE_UI_SEAM` — the handshake digest
 
-`api/_ui_seam.ENGINE_UI_SEAM: int` is the contract version the engine ships — **read the current value from that module**; it is deliberately not restated here, because a number quoted in prose goes stale silently (this line said "currently 1" until seam 11). The
-console declares `messagefoundry_webconsole.SUPPORTED_ENGINE_SEAMS: frozenset[int]` and refuses a skew
+`api/_ui_seam.ENGINE_UI_SEAM: str` is the contract identity the engine ships: a 16-hex-character
+SHA-256 digest of the contract surface, **derived and never chosen** (BACKLOG #1220). **Read the
+current value from that module**; it is deliberately not restated here, because a value quoted in
+prose goes stale silently (this line said "currently 1" back when the seam was a hand-picked
+integer). The console declares `messagefoundry_webconsole.SUPPORTED_ENGINE_SEAMS: frozenset[str]`
+and refuses a skew
 at startup via `assert_engine_seam(engine_seam)`, which raises `UiSeamMismatch` with a clear message
 rather than a raw `TypeError`. The handshake is **three-layered** and fails loud at every layer:
 
@@ -70,7 +74,7 @@ rather than a raw `TypeError`. The handshake is **three-layered** and fails loud
    surfaces as `UiSeamMismatch`, not a kwargs `TypeError`. A second identical assert at the top of
    `mount_ui` is belt-and-suspenders.
 3. **CI** — the package suite runs against the supported engine seam(s); the engine repo's snapshot gate
-   (below) fails on an unbumped incompatible change.
+   (below) fails on an incompatible change the seam did not follow.
 
 ### `mount_ui(app, deps)` and the injected bundle
 
@@ -91,8 +95,8 @@ Handler fields are typed `Callable[..., Awaitable[Any]]` (engine/gate params ins
 
 The auth dep factories — `require`, `require_step_up`, `require_reauth_only`, `get_auth`, `authorize_ws`,
 `ws_token` — are **not** injected; the console imports them directly from `messagefoundry.api.security`
-(leaf-safe). Their public surface is part of the seam's compat scope even so (a re-signature there is
-seam-bumping) and is captured by the snapshot gate.
+(leaf-safe). Their public surface is part of the seam's compat scope even so (a re-signature there
+moves the seam) and is captured by the snapshot gate.
 
 ### The `app.state` hooks
 
@@ -116,56 +120,105 @@ Independent versioning is exactly what makes runtime skew possible, so the engin
 **contract-snapshot gate**. Its purpose: a silent, incompatible change to the injected contract — a
 renamed handler field, a re-signatured `api.security` dep or `AuthService` method, or a renamed field on
 a **DTO the console renders** (which breaks render, not import, so `mypy` alone misses it) — must fail
-CI until `ENGINE_UI_SEAM` is bumped.
+CI until `ENGINE_UI_SEAM` is regenerated.
 
-Three files implement it:
+**The surface is DISCOVERED, not enumerated** (BACKLOG #1220). It used to be five hand-maintained
+tuples in the generator, and three of them had drifted: a list like that cannot detect its own
+omissions, because the gate's coverage *is* the list. Nothing below asks you to keep one current.
 
+Four files implement it:
+
+- [`scripts/seam_discovery.py`](../scripts/seam_discovery.py) — walks the console's own imports and
+  uses to derive the surface it depends on: the `api.security` deps, the `AuthService` members
+  (methods **and** properties), the `app.state` attributes, and the DTOs it renders, closed over
+  nested models. An idiom the walk cannot resolve exactly raises `SeamDiscoveryError` rather than
+  being skipped, so a new blind spot is loud instead of silent.
 - [`scripts/webconsole_seam_snapshot.py`](../scripts/webconsole_seam_snapshot.py) — emits a stable,
-  deterministic text serialization of the contract: `ENGINE_UI_SEAM`; the `UiDeps` / `CoreHandlers` /
-  `AdminHandlers` dataclass field names; a **curated** list of the cross-seam surface consumed outside
-  the bundle (the `api.security` deps' names+signatures, the `AuthService` methods, the `app.state`
-  attributes); and the **live-introspected** field sets of the `api.models` / `api.auth_models` DTOs the
-  console renders (so a rename on exactly those DTOs changes the snapshot).
+  deterministic text serialization of that surface: `ENGINE_UI_SEAM`; the `UiDeps` / `CoreHandlers` /
+  `AdminHandlers` dataclass field names; the discovered cross-seam surface consumed outside the
+  bundle; the DTO field sets, closed over nested models; and the enum member sets and `Literal` value
+  sets those DTOs expose. Field names alone are not the contract — the console indexes a dict by
+  `UploadedFileList.scope`, so a renamed literal would `KeyError` at runtime while a
+  field-name-only snapshot stayed byte-identical.
 - [`tests/golden/webconsole_seam.snapshot`](../tests/golden/webconsole_seam.snapshot) — the checked-in
   golden.
 - [`tests/test_webconsole_seam_snapshot.py`](../tests/test_webconsole_seam_snapshot.py) — regenerates the
-  snapshot and diffs it against the golden, failing with an actionable hint on any drift.
+  snapshot and diffs it against the golden, failing with an actionable hint on any drift. It also
+  pins the digest itself: `test_the_stored_seam_equals_the_derived_digest` fails any value that was
+  not derived from the current surface.
 
-This gate is the **sole backstop** against a *future* engine's unbumped, render-breaking DTO rename
-(the package CI matrix only covers engines that exist at package-CI time), so it must stay comprehensive
-and blocking.
+This gate is the **sole backstop** against a *future* engine's render-breaking DTO rename that the
+seam did not follow (the package CI matrix only covers engines that exist at package-CI time), so it
+must stay comprehensive and blocking.
 
-### Bumping the seam on an intentional contract change
+### Refreshing the seam on an intentional contract change
+
+**You cannot know the new value in advance, and you never type one.** The seam is a digest of the
+surface `seam_discovery.py` finds, so it exists only once the change is made and regenerated, and
+`test_the_stored_seam_equals_the_derived_digest` fails any hand-written value.
 
 When you deliberately change the injected contract (add/rename a `CoreHandlers`/`AdminHandlers` field,
-change an `api.security` dep signature, rename a rendered DTO field, add/remove an `app.state` hook or a
-consumed `AuthService` method):
+change an `api.security` dep signature, rename a rendered DTO field or one of its `Literal` values,
+add/remove an `app.state` hook or a consumed `AuthService` member):
 
 1. Make the contract change in the engine (and the matching consumer change in the package).
-2. Bump `ENGINE_UI_SEAM` in [`messagefoundry/api/_ui_seam.py`](../messagefoundry/api/_ui_seam.py)
-   (e.g. `1` → `2`).
-3. Update `messagefoundry_webconsole.SUPPORTED_ENGINE_SEAMS` in
-   [`messagefoundry_webconsole/__init__.py`](../messagefoundry_webconsole/__init__.py) to the NEW seam
-   alone — it holds exactly one value (BACKLOG #279). A test asserts
-   `SUPPORTED_ENGINE_SEAMS == {ENGINE_UI_SEAM}`, so forgetting this step fails CI on the bump commit
-   rather than at a deployment's startup. Widening it back to a range requires landing the cross-seam
-   CI matrix in the same change.
-4. If the change touched the *curated* surface (an `api.security` symbol, an `AuthService` method, an
-   `app.state` attribute, or which DTOs the console renders), update the corresponding list in
-   `scripts/webconsole_seam_snapshot.py`.
-5. Refresh the golden (write UTF-8, no BOM):
+2. Regenerate the engine side:
 
    ```bash
-   python scripts/webconsole_seam_snapshot.py > tests/golden/webconsole_seam.snapshot
+   python scripts/webconsole_seam_snapshot.py --write
    ```
 
-6. Confirm green: `python -m pytest tests/test_webconsole_seam_snapshot.py -q`.
-7. At release, update the compat range on both sides (the engine `[webconsole]` extra and the package's
+   That rewrites **both** `ENGINE_UI_SEAM` in
+   [`messagefoundry/api/_ui_seam.py`](../messagefoundry/api/_ui_seam.py) and the golden
+   [`tests/golden/webconsole_seam.snapshot`](../tests/golden/webconsole_seam.snapshot).
+
+   **Use `--write`, never a shell redirect over the golden**, and note that this fails in the worst
+   direction. A redirect writes the golden and never the constant, in every shell. The golden *embeds*
+   whatever `ENGINE_UI_SEAM` currently says, so redirecting makes the golden agree with a stale or
+   hand-typed value and `test_webconsole_seam_snapshot_matches_golden` goes **green** — measured
+   against a fabricated `deadbeefdeadbeef`. Exactly one test refuses it,
+   `test_the_stored_seam_equals_the_derived_digest`. (Windows PowerShell 5.1 also emits UTF-16LE with
+   a BOM there, which the test cannot decode as UTF-8 at all; `pwsh` 7 does not.)
+3. Set the console side **by hand, in the same commit**. `--write` deliberately leaves it alone — a
+   tool that wrote both halves would turn the handshake into a self-consistent tautology, removing
+   the one place a human states that this console build matches this engine contract. Its output
+   prints the exact one-line edit, with the new value already in it; paste that.
+
+   `messagefoundry_webconsole.SUPPORTED_ENGINE_SEAMS` in
+   [`messagefoundry_webconsole/__init__.py`](../messagefoundry_webconsole/__init__.py) holds exactly
+   one value (BACKLOG #279), and a test asserts `SUPPORTED_ENGINE_SEAMS == {ENGINE_UI_SEAM}`, so
+   forgetting this step reds CI on the same commit rather than becoming a hard startup refusal at a
+   deploying site. Widening it back to a range requires landing the cross-seam CI matrix in the same
+   change.
+4. Confirm green: `python -m pytest tests/test_webconsole_seam_snapshot.py -q`.
+5. At release, update the compat range on both sides (the engine `[webconsole]` extra and the package's
    `messagefoundry>=X,<Y` dep) — see the RELEASE checklist.
 
+**After any merge that moved the contract surface, regenerate. A clean merge is not evidence of a
+correct digest.**
+
+On a conflict, neither side is correct. If your branch and the base both moved the surface, the
+*merged* surface derives a **third** digest matching neither branch, so taking either side ships a
+value describing a tree that does not exist — and it looks like an ordinary conflict resolution.
+Resolve the markers to anything at all, rerun `--write`, then set the console side by hand from its
+output.
+
+The quieter half is why the rule is worded for every merge rather than for conflicts. The three files
+do not conflict together: the constant is one line and collides visibly, while the golden is long and
+its sections **auto-merge**. That is the #1220 origin story exactly — two branches, a cosmetic conflict
+in the constant's comment block, a golden that merged clean carrying both changes, and *resolving the
+visible conflict correctly still shipped the fault*. Nothing raises its hand for the half that merged
+quietly.
+
+What catches it is that `test_the_stored_seam_equals_the_derived_digest` **recomputes** from the
+surface rather than comparing two stored copies, so a stale digest reds CI. The consequence is
+therefore a red leg and a clean `main`, not a shipped wrong seam — but it presents as an
+unrelated-looking test failure on a merge somebody just resolved by hand, which is how a reader ends
+up debugging the gate instead of rerunning `--write`.
+
 If you see the snapshot test fail **without** having intended a contract change, that is the gate doing
-its job: an incompatible change leaked in. Fix the change or bump the seam deliberately — never refresh
-the golden to silence it.
+its job: an incompatible change leaked in. Fix the change, or make the contract change deliberately and
+rerun `--write` — never hand-edit the constant or the golden to silence it.
 
 ---
 
@@ -219,7 +272,7 @@ Option B decouples **development, test, and release**. It does **not** buy deplo
   console build still requires an **engine process restart** to rebuild the app — no hot-reload, no
   separate process/origin. This is the accepted cost of keeping the same-origin security model.
 - **New engine-data features.** A console change that needs a new engine handler, a new DTO field, or a
-  new `/ws` push field still requires an engine edit **plus a seam bump plus a coordinated release**.
+  new `/ws` push field still requires an engine edit **plus a seam change plus a coordinated release**.
   Only changes expressible over the existing contract are package-only.
 - **Hard cross-seam import.** `api.security`'s dep surface is imported directly (outside `UiDeps`), so a
   signature change there breaks the console outside the type-checked construction site — it is in the
