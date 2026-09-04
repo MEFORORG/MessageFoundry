@@ -721,4 +721,21 @@ jobs:
           # off by the third person who hits it.
           if [ -n "$MEFOR_MIN_DETECTORS" ]; then
             python scripts/security/scan_forbidden.py --assert-floor-fresh
+
+            # BACKLOG #321 -- CAN THE TABLE THAT LOADED ACTUALLY MATCH? The two checks above both count
+            # detectors: one asks whether the list fell below the floor, the other whether it outgrew
+            # it. Neither can see a table that is fully populated, fully fresh and INERT, which is a
+            # real state and not a hypothetical -- every site-code detector becomes an empty negative
+            # lookahead when no prefix loads, and an empty lookahead reports exactly what a clean tree
+            # reports. This probes each loaded class with a string built from that class, and prints
+            # counts and class names only, never a token.
+            #
+            # HERE AND NOT IN branch-leak-scan.yml ON PURPOSE: same secret, same tables, so a second
+            # copy would answer the same question twice and give two places for the answer to rot.
+            # This is the BLOCKING context, so it is where an inert instrument has to stop a merge.
+            #
+            # The pytest arm that asks this same question (tests/test_scan_forbidden_loaded_set.py)
+            # can only ever skip in CI -- no pytest job is given this secret -- so this stdlib
+            # entrypoint is the only place the REAL table is ever probed.
+            python scripts/security/scan_forbidden.py --self-test
           fi
