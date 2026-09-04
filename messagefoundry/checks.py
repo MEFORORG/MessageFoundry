@@ -52,6 +52,10 @@ relay, naming the trust anchor when it does and the acknowledgment state when it
 because the **serve gate** is what refuses an unauthenticated alert hop on an enforcing PHI instance;
 this only makes the hop's posture readable in review. It states the secure case out loud rather than
 going quiet, so a passing line is never confused with a check that did not run.
+So is ``smart-scope`` (#1159, ASVS 10.2.3) — it names every SMART-authenticated connection whose
+requested ``smart_scope`` asks for permission letters the connection's declared ``interaction`` cannot
+spend. Advisory because a SMART authorization server registers scopes per app and MAY grant a subset of
+what is requested, so refusing a requested string risks taking a working clinical feed offline.
 Exit-code policy lives in the CLI (``__main__._check``): 0 iff no required check failed.
 """
 
@@ -175,6 +179,9 @@ def run_checks(
         # is not the surface anyone queries three months later. Advisory — see the checks.
         _check_expiry_relaxed(config_dir),
         _check_generic_db_tls(config_dir),
+        # #1159 / ASVS 10.2.3: name every SMART connection asking for more FHIR authority than its
+        # declared interaction can spend. Advisory, and a refusal was ruled out — see the check.
+        _check_smart_scope(config_dir),
         # #323 layer 3: report whether the [alerts] SMTP hop authenticates the relay. The defect this
         # closes was invisible for exactly as long as nothing reported it. Advisory — see the check.
         _check_alert_smtp_tls(
@@ -1677,6 +1684,70 @@ def _check_generic_db_tls(config_dir: str | Path) -> CheckResult:
             "set a verifying keyword in odbc_params (e.g. SSLmode=verify-full). An enforcing "
             "instance REFUSES these off-loopback at build-check unless the connection declares "
             "tls_hop_attested or cleartext_accepted"
+        ),
+    )
+
+
+def _check_smart_scope(config_dir: str | Path) -> CheckResult:
+    """Surface every SMART-authenticated connection whose requested ``smart_scope`` asks for permission
+    letters the connection's DECLARED shape cannot use (#1159, ASVS 10.2.3).
+
+    ASVS 10.2.3 asks that the OAuth client request only the scopes it requires. Before this, both scope
+    settings travelled from operator config to the wire through one ``str(...)`` conversion and nothing
+    else, and ``check`` carried no scope rule at all — so on a first deployment a site would be free to
+    request broader FHIR authority than the connection can spend, with nothing reporting it. This is
+    that report.
+
+    **Advisory (``required=False``), and a refusing gate was ruled out on the merits.** A SMART
+    authorization server registers scopes per app and MAY grant a subset of what is requested, so a
+    requested string that looks wrong here can be exactly the string a partner registered. Refusing it
+    would take a working clinical feed offline to enforce a preference, which is a worse failure than
+    the one it prevents. The instrument that fits is one that makes the mismatch readable in review.
+
+    **It computes a requirement from the connection's declared shape and compares the request against
+    it** — :func:`~messagefoundry.config.wiring.overbroad_smart_scopes` — rather than pattern-matching
+    a ``*`` character in the scope string. A character match would let an over-broad NON-wildcard scope
+    on a create-only connection pass unremarked while reading as a control.
+
+    What it deliberately stays quiet about is in that function's docstring: under-grant, the resource
+    half of the scope, ``transaction``/``batch``, a plain ``Rest()`` with SMART auth, an unparseable
+    scope vocabulary, and the generic OAuth2 leg. Each silence is a case where computing a requirement
+    would be guessing, and an advisory that fires on a valid configuration teaches operators to ignore
+    it.
+
+    It states the clean case out loud rather than going quiet, on the ``alert-smtp-tls`` convention, so
+    a passing line is never confused with a check that did not run. SKIPs when the graph will not load
+    — ``validate`` reports that, and a check that reported an empty set on an unloadable config would be
+    worse than one that says it could not look."""
+    from messagefoundry.config.wiring import WiringError, load_config, overbroad_smart_scopes
+
+    try:
+        registry = load_config(config_dir)
+    except (WiringError, OSError, ImportError, SyntaxError, ValueError) as exc:
+        return CheckResult(
+            "smart-scope",
+            ok=True,
+            required=False,
+            skipped=True,
+            detail=f"config did not load: {exc}",
+        )
+    over = overbroad_smart_scopes(registry)
+    if not over:
+        return CheckResult(
+            "smart-scope",
+            ok=True,
+            required=False,
+            detail="no SMART connection requests permission letters its declared shape cannot use",
+        )
+    listed = "; ".join(f"{name}: {reason}" for name, reason in over)
+    return CheckResult(
+        "smart-scope",
+        ok=True,
+        required=False,
+        detail=(
+            f"{len(over)} SMART connection(s) request more FHIR authority than the connection can "
+            f"spend — {listed}; narrow the request to the letters the interaction uses "
+            "(SMART v2: c=create, r=read, u=update, d=delete, s=search)"
         ),
     )
 

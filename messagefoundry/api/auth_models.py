@@ -54,7 +54,14 @@ class UserSummary(BaseModel):
     username: str
     auth_provider: str
     display_name: str | None = None
+    #: The account's PROFILE address. On a directory account this is a mirror the next AD/OIDC login
+    #: overwrites, so it is not where a security notice goes -- see ``notify_email`` (BACKLOG #1139).
     email: str | None = None
+    #: READ-ONLY: the engine-owned address every out-of-band security notice is sent to. No directory
+    #: sync writes it, and no request can clear it -- it is repointed by setting ``email`` on a PATCH.
+    #: Surfaced so an operator can see where notices actually go; without it the split is invisible.
+    #: Defaults None, so an older client that never reads it is unaffected.
+    notify_email: str | None = None
     disabled: bool
     roles: list[str]
     channel_scope: list[str] | None = None  # per-channel RBAC: allowed connections; None = all
