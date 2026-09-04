@@ -109,13 +109,23 @@ _NAMING_MECHANISMS = frozenset({"path-literal", "path-pattern", "bare-filename",
 #: ``docs/BACKLOG.md`` written out, either slash direction. A Windows-spelled path is still a path.
 _PATH_LITERAL = re.compile(r"docs[/\\]BACKLOG\.md")
 
-#: The same path spelled as a REGEX or a GLOB, which a literal search cannot find. Three live shapes:
-#: an escaped dot (``BACKLOG\.md``, the pre-commit ``files:`` filter), a star (``BACKLOG*``), and a
-#: regex any-run (``BACKLOG.*``). Anchored on the token so ``BACKLOG-CLOSED.md`` does not match here.
-_PATH_PATTERN = re.compile(r"BACKLOG(?:\\\.md|\*|\.\*)")
+#: The same path spelled as a REGEX or a GLOB, which a literal search cannot find: an escaped dot
+#: (``BACKLOG\.md``, the pre-commit ``files:`` filter), a glob (``BACKLOG*.md``), a regex any-run
+#: (``BACKLOG.*\.md``).
+#:
+#: EVERY ARM MUST REACH THE ``md``, AND THAT IS NOT TIDINESS. The first version accepted a bare
+#: ``BACKLOG*``, on the reasoning that a glob is a glob. Run over the tree it reported
+#: ``docs/benchmarks/HANDOFF-enginebox-step2-step3.md``, which says "pages scale with **BACKLOG**"
+#: -- the closing bold marker of ordinary prose read as a wildcard. One false positive in a
+#: population of four is a 25 percent error in the one class this tool exists to surface, and it
+#: would have been reported as a migration target. Found by listing the hits rather than by trusting
+#: the count, which is the only way this class is ever found.
+_PATH_PATTERN = re.compile(r"BACKLOG(?:\\\.md|\*\\?\.?md|\.\*\\?\.?md)")
 
-#: ``BACKLOG.md`` with no ``docs/`` prefix. The lookbehind keeps ``BACKLOG-CLOSED.md`` and any other
-#: hyphenated sibling out: only the bare ledger filename counts.
+#: The ledger FILENAME wherever it appears -- a relative link, prose, or inside the full path, so
+#: this is a deliberate SUPERSET of ``path-literal`` rather than its complement (a file often has
+#: both, and a mechanism set is not a partition). The lookbehind keeps ``BACKLOG-CLOSED.md`` and any
+#: other hyphenated sibling out: only the live ledger's own filename counts.
 _BARE_FILENAME = re.compile(r"(?<![\w-])BACKLOG\.md")
 
 #: Reads the ledger through the single-source parser rather than by path.

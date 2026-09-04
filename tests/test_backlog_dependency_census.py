@@ -183,6 +183,43 @@ def test_the_closed_archive_filename_is_not_read_as_the_live_ledger(tmp_path: Pa
     assert result.references == []
 
 
+@pytest.mark.parametrize(
+    "prose",
+    [
+        "pages scale with **BACKLOG**, which differs per arm\n",
+        "the *BACKLOG* is long\n",
+        "BACKLOG #1250 is the item\n",
+    ],
+)
+def test_bold_markdown_around_the_word_is_not_a_glob(tmp_path: Path, prose: str) -> None:
+    """MEASURED, NOT PREDICTED. The first version of the glob arm accepted a bare ``BACKLOG*``, and
+    the real tree answered with ``docs/benchmarks/HANDOFF-enginebox-step2-step3.md`` -- prose whose
+    closing bold marker read as a wildcard. One false positive in a population of four is a quarter
+    of the one class this tool exists to surface, reported as a migration target.
+
+    Found by LISTING the hits, never by reading the count, which is the only way this class is found.
+    """
+    repo = _synthetic_repo(tmp_path / "repo", {"note.md": prose})
+    assert census_mod.run_census(repo).references == []
+
+
+@pytest.mark.parametrize(
+    "spelling",
+    [
+        "files: ^docs/(BACKLOG\\.md|archive/backlog/.*\\.md)$",
+        "glob('BACKLOG*.md')",
+        "re.compile(r'BACKLOG.*\\.md')",
+    ],
+)
+def test_the_real_pattern_spellings_still_fire(tmp_path: Path, spelling: str) -> None:
+    """The other half of the arm above. Tightening a pattern until it catches nothing is the easy
+    way to make a false positive go away, and it is the failure this project keeps filing."""
+    repo = _synthetic_repo(tmp_path / "repo", {"conf.yaml": spelling + "\n"})
+    result = census_mod.run_census(repo)
+    assert [ref.path for ref in result.references] == ["conf.yaml"]
+    assert "path-pattern" in result.references[0].mechanisms
+
+
 def test_a_broken_detector_reds_the_controls(monkeypatch: pytest.MonkeyPatch) -> None:
     """The control arm must be CAPABLE of going red, or it is a green tick over an assumption.
 
