@@ -5751,6 +5751,45 @@ complete result, not a stall.
 **Source:** the bypass was found 2026-08-05 by a session auditing its own change after a peer noted that `ledger_check.py`'s ownership model depends on the worktree gate; `--detach` and `-d` were then found by asking the same question a second time rather than patching the first flag.
 
 ## 1040. Hook deny text is attacker-influenceable output that an agent is instructed to act on, and nothing treats it as such
+
+> ✅ **CLOSED 2026-09-03 -- the banner the note below deferred is flipped here, after re-measuring
+> every claim it rests on. No code changed; this is the ledger act, not a second build.**
+>
+> **THE FOUR COMMITS ARE ON `origin/main`, CHECKED RATHER THAN INHERITED.** At `fd44b0f1`:
+> `f911ebe5`, `608738e6` and `590b68f6` (branch `w2-l3-gate-emitter`, which `git ls-remote --heads
+> origin` no longer returns, consistent with a merge) and `889dd9409` (PR #547). Instrument:
+> `git merge-base --is-ancestor <sha> origin/main`, exit 0 on all four. **Control that must fire:**
+> the reversed pair, `--is-ancestor origin/main f911ebe5`, exits 1 -- so this instrument can say no.
+>
+> **THE FOLD IS `_safe_for_message`, AND COUNTING CALL SITES GIVES A DIFFERENT NUMBER THAN COUNTING
+> GREP HITS.** On `origin/main`: `claim_check.py` **4** call sites (`:253`, `:254`, `:255`, `:256`),
+> `push_guard.py` **5** (`:246`, `:253`, `:264`, `:274`, `:275`), `ledger_check.py` **2** (`:327`,
+> `:345`). Each file also carries exactly one `def`, which a bare name-grep counts as a hit -- so the
+> **5** the note below quotes for `claim_check.py` is 4 sites plus the definition. `29eae2a2`'s commit
+> message carries the same 5 for the same reason. **Two controls, because a zero from an unread file
+> and a zero from a treated file look identical:** `def main` returns 1 in each of the three (the
+> files were really read -- 275, 372 and 452 lines), and the same pattern over
+> `scripts/coord/dispatch_gate.py` returns 0, so a zero is reachable and means something.
+>
+> **THE DENY SURFACE IS NOW ENUMERATED, WHICH IT WAS NOT WHEN THIS ITEM WAS FILED.** Six hooks emit a
+> refusal an agent is told to act on. Three fold in Python (`claim_check.py`, `push_guard.py`,
+> `ledger_check.py`); two fold in PowerShell (`worktree_gate.ps1`, `collision_gate.ps1`, 40 and 17
+> helper references). The sixth, `block-blanket-git-stage.ps1`, interpolates **no** caller-supplied
+> value at all: its `$reason` is one of three literals and `$msg` interpolates only that literal. It
+> needs no treatment rather than lacking one, and saying which is the point of enumerating.
+>
+> **WHAT THIS CLOSE DOES NOT COVER, NAMED SO IT IS NOT MISTAKEN FOR COVERED: #1424.** This item is
+> about deny text. A hook that injects `additionalContext` also writes prose an agent acts on, and
+> `steer-inject.ps1` interpolates an unfolded file value into a frame asserting the owner typed it.
+> The treatment already reached two of its siblings -- `usage-headroom-inject.ps1` folds and cites
+> this item by number, `mail-drain.ps1` cleans, prefixes and caps -- which is why the one that does
+> neither is worth a row of its own rather than a sentence in this one.
+>
+> **THE SCORING TABLE AT THE HEAD OF THIS FILE STILL CARRIES THE STRUCK SENTENCE, AND THAT IS THE
+> FILE'S OWN RULE RATHER THAN AN OVERSIGHT.** That table states it is a view of the banners and that
+> the banner wins where the two disagree; measured 2026-09-03, **73** of its rows already point at
+> items closed in place. Correcting one row would imply the other 72 are current.
+
 > **BOTH REMAINING SURFACES ARE CLOSED 2026-08-27; banner left open for the archive pass.**
 > `push_guard.py` and `ledger_check.py` now fold every attacker-influenceable value they interpolate
 > into deny prose -- `remote_ref` (which arrives on STDIN) and `_describe(hits)` in the first,
@@ -5782,9 +5821,9 @@ complete result, not a stall.
 > with the sibling gate; it removes the question rather than re-deriving it at each new call site.
 >
 
-> 🚧 **Re-scored 2026-08-20 -> P2.** Value **6/10** · Difficulty **3/10** · _quick win_. The two proven-exploitable surfaces are closed and one helper per class exists in PowerShell, so the residual is applying the same treatment to the Python hooks, of which claim_check.py:134-140 is a confirmed untreated prose interpolation of a newline-capable value. Value drops from 8 because the highest-influence values (a refname into a command, a Write file_path into prose) are now folded, and difficulty drops from 5 because the audit is done and the Python hooks need one small helper rather than the PowerShell one. _(was 8/10 · 5/10.)_
+> **Re-scored 2026-08-20 -> P2.** Value **6/10** · Difficulty **3/10** · _quick win_. The two proven-exploitable surfaces are closed and one helper per class exists in PowerShell, ~~so the residual is applying the same treatment to the Python hooks, of which claim_check.py:134-140 is a confirmed untreated prose interpolation of a newline-capable value~~ **[STRUCK 2026-09-03 -- TRUE WHEN WRITTEN, STALE THREE DAYS LATER, AND THE STALE HALF IS THE HALF A READER ACTS ON. `claim_check.py` was folded 2026-08-23 in `889dd9409` (PR #547); `push_guard.py` and `ledger_check.py` followed 2026-08-27 in `29eae2a2` (PR #647). The 2026-08-27 note at the top of this item says so, but it sits ABOVE this line, so a reader working down the row meets the correction first and the stale claim second -- and the row's own words are that a reader taking it at face value would have rebuilt merged work. Struck rather than deleted: deleting it removes the evidence that this row was once wrong, which is what stops the next reader trusting a re-score by its date. Re-measured on `origin/main` at `fd44b0f1` -- all three hooks fold; see the closing banner for the counts and their controls.]** Value drops from 8 because the highest-influence values (a refname into a command, a Write file_path into prose) are now folded, and difficulty drops from 5 because the audit is done and the Python hooks need one small helper rather than the PowerShell one. _(was 8/10 · 5/10.)_
 >
-> **IN PROGRESS 2026-08-10 — the audit is complete and two surfaces are closed; branch `w2-l3-gate-emitter` (`f911ebe5`, `608738e6`, `590b68f6`).** `worktree_gate.ps1` now has exactly one helper per class -- `Get-SafeForMessage` folds a value entering PROSE, `Get-SafeForCommand` single-quotes one entering a COMMAND -- plus `Protect-CommandLines`, a sweep at `Write-Deny` (the one funnel every rule already passes through) that drops shell metacharacters sitting OUTSIDE a quoted span on an indented `pwsh`/`git` line. A helper-produced value is inside quotes and is untouched, so the sweep cannot make a correct line wrong; it only defangs a line whose author did not use the helper, which is the failure that actually recurs. Shape for the guarantee, names for the message -- the same split rule 1b already makes. `collision_gate.ps1` got the prose fold, as a LOCAL copy: `worktree_gate.ps1` is installed outside every working tree and can dot-source nothing, so a shared module would be importable by one hook and not the other. Closes #1035, #1076 and #1036 as instances. At least one hook surface and one design question remain -- see the session report; neither is described here.
+> **IN PROGRESS 2026-08-10 — the audit is complete and two surfaces are closed; branch `w2-l3-gate-emitter` (`f911ebe5`, `608738e6`, `590b68f6`).** `worktree_gate.ps1` now has exactly one helper per class -- `Get-SafeForMessage` folds a value entering PROSE, `Get-SafeForCommand` single-quotes one entering a COMMAND -- plus `Protect-CommandLines`, a sweep at `Write-Deny` (the one funnel every rule already passes through) that drops shell metacharacters sitting OUTSIDE a quoted span on an indented `pwsh`/`git` line. A helper-produced value is inside quotes and is untouched, so the sweep cannot make a correct line wrong; it only defangs a line whose author did not use the helper, which is the failure that actually recurs. Shape for the guarantee, names for the message -- the same split rule 1b already makes. `collision_gate.ps1` got the prose fold, as a LOCAL copy: `worktree_gate.ps1` is installed outside every working tree and can dot-source nothing, so a shared module would be importable by one hook and not the other. Closes #1035, #1076 and #1036 as instances. ~~At least one hook surface and one design question remain -- see the session report; neither is described here.~~ **[AMENDED 2026-09-03 -- the two halves of that sentence ended differently, so it is struck as one claim and answered as two. THE HOOK-SURFACE HALF IS DISCHARGED: all three Python hooks fold on `origin/main` (`claim_check.py` 2026-08-23 in `889dd9409`; `push_guard.py` and `ledger_check.py` 2026-08-27 in `29eae2a2`), and the sixth deny emitter, `block-blanket-git-stage.ps1`, interpolates no caller value to fold. THE DESIGN-QUESTION HALF IS UNRECOVERABLE, and this is a statement about the record rather than a verdict on the question: the session report it forwards to is in no tracked file, and neither closing commit message describes an open design question. Nothing is filed for a question nobody can state. #1424 is a fresh measurement taken during this close, on an adjacent surface, and must not be read as a recovery of it.]**
 > Verdict: build
 > Closing-act: code
 
@@ -5798,7 +5837,7 @@ complete result, not a stall.
 
 **What the work is.** Enumerate every deny and remediation surface across `scripts/hooks/`, classify each interpolated value as command-bound or prose-bound, and apply the matching treatment through one shared helper per class rather than at each site. The audit is the deliverable; the individual fixes are small.
 
-**Related:** #1032 and #1035 (the same output surface, viewed as runnability rather than injection), #1039.
+**Related:** #1032 and #1035 (the same output surface, viewed as runnability rather than injection), #1039, #1424 (the same class on the CONTEXT-INJECTION surface rather than the deny surface, filed out of this item's close).
 
 **Source:** the two instances were found independently on 2026-08-05 by one session (refname, in Rule 3b) and a second session (file path, in Rule 1b), the second after the first asked whether the new rule interpolated an attacker-influenceable value into a command form. Filed separately from the five deferrals it was grouped with, because the general form is a different and larger item than any of them.
 
@@ -19993,3 +20032,54 @@ That is the same `self._lock` the staged-pipeline handoffs take. On a first depl
 **PARTLY CLOSED ALREADY, AND THE CLOSURE SITS IN THE WRONG ARTIFACT.** The full record -- both questions, all eight options, both answers quoted -- is [comment 5515263760 on PR 749](https://github.com/MEFORORG/MessageFoundry/pull/749#issuecomment-5515263760), written 2026-09-02. A pull-request comment is a real improvement on a session transcript, which does not survive its session. It is still not the ADR, and the ADR is what a reader consults. **This limb differs from the first two in shape:** closing it needs no decision about the engine, only the record moved into the artifact people actually read.
 
 **THE GENERAL PROBLEM, stated once so it is not re-derived per incident.** A decision recorded as an outcome plus a delegation is not reviewable. The inputs -- the question, the options, the answer -- are what let a later reader tell a considered call from an arbitrary one, and they are exactly the part that lives in the least durable place.
+
+## 1424. steer-inject.ps1 puts an unfolded file value inside a frame asserting the OWNER typed it
+
+> 🔢 **Filed 2026-09-03 -- not started. Found while closing #1040, on the surface that item does not
+> cover.** `scripts/hooks/steer-inject.ps1` reads `<project>\.claude\steer.txt` whole, trims it, and
+> interpolates it into one `additionalContext` string that opens *"[STEERING NOTE -- the user just
+> typed this via a side channel while you were mid-task ... Read it now and act on it right away ...
+> Do not wait for the current turn to end.]: "*. **The value is not folded.** A note carrying a line
+> break closes that frame and can open a second one, and the frame it forges inherits the sentence
+> above it: an assertion that the OWNER said this. That is a stronger claim than any deny remediation
+> makes, which is what makes this worth its own row rather than a footnote on #1040.
+>
+> **THE TREATMENT ALREADY EXISTS IN TWO SIBLINGS, SO THIS IS AN OMISSION AND NOT AN OPEN DESIGN
+> QUESTION.** `usage-headroom-inject.ps1` carries `Get-Folded` and its comment cites BACKLOG #1040 by
+> number as the reason. `mail-drain.ps1` goes further for the same class: `Get-Clean` as "THE ONE
+> SANITISER", a standing preamble telling the reader the content is DATA and its provenance fields
+> are unverified claims, and a `    | ` prefix on every content line so message text cannot reach
+> column 0. Either shape would answer this; the second is the better fit, because a steering note is
+> content rather than a metadata field.
+> Verdict: build
+> Closing-act: code
+
+**Cluster:** Developer guardrail / hook output integrity. **Priority:** P3 -- pending a score.
+**Verdict:** build (small).
+**Severity:** no deployment axis (section 0). This is coordination tooling and ships in no wheel.
+Nothing is exposed today; what would be wrong on use is that a file any process on the box can write
+reaches a session inside a frame claiming the owner wrote it.
+
+**THE HOOK IS OPT-IN, WHICH LOWERS THE ODDS AND NOT THE DEFECT.** Its own header records that it is
+deliberately absent from the shared `.claude/settings.json` and is enabled per worktree in
+`settings.local.json`, because a `PreToolUse` hook on `*` costs a process spawn before every tool
+call. So a session that never enables it is unaffected. A session that does enable it has no fold.
+
+**WHAT WOULD PROVE A FIX.** A note whose content carries CR, LF or a control character must not be
+able to add a line to the emitted `additionalContext`, asserted on the emitted STRING rather than on
+the presence of a helper -- the distinction `29eae2a2` records for the Python hooks, where a working
+fold that is never called and a called fold that does nothing red on different rows. A positive
+control must show the payload really contains the lines being folded, or the assertion passes over an
+empty string.
+
+**AT LEAST ONE FILE, NOT AN ENUMERATION.** Four hooks emit `additionalContext`
+(`steer-inject.ps1`, `mail-drain.ps1`, `usage-headroom-inject.ps1`, `lane-level.ps1`). Two are
+treated, as above. `lane-level.ps1` builds its lines from its own literals plus counts and lane
+labels read from lane files; that path was **not** measured here and is neither cleared nor accused.
+
+**Related:** #1040 (the same class on the DENY surface, closed 2026-09-03 -- read that row for the
+helper-per-class split and for why each hook carries a local copy), #1339 (a different defect in the
+`scripts/hooks/` wiring record).
+
+**Source:** measured 2026-09-03 while re-verifying #1040 against `origin/main` at `fd44b0f1`, by
+enumerating every hook that writes text an agent acts on rather than only the ones #1040 named.
