@@ -1284,6 +1284,171 @@ async def test_notifier_fires_on_ad_driven_role_change() -> None:
         await store.close()
 
 
+# ---------------------------------------------------------------------------------------------
+# BACKLOG #1139 (ASVS 6.3.7): the notification address is engine-owned, and the directory cannot
+# reach it. Every test below fails before the split, because before it there was one column and the
+# directory's write landed on it.
+# ---------------------------------------------------------------------------------------------
+
+
+async def test_a_directory_repoint_cannot_redirect_the_accounts_notices() -> None:
+    """THE DEFECT THIS ITEM WAS FILED AGAINST, end to end.
+
+    ``_upsert_ad_user`` runs on every AD/OIDC login and writes the account's address straight from the
+    directory's ``mail`` attribute. While one column served as both the mirror and the notification
+    target, a repointed attribute silently became the destination of every later notice on that
+    account -- so the question the item poses, "which address do we notify when the directory owns the
+    attribute", had no answer: the operation replacing the address was the one the notice was about.
+
+    After the split there is an address the repoint is not replacing, and the question dissolves.
+    """
+    store = await _store()
+    try:
+        original = AdPrincipal(
+            username="jdoe",
+            display_name="J Doe",
+            email="jdoe@example.org",
+            dn="CN=jdoe,DC=x",
+            groups=frozenset({"cn=mf-ops,dc=x"}),
+        )
+        # The same account, after someone repoints the directory's mail attribute.
+        repointed = AdPrincipal(
+            username="jdoe",
+            display_name="J Doe",
+            email="attacker@evil.example",
+            dn="CN=jdoe,DC=x",
+            groups=frozenset({"cn=mf-ops,dc=x"}),
+        )
+
+        class _FakeLdap:
+            def authenticate(self, username: str, password: str) -> AdPrincipal | None:
+                return None  # simple bind is retired (BACKLOG #1137); logins go through the tail
+
+            def resolve_principal(self, username: str) -> AdPrincipal | None:
+                return original if username == "jdoe" else None
+
+        settings = AuthSettings(
+            ad_enabled=True,
+            ad_server="ldaps://x",
+            ad_user_search_base="DC=x",
+            ad_bind_dn="CN=svc,DC=x",
+            ad_bind_password="x",
+        )
+        notifier = _FakeNotifier()
+        service = AuthService(store, settings, ldap=_FakeLdap(), security_notifier=notifier)  # type: ignore[arg-type]
+        await service.initialize()
+        await service.set_ad_group_map([("CN=MF-Ops,DC=x", "operator")], actor="admin")
+
+        # First login provisions the account and seeds the notification address once.
+        assert (await service._complete_ad_login(original, None, mfa_verified=True)).ok
+        user = await store.get_user_by_username("jdoe")
+        assert user is not None and user.notify_email == "jdoe@example.org"
+
+        # The directory now says something else, and the account logs in again.
+        assert (await service._complete_ad_login(repointed, None, mfa_verified=True)).ok
+        user = await store.get_user_by_username("jdoe")
+        assert user is not None
+        assert user.email == "attacker@evil.example"  # the mirror tracks the directory
+        assert user.notify_email == "jdoe@example.org"  # the notification target does not
+
+        # Now make the account emit a notice and check where it is addressed. A role resync is the
+        # cheapest trigger that runs on the same directory path the repoint came in on.
+        await service.set_ad_group_map([("CN=MF-Ops,DC=x", "viewer")], actor="admin")
+        assert (await service._complete_ad_login(repointed, None, mfa_verified=True)).ok
+        roles_changed = [e for e in notifier.events if e.event_type == ROLES_CHANGED]
+        assert roles_changed[-1].email == "jdoe@example.org"
+        assert all(e.email != "attacker@evil.example" for e in notifier.events)
+    finally:
+        await store.close()
+
+
+async def test_clearing_the_profile_address_leaves_the_account_still_notifiable() -> None:
+    """THE DURABILITY RULE, end to end, and the limb the item says the build owes itself.
+
+    Making an address required at creation does not make it durable: an explicit null still clears it
+    afterwards, and after the clear ``SecurityEventNotifier.notify`` returns early and the account is
+    structurally excluded from every later notice. So the clear must not be able to reach the
+    notification address at all -- ``set_user_notify_email`` takes a non-empty ``str``, and the admin
+    profile path simply does not call it with a blank.
+
+    Reachable exactly as the item describes: ``PATCH /users/{id}`` with an explicit null, and the
+    console form, which posts a blanked field as ``None``.
+    """
+    store = await _store()
+    try:
+        notifier = _FakeNotifier()
+        service = AuthService(store, AuthSettings(), security_notifier=notifier)
+        await _local_user(store, email="bob@example.org")
+
+        await service.update_user("u1", display_name=None, email=None, disabled=None, actor="admin")
+        cleared = await store.get_user("u1")
+        assert cleared is not None
+        assert cleared.email is None  # the profile mirror really did clear
+        assert cleared.notify_email == "bob@example.org"  # the notification address stood
+
+        # The account is NOT excluded from later notices, which is the whole point of the limb.
+        before = len(notifier.events)
+        await service.set_roles("u1", ["viewer"], actor="admin")
+        later = notifier.events[before:]
+        assert [e.event_type for e in later] == [ROLES_CHANGED]
+        assert later[0].email == "bob@example.org"
+    finally:
+        await store.close()
+
+
+async def test_an_admin_can_still_repoint_where_notices_go() -> None:
+    """Negative control for the test above: the address is durable, not frozen. Without this, making
+    ``set_user_notify_email`` a no-op would pass every other test in this block."""
+    store = await _store()
+    try:
+        notifier = _FakeNotifier()
+        service = AuthService(store, AuthSettings(), security_notifier=notifier)
+        await _local_user(store, email="old@example.org")
+
+        await service.update_user(
+            "u1", display_name=None, email="new@example.org", disabled=None, actor="admin"
+        )
+        moved = await store.get_user("u1")
+        assert moved is not None and moved.notify_email == "new@example.org"
+
+        # The notice about the repoint itself still goes to the address on file BEFORE it -- the
+        # legitimate owner is alerted even when it was a mistaken or hostile admin who moved it.
+        changed = next(e for e in notifier.events if e.event_type == EMAIL_CHANGED)
+        assert changed.email == "old@example.org"
+
+        # And the NEXT notice goes to the new one.
+        before = len(notifier.events)
+        await service.set_roles("u1", ["viewer"], actor="admin")
+        assert notifier.events[before].email == "new@example.org"
+    finally:
+        await store.close()
+
+
+async def test_the_deliverability_gate_reads_the_notification_address() -> None:
+    """``has_notifiable_admin`` decides whether a PHI instance may start. It must ask about the column
+    a notice is actually addressed to: an administrator whose profile mirror the directory had just
+    repointed would otherwise read as notifiable on an address no notice uses -- the instrument
+    answering the adjacent question (SDS-3.8)."""
+    store = await _store()
+    try:
+        service = AuthService(store, AuthSettings())
+        boot = await service.initialize()
+        assert boot is not None
+        admin = await store.get_user_by_username("admin")
+        assert admin is not None
+        assert not await service.has_notifiable_admin()  # minted with no address at all
+
+        # A profile-only write -- the shape of a directory sync -- must NOT satisfy the gate.
+        await store.update_user_profile(admin.id, display_name=None, email="admin@example.org")
+        assert not await service.has_notifiable_admin()
+
+        # Setting the engine-owned address does.
+        await store.set_user_notify_email(admin.id, email="admin@example.org")
+        assert await service.has_notifiable_admin()
+    finally:
+        await store.close()
+
+
 # --- WP-L3-12: admin password reset (ASVS 6.4.6) -----------------------------
 
 

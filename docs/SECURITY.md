@@ -1758,7 +1758,7 @@ multi-host deployment must additionally front the API with a proxy/WAF limiter a
 | Request body | `[store].max_upload_bytes` (the `/uploads` routes only) | 1 MiB elsewhere | per request | no | no | no | **stateless** — every route, in ASGI middleware | **413** over the cap, **400** on ambiguous CL+TE framing or an invalid `Content-Length`, **411** on a chunked body |
 | OIDC pending flows | `[auth].oidc_flow_cache_max` (global), `DEFAULT_PER_IP_CAP` (per-IP, no knob), `oidc_flow_ttl_seconds` | 512 / 16 / 300 s | 300 s TTL | no | **yes** (512) | **yes** (16) | **in-process** — `GET /ui/oidc/start` — reject-when-full, never evict | 303 → `/ui/login?e=rate_limited`, WARNING-logged, **never** audited |
 | WebAuthn pending ceremonies | `GLOBAL_PENDING_CAP`, `PER_USER_PENDING_CAP`, `CHALLENGE_TTL_SECONDS` (module constants, no knobs) | 4096 / 16 / 120 s | 120 s TTL | **yes** (16) | **yes** (4096) | no | **in-process** — every passkey registration + assertion ceremony | per-user: evicts that user's **own** oldest pending ceremony (silent); global: `ChallengeCacheFullError` naming the cause + the `admin_reset_mfa` recovery path |
-| **Ingest plane** | `max_messages_per_second`, `message_burst` (MLLP inbound) | **off** (unset = no rate bound) | per message | no | no | no | **in-process** — one bucket per MLLP connection, so it neither coordinates across engine shards nor aggregates per peer | **Ships OFF, and the off default is ruled rather than accidental** — a rate on a clinical interface is only safe at a number taken from a real feed profile. **So a default install has NO message-RATE bound on the ingest plane**, and that is a deliberate posture, not a gap in the control. Both keys are parameters of the `MLLP()` factory, and `connections.toml` desugars through that same factory, so **the code-first and the TOML surface both express them** (BACKLOG #1249 — until that landed the pacer was built and no documented configuration could turn it on, which is a different and worse thing than being off). *What it does when set:* the listener **pauses reading** over budget so TCP back-pressures the sender; no message is dropped, refused, NAK'd or reordered — the count-and-log invariant forbids accept-and-drop, so a discarding limiter was never available. **Not covered even when set:** the raw-TCP inbound, and any per-peer bound (MLLP peers are unauthenticated, so the only key would be source IP, which NAT collapses). **Resource bounds that DO ship on** — `max_connections` (256), `receive_timeout` (60.0 s), `max_frame_bytes` (16 MiB), per-connection `max_message_bytes`, `source_ip_allowlist` |
+| **Ingest plane** | `max_messages_per_second`, `message_burst` (MLLP, raw-TCP, X12 and HTTP inbounds) | **off** (unset = no rate bound) | per message | no | no | no | **in-process** — one bucket per MLLP / raw-TCP / X12 **connection** and one per HTTP **listener**, so it neither coordinates across engine shards nor aggregates per peer | **Ships OFF, and the off default is ruled rather than accidental** — a rate on a clinical interface is only safe at a number taken from a real feed profile. **So a default install has NO message-RATE bound on the ingest plane**, and that is a deliberate posture, not a gap in the control. Both keys are parameters of the `MLLP()`, `Tcp()`, `X12()` and `Http()` factories, and `connections.toml` desugars through those same factories, so **the code-first and the TOML surface both express them** (BACKLOG #1249 for MLLP, BACKLOG #1114 for the other three — until #1249 landed the pacer was built and no documented configuration could turn it on, and until #1114 landed the other three intakes had no rate control in **any** configuration, which is a different and worse thing than being off). *What it does when set:* the listener **pauses reading before its next read** so TCP back-pressures the sender; no message is dropped, refused, NAK'd, 429'd or reordered — the count-and-log invariant forbids accept-and-drop, so a discarding limiter was never available. **The HTTP bucket is listener-wide, not per-connection**, because that connector answers one request per connection; a `GET`/`HEAD` probe waits behind an outstanding debt but charges nothing. **Not covered even when set:** the DICOM C-STORE SCP (a pace-before-decode bound does not transfer to an association), the File / RemoteFile / Database poll sources (they bind nothing and need a per-tick ceiling instead — a different shape), and any per-peer bound (MLLP, TCP and X12 peers are unauthenticated, so the only key would be source IP, which NAT collapses). **Resource bounds that DO ship on** — `max_connections` (256), `receive_timeout` (60.0 s), `max_frame_bytes` (16 MiB), per-connection `max_message_bytes`, `source_ip_allowlist` |
 
 **What these limits defend, and what they do not.** The full inventory of resource-demanding
 functionality — including the surfaces that remain **unbounded** at this release — is
@@ -2016,6 +2016,55 @@ For a fully reproducible, tamper-resistant install, `pip install --require-hashe
 Before installing the engine wheel itself, **verify its release provenance** (`gh attestation verify`
 SLSA + the Sigstore identity check) per [INSTALL-GUIDE.md](INSTALL-GUIDE.md#verify-the-release-before-you-install-supply-chain-integrity)
 — hash-pinning proves bytes-match-lockfile, not who built the artifact.
+
+### Nothing on the server refuses a push by content, so the private-docs guard is client-side and bypassable
+
+Do not rely on the push guard. It is the only thing that can refuse a push carrying the
+maintainer-internal `docs/security/` corpus to this public remote. It runs on the client,
+`git push --no-verify` skips it, and a fresh clone does not have it at all. The owner accepted that
+posture on 2026-09-03 (BACKLOG #1056). It is recorded here so that no later document describes the
+arrangement as stronger than it is.
+
+**GitHub offers this repository no content-based push control.** That was measured on 2026-08-05,
+not inferred. A `file_path_restriction` push ruleset for `docs/security/**` is refused:
+
+```
+gh api -X POST repos/MEFORORG/MessageFoundry/rulesets -f name='block-private-docs' \
+  -f target='push' -f enforcement='active' \
+  -f 'rules[][type]=file_path_restriction' \
+  -f 'rules[][parameters][restricted_file_paths][]=docs/security/**'
+-> 422  "Source public repos cannot have push rules"
+```
+
+`enforce_admins` is not a substitute, whether or not it is enabled. It governs protected branches, so
+it never sees an ordinary feature branch, and a feature branch is the ref a leak rides on. It is a
+separate control with its own merits, and it does not answer this question. Read branch protection
+directly if you need its current state; this document does not track it.
+
+**What stands, and where each layer stops.** Read this as a floor rather than a full list. At least
+these limits hold, and a reader should assume there are others:
+
+- **Prevention runs on the client only.** `scripts/hooks/push_guard.py` refuses a pushed tip tree
+  that carries `docs/security`, on every ref it is offered, branches and tags alike. A clone or
+  worktree where `scripts/coord/install-git-hooks.ps1` has never run does not have it. It reads the
+  tip tree, so it is not a history check, and it matches paths, not content. Its own module
+  docstring lists the ways it is skipped or fails open. A client hook is advisory by construction:
+  treat it as a way to catch your own mistake, never as a boundary.
+- **Commit-time coverage is partial.** `scripts/security/scan_forbidden.py` refuses a *staged* file
+  under `docs/security`. It does not see the vector that matters, where those files arrive inside a
+  commit **tree** taken from another ref and never pass through the index.
+- **Detection runs after the push.** `.github/workflows/branch-leak-scan.yml` scans every branch
+  push. It exists because the `forbidden-content` job in `security.yml` triggers on pull requests,
+  pushes to `main`, and a daily cron, so a branch pushed with no pull request is scanned by none of
+  them. On a public repository the content is public the instant the push completes, so this layer
+  reports a leak and cannot prevent one.
+
+**What to do with this.** If you keep the private corpus beside this checkout, run
+`scripts/coord/install-git-hooks.ps1` in every clone and worktree, and never reach for `--no-verify`
+here. If you are assessing the repository, score the arrangement as detection with a client-side
+aid, not as prevention. A leak is found by a scan minutes later, by which time the content is
+already public, so the response is deleting the ref and assessing exposure, which limits reach
+rather than undoing publication.
 
 ## Not yet built (deliberate follow-ups)
 
