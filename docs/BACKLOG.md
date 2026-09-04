@@ -21940,7 +21940,7 @@ The other four are posture, inherited from the tripwire as it already stood:
 
 ## 1439. webconsole_seam_snapshot.py resolves messagefoundry from sys.path, not from its own repo
 
-> 🔢 **Filed 2026-09-03 - BUILT IN THIS COMMIT, not yet landed.** Found while building #1139, by a session that spent its debugging on the gate instead of the generator. The census in LIMB 3 is the reason this is filed as one defect and not a class.
+> ✅ **Filed 2026-09-03. LANDED 2026-09-04 on main via `bd9830fd4` (PR 826).** Found while building #1139, by a session that spent its debugging on the gate instead of the generator. The census in LIMB 3 is the reason this is filed as one defect and not a class.
 
 **Cluster:** repository tooling. **Priority:** P3. **Verdict:** build.
 **Severity:** no engine effect, no PHI axis, and **no deployment axis (sec. 0)** -- `scripts/` ships in no wheel and this tool touches no product surface. The cost is real and bounded to a developer's session: **wasted debugging, and a gate a reader would "fix" in the wrong direction.** Nothing was mis-shipped, because CI runs on a hosted runner with exactly one engine tree, where the defect cannot express itself.
