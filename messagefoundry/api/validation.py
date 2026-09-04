@@ -66,9 +66,19 @@ DIGEST_ID_PATTERN = r"^[0-9a-f]{64}$"
 #: Built-in role ids are words and are never accepted by the ``/roles/custom`` routes.
 CUSTOM_ROLE_ID_PATTERN = r"^custom:[0-9a-f]{32}$"
 
+#: Any role id: a built-in role's lowercase word, or a custom role's prefixed id. Which words exist
+#: stays ``messagefoundry.auth.permissions.Role``'s to say; the API decides only the shape, and the
+#: routes 404 an id no role carries. Measured against all 6 built-in roles.
+ROLE_ID_PATTERN = r"^[a-z]{1,32}$|^custom:[0-9a-f]{32}$"
+
+#: A permission id, ``area:action``. The catalog is ``Permission``'s; measured against all 28 members.
+PERMISSION_ID_PATTERN = r"^[a-z_]{1,32}:[a-z_]{1,32}$"
+
 ResourceId = Annotated[str, StringConstraints(pattern=RESOURCE_ID_PATTERN)]
 DigestId = Annotated[str, StringConstraints(pattern=DIGEST_ID_PATTERN)]
 CustomRoleId = Annotated[str, StringConstraints(pattern=CUSTOM_ROLE_ID_PATTERN)]
+RoleId = Annotated[str, StringConstraints(pattern=ROLE_ID_PATTERN)]
+PermissionId = Annotated[str, StringConstraints(pattern=PERMISSION_ID_PATTERN)]
 
 
 # --- Connection names ----------------------------------------------------------------------------
@@ -225,6 +235,11 @@ EmailAddress = Annotated[str, StringConstraints(pattern=EMAIL_ADDRESS_PATTERN, m
 
 #: The most explicitly-selected message ids one export may name -- the route's own ``limit`` ceiling.
 MAX_EXPORT_IDS = 100_000
+
+#: The most entries one directory-group mapping or one counter-reset request may carry. An uncapped
+#: list of nested models is a request whose cost the client sizes; every sibling list here was already
+#: capped, and these three were the ones that were not.
+MAX_MAP_ENTRIES = 1_000
 
 #: ``GET /search/layered`` takes preset ids as one comma-separated value. The route caps the layers
 #: it will compose; the pattern makes a non-id impossible before the split.

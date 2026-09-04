@@ -566,6 +566,11 @@ async def test_refusals_are_recorded_server_side(
     # exc.detail are all caller-supplied text, and writing those to a log is log injection.
     service = await _service(engine, ("op", Role.OPERATOR), ("op2", Role.OPERATOR))
     transport = httpx.ASGITransport(app=_app(engine, service, tmp_path))
+    # Two shapes of bad target, and they are refused at DIFFERENT places since BACKLOG #1108, which
+    # is why both are probed. ``absent`` is a legal connection name that no inbound carries, so it
+    # reaches the engine and comes back 404. ``bogus`` could not be a connection name at all, so the
+    # request model refuses it in the console before the engine is called.
+    absent = "IB_NOPEZQX_ABSENT"
     bogus = "IB_NOPEZQX<script>alert(1)</script>"
     async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
         await _login(c, "op")
@@ -577,17 +582,23 @@ async def test_refusals_are_recorded_server_side(
                 await _login(c, "op")
                 r = await c.post(
                     f"/ui/uploaded-logs/file/{fid}/resend",
-                    params={"index": "0", "to": bogus},
+                    params={"index": "0", "to": absent},
                     follow_redirects=False,
                 )
                 assert r.status_code == 303
+                malformed_target = await c.post(
+                    f"/ui/uploaded-logs/file/{fid}/resend",
+                    params={"index": "0", "to": bogus},
+                    follow_redirects=False,
+                )
+                assert malformed_target.status_code == 303
                 # A file_id the CALLER invented, carrying an encoded newline: the target is unknown, so
                 # the engine 404s before it ever validates the id, and the console still has to log
                 # something. The minted-shape guard makes it a fixed placeholder rather than a forged
                 # second log line.
                 forged = await c.post(
                     f"/ui/uploaded-logs/file/{'0' * 32}%0AWARNING-forged-line/resend",
-                    params={"index": "0", "to": bogus},
+                    params={"index": "0", "to": absent},
                     follow_redirects=False,
                 )
                 assert forged.status_code == 303
@@ -598,6 +609,8 @@ async def test_refusals_are_recorded_server_side(
     assert f"uploaded-log resend refused: file_id={fid} status=404" in lines
     assert f"uploaded-log delete refused: file_id={fid} status=404" in lines
     assert "uploaded-log resend refused: file_id=malformed status=404" in lines
+    # The earlier refusal records the same way: file_id plus a fixed reason, never the value.
+    assert f"uploaded-log resend refused: file_id={fid} reason=malformed_target" in lines
     # Nothing caller-supplied reached the log: not the inbound name, not the payload, not a newline.
     assert not any("IB_NOPEZQX" in line or "alert(1)" in line for line in lines)
     assert not any("forged" in line or "\n" in line for line in lines)

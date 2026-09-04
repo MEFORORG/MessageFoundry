@@ -21,6 +21,8 @@ before the value reaches a database query, a filesystem path, a log line or a CS
 | Resource id | Exactly 32 lowercase hex characters | `message_id`, `file_id`, `approval_id`, `preset_id`, `user_id`, and each entry of an export `ids` list |
 | Digest id | Exactly 64 lowercase hex characters | `attachment_id`, `session_id` |
 | Custom role id | `custom:` then 32 lowercase hex characters | `role_id` on the `/roles/custom` routes |
+| Role id | A lowercase word, or a custom role id | Each entry of a `roles` list |
+| Permission id | `area:action`, lowercase letters and underscores | Each entry of a `permissions` list |
 | Connection name | A letter, then letters, digits, `_` and `-`, up to 256 characters | `{name}` in a path, and `channel_id`, `destination_name`, `to`, `source`, `connection` |
 | Time bound | A finite number from 0 up to 4102444800 (2100-01-01 UTC) | `received_from`, `received_to`, `since`, `until` |
 | Free text | Printable text, no control characters, up to 512 characters | `content`, `field_value` |
@@ -33,8 +35,13 @@ before the value reaches a database query, a filesystem path, a log line or a CS
 "Printable text, no control characters" means every character except the C0 range, DEL, and the C1
 range. In practice: no NUL, no tab, no carriage return, no line feed.
 
-Two lists have a length of their own. A message export may name at most 100000 ids explicitly, the
-same ceiling as its `limit`. An events request may filter on at most 32 event kinds.
+Some lists have a length of their own. A message export may name at most 100000 ids explicitly, the
+same ceiling as its `limit`. An events request may filter on at most 32 event kinds. A directory
+group mapping, and a counter-reset request, may carry at most 1000 entries.
+
+**Which words and codes exist is not decided here.** The role names, the permission catalog and the
+status vocabulary belong to the engine. These rules decide only the shape a value may take, so a
+value that could not be a member is refused early and one that merely does not exist gets a 404.
 
 ---
 

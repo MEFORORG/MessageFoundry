@@ -281,6 +281,47 @@ def test_export_ids_are_ids_and_the_list_is_bounded() -> None:
         MessageExportRequest(ids=[_HEX32] * (v.MAX_EXPORT_IDS + 1))
 
 
+def test_role_and_permission_ids_admit_every_shipped_value() -> None:
+    """The shape rule must be wider than the catalogs, which stay the auth package's to define."""
+    from messagefoundry.auth.permissions import Permission, Role
+
+    for role in Role:
+        assert _accepts(v.RoleId, role.value), role
+    assert _accepts(v.RoleId, CUSTOM_ROLE_ID_PREFIX + _HEX32)
+    for perm in Permission:
+        assert _accepts(v.PermissionId, perm.value), perm
+    for bad in ("Administrator", "admin;DROP", "custom:short", "", "a" * 33):
+        assert not _accepts(v.RoleId, bad), bad
+    for bad in ("messages read", "messages", "MESSAGES:READ", "a:b:c"):
+        assert not _accepts(v.PermissionId, bad), bad
+
+
+def test_the_auth_models_carry_the_same_rules() -> None:
+    from messagefoundry.api.auth_models import (
+        AdGroupMap,
+        AdGroupMapEntry,
+        ChannelScope,
+        CustomRoleRequest,
+        RolesUpdateRequest,
+    )
+
+    assert ChannelScope(channels=["IB_A", "FILE-OUT_Test_ADT"]).channels is not None
+    assert ChannelScope().channels is None  # the all-channels scope survives
+    with pytest.raises(ValidationError):
+        ChannelScope(channels=["IB_A", "../../etc"])
+    assert RolesUpdateRequest(roles=["viewer"]).roles == ["viewer"]
+    with pytest.raises(ValidationError):
+        RolesUpdateRequest(roles=["viewer", "Bad Role"])
+    assert CustomRoleRequest(display_name="X", permissions=["messages:read"]).permissions
+    with pytest.raises(ValidationError):
+        CustomRoleRequest(display_name="X", permissions=["messages read"])
+    # The directory maps were the uncapped lists; a client no longer sizes the request.
+    entry = AdGroupMapEntry(ad_group="g", role="viewer")
+    assert AdGroupMap(entries=[entry]).entries == [entry]
+    with pytest.raises(ValidationError):
+        AdGroupMap(entries=[entry] * (v.MAX_MAP_ENTRIES + 1))
+
+
 def test_the_field_path_rule_stays_where_it_already_lives() -> None:
     """No pattern is declared for ``field_path``; ``parse_path`` is its single authority."""
     assert "FIELD_PATH" not in dir(v)
@@ -305,6 +346,7 @@ def _doc_claims() -> tuple[str, ...]:
         f"up to {v.SEARCH_TEXT_MAX} characters",
         f"at most {v.MAX_EXPORT_IDS} ids",
         f"at most {v.MAX_EVENT_KINDS} event kinds",
+        f"at most {v.MAX_MAP_ENTRIES} entries",
         CUSTOM_ROLE_ID_PREFIX,
     )
 

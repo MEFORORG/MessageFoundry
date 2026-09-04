@@ -24,6 +24,7 @@ from pydantic import BaseModel, Field
 from messagefoundry.api.phi_gate import PhiGatedModel
 from messagefoundry.api.validation import (
     MAX_EXPORT_IDS,
+    MAX_MAP_ENTRIES,
     ConnectionName,
     ControlIdFilter,
     DisplayLabel,
@@ -552,7 +553,7 @@ class StatsResetRequest(BaseModel):
     """Reset the dashboard's cumulative counters for ``targets``, or for every connection (``all``)."""
 
     all: bool = False
-    targets: list[StatsResetTarget] = Field(default_factory=list)
+    targets: list[StatsResetTarget] = Field(default_factory=list, max_length=MAX_MAP_ENTRIES)
 
 
 class StatsResetResult(BaseModel):
