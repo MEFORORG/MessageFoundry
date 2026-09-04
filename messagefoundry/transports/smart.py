@@ -35,6 +35,7 @@ authorization/resource server, JWKS hosting, ``.well-known`` discovery (the MVP 
 from __future__ import annotations
 
 import json
+import re
 import secrets
 import threading
 import time
@@ -299,6 +300,74 @@ class SmartBackendTokenProvider:
         return token, ttl
 
 
+# One FHIR resource scope, SMART v2 (`system/Patient.cru`) or v1 (`system/Patient.read`), with the
+# optional v2 search-parameter constraint (`?category=vital-signs`) tolerated and ignored. The context
+# half is captured but unused: a Backend Services client is `system/`, and `patient/`/`user/` on a
+# headless outbound is an operator's business, not this reader's.
+_FHIR_SCOPE_RE = re.compile(
+    r"^(?:patient|user|system)/(?:[A-Za-z*][A-Za-z0-9_*-]*)\.(?P<perms>[A-Za-z*]+)(?:\?.*)?$"
+)
+_V2_LETTERS = frozenset("cruds")  # create, read, update, delete, search
+# SMART v1 permission words, expanded to the v2 letters they stand for, so a v1 scope string grades the
+# same way a v2 one does. `*` here is the PERMISSION wildcard (`system/Patient.*`) and means every
+# letter; the RESOURCE wildcard (`system/*.rs`) is a different position and is never a finding.
+_V1_PERMS = {"read": frozenset("rs"), "write": frozenset("cud"), "*": _V2_LETTERS}
+
+
+def smart_scope_letters(scope: str) -> frozenset[str] | None:
+    """The union of SMART v2 permission letters a requested ``scope`` string asks for, or ``None`` when
+    the string contains no parseable FHIR resource scope at all (#1159, ASVS 10.2.3).
+
+    It lives beside :func:`token_provider_from_settings`, the code that puts ``scope`` on the wire, so
+    this module does not transmit a grammar it has no knowledge of. Its reader is
+    :func:`~messagefoundry.config.wiring.overbroad_smart_scopes`, which imports it lazily on the same
+    precedent ``unverified_generic_db_hops`` states for ``generic_odbc_tls_unenforced``.
+
+    A scope string is space-separated and may mix FHIR resource scopes with non-FHIR ones (``openid``,
+    ``fhirUser``, ``offline_access``, ``launch/patient``). Only the resource scopes carry permission
+    letters, so the rest are skipped rather than treated as an error — an unrecognised token is a scope
+    this reader does not model, never evidence of over-breadth. So is an unmodelled permission word
+    (``system/Patient.readwrite``, a vendor spelling).
+
+    ``None`` means "this reader cannot grade the string", and the caller stays quiet on it: a vocabulary
+    this function cannot read is exactly the case where computing a requirement would be guessing.
+
+    The RESOURCE half is matched and discarded on purpose. It is not derivable at config time — the
+    outbound reads the resourceType from the OUTGOING MESSAGE BODY at delivery — so ``system/*.rs``
+    grades as ``{r, s}`` and the ``*`` is never itself a finding. A check that flagged that character
+    instead would be pattern-matching a string rather than computing a requirement from the
+    connection's declared shape.
+
+    Pure — a string in, a letter set out. No graph, no I/O."""
+    letters: set[str] = set()
+    for token in scope.split():
+        m = _FHIR_SCOPE_RE.match(token)
+        if m is None:
+            continue
+        perms = m.group("perms").lower()
+        found = _V1_PERMS.get(perms) or (frozenset(perms) if set(perms) <= _V2_LETTERS else None)
+        if found:
+            letters |= found
+    return frozenset(letters) if letters else None
+
+
+def smart_auth_configured(s: Mapping[str, Any]) -> bool:
+    """Whether a settings mapping has SMART Backend Services auth turned ON.
+
+    ON means ``smart_token_url`` is present and ``smart_enabled`` is not switched off, so any connection
+    that never composed :func:`with_smart_backend` is byte-identical. The SINGLE definition, shared by
+    :func:`token_provider_from_settings` (which builds the provider), by the mutual-exclusion screen in
+    ``http_auth.build_token_provider`` and by
+    :func:`~messagefoundry.config.wiring.overbroad_smart_scopes` (which grades the requested scope).
+
+    It exists because those three readers each carried their own spelling of the same test and the
+    spellings had already drifted — one treated any falsy ``smart_enabled`` as off, another only a
+    literal ``False``. They agreed only because ``with_smart_backend`` writes a real ``bool``, which is
+    an agreement that decays silently the day anything else populates these settings. Off is the
+    conservative reading, so a falsy value is off."""
+    return bool(s.get("smart_token_url")) and bool(s.get("smart_enabled", True))
+
+
 def token_provider_from_settings(
     s: Mapping[str, Any], *, proxy: ProxyConfig | None = None, ech_sidecar: str | None = None
 ) -> SmartBackendTokenProvider | None:
@@ -312,9 +381,7 @@ def token_provider_from_settings(
     (ADR 0126) routes the token-endpoint POST through the connection's forward proxy; ``ech_sidecar``
     (#1176, ADR 0139) re-addresses it to the connection's loopback ECH sidecar instead. The two are
     mutually exclusive by construction."""
-    if not s.get("smart_token_url"):
-        return None
-    if not s.get("smart_enabled", True):
+    if not smart_auth_configured(s):
         return None
     # ADR 0153: the same per-connection declaration the delivery hop carries, mirrored into these
     # resolved settings by the runner's _dest_config (with the connection name, so the acceptance audit
@@ -384,11 +451,19 @@ def with_smart_backend(
             FHIR(url=env("epic_fhir_base"), interaction="create"),
             token_url=env("epic_token_url"),      # the authorization server token endpoint
             client_id=env("epic_client_id"),
-            scope="system/*.rs",                  # SMART v2 system scopes (no human)
+            scope="system/Patient.c",             # SMART v2, no human: ONLY what this feed writes
             private_key=env("epic_smart_key"),    # inline PEM via env(), or a PEM file path
             algorithm="RS384",                    # SMART SHALL: RS384 (default) | ES384
             key_id="epic-2026",                   # kid → the public key registered with the server
         ))
+
+    **Request the least scope the connection can work with** (ASVS 10.2.3, #1159). The v2 permission
+    letters are ``c``/``r``/``u``/``d``/``s`` (create/read/update/delete/search), so an
+    ``interaction="create"`` outbound needs ``c`` and nothing else, and the resource half should name
+    the type the feed actually writes rather than ``*``. ``messagefoundry check``'s advisory
+    ``smart-scope`` line reports a request the connection's declared interaction cannot spend; it
+    never blocks, because your authorization server registers the scopes it will grant and only it
+    knows what your app is entitled to.
 
     ``token_url`` / ``client_id`` / ``private_key`` / ``audience`` / ``private_key_password`` may be
     :func:`~messagefoundry.config.wiring.env` references — keep every secret in ``env()``. The minted

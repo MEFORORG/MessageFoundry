@@ -14,10 +14,13 @@ This is the authoritative doc for that package: its architecture, the injection 
 package agree on, the **version-skew gate** that keeps the two in lockstep of *meaning* (not version),
 how to develop and test it, and its **honest scope** (what the extraction does and does not decouple).
 
-> **Publishing the second wheel is a separate, owner-only step.** The engine `[webconsole]` extra is
-> deliberately **not** wired yet (an unpublished dependency breaks `uv lock`). Until the owner publishes,
-> install the console by path (`pip install -e packaging/messagefoundry-webconsole`). The full publish
-> checklist lives in [`../packaging/messagefoundry-webconsole/RELEASE.md`](../packaging/messagefoundry-webconsole/RELEASE.md).
+> **The wheel is published; the engine-side extra is still not wired.** The distribution name
+> `messagefoundry-webconsole` was registered on PyPI on 2026-07-29 by the first `webconsole-v*` release,
+> so `pip install messagefoundry-webconsole` resolves to this project's own wheel. What is still missing
+> is the **engine** side: the engine `pyproject.toml` declares no `webconsole` key, so an install of the
+> engine's `webconsole` extra still fails. Install the console as its own distribution, or from a
+> checkout by path (`pip install -e packaging/messagefoundry-webconsole`). Wiring the extra is step 1 of
+> [`../packaging/messagefoundry-webconsole/RELEASE.md`](../packaging/messagefoundry-webconsole/RELEASE.md).
 
 ---
 
