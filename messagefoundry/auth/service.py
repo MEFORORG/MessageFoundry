@@ -152,9 +152,12 @@ class LoginOutcome:
     identity: Identity | None = None
     must_change_password: bool = False
     error: str | None = None
-    #: The password was accepted but the session still needs a second factor (TOTP / recovery code)
-    #: before it may perform step-up (sensitive) operations — the client should prompt for a code and
-    #: call ``POST /auth/mfa-verify`` (WP-14, ASVS 6.3.3). Always False for an MFA-delegated AD login.
+    #: The credential was accepted but the session still owes a second factor before it may reach an
+    #: authorized route — the client should prompt for a code and call ``POST /auth/mfa-verify``, or
+    #: enrol a factor first if it has none (WP-14, ASVS 6.3.3). It used to be documented as always
+    #: False for a directory login; that stopped being true when the Kerberos leg began minting at the
+    #: minimum (BACKLOG #1144), and reporting False there would tell a JSON client no factor is needed
+    #: seconds before the gate refuses it with ``X-MFA-Required: 1``.
     mfa_required: bool = False
     #: A CLOSED-SET reject slug for the federated path (ADR 0142), so the browser layer can pick an
     #: allow-listed error code without parsing ``error`` (free prose) or seeing any IdP-supplied text.
@@ -1384,7 +1387,16 @@ class AuthService:
         await self._audit(
             "auth.login_success", actor=user.username, detail=_json(detail), client=client
         )
-        return LoginOutcome(ok=True, token=token, identity=identity)
+        # Ask the GATE, not the grant (BACKLOG #1144). A leg that granted nothing has not necessarily
+        # left a debt: with require_mfa off and no factor enrolled the shared rule still admits the
+        # session, so `not mfa_verified` would over-report and prompt for a factor the caller does not
+        # owe. One extra read on a rare path buys a single source for the answer.
+        return LoginOutcome(
+            ok=True,
+            token=token,
+            identity=identity,
+            mfa_required=not await self.mfa_satisfied(token),
+        )
 
     async def _sync_ad_channel_scope(
         self, user: UserRecord, roles: frozenset[Role], groups: Iterable[str]

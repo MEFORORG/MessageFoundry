@@ -286,7 +286,16 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
         outcome = await service.authenticate_kerberos(token_bytes, client=_client(request))
         if not outcome.ok or outcome.token is None or outcome.identity is None:
             raise HTTPException(status.HTTP_401_UNAUTHORIZED, "SSO authentication failed")
-        return _login_response(outcome.token, outcome.identity, outcome.must_change_password)
+        # mfa_required is FORWARDED here, not defaulted (BACKLOG #1144). This route used to omit it
+        # because a directory session was minted MFA-satisfied and the answer was always False; the
+        # Kerberos leg now mints at the minimum, so omitting it would tell the client no second factor
+        # is needed and let the next call be refused with no explanation it was given.
+        return _login_response(
+            outcome.token,
+            outcome.identity,
+            outcome.must_change_password,
+            mfa_required=outcome.mfa_required,
+        )
 
     @app.post("/auth/logout", response_model=SimpleMessage)
     async def logout(

@@ -408,3 +408,27 @@ async def test_a_directory_session_minted_at_the_minimum_is_confined_until_it_en
     )
     assert codes is not None
     assert await service.mfa_satisfied(out.token) is True
+
+
+async def test_the_directory_login_outcome_reports_the_debt_it_created(engine: Engine) -> None:
+    """RED when: the directory tail returns ``mfa_required=False`` for a session the gate will refuse.
+
+    A JSON client (``POST /auth/negotiate``) is told whether it still owes a factor. Before BACKLOG
+    #1144 a directory session was minted satisfied and the answer was always False, so the tail
+    hardcoded it. Minting at the minimum without moving this would tell a client no factor is needed
+    and then refuse its very next call with ``X-MFA-Required: 1`` and no earlier signal.
+
+    The second half pins the flag to the GATE rather than to the grant: with ``require_mfa`` off, an
+    un-enrolled directory session grants nothing yet owes nothing, and reporting True there would
+    prompt for a factor the caller does not need.
+    """
+    service = await _service(engine)
+    owes = await service._complete_ad_login(_principal("aduser5"), None, mfa_verified=False)
+    assert owes.ok and owes.mfa_required is True
+
+    granted = await service._complete_ad_login(_principal("aduser6"), None, mfa_verified=True)
+    assert granted.ok and granted.mfa_required is False
+
+    lax = await _service(engine, AuthSettings(login_rate_limit_enabled=False, require_mfa=False))
+    off = await lax._complete_ad_login(_principal("aduser7"), None, mfa_verified=False)
+    assert off.ok and off.mfa_required is False
