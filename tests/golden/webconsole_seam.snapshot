@@ -7,7 +7,7 @@
 # by hand (BACKLOG #1220) - so a newly rendered DTO is covered with nobody editing a list.
 
 ## ENGINE_UI_SEAM
-d4ae2ce03d5723a7
+767521d4399d1ef4
 
 ## dataclass messagefoundry.api._ui_seam.UiDeps
 engine_seam
@@ -168,7 +168,7 @@ messagefoundry.api.auth_models.RolesUpdateRequest: roles
 messagefoundry.api.auth_models.SecurityEventInfo: action, detail, ts
 messagefoundry.api.auth_models.SecurityEventsList: events
 messagefoundry.api.auth_models.UserCreateRequest: display_name, email, password, roles, username
-messagefoundry.api.auth_models.UserSummary: auth_provider, channel_scope, disabled, display_name, email, id, roles, username
+messagefoundry.api.auth_models.UserSummary: auth_provider, channel_scope, disabled, display_name, email, id, notify_email, roles, username
 messagefoundry.api.auth_models.UserUpdateRequest: disabled, display_name, email
 messagefoundry.api.models.AlertInstanceInfo: acked_at, acked_by, connection, count, event_type, first_seen, id, last_seen, reason, resolved_at, severity, status, suspended_until
 messagefoundry.api.models.AlertInstanceList: alerts

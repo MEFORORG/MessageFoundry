@@ -826,6 +826,9 @@ class UserRecord:
     username: str
     auth_provider: str  # 'local' | 'ad'
     display_name: str | None
+    # The account's PROFILE address, and on an AD/OIDC account the directory's mirror: every
+    # directory login overwrites it from the principal's ``mail`` attribute. NOT the notification
+    # target -- see ``notify_email`` below (BACKLOG #1139).
     email: str | None
     disabled: bool
     created_at: float
@@ -861,6 +864,28 @@ class UserRecord:
     # cannot stand in for it: a rotation clears that flag and an admin reset re-sets it, so no reader can
     # tell "never claimed" from "claimed, then reset".
     password_claimed_at: float | None = None
+    # THE ENGINE-OWNED NOTIFICATION ADDRESS (BACKLOG #1139, ASVS 6.3.7). Every out-of-band security
+    # notice about this account is addressed here, and NOTHING in the directory-sync path writes it:
+    # ``update_user_profile`` -- the one call ``_upsert_ad_user`` makes on every AD/OIDC login --
+    # touches ``display_name`` and ``email`` only.
+    #
+    # WHY THE COLUMN EXISTS AT ALL. Before the split, one nullable column was simultaneously the
+    # directory's mirror and the notification target, so a directory repoint would replace the very
+    # address the resulting notice had to reach, and "which address do we notify when the directory
+    # owns the attribute" had no answer. Separated, the notice goes to an address that the repoint is
+    # not replacing, and the question dissolves.
+    #
+    # SEEDED ONCE, AT ACCOUNT BIRTH, from whatever address ``create_user`` carried -- there is exactly
+    # one address at that instant and no reason for the two to differ. After that the only writer is
+    # ``set_user_notify_email``, which takes a non-empty ``str`` and so CANNOT express a clear. That
+    # refusal is the durability rule: a repoint is allowed, an erasure is not. Without it, making an
+    # address mandatory at creation would still leave an explicit null able to strip it afterwards.
+    #
+    # NULL means the account has never carried an address, and such an account is excluded from every
+    # out-of-band notice (``SecurityEventNotifier.notify`` returns early). NOT NULL was the other way
+    # to meet the durability rule and is deliberately not taken: accounts may still be created without
+    # an address, so the column would need a placeholder the notifier treats as absent anyway.
+    notify_email: str | None = None
 
     @classmethod
     def from_mapping(cls, d: Mapping[str, Any]) -> UserRecord:
@@ -889,6 +914,11 @@ class UserRecord:
             # retired. Failing loudly on a mapping that lacks the column beats silently retiring a
             # claimed account. Every reader is a SELECT *, so the column is present once migrated.
             password_claimed_at=_opt_float(d["password_claimed_at"]),
+            # Hard subscript for the same reason as its neighbour above (BACKLOG #1139): a missing key
+            # would decode as None, None means "no address on file", and an account read that way is
+            # silently excluded from every security notice. A loud failure on a mapping that lacks the
+            # column beats a quiet, permanent loss of the notification channel.
+            notify_email=d["notify_email"],
         )
 
 
@@ -1347,6 +1377,45 @@ def _opt_float(value: Any) -> float | None:
     return None if value is None else float(value)
 
 
+def seed_notify_email(email: str | None) -> str | None:
+    """The ``users.notify_email`` value a ``create_user`` INSERT binds — shared by all three backends
+    so the seeding rule is stated once (BACKLOG #1139).
+
+    Account birth is the ONE moment the engine adopts an address without a separate decision: there is
+    exactly one address in hand and no reason for the mirror and the notification target to differ.
+    After it, the directory can never move the notification address again — ``update_user_profile``,
+    the only call the AD/OIDC upsert makes on an existing account, does not name this column.
+
+    Blank is normalised to NULL so ``""`` cannot enter the column and read as an address that is
+    present but undeliverable. NULL states plainly that the account has never carried one.
+    """
+    return email.strip() or None if email is not None else None
+
+
+def require_notify_email(email: str) -> str:
+    """Validate a new ``users.notify_email`` value — shared by all three backends (BACKLOG #1139).
+
+    **THIS IS THE DURABILITY RULE, and it is the reason the parameter is ``str`` and not
+    ``str | None``.** Making an address mandatory at creation does not make it durable: an explicit
+    null still strips it afterwards, and once stripped the account is excluded from every later
+    out-of-band notice because ``SecurityEventNotifier.notify`` returns early on an empty address. So
+    the notification address is REPOINTABLE BUT NOT ERASABLE — the type refuses ``None`` at every call
+    site, and this refuses the whitespace-only string that would slip past the type and mean the same
+    thing in practice.
+
+    The other way to meet the rule was a NOT NULL column, and it is deliberately not taken: accounts
+    may still be created with no address at all, so NOT NULL would need a placeholder value that the
+    notifier treats as absent anyway — a constraint that reads as a guarantee and delivers none.
+    """
+    cleaned = email.strip()
+    if not cleaned:
+        raise ValueError(
+            "notify_email must be a non-empty address: the engine-owned notification address can be"
+            " repointed but never cleared (BACKLOG #1139)"
+        )
+    return cleaned
+
+
 def password_claim_set(must_change_password: bool, placeholder: str) -> str:
     """The ``users.password_claimed_at`` term of a ``set_password`` UPDATE — shared by all three
     backends so the single-writer rule is stated once (BACKLOG #1245).
@@ -1772,7 +1841,8 @@ CREATE TABLE IF NOT EXISTS users (
     username             TEXT NOT NULL UNIQUE,
     auth_provider        TEXT NOT NULL,        -- 'local' | 'ad'
     display_name         TEXT,
-    email                TEXT,
+    email                TEXT,                 -- BACKLOG #1139: the PROFILE address / directory mirror. Overwritten from the directory `mail` attribute on every AD login. NOT the notification target.
+    notify_email         TEXT,                 -- BACKLOG #1139: the ENGINE-OWNED notification address. Seeded once at creation; thereafter written only by set_user_notify_email, which cannot express a clear. The directory sync never touches it.
     disabled             INTEGER NOT NULL DEFAULT 0,
     created_at           REAL NOT NULL,
     updated_at           REAL NOT NULL,
@@ -3265,6 +3335,15 @@ class MessageStore:
                 "UPDATE users SET password_claimed_at = password_changed_at"
                 " WHERE must_change_password = 0 AND password_hash IS NOT NULL"
             )
+        # The engine-owned notification address (BACKLOG #1139). NULL on an existing row would read as
+        # "no address on file", which excludes the account from every out-of-band security notice — so
+        # the ADD is paired with a one-time seed from the column that IS the notification target today.
+        # The seed MUST stay inside this creation guard: hoisted out it becomes a permanent SECOND
+        # writer, and every directory login would then copy the directory's address back over the
+        # engine's, restoring the exact defect the split removes.
+        if "notify_email" not in user_cols:
+            await db.execute("ALTER TABLE users ADD COLUMN notify_email TEXT")
+            await db.execute("UPDATE users SET notify_email = email WHERE email IS NOT NULL")
         # Step B adds the routed stage, which carries the handler to run in queue.handler_name. A
         # Step-A DB's queue table predates the column — ALTER it in (NULL on existing ingress/outbound
         # rows is correct). The queue table always exists here (CREATE IF NOT EXISTS ran in _SCHEMA).
@@ -7973,16 +8052,17 @@ class MessageStore:
         now = time.time() if now is None else now
         async with self._lock:
             await self._db.execute(
-                "INSERT INTO users (id, username, auth_provider, display_name, email, disabled,"
-                " created_at, updated_at, last_login_at, password_hash, password_changed_at,"
+                "INSERT INTO users (id, username, auth_provider, display_name, email, notify_email,"
+                " disabled, created_at, updated_at, last_login_at, password_hash, password_changed_at,"
                 " must_change_password, failed_attempts, locked_until)"
-                " VALUES (?,?,?,?,?,0,?,?,NULL,?,?,?,0,NULL)",
+                " VALUES (?,?,?,?,?,?,0,?,?,NULL,?,?,?,0,NULL)",
                 (
                     user_id,
                     username,
                     auth_provider,
                     display_name,
                     email,
+                    seed_notify_email(email),
                     now,
                     now,
                     password_hash,
@@ -8063,11 +8143,33 @@ class MessageStore:
         email: str | None,
         now: float | None = None,
     ) -> None:
+        """Write the account's profile fields. **This is the directory-sync write** — ``_upsert_ad_user``
+        calls it on every AD/OIDC login — so it deliberately does NOT name ``notify_email`` (BACKLOG
+        #1139). Adding that column to this SET list would hand the directory the notification target
+        back and restore the defect the split removes."""
         now = time.time() if now is None else now
         async with self._lock:
             await self._db.execute(
                 "UPDATE users SET display_name=?, email=?, updated_at=? WHERE id=?",
                 (display_name, email, now, user_id),
+            )
+            await self._commit()
+
+    async def set_user_notify_email(
+        self, user_id: str, *, email: str, now: float | None = None
+    ) -> None:
+        """Repoint the account's engine-owned notification address (BACKLOG #1139).
+
+        The parameter is ``str``, so a clear is unrepresentable; :func:`require_notify_email` rejects
+        the whitespace-only string that would mean the same thing. That refusal is the durability rule
+        — see the helper for why it is this rather than a NOT NULL column.
+        """
+        cleaned = require_notify_email(email)
+        now = time.time() if now is None else now
+        async with self._lock:
+            await self._db.execute(
+                "UPDATE users SET notify_email=?, updated_at=? WHERE id=?",
+                (cleaned, now, user_id),
             )
             await self._commit()
 

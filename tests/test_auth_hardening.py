@@ -979,6 +979,11 @@ def test_ldap_empty_password_never_binds(monkeypatch: pytest.MonkeyPatch) -> Non
     # AUTHN-6: an empty password would trigger an anonymous LDAP bind (which many DCs accept),
     # silently authenticating anyone — so authenticate() must fail closed BEFORE any bind. We prove
     # no bind is attempted by making _service_conn explode if it is ever reached.
+    #
+    # This guard is also what keeps _equalizing_bind (the #1140 / ASVS 6.3.8 timing equalizer) from
+    # ever issuing an anonymous bind, because the equalizer is only reachable AFTER _service_conn
+    # succeeds. Anyone equalizing the remaining unpadded branches could read this early return as
+    # the last one left and delete it; this test is what that would cost.
     auth = _ldaps_authenticator()
 
     def must_not_be_called() -> object:

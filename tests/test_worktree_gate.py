@@ -19,7 +19,7 @@ import shutil
 import subprocess
 from collections.abc import Iterator
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 import pytest
 
@@ -35,8 +35,14 @@ pytestmark = pytest.mark.skipif(
 GATE_TIMEOUT_S = 60
 
 
-def run_gate(payload: dict[str, Any] | str, repos_file: Path) -> dict[str, Any] | None:
+def run_gate(
+    payload: dict[str, Any] | str, repos_file: Path, gate: Path | None = None
+) -> dict[str, Any] | None:
     """Invoke the hook exactly as Claude Code does. Returns the deny object, or None for 'allow'.
+
+    ``gate`` defaults to the shipped hook. It is overridden only by the ``prefix_gate`` fixture, which
+    hands in a rebuilt PRE-FIX copy so a control can measure that a guard STARTED firing (BACKLOG
+    #1229) rather than asserting it.
 
     **A LAUNCH THAT NEVER RETURNS IS REPORTED AS ITS OWN EVENT, NOT AS A GATE FAILURE (BACKLOG #1304).**
     The ``windows-2025`` harness leg intermittently times out STARTING ``pwsh`` -- not on any assertion --
@@ -56,7 +62,7 @@ def run_gate(payload: dict[str, Any] | str, repos_file: Path) -> dict[str, Any] 
                 "-NoProfile",
                 "-NonInteractive",
                 "-File",
-                str(GATE),
+                str(gate or GATE),
                 "-ReposFile",
                 str(repos_file),
             ],
@@ -727,3 +733,242 @@ def test_a_config_write_to_a_disarm_key_still_denies(
     """
     reason = assert_denied(run_gate(bash(cmd, cwd=git_primary), git_repos_file))
     assert "SHARED git configuration" in reason
+
+
+# --- rule 3b, class B: a HEAD-moving verb aimed at ANOTHER session's worktree (BACKLOG #1359) -------
+#
+# Rule 3b used to take its hand-off BY VERB and knew only checkout/switch, so eight of rule 3's twelve
+# verbs that DO move a HEAD were never evaluated against a linked worktree at all. This block pins the
+# six newly evaluated verbs, the four deliberately excluded ones, and the asymmetry between the two
+# classes -- class A denies even inside the session's own worktree, class B never does.
+#
+# EVERY TEST HERE NEEDS A REAL REPOSITORY WITH REAL LINKED WORKTREES, and that is not a detail. Rule
+# 3b asks git four questions about the target and ALLOWS when any of them fails; against the bare
+# `primary` fixture (a tmp path that is never created) the rule is inert and every assertion below
+# would pass while measuring nothing. Two of the older rule-3 rows in this file are green for exactly
+# that reason, which is why one of them is repeated here against a real repository.
+#
+# AND EVERY NEW DENY IS PAIRED WITH A PRE-FIX CONTROL. BACKLOG #1229 requires the fail-open direction
+# be measured: proving these commands are denied NOW says nothing unless it is also shown they were
+# not denied BEFORE. `prefix_gate` rebuilds the previous gate from the shipped file, so the pair
+# isolates this change as the cause rather than asserting it.
+
+
+class HijackRepo(NamedTuple):
+    """A governed primary plus two of its linked worktrees: the session's own, and another session's."""
+
+    primary: Path
+    mine: Path
+    victim: Path
+
+
+#: The six verbs #1359 added to rule 3b, each with the argument shape that moves a HEAD. The value is
+#: everything AFTER the verb, so the command is assembled identically for all six.
+CLASS_B_VERBS = [
+    ("reset", "--hard main"),
+    ("rebase", "main"),
+    ("merge", "main"),
+    ("cherry-pick", "main"),
+    ("revert", "HEAD"),
+    ("am", "patch.mbox"),
+]
+
+#: The four rule-3 verbs deliberately LEFT OUT of rule 3b, because none of them moves HEAD. Pinned so
+#: that widening the rule to cover another session's UNCOMMITTED work stays a deliberate act with its
+#: own item, rather than a silent side effect -- and so the residual recorded on #1359 stays honest.
+NON_HEAD_MOVING_VERBS = [
+    ("restore", "f.txt"),
+    ("stash", ""),
+    ("clean", "-fdx"),
+    ("apply", "p.patch"),
+]
+
+
+@pytest.fixture
+def hijack_repo(tmp_path: Path) -> HijackRepo:
+    primary = tmp_path / "GateRepo"
+    primary.mkdir()
+
+    def git(*args: str) -> None:
+        subprocess.run(["git", *args], cwd=primary, check=True, capture_output=True)
+
+    git("init", "-q", "-b", "main")
+    git("config", "user.email", "gate@example.invalid")
+    git("config", "user.name", "gate")
+    (primary / "f.txt").write_text("one\n", encoding="utf-8")
+    git("add", "f.txt")
+    git("commit", "-qm", "one")
+    mine = tmp_path / "GateRepo-mine"
+    git("worktree", "add", "-q", "-b", "my-branch", str(mine))
+    (mine / "sub").mkdir()
+    victim = tmp_path / "GateRepo-victim"
+    git("worktree", "add", "-q", "-b", "victim-branch", str(victim))
+    # Checked out NOWHERE, which is the only shape class A denies: git's own guard already refuses a
+    # switch onto a branch that is live in some other worktree.
+    git("branch", "free-branch")
+    return HijackRepo(primary=primary, mine=mine, victim=victim)
+
+
+@pytest.fixture
+def hijack_repos_file(tmp_path: Path, hijack_repo: HijackRepo) -> Path:
+    f = tmp_path / "hijack_repos.txt"
+    f.write_text(f"# governed\n{hijack_repo.primary}\n", encoding="utf-8")
+    return f
+
+
+#: The one line in the gate that this change adds. Rewriting it to an empty array reconstructs the
+#: PRE-FIX rule exactly: class A, the destination narrowing and all of the path resolution stay the
+#: shipped text, byte for byte.
+CLASS_B_ASSIGNMENT = (
+    '$hijackHeadMoveVerbs = @("reset", "rebase", "merge", "cherry-pick", "revert", "am")'
+)
+
+
+@pytest.fixture
+def prefix_gate(tmp_path: Path) -> Path:
+    """The gate as it stood before #1359, rebuilt from the shipped file.
+
+    The rewrite is ASSERTED to have happened. A pattern that silently matched nothing would produce a
+    control byte-identical to the gate under test, and the pair would then agree for the wrong reason
+    -- which is the failure mode a control exists to rule out.
+    """
+    src = GATE.read_text(encoding="utf-8")
+    assert src.count(CLASS_B_ASSIGNMENT) == 1, (
+        "the class B verb assignment moved or was reformatted, so this control no longer rebuilds "
+        "the pre-#1359 gate. Fix CLASS_B_ASSIGNMENT rather than deleting the control."
+    )
+    dst = tmp_path / "worktree_gate_prefix.ps1"
+    dst.write_text(src.replace(CLASS_B_ASSIGNMENT, "$hijackHeadMoveVerbs = @()"), encoding="utf-8")
+    return dst
+
+
+@pytest.mark.parametrize(("verb", "args"), CLASS_B_VERBS)
+def test_a_head_moving_verb_aimed_at_another_sessions_worktree_is_denied(
+    hijack_repo: HijackRepo, hijack_repos_file: Path, prefix_gate: Path, verb: str, args: str
+) -> None:
+    """The hole #1359 closes, one row per verb, each against its own pre-fix control.
+
+    The session stands in its OWN worktree and reaches into another session's by absolute `-C`. Every
+    one of these repoints the victim's branch and replaces the files under a session that is mid-task.
+    """
+    cmd = f'git -C "{hijack_repo.victim}" {verb} {args}'.strip()
+    payload = bash(cmd, cwd=hijack_repo.mine)
+    # THE CONTROL FIRST, so a row that could not fail open is visible as such rather than passing
+    # quietly on the strength of the deny alone.
+    assert run_gate(payload, hijack_repos_file, gate=prefix_gate) is None, (
+        f"'{verb}' was already denied before this change, so this row measures nothing"
+    )
+    reason = assert_denied(run_gate(payload, hijack_repos_file))
+    assert "move the HEAD of a LINKED WORKTREE" in reason
+    assert "victim-branch" in reason  # the deny names the branch it would have moved
+
+
+@pytest.mark.parametrize(("verb", "args"), CLASS_B_VERBS)
+def test_a_head_moving_verb_in_the_sessions_own_worktree_is_allowed(
+    hijack_repo: HijackRepo, hijack_repos_file: Path, verb: str, args: str
+) -> None:
+    """The false positive class B exists to avoid, and the reason it is not simply folded into class A.
+
+    `git rebase main` in your own worktree is the most ordinary thing a session does. BACKLOG #308
+    already recorded the cost of denying that exact shape, from the other side of this file.
+    """
+    cmd = f"git {verb} {args}".strip()
+    assert run_gate(bash(cmd, cwd=hijack_repo.mine), hijack_repos_file) is None
+
+
+@pytest.mark.parametrize(("verb", "args"), CLASS_B_VERBS)
+def test_a_head_moving_verb_naming_the_sessions_own_worktree_explicitly_is_allowed(
+    hijack_repo: HijackRepo, hijack_repos_file: Path, verb: str, args: str
+) -> None:
+    """Spelling the target with `-C` rather than leaving it implicit must not change the verdict.
+
+    Class B decides on the RESOLVED TREE, never on how the command names it -- the property the pinned
+    `Repo2` row protects from the other direction.
+    """
+    cmd = f'git -C "{hijack_repo.mine}" {verb} {args}'.strip()
+    assert run_gate(bash(cmd, cwd=hijack_repo.mine), hijack_repos_file) is None
+
+
+def test_a_head_move_from_a_subdirectory_of_the_sessions_own_worktree_is_allowed(
+    hijack_repo: HijackRepo, hijack_repos_file: Path
+) -> None:
+    """A cwd one level down is still the same working tree.
+
+    Comparing the two paths as STRINGS calls `<wt>/sub` a different tree from `<wt>` and denies a
+    session that merely stepped into a subdirectory, so both sides resolve through `rev-parse
+    --show-toplevel` instead. The control pins that this repository still discriminates.
+    """
+    victim = f'git -C "{hijack_repo.victim}" reset --hard main'
+    assert_denied(
+        run_gate(bash(victim, cwd=hijack_repo.mine / "sub"), hijack_repos_file)
+    )  # control
+    assert (
+        run_gate(bash("git reset --hard main", cwd=hijack_repo.mine / "sub"), hijack_repos_file)
+        is None
+    )
+
+
+@pytest.mark.parametrize(("verb", "args"), NON_HEAD_MOVING_VERBS)
+def test_a_verb_that_does_not_move_head_stays_allowed_on_another_worktree(
+    hijack_repo: HijackRepo, hijack_repos_file: Path, verb: str, args: str
+) -> None:
+    """The four exclusions, pinned WITH the control that proves the fixture would have caught them.
+
+    These clobber another session's UNCOMMITTED work, which is real harm rule 3b has never claimed to
+    guard and still does not. #1359 records that as an open residual; this row is what keeps the
+    record honest, because an untested exclusion is indistinguishable from an oversight.
+    """
+    denies = f'git -C "{hijack_repo.victim}" reset --hard main'
+    assert_denied(run_gate(bash(denies, cwd=hijack_repo.mine), hijack_repos_file))  # control
+    cmd = f'git -C "{hijack_repo.victim}" {verb} {args}'.strip()
+    assert run_gate(bash(cmd, cwd=hijack_repo.mine), hijack_repos_file) is None
+
+
+def test_class_a_still_denies_a_switch_inside_the_sessions_own_worktree(
+    hijack_repo: HijackRepo, hijack_repos_file: Path
+) -> None:
+    """The asymmetry between the classes, stated as a test rather than only as a comment.
+
+    Class A denies a branch switch even in the tree the session is standing in, because the gate
+    cannot tell a worktree's rightful owner from a squatter. Class B never does. Widening class B to
+    match would deny every session's own rebase; narrowing class A to match would reopen the original
+    hijack -- so this row fails if either class is quietly rewritten in terms of the other.
+    """
+    reason = assert_denied(
+        run_gate(bash("git checkout free-branch", cwd=hijack_repo.mine), hijack_repos_file)
+    )
+    assert "switch a LINKED WORKTREE" in reason
+    assert run_gate(bash("git rebase main", cwd=hijack_repo.mine), hijack_repos_file) is None
+
+
+def test_class_a_is_unchanged_when_aimed_at_another_sessions_worktree(
+    hijack_repo: HijackRepo, hijack_repos_file: Path, prefix_gate: Path
+) -> None:
+    """checkout/switch must keep the verdict AND the message they had before the verb set was split.
+
+    Run against the rebuilt pre-fix gate as well: class A is the half of this rule that was already
+    correct, and the control shows the split moved nothing in it.
+    """
+    payload = bash(f'git -C "{hijack_repo.victim}" switch free-branch', cwd=hijack_repo.mine)
+    before = assert_denied(run_gate(payload, hijack_repos_file, gate=prefix_gate))
+    after = assert_denied(run_gate(payload, hijack_repos_file))
+    assert "switch a LINKED WORKTREE" in before
+    assert before == after
+
+
+def test_a_head_moving_verb_aimed_at_an_ungoverned_repository_is_allowed(
+    tmp_path: Path, hijack_repo: HijackRepo, hijack_repos_file: Path
+) -> None:
+    """The widened verb set must not start judging repositories the allowlist never named.
+
+    This is the pinned `Repo2` shape against a REAL repository rather than a bare tmp path: the older
+    row is green because git fails on a directory that does not exist, so it could not see a
+    regression that only appears once git answers.
+    """
+    other = tmp_path / "GateRepo2"
+    other.mkdir()
+    subprocess.run(["git", "init", "-q", "-b", "main"], cwd=other, check=True, capture_output=True)
+    control = f'git -C "{hijack_repo.victim}" rebase main'
+    assert_denied(run_gate(bash(control, cwd=hijack_repo.mine), hijack_repos_file))  # control
+    ungoverned = f'git -C "{other}" rebase main'
+    assert run_gate(bash(ungoverned, cwd=hijack_repo.mine), hijack_repos_file) is None
