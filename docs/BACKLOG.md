@@ -14808,6 +14808,53 @@ CI iteration, not a builder at a local shell.** *Do not dispatch (a) to a lane t
 **because a pinned dependency really is old -- a fact about the package index, not about the guardrail.**
 ***AN ASSERTION THAT CANNOT FAIL FOR THE REASON IT NAMES IS NOT A CONTROL.*** That is the same defect
 class as the release gate `a92ab10f` fixed, and it is why (b) is not cosmetic.
+
+**PROGRESS 2026-09-03, builder seat. STEP (b) IS BUILT AND IS NOT BEHIND (a). (a) REMAINS OPEN AND
+REMAINS UNREACHABLE FROM A LOCAL BOX.**
+
+*(b) was listed as behind (a) on the premise that making the row honest requires knowing WHY the stub
+loses. It does not.* **Detecting the bypass and diagnosing it are different questions**, and only the
+second needs the runner. A row that refuses to render a verdict when its fixture was bypassed is
+strictly better than one that renders the right verdict off the package index, and it is buildable at
+a local shell.
+
+**What the row asserted at HEAD, measured rather than assumed.** `_assert_stubs_win` (landed
+`e03e8e06a`) probes `command -v` in a SEPARATE child process before the body runs, so it answers
+which binary the shell WOULD choose. It cannot answer whether the body consulted the fixture, and it
+says nothing about whose clock produced the timestamp. Step one (`a736e120`) is confirmed present and
+was used throughout: the child's stdout carries the step's own
+`::notice::'requests==2.32.3' was published 720h ago`, which is what made the second check below
+possible at all.
+
+**Built, in `tests/test_dependabot_automerge_guardrails.py`.** Two provenance checks that run BEFORE
+the `age_ok` assertion, so a bypassed row reports the bypass instead of a boolean:
+1. `_assert_the_fixture_answered` -- the curl stub journals its own argv to a file outside the stub
+   directory (outside, because `_assert_stubs_win` probes `command -v` on everything it finds
+   inside), and the row requires a recorded call for `requests/2.32.3/json`.
+2. `_assert_the_age_is_the_fixtures` -- the age the step PRINTED must match the fixture's own
+   timestamp within an hour. This is the half no PATH probe can reach: it asks whose clock the
+   verdict came off, so a proxy, a cache or any other answering party is caught even when resolution
+   looks correct.
+
+**The negative control the row demanded is built and was watched fail**
+(`test_a_bypassed_curl_stub_is_refused_rather_than_passed_off_the_network`). A decoy curl answering
+the way pypi.org answers for the pinned package is placed ahead of the fixture, with no network
+reached. **The pre-existing assertion is fully satisfied by that run** -- the control asserts
+`age_ok == "true"` to pin exactly that -- while both new checks raise. Its positive half runs the same
+fixture honestly and requires both checks to stay silent, so a guard that raised for everything cannot
+satisfy it. Two further mutations were driven by hand: stripping the journal write reddens all four
+rows with `THE CURL STUB WAS NEVER INVOKED`, and feeding a live-like timestamp through an honest
+journal reddens the aged row with `the step computed 11040h but the fixture says 720h` -- a failure
+the boolean alone cannot produce, because a bypass and the fixture both yield `true` there.
+
+**Ran:** `ruff check`, `ruff format --check`, `mypy messagefoundry` (strict, clean), and the module
+itself 36 passed. The four release-age rows and the new control are jq-gated and skip where jq is
+absent, so they were exercised behind a local jq shim; **on a runner they run for real, and the CI
+legs are the only place their verdict counts.**
+
+**Still open, and deliberately untouched:** (a), which needs CI iteration on the runner image. The
+workflow was not edited -- the row states it is not the defect. (c) is a decision, not a build; the
+recommendation is carried in the pull request rather than ruled on here.
 ## 1309. Scope GET /metrics and /stats labels to the caller's allowed_channels
 
 > 🔢 OPEN -- allocated 2026-08-22 by the Dispatcher at a builder's request, under the standing rule that this seat allocates and the building lane does not file.
