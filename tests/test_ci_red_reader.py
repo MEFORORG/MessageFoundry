@@ -373,6 +373,42 @@ def test_a_job_whose_conclusion_is_not_failure_is_never_blamed() -> None:
     assert mod.blame_job([cancelled]) == (None, None, False)
 
 
+def test_every_pytest_step_in_ci_yml_counts_as_work() -> None:
+    """Read from `ci.yml`, not from a copy of its step names, so this cannot pass by agreeing with a
+    stale list. There are three today and only two are paired with a margin step -- but an
+    unrecognised work step reads as "did not pass", so a fourth suite would silently stop being
+    classified with nothing reporting it."""
+    workflow = (Path(__file__).resolve().parents[1] / ".github" / "workflows" / "ci.yml").read_text(
+        encoding="utf-8"
+    )
+    names = [
+        line.split("- name:", 1)[1].strip()
+        for line in workflow.splitlines()
+        if "- name:" in line and line.rstrip().endswith("(pytest)")
+    ]
+    assert len(names) >= 3, f"expected at least the three known pytest steps, found {names}"
+    for name in names:
+        job = _job("j", steps=[_step(name, "success"), _step("Step margin -- x", "failure")])
+        _, step, work_passed = mod.blame_job([job])
+        assert step == "Step margin -- x"
+        assert work_passed is True, f"{name!r} was not recognised as a work step"
+
+
+def test_a_non_pytest_step_that_passes_is_not_mistaken_for_the_suite() -> None:
+    """The discriminating negative. Setup steps pass in every job; if one counted as work, EVERY
+    margin red would be labelled 'the suite PASSED', including one over a suite that never ran."""
+    job = _job(
+        "j",
+        steps=[
+            _step("Install dependencies", "success"),
+            _step("Web console tests (pytest)", "skipped"),
+            _step("Step margin -- web console suite", "failure"),
+        ],
+    )
+    _, _, work_passed = mod.blame_job([job])
+    assert work_passed is False
+
+
 def test_the_rollup_match_survives_a_matrix_suffix() -> None:
     """`CI gate` carries no matrix today. If it gains one, the rule must not silently stop matching
     and start naming the roll-up again."""

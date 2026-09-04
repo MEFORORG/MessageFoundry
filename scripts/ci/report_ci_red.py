@@ -33,11 +33,12 @@ TWO ATTRIBUTION RULES OF ITS OWN, and both exist because the naive read misrepor
     of the eight runs above and its own failing step is ``Fail -- a gated leg FAILED``, which points
     at a leg it does not name. Reporting it would send every reader to the one job whose log is
     guaranteed to be empty of the answer.
-  * **A watchdog step is reported as a watchdog** (``_TIMING_STEP_PREFIXES``), and only when the step
-    it measures concluded ``success`` in the same job. The second condition is not redundant: both
-    pytest steps in ``ci.yml`` carry an ``if:`` on the change filter, so a SKIPPED work step can
-    leave the margin step as the job's first failure, and "the suite PASSED" would then be a claim
-    about a suite that never ran.
+  * **A watchdog step is reported as a watchdog** (``_TIMING_STEP_PREFIXES``), and only when a step
+    that RUNS work concluded ``success`` in the same job. The second condition is not redundant:
+    every pytest step in ``ci.yml`` carries an ``if:`` on the change filter, so a SKIPPED work step
+    can leave the margin step as the job's first failure, and "the suite PASSED" would then be a
+    claim about a suite that never ran. Work steps are matched by the ``(pytest)`` SUFFIX rather
+    than enumerated, so a fourth suite does not silently fall out of the classification.
 
 TWO RULES ARE COPIED FROM THE WRITER ON PURPOSE, because a reader that classifies differently from
 the writer reports causes the label was never applied for:
@@ -116,9 +117,13 @@ _ROLLUP_JOBS: frozenset[str] = frozenset({"ci gate"})
 #: suffix names the suite being measured, and there is one per suite).
 _TIMING_STEP_PREFIXES: tuple[str, ...] = ("Step margin",)
 
-#: Steps that RUN the work a watchdog above measures. A timing verdict is only reported as
-#: "nothing failed" when one of these concluded `success` in the same job -- see the module docstring.
-_WORK_STEP_PREFIXES: tuple[str, ...] = ("Tests (pytest)", "Web console tests (pytest)")
+#: A step that RUNS the work a watchdog above measures, recognised by SUFFIX rather than by a list
+#: of names. `ci.yml` has three today -- `Tests (pytest)`, `Web console tests (pytest)` and
+#: `Harness tests (pytest)` -- and only the first two are paired with a margin step. An enumeration
+#: would be a completeness claim that goes stale the day a fourth suite arrives (SDS-3.6), and it
+#: would go stale SILENTLY: an unrecognised work step reads as "did not pass", so the timing verdict
+#: would simply stop being reported with nothing saying why.
+_WORK_STEP_SUFFIX = "(pytest)"
 
 
 def _is_rollup(job_name: str) -> bool:
@@ -279,7 +284,7 @@ def blame_job(jobs: list[dict[str, object]]) -> tuple[str | None, str | None, bo
     )
     work_passed = any(
         str(s.get("conclusion") or "").lower() == "success"
-        and str(s.get("name") or "").startswith(_WORK_STEP_PREFIXES)
+        and str(s.get("name") or "").strip().endswith(_WORK_STEP_SUFFIX)
         for s in steps
     )
     return str(chosen.get("name") or "") or None, step, work_passed
