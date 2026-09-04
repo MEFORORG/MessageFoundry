@@ -5666,6 +5666,11 @@ Both contain the identical slug. Only the first carries a `worktrees/` prefix.
 > guard both branches. The inventory comment is still updated rather than deleted.
 > `test_worktree_gate_shell_semantics.py` collects **35**, all passing.
 >
+> **THE FOUR NAMED SUITES NOW COLLECT 227, all passing on 2026-09-04**, against **201** on
+> 2026-09-03. The set grew by 26 in a day, which is exactly why the paragraph above names its suites:
+> the two counts are comparable only because it did. The 227 says nothing about #1085 on its own --
+> the suite that covers this item is the 35-test one.
+>
 > **THREE MUTATIONS, NOT ONE, BECAUSE THE EARLIER PASSES ONLY EVER SHOWED THE JOIN FIRING.** A guard
 > nobody has seen fire is not evidence, and two of these three had never been driven backwards. Each was
 > applied alone against the five composition tests, and the file restored to hash `8d5c4d50` between
