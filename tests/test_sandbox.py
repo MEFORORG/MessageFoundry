@@ -1490,3 +1490,46 @@ def test_the_relay_survives_hostile_bytes_and_a_dead_pipe(
             raise OSError("pipe died with the worker")
 
     _StderrRelay("IB_U", 1, 1).run(_Exploding())  # type: ignore[arg-type]
+
+
+# --- (l) BACKLOG #1278: the default is subprocess, end to end ----------------
+
+
+def test_the_shipped_default_is_subprocess_all_the_way_to_the_runner_policy() -> None:
+    """BACKLOG #1278 — the default flip is only real if it SURVIVES the seam it travels through.
+
+    Three separate objects could each contradict the shipped default, and a test on any one of them
+    alone would pass while the engine still ran Router/Handler code in-process:
+
+    1. ``SandboxSettings.mode`` — the setting itself, and the only place a default belongs.
+    2. ``Engine(sandbox_settings=None)`` — the caller that passes nothing. Before #1278 that meant
+       in-process, so a reader could reasonably expect it still does.
+    3. ``SandboxPolicy`` — which used to carry ``mode = SandboxMode.OFF`` as a SECOND default. It no
+       longer carries one at all, and this pins that: a default there would be free to disagree with
+       the setting silently, which is exactly the drift the flip must not reintroduce.
+
+    Deliberately NOT a subprocess round-trip — the parity and isolation behaviour is covered above.
+    This asserts only which mode a stock engine resolves to, which is the part #1278 changed."""
+    import dataclasses
+
+    from messagefoundry.config.settings import SandboxSettings, ServiceSettings
+    from messagefoundry.pipeline.engine import Engine
+
+    assert SandboxSettings().mode == "subprocess"
+    assert ServiceSettings().sandbox.mode == "subprocess"
+
+    # An Engine handed no [sandbox] section renders the SAME mode, not a quietly different one.
+    engine = Engine(store=None, sandbox_settings=None)  # type: ignore[arg-type]
+    assert engine._sandbox_settings.mode == "subprocess"
+
+    # SandboxPolicy must have NO default for `mode`, so it can never contradict the setting.
+    mode_field = next(f for f in dataclasses.fields(SandboxPolicy) if f.name == "mode")
+    assert mode_field.default is dataclasses.MISSING, (
+        "SandboxPolicy.mode grew a default again. The one default lives in SandboxSettings; a "
+        "second one here is free to drift away from it without any test noticing."
+    )
+
+    # mode=off is RETAINED. It is the supported escape for a Handler needing db_lookup/fhir_lookup,
+    # which fail closed inside the child, so removing it would strand those feeds.
+    assert SandboxSettings(mode="off").mode == "off"
+    assert SandboxPolicy(mode=SandboxMode.OFF).mode is SandboxMode.OFF
