@@ -67,7 +67,7 @@ param(
 # the drift, but a stamp that disagrees with the verdict beside it is the exact ambiguity this machinery
 # exists to remove. -Status now prints the SHA prefix on both lines, so agreement is visible rather than
 # asserted, and this label can never again be the only thing a reader compares.
-$GateVersion = "2026.09.03.1"
+$GateVersion = "2026.09.04.1"
 
 # Fail OPEN: any unhandled error must let the tool call through, never block it.
 $ErrorActionPreference = "SilentlyContinue"
@@ -434,6 +434,52 @@ function Resolve-ShellIndirection([string]$Token, [string]$Prefix) {
     $out
 }
 
+# ONE DEFINITION OF "FOLLOW A CHDIR", AND IT IS EXTRACTED RATHER THAN COPIED (BACKLOG #1065).
+#
+# This body used to live inline in Get-GitTargetCandidatesRaw and had exactly one caller. Rule 3c now
+# needs the same answer for a DIFFERENT span of the same command line -- the region between the first
+# git token and the disarm, which the resolver's own $Prefix is sliced short of and can never see. A
+# second copy beside the first is how the two drift apart silently, and this file already records that
+# happening: #1229's third round was a measured fail-open caused by two places spelling one fact
+# differently, and the resolver's own residual list says the fix for a resolution defect belongs in the
+# shared helper "rather than to this rule".
+#
+# RETURNS "" FOR EVERY CASE IT CANNOT ANSWER, and the callers treat "" and $null alike because both are
+# falsy in PowerShell -- so the resolver's behaviour is byte-identical to the inline version it replaces.
+# The four unanswerable cases are unchanged and are all "this text cannot be composed":
+#   * `popd` or `cd -`  -- restores a directory this scan never saw;
+#   * a `(` or `{`      -- a subshell whose chdir does not affect the parent;
+#   * more than one     -- the fold is not a single token and this is not a shell;
+#   * a target that is blank after trimming. Answering "" there costs an unclosed shape and never a
+#     wrong one; inventing a target from the residue would be the second kind.
+#
+# WHAT QUOTING DOES TO A CALLER READING THE SCAN STRING, MEASURED RATHER THAN ASSUMED -- because the
+# obvious guess is wrong in one direction and right in the other. Remove-QuotedSpans UNMASKS a quoted
+# span holding one bare word, so `cd "."`, `cd '.'` and a quoted path with no space are all followed
+# exactly like the unquoted spelling. It blanks a span containing whitespace to an empty pair, so a
+# QUOTED target CONTAINING A SPACE (`cd "C:/Pri mary"`) is not followed at all -- and that is a stated
+# residual, not a hazard: the pair defeats the regex, nothing is returned, and the caller keeps the
+# behaviour it had. The UNQUOTED spacey spelling IS followed, because the capture class here admits
+# spaces and stops at the separator -- unlike the `-C` reader's `[^"\s]+`, which is a different
+# residual this file already records. A caller reading RAW text is unaffected by any of it.
+function Get-ChdirTargetRaw([string]$Text) {
+    if (-not $Text) { return "" }
+    if ($Text -match '(?:^|\s)(?:popd|cd\s+-(?:\s|$))') { return "" }
+    if ($Text -match '[({]') { return "" }
+    # THE VERB LIST AND THE IGNORECASE OPTION ARE BOTH LOAD-BEARING and are carried over verbatim.
+    # [regex]::Matches is case-SENSITIVE by default and PowerShell verbs are conventionally written
+    # `Set-Location`, so a case-sensitive alternation of lowercase spellings would match none of them
+    # and this helper would silently do nothing. The shells being matched are themselves
+    # case-insensitive, so this widens nothing that was not already reachable.
+    $chdirComposeVerbs = 'cd|chdir|pushd|sl|set-location|push-location'
+    $cds = [regex]::Matches(
+        $Text,
+        "(?:^|\s)(?:$chdirComposeVerbs)\s+`"?([^`"&|;]+?)`"?\s*(?:&&|;|\||`$)",
+        [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)
+    if ($cds.Count -ne 1) { return "" }
+    $cds[0].Groups[1].Value.Trim()
+}
+
 function Get-GitTargetCandidatesRaw([string]$Line, [string]$Prefix, [string]$CwdRaw,
                                    [switch]$AllTargets, [switch]$BaseFallback,
                                    [switch]$ExplicitFirst) {
@@ -480,38 +526,29 @@ function Get-GitTargetCandidatesRaw([string]$Line, [string]$Prefix, [string]$Cwd
     # The bail-outs are unchanged and still guard both branches: `popd` and `cd -` restore an unknown
     # directory, and `(`/`{` mean a subshell whose `cd` does not affect the parent -- in all three the
     # prefix cannot be composed and $cd stays null, which falls back to exactly the old behaviour.
-    $cd = $null
-    if ($Prefix -notmatch '(?:^|\s)(?:popd|cd\s+-(?:\s|$))' -and $Prefix -notmatch '[({]') {
-        # THE VERB LIST MATCHES RULE 3c's CHDIR GUARD, and it did not until now. This composer knew
-        # only `cd` and `pushd`, so a PowerShell chdir verb never resolved its target and the command
-        # after it was judged against the SESSION cwd instead. Measured on the shipped gate, with the
-        # consequence read back from the governed working tree rather than inferred from a verdict:
-        #
-        #     Push-Location <governed>; git reset --hard      ALLOWED, and it DESTROYED uncommitted work
-        #
-        # run from an ungoverned cwd. That is precisely the hijack rule 3 exists to prevent, reached by
-        # spelling one verb differently.
-        #
-        # THE ABSOLUTE AND RELATIVE CASES FAILED DIFFERENTLY, which is why the fix is here rather than at
-        # a call site. With an ABSOLUTE governed path `sl` and `Set-Location` already denied -- caught
-        # downstream by the path itself -- while `Push-Location` did not. With a RELATIVE target every
-        # uncomposed verb failed open, because nothing resolved `../../..` against the chdir at all.
-        #
-        # IGNORECASE IS REQUIRED AND IS THE ONE RISKY CHARACTER HERE. [regex]::Matches is case-SENSITIVE
-        # by default, and PowerShell verbs are conventionally written `Set-Location`, so a case-sensitive
-        # alternation of lowercase spellings would match none of them and this fix would silently do
-        # nothing. The shells being matched are themselves case-insensitive, so this widens nothing that
-        # was not already reachable.
-        #
-        # ADDITIVE BY CONSTRUCTION: composing a chdir can only make a target RESOLVE where it previously
-        # did not, so every verdict it changes moves ALLOW to DENY.
-        $chdirComposeVerbs = 'cd|chdir|pushd|sl|set-location|push-location'
-        $cds = [regex]::Matches(
-            $Prefix,
-            "(?:^|\s)(?:$chdirComposeVerbs)\s+`"?([^`"&|;]+?)`"?\s*(?:&&|;|\||`$)",
-            [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)
-        if ($cds.Count -eq 1) { $cd = $cds[0].Groups[1].Value.Trim() }
-    }
+    # THE VERB LIST MATCHES RULE 3c's CHDIR GUARD, and it did not until #1304. The composer knew only
+    # `cd` and `pushd`, so a PowerShell chdir verb never resolved its target and the command after it
+    # was judged against the SESSION cwd instead. Measured on the shipped gate, with the consequence
+    # read back from the governed working tree rather than inferred from a verdict:
+    #
+    #     Push-Location <governed>; git reset --hard      ALLOWED, and it DESTROYED uncommitted work
+    #
+    # run from an ungoverned cwd. That is precisely the hijack rule 3 exists to prevent, reached by
+    # spelling one verb differently.
+    #
+    # THE ABSOLUTE AND RELATIVE CASES FAILED DIFFERENTLY, which is why the fix is in the composer rather
+    # than at a call site. With an ABSOLUTE governed path `sl` and `Set-Location` already denied --
+    # caught downstream by the path itself -- while `Push-Location` did not. With a RELATIVE target every
+    # uncomposed verb failed open, because nothing resolved `../../..` against the chdir at all.
+    #
+    # ADDITIVE BY CONSTRUCTION: composing a chdir can only make a target RESOLVE where it previously did
+    # not, so every verdict it changes moves ALLOW to DENY.
+    #
+    # THE BODY MOVED TO Get-ChdirTargetRaw (BACKLOG #1065) and is byte-identical in behaviour: the two
+    # bail-outs, the verb list, the IgnoreCase option and the exactly-one rule are all carried across,
+    # and "" is falsy exactly where $null was. It moved because rule 3c needs the same answer for a span
+    # this $Prefix is sliced short of, and a second copy is how two spellings of one fact drift apart.
+    $cd = Get-ChdirTargetRaw $Prefix
 
     # git's global `-C <path>`, read CASE-SENSITIVELY. `-match` is case-INsensitive in PowerShell, so
     # git's lowercase `-c name=value` config override was captured as if it were a path -- and being the
@@ -1970,8 +2007,8 @@ if ($tool -in @("Bash", "PowerShell")) {
         $rest = $dis.Groups['rest'].Value
         $via = $dis.Groups['via'].Value
         $viaConfig = $via -match '\bconfig\b'
-        # A read is not a write -- the EXPLICIT read flags.
-        if ($seg.Scan -match '(?:^|\s)--(get|get-all|get-regexp|list|show-origin)(\s|$)') { continue }
+        # THE EXPLICIT READ FLAGS ARE TESTED BELOW, AGAINST THE DISARMING INVOCATION'S OWN WINDOW, and
+        # they used to be tested here against the WHOLE SEGMENT. See the block after $ownCmdWin.
         # ...AND THE IMPLICIT ONE (BACKLOG #1306). `git config <key>` with NO VALUE AFTER IT assigns
         # nothing -- it is the bare read, and `--get` is merely its explicit spelling. Measured against
         # real git: bare `git config <key>` exits 1 on an unset key and stores nothing, while
@@ -2057,6 +2094,31 @@ if ($tool -in @("Bash", "PowerShell")) {
         $ownCmdWin = $seg.Scan.Substring($ownStart, $dis.Index - $ownStart)
         $ownGitDir = ($ownCmdWin -match '(?:^|\s)(--git-dir[=\s]|GIT_DIR=)')
 
+        # ===============================================================================================
+        # A READ IS NOT A WRITE -- BUT IT HAS TO BE *THIS* INVOCATION'S READ (BACKLOG #1065).
+        #
+        # THE DEFECT, MEASURED, AND IT IS THIS ITEM'S CLASS WITH A DIFFERENT TOKEN. The explicit read
+        # flags were matched against the WHOLE SEGMENT, so a read belonging to a NEIGHBOURING command
+        # excused the write beside it:
+        #
+        #     git config <key> /nope                        DENY
+        #     git config --list && git config <key> /nope   ALLOW   <- the same write
+        #
+        # Fifteen rows on `origin/main`, every disarm key this rule names by every cwd -- primary,
+        # nested worktree, linked worktree. `git config --list` is an ordinary thing to run, so the
+        # excusing token needs no more intent than the `-C HEAD` this item was filed about, and the
+        # mechanism is identical: a token that belongs to a different command on the line decides the
+        # rule. The banner records a REJECTED patch closing this shape; nothing shipped, so it was live.
+        #
+        # $ownCmdWin IS THE SAME WINDOW $ownGitDir ALREADY USES, deliberately, so there is one answer to
+        # "what did the disarming invocation itself say" rather than two. It runs from the separator
+        # before the owning git token to the disarm, which is where a read flag is actually written, and
+        # `$rest` is appended for the trailing spelling. `git config --get <key>` is therefore excluded
+        # exactly as before -- the flag is inside its own window -- and so is `git --no-pager config
+        # --get <key>`, while the neighbouring read no longer reaches across the separator.
+        # ===============================================================================================
+        if ("$ownCmdWin $rest" -match '(?:^|\s)--(get|get-all|get-regexp|list|show-origin)(\s|$)') { continue }
+
         # THE CHDIR GUARD, AND ITS POSITION BOUND IS THE LOAD-BEARING HALF. $pfx is sliced at the FIRST git
         # token, so the resolver's own `cd` composer cannot see a chdir that appears AFTER it. Without this
         # guard `git commit -C HEAD && cd <ungoverned> && git config <key> v` denied and NAMED THE GOVERNED
@@ -2086,6 +2148,63 @@ if ($tool -in @("Bash", "PowerShell")) {
         # THE FALLBACK IS THE ONLY SUBTRACTIVE PIECE IN THIS CHANGE, and it subtracts from something that
         # did not exist before, so getting either guard wrong leaves a shape unclosed and cannot open one.
         $fallbackOk = (-not $ownDashC) -and (-not $chdirBefore)
+
+        # ===============================================================================================
+        # SUPPRESSING THE BASE IS NOT THE SAME AS KNOWING WHERE THE WRITE LANDS (BACKLOG #1065).
+        #
+        # THE DEFECT, MEASURED, AND IT REVERTS THIS RULE'S OWN HEADLINE CLOSURE WITH ONE ORDINARY TOKEN.
+        # The guard above answers "a chdir happened, so the session cwd is no longer the answer" by
+        # dropping the base candidate. But the resolver cannot follow that chdir either -- $pfx is sliced
+        # at the FIRST git token and the chdir sits after it -- so on a line that also carries a decoy
+        # `-C` the candidate set collapses to the decoy alone, git rejects it, and the rule allows:
+        #
+        #     git commit -C HEAD && git config <key> /nope              DENY   (the closure)
+        #     git commit -C HEAD && cd . && git config <key> /nope      ALLOW  (the same write)
+        #
+        # Measured on this file before this change from the primary, a nested worktree and a linked
+        # worktree, and with every chdir verb the guard above enumerates -- `cd`, `cd ./`, `pushd`,
+        # `chdir`, `sl`, `Set-Location`, `Push-Location` -- plus the `;` spelling and the alias key:
+        # THIRTEEN rows, every one ALLOW, every one landing in the shared config. `cd .` is a no-op, so
+        # the poison token needs no intent and changes nothing about what the command does.
+        #
+        # THE FIX IS TO ANSWER THE QUESTION RATHER THAN TO DECLINE IT. When the disarming invocation
+        # names no repository of its own, the directory the shell is standing in IS the target, and that
+        # directory is the chdir this guard just found. Follow it with the SAME helper the resolver uses
+        # and append it as a candidate.
+        #
+        # GATED ON THE INVOCATION NAMING NO REPOSITORY ITSELF, and that gate is what keeps this from
+        # manufacturing a deny. If the disarming invocation carries its own `-C` or `--git-dir`, THAT
+        # token decides where the write lands and the surrounding chdir does not -- appending it there
+        # would let a governed chdir refuse a write aimed by an explicit token at an ungoverned repo,
+        # which is the #1085 shape this rule has already been fixed for twice.
+        #
+        # APPENDED LAST, NEVER FIRST. $where[0] is unchanged, so the unresolvable-target refusal below is
+        # still decided on exactly the token it is decided on today, and a candidate that ANSWERS still
+        # decides before this one is ever tried. The only reachable change is where the chain used to run
+        # out and allow.
+        #
+        # COMPOSE, NEVER REPLACE -- the rule the resolver states for the same reason. A relative chdir in
+        # the window resolves against a chdir in the PREFIX, so the two are joined. If the prefix carries
+        # a chdir the helper cannot follow, nothing is appended at all: a base that is wrong is worse than
+        # no base, because it produces a confident answer about the wrong repository.
+        #
+        # THE WINDOW IS READ OFF SCAN AND THE PREFIX OFF RAW, and the split is deliberate rather than an
+        # oversight. A chdir inside a quoted VALUE is not a chdir, which is why the window uses the same
+        # blanked string the guard above tests; $pfx is the resolver's own argument and stays RAW so this
+        # rule and the resolver compose the identical prefix. See Get-ChdirTargetRaw for exactly what
+        # quoting costs on the scan side -- one bare word survives, a spacey quoted target does not.
+        $chdirTarget = ""
+        if ($chdirBefore -and -not $ownDashC -and -not $ownGitDir) {
+            $winCd = Get-ChdirTargetRaw $chdirWin
+            $pfxCd = Get-ChdirTargetRaw $pfx
+            $pfxFollowable = $pfxCd -or ($pfx -notmatch "(?:^|\s)(?:$chdirVerbs)(?:\s|$)")
+            if ($winCd -and $pfxFollowable) {
+                $chdirTarget = $(
+                    if ($pfxCd -and -not [System.IO.Path]::IsPathRooted($winCd)) { Join-Path $pfxCd $winCd }
+                    else { $winCd })
+            }
+        }
+        # ===============================================================================================
         # -AllTargets IS GATED ON $ownDashC, and the gate is the whole point (BACKLOG #1065).
         #
         # Sweeping EVERY `-C` on the line was too wide, and adversarial measurement caught it: from an
@@ -2191,6 +2310,10 @@ What to do instead:
         # the primary's own root -- the exact spelling #1061 was filed about. "Unresolvable means not
         # governed" is how this whole defect shipped; it is not reinstated here in any form.
         # ===============================================================================================
+        # The followed chdir joins the chain HERE and nowhere earlier, so both properties above hold of
+        # it unchanged: $where[0] never moves, and the refusal above has already been decided.
+        if ($chdirTarget) { $where = @($where) + @($chdirTarget) }
+
         $govCfg = $null
         foreach ($cand in $where) {
             $candRaw = Get-FullPathRaw $cand $cwdRaw
