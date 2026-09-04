@@ -240,9 +240,44 @@ def _is_ui_fetch_scope(path: str) -> bool:
 #: CONSTRUCTION. METHOD is part of safe: a cross-site navigation carrying a POST is a CSRF form
 #: submission, and no supported flow makes one.
 _SAFE_NAVIGATION_METHODS = frozenset({"GET", "HEAD"})
-#: ``object``/``embed`` pull a subresource into someone else's page while still reporting
-#: ``Sec-Fetch-Mode: navigate``. That is framing, not navigation, so it does not get the carve-out.
-_FRAMING_DESTINATIONS = frozenset({"object", "embed"})
+
+
+def _is_safe_top_level_navigation(
+    site: str, mode: str | None, dest: str | None, user: str | None, method: str
+) -> bool:
+    """The carve-out, as a named rule: is this cross-site/same-site request a real navigation?
+
+    Called only once ``site`` is known to be in :data:`._auth._CROSS_ORIGIN_FETCH`, so every test
+    below is reached only after the browser proved it speaks fetch metadata (BACKLOG #1122).
+
+    ``dest`` is an ALLOWLIST of ``document``, and that is the #1122 fix. It was a denylist of
+    ``{object, embed}`` -- the two framing destinations anyone thinks of -- and the leak was measured
+    on this tree rather than reasoned: a cross-site ``Sec-Fetch-Mode: navigate`` carrying
+    ``Sec-Fetch-Dest: iframe``, ``frame``, or NO destination at all was served, while ``object`` and
+    ``embed`` were refused in the same run. ``iframe``/``frame`` are the same cross-site framing the
+    denylist was written to refuse, and omitting the header skipped it unread. ``frame-ancestors
+    'none'`` does not cover the gap either: it is emitted only on the /ui HTML surface, and
+    ``/ui/static`` -- the exact tier this middleware exists to reach -- carries no CSP at all.
+
+    ``Sec-Fetch-User: ?1`` marks a navigation the USER started, a click or an Enter key; a scripted
+    ``window.open``, a ``location =`` assignment and a ``<meta http-equiv=refresh>`` all navigate
+    without it. It is demanded of ``same-site`` ONLY -- see the class docstring for why the two halves
+    of the refused set are not alike. Written as ``site == "cross-site"`` rather than
+    ``site != "same-site"`` deliberately: should a third value ever join that set, this form demands
+    activation for it instead of waving it through.
+
+    **The route-level twins are knowingly left un-hardened and are NOT shadowed by this.**
+    ``routes/sso.py`` and ``routes/oidc.py`` ask the same question as ``mode is not None and mode !=
+    "navigate"``, which has both defects this function fixes. They are not changed here because they
+    also catch same-origin non-navigation fetches and they AUDIT the reject, which middleware cannot;
+    unifying the four sites behind one predicate is filed, unallocated, on BACKLOG #1122.
+    """
+    return (
+        mode == "navigate"
+        and method.upper() in _SAFE_NAVIGATION_METHODS
+        and dest == "document"
+        and (site == "cross-site" or user == "?1")
+    )
 
 
 class UiFetchMetadataMiddleware:
@@ -267,6 +302,34 @@ class UiFetchMetadataMiddleware:
     **403, NEVER 404.** The tray classifies 404 as DISABLED and every other status as ENABLED, so a
     404 here would make it report a healthy console as switched off. A later "return 404 rather than
     disclose the route" hardening pass would look like an improvement and silently break the tray.
+
+    **EVERY REQUIREMENT BELOW IS CONDITIONAL ON THE BROWSER HAVING ALREADY PROVED IT SPEAKS FETCH
+    METADATA (BACKLOG #1122).** None of them is reached until ``Sec-Fetch-Site`` arrived and said
+    cross-site or same-site, so a client that omits the family is unaffected by all of them. That is
+    what lets them ship with no supported-browser matrix in the tree -- ``docs/SYSTEM-REQUIREMENTS.md``
+    says only "A modern browser" -- and it is exactly what an ABSENCE rule could not claim. Measured
+    2026-09-04 by inverting this one condition and running the suite: making absence itself refuse
+    reds **231 of the 408 console tests**, and would refuse the tray probe; that limb is a
+    browser-support decision, not a code change, and it is not taken here.
+
+    **A SAME-SITE NAVIGATION MUST BE USER-ACTIVATED; A CROSS-SITE ONE MUST NOT BE ASKED TO BE.** The
+    two halves of the refused set are not alike, and treating them alike is what left the hole:
+
+    * ``SameSite=Strict`` strips the session cookie from every CROSS-site request, so a cross-site
+      navigation reaches us with no authority and the carve-out costs nothing. It is also the half
+      that must stay open -- an intranet link is one, and so is the IdP's redirect back to the OIDC
+      callback.
+    * It does NOT strip the cookie from a SAME-site request. "Site" ignores the port, so on the
+      shipped loopback default ``http://127.0.0.1:9999`` is same-site to the console: a page there can
+      script ``window.open`` at a /ui URL and the operator's cookie rides along. ``Sec-Fetch-User``
+      is what separates the operator's own click from that script, and it is safe to demand HERE
+      precisely because no federated-login leg is same-site.
+
+    **WHY ``Sec-Fetch-User`` IS NOT DEMANDED ON THE CROSS-SITE HALF, THOUGH IT WOULD LOOK SYMMETRICAL.**
+    The IdP's redirect back is a server-driven 302. When the IdP session is already established there
+    is no interaction on that hop, so a ``?1`` requirement would refuse silent re-authentication --
+    a broken login that every hermetic test in this tree still passes, which is how a first cut of
+    this middleware shipped a 403 on every real SSO login once already.
     """
 
     def __init__(self, app: ASGIApp) -> None:
@@ -278,7 +341,7 @@ class UiFetchMetadataMiddleware:
             return
         # Read from the raw scope rather than building a Request: this runs for every /ui asset, and
         # header names on the wire are lower-cased bytes by ASGI contract.
-        site = mode = dest = None
+        site = mode = dest = user = None
         for key, value in scope.get("headers") or ():
             if key == b"sec-fetch-site":
                 site = value.decode("latin-1")
@@ -286,14 +349,12 @@ class UiFetchMetadataMiddleware:
                 mode = value.decode("latin-1")
             elif key == b"sec-fetch-dest":
                 dest = value.decode("latin-1")
+            elif key == b"sec-fetch-user":
+                user = value.decode("latin-1")
         if site is None or site not in _CROSS_ORIGIN_FETCH:
             await self.app(scope, receive, send)
             return
-        if (
-            mode == "navigate"
-            and str(scope.get("method", "")).upper() in _SAFE_NAVIGATION_METHODS
-            and dest not in _FRAMING_DESTINATIONS
-        ):
+        if _is_safe_top_level_navigation(site, mode, dest, user, str(scope.get("method", ""))):
             await self.app(scope, receive, send)
             return
         await PlainTextResponse("cross-site request rejected", status_code=403)(
