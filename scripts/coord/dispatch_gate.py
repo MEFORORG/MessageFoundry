@@ -39,6 +39,25 @@ READ** and decides nothing. Four open rows state plainly that their work shipped
 built again, and every field above still says buildable on all four, because the verb in them is
 **REBUILD** and no screen in this repo reads for it.
 
+**And then it stops reading the row and ASKS THE TREE** (BACKLOG #1398). Every needle above reads
+prose somebody wrote about the code. A row can be fully built and shipped with **nothing in its text
+saying so**, and no amount of careful reading finds it. That is not the same class as the paragraph
+above: there the row SAYS its work shipped and a screen missed the verb; here **there is nothing in
+the text to miss.** Measured 2026-08-29: a dispatcher screened #1300 as open, unclaimed, in no pull
+request and carrying no bar, and it was already built and shipped on ``main``. The only way anyone
+found out was by starting the work.
+
+So before a wave is dispatched, one ``git grep`` over ``origin/main`` asks whether landed code cites
+each candidate's number, via :mod:`landed_citation_screen`. A hit raises the item to ``read`` --
+**MUST BE READ, never a verdict**, for two reasons that pull in opposite directions and are both
+live on today's corpus. A citation is not a completion: landed code cites a row while FILING it,
+while testing around it, or while recording why it was NOT done. And a clear row is not proof of
+unbuilt: this sees only what LANDED, and #1375 was fully built onto a branch that never reached
+``origin``. The flag rate settles it. Measured over ``origin/main`` at ``fd44b0f17`` and again at
+``46ea10a78`` by ``landed_citation_screen.py --all-open``: **118 of 275 open rows carry the joined
+citation form, 42.9 percent.** At that density a refusal is a wave that never dispatches, so nothing
+here blocks on a tree hit and ``--refuse`` does not either.
+
 **IT NAMES THE CLOSING ACT. IT DOES NOT REFUSE THE ITEM.** That is a correction to this tool's first
 version, and the correction matters more than the tool. That version refused any closing act a
 builder could not perform. Measured against the very range it was built for, it would have blocked
@@ -65,9 +84,11 @@ Usage::
 
     python scripts/coord/dispatch_gate.py 1107 1112 1122
     python scripts/coord/dispatch_gate.py --range 1107-1199 --explain
+    python scripts/coord/dispatch_gate.py --range 1380-1399 --no-tree
     python scripts/coord/dispatch_gate.py --self-test
 
 Exit 0 only when EVERY named item is dispatchable. Exit 1 otherwise, listing each refusal and why.
+A tree hit never changes the exit code.
 """
 
 from __future__ import annotations
@@ -79,6 +100,10 @@ from pathlib import Path
 from typing import NamedTuple
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "docs"))
+# The screen is a SIBLING, and it is imported rather than reimplemented. A second copy of the sweep
+# beside the one that carries the controls is the two-definitions defect the ledger rules forbid:
+# the copy would drift, and a drifted instrument here answers uniformly and confidently.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from backlog_status_check import (  # type: ignore[import-not-found]  # noqa: E402
     BUILDER_CLOSABLE_ACTS,
@@ -86,6 +111,18 @@ from backlog_status_check import (  # type: ignore[import-not-found]  # noqa: E4
     DEFAULT_SOURCES,
     Item,
     parse_items,
+)
+from landed_citation_screen import (  # type: ignore[import-not-found]  # noqa: E402
+    CITED,
+    DEFAULT_REF,
+    SEARCH_PATHS,
+    Finding,
+    InstrumentError,
+    check_agreement,
+    check_controls,
+    resolve_ref,
+    screen,
+    sweep,
 )
 
 # Below this, the ledger did not parse and no verdict from this gate is evidence.
@@ -452,6 +489,104 @@ def judge(item: Item, body: str = "", banner: str = "") -> tuple[str, str]:
     return "ok", f"closes by {act!r}, performed by {CLOSING_SEAT.get(act, 'the builder')}"
 
 
+# ASKING THE TREE IS A SEPARATE LIMB FROM `judge`, AND THE SPLIT IS DELIBERATE (BACKLOG #1398).
+#
+# `judge` is pure and reads ONE item. This reads git, once per WAVE rather than once per row, and it
+# fails in ways a ledger read cannot: an unfetched ref, a shallow clone, no remote at all. Fusing the
+# two would put I/O -- and a failure mode that must degrade LOUDLY rather than return a level --
+# inside a function whose whole contract is "no body, no claim", and every existing test of `judge`
+# would start needing a repository to run.
+#
+# ONLY THE JOINED FORM ELEVATES, AND THE WEAKER LEVEL IS LEFT TO THE STANDALONE SCREEN. A bare `#N`
+# spells a pull-request number just as well as an item number, and the two namespaces are
+# indistinguishable by shape; the screen's own docstring measures the difference at twelve extra open
+# rows. On the dispatch path that ambiguity buys nothing a reader can act on, so this consults
+# `Finding.strict` and never `Finding.loose`. Run the screen directly to see MENTIONED rows.
+#
+# WHERE THE TREE NOTE SITS IN THE MESSAGE IS DECIDED BY THE LEVEL, and it is not cosmetic. A `read`
+# or `refuse` note already OPENS with a stop-and-read sentence -- a retirement declaration, the row's
+# own already-built claim, or "the dispatch cannot name anything at all here". A retirement is the
+# strongest claim this file makes and `test_the_retirement_note_leads` pins that it leads, so a
+# weaker tree signal must not displace it: there the tree note is APPENDED. An `ok` or `advise` note
+# says the opposite -- that there is work to start -- so there the tree note LEADS, because on a row
+# of #1300's shape it is the only sentence in the whole output contradicting them.
+_TREE_LEADS = ("ok", "advise")
+
+#: How many citation locations a note quotes before it truncates. A reader whose next act is to open
+#: the file wants the line; a reader handed thirty of them reads none of them.
+TREE_LOCATIONS_SHOWN = 3
+
+
+def tree_note(ref: str, cited: tuple[str, ...]) -> str:
+    """The sentence a tree hit adds, worded so it cannot be read as a verdict.
+
+    **Both directions of wrongness are stated, because only one of them is intuitive.** A reader
+    guesses that a hit might be incidental. Almost nobody guesses the other way -- that a CLEAR row
+    can be finished work sitting on a branch nobody pushed -- and that is the half which sends
+    somebody to rebuild a shipped feature.
+
+    **No population figure travels in this note.** The flag rate is the reason this is a must-read
+    rather than a verdict, and it is dated and attributed in the module docstring instead. A constant
+    embedded in runtime output is a number nobody re-measures and everybody quotes.
+    """
+    shown = ", ".join(cited[:TREE_LOCATIONS_SHOWN])
+    if len(cited) > TREE_LOCATIONS_SHOWN:
+        shown += f", and {len(cited) - TREE_LOCATIONS_SHOWN} more"
+    return (
+        f"MUST BE READ -- LANDED CODE ON {ref} CITES THIS NUMBER: {shown}. THIS GATE HAS DECIDED "
+        f"NOTHING: it asked the tree, and 'code cites this number' is not the sentence 'this row is "
+        f"built'. A citation is not a completion -- landed code cites a row while FILING it, while "
+        f"testing around it, or while recording why it was NOT done. Read the row before a "
+        f"lane-window is spent on it."
+    )
+
+
+def merge_tree_finding(level: str, note: str, ref: str, cited: tuple[str, ...]) -> tuple[str, str]:
+    """Fold one row's tree answer into :func:`judge`'s answer. Pure, so it needs no repository.
+
+    ``cited`` is the joined-form locations for this row, empty when the tree said nothing. An empty
+    tuple returns ``(level, note)`` UNCHANGED and byte-identical, which is the same "no input, no
+    claim" contract ``judge`` keeps for a body nobody read: a caller that could not ask the tree must
+    get exactly the answer this gate gave before the limb existed, never a clear result it did not
+    measure.
+    """
+    if not cited:
+        return level, note
+    added = tree_note(ref, cited)
+    if level in _TREE_LEADS:
+        return "read", f"{added} {note}"
+    return level, f"{note} {added}"
+
+
+def ask_the_tree(
+    root: Path, nums: list[int], ref: str = DEFAULT_REF
+) -> tuple[dict[int, Finding], str | None]:
+    """``({num: Finding}, None)`` when the tree answered, ``({}, why)`` when it could not.
+
+    **A FAILURE HERE RETURNS A REASON, NEVER AN EMPTY RESULT, AND THE CALLER MUST SAY SO OUT LOUD.**
+    An unfetched ref, a shallow clone or a mistyped path list all return zero lines, which is
+    byte-identical to a tree where genuinely nothing is cited. Reporting that silently as "no row is
+    built" is the false zero the screen's own controls exist to catch, and it would reproduce the
+    exact failure this limb was added for while looking greener than before.
+
+    The controls are the screen's, run on every invocation, and a control that did not hold discards
+    the whole sweep rather than qualifying it. A reader handed a plausible listing under a caveat
+    keeps the listing and forgets the caveat.
+    """
+    try:
+        resolve_ref(root, ref)
+        sightings = sweep(root, ref)
+        broken = check_controls(sightings) + check_agreement(root, ref, sightings)
+    except InstrumentError as exc:
+        return {}, str(exc)
+    if broken:
+        return {}, (
+            "the screen's controls did not hold, so no tree result would be evidence: "
+            + "; ".join(broken)
+        )
+    return {f.num: f for f in screen(nums, sightings)}, None
+
+
 def _self_test() -> int:
     """Prove the gate refuses what it must before anyone trusts a pass from it."""
     failures: list[str] = []
@@ -625,11 +760,68 @@ def _self_test() -> int:
         if got != want:
             failures.append(f"{why}: wanted {want!r}, got {got!r} ({reason})")
 
+    # THE TREE LIMB'S OWN PAIR, RUN WITHOUT A REPOSITORY (BACKLOG #1398). A merge proven on one side
+    # proves nothing: a fold that elevates every row and one that elevates none both look correct
+    # against a single-sided check, and both are silent. So the cited arm must MOVE the level and the
+    # clear arm must leave it byte-identical.
+    hit = ("tests/test_x.py:1",)
+    merges: list[tuple[str, str, tuple[str, ...], str, bool, str]] = [
+        ("ok", "closes by 'code'", hit, "read", True, "a cited row is not dispatchable in silence"),
+        (
+            "ok",
+            "closes by 'code'",
+            (),
+            "ok",
+            False,
+            "THE NEGATIVE ARM: a clear row must come back byte-identical, never a fresh claim. A "
+            "fold that elevates everything passes the arm above and fails this one",
+        ),
+        (
+            "advise",
+            "closes by 'scorecard-rescore'",
+            hit,
+            "read",
+            True,
+            "MUST BE READ OUTRANKS ADVISE for the same reason the row's own claim does: an advise "
+            "row is workable, and a row that may be shipped costs a whole lane-window",
+        ),
+        (
+            "refuse",
+            "declares no Closing-act",
+            hit,
+            "refuse",
+            False,
+            "REFUSE STILL WINS THE LEVEL. The dispatch can name nothing on an undeclared row, and a "
+            "tree hit does not change that -- it rides in the note instead",
+        ),
+        (
+            "read",
+            "MUST BE READ -- THE ROW SAYS THIS WORK IS ALREADY BUILT.",
+            hit,
+            "read",
+            False,
+            "THE ROW'S OWN CLAIM KEEPS THE LEAD. It is the stronger, more specific sentence, and "
+            "the pinned note orderings above must not be displaced by a weaker signal",
+        ),
+    ]
+    for level, note, cited, want_level, want_lead, why in merges:
+        got_level, got_note = merge_tree_finding(level, note, "origin/main", cited)
+        leads = got_note.startswith("MUST BE READ -- LANDED CODE")
+        if got_level != want_level or leads != want_lead:
+            failures.append(
+                f"{why}: wanted {want_level!r} lead={want_lead}, got {got_level!r} lead={leads}"
+            )
+        if not cited and got_note != note:
+            failures.append(f"{why}: a clear row must return the note unchanged, got {got_note!r}")
+
     for line in failures:
         print(f"SELF-TEST FAIL: {line}", file=sys.stderr)
     if failures:
         return 1
-    print(f"self-test PASS: {len(cases)} cases; the wave shape is ADVISED, not refused")
+    print(
+        f"self-test PASS: {len(cases)} judge cases and {len(merges)} tree-merge cases, including "
+        f"both arms of the control pair; the wave shape is ADVISED, not refused"
+    )
     return 0
 
 
@@ -652,7 +844,22 @@ def main(argv: list[str] | None = None) -> int:
         "--refuse",
         action="store_true",
         help="exit 1 when any item is UNDECLARED or unknown. OFF by default: a dispatch names "
-        "closing acts, it does not block work.",
+        "closing acts, it does not block work. A tree hit never affects this.",
+    )
+    # ON BY DEFAULT, AND THAT IS THE WHOLE CHANGE. An opt-in tree check is a tree check nobody runs,
+    # and the failure it catches is invisible to every reader who does not run it -- which is how
+    # #1300 was dispatched in the first place. The escape exists for a checkout with no remote.
+    ap.add_argument(
+        "--no-tree",
+        action="store_true",
+        help="do not ask the tree whether landed code cites these rows. The gate then cannot see a "
+        "row that is fully built with nothing in its text saying so, and says so in its output.",
+    )
+    ap.add_argument(
+        "--tree-ref",
+        default=DEFAULT_REF,
+        help=f"the tree to ask (default {DEFAULT_REF}). LANDED code is the subject: a branch nobody "
+        f"pushed is invisible here by design.",
     )
     ap.add_argument("--self-test", action="store_true")
     args = ap.parse_args(argv)
@@ -675,17 +882,31 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 1
 
+    asked = sorted(set(wanted))
+    tree: dict[int, Finding] = {}
+    tree_off = "--no-tree given" if args.no_tree else None
+    if not args.no_tree:
+        tree, tree_off = ask_the_tree(args.root, asked, args.tree_ref)
+
     ok: list[tuple[int, str]] = []
     advise: list[tuple[int, str]] = []
     must_read: list[tuple[int, str]] = []
     refused: list[tuple[int, str]] = []
     unknown: list[int] = []
-    for num in sorted(set(wanted)):
+    tree_hits = 0
+    for num in asked:
         row = items.get(num)
         if row is None:
             unknown.append(num)
             continue
         level, note = judge(row.item, body=row.body, banner=row.banner)
+        found = tree.get(num)
+        # `.strict` and never `.loose`: a bare `#N` spells a pull-request number too. See the
+        # comment above `merge_tree_finding`.
+        cited = found.strict if found is not None and found.level == CITED else ()
+        if cited:
+            tree_hits += 1
+        level, note = merge_tree_finding(level, note, args.tree_ref, cited)
         # Explicit dispatch on the level. The first version did `if good` on judge()'s return, and
         # when judge started returning a LEVEL STRING every level became truthy -- an undeclared
         # item reported as dispatchable. A truthiness test over a widened return type is exactly the
@@ -695,8 +916,18 @@ def main(argv: list[str] | None = None) -> int:
             (num, note)
         )
 
-    print(f"items closing by the builder's own act: {len(ok)} of {len(set(wanted))}")
+    print(f"items closing by the builder's own act: {len(ok)} of {len(asked)}")
     print(f"  ledger parsed: {len(items)} items from {args.root}")
+    # THE TREE LINE PRINTS AT THE TOP WHETHER OR NOT THE TREE ANSWERED, and a failure prints the
+    # reason rather than nothing. A limb that degrades quietly is worse than no limb: the output
+    # looks the same, one whole class of row stops being detected, and the reader has no way to tell.
+    if tree_off is None:
+        print(
+            f"  tree asked: {args.tree_ref} over {' '.join(SEARCH_PATHS)} -- landed code cites "
+            f"{tree_hits} of {len(asked)} rows in this wave"
+        )
+    else:
+        print(f"  TREE NOT ASKED: {tree_off}")
     print()
 
     for num in unknown:
@@ -722,10 +953,24 @@ def main(argv: list[str] | None = None) -> int:
     )
     if must_read:
         print(
-            "A MUST BE READ ROW IS NOT REFUSED, AND --refuse DOES NOT BLOCK ON ONE. The row's own\n"
-            "sentence says the work is built; this gate read the row, not the tree, and the row can\n"
-            "be stale in either direction. Blocking on it would rebuild the screen #1394 records,\n"
-            "which discarded 46 percent of the live ledger on a token match."
+            "A MUST BE READ ROW IS NOT REFUSED, AND --refuse DOES NOT BLOCK ON ONE. A row can be\n"
+            "stale in either direction, whether the claim came from its own sentence or from the\n"
+            "tree. Blocking on it would rebuild the screen #1394 records, which discarded 46\n"
+            "percent of the live ledger on a token match."
+        )
+    if tree_off is None:
+        print(
+            "CLEAR IS NOT PROOF OF UNBUILT, AND THIS IS THE HALF NOBODY GUESSES. The tree above is\n"
+            "LANDED code, and built work does not always land: a row finished onto a branch that\n"
+            "never reached origin comes back clear here, and the strongest signal this gate has\n"
+            "would have missed a finished job. A tree hit is a four-minute read, never a verdict."
+        )
+    else:
+        print(
+            "THE TREE WAS NOT ASKED, so this run cannot see a row that is fully built and shipped\n"
+            "with NOTHING IN ITS TEXT SAYING SO. Every level above came from prose somebody wrote\n"
+            "about the code. That is the class #1300 belongs to, and no amount of careful reading\n"
+            "finds it. Re-run without --no-tree, or fetch the ref, before spending a lane-window."
         )
     if args.refuse and (refused or unknown):
         print("--refuse given: the wave contains undeclared or unknown items.")
