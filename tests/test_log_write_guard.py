@@ -32,9 +32,10 @@ from collections.abc import Callable
 from pathlib import Path
 
 import pytest
+from pydantic import ValidationError
 
 from messagefoundry.config.models import ConnectorType
-from messagefoundry.config.settings import LoggingSettings, LogWriteFailurePolicy
+from messagefoundry.config.settings import LoggingSettings, LogWriteFailurePolicy, load_settings
 from messagefoundry.config.wiring import (
     ConnectionSpec,
     InboundConnection,
@@ -466,6 +467,42 @@ def test_settings_refuse_the_legacy_planned_rotation_key_names(tmp_path: Path) -
         LoggingSettings(file=str(tmp_path / "engine.log"), max_bytes=1000)
     with pytest.raises(ValueError, match="file_backup_count"):
         LoggingSettings(file=str(tmp_path / "engine.log"), backups=2)
+
+
+@pytest.mark.parametrize(
+    ("env_var", "names"),
+    [("MEFOR_LOGGING_MAX_BYTES", "file_max_bytes"), ("MEFOR_LOGGING_BACKUPS", "file_backup_count")],
+)
+def test_the_legacy_rotation_key_is_refused_from_env_where_the_file_gate_does_not_reach(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, env_var: str, names: str
+) -> None:
+    # WHICH LAYER REFUSES DEPENDS ON WHERE THE KEY CAME FROM, and the model validator above is not
+    # the one a file reaches. `_reject_unknown_file_keys` refuses an unrecognized key in the TOML
+    # before any model is built, so a FILE carrying either spelling stops there. The env layer is
+    # different: `docs/CONFIGURATION.md` states plainly that the refusal "covers the FILE. It does not
+    # cover env or CLI", so a misspelled `MEFOR_*` is normally dropped in SILENCE.
+    #
+    # These two spellings are the exception, and that is the whole point of keeping the model
+    # validator once the loader gained a generic refusal. Without this test the docstring's claim
+    # about the env layer is unpinned prose, and the validator looks like dead weight next to the
+    # loader — which is exactly how a second line of defence gets deleted as redundant.
+    config = tmp_path / "messagefoundry.toml"
+    config.write_text('[logging]\nlevel = "INFO"\n', encoding="utf-8")
+    monkeypatch.setenv(env_var, "7")
+    with pytest.raises(ValidationError, match=names):
+        load_settings(config_path=config)
+
+
+def test_the_legacy_rotation_key_is_refused_in_the_file_by_the_loader(tmp_path: Path) -> None:
+    # The other half of the pair, so the docs cannot go stale in either direction. A file spelling is
+    # refused by the LOADER, not by the model validator, and the message an operator actually reads
+    # is the loader's. Pinned as a pair with the env test so a future loader change that swallowed
+    # one of these lands here rather than in a deployment.
+    config = tmp_path / "messagefoundry.toml"
+    for legacy in ("max_bytes", "backups"):
+        config.write_text(f"[logging]\n{legacy} = 7\n", encoding="utf-8")
+        with pytest.raises(ValueError, match=f"unrecognized config key.*{legacy}"):
+            load_settings(config_path=config)
 
 
 # --- the engine response: stop this process's connections, and say why -------
@@ -1070,6 +1107,58 @@ async def test_a_reload_re_arms_exactly_the_inbounds_it_re_binds(
         assert list(outdir.iterdir()) == []  # …but delivery is still paused
         await runner.start_outbound(OUTBOUND)
         assert await _until(lambda: any(outdir.iterdir())), "never drained after reload + resume"
+        assert await _until_processed(store, message_id), "drained but never finalized"
+    finally:
+        await runner.stop()
+
+
+@pytest.mark.parametrize("claim_mode", CLAIM_MODES)
+async def test_a_runner_started_into_a_dead_log_comes_up_halted(
+    store: MessageStore, tmp_path: Path, claim_mode: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # THE RE-ARM PATH THAT WAS NOT GATED, and it was found by execution rather than review. Every
+    # OTHER door back into processing asks `_log_recovery_ok` first — `restart_inbound`,
+    # `start_outbound`, a reload's `_start_inbound_unsafe`. `RegistryRunner.start` did not: it cleared
+    # `_log_write_stopped` and `_log_halted` unconditionally, on the reasoning that a fresh start is a
+    # fresh engine.
+    #
+    # MEASURED RED, in BOTH claim modes, on the rig below: with both sinks unwritable BEFORE the
+    # runner was built, a committed ingress row went to `PROCESSED` and was DELIVERED while
+    # `guard.can_log()` read False the whole time. That is the item's own sentence — processing what
+    # cannot be logged — reached through the one path the halt did not cover. It is not hypothetical
+    # plumbing: `Engine` starts a RegistryRunner on leadership acquisition and on the reload that
+    # first builds one, and neither asks about the log.
+    #
+    # The engine comes up HALTED rather than refusing to start, because /status, the alert state and
+    # the recovery paths are what an operator needs precisely here.
+    outdir, logdir = tmp_path / "out", tmp_path / "logs"
+    outdir.mkdir()
+    logdir.mkdir()
+    configure_logging("INFO", log_file=LogFile(path=str(logdir / "engine.log")))
+    _kill_every_sink(logdir, monkeypatch)  # the log dies BEFORE the runner exists
+    logging.getLogger("t").warning("a record this process cannot write anywhere")
+    guard = active_guard()
+    assert guard is not None and not guard.can_log(), "the rig never made the process unable to log"
+
+    runner = RegistryRunner(_e2e_registry(outdir), store, poll_interval=0.02, claim_mode=claim_mode)
+    await runner.start()
+    try:
+        assert runner._log_write_stopped, "start cleared the halt against an unwritable log"
+        assert INBOUND in runner._log_halted
+        assert INBOUND not in runner._sources, "intake stayed up with the internal stages halted"
+
+        message_id = await store.enqueue_ingress(channel_id=INBOUND, raw=RAW)
+        await asyncio.sleep(1.0)  # generous: the healthy rig above delivers far inside this
+        assert list(outdir.iterdir()) == []
+        assert await store.outbox_for(message_id) == []
+        assert (await store.get_message(message_id))["status"] == MessageStatus.RECEIVED.value
+
+        # …and the halt is CONDITIONED, not permanent — otherwise this test would also pass against a
+        # runner that simply never processes anything, which is the wrong control for the right reason.
+        _revive_every_sink(logdir, monkeypatch)
+        await runner.restart_inbound(INBOUND)
+        await runner.start_outbound(OUTBOUND)
+        assert await _until(lambda: any(outdir.iterdir())), "the repaired engine never drained"
         assert await _until_processed(store, message_id), "drained but never finalized"
     finally:
         await runner.stop()

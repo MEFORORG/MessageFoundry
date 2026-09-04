@@ -2583,6 +2583,47 @@ class RegistryRunner:
         except Exception:
             log.exception("alert sink raised on a refused log-failure restart for %r", name)
 
+    async def _unbind_for_log_failure(self) -> None:
+        """Take intake back down when :meth:`start` came up into an unwritable application log (#122).
+
+        The counterpart of :meth:`_stop_all_for_log_failure`'s inbound half, for the one case that
+        method cannot cover: at ``start`` there was no halt to fire, the log was *already* dead. Called
+        with the reload lock held, AFTER the dispatchers exist, so the internal stages are halted
+        before the listeners go down rather than after.
+
+        **Unbinding is not belt-and-braces.** Leaving intake up with the internal stages halted would
+        ACK a sender into a lane nothing is draining — the same reason
+        :meth:`_start_inbound_unsafe`'s own refusal path stops the listener it just bound. Pages
+        through the NOTIFIER rather than a log line, for the reason the whole control does: the thing
+        that is broken is the log."""
+        bound = [name for name in self.registry.inbound if name in self._sources]
+        for name in bound:
+            try:
+                await self._stop_inbound_unsafe(name)
+            except Exception:
+                # One listener refusing to unbind must not leave the others up: a fail-closed halt is
+                # better partial than abandoned (same rule as _stop_all_for_log_failure).
+                log.exception("log-failure start: inbound %r did not stop cleanly", name)
+        guard = active_log_guard()
+        dead = (
+            ",".join(s.sink for s in guard.status() if s.state == "unwritable")
+            if guard is not None
+            else "unknown"
+        )
+        try:
+            self._alert_sink.log_write_failed(
+                dead or "unknown",
+                stage="unwritable",
+                reason=(
+                    "the engine started while the application log was unwritable, so it is running "
+                    "HALTED: intake is down and nothing is being routed or transformed. Fix the log, "
+                    "then restart the connections"
+                ),
+                stopped=len(bound),
+            )
+        except Exception:
+            log.exception("alert sink raised on a log-failure start halt")
+
     def _resume_inbound_processing(self, name: str) -> bool:
         """Re-arm one inbound's internal stages after a log-failure halt (#122, ADR 0162). Returns
         whether it re-armed.
@@ -2742,8 +2783,30 @@ class RegistryRunner:
             # subscription is simply skipped — no engine behaviour depends on the guard existing.
             guard = active_log_guard()
             if guard is not None:
-                self._log_write_stopped = False  # a restart re-arms the halt
-                self._log_halted.clear()  # …and un-halts every inbound's internal stages
+                # A START IS A RE-ARM, SO IT IS GATED ON THE LOG LIKE EVERY OTHER ONE. This used to
+                # clear both latches unconditionally, and that made `start` the single door back into
+                # processing that never asked whether the log worked — the exact shape
+                # :meth:`_resume_inbound_processing` was gated for, reached by the one path that
+                # bypasses it. MEASURED, in both claim modes, with both sinks made unwritable BEFORE
+                # the runner was built: a committed ingress row went to ``PROCESSED`` and was
+                # delivered while ``guard.can_log()`` read False throughout.
+                #
+                # :meth:`~messagefoundry.logging_guard.LogWriteGuard.revalidate` re-tests each DEAD
+                # sink by writing a real record to it, so the ordinary case — a guard
+                # ``configure_logging`` built moments ago, with nothing dead — has nothing to probe,
+                # answers True, and the clear happens exactly as before.
+                if guard.revalidate():
+                    self._log_write_stopped = False  # a restart re-arms the halt
+                    self._log_halted.clear()  # …and un-halts every inbound's internal stages
+                else:
+                    # START HALTED rather than refuse to start: ``/status``, the alert state and every
+                    # recovery path live in a RUNNING engine, and tearing them down is how an operator
+                    # loses the explanation for why the engine went quiet — the same reason ADR 0162
+                    # rejects halting the whole engine. The per_lane workers read this set at their
+                    # loop top; the pooled lanes are paused in :meth:`_start_pooled_dispatchers`, and
+                    # the listeners that bound above come back down in :meth:`_unbind_for_log_failure`.
+                    self._log_write_stopped = True
+                    self._log_halted.update(self.registry.inbound)
                 guard.set_escalation(self._on_log_sink_event)
             # Connection-event drain task (#46): created before any source binds so an early accept's
             # enqueued event has a consumer. Skipped entirely when capture is off (no sink, no queue).
@@ -2832,6 +2895,11 @@ class RegistryRunner:
                 # ADR 0075: resolve per-hop statement batching on the store (SQL-Server-only, fail-closed).
                 # Independent of claim_mode, so it runs for both pooled and per_lane.
                 self._activate_statement_batching()
+                # #122 (ADR 0162): this runner came up into an unwritable application log, so the
+                # listeners that bound above have to come back down. LAST, because the halt is only
+                # complete once the dispatchers exist to be paused (step 2.6).
+                if self._log_write_stopped:
+                    await self._unbind_for_log_failure()
             except Exception:
                 # A truly fatal startup error (store / lookup executor — NOT a single connection, which
                 # is isolated above) must not leave half the graph wired with _running still False:
@@ -3518,6 +3586,18 @@ class RegistryRunner:
         if out is not None:
             for n in self._outbound_paused:
                 out.pause_lane(n)
+        # (2.6) THE #122 SIBLING OF (2.5), and it fails the same way if it is missing: replay an
+        # in-force log-failure halt onto the FRESH INGRESS/ROUTED/RESPONSE dispatchers before step (3)
+        # seeds every lane READY. Without it a runner that came up into an unwritable application log
+        # starts DRAINING under pooled, because the halt then survives only in the per_lane workers'
+        # loop-top gate — which pooled mode does not run. Measured: a committed ingress row reached
+        # PROCESSED with both sinks dead.
+        for stage in (Stage.INGRESS, Stage.ROUTED, Stage.RESPONSE):
+            internal = self._dispatchers.get(stage)
+            if internal is None:
+                continue
+            for n in self._log_halted:
+                internal.pause_lane(n)
         # (3) start each (seed-all-READY + immediate sweep). reset_stale_inflight already ran (engine).
         for dispatcher in self._dispatchers.values():
             await dispatcher.start()
@@ -3677,6 +3757,16 @@ class RegistryRunner:
         if out is not None:
             for n in self._outbound_paused:
                 out.pause_lane(n)
+        # …and the #122 halt on the INTERNAL stages, for the same reason and in the same gap. A
+        # reload never LIFTS a halt (that rides _resume_inbound_processing, which is gated on the log
+        # working again), so re-applying it here can only ever be a no-op or a repair; a lane whose
+        # PAUSED phase was lost while the log is still dead would otherwise start draining unlogged.
+        for stage in (Stage.INGRESS, Stage.ROUTED, Stage.RESPONSE):
+            internal = self._dispatchers.get(stage)
+            if internal is None:
+                continue
+            for n in self._log_halted:
+                internal.pause_lane(n)
 
     async def _pooled_maybe_buildup(self, lane: str, stage: str) -> None:
         """Pooled INGRESS/ROUTED buildup-alert hook (ADR 0066 D1). The per_lane buildup depth check lives

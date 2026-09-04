@@ -404,8 +404,7 @@ one file is how a log gets shredded, and the loser of that race is the log you r
 exactly as before. If you do set it, **put it outside `[logging].log_dir`** and do not point NSSM at
 it — the engine refuses to start otherwise, naming the collision.
 
-**The engine stops processing when it cannot log** (BACKLOG #122,
-ADR 0162), in two stages:
+**The engine stops processing when it cannot log** (BACKLOG #122, ADR 0162), in two stages:
 
 1. **Roll.** A write failure renames the broken file aside as `<name>.broken-<UTC>-<n>`, opens a fresh
    file at the live path, records the rollover event in it and re-writes the record that failed. A

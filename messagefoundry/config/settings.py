@@ -1538,7 +1538,21 @@ class LoggingSettings(_Section):
         Now that the sink is real, ignoring them would hand an operator the 50 MB / 5-backup defaults
         while their config said otherwise — a control that reports success while doing something
         else. ``mode="before"`` because ``extra="ignore"`` drops them before any field validator
-        could see them."""
+        could see them.
+
+        **WHICH LAYER ACTUALLY REFUSES DEPENDS ON WHERE THE KEY CAME FROM, and this validator is not
+        the one an operator meets first.** :func:`_reject_unknown_file_keys` refuses an unrecognized
+        key in the TOML **file** before any model is built, so a file carrying either spelling never
+        reaches here. Measured: ``[logging].max_bytes`` in a file is refused by the loader *and*
+        suggested onward as ``file_max_bytes``, while ``[logging].backups`` is refused naming no
+        replacement — the loader's nearest-name heuristic does not reach ``file_backup_count``.
+
+        **The layer this one covers is ENV, which the file refusal deliberately does not.**
+        ``_env_overrides`` scrapes ``MEFOR_LOGGING_*`` straight into the section dict, and a
+        misspelled env var is otherwise dropped in silence (docs/CONFIGURATION.md, "The refusal covers
+        the FILE"). Measured: ``MEFOR_LOGGING_MAX_BYTES`` and ``MEFOR_LOGGING_BACKUPS`` each reach
+        this validator and are refused naming their replacement. So the two spellings are the rare
+        env keys that fail loudly, and that is worth keeping rather than folding into the loader."""
         if isinstance(data, dict):
             for legacy, actual in (
                 ("max_bytes", "file_max_bytes"),

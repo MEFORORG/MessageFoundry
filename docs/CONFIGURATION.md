@@ -34,9 +34,11 @@
 > `[ai].baa_attested`, and `[update_check].index_url`/`index_allowed_hosts`. The former
 > "accepted-but-ignored" keys that were never fields at all — `[delivery].outbox_workers`/`dead_letter`
 > and `[logging].max_bytes`/`backups` — now **refuse**. **`[logging].file` is no longer one of them:**
-> #122 / ADR 0162 made it a
-> real, engine-owned field, and the two legacy spellings beside it refuse while naming their
-> replacements (`file_max_bytes`, `file_backup_count`).
+> #122 / ADR 0162 made it a real, engine-owned field, and the two legacy spellings beside it refuse.
+> **They refuse on BOTH layers, and only one of those is the general rule.** In the file they hit the
+> unknown-key refusal above (`max_bytes` is even suggested onward as `file_max_bytes`; `backups` is
+> refused naming nothing). From **env** — where a misspelled `MEFOR_*` is otherwise dropped in
+> silence — they hit a dedicated `[logging]` validator that names the replacement for both.
 
 ## Principle — two kinds of configuration
 
@@ -693,8 +695,8 @@ Only `baa_attested` is still a forward-compat placeholder (accepted-but-ignored)
 | `time_sync_max_skew_seconds` | float | `2.0` | \|local − peer\| above this is "skewed" (must be > 0) |
 | `time_sync_fail_closed` | bool | `false` | **refuse to start** (instead of warn) on skew or an unreachable peer. Further opt-in; requires `require_time_sync` |
 | `file` | str | _unset_ | **opt-in application-log file the ENGINE owns end to end** (#122, ADR 0162) — it opens it, size-rotates it, and rolls it aside on a write failure. Distinct from `log_dir` above, which is where the **supervisor** parks the captured stdout: **one file, one rotation owner**, so a `file` inside `log_dir` is **refused at load** rather than left to fight NSSM. Unset (the default) = stdout-only, unchanged. A path the engine cannot open **refuses startup** — an engine that starts unable to log is the blindness this closes |
-| `file_max_bytes` | int | `50000000` | size-rotate `file` at ~50 MB (`0` = never rotate on size). Engine-side rotation, unrelated to NSSM's. The legacy planned spelling `max_bytes` is **refused at load** naming this key, rather than silently ignored |
-| `file_backup_count` | int | `5` | how many `file.1` … `file.N` backups to keep (the legacy planned spelling `backups` is likewise refused, naming this key). The `*.broken-*` files a write failure rolls aside are **deliberately outside** this chain — they are incident evidence, and a rotation that could delete them would delete the record of the failure |
+| `file_max_bytes` | int | `50000000` | size-rotate `file` at ~50 MB (`0` = never rotate on size). Engine-side rotation, unrelated to NSSM's. The legacy planned spelling `max_bytes` is **refused at load** naming this key, rather than silently ignored -- from the file by the unknown-key refusal, and from `MEFOR_LOGGING_MAX_BYTES` by a `[logging]` validator, which is the layer the general file refusal does not reach |
+| `file_backup_count` | int | `5` | how many `file.1` … `file.N` backups to keep. The legacy planned spelling `backups` is likewise refused on both layers, though only the env one names this key: the file refusal's nearest-name hint does not reach it. The `*.broken-*` files a write failure rolls aside are **deliberately outside** this chain — they are incident evidence, and a rotation that could delete them would delete the record of the failure |
 | `on_write_failure` | enum | `stop` | **fail-closed control (#122):** when a log sink cannot be written **and** the fresh sink rolled into its place cannot be written either, stop every connection this engine **process** owns, in all three tiers — inbounds stop accepting, messages already accepted stop being routed and transformed, and outbounds pause with their queued rows **retained** (never dead-lettered). Recover by **fixing the log and then** restarting the affected connections, inbound **and** outbound (or the service): a `/config/reload` re-arms the inbounds it re-binds but deliberately never resumes a paused outbound, so on its own it moves the backlog one stage and stops. Every re-arm path is **gated on the log working again** — the engine re-checks by writing a real record to each dead sink at the moment you ask, and a restart issued against a still-unwritable log is **refused** (the connection stays halted, its listener stays down, and another `log_write_failed` names the refusal), so restarting repeatedly is not a way around the control. A first failure alone never stops anything; the roll absorbs the transient. Scope is the process because the application log is process-global and no per-connection attribution exists (ADR 0162 §4); under engine sharding that is the shard's connections. `continue` is the documented opt-out — it still rolls and still alerts, it just keeps processing with no log. The stop is announced by a `log_write_failed` alert through the notifier, a `connection_stopped` per halted connection naming the cause, and `GET /status`'s `log_sinks` block |
 
 > PHI redaction + control-char scrubbing are **always-on handler filters** (not a toggle) applied to
