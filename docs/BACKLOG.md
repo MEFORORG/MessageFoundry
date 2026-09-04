@@ -19940,3 +19940,82 @@ That is the same `self._lock` the staged-pipeline handoffs take. On a first depl
 **PARTLY CLOSED ALREADY, AND THE CLOSURE SITS IN THE WRONG ARTIFACT.** The full record -- both questions, all eight options, both answers quoted -- is [comment 5515263760 on PR 749](https://github.com/MEFORORG/MessageFoundry/pull/749#issuecomment-5515263760), written 2026-09-02. A pull-request comment is a real improvement on a session transcript, which does not survive its session. It is still not the ADR, and the ADR is what a reader consults. **This limb differs from the first two in shape:** closing it needs no decision about the engine, only the record moved into the artifact people actually read.
 
 **THE GENERAL PROBLEM, stated once so it is not re-derived per incident.** A decision recorded as an outcome plus a delegation is not reviewable. The inputs -- the question, the options, the answer -- are what let a later reader tell a considered call from an arbitrary one, and they are exactly the part that lives in the least durable place.
+
+## 1440. Commit messages and command-fed files must not live in the shared scratchpad
+
+> 🔢 **Filed 2026-09-03 (dazzling-jang-df503f) -- not started.** A session wrote a commit message to `<scratchpad>/msg1.txt` and then ran `git commit -F <scratchpad>/msg1.txt`. Between those two steps another agent overwrote that file with **its own** commit message, for a different backlog item. The scratchpad the harness advertises as *"session-specific, isolated from the user's project"* is shared by a session and **every subagent and background task it spawns** -- all of them are handed the identical path, and all of them are told the same sentence about isolation. **The substitution is invisible in `git commit -F` output.** What stopped the commit was the ledger claim gate, which exists for an unrelated reason and fired only because the substituted subject happened to cite a number this worktree did not hold.
+>
+> **Scored 2026-09-03 -> P2.** Value **6/10** · Difficulty **2/10** · _quick win_. The remedy is one convention line plus a one-line habit change, and the hazard is live for every manager seat running concurrent subagents. Value is held at 6 rather than higher because the failure corrupts the repository's own record and never reaches shipped code; it is held above the low band because the one control that caught it is incidental and fails open on the commonest shape -- a substituted message citing **no** backlog number, or citing one the worktree does hold, passes the gate and lands. Difficulty 2: `CLAUDE.md` sec. 5 already tells a Builder to use `git commit -F <file>` and already says *"inside the project"*, so the edit narrows an existing sentence rather than adding a rule.
+> Verdict: build
+> Research: none
+> Closing-act: code
+
+**Cluster:** fleet conventions / commit hygiene. **Priority:** P2. **Verdict:** build.
+**Severity:** no engine effect, no PHI axis, and **no deployment axis (sec. 0)** -- nothing here reaches shipped code. What it corrupts is this repository's own commit record, so the cost is a commit whose message describes work it does not contain.
+
+### The failure, as reported
+
+Measured 2026-09-03 in another seat's worktree while building #1395. **Reported to this author rather than witnessed by it, and marked as such deliberately:** the session wrote #1395's commit message to `<scratchpad>/msg1.txt`, ran `git commit -F` against that path, and the commit-msg claim gate (`scripts/coord/claim.ps1`) refused with `BACKLOG #1414 is NOT CLAIMED` while the session believed it was committing #1395.
+
+**The artifact was still on disk and is quoted here from a direct read.** `msg1.txt` holds a complete, well-formed commit message whose subject is:
+
+```
+feat(coord): count stranded allocations, and stop a correct refusal burning a number (BACKLOG #1414)
+```
+
+A sibling `msg2.txt` in the same directory holds a second message from the same work stream (`docs(ledger): record the measured recoveries, and correct three claims in #1414`). Neither mentions #1395. So the reported substitution is confirmed by the residue, not only by the report.
+
+### The framing in the original finding is wrong, and the correction matters for the remedy
+
+The finding was filed as *"the session-UUID segment does not partition; concurrent sessions in the same project resolve to one directory."* **That is not what happens.** The UUID segment partitions top-level sessions correctly. What it does not partition is a session from its own agents.
+
+**Measurement A -- direct, and it cannot return an ambiguous answer.** This author wrote `probe_marker.txt` into its own scratchpad, then spawned one subagent whose entire task was to quote back the scratchpad path from **its own** system prompt and list that directory. It returned this session's path verbatim, UUID segment included:
+
+```
+<local-temp>\claude\<working-directory-slug>\<session-uuid>\scratchpad
+```
+
+Its `ls -la` showed `probe_marker.txt` already present, it read the parent's marker back verbatim, and its own write landed beside it. **The positive control is built into the shape of the test:** had the two directories differed, the subagent's listing could not have contained a file only the parent wrote.
+
+**Measurement B -- the control that must fire in the opposite direction.** If the UUID segment did not discriminate sessions, every project slug under the temp root would carry exactly one UUID child. Counted on this machine: the busiest slug carries **209**, the next **76**, and at least 18 further slugs for this repository carry between 9 and 25. The UUID does discriminate.
+
+**Measurement C -- structural, and it closes the peer-session question.** The slug is a function of the working directory, with each path separator rewritten to a dash. Every fleet seat runs in its own worktree, so two top-level seats have different slugs and cannot collide by construction. Two sessions could only share a directory by sharing **both** a working directory and a session UUID.
+
+**So the sharing boundary is the top-level session, and the writers inside it are the session, its subagents, its background tasks and its hooks.** The observed directory is consistent with exactly that: the `3a8d4cbd` scratchpad sits beside a `tasks/` directory holding both subagent-shaped (`a` plus 16 hex) and background-task-shaped output files, and it accumulated four unrelated work streams inside a six-minute window (`board.py` 17:49, `gd1379_rows.py` 17:51, `strand_probe.py` 17:52, `final-sweep.txt` 17:53, `msg1.txt` 17:55). The seat is a manager (`Manager 2-3`), which is the seat shape that runs concurrent subagent Builders.
+
+**AND THE ISOLATION IS ASYMMETRIC, WHICH IS WHY THE MISTAKE IS EASY.** A subagent running under worktree isolation gets its **own git worktree, its own branch and its own `.venv`** -- `git worktree list` here registers **76** of them, named `agent-` plus the same 16-hex id that names its output file in the session's `tasks/` directory (`agent-ab736d15cb3676e08`, on branch `b-1375-install-gate-allowlist-merge`, is one). So an agent that checks whether it is isolated gets **yes** from git, from its branch, and from its interpreter, and the harness then tells it the scratchpad is *"session-specific, isolated from the user's project"* as well. Every signal it can cheaply consult agrees, and the one directory that is actually shared is the one it is told is private.
+
+**The hazard is unchanged by the correction, and arguably worse.** Peer seats were never going to collide. Sibling subagents of one manager collide by default, they all believe the directory is private to them, and there are more of them than there are seats.
+
+### What caught it was a gate built for something else, which is the argument for keeping it
+
+`scripts/coord/claim.ps1` exists to stop a seat committing under a backlog number it does not hold. It caught a clobbered message file -- a defect nobody designed it for -- because the substituted message cited `#1414` and this worktree held `#1395`.
+
+**Nothing else in the chain could have caught it.** `git commit -F` reads the file and prints a summary of the commit it made, not a diff against what the author intended; a message swapped between the write and the read produces no warning anywhere. The gate is the only reader that compares the message's *content* against something the session independently knows about itself.
+
+**It is incidental cover, not a control, and must not be recorded as one.** It fires only when the substituted message cites a backlog number **and** that number is not claimed by the committing worktree. A substituted message citing no number, or citing a number the worktree does hold, lands silently. That is the common case, not the exotic one.
+
+### Remedy
+
+**Write any file whose content is later fed to a command into the session's own git worktree, under a name that cannot collide.** Commit messages and PR bodies are the concrete instances; the class is wider.
+
+**A uniquely-named file in the worktree root, removed after the commit, is the whole remedy.** The worktree is already per-session, the harness already treats it as the place you may write, and a name carrying the item number cannot collide with a sibling's.
+
+**THE ATTRACTIVE ALTERNATIVE DOES NOT WORK, AND THIS WAS FOUND BY TRYING IT RATHER THAN BY REASONING.** The per-worktree git directory looks like the ideal home -- unique per worktree, never a commit candidate, `git rev-parse --git-dir` names it:
+
+```
+git rev-parse --git-dir
+<primary-checkout>/.git/worktrees/<worktree-name>
+```
+
+**`worktree_gate.ps1` refuses a `Write` there.** The gate matches on the primary checkout's path prefix, and `.git/worktrees/<name>/` is under it, so the private per-worktree directory is indistinguishable from the shared primary tree as far as the gate is concerned. The refusal is correct at its own rule and the path is simply unavailable to the tools an agent has. **A first draft of this item recommended it, and of `CLAUDE.md`'s amendment too;** both were corrected only because the author tried the write instead of trusting the reasoning.
+
+**`CLAUDE.md` sec. 5 should carry the reason, because the existing sentence is right and still lost this commit.** It already says to write a long message to *"a file inside the project"* and use `git commit -F <file>`. The scratchpad is not inside the project, so the rule was not followed -- but the rule does not say **why** the location matters, and the harness spends a paragraph telling every agent the scratchpad is isolated and is the place for *"any file that would otherwise go to `/tmp`"*. Between an unexplained repository convention and an emphatic harness instruction, agents take the harness. The amendment names the scratchpad as the wrong place and gives the one-line reason.
+
+**Do not change the scratchpad mechanism.** It is harness behaviour, not repository behaviour, and the convention fix is sufficient and cheap.
+
+### What is not resolved
+
+**Which agent wrote the substituted message is not established, and is not worth establishing.** What is established is that the writer shared that exact directory, and the only writers that can are the session itself, its subagents, its background tasks and its hooks. The remedy does not depend on which.
+
+**Whether a subagent can be told a different scratchpad path is unknown.** No option for it was looked for, and if one exists it belongs to the harness rather than here.
