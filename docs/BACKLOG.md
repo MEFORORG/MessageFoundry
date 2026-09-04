@@ -4876,7 +4876,7 @@ Retiring the tree costs the engine nothing operationally: **`tests/test_ech_egre
 3. **Rewrite the `SECURITY.md` 12.1.5 paragraph** so the residual rests on the true ground: not "infeasible", but *buildable off-stdlib and deliberately not owned, because no partner endpoint publishes an ECHConfig and the engine's own TLS stack cannot originate ECH until OpenSSL 4.0*. Same accepted residual; a premise that survives inspection.
 4. **Re-point `rest.py`'s docstring** — `ech_sidecar_url_from_settings` names `tools/ech-sidecar/` by path and asserts it is "proven to hide the SNI". After deletion that path resolves to nothing; the reference becomes the historical commit, and the "proven" claim needs whatever evidence actually backs it or should go.
 5. **Decide `samples/ech-sidecar/README.md`** — the operator recipe (the only file under that sample dir) describes running a sidecar the repo no longer contains. Re-aim it at the generic contract (any loopback ECH-terminating proxy) or retire it with the tree.
-6. **Mark SEC-71 discharged** in `docs/testing/master-test-plan/16-security-phi-and-supply-chain.md`, which specifies this exact disposition and is currently the only place in the repo that records the true state.
+6. **Mark SEC-71 discharged** in `docs/testing/master-test-plan/16-security-phi-and-supply-chain.md`, which specifies this exact disposition. **Corrected 2026-09-03 (BACKLOG #1435): that path is NOT in this repository and this step is not reachable from an engine checkout.** `docs/testing/` is gitignored except `VERIFY.md`, so the document lives in the vault clone and whoever holds it performs this step. The clause this replaces said the file "is currently the only place in the repo that records the true state" — false from any checkout, since the file is not in the repo at all, and a builder acting on it would have claimed a criterion it could never read. See [`testing/README.md`](testing/README.md).
 
 **Migration cost: none.** MessageFoundry is a not-yet-deployed beta with zero production instances, and `tools/` has never been in an sdist or a wheel — so no consumer of any published artifact is affected by deleting it. There is no deprecation window to run and nothing to sequence.
 
@@ -4884,7 +4884,7 @@ Retiring the tree costs the engine nothing operationally: **`tests/test_ech_egre
 
 **Related:** #1010 (split from the same draft — the licence-header gate; `main.go` is 1 of the 196 headerless sources and gets a header only if this rules *keep*), #272 (ADR 0139's owning item), #353 (an ungated compliance artifact — same "nothing compares it to the record" shape), #1000 (a gate that has never been watched fail; here the failure is a *language* nothing gates at all).
 
-**Source:** master test plan **SEC-71** (`docs/testing/master-test-plan/16-security-phi-and-supply-chain.md`), which specifies this disposition; escalated 2026-08-04 when the SPDX half of the original draft was found to rest on a false claim and was split out as **#1010**. Every fact above was re-executed against `origin/main` at `df9c4d54`.
+**Source:** master test plan **SEC-71** (`docs/testing/master-test-plan/16-security-phi-and-supply-chain.md` — vault-only, unreadable from an engine checkout; see [`testing/README.md`](testing/README.md)), which specifies this disposition; escalated 2026-08-04 when the SPDX half of the original draft was found to rest on a false claim and was split out as **#1010**. Every fact above was re-executed against `origin/main` at `df9c4d54`.
 
 ## 1002. AG-rig validation: prove the multi-subnet failover reconnect
 
@@ -21938,6 +21938,65 @@ The other four are posture, inherited from the tripwire as it already stood:
 
 ---
 
+## 1435. docs/testing has no checkout-side marker, so a vaulted path reads as unstarted work
+
+> 🚧 **Filed 2026-09-03. The marker is built; the gate is researched and deliberately NOT built.** Value **5/10** · Difficulty **2/10** for what shipped, **6/10** for what is left. A documentation and process defect, not a product exposure: MessageFoundry has zero deployments, nothing here reaches an operator, and no impact claim below is present-tense about a running site.
+
+**The defect, in one sentence: from an engine checkout, work that is UNREADABLE is indistinguishable from work that is UNSTARTED.**
+
+`git ls-files docs/testing` returns one file, and `/docs/security/` is blanket-ignored at `.gitignore:177`. The real documents live in the vault clone. So a reader who greps a cited path, finds nothing, and concludes the work was never done is reasoning correctly from everything the tree shows them, and reaching a false conclusion.
+
+**The measured instance, and it carries its own proof.** #1011 step 6 told a reader to mark SEC-71 discharged in a path under `docs/testing/`, and called that file *"currently the only place in the repo that records the true state"*. That sentence is false from any engine checkout, because the file is not in the repo at all. A builder acting on it would have claimed a criterion it could never read. Corrected in the same change that filed this item; both citations in #1011 now name the unreadability in the same breath as the path.
+
+Two peer fleets hit the same wall independently on 2026-09-03, on #1152 and on #1193, and a third case put half an availability strategy in a vaulted document under #1191. Three sessions worked it out unaided. The next one may not, and a better brief does not fix it, because the brief author hits the same blind spot.
+
+### What shipped here
+
+`docs/testing/README.md`, tracked through a second negation under `/docs/testing/*`. A reader standing in the directory, or browsing to it on GitHub, is told the material moved and told not to read absence as evidence. `docs/README.md` carries the same warning at the front door.
+
+**It is a POINTER and never an index.** It names no vaulted document. A path-to-document map over a closed set discloses what is NOT covered by subtraction, which is the disclosure the gitignore exists to prevent. Keep it that way. The `docs/security/` half already has its rule in [`SECURITY-DOCS-POLICY.md`](SECURITY-DOCS-POLICY.md) and the marker links there rather than restating it.
+
+`tests/test_private_paths_stay_ignored.py` pins the pair as an exact set, so a third negation fails until someone writes down why, and the marker cannot be silently dropped from fresh clones.
+
+### The gate: researched, measured, and NOT built. This is the finding, not a shortfall.
+
+A test that reds when a ledger body cites a vaulted path without flagging it is the most durable shape and was the first choice. It does not survive contact with the corpus. All figures measured 2026-09-03 against `46ea10a78`, and they are measurements rather than targets.
+
+| Granularity | Detection | Result on the corpus |
+|---|---|---|
+| Per line | path pattern | 55 lines cite, 23 carry no flag on the same line |
+| Per line, about three lines of context | path pattern plus `THREAT-MODEL` and `asvs-scorecard` | 75 lines cite, 22 carry no signal (measured independently, two readers agreeing to the line) |
+| Per item body | path pattern | 27 items cite, 2 unflagged |
+| Per item body | path pattern plus `master-test-plan` | 32 items cite, 5 unflagged |
+| Per citation, plus or minus 300 to 1200 characters | path plus name | 15 to 21 items carry at least one unflagged citation |
+
+**Three findings, each independently enough to stop the build.**
+
+1. **An unscoped gate reds about 22 times on day one**, against a corpus nobody repairs in one pull request. It needs a grandfather baseline or a changed-lines-only scope before it is shippable at all.
+2. **The item-granularity gate is quiet and measures the wrong thing.** At 2 unflagged it would ship comfortably, and it MISSES #1152 — the case that motivated this item. #1152's body flags a different vaulted document (the scorecard) while leaving its master-test-plan clause unflagged, so the item passes while the defect stands. A gate that is quiet because it is aimed slightly wrong is worse than no gate.
+3. **"Cites a vaulted path" overfires, and the real predicate may not be expressible as a pattern.** Line 22 is prose ABOUT the arrangement, not a citation anyone must follow. A table row giving a cell count is permitted vocabulary. Neither is a defect. The actual predicate is **a citation a reader must FOLLOW in order to act**, which is a judgement about intent, and no regex tried here expresses it.
+
+**The window parameter is undefended.** Three lines is arbitrary; nobody has a reason for it, and a single-block rule already missed a stale assertion in `docs/SERVICE.md` on a peer's item. Treat 53 against 22 as an order of magnitude, not a threshold.
+
+**IF SOMEONE BUILDS THIS, THE FAILURE MESSAGE IS ALSO A DISCLOSURE SURFACE.** A message naming WHICH paths are vaulted publishes the map into CI logs and into the workflow file, both public. That is the enumerating-marker defect wearing different clothes, and the helpful-error-message instinct walks straight into it. A message of the shape *"this item body cites a maintainer-internal path; state in the body that it is unreadable from an engine checkout"* tells the author exactly what to do and discloses nothing. Do not echo the offending path into the message, the summary, or the annotation.
+
+### The two-sided controls, named, so nobody re-derives them
+
+A gate proven on one side proves nothing: one that fires on everything and one that fires on nothing both look green against a single-sided test.
+
+**Fires side (must red), and it is on `main` today:** `docs/BACKLOG.md` lines 4763 and 4771 before the correction in this change. Both named a `docs/testing/master-test-plan/` chapter, and 4763 instructed the reader to act in it. The cleanest true positive in the corpus, and independent of #1152. Recover the pre-correction text from this item's own commit.
+
+**Quiet side (must pass):** the remedy bodies on PR 804 (#1191) and PR 812 (#1193). **Both were still unmerged on 2026-09-03**, so a builder calibrating against `main` alone sees the UNFLAGGED versions and draws the wrong conclusion about what the remedy looks like. Read them with `gh pr diff 804` and `gh pr diff 812`. #1191 is the sharper of the two: it records that the availability inventory is vaulted AND records that its builder deliberately did not add a read-side anchor to the public `_RESOURCE_ANCHORS` registry, because the registry is public and the document is not, so the anchor would red a tree nobody in an engine checkout can see or repair.
+
+Both are the shape a gate must PERMIT. An unflagged citation is the defect; a flagged one is the remedy the gate exists to produce.
+
+### What is left
+
+- Decide whether the follow-to-act predicate is expressible. If it is not, that is a finding and this item closes on the marker.
+- If it is, scope the gate to changed lines or grandfather the day-one population, and prove it on both controls above.
+- The `docs/security/` half has no marker of its own. `/docs/security/` is a blanket rule, so a placeholder there needs a deliberate gitignore negation. Judged not worth it here: [`SECURITY-DOCS-POLICY.md`](SECURITY-DOCS-POLICY.md) already states that rule in a tracked file and says how to request the material, and a second marker would restate a load-bearing fact instead of linking to it.
+
+**Related:** #1011 (the corrected instance), #1152, #1191 and #1193 (the three peer cases), #1244 (an engine change breaking a vault anchor produces no attribution — the same public-repo-cannot-see-the-vault shape, from the other direction).
 ## 1438. Fail closed when the bundled breach corpus is unusable, instead of silently disabling password screening
 
 > 🚧 **Filed 2026-09-03. Implemented and committed on a feature branch, not merged.** `_common_passwords()` read `messagefoundry/auth/data/common_passwords.txt` and returned a `frozenset` of its lines. An empty or truncated file produced an **empty set**, `PasswordPolicy.violations` stopped emitting the `"not be a common or breached password"` clause, and breach screening became a no-op. Nothing logged. `password_check_breached` ships `true`, so the shipped configuration would assert a check that was not running.
