@@ -19940,3 +19940,72 @@ That is the same `self._lock` the staged-pipeline handoffs take. On a first depl
 **PARTLY CLOSED ALREADY, AND THE CLOSURE SITS IN THE WRONG ARTIFACT.** The full record -- both questions, all eight options, both answers quoted -- is [comment 5515263760 on PR 749](https://github.com/MEFORORG/MessageFoundry/pull/749#issuecomment-5515263760), written 2026-09-02. A pull-request comment is a real improvement on a session transcript, which does not survive its session. It is still not the ADR, and the ADR is what a reader consults. **This limb differs from the first two in shape:** closing it needs no decision about the engine, only the record moved into the artifact people actually read.
 
 **THE GENERAL PROBLEM, stated once so it is not re-derived per incident.** A decision recorded as an outcome plus a delegation is not reviewable. The inputs -- the question, the options, the answer -- are what let a later reader tell a considered call from an arbitrary one, and they are exactly the part that lives in the least durable place.
+
+## 1442. Pin shipped-artifact line endings so a Windows-built wheel matches the released one
+
+> 🔢 **Filed 2026-09-03 -- the `.gitattributes` stanza is written and verified; it is committed and NOT pushed under the 2026-09-03 push hold.** Every blob in the repository stores pure LF, and under `core.autocrlf=true` every text file checks out CRLF, so a wheel built from a Windows tree is byte-different from the released Linux one and the two `*.dist-info/RECORD` rows disagree while the content is identical. **Nine shipped files drift, not one** -- the four non-`.py` files under `messagefoundry/`, plus `LICENSE`, `NOTICE`, `README.md`, `CHANGELOG.md` and `pyproject.toml`. Repo-wide the figure is **1,990 of 2,061 tracked files and 732,340 line endings**, but only the shipped set is in scope here; see the trap at the end before widening it.
+>
+> **Severity: no deployment axis (sec. 0), and no runtime axis either.** `messagefoundry/auth/policy.py` loads the corpus with `splitlines()` and `.strip()`, so CRLF never reaches the password comparison. Nothing published is affected: all three `release.yml` jobs run on `ubuntu-latest`, so every artifact on PyPI is the LF build. **What this costs is rebuild-to-verify**: the SLSA provenance binds an artifact's sha256 to this source commit, and an operator who rebuilds from that commit to check the binding reproduces the digest on Linux and cannot on Windows, with nothing telling them why.
+> Verdict: fix
+> Research: none
+> Closing-act: code
+
+**Cluster:** Release integrity / reproducible builds. **Scope:** the shipped set only.
+
+### The decision, and why the attribute is not a preference
+
+Owner chose the scope on 2026-09-03. The attribute was settled by measurement.
+
+```
+messagefoundry/** text=auto eol=lf
+/LICENSE text=auto eol=lf
+/NOTICE text=auto eol=lf
+/README.md text=auto eol=lf
+/CHANGELOG.md text=auto eol=lf
+/pyproject.toml text=auto eol=lf
+```
+
+**All three candidate spellings produce the same bytes on disk**, so a digest test cannot separate them. Fresh checkout, `core.autocrlf=true`, real corpus bytes, with a planted-byte control that matches neither:
+
+| attribute | on-disk size | sha256 | |
+|---|---|---|---|
+| none (today) | 188,636 | `fd9786f1` | the CRLF digest -- the defect |
+| `-text` | 173,380 | `136e7bcf` | |
+| `text eol=lf` | 173,380 | `136e7bcf` | |
+| `text=auto eol=lf` | 173,380 | `136e7bcf` | chosen |
+| control, planted byte | 173,381 | `3de9c816` | matches neither, so the test can fail |
+
+**What separates them is what happens on the NEXT write.** `-text` disables the clean filter, so it freezes rather than enforces: a Windows editor save commits CRLF into the blob permanently. `eol=lf` normalizes on the way in. Measured in a controlled repository -- the same CRLF edit lands `CRLF=4` in the blob under `-text` and `CRLF=0` under `eol=lf`. `-text` also shows the whole file as modified against the index (a 15,256-line diff on the corpus, which a careless `git add -A` would then commit), while `eol=lf` shows no content diff at all.
+
+**That equivalence is contingent, and must not be quoted as a general property.** The three agree only while the stored blob is already LF, so normalizing is a no-op. `-text` preserves whatever is committed; the `eol=lf` forms normalize on the way in. A census of all 2,061 tracked files is what makes it safe here: **exactly 4 blobs contain CRLF** -- the vendored CLA bundle (1,297 pairs) and 3 HL7 fixtures -- and none is in the shipped set. `messagefoundry/**` is a forward-looking glob, so this is a fact about today's files, not about the attributes.
+
+**Why the CLA-bundle precedent does not transfer.** That stanza uses `-text` because its blob genuinely holds CRLF and its recorded SHA256 would break on re-encoding, which is exactly what the census confirms. The corpus blob holds zero, so `eol=lf` re-encodes nothing.
+
+### Two traps, both measured
+
+**Never a bare `text` on a glob that can match a binary.** `text eol=lf` strips CRLF byte pairs from inside a binary blob -- a 17-byte fixture with NULs and CRLF pairs stored as 14 bytes. `text=auto` defers to git's binary detection and stores it intact. The 19 `messagefoundry/tray/assets/*.ico` files survive a bare `text` today only because none happens to contain a CRLF pair, which is agreement by luck.
+
+**Anchor the root patterns.** Unanchored, `README.md` also matched `messagefoundry/generators/README.md` and downgraded it to `text=set`, and the five root names pinned 11 files outside the shipped set. With a leading slash: 290 paths covered, 1,766 unspecified, zero leakage.
+
+### The blob id is the anchor worth quoting
+
+Peers circulated "`git hash-object` returns `4482f231` under `autocrlf=true` and `7ca7ef4a` under `autocrlf=false`". Both values are real, but that framing buries the checkable half. Measured by varying whether the clean filter runs -- **not** by toggling `core.autocrlf`, which was not tested:
+
+```
+git hash-object --no-filters <corpus>     -> 7ca7ef4a   raw CRLF working tree
+git hash-object --path <corpus> <corpus>  -> 4482f231   clean filter applied, LF
+git rev-parse HEAD:<corpus>               -> 4482f231   the committed blob id
+```
+
+`4482f231` is not "the value under some setting"; it is the committed blob id, checkable in one command that needs no config change.
+
+### What is NOT affected, because four sessions believed otherwise before anyone read the file
+
+**The ADR 0041 D3 startup attestation is not downstream of this pin.** `messagefoundry/integrity.py` hashes on-disk bytes, but it sources the expected value from `dist.read_text("RECORD")` -- the installed distribution's own RECORD, which pip writes from the bytes it unpacked. Baseline and installed file therefore come from one install and cannot be split by a line-ending policy: a CRLF-built wheel carries CRLF bytes *and* a CRLF-derived RECORD, and attests clean. Reading the hash site without the baseline site is what produced the false dependency. This would change only if a digest were ever recorded **in the repository** rather than sourced from RECORD.
+
+### Follow-ups this row does not close
+
+1. **No test yet.** A test asserting `git check-attr` returns the pinned values for the shipped set would prevent regression. It was left out deliberately: a new test file needs a `tests/tooling_manifest.txt` entry unless it imports the engine, and the full suite could not be run before the session closed. Add it with the manifest line in the same commit.
+2. **The working tree materializes on the next checkout.** Changing an attribute does not rewrite an existing checkout. The blobs already store LF so nothing is re-encoded, but to materialize immediately, delete the nine affected files and `git checkout -- .` rather than `git reset --hard`.
+3. **The repo-wide question is separate and NOT decided here.** If it is ever taken up, `samples/messages/**` needs `-text` as a **correctness requirement, not a style exception**: those 12 HL7 fixtures deliberately span three segment terminators (4 bare-CR, 3 CRLF, 5 LF-only) and HL7 v2 terminates segments on CR, so the endings are the test data. A blanket `eol=lf` rewrites the three CRLF ones.
+4. **A record on an unmerged branch states a precondition that is false.** `reference/1134-corpus-provenance-do-not-merge` records `sha256 136e7bcf` in `common_passwords.NOTICE` over raw on-disk bytes and asserts the corpus "is pinned `-text` in `.gitattributes`". That is false on `main` -- `git check-attr text eol` returns unspecified, the measurement this row started from -- and it becomes wrong in its specifics under `text=auto eol=lf` while staying right in substance. The branch is marked do-not-merge, so a NOTICE-only cherry-pick is the likely path and the likely place to miss it. Whoever lands that provenance work owns the sentence.

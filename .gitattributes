@@ -21,3 +21,41 @@ ci/locks/*.lock text eol=lf
 # was verified -- `eol=lf` was tried first and silently re-encoded ~1,300 bytes, which would have
 # committed a file that no longer matches its own recorded checksum.
 .github/actions/**/dist/** -text
+
+# Everything that ships must have platform-independent bytes (BACKLOG #1442). Without this,
+# `core.autocrlf=true` converts on checkout, so a wheel built from a Windows tree carries a
+# byte-different copy of every text file than the released Linux one and the two wheels'
+# `*.dist-info/RECORD` rows disagree -- different sha256, different size -- while the content is
+# identical. Measured 2026-09-03: nine shipped files drifted, 15,256 converted line endings in
+# messagefoundry/auth/data/common_passwords.txt alone.
+#
+# THE COST IS A VERIFICATION GAP, not a live defect. release.yml builds on ubuntu-latest only, so
+# every published artifact is the LF build, and the SLSA provenance binds that artifact's sha256 to
+# this source commit. An operator who rebuilds from the commit to check that binding -- the point of
+# the attestation -- reproduces the digest on Linux and cannot on Windows, with nothing explaining
+# why. This does NOT affect the ADR 0041 D3 startup attestation, which sources its baseline from the
+# installed distribution's own RECORD (messagefoundry/integrity.py, `dist.read_text("RECORD")`), so
+# baseline and installed file come from one install and cannot be split by a line-ending policy.
+#
+# `text=auto`, NEVER a bare `text`, on any pattern that can match a binary. Measured: bare
+# `text eol=lf` strips CRLF byte pairs from inside a binary blob (a 17-byte fixture stored as 14);
+# `text=auto` defers to git's binary detection and stores it intact. The 19 tray/assets/*.ico files
+# survive a bare `text` today only because none happens to contain a CRLF pair.
+#
+# `eol=lf` and NOT `-text`, which the vendored CLA bundle above uses for a reason that does not
+# transfer. That bundle's blob genuinely holds CRLF (1,297 pairs -- it is one of only 4 such blobs in
+# 2,061 tracked files) and its recorded SHA256 would break on re-encoding. Every file below already
+# stores pure LF, so `eol=lf` re-encodes nothing and all three spellings yield the same bytes on
+# disk. What separates them is what happens next: `-text` disables the clean filter and merely
+# FREEZES, so a later Windows editor save commits CRLF permanently, while `eol=lf` normalizes on the
+# way in. For files whose bytes anything downstream records, enforcing LF is what keeps that record
+# true.
+#
+# The root patterns are ANCHORED with a leading slash. Unanchored, `README.md` also matches
+# messagefoundry/generators/README.md, and the five root names pin 11 files outside the shipped set.
+messagefoundry/** text=auto eol=lf
+/LICENSE text=auto eol=lf
+/NOTICE text=auto eol=lf
+/README.md text=auto eol=lf
+/CHANGELOG.md text=auto eol=lf
+/pyproject.toml text=auto eol=lf
