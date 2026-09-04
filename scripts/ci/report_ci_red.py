@@ -34,8 +34,10 @@ TWO ATTRIBUTION RULES OF ITS OWN, and both exist because the naive read misrepor
     at a leg it does not name. Reporting it would send every reader to the one job whose log is
     guaranteed to be empty of the answer.
   * **A watchdog step is reported as a watchdog** (``_TIMING_STEP_PREFIXES``), and only when the step
-    it measures concluded ``success`` in the same job. Without that second condition the label would
-    also cover a margin step that fired alongside a genuine failure, where "nothing failed" is false.
+    it measures concluded ``success`` in the same job. The second condition is not redundant: both
+    pytest steps in ``ci.yml`` carry an ``if:`` on the change filter, so a SKIPPED work step can
+    leave the margin step as the job's first failure, and "the suite PASSED" would then be a claim
+    about a suite that never ran.
 
 TWO RULES ARE COPIED FROM THE WRITER ON PURPOSE, because a reader that classifies differently from
 the writer reports causes the label was never applied for:
@@ -150,8 +152,12 @@ class Red:
     def is_timing_gate(self) -> bool:
         """True when a watchdog step reddened a job whose own work step PASSED.
 
-        Both halves are required. A margin step can also fire in a job where a test genuinely failed,
-        and there "nothing failed" would be a false statement about a real regression.
+        BOTH halves are required, and the second is not implied by the first. Step ordering does
+        most of the work -- a failed ``Tests (pytest)`` sorts before the margin step that measures
+        it, so it would be the step named -- but a work step can also be SKIPPED or CANCELLED and
+        still leave the margin step as the first failure. ``ci.yml`` guards both pytest steps with
+        an ``if:`` on the change filter, so a skipped one is reachable rather than hypothetical, and
+        there "the suite PASSED" is false: the suite never ran.
         """
         if not self.step_name or not self.work_step_passed:
             return False
