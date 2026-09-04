@@ -26,6 +26,14 @@ blanks quoted spans and heredoc bodies before splitting, and resolves the subcom
 global options. Those twelve payloads are still driven, under
 `test_prose_and_read_only_commands_are_allowed`, with the opposite expectation.
 
+AND THE PRICE OF THAT FIX IS PINNED HERE, NOT LEFT TO BE DISCOVERED (BACKLOG #1341). Blanking a
+quoted span needs quote state, and this guard's has no escape handling and no end-of-input check,
+so an apostrophe with no partner opens a span that runs to the end of the command and blanks the
+real stage inside it. Eleven payloads were measured to stage a whole tree in a real shell and to be
+ALLOWED by the committed guard; ten of them denied at its own parent. Eight are driven below as
+`xfail(strict=True)` rows of MUST_STILL_DENY, so the fail-open is visible, is re-measured on every
+run, and clears itself the moment somebody repairs the scanner.
+
 WHY THE HISTORY IS KEPT RATHER THAN DELETED. The class was PRE-EXISTING and the case fix only
 widened it from one spelling to all of them -- every case was driven in its lowercase spelling
 first and already denied. That is what made the case fix landable while a known over-deny sat
@@ -386,6 +394,38 @@ def test_a_scoped_path_is_not_a_whole_tree_pathspec(command: str) -> None:
 # The rows below are the other direction: shapes that MUST still be refused. On this guard a
 # fail-open is the direction that loses coverage silently, so widening the allow side without this
 # test is how the same mistake gets made on a second file.
+#
+# EIGHT OF THESE ROWS ARE `xfail(strict=True)`, AND THE MARKER IS THE FINDING (BACKLOG #1341).
+# The quote-blanking pass that bought the allow side above tracks quote state with no escape
+# handling and no end-of-input check, so it opens a span it never closes and blanks the real
+# command that follows. The assertion on those rows is unchanged -- they still demand a DENY --
+# because writing the current ALLOW down as a requirement is exactly the mistake BACKLOG #1086
+# recorded: an attempt there put a live bypass in a must-ALLOW list, and anyone later restoring
+# the deny would have red the suite and concluded they broke something.
+#
+# `strict` is what makes the marker self-clearing. Repairing `Hide-QuotedSpans` turns each row
+# into an XPASS, which strict reports as a FAILURE, so the markers cannot be left behind to rot
+# silently green -- the same construction `tests/test_fixture_outbox_reset.py` used for its
+# pre-retirement pin.
+#
+# WHY THE REPAIR IS NOT IN THIS COMMIT. It is a quote-state parser change on a fail-open security
+# gate, and the owner declined that shape across the sibling family (#1066/#1070/#1086/#1305/#1336)
+# on 2026-08-25. The measurement is in the PR body; the short version is that the two limbs are not
+# separable. Honouring backslash escapes ALONE flips `echo "C:\temp\" ; git add -A` -- an ordinary
+# Windows path, measured to stage the whole tree under pwsh -- from DENY to ALLOW, because bash and
+# PowerShell disagree about what a backslash is. One scanner cannot be right for both shells at
+# once, which is the reason the family was declined rather than an argument for trying again.
+_UNBALANCED_QUOTE = pytest.mark.xfail(
+    strict=True,
+    reason="BACKLOG #1341: an apostrophe with no closing quote leaves the scanner inside a span "
+    "to end of input, so it blanks the stage that follows",
+)
+_ESCAPED_QUOTE = pytest.mark.xfail(
+    strict=True,
+    reason="BACKLOG #1341: an escaped quote closes a span the shell keeps open, so the scanner "
+    "desynchronises and blanks the stage that follows",
+)
+
 MUST_STILL_DENY = [
     # The plain forms. If any of these ever allows, the guard is off.
     "git add -A",
@@ -418,6 +458,53 @@ MUST_STILL_DENY = [
     'git commit -m "message" && git add -A',
     # A heredoc that ENDS before the real command does not blank it.
     "cat <<'EOF' > f.txt\nsome body\nEOF\ngit add -A",
+    # ---------------------------------------------------------- the quote-state class (#1341)
+    #
+    # EVERY ROW BELOW WAS MEASURED TO REALLY STAGE THE WHOLE TREE BEFORE BEING DRIVEN THROUGH THE
+    # GUARD, in a throwaway repo carrying one modified tracked file and one untracked file, under
+    # the real shell named in each comment. An alleged bypass that does not stage anything is not
+    # a bypass, and this class needed that step more than most: the two payloads BACKLOG #1341
+    # cites as its own evidence, `echo it's fine && git add -A` and `echo isn't ready ; git add
+    # .`, DO flip the guard's verdict and run in NEITHER shell -- bash answers `unexpected EOF
+    # while looking for matching '` and PowerShell answers ParserError. They are verdict moves,
+    # not bypasses, so they are deliberately absent here.
+    #
+    # THE CONTROL COMES FIRST, and it is what makes the rest of the block mean anything. A comment
+    # line followed by a real stage denies today. Only the apostrophe inside the comment changes
+    # the verdict, so the apostrophe is the cause and the comment is not.
+    "# no apostrophe here\ngit add -A",
+    # UNBALANCED: a shell COMMENT carrying an apostrophe. Both shells run this and both stage.
+    # This is the ordinary shape of the class -- no escaping trick, no unusual quoting, just an
+    # English contraction in a comment above the command.
+    pytest.param("# it's fine\ngit add -A", marks=_UNBALANCED_QUOTE, id="comment-apostrophe-add-A"),
+    pytest.param(
+        "# don't forget\ngit add .", marks=_UNBALANCED_QUOTE, id="comment-apostrophe-pathspec"
+    ),
+    pytest.param(
+        "# that's it\ngit commit -am wip", marks=_UNBALANCED_QUOTE, id="comment-apostrophe-commit"
+    ),
+    # The synonym limb BACKLOG #1340 added never denied this shape at all: it is a fail-open the
+    # quote repair introduced nothing into and closes nothing of, which is why it is pinned too.
+    pytest.param(
+        "# can't skip\ngit stage -A", marks=_UNBALANCED_QUOTE, id="comment-apostrophe-stage"
+    ),
+    # ESCAPED, bash spelling: a backslash-escaped double quote. bash stages; PowerShell refuses to
+    # parse it, because a backslash is not a PowerShell escape.
+    pytest.param(
+        'echo "a \\" b" ; git add .', marks=_ESCAPED_QUOTE, id="bash-escaped-dquote-pathspec"
+    ),
+    pytest.param(
+        'echo "a \\" b"\ngit add -A', marks=_ESCAPED_QUOTE, id="bash-escaped-dquote-newline"
+    ),
+    # A backslash-escaped APOSTROPHE outside any span. bash reads it as a literal character and
+    # runs the stage; the guard reads it as a span opening and blanks the stage.
+    pytest.param(
+        "echo it\\'s fine && git add -A", marks=_ESCAPED_QUOTE, id="bash-escaped-apostrophe"
+    ),
+    # ESCAPED, PowerShell spelling: a BACKTICK-escaped double quote. PowerShell stages; bash
+    # refuses to parse it. The pair is the argument against a single-shell repair -- the two
+    # shells do not agree on which character escapes, and this guard screens both tools.
+    pytest.param('echo "a `" b" && git add -A', marks=_ESCAPED_QUOTE, id="pwsh-escaped-dquote"),
 ]
 
 

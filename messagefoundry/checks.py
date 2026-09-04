@@ -1634,9 +1634,19 @@ def _check_generic_db_tls(config_dir: str | Path) -> CheckResult:
     (``DatabasePoll``) as well as outbound: the poll link crosses the same hop with the same credential
     in the same DSN.
 
-    Advisory (``required=False``): the engine cannot prove a given driver keyword verifies anything, so
-    a refusal here would be guess-based and would break legitimate drivers — exactly what ADR 0092
-    declined. SKIPs when the graph will not load, same convention as its siblings."""
+    **This is the INVENTORY, and the refusal is elsewhere** (BACKLOG #1178). A generic hop whose
+    ``odbc_params`` say TLS is not required is now gated at connector construction through the shared
+    cleartext-hop authority (``transports.database.generic_cleartext_hop_guard``), so on an enforcing
+    instance it fails the REQUIRED ``build-check`` — which stamps the derived posture and constructs
+    every connector — rather than being reported here and crossed anyway.
+
+    So this stays ``required=False`` on purpose, and not because the arm is ungated. Two reasons, each
+    sufficient. It has no posture to key on, so a refusal here would have to re-derive the gradient's
+    loopback / attested / accepted arms from the graph — a second, silently different definition of a
+    decision that already has one. And the residual it reports is genuinely unjudgeable: the engine
+    cannot prove a driver keyword that IS set verifies anything, so refusing on that would be
+    guess-based and would break legitimate drivers, exactly what ADR 0092 declined. SKIPs when the graph
+    will not load, same convention as its siblings."""
     from messagefoundry.config.wiring import WiringError, load_config, unverified_generic_db_hops
 
     try:
@@ -1664,7 +1674,9 @@ def _check_generic_db_tls(config_dir: str | Path) -> CheckResult:
         required=False,
         detail=(
             f"{len(hops)} generic-ODBC DATABASE connection(s) may cross in plaintext — {listed}; "
-            "set a verifying keyword in odbc_params (e.g. SSLmode=verify-full)"
+            "set a verifying keyword in odbc_params (e.g. SSLmode=verify-full). An enforcing "
+            "instance REFUSES these off-loopback at build-check unless the connection declares "
+            "tls_hop_attested or cleartext_accepted"
         ),
     )
 
