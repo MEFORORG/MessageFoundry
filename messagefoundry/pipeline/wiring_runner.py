@@ -87,6 +87,7 @@ from messagefoundry.config.wiring import (
     resolve_env_settings,
     resolve_listener_binding,
 )
+from messagefoundry.fhirsearch import FhirSearchParams
 from messagefoundry.parsing import (
     HL7PeekError,
     Peek,
@@ -1570,13 +1571,14 @@ class RegistryRunner:
         self,
         connection: str,
         query: str,
-        params: Mapping[str, str | list[str]] | None = None,
+        params: FhirSearchParams | None = None,
     ) -> dict[str, Any]:
         """The FHIR-lookup runner published to Handlers (``fhir_lookup`` → this). Called FROM the handler's
         worker thread, it bridges the async GET onto the engine loop via ``run_coroutine_threadsafe`` and
         blocks the WORKER THREAD — never the loop — for the result (bounded by
         ``_LOOKUP_RESULT_TIMEOUT_SECONDS``). ``params`` (BACKLOG #204) carries the safely-encoded
-        structured search form; the executor percent-encodes each value before it reaches the URL."""
+        structured search form; the executor percent-encodes each value and resolves its kind at the FHIR
+        value layer, refusing a plain ``str`` that carries a separator (BACKLOG #1243)."""
         executor = self._fhir_lookup_executor
         loop = self._loop
         if executor is None or loop is None:  # only published when both exist; guard defensively
