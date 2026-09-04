@@ -19940,3 +19940,71 @@ That is the same `self._lock` the staged-pipeline handoffs take. On a first depl
 **PARTLY CLOSED ALREADY, AND THE CLOSURE SITS IN THE WRONG ARTIFACT.** The full record -- both questions, all eight options, both answers quoted -- is [comment 5515263760 on PR 749](https://github.com/MEFORORG/MessageFoundry/pull/749#issuecomment-5515263760), written 2026-09-02. A pull-request comment is a real improvement on a session transcript, which does not survive its session. It is still not the ADR, and the ADR is what a reader consults. **This limb differs from the first two in shape:** closing it needs no decision about the engine, only the record moved into the artifact people actually read.
 
 **THE GENERAL PROBLEM, stated once so it is not re-derived per incident.** A decision recorded as an outcome plus a delegation is not reviewable. The inputs -- the question, the options, the answer -- are what let a later reader tell a considered call from an arbitrary one, and they are exactly the part that lives in the least durable place.
+
+## 1434. the tooling-partition gate names the file it rejects and not the remedy, so the Builder who trips it has already exited
+
+> 🚧 **Filed 2026-09-03. The failure message is fixed on this branch. Five open pull requests still carry unregistered test files, and only their own branches can fix them -- they are named below.** `tests/test_tooling_partition.py::test_every_non_engine_test_is_classified` fails when a file matching `tests/test_*.py` sits in neither `tests/tooling_manifest.txt` nor `_STAYS_WITHOUT_IMPORTING`. It is not deselected by `-m 'not tooling'`, so it reds **all three required `test` legs at once**. PR 774 hit exactly that, and its Builder's process had exited before any leg reported.
+
+**Cluster:** CI gates / development harness. **Priority:** P2. **Verdict:** build.
+**Severity:** no deployment axis (sec. 0). This is a repository gate over `tests/`. No engine behaviour, no shipped artifact, and no configuration a deploying site would meet.
+
+### The defect: the message stops one sentence before the remedy
+
+The predecessor read, in full:
+
+> these tests import no engine module, so they are unclassified: add them to tests/tooling_manifest.txt, or to _STAYS_WITHOUT_IMPORTING here if they read engine source: ['test_coord_fleet_fetch_clock.py']
+
+It names both registries, and that is where it stops. Three things a reader needs are absent:
+
+1. **The entry shape.** A manifest line must be the repo-relative path `tests/<name>.py`. Both readers of the manifest (`_manifest_names` here, `_tooling_basenames` in `tests/conftest.py`) `rsplit` on `/`, so a bare `<name>.py` still marks the test and still takes it off the engine legs -- but `ci.yml`'s `changes` job summons the `tooling` job with `grep -qxFf` over **whole changed paths**, so a later pull request editing only that test would match no arm and summon no job. Deselected everywhere, green.
+2. **Which list to pick, and the tie-break.** The choice is by the test's **subject**, not by its location or its name. This file's own header already carries the rule -- *"when ambiguous, LEAVE IT OFF"* -- and the message never said so. A hurried reader appends to the manifest because it is a one-line edit, which is the direction that loses coverage silently.
+3. **That an engine-importing test needs no entry at all.** 720 files match `tests/test_*.py` and 163 are registered. The other 557 import the engine and are classified by that alone.
+
+### Why the message is the whole remedy here
+
+A Builder gets one turn and its process exits when its pull request opens (CLAUDE.md section 5). Both Builders who tripped this gate on 2026-09-03 had exited before any leg reported, so neither could read its own failure. The person who eventually reads it is someone else, in a CI log, with no session to ask. **The assertion string is the only channel that reaches them.**
+
+### The sweep, 2026-09-03, over all 51 open pull requests
+
+Instrument: each pull request's own head ref evaluated against **its own** copy of the manifest and stay list, so a pull request that registers its file passes. Verified against the control pair the Console measured, which is what tells this apart from "is the file in the manifest":
+
+| control | file | in manifest | legs | why |
+|---|---|---|---|---|
+| PR 774 (negative) | `tests/test_coord_fleet_fetch_clock.py` | no | 3 red | subject is `scripts/coord/fleet.ps1`, harness, so it must be listed |
+| PR 769 (positive) | `tests/test_container_health_probe.py` | no | 3 green | imports `messagefoundry.config.settings`, so absence is correct |
+
+**Absence is not the defect.** Eleven open pull requests add a file under `tests/`. Five will red three required legs; every one of the five has a harness subject and belongs in the manifest:
+
+| PR | branch | file | subject |
+|---|---|---|---|
+| 774 | `worktree-agent-a1ba06ee275587442` | `test_coord_fleet_fetch_clock.py` | `scripts/coord/fleet.ps1` |
+| 789 | `claude/1385-ci-red-reader-and-timeout-flake` | `test_ci_red_reader.py` | `scripts/ci/report_ci_red.py`, `.github/workflows/failure-signal.yml` |
+| 795 | `b-1375-install-gate-allowlist-merge` | `test_install_gate_allowlist_merge.py` | `scripts/worktree/install-gate.ps1` |
+| 798 | `worktree-agent-a9051692500267199` | `test_claim_shared_registry.py` | `scripts/coord/claim.ps1`, `scripts/hooks/claim_check.py` |
+| 799 | `worktree-agent-a2baeeba559ec2796` | `test_steer_inject.py` | `scripts/hooks/steer-inject.ps1` |
+
+The remaining six are already correct: PRs 764, 769, 773 and 796 import the engine; PRs 792 and 806 each appended their `tests/<name>.py` line to the manifest.
+
+### The silent direction was checked too, and it is clean
+
+An engine test wrongly **in** the manifest leaves no trace: it is deselected from the engine legs, and the `tooling` job's `scripts/**` path gate is not tripped by an engine diff. `test_no_listed_test_imports_the_engine` catches the importing case; nothing catches a listed test that **reads** engine source off disk, which is the class the header records four files being caught in by review rather than by a guard.
+
+All 137 listed entries were swept for a repo-rooted read of `messagefoundry/**`. **One hit, and it is correctly listed.** `tests/test_serverdb_ci_coverage.py:276` runs `(REPO_ROOT / "messagefoundry").rglob("*.py")`, but only to prove `ci.yml`'s `serverdb` regex still **refuses** something. Its assertion is invariant to the content of every file it reads, so its subject is the workflow.
+
+**The discriminator, written down so the next sweep does not re-derive it: can an engine-only diff change this test's result?** If yes, it is engine-subject whatever it imports. That is what separates this file from `test_install_instruction_provenance.py`, which globs the same tree and asserts on what it finds, and is stay-listed for that reason.
+
+### What this change ships
+
+- `_unclassified_remedy` renders the failure. Line one keeps both registry paths and the file list, because that is the line a truncated summary keeps. The body gives the exact line to paste, states the criterion as **subject**, and gives the tie-break with its cost. Both registry paths are rendered from `_MANIFEST` and `__file__`, so a rename moves the message rather than leaving it pointing at a path that is gone.
+- `test_every_manifest_entry_resolves_as_written` replaces a basename check. It resolves each entry **as written** from the repository root and requires it to equal the path `git diff --name-only` reports, which is what `ci.yml`'s `grep -qxFf` gate matches. The predecessor rsplit the directory away and was blind to a bare name, a `./` prefix or a wrong directory.
+- `test_the_gate_offers_a_line_the_manifest_parser_accepts` takes the example off the **raised** message and feeds it through the manifest parser, so the advice cannot drift from either the assertion that issues it or the reader that consumes it.
+- `test_the_gate_raises_the_remedy_and_not_a_bare_list` pulls every `tests/...` path out of the raised message and requires each to name a real file, then checks `_STAYS_WITHOUT_IMPORTING` is defined in the file the message points at. Only the three prose claims are matched as literals.
+
+**Asserting on `_unclassified_remedy`'s return value was tried first and measured vacuous.** Reverting the assertion's call site to the predecessor string left every content arm green, because none of them touched the call site. The arms now read the message the gate actually raises. That is SDS-3.8: the instrument was answering *does the helper return good text*, and the question is *does the gate fail with good text*.
+
+### What remains
+
+**Two things, and neither is in this change's scope.**
+
+1. **The five pull requests above.** A Builder must not push to another seat's branch, so each is fixed by whoever next touches it: append `tests/<name>.py` to `tests/tooling_manifest.txt`, keeping the list alphabetical. **The gate is passable and two pull requests that night passed it correctly -- nothing here asks for it to be weakened.**
+2. **Three copies of the manifest parser, pinned against nothing.** This file, `_tooling_basenames` in `tests/conftest.py` (the copy that actually applies the marker), and `_manifest_paths` in `tests/test_ci_tooling_gate.py` all implement the same rule. Extracting one `tests/_tooling_manifest.py` is the real fix. Related: `test_every_manifest_entry_trips_its_own_gate` in `tests/test_ci_tooling_gate.py` feeds each manifest entry back as its own changed path, so on the manifest arm every entry matches itself unconditionally.
