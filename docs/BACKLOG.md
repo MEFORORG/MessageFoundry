@@ -20456,6 +20456,25 @@ Case D is caught by `expected_anchor` and by #328's `expected_prefix` comparator
 
 **The owner DELEGATED this question; nobody ruled on it.** It was put to the owner on 2026-09-03 and the answer was *"proceed as you judge best"*. That is the same shape as the #1277 delegation [ADR 0118](adr/0118-secure-by-default-security-configuration-section.md) now records, and cost 4 below is about precisely that defect, so it is filed as a delegation rather than written up as a ruling. The measurement above is what a ruling should rest on. **This row stays open and still picks no fix.**
 
+#### Reconciled 2026-09-03 -- the rationale disagreement is closed, and `docs/CONFIGURATION.md` is the source of record
+
+**Cost 1's second half -- the records disagreeing about WHY -- is done.** The measurement above deliberately withheld the correction so its evidence stayed checkable on its own; the correction is the PR stacked on that one. The first half stands: nothing bounds `audit_log`, and no bound is sized here.
+
+**[`docs/CONFIGURATION.md`](CONFIGURATION.md)'s `audit_days` row is the source of record.** It already was -- it carries the 2026-07-30 correction, the threat model and the anchor's semantics, and it says so in terms. It gains two things and loses nothing: that the measurement above confirmed it, and the archive contract case C1 produced (an archive must carry each row's `id` and `row_hash`, or the rows cannot be restored into a chain that verifies).
+
+**The fix is SDS-3.5, not four corrected copies.** Four restatements of one rationale is how they drifted apart, so the other records now state the short true thing and link, rather than each carrying reasoning that will drift again. Found by grep over tracked `.py` and `.md` for the chain-breakage phrasings, with `docs/BACKLOG.md` excluded because it is the record OF the defect -- at least these sites:
+
+| record | what changed |
+|---|---|
+| [`config/settings.py`](../messagefoundry/config/settings.py), above `audit_days` | drops chain-breakage as the reason, keeps the retention requirement, points at the source of record |
+| [`docs/PHI.md`](PHI.md) section 2, the `audit_log.detail` retention cell | the same, inside the one line a table cell allows. `keep-forever by design` is left verbatim because `tests/test_retention_classification_drift.py` parses that column against `PHI_RETENTION_WINDOWS`, and a backticked `[section].setting` in that cell would red it |
+| [`config/retention_classification.py`](../messagefoundry/config/retention_classification.py), its header | the reverse defect, so the repair is narrowing rather than deleting. Its *"not on chain-breakage"* is kept for what it can support -- chain-breakage is not the REASON the key is reserved -- and no longer reads as ruling the effect out, which the measurement shows is real for an oldest-first window |
+| [`docs/PHI.md`](PHI.md) section 7 stream 5, and section 8 | two more copies the earlier survey did not name. Section 8 is the one the source-of-record row already called out by name, so leaving it would have left that row's own instruction unexecuted |
+
+**Section 8 no longer "states no rationale at all",** which the survey above recorded as true at `fd44b0f17` and which this change makes false. It now states the retention requirement, states the split in one sentence, and cites the source of record.
+
+**Nothing here changes engine behaviour** -- comments and prose only, no purge, no new config field, no default moved. The levers table above still picks no fix, and **cost 2 is untouched and stays open**: the standalone commit per authenticated read is a separate question with its own answer.
+
 ### Cost 2 -- the per-request cost is a standalone COMMIT on the store's write lock, not merely a row
 
 #1277 and PR 749 both state this. It is re-traced here rather than inherited, at `efe061a3f`:
