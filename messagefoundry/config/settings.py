@@ -1251,6 +1251,12 @@ class PipelineSettings(_Section):
     # (never a lane outage). Reliability-core + read ONCE at engine construction (a /config/reload does
     # NOT re-read it — restart to change, exactly like claim_mode). Harness A/B via
     # MEFOR_PIPELINE_FUSE_THREAD_HOPS.
+    # SETTING THIS ALONE NOW DOES NOTHING ON THE SHIPPED DEFAULTS, and you must be told here rather
+    # than in the other knob's docs: the runner HARD-DISABLES fusion whenever [sandbox].mode is
+    # subprocess, which is the default since BACKLOG #1278. Fusion runs Router/Handler/accepts= code
+    # in-process on an executor hop, so honouring both would silently run unsandboxed the code a
+    # config asked to isolate; the runner fails CLOSED to the async sandboxed path and logs it. To
+    # get fusion you must also set [sandbox].mode=off, and that trade is yours to make on purpose.
     fuse_thread_hops: bool = Field(default=False)
     # Worker count for each per-stage fusing executor (ADR 0071 B5). Each fused stage (INGRESS/ROUTED)
     # gets its OWN ThreadPoolExecutor of this width plus a matching-width dedicated synchronous pyodbc
