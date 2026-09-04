@@ -21,3 +21,21 @@ ci/locks/*.lock text eol=lf
 # was verified -- `eol=lf` was tried first and silently re-encoded ~1,300 bytes, which would have
 # committed a file that no longer matches its own recorded checksum.
 .github/actions/**/dist/** -text
+
+# The offline password-screening corpus and its notice (BACKLOG #1433). The corpus SHA-256 is
+# recorded in the notice's generated block and recomputed by `scripts/security/build_password_corpus.py`,
+# so the checked-out bytes must not depend on the platform.
+# THE ATTRIBUTE WAS MISSING ENTIRELY BEFORE #1433 -- `git check-attr text` reported `unspecified`, so
+# under `core.autocrlf=true` the file checked out CRLF while the blob held LF: two SHA-256 values for
+# one committed file (fd9786f1 vs 136e7bcf). Adding a pin, not changing one.
+# `eol=lf` RATHER THAN `-text`, and the difference is load-bearing for a file a generator rewrites.
+# `-text` disables the clean filter, so it FREEZES the current bytes and does nothing about the next
+# write: a later CRLF edit lands CRLF in the blob permanently. `eol=lf` NORMALIZES on the way in, so
+# the invariant the recorded digest depends on keeps holding. The `-text` stanza above is for the CLA
+# bundle, whose blob genuinely CONTAINS CRLF; this blob holds none, so `eol=lf` re-encodes nothing
+# here. `text=auto` (not bare `text`) defers to git's binary detection.
+# Changing an attribute does not rewrite an existing working tree: an older checkout keeps its CRLF
+# copy until `git checkout -- <path>`. The generator normalizes CRLF to LF before digesting so such a
+# checkout still verifies rather than failing with a hex mismatch that names nothing.
+messagefoundry/auth/data/common_passwords.txt text=auto eol=lf
+messagefoundry/auth/data/common_passwords.NOTICE text=auto eol=lf

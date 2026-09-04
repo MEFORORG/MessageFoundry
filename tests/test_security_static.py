@@ -1057,6 +1057,10 @@ _CRYPTO_SITES_OUTSIDE_THE_PACKAGE = {
     # identity nobody picks by hand. A change detector over public type signatures and field names --
     # no key, no secret, nothing user- or PHI-derived.
     "scripts/webconsole_seam_snapshot.py": frozenset({"hashlib"}),
+    # BACKLOG #1433: SHA-256 over the shipped common-password corpus, recorded in the generated
+    # block of its .NOTICE so the notice cannot describe a file that no longer exists. A change
+    # detector over a published third-party wordlist -- no key, no secret, nothing PHI-derived.
+    "scripts/security/build_password_corpus.py": frozenset({"hashlib"}),
 }
 
 

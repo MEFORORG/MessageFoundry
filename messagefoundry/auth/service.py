@@ -275,19 +275,7 @@ class AuthService:
         # Out-of-band security-event push (ASVS 6.3.5/6.3.7), injected by the API lifespan. None = no
         # email push (the audited /me/security-events feed still records everything). Best-effort.
         self._security_notifier = security_notifier
-        self._policy = PasswordPolicy(
-            min_length=settings.password_min_length,
-            require_uppercase=settings.password_require_uppercase,
-            require_lowercase=settings.password_require_lowercase,
-            require_digit=settings.password_require_digit,
-            require_symbol=settings.password_require_symbol,
-            check_breached=settings.password_check_breached,
-            check_context=settings.password_check_context,
-            check_username=settings.password_check_username,
-            breach_corpus_file=settings.password_breach_corpus_file,
-            lockout_threshold=settings.lockout_threshold,
-            lockout_minutes=settings.lockout_minutes,
-        )
+        self._policy = PasswordPolicy.from_settings(settings)
         _warn_if_corpus_unreadable(settings.password_breach_corpus_file)
         if ldap is not None:
             self._ldap: LdapAuthenticator | None = ldap
