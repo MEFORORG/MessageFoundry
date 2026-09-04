@@ -357,6 +357,11 @@ async def test_spending_a_recovery_code_is_audited_distinguishably_and_notified(
         await store.update_user_profile(
             identity.user_id, display_name=None, email="admin@example.org"
         )
+        # THE TWO ADDRESSES MUST DIFFER OR THIS TEST CANNOT SEE THE DEFECT IT EXISTS FOR. ADR 0182
+        # splits the directory mirror from the engine-owned notification target; with both set to
+        # one string, a spent-code notice sent to `user.email` and one sent to `user.notify_email`
+        # are indistinguishable, and the assertion below passes either way.
+        await store.set_user_notify_email(identity.user_id, email="admin-notify@example.org")
         enroll = await service.begin_mfa_enrollment(identity)
         codes = await service.confirm_mfa_enrollment(
             identity, fresh_totp(enroll.secret), token=token
@@ -371,7 +376,10 @@ async def test_spending_a_recovery_code_is_audited_distinguishably_and_notified(
         assert len(spent) == 1
         ev = spent[0]
         assert ev.username == "admin"
-        assert ev.email == "admin@example.org"
+        assert ev.email == "admin-notify@example.org", (
+            "a spent-recovery-code notice must go to the ENGINE-OWNED address, not the "
+            "directory mirror -- see ADR 0182 / BACKLOG #1139"
+        )
         assert ev.client_ip == "10.0.0.7"
         assert ev.detail["remaining"] == 1
 

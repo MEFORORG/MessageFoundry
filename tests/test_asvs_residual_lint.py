@@ -184,6 +184,41 @@ def test_a_malformed_baseline_line_is_refused_rather_than_ignored(tmp_path: Path
         load_baseline(bad)
 
 
+def test_the_documented_baseline_recipe_round_trips(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Generate a baseline the way the module docstring says to, then require it to load green.
+
+    This is the ONE affordance the four-step wiring of BACKLOG #1205 depends on, and until this test
+    it was the only affordance in the tool that nothing drove. What is frozen here is the FILTER
+    RULE -- keep the four-column lines -- and not the ``awk`` invocation the docstring spells it with;
+    a shell is not available to every caller and is not what can rot.
+    """
+    sc = write_scorecard(tmp_path, ONE_CELL)
+
+    assert main([str(sc), "--no-baseline", "--print-keys"]) == 1, (
+        "with no baseline every citation is new, so generation exits 1 by design"
+    )
+    printed = capsys.readouterr().out
+
+    # THE NAIVE RECIPE IS THE CONTROL, and it is why the filter is documented rather than assumed.
+    # Captured whole, that stdout carries the scan inventory and the verdict as well as the keys.
+    naive = tmp_path / "naive.txt"
+    naive.write_text(printed, encoding="utf-8")
+    with pytest.raises(ValueError, match="malformed baseline line"):
+        load_baseline(naive)
+
+    base = tmp_path / "b.txt"
+    keys = [line for line in printed.splitlines() if line.count("\t") == 3]
+    assert keys, "the filter kept nothing -- that is a broken filter, not a citation-free record"
+    base.write_text("".join(f"{line}\n" for line in keys), encoding="utf-8")
+
+    assert load_baseline(base) == counted(scan_cells(load_scorecard(sc), ["residual"])[0])
+    assert main([str(sc), "--baseline", str(base)]) == 0, (
+        "a baseline generated from the record it grandfathers must read green on the next run"
+    )
+
+
 # --------------------------------------------------------------------------------------------
 # Empty-scan refusal. This tool runs where nobody is watching it.
 # --------------------------------------------------------------------------------------------

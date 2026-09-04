@@ -57,7 +57,11 @@ class SecurityEvent:
 
     event_type: str
     username: str
-    email: str | None = None  # the affected user's address (push target); None = no mailbox on file
+    # The affected account's ENGINE-OWNED notification address (``users.notify_email``, BACKLOG
+    # #1139) -- never the directory-mirrored profile address. None = the account has never carried
+    # one, and the notifier drops the notice; it does NOT mean a directory repoint removed it, which
+    # is a state the split makes unreachable.
+    email: str | None = None
     client_ip: str | None = None  # source IP of the triggering request, when known
     detail: dict[str, Any] = field(
         default_factory=dict

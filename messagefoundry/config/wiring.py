@@ -137,6 +137,7 @@ __all__ = [
     "accepted_cleartext_hops",
     "expiry_relaxed_hops",
     "unverified_generic_db_hops",
+    "overbroad_smart_scopes",
 ]
 
 _logger = logging.getLogger(__name__)
@@ -528,7 +529,7 @@ def FhirLookup(
         with_smart_backend(                                           # SMART Backend Services bearer
             FhirLookup("epic", url=env("epic_fhir_base")),
             token_url=env("epic_token_url"), client_id=env("epic_client_id"),
-            private_key=env("epic_smart_key"), scope="system/*.rs",
+            private_key=env("epic_smart_key"), scope="system/Patient.rs",  # read+search only
         )
 
     The read is **GET-only** (structurally read-only — a Handler cannot mutate the FHIR server through it;
@@ -1208,6 +1209,14 @@ def Tcp(
     max_connections: int | None = 256,  # cap concurrent clients (connection-flood guard)
     receive_timeout: float | None = 60.0,  # close a client idle this many seconds (slowloris)
     max_frame_bytes: int | None = 16 * 1024 * 1024,  # cap one frame's bytes (OOM guard); both dirs
+    # INBOUND message-RATE pacing (BACKLOG #1114) — the MLLP pacer, ported. Unlike the caps above
+    # these default to OFF, and that is ruled rather than accidental: a rate on a clinical interface
+    # is only safe at a number taken from a real feed profile. Over budget the listener PAUSES
+    # READING so TCP back-pressures the sender: nothing is dropped, refused or reordered, which the
+    # count-and-log invariant requires. One bucket per connection, as on MLLP.
+    max_messages_per_second: float | None = None,  # None/0 = no rate bound (the shipped default)
+    message_burst: float
+    | None = None,  # allowance over the sustained rate; None = one second's worth
     connect_timeout: float = 10.0,  # outbound: TCP connect timeout (seconds)
     timeout_seconds: float = 30.0,  # outbound: send/await-reply timeout
     # Persistent outbound connection (ADR 0067 §9 / BACKLOG #97) — outbound-only; None/0 on a freshness knob disables it:
@@ -1233,6 +1242,14 @@ def Tcp(
     framed reply and treats receiving it as confirmation (the reply is **not** parsed — X12 997/TA1
     acks are a deferred follow-up). Delivery is at-least-once → the receiver **must be idempotent**.
 
+    **Inbound message-rate pacing (BACKLOG #1114).** ``max_messages_per_second`` bounds how fast one
+    accepted connection may feed messages in; ``message_burst`` is how large a burst passes before the
+    sustained rate applies (default: one second's worth). Over budget the listener **pauses reading**
+    before its next read, so TCP back-pressures the sender — **no message is dropped, refused or
+    reordered**. Both ship **off**, which is a deliberate exception to this connector's usual
+    secure-default rule: a guessed rate on a clinical interface throttles real traffic, so the number
+    has to come from your own feed profile.
+
     ``persistent=true`` (ADR 0067 §9 / BACKLOG #97) reuses one lazily-established connection across
     deliveries (default ``false`` = connect-per-send, byte-identical); a stale socket is redialed once
     **before any byte is written** (uncharged), and any post-write failure is charged + retried.
@@ -1250,6 +1267,8 @@ def Tcp(
             "max_connections": max_connections,
             "receive_timeout": receive_timeout,
             "max_frame_bytes": max_frame_bytes,
+            "max_messages_per_second": max_messages_per_second,
+            "message_burst": message_burst,
             "connect_timeout": connect_timeout,
             "timeout_seconds": timeout_seconds,
             "persistent": persistent,
@@ -1274,6 +1293,11 @@ def X12(
     max_interchange_bytes: int | None = 16
     * 1024
     * 1024,  # cap one interchange's bytes (OOM); both dirs
+    # INBOUND interchange-RATE pacing (BACKLOG #1114) — the MLLP pacer, ported; one token per ISA/IEA
+    # interchange, which is this connector's frame. Defaults to OFF for the ruled reason in MLLP().
+    max_messages_per_second: float | None = None,  # None/0 = no rate bound (the shipped default)
+    message_burst: float
+    | None = None,  # allowance over the sustained rate; None = one second's worth
     connect_timeout: float = 10.0,  # outbound: TCP connect timeout (seconds)
     timeout_seconds: float = 30.0,  # outbound: send/await-reply timeout
     # Persistent outbound connection (ADR 0067 §9 / BACKLOG #97) — outbound-only; None/0 on a freshness knob disables it:
@@ -1307,6 +1331,13 @@ def X12(
     allowlist). Delivery is at-least-once → the receiver **must be idempotent** (a crash-re-send of a
     non-idempotent 270 yields a fresh 271 captured at the next ``response_seq``).
 
+    **Inbound interchange-rate pacing (BACKLOG #1114).** ``max_messages_per_second`` bounds how fast
+    one accepted connection may feed **interchanges** in (one token per ``ISA…IEA``);
+    ``message_burst`` is how large a burst passes before the sustained rate applies (default: one
+    second's worth). Over budget the listener **pauses reading** before its next read, so TCP
+    back-pressures the sender — **no interchange is dropped, refused or reordered**. Both ship
+    **off**: a guessed rate throttles real traffic, so the number has to come from your feed profile.
+
     ``persistent=true`` (ADR 0067 §9 / BACKLOG #97) reuses one lazily-established connection across
     deliveries (default ``false`` = connect-per-send, byte-identical); a stale socket is redialed once
     **before any byte is written** (uncharged). A returned TA1/business interchange is a complete
@@ -1321,6 +1352,8 @@ def X12(
             "max_connections": max_connections,
             "receive_timeout": receive_timeout,
             "max_interchange_bytes": max_interchange_bytes,
+            "max_messages_per_second": max_messages_per_second,
+            "message_burst": message_burst,
             "connect_timeout": connect_timeout,
             "timeout_seconds": timeout_seconds,
             "persistent": persistent,
@@ -1345,6 +1378,12 @@ def Http(
     | None = 60.0,  # bound the whole-request read (slow-loris guard), seconds
     max_body_bytes: int | None = 16 * 1024 * 1024,  # cap one request body's bytes (OOM guard)
     max_header_bytes: int | None = 64 * 1024,  # cap the request line + headers (header-flood guard)
+    # Message-RATE pacing (BACKLOG #1114) — the MLLP pacer, ported. Defaults to OFF for the ruled
+    # reason in MLLP(). Scoped to the LISTENER, not the connection: this connector answers one
+    # request per connection, so a per-connection bucket would pace nothing at all.
+    max_messages_per_second: float | None = None,  # None/0 = no rate bound (the shipped default)
+    message_burst: float
+    | None = None,  # allowance over the sustained rate; None = one second's worth
     # --- TLS (WP-13b, ADR 0002 §0 / ADR 0023 D4) — per-connection HTTPS ---
     tls: bool = False,  # turn TLS on (present a server cert; off-loopback without it is refused at start)
     tls_cert_file: str | None = None,  # SERVER cert (required when tls)
@@ -1404,6 +1443,17 @@ def Http(
     — bounds the whole-request read), ``max_body_bytes`` (the frame-cap twin — refused on the declared
     ``Content-Length`` before a byte is buffered), and ``max_header_bytes`` (header flood).
 
+    **Message-rate pacing (BACKLOG #1114).** ``max_messages_per_second`` bounds how fast this listener
+    takes messages in; ``message_burst`` is how large a burst passes before the sustained rate applies
+    (default: one second's worth). Over budget the connector **waits before reading the request**, so
+    the partner is back-pressured and its request is then served in full — nothing is dropped, refused
+    or answered differently, and the wait sits outside ``receive_timeout`` so a paced partner is never
+    handed a ``408`` for a delay the engine imposed. The bucket is **listener-wide, not
+    per-connection**: this connector answers one request per connection, so a per-connection bucket
+    would pace nothing. A ``GET``/``HEAD`` health probe waits behind an outstanding debt but charges
+    nothing, and neither does a refused request — only a committed message spends the budget. Both
+    keys ship **off**, for the same reason as MLLP's: the number has to come from your feed profile.
+
     **TLS (WP-13b).** ``tls=True`` presents ``tls_cert_file``/``tls_key_file`` as the HTTPS server
     identity (``tls_ca_file`` adds opt-in mTLS); ``tls_key_password`` decrypts an encrypted key (supply via
     ``env()``). The runner's exposed-gate refuses a **non-loopback** HTTP listener **without** TLS at start
@@ -1460,6 +1510,8 @@ def Http(
         "receive_timeout": receive_timeout,
         "max_body_bytes": max_body_bytes,
         "max_header_bytes": max_header_bytes,
+        "max_messages_per_second": max_messages_per_second,
+        "message_burst": message_burst,
         "tls": tls,
         "tls_cert_file": tls_cert_file,
         "tls_key_file": tls_key_file,
@@ -3692,6 +3744,12 @@ def unverified_generic_db_hops(registry: Registry) -> list[tuple[str, str]]:
     and a log line emitted once at startup is not the surface anyone queries three months later. This is
     that surface.
 
+    The exemption itself is narrower since BACKLOG #1178: a hop this function reports is also refused at
+    connector construction on an enforcing instance off-loopback, through the shared cleartext-hop
+    authority. This remains the INVENTORY of delegated hops — a hop can appear here and still be
+    crossed legitimately, on-box or under a declared attestation or acceptance — so read it as "who
+    owns TLS on this hop", never as "who is crossing in the clear".
+
     It walks **both** connection tables, unlike :func:`accepted_cleartext_hops`: a ``DatabasePoll``
     inbound crosses the same hop in the same dialect with the same credential in the same DSN, so
     reading only ``outbound`` would report a live unenforced hop as absent. Inbound names are prefixed
@@ -3730,6 +3788,102 @@ def unverified_generic_db_hops(registry: Registry) -> list[tuple[str, str]]:
             reason = unenforced(conn.spec.settings)
             if reason is not None:
                 out.append((f"{label}{conn.name}", f"{reason} ({_peer_label(conn.spec.settings)})"))
+    return sorted(out)
+
+
+def overbroad_smart_scopes(registry: Registry) -> list[tuple[str, str]]:
+    """Every SMART-authenticated connection whose requested ``smart_scope`` asks for permission letters
+    its DECLARED shape cannot spend, as ``(name, detail)`` (#1159, ASVS 10.2.3).
+
+    The SINGLE reader of the over-grant set, on the same contract as :func:`accepted_cleartext_hops` and
+    :func:`expiry_relaxed_hops`, so ``messagefoundry check`` and any later surface cannot disagree.
+    Sorted by connection name for a stable, diffable list. Lookup names are prefixed ``fhir_lookup:``
+    because they live in a separate namespace and could otherwise collide with an outbound's name.
+
+    Three predicates arrive by lazy import from ``transports``, on the precedent
+    :func:`unverified_generic_db_hops` states for ``generic_odbc_tls_unenforced`` — restating any of
+    them here would be a second definition that can silently disagree with the code that acts on it,
+    and ``config`` must not take a module-import dependency on ``transports``:
+
+    * ``smart_auth_configured`` — whether SMART auth is ON, shared with the code that builds the
+      provider and with the mutual-exclusion screen. Three spellings of this test had already drifted.
+    * ``smart_scope_letters`` — the scope grammar, beside the code that puts ``scope`` on the wire.
+    * ``scope_letters_for_shape`` — the letters a declared shape can spend, beside the
+      interaction/conditional dispatch it mirrors, which is what makes it read ``conditional`` FIRST.
+
+    A ``FhirLookup`` is not passed through that last one: it has no ``ConnectionSpec``, no interaction,
+    and is structurally GET-only (ADR 0043 — the read executor cannot mutate), so it spends ``r`` and
+    ``s`` and nothing else. Stated here so that giving a lookup a write path later cannot silently
+    escape this reader, exactly as ``accepted_cleartext_hops`` had to grow its ``fhir_lookups`` arm.
+
+    **Over-grant only, never under-grant.** ASVS 10.2.3 asks that the client request only the scopes it
+    requires; asking for MORE authority than the connection can spend is the thing that verb names. A
+    connection that requests too LITTLE is a correctness defect and it is not this verb, so this reader
+    stays silent on it: telling an operator to ADD a letter would tell them to request authority their
+    authorization server may never have registered, which a conformant server refuses outright.
+    Narrowing a request to a subset of what IS registered always succeeds, which is what makes the
+    over-grant direction safe to advise.
+
+    **Quiet wherever the shape does not determine the answer**, because an advisory that fires on a
+    valid clinical configuration teaches operators to ignore it: SMART auth off; no ``smart_scope``
+    set, so the server applies its registered default; ``transaction``/``batch``, a plain ``Rest()``
+    composed with SMART auth, or any connector declaring no interaction; a scope string carrying no
+    parseable FHIR resource scope; and the RESOURCE half, always.
+
+    The generic OAuth2 leg (``oauth2_scope``) is deliberately NOT covered, and that is a finding rather
+    than an omission: its scope vocabulary belongs to the partner (the shipped worked example is
+    ``claims.write``), so there is no declared shape to compute a requirement from and any screen over
+    it would be guessing at someone else's namespace.
+
+    Pure — it reads the loaded graph and touches nothing else."""
+    from messagefoundry.transports.fhir import scope_letters_for_shape
+    from messagefoundry.transports.smart import smart_auth_configured, smart_scope_letters
+
+    def one(
+        name: str, settings: Mapping[str, Any], conn_type: ConnectorType | None
+    ) -> tuple[str, str] | None:
+        if not smart_auth_configured(settings):
+            return None
+        scope = settings.get("smart_scope")
+        requested = smart_scope_letters(scope) if isinstance(scope, str) else None
+        allowed: frozenset[str] | None
+        if conn_type is None:  # a FhirLookup: structurally GET-only, so read and search
+            allowed, shape = frozenset("rs"), "GET-only lookup"
+        elif conn_type is ConnectorType.FHIR:
+            allowed = scope_letters_for_shape(
+                str(settings.get("interaction") or ""), settings.get("conditional")
+            )
+            shape = f"interaction={settings.get('interaction')!r}"
+            if settings.get("conditional"):
+                shape += f"/conditional={settings.get('conditional')!r}"
+        else:
+            return None  # a plain Rest() composed with SMART auth declares no interaction
+        if requested is None or allowed is None:
+            return None
+        extra = requested - allowed
+        if not extra:
+            return None
+        return (
+            name,
+            f"requests {'/'.join(sorted(extra))} which a {shape} connection cannot use "
+            f"(scope={scope!r}, usable={'/'.join(sorted(allowed))})",
+        )
+
+    # Two loops rather than the one table-driven loop `unverified_generic_db_hops` uses, because its two
+    # tables both hold connections carrying a `ConnectionSpec` and these two do not: an
+    # `OutboundConnection` has `.spec.settings` and a typed connector, a `FhirLookupSpec` has bare
+    # `.settings` and no connector type at all. Folding them costs a `getattr` that defeats the type
+    # checker to save two lines.
+    out = [
+        hit
+        for oc in registry.outbound.values()
+        if (hit := one(oc.name, oc.spec.settings, oc.spec.type)) is not None
+    ]
+    out += [
+        hit
+        for spec in registry.fhir_lookups.values()
+        if (hit := one(f"fhir_lookup:{spec.name}", spec.settings, None)) is not None
+    ]
     return sorted(out)
 
 
