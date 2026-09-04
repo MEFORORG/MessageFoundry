@@ -17,8 +17,9 @@ Context: the console is a separately-versioned second distribution mounted same-
 (Option B, [ADR 0065](../../docs/adr/0065-web-ops-dashboard.md)). Architecture, the seam, and the
 version-skew gate are documented in [`docs/WEBCONSOLE-PACKAGE.md`](../../docs/WEBCONSOLE-PACKAGE.md).
 The **`ENGINE_UI_SEAM` handshake means the engine and console versions can move independently within a
-compat range** — you do not have to release them lockstep; you must only keep the range and the seam
-integers honest.
+compat range** — you do not have to release them lockstep; you must only keep the range and the two
+seam digests honest. Nobody chooses a seam value: it is derived (BACKLOG #1220), and
+`docs/WEBCONSOLE-PACKAGE.md` carries the procedure for moving it.
 
 The console's own `release-webconsole` job already exists in
 [`.github/workflows/release.yml`](../../.github/workflows/release.yml), modelled on `release-harness`

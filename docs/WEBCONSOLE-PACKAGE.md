@@ -172,11 +172,13 @@ add/remove an `app.state` hook or a consumed `AuthService` member):
    [`messagefoundry/api/_ui_seam.py`](../messagefoundry/api/_ui_seam.py) and the golden
    [`tests/golden/webconsole_seam.snapshot`](../tests/golden/webconsole_seam.snapshot).
 
-   **Use `--write`, never a shell redirect over the golden.** A redirect writes the golden alone and
-   leaves the constant stale, so the gate still reds no matter which shell you use; and the shell
-   then damages the file on top of that. Measured: Windows PowerShell 5.1 emits UTF-16LE with a BOM,
-   which the test cannot decode as UTF-8 at all, and `pwsh` 7 emits CRLF, which diffs every line of
-   a golden written with `\n`.
+   **Use `--write`, never a shell redirect over the golden**, and note that this fails in the worst
+   direction. A redirect writes the golden and never the constant, in every shell. The golden *embeds*
+   whatever `ENGINE_UI_SEAM` currently says, so redirecting makes the golden agree with a stale or
+   hand-typed value and `test_webconsole_seam_snapshot_matches_golden` goes **green** — measured
+   against a fabricated `deadbeefdeadbeef`. Exactly one test refuses it,
+   `test_the_stored_seam_equals_the_derived_digest`. (Windows PowerShell 5.1 also emits UTF-16LE with
+   a BOM there, which the test cannot decode as UTF-8 at all; `pwsh` 7 does not.)
 3. Set the console side **by hand, in the same commit**. `--write` deliberately leaves it alone — a
    tool that wrote both halves would turn the handshake into a self-consistent tautology, removing
    the one place a human states that this console build matches this engine contract. Its output
