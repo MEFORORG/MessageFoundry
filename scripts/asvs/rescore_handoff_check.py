@@ -36,6 +36,32 @@ fingerprint.** That makes the check report the banner as OLDER than it really is
 rather than under-fires. Over-firing is the tolerable direction here -- the item's own text says *"a
 nonzero count still needs the entry read"* -- but a hit is a prompt to read, never a finding on its own.
 
+**A TRUNCATED LEDGER IS NOT AUTOMATICALLY AN UNANSWERABLE RUN, AND TREATING IT AS ONE REFUSED EVERY
+REAL RUN THIS TOOL HAS.** The engine checkout is shallow, its whole visible history begins at a graft,
+and both ledger files exist at that boundary -- so the truncation test fired, the tool exited 3, and
+the date comparison the item calls "the open work" never produced an answer at all. Deepening the clone
+writes to an object store shared by every worktree and is the owner's call, so the tool has to be
+correct on the clone it actually ships into.
+
+***THE TRUNCATION TEST WAS NECESSARY BUT NOT SUFFICIENT, AND THE MISSING HALF IS A DATE.*** A graft
+floors an affected item's last-touch at the boundary, and a floored date is always LATER than or equal
+to the true one. So the floor can only ever suppress a hit whose re-score is AT OR BEFORE that
+boundary; a re-score strictly AFTER it is decided identically on the floored date and on the true one,
+because ``re-score > floored >= true``. The same inequality rules out the other direction: a flag
+raised against a floored date is still a true flag, so truncation cannot manufacture one.
+
+**THE VERDICT IS THEREFORE PER PAIR, NOT PER RUN.** Pairs dated after the boundary are answered
+exactly. Pairs dated at or before it are UNDECIDABLE, and they are named and held out of the all-clear
+rather than folded into it -- the whole run is refused only when nothing is decidable, because an
+all-clear over zero decided pairs is the same reassuring-answer-to-an-unasked-question this file
+already refuses twice.
+
+**THE OTHER HALF OF THE DISTINCTION HOLDS BY CONSTRUCTION AND IS NOW PINNED RATHER THAN ASSUMED.** A
+graft OLDER than the ledger's first revision hides nothing, and ``git log -- <path>`` never reports it,
+because that walk lists only revisions where the path changed. So the oldest listed revision is a graft
+exactly when the path already existed at the boundary. That is why the test below is on the walk's own
+first revision and not on the repository's shallowness.
+
 **IT NAMES NO CELLS.** Output is item numbers and dates. Cell identifiers stay vaulted.
 
 Usage::
@@ -112,6 +138,29 @@ def read_pairs(scorecard_text: str) -> tuple[list[Pair], int]:
 
 
 @dataclass(frozen=True)
+class LedgerWalk:
+    """What ONE ledger path's walk actually saw, including where it began and why it stopped there.
+
+    Round two recorded truncation as a bare path name, which is enough to REFUSE and not enough to
+    decide anything finer. The boundary DATE is the whole discriminator -- it is what separates a pair
+    the floor could suppress from one it provably cannot -- so it is carried here rather than
+    re-derived by a caller that would have to walk the history again to find it.
+    """
+
+    path: str
+    #: Revisions the walk found for this path, before ``--limit`` narrows the window.
+    revisions_found: int
+    #: Revisions actually opened and fingerprinted. Equal to the above unless ``--limit`` was used.
+    revisions_walked: int
+    #: The oldest revision touching this path, and its committer date. Empty when the path has none.
+    oldest_rev: str
+    oldest_date: str
+    #: True when that oldest revision is a graft point git itself recorded, which means the path
+    #: already existed at the boundary and its earlier history is invisible.
+    graft_bounded: bool
+
+
+@dataclass(frozen=True)
 class Walk:
     """The walk's answer AND the two ways it can be incomplete, returned together on purpose.
 
@@ -125,8 +174,26 @@ class Walk:
     #: Revisions whose blob ``git show`` could not read. A revision that DELETED the path fails
     #: legitimately, so this is reported rather than refused.
     unreadable_revisions: int
-    #: Ledger paths whose walk began at a shallow graft boundary, so history before it is invisible.
-    truncated: tuple[str, ...]
+    #: Every ledger path walked, in the order given. Reported in full so an empty scan and a clean
+    #: scan cannot render alike.
+    ledgers: tuple[LedgerWalk, ...]
+    #: Every graft point read from ``.git/shallow``, whether or not it bounded any of these walks.
+    grafts_considered: tuple[str, ...]
+
+    @property
+    def truncated(self) -> tuple[LedgerWalk, ...]:
+        """The ledgers whose walk began at a graft, so history before that point is invisible."""
+        return tuple(walked for walked in self.ledgers if walked.graft_bounded)
+
+    @property
+    def boundary(self) -> str:
+        """The LATEST graft boundary date over every truncated ledger, or "" when none is.
+
+        The latest rather than the earliest, because this date is used as a floor that a pair must
+        clear to be decidable, and a pair must clear every floor that could apply to it. An item is
+        walked in both ledgers and the later touch wins, so the safe bound is the later boundary.
+        """
+        return max((walked.oldest_date for walked in self.truncated), default="")
 
 
 def banner_fingerprint(text: str) -> dict[int, str]:
@@ -157,9 +224,12 @@ def banner_last_touched(root: Path, backlog_paths: list[str], limit: int | None)
     """
     touched: dict[int, str] = {}
     unreadable = 0
-    truncated: list[str] = []
+    ledgers: list[LedgerWalk] = []
     # A SHALLOW CLONE IS THE ORDINARY STATE OF THIS REPOSITORY, NOT AN EDGE CASE. Measured
     # 2026-08-29: the primary and every worktree report true, over 856 commits with 3 graft points.
+    # RE-MEASURED 2026-09-03 AND BOTH NUMBERS HAD MOVED: 719 commits and 20 graft points, and the
+    # ONLY parentless commit reachable from HEAD is itself a graft. So the shape of this is not
+    # stable across re-fetches and neither figure should be relied on -- only the per-path test is.
     # So refusing on shallowness ALONE would refuse every real run on this machine -- which is why
     # the discriminator below is per-path rather than per-repository.
     #
@@ -211,11 +281,30 @@ def banner_last_touched(root: Path, backlog_paths: list[str], limit: int | None)
         # and not whether the oldest revision has a parent. Only a commit git itself recorded in
         # ``.git/shallow`` marks history it cannot see; a parentless commit that is not in that list
         # is a real beginning, and the walk that reached it saw everything there is.
-        if grafts and revs and revs[0].partition(" ")[0] in grafts:
-            truncated.append(backlog_path)
+        #
+        # AND THIS IS ALSO WHERE THE OTHER HALF OF THE DISTINCTION IS DECIDED, BY CONSTRUCTION
+        # RATHER THAN BY A SECOND TEST. ``git log -- <path>`` lists only revisions where the path
+        # CHANGED, so a graft that predates the ledger's own first revision is never the oldest line
+        # here -- the oldest line is the commit that created the ledger, which has a visible parent.
+        # The oldest revision is a graft exactly when the path ALREADY EXISTED at the boundary, which
+        # is exactly when earlier banner history is hidden. Recording the boundary DATE rather than
+        # just the fact lets the caller decide which pairs that hidden history could actually move.
+        oldest_rev, _, oldest_date = revs[0].partition(" ") if revs else ("", "", "")
+        graft_bounded = bool(grafts and revs and oldest_rev in grafts)
 
+        found = len(revs)
         if limit is not None:
             revs = revs[-limit:]
+        ledgers.append(
+            LedgerWalk(
+                path=backlog_path,
+                revisions_found=found,
+                revisions_walked=len(revs),
+                oldest_rev=oldest_rev,
+                oldest_date=oldest_date.strip(),
+                graft_bounded=graft_bounded,
+            )
+        )
 
         previous: dict[int, str] = {}
         for line in revs:
@@ -254,7 +343,12 @@ def banner_last_touched(root: Path, backlog_paths: list[str], limit: int | None)
                     if stamp > touched.get(num, ""):
                         touched[num] = stamp
             previous = current
-    return Walk(touched=touched, unreadable_revisions=unreadable, truncated=tuple(truncated))
+    return Walk(
+        touched=touched,
+        unreadable_revisions=unreadable,
+        ledgers=tuple(ledgers),
+        grafts_considered=tuple(sorted(grafts)),
+    )
 
 
 def evaluate(pairs: list[Pair], touched: dict[int, str]) -> tuple[list[Flag], list[int]]:
@@ -273,6 +367,25 @@ def evaluate(pairs: list[Pair], touched: dict[int, str]) -> tuple[list[Flag], li
         if pair.last_verified and pair.last_verified > when:
             flags.append(Flag(pair.item, pair.last_verified, when))
     return flags, sorted(set(unknown))
+
+
+def split_by_boundary(pairs: list[Pair], boundary: str) -> tuple[list[Pair], list[Pair]]:
+    """Split pairs into the ones a graft boundary cannot affect and the ones it can.
+
+    A graft floors an affected item's last-touch date AT the boundary, and the floor is always later
+    than or equal to the truth. So for a pair dated strictly after the boundary,
+    ``re-score > floored >= true`` holds and the verdict is the same on either date -- decidable. A
+    pair dated at or before it could have a true touch on either side of its own date, and no reading
+    of the visible history can say which -- undecidable, and the reason it is named rather than
+    silently answered.
+
+    An empty ``boundary`` means no walk began at a graft, so everything is decidable.
+    """
+    if not boundary:
+        return list(pairs), []
+    decidable = [pair for pair in pairs if pair.last_verified > boundary]
+    undecidable = [pair for pair in pairs if pair.last_verified <= boundary]
+    return decidable, undecidable
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -332,13 +445,16 @@ def main(argv: list[str] | None = None) -> int:
         sys.stderr.write(f"REFUSING: {exc}\n")
         return 3
     touched = walk.touched
-    if walk.truncated:
+    boundary = walk.boundary
+    decidable, undecidable = split_by_boundary(pairs, boundary)
+    if boundary and not decidable:
         sys.stderr.write(
-            "REFUSING: the ledger history is TRUNCATED at a shallow graft boundary for "
-            f"{list(walk.truncated)}, so every banner date floors at that boundary. A floored date "
-            "reads as a LATER touch, which SUPPRESSES real hits rather than inventing them -- the "
-            "one direction this check exists to rule out. Deepen the clone (git fetch --unshallow) "
-            "and re-run.\n"
+            "REFUSING: the ledger history is TRUNCATED at a shallow graft boundary dated "
+            f"{boundary} for {[walked.path for walked in walk.truncated]}, and EVERY pair read is "
+            "dated at or before it, so this run can decide nothing. A floored date reads as a LATER "
+            "touch, which SUPPRESSES real hits rather than inventing them -- the one direction this "
+            "check exists to rule out. Deepen the clone (git fetch --unshallow, which writes to an "
+            "object store shared by every worktree) and re-run.\n"
         )
         return 3
     # THE GUARD THIRTY LINES ABOVE, FOR THE OTHER INPUT, AND THE REASONING TRANSFERS VERBATIM. With
@@ -351,7 +467,7 @@ def main(argv: list[str] | None = None) -> int:
             f"to 'unknown' while the verdict still printed the all-clear. Walked: {ledgers}\n"
         )
         return 3
-    flags, unknown = evaluate(pairs, touched)
+    flags, unknown = evaluate(decidable, touched)
 
     print(f"# rescore-handoff scorecard={args.scorecard} engine={head[:12]}")
     print(
@@ -361,6 +477,45 @@ def main(argv: list[str] | None = None) -> int:
     print(f"items whose banner history was found: {len(touched)}")
     # STATED EVEN WHEN ZERO. An absent line cannot be checked; a printed zero can.
     print(f"revisions the walk could not read: {walk.unreadable_revisions}")
+    # WHAT THE WALK ACTUALLY SCANNED, PER PATH. An empty scan and a clean scan must not render
+    # alike, and this tool has already shipped one failure of exactly that shape: a locale-decoded
+    # blob destroyed every banner glyph, so the walk found no change anywhere and said so in
+    # perfectly plausible output. A revision count is the cheapest thing that would have caught it.
+    print(f"graft points git recorded in .git/shallow: {len(walk.grafts_considered)}")
+    for walked in walk.ledgers:
+        began = (
+            f"oldest {walked.oldest_rev[:12]} ({walked.oldest_date})"
+            if walked.oldest_rev
+            else "none"
+        )
+        where = (
+            "AT A GRAFT, so earlier banner history is hidden"
+            if walked.graft_bounded
+            else "not at a graft, so the walk saw every revision of this path there is"
+        )
+        print(
+            f"walked {walked.path}: {walked.revisions_walked} of {walked.revisions_found} "
+            f"revisions, {began}, {where}"
+        )
+    # WHICH BRANCH OF THE DISTINCTION THIS RUN TOOK, NAMED RATHER THAN INFERRED FROM THE ABSENCE OF
+    # A REFUSAL. The two branches produce different guarantees, and a reader cannot tell them apart
+    # from a verdict line that reads the same either way.
+    if not boundary:
+        print(
+            "truncation branch: NONE -- no ledger walk began at a graft, so every pair is decided "
+            "against a true last-touch date"
+        )
+    else:
+        print(
+            f"truncation branch: BOUNDED at {boundary}. A floored date can only suppress a hit "
+            f"dated at or before it, so {len(decidable)} pairs are decided exactly and "
+            f"{len(undecidable)} are UNDECIDABLE"
+        )
+    if undecidable:
+        print(
+            "items NOT covered by the verdict below (re-scored at or before the graft boundary): "
+            f"{sorted({pair.item for pair in undecidable})}"
+        )
     if unknown:
         print(f"items referenced but absent from every ledger walked: {sorted(unknown)}")
     print()
@@ -375,13 +530,34 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 0
     if not flags:
-        print("no item was re-scored after its banner was last touched")
+        # THE QUALIFIER IS THE POINT. An unqualified all-clear over a run that could not decide some
+        # of its pairs is the same wrong answer the refusals above exist to prevent, arriving one
+        # step later -- so the scope of the clean verdict is stated in the verdict itself, not left
+        # to a reader who is expected to have read the branch line four lines earlier.
+        if undecidable:
+            print(
+                f"no DECIDABLE item was re-scored after its banner was last touched "
+                f"({len(decidable)} of {len(pairs)} pairs). The "
+                f"{len({pair.item for pair in undecidable})} undecidable items above are NOT "
+                "covered by this line."
+            )
+        else:
+            print("no item was re-scored after its banner was last touched")
         return 0
     print(f"RE-SCORED AFTER THE BANNER WAS LAST TOUCHED: {len(flags)}")
     for flag in sorted(flags, key=lambda f: f.item):
-        print(
-            f"  BACKLOG #{flag.item}: re-scored {flag.last_verified}, banner last touched {flag.banner_touched}"
+        # A TOUCH DATE SITTING EXACTLY ON THE BOUNDARY IS A FLOOR, NOT A MEASUREMENT, AND PRINTING
+        # IT BARE WOULD HAND A READER A FLIP DATE THAT NEVER HAPPENED. The FLAG is still sound --
+        # the re-score cleared the floor and the floor is later than or equal to the truth -- but
+        # the item's real last touch is somewhere before the boundary and this walk cannot see it.
+        # Equality cannot separate "floored" from "genuinely touched by the graft revision", and it
+        # does not need to: the true date is at or before the boundary in both cases.
+        when = (
+            f"at or before {boundary} (FLOORED at the graft, not measured)"
+            if boundary and flag.banner_touched == boundary
+            else flag.banner_touched
         )
+        print(f"  BACKLOG #{flag.item}: re-scored {flag.last_verified}, banner last touched {when}")
     print()
     print(
         "A hit is a PROMPT TO READ THE ENTRY, not a finding. The item's own first run produced two"

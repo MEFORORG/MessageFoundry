@@ -44,6 +44,28 @@ than feeding it. Four facts, each measured, that are not obvious from the code b
   registered here and the ``pipeline/`` call sites stay ``ssl``-free. That is centralization, not
   evasion: one place decides the TLS policy for every SMTP hop in the product.
 
+**A SECOND ARM COVERS THE NON-PYTHON TREE (BACKLOG #1172, ASVS 11.5.1).** Everything above is an
+``import ast`` walk of ``*.py``, so it is Python-only *by construction* and cannot see a randomness
+draw in another language however the walk-set is spelled. :func:`check_non_python_randomness` scans
+:data:`NON_PYTHON_WALK_ROOTS` (``ide/``, the shipped TypeScript VS Code extension) for randomness
+sources and diffs them against :data:`NON_PYTHON_INVENTORY` the same bidirectional way. Three
+properties are the point of it, and each is pinned by a test in
+``tests/test_crypto_inventory_scanner.py``:
+
+* a **weak** source (:data:`WEAK_RANDOMNESS_PATTERNS`, i.e. ``Math.random()``) fails the gate and has
+  **no inventory row to hide behind** - registering one is refused on purpose, because ASVS 11.5.1
+  states an entropy floor on the VALUE and #1172 names "narrow the declared scope so the hit stops
+  being visible" as a disqualified pass;
+* a **strong** source is inventoried rather than merely tolerated, so a new CSPRNG site is reviewed;
+* an **empty walk is a violation, not a clean result**. A scan that reaches no files, and an
+  inventory anchor that has gone missing, both red. The anchor (``ide/src/cspNonce.ts`` ->
+  ``randomBytes``) is what makes this instrument able to fail: break the walk and the stale direction
+  names it.
+
+This is a *randomness* inventory, and that is the whole claim it supports. The other first-party
+crypto in ``ide/`` - the TLS floor ``ide/src/engineClient.ts`` applies to every https request - is
+still not discoverable from here.
+
 Stdlib only (no install), like ``scripts/security/scan_forbidden.py`` — runnable as a CI step and a
 pytest. Usage::
 
@@ -55,6 +77,7 @@ from __future__ import annotations
 
 import argparse
 import ast
+import re
 import sys
 from pathlib import Path
 
@@ -72,11 +95,14 @@ from pathlib import Path
 # across the extension, and ``ide/src/engineClient.ts`` pins a TLS floor it applies to every https
 # request. Both are first-party crypto in a shipped artifact and NEITHER is discoverable from here.
 #
-# ADDING ``ide/`` TO WALK_ROOTS WOULD BE A NO-OP THAT LOOKS LIKE A FIX: the Python AST scanner would
-# find zero ``.py`` there, report clean, and the TypeScript sites would stay invisible while the tree
-# gained a green whose greenness is evidence of nothing. Covering them needs a TypeScript arm on a
-# merge-gating context, which is unbuilt. Until it exists this gate's green means "no undocumented
-# crypto in the PYTHON of five roots", and that is the only claim it supports.
+# ADDING ``ide/`` TO WALK_ROOTS WOULD STILL BE A NO-OP THAT LOOKS LIKE A FIX, and that has not
+# changed: the Python AST scanner would find zero ``.py`` there, report clean, and the TypeScript
+# sites would stay invisible while the tree gained a green whose greenness is evidence of nothing.
+# ``ide/`` is covered by a SEPARATE arm instead (:data:`NON_PYTHON_WALK_ROOTS` below, BACKLOG #1172),
+# which reads ``.ts``/``.js`` by pattern rather than by AST and rides this same required context. So
+# this gate's green now means "no undocumented crypto in the PYTHON of five roots, AND no
+# undocumented or weak RANDOMNESS source in the non-Python roots". The randomness half is the only
+# claim the second arm supports - the extension's TLS floor is still outside both.
 # ``samples/`` is absent by design too, on the SAME rationale as the ``ide/`` exclusion (ASVS 11.1.3):
 # it is author-space EXAMPLE config, not shipped engine code, so its crypto (e.g. a content-fingerprint
 # ``hashlib.sha256`` in a sample Handler) is out of the deployed-system inventory scope — the gate
@@ -85,6 +111,60 @@ from pathlib import Path
 # so adding ``samples/`` here would break that pin AND drag author-space into the ReDoS/XML static
 # guards that consume the same tuple.
 WALK_ROOTS = ("messagefoundry", "messagefoundry_webconsole", "harness", "tee", "scripts")
+
+# --------------------------------------------------------------------------------------------
+# The NON-PYTHON randomness arm (BACKLOG #1172, ASVS 11.5.1).
+# --------------------------------------------------------------------------------------------
+#: First-party roots that hold shipped source in a language the AST walk above cannot read. Today
+#: that is ``ide/``, the TypeScript VS Code extension. Kept separate from :data:`WALK_ROOTS` on
+#: purpose: the two arms read different file types with different instruments, and merging them
+#: would let one arm's green stand in for the other's silence.
+NON_PYTHON_WALK_ROOTS = ("ide",)
+
+#: Suffixes the non-Python arm reads. Source only.
+NON_PYTHON_SUFFIXES = (".ts", ".js", ".mjs", ".cjs")
+
+#: Never walked: dependency trees and bundler output. They are not first-party source, and a
+#: node_modules walk would bury a real finding under thousands of vendor hits.
+NON_PYTHON_SKIP_DIRS = frozenset({"node_modules", "out", "dist", ".vscode-test", "coverage"})
+
+#: Randomness sources that are cryptographically sound. A file using one must carry a
+#: :data:`NON_PYTHON_INVENTORY` row, so a new CSPRNG site is reviewed rather than merely allowed.
+#: The lookbehind stops a longer identifier ending in the same word from matching.
+STRONG_RANDOMNESS_PATTERNS: dict[str, re.Pattern[str]] = {
+    "randomBytes": re.compile(r"(?<![A-Za-z0-9_$])randomBytes\s*\("),
+    "randomFillSync": re.compile(r"(?<![A-Za-z0-9_$])randomFillSync\s*\("),
+    "randomInt": re.compile(r"(?<![A-Za-z0-9_$])randomInt\s*\("),
+    "randomUUID": re.compile(r"(?<![A-Za-z0-9_$])randomUUID\s*\("),
+    "getRandomValues": re.compile(r"(?<![A-Za-z0-9_$])getRandomValues\s*\("),
+}
+
+#: Randomness sources that are NOT cryptographic. A hit here fails the gate outright and there is
+#: deliberately no inventory row that can silence it: V8's ``Math.random`` is xorshift128+, whose
+#: full internal state is recoverable from a short run of outputs, so no draw length rescues it.
+#: ``ide/src/cspNonce.ts`` is the worked replacement (``randomBytes`` from ``node:crypto``).
+#:
+#: IF A GENUINELY NON-SECURITY USE EVER APPEARS (jitter, a sample colour), the fix is not a row
+#: here. Either keep it out of the shipped extension, or make the non-security intent structural by
+#: routing it through one named helper and widening this comment to say why that helper is sound.
+#: An inventory row would record the same green whether the site was sound or not, which is the
+#: exact move BACKLOG #1172 rules out as a dishonest pass for ASVS 11.5.1.
+WEAK_RANDOMNESS_PATTERNS: dict[str, re.Pattern[str]] = {
+    "Math.random": re.compile(r"(?<![A-Za-z0-9_$])Math\s*\.\s*random\s*\("),
+    "pseudoRandomBytes": re.compile(r"(?<![A-Za-z0-9_$])pseudoRandomBytes\s*\("),
+}
+
+#: The maintained non-Python randomness inventory: repo-relative path -> the STRONG sources it is
+#: documented to draw from. Bidirectional like :data:`INVENTORY`, and the stale direction is what
+#: makes this arm able to fail: if the walk ever breaks or the file moves, this row is unbacked and
+#: the gate reds instead of reporting a clean empty scan.
+NON_PYTHON_INVENTORY: dict[str, frozenset[str]] = {
+    # ADR 0065-adjacent, BACKLOG #1172. The single source of CSP nonces for every webview the
+    # extension builds: 18 bytes (144 bits) of ``randomBytes`` in base64url. A CSP nonce is a
+    # capability, so its entropy SOURCE is the security property; the file's own header explains why
+    # ``node:crypto`` and not ``crypto.getRandomValues`` (extension-host code, not webview code).
+    "ide/src/cspNonce.ts": frozenset({"randomBytes"}),
+}
 
 # Top-level stdlib modules that mean "crypto happens here".
 CRYPTO_MODULES = frozenset({"hashlib", "secrets", "hmac", "ssl", "argon2", "cryptography"})
@@ -504,17 +584,23 @@ def find_violations(
     inventory: dict[str, frozenset[str]],
     *,
     check_stale: bool,
+    noun: str = "crypto",
+    stale_verb: str = "imports",
 ) -> tuple[list[str], list[str]]:
     """Return ``(undocumented, stale)`` message lists. ``undocumented`` = a file uses a crypto module
     not recorded for it (the security-relevant direction). ``stale`` = an inventory entry the file no
-    longer backs (kept honest only when scanning the real package)."""
+    longer backs (kept honest only when scanning the real package).
+
+    ``noun``/``stale_verb`` only reword the messages so the non-Python randomness arm can reuse this
+    diff verbatim rather than growing a second, silently different one. The defaults reproduce the
+    Python arm's wording byte-for-byte."""
     undocumented: list[str] = []
     for path, mods in sorted(actual.items()):
         extra = mods - inventory.get(path, frozenset())
         if extra:
             documented = sorted(inventory.get(path, frozenset())) or "(file not in inventory)"
             undocumented.append(
-                f"{path}: undocumented crypto use {sorted(extra)} (documented: {documented})"
+                f"{path}: undocumented {noun} use {sorted(extra)} (documented: {documented})"
             )
     stale: list[str] = []
     if check_stale:
@@ -522,15 +608,126 @@ def find_violations(
             gone = mods - actual.get(path, frozenset())
             if gone:
                 stale.append(
-                    f"{path}: inventory lists {sorted(gone)} but the file no longer imports it"
+                    f"{path}: inventory lists {sorted(gone)} but the file no longer {stale_verb} it"
                 )
     return undocumented, stale
 
 
+def _is_comment_only(line: str) -> bool:
+    """True for a line that is nothing but a ``//`` or block-comment line.
+
+    DELIBERATELY CONSERVATIVE, and the direction matters. A code line carrying a TRAILING comment is
+    still scanned in full, so a call cannot be hidden by putting a ``//`` earlier on the same line;
+    the cost is that a line beginning with ``*`` for some non-comment reason is skipped. The error
+    this can make is a false POSITIVE (flagging a call quoted inside a string), never a false
+    negative, which is the only safe direction for a security gate. Stripping comments properly would
+    need a JS lexer, and a naive strip would cut a line at the ``//`` of a URL and hide what follows.
+
+    The shipped extension test ``ide/src/test/suite/extension-hardening.test.ts`` uses the same rule
+    for the same reason: ``cspNonce.ts`` NAMES ``Math.random`` in prose to explain why it is unusable.
+    """
+    stripped = line.lstrip()
+    return stripped.startswith(("//", "*", "/*"))
+
+
+def randomness_tokens_in(text: str) -> set[str]:
+    """The randomness-source tokens (strong and weak) a non-Python source draws from."""
+    found: set[str] = set()
+    patterns = {**STRONG_RANDOMNESS_PATTERNS, **WEAK_RANDOMNESS_PATTERNS}
+    for line in text.splitlines():
+        if _is_comment_only(line):
+            continue
+        for token, pattern in patterns.items():
+            if token not in found and pattern.search(line):
+                found.add(token)
+    return found
+
+
+def non_python_sources(root: Path) -> list[Path]:
+    """Every first-party non-Python source under ``root``, dependency and build trees pruned."""
+    out: list[Path] = []
+    for dirpath, dirnames, filenames in root.walk():
+        dirnames[:] = [d for d in dirnames if d not in NON_PYTHON_SKIP_DIRS]
+        out.extend(dirpath / name for name in filenames if name.endswith(NON_PYTHON_SUFFIXES))
+    return sorted(out)
+
+
+def discover_non_python(root: Path, *, repo: Path) -> dict[str, frozenset[str]]:
+    """Map repo-relative path -> randomness tokens, for the files that draw randomness at all."""
+    out: dict[str, frozenset[str]] = {}
+    for path in non_python_sources(root):
+        tokens = randomness_tokens_in(path.read_text(encoding="utf-8"))
+        if tokens:
+            out[path.relative_to(repo).as_posix()] = frozenset(tokens)
+    return out
+
+
+def check_non_python_randomness(repo: Path) -> tuple[list[str], int]:
+    """Run the non-Python randomness arm. Returns ``(violation lines, files scanned)``.
+
+    The file count is returned so the caller can PRINT what was scanned. An instrument that reports
+    "clean" without saying what it read is indistinguishable from one that read nothing, which is the
+    failure this arm exists to close for ASVS 11.5.1."""
+    violations: list[str] = []
+    actual: dict[str, frozenset[str]] = {}
+    scanned = 0
+
+    for name in NON_PYTHON_WALK_ROOTS:
+        root = repo / name
+        if not root.is_dir():
+            violations.append(
+                f"randomness arm: declared walk root {name}/ is not a directory under {repo} - the "
+                "scan cannot report clean on a corpus it never reached"
+            )
+            continue
+        files = non_python_sources(root)
+        if not files:
+            violations.append(
+                f"randomness arm: the walk over {name}/ reached ZERO "
+                f"{'/'.join(NON_PYTHON_SUFFIXES)} files, so a clean result would be VACUOUS. Either "
+                "the sources moved, the suffix list is wrong, or the pruned-directory list now eats "
+                "the corpus. Fix the walk; do not read this as a clean tree"
+            )
+            continue
+        scanned += len(files)
+        actual |= discover_non_python(root, repo=repo)
+
+    weak_tokens = set(WEAK_RANDOMNESS_PATTERNS)
+    for path, tokens in sorted(actual.items()):
+        weak = sorted(tokens & weak_tokens)
+        if weak:
+            violations.append(
+                f"{path}: WEAK randomness source {weak} in shipped non-Python source. There is no "
+                "inventory row for this and adding one is refused: ASVS 11.5.1 states an entropy "
+                "floor on the VALUE, and hiding the hit is the disqualified pass BACKLOG #1172 names."
+                " Draw from node:crypto instead - ide/src/cspNonce.ts is the worked example"
+            )
+
+    strong_actual = {
+        path: frozenset(tokens - weak_tokens)
+        for path, tokens in actual.items()
+        if tokens - weak_tokens
+    }
+    undocumented, stale = find_violations(
+        strong_actual,
+        NON_PYTHON_INVENTORY,
+        check_stale=True,
+        noun="randomness",
+        stale_verb="draws from",
+    )
+    violations.extend(undocumented)
+    violations.extend(stale)
+    return violations, scanned
+
+
 def _assert_ide_is_typescript(repo: Path) -> list[str]:
-    """``ide/`` is excluded from the walk because it is TypeScript with zero ``.py`` files. Enforce
+    """``ide/`` is outside the PYTHON walk because it is TypeScript with zero ``.py`` files. Enforce
     that fact so a future ``.py`` there reds the gate (and forces a WALK_ROOTS + inventory update)
-    rather than silently escaping the crypto scan. Returns violation message lines (empty = OK)."""
+    rather than silently escaping the crypto scan. Returns violation message lines (empty = OK).
+
+    Still needed after the non-Python arm landed, and for a different reason than before: that arm
+    reads ``.ts``/``.js``, so a ``.py`` under ``ide/`` would fall between the two walks rather than
+    merely outside one. This is the guard that catches it."""
     ide = repo / "ide"
     if not ide.is_dir():
         return []
@@ -560,6 +757,8 @@ def main(argv: list[str] | None = None) -> int:
     scanning_default = args.package is None
     actual: dict[str, frozenset[str]] = {}
     ide_violations: list[str] = []
+    randomness_violations: list[str] = []
+    randomness_scanned = 0
     if scanning_default:
         repo = Path(__file__).resolve().parents[2]
         roots = [repo / name for name in WALK_ROOTS]
@@ -570,6 +769,7 @@ def main(argv: list[str] | None = None) -> int:
         for root in roots:
             actual |= discover(root)
         ide_violations = _assert_ide_is_typescript(repo)
+        randomness_violations, randomness_scanned = check_non_python_randomness(repo)
     else:
         package = args.package
         if not package.is_dir():
@@ -591,10 +791,20 @@ def main(argv: list[str] | None = None) -> int:
         print("crypto-inventory: STALE inventory entries (remove them from INVENTORY):")
         for line in stale:
             print(f"  - {line}")
-    if undocumented or stale or ide_violations:
+    if randomness_violations:
+        print("crypto-inventory: NON-PYTHON RANDOMNESS arm (ASVS 11.5.1, BACKLOG #1172) FAILED:")
+        for line in randomness_violations:
+            print(f"  - {line}")
+    if undocumented or stale or ide_violations or randomness_violations:
         return 1
 
-    print(f"crypto-inventory: OK - {len(actual)} documented crypto call site(s), no drift.")
+    # Print the corpus, not just the verdict: "clean" means nothing without what was read.
+    print(
+        f"crypto-inventory: OK - {len(actual)} documented crypto call site(s) across "
+        f"{len(WALK_ROOTS)} Python root(s), no drift; "
+        f"{randomness_scanned} non-Python source(s) scanned for randomness across "
+        f"{len(NON_PYTHON_WALK_ROOTS)} root(s), no weak source and no inventory drift."
+    )
     return 0
 
 
