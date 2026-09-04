@@ -80,8 +80,11 @@ egress/filesystem/imports), per platform.** Proposed (design only — no code in
 - **Denial routing unchanged.** A confinement fault (a denied syscall, a broker-rejected request, a worker
   crash) routes to **`ERROR`/dead-letter post-ACK** via the existing ADR 0087 paths — never a NAK, never a
   crashed connection (count-and-log invariant).
-- **Default-off, byte-identical.** `mode=off` (default) and `mode=subprocess` (ADR 0087) are unchanged;
-  `mode=isolated` is opt-in. The parent-side `[egress]` allowlist stays the single authority.
+- **Existing modes unchanged; `mode=isolated` is opt-in.** `mode=off` and `mode=subprocess` (ADR 0087)
+  behave exactly as they do today. *(Written when `off` was the default. BACKLOG #1278 made
+  `subprocess` the default on 2026-09-04 — which does not change this ADR's design, but does mean the
+  baseline `mode=isolated` would be measured against is now the subprocess path, not the in-process
+  one.)* The parent-side `[egress]` allowlist stays the single authority.
 
 ## Acceptance Criteria
 

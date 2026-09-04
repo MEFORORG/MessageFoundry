@@ -1028,9 +1028,12 @@ of the filters above. It is **out of scope for this section** — but treat a
 `--capture-bodies` capture store as a PHI-at-rest location on the terms of
 [§2](#2-where-phi-lives--data-at-rest-inventory).
 
-The **opt-in ADR 0087 sandbox worker** (`[sandbox].mode = "subprocess"`, default `"off"`) is **not** an
-exclusion, and this paragraph is the single statement of how its output reaches stream 1 — the code
-docstrings link here rather than restate it. Two independent mechanisms cover it:
+The **ADR 0087 sandbox worker** (`[sandbox].mode = "subprocess"`, **the default** since BACKLOG #1278)
+is **not** an exclusion, and this paragraph is the single statement of how its output reaches stream 1 —
+the code docstrings link here rather than restate it. Note what the flip did to this paragraph's scope:
+the child described below is now the **ordinary** path a deploying site takes, not an opt-in one, so
+both mechanisms are load-bearing on the shipped default rather than only for a site that went looking
+for the setting. Two independent mechanisms cover it:
 
 - **Inside the child.** It calls `configure_stderr_logging`, which installs the same three filters on
   its own stderr handler (BACKLOG #1054), so a `WARNING`+ record emitted there by admin-authored

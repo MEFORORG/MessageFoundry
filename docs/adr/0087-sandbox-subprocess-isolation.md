@@ -1,6 +1,6 @@
 # 0087 — Router/Handler subprocess isolation
 
-- **Status:** Accepted; **Amended (2026-08-04)** — the transform-result parity rule changed shape. The child now materialises a container return with `_partition`'s **own** rule instead of reproducing its exact input container, so a tuple/set/generator **delivers** in both modes (BACKLOG #341). AC-11 and the "Result parity" bullet below are rewritten accordingly; the isolation boundary and the codec grammar are untouched.  <!-- opt-in subprocess isolation built (#197, 2026-07-10) -->
+- **Status:** Accepted; **Amended (2026-08-04)** — the transform-result parity rule changed shape. The child now materialises a container return with `_partition`'s **own** rule instead of reproducing its exact input container, so a tuple/set/generator **delivers** in both modes (BACKLOG #341). AC-11 and the "Result parity" bullet below are rewritten accordingly; the isolation boundary and the codec grammar are untouched. **Amended (2026-09-04, BACKLOG #1278) — THE DEFAULT FLIPPED FROM `off` TO `subprocess`.** Nothing about the mechanism, the boundary or the codec changed; only which mode ships. The costs this ADR already measured are now costs of the DEFAULT, so read them as such: fail-closed refusal of `db_lookup`/`fhir_lookup`, an enforced `wall_seconds` where the in-process path had no timeout at all, the per-dispatch marshalling, and one worker child per inbound that receives traffic. `mode=off` is retained and supported as the escape for a Handler needing live enrichment. Below, "opt-in" and "default-off" describe the 2026-07-10 decision as it was taken; where a sentence would now mislead a reader about what ships, it is marked inline.  <!-- opt-in subprocess isolation built (#197, 2026-07-10); default flipped (#1278, 2026-09-04) -->
 - **Date:** 2026-07-10
 - **Related:** [ADR 0009](0009-run-scoped-context-providers.md) (RunContext providers) · [ADR 0010](0010-handler-callable-db-lookup.md) / [ADR 0043](0043-fhir-read-lookup.md) (`db_lookup`/`fhir_lookup`) · [ADR 0072](0072-traced-dryrun-mode.md) (tracer seam it composes with) · [ADR 0036](0036-windows-config-source-trust.md) / [ADR 0041](0041-load-path-attestation-and-change-attribution.md) (config-source trust) · CLAUDE.md §2 (reliability/purity, count-and-log) · CLAUDE.md §4 (layering) · BACKLOG #197 · ASVS 15.2.5 / `docs/security/ASVS-L3-REMEDIATION-PLAN.md` WP-L3-17
 
@@ -36,9 +36,16 @@ The forcing constraints on any fix:
 
 ## Decision
 
-Add an **opt-in `[sandbox]` section** that, when `mode=subprocess`, runs each inbound's
-Router/Handler in a **persistent per-inbound worker subprocess**; `mode=off` (the default) runs them
-in-process, byte-identically and with zero overhead.
+Add a **`[sandbox]` section** that, when `mode=subprocess`, runs each inbound's Router/Handler in a
+**persistent per-inbound worker subprocess**; `mode=off` runs them in-process, byte-identically and
+with zero overhead.
+
+> **As decided 2026-07-10 this section was opt-in and `mode=off` was the default. BACKLOG #1278
+> flipped that on 2026-09-04: `subprocess` is now the shipped default and `mode=off` is the opt-out.**
+> The mechanism below is unchanged. Two consequences of the flip that this ADR's original text does
+> not frame as defaults: `wall_seconds` is now **enforced on the shipped posture**, where the
+> in-process path it replaced had no timeout at all; and a Handler needing the live
+> `db_lookup`/`fhir_lookup` bridges must now **opt out** with `mode=off` rather than opt in.
 
 - **Approach (B) SUBPROCESS, stdlib-only.** `pipeline/sandbox.py` (`SandboxPolicy`, `SandboxSession`,
   `run_sandboxed`, `SandboxError`) + `pipeline/_sandbox_worker.py` (the child, launched
@@ -200,8 +207,9 @@ target, no `pickle` import left to mis-suppress:
 
 ## Acceptance Criteria
 
-- **AC-1** — WHERE `[sandbox].mode=off` (the default), THE SYSTEM SHALL run a Router and a Handler
-  in-process and return a result byte-identical to a direct call, spawning no subprocess.
+- **AC-1** — WHERE `[sandbox].mode=off` (the default as decided; the **opt-out** since BACKLOG #1278),
+  THE SYSTEM SHALL run a Router and a Handler in-process and return a result byte-identical to a
+  direct call, spawning no subprocess.
   → `tests/test_sandbox.py::test_mode_off_session_is_byte_identical_and_never_spawns`
 - **AC-2** — WHERE `[sandbox].mode=subprocess`, THE SYSTEM SHALL return a Router/Handler result
   byte-identical to the in-process path for a benign function.
@@ -306,9 +314,13 @@ target, no `pickle` import left to mis-suppress:
 closes the heaviest WP-L3-17 (15.2.5) residual as a **residual-closure**. That closure is only as
 good as the pipe: as originally shipped, the parent's `pickle.loads` of the child's frame let admin
 code cross the boundary it claims to enforce, so the MFW2 amendment is what makes the claim true
-rather than an enhancement on top of it. Default-off means zero overhead and byte-identical behaviour
-for existing deployments; the whole existing test suite is unaffected (sandbox is `None`/off
-everywhere).
+rather than an enhancement on top of it. **As decided, default-off meant zero overhead and
+byte-identical behaviour, and the existing test suite was unaffected (sandbox `None`/off everywhere).
+BACKLOG #1278 flipped the default to `subprocess` on 2026-09-04**, so that sentence no longer
+describes what ships: a stock `serve` now pays the round-trip and spawns a worker per trafficked
+inbound. It cost no migration — there were zero deployments to migrate (CLAUDE.md §0) — and the
+sample estate was executed under the new default rather than inspected, all inbounds ACKing and
+delivering identically to a `mode=off` control.
 
 **Negative / risks** — When enabled, each message pays a codec round-trip to the worker and the
 per-inbound worker serializes that inbound's Router/Handler calls (matching the per-inbound worker
@@ -318,8 +330,8 @@ caches; `enc_run_context` snapshots them to plain point-in-time rows **by constr
 them onto the wire — the read-only content a router/transform would have seen at that instant (re-run
 stability makes a point-in-time copy the contract anyway), so `mode=subprocess` processes real
 messages against the default SQLite store. Snapshotting copies the reference/state caches per
-dispatch, an accepted cost of the opt-in isolation mode (`code_sets`, the largest of the three, is
-hoisted out of the per-dispatch frame entirely). A value outside the closed grammar fails closed
+dispatch, an accepted cost of the isolation mode — and, since BACKLOG #1278, of the **default** mode
+(`code_sets`, the largest of the three, is hoisted out of the per-dispatch frame entirely). A value outside the closed grammar fails closed
 (`SandboxError`), never silently degrading — and the reverse is also true, so a Handler returning an
 exotic object now reports a *codec* rejection rather than the pickle error text it used to.
 

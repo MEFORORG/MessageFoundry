@@ -154,9 +154,12 @@ the `ruff`/`mypy` run-if-installed convention in escalation.
    prone on a domain API; a hard block on either failure mode is wrong. Blocking is offered opt-in (AC-5)
    for orgs that want it on their CI.
 3. **Rely only on the runtime sandbox ([ADR 0087](0087-sandbox-subprocess-isolation.md)).** Rejected as
-   *sufficient*: the sandbox is opt-in/off-by-default and is an address-space boundary — it does **not**
-   catch a Handler leaking PHI into the store's *own* log, or building SQL that runs *inside* the
-   sanctioned `db_lookup`. Static + runtime are overlapping, complementary layers (defense-in-depth), not
+   *sufficient*, and **the rejection survives BACKLOG #1278 flipping that sandbox on by default
+   (2026-09-04)** — which matters, because "it is off by default" was one of two reasons given here and
+   is no longer true. The reason that carries the rejection on its own is the second one: the sandbox is
+   an **address-space** boundary, so it does **not** catch a Handler leaking PHI into the store's *own*
+   log, or building SQL that runs *inside* the sanctioned `db_lookup`. Neither of those crosses an
+   address space. Static + runtime are overlapping, complementary layers (defense-in-depth), not
    substitutes; this ADR is the static half, ADR 0087 the runtime half.
 4. **Make Semgrep / CodeQL a required part of the local commit gate.** Rejected: a heavyweight required
    dependency for a non-developer author's commit. Custom Semgrep taint rules (e.g. tainted-source →

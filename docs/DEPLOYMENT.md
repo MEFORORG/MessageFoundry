@@ -501,11 +501,14 @@ transform.
 - **The `messagefoundry check` security lint** (ADR 0144) — a static scan for risky patterns in
   config-dir Router/Handler modules. It is **advisory: it prints and never blocks**, and static analysis
   catches a fraction of insecure code. A filter, not a boundary.
-- **The opt-in `[sandbox]` subprocess isolation** (ADR 0087) — `mode` defaults to **`off`**. Set to
-  `subprocess` it gives an address-space boundary plus a forbidden-import guard, which is real
-  blast-radius reduction, but it is **not a network-egress deny**: a worker can still connect sockets
-  from inside the child. It also **fails `db_lookup` / `fhir_lookup` closed**, so a feed needing live
-  enrichment cannot use it. A deny-by-default brokered sandbox is **proposed, not built** (ADR 0147).
+- **The `[sandbox]` subprocess isolation** (ADR 0087) — `mode` defaults to **`subprocess`** since
+  BACKLOG #1278, so you get this without asking. It gives an address-space boundary plus a
+  forbidden-import guard, which is real blast-radius reduction, but it is **not a network-egress
+  deny**: a worker can still connect sockets from inside the child. **It does not stop your config
+  Python executing in the engine process either** — the loader runs every `*.py` in the config dir
+  in-process regardless of `mode`. And it **fails `db_lookup` / `fhir_lookup` closed**, so a feed
+  needing live enrichment must set `mode = "off"` for that instance. A deny-by-default brokered
+  sandbox is **proposed, not built** (ADR 0147).
 
 For an off-loopback deployment, populate the lists you use so a **misconfigured or hostile destination**
 cannot deliver to an unapproved address — **all eight of them**, not just the transports you happen to
