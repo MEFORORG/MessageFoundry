@@ -50,6 +50,7 @@ tests/test_ci_tooling_gate.py
 tests/test_ci_venv_pinning.py
 tests/test_citation_line_check.py
 tests/test_claim_check.py
+tests/test_coord_alloc_strand_sweep.py
 tests/test_coord_fleet_fetch_clock.py
 tests/test_gate_ci_mirror_parity.py
 tests/test_hook_prose_folding.py
@@ -65,6 +66,7 @@ tests/test_coord_claim_refresh.py
 tests/test_coord_claim_release_history.py
 tests/test_coord_handoff_pointer.py
 tests/test_coord_handoff_report.py
+tests/test_coord_landed_citation_screen.py
 tests/test_coord_lane_statement.py
 tests/test_coord_lock.py
 tests/test_coord_overlap_attribution.py
@@ -78,12 +80,14 @@ tests/test_coord_seat_clock_alarm.py
 tests/test_coord_throughput.py
 tests/test_doc_guards_lane.py
 tests/test_install_gate_records_the_install.py
+tests/test_npm_audit_retry.py
 tests/test_quality_expiry_audit.py
 tests/test_coord_seat_prompt.py
 tests/test_coord_seat_session_key.py
 tests/test_coord_unbacked_check.py
 tests/test_coord_usage.py
 tests/test_cutover_slug_rot.py
+tests/test_dangling_citation_advisory.py
 tests/test_dangling_citation_check.py
 tests/test_dast_claims.py
 tests/test_defaulted_credential_lint.py
