@@ -495,6 +495,49 @@ the call to the Console on 2026-09-02; the Console decided ([ADR 0118](adr/0118-
   `security_loosenings()` / `GET /security/posture`. Inbound names are prefixed `inbound:`.
 - **What it cannot do:** it is advisory only, on every posture, in both directions. Nothing refuses it.
 
+### `store_principal_over_granted` — the engine's database credential holds more than its runbook allows
+
+> **An OBSERVATION, not a switch.** Nobody sets this; the serve-time preflight reads the store
+> principal's *effective* privileges and compares them against the grant
+> [`DEPLOY-SERVER-DB.md` §1.1/§1.2](DEPLOY-SERVER-DB.md) prescribes. BACKLOG #1008, ASVS 13.2.2.
+- **What you lose:** the store credential can reach data and administrative operations the engine
+  never uses. A `sysadmin` / `db_owner` login can read and alter every database on the instance; a
+  Postgres `SUPERUSER`, database owner, or member of `pg_read_all_data` / `pg_execute_server_program`
+  can do the equivalent. Any code path that reaches the store — an injection, a compromised process,
+  a mistaken statement — inherits that reach, so the blast radius of every other store defect widens.
+- **Why the engine cannot simply refuse:** it does not own the grant. Refusing by default would block a
+  legitimate deployment mid-setup on a posture only a DBA can change, so the shipped arm **warns**.
+- **When acceptable:** during bring-up, while a DBA reduces the grant. Not as a steady state.
+- **It is never silent:** a WARN at every start naming each excess grant; a `store_privilege_preflight`
+  audit row; a `store_principal_over_granted` entry here and in `GET /security/posture`, whose
+  `store_privilege` field carries the full observation.
+- **How to refuse:** set `[store].require_least_privilege = true`
+  ([`CONFIGURATION.md`](CONFIGURATION.md)). The refuse/warn split is `[security].enforcement`.
+- **`require_managed_identity` does NOT cover this.** It constrains the credential's *kind* — a
+  `sysadmin` gMSA satisfies it clean. The two are orthogonal and a site needs both.
+- **Before concluding it has misfired**, read [`DEPLOY-SERVER-DB.md` §1.3](DEPLOY-SERVER-DB.md): two
+  entries surprise sites that are trying to do the right thing. A SQL Server **user-defined** database
+  role is named even when it wraps exactly the three prescribed ones (the probe reads membership, not
+  a role's contents), and a PostgreSQL role **attribute** is named when it sits on any role the
+  principal may assume rather than on the principal itself (`CREATEROLE via role site_ops`) — reachable
+  by `SET ROLE`, so held in practice. Both are real deviations from the prescribed grant, not noise.
+
+### `store_principal_privileges_unobserved` — the privilege posture could not be read
+
+> The complement of the entry above, and it is reported **separately** on purpose: an over-grant and an
+> un-run probe demand different operator actions, and merging them would let "nobody looked" render as
+> a finding about what was seen.
+- **What you lose:** nothing is asserted about the store principal, in either direction. The
+  least-privilege grant both runbooks prescribe is **unverified** on this instance, so an over-granted
+  credential would not be detected here. This is the *absence* of a clean result, not one.
+- **How it happens:** the principal is denied the privilege query, the driver errors, or the store
+  handle implements no probe.
+- **On SQLite this entry never fires.** A local file has no server principal, so the probe reports
+  `not_applicable` — a third, distinct status — and reports nothing here. Treating SQLite as
+  "unobserved" would put a permanent, unactionable entry on every single-node install, and a
+  permanently-true warning is read as noise.
+- **How to refuse:** the same `[store].require_least_privilege = true` refuses on this condition too.
+
 ---
 
 ## Standards mapping (ASVS v5.0 · NIST SP 800-53r5 · HIPAA §164.312)
@@ -528,6 +571,7 @@ carried from that drive-to-pass, not re-derived here.**
 | `cleartext_accepted` (per-connection declared cleartext hop) | V12 Secure Communication | **SC-8** Transmission Confidentiality and Integrity · **SC-8(1)** Cryptographic Protection | §164.312(e)(1) Transmission Security · §164.312(e)(2)(ii) Encryption |
 | `tls_allow_expired` (per-connection expiry-only relaxation) | V12 Secure Communication | **SC-8(1)** Cryptographic Protection · **SC-12** Cryptographic Key Establishment and Management | §164.312(e)(1) Transmission Security · §164.312(e)(2)(ii) Encryption |
 | generic-ODBC `DATABASE` TLS unenforced (per-connection, driver-owned) | V12 Secure Communication | **SC-8** Transmission Confidentiality and Integrity · **SC-8(1)** Cryptographic Protection | §164.312(e)(1) Transmission Security · §164.312(e)(2)(ii) Encryption |
+| `store_principal_over_granted` / `store_principal_privileges_unobserved` (observed store-principal privilege) | V13 Configuration (backend component accounts, 13.2.2) | **AC-6(5)** Privileged Accounts · **AC-6(9)** Log Use of Privileged Functions · **CM-7(5)** Authorized Software / least functionality | §164.312(a)(1) Access Control · §164.308(a)(4) Information Access Management |
 
 > The synthetic-vs-PHI relaxation (a synthetic instance keeps the PHI-only gates relaxed) is **risk-based
 > tailoring** keyed on `handles_real_patient_data`: an instance carrying no ePHI is out of scope for the

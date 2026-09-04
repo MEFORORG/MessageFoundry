@@ -7,6 +7,45 @@ All notable changes to MessageFoundry are documented here. The format follows
 ## [Unreleased]
 
 ### Added
+- **A startup preflight that reads the store principal's *effective* privileges, so the least-privilege
+  grant the runbooks prescribe stops being a claim the engine cannot check.**
+  [`DEPLOY-SERVER-DB.md`](docs/DEPLOY-SERVER-DB.md) told operators exactly which grant the engine's
+  database login needs, and the engine had no way to see what it had actually been given: no
+  fixed-server-role probe and no database-role probe existed anywhere, and
+  `[store].require_managed_identity` constrains the credential's *kind* rather than its privilege — a
+  `sysadmin` gMSA satisfies it clean. On a first deployment an over-granted store principal would
+  therefore have gone unobserved. `serve` now reads fixed **server**-role and **database**-role
+  membership plus `CONTROL SERVER` / database `CONTROL` on SQL Server, and role attributes
+  (`SUPERUSER`, `CREATEROLE`, `CREATEDB`, `REPLICATION`, `BYPASSRLS`), assumable predefined roles and
+  database ownership on PostgreSQL — before any listener binds. The PostgreSQL attributes are read
+  across **every role the principal may assume**, not only its own row: attributes are never
+  inherited, but a member may `SET ROLE` to the holder and exercise them, so a wrapper role carrying
+  `CREATEROLE` is named (`CREATEROLE via role site_ops`) instead of reading clean.
+  **It observes and warns; it does not refuse by default** — refusing on an over-grant could block a
+  legitimate deployment mid-setup, and the engine does not own the grant. Every start logs what it saw,
+  writes a `store_privilege_preflight` audit row, and names each excess grant in
+  `security_loosenings()` and `GET /security/posture`. Set `[store].require_least_privilege = true` to
+  turn the warning into a refusal (refuse/warn splits on `[security].enforcement`, exactly like
+  `require_managed_identity`).
+  **It does not fail open, and that is the part to know before reading its output.** A probe that
+  cannot run — permission denied, a driver error, a store handle with no probe — reports
+  `unobservable`, which is a *different* result from "observed, and it is fine" in the log line, in the
+  audit row and in the posture response, and which a declared `require_least_privilege` also refuses.
+  SQLite reports `not_applicable` and says why: a local file has no server principal, and the control
+  there is the filesystem ACL. The PostgreSQL least-privilege grant is now documented
+  ([`DEPLOY-SERVER-DB.md`](docs/DEPLOY-SERVER-DB.md) §1.2), which it previously was not.
+  ([BACKLOG #1008](docs/BACKLOG.md))
+
+### Changed
+- **Web console engine UI seam `93ba1f10b9dccfc8` -> `b93f38d097f97a45`.** `SecurityPosture` gained the
+  additive `store_privilege` object above, and `StorePrivilegeView` joins the discovered surface.
+  Additive with a default, so an older console ignores it; the seam still moves because the golden seam
+  contract introspects that model's field set.
+- **`DEPLOY-SERVER-DB.md` §1.2 posture B now states its prerequisite.** "A DBA pre-creates the objects"
+  is not sufficient on its own: the engine skips its DDL batch only when the `schema_meta` marker
+  records the current batch, and on PostgreSQL `CREATE TABLE IF NOT EXISTS` against an existing table
+  is still refused for a role holding only `USAGE` (the schema ACL is checked before the existence
+  skip, measured on 16.14). Bootstrap once with a DDL-capable principal, then hand over.
 - **`messagefoundry audit-anchor`, and `audit-verify --expected-anchor` / `--expected-anchor-file` to
   check one back.** The audit hash chain links each row to its predecessor, so deleting the *newest*
   rows leaves a shorter chain that still walks cleanly — `audit-verify` on its own reports OK after a

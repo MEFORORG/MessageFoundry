@@ -7,7 +7,7 @@
 # by hand (BACKLOG #1220) - so a newly rendered DTO is covered with nobody editing a list.
 
 ## ENGINE_UI_SEAM
-93ba1f10b9dccfc8
+b93f38d097f97a45
 
 ## dataclass messagefoundry.api._ui_seam.UiDeps
 engine_seam
@@ -214,10 +214,11 @@ messagefoundry.api.models.ReloadResult: dry_run, handlers, inbound, outbound, ro
 messagefoundry.api.models.SearchPresetCreateRequest: criteria, name
 messagefoundry.api.models.SearchPresetCriteria: channel_id, content, control_id, field_path, field_value, limit, message_type, status, target
 messagefoundry.api.models.SecurityLoosening: risk, switch
-messagefoundry.api.models.SecurityPosture: allow_unencrypted_phi, backend, client_address_monoculture, client_denied_last, client_network_denials, data_class, encryption_enabled, enforcement, environment, fips_mode, kex_groups, key_id, key_source, loosenings, loosenings_scope, memory_encryption_note, memory_encryption_operator_declared, memory_encryption_readout_contradicts_declaration, memory_encryption_readout_source, memory_encryption_self_reported_active, memory_encryption_self_reported_capability, memory_encryption_self_reported_mechanism, openssl_version, plaintext_columns, production, require_encryption, security, synthetic_relaxation
+messagefoundry.api.models.SecurityPosture: allow_unencrypted_phi, backend, client_address_monoculture, client_denied_last, client_network_denials, data_class, encryption_enabled, enforcement, environment, fips_mode, kex_groups, key_id, key_source, loosenings, loosenings_scope, memory_encryption_note, memory_encryption_operator_declared, memory_encryption_readout_contradicts_declaration, memory_encryption_readout_source, memory_encryption_self_reported_active, memory_encryption_self_reported_capability, memory_encryption_self_reported_mechanism, openssl_version, plaintext_columns, production, require_encryption, security, store_privilege, synthetic_relaxation
 messagefoundry.api.models.ServiceStatusInfo: enabled, service_name, state
 messagefoundry.api.models.StatsResetRequest: all, targets
 messagefoundry.api.models.StatsResetTarget: channel_id, destination, role
+messagefoundry.api.models.StorePrivilegeView: detail, excess, status
 messagefoundry.api.models.SystemStatus: claim_proc, db, engine, kpis, logs, pool, update
 messagefoundry.api.models.UpdateInfo: current_version, pinned_version, update_available
 messagefoundry.api.models.UploadResendRequest: index, to

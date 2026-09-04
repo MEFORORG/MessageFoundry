@@ -66,6 +66,7 @@ from messagefoundry.config.models import RetryPolicy
 from messagefoundry.config.settings import (
     INSECURE_TLS_ESCAPE_ENV,
     StoreBackend,
+    StorePrivilegeStatus,
     StoreSettings,
     weakened_tls_escape_permitted,
 )
@@ -110,6 +111,11 @@ from messagefoundry.store.metadata import (
     merge_user_metadata,
 )
 from messagefoundry.store.pool_metrics import AcquireWaitHistogram, PoolStatus
+from messagefoundry.store.privilege import (
+    PostgresRoleFacts,
+    StorePrivilegeReport,
+    postgres_excess,
+)
 from messagefoundry.store.store import (
     MESSAGE_EVENT_KINDS,
     NOT_DEPLOYED_EVENT,
@@ -1235,6 +1241,75 @@ class PostgresStore:
         # (ADR 0066 §3.4) is non-blocking / never lock-skips with no toggle to verify — unlike SQL
         # Server's optional READ_COMMITTED_SNAPSHOT (ADR 0066 §3.3).
         return None
+
+    async def probe_principal_privileges(self) -> StorePrivilegeReport:
+        """Read this role's EFFECTIVE privileges (#1008, ASVS 13.2.2) and report them against the grant
+        ``docs/DEPLOY-SERVER-DB.md`` §1.2 prescribes (a plain ``LOGIN`` role with **no** attributes,
+        ``CONNECT`` on the database and ownership of its own schema — nothing wider).
+
+        Postgres has no fixed-server-role / fixed-database-role split to mirror SQL Server's. The
+        equivalents are role ATTRIBUTES (``SUPERUSER`` and friends), membership in the predefined
+        ``pg_*`` roles, and ownership, so all three are read.
+
+        **Attributes are read per assumable role, not only for the principal itself.** ``pg_has_role(…,
+        'MEMBER')`` is what the principal can exercise (by inheritance or ``SET ROLE``), so a
+        user-defined wrapper role that is itself ``SUPERUSER`` is caught by what it GRANTS rather than
+        by whether its name is on a list — a name denylist cannot see that. ``pg_roles`` is
+        world-readable, so unlike SQL Server's catalogs this read needs no special permission."""
+        rows = await self._fetchall(
+            "SELECT r.rolname, (r.rolname = current_user) AS is_self, r.rolsuper,"
+            " r.rolcreaterole, r.rolcreatedb, r.rolreplication, r.rolbypassrls"
+            " FROM pg_catalog.pg_roles r"
+            " WHERE pg_catalog.pg_has_role(current_user, r.oid, 'MEMBER')"
+            " ORDER BY r.rolname"
+        )
+        scalar = await self._fetchone(
+            "SELECT current_user AS principal, current_catalog AS db_name,"
+            " pg_catalog.pg_has_role(current_user, d.datdba, 'MEMBER') AS owns_database,"
+            " pg_catalog.has_database_privilege(current_user, d.oid, 'CREATE') AS create_on_database"
+            " FROM pg_catalog.pg_database d WHERE d.datname = current_catalog"
+        )
+        if scalar is None:
+            return StorePrivilegeReport(
+                backend=self.backend,
+                status=StorePrivilegeStatus.UNOBSERVABLE,
+                detail="the privilege query returned no row for current_catalog",
+            )
+        facts = tuple(
+            PostgresRoleFacts(
+                name=str(r["rolname"]),
+                is_self=bool(r["is_self"]),
+                superuser=bool(r["rolsuper"]),
+                createrole=bool(r["rolcreaterole"]),
+                createdb=bool(r["rolcreatedb"]),
+                replication=bool(r["rolreplication"]),
+                bypassrls=bool(r["rolbypassrls"]),
+            )
+            for r in rows
+        )
+        database = str(scalar["db_name"] or self._settings.database or "")
+        return StorePrivilegeReport(
+            backend=self.backend,
+            status=StorePrivilegeStatus.OBSERVED,
+            principal=str(scalar["principal"] or ""),
+            database=database,
+            # Postgres has no server-role tier; its server-level equivalents are role ATTRIBUTES, which
+            # surface in `excess` rather than as role names. Left empty rather than faked with a
+            # SQL-Server-shaped value that would not mean the same thing.
+            server_roles=(),
+            database_roles=tuple(f.name for f in facts if not f.is_self),
+            excess=postgres_excess(
+                roles=facts,
+                owns_database=bool(scalar["owns_database"]),
+                create_on_database=bool(scalar["create_on_database"]),
+                database=database,
+            ),
+            detail=(
+                "roles are every role this principal may assume (pg_has_role MEMBER, so inherited and "
+                "SET ROLE alike); role ATTRIBUTES (SUPERUSER/CREATEROLE/CREATEDB/REPLICATION/BYPASSRLS) "
+                "are Postgres's server-level equivalent and are reported as excess, not as role names"
+            ),
+        )
 
     # --- PHI-at-rest cipher seam for nullable text columns (WP-5) -------------
 

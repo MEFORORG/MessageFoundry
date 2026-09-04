@@ -69,7 +69,7 @@ from messagefoundry.config.models import RetryPolicy
 # may not import `messagefoundry.store` — can rebuild the SAME class the engine publishes. Re-exported
 # here so every existing `from messagefoundry.store.store import CapturedResponse` keeps working.
 from messagefoundry.config.response import CapturedResponse as CapturedResponse  # re-export
-from messagefoundry.config.settings import StoreBackend
+from messagefoundry.config.settings import StoreBackend, StorePrivilegeStatus
 from messagefoundry.parsing.binary import strip_documents as _strip_documents
 from messagefoundry.redaction import safe_text
 from messagefoundry.store.audit_tee import emit_audit_tee
@@ -95,6 +95,7 @@ from messagefoundry.store.metadata import (
     merge_user_metadata,
 )
 from messagefoundry.store.pool_metrics import PoolStatus
+from messagefoundry.store.privilege import StorePrivilegeReport
 
 log = logging.getLogger(__name__)
 
@@ -4667,6 +4668,25 @@ class MessageStore:
         # pooled claim's non-blocking / no-skip guarantees hold without any snapshot-isolation setting —
         # there is nothing to verify (ADR 0066 §3.5).
         return None
+
+    async def probe_principal_privileges(self) -> StorePrivilegeReport:
+        """NOT_APPLICABLE, and it says what it did instead of pretending it ran (#1008, ASVS 13.2.2).
+
+        SQLite has no login, no fixed-server-role tier and no database-role tier: this process opens a
+        file. Returning ``OBSERVED`` with an empty excess list would be a clean bill of health for a
+        check that never happened, which is the one thing this preflight must never emit — so the
+        status is its own value, and the detail names the control that DOES govern access here."""
+        return StorePrivilegeReport(
+            backend=self.backend,
+            status=StorePrivilegeStatus.NOT_APPLICABLE,
+            database=self.path,
+            detail=(
+                "the SQLite store is a local file this process opens directly — there is no server "
+                "principal, no fixed-server-role tier and no database-role tier to read. Access to the "
+                "store is governed by the filesystem ACL on the database file and its -wal/-shm "
+                "sidecars, which is an OS-level control the engine does not probe"
+            ),
+        )
 
     async def claim_next_fifo(
         self,
