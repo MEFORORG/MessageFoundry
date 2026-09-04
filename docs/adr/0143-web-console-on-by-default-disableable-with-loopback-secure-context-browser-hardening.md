@@ -173,6 +173,15 @@ Posture-A ASVS re-score is owner-gated and handled separately.
 - [x] Docs (`CONFIGURATION.md`, `SECURITY.md`, `PHI.md`, `OFF-LOOPBACK-DEPLOYMENT.md`) + `ide/src/securityEditor.ts` flip "off by default" → on by default.
 - [ ] Posture-A ASVS re-score (3.3.1/3.3.3 stay Partial on loopback; auto-TLS deferred) — **owner-gated, separate**.
 
+> **Note added 2026-09-04 (BACKLOG #1445). The checklist above is left as written.** Its
+> `app.state.loopback` row says the attribute was "curated into the webconsole seam snapshot", and
+> that was true on 2026-07-21. BACKLOG #1220 has since retired curation: `scripts/seam_discovery.py`
+> derives the surface, and `ENGINE_UI_SEAM` is a digest nobody picks, so the row's "(no
+> `ENGINE_UI_SEAM` bump)" names a decision that no longer exists either. Neither this ADR's decision
+> nor its analysis is affected. The live procedure is in
+> [`docs/WEBCONSOLE-PACKAGE.md`](../WEBCONSOLE-PACKAGE.md); this ADR is append-only history and is
+> dated rather than edited (`docs/adr/README.md`).
+
 ## Cross-reference (2026-08-04) — the in-place `serve_ui = False` flips feed no exposure predicate (BACKLOG #326)
 
 Both degrade arms decided here — the package-absent soft-degrade and the exposed-bind auto-degrade —

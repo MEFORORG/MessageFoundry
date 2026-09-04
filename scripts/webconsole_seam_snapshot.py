@@ -10,7 +10,7 @@ was renamed) would break the console at RUNTIME within a supported seam -- mypy 
 ``deps = UiDeps(...)`` site catches builder-signature drift, but NOT a Pydantic DTO field rename
 (that breaks render, not import). The engine test ``tests/test_webconsole_seam_snapshot.py``
 regenerates this snapshot and diffs it against the golden ``tests/golden/webconsole_seam.snapshot``,
-failing CI on any unbumped incompatible change.
+failing CI on an incompatible change the seam did not follow.
 
 **The surface is DISCOVERED, not curated** (BACKLOG #1220). It used to be five hand-maintained
 tuples, and three of them had drifted: 25 rendered DTOs were unlisted, ``api.security`` was missing
