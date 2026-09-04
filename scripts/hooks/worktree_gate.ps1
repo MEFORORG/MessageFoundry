@@ -67,7 +67,7 @@ param(
 # the drift, but a stamp that disagrees with the verdict beside it is the exact ambiguity this machinery
 # exists to remove. -Status now prints the SHA prefix on both lines, so agreement is visible rather than
 # asserted, and this label can never again be the only thing a reader compares.
-$GateVersion = "2026.08.13.1"
+$GateVersion = "2026.09.03.1"
 
 # Fail OPEN: any unhandled error must let the tool call through, never block it.
 $ErrorActionPreference = "SilentlyContinue"
@@ -1395,21 +1395,65 @@ function Get-RootCommonDirCmp($Root) {
 }
 
 # ---------------------------------------------------------------------------------------------------
-# Rule 3b -- hijacking a LINKED WORKTREE by switching it onto an ALREADY-EXISTING branch. Rule 3 below
-# protects only the shared PRIMARY; this protects every OTHER governed worktree from the one move that
+# Rule 3b -- MOVING THE HEAD of a LINKED WORKTREE that belongs to some other session. Rule 3 below
+# protects only the shared PRIMARY; this protects every OTHER governed worktree from the move that
 # actually happened here: a session with no worktree of its own ran `git checkout <a-branch>` inside
 # somebody else's worktree, yanking that session's files onto a different branch mid-task. git permits
 # it because its native guard only blocks a branch ALREADY checked out somewhere -- a "free" branch can
 # be grabbed by any worktree.
 #
-# Deliberately narrow: only a switch onto an EXISTING LOCAL BRANCH is denied. Creating a new branch
-# (-b/-c), restoring files (`--`/pathspec), and reset/rebase/merge of the worktree's OWN branch stay
-# allowed -- a worktree owns its own history; it just may not be pulled onto another in-flight branch.
-# The gate cannot tell a worktree's rightful session from a squatter (both share the cwd), so it blocks
-# the move for both; the rightful owner's escape hatch is a PLAIN terminal (never gated) or a fresh
-# worktree for the other branch. Returns normally to ALLOW; calls Write-Deny (which exits) to block.
-function Test-WorktreeHijack([string]$Verb, [string]$Cmd, [string]$WtRaw) {
-    if ($Verb -notin @("checkout", "switch")) { return }
+# TWO CLASSES OF VERB, AND THEY ARE NOT INTERCHANGEABLE (BACKLOG #1359). This rule used to take its
+# hand-off by verb and knew only two, so eight of rule 3's twelve that DO move a HEAD were never
+# evaluated against a linked worktree at all: `git -C <somebody else's worktree> reset --hard main`
+# was ALLOWED, and so were the `rebase` and fast-forward `merge` spellings of the same move.
+#
+#   CLASS A, THE BRANCH SWITCH ($hijackSwitchVerbs). Denied wherever the target is a governed linked
+#   worktree, INCLUDING the session's own, because the gate cannot tell a worktree's rightful session
+#   from a squatter (both stand in the same cwd) and a switch onto another in-flight branch is nearly
+#   never what the owner wanted. Narrowed by the DESTINATION instead: only an existing local branch,
+#   only one that is not already HEAD, and only one git would not have refused on its own.
+#
+#   CLASS B, THE HEAD MOVE AIMED FROM OUTSIDE ($hijackHeadMoveVerbs). Denied ONLY when the target tree
+#   is not the tree this session is standing in. That asymmetry is the entire reason the classes are
+#   separate: `git rebase main`, `git merge main` and `git reset --hard main` in your OWN worktree are
+#   the most ordinary things a session does, and BACKLOG #308 already recorded what denying that exact
+#   shape costs -- a block that depended on how the command was SPELLED rather than on what it touched.
+#   No destination analysis here: the harm is aiming a HEAD-moving verb at another session's checkout,
+#   and it is identical whether the destination is a branch, a tag, a raw SHA or absent.
+#
+# THE PER-VERB RULING over rule 3's twelve, one line each. The question asked of every verb: does it
+# move the TARGET worktree's HEAD -- either which ref HEAD names, or which commit that ref names?
+#   checkout     KEPT      class A. Repoints HEAD at another branch. The origin case.
+#   switch       KEPT      class A. The same move, newer spelling.
+#   reset        ADDED     class B. `--hard <ref>` repoints that worktree's branch and rewrites its files.
+#   rebase       ADDED     class B. Rewrites that worktree's branch onto a new base; every SHA changes.
+#   merge        ADDED     class B. A fast-forward moves the branch ref straight onto another branch.
+#   cherry-pick  ADDED     class B. Commits onto that worktree's branch and edits its files.
+#   revert       ADDED     class B. The same shape as cherry-pick: a new commit on that branch.
+#   am           ADDED     class B. Applies a mailbox as commits, advancing that branch.
+#   restore      EXCLUDED  Never moves HEAD. It is the pathspec case class A's `--` bail already allows.
+#   stash        EXCLUDED  Never moves HEAD. It moves UNCOMMITTED work, which this rule never governed.
+#   clean        EXCLUDED  Never moves HEAD. Deletes untracked files only.
+#   apply        EXCLUDED  Never moves HEAD. Writes the working tree and index from a patch.
+#
+# THE FOUR EXCLUSIONS ARE NOT COVERED ANYWHERE ELSE, AND SAYING SO IS THE POINT. Rule 3 catches all
+# twelve only at the PRIMARY, 3c governs `config`, 3d governs `worktree remove|move`. So `git -C
+# <somebody else's worktree> clean -fdx` stays allowed, exactly as it was before this change. That is
+# a stated residual on #1359 -- not coverage. A rule implying it guarded another session's uncommitted
+# work would be a compensating control resting on a false premise.
+#
+# The rightful owner's escape hatch, for either class, is a PLAIN terminal (never gated) or a fresh
+# worktree. Returns normally to ALLOW; calls Write-Deny (which exits) to block.
+#
+# KEEP EACH ASSIGNMENT BELOW ON ONE LINE. tests/test_worktree_gate.py rebuilds a PRE-FIX gate by
+# rewriting the $hijackHeadMoveVerbs line to an empty array, which is how the fail-open direction of
+# this change is MEASURED (BACKLOG #1229) rather than asserted.
+$hijackSwitchVerbs = @("checkout", "switch")
+$hijackHeadMoveVerbs = @("reset", "rebase", "merge", "cherry-pick", "revert", "am")
+function Test-WorktreeHijack([string]$Verb, [string]$Cmd, [string]$WtRaw, [string]$CwdRaw) {
+    $isSwitch = $hijackSwitchVerbs -contains $Verb
+    $isHeadMove = $hijackHeadMoveVerbs -contains $Verb
+    if (-not ($isSwitch -or $isHeadMove)) { return }
 
     # $WtRaw is resolved ONCE by rule 3 (Get-GitTargetCandidatesRaw) and handed down, so the two rules
     # cannot disagree about which tree a command acts on -- they used to have separate parsers, and a real
@@ -1419,26 +1463,32 @@ function Test-WorktreeHijack([string]$Verb, [string]$Cmd, [string]$WtRaw) {
     if (-not $WtRaw) { return }
     $wtRaw = $WtRaw
 
-    # Everything AFTER the first verb, up to the next command separator (so `git checkout x && ...`
-    # does not drag the next command's tokens in). Parsing args here -- not the whole command -- keeps
-    # git's pre-verb `-C`/`-c` globals from being read as checkout's `-b` / switch's `-c`.
-    $after = ($Cmd -replace ('(?s)^.*?\b' + [regex]::Escape($Verb) + '\b'), '')
-    $after = ($after -split '(?:&&|\|\||;|\|)', 2)[0]
-
-    # Not a branch switch onto an existing branch? Leave it alone.
-    #   `--`                       -> pathspec / file restore (`git checkout -- f`, `git checkout r -- f`)
-    #   -b/-B (checkout) / -c/-C (switch) AFTER the verb -> creating a branch, not moving onto one
-    if ($after -cmatch '(^|\s)--(\s|$)') { return }
-    if ($after -cmatch '(^|\s)-[bBcC](?=\s|$)') { return }
-
-    # The destination ref = first positional (non-flag) token after the verb.
+    # CLASS A ONLY, and the guard is the point: every bail below reads a DESTINATION REF, which is what
+    # narrows a branch switch. Class B has no destination to read -- `git reset --hard` with no argument
+    # and `git rebase --abort` both move the target worktree's HEAD -- so running these bails for it
+    # would allow exactly the shapes it exists to catch.
     $dest = $null
-    foreach ($tok in @($after -split '\s+' | Where-Object { $_ })) {
-        if ($tok.StartsWith('-')) { continue }
-        $dest = $tok.Trim('"', "'")
-        break
+    if ($isSwitch) {
+        # Everything AFTER the first verb, up to the next command separator (so `git checkout x && ...`
+        # does not drag the next command's tokens in). Parsing args here -- not the whole command -- keeps
+        # git's pre-verb `-C`/`-c` globals from being read as checkout's `-b` / switch's `-c`.
+        $after = ($Cmd -replace ('(?s)^.*?\b' + [regex]::Escape($Verb) + '\b'), '')
+        $after = ($after -split '(?:&&|\|\||;|\|)', 2)[0]
+
+        # Not a branch switch onto an existing branch? Leave it alone.
+        #   `--`                       -> pathspec / file restore (`git checkout -- f`, `git checkout r -- f`)
+        #   -b/-B (checkout) / -c/-C (switch) AFTER the verb -> creating a branch, not moving onto one
+        if ($after -cmatch '(^|\s)--(\s|$)') { return }
+        if ($after -cmatch '(^|\s)-[bBcC](?=\s|$)') { return }
+
+        # The destination ref = first positional (non-flag) token after the verb.
+        foreach ($tok in @($after -split '\s+' | Where-Object { $_ })) {
+            if ($tok.StartsWith('-')) { continue }
+            $dest = $tok.Trim('"', "'")
+            break
+        }
+        if (-not $dest) { return }
     }
-    if (-not $dest) { return }
 
     # Classify $wtRaw against git itself (robust for BOTH nested .claude/worktrees and sibling
     # worktrees): find the MAIN worktree of whatever repo it belongs to; act only if that main worktree
@@ -1455,6 +1505,63 @@ function Test-WorktreeHijack([string]$Verb, [string]$Cmd, [string]$WtRaw) {
     $selfTopRaw = "$(& git -C $wtRaw rev-parse --show-toplevel 2>$null)".Trim()
     $selfTop = Get-ComparablePath $selfTopRaw
     if (-not $selfTop -or $selfTop -eq $mainWt) { return }        # $wtRaw IS the primary -- Rule 3 owns it
+
+    if ($isHeadMove) {
+        # CLASS B. The target is a governed LINKED worktree; the only remaining question is whether it is
+        # the tree THIS SESSION is standing in. If it is, this is a session doing its own ordinary work
+        # and must be allowed -- see the class note above for why that is not a judgement call.
+        #
+        # RESOLVED THROUGH GIT, NOT BY COMPARING THE TWO PATH STRINGS. A session's cwd is routinely a
+        # SUBDIRECTORY of its worktree (`<wt>/scripts`), and a string comparison calls that a different
+        # tree -- which would deny every session that happened to have stepped into a subdirectory. Both
+        # sides therefore go through `rev-parse --show-toplevel` and are compared as toplevels.
+        #
+        # RAW path into `git -C`, never the Get-ComparablePath form: this file warns three times that a
+        # lowercased path passes on Windows and misses the real directory on a case-sensitive filesystem.
+        #
+        # FAILS OPEN, and the residual is stated rather than implied: if the session's own toplevel does
+        # not resolve -- no cwd in the payload, a cwd outside any repository, any git failure -- this
+        # returns and allows. Treating an unresolved cwd as "therefore not the owner" would deny on a
+        # transient git failure, which is the BACKLOG #308 false positive arriving through a new door.
+        # What it leaves open is a session standing outside every repository reaching into a worktree
+        # with a class B verb; that is narrower than the hole this rule closes, and it is not new.
+        if (-not $CwdRaw) { return }
+        $ownTopRaw = "$(& git -C $CwdRaw rev-parse --show-toplevel 2>$null)".Trim()
+        if ($LASTEXITCODE -ne 0 -or -not $ownTopRaw) { return }
+        if ((Get-ComparablePath $ownTopRaw) -eq $selfTop) { return }   # the session's OWN worktree
+
+        $head = "$(& git -C $wtRaw rev-parse --abbrev-ref HEAD 2>$null)".Trim()
+        # EVERY interpolation goes through one of the two helpers, chosen ONLY by whether the value lands
+        # in PROSE or in a COMMAND (BACKLOG #1040/#1076) -- the same discipline the class A message keeps,
+        # and for the same reason: the branch name below is ATTACKER-CHOSEN from a public fork.
+        #
+        # NO `new.ps1` LINE HERE, unlike class A, and that is deliberate. Class A knows a real destination
+        # branch to hand `-Branch`; class B does not, and the only ref it holds is the branch the VICTIM
+        # worktree has checked out -- for which `new.ps1` would die with "already checked out at ...".
+        # That is the unrunnable-remediation defect of #1032/#1035, so the bullet is omitted rather than
+        # filled with a placeholder the reader would have to guess at.
+        $selfTopQ = Get-SafeForCommand $selfTopRaw
+        $verbMsg = Get-SafeForMessage $Verb
+        $headMsg = Get-SafeForMessage $head
+        Write-Deny -Rule "3b" -Detail "git $Verb -> $selfTopRaw" -Reason @"
+BLOCKED: 'git $verbMsg' would move the HEAD of a LINKED WORKTREE ($(Get-SafeForMessage $selfTopRaw)) that this session is not standing in.
+
+That worktree belongs to another session, which is building on '$headMsg' right now. 'git $verbMsg' repoints
+what that session's branch names and rewrites every file under it mid-task -- silently. Nothing in git
+refuses this: its only worktree guard blocks a second CHECKOUT of a live branch, and a HEAD-moving verb
+aimed at a worktree from outside never trips it. It is a worktree of $(Get-SafeForMessage $gov.Display).
+
+What to do instead:
+  * If this is YOUR work, do it in YOUR OWN worktree -- drop the `-C` (or the `cd`) that aims this command
+    at that directory, and run it where you are standing.
+  * To READ that worktree's branch without touching one file of it, use the plumbing:
+        git -C $selfTopQ show $(Get-SafeForCommand $head -Suffix ':<path>')
+        git -C $selfTopQ diff $(Get-SafeForCommand $head -Prefix 'HEAD..')
+  * If you genuinely OWN that worktree and must do this, do it from a PLAIN terminal -- the gate governs
+    agents, not you. Do not route around this with a shell script; that only hides the collision.
+"@
+        return
+    }
 
     # Only an EXISTING local branch, and only if it is not the branch we are already on (a no-op).
     & git -C $wtRaw rev-parse --verify --quiet ("refs/heads/" + $dest) *> $null
@@ -2391,10 +2498,14 @@ $cleanupBullet
     }
     if (-not $root) {
         # Not the shared primary. It may still be a governed LINKED WORKTREE being hijacked onto an
-        # existing branch (rule 3b) -- Write-Deny + exit if so; otherwise this returns and we allow.
+        # existing branch, or having its HEAD moved from outside (rule 3b) -- Write-Deny + exit if so;
+        # otherwise this returns and we allow.
         # Hand down the LINE the verb was found on and the tree already resolved from it, so 3b judges
-        # the same command rule 3 did (including one recursed out of an interpreter argument).
-        Test-WorktreeHijack $verb $verbLine $targetRaw
+        # the same command rule 3 did (including one recursed out of an interpreter argument). The
+        # session cwd goes down too: 3b's class B needs to tell "another session's worktree" from "the
+        # one I am standing in", and reading a script-scope variable inside the function would hide that
+        # dependency from the reader of the call site.
+        Test-WorktreeHijack $verb $verbLine $targetRaw $cwdRaw
         exit 0
     }
 
