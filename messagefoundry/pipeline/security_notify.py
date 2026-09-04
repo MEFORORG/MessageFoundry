@@ -29,6 +29,7 @@ from messagefoundry.auth.notifications import (
     MFA_ENABLED,
     PASSWORD_CHANGED,
     PASSWORD_RESET,
+    RECOVERY_CODE_USED,
     ROLES_CHANGED,
     SecurityEvent,
 )
@@ -50,6 +51,7 @@ _SUBJECTS = {
     ACCOUNT_DISABLED: "Your MessageFoundry account was disabled",
     MFA_ENABLED: "Two-factor authentication was enabled on your MessageFoundry account",
     MFA_DISABLED: "Two-factor authentication was disabled on your MessageFoundry account",
+    RECOVERY_CODE_USED: "A MessageFoundry recovery code was used on your account",
     ADMIN_NEW_IP: "A sensitive action on your MessageFoundry account from a new location",
 }
 
@@ -64,6 +66,10 @@ _DESCRIPTIONS = {
     ACCOUNT_DISABLED: "Your account was disabled by an administrator.",
     MFA_ENABLED: "A two-factor authenticator (TOTP) was enrolled on your account.",
     MFA_DISABLED: "Two-factor authentication was removed from your account.",
+    RECOVERY_CODE_USED: (
+        "One of your single-use recovery codes was accepted as a second factor. That code is now "
+        "spent and cannot be used again."
+    ),
     ADMIN_NEW_IP: (
         "A sensitive administrative action on your account was attempted from a client address that "
         "differs from your session's last verified address. It was required to re-verify before "
@@ -110,6 +116,24 @@ def _build_body(event: SecurityEvent) -> str:
                 "The email address on the account profile was removed. This notice went to the "
                 "account's notification address, which that removal did not change."
             )
+        if event.detail.get("source") == "directory":
+            # BACKLOG #1139. Say WHERE the change came from, because it changes what the reader can
+            # do about it: a directory-driven repoint is not editable in the console, so "contact
+            # your administrator" is the only action, and an unexplained change the holder cannot
+            # find a cause for reads as a compromise.
+            lines.append(
+                "This change came from your organization's directory, not from the MessageFoundry "
+                "console."
+            )
+    if event.event_type == RECOVERY_CODE_USED:
+        remaining = event.detail.get("remaining")
+        if isinstance(remaining, int):
+            lines.append(f"Recovery codes remaining: {remaining}")
+            if remaining == 0:
+                lines.append(
+                    "That was your last recovery code. Enroll a new authenticator to generate more, "
+                    "or you will need an administrator to reset your second factor."
+                )
     if event.client_ip:
         lines.append(f"Source IP: {event.client_ip}")
     lines += [
