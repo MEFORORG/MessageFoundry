@@ -375,19 +375,23 @@ jobs:
           #      resolved at signing time.
           #   2. NO Dependabot ecosystem parses an inline `pip install X==Y` inside a workflow `run:`
           #      block (.github/dependabot.yml registers uv, github-actions, npm). So the pin had no
-          #      updater, no trigger and no owner — its own comment said "re-evaluate once it has aged
-          #      past the window" and nothing would ever have prompted that. It was 19 days overdue when
-          #      this landed. tests/test_ci_venv_pinning.py words the class: "a stale pin rots invisibly
-          #      and a DELETED pin is invisible twice over."
+          #      updater, no trigger and no owner: its own comment said "re-evaluate once it has aged
+          #      past the window" and nothing would ever have prompted that.
+          #      tests/test_ci_venv_pinning.py words the class: "a stale pin rots invisibly and a
+          #      DELETED pin is invisible twice over."
           # Routing it through `uv.lock` fixes both: the transitives are hash-pinned, and the group is
           # under the `uv` ecosystem Dependabot already watches.
           #
-          # ON THE VERSION: the lock resolves sigstore 4.5.0, which the old inline pin deliberately
-          # avoided. That choice was CORRECT when made — dependabot.yml sets a 5-day supply-chain
-          # cooldown and 4.5.0 was then <48h old, so pinning the SIGNING toolchain to a fresher artifact
-          # than the repo's own update policy allows would have inverted that policy at its
-          # highest-privilege point. MEASURED: 4.5.0 published 2026-07-28T07:34:00Z, so the window
-          # closed 2026-08-02. The objection is SPENT, not overridden.
+          # ON THE VERSION: the lock pins sigstore 4.4.0 BY OWNER RULING -- given 2026-08-22, and
+          # re-affirmed 2026-09-03 with the full history in hand. "NOT 4.5.0." The rationale lives
+          # ONCE, at the `release-tools` group in pyproject.toml; BACKLOG #332 carries the record.
+          # The one thing worth repeating HERE, because this is where the thought occurs to a reader
+          # standing at the install: DO NOT RE-DERIVE THE COOLDOWN ARGUMENT. dependabot.yml's 5-day
+          # window closed 2026-08-02 and BOTH rulings postdate it, so "the objection is spent" is not
+          # news to this pin -- it is what the rulings were made in spite of. That argument has been
+          # published and RETRACTED BY ITS OWN AUTHOR once already (PR 531, 2026-08-27), and shipped
+          # anyway two days later in a9354808e before being corrected back. dependabot.yml now
+          # carries a matching `ignore` entry so a bot cannot repeat it.
           python -m pip install --require-hashes -r ci/locks/release-tools.lock
           # Sign the wheel + sdist AND the SBOM + VEX, so an operator can verify the provenance of the
           # bill-of-materials and the exploitability assessment too — not just the code artifacts (ADR 0149).
