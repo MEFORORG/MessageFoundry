@@ -15419,8 +15419,12 @@ construction, and does not reach suite sets chosen inside `ldap3`, `hvac` or ODB
 enumeration half is now done and every first-party site asserts** -- the OIDC identity-provider
 opener, the syslog TLS forwarder (both arms, including `tls_verify=False`), the Postgres store
 (pinned-CA and verification-disabled arms), the SOAP mutual-TLS opener, the alert webhook, and the
-shared REST/FHIR/DICOMweb opener family. **The library half is unchanged and still open:** `ldap3`,
-`hvac` and ODBC Driver 18 choose their own suites and no engine object exists to assert on.
+shared REST/FHIR/DICOMweb opener family. **The library half was unchanged and open WHEN THIS SENTENCE
+WAS WRITTEN, and all three arms have since been ruled on -- read the 2026-09-03 amendment at the foot
+of this row, which supersedes it.** As written it said: `ldap3`, `hvac` and ODBC Driver 18 choose
+their own suites and no engine object exists to assert on. That is now false of `ldap3` (asserted,
+ADR 0180) and imprecise for the other two, which were ruled on with reasons rather than left
+unaddressed.
 **TWO FIRST-PARTY SITES ARE DELIBERATELY NOT ASSERTED, each with its reason in the code**, so a later
 reader does not "fix" them: the TLS floor probe below, and the Postgres `ssl=True` default arm, where
 asyncpg builds the context and asserting a look-alike here would grade an object the connection never
@@ -15457,8 +15461,93 @@ so a decoy call cannot satisfy it. Deleting the call from any one site reds that
 for -- admitting only suites present on every current candidate list, rejecting anything unnamed -- is
 not built. This records a call site gaining an assertion, not the allowlist changing shape.
 
+***THAT PARAGRAPH IS FALSE, AND IT WAS FALSE ON THE DAY IT WAS WRITTEN. Superseded by the 2026-09-03
+amendment below, which measures it.*** Left standing rather than deleted because it is a dated record
+of what a reader believed, and because the same reader's other claim on this row is sound. The
+allowlist landed eight days EARLIER, on 2026-08-22 in `ae72f5828` (PR 519), and this row's own BUILT
+paragraph says so a few paragraphs up. The banner is therefore not held open by the allowlist.
+
 *Recorded by the lander, not the author: the PR carried the code without the row, and a required check
 exists to catch exactly that. The row's status is unchanged; only its record of what has shipped is.*
+
+**AMENDMENT 2026-09-03 (builder) -- ALL THREE LIBRARY ARMS RE-MEASURED. TWO OF THIS ROW'S OWN OPEN
+CLAIMS ARE FALSE AT HEAD, AND THE OTHER TWO ARMS WERE RULED ON BY AN ADR THIS ROW NEVER RECORDED.**
+Measured on `main` at `c2237d78` by RUNNING the shipped code, the method this row set for itself, with
+controls firing both ways on every claim. Nothing here is a re-read of source.
+
+**1. THE ALLOWLIST IS BUILT.** Against `validate_tls_ciphers`:
+
+| input | `tls_ciphers` knob | `proxy_tls_ciphers` | what the row establishes |
+|---|---|---|---|
+| `ECDHE-RSA-AES256-GCM-SHA384` | accepted | accepted | positive control -- not refusing everything |
+| `ECDHE-RSA-AES256-SHA384` | **REFUSED (approved list)** | accepted | **the discriminating row** |
+| `ECDHE-RSA-NULL-SHA` | REFUSED (must ENCRYPT) | REFUSED | no confidentiality |
+| `ADH-AES256-GCM-SHA384` | REFUSED (must AUTHENTICATE) | REFUSED | no peer authentication |
+| `RC4-MD5` | REFUSED (parse) | REFUSED | control: the validator is not accepting everything |
+
+**Row two is the whole question.** `ECDHE-RSA-AES256-SHA384` is forward-secret, encrypting AND
+authenticated -- it satisfies all three property checks and is refused anyway, because it is not
+named. That is a strict positive allowlist and not a pile of properties, which is exactly what this
+row asked for. The same suite is ACCEPTED on `proxy_tls_ciphers`, so the refusal is the allowlist
+specifically and not a fourth property. `tests/test_tls_policy.py` already pins that row
+(`test_validate_tls_ciphers_rejects_an_unlisted_suite_that_passes_every_property`). **Nothing to
+build here; the 2026-08-30 paragraph above is corrected in place.**
+
+**2. THE `ldap3` ARM IS BUILT, and the sentence that said otherwise is corrected above.**
+`assert_ldap3_tls_suites` exists in `config/tls_policy.py`, `auth/ldap.py` calls it from
+`LdapAuthenticator.__init__`, and it refuses both ways under measurement: a sound config passes, a
+`ciphers=` argument it cannot replicate raises, and a fixture reporting every suite non-encrypting
+makes it raise on the good config too. Shipped by ADR 0180.
+
+**3. `hvac` AND ODBC DRIVER 18 WERE RULED ON BY ADR 0180 (accepted 2026-08-28), AND THIS ROW NEVER
+SAID SO.** Both rulings are re-measured here and both hold.
+
+- **ODBC Driver 18 -- OUT, permanently, and the ADR's evidence had a hole this closes.** TLS there is
+  connection-string keywords terminated inside the native driver, so the suite list belongs to the
+  driver and the OS TLS stack, not to the interpreter's OpenSSL. Measured: `pyodbc` 5.3.0 exposes
+  **zero** module-level or `Connection`-level names containing ssl/tls/cipher/cert, and so does
+  `aioodbc`; the control is the `ssl` module, where the same scan finds 75. Neither
+  `store/sqlserver.py` nor `transports/database.py` imports `ssl` or builds an `SSLContext`.
+  **The ADR measured `store/sqlserver.py` alone and generalised to "ODBC Driver 18".** The ODBC
+  *transport* -- the DATABASE destination and the ADR 0010 `db_lookup` hop, which is where message
+  content crosses -- was never named in it. It is measured now.
+- **`hvac` -- NOT BUILT, deliberately, and the ADR names its own trigger.** hvac delegates to
+  requests, which delegates to urllib3, which builds and owns the context per connection, so the
+  engine holds no object -- the same shape as `ldap3`. Unlike `ldap3` the gap cannot be closed by
+  measurement: `urllib3` is absent from the interpreter and **no CI leg installs the `[vault]` extra**
+  (measured across `.github/workflows/`: `dev,harness,fhir,dicom,x12,xml,webauthn` plus
+  `sqlserver`/`postgres`). An assertion there would be a security control no test in this project can
+  execute. Confirmed independently before ADR 0180 was found, on the same reasoning.
+
+**4. WHAT SHIPPED ON THIS ROW: the two scope-outs stop being prose.** ADR 0180 ruled two arms out on
+measurements taken once, written down, and re-checked by nothing. A scope-out is a compensating
+control like any other, so SDS-3.7 binds it: it must not rest on a premise nothing re-checks.
+`tests/test_tls_cipher_assertion_sites.py` gains three tests that re-check them, each with a live
+control and each proved non-vacuous by mutation.
+
+| test | premise it re-checks | mutation that reds it |
+|---|---|---|
+| `test_the_odbc_scope_out_premise_still_holds` | neither ODBC module reaches for an `ssl` context | appended an `ssl.create_default_context()` to `transports/database.py` |
+| (its control) | the scan finds contexts where they exist (`store/postgres.py`) | pointed the control at a module with none |
+| `test_the_sqlserver_hop_asserts_no_suites_and_pins_what_it_can_control` | the DSN path asserts nothing, and pins `Encrypt=yes` / `TrustServerCertificate=no`, which it CAN control | changed the emitted `Encrypt` value |
+| `test_the_hvac_scope_out_premise_still_holds` | `urllib3` absent AND no leg installs `[vault]` | made `urllib3` resolvable; separately added `vault` to a workflow's extras |
+| (its control) | the workflow scan reads real install lines | removed `webauthn` from both workflows that install it |
+
+**These are TRIGGERS, not guards.** A red does not mean the engine got worse. It means the reason an
+arm was left unasserted has stopped being true and the arm is now buildable -- build it and amend
+ADR 0180, never delete the test.
+
+**5. THE RESIDUAL, and it is the only one left.** Install the `[vault]` extra on a CI leg; then
+urllib3's own `urllib3.util.ssl_.create_urllib3_context()` -- the function urllib3 itself calls, not a
+look-alike -- becomes executable by a test, and the assertion belongs in both `_build_client`
+factories (`store/keyprovider_vault.py` and `config/secretprovider_vault.py`, which between them cover
+all three clients, since `store/crypto_transit.py` reuses the first). Named by subject, not by number:
+none is allocated. **The trigger test above is what will report the day that premise changes.**
+
+**PROPOSED CLOSURE, not taken here.** Every claim this row still carries as open is now either built
+(the allowlist, the `ldap3` arm), permanently out with evidence (ODBC Driver 18), or a named residual
+gated on a CI change (`hvac`). A builder must not flip a banner while a residual stands, so the banner
+is left PARTIAL for the owner to rule on with the residual in view.
 
 ## 1315. prose path:line citations carry no token, so nothing can verify them
 
