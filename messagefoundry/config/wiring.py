@@ -1208,6 +1208,14 @@ def Tcp(
     max_connections: int | None = 256,  # cap concurrent clients (connection-flood guard)
     receive_timeout: float | None = 60.0,  # close a client idle this many seconds (slowloris)
     max_frame_bytes: int | None = 16 * 1024 * 1024,  # cap one frame's bytes (OOM guard); both dirs
+    # INBOUND message-RATE pacing (BACKLOG #1114) — the MLLP pacer, ported. Unlike the caps above
+    # these default to OFF, and that is ruled rather than accidental: a rate on a clinical interface
+    # is only safe at a number taken from a real feed profile. Over budget the listener PAUSES
+    # READING so TCP back-pressures the sender: nothing is dropped, refused or reordered, which the
+    # count-and-log invariant requires. One bucket per connection, as on MLLP.
+    max_messages_per_second: float | None = None,  # None/0 = no rate bound (the shipped default)
+    message_burst: float
+    | None = None,  # allowance over the sustained rate; None = one second's worth
     connect_timeout: float = 10.0,  # outbound: TCP connect timeout (seconds)
     timeout_seconds: float = 30.0,  # outbound: send/await-reply timeout
     # Persistent outbound connection (ADR 0067 §9 / BACKLOG #97) — outbound-only; None/0 on a freshness knob disables it:
@@ -1233,6 +1241,14 @@ def Tcp(
     framed reply and treats receiving it as confirmation (the reply is **not** parsed — X12 997/TA1
     acks are a deferred follow-up). Delivery is at-least-once → the receiver **must be idempotent**.
 
+    **Inbound message-rate pacing (BACKLOG #1114).** ``max_messages_per_second`` bounds how fast one
+    accepted connection may feed messages in; ``message_burst`` is how large a burst passes before the
+    sustained rate applies (default: one second's worth). Over budget the listener **pauses reading**
+    before its next read, so TCP back-pressures the sender — **no message is dropped, refused or
+    reordered**. Both ship **off**, which is a deliberate exception to this connector's usual
+    secure-default rule: a guessed rate on a clinical interface throttles real traffic, so the number
+    has to come from your own feed profile.
+
     ``persistent=true`` (ADR 0067 §9 / BACKLOG #97) reuses one lazily-established connection across
     deliveries (default ``false`` = connect-per-send, byte-identical); a stale socket is redialed once
     **before any byte is written** (uncharged), and any post-write failure is charged + retried.
@@ -1250,6 +1266,8 @@ def Tcp(
             "max_connections": max_connections,
             "receive_timeout": receive_timeout,
             "max_frame_bytes": max_frame_bytes,
+            "max_messages_per_second": max_messages_per_second,
+            "message_burst": message_burst,
             "connect_timeout": connect_timeout,
             "timeout_seconds": timeout_seconds,
             "persistent": persistent,
@@ -1274,6 +1292,11 @@ def X12(
     max_interchange_bytes: int | None = 16
     * 1024
     * 1024,  # cap one interchange's bytes (OOM); both dirs
+    # INBOUND interchange-RATE pacing (BACKLOG #1114) — the MLLP pacer, ported; one token per ISA/IEA
+    # interchange, which is this connector's frame. Defaults to OFF for the ruled reason in MLLP().
+    max_messages_per_second: float | None = None,  # None/0 = no rate bound (the shipped default)
+    message_burst: float
+    | None = None,  # allowance over the sustained rate; None = one second's worth
     connect_timeout: float = 10.0,  # outbound: TCP connect timeout (seconds)
     timeout_seconds: float = 30.0,  # outbound: send/await-reply timeout
     # Persistent outbound connection (ADR 0067 §9 / BACKLOG #97) — outbound-only; None/0 on a freshness knob disables it:
@@ -1307,6 +1330,13 @@ def X12(
     allowlist). Delivery is at-least-once → the receiver **must be idempotent** (a crash-re-send of a
     non-idempotent 270 yields a fresh 271 captured at the next ``response_seq``).
 
+    **Inbound interchange-rate pacing (BACKLOG #1114).** ``max_messages_per_second`` bounds how fast
+    one accepted connection may feed **interchanges** in (one token per ``ISA…IEA``);
+    ``message_burst`` is how large a burst passes before the sustained rate applies (default: one
+    second's worth). Over budget the listener **pauses reading** before its next read, so TCP
+    back-pressures the sender — **no interchange is dropped, refused or reordered**. Both ship
+    **off**: a guessed rate throttles real traffic, so the number has to come from your feed profile.
+
     ``persistent=true`` (ADR 0067 §9 / BACKLOG #97) reuses one lazily-established connection across
     deliveries (default ``false`` = connect-per-send, byte-identical); a stale socket is redialed once
     **before any byte is written** (uncharged). A returned TA1/business interchange is a complete
@@ -1321,6 +1351,8 @@ def X12(
             "max_connections": max_connections,
             "receive_timeout": receive_timeout,
             "max_interchange_bytes": max_interchange_bytes,
+            "max_messages_per_second": max_messages_per_second,
+            "message_burst": message_burst,
             "connect_timeout": connect_timeout,
             "timeout_seconds": timeout_seconds,
             "persistent": persistent,
@@ -1345,6 +1377,12 @@ def Http(
     | None = 60.0,  # bound the whole-request read (slow-loris guard), seconds
     max_body_bytes: int | None = 16 * 1024 * 1024,  # cap one request body's bytes (OOM guard)
     max_header_bytes: int | None = 64 * 1024,  # cap the request line + headers (header-flood guard)
+    # Message-RATE pacing (BACKLOG #1114) — the MLLP pacer, ported. Defaults to OFF for the ruled
+    # reason in MLLP(). Scoped to the LISTENER, not the connection: this connector answers one
+    # request per connection, so a per-connection bucket would pace nothing at all.
+    max_messages_per_second: float | None = None,  # None/0 = no rate bound (the shipped default)
+    message_burst: float
+    | None = None,  # allowance over the sustained rate; None = one second's worth
     # --- TLS (WP-13b, ADR 0002 §0 / ADR 0023 D4) — per-connection HTTPS ---
     tls: bool = False,  # turn TLS on (present a server cert; off-loopback without it is refused at start)
     tls_cert_file: str | None = None,  # SERVER cert (required when tls)
@@ -1404,6 +1442,17 @@ def Http(
     — bounds the whole-request read), ``max_body_bytes`` (the frame-cap twin — refused on the declared
     ``Content-Length`` before a byte is buffered), and ``max_header_bytes`` (header flood).
 
+    **Message-rate pacing (BACKLOG #1114).** ``max_messages_per_second`` bounds how fast this listener
+    takes messages in; ``message_burst`` is how large a burst passes before the sustained rate applies
+    (default: one second's worth). Over budget the connector **waits before reading the request**, so
+    the partner is back-pressured and its request is then served in full — nothing is dropped, refused
+    or answered differently, and the wait sits outside ``receive_timeout`` so a paced partner is never
+    handed a ``408`` for a delay the engine imposed. The bucket is **listener-wide, not
+    per-connection**: this connector answers one request per connection, so a per-connection bucket
+    would pace nothing. A ``GET``/``HEAD`` health probe waits behind an outstanding debt but charges
+    nothing, and neither does a refused request — only a committed message spends the budget. Both
+    keys ship **off**, for the same reason as MLLP's: the number has to come from your feed profile.
+
     **TLS (WP-13b).** ``tls=True`` presents ``tls_cert_file``/``tls_key_file`` as the HTTPS server
     identity (``tls_ca_file`` adds opt-in mTLS); ``tls_key_password`` decrypts an encrypted key (supply via
     ``env()``). The runner's exposed-gate refuses a **non-loopback** HTTP listener **without** TLS at start
@@ -1460,6 +1509,8 @@ def Http(
         "receive_timeout": receive_timeout,
         "max_body_bytes": max_body_bytes,
         "max_header_bytes": max_header_bytes,
+        "max_messages_per_second": max_messages_per_second,
+        "message_burst": message_burst,
         "tls": tls,
         "tls_cert_file": tls_cert_file,
         "tls_key_file": tls_key_file,
