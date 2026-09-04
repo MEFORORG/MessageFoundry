@@ -94,8 +94,15 @@ class BreachCorpusUnavailable(RuntimeError):
     "not be a common or breached password" clause stopped being emitted, and nothing logged -- the
     shipped configuration would assert a check that was not happening on a first deployment.
 
-    Blast radius is narrow by construction: only the password *create* and *change* paths screen a
-    password, so this never touches login, never invalidates a session, and never stops message flow.
+    Blast radius on an ESTABLISHED instance is narrow by construction: only the password *create* and
+    *change* paths screen a password, so this never touches login, never invalidates a session, and
+    never stops message flow.
+
+    **A FIRST RUN IS THE EXCEPTION, and it is not narrow.** On an empty store ``AuthService.initialize``
+    mints the bootstrap admin, whose generator screens its own candidate, so this raises out of an
+    unguarded lifespan call and the engine does not start at all. That is fail-closed but arguably
+    disproportionate, because the candidate is a 192-bit random token the breach clause can never match.
+    Tracked separately; do not read the paragraph above as covering a first run.
     ``AuthService`` also loads the corpus eagerly at startup and logs the same defect as an error, so
     an operator learns about it from the log rather than from a user's failed password change.
     """

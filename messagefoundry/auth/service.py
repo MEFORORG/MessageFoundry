@@ -110,8 +110,11 @@ def _error_if_bundled_corpus_unusable(check_breached: bool) -> None:
     underneath it. Nothing screens underneath the BUNDLED list, so its loss is an ERROR: ``check_breached``
     ships ``True``, and a corpus that cannot load means the shipped configuration asserts a check that is
     not running. ``PasswordPolicy.violations`` refuses passwords in that state; this is only the loud
-    half. It deliberately does NOT stop the engine -- HL7 flow does not depend on password screening, and
-    bricking a message engine over an auth data asset would trade a contained failure for an outage.
+    half. THIS FUNCTION deliberately does not stop the engine -- HL7 flow does not depend on password
+    screening, and bricking a message engine over an auth data asset would trade a contained failure for
+    an outage. Read that as scoped to this function and not to the change as a whole: on a FIRST run
+    ``initialize`` mints the bootstrap admin, whose generator screens its own candidate, so the raise
+    from ``violations`` escapes an unguarded lifespan call and startup fails. Tracked separately.
 
     Skipped when the operator has turned screening off: a corpus nobody consults is not a defect.
     """

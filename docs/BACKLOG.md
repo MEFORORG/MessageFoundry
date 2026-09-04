@@ -22030,9 +22030,9 @@ Detection and containment are different jobs, and this row is the containment on
 
 Two halves, deliberately at different levels.
 
-**Contained, in `messagefoundry/auth/policy.py`.** `_common_passwords()` now raises `BreachCorpusUnavailable` when the file cannot be read, or when it holds fewer than `ASVS_6_2_4_MIN_CORPUS_ENTRIES` entries. `PasswordPolicy.violations` therefore refuses a password rather than accepting every password. Only the password *create* and *change* paths screen a password, so this never touches login, never invalidates a session, and never stops message flow.
+**Contained, in `messagefoundry/auth/policy.py`.** `_common_passwords()` now raises `BreachCorpusUnavailable` when the file cannot be read, or when it holds fewer than `ASVS_6_2_4_MIN_CORPUS_ENTRIES` entries. `PasswordPolicy.violations` therefore refuses a password rather than accepting every password. On an ESTABLISHED instance only the password *create* and *change* paths screen a password, so this never touches login, never invalidates a session, and never stops message flow. A **first** run is the exception and is not narrow: see BACKLOG #1447.
 
-**Loud, in `messagefoundry/auth/service.py`.** `_error_if_bundled_corpus_unusable` loads the corpus eagerly in `AuthService.__init__`, beside the existing `_warn_if_corpus_unreadable`, and logs the defect at `ERROR`. That closes gap 3 above: the operator learns at boot instead of at somebody's first password change. It does **not** stop the engine. HL7 flow does not depend on password screening, and bricking a message engine over an auth data asset trades a contained failure for an outage.
+**Loud, in `messagefoundry/auth/service.py`.** `_error_if_bundled_corpus_unusable` loads the corpus eagerly in `AuthService.__init__`, beside the existing `_warn_if_corpus_unreadable`, and logs the defect at `ERROR`. That closes gap 3 above: the operator learns at boot instead of at somebody's first password change. That reporter does **not** stop the engine. HL7 flow does not depend on password screening, and bricking a message engine over an auth data asset trades a contained failure for an outage. **Read that as scoped to the reporter, not to this change as a whole.** On a first run the bootstrap generator screens its own candidate, so the raise from `violations` escapes an unguarded lifespan call and startup fails. BACKLOG #1447 carries that, with the chain measured and the options weighed.
 
 The two halves sit at different levels on purpose. The operator corpus degrades to a `WARNING` because the bundled list still screens underneath it. Nothing screens underneath the bundled list.
 
@@ -22158,3 +22158,48 @@ So `test_the_script_prefers_its_own_repo_over_an_earlier_path_entry` supplies th
 **Verification:** 8 passed in `tests/test_webconsole_seam_snapshot.py`. Mutation check run rather than argued -- with the `sys.path.insert` line deleted, the decoy test reds naming the decoy import, and the by-path digest test **stays green**, which is the luck described above measured rather than predicted. Anchor restored, 8 passed again.
 
 **Adjacent and NOT fixed here, named rather than numbered.** `docs/WEBCONSOLE-PACKAGE.md`'s seam-refresh procedure is stale in three steps left behind by #1220: it says to bump `ENGINE_UI_SEAM` by hand (`1` to `2`) when the value is a derived digest, it says to update curated lists in this script that #1220 retired, and its step 5 prescribes `python scripts/webconsole_seam_snapshot.py > tests/golden/...`, the shell redirect this script's own docstring forbids because PowerShell's `>` writes UTF-16LE with a BOM into a file the test reads as UTF-8. That is doc drift with its own cause and it wants its own item; folding a documentation rewrite into a `sys.path` fix would make both harder to review.
+
+## 1447. an unusable breach corpus blocks minting the first admin account, because the bootstrap generator screens its own random token
+
+> 🔢 **Filed 2026-09-04. The heading understates it, and this line is the finding: on a FIRST run an unusable bundled corpus does not merely block the admin account, it stops the engine starting at all.** `AuthService.initialize` is awaited unguarded in the API lifespan, and on an empty store it mints the bootstrap admin through a generator that screens its own candidate. With BACKLOG #1438's guard in place that screen raises, the exception escapes the lifespan, and startup fails. On any later run `count_users() > 0` short-circuits the whole path and the engine starts normally.
+>
+> **Severity is conditional (sec. 0).** Zero instances run. Written as what a first deployment would meet: an operator whose wheel shipped or acquired a truncated corpus would get a process that refuses to come up, with the cause in the log from #1438's startup reporter but no admin account and no obvious link between the two.
+>
+> **Residual of #1438, which is not yet on `main`** as this is filed. The behaviour described here does not exist until that lands, so this row is filed ahead of its own subject deliberately rather than describing shipped code.
+
+**Cluster:** Auth / password policy (ASVS 6.2.4). **Priority:** P2. **Verdict:** needs an owner ruling, then a small fix.
+
+### The chain, measured
+
+Each link verified at this branch's merge base:
+
+1. [`api/app.py`](../messagefoundry/api/app.py) -- the lifespan awaits `auth.initialize()` with no `try`.
+2. [`auth/service.py`](../messagefoundry/auth/service.py) -- `initialize` calls `_ensure_bootstrap_admin`.
+3. Same file -- `_ensure_bootstrap_admin` returns early when `count_users() > 0`, so **only a first run continues**, then calls `_generate_policy_password`.
+4. Same file -- that generator loops 16 times over `secrets.token_urlsafe`, calling `self._policy.violations(candidate)` on each.
+5. [`auth/policy.py`](../messagefoundry/auth/policy.py) -- `violations` consults `_common_passwords()`, which raises `BreachCorpusUnavailable` when the corpus is unusable.
+
+The raise escapes on **iteration one**, so the generator's defensive `token_urlsafe(length) + "aA1!"` fallback is unreachable in this state. `admin_reset_password` reaches the same generator, so an admin-initiated password reset fails the same way, but that one is a 500 on a running engine rather than a failure to start.
+
+### Why the guard is arguably wrong HERE specifically, and right everywhere else
+
+The candidate is `secrets.token_urlsafe(max(24, min_length))` -- at least **192 bits** of entropy, rendered as roughly 32 URL-safe characters. It is not a human-chosen password and cannot appear in a corpus of human-chosen passwords. **The breach clause is inert on this input by construction.**
+
+So on this one path #1438's guard converts a check that can never fire into a check that always blocks. That is the precise shape of a false positive: the control is refusing an operation it was never able to evaluate in the first place, and the refusal is total.
+
+This does **not** generalise. On every other path `violations` screens an operator-supplied or user-supplied password, where the corpus is the whole point and failing closed is correct. Do not "fix" this by weakening the guard.
+
+### The options, not decided here
+
+| option | what it costs |
+|---|---|
+| screen the generated token with `check_breached=False` | one line and a comment; the screen it drops is provably inert on a 192-bit token. Keeps every other path failing closed. **Recommended.** |
+| catch `BreachCorpusUnavailable` inside the generator and fall through | keeps the screen wired but makes the generator quietly tolerate a broken corpus; a reader then has to reason about which failures it swallows |
+| guard `auth.initialize()` in the lifespan | wrong layer. It would let the engine start with no admin and no way to make one, trading a loud failure for a confusing one |
+| leave as is | defensible fail-closed reading: an install whose shipped security data is corrupt should not mint the highest-value credential in the system. Costs a first deployment a startup failure whose cause is two files away from its symptom |
+
+**The first option is the recommendation** because it removes a refusal that carries no security value while leaving every refusal that does. The fourth is a real position and the reason this is filed for a ruling rather than just fixed.
+
+### What would make this concrete
+
+A test that builds an `AuthService` against an empty store and an unusable corpus, and asserts `initialize()` does not raise once the chosen option lands. There is no such test today, which is why the interaction was found by reading the call graph rather than by a red leg.
