@@ -11308,6 +11308,7 @@ Nothing here touches the TLS/FTPS context in the same module, which was already 
 
 > 🔢 **Re-scored 2026-08-20 -> P2.** Value **6/10** · Difficulty **5/10** · _quick win_. Shipped defaults are unchanged: forward_host is None at settings.py:1413, the handler installs only behind if forward is not None at logging_setup.py:438, and the protocol default at :1415 is UDP. Value 6 not 7: the engine ships the entire secure-transmission mechanism (SyslogForward at logging_setup.py:240 with native TLS at :300, CA anchoring and hostname verification, plus the REFUSE gate at settings.py:2475), so an operator reaches a conforming posture by setting a host and forward_protocol=tls -- awkward, but a real workaround, which is what rung 7 requires to be absent. Difficulty 5 for measuring the REFUSE gate's actual coverage, arguing the deployed-system-versus-product reading against the text, and weighing a TLS protocol default against a precedent that a runbook edit bought and lost this cell in two days. _(was 7/10 · 5/10.)_
 > Research: done 2026-08-20
+> 🚧 **One slice BUILT 2026-09-03 -- the tee's per-process handler dependency, which the research named as the prerequisite for every other subject in this programme and as the thing that falsifies the one detection-limb row graded verified.** `emit_audit_tee` now guarantees its record reaches a handler in a process that installed none, so the `backup` subcommand's success and failure `dr_backup` rows no longer produce an off-box copy that is discarded unread. **The cell does NOT reach pass and nothing in this change claims it does:** this stops evidence being dropped INSIDE the box; it still transmits nothing OFF the host. Everything else in the programme stays open -- see "Built 2026-09-03" at the end of this item for the list.
 >
 > **Filed 2026-08-08 - not started. RESEARCH item: the goal is an HONEST pass, and "cannot honestly reach pass" is a valid finding.** ASVS **16.4.3** (L2) currently scores **partial**. The pinned verb requires logs to be securely transmitted to a logically separate system so they survive a breach of the application. What holds it short is that no shipped default transmits anything: `forward_host` is None (`config/settings.py:1359`) and `configure_logging` installs stdout only behind `if forward is not None` (`logging_setup.py:437`).
 > Verdict: research
@@ -11337,6 +11338,67 @@ Nothing here touches the TLS/FTPS context in the same module, which was already 
 **Still not an honest pass:** the runbook purchase, which briefly scored this cell a pass once and whose artifact is still in the tree at `docs/DEPLOYMENT.md:262` and `:130`; the vacuous flip of `forward_protocol` to TLS while the collector host stays unset, which changes nothing the verb measures and would pass CI; building the gate while keeping the loopback carve-out, which lets a site clear it with a loopback address -- the exact configuration that fails the separation limb; and crediting `forward_hop_attested`, a signed relaxation, inside the requirement gate. Note the separation limb is weaker than it looks either way: `messagefoundry/config/tls_policy.py:477-493` never resolves names, by its own docstring, so "not loopback" is a literal-address test.
 
 **Proposed work, unallocated and by subject:** the durable off-box forwarder; the verb-shaped start gate; a collector-separation probe that refuses when every resolved address is an address of the engine host; supervisor-process forwarding; the sandbox-child off-box path and the inventory wording that hides it; the `at_capacity` log line; the tee's per-process handler dependency, which must be fixed before any new tee is built; off-box tees for the remaining event tables, including the alert-instance and response tables the first plan named only in part; a disposition for the tray log, argued on security-log-content grounds rather than the PHI-content grounds an existing exclusion actually uses; the never-built forwarder egress allowlist; posture reporting for the absence of forwarding and for hop attestation (measured: zero forwarder references in `messagefoundry/checks.py` and `messagefoundry/verify/` against a positive control of forty-one advisory tokens, and zero occurrences inside the loosening registry body against a positive control of three hits for another loosening); and a subject ruling on whether the extension's output channels are logging components for this verb -- noting the falsifier published for the out-of-subject reading, an extension-side event with no engine-side counterpart, is arguably already tripped by the connectivity-failure outcomes at `ide/src/engineLog.ts:63-65`.
+
+**Built 2026-09-03 -- the tee's per-process handler dependency, and ONLY that.** The research's
+measurement reproduced exactly: `grep -rn "configure_logging(\|configure_stderr_logging(\|basicConfig("`
+over the package returns two handler-installing call sites, `serve` and `supervise` in
+`messagefoundry/__main__.py`, against a positive control of 111 `getLogger(` hits and a negative
+control returning zero. In a bare interpreter the tee's INFO record produced NOTHING while a WARNING
+on the same logger printed and the root handler list was empty, because `logging.lastResort` is
+WARNING-only. Driven from the measured instance rather than a unit stub: the real `messagefoundry
+backup` subcommand, run in a CHILD process, returned 0 with the archive on disk and an EMPTY stderr;
+on the failure arm its `ALERT backup_failed` WARNING reached stderr from the same handler-less process
+while the tee's record did not, which is the discriminating control -- the stream demonstrably worked
+and the record was dropped by level, not by a dead process.
+
+**The fix.** `emit_audit_tee` now calls `logging_setup.ensure_logger_sink`, which takes its own
+handler off the logger and then asks `logging.Logger.hasHandlers` -- the standard library's own walk,
+the same stop condition `callHandlers` uses, read from the interpreter's source rather than assumed --
+whether anything else would receive the record. On false it installs a named stderr handler built by
+the new shared `logging_setup.build_stderr_handler`, so the redaction chain is IDENTICAL to the
+configured path's by construction rather than by a second copy that could drift. It comes back off
+the moment the process configures a sink, so `serve` and `supervise` are untouched and nothing
+double-emits. Verified byte-for-byte: for a PHI-bearing `detail` the fallback's rendering equals what
+`configure_logging`'s stdout handler emits. Stderr rather than stdout is a requirement, not a
+preference -- subcommands print a machine-readable payload to stdout under `--json`. Eight guards in
+`tests/test_audit_offbox_tee.py`; SIX were confirmed RED before the fix, and the other two pass in
+both states by design -- one asserts the handler-less shape the rest are built on is the measured
+one, the other is the no-regression guard that a configured process still gets exactly one copy.
+
+**The mechanism sits in `logging_setup`, not in the tee**, beside the two shipped answers to "how
+does this process get a sink" -- entry-point configuration and import-time remediation -- and the
+`silence_phi_prone_dependency_loggers` precedent, so the four remaining off-box tees this item still
+lists cost one line each rather than a copied function. It has exactly one caller today. The three
+store backends' `record_audit` were deliberately not touched: the defect is the tee's, and fixing it
+at the tee fixes all three call sites at once.
+
+**Two adjacent defects found, deliberately NOT fixed, and unfiled.** Named as subjects, not numbered,
+per the citation rule.
+
+1. *The double-redacted tee line loses its JSON framing.* The handler-level `RedactionFilter`
+   re-scrubs the already-`safe_text`'d line, reads `PID|` inside the rendered JSON as a segment run,
+   and cuts to end-of-line -- so an audit record whose `detail` carries an HL7 fragment reaches the
+   wire with its closing brace gone, and a SIEM parsing one object per line gets a parse error
+   instead of the record. Measured 2026-09-03 as byte-identical on the CONFIGURED stdout path and on
+   the new fallback, so it is pre-existing, belongs to the redaction chain rather than to this
+   change, and errs toward MORE redaction rather than less.
+2. *`logging.lastResort` is unfiltered, so the WARNING traffic of every handler-less subcommand
+   bypasses the PHI chain.* Measured 2026-09-03 in a bare interpreter: `logging.lastResort` carries
+   `filters=[]` and `formatter=None`, and a WARNING carrying a synthetic `PID` segment printed
+   VERBATIM. This change closes the INFO record; it does not touch that, and closing it means
+   configuring logging for every subcommand in `main()`, which is the scope the 2026-09-03 ruling
+   excluded. Same family as the sandbox child's unfiltered-handler defect that
+   `configure_stderr_logging` was built for.
+
+**Still open, and this item stays open for them:** the durable off-box forwarder (queue handler,
+reconnect loop, bounded on-disk spool); the verb-shaped start gate; the collector-separation probe;
+supervisor-process forwarding; the sandbox-child off-box path and the inventory wording that hides it;
+the `at_capacity` log line; off-box tees for `connection_event`, `message_events`, `alert_instance`
+and `response`; the tray-log disposition; the never-built forwarder egress allowlist; posture
+reporting for the absence of forwarding and for hop attestation; and the extension-output-channel
+subject ruling. **Nothing under `docs/DEPLOYMENT.md` was touched** -- the runbook purchase is this
+cell's recorded wrong move, and it was reversed in two days once already -- `forward_protocol` was not
+flipped while the collector host stays unset, and `forward_hop_attested` was not credited anywhere.
 
 ## 1202. the vault ASVS gate runs a verifier this repo owns, on a bare interpreter, and nothing here checked it would run
 
