@@ -121,10 +121,22 @@ def _seg(value: str | int) -> str:
     """Percent-encode ``value`` for use as ONE URL path segment (ASVS 1.2.2, BACKLOG #1107).
 
     ``safe=""`` is the whole point: ``quote``'s default is ``safe="/"``, which leaves untouched the
-    one character a path segment turns on. Without this, an identifier carrying ``..``, ``/``, ``?``
-    or ``#`` does not merely look wrong on the wire -- httpx RESOLVES it, so
+    one character a path segment turns on. Without this, an identifier carrying ``..``, ``?`` or
+    ``#`` does not merely look wrong on the wire -- httpx RESOLVES it, so
     ``start_connection("../../users/admin")`` leaves ``/connections/`` and retargets the request at
-    ``/users/admin/start``, and a ``#`` truncates the path at the fragment, dropping the verb.
+    ``/users/admin/start``, and a ``#`` truncates the path at the fragment, dropping the verb. Those
+    three are held HERE, on the client, before the request is built.
+
+    **``/`` IS DIFFERENT, and this docstring used to bundle it with the other three (BACKLOG
+    #1107).** The ``%2F`` emitted here survives onto the wire, but the SERVER undoes it: ASGI defines
+    ``scope["path"]`` as the DECODED path and Starlette routes on it, so a slash is a separator again
+    before any route is matched. Measured on a real uvicorn server rather than TestClient. The engine
+    API has 13 route pairs shaped ``/x/{id}`` against ``/x/{id}/verb`` (``/users/{user_id}`` against
+    its six sub-routes, ``/messages/{message_id}`` against its five, ``/uploads/{file_id}`` against
+    its two), so an id carrying ``/verb`` reaches the sibling handler on a matching method. What
+    keeps that from mattering today is that every id interpolated here is engine-minted and read back
+    from a lookup -- which is provenance, not encoding. Do not cite this function as containment for
+    ``/``; ``tests/test_apiclient.py`` pins what it does hold.
 
     Applied at every interpolation site rather than only the ones carrying free text. Most of the
     identifiers here are engine-minted hex ids, but four sites carry a CONNECTION NAME, which is

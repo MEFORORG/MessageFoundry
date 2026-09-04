@@ -303,7 +303,11 @@ def roles_page(roles: Sequence[RoleInfo]) -> Markup:
         name: object = (
             role.display_name
             if role.builtin
-            else el("a", role.display_name, href=f"/ui/roles/{role.id}/edit")
+            # Encoded like the update/delete actions below, which carry this same value. Leaving it
+            # bare rested on role ids being `custom:` + uuid4().hex -- the trusted-identifier
+            # argument BACKLOG #1107 names as its live trap -- and made one file disagree with
+            # itself about the context of one value.
+            else el("a", role.display_name, href=f"/ui/roles/{_seg(role.id)}/edit")
         )
         rows.append(
             [
