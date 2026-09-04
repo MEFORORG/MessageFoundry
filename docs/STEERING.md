@@ -71,7 +71,7 @@ new speaker is quoting one rather than opening one. This is the same structural 
 deliberately a rule about line structure rather than a list of forbidden strings — a denylist of
 framing tokens has to be re-proved every time the harness gains a new frame.
 
-**What it fixed** ([BACKLOG #1428](BACKLOG.md)): the note used to be interpolated whole and unfolded
+**What it fixed** ([BACKLOG #1424](BACKLOG.md)): the note used to be interpolated whole and unfolded
 into a frame asserting the user had typed it, so one line break closed that frame and opened whatever
 came next. That is the same shape [BACKLOG #1040](BACKLOG.md) measured on the worktree gate's deny
 text, on a stronger surface — the frame being forged carries owner authority, which is the one

@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 MessageFoundry Organization and contributors
-"""The steering hook's frame cannot be forged by the note it carries (BACKLOG #1428).
+"""The steering hook's frame cannot be forged by the note it carries (BACKLOG #1424).
 
 ``scripts/hooks/steer-inject.ps1`` reads ``<project>/.claude/steer.txt`` and re-emits it as
 ``additionalContext`` inside a frame that tells the reading agent the note is an operator redirect.

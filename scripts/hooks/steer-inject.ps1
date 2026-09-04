@@ -14,7 +14,7 @@
 # worktree, which is a bad trade for an occasional-use feature. Enable it per worktree, in that
 # worktree's .claude/settings.local.json, when you actually want it. See docs/STEERING.md.
 #
-# NOTE CONTENT CANNOT REACH COLUMN 0 (BACKLOG #1428). Every line derived from the note file carries
+# NOTE CONTENT CANNOT REACH COLUMN 0 (BACKLOG #1424). Every line derived from the note file carries
 # the prefix '    | ', applied by Format-Note, which is the only place in this script where the note
 # becomes lines. Every other line in the injection was written here, and the frame says so, because a
 # containment rule the reader does not know about protects nobody.
