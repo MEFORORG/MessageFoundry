@@ -5559,6 +5559,35 @@ Both contain the identical slug. Only the first carries a `worktrees/` prefix.
 >
 > **Mutation-tested:** reverting the resolver reds ONLY the composition test; all four controls stay green.
 > 222 tests pass across the four closest gate suites.
+>
+> **RE-VERIFIED INDEPENDENTLY 2026-09-03 at `fd44b0f17`. Every claim above holds, nothing was left to
+> build, and the archive pass is the only thing outstanding.** Closure is PROPOSED here and deliberately
+> not taken by the session that verified it. The fix landed in `a490993b4` (PR #628); the resolver has
+> been changed three times since -- `7599ad190` (#1065, #1072), `2b9f5b3c4` (#1304, #1071, #1039),
+> `85516d100` (#1379) -- and the composition survived all three, which is the thing a re-read could
+> actually have found wrong.
+>
+> * **The join is present and GUARDED.** `Get-GitTargetCandidatesRaw` computes `$cd` above the `-C`
+>   branch, then joins a RELATIVE `-C` onto it and leaves an ABSOLUTE one alone, on
+>   `[System.IO.Path]::IsPathRooted`. The unconditional-composition fail-open this item warns about is
+>   guarded in the code and pinned by a test.
+> * **The three bail-outs guard BOTH branches.** `popd`, `cd -` and a `(`/`{` subshell leave `$cd`
+>   null, and so does more than one chdir (`$cds.Count -eq 1`), which falls back to the old behaviour.
+> * **The negative control this item promised EXISTS**, so there was no remaining work to add:
+>   `test_an_absolute_dash_C_still_ignores_a_preceding_cd`, whose docstring names the
+>   broader-than-its-evidence problem in `test_a_dash_C_beats_a_preceding_cd` in as many words. Two
+>   more sit beside it -- `test_a_relative_dash_C_with_no_cd_still_resolves_against_the_session_cwd`
+>   and `test_a_cd_inside_a_subshell_does_not_compose`.
+> * **The mutation reproduces.** Reverting the join alone to `$dashCOut += $dashC` reds exactly one of
+>   the 35 shell-semantics tests, the composition test, and all four controls stay green. Its failure
+>   prints the original defect verbatim: a deny naming the primary for a write that lands in the
+>   ungoverned `../Unrelated`. The file was restored byte-identical afterwards.
+>
+> **THE 222 IS DATED, NOT WRONG, AND IT IS NOT REPRODUCIBLE BECAUSE THE LINE DOES NOT NAME ITS FOUR
+> SUITES.** `test_worktree_gate_shell_semantics.py`, `test_worktree_gate.py`,
+> `test_worktree_gate_git.py` and `test_worktree_gate_hijack.py` collect **201**, all passing, on
+> 2026-09-03. Two counts over unnamed sets are not comparable, so the suites are named here for
+> whoever re-runs the measurement.
 
 > 🔢 **Re-scored 2026-08-20 -> P2.** Value **6/10** · Difficulty **4/10** · _quick win_. The defect is intact: worktree_gate.ps1:319 takes the -C value and the cd resolution at :321-330 is the else branch, so a relative -C behind a cd prefix resolves against the session cwd and the deny names the wrong repository. Value 6 is rung 6 -- a live false deny on developer tooling whose only workaround is a human overriding a message that actively misinforms. Difficulty 4, not 5, because the change is hoisting the existing cd computation above the -C branch and joining a relative -C to it inside one function, and the deny-text assertion the scorer priced as extra cost is already a shipped test capability. _(was 6/10 · 4/10.)_
 >
