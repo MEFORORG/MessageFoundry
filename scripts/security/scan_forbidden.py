@@ -55,8 +55,12 @@ Usage:
                                     #   it would copy the leak into public CI logs; default is
                                     #   reasons-only: location + category, never the matched text)
   scan_forbidden.py                 # scan all git-tracked files in the current repo
+  scan_forbidden.py --self-test     # probe each LOADED class with a string derived from itself, so a
+                                    #   table that parsed but cannot match is caught. Counts and class
+                                    #   names only -- never a token, so it is safe in public CI.
 
-Exit: 0 clean, 1 forbidden content found (fail closed), 2 usage error / required-tokens-missing.
+Exit: 0 clean, 1 forbidden content found (fail closed), 2 usage error / required-tokens-missing /
+self-test failure (an instrument that cannot see is not a content hit; the two need different fixes).
 """
 
 from __future__ import annotations
@@ -1169,6 +1173,133 @@ def floor_freshness_failure(
     )
 
 
+# --------------------------------------------------------------------------------------------------
+# SELF-TEST: can the detectors that LOADED actually FIRE? (BACKLOG #321, Proposed 2)
+# --------------------------------------------------------------------------------------------------
+# The floor counts detectors that PARSED. Parsing and matching are different questions, and this
+# module already carries the proof: with no prefix loaded both site-code detectors become ``_NEVER``,
+# an empty negative lookahead that matches nothing anywhere. A blind scanner and a clean tree produce
+# the same exit 0. So the floor establishes that a table arrived, never that the table can see.
+#
+# This closes that by probing each loaded class WITH A STRING DERIVED FROM ITSELF. Nothing here
+# prints, returns or stores a token value: probes are built in memory, matched in memory, and only
+# class names and COUNTS leave the function. That is what lets it run in a world-readable Actions log
+# on the one run that holds the real secret -- which is the only place the real table ever loads, and
+# therefore the only place this question can be answered about the set the gate actually uses.
+
+
+#: A ``[names]`` entry that is a plain word wrapped in word boundaries. That is the shape the class is
+#: overwhelmingly made of, and the only shape a matching string can be recovered from: a regex cannot
+#: be inverted in general, so anything richer is reported as UNPROBED rather than guessed at.
+_PLAIN_WORD_NAME = re.compile(r"\\b([A-Za-z][A-Za-z0-9]*)\\b")
+
+
+def plain_word_name_probes(text: str) -> list[str]:
+    """Words the plain-word ``[names]`` entries in ``text`` must match, recovered from the SOURCE.
+
+    Public because the self-test below and the loaded-set test suite both need it, and a second
+    spelling of "which entries are probeable" would be a second definition that can drift silently --
+    the same single-source rule the section-header parse follows.
+
+    Returns the recovered WORDS, which are token content, so a caller must not print them. Recovering
+    nothing is not an error here; the caller decides what an unprobeable class means.
+    """
+    probes: list[str] = []
+    in_names = False
+    for raw in text.splitlines():
+        line = raw.lstrip(_BOM).strip()
+        if line.startswith("[") and line.endswith("]"):
+            in_names = line[1:-1].strip().lower() == "names"
+            continue
+        if not in_names or not line or line.startswith("#"):
+            continue
+        if m := _PLAIN_WORD_NAME.fullmatch(line.split("|")[0].strip()):
+            probes.append(m.group(1))
+    return probes
+
+
+def self_test() -> tuple[list[str], list[str]]:
+    """Probe every loaded class with a string built from what that class loaded.
+
+    Returns ``(report, failures)``. Both hold counts and class names only -- never a token, never a
+    probe -- so both are safe to print in public CI.
+
+    Probing is TOTAL for ``site_prefix`` and for the file-scanned ``estate`` subset: a prefix is ASCII
+    digits and an estate pattern is ``re.escape``d around its own literal, so a matching string is
+    derivable from every entry that loaded. There a shortfall is a FAILURE. ``names`` is partial by
+    nature (see ``plain_word_name_probes``), so an unprobeable entry is counted, not failed --
+    a required gate that reds on a legitimate list shape gets switched off, and the value here is in
+    running on every real load rather than in being maximally strict on one.
+
+    The one unconditional failure is a run that probed NOTHING. That is the vacuous pass this check
+    exists to remove, and it must not be reported as a clean bill.
+    """
+    report: list[str] = []
+    failures: list[str] = []
+    probed_anything = False
+
+    # [site_prefix] -- the class that falls back to _NEVER, so the class where a silent load failure
+    # and a clean tree are the same green tick. The probe wraps the code in identifier separators
+    # because that is the boundary the FILE detector requires.
+    fired = 0
+    for prefix in _SITE_PREFIXES:
+        m = _SITE_CODE_FILE.search(f"PT_{prefix}0000_ADT")
+        if m is not None and m.group(0).startswith(prefix):
+            fired += 1
+    if _SITE_PREFIXES:
+        probed_anything = True
+        report.append(f"site_prefix fired {fired}/{len(_SITE_PREFIXES)}")
+        if fired != len(_SITE_PREFIXES):
+            failures.append(
+                f"site_prefix: {len(_SITE_PREFIXES) - fired} of {len(_SITE_PREFIXES)} loaded "
+                "prefix(es) did not match a site code built from that same prefix -- the detector "
+                "is loaded and inert"
+            )
+
+    # [estate] -- only the FILE-SCANNED subset. An [estate_body_only] token never enters scan_file, so
+    # probing one would assert nothing about the gate that guards tracked files.
+    fired = 0
+    for token, pattern in _ESTATE_FILE_RES:
+        if pattern.search(f"OB_{token}_ORU"):
+            fired += 1
+    if _ESTATE_FILE_RES:
+        probed_anything = True
+        report.append(f"estate_file_scanned fired {fired}/{len(_ESTATE_FILE_RES)}")
+        if fired != len(_ESTATE_FILE_RES):
+            failures.append(
+                f"estate: {len(_ESTATE_FILE_RES) - fired} of {len(_ESTATE_FILE_RES)} file-scanned "
+                "token(s) did not match their own literal butted against identifier separators"
+            )
+
+    # [names] -- partial by construction. The probe line is ordinary prose so nothing but a name
+    # pattern could account for a hit.
+    words = plain_word_name_probes(_resolve_token_text() or "")
+    fired = sum(
+        1
+        for word in words
+        if any(pat.search(f"contact {word} about the interface") for pat, _reason in FORBIDDEN)
+    )
+    if words:
+        probed_anything = True
+    report.append(f"names fired {fired}/{len(words)} probeable of {len(FORBIDDEN)} loaded")
+    if words and fired != len(words):
+        failures.append(
+            f"names: {len(words) - fired} of {len(words)} plain-word entries did not match their "
+            "own word -- the entry parsed but the detector is inert"
+        )
+    if FORBIDDEN and not words:
+        report.append(
+            "names UNPROVEN: no entry is a plain word, so no probe could be derived for this class"
+        )
+
+    if not probed_anything:
+        failures.append(
+            "no class could be probed at all, so this run proved nothing about detection -- which "
+            "is the vacuous pass the self-test exists to remove"
+        )
+    return report, failures
+
+
 def _detector_count_report(counts: dict[str, int]) -> list[str]:
     """Machine-readable counts AND the load MODE, one ``key=value`` per line.
 
@@ -1222,6 +1353,29 @@ def main(argv: list[str]) -> int:
             print(f"scan_forbidden: {why}", file=sys.stderr)
             return 1
         return 0
+
+    # BACKLOG #321. A third terminal mode, and the third distinct question about the same tables: the
+    # floor asks whether the list fell BELOW it, --assert-floor-fresh asks whether it outgrew it, and
+    # this asks whether what loaded can FIRE. Only the last one can see a table that is fully
+    # populated, fully fresh, and inert.
+    if "--self-test" in argv:
+        if not TOKENS_PRESENT:
+            print(
+                "scan_forbidden: --self-test needs a loaded token source; refusing rather than "
+                "reporting a pass against empty tables (fail closed).",
+                file=sys.stderr,
+            )
+            return 2
+        for line in _detector_count_report(loaded_token_counts()):
+            print(line)
+        report, failures = self_test()
+        for line in report:
+            print(f"self-test: {line}")
+        for why in failures:
+            print(f"scan_forbidden: self-test: {why}", file=sys.stderr)
+        # 2, not 1: a hit is content that must be removed from the tree, this is an instrument that
+        # cannot see. They call for different actions and must not share an exit code.
+        return 2 if failures else 0
 
     show_context = "--show-context" in argv
     rest = [a for a in argv if a != "--show-context"]

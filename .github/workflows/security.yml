@@ -150,6 +150,21 @@ jobs:
           # the advisory half not block, move the ci-quality line alone to its own step.
           pip-audit -r ci/locks/ci-scanners.lock --desc
           pip-audit -r ci/locks/ci-quality.lock --desc
+          # THE SIGNING TOOLCHAIN, and it is the one that most needs this (BACKLOG #332). a9354808e
+          # added ci/locks/release-tools.lock to the export set and the byte-diff gate above but NOT
+          # here, so from 2026-08-29 until this line landed the release signing closure was the only
+          # committed lock nothing audited -- hash-pinned, therefore sticky, therefore exactly the
+          # "pinned, stale, unpatched is worse than floating" case the two lines above exist to stop.
+          # It is also load-bearing for .github/dependabot.yml's `sigstore` ignore entry: that entry
+          # suppresses the security track for >=4.5.0, and is only acceptable while this audit can
+          # still see an advisory in the pinned closure. REMOVE THIS LINE AND YOU MUST REMOVE THAT
+          # ENTRY -- the comment there says so from the other side.
+          #
+          # Same REQUIRED-context consequence as the two above, and a better-earned one: a CVE in
+          # sigstore's closure reds the merge gate. That closure signs the wheel, the sdist, the SBOM
+          # and the VEX with the job's OIDC identity, so blocking is the wanted behaviour, not a cost
+          # reluctantly accepted for an advisory tool. `--ignore-vuln <ID>` remains the escape hatch.
+          pip-audit -r ci/locks/release-tools.lock --desc
       # ANTI-SLOPSQUAT. Deliberately a STEP in this already-REQUIRED job rather than a new context: it
       # blocks today with no branch-protection change, the same reasoning as the ledger-gate backstop
       # in ci.yml. (A hard-failing job that is NOT a required context does not stop auto-merge — it
@@ -188,7 +203,44 @@ jobs:
       - name: Audit the locked npm dependencies (install-free)
         # --package-lock-only audits straight from the committed package-lock.json (no install needed) —
         # fast and reproducible. Default level fails on ANY severity, matching pip-audit's strict posture.
-        run: npm audit --package-lock-only
+        #
+        # RETRIED, BECAUSE A REGISTRY HICCUP IS NOT AN AUDIT VERDICT. `npm audit` exits non-zero BOTH
+        # when the advisory database reports a vulnerability AND when it cannot be reached, so the bare
+        # invocation this replaces made an unreachable registry indistinguishable from a finding. A red
+        # therefore said nothing about the dependencies, which is a control resting on a false premise.
+        # Measured 2026-09-04: of 34 failures of this required context in one night, 32 were
+        # `503 Service Unavailable` or `network timeout at .../advisories/bulk` and 2 were real; each
+        # one blocked a merge or evicted a merge-queue entry.
+        #
+        # STILL FAIL-CLOSED, which is the point. A verdict is honoured the moment it arrives, and
+        # exhausting the retries FAILS rather than passing. Nothing here can turn a real advisory green;
+        # the only behaviour that changes is that a transport error is retried instead of reported as a
+        # finding. The discriminator is `.metadata.vulnerabilities`, which a verdict carries and a
+        # transport failure does not -- exit status alone cannot tell them apart.
+        shell: bash
+        run: |
+          set -uo pipefail
+          for attempt in 1 2 3 4 5; do
+            if npm audit --package-lock-only --json > audit.json 2> audit.err; then
+              echo "advisory database reachable, no vulnerabilities (attempt ${attempt})"
+              rm -f audit.json audit.err
+              exit 0
+            fi
+            if jq -e '.metadata.vulnerabilities' audit.json > /dev/null 2>&1; then
+              echo "::error::npm audit reports vulnerabilities in the locked ide/ dependencies."
+              jq '.metadata.vulnerabilities' audit.json
+              exit 1
+            fi
+            echo "attempt ${attempt}: no verdict from the advisory database; retrying"
+            # No `|| true` here: tests/test_security_posture.py forbids discarding an exit code
+            # anywhere in a required job, and it is right to -- that one token is how a gate goes
+            # quiet. `2> audit.err` above always creates the file, so this cannot fail anyway.
+            head -c 400 audit.err
+            [ "${attempt}" -lt 5 ] && sleep "$((attempt * 15))"
+          done
+          echo "::error::Could not reach the npm advisory database after 5 attempts, so this run"
+          echo "::error::obtained NO audit verdict. Failing closed: this is not evidence of a clean tree."
+          exit 1
 
   released-line-audit:
     name: released-line-audit (latest release's pinned runtime)
@@ -728,4 +780,21 @@ jobs:
           # off by the third person who hits it.
           if [ -n "$MEFOR_MIN_DETECTORS" ]; then
             python scripts/security/scan_forbidden.py --assert-floor-fresh
+
+            # BACKLOG #321 -- CAN THE TABLE THAT LOADED ACTUALLY MATCH? The two checks above both count
+            # detectors: one asks whether the list fell below the floor, the other whether it outgrew
+            # it. Neither can see a table that is fully populated, fully fresh and INERT, which is a
+            # real state and not a hypothetical -- every site-code detector becomes an empty negative
+            # lookahead when no prefix loads, and an empty lookahead reports exactly what a clean tree
+            # reports. This probes each loaded class with a string built from that class, and prints
+            # counts and class names only, never a token.
+            #
+            # HERE AND NOT IN branch-leak-scan.yml ON PURPOSE: same secret, same tables, so a second
+            # copy would answer the same question twice and give two places for the answer to rot.
+            # This is the BLOCKING context, so it is where an inert instrument has to stop a merge.
+            #
+            # The pytest arm that asks this same question (tests/test_scan_forbidden_loaded_set.py)
+            # can only ever skip in CI -- no pytest job is given this secret -- so this stdlib
+            # entrypoint is the only place the REAL table is ever probed.
+            python scripts/security/scan_forbidden.py --self-test
           fi
