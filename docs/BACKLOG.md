@@ -19984,6 +19984,23 @@ The two unanchored security modules are reached only as `scripts.security.X`, wh
 
 **So three siblings already carried this fix and one was missed.** That is the strongest thing the census says: the pattern was settled here, and the shape of a per-script anchor is exactly why a fourth omission was invisible -- there is no list of anchored scripts for an unanchored one to be absent from.
 
+**THE CENSUS IS KEYED ON THE ABSENCE OF AN EXPLICIT ANCHOR, NEVER ON OBSERVED RESOLUTION, AND THE DIFFERENCE IS NOT ACADEMIC.** Three peer sessions raised this independently on 2026-09-03 and they are right: a script can resolve to the correct tree today for a reason that has nothing to do with the script. Measured here, one interpreter, one command, three working directories:
+
+| Invocation | `sys.path[0]` | Resolves to |
+|---|---|---|
+| `python -c "import messagefoundry"` from a worktree root | `''` (cwd) | **the worktree** |
+| the same, from the primary checkout root | `''` (cwd) | the primary |
+| the same, from a neutral cwd | `''` (cwd) | the primary, via the `.pth` |
+| `python scripts/<any>.py` from anywhere | the script's dir | the primary, via the `.pth` |
+
+**That is this defect's mirror image.** A by-path script reads the primary because nothing anchors it; a bare interpreter reads the worktree because cwd happens to win. Both are the same missing anchor, and only one of them looks wrong. **A census keyed on "which tree did it resolve to" would clear every script whose cwd currently rescues it, and each of those flips silently the day it is launched from somewhere else.** The fleet's standard recipe for a `.venv`-less worktree -- the primary checkout's interpreter run from the worktree root -- depends entirely on that rescue.
+
+**THE TABLE ABOVE WAS THEREFORE RE-DERIVED BY AST, NOT BY READING**, on the predicate *imports an in-repo top-level package AND is runnable by path AND puts nothing on `sys.path`*. It agreed with the reading exactly. **Positive control, because a pattern that finds nothing anywhere is indistinguishable from a clean tree:** 53 `.py` files under `scripts/`, 28 deriving a path from `__file__`, 6 importing an in-repo package -- the walk is live. **Control on the instrument itself:** run against the parent commit's source the census flags `scripts/webconsole_seam_snapshot.py` as `EXPOSED` and nothing else; run against the fix it reports none. A census that cannot see the defect it was written for is not evidence of a clean directory.
+
+**The two library modules are structurally safe, not accidentally safe, and the distinction matters given the above.** `dast_target.py` and `route_gates.py` are reached only as `scripts.security.X`. That import form cannot resolve at all unless the repo root is already importable, so the root that supplies the module is necessarily the root that supplies its `messagefoundry` -- one tree by construction, not by cwd. They are not relying on the rescue.
+
+**WHAT THIS CENSUS COULD NOT SEE.** Its scope is `scripts/**/*.py` and nothing else -- `harness/`, `tee/`, `ide/` and the workflow-embedded `python -c` invocations were not examined. Its runnability test is the presence of a `__main__` guard, which would misjudge a module invoked by path despite having none. And it says nothing about the wider class the peers named: any process that resolves the package while cwd is not the worktree root reads the primary instead, which is a property of the fleet's test recipe rather than of any file in this directory.
+
 **THE FIX IS THE INSERT THE SIBLINGS ALREADY HAVE**, above the `from messagefoundry...` imports, citing the rule `scripts/coord/alloc.ps1` states for `git` (#1060): anchor on the script, not on the caller.
 
 **LIMB 4 -- WHY THERE ARE TWO TESTS, AND WHY THE OBVIOUS ONE IS NOT ENOUGH.** `test_the_script_run_by_path_computes_the_same_digest` runs the generator as a subprocess, by path, from a cwd that is not the repo root and with `PYTHONPATH` scrubbed, and requires its digest to equal the one the test derives in-process. Both scrubs are load-bearing: under pytest the root is already on `sys.path`, so **every in-process check in that file is blind to this defect by construction**, and a subprocess inheriting either rescue would pass for a reason unrelated to the script.
