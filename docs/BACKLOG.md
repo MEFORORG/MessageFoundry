@@ -11184,6 +11184,8 @@ this item** -- that is a sweep, it was costed and refused, and it is the owner's
 
 > 🔢 **Re-scored 2026-08-20 -> P2.** Value **6/10** · Difficulty **3/10** · _quick win_. The tool ships with the properties the item claims, including the empty-scan refusal, but no baseline exists and nothing invokes it, so the mode cannot go red. Value 6 because wiring it freezes roughly a thousand grandfathered claims so the part of the record a reviewer actually reads cannot decay further, with no product or PHI effect; difficulty 3 because the remainder is not one step -- the vault runs mirrored copies of engine tools, so wiring means mirroring this one, generating the baseline with --print-keys, adding the leg, and bringing the new copy under the drift gate that already exists for exactly this failure. _(was 7/10 · 3/10.)_
 >
+> **Re-measured 2026-09-03 at `fd44b0f17`, by driving the tool rather than reading it. Three of the four remaining steps are VAULT acts, and the fourth was already done at filing.** The tool is `scripts/docs/asvs_residual_lint.py`. The empty-scan refusal fires on four arms -- a document with no `[[cell]]` entries, an explicit `cell = []`, a field name that resolves to nothing, and a missing baseline file -- each exiting **2**; a cell carrying two citations with no baseline exits **1**; the same cell with a baseline grandfathering both exits **0**. All three codes are reachable, so the refusal is not an instrument that can only say one thing. Every arm ran under `python -I -S`, the bare-interpreter invocation the assessment repo uses, so the stdlib-only footing is measured and not merely asserted. **Nothing invokes it against the record:** no workflow under `.github/workflows/`, no `.pre-commit-config.yaml` hook, no `ci/` leg names it, and the only caller in the tree is `tests/test_asvs_residual_lint.py`, on fixtures. So the mode can go red on a broken TOOL and cannot go red on the RECORD, which is the item's claim stated precisely. No baseline exists here: `git ls-files` finds `scripts/docs/asvs_tally_baseline.txt` and no sibling for this lint. **The claim that has moved** is the fourth step. The engine half of the mirrored-tool contract was landed by `6559a58dc`, the same commit that built the tool: `MIRRORED_TOOLS` in `tests/test_asvs_verifier_vault_contract.py` lists this file and holds it stdlib-only. That contract is not the drift gate and must not be read as one -- the drift gate is the vault's own `asvs-verifier-drift.yml`, whose mirror automation `docs/CI.md` records as scoped to `scorecard.py` alone. **The handoff below names who does what.**
+>
 > **Filed 2026-08-09 - the FORWARD-ONLY gate is built; the existing population is grandfathered and NOT swept.** Roughly two thousand `file:line` citations live inside `residual` prose across about 250 cells. Nothing checks any of them, and a sample measured 44.9% stale.
 > Verdict: build
 > Closing-act: code
@@ -11240,6 +11242,83 @@ across every verdict class, including a large majority of the passing ones, and 
 cited-residual cells is close to even between pass and not-pass. **The verdict-leak argument does not
 hold** and is withdrawn. The baseline still belongs beside the data, on the stronger ground that a
 frozen list is unverifiable from a repo that cannot see what it grandfathers.
+
+**A second, independent reason the baseline belongs there, found 2026-09-03 and NOT a revival of the
+withdrawn one.** A baseline line is `cell id TAB field TAB file TAB count`, so the file IS a
+cell-to-path map. `CLAUDE.md` section 12 keeps exactly that pairing vaulted, because an enumeration
+of what is covered over a closed domain hands out what is not by subtraction. The withdrawn argument
+was about VERDICTS and stays withdrawn; this one is about the cell-to-file pairing and is a different
+claim. Practical consequence for whoever wires this: **the baseline must not be committed to the
+engine repo**, not even as a fixture.
+
+### HANDOFF: what is left, and whose act each step is
+
+**Three of the four remaining steps can only be performed in the assessment repo.** The engine seat
+that re-measured this item on 2026-09-03 could perform none of them, and said so rather than
+inventing engine work. The fourth step was already finished at filing. This section exists because
+the item stalled partly on nobody being able to tell whose act it was.
+
+**`Closing-act: code` above is still right, and is still misread.** The remaining act genuinely is
+code; it is code in the ASSESSMENT REPO. **Dispatching another engine-only Builder at this item
+cannot close it**, however good the brief.
+
+| # | Step | Repo | State at 2026-09-03 |
+|---|---|---|---|
+| 1 | Mirror the tool, and put the copy under the drift gate | vault | not done |
+| 2 | Generate the frozen baseline | vault | not done |
+| 3 | Add the CI leg that runs it | vault | not done |
+| 4 | Hold the mirrored copy to the stdlib-only mirrored-tool contract | **engine** | **done since `6559a58dc`** |
+
+**Step 4 is finished, and its NAME is why it keeps being re-opened.** The engine-side artifact is
+`MIRRORED_TOOLS` in `tests/test_asvs_verifier_vault_contract.py`, which lists
+`scripts/docs/asvs_residual_lint.py` and asserts it imports only the standard library. That is the
+mirrored-tool CONTRACT. It is not the drift gate, it does not compare two copies, and it never
+asserts a vault copy exists. The **drift gate** is the vault's own `asvs-verifier-drift.yml`, and
+`docs/CI.md` records its mirror automation as scoped to `scorecard.py` alone. Widening it is step 1.
+
+**Step 1 -- mirror one file, to the same relative path, then widen the drift gate.** Copy
+`scripts/docs/asvs_residual_lint.py` from the engine at the commit carrying this handoff to
+`scripts/docs/asvs_residual_lint.py` in the vault. Copy nothing else: the tool is stdlib-only and
+imports no sibling of its own. Then add that path to `asvs-verifier-drift.yml` alongside
+`scripts/asvs/scorecard.py`, in the same change. A mirror nothing watches is the failure the drift
+workflow was split out to end: before it existed, `scorecard.py` was mirrored by hand six times, and
+the last of those copies ran 326 lines behind the engine's.
+
+**Step 2 -- generate the baseline with this exact command.** It is a filter, not a redirect:
+
+```
+python scripts/docs/asvs_residual_lint.py docs/security/asvs-scorecard.toml \
+    --no-baseline --print-keys | awk -F'\t' 'NF==4' > scripts/docs/asvs_residual_baseline.txt
+```
+
+That run **exits 1 by design** -- with no baseline every citation reads as new -- so do not run it
+under `set -e`. **Then verify it in the same sitting** by re-running with
+`--baseline scripts/docs/asvs_residual_baseline.txt` and requiring **exit 0**. That single check
+catches a truncated, mis-encoded or mis-filtered baseline without anyone enumerating the ways one
+can go wrong. Give the file the header `asvs_tally_baseline.txt` already carries in the engine: a
+`#` comment block naming the producing command and stating that the list may only shrink.
+
+**Step 3 -- add the CI leg as a NEW workflow, never as a step in the vault's `ci.yml`.** ADR 0156's
+2026-08-01 amendment measured every pre-cutover vault workflow as `disabled_manually`, while a new
+workflow is active by default. **A leg added to the disabled estate ships a dead gate**, which is the
+same shape as the pre-commit hook Amendment 2 found had never been installed. Copy the shape of this
+repo's `.github/workflows/asvs-tally-lint.yml`: path-filtered to include the scorecard, the tool and
+the baseline (a gate excluded from its own trigger cannot observe a change to itself), `setup-python`
+with no install step, a short timeout, and **not** a required context. The leg runs:
+
+```
+python scripts/docs/asvs_residual_lint.py docs/security/asvs-scorecard.toml \
+    --baseline scripts/docs/asvs_residual_baseline.txt
+```
+
+**One engine-side defect was found and fixed on the way to writing this, and it sat on step 2.** The
+tool's own usage block promised `--print-keys > baseline.txt`, which does not work: the key lines
+share stdout with the scan inventory and the verdict, so the captured file is rejected on the next
+run by an uncaught `ValueError` at exit 1 -- and exit 1 is this tool's "found a new citation" code,
+so the wrong recipe reports as a lint failure rather than as a bad baseline. `--print-keys` was also
+the only affordance in the tool that nothing drove. Both are closed: the docstring now states the
+filter, and `test_the_documented_baseline_recipe_round_trips` freezes it, with the unfiltered capture
+kept as the control that proves the filter is load-bearing.
 
 ---
 

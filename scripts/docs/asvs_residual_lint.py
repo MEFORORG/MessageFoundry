@@ -36,7 +36,21 @@ Stdlib only, so it can be mirrored and run without an install -- the property
 ``tests/test_asvs_verifier_vault_contract.py`` holds over every mirrored tool.
 
     python scripts/docs/asvs_residual_lint.py <scorecard.toml> --baseline <baseline.txt>
-    python scripts/docs/asvs_residual_lint.py <scorecard.toml> --print-keys > <baseline.txt>
+
+GENERATING THE BASELINE IS A FILTER, NOT A REDIRECT, and this line used to say otherwise.
+``--print-keys`` writes the key lines onto the SAME stdout as the scan inventory and the verdict --
+which is deliberate, because the inventory has to print whether or not keys are wanted. So a plain
+``> baseline.txt`` captures the inventory too, and the next run rejects that file with an uncaught
+``ValueError`` and exit 1. Exit 1 is this tool's "found a new citation" code, so the wrong recipe
+reports as a lint failure rather than as a bad baseline. Keep only the four-column lines::
+
+    python scripts/docs/asvs_residual_lint.py <scorecard.toml> --no-baseline --print-keys \\
+        | awk -F'\\t' 'NF==4' > <baseline.txt>
+
+That generating run EXITS 1 by design -- with no baseline every citation is new -- so it must not be
+run under ``set -e``. Verify the result by re-running with ``--baseline <baseline.txt>`` and
+requiring exit 0: that one check catches a truncated, mis-encoded or mis-filtered baseline without
+anyone having to enumerate the ways it can go wrong.
 """
 
 from __future__ import annotations
