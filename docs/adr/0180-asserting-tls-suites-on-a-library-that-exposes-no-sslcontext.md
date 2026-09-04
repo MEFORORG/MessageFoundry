@@ -1,6 +1,6 @@
 # 0180 — Asserting TLS suites on a library that exposes no SSLContext
 
-- **Status:** Accepted (amended 2026-09-03 — see Amendment A)
+- **Status:** Accepted (amended 2026-09-03, extended 2026-09-04 — see Amendment A)
 - **Date:** 2026-08-28
 - **Related:** BACKLOG #1317 · `messagefoundry/config/tls_policy.py` (`harden_cipher_suites`, `build_asserted_https_handler`, `assert_ldap3_tls_suites`, `assert_hvac_tls_suites`) · `messagefoundry/auth/ldap.py` · `messagefoundry/config/secretprovider_vault.py` · `messagefoundry/store/keyprovider_vault.py` · `messagefoundry/store/crypto_transit.py` · `tests/test_tls_cipher_assertion_sites.py` · `.github/workflows/ci.yml`
 
@@ -212,5 +212,17 @@ unreplicable-argument refusal inert, dropping `harden_cipher_suites` from the re
 replica build a context that *differs* from urllib3's — every one turns the suite RED, and the
 restored tree returns green. The last is the one that matters for a replica: it proves the equivalence
 test can detect drift rather than merely passing.
+
+**The scope-out's own trigger fired, and it is converted rather than deleted (2026-09-04).** A
+separate change had meanwhile added `test_the_hvac_scope_out_premise_still_holds`, which asserted the
+two premises above: urllib3 absent, and no workflow installing `[vault]`. This amendment makes both
+false, which is that trigger working — its own text says so: *"A red does not mean the engine got
+worse. It means the reason an arm was left unasserted has stopped being true and the arm is now
+buildable -- build it and amend ADR 0180, never delete the test."* It landed first, so the conversion
+happened here. `test_the_hvac_arm_stays_built_and_stays_executable` guards the opposite failure, which
+a fired trigger cannot see: that a CI leg keeps installing `[vault]` (drop it and all seven tests
+above SKIP, which a suite reports as green), and that both `_build_client` factories still reach
+`assert_hvac_tls_suites` — a source-level half, because on an interpreter without the extra those
+seven tests are exactly the ones that would not run.
 
 **ODBC Driver 18 is unchanged and stays OUT, permanently.** Nothing in this amendment bears on it.

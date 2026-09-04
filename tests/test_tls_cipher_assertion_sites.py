@@ -29,8 +29,10 @@ so a test that saw no raise would be reporting a missing call rather than an ine
 
 from __future__ import annotations
 
+import ast
 import contextlib
 import datetime
+import re
 import socket
 import ssl
 import threading
@@ -60,7 +62,7 @@ from messagefoundry.config.settings import (
 from messagefoundry.config.wiring import FHIR, Rest, Soap
 from messagefoundry.pipeline import alert_sinks
 from messagefoundry.store import crypto_transit, keyprovider_vault, postgres
-from messagefoundry.transports import build_destination, rest, soap
+from messagefoundry.transports import build_destination, database, rest, soap
 from messagefoundry.transports.http_auth import with_http_digest
 from tests._extras_probe import OPTIONAL_EXTRAS, extra_is_installed
 
@@ -887,6 +889,224 @@ def test_the_handler_factory_refuses_when_it_cannot_reach_the_context(
     monkeypatch.setattr(urllib.request, "HTTPSHandler", _NoContextHandler)
     with pytest.raises(ValueError, match="cannot reach the TLS context"):
         tls_policy.build_asserted_https_handler(connector="a label")
+
+
+# --- the libraries ADR 0180 scoped OUT, and the premises that scoped them -------------------------
+#
+# BACKLOG #1317 names three third-party TLS surfaces: ldap3, hvac and ODBC Driver 18. ADR 0180 built
+# the first (above) and ruled the other two out in PROSE, each on a measurement taken once. A
+# scope-out is a compensating control like any other, so SDS-3.7 applies to it: it must not rest on a
+# premise nothing re-checks. Neither premise was checked by anything until these tests.
+#
+# ONE OF THE TWO TRIGGERS HAS SINCE FIRED, so the two are no longer the same shape and must not be
+# read as if they were:
+#
+# * ODBC stays a TRIGGER. A red does not mean the engine got worse; it means the reason that arm was
+#   left unasserted has stopped being true and the arm is now buildable. Build it and amend ADR 0180
+#   -- never delete the test.
+# * hvac is now a GUARD, in the opposite direction. Its trigger fired when the `test` leg started
+#   installing the `[vault]` extra, the assertion was built above, and ADR 0180 carries the amendment.
+#   A red there means the arm that WAS built has stopped being executed, which is the failure a
+#   scope-out trigger cannot detect.
+
+#: Ways a module can hold an ``SSLContext`` the engine could assert on. Shared by the ODBC subjects
+#: and by the control below, so a clean result on the subjects is a reading rather than a dead regex.
+_HOLDS_A_CONTEXT_RE = re.compile(
+    r"^\s*import\s+ssl\b|^\s*from\s+ssl\s+import\b|ssl\.SSLContext|ssl\.create_default_context"
+)
+
+#: The two ODBC modules. ADR 0180 measured only the first and generalised to "ODBC Driver 18".
+_ODBC_MODULES = (
+    "messagefoundry/store/sqlserver.py",
+    "messagefoundry/transports/database.py",
+)
+
+#: A module that DOES build a context, so the scan can be shown to find one.
+_ODBC_SCAN_CONTROL = "messagefoundry/store/postgres.py"
+
+
+def _context_lines(path: Path) -> list[str]:
+    """Every non-comment line in ``path`` that reaches for an ``ssl`` context."""
+    return [
+        line.strip()
+        for line in path.read_text(encoding="utf-8").splitlines()
+        if _HOLDS_A_CONTEXT_RE.search(line) and not line.lstrip().startswith("#")
+    ]
+
+
+def test_the_odbc_scope_out_premise_still_holds(request: Any) -> None:
+    """ADR 0180 rules ODBC Driver 18 out PERMANENTLY, and this re-measures why.
+
+    TLS on that hop is connection-string keywords (``Encrypt`` / ``TrustServerCertificate`` /
+    ``ServerCertificate``) terminated inside the native driver, so the suite list belongs to the
+    driver and the OS TLS stack rather than to the interpreter's OpenSSL. No Python-side context
+    exists to assert and no replica is possible.
+
+    **The ADR measured ``store/sqlserver.py`` alone and generalised.** The ODBC *transport* --
+    ``transports/database.py``, the DATABASE destination and the ADR 0010 ``db_lookup`` hop -- carries
+    the same keywords on a hop that moves message content, and was never named. Both are measured
+    here, so the ruling covers the surface it claims.
+    """
+
+    root = Path(request.config.rootpath)
+    control = _context_lines(root / _ODBC_SCAN_CONTROL)
+    assert control, (
+        f"the scan found no ssl context in {_ODBC_SCAN_CONTROL}, which is chosen BECAUSE it builds "
+        f"them -- the scan is broken, so a clean result on the ODBC modules would mean nothing"
+    )
+
+    holding = {rel: _context_lines(root / rel) for rel in _ODBC_MODULES}
+    assert not any(holding.values()), (
+        f"an ODBC module now reaches for an ssl context: {holding}. ADR 0180 ruled this arm out "
+        f"BECAUSE no Python-side context exists there; that premise has changed, so re-derive the "
+        f"ruling and assert the context (BACKLOG #1317) rather than deleting this test"
+    )
+
+
+def test_the_sqlserver_hop_asserts_no_suites_and_pins_what_it_can_control(
+    asserted_contexts: list[tuple[str, ssl.SSLContext]],
+) -> None:
+    """The other half of the same ruling: what the ODBC hop CANNOT do, and what it does instead.
+
+    Building the SQL Server DSN reaches ``harden_cipher_suites`` zero times -- there is nothing to
+    hand it. What the engine *can* express on that hop it does express, and this pins those two
+    keywords so the scope-out never reads as "TLS is unhandled here". ``Encrypt``/
+    ``TrustServerCertificate`` are the posture; the suite list is the driver's.
+
+    The spy is the same one the opener tests use, and its liveness is proved by
+    ``test_rest_shared_opener_context_is_the_one_that_was_asserted`` recording a context under the
+    same fixture -- so an empty list here reports an absent call, not an inert instrument.
+    """
+
+    dsn, weakened = database._build_connection(
+        {
+            "server": "sql.example.test",
+            "database": "mefor",
+            "username": "mefor",
+            "password": "not-a-real-password",
+            "encrypt": True,
+            "trust_server_certificate": False,
+        },
+        connection="OB_TEST_DB",
+    )
+
+    assert not weakened
+    assert "Encrypt=yes;" in dsn and "TrustServerCertificate=no;" in dsn, (
+        f"the SQL Server preset no longer pins the TLS posture it CAN control: {dsn}"
+    )
+    assert not asserted_contexts, (
+        f"the ODBC DSN path asserted a cipher context ({[lbl for lbl, _ in asserted_contexts]}). "
+        f"ADR 0180 says no such context exists on this hop -- re-derive the ruling"
+    )
+
+
+#: Extras installed by a CI workflow, e.g. ``-e ".[dev,harness,fhir]"``.
+_CI_EXTRAS_RE = re.compile(r'-e\s+"\.\[([^\]]+)\]"')
+
+
+def _ci_installed_extras(root: Path) -> set[str]:
+    """Every project extra any workflow under ``.github/workflows/`` installs.
+
+    Comment lines are skipped: several workflows discuss ``-e ".[extras]"`` in their rationale, and a
+    comment naming an extra is not a leg installing it.
+    """
+    extras: set[str] = set()
+    for workflow in sorted((root / ".github" / "workflows").glob("*.yml")):
+        for line in workflow.read_text(encoding="utf-8").splitlines():
+            if line.lstrip().startswith("#"):
+                continue
+            for match in _CI_EXTRAS_RE.finditer(line):
+                extras.update(part.strip() for part in match.group(1).split(","))
+    return extras
+
+
+#: The name every hvac construction point must CALL. Held as a string because the scan below reads
+#: source rather than importing (the modules it reads lazy-import hvac), and checked against the
+#: shipped module so a rename cannot leave the needle pointing at nothing.
+_HVAC_ASSERTION = "assert_hvac_tls_suites"
+
+#: The factory the scan looks inside. Both hvac modules name it identically.
+_HVAC_FACTORY = "_build_client"
+
+#: The two hvac construction points. ``store/crypto_transit.py`` is absent ON PURPOSE: it imports
+#: ``keyprovider_vault._build_client`` rather than building a client of its own, which
+#: :func:`test_the_transit_cipher_client_is_the_asserted_one` pins by identity rather than by prose.
+_HVAC_BUILD_SITES = (
+    "messagefoundry/config/secretprovider_vault.py",
+    "messagefoundry/store/keyprovider_vault.py",
+)
+
+
+def _factory_calls_the_assertion(path: Path) -> bool:
+    """Does ``path``'s ``_build_client`` CALL the assertion — parsed, not string-matched?
+
+    A substring scan is not good enough here and that was measured, not assumed: both modules carry
+    ``from ... import assert_hvac_tls_suites`` at module scope, so deleting the call from the factory
+    body leaves the name in the file and a substring scan stays green over a removed security control.
+    Parsing asks the question this test means to ask -- is the call INSIDE the factory -- which also
+    reds if the call is moved somewhere that never runs.
+    """
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    factories = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef) and node.name == _HVAC_FACTORY
+    ]
+    return any(
+        isinstance(call.func, ast.Name) and call.func.id == _HVAC_ASSERTION
+        for factory in factories
+        for call in ast.walk(factory)
+        if isinstance(call, ast.Call)
+    )
+
+
+def test_the_hvac_arm_stays_built_and_stays_executable(request: Any) -> None:
+    """ADR 0180 left the Vault (hvac) arm UNMEASURED, and this was that scope-out's trigger. It FIRED.
+
+    The premise was never that the hop was fine. It was that ``urllib3`` was absent and **no CI leg
+    installed the ``[vault]`` extra**, so a cipher assertion there would have been a security control
+    no test in this project could execute. The ADR named its own precondition, the `test` leg now
+    installs the extra, and the assertion above was built against urllib3's OWN
+    ``create_urllib3_context()`` rather than a hand-rolled look-alike (ADR 0180 Amendment A).
+
+    **So this test is now a GUARD, and both halves point the other way.** The failure a fired trigger
+    cannot see is the arm being built and then quietly stopping running, which is the silent-control
+    shape ADR 0158 catalogues:
+
+    * Drop the extra from CI and all seven ``_vault_extra`` tests SKIP. A suite that skips its way
+      past a security control reports green, so the extra is pinned here rather than trusted.
+    * Delete the call from a ``_build_client`` and, on an interpreter without the extra, nothing else
+      in this file notices -- every test that would have caught it is skipped. The source scan is the
+      half that still runs there.
+
+    Read a red here as the control having stopped being executed, and restore it. The one thing that
+    is NOT a fix is relaxing either half.
+    """
+
+    root = Path(request.config.rootpath)
+
+    extras = _ci_installed_extras(root)
+    assert "webauthn" in extras, (
+        f"control: the workflow scan should see the extras CI really installs, but read {extras}"
+    )
+    assert "vault" in extras, (
+        "no CI workflow installs the [vault] extra any more, so every test guarded by _vault_extra "
+        "skips and the hvac cipher assertion (ASVS 12.1.2) is a security control nothing executes. "
+        "Restore it on the leg that runs tests/ -- ADR 0180 Amendment A is what that install line "
+        "makes true (BACKLOG #1317)"
+    )
+
+    assert callable(getattr(tls_policy, _HVAC_ASSERTION, None)), (
+        f"control: tls_policy.{_HVAC_ASSERTION} is the name the scan below looks for, and it is no "
+        f"longer a callable there -- so a clean scan would mean the needle had gone stale, not that "
+        f"the call sites were wired"
+    )
+    unasserted = [rel for rel in _HVAC_BUILD_SITES if not _factory_calls_the_assertion(root / rel)]
+    assert not unasserted, (
+        f"{_HVAC_FACTORY} no longer calls {_HVAC_ASSERTION} in {unasserted}. That hop's suite list "
+        f"is inherited from urllib3 and unchecked again; restore the call (BACKLOG #1317, ADR 0180 "
+        f"Amendment A) rather than relaxing this test"
+    )
 
 
 def _covered_files() -> list[tuple[str, str]]:
