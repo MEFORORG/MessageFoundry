@@ -9,6 +9,7 @@ import datetime
 import ssl
 from collections.abc import Awaitable, Callable
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import httpx
@@ -1620,3 +1621,59 @@ def test_the_minted_pair_builds_a_serving_context(tmp_path: Path) -> None:
     serving = api.model_copy(update={"tls_cert_file": cert, "tls_key_file": key})
     ctx = build_api_ssl_context(serving)
     assert ctx.minimum_version is ssl.TLSVersion.TLSv1_2
+
+
+# --- BACKLOG #1118 / ASVS 3.3.3: what always-serve-TLS did to the `__Host-` cookie prefix ---------
+
+
+def test_a_minted_pair_does_not_satisfy_the_off_loopback_exposure_gate(tmp_path: Path) -> None:
+    """THE TRAP, pinned. A generated certificate must never make `exposure_protected` true.
+
+    `tls_enabled` is literally `bool(tls_cert_file)` and `exposure_protected` is
+    `tls_enabled or (tls_terminated_upstream and trusted_proxies)`. So surfacing the minted pair
+    through `[api].tls_cert_file` would flip the off-loopback /ui refusal open on EVERY bind, and a
+    self-signed placeholder with no chain of trust would silently satisfy a gate written for an
+    operator chain. The serve path avoids it by copying the paths into a LOCAL `model_copy` that
+    uvicorn reads and no gate does; this test is what stops a later refactor from "simplifying" that
+    copy back into `settings.api`.
+    """
+    api = ApiSettings()
+    cert, key = ensure_api_tls_material(api, state_dir=tmp_path)
+    assert Path(cert).exists()  # it really did mint -- otherwise the assertions below are vacuous
+    assert not api.tls_enabled
+    assert not api.exposure_protected
+    # POSITIVE CONTROL: the same two properties DO flip for an operator-supplied chain, which is the
+    # posture the gate was written for. Without this arm the assertions above would also pass if
+    # `exposure_protected` were broken to a constant False.
+    operator = api.model_copy(update={"tls_cert_file": cert, "tls_key_file": key})
+    assert operator.tls_enabled and operator.exposure_protected
+
+
+def test_the_served_https_scheme_resolves_both_cookies_to_their_host_twins() -> None:
+    """The #1118 premise measurement, made durable.
+
+    The item was filed to research how to reach ASVS 3.3.3 without breaking a cleartext loopback
+    login. ADR 0172 removed the cleartext loopback bind, so the request scheme is https and the
+    cookie code that was already correct now resolves both names to their `__Host-` twins with no
+    edit at all. Pinning it here means a change that reintroduces a cleartext default fails a test
+    naming the consequence, instead of quietly moving the cell back to partial.
+
+    The http arm is the positive control AND the reason an unconditional rename is wrong: a browser
+    rejects a `__Host-` cookie that is not Secure, so over cleartext the bare name is the correct
+    answer rather than a weaker one.
+    """
+    from messagefoundry_webconsole._auth import oidc_flow_cookie_name, session_cookie_name
+
+    def conn(scheme: str) -> Any:
+        return SimpleNamespace(
+            app=SimpleNamespace(state=SimpleNamespace(exposure_protected=False)),
+            url=SimpleNamespace(scheme=scheme),
+        )
+
+    served = conn("https")  # what ADR 0172 puts on the wire by shipped default
+    assert session_cookie_name(served) == "__Host-mf_session"
+    assert oidc_flow_cookie_name(served) == "__Host-mf_oidc_flow"
+
+    cleartext = conn("http")  # POSITIVE CONTROL -- the pre-0172 default, still correct behaviour
+    assert session_cookie_name(cleartext) == "mf_session"
+    assert oidc_flow_cookie_name(cleartext) == "mf_oidc_flow"

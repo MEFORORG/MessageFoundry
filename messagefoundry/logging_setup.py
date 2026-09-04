@@ -39,8 +39,10 @@ from messagefoundry.controlchars import _is_control_char
 from messagefoundry.redaction import redact
 
 __all__ = [
+    "build_stderr_handler",
     "configure_logging",
     "configure_stderr_logging",
+    "ensure_logger_sink",
     "set_runtime_level",
     "current_log_level",
     "silence_phi_prone_dependency_loggers",
@@ -509,6 +511,99 @@ def configure_logging(
     return forwarder_installed
 
 
+def build_stderr_handler() -> logging.Handler:
+    """A **stderr** handler carrying the shared text formatter and the PHI-redaction + control-char-
+    scrub filter chain — the single definition of "a MessageFoundry log sink on stderr".
+
+    Redaction here is a property of the **handler**, not of the logger or the call site (see
+    :func:`_install_phi_filters`), so anything that builds its own stderr handler builds an
+    *unfiltered* one unless it asks for the chain. At least two callers need one:
+    :func:`configure_stderr_logging`, for a process whose stdout is a binary channel, and
+    :func:`ensure_logger_sink`, for a process that installed no handler at all. Stating the chain
+    once means they cannot drift apart.
+
+    The handler level is left at ``NOTSET`` — matching the handlers :func:`configure_logging`
+    installs, so a record's only level gate is its logger's. ``sys.stderr`` is bound at build time,
+    exactly as :func:`configure_logging` binds ``sys.stdout``.
+    """
+    handler = logging.StreamHandler(sys.stderr)
+    handler.setFormatter(_make_formatter("text"))
+    _install_phi_filters(handler)
+    return handler
+
+
+def _fallback_sink_name(logger: logging.Logger) -> str:
+    """The handler name :func:`ensure_logger_sink` tags its own sink with, derived from ``logger``.
+
+    Deliberately **not** spelled "last resort", though that is what it is: this package already has a
+    ``messagefoundry.last_resort`` logger for excepthook reporting, and the standard library has
+    ``logging.lastResort``. Three unrelated things under one grep is the adjacent-name confusion
+    CLAUDE.md §11 keeps apart by rule.
+    """
+    return f"{logger.name}.fallback-sink"
+
+
+def ensure_logger_sink(logger: logging.Logger) -> None:
+    """Guarantee the next record on ``logger`` reaches a handler, in a process that configured none
+    (BACKLOG #1199). Idempotent, and self-removing once the process configures a real sink.
+
+    **The defect this closes.** Only two call sites in the package install a root handler — the
+    ``serve`` and ``supervise`` subcommands, both in :mod:`messagefoundry.__main__`. Every other
+    subcommand runs with an EMPTY root handler list, and ``logging.lastResort`` is WARNING-only, so
+    an INFO record is dropped outright rather than degraded. The measured instance is the off-box
+    audit tee (:mod:`messagefoundry.store.audit_tee`), whose whole purpose is that a copy of every
+    audit record leaves the box.
+
+    **What it does.** Takes our own handler off ``logger``, then asks ``logging.Logger.hasHandlers``
+    whether anything else would receive the record. That predicate is not an approximation of the
+    question: checked against the interpreter's source, it walks the chain — own handlers, then each
+    parent while ``propagate`` holds — with the SAME stop condition ``callHandlers`` uses, so it is
+    true exactly when ``callHandlers`` would find at least one handler, which is the condition that
+    decides whether the standard library diverts to its last resort. Handler LEVEL is deliberately
+    not consulted, for the same reason ``callHandlers`` does not consult it in that count: the
+    question is whether the process configured a sink at all, not whether that sink chose to keep
+    this record. On false, put ours back — the standard library's idea, at ``NOTSET`` instead of
+    WARNING and carrying the PHI filter chain. On true, ours simply stays off.
+
+    Removing first is what lets the standard library answer the question — ``hasHandlers`` cannot be
+    told to ignore one handler — and the removed object goes straight back rather than being rebuilt,
+    so a handler-less process builds one handler for its lifetime, not one per call.
+
+    **Lazy and per-call, unlike the two shipped patterns**, which are entry-point configuration
+    (``pipeline/_sandbox_worker``) and import-time remediation (``parsing/__init__``). Neither works
+    here: :func:`configure_logging` clears the **root** logger's handlers and never touches a named
+    one, so a sink installed once at import or at an entry point would survive into ``serve`` and
+    double-emit for the life of the service. Re-checking is what makes self-removal possible.
+
+    **Stderr, not stdout**, and that is a requirement rather than a preference: subcommands print a
+    machine-readable payload to stdout under ``--json``, and a log line there would corrupt the
+    document a caller parses.
+
+    **Not a forwarder.** This puts the record in front of an operator and into whatever the service
+    manager captures; it does not transmit anything off the host. The durable off-box forwarder, and
+    the question of what ASVS 16.4.3 requires beyond it, stay open on BACKLOG #1199.
+
+    Costs nothing on a configured process: it takes the ``hasHandlers`` branch and builds nothing, so
+    no new work lands on the event-loop thread a caller may be running on.
+    """
+    name = _fallback_sink_name(logger)
+    ours = [h for h in logger.handlers if h.name == name]
+    for handler in ours:
+        logger.removeHandler(handler)
+    if logger.hasHandlers():
+        return
+    if ours:
+        logger.addHandler(ours[0])
+        return
+    # Unsynchronized on purpose. Two threads racing here both install, and the loser's handler is
+    # dropped on the next call — so the worst case is ONE duplicated line, never a dropped one, and it
+    # self-heals. A lock on every call would buy nothing against that, and the shipped processes that
+    # reach this branch (the CLI subcommands) are single-threaded anyway.
+    handler = build_stderr_handler()
+    handler.set_name(name)
+    logger.addHandler(handler)
+
+
 def configure_stderr_logging(level: int = logging.WARNING) -> logging.Handler:
     """Install a **stderr-only** root handler carrying the same PHI-redaction + control-char-scrub
     filter chain :func:`configure_logging` puts on stdout, and return it.
@@ -516,23 +611,15 @@ def configure_stderr_logging(level: int = logging.WARNING) -> logging.Handler:
     For a MessageFoundry child process whose **stdout is a binary channel**: today the ADR 0087 sandbox
     worker, whose stdout carries the MFW2 IPC frames, so a stray log byte written there would corrupt a
     frame. The obvious way to express that — ``logging.basicConfig(stream=sys.stderr)`` — gets the
-    stream right and the *filters* wrong. It installs a handler with **no filters at all**, and
-    redaction here is a property of the **handler**, not of the logger or the call site (see
-    :func:`_install_phi_filters`), so a child that builds its own handler builds an unfiltered one
-    unless it asks for the chain: its records would reach the stderr the parent captures and relays
-    (ADR 0176) with neither PHI redaction nor CR/LF neutralization (BACKLOG #1054). Every process that
-    logs installs the chain, or it does not have it.
-
-    The text formatter is the shared one, so a child line is byte-compatible with the parent's and
-    :class:`ControlCharScrubFilter`'s "no line may impersonate the record prefix" guarantee is stated
-    against the same prefix on both streams.
+    stream right and the *filters* wrong: it installs a handler with **no filters at all**, so a
+    child's records would reach the stderr the parent captures and relays (ADR 0176) with neither PHI
+    redaction nor CR/LF neutralization (BACKLOG #1054). :func:`build_stderr_handler` is what supplies
+    the chain and the shared text formatter here, and says why that has to be asked for.
 
     Replaces any handlers already on the root logger, exactly as :func:`configure_logging` does, so it
     is idempotent and safe to call from a test.
     """
-    handler = logging.StreamHandler(sys.stderr)
-    handler.setFormatter(_make_formatter("text"))
-    _install_phi_filters(handler)
+    handler = build_stderr_handler()
 
     root = logging.getLogger()
     for existing in list(root.handlers):

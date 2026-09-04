@@ -313,3 +313,12 @@ scripts/security/scan-tokens.local.txt
 # considered both and left them: the 21 bench handoffs carry the measurement narrative for the ~133
 # data files beside them, so untracking either half strips the rationale from records that stay.
 # Re-proposing this is re-deriving a decision that is already written down.
+
+# A PR BODY IS SCRATCH, NOT A DELIVERABLE, AND ONE ALREADY REACHED A BRANCH TIP ONCE.
+# `PR_BODY.md` was committed at the repo root on 2026-09-03 because a push hold stopped a pull
+# request being opened, so the body had nowhere else to live. That is a real need and the file is
+# genuinely useful in the worktree -- but it describes ONE branch, it goes stale the moment that
+# branch merges, and `main` is the one place it must never land. Untracked-but-present is exactly
+# the state that serves both, so the rule is here rather than in a reviewer's memory.
+# Rooted with a leading slash: only the repo root, never a `docs/` or `tests/` file of that name.
+/PR_BODY.md

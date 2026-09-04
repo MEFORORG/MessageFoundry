@@ -749,6 +749,16 @@ async def authorize_ui_ws(
         return None, None
     for permission in permissions:
         if not identity.has(permission):
+            # ASVS 16.3.2 / BACKLOG #1197 — a failed authorization attempt has to leave a record, and
+            # this gate needs its OWN call because nothing downstream can write one. The caller falls
+            # back to the engine's ``authorize_ws``, which cannot reach a browser handshake at all:
+            # it reads the token from the Authorization header only, and its Origin check refuses
+            # every browser Origin against the shipped empty allowlist before its permission loop
+            # runs. No setting reaches here either — ``[diagnostics].audit_all_authz`` governs the
+            # engine's gates, not the console's. Same call shape as ``require_ui`` above and
+            # ``api/security.py``: the row carries the permission and the PATH, never the full URL,
+            # because the query string is where an operator's search terms live.
+            await auth.audit_permission_denied(identity, permission, websocket.url.path)
             return None, None
     return identity, token
 
