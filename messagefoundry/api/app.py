@@ -191,6 +191,19 @@ from messagefoundry.api.security import (
     require_step_up,
     ws_token,
 )
+from messagefoundry.api.validation import (
+    MAX_EVENT_KINDS,
+    MAX_EXPORT_IDS,
+    ConnectionName,
+    ControlIdFilter,
+    DigestId,
+    EpochSeconds,
+    EventKindFilter,
+    LayeredPresetIds,
+    MessageTypeFilter,
+    ResourceId,
+    StatusFilter,
+)
 
 # NOTE: the web console (messagefoundry_webconsole) is deliberately NOT imported at module scope
 # (ADR 0065 / Option B). It is a GUARDED import inside create_app's serve_ui tail (mounted via
@@ -2024,7 +2037,7 @@ def create_app(
 
     @app.post("/connections/{name}/start")
     async def start_connection(
-        name: str,
+        name: ConnectionName,
         request: Request,
         engine: Engine = Depends(_get_engine),
         identity: Identity = Depends(require_paced(Permission.CONNECTIONS_CONTROL)),
@@ -2033,7 +2046,7 @@ def create_app(
 
     @app.post("/connections/{name}/stop")
     async def stop_connection(
-        name: str,
+        name: ConnectionName,
         request: Request,
         engine: Engine = Depends(_get_engine),
         identity: Identity = Depends(require_paced(Permission.CONNECTIONS_CONTROL)),
@@ -2042,7 +2055,7 @@ def create_app(
 
     @app.post("/connections/{name}/restart")
     async def restart_connection(
-        name: str,
+        name: ConnectionName,
         request: Request,
         engine: Engine = Depends(_get_engine),
         identity: Identity = Depends(require_paced(Permission.CONNECTIONS_CONTROL)),
@@ -2053,7 +2066,7 @@ def create_app(
 
     @app.post("/connections/{name}/flag")
     async def set_connection_flag(
-        name: str,
+        name: ConnectionName,
         req: ConnectionFlagRequest,
         request: Request,
         engine: Engine = Depends(_get_engine),
@@ -2082,7 +2095,7 @@ def create_app(
 
     @app.get("/connections/{name}/metadata", response_model=ConnectionMetadata)
     async def connection_metadata(
-        name: str,
+        name: ConnectionName,
         request: Request,
         engine: Engine = Depends(_get_engine),
         identity: Identity = Depends(require(Permission.MONITORING_READ)),
@@ -2132,7 +2145,7 @@ def create_app(
 
     @app.post("/connections/{name}/test", response_model=ConnectionTestResult)
     async def connection_test(
-        name: str,
+        name: ConnectionName,
         request: Request,
         engine: Engine = Depends(_get_engine),
         identity: Identity = Depends(require_paced(Permission.CONNECTIONS_TEST)),
@@ -2181,7 +2194,7 @@ def create_app(
 
     @app.post("/connections/{name}/test-credential", response_model=ConnectionTestResult)
     async def connection_test_credential(
-        name: str,
+        name: ConnectionName,
         request: Request,
         engine: Engine = Depends(_get_engine),
         identity: Identity = Depends(require_paced(Permission.CONNECTIONS_TEST)),
@@ -2250,7 +2263,7 @@ def create_app(
 
     @app.post("/connections/{name}/purge", response_model=PurgeResult | PendingApprovalResponse)
     async def purge_connection(
-        name: str,
+        name: ConnectionName,
         response: Response,
         request: Request,
         engine: Engine = Depends(_get_engine),
@@ -2379,9 +2392,9 @@ def create_app(
         request: Request,
         engine: Engine = Depends(_get_engine),
         identity: Identity = Depends(require(Permission.MONITORING_READ)),
-        connection: str | None = Query(None, max_length=256),
-        kind: list[str] | None = Query(None),
-        since: float | None = Query(None, ge=0),
+        connection: ConnectionName | None = Query(None),
+        kind: list[EventKindFilter] | None = Query(None, max_length=MAX_EVENT_KINDS),
+        since: EpochSeconds | None = Query(None),
         limit: int = Query(100, ge=1, le=1000),
     ) -> list[ConnectionEventInfo]:
         """The Corepoint-style connection/transport event log (#46), newest first — **metadata only,
@@ -2403,12 +2416,12 @@ def create_app(
 
     @app.get("/connections/{name}/events", response_model=list[ConnectionEventInfo])
     async def list_connection_events_for(
-        name: str,
+        name: ConnectionName,
         request: Request,
         engine: Engine = Depends(_get_engine),
         identity: Identity = Depends(require(Permission.MONITORING_READ)),
-        kind: list[str] | None = Query(None),
-        since: float | None = Query(None, ge=0),
+        kind: list[EventKindFilter] | None = Query(None, max_length=MAX_EVENT_KINDS),
+        since: EpochSeconds | None = Query(None),
         limit: int = Query(100, ge=1, le=1000),
     ) -> list[ConnectionEventInfo]:
         """The connection/transport event log scoped to one connection (#46), newest first."""
@@ -2729,8 +2742,8 @@ def create_app(
         request: Request,
         engine: Engine = Depends(_get_engine),
         identity: Identity = Depends(require_phi_read(Permission.MESSAGES_READ)),
-        channel_id: str | None = Query(None, max_length=256),
-        destination_name: str | None = Query(None, max_length=256),
+        channel_id: ConnectionName | None = Query(None),
+        destination_name: ConnectionName | None = Query(None),
         limit: int = Query(50, ge=1, le=500),
         offset: int = Query(0, ge=0),
     ) -> DeadLetterList:
@@ -2823,7 +2836,7 @@ def create_app(
 
     @app.post("/approvals/{approval_id}/approve", response_model=ApprovalDecisionResult)
     async def approve_action(
-        approval_id: str,
+        approval_id: ResourceId,
         request: Request,
         identity: Identity = Depends(require_paced(Permission.APPROVALS_APPROVE)),
         gate: ApprovalGate | None = Depends(_get_gate),
@@ -2842,7 +2855,7 @@ def create_app(
 
     @app.post("/approvals/{approval_id}/reject", response_model=ApprovalDecisionResult)
     async def reject_action(
-        approval_id: str,
+        approval_id: ResourceId,
         request: Request,
         identity: Identity = Depends(require_paced(Permission.APPROVALS_APPROVE)),
         gate: ApprovalGate | None = Depends(_get_gate),
@@ -3019,12 +3032,12 @@ def create_app(
         request: Request,
         engine: Engine = Depends(_get_engine),
         identity: Identity = Depends(require_phi_read(Permission.MESSAGES_READ)),
-        channel_id: str | None = Query(None, max_length=256),
-        status: str | None = Query(None, max_length=64),
-        message_type: str | None = Query(None, max_length=64),
-        control_id: str | None = Query(None, max_length=256),
-        received_from: float | None = Query(None, ge=0),
-        received_to: float | None = Query(None, ge=0),
+        channel_id: ConnectionName | None = Query(None),
+        status: StatusFilter | None = Query(None),
+        message_type: MessageTypeFilter | None = Query(None),
+        control_id: ControlIdFilter | None = Query(None),
+        received_from: EpochSeconds | None = Query(None),
+        received_to: EpochSeconds | None = Query(None),
         limit: int = Query(50, ge=1, le=500),
         offset: int = Query(0, ge=0),
     ) -> MessageList:
@@ -3171,10 +3184,10 @@ def create_app(
         identity: Identity = Depends(require_step_up(Permission.MESSAGES_READ)),
         field_path: str | None = Query(None, max_length=32),
         target: str = Query("both", pattern="^(raw|summary|both)$"),
-        channel_id: str | None = Query(None, max_length=256),
-        status: str | None = Query(None, max_length=64),
-        message_type: str | None = Query(None, max_length=64),
-        control_id: str | None = Query(None, max_length=256),
+        channel_id: ConnectionName | None = Query(None),
+        status: StatusFilter | None = Query(None),
+        message_type: MessageTypeFilter | None = Query(None),
+        control_id: ControlIdFilter | None = Query(None),
         limit: int = Query(50, ge=1, le=500),
         scan_limit: int = Query(DEFAULT_CONTENT_SCAN_LIMIT, ge=1, le=MAX_CONTENT_SCAN_LIMIT),
     ) -> MessageSearchResults:
@@ -3345,13 +3358,13 @@ def create_app(
         identity: Identity = Depends(
             require_step_up(Permission.MESSAGES_EXPORT, Permission.MESSAGES_VIEW_RAW)
         ),
-        ids: list[str] = Query(default=[]),  # noqa: B006 — FastAPI repeated ?ids= (save-selected)
+        ids: list[ResourceId] = Query(default=[], max_length=MAX_EXPORT_IDS),  # noqa: B006 — FastAPI repeated ?ids=
         field_path: str | None = Query(None, max_length=32),
         target: str = Query("both", pattern="^(raw|summary|both)$"),
-        channel_id: str | None = Query(None, max_length=256),
-        status: str | None = Query(None, max_length=64),
-        message_type: str | None = Query(None, max_length=64),
-        control_id: str | None = Query(None, max_length=256),
+        channel_id: ConnectionName | None = Query(None),
+        status: StatusFilter | None = Query(None),
+        message_type: MessageTypeFilter | None = Query(None),
+        control_id: ControlIdFilter | None = Query(None),
         limit: int = Query(1000, ge=1, le=100_000),
         scan_limit: int = Query(DEFAULT_CONTENT_SCAN_LIMIT, ge=1, le=MAX_CONTENT_SCAN_LIMIT),
     ) -> StreamingResponse:
@@ -3406,7 +3419,7 @@ def create_app(
 
     @app.get("/messages/{message_id}", response_model=MessageDetail)
     async def get_message(
-        message_id: str,
+        message_id: ResourceId,
         request: Request,
         engine: Engine = Depends(_get_engine),
         identity: Identity = Depends(require_phi_read(Permission.MESSAGES_VIEW_RAW)),
@@ -3499,8 +3512,8 @@ def create_app(
 
     @app.get("/messages/{message_id}/attachments/{attachment_id}")
     async def download_attachment(
-        message_id: str,
-        attachment_id: str,
+        message_id: ResourceId,
+        attachment_id: DigestId,
         request: Request,
         engine: Engine = Depends(_get_engine),
         identity: Identity = Depends(require_phi_read(Permission.MESSAGES_VIEW_RAW)),
@@ -3583,7 +3596,7 @@ def create_app(
 
     @app.get("/messages/{message_id}/responses", response_model=MessageResponses)
     async def get_message_responses(
-        message_id: str,
+        message_id: ResourceId,
         request: Request,
         engine: Engine = Depends(_get_engine),
         identity: Identity = Depends(require_phi_read(Permission.MESSAGES_READ)),
@@ -3636,7 +3649,7 @@ def create_app(
 
     @app.get("/messages/{message_id}/outbound", response_model=OutboundPayloads)
     async def get_message_outbound(
-        message_id: str,
+        message_id: ResourceId,
         request: Request,
         engine: Engine = Depends(_get_engine),
         identity: Identity = Depends(require_phi_read(Permission.MESSAGES_VIEW_RAW)),
@@ -3680,7 +3693,7 @@ def create_app(
 
     @app.post("/messages/{message_id}/replay", response_model=ReplayResult)
     async def replay_message(
-        message_id: str,
+        message_id: ResourceId,
         request: Request,
         engine: Engine = Depends(_get_engine),
         identity: Identity = Depends(require_step_up(Permission.MESSAGES_REPLAY)),
@@ -3712,7 +3725,7 @@ def create_app(
 
     @app.post("/messages/{message_id}/resend", response_model=ResendResult)
     async def resend_message(
-        message_id: str,
+        message_id: ResourceId,
         body: ResendRequest,
         request: Request,
         engine: Engine = Depends(_get_engine),
@@ -3796,7 +3809,7 @@ def create_app(
 
     @app.post("/messages/{message_id}/edit-resend", response_model=EditResendResult)
     async def edit_resend_message(
-        message_id: str,
+        message_id: ResourceId,
         body: EditResendRequest,
         request: Request,
         engine: Engine = Depends(_get_engine),
@@ -4273,13 +4286,13 @@ def create_app(
     @app.get("/uploads/{file_id}/messages", response_model=UploadedMessagesResult)
     async def browse_uploaded_file_get(
         request: Request,
-        file_id: str,
+        file_id: ResourceId,
         engine: Engine = Depends(_get_engine),
         identity: Identity = Depends(require_step_up(Permission.FILES_BROWSE)),
         field_path: str | None = Query(None, max_length=32),
         target: str = Query("both", pattern="^(raw|summary|both)$"),
-        message_type: str | None = Query(None, max_length=64),
-        control_id: str | None = Query(None, max_length=256),
+        message_type: MessageTypeFilter | None = Query(None),
+        control_id: ControlIdFilter | None = Query(None),
         limit: int = Query(50, ge=1, le=500),
         offset: int = Query(0, ge=0),
     ) -> UploadedMessagesResult:
@@ -4305,7 +4318,7 @@ def create_app(
     @app.post("/uploads/{file_id}/messages/search", response_model=UploadedMessagesResult)
     async def browse_uploaded_file_post(
         request: Request,
-        file_id: str,
+        file_id: ResourceId,
         criteria: UploadedMessageSearchRequest,
         engine: Engine = Depends(_get_engine),
         identity: Identity = Depends(require_step_up(Permission.FILES_BROWSE)),
@@ -4331,7 +4344,7 @@ def create_app(
     @app.post("/uploads/{file_id}/resend", response_model=UploadResendResult)
     async def resend_uploaded_message(
         request: Request,
-        file_id: str,
+        file_id: ResourceId,
         body: UploadResendRequest,
         engine: Engine = Depends(_get_engine),
         identity: Identity = Depends(require_step_up(Permission.FILES_BROWSE)),
@@ -4395,7 +4408,7 @@ def create_app(
     @app.delete("/uploads/{file_id}", response_model=UploadDeleteResult)
     async def delete_uploaded_file(
         request: Request,
-        file_id: str,
+        file_id: ResourceId,
         engine: Engine = Depends(_get_engine),
         identity: Identity = Depends(require_step_up(Permission.FILES_DELETE)),
     ) -> UploadDeleteResult:
@@ -4504,7 +4517,7 @@ def create_app(
 
     @app.delete("/search/presets/{preset_id}", response_model=SearchPresetDeleteResult)
     async def delete_search_preset(
-        preset_id: str,
+        preset_id: ResourceId,
         request: Request,
         engine: Engine = Depends(_get_engine),
         identity: Identity = Depends(require(Permission.MESSAGES_READ)),
@@ -4528,7 +4541,7 @@ def create_app(
         request: Request,
         engine: Engine = Depends(_get_engine),
         identity: Identity = Depends(require_step_up(Permission.MESSAGES_READ)),
-        presets: str = Query(..., max_length=1024),
+        presets: LayeredPresetIds = Query(..., max_length=1024),
         limit: int = Query(50, ge=1, le=500),
         scan_limit: int = Query(DEFAULT_CONTENT_SCAN_LIMIT, ge=1, le=MAX_CONTENT_SCAN_LIMIT),
     ) -> MessageSearchResults:

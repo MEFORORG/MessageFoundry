@@ -87,6 +87,7 @@ catalog, and **[../CHANGELOG.md](../CHANGELOG.md)**, which is authoritative for 
 | [../.github/SECURITY.md](../.github/SECURITY.md) | **Vulnerability disclosure policy.** Report here. |
 | [SECURITY.md](SECURITY.md) | Authentication and RBAC — *not* the disclosure policy, despite the name. |
 | [PHI.md](PHI.md) | Where PHI can and cannot go, and what the engine guarantees. |
+| [API-INPUT-VALIDATION.md](API-INPUT-VALIDATION.md) | What the operator API accepts for each kind of data item you send it — ids, connection names, time bounds, search terms — and which input surfaces those rules do *not* reach. Control plane only; message payloads are `HL7-VALIDATION.md`. |
 | [ASVS-L2-PHASE0-CHANGES.md](ASVS-L2-PHASE0-CHANGES.md) | §4 key/crypto inventory and §5 communications inventory, both CI-drift-guarded. §1–§3 are a historical phase changelog. |
 | [Secure_Development_Standards.md](Secure_Development_Standards.md) | The standards the build process holds itself to. |
 | [SECURITY-LOOSENING.md](SECURITY-LOOSENING.md) | The inverse of a hardening guide: every `[security]` switch defaults to the protective position, and this is what moving one off it costs. |
