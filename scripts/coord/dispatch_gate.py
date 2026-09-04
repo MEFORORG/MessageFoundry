@@ -541,6 +541,22 @@ def tree_note(ref: str, cited: tuple[str, ...]) -> str:
     )
 
 
+def cited_locations(found: Finding | None) -> tuple[str, ...]:
+    """The joined-form locations this gate will act on, and nothing else. Pure.
+
+    THE JOINED-FORM-ONLY DECISION LIVES HERE SO ONE TEST CAN PIN IT. Inlined at the call site it
+    would be a `.strict` attribute access nobody reads twice, and widening it to `.loose` would flood
+    the dispatch path with pull-request numbers that happen to match an item number.
+
+    The dispatch on ``.level`` is explicit rather than a truthiness test over ``.strict``, for the
+    reason :meth:`Finding.level` records in the screen: this gate's own scar is an ``if good`` over a
+    function that had started returning a level string, which made every level truthy.
+    """
+    if found is None or found.level != CITED:
+        return ()
+    return found.strict
+
+
 def merge_tree_finding(level: str, note: str, ref: str, cited: tuple[str, ...]) -> tuple[str, str]:
     """Fold one row's tree answer into :func:`judge`'s answer. Pure, so it needs no repository.
 
@@ -900,10 +916,7 @@ def main(argv: list[str] | None = None) -> int:
             unknown.append(num)
             continue
         level, note = judge(row.item, body=row.body, banner=row.banner)
-        found = tree.get(num)
-        # `.strict` and never `.loose`: a bare `#N` spells a pull-request number too. See the
-        # comment above `merge_tree_finding`.
-        cited = found.strict if found is not None and found.level == CITED else ()
+        cited = cited_locations(tree.get(num))
         if cited:
             tree_hits += 1
         level, note = merge_tree_finding(level, note, args.tree_ref, cited)
