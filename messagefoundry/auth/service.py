@@ -817,7 +817,7 @@ class AuthService:
                 await self._notify_security(
                     ACCOUNT_LOCKED,
                     username=user.username,
-                    email=user.email,
+                    email=user.notify_email,
                     client=client,
                     detail={"failed_attempts": attempts},
                 )
@@ -887,7 +887,7 @@ class AuthService:
             await self._notify_security(
                 LOGIN_AFTER_FAILURES,
                 username=user.username,
-                email=user.email,
+                email=user.notify_email,
                 client=client,
                 detail={"failed_attempts": prior_failures},
             )
@@ -1314,7 +1314,7 @@ class AuthService:
             await self._notify_security(
                 FEDERATED_IDENTITY_BOUND,
                 username=user.username,
-                email=user.email,
+                email=user.notify_email,
                 client=client,
                 detail={"issuer": federated_subject[0]},
             )
@@ -1338,7 +1338,7 @@ class AuthService:
             await self._notify_security(
                 ROLES_CHANGED,
                 username=user.username,
-                email=user.email,
+                email=user.notify_email,
                 client=client,
                 detail={"roles": role_ids},
             )
@@ -1649,7 +1649,7 @@ class AuthService:
             await self._notify_security(
                 ACCOUNT_DISABLED if revocation.role_ids is None else ROLES_CHANGED,
                 username=user.username,
-                email=user.email,
+                email=user.notify_email,
                 detail={"reason": revocation.reason},
             )
 
@@ -2107,7 +2107,7 @@ class AuthService:
         await self._notify_security(
             ADMIN_NEW_IP,
             username=username,
-            email=user.email if user is not None else None,
+            email=user.notify_email if user is not None else None,
             client=client_ip,
             detail={"known_ip": session.client},
         )
@@ -2140,7 +2140,7 @@ class AuthService:
         await self._notify_security(
             PASSWORD_CHANGED,
             username=identity.username,
-            email=user.email if user is not None else None,
+            email=user.notify_email if user is not None else None,
             client=client,
         )
         return []
@@ -2271,7 +2271,7 @@ class AuthService:
         await self._store.mark_session_mfa_verified(hash_token(token))
         await self._audit("auth.mfa_enrolled", actor=identity.username, client=client)
         await self._notify_security(
-            MFA_ENABLED, username=user.username, email=user.email, client=client
+            MFA_ENABLED, username=user.username, email=user.notify_email, client=client
         )
         return plain
 
@@ -2319,7 +2319,7 @@ class AuthService:
             await self._notify_security(
                 ACCOUNT_LOCKED,
                 username=user.username,
-                email=user.email,
+                email=user.notify_email,
                 client=client,
                 detail={"failed_attempts": attempts},
             )
@@ -2415,7 +2415,7 @@ class AuthService:
         await self._notify_security(
             MFA_DISABLED,
             username=identity.username,
-            email=user.email if user is not None else None,
+            email=user.notify_email if user is not None else None,
             client=client,
         )
 
@@ -2444,7 +2444,7 @@ class AuthService:
             ),
         )
         await self._notify_security(
-            MFA_DISABLED, username=user.username, email=user.email, detail={"reset": True}
+            MFA_DISABLED, username=user.username, email=user.notify_email, detail={"reset": True}
         )
 
     async def mfa_status(self, identity: Identity) -> MfaStatus:
@@ -2599,7 +2599,7 @@ class AuthService:
             client=client,
         )
         await self._notify_security(
-            MFA_ENABLED, username=user.username, email=user.email, client=client
+            MFA_ENABLED, username=user.username, email=user.notify_email, client=client
         )
         return True
 
@@ -2763,7 +2763,7 @@ class AuthService:
             await self._notify_security(
                 MFA_DISABLED,
                 username=user.username,
-                email=user.email,
+                email=user.notify_email,
                 client=client,
                 detail={"factor": "webauthn"},
             )
@@ -2826,6 +2826,19 @@ class AuthService:
     ) -> None:
         before = await self._store.get_user(user_id)  # capture old email/disabled for notifications
         await self._store.update_user_profile(user_id, display_name=display_name, email=email)
+        # THE ENGINE-OWNED NOTIFICATION ADDRESS MOVES ONLY HERE, AND ONLY UPWARDS (BACKLOG #1139).
+        # This is an administrator acting on the engine's own surface, so it is the one write allowed
+        # to repoint where notices go — the directory sync above (`update_user_profile`, which
+        # `_upsert_ad_user` also calls) is not.
+        #
+        # A BLANK ADDRESS FALLS THROUGH DELIBERATELY, and that is the durability rule in force: the
+        # profile mirror clears, and the notification address stands. Requiring an address at creation
+        # would not have achieved this on its own, because an explicit null still strips it afterwards
+        # — and an account with no address is excluded from every later notice, which is exactly the
+        # structural exclusion this item was filed against. `set_user_notify_email` takes `str`, so
+        # there is no way to spell the clear even by mistake.
+        if email is not None and email.strip():
+            await self._store.set_user_notify_email(user_id, email=email)
         if disabled is not None:
             await self._store.set_user_disabled(user_id, disabled=disabled)
             if disabled:
@@ -2853,12 +2866,12 @@ class AuthService:
                 await self._notify_security(
                     EMAIL_CHANGED,
                     username=before.username,
-                    email=before.email,
+                    email=before.notify_email,
                     detail={"new_email": email},
                 )
             if disabled and not before.disabled:
                 await self._notify_security(
-                    ACCOUNT_DISABLED, username=before.username, email=before.email
+                    ACCOUNT_DISABLED, username=before.username, email=before.notify_email
                 )
 
     async def delete_user(self, user_id: str, *, actor: str) -> None:
@@ -2878,7 +2891,7 @@ class AuthService:
             await self._notify_security(
                 ROLES_CHANGED,
                 username=user.username,
-                email=user.email,
+                email=user.notify_email,
                 detail={"roles": list(roles)},
             )
 
@@ -3017,7 +3030,7 @@ class AuthService:
             actor=actor,
             detail=_json({"user_id": user_id, "username": user.username}),
         )
-        await self._notify_security(PASSWORD_RESET, username=user.username, email=user.email)
+        await self._notify_security(PASSWORD_RESET, username=user.username, email=user.notify_email)
         return temp
 
     async def set_channel_scope(
@@ -3054,7 +3067,7 @@ class AuthService:
         return admins == {user_id}
 
     async def has_notifiable_admin(self) -> bool:
-        """True iff at least one ENABLED administrator has an email address on file.
+        """True iff at least one ENABLED administrator carries a NOTIFICATION address.
 
         BACKLOG #1020. The PHI startup gate computes notification readiness from the SMTP transport
         alone (``notify_security_events`` + ``email_smtp_host`` + ``email_from``), which answers
@@ -3069,6 +3082,12 @@ class AuthService:
         privileged account has the identical hole. Keying on the bootstrap user alone would close
         the instance this was found on and leave the class open.
 
+        **Reads ``notify_email``, not ``email`` (BACKLOG #1139).** Those are two columns now: ``email``
+        is the profile address and, on a directory account, a mirror the next AD login overwrites,
+        while ``notify_email`` is where the notice is actually addressed. Asking about ``email`` would
+        be the instrument answering the adjacent question (SDS-3.8) -- an administrator whose mirror
+        the directory had just repointed would read as notifiable on an address no notice uses.
+
         Enumerates as :meth:`is_last_enabled_admin` and :meth:`_other_enabled_admin_exists` do --
         same store calls, same disabled-skip, same role test. **That agreement is a convention, not
         a mechanism, and this docstring must not claim otherwise:** these are now THREE independent
@@ -3078,7 +3097,7 @@ class AuthService:
         here, because it would rewrite two guards this change has no business touching.
         """
         for user in await self._store.list_users():
-            if user.disabled or not user.email:
+            if user.disabled or not user.notify_email:
                 continue
             if Role.ADMINISTRATOR.value in await self._store.get_user_role_ids(user.id):
                 return True
