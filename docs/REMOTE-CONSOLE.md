@@ -194,13 +194,13 @@ Auth is on by default; remote users sign in with local accounts (± TOTP MFA) or
   is about the `/ui` cookie and HSTS and is suppressed by §3's auto-degrade in the same posture. See
   the `allow_single_factor_admin_when_exposed` row in [`CONFIGURATION.md`](CONFIGURATION.md) and
   [`SECURITY-LOOSENING.md`](SECURITY-LOOSENING.md).
-- Under the shipped `require_mfa_scope = "every_local_account"`, a non-interactive **local**
+- Under the shipped `require_mfa_scope = "every_local_account"`, a non-interactive
   bearer-token service account becomes MFA-pending and cannot enrol unattended. Settle this **before**
-  you turn exposure on, and note there are only **two** real destinations for such an account:
-  **make it a directory (AD/Kerberos) principal** — those are out of MFA scope under either value,
-  their factor being delegated to the directory — or set
+  you turn exposure on, and note there is only **one** real destination for such an account: set
   `[security].require_mfa_scope = "administrators"`, which is itself reported as a loosening on
-  `GET /security/posture` and leaves *any* local Administrator still in scope.
+  `GET /security/posture` and leaves *any* Administrator still in scope.
+  **Not** a directory (AD/Kerberos) principal: those used to be out of MFA scope under either
+  value, their factor delegated to the directory, and BACKLOG #1144 retired that.
   **Not** mTLS: `[api].tls_client_cert_identities` maps a verified client cert to a principal, but
   that plane is admitted on exactly one route (`GET /service/identity`) and carries no bearer/session
   access, so a service account moved there can read back its own identity and nothing else — it
