@@ -87,6 +87,12 @@ _RETIRED_CLAIMS = (
     "two handler filters",
     "same two handler filters",
     "[ai].production",
+    # #122 / ADR 0162: the engine DOES install a file handler now, when the opt-in [logging].file is
+    # set. Both spellings the inventory used to carry are retired, so the absence claim cannot creep
+    # back as a copy-edit — a security document asserting an absence that has stopped being true is
+    # precisely what this scanner exists to catch.
+    "installs no file handler",
+    "installs **no file handler**",
 )
 
 
@@ -225,6 +231,10 @@ def test_default_on_wording_matches_the_shipped_defaults() -> None:
         "§7 says the off-box forward format defaults to JSON"
     )
     assert logging_settings.forward_tls_verify is True, "§7 says TLS verification is on by default"
+    assert logging_settings.file is None, (
+        "§7 calls the engine-managed [logging].file sink OPT-IN; a default-on file sink is a new "
+        "at-rest PHI surface and needs its own inventory row (#122, ADR 0162)"
+    )
     assert alerts.security_notifications_required is True, (
         "§7 calls the per-user security-event channel posture-mandatory"
     )
@@ -554,6 +564,15 @@ def test_every_diagnostics_field_is_named_in_the_inventory() -> None:
 #: which is how ``tray.log`` shipped undocumented.
 _ALLOWED_SINK_MODULES: dict[str, str] = {
     "messagefoundry/logging_setup.py": "streams 1 + 2 (stdout/stderr, the off-box syslog forwarder)",
+    # #122 / ADR 0162. This module defines the guarded handler CLASSES for stream 1 —
+    # GuardedStreamHandler (stdout) and GuardedFileHandler (the opt-in `[logging].file`, a
+    # RotatingFileHandler subclass) — which logging_setup constructs, filters and installs. No new
+    # DESTINATION: stream 1's row names both, and the same three PHI filters are installed on each.
+    # LISTED rather than excluded, because the class that opens and rolls the file genuinely lives
+    # here, so a future sink added beside it must still trip this gate.
+    "messagefoundry/logging_guard.py": (
+        "stream 1 — the guarded handler classes for stdout and the opt-in `[logging].file`"
+    ),
     "messagefoundry/tray/__main__.py": (
         "the tray's RotatingFileHandler — named in 'Not in this inventory, and why'"
     ),

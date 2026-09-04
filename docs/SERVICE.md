@@ -390,6 +390,53 @@ icacls "C:\ProgramData\MessageFoundry\logs" /inheritance:r `
   /grant "Administrators:(OI)(CI)F" "NT SERVICE\MessageFoundry:(OI)(CI)M"
 ```
 
+### Who owns which log file, and what happens when one cannot be written
+
+Two things can write log files here, and **each file has exactly one owner** — two rotators renaming
+one file is how a log gets shredded, and the loser of that race is the log you read after an incident.
+
+| File | Owner | Rotation | Configured by |
+|---|---|---|---|
+| The captured stdout/stderr (`logs\service-*.log` above) | **NSSM** | NSSM, at ~10 MB | the install script; `[logging].log_dir` only *tells the engine where they are*, for `GET /status` metering (#50), log retention (#120) and the console's log viewer |
+| `[logging].file` (optional, off by default) | **the engine** | the engine, at `[logging].file_max_bytes`, keeping `file_backup_count` backups | `[logging]` in your settings TOML |
+
+`[logging].file` is **opt-in and unset by default**; leave it unset and the engine is stdout-only
+exactly as before. If you do set it, **put it outside `[logging].log_dir`** and do not point NSSM at
+it — the engine refuses to start otherwise, naming the collision.
+
+**The engine stops processing when it cannot log** (BACKLOG #122,
+ADR 0162), in two stages:
+
+1. **Roll.** A write failure renames the broken file aside as `<name>.broken-<UTC>-<n>`, opens a fresh
+   file at the live path, records the rollover event in it and re-writes the record that failed. A
+   momentary lock or an antivirus scan heals here and **stops nothing**.
+2. **Stop.** If the **replacement** cannot be written either, every connection this engine process
+   owns is stopped, in **all three tiers**: inbounds stop accepting, messages already accepted stop
+   being routed and transformed, and outbounds pause with their queued messages **retained** (not
+   dead-lettered). All three, because processing a message you cannot log is the thing being
+   prevented — not just accepting or sending one. You are told three ways — a `log_write_failed`
+   alert through the notifier (email/webhook, which does not go through the log that broke), a
+   `connection_stopped` alert per halted connection naming the log as the cause, and `GET /status`'s
+   `log_sinks` block, which is read from memory and still answers when the disk does not.
+
+Recover by fixing the disk or permissions and then **restarting the affected connections** — inbounds
+*and* outbounds — from the web console, or by restarting the service; the retained queue then drains.
+**Fix the disk first — the restart is refused while the log is still unwritable.** The engine
+re-checks by writing a real record to each dead sink at the moment you ask, so a restart issued
+against a still-broken disk leaves the connection halted (and its listener down) and raises another
+`log_write_failed` naming the refusal, rather than quietly resuming with no log. That is deliberate:
+otherwise "restart it again" would be a way around the control.
+A `/config/reload` on its own is **not enough**: it re-arms the inbounds it re-binds, so messages
+start being routed again, but it deliberately never resumes a paused **outbound** (that is an
+operator decision), so the backlog moves one stage and stops. Restarting the service does both.
+Set `[logging].on_write_failure = "continue"` if you would rather the engine keep
+running with no log — it still rolls and still alerts, it just does not stop. The `*.broken-*` files
+are incident evidence and are deliberately left for you to review and remove; nothing rotates them
+away.
+
+**The message store is unaffected by any of this.** It is a separate durable record: a message already
+accepted and committed was ACKed, and a log-write failure neither loses it nor re-delivers it.
+
 ## Admin console (in a browser)
 
 This service is **headless**. Operators watch and run it from the **browser web console** served
