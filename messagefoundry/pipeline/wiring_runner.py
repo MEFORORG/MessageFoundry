@@ -785,7 +785,8 @@ class RegistryRunner:
         batch_handoff_statements: bool = False,  # ADR 0075: SQL-Server-only per-hop batching (default-OFF)
         snapshot_on_send: bool = False,  # ADR 0104: copy-on-Send at Send construction (default-OFF)
         sandbox_policy: SandboxPolicy
-        | None = None,  # ADR 0087 #197: opt-in subprocess isolation (default-OFF)
+        | None = None,  # ADR 0087 #197: subprocess isolation. None here = in-process; the ENGINE
+        # renders [sandbox] into a policy and the shipped default of that setting is subprocess (#1278).
         sandbox_config_source: tuple[str | None, str | None] | None = None,
     ) -> None:
         self.registry = registry
@@ -797,7 +798,8 @@ class RegistryRunner:
         self._reply_rendezvous = ReplyRendezvous()
         #: Per-inbound sync-reply counters, exposed via sync_reply_metrics() (ADR 0154 D8).
         self._sync_reply_metrics: dict[str, SyncReplyMetrics] = {}
-        # ADR 0087 (#197) opt-in Router/Handler subprocess isolation. None or mode=off → in-process,
+        # ADR 0087 (#197) Router/Handler subprocess isolation, mode=subprocess by DEFAULT since
+        # #1278. None or mode=off → in-process,
         # byte-identical, zero overhead (no session ever constructed). mode=subprocess → one PERSISTENT
         # worker child per inbound, built lazily on first dispatch (off the loop, inside the worker
         # thread) and closed at stop(). The (config_dir, env) source lets the child re-load the SAME
@@ -2629,8 +2631,11 @@ class RegistryRunner:
         """The persistent sandbox worker for inbound ``name`` (ADR 0087), or ``None`` to run in-process.
 
         Returns ``None`` — the byte-identical in-process path — unless ``[sandbox].mode=subprocess``
-        AND a config source is available (an embedded runner with no config dir can't re-load the
-        graph in a child, so it degrades to in-process). The :class:`SandboxSession` object is created
+        AND a config source is available. **An embedded runner with no config dir cannot isolate** —
+        the child re-loads the graph from ``(config_dir, env)`` to look a function up by name, so with
+        no config dir it degrades to in-process. That degradation is silent, and since #1278 made
+        ``subprocess`` the default it is the path a library embedder now takes without asking for it;
+        every ``serve`` route carries a config dir. The :class:`SandboxSession` object is created
         here (cheap; loop-safe) but the child subprocess is spawned lazily inside the worker thread on
         first dispatch, so this never blocks the event loop. Sessions are reused per inbound and reaped
         at :meth:`stop`."""

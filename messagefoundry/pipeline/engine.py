@@ -194,8 +194,9 @@ class Engine:
         log_dir: str | None = None,
     ) -> None:
         self.store = store
-        # [sandbox] opt-in Router/Handler subprocess isolation (ADR 0087, #197). None → defaults
-        # (mode=off, byte-identical). Rendered into a SandboxPolicy passed to every runner this engine
+        # [sandbox] Router/Handler subprocess isolation (ADR 0087, #197). None → the SandboxSettings
+        # defaults, which since #1278 means mode=subprocess: a caller passing nothing gets isolation,
+        # not the in-process path. Rendered into a SandboxPolicy passed to every runner this engine
         # builds; read ONCE here (a /config/reload does NOT re-read it — restart to change).
         self._sandbox_settings = sandbox_settings or SandboxSettings()
         # L3 multi-process sharding (messagefoundry/pipeline/sharding.py): an optional pure transform
@@ -673,8 +674,9 @@ class Engine:
     def add_registry(self, registry: Registry) -> RegistryRunner:
         """Run a code-first Connection/Router/Handler graph (one runner for the whole graph)."""
         # ADR 0087 (#197): render [sandbox] into the runner's policy + the (config_dir, env) source a
-        # subprocess worker uses to re-load the graph. mode=off (the default) makes _sandbox_for a
-        # no-op — byte-identical, no child ever spawned.
+        # subprocess worker uses to re-load the graph. mode=subprocess (the default since #1278)
+        # spawns one persistent worker child per inbound that dispatches; mode=off makes _sandbox_for
+        # a no-op — byte-identical, no child ever spawned.
         from messagefoundry.pipeline.sandbox import SandboxMode, SandboxPolicy
 
         _sb = self._sandbox_settings

@@ -1292,23 +1292,52 @@ class PipelineSettings(_Section):
 
 
 class SandboxSettings(_Section):
-    """``[sandbox]`` — opt-in subprocess isolation for Routers/Handlers (ADR 0087, BACKLOG #197).
+    """``[sandbox]`` — subprocess isolation for Routers/Handlers (ADR 0087, BACKLOG #197/#1278).
 
-    Routers/Handlers are admin-authored pure Python the engine runs in its own address space (the
-    DEK, audit chain, and live sockets live there). ASVS 15.2.5 wants a hard isolation boundary; this
-    section turns one on. ``mode="off"`` (the default) runs them in-process, **byte-identically and
-    with zero overhead** — the isolation seam is invisible. ``mode="subprocess"`` runs each inbound's
+    **THIS DOES NOT STOP CONFIG PYTHON EXECUTING IN THE ENGINE PROCESS, and that is the first thing
+    to know about it.** The loader executes every ``*.py`` in the config directory in-process, as the
+    service account, at every ``serve`` and every reload, ungated by ``mode``
+    (:func:`messagefoundry.config.wiring.load_config`). What ``mode`` governs is where a Router's or
+    Handler's *body* runs once the graph is built — module top level is out of its reach either way,
+    and the safe-source DACL gate is still what covers that.
+
+    Routers/Handlers are admin-authored pure Python. In the engine's own address space sit the DEK,
+    the audit chain, and every live socket. ASVS 15.2.5 wants a hard isolation boundary; this section
+    is one. ``mode="subprocess"`` (**the default since BACKLOG #1278**) runs each inbound's
     Router/Handler in a **persistent per-inbound worker child** (never a per-message fork), enforcing
     a forbidden-import guard (socket/store/crypto), the resource caps below, and a fail-closed refusal
-    of the live ``db_lookup``/``fhir_lookup`` bridges (they re-enter the event loop — a subprocess
-    boundary breaks that; a Handler needing live enrichment runs with ``mode=off``). An isolation
+    of the live ``db_lookup``/``fhir_lookup`` bridges. ``mode="off"`` runs them in-process,
+    **byte-identically and with zero overhead** — the isolation seam is invisible. An isolation
     denial routes the message to ``ERROR``/dead-letter **post-ACK** (no NAK), never dropping it.
 
-    Reliability-core + read ONCE at engine construction (a ``/config/reload`` does NOT re-read it —
-    restart to change, exactly like ``claim_mode``)."""
+    **What the default costs, all of it measured in ADR 0087 (do not re-derive):**
 
-    # off (default, byte-identical, no subprocess) | subprocess (persistent per-inbound worker child).
-    mode: Literal["off", "subprocess"] = Field(default="off")
+    * **Live enrichment is refused.** ``db_lookup``/``fhir_lookup`` re-enter the event loop, which a
+      process boundary breaks, so they fail closed inside the child. **A Handler needing either must
+      run ``mode="off"``** — that escape is supported and is not going away.
+    * **``wall_seconds`` starts being enforced.** At ``mode="off"`` there is no timeout at all; at
+      ``mode="subprocess"`` the parent kills a worker that overruns and dead-letters that message
+      post-ACK. A busy-loop can no longer wedge intake, **and** a legitimately slow Handler that used
+      to finish now dead-letters. ``startup_seconds`` and the POSIX ``cpu_seconds``/``mem_mb`` arm
+      with it.
+    * **Throughput** ~0.19 ms per dispatch with no reference view; a 20k-entry crosswalk ~4.5 ms
+      marshalling and ~6.2 ms end-to-end, ~1.4x a pickle round-trip — inside the pipeline's existing
+      per-interface bound. **One message is not one dispatch:** a message routed to one handler with
+      an ``accepts=`` predicate costs three (router, predicate, transform), and fan-out to K handlers
+      costs 1 + 2K, each re-marshalling the reference view.
+    * **Per inbound with traffic:** one child process, two parent daemon threads (frame reader +
+      stderr relay), three parent pipe fds, and on Windows a job-object handle.
+    * **The pre-deploy gate does not learn this setting.** ``messagefoundry check`` and ``dryrun``
+      always run in-process (:func:`messagefoundry.pipeline.dryrun.dry_run` takes no ``sandbox``
+      argument), so a Handler calling ``db_lookup``/``fhir_lookup`` passes the gate green and then
+      fails closed at ``serve``.
+
+    Reliability-core + read ONCE at engine construction (a ``/config/reload`` does NOT re-read it —
+    **restart to change**, exactly like ``claim_mode``)."""
+
+    # subprocess (DEFAULT since #1278; persistent per-inbound worker child) | off (in-process,
+    # byte-identical, zero overhead — and the supported escape for a Handler needing live enrichment).
+    mode: Literal["off", "subprocess"] = Field(default="subprocess")
     # Authoritative wall-clock cap (seconds) per Router/Handler call on EVERY platform: the parent
     # kills a worker that overruns it, so a pathological busy-loop can never wedge intake. Floor > 0.
     wall_seconds: float = Field(default=5.0, gt=0)
