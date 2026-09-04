@@ -8,8 +8,11 @@ and stalling commits -- collapsed the numerator while the denominator kept ticki
 fell and the gate went red with **no engine change**. Measured on one commit, one box: four contended
 replicates spread **0.451 to 2.49** against a 0.75 floor. That is a coin flip, not a detector.
 
-The fix reads ``empty_claims_per_msg`` instead. Both inputs are deltas over the SAME first-to-last
-in-hold samples, so the span cancels and the quantity is exactly ``Δempty_claims / Δread``.
+The fix reads ``empty_claims_per_msg`` instead. Both inputs are deltas over the SAME window --
+``samples[0]`` to ``samples[-1]`` -- so the span cancels and the quantity is exactly
+``Δempty_claims / Δread``. That window is the hold PLUS the step's post-drain tail, NOT the hold
+alone; it is defined once, in ``harness.load.connscale.runner._empty_claim_rates``, and this
+paragraph used to call it "in-hold", which the final sample is not (BACKLOG #1420).
 
 **These tests exist to stop the fix from being the WRONG kind of fix.** A metric that never fails is
 not an improvement on one that fails at random, and a correction is the easiest place to skip

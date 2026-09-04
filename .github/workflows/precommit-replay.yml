@@ -1,0 +1,142 @@
+name: pre-commit replay
+
+# Re-runs the commit-time gates in CI, because git does not run them for a replayed commit
+# (BACKLOG #1395).
+#
+# THE DEFECT THIS ANSWERS, measured with a positive control. `git` never invokes the `pre-commit`
+# hook for a commit created by the sequencer. An ordinary `git commit` printed 11 hook result lines;
+# a `git cherry-pick` and a `git rebase --continue` each printed 0 and still created a commit. So a
+# rebase -- which every branch behind `main` needs, and which is an entirely innocent daily operation
+# -- lands a commit with NONE of the eleven gates having run, and nothing anywhere reports it. The
+# commit is indistinguishable from a gated one afterwards: `git log` cannot show which commits were
+# gated, and the only evidence is the terminal output of the run that created it.
+#
+# WHY A CI RE-RUN RATHER THAN A `post-rewrite` / `pre-merge-commit` HOOK PAIR. #1395 names both and
+# prefers this one, for a reason that is structural rather than a preference: a local hook is
+# advisory by construction, and this row is the proof. A second local hook can be skipped by the same
+# class of workflow that skips the first.
+#
+# WHAT THIS LEG ACTUALLY ADDS, STATED HONESTLY, BECAUSE OVERSTATING IT WOULD MAKE IT THE
+# "COMPENSATING CONTROL RESTING ON A FALSE PREMISE" THAT CLAUDE.md SECTION 11 FORBIDS.
+#
+#   * IT IS NOT THE FIRST LINE, AND IT IS NOT EVEN EARLY. Ten of the eleven hooks already have a
+#     hand-written CI mirror that runs on the tip tree, so on a replayed commit the leak guard and
+#     the secret detector are LATE, not absent. This leg is late in the same way -- a push to this
+#     public repository publishes before any runner starts. It buys defence in depth, not earliness.
+#   * IT DOES NOT INSPECT INDIVIDUAL COMMITS. `--from-ref/--to-ref` resolves a CHANGED-FILE set
+#     between two refs and runs the hooks against the checked-out tree. Content that exists only in
+#     an intermediate commit and never reaches the tip is out of its reach, exactly as it is out of
+#     the tip-tree mirrors' reach.
+#   * WHAT IT DOES BUY IS THAT IT CANNOT DRIFT. Every other CI mirror is a separate hand-maintained
+#     re-implementation of a hook, and that drift has already happened once in this repository (see
+#     the "again" in security.yml's bandit comment). This leg runs THE HOOKS THEMSELVES, with their
+#     own args, from their own pinned environments -- so for the nine it runs, hook-versus-CI
+#     equivalence is true by construction rather than by a test. It also covers a future hook that is
+#     added with no mirror at all.
+#
+# TWO HOOKS ARE SKIPPED, AND THE RULE IS NARROW: skip only where running it here would produce a
+# WRONG answer -- a green that means nothing, or a red that is not the pull request's fault.
+# Everything else runs.
+#
+#   ledger-gate        Its hook entry carries no `--ci`, so the OWNERSHIP arm would run. That arm
+#                      reads an allocation registry living in `.git/mefor-coord/`, which never
+#                      reaches a runner, so it would red every pull request on a check no author can
+#                      satisfy. ci.yml already runs `ledger_check.py --ci`, which is the
+#                      duplicate-number half -- the half CI can enforce. #1395 records that the
+#                      ownership arm is unavoidably CI-skipped rather than an oversight, and this
+#                      leg must not "fix" that by teaching CI to read allocations.
+#   forbidden-content  The hook fails closed via `--require-tokens`, and the real token list is a
+#                      git-ignored file that no runner has. Reproducing security.yml's fork/secret
+#                      branching in a NON-REQUIRED leg would either red every fork pull request, or
+#                      hand back a structural-only green that reads as a leak-gate pass. Both are
+#                      worse than not running it. security.yml's `forbidden-content` job is REQUIRED
+#                      and scans the whole tree with the token secret and a per-section detector
+#                      floor; branch-leak-scan.yml runs the same scanner on every push. Nothing is
+#                      lost by skipping it here.
+#
+# tests/test_gate_ci_mirror_parity.py pins that skip list to exactly those two ids. Without that, the
+# list grows one convenient entry at a time until the leg runs nothing and still reports green.
+#
+# NOT A REQUIRED CHECK, and it must not become one without the owner's decision. Branch protection's
+# required set is read from the server, and `.github/required-contexts.txt` plus the count pinned in
+# tests/test_required_contexts.py have to move in the same pull request as any change to it. This job
+# is deliberately absent from that file. It is non-required for a second reason too: it builds every
+# pinned hook environment from scratch on each run, so it is the slowest way to learn any of these
+# facts and belongs off the critical path.
+#
+# NO `paths:` FILTER, DELIBERATELY. The subject is "which gates ran on the commits in this pull
+# request", and that question is live for any diff. A paths filter would answer it only for pull
+# requests that happen to touch the files it names.
+#
+# NO `merge_group:` TRIGGER, DELIBERATELY. A non-required context cannot gate a queue entry, so
+# running it there would spend queue time and change no outcome. (For a REQUIRED check the omission
+# would be the total failure codeql.yml's header records under BACKLOG #340 -- that hazard is the
+# reason this line says why it is absent rather than leaving it to be re-derived.)
+#
+# NO HOOK-ENVIRONMENT CACHE. `actions/cache` is used by no workflow in this repository, so adding the
+# first one means choosing and pinning a new third-party action -- its own decision, not a side
+# effect of this leg. The cost is a few minutes on a job that blocks nothing.
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: precommit-replay-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  replay:
+    name: pre-commit re-run over the diff
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      # fetch-depth: 0 is required, not defensive. `--from-ref/--to-ref` resolves the changed-file
+      # set between two refs, which needs a merge base; the default depth-1 checkout gives the head
+      # no history to find one in, so a shallow fetch of the base alone would not help.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false # read-only lint job; do not persist the token (zizmor: artipacked)
+
+      # setup-python is LOAD-BEARING HERE, not boilerplate. Four of the hooks are `language: system`
+      # with `entry: python ...`, and .pre-commit-config.yaml records the measurement that `python`
+      # (as distinct from `python3`) is not on a stock Ubuntu PATH. setup-python puts both on PATH,
+      # which is what lets those four resolve at all on this runner.
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.14'
+
+      # Pinned to the version this repository has actually measured against: the comments in
+      # tests/test_lint_scope_parity.py and .pre-commit-config.yaml both record behaviour verified
+      # against pre-commit 4.6.1. It is version-pinned but NOT hash-pinned, which is a real residual:
+      # pre-commit is in no dependency group, and adding one means a `uv lock`/`uv export` pass.
+      # Routing it through ci/locks/ the way the scanners are is the correct end state.
+      - name: Install pre-commit
+        run: python -m pip install --disable-pip-version-check "pre-commit==4.6.1"
+
+      # The base branch, resolved by NAME rather than by SHA so a re-targeted pull request still
+      # compares against the branch it will actually merge into. On workflow_dispatch there is no
+      # base_ref, so it falls back to the repository default branch.
+      - name: Fetch the base branch
+        env:
+          BASE_REF: ${{ github.base_ref || github.event.repository.default_branch }}
+        run: git fetch --no-tags origin "+refs/heads/${BASE_REF}:refs/remotes/origin/${BASE_REF}"
+
+      # SKIP is pre-commit's own comma-separated hook-id list. The two ids and the reasoning are in
+      # the header; tests/test_gate_ci_mirror_parity.py asserts this value stays exactly those two.
+      #
+      # This step may go red because a hook REWROTE a file rather than because it found something --
+      # `ruff-check` carries `args: [--fix]`. That is the same signal a developer gets locally, and
+      # --show-diff-on-failure prints the rewrite so the report says what to apply.
+      - name: Re-run every commit-time gate over the pull request diff
+        env:
+          BASE_REF: ${{ github.base_ref || github.event.repository.default_branch }}
+          SKIP: ledger-gate,forbidden-content
+        run: |
+          pre-commit run \
+            --show-diff-on-failure \
+            --from-ref "refs/remotes/origin/${BASE_REF}" \
+            --to-ref HEAD
