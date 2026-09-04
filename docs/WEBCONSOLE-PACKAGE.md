@@ -194,12 +194,27 @@ add/remove an `app.state` hook or a consumed `AuthService` member):
 5. At release, update the compat range on both sides (the engine `[webconsole]` extra and the package's
    `messagefoundry>=X,<Y` dep) — see the RELEASE checklist.
 
-**On a merge conflict over the seam, neither side is correct.** If your branch and the base both moved
-the contract surface, all three files carrying the value conflict — and the *merged* surface derives a
-**third** digest matching neither branch. That is #1220 working as designed: taking either side would
-ship a value describing a tree that does not exist, and it would look like an ordinary conflict
-resolution. Resolve the markers to anything at all, rerun `--write`, then set the console side by hand
-from its output.
+**After any merge that moved the contract surface, regenerate. A clean merge is not evidence of a
+correct digest.**
+
+On a conflict, neither side is correct. If your branch and the base both moved the surface, the
+*merged* surface derives a **third** digest matching neither branch, so taking either side ships a
+value describing a tree that does not exist — and it looks like an ordinary conflict resolution.
+Resolve the markers to anything at all, rerun `--write`, then set the console side by hand from its
+output.
+
+The quieter half is why the rule is worded for every merge rather than for conflicts. The three files
+do not conflict together: the constant is one line and collides visibly, while the golden is long and
+its sections **auto-merge**. That is the #1220 origin story exactly — two branches, a cosmetic conflict
+in the constant's comment block, a golden that merged clean carrying both changes, and *resolving the
+visible conflict correctly still shipped the fault*. Nothing raises its hand for the half that merged
+quietly.
+
+What catches it is that `test_the_stored_seam_equals_the_derived_digest` **recomputes** from the
+surface rather than comparing two stored copies, so a stale digest reds CI. The consequence is
+therefore a red leg and a clean `main`, not a shipped wrong seam — but it presents as an
+unrelated-looking test failure on a merge somebody just resolved by hand, which is how a reader ends
+up debugging the gate instead of rerunning `--write`.
 
 If you see the snapshot test fail **without** having intended a contract change, that is the gate doing
 its job: an incompatible change leaked in. Fix the change, or make the contract change deliberately and
