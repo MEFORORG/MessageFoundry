@@ -21997,3 +21997,65 @@ So `test_the_script_prefers_its_own_repo_over_an_earlier_path_entry` supplies th
 **Verification:** 8 passed in `tests/test_webconsole_seam_snapshot.py`. Mutation check run rather than argued -- with the `sys.path.insert` line deleted, the decoy test reds naming the decoy import, and the by-path digest test **stays green**, which is the luck described above measured rather than predicted. Anchor restored, 8 passed again.
 
 **Adjacent and NOT fixed here, named rather than numbered.** `docs/WEBCONSOLE-PACKAGE.md`'s seam-refresh procedure is stale in three steps left behind by #1220: it says to bump `ENGINE_UI_SEAM` by hand (`1` to `2`) when the value is a derived digest, it says to update curated lists in this script that #1220 retired, and its step 5 prescribes `python scripts/webconsole_seam_snapshot.py > tests/golden/...`, the shell redirect this script's own docstring forbids because PowerShell's `>` writes UTF-16LE with a BOM into a file the test reads as UTF-8. That is doc drift with its own cause and it wants its own item; folding a documentation rewrite into a `sys.path` fix would make both harder to review.
+## 1437. redact() is quadratic on a delimiter-free run and its linear-scan test cannot see it
+
+> 🚧 **Filed 2026-09-03. FIXED IN THE SAME CHANGE, NOT YET ON MAIN.** Found while fixing the sibling defect under #1385. `tests/test_redaction.py`'s `test_redact_free_text_heuristic_is_linear` asserted that `redact` scans in linear time. **Two things were wrong and they compound.** The arm timed `"A " * 5000`, whose longest delimiter-free token is ONE character, against a bare `< 1.0` literal from a single sample -- an input on which every candidate pattern, guarded or not, is trivially linear. And the property it named is false: `_HL7_FIELD_RUN` is quadratic on a long delimiter-free run, so the arm passed green over the defect it existed to catch, from `2a6693f33` (2026-08-13) until this change.
+>
+> **Scored 2026-09-03 -> P1.** Value **7/10** · Difficulty **2/10** · _quick win_. Value 7: `redact` is the PHI chokepoint on the exception and logging path and runs synchronously on the asyncio event loop, its input is attacker-influenceable and is not length-bounded, and a 20,000-character run cost 1.05 s. Not higher, because section 0 applies -- zero instances run, so nothing is stalling today. Difficulty 2: the fix is one lookbehind, and the equivalence that makes it safe is machine-checkable.
+> Verdict: fix
+> Research: none
+> Closing-act: code
+
+**Cluster:** PHI redaction / algorithmic denial of service. **Priority:** P1.
+**Severity:** no deployment axis (section 0). Zero instances run, so nothing is stalling an event loop today. Everything below is what a **first** deployment would meet.
+
+### Limb 1 -- the guard was real, the property it claimed was not
+
+[`redaction.py`](../messagefoundry/redaction.py)'s comment on `_HL7_FIELD_RUN` said the possessive quantifiers `*+` make the scan **linear**, naming `"a"*5000` as the input they protect against. Possessive quantifiers do remove backtracking inside one match attempt, and that is a real saving. **It is not where the cost was.**
+
+The leading `[^\s|^~&]*+` can match empty, so the engine restarts the pattern at **every offset**. Inside one long delimiter-free run each restart re-scans the rest of the run, which is quadratic whether or not the quantifier gives characters back. Possessive matching halved the constant and left the exponent alone.
+
+Measured 2026-09-03 on a dev box, through the shipping `redact` entry point:
+
+| input | pre-guard (greedy) | shipped before this change (possessive) | with the lookbehind |
+|---|---|---|---|
+| 5,000-char run | 0.116 s | 0.043 s | 0.00011 s |
+| 12,000-char run | 0.762 s | 0.419 s | 0.00049 s |
+| 20,000-char run | 2.36 s | **1.11 s** | **0.00053 s** |
+
+Four times the input, sixteen times the cost, in both of the first two columns. That is the signature the arm was written to detect.
+
+**The fix is a second guard, not a wider number.** `(?<![^\s|^~&])` admits a match only where the previous character is whitespace, a delimiter, or start-of-string, so a delimiter-free run gets ONE attempt instead of one per character and every other offset fails the lookbehind in constant time. It is the exact complement of the character class that follows it, so it cannot change what matches. Verified against the pre-guard pattern over **200,000 randomized delimiter-heavy strings with zero disagreements**, plus the HL7-shaped lines now parametrized into `test_the_linear_scan_guard_does_not_change_what_is_redacted`. A `\b` guard would have been the tempting spelling and is **not** equivalent: `-`, `.` and `:` are word boundaries but also live inside `[^\s|^~&]`, so `\b` would drop them from the front of a redacted span.
+
+### Limb 2 -- the input is not bounded, and the scan is on the event loop
+
+Two properties turn a slow regex into a whole-engine stall, and neither is obvious from the call site.
+
+1. **The truncation runs after the scan, not before it.** `safe_text` computes `redact(text)` and *then* applies `limit`, so the 200-character default bounds what reaches a stored `last_error`, not what the scan reads.
+2. **The logging filter has no bound at all.** `redact` is installed as a handler filter in [`logging_setup.py`](../messagefoundry/logging_setup.py) and rewrites whole rendered tracebacks, on whatever thread emitted the record -- for the engine, the asyncio event loop.
+
+The hostile shape is ordinary. The base64 alphabet contains none of `| ^ ~ &` and no whitespace, so an `mfb64:v1:` payload ([ADR 0028](adr/0028-base64-binary-carriage-codec.md)) quoted into an exception message or a traceback is one token to this scan. A Router or Handler raising with a message built from the received body produces exactly that.
+
+**One narrowing worth recording:** a base64 blob sitting *inside* an HL7 segment line is not the expensive case. `_HL7_SEGMENT` runs first and replaces the whole line, so the field-run scan never sees the blob. The expensive case is a bare run with no segment header, which is what a free-text exception message carries.
+
+### What the replacement test does
+
+`tests/test_redaction.py` now times the shipping `redact` on a 16,000-character delimiter-free run against one `_SCAN_BUDGET_SECONDS` line (0.05 s), with the **pre-fix** pattern swapped into that same path as a live positive control that must EXCEED the same line. Margins run in opposite directions across it: 93x above against the worst of 15 samples, 12.9x below against the best of 15.
+
+**The control is the possessive-without-lookbehind form, deliberately.** That is the half-fix. A control that only a fully unguarded pattern could fail would leave a band in which the half-fix cleared both arms -- which is the state this row found shipped.
+
+A third arm, `test_the_hostile_fixture_is_actually_hostile`, asserts the fixture's longest delimiter-free token directly, and pins the replaced arm's input at token length 1 for the record. Token length is the only property of an input that makes this scan expensive, so it is what a cost arm must assert about its fixture.
+
+### The mutation pair, one variable changed
+
+The mutation removes the `(?<![^\s|^~&])` lookbehind, restoring the pattern that shipped before this change:
+
+| test body | baseline (guarded) | under the SAME mutation |
+|---|---|---|
+| new | 35 passed in 2.18 s | **1 failed, 34 passed** in 5.47 s -- `cost 0.4643s ... against a 0.05s budget` |
+| old | 15 passed in 0.65 s | **15 passed** in 0.87 s -- completely invisible |
+
+### Still open
+
+- **Other single-sample wall-clock arms are not surveyed.** This row fixed the one it was pointed at and the sibling under #1385. Nobody has swept the suite for the same shape.
+- **`safe_text` redacts before it truncates, and that ordering is unchanged.** It is the safe ordering for PHI -- truncating first could cut a span mid-match -- and with the scan linear the cost argument for reversing it is gone. Recorded so the next reader does not re-derive the question.
