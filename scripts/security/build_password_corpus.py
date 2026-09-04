@@ -36,11 +36,11 @@ digest changes when anything changes; the block additionally records what each r
 rebuild that silently reordered or truncated a run is legible in the diff instead of showing up as
 one opaque hex string that moved.
 
-THE DIGEST IS TAKEN OVER LF-NORMALIZED BYTES, DELIBERATELY. The corpus is a text file with a ``-text``
-attribute (see ``.gitattributes``), so a checkout should hold the committed LF bytes on every
-platform. Normalizing anyway means the recorded digest still answers "is this the same corpus" on a
-checkout made before that attribute landed, which would otherwise hold CRLF and fail with a hex
-mismatch that names nothing. The loader (``messagefoundry.auth.policy._common_passwords``) splits on
+THE DIGEST IS TAKEN OVER LF-NORMALIZED BYTES, DELIBERATELY. The corpus carries ``text=auto eol=lf``
+(see ``.gitattributes``), so a checkout should hold the committed LF bytes on every platform.
+Normalizing anyway means the recorded digest still answers "is this the same corpus" on a checkout
+made before that attribute landed, which would otherwise hold CRLF and fail with a hex mismatch that
+names nothing. The loader (``messagefoundry.auth.policy._common_passwords``) splits on
 line boundaries and strips, so line endings cannot change what the engine screens against.
 
 THE FILTER IS THE SHIPPED POLICY OBJECT, NOT A LENGTH TEST. ASVS 6.2.4 asks for the top passwords

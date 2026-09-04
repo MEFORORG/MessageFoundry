@@ -8,7 +8,7 @@ import hashlib
 import importlib.util
 import sys
 from pathlib import Path
-from typing import Any
+from types import ModuleType
 
 import pytest
 
@@ -175,10 +175,11 @@ def test_breach_corpus_meets_the_asvs_6_2_4_policy_matching_bar() -> None:
     from messagefoundry.auth.policy import _common_passwords
 
     matches_policy = PasswordPolicy(check_breached=False, check_username=False)
+    bar: int = _corpus_generator().ASVS_6_2_4_BAR  # stated once, in the generator
     clearing = [e for e in _common_passwords() if not matches_policy.violations(e)]
-    assert len(clearing) >= 3000, (
+    assert len(clearing) >= bar, (
         f"only {len(clearing)} corpus entries clear the shipped policy; ASVS 6.2.4 wants at least "
-        "3000. A corpus can grow and still fail this -- the entries must MATCH THE POLICY"
+        f"{bar}. A corpus can grow and still fail this -- the entries must MATCH THE POLICY"
     )
 
 
@@ -203,7 +204,7 @@ def test_breach_corpus_growth_did_not_over_block_or_regress() -> None:
 # --- BACKLOG #1433: the notice's numbers are GENERATED, so one gate replaces every hand-copied one --
 
 
-def _corpus_generator() -> Any:
+def _corpus_generator() -> ModuleType:
     """Load the corpus generator by path. ``scripts/`` is not an importable package."""
     script = (
         Path(__file__).resolve().parents[1] / "scripts" / "security" / "build_password_corpus.py"
@@ -235,7 +236,9 @@ def test_the_corpus_notice_is_a_fixed_point_of_its_generator(
     assert module.check(None) == 0, capsys.readouterr().err
 
 
-def test_the_gate_sees_a_corpus_that_gained_one_entry(tmp_path: Path) -> None:
+def test_the_gate_sees_a_corpus_that_gained_one_entry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """MADE TO FAIL ON PURPOSE. The gate is evidence only if it can see the change class it exists
     to catch.
 
@@ -247,14 +250,11 @@ def test_the_gate_sees_a_corpus_that_gained_one_entry(tmp_path: Path) -> None:
 
     planted = tmp_path / "common_passwords.txt"
     planted.write_bytes(module.CORPUS_PATH.read_bytes() + b"a-planted-passphrase-entry\n")
-    original = module.CORPUS_PATH
-    try:
-        module.CORPUS_PATH = planted
-        assert module.render_block(module.measure()) != before
-    finally:
-        module.CORPUS_PATH = original
+    monkeypatch.setattr(module, "CORPUS_PATH", planted)
+    assert module.render_block(module.measure()) != before
 
-    assert module.render_block(module.measure()) == before  # and it restores exactly
+    monkeypatch.undo()
+    assert module.render_block(module.measure()) == before  # and it reads the path at call time
 
 
 def test_the_corpus_keeps_its_sub_minimum_entries() -> None:
@@ -269,9 +269,88 @@ def test_the_corpus_keeps_its_sub_minimum_entries() -> None:
     from messagefoundry.auth.policy import _common_passwords
 
     shipped = PasswordPolicy()
+    # Deliberately NOT the ASVS bar, which is also 3000 and counts the opposite population: that one
+    # counts entries CLEARING the floor, this one counts entries BELOW it. The collision is a
+    # coincidence, and a reader who fuses them draws a wrong conclusion from either.
+    sub_minimum_floor = 3000
     short = [e for e in _common_passwords() if len(e) < shipped.min_length]
-    assert len(short) > 3000, (
+    assert len(short) > sub_minimum_floor, (
         f"only {len(short)} corpus entries sit below the shipped {shipped.min_length}-character "
         "floor; a swap that dropped the short entries would silently weaken every deployment that "
         "has LOWERED password_min_length"
     )
+
+
+def test_the_rebuild_reproduces_the_two_run_structure_from_upstream(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The ``--seclists`` arm, exercised against a FAKE SecLists root.
+
+    That arm was the untested half, and it is where the one real defect in this work lived: the
+    generator used to parse the upstream digests back out of the block it had itself rendered, and
+    its prefix test also matched the corpus digest line -- so a source-less rebuild erased the
+    provenance it existed to preserve. Nothing failed, because nothing ran this path.
+
+    A real SecLists checkout is 8 MB and is deliberately not vendored, so this plants the smallest
+    input that can distinguish the behaviours: run 1 must arrive ENTIRE including entries the floor
+    rejects, and run 2 must be filtered to what clears the shipped policy and is not already there.
+    """
+    module = _corpus_generator()
+    root = tmp_path / "SecLists"
+    (root / "Passwords" / "Common-Credentials").mkdir(parents=True)
+
+    # Run 1 is taken whole: two entries the 15-char floor rejects, one that clears it.
+    (root / module.RUN1_MEMBER).write_text(
+        "123456\nletmein\na-passphrase-that-clears\n", encoding="utf-8"
+    )
+    # Run 2 is filtered. Only the first survives: the rest are too short, a duplicate of run 1,
+    # context-denied, and IPv4-shaped respectively.
+    (root / module.RUN2_MEMBER).write_text(
+        "another-clearing-passphrase\n"
+        "short\n"
+        "a-passphrase-that-clears\n"
+        "administrator-passphrase\n"
+        "203.0.113.99\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(module, "RUN1_LINES", 3)
+
+    assert module.rebuild_corpus(root) == [
+        "123456",
+        "letmein",
+        "a-passphrase-that-clears",
+        "another-clearing-passphrase",
+    ]
+
+
+def test_recorded_upstream_digests_are_verified_not_carried(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A RECORDED member digest that disagrees with the checkout is a problem; an unrecorded one is a
+    note.
+
+    The distinction is the fix for the defect above. Provenance now lives in module constants, which
+    a rebuild VERIFIES, rather than in prose the tool parses back out of its own output -- so writer
+    and reader cannot desync, because there is only one of them.
+    """
+    module = _corpus_generator()
+    root = tmp_path / "SecLists"
+    (root / "Passwords" / "Common-Credentials").mkdir(parents=True)
+    (root / module.RUN1_MEMBER).write_text("one\n", encoding="utf-8")
+    (root / module.RUN2_MEMBER).write_text("two\n", encoding="utf-8")
+
+    # Unrecorded: a note naming the value to paste, and NO problem.
+    problems, notes = module.check_upstream_digests(root)
+    assert problems == []
+    assert any("RUN1_MEMBER_SHA256" in note for note in notes)
+
+    # Recorded and wrong: a problem, because that is a different upstream file.
+    monkeypatch.setattr(module, "RUN1_MEMBER_SHA256", "0" * 64)
+    problems, _ = module.check_upstream_digests(root)
+    assert len(problems) == 1
+    assert "DIFFERENT upstream file" in problems[0]
+
+    # Recorded and right: silent.
+    actual, _ = module.upstream_digests(root)
+    monkeypatch.setattr(module, "RUN1_MEMBER_SHA256", actual)
+    assert module.check_upstream_digests(root)[0] == []

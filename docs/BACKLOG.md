@@ -19943,7 +19943,7 @@ That is the same `self._lock` the staged-pipeline handoffs take. On a first depl
 
 ## 1433. regenerate the password screening corpus from a committed script instead of by hand
 
-> ✅ **Shipped 2026-09-03.** `scripts/security/build_password_corpus.py` (`--check` / `--write`, plus `--seclists DIR` for the source arm) rebuilds or verifies `messagefoundry/auth/data/common_passwords.txt`, and writes a delimited generated block into `common_passwords.NOTICE` carrying the digest, the line and distinct counts, the two-run split and the whole by-floor table. `tests/test_auth_core.py` fails when the block stops describing the corpus. **TWO PREMISES THIS ITEM WAS CUT FROM WERE FALSE AT HEAD AND ARE CORRECTED BELOW** -- neither changes what was built.
+> ✅ **Shipped 2026-09-03.** `scripts/security/build_password_corpus.py` (`--check` / `--write`, plus `--seclists DIR` for the source arm) rebuilds or verifies `messagefoundry/auth/data/common_passwords.txt`, and writes a delimited generated block into `common_passwords.NOTICE` carrying the digest, the line and distinct counts, the two-run split and the whole by-floor table. `tests/test_auth_core.py` fails when the block stops describing the corpus, and a planted-mutation test proves that gate can move. **TWO PREMISES THIS ITEM WAS CUT FROM WERE FALSE AT HEAD AND ARE CORRECTED BELOW** -- neither changes what was built. **STILL OPEN:** the upstream member digests are recorded as `None`, because SecLists is not vendored here; `--check --seclists <checkout>` prints them for pasting. That is the last piece of #1134's honest path.
 > Verdict: build
 > Research: none
 > Closing-act: none
@@ -19967,9 +19967,13 @@ The tree's generator-plus-golden pattern (`scripts/webconsole_seam_snapshot.py -
 
 The brief this item was cut from said `tests/test_auth_core.py` pinned eight numbers from the notice against live measurement -- a headline count and seven by-floor rows -- plus the corpus sha256. **Measured on `main` at `46ea10a78`: it pinned none of them, and the notice carried no by-floor table at all.** The two corpus tests there assert a floor (`>= 3000` clearing entries, the ASVS 6.2.4 bar) and three behavioural arms; both survive untouched, because a floor is not a hand-copied number. So the fixed-point gate is the **first** machine check on those counts, not a replacement for several. Recorded because the difference decides what a reader should expect to find in the diff.
 
-### Correction 2: the `-text` attribute was missing, so the digest would not have been platform-independent
+### Correction 2: the line-ending attribute was missing entirely, and my first spelling of it was wrong
 
-The brief listed keeping the corpus's `-text` pin in `.gitattributes` as a constraint. **`git check-attr text` reported `unspecified` at `46ea10a78`**, and under `core.autocrlf=true` the working tree held CRLF while the blob held LF -- two different sha256 values for one committed file. The attribute is added by this item. Two belts, because one of them fails on an existing checkout: the attribute keeps a **fresh** checkout equal to the blob on every platform, and the generator digests **LF-normalized** bytes so an **older** Windows checkout still verifies instead of failing with a hex mismatch that names nothing. Changing an attribute does not rewrite a working tree; `git checkout -- <path>` does.
+The brief listed keeping the corpus's `-text` pin in `.gitattributes` as a constraint. **`git check-attr text` reported `unspecified` at `46ea10a78`**, and under `core.autocrlf=true` the working tree held CRLF while the blob held LF -- two different sha256 values for one committed file (`fd9786f1` against `136e7bcf`). So there was no pin to keep; this item adds one.
+
+**IT ADDS `text=auto eol=lf`, NOT `-text`, AND THE FIRST DRAFT HAD IT WRONG.** `-text` disables the clean filter, so it FREEZES the current bytes and does nothing about the next write: a later CRLF edit lands CRLF in the blob permanently. For a file a generator rewrites, that is the wrong guarantee -- `eol=lf` normalizes on the way in, so the invariant the recorded digest depends on keeps holding. The `-text` precedent in that file belongs to the vendored CLA bundle, whose blob genuinely CONTAINS 1,297 CRLF pairs; this blob holds none, so `eol=lf` re-encodes nothing here. Caught by a peer lane measuring it rather than by me; I had reasoned from the precedent's wording instead of its subject.
+
+Two belts, because one fails on an existing checkout: the attribute keeps a **fresh** checkout equal to the blob on every platform, and the generator digests **LF-normalized** bytes so an **older** Windows checkout still verifies instead of failing with a hex mismatch that names nothing. Changing an attribute does not rewrite a working tree; `git checkout -- <path>` does.
 
 ### What the gate does NOT verify, and why that is stated in its own output
 
