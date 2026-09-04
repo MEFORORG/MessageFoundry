@@ -181,7 +181,44 @@ jobs:
       - name: Audit the locked npm dependencies (install-free)
         # --package-lock-only audits straight from the committed package-lock.json (no install needed) —
         # fast and reproducible. Default level fails on ANY severity, matching pip-audit's strict posture.
-        run: npm audit --package-lock-only
+        #
+        # RETRIED, BECAUSE A REGISTRY HICCUP IS NOT AN AUDIT VERDICT. `npm audit` exits non-zero BOTH
+        # when the advisory database reports a vulnerability AND when it cannot be reached, so the bare
+        # invocation this replaces made an unreachable registry indistinguishable from a finding. A red
+        # therefore said nothing about the dependencies, which is a control resting on a false premise.
+        # Measured 2026-09-04: of 34 failures of this required context in one night, 32 were
+        # `503 Service Unavailable` or `network timeout at .../advisories/bulk` and 2 were real; each
+        # one blocked a merge or evicted a merge-queue entry.
+        #
+        # STILL FAIL-CLOSED, which is the point. A verdict is honoured the moment it arrives, and
+        # exhausting the retries FAILS rather than passing. Nothing here can turn a real advisory green;
+        # the only behaviour that changes is that a transport error is retried instead of reported as a
+        # finding. The discriminator is `.metadata.vulnerabilities`, which a verdict carries and a
+        # transport failure does not -- exit status alone cannot tell them apart.
+        shell: bash
+        run: |
+          set -uo pipefail
+          for attempt in 1 2 3 4 5; do
+            if npm audit --package-lock-only --json > audit.json 2> audit.err; then
+              echo "advisory database reachable, no vulnerabilities (attempt ${attempt})"
+              rm -f audit.json audit.err
+              exit 0
+            fi
+            if jq -e '.metadata.vulnerabilities' audit.json > /dev/null 2>&1; then
+              echo "::error::npm audit reports vulnerabilities in the locked ide/ dependencies."
+              jq '.metadata.vulnerabilities' audit.json
+              exit 1
+            fi
+            echo "attempt ${attempt}: no verdict from the advisory database; retrying"
+            # No `|| true` here: tests/test_security_posture.py forbids discarding an exit code
+            # anywhere in a required job, and it is right to -- that one token is how a gate goes
+            # quiet. `2> audit.err` above always creates the file, so this cannot fail anyway.
+            head -c 400 audit.err
+            [ "${attempt}" -lt 5 ] && sleep "$((attempt * 15))"
+          done
+          echo "::error::Could not reach the npm advisory database after 5 attempts, so this run"
+          echo "::error::obtained NO audit verdict. Failing closed: this is not evidence of a clean tree."
+          exit 1
 
   released-line-audit:
     name: released-line-audit (latest release's pinned runtime)

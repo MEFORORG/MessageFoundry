@@ -1672,9 +1672,14 @@ class RetentionSettings(_Section):
     # 0 = keep forever (the default — byte-identical on upgrade; nothing is deleted until an operator
     # sets a window).
     search_preset_days: int = 0
-    # Audit-log retention. RESERVED / not enforced: the audit_log is a tamper-evident hash chain and
-    # HIPAA expects ~6-year retention, so audit is keep-forever by design here; archive-first pruning
-    # is a tracked follow-up. Accepted (not rejected) so a forward-looking file still loads.
+    # Audit-log retention. RESERVED / not enforced. The rationale is the AUDIT-RETENTION REQUIREMENT
+    # (45 CFR 164.316(b)(2)(i), ~6 years) -- not chain-breakage, which this comment used to give as
+    # the reason. Whether a delete breaks the chain depends on WHICH rows go. Measured 2026-09-03,
+    # BACKLOG #1421. The reasoning is stated in ONE place -- the `audit_days` row in
+    # docs/CONFIGURATION.md, which also carries the contract an archive-first purge has to meet --
+    # so read it there rather than restating it here; four copies of it are how the records drifted
+    # apart. Archive-first pruning is a tracked follow-up. Accepted (not rejected) so a
+    # forward-looking file still loads.
     audit_days: int = 0
     # Warn (WARNING log + AlertSink storage_threshold) when the DB file (+ -wal/-shm) exceeds this
     # many MB. 0 = off. Advisory only — never auto-deletes.
