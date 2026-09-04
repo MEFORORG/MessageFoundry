@@ -51,6 +51,7 @@ tests/test_ci_tooling_gate.py
 tests/test_ci_venv_pinning.py
 tests/test_citation_line_check.py
 tests/test_claim_check.py
+tests/test_claim_shared_registry.py
 tests/test_coord_alloc_strand_sweep.py
 tests/test_gate_ci_mirror_parity.py
 tests/test_hook_prose_folding.py

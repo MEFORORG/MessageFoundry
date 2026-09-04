@@ -17167,6 +17167,41 @@ demonstrate its own pass arm has never been shown to have one.*
 **Expiry:** this stops being right if the two registries are unified, or if the vault stops installing
 the gate.
 
+**BUILT 2026-09-03 -- the registries are now unifiable, which is the first half of the expiry above.**
+**REPRODUCED FIRST, by execution.** `tests/test_claim_shared_registry.py` git-inits two independent
+checkouts, claims from one and commits in the other: 5 of 6 arms red, with the single-repository arm
+green in the same run as the positive control that the harness and the gate both work. The measured
+refusal was `is NOT CLAIMED` -- **not** `claimed by ANOTHER worktree` -- which is the proof the gate was
+reading an empty registry rather than adjudicating one.
+
+**THE ROOT CAUSE IS NARROWER THAN THE ROW STATES, AND NAMING IT CHANGED THE FIX.** `claim.ps1` used one
+value for TWO questions -- *where the registry is* and *who holds the claim*. Inside one repository those
+are always the same tree, so the conflation is invisible; across two they diverge. **The Console's
+preferred option, the gate reading the registry the tool writes, is necessary but NOT sufficient on its
+own:** the gate also compares the record's `worktree` against the tree being committed, so a claim taken
+by the engine's tool still reads as *held by another worktree* from the second repository. Both halves
+shipped, and both are proven load-bearing by mutation -- reverting the pointer reproduces all 5 original
+failures, reverting the holder split kills exactly the one arm it serves.
+
+**Option taken: ONE SHARED REGISTRY, both gates reading it** (not a vault-local registry). `git config
+mefor.claimsRoot <path>`, set in the repository that does not host the registry; both halves resolve from
+the repository the claim is FOR, so they cannot disagree about where to look. `-AsWorktree` names the
+holder when the tool is run from a tree it does not live in. Unset, behaviour is byte-for-byte what
+shipped before -- asserted, not asserted-about -- so **no existing claim is invalidated**. An
+unresolvable pointer FAILS CLOSED: the silent fallback would send the gate to a directory nothing writes,
+where a misconfigured pointer presents as an honestly unclaimed item.
+
+**THE VAULT HALF IS UNVERIFIED BY CONSTRUCTION and that is not a hedge.** CLAUDE.md limits reading that
+tree to `roles/`, so whether it carries its own `claim.ps1` is still the one unmeasured fact -- exactly
+as the row said. The fix is therefore built to not depend on the answer: the pass arm is tested in BOTH
+shapes, the second repository running its own copy of the tool and running this repository's copy by
+absolute path. **What remains for someone who may open that tree:** set the config key there, and re-run
+`install-git-hooks.ps1` so the shared `.git/hooks` payload is not the pre-change copy.
+
+**The commit-body route recorded above was the only route through an unpassable gate**, and it stops
+being needed here. It still must not be conflated with the 2026-08-06 evasion, where claiming properly
+was possible; the distinction is whether a correct alternative existed, and now one does.
+
 ## 1347. a multi-item commit cites only its first number with the BACKLOG prefix, so sibling items read as unbuilt to every citation-based check
 
 > 🔢 **Filed 2026-08-23 - not started.** The house form is `(BACKLOG #1319, #1322, #1323, #1331)` -- **the prefix appears ONCE and the siblings carry a bare `#N`.** So any check greping `BACKLOG #<N>` finds the first item and misses the rest. **Measured on `origin/main`: `#1319` matches, its three siblings do not.** ***The failure direction is the expensive one -- a sibling whose work landed months ago reads as unbuilt, and a dispatcher hands a builder work that is already done.***
