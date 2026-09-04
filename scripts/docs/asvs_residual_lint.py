@@ -49,6 +49,11 @@ AN EMPTY BASELINE IS THEREFORE REFUSED LIKE A MISSING ONE. The shell truncates t
 this program starts, so a generating run that refuses still leaves a 0-byte file behind -- and a
 baseline carrying zero claims grandfathers nothing while reading, in the inventory, as a baseline
 that loaded. Same "examined nothing" failure as an empty scan, arriving by a different door.
+
+DO NOT RUN THE GENERATING COMMAND UNDER ``set -e``, since it exits 1 by design, and verify the
+result by re-running with ``--baseline <baseline.txt>`` and requiring exit 0. That one check
+catches a truncated, mis-encoded or mis-filtered baseline without anyone having to enumerate the
+ways it can go wrong.
 """
 
 from __future__ import annotations

@@ -185,6 +185,57 @@ def test_a_malformed_baseline_line_is_refused_rather_than_ignored(tmp_path: Path
         load_baseline(bad)
 
 
+def test_the_documented_baseline_recipe_round_trips(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Generate a baseline the way the module docstring says to, then require it to load green.
+
+    This is the ONE affordance the four-step wiring of BACKLOG #1205 depends on, and until this test
+    it was the only affordance in the tool that nothing drove.
+
+    REWRITTEN BECAUSE THIS BRANCH RETIRES THE PREMISE THE EARLIER VERSION FROZE. That version pinned
+    a FILTER RULE and used the naive whole-stdout capture as its control, requiring it to be
+    MALFORMED because the scan inventory shared stdout with the keys. Under the stream split this
+    branch adds, stdout carries key lines and nothing else, so the naive capture is now the CORRECT
+    recipe and the old control could never fire again. Kept as-is it would have gone green while
+    asserting the opposite of what the tool now guarantees.
+
+    THE REPLACEMENT CONTROL IS THE ONE THAT CAN STILL CATCH SOMETHING: the inventory must appear on
+    STDERR. "Routed, not suppressed" is the property the split rests on, and a change that simply
+    stopped printing the inventory would satisfy every other assertion here while destroying the
+    empty-scan refusal this tool exists to hold.
+    """
+    sc = write_scorecard(tmp_path, ONE_CELL)
+
+    assert main([str(sc), "--no-baseline", "--print-keys"]) == 1, (
+        "with no baseline every citation is new, so generation exits 1 by design"
+    )
+    captured = capsys.readouterr()
+
+    keys = captured.out.splitlines()
+    assert keys, "the generating run wrote no keys at all"
+    assert all(line.count("	") == 3 or line.startswith("#") for line in keys), (
+        "under --print-keys stdout must carry ONLY baseline lines (and its comment header); "
+        f"something else reached it: {[k for k in keys if k.count(chr(9)) != 3 and not k.startswith('#')]!r}"
+    )
+
+    # POSITIVE CONTROL: routed, NOT suppressed. Without this a tool that printed no inventory at all
+    # would pass everything above, and the empty-scan refusal would be silently gone.
+    assert captured.err.strip(), (
+        "the scan inventory and verdict vanished entirely; they must go to stderr under "
+        "--print-keys, not be suppressed"
+    )
+
+    # The naive whole-stdout capture IS the documented recipe now, so it must load green.
+    base = tmp_path / "b.txt"
+    base.write_text(captured.out, encoding="utf-8")
+
+    assert load_baseline(base) == counted(scan_cells(load_scorecard(sc), ["residual"])[0])
+    assert main([str(sc), "--baseline", str(base)]) == 0, (
+        "a baseline generated from the record it grandfathers must read green on the next run"
+    )
+
+
 # --------------------------------------------------------------------------------------------
 # Empty-scan refusal. This tool runs where nobody is watching it.
 # --------------------------------------------------------------------------------------------
