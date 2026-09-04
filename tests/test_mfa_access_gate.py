@@ -20,6 +20,7 @@ import pytest
 
 from messagefoundry.api import create_app
 from messagefoundry.auth import Role, totp
+from messagefoundry.auth.identity import ALL_CHANNELS
 from messagefoundry.auth.ldap import AdPrincipal
 from messagefoundry.auth.service import AuthService
 from messagefoundry.config.settings import AuthSettings
@@ -55,6 +56,10 @@ async def _add(service: AuthService, username: str, *roles: Role) -> str:
         roles=[r.value for r in roles],
         actor="test",
     )
+    # BACKLOG #1152: an unset channel scope now DENIES. Grant the estate explicitly so this
+    # fixture still stands for an operator who has been provisioned; the channel axis itself
+    # is exercised in tests/test_channel_rbac.py.
+    await service.set_channel_scope(user_id, [ALL_CHANNELS], actor="test")
     # Admin-created accounts force first-login rotation; clear it so must_change does not mask the
     # MFA refusal under test (must_change is enforced FIRST by design).
     user = await service.store.get_user(user_id)

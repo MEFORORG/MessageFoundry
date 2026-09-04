@@ -65,9 +65,13 @@ class Permission(str, Enum):  # noqa: UP042
     FILES_BROWSE = "files:browse"  # list/browse/resend an uploaded file's messages (PHI read)
     FILES_DELETE = "files:delete"  # delete an uploaded file from the server (destructive)
     # Object-level override for the uploaded-file subsystem (ASVS 8.2.2). Uploaded files are OWNER-ONLY:
-    # `files:browse`/`files:delete` reach only the files the caller uploaded, because the channel axis
-    # (Identity.allowed_channels) defaults to "every channel" and so would protect nobody on a default
-    # install. This permission widens that object scope to every uploader's files, for administrative
+    # `files:browse`/`files:delete` reach only the files the caller uploaded. The channel axis cannot do
+    # this job at all -- an uploaded file is decoupled from any connection and so carries no channel to
+    # scope by, which is why ownership is the resource attribute (ADR 0134 Amendment A, owner-ratified).
+    # The rejection was ALSO argued at the time from `Identity.allowed_channels` defaulting to every
+    # channel; BACKLOG #1152 has since made that default DENY, so only the first reason still stands and
+    # the owner-only decision is unchanged by the flip. This permission widens that object scope to every
+    # uploader's files, for administrative
     # oversight and cleanup after a departed operator. It is NOT a capability of its own — a holder
     # still needs `files:browse` / `files:delete` for the route itself — and no built-in role but
     # ADMINISTRATOR (which is the whole catalogue) grants it. Never assignable to a custom role

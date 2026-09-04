@@ -13,7 +13,7 @@ import pytest
 
 from messagefoundry.api import create_app
 from messagefoundry.auth.permissions import Role
-from messagefoundry.auth.service import AuthService
+from messagefoundry.auth.service import AuthService, _allowed_channels
 from messagefoundry.config.settings import AuthSettings
 from messagefoundry.pipeline import Engine
 from messagefoundry.store.store import MessageStore
@@ -75,7 +75,11 @@ async def test_sync_star_means_all_and_admin_is_untouched(tmp_path: Path) -> Non
         await store.set_user_channel_scope("eve", json.dumps(["IB_A"]))  # previously scoped
         scoped = await store.get_user("eve")
         refreshed = await service._sync_ad_channel_scope(scoped, frozenset(), ["grp-all"])
-        assert refreshed.channel_scope is None  # '*' clears to all channels
+        # BACKLOG #1152: '*' persists the EXPLICIT all-channels grant. It used to persist SQL NULL
+        # and lean on NULL meaning "all"; NULL now denies, so that collapse would have inverted a
+        # deliberate wildcard mapping into a deny-everything one.
+        assert json.loads(refreshed.channel_scope) == ["*"]
+        assert _allowed_channels(refreshed, frozenset()) is None  # and it resolves to all channels
 
         admin = await _ad_user(store, "boss")
         out = await service._sync_ad_channel_scope(

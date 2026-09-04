@@ -7,7 +7,7 @@
 # by hand (BACKLOG #1220) - so a newly rendered DTO is covered with nobody editing a list.
 
 ## ENGINE_UI_SEAM
-266cbfd342b22819
+767521d4399d1ef4
 
 ## dataclass messagefoundry.api._ui_seam.UiDeps
 engine_seam
@@ -222,7 +222,7 @@ messagefoundry.api.models.SystemStatus: claim_proc, db, engine, kpis, logs, pool
 messagefoundry.api.models.UpdateInfo: current_version, pinned_version, update_available
 messagefoundry.api.models.UploadResendRequest: index, to
 messagefoundry.api.models.UploadedFileInfo: content_type, file_id, filename, message_count, sha256, size, uploaded_at, uploader
-messagefoundry.api.models.UploadedFileList: files, scope, total
+messagefoundry.api.models.UploadedFileList: files, limit, offset, scope, total
 messagefoundry.api.models.UploadedMessageSearchRequest: content, control_id, field_path, field_value, limit, message_type, offset, target
 messagefoundry.api.models.UploadedMessageSummary: control_id, index, message_type, size
 messagefoundry.api.models.UploadedMessagesResult: file_id, filename, matched, messages, scanned, total_messages, truncated

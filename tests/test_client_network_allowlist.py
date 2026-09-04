@@ -29,6 +29,7 @@ from uvicorn.middleware.proxy_headers import ProxyHeadersMiddleware
 from messagefoundry.api import create_app
 from messagefoundry.api.client_networks import DENIAL_HEADER, DENIAL_MARKER, ClientNetworkMiddleware
 from messagefoundry.auth import Role
+from messagefoundry.auth.identity import ALL_CHANNELS
 from messagefoundry.auth.service import AuthService
 from messagefoundry.config.settings import (
     AlertsSettings,
@@ -80,6 +81,10 @@ async def _add_viewer(service: AuthService, username: str) -> None:
         roles=[Role.VIEWER.value],
         actor="test",
     )
+    # BACKLOG #1152: an unset channel scope now DENIES. Grant the estate explicitly so this
+    # fixture still stands for an operator who has been provisioned; the channel axis itself
+    # is exercised in tests/test_channel_rbac.py.
+    await service.set_channel_scope(user_id, [ALL_CHANNELS], actor="test")
     user = await service.store.get_user(user_id)
     assert user is not None and user.password_hash is not None
     await service.store.set_password(

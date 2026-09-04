@@ -15,6 +15,7 @@ from typing import Any
 
 import pytest
 
+from messagefoundry.auth.identity import ALL_CHANNELS
 from messagefoundry.config.models import ConnectorType, Destination
 from messagefoundry.config.response import activated, response_get
 from messagefoundry.config.run_context import ROUTER, TRANSFORM, RunContext, run_contexts
@@ -606,6 +607,10 @@ async def test_responses_route_rbac_and_audit(tmp_path: Any) -> None:
                 roles=[role.value],
                 actor="test",
             )
+            # BACKLOG #1152: an unset channel scope now DENIES. Grant the estate explicitly so this
+            # fixture still stands for an operator who has been provisioned; the channel axis itself
+            # is exercised in tests/test_channel_rbac.py.
+            await service.set_channel_scope(uid, [ALL_CHANNELS], actor="test")
             # Admin-created accounts force first-login rotation (WP-L3-12); clear it (keep the hash).
             u = await service.store.get_user(uid)
             assert u is not None and u.password_hash is not None

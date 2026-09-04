@@ -20,6 +20,7 @@ import pytest
 
 from messagefoundry.api import create_app
 from messagefoundry.auth import Identity, Permission, Role
+from messagefoundry.auth.identity import ALL_CHANNELS
 from messagefoundry.auth.permissions import (
     CUSTOM_ROLE_ID_PREFIX,
     CustomRoleError,
@@ -53,6 +54,10 @@ async def _make_user(service: AuthService, username: str, *role_ids: str) -> str
         roles=list(role_ids),
         actor="test",
     )
+    # BACKLOG #1152: an unset channel scope now DENIES. Grant the estate explicitly so this
+    # fixture still stands for an operator who has been provisioned; the channel axis itself
+    # is exercised in tests/test_channel_rbac.py.
+    await service.set_channel_scope(user_id, [ALL_CHANNELS], actor="test")
     return user_id
 
 
@@ -326,6 +331,10 @@ async def test_crud_requires_users_manage(engine: Engine) -> None:
         roles=[Role.VIEWER.value],
         actor="test",
     )
+    # BACKLOG #1152: an unset channel scope now DENIES. Grant the estate explicitly so this
+    # fixture still stands for an operator who has been provisioned; the channel axis itself
+    # is exercised in tests/test_channel_rbac.py.
+    await service.set_channel_scope(viewer_id, [ALL_CHANNELS], actor="test")
     u = await engine.store.get_user(viewer_id)
     assert u is not None and u.password_hash is not None
     await engine.store.set_password(

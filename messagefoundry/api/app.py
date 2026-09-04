@@ -3944,9 +3944,14 @@ def create_app(
         ``objectSid``. Closing it means binding AD to a directory-immutable id the way OIDC binds
         ``(issuer, sub)`` — tracked as BACKLOG #1143, not solvable inside this function.
 
-        The channel axis is deliberately NOT used: ``Identity.allowed_channels`` defaults to ``None``
-        (= every channel) and an uploaded file carries no channel at all, so a channel-scoped rule
-        would protect nobody on a default install and would deny every scoped operator their own file.
+        The channel axis is deliberately NOT used, and ONE of its two original reasons has since
+        expired. The surviving one is decisive on its own: an uploaded file carries no channel at
+        all — it is decoupled from every connection by construction — so a channel-scoped rule has
+        nothing to match on and would deny every scoped operator their own file. The expired one was
+        that ``Identity.allowed_channels`` defaulted to ``None`` (= every channel), which would have
+        made such a rule protect nobody on a default install; BACKLOG #1152 flipped that default to
+        deny. Recorded rather than deleted, because a reader who remembers only the expired half
+        would think the owner-ratified decision (ADR 0134 Amendment A) had lost its ground.
 
         FAIL CLOSED on a sidecar with no ``uploader_id``. ``save()`` refuses to write one, but the
         tolerant loader yields ``""`` for a sidecar missing the key (a hand-placed one under the no-key
@@ -4151,8 +4156,10 @@ def create_app(
         request: Request,
         engine: Engine = Depends(_get_engine),
         identity: Identity = Depends(require(Permission.FILES_BROWSE)),
+        limit: int = Query(50, ge=1, le=500),
+        offset: int = Query(0, ge=0),
     ) -> UploadedFileList:
-        """List the caller's OWN uploaded files (metadata only — no bodies). Audited.
+        """List one page of the caller's OWN uploaded files (metadata only — no bodies). Audited.
 
         Object-level authorization (ASVS 8.2.2): the listing is owner-scoped, so one operator never
         sees another's filenames, sizes, digests or ``file_id`` s — the ``file_id`` being the token the
@@ -4160,7 +4167,18 @@ def create_app(
         The scope is returned in the response AND recorded in the audit row — computed once, here — so
         a count means the same thing to every reader and no consumer has to re-derive whose files it
         is holding. The web console renders the sentence that matches it rather than asserting the
-        owner-scoped case at an override holder, for whom it is false."""
+        owner-scoped case at an override holder, for whom it is false.
+
+        **Paged (BACKLOG #1152).** The route was pageless, so one response carried every visible file
+        and its size grew with the age of the install — an uploads directory has no bound, and
+        ``list_files`` decrypts a sidecar per entry. ``total`` remains the whole visible count, which
+        is what the audit row and the console's "N file(s)" both mean; ``files`` is the window.
+
+        **The window is applied AFTER the owner filter, and that order is the security-relevant
+        part.** Paging first would make each page's size depend on how many of another operator's
+        files happened to fall inside it, which turns the page length into a count of files the
+        caller may not know exist. Filter, then slice, and a scoped caller's pages are a function of
+        their own files only."""
         us = _require_upload_store(request)
         # Filtered HERE, not in UploadStore.list_files(): the store's unscoped scan is what the
         # per-uploader quota and the age-based retention sweep are built on, and both must keep seeing
@@ -4169,14 +4187,31 @@ def create_app(
         scope: Literal["own", "any_owner"] = (
             "any_owner" if identity.has(Permission.FILES_ACCESS_ANY) else "own"
         )
+        window = files[offset : offset + limit]
         await engine.store.record_audit(
             "upload.list",
             actor=identity.username,
-            detail=json.dumps({"count": len(files), "scope": scope}),
+            # `count` keeps meaning the whole visible set, unchanged from the pageless route, so an
+            # existing reader of this trail is not silently re-based onto a page size. `returned`,
+            # `limit` and `offset` are the new window. No filename and no owner: the audit of a
+            # listing is a count, not an inventory.
+            detail=json.dumps(
+                {
+                    "count": len(files),
+                    "returned": len(window),
+                    "limit": limit,
+                    "offset": offset,
+                    "scope": scope,
+                }
+            ),
             client=client_ip(request),
         )
         return UploadedFileList(
-            total=len(files), files=[_upload_info(m) for m in files], scope=scope
+            total=len(files),
+            files=[_upload_info(m) for m in window],
+            scope=scope,
+            limit=limit,
+            offset=offset,
         )
 
     async def browse_uploaded_file(

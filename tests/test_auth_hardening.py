@@ -29,6 +29,7 @@ from pydantic import ValidationError
 from messagefoundry.api import create_app
 from messagefoundry.api.app import _emit_bootstrap_admin, _session_reaper
 from messagefoundry.auth import Role, hash_password
+from messagefoundry.auth.identity import ALL_CHANNELS
 from messagefoundry.auth.ldap import AdPrincipal, LdapAuthenticator, LdapError
 from messagefoundry.auth.service import AuthService, BootstrapAdmin
 from messagefoundry.config.settings import AuthSettings, StoreSettings
@@ -71,6 +72,10 @@ async def _add(service: AuthService, username: str, *roles: Role) -> None:
         roles=[r.value for r in roles],
         actor="test",
     )
+    # BACKLOG #1152: an unset channel scope now DENIES. Grant the estate explicitly so this
+    # fixture still stands for an operator who has been provisioned; the channel axis itself
+    # is exercised in tests/test_channel_rbac.py.
+    await service.set_channel_scope(user_id, [ALL_CHANNELS], actor="test")
     # Admin-created accounts force first-login rotation (WP-L3-12); clear it so these fixtures behave
     # like already-onboarded users (keeping the same hash).
     user = await service.store.get_user(user_id)

@@ -839,9 +839,10 @@ class UserRecord:
     must_change_password: bool
     failed_attempts: int
     locked_until: float | None
-    channel_scope: str | None = (
-        None  # JSON list of allowed connection names; None = all (per-channel RBAC)
-    )
+    # Per-channel RBAC, as stored: a JSON list of granted connection names, `["*"]` for every
+    # channel, or None when nobody has set one — which DENIES (BACKLOG #1152). The resolution lives
+    # in auth.service._allowed_channels; this column carries the grant, never the decision.
+    channel_scope: str | None = None
     # MFA (WP-14): whether a native TOTP second factor is enrolled+active, and when. The secret and
     # the recovery-code hashes are deliberately NOT carried here (least exposure) — they are read only
     # via the store's get_totp_secret / get_recovery_code_hashes accessors.
@@ -1851,7 +1852,7 @@ CREATE TABLE IF NOT EXISTS users (
     must_change_password INTEGER NOT NULL DEFAULT 0,
     failed_attempts      INTEGER NOT NULL DEFAULT 0,
     locked_until         REAL,
-    channel_scope        TEXT,                 -- per-channel RBAC: JSON list of connections; NULL = all
+    channel_scope        TEXT,                 -- per-channel RBAC: JSON list of granted connections ('["*"]' = all); NULL = none granted, which denies (BACKLOG #1152)
     totp_secret          TEXT,                 -- MFA (WP-14): base32 TOTP secret, store-cipher encrypted; NULL = none
     totp_enabled         INTEGER NOT NULL DEFAULT 0,  -- TOTP enrolled + confirmed active
     totp_enrolled_at     REAL,
@@ -8620,8 +8621,8 @@ class MessageStore:
     async def set_user_channel_scope(
         self, user_id: str, scope_json: str | None, *, now: float | None = None
     ) -> None:
-        """Set a user's per-channel scope. ``scope_json`` is a JSON list of connection names, or
-        ``None`` for all channels (per-channel RBAC)."""
+        """Set a user's per-channel scope. ``scope_json`` is a JSON list of granted connection names
+        (``'["*"]'`` for every channel), or ``None`` to clear it — which denies (BACKLOG #1152)."""
         now = time.time() if now is None else now
         async with self._lock:
             await self._db.execute(

@@ -21,6 +21,8 @@ from messagefoundry.api.auth_models import (
     RoleInfo,
     UserSummary,
 )
+from messagefoundry.auth.identity import ALL_CHANNELS
+from messagefoundry.auth.permissions import Role
 
 from .._html import Markup, el, page, register_nav, rows_table
 from ._common import _seg
@@ -56,6 +58,31 @@ def _admin_links(active_page: str) -> Markup:
 # --- users --------------------------------------------------------------------
 
 
+def _scope_cell(user: UserSummary) -> str:
+    """The Channel scope column for one user: what that account can actually REACH.
+
+    Two things decide it and this column has to show the resolved answer, not one input. The stored
+    scope is the grant; ``None`` used to render "all" and, since BACKLOG #1152, an unset scope denies
+    — so it renders "(none)" alongside an explicit empty list, and all-channels is the ``*`` grant.
+    But an ADMINISTRATOR is all-channels BY ROLE whatever is stored (``_allowed_channels`` returns
+    before it reads the column), so rendering their stored scope would print "(none)" beside an
+    account holding the whole estate.
+
+    Both directions of that error are worth naming, because they fail differently. Showing "all" for
+    an account that reaches nothing sends an administrator hunting a permission bug that is not
+    there. Showing "(none)" for an account that reaches everything hides real access from the person
+    whose job is to review it, which is the worse of the two.
+    """
+    if Role.ADMINISTRATOR.value in user.roles:
+        return "all (administrator)"
+    stored = user.channel_scope
+    if stored is None:
+        return "(none)"
+    if ALL_CHANNELS in stored:
+        return "all"
+    return ", ".join(stored) or "(none)"
+
+
 def users_page(users: Sequence[UserSummary]) -> Markup:
     """The user list: every account with provider, roles, scope, and status; links to the admin forms."""
     rows: list[list[object]] = []
@@ -67,7 +94,7 @@ def users_page(users: Sequence[UserSummary]) -> Markup:
                 u.display_name or "",
                 u.email or "",
                 ", ".join(u.roles),
-                "all" if u.channel_scope is None else ", ".join(u.channel_scope) or "(none)",
+                _scope_cell(u),
                 "disabled" if u.disabled else "active",
             ]
         )
@@ -192,12 +219,22 @@ def user_detail_page(
             action=f"/ui/users/{user.id}/roles",
             class_="ctl",
         )
-    # Three explicit scope states so a deny-all ([]) scope ROUND-TRIPS: an empty textarea alone is
-    # ambiguous between "all channels" (None) and "no channels" ([]), and silently widening a stored
-    # deny-all to all-channels on a re-save would be a privilege-widening bug (review PR2-M3).
-    scope_mode = (
-        "all" if user.channel_scope is None else ("none" if user.channel_scope == [] else "list")
-    )
+    # Three explicit scope states so a deny-all scope ROUND-TRIPS: an empty textarea alone cannot
+    # say which of them was meant, and silently widening a stored deny-all to all-channels on a
+    # re-save would be a privilege-widening bug (review PR2-M3).
+    #
+    # BACKLOG #1152 moved which stored value is the wide one. All-channels is now the explicit
+    # ALL_CHANNELS grant; a null scope is "never granted" and denies, the same as []. Both null and
+    # [] therefore land on "none" — they differ only in whether anyone has touched the field, which
+    # is a provenance question the audit log answers and this form must not pretend to.
+    stored = user.channel_scope
+    listed = [c for c in (stored or []) if c != ALL_CHANNELS]
+    if stored is not None and ALL_CHANNELS in stored:
+        scope_mode = "all"
+    elif listed:
+        scope_mode = "list"
+    else:
+        scope_mode = "none"
     mode_options = [
         el("option", label, value=value, selected=value == scope_mode or None)
         for value, label in (
@@ -212,7 +249,13 @@ def user_detail_page(
         el(
             "label",
             "Allowed connections (one per line)",
-            el("textarea", "\n".join(user.channel_scope or []), name="channels", rows=4),
+            el("textarea", "\n".join(listed), name="channels", rows=4),
+        ),
+        el(
+            "p",
+            "A new account starts with no channels and sees an empty console until you grant "
+            "some. Administrators reach every channel regardless of this setting.",
+            class_="muted",
         ),
         el("button", "Save channel scope", type="submit"),
         method="post",

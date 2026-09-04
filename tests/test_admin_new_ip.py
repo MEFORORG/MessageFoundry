@@ -21,7 +21,7 @@ from _totp_clock import pin_totp_clock
 
 from messagefoundry.api import create_app
 from messagefoundry.auth import Role, totp
-from messagefoundry.auth.identity import Identity
+from messagefoundry.auth.identity import ALL_CHANNELS, Identity
 from messagefoundry.auth.notifications import ADMIN_NEW_IP, SecurityEvent
 from messagefoundry.auth.service import AuthService
 from messagefoundry.auth.tokens import hash_token
@@ -53,6 +53,10 @@ async def _enabled_admin(service: AuthService, *, client: str) -> tuple[str, Ide
         roles=[Role.ADMINISTRATOR.value],
         actor="t",
     )
+    # BACKLOG #1152: an unset channel scope now DENIES. Grant the estate explicitly so this
+    # fixture still stands for an operator who has been provisioned; the channel axis itself
+    # is exercised in tests/test_channel_rbac.py.
+    await service.set_channel_scope(uid, [ALL_CHANNELS], actor="test")
     user = await service.store.get_user(uid)
     assert user is not None and user.password_hash is not None
     await service.store.set_password(
@@ -114,6 +118,10 @@ async def test_missing_baseline_and_bad_tokens_not_flagged() -> None:
             roles=[Role.VIEWER.value],
             actor="t",
         )
+        # BACKLOG #1152: an unset channel scope now DENIES. Grant the estate explicitly so this
+        # fixture still stands for an operator who has been provisioned; the channel axis itself
+        # is exercised in tests/test_channel_rbac.py.
+        await service.set_channel_scope(uid, [ALL_CHANNELS], actor="test")
         # A session with no recorded login address is never penalized (avoids spurious friction).
         await store.create_session(
             token_hash=hash_token("noip"), user_id=uid, expires_at=2e12, client=None
@@ -185,6 +193,10 @@ async def test_loopback_addresses_treated_as_same_host() -> None:
             roles=[Role.ADMINISTRATOR.value],
             actor="t",
         )
+        # BACKLOG #1152: an unset channel scope now DENIES. Grant the estate explicitly so this
+        # fixture still stands for an operator who has been provisioned; the channel axis itself
+        # is exercised in tests/test_channel_rbac.py.
+        await service.set_channel_scope(uid, [ALL_CHANNELS], actor="test")
         await store.create_session(
             token_hash=hash_token("lb"), user_id=uid, expires_at=2e12, client="::1"
         )
@@ -257,6 +269,10 @@ async def _add_admin(service: AuthService, username: str) -> None:
         roles=[Role.ADMINISTRATOR.value],
         actor="test",
     )
+    # BACKLOG #1152: an unset channel scope now DENIES. Grant the estate explicitly so this
+    # fixture still stands for an operator who has been provisioned; the channel axis itself
+    # is exercised in tests/test_channel_rbac.py.
+    await service.set_channel_scope(user_id, [ALL_CHANNELS], actor="test")
     user = await service.store.get_user(user_id)
     assert user is not None and user.password_hash is not None
     await service.store.set_password(
@@ -335,6 +351,10 @@ async def test_new_ip_never_overrides_rbac(engine: Engine) -> None:
         roles=[Role.VIEWER.value],
         actor="t",
     )
+    # BACKLOG #1152: an unset channel scope now DENIES. Grant the estate explicitly so this
+    # fixture still stands for an operator who has been provisioned; the channel axis itself
+    # is exercised in tests/test_channel_rbac.py.
+    await service.set_channel_scope(uid, [ALL_CHANNELS], actor="test")
     user = await service.store.get_user(uid)
     assert user is not None and user.password_hash is not None
     await service.store.set_password(

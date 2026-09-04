@@ -652,11 +652,17 @@ class UploadStore:
 
     async def list_files(self) -> list[UploadedFileMeta]:
         """List all uploaded files (newest first). Undecryptable/foreign sidecars are skipped with a
-        warning (never a body in the log), so a rotated-away key can't 500 the whole page."""
+        warning (never a body in the log), so a rotated-away key can't 500 the whole page.
+
+        The sort is TOTAL — ``file_id`` breaks a timestamp tie — because ``GET /uploads`` pages off
+        this order (BACKLOG #1152). ``uploaded_at`` alone is not a total order: files written in the
+        same instant compare equal, and the underlying scan is a directory walk whose order is not
+        guaranteed to repeat, so two requests could place a tied file on both pages or on neither.
+        A stable tiebreak is what makes "page 2" mean the same thing twice."""
 
         def _scan() -> list[UploadedFileMeta]:
             out = self._scan_metas_sync()
-            out.sort(key=lambda m: m.uploaded_at, reverse=True)
+            out.sort(key=lambda m: (m.uploaded_at, m.file_id), reverse=True)
             return out
 
         return await asyncio.to_thread(_scan)

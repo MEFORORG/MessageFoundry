@@ -17,6 +17,7 @@ import httpx
 import pytest
 
 from messagefoundry.auth import Role
+from messagefoundry.auth.identity import ALL_CHANNELS
 from messagefoundry.auth.service import AuthService
 from messagefoundry.config.models import ConnectorType, RetryPolicy
 from messagefoundry.config.settings import AuthSettings
@@ -402,6 +403,10 @@ async def test_resend_requires_access_to_the_alternate_outbound_channel(tmp_path
             roles=[Role.OPERATOR.value],
             actor="test",
         )
+        # BACKLOG #1152: an unset channel scope now DENIES. Grant the estate explicitly so this
+        # fixture still stands for an operator who has been provisioned; the channel axis itself
+        # is exercised in tests/test_channel_rbac.py.
+        await service.set_channel_scope(uid, [ALL_CHANNELS], actor="test")
         user = await service.store.get_user(uid)
         assert user is not None and user.password_hash is not None
         await service.store.set_password(
@@ -447,6 +452,10 @@ async def test_resend_denied_without_the_resend_permission(tmp_path: Path) -> No
             roles=[Role.VIEWER.value],
             actor="test",
         )
+        # BACKLOG #1152: an unset channel scope now DENIES. Grant the estate explicitly so this
+        # fixture still stands for an operator who has been provisioned; the channel axis itself
+        # is exercised in tests/test_channel_rbac.py.
+        await service.set_channel_scope(uid, [ALL_CHANNELS], actor="test")
         user = await service.store.get_user(uid)
         assert user is not None and user.password_hash is not None
         await service.store.set_password(
@@ -494,6 +503,10 @@ async def test_resend_grant_is_audited_even_when_it_fails_downstream(tmp_path: P
             roles=[Role.OPERATOR.value],
             actor="test",
         )
+        # BACKLOG #1152: an unset channel scope now DENIES. Grant the estate explicitly so this
+        # fixture still stands for an operator who has been provisioned; the channel axis itself
+        # is exercised in tests/test_channel_rbac.py.
+        await service.set_channel_scope(uid, [ALL_CHANNELS], actor="test")
         user = await service.store.get_user(uid)
         assert user is not None and user.password_hash is not None
         await service.store.set_password(

@@ -20,6 +20,7 @@ import pytest
 from messagefoundry.api import create_app
 from messagefoundry.api.approvals import ApprovalGate
 from messagefoundry.auth import Role
+from messagefoundry.auth.identity import ALL_CHANNELS
 from messagefoundry.auth.service import AuthService
 from messagefoundry.config.models import ConnectorType
 from messagefoundry.config.settings import ApprovalsSettings, AuthSettings
@@ -70,6 +71,10 @@ async def _add(service: AuthService, username: str, *roles: Role) -> None:
         roles=[r.value for r in roles],
         actor="test",
     )
+    # BACKLOG #1152: an unset channel scope now DENIES. Grant the estate explicitly so this
+    # fixture still stands for an operator who has been provisioned; the channel axis itself
+    # is exercised in tests/test_channel_rbac.py.
+    await service.set_channel_scope(uid, [ALL_CHANNELS], actor="test")
     user = await service.store.get_user(uid)  # clear forced first-login rotation (WP-L3-12)
     assert user is not None and user.password_hash is not None
     await service.store.set_password(

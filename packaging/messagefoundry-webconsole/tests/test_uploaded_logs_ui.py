@@ -15,6 +15,7 @@ import pytest
 
 from messagefoundry.api import create_app
 from messagefoundry.auth import Role
+from messagefoundry.auth.identity import ALL_CHANNELS
 from messagefoundry.auth.service import AuthService
 from messagefoundry.config.models import ConnectorType
 from messagefoundry.config.settings import AuthSettings, StoreSettings
@@ -36,8 +37,13 @@ BATCH = ADT + ADT2
 async def _add_user(
     service: AuthService, name: str, role: Role, *, channels: list[str] | None = None
 ) -> str:
-    """Create a sign-in-ready local user. ``channels`` sets the per-channel RBAC scope (None = all);
-    it is applied BEFORE the first login because set_channel_scope revokes the user's sessions."""
+    """Create a sign-in-ready local user. ``channels`` sets the per-channel RBAC scope; it is applied
+    BEFORE the first login because set_channel_scope revokes the user's sessions.
+
+    ``None`` means "this test is not about the channel axis" and grants the whole estate. Before
+    BACKLOG #1152 that was what saying nothing already did; an unset scope now denies, and leaving
+    these fixtures unscoped would answer 403 on the resend target inbound for a reason this file --
+    which is about the uploads OWNER axis (ASVS 8.2.2) -- never asserts."""
     uid = await service.create_local_user(
         username=name, password=PW, display_name=None, email=None, roles=[role.value], actor="t"
     )
@@ -46,8 +52,10 @@ async def _add_user(
     await service.store.set_password(
         uid, password_hash=user.password_hash, must_change_password=False
     )
-    if channels is not None:
-        await service.set_channel_scope(uid, channels, actor="t")
+    # `is None`, not falsiness: an explicitly EMPTY list means deny-all and must survive as one.
+    await service.set_channel_scope(
+        uid, [ALL_CHANNELS] if channels is None else channels, actor="t"
+    )
     return uid
 
 
@@ -135,6 +143,73 @@ async def test_uploaded_logs_ui_flow(engine: Engine, tmp_path: Path) -> None:
         d = await c.post(f"/ui/uploaded-logs/file/{fid}/delete")
         assert d.status_code in (200, 303)
         assert "acme.hl7" not in (await c.get("/ui/uploaded-logs")).text
+
+
+async def test_uploaded_logs_list_is_paged(engine: Engine, tmp_path: Path) -> None:
+    """BACKLOG #1152: the console listing pages, and its counter says window-of-total.
+
+    A bare count could not distinguish "you have three files" from "you are looking at three of
+    forty", which is the reading that makes a pager invisible."""
+    service = await _service(engine, ("op", Role.OPERATOR))
+    transport = httpx.ASGITransport(app=_app(engine, service, tmp_path))
+    async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
+        await _login(c, "op")
+        for n in range(3):
+            up = await c.post(
+                "/ui/uploaded-logs/upload",
+                files={"file": (f"page{n}.hl7", BATCH, "application/octet-stream")},
+            )
+            assert up.status_code in (200, 303), up.text
+
+        first = await c.get("/ui/uploaded-logs", params={"limit": 2, "offset": 0})
+        assert first.status_code == 200
+        assert "1-2 of 3 file(s)" in first.text
+        assert "Next" in first.text and "Previous" not in first.text
+        assert "/ui/uploaded-logs?limit=2&amp;offset=2" in first.text
+
+        last = await c.get("/ui/uploaded-logs", params={"limit": 2, "offset": 2})
+        assert "3-3 of 3 file(s)" in last.text
+        assert "Previous" in last.text and "Next" not in last.text
+        # The two pages together are the whole set, and neither shows the other's file.
+        shown = [n for n in range(3) if f"page{n}.hl7" in first.text + last.text]
+        assert shown == [0, 1, 2]
+        assert sum(f"page{n}.hl7" in first.text for n in range(3)) == 2
+
+        # The /ui door is no looser than the JSON one: out-of-range bounds are refused, not clamped.
+        assert (await c.get("/ui/uploaded-logs", params={"limit": 501})).status_code == 422
+        assert (await c.get("/ui/uploaded-logs", params={"offset": -1})).status_code == 422
+
+
+async def test_confirm_pages_find_a_file_beyond_the_first_page(
+    engine: Engine, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #1152 regression: paging the listing must not hide a file from its OWN confirm page.
+
+    The delete/resend confirm pages read one file's metadata THROUGH the owner-scoped listing, so a
+    file the caller may not see is simply absent and the page 303s rather than disclosing it. Paging
+    that listing silently broke the shape: a first-page-only scan would redirect an operator away
+    from their own file the moment they had more than a page of uploads, and report it as not found
+    — a denial indistinguishable from the real one.
+
+    The scan page size is monkeypatched down rather than uploading 500 files, which would make this
+    test minutes long to assert something that is about the LOOP, not about the number."""
+    from messagefoundry_webconsole.routes import uploaded_logs as ul_routes
+
+    monkeypatch.setattr(ul_routes, "_SCAN_PAGE", 1)
+    service = await _service(engine, ("op", Role.OPERATOR))
+    transport = httpx.ASGITransport(app=_app(engine, service, tmp_path))
+    async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
+        await _login(c, "op")
+        ids = [await _upload(c, f"deep{n}.hl7") for n in range(3)]
+        # The OLDEST upload sorts last (newest first), so it is off page one by construction.
+        oldest = ids[0]
+        confirm = await c.get(f"/ui/uploaded-logs/file/{oldest}/delete-confirm")
+        assert confirm.status_code == 200, confirm.text
+        assert "deep0.hl7" in confirm.text
+
+        # An id nobody uploaded still 303s away rather than 200-ing on an empty page.
+        missing = await c.get(f"/ui/uploaded-logs/file/{'0' * 32}/delete-confirm")
+        assert missing.status_code == 303
 
 
 def test_upload_form_states_consent_affordance() -> None:

@@ -16,6 +16,7 @@ import pytest
 
 from messagefoundry.api import create_app
 from messagefoundry.auth import Role, totp
+from messagefoundry.auth.identity import ALL_CHANNELS
 from messagefoundry.auth.ldap import AdPrincipal
 from messagefoundry.auth.service import AuthService
 from messagefoundry.auth.tokens import hash_token
@@ -56,6 +57,10 @@ async def _add_admin(service: AuthService, username: str) -> None:
         roles=[Role.ADMINISTRATOR.value],
         actor="test",
     )
+    # BACKLOG #1152: an unset channel scope now DENIES. Grant the estate explicitly so this
+    # fixture still stands for an operator who has been provisioned; the channel axis itself
+    # is exercised in tests/test_channel_rbac.py.
+    await service.set_channel_scope(user_id, [ALL_CHANNELS], actor="test")
     user = await service.store.get_user(user_id)
     assert user is not None and user.password_hash is not None
     # Admin-created accounts force first-login rotation (WP-L3-12); clear it for a usable test login.
@@ -271,6 +276,10 @@ async def test_admin_user_update_is_action_bound(engine: Engine) -> None:
         roles=[Role.VIEWER.value],
         actor="test",
     )
+    # BACKLOG #1152: an unset channel scope now DENIES. Grant the estate explicitly so this
+    # fixture still stands for an operator who has been provisioned; the channel axis itself
+    # is exercised in tests/test_channel_rbac.py.
+    await service.set_channel_scope(target_id, [ALL_CHANNELS], actor="test")
     async with _client(engine, service) as c:
         token = await _login(c, "boss")
         body = {"display_name": "Renamed"}
@@ -301,6 +310,10 @@ async def test_admin_user_update_opt_out_uses_window(engine: Engine) -> None:
         roles=[Role.VIEWER.value],
         actor="test",
     )
+    # BACKLOG #1152: an unset channel scope now DENIES. Grant the estate explicitly so this
+    # fixture still stands for an operator who has been provisioned; the channel axis itself
+    # is exercised in tests/test_channel_rbac.py.
+    await service.set_channel_scope(target_id, [ALL_CHANNELS], actor="test")
     async with _client(engine, service) as c:
         token = await _login(c, "boss")
         r = await c.patch(f"/users/{target_id}", headers=_auth(token), json={"display_name": "X"})
@@ -434,6 +447,10 @@ async def test_create_session_stamps_reauth_at(engine: Engine) -> None:
         roles=[Role.VIEWER.value],
         actor="t",
     )
+    # BACKLOG #1152: an unset channel scope now DENIES. Grant the estate explicitly so this
+    # fixture still stands for an operator who has been provisioned; the channel axis itself
+    # is exercised in tests/test_channel_rbac.py.
+    await service.set_channel_scope(uid, [ALL_CHANNELS], actor="test")
     await engine.store.create_session(
         token_hash="deadbeef", user_id=uid, expires_at=2e12, client="t"
     )

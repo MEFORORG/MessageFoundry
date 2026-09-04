@@ -13,6 +13,7 @@ from _totp_clock import fresh_totp, pin_totp_clock
 
 from messagefoundry.api import create_app
 from messagefoundry.auth import Role, totp
+from messagefoundry.auth.identity import ALL_CHANNELS
 from messagefoundry.auth.ldap import AdPrincipal
 from messagefoundry.auth.service import AuthService
 from messagefoundry.auth.tokens import hash_token
@@ -70,6 +71,11 @@ async def _clear_must_change(service: AuthService, user_id: str) -> None:
     await service.store.set_password(
         user_id, password_hash=user.password_hash, must_change_password=False
     )
+    # BACKLOG #1152: an unset channel scope now denies. This file gates on ROLES and PERMISSIONS and
+    # asserts nothing about the channel axis (grep: zero references to channel_scope /
+    # can_access_channel), so grant the estate explicitly rather than let a second, unrelated control
+    # decide these outcomes. The channel axis is covered in tests/test_channel_rbac.py.
+    await service.set_channel_scope(user_id, [ALL_CHANNELS], actor="test")
 
 
 async def _login(
@@ -1155,6 +1161,10 @@ async def test_ad_session_maps_groups_and_grants_permission(engine: Engine) -> N
     service = AuthService(engine.store, settings, ldap=_FakeLdap())  # type: ignore[arg-type]
     await service.initialize()
     await service.set_ad_group_map([("CN=MF-Ops,DC=x", "operator")], actor="admin")
+    # BACKLOG #1152: an AD principal with no group-to-channel mapping is scoped to nothing, so the
+    # connections:control assertion below would answer 403 for a reason this test is not about. Map
+    # the same group to the wildcard channel — the AD-native way to say "the whole estate".
+    await engine.store.set_ad_group_scope_map([("CN=MF-Ops,DC=x", ALL_CHANNELS)])
     async with _client(engine, service) as c:
         # AD PASSWORD LOGIN is retired (BACKLOG #1137), so the session is minted through the tail
         # Kerberos and OIDC both end at. The subject is unchanged: an AD-provider session carries the

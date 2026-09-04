@@ -183,6 +183,15 @@ protect nobody on a default install while denying every scoped operator their ow
 protection depends on configuration nobody has set is a control resting on a false premise (CLAUDE.md §11,
 SDS-3.7). Owner-only protects with zero configuration.
 
+> **Note added 2026-09-03 (BACKLOG #1152, the principal-narrowing limb).** The first clause above is no
+> longer true of the code: `Identity.allowed_channels` now defaults to the EMPTY set, so an absent scope
+> denies and the general lesson has been applied to the axis itself rather than only routed around. **The
+> decision here is unchanged**, because the second clause was always sufficient on its own — an uploaded
+> file carries no channel, so there is nothing for a channel rule to match and a scoped operator would be
+> denied their own file. Recorded here rather than by editing the paragraph: a reader who checks the old
+> premise against today's code must find out that it moved, not conclude that the owner-ratified decision
+> lost its ground.
+
 **Ownership is keyed on `uploader_id` (`Identity.user_id`), never on `username`.** A username is reassignable:
 deleting a local account and recreating the name is unblocked, and the AD leg auto-provisions a fresh row for
 a returning name with no administrator action at all. Keying an object-level control on it would mean that
