@@ -34,6 +34,11 @@ OPTIONAL_EXTRAS: dict[str, tuple[str, ...]] = {
     "x12": ("pyx12",),
     "xml": ("lxml", "xmlschema", "signxml"),
     "webauthn": ("webauthn",),
+    # requests and urllib3 are listed beside hvac ON PURPOSE, and they are not padding: the Vault TLS
+    # suite assertion (ADR 0180) replicates the context **urllib3** builds, so an interpreter carrying
+    # hvac without urllib3 would collect that test and have nothing to assert against. Listing all
+    # three makes a half-installed extra read as absent, which is this table's stated contract.
+    "vault": ("hvac", "requests", "urllib3"),
 }
 
 

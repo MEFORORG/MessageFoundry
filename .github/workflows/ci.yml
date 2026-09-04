@@ -316,10 +316,17 @@ jobs:
           # and the hardened XML/SOAP codec (#31) tests run their assertions instead of importorskip-skipping.
           # [webauthn] (ADR 0068) so the passkey ceremony tests run real verify_* assertions instead of
           # importorskip-skipping, and mypy sees the py.typed library rather than Any.
+          # [vault] (hvac + requests + urllib3) so the Vault hops' TLS cipher assertion (ASVS 12.1.2,
+          # BACKLOG #1317, ADR 0180) is EXECUTED rather than merely shipped. ADR 0180 declined to build
+          # that assertion precisely because "no CI leg installs the [vault] extra", so a control there
+          # could never be run — the silent-control shape ADR 0158 catalogues. This is the leg that
+          # closes it: `tests/` runs here and nowhere else, so this is the only install line that can
+          # exercise it, and the extra costs six small pure-Python wheels already pinned in the lock.
+          # It also lets mypy type-check the urllib3 replica against the real py.typed library.
           # + the browser ops console as a second editable wheel (Option B) so the moved /ui tests
           # (tests/test_webui.py etc. now import messagefoundry_webconsole) run on this full-suite leg.
           # It is NOT a published extra yet (would break uv lock), so install it by path.
-          uv pip install --system --constraint constraints.lock -e ".[dev,harness,fhir,dicom,x12,xml,webauthn]" -e packaging/messagefoundry-webconsole
+          uv pip install --system --constraint constraints.lock -e ".[dev,harness,fhir,dicom,x12,xml,webauthn,vault]" -e packaging/messagefoundry-webconsole
 
       # ruff (lint + format) and mypy are PLATFORM-INDEPENDENT results — a ruff/format outcome is
       # identical on every OS, and mypy's platform-specific branches are covered by running it for

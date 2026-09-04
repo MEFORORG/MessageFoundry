@@ -32,6 +32,7 @@ import os
 from collections.abc import Sequence
 from typing import TYPE_CHECKING, Any
 
+from messagefoundry.config.tls_policy import assert_hvac_tls_suites
 from messagefoundry.store.keyprovider import KeyProviderError, _split_retired
 
 if TYPE_CHECKING:
@@ -40,6 +41,10 @@ if TYPE_CHECKING:
 #: The optional extra that carries ``hvac`` — named in every fail-closed message so the operator knows
 #: exactly what to install.
 _EXTRA = "vault"
+
+#: Operator-recognisable label for this hop, carried into the TLS suite assertion's error. Distinct
+#: from the KV secret provider's label so a refusal names which Vault client refused.
+_VAULT_TRANSIT_CONNECTOR = "Vault Transit key provider"
 
 # Vault connection + envelope config comes from the environment (never the config file): the Vault
 # address/token are secrets/host-specific and the wrapped DEK + Transit KEK name are per-deployment
@@ -94,7 +99,17 @@ def _build_client(addr: str | None, token: str | None) -> Any:
     # header on a same-host redirect. Measured against hvac 2.4.0: the kwarg lands on the adapter,
     # which passes it to requests.Session.request. Shared with crypto_transit.py, so the Transit
     # cipher inherits the policy from this one construction point.
-    client: Any = hvac.Client(url=addr, token=token, allow_redirects=False)
+    #
+    # ONE dict feeds both the assertion and the construction, deliberately. The LDAPS site had to
+    # grow a second test to prove its asserted arguments were the ones its bind used, because the two
+    # lived in different methods; here they cannot drift, because they are the same object.
+    kwargs: dict[str, object] = {"url": addr, "token": token, "allow_redirects": False}
+    # ASVS 12.1.2 (BACKLOG #1317, ADR 0180): hvac exposes no SSLContext, so this asserts the context
+    # urllib3 will build for this hop. Raises ValueError at construction. Shared with
+    # crypto_transit.py, so the Transit cipher's client inherits the assertion from here too — the
+    # two construction points cover all THREE hvac clients the engine builds.
+    assert_hvac_tls_suites(kwargs, connector=_VAULT_TRANSIT_CONNECTOR)
+    client: Any = hvac.Client(**kwargs)
     return client
 
 
@@ -129,8 +144,13 @@ class VaultKeyProvider:
             )
         addr = os.environ.get(_ENV_ADDR)
         token = os.environ.get(_ENV_TOKEN)
+        # OUTSIDE the try on purpose. The TLS suite assertion inside `_build_client` raises
+        # ValueError, and the `except Exception` below would relabel it "could not envelope-decrypt
+        # the store DEK" — turning a configuration refusal into what reads as a Vault-side failure,
+        # the same mistake ADR 0180 records for the LDAPS site. Fail-closed is unchanged either way:
+        # both paths propagate out of open_store and serve refuses to start.
+        client = _build_client(addr, token)
         try:
-            client = _build_client(addr, token)
             # transit.decrypt_data unwraps the DEK inside Vault against the non-extractable KEK and
             # returns response['data']['plaintext'] — already base64 of the sealed raw-32 DEK bytes, so
             # it IS the active_key() contract with no re-encoding (ADR 0019 §3, no double-base64).

@@ -192,10 +192,12 @@ def build_transit_cipher(settings: StoreSettings) -> TransitCipher:
     audit_key = os.environ.get(_ENV_AUDIT_KEY) or key_name
     addr = os.environ.get(_ENV_ADDR)
     token = os.environ.get(_ENV_TOKEN)
+    # OUTSIDE the try on purpose. `_build_client` asserts this hop's TLS suites (ADR 0180) and raises
+    # ValueError; the `except Exception` below would relabel that "could not reach a Vault Transit
+    # key", turning a configuration refusal into what reads as a connectivity failure. Fail-closed is
+    # unchanged either way: both paths propagate and the cipher provider refuses to come up.
+    client = _build_client(addr, token)  # lazy hvac import; fails closed naming the [vault] extra
     try:
-        client = _build_client(
-            addr, token
-        )  # lazy hvac import; fails closed naming the [vault] extra
         # Startup connectivity + key-existence check: read the key metadata (no crypto, no secrets). This
         # turns a mis-provisioned Vault into a refuse-to-start rather than a first-write dead-letter.
         client.secrets.transit.read_key(name=key_name)

@@ -29,11 +29,13 @@ so a test that saw no raise would be reporting a missing call rather than an ine
 
 from __future__ import annotations
 
+import ast
+import contextlib
 import datetime
-import importlib.util
 import re
 import socket
 import ssl
+import threading
 import urllib.request
 from collections.abc import Iterator, Mapping
 from pathlib import Path
@@ -49,7 +51,7 @@ from cryptography.x509.oid import NameOID
 from messagefoundry import logging_setup
 from messagefoundry.auth import ldap as ldap_auth
 from messagefoundry.auth import oidc_http
-from messagefoundry.config import tls_policy, tls_probe
+from messagefoundry.config import secretprovider_vault, tls_policy, tls_probe
 from messagefoundry.config.models import ConnectorType, Destination
 from messagefoundry.config.settings import (
     INSECURE_TLS_ESCAPE_ENV,
@@ -59,9 +61,10 @@ from messagefoundry.config.settings import (
 )
 from messagefoundry.config.wiring import FHIR, Rest, Soap
 from messagefoundry.pipeline import alert_sinks
-from messagefoundry.store import postgres
+from messagefoundry.store import crypto_transit, keyprovider_vault, postgres
 from messagefoundry.transports import build_destination, database, rest, soap
 from messagefoundry.transports.http_auth import with_http_digest
+from tests._extras_probe import OPTIONAL_EXTRAS, extra_is_installed
 
 # Imported at module scope ON PURPOSE. `rest` and `alert_sinks` build their shared opener AT IMPORT,
 # so a first import inside the every_suite_looks_weak fixture would raise during module execution and
@@ -627,6 +630,208 @@ def test_ldap3_swallows_a_rejected_cipher_string_and_strips_every_tls12_suite() 
     )
 
 
+# --- the Vault hops: a replica again, and this one is pinned to urllib3's own constructor ---------
+#
+# ADR 0180 DECLINED to build this assertion, and its stated reason was not that the hop was fine — it
+# was that "no CI leg installs the [vault] extra", so the control could never be executed. That is the
+# silent-control shape, and shipping into it would have been worse than the gap. The extra is now on
+# the `test` leg (.github/workflows/ci.yml), which is what makes these tests, and therefore the
+# assertion, real. Without the extra every test below SKIPS — and `tests/_extras_probe.py` now lists
+# `vault`, so such a run announces itself as INCOMPLETE rather than reporting a quiet green.
+
+
+_vault_extra = pytest.mark.skipif(
+    not extra_is_installed(OPTIONAL_EXTRAS["vault"]),
+    reason="the [vault] extra (hvac + requests + urllib3) is not installed in this interpreter",
+)
+
+
+def _context_urllib3_builds_for(client: Any) -> ssl.SSLContext:
+    """The ``SSLContext`` urllib3's OWN connect path builds for ``client`` — CAPTURED, not rebuilt.
+
+    The Vault twin of :func:`_context_ldap3_builds`, and it keeps this replica honest the same way.
+    urllib3 constructs the context inside ``_ssl_wrap_socket_and_match_hostname``, but only AFTER the
+    TCP connect succeeds — so the client is pointed at a real listener that accepts and immediately
+    closes. The handshake then fails at once (EOF), which is fine: the context was already built, and
+    the spy holds it. No peer certificate, no TLS, no off-box network — but urllib3's own construction
+    code really ran, with the arguments the shipped client really produces.
+    """
+    import urllib3.connection  # noqa: PLC0415  (optional [vault] extra; module-scope would break base)
+
+    captured: list[ssl.SSLContext] = []
+    real = urllib3.connection.create_urllib3_context
+
+    def spy(**kwargs: Any) -> ssl.SSLContext:
+        ctx = real(**kwargs)
+        captured.append(ctx)
+        return ctx
+
+    listener = socket.socket()
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(1)
+    port = listener.getsockname()[1]
+
+    def accept_then_close() -> None:
+        try:
+            conn, _ = listener.accept()
+            conn.close()
+        except OSError:  # the listener was closed from under us; the client already has its EOF
+            pass
+
+    server = threading.Thread(target=accept_then_close, daemon=True)
+    server.start()
+    monkey = pytest.MonkeyPatch()
+    try:
+        monkey.setattr(urllib3.connection, "create_urllib3_context", spy)
+        monkey.setattr(client, "url", f"https://127.0.0.1:{port}")
+        with contextlib.suppress(Exception):  # the handshake MUST fail; only the context matters
+            client.sys.read_health_status()
+    finally:
+        monkey.undo()
+        listener.close()
+        server.join(timeout=5)
+
+    assert len(captured) == 1, (
+        f"urllib3 built {len(captured)} contexts on one Vault request, not 1 — the replica in "
+        f"assert_hvac_tls_suites can no longer stand for 'the context this hop uses'"
+    )
+    return captured[0]
+
+
+@_vault_extra
+def test_the_vault_kv_secret_provider_asserts_its_tls_suites(every_suite_looks_weak: None) -> None:
+    """``config/secretprovider_vault._build_client`` — the connector-credential KV read.
+
+    Asserted inside ``_build_client`` rather than at the caller, because that function is the single
+    construction point and the assertion reads the SAME kwargs dict the client is built from.
+    """
+
+    with pytest.raises(ValueError, match=secretprovider_vault._VAULT_KV_CONNECTOR):
+        secretprovider_vault._build_client("https://vault.example.test:8200", "s.token")
+
+
+@_vault_extra
+def test_the_vault_transit_key_provider_asserts_its_tls_suites(
+    every_suite_looks_weak: None,
+) -> None:
+    """``store/keyprovider_vault._build_client`` — the store-DEK unwrap, and the Transit cipher.
+
+    ``store/crypto_transit.py`` imports THIS ``_build_client``, so the engine's third hvac client is
+    covered by this one site. That is why two construction points cover three clients.
+    """
+
+    with pytest.raises(ValueError, match=keyprovider_vault._VAULT_TRANSIT_CONNECTOR):
+        keyprovider_vault._build_client("https://vault.example.test:8200", "s.token")
+
+
+@_vault_extra
+def test_the_transit_cipher_client_is_the_asserted_one(
+    asserted_contexts: list[tuple[str, ssl.SSLContext]],
+) -> None:
+    """The third hvac client must reach the assertion, and by IDENTITY of the function, not by prose.
+
+    ADR 0180's scope note records that ``crypto_transit`` shares ``keyprovider_vault._build_client``.
+    A shared function is only shared while nobody copies it, so this pins the object rather than the
+    claim: rebind one and this goes red.
+    """
+
+    assert crypto_transit._build_client is keyprovider_vault._build_client
+
+
+@_vault_extra
+def test_the_vault_replica_matches_the_context_urllib3_actually_builds(
+    asserted_contexts: list[tuple[str, ssl.SSLContext]],
+) -> None:
+    """The replica must resolve to the same suite list as the context urllib3 really builds.
+
+    This is the substitute for the identity check the urllib openers get, and — like the LDAPS twin —
+    it compares against the library's OWN construction rather than a second reading of its source. The
+    replica is taken off the ``asserted_contexts`` spy, so this compares the exact object the shipped
+    control checked against the exact object the hop will use.
+
+    If urllib3 ever changes how it builds that context (its own defaults, or the arguments requests
+    hands it), this goes red and ``assert_hvac_tls_suites`` must be re-derived rather than trusted.
+    """
+
+    client = secretprovider_vault._build_client("https://vault.example.test:8200", "s.token")
+    replicas = [
+        ctx for label, ctx in asserted_contexts if label == secretprovider_vault._VAULT_KV_CONNECTOR
+    ]
+    assert len(replicas) == 1, "the assertion did not run exactly once on its own replica"
+    replica = replicas[0]
+
+    real = _context_urllib3_builds_for(client)
+    assert [c["name"] for c in real.get_ciphers()] == [c["name"] for c in replica.get_ciphers()], (
+        "the replica no longer resolves to the suite list urllib3's own connect path produces, so "
+        "the Vault assertion is now checking a context this hop will not use"
+    )
+
+
+@_vault_extra
+def test_the_shipped_vault_hop_offers_no_weak_suite() -> None:
+    """The POSITIVE control, and it is the half a reverted fix would still pass without.
+
+    Deliberately WITHOUT ``every_suite_looks_weak``: this measures the real suite list the Vault hops
+    negotiate over and requires it to be non-empty and clean on all three properties the shipped
+    predicates test. A refusal pinned alone cannot tell a working control from one that refuses
+    everything; a clean list pinned alone cannot fail when the call is deleted. Both are needed.
+    """
+
+    client = secretprovider_vault._build_client("https://vault.example.test:8200", "s.token")
+    ciphers = _context_urllib3_builds_for(client).get_ciphers()
+    assert ciphers, "the Vault hop offered no suites at all, so this test proves nothing"
+    for cipher in ciphers:
+        assert tls_policy._is_forward_secret(cipher), f"{cipher['name']} is not forward-secret"
+        assert tls_policy._is_encrypting(cipher), f"{cipher['name']} offers no confidentiality"
+        assert tls_policy._is_peer_authenticated(cipher), f"{cipher['name']} authenticates no peer"
+
+
+@_vault_extra
+def test_the_vault_assertion_refuses_a_client_argument_it_cannot_replicate() -> None:
+    """An unreplicable ``hvac.Client`` argument must REFUSE, not be replicated wrongly or ignored.
+
+    ``session=`` is the one that matters: it is the documented way to give this hop a different TLS
+    context, and a replica that accepted it would keep reporting a clean suite list for a context the
+    hop had stopped using. Deliberately without ``every_suite_looks_weak``, so this raise stands on
+    its own and a reader can tell the refusal apart from a suite-list failure.
+    """
+
+    with pytest.raises(ValueError, match="session"):
+        tls_policy.assert_hvac_tls_suites(
+            {"url": "https://vault.example.test:8200", "session": object()},
+            connector="Vault KV secret provider",
+        )
+
+
+@_vault_extra
+def test_hvac_holds_no_ssl_context_of_its_own_at_any_layer() -> None:
+    """The measurement the whole replica rests on — re-run rather than quoted.
+
+    ADR 0180 concluded a replica was the only instrument because no layer of the hvac stack exposes a
+    context the engine could assert directly. That is a property of three third-party libraries, not
+    of this repo, so it is pinned here: if any layer ever starts carrying an ``ssl_context``, this
+    goes RED and the replica should be REPLACED by the identity check the urllib openers get, which
+    is strictly stronger. A red here is good news, not a regression.
+    """
+
+    client = secretprovider_vault._build_client("https://vault.example.test:8200", "s.token")
+    assert not [a for a in dir(client) if "ssl" in a.lower() or "context" in a.lower()]
+
+    session = client.adapter.session
+    adapter = session.get_adapter("https://vault.example.test:8200")
+    assert "ssl_context" not in adapter.poolmanager.connection_pool_kw, (
+        "requests now seeds the pool with its own SSLContext — the engine can reach that object, so "
+        "assert it by identity instead of replicating urllib3's construction"
+    )
+
+    import requests.adapters  # noqa: PLC0415  (optional [vault] extra)
+
+    assert getattr(requests.adapters, "_preloaded_ssl_context", None) is None, (
+        "requests has reinstated the module-level preloaded SSLContext it carried in 2.32 — that is "
+        "a reachable object and the Vault assertion should hold it rather than rebuild it"
+    )
+
+
 # --- the preserved exemption: config/tls_probe.py -------------------------------------------------
 
 
@@ -686,16 +891,23 @@ def test_the_handler_factory_refuses_when_it_cannot_reach_the_context(
         tls_policy.build_asserted_https_handler(connector="a label")
 
 
-# --- the two libraries ADR 0180 scoped OUT, and the premises that scoped them ---------------------
+# --- the libraries ADR 0180 scoped OUT, and the premises that scoped them -------------------------
 #
 # BACKLOG #1317 names three third-party TLS surfaces: ldap3, hvac and ODBC Driver 18. ADR 0180 built
 # the first (above) and ruled the other two out in PROSE, each on a measurement taken once. A
 # scope-out is a compensating control like any other, so SDS-3.7 applies to it: it must not rest on a
-# premise nothing re-checks. Neither premise was checked by anything until the three tests below.
+# premise nothing re-checks. Neither premise was checked by anything until these tests.
 #
-# Both are TRIGGERS, not guards. A red here does not mean the engine got worse; it means the reason
-# an arm was left unasserted has stopped being true, and the arm is now buildable. The fix is to
-# build it and amend ADR 0180 -- never to delete the test.
+# ONE OF THE TWO TRIGGERS HAS SINCE FIRED, so the two are no longer the same shape and must not be
+# read as if they were:
+#
+# * ODBC stays a TRIGGER. A red does not mean the engine got worse; it means the reason that arm was
+#   left unasserted has stopped being true and the arm is now buildable. Build it and amend ADR 0180
+#   -- never delete the test.
+# * hvac is now a GUARD, in the opposite direction. Its trigger fired when the `test` leg started
+#   installing the `[vault]` extra, the assertion was built above, and ADR 0180 carries the amendment.
+#   A red there means the arm that WAS built has stopped being executed, which is the failure a
+#   scope-out trigger cannot detect.
 
 #: Ways a module can hold an ``SSLContext`` the engine could assert on. Shared by the ODBC subjects
 #: and by the control below, so a clean result on the subjects is a reading rather than a dead regex.
@@ -808,24 +1020,67 @@ def _ci_installed_extras(root: Path) -> set[str]:
     return extras
 
 
-def test_the_hvac_scope_out_premise_still_holds(request: Any) -> None:
-    """ADR 0180 records the Vault (hvac) arm as UNMEASURED rather than built. This is its trigger.
+#: The name every hvac construction point must CALL. Held as a string because the scan below reads
+#: source rather than importing (the modules it reads lazy-import hvac), and checked against the
+#: shipped module so a rename cannot leave the needle pointing at nothing.
+_HVAC_ASSERTION = "assert_hvac_tls_suites"
 
-    hvac delegates to requests, which delegates to urllib3, which builds and owns the context per
-    connection -- so the engine holds no object, exactly as with ldap3. Unlike ldap3 the gap cannot be
-    closed by measurement: ``urllib3`` is absent from this interpreter and **no CI leg installs the
-    ``[vault]`` extra**, so a cipher assertion there would be a security control that no test in this
-    project can execute. The ADR names its own precondition: install the extra on a CI leg, and then
-    the honest instrument is urllib3's OWN ``urllib3.util.ssl_.create_urllib3_context()`` -- the
-    function urllib3 itself calls, not a hand-rolled look-alike.
+#: The factory the scan looks inside. Both hvac modules name it identically.
+_HVAC_FACTORY = "_build_client"
 
-    Both halves red on the SAME action, so read either failure the same way: the instrument is now
-    executable, so build the assertion into both ``_build_client`` factories
-    (``store/keyprovider_vault.py`` and ``config/secretprovider_vault.py``, which between them cover
-    all three clients -- ``store/crypto_transit.py`` reuses the first) and amend ADR 0180.
+#: The two hvac construction points. ``store/crypto_transit.py`` is absent ON PURPOSE: it imports
+#: ``keyprovider_vault._build_client`` rather than building a client of its own, which
+#: :func:`test_the_transit_cipher_client_is_the_asserted_one` pins by identity rather than by prose.
+_HVAC_BUILD_SITES = (
+    "messagefoundry/config/secretprovider_vault.py",
+    "messagefoundry/store/keyprovider_vault.py",
+)
 
-    The urllib3 half is keyed on PRESENCE, not on which extra brought it: the ``otel`` extra pulls it
-    transitively too, and it would make the instrument executable just as well.
+
+def _factory_calls_the_assertion(path: Path) -> bool:
+    """Does ``path``'s ``_build_client`` CALL the assertion — parsed, not string-matched?
+
+    A substring scan is not good enough here and that was measured, not assumed: both modules carry
+    ``from ... import assert_hvac_tls_suites`` at module scope, so deleting the call from the factory
+    body leaves the name in the file and a substring scan stays green over a removed security control.
+    Parsing asks the question this test means to ask -- is the call INSIDE the factory -- which also
+    reds if the call is moved somewhere that never runs.
+    """
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    factories = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef) and node.name == _HVAC_FACTORY
+    ]
+    return any(
+        isinstance(call.func, ast.Name) and call.func.id == _HVAC_ASSERTION
+        for factory in factories
+        for call in ast.walk(factory)
+        if isinstance(call, ast.Call)
+    )
+
+
+def test_the_hvac_arm_stays_built_and_stays_executable(request: Any) -> None:
+    """ADR 0180 left the Vault (hvac) arm UNMEASURED, and this was that scope-out's trigger. It FIRED.
+
+    The premise was never that the hop was fine. It was that ``urllib3`` was absent and **no CI leg
+    installed the ``[vault]`` extra**, so a cipher assertion there would have been a security control
+    no test in this project could execute. The ADR named its own precondition, the `test` leg now
+    installs the extra, and the assertion above was built against urllib3's OWN
+    ``create_urllib3_context()`` rather than a hand-rolled look-alike (ADR 0180 Amendment A).
+
+    **So this test is now a GUARD, and both halves point the other way.** The failure a fired trigger
+    cannot see is the arm being built and then quietly stopping running, which is the silent-control
+    shape ADR 0158 catalogues:
+
+    * Drop the extra from CI and all seven ``_vault_extra`` tests SKIP. A suite that skips its way
+      past a security control reports green, so the extra is pinned here rather than trusted.
+    * Delete the call from a ``_build_client`` and, on an interpreter without the extra, nothing else
+      in this file notices -- every test that would have caught it is skipped. The source scan is the
+      half that still runs there.
+
+    Read a red here as the control having stopped being executed, and restore it. The one thing that
+    is NOT a fix is relaxing either half.
     """
 
     root = Path(request.config.rootpath)
@@ -834,15 +1089,23 @@ def test_the_hvac_scope_out_premise_still_holds(request: Any) -> None:
     assert "webauthn" in extras, (
         f"control: the workflow scan should see the extras CI really installs, but read {extras}"
     )
-    assert "vault" not in extras, (
-        "a CI leg now installs the [vault] extra, which is ADR 0180's own named trigger: the hvac "
-        "cipher assertion is now writable AND testable, so build it (BACKLOG #1317)"
+    assert "vault" in extras, (
+        "no CI workflow installs the [vault] extra any more, so every test guarded by _vault_extra "
+        "skips and the hvac cipher assertion (ASVS 12.1.2) is a security control nothing executes. "
+        "Restore it on the leg that runs tests/ -- ADR 0180 Amendment A is what that install line "
+        "makes true (BACKLOG #1317)"
     )
 
-    assert importlib.util.find_spec("urllib3") is None, (
-        "urllib3 is importable here, so urllib3.util.ssl_.create_urllib3_context() -- the instrument "
-        "ADR 0180 names -- can now be exercised by a test. The hvac hop's suite list is inherited and "
-        "unchecked; build the assertion (BACKLOG #1317) rather than relaxing this test"
+    assert callable(getattr(tls_policy, _HVAC_ASSERTION, None)), (
+        f"control: tls_policy.{_HVAC_ASSERTION} is the name the scan below looks for, and it is no "
+        f"longer a callable there -- so a clean scan would mean the needle had gone stale, not that "
+        f"the call sites were wired"
+    )
+    unasserted = [rel for rel in _HVAC_BUILD_SITES if not _factory_calls_the_assertion(root / rel)]
+    assert not unasserted, (
+        f"{_HVAC_FACTORY} no longer calls {_HVAC_ASSERTION} in {unasserted}. That hop's suite list "
+        f"is inherited from urllib3 and unchecked again; restore the call (BACKLOG #1317, ADR 0180 "
+        f"Amendment A) rather than relaxing this test"
     )
 
 
