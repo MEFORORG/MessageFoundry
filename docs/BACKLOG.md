@@ -8955,6 +8955,38 @@ filing.
 *Recorded here rather than only in the tracking seat's note, because the item that caused it should say what it caused.* The re-score itself is that seat's work and is not claimed here.
 
 **Two limits stated with it, both disclosed by the measuring seat rather than found by review.** The verify run's header reads `engine=NO-GIT` -- `git archive` strips `.git`, so **the tool could not attest which engine ref it read**, and that half of the header is asserted rather than measured. And the FAIL movement is **deliberately not attributed**: the prior figure came from a different engine tree *and* a scorecard with fewer commits, so subtracting them would manufacture a result.
+
+**RE-MEASURED 2026-09-03, AND FIVE OF THE SIX BUILD CONDITIONS THIS ITEM SET ARE MET.** Every line number was re-read rather than carried forward; several had moved again since August.
+
+| what this item required | instrument | result |
+|---|---|---|
+| both admin reset lanes action-bound on the JSON plane | read `api/auth_routes.py:771-812` | MET |
+| the same on the browser plane | read `messagefoundry_webconsole/routes/admin.py:269-303` | MET |
+| the MFA-gate-ON factory, not the gate-OFF one | `grep -rn` both factory names | MET, both planes |
+| the combined registration split per-action | read `routes/admin.py:43-62` | MET |
+| pacing charged in the action factories | `grep -rn _enforce_admin_write_pacing` | MET; **three** call sites now, not the two recorded above |
+| the CI guard's expected set SHRANK, not grew | ran `tests/test_security_doc_rate_limits.py` | MET; the unpaced set is now **empty** |
+
+**The 2026-08-22 retraction held.** `require_reauth_only_action` still appears at exactly two sites, `api/auth_routes.py:387` and `:408`, both self-service enrollment. Neither admin reset lane uses it on either plane.
+
+**Pacing went further than this item asked.** `require_step_up_action` now charges the floor first in its dependency (`api/security.py:664`), which closed the last exemption rather than adding a third: `PATCH /users/{user_id}` had lost the floor when it was promoted to that gate. The guard also stopped hardcoding the charging families and derives them from source, after a measurement in its own docstring -- with a hardcoded set, deleting the pacing call left the exemption test green.
+
+**The one condition still short, and it is not reachable from the action-grant mechanism.** `POST /me/password` (`api/auth_routes.py:298-303`) takes a plain `require()`, and `("POST", "/me/password")` is a member of `_MFA_EXEMPT_ROUTES` (`api/security.py:79-88`), which `require()` consults at `:244`. Its console delegate `POST /ui/account/password` (`routes/account.py:187-191`) is weaker still: `require_ui(allow_must_change=True, allow_mfa_pending=True)`. Both verify the current password and neither consults a second factor. Closing them needs the full-factor re-authentication mint, because the grant machinery lives inside `reauth()` and neither lane calls it.
+
+**Residual closed: the console write-action tag golden**, one of the subjects named above as proposed and unbuilt. `packaging/messagefoundry-webconsole/tests/golden/ui_write_actions.txt` pinned `path_re.pattern` only, so `UiWriteAction.action` was outside the comparison. That field is what `/ui/reauth` mints a single-use grant for -- `routes/core.py:927` passes `purpose=action.action`, and `None` mints nothing -- so deleting one `action=` kwarg downgrades a factor-binding browser lane to the shared login-seeded window in a one-line diff that reads like tidying. The golden now pins `pattern<TAB>action` for all 28 registrations, 9 of which carry a tag.
+
+***THE MEASURED RESULT IS NARROWER THAN THIS ITEM'S "UNGUARDED AGAINST SILENT REMOVAL", AND THE CORRECTION IS THE USEFUL PART.*** A mutation sweep deleted each of the 9 `action=` kwargs in turn and ran the console suite plus the three engine test files that reference the console (scope control: the other five files naming the action constants score **zero** on `grep -c messagefoundry_webconsole`, so they cannot observe a console tag).
+
+| what caught a deleted tag | result |
+|---|---|
+| the golden itself | **0 of 9.** It compared the pattern only, while its own docstring called it the step-up allow-list guard |
+| behavioural console tests | **9 of 9**, but incidentally: they were written for the MFA / WebAuthn / session lifecycles and report that a lifecycle broke, not that a pattern lost its tag |
+
+**The one real hole the sweep found is an interpreter-dependent one.** The 2 WebAuthn lanes are covered only when the optional `[webauthn]` extra is installed. Without it both deletions ran **completely green** (`test_webauthn_*` all `importorskip`); with `webauthn==3.0.0` installed they red immediately, 6 tests and 1 test respectively. So a contributor without the extra gets a clean local run on a real downgrade. That first sweep's two SILENT results were an artefact of the interpreter, not a coverage gap, and are recorded here so nobody re-derives them as one.
+
+So this column does not close an unguarded hole. It replaces incidental, extra-gated coverage with a direct guard that names the field.
+
+**Still unbuilt, named by subject rather than number:** the full-factor re-authentication mint; the self-service password lanes above; the target-scoped action grant; the console admin user-update edit-unlock work; the client full-factor reauth channel; the API-Kerberos step-up seeding asymmetry; and the golden's remaining blind spots, the `step_up` / `auto_retry` / `unlock` flags, which the action column deliberately did not take on. The closing act stays the scorecard re-score, which is the tracking seat's work and is not claimed here.
 ## 1149. research an honest pass for ASVS 7.5.2 -- what "authenticated again" means when the step-up window is seeded at login
 
 > 🔢 **Re-scored 2026-08-20 -> P2.** Value **5/10** · Difficulty **3/10** · _fill-in_. The seeding still happens at login: store/store.py carries seed_reauth as a create_session parameter defaulting True with the comment that reauth_at = now seeds the step-up window from login, one line above the INSERT (around :8380-8385; the item's :8287 anchor and the scorecard's :8263 have both drifted). View and terminate ship at api/auth_routes.py:451, :474 and :488, and seed_reauth is already threaded through auth/service.py (:887, :1039, :1177), so the open work is a semantic reading and a re-verify, not a mechanism. _(was 5/10 · 4/10.)_
