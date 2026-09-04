@@ -416,6 +416,63 @@ def test_the_cli_names_the_job_and_the_step_end_to_end(
     assert "NOT VISIBLE ON THE PR PAGE" in out  # the merge_group mark still fires
 
 
+def test_a_full_page_of_runs_says_UNATTRIBUTED_may_be_truncation_not_absence(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """#1385's own recorded trap: an unpaginated query returned 100 of `total_count` 190 and
+    dropped half the population silently. The reader still asks for one page, so when that page
+    FILLS, an unattributed verdict means "not in the window" and must not read as "nothing there"."""
+    prs = tmp_path / "prs.json"
+    runs = tmp_path / "runs.json"
+    prs.write_text(json.dumps([_pr(number=901, title="unattributed")]), encoding="utf-8")
+    # A full page, none of it attributable to PR 901.
+    filler = [
+        _run(
+            run_id=i,
+            branch=f"gh-readonly-queue/main/pr-{i}-abc123def456",
+            created="2026-09-04T01:00:00Z",
+        )
+        for i in range(1, mod.RUNS_PAGE + 1)
+    ]
+    runs.write_text(json.dumps(filler), encoding="utf-8")
+    assert mod.main(["--prs-json", str(prs), "--runs-json", str(runs), "--no-jobs"]) == 1
+    out = capsys.readouterr().out
+    assert "UNATTRIBUTED" in out
+    assert "filled its single page" in out
+    assert "NOT 'no failing run'" in out
+
+
+def test_a_short_page_of_runs_carries_no_truncation_caveat(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The negative control. A caveat that fires unconditionally teaches a reader to skip it."""
+    prs = tmp_path / "prs.json"
+    runs = tmp_path / "runs.json"
+    prs.write_text(json.dumps([_pr(number=901, title="unattributed")]), encoding="utf-8")
+    runs.write_text(json.dumps([_run()]), encoding="utf-8")
+    assert mod.main(["--prs-json", str(prs), "--runs-json", str(runs), "--no-jobs"]) == 1
+    out = capsys.readouterr().out
+    assert "UNATTRIBUTED" in out
+    assert "filled its single page" not in out
+
+
+def test_the_truncation_caveat_quotes_the_number_the_fetch_actually_asks_for(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The caveat and the query must not drift. A caveat quoting a stale literal is worse than none,
+    because it reads as measured. Asserted through the command the fetch actually builds rather than
+    by scraping the source, so a rewrite that keeps the behaviour keeps the test."""
+    seen: list[list[str]] = []
+
+    def capture(cmd: list[str]) -> object:
+        seen.append(cmd)
+        return {"workflow_runs": []}
+
+    monkeypatch.setattr(mod, "_gh", capture)
+    mod._fetch_runs("owner/name")
+    assert seen and f"per_page={mod.RUNS_PAGE}" in seen[0][-1]
+
+
 def test_supplying_saved_runs_never_reaches_the_network(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:

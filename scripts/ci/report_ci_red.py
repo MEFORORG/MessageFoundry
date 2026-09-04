@@ -101,6 +101,10 @@ _MERGE_QUEUE_REF = re.compile(r"(?:\A|/)pr-(\d+)-[0-9a-f]+\Z")
 #: The pull-request fields this reader needs. Beside the parser so the two cannot drift.
 PR_FIELDS = "number,title,state,headRefName"
 
+#: Runs asked for in ONE page. Named so the fetch and the truncation caveat below cannot disagree
+#: about the number -- a caveat quoting a stale literal is worse than none.
+RUNS_PAGE: int = 100
+
 #: Jobs that only MIRROR another job's verdict, and so must never be named as a cause. `CI gate` is
 #: the required roll-up: its failing step reads `Fail -- a gated leg FAILED` and names no leg, so a
 #: reader sent there learns nothing. Matched case-insensitively on the job name up to its matrix
@@ -352,7 +356,8 @@ def _fetch_runs(repo: str | None) -> list[dict[str, object]]:
     # per_page=100 deliberately: any gh api list route DEFAULTS TO 30, and a reader that silently
     # cannot see two thirds of its own corpus reports a clean repo. (BACKLOG #1385's own notes record
     # a session that concluded a label had never been re-applied off exactly that truncation.)
-    cmd = ["gh", "api", f"repos/{slug}/actions/runs?status=failure&per_page=100"]
+    # ...and it is still ONE page. `main` says so when the page fills; see the caveat there.
+    cmd = ["gh", "api", f"repos/{slug}/actions/runs?status=failure&per_page={RUNS_PAGE}"]
     payload = _gh(cmd)
     if not isinstance(payload, dict):
         return []
@@ -453,13 +458,32 @@ def main(argv: list[str] | None = None) -> int:
     for red in reds:
         print(f"::warning::{red.line()}")
 
+    # THE WINDOW IS ONE PAGE, AND AN UNATTRIBUTED LINE MUST NOT HIDE THAT. `_fetch_runs` asks for
+    # one page of RUNS_PAGE and does not paginate, so a full page means the corpus was cut off at
+    # an unknown depth and an UNATTRIBUTED verdict may be an artefact of the cut rather than a fact
+    # about the pull request. This is #1385's own recorded trap -- an unpaginated query returned 100
+    # of total_count 190 and dropped half the population silently. Saying so costs a line; not
+    # saying so renders "I could not see that far" as "there is nothing there".
+    unattributed = [r for r in reds if not r.attributed]
+    if unattributed and len(runs) >= RUNS_PAGE:
+        print(
+            f"::warning::{len(unattributed)} pull request(s) read UNATTRIBUTED against a run list "
+            f"that filled its single page of {RUNS_PAGE}. The window was cut off at an unknown "
+            "depth, so an unattributed verdict here is 'not in the window', NOT 'no failing run'. "
+            "Attribute those by hand with a paginated query before treating them as clean."
+        )
+
     timing = [r for r in reds if r.is_timing_gate]
     if timing:
+        count = (
+            "1 of these is a TIMING GATE"
+            if len(timing) == 1
+            else f"{len(timing)} of these are TIMING GATES"
+        )
         print(
-            f"::error::{len(timing)} of these are TIMING GATES, not test failures: the suite "
-            "concluded SUCCESS and a margin watchdog reddened the leg. Re-queueing cannot fix one. "
-            "Measured 2026-09-04, this shape reddened two merge_group runs on a leg reporting "
-            "405 passed and ZERO failures."
+            f"::error::{count}, not a test failure: the suite concluded SUCCESS and a margin "
+            "watchdog reddened the leg. Re-queueing cannot fix one. Measured 2026-09-04, this shape "
+            "reddened two merge_group runs on a leg reporting 405 passed and ZERO failures."
         )
 
     hidden = [r for r in reds if r.hidden_from_the_pr_page]
