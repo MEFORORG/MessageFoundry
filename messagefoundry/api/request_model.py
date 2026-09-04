@@ -2,11 +2,12 @@
 # Copyright (C) 2026 MessageFoundry Organization and contributors
 """The base class for every model the API parses out of a request body (ASVS 2.2.1, BACKLOG #1109).
 
-Pydantic's default is ``extra="ignore"``, so before this module every API request body accepted an
-unknown or misspelled key, dropped it, and reported success. On a first deployment that is a silent
-wrong answer rather than a refusal: ``PUT /users/{id}/channel-scope`` sent ``{"chanels": [...]}``
-leaves the optional ``channels`` at ``None``, and ``None`` means *all channels*. The operator asked
-for a narrow scope, the engine granted a wide one, and nothing anywhere reported a problem.
+Pydantic's default is ``extra="ignore"``, so until this module existed every API request body
+accepted an unknown or misspelled key, dropped it, and reported success. On a first deployment that
+is a silent wrong answer rather than a refusal. ``PUT /users/{id}/channel-scope`` is the sharpest
+case: a body of ``{"chanels": [...]}`` leaves the optional ``channels`` at ``None``, and ``None``
+means *all channels*. The operator asked for a narrow scope, the engine granted a wide one, and
+nothing anywhere reported a problem.
 
 **The posture is request-scoped on purpose, and the split must not be tidied away.** The engine's
 response models keep ``extra="ignore"`` because the same classes are the client's *reader*:
