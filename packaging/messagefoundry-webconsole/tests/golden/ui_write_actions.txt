@@ -1,28 +1,28 @@
-^/ui/account/mfa/confirm$
-^/ui/account/mfa/disable$
-^/ui/account/mfa/enroll$
-^/ui/account/sessions/[^/?#]+/revoke$
-^/ui/account/sessions/revoke-others$
-^/ui/account/webauthn/[^/?#]+/delete$
-^/ui/account/webauthn/enroll$
-^/ui/ad-groups$
-^/ui/config/reload$
-^/ui/connections/[^/?#]+/purge/(top|all)$
-^/ui/connections/purge-confirm$
-^/ui/dead-letters/[^/?#]+(/[^/?#]+)?/replay$
-^/ui/dead-letters/replay-all$
-^/ui/messages/[^/?#]+/edit$
-^/ui/messages/[^/?#]+/replay$
-^/ui/messages/search$
-^/ui/messages/search/layered$
-^/ui/roles/[^/?#]+/edit$
-^/ui/roles/custom/[^/?#]+/delete$
-^/ui/roles/new$
-^/ui/uploaded-logs/file/[^/?#]+$
-^/ui/uploaded-logs/file/[^/?#]+/delete$
-^/ui/uploaded-logs/file/[^/?#]+/resend-confirm(\?[^#]*)?$
-^/ui/users/[^/?#]+$
-^/ui/users/[^/?#]+/(revoke-sessions|delete)$
-^/ui/users/[^/?#]+/reset-mfa$
-^/ui/users/[^/?#]+/reset-password$
-^/ui/users/new$
+^/ui/account/mfa/confirm$	mfa_confirm
+^/ui/account/mfa/disable$	mfa_disable
+^/ui/account/mfa/enroll$	mfa_enroll
+^/ui/account/sessions/[^/?#]+/revoke$	session_terminate
+^/ui/account/sessions/revoke-others$	session_terminate
+^/ui/account/webauthn/[^/?#]+/delete$	webauthn_delete
+^/ui/account/webauthn/enroll$	webauthn_enroll
+^/ui/ad-groups$	-
+^/ui/config/reload$	-
+^/ui/connections/[^/?#]+/purge/(top|all)$	-
+^/ui/connections/purge-confirm$	-
+^/ui/dead-letters/[^/?#]+(/[^/?#]+)?/replay$	-
+^/ui/dead-letters/replay-all$	-
+^/ui/messages/[^/?#]+/edit$	-
+^/ui/messages/[^/?#]+/replay$	-
+^/ui/messages/search$	-
+^/ui/messages/search/layered$	-
+^/ui/roles/[^/?#]+/edit$	-
+^/ui/roles/custom/[^/?#]+/delete$	-
+^/ui/roles/new$	-
+^/ui/uploaded-logs/file/[^/?#]+$	-
+^/ui/uploaded-logs/file/[^/?#]+/delete$	-
+^/ui/uploaded-logs/file/[^/?#]+/resend-confirm(\?[^#]*)?$	-
+^/ui/users/[^/?#]+$	-
+^/ui/users/[^/?#]+/(revoke-sessions|delete)$	-
+^/ui/users/[^/?#]+/reset-mfa$	admin_reset_mfa
+^/ui/users/[^/?#]+/reset-password$	admin_reset_password
+^/ui/users/new$	-
