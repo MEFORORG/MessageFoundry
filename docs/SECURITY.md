@@ -811,8 +811,9 @@ returns the **single-use recovery codes** (shown once), and `POST /auth/mfa-veri
 second factor with a TOTP code or a recovery code. `DELETE /me/mfa` disables it; an administrator clears a
 lost authenticator via `POST /users/{id}/reset-mfa` (which also revokes the user's sessions). With
 `[security].require_mfa` on — **the default since BACKLOG #187 (secure-by-default, including the
-loopback bind)** — **every local account** must satisfy MFA: the scope is `every_local_account` by
-default, and `administrators` narrows it to the **Administrator** role. It is an **access gate, not
+loopback bind)** — **every account** must satisfy MFA: the scope is `every_local_account` by
+default (a value now wider than its name, BACKLOG #1144), and `administrators` narrows it to the
+**Administrator** role. It is an **access gate, not
 only a step-up gate** — the gate returns `403` + `X-MFA-Required: 1` on **every** authorized route
 until verified (console twin: a 303 to `/ui/mfa`), with the account and factor-enrolment routes
 exempt so an un-enrolled user is not stranded. A required-but-unenrolled

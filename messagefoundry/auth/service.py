@@ -2166,7 +2166,7 @@ class AuthService:
         )
         return []
 
-    # --- MFA: native TOTP second factor (local accounts, WP-14, ASVS 6.3.3) --
+    # --- MFA: native TOTP second factor (every account, WP-14, ASVS 6.3.3) -----
 
     async def _second_factor_enrolled(self, user: UserRecord) -> bool:
         """Any second factor enrolled — TOTP **or** ≥1 WebAuthn passkey (ADR 0068 decision 5). The
@@ -2505,7 +2505,7 @@ class AuthService:
             webauthn_enrolled=webauthn_enrolled,
         )
 
-    # --- MFA: WebAuthn passkeys second factor (local accounts, WP-14b / ADR 0068) ---
+    # --- MFA: WebAuthn passkeys second factor (every account, WP-14b / ADR 0068) ---
 
     def webauthn_available(self) -> bool:
         """Whether the optional ``[webauthn]`` extra is installed (the UI hides the passkey surface
