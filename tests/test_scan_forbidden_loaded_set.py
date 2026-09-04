@@ -14,7 +14,7 @@ lookahead that matches NOTHING ANYWHERE. A blind scanner and a scanner with noth
 the same green tick. So the suite that looks like per-class coverage cannot fail when the real set is
 wrong -- which is the shape of the original defect, reproduced inside its own tests.
 
-THE TWO ARMS, and the split is about what each is allowed to touch:
+THE THREE ARMS, and the split is about what each is allowed to touch:
 
 * THE BEHAVIOURAL ARM pins the source to the COMMITTED SYNTHETIC EXAMPLE and drives the REAL
   pipeline -- ``MEFOR_FORBIDDEN_TOKENS`` -> ``_resolve_token_text`` -> ``_parse_tokens`` ->
@@ -26,6 +26,13 @@ THE TWO ARMS, and the split is about what each is allowed to touch:
   token, because this repository's forbidden-content guard exists to keep exactly those values out of
   files like this one (CLAUDE.md sec. 9). A test that embedded one to prove the scanner catches it
   would be the leak it is testing for.
+* THE SELF-TEST ARM covers ``scan_forbidden.py --self-test``, which asks the behavioural question
+  from a STDLIB ENTRYPOINT rather than from pytest. That distinction is the whole reason it exists:
+  no workflow hands a pytest job the ``MEFOR_FORBIDDEN_TOKENS`` secret -- it reaches only the two
+  steps that run the scanner directly -- so the real-set arm below skips in CI every time, and the
+  proof this file offers would otherwise only ever be about the committed synthetic example. The
+  scanner's own entrypoint runs inside the step that HAS the secret, which is the one place the real
+  table is loaded. These tests are that entrypoint's coverage.
 
 TWO THINGS THIS FILE DELIBERATELY DOES NOT ASSERT:
 
@@ -83,31 +90,19 @@ def example(monkeypatch: pytest.MonkeyPatch) -> Any:
     sfm.reload_tokens()
 
 
-def _word_probes_for_names(text: str) -> list[str]:
-    """Words a ``\\b``-anchored ``[names]`` entry is expected to match, RECOVERED FROM THE SOURCE.
-
-    A ``[names]`` entry is ``regex | reason | flags``, so the loaded table holds compiled patterns and
-    the literal is gone -- and a regex cannot be inverted into a matching string in general. Rather
-    than type a probe here (which would drift silently from the file it is meant to exercise), this
-    recovers the plain-word entries, which are the shape the class is overwhelmingly made of, and
-    ignores the rest. Recovering NOTHING is treated as a failure by the caller, so a source whose
-    shape changed cannot quietly turn this into a no-op.
-    """
-    import re as _re
-
-    probes: list[str] = []
-    in_names = False
-    for raw in text.splitlines():
-        line = raw.strip()
-        if line.startswith("["):
-            in_names = line.lower().startswith("[names]")
-            continue
-        if not in_names or not line or line.startswith("#"):
-            continue
-        pattern = line.split("|")[0].strip()
-        if m := _re.fullmatch(r"\\b([A-Za-z][A-Za-z0-9]*)\\b", pattern):
-            probes.append(m.group(1))
-    return probes
+#: Words a ``\b``-anchored ``[names]`` entry is expected to match, RECOVERED FROM THE SOURCE.
+#:
+#: A ``[names]`` entry is ``regex | reason | flags``, so the loaded table holds compiled patterns and
+#: the literal is gone -- and a regex cannot be inverted into a matching string in general. Rather
+#: than type a probe here (which would drift silently from the file it is meant to exercise), this
+#: recovers the plain-word entries, which are the shape the class is overwhelmingly made of, and
+#: ignores the rest. Recovering NOTHING is treated as a failure by the caller, so a source whose
+#: shape changed cannot quietly turn this into a no-op.
+#:
+#: IMPORTED RATHER THAN DEFINED HERE. This file used to carry its own copy, and the scanner's
+#: ``--self-test`` needs the same answer -- two spellings of "which entries are probeable" is two
+#: definitions that can drift, with the drift invisible because each side keeps passing its own.
+_word_probes_for_names = sfm.plain_word_name_probes
 
 
 # --- the anti-vacuity guards: these run FIRST because every assertion below is worthless without ---
@@ -246,6 +241,130 @@ def test_a_digit_run_with_no_loaded_prefix_is_not_flagged(example: Any, tmp_path
     probe.write_text("order 4815162342 shipped\n", encoding="utf-8")
 
     assert example.scan_file(probe) == []
+
+
+# --- the self-test, which is the arm that can run where the REAL set loads ---------------------------
+# Every test above needs pytest, and no workflow gives a pytest job the MEFOR_FORBIDDEN_TOKENS secret
+# -- it reaches only the two stdlib-only steps that run the scanner directly. So the real-set arm at
+# the bottom of this file skips in CI, always. ``scan_forbidden.py --self-test`` is the same question
+# asked by a stdlib entrypoint, which CAN run in the step that holds the secret. These tests are the
+# coverage for that entrypoint; the entrypoint is what carries the answer to where it matters.
+
+
+def test_the_self_test_fires_every_class_of_the_example(example: Any) -> None:
+    """The shipped example must survive its own probe, class by class."""
+    report, failures = example.self_test()
+    assert failures == []
+    joined = " ".join(report)
+    for label in ("site_prefix fired", "estate_file_scanned fired", "names fired"):
+        assert label in joined, f"the self-test reported nothing for {label!r}"
+    # A report that says "fired 0/0" everywhere would satisfy the line above while proving nothing.
+    assert "0/0" not in joined
+
+
+def test_the_self_test_catches_a_detector_that_loaded_and_cannot_match(
+    example: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """THE NEGATIVE CONTROL. A check that has never been observed to fail is not a check.
+
+    ``_NEVER`` is the exact production failure: no prefix loads, the site detectors become an empty
+    negative lookahead, and the counts line still reports a populated table if the other sections
+    loaded. This forces that state with the prefix still counted, which is the shape the floor cannot
+    see -- fully populated, fully fresh, inert.
+    """
+    monkeypatch.setattr(example, "_SITE_CODE_FILE", example._NEVER)
+    _report, failures = example.self_test()
+    assert any("site_prefix" in f for f in failures), (
+        "a site detector that cannot match anything was reported as healthy"
+    )
+
+
+def test_a_source_that_loads_but_cannot_be_probed_is_a_failure_not_a_pass(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Probing NOTHING is the vacuous pass this whole file exists to remove, so it must fail.
+
+    The source below parses to a real detector -- ``TOKENS_PRESENT`` is true and the floor would see a
+    populated ``names`` section -- but the entry is a regex no matching string can be recovered from,
+    and no other class loaded. Reporting that as clean would be the original defect wearing the
+    self-test's clothes.
+    """
+    mod = _load(monkeypatch, "[names]\nAC[M]E+X | vendor\n")
+    try:
+        assert mod.TOKENS_PRESENT, "precondition: the source DID load a detector"
+        _report, failures = mod.self_test()
+        assert any("proved nothing" in f for f in failures)
+    finally:
+        monkeypatch.undo()
+        sfm.reload_tokens()
+
+
+def test_the_self_test_refuses_rather_than_passing_with_no_source(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Empty tables cannot fail a probe, so the CLI must refuse instead of exiting 0."""
+    monkeypatch.setenv("MEFOR_FORBIDDEN_TOKENS", "")
+    assert sfm.main(["--self-test"]) == 2
+    monkeypatch.undo()
+    sfm.reload_tokens()
+
+
+def test_the_self_test_cli_reports_the_load_mode_beside_its_result(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Exit 0 does not say WHICH table was probed, and the example passes as happily as a real set.
+
+    ``mode=`` is the only field that discriminates the synthetic example from a real list -- both have
+    reported the same three counts -- so the self-test prints it for the same reason the scan does.
+    """
+    monkeypatch.setenv("MEFOR_FORBIDDEN_TOKENS", str(EXAMPLE))
+    assert sfm.main(["--self-test"]) == 0
+    out = capsys.readouterr().out
+    assert "mode=synthetic" in out
+    assert "self-test: site_prefix fired" in out
+    monkeypatch.undo()
+    sfm.reload_tokens()
+
+
+def test_the_self_test_never_prints_a_token(example: Any) -> None:
+    """It runs in a world-readable Actions log on the run holding the real secret.
+
+    So the contract is structural, not editorial: no loaded value may appear in either list. Checked
+    against the values that actually loaded rather than against a wording, because a reviewer reading
+    the format strings is exactly the check that missed this class the first time.
+    """
+    report, failures = example.self_test()
+    printed = " ".join(report + failures)
+    secrets = list(example._SITE_PREFIXES)
+    secrets += [token for token, _pat in example._ESTATE_FILE_RES]
+    secrets += _word_probes_for_names(EXAMPLE.read_text(encoding="utf-8"))
+    assert secrets, "recovered no loaded value to check against -- this assertion would be vacuous"
+    for value in secrets:
+        assert value.lower() not in printed.lower(), "the self-test echoed a loaded token"
+
+
+def test_the_ambient_token_source_survives_its_own_self_test() -> None:
+    """The arm that runs against whatever THIS environment loaded -- real file, example, or nothing.
+
+    Every other behavioural test here pins the source to the committed example, which proves the load
+    path works and says nothing about the set a given machine is actually guarded by. This one takes
+    the ambient source untouched.
+
+    Skips loudly and by name where no source is configured, because a silent skip and a pass are the
+    same line in a pytest summary, and that equivalence IS the defect this file is named for.
+    """
+    sfm.reload_tokens()
+    if sfm._resolve_token_text() is None:
+        pytest.skip(
+            "no token source in this environment (no MEFOR_FORBIDDEN_TOKENS and no "
+            "scripts/security/scan-tokens.local.txt) -- the loaded set could not be probed"
+        )
+    assert sfm.TOKENS_PRESENT, (
+        "a token source IS configured but parsed to zero detectors -- present and unusable, which "
+        "reports identically to having none"
+    )
+    _report, failures = sfm.self_test()
+    assert failures == [], "; ".join(failures)
 
 
 # --- the real set, when one is configured ---------------------------------------------------------
