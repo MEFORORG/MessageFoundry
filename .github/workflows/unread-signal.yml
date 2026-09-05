@@ -47,9 +47,25 @@ on:
     # Every workflow that reports a REQUIRED context. The state becomes true when the last of them
     # settles, and there is no way to know in advance which that is -- so all of them trigger an
     # evaluation, and the ones that are too early simply find the rollup unsettled and do nothing.
-    # `review gate` is in the list so that labelling a pull request `reviewed` re-runs that gate,
-    # which re-triggers this, which withdraws the `unread` label. That is what makes it self-clearing.
-    workflows: [CI, Security, backlog-hygiene, review gate, CLA Assistant]
+    # `review gate` WAS in this list and was what made the label self-clearing: labelling a pull
+    # request `reviewed` re-ran that gate, whose completion re-triggered this workflow, which
+    # withdrew the `unread` label. The owner retired the reviewer requirement on 2026-09-04 and
+    # review-gate.yml was deleted, so the entry named a workflow that no longer exists.
+    # test_every_watched_workflow_exists_by_name failed on it, correctly.
+    #
+    # KNOWN REGRESSION, RECORDED RATHER THAN HIDDEN. `review gate` was the ONLY watched workflow
+    # firing on a `labeled` event: ci.yml, security.yml and backlog-hygiene.yml declare no `types:`
+    # and cla.yml declares [opened, synchronize]. So `unread` no longer withdraws when somebody
+    # reads a pull request and labels it. It clears on the NEXT PUSH, when a watched workflow next
+    # completes. A flag that survives being read is worse than no flag, and this one now does until
+    # that push.
+    #
+    # THE FIX IS NOT A ONE-LINE TRIGGER ADD, which is why it is not done here. Restoring the
+    # behaviour needs an arm firing on `labeled`, and this file deliberately uses `workflow_run`
+    # rather than `pull_request` -- see WHY `workflow_run` AND NOT `pull_request` above, and NOT
+    # REQUIRED, AND MUST NOT BECOME REQUIRED. A pull_request arm changes where this runs and what it
+    # can do, which is a security-surface decision and the owner's to make.
+    workflows: [CI, Security, backlog-hygiene, CLA Assistant]
     types: [completed]
   workflow_dispatch:
     inputs:

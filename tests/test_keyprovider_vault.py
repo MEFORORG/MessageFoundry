@@ -33,11 +33,20 @@ _WRAPPED_DEK = "vault:v1:ZmFrZS13cmFwcGVkLWRlaw=="
 
 
 class _FakeTransit:
-    """Stands in for hvac's `client.secrets.transit`; records the unwrap call and returns a base64 DEK."""
+    """Stands in for hvac's `client.secrets.transit`; records the unwrap call and returns a base64 DEK.
 
-    def __init__(self, plaintext: str) -> None:
+    `read_key` exists because BACKLOG #1166 made the KEK's TYPE a checked precondition of the unwrap;
+    `key_type` picks what it reports so a test can supply an unsuitable one."""
+
+    def __init__(self, plaintext: str, key_type: str = "aes256-gcm96") -> None:
         self._plaintext = plaintext
+        self._key_type = key_type
         self.calls: list[tuple[str, str]] = []
+        self.read_calls: list[str] = []
+
+    def read_key(self, *, name: str) -> dict[str, Any]:
+        self.read_calls.append(name)
+        return {"data": {"name": name, "type": self._key_type}}
 
     def decrypt_data(self, *, name: str, ciphertext: str) -> dict[str, Any]:
         self.calls.append((name, ciphertext))
@@ -137,6 +146,9 @@ def test_transit_failure_fails_closed_without_leaking_ciphertext(
     _configure_env(monkeypatch)
 
     class _BoomTransit:
+        def read_key(self, *, name: str) -> dict[str, Any]:
+            return {"data": {"name": name, "type": "aes256-gcm96"}}
+
         def decrypt_data(self, *, name: str, ciphertext: str) -> dict[str, Any]:
             # A Transit error can echo the ciphertext — the provider must not surface it.
             raise RuntimeError(f"vault denied for ciphertext {ciphertext}")
@@ -162,3 +174,77 @@ def test_empty_plaintext_fails_closed(monkeypatch: pytest.MonkeyPatch) -> None:
     provider = keyprovider_vault.build_provider(StoreSettings())
     with pytest.raises(KeyProviderError, match="empty"):
         provider.active_key()
+
+
+# --- the KEK's key TYPE is checked before the unwrap (BACKLOG #1166, ASVS 11.2.3) ------------------
+#
+# Owner ruling 2026-08-22; the pre-fix measurement is on this module's own section header. The
+# positive control that this path was otherwise live is
+# `test_transit_failure_fails_closed_without_leaking_ciphertext` above, which refused in the same run.
+
+
+def _provider_on(
+    monkeypatch: pytest.MonkeyPatch, transit: _FakeTransit
+) -> keyprovider_vault.VaultKeyProvider:
+    """Wire ``transit`` in as the Vault backend and hand back a provider built against it."""
+    _configure_env(monkeypatch)
+    monkeypatch.setattr(
+        keyprovider_vault, "_build_client", lambda addr, token: _FakeClient(transit)
+    )
+    return keyprovider_vault.build_provider(StoreSettings())
+
+
+@pytest.mark.parametrize(
+    "key_type",
+    [
+        "ecdsa-p256",  # signing only — cannot decrypt anything
+        "ed25519",  # signing only
+        "aes128-cmac",  # MAC only
+        "rsa-2048",  # can decrypt, but ~112 bits: the exact shortfall 11.2.3 names
+    ],
+)
+def test_kek_of_an_unusable_or_sub_128_bit_type_refuses_to_start(
+    monkeypatch: pytest.MonkeyPatch, key_type: str
+) -> None:
+    transit = _FakeTransit(KEY_A, key_type=key_type)
+    with pytest.raises(KeyProviderError) as excinfo:
+        _provider_on(monkeypatch, transit).active_key()
+    assert key_type in str(excinfo.value)
+    assert "MEFOR_STORE_VAULT_TRANSIT_KEY" in str(excinfo.value)  # names the knob to change
+    # Refused BEFORE the unwrap, not after: no decrypt was attempted under the unsuitable key.
+    assert transit.calls == []
+
+
+@pytest.mark.parametrize("key_type", ["aes256-gcm96", "aes128-gcm96", "rsa-4096"])
+def test_kek_of_a_supported_type_still_unwraps(
+    monkeypatch: pytest.MonkeyPatch, key_type: str
+) -> None:
+    transit = _FakeTransit(KEY_A, key_type=key_type)
+    assert _provider_on(monkeypatch, transit).active_key() == KEY_A
+    assert transit.read_calls == [_TRANSIT_KEY]  # the one added round trip, on the startup path
+
+
+def test_kek_type_that_cannot_be_read_fails_closed(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Pins the fail-closed rule stated on ``require_transit_key_type``, through this path's wiring:
+    an unreadable response shape must refuse rather than shrug."""
+
+    class _ShapelessTransit(_FakeTransit):
+        def read_key(self, *, name: str) -> dict[str, Any]:
+            return {"data": {"name": name}}  # no 'type' at all
+
+    with pytest.raises(KeyProviderError, match="did not report a key type"):
+        _provider_on(monkeypatch, _ShapelessTransit(KEY_A)).active_key()
+
+
+def test_the_three_uses_have_distinct_allowed_type_sets() -> None:
+    """The sets are deliberately different, and a future edit that collapses them should have to
+    confront why. Their reasons live on the constants; this pins the SHAPE, so a collapse cannot
+    happen silently."""
+    data = keyprovider_vault.TRANSIT_KEY_TYPES_DATA
+    audit = keyprovider_vault.TRANSIT_KEY_TYPES_AUDIT
+    kek = keyprovider_vault.TRANSIT_KEY_TYPES_KEK
+    assert data < audit and data < kek  # both are strict supersets of the AEAD core
+    assert audit - data == {"hmac"}
+    assert kek - data == {"rsa-3072", "rsa-4096"}
+    assert "rsa-2048" not in (data | audit | kek)
+    assert not any("ecdsa" in t or t == "ed25519" for t in data | audit | kek)

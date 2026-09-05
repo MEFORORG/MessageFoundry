@@ -28,11 +28,23 @@
 name: backlog-hygiene
 
 on:
-  # BACKLOG #340 step 1. INERT UNTIL A MERGE QUEUE EXISTS: with no queue configured GitHub never
-  # emits merge_group, so this workflow behaves identically today. It is added FIRST and separately
-  # because the failure mode of the reverse order is total -- enable a queue while a required
-  # context's workflow has no merge_group trigger and that check never reports in the queue, so
-  # NOTHING MERGES.
+  # BACKLOG #340 step 1. THE QUEUE IS LIVE, SO THIS TRIGGER IS LOAD-BEARING -- DO NOT REMOVE IT.
+  # This job's name is a REQUIRED context, and branch protection evaluates required contexts on the
+  # MERGE-GROUP commit, so removing this trigger means the context never reports in the queue and
+  # NOTHING MERGES. That is not hypothetical: codeql.yml's header records PR 619 sitting
+  # AWAITING_CHECKS on the queue's first entry with its CodeQL contexts simply absent.
+  #
+  # WHAT THIS JOB CHECKS ON merge_group IS NOT WHAT IT CHECKS ON A PULL REQUEST. Its question --
+  # "does THIS pull request update BACKLOG.md" -- has no subject in a merge group, where every
+  # `github.event.pull_request.*` field is null. The enforcement that matters therefore happens on
+  # the `pull_request` run; the queue-time run is what keeps the required context reporting. The
+  # concurrency note below is the other half of that story, and it was measured the hard way.
+  #
+  # THIS COMMENT USED TO SAY "INERT UNTIL A MERGE QUEUE EXISTS ... behaves identically today".
+  # That was true when the trigger landed on 2026-08-26 and became false once a queue was
+  # configured; corrected 2026-09-03, after PR 754 merged through the queue. BACKLOG #340 carries
+  # the measurements and STAYS OPEN -- a live queue is not that item being finished, and who
+  # enabled the queue is recorded nowhere.
   merge_group:
   pull_request:
     branches: [main]

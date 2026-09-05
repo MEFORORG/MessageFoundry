@@ -55,9 +55,14 @@ class _FakeTransit:
         self._hmac = hmac
         self._hashlib = hashlib
         self.encrypts = 0
+        # Per-key-name type override for the BACKLOG #1166 key-type checks; anything unnamed reports
+        # the type a correctly provisioned store key has.
+        self.key_types: dict[str, str] = {}
+        self.read_calls: list[str] = []
 
     def read_key(self, *, name: str) -> dict[str, Any]:
-        return {"data": {"name": name, "type": "aes256-gcm96"}}
+        self.read_calls.append(name)
+        return {"data": {"name": name, "type": self.key_types.get(name, "aes256-gcm96")}}
 
     def generate_hmac(
         self, *, name: str, hash_input: str, algorithm: str = "sha2-256", **_: Any
@@ -256,6 +261,97 @@ def test_unreachable_transit_fails_closed_type_only(monkeypatch: pytest.MonkeyPa
         build_transit_cipher(StoreSettings())
     assert "RuntimeError" in str(excinfo.value)
     assert "secret-host" not in str(excinfo.value)  # type-only message, no host/secret leak
+
+
+# --- the operator-chosen key TYPE is checked at startup (BACKLOG #1166, ASVS 11.2.3) --------------
+#
+# Owner ruling 2026-08-22: "check the type the product already fetches against what each of the three
+# uses requires, and refuse to start on a mismatch. The round trip is already being paid for; only the
+# answer is being thrown away." The pre-fix measurement and which types each use admits are recorded
+# once, on the section header in store/keyprovider_vault.py.
+#
+# The positive control that this build path was otherwise live is
+# `test_unreachable_transit_fails_closed_type_only` above, which refused in the same suite.
+
+
+@pytest.mark.parametrize(
+    "key_type",
+    [
+        "ecdsa-p256",  # signing only: cannot encrypt at all
+        "ed25519",  # signing only
+        "aes128-cmac",  # MAC only: cannot encrypt at all
+        "rsa-2048",  # ~112 bits, and no associated_data support for the cell binding
+        "rsa-4096",  # strong enough, but Transit RSA takes no associated_data -> no cell binding
+        "hmac",  # fine for the audit MAC, useless for at-rest encryption
+    ],
+)
+def test_data_key_of_the_wrong_type_refuses_to_start(
+    monkeypatch: pytest.MonkeyPatch, key_type: str
+) -> None:
+    transit = _FakeTransit()
+    transit.key_types[_KEY_NAME] = key_type
+    _use_fake(monkeypatch, transit)
+    with pytest.raises(KeyProviderError) as excinfo:
+        build_transit_cipher(StoreSettings())
+    assert key_type in str(excinfo.value)
+    assert "MEFOR_STORE_TRANSIT_KEY" in str(excinfo.value)  # names the knob to change
+
+
+@pytest.mark.parametrize("key_type", ["aes256-gcm96", "aes128-gcm96", "chacha20-poly1305"])
+def test_data_key_of_a_supported_aead_type_still_builds(
+    monkeypatch: pytest.MonkeyPatch, key_type: str
+) -> None:
+    transit = _FakeTransit()
+    transit.key_types[_KEY_NAME] = key_type
+    _use_fake(monkeypatch, transit)
+    monkeypatch.delenv("MEFOR_STORE_TRANSIT_AUDIT_KEY", raising=False)
+    assert isinstance(build_transit_cipher(StoreSettings()), TransitCipher)
+    assert transit.read_calls == [_KEY_NAME]  # still exactly ONE round trip, as before the fix
+
+
+def test_dedicated_audit_key_of_the_wrong_type_refuses_to_start(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    transit = _FakeTransit()
+    transit.key_types["mefor-audit"] = "ecdsa-p384"
+    _use_fake(monkeypatch, transit)
+    monkeypatch.setenv("MEFOR_STORE_TRANSIT_AUDIT_KEY", "mefor-audit")
+    with pytest.raises(KeyProviderError) as excinfo:
+        build_transit_cipher(StoreSettings())
+    assert "ecdsa-p384" in str(excinfo.value)
+    assert "MEFOR_STORE_TRANSIT_AUDIT_KEY" in str(excinfo.value)
+
+
+def test_dedicated_audit_key_may_be_vault_hmac_type(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Vault's dedicated `hmac` key type is the RIGHT type for a MAC and must not be refused, even
+    though the data key may not be one. That asymmetry is why the two sets differ."""
+    transit = _FakeTransit()
+    transit.key_types["mefor-audit"] = "hmac"
+    _use_fake(monkeypatch, transit)
+    monkeypatch.setenv("MEFOR_STORE_TRANSIT_AUDIT_KEY", "mefor-audit")
+    cipher = build_transit_cipher(StoreSettings())
+    assert cipher.audit_hmac(b"row").startswith("vault:v1:")
+
+
+def test_a_shared_key_is_held_to_the_narrower_data_key_set(monkeypatch: pytest.MonkeyPatch) -> None:
+    """With no dedicated audit key the ONE key does both jobs, so it must clear the stricter of the
+    two sets. `hmac` clears the audit set and must still be refused here."""
+    transit = _FakeTransit()
+    transit.key_types[_KEY_NAME] = "hmac"
+    _use_fake(monkeypatch, transit)
+    monkeypatch.delenv("MEFOR_STORE_TRANSIT_AUDIT_KEY", raising=False)
+    with pytest.raises(KeyProviderError, match="at-rest PHI encryption"):
+        build_transit_cipher(StoreSettings())
+
+
+def test_unreadable_key_type_fails_closed(monkeypatch: pytest.MonkeyPatch) -> None:
+    class _Shapeless(_FakeTransit):
+        def read_key(self, *, name: str) -> dict[str, Any]:
+            return {"data": {"name": name}}  # no 'type'
+
+    _use_fake(monkeypatch, _Shapeless())
+    with pytest.raises(KeyProviderError, match="did not report a key type"):
+        build_transit_cipher(StoreSettings())
 
 
 def test_transit_encrypt_failure_is_type_only(monkeypatch: pytest.MonkeyPatch) -> None:
