@@ -22560,6 +22560,7 @@ So `test_the_script_prefers_its_own_repo_over_an_earlier_path_entry` supplies th
 
 **Adjacent and NOT fixed here, named rather than numbered.** `docs/WEBCONSOLE-PACKAGE.md`'s seam-refresh procedure is stale in three steps left behind by #1220: it says to bump `ENGINE_UI_SEAM` by hand (`1` to `2`) when the value is a derived digest, it says to update curated lists in this script that #1220 retired, and its step 5 prescribes `python scripts/webconsole_seam_snapshot.py > tests/golden/...`, the shell redirect this script's own docstring forbids because PowerShell's `>` writes UTF-16LE with a BOM into a file the test reads as UTF-8. That is doc drift with its own cause and it wants its own item; folding a documentation rewrite into a `sys.path` fix would make both harder to review.
 
+
 ## 1434. the tooling-partition gate names the file it rejects and not the remedy, so the Builder who trips it has already exited
 
 > 🚧 **Filed 2026-09-03. The failure message is fixed on this branch. Five open pull requests still carry unregistered test files, and only their own branches can fix them -- they are named below.** `tests/test_tooling_partition.py::test_every_non_engine_test_is_classified` fails when a file matching `tests/test_*.py` sits in neither `tests/tooling_manifest.txt` nor `_STAYS_WITHOUT_IMPORTING`. It is not deselected by `-m 'not tooling'`, so it reds **all three required `test` legs at once**. PR 774 hit exactly that, and its Builder's process had exited before any leg reported.
@@ -22627,3 +22628,29 @@ All 137 listed entries were swept for a repo-rooted read of `messagefoundry/**`.
 
 1. **The five pull requests above.** A Builder must not push to another seat's branch, so each is fixed by whoever next touches it: append `tests/<name>.py` to `tests/tooling_manifest.txt`, keeping the list alphabetical. **The gate is passable and two pull requests that night passed it correctly -- nothing here asks for it to be weakened.**
 2. **Three copies of the manifest parser, pinned against nothing.** This file, `_tooling_basenames` in `tests/conftest.py` (the copy that actually applies the marker), and `_manifest_paths` in `tests/test_ci_tooling_gate.py` all implement the same rule. Extracting one `tests/_tooling_manifest.py` is the real fix. Related: `test_every_manifest_entry_trips_its_own_gate` in `tests/test_ci_tooling_gate.py` feeds each manifest entry back as its own changed path, so on the manifest arm every entry matches itself unconditionally.
+
+---
+
+## 1444. a backlog item can be filed with no value or difficulty, so a scoring pass decays at the filing rate
+
+> 🔢 **Filed 2026-09-04 - not started. This is a DECISION, not a defect: the items are behaving correctly and the ledger has no gate.** Value **5/10** · Difficulty **3/10** · _fill-in_. Value 5 because the ranked tables silently stop being a complete view of the corpus, and a reader has no way to tell a ranked ledger from a partly-ranked one; a re-run is a real workaround, which is what holds it out of the higher bands. Difficulty 3 because either remedy is small on its own and the cost is the ruling above it, not the code.
+
+**Cluster:** repository tooling / ledger integrity. **Priority:** P3. **Verdict:** research.
+**Severity:** no engine effect, no PHI axis, and **no deployment axis (sec. 0)** -- this is a property of `docs/BACKLOG.md`, which ships in no wheel. The cost is that a planning read of the ranked tables understates the corpus by however many items were filed since the last pass.
+
+**The mechanism, in one sentence: a scoring pass is a SNAPSHOT, and nothing in CI requires a score at filing, so the gap re-opens at the filing rate.**
+
+**Measured 2026-09-04 against `main` at `685d4f548`, and independently confirmed by the seat that ran the pass:** **278** open items, **5** carrying no value or difficulty -- #1424, #1427, #1429, #1430 and #1439. Every one of the five was filed on 2026-09-03. The previous pass closed this to zero on 2026-09-03 when PR 754 merged, so **the gap went from 0 to 5 in about a day.**
+
+**The items are not doing anything wrong, and #1427 says so in its own banner:** *"NO SCORE. Value and difficulty belong to a scoring pass"*. That is a deliberate convention, and it is exactly what makes this a decision rather than a bug report.
+
+**The two remedies, and why neither is free.**
+
+*Move the gate to filing time.* One check instead of recurring passes. It **contradicts the convention #1427 states**, so it needs a ruling before it needs code. And it would **red on the five existing unscored items on day one**, so it is unshippable without a grandfather baseline or a changed-lines-only scope -- the same shape as **#1435**, which is open in PR 831 and **not yet on `main`** -- there, an unscoped ledger gate measured 22 day-one failures and was deliberately not built for that reason.
+
+*Re-run the pass periodically.* Keeps the convention intact and needs no gate, but it is unbounded recurring work whose cadence nobody has set, and the gap re-opens between every run. That is precisely what just happened.
+
+**What would NOT settle this:** scoring the five and calling it closed. That is another snapshot, and it decays the same way. The thing to fix is the absence of a gate or a cadence, not the current five.
+
+**Source:** reported 2026-09-04 by the seat that ran the 2026-09-03 scoring pass, one day after that pass closed the gap to zero. Re-measured here with `parse_items` rather than a hand-rolled scan, against that seat's figures, and both the count and the exact five item numbers agreed.
+
