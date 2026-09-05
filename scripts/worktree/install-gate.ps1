@@ -34,6 +34,18 @@
     The gate only governs the checkouts listed in worktree-gate.repos.txt. That file IS the kill switch:
     -Uninstall removes it (and the hook entries from every config dir).
 
+    THE ALLOWLIST IS MERGED, NEVER REPLACED (BACKLOG #1375). A run ADDS the roots it names and keeps
+    every root already there. It used to overwrite the file with just this run's repos, and a bare run
+    resolves to exactly ONE repo -- so on a box governing two checkouts, re-installing dropped one.
+
+    AND THE DROPPED ROOT GOES UNGOVERNED IN SILENCE -- NOT by tripping the kill switch. A bare install
+    writes ONE root, never zero, so the gate's zero-root exit never fires on this path and the gate
+    stays fully on for the root that survived. The dropped root is simply ABSENT from the list: no rule
+    matches a path inside it, the hook exits 0 printing nothing, and writes into that checkout quietly
+    stop being denied. There is no empty file to notice and no message anywhere.
+
+    To stop governing one root without turning the gate off, name it: -Uninstall -Repo "<path>".
+
     Run from a PLAIN TERMINAL, not from inside Claude Code -- a session that can install its own gate can
     uninstall it. The script refuses when $env:CLAUDECODE is set.
 
@@ -42,11 +54,14 @@
     pwsh -NoProfile -File scripts\worktree\install-gate.ps1 -Repo C:\Users\me\Code\Probe   # govern a test repo
     pwsh -NoProfile -File scripts\worktree\install-gate.ps1 -ConfigDir C:\Users\me\.claude-account-3
     pwsh -NoProfile -File scripts\worktree\install-gate.ps1 -Uninstall
+    pwsh -NoProfile -File scripts\worktree\install-gate.ps1 -Uninstall -Repo C:\Users\me\Code\Probe  # stop governing ONE
     pwsh -NoProfile -File scripts\worktree\install-gate.ps1 -Status
 #>
 [CmdletBinding()]
 param(
-    # Primary checkout(s) to govern. Defaults to this repo's root.
+    # Primary checkout(s) to govern -- ADDED to the allowlist, never replacing it. Defaults to this
+    # repo's main worktree. With -Uninstall it means the opposite: stop governing exactly these roots
+    # and leave everything else alone.
     [string[]]$Repo,
     [switch]$Uninstall,
     [switch]$Status,
@@ -256,6 +271,316 @@ function Get-HandledTools([string]$Path) {
     ,@($tools)
 }
 
+# --------------------------------------------------------------------------------------- allowlist
+# THE DEFECT THESE CLOSE (BACKLOG #1375). The install path used to write the allowlist with a bare
+# Set-Content of only THIS run's resolved repos, and nothing between the parameter block and that write
+# ever read the file back. A bare run resolves to exactly ONE repo -- the main worktree, via
+# `git worktree list` -- so on a box whose allowlist named two roots (measured live on this machine: the
+# engine checkout AND the vault clone) a bare re-install DROPPED one.
+#
+# And the dropped root goes UNGOVERNED SILENTLY. Say the mechanism exactly, because the plausible one is
+# wrong and was written here first: this is NOT the zero-root kill switch firing. A bare install writes
+# ONE root, never zero, so `if ($roots.Count -eq 0) { exit 0 }` in the gate never runs on this path, and
+# the gate keeps governing the root that survived just as strictly as before.
+#
+# The dropped root is simply ABSENT from the list the gate loads. Test-Governed answers $null for every
+# path inside it, so no rule matches, the hook exits 0 with no output, and writes into that checkout stop
+# being denied. That is the shape this repo keeps finding -- a clean exit code over a wrong answer -- and
+# it is worse than the kill switch, not milder: the kill switch leaves an empty file somebody can notice,
+# whereas this leaves a plausible-looking allowlist that is quietly one root short.
+#
+# EVERYTHING BELOW IS PARAMETER-FED and reads no script-scope variable ($ReposFile, $HooksDir, $Repo).
+# That is not tidiness, it is the only way any of this gets verified: install-gate.ps1 REFUSES to run
+# inside Claude Code (the throw below), so no session can exercise the install path at all. The tests in
+# tests/test_install_gate_allowlist_merge.py lift these four functions out by AST and run them in
+# isolation under `Set-StrictMode -Version Latest`, so a future edit that reaches for a script variable
+# THROWS in the extracted copy instead of quietly yielding $null.
+
+# The comparison key for ONE allowlist line: case-insensitive, slash-direction-insensitive, trailing
+# separator ignored.
+#
+# String.Replace, not the -replace operator: `-replace '\'` is a lone escape and an invalid regex.
+#
+# DELIBERATELY NOT the gate's Get-ComparablePath (scripts/hooks/worktree_gate.ps1), which calls
+# GetFullPath first. This one must not: it runs over lines naming checkouts that may be GONE, or on a
+# drive this run cannot see, and resolving them could throw and take the install down -- or fold two
+# lines together on evidence that is not there.
+#
+# The omission is ONE-DIRECTIONAL, and that is the whole safety argument. Skipping GetFullPath can only
+# make this key FINER than the gate's, never coarser. Finer writes a harmless duplicate line; COARSER
+# silently drops a root, which is the defect above -- and in -Remove mode it un-governs a root THE
+# OPERATOR DID NOT NAME, which is that same defect through a different door. Measured: `C:\A\..\B` folds
+# to `c:/b` under the gate and stays `c:/a/../b` here.
+#
+# THAT IS TRUE OF THE OMISSION, AND IT WAS NOT TRUE OF THE FUNCTION -- which is a different sentence, and
+# the difference cost a measured counterexample. Coarseness can enter at any step, not only at the one
+# being argued about, and it entered at the TrimEnd, which is why the TrimEnd below is conditional. Bare,
+# it erases the separator that tells a drive ROOT from a drive-RELATIVE path, so `C:\` and `C:` both keyed
+# `c:` -- installer-COARSER, the direction the paragraph above rules out. They are not the same place:
+# the gate resolves `C:\` to the root of drive C and `C:` to the CURRENT DIRECTORY on drive C (measured
+# 2026-08-29: `c:` against `c:/users/<you>/...`). So the separator goes back on when trimming it would
+# leave a bare drive spec, and `C:` keeps a key of its own.
+#
+# THE DOMAIN IS TRIMMED LINES. Every caller trims before it compares -- Merge-GovernedRoots trims each
+# existing line and each incoming value, Write-GovernedRoots trims each line it reads back, and the gate
+# trims each line before Get-ComparablePath -- so a leading-space spelling is not a pair either
+# normalizer is ever asked about, and the corpus below says so rather than leaving it implied.
+#
+# tests/test_install_gate_allowlist_merge.py pins the direction by EXTRACTING both normalizers and
+# asserting installer-same implies gate-same, over a corpus that CARRIES the drive-root pair -- so the
+# exception above is a counterexample the corpus contains, not a sentence beside it. Extraction, not
+# restatement, because a restated predicate is a third predicate.
+function Get-RootKey([string]$Value) {
+    $v = $Value.Trim().Replace('\', '/')
+    $k = $v.TrimEnd('/')
+    if ($k.Length -lt $v.Length -and $k -match '\A[A-Za-z]:\z') { $k = "$k/" }
+    $k.ToLowerInvariant()
+}
+
+# Fold the roots this run names INTO the list already on the box, and report what changed.
+#
+# Returns Lines (what to write), Roots (what will be governed), Added, Dropped, Missing, Duplicated.
+# Every property is wrapped in @() so a one-element result stays an array through ConvertTo-Json.
+#
+# EXISTING LINES ARE KEPT VERBATIM -- comments, blanks, spelling, file order. This installer does not
+# tidy lines it was not asked to touch, and that rule buys three things at once: a hand-written comment
+# beside a root survives, a re-run is byte-identical so a diff shows only real change, and the contract
+# stays one sentence. Nothing resolves, validates or stats an existing line either: a root is often
+# removed precisely BECAUSE its checkout is gone.
+#
+# FIRST SPELLING WINS. An existing line is never rewritten to the incoming spelling -- the gate quotes
+# the operator's spelling back in its deny messages, so recasing a path changes what a reader sees for
+# no reason.
+#
+# TWO EXISTING LINES NAMING ONE ROOT ARE BOTH KEPT and reported in Duplicated. Collapsing them removes
+# no governance, so it is not this defect; keeping them costs the gate one string compare.
+#
+# DEDUP APPLIES TO Incoming ONLY -- against the existing keys and against itself, so `-Repo a,a` writes
+# one line. (PowerShell binds a comma-separated argument to a [string[]] parameter as two elements, so
+# `-Repo a,b` really does govern two repos.)
+#
+# The header is emitted ONLY when Existing is empty. On a merge the existing header survives verbatim.
+function Merge-GovernedRoots {
+    [CmdletBinding()]
+    param(
+        [string[]]$Existing = @(),
+        [string[]]$Incoming = @(),
+        # Removal mode: drop every existing line whose key an Incoming value names, keep everything else.
+        [switch]$Remove
+    )
+
+    $lines      = [System.Collections.Generic.List[string]]::new()
+    $roots      = [System.Collections.Generic.List[string]]::new()
+    $added      = [System.Collections.Generic.List[string]]::new()
+    $dropped    = [System.Collections.Generic.List[string]]::new()
+    $missing    = [System.Collections.Generic.List[string]]::new()
+    $duplicated = [System.Collections.Generic.List[string]]::new()
+
+    $incomingKeys = [System.Collections.Generic.HashSet[string]]::new()
+    foreach ($i in @($Incoming)) {
+        $t = "$i".Trim()
+        if ($t) { $null = $incomingKeys.Add((Get-RootKey $t)) }
+    }
+    $matched = [System.Collections.Generic.HashSet[string]]::new()
+    $kept    = [System.Collections.Generic.HashSet[string]]::new()
+
+    if (-not $Remove -and @($Existing).Count -eq 0) {
+        $lines.Add("# Primary checkouts governed by the worktree gate (scripts\hooks\worktree_gate.ps1).")
+        $lines.Add("# Writes INTO these trees are denied; a linked worktree may not be switched onto an existing branch.")
+        $lines.Add("# Deleting this file turns the gate OFF everywhere, immediately.")
+        $lines.Add("# install-gate.ps1 MERGES this list: a run ADDS the roots it names and keeps every root already here.")
+        $lines.Add("# To stop governing one:  install-gate.ps1 -Uninstall -Repo `"<path>`"")
+    }
+
+    # A ROOT is a line that is non-blank after Trim() and does not start with '#'. Comments and blanks
+    # are Lines but never Roots -- the same reading the gate itself uses.
+    foreach ($line in @($Existing)) {
+        $text = "$line"
+        $t = $text.Trim()
+        if (-not $t -or $t.StartsWith('#')) { $lines.Add($text); continue }
+        $key = Get-RootKey $t
+        if ($Remove -and $incomingKeys.Contains($key)) {
+            $null = $matched.Add($key)
+            $dropped.Add($t)
+            continue
+        }
+        $lines.Add($text)
+        $roots.Add($t)
+        if (-not $kept.Add($key)) { $duplicated.Add($t) }
+    }
+
+    if ($Remove) {
+        $reported = [System.Collections.Generic.HashSet[string]]::new()
+        foreach ($i in @($Incoming)) {
+            $t = "$i".Trim()
+            if (-not $t) { continue }
+            $key = Get-RootKey $t
+            if ($matched.Contains($key)) { continue }
+            if ($reported.Add($key)) { $missing.Add($t) }
+        }
+    } else {
+        foreach ($i in @($Incoming)) {
+            $t = "$i".Trim()
+            if (-not $t) { continue }
+            if (-not $kept.Add((Get-RootKey $t))) { continue }
+            $lines.Add($t)
+            $roots.Add($t)
+            $added.Add($t)
+        }
+    }
+
+    [pscustomobject]@{
+        Lines      = @($lines)
+        Roots      = @($roots)
+        Added      = @($added)
+        Dropped    = @($dropped)
+        Missing    = @($missing)
+        Duplicated = @($duplicated)
+    }
+}
+
+# Announce what the allowlist now says. A pure printer -- it takes the path as a parameter precisely so
+# a test can call it without the install path, and every string a merge or a narrowing prints lives here.
+function Show-AllowlistResult {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]$Result,
+        [Parameter(Mandatory)][string]$Path,
+        [string]$BackupPath,
+        # Removal mode: this run took roots AWAY, which is a change of posture and is reported loudly.
+        [switch]$Narrowed,
+        # The allowlist existed and named NO root, so the gate governed nothing until this run.
+        [switch]$WasOff,
+        # There was no allowlist at all before this run.
+        [switch]$Created
+    )
+
+    $addedKeys = [System.Collections.Generic.HashSet[string]]::new()
+    foreach ($a in @($Result.Added)) { $null = $addedKeys.Add((Get-RootKey $a)) }
+
+    # COUNT DISTINCT ROOTS, NOT LINES. Two lines naming one root are both kept on purpose (see
+    # Merge-GovernedRoots), so a line count over-reports -- "2 root(s)" for one governed tree. This is
+    # the one line an operator reads to confirm nothing was lost, so it must not claim more governance
+    # than the box has. It could never hide a DROP in either direction; it could only overstate.
+    $distinct = {
+        param($values)
+        $keys = [System.Collections.Generic.HashSet[string]]::new()
+        foreach ($v in @($values)) { $null = $keys.Add((Get-RootKey $v)) }
+        $keys.Count
+    }
+
+    if ($Narrowed) {
+        $n = & $distinct $Result.Dropped
+        $m = & $distinct $Result.Roots
+        Write-Host "Worktree gate: allowlist NARROWED -- $n root(s) REMOVED, $m still governed." -ForegroundColor Yellow
+        foreach ($d in @($Result.Dropped)) { Write-Host "  removed   : $d" }
+        Write-Host "              This root is UNGOVERNED the instant the file is written: writes into it stop being"
+        Write-Host "              denied, and nothing else reports that."
+        foreach ($r in @($Result.Roots)) { Write-Host "  governing : $r" }
+        Write-Host "  allowlist : $Path"
+        if ($BackupPath) { Write-Host "  backup    : $BackupPath  (the allowlist as it was BEFORE this run)" }
+        if ($m -eq 0) {
+            Write-Host "  WARNING   : the allowlist now names NO root, so the gate governs NOTHING and every session on" -ForegroundColor Yellow
+            Write-Host "              this box is ungated. That is the same state as -Uninstall, reached one root at a time." -ForegroundColor Yellow
+        }
+        Write-Host "  The hook wiring, the installed gate and every other root are untouched."
+        return
+    }
+
+    # No per-run MERGED/UNCHANGED banner. A line that appears on every run is one readers learn to skip
+    # -- this script already makes that argument about its own output, up in the -Status block -- so the
+    # count rides on the allowlist line that was going to be printed anyway.
+    $counts = "$(& $distinct $Result.Roots) root(s); $(& $distinct $Result.Added) added by this run"
+    $suffix = if ($Created) { " -- allowlist CREATED" } else { "" }
+    Write-Host "  allowlist : $Path  ($counts)$suffix"
+    foreach ($r in @($Result.Roots)) {
+        $mark = if ($addedKeys.Contains((Get-RootKey $r))) { "  (ADDED by this run)" } else { "" }
+        Write-Host "  governing : $r$mark"
+    }
+    if (@($Result.Duplicated).Count -gt 0) {
+        Write-Host "  note      : $(@($Result.Duplicated).Count) line(s) name a root already listed above. Every line is kept -- this installer does not tidy lines it was not asked to touch."
+    }
+    if ($WasOff) {
+        Write-Host "  WAS OFF   : the allowlist named NO root before this run, so the gate governed NOTHING on this" -ForegroundColor Yellow
+        Write-Host "              box. This run turns it on." -ForegroundColor Yellow
+    }
+}
+
+# THE ONE WRITER of the allowlist. Mirrors Write-Settings above, which already proves the idiom here.
+#
+# 1. Back up UNCONDITIONALLY, immediately before every write. The thriftier "only when the content
+#    changed" rule is what makes a .bak read as a recovery point two changes back; copying every time
+#    costs nothing and makes the backup exactly one write old BY CONSTRUCTION.
+# 2. Build the whole file in memory, write it to a temp file, then Move-Item over the target. That also
+#    closes a corruption path a naive Add-Content would open: a file whose last line lacks a trailing
+#    newline would get the next root concatenated onto it.
+# 3. Read it back and assert every intended root is there. WHAT THAT CATCHES, EXACTLY: a write that did
+#    not land. The file on disk does not carry the roots this run intended, so the run refuses instead of
+#    printing them as governed.
+#
+#    WHAT IT DOES NOT CATCH, and an earlier wording here claimed it did: two installers that both READ
+#    before either WRITES. Each merge is right about the content it read, each write lands, and each
+#    read-back passes -- and the second write silently drops the root the first one added. Nothing here
+#    compares the file against the content the merge was computed from, so that lost update is invisible
+#    to this check. It NARROWS the race; it does not close it, and it does not make every lost update
+#    loud. tests/test_install_gate_allowlist_merge.py RUNS the surviving case rather than describing it.
+#
+# WRITE-ONLY, AND THAT IS A SECURITY PROPERTY. Nothing reads the .bak back: not this installer, not the
+# gate. Gate rule 1a protects the allowlist and the gate script by EXACT FILENAME and explicitly refuses
+# to key on the parent directory, so a sibling worktree-gate.repos.txt.bak is NOT protected and a session
+# could write to it. That is harmless only while it is inert; the moment anything reads it, it becomes a
+# route around rule 1a. tests/test_install_gate_allowlist_merge.py pins that it stays unread -- by
+# following the VALUE through the variables that carry it, not by looking for the string ".bak", which
+# one local alias defeats.
+#
+# THE .bak OUTLIVES THE ALLOWLIST, on purpose. A full -Uninstall backs the file up and then deletes it,
+# so the sibling stays behind in a directory the gate no longer protects -- it is the only recovery from
+# the largest data loss this script performs. It also means a .bak can be OLDER than the allowlist beside
+# it: a later install creates a fresh file and takes no backup, having had nothing to back up. Read it as
+# a recovery copy, never as a record of the previous run.
+#
+# Returns the backup path, or $null when there was no file to back up.
+function Write-GovernedRoots {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [string[]]$Lines = @()
+    )
+
+    $bak = $null
+    if (Test-Path -LiteralPath $Path) {
+        $bak = "$Path.bak"
+        Copy-Item -LiteralPath $Path -Destination $bak -Force
+    }
+
+    $tmp = "$Path.tmp-$PID"
+    Set-Content -LiteralPath $tmp -Value @($Lines) -Encoding utf8
+    Move-Item -LiteralPath $tmp -Destination $Path -Force
+
+    $seen = [System.Collections.Generic.HashSet[string]]::new()
+    foreach ($b in @(Get-Content -LiteralPath $Path -ErrorAction Stop)) {
+        $t = "$b".Trim()
+        if (-not $t -or $t.StartsWith('#')) { continue }
+        $null = $seen.Add((Get-RootKey $t))
+    }
+    # THE REFUSAL SPEAKS FOR THE WHOLE RUN, so its claim about the rest of the box has to be kept true by
+    # the CALL SITES rather than asserted here. It used to say "Nothing else was changed", which was
+    # false on the install path: the gate copy ran FIRST, so a refusal left this box carrying a refreshed
+    # machine-global gate -- and, on a first install, no hook wiring at all -- while the operator read
+    # that nothing had changed. The install path now writes the allowlist BEFORE it copies the gate and
+    # before it wires any config dir, and tests/test_install_gate_allowlist_merge.py pins that order.
+    foreach ($l in @($Lines)) {
+        $t = "$l".Trim()
+        if (-not $t -or $t.StartsWith('#')) { continue }
+        if (-not $seen.Contains((Get-RootKey $t))) {
+            $recover = if ($bak) { "The allowlist as it was immediately before this write is in $bak." }
+                       else { "There was no allowlist before this write, so there is no backup." }
+            throw "WROTE $Path but reading it back does not show $t. Another install probably ran at the same time, so this run's roots may be missing from the file. Neither the gate script nor the hook wiring has been written yet. $recover Read $Path, then re-run this command."
+        }
+    }
+    return $bak
+}
+
 # ------------------------------------------------------------------------------------------ status
 # NB this branch runs BEFORE the CLAUDECODE refusal below, deliberately. Auditing is not installing, and
 # a session that cannot see whether the gate is current has no way to notice the exact failure that let
@@ -295,10 +620,24 @@ if ($Status) {
         }
     }
 
+    # ONE reading of "what is a root", borrowed from the merge rather than spelled again here: a line
+    # that is non-blank after Trim() and does not start with '#'. This block used to carry a THIRD,
+    # disagreeing definition -- it tested StartsWith('#') on the UNTRIMMED line, so an INDENTED comment
+    # printed as a governed root. That was unreachable only while the installer regenerated the file on
+    # every run; the merge now PRESERVES an operator's indented comment by design, which made a latent
+    # disagreement live. -Status is also the only allowlist audit a session is allowed to run, so it is
+    # the one reader that must not say a comment is being governed.
     if (Test-Path -LiteralPath $ReposFile) {
-        Write-Host "governing   :"
-        Get-Content -LiteralPath $ReposFile | Where-Object { $_ -and -not $_.StartsWith('#') } |
-            ForEach-Object { Write-Host "              $_" }
+        $governed = @((Merge-GovernedRoots -Existing @(Get-Content -LiteralPath $ReposFile)).Roots)
+        if ($governed.Count -gt 0) {
+            Write-Host "governing   :"
+            foreach ($g in $governed) { Write-Host "              $g" }
+        } else {
+            # An allowlist that exists and names no root is the gate switched OFF, and it printed as a
+            # bare "governing   :" with nothing under it -- which reads as a rendering glitch, not as a
+            # box with no governance.
+            Write-Host "governing   : nothing (the allowlist names no root -> gate is OFF)"
+        }
     } else {
         Write-Host "governing   : nothing (no allowlist -> gate is OFF)"
     }
@@ -409,11 +748,58 @@ if ($env:CLAUDECODE -eq "1") {
 
 # --------------------------------------------------------------------------------------- uninstall
 if ($Uninstall) {
+    # -Uninstall -Repo <path> NARROWS the allowlist: it stops governing the named roots and touches
+    # NOTHING else -- not the hook wiring, not the installed gate, not the other roots.
+    #
+    # This is a DELIBERATE narrowing of an existing combination, not a new parameter. The branch below
+    # never read $Repo, and the $Repo default is computed after it returns, so today `-Uninstall -Repo X`
+    # performs a FULL uninstall while the operator believes they scoped it -- and bare -Uninstall cannot
+    # fall in here, because it has no $Repo at all. Giving the combination the meaning it already looks
+    # like turns a silent misreading into the thing on the label. It also matches the -Uninstall
+    # -ConfigDir idiom the -Status audit already prints as a remedy.
+    if ($Repo -and $Repo.Count -gt 0) {
+        # An absent allowlist THROWS here: there is nothing to narrow, and that is not the same as
+        # narrowing to nothing.
+        $existing = @(Get-Content -LiteralPath $ReposFile -ErrorAction Stop)
+
+        # No Resolve-Path -ErrorAction Stop and no "Not a git checkout" throw: you remove a root
+        # BECAUSE the checkout is gone. Resolve only so a relative spelling like `.` works, and fall
+        # back to the literal string when it does not resolve.
+        $wanted = @(foreach ($r in $Repo) {
+                $p = Resolve-Path -LiteralPath $r -ErrorAction SilentlyContinue
+                if ($p) { $p.Path } else { $r }
+            })
+
+        $result = Merge-GovernedRoots -Existing $existing -Incoming $wanted -Remove
+
+        # ANY unmatched value refuses the WHOLE removal and writes nothing. A partial removal leaves the
+        # operator's model of which roots are governed wrong, which is the exact class of defect this
+        # change exists to remove; retyping the command costs nothing.
+        if ($result.Missing.Count -gt 0) {
+            $detail = @(
+                @($result.Missing) | ForEach-Object { "  no match  : $_" }
+                @($result.Roots)   | ForEach-Object { "  governing : $_" }
+            )
+            throw (@(
+                    "-Uninstall -Repo named $($result.Missing.Count) value(s) the allowlist does not carry, so NOTHING was removed and nothing"
+                    "was written. Matching ignores case and slash direction."
+                    $detail
+                ) -join [Environment]::NewLine)
+        }
+
+        $bak = Write-GovernedRoots -Path $ReposFile -Lines $result.Lines
+        Show-AllowlistResult -Result $result -Path $ReposFile -BackupPath $bak -Narrowed
+        return
+    }
+
     foreach ($cd in $ConfigDir) {
         $sp = Join-Path $cd "settings.json"
         if (-not (Test-Path -LiteralPath $sp)) { continue }
         Write-Settings $sp (Remove-GateHooks (Read-Settings $sp))
     }
+    # The largest data loss this script performs, and until now it left nothing behind. Same one-write-old
+    # backup every other write here takes.
+    if (Test-Path -LiteralPath $ReposFile) { Copy-Item -LiteralPath $ReposFile -Destination "$ReposFile.bak" -Force }
     Remove-Item -LiteralPath $ReposFile -Force -ErrorAction SilentlyContinue
     Remove-Item -LiteralPath $GateDst   -Force -ErrorAction SilentlyContinue
     Write-Host "Worktree gate REMOVED from $($ConfigDir.Count) config dir(s). Sessions are no longer gated (takes effect immediately)." -ForegroundColor Yellow
@@ -438,6 +824,27 @@ $resolved = foreach ($r in $Repo) {
 }
 
 New-Item -ItemType Directory -Force -Path $HooksDir | Out-Null
+
+# READ AND MERGE BEFORE ANYTHING ON THIS BOX CHANGES. An allowlist this run cannot read must stop the
+# install while the machine is still exactly as it was -- reading after the gate copy below would leave a
+# refreshed gate sitting behind a refusal.
+#
+# -ErrorAction Stop, never SilentlyContinue: a read that fails quietly turns an unreadable allowlist into
+# an EMPTY one, which re-creates the dropped-root defect through the back door. A file that is simply
+# absent is the fresh-box case and is not an error.
+$allowlistExisted = Test-Path -LiteralPath $ReposFile
+$existing = if ($allowlistExisted) { @(Get-Content -LiteralPath $ReposFile -ErrorAction Stop) } else { @() }
+$wasOff = $allowlistExisted -and ((Merge-GovernedRoots -Existing $existing).Roots.Count -eq 0)
+$result = Merge-GovernedRoots -Existing $existing -Incoming $resolved
+
+# WRITE THE ALLOWLIST BEFORE ANYTHING MACHINE-GLOBAL CHANGES -- the same argument as the read above, one
+# step later. Write-GovernedRoots can REFUSE (its read-back), and its refusal tells the operator that
+# neither the gate script nor the hook wiring has been written yet. Copying the gate first made that
+# sentence false: a refusal left this box carrying a refreshed machine-global gate and, on a first
+# install, no matchers at all. Nothing between here and the copy needs the installed gate to exist --
+# $command below is a string.
+$bak = Write-GovernedRoots -Path $ReposFile -Lines $result.Lines
+
 # BACK UP THE GATE BEFORE OVERWRITING IT. The allowlist writer has done this since #1375; the GATE
 # SCRIPT never did, and the near-miss is why: `Write-Settings` backs up settings.json, and reading
 # `Copy-Item ... .bak` in this file makes the absence here easy to read as presence. It is not the
@@ -487,13 +894,6 @@ $receipt = [ordered]@{
 } | ConvertTo-Json -Depth 4
 Set-Content -LiteralPath "$GateDst.receipt.json" -Value $receipt -Encoding utf8
 
-@(
-    "# Primary checkouts governed by the worktree gate (scripts\hooks\worktree_gate.ps1)."
-    "# Writes INTO these trees are denied; a linked worktree may not be switched onto an existing branch."
-    "# Deleting this file turns the gate OFF everywhere, immediately."
-    $resolved
-) | Set-Content -LiteralPath $ReposFile -Encoding utf8
-
 $command = "pwsh -NoProfile -File `"$GateDst`""
 
 # One matcher per rule in scripts/hooks/worktree_gate.ps1. A rule the hook implements but that is not
@@ -539,10 +939,14 @@ foreach ($cd in $ConfigDir) {
 Write-Host ""
 Write-Host "Worktree gate INSTALLED into $($ConfigDir.Count) config dir(s) (every session, no restart)." -ForegroundColor Green
 Write-Host "  gate      : $GateDst"
-Write-Host "  allowlist : $ReposFile"
 Write-Host "  installed : $($installedAtUtc.ToString('yyyy-MM-dd HH:mm:ss')) UTC  (receipt: $GateDst.receipt.json)"
-$resolved | ForEach-Object { Write-Host "  governing : $_" }
+# Not `$resolved | ForEach-Object`: that prints what THIS run named, which under-reports what the box
+# governs the moment the allowlist carries a root this run did not name -- which is the whole point.
+Show-AllowlistResult -Result $result -Path $ReposFile -BackupPath $bak -WasOff:$wasOff -Created:(-not $allowlistExisted)
 Write-Host "  matchers  : $($matchers -join '  +  ')"
 Write-Host ""
 Write-Host "Writes into a governed tree are DENIED; a linked worktree may not be switched onto an existing branch."
-Write-Host "To turn it off:  pwsh -NoProfile -File scripts\worktree\install-gate.ps1 -Uninstall"
+Write-Host "To turn it off:          pwsh -NoProfile -File scripts\worktree\install-gate.ps1 -Uninstall"
+Write-Host "To stop governing ONE:   pwsh -NoProfile -File scripts\worktree\install-gate.ps1 -Uninstall -Repo `"<path>`""
+Write-Host "                         This installer MERGES the allowlist: a run adds the roots it names and"
+Write-Host "                         never drops one it did not name."
