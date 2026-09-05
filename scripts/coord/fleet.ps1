@@ -210,20 +210,81 @@ if (Test-Path -LiteralPath $errFile) {
 # the same reason: it exposes the upstream COMMIT's date, which here preceded the ref update by 11
 # minutes. No git plumbing reports a fetch time, so the file mtime is the only clock on offer.
 #
-# STATED LIMITS, all three in the same direction a reader needs to know about:
+# STATED LIMITS, both in the same direction a reader needs to know about:
 #   1. `git ls-remote origin main` would answer the real question directly ("is my cached ref
 #      current?") in about 0.7 seconds, measured. DECLINED: this script is a PURE READER a stranded
 #      session runs to reconstitute a fleet, so it must work offline and unauthenticated. A network
 #      round-trip per render buys accuracy by adding the failure mode the instrument exists to
 #      survive. The clock is therefore a PROXY, deliberately.
-#   2. FETCH_HEAD says "a fetch happened", not "origin/main was refreshed". `git fetch origin
-#      refs/pull/N/head`, or a fetch of a different remote, bumps this clock while leaving
-#      origin/main untouched -- so this can read FRESH while the ref is stale, which is the
-#      dangerous direction. The file's own first line names the ref and remote fetched, so closing
-#      it is possible and is not attempted here.
-#   3. `git fetch --no-write-fetch-head` refreshes the ref and writes no clock at all, so it reads
+#   2. `git fetch --no-write-fetch-head` refreshes the ref and writes no clock at all, so it reads
 #      as no fetch ever. That one fails LOUD, via the unmeasurable stop, which is the safe direction.
-$originMainSha = Invoke-Git -Dir $repo -GitArgs @('rev-parse', 'origin/main')
+#
+# A CLOCK ONLY COUNTS IF IT NAMES origin's main (BACKLOG #1374 -- the limit that WAS stated here and
+# is now closed). "A fetch happened" is not "origin/main was refreshed": `git fetch origin
+# refs/pull/N/head`, or a fetch of another remote, bumps the mtime and leaves the ref alone. That
+# reads FRESH against a stale ref, which is the dangerous direction. FETCH_HEAD answers this itself,
+# because it records WHAT was fetched, one line per ref, as <sha> TAB <flag> TAB <description>:
+#
+#     <sha>              branch 'main' of https://github.com/MEFORORG/MessageFoundry
+#     <sha> not-for-merge branch 'feature' of https://github.com/MEFORORG/MessageFoundry
+#     <sha>              'refs/pull/7/head' of https://github.com/MEFORORG/MessageFoundry
+#
+# Measured in a sandbox 2026-09-04, one fetch form per run: `git fetch origin`, `git fetch origin
+# main` and `git fetch origin refs/heads/main` ALL write `branch 'main' of <url>`, so matching that
+# one line form covers a refspec given by short name or by full ref. `git fetch origin
+# refs/pull/7/head` writes `'refs/pull/7/head' of <url>` -- no `branch` prefix and no mention of
+# main. That is the case that used to read fresh.
+#
+# THE FILE IS REWRITTEN AND NOT APPENDED, so an older main line cannot be relied on to linger.
+# Measured the same day: `git fetch origin main` followed by `git fetch origin refs/pull/7/head`
+# left a ONE-LINE FETCH_HEAD naming only the pull ref, six seconds newer, main line gone.
+#
+# THE URL IS WRITTEN WITHOUT ITS `.git` SUFFIX, so a literal compare against the configured remote
+# never matches. Measured: `git remote get-url origin` returned `.../remote.git` while FETCH_HEAD in
+# that same clone said `.../remote`. Both sides are normalised below. The match is on a NORMALISED
+# URL rather than on the remote NAME because FETCH_HEAD records the url and never the name.
+#
+# WHEN NOTHING QUALIFIES THIS GOES NULL rather than falling back to the newest clock. The fallback
+# is the tempting line to write and it would restore the exact defect -- a pull-ref fetch reporting
+# itself as origin/main's freshness. The two roads to null say DIFFERENT things and get DIFFERENT
+# stops: no clock at all, versus clocks that all fetched something else. "No FETCH_HEAD exists
+# anywhere in this clone" is a FALSE SENTENCE in the second case, and a reader who just ran a fetch
+# would disbelieve the instrument that said it.
+$mainBranch = 'main'
+$originMainSha = Invoke-Git -Dir $repo -GitArgs @('rev-parse', "origin/$mainBranch")
+
+# Both sides of the url compare go through this. Trailing separators and the `.git` suffix differ
+# between what git CONFIGURES and what git WRITES, and nothing else is touched: an ssh alias and an
+# https url for one repo are genuinely not comparable, and forcing them to look it would invent a
+# match this instrument cannot support.
+function ConvertTo-ComparableUrl([string]$u) {
+    if (-not $u) { return '' }
+    $s = ($u.Trim() -replace '\\', '/').TrimEnd('/')
+    if ($s.EndsWith('.git', [System.StringComparison]::OrdinalIgnoreCase)) {
+        $s = $s.Substring(0, $s.Length - 4)
+    }
+    return $s.TrimEnd('/').ToLowerInvariant()
+}
+
+# Does this FETCH_HEAD record a fetch that refreshed origin's main? The description is the THIRD
+# tab-separated field, rejoined rather than indexed at [2] so a description carrying a tab cannot
+# silently truncate the url being compared. An unreadable or half-written file answers "no
+# evidence", which is the safe direction: it withholds the clock rather than inventing one.
+function Test-FetchHeadNamesOriginMain([string]$Path, [string]$Branch, [string]$Url) {
+    if (-not $Url) { return $false }
+    $wanted = "branch '$Branch' of "
+    try { $lines = @(Get-Content -LiteralPath $Path -EA Stop) } catch { return $false }
+    foreach ($line in $lines) {
+        $parts = $line -split "`t"
+        if ($parts.Count -lt 3) { continue }
+        $desc = ($parts[2..($parts.Count - 1)] -join "`t").Trim()
+        if (-not $desc.StartsWith($wanted, [System.StringComparison]::Ordinal)) { continue }
+        if ((ConvertTo-ComparableUrl $desc.Substring($wanted.Length)) -eq $Url) { return $true }
+    }
+    return $false
+}
+
+$originUrl = ConvertTo-ComparableUrl (Invoke-Git -Dir $repo -GitArgs @('remote', 'get-url', 'origin'))
 
 # The clone's worktrees, enumerated a SECOND way and on purpose: `$repoWorktrees` above lists WORKING
 # TREE paths from `git worktree list`, and getting a git dir out of one costs a git child process
@@ -236,19 +297,33 @@ if (Test-Path -LiteralPath $worktreeGitDirs) {
     }
 }
 
-$lastFetchAgeMinutes = $null
+$originMainFetchAgeMinutes = $null
 # NEVER NULL, because this is the line a reader scans past. A blank value beside a null age is how
 # the blind case passed for a healthy one; a sentence saying it could not be measured cannot.
-$lastFetchClock = 'UNMEASURABLE -- no FETCH_HEAD in this clone (see stop conditions)'
+$originMainFetchClock = 'UNMEASURABLE -- no FETCH_HEAD in this clone (see stop conditions)'
+$originMainFetchStop = 'originMainFetchAgeMinutes=UNMEASURABLE -- no FETCH_HEAD exists anywhere in this clone, so this instrument CANNOT tell a fetch made seconds ago from one never made, and every landed verdict below is computed against an origin/main of UNKNOWN age. A fresh clone reads this way on purpose: `git clone` writes no FETCH_HEAD. Run `git fetch origin` -- it both refreshes the ref and makes this field measurable'
 # -LiteralPath, not a glob: a checkout path may contain [ or ], and -Path would treat it as a
 # wildcard and silently match nothing. Missing and unreadable both fall out as no item.
-$newestFetch = @($fetchClockPaths |
+$allClocks = @($fetchClockPaths |
         ForEach-Object { Get-Item -LiteralPath $_ -EA SilentlyContinue } |
-        Sort-Object LastWriteTimeUtc -Descending |
-        Select-Object -First 1)
-if ($newestFetch.Count -eq 1) {
-    $lastFetchAgeMinutes = [int]((Get-Date).ToUniversalTime() - $newestFetch[0].LastWriteTimeUtc).TotalMinutes
-    $lastFetchClock = $newestFetch[0].FullName
+        Sort-Object LastWriteTimeUtc -Descending)
+# Sorted newest-first, so the FIRST qualifying file is the newest qualifying file and the loop can
+# stop there. It also means an unreadable newest clock falls through to the next one rather than
+# ending the search.
+$mainClock = $null
+foreach ($c in $allClocks) {
+    if (Test-FetchHeadNamesOriginMain $c.FullName $mainBranch $originUrl) { $mainClock = $c; break }
+}
+if ($null -ne $mainClock) {
+    $originMainFetchAgeMinutes = [int]((Get-Date).ToUniversalTime() - $mainClock.LastWriteTimeUtc).TotalMinutes
+    $originMainFetchClock = $mainClock.FullName
+    $originMainFetchStop = $null
+} elseif ($allClocks.Count -ge 1) {
+    # The newly-closed blind spot, and it needs its OWN sentence. Telling this reader that no
+    # FETCH_HEAD exists would be false on its face -- they can see the files -- and an instrument
+    # caught in an obvious lie stops being read at all.
+    $originMainFetchClock = "UNMEASURABLE -- $($allClocks.Count) FETCH_HEAD file(s) here, none naming origin/$mainBranch (newest: $($allClocks[0].FullName))"
+    $originMainFetchStop = "originMainFetchAgeMinutes=UNMEASURABLE -- $($allClocks.Count) FETCH_HEAD file(s) exist in this clone and NOT ONE records a fetch of origin/$mainBranch. Every one of them fetched something else (a pull ref, a different remote), which bumps the clock and leaves origin/$mainBranch untouched -- so the cached ref is of UNKNOWN age no matter how recently this clone fetched. Run ``git fetch origin`` to refresh the ref and make this field measurable"
 }
 
 # ---------------------------------------------------------------------------------------------
@@ -346,10 +421,12 @@ if ($records.Count -eq 0 -and $heartbeats.Count -eq 0) { $stops += 'recordsExami
 # BOTH DIRECTIONS FIRE, and the null one is the reason this rung exists (BACKLOG #1374). The old
 # guard was `-ne $null -and -gt 60`, so the one state where the instrument knows nothing was the one
 # state it said nothing about.
-if ($null -eq $lastFetchAgeMinutes) {
-    $stops += 'lastFetchAgeMinutes=UNMEASURABLE -- no FETCH_HEAD exists anywhere in this clone, so this instrument CANNOT tell a fetch made seconds ago from one never made, and every landed verdict below is computed against an origin/main of UNKNOWN age. A fresh clone reads this way on purpose: `git clone` writes no FETCH_HEAD. Run `git fetch origin` -- it both refreshes the ref and makes this field measurable'
-} elseif ($lastFetchAgeMinutes -gt 60) {
-    $stops += "lastFetchAgeMinutes=$lastFetchAgeMinutes -- the last fetch anywhere in this clone was $lastFetchAgeMinutes minutes ago; landed verdicts would be computed against a stale origin/main"
+if ($null -eq $originMainFetchAgeMinutes) {
+    # Which of the two blind states this is was decided where the clocks were read, because that is
+    # the only place that still knows. Both are UNMEASURABLE; they differ in what to DO about it.
+    $stops += $originMainFetchStop
+} elseif ($originMainFetchAgeMinutes -gt 60) {
+    $stops += "originMainFetchAgeMinutes=$originMainFetchAgeMinutes -- the newest fetch of origin/$mainBranch anywhere in this clone was $originMainFetchAgeMinutes minutes ago; landed verdicts would be computed against a stale origin/$mainBranch"
 }
 
 # POINTER CENSUS, resolved here rather than trusted from the records. Printed as a RATIO because the
@@ -416,14 +493,20 @@ $receipt = [ordered]@{
     writerErrorLines          = $writerErrors
     repoWorktrees             = $repoWorktrees.Count
     originMainSha             = $originMainSha
-    # NAMED FOR THE CLOCK IT READS. The predecessor key `originMainAgeMinutes` claimed fetch recency
-    # and timed the ref file instead; nothing outside docs/BACKLOG.md ever read it by name (checked
-    # against this repo and the vault's origin/main, with `fleet.ps1` itself as the positive
-    # control), so it was renamed rather than doubled. A consumer pinned to the old key now finds no
-    # key at all, which is the honest failure -- the alternative was a familiar name that keeps
-    # answering the wrong question.
-    lastFetchAgeMinutes       = $lastFetchAgeMinutes
-    lastFetchClock            = $lastFetchClock
+    # NAMED FOR THE QUESTION IT ANSWERS, and it has now been renamed TWICE for the same reason, so
+    # the rule is worth stating plainly: this key must say origin/main, because that is the ref the
+    # verdicts below are computed against.
+    #   `originMainAgeMinutes` (first) claimed fetch recency and timed the REF FILE.
+    #   `lastFetchAgeMinutes` (second) timed a real fetch, but ANY fetch. It was literally accurate
+    #   and still wrong in the case that matters: with a pull-ref fetch one minute old beside a main
+    #   fetch three hours old, the honest value of THIS field is 180, which the name `lastFetch`
+    #   contradicts. A name that fights its own value is how this item started.
+    # Nothing outside docs/BACKLOG.md and this script's own test ever read either key by name --
+    # checked with `originMainSha` as the positive control that the search could see the files -- so
+    # each was renamed rather than doubled. A consumer pinned to an old key now finds no key at all,
+    # which is the honest failure.
+    originMainFetchAgeMinutes = $originMainFetchAgeMinutes
+    originMainFetchClock      = $originMainFetchClock
     handoffPointers           = $ptrTotal
     handoffPointerSeats       = $ptrBoxes.Count
     handoffPointersDangling   = $ptrDangling
@@ -574,7 +657,7 @@ foreach ($k in $receipt.Keys) {
     # one -- the same failure BACKLOG #1374 is about, on whichever field happens to be null next.
     # `originMainSha` is null in any checkout with no `origin` remote and was rendering that way.
     # This is the generic backstop; a field whose null needs a REMEDY still carries its own sentence
-    # (`lastFetchClock`), because "(null)" cannot tell anyone to run `git fetch origin`.
+    # (`originMainFetchClock`), because "(null)" cannot tell anyone to run `git fetch origin`.
     $v = if ($null -eq $receipt[$k]) { '(null)' } else { $receipt[$k] }
     "  {0,-26} {1}" -f $k, $v
 }
