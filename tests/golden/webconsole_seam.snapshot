@@ -7,7 +7,7 @@
 # by hand (BACKLOG #1220) - so a newly rendered DTO is covered with nobody editing a list.
 
 ## ENGINE_UI_SEAM
-266cbfd342b22819
+74ff1cc6b7b9cb8a
 
 ## dataclass messagefoundry.api._ui_seam.UiDeps
 engine_seam
@@ -199,6 +199,7 @@ messagefoundry.api.models.GraphNode: kind, name, status
 messagefoundry.api.models.GraphResponse: dynamic, edges, nodes
 messagefoundry.api.models.IntegrityResult: detail, ok
 messagefoundry.api.models.LogInfo: disk_free_bytes, path, size_bytes
+messagefoundry.api.models.LogSinkInfo: last_event, last_event_at, rolled_aside, rollovers, sink, state
 messagefoundry.api.models.MessageDetail: attachments, channel_id, control_id, error, event, events, id, message_type, metadata, outbox, raw, received_at, source_type, status, summary
 messagefoundry.api.models.MessageList: limit, messages, offset, total
 messagefoundry.api.models.MessageSearchResults: limit, matched, messages, scan_limit, scanned, truncated
@@ -218,7 +219,7 @@ messagefoundry.api.models.SecurityPosture: allow_unencrypted_phi, backend, clien
 messagefoundry.api.models.ServiceStatusInfo: enabled, service_name, state
 messagefoundry.api.models.StatsResetRequest: all, targets
 messagefoundry.api.models.StatsResetTarget: channel_id, destination, role
-messagefoundry.api.models.SystemStatus: claim_proc, db, engine, kpis, logs, pool, update
+messagefoundry.api.models.SystemStatus: claim_proc, db, engine, kpis, log_sinks, logs, pool, update
 messagefoundry.api.models.UpdateInfo: current_version, pinned_version, update_available
 messagefoundry.api.models.UploadResendRequest: index, to
 messagefoundry.api.models.UploadedFileInfo: content_type, file_id, filename, message_count, sha256, size, uploaded_at, uploader

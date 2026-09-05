@@ -5,8 +5,14 @@
 Stdlib ``logging`` only (no structlog): a stdout stream handler with a timestamped text format by
 default, optionally **structured JSON** (one object per line, ``[logging].format = "json"``), with
 uvicorn's own loggers routed through the same handler. When the engine runs under NSSM as a Windows
-service, NSSM captures stdout/stderr to rotating files, so we deliberately do **not** add file handlers
-here. A copy of every record can also be **forwarded off-box** to a syslog/SIEM collector
+service, NSSM captures stdout/stderr to rotating files, so we add **no file handler by default** — the
+supervisor owns those files. The one exception is opt-in and engine-owned end to end:
+``[logging].file`` adds a second, size-rotating sink the engine itself opens, rotates and rolls
+(BACKLOG #122, :mod:`messagefoundry.logging_guard`), and the settings validator refuses a path inside
+``[logging].log_dir`` so the supervisor and the engine can never rotate the same file. Every sink is
+wrapped in the two-stage write guard: a failed write rolls the sink, and only an unwritable
+*replacement* stops this process's connections.
+A copy of every record can also be **forwarded off-box** to a syslog/SIEM collector
 (``[logging].forward_*``; sec-offbox-log, ASVS 16.x) so log evidence survives a host compromise; PHI
 redaction + control-char scrubbing apply to the forwarded stream exactly as to stdout. The off-box
 transport is UDP (RFC 5426), plaintext TCP (RFC 6587), or **native TLS** (RFC 5425 — an ``ssl``-wrapped
@@ -36,9 +42,16 @@ from messagefoundry.config.tls_policy import harden_cipher_suites
 # A LEAF MODULE, imported for its DEFINITION rather than its behaviour (BACKLOG #1273). controlchars
 # imports nothing from this package, so there is no cycle -- checked by import, not assumed.
 from messagefoundry.controlchars import _is_control_char
+from messagefoundry.logging_guard import (
+    GuardedFileHandler,
+    GuardedStreamHandler,
+    LogWriteGuard,
+    set_active_guard,
+)
 from messagefoundry.redaction import redact
 
 __all__ = [
+    "LogFile",
     "build_stderr_handler",
     "configure_logging",
     "configure_stderr_logging",
@@ -442,11 +455,27 @@ def _resolve_level(level: str) -> int:
     return resolved
 
 
+@dataclass(frozen=True, slots=True)
+class LogFile:
+    """``[logging].file`` — the OPT-IN application-log file the ENGINE owns end to end (#122, ADR 0162).
+
+    Distinct from ``[logging].log_dir``, which is where the SUPERVISOR (NSSM) parks and rotates the
+    captured stdout: the engine opens this path, size-rotates it, and rolls it aside on a write
+    failure. The settings validator refuses a ``file`` inside ``log_dir`` so the two rotation owners
+    can never collide on one directory (docs/SERVICE.md)."""
+
+    path: str
+    max_bytes: int = 50_000_000
+    backup_count: int = 5
+
+
 def configure_logging(
     level: str = "INFO",
     *,
     fmt: str = "text",
     forward: SyslogForward | None = None,
+    log_file: LogFile | None = None,
+    stop_on_write_failure: bool = True,
 ) -> bool:
     """Install the stdout handler on the root logger, route uvicorn through it, and optionally forward
     a copy of every record off-box to a syslog/SIEM collector. Returns whether the off-box forwarder
@@ -464,13 +493,27 @@ def configure_logging(
     is then dropped) rather than blocking the event-loop thread the engine logs from. The send is still
     synchronous, so for a high-volume feed prefer UDP or a local forwarding agent.
 
+    ``log_file`` adds the OPT-IN engine-managed application-log file (``[logging].file``, #122/ADR
+    0162) alongside stdout. Unlike the forwarder it is **NOT best-effort**: a path the engine cannot
+    open raises here, so the service refuses to start rather than starting unable to log — the same
+    fail-closed reasoning as ``stop_on_write_failure`` itself, applied at configuration time.
+
+    Both sinks are wrapped in the two-stage write guard
+    (:mod:`~messagefoundry.logging_guard`): a write failure rolls the sink and heals; only an
+    unwritable *replacement* escalates, and ``stop_on_write_failure`` decides whether that escalation
+    stops this process's connections. The guard is installed process-wide
+    (:func:`~messagefoundry.logging_guard.set_active_guard`); the engine's ``RegistryRunner`` wires
+    itself to it at start, so a process with no engine (a CLI subcommand, a test) rolls and reports on
+    stderr but stops nothing.
+
     Idempotent: replaces any handlers a previous call installed, so it is safe to call from tests as
     well as the CLI. Pair with ``uvicorn.run(..., log_config=None)`` so uvicorn's loggers propagate to
     these handlers instead of installing their own.
     """
     numeric = _resolve_level(level)
 
-    stdout_handler = logging.StreamHandler(sys.stdout)
+    guard = LogWriteGuard(stop_on_unwritable=stop_on_write_failure)
+    stdout_handler = GuardedStreamHandler(sys.stdout, guard=guard, sink="stdout")
     stdout_handler.setFormatter(_make_formatter(fmt))
     _install_phi_filters(stdout_handler)
 
@@ -479,6 +522,23 @@ def configure_logging(
         root.removeHandler(existing)
     root.addHandler(stdout_handler)
     root.setLevel(numeric)
+
+    if log_file is not None:
+        # No try/except: an OSError here means the operator named a path the engine cannot write, and
+        # starting anyway would ship exactly the silent blindness #122 exists to end.
+        file_handler = GuardedFileHandler(
+            log_file.path,
+            guard=guard,
+            sink="file",
+            max_bytes=log_file.max_bytes,
+            backup_count=log_file.backup_count,
+        )
+        file_handler.setFormatter(_make_formatter(fmt))
+        _install_phi_filters(file_handler)
+        root.addHandler(file_handler)
+
+    # Published LAST, so a concurrently-starting engine never wires itself to a half-built guard.
+    set_active_guard(guard)
 
     forwarder_installed = False
     if forward is not None:

@@ -129,12 +129,21 @@ from typing import Any
 #: for two independent contract changes. Skipping to 20 bought room but fixed nothing: the next pair
 #: of branches would collide identically. BACKLOG #1220 removed the hand-chosen number entirely.
 #:
+#: BACKLOG #122 / ADR 0162: SystemStatus gained the additive ``log_sinks`` -- per-sink
+#: application-log WRITE health (healthy / rolled / unwritable, a rollover count, a ``safe_exc``
+#: reason and the path a broken file was rolled aside to). The two log readings answer DIFFERENT
+#: questions and that is the point: ``logs`` meters the SUPERVISOR's directory from the filesystem,
+#: so it cannot observe a sink the engine failed to write; ``log_sinks`` is read from process
+#: memory, so it still answers when the disk does not. Additive with a default of ``[]``, so the
+#: payload is unchanged when logging was not configured through ``configure_logging``; the digest
+#: below still moves, because it introspects SystemStatus's field set.
+#:
 #: The digest below covers the surface DISCOVERED from the console's own imports and uses, which is
 #: strictly larger than the five hand-maintained tuples it replaced -- those had drifted, and the
 #: proof is that commit 40a4d5d9 added a REQUIRED ``UploadedFileList.scope`` field the console renders
 #: unconditionally while touching no seam file at all. Regenerate with
 #: ``python scripts/webconsole_seam_snapshot.py --write``; never hand-edit it to silence a gate.
-ENGINE_UI_SEAM: str = "266cbfd342b22819"
+ENGINE_UI_SEAM: str = "74ff1cc6b7b9cb8a"
 
 
 @dataclass(frozen=True, slots=True)

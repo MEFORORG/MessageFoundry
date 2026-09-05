@@ -94,6 +94,7 @@ __all__ = [
     "DiagnosticsSettings",
     "EnvironmentsSettings",
     "LoggingSettings",
+    "LogWriteFailurePolicy",
     "LogFormat",
     "SyslogProtocol",
     "ReferenceSettings",
@@ -1410,6 +1411,17 @@ class LogFormat(str, Enum):  # noqa: UP042
     JSON = "json"  # one JSON object per line — structured for a log shipper / SIEM
 
 
+class LogWriteFailurePolicy(str, Enum):  # noqa: UP042
+    """What the engine does when an application-log sink is unwritable AND its replacement is too."""
+
+    # Fail-closed (the default): stop every connection this process owns. Never fires on a first
+    # failure — only when the rolled replacement is unwritable as well (#122 stage 2, ADR 0162).
+    STOP = "stop"
+    # Alert + roll, but keep running. The documented opt-out; an operator choosing it accepts that
+    # messages can be processed with no application-log record of the processing.
+    CONTINUE = "continue"
+
+
 class SyslogProtocol(str, Enum):  # noqa: UP042
     # RFC 5426; fire-and-forget, never blocks the engine (the default).
     UDP = "udp"
@@ -1435,11 +1447,29 @@ class LoggingSettings(_Section):
     # a log shipper tailing NSSM's captured stdout).
     format: LogFormat = LogFormat.TEXT
     # Optional directory NSSM (or another supervisor) rotates the engine's captured stdout/stderr into.
-    # We never write log FILES ourselves (the engine logs to stdout — see logging_setup), but if an
+    # The engine writes no log FILE of its own unless `file` below is set (opt-in, #122), but if an
     # operator tells us where the supervisor parks them, GET /status meters that directory's total bytes
     # + filesystem free space alongside the DB metrics (#50). None (the default) = stdout-only, no
     # metering. Metadata only — the contents are never read.
     log_dir: str | None = None
+
+    # --- Engine-managed application log file + fail-closed write guard (#122, ADR 0162) ----------
+    # OPT-IN second sink the ENGINE owns end to end: it opens it, it size-rotates it (file_max_bytes /
+    # file_backup_count) and it rolls it aside on a write failure. None (the default) = stdout-only,
+    # byte-identical to before, and NSSM stays the sole rotation owner of the captured stdout files.
+    # ONE FILE, ONE OWNER: the validator below refuses a `file` inside `log_dir` (the supervisor's
+    # rotation territory) — two rotation owners renaming one file is how a log gets shredded. See
+    # docs/SERVICE.md "Who owns which log file".
+    file: str | None = None
+    file_max_bytes: int = 50_000_000  # size-rotate at ~50 MB (0 = never rotate on size)
+    file_backup_count: int = 5  # keep app.log.1 .. app.log.N alongside the live file
+    # THE FAIL-CLOSED CONTROL (#122). "stop" (default): when a log sink cannot be written AND the
+    # replacement rolled into its place cannot be written either, every connection this PROCESS owns
+    # stops — an engine that cannot log must not keep processing (CLAUDE.md §1 count-and-log). A first
+    # failure alone NEVER stops anything; the roll absorbs the transient. "continue" is the documented
+    # opt-out for an operator who would rather run blind than stop a feed; it still alerts and still
+    # rolls, it just does not stop.
+    on_write_failure: LogWriteFailurePolicy = LogWriteFailurePolicy.STOP
 
     # --- Off-box forwarding to a syslog/SIEM collector (ASVS 16.x; ADR 0080) ----------
     # Ship a copy of every log record to a remote syslog collector so log evidence survives a host
@@ -1497,6 +1527,43 @@ class LoggingSettings(_Section):
     time_sync_fail_closed: bool = (
         False  # refuse to start on skew / unreachable peer (further opt-in)
     )
+
+    @model_validator(mode="before")
+    @classmethod
+    def _refuse_renamed_file_keys(cls, data: Any) -> Any:
+        """Refuse the legacy planned spellings instead of silently ignoring them.
+
+        ``[logging]`` is pydantic ``extra="ignore"`` and CONFIGURATION.md carried ``max_bytes`` /
+        ``backups`` as accepted-but-ignored *planned* keys while the engine-managed file was unbuilt.
+        Now that the sink is real, ignoring them would hand an operator the 50 MB / 5-backup defaults
+        while their config said otherwise — a control that reports success while doing something
+        else. ``mode="before"`` because ``extra="ignore"`` drops them before any field validator
+        could see them.
+
+        **WHICH LAYER ACTUALLY REFUSES DEPENDS ON WHERE THE KEY CAME FROM, and this validator is not
+        the one an operator meets first.** :func:`_reject_unknown_file_keys` refuses an unrecognized
+        key in the TOML **file** before any model is built, so a file carrying either spelling never
+        reaches here. Measured: ``[logging].max_bytes`` in a file is refused by the loader *and*
+        suggested onward as ``file_max_bytes``, while ``[logging].backups`` is refused naming no
+        replacement — the loader's nearest-name heuristic does not reach ``file_backup_count``.
+
+        **The layer this one covers is ENV, which the file refusal deliberately does not.**
+        ``_env_overrides`` scrapes ``MEFOR_LOGGING_*`` straight into the section dict, and a
+        misspelled env var is otherwise dropped in silence (docs/CONFIGURATION.md, "The refusal covers
+        the FILE"). Measured: ``MEFOR_LOGGING_MAX_BYTES`` and ``MEFOR_LOGGING_BACKUPS`` each reach
+        this validator and are refused naming their replacement. So the two spellings are the rare
+        env keys that fail loudly, and that is worth keeping rather than folding into the loader."""
+        if isinstance(data, dict):
+            for legacy, actual in (
+                ("max_bytes", "file_max_bytes"),
+                ("backups", "file_backup_count"),
+            ):
+                if legacy in data:
+                    raise ValueError(
+                        f"[logging].{legacy} is not a setting — the engine-managed application-log "
+                        f"file uses [logging].{actual} (BACKLOG #122, ADR 0162)"
+                    )
+        return data
 
     @field_validator("level")
     @classmethod
@@ -1562,6 +1629,24 @@ class LoggingSettings(_Section):
             )
         if self.time_sync_fail_closed and not self.require_time_sync:
             raise ValueError("[logging].time_sync_fail_closed requires [logging].require_time_sync")
+        # ONE FILE, ONE ROTATION OWNER (#122, ADR 0162 §6). `log_dir` is where the SUPERVISOR (NSSM)
+        # parks and rotates the captured stdout; `file` is a log the ENGINE opens, rotates and rolls.
+        # Putting the engine's file inside the supervisor's directory points two rotators at one
+        # directory, and the loser of that race is the log an operator reads after an incident.
+        if self.file is not None and self.log_dir is not None:
+            engine_file = Path(self.file).expanduser().resolve(strict=False)
+            supervisor_dir = Path(self.log_dir).expanduser().resolve(strict=False)
+            if engine_file == supervisor_dir or supervisor_dir in engine_file.parents:
+                raise ValueError(
+                    f"[logging].file ({self.file}) is inside [logging].log_dir ({self.log_dir}), "
+                    "which the supervisor (NSSM) rotates. Two rotation owners on one directory "
+                    "corrupt the log they are meant to preserve — put the engine-managed file "
+                    "somewhere the supervisor does not rotate (docs/SERVICE.md)"
+                )
+        if self.file_max_bytes < 0:
+            raise ValueError("[logging].file_max_bytes must be >= 0 (0 = never rotate on size)")
+        if self.file_backup_count < 0:
+            raise ValueError("[logging].file_backup_count must be >= 0")
         return self
 
 
@@ -2711,6 +2796,11 @@ _ALERT_EVENT_TYPES = frozenset(
         # ASVS 6.4.5 arm 2: an UNCLAIMED first-run bootstrap admin is nearing its auto-disable deadline
         # (payload is the ISO deadline + whole hours remaining — never the password; PHI-free)
         "bootstrap_admin_expiring",
+        # #122 (ADR 0162): an application-log sink was rolled after a write failure (stage 1) or is
+        # UNWRITABLE and this process's connections were stopped (stage 2). Routable on its own so an
+        # operator can page on "the engine went deaf" apart from the per-connection connection_stopped
+        # events the stop also emits.
+        "log_write_failed",
         # NOTE: the INVERSE events (leadership_lost / dr_released) are auto-resolve-only (alert_sinks
         # _AUTO_RESOLVE), NOT rule-targetable alert types — a step-down / fail-back needs no page.
     }

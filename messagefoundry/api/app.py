@@ -127,6 +127,7 @@ from messagefoundry.api.models import (
     LogInfo,
     LogLevelInfo,
     LogLevelUpdate,
+    LogSinkInfo,
     LogTailPage,
     MessageDetail,
     MessageExportRequest,
@@ -276,6 +277,7 @@ from messagefoundry.config.wiring import (
 )
 from messagefoundry.integrity import run_startup_attestation
 from messagefoundry.last_resort import install_loop_exception_handler
+from messagefoundry.logging_guard import active_guard as active_log_guard
 from messagefoundry.logging_setup import LOG_LEVELS, current_log_level, set_runtime_level
 from messagefoundry.parsing.sniff import attachment_mime_agrees, nontext_upload_reason
 from messagefoundry.pipeline import ConfigReloadDenied, Engine
@@ -435,6 +437,28 @@ def _log_storage(log_dir: str | None) -> LogInfo | None:
     except OSError:
         return None
     return LogInfo(path=str(path), size_bytes=total, disk_free_bytes=free)
+
+
+def _log_sink_health() -> list[LogSinkInfo]:
+    """Per-sink application-log WRITE health (#122, ADR 0162) for ``GET /status``.
+
+    In-memory only — no filesystem access, so unlike :func:`_log_storage` it cannot be defeated by the
+    very unwritable directory it is reporting on, and it is safe to call on the event loop. Empty when
+    logging was not configured through ``configure_logging`` (an embedding or a test)."""
+    guard = active_log_guard()
+    if guard is None:
+        return []
+    return [
+        LogSinkInfo(
+            sink=status.sink,
+            state=status.state,
+            rollovers=status.rollovers,
+            last_event=status.last_event,
+            last_event_at=status.last_event_at,
+            rolled_aside=status.rolled_aside,
+        )
+        for status in guard.status()
+    ]
 
 
 def _read_log_tail(log_dir: str | None, *, limit: int, offset: int) -> tuple[list[str], int, bool]:
@@ -5019,6 +5043,7 @@ def create_app(
                 synchronous=db.synchronous,
             ),
             logs=logs,
+            log_sinks=_log_sink_health(),
             update=update,
             pool=pool,
             claim_proc=claim_proc,
