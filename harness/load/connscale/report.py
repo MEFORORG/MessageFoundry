@@ -116,7 +116,10 @@ class ConnScaleRecord:
     wake_fanout_per_s: (
         float  # the per-commit thundering-herd cost (the herd slope vs N is read here)
     )
-    # Empty claims PER MESSAGE absorbed, over the same first→last in-hold window as the rates above.
+    # Empty claims PER MESSAGE absorbed, over the same first→last sample window as the rates above.
+    # That window is the hold PLUS the step's post-drain tail, and it is defined once, in
+    # `harness.load.connscale.runner._empty_claim_rates` (BACKLOG #1420). This line used to call it
+    # "in-hold", which the final sample is not.
     # BACKLOG #1101: the per-SECOND form has wall clock in its denominator, so anything that slows the
     # run — CPU contention on a shared CI runner, or the O(N) reload probe firing mid-hold — collapses
     # it without the engine changing. Per-message is the quantity wall #3 actually means (the herd size

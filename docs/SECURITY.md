@@ -149,11 +149,22 @@ MessageFoundry states the boundary and adds one opt-in precondition check (#203)
 - **Managed identity over static credentials.** The store can authenticate with a managed / delegated
   identity — SQL Server `[store].auth = integrated` (gMSA / Windows Integrated) or `entra` (Microsoft
   Entra ID) — instead of a static username + password. Set `[store].require_managed_identity = true` to
-  make it a **checked precondition**: on a **production** instance `serve` **refuses to start** (a
-  non-production instance **warns**) if the store still uses a static SQL login, or a Postgres store
-  (which has no managed-identity mode). Off by default. AD (`ad_bind_password`) and SMTP
+  make it a **checked precondition**: `serve` **refuses to start** if the store still uses a static SQL
+  login, or a Postgres store (which has no managed-identity mode). Off by default. **The refuse/warn
+  split is `[security].enforcement`, not the deployment tier** — `enforce` is the shipped default on
+  `dev` and `staging` as much as on `prod`, so a staging box that turns this on and leaves `auth = "sql"`
+  is refused, not warned; it downgrades to a warning only under `enforcement = warn`. See
+  [`docs/CONFIGURATION.md`](CONFIGURATION.md), which is the source of record for that split.
+  AD (`ad_bind_password`) and SMTP
   (`email_password`) have no managed-identity mode yet — supply those secrets via the environment
   (`MEFOR_*`, never the config file) under a least-privilege service account.
+- **The precondition covers the STORE hop and nothing else** (ASVS 13.2.1, BACKLOG #1182).
+  `managed_identity_precondition` is a `StoreSettings` method, so the `[store]` service settings are all
+  it can read — the four graph-declared database hops (`Database`, `DatabasePoll`, `DatabaseLookup`,
+  `DatabaseRef`) are outside its reach by construction, and each defaults to a static SQL login. Setting
+  the flag therefore says nothing about them. `messagefoundry check`'s advisory `static-db-credentials`
+  line is what names that set; it reports and does not refuse. See
+  [`docs/CONNECTIONS.md`](CONNECTIONS.md) §*Static database credentials*.
 - **Least-privilege secret access** is the operator's precondition: secrets live in the environment, the
   engine's service account is granted only what it needs (the least-privilege account + ACLs are the
   Windows-service install's job), and at-rest custody is the DPAPI / KeyProvider chain. The precondition
@@ -1487,8 +1498,8 @@ MFA step-up is now built (WP-14 native TOTP); a web console banner for the feed 
 
 Local passwords follow an **ASVS 5.0-aligned** policy (WP-3): **min length 15**, **no mandatory
 character-class composition** (the `require_*` class flags are opt-in, default off — ASVS forbids
-mandatory composition), plus **offline breached/common-password screening** (a bundled top-10k list,
-no live HIBP call) and a fixed **context-word deny-list**, enumerated in full below. Enforced
+mandatory composition), plus **offline breached/common-password screening** (a bundled offline
+corpus, no live HIBP call) and a fixed **context-word deny-list**, enumerated in full below. Enforced
 identically on create-user and change-password; tune via `[auth]` (see
 [CONFIGURATION.md](CONFIGURATION.md)). AD passwords are governed by Active Directory.
 
@@ -1521,7 +1532,7 @@ Two further screens (ASVS 6.2.11 / 6.2.12), both on by default and fully offline
   user's own username (case-insensitive, for usernames ≥ 4 chars) is rejected, catching the common
   `jsmith2026`-style choice that the corpus can't.
 - **Larger operator breach corpus** (`password_breach_corpus_file`) — point this at an offline list to
-  augment the bundled top-10k: a **plaintext** file *or* an **HIBP-style SHA-1-hash export**
+  augment the bundled corpus: a **plaintext** file *or* an **HIBP-style SHA-1-hash export**
   (`HASH[:count]` lines, auto-detected), checked locally with no network call. Use a curated subset
   (it's loaded into memory), not the full ~40 GB HIBP set; a configured-but-unreadable path is warned
   at startup and falls back to the bundled list.
@@ -1743,8 +1754,12 @@ write) and the two pending-flow caches are **in-process, per API process** — N
 *those* budgets by N. The account lockout, the concurrent-session cap and the bootstrap-admin timer are
 **store-backed** (`record_login_failure` / `enforce_session_cap` / `set_user_disabled` against the one
 unified store), so they are **shared** by every API process and are **not** multiplied by N. The
-request-body cap is **stateless** — a per-request test that carries no budget at all. An exposed or
-multi-host deployment must additionally front the API with a proxy/WAF limiter and TLS.
+per-uploader file/byte quota is also **not** multiplied by N: it is scoped to the `uploads_dir` (an
+uncached sidecar scan) with its check-then-write held as an atomic reservation on that same unified
+store, so shards sharing one dir enforce one budget between them. The request-body cap and the
+remote-file retrieve bound are **stateless** — a per-request and a per-file test that carry no budget
+at all. An exposed or multi-host deployment must additionally front the API with a proxy/WAF limiter
+and TLS.
 
 | Limit | Setting(s) | Default | Window | Per-user | Global | Per-IP | Scope | On breach |
 |---|---|---|---|---|---|---|---|---|
@@ -1756,9 +1771,11 @@ multi-host deployment must additionally front the API with a proxy/WAF limiter a
 | Concurrent sessions | `[auth].max_sessions_per_user` | 5 (`0` = unlimited) | — | **yes** | no | no | **store-backed** — every login | the user's oldest session is revoked |
 | Bootstrap-admin lifetime | `[auth].bootstrap_expiry_hours` | 72 h (`0` = no timer) | — | n/a | n/a | n/a | **store-backed** — the unclaimed bootstrap account | disabled + audited |
 | Request body | `[store].max_upload_bytes` (the `/uploads` routes only) | 1 MiB elsewhere | per request | no | no | no | **stateless** — every route, in ASGI middleware | **413** over the cap, **400** on ambiguous CL+TE framing or an invalid `Content-Length`, **411** on a chunked body |
+| Uploaded files retained, per uploader | `[store].max_upload_files_per_user`, `max_upload_total_bytes_per_user`, `uploads_retention_days` | 100 files / 250 MiB / 30 days | cumulative (no window; the retention age is what releases budget) | **yes** — a **cumulative** count *and* byte total, so the single-file cap above is not the only upload bound | no | no | **store-backed** — scoped to the `uploads_dir` via an uncached sidecar scan, with the check-then-write held as an atomic `reserve_upload_quota` on the unified store, so shards sharing a dir share one budget (separate dirs get separate budgets by construction) | **409** before any write, audited `upload.reject_quota`; over-age blob+meta pairs are pruned and audited `upload.prune`. Defaults-**on** with a `ge=1` floor once `uploads_dir` is set — the control cannot ship disabled |
+| Remote-file retrieve | `max_file_bytes` (the `File(...)` and `Sftp`/`Ftp` inbound connections) | 16 MiB | per file | no | no | no | **stateless** — a per-file test carrying no budget, applied in the connector | the file is quarantined to `error_subdir` and WARNING-logged; it never becomes a received message, so there is no store disposition. **Charged twice on a remote source, and the second charge is the one that binds** (BACKLOG #1191): once against the size the partner server reported in its own directory listing, then again against the **bytes actually read**, streaming in 1 MiB chunks so a share that lists a small file and delivers an arbitrarily large body is cut off mid-transfer. That second charge is the only bound that can see this surface at all — the connector consumes the body *before* an ingress row exists |
 | OIDC pending flows | `[auth].oidc_flow_cache_max` (global), `DEFAULT_PER_IP_CAP` (per-IP, no knob), `oidc_flow_ttl_seconds` | 512 / 16 / 300 s | 300 s TTL | no | **yes** (512) | **yes** (16) | **in-process** — `GET /ui/oidc/start` — reject-when-full, never evict | 303 → `/ui/login?e=rate_limited`, WARNING-logged, **never** audited |
 | WebAuthn pending ceremonies | `GLOBAL_PENDING_CAP`, `PER_USER_PENDING_CAP`, `CHALLENGE_TTL_SECONDS` (module constants, no knobs) | 4096 / 16 / 120 s | 120 s TTL | **yes** (16) | **yes** (4096) | no | **in-process** — every passkey registration + assertion ceremony | per-user: evicts that user's **own** oldest pending ceremony (silent); global: `ChallengeCacheFullError` naming the cause + the `admin_reset_mfa` recovery path |
-| **Ingest plane** | `max_messages_per_second`, `message_burst` (MLLP inbound) | **off** (unset = no rate bound) | per message | no | no | no | **in-process** — one bucket per MLLP connection, so it neither coordinates across engine shards nor aggregates per peer | **Ships OFF, and the off default is ruled rather than accidental** — a rate on a clinical interface is only safe at a number taken from a real feed profile. **So a default install has NO message-RATE bound on the ingest plane**, and that is a deliberate posture, not a gap in the control. Both keys are parameters of the `MLLP()` factory, and `connections.toml` desugars through that same factory, so **the code-first and the TOML surface both express them** (BACKLOG #1249 — until that landed the pacer was built and no documented configuration could turn it on, which is a different and worse thing than being off). *What it does when set:* the listener **pauses reading** over budget so TCP back-pressures the sender; no message is dropped, refused, NAK'd or reordered — the count-and-log invariant forbids accept-and-drop, so a discarding limiter was never available. **Not covered even when set:** the raw-TCP inbound, and any per-peer bound (MLLP peers are unauthenticated, so the only key would be source IP, which NAT collapses). **Resource bounds that DO ship on** — `max_connections` (256), `receive_timeout` (60.0 s), `max_frame_bytes` (16 MiB), per-connection `max_message_bytes`, `source_ip_allowlist` |
+| **Ingest plane** | `max_messages_per_second`, `message_burst` (MLLP, raw-TCP, X12 and HTTP inbounds) | **off** (unset = no rate bound) | per message | no | no | no | **in-process** — one bucket per MLLP / raw-TCP / X12 **connection** and one per HTTP **listener**, so it neither coordinates across engine shards nor aggregates per peer | **Ships OFF, and the off default is ruled rather than accidental** — a rate on a clinical interface is only safe at a number taken from a real feed profile. **So a default install has NO message-RATE bound on the ingest plane**, and that is a deliberate posture, not a gap in the control. Both keys are parameters of the `MLLP()`, `Tcp()`, `X12()` and `Http()` factories, and `connections.toml` desugars through those same factories, so **the code-first and the TOML surface both express them** (BACKLOG #1249 for MLLP, BACKLOG #1114 for the other three — until #1249 landed the pacer was built and no documented configuration could turn it on, and until #1114 landed the other three intakes had no rate control in **any** configuration, which is a different and worse thing than being off). *What it does when set:* the listener **pauses reading before its next read** so TCP back-pressures the sender; no message is dropped, refused, NAK'd, 429'd or reordered — the count-and-log invariant forbids accept-and-drop, so a discarding limiter was never available. **The HTTP bucket is listener-wide, not per-connection**, because that connector answers one request per connection; a `GET`/`HEAD` probe waits behind an outstanding debt but charges nothing. **Not covered even when set:** the DICOM C-STORE SCP (a pace-before-decode bound does not transfer to an association), the File / RemoteFile / Database poll sources (they bind nothing and need a per-tick ceiling instead — a different shape), and any per-peer bound (MLLP, TCP and X12 peers are unauthenticated, so the only key would be source IP, which NAT collapses). **Resource bounds that DO ship on** — `max_connections` (256), `receive_timeout` (60.0 s), `max_frame_bytes` (16 MiB), per-connection `max_message_bytes`, `source_ip_allowlist` |
 
 **What these limits defend, and what they do not.** The full inventory of resource-demanding
 functionality — including the surfaces that remain **unbounded** at this release — is

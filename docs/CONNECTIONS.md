@@ -415,6 +415,8 @@ the bytes.
 | `max_connections` | in | `256` | cap on concurrent client connections (flood guard). `None`/`0` = unlimited. |
 | `receive_timeout` | in | `60.0` | close a client idle this many seconds (slowloris). `None`/`0` = no timeout. |
 | `max_frame_bytes` | both | `16 MiB` | reject a single frame larger than this before buffering it whole (OOM guard); applies to inbound frames and any framed reply. `None`/`0` = unlimited. |
+| `max_messages_per_second` | in | **off** | sustained message-rate ceiling per **connection** (ASVS 2.4.1 / 15.2.2, BACKLOG #1114 — the MLLP pacer, ported). Over budget the listener **pauses reading**, so TCP back-pressures the sender — **no message is ever dropped, refused or reordered**. Unset = no bound, which is a deliberate exception to this table's usual secure-default rule: a guessed rate on a clinical interface throttles real traffic, so the number has to come from your own feed profile. |
+| `message_burst` | in | = the rate | tokens the bucket holds, i.e. how large a burst passes unpaced before the sustained rate applies. Only meaningful with `max_messages_per_second` set. Floor of 1 so a connection can always make progress. |
 | `connect_timeout` | out | `10.0` | TCP connect timeout (s) |
 | `timeout_seconds` | out | `30.0` | send / await-reply timeout (s) |
 | `persistent` | out | `false` | **(ADR 0067 §9 / BACKLOG #97)** reuse **one** lazily-established TCP connection across deliveries (opt-in; default `false` = connect-per-send, byte-identical). A stale cached connection is redialed once **before any byte is written** (uncharged); any post-write failure discards it (charged, normal retry). Same model as the MLLP `persistent` knob, minus TLS (raw TCP has none). |
@@ -430,6 +432,13 @@ inbound("TCP-IN_PARTNER_X12", Tcp(port=9100, framing="stx_etx"), router="x12_rou
         content_type="x12")
 # Relay it back out over VT/FS framing to a downstream peer.
 outbound("TCP-OUT_DOWNSTREAM_X12", Tcp(host="downstream", port=9200, framing="vt_fs"))
+
+# Same feed, with a message-rate bound taken from ITS OWN measured profile: 40/s sustained,
+# 200 absorbed as a burst. Over that the listener stops reading until the debt clears; the
+# partner is back-pressured by TCP and every message it sent still arrives, in order.
+inbound("TCP-IN_PARTNER_X12", Tcp(port=9100, framing="stx_etx",
+                                  max_messages_per_second=40, message_burst=200),
+        router="x12_router", content_type="x12")
 ```
 
 - **No HL7 ACK.** A `Tcp(...)` source does **not** generate an HL7 acknowledgement. If a Handler
@@ -470,6 +479,8 @@ when each interchange is wrapped in a fixed sentinel (STX/ETX, VT/FS). The paylo
 | `max_connections` | in | `256` | cap on concurrent client connections (flood guard). `None`/`0` = unlimited. |
 | `receive_timeout` | in | `60.0` | close a client idle this many seconds (slowloris). `None`/`0` = no timeout. |
 | `max_interchange_bytes` | both | `16 MiB` | reject a single interchange larger than this before it completes (OOM guard); applies inbound and to any returned interchange. `None`/`0` = unlimited. |
+| `max_messages_per_second` | in | **off** | sustained **interchange**-rate ceiling per **connection** (ASVS 2.4.1 / 15.2.2, BACKLOG #1114 — the MLLP pacer, ported; one token per `ISA…IEA`). Over budget the listener **pauses reading**, so TCP back-pressures the sender — **nothing is dropped, refused or reordered**. Unset = no bound, deliberately: a guessed rate throttles real traffic, so the number has to come from your own feed profile. |
+| `message_burst` | in | = the rate | tokens the bucket holds, i.e. how large a burst passes unpaced before the sustained rate applies. Only meaningful with `max_messages_per_second` set. Floor of 1 so a connection can always make progress. |
 | `connect_timeout` | out | `10.0` | TCP connect timeout (s) |
 | `timeout_seconds` | out | `30.0` | send / await-reply timeout (s) |
 | `persistent` | out | `false` | **(ADR 0067 §9 / BACKLOG #97)** reuse **one** lazily-established connection across deliveries (opt-in; default `false` = connect-per-send, byte-identical). A stale socket is redialed once **before any byte is written** (uncharged); any post-write failure is charged + retried. A returned TA1/business interchange is a complete transaction on a healthy transport, so the connection **stays cached** across a captured reply (and a TA1\*R reject). |
@@ -498,6 +509,11 @@ outbound("X12-OUT_RTE", X12(host="payer.example.org", port=5010,
                             expect_reply=True, reingress_to="X12-IN_ELIG_RESULT", ta1_required=True))
 inbound("X12-IN_ELIG_RESULT", Loopback(), router="route_elig_result",
         content_type=ContentType.X12)   # the captured 271 re-ingresses as a RawMessage
+
+# Same intake with an interchange-rate bound from its own measured profile: 10/s sustained,
+# 50 absorbed as a burst. Over that the listener stops reading; nothing is dropped or refused.
+inbound("X12-IN_PARTNER_270", X12(port=2710, max_messages_per_second=10, message_burst=50),
+        router="partner_x12_router", content_type=ContentType.X12)
 ```
 
 See `samples/config/IB_PARTNER_X12.py` + `samples/messages/x12_270_eligibility.edi` for a runnable
@@ -548,6 +564,8 @@ routes a `Message`; `json`/`xml`/`text`/`fhir` route a `RawMessage` the Handler 
 | `receive_timeout` | `60.0` | bound the **whole-request** read — request line + headers + body (slowloris guard); over budget answers a synchronous `408`. `None`/`0` = no timeout. |
 | `max_body_bytes` | `16 MiB` | the MLLP frame cap's HTTP twin — an over-declared `Content-Length` (or a read past the cap) is refused `413` **before the body is buffered whole** (OOM guard). `None`/`0` = unlimited. |
 | `max_header_bytes` | `64 KiB` | cap the request line + headers (header-flood guard). A falsy value falls back to the 64 KiB default — this one cap can't be switched off. |
+| `max_messages_per_second` | **off** | sustained message-rate ceiling for the **whole listener** (ASVS 2.4.1 / 15.2.2, BACKLOG #1114 — the MLLP pacer, ported). Over budget the connector **waits before reading the request**, so the partner is back-pressured and then served in full — **nothing is dropped, refused or answered differently**, and the wait sits outside `receive_timeout` so a paced partner is never handed a `408` for a delay the engine imposed. **Listener-wide, not per-connection**, unlike MLLP/TCP/X12: this connector answers one request per connection, so a per-connection bucket would be charged once and thrown away, bounding nothing. A `GET`/`HEAD` probe and a refused request wait behind an outstanding debt but **charge nothing** — only a committed message spends budget, so a peer that submits nothing cannot starve one that does. Unset = no bound, deliberately: a guessed rate throttles real traffic, so the number has to come from your own feed profile. |
+| `message_burst` | = the rate | tokens the bucket holds, i.e. how large a burst passes unpaced before the sustained rate applies. Only meaningful with `max_messages_per_second` set. Floor of 1 so the listener can always make progress. |
 | `tls` | `false` | serve **HTTPS** (TLS 1.2+, the same per-connection inbound TLS builder MLLP uses). |
 | `tls_cert_file` / `tls_key_file` | — | the server-identity cert + its private key (required when `tls`). A PEM **path** (a plain string — unlike `DICOM()`, these two are not typed for `env()`). |
 | `tls_key_password` | — | passphrase for an **encrypted** `tls_key_file` — a **secret**, supply via `env()`. |
@@ -629,6 +647,15 @@ inbound("REST-IN_ACME_ORDERS",
              tls_key_password=env("http_tls_key_password")),   # only if the key is encrypted
         router="acme_orders_router", content_type=ContentType.JSON,
         source_ip_allowlist=["10.0.0.0/8"])
+
+# The same listener with a message-rate bound from its own measured profile: 25/s sustained,
+# 100 absorbed as a burst, shared by every partner connection. Over that a POST waits before
+# its request is read, then is served in full and answered 202 -- never 429, never dropped.
+inbound("REST-IN_ACME_ORDERS",
+        Http(port=8088, tls=True,
+             tls_cert_file="/etc/mefor/http.crt", tls_key_file="/etc/mefor/http.key",
+             max_messages_per_second=25, message_burst=100),
+        router="acme_orders_router", content_type=ContentType.JSON)
 
 
 @router("acme_orders_router")
@@ -898,7 +925,7 @@ poll/write shape against a remote server, selected by an internal `protocol` set
 | `poll_seconds` | in | `5.0` | poll interval |
 | `min_age_seconds` | in | `0.0` | **accepted but not honoured on a remote source today** — the connector never reads it (a remote directory listing carries no reliable mtime). Only `File(...)` implements it; use `after_read`/the partner's own write-then-rename to avoid partial reads. |
 | `after_read` | in | `move` | `move` (→ `processed_subdir`), `delete`, or `leave` (process **in place**, #142 — a durable dedup ledger keyed on a hash of the **full remote path** + size ensures a left file is ingested once) |
-| `max_file_bytes` | in | `16 MiB` | move a file larger than this to `error_subdir` instead of retrieving it (OOM guard). `None`/`0` = unlimited. |
+| `max_file_bytes` | in | `16 MiB` | **charged twice, and the second charge is the one that binds.** Before the retrieve, against the size the **server reported** in its own directory listing — an over-size entry is moved to `error_subdir` without being read. Then **during** the retrieve, against the **bytes actually read**: the download streams in 1 MiB chunks and is cut off at the first byte past the budget, so a share that lists a small file and then delivers an arbitrarily large body is refused mid-transfer rather than buffered whole (BACKLOG #1191). Either refusal quarantines the file to `error_subdir` and logs it — never a silent drop, and never left in place to be re-pulled every poll. `None`/`0` = unlimited, in both charges. |
 | `validate_directory` | both | `false` | validate `remote_dir` **at startup** (#114): unreachable/unusable reports the connection **`failed`** (ADR 0031) instead of deferring to run time. The probe is a **listing** — it never creates. **Out:** the upload dir is then never `ensure_dir`ed either, on send or by `POST /connections/{name}/test`; an upload into a vanished dir fails **retryably** rather than dead-lettering on the partner's permanent no-such-dir. Left off (the default) the upload dir is still created on first send, but the creation is now logged as a `WARNING`. |
 | `processed_subdir` / `error_subdir` | in | `.processed` / `.error` | where read / failed files go |
 | `filename` | out | `{MSH-10}.hl7` | upload name (supports `{HL7-path}` placeholders, sanitized to a **single safe filename** exactly as `File(...)`) |
@@ -1020,7 +1047,7 @@ The Handler produces a **JSON-object** body; the connector binds its keys to the
 | `database` | — | database name — **required** for `dialect="sqlserver"`; optional for `"generic"` |
 | `statement` | — (required) | parameterized SQL / proc call with `:name` placeholders, e.g. `INSERT INTO obs (mrn, val) VALUES (:mrn, :val)` |
 | `dialect` | `sqlserver` | `sqlserver` preset · `generic` ODBC (see [*Generic ODBC*](#generic-odbc-postgresql--oracle--mysql)) |
-| `auth` | `sql` | `sql` · `integrated` (Windows) · `entra` (ActiveDirectoryDefault) — **SQL Server preset only** |
+| `auth` | `sql` | `sql` · `integrated` (Windows) · `entra` (ActiveDirectoryDefault) — **SQL Server preset only**. On `dialect="generic"` this setting is **not read at all**: that arm emits `username`/`password` under `odbc_user_key`/`odbc_password_key`, so writing `auth="integrated"` there still produces a static login. `messagefoundry check`'s advisory `static-db-credentials` line names every DATABASE hop on an unchanging credential (ASVS 13.2.1), including that case — see [*Static database credentials*](#static-database-credentials) |
 | `username` / `password` | — | SQL-auth credentials (`password` is a **secret** — via `env()`) |
 | `port` | `1433` | server port |
 | `encrypt` | `true` | TLS to the DB (**SQL Server preset only** — see the generic-ODBC note below). `false` is a weakened hop and is **refused at construction**; `MEFOR_ALLOW_INSECURE_TLS` relaxes it **only while `[security].enforcement` is not `enforce`** — the escape is **clamped** (#200, ADR 0092 decision 2) and is **inert on the shipped default** |
@@ -1117,6 +1144,39 @@ The DSN is built as `DRIVER={odbc_driver};SERVER=<server>;[DATABASE={database};]
 > **out of scope** (dep-heavy) — the generic path is ODBC-only. The `test_connection` reachability probe
 > runs `SELECT 1` (works on PostgreSQL / MySQL / SQL Server; Oracle needs `SELECT 1 FROM DUAL`, so its
 > probe reports an error even though delivery works). Read-only `db_lookup` (ADR 0010) stays SQL-Server-only.
+
+#### Static database credentials
+
+ASVS 13.2.1 asks that a backend hop authenticate with an individual service account, a short-term token
+or a certificate rather than an unchanging credential. On SQL Server that means `auth="integrated"` (a
+gMSA or Windows machine principal) or `auth="entra"`; `auth="sql"`, the shipped default, is a static
+username and password.
+
+`messagefoundry check` prints an advisory **`static-db-credentials`** line naming every declared database
+hop that presents an unchanging credential, with its peer. It is an **inventory, not a gate** — it
+refuses nothing and blocks nothing. A named hop may be entirely legitimate, and a site whose database
+offers no managed-identity mode has no compliant option to move to.
+
+It covers **four** factories, because four of them dial a database with a credential:
+
+| Factory | Table | Reported as |
+|---------|-------|-------------|
+| `Database(...)` | outbound | `<name>` |
+| `DatabasePoll(...)` | inbound | `inbound:<name>` |
+| `DatabaseLookup(...)` | `db_lookup` read pool (ADR 0010) | `db_lookup:<name>` |
+| `DatabaseRef(...)` | reference source (ADR 0006) | `reference:<name>` |
+
+> **`[store].require_managed_identity` does NOT cover any of them.** That flag is a `StoreSettings`
+> method, so it reads the `[store]` service settings and nothing else — no connector, lookup or
+> reference hop is within its reach. Its name reads as though it governs the engine's whole database
+> posture; it governs the store hop. See
+> [`docs/CONFIGURATION.md`](CONFIGURATION.md) for the flag and
+> [`docs/SECURITY.md`](SECURITY.md) for the delegation boundary.
+
+One case is deliberately **not** reported: a `dialect="generic"` hop that sets no top-level
+`username`/`password`. A credential may still ride in `odbc_params` under an arbitrary driver keyword,
+and the engine cannot enumerate an arbitrary driver's keywords — the same limit the generic-ODBC TLS
+note above records. Classifying it would be guessing, and a guess belongs in no security report.
 
 ```python
 from messagefoundry import outbound, Database, env
@@ -1585,7 +1645,7 @@ assertion, exchanges it at the **token endpoint**, caches the bearer with expiry
 | `client_id` | — (required) | the registered client id (`iss`/`sub` of the assertion; `env()`) |
 | `private_key` | — (required) | the assertion signing key as inline PEM (via `env()`) or a PEM file path |
 | `algorithm` | `RS384` | `RS384` (RSA) or `ES384` (ECDSA P-384) — the two SMART **SHALL**-support algorithms |
-| `scope` | `None` | the requested scopes, e.g. `system/*.rs` (SMART v2 system scopes — no human) |
+| `scope` | `None` | the requested scopes, e.g. `system/Patient.c` (SMART v2 system scopes — no human). Request the least the connection can work with — see *Least scope* below |
 | `key_id` | `None` | the JWT `kid` → the public key registered with the server (for rotation) |
 | `audience` | = `token_url` | the assertion `aud`, if the server documents a different audience |
 | `private_key_password` | `None` | passphrase for an encrypted key (secret — use `env()`) |
@@ -1600,12 +1660,39 @@ outbound("FHIR-OUT_EPIC", with_smart_backend(
     FHIR(url=env("epic_fhir_base"), interaction="create"),
     token_url=env("epic_token_url"),     # add this host to [egress].allowed_http too
     client_id=env("epic_client_id"),
-    scope="system/*.rs",
+    scope="system/Patient.c",            # ONLY what this feed writes — see below
     private_key=env("epic_smart_key"),   # inline PEM via env(), or a PEM file path
     algorithm="RS384",
     key_id="epic-2026",
 ))
 ```
+
+**Least scope.** A SMART v2 scope is `system/<ResourceType>.<letters>`, where the letters are `c` create,
+`r` read, `u` update, `d` delete and `s` search. Ask for the ones this connection actually spends and no
+more (ASVS 10.2.3):
+
+A `conditional=` knob **overrides** `interaction` — it decides the HTTP method on its own, so read this
+table top to bottom and take the first row that matches:
+
+| the connection you declared | the letters it can use |
+|---|---|
+| `conditional="conditional-update"` | `u`, `s` — a search-based `PUT` |
+| `conditional="if-none-exist"` | `c`, `s` — a `POST` the server searches for first |
+| `conditional="if-match"` | `u` — a version-aware `PUT`, no search |
+| `interaction="create"` (no conditional) | `c` |
+| `interaction="update"` (no conditional) | `u` |
+| `FhirLookup(...)` (structurally GET-only) | `r`, `s` |
+| `interaction="transaction"`/`"batch"` | the Bundle decides, so no fixed set |
+
+`interaction` defaults to `"create"`, so a connection declaring only `conditional="conditional-update"`
+issues `PUT` and needs `u` — not the `c` the interaction name suggests.
+
+The **resource** half is yours to choose: the outbound reads the resourceType from each outgoing message,
+so name the type the feed writes rather than `*`. `messagefoundry check` prints an advisory `smart-scope`
+line naming any connection that requests letters its declared interaction cannot spend. It **never
+blocks**: your authorization server registers the scopes it will grant, and a refusal computed here could
+take a working feed offline. It also stays quiet when a request is too *narrow* — that is a correctness
+question, and asking for a letter the server never registered fails the token request outright.
 
 Put **every** secret in `env()` (`token_url`/`client_id`/`private_key`/`private_key_password`); the minted
 access token and `client_assertion` are runtime-only — never logged or persisted. (The signing key comes
