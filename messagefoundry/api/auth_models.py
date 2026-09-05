@@ -1,10 +1,19 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 MessageFoundry Organization and contributors
-"""Pydantic request/response models for the auth + user-administration endpoints."""
+"""Pydantic request/response models for the auth + user-administration endpoints.
+
+A model the API parses out of a REQUEST BODY subclasses
+:class:`~messagefoundry.api.request_model.RequestModel`, which refuses unknown keys; a response
+model stays on ``BaseModel`` so a client reading a newer engine tolerates a field it has not learned
+yet. That module states the split and why it is directional -- read it before moving a class between
+the two bases.
+"""
 
 from __future__ import annotations
 
 from pydantic import BaseModel, Field
+
+from messagefoundry.api.request_model import RequestModel
 
 # Upper bounds on free-text request fields (API-INPUT): reject absurd inputs before they reach the
 # store or argon2. Generous vs any legitimate value; the password cap also bounds argon2 work.
@@ -13,7 +22,7 @@ _PASSWORD_MAX = 1024
 _GROUP_MAX = 512
 
 
-class LoginRequest(BaseModel):
+class LoginRequest(RequestModel):
     username: str = Field(max_length=_NAME_MAX)
     password: str = Field(max_length=_PASSWORD_MAX)
     provider: str = Field("local", max_length=16)  # 'local' | 'ad'
@@ -80,13 +89,13 @@ class UserPermissions(BaseModel):
     permissions: list[str]
 
 
-class ChannelScope(BaseModel):
+class ChannelScope(RequestModel):
     """A user's per-channel RBAC scope. ``None`` = all channels; a list = exactly those connections."""
 
     channels: list[str] | None = Field(default=None, max_length=512)
 
 
-class UserCreateRequest(BaseModel):
+class UserCreateRequest(RequestModel):
     username: str = Field(max_length=_NAME_MAX)
     password: str = Field(max_length=_PASSWORD_MAX)
     display_name: str | None = Field(default=None, max_length=_NAME_MAX)
@@ -94,22 +103,22 @@ class UserCreateRequest(BaseModel):
     roles: list[str] = Field(default=[], max_length=64)
 
 
-class UserUpdateRequest(BaseModel):
+class UserUpdateRequest(RequestModel):
     display_name: str | None = Field(default=None, max_length=_NAME_MAX)
     email: str | None = Field(default=None, max_length=_NAME_MAX)
     disabled: bool | None = None
 
 
-class RolesUpdateRequest(BaseModel):
+class RolesUpdateRequest(RequestModel):
     roles: list[str] = Field(max_length=64)
 
 
-class PasswordChangeRequest(BaseModel):
+class PasswordChangeRequest(RequestModel):
     current_password: str = Field(max_length=_PASSWORD_MAX)
     new_password: str = Field(max_length=_PASSWORD_MAX)
 
 
-class ReauthRequest(BaseModel):
+class ReauthRequest(RequestModel):
     """Step-up re-verification (ASVS 7.5.3): the caller re-supplies their current credential to refresh
     the session's step-up window before a highly sensitive operation."""
 
@@ -132,7 +141,7 @@ class PasswordResetResponse(BaseModel):
 # --- MFA: native TOTP second factor (WP-14, ASVS 6.3.3) ----------------------
 
 
-class MfaVerifyRequest(BaseModel):
+class MfaVerifyRequest(RequestModel):
     """Satisfy a session's second factor with a TOTP code **or** a single-use recovery code."""
 
     code: str = Field(max_length=64)
@@ -146,7 +155,7 @@ class MfaEnrollResponse(BaseModel):
     otpauth_uri: str
 
 
-class MfaConfirmRequest(BaseModel):
+class MfaConfirmRequest(RequestModel):
     """Confirm a staged enrollment by proving a live TOTP code from the authenticator app."""
 
     code: str = Field(max_length=16)
@@ -182,7 +191,7 @@ class RoleInfo(BaseModel):
     builtin: bool = True
 
 
-class CustomRoleRequest(BaseModel):
+class CustomRoleRequest(RequestModel):
     """Create/update an admin-defined custom role (ADR 0045): a named SUBSET of the existing Permission
     catalog. The engine validates the subset (recognized perms only, non-empty, no carved-out
     escalation primitive) and rejects otherwise."""
@@ -199,23 +208,23 @@ class CustomRoleInfo(BaseModel):
     permissions: list[str]
 
 
-class AdGroupMapEntry(BaseModel):
+class AdGroupMapEntry(RequestModel):
     ad_group: str = Field(max_length=_GROUP_MAX)
     role: str = Field(max_length=64)
 
 
-class AdGroupMap(BaseModel):
+class AdGroupMap(RequestModel):
     entries: list[AdGroupMapEntry]
 
 
-class AdGroupScopeEntry(BaseModel):
+class AdGroupScopeEntry(RequestModel):
     """Maps an AD group to one allowed channel; channel ``*`` = all channels (per-channel RBAC C3)."""
 
     ad_group: str = Field(max_length=_GROUP_MAX)
     channel: str = Field(max_length=_NAME_MAX)
 
 
-class AdGroupScopeMap(BaseModel):
+class AdGroupScopeMap(RequestModel):
     entries: list[AdGroupScopeEntry]
 
 
