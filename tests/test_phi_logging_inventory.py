@@ -87,6 +87,11 @@ _RETIRED_CLAIMS = (
     "two handler filters",
     "same two handler filters",
     "[ai].production",
+    # BACKLOG #1184 (ASVS 14.2.1): PHI.md described the search needle as riding the query string and
+    # its removal as future work. Both names are gone from every GET signature; see PHI.md §7 for
+    # what survives. Retiring the wording, not the residual.
+    "takes the needle as a QUERY PARAMETER",
+    "search needle out of the URL is tracked separately",
 )
 
 

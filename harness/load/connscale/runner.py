@@ -1249,7 +1249,14 @@ def _empty_claims_per_msg(total_per_s: float, achieved_read_per_s: float) -> flo
 
 def _throughput_rates(samples: list[EngineSample]) -> tuple[float, float]:
     """Achieved (read/s, written/s) over the window, first→last sample (same span as the empty-claim
-    rates), so both arms are measured identically for the A/B non-regression guard."""
+    rates), so both arms are measured identically for the A/B non-regression guard.
+
+    That span is the hold PLUS the step's post-drain tail, not the hold alone; it is defined once, in
+    :func:`_empty_claim_rates`, and this docstring points there rather than restating it (BACKLOG
+    #1420). ``achieved_read_per_s`` is the DENOMINATOR of :func:`_empty_claims_per_msg`, so the two
+    must be read over the same window for the span to cancel -- which is why this reads ``samples[-1]``
+    rather than the last in-hold sample.
+    """
     if len(samples) < 2:
         return 0.0, 0.0
     first, last = samples[0], samples[-1]
