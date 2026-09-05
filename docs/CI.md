@@ -19,7 +19,6 @@ claims move with it.
 | `ci.yml` | Lint (`ruff check` + `ruff format --check`), types (`mypy --strict`, plus a `--platform win32` pass on Linux so Windows type-branches are checked), and the `pytest` suite across **ubuntu-latest**, **windows-2022**, and **windows-2025** (Python 3.14). Also builds the VS Code extension (`ide/`). A `CI gate` job rolls the legs up. |
 | `security.yml` | Static and supply-chain security: `bandit` (Python SAST), `semgrep`, `pip-audit` and `npm-audit` against the hash-locked tree, `gitleaks` (secret scan), `forbidden-content` (customer/PHI leak guard), a crypto-inventory check, an SBOM build, and a `trivy` scan. A **daily cron** re-runs the dependency audits so a CVE filed against an unchanged pin is caught within ~24h. A separate `released-line-audit` job runs on the same cron and audits the **latest release tag's** pinned core runtime, which the daily audits do not cover — they read the checked-out tree, so between a fix landing on `main` and a release carrying it the two answers differ. Hard-failing but **not** a required check (schedule/dispatch only), the same posture as `dast.yml`. |
 | `codeql.yml` | GitHub CodeQL analysis (python / javascript-typescript). Advisory — **not** required checks. |
-| `review-gate.yml` | Blocks a merge until a reviewer marks the PR read with the `reviewed` label. A **required check**, and — with approvals pinned at 0 — the repository's only review control. It removes the label on `synchronize`, so new commits are unread again; that is the one thing it writes, and it only ever writes toward blocked. |
 | `scorecard.yml` | OpenSSF Scorecard analysis. |
 | `cla.yml` | CLA Assistant — records the Contributor License Agreement signature on each PR. |
 | `zizmor.yml` | Lints the workflow files themselves for insecure patterns (template injection, over-broad tokens), and runs `actionlint` on the workflow syntax. Hard-fails, but **not a required check** — it is paths-filtered, so it does not report on a PR that touches no workflow, and requiring it would wedge every such PR. The `actionlint` pre-commit hook is the local half. |
@@ -51,7 +50,6 @@ The stable contexts required on `main` are — mirroring
 - `forbidden-content (customer/PHI leak guard)`
 - `a PR that implements BACKLOG #N must update BACKLOG.md`
 - `cla`
-- `a reviewer has read this`
 
 `cla` is the **job key** in `cla.yml`, whose job declares no `name:`. Branch protection
 matches the job name, never the workflow name — so the context is `cla`, not "CLA Assistant". Every
@@ -69,12 +67,49 @@ the same reason and additionally **does not run on PRs at all** (`scorecard.yml`
 trigger — it runs on push-to-main, a schedule, and branch-protection changes). Nightly / path-gated
 legs (service-smoke, load, SQL/Postgres store) are deliberately **not** required.
 
-`a reviewer has read this` (`review-gate.yml`) is the required check that is **not a test of the code**,
-and the one with nothing behind it. `required_approving_review_count` is 0 and stays 0 — every session
-pushes as one GitHub identity, so a human-approval rule would wedge every PR rather than review any —
-which makes this single context the repository's whole review requirement. A PR clears it with
-`gh pr edit <N> --add-label reviewed`; a new commit removes the label, so re-review is automatic. It
-proves a **step happened**, not that an independent party looked.
+`a reviewer has read this` (`review-gate.yml`) was **retired by the owner on 2026-09-04**. The context
+came off branch protection and the workflow was **deleted** in the same change, so nothing posts that
+check any more and **a PR needs no `reviewed` label to land**. Read the live set from the server rather
+than from any prose, here or elsewhere:
+
+```powershell
+gh api repos/MEFORORG/MessageFoundry/branches/main/protection --jq '.required_status_checks.contexts[]'
+```
+
+The same endpoint read the settings that decide a merge, on 2026-09-04:
+
+```powershell
+gh api repos/MEFORORG/MessageFoundry/branches/main/protection --jq '{n: (.required_status_checks.contexts|length), strict: .required_status_checks.strict, enforce_admins: .enforce_admins.enabled, approvals: .required_pull_request_reviews.required_approving_review_count}'
+```
+
+It returned `{"approvals":0,"enforce_admins":true,"n":13,"strict":true}`. `strict` and `enforce_admins`
+did not move; the review context is simply not among what is required.
+
+**Read what that leaves, because the two halves were always separate.** `required_approving_review_count`
+is 0 and stays 0 -- every session pushes as one GitHub identity, so a human-approval rule would wedge
+every PR rather than review any. With the label context retired as well, **no automated control now
+requires that any change be read before it merges.** That is a deliberate owner decision, recorded here
+rather than inferred; it is not a gap to be quietly closed by re-arming the context. Re-arming it is an
+owner decision too.
+
+Worth keeping in view if it is ever reconsidered: the label is applied by hand, commonly by the PR's own
+author, so the check proved a **step happened**, not that an independent party looked. Two further
+findings the gate produced outlive it, because neither was about that one workflow. It failed **stale
+rather than closed** -- a run reported SUCCESS from a webhook payload snapshotted before the label was
+stripped, so PR 724 carried the context green with no `reviewed` label for 10 minutes on 2026-09-01,
+and `strict: true` is what stopped it merging (BACKLOG #1417; any gate reading `github.event.*`
+inherits the same skew). And **nothing ever told a reviewer a pull request was waiting**, measured as
+zero hits for each of `requested_reviewers`, `review_requested`, `pull_request_review`, `--reviewer`
+and `gh pr review` across the workflow directory, against a `runs-on` positive control that hit every
+file (BACKLOG #1413).
+
+**The `reviewed` label still exists, and one workflow still keys on it.** With `review-gate.yml` gone,
+nothing adds or removes the label -- labels already sitting on open PRs are inert leftovers, and the
+`synchronize` strip is gone with the workflow that did it. `unread-signal.yml` and
+`scripts/ci/check_unread_prs.py` still comment on and label an otherwise-mergeable PR that carries no
+`reviewed` label, so **that signal now reports against a standard nothing enforces**. It is left
+running deliberately rather than by oversight: retiring a shipped feature is a product decision the
+owner has not made.
 
 The `quality-advisory.yml` jobs create **no code-scanning category** and **no _required_ check context** —
 they do report as ordinary advisory checks, and they **must never be added to the required list**. Two

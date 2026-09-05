@@ -403,72 +403,97 @@ deliberately hostile ambient (PYTHONIOENCODING=cp1252, PYTHONUTF8=0, LC_ALL=tr_T
 core.autocrlf, and PATH ordered so the WSL bash comes first).
 """
 
-# --- review-gate.yml -------------------------------------------------------------------------------
-
-[[control]]
-context = "a reviewer has read this"
-plants = """
-Six label sets that are not a review -- none at all, unrelated ones, and four NEAR-MISSES
-(`reviewed-by-bot`, `not-reviewed`, `Reviewed`, `re,viewed`) -- plus the stale payload: a `synchronize`
-whose event still carries `reviewed` because the removal step ran one step ago. The gate's OWN shell is
-lifted out of the workflow and run under the flags Actions uses, not re-implemented; a second copy of
-that `case` would be free to agree with itself. Four structural plants sit beside them, because the
-quieter death of this gate is the context never arriving or never clearing: a renamed job, a job-level
-`if:`, a trigger set that cannot report on a pull request or in the merge queue, and a `types:` list
-that does not re-run the job when the reviewer adds the label.
-"""
-red = [
-  "tests/test_merge_gate_controls.py::test_the_review_gate_refuses_a_pull_request_nobody_has_marked_read",
-  "tests/test_merge_gate_controls.py::test_the_review_gate_refuses_a_synchronize_even_when_the_payload_shows_the_label",
-  "tests/test_merge_gate_controls.py::test_the_review_gate_still_reports_under_the_required_context_string",
-  "tests/test_merge_gate_controls.py::test_nothing_in_the_review_gate_adds_the_label_it_checks_for",
-  "tests/test_merge_gate_controls.py::test_the_review_gate_reruns_when_a_reviewer_adds_the_label",
-]
-holds = """
-A labelled pull request must PASS, in every position the token can occupy in the joined label list --
-first, last, middle and alone. A gate that refused uniformly would satisfy every planted case above
-while wedging every pull request in the repository, permanently, because `strict = true` means a
-blocked pull request cannot even be brought up to date past it. The merge queue is the other half: a
-merge_group entry carries no pull request and therefore no labels, so the label-reading step must stay
-confined to pull_request events -- a required context that can never go green in the queue means
-NOTHING MERGES, which codeql.yml's header records happening here. The trigger list has the same shape
-of asymmetry: every action the gate depends on must be named individually when it is dropped, while a
-list that only ADDS actions must stay clean.
-"""
-green = [
-  "tests/test_merge_gate_controls.py::test_the_review_gate_passes_a_pull_request_a_reviewer_has_marked_read",
-  "tests/test_merge_gate_controls.py::test_the_review_gate_lets_a_merge_queue_entry_through",
-  "tests/test_merge_gate_controls.py::test_the_absence_detector_fires_on_a_trigger_set_that_can_go_quiet",
-  "tests/test_merge_gate_controls.py::test_the_label_rerun_detector_fires_on_a_types_list_that_ignores_the_label",
-]
-observed = """
-RUN AGAINST A NEUTERED GATE, 2026-08-31, and the result is SPECIFIC rather than uniform, which is the
-part that makes it evidence. Two separate neuterings of review-gate.yml, each reverted from the same
-run:
-
-  * the `*,reviewed,*)` case arm widened to `*)`, so the gate can never refuse -- 1 of the 11 selected
-    controls red, 10 green.
-  * the synchronize comparison changed to a value that never occurs
-    (`[ "$ACTION" = "never-happens" ]`), which leaves the gate reading a payload that is stale by one
-    step -- 1 red, 10 green, and the one that reddened is the stale-payload control specifically.
-
-A THIRD SPELLING OF THE SAME NEUTERING IS REPORTED AS A HARNESS FAULT, DELIBERATELY. Replacing the
-test with `if false` removes `$ACTION` from the script, and the fixture refuses to run a script that
-ignores the input it is being fed -- three ERRORS rather than three passes. A control that fed input to
-a script which cannot read it would be green about nothing (BACKLOG #1216).
-
-The gate has also been seen red in ordinary use: arming the context on 2026-08-31 turned every open
-pull request red on this one check until a reviewer labelled it.
-
-A THIRD NEUTERING WAS FOUND BY IT SURVIVING, 2026-08-31, which is the only reason it is written down.
-Deleting `labeled` from review-gate.yml's `types:` list reddened NOTHING -- 65 tests passed with the
-gate made permanently unclearable, because the absence detector reads `pull_request`, `merge_group` and
-`paths` and never looked at `types`. With the trigger-list control added, the same edit reds exactly
-ONE test by name -- test_the_review_gate_reruns_when_a_reviewer_adds_the_label -- and 62 pass. Exactly
-one, not two: the detector's own control uses literal trigger lists rather than subtracting from the
-shipped file, so it does not move with the workflow it judges and cannot bury the naming red under a
-second one that is only bookkeeping.
-"""
+# --- review-gate.yml: RETIRED 2026-09-04. THE TABLE IS GONE; THE EVIDENCE IS NOT. -------------------
+#
+# WHAT CHANGED. The owner retired the review requirement on 2026-09-04. `a reviewer has read this` was
+# removed from MEFORORG/MessageFoundry's `main` branch protection -- fourteen required contexts became
+# thirteen, `strict` and `enforce_admins` unchanged -- read back with
+#   gh api repos/MEFORORG/MessageFoundry/branches/main/protection --jq '.required_status_checks.contexts[]'
+# and `.github/workflows/review-gate.yml` was deleted in the same pull request.
+#
+# WHY THE TABLE HAD TO GO RATHER THAN BE MARKED RETIRED IN PLACE. It was a LIVE assertion in two
+# directions and both now fail: `reconcile()` rejects a control whose context is not in
+# `.github/required-contexts.txt`, and `unresolved_nodes()` rejects node ids naming tests that no
+# longer exist. A retired control left as data would redden the suite while proving nothing.
+#
+# WHY THE PROSE STAYS. This file is a ledger of controls that failed to catch things, and that record
+# does not expire with its subject. The third finding below is the reason the rest is worth the lines:
+# it is a fact about DETECTOR SHAPE, not about review-gate.yml. An absence detector that reads
+# `pull_request`, `merge_group` and `paths` and never reads `types` is blind to a trigger ACTION being
+# dropped, whatever workflow it is pointed at. Whoever writes the next absence detector needs that.
+#
+# THE RETIRED ENTRY, verbatim. context = "a reviewer has read this".
+#
+# plants:
+#   Six label sets that are not a review -- none at all, unrelated ones, and four NEAR-MISSES
+#   (`reviewed-by-bot`, `not-reviewed`, `Reviewed`, `re,viewed`) -- plus the stale payload: a
+#   `synchronize` whose event still carries `reviewed` because the removal step ran one step ago. The
+#   gate's OWN shell is lifted out of the workflow and run under the flags Actions uses, not
+#   re-implemented; a second copy of that `case` would be free to agree with itself. Four structural
+#   plants sit beside them, because the quieter death of this gate is the context never arriving or
+#   never clearing: a renamed job, a job-level `if:`, a trigger set that cannot report on a pull
+#   request or in the merge queue, and a `types:` list that does not re-run the job when the reviewer
+#   adds the label.
+#
+# holds:
+#   A labelled pull request must PASS, in every position the token can occupy in the joined label list
+#   -- first, last, middle and alone. A gate that refused uniformly would satisfy every planted case
+#   above while wedging every pull request in the repository, permanently, because `strict = true`
+#   means a blocked pull request cannot even be brought up to date past it. The merge queue is the
+#   other half: a merge_group entry carries no pull request and therefore no labels, so the
+#   label-reading step must stay confined to pull_request events -- a required context that can never
+#   go green in the queue means NOTHING MERGES, which codeql.yml's header records happening here. The
+#   trigger list has the same shape of asymmetry: every action the gate depends on must be named
+#   individually when it is dropped, while a list that only ADDS actions must stay clean.
+#
+# observed:
+#   RUN AGAINST A NEUTERED GATE, 2026-08-31, and the result is SPECIFIC rather than uniform, which is
+#   the part that makes it evidence. Two separate neuterings of review-gate.yml, each reverted from the
+#   same run:
+#
+#     * the `*,reviewed,*)` case arm widened to `*)`, so the gate can never refuse -- 1 of the 11
+#       selected controls red, 10 green.
+#     * the synchronize comparison changed to a value that never occurs
+#       (`[ "$ACTION" = "never-happens" ]`), which leaves the gate reading a payload that is stale by
+#       one step -- 1 red, 10 green, and the one that reddened is the stale-payload control
+#       specifically.
+#
+#   A THIRD SPELLING OF THE SAME NEUTERING IS REPORTED AS A HARNESS FAULT, DELIBERATELY. Replacing the
+#   test with `if false` removes `$ACTION` from the script, and the fixture refuses to run a script
+#   that ignores the input it is being fed -- three ERRORS rather than three passes. A control that fed
+#   input to a script which cannot read it would be green about nothing (BACKLOG #1216).
+#
+#   The gate has also been seen red in ordinary use: arming the context on 2026-08-31 turned every open
+#   pull request red on this one check until a reviewer labelled it.
+#
+#   A THIRD NEUTERING WAS FOUND BY IT SURVIVING, 2026-08-31, which is the only reason it is written
+#   down. Deleting `labeled` from review-gate.yml's `types:` list reddened NOTHING -- 65 tests passed
+#   with the gate made permanently unclearable, because the absence detector reads `pull_request`,
+#   `merge_group` and `paths` and never looked at `types`. With the trigger-list control added, the
+#   same edit reds exactly ONE test by name --
+#   test_the_review_gate_reruns_when_a_reviewer_adds_the_label -- and 62 pass. Exactly one, not two:
+#   the detector's own control uses literal trigger lists rather than subtracting from the shipped
+#   file, so it does not move with the workflow it judges and cannot bury the naming red under a
+#   second one that is only bookkeeping.
+#
+# THE FIVE `red` AND FOUR `green` NODE IDS IT NAMED, all in tests/test_merge_gate_controls.py. Eight
+# went with the gate; ONE SURVIVES and is marked below, because it judges a trigger set generically
+# rather than review-gate.yml specifically. Recorded so a reader who finds one of these names quoted
+# elsewhere can tell "renamed" from "retired":
+#   red:   test_the_review_gate_refuses_a_pull_request_nobody_has_marked_read
+#          test_the_review_gate_refuses_a_synchronize_even_when_the_payload_shows_the_label
+#          test_the_review_gate_still_reports_under_the_required_context_string
+#          test_nothing_in_the_review_gate_adds_the_label_it_checks_for
+#          test_the_review_gate_reruns_when_a_reviewer_adds_the_label
+#   green: test_the_review_gate_passes_a_pull_request_a_reviewer_has_marked_read
+#          test_the_review_gate_lets_a_merge_queue_entry_through
+#          test_the_absence_detector_fires_on_a_trigger_set_that_can_go_quiet  <-- KEPT
+#          test_the_label_rerun_detector_fires_on_a_types_list_that_ignores_the_label
+#
+# ONE THING THE RETIREMENT DID NOT SETTLE, flagged rather than acted on. `.github/workflows/
+# unread-signal.yml` and `scripts/ci/check_unread_prs.py` still key on the `reviewed` label. They now
+# report on a signal nothing enforces. Deleting a feature is the owner's call, so that cluster is left
+# working and untouched here.
 
 # --- codeql.yml: NO ENTRY, BECAUSE ITS CONTEXTS ARE NOT REQUIRED -----------------------------------
 #
