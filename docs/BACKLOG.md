@@ -64,6 +64,8 @@ commit, and that mismatch is invisible at allocation time. **A number is allocat
 commit it, in that seat's own worktree, and never handed over** -- `alloc.ps1` carries no transfer verb by
 design ("holes are free, collisions are not"), and the missing transfer path is itself filed as **#1414**.
 
+**#1422's own subject was re-filed at #1423**, with its text unchanged, from the worktree that would commit it.
+
 **If you allocated a backlog number before 2026-07-31T00:31Z, re-check it — the trigger is the
 timestamp, not the value.** That is when the floor fix landed. Any number issued before it came from a
 floor that could not see most of the namespace, so it is suspect **regardless of how low or high it
@@ -22014,6 +22016,76 @@ That is the same `self._lock` the staged-pipeline handoffs take. On a first depl
 **LIMB SHIPPED 2026-09-03.** The section 5 amendment now carries both questions, all eight options and both owner answers quoted, and keeps the PR 749 comment as provenance. The comment stays where it is; the ADR no longer depends on it.
 
 **THE GENERAL PROBLEM, stated once so it is not re-derived per incident.** A decision recorded as an outcome plus a delegation is not reviewable. The inputs -- the question, the options, the answer -- are what let a later reader tell a considered call from an arbitrary one, and they are exactly the part that lives in the least durable place.
+
+## 1423. The review gate passes green with no reviewed label: a queued synchronize run strips the label after the reviewer applies it, and the labeled run then reads a stale payload
+
+> 🚧 **Filed 2026-09-03 -- the fix is in the pull request that files this row.** `a reviewer has read this` is a required status check on `main`, and with `required_approving_review_count` at 0 it is this repository's entire automated review requirement. **It reported SUCCESS on pull request 765 while that pull request carried zero labels.** The workflow now reads the label set live from the API instead of out of the frozen webhook payload, and BLOCKS when that read fails.
+>
+> **Scored 2026-09-03 -> P2.** Value **7/10** · Difficulty **3/10** · _quick win_. Value 7 rather than #1417's 6, on one fact #1417 does not carry: the correction a reader would assume exists does not fire, so a false green stands until a person notices it. Difficulty 3, which is what #1417 predicted: the workflow edit is small and the cost was the control harness, welded to a `$LABELS` env contract and needing a `gh` stand-in on PATH.
+> Verdict: build
+> Research: none
+> Closing-act: code
+
+**Cluster:** CI gates / merge protection. **Priority:** P2. **Verdict:** build.
+**Severity:** no engine effect, no PHI axis, and **no deployment axis (sec. 0)** -- nothing here reaches shipped code. What it reaches is this repository's own merge control, so the cost is an unreviewed change landing on `main`. **It does not mean past merges were unreviewed.** The race needs a specific ordering, and #1417's replay over the last 25 merged pull requests found every deciding run created after its last `reviewed` event.
+
+**RELATIONSHIP TO #1417, STATED FIRST so the two are not read as one finding counted twice.** #1417 filed this defect on pull request 724 and worked out the detection rule; its remedy list already names reading the labels live as one of two options. This row is a second, independent instance on pull request 765, it takes that option, and it adds one fact #1417 does not have. **Whether #1417 closes alongside this is the Lander's call, not this row's.**
+
+### The measurement, pull request 765, 2026-09-03
+
+Every timestamp below is a quoted API value from the runs, jobs and issue-timeline endpoints, on head `ee2e7ec2423a73fd385d2afa27733ca050058cba`.
+
+| time (UTC) | event |
+|---|---|
+| 20:40:58Z | run `33803677823` created by a Builder's `synchronize` push |
+| 20:43:19Z | `wshallwshall` applies `reviewed` |
+| 20:43:24Z | run `33803911587` created by that `labeled` event -- **its payload records the label as PRESENT** |
+| 20:45:10Z | the `synchronize` run's job finally starts, four minutes after creation |
+| 20:45:11-20:45:15Z | its step 3 removes the label; `github-actions[bot]` unlabels at 20:45:14Z |
+| 20:45:16Z | that run concludes FAILURE (check-run `100808902697`) |
+| 20:49:34Z | the `labeled` run's job starts, **six minutes** after creation |
+| 20:49:37Z | it reads its own 20:43:24 payload, finds `reviewed`, and concludes **SUCCESS** (check-run `100809679433`) |
+| 20:49:37-20:52:55Z | pull request 765 carries `a reviewer has read this` = success **with zero labels** |
+| 20:52:55Z | a person re-applies the label by hand, which creates a run whose payload is honest |
+
+The success is the newer check-run on the head, so it is the one branch protection reads.
+
+### The mechanism
+
+1. A push fires `synchronize`. That run is queued, here for four minutes.
+2. A reviewer, seeing a red gate, applies the label. That fires a `labeled` run whose payload captures the label as present.
+3. The queued `synchronize` run starts and deletes the label. Correct in isolation -- that removal is the whole re-review mechanism and must stay.
+4. The `labeled` run then evaluates its OWN payload, now stale by minutes, sees a label that no longer exists, and passes.
+
+**THE PAYLOAD IS A SNAPSHOT AND THE VERDICT IS NOT.** Those are two clocks, and the gate was reading the older one.
+
+### And nothing corrects it, which is why the payload read had to go
+
+The workflow header used to claim `unlabeled` was *"the opposite half"* that stops a withdrawn label leaving a green context. **That reasoning does not hold for this removal.** GitHub does not dispatch a workflow run from an event raised by the repository's own `GITHUB_TOKEN` -- `workflow_dispatch` and `repository_dispatch` are the documented exceptions, and a label event is neither. The removal runs `gh` under `github.token`, so its `unlabeled` event emits nothing.
+
+**Verified rather than inferred:** the workflow-runs API reports exactly **two** review-gate runs on that head, the two named above, and none for the 20:45:14Z removal. `unlabeled` therefore covers a **person** taking the label back, and nothing else. The header now says that.
+
+### What the fix does, and the three properties that constrain it
+
+The label-reading step now runs `gh pr view "$NUMBER" --json labels --jq '[.labels[].name] | join(",")'` and decides on the result. A gate must assert about the present.
+
+1. **It fails closed on a failed read.** `gh` absent, unauthenticated, rate-limited or answering with an error all BLOCK. A gate whose safe state depends on a network call succeeding is not a gate.
+2. **The `synchronize` removal stays.** Deleting the label on new commits is correct.
+3. **`synchronize` still fails by definition**, decided before any read rather than from a value it could race. Commits nobody has read are unread whatever a label says.
+
+The payload is still passed in, as a **diagnostic only**: when it and the live set disagree about `reviewed`, the log says so in words. Nothing branches on it. That line exists so the next reader is told the payload went stale instead of reconstructing it from three endpoints and two clocks.
+
+**THE OLD SHAPE WAS A ONE-ACTION SCREEN, and that is the generalisable lesson.** The workflow already knew the payload went stale -- its own comment said so -- and hard-coded a fix for the single action its author had an instance of, leaving every other action reading the same snapshot. A screen built from one case finds one shape.
+
+### What the fix does NOT do, said plainly
+
+**It narrows the window; it does not close it to zero.** A `labeled` run can still read a label that a `synchronize` run removes moments later, and its green then stands on a state that has just changed. The difference is the size: the payload read cost **minutes** of queue delay -- six, measured above -- while what remains is the gap between the API call and the job finishing, which is seconds. Claiming closure here would be the compensating control resting on a false premise that section 11 forbids.
+
+So the operational rule survives the fix rather than expiring with it. **For a BEHIND pull request: update-branch, WAIT for the resulting `synchronize` review-gate run to COMPLETE, then label, then merge.** Labelling while that run is still queued is what produced the false green above, and it is still the shape to avoid. Closing the residual entirely needs a different mechanism -- pinning the verdict to the head and the label event, which is #1417's rule (4) plus (5) -- and that is not built here.
+
+### Controls
+
+`tests/test_merge_gate_controls.py` lifts the step's own shell out of the workflow and runs it against a `gh` stand-in placed first on PATH, which records its own argv so a gate that stopped calling the API cannot be graded as though it had. Both directions are pinned: a stale payload showing `reviewed` over an empty live set must FAIL on every action the gate can see, a genuinely labelled pull request must PASS, and an unreadable label set must BLOCK. **The pre-fix form is run against the identical planted fixture and must go GREEN**, so the shipped refusal is measured against a form known to accept rather than merely asserted. `tests/negative_controls.toml` carries the registry rows.
 
 ## 1424. steer-inject.ps1 puts an unfolded file value inside a frame asserting the OWNER typed it
 

@@ -76,6 +76,11 @@ which makes this single context the repository's whole review requirement. A PR 
 `gh pr edit <N> --add-label reviewed`; a new commit removes the label, so re-review is automatic. It
 proves a **step happened**, not that an independent party looked.
 
+**Do not label a PR while a `synchronize` review-gate run is still queued.** That run removes the
+label when it finally executes, and the ordering has produced a green context on an unlabelled PR
+(BACKLOG #1423). For a PR that is BEHIND: update-branch, wait for that run to COMPLETE, then label,
+then merge.
+
 The `quality-advisory.yml` jobs create **no code-scanning category** and **no _required_ check context** —
 they do report as ordinary advisory checks, and they **must never be added to the required list**. Two
 things keep them advisory: they are absent from branch protection, and every analysis step is
