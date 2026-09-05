@@ -63,8 +63,8 @@ the marker survives a crash, a compaction, an account switch, and a respawn.
 
 ### 2.2 The cards: `docs/roles/<seat>.card.md`
 
-One tracked file per live seat. Six of them: Console, Builder, Reviewer, Regulator,
-Steward, Lander.
+One tracked file per live seat. Five of them: Console, Builder, Regulator, Steward,
+Lander. (Six at the time of writing; the Reviewer was retired on 2026-09-05.)
 
 Each card is capped at **150 lines and 6 KB**. Only one is ever injected, so the cost
 to a session is about 1,500 tokens against the 60 KB `CLAUDE.md` already loaded.
@@ -158,8 +158,9 @@ Set-Content .claude\seat 'builder'
 
 ## 4. The roster, and which document governs it
 
-Six seats: **Console, Builder, Reviewer, Regulator, Steward, Lander.** That list comes
-from section 5 of `CLAUDE.md`.
+Five seats: **Console, Builder, Regulator, Steward, Lander.** That list comes from section 5
+of `CLAUDE.md`. The Reviewer was a sixth until 2026-09-05, when the owner retired it with the
+`reviewed` label and the review gate.
 
 **The vault's `roles/README.md` disagrees, and it is the stale one.** Its table still
 lists Dispatcher, PM, Liaison, ASVS Tracker, Cleaner, Role manager and Process
@@ -184,7 +185,7 @@ so nobody goes looking for a longer version that does not exist.
 - **It does not replace the seat declaration.** `seat.ps1 -Declare` still carries the
   goal, which no machine can write. The marker carries the role, which one can.
 - **It does not compete with nested `CLAUDE.md` files.** Those scope by directory. A
-  Builder and a Reviewer editing the same folder need different rules, so directory
+  Builder and a Lander editing the same folder need different rules, so directory
   scoping cannot carry a seat.
 
 ---
@@ -252,7 +253,6 @@ already and must keep holding.
 | `docs/roles/seats.json` | The roster, the alias map, and the retired seats with reasons |
 | `docs/roles/console.card.md` | Role card, no vault playbook exists |
 | `docs/roles/builder.card.md` | Role card |
-| `docs/roles/reviewer.card.md` | Role card |
 | `docs/roles/regulator.card.md` | Role card, no vault playbook exists |
 | `docs/roles/steward.card.md` | Role card |
 | `docs/roles/lander.card.md` | Role card |

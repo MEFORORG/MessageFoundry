@@ -35,9 +35,9 @@ Declare, and quote the Windows path -- unquoted, the shell eats the backslashes.
 You push your own branch and open your own PR, without asking. Owner ruling 2026-08-29:
 "Sessions push their own."
 
-Any seat may apply the `reviewed` label, and nothing automated adds it. A push strips it,
-so label after your last push. The gate records that a step happened, not that an
-independent party looked, so labelling your own PR unread defeats the point.
+There is no `reviewed` label and no review gate; both were retired on 2026-09-05. What
+blocks a merge is the required check set. Say in the PR body what state you left it in,
+because no workflow reports that a PR is finished and unread.
 
 ## On arrival
 

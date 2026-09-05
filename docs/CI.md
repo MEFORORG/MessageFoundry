@@ -19,7 +19,6 @@ claims move with it.
 | `ci.yml` | Lint (`ruff check` + `ruff format --check`), types (`mypy --strict`, plus a `--platform win32` pass on Linux so Windows type-branches are checked), and the `pytest` suite across **ubuntu-latest**, **windows-2022**, and **windows-2025** (Python 3.14). Also builds the VS Code extension (`ide/`). A `CI gate` job rolls the legs up. |
 | `security.yml` | Static and supply-chain security: `bandit` (Python SAST), `semgrep`, `pip-audit` and `npm-audit` against the hash-locked tree, `gitleaks` (secret scan), `forbidden-content` (customer/PHI leak guard), a crypto-inventory check, an SBOM build, and a `trivy` scan. A **daily cron** re-runs the dependency audits so a CVE filed against an unchanged pin is caught within ~24h. A separate `released-line-audit` job runs on the same cron and audits the **latest release tag's** pinned core runtime, which the daily audits do not cover — they read the checked-out tree, so between a fix landing on `main` and a release carrying it the two answers differ. Hard-failing but **not** a required check (schedule/dispatch only), the same posture as `dast.yml`. |
 | `codeql.yml` | GitHub CodeQL analysis (python / javascript-typescript). Advisory — **not** required checks. |
-| `review-gate.yml` | Blocks a merge until a reviewer marks the PR read with the `reviewed` label. A **required check**, and — with approvals pinned at 0 — the repository's only review control. It removes the label on `synchronize`, so new commits are unread again; that is the one thing it writes, and it only ever writes toward blocked. |
 | `scorecard.yml` | OpenSSF Scorecard analysis. |
 | `cla.yml` | CLA Assistant — records the Contributor License Agreement signature on each PR. |
 | `zizmor.yml` | Lints the workflow files themselves for insecure patterns (template injection, over-broad tokens), and runs `actionlint` on the workflow syntax. Hard-fails, but **not a required check** — it is paths-filtered, so it does not report on a PR that touches no workflow, and requiring it would wedge every such PR. The `actionlint` pre-commit hook is the local half. |
@@ -51,7 +50,6 @@ The stable contexts required on `main` are — mirroring
 - `forbidden-content (customer/PHI leak guard)`
 - `a PR that implements BACKLOG #N must update BACKLOG.md`
 - `cla`
-- `a reviewer has read this`
 
 `cla` is the **job key** in `cla.yml`, whose job declares no `name:`. Branch protection
 matches the job name, never the workflow name — so the context is `cla`, not "CLA Assistant". Every
@@ -69,12 +67,16 @@ the same reason and additionally **does not run on PRs at all** (`scorecard.yml`
 trigger — it runs on push-to-main, a schedule, and branch-protection changes). Nightly / path-gated
 legs (service-smoke, load, SQL/Postgres store) are deliberately **not** required.
 
-`a reviewer has read this` (`review-gate.yml`) is the required check that is **not a test of the code**,
-and the one with nothing behind it. `required_approving_review_count` is 0 and stays 0 — every session
-pushes as one GitHub identity, so a human-approval rule would wedge every PR rather than review any —
-which makes this single context the repository's whole review requirement. A PR clears it with
-`gh pr edit <N> --add-label reviewed`; a new commit removes the label, so re-review is automatic. It
-proves a **step happened**, not that an independent party looked.
+**RETIRED 2026-09-05: there is no review gate and no `reviewed` label.** This paragraph used to
+describe `a reviewer has read this` (`review-gate.yml`) as the repository's whole review requirement.
+Measured 2026-09-05, that context was already absent from live branch protection while this file, the
+checked-in required-contexts list and the vault all still asserted it was armed. The owner retired the
+label, the workflow and the Reviewer seat together rather than restore it.
+
+`required_approving_review_count` is 0 and stays 0 — every session pushes as one GitHub identity, so a
+human-approval rule would wedge every PR rather than review any. **So no machine now requires that
+anyone read a PR before it merges.** Review is a seat reading the diff and reporting on the pull
+request. That is a real reduction in enforcement, stated plainly rather than described as a cleanup.
 
 The `quality-advisory.yml` jobs create **no code-scanning category** and **no _required_ check context** —
 they do report as ordinary advisory checks, and they **must never be added to the required list**. Two

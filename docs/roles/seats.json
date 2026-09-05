@@ -11,7 +11,7 @@
     "distinct strings for a six-seat roster. Do not add a spelling nobody has actually used."
   ],
 
-  "seats": ["console", "builder", "reviewer", "regulator", "steward", "lander"],
+  "seats": ["console", "builder", "regulator", "steward", "lander"],
 
   "aliases": {
     "console": "console",
@@ -20,7 +20,6 @@
     "builder2": "builder",
     "builder-2": "builder",
     "builder3": "builder",
-    "reviewer": "reviewer",
     "regulator": "regulator",
     "steward": "steward",
     "lander": "lander"
@@ -33,6 +32,7 @@
     "cleaner": "retired by CLAUDE.md section 5 on 2026-09-01",
     "role-manager": "retired by CLAUDE.md section 5 on 2026-09-01",
     "process-improvement": "retired by CLAUDE.md section 5 on 2026-09-01",
-    "asvs-tracker": "retired by CLAUDE.md section 5 on 2026-09-01"
+    "asvs-tracker": "retired by CLAUDE.md section 5 on 2026-09-01",
+    "reviewer": "retired 2026-09-05 with the reviewed-label gate; any seat reads a diff and reports on the PR"
   }
 }

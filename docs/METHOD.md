@@ -17,7 +17,6 @@ is defined here and nowhere else, so other pages point at this line rather than 
 |---|---|---|
 | Console | Long-lived | The only seat the owner talks to. Reads the record and writes a brief citing an item, then polls. The record is two ledgers: `docs/BACKLOG.md` here, and the `wshallwshall/claude-multisession` issues that track KORUS itself. Nothing pushes to it. |
 | Builder | One brief, then exits | Works, commits, pushes, opens the PR, and stops. That is you, most of the time. |
-| Reviewer | Spawned per PR | Runs quality checks on the diff. A pass adds the `reviewed` label and posts the head SHA it read. A fail posts findings on the PR, for whichever Builder the Console spawns next. |
 | Regulator | Spawned on a red | Decides whose failure a red belongs to: the PR's, main's, a flake, or the queue's. Only a PR's own failure comes back to a Builder. |
 | Steward | A cron, no model calls | Reads account usage and names the account with headroom. It cannot interrupt a running session. |
 | Lander | Standing authority | Merges. |
@@ -47,12 +46,20 @@ name pattern and prints `Roots examined: <n>` with a line per root, so enumerate
 each root's own `settings.json` for the grant.
 
 Seven seats were retired by owner decision on 2026-09-01: Dispatcher, Liaison, PM, Cleaner, Role
-Manager, Process Improvement and ASVS Tracker. If a document names one, that document is stale.
+Manager, Process Improvement and ASVS Tracker. **The Reviewer went on 2026-09-05**, with the
+`reviewed` label, `review-gate.yml` and `unread-signal.yml`. If a document names one, that document
+is stale.
 
 Three rules went with those seats, and they are not repeated anywhere. Routing an owner question
 through the Liaison is retired. Getting owner approval before your own push is retired. Falling back
-to the Lander when no Reviewer is running is retired too. A `reviewed` label now gates the merge, and
-no seat can merge without it.
+to the Lander when no Reviewer is running is retired too.
+
+**RETIRED 2026-09-05, and the retraction is kept because the wrong version was load-bearing.** This
+paragraph used to end "A `reviewed` label now gates the merge, and no seat can merge without it."
+Measured 2026-09-05: that context was already absent from live branch protection while this file,
+`CLAUDE.md`, `docs/CI.md` and the vault all still asserted it was armed, so it gated nothing. The
+owner retired the label and the seat rather than restore the gate. **Nothing now requires that anyone
+read a PR before it merges.** What blocks a merge is the required check set and nothing else.
 
 Nothing in this system gets pushed to anybody. Everything is polled.
 
@@ -184,15 +191,11 @@ it is.
 If your brief already names a red and says it belongs to the PR, that judgement is made and the fix
 is yours.
 
-### The reviewed label is one label and one command
+### There is no reviewed label
 
-`gh pr edit <N> --add-label reviewed` is the entire protocol. Nothing automated ever adds it, and a
-`synchronize` run strips it, so commits nobody has read are unread again.
-
-Pushing to your own PR after it was labelled un-labels it. That is the design. If you push, the PR
-needs reading again.
-
-The gate records that a step happened. It does not establish that an independent party looked.
+**RETIRED 2026-09-05.** This section used to give the protocol: `gh pr edit <N> --add-label reviewed`,
+stripped by a `synchronize` run so unread commits were unread again. The label, the workflow and the
+Reviewer seat are gone. Read a diff because it is worth reading; no machine records that you did.
 Labelling your own unread PR satisfies the machine and defeats the point.
 
 ### The merge queue re-checks everything
@@ -215,16 +218,14 @@ named files, and the two **merge clean**. It has fired three times here. Full re
 because its process exits before any run reports.**
 
 `mergeStateStatus` alone will mislead you. It reports `BEHIND` or `DIRTY` in preference to `BLOCKED`.
-A PR that is only waiting on a review can therefore read as though it needs a rebase. A seat that triages on
-that field will push, strip the `reviewed` label, and wedge the PR further from green.
+A seat that triages on that field will push and wedge the PR further from green.
 
 Settle it this way instead.
 
-1. Find the gate run for the PR.
-2. Compare that run's originating `createdAt` against the newest `reviewed` label event.
-3. If the run was created before the label event, the verdict is stale, whatever it says.
-4. If no run at all is newer than the label event, the state is unknown and the Console keeps
-   polling.
+1. Gate on `mergeable == CONFLICTING` first. A PR that conflicts after its checks ran keeps passing
+   but stale checks, and the merge ref persists, so it discriminates nothing.
+2. Read the required set from LIVE branch protection, never from a checked-in file.
+3. Join that set against the PR's rollup. A required context that has not reported is not a pass.
 
 Never inherit the last verdict when the state is unknown. The gate's own version of this staleness is
 BACKLOG #1417. That item is open in PR 731 and not yet on `main`, so it does not resolve on
@@ -232,8 +233,6 @@ BACKLOG #1417. That item is open in PR 731 and not yet on `main`, so it does not
 
 Two more measured facts about PR state, so you do not re-derive them:
 
-- The `reviewed` label is stripped by a `synchronize` run only when that run executes. While the run
-  is queued the label is present and already invalid.
 - A PR rollup cannot tell "never ran" from "not yet registered". Both look like an empty string. The
   lag has measured nine minutes. Use `gh run list --branch <branch>`.
 
@@ -355,13 +354,13 @@ no commit and no PR the worktree is the only record of what you saw.
 
 ---
 
-## Nothing tells a Reviewer your PR is waiting
+## Nothing tells anyone your PR is waiting
 
-No workflow notifies a reviewer that a PR needs reading. That gap is BACKLOG #1413, which is filed
-and on `main`. The corpus is the 27 files in `.github/workflows`, and the needle is a job that
-messages a reviewer about an unread PR.
+No workflow reports that a PR is finished and unread. `stalled-prs.yml` comes closest, and it reports
+green-but-unmergeable PRs on a daily cron. `failure-signal.yml` labels a red PR `ci-red`, and nothing
+reads that label either.
 
-`stalled-prs.yml` comes closest, and it reports green-but-unmergeable PRs on a daily cron rather than
-unread ones. `failure-signal.yml` labels a red PR `ci-red`, and nothing reads that label either.
+`unread-signal.yml` used to report unread PRs. It was deleted on 2026-09-05 with the review gate,
+because "unread" stopped being a state anything tracked.
 
 So say in your PR body what state you left it in. For now the prose is the signal.

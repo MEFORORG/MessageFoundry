@@ -139,8 +139,6 @@ tests/test_session_registry.py
 tests/test_setup_leak_gate_reports_source.py
 tests/test_stalled_prs.py
 tests/test_testpaths_webconsole_coverage.py
-tests/test_unread_prs.py
-tests/test_unread_signal.py
 tests/test_verdict_divergence_check.py
 tests/test_workflow_local_action_check.py
 tests/test_workflow_shell_syntax.py

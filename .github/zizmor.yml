@@ -97,13 +97,6 @@ rules:
       #   * The one attacker-influenceable field it parses, `head_branch`, is read ONLY to recover a
       #     pull-request number from a merge-queue ref, and only when the triggering run's event was
       #     `merge_group` -- which a fork pull request cannot produce.
-      # Each of the last three is pinned by tests/test_unread_signal.py, on failure-signal.yml's model.
-      #
-      # EXPECT THIS RATHER THAN BE SURPRISED BY IT, same as failure-signal.yml: GitHub leaves
-      # `workflow_run.pull_requests` empty for a fork pull request, so a fork resolves to no number and
-      # the job does nothing at all. A fork contribution is therefore never announced by this route,
-      # and CODEOWNERS -- which is NOT inert on a pull request the owner did not author -- covers it.
-      - unread-signal.yml
 
   artipacked:
     ignore:

@@ -20,8 +20,8 @@ The brief is disposable. The BACKLOG item is the record.
 
 - **Build.** You cut briefs; Builders build.
 - **Wait on inbound messages.** Every notice here is polled and nothing is pushed. No workflow
-  tells a Reviewer a PR is waiting. `failure-signal.yml` adds a `ci-red` label that no workflow
-  reads back. So you find things by asking.
+  reports that a PR is finished and unread. `failure-signal.yml` adds a `ci-red` label that no
+  workflow reads back. So you find things by asking.
 - **Arm auto-merge.** Enqueuing is yours; merging is the Lander's.
 - **Announce a hold, a freeze, or a promise about future state.** A 2026-08-01 rehearsal of that
   shape stayed "in force" for hours after its condition resolved, while `main` moved four times.
@@ -60,12 +60,11 @@ front and offer to re-send with it. You cannot switch it on yourself.
 
 ## Reading a PR's state
 
-A merge state is a join over three clocks. `mergeStateStatus` alone is never the verdict -- it
-reports `BEHIND` or `DIRTY` in preference to `BLOCKED`. Compare the gate run's `createdAt`
-against the newest `reviewed` label event; created-before means stale whatever the label says.
-Gate on `mergeable == CONFLICTING` first: a PR that conflicts after its checks ran keeps passing
-but stale checks. When no run is newer than the label event, the state is unknown -- keep
-polling, and inherit nobody's last verdict.
+`mergeStateStatus` alone is never the verdict -- it reports `BEHIND` or `DIRTY` in preference to
+`BLOCKED`. Gate on `mergeable == CONFLICTING` first: a PR that conflicts after its checks ran
+keeps passing but stale checks, and the merge ref persists, so it discriminates nothing. Then read
+the required set from LIVE branch protection and join it against the PR's rollup -- a required
+context that has not reported is not a pass, and absent reads identically to queued.
 
 ## The full playbook
 

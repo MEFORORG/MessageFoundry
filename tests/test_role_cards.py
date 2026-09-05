@@ -34,7 +34,7 @@ _SEATS_JSON = _ROLES / "seats.json"
 
 #: From CLAUDE.md section 5. That table is the authority: the vault's roles/README.md still lists
 #: seven retired seats and calls itself a partial list, so it loses on every disagreement.
-_LIVE_SEATS = ("console", "builder", "reviewer", "regulator", "steward", "lander")
+_LIVE_SEATS = ("console", "builder", "regulator", "steward", "lander")
 
 #: Measured 2026-09-05 across 968 worktree seat records: eight spellings of one seat.
 _BUILDER_SPELLINGS = (
@@ -49,7 +49,15 @@ _BUILDER_SPELLINGS = (
 )
 
 #: Retired by CLAUDE.md section 5, still present in live seat records.
-_RETIRED = ("dispatcher", "liaison", "pm", "cleaner", "role-manager", "asvs-tracker")
+_RETIRED = (
+    "dispatcher",
+    "liaison",
+    "pm",
+    "cleaner",
+    "role-manager",
+    "asvs-tracker",
+    "reviewer",
+)
 
 _MAX_LINES = 150
 _MAX_BYTES = 6 * 1024
@@ -256,7 +264,7 @@ def test_hook_falls_back_to_the_environment_when_no_marker_is_written(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Rung 2. The Console sets this when it spawns, before any marker exists."""
-    monkeypatch.setenv("MEFOR_SEAT", "reviewer")
+    monkeypatch.setenv("MEFOR_SEAT", "steward")
     r = _run_hook(tmp_path)
     assert r.returncode == 0, r.stderr
     assert "What this seat owns" in _card_text(r.stdout)
@@ -267,8 +275,8 @@ def test_a_written_marker_outranks_the_environment(
 ) -> None:
     (tmp_path / ".claude").mkdir()
     (tmp_path / ".claude" / "seat").write_text("lander\n", encoding="utf-8")
-    monkeypatch.setenv("MEFOR_SEAT", "reviewer")
+    monkeypatch.setenv("MEFOR_SEAT", "steward")
     r = _run_hook(tmp_path)
     assert r.returncode == 0, r.stderr
     assert "lander" in _card_text(r.stdout).lower()
-    assert "Reviewer" not in _card_text(r.stdout).splitlines()[0]
+    assert "Steward" not in _card_text(r.stdout).splitlines()[0]

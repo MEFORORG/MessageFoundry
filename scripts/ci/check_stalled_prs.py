@@ -53,9 +53,9 @@ from pathlib import Path
 
 _ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(_ROOT))
-# The rollup vocabulary is GitHub's, not ours, and check_unread_prs.py reads the same array to answer
-# a different question. One module owns it so the two cannot drift — a conclusion string neither copy
-# classified would read as GREEN, which is the exact defect both scripts exist to catch.
+# The rollup vocabulary is GitHub's, not ours. One module owns it so no second copy can drift — a
+# conclusion string nobody classified would read as GREEN, which is the exact defect this exists to
+# catch. check_unread_prs.py was the other reader until it was deleted on 2026-09-05.
 from scripts.ci._pr_checks import counts as _counts  # noqa: E402
 
 #: The merge state that means "head is behind base". GitHub computes this server-side; it is not
