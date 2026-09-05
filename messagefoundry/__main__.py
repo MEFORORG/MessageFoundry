@@ -613,6 +613,31 @@ def main(argv: list[str] | None = None) -> int:
     admin_unlock.add_argument("--db", default=None, help="store path (overrides [store].path)")
     admin_unlock.add_argument("--json", action="store_true", help="emit JSON")
 
+    # BACKLOG #1136 (ASVS 6.3.2). Run before the first `serve` and the engine never mints a default
+    # account: `_ensure_bootstrap_admin` seeds only an EMPTY user table. There is deliberately no
+    # --password and no --password-file -- see `_provision_admin`.
+    provision_admin = sub.add_parser(
+        "provision-admin",
+        help="create the first administrator offline, so no default account is ever minted",
+    )
+    provision_admin.add_argument(
+        "--username", required=True, help="the administrator to create (no default, on purpose)"
+    )
+    provision_admin.add_argument("--display-name", default=None, help="optional display name")
+    provision_admin.add_argument(
+        "--email",
+        default=None,
+        help="notification address for out-of-band security notices; a PHI instance under "
+        "[security].enforcement=enforce refuses to serve without one on some enabled Administrator",
+    )
+    provision_admin.add_argument(
+        "--service-config",
+        default=None,
+        help="service settings TOML (default: ./messagefoundry.toml if present)",
+    )
+    provision_admin.add_argument("--db", default=None, help="store path (overrides [store].path)")
+    provision_admin.add_argument("--json", action="store_true", help="emit JSON")
+
     audit_verify = sub.add_parser(
         "audit-verify", help="verify the audit-log hash chain (tamper-evidence)"
     )
@@ -4277,6 +4302,136 @@ def _admin_unlock(args: argparse.Namespace) -> int:
     return 0
 
 
+class _PasswordEntryRefused(RuntimeError):
+    """The interactive credential prompt declined. The message is operator-facing."""
+
+
+def _read_new_password(prompt: str) -> str:
+    """Read a new password twice from the controlling terminal, or raise with an explanation.
+
+    TTY-ONLY, AND THE REFUSAL IS THE POINT RATHER THAN AN OVERSIGHT (BACKLOG #1136). An unattended
+    MSI/Ansible/NSSM install has no terminal, so the pressure to add ``--password`` or
+    ``--password-file`` is structural. Either one lands a standing Administrator credential in argv
+    -- readable by every other process on the host -- or on disk, which is the shape the first-run
+    redesign exists to remove. So unattended provisioning is refused in terms: an operator who needs
+    it should provision interactively, or supply the credential from their own secret store by
+    driving this command's prompt. Never a default, and never a fallback.
+    """
+    import getpass
+
+    if not sys.stdin.isatty():
+        raise _PasswordEntryRefused(
+            "refusing to provision without a terminal: the password is read interactively and "
+            "there is deliberately no --password or --password-file (either would put a standing "
+            "Administrator credential in argv or on disk). Run this from a console."
+        )
+    first = getpass.getpass(prompt)
+    if not first:
+        raise _PasswordEntryRefused("empty password")
+    if getpass.getpass("Confirm: ") != first:
+        raise _PasswordEntryRefused("the two entries did not match")
+    return first
+
+
+def _provision_admin(args: argparse.Namespace) -> int:
+    """Create the first administrator offline (BACKLOG #1136, ASVS 6.3.2).
+
+    Run before the first ``serve`` and the engine never creates the account named ``admin``: the
+    seeding path fires only on an EMPTY user table, so an operator-named administrator pre-empts it.
+    That is the "not present" arm of the verb, reached by an operator action rather than by a
+    configuration knob. The shipped default is unchanged and still mints one -- retiring the
+    auto-create is the remaining half of the item, and it is not this command.
+
+    The gate is host access, argued once on :func:`_admin_unlock` and in ADR 0171. What differs is
+    the refusal: this one declines when an ENABLED ADMINISTRATOR exists rather than when the table is
+    non-empty, because a directory sign-in can fill the table without producing an administrator.
+    """
+    import asyncio
+    import getpass
+
+    from pydantic import ValidationError
+
+    from messagefoundry.auth.service import (
+        AuthService,
+        FirstAdministratorRefused,
+        ProvisionedAdministrator,
+    )
+    from messagefoundry.config.settings import load_settings
+    from messagefoundry.store.base import open_store
+
+    cli: dict[str, dict[str, object]] = {}
+    if args.db is not None:
+        cli.setdefault("store", {})["path"] = args.db
+    try:
+        settings = load_settings(config_path=args.service_config, cli=cli)
+    except (FileNotFoundError, ValueError, ValidationError) as exc:
+        return _emit_error(str(exc), as_json=args.json)
+
+    try:
+        password = _read_new_password("New administrator password: ")
+    except _PasswordEntryRefused as exc:
+        # Read BEFORE the store is opened, so a refusal cannot leave a SQLite file behind that the
+        # next `serve` would find non-empty.
+        return _emit_error(str(exc), as_json=args.json)
+
+    async def run() -> tuple[ProvisionedAdministrator, str]:
+        store = await open_store(settings.store)
+        try:
+            outcome = await AuthService(store, settings.auth).provision_first_administrator(
+                username=args.username,
+                password=password,
+                display_name=args.display_name,
+                notify_email=args.email,
+                actor=f"cli:{getpass.getuser()}",
+            )
+            # NO M-31 "the store must already exist" guard here, and the difference from
+            # `admin-unlock` is deliberate: the ordinary sequence is install, provision, serve, so on
+            # a first run the SQLite store legitimately does NOT exist and creating it is correct.
+            # The typo hazard M-31 covers is real all the same -- a mistyped --db provisions into a
+            # store `serve` will never open, and `serve` then mints the default account after all.
+            # The substitute is naming the target below. It is read off the OPENED store rather than
+            # off `[store].path`, which is the SQLite field and would name a file that was never
+            # touched on the two server backends.
+            return (outcome, store.path)
+        finally:
+            await store.close()
+
+    try:
+        outcome, store_path = asyncio.run(run())
+    except FirstAdministratorRefused as exc:
+        return _emit_error(str(exc), as_json=args.json)
+
+    if args.json:
+        _print_json(
+            {
+                "ok": True,
+                # The account's own name, not the raw argv: the service strips it, and reporting a
+                # name that differs from the one created is how an operator ends up unable to log in.
+                "username": outcome.username,
+                "user_id": outcome.user_id,
+                "repaired": outcome.repaired,
+                "store": store_path,
+                "notify_email_set": bool(args.email and args.email.strip()),
+            },
+            compact=True,
+        )
+        return 0
+    verb = "completed an incomplete provision of" if outcome.repaired else "created"
+    # `_safe_print`, not `print`: both the username and the store path are operator-supplied, and a
+    # UnicodeEncodeError on a legacy Windows console would traceback AFTER the account was created.
+    _safe_print(f"OK: {verb} Administrator {outcome.username!r} in {store_path}")
+    _safe_print(
+        "The engine will NOT create a default 'admin' account: the user table is no longer empty."
+    )
+    if not (args.email and args.email.strip()):
+        _safe_print(
+            "WARNING: no notification address. A PHI instance under [security].enforcement=enforce "
+            "refuses to start unless some enabled Administrator carries one -- re-run with --email, "
+            "or set one from the web console."
+        )
+    return 0
+
+
 def _audit_verify(args: argparse.Namespace) -> int:
     import asyncio
     from pathlib import Path
@@ -5418,6 +5573,7 @@ _DISPATCH = {
     "cert": _cert,
     "protect-key": _protect_key,
     "admin-unlock": _admin_unlock,
+    "provision-admin": _provision_admin,
     "audit-verify": _audit_verify,
     "audit-anchor": _audit_anchor,
     "rekey-audit": _rekey_audit,

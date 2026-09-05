@@ -69,6 +69,32 @@ auto-retirement is not the only way to lose an administrator: the failed-attempt
 bootstrap login is refused like any other invalid credential and the retirement is audited
 (`auth.bootstrap_admin_retired`).
 
+### Provisioning the first administrator instead (ASVS 6.3.2)
+
+**Run `messagefoundry provision-admin --username <name> --email <address>` before the first `serve`
+and no bootstrap admin is ever created** — the seeding above fires only on an empty user table, so an
+operator-named administrator pre-empts it and the account named `admin` never exists. That is the
+"not present" arm of ASVS 6.3.2, and it is why the command exists
+([ADR 0183](adr/0183-provision-the-first-administrator-offline-no-default-account-at-first-run.md),
+BACKLOG #1136). **The shipped default is unchanged:** skip this and you still get the bootstrap
+account described above.
+
+Four properties are load-bearing rather than incidental:
+
+- **The gate is host access**, the same one `messagefoundry admin-unlock` ships on
+  ([ADR 0171](adr/0171-offline-administrator-unlock-a-host-gated-cli-recovery-path-for-a-sole-administrator-lockout.md)):
+  the service config, the store path and, on an encrypted store, the key material. Nothing is
+  reachable over the network.
+- **The password is read from a terminal.** There is deliberately no `--password` and no
+  `--password-file`: either would put a standing Administrator credential in argv or on disk, so
+  unattended provisioning is refused rather than given a hatch.
+- **It refuses when an enabled Administrator already exists** — not merely when the table is empty,
+  because a directory sign-in can fill the table without producing an administrator.
+- **The credential is claimed at creation**, so the account is a normal administrator from birth and
+  WP-3 auto-retirement never applies to it, even under the name `admin`.
+
+Re-running with the same username completes a provision an earlier run left half-written, and says so.
+
 ### Admin password reset (WP-L3-12, ASVS 6.4.6)
 
 An administrator (`users:manage`) recovers a locked-out or compromised **local** account with
