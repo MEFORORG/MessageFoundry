@@ -35,6 +35,7 @@ tests/test_asvs_scorecard.py
 tests/test_asvs_tally_lint.py
 tests/test_asvs_verifier_vault_contract.py
 tests/test_backlog_citation_check.py
+tests/test_backlog_dependency_census.py
 tests/test_backlog_hygiene_claim_extraction.py
 tests/test_backlog_status_check.py
 tests/test_banner_sha_check.py
@@ -151,6 +152,7 @@ tests/test_worktree_gate_git.py
 tests/test_worktree_gate_hijack.py
 tests/test_worktree_gate_interpreter_flags.py
 tests/test_worktree_gate_interpreter_sigils.py
+tests/test_worktree_gate_line_split_discriminator.py
 tests/test_worktree_gate_path_aliases.py
 tests/test_worktree_gate_quote_straddle.py
 tests/test_usage_headroom_inject.py
