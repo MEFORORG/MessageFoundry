@@ -22627,3 +22627,33 @@ All 137 listed entries were swept for a repo-rooted read of `messagefoundry/**`.
 
 1. **The five pull requests above.** A Builder must not push to another seat's branch, so each is fixed by whoever next touches it: append `tests/<name>.py` to `tests/tooling_manifest.txt`, keeping the list alphabetical. **The gate is passable and two pull requests that night passed it correctly -- nothing here asks for it to be weakened.**
 2. **Three copies of the manifest parser, pinned against nothing.** This file, `_tooling_basenames` in `tests/conftest.py` (the copy that actually applies the marker), and `_manifest_paths` in `tests/test_ci_tooling_gate.py` all implement the same rule. Extracting one `tests/_tooling_manifest.py` is the real fix. Related: `test_every_manifest_entry_trips_its_own_gate` in `tests/test_ci_tooling_gate.py` feeds each manifest entry back as its own changed path, so on the manifest arm every entry matches itself unconditionally.
+
+## 1454. the leak gate has no URL detector of any kind, so a private artifact link commits clean
+
+> 🚧 **Filed 2026-09-05. The detector and both test arms are built on this branch; nothing is left but the merge.** Value **6/10** - Difficulty **2/10**. **PREVENTIVE, NOT REMEDIAL: the population is zero.** `scripts/security/scan_forbidden.py` -- the `forbidden-content (customer/PHI leak guard)` required context -- carried four structural detectors and **no URL detector of any kind**, so a link of the form `claude.ai/code/artifact/<uuid>` pasted into a doc, an ADR, a backlog row or a PR-derived file would have been committed with nothing turning red.
+
+**Cluster:** repository security gates. **Priority:** P3. **Verdict:** build.
+**Severity:** no deployment axis (sec. 0), no engine behaviour, no PHI axis, and nothing in a shipped wheel. The exposure is **repository disclosure**: MessageFoundry is public on GitHub and on PyPI, and a private artifact URL is a link to private content. Written in the conditional throughout, because there is nothing to remediate.
+
+**What the detector set was.** `_IPV4` (routable addresses), `_HOME_PATH` (an OS account name in an absolute path), `_WORKTREE_SLUG_PATH` / `_WORKTREE_SLUG_BARE` (an internal project name) and `_ESTATE_ID_SHAPE` (the ported-estate site-code shape). Every one of them recognises something that **identifies a party**. An artifact URL is a different kind of string: the UUID in it is not a name, it is a **capability**, and whoever holds the link can fetch the content. None of the four can see it -- it carries no host address, no home path and no estate identifier.
+
+**How the class arrives.** The same way every class in that file arrives: pasted out of one session into a note, a handoff, or a row that a later commit sweeps into the tree. Sessions in this repo exchange these links routinely.
+
+**LIMB 1 -- THE POPULATION IS ZERO, AND THE MEASUREMENT SAYS SO WITH ITS NEEDLE ATTACHED.** At `16efb8cde` over 2095 tracked files, `HEAD` and `origin/main` being the same commit. The control fires, so the search demonstrably ran over the corpus:
+
+```
+needle='claude\.ai/(code/)?artifact/<uuid-shape>'   files=0
+needle='claude\.ai/(code/)?artifact'                files=0
+needle='artifact/<uuid-shape>'                      files=0
+CONTROL needle='worktree/branch slug'               files=3   (fires)
+```
+
+A zero with no positive control is indistinguishable from a broken search, which is why the control is quoted beside it rather than described.
+
+**LIMB 2 -- THE UUID SHAPE IS REQUIRED ON PURPOSE, AND THAT IS THE FALSE-POSITIVE FIX.** This repo's own prose has to discuss artifact URLs as a concept -- this row does it twice -- so a pattern matching the word, or the host, or the path segment alone would fire on the documentation that explains it. The remedy for that is an allowlist line, and an allowlist entry here is a **per-line veto over every other detector on that line too**. Requiring the full UUID means the placeholder form the documentation must print is simply not a hit, and no allowlist line is ever earned. A publicly shared artifact is also excluded for free: that path segment is plural, so the literal `artifact/` cannot reach it, and a deliberately published link is not a disclosure.
+
+**LIMB 3 -- NO BARE-UUID DETECTOR, AND THE NUMBER IS WHY.** A bare UUID names no host, no account and no project; it is an opaque 128-bit integer, and it becomes a disclosure only when something says what it addresses. Measured over the same 2095 files, a bare-UUID detector would fire on **35 lines across 8 files today**, every one innocent -- a vendored CLA action bundle, a deployment guide, an HL7 sample message, and five test modules that build session ids. Each would be answered with an allowlist line, and a gate people mute is worth nothing.
+
+**LIMB 4 -- PRIOR ART, AND IT IS NOT HYPOTHETICAL THERE.** The sibling KORUS repo merged its PR #48 for exactly this class. Its leak gate had the same gap -- detectors for addresses, home paths and invisible codepoints, none for a URL -- and two private artifact URLs had been sitting on its `origin/main` since its playbooks came across from the vault. They came out because a person read the diff, which is the review this gate exists to make cheaper. KORUS argued against a bare-UUID detector from a zero; a zero argues weakly in either direction, so the 35-line count in LIMB 3 is the figure to cite instead.
+
+**What shipped with this row.** The `_ARTIFACT_URL` detector and its call site in `scan_file` (reason-only, and not `ctx`-appended even under `show_context`: the other reason-only detectors withhold the value because it names someone, this one withholds it because the URL **is** the access), plus paired must-trip and must-not-trip arms in `tests/test_scan_tokens_source.py` and a mutation test that holds the two arms disjoint.
