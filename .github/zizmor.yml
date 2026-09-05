@@ -75,18 +75,36 @@ rules:
       # moment is a workflow COMPLETING -- there is no `pull_request` event then, and no trigger other
       # than `workflow_run` observes another workflow's conclusion. Same argument as the two above.
       #
+      # IT ALSO RUNS ON `pull_request_target`, WHICH THIS RULE FLAGS FOR THE SAME CLASS, and the
+      # entry covers both arms rather than only the one it was written for. A pull request STOPS
+      # being unread when somebody adds a LABEL, and a label event exists on `pull_request` and
+      # `pull_request_target` and nowhere else -- no `workflow_run` sees one. Between 2026-09-04 and
+      # the arm that fixed it there was no such arm at all, and the `unread` label survived being
+      # read (measured on PR 897, recorded on the trigger list in the workflow itself).
+      #
       # THIS ENTRY IS WEAKER THAN BOTH OF THEM AND THE DIFFERENCE IS THE POINT, so it is stated rather
       # than left to be inferred: nightly-notice.yml and failure-signal.yml both claim NO CHECKOUT and
       # no `uses:` at all. THIS WORKFLOW CHECKS OUT AND RUNS TWO ACTIONS. What makes that safe is a
       # different property, not the same one:
-      #   * THE CHECKOUT IS OF TRUSTED CODE, NOT THE TRIGGERING HEAD. On a `workflow_run` GitHub sets
-      #     `github.sha` to the DEFAULT BRANCH's last commit, and the checkout step declares no `ref:`,
-      #     so it takes that default-branch tree. The pull request's head is never fetched and never
+      #   * THE CHECKOUT IS OF TRUSTED CODE, NOT THE TRIGGERING HEAD, ON EITHER ARM. GitHub sets
+      #     `github.sha` to the DEFAULT BRANCH's last commit on a `workflow_run` and to the BASE
+      #     branch's last commit on a `pull_request_target`, and the checkout step declares no `ref:`,
+      #     so it takes a trusted tree either way. The pull request's head is never fetched and never
       #     executed. That is the whole pwn-request precondition, and it is absent.
       #     `ref:`-lessness is the load-bearing half, so it is PINNED by
       #     tests/test_unread_signal.py::test_the_checkout_never_names_a_ref rather than asserted here
       #     -- adding `ref: ${{ github.event.workflow_run.head_sha }}` would open the hole in one line
       #     and redden nothing else.
+      #   * WHICH LABEL-BEARING EVENT CARRIES THE SECOND ARM IS ITSELF THE CONTROL, and no assertion
+      #     about the checkout can see it. Under `pull_request` a `ref:`-less checkout takes the MERGE
+      #     commit -- the pull request's own code -- and the workflow FILE is read from the head too.
+      #     Under `pull_request_target` both come from the base. So `pull_request_target` is the safer
+      #     of the two here rather than a concession, and swapping one word for the other would open
+      #     the hole while leaving every checkout assertion green. Pinned by
+      #     tests/test_unread_signal.py::test_the_label_arm_runs_on_the_event_whose_default_checkout_is_the_base.
+      #   * ONLY AN ACCOUNT WITH WRITE OR TRIAGE PERMISSION CAN FIRE THE LABEL ARM, because only such
+      #     an account can label a pull request. A fork contributor cannot reach it at all, which is a
+      #     narrower exposure than the `workflow_run` arm's and not a wider one.
       #   * BOTH ACTIONS ARE FIRST-PARTY AND SHA-PINNED (actions/checkout, actions/setup-python), and
       #     the checkout sets persist-credentials: false so no git credential survives the step.
       #   * Least privilege: file default `contents: read`; the single job adds only
@@ -101,8 +119,12 @@ rules:
       #
       # EXPECT THIS RATHER THAN BE SURPRISED BY IT, same as failure-signal.yml: GitHub leaves
       # `workflow_run.pull_requests` empty for a fork pull request, so a fork resolves to no number and
-      # the job does nothing at all. A fork contribution is therefore never announced by this route,
-      # and CODEOWNERS -- which is NOT inert on a pull request the owner did not author -- covers it.
+      # the job does nothing at all on that arm. A fork contribution is therefore never ANNOUNCED by
+      # this route, and CODEOWNERS -- which is NOT inert on a pull request the owner did not author --
+      # covers it. The label arm behaves differently and the difference is benign: a maintainer
+      # labelling a fork pull request DOES resolve to a number, because `pull_request_target` carries
+      # it directly, so a fork pull request can be evaluated and cleared even though it was never
+      # flagged. `decide()` returns `none` in that case and nothing is written.
       - unread-signal.yml
 
   artipacked:

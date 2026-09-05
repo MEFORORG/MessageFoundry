@@ -7,13 +7,20 @@ A SUPPRESSION IS A CLAIM, AND A CLAIM NOBODY CAN WATCH FAIL IS AN ASSUMPTION WEA
 runs from the DEFAULT BRANCH with a privileged token, so a workflow that checks out and EXECUTES the
 triggering pull request's code would hand any fork pull request a write token.
 
-THIS WORKFLOW IS THE WEAKEST OF THE THREE `workflow_run` SUPPRESSIONS IN THIS REPOSITORY, and that is
-why it needs its own file. `nightly-notice.yml` and `failure-signal.yml` both claim NO CHECKOUT and no
+THIS WORKFLOW IS THE WEAKEST OF THE `workflow_run` SUPPRESSIONS IN THIS REPOSITORY, and that is why
+it needs its own file. `nightly-notice.yml` and `failure-signal.yml` both claim NO CHECKOUT and no
 `uses:` at all, and their tests assert exactly that. This one checks out and runs two actions, so it
-cannot borrow their argument. What makes it safe is a DIFFERENT property -- on a `workflow_run`,
-`github.sha` is the default branch's last commit, so a checkout that names no `ref:` takes TRUSTED
-code and never the pull request's head. That single word `ref:` is the whole difference between this
-workflow and the escalation zizmor is warning about, and adding it would redden nothing else.
+cannot borrow their argument. What makes it safe is a DIFFERENT property -- `github.sha` is the
+default branch's last commit on a `workflow_run` and the base branch's last commit on a
+`pull_request_target`, so a checkout that names no `ref:` takes TRUSTED code on either arm and never
+the pull request's head. That single word `ref:` is the whole difference between this workflow and
+the escalation zizmor is warning about, and adding it would redden nothing else.
+
+IT ALSO RUNS ON `pull_request_target`, which zizmor flags under the same rule, and the argument is
+the one above rather than a second one: the ref-less checkout. Which of the two label-bearing events
+carries that arm is itself load-bearing -- under `pull_request` the ref-less default is the MERGE
+commit, so the same file with one word changed would execute head code -- and no assertion about the
+checkout can see it, so it has a test of its own.
 
 Each test below corresponds to one bullet of the justification in `.github/zizmor.yml`. If one fails,
 fix the workflow or re-justify the suppression -- do not weaken the test.
@@ -71,10 +78,19 @@ def _step(step_id: str) -> dict:
 def test_the_checkout_never_names_a_ref() -> None:
     """THE pwn-request precondition, and the only thing standing between this and an escalation.
 
-    On a `workflow_run` GitHub sets `github.sha` to the DEFAULT BRANCH's last commit. A checkout with
-    no `ref:` therefore takes trusted code. `ref: ${{ github.event.workflow_run.head_sha }}` would
+    ONE ASSERTION, TWO ARMS, and the same missing word carries both. On a `workflow_run` GitHub sets
+    `github.sha` to the DEFAULT BRANCH's last commit; on a `pull_request_target` it sets it to the
+    BASE branch's last commit. Either way a checkout with no `ref:` takes trusted code.
+    `ref: ${{ github.event.workflow_run.head_sha }}` -- or its `pull_request.head.sha` twin -- would
     fetch the triggering pull request's head instead and execute it under a token that can write to
-    this repository -- a one-line change that reddens nothing else in CI.
+    this repository. A one-line change that reddens nothing else in CI.
+
+    WHAT THIS TEST CANNOT SEE is the other half of that argument: WHICH EVENT the label arm runs on.
+    Switching `pull_request_target` to `pull_request` leaves this checkout `ref:`-less and still
+    opens the hole, because under `pull_request` the ref-less default is the MERGE commit. That
+    mutation is named by
+    `test_the_label_arm_runs_on_the_event_whose_default_checkout_is_the_base` below, so the two
+    breaks stay one red each.
     """
     checkouts = [s for s in _steps() if str(s.get("uses", "")).startswith("actions/checkout")]
     assert checkouts, "no checkout step found; this test is watching the wrong workflow"
@@ -217,36 +233,225 @@ def test_every_watched_workflow_exists_by_name() -> None:
     assert missing == [], f"unread-signal.yml watches {missing}, which no workflow is named."
 
 
-def test_the_lost_self_clearing_chain_is_recorded_where_it_was_lost() -> None:
-    """RETIRED 2026-09-04, and this test now guards the RECORD instead of the behaviour.
+def test_review_gate_stays_out_of_the_watched_list() -> None:
+    """review-gate.yml was DELETED on 2026-09-04; a watched name resolving to nothing fires never.
 
-    IT USED TO ASSERT `review gate` was in the watched list, because that is what made the `unread`
-    label self-withdrawing rather than sticky: labelling a pull request `reviewed` re-ran
-    review-gate.yml, whose completion re-triggered this workflow, which removed the label. The
-    docstring ended "drop `review gate` from the watched list and the flag survives being read, with
-    nothing reporting it". That prediction was correct and it is now the shipped behaviour.
-
-    The owner retired the reviewer requirement and review-gate.yml was deleted, so the entry named a
-    workflow that no longer exists and `test_every_watched_workflow_exists_by_name` failed on it.
-    The two tests were in direct contradiction: one required the name present, the other required it
-    resolvable. Nobody could satisfy both.
-
-    SO THE REGRESSION IS REAL AND ACCEPTED, NOT FIXED. `review gate` was the only watched workflow
-    firing on a `labeled` event, so `unread` now clears on the next push rather than when somebody
-    reads the pull request. This test exists so that fact cannot quietly disappear: it fails if the
-    entry is re-added without restoring the mechanism, and it fails if the explanation is deleted.
+    `test_every_watched_workflow_exists_by_name` already refuses an unresolvable name generically.
+    This one names the specific entry, because `review gate` is what a reader restoring the
+    self-clearing chain would reach for first -- and re-adding it would restore nothing.
     """
     watched = _on(_doc())["workflow_run"]["workflows"]
     assert "review gate" not in watched, (
         "`review gate` is back in the watched list. review-gate.yml was deleted on 2026-09-04, so "
-        "this entry resolves to nothing and fires never. If the workflow has been restored, restore "
-        "the original test with it rather than leaving this one passing by accident."
+        "this entry resolves to nothing and fires never. The self-clearing chain is carried by the "
+        "`pull_request_target` label arm now; see the tests below."
     )
-    assert "KNOWN REGRESSION" in FILE.read_text(encoding="utf-8"), (
-        "the recorded reason `review gate` left the watched list is gone from unread-signal.yml. "
-        "The regression it names -- `unread` no longer withdrawing when a pull request is read -- is "
-        "still shipped, so deleting the explanation leaves the behaviour with nothing describing it."
+
+
+# --- the trigger list, which is load-bearing and can go quiet without reddening anything ---------
+#
+# WHY THIS SECTION EXISTS, and the lesson is not this workflow's alone.
+# `.github/required-contexts.txt` records it as a general finding: A CONTROL BUILT ON ONE TRIGGER CAN
+# BE BLIND TO ITS OWN REMOVAL. Measured 2026-08-31 on the retired review gate -- dropping `labeled`
+# from its `types:` list made that gate unclearable and reddened NOTHING, with 65 tests passing.
+#
+# THIS WORKFLOW THEN SHIPPED THE SAME FAILURE, which is why the finding gets a test here rather than
+# a citation. `review gate` was the only watched workflow firing on a label event. It was deleted
+# with the reviewer requirement on 2026-09-04, the entry naming it went because it resolved to
+# nothing, and the label arm went with it -- silently, because no test asked whether one existed.
+# MEASURED on PR 897, 2026-09-05: `reviewed` was added at 20:39:02Z and `unread` was not withdrawn
+# until 20:42:38Z, by run 33990769043 reacting to a `workflow_run` COMPLETION. The read did not clear
+# the flag; an unrelated workflow finishing did.
+#
+# THE DETECTOR IS FED LITERALS, NEVER VALUES TAKEN FROM THE SHIPPED FILE. A control derived from the
+# artifact it judges moves with that artifact, so a real mutation reddens the control as well as the
+# test that should be naming the mutation -- two reds, one of them bookkeeping. The rule and the
+# measurement behind it are recorded in tests/test_merge_gate_controls.py's retirement note.
+
+
+def _signal_gaps(triggers: dict) -> list[str]:
+    """Ways a trigger set leaves the `unread` flag unable to be raised, or unable to be withdrawn.
+
+    Pure, and it takes a plain mapping so the controls below can plant one.
+    """
+    gaps: list[str] = []
+
+    run = triggers.get("workflow_run")
+    if not isinstance(run, dict) or not run.get("workflows"):
+        gaps.append(
+            "no `workflow_run` arm watching any workflow: nothing observes the last required check "
+            "settling, which is the only moment a pull request BECOMES green and unread, so the "
+            "flag is never raised"
+        )
+    elif "completed" not in (run.get("types") or []):
+        gaps.append(
+            "the `workflow_run` arm does not take `completed`: a run that has merely STARTED says "
+            "nothing about whether the pull request is green"
+        )
+
+    # A label event exists on these two events and nowhere else. An arm declaring no `types:` takes
+    # GitHub's default of [opened, synchronize, reopened], which carries neither label event -- so
+    # presence of the ARM is not presence of the TRIGGER, and both are checked.
+    arms = {
+        k: (triggers.get(k) or {}) for k in ("pull_request", "pull_request_target") if k in triggers
+    }
+    for event, why in (
+        (
+            "labeled",
+            "so `unread` is not withdrawn when somebody reads the pull request and labels it. It "
+            "waits for the next watched-workflow completion, and a pull request that is finished "
+            "and green -- the only kind this signal is about -- has none coming",
+        ),
+        (
+            "unlabeled",
+            "so removing `reviewed` cannot put the flag back. The pull request then stops being "
+            "reported as unread while being exactly that",
+        ),
+    ):
+        if not any(event in ((block or {}).get("types") or []) for block in arms.values()):
+            gaps.append(f"no arm fires on an `{event}` event, {why}")
+
+    return gaps
+
+
+def test_the_signal_gap_detector_fires_on_a_trigger_set_that_can_go_quiet() -> None:
+    """NEGATIVE CONTROL OF THE DETECTOR.
+
+    "The shipped triggers are whole" and "the detector matches nothing" are the same green, and
+    separating them is the whole point of this pair. Every planted set below is a LITERAL; the first
+    is the state this repository actually shipped between 2026-09-04 and the arm that fixed it.
+    """
+    watching = {"workflows": ["CI"], "types": ["completed"]}
+
+    shipped_regression = {"workflow_run": watching, "workflow_dispatch": None}
+    assert any("`labeled`" in g for g in _signal_gaps(shipped_regression)), (
+        "the detector cannot see a missing label arm, which is the exact shape that shipped"
     )
+    assert any("`unlabeled`" in g for g in _signal_gaps(shipped_regression))
+
+    assert any(
+        "workflow_run" in g for g in _signal_gaps({"pull_request_target": {"types": ["labeled"]}})
+    ), (
+        "the detector cannot see a missing workflow_run arm, which is how the flag stops being RAISED"
+    )
+
+    assert any(
+        "completed" in g
+        for g in _signal_gaps({"workflow_run": {"workflows": ["CI"], "types": ["requested"]}})
+    ), "the detector cannot see a workflow_run arm reacting to the wrong phase"
+
+    # PRESENCE OF THE ARM IS NOT PRESENCE OF THE TRIGGER. A bare `pull_request_target:` takes
+    # GitHub's default types, which carry no label event at all -- the shape most likely to be read
+    # as a fix while changing nothing.
+    bare = _signal_gaps({"workflow_run": watching, "pull_request_target": None})
+    assert any("`labeled`" in g for g in bare) and any("`unlabeled`" in g for g in bare), (
+        "the detector accepted a bare `pull_request_target:` as carrying a label trigger"
+    )
+
+    # Exactly one edge missing must report exactly one gap, or the detector cannot tell a half-fix
+    # from a whole one.
+    half = _signal_gaps({"workflow_run": watching, "pull_request_target": {"types": ["labeled"]}})
+    assert len(half) == 1 and "`unlabeled`" in half[0], half
+
+
+def test_the_signal_gap_detector_stays_quiet_on_a_trigger_set_that_only_widens() -> None:
+    """THE OTHER MUTATION, and a must-trip suite is blind to over-correction without it.
+
+    A detector broad enough to flag legitimate widening gets "fixed" by deleting the event somebody
+    added on purpose. Adding a cron, a push arm, or further pull-request types is not the hazard, so
+    each must stay clean here -- and this test must not go red for any mutation the one above
+    catches, or the two stop naming different breaks.
+    """
+    widened = {
+        "workflow_run": {"workflows": ["CI", "Security"], "types": ["completed"]},
+        "pull_request_target": {"types": ["labeled", "unlabeled", "reopened", "ready_for_review"]},
+        "workflow_dispatch": {"inputs": {"pr": {"required": True}}},
+        "schedule": [{"cron": "0 7 * * 1"}],
+        "push": {"branches": ["main"]},
+    }
+    assert _signal_gaps(widened) == [], (
+        "the detector flagged a trigger set that only ADDS events and types. Widening when this "
+        "workflow evaluates is legitimate, and a detector that refuses it will be silenced."
+    )
+
+
+def test_the_shipped_trigger_list_can_both_raise_and_withdraw_the_flag() -> None:
+    """THE DETECTOR AGAINST THE SHIPPED FILE, which is the half that can actually go wrong.
+
+    The controls above prove it can fire and that it does not fire at everything. This is what it
+    fires at.
+    """
+    gaps = _signal_gaps(_on(_doc()))
+    assert gaps == [], (
+        "unread-signal.yml's trigger list has a gap that reddens nothing else in CI:\n  "
+        + "\n  ".join(gaps)
+    )
+
+
+def test_the_label_arm_runs_on_the_event_whose_default_checkout_is_the_base() -> None:
+    """THE HALF `test_the_checkout_never_names_a_ref` CANNOT SEE, and the swap is one word.
+
+    A label event exists on `pull_request` and `pull_request_target` only, so restoring the
+    self-clearing chain had to take one of them. They are not interchangeable here:
+
+    * under `pull_request_target` a `ref:`-less checkout takes the BASE branch, and the workflow
+      FILE is read from the base too. Both trusted.
+    * under `pull_request` a `ref:`-less checkout takes the MERGE commit -- the pull request's own
+      code, fetched and executed under this job's `pull-requests: write` token -- and the workflow
+      file is read from the head as well.
+
+    So switching this one word opens the pwn-request hole the zizmor `dangerous-triggers`
+    suppression for this file says is closed, while leaving every other test in this module green.
+    scripts/quality/workflow_local_action_check.py records the same rule at its own source.
+    """
+    triggers = _on(_doc())
+    assert "pull_request_target" in triggers, (
+        "the label arm is gone or was renamed. If it moved to `pull_request`, read this docstring "
+        "before changing this assertion: that event's ref-less checkout takes the merge commit."
+    )
+    assert "pull_request" not in triggers, (
+        "a `pull_request` arm was added. Under it a `ref:`-less checkout takes the MERGE commit, so "
+        "this workflow would fetch and run the triggering pull request's code while holding "
+        "`pull-requests: write`. Use `pull_request_target`, whose ref-less default is the base."
+    )
+
+
+def test_the_label_arm_reaches_the_resolver_through_env() -> None:
+    """The `pull_request_target` arm carries its own number, and it must arrive the way the others
+    do -- through `env:`, never spliced into the shell body.
+
+    `test_every_event_value_reaches_a_script_through_env` refuses the splice generically. This names
+    the specific value, so deleting the arm's plumbing while leaving its trigger in place -- which
+    would resolve every label event to no pull request and do nothing, quietly -- is one named red.
+    """
+    env = _step("resolve").get("env", {})
+    hoisted = [k for k, v in env.items() if "github.event.pull_request.number" in str(v)]
+    assert hoisted, (
+        "no `env:` entry on the resolve step carries `github.event.pull_request.number`. The "
+        "`pull_request_target` arm then resolves to no pull request, and every label event is a "
+        "no-op run that reports success."
+    )
+    block = str(_step("resolve")["run"])
+    for name in hoisted:
+        assert name in block, f"{name!r} is declared in `env:` but the script never reads it"
+
+
+def test_both_arms_share_one_concurrency_key() -> None:
+    """Two runs asking "is this pull request unread" are the SAME fact.
+
+    The group must resolve to the same string for a label event and for a workflow completion on one
+    pull request, or the two arms serialise against nothing and the comment can post twice. Both
+    `workflow_run.head_branch` and `pull_request.head.ref` are the head's unqualified branch name,
+    which is why the key is a branch rather than a number.
+    """
+    concurrency = _doc()["concurrency"]
+    group = str(concurrency["group"])
+    assert "github.event.workflow_run.head_branch" in group
+    assert "github.event.pull_request.head.ref" in group, (
+        f"the concurrency group is {group!r}. A `pull_request_target` run falls through to an empty "
+        "key, so every pull request's label events share one group and a run for one blocks another."
+    )
+    assert concurrency["cancel-in-progress"] is False
 
 
 def test_the_comment_is_written_only_on_the_flag_transition() -> None:
