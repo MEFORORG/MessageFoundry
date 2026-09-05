@@ -1037,7 +1037,3 @@ def test_the_absence_detector_is_pointed_at_a_workflow_that_still_gates_a_merge(
         "required context whose workflow does not report wedges every pull request with nothing "
         "turning red."
     )
-
-
-# ===================================================================================================
-# `a reviewer has read this` -- run as the SHIPPED SHELL against planted label sets.
