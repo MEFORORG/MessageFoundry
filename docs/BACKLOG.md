@@ -7604,6 +7604,44 @@ clinical traffic the engine exists to tolerate. And the method question this ite
 "all input" or the L1 focus binds a level-1 requirement inside an L3 assessment, is still undecided
 and still decides whether the cell is reachable at all.
 
+**Built 2026-09-05: the network-listener sniff, the residual the 2026-08-20 research named. The item
+stays OPEN and this build is EXPLICITLY NOT SCOREABLE against the cell** -- the research already said
+so when it proposed the work, and the closing act is still `scorecard-rescore`, which is the ASVS
+Tracker's act followed by the Lander's banner flip. The HL7 limb is untouched and the method question
+is still undecided.
+
+**What shipped.** `_content_matches_declared` now runs on the shared ingress handlers the network
+listeners funnel through (`pipeline/wiring_runner.py`, `_handle_inbound` and `_handle_inbound_http`),
+so a non-HL7 body contradicting its inbound's declared `content_type` is dead-lettered instead of
+committed. **It went into the pipeline rather than into the four transport modules, and the
+disposition is what forced that.** A file source quarantines a mismatch to its `.error` directory and
+the research's own honesty test demands the check *decide*, not merely detect. A socket has no
+`.error` directory, and a transport does not hold the store, so a transport-level check could only
+log -- which that test names as earning nothing. The disposition that fits a socket is the one the
+decode, NUL and size guards beside it already take: a persisted `ERROR` row, so the body is recorded
+and the count-and-log invariant holds. The check keys on `content_type`, never on connector type, so
+it reaches every source arriving through those handlers without the pipeline special-casing a
+connection.
+
+**The `hl7v2` branch was deliberately left alone, and that is a measurement rather than a scoping
+choice.** `Peek.parse` rejects every body the sniff would and additionally rejects an `FHS`/`BHS`
+batch header the sniff accepts, so it is strictly stronger; wiring the sniff in front of it would
+have added a weaker duplicate check and no coverage. A test pins that an HL7 mismatch still reports a
+*parse* error and still NAKs, which is what tells the two apart.
+
+**One design point worth keeping.** The network path sniffs the DECODED head, not the original bytes,
+because unlike a file source it has a declared `encoding` and has already used it. Sniffing the bytes
+would have quarantined a legitimate `encoding="utf-16"` JSON body, whose leading bytes are a BOM and
+an interleaved NUL rather than a brace. For every ASCII-superset encoding the two are identical.
+
+**Two of this item's cited lines had drifted, re-measured at `c57903c2c` before anything changed; the
+substance held on both.** The file-family call site is at `transports/remotefile.py:1196`, not the
+`:1008` the 2026-08-20 research recorded, and `validation.strict: bool = False` is at
+`config/models.py:682`, not the `:667` recorded twice above. `parsing/sniff.py:63`,
+`transports/file.py:580` and `parsing/validate.py:44` all still read as written. The positive control
+in the same run is the file family itself: a probe finding the check absent on all six sources would
+be broken, not a finding, and it found it present on both file sources.
+
 ## 1110. research an honest pass for ASVS 2.2.3 -- whether cross-field reasonableness is shippable at all in a code-first engine, or belongs to the feed author
 
 > 🔢 **Re-scored 2026-08-20 -> P2.** Value **5/10** · Difficulty **5/10** · _fill-in_. The gap is unchanged: consistency.py:11-17 still describes itself as a compose-it-yourself toolkit, its only non-test importer is samples/consistency/validated_adt.py:27, and nothing on the shipped message path calls it. The research question is genuinely open and its most likely output is a negative finding, so worth-if-built is bounded by the clean existing workaround of a Handler composing the primitives; difficulty carries the HL7-general rule-set research plus, if a set exists, a check on the message hot path with tests. _(was 5/10 · 6/10.)_
