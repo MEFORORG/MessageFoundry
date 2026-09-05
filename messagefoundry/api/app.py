@@ -353,7 +353,48 @@ _WS_REVALIDATE_SECONDS = 3.0  # re-check the session on an open /ws/stats this o
 #: outside it. Non-GET routes under these prefixes pick the header up too, which is harmless.
 #: The ``/ui`` HTML surface is covered by its own branch in the middleware below.
 _NO_STORE_PREFIXES = ("/messages", "/dead-letters", "/search", "/logs", "/uploads")
+#: Route path TEMPLATES (not URL prefixes) whose responses project a column ``docs/PHI.md`` rates
+#: PL-1/PL-2/PL-3, but which no ``_NO_STORE_PREFIXES`` family reaches. They are gated on
+#: ``monitoring:read`` / ``monitoring:diagnose`` rather than on a PHI permission, and that is the whole
+#: reason they were missed: the control above is keyed to the PHI-read families, so sensitivity that
+#: arrives under a different permission falls outside it. ``connection_event.reason`` and
+#: ``alert_instance.reason`` are both **PL-2** free text (§2 of ``docs/PHI.md``), so these responses
+#: were served with no cache directive at all.
+#:
+#: TEMPLATES, because ``/connections/{name}/events`` cannot be written as a prefix without blanketing
+#: the whole ``/connections`` dashboard family — most of which returns no classified column. The
+#: middleware reads the template off ``request.scope["route"]``, which the router populates during
+#: ``call_next``. An exact set is safe here only because
+#: ``tests/test_no_store_phi_coverage.py`` selects routes by what their response model CARRIES rather
+#: than by what permission gates it: a new classified route that nobody adds here reds that guard.
+#:
+#: The PREFIX set above does not become redundant, and the reason is not style. A route can carry PHI
+#: with NO response model to inspect: ``GET /messages/{message_id}/attachments/{attachment_id}``
+#: streams raw detached-document bytes and declares no ``response_model`` at all, so no model walk can
+#: ever see it. Prefixes cover the families; this set covers the classified stragglers outside them.
+_NO_STORE_ROUTE_PATHS = frozenset(
+    {
+        "/events",
+        "/connections/{name}/events",
+        "/alerts/active",
+        # The alert-mutation replies return the same AlertInstanceInfo, PL-2 ``reason`` included.
+        "/alerts/{alert_id}/ack",
+        "/alerts/{alert_id}/resolve",
+        "/alerts/{alert_id}/suspend",
+        "/alerts/{alert_id}/resume",
+    }
+)
 _log = logging.getLogger(__name__)
+
+
+def _matched_route_path(request: Request) -> str | None:
+    """The matched route's path TEMPLATE (``/connections/{name}/events``), or ``None``.
+
+    The router writes the matched route into the request scope while ``call_next`` runs, so this is
+    readable in a middleware only AFTER the downstream call returns. ``None`` covers a 404 (nothing
+    matched) and a mount, neither of which is in :data:`_NO_STORE_ROUTE_PATHS`.
+    """
+    return getattr(request.scope.get("route"), "path", None)
 
 
 def _peer_display(value: Any) -> str | None:
@@ -1346,8 +1387,10 @@ def create_app(
         # /ui browser surface (ADR 0065 §5): a strict CSP (no unsafe-*) and no-store on every HTML
         # response; the vendored /ui/static assets keep StaticFiles' own cache. PHI JSON reads also get
         # no-store (every _NO_STORE_PREFIXES family, ASVS 14.2.2) so a browser/proxy never caches a
-        # message body, a search hit, a log line or an uploaded file's split messages. These are SET
-        # (override) so a stale cache directive can't slip through. nosniff/frame-deny/HSTS still apply.
+        # message body, a search hit, a log line or an uploaded file's split messages. The second arm,
+        # _NO_STORE_ROUTE_PATHS, carries the classified responses that arrive under a MONITORING
+        # permission and so sit outside every PHI-read family. These are SET (override) so a stale
+        # cache directive can't slip through. nosniff/frame-deny/HSTS still apply.
         path = request.url.path
         if (path == "/ui" or path.startswith("/ui/")) and not path.startswith("/ui/static"):
             # The /ui CSP is co-versioned with the app.js/app.css it governs, so the web console owns
@@ -1358,7 +1401,11 @@ def create_app(
             if ui_csp is not None:
                 response.headers["Content-Security-Policy"] = ui_csp
             response.headers["Cache-Control"] = "no-store"
-        elif path.startswith(_NO_STORE_PREFIXES):
+        # Prefix test first: it is a C-level startswith over a 5-tuple and short-circuits the whole
+        # PHI-read surface before the scope lookup is reached.
+        elif path.startswith(_NO_STORE_PREFIXES) or (
+            _matched_route_path(request) in _NO_STORE_ROUTE_PATHS
+        ):
             response.headers["Cache-Control"] = "no-store"
         return response
 
