@@ -139,6 +139,8 @@ from messagefoundry.store.store import (
     not_deployed_detail,
     owned_lane_scope,
     password_claim_set,
+    require_notify_email,
+    seed_notify_email,
     should_record_event,
 )
 
@@ -1373,7 +1375,11 @@ _SCHEMA: list[str] = [
         id NVARCHAR(64) NOT NULL PRIMARY KEY,
         username NVARCHAR(256) COLLATE Latin1_General_100_BIN2 NOT NULL UNIQUE,
         auth_provider NVARCHAR(16) NOT NULL, display_name NVARCHAR(256) NULL,
-        email NVARCHAR(256) NULL, disabled BIT NOT NULL DEFAULT 0, created_at FLOAT NOT NULL,
+        -- BACKLOG #1139: `email` is the PROFILE address / directory mirror (overwritten from the
+        -- directory `mail` attribute on every AD login); `notify_email` is the ENGINE-OWNED
+        -- notification target, seeded once at creation and never written by the directory sync.
+        email NVARCHAR(256) NULL, notify_email NVARCHAR(256) NULL,
+        disabled BIT NOT NULL DEFAULT 0, created_at FLOAT NOT NULL,
         updated_at FLOAT NOT NULL, last_login_at FLOAT NULL, password_hash NVARCHAR(512) NULL,
         password_changed_at FLOAT NULL, must_change_password BIT NOT NULL DEFAULT 0,
         failed_attempts INT NOT NULL DEFAULT 0, locked_until FLOAT NULL,
@@ -1441,6 +1447,18 @@ _SCHEMA: list[str] = [
         ALTER TABLE users ADD password_claimed_at FLOAT NULL;
         EXEC(N'UPDATE users SET password_claimed_at = password_changed_at
                WHERE must_change_password = 0 AND password_hash IS NOT NULL');
+    END""",
+    # The engine-owned notification address (BACKLOG #1139). NULL on an existing row would read as "no
+    # address on file", which excludes the account from every out-of-band security notice — so the ADD
+    # is paired with a one-time seed from the column that IS the notification target today. The seed
+    # MUST stay inside this COL_LENGTH guard: split out it becomes a permanent SECOND writer, and every
+    # directory login would then copy the directory's address back over the engine's, restoring the
+    # exact defect the split removes. EXEC defers the parse, so a statement naming a column added
+    # earlier in the SAME batch still compiles.
+    """IF COL_LENGTH('users','notify_email') IS NULL
+    BEGIN
+        ALTER TABLE users ADD notify_email NVARCHAR(256) NULL;
+        EXEC(N'UPDATE users SET notify_email = email WHERE email IS NOT NULL');
     END""",
     """IF OBJECT_ID('roles','U') IS NULL CREATE TABLE roles (
         id NVARCHAR(64) NOT NULL PRIMARY KEY, display_name NVARCHAR(128) NOT NULL,
@@ -6296,11 +6314,21 @@ class SqlServerStore:
         now: float | None = None,
         connection_cutoffs: Mapping[str, float] | None = None,
     ) -> int:
-        """Blank the payload of dead outbound rows updated before ``older_than`` (retention). Keeps the
+        """Blank the payload of dead rows updated before ``older_than`` (retention). Keeps the
         dead row + 'dead' status (counts/disposition) but frees the body; idempotent (payload <> '').
 
+        **Every stage, not only outbound** (#1188, ASVS 14.2.7) — mirrors the SQLite backend. A dead
+        ``ingress``/``routed`` row holds the full raw body and is neither pending nor inflight, so its
+        message is body-purge-eligible: the outbound-only scope blanked ``messages.raw`` while that raw
+        survived in the queue row unreachable by any sweep. :meth:`replay` re-queues such a row from its
+        own payload, so it is replayable-until-purged exactly as a dead outbound row is. The stage
+        predicate is dropped rather than widened to a list, so a later stage is covered by construction.
+
         ``connection_cutoffs`` (#34, ADR 0027) optionally overrides the cutoff per ``destination_name``
-        (``float('-inf')`` = keep forever); default empty ⇒ a single global cutoff, byte-identical."""
+        (``float('-inf')`` = keep forever); default empty ⇒ a single global cutoff, byte-identical. An
+        ingress/routed/response row has a NULL ``destination_name``, so ``CASE NULL WHEN ...`` matches no
+        arm and it takes the ``ELSE`` — always the global dead-letter window (``dead_letter_days`` is
+        declared on an OUTBOUND connection, so no inbound-keyed override exists to honour)."""
         cutoff_sql, cutoff_params = _qmark_cutoff_case(
             "destination_name", older_than, connection_cutoffs
         )
@@ -6308,8 +6336,8 @@ class SqlServerStore:
             try:
                 await cur.execute(
                     "UPDATE queue SET payload='', last_error=NULL"
-                    f" WHERE stage=? AND status=? AND payload <> '' AND updated_at < {cutoff_sql}",
-                    (Stage.OUTBOUND.value, OutboxStatus.DEAD.value, *cutoff_params),
+                    f" WHERE status=? AND payload <> '' AND updated_at < {cutoff_sql}",
+                    (OutboxStatus.DEAD.value, *cutoff_params),
                 )
                 purged = cur.rowcount
                 # #149 Phase 4 (mirrors SQLite Phase 3a): a dead row just lost its payload + body_ref, so
@@ -6321,10 +6349,9 @@ class SqlServerStore:
                 await self._release_message_attachments(
                     cur,
                     "message_id IN (SELECT DISTINCT q0.message_id FROM queue q0"
-                    f" WHERE q0.stage=? AND q0.status=? AND q0.updated_at < {cutoff_sql}"
+                    f" WHERE q0.status=? AND q0.updated_at < {cutoff_sql}"
                     f" AND NOT {self._attachment_still_referenced_sql('q0.message_id')})",
                     (
-                        Stage.OUTBOUND.value,
                         OutboxStatus.DEAD.value,
                         *cutoff_params,
                         OutboxStatus.PENDING.value,
@@ -9315,16 +9342,17 @@ class SqlServerStore:
     ) -> None:
         now = time.time() if now is None else now
         await self._execute(
-            "INSERT INTO users (id, username, auth_provider, display_name, email, disabled,"
-            " created_at, updated_at, last_login_at, password_hash, password_changed_at,"
+            "INSERT INTO users (id, username, auth_provider, display_name, email, notify_email,"
+            " disabled, created_at, updated_at, last_login_at, password_hash, password_changed_at,"
             " must_change_password, failed_attempts, locked_until)"
-            " VALUES (?,?,?,?,?,0,?,?,NULL,?,?,?,0,NULL)",
+            " VALUES (?,?,?,?,?,?,0,?,?,NULL,?,?,?,0,NULL)",
             (
                 user_id,
                 username,
                 auth_provider,
                 display_name,
                 email,
+                seed_notify_email(email),
                 now,
                 now,
                 password_hash,
@@ -9624,10 +9652,28 @@ class SqlServerStore:
         email: str | None,
         now: float | None = None,
     ) -> None:
+        """Write the account's profile fields. **This is the directory-sync write** — ``_upsert_ad_user``
+        calls it on every AD/OIDC login — so it deliberately does NOT name ``notify_email`` (BACKLOG
+        #1139). Adding that column to this SET list would hand the directory the notification target
+        back and restore the defect the split removes."""
         now = time.time() if now is None else now
         await self._execute(
             "UPDATE users SET display_name=?, email=?, updated_at=? WHERE id=?",
             (display_name, email, now, user_id),
+        )
+
+    async def set_user_notify_email(
+        self, user_id: str, *, email: str, now: float | None = None
+    ) -> None:
+        """Repoint the account's engine-owned notification address (BACKLOG #1139).
+
+        The parameter is ``str``, so a clear is unrepresentable; :func:`require_notify_email` rejects
+        the whitespace-only string that would mean the same thing. That refusal is the durability rule.
+        """
+        cleaned = require_notify_email(email)
+        now = time.time() if now is None else now
+        await self._execute(
+            "UPDATE users SET notify_email=?, updated_at=? WHERE id=?", (cleaned, now, user_id)
         )
 
     async def delete_user(self, user_id: str) -> None:

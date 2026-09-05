@@ -52,6 +52,10 @@ relay, naming the trust anchor when it does and the acknowledgment state when it
 because the **serve gate** is what refuses an unauthenticated alert hop on an enforcing PHI instance;
 this only makes the hop's posture readable in review. It states the secure case out loud rather than
 going quiet, so a passing line is never confused with a check that did not run.
+So is ``smart-scope`` (#1159, ASVS 10.2.3) — it names every SMART-authenticated connection whose
+requested ``smart_scope`` asks for permission letters the connection's declared ``interaction`` cannot
+spend. Advisory because a SMART authorization server registers scopes per app and MAY grant a subset of
+what is requested, so refusing a requested string risks taking a working clinical feed offline.
 Exit-code policy lives in the CLI (``__main__._check``): 0 iff no required check failed.
 """
 
@@ -175,6 +179,13 @@ def run_checks(
         # is not the surface anyone queries three months later. Advisory — see the checks.
         _check_expiry_relaxed(config_dir),
         _check_generic_db_tls(config_dir),
+        # #1159 / ASVS 10.2.3: name every SMART connection asking for more FHIR authority than its
+        # declared interaction can spend. Advisory, and a refusal was ruled out — see the check.
+        _check_smart_scope(config_dir),
+        # #1182 / ASVS 13.2.1: name every DATABASE hop on an unchanging credential. The store's own
+        # precondition is a StoreSettings method and reaches none of these. Advisory, and the refusing
+        # gate is deliberately deferred — see the check.
+        _check_static_db_credentials(config_dir),
         # #323 layer 3: report whether the [alerts] SMTP hop authenticates the relay. The defect this
         # closes was invisible for exactly as long as nothing reported it. Advisory — see the check.
         _check_alert_smtp_tls(
@@ -1634,9 +1645,19 @@ def _check_generic_db_tls(config_dir: str | Path) -> CheckResult:
     (``DatabasePoll``) as well as outbound: the poll link crosses the same hop with the same credential
     in the same DSN.
 
-    Advisory (``required=False``): the engine cannot prove a given driver keyword verifies anything, so
-    a refusal here would be guess-based and would break legitimate drivers — exactly what ADR 0092
-    declined. SKIPs when the graph will not load, same convention as its siblings."""
+    **This is the INVENTORY, and the refusal is elsewhere** (BACKLOG #1178). A generic hop whose
+    ``odbc_params`` say TLS is not required is now gated at connector construction through the shared
+    cleartext-hop authority (``transports.database.generic_cleartext_hop_guard``), so on an enforcing
+    instance it fails the REQUIRED ``build-check`` — which stamps the derived posture and constructs
+    every connector — rather than being reported here and crossed anyway.
+
+    So this stays ``required=False`` on purpose, and not because the arm is ungated. Two reasons, each
+    sufficient. It has no posture to key on, so a refusal here would have to re-derive the gradient's
+    loopback / attested / accepted arms from the graph — a second, silently different definition of a
+    decision that already has one. And the residual it reports is genuinely unjudgeable: the engine
+    cannot prove a driver keyword that IS set verifies anything, so refusing on that would be
+    guess-based and would break legitimate drivers, exactly what ADR 0092 declined. SKIPs when the graph
+    will not load, same convention as its siblings."""
     from messagefoundry.config.wiring import WiringError, load_config, unverified_generic_db_hops
 
     try:
@@ -1664,7 +1685,135 @@ def _check_generic_db_tls(config_dir: str | Path) -> CheckResult:
         required=False,
         detail=(
             f"{len(hops)} generic-ODBC DATABASE connection(s) may cross in plaintext — {listed}; "
-            "set a verifying keyword in odbc_params (e.g. SSLmode=verify-full)"
+            "set a verifying keyword in odbc_params (e.g. SSLmode=verify-full). An enforcing "
+            "instance REFUSES these off-loopback at build-check unless the connection declares "
+            "tls_hop_attested or cleartext_accepted"
+        ),
+    )
+
+
+def _check_smart_scope(config_dir: str | Path) -> CheckResult:
+    """Surface every SMART-authenticated connection whose requested ``smart_scope`` asks for permission
+    letters the connection's DECLARED shape cannot use (#1159, ASVS 10.2.3).
+
+    ASVS 10.2.3 asks that the OAuth client request only the scopes it requires. Before this, both scope
+    settings travelled from operator config to the wire through one ``str(...)`` conversion and nothing
+    else, and ``check`` carried no scope rule at all — so on a first deployment a site would be free to
+    request broader FHIR authority than the connection can spend, with nothing reporting it. This is
+    that report.
+
+    **Advisory (``required=False``), and a refusing gate was ruled out on the merits.** A SMART
+    authorization server registers scopes per app and MAY grant a subset of what is requested, so a
+    requested string that looks wrong here can be exactly the string a partner registered. Refusing it
+    would take a working clinical feed offline to enforce a preference, which is a worse failure than
+    the one it prevents. The instrument that fits is one that makes the mismatch readable in review.
+
+    **It computes a requirement from the connection's declared shape and compares the request against
+    it** — :func:`~messagefoundry.config.wiring.overbroad_smart_scopes` — rather than pattern-matching
+    a ``*`` character in the scope string. A character match would let an over-broad NON-wildcard scope
+    on a create-only connection pass unremarked while reading as a control.
+
+    What it deliberately stays quiet about is in that function's docstring: under-grant, the resource
+    half of the scope, ``transaction``/``batch``, a plain ``Rest()`` with SMART auth, an unparseable
+    scope vocabulary, and the generic OAuth2 leg. Each silence is a case where computing a requirement
+    would be guessing, and an advisory that fires on a valid configuration teaches operators to ignore
+    it.
+
+    It states the clean case out loud rather than going quiet, on the ``alert-smtp-tls`` convention, so
+    a passing line is never confused with a check that did not run. SKIPs when the graph will not load
+    — ``validate`` reports that, and a check that reported an empty set on an unloadable config would be
+    worse than one that says it could not look."""
+    from messagefoundry.config.wiring import WiringError, load_config, overbroad_smart_scopes
+
+    try:
+        registry = load_config(config_dir)
+    except (WiringError, OSError, ImportError, SyntaxError, ValueError) as exc:
+        return CheckResult(
+            "smart-scope",
+            ok=True,
+            required=False,
+            skipped=True,
+            detail=f"config did not load: {exc}",
+        )
+    over = overbroad_smart_scopes(registry)
+    if not over:
+        return CheckResult(
+            "smart-scope",
+            ok=True,
+            required=False,
+            detail="no SMART connection requests permission letters its declared shape cannot use",
+        )
+    listed = "; ".join(f"{name}: {reason}" for name, reason in over)
+    return CheckResult(
+        "smart-scope",
+        ok=True,
+        required=False,
+        detail=(
+            f"{len(over)} SMART connection(s) request more FHIR authority than the connection can "
+            f"spend — {listed}; narrow the request to the letters the interaction uses "
+            "(SMART v2: c=create, r=read, u=update, d=delete, s=search)"
+        ),
+    )
+
+
+def _check_static_db_credentials(config_dir: str | Path) -> CheckResult:
+    """Surface every declared DATABASE hop that authenticates with an unchanging credential
+    (BACKLOG #1182, ASVS 13.2.1), with its peer.
+
+    ASVS 13.2.1 asks that backend component communications use individual service accounts, short-term
+    tokens or certificates rather than unchanging credentials. The engine has exactly one control on
+    that verb today — the opt-in ``[store].require_managed_identity`` — and it is a ``StoreSettings``
+    method, so it covers the store hop and, by construction, no connector, lookup or reference hop at
+    all. On a first deployment a site could run four database hops on static SQL logins with nothing
+    naming them, while the one flag whose name reads as the engine's database-credential posture
+    reported itself satisfied. This is that report.
+
+    **Advisory (``required=False``), and a refusing gate is deliberately NOT built here.** #1182 records
+    the reason and it is not timidity: a gate shipped before every hop has a reachable compliant
+    credential kind collects an opt-out on precisely the hops that made the requirement fail, so its
+    opt-out list becomes the static-credential inventory. The inventory has to exist and be trusted
+    first. Whether the delegated-identity precondition is then widened, and whether it is scoped per
+    backend, is an owner decision this check does not pre-empt.
+
+    **Reported is not gated**, on the standing rule ``docs/DEPLOYMENT.md`` carries for the sibling
+    connection-scoped advisories: naming a hop here changes no disposition anywhere.
+
+    What it classifies, which table each hop lives in, and the one generic-ODBC case it deliberately
+    stays quiet on are in :func:`~messagefoundry.config.wiring.static_credential_db_hops`.
+
+    It states the clean case out loud rather than going quiet, on the ``alert-smtp-tls`` convention, so
+    a passing line is never confused with a check that did not run. SKIPs when the graph will not load
+    — ``validate`` reports that, and a check that reported an empty set on an unloadable config would be
+    worse than one that says it could not look."""
+    from messagefoundry.config.wiring import WiringError, load_config, static_credential_db_hops
+
+    try:
+        registry = load_config(config_dir)
+    except (WiringError, OSError, ImportError, SyntaxError, ValueError) as exc:
+        return CheckResult(
+            "static-db-credentials",
+            ok=True,
+            required=False,
+            skipped=True,
+            detail=f"config did not load: {exc}",
+        )
+    hops = static_credential_db_hops(registry)
+    if not hops:
+        return CheckResult(
+            "static-db-credentials",
+            ok=True,
+            required=False,
+            detail="no DATABASE hop authenticates with a static credential",
+        )
+    listed = "; ".join(f"{name}: {reason}" for name, reason in hops)
+    return CheckResult(
+        "static-db-credentials",
+        ok=True,
+        required=False,
+        detail=(
+            f"{len(hops)} DATABASE hop(s) authenticate with an unchanging credential — {listed}; "
+            "on SQL Server prefer auth='integrated' (gMSA) or auth='entra'. "
+            "[store].require_managed_identity does NOT cover these hops"
         ),
     )
 

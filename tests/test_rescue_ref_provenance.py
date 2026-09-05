@@ -422,6 +422,114 @@ def test_the_suite_OBSERVES_every_verdict_the_script_can_emit(tmp_path: Path) ->
     )
 
 
+def _repo_with_a_remote(path: Path, bare: Path) -> Path:
+    """A checkout plus a bare remote carrying the rescuetags refspec this repository really uses.
+
+    ``git config --get-all remote.private.fetch`` in the live checkout returns
+    ``+refs/tags/rescue/*:refs/remotes/private/rescuetags/*`` beside the ordinary branch line, so one
+    server-side tag arrives under a SECOND local name. That is not a quirk of one machine -- it is
+    why ``git tag -l 'rescue/*'`` cannot see the larger of the two populations.
+    """
+    repo = _repo(path)
+    subprocess.run(
+        ["git", "init", "-q", "--bare", "-b", "main", str(bare)], check=True, capture_output=True
+    )
+    _git("remote", "add", "priv", str(bare), cwd=repo)
+    _git(
+        "config",
+        "--add",
+        "remote.priv.fetch",
+        "+refs/tags/rescue/*:refs/remotes/priv/rescuetags/*",
+        cwd=repo,
+    )
+    return repo
+
+
+def test_the_audit_reads_the_PUSH_UPDATED_namespace_it_used_to_skip(tmp_path: Path) -> None:
+    """The largest population was never examined, and nothing said so.
+
+    Measured 2026-09-03 in the live checkout: 266 refs under ``refs/rescue`` and 1405 under
+    ``refs/tags/rescue`` were graded, while 1505 under ``refs/remotes/private/rescuetags`` were not
+    read at all. A ref under a name the audit does not enumerate is not reported as unexamined -- it
+    is absent, which reads exactly like a clean bill.
+    """
+    repo = _repo_with_a_remote(tmp_path / "r", tmp_path / "priv.git")
+    _git("checkout", "-b", "work", cwd=repo)
+    _advance(repo, "two\n")
+    assert _run(repo, "-Anchor", "mirrored").returncode == 0
+    _git("push", "-q", "priv", "refs/tags/rescue/mirrored", cwd=repo)
+    _git("fetch", "-q", "priv", cwd=repo)
+
+    verdicts = _verdicts(repo)
+    assert "refs/remotes/priv/rescuetags/mirrored" in verdicts, (
+        "the push-updated mirror is invisible to the audit"
+    )
+    # The positive control on the fixture: both names must exist, or 'the audit reads both' is
+    # satisfied by a repository that only has one.
+    assert "refs/tags/rescue/mirrored" in verdicts
+
+
+def test_a_LAGGING_push_updated_ref_does_not_read_like_a_PERMANENTLY_stale_tag(
+    tmp_path: Path,
+) -> None:
+    """ONE OBJECT, TWO NAMES, TWO MECHANISMS -- and the item's whole point is that they differ.
+
+    A ``refs/tags/rescue/*`` ref is a snapshot: nothing re-takes it, so behind its branch means
+    behind it forever. A ``refs/remotes/<remote>/rescuetags/*`` ref is force-moved by the durability
+    hook on the next commit, so behind its branch may merely be lag -- one such ref's reflog shows
+    six updates. Reporting the two at one severity is the naming collapse #1349 exists to name, and
+    a reader who checks "the rescue tag" gets opposite answers depending only on which name they
+    reach for.
+
+    The verdict is deliberately the SAME on both. It is the DETAIL, the thing a recovery decision is
+    actually made from, that has to differ.
+    """
+    repo = _repo_with_a_remote(tmp_path / "r", tmp_path / "priv.git")
+    _git("checkout", "-b", "work", cwd=repo)
+    _advance(repo, "two\n")
+    _run(repo, "-Anchor", "mirrored")
+    _git("push", "-q", "priv", "refs/tags/rescue/mirrored", cwd=repo)
+    _git("fetch", "-q", "priv", cwd=repo)
+    _advance(repo, "three\n")
+    _advance(repo, "four\n")
+
+    rows = _rows(repo)
+    tag = rows["refs/tags/rescue/mirrored"]
+    mirror = rows["refs/remotes/priv/rescuetags/mirrored"]
+
+    assert tag["commit"] == mirror["commit"], "fixture broken -- these must be the same object"
+    assert tag["verdict"] == mirror["verdict"] == "BEHIND"
+    assert tag["mechanism"] == "snapshot"
+    assert mirror["mechanism"] == "push-updated"
+    assert tag["detail"] != mirror["detail"], "same severity for two different mechanisms"
+    assert "NOT a defect" in tag["detail"]
+    assert "LAGGING" in mirror["detail"]
+
+    out = _run(repo, "-Check").stdout
+    assert "push-updated" in out and "snapshot" in out
+    assert "merely be lagging" in out
+
+
+def test_a_namespace_that_matched_NOTHING_is_still_named_in_the_coverage(tmp_path: Path) -> None:
+    """A namespace silently dropped for being empty is how a reader loses the ability to tell.
+
+    This is the standard the sibling ``unbacked_check.ps1`` already sets: a run that examined
+    nothing and a run that examined everything must not print the same reassuring line. An empty
+    namespace is the case where that is easiest to get wrong, because omitting it costs nothing and
+    looks tidier.
+    """
+    repo = _repo_with_a_remote(tmp_path / "r", tmp_path / "priv.git")
+    proc = _run(repo, "-Check", "-Json")
+    assert proc.returncode == 0, proc.stderr or proc.stdout
+    listed = {n["namespace"]: n for n in json.loads(proc.stdout)["namespaces"]}
+
+    assert listed["refs/remotes/priv/rescue"]["count"] == 0
+    assert listed["refs/remotes/priv/rescuetags"]["count"] == 0
+    assert listed["refs/rescue"]["mechanism"] == "snapshot"
+    assert listed["refs/remotes/priv/rescuetags"]["mechanism"] == "push-updated"
+    assert "refs/remotes/priv/rescuetags" in _run(repo, "-Check").stdout
+
+
 def test_an_annotated_tag_reports_its_COMMIT_not_the_tag_object(tmp_path: Path) -> None:
     """``rev-parse`` on an annotated tag returns the TAG OBJECT, and the item flags it by name.
 
