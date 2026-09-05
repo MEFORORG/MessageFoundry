@@ -8822,6 +8822,86 @@ That covers every startable topology, not just the loopback default. The one pos
 
 ## 1139. research an honest pass for ASVS 6.3.7 -- notifying a user whose authentication details the directory changed
 
+> **PARTIAL 2026-09-04 (builder), NOT A CLOSURE -- this item stays OPEN.** Re-measures the banner
+> below and lands the one thing it got wrong. **Three of its four load-bearing claims hold; the
+> fourth is refuted, and it is the claim the item's own question rests on.**
+>
+> **HELD, each read in the code rather than taken from the banner.** `update_user_profile` is the
+> only write `_upsert_ad_user` issues against an existing account (the else-branch in
+> `messagefoundry/auth/service.py`; the trailing `get_user` is a read, and `_audit` /
+> `_notify_security` touch no `users` row), and it names `display_name`, `email` and `updated_at`
+> only -- verified in all three backends (`store/store.py`, `store/postgres.py`,
+> `store/sqlserver.py`). `has_notifiable_admin` and `_assert_security_notice_is_deliverable`
+> (`messagefoundry/api/app.py`) both read `notify_email`. `set_user_notify_email` takes `email: str`,
+> and `require_notify_email` refuses the whitespace-only string.
+>
+> **REFUTED: "every `_notify_security` call site reads the new column."** Eighteen of nineteen did.
+> The nineteenth was `_upsert_ad_user`'s own EMAIL_CHANGED, which read `existing.email or email` --
+> the profile mirror, the one column a directory repoint is free to move. The notice about a
+> directory repoint was therefore addressed off the very column the split exists to protect. That is
+> ADR 0182 option 3 (notify the directory's NEW address) arrived at by a fallback rather than by
+> decision, and that option was rejected in terms.
+>
+> **SO THE ITEM'S QUESTION HAD NOT FULLY DISSOLVED.** It had dissolved for the other eighteen
+> notices and not for the one the question names.
+>
+> **Two states reach it, both DRIVEN rather than argued** -- logins against an in-memory store,
+> reading the address off the captured event:
+>
+> 1. **the SECOND consecutive repoint.** The mirror then holds what the first repoint wrote, so on a
+>    first deployment the notice would be addressed to an address an earlier repoint had installed,
+>    while the engine-owned address sat untouched on the account.
+> 2. **any repoint after an administrator clears the profile address.** ADR 0182 AC-4 guarantees the
+>    clear leaves `notify_email` standing; the empty mirror then fell through to the directory's NEW
+>    value.
+>
+> **WHY A GREEN SUITE COULD NOT SEE THIS, and it is the reusable part.** A single repoint on an
+> untouched account leaves both columns holding the same string, so
+> `test_directory_email_repoint_is_audited_and_notified_to_the_old_address` passes against the right
+> column and the wrong one alike, and AC-2's test triggers on a ROLES_CHANGED notice rather than on
+> the EMAIL_CHANGED the repoint itself emits. Both are honest tests. Neither can separate the two
+> columns, because the case that separates them was never built.
+>
+> **BUILT:** the address now reads `existing.notify_email or existing.email or email`, with two
+> tests driving the two states, each proven red first. **The mirror term is not dead** -- it is
+> reachable in exactly one state, which only this method produces: an account created with no
+> address that later acquired one from the directory, since `update_user_profile` writes the mirror
+> and never seeds `notify_email`. Also struck the completeness claim *"every notice, this one
+> included, is addressed to `users.notify_email`"* from two comments that cannot enforce it
+> (SDS-3.6) -- it was false about the very notice it described -- and stated the addressing rule and
+> its one exception once, on `SecurityEvent.email` (SDS-3.5).
+>
+> **WHAT A GRADER WOULD NOW MEASURE.** The closing act is a scorecard re-score, the record is not in
+> this repository, and nothing here was written to it. Two things a grader can now check that were
+> false before: every `_notify_security` call site addresses an engine-owned column no directory
+> statement can move, and the directory-repoint notice is reachable end to end rather than only
+> structurally present.
+>
+> **WHAT STILL HOLDS 6.3.7 SHORT IS THE NO-ADDRESS ARM, untouched by this build and re-measured.**
+> Three paths land `notify_email` NULL: `_ensure_bootstrap_admin` creates the first-run
+> Administrator with no address, `create_user` leaves it optional, and a directory account whose
+> `mail` attribute the directory never returns is born with none. `SecurityEventNotifier.notify`
+> then drops every notice for such an account silently.
+> **`_assert_security_notice_is_deliverable` fails CLOSED for it only in a narrow case** -- a PHI
+> instance under `enforce`, where it asks whether SOME enabled Administrator carries an address. A
+> non-administrator is not covered at all, nor is an administrator with one notifiable peer, and
+> under `warn` it only logs. On a first deployment those accounts would receive nothing.
+>
+> **STILL OPEN, unchanged by this build:** the first-login set-address step; generalising the
+> startup assertion from *some enabled Administrator* to every enabled account; passkey-removal
+> notice parity; the silent drop when no address is on file; and `AuthService.update_user` writing
+> both addresses from one field. **One follow-on is NEW and came out of this build:** nineteen call
+> sites each choosing the column correctly is the only thing holding the addressing rule up, and
+> nothing enforces it. A single choke point resolving the address inside `_notify_security` would,
+> but it is a nineteen-site signature change with a real read-after-write constraint at the two
+> sites that deliberately address a PRE-IMAGE. Named rather than numbered, because it is unfiled.
+>
+> The score and status are unchanged, so the ranked table above is deliberately not edited.
+> `ruff check`, `ruff format --check` and `mypy --strict` clean; 140 tests pass locally across the
+> auth service, auth store, notifier, AD pathway, OIDC and deliverability legs. The full suite was
+> not run locally, and the Postgres and SQL Server legs are hosted-runner only, so **CI is the
+> authority for those.**
+
 > **PARTIAL 2026-09-03 (builder), NOT A CLOSURE -- this item stays OPEN.** Lands the HONEST-PASS CORE
 > the research nominated: the column split, under an owner ruling of the same date, built rather than
 > staged because CLAUDE.md section 0 prices a breaking change at zero on a not-deployed beta. See
