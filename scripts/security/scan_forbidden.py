@@ -14,8 +14,8 @@ routable host IP -- which are not credentials but must never reach the open-sour
 Token authority is EXTERNALIZED. The committed source carries only STRUCTURAL detectors -- at least a
 routable-IPv4 detector, a worktree/branch slug detector, an absolute-home-path detector, a private
 artifact-URL detector and the prefix-free estate-identifier *shape*; the real customer/vendor name
-patterns, estate substrings, and
-the site-code numeric prefix are loaded at runtime from, in order of precedence:
+patterns, estate substrings, and the site-code numeric prefix are loaded at runtime from, in order
+of precedence:
 
   1. ``MEFOR_FORBIDDEN_TOKENS`` -- either a path to a token file OR the token content inline
      (newline-separated, same format). Used in CI via the Actions secret of the same name.
@@ -207,17 +207,19 @@ _HOME_PATH = re.compile(
 # backlog row that a later commit sweeps into the tree. This repo is public on GitHub and on PyPI, so
 # the paste and the publication are one step apart.
 #
-# PREVENTIVE, NOT REMEDIAL, and measured rather than assumed. At 16efb8cde over 2095 tracked files the
-# population is zero, with the needle printed beside each count and a two-sided control:
+# PREVENTIVE, NOT REMEDIAL, and measured rather than assumed. At 16efb8cde over the 2095 tracked files
+# the population is zero. THE CONTROL IS THE PART THAT MAKES THAT ZERO MEAN ANYTHING, and it must be a
+# control that FIRES over this same corpus -- an earlier draft of this block quoted a slug-detector
+# count as its control, which is itself zero on a healthy tree, so every row was a zero and the block
+# demonstrated only that something had been typed:
 #
-#     needle='claude\.ai/(code/)?artifact/<uuid-shape>'  files=0
-#     needle='claude\.ai/(code/)?artifact'               files=0
-#     CONTROL needle='worktree/branch slug'              files=3   (fires, so the search ran)
+#     detector hits over 2095 tracked files                      = 0
+#     CONTROL needle='<uuid-shape>' (bare UUID) over that corpus = 8 files / 35 lines   (FIRES)
+#     CONTROL planted URL through scan_file                      = 1 hit                (FIRES)
 #
 # Filed anyway because the sibling project hit it for real: KORUS carried two of these on its own
-# origin/main from the commit that brought its playbooks over, and its leak gate -- which has the same
-# three shape detectors this one does -- passed them both. They came out because a person read the
-# diff, which is the review this gate exists to make cheaper.
+# origin/main from the commit that brought its playbooks over, and its leak gate passed them both.
+# They came out because a person read the diff, which is the review this gate exists to make cheaper.
 #
 # THE UUID SHAPE IS REQUIRED ON PURPOSE, and it is what keeps the detector off its own documentation.
 # The placeholder this file, its tests and any future ADR have to print -- claude.ai/code/artifact/
@@ -225,8 +227,21 @@ _HOME_PATH = re.compile(
 # it, which earns an allowlist line, and an allowlist line here is a per-line veto over every OTHER
 # detector on that line too.
 #
-# A PUBLICLY SHARED artifact does not match either: that path segment is plural (/public/artifacts/),
-# so the literal `artifact/` cannot reach it. A deliberately published URL is not a disclosure.
+# THREE ADDRESSES, NOT ONE, and this is read off the vendor's own grammar rather than guessed. The
+# installed client (claude.exe 2.1.259, recovered with `grep -a`, negative control returning 0) parses
+#
+#     /code/(?:artifact|frame)/(?:([A-Za-z0-9_-]*)-)?(<uuid>)(?:[/?#]|$)
+#
+# and separately builds `${uuid}.frame.${env}claudeusercontent.com`. So `frame` is a sibling of
+# `artifact`, an OPTIONAL human-readable vanity segment may sit between the path and the UUID, and the
+# content host carries the UUID as a SUBDOMAIN with the string `claude.ai` absent entirely. A pattern
+# anchored on `artifact/` immediately followed by the UUID -- which is what this detector shipped as
+# first, and what KORUS still carries -- reports a file holding any of the other forms as CLEAN. The
+# vanity form is the one that matters most, because it is the shape a person's address bar produces
+# and pasting is the whole arrival path above.
+#
+# A PUBLICLY SHARED artifact still does not match: that path segment is plural (/public/artifacts/),
+# so the singular literal cannot reach it. A deliberately published URL is not a disclosure.
 #
 # NO BARE-UUID DETECTOR, and that is a decision with a number behind it. A bare UUID names no host, no
 # account and no project -- it is an opaque 128-bit integer, and it becomes a disclosure only when
@@ -237,9 +252,19 @@ _HOME_PATH = re.compile(
 # with an allowlist line that switches this whole gate off for the lines it covers. A gate people mute
 # is worth nothing. (KORUS reasoned to the same conclusion from a zero; a zero argues weakly either
 # way, so the number above is the one to cite.)
+#: The UUID, written once so the two arms below cannot drift into different ideas of one -- the same
+#: single-atom discipline the slug detector's two arms follow.
+_ARTIFACT_UUID = r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
+
 _ARTIFACT_URL = re.compile(
-    r"claude\.ai/(?:code/)?artifact/"
-    r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
+    # ARM 1 -- the path form on claude.ai. The vanity segment is bounded at 64 characters rather than
+    # left unbounded as the vendor writes it: the grammar's `*` is safe there because it is anchored
+    # at both ends, and here it is not. {0,64} still admits the vendor's own cap of 60.
+    rf"claude\.ai/(?:code/)?(?:artifact|frame)/(?:[A-Za-z0-9_-]{{0,64}}-)?{_ARTIFACT_UUID}"
+    # ARM 2 -- the direct content host, where the UUID is a SUBDOMAIN and `claude.ai` never appears,
+    # so arm 1 cannot see it however it is widened. A literal host anchors it, so it carries no
+    # false-positive risk worth trading against.
+    rf"|{_ARTIFACT_UUID}\.frame\.(?:staging\.)?claudeusercontent\.com",
     re.IGNORECASE,
 )
 

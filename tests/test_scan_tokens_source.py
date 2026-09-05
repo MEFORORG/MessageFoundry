@@ -1400,7 +1400,10 @@ def test_allowlist_rejects_an_entry_broad_enough_to_disable_the_estate_shape(
 _ART_UUID = "3f2a91c4-" + "b6d8-" + "4e1f-" + "9a07-" + "c5e2d4180b73"
 _ART_HOST = "claude." + "ai/"
 _ART_SEG = "artifact/"
+_ART_FRAME = "frame/"
 _ART_URL = _ART_HOST + "code/" + _ART_SEG + _ART_UUID
+#: The direct content host, where the UUID is a SUBDOMAIN and the string `claude.ai` is absent.
+_ART_CDN = _ART_UUID + ".frame." + "claudeusercontent" + ".com"
 
 
 @pytest.mark.parametrize(
@@ -1412,6 +1415,28 @@ _ART_URL = _ART_HOST + "code/" + _ART_SEG + _ART_UUID
         (f"handed over {_ART_HOST}code/{_ART_SEG}{_ART_UUID.upper()}", "upper-cased UUID"),
         (f"<https://{_ART_URL}>", "angle-bracketed, as a bare autolink"),
         (f"the write-up is at {_ART_URL}.", "a sentence-final period butted against it"),
+        # THE FOUR FORMS THE FIRST SHIPPED PATTERN MISSED, each read off the vendor's own grammar
+        # in the installed client rather than guessed. The vanity one is the form that matters
+        # most: it is what a person's address bar produces, and pasting is the arrival path this
+        # detector exists for.
+        (
+            f"banked at https://{_ART_HOST}code/{_ART_SEG}q4-migration-plan-{_ART_UUID}",
+            "a human-readable vanity segment before the UUID",
+        ),
+        (
+            f"see https://{_ART_HOST}code/{_ART_FRAME}{_ART_UUID}",
+            "the frame path, a sibling of artifact in the grammar",
+        ),
+        (
+            f"see https://{_ART_HOST}code/{_ART_FRAME}my-board-{_ART_UUID}",
+            "frame and vanity together",
+        ),
+        (f"served from https://{_ART_CDN}/", "the content host, where claude.ai never appears"),
+        (
+            f"served from https://{_ART_UUID}.frame.staging.claudeusercontent.com/",
+            "the staging content host",
+        ),
+        (f"asset at https://{_ART_URL}/index.html", "an asset sub-path below the UUID"),
     ],
 )
 def test_a_private_artifact_url_is_flagged_without_any_token_source(
@@ -1439,6 +1464,12 @@ def test_a_private_artifact_url_is_flagged_without_any_token_source(
         # the shape they are describing. A detector that refuses its own manual earns an allowlist
         # line, and that line vetoes every other detector on it.
         (f"paste a {_ART_HOST}code/{_ART_SEG}<uuid> into the handoff", "the doc placeholder"),
+        # The same placeholder on the frame path. Widening to cover `frame` must not cost the
+        # self-documentation property that the UUID requirement buys.
+        (f"or a {_ART_HOST}code/{_ART_FRAME}<uuid> link", "the doc placeholder, frame path"),
+        # The needle line the detector's own comment block prints. A detector that reds the file
+        # explaining it is the exact pressure that earns an allowlist entry.
+        (r"needle='claude\.ai/(code/)?artifact/<uuid-shape>'", "the comment's own needle line"),
         # A DELIBERATELY PUBLISHED artifact. The path segment is plural, so the literal `artifact/`
         # cannot reach it -- and a link its owner chose to publish is not a disclosure.
         (f"published at {_ART_HOST}public/artifacts/{_ART_UUID}", "a public artifact, plural path"),
@@ -1548,3 +1579,29 @@ def test_the_two_arms_are_DISJOINT_under_mutation(
     assert not fires(keep), (
         "over-narrow must leave the must-NOT-trip arm green, or the reds are not disjoint"
     )
+
+    # MUTATION C -- THE PATTERN AS FIRST SHIPPED, before the vendor grammar was read. It satisfies
+    # BOTH arms above, which is exactly why those two mutations cannot protect the vanity form: a
+    # suite that only pins the bare shape accepts a pattern blind to the address a person's browser
+    # actually produces. This is the regression the third mutation exists to catch.
+    vanity = f"banked at https://{_ART_HOST}code/{_ART_SEG}q4-migration-plan-{_ART_UUID}"
+    mod._ARTIFACT_URL = re.compile(  # type: ignore[attr-defined]
+        r"claude\.ai/(?:code/)?artifact/"
+        r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
+        re.IGNORECASE,
+    )
+    assert fires(trip) and not fires(keep), (
+        "precondition: the first-shipped pattern satisfies both of the arms above, which is what "
+        "makes it invisible to them"
+    )
+    assert not fires(vanity), "the first-shipped pattern is blind to the vanity form"
+
+    # And the SHIPPED pattern sees it. Reload rather than reassign, so this asserts against the
+    # real module rather than against a pattern this test typed.
+    fresh = _load(None, monkeypatch)
+    f = tmp_path / "vanity.md"
+    f.write_text(vanity + "\n", encoding="utf-8")
+    assert any(
+        "private artifact URL" in h
+        for h in fresh.scan_file(f, "docs/vanity.md")  # type: ignore[attr-defined]
+    ), "the shipped pattern must see the vanity form"
