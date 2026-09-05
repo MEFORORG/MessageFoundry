@@ -6,8 +6,8 @@
 elapsed since the lane's previous send began, so a partner that cannot absorb bursts sees a bounded send
 rate. Pacing is enforced ONCE at the pipeline delivery seam (``_pace_outbound``, called before the
 item/batch body in both the per_lane worker and the pooled dispatcher), keyed per-lane, and is
-byte-identical when unset. These tests cover the seam gate, the per-lane clock, lane independence, the
-no-pacing default, and the wiring validation. The BATCH seam proof lives in ``test_outbound_batch.py``.
+byte-identical when unset. These tests cover at least the seam gate, the per-lane clock, lane
+independence, the already-elapsed path, the no-pacing default, and the wiring validation. The BATCH seam proof lives in ``test_outbound_batch.py``.
 """
 
 from __future__ import annotations
@@ -161,6 +161,36 @@ async def test_unset_is_noop(store: MessageStore) -> None:
     runner._send_pace[DEST2] = 0.0  # explicit 0 is likewise off
     await runner._pace_outbound(DEST2)
     assert DEST2 not in runner._send_pace_at
+
+
+# --- _pace_outbound: (d) a lane that already waited long enough is NOT delayed again --------------
+
+
+async def test_pace_skips_the_wait_once_the_interval_has_passed(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The fourth path through the pacer: a prior send exists, but MORE than the interval has already
+    gone by, so nothing is owed and the lane must not be held at all. It still re-stamps, or the send
+    after this one would measure its interval from a stale instant and under-space.
+
+    THIS PATH HAD NO TEST. Measured 2026-09-05: adding ``else: await asyncio.sleep(interval)`` to the
+    elapsed branch -- a mutant that corrupts this path and no other -- left the whole pacing suite
+    green. The assertion below kills it. Reaching the branch against a real clock would have meant
+    really sleeping past the interval, which is why the wall-clock form never covered it; on a clock
+    the test owns it is one call to ``advance``.
+    """
+    runner = _runner(store)
+    interval = 0.05
+    runner._send_pace[DEST] = interval
+    probe = install_pace_probe(monkeypatch, runner)
+
+    await runner._pace_outbound(DEST)  # stamps the lane clock
+    probe.advance(interval * 2)  # a slow send: the interval elapsed on its own, twice over
+    await runner._pace_outbound(DEST)
+
+    assert probe.slept == []  # nothing owed, so nothing waited
+    # Re-stamped even though it did not wait, so the NEXT send paces from this one rather than the first.
+    assert runner._send_pace_at[DEST] == pytest.approx(probe.now, abs=1e-9)
 
 
 # --- integration: the SINGLE-MESSAGE seam is paced end-to-end via _dispatch_delivery (non-batch) --
