@@ -9222,6 +9222,91 @@ That covers every startable topology, not just the loopback default. The one pos
 
 **RETRACTED IN PLACE, kept because the wrong version is the one a later reader would re-derive:** an earlier reading of this item held that changing `:1323` alone would let `:1187` and `:1323` resolve two different accounts in one login. **That cannot happen, because `:1323` cannot be changed as the mutation specifies.** The divergence framing was wrong; the unbuildable-mutation finding replaces it.
 
+---
+
+### RE-VERIFIED 2026-09-04 AT ENGINE `a2eef0f3`. THE RE-SCORE BANNER IS NOW WRONG ON ONE LIMB, AND IT IS THE LIMB THE DIFFICULTY RESTED ON.
+
+**The 2026-08-20 banner says every named condition still holds and only the line numbers moved. Three of the four still hold. The fourth does not: `no uniqueness of any kind on the OIDC columns on any backend` is FALSE at HEAD.** Read the body below rather than the banner. The banner is left standing as the historical record, per this item's own convention of retracting in place rather than quietly patching.
+
+**Every anchor re-measured at HEAD, and every line number in the filed text and in the re-score has moved again.** Anyone citing a line from this item without re-reading it is citing a line that has moved twice.
+
+| Condition | Filed | Re-score 2026-08-20 | HEAD `a2eef0f3` | Holds? |
+|---|---|---|---|---|
+| One shared `users.username` namespace | `store.py:1590` (a blank line; corrected to `:1593`) | `store.py:1638` | `store/store.py:1840`, `store/postgres.py:528`, `store/sqlserver.py:1376` | YES on all three |
+| No uniqueness of any kind on the OIDC columns, any backend | asserted | asserted | `store/store.py:3375-3379`, `store/postgres.py:560-562`, `store/sqlserver.py:1432-1434` | **NO. It shipped.** |
+| `AuthProvider` carries no federated member | `auth/identity.py:23` | same | `auth/identity.py:19-23`, members `LOCAL` and `AD` only | YES |
+| Continuity guard short-circuits on an unbound account | `auth/service.py:1026` | `:1116` | `auth/service.py:1155-1157`, `and bound.oidc_subject is not None` | YES |
+| `oidc_username_claim` defaults to `preferred_username` | `config/settings.py:1906` | `:1968` | `config/settings.py:2029` | YES |
+| UPN allow-list constrains the suffix only | `auth/oidc/claims.py:341` | same | `auth/oidc/claims.py:341`, `domain.strip().lower() not in ...` | YES, still `:341` |
+
+**THE CONTROL FIRED, WHICH IS THE WHOLE POINT OF RE-RUNNING IT.** The 2026-08-13 amendment recorded `0/0/0` unique indexes naming the OIDC columns against a positive control of `13/8/10` total `UNIQUE` declarations. The same probe at HEAD returns **`1/1/1`** (`ux_users_federated_subject` in `store.py`, `postgres.py` and `sqlserver.py`) against a still-firing control of `10/6/8`. An instrument that once returned zero and now returns one on the same corpus is the discriminating evidence that the earlier zero was a true absence and this is a true presence, not a broken pattern either time.
+
+**BOTH HALVES OF THE 2026-08-13 SCHEMA AMENDMENT ARE BUILT, BY BACKLOG #1256 (its own banner dates the atomicity half 2026-08-27, five days after this item's last pass).** The columns are re-typed to a bounded width on SQL Server (`store/sqlserver.py:1394`, with the `COL_LENGTH = -1` re-type migration at `:1423-1426` and a comment naming the 1700-byte key limit the amendment predicted), and the filtered unique index exists on all three backends. The keyed lookup and the setter are on the Store protocol (`store/base.py:1772`, `:1780`) with all three implementations. **The instrument for the date is NOT git: this checkout is shallow (110 commits, `--is-shallow-repository` returns true), so `git log -S` returns the boundary commit for every string, including a control string that certainly predates it. Dates below come from the ledger banners, not from history.**
+
+### VERDICT: AN HONEST PASS IS REACHABLE, AND IT NO LONGER NEEDS A SCHEMA CHANGE TO GET THERE.
+
+The difficulty-7 estimate priced a new ADR plus a three-backend schema and index change plus an open trust decision. **The schema and index change is done.** What remains is code plus the one trust decision, and the decision is the only thing that has not moved since filing.
+
+**What the verb's own mitigation requires here.** 6.8.1 names registering and identifying the user by IdP ID plus the user's ID in that IdP. The engine now stores that pair and can look an account up by it. It does not yet *identify* by it. The federated leg reaches an account through three username-keyed reads and consults the pair only afterwards:
+
+- `auth/service.py:1127-1129` -- `authenticate_oidc` resolves the directory principal with `resolve_principal(username)`, where `username` came from the token claim.
+- `auth/service.py:1154` -- the #1015 continuity guard fetches by `principal.username`, then tests the pair. **This is the read that short-circuits**: `bound.oidc_subject is not None` at `:1157` is false on every never-federated account, so the guard passes exactly the accounts most at risk.
+- `auth/service.py:1228` -- `_complete_ad_login` fetches by `principal.username` again; `:1229` is the provider-confusion guard that stops an AD login adopting a like-named LOCAL account. **This is the read that returns the row the session is issued for.**
+- `auth/service.py:1238` runs `_upsert_ad_user` **before** the `federated_subject` branch at `:1239`, whose exclusivity veto reaches `get_user_by_federated_subject` at `:1260`. The pair is therefore an exclusivity check on an account already chosen by username, never a selector.
+
+**So the honest pass is a re-ordering, not a new primitive.** Resolve by `(issuer, subject)` at the head of `_complete_ad_login`, before `:1228`; on a hit, re-resolve the directory principal from the bound row's stored username rather than from the token claim, which removes identifier equality from the identification path -- literally the pinned text's parenthetical. `federated_subject` is already a parameter there (`:1222`) and already defaults to `None`, so the AD simple-bind and Kerberos callers are untouched by construction. Then delete the `:1157` short-circuit and answer first contact.
+
+**THE ITEM'S TRAP STILL STANDS AND MUST NOT BE RE-DERIVED.** Grounding the cell on the `(issuer, sub)` continuity pair is not an honest pass. `auth/oidc/claims.py:227` rejects any token whose `iss` differs from the single pinned issuer before the guard ever runs, so the pair cannot do cross-provider work. Rescoring `na` because the feature ships off is also not a pass.
+
+### THE REMAINING SCHEMA DELTA, PRICED
+
+**For the login path: none.** Columns, widths, filtered unique index, protocol method and three implementations all exist. A build that re-orders resolution writes no DDL.
+
+**For the reconciler: one nullable column on `users`, on three backends, no index.** `reconcile_directory_sessions` (`auth/service.py:1536`) runs on a shipped 300-second default (`config/settings.py:1965`) over every AD-provider account holding a live session, and every federated-bound account is an AD-provider account because `_upsert_ad_user` creates them that way. Its candidate filter (`:1560-1563`) has no exclusion for a bound row, and `_probe_principal` re-resolves with `resolve_principal(user.username)` (`:1522`), then rewrites the role set. **Keying identification at login while leaving this loop username-keyed would leave the same-identifier cross-provider attachment live after login.** Two ways out, and they price differently:
+
+1. **Exclude bound rows from the candidate set.** No schema at all -- `UserRecord` already carries `oidc_subject`. Cost: a bound account stops getting directory disable and role reconciliation, which is a security control traded away to fix a security control. Not obviously acceptable.
+2. **Re-key the probe to a non-reassignable directory attribute.** One nullable column (`TEXT` on SQLite and Postgres, `NVARCHAR(n)` on SQL Server), read per row rather than looked up, so **no index and therefore no SQL Server width trap**. Plus a new LDAP lookup, because `resolve_principal` takes only a username (`auth/ldap.py:355`). **`AdPrincipal.dn` (`auth/ldap.py:47-54`) is the attribute already carried and is the WRONG one:** a DN changes when the object is renamed or moved between organizational units, so it is not immutable. `objectGUID` is the immutable directory key and is not read anywhere today. Price this as the column plus an attribute read plus a DN-or-GUID lookup path, not as a column.
+
+### THE FIRST-FEDERATED-LOGIN CEREMONY IS STILL OPEN, AND THIS PASS DID NOT CLOSE IT
+
+An account that predates federation holds no `(issuer, sub)`. Whatever binds it the first time is trust-on-first-use wearing some hat. **The engine has zero deployments (CLAUDE.md section 0), so migration cost is zero and a staged ceremony buys nothing** -- but that removes a cost from the comparison, it does not choose. The options and what each costs:
+
+| Ceremony | What it trusts | Cost |
+|---|---|---|
+| Bind on first presentation (today's behaviour, `auth/service.py:1270-1276`) | The issuer's username claim, once | Free. Trusts the counterparty to name the account, which is the defect stated as a policy |
+| Administrative binding surface (set, unbind, rebind) beside the user-admin routes at `api/auth_routes.py:607-806`, step-up gated and audited, mirrored in the web console | An operator | Largest build. Also discharges the availability residual: today a legitimately reassigned username is a permanent lockout with no rebind path, so one control closes two defects |
+| Directory-credential-proved self-service link | The user's own directory password | Medium. **Unavailable for passwordless accounts** (Kerberos-only, or any account with no bindable credential), so it cannot be the only path |
+| Refuse first contact entirely until bound | Nothing | Cheapest to build, worst to operate: every account needs an out-of-band bind before it can ever federate |
+
+**Explicitly off the list, and previously measured:** binding on a directory-held immutable attribute. It is directory-readable and not secret, so an issuer willing to mint an arbitrary username claim will mint an arbitrary claim of any name. Note this does **not** rule the same attribute out for the *reconciler* above, where the purpose is re-resolving an already-identified account rather than authenticating it.
+
+**This decision is not the researcher's to take. It is an owner-level trust decision and it is the one thing blocking the build.**
+
+### IS AN `AuthProvider` OIDC MEMBER SEPARABLE AND CHEAPER? NO, AND THE MEASUREMENT SAYS WHY
+
+**Do not build a third member.** `username` is globally unique across one namespace, all three directory mechanisms converge on `_complete_ad_login`, and its single guard at `auth/service.py:1229` refuses any row whose `auth_provider` is not the AD value. A third member either breaks hybrid login at that guard or is written nowhere and enforces nothing. The discriminator belongs on the session, and it must name a consumer that can read it -- not the reconciler, which iterates account rows.
+
+**A CORRECTION TO THIS ITEM'S OWN THIRD CONDITION, measured at HEAD.** The item says a federated session and an LDAP simple bind report the same value and no code can tell them apart, **which also means no audit record can**. The second half is FALSE. `_complete_ad_login` adds `detail["mech"] = mech` to the `auth.login_success` row on the federated path only (`auth/service.py:1372-1374`), plus an `evidence` block carrying `amr`, `acr` and `sub`, and binding emits its own `auth.federated_subject_bound` row (`:1305-1310`). **An operator reading the audit store can tell a federated login from a simple bind.** What genuinely cannot is any code making a runtime decision: `Identity` carries `auth_provider` (`auth/identity.py:32`) and `SessionRecord` carries no mechanism field at all (`store/store.py:925-940`). Word the condition as *no runtime authorization decision can discriminate*, and drop the audit half. Introduction date not attributable here -- shallow checkout, see the instrument note above.
+
+**A small honest improvement that does not presume the ceremony decision, NAMED AND NOT BUILT:** exclude federated-bound rows from the reconciler's candidate filter, or re-key its probe. It is independent of both the resolution re-ordering and the ceremony, and it closes the post-login half of the attachment on its own. It is named here so a Builder can take it as its own item rather than smuggling it into this one.
+
+### SEVERITY, RESTATED AT HEAD
+
+On a first deployment running both the directory and the pinned OIDC issuer, a principal that issuer will mint an allow-listed-suffix UPN for could land on a **never-federated** AD account and inherit its directory-derived roles, with no credential compromise required. The allow-list constrains the suffix only (`auth/oidc/claims.py:341`) and defaults to the configured `ad_domain` (`config/settings.py:2350-2360`); the claim it reads defaults to `preferred_username` (`config/settings.py:2029`), which OIDC Core calls neither unique nor stable. **Whether an operator's IdP will mint such a UPN is a property of that tenancy, not of this engine.** Nothing here is a live exposure: the engine has zero deployments.
+
+### TRACKER HANDOFF
+
+For whoever performs the closing act (scorecard-rescore, in the vault, not here):
+
+1. **The cell's schema-absence premise is stale.** Uniqueness on `(oidc_issuer, oidc_subject)` exists on all three backends, filtered, at `messagefoundry/store/store.py:3375-3379`, `messagefoundry/store/postgres.py:560-562`, `messagefoundry/store/sqlserver.py:1432-1434`. Re-read the call site, not the symbol.
+2. **The residual is now narrower and entirely code plus one decision.** Identification is username-keyed at `messagefoundry/auth/service.py:1127-1129`, `:1154` and `:1228`; the pair is consulted only at `:1260`, after selection.
+3. **The unbound short-circuit is the whole first-contact gap**, at `messagefoundry/auth/service.py:1155-1157`.
+4. **Do not rescore on the continuity pair.** `messagefoundry/auth/oidc/claims.py:227` pins the issuer before any guard runs, so the pair cannot discriminate cross-provider. That is 10.5.2's verb.
+5. **Correct the audit half of the third condition** against `messagefoundry/auth/service.py:1372-1374`.
+6. **The post-login loop is unexamined by the cell**: `messagefoundry/auth/service.py:1536`, candidate filter `:1560-1563`, probe `:1522`, on a 300-second default at `messagefoundry/config/settings.py:1965`.
+
+**This pass wrote no code, changed no schema, and touched no vault file.** Research only, per its brief.
+
 ## 1144. research an honest pass for ASVS 6.8.4 -- IdP-asserted strength and recentness when two of the three login legs assert nothing
 
 > 🔢 **Re-scored 2026-08-20 -> P2.** Value **6/10** · Difficulty **5/10** · _quick win_. Gap stands on both axes: auth_time appears nowhere in the auth tree, flow.py requests no max_age, and service.py:884/:914 still mint mfa_verified=True on the directory legs with no IdP evidence, so a directory session would satisfy the step-up gate on a first deployment (value 6). The remainder prices at 5, not 6: the AD arm is deferred to #296 by the item's own text, so the deliverable is a research finding plus at most an OIDC-leg recency check, a setting and a SECURITY.md fallback, with the store limb bounded to one nullable column on a sessions table that already gained reauth_at the same way (store.py:3181). _(was 6/10 · 7/10.)_
