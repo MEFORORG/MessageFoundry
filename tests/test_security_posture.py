@@ -278,8 +278,8 @@ def test_required_jobs_carry_no_continue_on_error() -> None:
         f"[security-posture] examined {examined} distinct jobs backing "
         f"{len(required_contexts())} required contexts"
     )
-    assert examined == 12, (
-        f"expected the 14 required contexts to resolve to 12 distinct jobs (the 3 `test` legs share "
+    assert examined == 11, (
+        f"expected the 13 required contexts to resolve to 11 distinct jobs (the 3 `test` legs share "
         f"one matrix job); got {examined}. If the workflow layout genuinely changed, update this "
         "count."
     )

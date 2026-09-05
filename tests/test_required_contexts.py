@@ -116,7 +116,7 @@ def test_the_canonical_file_parses_and_names_the_live_set() -> None:
     # one. A count that only ever fails when someone edits the FILE cannot notice the server moving
     # underneath it, so reconcile against the API, never against this number. The server moved four
     # times on 2026-07-29 and twice more on 2026-08-31.
-    assert len(contexts) == 14, (
+    assert len(contexts) == 13, (
         f"the canonical required set changed to {len(contexts)} contexts. If branch protection really "
         "changed, update this count AND every claim this suite checks; if it did not, revert the file."
     )
