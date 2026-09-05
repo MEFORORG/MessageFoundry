@@ -187,8 +187,16 @@ target, no `pickle` import left to mis-suppress:
   `str`. Without it the per-entry Python walk over `reference_view` made `mode=subprocess` ~5×
   slower per message than the pickle it replaced on a 20k-entry table. With it, that table costs
   ~1.4× the pickle round-trip (4.5 ms vs 3.3 ms of marshalling; ~6.2 ms end-to-end per dispatch,
-  ~0.19 ms with no reference view) — the standing, measured price of a non-executing wire, and well
-  inside the ~60 msg/s per-interface end-to-end bound the pipeline already has.
+  ~0.19 ms with no reference view) — the standing price of a non-executing wire.
+  **Corrected 2026-09-04 (BACKLOG #1194): this line used to call that "well inside the ~60 msg/s
+  per-interface end-to-end bound", which set a PER-DISPATCH cost against a PER-MESSAGE bound.** A
+  message that routes to one handler pays the cost twice — one router dispatch and one transform
+  dispatch — on the same serialized per-inbound worker. Re-measured against an artifact
+  ([`docs/benchmarks/results/2026-09-04-adr0087-sandbox-dispatch/`](../benchmarks/results/2026-09-04-adr0087-sandbox-dispatch/README.md),
+  instrument `scripts/bench/sandbox_dispatch.py`): the no-reference figure holds at ~0.19 ms per
+  dispatch, so the shipped posture costs **0.40 ms per message** (±3 percent over five runs); the
+  20k-table case costs **about 16 ms per message**, a sandbox-only per-lane ceiling of roughly
+  61–66 msg/s — the whole of that stated budget, not a slice of it.
 - **`CapturedResponse` relocated** to the store-free `config/response.py` (re-exported from
   `store/store.py`). It is what `response_view` carries, and `messagefoundry.store` is on the
   forbidden-import list — so `mode=subprocess` plus a LOOPBACK inbound with a correlated reply was
@@ -322,6 +330,17 @@ dispatch, an accepted cost of the opt-in isolation mode (`code_sets`, the larges
 hoisted out of the per-dispatch frame entirely). A value outside the closed grammar fails closed
 (`SandboxError`), never silently degrading — and the reverse is also true, so a Handler returning an
 exotic object now reports a *codec* rejection rather than the pickle error text it used to.
+
+**Resident footprint, measured 2026-09-04 (BACKLOG #1194) — this ADR did not state it.** The worker
+is one persistent child *per inbound*, and that child costs **~50 MiB unique / ~77 MiB resident**
+([the artifact](../benchmarks/results/2026-09-04-adr0087-sandbox-dispatch/README.md); a minimal
+one-router one-handler graph, so it is a floor), plus a one-time spawn and config load measured in
+**seconds** (1.8–2.7 s). Against the committed 1,500-connection target that is roughly **74 GiB** and 1,500 extra OS
+processes. The bill attaches to the per-inbound worker *cardinality*, not to the process boundary —
+a bounded shared worker pool would decouple it from the connection count, and would keep the
+property this ADR claims (a boundary to the **engine**) while dropping only one it already disclaims
+in `sandbox.py` (the seam draws no line between admin functions). Not a defect of the opt-in mode;
+it is the constraint any proposal to make `subprocess` a *default* has to clear first.
 
 **Out of scope / honest residuals** —
 - **DEK-in-worker:** the child never constructs the store/DEK, so there is no DEK in the worker to

@@ -163,6 +163,12 @@ log = logging.getLogger(__name__)
 _FIFO_HEADS_LANE_CHUNK = 500
 # ADR 0066 §3.1: release_claimed id-chunk bound (ids per UPDATE statement).
 _RELEASE_CHUNK = 500
+# BACKLOG #1169: rows per batch for the `attachment_chunk` at-rest migration. Every OTHER cipher pass
+# batches 500 because its rows are kilobyte-shaped; one attachment_chunk row is a whole
+# DETACH_CHUNK_BYTES (1 MiB) slice, ~1.33 MiB once base64+GCM sealed. 16 keeps a batch near 21 MiB,
+# which is the memory budget the 500-row passes actually spend; 500 here would be ~650 MiB held in a
+# single transaction while the store is still opening.
+_ATTACHMENT_CHUNK_BATCH = 16
 
 # Advisory-lock keys passed to the TWO-key pg_advisory_xact_lock(classid, hashtext($key)). They
 # serialize the audit-chain append (H-7) and schema init across concurrent opens; the finalize lock is
@@ -1745,6 +1751,21 @@ class PostgresStore:
                 encrypt=True,
                 value_col=col,
             )
+        # The `attachment_chunk` table (#149, ADR 0105) is cipher-covered (`ciphertext`) with the
+        # composite PK (attachment_id, seq), so it can't ride the id-keyed loop either. Its ROTATION
+        # pass already existed; this ON-OPEN pass did not, so a keyless→keyed transition left legacy
+        # plaintext chunks unsealed on this backend while SQLite sealed them (BACKLOG #1169).
+        # A SMALL batch, unlike every sibling above: each row is one DETACH_CHUNK_BYTES (1 MiB) slice
+        # rather than a kilobyte-shaped value, so 500 would hold ~650 MiB resident in one transaction
+        # while the store is still opening.
+        total += await self._encrypt_existing_composite(
+            "attachment_chunk",
+            ("attachment_id", "seq"),
+            like,
+            encrypt=True,
+            value_col="ciphertext",
+            limit=_ATTACHMENT_CHUNK_BATCH,
+        )
         # BIGSERIAL-id tables bind to insert-time-known natural columns (id_keyed=True; see
         # _CIPHER_COLUMNS) — their own composite migration passes (ASVS 11.3.3).
         total += await self._encrypt_existing_composite(
@@ -1783,6 +1804,7 @@ class PostgresStore:
         encrypt: bool,
         value_col: str = "value",
         id_keyed: bool = False,
+        limit: int = 500,
     ) -> int:
         """Encrypt the ``value_col`` of a non-id-keyed table in place — the migration loop for tables that
         can't ride the id-keyed loop. Each value binds to ``cell_aad(table, value_col, *aad_cols)`` (ASVS
@@ -1791,7 +1813,11 @@ class PostgresStore:
         ``response`` passes ``body``/``detail``. ``aad_cols`` are the composite PK for state/reference/
         response; for the BIGSERIAL-id tables (``message_events``/``connection_event``/``alert_instance``)
         set ``id_keyed=True`` — the AAD then comes from ``aad_cols`` (insert-time-known natural columns)
-        while the UPDATE targets ``id`` (so a natural-column collision can never re-write the wrong row)."""
+        while the UPDATE targets ``id`` (so a natural-column collision can never re-write the wrong row).
+
+        ``limit`` is the rows held in memory per batch. 500 suits the KILOBYTE-shaped columns this
+        started with (state/reference/response); ``attachment_chunk`` holds one 1 MiB slice per row,
+        where 500 would be ~650 MiB resident inside a single transaction at store open."""
         rotated = 0
         select_cols = ("id", *aad_cols) if id_keyed else aad_cols
         pk_select = ", ".join(select_cols)
@@ -1801,7 +1827,7 @@ class PostgresStore:
         while True:
             rows = await self._fetchall(
                 f"SELECT {pk_select}, {value_col} AS v FROM {table}"
-                f" WHERE {value_col} NOT LIKE $1 AND {value_col} <> '' LIMIT 500",
+                f" WHERE {value_col} NOT LIKE $1 AND {value_col} <> '' LIMIT {int(limit)}",
                 like,
             )
             if not rows:
@@ -4890,18 +4916,18 @@ class PostgresStore:
     ) -> tuple[str, list[Any]]:
         """Build the ``(where, params)`` (``$1``-based) for :meth:`purge_dead_letters`' attachment
         release: the messages owning a dead row purged in this window whose LAST replayable row is now
-        gone. ``$1``=OUTBOUND stage, ``$2``=DEAD status, cutoff from ``$3``. Mirrors SQLite."""
+        gone. ``$1``=DEAD status, cutoff from ``$2``. Mirrors SQLite — stage-agnostic since #1188, so a
+        message whose last replayable row is a dead INGRESS row releases its attachment here too."""
         cutoff_sql, cutoff_params, idx = _pg_cutoff_case(
-            "q0.destination_name", older_than, connection_cutoffs, start=3
+            "q0.destination_name", older_than, connection_cutoffs, start=2
         )
         still = self._attachment_still_referenced_sql("q0.message_id", idx, idx + 1)
         where = (
             "message_id IN (SELECT DISTINCT q0.message_id FROM queue q0"
-            f" WHERE q0.stage=$1 AND q0.status=$2 AND q0.updated_at < {cutoff_sql}"
+            f" WHERE q0.status=$1 AND q0.updated_at < {cutoff_sql}"
             f" AND NOT {still})"
         )
         params = [
-            Stage.OUTBOUND.value,
             OutboxStatus.DEAD.value,
             *cutoff_params,
             [OutboxStatus.PENDING.value, OutboxStatus.INFLIGHT.value],
@@ -7125,24 +7151,33 @@ class PostgresStore:
         now: float | None = None,
         connection_cutoffs: Mapping[str, float] | None = None,
     ) -> int:
-        """Null the bodies of dead-lettered **outbound** rows last updated before ``older_than`` (their
-        own retention window). Keeps the row + ``dead`` status; blanks ``payload`` + ``last_error``.
+        """Null the bodies of dead-lettered rows last updated before ``older_than`` (their own
+        retention window). Keeps the row + ``dead`` status; blanks ``payload`` + ``last_error``.
         Ported, not stubbed. Returns the number of dead rows purged.
+
+        **Every stage, not only outbound** (#1188, ASVS 14.2.7) — mirrors the SQLite backend. A dead
+        ``ingress``/``routed`` row holds the full raw body and is neither pending nor inflight, so its
+        message is body-purge-eligible: the outbound-only scope blanked ``messages.raw`` while that raw
+        survived in the queue row unreachable by any sweep. :meth:`replay` re-queues such a row from its
+        own payload, so it is replayable-until-purged exactly as a dead outbound row is. The stage
+        predicate is dropped rather than widened to a list, so a later stage is covered by construction.
 
         ``connection_cutoffs`` (#34, ADR 0027) optionally overrides the cutoff per ``destination_name``
         (``float('-inf')`` = keep forever); default empty ⇒ a single global cutoff, byte-identical to
-        the prior behaviour."""
+        the prior behaviour. An ingress/routed/response row has a NULL ``destination_name``, so
+        ``CASE NULL WHEN ...`` matches no arm and it takes the ``ELSE`` — always the global dead-letter
+        window (``dead_letter_days`` is declared on an OUTBOUND connection, so there is no inbound-keyed
+        override to honour)."""
         now = time.time() if now is None else now
-        # stage/status are $1/$2; the cutoff CASE (#34) numbers from $3 onward.
+        # status is $1; the cutoff CASE (#34) numbers from $2 onward.
         cutoff_sql, cutoff_params, _ = _pg_cutoff_case(
-            "destination_name", older_than, connection_cutoffs, start=3
+            "destination_name", older_than, connection_cutoffs, start=2
         )
         async with self._timed_acquire() as conn:  # noqa: SIM117
             async with conn.transaction():
                 result = await conn.execute(
                     "UPDATE queue SET payload='', last_error=NULL"
-                    f" WHERE stage=$1 AND status=$2 AND payload <> '' AND updated_at < {cutoff_sql}",
-                    Stage.OUTBOUND.value,
+                    f" WHERE status=$1 AND payload <> '' AND updated_at < {cutoff_sql}",
                     OutboxStatus.DEAD.value,
                     *cutoff_params,
                 )

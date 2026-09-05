@@ -149,11 +149,22 @@ MessageFoundry states the boundary and adds one opt-in precondition check (#203)
 - **Managed identity over static credentials.** The store can authenticate with a managed / delegated
   identity — SQL Server `[store].auth = integrated` (gMSA / Windows Integrated) or `entra` (Microsoft
   Entra ID) — instead of a static username + password. Set `[store].require_managed_identity = true` to
-  make it a **checked precondition**: on a **production** instance `serve` **refuses to start** (a
-  non-production instance **warns**) if the store still uses a static SQL login, or a Postgres store
-  (which has no managed-identity mode). Off by default. AD (`ad_bind_password`) and SMTP
+  make it a **checked precondition**: `serve` **refuses to start** if the store still uses a static SQL
+  login, or a Postgres store (which has no managed-identity mode). Off by default. **The refuse/warn
+  split is `[security].enforcement`, not the deployment tier** — `enforce` is the shipped default on
+  `dev` and `staging` as much as on `prod`, so a staging box that turns this on and leaves `auth = "sql"`
+  is refused, not warned; it downgrades to a warning only under `enforcement = warn`. See
+  [`docs/CONFIGURATION.md`](CONFIGURATION.md), which is the source of record for that split.
+  AD (`ad_bind_password`) and SMTP
   (`email_password`) have no managed-identity mode yet — supply those secrets via the environment
   (`MEFOR_*`, never the config file) under a least-privilege service account.
+- **The precondition covers the STORE hop and nothing else** (ASVS 13.2.1, BACKLOG #1182).
+  `managed_identity_precondition` is a `StoreSettings` method, so the `[store]` service settings are all
+  it can read — the four graph-declared database hops (`Database`, `DatabasePoll`, `DatabaseLookup`,
+  `DatabaseRef`) are outside its reach by construction, and each defaults to a static SQL login. Setting
+  the flag therefore says nothing about them. `messagefoundry check`'s advisory `static-db-credentials`
+  line is what names that set; it reports and does not refuse. See
+  [`docs/CONNECTIONS.md`](CONNECTIONS.md) §*Static database credentials*.
 - **Least-privilege secret access** is the operator's precondition: secrets live in the environment, the
   engine's service account is granted only what it needs (the least-privilege account + ACLs are the
   Windows-service install's job), and at-rest custody is the DPAPI / KeyProvider chain. The precondition
@@ -1212,6 +1223,7 @@ one-to-one — that is why the bind/exposure posture occupies two rows and the A
 | Bootstrap-admin claim state × age × admin population | `users.password_claimed_at` and `users.created_at` for the built-in bootstrap account × whether a second enabled Administrator exists | still unclaimed (`password_claimed_at` unset — only the holder's own self-service rotation stamps it, and nothing clears it) **and** (`now ≥ created_at + bootstrap_expiry_hours × 3600` **or** another enabled admin exists); `0` = no time expiry | **DENY** — the account is disabled, **all** its sessions revoked, `auth.bootstrap_admin_retired` audited. A *claimed* bootstrap account is never touched, and an admin password reset does not un-claim it (ADR 0164) | 72 h | `[auth].bootstrap_expiry_hours` |
 | Browser `Origin` at the WebSocket handshake | the `Origin` header on the upgrade | absent (a native client) → allowed; present → must be an exact member of the list, whose default `[]` rejects **every** browser Origin | **DENY** before `accept()`, so the route never runs | `[]` | `[api].ws_allowed_origins` |
 | Cross-site request signal on a `/ui` state change | `Sec-Fetch-Site` (preferred) else `Origin` vs our own origin (`[api].public_origin` is authoritative when set; `Host` is the fallback) | `Sec-Fetch-Site` ∈ {cross-site, same-site}, or a non-matching `Origin` | **DENY** 403 — defence-in-depth over the `SameSite=Strict` cookie, deliberately token-free | on | `[api].public_origin` |
+| Fetch metadata on **every** `/ui` request, including the `/ui/static` mount | `Sec-Fetch-Site` / `-Mode` / `-Dest` / `-User`, read as ASGI middleware (`_security.UiFetchMetadataMiddleware`) rather than as a route dependency — a Starlette `Mount` runs no dependencies, so the asset tier is the one surface the row above cannot reach | `Sec-Fetch-Site` ∈ {cross-site, same-site}, **unless** the request is a safe top-level navigation: `Sec-Fetch-Mode: navigate` **and** method GET/HEAD **and** `Sec-Fetch-Dest: document` (an **allowlist** — `iframe`/`frame`/`object`/`embed` and an omitted destination are all framing or evasion) **and**, for `same-site` only, `Sec-Fetch-User: ?1`. Only the `same-site` half demands user activation, because `SameSite` keys on the site and a site ignores the port: on the loopback default `http://127.0.0.1:9999` is same-site, so its scripted `window.open` arrives **with the session cookie**, which a cross-site page cannot manage. Cross-site is deliberately **not** asked for `?1` — the IdP's redirect back to the OIDC callback is a server-driven 302 with no user activation once the IdP session is established. An **absent** `Sec-Fetch-Site` is ALLOWED and every rule here is reached only after it has arrived, so a non-browser client (the shipped Windows tray's own liveness `GET /ui` sends no headers at all) is wholly unaffected; failing closed there is a browser-support decision rather than a hardening pass, and is tracked with its measured cost on **BACKLOG #1122** | **DENY** 403, **never 404** (`tray/probe.py` reads 404 as console-DISABLED and every other status as ENABLED) | on | (no knob) |
 
 #### Table B — data plane (ingest listeners)
 
