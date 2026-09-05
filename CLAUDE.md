@@ -401,8 +401,13 @@ clause describes the machine today.
   narrate each. Respect the ledger gate: never `--no-verify`, never a rename workaround.
 - A long commit message can fail to parse. The harness reported a 1015-byte ceiling when it refused
   one on 2026-09-02; that number is not recorded anywhere in this repository, so treat it as a
-  measurement rather than a contract. Write the message to a file inside the project
-  and use `git commit -F <file>`.
+  measurement rather than a contract. Write the message to a uniquely-named file **inside your own
+  worktree**, use `git commit -F <file>`, and delete it. Not the per-worktree git dir: it sits under
+  the primary checkout's path, so `worktree_gate.ps1` refuses a `Write` there.
+  **Never the harness scratchpad, whatever its system prompt says about isolation.** That directory
+  is shared with every subagent and background task the session spawns, so a sibling writing the same
+  generic name between your write and your `commit -F` silently substitutes its message for yours --
+  measured 2026-09-03, BACKLOG #1440. Same rule for any file whose content is later fed to a command.
 - **Every seat pushes its own branch and opens its own PR, without asking.** Owner ruling 2026-08-29,
   anchored at `refs/liaison/owner-ruling-20260829-push` (`987705dfb`), in their words: *"Sessions
   push their own."*
