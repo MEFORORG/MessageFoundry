@@ -22066,3 +22066,32 @@ So `test_the_script_prefers_its_own_repo_over_an_earlier_path_entry` supplies th
 **Verification:** 8 passed in `tests/test_webconsole_seam_snapshot.py`. Mutation check run rather than argued -- with the `sys.path.insert` line deleted, the decoy test reds naming the decoy import, and the by-path digest test **stays green**, which is the luck described above measured rather than predicted. Anchor restored, 8 passed again.
 
 **Adjacent and NOT fixed here, named rather than numbered.** `docs/WEBCONSOLE-PACKAGE.md`'s seam-refresh procedure is stale in three steps left behind by #1220: it says to bump `ENGINE_UI_SEAM` by hand (`1` to `2`) when the value is a derived digest, it says to update curated lists in this script that #1220 retired, and its step 5 prescribes `python scripts/webconsole_seam_snapshot.py > tests/golden/...`, the shell redirect this script's own docstring forbids because PowerShell's `>` writes UTF-16LE with a BOM into a file the test reads as UTF-8. That is doc drift with its own cause and it wants its own item; folding a documentation rewrite into a `sys.path` fix would make both harder to review.
+
+## 1452. required-contexts.txt and its pin still claim the retired reviewer context is required
+
+> 🔢 **Filed 2026-09-04 - FIXED IN THIS PULL REQUEST, not yet landed.** The owner removed `a reviewer has read this` from `main`'s branch protection earlier the same day. The checked-in claim did not follow it, so the repository's own answer to "does this check block a merge" over-reported the required set by exactly one context.
+
+**Cluster:** repository tooling. **Priority:** P3. **Verdict:** build.
+**Severity:** no engine effect, no PHI axis, and **no deployment axis (sec. 0)** -- none of these files ship in a wheel. The cost is a merge-path claim that was wrong, in the one file whose entire purpose is to be that answer readable from a clone.
+
+**MEASURED 2026-09-04 18:48 CDT** against `gh api repos/MEFORORG/MessageFoundry/branches/main/protection`: the server requires **13** contexts, `.github/required-contexts.txt` named **14**, and the difference is exactly `a reviewer has read this`. The other twelve matched, both directions. `strict`, `enforce_admins` and `required_approving_review_count` re-read TRUE, TRUE and 0 in the same call, unchanged.
+
+**THE DIRECTION OF THE ERROR IS THE UNUSUAL PART, AND IT IS THE SAFER ONE.** The failure this file was built against is the file naming FEWER contexts than the server, because a context the file omits reads as not-blocking -- the reassuring answer rather than the true one. This drift ran the other way: the file claimed a gate that nothing enforced. That still misdirects, and it does so about review specifically, which is the one gate that never tested the code.
+
+**ONE INSTRUMENT SAW IT, AND IT IS DELIBERATELY NOT A REQUIRED ONE.** `tests/test_required_contexts.py` compares the file against prose, workflow job names and a hand-written count, so all nine of its tests stayed green throughout while the claim was false. That is by construction rather than a defect in it: the `gh api` line beside its count pin is a COMMENT recording a past manual read, not a call. `scripts/ci/check_required_contexts_drift.py` does read the server and fails closed, and it was RED on `main` for this drift -- it is not in the required 13, so it reported and blocked nothing. Watched fail 2026-09-04: exit 1 against the pre-fix file, naming that context, and exit 0 against the corrected file at 13 against 13.
+
+**WHAT THE CORRECTION HAD TO TOUCH, which is wider than the two lines it looks like.** Removing one context from the canonical file moves five in-repo claims that are reconciled against it:
+
+| File | What moved |
+|---|---|
+| `.github/required-contexts.txt` | the context line, the set-equal header read, and a new DELIBERATELY NOT REQUIRED entry recording the de-requiring and its cost |
+| `tests/test_required_contexts.py` | the pinned count, 14 to 13, plus the module docstring |
+| `docs/CI.md` | the required-checks bullet and the review-gate paragraph |
+| `tests/test_security_posture.py` | 13 contexts resolving to 11 distinct jobs, was 14 over 12 |
+| `tests/negative_controls.toml` | the review-gate control entry, because the registry refuses a control naming a context nobody requires |
+
+**THE NEGATIVE CONTROLS WERE DE-REGISTERED, NOT DELETED.** `review-gate.yml` still exists and still runs, so the nine test nodes that entry named still hold its real behaviour inside the required `test` legs. What ended is their status as controls for a merge gate. One assertion did have to go: `test_the_review_gate_still_reports_under_the_required_context_string` asserted the context was required, which is now false; it kept its three structural assertions, was renamed to `..._under_its_declared_context_string`, and its docstring records that a re-arm is caught by the registry reconciliation rather than duplicated there.
+
+**RESIDUE, NAMED RATHER THAN NUMBERED, because retiring any of it is an owner decision this seat cannot take.** `CLAUDE.md` section 5 still describes the Reviewer seat and still states that the `reviewed` label is what blocks a merge. `.github/workflows/unread-signal.yml` and `scripts/ci/check_unread_prs.py` exist to notify a reviewer that a pull request is waiting on a gate that now blocks nothing. `review-gate.yml` itself still reddens an unlabelled pull request, which is expected and harmless but reads as a failure. Whether any of that is retired, and whether the context is re-armed, is the owner's call.
+
+**TWO NUMBERS WERE BURNED ON THIS SUBJECT BEFORE THIS ONE, AND NEITHER IS FILED.** A peer seat allocated 1449 for the same drift and left it unfiled. This seat then allocated 1451 from the PRIMARY checkout by mistake: ledger ownership keys on the allocating worktree or its branch, both non-transferable, so 1451 is claimed by `main` in a tree that must never commit it and is unusable here. 1452 was re-allocated from this worktree and is the only one of the three that names this work. Recorded so a later reader does not read three numbers as three defects; `scripts/coord/alloc_strand_sweep.py` is the tool that already exists for stranded allocations.
