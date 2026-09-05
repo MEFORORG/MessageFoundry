@@ -1456,46 +1456,50 @@ def test_a_private_artifact_url_is_flagged_without_any_token_source(
     assert any("private artifact URL" in h for h in hits), why
 
 
-@pytest.mark.parametrize(
-    ("body", "why"),
-    [
-        # THE DOCUMENTATION PLACEHOLDER. This is the case the UUID requirement exists for: the
-        # detector's own comment block, this repo's backlog row and any future ADR all have to print
-        # the shape they are describing. A detector that refuses its own manual earns an allowlist
-        # line, and that line vetoes every other detector on it.
-        (f"paste a {_ART_HOST}code/{_ART_SEG}<uuid> into the handoff", "the doc placeholder"),
-        # The same placeholder on the frame path. Widening to cover `frame` must not cost the
-        # self-documentation property that the UUID requirement buys.
-        (f"or a {_ART_HOST}code/{_ART_FRAME}<uuid> link", "the doc placeholder, frame path"),
-        # The needle line the detector's own comment block prints. A detector that reds the file
-        # explaining it is the exact pressure that earns an allowlist entry.
-        (r"needle='claude\.ai/(code/)?artifact/<uuid-shape>'", "the comment's own needle line"),
-        # A DELIBERATELY PUBLISHED artifact. The path segment is plural, so the literal `artifact/`
-        # cannot reach it -- and a link its owner chose to publish is not a disclosure.
-        (f"published at {_ART_HOST}public/artifacts/{_ART_UUID}", "a public artifact, plural path"),
-        # A BARE UUID. Measured over the tracked tree at 16efb8cde, a bare-UUID detector would fire
-        # on 35 lines across 8 innocent files -- a CLA action bundle, a deployment guide, an HL7
-        # sample and five test modules that build session ids. It names no host and no account; it
-        # becomes a disclosure only when something says what it addresses.
-        (f"the session id is {_ART_UUID} for this run", "a bare UUID with no URL around it"),
-        # ORDINARY PROSE using the word. Lifted from CLAUDE.md section 0, which this repo reads
-        # constantly -- a word-alone pattern would red the project's own governing document.
-        ("a release artifact on an index is not a running instance", "the word in ordinary prose"),
-        # ANOTHER HOST's artifact path. A CI build artifact is not a private Claude artifact, and the
-        # host is the whole of what makes this class a disclosure.
-        (f"github.com/o/r/actions/runs/1/{_ART_SEG}{_ART_UUID}", "an artifact path off-host"),
-        # NON-ARTIFACT claude.ai LINKS CARRYING A UUID. These are the cases that give the arm WIDTH
-        # discrimination rather than mere presence discrimination: they are on the right host and do
-        # carry a real UUID, so the only thing keeping them silent is the PATH. Without them the
-        # only case refusing a path-widened pattern is the public-plural one, and a negative corpus
-        # resting on a single case is one edit away from having none. This detector's scope is
-        # artifact addresses; a conversation URL is a different class and not this row's business.
-        (f"the thread is at {_ART_HOST}chat/{_ART_UUID}", "a conversation link, right host"),
-        (f"see {_ART_HOST}recents/{_ART_UUID}", "another non-artifact claude.ai path"),
-        # A TRUNCATED id. Not a UUID, so not an addressable artifact.
-        (f"see {_ART_HOST}code/{_ART_SEG}{_ART_UUID.split('-')[0]}", "a truncated UUID"),
-    ],
+#: THE NEGATIVE CORPUS, named rather than inlined so the mutation test below can COUNT it. A
+#: disjointness assertion is a BOOLEAN over two sets whose SIZE is the thing actually at risk:
+#: {3} against {1} and {3} against {4} are both "disjoint", and only the second survives an
+#: unrelated edit to this list. The count is the margin, and the boolean hides it.
+_ART_NEGATIVE: tuple[tuple[str, str], ...] = (
+    # THE DOCUMENTATION PLACEHOLDER. This is the case the UUID requirement exists for: the
+    # detector's own comment block, this repo's backlog row and any future ADR all have to print
+    # the shape they are describing. A detector that refuses its own manual earns an allowlist
+    # line, and that line vetoes every other detector on it.
+    (f"paste a {_ART_HOST}code/{_ART_SEG}<uuid> into the handoff", "the doc placeholder"),
+    # The same placeholder on the frame path. Widening to cover `frame` must not cost the
+    # self-documentation property that the UUID requirement buys.
+    (f"or a {_ART_HOST}code/{_ART_FRAME}<uuid> link", "the doc placeholder, frame path"),
+    # The needle line the detector's own comment block prints. A detector that reds the file
+    # explaining it is the exact pressure that earns an allowlist entry.
+    (r"needle='claude\.ai/(code/)?artifact/<uuid-shape>'", "the comment's own needle line"),
+    # A DELIBERATELY PUBLISHED artifact. The path segment is plural, so the literal `artifact/`
+    # cannot reach it -- and a link its owner chose to publish is not a disclosure.
+    (f"published at {_ART_HOST}public/artifacts/{_ART_UUID}", "a public artifact, plural path"),
+    # A BARE UUID. Measured over the tracked tree at 16efb8cde, a bare-UUID detector would fire
+    # on 35 lines across 8 innocent files -- a CLA action bundle, a deployment guide, an HL7
+    # sample and five test modules that build session ids. It names no host and no account; it
+    # becomes a disclosure only when something says what it addresses.
+    (f"the session id is {_ART_UUID} for this run", "a bare UUID with no URL around it"),
+    # ORDINARY PROSE using the word. Lifted from CLAUDE.md section 0, which this repo reads
+    # constantly -- a word-alone pattern would red the project's own governing document.
+    ("a release artifact on an index is not a running instance", "the word in ordinary prose"),
+    # ANOTHER HOST's artifact path. A CI build artifact is not a private Claude artifact, and the
+    # host is the whole of what makes this class a disclosure.
+    (f"github.com/o/r/actions/runs/1/{_ART_SEG}{_ART_UUID}", "an artifact path off-host"),
+    # NON-ARTIFACT claude.ai LINKS CARRYING A UUID. These are the cases that give the arm WIDTH
+    # discrimination rather than mere presence discrimination: they are on the right host and do
+    # carry a real UUID, so the only thing keeping them silent is the PATH. Without them the
+    # only case refusing a path-widened pattern is the public-plural one, and a negative corpus
+    # resting on a single case is one edit away from having none. This detector's scope is
+    # artifact addresses; a conversation URL is a different class and not this row's business.
+    (f"the thread is at {_ART_HOST}chat/{_ART_UUID}", "a conversation link, right host"),
+    (f"see {_ART_HOST}recents/{_ART_UUID}", "another non-artifact claude.ai path"),
+    # A TRUNCATED id. Not a UUID, so not an addressable artifact.
+    (f"see {_ART_HOST}code/{_ART_SEG}{_ART_UUID.split('-')[0]}", "a truncated UUID"),
 )
+
+
+@pytest.mark.parametrize(("body", "why"), _ART_NEGATIVE)
 def test_prose_about_artifact_urls_does_not_fire(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, body: str, why: str
 ) -> None:
@@ -1596,21 +1600,32 @@ def test_the_two_arms_are_DISJOINT_under_mutation(
     # DISJOINT from mutation A's: if one case refused both, the arm would have presence
     # discrimination and no width discrimination, which for a leak gate is the difference between
     # "detects artifact URLs" and "detects URLs".
-    placeholder = f"paste a {_ART_HOST}code/{_ART_SEG}<uuid> into the handoff"
-    wrong_path = f"the thread is at {_ART_HOST}chat/{_ART_UUID}"
+    # COUNTED OVER THE WHOLE CORPUS, not against two hand-picked strings, and the count is the
+    # point. Disjointness is a boolean over two sets whose SIZE is what is actually at risk: {3}
+    # against {1} and {3} against {4} are both "disjoint", and only the second survives an unrelated
+    # edit to `_ART_NEGATIVE`. This suite WAS in the {3}-against-{1} state -- the single case
+    # refusing a path-widening was the public-plural one, present for an unrelated reason -- and
+    # disjointness alone reported that as healthy.
+    def reds(pattern: re.Pattern[str]) -> set[str]:
+        mod._ARTIFACT_URL = pattern  # type: ignore[attr-defined]
+        return {why for body, why in _ART_NEGATIVE if fires(body)}
 
-    mod._ARTIFACT_URL = re.compile(  # type: ignore[attr-defined]
-        r"claude\.ai/(?:code/)?(?:artifact|frame)/", re.IGNORECASE
+    a_reds = reds(re.compile(r"claude\.ai/(?:code/)?(?:artifact|frame)/", re.IGNORECASE))
+    d_reds = reds(
+        re.compile(
+            r"claude\.ai/(?:[A-Za-z0-9_/-]+/)?"
+            r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
+            re.IGNORECASE,
+        )
     )
-    a_reds = {"placeholder": fires(placeholder), "wrong_path": fires(wrong_path)}
-    mod._ARTIFACT_URL = re.compile(  # type: ignore[attr-defined]
-        r"claude\.ai/(?:[A-Za-z0-9_/-]+/)?"
-        r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
-        re.IGNORECASE,
+    assert not (a_reds & d_reds), (
+        f"the two widenings must red DISJOINT cases; both are refused by {sorted(a_reds & d_reds)}"
     )
-    d_reds = {"placeholder": fires(placeholder), "wrong_path": fires(wrong_path)}
-    assert a_reds == {"placeholder": True, "wrong_path": False}, a_reds
-    assert d_reds == {"placeholder": False, "wrong_path": True}, d_reds
+    # FLOOR OF 2, against a measured margin of 3 each. Two rather than three leaves one case of
+    # slack for a legitimate edit to the corpus, while still refusing the single-case state above.
+    # Raise it if the margin grows; never lower it to make a corpus edit pass.
+    assert len(a_reds) >= 2, f"presence discrimination is down to {len(a_reds)}: {sorted(a_reds)}"
+    assert len(d_reds) >= 2, f"width discrimination is down to {len(d_reds)}: {sorted(d_reds)}"
 
     # MUTATION C -- THE PATTERN AS FIRST SHIPPED, before the vendor grammar was read. It satisfies
     # BOTH arms above, which is exactly why those two mutations cannot protect the vanity form: a
