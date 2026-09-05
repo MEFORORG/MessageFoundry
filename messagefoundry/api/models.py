@@ -13,6 +13,12 @@ and declares it in ``phi_gated_properties``: the property is then withheld from 
 route that forgets that call denies rather than exposes (BACKLOG #1045). Which permission unlocks
 which property stays in :mod:`messagefoundry.api.field_authz`; the two are pinned to each other by
 ``tests/test_field_authz_fail_closed.py``.
+
+A model the API parses out of a REQUEST BODY subclasses
+:class:`~messagefoundry.api.request_model.RequestModel`, which refuses unknown keys; a response
+model stays on ``BaseModel`` (or ``PhiGatedModel``) so a client reading a newer engine tolerates a
+field it has not learned yet. That module states the split and why it is directional -- read it
+before moving a class between the two bases.
 """
 
 from __future__ import annotations
@@ -22,6 +28,7 @@ from typing import Any, ClassVar, Literal
 from pydantic import BaseModel, Field
 
 from messagefoundry.api.phi_gate import PhiGatedModel
+from messagefoundry.api.request_model import RequestModel
 from messagefoundry.config.ai_policy import (
     AiDataScope,
     AiMode,
@@ -79,7 +86,7 @@ class MessageSearchResults(BaseModel):
     scan_limit: int
 
 
-class MessageSearchRequest(BaseModel):
+class MessageSearchRequest(RequestModel):
     """The POST body for content search and for export's search-mode selection (BACKLOG #1184).
 
     ASVS 14.2.1 asks that sensitive data reach the server in the body or the headers and never in the
@@ -120,7 +127,7 @@ class MessageExportRequest(MessageSearchRequest):
     limit: int = Field(1000, ge=1, le=100_000)
 
 
-class UploadedMessageSearchRequest(BaseModel):
+class UploadedMessageSearchRequest(RequestModel):
     """The POST body for browsing an uploaded file's split messages (BACKLOG #1184). The uploaded-log
     browse takes no channel/status filter and pages with ``offset``, so it is a sibling of
     :class:`MessageSearchRequest` rather than a subclass of it."""
@@ -226,7 +233,7 @@ class ReplayResult(BaseModel):
     requeued: int
 
 
-class ResendRequest(BaseModel):
+class ResendRequest(RequestModel):
     """Resend a stored message's transformed body to an ALTERNATE outbound (ADR 0090, BACKLOG #123).
 
     ``to`` is the alternate outbound connection; ``source`` (optional) names which delivered
@@ -251,7 +258,7 @@ class ResendResult(BaseModel):
     outbox_id: str | None = None
 
 
-class EditResendRequest(BaseModel):
+class EditResendRequest(RequestModel):
     """Edit a stored message and resubmit the edited body (ADR 0090 §9, BACKLOG #153).
 
     The edit is CLIENT-SIDE + EPHEMERAL: the console holds the editable copy until this POST — nothing
@@ -351,7 +358,7 @@ class AlertInstanceInfo(BaseModel):
     suspended_until: float | None = None
 
 
-class AlertSuspendRequest(BaseModel):
+class AlertSuspendRequest(RequestModel):
     """Body for ``POST /alerts/{id}/suspend`` (#143) — the length of the NOTIFICATION-mute window. The
     window end is ``now + minutes·60``; the instance keeps firing into state (stays open/counted) — only
     re-alerts are silenced for the window. ``POST /alerts/{id}/resume`` takes no body."""
@@ -366,7 +373,7 @@ class AlertInstanceList(BaseModel):
     alerts: list[AlertInstanceInfo]
 
 
-class DeadLetterReplayRequest(BaseModel):
+class DeadLetterReplayRequest(RequestModel):
     # Connection names; bounded so an over-long value can't reach the store query (ASVS 1.3.3).
     channel_id: str | None = Field(None, max_length=256)  # scope replay to one inbound (None = all)
     destination_name: str | None = Field(None, max_length=256)  # scope to one outbound (None = all)
@@ -412,7 +419,7 @@ class ApprovalDecisionResult(BaseModel):
     result: dict[str, Any] | None = None
 
 
-class ReloadRequest(BaseModel):
+class ReloadRequest(RequestModel):
     # Directory of code-first config modules to load + apply. Optional: omitted/None reloads the
     # server's startup --config dir. Any value must resolve within an allowed reload root (the
     # startup dir or [api].config_reload_roots) — the loader executes Python from it. Length-bounded
@@ -506,7 +513,7 @@ class ConnectionRow(BaseModel):
     waiting_for_reply: bool = False
 
 
-class ConnectionFlagRequest(BaseModel):
+class ConnectionFlagRequest(RequestModel):
     """Body for ``POST /connections/{name}/flag`` (#131, ADR 0007 amendment) — the FIRST
     console→connections.toml write seam. ``direction`` disambiguates a name declared as both an inbound
     and an outbound. Display-only; the write is refused (409) on a code-first connection (no TOML home)."""
@@ -515,7 +522,7 @@ class ConnectionFlagRequest(BaseModel):
     direction: Literal["inbound", "outbound"]
 
 
-class StatsResetTarget(BaseModel):
+class StatsResetTarget(RequestModel):
     """One connections-dashboard endpoint to reset, matching a row's (role, channel_id, destination).
     For ``source`` rows ``destination`` is ignored; for ``destination`` rows it is required."""
 
@@ -524,7 +531,7 @@ class StatsResetTarget(BaseModel):
     destination: str | None = Field(default=None, max_length=256)
 
 
-class StatsResetRequest(BaseModel):
+class StatsResetRequest(RequestModel):
     """Reset the dashboard's cumulative counters for ``targets``, or for every connection (``all``)."""
 
     all: bool = False
@@ -731,7 +738,7 @@ class LogLevelInfo(BaseModel):
     levels: list[str]
 
 
-class LogLevelUpdate(BaseModel):
+class LogLevelUpdate(RequestModel):
     """PATCH body for the runtime verbosity control (BACKLOG #171): the new root/uvicorn level. Ephemeral
     — the override resets on process restart, and NOT on ``/config/reload`` (ADR 0130 §1)."""
 
@@ -946,7 +953,7 @@ class DrActionResult(BaseModel):
     vip_hook_ran: bool = False
 
 
-class DrActivateRequest(BaseModel):
+class DrActivateRequest(RequestModel):
     """Request body for ``POST /dr/activate`` (#61 / BACKLOG #102, ADR 0048). Both fields are optional so
     an empty body still reaches the fail-closed cold-seed step (a missing seed then aborts as before).
 
@@ -979,7 +986,7 @@ class AiPolicy(BaseModel):
     reason: str | None = None
 
 
-class AiChatRequest(BaseModel):
+class AiChatRequest(RequestModel):
     """A single engine-brokered AI-assist request (ADR 0135, BACKLOG #95) — the body of
     ``POST /ai/chat``. ``prompt`` is the IDE-assembled **code_only** context (the config graph *names* +
     the active editor *code* — never message bodies / PHI). ``data_scope`` is the IDE's CLAIMED scope; the
@@ -1194,7 +1201,7 @@ class ConnectionTestResult(BaseModel):
     detail: str | None = None
 
 
-class AlertTestEmailRequest(BaseModel):
+class AlertTestEmailRequest(RequestModel):
     """Body for ``POST /alerts/test-email`` (BACKLOG #118). All fields optional — an empty body tests
     the configured ``[alerts]`` email transport against the configured ``email_to``. ``recipient_override``,
     when set, redirects this one test send to a single alternate address (operator config, admin-gated);
@@ -1272,7 +1279,7 @@ class UploadedMessagesResult(BaseModel):
     truncated: bool
 
 
-class UploadResendRequest(BaseModel):
+class UploadResendRequest(RequestModel):
     """Resend one message from an uploaded file INTO a chosen inbound connection's pipeline (ADR 0134).
 
     ``index`` is the 0-based message position in the file; ``to`` is the target inbound connection the
@@ -1303,7 +1310,7 @@ class UploadDeleteResult(BaseModel):
 # --- Saved / layered Log-Search filter presets (BACKLOG #151, ADR 0136) -------------------------
 
 
-class SearchPresetCriteria(BaseModel):
+class SearchPresetCriteria(RequestModel):
     """The saved content-search form state. Mirrors the ``/messages/search`` typed params exactly (the
     ADR 0046 seam). ``content`` / ``field_value`` are PHI-shaped — the preset column is encrypted at
     rest and every save/recall is step-up-gated + audited."""
@@ -1334,7 +1341,7 @@ class SearchPresetList(BaseModel):
     presets: list[SearchPresetInfo]
 
 
-class SearchPresetCreateRequest(BaseModel):
+class SearchPresetCreateRequest(RequestModel):
     """Create-or-replace a named preset for the calling user. ``name`` is a per-user unique label."""
 
     name: str = Field(min_length=1, max_length=128)
