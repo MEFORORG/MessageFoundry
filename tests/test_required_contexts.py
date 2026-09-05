@@ -12,19 +12,19 @@ not be answered from a clone -- and five places in this repo answered it differe
                                           and under a different string than its own line 18 gives
     tests/test_push_guard.py              12
 
-The live API said 12 when those five were counted. It says 14 at 2026-08-31 20:57 CDT. That question
-is not trivia here: ``required_approving_review_count`` is 0 and auto-merge is armed, so required-set
-membership is the ONLY thing separating "reviewed" from "merged unread". A session reasoning from
-docs/CI.md would conclude that gitleaks, semgrep, npm-audit and crypto-inventory are advisory -- i.e.
-that four blocking security gates were safe to weaken.
+The live API said 12 when those five were counted, 14 at 2026-08-31 20:57 CDT, and 13 at 2026-09-04
+19:05 CDT. That question is not trivia here: ``required_approving_review_count`` is 0 and auto-merge is
+armed, so required-set membership is the ONLY thing separating "reviewed" from "merged unread". A
+session reasoning from docs/CI.md would conclude that gitleaks, semgrep, npm-audit and crypto-inventory
+are advisory -- i.e. that four blocking security gates were safe to weaken.
 
-THE SET NOW HOLDS A CONTEXT THAT DOES NOT TEST THE CODE, and it is the one with the least behind it.
-``a reviewer has read this`` (review-gate.yml, armed 2026-08-31, BACKLOG #1404) is this repository's
-ENTIRE review requirement. It is load-bearing BECAUSE approvals are pinned at 0 rather than in spite of
-it: every session pushes as one GitHub identity, so a human-approval rule would wedge every pull
-request instead of reviewing any. Drop that context from protection and review is not weakened, it is
-gone -- nothing else anywhere reports that a green pull request was never read. The count below is what
-makes removing it a deliberate edit rather than a quiet one.
+THE SET BRIEFLY HELD A CONTEXT THAT DID NOT TEST THE CODE, AND IT IS NOW RETIRED.
+``a reviewer has read this`` (review-gate.yml, armed 2026-08-31 under BACKLOG #1404, RETIRED
+2026-09-04 by the owner's decision) was this repository's entire review requirement. It left branch
+protection and its workflow was deleted in the same change, taking the set from 14 to 13. Approvals
+stay pinned at 0 -- every session pushes as one GitHub identity, so a human-approval rule would wedge
+every pull request instead of reviewing any -- so nothing automated now reports that a green pull
+request was never read. That is the recorded state, not a gap for a later session to quietly close.
 
 WHAT THIS PINS. ``.github/required-contexts.txt`` is the checked-in claim; these tests assert every
 in-repo statement agrees with it. The file is NOT the enforcement -- the server is -- so when branch
@@ -106,17 +106,27 @@ def test_the_canonical_file_parses_and_names_the_live_set() -> None:
         f"duplicate context in {_CANONICAL.name}: {contexts}"
     )
     # Pinned so that ADDING or REMOVING a required check is a deliberate, reviewed edit here rather
-    # than a silent one. Verified against `gh api repos/MEFORORG/MessageFoundry/branches/main/protection`
-    # at 2026-08-31 20:57 CDT: 14 contexts, SET-EQUAL to the file with nothing extra on either side.
-    # Set-equal is the reading worth recording -- a count alone cannot tell a matching set from two
-    # errors that cancel.
+    # than a silent one. Verified against `gh api repos/MEFORORG/MessageFoundry/branches/main/protection
+    # --jq '.required_status_checks.contexts[]'` at 2026-09-04 19:05 CDT: 13 contexts, SET-EQUAL to the
+    # file with nothing extra on either side, checked by diffing the sorted API read against the sorted
+    # parse of the file. The previous reading was 14 at 2026-08-31 20:57 CDT, before the owner retired
+    # `a reviewer has read this`. Set-equal is the reading worth recording -- a count alone cannot tell
+    # a matching set from two errors that cancel.
     #
     # THE PIN GOES STALE IN THE DIRECTION THAT LOOKS FINE. It read 13 while the server held more, and
     # a context this file omits reads as NOT BLOCKING -- the reassuring answer rather than the true
     # one. A count that only ever fails when someone edits the FILE cannot notice the server moving
     # underneath it, so reconcile against the API, never against this number. The server moved four
-    # times on 2026-07-29 and twice more on 2026-08-31.
-    assert len(contexts) == 14, (
+    # times on 2026-07-29, twice more on 2026-08-31, and again on 2026-09-04.
+    #
+    # 2026-09-04 IS THE LIVE PROOF OF THAT DEFECT, so it is recorded here rather than left as a
+    # caution. `contexts` is parsed from the FILE, never from the server, so this assertion can only
+    # fail when somebody edits the thing it guards -- the case it is least needed for. On 2026-09-04
+    # the owner removed a context from branch protection and THIS TEST STAYED GREEN, at 14, over a
+    # server holding 13. It reddened only when a human came to edit the file. A guard whose trigger is
+    # the edit it is guarding cannot see the drift it exists to catch; what catches that is
+    # scripts/ci/check_required_contexts_drift.py, which reads the API.
+    assert len(contexts) == 13, (
         f"the canonical required set changed to {len(contexts)} contexts. If branch protection really "
         "changed, update this count AND every claim this suite checks; if it did not, revert the file."
     )

@@ -263,25 +263,33 @@ def test_required_jobs_carry_no_continue_on_error() -> None:
     # change in the collapse — a matrix split, or a context that quietly stops resolving — forces a
     # look here instead of passing on a self-consistent count.
     #
-    # 14/12 since 2026-08-31 (BACKLOG #1404), when `a reviewer has read this` was recorded. One
-    # collapse: ci.yml's `test` matrix reports 3 contexts from 1 job, so 14 - 2 = 12.
+    # 13/11 since 2026-09-04, when the owner retired the review requirement and
+    # `a reviewer has read this` came off branch protection. It was 14/12 from 2026-08-31 (BACKLOG
+    # #1404), when that context was armed, and 13/11 before that. One collapse throughout: ci.yml's
+    # `test` matrix reports 3 contexts from 1 job, so 13 - 2 = 11.
     #
     # THIS MODULE READS THE CANONICAL FILE, NOT THE SERVER, so a context that reaches protection and
-    # not the file is not examined here. That file's own header states the ordering rule — protection
-    # first, the file in the same pull request — and this pin is only as live as that discipline. Read
-    # at 2026-08-31 20:57 CDT the two were SET-EQUAL, so nothing is currently unexamined.
+    # not the file is not examined here. That file's own header states the ordering rule -- protection
+    # first, the file in the same pull request -- and this pin is only as live as that discipline. Read
+    # at 2026-08-31 20:57 CDT the two were SET-EQUAL. The 2026-09-04 removal followed the same order:
+    #   gh api repos/MEFORORG/MessageFoundry/branches/main/protection --jq '.required_status_checks.contexts[]'
+    # returned thirteen contexts with `a reviewer has read this` absent, and the canonical file drops
+    # the same line in this pull request.
     #
-    # Recording a context drags its job under every rule in this module for the first time, exactly as
-    # backlog-hygiene did on 2026-07-29 — and it paid immediately here: the review-gate job's
-    # `|| true` surfaced on the first CI run after that context was recorded.
+    # RECORDING a context drags its job under every rule in this module for the first time, exactly as
+    # backlog-hygiene did on 2026-07-29 -- and it paid immediately here: on 2026-08-31 the review-gate
+    # job's `|| true` surfaced on the first CI run after that context was recorded. That is why the
+    # finding is kept although its subject is gone: the mechanism belongs to RECORDING A CONTEXT, not
+    # to review-gate.yml, and it fires again for whatever context is recorded next. The gate itself is
+    # retired and the workflow deleted, so nothing here examines it any more.
     print(
         f"[security-posture] examined {examined} distinct jobs backing "
         f"{len(required_contexts())} required contexts"
     )
-    assert examined == 12, (
-        f"expected the 14 required contexts to resolve to 12 distinct jobs (the 3 `test` legs share "
-        f"one matrix job); got {examined}. If the workflow layout genuinely changed, update this "
-        "count."
+    assert examined == 11, (
+        f"expected the {len(required_contexts())} required contexts to resolve to 11 distinct jobs "
+        f"(the 3 `test` legs share one matrix job); got {examined}. If the workflow layout genuinely "
+        "changed, update this count."
     )
     assert not offenders, (
         "a REQUIRED status check cannot fail, so it gates nothing:\n  "
