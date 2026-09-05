@@ -37,6 +37,7 @@ tests/test_asvs_verifier_vault_contract.py
 tests/test_backlog_citation_check.py
 tests/test_backlog_dependency_census.py
 tests/test_backlog_hygiene_claim_extraction.py
+tests/test_backlog_score_advisory.py
 tests/test_backlog_status_check.py
 tests/test_banner_sha_check.py
 tests/test_bash_probe_path.py

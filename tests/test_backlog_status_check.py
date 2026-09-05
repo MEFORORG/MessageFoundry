@@ -43,8 +43,20 @@ def _scan(text: str, changelog: str | None = None) -> tuple[list[str], list[str]
     return bsc.scan([("BACKLOG.md", text)], changelog)  # type: ignore[no-any-return]
 
 
+# THE OPEN FIXTURES BELOW CARRY A SCORE ON PURPOSE (BACKLOG #1455). A second advisory class landed
+# 2026-09-05: an OPEN row with no value/difficulty warns, because such a row is absent from the
+# ranked table while present in the ledger. These cases assert `warnings == []`, a TOTAL-silence
+# claim and the stronger assertion, so the fixtures were given scores rather than the assertions
+# being narrowed to "no CHANGELOG warnings". Narrowing would decouple them from any future third
+# class, which is the property that makes a total assertion worth keeping.
+#
+# One fixture read `Value **3/5**`, on the five-level scale retired 2026-07-10. No open row uses /5
+# today, so it moved to the current rubric rather than the score pattern being widened to accept a
+# retired scale.
+
+
 def test_open_item_with_priority_banner_passes() -> None:
-    text = "## 7. Something\n\n> 🔢 **Re-prioritized 2026-07-09 → P2.** Value **3/5**.\n\n**Scope:** x\n"
+    text = "## 7. Something\n\n> 🔢 **Re-prioritized 2026-07-09 → P2.** Value **3/10** · Difficulty **2/10**.\n\n**Scope:** x\n"
     errors, warnings = _scan(text)
     assert errors == []
     assert warnings == []
@@ -111,7 +123,9 @@ def test_banner_after_prose_does_not_count() -> None:
 
 def test_changelog_crossref_flags_an_open_item_cited_as_shipped() -> None:
     """The #60 failure mode: CHANGELOG says it shipped, BACKLOG still says open."""
-    backlog = "## 60. Turnkey DR\n\n> 🔢 **Re-prioritized → P3.** still open\n"
+    backlog = (
+        "## 60. Turnkey DR\n\n> 🔢 **Re-prioritized → P3.** Value **6/10** · Difficulty **4/10**\n"
+    )
     changelog = (
         "- **Turnkey DR backup + restore-verify** (#60, [ADR 0049](docs/adr/0049.md)) — ships.\n"
     )
@@ -123,7 +137,7 @@ def test_changelog_crossref_flags_an_open_item_cited_as_shipped() -> None:
 
 def test_changelog_crossref_ignores_pr_numbers() -> None:
     """`(#641)` is a PR number, not a backlog item — must not warn."""
-    backlog = "## 641. Not a real item\n\n> 🔢 **Re-prioritized → P3.** open\n"
+    backlog = "## 641. Not a real item\n\n> 🔢 **Re-prioritized → P3.** Value **3/10** · Difficulty **1/10**\n"
     changelog = "- Something landed (#641).\n"
     assert _scan(backlog, changelog)[1] == []
 
@@ -134,7 +148,7 @@ def test_changelog_crossref_ignores_narrative_prose() -> None:
     Real case: "the correctness edge is closed (… BACKLOG #82) or field-confirmed benign" is a
     continuation line, not an entry. A noisy advisory is an ignored advisory.
     """
-    backlog = "## 82. Sender transport polish\n\n> 🔢 **Re-prioritized → P1.** open\n"
+    backlog = "## 82. Sender transport polish\n\n> 🔢 **Re-prioritized → P1.** Value **7/10** · Difficulty **2/10**\n"
     changelog = "    correctness edge is closed (the MSA-2 correlation, BACKLOG #82) or benign.\n"
     assert _scan(backlog, changelog)[1] == []
 

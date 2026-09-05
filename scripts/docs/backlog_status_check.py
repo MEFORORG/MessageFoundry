@@ -87,6 +87,17 @@ _HEADING = re.compile(r"^## (?P<num>\d+)\.\s")
 _FIELD_KEYS = ("verdict", "research", "closing-act")
 _FIELD = re.compile(rf"^>\s*(?P<key>{'|'.join(_FIELD_KEYS)})\s*:\s*(?P<value>.+?)\s*$", re.I)
 
+# A value/difficulty SCORE inside the banner block. Deliberately keyed on the SCORE ITSELF and not
+# on the sentence that usually introduces one: `Scored 2026-09-04 ->` and `Re-scored 2026-08-20 ->`
+# are both common, but #1435 carries its numbers inline in a filing banner with neither phrase, and
+# a check keyed on the phrase reports that correctly-scored row as unscored. Measured 2026-09-05:
+# phrase-keyed and score-keyed censuses disagreed on exactly that row.
+#
+# The bold markers are optional because the ledger is not uniform -- #1312 was hand-written with
+# `--` separators and no emphasis -- and a gate that only sees the house style teaches filers a
+# magic string instead of a score.
+_SCORE = re.compile(r"[Vv]alue\s*\**\s*(?P<value>\d+)\s*/\s*10", re.I)
+
 # Closing acts a BUILDER can perform themselves. An item outside this set is still WORKABLE -- the
 # seat writes the code and finishes with an open item, which is a complete outcome, not a failure.
 #
@@ -148,7 +159,16 @@ DuplicateField = tuple[str, int, str, str]
 class Item:
     """One numbered backlog item and the status banners in its leading blockquote block."""
 
-    __slots__ = ("num", "line", "closed", "open", "fields", "duplicate_fields", "body_line")
+    __slots__ = (
+        "num",
+        "line",
+        "closed",
+        "open",
+        "fields",
+        "duplicate_fields",
+        "body_line",
+        "score",
+    )
 
     def __init__(self, num: int, line: int) -> None:
         self.num = num
@@ -179,6 +199,11 @@ class Item:
         # those totals are the entire check every seat runs after a ledger edit. The reader could
         # not represent the defect, so nothing downstream could detect it.
         self.duplicate_fields: list[DuplicateField] = []
+        # The value half of a value/difficulty score, when the banner block carries one, else
+        # None. Only the value is kept: this parser's job is to answer WHETHER the row is
+        # ranked, and storing the difficulty too would invite a reader to rank FROM here rather
+        # than from the ranked table, which is the artefact that owns ordering.
+        self.score: int | None = None
 
     @property
     def is_open(self) -> bool:
@@ -223,6 +248,13 @@ def parse_items(text: str) -> list[Item]:
                 if b:
                     emoji = b.group("emoji")
                     (item.closed if emoji in _CLOSED else item.open).append(emoji)
+                s = _SCORE.search(line)
+                if s is not None and item.score is None:
+                    # FIRST match wins, because the newest score sits FIRST in the block by this
+                    # file's convention -- a re-score is prepended above the superseded one, which
+                    # is often still present and explicitly labelled SUPERSEDED. Taking the last
+                    # would read the retired number.
+                    item.score = int(s.group("value"))
                 f = _FIELD.match(line)
                 if f:
                     key = f.group("key").strip().lower()
@@ -309,6 +341,44 @@ def scan(
                 f"item #{num} is cited as shipped in CHANGELOG.md but is still marked OPEN in "
                 f"BACKLOG.md — verify and add a ✅ banner if the work landed."
             )
+
+    # ADVISORY ONLY, BY OWNER RULING 2026-09-05 (BACKLOG #1455, filed and not yet on main).
+    #
+    # An open row with no value or difficulty is absent from the ranked table while present in the
+    # ledger, so the instrument that answers "what next" reads complete while being incomplete.
+    # Measured over three days: 73 rows carried no score on 2026-09-03, 5 on 2026-09-04 and 1 on
+    # 2026-09-05 -- each pass closed the gap and ordinary filing re-opened it, and none of the three
+    # was found by a gate.
+    #
+    # WHY IT IS NOT FATAL, and this is the ruling rather than a hedge. This module runs in the
+    # required `test` leg, so an error here would red the pull request of anyone who FILES an
+    # unscored row. That prices filing, which is the act this project wants cheap, to buy ranking,
+    # which a later pass can supply. The owner weighed advisory against a fatal gate and chose
+    # advisory. Do not promote this to an error without a new ruling.
+    #
+    # CLOSED ROWS ARE EXEMPT BY DESIGN: a score prices the REMAINDER, and a shipped or declined row
+    # has none, so demanding one there would ask for a number with no referent.
+    #
+    # KNOWN LIMIT, stated rather than discovered later: this sees the BANNER BLOCK only, because
+    # that is all `parse_items` reads. A row whose score sits below the block would be reported
+    # here as unscored. Measured 2026-09-05 over all 277 open rows: ZERO are shaped that way, every
+    # scored row carries its numbers in the block, so the limit costs nothing today. It is written
+    # down because the day a row is scored below the block, this advisory is wrong about it, and a
+    # reader should reach for the boundary rather than for the score pattern.
+    for label, it in items:
+        if it.is_open and it.score is None:
+            warnings.append(
+                f"{label}:{it.line}: item #{it.num} is OPEN and carries no value/difficulty score, "
+                f"so it is absent from the ranked table while present in the ledger. Add a "
+                # ASCII ONLY, DELIBERATELY. Warnings go to STDERR, and main() hardens stdout
+                # alone (#1030), so a middot here could raise UnicodeEncodeError on a stock
+                # cp1252 console -- turning an advisory into a crash, which is the opposite of
+                # advisory. The house separator is a middot; this says so in words instead.
+                f"'Value **N/10**' and a difficulty, separated by a middot, inside the banner "
+                f"block. "
+                f"Advisory by owner ruling (BACKLOG #1455); this never fails the gate."
+            )
+
     return errors, warnings
 
 
