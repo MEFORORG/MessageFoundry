@@ -32,7 +32,29 @@ pytestmark = pytest.mark.skipif(
 
 #: Seconds allowed for ONE ``pwsh`` launch plus the gate's own work. Named so the diagnostic below can
 #: quote it, rather than repeating the literal in a message that then drifts from the argument.
-GATE_TIMEOUT_S = 60
+#:
+#: CALIBRATED 2026-09-03 (BACKLOG #1304), and it was 60 until then with no recorded calibration at all --
+#: the surviving half of that item's not-measured list. Same shape as its sibling at
+#: ``tests/test_coord_claim_reconcile.py``: this is a DIAGNOSTIC sited deliberately BELOW pytest's own
+#: bound, so that when it fires the message names a hung ``pwsh`` spawn instead of pytest's generic
+#: timeout. Measured worst case is **4.6s per call** (n=127 real launches across this file and
+#: test_worktree_gate_control_plane.py; p50 2.1s, p99 4.2s; one sub-50ms sample excluded as a call that
+#: raised before launching). Sequential, on a developer box already running several peer pytest sessions
+#: -- so it is a CONTENDED sample, which is the useful direction, but a 4-vCPU hosted runner is still not
+#: measurable from here and the absolute numbers do not transfer. 45 against 4.6s is a **9.8x margin**.
+#:
+#: WHY IT MOVED DOWN FROM 60, and this is the whole reason the calibration was worth doing. pytest-timeout
+#: arms in ``pytest_runtest_protocol``, covering setup + call + teardown; this bound starts later, inside
+#: the call. So pytest's window strictly CONTAINS this one and at equal values pytest expires first --
+#: measured, not reasoned, with a paired control: at 5s against ``--timeout=5`` pytest won 2/2 and this
+#: diagnostic never fired; at 5s against ``--timeout=30`` it won 2/2. ``addopts`` carries
+#: ``--timeout=60``, so at 60 this diagnostic could NEVER fire on a bare local ``pytest`` -- decorative
+#: locally, live only on CI's tooling leg, which overrides to 120. That is exactly the silent
+#: one-platform failure the sibling comment was written to prevent. 45 clears both bounds.
+#:
+#: RE-DERIVE IF ``addopts`` or the tooling leg's ``--timeout`` moves, or if a call is ever observed above
+#: ~15s. NOTE FOR ANYONE GREPPING CI HISTORY: failures before this change read ``after 60 seconds``.
+GATE_TIMEOUT_S = 45
 
 
 def run_gate(
