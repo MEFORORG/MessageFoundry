@@ -1564,6 +1564,83 @@ async def test_directory_email_repoint_is_audited_and_notified_to_the_old_addres
         await store.close()
 
 
+async def test_a_second_directory_repoint_notifies_the_engine_owned_address() -> None:
+    """BACKLOG #1139. The repoint notice is addressed to ``notify_email``, not to the mirror.
+
+    **A SINGLE REPOINT CANNOT SEE THIS.** On the first one the mirror and the notification address
+    still hold the same value, so reading either produces the same string and the test above passes
+    against both the right column and the wrong one. The second repoint separates them: the mirror
+    now holds whatever the FIRST repoint installed, and addressing the notice there sends it to the
+    party who performed the change being announced -- ADR 0182 option 3, rejected in terms.
+
+    The engine-owned address is untouched by both repoints, which is the entire point of the split,
+    so it is the target while it exists.
+    """
+    store = await _store()
+    try:
+        notifier = _FakeNotifier()
+        service = AuthService(store, _ad_settings(), security_notifier=notifier)
+        await service.initialize()
+
+        assert (await service._complete_ad_login(_principal("owner@x"), None, mfa_verified=True)).ok
+        assert (
+            await service._complete_ad_login(_principal("attacker@evil"), None, mfa_verified=True)
+        ).ok
+        assert (
+            await service._complete_ad_login(_principal("attacker2@evil"), None, mfa_verified=True)
+        ).ok
+
+        user = await store.get_user_by_username("jdoe")
+        assert user is not None
+        assert user.email == "attacker2@evil"  # the mirror tracks the directory
+        assert user.notify_email == "owner@x"  # the notification target does not
+
+        changed = [e for e in notifier.events if e.event_type == EMAIL_CHANGED]
+        assert len(changed) == 2
+        assert changed[-1].email == "owner@x"
+        assert changed[-1].detail["new_email"] == "attacker2@evil"
+        # The address the first repoint installed must never be a notice target.
+        assert all(e.email != "attacker@evil" for e in notifier.events)
+    finally:
+        await store.close()
+
+
+async def test_a_repoint_after_a_profile_clear_still_notifies_the_engine_owned_address() -> None:
+    """BACKLOG #1139, the other way the two columns come apart -- with no second repoint at all.
+
+    ADR 0182 AC-4 says clearing the PROFILE address leaves the account notifiable. It does. But the
+    next directory login then finds an empty mirror, and a fallback that reaches for the mirror
+    first falls through to the directory's NEW value -- announcing the change to whoever made it
+    while a deliverable engine-owned address sits on the account untouched.
+    """
+    store = await _store()
+    try:
+        notifier = _FakeNotifier()
+        service = AuthService(store, _ad_settings(), security_notifier=notifier)
+        await service.initialize()
+
+        assert (await service._complete_ad_login(_principal("owner@x"), None, mfa_verified=True)).ok
+        user = await store.get_user_by_username("jdoe")
+        assert user is not None
+        await service.update_user(
+            user.id, display_name="J Doe", email=None, disabled=None, actor="admin"
+        )
+        user = await store.get_user_by_username("jdoe")
+        assert user is not None and user.email is None and user.notify_email == "owner@x"
+
+        before = len(notifier.events)
+        assert (
+            await service._complete_ad_login(_principal("attacker@evil"), None, mfa_verified=True)
+        ).ok
+
+        changed = [e for e in notifier.events[before:] if e.event_type == EMAIL_CHANGED]
+        assert len(changed) == 1
+        assert changed[0].email == "owner@x"
+        assert changed[0].detail["new_email"] == "attacker@evil"
+    finally:
+        await store.close()
+
+
 async def test_an_absent_directory_attribute_does_not_erase_the_stored_address() -> None:
     store = await _store()
     try:
