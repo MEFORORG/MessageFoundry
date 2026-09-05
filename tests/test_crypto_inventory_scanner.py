@@ -21,6 +21,14 @@ nothing: it must FIND a planted ``Math.random()`` in a ``.ts`` file, it must NOT
 ``randomBytes`` draw in ``ide/src/cspNonce.ts``, and it must REFUSE an empty walk rather than let one
 render as clean.
 
+A fourth property joined them in the ASVS 11.5.1 **scope-completeness pass**: the arm must reach
+EVERY root that holds non-Python source, not only the root someone remembered. It previously walked
+``ide/`` alone, and a sibling test asserted the non-Python roots were DISJOINT from the Python ones —
+which quietly asserted that no first-party root is mixed-language. ``messagefoundry_webconsole`` is,
+so its shipped ``static/*.js`` was read by neither arm while the root reported green off its ``.py``.
+The disjointness assertion is gone and the walk covers both roots; a weak draw planted in the real
+console now reds the gate (measured, then reverted).
+
 PHI-free: it reads only code *names/paths*, never a secret value. The gate script is not an importable
 package (``scripts/`` has no ``__init__``), so load it standalone by file path like the doc guard does.
 """
@@ -154,16 +162,38 @@ _ANCHOR_SRC = (
 )
 
 
+#: One inert placeholder source per DECLARED non-Python walk root that a fixture does not otherwise
+#: populate. Needed because the arm refuses a declared root that is missing from the tree — which is
+#: a control worth keeping, not a nuisance to route around, so the fixture satisfies it rather than
+#: the gate relaxing it. Derived from the gate's own tuple so a third root added later cannot leave
+#: these fixtures silently red.
+_PLACEHOLDER_SRC = "// inert fixture placeholder: no randomness draw\nexport const x = 1;\n"
+
+
 def _ts_repo(tmp_path: Path, files: dict[str, str], *, with_anchor: bool = True) -> Path:
-    """Write ``files`` (repo-relative path -> text) into a throwaway repo root and return it."""
+    """Write ``files`` (repo-relative path -> text) into a throwaway repo root and return it.
+
+    Every declared non-Python walk root the caller did not write into gets one inert placeholder, so
+    the missing-root and empty-walk refusals stay armed for the root under test without firing on the
+    others."""
     written = dict(files)
     if with_anchor:
         written.setdefault(_ANCHOR_REL, _ANCHOR_SRC)
+    touched = {rel.split("/", 1)[0] for rel in written}
+    for root in _gate().NON_PYTHON_WALK_ROOTS:
+        if root not in touched:
+            written.setdefault(f"{root}/_placeholder.js", _PLACEHOLDER_SRC)
     for rel, text in written.items():
         path = tmp_path / rel
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(text, encoding="utf-8")
     return tmp_path
+
+
+def _placeholders_in(repo: Path) -> int:
+    """How many inert placeholders :func:`_ts_repo` seeded, so a ``scanned`` expectation stays
+    derivable rather than a transcribed constant that drifts when a root is added."""
+    return len(list(repo.rglob("_placeholder.js")))
 
 
 @pytest.mark.parametrize(
@@ -184,7 +214,9 @@ def test_a_planted_weak_draw_in_a_ts_file_is_flagged(tmp_path: Path, call: str) 
     )
     violations, scanned = gate.check_non_python_randomness(repo)
 
-    assert scanned == 2, f"the fixture walk should have read both files, it read {scanned}"
+    assert scanned == 2 + _placeholders_in(repo), (
+        f"the fixture walk should have read both files, it read {scanned}"
+    )
     weak = [v for v in violations if "WEAK randomness source" in v]
     assert len(weak) == 1, violations
     assert "ide/src/planted.ts" in weak[0], weak[0]
@@ -296,7 +328,9 @@ def test_a_broken_walk_reds_through_the_stale_anchor(tmp_path: Path) -> None:
     gate = _gate()
     repo = _ts_repo(tmp_path, {"ide/src/plain.ts": "export const x = 1;\n"}, with_anchor=False)
     violations, scanned = gate.check_non_python_randomness(repo)
-    assert scanned == 1, "the walk must have run; this is not the empty-scan case"
+    assert scanned == 1 + _placeholders_in(repo), (
+        "the walk must have run; this is not the empty-scan case"
+    )
     assert any(_ANCHOR_REL in v and "no longer draws from" in v for v in violations), violations
 
 
@@ -313,7 +347,9 @@ def test_vendor_and_build_trees_are_pruned(tmp_path: Path) -> None:
         },
     )
     violations, scanned = gate.check_non_python_randomness(repo)
-    assert scanned == 1, f"only the anchor is first-party source; scanned {scanned}"
+    assert scanned == 1 + _placeholders_in(repo), (
+        f"only the anchor is first-party source; scanned {scanned}"
+    )
     assert violations == [], violations
 
 
@@ -344,9 +380,55 @@ def test_the_shipped_anchor_is_both_discovered_and_inventoried() -> None:
     assert _ANCHOR_REL in gate.NON_PYTHON_INVENTORY
 
 
-def test_non_python_walk_roots_are_declared_and_disjoint_from_the_python_ones() -> None:
-    # The two arms read different file types with different instruments; merging the walk-sets would
-    # let one arm's green stand in for the other's silence.
+def test_non_python_walk_roots_are_declared_and_each_holds_the_source_it_claims() -> None:
+    # THIS ASSERTION REPLACED A DISJOINTNESS ONE, and the replacement is the finding (BACKLOG #1172).
+    # The old test asserted ``NON_PYTHON_WALK_ROOTS`` shared no member with ``WALK_ROOTS``, reasoning
+    # that "merging the walk-sets would let one arm's green stand in for the other's silence". That
+    # reasoning is sound and it justifies keeping the two ARMS separate -- different instruments,
+    # separately reported corpus sizes. It does NOT justify requiring the two ROOT SETS to be
+    # disjoint, and conflating the two claims is what hid a real gap: disjointness silently asserts
+    # that no first-party root is MIXED-language, and ``messagefoundry_webconsole`` is exactly that.
+    # Its Python sat in WALK_ROOTS, so the root rendered green and looked covered, while its shipped
+    # first-party JavaScript was read by NEITHER arm -- ``discover()`` rglobs ``*.py``, and the
+    # randomness arm walked only ``ide/``. The greenness was a fact about the root's ``.py`` alone.
+    #
+    # The invariant that actually earns its place: a root is declared here only if it really holds
+    # non-Python source, so a declared root can never report clean on a corpus it never reached.
     gate = _gate()
-    assert gate.NON_PYTHON_WALK_ROOTS == ("ide",)
-    assert set(gate.NON_PYTHON_WALK_ROOTS).isdisjoint(gate.WALK_ROOTS)
+    assert gate.NON_PYTHON_WALK_ROOTS == ("ide", "messagefoundry_webconsole")
+    for name in gate.NON_PYTHON_WALK_ROOTS:
+        assert gate.non_python_sources(_ROOT / name), (
+            f"{name}/ is declared a non-Python walk root but holds no "
+            f"{'/'.join(gate.NON_PYTHON_SUFFIXES)} source"
+        )
+
+
+def test_the_walk_reaches_the_operator_consoles_shipped_javascript() -> None:
+    # The regression this arm could not catch before (BACKLOG #1172, ASVS 11.5.1 scope pass). Both
+    # files are first-party, shipped, and served to an authenticated operator's browser at /ui, and
+    # ``csp-probe.js`` IS a security control (the ASVS 3.7.5 CSP-enforcement canary) rather than a
+    # cosmetic asset. A weak draw added to either would have merged green.
+    gate = _gate()
+    found = {
+        p.relative_to(_ROOT).as_posix()
+        for p in gate.non_python_sources(_ROOT / "messagefoundry_webconsole")
+    }
+    assert "messagefoundry_webconsole/static/app.js" in found, sorted(found)[:20]
+    assert "messagefoundry_webconsole/static/csp-probe.js" in found, sorted(found)[:20]
+
+
+def test_a_weak_draw_in_the_operator_console_is_caught(tmp_path: Path) -> None:
+    # The arm must FAIL on a planted weak source in the console, not merely walk past it. Planted in
+    # a copy so the shipped tree is never mutated; the console's real JS is clean today (measured),
+    # which is why this control is what proves the arm can see it at all.
+    gate = _gate()
+    console = tmp_path / "messagefoundry_webconsole" / "static"
+    console.mkdir(parents=True)
+    (console / "app.js").write_text("var nonce = Math.random().toString(36);\n", encoding="utf-8")
+    (tmp_path / "ide").mkdir()
+    (tmp_path / "ide" / "cspNonce.ts").write_text("// placeholder\n", encoding="utf-8")
+
+    violations, scanned = gate.check_non_python_randomness(tmp_path)
+
+    assert scanned >= 2, scanned
+    assert any("WEAK randomness source" in v and "app.js" in v for v in violations), violations
