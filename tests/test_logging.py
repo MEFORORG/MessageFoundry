@@ -18,6 +18,7 @@ import pytest
 
 from messagefoundry import __main__
 from messagefoundry.logging_setup import (
+    _CREDENTIAL_QUERY_KEYS,
     ControlCharScrubFilter,
     CredentialQueryScrubFilter,
     JsonFormatter,
@@ -306,6 +307,61 @@ def test_control_char_block_scrub_is_idempotent() -> None:
     once = rec.exc_text
     ControlCharScrubFilter().filter(rec)
     assert rec.exc_text == once
+
+
+# --- BACKLOG #1184: the access-log residual, pinned as a measurement ---------
+
+#: A synthetic, non-realistic needle. Never a real or realistic patient identifier (PHI.md).
+_SYNTHETIC_NEEDLE = "ZZQ9X7"
+
+
+def test_an_undeclared_phi_needle_is_not_scrubbed_from_the_access_line() -> None:
+    """The residual BACKLOG #1184 (ASVS 14.2.1) leaves open, measured rather than described.
+
+    Uvicorn builds its access line from the raw ASGI ``query_string``
+    (``uvicorn/protocols/utils.py::get_path_with_query_string``), never from the parameters a route
+    binds. So a hand-crafted ``?content=`` reaches the log even though no GET signature declares it
+    any more, and the filter chain does not scrub it.
+
+    **That is a ruled state, not an omission** — the ruling is ``docs/PHI.md`` §7 and this test does
+    not restate it. What this holds is the measurement the ruling rests on, the way
+    :func:`test_redaction_filter_residual_bare_name_not_caught` holds its own documented residual.
+    The ruled-against EDIT is pinned separately, one test below: this assertion reads a *rendering*,
+    so it also reds on a control that is not the one #1184 rejected.
+    """
+    line = f'127.0.0.1:0 - "GET /messages/search?content={_SYNTHETIC_NEEDLE} HTTP/1.1" 200'
+    rec = logging.LogRecord("uvicorn.access", logging.INFO, __file__, 1, line, (), None)
+    rendered = "\n".join(_production_lines(rec))
+    assert f"content={_SYNTHETIC_NEEDLE}" in rendered, (
+        "the access line no longer carries an undeclared `content=` verbatim. This is a MEASUREMENT, "
+        "not a prohibition. If a name denylist now scrubs it, read BACKLOG #1184 -- that was ruled "
+        "against. If a DIFFERENT control landed (an allowlist over query values, say), the ruling "
+        "does not reach it: delete this measurement and correct docs/PHI.md section 7."
+    )
+
+    # Positive control on a SECOND record: the keys the chain DOES cover are scrubbed, so a green
+    # above cannot mean the filters never ran.
+    callback = f'127.0.0.1:0 - "GET /ui/oidc/callback?code={_SYNTHETIC_NEEDLE} HTTP/1.1" 302'
+    cred = logging.LogRecord("uvicorn.access", logging.INFO, __file__, 1, callback, (), None)
+    assert "code=<redacted>" in "\n".join(_production_lines(cred)), (
+        "the credential scrub is inert, so the measurement above is void"
+    )
+
+
+def test_the_phi_needle_names_stay_out_of_the_credential_scrub_list() -> None:
+    """The two-token edit BACKLOG #1184 ruled against, pinned at the tuple, not at a rendering.
+
+    The measurement above reds on any control over the access line's query string, including one the
+    ruling does not reach. This reds only on the ruled-against edit, so the PAIR discriminates:
+    **both red** means a needle name went into the tuple; **the measurement alone** means some other
+    control landed, which the ruling does not cover.
+    """
+    assert not {"content", "field_value"} & set(_CREDENTIAL_QUERY_KEYS), (
+        "`content`/`field_value` were added to _CREDENTIAL_QUERY_KEYS. BACKLOG #1184 ruled against a "
+        "name denylist here: whoever hand-crafts such a URL also picks the name, so `?patient=` "
+        "passes the entry untouched while the entry reads as a protection this log does not have. "
+        "The ruling is docs/PHI.md section 7."
+    )
 
 
 # --- C2: prod-DEBUG serve guard ----------------------------------------------

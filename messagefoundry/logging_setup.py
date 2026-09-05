@@ -216,6 +216,13 @@ class RedactionFilter(logging.Filter):
 #: Query-string parameters that carry a credential and must never reach a log line. ``code`` and
 #: ``state`` arrive on the OIDC callback's URL (ADR 0142 pins ``response_mode=query``), and uvicorn's
 #: access logger emits the full request line *including* the query string.
+#:
+#: **``content`` and ``field_value`` are deliberately absent, and this tuple sits two tokens from
+#: containing them** (BACKLOG #1184, ASVS 14.2.1). That is a ruled state, not an omission; the ruling
+#: and its reasoning are ``docs/PHI.md`` §7 and this comment does not restate them. What stops the
+#: two-token edit landing quietly is
+#: ``tests/test_logging.py::test_an_undeclared_phi_needle_is_not_scrubbed_from_the_access_line``.
+#: **Cite the ruling, not this sentence.**
 _CREDENTIAL_QUERY_KEYS = ("code", "state", "id_token", "access_token", "token", "session_state")
 
 _CREDENTIAL_QUERY_RE = re.compile(

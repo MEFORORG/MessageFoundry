@@ -917,9 +917,22 @@ one `&` is below the HL7 field-run threshold, and neither parameter name is in t
 **What changed is who can produce such a line.** BACKLOG #1184 (ASVS 14.2.1) removed both names from
 every GET signature, so no route, console form or shipped client puts them on a URL any more. Uvicorn,
 though, builds its access line from the raw ASGI `query_string` rather than from the parameters a route
-binds, so an operator's stale bookmark or a hand-typed URL still reaches the log intact while the route
-itself ignores the term. The filter chain is therefore the only control left over a shape the product no
-longer emits — which is why the engine still classifies the general log as a PHI read surface (below).
+binds, so a hand-crafted URL still reaches the log intact while the route itself ignores the term.
+
+**There is no control over that residual, and the filter chain is not one** — `redact()` leaves a
+single-token identifier alone and neither parameter name is in the credential list, measured by
+`tests/test_logging.py::test_an_undeclared_phi_needle_is_not_scrubbed_from_the_access_line`.
+
+**This section is the record for why, and it is a ruling rather than an omission.** #1184 rejected
+adding the two names to `_CREDENTIAL_QUERY_KEYS`: whoever hand-crafts such a URL also picks the
+parameter name, so `?patient=` or `?q=` would pass an entry for `content` untouched, and the entry
+would read as a protection this log does not have — a compensating control resting on a false premise.
+The catchment is empty besides: no shipped client, bookmark or stored link can carry those names, since
+the parameter was deleted before any first deployment. `tests/test_logging.py::test_the_phi_needle_names_stay_out_of_the_credential_scrub_list`
+pins that edit at the tuple. **The ruling is against a name DENYLIST only** — it says nothing about a
+different control, such as an allowlist scrubbing every non-allowlisted query value, and whoever builds
+one should correct this section rather than work around those tests. That is why the engine still
+classifies the general log as a PHI read surface (below).
 
 **Prod-`DEBUG` refusal.** `serve` **refuses to start at `DEBUG` on a production instance** — derived
 from `--env prod` or **`[security].production_instance = true`** (exit code 2). DEBUG can surface full
