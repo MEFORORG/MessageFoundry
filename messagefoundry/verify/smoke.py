@@ -17,8 +17,14 @@ from __future__ import annotations
 
 import importlib
 import socket
+import ssl
 
 from messagefoundry.config.settings import StoreSettings
+from messagefoundry.config.tls_policy import (
+    harden_cipher_suites,
+    harden_kex_groups,
+    harden_verify_flags,
+)
 from messagefoundry.verify.model import CheckResult, Status
 
 
@@ -119,13 +125,68 @@ def _ack_code(frame: bytes) -> str | None:
     return None
 
 
-def smoke_live(*, host: str, port: int, message: str, timeout: float = 10.0) -> CheckResult:
-    """MLLP-send ``message`` to the running engine and confirm an AA ACK."""
+def live_smoke_ssl_context(*, ca_file: str | None = None) -> ssl.SSLContext:
+    """The client TLS context for a live smoke against a ``tls = true`` MLLP inbound (BACKLOG #1178).
+
+    Hardened the same way every other context the engine builds is: a TLS 1.2 floor, the approved
+    key-exchange groups, the forward-secrecy assertion (ASVS 12.1.2) and strict RFC 5280 validation
+    (ASVS 12.1.4). Inheriting the interpreter's defaults without asserting them is the residual the
+    hardening helpers exist to close, and a verifier is not exempt from it.
+
+    ``ca_file`` anchors the engine's certificate when it is not in the system trust store, which is
+    the usual case: the engine mints a self-signed pair on first run (ADR 0172). There is
+    deliberately **no** verify-off switch — a smoke that accepts any certificate proves the port
+    answers, not that the hop is the engine, and this whole item is about not weakening a hop to
+    make a test pass."""
+    ctx = ssl.create_default_context(ssl.Purpose.SERVER_AUTH, cafile=ca_file)
+    ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+    ctx.check_hostname = True
+    harden_kex_groups(ctx)  # pin approved ECDHE groups where supported (ASVS 11.6.2)
+    harden_cipher_suites(ctx, connector="verify live smoke")  # forward secrecy (ASVS 12.1.2)
+    harden_verify_flags(ctx)  # strict RFC 5280 validation of the engine cert (ASVS 12.1.4)
+    return ctx
+
+
+def smoke_live(
+    *,
+    host: str,
+    port: int,
+    message: str,
+    timeout: float = 10.0,
+    ssl_context: ssl.SSLContext | None = None,
+    server_hostname: str | None = None,
+) -> CheckResult:
+    """MLLP-send ``message`` to the running engine and confirm an AA ACK.
+
+    ``ssl_context`` makes the smoke speak the protocol the target inbound speaks (BACKLOG #1178,
+    ASVS 12.3.1). Without it this call writes a whole MLLP frame — a synthetic message body, but a
+    body — onto a bare socket before it has any evidence the peer is a cleartext listener. ``None``
+    keeps that plaintext path, which is correct for a plaintext inbound and only for one.
+
+    The switch is the caller's to make and is never inferred: probing in the clear and retrying over
+    TLS (or the reverse) is exactly the protocol fall-back 12.3.1 forbids, so a mismatch fails and
+    says so instead."""
     frame = b"\x0b" + message.encode("utf-8") + b"\x1c\x0d"
     try:
-        with socket.create_connection((host, port), timeout=timeout) as sock:
-            sock.sendall(frame)
-            reply = _recv_mllp(sock, timeout)
+        with socket.create_connection((host, port), timeout=timeout) as raw:
+            # Handshake FIRST when TLS is asked for, so no application byte can precede it.
+            # wrap_socket detaches `raw`, so the outer context manager's close is a no-op and the
+            # descriptor is closed exactly once, by the inner one.
+            sock = (
+                raw
+                if ssl_context is None
+                else ssl_context.wrap_socket(raw, server_hostname=server_hostname or host)
+            )
+            with sock:
+                sock.sendall(frame)
+                reply = _recv_mllp(sock, timeout)
+    except ssl.SSLError as exc:  # an OSError subclass, so it must be caught before the arm below
+        return CheckResult(
+            "smoke.live",
+            "Live smoke (MLLP + ACK)",
+            Status.FAIL,
+            f"TLS handshake with the engine inbound at {host}:{port} failed: {exc}",
+        )
     except OSError as exc:
         return CheckResult(
             "smoke.live",
@@ -148,12 +209,21 @@ def smoke_live(*, host: str, port: int, message: str, timeout: float = 10.0) -> 
             Status.FAIL,
             f"engine NAK'd the message: MSA-1={code}",
         )
-    return CheckResult(
-        "smoke.live",
-        "Live smoke (MLLP + ACK)",
-        Status.FAIL,
-        f"no parseable ACK from {host}:{port} ({len(reply)} bytes received)",
-    )
+    detail = f"no parseable ACK from {host}:{port} ({len(reply)} bytes received)"
+    if not reply and ssl_context is None:
+        # A TLS listener handed a cleartext MLLP frame fails the handshake and closes, so the
+        # client sees an accepted connection and zero bytes — indistinguishable, from here, from a
+        # plaintext listener that hung up. Name the possibility rather than act on it: switching
+        # protocols on this evidence is the fall-back ASVS 12.3.1 forbids, and the operator knows
+        # which one their inbound is.
+        detail += (
+            "; the listener accepted the connection and closed without a byte, which is also what "
+            "a tls = true MLLP inbound does to a cleartext frame. If this inbound is TLS, the "
+            "synthetic message has already crossed in the clear; re-run with --smoke-tls (and "
+            "--smoke-tls-ca for a self-signed engine certificate). The smoke never retries over "
+            "TLS on its own"
+        )
+    return CheckResult("smoke.live", "Live smoke (MLLP + ACK)", Status.FAIL, detail)
 
 
 def check_store_connectivity(store: StoreSettings) -> CheckResult:

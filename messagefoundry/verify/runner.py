@@ -106,16 +106,23 @@ def _run_live_smoke(
     settings: ServiceSettings | None,
     check_disposition: bool,
     disposition_timeout: float,
+    smoke_tls: bool = False,
+    smoke_tls_ca: str | None = None,
 ) -> list[CheckResult]:
     """Live MLLP smoke (ACK), plus the opt-in store-disposition follow-up.
 
     The disposition follow-up snapshots the store *before* sending (so a re-used synthetic control id
     can't match a prior run), then — only if the ACK passed — polls for the message reaching a terminal
     disposition. It is the real "did it process" check; ``smoke.live`` alone proves only the ACK.
+
+    ``smoke_tls`` sends the frame inside TLS, for an inbound configured ``tls = true`` (BACKLOG
+    #1178). It is declared, never sniffed: the smoke does not probe one protocol and retry the
+    other, because that fall-back is what ASVS 12.3.1 forbids.
     """
     from messagefoundry.parsing.peek import HL7PeekError, Peek
     from messagefoundry.verify.smoke import (
         check_smoke_disposition,
+        live_smoke_ssl_context,
         newest_message_id,
         smoke_live,
     )
@@ -130,7 +137,8 @@ def _run_live_smoke(
         if control_id:
             baseline_id = newest_message_id(settings.store, control_id)
 
-    results = [smoke_live(host=host, port=port, message=message)]
+    ctx = live_smoke_ssl_context(ca_file=smoke_tls_ca) if smoke_tls else None
+    results = [smoke_live(host=host, port=port, message=message, ssl_context=ctx)]
     if not check_disposition:
         return results
 
@@ -175,6 +183,8 @@ def run_verify(
     inbound: str | None = None,
     check_disposition: bool = False,
     disposition_timeout: float = 15.0,
+    smoke_tls: bool = False,
+    smoke_tls_ca: str | None = None,
     fed_id_token: str | None = None,
     fed_jwks: str | None = None,
     fed_nonce: str | None = None,
@@ -249,6 +259,8 @@ def run_verify(
                     settings=settings,
                     check_disposition=check_disposition,
                     disposition_timeout=disposition_timeout,
+                    smoke_tls=smoke_tls,
+                    smoke_tls_ca=smoke_tls_ca,
                 )
         # smoke_mode == "none": nothing to run
 

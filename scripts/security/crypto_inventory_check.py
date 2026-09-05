@@ -383,6 +383,12 @@ INVENTORY: dict[str, frozenset[str]] = {
     # digests. The HMAC key is HKDF-derived (in crypto.py) from the DEK. store.crypto seam = the at-rest
     # cipher (MARKER_PREFIX/cell_aad/CipherError) it drives over the PHI columns.
     "messagefoundry/store/store.py": frozenset({"hashlib", "hmac", "messagefoundry.store.crypto"}),
+    # BACKLOG #1178 (ASVS 12.3.1): probe_tcp_reachable builds NO context -- it accepts the caller's
+    # and hands it to asyncio.open_connection, so the connection test crosses the same hop the send
+    # path does instead of opening a plaintext socket to a tls=true partner. ssl is imported for the
+    # parameter's type and to tell an ssl.SSLError (handshake) from a plain OSError (connect) in the
+    # failure message. There is no plaintext retry: that downgrade is what 12.3.1 forbids.
+    "messagefoundry/transports/base.py": frozenset({"ssl"}),
     # ADR 0025: the DICOM C-STORE SCP's server SSLContext (Phase 1) + the C-STORE SCU's client SSLContext
     # (Phase 2) for DICOM-over-TLS (the MLLP inbound/outbound posture).
     "messagefoundry/transports/dicom.py": frozenset({"messagefoundry.config.tls_policy", "ssl"}),
@@ -440,6 +446,13 @@ INVENTORY: dict[str, frozenset[str]] = {
     # bytes (integrity/dedup metadata). Body encryption at rest rides the store cipher — the
     # store.crypto seam (Cipher, cell_aad) it imports directly, now a first-class inventory token.
     "messagefoundry/uploads.py": frozenset({"hashlib", "secrets", "messagefoundry.store.crypto"}),
+    # BACKLOG #1178 (ASVS 12.3.1): live_smoke_ssl_context is the verifier's CLIENT context for a
+    # `messagefoundry verify --smoke live --smoke-tls` run against a tls = true MLLP inbound, so the
+    # smoke stops writing a synthetic message body onto a bare socket. It resolves its posture
+    # through the shared seam (harden_kex_groups / harden_cipher_suites / harden_verify_flags)
+    # rather than inheriting the interpreter's defaults, and offers NO verify-off escape -- a smoke
+    # that accepts any certificate proves the port answers, not that it is the engine.
+    "messagefoundry/verify/smoke.py": frozenset({"messagefoundry.config.tls_policy", "ssl"}),
     # --- BACKLOG #282: modules the seam / library / non-messagefoundry-root widening newly surfaces ---
     # The CLI (gen-key / rotate-key / serve): mints the store DEK (store.crypto.generate_key),
     # gates a keyless PHI start, and surfaces KeyProviderError — all delegated through the store seams,
