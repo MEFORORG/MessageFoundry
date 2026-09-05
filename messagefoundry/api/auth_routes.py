@@ -200,6 +200,7 @@ def _user_summary(user: UserRecord, role_ids: list[str]) -> UserSummary:
         auth_provider=user.auth_provider,
         display_name=user.display_name,
         email=user.email,
+        notify_email=user.notify_email,
         disabled=user.disabled,
         roles=sorted(role_ids),
         channel_scope=_parse_channel_scope(user.channel_scope),

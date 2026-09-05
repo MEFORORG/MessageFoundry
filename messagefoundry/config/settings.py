@@ -1672,9 +1672,14 @@ class RetentionSettings(_Section):
     # 0 = keep forever (the default — byte-identical on upgrade; nothing is deleted until an operator
     # sets a window).
     search_preset_days: int = 0
-    # Audit-log retention. RESERVED / not enforced: the audit_log is a tamper-evident hash chain and
-    # HIPAA expects ~6-year retention, so audit is keep-forever by design here; archive-first pruning
-    # is a tracked follow-up. Accepted (not rejected) so a forward-looking file still loads.
+    # Audit-log retention. RESERVED / not enforced. The rationale is the AUDIT-RETENTION REQUIREMENT
+    # (45 CFR 164.316(b)(2)(i), ~6 years) -- not chain-breakage, which this comment used to give as
+    # the reason. Whether a delete breaks the chain depends on WHICH rows go. Measured 2026-09-03,
+    # BACKLOG #1421. The reasoning is stated in ONE place -- the `audit_days` row in
+    # docs/CONFIGURATION.md, which also carries the contract an archive-first purge has to meet --
+    # so read it there rather than restating it here; four copies of it are how the records drifted
+    # apart. Archive-first pruning is a tracked follow-up. Accepted (not rejected) so a
+    # forward-looking file still loads.
     audit_days: int = 0
     # Warn (WARNING log + AlertSink storage_threshold) when the DB file (+ -wal/-shm) exceeds this
     # many MB. 0 = off. Advisory only — never auto-deletes.
@@ -1872,9 +1877,10 @@ class AuthSettings(_Section):
     password_check_username: bool = (
         True  # reject passwords containing the user's own username (6.2.11)
     )
-    # Optional path to a larger offline breach corpus that augments the bundled top-10k list (6.2.12):
-    # a plaintext list OR an HIBP-style SHA-1-hash export (HASH[:count] lines, auto-detected). Fully
-    # offline — no live HIBP call. Use a curated subset, not the full ~40 GB HIBP set (loaded into memory).
+    # Optional path to a larger offline breach corpus that augments the bundled one (6.2.12): a
+    # plaintext list OR an HIBP-style SHA-1-hash export (HASH[:count] lines, auto-detected). Fully
+    # offline — no live HIBP call. Use a curated subset, not the full ~40 GB HIBP set (loaded into
+    # memory). Only entries at or above password_min_length add coverage — see docs/CONFIGURATION.md.
     password_breach_corpus_file: str | None = None
     lockout_threshold: int = 5  # consecutive failed logins before the account locks
     lockout_minutes: int = 15

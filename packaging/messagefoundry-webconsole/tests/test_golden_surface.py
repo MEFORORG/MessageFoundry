@@ -6,13 +6,15 @@ Two drift guards over the console's externally-observable surface, both built by
 console onto a real engine app (``create_app(serve_ui=True)`` -> ``mount_ui``):
 
 * the exact set of mounted ``(method, path)`` /ui routes matches a checked-in golden list, and
-* the ``register_ui_action`` write-action patterns (``_auth._UI_WRITE_ACTIONS``) match a golden set.
+* the ``register_ui_action`` write-action registry (``_auth._UI_WRITE_ACTIONS``) matches a golden set
+  of ``pattern<TAB>action`` rows — the pattern AND the single-use step-up action tag bound to it.
 
-A new page/route or a renamed write-action pattern is an intentional change that must update the
-golden — so an *accidental* drift (a dropped route after a move, a stale/misspelled step-up pattern)
-fails loudly here. A third check pins the security-relevant registration ORDER for the literal-vs-
-path-param pairs (a literal route registered AFTER its ``{param}`` sibling would be shadowed — an
-authz regression, e.g. ``/ui/messages/search`` swallowed by ``/ui/messages/{message_id}``).
+A new page/route, a renamed write-action pattern, or a changed action tag is an intentional change
+that must update the golden — so an *accidental* drift (a dropped route after a move, a
+stale/misspelled step-up pattern, a silently deleted action tag) fails loudly here. A third check
+pins the security-relevant registration ORDER for the literal-vs-path-param pairs (a literal route
+registered AFTER its ``{param}`` sibling would be shadowed — an authz regression, e.g.
+``/ui/messages/search`` swallowed by ``/ui/messages/{message_id}``).
 """
 
 from __future__ import annotations
@@ -29,6 +31,11 @@ from messagefoundry.config.settings import AuthSettings
 from messagefoundry.pipeline import Engine
 
 _GOLDEN = Path(__file__).resolve().parent / "golden"
+
+# The action column's stand-in for ``UiWriteAction.action is None``. A literal marker, never an empty
+# field: a blank second column is indistinguishable from a row that lost its tab, so the one drift
+# this column exists to catch would read as a formatting nit.
+_UNTAGGED = "-"
 
 
 def _read_golden(name: str) -> list[str]:
@@ -73,15 +80,43 @@ async def test_ui_route_table_matches_golden(engine: Engine) -> None:
 
 
 async def test_ui_write_action_registry_matches_golden(engine: Engine) -> None:
-    """The write-action registry (``register_ui_action`` patterns) is pinned. This is the step-up
-    re-auth allow-list; a stale/misspelled/renamed pattern after a route move — the exact failure a
-    single-module registry can still make silently — diverges from the golden and fails here."""
+    """The write-action registry is pinned as ``pattern<TAB>action``. This is the step-up re-auth
+    allow-list; a stale/misspelled/renamed pattern after a route move — the exact failure a
+    single-module registry can still make silently — diverges from the golden and fails here.
+
+    THE ACTION COLUMN IS THE SECURITY-LOAD-BEARING HALF (BACKLOG #1148). ``action`` is the
+    single-use step-up grant ``/ui/reauth`` mints for a continuation (``routes/core.py`` passes it
+    as ``purpose``); ``None`` mints nothing, so the lane falls back to the shared login-seeded
+    window. Deleting one ``action=`` kwarg therefore downgrades a factor-binding browser lane from a
+    fresh per-action proof to a window a five-minute-old login satisfies, in a one-line deletion
+    that reads like tidying.
+
+    WHAT WAS ACTUALLY MEASURED, because the honest result is narrower than "it was unguarded".
+    A mutation sweep deleted each of the 9 ``action=`` kwargs in turn:
+
+    * this golden caught NONE of them. It compared ``path_re.pattern`` only, so the field that
+      changed was invisible to it while its own docstring called it the step-up allow-list guard.
+    * behavioural console tests caught all 9, but incidentally: they were written for the MFA,
+      WebAuthn and session lifecycles, and they report "the lifecycle broke", not "this pattern lost
+      its action tag".
+    * for the 2 WebAuthn lanes that coverage exists ONLY with the optional ``[webauthn]`` extra
+      installed. Without it those tests ``importorskip`` and both deletions ran completely GREEN —
+      so a contributor without the extra gets a clean local run on a real downgrade.
+
+    So this column does not close an unguarded hole. It replaces incidental, extra-gated coverage
+    with a direct one that names the field. Pin the pair, not the pattern.
+    """
     await _serve_ui_app(engine)  # mount so every module-level register_ui_action has fired
-    actual = sorted(action.path_re.pattern for action in ui_auth._UI_WRITE_ACTIONS)
+    actual = sorted(
+        f"{action.path_re.pattern}\t{action.action or _UNTAGGED}"
+        for action in ui_auth._UI_WRITE_ACTIONS
+    )
     golden = _read_golden("ui_write_actions.txt")
     assert actual == golden, (
         "the /ui write-action registry drifted from tests/golden/ui_write_actions.txt — if "
-        "intentional, regenerate the golden; if not, a register_ui_action pattern changed.\n"
+        "intentional, regenerate the golden; if not, a register_ui_action pattern or its step-up "
+        "action tag changed. A row whose action column went to "
+        f"{_UNTAGGED!r} LOST its single-use grant and now rides the shared step-up window.\n"
         f"missing (in golden, not registered): {sorted(set(golden) - set(actual))}\n"
         f"unexpected (registered, not golden): {sorted(set(actual) - set(golden))}"
     )

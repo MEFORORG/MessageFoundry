@@ -749,6 +749,16 @@ async def authorize_ui_ws(
         return None, None
     for permission in permissions:
         if not identity.has(permission):
+            # ASVS 16.3.2 / BACKLOG #1197 — a failed authorization attempt has to leave a record, and
+            # this gate needs its OWN call because nothing downstream can write one. The caller falls
+            # back to the engine's ``authorize_ws``, which cannot reach a browser handshake at all:
+            # it reads the token from the Authorization header only, and its Origin check refuses
+            # every browser Origin against the shipped empty allowlist before its permission loop
+            # runs. No setting reaches here either — ``[diagnostics].audit_all_authz`` governs the
+            # engine's gates, not the console's. Same call shape as ``require_ui`` above and
+            # ``api/security.py``: the row carries the permission and the PATH, never the full URL,
+            # because the query string is where an operator's search terms live.
+            await auth.audit_permission_denied(identity, permission, websocket.url.path)
             return None, None
     return identity, token
 
@@ -762,10 +772,12 @@ def set_session_cookie(response: Response, token: str, *, request: Request) -> N
     handshake at the root can carry it (M2); the cookie is only ever *read* by ``require_ui`` on /ui
     routes, never by the JSON API deps.
     """
+    # BACKLOG #1118: the NAME comes from the shared resolver, not a second copy of its expression.
+    # `secure` stays its own `effective_https` call because the two are DIFFERENT conjuncts -- see
+    # `clear_session_cookie` for why #1117 forbids inferring one from the other.
     secure = effective_https(request.app.state, request.url.scheme)
-    name = HOST_COOKIE_NAME if (secure and browser_hardening_enabled()) else COOKIE_NAME
     response.set_cookie(
-        name,
+        session_cookie_name(request),
         token,
         httponly=True,
         samesite="strict",
@@ -848,10 +860,11 @@ def set_oidc_flow_cookie(
     ``max_age`` bounds it to the server-side flow TTL so an abandoned login does not leave a cookie
     behind indefinitely.
     """
+    # BACKLOG #1118: the NAME comes from the shared resolver -- see `set_session_cookie` for why
+    # `secure` is still computed separately rather than inferred from it.
     secure = effective_https(request.app.state, request.url.scheme)
-    name = HOST_FLOW_COOKIE_NAME if (secure and browser_hardening_enabled()) else FLOW_COOKIE_NAME
     response.set_cookie(
-        name,
+        oidc_flow_cookie_name(request),
         flow_id,
         max_age=max_age,
         httponly=True,

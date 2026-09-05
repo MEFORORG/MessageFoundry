@@ -95,7 +95,7 @@ outbound("OB_EPIC_FHIR", with_smart_backend(
     FHIR(url=env("epic_fhir_base"), interaction="create"),
     token_url=env("epic_token_url"),       # the authorization server token endpoint
     client_id=env("epic_client_id"),
-    scope="system/*.rs",                    # SMART v2 scopes; system/ = no-human
+    scope="system/Patient.c",               # SMART v2, no-human; ONLY what this feed writes
     private_key=env("epic_smart_key"),      # inline PEM via env(), or a PEM file path
     algorithm="RS384",                      # SMART SHALL: RS384 (default) | ES384
     key_id="epic-2026",                     # kid → the public key the server has registered

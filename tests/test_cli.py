@@ -1614,6 +1614,54 @@ def test_serve_ui_default_on_loopback_mounts_ui(
     assert "refusing to serve the browser ops dashboard" not in capsys.readouterr().err
 
 
+def _bare_loopback_serve(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> int:
+    """A bare loopback `serve` — the shipped default, with uvicorn and the app build stubbed out."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("MEFOR_STORE_ENCRYPTION_KEY", "x" * 44)
+    (tmp_path / "messagefoundry.toml").write_text(
+        "security.handles_real_patient_data = false\n", encoding="utf-8"
+    )
+    monkeypatch.setattr("messagefoundry.api.create_managed_app", lambda **kw: object())
+    monkeypatch.setattr("uvicorn.run", lambda *a, **k: None)
+    return main(["serve", "--config", str(SAMPLES_CONFIG), "--env", "dev"])
+
+
+def test_browser_hardening_opt_out_is_reported_at_start(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """BACKLOG #1118: setting the opt-out must SAY so at start, naming what reverts.
+
+    The predicate was read only from `_auth.py` and `_security.py`, both per-request, so an operator
+    who set this env — or inherited it from a service environment — got a quietly weaker console with
+    no signal anywhere. Since ADR 0172 made the engine always serve TLS this is the only remaining
+    way a default deployment loses the `__Host-` binding, which is what makes the silence worth
+    fixing. The message must name the env, the two unprefixed cookie names, and the fact that Secure
+    is not downgraded, because an operator who reads only "hardening off" cannot tell which of those
+    three things happened.
+    """
+    monkeypatch.setenv("MEFOR_WEBCONSOLE_DISABLE_BROWSER_HARDENING", "1")
+    assert _bare_loopback_serve(tmp_path, monkeypatch) == 0
+    err = capsys.readouterr().err
+    assert "MEFOR_WEBCONSOLE_DISABLE_BROWSER_HARDENING is set" in err
+    assert "mf_session / mf_oidc_flow" in err  # the names it reverts TO
+    assert "__Host-" in err  # what is lost
+    assert "Secure is still set over https" in err  # what is NOT lost
+
+
+def test_browser_hardening_default_reports_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Positive control for the arm above: on the shipped default the warning must be ABSENT.
+
+    Without this, a warning that fired unconditionally would pass the test above while telling every
+    operator their console is weakened. `delenv(raising=False)` because the arm keys on the env being
+    absent, and a leaked value from another test would make this pass for the wrong reason.
+    """
+    monkeypatch.delenv("MEFOR_WEBCONSOLE_DISABLE_BROWSER_HARDENING", raising=False)
+    assert _bare_loopback_serve(tmp_path, monkeypatch) == 0
+    assert "MEFOR_WEBCONSOLE_DISABLE_BROWSER_HARDENING" not in capsys.readouterr().err
+
+
 def test_serve_ui_explicit_offloopback_still_refuses(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
