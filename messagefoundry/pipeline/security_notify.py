@@ -101,8 +101,11 @@ def _build_body(event: SecurityEvent) -> str:
         # applies no ``_externally_managed`` guard, though this same module guards three other routes
         # with one, so an admin may clear a directory account's address and ``_upsert_ad_user``
         # restores it on the next directory login. And the removal reaches the PROFILE MIRROR only:
-        # every notice, this one included, is addressed to ``users.notify_email``, which no clear can
-        # strip -- ``set_user_notify_email`` takes a non-empty ``str``.
+        # this notice is addressed to ``users.notify_email``, which no clear can strip --
+        # ``set_user_notify_email`` takes a non-empty ``str``. (The completeness claim that used to
+        # stand here, "every notice, this one included", is struck as a claim this renderer cannot
+        # make -- SDS-3.6. The addressing rule and its one exception are stated once, on
+        # ``SecurityEvent.email``.)
         #
         # A security notice written to make someone act NOW, resting on a promise the schema
         # contradicts, is the compensating-control-on-a-false-premise shape SDS-3.7 forbids. So this
@@ -178,10 +181,12 @@ class SecurityEventNotifier(_BackgroundDispatcher[SecurityEvent]):
 
     async def notify(self, event: SecurityEvent) -> None:
         # No deliverable address → nothing to email; the audited /me/security-events feed still
-        # records it. Non-blocking enqueue. ``event.email`` is the account's ENGINE-OWNED
-        # ``notify_email`` (BACKLOG #1139), never the directory-mirrored profile address, so an
-        # empty one here means the account has never carried an address -- not that a directory
-        # repoint took it away.
+        # records it. Non-blocking enqueue.
+        #
+        # **WHICH ADDRESS ``event.email`` HOLDS IS A CALLER'S PROPERTY, NOT AN INVARIANT THIS METHOD
+        # HOLDS**, and it used to be written here as one (BACKLOG #1139). The rule and its single
+        # exception are stated once on ``SecurityEvent.email``; this method enforces nothing beyond
+        # the drop below, so do not restate the rule here as though it did.
         if not event.email:
             return
         self._enqueue(event, dropped=f"{event.event_type} for {event.username}")
