@@ -22915,3 +22915,48 @@ git rev-parse --git-dir
 
 **A NOTE ON REPRODUCING THIS, because the first framing did not reproduce and that nearly buried it.** A reader in their own worktree who lists their own project directory will find exactly one session UUID and correctly conclude that nothing is shared with other seats. That result is right and it is not a refutation: the collision is inside one session, so the reproduction is to write a marker into the scratchpad and then spawn a subagent to list that same directory. **The two colliding paths are deliberately not published here** -- they carry a host account name and worktree slugs, which the forbidden-content gate blocks and which its own message says must be removed rather than allowlisted. The schematic form above is the publishable version.
 
+## 1455. nothing requires a value or difficulty at filing, so the ranked table goes silently incomplete between passes
+
+> 🔢 **Filed 2026-09-05 -- not started. Scored at filing, which is the convention this row proposes making universal.** Value **5/10** · Difficulty **2/10** · _fill-in_. An item enters the ledger with no value or difficulty and stays that way until a scoring pass reaches it. Nothing in CI, in `scripts/docs/backlog_status_check.py`, or in `.github/workflows/backlog-hygiene.yml` asserts that an OPEN item carries a score, so the omission is invisible to every gate and shows up only when somebody runs a census by hand. The remainder is one assertion on a parser that already walks every item, plus its must-trip and must-not-trip arms; difficulty 2 for a small additive change on an existing seam, and the value band is argued below rather than asserted.
+> Verdict: owner-ruling
+> Research: none
+> Closing-act: owner-ruling
+
+**Cluster:** ledger hygiene / planning instruments. **Priority:** P2. **Verdict:** owner-ruling.
+**Severity:** no deployment axis (sec. 0). This is a property of `docs/BACKLOG.md`, not of the engine. No shipped artifact, no PHI, and nothing a deploying site would meet.
+
+**The defect, in one sentence:** the ranked table is how this project answers *"what next"*, and an item with no score is absent from it while being present in the ledger -- so the instrument reads complete while being incomplete.
+
+### The measurement, taken three times because it recurred three times
+
+| pass | items found carrying no score | on |
+|---|--:|---|
+| first score | **73** | 2026-09-03 |
+| again | **5** | 2026-09-04 |
+| again | **1** | 2026-09-05 |
+
+Each pass closed the gap to zero and each was re-opened by ordinary filing within a day. None of the three was found by a gate; all three were found by running `parse_items` by hand and grepping for a `Value **N/10**` line.
+
+**The gap is not universal, and that is the strongest argument against this row.** Of the **8** open items filed on or after 2026-09-03, **3 were scored at filing** (#1431, #1435, #1440) and **5 needed a later pass** (#1424, #1427, #1429, #1430, #1434). So a convention is already emerging without a gate, and one seat adopted it explicitly on **#1443** after being shown the cost. A gate may be codifying something that is fixing itself.
+
+**Two instruments disagree on this population, and the disagreement is instructive.** Counting items whose banner carries a `Scored <date>` line reports #1435 as never scored; counting items whose body carries `Value **N/10**` reports it as scored. The second is right -- #1435 scores inline in its filing banner without the `Scored` phrasing. **Any gate built here must key on the SCORE, not on the sentence that usually introduces one**, or it will red a correctly-scored item and teach filers to write a magic phrase.
+
+### Why value 5 and not 6
+
+The band-6 shape in this ledger is an instrument whose silence looks like success with no control that catches the bad state -- **#1398** sits there. This is one rung down for a specific reason: the bad state is **trivially detectable**, by one pass of the parser the repository already ships, and the workaround has been exercised three times in three days. It is a real gap with an awkward workaround, which is band 6's neighbour and band 5's definition once the workaround is this well-trodden.
+
+**Argue it up if you disagree.** The case for 6 is that a planning instrument going incomplete is not merely awkward, because the reader who consults the table does not know to run the census, and nothing tells them.
+
+### Why this is an owner ruling rather than a build
+
+`backlog_status_check.py` runs in the required `test` leg. An assertion there would **red the pull request of anyone who files an unscored item**, which changes what filing costs for every seat, not just for the scoring pass. That is a policy decision about the filing contract. The cheaper alternatives, which should be weighed first:
+
+1. **Advisory only** -- warn in the checker, never fatal, the way its CHANGELOG cross-reference already works.
+2. **Convention, no gate** -- record the expectation in `CLAUDE.md` and let the emerging practice carry it, given 3 of 8 already comply.
+3. **Fatal gate** -- the strongest, and the only one that cannot drift.
+
+**Do not build 3 on the strength of this row alone.**
+
+**Source:** measured while scoring the ledger on 2026-09-03, 2026-09-04 and 2026-09-05; the first-score section header of this file already records the mechanism, and this row exists so the recurrence is tracked rather than re-derived each time.
+
+---
