@@ -4890,18 +4890,18 @@ class PostgresStore:
     ) -> tuple[str, list[Any]]:
         """Build the ``(where, params)`` (``$1``-based) for :meth:`purge_dead_letters`' attachment
         release: the messages owning a dead row purged in this window whose LAST replayable row is now
-        gone. ``$1``=OUTBOUND stage, ``$2``=DEAD status, cutoff from ``$3``. Mirrors SQLite."""
+        gone. ``$1``=DEAD status, cutoff from ``$2``. Mirrors SQLite — stage-agnostic since #1188, so a
+        message whose last replayable row is a dead INGRESS row releases its attachment here too."""
         cutoff_sql, cutoff_params, idx = _pg_cutoff_case(
-            "q0.destination_name", older_than, connection_cutoffs, start=3
+            "q0.destination_name", older_than, connection_cutoffs, start=2
         )
         still = self._attachment_still_referenced_sql("q0.message_id", idx, idx + 1)
         where = (
             "message_id IN (SELECT DISTINCT q0.message_id FROM queue q0"
-            f" WHERE q0.stage=$1 AND q0.status=$2 AND q0.updated_at < {cutoff_sql}"
+            f" WHERE q0.status=$1 AND q0.updated_at < {cutoff_sql}"
             f" AND NOT {still})"
         )
         params = [
-            Stage.OUTBOUND.value,
             OutboxStatus.DEAD.value,
             *cutoff_params,
             [OutboxStatus.PENDING.value, OutboxStatus.INFLIGHT.value],
@@ -7125,24 +7125,33 @@ class PostgresStore:
         now: float | None = None,
         connection_cutoffs: Mapping[str, float] | None = None,
     ) -> int:
-        """Null the bodies of dead-lettered **outbound** rows last updated before ``older_than`` (their
-        own retention window). Keeps the row + ``dead`` status; blanks ``payload`` + ``last_error``.
+        """Null the bodies of dead-lettered rows last updated before ``older_than`` (their own
+        retention window). Keeps the row + ``dead`` status; blanks ``payload`` + ``last_error``.
         Ported, not stubbed. Returns the number of dead rows purged.
+
+        **Every stage, not only outbound** (#1188, ASVS 14.2.7) — mirrors the SQLite backend. A dead
+        ``ingress``/``routed`` row holds the full raw body and is neither pending nor inflight, so its
+        message is body-purge-eligible: the outbound-only scope blanked ``messages.raw`` while that raw
+        survived in the queue row unreachable by any sweep. :meth:`replay` re-queues such a row from its
+        own payload, so it is replayable-until-purged exactly as a dead outbound row is. The stage
+        predicate is dropped rather than widened to a list, so a later stage is covered by construction.
 
         ``connection_cutoffs`` (#34, ADR 0027) optionally overrides the cutoff per ``destination_name``
         (``float('-inf')`` = keep forever); default empty ⇒ a single global cutoff, byte-identical to
-        the prior behaviour."""
+        the prior behaviour. An ingress/routed/response row has a NULL ``destination_name``, so
+        ``CASE NULL WHEN ...`` matches no arm and it takes the ``ELSE`` — always the global dead-letter
+        window (``dead_letter_days`` is declared on an OUTBOUND connection, so there is no inbound-keyed
+        override to honour)."""
         now = time.time() if now is None else now
-        # stage/status are $1/$2; the cutoff CASE (#34) numbers from $3 onward.
+        # status is $1; the cutoff CASE (#34) numbers from $2 onward.
         cutoff_sql, cutoff_params, _ = _pg_cutoff_case(
-            "destination_name", older_than, connection_cutoffs, start=3
+            "destination_name", older_than, connection_cutoffs, start=2
         )
         async with self._timed_acquire() as conn:  # noqa: SIM117
             async with conn.transaction():
                 result = await conn.execute(
                     "UPDATE queue SET payload='', last_error=NULL"
-                    f" WHERE stage=$1 AND status=$2 AND payload <> '' AND updated_at < {cutoff_sql}",
-                    Stage.OUTBOUND.value,
+                    f" WHERE status=$1 AND payload <> '' AND updated_at < {cutoff_sql}",
                     OutboxStatus.DEAD.value,
                     *cutoff_params,
                 )
