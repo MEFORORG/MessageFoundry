@@ -22627,3 +22627,162 @@ All 137 listed entries were swept for a repo-rooted read of `messagefoundry/**`.
 
 1. **The five pull requests above.** A Builder must not push to another seat's branch, so each is fixed by whoever next touches it: append `tests/<name>.py` to `tests/tooling_manifest.txt`, keeping the list alphabetical. **The gate is passable and two pull requests that night passed it correctly -- nothing here asks for it to be weakened.**
 2. **Three copies of the manifest parser, pinned against nothing.** This file, `_tooling_basenames` in `tests/conftest.py` (the copy that actually applies the marker), and `_manifest_paths` in `tests/test_ci_tooling_gate.py` all implement the same rule. Extracting one `tests/_tooling_manifest.py` is the real fix. Related: `test_every_manifest_entry_trips_its_own_gate` in `tests/test_ci_tooling_gate.py` feeds each manifest entry back as its own changed path, so on the manifest arm every entry matches itself unconditionally.
+
+## 1441. Non-serve CLI subcommands run with no root logging handler, so WARNING+ records bypass the PHI filter chain via logging.lastResort
+
+> 🔢 **Filed 2026-09-03 -- not started.** Two of the CLI's 32 subcommands install a root logging handler. The other 30 run with an empty root handler list, so the standard library services their records through `logging.lastResort`. That handler carries `filters=[]` and `formatter=None`. Every `RedactionFilter`, `CredentialQueryScrubFilter` and `ControlCharScrubFilter` that `logging_setup._install_phi_filters` puts on a configured handler is therefore absent, and a WARNING or above prints to stderr as written. **On a first deployment an operator running `backup`, `restore-verify`, `rekey-audit`, `rotate-key` or `admin-unlock` would get any such record, and any traceback attached to it, rendered raw.** Measured below with a paired control. **#1199's fix, [PR 820](https://github.com/MEFORORG/MessageFoundry/pull/820), has since merged and was re-checked against this at `a2eef0f37`; it does not close it** -- it is per-logger with one call site, and it never touches `__main__.py`.
+>
+> **Scored 2026-09-03 -> P2.** Value **7/10** · Difficulty **4/10** · _quick win_. Value 7 -- a real gap with no in-product workaround, because the filter chain is a property of the handler and no call site can restore it for a process that installed none. Held below 8 by two bounds this item measured rather than assumed: `lastResort.level` is `WARNING`, so the 19 DEBUG and INFO `exc_info` sites under `store/` and `pipeline/` are dropped rather than leaked, and some call sites already redact through `redaction.safe_exc`, which survives an unfiltered handler. Difficulty 4 -- the code change is small and sits on an existing seam, but 40 test files assert on captured CLI output and 6 of them use `caplog`, which `configure_logging` breaks by construction (measured below). The remainder is test reconciliation, not new machinery.
+> Verdict: build
+> Research: none
+> Closing-act: code
+
+**Cluster:** Error handling / PHI redaction. **Priority:** P2. **Verdict:** build.
+**Severity:** a redaction-coverage gap in shipped code, stated in the conditional per section 0 -- there are no deployments, so nothing is leaking today. What is wrong today is the code: a PHI-safety control the `serve` path has does not exist in 30 sibling processes. **The exposure route would be an operator's own console, and whatever it is piped to** -- a terminal scrollback, a redirect, a ticket attachment, a CI log. Unlike `serve`, these subcommands do not run under NSSM, so nothing captures their output to a controlled file.
+
+**This extends a hazard the project has already half-named, which is why it should not be read as an exotic new claim.** CLAUDE.md section 9 records that CLI `dryrun` and `generate` output can contain full message bodies on stdout and stderr, and rules that they must never run against real PHI or have their output redirected to a committed file, ticket or CI log. That rule covers **deliberate** payload output from two subcommands. This item is the **incidental** case across 30: the same two streams, the same destinations, no operator intent, and no rule written for it. The existing prohibition tells an operator not to point `dryrun` at real data. Nothing tells them that `backup` failing at 2am writes whatever the traceback quotes.
+
+### The state, measured 2026-09-03 at `46ea10a78`, re-verified 2026-09-04 at `a2eef0f37`
+
+**Re-verified because `main` moved 58 commits between the two dates, and both measured files changed** (`__main__.py` +264 lines, `logging_setup.py` +113). The counts below are unchanged across that move: still 32 subcommands, still exactly `serve` and `supervise`, and `main()` still installs nothing. One claim in an earlier draft of this row **did** go stale in that window and was corrected rather than left standing -- see the #1199 section.
+
+`_DISPATCH` in [`messagefoundry/__main__.py`](../messagefoundry/__main__.py) holds **32 subcommands**. Reading each dispatch target's own source for a `configure_logging(` call:
+
+| result | count | which |
+|---|---|---|
+| configures logging | 2 | `serve`, `supervise` |
+| does not | 30 | `admin-unlock`, `adr-analyze`, `ai-policy`, `alert`, `audit-anchor`, `audit-verify`, `backup`, `cert`, `check`, `codeset`, `connection`, `dryrun`, `gen-key`, `generate`, `graph`, `hl7schema`, `hl7structures`, `impact`, `import`, `init`, `lens`, `protect-key`, `rekey-audit`, `restore-verify`, `rotate-key`, `security`, `service`, `support-bundle`, `validate`, `verify` |
+
+A second, independent instrument agrees. A static sweep for `configure_logging(`, `configure_stderr_logging(`, `basicConfig(` and `root.addHandler` across `messagefoundry/` returns handler installs only in `logging_setup` itself, in `_serve` and `_supervise`, in `pipeline/_sandbox_worker` (which correctly calls `configure_stderr_logging`), and in the tray entrypoint -- out of scope, see the last section.
+
+### The mechanism: `logging.lastResort` is unfiltered and unformatted
+
+In a bare interpreter:
+
+```
+type      = _StderrHandler
+filters   = []
+formatter = None
+level     = WARNING
+root.handlers = []
+```
+
+`filters = []` is the whole finding. Redaction here is a property of the **handler**, not of the logger or the call site -- the premise `configure_stderr_logging` states in its own docstring. A process that installs no handler does not get a weaker chain. It gets no chain.
+
+**The shipped code already knows about the level half of this, in four places, and none of them mentions the filters.** All four sit in `_serve`, in the window before `configure_logging` runs. One comment states the mechanism outright -- every record there is serviced by `logging.lastResort`, "which drops < WARNING at ANY `--log-level` and reaches none of the handlers/filters/off-box forwarder the operator configured". The other three are workarounds built on the same fact: one routes an announcement to `print(file=sys.stderr)` instead of `logging.info` because INFO would vanish, and two deliberately raise an audit line to WARNING **so that `lastResort` will surface it**. Those two are the sharp ones. They are shipped code choosing the level that reaches the unfiltered handler, and they are correct about visibility while saying nothing about redaction. So the mechanism is not a discovery. **What is missing everywhere is the filter guarantee attached to it.**
+
+### The A/B, through the real `main()`, one variable
+
+Both arms run the real `messagefoundry backup` path: real argparse, real stream hardening, real dispatch. Only the subcommand body is replaced, so the record is deterministic. Arm B adds the single call `_serve` makes.
+
+| arm | `root.handlers` at dispatch | WARNING output | traceback output |
+|---|---|---|---|
+| **A** -- as shipped, no `configure_logging` | `[]` | `dr backup: could not persist PID\|1\|\|123456^^^HOSP^MR\|\|DOE^JANE^Q\|\|19800101\|F` | full traceback, ending `ValueError: row rejected: PID\|1\|\|123456^^^HOSP^MR\|\|...` verbatim |
+| **B** -- control, `configure_logging` first | `[StreamHandler]` carrying `RedactionFilter`, `CredentialQueryScrubFilter`, `ControlCharScrubFilter` | `2026-09-03T23:41:43Z WARNING messagefoundry.store: dr backup: could not persist PID\|[redacted]` | traceback indented and quoted, ending `ValueError: row rejected: PID\|[redacted]` |
+
+**The control fires in both limbs**, which is what makes arm A a reading rather than an absence. A probe that found nothing here would be indistinguishable from a filter chain that does not redact this shape at all.
+
+Segment used: the synthetic `PID|1||123456^^^HOSP^MR||DOE^JANE^Q||19800101|F`. No real PHI, per section 9.
+
+### What a deploying site would reach
+
+A **real** `messagefoundry backup --db <path> --destination <dir>` run was executed and instrumented. `root.handlers` was `[]` for the whole run, before and after. Seven modules carrying WARNING-or-above traceback sites loaded during it:
+
+| module | WARNING+ sites carrying a traceback |
+|---|---|
+| `store/store.py` | 6 |
+| `pipeline/dr_backup.py` | 5 |
+| `pipeline/dr.py` | 2 |
+| `pipeline/retention.py` | 2 |
+| `store/audit_tee.py` | 1 |
+| `store/base.py` | 1 |
+| `store/gcm_bound.py` | 1 |
+| **total reachable from one `backup` run** | **18** |
+
+Counted by walking the AST for `.warning`, `.error`, `.critical` or `.exception` calls carrying `exc_info`, so a call split across lines is not missed.
+
+**One limit, stated rather than papered over.** This establishes the mechanism and the reachable site count. It does **not** establish that any of those 18 records carries PHI in its text or its traceback frames. Some already redact at the call site through `redaction.safe_exc`, and that redaction survives an unfiltered handler. Whoever takes this item should sample the reachable sites before restating the severity. The defect is that the control is absent, not that a named record is known to leak.
+
+**Negative control on the level bound:** 19 DEBUG and INFO `exc_info` sites exist under the same two trees. `lastResort.level` is `WARNING`, so those are dropped, not leaked. That is a different defect, treated next, and it is why this item is scoped to WARNING and above.
+
+### This is not #1199, and the two must not be merged
+
+Both items sit on the same empty-root-handler state and take **opposite** consequences from it, split by the `lastResort` level threshold:
+
+| level | consequence | item |
+|---|---|---|
+| below WARNING | the record is dropped outright and never reaches the off-box tee | **#1199** |
+| WARNING and above | the record is rendered, unfiltered and unformatted | **this item** |
+
+#1199 already records the shared premise in its own text, including the two-call-site count. Its fix -- `logging_setup.ensure_logger_sink` -- addresses the audit tee's INFO record. **It has landed**, as commit `99887f5a4` via [PR 820](https://github.com/MEFORORG/MessageFoundry/pull/820).
+
+**It does not close this gap, and that was checked rather than assumed.** Re-measured against `a2eef0f37`:
+
+| question | reading on `main` |
+|---|---|
+| does `main()` call `configure_logging`? | no |
+| does `main()` call `ensure_logger_sink`? | no -- the symbol does not appear in `__main__.py` at all |
+| subcommands in `_DISPATCH` | 32 |
+| of those, configuring logging | 2 (`serve`, `supervise`) -- unchanged |
+
+`ensure_logger_sink` is **per-logger by construction**: it guarantees a sink on the one logger it is handed, and its only caller hands it the audit logger. The 18 traceback sites this item counts log on `messagefoundry.store` and `messagefoundry.pipeline.dr_backup`, which it never touches. A narrow fix for the INFO-drop half is the right shape for #1199 and leaves the WARNING+ half exactly as measured.
+
+**It is the right seam to read first.** `build_stderr_handler` is now the single definition of a MessageFoundry stderr sink and already calls `_install_phi_filters`, and `ensure_logger_sink` is idempotent and self-removing once a process configures a real sink. Remedy (2) below is close to "call it on the `messagefoundry` logger too". Read `logging_setup` as it stands before building anything here.
+
+**A method note, recorded because it nearly shipped a false claim in this row.** An earlier draft asserted the #1199 fix was *"not on `main`"* and cited its branch head. That was true when measured and false eight hours later, and the row was one push away from carrying it. **A claim about another branch's state has a shelf life; a claim about your own measurement does not.** Prefer the second, and re-read the first before you land.
+
+### The precedent: this class has been fixed here twice
+
+- **#1054** -- the sandbox child logged through an unfiltered root logger. `configure_stderr_logging` exists because of it, and its docstring states the governing rule: *"Every process that logs installs the chain, or it does not have it."* Thirty subcommands do not.
+- **#1055** -- `threading.excepthook` was unreplaced, so a traceback on the sandbox reader thread reached the stdlib hook unredacted. Shipped 2026-08-10, measured with the same synthetic segment, and the pre-fix reading had this shape: a raw traceback ending in a full `PID` segment.
+
+Both were accepted as defects and built. This is the third member of the family and the widest, because it covers 30 entrypoints rather than one thread or one child process.
+
+**A naming collision to avoid.** `messagefoundry/last_resort.py` is a different subject: the process-level uncaught-exception backstop for ASVS 16.5.4. It routes through `safe_exc` and works correctly. It has nothing to do with `logging.lastResort`, the standard library's handler of last resort. Say which one you mean.
+
+### Two candidate remedies, and this item does not pick one
+
+**(1) Configure logging for every subcommand, in `main()`.** Correct by construction, and it matches the #1054 rule. Every process installs the chain. The cost is the blast radius below.
+
+**(2) A narrower per-logger fallback.** Attach the filter chain to the `messagefoundry` logger, or install a filtered sink only when the root has no handlers -- the shape `ensure_logger_sink` already takes on the #1199 branch. Smaller output change, and it leaves third-party WARNINGs on `lastResort`. Whether that residue matters is the open question for whoever takes this.
+
+**Neither is chosen here.** Remedy (1) has the larger and better-understood cost. Remedy (2) has an unmeasured coverage boundary.
+
+### Blast radius, measured -- and remedy (1) breaks `caplog` by construction
+
+| reading | count |
+|---|---|
+| test files importing `messagefoundry.__main__` | 47 |
+| of those, asserting on captured output | 40 |
+| using `capsys` / `capfd` | 39 |
+| using `caplog` | 6 |
+
+Two distinct effects, and the second is the sharp one.
+
+**`capsys` / `capfd`:** records that today reach stderr bare would gain the standard formatter prefix (`<UTC timestamp> LEVEL logger: `) and real redaction. Under remedy (1) as `configure_logging` is written, they would also move from **stderr to stdout**. Any assertion pinning exact text, or pinning which stream carried it, sees something different.
+
+**`caplog`:** `configure_logging` removes every existing root handler before adding its own. Pytest's `caplog` captures through a handler on the root logger. Measured as a paired test, one variable:
+
+| arm | result |
+|---|---|
+| control -- `caplog` with nothing clearing root handlers | captures the record, **passes** |
+| arm -- identical, `configure_logging` called first | `caplog.text` is empty, **fails** |
+
+So remedy (1) does not merely change what those 6 files read. It empties their capture. That is a design question for the fix -- whether `main()` should configure only when the root has no handlers, or whether those tests should install the chain themselves -- and it is why difficulty is 4 rather than 2.
+
+### One adjacent observation, deliberately NOT part of this item
+
+`messagefoundry/tray/__main__.py` installs its own root handler in `_setup_logging`: a `RotatingFileHandler` on `tray.log` with a hand-written `logging.Formatter` and **no call to `_install_phi_filters`**. It is a separate Windows entrypoint (ADR 0113), not a `messagefoundry` subcommand, so it sits outside this item's scope and outside every measurement above.
+
+**This paragraph is the only record of it, deliberately.** The owner ruled on 2026-09-03 to keep it here rather than allocate a second number, so it is a footnote by decision, not by oversight. Re-find it with the instrument that catches it:
+
+```bash
+grep -rn "root\.addHandler" --include=*.py messagefoundry/
+```
+
+**Why it was missed, which is the transferable part.** #1199 and PR 820 both state "only two call sites install a root handler in the package". That count came from a pattern matching `configure_logging(`, `configure_stderr_logging(` and `basicConfig(`, which **cannot** match a bare `root.addHandler` -- so it returned a complete-looking answer over an incomplete search space. Its positive control counted `getLogger` hits, which fires whether or not the pattern covers every install route: a control on the corpus, not on the predicate. **Prefer "at least two" to an enumeration**, per section 11. The author of PR 820 accepted this as a defect in that docstring. **820 has since merged with the wording intact**, so the overstatement is on `main` today: `git show origin/main:messagefoundry/logging_setup.py | grep -c "Only two call sites"` returns 1 at `a2eef0f37`. Correcting it is a one-line docstring edit that belongs to whoever takes this row.
+
+Whether the tray needs the chain is unresolved and unclaimed. It is named as a subject rather than a number, per the ledger rule on citing work nobody has allocated.
+
+**Related:** #1054 and #1055 (the same class, both shipped), #1199 (the same premise, the opposite consequence) and its fix [PR 820](https://github.com/MEFORORG/MessageFoundry/pull/820), merged as `99887f5a4` and re-checked against this gap at `a2eef0f37`, which does not close it.
+
