@@ -30,6 +30,16 @@ def _is_ar_nak(ack: str | None) -> bool:
     return ack is not None and "MSA|AR" in ack
 
 
+# BACKLOG #1109: the shared ingress handlers now also sniff a non-HL7 body against its declared
+# content_type, so an UNDER-cap body must be format-conformant to reach RECEIVED. The bodies below are
+# therefore shaped like their declared type on purpose — do not "simplify" them back to filler, or these
+# size-cap tests would start failing for the sniff's reason instead of asserting their own. A DICOM
+# Part-10 stub is 132 bytes before any payload, so the DICOM caps here sit above 132, not at 64.
+def _dicom_body(extra: int) -> bytes:
+    """A minimal Part-10-shaped body: 128-byte preamble + ``DICM`` + ``extra`` filler bytes."""
+    return b"\x00" * 128 + b"DICM" + b"a" * extra
+
+
 @pytest.fixture
 async def store(tmp_path: Path):
     s = await MessageStore.open(tmp_path / "engine.db")
@@ -81,12 +91,12 @@ async def test_text_under_cap_received(store: MessageStore, monkeypatch) -> None
     reg = _registry("IB_JSON", ContentType.JSON)
     runner = RegistryRunner(reg, store)
 
-    ack = await runner._handle_inbound(reg.inbound["IB_JSON"], b"hello")
+    ack = await runner._handle_inbound(reg.inbound["IB_JSON"], b'{"a":1}')
     assert ack is None
     rows = await _rows(store)
     assert len(rows) == 1
     assert rows[0]["status"] == MessageStatus.RECEIVED.value
-    assert rows[0]["raw"] == "hello"
+    assert rows[0]["raw"] == '{"a":1}'
 
 
 async def test_text_boundary_exact_cap_accepted(store: MessageStore, monkeypatch) -> None:
@@ -94,9 +104,10 @@ async def test_text_boundary_exact_cap_accepted(store: MessageStore, monkeypatch
     reg = _registry("IB_JSON", ContentType.JSON)
     runner = RegistryRunner(reg, store)
 
-    # exactly len == cap is accepted (RECEIVED); cap + 1 is ERROR
-    await runner._handle_inbound(reg.inbound["IB_JSON"], ("a" * 64).encode("utf-8"))
-    await runner._handle_inbound(reg.inbound["IB_JSON"], ("b" * 65).encode("utf-8"))
+    # exactly len == cap is accepted (RECEIVED); cap + 1 is ERROR. The leading "{" satisfies the JSON
+    # sniff so the ONLY thing separating these two bodies is their length.
+    await runner._handle_inbound(reg.inbound["IB_JSON"], ("{" + "a" * 63).encode("utf-8"))
+    await runner._handle_inbound(reg.inbound["IB_JSON"], ("{" + "b" * 64).encode("utf-8"))
 
     rows = sorted(await _rows(store), key=lambda r: len(r["raw"]))
     assert rows[0]["status"] == MessageStatus.RECEIVED.value  # 64 chars
@@ -150,11 +161,12 @@ async def test_binary_over_cap_nul_free_stays_plain_latin1(
 
 
 async def test_binary_under_cap_received(store: MessageStore, monkeypatch) -> None:
-    monkeypatch.setattr(wiring_runner, "_INGRESS_MAX_BYTES", 64)
+    monkeypatch.setattr(wiring_runner, "_INGRESS_MAX_BYTES", 200)
     reg = _registry("IB_DICOM", ContentType.DICOM)
     runner = RegistryRunner(reg, store)
 
-    ack = await runner._handle_inbound(reg.inbound["IB_DICOM"], b"\x00\x01\x02\x03")
+    body = _dicom_body(4)  # 136 bytes: Part-10-shaped, under the 200-byte cap
+    ack = await runner._handle_inbound(reg.inbound["IB_DICOM"], body)
     assert ack is None
     rows = await _rows(store)
     assert len(rows) == 1
@@ -162,14 +174,15 @@ async def test_binary_under_cap_received(store: MessageStore, monkeypatch) -> No
 
 
 async def test_binary_boundary_measured_on_raw_bytes(store: MessageStore, monkeypatch) -> None:
-    monkeypatch.setattr(wiring_runner, "_INGRESS_MAX_BYTES", 64)
+    monkeypatch.setattr(wiring_runner, "_INGRESS_MAX_BYTES", 140)
     reg = _registry("IB_DICOM", ContentType.DICOM)
     runner = RegistryRunner(reg, store)
 
-    # The cap is measured on the RAW bytes (pre-base64-inflation): 64 raw bytes is accepted even though
-    # its base64 carriage form is larger; 65 raw bytes is rejected.
-    await runner._handle_inbound(reg.inbound["IB_DICOM"], b"a" * 64)
-    await runner._handle_inbound(reg.inbound["IB_DICOM"], b"b" * 65)
+    # The cap is measured on the RAW bytes (pre-base64-inflation): 140 raw bytes is accepted even though
+    # its base64 carriage form is larger; 141 raw bytes is rejected. Both are Part-10-shaped, so length
+    # is the only difference between them.
+    await runner._handle_inbound(reg.inbound["IB_DICOM"], _dicom_body(8))  # 140 bytes
+    await runner._handle_inbound(reg.inbound["IB_DICOM"], _dicom_body(9))  # 141 bytes
 
     rows = await _rows(store)
     statuses = sorted(r["status"] for r in rows)
