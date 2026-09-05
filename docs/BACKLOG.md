@@ -54,15 +54,20 @@ worktree") and the item was re-filed at **#1298**. The gate did its job; the les
 records the claim against **whatever tree it runs in**, so run it from the worktree that will commit.
 Always allocate with `scripts/coord/alloc.ps1`; never pick a number by reading this file.
 
-**#1422 and #1425 are holes, and they share #1297's cause in a form worth naming separately.** Both were
-allocated on 2026-09-03 by a **coordinating session, on a Builder's behalf** -- the claim recorded the
-coordinator's worktree, so the Builder that was supposed to file the item could not commit against the
-number and the ledger gate correctly refused it. #1425's subject was re-filed at **#1426** from the
-Builder's own worktree. The variant matters because it does not look like #1297: the allocating shell's
-working directory was not wrong for the session that ran it, it was wrong for the session that would
-commit, and that mismatch is invisible at allocation time. **A number is allocated by the seat that will
-commit it, in that seat's own worktree, and never handed over** -- `alloc.ps1` carries no transfer verb by
-design ("holes are free, collisions are not"), and the missing transfer path is itself filed as **#1414**.
+**At least #1422 and #1425 are holes of the #1297 kind with one variation, and the variation is what
+makes it recur: both were allocated by a COORDINATING session on a BUILDER's behalf.** Recorded
+2026-09-03. The allocating shell was in the right worktree for itself and the wrong one for the seat
+that would commit, so the claim went to the coordinator's tree while the commit came from the
+Builder's. The gate keys ownership on the allocating WORKTREE first and falls back to the BRANCH only
+once that worktree is gone, so with the coordinator's worktree still live BOTH keys miss and the
+commit is refused — correctly, and far from the cause. #1425 was re-filed at **#1426** by the Builder,
+allocating in its own worktree. **The rule that follows is narrower than "run it from the right
+directory": a number must be allocated by the seat that will commit it, and a coordinator that
+allocates ahead for someone else spends the number without being able to use it.** Only these two are
+verified holes of this shape; the coordinator's other 2026-09-03 allocations (#1401 and up) were filed
+from that same worktree and are ordinary items.
+
+`alloc.ps1` carries no transfer verb by design ("holes are free, collisions are not"), and the missing transfer path is itself filed as **#1414**.
 
 **If you allocated a backlog number before 2026-07-31T00:31Z, re-check it — the trigger is the
 timestamp, not the value.** That is when the floor fix landed. Any number issued before it came from a
@@ -22065,6 +22070,63 @@ helper-per-class split and for why each hook carries a local copy), #1339 (a dif
 
 **Source:** measured 2026-09-03 while re-verifying #1040 against `origin/main` at `fd44b0f1`, by
 enumerating every hook that writes text an agent acts on rather than only the ones #1040 named.
+
+## 1426. Nothing reads the code to ask whether an open item's subject already exists on main, so a re-score that predates the landing keeps the row open forever
+
+> 🚧 **Filed 2026-09-03 -- the screen is BUILT and reports candidates; nothing yet flips a banner off it.** Every existing ledger gate reads the LEDGER. `scripts/docs/subject_exists_screen.py` is the first that reads the CODE: for each OPEN item it extracts the concrete code-side subjects the row names -- commit shas, merged pull requests, file paths and distinctive symbol names -- and asks git whether they are already on `origin/main`. **It reports candidates and flips nothing.** A wrongly-closed item is invisible forever, so the closing act stays a person reading each row.
+>
+> **The remaining work is the reading pass, not the tool.** First run at `46ea10a78`: 275 open items, 3781 subjects, **80 candidates and 114 weak-candidates**. Nobody has read that list. Two of the 80 were already known-true and are wired as controls; the other 78 are unread.
+> Verdict: build
+> Closing-act: code
+
+**Cluster:** Ledger hygiene / dispatch. **Priority:** P2 -- filed, not separately scored.
+**Severity:** no deployment axis (section 0). Zero instances run. The cost is spent Builder sessions and a ledger that misdescribes build state, not anything an operator would meet.
+
+### The defect, measured twice on one day
+
+On 2026-09-03 five items were dispatched as builds. **Two were already complete, and a Builder was spent on each discovering it.**
+
+| item | what had already landed | why the ledger did not say so |
+|---|---|---|
+| **#1040** | all three commits from its branch were ancestors of `main`, and its cited pull request was on `main` | a note said the banner was "left open for the archive pass", while an OLDER re-score beneath it still described the landed work as outstanding |
+| **#1229** | its backslash-escape limb shipped 2026-08-22 in `3c5cb9885` | that commit's subject names **BACKLOG #1268**, not #1229, so a search keyed on the item number never finds it. The re-score calling the limb unbuilt is dated **2026-08-20** -- two days BEFORE the merge |
+
+**The common shape is one sentence: a re-score dated before the landing, and nothing afterward reads the code.** The #1234 amendment already states why no ledger-side check can close it -- *"Does the subject exist on main is the only check that reads the CODE, and it is the one that decides startability."*
+
+### What was built
+
+`scripts/docs/subject_exists_screen.py`, with `tests/test_subject_exists_screen.py` (51 tests, on the tooling manifest and in `ci.yml`'s `DOC_GUARDS`). Six signals, ranked, so the strongest rows sort first:
+
+| strength | signal | what fires it |
+|---|---|---|
+| strong | `sha-ancestor-landing` | a cited sha that IS an ancestor of the ref, on a line worded as a landing |
+| strong | `pr-merged-landing` | an explicit `PR #N` whose squash commit is on the ref, worded as a landing |
+| strong | `path-added-after` | a cited path first ADDED to the ref after the row's newest date -- it did not exist when the row was last read |
+| medium | `sha-ancestor`, `pr-merged` | the same two, cited as a base ref rather than a landing |
+| medium | `sha-unverifiable-shallow` | ancestry could not be settled under a shallow clone (below) |
+| weak | `path-changed-after`, `symbol-on-main` | the cited file moved since the row was read; the cited identifier exists |
+
+### Four properties that are not incidental
+
+1. **It reports, it never flips.** There is no `--fix` and there must not be one.
+2. **Over-firing is the tolerable direction.** A false candidate costs one read; a missed one costs a Builder. 80 candidates from 275 rows is deliberate, and where a probe cannot answer the answer is a signal rather than silence.
+3. **It prints what it scanned** -- items, subjects by kind, probes run, probes skipped by the cap. An empty scan and a clean scan must not render alike.
+4. **It runs a control that must fire, in both directions, before it reports anything.** A structural control over the probes (a known commit resolves and a nonsense one does not; a tracked path resolves and an invented one does not) exits **2** on failure and says the SCREEN is broken. A ledger control over #1229 and #1040 exits **1** if either stops firing while still open -- and RETIRES BY NAME when one is closed, so a control that stopped applying can never read like a control that passed.
+
+**`#N` is never read bare.** It spells a pull request and a ledger item identically, and a security record entry reading "the build is #156" once resolved to a pull request while backlog #156 was unrelated work. Only `BACKLOG #N` (a cross-reference, never a subject) and an explicit `PR #N` are read.
+
+**A sha is evidence only under `git merge-base --is-ancestor`.** Presence in `git log` output answers a different question.
+
+### The shallow-clone trap is live here, and it is why one signal exists
+
+Measured 2026-09-03: this repository reports `--is-shallow-repository` **true**, with **16 graft points** over 931 commits reachable from `origin/main`. **Under a graft the two ancestry answers are not equally sound.** A TRUE is reliable -- the walk found the commit. A FALSE may only mean the walk stopped at a boundary, and an unresolvable sha may merely sit beyond it. Rendering either as "not on main" is a confident wrong answer, so both become `sha-unverifiable-shallow`, which surfaces the item instead of silently dropping it. **That is not a rare corner: it fired 63 times in the first run.**
+
+### What is open
+
+- **Nobody has read the 80 candidates.** Two are the controls. The other 78 are unread, and reading them is the act that closes rows.
+- Two rows already look like repeats of the #1229 shape and are named here so the reading pass starts somewhere rather than at the top: **#1255**, whose `tests/test_conftest_name_collision_guard.py` was added to the ref on 2026-08-26 against a row last dated 2026-08-25; and **#1276**, against which `docs/adr/0172-the-engine-always-serves-tls-minting-a-self-signed-certificate-on-first-run.md` was added on 2026-09-02 against a row last dated 2026-08-25. **Named as candidates, not as findings** -- neither has been read, and this row does not close them.
+- The screen runs on demand and is wired to no schedule. Whether it should run on a cron, or at dispatch time, is unanswered.
+- The date proxy is the newest date anywhere in the row, because `parse_items` returns status and fields but not the banner block's text. Its error runs toward under-firing, which is why the two strongest signals are date-free.
 
 ## 1427. Three residual quote-scanner holes in worktree_gate: an uppercase quoted program spelling, an unknown interpreter's -c payload, and a class of shapes inherited from main
 

@@ -248,6 +248,7 @@ jobs:
             tests/test_claude_section_citations.py tests/test_write_share_denominator.py
             tests/test_cutover_slug_rot.py tests/test_backlog_citation_check.py
             tests/test_dangling_citation_check.py
+            tests/test_subject_exists_screen.py
             tests/test_docs_cite_no_refused_config_keys.py"
           # Every named module must EXIST. A path typo would otherwise make pytest error on an unknown
           # file, or — worse under a future -k/--ignore form — silently scan nothing and read as a pass.
