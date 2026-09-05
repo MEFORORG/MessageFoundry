@@ -20891,7 +20891,8 @@ Within `scripts/coord` and `scripts/hooks` specifically, four files are caught b
 **Related:** the porting and de-drifting work is filed in that repository's own tracker, issues 99 to 105, deliberately outside this number space.
 
 ## 1413. nothing triggers a reviewer, so a required context waits on a label only a person applies
-> 🔢 **Filed 2026-09-01 (korus-palette-fluent2). Trigger BUILT 2026-09-03 -- the banner flip is the Lander's, not the builder's.** `a reviewer has read this` became a required status check on `main` on the afternoon of 2026-08-31. **Nothing anywhere notifies a reviewer that a pull request exists.** The gate is correct and fail-closed by design; the missing half is the trigger. What shipped, and what is still unproven, is recorded at the foot of this item.
+> ✅ **Filed 2026-09-01 (korus-palette-fluent2). Trigger BUILT 2026-09-03. CLOSED 2026-09-05 -- there is no reviewer gate left to trigger.** `review-gate.yml` and the required context `a reviewer has read this` were removed on 2026-09-05 at the owner's instruction (PR 894), so nothing waits on a label any more and this item has no subject. The trigger work and the measurements below are kept because they record what was true while the gate existed.
+> `a reviewer has read this` became a required status check on `main` on the afternoon of 2026-08-31. **Nothing anywhere notifies a reviewer that a pull request exists.** The gate is correct and fail-closed by design; the missing half is the trigger. What shipped, and what is still unproven, is recorded at the foot of this item.
 >
 > **Scored 2026-09-03 -> P2.** Value **6/10** · Difficulty **4/10** · _quick win_. Not started, re-measured at HEAD: none of requested_reviewers, review_requested, pull_request_review, gh pr review or --reviewer appears in any of the 27 files under .github/workflows/, against a positive control of runs-on in 27 of 27. The nearest existing signal does not cover it either -- scripts/ci/check_stalled_prs.py:56 and :122 key the daily cron on mergeStateStatus BEHIND, and an unread pull request reads BLOCKED, so it falls outside that report. The gate itself is correct and must stay fail-closed: .github/workflows/review-gate.yml:30 records that nothing automated ever adds the label and :100 strips it on synchronize, so what is left to build is only the trigger that says a finished, green, unread pull request exists. The cost is throughput rather than product, and a seat polling gh pr list is an awkward but real workaround, which is what holds this out of the higher bands. Landing it is a small workflow or a mail drop on an existing seam, and the hard half is reaching a background session bound to another account, which the gate header records as blocked and which partly lives outside this repository.
 > Verdict: build
@@ -21788,7 +21789,8 @@ Four things read those files, and none can interrupt anything: `usage.ps1` on de
 **Not in scope:** giving the watcher an account. It makes no model calls, so it cannot be exhausted by what it watches. The hazard runs the other way: the usage endpoint returns 429 PER ENDPOINT rather than per caller, proven inside a single process, so the design wants ONE reader and a dedicated account would add one.
 ## 1417. the review gate can report success on a head nobody reviewed: it reads the label from a snapshotted event payload
 
-> 🔢 **Filed 2026-09-01 (lander-5eaa4e) -- not started.** `a reviewer has read this` is a required status check on `main` with `enforce_admins: true`, so it is the control that stands between an unread diff and `main`. **It can be satisfied by a pull request carrying no `reviewed` label at all.** Reproduced on PR 724, with the window measured end to end.
+> ✅ **Filed 2026-09-01 (lander-5eaa4e). CLOSED 2026-09-05 -- the workflow carrying the defect was deleted, so it has no site.** `review-gate.yml` and the required context `a reviewer has read this` were removed on 2026-09-05 at the owner's instruction (PR 894). The stale-payload read at `review-gate.yml:105` went with the file; nothing now reads a label payload, fresh or snapshotted. **Closed as moot, not as fixed** -- the defect was real and reproduced, and the evidence below is kept for that reason.
+> `a reviewer has read this` is a required status check on `main` with `enforce_admins: true`, so it is the control that stands between an unread diff and `main`. **It can be satisfied by a pull request carrying no `reviewed` label at all.** Reproduced on PR 724, with the window measured end to end.
 >
 > **Scored 2026-09-03 -> P2.** Value **6/10** · Difficulty **3/10** · _quick win_. Not started, and the defect is intact at HEAD: .github/workflows/review-gate.yml:105 still reads LABELS out of the frozen webhook payload, and line 112 still hard-codes the remedy for the single synchronize action, so any other action can report SUCCESS from a payload snapshotted before the label moved. That gate is the repository's entire automated review requirement, since .github/required-contexts.txt:160 to :166 pins approvals at 0 and states that nothing else reports that a green pull request was never read. VALUE LOWERED 7 to 6, because a workaround exists and is already written down: CLAUDE.md:407 to :414 makes the reader compare the gate run's originating createdAt against the newest reviewed label event, and CLAUDE.md:287 forbids the Lander from merging a pull request carrying no reviewed label, so a seat that reads the label live is not fooled by the stale green. It is awkward rather than clean, because the documented join is this item's rule (4) alone and returns a false clean when the label predates the head. Difficulty 3 holds: the workflow edit is small, but tests/test_merge_gate_controls.py:1044 to :1069 welds the existing control suite to the $LABELS and $ACTION env contract, so reading labels live forces a gh stub into that harness on top of the new staleness assertion.
 > Verdict: build
@@ -22627,3 +22629,64 @@ All 137 listed entries were swept for a repo-rooted read of `messagefoundry/**`.
 
 1. **The five pull requests above.** A Builder must not push to another seat's branch, so each is fixed by whoever next touches it: append `tests/<name>.py` to `tests/tooling_manifest.txt`, keeping the list alphabetical. **The gate is passable and two pull requests that night passed it correctly -- nothing here asks for it to be weakened.**
 2. **Three copies of the manifest parser, pinned against nothing.** This file, `_tooling_basenames` in `tests/conftest.py` (the copy that actually applies the marker), and `_manifest_paths` in `tests/test_ci_tooling_gate.py` all implement the same rule. Extracting one `tests/_tooling_manifest.py` is the real fix. Related: `test_every_manifest_entry_trips_its_own_gate` in `tests/test_ci_tooling_gate.py` feeds each manifest entry back as its own changed path, so on the manifest arm every entry matches itself unconditionally.
+
+## 1453. adopt the three hook patterns the orchestration survey found genuinely missing: a context-budget guard, a gh-run-watch denial, and a PreCompact re-prime
+
+> 🚧 **Filed 2026-09-05. Three hooks are built, tested and wired on this branch. The survey that motivated them ALSO found that two of its top-ranked gaps were already closed, and that correction is the more useful half of this item.** A survey of ten agent-orchestration repositories ranked eight Claude Code hook and skill patterns for adoption. Measured against the INSTALLED configuration rather than against `CLAUDE.md` prose, three of the eight were genuinely absent, two were already built, and three are structural changes to how seats spawn that are deliberately not in this change.
+
+**Cluster:** CI gates / development harness. **Priority:** P3. **Verdict:** build.
+**Severity:** no deployment axis (sec. 0). These are repository-side developer hooks. No engine behaviour, no shipped artifact, and no configuration a deploying site would meet.
+
+### What was measured, and how the ranking was wrong
+
+The adoption ranking was written by reading `CLAUDE.md` and never reading `~/.claude-account-1/settings.json`. That is the method document, not the running configuration, and the two disagree.
+
+| Ranked item | Claimed gap | Measured state |
+|---|---|---|
+| Stop-hook mail injection | "nothing pushes a notice to a seat" | **Already built.** `scripts/hooks/mail-drain.ps1` is wired at `Stop` and emits `hookSpecificOutput.additionalContext`. |
+| UserPromptSubmit mail inject | "mail drains at SessionStart only" | **Already substantially covered** by the same `Stop` drain. |
+| Context-budget guard | no instrument for context-window fullness | **Absent.** Built here. |
+| `gh run watch` denial | no guard on shared API budget | **Absent.** Built here. |
+| PreCompact re-prime | context lost at compaction | **Absent.** Built here. |
+
+The claim `"every notice is polled, and nothing is pushed"` in section 5 is scoped to **workflows** by its own following sentences, and was over-read as covering session messaging. KORUS has the channel; what it lacked was an automatic trigger on the events below.
+
+### What is built
+
+1. **`scripts/hooks/context-budget.ps1`** (`UserPromptSubmit`). Reports how full THIS SESSION'S context window is, at 0.75 / 0.85 / 0.92. It measures a different quantity from `usage-headroom-inject.ps1`, which reads **account pool** headroom -- a seat with a fresh pool can still be one turn from a compaction, and both get called "usage". It **reports and never blocks**: gastown's original hard-gates by role, but a Builder blocked at its prompt has no next turn in which to be told, so blocking burns the brief rather than saving it. Fails open on every path.
+2. **`scripts/hooks/block-api-burn.ps1`** (`PreToolUse` on `Bash` and `PowerShell`). Denies `gh run watch`, any `gh ... --watch`, and hand-rolled `gh` poll loops. Every seat acts as one GitHub identity against one 5000/hr budget, and `gh run watch` polls every three seconds. The denial reason names the single-shot replacement. `gh` must sit in **command position**: the first draft denied `echo "gh run watch is banned"`, which would have blocked writing this very item.
+3. **`scripts/hooks/precompact-reprime.ps1`** (`PreCompact`). Restores the seat, the goal, the ledger numbers this worktree holds, and whether the branch is pushed. **It refuses to restore a declaration whose branch differs from the current one**, because worktrees are re-used and a stale goal reads as authoritative. Run live in the allocating worktree it correctly reported the declaration as a previous occupant's, on branch `ci/retire-review-gate`, 2.6 days old.
+
+### What is deliberately NOT in this change
+
+Three ranked items alter how every seat launches, and six sessions were live while this was written.
+
+1. **Separate autonomous and interactive settings profiles.** `scripts/worktree/spawn.ps1` has no profile or `--settings` logic today.
+2. **A base-to-role settings merge passed with `--settings`.** This is the real fix for tracked `.claude/settings.json` being per-worktree-per-branch, and it is a spawn-path change.
+3. **A contributor skill carrying an executable pre-commit self-check.** Additive and low risk, but it belongs with the two above so the checks it runs match the profile the seat launched under.
+
+**Where `--settings` could actually go, measured 2026-09-05. Read this before picking up item 2, because the sentence above points at the wrong file.** `scripts/worktree/spawn.ps1` is not the seam: it never invokes `claude` at all (`grep -c claude` returns 0), it calls `new.ps1` and opens a VS Code window for a person to start a chat in. Nor is `new.ps1`, which creates worktrees at `<repo-parent>/MessageFoundry-<name>` -- 18 of the 21 worktrees on this clone, including all eight live sessions, sit at `.claude/worktrees/<name>-<hash>`, the harness's own layout. Three do match `new.ps1`'s layout, so it is not dead code, but no live session is in one. **A `--settings` flag can only be passed by whoever runs `claude`, so it reaches a Console-spawned Builder and nothing else.**
+
+**The divergence item 2 is really about is confirmed.** Tracked `.claude/settings.json` is per-worktree-per-branch: 3352 bytes and 6 hook entries on this branch against 2267 bytes and 3 in the primary checkout at `main`. The three hooks above therefore bind only sessions running on this branch until it merges.
+
+**The layer that already binds every seat is the account file.** `~/.claude-account-1/settings.json` wires 16 hook scripts and applies regardless of worktree or branch, and this session shows both layers firing together. Whoever takes item 2 should first say why that file is not the answer.
+
+### Where the evidence lives
+
+The full ranked register, its corrections and its per-item evidence strength are a published artifact, not a repository document, so a repository search for it returns zero and **that zero is not evidence the work was not done**.
+
+
+## 1416. review-gate reads a stale label payload, so a queued run can report success unread
+
+> ✅ **Allocated 2026-09-01 at 10:17:26, never filed. FILED AND CLOSED 2026-09-05 in one act -- the workflow it names was deleted, so the defect has no site.** It is written down rather than dropped because allocation here is one-way: `scripts/coord/alloc.ps1` has no release path, so an allocated number with no row reads to a later reader as lost work rather than as a duplicate that resolved.
+
+**Cluster:** CI gates / merge protection. **Priority:** closed. **Verdict:** moot.
+**Severity:** no engine effect, no PHI axis, and **no deployment axis (sec. 0)** -- repository-side merge tooling; nothing here reaches shipped code.
+
+### It was the third allocation against one defect
+
+Three numbers were allocated against the same finding -- the review gate reading a snapshotted label payload -- by seats that could not see each other. Read from the allocation records: 1416 at 10:17:26 and 1417 at 10:18:37 on 2026-09-01, **seventy-one seconds apart**, from two different worktrees, and a third on 2026-09-03. #1417 was filed and carries the evidence; this one never was. #1413 records that collision, and names the missing waiting-pull-request signal as its cause.
+
+### Why it closes without a fix
+
+`review-gate.yml`, `unread-signal.yml`, `scripts/ci/check_unread_prs.py` and the required context `a reviewer has read this` were removed on 2026-09-05 at the owner's instruction. **The server had already dropped that context**: read from the API that day, branch protection carried 13 contexts and it was not among them, while `.github/required-contexts.txt` still claimed 14. So the removal made the repository's claim match the server rather than changing what the server enforces. What blocks a merge now is exactly the 13 required contexts, and review here is a human practice rather than a machine gate.

@@ -3,12 +3,13 @@
 # Copyright (C) 2026 MessageFoundry Organization and contributors
 """One reading of a pull request's ``statusCheckRollup``, shared by the checks that need it.
 
-WHY THIS IS ONE MODULE AND NOT TWO COPIES. ``check_stalled_prs.py`` asks "is this green and unable to
-merge". ``check_unread_prs.py`` asks "is this green and unread". Different questions, but both turn on
-the same underlying fact: GitHub's rollup vocabulary, which is GitHub's to change and not ours. Two
-copies of that vocabulary would be free to drift, and the drift would be silent in the one direction
-that matters -- a conclusion string nobody classified reads as green -- which is the defect both
-checks exist to prevent. ``tests/_workflow_contexts.py`` carries the same single-source note for the
+WHY THIS IS STILL ITS OWN MODULE ON ONE CALLER. It was split out when two scripts read the rollup:
+``check_stalled_prs.py`` asked "is this green and unable to merge", ``check_unread_prs.py`` asked "is
+this green and unread". The second was deleted on 2026-09-05 with the review gate, so the first is the
+only caller today. The split is kept because what it owns is GitHub's rollup vocabulary, which is
+GitHub's to change and not ours, and the next reader that needs it would otherwise start a second copy
+free to drift -- silently, in the one direction that matters, since a conclusion string nobody
+classified reads as green. ``tests/_workflow_contexts.py`` carries the same single-source note for the
 context-to-job mapping, for the same reason.
 
 TWO NODE SHAPES, and mixing them up is the easy mistake. GitHub returns a CheckRun (``status`` plus

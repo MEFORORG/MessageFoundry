@@ -71,39 +71,6 @@ rules:
       # standing-issue branch instead of labelling anything. Benign, and it is why a fork's red
       # arrives as a comment on the tracker rather than as a `ci-red` label.
       - failure-signal.yml
-      # A pull request becomes "green and unread" at the moment the LAST required check settles. That
-      # moment is a workflow COMPLETING -- there is no `pull_request` event then, and no trigger other
-      # than `workflow_run` observes another workflow's conclusion. Same argument as the two above.
-      #
-      # THIS ENTRY IS WEAKER THAN BOTH OF THEM AND THE DIFFERENCE IS THE POINT, so it is stated rather
-      # than left to be inferred: nightly-notice.yml and failure-signal.yml both claim NO CHECKOUT and
-      # no `uses:` at all. THIS WORKFLOW CHECKS OUT AND RUNS TWO ACTIONS. What makes that safe is a
-      # different property, not the same one:
-      #   * THE CHECKOUT IS OF TRUSTED CODE, NOT THE TRIGGERING HEAD. On a `workflow_run` GitHub sets
-      #     `github.sha` to the DEFAULT BRANCH's last commit, and the checkout step declares no `ref:`,
-      #     so it takes that default-branch tree. The pull request's head is never fetched and never
-      #     executed. That is the whole pwn-request precondition, and it is absent.
-      #     `ref:`-lessness is the load-bearing half, so it is PINNED by
-      #     tests/test_unread_signal.py::test_the_checkout_never_names_a_ref rather than asserted here
-      #     -- adding `ref: ${{ github.event.workflow_run.head_sha }}` would open the hole in one line
-      #     and redden nothing else.
-      #   * BOTH ACTIONS ARE FIRST-PARTY AND SHA-PINNED (actions/checkout, actions/setup-python), and
-      #     the checkout sets persist-credentials: false so no git credential survives the step.
-      #   * Least privilege: file default `contents: read`; the single job adds only
-      #     `pull-requests: write`. It cannot push, tag, or modify code. The most its token does is add
-      #     or remove one label and post one comment.
-      #   * Every `github.event` value reaches a script through `env` and is never interpolated into a
-      #     `run:` body, so a branch name chosen by an attacker cannot break out of the shell.
-      #   * The one attacker-influenceable field it parses, `head_branch`, is read ONLY to recover a
-      #     pull-request number from a merge-queue ref, and only when the triggering run's event was
-      #     `merge_group` -- which a fork pull request cannot produce.
-      # Each of the last three is pinned by tests/test_unread_signal.py, on failure-signal.yml's model.
-      #
-      # EXPECT THIS RATHER THAN BE SURPRISED BY IT, same as failure-signal.yml: GitHub leaves
-      # `workflow_run.pull_requests` empty for a fork pull request, so a fork resolves to no number and
-      # the job does nothing at all. A fork contribution is therefore never announced by this route,
-      # and CODEOWNERS -- which is NOT inert on a pull request the owner did not author -- covers it.
-      - unread-signal.yml
 
   artipacked:
     ignore:

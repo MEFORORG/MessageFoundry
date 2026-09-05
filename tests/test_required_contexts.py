@@ -12,19 +12,19 @@ not be answered from a clone -- and five places in this repo answered it differe
                                           and under a different string than its own line 18 gives
     tests/test_push_guard.py              12
 
-The live API said 12 when those five were counted. It says 14 at 2026-08-31 20:57 CDT. That question
-is not trivia here: ``required_approving_review_count`` is 0 and auto-merge is armed, so required-set
-membership is the ONLY thing separating "reviewed" from "merged unread". A session reasoning from
-docs/CI.md would conclude that gitleaks, semgrep, npm-audit and crypto-inventory are advisory -- i.e.
-that four blocking security gates were safe to weaken.
+The live API said 12 when those five were counted. It says 13 at 2026-09-05. That question is not
+trivia here: ``required_approving_review_count`` is 0, so the required set is what a merge has to
+clear. A session reasoning from docs/CI.md would conclude that gitleaks, semgrep, npm-audit and
+crypto-inventory are advisory -- i.e. that four blocking security gates were safe to weaken.
 
-THE SET NOW HOLDS A CONTEXT THAT DOES NOT TEST THE CODE, and it is the one with the least behind it.
-``a reviewer has read this`` (review-gate.yml, armed 2026-08-31, BACKLOG #1404) is this repository's
-ENTIRE review requirement. It is load-bearing BECAUSE approvals are pinned at 0 rather than in spite of
-it: every session pushes as one GitHub identity, so a human-approval rule would wedge every pull
-request instead of reviewing any. Drop that context from protection and review is not weakened, it is
-gone -- nothing else anywhere reports that a green pull request was never read. The count below is what
-makes removing it a deliberate edit rather than a quiet one.
+THE SET NO LONGER HOLDS A REVIEW CONTEXT. ``a reviewer has read this`` (review-gate.yml, armed
+2026-08-31 under BACKLOG #1404) was removed on 2026-09-05 at the owner's instruction, along with the
+workflow behind it. THE SERVER HAD ALREADY DROPPED IT: read from the API that day, branch protection
+carried 13 contexts and this was not among them, while this repository still claimed 14 -- so the
+removal made the claim match the server, and is not what stopped the enforcement. Approvals stay
+pinned at 0 for the reason they always were: every session pushes as one GitHub identity and GitHub
+refuses self-approval, so raising the count wedges every pull request instead of reviewing any.
+Review here is a human practice, not a machine gate, and no prose in this suite may say otherwise.
 
 WHAT THIS PINS. ``.github/required-contexts.txt`` is the checked-in claim; these tests assert every
 in-repo statement agrees with it. The file is NOT the enforcement -- the server is -- so when branch
@@ -116,7 +116,7 @@ def test_the_canonical_file_parses_and_names_the_live_set() -> None:
     # one. A count that only ever fails when someone edits the FILE cannot notice the server moving
     # underneath it, so reconcile against the API, never against this number. The server moved four
     # times on 2026-07-29 and twice more on 2026-08-31.
-    assert len(contexts) == 14, (
+    assert len(contexts) == 13, (
         f"the canonical required set changed to {len(contexts)} contexts. If branch protection really "
         "changed, update this count AND every claim this suite checks; if it did not, revert the file."
     )
