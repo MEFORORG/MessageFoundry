@@ -22560,6 +22560,7 @@ So `test_the_script_prefers_its_own_repo_over_an_earlier_path_entry` supplies th
 
 **Adjacent and NOT fixed here, named rather than numbered.** `docs/WEBCONSOLE-PACKAGE.md`'s seam-refresh procedure is stale in three steps left behind by #1220: it says to bump `ENGINE_UI_SEAM` by hand (`1` to `2`) when the value is a derived digest, it says to update curated lists in this script that #1220 retired, and its step 5 prescribes `python scripts/webconsole_seam_snapshot.py > tests/golden/...`, the shell redirect this script's own docstring forbids because PowerShell's `>` writes UTF-16LE with a BOM into a file the test reads as UTF-8. That is doc drift with its own cause and it wants its own item; folding a documentation rewrite into a `sys.path` fix would make both harder to review.
 
+
 ## 1434. the tooling-partition gate names the file it rejects and not the remedy, so the Builder who trips it has already exited
 
 > 🚧 **Filed 2026-09-03. The failure message is fixed on this branch. Five open pull requests still carry unregistered test files, and only their own branches can fix them -- they are named below.** `tests/test_tooling_partition.py::test_every_non_engine_test_is_classified` fails when a file matching `tests/test_*.py` sits in neither `tests/tooling_manifest.txt` nor `_STAYS_WITHOUT_IMPORTING`. It is not deselected by `-m 'not tooling'`, so it reds **all three required `test` legs at once**. PR 774 hit exactly that, and its Builder's process had exited before any leg reported.
@@ -22627,3 +22628,72 @@ All 137 listed entries were swept for a repo-rooted read of `messagefoundry/**`.
 
 1. **The five pull requests above.** A Builder must not push to another seat's branch, so each is fixed by whoever next touches it: append `tests/<name>.py` to `tests/tooling_manifest.txt`, keeping the list alphabetical. **The gate is passable and two pull requests that night passed it correctly -- nothing here asks for it to be weakened.**
 2. **Three copies of the manifest parser, pinned against nothing.** This file, `_tooling_basenames` in `tests/conftest.py` (the copy that actually applies the marker), and `_manifest_paths` in `tests/test_ci_tooling_gate.py` all implement the same rule. Extracting one `tests/_tooling_manifest.py` is the real fix. Related: `test_every_manifest_entry_trips_its_own_gate` in `tests/test_ci_tooling_gate.py` feeds each manifest entry back as its own changed path, so on the manifest arm every entry matches itself unconditionally.
+
+## 1450. the live-API drift detector is invisible from the file it guards, so two readers in one night concluded the drift was undetectable
+
+> 🚧 **Filed 2026-09-04. Nothing is built here. This item is a measurement and a recommendation NOT to build the thing it was opened for.** Value **4/10** · Difficulty **2/10** for the documentation fix, **5/10** for routing the notice. A process and documentation defect, not a product exposure: MessageFoundry has zero deployments, and no claim below is present-tense about a running site.
+
+**The defect, in one sentence: `.github/required-contexts.txt` names its document-to-document guard and does not name its live-API guard, so a reader who asks "what would catch the server moving?" reads the file and correctly concludes: nothing.**
+
+The live-API guard exists. `scripts/ci/check_required_contexts_drift.py` reads the required set from the public `GET /repos/{owner}/{repo}/branches/{branch}` endpoint, which answers unauthenticated, and compares it to the checked-in file as a SET rather than a count. It runs as the job `the required-contexts file matches the server` in `.github/workflows/required-workflow-state.yml`. It fails closed: a read error is reported as a failure, never as agreement.
+
+Neither `.github/required-contexts.txt` nor `tests/test_required_contexts.py` mentions it. The file's own summary of what guards it says the checked-in claim is "what `tests/test_required_contexts.py` asserts", full stop. The test's count-pin comment goes further and tells the reader to "reconcile against the API, never against this number" without saying that a script and a CI job already do exactly that.
+
+### The measured instance, and it is this item's own filing
+
+On 2026-09-04 a Console measured the drift, read those two files, and briefed a Builder that the guard "is structurally incapable of catching a server-side change" and had "now failed that way twice". A peer Console corrected it mid-flight. Both readings were reasonable from the sources; one of them was wrong. The brief that reached this Builder therefore asked for an instrument that already exists, and asked for it to be recorded as a structural impossibility.
+
+**That is the failure worth recording.** The instrument is not missing. It is unfindable from the artifact it protects, which for a repository whose sessions are isolated and whose only shared memory is the ledger is close to the same thing.
+
+### What was actually measured, 2026-09-04
+
+All readings taken between 23:24Z and 23:56Z, each with a positive control, because a broken instrument returns the same empty output as a clean repository.
+
+| Question | Instrument | Reading |
+|---|---|---|
+| Required contexts on `main` | `gh api .../branches/main/protection` | 13, no `a reviewer has read this` |
+| The same, public endpoint | `gh api .../branches/main` | 13, identical set. The two endpoints agreed |
+| Contexts named in the file | `git show origin/main:.github/required-contexts.txt` | 14, still naming the retired context |
+| The pin | `tests/test_required_contexts.py` | `assert len(contexts) == 14` |
+| Does the drift job carry `continue-on-error`? | grep, positive control on `runs-on` | **No.** Zero occurrences; it goes red on a finding |
+| Is the drift job a required context? | the 13 above | **No.** It reports; it blocks nothing |
+| Has it run and failed on this drift? | `gh run view --json jobs` | **Not yet, and pending is not a verdict.** Its last verdict was `success` at 23:25:00Z, which BOUNDS the retirement: the server still held 14 contexts then and held 13 by 23:52Z. The only later runs were queued with no conclusion |
+
+**A whole-run conclusion is not a job conclusion.** The runs above were read per job (SDS-3.8). Reading `gh run list`'s `conclusion` field would have answered a different question than the one asked.
+
+### The real remainder, which is smaller than the brief claimed and is about ROUTING, not detection
+
+Detection works. Three things sit between a server-side change and a reader.
+
+1. **The job is not required, so it blocks nothing.** A drifted file merges. That is arguably correct and is dealt with under *the recommendation* below.
+2. **A pull-request run reads the PULL REQUEST'S file, so it can never report `main` stale.** This is the sharp one and an earlier draft of this item got it wrong. The `pull_request:` trigger IS paths-filtered to `.github/required-contexts.txt` and `.github/workflows/**`, but a PR touching those paths DOES fire it -- measured on PR 884, run created 2026-09-04T23:55:21Z, `event=pull_request`. What stops it seeing the drift is the CHECKOUT: the job runs `actions/checkout` with no `ref:`, so on a pull-request event it reads the file as that PR has it, then compares against the live server. So 884 compares 13 against 13 and PASSES. The run VALIDATES A FIX; it is structurally incapable of reporting that `main` is stale. "No pull request triggers it" is falsifiable and false; "no pull-request run can see the drift on `main`" is true, stronger, and the one to carry. Correction owed to the Lander, who caught it.
+3. **What is left is the 07:00 UTC cron on `main`, and a red scheduled run notifies nobody.** This repository already knows that shape: #1402 records a required check going red signalling nobody, and #1406 records a watcher that can find a problem and has no way to tell anyone. This is the same failure on a scheduled job. Detection at most once a day is adequate for this; detection into a channel nobody polls is not.
+
+The window that follows is bounded and was measured on this instance: the retirement landed after 23:25Z, so the first scheduled verdict falls due 2026-09-05 07:00 UTC, up to about eight hours later.
+
+### The recommendation: DO NOT add a live-API arm to the pytest suite
+
+This item was opened to assess exactly that. The assessment is negative, for reasons that are about where the check lives rather than whether it is worth having.
+
+**`tests/test_required_contexts.py` runs inside a REQUIRED test leg.** Putting a network call there makes every required leg on every pull request depend on GitHub's API being reachable from the runner. The drift script fails closed by design, which is right for a scheduled advisory job and wrong for a required one: a transient API failure would then red a required check on every open PR at once, for a reason unrelated to any of them. That is the required-but-absent trap's cousin, and `.github/required-contexts.txt` already documents the family.
+
+**The test suite also runs offline, on fork PRs, and on developer machines**, none of which can be assumed to reach the API or hold `gh`. An arm that skips when it cannot reach the network is worse than no arm: a skip renders as a pass.
+
+**And the instrument already exists.** Writing a second one inside pytest would give two implementations of one question, which is the drift script's own stated reason for not folding itself into `check_required_workflow_state.py`.
+
+**What to do instead, in cost order:**
+
+1. **Name the drift job in the two files that hide it.** `.github/required-contexts.txt` should say which instrument answers which question, and `tests/test_required_contexts.py`'s count-pin comment should point at the script rather than at "the API" in the abstract. This is the whole documentation defect and it is a few lines. It is what would have prevented this item's own filing.
+2. **Route the scheduled red.** A failing 07:00 UTC run on `main` should reach a seat the way `unread-signal.yml` (#1413) and `failure-signal.yml` route theirs. Shape it after those; do not invent a third pattern.
+3. **Promoting the job to required is an owner decision and is NOT recommended here.** It would need the fail-closed behaviour reconsidered first, and adding to protection is all-or-nothing (the REST endpoint 422s with `already_exists` and then adds none of the request).
+
+### Not fixed here, and why
+
+**The reconciliation itself is PR 884**, which removes the retired context, moves the pin from 14 to 13, and updates `docs/CI.md`, `tests/negative_controls.toml`, `tests/test_merge_gate_controls.py`, `tests/test_security_posture.py` and `codeql.yml`. This Builder began the same edit, was warned by the collision registry, read that branch, and stood down rather than ship a competing edit to the same lines of a file 60 open pull requests already conflict over. No file in that PR's diff is touched here.
+
+**One thing PR 884 leaves stale, named rather than numbered so it does not need re-measuring.** `.github/required-contexts.txt` lines 18 to 24 still read "THE LIST BELOW IS SET-EQUAL TO THE SERVER -- fourteen contexts, nothing extra on either side -- read from the API at 2026-08-31 20:57 CDT". PR 884 edits only the block around line 202, so on that branch the file names thirteen contexts under a header asserting fourteen. **The set-equality claim is the single assertion this file exists to carry**, and it is the one left pointing at a superseded reading. It wants the 2026-09-04 date and the thirteen-context reading, and the fix is that paragraph alone.
+
+### The prose in the pin comment that is now half true
+
+`tests/test_required_contexts.py` lines 114 to 118 say the pin "GOES STALE IN THE DIRECTION THAT LOOKS FINE" and that "a count that only ever fails when someone edits the FILE cannot notice the server moving underneath it". **Both sentences are still literally true of that test** and should stay. What has changed is the implication a reader draws from them, which is that nothing notices. Something does. The paragraph needs one clause naming it, not a rewrite.
+
