@@ -276,7 +276,7 @@ messagefoundry-tray = "messagefoundry.tray.__main__:main"
 ci-scanners = [
     "bandit==1.9.4",
     "pip-audit==2.10.1",
-    "zizmor==1.29.0",
+    "zizmor==1.30.0",
 ]
 # The RELEASE SIGNING toolchain (BACKLOG #332). Exact `==`, and the version is the contract for the
 # same reason the scanners' are: this runs in the job holding `id-token: write`, and whatever executes
