@@ -1,0 +1,51 @@
+{
+  "python": "3.14.6",
+  "platform": "win32",
+  "reps": 5,
+  "iters_per_rep": 100,
+  "warmup": 20,
+  "reference_entries": 20000,
+  "obx_segments": 0,
+  "payload_bytes": 195,
+  "one_time_spawn_ms": 1904.3333,
+  "worker_tree_rss_mb": 82.4765625,
+  "worker_tree_uss_mb": 57.03515625,
+  "worker_tree_processes": 2,
+  "router_overhead_p50_ms": 7.76065,
+  "transform_overhead_p50_ms": 8.0037,
+  "per_message_overhead_p50_ms": 15.76435,
+  "legs": {
+    "router/off": {
+      "p50_ms": 0.0034,
+      "p90_ms": 0.004,
+      "rep_median_min_ms": 0.0031,
+      "rep_median_max_ms": 0.0036,
+      "n": 500.0,
+      "reps": 5.0
+    },
+    "router/subprocess": {
+      "p50_ms": 7.76405,
+      "p90_ms": 8.7145,
+      "rep_median_min_ms": 7.651400000000001,
+      "rep_median_max_ms": 8.01115,
+      "n": 500.0,
+      "reps": 5.0
+    },
+    "transform/off": {
+      "p50_ms": 0.0099,
+      "p90_ms": 0.0112,
+      "rep_median_min_ms": 0.0096,
+      "rep_median_max_ms": 0.0101,
+      "n": 500.0,
+      "reps": 5.0
+    },
+    "transform/subprocess": {
+      "p50_ms": 8.0136,
+      "p90_ms": 8.8206,
+      "rep_median_min_ms": 7.85365,
+      "rep_median_max_ms": 8.14475,
+      "n": 500.0,
+      "reps": 5.0
+    }
+  }
+}
