@@ -242,6 +242,60 @@ class Ledger:
                 out.setdefault(m.group(1), f.rsplit("/", 1)[-1])
         return out
 
+    # -- merge parents -------------------------------------------------------------------------------
+    #
+    # A MERGE COMMIT ALLOCATES NOTHING. It carries forward numbers another branch already committed, and
+    # the ownership rule below is keyed on the worktree that ran the allocator -- so without this, a
+    # merge resolved by anyone other than the item's author is refused for carrying that author's number.
+    #
+    # MEASURED 2026-09-05. The Lander resolved a docs/BACKLOG.md tail conflict on PR 850 -- the routine
+    # kind, two branches appending different items -- verified it (zero deleted or changed lines against
+    # main, 158 added, byte-identical to the branch's own section) and could not commit it: `#1441 was
+    # not allocated to this worktree`. The gate then named the owning worktree and said to commit from
+    # there, which the WORKTREE gate refuses, because operating in another session's tree is what that
+    # one exists to stop. Two correct controls, and between them a duty the Lander playbook assigns
+    # ("docs/BACKLOG.md row conflicts -- Lander, locally") that could not be discharged from any seat.
+    #
+    # THIS OPENS NO HOLE, and the reason is that the grandfathered numbers are not asserted, they are
+    # READ OFF A COMMIT. To launder a number this way you would need a commit that already contains it,
+    # and producing one means passing this same gate on the worktree that allocated it. Editing the BODY
+    # of an item that already exists was never policed here either way -- the rule compares NUMBER SETS,
+    # `head - base`, so a merge cannot smuggle a subject past a check that never read subjects.
+    def _merge_parents(self) -> list[str]:
+        """Commits being merged INTO this one; empty when no merge is in progress.
+
+        Read from ``MERGE_HEAD`` as LINES, not via ``git rev-parse MERGE_HEAD``: an octopus merge writes
+        one sha per line and rev-parse would answer only the first, silently policing the rest. CI never
+        has a merge in progress -- there HEAD is already the merge commit -- so this is empty there and
+        the CI path is unchanged.
+        """
+        if self.ci:
+            return []
+        path = Path(git("rev-parse", "--path-format=absolute", "--git-path", "MERGE_HEAD").strip())
+        if not path.is_file():
+            return []
+        return [ln.strip() for ln in path.read_text(encoding="utf-8").splitlines() if ln.strip()]
+
+    def _backlog_numbers_at(self, ref: str) -> set[str]:
+        """Every ``## N.`` number carried by ``ref``, across the live file and the archive.
+
+        Mirrors :meth:`backlog_paths` for an arbitrary commit rather than for base/head, and probes each
+        path's existence for the same reason that method does: a listed-but-absent path makes `git show`
+        exit 128, which :func:`git` correctly raises on and which would read here as a crash rather than
+        as "this ref has no archive".
+        """
+        paths = [BACKLOG_PATH] if _obj_exists(f"{ref}:{BACKLOG_PATH}") else []
+        listing = git("ls-tree", "-r", "--name-only", ref, f"{BACKLOG_ARCHIVE_DIR}/")
+        paths += [p for p in listing.split() if p.endswith(".md")]
+        out: set[str] = set()
+        for p in paths:
+            out |= set(BACKLOG_HEADING.findall(git("show", f"{ref}:{p}")))
+        return out
+
+    def _carried_by_a_merge_parent(self, path: str) -> bool:
+        """Does ``path`` already exist on a commit this merge is bringing in?"""
+        return any(_obj_exists(f"{parent}:{path}") for parent in self._merge_parents())
+
     # -- ownership -----------------------------------------------------------------------------------
     def owns(self, kind: str, number: str) -> bool:
         """Was this number allocated to THIS worktree by scripts/coord/alloc.ps1?
@@ -373,7 +427,11 @@ class Ledger:
                         'pwsh -NoProfile -File scripts\\coord\\alloc.ps1 -Kind adr -Title "<title>"'
                         "   # then rename your file to the number it prints",
                     )
-            elif not self.ci and not self.owns("adr", number):
+            elif (
+                not self.ci
+                and not self.owns("adr", number)
+                and not self._carried_by_a_merge_parent(path)
+            ):
                 self.fail(
                     f"ADR {number} was not allocated to this worktree",
                     f"Nothing in {self.alloc / 'adr' / (number + '.json')} names {self.repo}. A sibling "
@@ -445,6 +503,10 @@ class Ledger:
         base: set[str] = set()
         for p in base_paths:
             base |= set(BACKLOG_HEADING.findall(self.base_text(p)))
+        # A merge allocates nothing: numbers the other parent already carries are not new here. See
+        # the MERGE PARENTS block above for why this is safe and what it cost when it was missing.
+        for parent in self._merge_parents():
+            base |= self._backlog_numbers_at(parent)
         # Only `head - base` is examined, so everything already on origin/main -- including the
         # pre-partition overlap -- is grandfathered by construction. No allowlist, nothing to maintain.
         for number in sorted(head - base, key=int):
