@@ -2489,8 +2489,10 @@ def _serve(args: argparse.Namespace) -> int:
     # --- #186(a) secure-by-default data retention (ASVS 14.2.4) --------------------------------------
     # RetentionSettings defaults every window to 0 (keep-forever) and RetentionRunner then purges
     # NOTHING, so a PHI instance accumulates PHI bodies indefinitely. Both PHI-body windows must be
-    # bounded: messages_days (inbound bodies) AND dead_letter_days (dead-lettered outbound bodies stay
-    # replayable, i.e. full PHI, until their own window purges them). Mirror the open-egress / MFA-at-
+    # bounded: messages_days (inbound bodies) AND dead_letter_days (a dead-lettered row at ANY stage
+    # stays replayable, i.e. full PHI, until its own window purges it — #1188 widened that purge past
+    # the outbound stage, so this window now also bounds a dead ingress/routed row, which carries the
+    # whole raw body). Mirror the open-egress / MFA-at-
     # exposure posture: a PRODUCTION PHI instance with EITHER window unbounded REFUSES to start; a
     # non-production PHI instance (staging / declared-PHI loopback) AUTO-BOUNDS each UNSET window to 30
     # days (WP243/#243, secure-by-default) and only WARNS on a window explicitly left unbounded; a

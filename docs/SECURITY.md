@@ -149,11 +149,22 @@ MessageFoundry states the boundary and adds one opt-in precondition check (#203)
 - **Managed identity over static credentials.** The store can authenticate with a managed / delegated
   identity — SQL Server `[store].auth = integrated` (gMSA / Windows Integrated) or `entra` (Microsoft
   Entra ID) — instead of a static username + password. Set `[store].require_managed_identity = true` to
-  make it a **checked precondition**: on a **production** instance `serve` **refuses to start** (a
-  non-production instance **warns**) if the store still uses a static SQL login, or a Postgres store
-  (which has no managed-identity mode). Off by default. AD (`ad_bind_password`) and SMTP
+  make it a **checked precondition**: `serve` **refuses to start** if the store still uses a static SQL
+  login, or a Postgres store (which has no managed-identity mode). Off by default. **The refuse/warn
+  split is `[security].enforcement`, not the deployment tier** — `enforce` is the shipped default on
+  `dev` and `staging` as much as on `prod`, so a staging box that turns this on and leaves `auth = "sql"`
+  is refused, not warned; it downgrades to a warning only under `enforcement = warn`. See
+  [`docs/CONFIGURATION.md`](CONFIGURATION.md), which is the source of record for that split.
+  AD (`ad_bind_password`) and SMTP
   (`email_password`) have no managed-identity mode yet — supply those secrets via the environment
   (`MEFOR_*`, never the config file) under a least-privilege service account.
+- **The precondition covers the STORE hop and nothing else** (ASVS 13.2.1, BACKLOG #1182).
+  `managed_identity_precondition` is a `StoreSettings` method, so the `[store]` service settings are all
+  it can read — the four graph-declared database hops (`Database`, `DatabasePoll`, `DatabaseLookup`,
+  `DatabaseRef`) are outside its reach by construction, and each defaults to a static SQL login. Setting
+  the flag therefore says nothing about them. `messagefoundry check`'s advisory `static-db-credentials`
+  line is what names that set; it reports and does not refuse. See
+  [`docs/CONNECTIONS.md`](CONNECTIONS.md) §*Static database credentials*.
 - **Least-privilege secret access** is the operator's precondition: secrets live in the environment, the
   engine's service account is granted only what it needs (the least-privilege account + ACLs are the
   Windows-service install's job), and at-rest custody is the DPAPI / KeyProvider chain. The precondition
