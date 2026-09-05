@@ -6314,11 +6314,21 @@ class SqlServerStore:
         now: float | None = None,
         connection_cutoffs: Mapping[str, float] | None = None,
     ) -> int:
-        """Blank the payload of dead outbound rows updated before ``older_than`` (retention). Keeps the
+        """Blank the payload of dead rows updated before ``older_than`` (retention). Keeps the
         dead row + 'dead' status (counts/disposition) but frees the body; idempotent (payload <> '').
 
+        **Every stage, not only outbound** (#1188, ASVS 14.2.7) — mirrors the SQLite backend. A dead
+        ``ingress``/``routed`` row holds the full raw body and is neither pending nor inflight, so its
+        message is body-purge-eligible: the outbound-only scope blanked ``messages.raw`` while that raw
+        survived in the queue row unreachable by any sweep. :meth:`replay` re-queues such a row from its
+        own payload, so it is replayable-until-purged exactly as a dead outbound row is. The stage
+        predicate is dropped rather than widened to a list, so a later stage is covered by construction.
+
         ``connection_cutoffs`` (#34, ADR 0027) optionally overrides the cutoff per ``destination_name``
-        (``float('-inf')`` = keep forever); default empty ⇒ a single global cutoff, byte-identical."""
+        (``float('-inf')`` = keep forever); default empty ⇒ a single global cutoff, byte-identical. An
+        ingress/routed/response row has a NULL ``destination_name``, so ``CASE NULL WHEN ...`` matches no
+        arm and it takes the ``ELSE`` — always the global dead-letter window (``dead_letter_days`` is
+        declared on an OUTBOUND connection, so no inbound-keyed override exists to honour)."""
         cutoff_sql, cutoff_params = _qmark_cutoff_case(
             "destination_name", older_than, connection_cutoffs
         )
@@ -6326,8 +6336,8 @@ class SqlServerStore:
             try:
                 await cur.execute(
                     "UPDATE queue SET payload='', last_error=NULL"
-                    f" WHERE stage=? AND status=? AND payload <> '' AND updated_at < {cutoff_sql}",
-                    (Stage.OUTBOUND.value, OutboxStatus.DEAD.value, *cutoff_params),
+                    f" WHERE status=? AND payload <> '' AND updated_at < {cutoff_sql}",
+                    (OutboxStatus.DEAD.value, *cutoff_params),
                 )
                 purged = cur.rowcount
                 # #149 Phase 4 (mirrors SQLite Phase 3a): a dead row just lost its payload + body_ref, so
@@ -6339,10 +6349,9 @@ class SqlServerStore:
                 await self._release_message_attachments(
                     cur,
                     "message_id IN (SELECT DISTINCT q0.message_id FROM queue q0"
-                    f" WHERE q0.stage=? AND q0.status=? AND q0.updated_at < {cutoff_sql}"
+                    f" WHERE q0.status=? AND q0.updated_at < {cutoff_sql}"
                     f" AND NOT {self._attachment_still_referenced_sql('q0.message_id')})",
                     (
-                        Stage.OUTBOUND.value,
                         OutboxStatus.DEAD.value,
                         *cutoff_params,
                         OutboxStatus.PENDING.value,
