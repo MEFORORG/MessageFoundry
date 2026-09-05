@@ -51,6 +51,19 @@
               "${CLAUDE_PROJECT_DIR}/scripts/hooks/seat-declare-prompt.ps1"
             ],
             "statusMessage": "Asking this seat to declare its goal"
+          },
+          {
+            "type": "command",
+            "command": "pwsh",
+            "args": [
+              "-NoProfile",
+              "-NonInteractive",
+              "-File",
+              "${CLAUDE_PROJECT_DIR}/scripts/hooks/role-card-inject.ps1",
+              "-Worktree",
+              "${CLAUDE_PROJECT_DIR}"
+            ],
+            "statusMessage": "Injecting this worktree's role card"
           }
         ]
       }

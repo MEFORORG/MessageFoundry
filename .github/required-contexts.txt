@@ -152,90 +152,16 @@ a PR that implements BACKLOG #N must update BACKLOG.md
 # prevent. Adding to protection is all-or-nothing: the REST endpoint 422s with `already_exists` if any
 # context in the request is already required, and then adds NONE of them, so send only the missing ones.
 
-# --- review-gate.yml --------------------------------------------------------------------------------
-# ARMED 2026-08-31 (BACKLOG #1404), and this line is the second half of that arming -- protection moved
-# first, this file followed, which is the order the paragraph directly above prescribes.
+# --- review-gate.yml: RETIRED 2026-09-05 ------------------------------------------------------------
+# The `a reviewer has read this` context, review-gate.yml, unread-signal.yml and the Reviewer seat
+# were all removed on 2026-09-05. The long note that stood here described the gate as armed and as
+# the repository's entire review requirement.
 #
-# THIS ONE CONTEXT IS THE REPOSITORY'S ENTIRE REVIEW REQUIREMENT, AND THERE IS NOTHING BEHIND IT.
-# `required_approving_review_count` is 0 and has to stay 0: every session on this machine pushes as ONE
-# GitHub identity (`gh` auth lives at AppData\Roaming\GitHub CLI\hosts.yml, machine-wide rather than per
-# config root), CODEOWNERS assigns every path to that same account, and GitHub refuses to let an author
-# approve their own pull request -- so raising the count to 1 wedges every pull request permanently
-# instead of reviewing any of them. review-gate.yml's header carries that measurement. With approvals
-# pinned at 0, dropping this context from protection does not weaken review, it REMOVES it: nothing
-# else anywhere reports that a green pull request was never read.
+# IT WAS ALREADY FALSE WHEN IT WAS READ. Measured 2026-09-05: the live API returned 13 contexts and
+# did NOT include it, while this file, docs/CI.md, CLAUDE.md and the vault's roles/README.md all still
+# asserted it was armed. The owner retired the gate rather than restore it.
 #
-# What it enforces is a STEP, not an identity. `gh pr edit <N> --add-label reviewed` is the whole
-# protocol; nothing automated ever adds the label, and a `synchronize` event REMOVES it, so commits
-# nobody has read are unread again. It does not establish that an independent party looked, and no
-# prose here or anywhere else may describe it as if it does.
-#
-# SAFE TO REQUIRE, which for this file means one thing: the required-but-absent trap. A required check
-# that never reports blocks every pull request forever, so three separate ways it could fail to report
-# were checked before arming, and all three came back clean:
-#
-#   * IT ALWAYS DISPATCHES. The trigger is `pull_request` with NO paths filter, and the `reviewed` job
-#     carries no `if:` of its own. The `if:`s in that workflow sit on STEPS, inside a job that always
-#     runs -- and a skipped step still leaves the job reporting a conclusion, which is what branch
-#     protection reads.
-#   * IT REPORTS IN THE QUEUE. review-gate.yml declares `merge_group:`. Omitting that is the total
-#     failure codeql.yml's own header records under BACKLOG #340: a required context whose workflow has
-#     no merge_group trigger never reports on a queue entry, so NOTHING MERGES. Measured there on the
-#     first entry the queue ever held -- 32 check-runs green and three contexts simply absent.
-#   * IT REPORTS ON PULL REQUESTS OLDER THAN ITSELF. GitHub runs a `pull_request` workflow from the
-#     MERGE commit, not from the head, so a branch that predates the workflow still gets the check.
-#     VERIFIED on PR 713: its head 5cb51e46 returns 404 for .github/workflows/review-gate.yml, and the
-#     context reported on it anyway.
-#
-# SO ARMING IT STRANDED NOTHING, and the remedy is not a rebase. Every open pull request goes red on
-# this one check until a reviewer labels it; `labeled` is in the trigger list, so the label alone
-# re-runs the job and clears it. That distinction is the one worth keeping: a reader who assumes a
-# stranded check needs a rebase will rebase, which on `synchronize` STRIPS the label and moves the pull
-# request further from green.
-#
-# THAT SENTENCE IS ONLY TRUE WHILE `labeled` IS IN THE WORKFLOW'S `types:` LIST, so it is held by a
-# test rather than by this paragraph:
-#
-#   tests/test_merge_gate_controls.py::test_the_review_gate_reruns_when_a_reviewer_adds_the_label
-#
-# Deleting that action reddens nothing on its own and leaves a gate no reviewer action can clear: the
-# label fires no run, and the only trigger that still re-runs the job is `synchronize`, whose first
-# step REMOVES the label. Measured 2026-08-31 -- before the test above existed, dropping `labeled`
-# passed 65 tests.
-a reviewer has read this
-
-# DELIBERATELY NOT REQUIRED (do not add without the owner's decision; each has a recorded reason):
-#   codeql.yml, scorecard.yml  -- their SARIF upload needs `security-events: write`, which fork-PR
-#                                 tokens lack, so requiring them would block every fork PR.
-#                                 `CodeQL (python)` and `CodeQL (javascript-typescript)` were read as
-#                                 required earlier on 2026-08-31 and are NOT required at 20:57 CDT
-#                                 that day. This entry is the reason that reading is the settled one,
-#                                 so do not transcribe a future sighting over it -- reinstating them
-#                                 is an owner decision that has to retract the fork-PR cost first.
-#                                 scorecard.yml additionally has no `pull_request` trigger at all
-#                                 (`push`, `schedule`, `branch_protection_rule`, `workflow_dispatch`),
-#                                 so it can never report on one -- the required-but-absent trap, on
-#                                 top of the token problem.
-#   zizmor.yml                 -- paths-filtered, so it does not report on most PRs.
-#   quality-advisory.yml       -- advisory BY DESIGN and must never be promoted; the invariant is
-#                                 pinned by tests/test_quality_advisory_invariants.py.
-#   dast.yml                   -- nightly/tag/dispatch only, with no pull_request trigger, so it can
-#                                 never report on a PR (required-but-absent trap). Advisory by
-#                                 placement, not by continue-on-error: the job goes red on a finding.
-#                                 See ADR 0155.
-#   security.yml's             -- `released-line-audit (latest release's pinned runtime)` is
-#   released-line-audit           schedule/dispatch only, so it can never report on a PR
-#                                 (required-but-absent trap). Advisory by placement, not by
-#                                 continue-on-error: it goes red on a finding, and
-#                                 tests/test_security_posture.py holds that. It also could not be
-#                                 actioned by a PR author -- its remedy is cutting a release on the
-#                                 latest line (docs/SUPPORT-POLICY.md), not editing the branch under
-#                                 review. BACKLOG #1081.
-#   ingress-rate-probe.yml     -- workflow_dispatch only, so it never reports on a PR. It is also
-#                                 structurally unfit to gate anything: it MEASURES a runner's ingress
-#                                 service rate and exits 0 even when the reconcile fails, because a
-#                                 machine too slow to keep up is the finding, not an error. See #320.
-#   freethread-smoke.yml       -- a 3.14t canary; informational only.
-#   manifest-lint.yml          -- paths-filtered to the k8s manifests.
-#   nightly / path-gated legs  -- server-DB store, load/throughput, service-smoke, DICOM/FHIR
-#                                 breadth: they do not run on every PR (required-but-absent trap).
+# SO NOTHING NOW REQUIRES THAT ANYONE READ A PULL REQUEST BEFORE IT MERGES. Approvals stay pinned at
+# 0 because every session pushes as one GitHub identity. What blocks a merge is the required check
+# set below and nothing else. That is a real reduction in enforcement, recorded plainly here rather
+# than described as a cleanup.

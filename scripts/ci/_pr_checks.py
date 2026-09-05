@@ -4,7 +4,8 @@
 """One reading of a pull request's ``statusCheckRollup``, shared by the checks that need it.
 
 WHY THIS IS ONE MODULE AND NOT TWO COPIES. ``check_stalled_prs.py`` asks "is this green and unable to
-merge". ``check_unread_prs.py`` asks "is this green and unread". Different questions, but both turn on
+merge". ``check_unread_prs.py`` asked "is this green and unread" until it was deleted on 2026-09-05
+with the review gate; the separation is kept because a second reader may return. Both turn on
 the same underlying fact: GitHub's rollup vocabulary, which is GitHub's to change and not ours. Two
 copies of that vocabulary would be free to drift, and the drift would be silent in the one direction
 that matters -- a conclusion string nobody classified reads as green -- which is the defect both
