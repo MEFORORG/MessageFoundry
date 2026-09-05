@@ -57,10 +57,23 @@ class SecurityEvent:
 
     event_type: str
     username: str
-    # The affected account's ENGINE-OWNED notification address (``users.notify_email``, BACKLOG
-    # #1139) -- never the directory-mirrored profile address. None = the account has never carried
-    # one, and the notifier drops the notice; it does NOT mean a directory repoint removed it, which
-    # is a state the split makes unreachable.
+    # THE ADDRESS THE NOTICE IS SENT TO, and the ONE place the rule for choosing it is stated
+    # (SDS-3.5). Callers pass the affected account's ENGINE-OWNED ``users.notify_email`` (BACKLOG
+    # #1139, ADR 0182) rather than the directory-mirrored profile address, so a directory repoint
+    # cannot redirect an account's notices. None = no deliverable address, and the notifier drops
+    # the notice.
+    #
+    # **THAT IS A RULE EVERY CALLER FOLLOWS, NOT AN INVARIANT ANY CODE ENFORCES.** This comment
+    # asserted it as an absolute -- "never the directory-mirrored profile address" -- while
+    # ``_upsert_ad_user`` was addressing the directory-repoint notice from the mirror, which is the
+    # one notice the rule exists for. Stated absolutely it also invites the reverse reading, that a
+    # None here proves no clear occurred; nothing establishes that. Nineteen call sites are the only
+    # thing holding the rule up, and giving it a single enforcing choke point is recorded as a
+    # follow-on on BACKLOG #1139.
+    #
+    # ONE DELIBERATE EXCEPTION, at the directory repoint itself: an account that has never carried
+    # any address falls back to the incoming directory value, because it is then the only reachable
+    # party and there is no earlier holder to protect.
     email: str | None = None
     client_ip: str | None = None  # source IP of the triggering request, when known
     detail: dict[str, Any] = field(
