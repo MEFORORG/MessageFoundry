@@ -1,0 +1,38 @@
+{
+  "_comment": [
+    "The canonical seat roster, the spellings observed in the wild, and the retired seats.",
+    "Read by scripts/hooks/role-card-inject.ps1 and by tests/test_role_cards.py.",
+    "JSON rather than TOML, against the CLAUDE.md section 7 default, for one concrete reason:",
+    "PowerShell reads JSON with a built-in and has no TOML parser, and this file has to be read",
+    "by both a hook and a pytest. Keys are lowercase; the hook lowercases before it looks up.",
+    "The roster comes from CLAUDE.md section 5. The vault's roles/README.md disagrees and is the",
+    "stale one -- it still lists seven retired seats as live and calls itself a partial list.",
+    "The alias keys were MEASURED on 2026-09-05 across 968 worktree seat records, which held 46",
+    "distinct strings for a six-seat roster. Do not add a spelling nobody has actually used."
+  ],
+
+  "seats": ["console", "builder", "reviewer", "regulator", "steward", "lander"],
+
+  "aliases": {
+    "console": "console",
+    "builder": "builder",
+    "builder1": "builder",
+    "builder2": "builder",
+    "builder-2": "builder",
+    "builder3": "builder",
+    "reviewer": "reviewer",
+    "regulator": "regulator",
+    "steward": "steward",
+    "lander": "lander"
+  },
+
+  "retired": {
+    "dispatcher": "retired by CLAUDE.md section 5 on 2026-09-01; the Console reads the backlog and cuts briefs",
+    "liaison": "retired by CLAUDE.md section 5 on 2026-09-01; seats reach the owner through the Console",
+    "pm": "retired by CLAUDE.md section 5 on 2026-09-01; the Console holds reporting",
+    "cleaner": "retired by CLAUDE.md section 5 on 2026-09-01",
+    "role-manager": "retired by CLAUDE.md section 5 on 2026-09-01",
+    "process-improvement": "retired by CLAUDE.md section 5 on 2026-09-01",
+    "asvs-tracker": "retired by CLAUDE.md section 5 on 2026-09-01"
+  }
+}
