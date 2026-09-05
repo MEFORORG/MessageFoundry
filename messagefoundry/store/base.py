@@ -1316,10 +1316,12 @@ class QueueStore(StoreLifecycle, Protocol):
         now: float | None = None,
         connection_cutoffs: Mapping[str, float] | None = None,
     ) -> int:
-        """Null dead-lettered outbound bodies updated before ``older_than`` (their own window).
-        ``connection_cutoffs`` (#34, ADR 0027) optionally overrides the cutoff per ``destination_name``
-        (``float('-inf')`` = keep forever); default empty ⇒ a single global cutoff. Returns the number
-        purged."""
+        """Null dead-lettered bodies updated before ``older_than`` (their own window), at **every
+        stage** — a dead ``ingress``/``routed`` row carries the full raw body and is reached here
+        (#1188, ASVS 14.2.7), not only a dead ``outbound`` row. ``connection_cutoffs`` (#34, ADR 0027)
+        optionally overrides the cutoff per ``destination_name`` (``float('-inf')`` = keep forever);
+        default empty ⇒ a single global cutoff. A row with a NULL ``destination_name`` (ingress, routed,
+        response) always takes the global window. Returns the number purged."""
         ...
 
     async def purge_state(self, *, older_than: float, now: float | None = None) -> int:
@@ -1614,6 +1616,11 @@ class AuthStore(Protocol):
         self, user_id: str, *, disabled: bool, now: float | None = None
     ) -> None: ...
 
+    # ``email`` here is the account's PROFILE address, and on an AD/OIDC account the directory's
+    # mirror: ``_upsert_ad_user`` calls this on every directory login and the write is unconditional,
+    # so whatever the directory's ``mail`` attribute says wins. IT IS NOT THE NOTIFICATION TARGET, and
+    # this method must never gain that column (BACKLOG #1139) -- handing the directory sync the
+    # notification address back is the whole defect the split removes.
     async def update_user_profile(
         self,
         user_id: str,
@@ -1621,6 +1628,20 @@ class AuthStore(Protocol):
         display_name: str | None,
         email: str | None,
         now: float | None = None,
+    ) -> None: ...
+
+    # The ONLY writer of ``users.notify_email`` after account creation, which seeds it once from the
+    # address it was given (BACKLOG #1139, ASVS 6.3.7). Every out-of-band security notice is addressed
+    # to this column, and no directory-sync path names it -- so a directory repoint cannot replace the
+    # address the resulting notice has to reach.
+    #
+    # ``email`` IS ``str``, NOT ``str | None``, AND THAT IS THE DURABILITY RULE RATHER THAN A STYLE
+    # CHOICE. Requiring an address at creation does not make it durable, because an explicit null still
+    # strips it afterwards, and an account with no address is excluded from every later notice. The
+    # notification address is therefore repointable but not erasable: the type refuses the clear, and
+    # the implementations reject the whitespace-only string that would mean the same thing.
+    async def set_user_notify_email(
+        self, user_id: str, *, email: str, now: float | None = None
     ) -> None: ...
 
     async def delete_user(self, user_id: str) -> None: ...

@@ -27,6 +27,37 @@ that defines item status (``backlog_status_check.parse_items``), never a second 
     > Research: none | done <date>
     > Closing-act: code | scorecard-rescore | owner-ruling | banner-only
 
+It also reads the item's **heading and prose** for a retirement declaration, because the ledger
+retires an item **in place**: the number is kept, the banner and the fields stay exactly as filed,
+and the retirement is prose. Every field above therefore still says buildable on a row that must not
+be built. The banner block itself is excluded from that read -- it is where a machine writes ABOUT
+the item, including a scoring summary that quotes the retirement wording of other rows.
+
+And it reads the item's **whole text, banner included**, for a declaration that the work is
+**already built** (BACKLOG #1393). That produces a fourth level, ``read``, which says **MUST BE
+READ** and decides nothing. Four open rows state plainly that their work shipped and must not be
+built again, and every field above still says buildable on all four, because the verb in them is
+**REBUILD** and no screen in this repo reads for it.
+
+**And then it stops reading the row and ASKS THE TREE** (BACKLOG #1398). Every needle above reads
+prose somebody wrote about the code. A row can be fully built and shipped with **nothing in its text
+saying so**, and no amount of careful reading finds it. That is not the same class as the paragraph
+above: there the row SAYS its work shipped and a screen missed the verb; here **there is nothing in
+the text to miss.** Measured 2026-08-29: a dispatcher screened #1300 as open, unclaimed, in no pull
+request and carrying no bar, and it was already built and shipped on ``main``. The only way anyone
+found out was by starting the work.
+
+So before a wave is dispatched, one ``git grep`` over ``origin/main`` asks whether landed code cites
+each candidate's number, via :mod:`landed_citation_screen`. A hit raises the item to ``read`` --
+**MUST BE READ, never a verdict**, for two reasons that pull in opposite directions and are both
+live on today's corpus. A citation is not a completion: landed code cites a row while FILING it,
+while testing around it, or while recording why it was NOT done. And a clear row is not proof of
+unbuilt: this sees only what LANDED, and #1375 was fully built onto a branch that never reached
+``origin``. The flag rate settles it. Measured over ``origin/main`` at ``fd44b0f17`` and again at
+``46ea10a78`` by ``landed_citation_screen.py --all-open``: **118 of 275 open rows carry the joined
+citation form, 42.9 percent.** At that density a refusal is a wave that never dispatches, so nothing
+here blocks on a tree hit and ``--refuse`` does not either.
+
 **IT NAMES THE CLOSING ACT. IT DOES NOT REFUSE THE ITEM.** That is a correction to this tool's first
 version, and the correction matters more than the tool. That version refused any closing act a
 builder could not perform. Measured against the very range it was built for, it would have blocked
@@ -40,10 +71,11 @@ wave picked unclosable items believing they would close, and the first gate prop
 workable items because they would not. Both fuse *can a builder do it* with *can anyone here close
 it*.
 
-So each item comes back as one of three levels. ``ok`` closes by the builder's own act. ``advise``
-is workable, with the closing act and its owning seat named. ``refuse`` is reserved for an item
-whose state nobody has declared, because there the dispatch can name nothing at all -- and even that
-blocks only under ``--refuse``.
+So each item comes back as one of four levels. ``ok`` closes by the builder's own act. ``advise``
+is workable, with the closing act and its owning seat named. ``read`` is **MUST BE READ**: the row
+itself says the work is already built, so this gate stops claiming to know and hands the question
+back. ``refuse`` is reserved for an item whose state nobody has declared, because there the dispatch
+can name nothing at all -- and even that blocks only under ``--refuse``.
 
 **It is a DISPATCH aid, not a CI gate, on purpose.** Making missing fields a CI error would red the
 build for all 330 items at once and be disabled within a day.
@@ -52,18 +84,26 @@ Usage::
 
     python scripts/coord/dispatch_gate.py 1107 1112 1122
     python scripts/coord/dispatch_gate.py --range 1107-1199 --explain
+    python scripts/coord/dispatch_gate.py --range 1380-1399 --no-tree
     python scripts/coord/dispatch_gate.py --self-test
 
 Exit 0 only when EVERY named item is dispatchable. Exit 1 otherwise, listing each refusal and why.
+A tree hit never changes the exit code.
 """
 
 from __future__ import annotations
 
 import argparse
+import re
 import sys
 from pathlib import Path
+from typing import NamedTuple
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "docs"))
+# The screen is a SIBLING, and it is imported rather than reimplemented. A second copy of the sweep
+# beside the one that carries the controls is the two-definitions defect the ledger rules forbid:
+# the copy would drift, and a drifted instrument here answers uniformly and confidently.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from backlog_status_check import (  # type: ignore[import-not-found]  # noqa: E402
     BUILDER_CLOSABLE_ACTS,
@@ -71,6 +111,18 @@ from backlog_status_check import (  # type: ignore[import-not-found]  # noqa: E4
     DEFAULT_SOURCES,
     Item,
     parse_items,
+)
+from landed_citation_screen import (  # type: ignore[import-not-found]  # noqa: E402
+    CITED,
+    DEFAULT_REF,
+    SEARCH_PATHS,
+    Finding,
+    InstrumentError,
+    check_agreement,
+    check_controls,
+    resolve_ref,
+    screen,
+    sweep,
 )
 
 # Below this, the ledger did not parse and no verdict from this gate is evidence.
@@ -119,20 +171,203 @@ GATED_VERDICTS = {
 }
 
 
-def load_items(root: Path) -> dict[int, Item]:
-    """Every item across the ledger namespace, keyed by number."""
-    out: dict[int, Item] = {}
+# RETIREMENT IS PROSE, NOT A FIELD, AND THAT IS WHY NOTHING WAS READING IT (BACKLOG #1334).
+#
+# The ledger retires an item IN PLACE: the number is kept -- commits and mail already cite it -- and
+# the banner and the fields stay exactly as filed. So every field this gate reads still says
+# buildable on a row whose first body line says it must not be built. Measured on `main` at
+# 3760a93b, before this limb: #1332 graded ``ok`` with a note BYTE-IDENTICAL to an ordinary build
+# item's, and #1309 and #1311 graded ``advise`` for their closing act. None of the three notes said
+# the word. Three rows, all dispatchable, all retired.
+#
+# WHICH WAY THIS ERRS, ON PURPOSE. A MISSED retirement green-lights an item the ledger says must not
+# be built -- the whole failure this limb exists to stop, and what happened to #1332. A false STOP
+# costs a reader one minute of reading the body. So the needles match a DECLARATION about this item
+# and never a bare word, and where the two errors trade off, the miss is the expensive one.
+#
+# THE BARE WORD IS NOT A CANDIDATE: it appears in 49 of the 657 bodies read this way, including
+# #1086 -- the item #1332's own body tells builders to build INSTEAD.
+#
+# WHAT THE NEEDLES READ IS THE ITEM'S PROSE, NOT ITS BANNER BLOCK, AND THAT SPLIT IS MEASURED RATHER
+# THAN TIDY. The banner block is where a machine writes ABOUT the item: the status glyph, the three
+# dispatch fields, and since the 2026-09-03 scoring pass a summary paragraph per row. That pass wrote
+# into #1334's banner a sentence quoting the very rows #1334 documents -- "three open rows are
+# retired in place ... and should not be built" -- and the body needle fired on it. So on `main` at
+# 2b8bccb43 the limb flagged #1334, the row that DOCUMENTS the convention and is the worst false
+# positive available, because a reader who stops there never reaches the rows that are actually
+# retired. Reading prose only, the same corpus fires on #1309, #1311 and #1332 and on nothing else,
+# and no row anywhere fires from its banner alone -- so the split costs no detection today.
+#
+#: The declaration, in the body: retired, and therefore not to be built. Newline-tolerant because
+#: the ledger hard-wraps at ~100 columns and #1332's declaration already wraps mid-sentence.
+_RETIRED_DECLARATION = re.compile(
+    r"RETIRED\b[\s\S]{0,160}?(?:SHOULD|MUST)\s+NOT\s+BE\s+BUILT", re.I
+)
+
+#: The declaration, in the heading: `## 1311. WITHDRAWN -- duplicate of #1310`. #1311's body never
+#: says "should not be built", so the needle above MISSES it entirely -- one form, one whole row.
+_RETIRED_HEADING = re.compile(
+    r"^##\s+\d+\.\s*\**\s*(?:WITHDRAWN|RETIRED|SUPERSEDED)\b", re.I | re.M
+)
+
+# A THIRD NEEDLE WAS PROPOSED FOR THIS LIMB AND MEASURED OUT: "retired in place" adjacent to a
+# duplicate-of declaration. Over the ledger namespace it fires on #1309, #1332 -- and #1334, the
+# row that DOCUMENTS the convention and lists the other two by number. That is exactly the landmine
+# `verdict_divergence_check.py` records in its own docstring: the migration that writes a vocabulary
+# into an item body makes that item look governed by it. A detector that flags correct prose is not
+# noisy, it is wrong. The two needles above carry all three retired rows without it.
+
+
+def retirement_marker(body: str) -> str | None:
+    """The declaration text if ``body`` retires this item, else ``None``.
+
+    ``body`` is the item's heading and its own prose. ``load_ledger`` drops the banner block before
+    calling this, because a banner is what a machine writes ABOUT an item and it quotes other rows.
+
+    Returns WHAT FIRED, whitespace-collapsed and clipped, so the note can quote it and a reader can
+    check the claim instead of taking the gate's word for it.
+    """
+    for pattern in (_RETIRED_HEADING, _RETIRED_DECLARATION):
+        found = pattern.search(body)
+        if found is not None:
+            return " ".join(found.group(0).split())[:140]
+    return None
+
+
+# ALREADY BUILT IS THE OTHER WAY A ROW STOPS BEING BUILDABLE, AND THE VERB IS WHY NOTHING READ IT
+# (BACKLOG #1393).
+#
+# Four open rows say their work has shipped and must not be built again -- #1107, #1130, #1183 and
+# #1242 -- and every field this gate reads still says buildable on all four, because closing them is
+# a judgement the building seat cannot make. So the ledger accumulates done-but-open rows by
+# construction and nothing prunes them. The item's own measurement: two independently-written
+# blocker screens were run over this population on 2026-08-29 and BOTH missed all four, because a
+# screen matches a verb list -- BUILD, START, DISPATCH, IMPLEMENT, LAND -- and none of those matches
+# REBUILD. That makes it a property of the vocabulary rather than of one tool.
+#
+# THIS RETURNS A LEVEL THAT DECIDES NOTHING, ON PURPOSE. 35 of the 275 open rows carry the bare
+# words at this branch's base. A gate that refused them would be the noise failure #1394 already
+# records, where a screen matching "DO NOT" discarded 46 percent of the live ledger. What a reader
+# gets here is the sentence and an instruction to go and read the row.
+#
+# THE BARE WORD IS NOT A CANDIDATE, measured the same way the retirement limb measured its own:
+# "rebuild" or "already shipped/built" anywhere in an open row fires on 35 of 275. The needle below
+# fires on 7 of them (9 rows across the whole namespace). Both figures count OPEN rows at the same
+# ref, so they are comparable, and `test_the_needle_does_not_fire_on_rows_that_describe_the_defect`
+# re-derives the pair rather than trusting this sentence.
+#
+# THREE SHAPES WERE MEASURED OUT, and each failed on a row it must not stop:
+#   * the bar alone (`do not rebuild`, no shipped assertion) fires on #353, #1007 and #347, which
+#     say "do not REWRITE" about output, and on #1393 ITSELF -- see the two guards below;
+#   * reading the item's prose without its banner LOSES #1242, one of the four rows this limb
+#     exists for: #1242 is written almost entirely as blockquote, so its declaration sits at
+#     `BACKLOG.md:12345` and its prose region is two lines long;
+#   * a needle allowed to start mid-line fires on #1393's own table, which QUOTES all four
+#     declarations verbatim in cells that begin `| #1107 | "`.
+#
+#: A declaration that the work is already done. The two guards are what keep it off the row that
+#: describes the defect, and both are measured rather than defensive:
+#:
+#: ``^(?!#)`` -- a HEADING may not start a match. #1393's own title reads "four open rows say their
+#: work ALREADY SHIPPED and must not be rebuilt", which is a perfect instance of the pattern written
+#: as narration. The retirement limb reads headings safely because its heading needle is anchored at
+#: the TITLE's start (`## 1311. WITHDRAWN`); this one scans free text, so a narrating title matches.
+#:
+#: ``[^\n|"]`` in the prefix -- a match may not begin after a table pipe or an opening quotation
+#: mark. #1393's table quotes all four rows' declarations verbatim, and #1394 and #1398 restate the
+#: same class in prose. Without this guard the needle flags #1393, and a reader stopped by the row
+#: that DOCUMENTS the trap never reaches the four rows that are the trap.
+_ALREADY_BUILT_DECLARATION = re.compile(
+    r"(?m)^(?!#)[ \t]*(?:>[ \t]*)*[^\n|\"]{0,140}?"
+    r"(?:ALREADY\b|SHIPPED\s+IN\b"
+    r"|(?:HAS|HAVE|IS|ARE|WAS|WERE)\s+(?:BEEN\s+)?(?:LANDED|BUILT|SHIPPED|MERGED|PUSHED|DONE))"
+    r"[^|\"]{0,160}?"
+    r"(?:DO\s+NOT|DOES\s+NOT|DON'?T|NEVER|(?:MUST|SHOULD|CANNOT|CAN'?T)\s+NOT?\s*BE|NOT\s+BE)"
+    r"[\s\S]{0,12}?RE-?(?:BUILD|BUILT|DO\b|DOING|IMPLEMENT)",
+    re.I,
+)
+
+
+def rebuild_marker(text: str) -> str | None:
+    """The declaration text if ``text`` says this row's work is already built, else ``None``.
+
+    ``text`` is the item's WHOLE text -- heading, banner block and prose. That differs from
+    :func:`retirement_marker`, which reads prose only, and the difference is measured: #1242
+    declares "THE CORRECTION IS ALREADY BUILT AND PUSHED. Do not rebuild it." inside its banner
+    block, so a prose-only read loses one of the four rows this needle exists for. The two guards
+    documented on the pattern above are what make the wider region safe.
+
+    Returns WHAT FIRED, whitespace-collapsed and clipped, so the note can quote it and a reader can
+    check the claim instead of taking the gate's word for it.
+    """
+    found = _ALREADY_BUILT_DECLARATION.search(text)
+    if found is None:
+        return None
+    # The blockquote marker is stripped from the QUOTE only. It is load-bearing to the match -- it
+    # is how #1242's banner declaration is reached at all -- and noise to a reader checking it.
+    return " ".join(found.group(0).split()).lstrip("> ")[:180]
+
+
+class Row(NamedTuple):
+    """One ledger item, its heading plus prose, and its banner block on its own."""
+
+    item: Item
+    body: str
+    banner: str
+
+
+def load_ledger(root: Path) -> dict[int, Row]:
+    """Every item across the ledger namespace, with its body, keyed by number.
+
+    **The body comes from the SAME read as the status, and the pairing is why this replaced a
+    status-only loader.** A second pass for bodies could come back empty -- a renamed file, a
+    narrowed source list -- while the item count, the levels and every printed total stayed exactly
+    right, and the retirement limb would simply be off with nothing reporting it. Here an empty
+    result is an empty result: the MIN_ITEMS floor in ``main`` already refuses to report on one.
+
+    **The banner block is dropped and the heading is kept, which is not a tidy-up.** A banner is
+    what a machine writes ABOUT an item -- the status glyph, the three dispatch fields, and a
+    scoring summary that quotes the rows it describes -- so a needle reading it grades an item on
+    somebody else's prose. The heading stays because #1311 declares its withdrawal there and
+    nowhere else. ``Item.body_line`` supplies the boundary; deriving it here would put a second
+    definition of the banner block beside the parser that owns it.
+
+    **The banner is CARRIED rather than discarded, from that same boundary** (BACKLOG #1393). It is
+    not safe for the retirement needle and it is required by the already-built one: #1242 declares
+    "THE CORRECTION IS ALREADY BUILT AND PUSHED. Do not rebuild it." in its banner block, and its
+    prose region is two lines long. Splitting the region here, from one ``Item.body_line`` read,
+    keeps both needles reading a boundary the parser owns and neither re-deriving one.
+    """
+    out: dict[int, Row] = {}
+    heading = re.compile(r"^## \d+\.\s")
     for src in DEFAULT_SOURCES:
         path = root / src
         if not path.is_file():
             continue
-        for item in parse_items(path.read_text(encoding="utf-8", errors="replace")):
-            out[item.num] = item
+        text = path.read_text(encoding="utf-8", errors="replace")
+        lines = text.splitlines()
+        for item in parse_items(text):
+            end = len(lines)
+            for k in range(item.line, len(lines)):
+                if heading.match(lines[k]):
+                    end = k
+                    break
+            banner = lines[item.line : min(item.body_line - 1, end)]
+            prose = lines[min(item.body_line - 1, end) : end]
+            out[item.num] = Row(item, "\n".join([lines[item.line - 1], *prose]), "\n".join(banner))
     return out
 
 
-def judge(item: Item) -> tuple[str, str]:
-    """Return (level, note). Levels: ``ok``, ``advise``, ``refuse``.
+def judge(item: Item, body: str = "", banner: str = "") -> tuple[str, str]:
+    """Return (level, note). Levels: ``ok``, ``read``, ``advise``, ``refuse``.
+
+    ``body`` is the item's prose, and it DEFAULTS TO EMPTY on purpose: a caller with no body gets
+    exactly the answer this function gave before the retirement limb existed, rather than a
+    retirement claim derived from a body nobody read. No body, no claim.
+
+    ``banner`` is the item's banner block, and it defaults to empty for the same reason. It is read
+    ONLY by the already-built needle, never by the retirement one -- see :func:`rebuild_marker` and
+    :func:`load_ledger` for why the two regions differ and how both come off one boundary.
 
     **This ADVISES by default and refuses almost nothing, which is a correction.** The first version
     returned a boolean and refused any closing act a builder could not perform. Measured against the
@@ -148,19 +383,77 @@ def judge(item: Item) -> tuple[str, str]:
     ``demand-gate`` item can legitimately be scoped or researched; what it cannot be is silently
     treated as ordinary build work. So the note leads with what gates it and who lifts it, and the
     seat still decides.
+
+    **``read`` DECIDES NOTHING AND OUTRANKS ``advise``, which are two separate claims.** It decides
+    nothing because the row's own sentence is the evidence and this function has not checked the
+    tree; it says MUST BE READ and hands the question back. It outranks ``advise`` because of what
+    each one costs a reader who acts on the level alone: an ``advise`` row is workable and the note
+    only names who closes it, while a row that may already be built can cost a whole lane-window
+    rebuilding shipped code. Nothing is hidden by the ranking -- every ``advise`` reason still rides
+    in the note, after the MUST BE READ lead.
     """
     act = item.fields.get("closing-act", "").strip().lower()
     verdict = item.fields.get("verdict", "").strip().lower()
     research = item.fields.get("research", "").strip().lower()
 
+    # THE ONE CONSULT. Everything below reads this variable, so the mutation that turns this limb off
+    # is a single line and every retirement test dies with it.
+    retired = retirement_marker(body)
+    retired_note = (
+        ""
+        if retired is None
+        else (
+            f'RETIRED IN PLACE -- DO NOT BUILD IT. The body declares: "{retired}". The number is '
+            f"kept, so the banner and every field this gate reads still describe a live item; the "
+            f"retirement is prose. Read the item this one names instead."
+        )
+    )
+
+    # THE SECOND CONSULT, and the same single-line shape: turning this limb off kills every
+    # already-built test at once. It reads the WHOLE row -- banner included -- because #1242
+    # declares in its banner and its prose region is two lines long.
+    already_built = rebuild_marker("\n".join((body, banner)))
+    read_note = (
+        ""
+        if already_built is None
+        else (
+            f'MUST BE READ -- THE ROW SAYS THIS WORK IS ALREADY BUILT. It declares: "'
+            f'{already_built}". THIS GATE HAS DECIDED NOTHING: it read the row, not the tree, and '
+            f"the row can be stale in either direction. Closing such a row is a judgement the "
+            f"building seat cannot make, so the ledger carries done-but-open rows by construction "
+            f"and every field here still says buildable. Read it before briefing it."
+        )
+    )
+
     if not act:
         missing = [k for k in ("verdict", "research", "closing-act") if k not in item.fields]
-        return "refuse", (
+        # REFUSE STILL WINS THE LEVEL -- the dispatch can name nothing here -- but not the whole
+        # message. Without the lead, the reader of a retired undeclared row is sent to add three
+        # banner lines to an item that must not be built at all. The already-built lead is here for
+        # the identical reason, and it comes second because a retirement is the stronger claim: it
+        # says the row is dead, where this one says the row may be finished.
+        undeclared = (
             f"declares no Closing-act (missing: {', '.join(missing)}). The dispatch cannot tell the "
             f"seat what would close this, or who closes it. Add the three lines to the banner."
         )
+        leads = [n for n in (retired_note, read_note) if n]
+        return "refuse", " ".join([*leads, undeclared])
 
     notes: list[str] = []
+
+    # THE RETIREMENT LEADS, ahead of the gated-verdict note that leads for the same reason. Both of
+    # the notes below tell a reader there is work to start: the gated one says scoping and research
+    # are legitimate, and the closing-act one ends "That is a complete outcome, not a failure". On a
+    # retired row there is no work to start, and the row it points at is where the work is.
+    # test_the_retirement_note_leads pins the order, because a comment cannot.
+    if retired_note:
+        notes.append(retired_note)
+
+    # AND THE ALREADY-BUILT NOTE LEADS THE REST, for that same reason: on a row whose work has
+    # shipped there is no work to start either. It sits behind the retirement note because a
+    # retirement is the stronger claim. test_the_must_be_read_note_leads pins this.
+    if read_note:
+        notes.append(read_note)
 
     # THIS BRANCH GOES FIRST, and the order is load-bearing rather than cosmetic. The closing-act
     # note below ends "That is a complete outcome, not a failure." Left to lead, it tells the reader
@@ -186,9 +479,128 @@ def judge(item: Item) -> tuple[str, str]:
             "Verdict is 'research' with no completed pass recorded, so the question may still be "
             "open. Read the item's CURRENT body before briefing it."
         )
+    # ORDER MATTERS HERE AND A SWAP IS SILENT. `read` is tested BEFORE `advise` because most rows
+    # that fire the already-built needle also earn an advise reason, so an `if notes` first would
+    # make this level unreachable on the live ledger while every fixture still passed.
+    if read_note:
+        return "read", " ".join(notes)
     if notes:
         return "advise", " ".join(notes)
     return "ok", f"closes by {act!r}, performed by {CLOSING_SEAT.get(act, 'the builder')}"
+
+
+# ASKING THE TREE IS A SEPARATE LIMB FROM `judge`, AND THE SPLIT IS DELIBERATE (BACKLOG #1398).
+#
+# `judge` is pure and reads ONE item. This reads git, once per WAVE rather than once per row, and it
+# fails in ways a ledger read cannot: an unfetched ref, a shallow clone, no remote at all. Fusing the
+# two would put I/O -- and a failure mode that must degrade LOUDLY rather than return a level --
+# inside a function whose whole contract is "no body, no claim", and every existing test of `judge`
+# would start needing a repository to run.
+#
+# ONLY THE JOINED FORM ELEVATES, AND THE WEAKER LEVEL IS LEFT TO THE STANDALONE SCREEN. A bare `#N`
+# spells a pull-request number just as well as an item number, and the two namespaces are
+# indistinguishable by shape; the screen's own docstring measures the difference at twelve extra open
+# rows. On the dispatch path that ambiguity buys nothing a reader can act on, so this consults
+# `Finding.strict` and never `Finding.loose`. Run the screen directly to see MENTIONED rows.
+#
+# WHERE THE TREE NOTE SITS IN THE MESSAGE IS DECIDED BY THE LEVEL, and it is not cosmetic. A `read`
+# or `refuse` note already OPENS with a stop-and-read sentence -- a retirement declaration, the row's
+# own already-built claim, or "the dispatch cannot name anything at all here". A retirement is the
+# strongest claim this file makes and `test_the_retirement_note_leads` pins that it leads, so a
+# weaker tree signal must not displace it: there the tree note is APPENDED. An `ok` or `advise` note
+# says the opposite -- that there is work to start -- so there the tree note LEADS, because on a row
+# of #1300's shape it is the only sentence in the whole output contradicting them.
+_TREE_LEADS = ("ok", "advise")
+
+#: How many citation locations a note quotes before it truncates. A reader whose next act is to open
+#: the file wants the line; a reader handed thirty of them reads none of them.
+TREE_LOCATIONS_SHOWN = 3
+
+
+def tree_note(ref: str, cited: tuple[str, ...]) -> str:
+    """The sentence a tree hit adds, worded so it cannot be read as a verdict.
+
+    **Both directions of wrongness are stated, because only one of them is intuitive.** A reader
+    guesses that a hit might be incidental. Almost nobody guesses the other way -- that a CLEAR row
+    can be finished work sitting on a branch nobody pushed -- and that is the half which sends
+    somebody to rebuild a shipped feature.
+
+    **No population figure travels in this note.** The flag rate is the reason this is a must-read
+    rather than a verdict, and it is dated and attributed in the module docstring instead. A constant
+    embedded in runtime output is a number nobody re-measures and everybody quotes.
+    """
+    shown = ", ".join(cited[:TREE_LOCATIONS_SHOWN])
+    if len(cited) > TREE_LOCATIONS_SHOWN:
+        shown += f", and {len(cited) - TREE_LOCATIONS_SHOWN} more"
+    return (
+        f"MUST BE READ -- LANDED CODE ON {ref} CITES THIS NUMBER: {shown}. THIS GATE HAS DECIDED "
+        f"NOTHING: it asked the tree, and 'code cites this number' is not the sentence 'this row is "
+        f"built'. A citation is not a completion -- landed code cites a row while FILING it, while "
+        f"testing around it, or while recording why it was NOT done. Read the row before a "
+        f"lane-window is spent on it."
+    )
+
+
+def cited_locations(found: Finding | None) -> tuple[str, ...]:
+    """The joined-form locations this gate will act on, and nothing else. Pure.
+
+    THE JOINED-FORM-ONLY DECISION LIVES HERE SO ONE TEST CAN PIN IT. Inlined at the call site it
+    would be a `.strict` attribute access nobody reads twice, and widening it to `.loose` would flood
+    the dispatch path with pull-request numbers that happen to match an item number.
+
+    The dispatch on ``.level`` is explicit rather than a truthiness test over ``.strict``, for the
+    reason :meth:`Finding.level` records in the screen: this gate's own scar is an ``if good`` over a
+    function that had started returning a level string, which made every level truthy.
+    """
+    if found is None or found.level != CITED:
+        return ()
+    return found.strict
+
+
+def merge_tree_finding(level: str, note: str, ref: str, cited: tuple[str, ...]) -> tuple[str, str]:
+    """Fold one row's tree answer into :func:`judge`'s answer. Pure, so it needs no repository.
+
+    ``cited`` is the joined-form locations for this row, empty when the tree said nothing. An empty
+    tuple returns ``(level, note)`` UNCHANGED and byte-identical, which is the same "no input, no
+    claim" contract ``judge`` keeps for a body nobody read: a caller that could not ask the tree must
+    get exactly the answer this gate gave before the limb existed, never a clear result it did not
+    measure.
+    """
+    if not cited:
+        return level, note
+    added = tree_note(ref, cited)
+    if level in _TREE_LEADS:
+        return "read", f"{added} {note}"
+    return level, f"{note} {added}"
+
+
+def ask_the_tree(
+    root: Path, nums: list[int], ref: str = DEFAULT_REF
+) -> tuple[dict[int, Finding], str | None]:
+    """``({num: Finding}, None)`` when the tree answered, ``({}, why)`` when it could not.
+
+    **A FAILURE HERE RETURNS A REASON, NEVER AN EMPTY RESULT, AND THE CALLER MUST SAY SO OUT LOUD.**
+    An unfetched ref, a shallow clone or a mistyped path list all return zero lines, which is
+    byte-identical to a tree where genuinely nothing is cited. Reporting that silently as "no row is
+    built" is the false zero the screen's own controls exist to catch, and it would reproduce the
+    exact failure this limb was added for while looking greener than before.
+
+    The controls are the screen's, run on every invocation, and a control that did not hold discards
+    the whole sweep rather than qualifying it. A reader handed a plausible listing under a caveat
+    keeps the listing and forgets the caveat.
+    """
+    try:
+        resolve_ref(root, ref)
+        sightings = sweep(root, ref)
+        broken = check_controls(sightings) + check_agreement(root, ref, sightings)
+    except InstrumentError as exc:
+        return {}, str(exc)
+    if broken:
+        return {}, (
+            "the screen's controls did not hold, so no tree result would be evidence: "
+            + "; ".join(broken)
+        )
+    return {f.num: f for f in screen(nums, sightings)}, None
 
 
 def _self_test() -> int:
@@ -200,10 +612,50 @@ def _self_test() -> int:
         it.fields.update(fields)
         return it
 
-    cases: list[tuple[dict[str, str], str, str]] = [
-        ({}, "refuse", "an item declaring nothing has nothing to name"),
+    # A RETIRED BODY, WORDED AS THE LEDGER WORDS IT. #1332's declaration, with the number changed.
+    retired_body = (
+        "## 4242. Scope the widget to the caller's allowed_channels\n\n"
+        "**RETIRED THE HOUR IT WAS FILED -- THIS IS A DUPLICATE OF `#1152` AND SHOULD NOT BE BUILT.\n"
+        "The number is kept, retired in place, because commits and mail already cite it.**\n"
+    )
+    withdrawn_body = "## 4244. WITHDRAWN -- duplicate of #1310, same defect, same fix\n"
+    # The row that DOCUMENTS the convention. A bare-word needle stops it; these needles must not.
+    documents_body = (
+        "## 4245. The gate green-lights the verdicts that mean do not just build it\n\n"
+        "An item retired in place keeps its number, its banner and its fields -- the established\n"
+        "convention. | `#1332` | **retired in place**, duplicate of `#1086` | `build` / `code` |\n"
+    )
+
+    # AN ALREADY-BUILT BODY, WORDED AS THE LEDGER WORDS IT. #1107's declaration, number changed.
+    shipped_body = (
+        "## 4248. research an honest pass for ASVS 1.2.2\n\n"
+        "**SHIPPED IN `#488` AT `cf38e16a`, AND STILL OPEN ON PURPOSE. DO NOT REBUILD IT.** The\n"
+        "build landed; the banner has not moved because closing it is a judgement this seat cannot\n"
+        "make alone.\n"
+    )
+    # #1242's shape, and it is the whole reason the banner is read. Its declaration is a BLOCKQUOTE
+    # inside the banner block, and its prose region is two lines long.
+    shipped_in_banner = (
+        "> **THE CORRECTION IS ALREADY BUILT AND PUSHED. Do not rebuild it.**\n"
+        "> Closing-act: code\n"
+    )
+    # THE SELF-REFERENCE TWIN, and it is #1393's own table verbatim with the numbers changed. This
+    # row DESCRIBES the class the needle detects, so a needle allowed to start mid-line stops the
+    # only row that explains the trap.
+    quotes_the_declarations = (
+        "## 4249. four open rows say their work ALREADY SHIPPED and must not be rebuilt\n\n"
+        "| row | the sentence in it |\n"
+        "|---|---|\n"
+        '| #4248 | "SHIPPED IN `#488` AT `cf38e16a`, AND STILL OPEN ON PURPOSE. '
+        '**DO NOT REBUILD IT.**" |\n'
+    )
+
+    cases: list[tuple[dict[str, str], str, str, str, str]] = [
+        ({}, "", "", "refuse", "an item declaring nothing has nothing to name"),
         (
             {"closing-act": "code", "verdict": "build", "research": "none"},
+            "",
+            "",
             "ok",
             "a build item the seat can close itself",
         ),
@@ -213,52 +665,179 @@ def _self_test() -> int:
                 "verdict": "research",
                 "research": "done 2026-08-20",
             },
+            "",
+            "",
             "advise",
             "THE WAVE SHAPE IS WORKABLE AND MUST BE ADVISED, NEVER REFUSED -- refusing it would "
             "have blocked #1112, #1171 and #1187, all of which reached main",
         ),
         (
             {"closing-act": "code", "verdict": "research", "research": "none"},
+            "",
+            "",
             "advise",
             "an open research question is a warning to read the body, not a bar to working it",
         ),
         (
             {"closing-act": "code", "verdict": "research", "research": "done 2026-08-20"},
+            "",
+            "",
             "ok",
             "research done, closing act is code",
         ),
         (
             {"closing-act": "code", "verdict": "demand-gate", "research": "none"},
+            "",
+            "",
             "advise",
             "a demand gate means the DEMAND is unproven -- shipping the code does not close it",
         ),
         (
             {"closing-act": "code", "verdict": "demand-gate", "research": "done 2026-08-20"},
+            "",
+            "",
             "advise",
             "THE DISCRIMINATOR: a demand gate is lifted by a RULING, never by finished research, so "
             "mirroring the research branch's guard here would wrongly re-green this",
         ),
         (
             {"closing-act": "code", "verdict": "owner-ruling", "research": "none"},
+            "",
+            "",
             "advise",
             "an owner-ruling verdict routes the scope question to the owner before anyone builds",
         ),
         (
             {"closing-act": "code", "verdict": "owner-ruling", "research": "done 2026-08-20"},
+            "",
+            "",
             "advise",
             "DISCRIMINATOR TWIN: research done does not answer a question routed to the owner",
         ),
+        (
+            {"closing-act": "code", "verdict": "build", "research": "none"},
+            retired_body,
+            "",
+            "advise",
+            "THE RETIREMENT CASE: identical fields to the ok case above, and only the body differs. "
+            "#1332 graded ok here, byte-identical to an ordinary build item",
+        ),
+        (
+            {"closing-act": "code", "verdict": "build", "research": "none"},
+            withdrawn_body,
+            "",
+            "advise",
+            "#1311's shape: WITHDRAWN in the heading, and its body never says 'not be built', so the "
+            "body needle misses it entirely",
+        ),
+        (
+            {"closing-act": "code", "verdict": "build", "research": "none"},
+            documents_body,
+            "",
+            "ok",
+            "THE FALSE-POSITIVE TWIN: prose DOCUMENTING the convention is not a retirement, and a "
+            "bare-word needle would stop the row that describes the rule",
+        ),
+        (
+            {"closing-act": "code", "verdict": "build", "research": "none"},
+            shipped_body,
+            "",
+            "read",
+            "THE ALREADY-BUILT CASE: identical fields to the ok case, only the body differs. #1107, "
+            "#1130 and #1183 all carry this sentence and all three dispatched without it being said",
+        ),
+        (
+            {"closing-act": "code", "verdict": "build", "research": "none"},
+            "## 4250. a lossy writer\n\nCluster: security tooling.\n",
+            shipped_in_banner,
+            "read",
+            "#1242's shape: the declaration is in the BANNER, so a prose-only read loses one of the "
+            "four rows this limb exists for",
+        ),
+        (
+            {"closing-act": "code", "verdict": "build", "research": "none"},
+            quotes_the_declarations,
+            "",
+            "ok",
+            "THE SELF-REFERENCE TWIN: #1393's own table QUOTES all four declarations, so a needle "
+            "allowed to start after a table pipe flags the row that documents the trap",
+        ),
+        (
+            {"closing-act": "scorecard-rescore", "verdict": "research", "research": "none"},
+            shipped_body,
+            "",
+            "read",
+            "MUST BE READ OUTRANKS ADVISE: #1107's real shape, where the advise reasons are present "
+            "too and would otherwise take the headline off a row that may already be built",
+        ),
     ]
-    for fields, want, why in cases:
-        got, reason = judge(mk(fields))
+    for fields, body, banner, want, why in cases:
+        got, reason = judge(mk(fields), body=body, banner=banner)
         if got != want:
             failures.append(f"{why}: wanted {want!r}, got {got!r} ({reason})")
+
+    # THE TREE LIMB'S OWN PAIR, RUN WITHOUT A REPOSITORY (BACKLOG #1398). A merge proven on one side
+    # proves nothing: a fold that elevates every row and one that elevates none both look correct
+    # against a single-sided check, and both are silent. So the cited arm must MOVE the level and the
+    # clear arm must leave it byte-identical.
+    hit = ("tests/test_x.py:1",)
+    merges: list[tuple[str, str, tuple[str, ...], str, bool, str]] = [
+        ("ok", "closes by 'code'", hit, "read", True, "a cited row is not dispatchable in silence"),
+        (
+            "ok",
+            "closes by 'code'",
+            (),
+            "ok",
+            False,
+            "THE NEGATIVE ARM: a clear row must come back byte-identical, never a fresh claim. A "
+            "fold that elevates everything passes the arm above and fails this one",
+        ),
+        (
+            "advise",
+            "closes by 'scorecard-rescore'",
+            hit,
+            "read",
+            True,
+            "MUST BE READ OUTRANKS ADVISE for the same reason the row's own claim does: an advise "
+            "row is workable, and a row that may be shipped costs a whole lane-window",
+        ),
+        (
+            "refuse",
+            "declares no Closing-act",
+            hit,
+            "refuse",
+            False,
+            "REFUSE STILL WINS THE LEVEL. The dispatch can name nothing on an undeclared row, and a "
+            "tree hit does not change that -- it rides in the note instead",
+        ),
+        (
+            "read",
+            "MUST BE READ -- THE ROW SAYS THIS WORK IS ALREADY BUILT.",
+            hit,
+            "read",
+            False,
+            "THE ROW'S OWN CLAIM KEEPS THE LEAD. It is the stronger, more specific sentence, and "
+            "the pinned note orderings above must not be displaced by a weaker signal",
+        ),
+    ]
+    for level, note, cited, want_level, want_lead, why in merges:
+        got_level, got_note = merge_tree_finding(level, note, "origin/main", cited)
+        leads = got_note.startswith("MUST BE READ -- LANDED CODE")
+        if got_level != want_level or leads != want_lead:
+            failures.append(
+                f"{why}: wanted {want_level!r} lead={want_lead}, got {got_level!r} lead={leads}"
+            )
+        if not cited and got_note != note:
+            failures.append(f"{why}: a clear row must return the note unchanged, got {got_note!r}")
 
     for line in failures:
         print(f"SELF-TEST FAIL: {line}", file=sys.stderr)
     if failures:
         return 1
-    print(f"self-test PASS: {len(cases)} cases; the wave shape is ADVISED, not refused")
+    print(
+        f"self-test PASS: {len(cases)} judge cases and {len(merges)} tree-merge cases, including "
+        f"both arms of the control pair; the wave shape is ADVISED, not refused"
+    )
     return 0
 
 
@@ -281,7 +860,22 @@ def main(argv: list[str] | None = None) -> int:
         "--refuse",
         action="store_true",
         help="exit 1 when any item is UNDECLARED or unknown. OFF by default: a dispatch names "
-        "closing acts, it does not block work.",
+        "closing acts, it does not block work. A tree hit never affects this.",
+    )
+    # ON BY DEFAULT, AND THAT IS THE WHOLE CHANGE. An opt-in tree check is a tree check nobody runs,
+    # and the failure it catches is invisible to every reader who does not run it -- which is how
+    # #1300 was dispatched in the first place. The escape exists for a checkout with no remote.
+    ap.add_argument(
+        "--no-tree",
+        action="store_true",
+        help="do not ask the tree whether landed code cites these rows. The gate then cannot see a "
+        "row that is fully built with nothing in its text saying so, and says so in its output.",
+    )
+    ap.add_argument(
+        "--tree-ref",
+        default=DEFAULT_REF,
+        help=f"the tree to ask (default {DEFAULT_REF}). LANDED code is the subject: a branch nobody "
+        f"pushed is invisible here by design.",
     )
     ap.add_argument("--self-test", action="store_true")
     args = ap.parse_args(argv)
@@ -295,7 +889,7 @@ def main(argv: list[str] | None = None) -> int:
     if not wanted:
         ap.error("name at least one item, or a --range, or pass --self-test")
 
-    items = load_items(args.root)
+    items = load_ledger(args.root)
     if len(items) < MIN_ITEMS:
         print(
             f"INSTRUMENT ERROR: parsed {len(items)} items from {args.root}, below the floor of "
@@ -304,30 +898,60 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 1
 
+    asked = sorted(set(wanted))
+    tree: dict[int, Finding] = {}
+    tree_off = "--no-tree given" if args.no_tree else None
+    if not args.no_tree:
+        tree, tree_off = ask_the_tree(args.root, asked, args.tree_ref)
+
     ok: list[tuple[int, str]] = []
     advise: list[tuple[int, str]] = []
+    must_read: list[tuple[int, str]] = []
     refused: list[tuple[int, str]] = []
     unknown: list[int] = []
-    for num in sorted(set(wanted)):
-        item = items.get(num)
-        if item is None:
+    tree_hits = 0
+    for num in asked:
+        row = items.get(num)
+        if row is None:
             unknown.append(num)
             continue
-        level, note = judge(item)
+        level, note = judge(row.item, body=row.body, banner=row.banner)
+        cited = cited_locations(tree.get(num))
+        if cited:
+            tree_hits += 1
+        level, note = merge_tree_finding(level, note, args.tree_ref, cited)
         # Explicit dispatch on the level. The first version did `if good` on judge()'s return, and
         # when judge started returning a LEVEL STRING every level became truthy -- an undeclared
         # item reported as dispatchable. A truthiness test over a widened return type is exactly the
-        # silent-wrong-answer shape this tool exists to catch.
-        {"ok": ok, "advise": advise, "refuse": refused}[level].append((num, note))
+        # silent-wrong-answer shape this tool exists to catch. A level missing from this map is a
+        # KeyError here, which is the loud failure that shape lacked.
+        {"ok": ok, "advise": advise, "read": must_read, "refuse": refused}[level].append(
+            (num, note)
+        )
 
-    print(f"items closing by the builder's own act: {len(ok)} of {len(set(wanted))}")
+    print(f"items closing by the builder's own act: {len(ok)} of {len(asked)}")
     print(f"  ledger parsed: {len(items)} items from {args.root}")
+    # THE TREE LINE PRINTS AT THE TOP WHETHER OR NOT THE TREE ANSWERED, and a failure prints the
+    # reason rather than nothing. A limb that degrades quietly is worse than no limb: the output
+    # looks the same, one whole class of row stops being detected, and the reader has no way to tell.
+    if tree_off is None:
+        print(
+            f"  tree asked: {args.tree_ref} over {' '.join(SEARCH_PATHS)} -- landed code cites "
+            f"{tree_hits} of {len(asked)} rows in this wave"
+        )
+    else:
+        print(f"  TREE NOT ASKED: {tree_off}")
     print()
 
     for num in unknown:
         print(f"  #{num}: NOT IN THE LEDGER")
     for num, note in refused:
         print(f"  #{num}: UNDECLARED -- {note}")
+    # MUST BE READ prints ahead of the workable rows because it is the only line here that can cost
+    # a whole lane-window if a reader skips it. No bucket label: the note already opens with the
+    # words, and a label would print them twice.
+    for num, note in must_read:
+        print(f"  #{num}: {note}")
     for num, note in advise:
         print(f"  #{num}: workable -- {note}")
     if args.explain:
@@ -340,6 +964,27 @@ def main(argv: list[str] | None = None) -> int:
         "ships the code and the item stays open until its named seat closes it. What the 2026-08-21\n"
         "wave lacked was the NAME, not permission -- nobody was told the closing act was elsewhere."
     )
+    if must_read:
+        print(
+            "A MUST BE READ ROW IS NOT REFUSED, AND --refuse DOES NOT BLOCK ON ONE. A row can be\n"
+            "stale in either direction, whether the claim came from its own sentence or from the\n"
+            "tree. Blocking on it would rebuild the screen #1394 records, which discarded 46\n"
+            "percent of the live ledger on a token match."
+        )
+    if tree_off is None:
+        print(
+            "CLEAR IS NOT PROOF OF UNBUILT, AND THIS IS THE HALF NOBODY GUESSES. The tree above is\n"
+            "LANDED code, and built work does not always land: a row finished onto a branch that\n"
+            "never reached origin comes back clear here, and the strongest signal this gate has\n"
+            "would have missed a finished job. A tree hit is a four-minute read, never a verdict."
+        )
+    else:
+        print(
+            "THE TREE WAS NOT ASKED, so this run cannot see a row that is fully built and shipped\n"
+            "with NOTHING IN ITS TEXT SAYING SO. Every level above came from prose somebody wrote\n"
+            "about the code. That is the class #1300 belongs to, and no amount of careful reading\n"
+            "finds it. Re-run without --no-tree, or fetch the ref, before spending a lane-window."
+        )
     if args.refuse and (refused or unknown):
         print("--refuse given: the wave contains undeclared or unknown items.")
         return 1

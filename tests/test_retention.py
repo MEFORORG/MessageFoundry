@@ -256,6 +256,175 @@ async def test_purge_dead_letters_respects_window_and_is_idempotent(store: Messa
     assert await store.purge_dead_letters(older_than=10 * DAY) == 0
 
 
+# --- the dead-letter window reaches EVERY stage, not just outbound (#1188) ----
+#
+# A router raise dead-letters the INGRESS row and a handler raise dead-letters the ROUTED row
+# (wiring_runner._apply_router_internal_error / _apply_transform_internal_error). Both rows carry the
+# full raw body in `queue.payload`. They are `dead`, so they are neither pending nor inflight — which
+# means purge_message_bodies finds the message ELIGIBLE and blanks `messages.raw`, and the message
+# then reads as purged while a full raw PHI body survives in the queue row. Scoping the dead-letter
+# purge to `stage='outbound'` left that body unreachable by any sweep (ASVS 14.2.7).
+#
+# Riding the dead-letter window is the symmetric answer, not a widening of convenience: `replay()`
+# recovers "a dead-lettered ingress/routed row" by re-queueing it in place from its OWN payload, so
+# such a row is replayable-until-purged in exactly the sense that justified giving dead outbound rows
+# their own, later window.
+
+
+async def _dead_ingress(
+    store: MessageStore, *, now: float, raw: str = "MSH|^~\\&|raw-ingress-dead"
+) -> tuple[str, str]:
+    """Drive a message to a DEAD **ingress** row — the shape a router raise leaves behind."""
+    from messagefoundry.store.store import Stage
+
+    mid = await store.enqueue_ingress(channel_id="c1", raw=raw, control_id="CID-ING", now=now)
+    item = await store.claim_next_fifo("c1", stage=Stage.INGRESS.value, now=now)
+    assert item is not None
+    await store.dead_letter_now(item.id, "router error: boom", now=now)
+    return mid, item.id
+
+
+async def _dead_routed(
+    store: MessageStore, *, now: float, raw: str = "MSH|^~\\&|raw-routed-dead"
+) -> tuple[str, str]:
+    """Drive a message to a DEAD **routed** row — the shape a handler raise leaves behind."""
+    from messagefoundry.store import MessageStatus
+    from messagefoundry.store.store import Stage
+
+    mid = await store.enqueue_ingress(channel_id="c1", raw=raw, control_id="CID-ROU", now=now)
+    ingress = await store.claim_next_fifo("c1", stage=Stage.INGRESS.value, now=now)
+    assert ingress is not None
+    assert await store.route_handoff(
+        ingress_id=ingress.id,
+        message_id=mid,
+        channel_id="c1",
+        handlers=[("h1", raw)],
+        disposition=MessageStatus.ROUTED,
+        now=now,
+    )
+    item = await store.claim_next_fifo("c1", stage=Stage.ROUTED.value, now=now)
+    assert item is not None
+    await store.dead_letter_now(item.id, "handler error: boom", now=now)
+    return mid, item.id
+
+
+async def test_purge_dead_letters_reaches_a_dead_ingress_row(store: MessageStore) -> None:
+    """A router-stage dead letter holds the whole raw body; it must ride the dead-letter window."""
+    mid, ingress_id = await _dead_ingress(store, now=5 * DAY)
+    assert await _payload(store, ingress_id) != ""  # precondition: the raw is in the queue row
+
+    # The hazard this closes: the message window blanks `messages.raw`, so the message READS as
+    # purged while the ingress row still holds the same body.
+    assert await store.purge_message_bodies(older_than=10 * DAY) == 1
+    assert (await store.get_message(mid))["raw"] == ""
+    assert await _payload(store, ingress_id) != ""  # ...and the body is still here
+
+    # Its own (later) window then blanks it, keeping the row + DEAD status (counts/disposition).
+    assert await store.purge_dead_letters(older_than=1 * DAY) == 0  # window not yet elapsed
+    assert await store.purge_dead_letters(older_than=10 * DAY) == 1
+    assert await _payload(store, ingress_id) == ""
+    assert await store.purge_dead_letters(older_than=10 * DAY) == 0  # idempotent
+
+    cur = await store._db.execute("SELECT status FROM queue WHERE id=?", (ingress_id,))
+    assert (await cur.fetchone())["status"] == OutboxStatus.DEAD.value
+
+
+async def test_purge_dead_letters_reaches_a_dead_routed_row(store: MessageStore) -> None:
+    """A transform-stage dead letter carries the raw the handler re-parses — same window."""
+    _, routed_id = await _dead_routed(store, now=0.0)
+    assert await _payload(store, routed_id) != ""
+
+    assert await store.purge_dead_letters(older_than=10 * DAY) == 1
+    assert await _payload(store, routed_id) == ""
+    assert await store.purge_dead_letters(older_than=10 * DAY) == 0
+
+    cur = await store._db.execute("SELECT status FROM queue WHERE id=?", (routed_id,))
+    assert (await cur.fetchone())["status"] == OutboxStatus.DEAD.value
+
+
+async def test_dead_ingress_row_does_not_pin_a_streaming_attachment_forever(
+    store: MessageStore,
+) -> None:
+    """The same defect over-retained the DETACHED document, not only the queue body.
+
+    ``_attachment_still_referenced_sql`` is already stage-agnostic: a ``dead`` row with a non-blank
+    payload counts as a live holder whatever its stage. So an unreachable dead ingress row also kept
+    the message's streaming attachment (a very large PHI document) alive with no sweep able to
+    release it. Blanking the row on its own window makes the predicate go false and the decref fire."""
+    ref = await store.put_attachment(["JVBERi0xLjQ=synthetic-report"], "application/pdf")
+    mid = await store.enqueue_ingress(
+        channel_id="c1",
+        raw="MSH|^~\\&|raw-attached",
+        control_id="CID-ATT",
+        attachment_refs=[ref],
+        now=0.0,
+    )
+    from messagefoundry.store.store import Stage
+
+    item = await store.claim_next_fifo("c1", stage=Stage.INGRESS.value, now=0.0)
+    assert item is not None
+    await store.dead_letter_now(item.id, "router error: boom", now=0.0)
+
+    # The message body purge cannot release it: the dead ingress row is still a live holder.
+    await store.purge_message_bodies(older_than=10 * DAY)
+    assert await _attachment_rows(store, mid) == 1
+
+    # The dead-letter window blanks the row and releases the last holder in the same transaction.
+    assert await store.purge_dead_letters(older_than=10 * DAY) == 1
+    assert await _attachment_rows(store, mid) == 0
+
+
+async def _attachment_rows(store: MessageStore, message_id: str) -> int:
+    cur = await store._db.execute(
+        "SELECT COUNT(*) AS n FROM message_attachment WHERE message_id=?", (message_id,)
+    )
+    return int((await cur.fetchone())["n"])
+
+
+#: Stage predicates each backend's `purge_dead_letters` BODY may still carry, and why. The two body
+#: statements (the payload blank and the attachment release) must be stage-agnostic on all three; the
+#: ONE survivor is SQLite's store-once `body_ref` release, which is legitimately outbound-scoped
+#: because `body_ref` is written only by `_insert_outbound_deliveries`.
+_ALLOWED_STAGE_PREDICATES = {"sqlite": 1, "postgres": 0, "sqlserver": 0}
+
+
+def test_no_backend_scopes_the_dead_letter_purge_to_one_stage() -> None:
+    """The #1188 widening must hold on all THREE backends, and only one of them runs locally.
+
+    The Postgres and SQL Server purges execute on hosted runners only, so a re-narrowing there would
+    reach `main` unseen by anyone working on SQLite. This reads the shipped source instead: a stage
+    predicate reappearing in a purge body reds here, on every runner, with no database.
+    """
+    import inspect
+
+    from messagefoundry.store.postgres import PostgresStore
+    from messagefoundry.store.sqlserver import SqlServerStore
+
+    backends = {
+        "sqlite": MessageStore,
+        "postgres": PostgresStore,
+        "sqlserver": SqlServerStore,
+    }
+    for name, cls in backends.items():
+        src = inspect.getsource(cls.purge_dead_letters)
+        # Drop the docstring: it DISCUSSES the outbound stage at length, so counting the whole source
+        # would measure the prose rather than the SQL.
+        parts = src.split('"""')
+        assert len(parts) >= 3, (
+            f"{name}: purge_dead_letters lost its docstring; this parse is stale"
+        )
+        body = parts[2]
+        found = body.count("stage=?") + body.count("stage=$1")
+        assert found == _ALLOWED_STAGE_PREDICATES[name], (
+            f"{name}: purge_dead_letters carries {found} stage predicate(s), expected "
+            f"{_ALLOWED_STAGE_PREDICATES[name]}. Scoping this purge to one stage is the #1188 defect: "
+            f"a dead ingress/routed row holds the full raw PHI body, its message still body-purges "
+            f"(dead is neither pending nor inflight), and the body then survives with no sweep able to "
+            f"reach it. If you added a legitimately outbound-only statement, raise the count here and "
+            f"say why in the same commit."
+        )
+
+
 # --- purge_search_presets (ADR 0136 saved searches, ASVS 14.2.7 Tier 2) -------
 
 

@@ -58,9 +58,13 @@ async def _store_with_admin(*, email: str | None, disabled: bool = False) -> Mes
         boot = await service.initialize()
         assert boot is not None
         admin = await store.get_user_by_username("admin")
-        assert admin is not None and admin.email is None  # the defect's own starting state
+        assert admin is not None and admin.notify_email is None  # the defect's own starting state
         if email is not None:
-            await store.update_user_profile(admin.id, display_name=None, email=email)
+            # ``set_user_notify_email``, NOT ``update_user_profile`` (BACKLOG #1139). The profile
+            # write moves the directory mirror, and the gate under test reads the engine-owned
+            # notification address. Setting the mirror here would build a store the gate correctly
+            # calls unreachable, and the test would then be measuring the wrong column.
+            await store.set_user_notify_email(admin.id, email=email)
         if disabled:
             await store.set_user_disabled(admin.id, disabled=True)
     except BaseException:
@@ -118,7 +122,7 @@ async def test_phi_enforce_refuses_when_no_admin_has_an_address() -> None:
         with pytest.raises(RuntimeError) as exc:
             await _call(store)
         assert "refusing to start" in str(exc.value)
-        assert "no enabled Administrator has an email address" in str(exc.value)
+        assert "no enabled Administrator has a notification address" in str(exc.value)
     finally:
         await store.close()
 
@@ -233,7 +237,7 @@ async def test_the_LIFESPAN_refuses_and_not_merely_the_predicate(tmp_path: Path)
         async with app.router.lifespan_context(app):
             pass  # pragma: no cover -- startup must not reach here
     assert "refusing to start" in str(exc.value)
-    assert "no enabled Administrator has an email address" in str(exc.value)
+    assert "no enabled Administrator has a notification address" in str(exc.value)
 
 
 async def test_the_same_app_starts_cleanly_under_warn(tmp_path: Path) -> None:

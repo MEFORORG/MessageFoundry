@@ -151,6 +151,8 @@ from messagefoundry.store.store import (
     not_deployed_detail,
     owned_lane_scope,
     password_claim_set,
+    require_notify_email,
+    seed_notify_email,
     should_record_event,
 )
 
@@ -526,7 +528,11 @@ _SCHEMA: list[str] = [
         username             TEXT NOT NULL UNIQUE,
         auth_provider        TEXT NOT NULL,
         display_name         TEXT,
+        -- BACKLOG #1139: `email` is the PROFILE address / directory mirror (overwritten from the
+        -- directory `mail` attribute on every AD login); `notify_email` is the ENGINE-OWNED
+        -- notification target, seeded once at creation and never written by the directory sync.
         email                TEXT,
+        notify_email         TEXT,
         disabled             BOOLEAN NOT NULL DEFAULT FALSE,
         created_at           DOUBLE PRECISION NOT NULL,
         updated_at           DOUBLE PRECISION NOT NULL,
@@ -684,7 +690,10 @@ _SCHEMA: list[str] = [
 # Leaning on that coincidence is the trap the contract exists to close — a later edit confined to
 # _migrate_lease_columns would move nothing, and an already-open DB would take the schema_meta fast
 # path straight past it.
-_MIGRATION_REV = 2
+# 3 (BACKLOG #1139): the users.notify_email ADD + its one-time seed land in the same function, for the
+# same reason and with the same caveat — the users CREATE TABLE in _SCHEMA moved too, so the hash would
+# shift without this bump, and relying on that is the trap the paragraph above names.
+_MIGRATION_REV = 3
 
 
 def _schema_hash() -> str:
@@ -1149,6 +1158,15 @@ class PostgresStore:
                 "UPDATE users SET password_claimed_at = password_changed_at"
                 " WHERE must_change_password = FALSE AND password_hash IS NOT NULL"
             )
+        # The engine-owned notification address (BACKLOG #1139). NULL on an existing row would read as
+        # "no address on file", which excludes the account from every out-of-band security notice — so
+        # the ADD is paired with a one-time seed from the column that IS the notification target today.
+        # The seed MUST stay inside this creation guard: hoisted out it becomes a permanent SECOND
+        # writer, and every directory login would then copy the directory's address back over the
+        # engine's, restoring the exact defect the split removes.
+        if "notify_email" not in users_cols:
+            await conn.execute("ALTER TABLE users ADD COLUMN notify_email TEXT")
+            await conn.execute("UPDATE users SET notify_email = email WHERE email IS NOT NULL")
         sessions_has_mfa = await conn.fetch(
             "SELECT 1 FROM information_schema.columns"
             " WHERE table_name='sessions' AND column_name='mfa_verified_at'"
@@ -4872,18 +4890,18 @@ class PostgresStore:
     ) -> tuple[str, list[Any]]:
         """Build the ``(where, params)`` (``$1``-based) for :meth:`purge_dead_letters`' attachment
         release: the messages owning a dead row purged in this window whose LAST replayable row is now
-        gone. ``$1``=OUTBOUND stage, ``$2``=DEAD status, cutoff from ``$3``. Mirrors SQLite."""
+        gone. ``$1``=DEAD status, cutoff from ``$2``. Mirrors SQLite — stage-agnostic since #1188, so a
+        message whose last replayable row is a dead INGRESS row releases its attachment here too."""
         cutoff_sql, cutoff_params, idx = _pg_cutoff_case(
-            "q0.destination_name", older_than, connection_cutoffs, start=3
+            "q0.destination_name", older_than, connection_cutoffs, start=2
         )
         still = self._attachment_still_referenced_sql("q0.message_id", idx, idx + 1)
         where = (
             "message_id IN (SELECT DISTINCT q0.message_id FROM queue q0"
-            f" WHERE q0.stage=$1 AND q0.status=$2 AND q0.updated_at < {cutoff_sql}"
+            f" WHERE q0.status=$1 AND q0.updated_at < {cutoff_sql}"
             f" AND NOT {still})"
         )
         params = [
-            Stage.OUTBOUND.value,
             OutboxStatus.DEAD.value,
             *cutoff_params,
             [OutboxStatus.PENDING.value, OutboxStatus.INFLIGHT.value],
@@ -6285,15 +6303,16 @@ class PostgresStore:
     ) -> None:
         now = time.time() if now is None else now
         await self._execute(
-            "INSERT INTO users (id, username, auth_provider, display_name, email, disabled,"
-            " created_at, updated_at, last_login_at, password_hash, password_changed_at,"
+            "INSERT INTO users (id, username, auth_provider, display_name, email, notify_email,"
+            " disabled, created_at, updated_at, last_login_at, password_hash, password_changed_at,"
             " must_change_password, failed_attempts, locked_until)"
-            " VALUES ($1,$2,$3,$4,$5,FALSE,$6,$6,NULL,$7,$8,$9,0,NULL)",
+            " VALUES ($1,$2,$3,$4,$5,$6,FALSE,$7,$7,NULL,$8,$9,$10,0,NULL)",
             user_id,
             username,
             auth_provider,
             display_name,
             email,
+            seed_notify_email(email),
             now,
             password_hash,
             now if password_hash is not None else None,
@@ -6450,6 +6469,10 @@ class PostgresStore:
         email: str | None,
         now: float | None = None,
     ) -> None:
+        """Write the account's profile fields. **This is the directory-sync write** — ``_upsert_ad_user``
+        calls it on every AD/OIDC login — so it deliberately does NOT name ``notify_email`` (BACKLOG
+        #1139). Adding that column to this SET list would hand the directory the notification target
+        back and restore the defect the split removes."""
         now = time.time() if now is None else now
         await self._execute(
             "UPDATE users SET display_name=$1, email=$2, updated_at=$3 WHERE id=$4",
@@ -6457,6 +6480,20 @@ class PostgresStore:
             email,
             now,
             user_id,
+        )
+
+    async def set_user_notify_email(
+        self, user_id: str, *, email: str, now: float | None = None
+    ) -> None:
+        """Repoint the account's engine-owned notification address (BACKLOG #1139).
+
+        The parameter is ``str``, so a clear is unrepresentable; :func:`require_notify_email` rejects
+        the whitespace-only string that would mean the same thing. That refusal is the durability rule.
+        """
+        cleaned = require_notify_email(email)
+        now = time.time() if now is None else now
+        await self._execute(
+            "UPDATE users SET notify_email=$1, updated_at=$2 WHERE id=$3", cleaned, now, user_id
         )
 
     # --- WebAuthn credentials (WP-14b, ADR 0068) ------------------------------
@@ -7088,24 +7125,33 @@ class PostgresStore:
         now: float | None = None,
         connection_cutoffs: Mapping[str, float] | None = None,
     ) -> int:
-        """Null the bodies of dead-lettered **outbound** rows last updated before ``older_than`` (their
-        own retention window). Keeps the row + ``dead`` status; blanks ``payload`` + ``last_error``.
+        """Null the bodies of dead-lettered rows last updated before ``older_than`` (their own
+        retention window). Keeps the row + ``dead`` status; blanks ``payload`` + ``last_error``.
         Ported, not stubbed. Returns the number of dead rows purged.
+
+        **Every stage, not only outbound** (#1188, ASVS 14.2.7) — mirrors the SQLite backend. A dead
+        ``ingress``/``routed`` row holds the full raw body and is neither pending nor inflight, so its
+        message is body-purge-eligible: the outbound-only scope blanked ``messages.raw`` while that raw
+        survived in the queue row unreachable by any sweep. :meth:`replay` re-queues such a row from its
+        own payload, so it is replayable-until-purged exactly as a dead outbound row is. The stage
+        predicate is dropped rather than widened to a list, so a later stage is covered by construction.
 
         ``connection_cutoffs`` (#34, ADR 0027) optionally overrides the cutoff per ``destination_name``
         (``float('-inf')`` = keep forever); default empty ⇒ a single global cutoff, byte-identical to
-        the prior behaviour."""
+        the prior behaviour. An ingress/routed/response row has a NULL ``destination_name``, so
+        ``CASE NULL WHEN ...`` matches no arm and it takes the ``ELSE`` — always the global dead-letter
+        window (``dead_letter_days`` is declared on an OUTBOUND connection, so there is no inbound-keyed
+        override to honour)."""
         now = time.time() if now is None else now
-        # stage/status are $1/$2; the cutoff CASE (#34) numbers from $3 onward.
+        # status is $1; the cutoff CASE (#34) numbers from $2 onward.
         cutoff_sql, cutoff_params, _ = _pg_cutoff_case(
-            "destination_name", older_than, connection_cutoffs, start=3
+            "destination_name", older_than, connection_cutoffs, start=2
         )
         async with self._timed_acquire() as conn:  # noqa: SIM117
             async with conn.transaction():
                 result = await conn.execute(
                     "UPDATE queue SET payload='', last_error=NULL"
-                    f" WHERE stage=$1 AND status=$2 AND payload <> '' AND updated_at < {cutoff_sql}",
-                    Stage.OUTBOUND.value,
+                    f" WHERE status=$1 AND payload <> '' AND updated_at < {cutoff_sql}",
                     OutboxStatus.DEAD.value,
                     *cutoff_params,
                 )

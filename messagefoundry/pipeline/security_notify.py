@@ -29,6 +29,7 @@ from messagefoundry.auth.notifications import (
     MFA_ENABLED,
     PASSWORD_CHANGED,
     PASSWORD_RESET,
+    RECOVERY_CODE_USED,
     ROLES_CHANGED,
     SecurityEvent,
 )
@@ -50,6 +51,7 @@ _SUBJECTS = {
     ACCOUNT_DISABLED: "Your MessageFoundry account was disabled",
     MFA_ENABLED: "Two-factor authentication was enabled on your MessageFoundry account",
     MFA_DISABLED: "Two-factor authentication was disabled on your MessageFoundry account",
+    RECOVERY_CODE_USED: "A MessageFoundry recovery code was used on your account",
     ADMIN_NEW_IP: "A sensitive action on your MessageFoundry account from a new location",
 }
 
@@ -64,6 +66,10 @@ _DESCRIPTIONS = {
     ACCOUNT_DISABLED: "Your account was disabled by an administrator.",
     MFA_ENABLED: "A two-factor authenticator (TOTP) was enrolled on your account.",
     MFA_DISABLED: "Two-factor authentication was removed from your account.",
+    RECOVERY_CODE_USED: (
+        "One of your single-use recovery codes was accepted as a second factor. That code is now "
+        "spent and cannot be used again."
+    ),
     ADMIN_NEW_IP: (
         "A sensitive administrative action on your account was attempted from a client address that "
         "differs from your session's last verified address. It was required to re-verify before "
@@ -85,29 +91,52 @@ def _build_body(event: SecurityEvent) -> str:
         lines.append(f"Failed attempts: {failed}")
     if event.event_type == EMAIL_CHANGED:
         # BACKLOG #1139: an EMAIL_CHANGED carrying no ``new_email`` is a REMOVAL, not a repoint, and
-        # it must not render as the repoint wording minus a line. Two reasons this arm is worth its
-        # own sentence: "was changed" with the new value silently omitted reads as a truncated
-        # notice, and the holder needs to know the address is gone while they can still act.
+        # it must not render as the repoint wording minus a line. "Was changed" with the new value
+        # silently omitted reads as a truncated notice.
         #
-        # WHAT THIS SENTENCE MUST NOT SAY, and did until 2026-08-26: that this is the LAST notice
-        # the address will ever receive. Two shipped paths falsify that. ``users.email`` carries NO
-        # UNIQUE constraint on any of the three store backends -- only ``username`` does -- so a
-        # second account may hold the same address and keep notifying it. And ``admin_user_update``
-        # applies no ``_externally_managed`` guard, though this same module guards three other
-        # routes with one, so an admin may clear a directory account's address and
-        # ``_upsert_ad_user`` restores it on the next directory login.
+        # WHAT THIS SENTENCE MUST NOT SAY, and did until the column split: that the removal ends the
+        # account's notices. THREE things falsify it, and the third is now structural. ``users.email``
+        # carries NO UNIQUE constraint on any of the three store backends -- only ``username`` does --
+        # so a second account may hold the same address and keep notifying it. ``admin_user_update``
+        # applies no ``_externally_managed`` guard, though this same module guards three other routes
+        # with one, so an admin may clear a directory account's address and ``_upsert_ad_user``
+        # restores it on the next directory login. And the removal reaches the PROFILE MIRROR only:
+        # this notice is addressed to ``users.notify_email``, which no clear can strip --
+        # ``set_user_notify_email`` takes a non-empty ``str``. (The completeness claim that used to
+        # stand here, "every notice, this one included", is struck as a claim this renderer cannot
+        # make -- SDS-3.6. The addressing rule and its one exception are stated once, on
+        # ``SecurityEvent.email``.)
         #
         # A security notice written to make someone act NOW, resting on a promise the schema
-        # contradicts, is the compensating-control-on-a-false-premise shape SDS-3.7 forbids. Scope
-        # the claim to THIS ACCOUNT, which is true and is all the holder needs.
+        # contradicts, is the compensating-control-on-a-false-premise shape SDS-3.7 forbids. So this
+        # arm reports WHAT CHANGED and states the one thing the schema does guarantee, rather than
+        # forecasting what the address will or will not receive.
         new_email = event.detail.get("new_email")
         if new_email:
             lines.append(f"New email on file: {new_email}")
         else:
             lines.append(
-                "This address was removed from the account, so it will receive no further "
-                "security notices about this account."
+                "The email address on the account profile was removed. This notice went to the "
+                "account's notification address, which that removal did not change."
             )
+        if event.detail.get("source") == "directory":
+            # BACKLOG #1139. Say WHERE the change came from, because it changes what the reader can
+            # do about it: a directory-driven repoint is not editable in the console, so "contact
+            # your administrator" is the only action, and an unexplained change the holder cannot
+            # find a cause for reads as a compromise.
+            lines.append(
+                "This change came from your organization's directory, not from the MessageFoundry "
+                "console."
+            )
+    if event.event_type == RECOVERY_CODE_USED:
+        remaining = event.detail.get("remaining")
+        if isinstance(remaining, int):
+            lines.append(f"Recovery codes remaining: {remaining}")
+            if remaining == 0:
+                lines.append(
+                    "That was your last recovery code. Enroll a new authenticator to generate more, "
+                    "or you will need an administrator to reset your second factor."
+                )
     if event.client_ip:
         lines.append(f"Source IP: {event.client_ip}")
     lines += [
@@ -151,8 +180,13 @@ class SecurityEventNotifier(_BackgroundDispatcher[SecurityEvent]):
         self._trust_anchor_policy = trust_anchor_policy
 
     async def notify(self, event: SecurityEvent) -> None:
-        # No deliverable address (common for local accounts / unset email) → nothing to email; the
-        # audited /me/security-events feed still records it. Non-blocking enqueue.
+        # No deliverable address → nothing to email; the audited /me/security-events feed still
+        # records it. Non-blocking enqueue.
+        #
+        # **WHICH ADDRESS ``event.email`` HOLDS IS A CALLER'S PROPERTY, NOT AN INVARIANT THIS METHOD
+        # HOLDS**, and it used to be written here as one (BACKLOG #1139). The rule and its single
+        # exception are stated once on ``SecurityEvent.email``; this method enforces nothing beyond
+        # the drop below, so do not restate the rule here as though it did.
         if not event.email:
             return
         self._enqueue(event, dropped=f"{event.event_type} for {event.username}")

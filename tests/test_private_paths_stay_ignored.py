@@ -81,7 +81,15 @@ _TRACKED_EXCEPTIONS: dict[str, frozenset[str]] = {
     # runs, and docs/README.md lists it as step 6 of "Start here -- a new operator, in order" while
     # line 8 warns that it "is an operator tool, not a test plan". Its siblings are maintainer QA:
     # two drafts awaiting owner approval, and a matrix and plan scoped to one specific build box.
-    "/docs/testing/*": frozenset({"docs/testing/VERIFY.md"}),
+    #
+    # docs/testing/README.md is the second, and it is a MARKER rather than QA material -- the
+    # checkout-side answer to the rule above succeeding too well. With one file tracked here, a path
+    # cited under this tree is indistinguishable from work that was never done: a reader greps, finds
+    # nothing, and concludes the document does not exist. It does, in the vault. The marker says so
+    # in the one place a reader standing in the directory cannot miss it, and it is a POINTER rather
+    # than an index -- it names no vaulted document, because a path-to-document map over a closed set
+    # discloses what is NOT covered by subtraction. See BACKLOG #1435.
+    "/docs/testing/*": frozenset({"docs/testing/VERIFY.md", "docs/testing/README.md"}),
 }
 
 
@@ -181,27 +189,41 @@ def test_the_negation_re_includes_exactly_one_file() -> None:
         )
 
 
-def test_the_testing_negation_re_includes_exactly_verify_md() -> None:
-    """The second negation, asserted in both directions for the same reason as the first.
+@pytest.mark.parametrize("negated_path", ["docs/testing/VERIFY.md", "docs/testing/README.md"])
+def test_the_testing_negations_re_include_their_two_files(negated_path: str) -> None:
+    """Both negations under `/docs/testing/*`, asserted for the same reason as the `.claude/` one.
 
     `/docs/testing/*` carries the identical one-character hazard: written `/docs/testing/` the
-    directory is excluded, git never descends into it, and `!/docs/testing/VERIFY.md` parses fine
-    while applying to nothing. The failure is silent -- the operator's step 6 link would simply stop
-    resolving for anyone who cloned, with no error at commit, push or CI.
+    directory is excluded, git never descends into it, and a `!` line under it parses fine while
+    applying to nothing. The failure is silent -- the file would simply stop reaching anyone who
+    cloned, with no error at commit, push or CI.
 
-    The siblings are asserted too, because the risk here is the opposite of the `.claude/` one. There
-    the danger was publishing session state; here it is publishing maintainer QA that names a specific
-    build box (`WIN2025-TEST-PLAN.md` carries the host and its service identity), plus two drafts that
-    say on their face they are awaiting owner approval.
+    `VERIFY.md` is the operator tool docs/README.md links as step 6 of the new-operator path.
+    `README.md` is the MARKER (BACKLOG #1435), and its silent loss is the more interesting one: it is
+    the only thing in a checkout that tells a reader a cited path under this tree is unreadable rather
+    than unwritten. Lose it and the tree reverts to the state where absence reads as evidence.
     """
-    negated = _git("check-ignore", "-q", "--no-index", "docs/testing/VERIFY.md")
+    negated = _git("check-ignore", "-q", "--no-index", negated_path)
     assert negated.returncode != 0, (
-        "`docs/testing/VERIFY.md` is IGNORED — the `!/docs/testing/VERIFY.md` negation is not taking "
-        "effect. Check that the rule above it is `/docs/testing/*` and not `/docs/testing/`: a "
-        "negation cannot re-include a file whose parent directory is excluded, and it fails silently. "
-        "This file is an OPERATOR tool and docs/README.md links it as step 6 of the new-operator path."
+        f"`{negated_path}` is IGNORED -- its `!` negation is not taking effect. Check that the rule "
+        "above it is `/docs/testing/*` and not `/docs/testing/`: a negation cannot re-include a file "
+        "whose parent directory is excluded, and it fails silently."
     )
 
+
+def test_the_testing_negations_re_include_nothing_else() -> None:
+    """The other direction: exactly two files travel, and a third needs a written decision.
+
+    The risk here is the opposite of the `.claude/` one. There the danger was publishing session
+    state; here it is publishing maintainer QA -- two drafts that say on their face they await owner
+    approval, plus a matrix and plan scoped to one specific build box.
+
+    On that build box, note what the risk is NOT. `WIN2025-TEST-PLAN.md` uses `<box-hostname>`,
+    `<box-ip>` and credential placeholders throughout, so it names no host and no identity; .gitignore
+    records that correction beside the rule. The removal is right on ADR 0160's subject test -- QA
+    planning for one build box is neither operator nor security-reviewer material -- and overstating
+    it as a disclosure risk is how a correct decision acquires a wrong rationale that outlives it.
+    """
     for sibling in (
         "docs/testing/MASTER-TEST-PLAN.md",
         "docs/testing/WIN2025-TEST-PLAN.md",
@@ -210,6 +232,7 @@ def test_the_testing_negation_re_includes_exactly_verify_md() -> None:
     ):
         res = _git("check-ignore", "-q", "--no-index", sibling)
         assert res.returncode == 0, (
-            f"{sibling!r} is NOT ignored. The negation is meant to cover `VERIFY.md` alone. If this "
-            "path is now meant to travel, pin it in _TRACKED_EXCEPTIONS and say why in .gitignore."
+            f"{sibling!r} is NOT ignored. The negations are meant to cover `VERIFY.md` and "
+            "`README.md` alone. If this path is now meant to travel, pin it in _TRACKED_EXCEPTIONS "
+            "and say why in .gitignore."
         )
