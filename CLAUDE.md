@@ -391,9 +391,20 @@ clause describes the machine today.
 
 ### Branch, commit one layer, open the PR
 
-- **Never arm auto-merge.** Enqueuing is the Console's call and merging is the Lander's. Auto-merge
-  fires on the head it saw, so a later push is dropped: the PR reads MERGED, the branch stays alive,
-  and nothing reports a problem.
+- **"Merge when ready" is the ENQUEUE action here and is permitted. Arming auto-merge on a branch
+  that would merge WITHOUT the queue stays forbidden.** Enqueuing is still the Console's call and
+  merging still the Lander's — that division is unchanged. What changed is the reading of the
+  button: `main` requires a merge queue, so the mutation behind "Merge when ready" adds a queue
+  entry rather than merging on green. **Owner ruling 2026-09-05**, given when a seat stopped and
+  asked rather than guess which of the two operations it was.
+
+  **The hazard this bullet was written against is KEPT, not deleted, because nobody has measured it
+  under a queue.** It read, in full: *"Never arm auto-merge. Auto-merge fires on the head it saw, so
+  a later push is dropped: the PR reads MERGED, the branch stays alive, and nothing reports a
+  problem."* Whether a QUEUED entry does that when its branch is pushed underneath it is
+  **unmeasured** — what is measured on this repository is eviction and group rebuild, which is a
+  different event with a different cause. Until somebody watches a push land under a live entry, the
+  safe course is to dequeue before pushing, and the claim above must not be read as covering it.
 
 - Work on a feature branch and open a PR. Commit at logical stops, **one coherent layer per commit**,
   with clear messages. Direct pushes to `main` stay blocked by the harness.
