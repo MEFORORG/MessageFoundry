@@ -47,8 +47,12 @@ than feeding it. Four facts, each measured, that are not obvious from the code b
 **A SECOND ARM COVERS THE NON-PYTHON TREE (BACKLOG #1172, ASVS 11.5.1).** Everything above is an
 ``import ast`` walk of ``*.py``, so it is Python-only *by construction* and cannot see a randomness
 draw in another language however the walk-set is spelled. :func:`check_non_python_randomness` scans
-:data:`NON_PYTHON_WALK_ROOTS` (``ide/``, the shipped TypeScript VS Code extension) for randomness
-sources and diffs them against :data:`NON_PYTHON_INVENTORY` the same bidirectional way. Three
+:data:`NON_PYTHON_WALK_ROOTS` (``ide/``, the shipped TypeScript VS Code extension, and
+``messagefoundry_webconsole/``, whose ``static/*.js`` is the operator console's own first-party
+JavaScript) for randomness sources and diffs them against :data:`NON_PYTHON_INVENTORY` the same
+bidirectional way. Note that the second root is ALSO a Python walk root: a first-party root may be
+mixed-language, and requiring otherwise is what kept the console's JavaScript out of both arms until
+the ASVS 11.5.1 scope pass (see :data:`NON_PYTHON_WALK_ROOTS`). Three
 properties are the point of it, and each is pinned by a test in
 ``tests/test_crypto_inventory_scanner.py``:
 
@@ -115,11 +119,30 @@ WALK_ROOTS = ("messagefoundry", "messagefoundry_webconsole", "harness", "tee", "
 # --------------------------------------------------------------------------------------------
 # The NON-PYTHON randomness arm (BACKLOG #1172, ASVS 11.5.1).
 # --------------------------------------------------------------------------------------------
-#: First-party roots that hold shipped source in a language the AST walk above cannot read. Today
-#: that is ``ide/``, the TypeScript VS Code extension. Kept separate from :data:`WALK_ROOTS` on
-#: purpose: the two arms read different file types with different instruments, and merging them
-#: would let one arm's green stand in for the other's silence.
-NON_PYTHON_WALK_ROOTS = ("ide",)
+#: First-party roots that hold shipped source in a language the AST walk above cannot read: ``ide/``
+#: (the TypeScript VS Code extension) and ``messagefoundry_webconsole/`` (the operator console's
+#: hand-written JavaScript under ``static/``).
+#:
+#: THIS SET DELIBERATELY OVERLAPS :data:`WALK_ROOTS`, and it used to be asserted disjoint from it.
+#: That assertion cost real coverage (BACKLOG #1172, ASVS 11.5.1 scope pass). Its stated reason —
+#: "the two arms read different file types with different instruments, and merging them would let
+#: one arm's green stand in for the other's silence" — is sound, and it argues for keeping the two
+#: ARMS separate, which they still are: different instruments, separately reported corpus sizes,
+#: neither substituting for the other. It does NOT argue that a first-party ROOT must be
+#: single-language, which is what disjointness actually asserted.
+#:
+#: ``messagefoundry_webconsole`` is the counter-example that was sitting in the tree the whole time.
+#: Its Python is in :data:`WALK_ROOTS`, so the root reported green and READ as covered, while
+#: ``static/app.js`` and ``static/csp-probe.js`` were read by neither arm — :func:`discover` rglobs
+#: ``*.py``, and this walk stopped at ``ide/``. The green was a true statement about the root's
+#: ``.py`` and an accidental one about everything else in it. Coverage was being reasoned about per
+#: ROOT while the instruments split per LANGUAGE, and disjointness froze that mismatch as an
+#: invariant with nothing checking whether it should hold.
+#:
+#: The console's JavaScript is not incidental to security: ``csp-probe.js`` is the ASVS 3.7.5
+#: CSP-enforcement canary, and ``app.js`` registers the page's security controls ahead of its
+#: cosmetic ones. Both are served to an authenticated operator's browser at ``/ui``.
+NON_PYTHON_WALK_ROOTS = ("ide", "messagefoundry_webconsole")
 
 #: Suffixes the non-Python arm reads. Source only.
 NON_PYTHON_SUFFIXES = (".ts", ".js", ".mjs", ".cjs")
