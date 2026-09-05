@@ -18,6 +18,28 @@ FAILING run attributed to it, marked ``[merge_group]`` when the run is one the P
 That mark is the finding, not decoration -- it is the difference between "your change is broken" and
 "your change conflicts with what landed since", and the PR page renders the second as green.
 
+IT ALSO NAMES THE FAILING JOB AND STEP, because the run alone does not say what KIND of red it was
+and the kinds need different responses. Measured 2026-09-04 on this repository, eight ``merge_group``
+CI failures across seven pull requests in one day: five were a test job, and TWO were the
+``web console tests (windows-2025)`` leg where the pytest step CONCLUDED SUCCESS with
+``405 passed, 3 skipped`` and zero failures, and ``Step margin -- web console suite`` reddened the
+job at ``4:46 of a 6:00 cap (margin 1.261x, floor 1.30x)``. ``step_margin.py`` already says exactly
+that, in words, in its own step log. **Nothing carried it to a reader.** A margin verdict answered as
+though it were a flaky test earns a re-queue that cannot help, which is this item's whole cost.
+
+TWO ATTRIBUTION RULES OF ITS OWN, and both exist because the naive read misreports:
+
+  * **A roll-up job is never named as the cause** (``_ROLLUP_JOBS``). ``CI gate`` fails in every one
+    of the eight runs above and its own failing step is ``Fail -- a gated leg FAILED``, which points
+    at a leg it does not name. Reporting it would send every reader to the one job whose log is
+    guaranteed to be empty of the answer.
+  * **A watchdog step is reported as a watchdog** (``_TIMING_STEP_PREFIXES``), and only when a step
+    that RUNS work concluded ``success`` in the same job. The second condition is not redundant:
+    every pytest step in ``ci.yml`` carries an ``if:`` on the change filter, so a SKIPPED work step
+    can leave the margin step as the job's first failure, and "the suite PASSED" would then be a
+    claim about a suite that never ran. Work steps are matched by the ``(pytest)`` SUFFIX rather
+    than enumerated, so a fourth suite does not silently fall out of the classification.
+
 TWO RULES ARE COPIED FROM THE WRITER ON PURPOSE, because a reader that classifies differently from
 the writer reports causes the label was never applied for:
 
@@ -42,8 +64,10 @@ USAGE
     python scripts/ci/report_ci_red.py                       # uses gh's auth
     python scripts/ci/report_ci_red.py --repo owner/name
     python scripts/ci/report_ci_red.py --warn-only           # report, always exit 0
+    python scripts/ci/report_ci_red.py --no-jobs             # skip the per-run job fetch
     python scripts/ci/report_ci_red.py \\
-        --prs-json prs.json --runs-json runs.json            # offline/testing
+        --prs-json prs.json --runs-json runs.json \\
+        --jobs-json jobs.json                                # offline/testing
 
 EXIT
     0  nothing carries the label (or --warn-only)
@@ -78,6 +102,39 @@ _MERGE_QUEUE_REF = re.compile(r"(?:\A|/)pr-(\d+)-[0-9a-f]+\Z")
 #: The pull-request fields this reader needs. Beside the parser so the two cannot drift.
 PR_FIELDS = "number,title,state,headRefName"
 
+#: Runs asked for in ONE page. Named so the fetch and the truncation caveat below cannot disagree
+#: about the number -- a caveat quoting a stale literal is worse than none.
+RUNS_PAGE: int = 100
+
+#: Jobs that only MIRROR another job's verdict, and so must never be named as a cause. `CI gate` is
+#: the required roll-up: its failing step reads `Fail -- a gated leg FAILED` and names no leg, so a
+#: reader sent there learns nothing. Matched case-insensitively on the job name up to its matrix
+#: suffix, because a roll-up gains legs over time and this must not silently stop matching.
+_ROLLUP_JOBS: frozenset[str] = frozenset({"ci gate"})
+
+#: A failing step whose name starts with one of these is a WATCHDOG verdict rather than a failed
+#: assertion. Only `step_margin.py`'s steps today; the prefix is the stable half of the name (the
+#: suffix names the suite being measured, and there is one per suite).
+_TIMING_STEP_PREFIXES: tuple[str, ...] = ("Step margin",)
+
+#: A step that RUNS the work a watchdog above measures, recognised by SUFFIX rather than by a list
+#: of names. `ci.yml` has three today -- `Tests (pytest)`, `Web console tests (pytest)` and
+#: `Harness tests (pytest)` -- and only the first two are paired with a margin step. An enumeration
+#: would be a completeness claim that goes stale the day a fourth suite arrives (SDS-3.6), and it
+#: would go stale SILENTLY: an unrecognised work step reads as "did not pass", so the timing verdict
+#: would simply stop being reported with nothing saying why.
+_WORK_STEP_SUFFIX = "(pytest)"
+
+
+def _is_rollup(job_name: str) -> bool:
+    """True for a job that only mirrors another job's verdict.
+
+    Compares the name with any ` (matrix, suffix)` removed, so `CI gate` matches whether or not it
+    ever grows a matrix.
+    """
+    bare = job_name.split(" (", 1)[0].strip().lower()
+    return bare in _ROLLUP_JOBS
+
 
 @dataclass(frozen=True)
 class Red:
@@ -89,10 +146,39 @@ class Red:
     run_event: str | None = None
     run_url: str | None = None
     created_at: str | None = None
+    job_name: str | None = None
+    step_name: str | None = None
+    #: True only when a step this job RUNS (see ``_WORK_STEP_PREFIXES``) concluded ``success``.
+    #: Never inferred from the absence of a failing test step: a job whose jobs payload was not
+    #: fetched has no steps at all, and "I did not look" must not render as "nothing failed".
+    work_step_passed: bool = False
 
     @property
     def attributed(self) -> bool:
         return self.run_name is not None
+
+    @property
+    def is_timing_gate(self) -> bool:
+        """True when a watchdog step reddened a job whose own work step PASSED.
+
+        BOTH halves are required, and the second is not implied by the first. Step ordering does
+        most of the work -- a failed ``Tests (pytest)`` sorts before the margin step that measures
+        it, so it would be the step named -- but a work step can also be SKIPPED or CANCELLED and
+        still leave the margin step as the first failure. ``ci.yml`` guards both pytest steps with
+        an ``if:`` on the change filter, so a skipped one is reachable rather than hypothetical, and
+        there "the suite PASSED" is false: the suite never ran.
+        """
+        if not self.step_name or not self.work_step_passed:
+            return False
+        return self.step_name.startswith(_TIMING_STEP_PREFIXES)
+
+    @property
+    def where(self) -> str:
+        """The failing job and step, as a trailing clause. Empty when nothing was attributed."""
+        if not self.job_name:
+            return ""
+        step = f" / {self.step_name}" if self.step_name else ""
+        return f" in {self.job_name}{step}"
 
     @property
     def hidden_from_the_pr_page(self) -> bool:
@@ -112,10 +198,19 @@ class Red:
                 f"#{self.number} {self.title[:60]} -- UNATTRIBUTED: no failing run for this pull "
                 f"request in the window queried (aged out, or the label outlived its run)"
             )
-        where = (
+        hidden = (
             " [merge_group -- NOT VISIBLE ON THE PR PAGE]" if self.hidden_from_the_pr_page else ""
         )
-        return f"#{self.number} {self.title[:60]} -- {self.run_name} failed{where} {self.run_url}"
+        kind = (
+            " [TIMING GATE -- the suite PASSED; a watchdog reddened the leg, so a re-queue cannot "
+            "help. Read the step log for the margin, not the test list]"
+            if self.is_timing_gate
+            else ""
+        )
+        return (
+            f"#{self.number} {self.title[:60]} -- {self.run_name} failed{hidden}"
+            f"{self.where}{kind} {self.run_url}"
+        )
 
 
 def _pr_for_run(run: dict[str, object]) -> int | None:
@@ -137,13 +232,12 @@ def _pr_for_run(run: dict[str, object]) -> int | None:
     return int(found.group(1)) if found else None
 
 
-def attribute(prs: list[dict[str, object]], runs: list[dict[str, object]]) -> list[Red]:
-    """Join labelled pull requests to the newest failing run of a watched workflow.
+def newest_red_run_by_pr(runs: list[dict[str, object]]) -> dict[int, dict[str, object]]:
+    """The newest failing run of a WATCHED workflow, per pull request.
 
-    Pure: no network, no git. The CLI supplies both payloads so tests drive THIS function rather than
-    a re-implementation of the rule -- a test asserting a copy of the rule proves nothing about the
-    rule. Ordering is newest-run-first by ``created_at``; a run with no timestamp sorts last rather
-    than being dropped.
+    Factored out of :func:`attribute` so the CLI can learn WHICH runs it needs jobs for without
+    re-implementing the selection -- a second copy of this rule would fetch jobs for runs the report
+    then does not name, and quietly miss the ones it does.
     """
     newest: dict[int, dict[str, object]] = {}
     for run in runs:
@@ -160,6 +254,55 @@ def attribute(prs: list[dict[str, object]], runs: list[dict[str, object]]) -> li
         held = newest.get(number)
         if held is None or stamp > str(held.get("created_at") or ""):
             newest[number] = run
+    return newest
+
+
+def blame_job(jobs: list[dict[str, object]]) -> tuple[str | None, str | None, bool]:
+    """Pick the failing job to NAME, its failing step, and whether that job's work step passed.
+
+    Pure, and it prefers a real leg over the roll-up: ``CI gate`` fails in every red run and points
+    at a leg it does not name, so naming it would be strictly worse than naming nothing. If the ONLY
+    failing job is a roll-up the roll-up is reported anyway -- suppressing it entirely would render a
+    red as unattributed, which is the same "I could not tell" rendered as "fine" this script exists
+    to refuse.
+
+    Returns ``(job, step, work_step_passed)``; any element may be absent rather than guessed.
+    """
+    failed = [
+        j for j in jobs if isinstance(j, dict) and str(j.get("conclusion") or "").lower() == _RED
+    ]
+    if not failed:
+        return None, None, False
+    legs = [j for j in failed if not _is_rollup(str(j.get("name") or ""))]
+    chosen = legs[0] if legs else failed[0]
+
+    steps = chosen.get("steps")
+    steps = [s for s in steps if isinstance(s, dict)] if isinstance(steps, list) else []
+    step = next(
+        (str(s.get("name") or "") for s in steps if str(s.get("conclusion") or "").lower() == _RED),
+        None,
+    )
+    work_passed = any(
+        str(s.get("conclusion") or "").lower() == "success"
+        and str(s.get("name") or "").strip().endswith(_WORK_STEP_SUFFIX)
+        for s in steps
+    )
+    return str(chosen.get("name") or "") or None, step, work_passed
+
+
+def attribute(
+    prs: list[dict[str, object]],
+    runs: list[dict[str, object]],
+    jobs_by_run: dict[int, list[dict[str, object]]] | None = None,
+) -> list[Red]:
+    """Join labelled pull requests to the newest failing run of a watched workflow.
+
+    Pure: no network, no git. The CLI supplies both payloads so tests drive THIS function rather than
+    a re-implementation of the rule -- a test asserting a copy of the rule proves nothing about the
+    rule. Ordering is newest-run-first by ``created_at``; a run with no timestamp sorts last rather
+    than being dropped.
+    """
+    newest = newest_red_run_by_pr(runs)
 
     found: list[Red] = []
     for pr in prs:
@@ -169,6 +312,12 @@ def attribute(prs: list[dict[str, object]], runs: list[dict[str, object]]) -> li
         # Narrow rather than coerce: a surprising payload must become a finding, never a crash.
         number = raw if isinstance(raw, int) else 0
         run = newest.get(number)
+        job_name = step_name = None
+        work_passed = False
+        if run is not None and jobs_by_run:
+            raw_id = run.get("id")
+            if isinstance(raw_id, int):
+                job_name, step_name, work_passed = blame_job(jobs_by_run.get(raw_id, []))
         found.append(
             Red(
                 number=number,
@@ -177,6 +326,9 @@ def attribute(prs: list[dict[str, object]], runs: list[dict[str, object]]) -> li
                 run_event=str(run.get("event") or "") if run else None,
                 run_url=str(run.get("html_url") or "") if run else None,
                 created_at=str(run.get("created_at") or "") if run else None,
+                job_name=job_name,
+                step_name=step_name,
+                work_step_passed=work_passed,
             )
         )
     return sorted(found, key=lambda r: r.number, reverse=True)
@@ -209,12 +361,28 @@ def _fetch_runs(repo: str | None) -> list[dict[str, object]]:
     # per_page=100 deliberately: any gh api list route DEFAULTS TO 30, and a reader that silently
     # cannot see two thirds of its own corpus reports a clean repo. (BACKLOG #1385's own notes record
     # a session that concluded a label had never been re-applied off exactly that truncation.)
-    cmd = ["gh", "api", f"repos/{slug}/actions/runs?status=failure&per_page=100"]
+    # ...and it is still ONE page. `main` says so when the page fills; see the caveat there.
+    cmd = ["gh", "api", f"repos/{slug}/actions/runs?status=failure&per_page={RUNS_PAGE}"]
     payload = _gh(cmd)
     if not isinstance(payload, dict):
         return []
     runs = payload.get("workflow_runs")
     return [r for r in runs if isinstance(r, dict)] if isinstance(runs, list) else []
+
+
+def _fetch_jobs(repo: str | None, run_id: int) -> list[dict[str, object]]:
+    """The jobs of ONE run. Called only for runs the report will actually name, so this is at most
+    one extra request per labelled pull request rather than one per scanned run.
+    """
+    slug = repo or ":owner/:repo"
+    # per_page=100 for the same reason the runs query carries it: the default is 30, and a CI run
+    # here already has more jobs than that on some events.
+    cmd = ["gh", "api", f"repos/{slug}/actions/runs/{run_id}/jobs?per_page=100"]
+    payload = _gh(cmd)
+    if not isinstance(payload, dict):
+        return []
+    jobs = payload.get("jobs")
+    return [j for j in jobs if isinstance(j, dict)] if isinstance(jobs, list) else []
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -224,6 +392,15 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--repo", default=None, help="owner/name; defaults to gh's current repo")
     parser.add_argument("--prs-json", type=Path, default=None, help="a saved payload (testing)")
     parser.add_argument("--runs-json", type=Path, default=None, help="a saved payload (testing)")
+    parser.add_argument(
+        "--jobs-json",
+        type=Path,
+        default=None,
+        help="a saved {run_id: [job, ...]} payload (testing)",
+    )
+    parser.add_argument(
+        "--no-jobs", action="store_true", help="skip the per-run job fetch; report the run only"
+    )
     parser.add_argument(
         "--warn-only", action="store_true", help="report and exit 0 rather than 1 on a finding"
     )
@@ -240,7 +417,30 @@ def main(argv: list[str] | None = None) -> int:
             runs = [r for r in loaded if isinstance(r, dict)] if isinstance(loaded, list) else []
         else:
             runs = _fetch_runs(args.repo) if prs else []
-    except (RuntimeError, json.JSONDecodeError, subprocess.SubprocessError, OSError) as exc:
+
+        jobs_by_run: dict[int, list[dict[str, object]]] = {}
+        if args.jobs_json is not None:
+            raw = json.loads(args.jobs_json.read_text(encoding="utf-8"))
+            if isinstance(raw, dict):
+                for key, value in raw.items():
+                    if isinstance(value, list):
+                        jobs_by_run[int(key)] = [j for j in value if isinstance(j, dict)]
+        # `--runs-json` means the caller is OFFLINE. Fetching jobs live there would join saved run
+        # ids against the live repository, which is not a smaller answer but a wrong one -- and it
+        # would put a network call inside every test that supplies a saved corpus.
+        elif not args.no_jobs and prs and args.runs_json is None:
+            labelled = {p.get("number") for p in prs}
+            for number, run in newest_red_run_by_pr(runs).items():
+                run_id = run.get("id")
+                if number in labelled and isinstance(run_id, int):
+                    jobs_by_run[run_id] = _fetch_jobs(args.repo, run_id)
+    except (
+        RuntimeError,
+        ValueError,
+        json.JSONDecodeError,
+        subprocess.SubprocessError,
+        OSError,
+    ) as exc:
         # FAIL CLOSED. "I could not ask" must never render as "nothing is red" -- that is this
         # script's own defect class, one level up.
         print(f"::error::could not read the {CI_RED_LABEL} state ({exc!r}). Treating as a FAILURE.")
@@ -259,9 +459,37 @@ def main(argv: list[str] | None = None) -> int:
         print("ci-red: no pull request is carrying a red.")
         return 0
 
-    reds = attribute(prs, runs)
+    reds = attribute(prs, runs, jobs_by_run)
     for red in reds:
         print(f"::warning::{red.line()}")
+
+    # THE WINDOW IS ONE PAGE, AND AN UNATTRIBUTED LINE MUST NOT HIDE THAT. `_fetch_runs` asks for
+    # one page of RUNS_PAGE and does not paginate, so a full page means the corpus was cut off at
+    # an unknown depth and an UNATTRIBUTED verdict may be an artefact of the cut rather than a fact
+    # about the pull request. This is #1385's own recorded trap -- an unpaginated query returned 100
+    # of total_count 190 and dropped half the population silently. Saying so costs a line; not
+    # saying so renders "I could not see that far" as "there is nothing there".
+    unattributed = [r for r in reds if not r.attributed]
+    if unattributed and len(runs) >= RUNS_PAGE:
+        print(
+            f"::warning::{len(unattributed)} pull request(s) read UNATTRIBUTED against a run list "
+            f"that filled its single page of {RUNS_PAGE}. The window was cut off at an unknown "
+            "depth, so an unattributed verdict here is 'not in the window', NOT 'no failing run'. "
+            "Attribute those by hand with a paginated query before treating them as clean."
+        )
+
+    timing = [r for r in reds if r.is_timing_gate]
+    if timing:
+        count = (
+            "1 of these is a TIMING GATE"
+            if len(timing) == 1
+            else f"{len(timing)} of these are TIMING GATES"
+        )
+        print(
+            f"::error::{count}, not a test failure: the suite concluded SUCCESS and a margin "
+            "watchdog reddened the leg. Re-queueing cannot fix one. Measured 2026-09-04, this shape "
+            "reddened two merge_group runs on a leg reporting 405 passed and ZERO failures."
+        )
 
     hidden = [r for r in reds if r.hidden_from_the_pr_page]
     if hidden:
