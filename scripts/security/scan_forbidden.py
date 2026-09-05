@@ -12,8 +12,9 @@ Why a custom scanner in addition to gitleaks: gitleaks finds *secrets* (keys/tok
 routable host IP -- which are not credentials but must never reach the open-source repo.
 
 Token authority is EXTERNALIZED. The committed source carries only STRUCTURAL detectors -- at least a
-routable-IPv4 detector, a worktree/branch slug detector, an absolute-home-path detector and the
-prefix-free estate-identifier *shape*; the real customer/vendor name patterns, estate substrings, and
+routable-IPv4 detector, a worktree/branch slug detector, an absolute-home-path detector, a private
+artifact-URL detector and the prefix-free estate-identifier *shape*; the real customer/vendor name
+patterns, estate substrings, and
 the site-code numeric prefix are loaded at runtime from, in order of precedence:
 
   1. ``MEFOR_FORBIDDEN_TOKENS`` -- either a path to a token file OR the token content inline
@@ -194,6 +195,52 @@ _HOME_PATH = re.compile(
     r"|me|svc|you|user|username|example)[\\/\s\"'`]"
     r")"
     r"[A-Za-z][A-Za-z0-9._-]*"
+)
+
+# Private artifact URL (BACKLOG #1454). The UUID here is not a name, it is a CAPABILITY: whoever holds
+# the URL can fetch the artifact, so the string discloses the CONTENT the way a token does rather than
+# the way a hostname does. Every other detector in this file recognises something that IDENTIFIES a
+# party; this one recognises something that GRANTS ACCESS, which is why none of them can stand in for
+# it. An artifact URL carries no home path, no host address and no estate identifier.
+#
+# It arrives the way this whole class arrives -- pasted out of one session into a note, a handoff or a
+# backlog row that a later commit sweeps into the tree. This repo is public on GitHub and on PyPI, so
+# the paste and the publication are one step apart.
+#
+# PREVENTIVE, NOT REMEDIAL, and measured rather than assumed. At 16efb8cde over 2095 tracked files the
+# population is zero, with the needle printed beside each count and a two-sided control:
+#
+#     needle='claude\.ai/(code/)?artifact/<uuid-shape>'  files=0
+#     needle='claude\.ai/(code/)?artifact'               files=0
+#     CONTROL needle='worktree/branch slug'              files=3   (fires, so the search ran)
+#
+# Filed anyway because the sibling project hit it for real: KORUS carried two of these on its own
+# origin/main from the commit that brought its playbooks over, and its leak gate -- which has the same
+# three shape detectors this one does -- passed them both. They came out because a person read the
+# diff, which is the review this gate exists to make cheaper.
+#
+# THE UUID SHAPE IS REQUIRED ON PURPOSE, and it is what keeps the detector off its own documentation.
+# The placeholder this file, its tests and any future ADR have to print -- claude.ai/code/artifact/
+# followed by a bracketed <uuid> -- is not a hit. The alternative is a detector whose own manual trips
+# it, which earns an allowlist line, and an allowlist line here is a per-line veto over every OTHER
+# detector on that line too.
+#
+# A PUBLICLY SHARED artifact does not match either: that path segment is plural (/public/artifacts/),
+# so the literal `artifact/` cannot reach it. A deliberately published URL is not a disclosure.
+#
+# NO BARE-UUID DETECTOR, and that is a decision with a number behind it. A bare UUID names no host, no
+# account and no project -- it is an opaque 128-bit integer, and it becomes a disclosure only when
+# something says what it addresses, which is exactly what the URL prefix supplies. Measured over the
+# same 2095 files, a bare-UUID detector would fire on 35 lines across 8 files TODAY, every one of them
+# innocent: a vendored CLA action bundle, a deployment guide, an HL7 sample message, and five test
+# modules that build session ids. That is a false-positive storm on the first run, each one answered
+# with an allowlist line that switches this whole gate off for the lines it covers. A gate people mute
+# is worth nothing. (KORUS reasoned to the same conclusion from a zero; a zero argues weakly either
+# way, so the number above is the one to cite.)
+_ARTIFACT_URL = re.compile(
+    r"claude\.ai/(?:code/)?artifact/"
+    r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
+    re.IGNORECASE,
 )
 
 # Ported-estate identifier SHAPE. The site-code detectors below are keyed on a numeric PREFIX loaded
@@ -1034,6 +1081,11 @@ def scan_file(path: Path, rel_posix: str | None = None, *, show_context: bool = 
             hits.append(f"{posix}:{lineno}: worktree/branch slug (internal project name)")
         if _HOME_PATH.search(line):
             hits.append(f"{posix}:{lineno}: absolute user-home path (OS account name)")
+        # Reason-only, and NOT ctx-appended even under show_context. The other reason-only detectors
+        # withhold the value because it NAMES someone; this one withholds it because the URL IS the
+        # access. Echoing it into a public CI log would hand out the capability the hit reports.
+        if _ARTIFACT_URL.search(line):
+            hits.append(f"{posix}:{lineno}: private artifact URL (the link itself grants access)")
         # Security-record content (BACKLOG #1337). REASON-ONLY, never the value, for the same reason
         # as the slug above: the identifier-verdict pair IS the disclosure, so echoing it into a
         # public CI log would publish exactly what the hit reports.
