@@ -611,6 +611,72 @@ def test_an_unreachable_base_ref_never_reports_success(tmp_path: Path) -> None:
     assert code != 0, "a missing base ref must not read as 'nothing to check'"
 
 
+# ------------------------------------------------------- a merge allocates nothing (BACKLOG #1441 case)
+#
+# The pair below is deliberately disjoint: the first arm reds if the gate refuses a merge that invents
+# no number, the second reds if it stops policing during one. A single arm would pass on a gate that had
+# simply been switched off while MERGE_HEAD exists, which is the mutation that matters here.
+
+
+def _diverge_and_merge(repo: Path, tmp_path: Path, *, number: str) -> None:
+    """Leave ``repo`` mid-merge, carrying ``number`` from a branch owned by ANOTHER worktree.
+
+    `--no-commit --no-ff` is the whole point: a clean merge auto-commits and tears down MERGE_HEAD, so
+    the state the hook actually runs in would never be reached.
+    """
+    git(repo, "checkout", "-q", "-b", "sibling")
+    backlog = (repo / "docs/BACKLOG.md").read_text(encoding="utf-8")
+    write(repo, "docs/BACKLOG.md", backlog + f"\n## {number}. From a sibling worktree\n\nbody\n")
+    git(repo, "add", "-A")
+    # Allocated to the SIBLING while it is the one committing, so this commit is legal there...
+    allocate(repo, "backlog", number, worktree=repo, branch="sibling")
+    git(repo, "commit", "-qm", f"sibling files #{number}")
+    # ...and then re-pointed at a worktree that is not this one, which is the real situation: the
+    # allocation record belongs to the session that filed it, and the merger is somebody else.
+    allocate(repo, "backlog", number, worktree=tmp_path / "somewhere-else", branch="sibling")
+
+    git(repo, "checkout", "-q", "main")
+    write(repo, "docs/unrelated.md", "a file that does not collide\n")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-qm", "main moves on")
+    git(repo, "merge", "--no-commit", "--no-ff", "sibling")
+
+
+def test_a_merge_carrying_ANOTHER_worktrees_number_is_committable(
+    repo: Path, tmp_path: Path
+) -> None:
+    """The measured case: a Lander resolving a docs/BACKLOG.md tail conflict on somebody else's PR.
+
+    Before this, the gate refused it -- the number is real, allocated and committed, just not HERE --
+    and its remedy named a worktree the worktree gate forbids the merger from entering.
+    """
+    _diverge_and_merge(repo, tmp_path, number="1441")
+
+    code, out = run_check(repo)
+    assert code == 0, f"a merge that allocates nothing must commit; got:\n{out}"
+    assert "1441" not in out
+
+
+def test_a_number_INVENTED_during_a_merge_is_still_refused(repo: Path, tmp_path: Path) -> None:
+    """The other half, and the one that keeps the arm above from being a hole.
+
+    Same mid-merge state, plus a heading no commit anywhere carries. Being inside a merge must not
+    become a way to file an unallocated number.
+    """
+    _diverge_and_merge(repo, tmp_path, number="1441")
+
+    merged = (repo / "docs/BACKLOG.md").read_text(encoding="utf-8")
+    write(repo, "docs/BACKLOG.md", merged + "\n## 1442. Invented while merging\n\nbody\n")
+    git(repo, "add", "-A")
+
+    code, out = run_check(repo)
+    assert code != 0, "a number on no parent is a fresh allocation, merge or not"
+    assert "1442" in out, out
+    # DELIBERATELY NOT asserted here: that 1441 is absent from the message. It is true, and it belongs
+    # to the arm above. Asserting it here made both arms red under the same mutation, which is exactly
+    # the overlap that stops a pair from localising a failure -- caught by running the mutation.
+
+
 def _ledger_hook() -> dict[str, object]:
     """The ledger-gate entry from .pre-commit-config.yaml, or fail loudly.
 

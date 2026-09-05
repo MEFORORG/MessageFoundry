@@ -22969,3 +22969,29 @@ git rev-parse --git-dir
 
 **A NOTE ON REPRODUCING THIS, because the first framing did not reproduce and that nearly buried it.** A reader in their own worktree who lists their own project directory will find exactly one session UUID and correctly conclude that nothing is shared with other seats. That result is right and it is not a refutation: the collision is inside one session, so the reproduction is to write a marker into the scratchpad and then spawn a subagent to list that same directory. **The two colliding paths are deliberately not published here** -- they carry a host account name and worktree slugs, which the forbidden-content gate blocks and which its own message says must be removed rather than allowlisted. The schematic form above is the publishable version.
 
+## 1456. a merge commit allocates nothing, but the ledger gate policed it as a fresh allocation
+
+> 🔢 **Filed 2026-09-05. The fix and both arms are built on this branch.** Value **5/10** · Difficulty **2/10** · _quick win_. Two correct controls composed into a duty nobody could discharge: `scripts/hooks/ledger_check.py` keys number ownership on the worktree that ran the allocator, and a MERGE carries another branch's numbers without allocating anything -- so a merge resolved by anyone but the item's author was refused for carrying that author's number.
+
+**Cluster:** repository gates / ledger hygiene. **Priority:** P2. **Verdict:** build.
+**Severity:** no deployment axis (sec. 0). A commit-time gate over this repository's own records. No engine behaviour, no shipped artifact, no PHI.
+
+### The measured instance
+
+2026-09-05. The Lander resolved a `docs/BACKLOG.md` tail conflict on PR 850 -- the routine kind, two branches appending different items -- and verified it properly: **zero deleted or changed lines against `origin/main`, 158 added, and the added block byte-identical to that branch's own section.** The commit was then refused:
+
+```
+BLOCKED: BACKLOG item #1441 was not allocated to this worktree
+```
+
+The gate's remedy named the owning worktree and said to commit from there. **`worktree_gate.ps1` refuses exactly that**, because operating in another session's tree is what it exists to stop. Neither gate was wrong. Between them sat a duty `LANDER.md` assigns -- *"`docs/BACKLOG.md` row conflicts -- Lander, locally"*, on latency grounds -- that could not be discharged from any seat. The verified resolution was thrown away.
+
+### What shipped
+
+`_merge_parents()` reads `MERGE_HEAD` **as lines**, because an octopus merge writes one sha per line and `git rev-parse MERGE_HEAD` answers only the first. Numbers carried by any parent are folded into the base set for the BACKLOG rule, and an ADR file already present on a parent is exempt from the ownership rule. CI is untouched: it never has a merge in progress, so `_merge_parents()` is empty there.
+
+### Why this opens no hole
+
+**The grandfathered numbers are not asserted, they are read off a commit.** Laundering a number this way needs a commit that already contains it, and producing one means passing this same gate on the worktree that allocated it. Editing the BODY of an existing item was never policed here in either direction -- the rule compares NUMBER SETS (`head - base`), so a merge cannot smuggle a subject past a check that never read subjects.
+
+**Two mutations hold the arms disjoint**, and the first attempt did not: an assertion about the carried number was written into the invented-number arm, so disabling the fix reddened both and the pair localised nothing. Corrected, then re-measured. Fix disabled reds only `test_a_merge_carrying_ANOTHER_worktrees_number_is_committable`; ownership skipped wholesale during a merge reds only `test_a_number_INVENTED_during_a_merge_is_still_refused`.
