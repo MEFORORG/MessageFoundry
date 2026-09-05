@@ -5677,6 +5677,50 @@ Both contain the identical slug. Only the first carries a `worktrees/` prefix.
 > `test_worktree_gate_git.py` and `test_worktree_gate_hijack.py` collect **201**, all passing, on
 > 2026-09-03. Two counts over unnamed sets are not comparable, so the suites are named here for
 > whoever re-runs the measurement.
+>
+> **RE-VERIFIED AGAIN 2026-09-04 at `a2eef0f37`, WITH THE GUARDS MUTATED RATHER THAN READ.** `main` has
+> moved since the 2026-09-03 pass. All four code claims still hold, read by symbol rather than by line
+> number: `Get-GitTargetCandidatesRaw` computes `$cd` above the `-C` branch, joins a RELATIVE `-C` onto
+> it, leaves an ABSOLUTE one alone on `IsPathRooted`, and the three bail-outs plus `$cds.Count -eq 1`
+> guard both branches. The inventory comment is still updated rather than deleted.
+> `test_worktree_gate_shell_semantics.py` collects **35**, all passing.
+>
+> **THE FOUR NAMED SUITES NOW COLLECT 227, all passing on 2026-09-04**, against **201** on
+> 2026-09-03. The set grew by 26 in a day, which is exactly why the paragraph above names its suites:
+> the two counts are comparable only because it did. The 227 says nothing about #1085 on its own --
+> the suite that covers this item is the 35-test one.
+>
+> **THREE MUTATIONS, NOT ONE, BECAUSE THE EARLIER PASSES ONLY EVER SHOWED THE JOIN FIRING.** A guard
+> nobody has seen fire is not evidence, and two of these three had never been driven backwards. Each was
+> applied alone against the five composition tests, and the file restored to hash `8d5c4d50` between
+> them.
+>
+> | mutation | reds | direction of the regression |
+> |---|---|---|
+> | join reverted to `$dashCOut += $dashC` | the composition test alone; all four controls stayed green | FALSE DENY, and its message names the primary for a write that lands in the ungoverned `../Unrelated` |
+> | `IsPathRooted` guard dropped, so composition is unconditional | `test_an_absolute_dash_C_still_ignores_a_preceding_cd` and `test_a_dash_C_beats_a_preceding_cd` | FAIL-OPEN, *"expected a DENY, got allow"* |
+> | the three bail-outs replaced by `if ($true)` | `test_a_cd_inside_a_subshell_does_not_compose` alone | FAIL-OPEN, *"expected a DENY, got allow"* |
+>
+> The first row reproduces the 2026-08-26 measurement exactly. **The other two matter more, because the
+> FAIL-OPEN this item warns about is now demonstrated rather than asserted:** dropping the guard really
+> does turn a correct DENY into an ALLOW, and the negative control really does catch it.
+>
+> **THE BROAD-NAMED TEST STILL MISLEADS, and that is now measured too.** Every case
+> `test_a_dash_C_beats_a_preceding_cd` drives still uses an ABSOLUTE `-C`, so its name and its "never"
+> remain broader than its evidence. It DID red under the second mutation -- but at its FIRST assertion,
+> in the false-deny direction, so its green still says nothing about the relative case and nothing about
+> the fail-open the guard exists to stop. Read it beside the negative control, never instead of it.
+>
+> **ONE REAL DEFECT FOUND, IN THIS ITEM'S OWN TEST COMMENT, AND FIXED.** The measured-evidence table
+> above `_WRITE` had lost its `<disarm write>` placeholder when these tests moved into
+> `test_worktree_gate_shell_semantics.py` (`72bfddfad`): the middle row read `git -C . checkout main`,
+> byte-identical to the row above it and carrying the opposite verdict, so the table asserted that one
+> command both DENIES and ALLOWS and the paragraph it supports had no evidence left. The originating
+> commit `a490993b4` wrote the placeholder correctly. Restored, with a note saying why it must stay a
+> placeholder.
+>
+> **The archive pass is still the only thing outstanding**, and closure is still PROPOSED rather than
+> taken: the banner belongs to the Lander (`scripts/docs/backlog_status_check.py`).
 
 > 🔢 **Re-scored 2026-08-20 -> P2.** Value **6/10** · Difficulty **4/10** · _quick win_. The defect is intact: worktree_gate.ps1:319 takes the -C value and the cd resolution at :321-330 is the else branch, so a relative -C behind a cd prefix resolves against the session cwd and the deny names the wrong repository. Value 6 is rung 6 -- a live false deny on developer tooling whose only workaround is a human overriding a message that actively misinforms. Difficulty 4, not 5, because the change is hoisting the existing cd computation above the -C branch and joining a relative -C to it inside one function, and the deny-text assertion the scorer priced as extra cost is already a shipped test capability. _(was 6/10 · 4/10.)_
 >
