@@ -392,7 +392,7 @@ Ordered by value descending, then difficulty ascending (cheapest first at equal 
 | 27 | **#122** | Corrupted application-log detection, rollover, and connection-stop | 7 | 6 | _big bet_ | P2 | No enforcement ships: the only log handlers on main are the stdout StreamHandler at logging_setup.py:427 and the syslog family, and nothing anywhere reacts to a write failure by stopping work. The owner ruling of 2026-08-11 binds this to the count-and-log invariant, which is enforcement rather than the visibility the 2/10 priced. Difficulty 6 prices a fail-closed halt across the listener and the internal routed/outbound stages plus a console-seam change, with the eight branch commits unverified and carrying a seam bump #1220 obsoleted. |
 | 28 | **#318** | DAST — authenticated dynamic security testing of the running engine | 7 | 6 | _big bet_ | P2 | Increment 1 is on disk and wired into the required pytest legs; the remainder is increment 2, whose highest-value piece is fuzzing the unauthenticated MLLP/raw-TCP/X12 ingress plane, and no mutator exists in the tree to extend. Value 7 for a real gap with no workaround (every other security test here is static or in-process); difficulty 6 for a mutator the project does not have plus an OpenAPI security overlay with a fifth DEP-1 lock, a TLS black-box target and the console plane, with only the nightly-notice widening cheap. |
 | 29 | **#1059** | Shell variable indirection defeats the worktree gate's path resolution, so the primary is reachable | 7 | 6 | _big bet_ | P2 | The gate moved forward two versions without touching this: the shared resolver still hands raw candidate strings through with no sigil handling, and a test at test_worktree_gate_control_plane.py:685 now pins the variable spelling as a deliberate ALLOW, so the bypass is documented rather than closed. Difficulty stays at 6 because the fix moves fail-closed semantics into the resolver that rules 3, 3b, 3c and 3d all depend on, under 4935 lines of pinned gate tests, and needs remedy text precise enough not to be routed around plus the negative control #1000 demands. |
-| 30 | **#1065** | Rule 3c reads the target-candidate SET as a scalar, so any `-C` token on the line disables it | 7 | 6 | _big bet_ | P2 | Rule 3c still takes the scalar $where[0] at worktree_gate.ps1:1031 from the set the resolver returns at :985, so neither banked fix is in the tree and the fail-open stands as filed. Value 7 is the rubric's real-gap-no-workaround rung: a gate that fails open admits no operator workaround, but the item's own Severity line records no product effect and no PHI effect, which forecloses rung 8's only applicable clause as well as rung 9's. Difficulty 6 because two written fixes were rejected by independent verification, the second with at least five new fail-opens and two false-deny classes that a 420-test green suite could not see, so the remainder is a correctness-gated rewrite of the matching rule. |
+| 30 | **#1065** | Rule 3c reads the target-candidate SET as a scalar, so any `-C` token on the line disables it | 7 | 6 | _big bet_ | P2 | CORRECTED 2026-09-04, re-measured: the scalar read is gone (rule 3c walks foreach ($cand in $where)) and all thirteen rows of this item's own acceptance corpus DENY on origin/main's gate blob 8d5c4d50, so the still-takes-the-scalar premise this rationale carried is stale; what actually stood were two live fail-opens of the same class, both closed in the amendment -- one no-op chdir between the decoy -C and the disarm reverted every one of those thirteen rows to ALLOW, and a neighbouring `git config --list` excused the disarm beside it in fifteen more. The numbers are left as the re-scoring pass set them rather than re-priced against a different remainder. Value 7 is the rubric's real-gap-no-workaround rung: a gate that fails open admits no operator workaround, but the item's own Severity line records no product effect and no PHI effect, which forecloses rung 8's only applicable clause as well as rung 9's. Difficulty 6 because two written fixes were rejected by independent verification, the second with at least five new fail-opens and two false-deny classes that a 420-test green suite could not see, so the remainder is a correctness-gated rewrite of the matching rule. |
 | 31 | **#1066** | Rule 3c strips double quotes only, so a single-quoted -C target bypasses it -- including an absolute one | 7 | 6 | _big bet_ | P2 | Both halves are live on the repo blob and on the installed hook that actually governs this machine: the -C reader is the unchanged double-quote-only regex and the disarm-key match still reads the quote-blanked scan text, so a single-quoted absolute -C and every quoted -c alias override remain reachable by ordinary spellings. Value 7 because this governs agent behaviour in development with no product or PHI effect, which is above the rubric's parity rungs but below the production and ASVS rungs; difficulty 6 because two written fixes have been rejected by adversarial verification, the second yielding at least five new fail-opens with residuals filed as #1067, #1069, #1070, #1071 and #1072. |
 | 32 | **#1108** | research an honest pass for ASVS 2.1.1 -- what the operator API's input validation rules would have to be before any documentation could define them | 7 | 6 | _big bet_ | P2 | Counted at HEAD, api/models.py carries 21 max_length bounds against 206 str annotations, reproducing the item's 21-of-205, expose_docs still ships False at settings.py:726, and no per-field validation reference exists under docs/ (HL7-VALIDATION.md and CODESETS.md are both data-plane). Value 7 for a real L1 gap with no workaround where the coverage half is not merely documentary; difficulty 6 because the item forbids restating field types as the honest pass, so an expected structure must first be decided for ids, connection names, globs, time ranges and free-text search and then made real across the API models under mypy strict, with the console, harness, IDE extension and apiclient all consuming those bounds. |
 | 33 | **#1109** | research an honest pass for ASVS 2.2.1 -- positive validation that does not sacrifice the tolerance the HL7 default exists to protect | 7 | 6 | _big bet_ | P2 | The API limb SHIPPED 2026-09-04 (see the item note): the 32 request-body models now carry extra=forbid via api/request_model.py, so the 84-models-with-no-model_config reading on this row is spent. The HL7 limb stands -- validation.strict still ships False at config/models.py:667 -- and the method ruling is still undecided, so the item stays open on the Tracker's re-score. Scores NOT re-rated here; a builder does not re-score. Value 7 not 8: the 2.2.1 cell is graded at LEVEL 1, so rung 8's ASVS L3 Partial limb does not reach it, and an authenticated loopback-bound API silently ignoring unknown body keys is not rung 8's production blind spot with no workaround -- it is rung 7, a real gap an operator cannot close from outside the app. Difficulty 6 stands: two independent limbs, a method ruling on which clause binds an L1 requirement inside an L3 assessment, and an API-side positive-validation change that would reach the console and apiclient callers too. |
@@ -6459,6 +6459,49 @@ Reach proven with a harmless key, no disarm key executed: `git -C '../../..' con
 Fixed in the rule-3c follow-on work. **The rule-3 and rule-3d half is NOT this item** -- it is filed separately as #1377, because a row naming only the enumeration half produces "add the missing spellings", which closes an instance and leaves the class open.
 
 **Two further classes found in the same pass are INHERITED rather than introduced and are filed as #1379**, both consequence-proven against the governed shared config: `-C` precedence composition, and the PowerShell environment-assignment spelling.
+
+
+**AMENDMENT 2026-09-04 (builder). THE SCORING ROW'S PREMISE IS STALE, THE CLOSURE IT DENIES IS REAL -- AND ONE NO-OP TOKEN REVERTED IT, WHICH IS WHAT THIS ACT FIXES.**
+
+**Re-measured, not argued.** Throwaway governed rig with a primary, a nested worktree under `.claude/worktrees/`, a linked sibling worktree and an independent clone; hook subprocess cwd set equal to the payload cwd. **All thirteen rows of the measured acceptance corpus above DENY** on `origin/main`'s gate, and the scalar read the scoring rationale still names is gone -- rule 3c walks `foreach ($cand in $where)`. The identical corpus run against the gate this item was FILED on (`a67838d2`, blob `3e7db362`) reproduces the filed ALLOWs, so the rig can produce a different answer rather than agreeing with itself.
+
+**THE CLOSURE WAS ONE ORDINARY TOKEN FROM BEING REVERTED.**
+
+```
+git commit -C HEAD && git config core.hooksPath /nope           DENY
+git commit -C HEAD && cd . && git config core.hooksPath /nope   ALLOW   <- the same write
+```
+
+Thirteen rows moved back to ALLOW on `origin/main`: seven chdir spellings (`cd`, `cd ./`, `pushd`, `chdir`, `sl`, `Set-Location`, `Push-Location`), three cwds (the primary, a nested worktree, a linked worktree), the `;` join as well as `&&`, and `alias.*` as well as `core.hooksPath`. **Consequence read back rather than inferred:** with `;` the command really runs, and `core.hooksPath` then reads `/nope` **from a different worktree of the same repository** -- which is what proves it reached the SHARED config rather than something local. `cd .` is a no-op, so the poison needs no intent, no relative path and no unusual spelling.
+
+**MECHANISM -- this item's own fix, one layer along.** The chdir guard covers `[first git token, disarm)` and answers a chdir by SUPPRESSING the base candidate. The resolver cannot follow that chdir either: its `$Prefix` is sliced at the FIRST git token and the chdir sits after it. So on a line that also carries a decoy `-C` the candidate set collapses to the decoy alone, git rejects it, the chain runs out, and the rule allows. **Suppressing the base is not the same as knowing where the write lands.**
+
+**THE FIX FOLLOWS THE CHDIR INSTEAD OF DECLINING TO.** `Get-ChdirTargetRaw` is extracted from the resolver -- one definition, two callers, no second spelling of "follow a cd" -- and rule 3c calls it on the guard window, composing a relative window chdir onto a prefix chdir and appending the result as the **LAST** candidate. Gated on the disarming invocation naming **no repository of its own**, so an explicit `-C`/`--git-dir` still decides and a governed chdir cannot manufacture a refusal for a write aimed elsewhere. `$where[0]` never moves, so the unresolvable-target refusal is still decided on exactly the token it was.
+
+**A SECOND LIVE FAIL-OPEN OF THE SAME CLASS, FOUND BY THE SAME SWEEP AND CLOSED IN THE SAME ACT.** The explicit READ flags were matched against the **whole segment**, so a read belonging to a NEIGHBOURING command excused the write beside it:
+
+```
+git config core.hooksPath /nope                        DENY
+git config --list && git config core.hooksPath /nope   ALLOW   <- the same write
+```
+
+**Fifteen rows on `origin/main`** -- every disarm key this rule names (`core.hooksPath`, `core.worktree`, `include.path`, `includeif.`, `alias.*`) by every cwd (primary, nested worktree, linked worktree). **Consequence read back:** run from the LINKED worktree, the PRIMARY then reads `/nope`. This banner already claims the shape was closed -- but by the **rejected** round-3 patch, which never shipped, so it has been live the whole time and had no number of its own. The exclusion is now tested against `$ownCmdWin` plus `$rest`, the same window `$ownGitDir` already uses, so `git config --get <key>` and `git --no-pager config --get <key>` are excluded exactly as before while the neighbour no longer reaches across the separator.
+
+**RESIDUALS -- READ THIS AS "AT LEAST THESE", and none of it says rule 3c is unbypassable.** More than one chdir in the window is not followed: the helper declines rather than guess a base, and that ALLOW is pinned as a negative control (#1000's shape) rather than left to be discovered. A prefix chdir the helper cannot follow suppresses the append entirely. A chdir target that is **quoted AND contains a space** is blanked on the scan string and is not followed -- measured on a rig whose governed root is literally `Pri mary`, where `cd "<spacey primary>"` stays ALLOW while the unquoted spelling, `cd "."` and `cd '.'` all DENY, because `Remove-QuotedSpans` unmasks a quoted span holding one bare word and blanks one containing whitespace. That is the same space family the file already records against the `-C` reader. Everything #1066, #1067 and #1069-#1072 record stays open.
+
+**NOT FIXED HERE, FILED AS #1446** (allocated on this branch, so the citation resolves only once both land): a RELATIVE `-C` on the disarming invocation still resolves against the SESSION cwd when a chdir in the guard window has already moved the shell. Measured in both directions and identical before and after this act. Closing it means composing that chdir into the `-C` branch of the resolver, which is the widening two rejected rounds died of.
+
+**THE BANNER'S HASHES ARE FALSE, AND THE SENTENCE IN #1061 THAT CORRECTS THEM IS NOW STALE TOO. Measured 2026-09-04:**
+
+| what | value |
+|---|---|
+| the banner's claim | commit `a67838d2`, blob `3e7db362` |
+| `origin/main`, immediately before this act | blob `8d5c4d50`, sha256 `59c896fc`, 3172 lines, `$GateVersion` `2026.09.03.1` |
+| INSTALLED at `~/.claude/hooks/worktree_gate.ps1` | sha256 `6d95811e`, 198887 bytes, 2712 lines, `$GateVersion` `2026.08.13.1` |
+
+The installed hook is **460 lines behind the repo copy** and carries the gate blob of `2b9f5b3c4` -- so it has this item's candidate chain and **not** #1379's `--git-dir` ranking, #1359's rule-3b verbs or #1229's encoding fix. #1061's correction (*"the installed hook hashes to `e7133498`, identical to `origin/main`'s blob ... byte-identical"*) was true when written and is not true now, so **a third re-measurement is owed before either sentence is cited again**. Nothing in this act installs anything: the drift is reported, not repaired.
+
+**The score is NOT moved here.** Its stated basis is corrected because it was factually wrong; the numbers are left where a re-scoring pass put them, because what remains open under this title (the residuals above, plus #1446) is a different quantity from what it was measured on and re-pricing it is not this act's work.
 
 ## 1066. Rule 3c strips double quotes only, so a single-quoted -C target bypasses it -- including an absolute one
 
@@ -22560,6 +22603,7 @@ So `test_the_script_prefers_its_own_repo_over_an_earlier_path_entry` supplies th
 
 **Adjacent and NOT fixed here, named rather than numbered.** `docs/WEBCONSOLE-PACKAGE.md`'s seam-refresh procedure is stale in three steps left behind by #1220: it says to bump `ENGINE_UI_SEAM` by hand (`1` to `2`) when the value is a derived digest, it says to update curated lists in this script that #1220 retired, and its step 5 prescribes `python scripts/webconsole_seam_snapshot.py > tests/golden/...`, the shell redirect this script's own docstring forbids because PowerShell's `>` writes UTF-16LE with a BOM into a file the test reads as UTF-8. That is doc drift with its own cause and it wants its own item; folding a documentation rewrite into a `sys.path` fix would make both harder to review.
 
+
 ## 1434. the tooling-partition gate names the file it rejects and not the remedy, so the Builder who trips it has already exited
 
 > 🚧 **Filed 2026-09-03. The failure message is fixed on this branch. Five open pull requests still carry unregistered test files, and only their own branches can fix them -- they are named below.** `tests/test_tooling_partition.py::test_every_non_engine_test_is_classified` fails when a file matching `tests/test_*.py` sits in neither `tests/tooling_manifest.txt` nor `_STAYS_WITHOUT_IMPORTING`. It is not deselected by `-m 'not tooling'`, so it reds **all three required `test` legs at once**. PR 774 hit exactly that, and its Builder's process had exited before any leg reported.
@@ -22627,3 +22671,42 @@ All 137 listed entries were swept for a repo-rooted read of `messagefoundry/**`.
 
 1. **The five pull requests above.** A Builder must not push to another seat's branch, so each is fixed by whoever next touches it: append `tests/<name>.py` to `tests/tooling_manifest.txt`, keeping the list alphabetical. **The gate is passable and two pull requests that night passed it correctly -- nothing here asks for it to be weakened.**
 2. **Three copies of the manifest parser, pinned against nothing.** This file, `_tooling_basenames` in `tests/conftest.py` (the copy that actually applies the marker), and `_manifest_paths` in `tests/test_ci_tooling_gate.py` all implement the same rule. Extracting one `tests/_tooling_manifest.py` is the real fix. Related: `test_every_manifest_entry_trips_its_own_gate` in `tests/test_ci_tooling_gate.py` feeds each manifest entry back as its own changed path, so on the manifest arm every entry matches itself unconditionally.
+
+## 1446. Rule 3c resolves a relative -C against the session cwd when a chdir in the guard window has already moved the shell
+
+> 🔢 **Filed 2026-09-04 (builder) -- MEASURED IN BOTH DIRECTIONS, INHERITED RATHER THAN INTRODUCED, AND DELIBERATELY NOT FIXED IN THE ACT THAT FOUND IT.** Found by the adversarial pass on #1065's chdir-window fix, measured against `origin/main`'s gate and against the branch that closes that one, and byte-identical on both.
+
+**Cluster:** Session-drift controls / gate integrity. **Priority:** P2. **Verdict:** build.
+
+**Severity:** no product effect and no PHI effect -- this governs agent behaviour in development. *(Clause carried verbatim from #1065, because without it this row reads as a product-severity claim and it is not.)* It is a **fail-open in an enforcement control** whose mirror is a **false deny naming a repository the write never touches**, and both are reached by ordinary tokens.
+
+**What.** `Get-GitTargetCandidatesRaw` roots a relative `-C` against the session cwd, composing it with a chdir it can see in the PREFIX (#1085). It cannot see a chdir sitting BETWEEN the first git token and the disarm, because the prefix is sliced at the first git token. So when the disarming invocation carries its own relative `-C` and a chdir has already moved the shell, the gate measures that `-C` against the directory the session started in rather than the one git will stand in.
+
+**Measured 2026-09-04.** Throwaway governed rig -- a primary, a nested worktree, a linked worktree and an independent clone -- with the hook subprocess cwd set equal to the payload cwd. Identical verdicts on `origin/main` and on the #1065 chdir-window branch:
+
+```
+cwd = an UNGOVERNED clone
+  git commit -C HEAD && cd "<primary>" && git -C . config core.hooksPath /nope     ALLOW
+  reality: the write lands in the GOVERNED primary's shared config
+
+cwd = the GOVERNED primary
+  git commit -C HEAD && cd "<ungoverned>" && git -C . config core.hooksPath /nope  DENY
+  reality: the write lands in the ungoverned clone, and the refusal names the primary
+
+controls, the same `-C .` with no chdir on the line
+  from the primary            DENY
+  from the ungoverned clone   ALLOW
+```
+
+The controls are what make the two rows above readable: `-C .` alone is judged correctly in both directions, so the chdir is the only variable.
+
+**ONE ROOT CAUSE, SYMPTOMS IN BOTH DIRECTIONS**, which is a signature this file already records twice -- a base that is not the base. A fix aimed only at the ALLOW direction produces the DENY direction, and #1085 is this same defect one window earlier on the line.
+
+**WHY #1065's ACT STOPPED SHORT, stated so the gap is not read as an oversight.** That fix appends the followed chdir as a candidate ONLY when the disarming invocation names no repository of its own. The gate is deliberate: when an explicit `-C` or `--git-dir` IS present, that token decides where the write lands, and letting a governed chdir outrank it manufactures exactly the false deny above. Closing THIS row instead means composing the window chdir into the **`-C` branch** of the resolver -- widening the base every `-C` on every calling rule is measured against -- and that is the class of change two rejected rounds of #1065 died of, both times because the replacement turned out narrower or wider than the matching it displaced.
+
+**ANY FIX MUST PIN BOTH DIRECTIONS PLUS AN UNGOVERNED CONTROL**, red-first against the pre-fix gate in each direction. A suite carrying only the fail-open row passes against a rule that denies everything, and the false-deny row is the one that actively misinforms the session reading it.
+
+**Related:** #1065 (the pass that measured this, and whose fix deliberately stops at the gate described above), #1085 (the same COMPOSE-versus-PREFER defect in the prefix window, fixed and verified), #1066 (declined-by-design 2026-08-25, the residual family this joins), #1000 (a control green because it cannot see the class it covers).
+
+**Source:** the adversarial pass on #1065's own chdir-window fix, tasked with finding the shapes the new matching does not catch rather than confirming the ones it does.
+
