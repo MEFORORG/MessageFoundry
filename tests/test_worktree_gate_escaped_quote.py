@@ -224,6 +224,17 @@ def test_an_ordinary_command_is_still_allowed(primary: Path, repos_file: Path) -
 # command substitution, backticks, ANSI-C quoting, concatenated quoting, heredocs, bare program
 # names, and the per-line split. None is introduced here and none is fixed here. They are with the
 # Dispatcher as a disclosure question.
+#
+# THREE THINGS ABOVE HAVE SINCE MOVED, and none of them deletes the disclosure. (1) The count of
+# twelve is UNCONFIRMED -- BACKLOG #1427 re-derived the census and could not reach it, and no
+# artifact anywhere lists the twelve individually. Read the list as categories, not as a number.
+# (2) The Dispatcher is a RETIRED SEAT (CLAUDE.md section 5), so "with the Dispatcher" routes
+# nowhere; the disclosure landed in #1427 instead. (3) "the per-line split" names the mechanism and
+# not the hole. The hole needs the gated command on a LINE carrying the closing quote of one
+# newline-crossing span AND the opening quote of the next; every neighbour one property away denies.
+# That imprecision is what let #1427 and #1429 record opposite results and both be right. The four
+# allowing corners are pinned in tests/test_worktree_gate_quote_straddle.py and the neighbours in
+# tests/test_worktree_gate_line_split_discriminator.py.
 
 
 # COVERAGE NOTE, deliberately a comment rather than an assertion, because what it names is a CLASS and
