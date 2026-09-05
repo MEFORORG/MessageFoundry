@@ -44,6 +44,7 @@ tests/test_bash_resolver.py
 tests/test_blanket_stage_guard.py
 tests/test_ci_docs_only_detector.py
 tests/test_ci_engine_step_excludes_webconsole.py
+tests/test_ci_faulthandler_belts.py
 tests/test_ci_leg_data_class.py
 tests/test_ci_red_reader.py
 tests/test_ci_retry_native_crash.py

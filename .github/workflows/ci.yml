@@ -1159,13 +1159,56 @@ jobs:
       #
       # `--dist loadfile` for the same reason as the engine step: these tests bind real port windows and
       # own module-scoped fixtures, so a file's tests must stay in one worker.
+      #
+      # THE SECOND FAULTHANDLER BELT, PORTED FROM THE ENGINE STEP (BACKLOG #1304). The engine
+      # `Tests (pytest)` step carries TWO watchdogs against a hung Windows leg; its derivation is there,
+      # not repeated here. This tier carried exactly ONE of them. `--timeout-method=thread` arrives
+      # repo-wide through `addopts` in pyproject.toml, so it was already live here; `PYTHONFAULTHANDLER=1`
+      # plus `-o faulthandler_timeout=` is set on the engine and web-console test steps and on nine
+      # further steps in this file, and on this one it was absent.
+      #
+      # THIS DOES NOT TURN AN UNNAMED FAILURE INTO A NAMED ONE, AND THE MEASUREMENT SAYS SO. Paired local
+      # arms on a test that blocks in `subprocess.run` with no `timeout=` of its own -- the shape 164 of
+      # this tier's 317 `subprocess` calls have, across 57 of the 138 files in tests/tooling_manifest.txt
+      # (AST count at 46ea10a78 against a control of 153 bounded calls, so a zero was reachable). WITHOUT
+      # this belt the thread method already fires and already names the frame, down to
+      # `_winapi.WaitForSingleObject`, and the `+ Timeout +` header appears twice in BOTH arms while the
+      # faulthandler header appears in ONE. Reading the pinned pytest-timeout on disk
+      # says why -- `timeout_timer` dumps from a WATCHDOG THREAD and calls `os._exit(1)`, so it never
+      # needs to interrupt the wedged main thread. Anyone porting this on the belief that the thread
+      # method cannot fire on a C-level wait is porting it for a reason that does not hold.
+      #
+      # WHAT IT ACTUALLY BUYS, which is narrower and still worth the two lines. A SECOND watchdog on an
+      # INDEPENDENT mechanism (CPython's C-level `dump_traceback_later`, not a Python `threading.Timer`),
+      # writing down a DIFFERENT path: faulthandler dumps to a raw dup'd stderr fd, while pytest-timeout
+      # writes through `config.get_terminal_writer()`. That distinction is why it is worth having on the
+      # one tier that runs `-n 4` -- `_pytest/faulthandler.py` comments that xdist monkeypatches
+      # `sys.stderr` with a non-file, and whether the terminal-writer dump survives a worker's `os._exit`
+      # and reaches the controller log is NOT established here (no xdist on the measuring box).
+      # `PYTHONFAULTHANDLER=1` additionally arms the fatal-signal handler from interpreter start, before
+      # `pytest_configure` arms pytest's own and after `pytest_unconfigure` disables it, and is inherited
+      # by Python children -- and this tier spawns more children than any other. faulthandler only DUMPS,
+      # never kills, so the outcome of every run is unchanged.
+      #
+      # 150 AGAINST THE 120 BELOW, and the ordering is the contract, not the numbers: the per-test bound
+      # must be attributed FIRST, so this sits above it, exactly as the engine legs pair 150/120 and
+      # 90/60. Both legs here share one `--timeout=120` (unlike the engine matrix, which varies it per
+      # leg), so one literal covers both and no matrix field is needed. Move one, move the other.
+      #
+      # WHAT NEITHER BELT COVERS, stated so nobody reads this as more than it is. Both arm per-ITEM, so a
+      # wedge during collection or in a session fixture reaches neither. And under `-n` the xdist
+      # CONTROLLER runs no items, so a controller left polling a dead worker is silent until the step cap
+      # -- the engine step answers THAT with a third belt (`--max-worker-restart=0`) this tier does not
+      # carry. It was deliberately not ported blind: it is a behaviour change whose zero cost was
+      # measured on the engine tier's history and on no sample from this one. See BACKLOG #1304.
       - name: Harness tests (pytest)
         timeout-minutes: 30 # see the job cap above for the derivation; must stay under it with setup
         env:
           # Same reason as the apt step above: collection imports the Qt modules whether or not this
           # job executes them, and the shipped ones construct QApplication at import on some paths.
           QT_QPA_PLATFORM: offscreen
-        run: pytest -q -n 4 --dist loadfile -m tooling --ignore-glob='*messagefoundry-webconsole*' --timeout=120 --junitxml=tooling-junit.xml
+          PYTHONFAULTHANDLER: "1"
+        run: pytest -q -n 4 --dist loadfile -m tooling --ignore-glob='*messagefoundry-webconsole*' -o faulthandler_timeout=150 --timeout=120 --junitxml=tooling-junit.xml
 
       # A marker typo, a manifest rename, or a conftest hook that silently stops firing all produce the
       # same thing: zero selected tests and a GREEN job. Deselection cannot be distinguished from success
