@@ -22627,3 +22627,42 @@ All 137 listed entries were swept for a repo-rooted read of `messagefoundry/**`.
 
 1. **The five pull requests above.** A Builder must not push to another seat's branch, so each is fixed by whoever next touches it: append `tests/<name>.py` to `tests/tooling_manifest.txt`, keeping the list alphabetical. **The gate is passable and two pull requests that night passed it correctly -- nothing here asks for it to be weakened.**
 2. **Three copies of the manifest parser, pinned against nothing.** This file, `_tooling_basenames` in `tests/conftest.py` (the copy that actually applies the marker), and `_manifest_paths` in `tests/test_ci_tooling_gate.py` all implement the same rule. Extracting one `tests/_tooling_manifest.py` is the real fix. Related: `test_every_manifest_entry_trips_its_own_gate` in `tests/test_ci_tooling_gate.py` feeds each manifest entry back as its own changed path, so on the manifest arm every entry matches itself unconditionally.
+
+## 1453. adopt the three hook patterns the orchestration survey found genuinely missing: a context-budget guard, a gh-run-watch denial, and a PreCompact re-prime
+
+> 🚧 **Filed 2026-09-05. Three hooks are built, tested and wired on this branch. The survey that motivated them ALSO found that two of its top-ranked gaps were already closed, and that correction is the more useful half of this item.** A survey of ten agent-orchestration repositories ranked eight Claude Code hook and skill patterns for adoption. Measured against the INSTALLED configuration rather than against `CLAUDE.md` prose, three of the eight were genuinely absent, two were already built, and three are structural changes to how seats spawn that are deliberately not in this change.
+
+**Cluster:** CI gates / development harness. **Priority:** P3. **Verdict:** build.
+**Severity:** no deployment axis (sec. 0). These are repository-side developer hooks. No engine behaviour, no shipped artifact, and no configuration a deploying site would meet.
+
+### What was measured, and how the ranking was wrong
+
+The adoption ranking was written by reading `CLAUDE.md` and never reading `~/.claude-account-1/settings.json`. That is the method document, not the running configuration, and the two disagree.
+
+| Ranked item | Claimed gap | Measured state |
+|---|---|---|
+| Stop-hook mail injection | "nothing pushes a notice to a seat" | **Already built.** `scripts/hooks/mail-drain.ps1` is wired at `Stop` and emits `hookSpecificOutput.additionalContext`. |
+| UserPromptSubmit mail inject | "mail drains at SessionStart only" | **Already substantially covered** by the same `Stop` drain. |
+| Context-budget guard | no instrument for context-window fullness | **Absent.** Built here. |
+| `gh run watch` denial | no guard on shared API budget | **Absent.** Built here. |
+| PreCompact re-prime | context lost at compaction | **Absent.** Built here. |
+
+The claim `"every notice is polled, and nothing is pushed"` in section 5 is scoped to **workflows** by its own following sentences, and was over-read as covering session messaging. KORUS has the channel; what it lacked was an automatic trigger on the events below.
+
+### What is built
+
+1. **`scripts/hooks/context-budget.ps1`** (`UserPromptSubmit`). Reports how full THIS SESSION'S context window is, at 0.75 / 0.85 / 0.92. It measures a different quantity from `usage-headroom-inject.ps1`, which reads **account pool** headroom -- a seat with a fresh pool can still be one turn from a compaction, and both get called "usage". It **reports and never blocks**: gastown's original hard-gates by role, but a Builder blocked at its prompt has no next turn in which to be told, so blocking burns the brief rather than saving it. Fails open on every path.
+2. **`scripts/hooks/block-api-burn.ps1`** (`PreToolUse` on `Bash` and `PowerShell`). Denies `gh run watch`, any `gh ... --watch`, and hand-rolled `gh` poll loops. Every seat acts as one GitHub identity against one 5000/hr budget, and `gh run watch` polls every three seconds. The denial reason names the single-shot replacement. `gh` must sit in **command position**: the first draft denied `echo "gh run watch is banned"`, which would have blocked writing this very item.
+3. **`scripts/hooks/precompact-reprime.ps1`** (`PreCompact`). Restores the seat, the goal, the ledger numbers this worktree holds, and whether the branch is pushed. **It refuses to restore a declaration whose branch differs from the current one**, because worktrees are re-used and a stale goal reads as authoritative. Run live in the allocating worktree it correctly reported the declaration as a previous occupant's, on branch `ci/retire-review-gate`, 2.6 days old.
+
+### What is deliberately NOT in this change
+
+Three ranked items alter how every seat launches, and six sessions were live while this was written.
+
+1. **Separate autonomous and interactive settings profiles.** `scripts/worktree/spawn.ps1` has no profile or `--settings` logic today.
+2. **A base-to-role settings merge passed with `--settings`.** This is the real fix for tracked `.claude/settings.json` being per-worktree-per-branch, and it is a spawn-path change.
+3. **A contributor skill carrying an executable pre-commit self-check.** Additive and low risk, but it belongs with the two above so the checks it runs match the profile the seat launched under.
+
+### Where the evidence lives
+
+The full ranked register, its corrections and its per-item evidence strength are a published artifact, not a repository document, so a repository search for it returns zero and **that zero is not evidence the work was not done**.
