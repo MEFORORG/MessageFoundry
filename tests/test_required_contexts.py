@@ -12,19 +12,33 @@ not be answered from a clone -- and five places in this repo answered it differe
                                           and under a different string than its own line 18 gives
     tests/test_push_guard.py              12
 
-The live API said 12 when those five were counted. It says 14 at 2026-08-31 20:57 CDT. That question
+The live API said 12 when those five were counted. It says 13 at 2026-09-04 18:48 CDT. That question
 is not trivia here: ``required_approving_review_count`` is 0 and auto-merge is armed, so required-set
 membership is the ONLY thing separating "reviewed" from "merged unread". A session reasoning from
 docs/CI.md would conclude that gitleaks, semgrep, npm-audit and crypto-inventory are advisory -- i.e.
 that four blocking security gates were safe to weaken.
 
-THE SET NOW HOLDS A CONTEXT THAT DOES NOT TEST THE CODE, and it is the one with the least behind it.
-``a reviewer has read this`` (review-gate.yml, armed 2026-08-31, BACKLOG #1404) is this repository's
-ENTIRE review requirement. It is load-bearing BECAUSE approvals are pinned at 0 rather than in spite of
-it: every session pushes as one GitHub identity, so a human-approval rule would wedge every pull
-request instead of reviewing any. Drop that context from protection and review is not weakened, it is
-gone -- nothing else anywhere reports that a green pull request was never read. The count below is what
-makes removing it a deliberate edit rather than a quiet one.
+EVERY CONTEXT IN THE SET NOW TESTS THE CODE. The one that did not, ``a reviewer has read this``
+(review-gate.yml, armed 2026-08-31 under BACKLOG #1404), was DE-REQUIRED by the owner on 2026-09-04.
+With approvals pinned at 0 -- every session pushes as one GitHub identity, so a human-approval rule
+would wedge every pull request instead of reviewing any -- that context was the repository's entire
+review requirement, and removing it did not weaken review so much as end it: nothing on the merge path
+now reports that a green pull request was never read. ``.github/required-contexts.txt`` records the
+owner's call and its cost; this suite only holds the file honest about it.
+
+THIS SUITE CANNOT SEE THE SERVER, WHICH IS WHY THE DE-REQUIRING SAT HERE UNNOTICED. Everything in this
+file reads the checked-in file, the workflows and the prose; the ``gh api`` line beside the count pin
+is a COMMENT recording a manual read, not a call. So every test here stayed green while the file
+overstated the required set by one context. A green run means the in-repo claims AGREE, never that they
+are true.
+
+SOMETHING ELSE DOES READ THE SERVER, and it is the instrument to reach for when the answer matters:
+``scripts/ci/check_required_contexts_drift.py`` reconciles the canonical file against live branch
+protection and fails closed, run by the drift job in ``.github/workflows/required-workflow-state.yml``.
+It is deliberately NOT one of the required contexts, so it reports without blocking -- it went red on
+`main` for this very drift while this suite was green, which is the division of labour working, not a
+gap. Watched fail 2026-09-04: against the pre-fix file it exited 1 naming ``a reviewer has read this``,
+and against the corrected file it exited 0 on 13 versus 13.
 
 WHAT THIS PINS. ``.github/required-contexts.txt`` is the checked-in claim; these tests assert every
 in-repo statement agrees with it. The file is NOT the enforcement -- the server is -- so when branch
@@ -107,16 +121,21 @@ def test_the_canonical_file_parses_and_names_the_live_set() -> None:
     )
     # Pinned so that ADDING or REMOVING a required check is a deliberate, reviewed edit here rather
     # than a silent one. Verified against `gh api repos/MEFORORG/MessageFoundry/branches/main/protection`
-    # at 2026-08-31 20:57 CDT: 14 contexts, SET-EQUAL to the file with nothing extra on either side.
+    # at 2026-09-04 18:48 CDT: 13 contexts, SET-EQUAL to the file with nothing extra on either side.
     # Set-equal is the reading worth recording -- a count alone cannot tell a matching set from two
     # errors that cancel.
+    #
+    # THE DATE IS NOT DECORATION AND MUST NOT BE COPIED FORWARD. Re-read the API and write down what
+    # THAT call returned; a stamp carried over from the last edit claims a measurement nobody took.
     #
     # THE PIN GOES STALE IN THE DIRECTION THAT LOOKS FINE. It read 13 while the server held more, and
     # a context this file omits reads as NOT BLOCKING -- the reassuring answer rather than the true
     # one. A count that only ever fails when someone edits the FILE cannot notice the server moving
-    # underneath it, so reconcile against the API, never against this number. The server moved four
-    # times on 2026-07-29 and twice more on 2026-08-31.
-    assert len(contexts) == 14, (
+    # underneath it, so reconcile against the API, never against this number -- or let
+    # scripts/ci/check_required_contexts_drift.py do it, per the module docstring. The server moved
+    # four times on 2026-07-29, twice more on 2026-08-31, and again on 2026-09-04 when `a reviewer has
+    # read this` was de-required, which this pin over-reported as required until it was re-measured.
+    assert len(contexts) == 13, (
         f"the canonical required set changed to {len(contexts)} contexts. If branch protection really "
         "changed, update this count AND every claim this suite checks; if it did not, revert the file."
     )

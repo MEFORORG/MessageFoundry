@@ -263,23 +263,27 @@ def test_required_jobs_carry_no_continue_on_error() -> None:
     # change in the collapse — a matrix split, or a context that quietly stops resolving — forces a
     # look here instead of passing on a self-consistent count.
     #
-    # 14/12 since 2026-08-31 (BACKLOG #1404), when `a reviewer has read this` was recorded. One
-    # collapse: ci.yml's `test` matrix reports 3 contexts from 1 job, so 14 - 2 = 12.
+    # 13/11 since 2026-09-04, when the owner DE-REQUIRED `a reviewer has read this` and review-gate's
+    # job left this module's scope with it. One collapse: ci.yml's `test` matrix reports 3 contexts
+    # from 1 job, so 13 - 2 = 11. (It was 14/12 from 2026-08-31, when that context was armed, #1404.)
     #
     # THIS MODULE READS THE CANONICAL FILE, NOT THE SERVER, so a context that reaches protection and
     # not the file is not examined here. That file's own header states the ordering rule — protection
     # first, the file in the same pull request — and this pin is only as live as that discipline. Read
-    # at 2026-08-31 20:57 CDT the two were SET-EQUAL, so nothing is currently unexamined.
+    # at 2026-09-04 18:48 CDT the two were SET-EQUAL, so nothing is currently unexamined; the
+    # instrument that keeps them so is scripts/ci/check_required_contexts_drift.py, not this file.
     #
-    # Recording a context drags its job under every rule in this module for the first time, exactly as
-    # backlog-hygiene did on 2026-07-29 — and it paid immediately here: the review-gate job's
-    # `|| true` surfaced on the first CI run after that context was recorded.
+    # DE-RECORDING A CONTEXT TAKES ITS JOB BACK OUT OF EVERY RULE HERE, which is the direction that
+    # loses coverage quietly: review-gate.yml still runs, and its steps are no longer read by this
+    # module at all. Recording one does the reverse, exactly as backlog-hygiene did on 2026-07-29 —
+    # and that paid immediately here, the review-gate job's `|| true` surfacing on the first CI run
+    # after its context was recorded.
     print(
         f"[security-posture] examined {examined} distinct jobs backing "
         f"{len(required_contexts())} required contexts"
     )
-    assert examined == 12, (
-        f"expected the 14 required contexts to resolve to 12 distinct jobs (the 3 `test` legs share "
+    assert examined == 11, (
+        f"expected the 13 required contexts to resolve to 11 distinct jobs (the 3 `test` legs share "
         f"one matrix job); got {examined}. If the workflow layout genuinely changed, update this "
         "count."
     )

@@ -15,13 +15,14 @@
 # "nothing pending" would have reported green without ever waiting for a test leg, because with one
 # required context there was nothing to wait for. Count what SHOULD gate the merge, not what does.
 #
-# The set then moved four more times the same day (1 -> 13 -> 12 -> 15 -> 12), and it moved again on
-# 2026-08-31: `a reviewer has read this` was armed, and the two CodeQL matrix contexts were seen
-# required earlier that day and are no longer. THE LIST BELOW IS SET-EQUAL TO THE SERVER -- fourteen
-# contexts, nothing extra on either side -- read from the API at 2026-08-31 20:57 CDT. A set-equal
-# read is the only one worth writing down: a count alone cannot tell a matching set from two
-# offsetting errors. Two non-context settings also moved and are recorded because they change merge
-# semantics:
+# The set then moved four more times the same day (1 -> 13 -> 12 -> 15 -> 12); it moved on 2026-08-31,
+# when `a reviewer has read this` was armed and the two CodeQL matrix contexts stopped being required;
+# and it moved again on 2026-09-04, when the owner DE-REQUIRED `a reviewer has read this`. That last
+# one is recorded with its cost in the review-gate.yml entry at the foot of this file. THE LIST BELOW
+# IS SET-EQUAL TO THE SERVER -- thirteen contexts, nothing extra on either side -- read from the API at
+# 2026-09-04 18:48 CDT. A set-equal read is the only one worth writing down: a count alone cannot tell
+# a matching set from two offsetting errors. Two non-context settings also moved and are recorded
+# because they change merge semantics:
 #
 #   strict = TRUE  -- a PR must be up to date with `main` before it can merge. This closes the
 #                     stale-green hole: previously a PR validated against an older base could merge
@@ -30,7 +31,8 @@
 #   enforce_admins = TRUE -- an admin's direct push to `main` is refused by the server, not merely by
 #                     the local hook. It was ON from 2026-07-28, turned OFF on 2026-07-29 through the
 #                     escape hatch in scripts/hooks/push_guard.py (for when a permanently red required
-#                     check blocks every merge), and READ BACK AS TRUE on 2026-08-31.
+#                     check blocks every merge), READ BACK AS TRUE on 2026-08-31, and TRUE again in
+#                     the 2026-09-04 read above. `strict` re-read TRUE in that same call.
 #
 #                     THE HOOK ITSELF IS ALREADY CORRECTED. scripts/hooks/push_guard.py's module
 #                     docstring and its user-facing warning were rewritten in this same change, and
@@ -152,59 +154,45 @@ a PR that implements BACKLOG #N must update BACKLOG.md
 # prevent. Adding to protection is all-or-nothing: the REST endpoint 422s with `already_exists` if any
 # context in the request is already required, and then adds NONE of them, so send only the missing ones.
 
-# --- review-gate.yml --------------------------------------------------------------------------------
-# ARMED 2026-08-31 (BACKLOG #1404), and this line is the second half of that arming -- protection moved
-# first, this file followed, which is the order the paragraph directly above prescribes.
-#
-# THIS ONE CONTEXT IS THE REPOSITORY'S ENTIRE REVIEW REQUIREMENT, AND THERE IS NOTHING BEHIND IT.
-# `required_approving_review_count` is 0 and has to stay 0: every session on this machine pushes as ONE
-# GitHub identity (`gh` auth lives at AppData\Roaming\GitHub CLI\hosts.yml, machine-wide rather than per
-# config root), CODEOWNERS assigns every path to that same account, and GitHub refuses to let an author
-# approve their own pull request -- so raising the count to 1 wedges every pull request permanently
-# instead of reviewing any of them. review-gate.yml's header carries that measurement. With approvals
-# pinned at 0, dropping this context from protection does not weaken review, it REMOVES it: nothing
-# else anywhere reports that a green pull request was never read.
-#
-# What it enforces is a STEP, not an identity. `gh pr edit <N> --add-label reviewed` is the whole
-# protocol; nothing automated ever adds the label, and a `synchronize` event REMOVES it, so commits
-# nobody has read are unread again. It does not establish that an independent party looked, and no
-# prose here or anywhere else may describe it as if it does.
-#
-# SAFE TO REQUIRE, which for this file means one thing: the required-but-absent trap. A required check
-# that never reports blocks every pull request forever, so three separate ways it could fail to report
-# were checked before arming, and all three came back clean:
-#
-#   * IT ALWAYS DISPATCHES. The trigger is `pull_request` with NO paths filter, and the `reviewed` job
-#     carries no `if:` of its own. The `if:`s in that workflow sit on STEPS, inside a job that always
-#     runs -- and a skipped step still leaves the job reporting a conclusion, which is what branch
-#     protection reads.
-#   * IT REPORTS IN THE QUEUE. review-gate.yml declares `merge_group:`. Omitting that is the total
-#     failure codeql.yml's own header records under BACKLOG #340: a required context whose workflow has
-#     no merge_group trigger never reports on a queue entry, so NOTHING MERGES. Measured there on the
-#     first entry the queue ever held -- 32 check-runs green and three contexts simply absent.
-#   * IT REPORTS ON PULL REQUESTS OLDER THAN ITSELF. GitHub runs a `pull_request` workflow from the
-#     MERGE commit, not from the head, so a branch that predates the workflow still gets the check.
-#     VERIFIED on PR 713: its head 5cb51e46 returns 404 for .github/workflows/review-gate.yml, and the
-#     context reported on it anyway.
-#
-# SO ARMING IT STRANDED NOTHING, and the remedy is not a rebase. Every open pull request goes red on
-# this one check until a reviewer labels it; `labeled` is in the trigger list, so the label alone
-# re-runs the job and clears it. That distinction is the one worth keeping: a reader who assumes a
-# stranded check needs a rebase will rebase, which on `synchronize` STRIPS the label and moves the pull
-# request further from green.
-#
-# THAT SENTENCE IS ONLY TRUE WHILE `labeled` IS IN THE WORKFLOW'S `types:` LIST, so it is held by a
-# test rather than by this paragraph:
-#
-#   tests/test_merge_gate_controls.py::test_the_review_gate_reruns_when_a_reviewer_adds_the_label
-#
-# Deleting that action reddens nothing on its own and leaves a gate no reviewer action can clear: the
-# label fires no run, and the only trigger that still re-runs the job is `synchronize`, whose first
-# step REMOVES the label. Measured 2026-08-31 -- before the test above existed, dropping `labeled`
-# passed 65 tests.
-a reviewer has read this
-
 # DELIBERATELY NOT REQUIRED (do not add without the owner's decision; each has a recorded reason):
+#   review-gate.yml            -- DE-REQUIRED 2026-09-04 by the owner, having been armed on 2026-08-31
+#                                 (BACKLOG #1404). The workflow is untouched: it still dispatches, and
+#                                 it still reports `a reviewer has read this`. It no longer BLOCKS, so
+#                                 a red one on a pull request is not a merge problem.
+#
+#                                 WHAT THAT COSTS, recorded because nothing else on the merge path now
+#                                 records it. `required_approving_review_count` is 0 and has to stay 0
+#                                 -- every session here pushes as ONE GitHub identity and GitHub
+#                                 refuses to let an author approve their own pull request, so raising
+#                                 it to 1 wedges every pull request instead of reviewing any;
+#                                 review-gate.yml's header carries that measurement. This context was
+#                                 therefore the repository's ENTIRE review requirement. With it
+#                                 de-required, NOTHING on the merge path reports that a green pull
+#                                 request was never read. That is the owner's call, recorded here
+#                                 rather than argued.
+#
+#                                 The `reviewed` label protocol is correspondingly unenforced. `gh pr
+#                                 edit <N> --add-label reviewed` still works and still means what it
+#                                 meant -- a STEP happened, never that an independent party looked --
+#                                 but no gate reads it any more.
+#
+#                                 THE WORKFLOW'S OWN PROPERTIES ARE STILL HELD BY TESTS, in
+#                                 tests/test_merge_gate_controls.py: it reports under this exact
+#                                 context string, it declares `merge_group:`, and `labeled` is in its
+#                                 `types:` so a reviewer's label re-runs the job. Those tests stay.
+#                                 What they are no longer is NEGATIVE CONTROLS: the registry at
+#                                 tests/negative_controls.toml indexes controls by REQUIRED context
+#                                 and its reconciliation fails on a control naming a context nobody
+#                                 requires, so that entry came out in this same change and the tests
+#                                 themselves were kept.
+#
+#                                 RE-ARMING IS AN OWNER DECISION, and the three ways it could have hit
+#                                 the required-but-absent trap were measured clean before 2026-08-31
+#                                 and are unchanged: no paths filter and no job-level `if:`, a
+#                                 `merge_group:` trigger (whose absence is the total failure
+#                                 codeql.yml's header records under BACKLOG #340), and it reports on
+#                                 branches older than itself -- verified on PR 713, whose head
+#                                 5cb51e46 404s for the workflow file and got the check anyway.
 #   codeql.yml, scorecard.yml  -- their SARIF upload needs `security-events: write`, which fork-PR
 #                                 tokens lack, so requiring them would block every fork PR.
 #                                 `CodeQL (python)` and `CodeQL (javascript-typescript)` were read as

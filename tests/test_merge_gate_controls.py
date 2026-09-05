@@ -2,17 +2,24 @@
 # Copyright (C) 2026 MessageFoundry Organization and contributors
 """Negative controls for the required merge contexts that had none (BACKLOG #1000).
 
-A GATE NOBODY HAS WATCHED FAIL IS AN ASSUMPTION WEARING A GREEN TICK. Fourteen contexts are the entire
-merge gate as of 2026-08-31, and several of them were guarded only by the property that they exist.
+A GATE NOBODY HAS WATCHED FAIL IS AN ASSUMPTION WEARING A GREEN TICK. Thirteen contexts are the entire
+merge gate as of 2026-09-04, and several of them were guarded only by the property that they exist.
 This file supplies the missing plant-and-observe controls; ``tests/negative_controls.toml`` records
 which control belongs to which context and ``tests/test_negative_controls.py`` fails when a context has
 none.
 
 THE COUNT IS RECORDED HERE, NEVER DERIVED HERE. ``.github/required-contexts.txt`` is the checked-in
-claim and the only thing this file reads. It said thirteen until ``a reviewer has read this`` was
-reconciled onto it (BACKLOG #1404), and that is exactly how a context arrives here unproven: the
-reconciliation is driven by the LIVE required set, so a newly-required context lands with zero controls
-and SAYS SO, rather than quietly not being looked at.
+claim and the only thing this file reads. It said thirteen, then fourteen when ``a reviewer has read
+this`` was reconciled onto it (BACKLOG #1404), and thirteen again when the owner de-required that
+context on 2026-09-04. The churn is the point: the reconciliation is driven by the LIVE required set,
+so a newly-required context lands with zero controls and SAYS SO, rather than quietly not being looked
+at.
+
+NOT EVERY TEST HERE BACKS A REQUIRED CONTEXT ANY MORE. The review-gate section at the foot is the case:
+``review-gate.yml`` still exists and still runs, so those tests still hold its real behaviour, but they
+stopped being NEGATIVE CONTROLS the moment its context left the required set -- the registry indexes by
+required context and refuses an entry naming one nobody requires. They were kept rather than deleted,
+because watched-fail evidence is not bookkeeping.
 
 EVERY CONTROL HERE IS ASYMMETRIC, and that is the part most likely to be skipped. It is not enough that
 neutering a rule turns a control red -- the control must fail for exactly the shapes that rule covers
@@ -48,7 +55,7 @@ from typing import Any
 import pytest
 from _bash_resolver import CANNOT_RUN_CODES, bash_sees, explain_returncode, require_bash
 
-from tests._workflow_contexts import ROOT, jobs_of, load_workflow, required_contexts
+from tests._workflow_contexts import ROOT, jobs_of, load_workflow
 
 _TIMEOUT = 300
 
@@ -1019,11 +1026,16 @@ def test_the_absence_detector_fires_on_a_trigger_set_that_can_go_quiet() -> None
 # `a reviewer has read this` -- run as the SHIPPED SHELL against planted label sets.
 # ===================================================================================================
 #
-# ARMED 2026-08-31 (BACKLOG #1404). With `required_approving_review_count` pinned at 0 -- every
-# session on this machine pushes as one GitHub identity, so a human-approval rule would wedge every
-# pull request rather than review any -- this single context is the repository's ENTIRE review
-# requirement. Nothing else anywhere reports that a green pull request was never read, so a gate that
-# could not go red here would not be a weakened control, it would be the absence of one.
+# ARMED 2026-08-31 (BACKLOG #1404), DE-REQUIRED by the owner 2026-09-04. THE WORKFLOW IS UNCHANGED --
+# it still dispatches and still reports -- so everything below still describes live behaviour; what
+# ended is the context's power to block a merge, which is why these are no longer registered in
+# tests/negative_controls.toml. Expect a red `a reviewer has read this` on an unlabelled pull request:
+# it gates nothing now.
+#
+# WHY THEY ARE KEPT ANYWAY. With `required_approving_review_count` pinned at 0 -- every session on this
+# machine pushes as one GitHub identity, so a human-approval rule would wedge every pull request rather
+# than review any -- this context WAS the repository's entire review requirement, and nothing replaced
+# it. Re-arming is an owner decision; these tests are what would make it provable rather than hopeful.
 #
 # The gate's OWN shell is lifted out of the workflow and run, never re-implemented: a second copy of
 # that `case` would be free to agree with itself.
@@ -1163,22 +1175,27 @@ def test_the_review_gate_passes_a_pull_request_a_reviewer_has_marked_read(
         )
 
 
-def test_the_review_gate_still_reports_under_the_required_context_string() -> None:
+def test_the_review_gate_still_reports_under_its_declared_context_string() -> None:
     """The other way this gate dies, and the quieter one: the context stops arriving at all.
 
     Three surfaces, every one of them in-repo. The job NAME is the context string; a job-level `if:`
-    would let the job skip, and a skipped required check reports nothing; the trigger set decides
-    whether it reports on a pull request and in the merge queue. The `cla` control is this same shape
-    for the same reason -- where the context string is the surface, the string is what to pin.
+    would let the job skip, and a skipped check reports nothing; the trigger set decides whether it
+    reports on a pull request and in the merge queue. The `cla` control is this same shape for the
+    same reason -- where the context string is the surface, the string is what to pin.
+
+    IT NO LONGER ASSERTS THAT THE CONTEXT IS REQUIRED, because since 2026-09-04 it is not. This test
+    kept its three structural assertions and dropped only that one, so what it now holds is that
+    re-arming would WORK: a job whose name drifted, or which could skip, or which could go absent in
+    the queue, is a context that cannot be put back on the merge path without wedging every pull
+    request. A re-arm is caught elsewhere and deliberately not duplicated here -- the registry
+    reconciliation in tests/test_negative_controls.py fails on a required context with no control, so
+    this gate cannot quietly return to blocking unproven.
     """
     job = jobs_of(_REVIEW_GATE)[_REVIEW_GATE_JOB]
-    assert _REVIEW_GATE_CONTEXT in required_contexts(), (
-        f"{_REVIEW_GATE_CONTEXT!r} left .github/required-contexts.txt. With approvals pinned at 0 "
-        "that does not weaken review, it removes it."
-    )
     assert str(job.get("name")) == _REVIEW_GATE_CONTEXT, (
         f"the job name is {job.get('name')!r}, so it reports under a different context string than "
-        f"branch protection requires. {_REVIEW_GATE_CONTEXT!r} would never report and every pull "
+        f"{_REVIEW_GATE_CONTEXT!r}. While that context is not required this reports nothing worse "
+        "than a renamed check; the moment it is re-armed, it would never report and every pull "
         "request would wedge."
     )
     assert "if" not in job, (

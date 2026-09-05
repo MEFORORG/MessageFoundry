@@ -51,7 +51,6 @@ The stable contexts required on `main` are — mirroring
 - `forbidden-content (customer/PHI leak guard)`
 - `a PR that implements BACKLOG #N must update BACKLOG.md`
 - `cla`
-- `a reviewer has read this`
 
 `cla` is the **job key** in `cla.yml`, whose job declares no `name:`. Branch protection
 matches the job name, never the workflow name — so the context is `cla`, not "CLA Assistant". Every
@@ -69,12 +68,13 @@ the same reason and additionally **does not run on PRs at all** (`scorecard.yml`
 trigger — it runs on push-to-main, a schedule, and branch-protection changes). Nightly / path-gated
 legs (service-smoke, load, SQL/Postgres store) are deliberately **not** required.
 
-`a reviewer has read this` (`review-gate.yml`) is the required check that is **not a test of the code**,
-and the one with nothing behind it. `required_approving_review_count` is 0 and stays 0 — every session
-pushes as one GitHub identity, so a human-approval rule would wedge every PR rather than review any —
-which makes this single context the repository's whole review requirement. A PR clears it with
-`gh pr edit <N> --add-label reviewed`; a new commit removes the label, so re-review is automatic. It
-proves a **step happened**, not that an independent party looked.
+`a reviewer has read this` (`review-gate.yml`) was **de-required by the owner on 2026-09-04**, having
+been required since 2026-08-31. **The workflow still runs**, so a PR with no `reviewed` label still
+shows that check red — it just does not block a merge any more, and it is not something to chase.
+`required_approving_review_count` is 0 and stays 0, because every session pushes as one GitHub identity
+and a human-approval rule would wedge every PR rather than review any. That made this one context the
+repository's whole review requirement, so **nothing on the merge path now reports that a green PR was
+never read**. `.github/required-contexts.txt` records that call and its cost; do not restate it here.
 
 The `quality-advisory.yml` jobs create **no code-scanning category** and **no _required_ check context** —
 they do report as ordinary advisory checks, and they **must never be added to the required list**. Two
