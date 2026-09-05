@@ -159,8 +159,17 @@ down with it, so the enumeration shipping in this wheel was checked by nothing a
   honours the nonce CSP honours it.
 * **``Referrer-Policy: no-referrer``** (engine middleware) — DEGRADES SILENTLY. Compensating: the same
   policy is ALSO carried in-document by ``<meta name="referrer" content="no-referrer">`` in every page
-  shell (:func:`._html.page`), /ui URLs carry opaque ids only (never PHI), and ``/ui`` links off-site
+  shell (:func:`._html.page`), /ui URLs carry no operator-typed search term, and ``/ui`` links off-site
   nowhere.
+
+  That middle clause holds BY CONSTRUCTION, and it did not always — the console's search and
+  uploaded-log browse once took the operator's typed needle on the query string, which is exactly what
+  BACKLOG #1184 (ASVS 14.2.1) removed. ``docs/PHI.md`` §5 classifies what a /ui URL may carry (and §7
+  the log residual that outlived the removal); this file does not restate either. What keeps it true is
+  ``tests/test_content_search.py::test_no_get_or_head_route_declares_a_phi_needle_parameter``, which
+  walks both planes' route tables and reds if ``content`` or ``field_value`` is declared on a GET or
+  HEAD again. **Cite that guard, not this sentence.** A compensating control that is merely true, with
+  nothing naming what makes it true, goes quietly false the next time somebody adds a search parameter.
 * **``Strict-Transport-Security``** (engine middleware, effective-https only) — DEGRADES SILENTLY.
   Compensating: TLS is terminated by the documented reverse proxy, which is configured to redirect
   cleartext, and the ``window.isSecureContext`` banner above makes a cleartext hop visible to the
