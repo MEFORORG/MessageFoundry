@@ -395,7 +395,7 @@ Ordered by value descending, then difficulty ascending (cheapest first at equal 
 | 30 | **#1065** | Rule 3c reads the target-candidate SET as a scalar, so any `-C` token on the line disables it | 7 | 6 | _big bet_ | P2 | Rule 3c still takes the scalar $where[0] at worktree_gate.ps1:1031 from the set the resolver returns at :985, so neither banked fix is in the tree and the fail-open stands as filed. Value 7 is the rubric's real-gap-no-workaround rung: a gate that fails open admits no operator workaround, but the item's own Severity line records no product effect and no PHI effect, which forecloses rung 8's only applicable clause as well as rung 9's. Difficulty 6 because two written fixes were rejected by independent verification, the second with at least five new fail-opens and two false-deny classes that a 420-test green suite could not see, so the remainder is a correctness-gated rewrite of the matching rule. |
 | 31 | **#1066** | Rule 3c strips double quotes only, so a single-quoted -C target bypasses it -- including an absolute one | 7 | 6 | _big bet_ | P2 | Both halves are live on the repo blob and on the installed hook that actually governs this machine: the -C reader is the unchanged double-quote-only regex and the disarm-key match still reads the quote-blanked scan text, so a single-quoted absolute -C and every quoted -c alias override remain reachable by ordinary spellings. Value 7 because this governs agent behaviour in development with no product or PHI effect, which is above the rubric's parity rungs but below the production and ASVS rungs; difficulty 6 because two written fixes have been rejected by adversarial verification, the second yielding at least five new fail-opens with residuals filed as #1067, #1069, #1070, #1071 and #1072. |
 | 32 | **#1108** | research an honest pass for ASVS 2.1.1 -- what the operator API's input validation rules would have to be before any documentation could define them | 7 | 6 | _big bet_ | P2 | Counted at HEAD, api/models.py carries 21 max_length bounds against 206 str annotations, reproducing the item's 21-of-205, expose_docs still ships False at settings.py:726, and no per-field validation reference exists under docs/ (HL7-VALIDATION.md and CODESETS.md are both data-plane). Value 7 for a real L1 gap with no workaround where the coverage half is not merely documentary; difficulty 6 because the item forbids restating field types as the honest pass, so an expected structure must first be decided for ids, connection names, globs, time ranges and free-text search and then made real across the API models under mypy strict, with the console, harness, IDE extension and apiclient all consuming those bounds. |
-| 33 | **#1109** | research an honest pass for ASVS 2.2.1 -- positive validation that does not sacrifice the tolerance the HL7 default exists to protect | 7 | 6 | _big bet_ | P2 | Both limbs stand -- validation.strict ships False at config/models.py:667 and api/models.py carries no model_config across 84 models, against five extra=forbid declarations in config/models.py. Value 7 not 8: the 2.2.1 cell is graded at LEVEL 1, so rung 8's ASVS L3 Partial limb does not reach it, and an authenticated loopback-bound API silently ignoring unknown body keys is not rung 8's production blind spot with no workaround -- it is rung 7, a real gap an operator cannot close from outside the app. Difficulty 6 stands: two independent limbs, a method ruling on which clause binds an L1 requirement inside an L3 assessment, and an API-side positive-validation change that would reach the console and apiclient callers too. |
+| 33 | **#1109** | research an honest pass for ASVS 2.2.1 -- positive validation that does not sacrifice the tolerance the HL7 default exists to protect | 7 | 6 | _big bet_ | P2 | The API limb SHIPPED 2026-09-04 (see the item note): the 32 request-body models now carry extra=forbid via api/request_model.py, so the 84-models-with-no-model_config reading on this row is spent. The HL7 limb stands -- validation.strict still ships False at config/models.py:667 -- and the method ruling is still undecided, so the item stays open on the Tracker's re-score. Scores NOT re-rated here; a builder does not re-score. Value 7 not 8: the 2.2.1 cell is graded at LEVEL 1, so rung 8's ASVS L3 Partial limb does not reach it, and an authenticated loopback-bound API silently ignoring unknown body keys is not rung 8's production blind spot with no workaround -- it is rung 7, a real gap an operator cannot close from outside the app. Difficulty 6 stands: two independent limbs, a method ruling on which clause binds an L1 requirement inside an L3 assessment, and an API-side positive-validation change that would reach the console and apiclient callers too. |
 | 34 | **#1169** | research an honest pass for ASVS 11.3.3 -- a strict-ciphertext read that refuses an unmarked cipher column | 7 | 6 | _big bet_ | P2 | A stripped marker would, on a first deployment, read back as plaintext instead of failing, so the integrity property the AEAD writer provides would be silently absent on that row, and the cell additionally carries the re-homed DIRECT S/MIME unauthenticated AES-128-CBC surface with no other cell to defer to. Difficulty 6 stands because strict mode must decide per-column versus global scope across dozens of decrypt call sites in three backends, and must define the mixed-marker state that arises inside a single install when encryption is enabled after rows exist or a value is purged. |
 | 35 | **#1180** | research an honest pass for ASVS 12.3.4 -- narrowing internal TLS trust when the anchor is an artifact only the deployer holds | 7 | 6 | _big bet_ | P2 | Both shortfalls confirmed at HEAD: the anchor ships off, and on the HTTP egress family it is inexpressible, since resolve_trust_anchor reaches only dicom, mllp and remotefile while rest.py and soap.py expose verify_tls alone and both hvac sites pass no CA. On a first deployment every internal REST, SOAP, FHIR, DICOMweb and Vault hop would verify against the whole OS store, including the hop that hands out the store data-encryption key. Difficulty 6 because this is a client-construction change across rest.py, soap.py and both hvac sites plus a refuse-versus-fall-back posture decision, not a default flip. |
 | 36 | **#1185** | research an honest pass for ASVS 14.2.2 -- cache control for PL-2 responses the coverage guard is structurally unable to see | 7 | 6 | _big bet_ | P2 | The tuple at api/app.py:346 still carries the same five prefixes, the middleware at :1296-1305 has exactly two arms, and none of the three monitoring routes at :2321, :2348 and :2391 falls under either, so on a first deployment those PL-2-bearing responses would carry no cache directive. Value 7 is rung 7 -- no operator-side remedy exists in the default posture, and the second disjunct's process-lifetime decrypted caches have none at all. Difficulty 6 because the fix is structural rather than additive: the guard in tests/test_no_store_phi_coverage.py selects routes by permission gate and so can never see a monitoring-gated PL-2 route, and the item also requires rulings on whether sensitivity tracks permission or classification and on the docstring-versus-PHI.md conflict. |
@@ -7563,6 +7563,55 @@ The refusal names the scheme it found. A base URL with no scheme fails here too,
 **One correction to the supporting record before anyone builds the API limb: it is not a one-line fix.** `messagefoundry/apiclient/client.py:27` and `:45` import 38 of those same classes to parse engine RESPONSES, so a blanket `extra="forbid"` would make the apiclient, the harness and the web console throw when reading a newer engine that grew a response field. The posture must be request-model-scoped, with the split recorded in a comment beside the shared base so it is not later tidied away.
 
 **Proposed work, by subject, all unallocated:** extending the existing declared-content-type sniff to the four network-listener sources -- worth doing, and explicitly NOT scoreable as moving this cell; the request-model extra-key posture, request-scoped, correcting the one-line-fix characterisation in the same change; the IDE engine-response contract, giving the success path at `ide/src/engineClient.ts:127` and `:183` the discipline the error path in the same file already has at `:211-221`; and the conformance `profile` parameter, which `messagefoundry/parsing/validate.py:48,57-58` accepts, documents and enforces nowhere -- enforce it or delete it.
+
+**Built 2026-09-04: the API limb, and only that. The item stays OPEN.** Its closing act is
+`scorecard-rescore`, which is the ASVS Tracker's act followed by the Lander's banner flip. Neither
+is a builder's. The HL7 limb was not touched and the method question was not decided, so **this
+build does not move the cell and must not be scored as if it did.** What it does is take the API
+limb off the list of things holding the cell short.
+
+**Both counts on this item were re-measured at HEAD `a2eef0f3` before anything changed, because
+both had drifted.** `messagefoundry/api/models.py` and `messagefoundry/api/auth_models.py` carried
+**zero** `model_config` across **125** model classes (93 and 32), against this item's "84" and the
+2026-08-20 research's "116" -- the substance held on both readings, the counts did not, because the
+files grew. Positive control in the same run: five `extra="forbid"` in
+`messagefoundry/config/models.py`. The request/response split was then read from FastAPI's own
+`route.body_field` at runtime rather than re-derived from source with a regex, which is a second and
+silently different definition of "request model". That read reports **32** of the 125 reachable from
+a request body and **93** reachable only from a response.
+
+**What shipped.** Those 32 now subclass a new `RequestModel` in
+`messagefoundry/api/request_model.py`, which sets `extra="forbid"`; the 93 stay tolerant.
+`tests/test_api_request_models_forbid_extra.py` pins the split in **both** directions off that same
+runtime read. The second direction is the control, not decoration: a blanket flip across all 125
+passes the first assertion and breaks every client, so the test that response-only models stay
+tolerant is the only thing that tells the two apart.
+
+**The record's "not a one-line fix" correction is carried, and the defect is sharper than "a key is
+dropped".** `PUT /users/{id}/channel-scope` takes `ChannelScope`, whose `channels` is optional and
+whose `None` means ALL channels. A body of `{"chanels": ["IB_ACME_ADT"]}` therefore asked for one
+connection, granted every one, and answered 200 -- an RBAC over-grant by typo. That is why the five
+shapes carried in **both** directions (`AdGroupMap`, `AdGroupMapEntry`, `AdGroupScopeEntry`,
+`AdGroupScopeMap`, `ChannelScope`) take the request rule rather than being excused as response
+models, and the cost is written where it bites, in the base class and in the pinning test: adding a
+field to one of those five is a client-visible wire change, and the release that adds it must ship
+the client bump with it.
+
+**No caller needed changing, and that is a measurement rather than an assumption.** The web console
+constructs these models by explicit keyword against declared fields (`routes/search.py:191,240`,
+`routes/core.py:682`, `routes/monitoring_writes.py:131,164`, `routes/uploaded_logs.py:312,387`,
+`routes/connection_writes.py:119`, `routes/config.py:58`) and never splats a form dict into one; the
+apiclient's JSON bodies are field-exact; the harness reaches the engine only through the apiclient
+and imports response models alone; the IDE's three bodies (`/auth/login`, `/ai/chat`,
+`/config/reload`) name declared fields only; and the approvals replay path reads its stored params as
+a bare `Mapping` (`api/app.py:530-560`), never re-validating them into a request model.
+
+**What remains, unchanged by this build.** The HL7 limb: `validation.strict` still ships `False` at
+`config/models.py:667`, deliberately, and the 2026-08-20 finding that this cell's ceiling is
+**partial** is untouched -- shipping strict validation on would make a deploying site NAK the
+clinical traffic the engine exists to tolerate. And the method question this item names, whether
+"all input" or the L1 focus binds a level-1 requirement inside an L3 assessment, is still undecided
+and still decides whether the cell is reachable at all.
 
 ## 1110. research an honest pass for ASVS 2.2.3 -- whether cross-field reasonableness is shippable at all in a code-first engine, or belongs to the feed author
 
