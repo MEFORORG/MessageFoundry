@@ -746,6 +746,22 @@ async def authorize_ui_ws(
     # ASVS 6.3.3, mirroring authorize_ws on the header path: an MFA-pending session does not stream.
     # No exempt set — every /ui socket is a data feed, none is part of the enroll/verify escape path.
     if not await auth.mfa_satisfied(token):
+        # ASVS 16.3.2 / BACKLOG #1197 — audited for the SAME reason ``audit_mfa_denied`` exists on the
+        # engine's gates: this refusal sits ABOVE the permission loop, so the denial call down there
+        # cannot reach it, and nothing downstream records it either (the caller falls back to the
+        # engine's ``authorize_ws``, which never sees a browser handshake — header-only token, and its
+        # Origin check refuses every browser Origin against the shipped empty allowlist). Without this
+        # a stolen password-only cookie could probe the socket and leave the chain silent.
+        #
+        # The rate is bounded by the client, not by a knob: ``static/app.js`` opens ``/ws/stats`` once
+        # per page load and its ``onclose`` resumes the HTTP poll instead of re-opening, so there is no
+        # reconnect loop behind this row. An MFA-pending session cannot load that page anyway
+        # (``require_ui`` diverts it to enroll), which leaves the direct handshake — the attacker case
+        # this row exists to catch.
+        #
+        # Same shape as ``require_ui`` above and ``api/security.py``: the PATH, never the full URL,
+        # because the query string is where an operator's search terms live.
+        await auth.audit_mfa_denied(identity, websocket.url.path)
         return None, None
     for permission in permissions:
         if not identity.has(permission):

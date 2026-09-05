@@ -977,6 +977,82 @@ async def test_ws_cookie_auth_permission_denial_is_audited(engine: Engine) -> No
     }
 
 
+async def test_ws_cookie_auth_mfa_pending_refusal_is_audited(engine: Engine) -> None:
+    """BACKLOG #1197 (ASVS 16.3.2, the BASE failed-attempt limb): the MFA-pending refusal leaves a row.
+
+    This refusal sits ABOVE the permission loop, so the denial call inside that loop cannot reach it,
+    and nothing downstream records it either — the caller falls back to the engine's ``authorize_ws``,
+    which never sees a browser handshake (header-only token, and its Origin check refuses every browser
+    Origin against the shipped empty allowlist). Without this call a stolen password-only cookie could
+    probe the socket and leave the chain completely silent, which is the exact scenario
+    ``audit_mfa_denied`` was added to the engine's gates for.
+
+    RED when the ``audit_mfa_denied`` call is removed from ``authorize_ui_ws``. Measured at HEAD before
+    it existed: the console wrote ZERO rows here while the engine's header path wrote
+    ``auth.mfa_denied`` for the same session in the same run.
+
+    The permission asserted is one this OPERATOR does NOT hold, which makes this an ordering guard too:
+    only ``auth.mfa_denied`` may appear. A ``auth.permission_denied`` row would mean the MFA gate had
+    slipped below the permission loop, and refusing there tells an unverified caller whether it holds
+    the permission — a free authorization oracle.
+    """
+    from messagefoundry.auth import Permission
+    from messagefoundry_webconsole import authorize_ui_ws
+
+    service = AuthService(engine.store, AuthSettings(require_mfa=True))
+    await service.initialize()
+    await _add(service, "op", Role.OPERATOR)
+    app, token = await _token(engine, service, "op")
+
+    # Controls: the arm really is MFA-pending, and the identity resolves — so the gate reaches the MFA
+    # branch rather than returning at an earlier one. Without these a broken sign-in would produce the
+    # same silent shape as a working one, and the assertion below would be measuring nothing.
+    assert await service.mfa_satisfied(token) is False
+    resolved = await service.identity_for_token(token)
+    assert resolved is not None and not resolved.must_change_password
+
+    async def _rows(action: str) -> list[dict[str, object]]:
+        return [a for a in await engine.store.list_audit() if a["action"] == action]
+
+    # Negative control: the sign-in above audits, but it audits nothing of this action.
+    assert await _rows("auth.mfa_denied") == []
+
+    ws = _FakeWS(origin="http://t", host="t", cookie=token, app=app)
+    identity, tok = await authorize_ui_ws(ws, Permission.CONFIG_DEPLOY)  # type: ignore[arg-type]
+    assert identity is None and tok is None  # behaviour unchanged: the caller still falls through
+
+    rows = await _rows("auth.mfa_denied")
+    assert len(rows) == 1, "the MFA-pending handshake left no record"
+    assert rows[0]["actor"] == "op"
+    # Exact equality, for the same reason the permission-denial row asserts it: the row carries the
+    # PATH and nothing else. Widening it to the full URL would put an operator's query string — where
+    # a clinician's search terms live — into the hash chain.
+    assert json.loads(str(rows[0]["detail"])) == {"path": "/ws/stats"}
+    assert await _rows("auth.permission_denied") == [], (
+        "the MFA gate must stay ABOVE the permission loop — a denial row here would mean an "
+        "unverified caller was told whether it holds the permission"
+    )
+
+
+async def test_ws_cookie_auth_mfa_satisfied_writes_no_mfa_row(engine: Engine) -> None:
+    """The MFA audit fires on the refusal branch only — a session that satisfies MFA stays quiet.
+
+    Pairs with the test above the way the grant guard pairs with the permission denial: without it, a
+    change that audited every handshake would still pass that test while multiplying the trail.
+    """
+    from messagefoundry.auth import Permission
+    from messagefoundry_webconsole import authorize_ui_ws
+
+    service = await _service(engine)  # require_mfa=False → mfa_satisfied is True for this session
+    await _add(service, "op", Role.OPERATOR)
+    app, token = await _token(engine, service, "op")
+    assert await service.mfa_satisfied(token) is True  # control: this is the SATISFIED arm
+    ws = _FakeWS(origin="http://t", host="t", cookie=token, app=app)
+    identity, _ = await authorize_ui_ws(ws, Permission.MONITORING_READ)  # type: ignore[arg-type]
+    assert identity is not None
+    assert "auth.mfa_denied" not in {a["action"] for a in await engine.store.list_audit()}
+
+
 async def test_ws_cookie_auth_grant_writes_no_denial_row(engine: Engine) -> None:
     """The denial audit fires on the denial branch only — an authorized handshake stays quiet here.
 

@@ -6,6 +6,7 @@ serve-time wiring + bind-guard (a non-loopback API bind is allowed once TLS is c
 from __future__ import annotations
 
 import datetime
+import json
 import ssl
 from collections.abc import Awaitable, Callable
 from pathlib import Path
@@ -18,6 +19,7 @@ from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.x509.oid import ExtendedKeyUsageOID, NameOID
+from fastapi import HTTPException
 from pydantic import ValidationError
 from starlette.requests import Request
 
@@ -1076,6 +1078,12 @@ def _wrap_with_cert(
     return wrapped
 
 
+#: The 'svc' account's passphrase. Named rather than inlined so the bearer-plane POSITIVE CONTROL in
+#: ``test_service_cert_authz_denial_is_audited`` signs in with the SAME credential this creates — a
+#: second copy that drifted would fail the login, and the control would report a tidy, wrong zero.
+_SVC_PW = "Correct-horse-battery-9"
+
+
 async def _svc_app(tmp_path: Path, db: str, *roles: Role) -> tuple[Any, Any]:
     """An engine + create_app wired with a cert-identity map for username 'svc' (given ``roles``)."""
     engine = await Engine.create(tmp_path / db, poll_interval=0.02)
@@ -1083,13 +1091,22 @@ async def _svc_app(tmp_path: Path, db: str, *roles: Role) -> tuple[Any, Any]:
     await service.initialize()
     uid = await service.create_local_user(
         username="svc",
-        password="Correct-horse-battery-9",
+        password=_SVC_PW,
         display_name=None,
         email=None,
         roles=[r.value for r in roles],
         actor="test",
     )
     assert uid
+    # Clear the first-login must-change flag. The CERT plane never consults it (require_service_cert
+    # carries none of require()'s session concerns), so this is inert for the tests that only drive
+    # the cert gate — but require() refuses a must-change identity ABOVE its permission loop, which
+    # would make the bearer-plane POSITIVE CONTROL below record no denial row and report a false zero.
+    user = await service.store.get_user(uid)
+    assert user is not None and user.password_hash is not None
+    await service.store.set_password(
+        uid, password_hash=user.password_hash, must_change_password=False
+    )
     app = create_app(engine, auth=service, tls_client_cert_identities={"CN:svc.internal": "svc"})
     return engine, app
 
@@ -1159,6 +1176,119 @@ async def test_service_cert_auth_emits_audit_event(tmp_path: Path) -> None:
         async with httpx.AsyncClient(transport=t_spoof, base_url="http://t") as c:
             assert (await c.get("/service/identity")).status_code == 401
         assert len(await engine.store.list_audit(action="service_cert_auth")) == 1
+    finally:
+        await engine.stop()
+
+
+# --- BACKLOG #1197 (ASVS 16.3.2): the cert plane's AUTHORIZATION decisions ------------------------
+# The row above covers AUTHENTICATION, and it is written by the ROUTE BODY of `GET /service/identity`
+# rather than by the gate — so it says nothing about the authorization decision, and a future route
+# built on the same factory inherits none of it. These two pin the gate's own behaviour.
+
+
+def _shim_cert_request(app: object, cn: str = "svc.internal") -> Request:
+    """A request carrying a verified, mapped client cert — the shape the connection-made SHIM leaves.
+
+    Named apart from :func:`_cert_request` above on purpose: that one stashes the cert on
+    ``scope['transport']`` (the TLS-extension-capable server arm) and this one on ``scope['state']``
+    (the shipped shim arm). They are different code paths in :func:`peer_cert_from_request`, and a
+    module-level redefinition would silently rebind every earlier caller to the wrong one.
+
+    Driven through the FACTORY rather than through ``GET /service/identity`` because every built-in
+    role holds ``monitoring:read``, so the only wired route cannot produce a denial at all; and because
+    the property under test belongs to the gate that any future service route would also use. The
+    query string is deliberately non-empty: the audit row must carry the PATH and never the full URL.
+    """
+    return Request(
+        {
+            "type": "http",
+            "method": "GET",
+            "path": "/service/probe",
+            "query_string": b"q=a-clinician-search-term",
+            "headers": [],
+            "app": app,
+            "scheme": "http",
+            "server": ("t", 80),
+            "state": {MF_CLIENT_PEERCERT_STATE_KEY: _peercert(cn)},
+        }
+    )
+
+
+async def test_service_cert_authz_denial_is_audited(tmp_path: Path) -> None:
+    """A refused cert-identity authorization reaches the tamper-evident chain, not only the log.
+
+    RED when the ``audit_permission_denied`` call is removed from ``require_service_cert``. Measured at
+    HEAD before it existed: the denial emitted a ``log.warning`` and ZERO audit rows. The positive
+    control is re-run here rather than quoted — ``require``'s bearer-plane denial writes its row for
+    the same principal, on the same store, through the same counter — because a zero is otherwise a
+    fact about the instrument rather than about the gate.
+
+    The exact-equality assertion on ``detail`` is the second half and is deliberate: widening it to the
+    full URL would put the query string, where an operator's search terms live, into the chain.
+    """
+    from messagefoundry.api.security import require
+
+    engine, app = await _svc_app(tmp_path, "svc_authz_denial.db", Role.VIEWER)
+    try:
+        # VIEWER holds monitoring:read but not users:manage, so the permission loop is what refuses.
+        with pytest.raises(HTTPException) as excinfo:
+            await require_service_cert(Permission.USERS_MANAGE)(_shim_cert_request(app))
+        assert excinfo.value.status_code == 403
+
+        rows = await engine.store.list_audit(action="auth.permission_denied")
+        assert len(rows) == 1, "the refused cert-identity left no denial row"
+        assert rows[0]["actor"] == "svc"
+        assert json.loads(str(rows[0]["detail"])) == {
+            "permission": "users:manage",
+            "path": "/service/probe",
+        }
+
+        # POSITIVE CONTROL, same store and same counter: the bearer plane's denial also lands, so the
+        # zero this test was written against could not have been an inert audit path on this app.
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://t"
+        ) as client:
+            token = (
+                await client.post("/auth/login", json={"username": "svc", "password": _SVC_PW})
+            ).json()["token"]
+        bearer = Request(
+            {
+                "type": "http",
+                "method": "GET",
+                "path": "/probe-bearer",
+                "query_string": b"",
+                "app": app,
+                "scheme": "http",
+                "server": ("t", 80),
+                "headers": [(b"authorization", f"Bearer {token}".encode())],
+            }
+        )
+        with pytest.raises(HTTPException):
+            await require(Permission.USERS_MANAGE)(bearer)
+        assert len(await engine.store.list_audit(action="auth.permission_denied")) == 2
+    finally:
+        await engine.stop()
+
+
+async def test_service_cert_grant_writes_no_authorization_row(tmp_path: Path) -> None:
+    """The cert plane's GRANT side stays out of the chain, and that is a scope decision, not a bug.
+
+    BACKLOG #1197 measured that a grant row is per-request while the audit chain has no drain
+    (``[retention].audit_days`` is reserved and unenforced, ``[retention].max_db_mb`` ships at 0), so
+    grant parity waits on the drain. This is the guard that a later mirror cannot arrive unnoticed.
+
+    It also pins the measured fact that ``[diagnostics].audit_all_authz`` does not reach this gate:
+    the switch is asserted True on this app and the grant still writes nothing. Reading that as an
+    access-control hole would be wrong — the DENIAL row above is unconditional.
+    """
+    engine, app = await _svc_app(tmp_path, "svc_authz_grant.db", Role.VIEWER)
+    try:
+        assert app.state.audit_all_authz is True  # the shipped default (BACKLOG #1277)
+        identity = await require_service_cert(Permission.MONITORING_READ)(_shim_cert_request(app))
+        assert identity.username == "svc"
+        actions = {row["action"] for row in await engine.store.list_audit()}
+        assert "auth.permission_granted" not in actions
+        assert "auth.permission_denied" not in actions
     finally:
         await engine.stop()
 
