@@ -217,14 +217,36 @@ def test_every_watched_workflow_exists_by_name() -> None:
     assert missing == [], f"unread-signal.yml watches {missing}, which no workflow is named."
 
 
-def test_it_watches_the_review_gate_so_the_label_can_clear_itself() -> None:
-    """This is what makes the `unread` label self-withdrawing rather than sticky.
+def test_the_lost_self_clearing_chain_is_recorded_where_it_was_lost() -> None:
+    """RETIRED 2026-09-04, and this test now guards the RECORD instead of the behaviour.
 
-    Labelling a pull request `reviewed` re-runs review-gate.yml; that completion re-triggers this
-    workflow, which re-evaluates and removes the `unread` label. Drop `review gate` from the watched
-    list and the flag survives being read, with nothing reporting it.
+    IT USED TO ASSERT `review gate` was in the watched list, because that is what made the `unread`
+    label self-withdrawing rather than sticky: labelling a pull request `reviewed` re-ran
+    review-gate.yml, whose completion re-triggered this workflow, which removed the label. The
+    docstring ended "drop `review gate` from the watched list and the flag survives being read, with
+    nothing reporting it". That prediction was correct and it is now the shipped behaviour.
+
+    The owner retired the reviewer requirement and review-gate.yml was deleted, so the entry named a
+    workflow that no longer exists and `test_every_watched_workflow_exists_by_name` failed on it.
+    The two tests were in direct contradiction: one required the name present, the other required it
+    resolvable. Nobody could satisfy both.
+
+    SO THE REGRESSION IS REAL AND ACCEPTED, NOT FIXED. `review gate` was the only watched workflow
+    firing on a `labeled` event, so `unread` now clears on the next push rather than when somebody
+    reads the pull request. This test exists so that fact cannot quietly disappear: it fails if the
+    entry is re-added without restoring the mechanism, and it fails if the explanation is deleted.
     """
-    assert "review gate" in _on(_doc())["workflow_run"]["workflows"]
+    watched = _on(_doc())["workflow_run"]["workflows"]
+    assert "review gate" not in watched, (
+        "`review gate` is back in the watched list. review-gate.yml was deleted on 2026-09-04, so "
+        "this entry resolves to nothing and fires never. If the workflow has been restored, restore "
+        "the original test with it rather than leaving this one passing by accident."
+    )
+    assert "KNOWN REGRESSION" in FILE.read_text(encoding="utf-8"), (
+        "the recorded reason `review gate` left the watched list is gone from unread-signal.yml. "
+        "The regression it names -- `unread` no longer withdrawing when a pull request is read -- is "
+        "still shipped, so deleting the explanation leaves the behaviour with nothing describing it."
+    )
 
 
 def test_the_comment_is_written_only_on_the_flag_transition() -> None:

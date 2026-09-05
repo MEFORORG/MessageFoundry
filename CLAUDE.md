@@ -281,10 +281,10 @@ document as stale and follow this section.
 |---|---|---|---|
 | **Console** | long-lived, one | The only seat the owner talks to. Reads `docs/BACKLOG.md`, writes a disposable brief citing an item, spawns a Builder bound to an account via `CLAUDE_CONFIG_DIR`, polls for state, enqueues PRs, spawns a Regulator on a red. | Build. Wait on inbound messages; it polls instead. |
 | **Builder** | ephemeral, one per brief | The change, the commit, the push, and the PR carrying the `BACKLOG.md` update. | Guess at something the brief left open, or wait for an answer; it writes the question to the Console, comments it on the PR, and stops. Plan and wait for a "go". Declare its own seat. Spawn another session. |
-| **Reviewer** | spawned per PR by the owner today, by the Console once it holds the spawn permission | Quality checks on the diff. A pass applies the `reviewed` label and posts the head SHA it read. A fail posts findings ON THE PR, for whichever Builder the Console spawns next. | Merge. Label a PR it did not read. |
+| **Reviewer** | spawned per PR by the owner today, by the Console once it holds the spawn permission | Quality checks on the diff. A fail posts findings ON THE PR, for whichever Builder the Console spawns next. **The `reviewed` label no longer gates anything (see below), so a pass posts the head SHA it read and nothing depends on the label.** | Merge. Claim to have read a diff it did not read. |
 | **Regulator** | spawned on a red | Deciding whose failure it is: the PR's, `main`'s, a flake's, or the queue's. Keeps a log. | Assume it remembers an earlier red; it starts with none. Send anything but the PR's own failure back to a Builder. |
 | **Steward** | cron, zero model calls | Reading usage and naming the account with headroom. | Warn a running session. Nothing can interrupt one. |
-| **Lander** | as needed | Merging. Standing authority on the engine repo and the vault, with no per-action owner approval. | Merge a PR with no `reviewed` label. |
+| **Lander** | as needed | Merging. Standing authority on the engine repo and the vault, with no per-action owner approval. | (was: merge a PR with no `reviewed` label -- **RETIRED 2026-09-04**, see below) |
 
 The Console spawns a Builder where it holds the spawn permission, and that is per config root. The
 grant is a rule matching `Bash(claude:*)` or `PowerShell(claude:*)` under `permissions.allow` in the
@@ -297,10 +297,16 @@ one.
 
 The brief is disposable. The BACKLOG item is the record.
 
-Every notice is polled, and nothing is pushed. No workflow notifies a Reviewer that a PR is waiting
-(BACKLOG #1413). `stalled-prs.yml` reports green-but-unmergeable PRs on a daily 07:05 UTC cron, and
-nothing reports unread ones. `failure-signal.yml` adds a `ci-red` label to a PR whose required check
-went red, and no workflow reads that label back. So the Console finds both by asking.
+Every notice is polled, and nothing is pushed. `stalled-prs.yml` reports green-but-unmergeable PRs on
+a daily 07:05 UTC cron. `failure-signal.yml` adds a `ci-red` label to a PR whose required check went
+red, and no workflow reads that label back. So the Console finds both by asking.
+
+**Two clauses here were retired on 2026-09-04 and are kept named rather than deleted, because seats
+still quote them.** *"No workflow notifies a Reviewer that a PR is waiting"* was overtaken first:
+`unread-signal.yml` shipped for BACKLOG #1413 and is on `origin/main`, and it comments on and labels a
+green, unread PR. *"Nothing reports unread ones"* went with it. Then the review gate itself was retired
+-- so what `unread-signal.yml` announces is now a PR missing a label that **gates nothing**. Neither
+clause describes the machine today.
 
 ### A Builder gets one turn, and a brief that forgets this deadlocks it
 
@@ -400,18 +406,25 @@ went red, and no workflow reads that label back. So the Console finds both by as
 - **Every seat pushes its own branch and opens its own PR, without asking.** Owner ruling 2026-08-29,
   anchored at `refs/liaison/owner-ruling-20260829-push` (`987705dfb`), in their words: *"Sessions
   push their own."*
-- The merge is the Lander's, and what blocks it is the `reviewed` label. Any seat can apply that
-  label with `gh pr edit <N> --add-label reviewed`. Nothing automated adds it, and a push strips it,
-  so label after your last push. The gate records that a step **happened**, not that an independent
-  party looked, so labelling your own PR unread satisfies the machine and defeats the point.
-- **A PR's merge state is a join over three clocks, and the join is the part you must not miss.**
+- **The merge is the Lander's. THE `reviewed` LABEL NO LONGER BLOCKS IT -- owner ruling 2026-09-04,
+  in their words: "the reviewer requirement is retired."** `a reviewer has read this` came off `main`
+  branch protection and `.github/workflows/review-gate.yml` was deleted, so nothing posts that check,
+  nothing strips the label on a push, and a PR merges without it. **This bullet previously read** "what
+  blocks it is the `reviewed` label. Any seat can apply that label ... so label after your last push".
+  It is recorded rather than deleted because it was live long enough that seats still quote it.
+  **What survives is the reason it was never worth much**: the gate recorded that a step *happened*,
+  not that an independent party looked, so labelling your own PR unread satisfied the machine and
+  defeated the point. Reading a diff before merging it is still the job; no check now asks whether you
+  did.
+- **A PR's merge state is a join over clocks, and the join is the part you must not miss.**
   `gh pr view <N> --json mergeStateStatus` is the starting read, never the verdict: it reports
-  `BEHIND` or `DIRTY` in preference to `BLOCKED`. Compare the gate run's originating `createdAt`
-  against the newest `reviewed` label event. Created-before means stale, whatever the label says. A
-  queued synchronize run has not stripped the label yet, so the label can be present and invalid at
-  the same time. When no run is newer than the label event at all, the state is unknown: the Console
-  keeps polling, and nobody inherits the last verdict. A Builder never evaluates this, because its
-  process exits before any run reports. Filed as BACKLOG #1417, open in PR 731 and not yet on main.
+  `BEHIND` or `DIRTY` in preference to `BLOCKED`. **The `reviewed`-label arm of this join is RETIRED
+  with the gate** -- there is no gate run and no strip, so comparing a gate run's `createdAt` against
+  the newest `reviewed` label event now compares two things that decide nothing. The rest stands:
+  `mergeStateStatus` still hides one blocking reason behind another, so poll the gate RUN for the
+  contexts that are still required. BACKLOG #1417 recorded the stale-payload defect and PR 731 was
+  built against a workflow that no longer exists; see that item's 2026-09-04 amendment before acting
+  on either.
 - Never write the required-context count into a document. `.github/required-contexts.txt` is a
   checked-in claim that can lag the server, so read branch protection for the live set. When the set
   moves, move that file and the pinned count in `tests/test_required_contexts.py` in the same PR, or
