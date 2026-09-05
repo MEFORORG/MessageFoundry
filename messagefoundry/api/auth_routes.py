@@ -119,11 +119,17 @@ def _session_info(session: SessionRecord, current_token_hash: str) -> SessionInf
 def _externally_managed(provider: AuthProvider | str) -> bool:
     """True when an account's credentials/roles come from an external directory (anything but LOCAL).
 
-    Mirrors the service layer's ``!= AuthProvider.LOCAL.value`` gate (``auth/service.py``). The API
-    previously spot-checked ``is AuthProvider.AD`` / ``== AuthProvider.AD.value`` here, which diverges
-    the instant a third provider exists: an ``== AD`` test would wave a non-LOCAL, non-AD account
-    *through* a LOCAL-only ceremony (change engine password, enroll an engine TOTP, get engine-managed
-    roles) that the service then rejects. Gating on ``!= LOCAL`` keeps every provider consistent.
+    The API previously spot-checked ``is AuthProvider.AD`` / ``== AuthProvider.AD.value`` here, which
+    diverges the instant a third provider exists: an ``== AD`` test would wave a non-LOCAL, non-AD
+    account *through* a ceremony the engine does not own for it. Gating on ``!= LOCAL`` keeps every
+    provider consistent.
+
+    **TWO LIVE CALL SITES, and this is the SOLE enforcement point for both** — ``POST /me/password``
+    and the role update. It used to describe itself as mirroring a service-layer twin; that mirror
+    survives only for ``admin_reset_password``, and MFA enrollment left this set entirely (BACKLOG
+    #1144), because an engine second factor IS engine-held state that any provider may hold. What
+    remains is the narrower rule: the engine is not the system of record for a directory account's
+    password or roles.
     Accepts either the ``AuthProvider`` enum (``Identity.auth_provider``) or its stored string value
     (``UserRecord.auth_provider``)."""
     value = provider.value if isinstance(provider, AuthProvider) else provider
@@ -281,7 +287,16 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
         outcome = await service.authenticate_kerberos(token_bytes, client=_client(request))
         if not outcome.ok or outcome.token is None or outcome.identity is None:
             raise HTTPException(status.HTTP_401_UNAUTHORIZED, "SSO authentication failed")
-        return _login_response(outcome.token, outcome.identity, outcome.must_change_password)
+        # mfa_required is FORWARDED here, not defaulted (BACKLOG #1144). This route used to omit it
+        # because a directory session was minted MFA-satisfied and the answer was always False; the
+        # Kerberos leg now mints at the minimum, so omitting it would tell the client no second factor
+        # is needed and let the next call be refused with no explanation it was given.
+        return _login_response(
+            outcome.token,
+            outcome.identity,
+            outcome.must_change_password,
+            mfa_required=outcome.mfa_required,
+        )
 
     @app.post("/auth/logout", response_model=SimpleMessage)
     async def logout(
@@ -396,11 +411,9 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
         """Begin TOTP enrollment: stage a secret and return it + the ``otpauth://`` URI for the QR.
         Gated by a fresh **password** step-up BOUND to this enroll action (ADR 0077 — not MFA, you may
         have none yet; and not the shared login window, so a hijacked session can't bind a factor); not
-        active until confirmed via ``/me/mfa/confirm``."""
-        if _externally_managed(identity.auth_provider):
-            raise HTTPException(
-                status.HTTP_400_BAD_REQUEST, "AD accounts use directory MFA, not an engine TOTP"
-            )
+        active until confirmed via ``/me/mfa/confirm``. No provider gate: an engine factor is engine-
+        held state and every provider may hold one (BACKLOG #1144, and see
+        :meth:`~messagefoundry.auth.service.AuthService.begin_mfa_enrollment` for why)."""
         try:
             enroll = await service.begin_mfa_enrollment(identity)
         except ValueError as exc:

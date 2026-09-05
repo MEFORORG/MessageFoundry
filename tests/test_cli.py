@@ -966,9 +966,9 @@ def test_serve_exposed_prod_phi_single_factor_ack_starts_with_warning(
 def test_serve_refuses_exposed_without_mfa_even_with_ad_enabled(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    # The gate keys on require_mfa only — AD/Kerberos MFA is delegated to the directory — so an
-    # AD-enabled prod exposed bind with require_mfa off is STILL refused, pinning the error text's
-    # "safe even on an AD-only deployment (it gates only local Administrator accounts)".
+    # The gate keys on require_mfa only, so an AD-enabled prod exposed bind with require_mfa off is
+    # STILL refused. Since BACKLOG #1144 the error text no longer promises the knob is a no-op for
+    # directory users: turning it on binds them too, each enrolling an engine factor.
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("MEFOR_STORE_ENCRYPTION_KEY", "x" * 44)
     monkeypatch.setenv("MEFOR_AUTH_AD_BIND_PASSWORD", "s3cret-pw")
@@ -983,7 +983,7 @@ def test_serve_refuses_exposed_without_mfa_even_with_ad_enabled(
         '[api]\ntls_terminated_upstream = true\ntrusted_proxies = ["10.0.0.1"]\n'
         'proxy_intra_service_auth = "network"\nproxy_tls_min_version = "1.2"\n'
         # Opt out of the BACKLOG #187 secure default so the single-factor-at-exposure gate fires even
-        # on an AD-enabled bind (the gate keys on require_mfa only; AD MFA is delegated to the directory).
+        # on an AD-enabled bind (the gate keys on require_mfa only, whatever the providers in play).
         "[auth]\nad_enabled = true\n"
         'ad_server = "ldaps://dc1.example.com:636"\n'
         'ad_user_search_base = "ou=users,dc=example,dc=com"\n'

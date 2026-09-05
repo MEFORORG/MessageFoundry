@@ -103,8 +103,9 @@ class LoginDialog(QDialog):
             # Hand the must-change flag and the just-entered plaintext back to _authenticate.
             self.must_change_password = result.must_change_password
             self.entered_password = password
-        # The engine accepted the password but wants a second factor (local MFA-enrolled / required
-        # admin); _authenticate prompts for the TOTP code before opening the window (always False for
-        # an MFA-delegated AD login).
+        # The engine accepted the credential but wants a second factor; _authenticate prompts for the
+        # TOTP code before opening the window. This used to be documented as always False for a
+        # directory login; that delegation is retired (BACKLOG #1144), and a directory session now
+        # reports the debt like any other.
         self.mfa_required = result.mfa_required
         self.accept()

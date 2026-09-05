@@ -17,11 +17,11 @@ from __future__ import annotations
 
 import ast
 import inspect
-import textwrap
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from _mfa_grant import mfa_grant_values
 from pydantic import BaseModel
 
 from messagefoundry.api import security as api_security
@@ -418,65 +418,61 @@ def test_local_row_scopes_the_second_factor_to_step_up_and_administrator() -> No
         )
 
 
-def test_the_delegated_row_discloses_the_unconditional_mfa_satisfied_grant() -> None:
-    """The delegated directory pathway is the dominant one in the scored posture, so its MFA truth
-    belongs in the TABLE.
+def test_the_directory_rows_disclose_what_each_leg_actually_grants() -> None:
+    """The directory pathways are the dominant ones in the scored posture, so their MFA truth belongs
+    in the TABLE.
 
     Since ASVS 6.3.4 the grant is a per-mechanism ARGUMENT rather than a literal inside
-    ``_complete_ad_login``, so this is pinned at the call sites: the delegated leg still passes a hard
-    ``True`` (the owner-signed relaxation — a directory sign-in clears every engine MFA gate with zero
-    engine-verified evidence, which is what its row must disclose), while the federated leg must NOT,
-    because its grant is derived from ``oidc_require_mfa_claim``. Asserting both halves keeps the two
-    legs from silently converging in either direction.
+    ``_complete_ad_login``, so this is pinned at the call sites: Kerberos passes a hard ``False`` (it
+    receives no assertion the engine can read, so it grants nothing — BACKLOG #1144), while the
+    federated leg must pass no constant at all, because its grant is derived from
+    ``oidc_require_mfa_claim``. Asserting both halves keeps the two legs from silently converging in
+    either direction.
 
-    RETIREMENT NOTE (BACKLOG #1137): the hard ``True`` used to be read off ``_login_ad``. That leg is
-    gone, so the assertion follows the FACT to the caller that still makes the grant — Kerberos —
-    rather than being dropped. The disclosure did not change; only which pathway carries it did.
+    TWO RETIREMENT NOTES. BACKLOG #1137: the grant used to be read off ``_login_ad``; that leg is
+    gone, so the assertion follows the fact to the caller that still makes it. BACKLOG #1144: the
+    grant this test pinned was a hard ``True`` under the owner-signed delegated-directory relaxation.
+    That relaxation is retired, so the polarity here is inverted rather than the test dropped —
+    the table must disclose the current grant, whichever way it points.
     """
 
-    def _mfa_grant(func: object) -> list[ast.expr]:
-        tree = ast.parse(textwrap.dedent(inspect.getsource(func)))  # type: ignore[arg-type]
-        return [
-            kw.value
-            for node in ast.walk(tree)
-            if isinstance(node, ast.Call)
-            for kw in node.keywords
-            if kw.arg == "mfa_verified"
-        ]
-
-    bind_grant = _mfa_grant(AuthService.authenticate_kerberos)
-    assert bind_grant and all(
-        isinstance(v, ast.Constant) and v.value is True for v in bind_grant
+    kerberos_grant = mfa_grant_values(AuthService.authenticate_kerberos)
+    assert kerberos_grant and all(
+        isinstance(v, ast.Constant) and v.value is False for v in kerberos_grant
     ), (
-        "the Kerberos leg no longer mints sessions mfa_verified=True under the signed relaxation; the "
-        "Kerberos rows' disclosure is stale — re-derive it."
+        "the Kerberos leg mints sessions mfa_verified=True again; the Kerberos rows say it grants "
+        "nothing on an unreadable assertion — re-derive the disclosure."
     )
-    oidc_grant = _mfa_grant(AuthService.authenticate_oidc)
+    oidc_grant = mfa_grant_values(AuthService.authenticate_oidc)
     assert oidc_grant and not any(isinstance(v, ast.Constant) for v in oidc_grant), (
         "the OIDC leg passes a CONSTANT mfa_verified; 6.3.4 requires it to be derived from "
         "[auth].oidc_require_mfa_claim, and the OIDC row claims the engine verifies it."
     )
     factor = next(r for r in _primary_table()[1:] if r[0].startswith("**Kerberos"))[1]
-    for token in ("MFA-satisfied", "unverifiable"):
+    for token in ("MFA-pending", "engine second factor"):
         assert token in factor, (
-            f"the Kerberos Factor cell must state {token!r}: the engine grants MFA satisfaction with "
-            "no evidence, which is a comparative-strength fact, not a footnote."
+            f"the Kerberos Factor cell must state {token!r}: what the engine does with a ticket that "
+            "asserts nothing is a comparative-strength fact, not a footnote."
         )
     companion = next(
         t for t in _tables(_section()) if t[0][:2] == ["Pathway", "Phishing resistance"]
     )
     mfa_col = companion[0].index("MFA support")
     kerb_mfa = next(r for r in companion[1:] if r[0].startswith("**Kerberos"))[mfa_col]
-    assert "unverifiable" in kerb_mfa, (
-        "the companion Kerberos row reads as an enforcement claim ('delegated to the directory'); it "
-        "must say the grant is unconditional and unverifiable at the engine."
+    assert "engine" in kerb_mfa, (
+        "the companion Kerberos row reads as a delegation claim; it must say the factor is an ENGINE "
+        "factor, because nothing the ticket asserts reaches the engine."
     )
     block = _section()
     marker = "ASVS 6.1.3"
     paragraph = " ".join(block[block.index(marker) :].split())
-    assert "same PHI surface" in paragraph, (
-        "the 6.1.3 paragraph must state the consequence: every directory pathway satisfies the "
-        "engine's MFA gates without an engine-verified factor."
+    assert (
+        "No pathway grants MFA satisfaction on an assertion the engine cannot read" in paragraph
+    ), (
+        "the paragraph after the 6.1.3 block must state the current consequence. It used to assert "
+        "the opposite — that a domain ticket reaches the same PHI surface as a passkey-backed local "
+        "Administrator — and that sentence is now a recorded retraction, not the live disclosure, so "
+        "matching on it would answer the adjacent question (SDS-3.8)."
     )
 
 

@@ -384,7 +384,8 @@ The console stays a **host-side process**; only its target URL changes.
 
 7. **Production-PHI + local accounts must enable MFA to even start.** The MFA-at-exposure gate
    *refuses* a non-loopback bind on a production PHI instance with local accounts unless
-   `[auth].require_mfa = true` (or all accounts are AD, where MFA is delegated). The container's
+   `[auth].require_mfa = true`. An all-AD deployment is no exception: BACKLOG #1144 retired the
+   directory delegation, so directory accounts are in scope too. The container's
    default config and docs must make `require_mfa = true` the production default, or the operator hits
    a hard startup refusal — which is correct, but should be expected, not surprising.
 

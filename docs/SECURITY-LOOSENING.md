@@ -191,7 +191,8 @@ the call to the Console on 2026-09-02; the Console decided ([ADR 0118](adr/0118-
 
 ### `require_mfa = false` — single-factor admin
 - **What you lose:** the Administrator role authenticates with a password only (no native TOTP second
-  factor). AD/Kerberos MFA is delegated to the directory and is unaffected.
+  factor). Directory accounts lose it too (BACKLOG #1144): a Kerberos session mints MFA-pending, and
+  this knob is the only thing that lets it through the gate without an engine factor.
 - **When acceptable:** a loopback single-operator box where the second factor adds friction without a
   network exposure.
 - **Compensating controls:** keep the bind loopback; enable `admin_new_ip_step_up` if exposed.
@@ -261,8 +262,9 @@ the call to the Console on 2026-09-02; the Console decided ([ADR 0118](adr/0118-
   off; read that arm, not the ADR 0068 §8 undeclared-proxy warning, as the control for this case (§8 is
   about the `/ui` cookie and HSTS, and the ADR 0143 auto-degrade suppresses it in the same posture).
 - **When acceptable:** a production exposure where the second factor is supplied by a **compensating control
-  outside MessageFoundry** — an authenticating reverse proxy / mTLS admin gateway, or AD/Kerberos MFA
-  delegated to the directory (this flag gates only local Administrator accounts).
+  outside MessageFoundry** — an authenticating reverse proxy / mTLS admin gateway. AD/Kerberos MFA
+  delegated to the directory is **no longer** one of them: BACKLOG #1144 retired that delegation, so
+  this flag gates every Administrator, directory ones included.
 - **Compensating controls:** front the admin surface with an MFA-enforcing proxy; prefer `require_mfa = true`
   (native TOTP); enable `admin_new_ip_step_up`. A startup **AUDIT** line records the override and the posture
   view (`GET /security/posture`) names it.

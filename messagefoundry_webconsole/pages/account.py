@@ -436,43 +436,43 @@ def account_page(
         el("p", "Roles: " + (", ".join(me.roles) or "(none)"), class_="muted"),
         class_="card",
     )
-    if is_ad:
-        pw_section = el("p", "AD passwords are managed in Active Directory.", class_="muted")
-        mfa_section: Markup = el(
-            "p", "AD accounts use directory MFA, not an engine TOTP.", class_="muted"
+    # Only the password card is directory-gated: an engine password is the one credential a directory
+    # account does not have. The MFA and passkey cards are not (BACKLOG #1144) — hiding them would
+    # strand the users the Kerberos leg's minimum-strength mint now confines.
+    pw_section = (
+        el("p", "AD passwords are managed in Active Directory.", class_="muted")
+        if is_ad
+        else el("p", el("a", "Change password", href="/ui/account/password"))
+    )
+    if mfa.enabled:
+        status_line = el(
+            "p",
+            f"Enabled — {mfa.recovery_codes_remaining} recovery code(s) remaining.",
+            class_="muted",
+        )
+        action = el(
+            "form",
+            el("button", "Disable MFA", type="submit"),
+            method="post",
+            action="/ui/account/mfa/disable",
+            class_="ctl",
         )
     else:
-        pw_section = el("p", el("a", "Change password", href="/ui/account/password"))
-        if mfa.enabled:
-            status_line = el(
-                "p",
-                f"Enabled — {mfa.recovery_codes_remaining} recovery code(s) remaining.",
-                class_="muted",
-            )
-            action = el(
-                "form",
-                el("button", "Disable MFA", type="submit"),
-                method="post",
-                action="/ui/account/mfa/disable",
-                class_="ctl",
-            )
-        else:
-            status_line = el(
-                "p",
-                "Not enrolled."
-                + (" This account REQUIRES MFA — enroll now." if mfa.required else ""),
-                class_="muted",
-            )
-            action = el(
-                "form",
-                el("button", "Enroll an authenticator", type="submit"),
-                method="post",
-                action="/ui/account/mfa/enroll",
-                class_="ctl",
-            )
-        mfa_section = Markup(status_line + action)
-    passkey_card = Markup("") if is_ad else _passkey_card(mfa, passkeys or (), webauthn_notice)
-    # Active-session management is self-service for EVERY account (local + AD), unlike password/MFA.
+        status_line = el(
+            "p",
+            "Not enrolled." + (" This account REQUIRES MFA — enroll now." if mfa.required else ""),
+            class_="muted",
+        )
+        action = el(
+            "form",
+            el("button", "Enroll an authenticator", type="submit"),
+            method="post",
+            action="/ui/account/mfa/enroll",
+            class_="ctl",
+        )
+    mfa_section = Markup(status_line + action)
+    passkey_card = _passkey_card(mfa, passkeys or (), webauthn_notice)
+    # Active-session management is self-service for EVERY account (local + AD), as MFA now is.
     sessions_card = el(
         "div",
         el("h2", "Active sessions"),

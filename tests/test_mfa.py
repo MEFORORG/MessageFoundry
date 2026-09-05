@@ -2,10 +2,11 @@
 # Copyright (C) 2026 MessageFoundry Organization and contributors
 """AuthService-level MFA (TOTP) tests (WP-14, ASVS 6.3.3).
 
-Covers the full second-factor lifecycle on local accounts — enrollment → confirm → recovery codes,
-the step-up MFA gate, the ``require_mfa`` administrator enforcement, recovery-code single-use, and
-disable/admin-reset — plus the AD/Kerberos **delegation** guarantee (a directory login is never
-prompted for an engine TOTP and is MFA-satisfied at issuance).
+Covers the full second-factor lifecycle — enrollment to confirm to recovery codes, the step-up MFA
+gate, the ``require_mfa`` administrator enforcement, recovery-code single-use, and
+disable/admin-reset — on a **local and a directory** account alike. The AD/Kerberos delegation
+guarantee this file used to pin is retired (BACKLOG #1144): a directory sign-in no longer clears the
+engine's MFA gates on an assertion the engine never receives.
 """
 
 from __future__ import annotations
@@ -273,7 +274,18 @@ async def test_disable_and_admin_reset_clear_mfa(monkeypatch: pytest.MonkeyPatch
         await store.close()
 
 
-async def test_ad_login_is_mfa_satisfied_by_delegation() -> None:
+async def test_a_directory_account_enrolls_and_satisfies_an_engine_factor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """RED when: ``_mfa_required_for`` re-adds a provider exemption, or an enrollment ceremony
+    re-adds a non-local refusal.
+
+    This used to be ``test_ad_login_is_mfa_satisfied_by_delegation`` and asserted the reverse
+    (BACKLOG #1144): a directory sign-in cleared every engine MFA gate on an assertion the engine
+    never received. The two halves are one change — the exemption can only go once the account has a
+    factor it can enrol — so this walks the whole path: mint, find the session unsatisfied, enrol,
+    verify, find it satisfied.
+    """
     store = await _store()
     try:
         principal = AdPrincipal(
@@ -292,7 +304,7 @@ async def test_ad_login_is_mfa_satisfied_by_delegation() -> None:
                 return principal if username == "jdoe" else None
 
         settings = AuthSettings(
-            require_mfa=True,  # even with MFA required + an admin role, AD MFA is delegated
+            require_mfa=True,  # MFA required + an admin role: the directory earns no exemption
             ad_enabled=True,
             ad_server="ldaps://x",
             ad_user_search_base="DC=x",
@@ -303,13 +315,34 @@ async def test_ad_login_is_mfa_satisfied_by_delegation() -> None:
         await service.initialize()
         await service.set_ad_group_map([("CN=MF-Admins,DC=x", "administrator")], actor="admin")
 
-        # The subject is DELEGATED MFA, not the login mechanism. The simple-bind pathway is retired
-        # (BACKLOG #1137), so this mints the session through _complete_ad_login -- the shared tail
-        # where mfa_verified is stamped, reached identically by Kerberos and OIDC.
-        out = await service._complete_ad_login(principal, None, mfa_verified=True)
-        assert out.ok and out.token is not None
-        assert out.mfa_required is False  # delegated to the directory, never an engine TOTP
+        # The subject is the engine factor on a DIRECTORY account, not the login mechanism. The
+        # simple-bind pathway is retired (BACKLOG #1137), so this mints through _complete_ad_login --
+        # the shared tail where mfa_verified is stamped, reached identically by Kerberos and OIDC.
+        # False is what the Kerberos leg passes: the ticket asserts nothing the engine can read.
+        out = await service._complete_ad_login(principal, None, mfa_verified=False)
+        assert out.ok and out.token is not None and out.identity is not None
+        assert await service.mfa_satisfied(out.token) is False
+
+        # The ceremony accepts the directory account -- the half that makes the mint above safe.
+        t0 = 1_700_000_000.0
+        pin_totp_clock(monkeypatch, t0)
+        enroll = await service.begin_mfa_enrollment(out.identity)
+        codes = await service.confirm_mfa_enrollment(
+            out.identity, totp.totp(enroll.secret, now=t0), token=out.token
+        )
+        assert codes  # recovery codes are minted for a directory account like any other
         assert await service.mfa_satisfied(out.token) is True
+
+        # A NEW directory session is still unsatisfied: the factor is now enrolled, so it is required
+        # under either require_mfa_scope value, and only proving it lifts the gate. The later code
+        # must live in a HIGHER step -- enrollment consumed t0's (BACKLOG #1021).
+        second = await service._complete_ad_login(principal, None, mfa_verified=False)
+        assert second.ok and second.token is not None
+        assert await service.mfa_satisfied(second.token) is False
+        t1 = t0 + totp.DEFAULT_PERIOD
+        pin_totp_clock(monkeypatch, t1)
+        assert await service.verify_mfa(second.token, totp.totp(enroll.secret, now=t1)) is True
+        assert await service.mfa_satisfied(second.token) is True
     finally:
         await store.close()
 
