@@ -2807,9 +2807,15 @@ async def test_admin_cookie_not_accepted_on_json_routes(engine: Engine) -> None:
         assert (await c.delete(f"/users/{boss_id}")).status_code == 401
 
 
-async def test_error_banner_escapes_hostile_input(engine: Engine) -> None:
-    # _validate_roles echoes posted role ids into the 400 detail; the /ui banner must render it
-    # escaped (reflected-XSS regression guard for every rerender-with-error path).
+async def test_a_hostile_role_id_is_refused_before_anything_can_echo_it(engine: Engine) -> None:
+    # This used to post a hostile role id, rely on _validate_roles echoing it into the 400 detail,
+    # and assert the banner escaped it. Since BACKLOG #1108 the role-id rule refuses that value at
+    # RolesUpdateRequest, so it never reaches _validate_roles and the route renders its own fixed
+    # "invalid input" instead. That is the stronger property and it is what this now pins.
+    #
+    # The escaping half did NOT move with it. Losing an XSS regression guard because an upstream
+    # rule made one route stop delivering hostile text is exactly how a guard goes quiet, so it is
+    # re-armed directly against the renderer in the test below, where no upstream rule can disarm it.
     service = await _service(engine)
     await _add(service, "u1", Role.VIEWER)
     async with _boss_client(engine, service) as c:
@@ -2817,8 +2823,37 @@ async def test_error_banner_escapes_hostile_input(engine: Engine) -> None:
         hostile = "<img src=x onerror=alert(1)>"
         r = await _post_pairs(c, f"/ui/users/{uid}/roles", [("roles", hostile)])
         assert r.status_code == 400
+        # Neither the raw value nor an escaped copy of it: the page never saw it.
         assert hostile not in r.text
-        assert "&lt;img src=x onerror=alert(1)&gt;" in r.text
+        assert "&lt;img src=x onerror=alert(1)&gt;" not in r.text
+        assert "invalid input" in r.text
+        # The control: a well-formed role id that no role carries still reaches the handler, so the
+        # route's OTHER arm is alive and the refusal above is the rule and not a dead route.
+        ok = await _post_pairs(c, f"/ui/users/{uid}/roles", [("roles", "nosuchrole")])
+        assert ok.status_code == 400 and "invalid input" not in ok.text
+
+
+def test_the_error_banner_escapes_hostile_text() -> None:
+    """The reflected-XSS guard for every rerender-with-error path, armed at the renderer itself.
+
+    Driven directly rather than through a route: a route can stop being able to deliver hostile text
+    (see above), and when that happens a route-driven guard passes while measuring nothing.
+    """
+    from messagefoundry.api.auth_models import UserSummary
+    from messagefoundry_webconsole import pages
+
+    user = UserSummary(
+        id="0" * 32, username="u1", auth_provider="local", disabled=False, roles=["viewer"]
+    )
+    hostile = "<img src=x onerror=alert(1)>"
+    page = str(pages.user_detail_page(user, [], error=hostile))
+    assert hostile not in page
+    assert "&lt;img src=x onerror=alert(1)&gt;" in page
+    # The control: an ordinary message still renders, so the assertion above is escaping and not
+    # the banner having been dropped.
+    assert "something went wrong" in str(
+        pages.user_detail_page(user, [], error="something went wrong")
+    )
 
 
 async def test_ad_user_carveouts_on_ui_surface(engine: Engine) -> None:

@@ -372,7 +372,13 @@ async def test_ui_delegate_serves_the_sandbox_csp_not_the_console_csp(
 
 
 async def test_download_unknown_message_is_404(client: httpx.AsyncClient) -> None:
-    assert (await client.get("/messages/missing/attachments/" + "a" * 64)).status_code == 404
+    absent = "0" * 32  # a well-formed message id nothing seeded
+    assert (await client.get(f"/messages/{absent}/attachments/" + "a" * 64)).status_code == 404
+    # A message id that could not be one, and an attachment id that is not a 64-hex digest, are each
+    # refused before the lookup (BACKLOG #1108). Paired with the 404 above so neither arm can pass by
+    # the route simply refusing everything.
+    assert (await client.get("/messages/missing/attachments/" + "a" * 64)).status_code == 422
+    assert (await client.get(f"/messages/{absent}/attachments/nope")).status_code == 422
 
 
 async def test_download_unlinked_attachment_is_404(

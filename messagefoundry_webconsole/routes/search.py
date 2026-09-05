@@ -237,20 +237,23 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         # search page's unlock form on a stale step-up rather than being auto-retried.
         assert_same_origin(request)
         form = dict(await _form_pairs(request))
-        criteria = SearchPresetCriteria(
-            content=form.get("content") or None,
-            field_path=form.get("field_path") or None,
-            field_value=form.get("field_value") or None,
-            target=form.get("target")
-            if form.get("target") in ("raw", "summary", "both")
-            else "both",  # type: ignore[arg-type]
-            channel_id=form.get("channel_id") or None,
-            status=form.get("status") or None,
-            message_type=form.get("message_type") or None,
-            control_id=form.get("control_id") or None,
-            limit=50,
-        )
         try:
+            # Inside the try, unlike before. The criteria model enforces the API's own input rules
+            # (BACKLOG #1108), so a criterion that breaks one raises HERE; built outside, that
+            # exception left the route as a 500 instead of the form's own error.
+            criteria = SearchPresetCriteria(
+                content=form.get("content") or None,
+                field_path=form.get("field_path") or None,
+                field_value=form.get("field_value") or None,
+                target=form.get("target")
+                if form.get("target") in ("raw", "summary", "both")
+                else "both",  # type: ignore[arg-type]
+                channel_id=form.get("channel_id") or None,
+                status=form.get("status") or None,
+                message_type=form.get("message_type") or None,
+                control_id=form.get("control_id") or None,
+                limit=50,
+            )
             body = SearchPresetCreateRequest(name=form.get("name", ""), criteria=criteria)
             await core.create_search_preset(
                 body=body, engine=engine, identity=identity, request=request
@@ -261,10 +264,17 @@ def register(app: FastAPI, deps: UiDeps) -> None:
                 pages.message_search(None, error=str(exc.detail), presets=preset_list),
                 status_code=exc.status_code,
             )
-        except ValueError:  # pydantic validation (e.g. empty name)
+        except ValueError:  # pydantic: an empty name, or a criterion that breaks its input rule
+            # The message says WHICH field is at fault only in the generic sense. pydantic's own text
+            # quotes the offending value, and that value is form input on a PHI-shaped page, so it is
+            # never rendered.
             preset_list = await _presets(engine, identity, request)
             return HTMLResponse(
-                pages.message_search(None, error="a preset name is required", presets=preset_list),
+                pages.message_search(
+                    None,
+                    error="a preset name is required, and each criterion must be a valid value",
+                    presets=preset_list,
+                ),
                 status_code=400,
             )
         return RedirectResponse("/ui/messages/search", status_code=303)

@@ -6,8 +6,17 @@ from __future__ import annotations
 
 from pydantic import BaseModel, Field
 
+from messagefoundry.api.validation import (
+    MAX_MAP_ENTRIES,
+    ConnectionName,
+    PermissionId,
+    RoleId,
+)
+
 # Upper bounds on free-text request fields (API-INPUT): reject absurd inputs before they reach the
 # store or argon2. Generous vs any legitimate value; the password cap also bounds argon2 work.
+# The ITEM rules for the id-shaped lists below live in `api/validation.py`, with the rest of the
+# operator API's input rules (BACKLOG #1108, docs/API-INPUT-VALIDATION.md).
 _NAME_MAX = 256
 _PASSWORD_MAX = 1024
 _GROUP_MAX = 512
@@ -83,7 +92,7 @@ class UserPermissions(BaseModel):
 class ChannelScope(BaseModel):
     """A user's per-channel RBAC scope. ``None`` = all channels; a list = exactly those connections."""
 
-    channels: list[str] | None = Field(default=None, max_length=512)
+    channels: list[ConnectionName] | None = Field(default=None, max_length=512)
 
 
 class UserCreateRequest(BaseModel):
@@ -91,7 +100,7 @@ class UserCreateRequest(BaseModel):
     password: str = Field(max_length=_PASSWORD_MAX)
     display_name: str | None = Field(default=None, max_length=_NAME_MAX)
     email: str | None = Field(default=None, max_length=_NAME_MAX)
-    roles: list[str] = Field(default=[], max_length=64)
+    roles: list[RoleId] = Field(default=[], max_length=64)
 
 
 class UserUpdateRequest(BaseModel):
@@ -101,7 +110,7 @@ class UserUpdateRequest(BaseModel):
 
 
 class RolesUpdateRequest(BaseModel):
-    roles: list[str] = Field(max_length=64)
+    roles: list[RoleId] = Field(max_length=64)
 
 
 class PasswordChangeRequest(BaseModel):
@@ -189,7 +198,7 @@ class CustomRoleRequest(BaseModel):
 
     display_name: str = Field(max_length=_NAME_MAX)
     description: str | None = Field(default=None, max_length=_NAME_MAX)
-    permissions: list[str] = Field(max_length=64)
+    permissions: list[PermissionId] = Field(max_length=64)
 
 
 class CustomRoleInfo(BaseModel):
@@ -205,7 +214,7 @@ class AdGroupMapEntry(BaseModel):
 
 
 class AdGroupMap(BaseModel):
-    entries: list[AdGroupMapEntry]
+    entries: list[AdGroupMapEntry] = Field(max_length=MAX_MAP_ENTRIES)
 
 
 class AdGroupScopeEntry(BaseModel):
@@ -216,7 +225,7 @@ class AdGroupScopeEntry(BaseModel):
 
 
 class AdGroupScopeMap(BaseModel):
-    entries: list[AdGroupScopeEntry]
+    entries: list[AdGroupScopeEntry] = Field(max_length=MAX_MAP_ENTRIES)
 
 
 class AuditEntry(BaseModel):
