@@ -138,6 +138,7 @@ __all__ = [
     "expiry_relaxed_hops",
     "unverified_generic_db_hops",
     "overbroad_smart_scopes",
+    "static_credential_db_hops",
 ]
 
 _logger = logging.getLogger(__name__)
@@ -3789,6 +3790,100 @@ def unverified_generic_db_hops(registry: Registry) -> list[tuple[str, str]]:
             reason = unenforced(conn.spec.settings)
             if reason is not None:
                 out.append((f"{label}{conn.name}", f"{reason} ({_peer_label(conn.spec.settings)})"))
+    return sorted(out)
+
+
+#: The two ``auth`` values that are a DELEGATED identity rather than an unchanging credential, on the
+#: SQL Server preset: Windows Integrated (a machine/gMSA principal) and Entra ID. Kept beside the reader
+#: that spends it and matched against the SAME vocabulary
+#: :func:`~messagefoundry.transports.database._build_dsn` dispatches on, so the classification and the
+#: DSN can never disagree about what "sql" means.
+_DELEGATED_DB_AUTH = frozenset({"integrated", "entra"})
+
+
+def static_credential_db_hops(registry: Registry) -> list[tuple[str, str]]:
+    """Every declared DATABASE hop that authenticates with an UNCHANGING credential, as
+    ``(name, reason)`` (BACKLOG #1182, ASVS 13.2.1).
+
+    The SINGLE reader of the static-credential database set, on the same contract as
+    :func:`accepted_cleartext_hops`, :func:`expiry_relaxed_hops` and :func:`unverified_generic_db_hops`,
+    so ``messagefoundry check`` and any later surface cannot disagree. Sorted by name for a stable,
+    diffable list.
+
+    **This is an INVENTORY, not a gate, and the distinction is the point.** ASVS 13.2.1 asks that
+    backend communications use individual service accounts, short-term tokens or certificates rather
+    than unchanging credentials. Nothing here refuses anything: a hop this function names may be
+    entirely legitimate, and a site that has no managed-identity option on a given database has no
+    compliant answer to move to. Read it as "which database hops present a static credential", never as
+    "which hops are misconfigured". A refusing gate is deliberately NOT built, because #1182 records
+    that a gate shipped before every hop has a reachable compliant credential kind collects an opt-out
+    on precisely the hops that made the requirement fail, which is theatre.
+
+    **It walks FOUR tables, because there are four database-hop factories and the ledger named two.**
+    ``Database()`` lands in ``outbound``; ``DatabasePoll()`` lands in ``inbound`` and crosses the same
+    hop with the same credential in the same DSN; ``DatabaseLookup()`` lands in ``lookups`` (the ADR
+    0010 ``db_lookup`` read pool); and ``DatabaseRef()`` lands in ``references`` as a ``"database"``
+    source, which the reference sync dials on its own refresh cadence. Names are prefixed per table
+    (``inbound:``, ``db_lookup:``, ``reference:``) because those are separate namespaces that could
+    otherwise collide, exactly as ``accepted_cleartext_hops`` prefixes ``fhir_lookup:``.
+
+    **The store hop is NOT here, and that is a fact about where it lives rather than a scoping choice.**
+    ``[store]`` is service settings, not a graph entry, so its own precondition —
+    :meth:`~messagefoundry.config.settings.StoreSettings.managed_identity_precondition`, gated by the
+    opt-in ``[store].require_managed_identity`` — is the only thing that reads it. That flag covers the
+    store and nothing else: it is a ``StoreSettings`` method, so no connector, lookup or reference hop
+    is within its reach by construction. Said out loud here because the flag's name reads as though it
+    governs the whole engine's database posture, and it does not.
+
+    **Two classification rules, and the second is where a grep would get it wrong.**
+
+    * On the SQL Server preset (``dialect='sqlserver'``, the default, and the only dialect
+      ``DatabaseLookup``/``DatabaseRef`` have) the credential kind IS ``auth``: ``integrated`` or
+      ``entra`` is a delegated identity and anything else emits ``UID``/``PWD``.
+    * On ``dialect='generic'`` ``auth`` is **ignored entirely** — ``_build_odbc_dsn`` never reads it and
+      emits the top-level ``username``/``password`` under the operator's own ODBC keywords. So a generic
+      hop is classified on whether it emits a credential, and an ``auth='integrated'`` written on a
+      generic connection is reported as static, because that is what the DSN does with it.
+
+    **One residual, written down rather than implied:** a generic hop that sets no top-level
+    ``username``/``password`` is NOT reported, even though its ``odbc_params`` may carry a credential
+    under an arbitrary driver keyword. The engine cannot enumerate an arbitrary driver's keywords —
+    the same limit :func:`unverified_generic_db_hops` records for TLS — so classifying that case would
+    be guessing, and a reader that guessed would put a wrong name in a security report.
+
+    Pure — it reads the loaded graph and touches nothing else."""
+
+    def kind(settings: Mapping[str, Any]) -> str | None:
+        """The reason this hop's credential is unchanging, or ``None`` when it is delegated."""
+        if str(settings.get("dialect", "sqlserver")).lower() == "generic":
+            if not (settings.get("username") or settings.get("password")):
+                return None
+            return (
+                "generic-ODBC hop emits a static username/password (auth= is not read on this arm)"
+            )
+        auth = str(settings.get("auth", "sql")).lower()
+        if auth in _DELEGATED_DB_AUTH:
+            return None
+        return f"static SQL login (auth={auth!r})"
+
+    out: list[tuple[str, str]] = []
+    for label, table in (("", registry.outbound), ("inbound:", registry.inbound)):
+        for conn in table.values():
+            if conn.spec.type is not ConnectorType.DATABASE:
+                continue
+            reason = kind(conn.spec.settings)
+            if reason is not None:
+                out.append((f"{label}{conn.name}", f"{reason} ({_peer_label(conn.spec.settings)})"))
+    for spec in registry.lookups.values():
+        reason = kind(spec.settings)
+        if reason is not None:
+            out.append((f"db_lookup:{spec.name}", f"{reason} ({_peer_label(spec.settings)})"))
+    for ref in registry.references.values():
+        if ref.source.kind != "database":
+            continue
+        reason = kind(ref.source.settings)
+        if reason is not None:
+            out.append((f"reference:{ref.name}", f"{reason} ({_peer_label(ref.source.settings)})"))
     return sorted(out)
 
 
