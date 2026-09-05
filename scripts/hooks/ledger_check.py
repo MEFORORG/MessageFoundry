@@ -262,19 +262,36 @@ class Ledger:
     # of an item that already exists was never policed here either way -- the rule compares NUMBER SETS,
     # `head - base`, so a merge cannot smuggle a subject past a check that never read subjects.
     def _merge_parents(self) -> list[str]:
-        """Commits being merged INTO this one; empty when no merge is in progress.
+        """EVERY parent of the merge commit being built, HEAD included; empty outside a merge.
 
-        Read from ``MERGE_HEAD`` as LINES, not via ``git rev-parse MERGE_HEAD``: an octopus merge writes
-        one sha per line and rev-parse would answer only the first, silently policing the rest. CI never
-        has a merge in progress -- there HEAD is already the merge commit -- so this is empty there and
-        the CI path is unchanged.
+        ***HEAD IS A PARENT, AND LEAVING IT OUT MISSED THE CASE THIS WAS WRITTEN FOR.*** The first
+        version of this read only ``MERGE_HEAD``, which covers *their branch merged into mine* and
+        not *main merged into theirs* -- and the second is the shape a Lander actually resolves,
+        because the number then sits on HEAD rather than on MERGE_HEAD. Measured 2026-09-05, after
+        the first fix had already landed: a faithful reproduction of the PR 850 case was still
+        refused with ``#1441 was not allocated to this worktree``.
+
+        **The test that shipped with that version merged the sibling INTO main -- the easy direction
+        -- so it passed, and two mutations proved its arms disjoint from each other while both
+        exercised the wrong direction.** Disjointness is not coverage.
+
+        ``MERGE_HEAD`` is read as LINES, not via ``git rev-parse MERGE_HEAD``: an octopus merge
+        writes one sha per line and rev-parse would answer only the first, silently policing the
+        rest. CI never has a merge in progress -- there HEAD is already the merge commit -- so this
+        is empty there and the CI path is unchanged.
         """
         if self.ci:
             return []
         path = Path(git("rev-parse", "--path-format=absolute", "--git-path", "MERGE_HEAD").strip())
         if not path.is_file():
             return []
-        return [ln.strip() for ln in path.read_text(encoding="utf-8").splitlines() if ln.strip()]
+        parents = [ln.strip() for ln in path.read_text(encoding="utf-8").splitlines() if ln.strip()]
+        if not parents:
+            return []
+        # HEAD only counts once a merge is confirmed in progress. Outside one it is the commit being
+        # built on, and folding it in unconditionally would stop policing an ordinary second commit
+        # that adds a number to a branch -- a real narrowing, and not this fix's business.
+        return [*parents, "HEAD"]
 
     def _backlog_numbers_at(self, ref: str) -> set[str]:
         """Every ``## N.`` number carried by ``ref``, across the live file and the archive.
