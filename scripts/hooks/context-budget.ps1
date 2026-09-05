@@ -106,6 +106,23 @@ try {
     if ($used -le 0) { exit 0 }
 
     $frac = [double]$used / [double]$maxTokens
+
+    # THE DENOMINATOR IS AN ASSUMPTION AND IT CAN BE WRONG. 200000 is a default, not a reading: the
+    # window depends on the model and the deployment, and nothing in the transcript states it. When
+    # the count exceeds the assumed ceiling the ARITHMETIC is not what failed -- the ceiling is -- and
+    # printing "172.9% spent" is a percentage of the wrong thing. This fired on its author within an
+    # hour of shipping, which is the only reason it was caught: an impossible number is visible, where
+    # a merely wrong one would have been believed. Report the absolute figure and name the fix.
+    if ($frac -gt 1.0) {
+        $k = [math]::Round($used / 1000.0, 1)
+        Write-Context ("[context-budget] CEILING WRONG, not a reading. This session reports about ${k}k " +
+            "tokens against an assumed $($maxTokens / 1000)k window, which is impossible as a percentage " +
+            "-- so the assumed window is wrong for this model, not the count. No fullness figure is " +
+            "given because none can be trusted. The session IS large; treat that as the signal. Set " +
+            "MEFOR_CONTEXT_BUDGET_MAX_TOKENS to this model's real window to restore the gauge.")
+        exit 0
+    }
+
     if ($frac -lt $warn) { exit 0 }
 
     $pct = [math]::Round($frac * 100, 1)
