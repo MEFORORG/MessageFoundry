@@ -1484,6 +1484,14 @@ def test_a_private_artifact_url_is_flagged_without_any_token_source(
         # ANOTHER HOST's artifact path. A CI build artifact is not a private Claude artifact, and the
         # host is the whole of what makes this class a disclosure.
         (f"github.com/o/r/actions/runs/1/{_ART_SEG}{_ART_UUID}", "an artifact path off-host"),
+        # NON-ARTIFACT claude.ai LINKS CARRYING A UUID. These are the cases that give the arm WIDTH
+        # discrimination rather than mere presence discrimination: they are on the right host and do
+        # carry a real UUID, so the only thing keeping them silent is the PATH. Without them the
+        # only case refusing a path-widened pattern is the public-plural one, and a negative corpus
+        # resting on a single case is one edit away from having none. This detector's scope is
+        # artifact addresses; a conversation URL is a different class and not this row's business.
+        (f"the thread is at {_ART_HOST}chat/{_ART_UUID}", "a conversation link, right host"),
+        (f"see {_ART_HOST}recents/{_ART_UUID}", "another non-artifact claude.ai path"),
         # A TRUNCATED id. Not a UUID, so not an addressable artifact.
         (f"see {_ART_HOST}code/{_ART_SEG}{_ART_UUID.split('-')[0]}", "a truncated UUID"),
     ],
@@ -1579,6 +1587,30 @@ def test_the_two_arms_are_DISJOINT_under_mutation(
     assert not fires(keep), (
         "over-narrow must leave the must-NOT-trip arm green, or the reds are not disjoint"
     )
+
+    # MUTATION D -- OVER-BROAD IN THE OTHER DIRECTION: keep the UUID requirement, widen the PATH to
+    # any segment. This is the widening a paired arm most easily misses, because it still demands a
+    # real UUID and so leaves every placeholder case silent -- the must-trip arm passes, and the
+    # must-not-trip cases that refuse mutation A do not refuse this one. Only a negative case that
+    # is on the RIGHT HOST with a REAL UUID and merely the wrong path can catch it. The reds must be
+    # DISJOINT from mutation A's: if one case refused both, the arm would have presence
+    # discrimination and no width discrimination, which for a leak gate is the difference between
+    # "detects artifact URLs" and "detects URLs".
+    placeholder = f"paste a {_ART_HOST}code/{_ART_SEG}<uuid> into the handoff"
+    wrong_path = f"the thread is at {_ART_HOST}chat/{_ART_UUID}"
+
+    mod._ARTIFACT_URL = re.compile(  # type: ignore[attr-defined]
+        r"claude\.ai/(?:code/)?(?:artifact|frame)/", re.IGNORECASE
+    )
+    a_reds = {"placeholder": fires(placeholder), "wrong_path": fires(wrong_path)}
+    mod._ARTIFACT_URL = re.compile(  # type: ignore[attr-defined]
+        r"claude\.ai/(?:[A-Za-z0-9_/-]+/)?"
+        r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
+        re.IGNORECASE,
+    )
+    d_reds = {"placeholder": fires(placeholder), "wrong_path": fires(wrong_path)}
+    assert a_reds == {"placeholder": True, "wrong_path": False}, a_reds
+    assert d_reds == {"placeholder": False, "wrong_path": True}, d_reds
 
     # MUTATION C -- THE PATTERN AS FIRST SHIPPED, before the vendor grammar was read. It satisfies
     # BOTH arms above, which is exactly why those two mutations cannot protect the vanity form: a
