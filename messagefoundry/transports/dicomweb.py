@@ -67,6 +67,7 @@ from messagefoundry.transports.rest import (
     _redact_url,
     egress_route_from_settings,
     enforce_outbound_length_limits,
+    http_family_trust_anchor,
     refuse_cleartext_credentials,
     refuse_cleartext_egress,
     refuse_unrevoked_verified_hop,
@@ -264,8 +265,14 @@ class DicomWebDestination(DestinationConnector):
                 connector="DICOMweb destination",
                 revocation_attested=config.tls_revocation_attested,
             )
+            # #1180 (ADR 0093): the client trust anchor for this STOW-RS hop.
+            anchor = http_family_trust_anchor(
+                s, url=self.base_url, trust_anchor_policy=config.trust_anchor_policy
+            )
             self._opener: urllib.request.OpenerDirector = (
-                _no_redirect_opener(*proxy_handlers) if proxy_handlers else _NO_REDIRECT_OPENER
+                _no_redirect_opener(*proxy_handlers, trust_anchor=anchor)
+                if proxy_handlers or anchor.narrows
+                else _NO_REDIRECT_OPENER
             )
         else:
             # verify_tls=false makes the https hop MITM-able — a posture-keyed insecure hop (#200).

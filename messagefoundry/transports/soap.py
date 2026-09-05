@@ -65,7 +65,13 @@ from xml.sax.saxutils import escape as _xml_escape  # nosec B406 — pure string
 from xml.sax.xmlreader import InputSource  # nosec B406 — fed only the hardened, no-DTD parser
 
 from messagefoundry.config.models import ConnectorType, Destination
-from messagefoundry.config.tls_policy import harden_cipher_suites, relax_verify_expiry
+from messagefoundry.config.tls_policy import (
+    SYSTEM_TRUST_ANCHOR,
+    TrustAnchor,
+    build_verifying_client_context,
+    harden_cipher_suites,
+    relax_verify_expiry,
+)
 from messagefoundry.transports.base import (
     DeliveryError,
     DeliveryResponse,
@@ -90,6 +96,7 @@ from messagefoundry.transports.rest import (
     enforce_outbound_length_limits,
     enforce_send_time_length_limits,
     enforce_signature_header_limits,
+    http_family_trust_anchor,
     normalize_header_allowlist,
     refuse_cleartext_credential_hop,
     refuse_cleartext_credentials,
@@ -188,6 +195,7 @@ def _client_cert_opener(
     *extra_handlers: urllib.request.BaseHandler,
     allow_expired: bool = False,
     host: str = "",
+    trust_anchor: TrustAnchor = SYSTEM_TRUST_ANCHOR,
 ) -> urllib.request.OpenerDirector:
     """A no-redirect opener that presents a **client certificate** for mutual TLS (ADR 0015 §3).
 
@@ -198,8 +206,14 @@ def _client_cert_opener(
 
     ``allow_expired`` (#129, ADR 0094) relaxes ONLY the peer cert's validity-period check (chain +
     hostname stay enforced) — the granular expiry tolerance, composable with mTLS. Default off =
-    byte-identical."""
-    ctx = ssl.create_default_context()
+    byte-identical.
+
+    ``trust_anchor`` (#1180, ADR 0093) selects the roots that verify the SERVER; the client identity
+    loaded below is a separate direction and is untouched by it. The default resolves to the OS trust
+    store, which is the ``ssl.create_default_context()`` this line used to be. mTLS is exactly the
+    deployment where an internal CA is likeliest, so leaving this hop unable to name one was the
+    sharpest edge of the inexpressible slice."""
+    ctx = build_verifying_client_context(trust_anchor)
     ctx.minimum_version = ssl.TLSVersion.TLSv1_2
     ctx.load_cert_chain(certfile, keyfile, password)
     if allow_expired:
@@ -407,6 +421,11 @@ class SoapDestination(DestinationConnector):
                 revocation_attested=config.tls_revocation_attested,
             )
 
+        # #1180 (ADR 0093): the client trust anchor, shared by every VERIFYING branch below. Not
+        # resolved on the verify_tls=false branch, which is CERT_NONE and has no roots to choose.
+        anchor = http_family_trust_anchor(
+            s, url=self.url, trust_anchor_policy=config.trust_anchor_policy
+        )
         if self.client_cert_file and self.client_key_file:  # NEW — mutual TLS, takes precedence
             self._opener: urllib.request.OpenerDirector = _client_cert_opener(
                 self.client_cert_file,
@@ -415,17 +434,21 @@ class SoapDestination(DestinationConnector):
                 *proxy_handlers,  # ADR 0126: forward proxy threaded through the mTLS opener too
                 allow_expired=bool(s.get("tls_allow_expired", False)),  # #129 (ADR 0094)
                 host=urllib.parse.urlsplit(self.url).hostname or "",
+                trust_anchor=anchor,
             )
         elif bool(s.get("verify_tls", True)):
             # #129 (ADR 0094): granular expiry-only relaxation — verify chain + hostname but tolerate an
             # expired peer cert (opt-in; default off = the shared verifying opener, byte-identical).
             if bool(s.get("tls_allow_expired", False)):
                 self._opener = _expiry_relaxed_opener(
-                    urllib.parse.urlsplit(self.url).hostname or "", *proxy_handlers
+                    urllib.parse.urlsplit(self.url).hostname or "",
+                    *proxy_handlers,
+                    trust_anchor=anchor,
                 )
-            elif proxy_handlers:
+            elif proxy_handlers or anchor.narrows:
                 # A forward proxy → a per-connection verifying opener carrying it (never the shared one).
-                self._opener = _no_redirect_opener(*proxy_handlers)
+                # A narrowed trust anchor needs its own opener for the same reason.
+                self._opener = _no_redirect_opener(*proxy_handlers, trust_anchor=anchor)
             else:
                 self._opener = _NO_REDIRECT_OPENER
         else:

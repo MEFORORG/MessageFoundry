@@ -32,6 +32,7 @@ import os
 from typing import TYPE_CHECKING, Any
 
 from messagefoundry.config.secretprovider import SecretProviderError
+from messagefoundry.config.tls_policy import vault_client_verify_kwargs
 
 if TYPE_CHECKING:
     from messagefoundry.config.settings import SecretsSettings
@@ -47,6 +48,13 @@ _ENV_ADDR = "MEFOR_SECRETS_VAULT_ADDR"
 _ENV_TOKEN = "MEFOR_SECRETS_VAULT_TOKEN"  # nosec B105 — the env-var NAME, not a token value
 #: KV v2 mount point the connector secrets live under (Vault's conventional default is ``secret``).
 _ENV_KV_MOUNT = "MEFOR_SECRETS_VAULT_KV_MOUNT"
+#: PEM path to the CA that issued the Vault server's certificate (#1180, ASVS 12.3.4). A PATH, not a
+#: secret. The twin of the store KeyProvider's ``MEFOR_STORE_VAULT_CA_FILE``, kept separate for the
+#: same reason the address and token are: the two providers may point at different Vaults. Unset =
+#: hvac's own default, which is ``requests``' PUBLIC certifi bundle.
+#: (:func:`~messagefoundry.config.tls_policy.vault_client_verify_kwargs` records why ``[tls]`` does
+#: not reach this hop yet.)
+_ENV_CA_FILE = "MEFOR_SECRETS_VAULT_CA_FILE"
 
 #: Default field read from a KV secret when a reference omits ``#<field>``.
 _DEFAULT_FIELD = "value"
@@ -67,6 +75,26 @@ def _import_hvac() -> Any:
     return hvac
 
 
+def _vault_ca_kwargs(addr: str | None) -> dict[str, str]:
+    """This Vault hop's ``verify=`` keyword arguments — ``{}`` when no anchor is configured.
+
+    #1180 (ASVS 12.3.4) — the twin of ``store/keyprovider_vault.py``'s, sharing
+    :func:`~messagefoundry.config.tls_policy.vault_client_verify_kwargs`. This client reads connector
+    credentials out of Vault KV, so the anchor that verifies the server is the only thing standing
+    between a spoofed Vault and every partner credential the engine holds.
+
+    Fails closed here rather than in the shared helper, because the error type and cell name are this
+    module's: ``requests`` would otherwise raise deep inside the first KV read, surfacing as an opaque
+    resolution failure that names no cause."""
+    ca = os.environ.get(_ENV_CA_FILE) or None
+    if ca is not None and not os.path.isfile(ca):
+        raise SecretProviderError(
+            f"[secrets].provider={_EXTRA!r}: {_ENV_CA_FILE} names {ca!r}, which is not a readable "
+            f"file — point it at the PEM of the CA that issued the Vault server certificate."
+        )
+    return vault_client_verify_kwargs(ca_file=ca, addr=addr, cell=f"[secrets].provider={_EXTRA!r}")
+
+
 def _build_client(addr: str | None, token: str | None) -> Any:
     """Construct an ``hvac.Client``. Factored out so tests can substitute a fake KV backend without a live
     Vault. ``addr``/``token`` pass through; when ``None``, hvac falls back to its own VAULT_ADDR/VAULT_TOKEN
@@ -77,7 +105,11 @@ def _build_client(addr: str | None, token: str | None) -> Any:
     # egress does. `token` rides as an `X-Vault-Token` header on every KV read, so a 3xx from an
     # on-path attacker (absent TLS integrity) or a spoofed Vault would otherwise relocate the
     # request carrying it. See store/keyprovider_vault.py's twin for the measurement.
-    client: Any = hvac.Client(url=addr, token=token, allow_redirects=False)
+    # #1180 (ASVS 12.3.4): narrow the trust anchor when the operator named one. The keyword is OMITTED
+    # when they did not, so the stock construction is unchanged rather than passed an explicit default.
+    client: Any = hvac.Client(
+        url=addr, token=token, allow_redirects=False, **_vault_ca_kwargs(addr)
+    )
     return client
 
 

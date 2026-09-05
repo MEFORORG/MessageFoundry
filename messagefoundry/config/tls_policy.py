@@ -35,6 +35,7 @@ import logging
 import os
 import ssl
 import time
+import urllib.parse
 import urllib.request
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
@@ -66,6 +67,8 @@ __all__ = [
     "active_hop_posture",
     "APPROVED_SMTP_AUTH_MECHANISMS",
     "assert_ldap3_tls_suites",
+    "urllib_handler_context",
+    "build_anchored_https_handler",
     "build_asserted_https_handler",
     "build_smtp_tls_context",
     "smtp_login_approved",
@@ -78,6 +81,9 @@ __all__ = [
     "harden_verify_flags",
     "kex_groups_report",
     "relax_verify_expiry",
+    "requests_verify_from_anchor",
+    "vault_client_verify_kwargs",
+    "SYSTEM_TRUST_ANCHOR",
     "in_process_tls_revocation_refused",
     "insecure_hop_disposition",
     "is_loopback_hop_host",
@@ -684,15 +690,28 @@ def build_asserted_https_handler(*, connector: str) -> urllib.request.HTTPSHandl
     same class ``build_opener`` would have instantiated itself, built the same way, and supplying an
     instance only stops urllib adding a second one.
 
+    ``connector`` is the operator-recognisable label :func:`harden_cipher_suites` names in its error.
+    Lives here rather than beside each opener so the two call sites (the HTTP-family destinations and
+    the alert webhook) cannot drift onto different constructions. The guarded read of urllib's private
+    context lives in :func:`urllib_handler_context`."""
+    handler = urllib.request.HTTPSHandler()
+    harden_cipher_suites(urllib_handler_context(handler, connector=connector), connector=connector)
+    return handler
+
+
+def urllib_handler_context(
+    handler: urllib.request.HTTPSHandler, *, connector: str
+) -> ssl.SSLContext:
+    """The :class:`ssl.SSLContext` ``handler`` built for itself, or refuse.
+
     Reads the handler's private ``_context`` deliberately, and **fails closed** if it is not there. A
     ``getattr(..., None)`` that shrugged and returned would be a security control reporting success
     forever — exactly the failure :func:`harden_kex_groups` documents. A CPython that renames the
     attribute must break loudly at construction, not go quiet.
 
-    ``connector`` is the operator-recognisable label :func:`harden_cipher_suites` names in its error.
-    Lives here rather than beside each opener so the two call sites (the HTTP-family destinations and
-    the alert webhook) cannot drift onto different constructions."""
-    handler = urllib.request.HTTPSHandler()
+    One function so the two readers of that private attribute — the forward-secrecy assertion above
+    and :func:`build_anchored_https_handler`'s ``augment`` arm, which loads an extra root into the
+    same context — cannot drift onto different guards."""
     ctx = getattr(handler, "_context", None)
     if not isinstance(ctx, ssl.SSLContext):
         raise ValueError(
@@ -700,8 +719,7 @@ def build_asserted_https_handler(*, connector: str) -> urllib.request.HTTPSHandl
             f"(no `_context` attribute on this runtime), so the forward-secrecy assertion "
             f"(ASVS 12.1.2) cannot run on this hop. Refusing rather than crossing unchecked."
         )
-    harden_cipher_suites(ctx, connector=connector)
-    return handler
+    return ctx
 
 
 #: The ``ldap3.Tls`` keyword arguments :func:`assert_ldap3_tls_suites` can faithfully replicate.
@@ -1272,6 +1290,22 @@ class TrustAnchor:
     cafile: str | None
     load_system_roots: bool
 
+    @property
+    def narrows(self) -> bool:
+        """Whether this anchor names a CA of its own, i.e. whether it changes anything.
+
+        The one predicate a caller needs: an anchor that names no CA resolves to the OS trust store,
+        which is what every hop had before an anchor was resolvable at all. Callers that must choose
+        between a shared, unanchored client and a per-connection one read THIS rather than spelling
+        out the ``cafile is not None`` test, so the five HTTP-family call sites cannot drift apart."""
+        return self.cafile is not None
+
+
+#: The anchor a hop that configures nothing resolves to: the OS trust store, no private CA. The
+#: default for every ``trust_anchor`` parameter, so "no anchor" and "an anchor that narrows nothing"
+#: are ONE value rather than two spellings of it (``None`` used to be a second).
+SYSTEM_TRUST_ANCHOR = TrustAnchor(cafile=None, load_system_roots=True)
+
 
 def resolve_trust_anchor(
     *,
@@ -1327,6 +1361,116 @@ def build_verifying_client_context(
         return ctx
     # pinned / per-connection: ONLY this CA (no load_default_certs), matching forward_tls_ca_file.
     return ssl.create_default_context(purpose, cafile=anchor.cafile)
+
+
+#: urllib's ALPN advertisement — see :func:`build_anchored_https_handler` for why it is replayed.
+_URLLIB_HTTPS_ALPN_PROTOCOLS = ["http/1.1"]
+
+
+def build_anchored_https_handler(
+    *, anchor: TrustAnchor, connector: str
+) -> urllib.request.HTTPSHandler:
+    """The HTTP-family https handler for a hop whose client trust anchor is ``anchor`` (#1180, ADR 0093).
+
+    The HTTP egress family (REST / SOAP / FHIR / DICOMweb / the ``fhir_lookup`` read path) exposed only
+    a ``verify_tls`` boolean, so :func:`resolve_trust_anchor` could not be *spoken* there at all: an
+    operator who set ``[tls].internal_ca_file`` had it honoured on the MLLP / DICOM / FTPS hops and
+    silently ignored on every https one. This is the single construction point that closes that, so the
+    call sites cannot drift onto different constructions.
+
+    **An anchor that narrows nothing changes nothing, and that is the point.** A hop with no internal
+    CA — ``system`` mode, a loopback hop, or a connection that named no CA of its own — returns
+    :func:`build_asserted_https_handler` verbatim, i.e. urllib's OWN context, asserted in place. Nothing
+    about a stock hop's handshake moves. **This is the one place that claim is made; the call sites do
+    not restate it.**
+
+    **``augment`` keeps urllib's own context too**, and simply loads the internal CA into it — adding
+    a root needs no new context, so that arm changes the trust store and nothing else.
+
+    Only ``pinned`` (and a per-connection CA, which is the same shape) substitutes a context, and it
+    substitutes for a measured reason rather than a stylistic one: it must trust ONLY the internal CA,
+    and an :class:`ssl.SSLContext` cannot unload the default roots urllib's context has already
+    loaded. That one arm gets :func:`build_verifying_client_context` plus the two deltas urllib
+    applies over ``create_default_context`` (``set_alpn_protocols(["http/1.1"])`` and
+    ``post_handshake_auth``, measured on CPython 3.14.6 in :func:`build_asserted_https_handler`) —
+    otherwise pinning a hop would quietly drop its ALPN advertisement and post-handshake auth, which
+    is exactly the silent handshake change that function was written to avoid."""
+    if not anchor.narrows:
+        return build_asserted_https_handler(connector=connector)
+    if anchor.load_system_roots:
+        # augment: urllib's OWN context, with the internal CA loaded on top. Nothing is replayed
+        # because nothing is rebuilt — the only change is one more trusted root.
+        handler = build_asserted_https_handler(connector=connector)
+        urllib_handler_context(handler, connector=connector).load_verify_locations(
+            cafile=anchor.cafile
+        )
+        return handler
+    ctx = build_verifying_client_context(anchor)
+    ctx.set_alpn_protocols(_URLLIB_HTTPS_ALPN_PROTOCOLS)
+    if ctx.post_handshake_auth is not None:  # urllib guards it the same way
+        ctx.post_handshake_auth = True
+    harden_cipher_suites(ctx, connector=connector)  # assert forward secrecy (ASVS 12.1.2)
+    return urllib.request.HTTPSHandler(context=ctx)
+
+
+def requests_verify_from_anchor(anchor: TrustAnchor, *, cell: str) -> str | None:
+    """The ``verify=`` argument a ``requests``-based client needs to honour ``anchor`` (#1180).
+
+    For the two ``hvac`` clients, which ride ``requests`` rather than stdlib ``urllib``. ``requests``
+    takes ONE bundle path and trusts only what that path holds, so the mapping is exact for two of the
+    three anchor shapes and impossible for the third:
+
+    * no CA (``system``, no internal CA, loopback) → ``None``, meaning **pass nothing**. The caller
+      omits the keyword entirely, so the client is constructed exactly as it was.
+    * a pinned / per-connection CA → that path. ``requests`` then trusts ONLY it, which is precisely
+      what ``load_system_roots=False`` asks for.
+    * ``augment`` (OS roots **plus** the internal CA) → **refused**, because a single ``verify=`` path
+      cannot say it. Silently passing the path would narrow a hop the operator asked to widen, and
+      silently dropping it would ignore the anchor — the failure this whole item is about. So it says
+      so instead.
+
+    Worth stating plainly, because the direction is counter-intuitive: this hop is not one of the
+    broadly-trusting ones. ``requests`` defaults to the PUBLIC certifi bundle, not the OS store, so an
+    internal-CA Vault fails closed today rather than being widely trusted. What was missing here is
+    the ability to reach such a Vault at all."""
+    if not anchor.narrows:
+        return None
+    if anchor.load_system_roots:
+        raise ValueError(
+            f"{cell}: trust_anchor_mode='augment' (OS roots plus an internal CA) cannot be expressed "
+            f"to a requests-based client, which trusts exactly one bundle path. Use a pinned anchor "
+            f"(a CA file naming the issuer for this hop) or leave the anchor unset."
+        )
+    return anchor.cafile
+
+
+def vault_client_verify_kwargs(
+    *, ca_file: str | None, addr: str | None, cell: str
+) -> dict[str, str]:
+    """The ``verify=`` keyword arguments an ``hvac.Client`` needs for a Vault hop (#1180).
+
+    Returns ``{}`` when nothing is configured — the caller splats it, so the client is constructed
+    with exactly the arguments it carried before rather than an explicit default — and
+    ``{"verify": <path>}`` when an anchor narrows the hop.
+
+    Shared by ``config/secretprovider_vault.py`` and ``store/keyprovider_vault.py``, which resolve the
+    same anchor for two different Vaults; the fail-closed check on ``ca_file`` stays with each caller,
+    because each has its own error type and its own operator-facing cell name.
+
+    The policy is the default :class:`TrustAnchorPolicy` today, so the anchor reduces to whatever
+    ``ca_file`` names. That is a real limit and not an oversight: neither provider has the instance
+    ``[tls]`` section in scope — they hold a ``StoreSettings`` / ``SecretsSettings`` and are built
+    from the environment — so making ``[tls].internal_ca_file`` reach these two hops means threading
+    the policy through ``resolve_key_provider`` / ``resolve_secret_provider``, which is a separate
+    plumbing change. Routing through :func:`resolve_trust_anchor` anyway means that change moves one
+    argument rather than rewriting the hop."""
+    anchor = resolve_trust_anchor(
+        connection_ca_file=ca_file,
+        host=urllib.parse.urlsplit(addr or "").hostname or "",
+        policy=TrustAnchorPolicy(),
+    )
+    verify = requests_verify_from_anchor(anchor, cell=cell)
+    return {} if verify is None else {"verify": verify}
 
 
 def build_smtp_tls_context(

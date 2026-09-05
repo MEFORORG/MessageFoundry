@@ -93,7 +93,10 @@ class _FakeCtx:
 
 def test_client_cert_opener_loads_chain_and_floors_tls(monkeypatch: pytest.MonkeyPatch) -> None:
     fake = _FakeCtx()
-    monkeypatch.setattr(soap_mod.ssl, "create_default_context", lambda: fake)
+    # The stub takes the real signature's arguments. #1180 routed this opener's context through
+    # `build_verifying_client_context`, which passes the ssl.Purpose positionally the way the stdlib
+    # is called everywhere else; a zero-argument stub only ever matched one of the two call shapes.
+    monkeypatch.setattr(soap_mod.ssl, "create_default_context", lambda *args, **kwargs: fake)
     opener = _client_cert_opener("client.pem", "key.pem", "pw")
     assert fake.cert_args == ("client.pem", "key.pem", "pw")
     assert fake.minimum_version == ssl.TLSVersion.TLSv1_2  # ADR 0002 floor
