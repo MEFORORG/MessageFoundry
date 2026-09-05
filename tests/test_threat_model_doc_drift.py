@@ -159,6 +159,12 @@ _RESOURCE_ROW_KEYS: dict[str, str] = {
 }
 
 _DANGEROUS_ROW_KEYS: dict[str, str] = {
+    # BACKLOG #1278 made `subprocess` the default, so this key names vault text that is now false:
+    # in-process is the opt-OUT, not the default. The anchor is deliberately NOT re-picked here. It
+    # names a token that must appear in the vault document, and choosing a replacement from a
+    # checkout that cannot read that document would trade a stale anchor for an unverifiable one and
+    # red the leg for whoever does hold the vault. Same reasoning as the `pickle` anchor below. This
+    # is a COUPLED edit: the vault row and this key move together, vault-side.
     "**In-process (default) or subprocess-isolated execution": "sandbox",
     "**`db_lookup`**": "db_lookup",
     "**`fhir_lookup`**": "fhir_lookup",
@@ -735,7 +741,18 @@ def _checks() -> list[tuple[str, object, object]]:
             0,
         ),
         ("15.1.3 ACK-on-receipt is the default", s.inbound.ack_after, AckAfter.INGEST),
-        ("15.1.3 sandbox default = off (no Router/Handler wall cap)", s.sandbox.mode, "off"),
+        # BACKLOG #1278 flipped this from "off". The old label read "no Router/Handler wall cap",
+        # which is now BACKWARDS: at mode=off `run_sandboxed` is literally `fn(payload)` with no
+        # timeout at all, and it is the SUBPROCESS default that arms wall_seconds below. So the
+        # shipped posture GAINED a cap it did not have. This is a COUPLED edit -- the 15.1.3 row in
+        # `docs/security/THREAT-MODEL.md` (vault-only, absent from every checkout, so the
+        # doc-CONTENT half of this module is inert here and in CI) must be rewritten to say the wall
+        # cap is enforced on the default rather than off it.
+        (
+            "15.1.3 sandbox default = subprocess (Router/Handler wall cap ARMED)",
+            s.sandbox.mode,
+            "subprocess",
+        ),
         ("15.1.3 sandbox wall cap = 5.0 s", s.sandbox.wall_seconds, 5.0),
         ("15.1.3 sandbox cpu cap = 2.0 s (POSIX)", s.sandbox.cpu_seconds, 2.0),
         ("15.1.3 sandbox mem cap = 512 MiB (POSIX)", s.sandbox.mem_mb, 512),

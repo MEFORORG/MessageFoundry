@@ -731,8 +731,10 @@ def test_the_sandbox_worker_stderr_writer_is_filtered_not_disclosed() -> None:
             "reader cannot act on the disclosure: they learn content is withheld and not where to "
             "find it, nor that finding it puts full Handler output on a PHI-class log."
         )
-    assert ServiceSettings().sandbox.mode == "off", (
-        "[sandbox].mode no longer defaults off; §7 describes an OPT-IN posture — revisit it here."
+    assert ServiceSettings().sandbox.mode == "subprocess", (
+        "[sandbox].mode no longer defaults subprocess. BACKLOG #1278 flipped it, and that is what "
+        "makes the child-stderr relay above the DEFAULT logging path rather than an opt-in one — so "
+        "the reason to check §7 here strengthened rather than lapsed. Revisit §7 either way."
     )
 
 

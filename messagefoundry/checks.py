@@ -19,6 +19,17 @@ checks). Two checks are **required** (they can block a commit):
   to the setting's own default (ON) — so the gate previews what the default engine actually delivers,
   never a silent OFF (#230).
 
+  **THAT PREVIEW GUARANTEE IS SCOPED TO ``snapshot_on_send``, AND ONE OTHER SETTING BREAKS IT.** The
+  dry run ALWAYS executes Routers/Handlers **in-process**: :func:`messagefoundry.pipeline.dryrun.dry_run`
+  takes no ``sandbox`` argument, so it never consults ``[sandbox].mode`` — which has defaulted to
+  ``subprocess`` since BACKLOG #1278. Two consequences a reader must not have to infer. A Handler
+  calling the live ``db_lookup``/``fhir_lookup`` bridges **passes this gate green and then fails
+  closed at** ``serve``, because those bridges re-enter the event loop and the child refuses them.
+  And ``[sandbox].wall_seconds`` is not enforced here either, so a Handler slow enough to be killed
+  and dead-lettered at ``serve`` finishes clean in the preview. Neither is a gate defect to route
+  around: **the fix for both is to run the feed under ``serve``**, or to set ``[sandbox].mode=off``
+  for a Handler that genuinely needs live enrichment.
+
 A third required check, ``posture``, is **best-effort**: when a ``messagefoundry.toml`` is present
 (searched from ``config_dir`` upward + the CWD) it loads the service settings and — if an active
 environment is set whose security posture is unresolved (a *custom* name with no ``[ai].data_class``
