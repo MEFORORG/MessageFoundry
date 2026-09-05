@@ -2494,6 +2494,25 @@ class RegistryRunner:
             except Exception:
                 log.exception("alert sink raised on connection_stopped for %r", name)
 
+    def _pause_internal_lanes(self, names: Iterable[str]) -> None:
+        """Pause the pooled INGRESS / ROUTED / RESPONSE lanes for ``names``. Sync and await-free.
+
+        The one place that knows WHICH stages the #122 halt covers, because three callers need
+        exactly this loop and a fourth copy is how they drift: the halt itself
+        (:meth:`_halt_inbound_processing`), the fresh dispatchers at start
+        (:meth:`_start_pooled_dispatchers` step 2.6), and the reload re-apply
+        (:meth:`_reconcile_pooled_dispatchers`). A stage with no dispatcher is skipped -- per_lane
+        mode builds none, and a graph with no loopback inbound has no RESPONSE dispatcher.
+        ``pause_lane`` on an unregistered key registers it ALREADY-PAUSED, so calling this before a
+        dispatcher starts is what makes step 2.6 work at all (#115)."""
+        halted = list(names)  # materialised: callers pass registry.inbound, a live dict
+        for stage in (Stage.INGRESS, Stage.ROUTED, Stage.RESPONSE):
+            dispatcher = self._dispatchers.get(stage)
+            if dispatcher is None:
+                continue  # not pooled, or no loopback inbound => no RESPONSE dispatcher
+            for name in halted:
+                dispatcher.pause_lane(name)
+
     def _halt_inbound_processing(self, names: Iterable[str]) -> None:
         """Shut down the INTERNAL stages — router, transform, and a loopback's response re-ingress —
         for these inbounds. Sync + await-free; callers hold the reload lock.
@@ -2521,12 +2540,7 @@ class RegistryRunner:
         """
         halted = list(names)  # materialised: registry.inbound is a live dict we iterate twice
         self._log_halted.update(halted)
-        for stage in (Stage.INGRESS, Stage.ROUTED, Stage.RESPONSE):
-            dispatcher = self._dispatchers.get(stage)
-            if dispatcher is None:
-                continue  # not pooled, or no loopback inbound => no RESPONSE dispatcher
-            for name in halted:
-                dispatcher.pause_lane(name)
+        self._pause_internal_lanes(halted)
         if self._claim_mode != "pooled":
             # per_lane only: a worker parked in _wait_for_work must be woken to reach its gate. NOT
             # via _wake_lane, whose pooled branch is mark_ready() — re-readying a lane we just paused.
@@ -3592,12 +3606,7 @@ class RegistryRunner:
         # starts DRAINING under pooled, because the halt then survives only in the per_lane workers'
         # loop-top gate — which pooled mode does not run. Measured: a committed ingress row reached
         # PROCESSED with both sinks dead.
-        for stage in (Stage.INGRESS, Stage.ROUTED, Stage.RESPONSE):
-            internal = self._dispatchers.get(stage)
-            if internal is None:
-                continue
-            for n in self._log_halted:
-                internal.pause_lane(n)
+        self._pause_internal_lanes(self._log_halted)
         # (3) start each (seed-all-READY + immediate sweep). reset_stale_inflight already ran (engine).
         for dispatcher in self._dispatchers.values():
             await dispatcher.start()
@@ -3761,12 +3770,7 @@ class RegistryRunner:
         # reload never LIFTS a halt (that rides _resume_inbound_processing, which is gated on the log
         # working again), so re-applying it here can only ever be a no-op or a repair; a lane whose
         # PAUSED phase was lost while the log is still dead would otherwise start draining unlogged.
-        for stage in (Stage.INGRESS, Stage.ROUTED, Stage.RESPONSE):
-            internal = self._dispatchers.get(stage)
-            if internal is None:
-                continue
-            for n in self._log_halted:
-                internal.pause_lane(n)
+        self._pause_internal_lanes(self._log_halted)
 
     async def _pooled_maybe_buildup(self, lane: str, stage: str) -> None:
         """Pooled INGRESS/ROUTED buildup-alert hook (ADR 0066 D1). The per_lane buildup depth check lives
