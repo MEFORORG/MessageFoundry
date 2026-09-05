@@ -3275,6 +3275,36 @@ Wall time (the cleaner signal — all three still ingest everything up to 300/s)
 
 ## 321. Leak gate is blind to the ported-estate site-code and partner-product token class
 
+> **PARTIAL 2026-09-05 (builder), NOT A CLOSURE -- this item stays OPEN.** The 2026-09-03 note below
+> records `names fired 6/6 probeable of 8 loaded` as the measurement that answered the detector
+> question about the real table. It did, and it also carried this item's own defect one level down:
+> **two of those eight loaded entries were never probed at all, and nothing said so.** Re-measured by
+> execution against the REAL loaded set at 2026-09-05, unchanged from the shipped run: the three class
+> lines read `site_prefix fired 2/2`, `estate_file_scanned fired 13/13` and `names fired 6/6 probeable
+> of 8 loaded`, exit 0 -- three perfect ratios, over 24 loaded entries of which **3 had never been
+> probed**. Two are `[names]` regexes the prober cannot invert (legitimate list shapes: an alternation,
+> an optional character); one is an `[estate_body_only]` hold-out visible only by subtracting a number
+> in the report from a number in the counts block above it. The `estate` and `site_prefix` report lines
+> were also guarded on their PROBE sets, so a class whose entries were all unprobeable **vanished from
+> the report entirely** and its silence read as nothing to say rather than nothing checked. *A
+> permanent skip and a pass are the same line in a summary* -- this item's own sentence, fired again.
+>
+> **This change** makes every class that loaded anything report a line; states each class's UNPROBED
+> residual by count and by class-level reason on that class's own line; adds an aggregate `coverage X
+> of Y loaded entries probed` line so three perfect ratios cannot read as full coverage; and fails when
+> a class loaded entries and could probe **none** of them, which is the per-class form of the vacuous
+> pass the global `probed_anything` rule already forbade. **Which way it fails, deliberately: a PARTIAL
+> residual is reported and NOT failed** (fail-open -- a required merge context that reds on a correct
+> list is one somebody switches off, so the residual is made impossible to miss instead), **a TOTAL
+> one fails** (fail-closed -- an accurate report that the class was never exercised, not a false
+> failure). Verified it does not newly red: the real set and the shipped synthetic example both still
+> exit 0. Seven new tests in `tests/test_scan_forbidden_loaded_set.py` were each **run against the
+> unmodified scanner first and all seven failed**, including a positive control that a fully-probeable
+> source emits no residual, and an attack test asserting the new lines never echo the entry they could
+> not probe. **What is NOT done remains Proposed 1**, the owner-run token data across the private file
+> and the Actions + Dependabot secret stores -- owner-only, unverifiable from any checkout, and the
+> reason this item stays open.
+
 > **PARTIAL 2026-09-03 (builder), NOT A CLOSURE -- this item stays OPEN.** Proposed 2 is now done on
 > both halves, and the second half is the one the 2026-08-26 note could not reach. Per-class coverage
 > against the loaded set landed 2026-08-28 (`tests/test_scan_forbidden_loaded_set.py`, PR 615), but

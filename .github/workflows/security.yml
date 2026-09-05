@@ -796,5 +796,14 @@ jobs:
             # The pytest arm that asks this same question (tests/test_scan_forbidden_loaded_set.py)
             # can only ever skip in CI -- no pytest job is given this secret -- so this stdlib
             # entrypoint is the only place the REAL table is ever probed.
+            #
+            # READ THE `coverage` LINE, NOT ONLY THE PER-CLASS RATIOS. Not every loaded entry can be
+            # probed: a [names] regex the prober cannot invert and an [estate_body_only] hold-out are
+            # both legitimate list shapes. Measured against the real table 2026-09-05, 3 of 24 loaded
+            # entries were unprobeable while all three class lines read a perfect ratio, so each class
+            # now states its own UNPROBED count and the last line states the total. A PARTIAL residual
+            # is reported and NOT failed, on purpose -- reddening this required context on a correct
+            # list is how a required context gets switched off. A class that could probe NONE of its
+            # loaded entries DOES fail: that is the vacuous pass, per class.
             python scripts/security/scan_forbidden.py --self-test
           fi
