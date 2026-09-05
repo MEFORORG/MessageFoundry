@@ -10336,6 +10336,42 @@ Nothing here touches the TLS/FTPS context in the same module, which was already 
 > defect the row's own body records as retired. **NOT done and named as such:** the scorecard
 > re-score and the scope-completeness adversarial pass -- see *The handoff* below.
 >
+> **PARTIAL 2026-09-04 -- THE SCOPE-COMPLETENESS PASS HAS NOW RUN ON ITS CENSUS AXIS AND FOUND A
+> REAL GAP, NOW CLOSED. THE ROW STAYS OPEN on the same unchanged ground: the closing act is the vault
+> scorecard re-score.** Handoff act 2 is no longer untouched. **The finding:** the randomness arm
+> walked `ide/` alone, so `messagefoundry_webconsole/static/app.js` and `static/csp-probe.js` --
+> shipped, hand-written, first-party JavaScript served to an authenticated operator at `/ui`, one of
+> which IS a security control (the ASVS 3.7.5 CSP-enforcement canary) -- were read by NEITHER arm.
+> `discover()` rglobs `*.py`; the randomness arm stopped at `ide/`. **What hid it is the shape this
+> item keeps naming:** coverage was reasoned about per ROOT while the instruments split per LANGUAGE.
+> `messagefoundry_webconsole` is in `WALK_ROOTS`, so the root reported green -- a true statement about
+> its `.py` and an accidental one about the rest of it -- and a test then froze the mismatch as an
+> invariant, asserting `NON_PYTHON_WALK_ROOTS` was DISJOINT from `WALK_ROOTS`. That assertion's stated
+> reason (keeping one arm's green from standing in for the other's silence) argues for separate ARMS,
+> which these still are; it does not argue that a first-party root must be single-language, which is
+> what disjointness actually asserted. An exclusion asserted as an invariant with nothing checking
+> whether the invariant should hold -- the same silent-control shape #1164 found in the `ide/`
+> exclusion, one root over and arrived at from the opposite direction. **Built:** the arm now walks
+> `("ide", "messagefoundry_webconsole")`, riding the same required context, so a weak draw in the
+> console blocks a merge. The disjointness assertion is replaced by one that earns its place -- a
+> declared root must actually hold non-Python source, so it can never report clean on a corpus it
+> never reached. The missing-root refusal was KEPT and the fixtures taught to satisfy it, rather than
+> the control relaxed to suit them. **The console's JavaScript is clean today** (measured, zero
+> randomness draws), so this is a would-be gap on a first deployment, not a live defect: a weak draw
+> added there tomorrow would have merged green. **Two mutation controls RUN against shipped code, not
+> asserted, both reverted by byte-copy with the md5 verified:** reverting the walk tuple to `("ide",)`
+> reds the 2 new tests, and a `Math.random()` appended to the real `app.js` reds the gate itself
+> (exit 1). Corpus grew **110 -> 112** sources across 2 roots, which is the walk demonstrably reaching
+> the new root. **Two of this item's own claims were re-measured and one is short:** its
+> "non-CSPRNG `random` appears only in `generators/` and behind the keyed HMAC in `anon/`" is an
+> ENUMERATION and it misses four sites in `harness/` (`file_panel.py`, `send.py`, `load/corpus.py`,
+> `load/sender.py`). All four are benign -- seeded `random.Random(seed)` weighted pickers over an HL7
+> test-message mix, no non-guessable value among them -- so the SUBSTANCE holds and only the
+> enumeration failed, which is SDS-3.6 exactly. The `uuid4` claim re-measured clean (62 sites, all
+> identifiers). **STILL NOT DONE:** the vault scorecard re-score; and within the scope pass, whether
+> the STOW-RS multipart boundary and the WS-Security nonce are in the verb's reach at all, which this
+> pass did not settle. PowerShell remains out of scope here and filed under #1164.
+>
 > **Filed 2026-08-08 - not started. RESEARCH item: the goal is an HONEST pass, and "cannot honestly reach pass" is a valid finding.** ASVS **11.5.1** (L2) currently scores **partial**. The pinned verb sets a 128-bit floor on every non-guessable random value. ~~TOTP recovery codes are CSPRNG-drawn but reach only about 74.3 bits, and the IDE extension mints its webview CSP nonces from `Math.random()`.~~ **[BOTH CLAUSES SUPERSEDED -- struck, not deleted, because the evidence that this row was once wrong is what stops the next reader trusting the rest of it unchecked. The recovery-code clause was superseded by PR #603 on 2026-08-25 (`_RECOVERY_GROUPS` 3 -> 6, 148.63 bits raw and 142.98 multiplicity-adjusted). The IDE clause was TRUE when filed and was superseded nine days later by PR #422 (`c49a8a7b`, 2026-08-17), which added `ide/src/cspNonce.ts` -- 18 bytes of `randomBytes` from `node:crypto` -- and consolidated the twelve hand-copied generators into it. This item's own research then measured it false on 2026-08-20 at `fc54d169`, and the top of the row went on asserting it for another two weeks. RE-MEASURED 2026-09-03 at `fd44b0f17`: zero `Math.random(` call sites anywhere under `ide/` in `.ts` or `.js`, against a positive control in the same run of 6 bare `Math.random` occurrences and 110 files walked, so the walk reached the corpus. None of the 6 is a call: five sit in comments (two in `cspNonce.ts`, which names the generator to explain why it is unusable) and one is a test NAME string. The top of this row had gone on asserting the defect in the present tense while its own body recorded the retirement; the two now agree.]**
 > Verdict: research
 > Closing-act: scorecard-rescore
@@ -10378,7 +10414,7 @@ Nothing here touches the TLS/FTPS context in the same module, which was already 
 **THE HANDOFF -- two acts remain and NEITHER may be performed from an engine checkout.** Both belong to a Tracker seat working in the `MessageFoundry-vault` clone that sits beside this repository. Naming the requirement number here is fine; the cell's verdict, coverage and gaps are vaulted and stay there.
 
 1. **The ASVS 11.5.1 scorecard re-score -- this item's declared closing act.** The record is `docs/security/asvs-scorecard.toml` in the vault. `docs/security/` is gitignored here, so `git ls-files docs/security` from an engine checkout returns zero and the record looks absent rather than misplaced; that is the trap, not evidence. The status read needs no engine tree, corpus or network: `python scripts/asvs/scorecard.py --scorecard <vault>/docs/security/asvs-scorecard.toml --status`. A full verify additionally needs `--corpus` and an explicit `--root` naming the engine tree, and `verify` refuses a root that CONTAINS the scorecard. **The engine-side evidence the re-score needs is all on `main` and all citable:** `auth/totp.py:57-67` for the six-group shape and the comment that derives it; `tests/test_recovery_code_entropy.py` for the floor derived from the shipped constants plus its mutation control; `auth/service.py:600-614` for the 192-bit administrator draw; `ide/src/cspNonce.ts` for the 144-bit nonce; `ide/src/test/suite/extension-hardening.test.ts` for the extension's own negative test; and `scripts/security/crypto_inventory_check.py` (`check_non_python_randomness`) plus `tests/test_crypto_inventory_scanner.py` for the cross-language arm now riding a required context. **Anchor at a commit and print the ref pair:** no number that tool emits is a fact without the `# asvs-verify scorecard=X engine=Y` header beside it.
-2. **The scope-completeness adversarial pass, which this item's own caveat says was never run.** The cheap-flip axis was reviewed once; the scope-completeness axis was not. The reason it matters is stated above: the census that supported the original verdict is a `secrets`-and-`os.urandom` pattern that can only find GOOD draws, so it cannot report a value drawn from something it does not pattern for. The five values in the table are what that census returns when it is asked the other question, and they are the starting point rather than the answer. **The pass should also re-ask the census question itself**, because the arm shipped here answers only the non-Python half of it: `ide/` is now inventoried for randomness, but PowerShell is not -- `scripts/**/*.ps1` is **56 files** (re-measured 2026-09-03, against a positive control of 53 of them matching `param(`; #1164 recorded 48 at its own commit, so the corpus grew) sitting inside `WALK_ROOTS[4]` that `discover()` never reads because it rglobs `*.py`, and #1164 records nine of them performing first-party crypto. That gap is filed under #1164, not here, and it is named so the completeness pass does not re-derive it as new.
+2. **The scope-completeness adversarial pass. ~~which this item's own caveat says was never run.~~ [PARTLY SUPERSEDED 2026-09-04 -- struck, not deleted, on this row's own standing rule that the evidence it was once wrong is what stops the next reader trusting the rest of it unchecked. The pass has now RUN on its census axis and is recorded in the 2026-09-04 banner above: it found the operator console's shipped JavaScript invisible to both arms, and that gap is closed. What remains unrun is narrower than "the pass" -- see the end of this entry.]** The cheap-flip axis was reviewed once; the scope-completeness axis was not. The reason it matters is stated above: the census that supported the original verdict is a `secrets`-and-`os.urandom` pattern that can only find GOOD draws, so it cannot report a value drawn from something it does not pattern for. The five values in the table are what that census returns when it is asked the other question, and they are the starting point rather than the answer. **The pass should also re-ask the census question itself**, because the arm shipped here answers only the non-Python half of it: `ide/` is now inventoried for randomness, but PowerShell is not -- `scripts/**/*.ps1` is **56 files** (re-measured 2026-09-03, against a positive control of 53 of them matching `param(`; #1164 recorded 48 at its own commit, so the corpus grew) sitting inside `WALK_ROOTS[4]` that `discover()` never reads because it rglobs `*.py`, and #1164 records nine of them performing first-party crypto. That gap is filed under #1164, not here, and it is named so the completeness pass does not re-derive it as new.
 
 ## 1173. research an honest pass for ASVS 11.5.2 -- an RNG-under-demand claim that survives the IDE extension staying in scope
 
