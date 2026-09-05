@@ -272,8 +272,11 @@ retractions. At least these went:
 - routing owner questions through a Liaison.
 
 Seven seats went with them: Dispatcher, Liaison, PM, Cleaner, Role Manager, Process Improvement,
-ASVS Tracker. If a document you are reading names a retired seat or a retired rule, treat that
-document as stale and follow this section.
+ASVS Tracker. If a document you are reading names a retired seat or a retired rule, treat **that
+naming** as stale and follow this section. **Do not extend it to the whole document.** A retired rule
+often leaves a mechanism running on purpose, with the reason recorded beside it -- `.github/` headers
+are the source of record for what CI still reads and why. A mechanism this section does not mention
+is not thereby retired; this section binds on seats and rules, not on the machine's inventory.
 
 ### The KORUS roster, and only these seats
 
