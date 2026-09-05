@@ -545,25 +545,32 @@ def test_no_get_or_head_route_declares_a_phi_needle_parameter() -> None:
     app = create_app(serve_ui=True)
     banned = {"content", "field_value"}
     offenders: list[str] = []
-    seen_query_params = 0
+    seen: dict[str, int] = {"console": 0, "engine": 0}
     for route in app.routes:
         if not isinstance(route, APIRoute):
             continue
         methods = route.methods or set()
         if not (methods & {"GET", "HEAD"}):
             continue
+        plane = "console" if route.path.startswith("/ui") else "engine"
         for param in route.dependant.query_params:
-            seen_query_params += 1
+            seen[plane] += 1
             name = getattr(param, "alias", None) or param.name
             if name in banned:
                 offenders.append(f"{sorted(methods)} {route.path} declares {name!r}")
     # Positive control FIRST: a walk that inspects nothing would report a clean repo forever, which
     # is indistinguishable from a guard that works. Mirrors the "backstop is inert" check elsewhere
-    # in this suite.
-    assert seen_query_params > 20, (
-        f"the route walk found only {seen_query_params} query parameters -- the guard is inert and "
-        "its clean result means nothing"
-    )
+    # in this suite. Counted PER PLANE so it witnesses the docstring's two-plane claim: the failure
+    # mode it exists for is the console's routes leaving this walk -- registered behind an
+    # `app.mount` the way /ui/static already is, rather than onto `app` by `mount_ui` -- which a
+    # single total would hide, because the engine plane alone clears any global threshold.
+    # Measured here: console 36, engine 60. The bound sits far below both on purpose; this is an
+    # inertness check, not a census, and a tight number would red on every unrelated route edit.
+    for plane, count in seen.items():
+        assert count > 20, (
+            f"the route walk found only {count} query parameters on the {plane} plane -- that half of "
+            "the guard is inert and its clean result means nothing"
+        )
     assert not offenders, (
         "a PHI search needle is declared on a GET/HEAD route again (BACKLOG #1184, ASVS 14.2.1). "
         "The URL, browser history and the access log are outside the redactor's reach; send it in a "
