@@ -65,15 +65,18 @@ section reference.
 | | `production_instance` | *derived from environment* |
 | Outside `[security]` | `[store].aad_bind` | `true` (at-rest values bound to their cell) |
 | | `[auth].ad_session_recheck_seconds` | `300` s (*conditional* — a loosening only once `ad_enabled`) |
+| | `[secret_rotation].enforce_store_key_expiry` | `true` (a calendar-overdue store DEK refuses to start) |
 | Per-connection | `cleartext_accepted` | `false` on every outbound / `FhirLookup` (*connection-scoped* — see below) |
 | | `tls_allow_expired` | `false` on all six outbound connectors that take it (*connection-scoped*) |
 | | generic-ODBC `DATABASE` TLS | a verifying `odbc_params` keyword (*connection-scoped*; inbound **and** outbound) |
 
-**Five of these do not live in `[security]`.** `[store].aad_bind` and `[auth].ad_session_recheck_seconds`
-sit in their own sections for cohesion, and the last three are per-**connection** facts, not service
+**Six of these do not live in `[security]`.** `[store].aad_bind`,
+`[auth].ad_session_recheck_seconds` and `[secret_rotation].enforce_store_key_expiry` sit in their own
+sections for cohesion, and the last three are per-**connection** facts, not service
 settings at all. They are listed and reported here anyway, because the rule is *one shipped
 posture, loosen only* — a deviation the registry cannot see is a second posture by the back door. The
-first two are named by `security_loosenings()` from the loaded `[store]`/`[auth]` sections; the last
+first three are named by `security_loosenings()` from the loaded
+`[store]`/`[auth]`/`[secret_rotation]` sections; the last
 three are resolved from the loaded connection graph and passed in by name (see their entries below for
 exactly which surfaces see them, and which cannot).
 
@@ -367,6 +370,26 @@ the call to the Console on 2026-09-02; the Console decided ([ADR 0118](adr/0118-
 - **Reversible:** yes, in both directions. Legacy `v1` rows always decrypt (dual-read) and
   `messagefoundry rotate-key` upgrades them `v1`→`v2` in place, so turning it back on does not strand an
   existing store. See [ADR 0019](adr/0019-pluggable-keyprovider-hsm-kms-vault.md) (2026-07-28 amendment).
+
+### `[secret_rotation].enforce_store_key_expiry = false` — the store DEK's calendar expiry stops the engine no more
+- **What you lose:** the **hard stop** on a calendar-expired data-encryption key. With it on, a DEK past
+  `store_key_max_age_days + enforce_grace_days` (365 + 30 as shipped) aborts engine start under
+  `[security].enforcement = enforce`, and so does a DEK whose age cannot be determined at all. With it
+  off, that same key keeps encrypting PHI at rest indefinitely and the only remaining signal is a
+  `secret_rotation_due` alert — which nobody has to answer. The engine documents an annual DEK cadence
+  (ASVS 13.3.4); this switch is what makes that cadence a control rather than a suggestion.
+- **What you keep:** the alert. The opt-out suppresses the refusal and nothing else, deliberately — an
+  operator who accepted the risk still needs to be told the key is stale. The same key's **usage** axis
+  is also untouched: it still refuses unconditionally at 2^32 encrypts, with no opt-out at all.
+- **When acceptable:** a scheduled maintenance start where rotating first is genuinely impossible, or a
+  restore/forensic bring-up against an old store whose key you must not rotate. Both are bounded windows.
+  Leaving it off permanently means the annual cadence is unenforced.
+- **Compensating controls:** none that substitute. Route `event_type = "secret_rotation"` to a transport
+  somebody reads and treat `enforced = true` as an incident; the alert is the whole remaining signal.
+  `GET /security/posture` and the `serve` warning name the switch on every boot, so at least the gap is
+  visible.
+- **Reversible:** yes, immediately — set it back to `true` (or delete the line) and restart. Nothing
+  about the key or the store changes either way; only whether the engine agrees to start.
 
 ### `[auth].ad_session_recheck_seconds = 0` **with `ad_enabled`** — directory revocation stops propagating
 > **Conditional**, like `allowed_client_networks`. With no directory to reconcile against, `0` is not a

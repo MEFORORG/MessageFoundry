@@ -29,6 +29,7 @@ from messagefoundry.config.settings import (
     INSECURE_TLS_ESCAPE_ENV,
     AlertsSettings,
     AuthSettings,
+    SecretRotationSettings,
     SecuritySettings,
     StoreSettings,
     security_loosenings,
@@ -202,7 +203,10 @@ def _names(**kw: Any) -> list[str]:
     )
     sec = SecuritySettings(**kw.pop("security", {}))
     return [
-        n for n, _ in security_loosenings(sec, StoreSettings(), AuthSettings(), alerts, (), (), ())
+        n
+        for n, _ in security_loosenings(
+            sec, StoreSettings(), AuthSettings(), alerts, SecretRotationSettings(), (), (), ()
+        )
     ]
 
 
@@ -238,7 +242,14 @@ def test_an_unconfigured_alert_transport_reports_no_hop_deviation() -> None:
     names = [
         n
         for n, _ in security_loosenings(
-            SecuritySettings(), StoreSettings(), AuthSettings(), bare, (), (), ()
+            SecuritySettings(),
+            StoreSettings(),
+            AuthSettings(),
+            bare,
+            SecretRotationSettings(),
+            (),
+            (),
+            (),
         )
     ]
     assert "email_use_tls" not in names

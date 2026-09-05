@@ -3212,6 +3212,14 @@ class SecretRotationSettings(_Section):
     of due. It reads **only** the rotation *dates* an operator supplied here — never any secret value
     (PHI-free). Set ``warn_days`` to 0 to disable the reminder.
 
+    **The store DEK's calendar expiry is ENFORCED, not merely announced** (ASVS 13.3.4, BACKLOG #1004).
+    Under ``[security].enforcement=ENFORCE`` with a keyed store, a DEK past ``store_key_max_age_days +
+    enforce_grace_days`` — or one whose age cannot be determined at all — **aborts engine start**
+    (``StoreKeyRotationOverdueError``), alongside the escalated alert rather than instead of it. That
+    matches the same key's **usage** axis, which has always refused unconditionally at ``2**32``
+    encrypts. ``enforce_store_key_expiry = false`` keeps the alert and drops the refusal; it is a
+    reported security loosening, not a quiet switch.
+
     The store DEK is tracked **live-by-default** (ASVS 13.3.4, BACKLOG #282): at first keyed start the
     engine persists a non-secret tracked-since stamp (the DEK key-id + first-seen date) in store meta and
     watches the DEK off it, so setting ``store_key_last_rotated`` (an ISO ``YYYY-MM-DD`` date) is an
@@ -3240,6 +3248,14 @@ class SecretRotationSettings(_Section):
     # ENFORCE escalation grace (ASVS 13.3.4): under [security].enforcement=ENFORCE, a DEK older than
     # store_key_max_age_days + this grace escalates its rotation alert (higher severity) at restart.
     enforce_grace_days: int = 30
+    # ASVS 13.3.4 / BACKLOG #1004 — the calendar axis REFUSES, not just alerts. Under
+    # [security].enforcement=ENFORCE with a keyed store, a DEK past store_key_max_age_days +
+    # enforce_grace_days (or one whose age cannot be determined) aborts engine start. Default TRUE:
+    # the DEK's USAGE axis already refuses unconditionally at 2**32 encrypts, so a calendar axis
+    # shipping OFF would be strictly weaker than its own sibling on the same key, and a default-off
+    # build would buy the setting without the posture. Setting it false is a LOOSENING and
+    # security_loosenings() names it, so the opt-out is never silent.
+    enforce_store_key_expiry: bool = True
 
     @field_validator("warn_days")
     @classmethod
@@ -4309,6 +4325,7 @@ def security_loosenings(
     store: StoreSettings,
     auth: AuthSettings,
     alerts: AlertsSettings,
+    secret_rotation: SecretRotationSettings,
     cleartext_hops: Sequence[str],
     expiry_relaxed_hops: Sequence[str],
     unverified_db_hops: Sequence[str],
@@ -4321,7 +4338,8 @@ def security_loosenings(
     that iterates ``SecuritySettings.model_fields`` and fails on an unreported, unexempted one — plus an
     ENUMERATED set of deviations that live elsewhere: ``[store].aad_bind``,
     ``[auth].ad_session_recheck_seconds``, ``[alerts].email_use_tls``/``email_tls_verify`` (#323
-    layer 3), and three per-connection deviations — ``cleartext_accepted``, ``tls_allow_expired``, and a
+    layer 3), ``[secret_rotation].enforce_store_key_expiry`` (#1004), and three per-connection
+    deviations — ``cleartext_accepted``, ``tls_allow_expired``, and a
     generic-ODBC ``DATABASE`` hop with TLS unenforced (#333). It is NOT yet
     an exhaustive registry of every security-relevant switch in every section; ``[store]``/``[auth]``
     carry others (``encrypt``, ``trust_server_certificate``, ``enabled``, ``require_mfa``,
@@ -4525,6 +4543,20 @@ def security_loosenings(
                 "aad_bind",
                 "at-rest values are NOT bound to their (table, column, row) cell — a ciphertext moved "
                 "between cells decrypts instead of failing its auth tag (no effect without a store key)",
+            )
+        )
+    # BACKLOG #1004 (ASVS 13.3.4). Stated as what the SITE gives up rather than "a setting is off": the
+    # engine keeps starting on a key past its documented cadence, and the only remaining signal is an
+    # alert nobody has to answer. Named here because a silent opt-out from a refusal is indistinguishable
+    # from the refusal never having been built — which is the defect the refusal replaced.
+    if not secret_rotation.enforce_store_key_expiry:
+        out.append(
+            (
+                "enforce_store_key_expiry",
+                "the store data-encryption key's CALENDAR expiry does not stop anything — a DEK past "
+                "its max age plus grace, or one whose age cannot be determined, still starts the "
+                "engine and keeps encrypting PHI at rest, with an alert as the only signal (the same "
+                "key's 2**32-encrypt usage ceiling still refuses unconditionally)",
             )
         )
     # Conditional on ad_enabled, like allowed_client_networks above: with no directory there is nothing to
