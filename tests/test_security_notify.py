@@ -9,7 +9,7 @@ no deliverable address is skipped.
 
 from __future__ import annotations
 
-import asyncio
+import logging
 from typing import Any
 
 import pytest
@@ -17,7 +17,6 @@ import pytest
 from messagefoundry.auth.notifications import (
     ACCOUNT_LOCKED,
     EMAIL_CHANGED,
-    PASSWORD_CHANGED,
     RECOVERY_CODE_USED,
     SecurityEvent,
 )
@@ -27,6 +26,9 @@ from messagefoundry.pipeline.security_notify import (
     _build_body,
     security_notifier_from_settings,
 )
+
+# The module's own logger, named once so the capture filter and the module cannot drift apart.
+_NOTIFY_LOGGER = "messagefoundry.pipeline.security_notify"
 
 
 def test_factory_returns_none_without_smtp() -> None:
@@ -69,18 +71,47 @@ async def test_notify_emails_the_affected_user(monkeypatch: pytest.MonkeyPatch) 
     assert "MSH|" not in call["body"] and "PID|" not in call["body"]
 
 
-async def test_notify_skips_when_user_has_no_email(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_notify_skips_and_reports_when_the_account_has_no_address(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """No deliverable address means no email, and the drop must SAY SO (BACKLOG #1139, ASVS 6.3.7).
+
+    "Nothing was sent" holds identically whether the drop speaks or not, so asserting only that
+    cannot see the difference. The record count below is the assertion that separates them; the
+    reasoning for warning at all lives once, on the branch itself in ``security_notify.py``.
+    """
     sent: list[dict[str, Any]] = []
     monkeypatch.setattr(
         "messagefoundry.pipeline.security_notify.send_plain_email",
         lambda **kw: sent.append(kw),
     )
     notifier = SecurityEventNotifier(host="smtp.example.org", port=25, sender="mf@example.org")
+    # start()/aclose() are a pair with the monkeypatch above: without a running drain, a regression
+    # that ENQUEUED instead of dropping would leave the item undrained and `sent == []` would still
+    # pass. No sleep() tick is needed -- the drop returns before _enqueue, so nothing is queued.
     notifier.start()
-    await notifier.notify(SecurityEvent(PASSWORD_CHANGED, username="bob", email=None))
-    await asyncio.sleep(0)  # give the loop a tick
+    with caplog.at_level(logging.WARNING, logger=_NOTIFY_LOGGER):
+        # Driven with an EMAIL_CHANGED because its detail carries an ADDRESS. The no-leak assertion
+        # at the bottom is only load-bearing if there is something there to leak.
+        await notifier.notify(
+            SecurityEvent(
+                EMAIL_CHANGED,
+                username="bootstrap-admin",
+                email=None,
+                detail={"new_email": "repointed@example.net"},
+            )
+        )
     await notifier.aclose()
-    assert sent == []  # no deliverable address → no email
+
+    assert sent == []  # the drop is reported, not repaired: still no email
+    dropped = [r for r in caplog.records if r.name == _NOTIFY_LOGGER]
+    assert len(dropped) == 1, "an undeliverable notice must be reported exactly once, not swallowed"
+    message = dropped[0].getMessage()
+    # Names WHICH notice and WHOSE account, so the operator can act on it.
+    assert EMAIL_CHANGED in message
+    assert "bootstrap-admin" in message
+    # Never event.detail: on this event type it holds an email address.
+    assert "repointed@example.net" not in message
 
 
 async def test_notify_send_failure_is_swallowed(monkeypatch: pytest.MonkeyPatch) -> None:
