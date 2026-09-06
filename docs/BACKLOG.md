@@ -17519,9 +17519,9 @@ the residual-only scope of that `blob` changes.
 
 ## 1334. The dispatch gate green-lights demand-gate and owner-ruling verdicts, the two that mean do not just build it
 
-> 🔢 **Filed 2026-08-23 - not started.** `judge()` in `scripts/coord/dispatch_gate.py` checks exactly one verdict value. `research` gets an advisory; `demand-gate` and `owner-ruling` return **`ok`** -- the same answer a plain `build` gets. The gate names the closing act correctly and says nothing about whether the item should be started at all.
+> ✅ **Filed 2026-08-23. LANDED 2026-09-04 on `main` via `c44bdd6f0` (PR 791) -- all three parts, verified 2026-09-05 by calling `judge()`.** As filed, `judge()` in `scripts/coord/dispatch_gate.py` checked exactly one verdict value: `research` got an advisory, while `demand-gate` and `owner-ruling` returned **`ok`** -- the same answer a plain `build` gets -- and a retirement was invisible to it entirely. The gate named the closing act correctly and said nothing about whether the item should be started at all.
 >
-> **Scored 2026-09-03 -> P1.** Value **6/10** · Difficulty **2/10** · _quick win_. Partly shipped -- the two advise limbs landed and the retirement limb is written but not on main. GATED_VERDICTS at scripts/coord/dispatch_gate.py:108 and the branch at :175 advise on demand-gate and owner-ruling, pinned by tests/test_coord_dispatch_gate.py:237 and :320. The retirement limb is absent from HEAD: judge() at scripts/coord/dispatch_gate.py:134 takes only the item and reads only item.fields at :152, and the word retire appears nowhere in that file. I ran the limb's own needles over the ledger at HEAD -- three open rows are retired in place (#1309, #1311, #1332) and the gate grades #1332 ok, the row whose body says it is a duplicate of #1086 and should not be built, which is what holds value at 6 against the awkward workaround of reading each row by eye. Landing it is cheaper than a rebase: eaf6d0940 on claude/builder-2-1334-retirement-limb is 363 lines across the gate and its tests, git merge-base --is-ancestor returns false against main, but git merge-tree main eaf6d0940 reports no conflict and main has touched neither file since the merge base, so the cost is a clean merge plus ruff, mypy and pytest.
+> **Scored 2026-09-03 -> P1.** Value **6/10** · Difficulty **2/10** · _quick win_. Partly shipped -- the two advise limbs landed and the retirement limb is written but not on main. GATED_VERDICTS at scripts/coord/dispatch_gate.py:108 and the branch at :175 advise on demand-gate and owner-ruling, pinned by tests/test_coord_dispatch_gate.py:237 and :320. The retirement limb is absent from HEAD: judge() at scripts/coord/dispatch_gate.py:134 takes only the item and reads only item.fields at :152, and the word retire appears nowhere in that file. I ran the limb's own needles over the ledger at HEAD -- three open rows are retired in place (#1309, #1311, #1332) and the gate grades #1332 ok, the row whose body says it is a duplicate of #1086 and should not be built, which is what holds value at 6 against the awkward workaround of reading each row by eye. Landing it is cheaper than a rebase: eaf6d0940 on claude/builder-2-1334-retirement-limb is 363 lines across the gate and its tests, git merge-base --is-ancestor returns false against main, but git merge-tree main eaf6d0940 reports no conflict and main has touched neither file since the merge base, so the cost is a clean merge plus ruff, mypy and pytest. **SUPERSEDED 2026-09-05 -- every "not on main" reading in this paragraph was taken before `c44bdd6f0` merged.** The retirement limb has been on `main` since 2026-09-04, `judge()` takes the item's body and banner, and `retirement_marker` fires on exactly #1309, #1311 and #1332.
 > Verdict: build
 > Research: none
 > Closing-act: code
@@ -17605,8 +17605,46 @@ boundary so the gate does not re-derive it beside the parser that owns it.
 **What remains after this merges:** the fourth banner key this row offers as the cleaner answer is
 still unbuilt, and nothing in the ledger yet declares a retirement in a field rather than in prose.
 Both needles therefore stay wording-sensitive, and `tests/test_coord_dispatch_gate.py` carries the
-live-ledger arm that goes red when the wording drifts. This row closes by `code`, so the LANDER
-flips the banner on merge.
+live-ledger arm that goes red when the wording drifts.
+
+***CLOSED 2026-09-05. THE LIMB LANDED UNDER ANOTHER ITEM'S NUMBER, WHICH IS WHY THIS ROW STILL READ
+AS NOT STARTED FOR A DAY.*** The paragraph above says all three parts are "on a pull request", and
+that pull request was **767, closed unmerged 2026-09-04T02:29:20Z**. It was closed as *superseded*,
+not rejected: `767`'s two commits are ancestors of PR **791**, which carried this limb plus the
+`read` level of #1393 over an identical set of four files. 791 merged as **`c44bdd6f0`**, so the
+work reached `main` under **#1393**'s heading and nothing under #1334's number ever merged. A reader
+checking this row by its own PR finds a closed one and concludes the work is lost.
+
+**Ancestry is the wrong instrument here and it is what kept the row stale.** Under squash-merge
+`git merge-base --is-ancestor origin/claude/builder-1334-land-retirement-limb origin/main` still
+returns false today, which reads as *not landed*; the branch object is genuinely not an ancestor
+while its content is on `main`. Verified by **content** instead, at `c57903c2c`: `retire` appears
+56 times in `scripts/coord/dispatch_gate.py` and 74 in `tests/test_coord_dispatch_gate.py`, and
+`body_line` 4 times each in the gate and in `scripts/docs/backlog_status_check.py`. A negative
+control over the same corpus returned nothing, so the grep discriminates.
+
+**Re-proven by calling `judge()`, the way this row's own tables were made** -- 670 rows, at
+`c57903c2c`:
+
+| item | level | what the note leads with |
+| --- | --- | --- |
+| `#1332` | `advise` | RETIRED IN PLACE -- DO NOT BUILD IT, quoting the duplicate-of-`#1086` line |
+| `#1309` | `advise` | RETIRED IN PLACE, quoting the duplicate-of-`#1152` line |
+| `#1311` | `advise` | RETIRED IN PLACE, quoting its `WITHDRAWN` heading |
+| `#1086` | `ok` | closes by `code` -- the control that must stay buildable |
+| `#1334` | `ok` | closes by `code` -- this row, and see below |
+
+`retirement_marker` fires on exactly those three rows across the whole ledger and on nothing else.
+**The banner split is still load-bearing, and this row is the live proof:** the needle *does* fire
+on #1334's banner block and does *not* fire on its body, so the defect described above is present
+in today's ledger and suppressed by the fix rather than by luck. `tests/test_coord_dispatch_gate.py`
+and `tests/test_backlog_status_check.py` pass, 87 tests, and `dispatch_gate.py --self-test` reports
+16 judge cases and 5 tree-merge cases.
+
+**The fourth banner key stays unbuilt and unfiled.** It is an alternative to the body read, not a
+fourth required part, so its absence does not hold this row open. Naming the subject rather than a
+number, deliberately: a row that declares its retirement in a field instead of in prose would let
+both needles stop being wording-sensitive.
 
 ## 1335. Lane virtualenvs install five fewer extras than CI, so a lane can pass locally and fail on the runner
 
