@@ -10091,8 +10091,14 @@ Ruling 1's disposition to all six and inherit its PREMISE on five. **RETRACTED S
 amendment first said the 2026-08-17 ruling was "not written anywhere in the engine tree ... a document
 nobody can read", and asked for its text to be copied into `docs/ASVS-ASSESSMENT-METHOD.md`. **The
 measurement was true and the conclusion was false.** The ruling is
-`docs/security/OWNER-RULINGS-2026-08-17.md` in the VAULT, on `origin/main`, added by vault commit
-`9b311054`; the federated-login ruling is **Ruling 1**, at lines 6-38. It is not in the engine tree
+`docs/security/OWNER-RULINGS-2026-08-17.md` in the **`MessageFoundry-vault` repository**, on **that
+repository's** `origin/main`, added by vault commit `9b311054`; the federated-login ruling is
+**Ruling 1**, at lines 6-38. **Name the repository whenever you cite this path.** The identical
+string `docs/security/` also exists as a gitignored directory in the ENGINE repo, where it is
+genuinely unreachable -- `git ls-files docs/security` returns zero there against a positive control
+of 464 for `git ls-files docs/` -- so "the ruling is reachable" and "docs/security is unreachable
+from an engine checkout" are both true and about different repositories. Dropping the repository
+name is how one gets read as refuting the other. It is not in the engine tree
 BY DESIGN, because rulings live in the vault, so nothing needs copying anywhere and the six items
 defer to a document that reads fine. **The instrument could not have returned anything else:**
 `docs/security/` is gitignored from every engine checkout, which `CLAUDE.md` section 12 names as a
@@ -10448,8 +10454,13 @@ value loads as the control. It is not cosmetic. `oidc_client_id` is the expected
 audience check would compare an incoming claim against whitespace; and for the four pinned URLs the
 same test defers the failure to the https check, which then reports a SCHEME problem for what is really
 a missing value. The fix is one character class: strip before testing, exactly as the sibling guard
-does. **NOT BUILT HERE:** `messagefoundry/config/settings.py` was held by another live session's
-uncommitted work and the collision gate refused the edit; the finding is recorded so it is not lost.
+does. **BUILT 2026-09-06** once the session holding `config/settings.py` committed and confirmed its
+own diff touches no OIDC validator. **The test's assertion matches the MISSING-VALUE message rather
+than the field name, and that is the whole discriminator** -- matching the field name alone was green
+for eight of its ten cases against the unfixed code, because the downstream https check refuses a
+whitespace URL too and names the same field. That was caught by sabotage before landing, not by
+review; with the pre-fix test restored all ten cases go red, and a padded-but-real value still loads
+with its padding intact, so the change cannot be confused with silently normalising operator values.
 **The cell does not move on it** -- a blank value also rides the authorization request and fails closed
 at the identity provider, so this is config hygiene on a fence the record calls load-bearing.
 ## 1162. research an honest pass for ASVS 11.1.1 -- a key-management policy covering all six keys, and an oversharing bound that does not fight escrow
