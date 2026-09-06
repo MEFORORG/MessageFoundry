@@ -18307,6 +18307,21 @@ the gate stops keying on the committing worktree.
 > Research: none
 > Closing-act: code
 
+**Amendment 2026-09-06 -- the TOOL half landed and the record is untouched, so this row stays OPEN.**
+`scripts/asvs/anchor_provenance.py --annotate` emits the per-anchor witness as data: a payload the
+scorecard writer takes, naming for each anchor what the control ref found, both line numbers, the commit
+the cell stamps, and the resolved sha of the control ref itself. Three properties, each with a
+mutation-killed arm. The emission REFUSES without `--control-ref`, because a mass re-anchor raises the
+apparent rate and a working-tree derivation records an inflated population -- measured against the live
+record, the control ref removes 223 anchors of inflation from a population of 935. The payload BODY comes
+from the live record and only the annotation from the control ref, so applying it adds one key per anchor
+and reverts nothing; built the other way it would carry the control ref's older lines back and undo the
+repairs it documents. An anchor already carrying a witness is counted and SKIPPED, since overwriting it is
+this row's own defect arriving through its fix. The writer needed no change, driven end to end rather than
+assumed. **Still open:** applying the payload belongs to the seat that holds the record, and the residual
+question this row calls its real subject -- how an unverified field passed review, repeatedly -- is a
+process answer that no code change reaches.
+
 **Cluster:** security record / assessment method. **Priority:** P2. **Verdict:** build -- *the repair half
 is mechanical; the residual question below may be research.* **Severity:** no product or deployment axis
 (sec. 0). **The cost is that the record asserts a verification that never happened.**
