@@ -1212,7 +1212,17 @@ class MLLPDestination(DestinationConnector):
         # Reachability only: open + close a connection (no frame, no ACK) so a test never delivers.
         # Always a fresh probe socket — never the cached persistent connection (a probe must not
         # disturb, consume from, or be confused with live delivery traffic).
-        await probe_tcp_reachable(self.host, self.port, self.connect_timeout, "MLLP")
+        #
+        # #1178: the probe carries the SAME prebuilt context the delivery dial uses, so a tls=true
+        # hop is tested over TLS instead of over a plaintext socket the operator never configured.
+        # Without it the engine fell back to an unencrypted protocol on a hop its own configuration
+        # says is encrypted (ASVS 12.3.1), and — the half an operator feels — a broken certificate,
+        # CA or hostname passed a green connection test and then failed every delivery. The DICOM
+        # SCU already works this way, associating its C-ECHO through the same tls_args as a C-STORE;
+        # TCP and X12 pass nothing because neither can speak TLS in any configuration.
+        await probe_tcp_reachable(
+            self.host, self.port, self.connect_timeout, "MLLP", ssl_context=self._ssl
+        )
 
     async def _read_ack(self, reader: asyncio.StreamReader) -> bytes:
         decoder = MLLPDecoder(max_frame_bytes=self.max_frame_bytes)
