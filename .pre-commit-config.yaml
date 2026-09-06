@@ -239,6 +239,20 @@ repos:
         pass_filenames: false
         always_run: true
 
+      # A renamed repository's OLD path still RESOLVES -- GitHub keeps a permanent redirect, and
+      # their documentation names exactly one way to drop it: create a new repo claiming the old
+      # name, which would put the engine's name back in the account listing. So the redirect stays,
+      # and a stale reference does not fail. It quietly answers, correctly, about the vault, under a
+      # name that is gone. always_run with pass_filenames FALSE for the reason the screen above
+      # states: this walks the tracked TREE, and a changed-file list would narrow what it looked at
+      # while still reporting clean.
+      - id: stale-repo-slug
+        name: stale repo slug (pre-rename vault path)
+        entry: python scripts/quality/stale_repo_slug_check.py
+        language: system
+        pass_filenames: false
+        always_run: true
+
   # Secret scanning — blocks a commit that would introduce a credential/token/key.
   # (rev is verified by `pre-commit autoupdate` on first install; a wrong tag fails loudly there,
   # never silently in CI. Run it TARGETED -- `pre-commit autoupdate --repo
