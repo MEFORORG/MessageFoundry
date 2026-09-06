@@ -11245,7 +11245,27 @@ asserting an owner ratification that no rulings document carries is a compensati
 on a false premise, which the standards forbid by name. The honest wording is that the retention is a
 recorded IN-CODE decision whose interop premise is unmeasured, and that retiring the six is an owner
 call **because** nobody has run the census -- which tells the next reader both why not to act alone
-and what would settle it. Removal is
+and what would settle it. **Retracted in place by the packet B session in `af4a8a646` (PR 946)
+before it landed**, taking that framing; the comment now retracts rather than deletes, because a
+comment that silently loses a claim teaches nothing.
+
+**WHY THE PHRASE KEPT SPREADING, which is the part worth carrying forward: TWO GENUINE OWNER
+RULINGS SIT WITHIN ABOUT SIXTY LINES OF THE RETENTION COMMENT, AND NEITHER IS ABOUT IT.**
+`_APPROVED_TLS_SUITES` is a strict positive allow-list by owner ruling of 2026-08-22, which governs
+what an operator may CONFIGURE; the posture precedence gradient in the same module is owner-ratified
+under ADR 0153. Both are real. The defect was attaching their authority to a third subject in the
+same file that has none -- which is harder to catch than an invention, because every neighbouring
+citation checks out. A reader spot-checking "is there an owner ruling in this module" gets yes.
+
+**BOTH NEIGHBOURING CITATIONS WERE VERIFIED, and the verification is itself a warning.** ADR 0153
+resolves to a real file. The 2026-08-22 ruling on the allow-list is recorded in **BACKLOG #1317**
+(*"What to build, per the 2026-08-22 owner ruling"*) -- **not** in any rulings document, and not in
+the vault. Searching for it by DATE across both repositories, and by subject across the vault's
+`docs/security/` rulings files, returned nothing: the vault's only 2026-08-22 ruling artefact is a
+ruling-REQUEST packet listing fourteen cells awaiting a decision, which is the opposite of a record
+of one. **So an owner ruling in this project may be recorded in the live ledger under an item
+number and nowhere else, and an instrument that looks only in rulings documents will report a
+sound citation as unsourced.** Check the ledger before calling any ruling citation unsupported. Removal is
 one file: pass the approved list to `set_ciphers` inside `harden_cipher_suites` before the four
 assertions, and invert the comment that currently argues the allowlist must never touch an inherited
 context. The peers that would lose interop are TLS-1.2-only ones offering ONLY ECDHE/DHE CBC-SHA2 with
