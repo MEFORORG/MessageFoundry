@@ -241,7 +241,7 @@ def test_each_family_survives_when_its_own_patterns_are_disabled(
 #: The first two lines are the ONLY ones that discriminate on the ``_AUTH_SCHEME`` word set, and that
 #: was measured rather than assumed. "basic" and "digest" are ordinary configuration vocabulary in this
 #: engine -- ``transports/http_auth.py`` raises "oauth2_auth_style must be 'basic' or 'post'" and
-#: ``transports/soap.py`` raises "ws_password_type must be 'text' or 'digest'" -- but BOTH of those real
+#: ``transports/soap.py`` raises "ws_password_type must be 'text'" -- but BOTH of those real
 #: strings quote the word, so ``\s+`` cannot match and they survive a wide pattern and a narrow one
 #: alike. Using them as the guard would have looked like coverage and tested nothing. Run against the
 #: widened ``(bearer|basic|digest)`` alternative, the first two lines below are eaten and the real
@@ -250,7 +250,7 @@ ORDINARY_DIAGNOSTICS = (
     "falling back to basic auth for this hop",
     "server offered digest challenge, retrying",
     "oauth2_auth_style must be 'basic' or 'post', got 'bogus'",
-    "SOAP ws_password_type must be 'text' or 'digest' (ADR 0015)",
+    "SOAP ws_password_type must be 'text' (ADR 0015, BACKLOG #1171)",
     "INFO engine started on port 8765",
     "connection IB_DEMO_ADT bound, password rotation scheduled",
 )

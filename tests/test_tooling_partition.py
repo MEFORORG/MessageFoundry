@@ -137,18 +137,105 @@ _STAYS_WITHOUT_IMPORTING = frozenset(
 )
 
 
-def _manifest_names() -> list[str]:
+def _manifest_lines(text: str) -> list[str]:
     return [
-        line.strip().rsplit("/", 1)[-1]
-        for line in _MANIFEST.read_text(encoding="utf-8").splitlines()
+        line.strip()
+        for line in text.splitlines()
         if line.strip() and not line.lstrip().startswith("#")
     ]
 
 
-def test_every_manifest_entry_exists() -> None:
-    """A stale entry silently un-marks a test back onto the engine legs."""
-    missing = sorted(n for n in _manifest_names() if not (_TESTS / n).is_file())
-    assert not missing, f"tooling_manifest.txt names files that do not exist: {missing}"
+def _names_from(text: str) -> list[str]:
+    """THIS FILE's manifest parser, over arbitrary text rather than over the file.
+
+    Split out so ``test_the_gate_offers_a_line_the_manifest_parser_accepts`` can feed the example
+    line the failure message hands out straight back through it. A message that recommends a shape
+    nothing checks is the compensating-control-on-a-false-premise defect (CLAUDE.md 11).
+
+    IT IS NOT THE ONLY PARSER, AND SAYING SO WOULD BE THE SAME DEFECT ONE LEVEL UP. The copy that
+    actually applies the ``tooling`` marker is ``_tooling_basenames`` in tests/conftest.py, and a
+    third lives in ``_manifest_paths`` in tests/test_ci_tooling_gate.py. All three implement the
+    same rule -- strip, drop blanks and ``#`` comments, rsplit on ``/`` -- and NOTHING pins them
+    against each other. Extracting one shared ``tests/_tooling_manifest.py`` is the real fix and it
+    is not this change's job; until then, what the arm below proves is that the recommended line
+    survives THIS parser.
+    """
+    return [line.rsplit("/", 1)[-1] for line in _manifest_lines(text)]
+
+
+def _manifest_entries() -> list[str]:
+    """The manifest's full lines -- ``tests/<name>.py``, which is what ci.yml's path gate matches."""
+    return _manifest_lines(_MANIFEST.read_text(encoding="utf-8"))
+
+
+def _manifest_names() -> list[str]:
+    return [line.rsplit("/", 1)[-1] for line in _manifest_entries()]
+
+
+def _unclassified_remedy(names: list[str]) -> str:
+    """The text ``test_every_non_engine_test_is_classified`` fails with.
+
+    WRITTEN TO BE ACTIONABLE FROM A CI LOG ALONE, because its reader usually cannot ask. Measured
+    2026-09-03: this assertion reds all three required ``test`` legs, and the two Builders who
+    tripped it that night had each exited before any leg reported. The message is therefore the
+    whole remedy, and its predecessor named the offending file and stopped -- so both of them left
+    a red branch nobody was on.
+
+    Line one carries the two registry paths and the file list, because that is the line a truncated
+    summary keeps. NOTHING HERE IS A HAND-WRITTEN PATH: the example is built from a real offender,
+    and both registries are rendered from ``_MANIFEST`` and ``__file__``, so a rename moves the
+    message with the file instead of leaving it pointing at a path that no longer exists.
+    """
+    example = names[0] if names else "test_example.py"
+    manifest = _MANIFEST.relative_to(_ROOT).as_posix()
+    here = Path(__file__).resolve().relative_to(_ROOT).as_posix()
+    return (
+        f"UNCLASSIFIED TEST FILE(S) -- add each to {manifest} or to "
+        f"_STAYS_WITHOUT_IMPORTING in {here}: {names}\n"
+        "They import no engine module, so nothing decides which CI legs run them. Choose one, per "
+        "file, in the SAME pull request:\n"
+        f"  (a) HARNESS subject (scripts/**, .github/**, the ledger) -> append `tests/{example}` "
+        f"to {manifest}, keeping the `tests/` prefix (ci.yml matches whole changed paths against "
+        "these lines).\n"
+        f'  (b) ENGINE subject it READS off disk without importing -> add `"{example}"` to '
+        f"_STAYS_WITHOUT_IMPORTING in {here}, with a comment naming the messagefoundry/** file it "
+        "reads.\n"
+        "  A test that IMPORTS the engine needs neither entry -- which is why most files here sit "
+        "in no list at all.\n"
+        "WHEN AMBIGUOUS CHOOSE (b). (a) is the answer that loses coverage silently: a wrongly "
+        "listed engine test leaves the engine legs, and the tooling job's scripts/** path gate is "
+        "not tripped by an engine diff, so it runs on NO leg for the change that would break it."
+    )
+
+
+def test_every_manifest_entry_resolves_as_written() -> None:
+    """A stale entry silently un-marks a test back onto the engine legs.
+
+    RESOLVED AS WRITTEN, not by basename, and that is the strengthening. The predecessor read this
+    file through ``_manifest_names``, which rsplits the directory away -- so it proved a file of
+    that NAME exists somewhere in tests/ and was blind to the path actually written down. That
+    blindness matters because ci.yml's ``changes`` job summons the tooling job by matching WHOLE
+    changed paths against these lines (``grep -qxFf`` over ``git diff --name-only``). A bare
+    ``test_x.py``, a ``./tests/`` prefix or a backslash separator all still MARK the test -- this
+    file's parser and tests/conftest.py both rsplit on ``/`` -- so the test leaves the engine legs
+    by ``-m 'not tooling'``, and then a later pull request editing only that test matches no arm of
+    the gate and summons no tooling job. Deselected everywhere, green.
+
+    Two clauses, because one does not cover it: the entry must name a real file, AND it must be
+    spelled the way git spells it. ``./tests/test_x.py`` satisfies the first and fails the second.
+    """
+    bad: list[str] = []
+    for line in _manifest_entries():
+        target = _ROOT / line
+        if not target.is_file():
+            bad.append(f"{line} (names no file)")
+        elif line != target.resolve().relative_to(_ROOT).as_posix():
+            bad.append(f"{line} (not the repo-relative path git reports for it)")
+    assert not bad, (
+        "tooling_manifest.txt entries must be repo-relative paths naming a real file, exactly as "
+        "`git diff --name-only` spells them, or ci.yml's path gate cannot match the changed file "
+        f"and the tier stops being summoned by an edit to it: {bad}"
+    )
 
 
 def test_manifest_has_no_duplicates() -> None:
@@ -170,23 +257,118 @@ def test_no_listed_test_imports_the_engine() -> None:
     )
 
 
+def _assert_every_test_is_classified(
+    tests_dir: Path, listed: set[str], stays: frozenset[str]
+) -> None:
+    """The gate itself, over a NAMED directory rather than the real one.
+
+    Parameterised for one reason: so ``test_the_gate_raises_the_remedy_and_not_a_bare_list`` can
+    drive this exact assertion into failure against a tmp_path and read the message it actually
+    raises. Asserting on ``_unclassified_remedy``'s return value instead was tried and MEASURED
+    VACUOUS -- reverting the call site below to the predecessor string left all the content arms
+    green, because they never touched the call site. The instrument was answering "does the helper
+    return good text" while the question is "does the gate FAIL with good text" (CLAUDE.md 11,
+    SDS-3.8).
+    """
+    unclassified = sorted(
+        p.name
+        for p in tests_dir.glob("test_*.py")
+        if p.name not in listed
+        and p.name not in stays
+        and not _ENGINE_IMPORT.search(p.read_text(encoding="utf-8", errors="replace"))
+    )
+    assert not unclassified, _unclassified_remedy(unclassified)
+
+
 def test_every_non_engine_test_is_classified() -> None:
     """The drift guard: a NEW harness test must land in the manifest or be named as staying.
 
     Without this, a new worktree-gate test quietly joins the engine legs and the tier grows back.
     """
-    listed = set(_manifest_names())
-    unclassified = sorted(
-        p.name
-        for p in _TESTS.glob("test_*.py")
-        if p.name not in listed
-        and p.name not in _STAYS_WITHOUT_IMPORTING
-        and not _ENGINE_IMPORT.search(p.read_text(encoding="utf-8", errors="replace"))
+    _assert_every_test_is_classified(_TESTS, set(_manifest_names()), _STAYS_WITHOUT_IMPORTING)
+
+
+#: The offender the two arms below fabricate. One spelling, so renaming it cannot leave an
+#: assertion comparing against a stale literal.
+_SENTINEL = "test_made_up_harness_thing.py"
+
+
+def _raised_remedy(tmp_path: Path) -> str:
+    """Drive the real gate into failure over one unclassified file and hand back its message.
+
+    Doubles as the mechanism's positive control: a gate that cannot be made to fire here would
+    satisfy every arm below while reporting nothing on the real tree.
+
+    The empty lists are deliberate rather than incidental -- they keep this arm hermetic against
+    someone later adding ``_SENTINEL`` to the real manifest or stay list.
+    """
+    (tmp_path / _SENTINEL).write_text("def test_x() -> None:\n    assert True\n", encoding="utf-8")
+    with pytest.raises(AssertionError) as caught:
+        _assert_every_test_is_classified(tmp_path, set(), frozenset())
+    return str(caught.value)
+
+
+def test_the_gate_offers_a_line_the_manifest_parser_accepts(tmp_path: Path) -> None:
+    """The message hands out a manifest line; this file's parser must read it back.
+
+    Taken off the RAISED message, so it cannot drift from the assertion that issues it, and fed
+    through ``_names_from``, so it cannot drift from the reader that consumes it.
+    """
+    rendered = _raised_remedy(tmp_path)
+    recommended = f"tests/{_SENTINEL}"
+    assert f"`{recommended}`" in rendered, rendered
+    assert _names_from(recommended) == [_SENTINEL], (
+        "the manifest parser does not read back the line the failure message recommends"
     )
-    assert not unclassified, (
-        "these tests import no engine module, so they are unclassified: add them to "
-        "tests/tooling_manifest.txt, or to _STAYS_WITHOUT_IMPORTING here if they read engine "
-        f"source: {unclassified}"
+
+
+def test_the_gate_raises_the_remedy_and_not_a_bare_list(tmp_path: Path) -> None:
+    """A reader who only ever sees this string must be able to act on it.
+
+    Both Builders who tripped this gate on 2026-09-03 had exited before any leg reported, so there
+    was nobody to ask what the remedy was.
+
+    THE PATHS ARE RESOLVED, NOT MATCHED. A literal needle for ``tests/tooling_manifest.txt`` here
+    would be a literal checked against a literal: rename or move either registry and the message and
+    the test go stale together, green. So every ``tests/...`` path the message offers is pulled out
+    of the rendered string and required to name a real file, and the stay list is required to be
+    defined in the file the message sends the reader to.
+
+    Read off the RAISED message, so reverting the call site to the predecessor (which named the
+    offending file and stopped) turns this red. Reading ``_unclassified_remedy`` directly did NOT --
+    measured, and it is the whole reason this arm is shaped this way.
+    """
+    rendered = _raised_remedy(tmp_path)
+
+    offered = set(re.findall(r"tests/[A-Za-z0-9_./-]+\.(?:py|txt)", rendered))
+    named_files = {p for p in offered if not p.endswith(f"/{_SENTINEL}")}
+    assert len(named_files) >= 2, f"the message offers fewer than two registry paths: {offered}"
+    unresolvable = sorted(p for p in named_files if not (_ROOT / p).is_file())
+    assert not unresolvable, (
+        f"the failure message sends its reader to paths that do not exist: {unresolvable}"
+    )
+    assert _MANIFEST.relative_to(_ROOT).as_posix() in named_files, (
+        f"the message never names the manifest itself: {sorted(named_files)}"
+    )
+
+    stay_list_home = next(p for p in named_files if p.endswith(".py"))
+    assert "_STAYS_WITHOUT_IMPORTING" in (_ROOT / stay_list_home).read_text(encoding="utf-8"), (
+        f"the message sends the reader to {stay_list_home} for _STAYS_WITHOUT_IMPORTING, and it is "
+        "not defined there"
+    )
+
+    # The prose half. These carry no path to resolve, so they are needles -- and they are the three
+    # claims that make the message a remedy rather than a report.
+    for needle, why in (
+        ("HARNESS subject", "the criterion is the test's SUBJECT, not its location"),
+        ("ENGINE subject", "the other half of that criterion"),
+        ("WHEN AMBIGUOUS", "the tie-break, without which a hurried reader picks (a)"),
+    ):
+        assert needle in rendered, f"the failure message no longer states {why}: {needle!r}"
+
+    assert rendered.splitlines()[0].endswith(f"['{_SENTINEL}']"), (
+        "line one must still end with the offending files -- it is the line a truncated CI summary "
+        "keeps, and it must name both the registries and the files at once"
     )
 
 

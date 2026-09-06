@@ -152,6 +152,12 @@ log = logging.getLogger(__name__)
 _FIFO_HEADS_LANE_CHUNK = 500
 # ADR 0066 §3.1: release_claimed id-chunk bound (ids per UPDATE statement).
 _RELEASE_CHUNK = 500
+# BACKLOG #1169: rows per batch for the `attachment_chunk` at-rest migration. Every OTHER cipher pass
+# batches 500 because its rows are kilobyte-shaped; one attachment_chunk row is a whole
+# DETACH_CHUNK_BYTES (1 MiB) slice, ~1.33 MiB once base64+GCM sealed. 16 keeps a batch near 21 MiB,
+# which is the memory budget the 500-row passes actually spend; 500 here would be ~650 MiB held in a
+# single transaction while the store is still opening.
+_ATTACHMENT_CHUNK_BATCH = 16
 # ADR 0073: ownership-scoped reset lane-chunk bound (lane names per UPDATE's IN list) — well under
 # pyodbc's ~2,100-parameter bound with the fixed parameters; chunks run inside the reset's single
 # transaction, so the all-or-nothing recovery pass is unchanged.
@@ -2805,9 +2811,53 @@ class SqlServerStore:
                     raise
             await self._charge_bound_batch()
             total += len(rows)
+        # `attachment_chunk` detached-document slices (#149, ADR 0105, composite PK
+        # (attachment_id, seq)) — a separate pass (can't ride the id-keyed loop). Its ROTATION pass
+        # already existed here; this ON-OPEN pass did not, so a no-key -> key transition left legacy
+        # plaintext chunks unsealed on SQL Server and Postgres while SQLite sealed them
+        # (BACKLOG #1169). `ciphertext` is NOT NULL, so the `<> ''` guard alone keeps a blank from
+        # becoming ciphertext-of-empty. A SMALL batch, unlike every sibling above: each row is one
+        # DETACH_CHUNK_BYTES (1 MiB) slice, so the usual 500 would hold ~650 MiB resident in one
+        # transaction while the store is still opening. It is still a whole SLICE at a time, not a
+        # whole document — a large attachment spans many rows and is never reassembled here.
+        while True:
+            rows = await self._fetchall(
+                f"SELECT TOP ({_ATTACHMENT_CHUNK_BATCH}) attachment_id, seq, ciphertext"
+                " FROM attachment_chunk WHERE ciphertext NOT LIKE ? AND ciphertext <> ''",
+                (like,),
+            )
+            if not rows:
+                break
+            async with self._acquire() as conn, self._cursor(conn) as cur:
+                try:
+                    for r in rows:
+                        await cur.execute(
+                            "UPDATE attachment_chunk SET ciphertext=?"
+                            " WHERE attachment_id=? AND seq=?",
+                            (
+                                self._cipher.encrypt(
+                                    r["ciphertext"],
+                                    aad=cell_aad(
+                                        "attachment_chunk",
+                                        "ciphertext",
+                                        r["attachment_id"],
+                                        r["seq"],
+                                    ),
+                                ),
+                                r["attachment_id"],
+                                r["seq"],
+                            ),
+                        )
+                    await self._commit(conn)
+                except Exception:
+                    await conn.rollback()
+                    raise
+            await self._charge_bound_batch()
+            total += len(rows)
         if total:
             log.info(
-                "encrypted %d existing message/outbox/response/reference/state row(s) at rest",
+                "encrypted %d existing message/outbox/response/reference/state/attachment row(s) "
+                "at rest",
                 total,
             )
 
@@ -6314,11 +6364,21 @@ class SqlServerStore:
         now: float | None = None,
         connection_cutoffs: Mapping[str, float] | None = None,
     ) -> int:
-        """Blank the payload of dead outbound rows updated before ``older_than`` (retention). Keeps the
+        """Blank the payload of dead rows updated before ``older_than`` (retention). Keeps the
         dead row + 'dead' status (counts/disposition) but frees the body; idempotent (payload <> '').
 
+        **Every stage, not only outbound** (#1188, ASVS 14.2.7) — mirrors the SQLite backend. A dead
+        ``ingress``/``routed`` row holds the full raw body and is neither pending nor inflight, so its
+        message is body-purge-eligible: the outbound-only scope blanked ``messages.raw`` while that raw
+        survived in the queue row unreachable by any sweep. :meth:`replay` re-queues such a row from its
+        own payload, so it is replayable-until-purged exactly as a dead outbound row is. The stage
+        predicate is dropped rather than widened to a list, so a later stage is covered by construction.
+
         ``connection_cutoffs`` (#34, ADR 0027) optionally overrides the cutoff per ``destination_name``
-        (``float('-inf')`` = keep forever); default empty ⇒ a single global cutoff, byte-identical."""
+        (``float('-inf')`` = keep forever); default empty ⇒ a single global cutoff, byte-identical. An
+        ingress/routed/response row has a NULL ``destination_name``, so ``CASE NULL WHEN ...`` matches no
+        arm and it takes the ``ELSE`` — always the global dead-letter window (``dead_letter_days`` is
+        declared on an OUTBOUND connection, so no inbound-keyed override exists to honour)."""
         cutoff_sql, cutoff_params = _qmark_cutoff_case(
             "destination_name", older_than, connection_cutoffs
         )
@@ -6326,8 +6386,8 @@ class SqlServerStore:
             try:
                 await cur.execute(
                     "UPDATE queue SET payload='', last_error=NULL"
-                    f" WHERE stage=? AND status=? AND payload <> '' AND updated_at < {cutoff_sql}",
-                    (Stage.OUTBOUND.value, OutboxStatus.DEAD.value, *cutoff_params),
+                    f" WHERE status=? AND payload <> '' AND updated_at < {cutoff_sql}",
+                    (OutboxStatus.DEAD.value, *cutoff_params),
                 )
                 purged = cur.rowcount
                 # #149 Phase 4 (mirrors SQLite Phase 3a): a dead row just lost its payload + body_ref, so
@@ -6339,10 +6399,9 @@ class SqlServerStore:
                 await self._release_message_attachments(
                     cur,
                     "message_id IN (SELECT DISTINCT q0.message_id FROM queue q0"
-                    f" WHERE q0.stage=? AND q0.status=? AND q0.updated_at < {cutoff_sql}"
+                    f" WHERE q0.status=? AND q0.updated_at < {cutoff_sql}"
                     f" AND NOT {self._attachment_still_referenced_sql('q0.message_id')})",
                     (
-                        Stage.OUTBOUND.value,
                         OutboxStatus.DEAD.value,
                         *cutoff_params,
                         OutboxStatus.PENDING.value,

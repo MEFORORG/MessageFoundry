@@ -9256,12 +9256,30 @@ class MessageStore:
         now: float | None = None,
         connection_cutoffs: Mapping[str, float] | None = None,
     ) -> int:
-        """Null the bodies of dead-lettered **outbound** rows last updated before ``older_than`` —
-        their own retention window, separate from :meth:`purge_message_bodies` because a dead row stays
+        """Null the bodies of dead-lettered rows last updated before ``older_than`` — their own
+        retention window, separate from :meth:`purge_message_bodies` because a dead row stays
         replayable (re-queueing its stored ``payload``) until purged. Keeps the row + ``dead`` status
         (counts/disposition intact) and blanks ``payload`` + ``last_error``; after this the row can no
         longer be meaningfully replayed (its body is gone — the intended retention trade-off).
         Idempotent (guards on a non-blank payload); returns the number of dead rows purged.
+
+        **Every stage, not only outbound** (#1188, ASVS 14.2.7). A router raise dead-letters the
+        ``ingress`` row and a handler raise the ``routed`` row
+        (:meth:`wiring_runner._apply_router_internal_error` / ``_apply_transform_internal_error``), and
+        both carry the full raw body in ``payload``. Such a row is ``dead``, so it is neither
+        ``pending`` nor ``inflight`` — which makes its message ELIGIBLE for
+        :meth:`purge_message_bodies`. Scoping this purge to ``stage='outbound'`` therefore blanked
+        ``messages.raw`` (the message reads as purged) while a full raw PHI body survived in the queue
+        row with no sweep able to reach it, indefinitely.
+
+        Riding this window is the SYMMETRIC answer rather than a widening of convenience: :meth:`replay`
+        recovers "a dead-lettered ingress/routed row" by re-queueing it in place from its OWN payload,
+        so such a row is replayable-until-purged in exactly the sense that justified giving dead
+        outbound rows a later window than the body. The stage predicate is DROPPED rather than widened
+        to a three-stage list, so a stage added later is covered by construction instead of silently
+        re-opening this gap. The dead-letter VIEW stays outbound-only by design (:meth:`list_dead`,
+        :meth:`replay_dead`): what an operator can enumerate is a separate question from what retention
+        must delete, and an unenumerable body is the stronger reason to bound it.
 
         When blanking a ``dead`` row removes a message's **last** replayable queue row, this also releases
         that message's streaming attachment (#149, ADR 0105 Phase 3a) — the deferred half of the
@@ -9271,7 +9289,13 @@ class MessageStore:
         ``connection_cutoffs`` (#34, ADR 0027) is an optional ``{destination_name -> cutoff}`` map of
         per-connection overrides: a dead row is purged at its outbound's own cutoff (``float('-inf')`` =
         keep forever) instead of the global ``older_than``; an outbound absent from the map falls back to
-        ``older_than``. Default empty ⇒ a single global cutoff, byte-identical to the prior behaviour."""
+        ``older_than``. Default empty ⇒ a single global cutoff, byte-identical to the prior behaviour.
+        An ingress/routed/response row keys by ``channel_id`` and carries a NULL ``destination_name``, so
+        ``CASE NULL WHEN ...`` never matches a ``WHEN`` arm and it takes the ``ELSE`` — i.e. it always
+        rides the GLOBAL dead-letter window. That is deliberate: ``dead_letter_days`` is declared on an
+        OUTBOUND connection (see ``OutboundConnection``), so honouring an inbound-keyed override here
+        would invent a per-connection semantic no configuration surface declares. Giving these stages
+        their own inbound-keyed override is a separate, unallocated follow-up."""
         now = time.time() if now is None else now
         cutoff_sql, cutoff_params = _qmark_cutoff_case(
             "destination_name", older_than, connection_cutoffs
@@ -9281,15 +9305,18 @@ class MessageStore:
                 await self._db.execute("BEGIN")
                 # store-once: release shared bodies these dead rows reference (refcount-/GC/null body_ref)
                 # before blanking, so a shared body outlives its last dead referrer no longer than this.
+                # This one STAYS scoped to outbound, and that is not an oversight: `body_ref` is written
+                # only by _insert_outbound_deliveries, so an ingress/routed/response row always carries an
+                # inline payload and a NULL body_ref. A wider scope here would match nothing extra.
                 await self._release_outbound_body_refs(
                     f"stage=? AND status=? AND body_ref IS NOT NULL AND updated_at < {cutoff_sql}",
                     (Stage.OUTBOUND.value, OutboxStatus.DEAD.value, *cutoff_params),
                 )
                 cur = await self._db.execute(
                     "UPDATE queue SET payload='', last_error=NULL "
-                    "WHERE stage=? AND status=? AND (payload <> '' OR last_error IS NOT NULL) "
+                    "WHERE status=? AND (payload <> '' OR last_error IS NOT NULL) "
                     f"AND updated_at < {cutoff_sql}",
-                    (Stage.OUTBOUND.value, OutboxStatus.DEAD.value, *cutoff_params),
+                    (OutboxStatus.DEAD.value, *cutoff_params),
                 )
                 # #149 Phase 3a: a dead row just lost its payload + body_ref, so it can no longer be
                 # replayed. If that was the message's LAST replayable row (no pending/inflight and no other
@@ -9301,10 +9328,9 @@ class MessageStore:
                 # dead rows already read as non-replayable (payload='' AND body_ref NULL).
                 await self._release_message_attachments(
                     "message_id IN (SELECT DISTINCT q0.message_id FROM queue q0 "
-                    f"WHERE q0.stage=? AND q0.status=? AND q0.updated_at < {cutoff_sql} "
+                    f"WHERE q0.status=? AND q0.updated_at < {cutoff_sql} "
                     f"AND NOT {self._attachment_still_referenced_sql('q0.message_id')})",
                     (
-                        Stage.OUTBOUND.value,
                         OutboxStatus.DEAD.value,
                         *cutoff_params,
                         OutboxStatus.PENDING.value,

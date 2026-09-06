@@ -1,6 +1,6 @@
 # 0087 — Router/Handler subprocess isolation
 
-- **Status:** Accepted; **Amended (2026-08-04)** — the transform-result parity rule changed shape. The child now materialises a container return with `_partition`'s **own** rule instead of reproducing its exact input container, so a tuple/set/generator **delivers** in both modes (BACKLOG #341). AC-11 and the "Result parity" bullet below are rewritten accordingly; the isolation boundary and the codec grammar are untouched.  <!-- opt-in subprocess isolation built (#197, 2026-07-10) -->
+- **Status:** Accepted; **Amended (2026-08-04)** — the transform-result parity rule changed shape. The child now materialises a container return with `_partition`'s **own** rule instead of reproducing its exact input container, so a tuple/set/generator **delivers** in both modes (BACKLOG #341). AC-11 and the "Result parity" bullet below are rewritten accordingly; the isolation boundary and the codec grammar are untouched. **Amended (2026-09-05)** — a 74 GiB extrapolation added under the per-worker footprint on 2026-09-04 is **retracted in place**; the measured per-child figures stand, and the surviving constraint is restated as the ADR 0052 AC-2 conflict it always was. No decision, boundary or acceptance criterion of this ADR changes.  <!-- opt-in subprocess isolation built (#197, 2026-07-10) -->
 - **Date:** 2026-07-10
 - **Related:** [ADR 0009](0009-run-scoped-context-providers.md) (RunContext providers) · [ADR 0010](0010-handler-callable-db-lookup.md) / [ADR 0043](0043-fhir-read-lookup.md) (`db_lookup`/`fhir_lookup`) · [ADR 0072](0072-traced-dryrun-mode.md) (tracer seam it composes with) · [ADR 0036](0036-windows-config-source-trust.md) / [ADR 0041](0041-load-path-attestation-and-change-attribution.md) (config-source trust) · CLAUDE.md §2 (reliability/purity, count-and-log) · CLAUDE.md §4 (layering) · BACKLOG #197 · ASVS 15.2.5 / `docs/security/ASVS-L3-REMEDIATION-PLAN.md` WP-L3-17
 
@@ -187,8 +187,16 @@ target, no `pickle` import left to mis-suppress:
   `str`. Without it the per-entry Python walk over `reference_view` made `mode=subprocess` ~5×
   slower per message than the pickle it replaced on a 20k-entry table. With it, that table costs
   ~1.4× the pickle round-trip (4.5 ms vs 3.3 ms of marshalling; ~6.2 ms end-to-end per dispatch,
-  ~0.19 ms with no reference view) — the standing, measured price of a non-executing wire, and well
-  inside the ~60 msg/s per-interface end-to-end bound the pipeline already has.
+  ~0.19 ms with no reference view) — the standing price of a non-executing wire.
+  **Corrected 2026-09-04 (BACKLOG #1194): this line used to call that "well inside the ~60 msg/s
+  per-interface end-to-end bound", which set a PER-DISPATCH cost against a PER-MESSAGE bound.** A
+  message that routes to one handler pays the cost twice — one router dispatch and one transform
+  dispatch — on the same serialized per-inbound worker. Re-measured against an artifact
+  ([`docs/benchmarks/results/2026-09-04-adr0087-sandbox-dispatch/`](../benchmarks/results/2026-09-04-adr0087-sandbox-dispatch/README.md),
+  instrument `scripts/bench/sandbox_dispatch.py`): the no-reference figure holds at ~0.19 ms per
+  dispatch, so the shipped posture costs **0.40 ms per message** (±3 percent over five runs); the
+  20k-table case costs **about 16 ms per message**, a sandbox-only per-lane ceiling of roughly
+  61–66 msg/s — the whole of that stated budget, not a slice of it.
 - **`CapturedResponse` relocated** to the store-free `config/response.py` (re-exported from
   `store/store.py`). It is what `response_view` carries, and `messagefoundry.store` is on the
   forbidden-import list — so `mode=subprocess` plus a LOOPBACK inbound with a correlated reply was
@@ -322,6 +330,42 @@ dispatch, an accepted cost of the opt-in isolation mode (`code_sets`, the larges
 hoisted out of the per-dispatch frame entirely). A value outside the closed grammar fails closed
 (`SandboxError`), never silently degrading — and the reverse is also true, so a Handler returning an
 exotic object now reports a *codec* rejection rather than the pickle error text it used to.
+
+**Per-worker footprint, measured 2026-09-04 (BACKLOG #1194) — this ADR did not state it.** The worker
+is one persistent child *per inbound*, and that child costs **~50 MiB unique / ~77 MiB resident**
+([the artifact](../benchmarks/results/2026-09-04-adr0087-sandbox-dispatch/README.md); a minimal
+one-router one-handler graph, so it is a floor), plus a one-time spawn and config load measured in
+**seconds** (1.8–2.7 s). Those are the measured numbers and they stand.
+
+> **RETRACTED 2026-09-05, IN PLACE RATHER THAN DELETED.** This paragraph continued: *"Against the
+> committed 1,500-connection target that is roughly **74 GiB** and 1,500 extra OS processes."*
+> **Do not quote that figure.** It was refuted by an adversarial pass run by the seat that produced
+> it, and each defect below was then re-checked against the files. **Three, each sufficient alone:**
+> **(1) Wrong multiplier.** [ADR 0052](0052-enterprise-scale-target.md) AC-2 commits to *"1,500
+> concurrent connections"* — **"inbound" does not appear**. Sandbox children exist per traffic-carrying
+> *inbound*, so 1,500 is not the count to multiply by.
+> **(2) Linearity was never measured.** Every result JSON in that artifact records
+> `worker_tree_uss_mb`, `worker_tree_rss_mb` and `worker_tree_processes` **singular** — one tree, five
+> files, no scaling series. A single-tree measurement was multiplied by 1,500 with nothing validating
+> linearity.
+> **(3) Resident set is bounded by installed RAM.** The tier is 16 GB and the bench box 31.7 GiB, so
+> 74 GiB *resident* is not a quantity any sized host can exhibit; the observable outcome is paging and
+> spawn failure. The right quantity for a demand figure is private commit charge.
+> **The correction matters beyond the number:** an extrapolation was presented as a measurement, in a
+> ratified ADR, where later readers cite it.
+
+**The constraint that survives needs no extrapolation, and it is stronger.**
+[ADR 0052](0052-enterprise-scale-target.md) AC-2 requires 1,500 concurrent connections *"without
+per-connection-worker exhaustion (fd/socket/worker-task limits)"*. At `mode=subprocess` the engine
+holds one persistent worker tree per traffic-carrying inbound — never pooled, never evicted — and each
+is a process tree (**two** processes on Windows, per `worker_tree_processes` in every result file),
+two parent daemon threads, three parent pipe fds and a job-object handle. **That is precisely the
+resource class AC-2 names**, and ADR 0052 records its 1,500-connection axis as unvalidated with no
+harness. The bill attaches to the per-inbound worker *cardinality*, not to the process boundary —
+a bounded shared worker pool would decouple it from the connection count, and would keep the
+property this ADR claims (a boundary to the **engine**) while dropping only one it already disclaims
+in `sandbox.py` (the seam draws no line between admin functions). Not a defect of the opt-in mode;
+it is the constraint any proposal to make `subprocess` a *default* has to clear first.
 
 **Out of scope / honest residuals** —
 - **DEK-in-worker:** the child never constructs the store/DEK, so there is no DEK in the worker to

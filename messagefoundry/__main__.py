@@ -2260,9 +2260,9 @@ def _serve(args: argparse.Namespace) -> int:
     # keyless-store / open-egress posture: refuse on a production PHI instance (the prod fail-closed
     # analogue), warn on a non-production PHI instance, stay quiet on a synthetic instance. Reached only
     # for an otherwise-permitted exposed bind (the TLS gate above ran first); the loopback default (now
-    # require_mfa on) never trips it. AD/Kerberos MFA is delegated to the directory, so require_mfa only
-    # gates LOCAL Administrator accounts (the bootstrap admin is one) — it is safe to leave on even on
-    # an AD-only deployment.
+    # require_mfa on) never trips it. Since BACKLOG #1144 require_mfa gates DIRECTORY accounts too — a
+    # ticket asserts no factor strength the engine can read, so the engine asks for its own factor —
+    # which makes leaving it on correct on an AD-only deployment rather than merely harmless there.
     #
     # L5b review fix (ADR 0068 §8), corrected by BACKLOG #326: the gate keys on the same EXPOSURE signal
     # as the ladder above, not the bind host alone — the runbook's RECOMMENDED topology (loopback bind
@@ -2285,8 +2285,8 @@ def _serve(args: argparse.Namespace) -> int:
                     f"instance ({env_name!r}) with [security].require_mfa off; refusing to start — the "
                     "Administrator role would authenticate with a single factor over the network. "
                     "Enable native TOTP MFA with [security].require_mfa=true (WP-14) before exposing the "
-                    "API (safe even on an AD-only deployment — it gates only local Administrator "
-                    "accounts); or set [security].allow_single_factor_admin_when_exposed=true to "
+                    "API (on an AD-only deployment it binds directory principals too, each enrolling "
+                    "an engine factor); or set [security].allow_single_factor_admin_when_exposed=true to "
                     "deliberately permit single-factor admin at exposure (audited).",
                     file=sys.stderr,
                 )
@@ -2489,8 +2489,10 @@ def _serve(args: argparse.Namespace) -> int:
     # --- #186(a) secure-by-default data retention (ASVS 14.2.4) --------------------------------------
     # RetentionSettings defaults every window to 0 (keep-forever) and RetentionRunner then purges
     # NOTHING, so a PHI instance accumulates PHI bodies indefinitely. Both PHI-body windows must be
-    # bounded: messages_days (inbound bodies) AND dead_letter_days (dead-lettered outbound bodies stay
-    # replayable, i.e. full PHI, until their own window purges them). Mirror the open-egress / MFA-at-
+    # bounded: messages_days (inbound bodies) AND dead_letter_days (a dead-lettered row at ANY stage
+    # stays replayable, i.e. full PHI, until its own window purges it — #1188 widened that purge past
+    # the outbound stage, so this window now also bounds a dead ingress/routed row, which carries the
+    # whole raw body). Mirror the open-egress / MFA-at-
     # exposure posture: a PRODUCTION PHI instance with EITHER window unbounded REFUSES to start; a
     # non-production PHI instance (staging / declared-PHI loopback) AUTO-BOUNDS each UNSET window to 30
     # days (WP243/#243, secure-by-default) and only WARNS on a window explicitly left unbounded; a
@@ -4464,6 +4466,7 @@ def _rotate_key(args: argparse.Namespace) -> int:
     from messagefoundry.store.base import open_store, resolve_active_key
     from messagefoundry.store.crypto import CipherError
     from messagefoundry.store.keyprovider import KeyProviderError
+    from messagefoundry.uploads import ResealResult, UploadStore
 
     cli: dict[str, dict[str, object]] = {}
     if args.db is not None:
@@ -4495,7 +4498,7 @@ def _rotate_key(args: argparse.Namespace) -> int:
         )
         return 2
 
-    async def run() -> int:
+    async def run() -> tuple[int, ResealResult]:
         import datetime
 
         from messagefoundry.store.store import SecretRotationMetaStore
@@ -4503,6 +4506,21 @@ def _rotate_key(args: argparse.Namespace) -> int:
         store = await open_store(settings.store)
         try:
             count = await store.reencrypt_to_active()
+            # BACKLOG #1169: the uploaded-file store is the OTHER surface this cipher covers, and it
+            # had no rotation of any kind — a rotation re-sealed every database cell and left every
+            # uploaded file under the retired key, so the operator's next step (dropping that key)
+            # silently destroyed them. Re-seal it in the SAME command, on the store's own live cipher
+            # instance so the AES-GCM invocation bound (ASVS 11.3.4) charges to the new key exactly
+            # as the store's own pass does. A second cipher over the same DEK would charge nothing.
+            uploads = (
+                await UploadStore(
+                    settings.store.uploads_dir,
+                    store.cipher(),
+                    max_bytes=settings.store.max_upload_bytes,
+                ).reseal_to_active()
+                if settings.store.uploads_dir
+                else ResealResult()
+            )
             # ASVS 13.3.4: stamp the DEK rotation so the watcher's clock resets automatically (rotation
             # auto-detected). The store is open under the NEW active key, so its key-id is the new
             # fingerprint; preserve the tracked-since floor. NON-SECRET (key-id + dates only).
@@ -4518,21 +4536,37 @@ def _rotate_key(args: argparse.Namespace) -> int:
                         tracked_since=prior.tracked_since if prior is not None else today,
                         last_rotated=today,
                     )
-            return count
+            return count, uploads
         finally:
             await store.close()
 
     try:
-        count = asyncio.run(run())
+        count, uploads = asyncio.run(run())
     except CipherError as exc:
-        # A value couldn't be decrypted by any supplied key — the prior key is missing. Nothing was
-        # corrupted (a batch is all-or-nothing); supply the key and re-run.
+        # A value couldn't be decrypted by any supplied key — the prior key is missing. Nothing is
+        # corrupted: every pass is all-or-nothing per batch AND idempotent, so re-running with the
+        # key supplied finishes the job. Note the command now spans TWO surfaces (the store, then
+        # the uploaded-file store), so a failure in the second leaves the FIRST already committed
+        # and the ASVS 13.3.4 rotation stamp unwritten. That is safe precisely because both passes
+        # skip what is already under the active key — it is a resumable rotation, not a rollback.
         print(f"error: rotation aborted — {exc}", file=sys.stderr)
         return 1
     except NotImplementedError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
-    print(f"OK: re-encrypted {count} value(s) under the active key")
+    print(
+        f"OK: re-encrypted {count} value(s) under the active key"
+        f" (+{uploads.resealed} uploaded-file value(s) re-sealed)"
+    )
+    if uploads.skipped:
+        # Say it plainly and on stderr: a skipped file is STILL under the old key, so retiring that
+        # key now destroys it. This is the one outcome where "OK" alone would mislead.
+        print(
+            f"warning: {uploads.skipped} uploaded-file value(s) could not be read and were NOT "
+            "re-sealed — they are still under the prior key. Fix the cause and re-run rotate-key "
+            "BEFORE removing MEFOR_STORE_ENCRYPTION_KEYS_RETIRED.",
+            file=sys.stderr,
+        )
     return 0
 
 
