@@ -24658,7 +24658,7 @@ neither of which is this).
 
 ## 1470. a deleted item heading silently merges two ledger rows and every gate stays green
 
-> 🔢 **Filed 2026-09-06 -- the instance is NOT repaired, because the ledger gate REFUSES THE REPAIR; that refusal is the second half of the finding.** Value **6/10** · Difficulty **3/10** · _quick win_. A commit amending one item deleted the next item's `## N.` heading line and put its own prose there. The orphaned item's banner, verdict, closing-act and body were absorbed into the item above it, `parse_items` stopped returning it, and **both ledger gates passed**. It reached `main`.
+> 🔢 **Filed 2026-09-06. AMENDED SAME DAY: the repair is NOT gate-blocked, and my first version of this row said it was.** Value **6/10** · Difficulty **3/10** · _quick win_. A commit amending one item deleted the next item's `## N.` heading line and put its own prose there. The orphaned item's banner, verdict, closing-act and body were absorbed into the item above it, `parse_items` stopped returning it, and **both ledger gates passed**. It reached `main`.
 > Verdict: build
 > Research: none
 > Closing-act: code
@@ -24710,16 +24710,26 @@ be committed by the session that found it.** `ledger_check.py` reads the restore
 as a number being INTRODUCED by a worktree that does not own it, and refuses -- correctly, on its own
 terms, because it has no way to tell a restoration from an appropriation.
 
-**AND ITS REMEDIATION PATH IS BROKEN FOR THIS CASE.** The gate names three routes: commit from the
-owning worktree, check out the owning branch, or -- *only if neither survives* -- allocate a new
-number. Measured here: the owning worktree is **GONE** while its branch still exists, so route three
-is closed by the gate's own condition and route two would land a repair to the LIVE ledger on an
-unrelated stale branch. (The gate prints both identifiers when it refuses, so whoever performs the
-repair has them; they are deliberately not written into the public ledger.)
-Allocating a new number is wrong on the merits regardless: the row's identity IS #1147, and the
-citations pointing at it do not move. So the guard below needs a companion -- the gate must be able
-to accept a heading whose exact text is being RESTORED from an ancestor commit, which is checkable
-without weakening anything: the heading existed at a known ancestor and is byte-identical to it.
+**THE CORRECTION, AND IT MATTERS BECAUSE THIS ROW WOULD OTHERWISE ASSERT A LIMITATION THE TOOL DOES
+NOT HAVE.** This item first said the gate has no restore path. It does. `ledger_check.py` grandfathers
+every number carried by a **merge parent**, in terms: *"A MERGE COMMIT ALLOCATES NOTHING. It carries
+forward numbers another branch already committed."* So the working route is to restore #1147 by
+MERGING a branch that predates the deletion and still carries the heading, with a commit subject that
+does not cite `BACKLOG #1147` -- the CLAIM gate, a different control, fires on a code-touching subject
+naming a number the committer does not hold. No gate widening, no force, and no new number.
+
+**WHY I MEASURED A REFUSAL ANYWAY, since the two results are both real.** I re-inserted the heading
+BY HAND on a branch that had already merged the deletion. A hand-added heading is an ASSERTION, and
+the gate is right to refuse it -- its own note explains that grandfathered numbers *"are not asserted,
+they are READ OFF A COMMIT"*, which is precisely what makes the allowance safe. My case and the merge
+case are different inputs, and the gate answers each correctly.
+
+**THE GENERAL GAP SURVIVES, NARROWED.** Merge-parent grandfathering only helps while SOME branch still
+carries the number. Once every branch predating the deletion is pruned, the heading exists in no
+commit anyone can merge, and the restoration has no route at all. That is the case worth a companion
+guard: accept a heading byte-identical to one at a named ancestor commit, which is checkable without
+weakening the allocation rule. Not urgent while carrying branches survive; unfixable if it is left
+until they do not.
 
 **The damage and its fix are both a single line, which is why the guard matters** -- nothing about
 the size of the change signals the size of the consequence, in either direction.
@@ -24741,5 +24751,6 @@ resting on a false premise.
 **Source:** found 2026-09-06 from the ASVS packet C branch, as a gate refusal on an unrelated
 commit. The mechanism was then re-derived against `origin/main` with the commit diff, and both the
 loss and the repair verified through `parse_items` with the before and after counts recorded above.
-**#1147 IS STILL LOST ON `main` AS THIS IS FILED.** Restoring it needs either the owning branch or
-standing authority on the engine repo; it is one line and the exact text is in `744a7a434`.
+**#1147 IS STILL LOST ON `main` AS THIS IS FILED**, and the restoration is with the Lander, who
+identified the merge route and holds standing authority on the engine repo. The heading text is in
+`744a7a434` and in nine or more branches predating the deletion.
