@@ -21,9 +21,15 @@ declaration — :func:`._auth.effective_https`, read-only) **OR a loopback secur
 ADR 0143), and only while the org opt-out (:func:`._auth.browser_hardening_enabled`) is unset — the
 combined gate is :func:`._auth.security_headers_context`. On loopback the http-safe headers (nonce-CSP /
 COOP / CORP / Reporting) engage, but the session cookie's Secure / ``__Host-`` prefix still requires
-real https (:func:`._auth.effective_https`) so login is not broken over cleartext loopback (Chrome /
-Safari reject a Secure / ``__Host-`` cookie over http); HSTS likewise stays off on loopback (the engine
-emits it only over real https / ``exposure_protected``). Where the middleware is a strict no-op — the
+real https (:func:`._auth.effective_https`); HSTS likewise stays off on loopback (the engine emits it
+only over real https / ``exposure_protected``). **That split no longer rests on the browser fact this
+sentence used to give** (BACKLOG #1117). It said Chrome and Safari reject a Secure / ``__Host-`` cookie
+over http, which is true off-loopback and FALSE on the loopback origin the sentence was written to
+justify: measured 2026-09-06 against Chrome 148.0.7778.280, an ``http://127.0.0.1`` origin STORED and
+returned ``__Host-``, ``__Secure-`` and a bare-Secure cookie alike, with a domain-mismatch control
+dropped in the same run. Two grounds survive and are the ones to cite -- Safari and Firefox are
+unmeasured, and since ADR 0172 no ``messagefoundry serve`` posture reaches the cleartext branch at all.
+See :func:`._auth.security_headers_context`, which carries the same correction. Where the middleware is a strict no-op — the
 org opt-out, or a cleartext NON-loopback context with no ``exposure_protected`` — it binds no nonce and
 mutates no header, so the engine's existing static ``app.state.ui_csp`` response is emitted
 byte-for-byte. This is why the engine's ``app.state.ui_csp`` seam is left set (option (b) in the lane
