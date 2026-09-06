@@ -29,11 +29,18 @@ name: Security
 # who finds one paragraph of it demonstrably false has no way to tell which of the others still hold.
 # tests/test_security_posture.py refuses the return of a header claim that denies a declared trigger.
 on:
-  # BACKLOG #340 step 1. INERT UNTIL A MERGE QUEUE EXISTS: with no queue configured GitHub never
-  # emits merge_group, so this workflow behaves identically today. It is added FIRST and separately
-  # because the failure mode of the reverse order is total -- enable a queue while a required
-  # context's workflow has no merge_group trigger and that check never reports in the queue, so
-  # NOTHING MERGES.
+  # BACKLOG #340 step 1. THE QUEUE IS LIVE, SO THIS TRIGGER IS LOAD-BEARING -- DO NOT REMOVE IT.
+  # Branch protection evaluates required contexts on the MERGE-GROUP commit, so a required context
+  # whose workflow has no merge_group trigger never reports in the queue and NOTHING MERGES. That
+  # is not hypothetical: codeql.yml's header records PR 619 sitting AWAITING_CHECKS on the queue's
+  # first entry with its CodeQL contexts simply absent. Jobs in this file are among the required
+  # contexts; read branch protection for the live set, never a count written down here.
+  #
+  # THIS COMMENT USED TO SAY "INERT UNTIL A MERGE QUEUE EXISTS ... behaves identically today".
+  # That was true when the trigger landed on 2026-08-26 and became false once a queue was
+  # configured; corrected 2026-09-03, after PR 754 merged through the queue. BACKLOG #340 carries
+  # the measurements and STAYS OPEN -- a live queue is not that item being finished, and who
+  # enabled the queue is recorded nowhere.
   merge_group:
   pull_request:
   # Post-merge re-scan (main only). A fork PR is scanned STRUCTURAL-ONLY by design -- the secret is
@@ -789,5 +796,14 @@ jobs:
             # The pytest arm that asks this same question (tests/test_scan_forbidden_loaded_set.py)
             # can only ever skip in CI -- no pytest job is given this secret -- so this stdlib
             # entrypoint is the only place the REAL table is ever probed.
+            #
+            # READ THE `coverage` LINE, NOT ONLY THE PER-CLASS RATIOS. Not every loaded entry can be
+            # probed: a [names] regex the prober cannot invert and an [estate_body_only] hold-out are
+            # both legitimate list shapes. Measured against the real table 2026-09-05, 3 of 24 loaded
+            # entries were unprobeable while all three class lines read a perfect ratio, so each class
+            # now states its own UNPROBED count and the last line states the total. A PARTIAL residual
+            # is reported and NOT failed, on purpose -- reddening this required context on a correct
+            # list is how a required context gets switched off. A class that could probe NONE of its
+            # loaded entries DOES fail: that is the vacuous pass, per class.
             python scripts/security/scan_forbidden.py --self-test
           fi

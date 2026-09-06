@@ -1,7 +1,7 @@
 # MessageFoundry documentation
 
-There are **377 markdown files** under `docs/`. Most of them are maintainer planning history, not
-documentation. This page exists so you do not have to guess which is which.
+Most of `docs/` is maintainer planning history, not documentation. This page exists so you do not
+have to guess which is which.
 
 **Filenames in this repository are unreliable signals.** `docs/CI.md` and `docs/ADOPTER-CI.md` describe
 different repositories for opposite audiences. `docs/ASVS-L2-PHASE0-CHANGES.md` is operator notes.
