@@ -162,7 +162,7 @@ MIN_ITEMS = 50
 # than repairing neither: a reader who sees the closing act named correctly has no reason to doubt
 # the verdict sentence beside it. Measured over `origin/main`'s ledger by calling `judge()` on all
 # 434 rows -- LIAISON on 35 and Dispatcher on 33, against ASVS Tracker's 97 from the other constant,
-# 132 distinct rows and 130 of them open. See BACKLOG #1460 (filed, not yet on `main`) and #1462.
+# 132 distinct rows and 130 of them open. See BACKLOG #1460, filed and not yet on `main`.
 #
 # The routing itself changed, not just the seat's name. CLAUDE.md section 5 retired the Liaison AND
 # the rule that owner questions route through one: the CONSOLE is now the only seat the owner talks

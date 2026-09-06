@@ -23103,80 +23103,33 @@ The gate's remedy named the owning worktree and said to commit from there. **`wo
 
 **Two mutations hold the arms disjoint**, and the first attempt did not: an assertion about the carried number was written into the invented-number arm, so disabling the fix reddened both and the pair localised nothing. Corrected, then re-measured. Fix disabled reds only `test_a_merge_carrying_ANOTHER_worktrees_number_is_committable`; ownership skipped wholesale during a merge reds only `test_a_number_INVENTED_during_a_merge_is_still_refused`.
 
-## 1462. the dispatch gate's two seat maps named retired seats, so it printed a performer who cannot act
+## 1462. RETIRED -- folded into BACKLOG #1460, which is the primary row for this fix
 
-> 🔢 **Filed 2026-09-05. The fix and its arms are built on this branch.** Value **5/10** · Difficulty **2/10** · _quick win_. **This is the CODE half of BACKLOG #1460; that row is the primary filing and carries the joint measurement set.** #1460 and #1461 are filed on the branch behind PR 936 and are **not yet on `main`**, so this row states its own measurements rather than depending on text a reader cannot resolve yet.
+> 🔢 **Filed and retired in place 2026-09-05.** Value **5/10** · Difficulty **2/10** · _quick win_. The number is kept because commits, a PR title and a claim already cite it; the banner and fields stay exactly as filed, per the retire-in-place convention this ledger uses.
+
+**RETIRED IN PLACE.** Superseded by BACKLOG #1460, which was filed as the primary row for the same fix and carries the joint measurement set. This row SHOULD NOT BE BUILT.
 
 **Cluster:** repository gates / ledger hygiene. **Priority:** P2. **Verdict:** build.
 **Severity:** no deployment axis (sec. 0). Coordination prose read at dispatch time. No engine behaviour, no shipped artifact, no PHI.
 
-### What was wrong -- two constants, not one
+### Why it was retired rather than deleted
 
-`judge()` folds both maps straight into the line a dispatcher reads, so neither is documentation:
+Two rows describing one fix is the ledger decay this fleet spent 2026-09-05 correcting -- three rows read "not started" over shipped work and cost three sessions a wrong premise. #1460 was allocated first, as the primary, with the fuller scope. Adding a second row for the same sentence would have been a fresh instance of the defect being fixed.
 
-```
-Verdict is 'owner-ruling' -- DO NOT JUST BUILD IT: <GATED_VERDICTS value>
-closes by 'scorecard-rescore', performed by <CLOSING_SEAT value> -- NOT by the builder.
-```
+Deleting the number was not an option: `git log` carries it, PR 937's title cites it, and `claim.ps1` holds it. A deleted number turns those into citations that resolve to nothing, and the day someone re-allocates 1462 they start resolving to unrelated work.
 
-| Constant | Retired seats named |
-| --- | --- |
-| `CLOSING_SEAT` (`scripts/docs/backlog_status_check.py`) | ASVS Tracker, Liaison, Dispatcher -- in 3 of 4 values |
-| `GATED_VERDICTS` (`scripts/coord/dispatch_gate.py`) | Liaison in both values, Dispatcher in one |
+### The risk this retirement takes, stated plainly
 
-**Reach, measured here** by calling `judge()` over each of `origin/main`'s 434 ledger rows with its own body: **ASVS Tracker on 97, LIAISON on 35, Dispatcher on 33 -- 132 distinct rows, 130 of them open.** Independently reproduced against a peer session's identical figures.
+**BACKLOG #1460 is not on `main`.** It lives on `origin/builder-seat-name-filing` behind PR 936, open and unmerged; both its heading and #1461's were verified there. **If PR 936 is rejected outright, #1460 never exists and this retirement stranded the only surviving row for work that shipped.** That is the accepted trade, not an overlooked one. PR 936 should land before PR 937 so the citation resolves.
 
-**Repairing one alone is worse than repairing neither.** A reader who sees the closing act named correctly has no reason to doubt the verdict sentence printed beside it.
+### What shipped under this number, so the record is not empty
 
-### How bad it is NOT, stated so the score is honest
+PR 937 repaired both of the dispatch gate's seat maps: `CLOSING_SEAT` in `scripts/docs/backlog_status_check.py` (3 of 4 values named the ASVS Tracker, the Liaison or the Dispatcher) and `GATED_VERDICTS` in `scripts/coord/dispatch_gate.py` (the Liaison in both values, the Dispatcher in one). Reach, measured by calling `judge()` over each of `origin/main`'s 434 rows: ASVS Tracker 97, LIAISON 35, Dispatcher 33 -- 132 distinct rows, 130 open.
 
-**No gate decides wrongly.** Replacing every value in both maps with a placeholder changes the level on **0 rows**. The positive control on the same experiment: emptying `BUILDER_CLOSABLE_ACTS`, the frozenset that actually drives the branch, moves 161. And **no workflow and no pre-commit hook invokes `dispatch_gate.py`** -- `grep -rn dispatch_gate .github/ .pre-commit-config.yaml` returns nothing.
+The stale `BUILDER.md:253` and `:148` citations became quotes of their claims; the file lives in the vault, so no checkout of this repository could ever have resolved them, and `citation_line_check.py` refuses bare filenames besides. Two paired regression arms walk both maps, mutation-tested three ways.
 
-So this is **stale prose with a tool as its delivery channel**, not a misfiring gate. It still matters, because the prose is the whole product: the gate exists to NAME a performer rather than refuse an item.
+**Severity bound, so #1460 is not over-scored:** replacing every value in both maps changes the gate level on **0** rows, against 161 for the positive control of emptying `BUILDER_CLOSABLE_ACTS`. No workflow and no pre-commit hook invokes `dispatch_gate.py`. This was stale prose with a tool as its delivery channel.
 
-### The routing changed, not just the seat's name
+### A correction to this row's first version
 
-`GATED_VERDICTS` said the ruling "comes via the LIAISON". CLAUDE.md section 5 retired the Liaison **and** the rule that owner questions route through one -- the Console is now the only seat the owner talks to. So that clause could not be repaired by substituting a name; the hop it described is gone.
-
-`scorecard-rescore` follows the **owner ruling of 2026-09-05: the LANDER performs vault scorecard re-scores.** It already held the banner and standing vault authority.
-
-**The two-step reasoning is kept, because the failure it describes is unchanged.** A re-score lands in a vault file gitignored from every engine checkout, so nothing in this repository reports that step one happened. Only the shape moved -- a handoff message between two seats became a sequencing obligation inside one. Measured 2026-08-22, while the acts still had two owners: three re-scores, zero banner flips, and no flip ever requested.
-
-### The stale citations, and why nothing here could have caught them
-
-The comment cited `BUILDER.md:253` and `:148`. Both had drifted:
-
-| Cited | Claim | Actually at |
-| --- | --- | --- |
-| `:253` | "You may not conclude an item CLOSED" | **`:142`**. Line 253 itself is **BLANK**, and `filer` -- the word the citation's prose used -- appears **zero** times in the file, with `banner` at 7 as the positive control. |
-| `:148` | "The lander writes the banner" | **`:216`**, inside the `:213-217` block. Line 148 is now about ADR numbering. |
-
-**Two independent reasons no gate here could have fired:**
-
-1. `BUILDER.md` lives in the `MessageFoundry-vault` `roles/` folder. **No checkout of this repository carries it**, so nothing here can resolve the path at all.
-2. `citation_line_check.py` **REFUSES a bare filename** rather than guess which file is meant -- 935 of 3,086 citations sit in that bucket, and these were two of them.
-
-Both are now QUOTES of the claim. A line number nothing can check decays in silence.
-
-### The arms, and the mutations that earned them
-
-Both arms walk **both** maps. `test_no_seat_map_value_names_a_retired_seat` forbids the seven retired names, word-anchored. `test_every_seat_map_value_names_a_live_seat` is its pair: deleting a retired name and leaving the value naming nobody passes the first check while a dispatcher reads a value with no performer in it.
-
-Three mutations, each confirming a different arm is real rather than decorative:
-
-| Mutation | arm 1 | arm 2 |
-| --- | --- | --- |
-| `CLOSING_SEAT` regressed to the ASVS Tracker | **fires** | silent |
-| `GATED_VERDICTS` regressed to the Liaison | **fires** | silent |
-| a value stripped to name nobody | silent | **fires** |
-
-**The negative control caught a defect in the arm itself.** The first arm asserts its matcher hits a known-bad string before it checks the maps. That failed on the first run: the word-boundary anchors reached the file as literal backspace bytes (`0x08`) through the Bash-tool heredoc unescaping of #1397, so the pattern matched nothing -- and a silently-broken checker over a repaired map is green.
-
-### The same-PR constraint
-
-`tests/test_coord_dispatch_gate.py` is listed at `tests/tooling_manifest.txt:84`; `tooling` is in the `needs:` list of the `ci-gate` job in `.github/workflows/ci.yml`; `CI gate` is a required context per `.github/required-contexts.txt`. **Verified all three in this checkout.** So a constant and its assertions must move in the same PR or `CI gate` reds and blocks every PR behind it. They do here.
-
-### Not taken
-
-- **`CLOSING_SEAT["code"]` may misassign the ledger edit.** It says the Lander flips the banner on merge, while `backlog-hygiene.yml` demands the backlog edit in the *same* PR that touches code -- a Builder's PR. Both seats are live, so this is a **routing disagreement between two live playbook sources**, not seat rot, and resolving it is an owner or roster question rather than a rename. Raised by a peer session; left for #1460.
-- **Three further `BUILDER.md:253` citations** in `docs/BACKLOG.md` (around lines 16620, 16755, 17122). All RECORD what was measured while the acts had two owners, so they are accurate history, not instructions.
+It said `CLOSING_SEAT["code"]` was "a routing disagreement between two live playbook sources". **That was wrong.** `.github/workflows/backlog-hygiene.yml` and CLAUDE.md section 5's Builder row AGREE -- both put the `docs/BACKLOG.md` edit in the same PR that carries the code, and that PR is the Builder's. The source that disagrees is the vault `roles/BUILDER.md` line 216, which is stale rather than live, because section 5 replaced the method those lines assume. The vault half is #1461. Left to #1460 either way, but for the right reason.

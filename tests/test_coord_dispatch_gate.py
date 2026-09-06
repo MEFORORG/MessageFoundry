@@ -101,7 +101,7 @@ def test_the_wave_shape_is_advised_never_refused(gate: ModuleType) -> None:
     # BOTH ARE THE LANDER'S since the owner ruling of 2026-09-05, so the seat name no longer
     # discriminates between them -- pin the two ACTS, which is what the reader must come away with.
     # BUILDER.md forbids a builder concluding an item CLOSED and gives the banner to the lander;
-    # it is quoted rather than line-cited, because it lives in the vault (BACKLOG #1462).
+    # it is quoted rather than line-cited, because it lives in the vault (BACKLOG #1460).
     assert "re-scores the cell in the vault" in reason, "the advice must name the work act"
     assert "flips the banner" in reason, "the advice must also name the banner act"
     assert "LANDER" in reason, "the advice must name the seat that performs both"
@@ -133,7 +133,7 @@ def _seat_maps(gate: ModuleType) -> dict[str, dict[str, str]]:
 
 
 def test_no_seat_map_value_names_a_retired_seat(gate: ModuleType) -> None:
-    """BACKLOG #1462, filed as #1460. Both constants named seats that no longer exist.
+    """BACKLOG #1460. Both constants named seats that no longer exist.
 
     `CLOSING_SEAT` named the ASVS Tracker, the Liaison and the Dispatcher across three of its four
     values; `GATED_VERDICTS` named the Liaison in both of its two, and the Dispatcher in one.
@@ -316,7 +316,7 @@ def test_a_demand_gate_verdict_is_advised_not_green(gate: ModuleType) -> None:
     # would also produce it. The reason text is the only thing that tells a seat what gates the item.
     assert "DO NOT JUST BUILD IT" in reason
     # Was `"LIAISON" in reason`. Section 5 retired that seat AND the hop it named, so the assertion
-    # is on where an owner ruling actually goes now -- the CONSOLE (BACKLOG #1462).
+    # is on where an owner ruling actually goes now -- the CONSOLE (BACKLOG #1460).
     assert "CONSOLE" in reason
 
 
