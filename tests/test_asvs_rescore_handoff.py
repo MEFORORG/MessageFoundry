@@ -27,10 +27,16 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts" / "asvs"))
 
 from rescore_handoff_check import (  # noqa: E402
+    GRADE_MOVED,
+    GRADE_MOVED_DOWN,
+    GRADE_UNCHANGED,
+    GRADE_UNKNOWN,
     Flag,
     Pair,
     banner_last_touched,
+    classify,
     evaluate,
+    grade_history,
     main,
     read_pairs,
     split_by_boundary,
@@ -721,7 +727,7 @@ def test_a_pair_after_the_boundary_is_decidable_and_one_at_or_before_it_is_not()
     is unavailable, and the answer is unknown rather than clean.
     """
     pairs = [Pair(1, "2026-05-06"), Pair(2, "2026-05-05"), Pair(3, "2026-05-04")]
-    decidable, undecidable = split_by_boundary(pairs, "2026-05-05")
+    decidable, undecidable = split_by_boundary(pairs, "2026-05-05", {})
     assert [p.item for p in decidable] == [1]
     assert [p.item for p in undecidable] == [2, 3]
 
@@ -730,7 +736,7 @@ def test_with_no_boundary_every_pair_is_decidable() -> None:
     """The unbounded branch. An empty boundary means no walk began at a graft, so nothing is floored
     and holding anything back would be a refusal with no cause."""
     pairs = [Pair(1, "2026-05-06"), Pair(2, "2026-01-01")]
-    decidable, undecidable = split_by_boundary(pairs, "")
+    decidable, undecidable = split_by_boundary(pairs, "", {})
     assert decidable == pairs
     assert undecidable == []
 
@@ -754,3 +760,221 @@ def test_the_run_reports_what_it_actually_scanned(ledger: Path, tmp_path: Path, 
     assert f"walked {LIVE}: 3 of 3 revisions" in out
     assert f"walked {ARCHIVE}: 2 of 2 revisions" in out
     assert "truncation branch: NONE" in out
+
+
+# ------------------------------------------- a measured touch is decidable whatever the graft says
+
+
+def test_an_item_whose_touch_was_MEASURED_is_decidable_below_the_boundary() -> None:
+    """The half of the inequality the first fix read only one way.
+
+    Hidden revisions all sit at or before the boundary, so a true last touch is
+    ``max(visible, something <= boundary)``. When the visible touch already clears the boundary, that
+    max IS the visible date -- the graft cannot raise it. Item 2's own re-score date sits below the
+    boundary, and it is still decided exactly, because its BANNER date was measured rather than
+    floored.
+    """
+    pairs = [Pair(1, "2026-05-04"), Pair(2, "2026-05-04")]
+    touched = {1: "2026-05-05", 2: "2026-05-09"}
+    decidable, undecidable = split_by_boundary(pairs, "2026-05-05", touched)
+    assert [p.item for p in decidable] == [2]
+    assert [p.item for p in undecidable] == [1]
+
+
+def test_the_per_item_rule_never_narrows_the_old_one() -> None:
+    """A widening must not turn a previously decided pair undecidable. Pinned because the two rules
+    are OR-ed, and an OR written as an AND would silently shrink the answer instead of growing it."""
+    pairs = [Pair(1, "2026-05-06"), Pair(2, "2026-05-04")]
+    old, _ = split_by_boundary(pairs, "2026-05-05", {})
+    new, _ = split_by_boundary(pairs, "2026-05-05", {2: "2026-05-01"})
+    assert {p.item for p in old} <= {p.item for p in new}
+    assert [p.item for p in new] == [1]
+
+
+def test_a_FLOORED_banner_date_cannot_produce_a_clean_GRADE_UNCHANGED(tmp_path: Path) -> None:
+    """THE INEQUALITY RUNS THE OPPOSITE WAY HERE, AND REUSING IT UNEXAMINED INVERTED THE ANSWER.
+
+    ``evaluate`` is safe against a floored banner date because a later date can only suppress a hit.
+    ``classify`` asks what survives ABOVE that date, so pushing it later DELETES change points and
+    turns a real move into a confident confirmation. Same history, same cell: on the true date the
+    grade moved; on the floored one the walk can see nothing above it and must say so.
+    """
+    repo = scorecard_repo(tmp_path, [("2026-01-01", "partial"), ("2026-05-01", "pass")])
+    history = grade_history(repo / "card.toml")
+    true_date = Flag(10, "2026-05-01", "2026-02-01", "C1")
+    assert classify(true_date, history) == GRADE_MOVED
+    floored = Flag(10, "2026-05-01", "2026-08-31", "C1")
+    assert classify(floored, history, "2026-08-31") == GRADE_UNKNOWN
+    # A change ABOVE the floor is still a true change, so it is answered rather than withheld.
+    low_floor = Flag(10, "2026-05-01", "2026-02-01", "C1")
+    assert classify(low_floor, history, "2026-02-01") == GRADE_MOVED
+
+
+def test_an_UNKNOWN_verdict_is_not_counted_as_a_grade_that_MOVED(
+    ledger: Path, tmp_path: Path, capsys
+) -> None:
+    """FAILURE-TO-LOOK MUST NOT RENDER AS THE STRONGEST SIGNAL IN THE ONE LINE A READER ACTS ON.
+
+    The first cut counted every verdict that was not UNCHANGED as "moved", so a hit whose grade
+    history could not be read was summarised as a grade that moved. Here the scorecard's committed
+    history carries a different cell id than the working tree, which is what an uncommitted re-score
+    looks like, so the join misses and the verdict is UNKNOWN.
+    """
+    repo = scorecard_repo(tmp_path, [("2026-01-01", "partial")])
+    card = repo / "card.toml"
+    card.write_text(
+        '[[cell]]\nid = "UNCOMMITTED"\nverdict = "partial"\n'
+        'last_verified = "2026-05-01"\nresidual = "BACKLOG #10"\n',
+        encoding="utf-8",
+    )
+    assert main(["--scorecard", str(card), "--root", str(ledger)]) == 0
+    out = capsys.readouterr().out
+    assert "0 sit on a cell whose GRADE moved after the banner" in out
+    assert "1 could not be decided" in out
+    assert GRADE_UNKNOWN in out
+    # The steer to read the moved lines first must not appear when there are none.
+    assert "READ THE 'GRADE MOVED' LINES FIRST" not in out
+
+
+def test_the_ranked_verdicts_cannot_drift_from_the_lines_printed(
+    ledger: Path, tmp_path: Path, capsys
+) -> None:
+    """The summary counts and the detail lines come from one structure, so they cannot disagree.
+
+    Keying the verdicts on the Flag dataclass collapsed two flags equal in every field into one
+    entry, which would have described fewer hits than it went on to print.
+    """
+    repo = scorecard_repo(tmp_path, [("2026-01-01", "partial"), ("2026-05-01", "pass")])
+    assert main(["--scorecard", str(repo / "card.toml"), "--root", str(ledger)]) == 0
+    out = capsys.readouterr().out
+    printed = [line for line in out.splitlines() if line.strip().startswith("BACKLOG #")]
+    assert "RE-SCORED AFTER THE BANNER WAS LAST TOUCHED: 1" in out
+    assert len(printed) == 1
+    assert "1 sit on a cell whose GRADE moved after the banner" in out
+
+
+# --------------------------------------------- a date move is not a re-score: the grade classifier
+
+
+def scorecard_repo(tmp_path: Path, revisions: list[tuple[str, str]]) -> Path:
+    """A scorecard repo whose single cell takes each ``(date, verdict)`` in turn."""
+    repo = tmp_path / "vault"
+    repo.mkdir()
+    git("init", "-b", "main", str(repo), cwd=tmp_path)
+    git("config", "user.email", "t@example.com", cwd=repo)
+    git("config", "user.name", "t", cwd=repo)
+    card = repo / "card.toml"
+    for when, verdict in revisions:
+        card.write_text(
+            f'[[cell]]\nid = "C1"\nverdict = "{verdict}"\n'
+            f'last_verified = "{when}"\nresidual = "BACKLOG #10"\n',
+            encoding="utf-8",
+        )
+        commit_at(repo, f"{verdict} at {when}", when)
+    return repo
+
+
+def test_a_cell_only_RE_VERIFIED_after_the_banner_is_not_a_re_score(tmp_path: Path) -> None:
+    """THE DEFECT THIS CLASSIFIER EXISTS FOR. ``last_verified`` bumps on a confirming re-check just as
+    it does on a real re-score, so the date comparison alone fires on both.
+
+    Measured 2026-09-04 against the vault record: 22 of 28 flagged items were this case.
+    """
+    repo = scorecard_repo(tmp_path, [("2026-01-01", "partial"), ("2026-05-01", "partial")])
+    history = grade_history(repo / "card.toml")
+    assert classify(Flag(10, "2026-05-01", "2026-03-01", "C1"), history) == GRADE_UNCHANGED
+
+
+def test_a_cell_whose_grade_moved_after_the_banner_is_the_real_signal(tmp_path: Path) -> None:
+    repo = scorecard_repo(tmp_path, [("2026-01-01", "partial"), ("2026-05-01", "pass")])
+    history = grade_history(repo / "card.toml")
+    assert classify(Flag(10, "2026-05-01", "2026-03-01", "C1"), history) == GRADE_MOVED
+
+
+def test_a_grade_that_moved_DOWN_after_a_banner_is_called_out_separately(tmp_path: Path) -> None:
+    """The reverting direction, which is the one #1328's amendment warns about: a CLOSED banner
+    resting on a pass that a later re-score withdrew is a compensating control on a false premise
+    (SDS-3.7). It must not render the same as a strengthening."""
+    repo = scorecard_repo(tmp_path, [("2026-01-01", "pass"), ("2026-05-01", "partial")])
+    history = grade_history(repo / "card.toml")
+    assert classify(Flag(10, "2026-05-01", "2026-03-01", "C1"), history) == GRADE_MOVED_DOWN
+
+
+def test_a_move_into_na_is_a_scope_change_not_a_weakening(tmp_path: Path) -> None:
+    """``na`` means the requirement does not apply. Ranking it at either end of the scale would
+    report every scope change as a strengthening or a weakening, which is a grade claim the record
+    never made."""
+    repo = scorecard_repo(tmp_path, [("2026-01-01", "pass"), ("2026-05-01", "na")])
+    history = grade_history(repo / "card.toml")
+    assert classify(Flag(10, "2026-05-01", "2026-03-01", "C1"), history) == GRADE_MOVED
+
+
+def test_an_unreadable_grade_history_is_UNKNOWN_and_never_silently_UNCHANGED(
+    tmp_path: Path,
+) -> None:
+    """THE WHOLE POINT OF RETURNING None. An empty history would classify every hit as UNCHANGED --
+    the most reassuring possible answer, produced by having failed to look. That is the same shape as
+    the two refusals this tool already carries."""
+    loose = tmp_path / "loose"
+    loose.mkdir()
+    card = loose / "card.toml"
+    card.write_text('[[cell]]\nid = "C1"\nlast_verified = "2026-05-01"\n', encoding="utf-8")
+    assert grade_history(card) is None
+    assert classify(Flag(10, "2026-05-01", "2026-03-01", "C1"), None) == GRADE_UNKNOWN
+
+
+def test_a_cell_absent_from_the_grade_history_is_UNKNOWN_rather_than_confirmed(
+    tmp_path: Path,
+) -> None:
+    """A cell the history never saw is not a cell whose grade held steady."""
+    repo = scorecard_repo(tmp_path, [("2026-01-01", "partial")])
+    history = grade_history(repo / "card.toml")
+    assert classify(Flag(10, "2026-05-01", "2026-03-01", "MISSING"), history) == GRADE_UNKNOWN
+
+
+def test_read_pairs_carries_the_cell_so_the_grade_can_be_joined() -> None:
+    """The join key. It is READ but never PRINTED -- cell ids stay vaulted."""
+    pairs, _ = read_pairs(
+        '[[cell]]\nid = "C1"\nlast_verified = "2026-01-01"\nresidual = "BACKLOG #10"\n'
+    )
+    assert [(p.item, p.cell) for p in pairs] == [(10, "C1")]
+
+
+def test_the_run_splits_confirmations_from_real_grade_moves(
+    ledger: Path, tmp_path: Path, capsys
+) -> None:
+    """End to end: the hit list states how much of itself is noise, so a reader knows where to start.
+
+    #10's banner is flipped 2026-02-01 and the cell is re-verified 2026-05-01 WITHOUT moving, which
+    is the in-sync state and the dominant real-world case -- 22 of 28 items when this ran against the
+    vault record.
+    """
+    repo = scorecard_repo(tmp_path, [("2026-01-01", "partial"), ("2026-05-01", "partial")])
+    assert main(["--scorecard", str(repo / "card.toml"), "--root", str(ledger)]) == 0
+    out = capsys.readouterr().out
+    assert "RE-SCORED AFTER THE BANNER WAS LAST TOUCHED: 1" in out
+    assert "0 sit on a cell whose GRADE moved after the banner" in out
+    assert "1 on a cell that was only re-verified" in out
+    assert "0 could not be decided" in out
+    assert GRADE_UNCHANGED in out
+
+
+def test_the_refusal_names_the_route_that_needs_no_owner_decision(
+    shallow_ledger: Path, tmp_path: Path, capsys
+) -> None:
+    """A refusal whose only remedy is 'ask the owner' is why this tool sat unrun for twelve days.
+
+    A throwaway clone shares no object store, so the shared-store objection that makes --unshallow
+    the owner's call does not reach it, and --root already takes a separate history source.
+    """
+    card = tmp_path / "card.toml"
+    card.write_text(
+        '[[cell]]\nid = "C1"\nlast_verified = "2020-01-01"\nresidual = "BACKLOG #10"\n',
+        encoding="utf-8",
+    )
+    assert main(["--scorecard", str(card), "--root", str(shallow_ledger)]) == 3
+    err = capsys.readouterr().err
+    assert "git clone --single-branch" in err
+    assert "shares no object store" in err
+    assert "2020-01-01" in err
+    assert "--filter=blob:none" in err

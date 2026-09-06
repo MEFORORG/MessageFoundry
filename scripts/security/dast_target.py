@@ -29,7 +29,7 @@ import asyncio
 import os
 import secrets
 import tempfile
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -82,6 +82,13 @@ class DastTarget:
     app: FastAPI
     posture: dict[str, str]
     identities: dict[str, tuple[str, ...]]
+    #: Mint a FRESH session for a scan username. The write passes need it because a probe carrying a
+    #: valid token can legitimately DESTROY the session it is probing with — ``POST /auth/logout`` is
+    #: measured doing exactly that — after which every later row answers 401 and would be miscounted as
+    #: refused. The password stays inside this closure rather than on the handle, so it cannot reach a
+    #: repr, a log line or the receipt. It raises :class:`DastTargetUnusable` when a session can no
+    #: longer be minted, which the runner turns into exit 2 rather than a clean-looking wall of 401s.
+    relogin: Callable[[str], Awaitable[str]]
 
 
 def _scan_password() -> str:
@@ -260,10 +267,27 @@ async def dast_target(
                     "makes every later 403 meaningless, so this run measured nothing."
                 )
 
+        async def relogin(username: str) -> str:
+            """A fresh session for ``username``, on a short-lived client of its own.
+
+            Deliberately not sharing the bring-up client: that one is closed before the target is
+            yielded, and coupling the handle's lifetime to it would make a re-mint fail for a reason
+            that has nothing to do with the app under test.
+
+            Under ``open-auth`` there is no session to mint — that IS the injected defect — so the
+            sentinel is returned. Nothing calls it there: authentication is disabled, so no probe can
+            produce the refusal that triggers a re-mint.
+            """
+            if canary == "open-auth":
+                return _NO_SESSION_SENTINEL
+            async with httpx.AsyncClient(base_url=base_url, timeout=30.0) as fresh:
+                return await _login(fresh, username, password)
+
         yield DastTarget(
             base_url=base_url,
             admin_token=admin_token,
             viewer_token=viewer_token,
+            relogin=relogin,
             app=app,
             posture=_posture(canary=canary),
             identities={
