@@ -24178,3 +24178,137 @@ Vault `roles/BUILDER.md:213-217`, under the heading "Closing a ledger row makes 
 ### Not checked
 
 I read only `roles/` in the vault and ran no git history there, so I cannot date when any of these lines was written. Eleven of the fourteen playbooks were matched by the needle above but not read, so treat the population as **at least three files**, not a total. I did not check whether any workflow or CI job reads a playbook, and I confirmed no case in which a seat actually followed `BUILDER.md:216` and produced a red PR -- I measured the instruction and the gate, not an incident.
+
+## 1473. the ASVS record's evidence has drifted from engine main -- 87 anchors do not locate and 16 absence claims are false -- and four different remedies hide behind that one symptom
+
+> 🔢 **Filed 2026-09-06 -- not started. Owner-requested filing.** Value **5/10** · Difficulty **6/10** · _money pit_. A full verify of the ASVS record against engine `main` at `ebdfa44a6` resolves 2,088 evidence anchors and leaves **87 that do not locate**, and checks 275 absence claims of which **16 are now false**. **The engine is not less secure.** The evidence went stale, usually because the code got better and the fix deleted the line the anchor quoted. Difficulty 6 because the remedy is one cell at a time in a separate repository and **a bulk re-anchor would silently convert closed gaps and removed controls into false green**; value 5 because nothing ships, no engine behaviour changes, and no operator reads the record.
+> Verdict: build
+> Research: none -- the measurement is in the body
+> Closing-act: scorecard-rescore
+
+**Cluster:** Security records. **Priority:** P3. **Verdict:** build.
+**Severity:** no engine axis, no PHI axis, and **no deployment axis (sec. 0)**. Nothing ships in the wheel and no control moved. The cost is that a graded cell's evidence no longer points at the code it was graded from, so its verdict cannot be re-checked without redoing the reading from scratch.
+
+**Distinct from [#1405](#1405-nothing-writes-the-security-scorecard-so-its-anchors-go-stale-exactly-when-the-code-improves), which is the MECHANISM.** That row says nothing writes the scorecard, so anchors go stale exactly when the code improves, and it asks for a reporter. This row is a MEASUREMENT taken against that mechanism: what such a reporter would currently print, the two findings the run produced, and why the obvious response to its output is wrong. #1405 can close with a reporter; this row cannot, because the triage is the work.
+
+### How the measurement was taken, because the instrument is the interesting part
+
+One command, read-only:
+
+```
+python scripts/asvs/scorecard.py --scorecard <the record> --corpus <the ASVS 5.0.0 flat json> --root <an engine tree>
+```
+
+Engine tree at `main`, commit `ebdfa44a6`. The record read from the vault's `origin/main`.
+
+`--root` is required in verify mode, and the tool refuses a root that CONTAINS the scorecard: resolving anchors against the repository that stores the record produces a self-consistent, wrong answer.
+
+### What the run reports
+
+| reading | count |
+|---|---|
+| evidence anchors resolved | 2,088 |
+| anchors that DID NOT LOCATE | **87** |
+| absence claims checked | 275 |
+| absence claims now FALSE | **16** |
+
+**The graded content is deliberately not reproduced here, and the line is finer than it looks.** Cell IDS are public -- this ledger names them in the clear in hundreds of places. What stays in the vault is the GRADED CONTENT: coverage totals, gap counts and per-cell verdicts. [`CLAUDE.md`](../CLAUDE.md) section 12 lists ids first and separately from coverage and gaps, which is exactly why the two halves get swapped.
+
+So every number above is a property of the EVIDENCE LAYER -- how much of the record's own citation apparatus still resolves -- and none of it grades a cell. **A count of non-locating anchors is safe to publish; the same count paired with how many cells pass is not**, and paraphrasing the split (*"roughly half pass"*) discloses it just as effectively, with error bars.
+
+**This ledger already carries hard-coded ASVS verdict tallies of its own -- at least three, on two lines**, and the closed archive carries more. Measured with `scripts/docs/asvs_tally_lint.py`, which exists to find exactly these and whose own summary is the argument this row is making from the other end: *"Cite the rendered record instead of copying a number out of it: every copy goes stale on the next re-score, and of the roughly fifty that exist, approximately one is correct."* So the boundary is not currently held here. Recorded as an observation about this record's hygiene and deliberately not repaired: those are other items, and this row does not touch them.
+
+An anchor that does not locate means the cited token is no longer at that line, or now occurs more than once so the line number is not load-bearing. An absence claim that is false means the thing the record says is missing now exists.
+
+### Do not fix this with a bulk re-anchor
+
+The tool says so itself: *"Re-read the cell before touching the anchor: the token may have moved, been renamed, had the gap it certified CLOSED (retire it), or had its control removed (re-score). Do not re-anchor by default."*
+
+**Four different remedies hide behind one symptom**, and only the first two are mechanical:
+
+| what actually happened | remedy |
+|---|---|
+| the token moved | re-anchor |
+| the token was renamed | re-anchor to the new name |
+| the gap the anchor certified is CLOSED | retire the anchor |
+| the control it cited was REMOVED | re-score the cell |
+
+A sweep that re-anchors everything applies remedy one to all four. On the third and fourth rows that **converts a closed gap and a removed control into false green** -- a record asserting a control that is not there, which is exactly the compensating-control-resting-on-a-false-premise defect [`CLAUDE.md`](../CLAUDE.md) section 11 forbids. The 87 are a work queue, not a diff to apply.
+
+### The repair shape already has precedent, so this is not a new practice
+
+Two repairs on the vault's `origin/main` establish the convention: one repaired 15 stale evidence locators, the other a single documentation residual. **Both state in the commit subject whether the VERDICT moved and whether the STAMP moved**, and *"no verdict and no stamp moved"* is a normal and respected outcome rather than a weak result.
+
+That convention is the concrete answer to the caution above. Repairs land in **small, individually-justified batches that declare what did not move**, and the declaration is what makes the third and fourth remedies visible -- a batch that retires an anchor or re-scores a cell cannot claim no verdict moved. A sweep has no such field to fill in, which is precisely why it can convert a closed gap into false green without anybody being able to see it happen. Follow the existing shape; do not invent a bulk path beside it.
+
+### The remedy is a procedure, not an open design question -- the writer exists and its guards ARE the caution
+
+`scripts/asvs/apply.py` is the sanctioned writer for the record, and **the two guards this row argues for are already implemented in it.** Measured from its `--help` at `ebdfa44a6`:
+
+| flag | what it does |
+|---|---|
+| *(default)* | **dry run; the file is not touched.** `--apply` writes. |
+| `--allow-retirement` | permits an evidence or absence list to SHRINK, but **only where the payload DECLARES the retirement** via `retired_evidence` / `retired_absence`. Refused by default, because *"a silent cardinality drop is what this guard exists to stop, and the flag alone is not enough"*. |
+| `--allow-verdict-change` | permits a payload to move a verdict. Refused by default, because *"a verdict move is an assessor decision, and this writer's failure mode is making one during a pass whose stated purpose was mechanical"*. |
+
+So retiring one of the 16 false absence claims is not something to design. It is `apply.py --allow-retirement` with a declared `retired_absence`, and **the retirement itself must be re-confirmed with the owner rather than inherited from whoever first called it confirmed.** One of the 16 is being worked that way now, so the procedure has a live worked example and not just a specification.
+
+### The sharper finding: the tooling exists and most of it runs only when a human runs it
+
+**The gap is NOT "no tooling exists".** Six tools sit in `scripts/asvs/`: `scorecard.py` verifies, `apply.py` writes under the guards above, `anchor_report.py` and `anchor_provenance.py` cover anchor work, `rescore_handoff_check.py` answers *"did a cell get re-scored AFTER its item's banner was last touched"*, and `prove_report.py` reports absence proofs.
+
+Measured at `ebdfa44a6`, counting workflow and `.pre-commit-config.yaml` references to each script path:
+
+| tool | wired into |
+|---|---|
+| `scorecard.py` | `asvs-anchor-report.yml`, `asvs-prove-absences.yml` |
+| `anchor_report.py` | `asvs-anchor-report.yml` |
+| `prove_report.py` | `asvs-prove-absences.yml` |
+| `apply.py` | **nothing** |
+| `anchor_provenance.py` | **nothing** |
+| `rescore_handoff_check.py` | **nothing** |
+
+**Three of the six are referenced by no workflow and no hook in this repository**, and the two that are wired run in jobs [#1405](#1405-nothing-writes-the-security-scorecard-so-its-anchors-go-stale-exactly-when-the-code-improves) already records as gated on a repository variable that deliberately does not exist, because a vault read credential held in the public repository would collapse the boundary the vault creates.
+
+**What runs automatically on the VAULT side is NOT established here, and two sources disagree.** #1405 records an unconditional daily cron in the vault that reads the same anchors and opens an alarm issue on failure; a peer reports that vault CI is off and the pre-commit framework absent there. I did not read the vault, so this row **does not resolve that** -- it flags it as the first thing the next reader should measure, because the two answers imply very different amounts of remaining work.
+
+### One false absence claim is substantive, and it corroborates a finding already on `main`
+
+The record says no unique index exists on the federated-subject columns. One does, and it ships on all three backends:
+
+- `messagefoundry/store/sqlserver.py:1439` -- `CREATE UNIQUE INDEX ux_users_federated_subject ON users(oidc_issuer, oidc_subject)`
+- `messagefoundry/store/postgres.py:566`
+- `messagefoundry/store/store.py:3376`
+
+The verifier reports three matches, one per backend.
+
+**This is corroboration, not a new defect.** It independently confirms, from a different instrument, the finding recorded on **#1143** and [ADR 0184](adr/0184-identify-a-federated-login-by-the-idp-namespaced-subject-not-by-the-username-it-claims.md), both merged: the claim that there is *"no uniqueness of any kind on the OIDC columns on any backend"* has been false since [#1256](#1256-the-federated-binding-guards-account-continuity-but-never-subject-exclusivity-so-two-accounts-can-bind-one-identity) built the partial unique index. The value is that a second instrument reached the same finding without being pointed at it.
+
+### One false absence claim is a false positive in the instrument, and no shipped cookie is affected
+
+The record's absence pattern for HttpOnly matches `httponly\s*=\s*False`. At `ebdfa44a6` that pattern hits two occurrences and **both are prose**:
+
+- `messagefoundry_webconsole/_auth.py:802` -- a comment explaining what Starlette's `delete_cookie` defaults are
+- `packaging/messagefoundry-webconsole/tests/test_ui_hardening.py:357` -- a test comment quoting the same defaults
+
+**No shipped cookie sets `httponly=False`.** Nothing here needs an alarm, and this row exists partly so nobody raises one.
+
+The generalisable part is a weakness of the method, worth recording on its own: **an absence pattern that scans prose as if it were code will keep producing this.** A comment that NAMES a banned pattern is indistinguishable from code that USES it, to a regex. The failure direction is the expensive one -- it manufactures a finding where the control is fine, so triage cost is spent on a cell that needed no work.
+
+### The two readings differ because the record MOVED, and the stale copy encoded superseded verdicts
+
+**Say which copy of the record you read, or the count means nothing.** The same command over the same engine tree gives **61** non-locating anchors from the vault clone's working tree and **87** from the vault's `origin/main`.
+
+**Those are not two copies of one record. They are the same record before and after at least five upstream changes landed on it**, and some of those changes moved verdicts rather than only anchors. So the stale copy did not merely lag: it encoded decisions that had already been reversed, and scoring against it would have graded the engine against superseded verdicts. Both runs are correct, both answer a different question, and neither output says which one it answered.
+
+**The clone holds no local scorecard edits, and the contrary claim is false.** Measured 2026-09-06: the clone is 4 commits ahead of `origin` and 54 behind, with 23 dirty files, but `git log origin/main..HEAD -- <the record>` is EMPTY. The record appears in a two-dot `git diff` only because the clone is BEHIND. The divergence is entirely inbound, which is why the fix is to read `origin/main` and not to reconcile anything.
+
+This is [`CLAUDE.md`](../CLAUDE.md) section 11's SDS-3.8 rule -- confirm your instrument answers the question you asked -- landing on the record rather than on the code. It cost a pass here before anyone noticed.
+
+### Not established
+
+I did not triage the 87. I read two absence claims by hand and confirmed that one merged wave did not cause the drift.
+
+**87 and 16 are counts from ONE run at ONE commit pair, and both sides move.** The engine advances and the record is edited independently, so each number is a reading and not a property. Re-run before acting, and record the engine commit and the record ref together the way this row does.
+
+Treat the findings as **at least** what is written here. The two hand-checked claims are the only ones whose classification I can defend, so the split between substantive and spurious across the other 14 false absence claims is unmeasured, and so is the split across the 87 among the four remedies above.
