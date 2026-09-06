@@ -129,7 +129,14 @@ an owner decision, not a build.
 which the redaction guard's own ordinary-diagnostics fixture pins. Under-redaction is the safe
 direction there, and it is named rather than left looking overlooked.
 
-**Did not build #1183's proposed work** -- the read-privilege preflight, the file-borne asset
+**Did not derive the redactor's credential vocabulary from the engine's own tables.** Measured: 11
+names are still unreached -- six username spellings, four `key` spellings, and `intake_api_key_next`,
+which puts the keyword mid-label where the trailing word boundary cannot reach it. Three different
+causes and only one is an oversight, and widening onto the username class is a scope decision rather
+than a bug fix. Recorded on the row as unallocated proposed work, with the number, so the next pass
+does not start from zero.
+
+**Did not build #1183's other proposed work** -- the read-privilege preflight, the file-borne asset
 registry, the process-principal self-check, the environment scrub, the subprocess environment. All
 remain unallocated and by subject.
 
