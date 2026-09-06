@@ -905,9 +905,12 @@ them at the response: the sender-influenced OBX-5.2 MIME is forced through `_saf
 to `application/octet-stream` on any non-clean value **and** on any **browser-active** type (`html`,
 `xml`, `script`, `svg` subtypes + `multipart`, matched case-folded, length-bounded); the response carries
 `Content-Disposition: attachment` (a download, never an inline render), `X-Content-Type-Options: nosniff`
-(no MIME re-sniff), and `Content-Security-Policy: default-src 'none'; sandbox` (an opaque origin with
-scripts/forms disabled), re-asserted on the `/ui` delegate from **outside** the console's own CSP writers
-so a browser-active representation can never execute in the application origin.
+(no MIME re-sniff), and `Content-Security-Policy: default-src 'none'; sandbox; frame-ancestors 'none'`
+(an opaque origin with scripts/forms disabled, and no framing), re-asserted on the `/ui` delegate from
+**outside** the console's own CSP writers so a browser-active representation can never execute in the
+application origin. `frame-ancestors` is named in that policy rather than left to the API's security
+header floor because it takes **no fallback from `default-src`** — without it, the strictest policy the
+engine writes was the one response family carrying no framing decision at all (ASVS 3.4.6).
 
 ### Remote file — `Sftp(...)` / `Ftp(...)`
 
