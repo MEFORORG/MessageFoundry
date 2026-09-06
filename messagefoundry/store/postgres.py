@@ -1855,7 +1855,27 @@ class PostgresStore:
         Returns the number of values rewritten. Ported, not stubbed — Postgres supports rotation."""
         cipher = self._cipher
         if not isinstance(cipher, AesGcmCipher):
-            return 0  # identity cipher (no key) — nothing to rotate
+            # BACKLOG #1165 (ASVS 11.2.2). Two very different cases used to share this return,
+            # and the comment named only the harmless one. IdentityCipher means NO key is
+            # configured, so there is genuinely nothing to rotate and 0 is the truthful answer.
+            # Any OTHER non-AesGcmCipher -- today TransitCipher, whose keys live in Vault --
+            # HOLDS keys this loop cannot rewrite, and answering 0 there made
+            # `messagefoundry rotate-key` print "OK: re-encrypted 0 value(s) under the active
+            # key" and exit 0 having rotated nothing. A rotation that silently rotates nothing
+            # is precisely what 11.2.2's "keys replaceable with data re-encrypted" clause exists
+            # to prevent, and on a first deployment an operator would believe it.
+            #
+            # NotImplementedError deliberately: `messagefoundry rotate-key` already catches it,
+            # prints the message and exits 2, so the refusal reaches the operator as an error
+            # rather than as a success with a zero in it.
+            if not isinstance(cipher, IdentityCipher):
+                raise NotImplementedError(
+                    f"{type(cipher).__name__} cannot re-encrypt store values in place: its keys"
+                    " are held by the provider, not by this engine, so rotation happens at the"
+                    " provider. Reporting 0 rewritten values here would be indistinguishable"
+                    " from a completed rotation (BACKLOG #1165, ASVS 11.2.2)."
+                )
+            return 0  # identity cipher (no key) -- nothing to rotate
         # Active-format prefix through the active key's fingerprint (M9): `mfenc:v1:<kid>:` or, for a
         # v2-active cipher, `mfenc:v2:<alg>:<kid>:`. Built off the cipher (not a baked-in v1 prefix+keyid)
         # so a v2-active rotation matches v2 rows and the loop terminates.
