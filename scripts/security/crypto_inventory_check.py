@@ -385,12 +385,24 @@ INVENTORY: dict[str, frozenset[str]] = {
     "messagefoundry/store/store.py": frozenset({"hashlib", "hmac", "messagefoundry.store.crypto"}),
     # BACKLOG #1178: `probe_tcp_reachable`, the reachability probe the socket destinations share for
     # `test_connection`, takes an optional `ssl_context` and dials with it. It BUILDS no context and
-    # imports `ssl` under TYPE_CHECKING only — the value is a pass-through it never dereferences —
-    # but this is where a caller's context is APPLIED to a probe socket, so it is a real site: the
-    # decision whether a connection test speaks the hop's own transport or a plaintext approximation
-    # of it is made here. Before #1178 the probe was unconditionally cleartext, so a tls=true MLLP
-    # destination tested a transport the operator never configured. `None` (the default) is the
+    # imports `ssl` under TYPE_CHECKING only. Registered anyway, and NOT routed through the
+    # bare-local escape this module's docstring offers, because the escape is for a call site that
+    # CARRIES inputs to a builder that decides — and this one decides.
+    #
+    # THE DECIDING LINE IS `server_hostname=host if ssl_context else None`: that conditional sets
+    # whether SNI and the hostname check happen at all, so the module holds a verification-posture
+    # decision rather than passing one through. Hiding the `ssl` name would hide exactly that
+    # conditional. Before #1178 the probe was unconditionally cleartext, so a `tls=true` MLLP
+    # destination tested a transport the operator never configured; `None` (the default) stays the
     # honest value for TCP and X12, which cannot speak TLS in any configuration.
+    #
+    # THE TEST TO APPLY AT THE NEXT SITE, because "it only passes a context through" is the argument
+    # that reaches for the escape: does this module DECIDE anything about the crypto, or only carry
+    # inputs to something that does? The SMTP cells carry — `build_smtp_tls_context` decides for all
+    # three, which is why exactly one file is registered for them and the `pipeline/` call sites stay
+    # `ssl`-free. A module holding a conditional that changes verification behaviour is the opposite
+    # case, and taking the escape there manufactures the #1164 state deliberately: not undocumented
+    # but UNSEEN, which is the one state a green cannot report.
     "messagefoundry/transports/base.py": frozenset({"ssl"}),
     # ADR 0025: the DICOM C-STORE SCP's server SSLContext (Phase 1) + the C-STORE SCU's client SSLContext
     # (Phase 2) for DICOM-over-TLS (the MLLP inbound/outbound posture).
