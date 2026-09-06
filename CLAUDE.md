@@ -611,15 +611,29 @@ new PySide6 operator surfaces; and do **not** import PySide6 or FastAPI inside t
 
   **THE WARNING SIGN (U+26A0) IS NOT A SIXTH HOLDOUT — owner-ruled 2026-08-14, "not sanctioned".** It
   is in neither `_CLOSED` nor `_OPEN`, so `parse_items` ignores it and it carries no status semantics
-  anywhere; it is decoration, which the rule above forbids outright. **The measured population is
-  recorded here so nobody re-derives the false zero that stalled this question once already: 496
-  occurrences across 80 files** at `ae76b9f9` — 447 under `docs/` (121 in `BACKLOG.md`, 93 in
-  `BACKLOG-CLOSED.md`, 35 in `docs/adr/`), 10 in `tests/`, 4 in `ide/`, 3 in engine source, and **zero
-  in `scripts/`, in the web console, and in this file**. Retiring them is **BACKLOG #1265**, a filed
-  migration — *not* a licence to start editing those 496 lines, and not a cp1252 hazard (the cp1252
-  gate covers `scripts/**/*.py`, which contains none of them). **Census this population only with the
-  ledger counts as a positive control** — the first attempt returned a false zero off a broken shell
-  escape, and a pattern that finds nothing anywhere is indistinguishable from a clean repo.
+  anywhere; it is decoration, which the rule above forbids outright. Retiring it is **BACKLOG #1265**,
+  a filed migration — *not* a licence to start editing the lines that remain, and not a cp1252 hazard
+  (the cp1252 gate covers `scripts/**/*.py`, which contains none of them).
+
+  **The measured population is recorded here so nobody re-derives the false zero that stalled this
+  question once already. Censused over git-tracked files at `172b1327c`: 496 occurrences across 75
+  files, and 479 across 70 once #1265's first slice landed.** That slice was the five shipped operator
+  docs — `SECURITY.md`, `PHI.md`, `INSTALL-GUIDE.md`, `DEPLOYMENT.md`, `CONNECTIONS.md` — now at zero
+  and pinned there by `tests/test_operator_docs_no_warning_sign.py`. What is left: 430 under `docs/`
+  (127 in `BACKLOG.md`, 93 in `BACKLOG-CLOSED.md`, 38 in `docs/adr/`), 26 in `harness/`, 10 in
+  `tests/`, 4 in `ide/`, 3 in engine source, 2 in the web console, 4 across repository-root and
+  `.github/` files, and **zero in `scripts/` and in this file**. Those buckets sum to the total; the
+  filed table's did not.
+
+  **Two rows of the filed table were instrument errors, both SDS-3.8.** It read the web console as
+  zero by counting `packaging/`; the console's source is `messagefoundry_webconsole/`, which carries
+  **2**. And it had no `harness/` row at all, so **26** occurrences sat outside every bucket while the
+  buckets still printed a confident total.
+
+  **Census this population only with the ledger counts as a positive control** — the first attempt
+  returned a false zero off a broken shell escape, and a pattern that finds nothing anywhere is
+  indistinguishable from a clean repo. `docs/BACKLOG.md` at 127 and `BACKLOG-CLOSED.md` at 93 are that
+  control: an instrument that cannot find those proves nothing by returning zero anywhere else.
 
   **When you must read that alphabet, import `parse_items` from `backlog_status_check.py`. Never
   re-derive it.** It *defines* item status — the banner block ends at the first line that is neither
