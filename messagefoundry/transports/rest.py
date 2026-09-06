@@ -66,6 +66,7 @@ from messagefoundry.transports.base import (
     encode_wire_body,
     register_destination,
 )
+from messagefoundry.transports.bounded_read import read_bounded, read_bounded_text
 from messagefoundry.transports.signing import MessageSigner, signer_from_destination
 
 __all__ = [
@@ -1497,7 +1498,9 @@ class RestDestination(DestinationConnector):
             raise
         try:
             with self._opener.open(req, timeout=self.timeout) as resp:
-                resp.read()
+                # ASVS 15.2.2: the probe body is discarded, but an unbounded drain would let a
+                # reachability check be turned into a memory exhaustion.
+                read_bounded(resp, connector=f"REST {_redact_url(self.url)} probe")
         except urllib.error.HTTPError as exc:
             if exc.code in (401, 403):
                 raise DeliveryError(
@@ -1577,7 +1580,11 @@ class RestDestination(DestinationConnector):
                 # Read the body (drains the connection for clean close; returned for capture). 2xx ⇒
                 # delivered. Decoding a drained body is cheap, so this stays byte-identical when capture
                 # is off (the worker just ignores the return).
-                body = resp.read().decode(self.encoding, errors="replace")
+                # ASVS 15.2.2: bounded on the socket read, so the drain cannot be turned into an
+                # unbounded buffer by a partner that answers a POST with an arbitrarily large body.
+                body = read_bounded_text(
+                    resp, connector=f"REST {_redact_url(self.url)}", encoding=self.encoding
+                )
                 status = int(getattr(resp, "status", 200))
                 # #154: capture only the allow-listed response headers (empty allow-list → {}).
                 headers = capture_response_headers(

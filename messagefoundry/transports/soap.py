@@ -74,6 +74,11 @@ from messagefoundry.transports.base import (
     encode_wire_body,
     register_destination,
 )
+from messagefoundry.transports.bounded_read import (
+    ResponseTooLargeError,
+    read_bounded,
+    read_bounded_text,
+)
 
 # Reuse REST's hardened HTTP plumbing — same transports/ package, same no-redirect + TLS posture.
 from messagefoundry.transports.rest import (
@@ -768,7 +773,10 @@ class SoapDestination(DestinationConnector):
         )
         try:
             with self._opener.open(req, timeout=self.timeout) as resp:
-                resp.read()
+                # ASVS 15.2.2: the HEAD probe body is discarded, but an unbounded drain would let a
+                # reachability check be turned into a memory exhaustion. Unlike the length gate this
+                # method deliberately omits, this bound CAN fire: the peer chooses the body.
+                read_bounded(resp, connector=f"SOAP {_redact_url(self.url)} probe")
         except urllib.error.HTTPError as exc:
             if exc.code in (401, 403):
                 raise DeliveryError(
@@ -827,7 +835,11 @@ class SoapDestination(DestinationConnector):
             raise
         try:
             with self._opener.open(req, timeout=self.timeout) as resp:
-                body = resp.read().decode(self.encoding, errors="replace")
+                # ASVS 15.2.2: bounded on the socket read. One SOAP response envelope sits far under
+                # the 16 MiB ceiling, so this refuses only a peer that is broken or hostile.
+                body = read_bounded_text(
+                    resp, connector=f"SOAP {_redact_url(self.url)}", encoding=self.encoding
+                )
                 status = int(getattr(resp, "status", 200))
                 # #154: capture only the allow-listed response headers (empty allow-list → {}).
                 headers = capture_response_headers(
@@ -836,7 +848,23 @@ class SoapDestination(DestinationConnector):
                 return body, status, headers
         except urllib.error.HTTPError as exc:
             try:
-                body = exc.read().decode(self.encoding, errors="replace")
+                # ASVS 15.2.2: the fault body is bounded too. It is only ever read to CLASSIFY the
+                # non-2xx, so an over-cap one is logged and dropped rather than raised: the delivery
+                # already fails below on the status, and raising here would swap a classified
+                # failure for an unclassified one.
+                body = read_bounded_text(
+                    exc,
+                    connector=f"SOAP {_redact_url(self.url)} fault body",
+                    encoding=self.encoding,
+                )
+            except ResponseTooLargeError:
+                logger.warning(
+                    "SOAP %s returned an HTTP %s fault body over the response bound; "
+                    "classifying on the status alone",
+                    _redact_url(self.url),
+                    exc.code,
+                )
+                body = ""
             except Exception:  # noqa: BLE001 - a body we can't read just becomes status-only
                 body = ""
             # A non-2xx status: _classify_soap always returns a failure here (it returns None only on
