@@ -222,7 +222,7 @@ _NOT_A_SECRET: dict[str, str] = {
     "tls_key_file": "filesystem path to the TLS key — not the key material",
     "client_key_file": "filesystem path to the mTLS client key — not the key material",
     "signing_key": "filesystem path to the Direct S/MIME signing key — not the key material",
-    "ws_password_type": "WS-Security password *mode*: 'text' | 'digest'",
+    "ws_password_type": "WS-Security password *mode*: 'text' ('digest' retired, #1171)",
     "odbc_user_key": "the ODBC keyword the username is emitted under (e.g. 'UID')",
     "odbc_password_key": "the ODBC keyword the password is emitted under (e.g. 'PWD')",
     # This IS secret-carrying, but the Soap() factory desugars it into flat body_secret_value_<i>
@@ -314,7 +314,7 @@ def test_ws_security_and_direct_credentials_are_redacted() -> None:
             "ws_password": "SEKRET-WS-PW",
             "client_key_password": "SEKRET-KEYPASS",
             "signing_key_password": "SEKRET-SIGNPASS",
-            "ws_password_type": "digest",
+            "ws_password_type": "text",
             "client_key_file": "/etc/mf/client.key",
         }
     )
@@ -322,7 +322,7 @@ def test_ws_security_and_direct_credentials_are_redacted() -> None:
     assert out["ws_password"] == "***"
     assert out["client_key_password"] == "***"
     assert out["signing_key_password"] == "***"
-    assert out["ws_password_type"] == "digest"  # a mode, not a credential
+    assert out["ws_password_type"] == "text"  # a mode, not a credential
     assert out["client_key_file"] == "/etc/mf/client.key"  # a path, not the key
     assert "SEKRET" not in json.dumps(out)
 

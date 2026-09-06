@@ -62,7 +62,7 @@ _BEARER = re.compile(
 # There the header label guarantees the line is an authorization header; here nothing does, and both
 # other words are ordinary configuration vocabulary in this codebase — ``transports/http_auth.py``
 # raises "oauth2_auth_style must be 'basic' or 'post'" and ``transports/soap.py`` raises
-# "ws_password_type must be 'text' or 'digest'". A token that is also ordinary vocabulary discriminates
+# "ws_password_type must be 'text'". A token that is also ordinary vocabulary discriminates
 # nothing, so matching on it would redact operator diagnostics and buy no confidentiality: a labelled
 # "Authorization: Basic <cred>" is already carried by ``_BEARER``.
 _AUTH_SCHEME = re.compile(r"(?i)\b(bearer)\s+['\"]?[^\s'\",;]{4,}")
