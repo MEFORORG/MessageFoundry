@@ -214,3 +214,45 @@ def test_every_profile_claim_is_attributed_to_profile(tmp_path: Path, claim: str
     detail = _detail(tmp_path, oidc_username_claim=f'"{claim}"')
     assert "username_claim_missing" not in detail
     assert "not an OIDC Core standard claim" not in detail
+
+
+# --- the issuer/endpoint split (#1158, ASVS 10.2.2) ---------------------------------------------
+
+
+def test_an_endpoint_on_a_different_host_from_the_issuer_fires(tmp_path: Path) -> None:
+    """Nothing else relates the four pinned OIDC settings to each other. `_require_oidc_fields`
+    checks each independently for https and for allow-list membership, so a configuration that
+    authorizes the browser at one host and POSTs the code, the PKCE verifier and the client secret
+    to another loads clean -- the shape RFC 9700 section 4.4.2 names."""
+    detail = _detail(
+        tmp_path,
+        oidc_token_endpoint='"https://tokens.example.invalid/token"',
+        oidc_allowed_endpoints='["idp.example.invalid", "tokens.example.invalid"]',
+    )
+    assert "oidc_token_endpoint=tokens.example.invalid" in detail
+    assert "idp.example.invalid" in detail
+
+
+def test_all_four_on_one_host_stays_quiet(tmp_path: Path) -> None:
+    """The discriminator. The base fixture puts every endpoint on the issuer's host, so a check
+    that reported the split unconditionally would fire here too."""
+    detail = _detail(tmp_path)
+    assert "oidc_issuer is hosted at" not in detail
+
+
+def test_the_split_is_reported_and_not_refused(tmp_path: Path) -> None:
+    """ADVISORY BY DESIGN, and the reason is the specification rather than caution. OIDC Discovery
+    makes the issuer an IDENTIFIER whose metadata may advertise endpoints on any host, so host
+    equality is not a property a conforming provider must have. Refusing on it would reject correct
+    configurations, which is why this asserts the config still LOADS while the note is emitted."""
+    result = _check_oidc_auth_params(
+        tmp_path,
+        service_config=_toml(
+            tmp_path,
+            oidc_jwks_uri='"https://keys.example.invalid/jwks"',
+            oidc_allowed_endpoints='["idp.example.invalid", "keys.example.invalid"]',
+        ),
+    )
+    assert result.ok is True and result.required is False and result.skipped is False
+    assert "settings did not load" not in result.detail
+    assert "oidc_jwks_uri=keys.example.invalid" in result.detail

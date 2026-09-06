@@ -1893,6 +1893,8 @@ def _check_oidc_auth_params(
     States the clean case out loud rather than going quiet — an absent line is indistinguishable
     from a check that did not run. Service-toml resolution is :func:`_check_alert_smtp_tls`'s,
     verbatim: these are ``[auth]`` settings, so ``load_config`` is the wrong reader."""
+    from urllib.parse import urlsplit
+
     from pydantic import ValidationError
 
     from messagefoundry.config.settings import load_settings
@@ -1982,6 +1984,45 @@ def _check_oidc_auth_params(
             f"[auth].oidc_acr_values requests {sorted(asked_acr - required_acr)}, which "
             f"[auth].oidc_required_acr_values does not enforce on the returned token"
         )
+
+    # #1158 / ASVS 10.2.2: report a pinned endpoint that does not share the issuer's host.
+    #
+    # ADVISORY AND NOT A REFUSAL, deliberately, and the reason is in the specification rather than in
+    # caution. OIDC Discovery makes the issuer an IDENTIFIER, and the metadata document it serves may
+    # advertise an authorization, token or JWKS endpoint on any host — so host equality is not a
+    # property a conforming provider has to have, and refusing on it would reject correct
+    # configurations. What the operator can usefully be told is that the split EXISTS, so they can
+    # confirm it is their provider's real topology and not a transcription error.
+    #
+    # Why it is worth reporting at all: `_require_oidc_fields` checks each of the four URLs
+    # independently for https and for membership in the operator's own `oidc_allowed_endpoints`, and
+    # nothing relates them to each other. On a first deployment an operator whose allow-list named two
+    # hosts could load a configuration that authorizes the browser at one host and POSTs the code, the
+    # PKCE verifier and the client secret to another, with the only issuer check running after that
+    # POST. RFC 9700 section 4.4.2 names that shape in terms: storing the authorization server's URL
+    # alone is not sufficient. Not attacker-selected, so this is config integrity, not a live path.
+    issuer_host = urlsplit(auth.oidc_issuer or "").hostname
+    if issuer_host:
+        split_hosts = sorted(
+            {
+                f"{name}={host}"
+                for name, host in (
+                    (
+                        "oidc_authorization_endpoint",
+                        urlsplit(auth.oidc_authorization_endpoint or "").hostname,
+                    ),
+                    ("oidc_token_endpoint", urlsplit(auth.oidc_token_endpoint or "").hostname),
+                    ("oidc_jwks_uri", urlsplit(auth.oidc_jwks_uri or "").hostname),
+                )
+                if host and host != issuer_host
+            }
+        )
+        if split_hosts:
+            notes.append(
+                f"[auth].oidc_issuer is hosted at {issuer_host!r} but {', '.join(split_hosts)} — "
+                f"legitimate for some providers, and worth confirming against your identity "
+                f"provider's own metadata, because nothing else relates these four settings"
+            )
 
     prompt = (auth.oidc_prompt or "").split()
     unknown_prompt = [p for p in prompt if p not in _OIDC_PROMPT_VALUES]
