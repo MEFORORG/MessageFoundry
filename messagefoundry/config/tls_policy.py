@@ -541,8 +541,24 @@ def harden_cipher_suites(ctx: ssl.SSLContext, *, connector: str) -> None:
     # So the verb is unsatisfiable BY OBSERVATION on this interpreter, not merely unimplemented. The
     # remedy available is the one already taken: constrain what an operator may CONFIGURE
     # (`validate_tls_ciphers` refuses CBC-SHA2 outright) and leave the inherited default's six suites
-    # as a recorded, owner-ratified interop decision. Retiring those six is an availability decision
-    # about hospital peers, which is an owner call and not this module's to make.
+    # in place.
+    #
+    # THAT RETENTION IS AN IN-CODE DECISION RECORDED ABOVE, AND ITS INTEROP PREMISE IS UNMEASURED.
+    # An earlier draft of this comment called it "owner-ratified", which was wrong and is retracted
+    # here rather than quietly deleted. No owner ruling on these six suites exists in this tree. Two
+    # real rulings sit close enough to borrow from by accident, and that is how the error was made:
+    # the STRICT ALLOW-LIST below carries an owner ruling of 2026-08-22, and the posture PRECEDENCE
+    # gradient in this module is owner-ratified under ADR 0153. Neither is about retaining a suite
+    # the interpreter default already enables.
+    #
+    # The interop half is unmeasured too. The rejection note above says real MLLP/DICOM hospital
+    # peers still speak these suites; no census is cited for that, here or anywhere this module can
+    # point at. What `harden_cipher_suites` actually measures is the SUITE-SET DELTA of a candidate
+    # `set_ciphers` string against the default -- a fact about two lists, not about any peer.
+    #
+    # So retiring the six is an owner call PRECISELY BECAUSE nobody has run that census, which is a
+    # stronger reason not to act unilaterally than a ruling would have been: it says what is missing
+    # and what would settle it. Run the peer census first; do not read this paragraph as a refusal.
     plaintext = sorted({str(c.get("name", "?")) for c in resolved if not _is_encrypting(c)})
     if plaintext:
         raise ValueError(
