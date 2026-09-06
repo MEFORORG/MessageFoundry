@@ -11330,10 +11330,12 @@ own verb; and a broken certificate, CA or hostname would pass a GREEN connection
 every delivery, because the probe never performed the handshake. **MLLP is the only socket destination
 with the mismatch** -- `tcp.py` and `x12.py` carry zero `ssl` references, so their cleartext probe is
 honest, and the DICOM SCU already associates its C-ECHO through the same `tls_args` as a C-STORE.
-**The MLLP CALL SITE IS UNLANDED and is the remaining half:** `transports/mllp.py` was held by another
-live session's uncommitted work and the collision gate refused the edit, so `MLLP()` is unchanged until
-one line passes `self._ssl` through. **The cell does not move on this** -- the partner-feed scope
-question and the remaining ungated data-layer hop sites are both untouched.
+**Both halves are landed:** the shared helper first, then the MLLP call site once the other session
+holding that file committed. The discriminating test is the cleartext-peer case -- a `tls=true`
+destination probing a plaintext peer must now FAIL, where before it reported the peer reachable; the
+two positive tests pass either way, because a TCP connect to a TLS listener returns cleanly on the
+client side. **The cell does not move on this** -- the partner-feed scope question and the remaining
+ungated data-layer hop sites are both untouched.
 ## 1179. research an honest pass for ASVS 12.3.3 -- internal-hop transport encryption when a certificate cannot be a shipped default
 
 > 🚧 **IN PROGRESS 2026-08-22 -- builder-1 lane**, banner written by the dispatcher: `BUILDER.md` puts banner flips outside a builder's lane and the lane-versus-broadcast expiry is ambiguous enough that two builders read it differently, so this seat writes it. Claimed via `claim.ps1`; the coord ledger and this banner are different artifacts with different writers. The 2026-08-20 pass is being applied in its own order -- scope correction first, then the shipped-surface refusal case, then the build. **Not a closure.**
