@@ -16,18 +16,47 @@ goes positive, and the run fails — instead of reporting a clean sweep of refus
 computed by this runner from its own request log and the LIVE route table; nothing is parsed out of
 another tool's human-readable summary.
 
-THREE PASSES, over the gated HTTP rows derived by ``scripts/security/route_gates.py``:
-  NEGATIVE  every gated operation, twice: no credential, and an invalid bearer. Not-401 is a finding.
-  REACH     every gated GET, with the administrator bearer. GET-ONLY IS A SAFETY RULE, NOT LAZINESS —
-            a reach probe carries a VALID privileged token and would really execute a mutating
-            endpoint. Reached = the status is outside {401, 403, 429}.
-  BFLA      every gated GET whose permission set the low-privilege role does NOT hold, with the viewer
-            bearer. Refused = {401, 403, 429}; anything else is a finding, INCLUDING 404 — the path
-            template matched, so a 404 means the caller got past authorization into resource lookup.
+FIVE PASSES, over the gated HTTP rows derived by ``scripts/security/route_gates.py``:
+  NEGATIVE     every gated operation, twice: no credential, and an invalid bearer. Not-401 is a
+               finding. Always covered every verb — an unauthenticated probe executes nothing.
+  REACH        every gated GET, with the administrator bearer. Reached = a status outside
+               {401, 403, 429}.
+  BFLA         every gated GET whose permission set the low-privilege role does NOT hold, with the
+               viewer bearer. Refused = {401, 403, 429}; anything else is a finding, INCLUDING 404 —
+               the path template matched, so a 404 means the caller got past authorization into
+               resource lookup.
+  WRITE BFLA   the same rule over the non-GET candidate rows.
+  WRITE REACH  every gated non-GET row, with the administrator bearer. Runs LAST, so no earlier
+               measurement can depend on state a write probe left behind.
+
+WHY THE WRITE PASSES ARE SAFE, since a probe carrying a VALID privileged token really does execute:
+
+  NO BODY IS EVER SENT. Not an absent one by accident and not a plausible one on purpose — a
+  plausible body maximises execution, which is the opposite of what a probe wants. FastAPI solves a
+  route's DEPENDENCIES (where every ``require*()`` gate lives) BEFORE it validates the body and the
+  path/query parameters, so a gate's 401/403 always beats a 422. That ordering is what makes the
+  empty probe sound rather than lucky: wherever a route declares a body or a required parameter, the
+  request stops at validation with the authorization question already answered, and the handler never
+  runs. Measured against the shipped app: of 55 gated non-GET rows, 27 stop at 422 and 20 execute a
+  handler — 11 of those answering 404 because the path placeholder names nothing that exists.
+
+  THE TARGET IS DISPOSABLE. An empty store in a temporary directory, an empty ``Registry``, no config
+  dir, destroyed when the sweep returns (``dast_target``). An executed handler has nothing real to act
+  on, and nothing it does outlives the run.
+
+  A PROBE MAY DESTROY THE SESSION IT IS PROBING WITH, and that is not hypothetical: ``POST
+  /auth/logout`` was measured revoking the administrator session mid-pass, after which 44 of the 55
+  rows answered 401 and would have been counted as refused — 44 fabricated findings from one real
+  side effect. The answer is NOT a hand-kept skip list, which rots the day a route lands: the sweep
+  re-checks the probing identity's session after EVERY write probe and mints a fresh one when a probe
+  destroyed it. Row order therefore cannot change the result, and a NEW self-destroying route lands in
+  the receipt as a named rebuild instead of as a wall of phantom findings. Rebuilds are capped, and a
+  re-mint that fails is a fail-closed exit 2 — never a clean-looking wall of refusals.
 
 EXIT CONTRACT: 0 = clean AND a liveness receipt naming how many units were EXAMINED; 1 = findings;
 2 = FAIL CLOSED, could not measure (a coverage floor unmet, no gated operation derived, an unreadable
-policy, a target whose administrator session cannot reach a deep route, or ANY escape that stopped the
+policy, a target whose administrator session cannot reach a deep route, a write pass that could not
+keep a session alive, or ANY escape that stopped the
 sweep finishing — a transport failure mid-scan is the canonical one). A floor that is not met is 2,
 never 0, and a run that never measured must never borrow the FINDINGS code: CI reads exit 1 from a
 canary as proof the injected defect was detected, so a crash returning 1 would certify a detection
@@ -47,7 +76,7 @@ import argparse
 import asyncio
 import json
 import sys
-from collections.abc import Coroutine
+from collections.abc import Coroutine, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
@@ -62,7 +91,14 @@ if str(_ROOT) not in sys.path:
 
 from messagefoundry.auth.permissions import BUILTIN_ROLE_PERMISSIONS  # noqa: E402
 from scripts.security import route_gates  # noqa: E402
-from scripts.security.dast_target import DastTargetUnusable, dast_target  # noqa: E402
+from scripts.security.dast_target import (  # noqa: E402
+    ADMIN_USERNAME,
+    PREFLIGHT_PATH,
+    VIEWER_USERNAME,
+    DastTarget,
+    DastTargetUnusable,
+    dast_target,
+)
 
 #: The honesty boundary, held as ONE long line so it can be embedded verbatim in a markdown paragraph.
 #: It exists in exactly TWO places — here and docs/adr/0155 — and tests/test_dast_claims.py pins the
@@ -91,6 +127,11 @@ INVALID_BEARER = "dast-not-a-real-token"
 
 #: Statuses that mean "the caller was refused before the endpoint did any work".
 REFUSED = frozenset({401, 403, 429})
+
+#: FastAPI's status for a request that satisfied every dependency and then failed body or
+#: path/query validation. On a write probe it is the SAFE outcome: the authorization question was
+#: answered and the handler never ran.
+VALIDATION_STATUS = 422
 
 _PREFIX = "dast_auth_sweep"
 
@@ -158,6 +199,25 @@ def is_reached(status: int) -> bool:
     return not is_refused(status)
 
 
+def write_probe_outcome(status: int) -> str:
+    """How far a write probe got: ``"refused"``, ``"stopped-at-validation"`` or ``"executed"``.
+
+    This is the sweep's SIDE-EFFECT accounting, and it is deliberately separate from
+    :func:`is_reached` — which stays the single oracle for the authorization question. A reader of the
+    receipt must be able to see how many handlers a run actually executed, because that number is the
+    whole safety claim of the write passes.
+
+    Only 422 counts as stopped-at-validation. A 400 is left in ``"executed"`` even though FastAPI can
+    also produce one, because a handler is free to return 400 itself: on a claim about what a scan
+    EXECUTED, the honest error is to over-report execution rather than to under-report it.
+    """
+    if is_refused(status):
+        return "refused"
+    if status == VALIDATION_STATUS:
+        return "stopped-at-validation"
+    return "executed"
+
+
 def _finding(
     method: str, path: str, pass_name: str, observed: int, expected: str
 ) -> dict[str, Any]:
@@ -176,6 +236,57 @@ async def _probe(client: httpx.AsyncClient, method: str, url: str, token: str | 
     headers = {"Authorization": f"Bearer {token}"} if token is not None else {}
     response = await client.request(method, url, headers=headers)
     return response.status_code
+
+
+async def _write_pass(
+    client: httpx.AsyncClient,
+    rows: Sequence[route_gates.RouteRow],
+    *,
+    target: DastTarget,
+    username: str,
+    token: str,
+    placeholder: str,
+    max_rebuilds: int,
+    rebuilt: list[str],
+) -> list[tuple[route_gates.RouteRow, int]]:
+    """Probe ``rows`` with ``username``'s session, keeping that session alive across side effects.
+
+    THE PROBLEM THIS SOLVES, measured rather than imagined: ``POST /auth/logout`` answers a valid
+    administrator token with 200 and revokes the session. Every row probed after it then answers 401,
+    scores as refused, and lands as an unexplained-unreached finding. One real side effect, 44 false
+    ones, and the count that mattered — authorized reach — collapses to something a reader would read
+    as broken authorization.
+
+    So the session is re-checked after EVERY probe against the same deep route the bring-up preflight
+    uses, and re-minted the moment a probe destroys it. That keeps the pass INDEPENDENT OF ROW ORDER,
+    which is what makes the run repeatable, and it measures the self-destroying row instead of
+    skipping it. ``rebuilt`` collects those rows for the receipt — method and path template, the same
+    body-free shape as a finding.
+
+    A re-mint failure raises out of :func:`_login` as ``DastTargetUnusable`` (exit 2). Exceeding
+    ``max_rebuilds`` is the same class and is raised here: a target whose session cannot survive being
+    probed is one whose reach numbers cannot be credited, and grinding through a login per row would
+    report a number built on an unstable target rather than refusing to report one.
+    """
+    results: list[tuple[route_gates.RouteRow, int]] = []
+    for row in rows:
+        url = route_gates.concrete_path(row.path, placeholder)
+        status = await _probe(client, row.method, url, token)
+        results.append((row, status))
+
+        # The liveness probe is a plain GET on the preflight route, so it can never itself mutate
+        # anything, and it reuses is_refused() rather than carrying a second copy of the rule.
+        if is_refused(await _probe(client, "GET", PREFLIGHT_PATH, token)):
+            rebuilt.append(f"{row.method} {row.path}")
+            if len(rebuilt) > max_rebuilds:
+                raise DastTargetUnusable(
+                    f"the scan session was destroyed by {len(rebuilt)} write probe(s), over the "
+                    f"policy cap of {max_rebuilds} (most recently {row.method} {row.path}). A target "
+                    "that cannot keep a session alive while being probed cannot support a reach "
+                    "measurement, so this run measured nothing."
+                )
+            token = await target.relogin(username)
+    return results
 
 
 async def run_sweep(policy: dict[str, Any], *, canary: str | None = None) -> dict[str, Any]:
@@ -200,10 +311,20 @@ async def run_sweep(policy: dict[str, Any], *, canary: str | None = None) -> dic
         bfla_probes = 0
         bfla_violations = 0
 
+        write_rows = [r for r in gated if r.method != "GET"]
+        write_reached = 0
+        write_unreached_allowlisted = 0
+        write_bfla_probes = 0
+        write_bfla_violations = 0
+        write_outcomes = {"refused": 0, "stopped-at-validation": 0, "executed": 0}
+        rebuilt: list[str] = []
+        max_rebuilds = int(policy.get("max_write_session_rebuilds", 0))
+
         # Every gated row is a BFLA CANDIDATE when the low-privilege role does not hold its whole
-        # permission set. Only the GET subset is probed in increment 1 (see the module docstring), so
-        # the receipt reports the ratio instead of implying full BFLA coverage.
+        # permission set. Both the GET subset and the write subset are probed, so the receipt asserts
+        # the two add up to the candidate total rather than printing a ratio.
         bfla_candidates = [r for r in gated if not set(r.permissions) <= viewer_permissions]
+        write_bfla_candidates = [r for r in bfla_candidates if r.method != "GET"]
 
         async with httpx.AsyncClient(base_url=target.base_url, timeout=30.0) as client:
             for row in gated:
@@ -257,6 +378,58 @@ async def run_sweep(policy: dict[str, Any], *, canary: str | None = None) -> dic
                         _finding(row.method, row.path, "bfla", status, "401, 403 or 429")
                     )
 
+            # The two write passes run LAST, and BFLA before REACH. Nothing measured earlier can then
+            # depend on state a write probe left behind, and the low-privilege pass — which should be
+            # refused everywhere and so should execute nothing — runs before the privileged one that
+            # deliberately does execute.
+            for row, status in await _write_pass(
+                client,
+                write_bfla_candidates,
+                target=target,
+                username=VIEWER_USERNAME,
+                token=target.viewer_token,
+                placeholder=placeholder,
+                max_rebuilds=max_rebuilds,
+                rebuilt=rebuilt,
+            ):
+                write_bfla_probes += 1
+                if not is_refused(status):
+                    # A missing body cannot manufacture a false PASS here, which is what makes the
+                    # write pass sound: dependencies are solved BEFORE body validation, so a gate that
+                    # meant to refuse this caller would have answered 403 and never reached the 422.
+                    write_bfla_violations += 1
+                    findings.append(
+                        _finding(row.method, row.path, "bfla-write", status, "401, 403 or 429")
+                    )
+
+            for row, status in await _write_pass(
+                client,
+                write_rows,
+                target=target,
+                username=ADMIN_USERNAME,
+                token=target.admin_token,
+                placeholder=placeholder,
+                max_rebuilds=max_rebuilds,
+                rebuilt=rebuilt,
+            ):
+                write_outcomes[write_probe_outcome(status)] += 1
+                if is_reached(status):
+                    write_reached += 1
+                elif (row.method, row.path) in allowlisted:
+                    write_unreached_allowlisted += 1
+                else:
+                    unreached_unexplained += 1
+                    findings.append(
+                        _finding(
+                            row.method,
+                            row.path,
+                            "authorized-reach-write",
+                            status,
+                            "a status outside {401,403,429} for the administrator identity, or an "
+                            "entry in the policy's unreachable_allowlist with a reason",
+                        )
+                    )
+
         return {
             "independence_notice": INDEPENDENCE_NOTICE,
             "target_base_url": target.base_url,
@@ -276,6 +449,16 @@ async def run_sweep(policy: dict[str, Any], *, canary: str | None = None) -> dic
             "bfla_probes": bfla_probes,
             "bfla_violations": bfla_violations,
             "bfla_candidate_rows_total": len(bfla_candidates),
+            "write_rows": len(write_rows),
+            "write_reached": write_reached,
+            "write_unreached_allowlisted": write_unreached_allowlisted,
+            "write_bfla_probes": write_bfla_probes,
+            "write_bfla_violations": write_bfla_violations,
+            "write_bfla_candidate_rows_total": len(write_bfla_candidates),
+            "write_probe_outcomes": dict(write_outcomes),
+            "write_session_rebuilds": len(rebuilt),
+            # Method + path template only, the same body-free shape as a finding.
+            "write_session_rebuild_rows": list(rebuilt),
             "findings": findings,
             "canary": canary,
         }
@@ -297,6 +480,13 @@ def evaluate(receipt: dict[str, Any], policy: dict[str, Any]) -> tuple[int, list
         "min_negative_probes": int(receipt.get("negative_probes", 0)),
         "min_get_rows_reached": int(receipt.get("reached", 0)),
         "min_bfla_probes": int(receipt.get("bfla_probes", 0)),
+        # The write passes carry their own floors for the same reason the GET ones do: a deny-by-
+        # default API rewards a scanner that measures nothing, and a write pass that quietly stopped
+        # probing would otherwise report zero findings and read as clean. An ABSENT count reads as 0
+        # here and breaches the floor, which is the point — fail closed means the floor bites on a
+        # pass that did not run at all, not only on one that ran short.
+        "min_write_rows_reached": int(receipt.get("write_reached", 0)),
+        "min_write_bfla_probes": int(receipt.get("write_bfla_probes", 0)),
     }
 
     if observed["min_gated_http_rows"] == 0:
@@ -333,11 +523,23 @@ def evaluate(receipt: dict[str, Any], policy: dict[str, Any]) -> tuple[int, list
             "A route with no require*() gate is reachable by anyone."
         )
 
+    # A run whose session kept being destroyed measured a target moving underneath it. The cap is
+    # enforced inside the pass too (it stops there rather than grinding out a login per row); this is
+    # the receipt-side half, so a receipt read on its own reaches the same verdict.
+    rebuilds = int(receipt.get("write_session_rebuilds", 0))
+    max_rebuilds = int(policy.get("max_write_session_rebuilds", 0))
+    if rebuilds > max_rebuilds:
+        fatal.append(
+            f"{rebuilds} write probe(s) destroyed the scan session, over the cap of {max_rebuilds}: "
+            f"{receipt.get('write_session_rebuild_rows', [])}. Reach measured against a session that "
+            "kept dying cannot be credited."
+        )
+
     max_unexplained = int(policy.get("max_unexplained_unreached", 0))
     unexplained = int(receipt.get("unreached_unexplained", 0))
     if unexplained > max_unexplained:
         errors.append(
-            f"{unexplained} gated GET operation(s) refused the ADMINISTRATOR identity and are not in "
+            f"{unexplained} gated operation(s) refused the ADMINISTRATOR identity and are not in "
             "the policy's unreachable_allowlist. Either authorization is wrong, or a wall (MFA, "
             "step-up, a limiter) re-armed and this run measured far less than it appears to."
         )
@@ -354,22 +556,29 @@ def evaluate(receipt: dict[str, Any], policy: dict[str, Any]) -> tuple[int, list
     canary = receipt.get("canary")
     if canary is not None:
         canary_floors = policy.get("canary_floors", {})
-        if canary == "open-auth":
-            got, floor_name = (
-                int(receipt.get("negative_non_401", 0)),
-                ("open-auth_min_negative_findings"),
-            )
-        else:
-            got, floor_name = int(receipt.get("bfla_violations", 0)), "bfla_min_violations"
-        floor = canary_floors.get(floor_name)
-        if floor is None:
-            fatal.append(f"the policy declares no canary floor {floor_name!r}")
-        elif got < int(floor):
-            fatal.append(
-                f"canary {canary!r} produced {got} finding(s), below the floor of {floor}. The "
-                "injected defect was not detected as expected — the sweep's detection is NOT "
-                "demonstrated, so nothing this run reports can be credited."
-            )
+        # Every DETECTOR the sweep carries needs its own canary floor, or it can go blind while a
+        # sibling pass keeps the canary red. The bfla canary therefore floors the GET violations and
+        # the WRITE violations separately: with one combined number, a write pass that stopped
+        # probing entirely would still clear a floor the GET pass alone satisfies.
+        counted: list[tuple[str, int]] = (
+            [("open-auth_min_negative_findings", int(receipt.get("negative_non_401", 0)))]
+            if canary == "open-auth"
+            else [
+                ("bfla_min_violations", int(receipt.get("bfla_violations", 0))),
+                ("bfla_min_write_violations", int(receipt.get("write_bfla_violations", 0))),
+            ]
+        )
+        for floor_name, got in counted:
+            floor = canary_floors.get(floor_name)
+            if floor is None:
+                fatal.append(f"the policy declares no canary floor {floor_name!r}")
+            elif got < int(floor):
+                fatal.append(
+                    f"canary {canary!r} produced {got} finding(s) against {floor_name}, below the "
+                    f"floor of {floor}. The injected defect was not detected as expected — the "
+                    "sweep's detection is NOT demonstrated, so nothing this run reports can be "
+                    "credited."
+                )
 
     if fatal:
         return 2, fatal + errors
@@ -417,8 +626,11 @@ def receipt_lines(receipt: dict[str, Any], policy: dict[str, Any], verdict: str)
             ("min_negative_probes", receipt.get("negative_probes", 0)),
             ("min_get_rows_reached", receipt.get("reached", 0)),
             ("min_bfla_probes", receipt.get("bfla_probes", 0)),
+            ("min_write_rows_reached", receipt.get("write_reached", 0)),
+            ("min_write_bfla_probes", receipt.get("write_bfla_probes", 0)),
         )
     )
+    outcomes = receipt.get("write_probe_outcomes", {})
     anonymous_ok = len(receipt.get("ungated_routes", [])) and {
         (str(r["method"]).upper(), str(r["path"])) for r in receipt["ungated_routes"]
     } == {_key(e) for e in policy.get("anonymous_allowlist", [])}
@@ -443,10 +655,21 @@ def receipt_lines(receipt: dict[str, Any], policy: dict[str, Any], verdict: str)
         "operations answered outside {401,403,429} with the administrator token",
         f"unreached -- {receipt.get('unreached_allowlisted')} allowlisted; unexplained "
         f"{receipt.get('unreached_unexplained')}",
-        f"BFLA -- {receipt.get('bfla_probes')} of {receipt.get('bfla_candidate_rows_total')} "
-        f"candidate rows probed (GET only, increment 1); "
+        f"BFLA -- {int(receipt.get('bfla_probes', 0)) + int(receipt.get('write_bfla_probes', 0))} of "
+        f"{receipt.get('bfla_candidate_rows_total')} candidate rows probed "
+        f"({receipt.get('bfla_probes')} GET + {receipt.get('write_bfla_probes')} write); "
         f"{int(receipt.get('bfla_probes', 0)) - int(receipt.get('bfla_violations', 0))}/"
-        f"{receipt.get('bfla_probes')} refused",
+        f"{receipt.get('bfla_probes')} GET refused, "
+        f"{int(receipt.get('write_bfla_probes', 0)) - int(receipt.get('write_bfla_violations', 0))}/"
+        f"{receipt.get('write_bfla_probes')} write refused",
+        f"write reach -- {receipt.get('write_reached')}/{receipt.get('write_rows')} gated non-GET "
+        "operations answered outside {401,403,429} with the administrator token; "
+        f"{receipt.get('write_unreached_allowlisted')} allowlisted",
+        f"write side effects -- {outcomes.get('refused', 0)} refused, "
+        f"{outcomes.get('stopped-at-validation', 0)} stopped at validation (422, before the handler), "
+        f"{outcomes.get('executed', 0)} executed a handler on the throwaway target; "
+        f"{receipt.get('write_session_rebuilds')} probe(s) destroyed the scan session and it was "
+        f"re-minted -- {receipt.get('write_session_rebuild_rows') or 'none'}",
         f"floors -- {floor_text} unexplained<="
         f"{policy.get('max_unexplained_unreached', 0)} "
         f"{'ok' if int(receipt.get('unreached_unexplained', 0)) <= int(policy.get('max_unexplained_unreached', 0)) else 'FAIL'}"
@@ -543,6 +766,8 @@ def main(argv: list[str] | None = None) -> int:
             ("min_negative_probes", receipt["negative_probes"]),
             ("min_get_rows_reached", receipt["reached"]),
             ("min_bfla_probes", receipt["bfla_probes"]),
+            ("min_write_rows_reached", receipt["write_reached"]),
+            ("min_write_bfla_probes", receipt["write_bfla_probes"]),
         )
     }
     receipt["floors"]["max_unexplained_unreached"] = {
