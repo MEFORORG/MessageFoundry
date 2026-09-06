@@ -8870,6 +8870,43 @@ That covers every startable topology, not just the loopback default. The one pos
 **UNTIL THE GATE IS GREEN the honest verdict is partial on a CORRECTED ground -- "enumerated but unpinned" -- not partial on this item's dead ground and not pass.** That correction is worth landing on its own. One dependency stated rather than assumed: whether a tracked, published document counts as operator-facing rests on a disclosure-classification policy that answers **public versus withheld**, not **received by an operator**, while packaging keeps `docs/` out of both sdist and wheel.
 
 ## 1136. research an honest pass for ASVS 6.3.2 -- a first-run bootstrap that leaves no enabled default account
+> **GUARD RULED 2026-09-06 (builder, under owner DELEGATION). NOT A CLOSURE and NOT A BUILD -- this
+> item stays OPEN.** The owner was asked to rule the provisioning command's refusal guard and
+> delegated the decision rather than taking it. Recorded here with its grounds so the next builder
+> inherits a ruling instead of re-deriving one, and so the delegation is visible rather than reading
+> as an owner ruling it was not.
+>
+> **THE GUARD ASKS WHETHER AN ENABLED ADMINISTRATOR EXISTS, NOT WHETHER THE USER TABLE IS EMPTY.**
+> The 2026-08-20 research inherited `_ensure_bootstrap_admin`'s `count_users() == 0` test on the
+> stated ground that reusing it leaves the authority bound unchanged. The 2026-09-04 pass measured
+> that this is unsafe, and that what it fails at is **this item's own named risk**: `_upsert_ad_user`
+> calls `create_user` and assigns no role anywhere in its body, so one completed directory sign-in
+> leaves `count_users() == 1`, an empty role list and no administrator -- after which an empty-table
+> guard declines forever. A stranded install, reached entirely through shipped code.
+>
+> **THE WIDER BOUND GRANTS NOTHING TO A NETWORK ATTACKER**, which is why it is affordable. It is the
+> same host-access boundary `admin-unlock` already ships on, and that command's own docstring argues
+> exactly this. Filesystem authority over the store is held by every operator who installs the
+> service and by nobody reaching it over the network.
+>
+> **IT ALSO MAKES THE COMMAND A STANDING RECOVERY PATH whenever every administrator is lost, and that
+> is a FEATURE rather than a leak** -- it is #1236's subject, and the alternative is an install with
+> no way in, which is what this row exists to avoid creating.
+>
+> **TWO CONSTRAINTS THE BUILD STILL CARRIES, unchanged by this ruling.** The unattended-install
+> escape hatch must be refused EXPLICITLY: no `--password`, no `--password-file`, because either
+> lands a credential in argv or on disk, which is the shape [ADR 0034](adr/0034-static-analysis-triage-policy-accepted-risk-register.md)
+> accepted a risk for and this redesign exists to remove. And the PHI security-notice deliverability
+> gate stays fail-closed on a zero-user table; only its message changes, to name the command.
+>
+> **WHAT THIS RULING DOES NOT DO.** It does not make the redesign smaller. `.initialize()` still has
+> 197 call sites across 64 files, the store protocol and three backends still hardcode the `disabled`
+> column, and **the ADR this item has owed since 2026-09-04 is still unfiled**. The guard was one
+> open question among several; the others stand. No code was written for this item.
+>
+> Score and status unchanged, so the ranked table is deliberately not edited. Closing act stays
+> `scorecard-rescore`.
+
 
 > 🔢 **Re-scored 2026-08-20 -> P1.** Value **8/10** · Difficulty **6/10** · _big bet_. Unchanged at the shipped default: _ensure_bootstrap_admin creates a live account named admin holding Administrator with no disabled argument, and the expiry default is still 72 hours, so neither arm of the verb holds at creation. Difficulty 6 for a first-run redesign spanning the auth service, the owner-only credential file, a CLI or console claim step and the headless NSSM restart path, with the item's own named risk of stranding an install with no way in. _(was 8/10 · 6/10.)_
 > Research: done 2026-08-20
