@@ -623,6 +623,42 @@ def test_the_ingest_row_agrees_with_the_poll_and_dicom_signatures() -> None:
         )
 
 
+def test_the_ingest_row_does_not_generalise_the_toml_surface_past_x12() -> None:
+    """The row claimed the code-first AND TOML surfaces both express the pacing keys "across all
+    four named factories". For ``X12`` the second half was false, and it was false for a reason the
+    row's own sibling paragraph already gave: ``_TRANSPORTS`` carries no ``x12`` key, so NO X12
+    setting is expressible in ``connections.toml``.
+
+    Derived from the loader map, not from the retired wording, so this flips by itself the day the
+    transport is added: add ``x12`` to ``_TRANSPORTS`` and the row is required to stop carving it out.
+    """
+    row = _ingest_row()
+    code_first = [
+        f
+        for f in ("MLLP", "Tcp", "X12", "Http")
+        if "max_messages_per_second" in inspect.signature(getattr(wiring, f)).parameters
+    ]
+    toml_reachable = [f for f in code_first if f.lower() in _TRANSPORTS]
+    assert code_first, "no listen factory takes the pacing keys any more; re-derive this guard"
+
+    if len(toml_reachable) < len(code_first):
+        missing = sorted(set(code_first) - set(toml_reachable))
+        assert "the code-first and the TOML surface both express them" not in row, (
+            f"{missing} take the pacing keys code-first but have no connections.toml row, so the "
+            "ingest row may not claim both surfaces express them across all four factories"
+        )
+        for factory in missing:
+            assert factory in row, (
+                f"{factory} is unreachable from connections.toml; the ingest row must name it rather "
+                "than let a reader generalise from the factories that are reachable"
+            )
+    else:
+        assert "three of the four" not in row, (
+            "every pacing factory now has a connections.toml row, so the row must stop carving one "
+            "out of the TOML claim"
+        )
+
+
 def test_the_ingest_row_still_states_the_shipped_defaults_in_both_directions() -> None:
     """The two bounds ship OPPOSITE ways, and a row that stated only one would mislead either way.
 
