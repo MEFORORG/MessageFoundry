@@ -7684,6 +7684,35 @@ substance held on both.** The file-family call site is at `transports/remotefile
 in the same run is the file family itself: a probe finding the check absent on all six sources would
 be broken, not a finding, and it found it present on both file sources.
 
+
+**BUILT 2026-09-06: the conformance `profile` parameter, the last named subject on this row's
+proposed-work list that was still unbuilt. The item stays OPEN and this does NOT move the cell** -- the
+HL7 limb is untouched, `validation.strict` still ships False deliberately, and the method question this
+row names is still undecided.
+
+**DELETED, not enforced, and the branch was chosen on evidence rather than by default.** No
+conformance-profile type ships anywhere (the `class .*Profile` hits are harness load profiles; the
+"conformance profile" strings in `parsing/fhir/peek.py` and ADR 0022 are FHIR `meta.profile[]` URLs, a
+different concept), no ADR covers it, `docs/HL7-VALIDATION.md` never mentions it, and the feature is
+BACKLOG #78, re-scored twice to demand-gate. A RAISE was ruled out too: with zero callers the branch is
+dead by construction, and the signature would still advertise a keyword that does nothing.
+
+**The measurement, with its positive control:** `profile=` reaches `validate()` ZERO times, against 13
+for the sibling `expected_version=` in the same run. All 41 `profile=` hits tree-wide are harness load
+profiles and DR callbacks. The parameter was keyword-only, so no positional call could reach it.
+
+**The same false affordance existed one layer up and went with it.** `Validation.profile` was reachable
+from no authoring path -- `inbound()` never passed it, so `connections.toml` could not set it -- and
+nothing read it, yet its comment promised an operator that naming a conformance profile would do
+something. Removing it changes no construction: the model takes Pydantic's default `extra="ignore"`, so
+`Validation(profile=...)` was silently ignored before and is silently ignored now.
+
+**A docstring that was the source of the confusion is corrected:** `Validation` said `strict` runs
+"hl7apy **profile** validation". hl7apy does STRUCTURAL validation and takes no profile.
+
+**Five citations in this file quoted the removed parameter as evidence** that it is an accepted no-op.
+They went stale in the good direction -- the code got better and the fix deleted the line the citation
+quoted -- and `parsing/validate.py`'s `def validate(` has moved under the new comment block.
 ## 1110. research an honest pass for ASVS 2.2.3 -- whether cross-field reasonableness is shippable at all in a code-first engine, or belongs to the feed author
 
 > 🔢 **Re-scored 2026-08-20 -> P2.** Value **5/10** · Difficulty **5/10** · _fill-in_. The gap is unchanged: consistency.py:11-17 still describes itself as a compose-it-yourself toolkit, its only non-test importer is samples/consistency/validated_adt.py:27, and nothing on the shipped message path calls it. The research question is genuinely open and its most likely output is a negative finding, so worth-if-built is bounded by the clean existing workaround of a Handler composing the primitives; difficulty carries the HL7-general rule-set research plus, if a set exists, a check on the message hot path with tests. _(was 5/10 · 6/10.)_
@@ -7718,6 +7747,44 @@ be broken, not a finding, and it found it present on both file sources.
 
 **Proposed work, by subject, all unallocated:** the outbound peer-address rule, making the three silently-defaulting connectors refuse a missing host as the others already do; the IDE conditional-required premise correction, which must land whether or not the host fix does, because `ide/src/connectionForm.ts:129-131` justifies not blocking a save with "only the engine can judge the condition, and it already does so loudly at load" -- a compensating control resting on a premise the measurement above falsifies; a structured `requiredWhen` predicate emitted by the engine, replacing the bare word-match at `messagefoundry/config/connection_schema.py:53`, consumed and enforced by both IDE authoring paths and the loader; the API and web-console request-layer combination-rule census and declaration; and a combination-rule inventory MEASURED rather than prose-grepped, so the documentation requirement and this enforcement requirement rest on one enumerated set instead of two independent word-matches.
 
+
+**BUILT 2026-09-06: the outbound peer-address rule. The item stays OPEN and NOTHING claims the
+cell moves** -- this row is explicit that re-scoring on this would be the same trap wearing a
+config-plane hat.
+
+**THIS ROW'S OWN JUSTIFICATION IS FALSE AND IS CORRECTED HERE.** The text above says the INBOUND half
+of the rule is enforced while the outbound half is not, and calls that asymmetry what makes it a
+defect. Both halves are enforced, 350 lines apart in the same file: `config/wiring.py:4461` already
+refuses an ABSENT host for MLLP, TCP and X12 outbound, through the shared `build_outbound_connection`
+core, so both the code-first surface and `connections.toml` refuse. Measured through the TOML loader,
+which is the GUI's own save target.
+
+**WHAT IS GENUINELY UNGUARDED AT EVERY LAYER IS A BLANK HOST, and nobody had named it.** Wiring tests
+`settings.get("host") is None`, so `host=""` passes it and the connector kept the empty string. That is
+not loopback: measured on this machine, `getaddrinfo("")` resolves to the host's own LAN interfaces, so
+on a first deployment a blank host would dial the engine's own box OFF-LOOPBACK -- and where the same
+engine runs a listener on that port the delivery would SUCCEED into its own intake rather than failing,
+surfacing as a misdelivered feed rather than a connection error. X12 was worse: its `str()` turned a
+`None` host into the literal hostname `"None"`.
+
+All three dialing destinations now refuse a missing, blank or non-string host at construction, matching
+`EmailDestination`, `DirectDestination` and `DicomScuDestination`. `build_check_registry` builds every
+deployed outbound, so the refusal fires at `check` and dry-run.
+
+**`wiring.py`'s `is None` test is left alone deliberately:** tightening it must stay a falsy test rather
+than an isinstance one, because `host=env(...)` puts a truthy `EnvRef` there.
+
+**Destination-versus-source was established per site from the enclosing class and its `register_*`
+call, not from line numbers.** The `s.get("host") or "127.0.0.1"` lines in `MLLPSource`, `TcpSource`
+and `X12Source` are untouched -- loopback is the correct default for a LISTENER bind -- and a source
+guard test pins that it still is.
+
+**Not done, and the reason is a premise rather than scope:** the IDE `connectionForm.ts` comment
+justifying not blocking a save says "only the engine can judge the condition, and it already does so
+loudly at load". That is TRUE today for outbound `mllp.host`, measured through the loader, so writing
+"your fix made this true" would have put a false attribution in the record. Worth its own row:
+`conditionallyRequired` derives from a bare word-match over comment prose, so the set it covers is
+whatever wording happens to match rather than a curated list.
 ## 1111. research an honest pass for ASVS 2.3.3 -- what a business-logic transaction boundary means where the approval gate commits before it executes
 
 > 🔢 **Re-scored 2026-08-20 -> P2.** Value **5/10** · Difficulty **3/10** · _fill-in_. The audit-record defect the item was filed on is fixed (approvals.py:141-157 plus :181-208), but the pinned verb is still unmet: a partially applied executor is now recorded 'failed' with its effect landed, which app.py:537-548 exhibits concretely because config_reload swaps the graph before its audit row is written. So the remainder is the item's real research question -- the correct boundary and whether the three operations are replay-safe -- rather than only an out-of-repo re-score (value 5, difficulty 3 for a bounded API-side decision plus its tests). _(was 6/10 · 5/10.)_
@@ -7754,6 +7821,37 @@ be broken, not a finding, and it found it present on both file sources.
 
 **Proposed work, by subject, all unallocated:** the approvals executor replay-safety and request-binding work, per executor, as the precondition for everything else; the approvals executor outcome contract with its startup reconciliation sweep, preserving the existing race guard; the config-reload success-reporting fix, since `messagefoundry/pipeline/engine.py:1598` swaps the live graph before `:1602`, `:1610` and `:1622` can raise, so a raise today reports a FAILED reload while the new graph is live and possibly already propagated; a composable write-transaction boundary on the Store protocol, proven on the server CI legs (`messagefoundry/store/base.py` exposes none -- measured zero against a four-hit positive control in the same file); wrapping the identity and authorization flows in it so an authorization change and its session revocation cannot land apart; DR activation and release recovery; and the sweep PERFORMED rather than asserted, recorded with its instrument and its false-negative limit stated.
 
+
+**BUILT 2026-09-06: the config-reload success-reporting fix, one named subject from this row's
+proposed-work list. The item stays OPEN and this does NOT move the cell** -- the approvals executor
+replay-safety, the store transaction boundary and DR activation recovery are all untouched, and this
+row records at least 14 further uncompensated flows in `auth/service.py` alone.
+
+**Each post-swap step was ASKED whether it could move before the swap**, rather than assuming none
+could:
+
+* the reference-set reconcile: NO. `_make_reference_runner` reads its specs through a lambda closing
+  over the live registry, so pre-swap it would materialise the OLD graph's reference sets and a reload
+  that ADDS a set would leave it unarmed. Moving it changes what it means.
+* the provenance fingerprint: YES, and it moved. `config_fingerprint_detail` is a pure offline fold
+  over the directory bytes and never reads the live graph. Moving it also narrows the gap between the
+  bytes `load_config` read and the bytes the reload is credited with, and puts the local import's
+  `ImportError` -- which `except OSError` never covered -- on the honest side of the swap.
+* the cluster version bump: NO. It TELLS other nodes to converge, so bumping first would announce a
+  config this node had not applied.
+
+What cannot move is now reported instead of swallowed, in three discriminable states: a raise means
+nothing was applied; applied with no failures is clean; applied WITH named failures means the graph is
+live and a step did not finish.
+
+**The operator-facing half landed in the same branch.** `POST /config/reload` and the dual-control
+executor both call `reload_detail`; `ReloadResult` carries `degraded` and `failures`; and the failed
+step names reach the AUDIT row as well as the response body, because the response goes to one caller
+once and the audit is what a later reader has.
+
+**Mutated three ways:** reverting the reference-sync guard, reporting the swap itself as degraded (the
+dishonest direction, caught by the pre-swap negative control), and moving the fingerprint back. Each
+reds a different test.
 ## 1112. research an honest pass for ASVS 2.3.4 -- a quota that holds across concurrent uploads and across engine shards at once
 
 > 🔢 **Re-scored 2026-08-20 -> P2.** Value **5/10** · Difficulty **5/10** · _fill-in_. Only the cross-shard limb remains and it is small: settings.py:461-466 records in shipped code that shards over one uploads_dir enforce one budget, so the remainder is an at-most N-1 file overshoot on a subsystem that is OFF on shipped defaults (uploads_dir default None, settings.py:442) and whose cell the owner already ruled holds at partial. Difficulty is the store-row-versus-advisory-lock decision plus a demonstrated two-shard concurrent-writer run. _(was 6/10 · 5/10.)_
@@ -7802,6 +7900,39 @@ be broken, not a finding, and it found it present on both file sources.
 **Disclosed by the building lane itself, unprompted, after its pull request was open.** *This is the store-test blind spot this project already knows about in another form -- a local run silently skips the server-database legs, so "the suite is green" and "the backend works" are different sentences.*
 
 **DO NOT READ THE GREEN SUITE AS COVERING THEM.** The remaining work is a reservation test that runs against Postgres and SQL Server, not a re-read of the SQLite one.
+
+**BUILT 2026-09-06: the `serve --shard` unified-store guard. The item stays OPEN and this does
+NOT move the cell** -- the remaining limb is a Postgres and SQL Server reservation test, which needs a
+server-DB rig.
+
+**THIS NARROWS; IT DOES NOT CLOSE, and the reason is that the two routes this row offers are NOT
+substitutes.** Neither subsumes the other:
+
+* A store-open single-writer lock structurally cannot see a LONE `serve --shard a` against a
+  multi-shard config. That is one writer, so nothing trips -- but `filter_registry_for_shard` arms
+  ADR 0073 lane ownership whenever the config declares more than one shard, so lanes owned by shards
+  nobody started would get no delivery consumer at all: ACKed at ingress, never delivered, nothing
+  reporting it. The entrypoint guard refuses that.
+* The entrypoint guard cannot see two plain `serve` processes on one SQLite file. There is no
+  engine-shard universe to refuse.
+
+**A WORSE UNGUARDED PATH WAS FOUND WHILE ENUMERATING AND IS NOT CLOSED HERE.** `Engine._owned_lanes`
+returns `None` when `registry.shard_id is None`, so an UNSHARDED second `serve` calls
+`reset_stale_inflight(owned=None)` -- documented as "every inflight row at startup is this node's own
+crash residue". On a first deployment a second plain `serve` against the same `--db` would re-pend
+every in-flight row store-wide, including a live sibling's. Recorded in the source and the test module
+so a green run cannot imply closure.
+
+**The enumeration ran with both controls in the same pass** -- the plain-`serve` store open was found
+and the supervisor correctly returned zero -- so the twelve-site result is a measurement rather than a
+pattern matching one spelling.
+
+**ONE PREMISE THIS ROW CARRIES IS FALSE AND IS CORRECTED.** "No advisory-locking precedent exists in
+the engine" rests on a six-token grep that still returns zero, but `messagefoundry/tray/instance.py` is
+a single-instance guard on a `Local\` named mutex via ctypes `CreateMutexW` (ADR 0113), which none of
+those tokens match. It is Windows-only and outside the engine packages, so the store-open lock still
+needs a POSIX arm and a stale-lock policy for the six admin CLIs that legitimately open the store. That
+is ADR-shaped and belongs in its own item.
 ## 1113. research an honest pass for ASVS 2.3.5 -- which flows in a PHI engine are high-value enough to demand a second approver, under a default that must not strand a single-operator site
 
 > 🔢 **Re-scored 2026-08-20 -> P2.** Value **5/10** · Difficulty **6/10** · _money pit_. The code matches the item's substance: the gate ships off, three operations are registered and all three are guarded at api/app.py:2236, :2730 and :2837, and the default approvable set names only two, so no user-administration and no PHI-export flow is approvable in any configuration. Value stays mid-band because the consequence is a narrow opt-in control gap with no first-deployment product effect; difficulty is 6 because an honest pass most likely means widening the registry across API, settings, audit and console while resolving the self-approval availability cost at api/approvals.py:120. _(was 5/10 · 6/10.)_
@@ -7841,6 +7972,36 @@ be broken, not a finding, and it found it present on both file sources.
 
 **OWNER RULING 2026-08-22 -- the verdict stands; both load-bearing clauses are amended.** The re-scoping found **13 distinct client call sites yielding 6 distinct shipped defects**, against the 3 the earlier pass recorded, and **1 of 6 built-in roles reachable by 3 assignment paths**. The scope-out reasoning survives intact and both dishonest moves stay dishonest, so the verdict does not move. But the ruling turns on exactly two sentences and **both are measurably narrower than the code**. First, dual control is honoured on the console only in the sense that it **stops** you, not that it **works** there: there are zero release callers and no cookie on the JSON API. Second, the second approver is not a second operator but a **second full administrator**, minted most cheaply by mapping a directory group, and asked for **less credential proof than the requester was**. Both sentences are corrected in place, because a later ruling would otherwise inherit them as descriptions of a working mechanism.
 
+
+**BUILT 2026-09-06 -- the "fix them regardless of what the verdict does" half of this row.
+The item stays OPEN and NOTHING here claims the cell moves:** 2.3.5 is an owner-ruled permanent
+`partial`, reaffirmed 2026-08-22.
+
+**All three shipped client defects this row names are fixed together, because three behaviours for one
+wire state was the underlying defect.** The engine answers 202 with a `PendingApprovalResponse` when
+dual control holds an operation; the shared client raised only at 400 and above, so the hold arrived as
+success. `replay_dead_letters` and `reload_config` then parsed it bare, bypassing the module's own
+decoder, and on a first deployment with the gate on a correctly-working hold would have raised an
+unhandled pydantic `ValidationError` out of the client -- breaking the contract that file's docstring
+says the decoder exists to preserve. `purge_connection` used the decoder and would have reported the
+hold as engine version skew.
+
+All three now return `<result> | PendingApprovalResponse`, discriminated on the status code and decoded
+through `_decode`, so a malformed body of either shape is still an `ApiError` and never a bare
+`ValidationError`. That mirrors the engine's own route signatures and the console's existing
+`isinstance` narrowing rather than inventing a second convention.
+
+**Callers were measured, not assumed.** The web console needed nothing -- it reaches the engine through
+the in-process seam, not the apiclient, and already discriminates. `harness/monitor.py` reports a hold
+as a status line rather than an error. `harness/load/connscale/probe.py` would have TIMED a held reload
+as a fast one, reading as the O(connections) cost getting cheaper.
+
+**Mutated both ways:** reverting one call to the bare `model_validate` reds three tests; reporting
+every 2xx as held reds exactly the three negative controls.
+
+**Deliberately not built, named by subject:** the IDE held-promote defect, where `engineClient.ts`
+casts any 2xx body to its expected type and `promote.ts` would announce a successful promote with
+undefined counts for a reload that was only held. TypeScript, a separate surface and a separate review.
 ## 1114. research an honest pass for ASVS 2.4.1 -- anti-automation on a data plane whose senders are machines and whose intake has no authentication
 
 > 🔢 **Re-scored 2026-08-20 -> P2.** Value **7/10** · Difficulty **5/10** · _quick win_. A default install would still take messages at an unbounded rate on first deployment, and ~~for non-MLLP inbounds there is no opt-in bound at all, so no workaround exists there~~ **[FALSIFIED 2026-09-04 at `a2eef0f3` -- struck, not deleted. The pacing keys now reach FOUR of the nine externally-facing inbound factories; five still reach nothing. See "Re-measured 2026-09-04" below for the probe and its controls.]**. Difficulty 5 covers the ruling plus ~~the likely follow-on of taking pacing across the transport registry to at least the raw-TCP inbound, with tests and docs~~ **[BOTH SPENT: the raw-TCP limb was delivered 2026-09-03, and the ruling it prices was written on 2026-08-16, BEFORE this score was set. The numbers are left as the scoring pass recorded them -- re-scoring is that pass's act, not a builder's -- but neither half of the justification now holds.]** _(was 8/10 · 7/10.)_
@@ -7907,6 +8068,39 @@ be broken, not a finding, and it found it present on both file sources.
 
 **One residual measured here and deliberately left unedited.** That same row concludes that "the code-first and the TOML surface both express them" across all four named factories. For `X12` the second half is false, for the reason the separate-subject paragraph above already gives: `_TRANSPORTS` carries no `x12` key, so the shipped sentence generalises past its own premise. The gap is already pinned with its own positive control in `tests/test_ingress_message_pacing.py::test_x12_has_no_toml_surface_at_all_which_is_a_separate_gap`; what is new here is only that the security prose overstates it. Left for its own diff -- this pass touched no document outside this row, and a security sentence deserves a change a reviewer can see on its own.
 
+
+**BUILT 2026-09-06: shipped-ON per-tick ceilings for the File, RemoteFile and Database poll
+sources. The item stays OPEN and THIS DOES NOT MOVE THE CELL** -- this row is explicit that a builder
+should not build in order to move it, and the two acts that would are the owner's.
+
+**Why these may default ON when the network-listener pacer may not**, stated in the code because a
+later reader will otherwise "fix" the inconsistency the wrong way: deferral on a poll source is not a
+drop. A file the scan does not reach is still in the drop directory; a row the poll does not fetch is
+still in the table, unmarked. Nothing is quarantined, errored or accepted-and-dropped, so the
+count-and-log invariant is untouched -- an item never received has no disposition to record.
+
+**The number is anchored on the repo's own published measurements rather than picked.** 500 per tick
+is 500/s on File and 100/s on the other two at the shipped intervals, at or above every rate this
+engine has been measured achieving (`docs/THROUGHPUT.md` ~450 at intake and ~60 end-to-end;
+`docs/SYSTEM-REQUIREMENTS.md` ~97 sustained, ~107 burst). `capture_max_rows=100` was deliberately NOT
+reused -- 100 rows per 5-second poll is 20/s, BELOW the measured sustained rate, so it would have
+throttled a real feed.
+
+**Fair progress is the subtle half.** Only an item the tick FINISHED with charges the budget. Every arm
+that leaves an item for a later retry (locked or vanished file, scan-hook malfunction, handler failure,
+unsafe listing name) deliberately does not charge, because charging them would let one stuck
+early-sorting item eat the whole ceiling every tick and starve the healthy items behind it.
+
+**Two anchors in this row point at the CAPTURE path rather than the poll path** and are corrected: the
+poll `fetchall` was at `database.py:1181`, and the capture row ceiling is at `:899`/`:952`. The defect
+itself reproduced exactly.
+
+**A residual measured on the way and left recorded rather than fixed:** the ceiling bounds the INGEST,
+not the listing. `_candidates` still globs and screens the whole directory every tick, so draining a
+large backlog now pays that listing once per tick over a shrinking set instead of once in total.
+Bounding it properly means deferring the per-candidate screens into the scan loop, which is available
+under `sort="name"` and not under `sort="mtime"`, and costs the accurate remaining count the ceiling's
+log carries. Written into `_candidates` with that cost stated.
 ## 1115. research an honest pass for ASVS 2.4.2 -- whether human-timing pacing is meaningful for an engine whose only human surface is the console
 
 > 🔢 **Re-scored 2026-08-20 -> P3.** Value **4/10** · Difficulty **6/10** · _money pit_. The research half is delivered and the code it was written against is unchanged: the /ui surface charges nothing (zero allow_admin_write references in the web console) and the only pacing is a per-request per-actor budget at config/settings.py:2017-2021, never a flow timer. Value 4 because on a first deployment this is a coverage and calibration gap on an admin surface rather than a data-plane exposure; difficulty 6 because a flow timer spanning login, MFA enrolment and approve-then-decide is a new mechanism across auth service, API and console, and the floor has to come from a measurement the record does not have. _(was 3/10 · 5/10.)_
@@ -9660,6 +9854,40 @@ A recycled name inside one directory is **not** cross-IdP spoofing, so a 6.8.1 r
 
 **Still not an honest pass:** documenting the Kerberos absence and scoring on that, because a signed relaxation is never a pass and documenting an absence is not documenting a control; re-citing the existing signed acceptance, which is a recorded decision and not a satisfied verb; and now a third -- publishing the extension's lifetime row without either fixing the live-status poll or writing the honest version of the sentence, which would put an unmeasured coordination claim into the shipped security document. Proposed work, all unallocated and named by subject: the federated session-coordination inventory section in `docs/SECURITY.md`, one row per system with lifetime, termination and re-authentication columns; the session-holder enumeration fix at `docs/SECURITY.md:1368`, or its conversion to an "at least" form; the IDE live-status bearer-on-a-timer work, preferring the simple correct end state of not carrying the bearer on a timer at all; the Kerberos service-ticket lifetime cap on the Windows acceptor with its three gates; the Linux and GSSAPI decision, which must be settled before the inventory can be written truthfully; an AD-lab measurement of `ptsExpiry` through the Negotiate acceptor before the cap is relied on; and a record correction re-anchoring `settings.py:1817` and rewriting the residual so it grades this requirement's documentation verb.
 
+
+**BUILT 2026-09-06: the IDE live-status bearer-on-a-timer, which this row names as preferring
+"the simple correct end state of not carrying the bearer on a timer at all". The item stays OPEN and
+the cell does NOT move** -- the Kerberos ticket-lifetime limb is untouched and the cell carries its
+signed acceptance to 2027-01-14.
+
+**The premise is sharper than this row states.** `ide/src/statusBar.ts` opens with a load-bearing block
+whose first item says its own poll sends NO TOKEN, because a bearer on a timer would keep refreshing
+the engine's idle clock and make the 30-minute idle timeout unreachable (CWE-613). `liveStatus.ts` did
+exactly that, on a 5-to-10-second timer. Two files, one rule, opposite behaviour.
+
+**Keeping the bearer safe is not available to a client, and that was measured rather than assumed.**
+Of the four `identity_for_token` call sites in `api/`, three take the `activity=True` default and one
+is a hardcoded `activity=False` WebSocket keepalive. No header, query parameter or route lets a CALLER
+ask for `activity=False`. That surface is an engine-side change and is named, not built.
+
+**Tokenlessness is DATA, not a comment** -- `LIVE_STATUS_PLAN` carries `authenticated: false` and CI
+asserts it. A comment a later edit can contradict is how the two files diverged in the first place.
+
+**Accepted cost, stated where it bites:** against an auth-enabled engine the rows stay undecorated. The
+setting ships OFF by default, and the full monitor remains the web console, which reads the same data
+under `activity=False`.
+
+**Two documents asserted the defect was fine and are corrected.** ADR 0091's shipped-status bullet
+called it "auth is passive" -- passive there meant never prompts, and it was not passive about the idle
+clock. And `docs/SECURITY.md`'s enumeration of PHI-scoped token holders omitted the extension, which is
+the only holder putting the token in durable OS-managed storage that outlives the process; it is now an
+"at least" form per SDS-3.6.
+
+**Unverified by execution, and the code says so:** the idle-clock claim rests on reading
+`identity_for_token`'s signature and the route's dependency chain, not on running an engine.
+
+**Untouched, named only:** the `sspilib` Kerberos ticket-lifetime cap and its three correctness gates,
+the Linux/GSSAPI decision, the AD-lab measurement, and the federated session-coordination inventory.
 ## 1146. research an honest pass for ASVS 7.2.4 -- what session-token rotation on re-authentication must not break
 
 > 🔢 **Re-scored 2026-08-20 -> P1.** Value **8/10** · Difficulty **6/10** · _big bet_. Verified unchanged: the primitive is defined at auth/service.py:1614 and implemented on all three backends, but a tree-wide search finds no caller outside tests, and reauth (:1796-1832) stamps state on hash_token(token) rather than rotating, so a token minted at the password leg would survive the second factor. Value 8 because on a first deployment a pre-MFA token captured before the second factor would be elevated in place to a fully authenticated session; difficulty 6 because rotation must be wired without stranding the token-hash-keyed state the primitive's own test names, and in-flight requests and open WebSocket subscriptions have to be reasoned about at every elevation site. _(was 8/10 · 6/10.)_
@@ -9692,6 +9920,41 @@ A recycled name inside one directory is **not** cross-IdP spoofing, so a 6.8.1 r
 
 **Still not an honest pass, and the cheapest wiring now comes with cover.** The 2026-07-25 owner ruling on the token-delivery contract names exactly two JSON routes; building precisely those two looks like building to the owner's own words and would leave `confirm_mfa_enrollment`, `finish_webauthn_registration` and `finish_webauthn_assertion` un-rotated -- the legs that turn an MFA-pending session into an MFA-satisfied one for a first enrollment or a passkey-only account, and for `POST /ui/mfa` the passkey assertion is the ONLY leg. So the owner-named subset covers TOTP and misses the passkey path entirely while the cell would read "rotates on re-authentication". A partial covering is a legitimate increment and never a score: if sites are deferred the residual must NAME them. And because the cell's absence marker is literally the primitive's own call pattern, the pass must rest on a behavioural regression test -- a pre-elevation token stops authenticating at the moment of elevation, one case per site with a named red mutation -- and the residual must cite that test rather than the marker flipping. Proposed work, all unallocated and named by subject: the five-site rotation wiring under that ordering invariant; the breaking token-delivery contract on the three JSON re-authentication routes with `Cache-Control: no-store`; the apiclient token-adoption work, including replacing the copied-token polling clone with a shared token cell and rewriting the now-false `for_polling` invariant docstring; the console cookie re-set across the seven post-elevation response paths; login supersession on the three console legs plus written rationales for both bearer login legs; the IDE sign-in supersession; the console self-session revoke identifier work, which today would report a revoke that did not happen; the session-rotation audit event, since the in-place re-key leaves no store trace; a bounded console WebSocket reconnect, explicitly not a token grace window; the behavioural regression suite; the seam digest regeneration and the roughly forty affected test call sites; and the ledger-citation repair in the test file, replacing the number with the subject.
 
+
+**BUILT 2026-09-06: rotation wired at ALL FIVE elevation sites. The item stays OPEN** -- the
+closing act is a scorecard re-score, which no builder performs.
+
+**Not the cheap subset, deliberately.** This row warns that the 2026-07-25 owner ruling names two JSON
+routes and that building precisely those would look like building to the owner's own words while
+leaving `confirm_mfa_enrollment`, `finish_webauthn_registration` and `finish_webauthn_assertion`
+un-rotated -- and that for `POST /ui/mfa` the passkey assertion is the ONLY leg. All five are wired.
+
+**The ordering invariant lives in ONE place.** A private `_elevated()` is the sole caller of
+`_rotate_session_token`, so the rule that every rowcount-blind stamp must land BEFORE the rotation is
+stated once rather than in nine route handlers. Both site-specific traps are handled: `reauth` decides
+`_factor_binding_is_blocked` before the rotation and mints its grant after, against the new hash;
+`verify_mfa`'s three-write group lands first. A rotation on a vanished session reports `session_lost`,
+which the routes map to 401 rather than the 403 a wrong proof gets -- a correct password must not be
+reported as incorrect because the session died mid-ceremony.
+
+**The pass rests on BEHAVIOUR, not on the marker**, exactly as this row requires: the cell's absence
+claim keys on the primitive's own call pattern, so wiring it for effect would flip the marker and
+change nothing. `tests/test_session_rotation_wiring.py` asserts a pre-elevation token stops
+authenticating at the moment of elevation, one case per site, with a mutation-checked negative control
+(making `reauth` rotate unconditionally reds it and nothing else).
+
+**The WebSocket question this row asks is answered and recorded in code.** A rotation would drop an
+open `/ws/stats` socket at the next revalidation tick, which is fail-closed and correct; `app.js`
+resumes the HTTP poll carrying the new cookie, so completing MFA would cost the live push for the rest
+of that page's life. A liveness regression, not correctness or data loss -- which is why the bounded
+reconnect is deferred rather than built.
+
+**Also repaired, as this row asks:** the test file's citation of a backlog number that cannot resolve
+from a public checkout now names the subject instead.
+
+**Still unbuilt, named by subject:** the IDE sign-in supersession; login supersession on the three
+console cookie-minting legs and written rationales for both bearer login legs; the console
+self-session revoke identifier; and the bounded console WebSocket reconnect.
 ## 1147. research an honest pass for ASVS 7.4.3 -- offering session termination as part of the MFA-change ceremony rather than beside it
 
 > 🔢 **Re-scored 2026-08-20 -> P2.** Value **5/10** · Difficulty **4/10** · _fill-in_. disable_mfa still offers and revokes nothing, and the post-disable redirect still lands on a page whose only relation to session termination is a link, so the option remains adjacent to the ceremony rather than part of it. The capability ships and is one click away, which caps value; difficulty 4 covers research plus a uniform ceremony across five factor-change paths without cutting the caller's own session mid-flow. _(was 5/10 · 4/10.)_
@@ -9862,6 +10125,30 @@ Interpreter named rather than assumed, since the extra-gated coverage hazard abo
 
 **Still not an honest pass, and the trap has moved somewhere worse than the item names.** The item disqualifies flipping `seed_reauth` on the password leg, and that stands -- `has_recent_step_up` is read at six call sites governing 26 engine and 33 console step-up dependencies, so a flip would silently change the freshness posture of a neighbouring requirement's entire scored surface. But on the shipped default the password leg ALREADY passes `seed_reauth=False`, so the move actually tempting today is deleting the single `mark_session_reauthed` line inside `verify_mfa` -- a one-line change that moves the cell, looks like a tightening, and is worse on three counts: it would force a fresh password step-up on all 59 step-up-gated routes immediately after every MFA login; the line is not a seeding line at all, its own comment at `auth/service.py:2196-2198` says it re-anchors the session to the address that completed the second factor so a roamed administrator clears the new-client-IP signal with one proof, so deleting it breaks a control belonging to a different requirement; and it would be invisible to a reviewer reading only the diff against the residual's stated mechanism. Also disqualified: gating `GET /me/sessions` so the whole surface "looks protected", since the pinned parenthetical binds terminate only and friction on viewing buys no limb; and treating the login-supersession question on `GET /ui/sso` as verdict-neutral -- it is not, because declining it leaves the terminate limb unmet on one of the three cookie-minting login legs. Proposed work, all unallocated and named by subject: the session-terminate action-binding build across the four self-service routes; the test inversion, since the two currently-passing immediate-terminate tests are the instrument that measures the gap; the ADR 0077 amendment recording the session-terminate action, since that ADR scopes the vocabulary to durable-takeover factor-binding routes; the `docs/SECURITY.md:1418-1434` session-inventory documentation gap, which enumerates all four routes and never mentions the password re-proof gate that already shipped; the current-session revocability correction at `docs/SECURITY.md:1433`, which says the current session is only revocable via sign-out while `revoke_own_session` accepts it; the stale in-source docstring at `pages/account.py:508` asserting the sessions page carries no step-up; and the residual and anchor repair, including the reviewer attribution and re-score trigger the cell has never carried.
 
+
+**BUILT 2026-09-06, and the build was NOT the one this row asks for -- that had already
+landed. The item stays OPEN.**
+
+**A builder arriving here should not rebuild the action binding.** `STEP_UP_ACTION_SESSION_TERMINATE`
+ships, both JSON terminate routes and both console twins take the action-bound reauth-only factory,
+both continuations carry the `action=` tag, and the two immediate-terminate tests are inverted with
+their reasoning recorded in place.
+
+**What was left behind were three shipped statements that the gate itself made false**, which is the
+SDS-3.7 shape in reverse -- prose asserting the absence of a control that now exists:
+
+* `messagefoundry_webconsole/pages/account.py` said revoking one's own sessions is
+  "cookie-authenticated self-service (no step-up)". A stale absence claim beside a control reads as a
+  licence to remove the gate for consistency.
+* `docs/SECURITY.md`'s session-inventory section enumerated all four routes and never mentioned the
+  password re-proof gate.
+* The same section asserted the current session is "only revocable via Sign out". That is a property
+  of the console PAGE, not of the endpoint: `revoke_own_session` checks ownership and nothing else, so
+  on a first deployment `DELETE /me/sessions/{id}` would accept the caller's own current session id
+  and revoke it.
+
+That last claim is DERIVED rather than asserted -- a test drives the real route, and a mutation adding
+the current-session guard the prose implied makes it answer 404, which reds the assertion.
 ## 1150. research an honest pass for ASVS 7.6.1 -- bounding time since the IdP authentication event without forcing a credential prompt every round trip
 
 > 🔢 **Re-scored 2026-08-20 -> P2.** Value **5/10** · Difficulty **5/10** · _fill-in_. With federation enabled a first deployment could not bound time since the IdP authentication event at all, and the one shipped lever destroys single sign-on, so there is no acceptable workaround. Difficulty 5: an owner ruling plus one setting, a max_age parameter on the existing authorize call and an auth_time comparison at the id_token seam, with a fallback for IdPs that omit the claim. _(was 5/10 · 7/10.)_
@@ -18780,6 +19067,37 @@ rest on specification alone, including that `Content-Disposition: attachment` su
 rendering. That is the gap a pass would have to close with a real user agent.
 
 
+
+**BUILT 2026-09-06. THE ITEM STAYS OPEN -- the closing act is a scorecard re-score, which no
+builder performs.** All three pieces the 2026-08-23 research named are done.
+
+**The classifier is now an ALLOW-LIST.** `_BROWSER_ACTIVE_SUBTYPE_TOKENS`, `_BROWSER_ACTIVE_TYPES` and
+`_is_browser_active_mime` are deleted. `_safe_attachment_content_type` returns the CANONICAL key from a
+ten-entry exact-match table, so no attacker-influenced byte reaches the `Content-Type` header at all;
+everything else is `application/octet-stream`. Completeness is now a property of a short reviewable
+list rather than the unprovable negative the research named -- `application/hta` was the counterexample
+that carried none of the four tokens.
+
+**`mimetypes.guess_extension` is gone**, and the reason is stronger than "an unstated contract": on
+Windows it reads the HOST REGISTRY, so the served filename extension was a property of the machine the
+engine happens to run on rather than of the product. Measured on this host, `guess_extension(
+"application/hta")` returns `.hta`. The extension now comes from the same table, defaulting to `.bin`.
+
+**The PDF question is decided in writing**, above the table, and `application/pdf` STAYS on the list.
+The clause this control answers is about executing in the APPLICATION ORIGIN; PDF script runs in the
+viewer against the document, so a downgrade narrows nothing while costing the type hint on the
+commonest clinical attachment. What would narrow the local-open threat is content scanning, which this
+route does not do -- named there as unfiled work, by subject.
+
+**Unchanged and deliberately so:** the CSP, the unconditional `Content-Disposition`, `nosniff`, the
+middleware and `attachment_mime_agrees`. The allow-list decides what is DECLARED, never whether a file
+is served: an unrecognised type downloads exactly as a refused one does.
+
+**Differential control:** restoring the deny-list behind the new names reds 19 of 94.
+
+**STILL UNMEASURED, and no code comment claims otherwise: no browser was exercised.** That
+`Content-Disposition: attachment` suppresses inline rendering still rests on specification alone. That
+is the gap a pass would have to close with a real user agent.
 ## 1352. research an honest pass for ASVS 11.4.4 -- key-derivation parameters that balance security against brute force, at every derivation site
 
 > 🔢 **Filed 2026-08-23 - not started. RESEARCH item: the goal is an HONEST pass, and "cannot honestly reach pass" is a valid finding.** ASVS **11.4.4** (L2) is one of the three cells the assessment record holds as CONTESTED between assessors rather than merely unbuilt, so the blocker is a reading to be settled before any build is scoped. Value **5/10** - Difficulty **3/10** - _fill-in_.
