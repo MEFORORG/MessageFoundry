@@ -1465,15 +1465,24 @@ Users and admins can see and revoke individual sessions (ASVS 7.5.2 / 7.4.5):
   flagged). The session `id` is the session's `token_hash` (a one-way hash of the opaque token, safe to
   expose).
 - **`DELETE /me/sessions/{id}`** — revoke one of **your own** sessions (ownership-checked: another
-  user's id returns 404, never revealing or touching it).
+  user's id returns 404, never revealing or touching it). **Gated on a fresh password re-proof bound
+  to the `session_terminate` action** (ASVS 7.5.2 — see the route table above): the sign-in you
+  already hold does not unlock a terminate, and the grant is single-use.
 - **`DELETE /me/sessions`** — "sign out everywhere else": revoke all your sessions except the current.
+  Same `session_terminate` re-proof gate.
 - **`DELETE /users/{id}/sessions`** (`users:manage`) — admin force-sign-out of a user (offboarding /
   suspected compromise).
 
+The two self-service terminates are **password-only** step-ups deliberately: a second-factor gate
+would deadlock an MFA-required-but-unenrolled operator out of revoking their own sessions.
+
 Every targeted revoke is audited (`auth.session_revoked`, with scope + actor). The **web console** surfaces
 this: an **Active sessions…** view in the account menu lists your sessions and offers per-session
-revoke + "sign out everywhere else" (the current session is shown but only revocable via *Sign out*),
-and the **Users** page has a **Revoke sessions** action for admin force-sign-out.
+revoke + "sign out everywhere else". The console renders **no Revoke button on the current session**,
+so the list cannot leave the operator mid-request; *Sign out* is the console's way to end it. That is
+a property of the **page**, not of the API — `DELETE /me/sessions/{id}` checks ownership only, so it
+accepts the caller's own current session id and revokes it. The **Users** page has a **Revoke
+sessions** action for admin force-sign-out.
 
 ### Security-event notifications (WP-L3-05, ASVS 6.3.5 / 6.3.7)
 

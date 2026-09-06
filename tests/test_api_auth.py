@@ -1006,6 +1006,35 @@ async def test_revoke_other_sessions_keeps_current(engine: Engine) -> None:
         assert (await c.get("/auth/me", headers=_auth(t2))).status_code == 200
 
 
+async def test_the_api_accepts_a_revoke_of_the_callers_own_current_session(engine: Engine) -> None:
+    """`DELETE /me/sessions/{id}` checks OWNERSHIP only, so the caller's CURRENT session id is a
+    valid target and revoking it ends the caller's own session.
+
+    RED when: a current-session guard is added to the route or to ``revoke_own_session`` without
+    the documentation changing with it. This test exists because `docs/SECURITY.md` and
+    `messagefoundry_webconsole/pages/account.py` both describe the console's missing Revoke button
+    on the current row, and a reader would reasonably carry that over to the API. It is a property
+    of the PAGE, not of the endpoint, and this pins which. Derived, not asserted.
+    """
+    service = await _service(engine)
+    await _add(service, "u", Role.VIEWER)
+    async with _client(engine, service) as c:
+        token = (await _login(c, "u")).json()["token"]
+        sessions = (await c.get("/me/sessions", headers=_auth(token))).json()["sessions"]
+        current = next(s for s in sessions if s["current"])
+        re = await _reauth(c, token, purpose="session_terminate")
+        assert re.status_code == 200
+        # Adopt a rotated token if the re-auth handed one back. ASVS 7.2.4 (BACKLOG #1146) wires
+        # rotation into this leg, and this test must pin the ownership rule either side of that.
+        token = re.json().get("token") or token
+        assert (
+            await c.delete(f"/me/sessions/{current['id']}", headers=_auth(token))
+        ).status_code == 200
+        # The caller signed THEMSELVES out — the whole point, and the negative control for the
+        # ownership rule is the sibling test above, where another user's id answers 404.
+        assert (await c.get("/auth/me", headers=_auth(token))).status_code == 401
+
+
 async def test_cannot_revoke_another_users_session(engine: Engine) -> None:
     service = await _service(engine)
     await _add(service, "a", Role.VIEWER)

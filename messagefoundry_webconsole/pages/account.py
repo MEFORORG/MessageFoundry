@@ -498,9 +498,21 @@ def sessions_page(sessions: Sequence[Mapping[str, object]], *, notice: str | Non
     every live session for the caller with its own **Revoke**, plus **Sign out everywhere else**.
 
     ``sessions`` are plain row mappings built by the route (id / created_at / last_used_at /
-    expires_at / client / current) — this module never touches the store. Revoking one's OWN
-    sessions is cookie-authenticated self-service (no step-up); the current session shows no Revoke
-    button (use the header Sign out to end it) so the list can't leave the user mid-request."""
+    expires_at / client / current) — this module never touches the store.
+
+    **Revoking one's OWN sessions is step-up gated** (ASVS 7.5.2, BACKLOG #1149): both terminate
+    POSTs take ``require_ui_reauth_only_action(STEP_UP_ACTION_SESSION_TERMINATE)``, so the cookie
+    alone does not carry them — ``/ui/reauth`` mints a single-use grant bound to that action and each
+    terminate consumes one. It is the password-only family on purpose: the full step-up would
+    deadlock an MFA-required-but-unenrolled operator out of revoking their own sessions.
+
+    *This docstring previously said "no step-up", which stopped being true when that gate landed.
+    A stale absence claim beside a control is worse than silence: it reads as a licence to remove
+    the gate for consistency.*
+
+    The current session shows no Revoke button (use the header Sign out to end it) so the list can't
+    leave the user mid-request. That is a property of this PAGE — ``DELETE /me/sessions/{id}`` checks
+    ownership only and would accept the caller's own current session id."""
     note = el("p", notice, class_="muted") if notice else Markup("")
     rows: list[Markup] = []
     others = 0
