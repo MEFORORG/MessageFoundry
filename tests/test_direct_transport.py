@@ -30,7 +30,7 @@ from typing import Any
 import pytest
 from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
-from cryptography.hazmat.primitives.asymmetric import padding, rsa
+from cryptography.hazmat.primitives.asymmetric import ec, padding, rsa
 from cryptography.hazmat.primitives.serialization import pkcs7
 from cryptography.x509.oid import NameOID
 
@@ -493,3 +493,147 @@ def test_credentials_over_a_fully_verified_hop_still_construct(pki: dict[str, An
     # POSITIVE CONTROL: proves the new gate can be PASSED, so the refusal test above is not green
     # merely because DirectDestination rejects every credentialed construction.
     DirectDestination(_dest(pki, username="svc", password="pw"))
+
+
+# --- signature_padding: the ASVS 11.3.1 operator choice (BACKLOG #1168) ------------------------------
+#
+# Measured against the PINNED cryptography (50.0.1 in requirements.lock), not the interpreter that
+# happened to be on the builder's box, which reported 49.0.0. `add_signer` takes a keyword-only
+# `rsa_padding`; `PKCS7EnvelopeBuilder.add_recipient` takes none, so the ENVELOPE half is out of
+# reach of this setting and is asserted as such below rather than left to inference.
+
+#: DER encoding of the RSASSA-PSS algorithm OID 1.2.840.113549.1.1.10, as it appears in a SignerInfo.
+_RSASSA_PSS_OID_DER = bytes.fromhex("06092a864886f70d01010a")
+
+
+def _mint_ec_leaf(
+    common_name: str, ca_key: rsa.RSAPrivateKey, ca_cert: x509.Certificate
+) -> tuple[ec.EllipticCurvePrivateKey, x509.Certificate]:
+    """An EC (P-256) leaf issued by the RSA test CA — the key type that reaches an approved signature
+    with no padding parameter at all."""
+    key = ec.generate_private_key(ec.SECP256R1())
+    subject = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, common_name)])
+    now = datetime.datetime.now(datetime.UTC)
+    cert = (
+        x509.CertificateBuilder()
+        .subject_name(subject)
+        .issuer_name(ca_cert.subject)
+        .public_key(key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(now - datetime.timedelta(days=1))
+        .not_valid_after(now + datetime.timedelta(days=365))
+        .sign(ca_key, hashes.SHA256())
+    )
+    return key, cert
+
+
+def _ec_signer(pki: dict[str, Any], tmp_path: Path) -> dict[str, str]:
+    """Overrides swapping the RSA signer for an EC one. Only the SIGNER changes — the recipient cert
+    and trust anchor are untouched, so this isolates the key type."""
+    key, cert = _mint_ec_leaf("EC Sender Direct", pki["ca_key"], pki["ca_cert"])
+    cert_p = tmp_path / "ec_signer.crt"
+    key_p = tmp_path / "ec_signer.key"
+    _write_pem(cert_p, cert)
+    key_p.write_bytes(
+        key.private_bytes(
+            serialization.Encoding.PEM,
+            serialization.PrivateFormat.PKCS8,
+            serialization.NoEncryption(),
+        )
+    )
+    return {"signing_cert": str(cert_p), "signing_key": str(key_p)}
+
+
+def test_signature_padding_defaults_to_pkcs1v15(pki: dict[str, Any]) -> None:
+    # The default is deliberate and interoperability-driven, so pin it: a silent flip to PSS would
+    # break any HISP peer whose S/MIME stack verifies only PKCS#1 v1.5.
+    d = DirectDestination(_dest(pki))
+    assert d.signature_padding == "pkcs1v15"
+    assert d._rsa_padding is None  # None, not PKCS1v15() — the one branch EC keys also accept
+
+
+async def test_signature_padding_pss_changes_the_signerinfo_algorithm(
+    monkeypatch: pytest.MonkeyPatch, pki: dict[str, Any]
+) -> None:
+    """`signature_padding='pss'` really reaches the CMS SignerInfo, and the default really does not."""
+    body = _SYNTHETIC_HL7.encode("utf-8")
+
+    _install_fake(monkeypatch)
+    await DirectDestination(_dest(pki)).send(_SYNTHETIC_HL7)
+    [smtp_default] = _FakeSMTP.instances
+    signed_default = pkcs7.pkcs7_decrypt_der(
+        _sent_smime_bytes(smtp_default), pki["recip_cert"], pki["recip_key"], []
+    )
+
+    _install_fake(monkeypatch)
+    d = DirectDestination(_dest(pki, signature_padding="pss"))
+    assert d.signature_padding == "pss"
+    await d.send(_SYNTHETIC_HL7)
+    [smtp_pss] = _FakeSMTP.instances
+    signed_pss = pkcs7.pkcs7_decrypt_der(
+        _sent_smime_bytes(smtp_pss), pki["recip_cert"], pki["recip_key"], []
+    )
+
+    # The algorithm identifier moves, and the NEGATIVE half is what makes this a measurement rather
+    # than a presence check: the default must NOT carry the PSS OID.
+    assert _RSASSA_PSS_OID_DER in signed_pss
+    assert _RSASSA_PSS_OID_DER not in signed_default
+
+    # The discriminating control. PKCS#1 v1.5 is deterministic, so the exact signature the default
+    # produces is reproducible — and it must be ABSENT from the PSS blob. Without this, a change that
+    # wrote a PSS algorithm identifier while still signing PKCS#1 v1.5 would pass the OID assertions.
+    pkcs1_sig = pki["signer_key"].sign(body, padding.PKCS1v15(), hashes.SHA256())
+    assert pkcs1_sig in signed_default
+    assert pkcs1_sig not in signed_pss
+
+    # Both blobs still carry the signer cert and the exact synthetic body — PSS changed the padding
+    # and nothing else about the message.
+    assert body in signed_pss
+    assert any(c == pki["signer_cert"] for c in pkcs7.load_der_pkcs7_certificates(signed_pss))
+
+
+def test_signature_padding_rejects_an_unknown_value(pki: dict[str, Any]) -> None:
+    # Fail loud at construction (check/dry-run/start), never as a wire-time surprise.
+    with pytest.raises(ValueError, match="signature_padding"):
+        DirectDestination(_dest(pki, signature_padding="oaep"))
+
+
+def test_signature_padding_pss_is_refused_on_an_ec_key(pki: dict[str, Any], tmp_path: Path) -> None:
+    # cryptography raises `TypeError: Padding is only supported for RSA keys` from add_signer, which
+    # would abort every delivery at wire time. Refuse it at construction instead, with an error that
+    # says what to do.
+    with pytest.raises(ValueError, match="requires an RSA 'signing_key'"):
+        DirectDestination(_dest(pki, signature_padding="pss", **_ec_signer(pki, tmp_path)))
+
+
+async def test_ec_signing_key_avoids_pkcs1_padding_entirely(
+    monkeypatch: pytest.MonkeyPatch, pki: dict[str, Any], tmp_path: Path
+) -> None:
+    # POSITIVE CONTROL for the refusal above, and the documented escape from the interoperability
+    # dilemma: an EC signer needs no padding parameter, so it reaches an approved signature under the
+    # DEFAULT setting. Proves the refusal is about `pss` on EC, not about EC keys being unusable.
+    _install_fake(monkeypatch)
+    d = DirectDestination(_dest(pki, **_ec_signer(pki, tmp_path)))
+    assert d._rsa_padding is None
+    await d.send(_SYNTHETIC_HL7)
+    [smtp] = _FakeSMTP.instances
+    signed = pkcs7.pkcs7_decrypt_der(
+        _sent_smime_bytes(smtp), pki["recip_cert"], pki["recip_key"], []
+    )
+    assert _SYNTHETIC_HL7.encode("utf-8") in signed
+    assert _RSASSA_PSS_OID_DER not in signed  # ECDSA, so no RSA padding identifier at all
+
+
+def test_envelope_key_transport_is_out_of_reach_of_this_setting() -> None:
+    """The ENVELOPE half of ASVS 11.3.1 is a reasoned cannot-pass on the pinned library, and this
+    test is the instrument that would notice if a future bump changed that.
+
+    `PKCS7EnvelopeBuilder.add_recipient` exposes no padding parameter, so a Direct message's key
+    transport would be RSAES-PKCS1-v1_5 on a first deployment whatever `signature_padding` says.
+    If a later `cryptography` adds the parameter, this test fails and the finding must be re-read.
+    """
+    import inspect
+
+    params = inspect.signature(pkcs7.PKCS7EnvelopeBuilder.add_recipient).parameters
+    assert "rsa_padding" not in params
+    assert set(params) == {"self", "certificate"}
