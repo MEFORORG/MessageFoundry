@@ -9532,10 +9532,20 @@ That covers every startable topology, not just the loopback default. The one pos
 > is **Proposed** and its status line says in terms that the build must not start; five boxes under
 > its own *To resolve on acceptance* are unchecked, and the first is an owner trust decision.
 >
-> **THE OWNER DECISION THIS ROW IS WAITING ON, as one answerable question.** *Besides an
-> administrative binding surface, which is entailed rather than optional, what may create a federated
-> binding: bind-on-first-presentation inside a bounded bootstrap window, a self-service link proved by
-> the user's own directory password, or nothing at all?*
+> **THE OWNER DECISION THIS ROW WAS WAITING ON WAS TAKEN THE SAME DAY. RULED 2026-09-06: NOTHING
+> ELSE.** The administrative binding surface is the only path that may create a federated binding --
+> neither bind-on-first-presentation inside a bounded window nor a self-service link proved by the
+> directory password is adopted. Recorded against the first box of ADR 0184's *To resolve on
+> acceptance*, with what it buys and what it costs.
+>
+> **THIS DOES NOT UNBLOCK THE BUILD, and reading it as though it did is the error to avoid.** Four
+> boxes remain open and the ADR is still **Proposed**; accepting it is a separate act. The second box
+> is now the live question rather than a hypothetical one, because it follows directly from the
+> ruling: with no bindings and no bind-on-first-presentation, a fresh deployment would refuse every
+> federated login until an operator binds each account, and whether that is the shipped default is
+> unanswered. **What the ruling does buy is that the spoofing path this row names is closed by
+> construction rather than bounded by a window** -- no state exists in which presenting a claim
+> creates a binding.
 >
 > **THE RANKED-TABLE ENTRY ABOVE ASSERTS TWO THINGS THAT ARE FALSE AT HEAD**, and a dispatcher reads
 > that entry rather than this body. **(a) "No uniqueness of any kind on the OIDC columns on any
