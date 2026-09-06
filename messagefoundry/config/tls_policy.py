@@ -525,6 +525,24 @@ def harden_cipher_suites(ctx: ssl.SSLContext, *, connector: str) -> None:
     # carries six CBC-SHA2 suites, so applying it to an INHERITED context would refuse every current
     # configuration. The allow-list governs what an operator may CONFIGURE, not what a default may
     # contain; conflating the two is how a strict list becomes an outage.
+    #
+    # THE RFC 7366 (encrypt-then-MAC) QUESTION IS SETTLED HERE, AND THE ANSWER IS THAT IT CANNOT BE
+    # ASKED (ASVS 11.3.5, BACKLOG #1170). Those six retained CBC-SHA2 suites are the only MAC-then-
+    # encrypt exposure left on any hop -- the application's own cryptography is AEAD-only and so is
+    # encrypt-then-MAC by construction -- which invites the next reader to try asserting the
+    # negotiated RFC 7366 state instead of the suite list. There is nothing to assert. Measured on
+    # CPython 3.14.6 / OpenSSL 3.5.7, with positive controls in the same run (`cipher` and
+    # `shared_ciphers` are found; `OP_NO_TICKET` exists): the `ssl` module exposes no name containing
+    # "etm", no `OP_NO_ENCRYPT_THEN_MAC`, and no `ssl.Options` member naming encryption-then-MAC, and
+    # neither `SSLObject` nor `SSLSocket` exposes any accessor for it. `cipher()` returns
+    # (name, protocol, bits), and a suite NAME is compatible with both compositions, so it cannot
+    # answer the question either.
+    #
+    # So the verb is unsatisfiable BY OBSERVATION on this interpreter, not merely unimplemented. The
+    # remedy available is the one already taken: constrain what an operator may CONFIGURE
+    # (`validate_tls_ciphers` refuses CBC-SHA2 outright) and leave the inherited default's six suites
+    # as a recorded, owner-ratified interop decision. Retiring those six is an availability decision
+    # about hospital peers, which is an owner call and not this module's to make.
     plaintext = sorted({str(c.get("name", "?")) for c in resolved if not _is_encrypting(c)})
     if plaintext:
         raise ValueError(
