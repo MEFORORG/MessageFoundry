@@ -23701,3 +23701,70 @@ This item was opened to assess exactly that. The assessment is negative, for rea
 
 **Cluster:** repository security gates. **Priority:** P3. **Verdict:** build.
 **Severity:** no deployment axis (sec. 0), no engine behaviour, no PHI axis, and nothing reaches a shipped wheel. The cost is a **control losing its meaning**: a scanner that is red for a reason nobody intends to act on trains its readers to skip it, and the next real finding arrives in a job that has been failing for weeks. That is the same pathology BACKLOG #1413 records for a signal reporting against a standard nothing enforces, and it is why this is filed rather than left to the next person who notices a red.
+
+## 1459. the usage-headroom hook reads a file no collector has written on any config root, so every reading is UNKNOWN
+
+> 🔢 **Filed 2026-09-05 -- not started. Scored at filing.** Value **4/10** · Difficulty **3/10** · _fill-in_. `scripts/hooks/usage-headroom-inject.ps1:224` reads `latest.json` out of the state directory, and **that file exists on none of the six config roots on this machine**, so the injection resolves to `UNKNOWN -- no data` on every spawn it fires for. Measured six times in one session, on every `Workflow` launch. The remainder is to make the collector actually write for each root, or point the hook at a source that exists; difficulty 3 for install wiring plus a check that it holds across roots, and the value band is argued down below rather than assumed.
+> Verdict: build
+> Research: none
+> Closing-act: code
+
+**Cluster:** fleet instrumentation. **Priority:** P3. **Verdict:** build.
+**Severity:** no deployment axis (sec. 0). This is a maintainer-workstation hook. No engine behaviour, no shipped artifact, no PHI.
+
+**The defect, in one sentence:** the hook that exists to price a spawn has never had a number to price it with.
+
+### Measured 2026-09-05, with a positive control
+
+| root | `mefor-usage/` | `latest.json` |
+|---|---|---|
+| `.claude` | present, 70+ files | **absent** |
+| `.claude-account-1` | present, `status.json` only | **absent** |
+| `.claude-account-2` | absent | absent |
+| `.claude-account-3` | present, `status.json` only | **absent** |
+| `.claude-account-4` | present, `status.json` only | **absent** |
+| `.claude-account-5` | absent | absent |
+
+A `find` for `latest.json` across every root returns **zero**. The control is the same sweep for
+`status.json`, which returns **three** -- so the search works and the absence is real, not a broken
+pattern. This is the shape the ASVS census rule already warns about: a pattern that finds nothing
+anywhere is indistinguishable from a clean tree until you run the control.
+
+The hook's own header at `:10` says the collector **is a statusLine** that writes `latest.json` and
+appends `history.jsonl`. So the file appears only where that statusLine is installed and running,
+and on this machine that is nowhere.
+
+### WHY THIS IS VALUE 4 AND NOT 6, and the distinction is the point
+
+The band-6 shape in this ledger is an instrument whose **silence looks like success**. This one is
+the opposite, and it says so in its own output:
+
+> `UNKNOWN is not zero headroom and it is not full headroom. It is no measurement.`
+
+It refuses to be read as a green. A reader is told to spawn on their own judgment and that a cutoff
+is possible. **An instrument that announces its own blindness is a degraded instrument, not a
+deceptive one**, and that is the whole difference between this row and the band the project reserves
+for a gate that passes while checking nothing. Argue it up if you think a spawn decision made blind
+six times in one session is worth more than DX.
+
+### It is one half of a pair, and the other half has a number
+
+**#1406** records that the hook never fires on the path that spends the most: it is wired on matcher
+`^(Task|Agent|Workflow)$|spawn_task`, while `CLAUDE.md` has a Console spawn a Builder through a
+`Bash(claude:*)` grant, which no tool-name matcher can select. `tests/test_claude_settings_contract.py`
+puts `Bash` in its near-miss list and asserts no matcher wiring this hook may select it.
+
+So the two failures are independent and compose badly: **#1406 is "it does not fire where it matters
+most", this row is "where it does fire, it has nothing to read".** Fixing either alone leaves the
+instrument useless. Neither row should be closed on the strength of the other.
+
+### What would prove a fix
+
+A spawn on a fresh config root prints a real headroom figure rather than `UNKNOWN`, and the check
+that proves it must run on a root where the statusLine was **not** hand-installed -- otherwise it
+passes on the one machine state that was never the problem.
+
+**Source:** measured while running scoring and screening workflows on 2026-09-05; the `UNKNOWN`
+line appeared on every one of six `Workflow` spawns in that session.
+
+---
