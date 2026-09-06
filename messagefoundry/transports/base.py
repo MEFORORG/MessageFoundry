@@ -19,9 +19,13 @@ import asyncio
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import ClassVar, Protocol
+from typing import TYPE_CHECKING, ClassVar, Protocol
 
 from messagefoundry.config.models import ConnectorType, ContentType, Destination, Source
+
+if TYPE_CHECKING:  # ``ssl`` is only ever a pass-through annotation here — never dereferenced at
+    import ssl  # runtime — so keep this module's import cost byte-identical for the plaintext
+    # connectors that never build a context.
 
 # Re-exported, not defined here: the matcher moved to the neutral, stdlib-only
 # ``messagefoundry.netaddr`` so the operator-surface allow-list
@@ -585,12 +589,42 @@ def build_destination(config: Destination) -> DestinationConnector:
     return builder(config)
 
 
-async def probe_tcp_reachable(host: str, port: int, timeout: float, label: str) -> None:
-    """Open a TCP connection to ``host:port`` and immediately close it — a no-data reachability probe
+async def probe_tcp_reachable(
+    host: str,
+    port: int,
+    timeout: float,
+    label: str,
+    *,
+    ssl_context: ssl.SSLContext | None = None,
+) -> None:
+    """Open a connection to ``host:port`` and immediately close it — a no-data reachability probe
     shared by the socket destinations (MLLP/TCP/X12) for ``test_connection``. Raises
-    :class:`DeliveryError` if the connect fails or times out."""
+    :class:`DeliveryError` if the connect fails or times out.
+
+    ``ssl_context`` makes the probe speak the destination's **own** transport instead of a plaintext
+    approximation of it, and a destination that holds a context must pass it. Without it a
+    ``tls=true`` connector's connection test opens a CLEARTEXT socket to the partner — the engine
+    falling back to an unencrypted protocol on a hop its own configuration says is encrypted (ASVS
+    12.3.1) — and, the part an operator feels, a broken certificate, CA or hostname would pass a
+    green test and then fail every delivery, because the probe never performed the handshake the
+    real dial does. ``None`` (the default) is the honest value for a connector that cannot speak TLS
+    in any configuration (TCP, X12).
+
+    :class:`ssl.SSLError` is an :class:`OSError`, so a failed handshake is reported through the same
+    :class:`DeliveryError` as a refused connect — which is the point: the test fails where delivery
+    would."""
     try:
-        _reader, writer = await asyncio.wait_for(asyncio.open_connection(host, port), timeout)
+        _reader, writer = await asyncio.wait_for(
+            asyncio.open_connection(
+                host,
+                port,
+                ssl=ssl_context,
+                # SNI, and the hostname check when the context verifies — matching the delivery dial
+                # exactly. A probe that skipped it would verify LESS than the hop it is testing.
+                server_hostname=host if ssl_context else None,
+            ),
+            timeout,
+        )
     except (TimeoutError, OSError) as exc:
         raise DeliveryError(f"{label} connect to {host}:{port} failed: {exc}") from exc
     writer.close()
