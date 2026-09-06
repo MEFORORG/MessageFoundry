@@ -8761,6 +8761,49 @@ That covers every startable topology, not just the loopback default. The one pos
 > Verdict: research
 > Closing-act: scorecard-rescore
 
+> **PARTIAL 2026-09-06 (builder), NOT A CLOSURE -- this row stays OPEN.** Builds two of the three
+> findings the 2026-09-03 pass handed to a follow-on lane, and reports the third as refuted. The
+> closing act is still the scorecard re-score, the record is not in this repository, and nothing
+> here was written to it.
+>
+> **THE BY-FLOOR TABLE IS NOW GATED.** The depth test pinned only the headline -- at least 3,000
+> entries clearing the policy at the shipped floor. The by-floor counts the HEADROOM claim is
+> derived from were prose nothing read, so a corpus change could hold 3,000 at 15 and collapse at
+> 16 with nothing reporting it. That is the number the regeneration warning rests on. The new test
+> parses the table out of `common_passwords.NOTICE` and re-measures every row through the shipped
+> loader, so the data file stays the single source; a second test states the headroom as the
+> property (16 clears, 17 does not) so it survives a corpus swap. Both proven red by planted
+> mutation.
+>
+> **THE CORPUS IS PINNED TO LF AND THE NOTICE NOW CARRIES ITS PROVENANCE DIGEST.** Finding (1)
+> said a recorded digest is true only by luck without a `.gitattributes` pin. Confirmed and built:
+> git stores the file LF while `core.autocrlf=true` checks it out CRLF, so the pin is an empty
+> content diff (`git add --renormalize` stages nothing). The digest is over LF bytes and the test
+> normalises before hashing, so a clone predating the pin cannot be accused of tampering over a
+> line ending.
+>
+> **AND THAT SUPPLIED A RECORD ANOTHER MODULE ALREADY CITED.** `messagefoundry/integrity.py`
+> reasons at length about why a runtime baseline must come from the installed wheel's `RECORD`,
+> and contrasts itself with `common_passwords.NOTICE` as the near-neighbour that "records a sha256
+> of the corpus" and is "explicit that it holds only under a `.gitattributes` pin". Neither the
+> digest nor the pin existed when that was written. The argument is correct and was left untouched;
+> this build supplied the record it described.
+>
+> **FINDING (3) IS REFUTED AND NO ITEM WAS FILED.** It said startup attestation skips shipped DATA
+> because `_ATTESTED_SUFFIX` is `".py"`, and needed its own item. It has one and it shipped:
+> `_ATTESTED_ASSETS` (**#1432**) declares `auth/data/common_passwords.txt` by name, with the
+> truncate-to-zero scenario written out in the same comment. Filing a second item would have
+> duplicated closed work.
+>
+> **WHAT STILL HOLDS THE ROW OPEN** is only the re-score. The prose half was already done on
+> 2026-09-03 and the corpus tooling landed in the other lane; the two residuals the count must
+> carry (the slice is drawn from deep in the upstream tail, and roughly twelve percent of that
+> depth are cracked-hash artefacts) are now recorded in the NOTICE beside the numbers rather than
+> only in this ledger. Score and status unchanged, so the ranked table is deliberately not edited.
+> `ruff check`, `ruff format --check` and `mypy --strict` clean on the changed file; 139 tests pass
+> locally across the auth core, startup attestation, forbidden-token scan, installed-gate parity
+> and ASVS rescore-handoff legs. The full suite was not run locally, so **CI is the authority.**
+
 **Cluster:** Security / ASVS remediation research. **Priority:** P1. **Verdict:** research.
 **Severity:** modest on a first deployment, because the 15-character minimum is itself a strong control -- but the incremental coverage the requirement asks for is 18 values against a bar of at least 3000, and the documentation does not tell an operator that, so a site cannot decide whether to configure a larger corpus.
 
