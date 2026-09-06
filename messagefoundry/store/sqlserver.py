@@ -152,6 +152,12 @@ log = logging.getLogger(__name__)
 _FIFO_HEADS_LANE_CHUNK = 500
 # ADR 0066 §3.1: release_claimed id-chunk bound (ids per UPDATE statement).
 _RELEASE_CHUNK = 500
+# BACKLOG #1169: rows per batch for the `attachment_chunk` at-rest migration. Every OTHER cipher pass
+# batches 500 because its rows are kilobyte-shaped; one attachment_chunk row is a whole
+# DETACH_CHUNK_BYTES (1 MiB) slice, ~1.33 MiB once base64+GCM sealed. 16 keeps a batch near 21 MiB,
+# which is the memory budget the 500-row passes actually spend; 500 here would be ~650 MiB held in a
+# single transaction while the store is still opening.
+_ATTACHMENT_CHUNK_BATCH = 16
 # ADR 0073: ownership-scoped reset lane-chunk bound (lane names per UPDATE's IN list) — well under
 # pyodbc's ~2,100-parameter bound with the fixed parameters; chunks run inside the reset's single
 # transaction, so the all-or-nothing recovery pass is unchanged.
@@ -2805,9 +2811,53 @@ class SqlServerStore:
                     raise
             await self._charge_bound_batch()
             total += len(rows)
+        # `attachment_chunk` detached-document slices (#149, ADR 0105, composite PK
+        # (attachment_id, seq)) — a separate pass (can't ride the id-keyed loop). Its ROTATION pass
+        # already existed here; this ON-OPEN pass did not, so a no-key -> key transition left legacy
+        # plaintext chunks unsealed on SQL Server and Postgres while SQLite sealed them
+        # (BACKLOG #1169). `ciphertext` is NOT NULL, so the `<> ''` guard alone keeps a blank from
+        # becoming ciphertext-of-empty. A SMALL batch, unlike every sibling above: each row is one
+        # DETACH_CHUNK_BYTES (1 MiB) slice, so the usual 500 would hold ~650 MiB resident in one
+        # transaction while the store is still opening. It is still a whole SLICE at a time, not a
+        # whole document — a large attachment spans many rows and is never reassembled here.
+        while True:
+            rows = await self._fetchall(
+                f"SELECT TOP ({_ATTACHMENT_CHUNK_BATCH}) attachment_id, seq, ciphertext"
+                " FROM attachment_chunk WHERE ciphertext NOT LIKE ? AND ciphertext <> ''",
+                (like,),
+            )
+            if not rows:
+                break
+            async with self._acquire() as conn, self._cursor(conn) as cur:
+                try:
+                    for r in rows:
+                        await cur.execute(
+                            "UPDATE attachment_chunk SET ciphertext=?"
+                            " WHERE attachment_id=? AND seq=?",
+                            (
+                                self._cipher.encrypt(
+                                    r["ciphertext"],
+                                    aad=cell_aad(
+                                        "attachment_chunk",
+                                        "ciphertext",
+                                        r["attachment_id"],
+                                        r["seq"],
+                                    ),
+                                ),
+                                r["attachment_id"],
+                                r["seq"],
+                            ),
+                        )
+                    await self._commit(conn)
+                except Exception:
+                    await conn.rollback()
+                    raise
+            await self._charge_bound_batch()
+            total += len(rows)
         if total:
             log.info(
-                "encrypted %d existing message/outbox/response/reference/state row(s) at rest",
+                "encrypted %d existing message/outbox/response/reference/state/attachment row(s) "
+                "at rest",
                 total,
             )
 
