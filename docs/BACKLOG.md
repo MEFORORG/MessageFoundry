@@ -24655,3 +24655,91 @@ run, at the request of the Console seat triaging the CI-signal rows, which confi
 item covers it (`no_accept_acked_message_is_absent` returns zero across the ledger; the nearby
 ordering-flavoured rows are a PATH-order finding and #1304's windows-2025 pwsh launch timeout,
 neither of which is this).
+
+## 1470. a deleted item heading silently merges two ledger rows and every gate stays green
+
+> 🔢 **Filed 2026-09-06 -- the instance is NOT repaired, because the ledger gate REFUSES THE REPAIR; that refusal is the second half of the finding.** Value **6/10** · Difficulty **3/10** · _quick win_. A commit amending one item deleted the next item's `## N.` heading line and put its own prose there. The orphaned item's banner, verdict, closing-act and body were absorbed into the item above it, `parse_items` stopped returning it, and **both ledger gates passed**. It reached `main`.
+> Verdict: build
+> Research: none
+> Closing-act: code
+
+**Cluster:** Ledger integrity / tooling. **Priority:** P2. **Verdict:** build.
+**Severity:** no product effect -- nothing here reaches the engine. The cost is to the record: an
+ASVS row's status and verdict disappear from every machine-parsed view, and its number becomes
+available for reallocation, which is the silent-corruption outcome the ledger gate exists to
+prevent, reached from a direction it does not watch.
+
+**WHAT HAPPENED, measured on `origin/main` rather than inferred.** Commit `642225f78` (PR 855) was
+appending a re-verification note to **#1146**. Its diff against `docs/BACKLOG.md` is **five
+insertions and one deletion**, and the single deleted line is:
+
+> `## 1147. research an honest pass for ASVS 7.4.3 -- offering session termination as part of the MFA-change ceremony rather than beside it`
+
+The amendment prose landed exactly where that heading had been. So **#1147's entire record stayed in
+the file and stopped being an item.** On `main` before this commit, `parse_items` returned 1146,
+1147 and 1148; after it, 1146 and 1148 only, with #1146's body grown from 38 lines to 68 and
+carrying #1147's banner, `Verdict: research` and `Closing-act: scorecard-rescore` as narrative.
+
+**WHY BOTH GATES PASSED, and this is the part to fix.** Neither is wrong; neither is asking this
+question.
+
+* `scripts/hooks/ledger_check.py` guards number REUSE and allocation ownership. It asks *"is this
+  `## N.` heading allocated to the committing worktree"*. A heading that DISAPPEARS is not a heading
+  it can see.
+* `scripts/docs/backlog_status_check.py` asserts each item declares exactly ONE status. `parse_items`
+  ends a banner block at the first line that is neither blank nor a blockquote, so #1147's banner --
+  now sitting mid-body inside #1146, well past that boundary -- is read as narrative and ignored.
+  The one-status invariant then holds **vacuously** for the merged row.
+
+So a change that loses a ledger row is invisible to the gate built to protect ledger numbers and to
+the gate built to protect item status, simultaneously.
+
+**HOW IT SURFACED, which is worth recording because nobody was looking for it.** It was found as a
+FALSE POSITIVE on an unrelated commit. A branch cut before `642225f78` still carried the #1147
+heading; when that branch tried to commit an unrelated ledger edit, `ledger_check.py` refused it --
+*"BACKLOG item #1147 was not allocated to this worktree"* -- because from its point of view the
+branch was INTRODUCING a number it did not own. The gate reported the stale branch and not the
+deletion. Nothing would have reported the deletion.
+
+**THE REPAIR IS ONE LINE, IT WAS PERFORMED AND VERIFIED, AND THE GATE THEN REFUSED THE COMMIT.**
+Re-inserting the heading immediately before #1147's own banner, taken verbatim from `744a7a434`
+rather than retyped, restores the ledger completely: `parse_items` returns 1146, 1147 and 1148;
+#1147 parses OPEN with its own score of 5; #1146 returns from 68 lines to 38 while #1147 holds 32;
+the live-ledger count goes 443 to 444; and `backlog_status_check` stays green. **That change cannot
+be committed by the session that found it.** `ledger_check.py` reads the restored `## 1147.` heading
+as a number being INTRODUCED by a worktree that does not own it, and refuses -- correctly, on its own
+terms, because it has no way to tell a restoration from an appropriation.
+
+**AND ITS REMEDIATION PATH IS BROKEN FOR THIS CASE.** The gate names three routes: commit from the
+owning worktree, check out the owning branch, or -- *only if neither survives* -- allocate a new
+number. Measured here: the owning worktree is **GONE** while its branch still exists, so route three
+is closed by the gate's own condition and route two would land a repair to the LIVE ledger on an
+unrelated stale branch. (The gate prints both identifiers when it refuses, so whoever performs the
+repair has them; they are deliberately not written into the public ledger.)
+Allocating a new number is wrong on the merits regardless: the row's identity IS #1147, and the
+citations pointing at it do not move. So the guard below needs a companion -- the gate must be able
+to accept a heading whose exact text is being RESTORED from an ancestor commit, which is checkable
+without weakening anything: the heading existed at a known ancestor and is byte-identical to it.
+
+**The damage and its fix are both a single line, which is why the guard matters** -- nothing about
+the size of the change signals the size of the consequence, in either direction.
+
+**WHAT TO BUILD.** A monotonicity check over the item-id SET, not the count. The union of ids in
+`docs/BACKLOG.md` and `docs/archive/backlog/BACKLOG-CLOSED.md` may only grow; an id present in the
+parent commit and absent from both files in the child is a lost row and must red. Archival stays
+legal by construction, because it moves an id between the two files and the union is unchanged. Read
+the ids with `parse_items` -- never a hand-rolled scan, for the reason `ledger_check.py` already
+records about `PUBLIC_BACKLOG_FLOOR`: a second definition of what an item is drifts from the first.
+
+**WHAT WOULD NOT BE A FIX.** Restoring the heading and stopping. That repair is owed and should
+happen, but on its own it leaves the next slip just as silent. Asserting a FIXED item count, which goes stale on every filing
+and trains people to bump the number without reading why it moved. And widening `parse_items` to
+recover an orphaned banner from mid-body: that would make the merged state parse as two items and
+hide the defect rather than report it, which is the shape the standards call a compensating control
+resting on a false premise.
+
+**Source:** found 2026-09-06 from the ASVS packet C branch, as a gate refusal on an unrelated
+commit. The mechanism was then re-derived against `origin/main` with the commit diff, and both the
+loss and the repair verified through `parse_items` with the before and after counts recorded above.
+**#1147 IS STILL LOST ON `main` AS THIS IS FILED.** Restoring it needs either the owning branch or
+standing authority on the engine repo; it is one line and the exact text is in `744a7a434`.
