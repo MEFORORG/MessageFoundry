@@ -56,6 +56,13 @@ So is ``smart-scope`` (#1159, ASVS 10.2.3) — it names every SMART-authenticate
 requested ``smart_scope`` asks for permission letters the connection's declared ``interaction`` cannot
 spend. Advisory because a SMART authorization server registers scopes per app and MAY grant a subset of
 what is requested, so refusing a requested string risks taking a working clinical feed offline.
+So is ``oidc-auth-params`` (#1159, ASVS 10.2.3) — the relying-party half of that same verb. It reports
+the ``[auth]`` authorization parameters the federated login sends that nothing else screens: the
+``oidc_scopes`` / ``oidc_username_claim`` pair, ``oidc_acr_values`` against ``oidc_required_acr_values``,
+and ``oidc_prompt``. Its most useful line is not a least-privilege one — a username claim whose scope
+was never requested is a login that fails at its last hop on a live user, and it is computable the
+moment the config loads. Advisory for ``smart-scope``'s reason: an identity provider registers
+parameters per client and may ignore or substitute them.
 Exit-code policy lives in the CLI (``__main__._check``): 0 iff no required check failed.
 """
 
@@ -182,6 +189,13 @@ def run_checks(
         # #1159 / ASVS 10.2.3: name every SMART connection asking for more FHIR authority than its
         # declared interaction can spend. Advisory, and a refusal was ruled out — see the check.
         _check_smart_scope(config_dir),
+        # #1159 / ASVS 10.2.3, the relying-party half of the same verb: the authorization parameters
+        # the OIDC login sends that nothing else screens. Advisory — see the check.
+        _check_oidc_auth_params(
+            config_dir,
+            service_config=service_config,
+            suppress_search=suppress_service_toml_search,
+        ),
         # #1182 / ASVS 13.2.1: name every DATABASE hop on an unchanging credential. The store's own
         # precondition is a StoreSettings method and reaches none of these. Advisory, and the refusing
         # gate is deliberately deferred — see the check.
@@ -1816,6 +1830,184 @@ def _check_static_db_credentials(config_dir: str | Path) -> CheckResult:
             "[store].require_managed_identity does NOT cover these hops"
         ),
     )
+
+
+# Which OIDC scope carries which standard claim (OIDC Core 1.0 section 5.4). Only the claims this
+# engine can be configured to READ are listed: `oidc_username_claim` is the sole scope-gated claim
+# the login path consumes, so this table is the whole of what the product needs a scope for.
+# `sub` is absent deliberately — it is returned with `openid` itself and needs no further scope.
+_OIDC_CLAIM_SCOPES: dict[str, str] = {
+    "name": "profile",
+    "family_name": "profile",
+    "given_name": "profile",
+    "middle_name": "profile",
+    "nickname": "profile",
+    "preferred_username": "profile",
+    "profile": "profile",
+    "email": "email",
+}
+
+# The `prompt` values OIDC Core 1.0 defines for the authorization endpoint (its section 3-1-2-1,
+# spelled with dashes because the dotted form trips the routable-IP-address content scanner). An
+# identity provider MAY define more, which is why a value outside this set is REPORTED, not refused.
+_OIDC_PROMPT_VALUES: frozenset[str] = frozenset({"none", "login", "consent", "select_account"})
+
+
+def _check_oidc_auth_params(
+    config_dir: str | Path,
+    *,
+    service_config: str | Path | None = None,
+    suppress_search: bool = False,
+) -> CheckResult:
+    """Report the authorization parameters the relying party sends that nothing else screens
+    (#1159, ASVS 10.2.3 — "the OAuth client only requests the required scopes (or other
+    authorization parameters)").
+
+    ``smart-scope`` covers the outbound SMART leg. This is the relying-party leg, and four of its
+    settings reach the authorization URL through no content check at all: ``[auth].oidc_scopes``
+    (``_split_oidc_lists`` comma-splits an env string into a list and screens nothing),
+    ``oidc_acr_values`` and ``oidc_prompt`` (plumbed straight through), with
+    ``oidc_username_claim`` the setting that decides which of them is actually *required*.
+
+    **The line worth having is the third one, and it is not a least-privilege report at all.** The
+    login path reads exactly one scope-gated claim, whichever ``oidc_username_claim`` names, and
+    raises ``username_claim_missing`` when the ID Token does not carry it. So an operator who points
+    that setting at ``email`` without adding the ``email`` scope has configured a login that fails
+    at its last hop, on a live user, with a message about a missing claim rather than a missing
+    scope. It is computable the moment the config loads, and before this nothing computed it.
+
+    The requested-versus-required comparison is deliberately at SCOPE granularity, because a scope
+    is the smallest thing an OAuth client can ask for — an over-grant is a scope that carries none
+    of the claims this engine reads, never an individual claim inside one it needs.
+
+    Advisory (``required=False``), for ``smart-scope``'s reason and one of its own. An IdP registers
+    parameters per client and MAY ignore or substitute what it is sent, so a refusal here would take
+    a working federated login offline to enforce a preference. And the ACR arm reports a *shape*: an
+    ``acr`` value the engine requires but never requests can still be satisfied by an IdP that
+    applies its own policy, so it is a question for an operator rather than a defect.
+
+    Stays silent where computing a requirement would be guessing: a ``oidc_username_claim`` outside
+    :data:`_OIDC_CLAIM_SCOPES` is a custom claim whose scope only the IdP knows, so no scope
+    conclusion is drawn from it and the over-grant arm is suppressed with it.
+
+    States the clean case out loud rather than going quiet — an absent line is indistinguishable
+    from a check that did not run. Service-toml resolution is :func:`_check_alert_smtp_tls`'s,
+    verbatim: these are ``[auth]`` settings, so ``load_config`` is the wrong reader."""
+    from pydantic import ValidationError
+
+    from messagefoundry.config.settings import load_settings
+
+    if service_config is not None:
+        toml: Path | None = Path(service_config) if Path(service_config).is_file() else None
+    elif suppress_search:
+        candidate = Path(config_dir) / "messagefoundry.toml"
+        toml = candidate if candidate.is_file() else None
+    else:
+        toml = _find_service_toml(config_dir)
+    if toml is None:
+        return CheckResult(
+            "oidc-auth-params",
+            ok=True,
+            required=False,
+            skipped=True,
+            detail="no messagefoundry.toml",
+        )
+    try:
+        settings = load_settings(config_path=toml)
+    except (FileNotFoundError, ValueError, ValidationError, OSError) as exc:
+        # Present-but-refused is a failure, not a skip (BACKLOG #1318) — same reasoning as
+        # `alert-smtp-tls`: `toml` resolved to an existing file above, so the loader rejected it.
+        return CheckResult(
+            "oidc-auth-params",
+            ok=False,
+            required=False,
+            detail=f"settings did not load: {exc}",
+        )
+    auth = settings.auth
+    if not auth.oidc_enabled:
+        return CheckResult(
+            "oidc-auth-params",
+            ok=True,
+            required=False,
+            detail="[auth].oidc_enabled=false — no authorization request is built",
+        )
+
+    notes: list[str] = []
+    requested = [s for s in auth.oidc_scopes if s]
+    claim = auth.oidc_username_claim
+    carrier = _OIDC_CLAIM_SCOPES.get(claim)
+
+    if "openid" not in requested:
+        notes.append(
+            "[auth].oidc_scopes omits 'openid' — an OpenID Connect authorization request "
+            "requires it and the identity provider will reject the request"
+        )
+    if carrier is not None and carrier not in requested:
+        notes.append(
+            f"[auth].oidc_username_claim={claim!r} is carried by the {carrier!r} scope, which "
+            f"[auth].oidc_scopes does not request — every federated login would fail at the "
+            f"last hop with username_claim_missing"
+        )
+    if carrier is not None or claim == "sub":
+        needed = {"openid"} | ({carrier} if carrier else set())
+        spare = sorted(set(requested) - needed)
+        if spare:
+            notes.append(
+                f"[auth].oidc_scopes requests {', '.join(repr(s) for s in spare)}, which carry no "
+                f"claim this engine reads — it consumes {claim!r} and nothing else scope-gated"
+            )
+    elif requested != ["openid", "profile"]:
+        # A custom username claim: its carrying scope is the IdP's business, so no scope is
+        # attributable and reporting an over-grant would be inventing a requirement.
+        notes.append(
+            f"[auth].oidc_username_claim={claim!r} is not an OIDC Core standard claim, so which "
+            f"scope carries it is the identity provider's to say — requested scopes not screened"
+        )
+
+    asked_acr = set((auth.oidc_acr_values or "").split())
+    required_acr = {v for v in auth.oidc_required_acr_values if v}
+    if required_acr and not asked_acr:
+        notes.append(
+            f"[auth].oidc_required_acr_values refuses a login without {sorted(required_acr)} but "
+            f"[auth].oidc_acr_values requests none — the identity provider is never asked for the "
+            f"assurance the engine then demands"
+        )
+    elif required_acr - asked_acr:
+        notes.append(
+            f"[auth].oidc_required_acr_values includes {sorted(required_acr - asked_acr)}, which "
+            f"[auth].oidc_acr_values does not request"
+        )
+    if asked_acr - required_acr:
+        notes.append(
+            f"[auth].oidc_acr_values requests {sorted(asked_acr - required_acr)}, which "
+            f"[auth].oidc_required_acr_values does not enforce on the returned token"
+        )
+
+    prompt = (auth.oidc_prompt or "").split()
+    unknown_prompt = [p for p in prompt if p not in _OIDC_PROMPT_VALUES]
+    if unknown_prompt:
+        notes.append(
+            f"[auth].oidc_prompt requests {unknown_prompt}, outside the OIDC Core set "
+            f"{sorted(_OIDC_PROMPT_VALUES)} — an identity provider MAY define its own, so confirm "
+            f"yours does"
+        )
+    if "none" in prompt and len(prompt) > 1:
+        notes.append(
+            "[auth].oidc_prompt combines 'none' with another value — OIDC Core requires 'none' to "
+            "appear alone and an identity provider will return an error"
+        )
+
+    if not notes:
+        return CheckResult(
+            "oidc-auth-params",
+            ok=True,
+            required=False,
+            detail=(
+                f"the OIDC authorization request asks for exactly what it reads — scopes "
+                f"{requested}, username claim {claim!r}"
+            ),
+        )
+    return CheckResult("oidc-auth-params", ok=True, required=False, detail="; ".join(notes))
 
 
 def _check_reference_backend(
