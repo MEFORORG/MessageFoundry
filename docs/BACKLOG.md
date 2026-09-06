@@ -10211,6 +10211,50 @@ further site-supplied values, measured by adding one at a time until the config 
 
 **Enumeration corrections from the lenses, none verdict-moving.** `OidcClaimPolicy` has two non-test construction sites, not one -- the second in `messagefoundry/verify/federation.py:292`, an in-scope engine module no matrix named. `/ui/sso` is a fourth federated console route (Kerberos, not OAuth, so this verb does not reach it) that a completeness claim has to name and exclude. And the two back-channel no-redirect citations quote one limb of a two-branch expression; both branches refuse a 3xx, so the property is stronger than recorded, but a second opener construction exists on the credential-bearing POST and one of this cell's own re-score triggers watches exactly that.
 
+
+**RE-MEASURED 2026-09-06 against RFC 9207 and RFC 9700 fetched from rfc-editor.org rather than
+paraphrased. THE FINDING HOLDS AND THE AFFIRMATIVE LIMB SHOULD BE RETRACTED: an `id_token` `iss`
+CLAIM is not a substitute for the RFC 9207 `iss` PARAMETER, and the reason is ORDERING.** The
+parameter is absent from the whole product: the callback route accepts `code`, `state` and `error`
+only, so an `iss` parameter from a conforming provider is discarded unread, and `complete_oidc_login`
+has no issuer argument to pass one to. The claim check is real and correct as an OIDC Core issuer
+check -- `_check_core_claims` compares `claims.get("iss")` against the pinned issuer -- but
+`_exchange_and_validate` runs `exchange_code` FIRST and `validate_id_token` second, and
+`exchange_code` POSTs the code, the PKCE verifier and, for a confidential client, the client secret
+before returning. So the check fires strictly downstream of the disclosure a mix-up defense exists to
+prevent. RFC 9207 section 4 permits omitting the parameter only where the AUTHORIZATION RESPONSE
+already carries the issuer identifier, naming the response types that return an ID Token from the
+AUTHORIZATION endpoint, or JARM; this client sends `response_type=code` with `response_mode=query`
+and refuses a token response with no ID Token, so its ID Token can only arrive from the TOKEN
+endpoint and the exemption does not reach it. RFC 9700 section 4.4.2, first subsection, lists both sanctioned
+transports for the identifier and both are in the authorization response.
+**WHAT ACTUALLY DEFENDS THE REDIRECT LEG is structural single-issuer pinning, not the claim check**,
+and the residual should be re-based on it: the four endpoint settings are scalar, the load-time
+validator requires all four and admits no selector, and RFC 9700 section 4.4.2 opens by stating that
+a client able to interact with only ONE authorization server needs no mix-up defense. So do not
+re-score downward either -- `fail` means no implementing control exists in any configuration, and on
+the only leg where the mix-up class is defined the antecedent is false.
+**A SEPARATE GAP THIS ITEM DOES NOT NAME, and RFC 9700 section 4.4.2 names it almost verbatim:**
+nothing requires `oidc_authorization_endpoint`, `oidc_token_endpoint` and `oidc_jwks_uri` to belong
+to the pinned `oidc_issuer`. The validator checks each URL independently for https and for membership
+in the operator's own `oidc_allowed_endpoints` list. The RFC warns that storing the authorization
+server URL alone is not sufficient, because an attacker can declare an honest server's authorization
+endpoint while declaring a token endpoint under their own control -- which is load-legal here. Stated
+conditionally: on a first deployment an operator whose allowlist named two hosts could configure a
+setup that authorizes the browser at host A and POSTs the code, the verifier and the client secret to
+host B, with the only issuer check firing after that POST. Not attacker-selected, so it is
+config-integrity hardening rather than a live attack path, and RFC 9207 support would NOT close it --
+the `iss` parameter attests who issued the authorization RESPONSE, not where the token POST goes. The
+fix is a coherence check in `_require_oidc_fields` after the existing per-URL loop. **NOT BUILT
+HERE:** `config/settings.py` was held by another live session's uncommitted work and the collision
+gate refused the edit.
+**ONE THING A READER WILL GET WRONG, supplied by the packet A session and worth stating in terms
+because it is the natural objection:** `auth/oidc/claims.py` pins the issuer before any continuity
+guard runs, so a reader who finds that pin will assume it closes the window above. It does not. The
+pin is on the TOKEN, which the engine does not hold until `exchange_code` has already returned -- it
+is the same check, at the same point in the sequence, and the sequence is the finding.
+Anchor drift: `flow.py:307` resolves at `:306`; `flow.py:253-262` at `:252-260`;
+`settings.py:1943` at `:2003`; `settings.py:2236-2248` at `:2296-2310`.
 ## 1159. research an honest pass for ASVS 10.2.3 -- least-privilege OAuth scopes the engine never validates
 
 > 🔢 **Re-scored 2026-08-20 -> P2.** Value **6/10** · Difficulty **4/10** · _quick win_. Gap stands unchanged: both scope settings reach the wire through a bare str() at smart.py:305 and http_auth.py:305 with no cross-check against the connector's declared interaction, checks.py carries no scope rule, and the wildcard example survives in at least five artifacts including the shipped wiring sample at wiring.py:531 (value 6). The remainder prices at 4: a research call on whether required scope is derivable, then an additive advisory check on the established checks.py CheckResult seam (four such checks already at :219/:253/:292/:424) plus doc narrowing, with a refusing gate ruled out. _(was 6/10 · 5/10.)_
