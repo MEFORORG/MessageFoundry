@@ -23359,3 +23359,681 @@ The gate's remedy named the owning worktree and said to commit from there. **`wo
 **The grandfathered numbers are not asserted, they are read off a commit.** Laundering a number this way needs a commit that already contains it, and producing one means passing this same gate on the worktree that allocated it. Editing the BODY of an existing item was never policed here in either direction -- the rule compares NUMBER SETS (`head - base`), so a merge cannot smuggle a subject past a check that never read subjects.
 
 **Two mutations hold the arms disjoint**, and the first attempt did not: an assertion about the carried number was written into the invented-number arm, so disabling the fix reddened both and the pair localised nothing. Corrected, then re-measured. Fix disabled reds only `test_a_merge_carrying_ANOTHER_worktrees_number_is_committable`; ownership skipped wholesale during a merge reds only `test_a_number_INVENTED_during_a_merge_is_still_refused`.
+
+## 1436. the leak gate's six-digit rule is a site-code prefix match, not a bare-integer rule, and narrowing it is dead on the true positives
+> 🔢 **Filed 2026-09-03 (worktree-agent-a056e3d1358c919f9) -- adversarial review complete; NO detector change recommended.** Value **3/10** · Difficulty **1/10** · _quick win_. A Builder reported in passing that the leak gate "flags any bare six-digit number as a site code", was blocked over a millisecond timeout constant, rephrased the line and moved on. Nobody had decided whether that was a defect. It was reviewed from both sides on 2026-09-03 and the answer is to leave the detectors alone. What remains is one paragraph of documentation, because the wrong mental model is what will reopen this question.
+>
+> Verdict: build (documentation only)
+> Research: none -- the measurement is in the body
+> Closing-act: docs
+
+**Cluster:** Leak gate / developer experience. **Priority:** P3. **Verdict:** build (small).
+**Severity:** no engine effect, no PHI axis, and **no deployment axis (sec. 0)** -- nothing here reaches shipped code. The measured cost of the gate is roughly one rephrased line per few hundred commits. The measured cost of every narrowing considered is a missed site code.
+
+### RECOMMENDATION: leave it, and the asymmetry settles it
+
+Every narrowing tested lets a realistic site code through, and the friction it would buy back is close to zero because the gate as configured **flags nothing on the tracked tree today**. There is no trade to make. The one real defect is a documentation gap: the Builder's model of the rule was wrong in both directions, nothing on the commit path corrects it, and a wrong model is what turns a rare, correct refusal into a standing proposal to weaken a control.
+
+### The rule the Builder described does not exist. There are two rules, and neither is "any bare six-digit number"
+
+| detector | where | fires on a bare six-digit integer? |
+|---|---|---|
+| `_ESTATE_ID_SHAPE` | [`scan_forbidden.py:233`](../scripts/security/scan_forbidden.py), reason at `:247` | **No.** The run must be welded to a letter-bearing segment by an underscore. Structural, always on, no token source needed. |
+| `_SITE_CODE_FILE` | built at [`scan_forbidden.py:679`](../scripts/security/scan_forbidden.py), reason `site code` emitted at `:1018` | **Only when its leading digits are one of the loaded `[site_prefix]` values.** The prefix is the secret and is never committed. |
+
+`_SITE_CODE_FILE` is `(?<![A-Za-z0-9.])(?:PREFIX)\d{4}(?![A-Za-z0-9.])`. A **two-digit** prefix therefore matches a delimited run of exactly six digits -- which is what a reader who cannot see the token list experiences as "any six-digit number". It is not: it is two of the ninety possible two-digit leading pairs. CI's floor in [`security.yml`](../.github/workflows/security.yml) pins `site_prefixes=2`, so two is what loads.
+
+Both paths were separated on one probe file, reasons-only, on 2026-09-03:
+
+```
+MEFOR_FORBIDDEN_TOKENS="" python scripts/security/scan_forbidden.py --path <probe>
+```
+
+With **no token source**, a six-digit millisecond constant written `timeout_ms = <n>` is clean, the same constant in prose is clean, and a byte count in a shell line is clean. Only the four underscore-joined forms hit -- `PT_<code>_ADT`, `IB_ACME_<code>.py`, `MAX_TIMEOUT_<n> = True` and `<n>_ms_budget`. So there **is** a prefix-free false-positive path, and it is narrow: it needs the integer welded into an identifier. With the real list loaded, the plain assignment and the prose line hit as well, because their leading digits happen to match a loaded prefix. That is the block the Builder hit.
+
+### What it protects, from the code rather than from assumption
+
+A site code identifies a real customer site in a ported estate, and the token-keyed detectors are `_NEVER` until the owner adds that estate's prefix -- so the estate nobody has filed yet is exactly the one that leaks. The comment at [`scan_forbidden.py:216`](../scripts/security/scan_forbidden.py) records the case that produced `_ESTATE_ID_SHAPE`: a required merge context exited 0 on a tracked file carrying a real site code, because the file **was** scanned and the loaded detectors simply did not cover that prefix (**#321**). The structural shape is the backstop for that, not a second copy of the same check.
+
+### False positives over the real corpus, at `46ea10a78`
+
+Instrument: the scanner's own `_candidate_files`, `_read_text`, `_is_skipped`, skip sets and allowlist, imported rather than re-derived. **2,038 tracked text files** scanned, 23 binary skipped.
+
+| population | lines | files |
+|---|---|---|
+| bare delimited six-digit runs, ungated | 1,199 | 136 |
+| the same, over the population `_SITE_CODE_FILE` actually sees (site-skip applied) | 379 | 129 |
+| `_ESTATE_ID_SHAPE` | **0** | **0** |
+| **the gate as configured, real token list, whole tracked tree** | **0** | **0** |
+
+That last row is the whole argument, and it is one command: `python scripts/security/scan_forbidden.py` over the tracked tree exits **0** with the real list loaded (`names=8, estate=14, site_prefixes=2`). A gate that flags nothing is not a gate anyone is being trained to route around.
+
+**The two populations are different questions and must not be quoted for each other.** The 1,199 figure is ungated; the 379 figure has the site-skip applied, which is what `_SITE_CODE_FILE` sees and `_ESTATE_ID_SHAPE` deliberately does not. The scanner's own comment at `:204` quotes 1,414 across 152 files for the ungated population at an earlier commit -- same order, drifted down; it is stale rather than wrong.
+
+**Positive control.** The same sweep carried a nonsense token that returned 0 everywhere, while the width-5, width-6 and width-7 arms returned 1,619, 1,199 and 453 lines from the identical loop. A zero from a broken search would have looked like the estate-shape row; it does not, because the instrument that produced that zero produced four non-zero numbers beside it.
+
+**Cost per hypothetical prefix.** Sweeping all 90 two-digit prefixes rather than looking up the real ones -- so this discloses nothing -- one prefix flags **min 0, median 1, p75 5, p90 15, max 32** lines across 2,038 files. 58 of 90 flag at least one.
+
+### Friction is a rate, and the standing corpus only measures survivors
+
+Over the **350 commits** reachable from `46ea10a78` (shallow clone, deepened for this), reading added lines only:
+
+- **21 of 350 commits (6.0%)** added a line carrying a bare delimited six-digit run anywhere.
+- Per hypothetical two-digit prefix: **median 1 commit blocked in 350, p75 2, max 6.**
+- `_ESTATE_ID_SHAPE` matched an added line in **1 of 350 commits** -- `6c963cac3`, the commit that added the detector's own test fixtures.
+
+So one loaded prefix costs roughly one blocked commit in 350, and the pair roughly one in 175. The Builder drew that card. **A rate that low does not train anyone to route around anything**; the case for narrowing rests on friction that was asserted from a single instance and is not there when measured.
+
+### Every narrowing considered is dead on the true positives
+
+Judged against the pair the gate actually runs (`_SITE_CODE_FILE` **or** `_ESTATE_ID_SHAPE`), because judging either alone answers the adjacent question. True positives were built on the **shipped synthetic prefix** from `scan-tokens.local.txt.example`, so no real value appears anywhere in this work.
+
+| narrowing | true positives missed (of 12) | corpus lines it would clear | verdict |
+|---|---|---|---|
+| require an underscore-joined identifier | 8 -- every bare form: HL7 field, prose, quoted config value, CSV cell, a code alone on a line | -- | **dead** |
+| drop runs whose last four digits are zeros | 3 -- a site code that happens to be round | 6.2% | **dead** |
+| drop runs ending in three or more zeros | 3 -- same | 6.5% | **dead** |
+| require an adjacent identifier, HL7 or quoting character | 4 -- bare in prose, bare on a line, both round-bare | -- | **dead** |
+| **shipped pair, unchanged** | **0** | -- | keep |
+
+The first row is the one that looks most reasonable and is the most clearly wrong: **it re-derives `_ESTATE_ID_SHAPE`, which already ships.** The token-loaded detector exists precisely to add the forms the underscore anchor cannot reach -- a code in an HL7 field, in prose, in a quoted config value. Narrowing it to the anchor would delete its entire reason for existing and leave a second copy of a detector that already matched 0 lines of the tree.
+
+The round-number rows are dead on an assumption worth naming: **that an estate can issue a site code ending in four zeros.** Nothing in the format reserves it, and the exclusion would open a hole of one code in ten thousand per prefix. Whether any real estate has actually issued such a code was not checked, and could not be without reading the token list. If someone later shows that band is unissued, these two rows move from "dead" to "buys 6% of nothing", which is still not worth an under-detection hole in a gate whose filed defect is an unnoticed blind spot.
+
+### The third paths, and which of them is displacement
+
+- **A documented allowlist mechanism already exists** and is the right remedy for a vetted false positive: [`scan-allowlist.txt`](../scripts/security/scan-allowlist.txt), guarded against over-broad entries by `_ALLOWLIST_CANARIES`, and already carrying an entry for exactly this class -- a benchmark task counter that collided with the synthetic site-code guard. Proposing it as new work is displacement.
+- **A per-hit reason naming the loaded set was already declined** by lane ruling under **#322**. Do not re-propose it.
+- **The one thing actually missing** is a short paragraph, in the place a blocked committer looks, saying: a plain integer can be a site-code hit when its leading digits match a loaded prefix; the run banner tells you which detector set is live; the remedy is to rephrase or to add a vetted allowlist line, never to weaken the rule. That text exists today only in `scan-tokens.local.txt.example`, under a heading scoped to *running the synthetic set*, which a maintainer on the real list reads as somebody else's problem. **The scope of this item is moving it to [`CONTRIBUTING.md`](../CONTRIBUTING.md)'s leak-gate section.**
+
+### Two notes on how this review was run
+
+**A `--show-context` run echoed a real token value into a session transcript.** The scanner's own docstring says that flag is never used in CI because a hit means the content is already tracked, so echoing it copies the leak into a public log. It was used once here on a scratch probe file outside the repository, the value reached no tracked file, no commit and no pull request, and every later run in this review was reasons-only. Recorded because a control that is bypassed quietly is worse than one that is bypassed loudly.
+
+**No concrete six-digit value appears in this item, deliberately.** Writing one is the trap **#322** documents: a placeholder built from a loaded prefix is a real hit in tracked content, and nothing warns you before the hook fires.
+
+## 1444. a backlog item can be filed with no value or difficulty, so a scoring pass decays at the filing rate
+
+> 🔢 **Filed 2026-09-04 - not started. This is a DECISION, not a defect: the items are behaving correctly and the ledger has no gate.** Value **5/10** · Difficulty **3/10** · _fill-in_. Value 5 because the ranked tables silently stop being a complete view of the corpus, and a reader has no way to tell a ranked ledger from a partly-ranked one; a re-run is a real workaround, which is what holds it out of the higher bands. Difficulty 3 because either remedy is small on its own and the cost is the ruling above it, not the code.
+
+**Cluster:** repository tooling / ledger integrity. **Priority:** P3. **Verdict:** research.
+**Severity:** no engine effect, no PHI axis, and **no deployment axis (sec. 0)** -- this is a property of `docs/BACKLOG.md`, which ships in no wheel. The cost is that a planning read of the ranked tables understates the corpus by however many items were filed since the last pass.
+
+**The mechanism, in one sentence: a scoring pass is a SNAPSHOT, and nothing in CI requires a score at filing, so the gap re-opens at the filing rate.**
+
+**Measured 2026-09-04 against `main` at `685d4f548`, and independently confirmed by the seat that ran the pass:** **278** open items, **5** carrying no value or difficulty -- #1424, #1427, #1429, #1430 and #1439. Every one of the five was filed on 2026-09-03. The previous pass closed this to zero on 2026-09-03 when PR 754 merged, so **the gap went from 0 to 5 in about a day.**
+
+**The items are not doing anything wrong, and #1427 says so in its own banner:** *"NO SCORE. Value and difficulty belong to a scoring pass"*. That is a deliberate convention, and it is exactly what makes this a decision rather than a bug report.
+
+**The two remedies, and why neither is free.**
+
+*Move the gate to filing time.* One check instead of recurring passes. It **contradicts the convention #1427 states**, so it needs a ruling before it needs code. And it would **red on the five existing unscored items on day one**, so it is unshippable without a grandfather baseline or a changed-lines-only scope -- the same shape as **#1435**, which is open in PR 831 and **not yet on `main`** -- there, an unscoped ledger gate measured 22 day-one failures and was deliberately not built for that reason.
+
+*Re-run the pass periodically.* Keeps the convention intact and needs no gate, but it is unbounded recurring work whose cadence nobody has set, and the gap re-opens between every run. That is precisely what just happened.
+
+**What would NOT settle this:** scoring the five and calling it closed. That is another snapshot, and it decays the same way. The thing to fix is the absence of a gate or a cadence, not the current five.
+
+**Source:** reported 2026-09-04 by the seat that ran the 2026-09-03 scoring pass, one day after that pass closed the gap to zero. Re-measured here with `parse_items` rather than a hand-rolled scan, against that seat's figures, and both the count and the exact five item numbers agreed.
+
+## 1441. Non-serve CLI subcommands run with no root logging handler, so WARNING+ records bypass the PHI filter chain via logging.lastResort
+
+> 🔢 **Filed 2026-09-03 -- not started.** Two of the CLI's 32 subcommands install a root logging handler. The other 30 run with an empty root handler list, so the standard library services their records through `logging.lastResort`. That handler carries `filters=[]` and `formatter=None`. Every `RedactionFilter`, `CredentialQueryScrubFilter` and `ControlCharScrubFilter` that `logging_setup._install_phi_filters` puts on a configured handler is therefore absent, and a WARNING or above prints to stderr as written. **On a first deployment an operator running `backup`, `restore-verify`, `rekey-audit`, `rotate-key` or `admin-unlock` would get any such record, and any traceback attached to it, rendered raw.** Measured below with a paired control. **#1199's fix, [PR 820](https://github.com/MEFORORG/MessageFoundry/pull/820), has since merged and was re-checked against this at `a2eef0f37`; it does not close it** -- it is per-logger with one call site, and it never touches `__main__.py`.
+>
+> **Scored 2026-09-03 -> P2.** Value **7/10** · Difficulty **4/10** · _quick win_. Value 7 -- a real gap with no in-product workaround, because the filter chain is a property of the handler and no call site can restore it for a process that installed none. Held below 8 by two bounds this item measured rather than assumed: `lastResort.level` is `WARNING`, so the 19 DEBUG and INFO `exc_info` sites under `store/` and `pipeline/` are dropped rather than leaked, and some call sites already redact through `redaction.safe_exc`, which survives an unfiltered handler. Difficulty 4 -- the code change is small and sits on an existing seam, but 40 test files assert on captured CLI output and 6 of them use `caplog`, which `configure_logging` breaks by construction (measured below). The remainder is test reconciliation, not new machinery.
+> Verdict: build
+> Research: none
+> Closing-act: code
+
+**Cluster:** Error handling / PHI redaction. **Priority:** P2. **Verdict:** build.
+**Severity:** a redaction-coverage gap in shipped code, stated in the conditional per section 0 -- there are no deployments, so nothing is leaking today. What is wrong today is the code: a PHI-safety control the `serve` path has does not exist in 30 sibling processes. **The exposure route would be an operator's own console, and whatever it is piped to** -- a terminal scrollback, a redirect, a ticket attachment, a CI log. Unlike `serve`, these subcommands do not run under NSSM, so nothing captures their output to a controlled file.
+
+**This extends a hazard the project has already half-named, which is why it should not be read as an exotic new claim.** CLAUDE.md section 9 records that CLI `dryrun` and `generate` output can contain full message bodies on stdout and stderr, and rules that they must never run against real PHI or have their output redirected to a committed file, ticket or CI log. That rule covers **deliberate** payload output from two subcommands. This item is the **incidental** case across 30: the same two streams, the same destinations, no operator intent, and no rule written for it. The existing prohibition tells an operator not to point `dryrun` at real data. Nothing tells them that `backup` failing at 2am writes whatever the traceback quotes.
+
+### The state, measured 2026-09-03 at `46ea10a78`, re-verified 2026-09-04 at `a2eef0f37`
+
+**Re-verified because `main` moved 58 commits between the two dates, and both measured files changed** (`__main__.py` +264 lines, `logging_setup.py` +113). The counts below are unchanged across that move: still 32 subcommands, still exactly `serve` and `supervise`, and `main()` still installs nothing. One claim in an earlier draft of this row **did** go stale in that window and was corrected rather than left standing -- see the #1199 section.
+
+`_DISPATCH` in [`messagefoundry/__main__.py`](../messagefoundry/__main__.py) holds **32 subcommands**. Reading each dispatch target's own source for a `configure_logging(` call:
+
+| result | count | which |
+|---|---|---|
+| configures logging | 2 | `serve`, `supervise` |
+| does not | 30 | `admin-unlock`, `adr-analyze`, `ai-policy`, `alert`, `audit-anchor`, `audit-verify`, `backup`, `cert`, `check`, `codeset`, `connection`, `dryrun`, `gen-key`, `generate`, `graph`, `hl7schema`, `hl7structures`, `impact`, `import`, `init`, `lens`, `protect-key`, `rekey-audit`, `restore-verify`, `rotate-key`, `security`, `service`, `support-bundle`, `validate`, `verify` |
+
+A second, independent instrument agrees. A static sweep for `configure_logging(`, `configure_stderr_logging(`, `basicConfig(` and `root.addHandler` across `messagefoundry/` returns handler installs only in `logging_setup` itself, in `_serve` and `_supervise`, in `pipeline/_sandbox_worker` (which correctly calls `configure_stderr_logging`), and in the tray entrypoint -- out of scope, see the last section.
+
+### The mechanism: `logging.lastResort` is unfiltered and unformatted
+
+In a bare interpreter:
+
+```
+type      = _StderrHandler
+filters   = []
+formatter = None
+level     = WARNING
+root.handlers = []
+```
+
+`filters = []` is the whole finding. Redaction here is a property of the **handler**, not of the logger or the call site -- the premise `configure_stderr_logging` states in its own docstring. A process that installs no handler does not get a weaker chain. It gets no chain.
+
+**The shipped code already knows about the level half of this, in four places, and none of them mentions the filters.** All four sit in `_serve`, in the window before `configure_logging` runs. One comment states the mechanism outright -- every record there is serviced by `logging.lastResort`, "which drops < WARNING at ANY `--log-level` and reaches none of the handlers/filters/off-box forwarder the operator configured". The other three are workarounds built on the same fact: one routes an announcement to `print(file=sys.stderr)` instead of `logging.info` because INFO would vanish, and two deliberately raise an audit line to WARNING **so that `lastResort` will surface it**. Those two are the sharp ones. They are shipped code choosing the level that reaches the unfiltered handler, and they are correct about visibility while saying nothing about redaction. So the mechanism is not a discovery. **What is missing everywhere is the filter guarantee attached to it.**
+
+### The A/B, through the real `main()`, one variable
+
+Both arms run the real `messagefoundry backup` path: real argparse, real stream hardening, real dispatch. Only the subcommand body is replaced, so the record is deterministic. Arm B adds the single call `_serve` makes.
+
+| arm | `root.handlers` at dispatch | WARNING output | traceback output |
+|---|---|---|---|
+| **A** -- as shipped, no `configure_logging` | `[]` | `dr backup: could not persist PID\|1\|\|123456^^^HOSP^MR\|\|DOE^JANE^Q\|\|19800101\|F` | full traceback, ending `ValueError: row rejected: PID\|1\|\|123456^^^HOSP^MR\|\|...` verbatim |
+| **B** -- control, `configure_logging` first | `[StreamHandler]` carrying `RedactionFilter`, `CredentialQueryScrubFilter`, `ControlCharScrubFilter` | `2026-09-03T23:41:43Z WARNING messagefoundry.store: dr backup: could not persist PID\|[redacted]` | traceback indented and quoted, ending `ValueError: row rejected: PID\|[redacted]` |
+
+**The control fires in both limbs**, which is what makes arm A a reading rather than an absence. A probe that found nothing here would be indistinguishable from a filter chain that does not redact this shape at all.
+
+Segment used: the synthetic `PID|1||123456^^^HOSP^MR||DOE^JANE^Q||19800101|F`. No real PHI, per section 9.
+
+### What a deploying site would reach
+
+A **real** `messagefoundry backup --db <path> --destination <dir>` run was executed and instrumented. `root.handlers` was `[]` for the whole run, before and after. Seven modules carrying WARNING-or-above traceback sites loaded during it:
+
+| module | WARNING+ sites carrying a traceback |
+|---|---|
+| `store/store.py` | 6 |
+| `pipeline/dr_backup.py` | 5 |
+| `pipeline/dr.py` | 2 |
+| `pipeline/retention.py` | 2 |
+| `store/audit_tee.py` | 1 |
+| `store/base.py` | 1 |
+| `store/gcm_bound.py` | 1 |
+| **total reachable from one `backup` run** | **18** |
+
+Counted by walking the AST for `.warning`, `.error`, `.critical` or `.exception` calls carrying `exc_info`, so a call split across lines is not missed.
+
+**One limit, stated rather than papered over.** This establishes the mechanism and the reachable site count. It does **not** establish that any of those 18 records carries PHI in its text or its traceback frames. Some already redact at the call site through `redaction.safe_exc`, and that redaction survives an unfiltered handler. Whoever takes this item should sample the reachable sites before restating the severity. The defect is that the control is absent, not that a named record is known to leak.
+
+**Negative control on the level bound:** 19 DEBUG and INFO `exc_info` sites exist under the same two trees. `lastResort.level` is `WARNING`, so those are dropped, not leaked. That is a different defect, treated next, and it is why this item is scoped to WARNING and above.
+
+### This is not #1199, and the two must not be merged
+
+Both items sit on the same empty-root-handler state and take **opposite** consequences from it, split by the `lastResort` level threshold:
+
+| level | consequence | item |
+|---|---|---|
+| below WARNING | the record is dropped outright and never reaches the off-box tee | **#1199** |
+| WARNING and above | the record is rendered, unfiltered and unformatted | **this item** |
+
+#1199 already records the shared premise in its own text, including the two-call-site count. Its fix -- `logging_setup.ensure_logger_sink` -- addresses the audit tee's INFO record. **It has landed**, as commit `99887f5a4` via [PR 820](https://github.com/MEFORORG/MessageFoundry/pull/820).
+
+**It does not close this gap, and that was checked rather than assumed.** Re-measured against `a2eef0f37`:
+
+| question | reading on `main` |
+|---|---|
+| does `main()` call `configure_logging`? | no |
+| does `main()` call `ensure_logger_sink`? | no -- the symbol does not appear in `__main__.py` at all |
+| subcommands in `_DISPATCH` | 32 |
+| of those, configuring logging | 2 (`serve`, `supervise`) -- unchanged |
+
+`ensure_logger_sink` is **per-logger by construction**: it guarantees a sink on the one logger it is handed, and its only caller hands it the audit logger. The 18 traceback sites this item counts log on `messagefoundry.store` and `messagefoundry.pipeline.dr_backup`, which it never touches. A narrow fix for the INFO-drop half is the right shape for #1199 and leaves the WARNING+ half exactly as measured.
+
+**It is the right seam to read first.** `build_stderr_handler` is now the single definition of a MessageFoundry stderr sink and already calls `_install_phi_filters`, and `ensure_logger_sink` is idempotent and self-removing once a process configures a real sink. Remedy (2) below is close to "call it on the `messagefoundry` logger too". Read `logging_setup` as it stands before building anything here.
+
+**A method note, recorded because it nearly shipped a false claim in this row.** An earlier draft asserted the #1199 fix was *"not on `main`"* and cited its branch head. That was true when measured and false eight hours later, and the row was one push away from carrying it. **A claim about another branch's state has a shelf life; a claim about your own measurement does not.** Prefer the second, and re-read the first before you land.
+
+### The precedent: this class has been fixed here twice
+
+- **#1054** -- the sandbox child logged through an unfiltered root logger. `configure_stderr_logging` exists because of it, and its docstring states the governing rule: *"Every process that logs installs the chain, or it does not have it."* Thirty subcommands do not.
+- **#1055** -- `threading.excepthook` was unreplaced, so a traceback on the sandbox reader thread reached the stdlib hook unredacted. Shipped 2026-08-10, measured with the same synthetic segment, and the pre-fix reading had this shape: a raw traceback ending in a full `PID` segment.
+
+Both were accepted as defects and built. This is the third member of the family and the widest, because it covers 30 entrypoints rather than one thread or one child process.
+
+**A naming collision to avoid.** `messagefoundry/last_resort.py` is a different subject: the process-level uncaught-exception backstop for ASVS 16.5.4. It routes through `safe_exc` and works correctly. It has nothing to do with `logging.lastResort`, the standard library's handler of last resort. Say which one you mean.
+
+### Two candidate remedies, and this item does not pick one
+
+**(1) Configure logging for every subcommand, in `main()`.** Correct by construction, and it matches the #1054 rule. Every process installs the chain. The cost is the blast radius below.
+
+**(2) A narrower per-logger fallback.** Attach the filter chain to the `messagefoundry` logger, or install a filtered sink only when the root has no handlers -- the shape `ensure_logger_sink` already takes on the #1199 branch. Smaller output change, and it leaves third-party WARNINGs on `lastResort`. Whether that residue matters is the open question for whoever takes this.
+
+**Neither is chosen here.** Remedy (1) has the larger and better-understood cost. Remedy (2) has an unmeasured coverage boundary.
+
+### Blast radius, measured -- and remedy (1) breaks `caplog` by construction
+
+| reading | count |
+|---|---|
+| test files importing `messagefoundry.__main__` | 47 |
+| of those, asserting on captured output | 40 |
+| using `capsys` / `capfd` | 39 |
+| using `caplog` | 6 |
+
+Two distinct effects, and the second is the sharp one.
+
+**`capsys` / `capfd`:** records that today reach stderr bare would gain the standard formatter prefix (`<UTC timestamp> LEVEL logger: `) and real redaction. Under remedy (1) as `configure_logging` is written, they would also move from **stderr to stdout**. Any assertion pinning exact text, or pinning which stream carried it, sees something different.
+
+**`caplog`:** `configure_logging` removes every existing root handler before adding its own. Pytest's `caplog` captures through a handler on the root logger. Measured as a paired test, one variable:
+
+| arm | result |
+|---|---|
+| control -- `caplog` with nothing clearing root handlers | captures the record, **passes** |
+| arm -- identical, `configure_logging` called first | `caplog.text` is empty, **fails** |
+
+So remedy (1) does not merely change what those 6 files read. It empties their capture. That is a design question for the fix -- whether `main()` should configure only when the root has no handlers, or whether those tests should install the chain themselves -- and it is why difficulty is 4 rather than 2.
+
+### One adjacent observation, deliberately NOT part of this item
+
+`messagefoundry/tray/__main__.py` installs its own root handler in `_setup_logging`: a `RotatingFileHandler` on `tray.log` with a hand-written `logging.Formatter` and **no call to `_install_phi_filters`**. It is a separate Windows entrypoint (ADR 0113), not a `messagefoundry` subcommand, so it sits outside this item's scope and outside every measurement above.
+
+**This paragraph is the only record of it, deliberately.** The owner ruled on 2026-09-03 to keep it here rather than allocate a second number, so it is a footnote by decision, not by oversight. Re-find it with the instrument that catches it:
+
+```bash
+grep -rn "root\.addHandler" --include=*.py messagefoundry/
+```
+
+**Why it was missed, which is the transferable part.** #1199 and PR 820 both state "only two call sites install a root handler in the package". That count came from a pattern matching `configure_logging(`, `configure_stderr_logging(` and `basicConfig(`, which **cannot** match a bare `root.addHandler` -- so it returned a complete-looking answer over an incomplete search space. Its positive control counted `getLogger` hits, which fires whether or not the pattern covers every install route: a control on the corpus, not on the predicate. **Prefer "at least two" to an enumeration**, per section 11. The author of PR 820 accepted this as a defect in that docstring. **820 has since merged with the wording intact**, so the overstatement is on `main` today: `git show origin/main:messagefoundry/logging_setup.py | grep -c "Only two call sites"` returns 1 at `a2eef0f37`. Correcting it is a one-line docstring edit that belongs to whoever takes this row.
+
+Whether the tray needs the chain is unresolved and unclaimed. It is named as a subject rather than a number, per the ledger rule on citing work nobody has allocated.
+
+**Related:** #1054 and #1055 (the same class, both shipped), #1199 (the same premise, the opposite consequence) and its fix [PR 820](https://github.com/MEFORORG/MessageFoundry/pull/820), merged as `99887f5a4` and re-checked against this gap at `a2eef0f37`, which does not close it.
+
+## 1450. the live-API drift detector is invisible from the file it guards, so two readers in one night concluded the drift was undetectable
+
+> 🚧 **Filed 2026-09-04. Nothing is built here. This item is a measurement and a recommendation NOT to build the thing it was opened for.** Value **4/10** · Difficulty **2/10** for the documentation fix, **5/10** for routing the notice. A process and documentation defect, not a product exposure: MessageFoundry has zero deployments, and no claim below is present-tense about a running site.
+
+**The defect, in one sentence: `.github/required-contexts.txt` names its document-to-document guard and does not name its live-API guard, so a reader who asks "what would catch the server moving?" reads the file and correctly concludes: nothing.**
+
+The live-API guard exists. `scripts/ci/check_required_contexts_drift.py` reads the required set from the public `GET /repos/{owner}/{repo}/branches/{branch}` endpoint, which answers unauthenticated, and compares it to the checked-in file as a SET rather than a count. It runs as the job `the required-contexts file matches the server` in `.github/workflows/required-workflow-state.yml`. It fails closed: a read error is reported as a failure, never as agreement.
+
+Neither `.github/required-contexts.txt` nor `tests/test_required_contexts.py` mentions it. The file's own summary of what guards it says the checked-in claim is "what `tests/test_required_contexts.py` asserts", full stop. The test's count-pin comment goes further and tells the reader to "reconcile against the API, never against this number" without saying that a script and a CI job already do exactly that.
+
+### The measured instance, and it is this item's own filing
+
+On 2026-09-04 a Console measured the drift, read those two files, and briefed a Builder that the guard "is structurally incapable of catching a server-side change" and had "now failed that way twice". A peer Console corrected it mid-flight. Both readings were reasonable from the sources; one of them was wrong. The brief that reached this Builder therefore asked for an instrument that already exists, and asked for it to be recorded as a structural impossibility.
+
+**That is the failure worth recording.** The instrument is not missing. It is unfindable from the artifact it protects, which for a repository whose sessions are isolated and whose only shared memory is the ledger is close to the same thing.
+
+### What was actually measured, 2026-09-04
+
+All readings taken between 23:24Z and 23:56Z, each with a positive control, because a broken instrument returns the same empty output as a clean repository.
+
+| Question | Instrument | Reading |
+|---|---|---|
+| Required contexts on `main` | `gh api .../branches/main/protection` | 13, no `a reviewer has read this` |
+| The same, public endpoint | `gh api .../branches/main` | 13, identical set. The two endpoints agreed |
+| Contexts named in the file | `git show origin/main:.github/required-contexts.txt` | 14, still naming the retired context |
+| The pin | `tests/test_required_contexts.py` | `assert len(contexts) == 14` |
+| Does the drift job carry `continue-on-error`? | grep, positive control on `runs-on` | **No.** Zero occurrences; it goes red on a finding |
+| Is the drift job a required context? | the 13 above | **No.** It reports; it blocks nothing |
+| Has it run and failed on this drift? | `gh run view --json jobs` | **Not yet, and pending is not a verdict.** Its last verdict was `success` at 23:25:00Z, which BOUNDS the retirement: the server still held 14 contexts then and held 13 by 23:52Z. The only later runs were queued with no conclusion |
+
+**A whole-run conclusion is not a job conclusion.** The runs above were read per job (SDS-3.8). Reading `gh run list`'s `conclusion` field would have answered a different question than the one asked.
+
+### The real remainder, which is smaller than the brief claimed and is about ROUTING, not detection
+
+Detection works. Three things sit between a server-side change and a reader.
+
+1. **The job is not required, so it blocks nothing.** A drifted file merges. That is arguably correct and is dealt with under *the recommendation* below.
+2. **A pull-request run reads the PULL REQUEST'S file, so it can never report `main` stale.** This is the sharp one and an earlier draft of this item got it wrong. The `pull_request:` trigger IS paths-filtered to `.github/required-contexts.txt` and `.github/workflows/**`, but a PR touching those paths DOES fire it -- measured on PR 884, run created 2026-09-04T23:55:21Z, `event=pull_request`. What stops it seeing the drift is the CHECKOUT: the job runs `actions/checkout` with no `ref:`, so on a pull-request event it reads the file as that PR has it, then compares against the live server. So 884 compares 13 against 13 and PASSES. The run VALIDATES A FIX; it is structurally incapable of reporting that `main` is stale. "No pull request triggers it" is falsifiable and false; "no pull-request run can see the drift on `main`" is true, stronger, and the one to carry. Correction owed to the Lander, who caught it.
+3. **What is left is the 07:00 UTC cron on `main`, and a red scheduled run notifies nobody.** This repository already knows that shape: #1402 records a required check going red signalling nobody, and #1406 records a watcher that can find a problem and has no way to tell anyone. This is the same failure on a scheduled job. Detection at most once a day is adequate for this; detection into a channel nobody polls is not.
+
+The window that follows is bounded and was measured on this instance: the retirement landed after 23:25Z, so the first scheduled verdict falls due 2026-09-05 07:00 UTC, up to about eight hours later.
+
+### The recommendation: DO NOT add a live-API arm to the pytest suite
+
+This item was opened to assess exactly that. The assessment is negative, for reasons that are about where the check lives rather than whether it is worth having.
+
+**`tests/test_required_contexts.py` runs inside a REQUIRED test leg.** Putting a network call there makes every required leg on every pull request depend on GitHub's API being reachable from the runner. The drift script fails closed by design, which is right for a scheduled advisory job and wrong for a required one: a transient API failure would then red a required check on every open PR at once, for a reason unrelated to any of them. That is the required-but-absent trap's cousin, and `.github/required-contexts.txt` already documents the family.
+
+**The test suite also runs offline, on fork PRs, and on developer machines**, none of which can be assumed to reach the API or hold `gh`. An arm that skips when it cannot reach the network is worse than no arm: a skip renders as a pass.
+
+**And the instrument already exists.** Writing a second one inside pytest would give two implementations of one question, which is the drift script's own stated reason for not folding itself into `check_required_workflow_state.py`.
+
+**What to do instead, in cost order:**
+
+1. **Name the drift job in the two files that hide it.** `.github/required-contexts.txt` should say which instrument answers which question, and `tests/test_required_contexts.py`'s count-pin comment should point at the script rather than at "the API" in the abstract. This is the whole documentation defect and it is a few lines. It is what would have prevented this item's own filing.
+2. **Route the scheduled red.** A failing 07:00 UTC run on `main` should reach a seat the way `unread-signal.yml` (#1413) and `failure-signal.yml` route theirs. Shape it after those; do not invent a third pattern.
+3. **Promoting the job to required is an owner decision and is NOT recommended here.** It would need the fail-closed behaviour reconsidered first, and adding to protection is all-or-nothing (the REST endpoint 422s with `already_exists` and then adds none of the request).
+
+### Not fixed here, and why
+
+**The reconciliation itself is PR 884**, which removes the retired context, moves the pin from 14 to 13, and updates `docs/CI.md`, `tests/negative_controls.toml`, `tests/test_merge_gate_controls.py`, `tests/test_security_posture.py` and `codeql.yml`. This Builder began the same edit, was warned by the collision registry, read that branch, and stood down rather than ship a competing edit to the same lines of a file 60 open pull requests already conflict over. No file in that PR's diff is touched here.
+
+**One thing PR 884 leaves stale, named rather than numbered so it does not need re-measuring.** `.github/required-contexts.txt` lines 18 to 24 still read "THE LIST BELOW IS SET-EQUAL TO THE SERVER -- fourteen contexts, nothing extra on either side -- read from the API at 2026-08-31 20:57 CDT". PR 884 edits only the block around line 202, so on that branch the file names thirteen contexts under a header asserting fourteen. **The set-equality claim is the single assertion this file exists to carry**, and it is the one left pointing at a superseded reading. It wants the 2026-09-04 date and the thirteen-context reading, and the fix is that paragraph alone.
+
+### The prose in the pin comment that is now half true
+
+`tests/test_required_contexts.py` lines 114 to 118 say the pin "GOES STALE IN THE DIRECTION THAT LOOKS FINE" and that "a count that only ever fails when someone edits the FILE cannot notice the server moving underneath it". **Both sentences are still literally true of that test** and should stay. What has changed is the implication a reader draws from them, which is that nothing notices. Something does. The paragraph needs one clause naming it, not a rewrite.
+
+## 1457. zizmor 1.30.0 flags cla.yml self-repository, and the bump that introduced it merged with its own gate red
+
+> 🔢 **Filed 2026-09-05 (handoff-review-1211-f6d05b), found while attributing a red on PR 901 rather than looked for.** Value **5/10** - Difficulty **3/10**. **`main` CARRIES A ZIZMOR RED THAT NOTHING WILL CLEAR ON ITS OWN.** Dependabot's #891 bumped `zizmor==1.29.0` to `1.30.0` in `ci/locks/ci-scanners.lock`. That release added the `self-repository` audit, which fires LOW on `.github/workflows/cla.yml:102` -- the vendored local action is referenced as `uses: ./.github/actions/cla-assistant-lite`, and the audit wants what its help text calls GitHub's dedicated self-repository syntax. The job exits 12 on any finding, so one LOW fails it.
+>
+> **THE GATE RAN ON THE BUMP AND WAS MERGED PAST, which is the part worth filing.** #891's own zizmor run 33945900593 finished 2026-09-05T04:57:02Z with `79 findings (30 ignored, 48 suppressed, 1 safe fixes): 0 informational, 1 low, 0 medium, 0 high` and `exit code 12`. The pull request merged at 21:02:26Z, about sixteen hours later. **This was not a protection bypass:** read from the server that day, `zizmor (GitHub Actions static analysis)` is NOT among the thirteen required contexts, `autoMergeRequest` was null, and the merge was an ordinary one. An advisory check went red and nobody was obliged to stop. That is the finding -- not misconduct, a gate whose redness costs nothing.
+>
+> **MEASURED, AND THE INSTRUMENT WAS NOT `main`.** `main` has not run zizmor since the bump; its last run is 2026-09-05T09:35:09Z at `b9d204e38`, green, and it predates #891's merge. What was measured is stronger than a prediction and is stated as what it is: PR 901's run 33992002941 executed **main's own pinned scanner** (`origin/main:ci/locks/ci-scanners.lock` reads `zizmor==1.30.0`) against **main's own `cla.yml`** -- the blob is byte-identical on both, `a4d4e1e98a5c2bcd255b615b93ec8c440aed2f03` -- and reported the same single LOW. The remaining step to `main` going red is that its 06:00 UTC cron runs those same two inputs. Confirm rather than assume: `gh run list --workflow zizmor.yml --branch main --limit 1`.
+>
+> **THE REMEDY IS NOT KNOWN AND MUST NOT BE GUESSED.** zizmor's help says *"use '$/...' instead of './...'"* and marks the finding auto-fixable. **That syntax was NOT verified against GitHub's own documentation by this filing**, and it is quoted as the tool's claim rather than repeated as fact. Verifying it IS the work. At least three ends are available and they are not equivalent: adopt the syntax if it is real and supported by the runner in use; suppress `self-repository` for this file in `.github/zizmor.yml` with a reason, the way four `dangerous-triggers` entries already are; or record it as an accepted residual beside the `archived-uses` entry that already exists for this same file at `cla.yml:44`.
+>
+> **WHY THE ONE-CHARACTER FIX IS THE DANGEROUS ONE, and this is the constraint that sets the difficulty rather than the edit size.** `cla` IS a required context, `cla.yml` runs on `pull_request_target`, and **a `pull_request_target` workflow cannot be tested by the pull request that changes it** -- its runs execute the copy on the default branch, so the change lands on `main` untested. A wrong edit then breaks every contribution, and the repair for it is itself a pull request gated by the check it broke. That deadlock has happened here once already, on PR 621, and it needed an administrator. `scripts/quality/workflow_local_action_check.py` exists because of it and records the whole sequence in its header. Whoever takes this should read that first.
+>
+> **ONE STALE LINE FOUND IN PASSING.** `.github/workflows/zizmor.yml`'s header says a bump pull request touching only `pyproject.toml` and the lock *"never ran this gate"*, citing PR #66. That is no longer true: the workflow's `pull_request` trigger now carries `paths: [".github/**", "ci/locks/ci-scanners.lock"]`, so #891 did run it -- and did fail it. The header's conclusion, that a version jump is first adjudicated somewhere other than the bump PR, survives in a different form: the gate ran, and being advisory, it did not adjudicate anything.
+>
+> Verdict: build
+> Research: whether `$/` is real, supported GitHub Actions syntax for a local action, and on which runner images
+> Closing-act: code
+
+**Cluster:** repository security gates. **Priority:** P3. **Verdict:** build.
+**Severity:** no deployment axis (sec. 0), no engine behaviour, no PHI axis, and nothing reaches a shipped wheel. The cost is a **control losing its meaning**: a scanner that is red for a reason nobody intends to act on trains its readers to skip it, and the next real finding arrives in a job that has been failing for weeks. That is the same pathology BACKLOG #1413 records for a signal reporting against a standard nothing enforces, and it is why this is filed rather than left to the next person who notices a red.
+
+## 1459. the usage-headroom hook reads a file no collector has written on any config root, so every reading is UNKNOWN
+
+> 🔢 **Filed 2026-09-05 -- not started. Scored at filing.** Value **4/10** · Difficulty **3/10** · _fill-in_. `scripts/hooks/usage-headroom-inject.ps1:224` reads `latest.json` out of the state directory, and **that file exists on none of the six config roots on this machine**, so the injection resolves to `UNKNOWN -- no data` on every spawn it fires for. Measured six times in one session, on every `Workflow` launch. The remainder is to make the collector actually write for each root, or point the hook at a source that exists; difficulty 3 for install wiring plus a check that it holds across roots, and the value band is argued down below rather than assumed.
+> Verdict: build
+> Research: none
+> Closing-act: code
+
+**Cluster:** fleet instrumentation. **Priority:** P3. **Verdict:** build.
+**Severity:** no deployment axis (sec. 0). This is a maintainer-workstation hook. No engine behaviour, no shipped artifact, no PHI.
+
+**The defect, in one sentence:** the hook that exists to price a spawn has never had a number to price it with.
+
+### Measured 2026-09-05, with a positive control
+
+| root | `mefor-usage/` | `latest.json` |
+|---|---|---|
+| `.claude` | present, 70+ files | **absent** |
+| `.claude-account-1` | present, `status.json` only | **absent** |
+| `.claude-account-2` | absent | absent |
+| `.claude-account-3` | present, `status.json` only | **absent** |
+| `.claude-account-4` | present, `status.json` only | **absent** |
+| `.claude-account-5` | absent | absent |
+
+A `find` for `latest.json` across every root returns **zero**. The control is the same sweep for
+`status.json`, which returns **three** -- so the search works and the absence is real, not a broken
+pattern. This is the shape the ASVS census rule already warns about: a pattern that finds nothing
+anywhere is indistinguishable from a clean tree until you run the control.
+
+The hook's own header at `:10` says the collector **is a statusLine** that writes `latest.json` and
+appends `history.jsonl`. So the file appears only where that statusLine is installed and running,
+and on this machine that is nowhere.
+
+### WHY THIS IS VALUE 4 AND NOT 6, and the distinction is the point
+
+The band-6 shape in this ledger is an instrument whose **silence looks like success**. This one is
+the opposite, and it says so in its own output:
+
+> `UNKNOWN is not zero headroom and it is not full headroom. It is no measurement.`
+
+It refuses to be read as a green. A reader is told to spawn on their own judgment and that a cutoff
+is possible. **An instrument that announces its own blindness is a degraded instrument, not a
+deceptive one**, and that is the whole difference between this row and the band the project reserves
+for a gate that passes while checking nothing. Argue it up if you think a spawn decision made blind
+six times in one session is worth more than DX.
+
+### It is one half of a pair, and the other half has a number
+
+**#1406** records that the hook never fires on the path that spends the most: it is wired on matcher
+`^(Task|Agent|Workflow)$|spawn_task`, while `CLAUDE.md` has a Console spawn a Builder through a
+`Bash(claude:*)` grant, which no tool-name matcher can select. `tests/test_claude_settings_contract.py`
+puts `Bash` in its near-miss list and asserts no matcher wiring this hook may select it.
+
+So the two failures are independent and compose badly: **#1406 is "it does not fire where it matters
+most", this row is "where it does fire, it has nothing to read".** Fixing either alone leaves the
+instrument useless. Neither row should be closed on the strength of the other.
+
+### What would prove a fix
+
+A spawn on a fresh config root prints a real headroom figure rather than `UNKNOWN`, and the check
+that proves it must run on a root where the statusLine was **not** hand-installed -- otherwise it
+passes on the one machine state that was never the problem.
+
+**Source:** measured while running scoring and screening workflows on 2026-09-05; the `UNKNOWN`
+line appeared on every one of six `Workflow` spawns in that session.
+
+---
+
+## 1458. the subprocess sandbox allocates one unpooled worker tree per traffic-carrying inbound, the exact per-connection-worker growth ADR 0052 AC-2 forbids
+
+> 🔢 **Filed 2026-09-05 -- not started. Scored at filing.** Value **6/10** · Difficulty **7/10** · _big bet_. At `[sandbox].mode = "subprocess"` the engine holds one persistent worker process tree per traffic-carrying inbound. Nothing pools it and nothing caps it: the child is spawned lazily on first dispatch, never evicted, and released only at runner stop or config reload. Each one adds a process tree, two parent daemon threads, three parent pipe file descriptors and a Windows job-object handle -- which is precisely the resource class [ADR 0052](adr/0052-enterprise-scale-target.md) AC-2 names. The remedy is a rearchitecture of the worker cardinality, and this row deliberately does not choose between the two shapes the record already names.
+> Verdict: research
+> Research: none
+> Closing-act: code
+
+**Cluster:** sandbox isolation / enterprise scale. **Priority:** P2. **Verdict:** research.
+**Severity:** no live exposure. `mode="off"` is the shipped default (`messagefoundry/config/settings.py:1311`), so the growth described here is reached only by opting in. Per sec. 0 there are zero deployments, so every cost below is what a deploying site **would** meet, never what one meets today. Nothing here is PHI-bearing.
+
+**This is not an argument against sandboxing, and a future reader must not file it as one.** Routers and Handlers are admin-authored Python that the engine runs in its own address space today, beside the DEK, the audit chain and live sockets. Isolating them is right, and ADR 0087 built a real address-space seam to do it. The objection is to the **shape** -- per-inbound worker cardinality -- and to two records that now assert a scaled total their own single-worker measurement does not establish.
+
+### The defect, stated against the acceptance criterion it contradicts
+
+[ADR 0052](adr/0052-enterprise-scale-target.md) AC-2, verbatim (`:73-74`):
+
+> THE SYSTEM SHALL support up to 1,500 concurrent connections without per-connection-worker exhaustion (fd/socket/worker-task limits).
+
+At `mode="subprocess"` the sandbox creates exactly the growth that criterion forbids, and **no multiplication is needed to see it**. Per traffic-carrying inbound, measured by reading `messagefoundry/pipeline/sandbox.py` at HEAD of this branch:
+
+| per inbound | anchor |
+|---|---|
+| one process tree -- two OS processes under a Windows virtual environment (a launcher stub plus the interpreter it re-execs) | `sandbox.py:616` (`subprocess.Popen`), and the launcher-stub mechanism recorded in the benchmark's instrument-correction note |
+| two parent daemon threads | `sandbox.py:645`, `:651` |
+| three parent pipe file descriptors | `sandbox.py:618-623` (`stdin`, `stdout`, `stderr` all `subprocess.PIPE`) |
+| one Windows kill-on-close job-object handle | `sandbox.py:451` (`_assign_kill_on_close_job`) |
+
+The child is *"spawned lazily on first dispatch"* (`sandbox.py:550`), so an inbound that never carries a message costs nothing -- which is why the multiplier is *traffic-carrying* inbounds and not the configured count.
+
+**There is no pool, no cap and no eviction, and that is a measured absence rather than an unread file.** A search of `sandbox.py` for `evict`, `idle_`, `lru`, `max_worker` and `pool` returns **zero**. Two controls, because a pattern that finds nothing everywhere is indistinguishable from a clean file: the same instrument on the same file finds **83** occurrences of `worker` over 50,065 bytes read, and `pool` itself appears in **five** sibling modules under `messagefoundry/pipeline/`. The zero is an absence.
+
+### What one worker costs, and the three ways a scaled total goes wrong
+
+The per-worker figures are sound and come from [the 2026-09-04 artifact](benchmarks/results/2026-09-04-adr0087-sandbox-dispatch/README.md):
+
+| | measured | note |
+|---|---|---|
+| worker process tree, unique (USS) | 49.9 - 57.0 MiB | the marginal figure |
+| worker process tree, resident (RSS) | 76.8 - 82.5 MiB | double-counts the shared interpreter across children |
+| one-time spawn + `load_config` + guard install | 1.8 - 2.7 s | once per inbound per engine start |
+
+**A first version of this row led with a 74 GiB product, and that framing was retracted before filing.** It is written up here rather than quietly dropped, because two records on `main` still carry it and a future reader will otherwise re-derive it. Three defects, each sufficient alone:
+
+1. **The multiplier is the wrong count.** ADR 0052 commits to *"45,000,000 messages/day, 1,500 connections, and a remote production database"* (`:43`) -- **connections**, inbound and outbound. Sandbox children exist per traffic-carrying **inbound**. The word *inbound* is not in ADR 0052, and a deployment with an outbound share has proportionally fewer children.
+2. **Linearity was never measured.** All five result JSONs in that directory record `"worker_tree_processes": 2` -- one live worker tree, two OS processes. The instrument's own docstring (`scripts/bench/sandbox_dispatch.py:213`) supplies the justification in place of a second data point: *"USS is the marginal cost of one more worker, which is the figure that multiplies by the connection count."* That is an argument, not a result, and the README's own *"What this does not establish"* section concedes it *"does not measure the sandbox under concurrent lanes"*.
+3. **"Resident memory" names a quantity no sized host can exhibit.** Resident set is bounded by installed RAM. The recommended high single-node tier is 4-8 cores / 16 GB (`SYSTEM-REQUIREMENTS.md:220`) and the bench box has 31.7 GiB. At that demand a host produces working-set trimming, paging and spawn failure -- not a 74 GiB reading. The correct quantity is **private commit charge**: demand, not residency.
+
+**Two counterweights, carried rather than buried, because the magnitude survives even though the framing did not.** `_spawn` uses `subprocess.Popen` (`sandbox.py:616`) and not `fork`, so there is no copy-on-write sharing of a parent heap and the bulk of that ~50 MiB is genuinely private and does replicate. And every uncertainty the artifact names points **up**: 50 MiB is a stated floor measured on a one-router one-handler graph, case E measured 57.0 MiB, and RSS runs about 27 MiB higher again.
+
+**If a total is quoted at all, label the extrapolation** -- for example *"roughly 73-74 GiB of private commit demand if 1,500 traffic-carrying inbounds ran on one host, a linear extrapolation from a single worker and never validated at two"*. Note also that ADR 0052 calls the 1,500-connection axis **"unvalidated"** in its own words (`:99`) and records that the connection-scale validation harness *"does not exist"* (`:108`).
+
+### Two records on `main` assert the retracted framing
+
+- [ADR 0087](adr/0087-sandbox-subprocess-isolation.md) `:334-340` states the per-worker cost correctly and then writes *"Against the committed 1,500-connection target that is roughly 74 GiB and 1,500 extra OS processes."* All three defects above apply to that sentence.
+- The benchmark README's finding 3 rewrites the target as *"1,500 inbound connections"* and reports the same product as *"additional resident memory"*.
+
+**#1278 is deliberately not edited by this row.** It still calls the memory cost unmeasured, which is now false. PR 879 is rewriting that block, so the correction belongs in a follow-up taken **after** 879 lands, not here -- filing a conflicting edit into a block another branch is actively rewriting is how a ledger row gets lost.
+
+### The other two costs on the same axis
+
+**Throughput, and it is already corrected upstream.** ADR 0087 compared a per-dispatch cost against a per-message bound; a message that routes to one handler pays the cost **twice** on the same serialized per-inbound worker. That was corrected in ADR 0087 itself on 2026-09-04 under **#1194**, which re-measured the 20k-reference-table case at about 16 ms per message -- a sandbox-only per-lane ceiling of roughly **61-66 msg/s**, against the ~70-100 msg/s the high single-node tier claims (`SYSTEM-REQUIREMENTS.md:220`). It is carried here because it bears on the remedy: **a pool that still serializes both dispatches of a message on one worker inherits this ceiling**, so a shape chosen for memory alone can leave the throughput half untouched.
+
+**Processes, which is the limb AC-2 names most directly.** 1,500 extra OS processes, or 3,000 under a Windows virtual environment counting launcher stubs. This is a ceiling separate from memory and it does not soften with a larger host.
+
+### `[sandbox].mode` is engine-global, which removes the obvious workaround
+
+One `SandboxPolicy` is built for the whole graph (`messagefoundry/pipeline/engine.py:675-688`) and passed to every runner. `SandboxSettings` (`messagefoundry/config/settings.py:1294-1321`) carries `mode`, `wall_seconds`, `cpu_seconds`, `mem_mb` and `startup_seconds` and **nothing per-connection or per-handler**. So a single Handler needing `mode="off"` -- for a live `db_lookup`, say -- spends the entire process's isolation, and an operator cannot sandbox the cheap lanes while exempting the expensive one. Any rearchitecture should decide whether that stays true.
+
+### Two candidate shapes, and this row does not choose between them
+
+1. **A bounded shared worker pool.** The benchmark states the constraint *"attaches to the per-inbound worker cardinality, not to the process boundary"*, and that a pool *"would decouple the bill from the connection count"* while preserving exactly the property ADR 0087 claims (a boundary to the **engine**) and dropping only one it already disclaims (`sandbox.py:39-42`: the seam draws no line between admin functions).
+2. **Router-phase-only isolation.** The live-enrichment carve-out is the stated reason `subprocess` cannot be a default, and it is a **transform-phase** feature only. `db_lookup` raises unless a runner is active (`messagefoundry/config/db_lookup.py:109-116`), and both engine activation sites sit inside `run_contexts(..., phase="transform")` (`messagefoundry/pipeline/wiring_runner.py:5606` and `:5883`). The engine's own comment at `wiring_runner.py:5119` says it: *"db_lookup raises on a Router by design, so no lookup runner."*
+
+**An unmeasured connection between the two, flagged for the ADR to settle rather than asserted here:** the phase that carries the sanctioned non-pure inputs is the transform phase, so the router phase is the one where a *shared* worker has no per-lane live-lookup state to keep straight. That suggests shape 2 is what makes shape 1 tractable first, but it is this row's reasoning and not a measurement.
+
+### How [ADR 0147](adr/0147-hardened-runtime-isolation-for-router-handler-code-ipc-brokered-sandbox-extends-adr-0087.md) relates
+
+0147 is **Proposed, with no code**. It is the only shape the record says reconciles isolation with the sanctioned live lookups: an IPC request-broker back to the parent, re-enabling `db_lookup`/`fhir_lookup` inside a confined child. **It is orthogonal to this row's axis** -- 0147 makes each child more capable and more confined, and says nothing about how many children there are. A pool and a broker compose; neither substitutes for the other. Whoever takes this should read 0147 first anyway, because pooling changes what a broker must authorize: a shared child serving several inbounds needs the broker to scope a lookup to the requesting lane, which a per-inbound child gets for free.
+
+### Why value 6 and difficulty 7
+
+**Value 6.** This is the gating constraint on an opt-in **security** control becoming a default -- #1278's subject -- and it stands against a committed acceptance criterion rather than a preference. It also corrects two records that overstate their own evidence, and the engine-global `mode` removes the partial workaround an operator would otherwise reach for. It is held out of the higher bands because `mode="off"` ships, so nothing is broken in the shipped posture, and because ADR 0052 itself calls the axis it contradicts unvalidated. **Argue it down** if you think a criterion for an unvalidated axis should not price this high.
+
+**Difficulty 7.** The remedy changes worker identity from per-inbound to pooled, which means a shared child must load and dispatch for graphs it does not currently know about, while preserving request/response correlation, the wall-clock kill semantics (killing a shared worker now affects sibling lanes), and the fail-closed guarantees ADR 0087 rests on. It is ADR-gated and it touches a security seam, which is why the verdict is research before build.
+
+**Source:** [the 2026-09-04 sandbox-dispatch benchmark](benchmarks/results/2026-09-04-adr0087-sandbox-dispatch/README.md), where these figures were first recorded under **#1194**; every anchor above re-checked by hand at this branch's HEAD because line numbers had drifted. The 74 GiB framing was posted to PR 879 and then publicly retracted there by its author before this row was written ([the finding](https://github.com/MEFORORG/MessageFoundry/pull/879#issuecomment-5555572867), [the retraction](https://github.com/MEFORORG/MessageFoundry/pull/879#issuecomment-5555582729)); the retraction is cited so this row's provenance is honest rather than tidy.
+
+## 1460. the dispatch gate names three retired seats and gives the Lander a ledger edit backlog-hygiene demands of the Builder's own PR
+
+> 🔢 **Filed 2026-09-05 -- not started. FILED ONLY: nothing here is fixed on this branch, and the reason is a dependency recorded below.** Value **5/10** · Difficulty **2/10** · _quick win_. Two constants in the dispatch tooling carry stale seat assignments. `CLOSING_SEAT` names three seats `CLAUDE.md:274` retires, and `GATED_VERDICTS`, in a second file, names two more -- so correcting one constant leaves the other emitting. A fourth value is not a retired seat at all and is the harder one to see: `CLOSING_SEAT["code"]` tells a Builder that the Lander flips the banner, while a required check demands the ledger edit of that same Builder's own PR.
+> Verdict: build
+> Research: none
+> Closing-act: code
+
+**Cluster:** coordination tooling / ledger integrity. **Priority:** P2. **Verdict:** build.
+**Severity:** no deployment axis (sec. 0). This is advice a hand-run tool prints to a seat. No engine behaviour, no shipped artifact, no PHI, and nothing a deploying site would ever meet. The cost is wasted seat effort and a handoff reported to a seat that does not exist.
+
+**Measured 2026-09-05 at `c57903c2c`, byte-equal to `origin/main`, working tree clean.** Every number below was re-derived from a clean checkout, not carried in.
+
+### The two constants, and why one fix is not enough
+
+`CLOSING_SEAT` at `scripts/docs/backlog_status_check.py:122` has four entries. Three name a seat `CLAUDE.md:274` retires:
+
+| line | key | the retired seat it names |
+|---|---|---|
+| `:124-128` | `scorecard-rescore` | "the ASVS Tracker re-scores the cell in the vault" |
+| `:129` | `owner-ruling` | "the owner rules via the LIAISON; the Dispatcher or Lander records it" |
+| `:130` | `banner-only` | "the DISPATCHER or LANDER, in the ledger" |
+
+`GATED_VERDICTS` at `scripts/coord/dispatch_gate.py:160` is a **second, independent instance in a different file**. `:164` names the LIAISON and `:168` names the LIAISON and the Dispatcher. `scripts/coord/dispatch_gate.py` imports `CLOSING_SEAT` at `:110` and prints its value at `:472` and `:489`; it reads `GATED_VERDICTS` at `:468` and prints it at `:469`. **Touching only `CLOSING_SEAT` leaves 35 rows still naming a retired seat through the other constant.**
+
+### The fourth defect is a wrong assignment, not a dangling name
+
+`CLOSING_SEAT["code"]` at `:123` reads *"the builder writes it; the LANDER flips the banner on merge"*. Both seats are live, so nothing looks wrong. What is wrong is the assignment.
+
+`.github/workflows/backlog-hygiene.yml` runs the job `banner-on-implementation` at `:78`, whose `name:` at `:82` is the context string *"a PR that implements BACKLOG #N must update BACKLOG.md"*. It sets `touches_code` for `messagefoundry/`, `ide/` or `messagefoundry_webconsole/` at `:180-183`, and when that holds it requires the **same** PR to touch `docs/BACKLOG.md` or `docs/archive/backlog/` at `:194`. A code-closing PR touches those paths by definition. That context is live on branch protection: `gh api repos/:owner/:repo/branches/main/protection --jq '.required_status_checks.contexts[]'` returned 13 contexts on 2026-09-05 and it is the first of them.
+
+`CLAUDE.md:286` puts that PR on the Builder: *"The change, the commit, the push, and the PR carrying the `BACKLOG.md` update."* So the tool tells a Builder the ledger edit is somebody else's while a required check demands it of that Builder's own PR.
+
+**State the correction as the PR, not as closure.** The gate checks only that the PR touches the backlog namespace, never that a banner flipped to closed; its own remediation text allows an open banner on a partial implementation. The corrected value must say the Builder's PR carries the edit. It must not say the Builder declares the item closed.
+
+### Reach, and it is advice shown to a reader, not a verdict
+
+Calling `judge()` over the whole ledger namespace, 670 rows across `docs/BACKLOG.md` and `docs/archive/backlog/`, **taken at `c57903c2c` before this row and #1461 were written**:
+
+| what the returned reason says | rows | of those, open |
+|---|--:|--:|
+| names a retired seat | **132** | **130** |
+| "the LANDER flips the banner on merge" | **166** | **119** |
+| `banner-only` declared by any row | **0** | **0** |
+
+Per needle: ASVS Tracker 97, LIAISON 35, Dispatcher 33. The closing-act census is `code` 167, `scorecard-rescore` 97, `owner-ruling` 33, `blocked` 4, absent 369. **167 rows carry `code` but only 166 print the LANDER sentence**, because #1343 grades `advise` for an unrelated reason and the `read`/`advise` returns precede the `ok` path that prints it.
+
+**The `banner-only` zero was true when measured and is not true any more, and this row changed it.** At `c57903c2c` no row declared that closing act, so the entry never rendered. **#1461**, filed in the same commit as this row, declares `banner-only` because its work lands in the vault and leaves nothing but a banner here. So the entry now renders on exactly one row, and the string it prints names the Dispatcher.
+
+### The staleness moves no gate decision, and saying so is what holds this at P2
+
+Replacing every value in **both** constants with a placeholder changed the level on **0 of 670 rows** (`advise` 135, `refuse` 369, `ok` 166, before and after). **Positive control on the same experiment and the same corpus:** emptying `BUILDER_CLOSABLE_ACTS`, the frozenset at `backlog_status_check.py:108` that actually drives the branch at `dispatch_gate.py:471` and contains no seat name, moved **166** levels. So the instrument can detect a level change and did not detect one here. No branch compares a seat name; the gate never refuses on one.
+
+### Why CLAUDE.md's own rule does not absorb this
+
+`CLAUDE.md:274-276` tells a reader to treat a retired seat's naming as stale. That disposes of the **prose** instances, and nothing is filed for those. It cannot reach a Python string that a second module interpolates into output, and for two of the four values it does not apply at all:
+
+- For `CLOSING_SEAT["code"]` the rule is inapplicable, because the Lander is a live seat. There is no retired naming to discount.
+- For `scorecard-rescore` the rule removes the dangling name but supplies no successor, so a reader who applies it correctly is left holding a work act with no seat.
+
+### The successors, and the one that is not yet on main
+
+Two come straight off the roster table and need no ruling:
+
+- **Liaison becomes Console.** `CLAUDE.md:285` makes the Console "the only seat the owner talks to".
+- **Dispatcher, in its recording half, becomes Lander.** `CLAUDE.md:289` gives the Lander "Standing authority on the engine repo and the vault, with no per-action owner approval".
+
+The third has a ruling but not yet a merge. **Who performs an ASVS cell re-score under KORUS was ruled by the owner on 2026-09-05, and `CLAUDE.md` section 5's Lander row is where that ruling is recorded** -- read it there rather than here. **PR 929 carries it and was OPEN when this row was filed** (`gh pr view 929 --json state,mergedAt` returned `state OPEN`, `mergedAt null`). Until it is on `main`, correcting the `scorecard-rescore` value would put an operative instruction into shipped source citing a section that does not yet say it. **That value is the 97-row half, so it is the largest part of the fix and the part that must wait.**
+
+### Test coupling, and the CI leg is one unit
+
+Five assertions in `tests/test_coord_dispatch_gate.py` pin these strings: `:100` and `:796` assert `"ASVS Tracker"`, `:247` and `:274` assert `"LIAISON"`, and `:104` asserts `"LANDER"` and so pins the wrong banner assignment. **The two `LIAISON` assertions come from `GATED_VERDICTS`, not `CLOSING_SEAT`**, because both tests drive `closing-act: code`, which is in `BUILDER_CLOSABLE_ACTS`, so the `CLOSING_SEAT` branch never fires for them. A fixer who patches only `CLOSING_SEAT` and sees those two still passing will conclude wrongly that they are unrelated to this work.
+
+The constants and their assertions must move in one PR. `tests/tooling_manifest.txt:84` lists the module, `tests/conftest.py` marks manifest members `tooling`, `tooling` is in `ci-gate`'s `needs` in `.github/workflows/ci.yml`, and `CI gate` is a required context. The tooling path filter matches `scripts/` as well as the manifest paths, so a PR editing both the constants and the assertions fires one leg and goes green or red as a unit. There is no split red to manage.
+
+### Why this row was filed and not fixed on the same branch
+
+Three reasons, and the first is sufficient on its own.
+
+1. The largest half, `scorecard-rescore` at 97 rows, needs PR 929 on `main` first. Shipping the other five values would leave the constant half-corrected in a way a later reader could mistake for the finished state.
+2. A half-fix touches `tests/test_coord_dispatch_gate.py` twice across two PRs.
+3. The owner's ask was to file it. This row records each value, its line, its successor and the assertions that move with it, so the follow-on edit is mechanical rather than a re-derivation.
+
+### The justifying comment rests on two dead line numbers
+
+`backlog_status_check.py:114-115` cites `BUILDER.md:253` and `:148`. In the live vault file, line 253 is empty and line 148 is mid-paragraph ADR prose. **Both anchors resolved exactly when written** and broke in a later condensation of that playbook, so this is line drift, not a fabricated citation. It is one instance of the class already filed as **#1315**; correct these two anchors while the comment is being rewritten anyway and file nothing new for it. **Do not repoint `:253` at `:148`'s sentence** -- they cite two different rules, and the quotation `:253` carries, "banner flips and ledger reconciles are not the builder's", is absent from the current `BUILDER.md` entirely.
+
+### The upstream disagrees, and correcting it is a different row
+
+Vault `roles/BUILDER.md:216` reads *"Do **not** edit `docs/BACKLOG.md`. The lander writes the banner."* That is the source of this constant's wording, it is a write outside this repository, and it is filed as **#1461**.
+
+### Controls, each able to fire
+
+1. **Reach loop, needles swapped for live seats** (`Steward`, `Regulator`, `Console`): **0** rows, against 132 for retired names. The loop does not match everything.
+2. **Level counterfactual, positive arm:** emptying `BUILDER_CLOSABLE_ACTS` moved 166 levels, so a level change is detectable; the constants' placeholder swap moved 0.
+3. **Ledger duplicate census, dead needle** `ZZQQ_IMPOSSIBLE`: 0 and 0 across both ledger files, against a same-corpus control of "banner" returning 513 and 57. `CLOSING_SEAT` returns 0 and 0, so the absence is real. `GATED_VERDICTS` returns 3 in the live file, and all three sit inside **#1334**, which covers whether the gate advises on those verdicts, not the seat names inside the advice.
+4. **Test-assertion needle, invented seats** (`Quartermaster`, `Bosun`): exit 1, against 6 real hits for the seat-name pattern in the same file.
+5. **Contention scan, positive arm:** of 67 open PRs (`gh pr list --limit 200`, asserted strictly below the limit), **0** touch `dispatch_gate.py`, `backlog_status_check.py` or `test_coord_dispatch_gate.py`, while **64** touch `docs/BACKLOG.md` on the identical loop. The zero is measured, not an empty instrument.
+
+### Not checked
+
+I did not census retired-seat naming outside these three files and the vault `roles/` folder. I ran no hosted CI leg, so the claim that the tooling job carries this module is read from `tooling_manifest.txt`, `conftest.py` and `ci.yml` text plus the live branch-protection query, not from an observed run. I did not re-derive the provenance of the fixture behind the `:796` assertion. I read only `roles/` in the vault and ran no git history there.
+
+---
+
+## 1461. three vault role playbooks still give the Lander the ledger banner that CLAUDE.md section 5 puts in the Builder's PR
+
+> 🔢 **Filed 2026-09-05 -- not started. A BUILDER CANNOT CLOSE THIS. The work is a write to the separate `MessageFoundry-vault` repository, which sits outside this repo's PR flow. `CLAUDE.md:289` gives the Lander "Standing authority on the engine repo and the vault, with no per-action owner approval", so the Lander performs it and needs no owner ruling first.** Value **4/10** · Difficulty **2/10** · _fill-in_. Three role playbooks carry the pre-2026-09-01 banner assignment as live instruction. `BUILDER.md:216` forbids the Builder the exact edit `CLAUDE.md:286` assigns it, and justifies the ban with a gate rule that does not apply. `LANDER.md` states the same assignment four times, and `DISPATCHER.md:209` states it in a retired seat's voice.
+> Verdict: build
+> Research: none
+> Closing-act: banner-only
+
+**Cluster:** coordination tooling / role playbooks. **Priority:** P2. **Verdict:** build.
+**Severity:** no deployment axis (sec. 0). These are instructions to a seat, in a separate repository. No engine behaviour, no shipped artifact, no PHI. The cost is a Builder that declines a ledger edit its own PR needs, and a handoff each seat believes the other performs.
+
+**`banner-only` is the closing act because nothing lands in THIS repository except the banner.** The work is a vault edit, so no engine-repo commit records it, and the last act that closes the item here is the banner flip. That is the same two-act shape as `scorecard-rescore`, which exists as its own value only because the vault half there is a scorecard re-score specifically. **This is the first row on the ledger to declare `banner-only`**, so it is also the first time that entry of `CLOSING_SEAT` renders -- and the value it renders names a retired seat, which is **#1460**'s subject.
+
+**Measured 2026-09-05.** Engine checkout at `c57903c2c`, byte-equal to `origin/main`. Vault read from the working tree of the clone beside it.
+
+### The contradiction, in two sentences side by side
+
+`CLAUDE.md:286`, the Builder's Owns column: *"The change, the commit, the push, and the PR carrying the `BACKLOG.md` update."*
+
+Vault `roles/BUILDER.md:213-217`, under the heading "Closing a ledger row makes your PR red, and both escapes are violations": *"a PR citing `BACKLOG #N` needs a banner edit in the same PR, and single-writer forbids you making it. Do **not** drop the citation to clear the check -- it then passes while looking at nothing. Do **not** edit `docs/BACKLOG.md`. The lander writes the banner."*
+
+### The stated justification is measurably false, not merely superseded
+
+`BUILDER.md:216` grounds the ban on "single-writer forbids you making it". `scripts/hooks/ledger_check.py` records the opposite: *"Editing the BODY of an item that already exists was never policed here either way -- the rule compares NUMBER SETS, `head - base`"*. A banner flip is a body edit, so the pre-commit ledger gate refuses no Builder for making one.
+
+`main` already follows `CLAUDE.md`. PR 902 (`8432ad496`), a code fix citing BACKLOG #1456, carries the `docs/BACKLOG.md` edit in the same commit, and most recent `main` commits do the same.
+
+### CLAUDE.md's stale-naming rule provably does not reach these lines
+
+`CLAUDE.md:274-276` fires on a **retired seat** or a **retired rule**, and forbids extending that to a whole document. `BUILDER.md:216` names only the Lander, a live seat, and "single-writer", which appears zero times in `CLAUDE.md`. So a Builder applying the rule correctly still reads line 216 as binding. `DISPATCHER.md:209` is the one hit the rule does cover, and it lives in a retired seat's own file.
+
+### The population, measured with a dead-needle control
+
+`grep -rn -i -E "(writes the banner|flips the banner|write the banner|banner is written)" roles/` returns 4 lines in 3 files:
+
+| file and line | what it says |
+|---|---|
+| `roles/BUILDER.md:216` | "Do **not** edit `docs/BACKLOG.md`. The lander writes the banner." |
+| `roles/DISPATCHER.md:209` | "**Ledger authorship and push are held by DIFFERENT SEATS.** You write the banner; the Lander pushes it." |
+| `roles/LANDER.md:816` | "**The lander writes the banner INTO the worker's PR** as a separate commit" |
+| `roles/LANDER.md:940` | "the banner is written later, by this seat" |
+
+**Zero of the four assigns the banner to a Builder.** Dead-needle control on the same instrument and corpus, "writes the pennant": exit 1, no output. The instrument discriminates, so the zero is measured.
+
+`LANDER.md` carries the assignment twice more in section 7g, which the needle above does not match: `:926` *"Deciding an item is closed is YOURS, and it is a separate act from recomputing the census"*, and `:933` *"The vault ASVS cell is re-scored first, and the banner flips second. The second act is yours."*
+
+### One line becomes newly stale the moment PR 929 merges
+
+`LANDER.md:933` also says of the ASVS re-score: *"No live seat performs the first, so read the scorecard commits yourself rather than waiting on a notice."* The owner ruled on 2026-09-05 that the Lander performs the vault scorecard re-score, and `CLAUDE.md` section 5's Lander row is where that ruling is recorded. PR 929 carries it and was OPEN when this row was filed. **Once it merges, "no live seat performs the first" is false**, so whoever fixes this row should correct that sentence in the same pass rather than leaving a second stale claim behind.
+
+### Two things the fixer must not do
+
+1. **Do not edit the dated records.** `LANDER.md` section 7g carries measurements from 2026-08-22 and a table of what a drain found. Those are history; rewriting them destroys the evidence. Only the present-tense instructions move.
+2. **Do not pick a winner where the playbooks merely disagree with each other.** This row resolves one question only, the one `CLAUDE.md:286` already answers: the Builder's PR carries the `BACKLOG.md` edit. `BUILDER.md:73-74` separately routes "who writes the ledger banner" to `LANDER` as the authority, and that routing is what made this survive the roster rewrite. Correcting it is part of the same fix.
+
+### Not checked
+
+I read only `roles/` in the vault and ran no git history there, so I cannot date when any of these lines was written. Eleven of the fourteen playbooks were matched by the needle above but not read, so treat the population as **at least three files**, not a total. I did not check whether any workflow or CI job reads a playbook, and I confirmed no case in which a seat actually followed `BUILDER.md:216` and produced a red PR -- I measured the instruction and the gate, not an incident.
