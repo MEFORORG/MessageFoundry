@@ -23768,3 +23768,90 @@ passes on the one machine state that was never the problem.
 line appeared on every one of six `Workflow` spawns in that session.
 
 ---
+
+## 1458. the subprocess sandbox allocates one unpooled worker tree per traffic-carrying inbound, the exact per-connection-worker growth ADR 0052 AC-2 forbids
+
+> 🔢 **Filed 2026-09-05 -- not started. Scored at filing.** Value **6/10** · Difficulty **7/10** · _big bet_. At `[sandbox].mode = "subprocess"` the engine holds one persistent worker process tree per traffic-carrying inbound. Nothing pools it and nothing caps it: the child is spawned lazily on first dispatch, never evicted, and released only at runner stop or config reload. Each one adds a process tree, two parent daemon threads, three parent pipe file descriptors and a Windows job-object handle -- which is precisely the resource class [ADR 0052](adr/0052-enterprise-scale-target.md) AC-2 names. The remedy is a rearchitecture of the worker cardinality, and this row deliberately does not choose between the two shapes the record already names.
+> Verdict: research
+> Research: none
+> Closing-act: code
+
+**Cluster:** sandbox isolation / enterprise scale. **Priority:** P2. **Verdict:** research.
+**Severity:** no live exposure. `mode="off"` is the shipped default (`messagefoundry/config/settings.py:1311`), so the growth described here is reached only by opting in. Per sec. 0 there are zero deployments, so every cost below is what a deploying site **would** meet, never what one meets today. Nothing here is PHI-bearing.
+
+**This is not an argument against sandboxing, and a future reader must not file it as one.** Routers and Handlers are admin-authored Python that the engine runs in its own address space today, beside the DEK, the audit chain and live sockets. Isolating them is right, and ADR 0087 built a real address-space seam to do it. The objection is to the **shape** -- per-inbound worker cardinality -- and to two records that now assert a scaled total their own single-worker measurement does not establish.
+
+### The defect, stated against the acceptance criterion it contradicts
+
+[ADR 0052](adr/0052-enterprise-scale-target.md) AC-2, verbatim (`:73-74`):
+
+> THE SYSTEM SHALL support up to 1,500 concurrent connections without per-connection-worker exhaustion (fd/socket/worker-task limits).
+
+At `mode="subprocess"` the sandbox creates exactly the growth that criterion forbids, and **no multiplication is needed to see it**. Per traffic-carrying inbound, measured by reading `messagefoundry/pipeline/sandbox.py` at HEAD of this branch:
+
+| per inbound | anchor |
+|---|---|
+| one process tree -- two OS processes under a Windows virtual environment (a launcher stub plus the interpreter it re-execs) | `sandbox.py:616` (`subprocess.Popen`), and the launcher-stub mechanism recorded in the benchmark's instrument-correction note |
+| two parent daemon threads | `sandbox.py:645`, `:651` |
+| three parent pipe file descriptors | `sandbox.py:618-623` (`stdin`, `stdout`, `stderr` all `subprocess.PIPE`) |
+| one Windows kill-on-close job-object handle | `sandbox.py:451` (`_assign_kill_on_close_job`) |
+
+The child is *"spawned lazily on first dispatch"* (`sandbox.py:550`), so an inbound that never carries a message costs nothing -- which is why the multiplier is *traffic-carrying* inbounds and not the configured count.
+
+**There is no pool, no cap and no eviction, and that is a measured absence rather than an unread file.** A search of `sandbox.py` for `evict`, `idle_`, `lru`, `max_worker` and `pool` returns **zero**. Two controls, because a pattern that finds nothing everywhere is indistinguishable from a clean file: the same instrument on the same file finds **83** occurrences of `worker` over 50,065 bytes read, and `pool` itself appears in **five** sibling modules under `messagefoundry/pipeline/`. The zero is an absence.
+
+### What one worker costs, and the three ways a scaled total goes wrong
+
+The per-worker figures are sound and come from [the 2026-09-04 artifact](benchmarks/results/2026-09-04-adr0087-sandbox-dispatch/README.md):
+
+| | measured | note |
+|---|---|---|
+| worker process tree, unique (USS) | 49.9 - 57.0 MiB | the marginal figure |
+| worker process tree, resident (RSS) | 76.8 - 82.5 MiB | double-counts the shared interpreter across children |
+| one-time spawn + `load_config` + guard install | 1.8 - 2.7 s | once per inbound per engine start |
+
+**A first version of this row led with a 74 GiB product, and that framing was retracted before filing.** It is written up here rather than quietly dropped, because two records on `main` still carry it and a future reader will otherwise re-derive it. Three defects, each sufficient alone:
+
+1. **The multiplier is the wrong count.** ADR 0052 commits to *"45,000,000 messages/day, 1,500 connections, and a remote production database"* (`:43`) -- **connections**, inbound and outbound. Sandbox children exist per traffic-carrying **inbound**. The word *inbound* is not in ADR 0052, and a deployment with an outbound share has proportionally fewer children.
+2. **Linearity was never measured.** All five result JSONs in that directory record `"worker_tree_processes": 2` -- one live worker tree, two OS processes. The instrument's own docstring (`scripts/bench/sandbox_dispatch.py:213`) supplies the justification in place of a second data point: *"USS is the marginal cost of one more worker, which is the figure that multiplies by the connection count."* That is an argument, not a result, and the README's own *"What this does not establish"* section concedes it *"does not measure the sandbox under concurrent lanes"*.
+3. **"Resident memory" names a quantity no sized host can exhibit.** Resident set is bounded by installed RAM. The recommended high single-node tier is 4-8 cores / 16 GB (`SYSTEM-REQUIREMENTS.md:220`) and the bench box has 31.7 GiB. At that demand a host produces working-set trimming, paging and spawn failure -- not a 74 GiB reading. The correct quantity is **private commit charge**: demand, not residency.
+
+**Two counterweights, carried rather than buried, because the magnitude survives even though the framing did not.** `_spawn` uses `subprocess.Popen` (`sandbox.py:616`) and not `fork`, so there is no copy-on-write sharing of a parent heap and the bulk of that ~50 MiB is genuinely private and does replicate. And every uncertainty the artifact names points **up**: 50 MiB is a stated floor measured on a one-router one-handler graph, case E measured 57.0 MiB, and RSS runs about 27 MiB higher again.
+
+**If a total is quoted at all, label the extrapolation** -- for example *"roughly 73-74 GiB of private commit demand if 1,500 traffic-carrying inbounds ran on one host, a linear extrapolation from a single worker and never validated at two"*. Note also that ADR 0052 calls the 1,500-connection axis **"unvalidated"** in its own words (`:99`) and records that the connection-scale validation harness *"does not exist"* (`:108`).
+
+### Two records on `main` assert the retracted framing
+
+- [ADR 0087](adr/0087-sandbox-subprocess-isolation.md) `:334-340` states the per-worker cost correctly and then writes *"Against the committed 1,500-connection target that is roughly 74 GiB and 1,500 extra OS processes."* All three defects above apply to that sentence.
+- The benchmark README's finding 3 rewrites the target as *"1,500 inbound connections"* and reports the same product as *"additional resident memory"*.
+
+**#1278 is deliberately not edited by this row.** It still calls the memory cost unmeasured, which is now false. PR 879 is rewriting that block, so the correction belongs in a follow-up taken **after** 879 lands, not here -- filing a conflicting edit into a block another branch is actively rewriting is how a ledger row gets lost.
+
+### The other two costs on the same axis
+
+**Throughput, and it is already corrected upstream.** ADR 0087 compared a per-dispatch cost against a per-message bound; a message that routes to one handler pays the cost **twice** on the same serialized per-inbound worker. That was corrected in ADR 0087 itself on 2026-09-04 under **#1194**, which re-measured the 20k-reference-table case at about 16 ms per message -- a sandbox-only per-lane ceiling of roughly **61-66 msg/s**, against the ~70-100 msg/s the high single-node tier claims (`SYSTEM-REQUIREMENTS.md:220`). It is carried here because it bears on the remedy: **a pool that still serializes both dispatches of a message on one worker inherits this ceiling**, so a shape chosen for memory alone can leave the throughput half untouched.
+
+**Processes, which is the limb AC-2 names most directly.** 1,500 extra OS processes, or 3,000 under a Windows virtual environment counting launcher stubs. This is a ceiling separate from memory and it does not soften with a larger host.
+
+### `[sandbox].mode` is engine-global, which removes the obvious workaround
+
+One `SandboxPolicy` is built for the whole graph (`messagefoundry/pipeline/engine.py:675-688`) and passed to every runner. `SandboxSettings` (`messagefoundry/config/settings.py:1294-1321`) carries `mode`, `wall_seconds`, `cpu_seconds`, `mem_mb` and `startup_seconds` and **nothing per-connection or per-handler**. So a single Handler needing `mode="off"` -- for a live `db_lookup`, say -- spends the entire process's isolation, and an operator cannot sandbox the cheap lanes while exempting the expensive one. Any rearchitecture should decide whether that stays true.
+
+### Two candidate shapes, and this row does not choose between them
+
+1. **A bounded shared worker pool.** The benchmark states the constraint *"attaches to the per-inbound worker cardinality, not to the process boundary"*, and that a pool *"would decouple the bill from the connection count"* while preserving exactly the property ADR 0087 claims (a boundary to the **engine**) and dropping only one it already disclaims (`sandbox.py:39-42`: the seam draws no line between admin functions).
+2. **Router-phase-only isolation.** The live-enrichment carve-out is the stated reason `subprocess` cannot be a default, and it is a **transform-phase** feature only. `db_lookup` raises unless a runner is active (`messagefoundry/config/db_lookup.py:109-116`), and both engine activation sites sit inside `run_contexts(..., phase="transform")` (`messagefoundry/pipeline/wiring_runner.py:5606` and `:5883`). The engine's own comment at `wiring_runner.py:5119` says it: *"db_lookup raises on a Router by design, so no lookup runner."*
+
+**An unmeasured connection between the two, flagged for the ADR to settle rather than asserted here:** the phase that carries the sanctioned non-pure inputs is the transform phase, so the router phase is the one where a *shared* worker has no per-lane live-lookup state to keep straight. That suggests shape 2 is what makes shape 1 tractable first, but it is this row's reasoning and not a measurement.
+
+### How [ADR 0147](adr/0147-hardened-runtime-isolation-for-router-handler-code-ipc-brokered-sandbox-extends-adr-0087.md) relates
+
+0147 is **Proposed, with no code**. It is the only shape the record says reconciles isolation with the sanctioned live lookups: an IPC request-broker back to the parent, re-enabling `db_lookup`/`fhir_lookup` inside a confined child. **It is orthogonal to this row's axis** -- 0147 makes each child more capable and more confined, and says nothing about how many children there are. A pool and a broker compose; neither substitutes for the other. Whoever takes this should read 0147 first anyway, because pooling changes what a broker must authorize: a shared child serving several inbounds needs the broker to scope a lookup to the requesting lane, which a per-inbound child gets for free.
+
+### Why value 6 and difficulty 7
+
+**Value 6.** This is the gating constraint on an opt-in **security** control becoming a default -- #1278's subject -- and it stands against a committed acceptance criterion rather than a preference. It also corrects two records that overstate their own evidence, and the engine-global `mode` removes the partial workaround an operator would otherwise reach for. It is held out of the higher bands because `mode="off"` ships, so nothing is broken in the shipped posture, and because ADR 0052 itself calls the axis it contradicts unvalidated. **Argue it down** if you think a criterion for an unvalidated axis should not price this high.
+
+**Difficulty 7.** The remedy changes worker identity from per-inbound to pooled, which means a shared child must load and dispatch for graphs it does not currently know about, while preserving request/response correlation, the wall-clock kill semantics (killing a shared worker now affects sibling lanes), and the fail-closed guarantees ADR 0087 rests on. It is ADR-gated and it touches a security seam, which is why the verdict is research before build.
+
+**Source:** [the 2026-09-04 sandbox-dispatch benchmark](benchmarks/results/2026-09-04-adr0087-sandbox-dispatch/README.md), where these figures were first recorded under **#1194**; every anchor above re-checked by hand at this branch's HEAD because line numbers had drifted. The 74 GiB framing was posted to PR 879 and then publicly retracted there by its author before this row was written ([the finding](https://github.com/MEFORORG/MessageFoundry/pull/879#issuecomment-5555572867), [the retraction](https://github.com/MEFORORG/MessageFoundry/pull/879#issuecomment-5555582729)); the retraction is cited so this row's provenance is honest rather than tidy.
