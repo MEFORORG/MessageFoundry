@@ -23102,3 +23102,167 @@ The gate's remedy named the owning worktree and said to commit from there. **`wo
 **The grandfathered numbers are not asserted, they are read off a commit.** Laundering a number this way needs a commit that already contains it, and producing one means passing this same gate on the worktree that allocated it. Editing the BODY of an existing item was never policed here in either direction -- the rule compares NUMBER SETS (`head - base`), so a merge cannot smuggle a subject past a check that never read subjects.
 
 **Two mutations hold the arms disjoint**, and the first attempt did not: an assertion about the carried number was written into the invented-number arm, so disabling the fix reddened both and the pair localised nothing. Corrected, then re-measured. Fix disabled reds only `test_a_merge_carrying_ANOTHER_worktrees_number_is_committable`; ownership skipped wholesale during a merge reds only `test_a_number_INVENTED_during_a_merge_is_still_refused`.
+
+---
+
+## 1460. the dispatch gate names three retired seats and gives the Lander a ledger edit backlog-hygiene demands of the Builder's own PR
+
+> 🔢 **Filed 2026-09-05 -- not started. FILED ONLY: nothing here is fixed on this branch, and the reason is a dependency recorded below.** Value **5/10** · Difficulty **2/10** · _quick win_. Two constants in the dispatch tooling carry stale seat assignments. `CLOSING_SEAT` names three seats `CLAUDE.md:274` retires, and `GATED_VERDICTS`, in a second file, names two more -- so correcting one constant leaves the other emitting. A fourth value is not a retired seat at all and is the harder one to see: `CLOSING_SEAT["code"]` tells a Builder that the Lander flips the banner, while a required check demands the ledger edit of that same Builder's own PR.
+> Verdict: build
+> Research: none
+> Closing-act: code
+
+**Cluster:** coordination tooling / ledger integrity. **Priority:** P2. **Verdict:** build.
+**Severity:** no deployment axis (sec. 0). This is advice a hand-run tool prints to a seat. No engine behaviour, no shipped artifact, no PHI, and nothing a deploying site would ever meet. The cost is wasted seat effort and a handoff reported to a seat that does not exist.
+
+**Measured 2026-09-05 at `c57903c2c`, byte-equal to `origin/main`, working tree clean.** Every number below was re-derived from a clean checkout, not carried in.
+
+### The two constants, and why one fix is not enough
+
+`CLOSING_SEAT` at `scripts/docs/backlog_status_check.py:122` has four entries. Three name a seat `CLAUDE.md:274` retires:
+
+| line | key | the retired seat it names |
+|---|---|---|
+| `:124-128` | `scorecard-rescore` | "the ASVS Tracker re-scores the cell in the vault" |
+| `:129` | `owner-ruling` | "the owner rules via the LIAISON; the Dispatcher or Lander records it" |
+| `:130` | `banner-only` | "the DISPATCHER or LANDER, in the ledger" |
+
+`GATED_VERDICTS` at `scripts/coord/dispatch_gate.py:160` is a **second, independent instance in a different file**. `:164` names the LIAISON and `:168` names the LIAISON and the Dispatcher. `scripts/coord/dispatch_gate.py` imports `CLOSING_SEAT` at `:110` and prints its value at `:472` and `:489`; it reads `GATED_VERDICTS` at `:468` and prints it at `:469`. **Touching only `CLOSING_SEAT` leaves 35 rows still naming a retired seat through the other constant.**
+
+### The fourth defect is a wrong assignment, not a dangling name
+
+`CLOSING_SEAT["code"]` at `:123` reads *"the builder writes it; the LANDER flips the banner on merge"*. Both seats are live, so nothing looks wrong. What is wrong is the assignment.
+
+`.github/workflows/backlog-hygiene.yml` runs the job `banner-on-implementation` at `:78`, whose `name:` at `:82` is the context string *"a PR that implements BACKLOG #N must update BACKLOG.md"*. It sets `touches_code` for `messagefoundry/`, `ide/` or `messagefoundry_webconsole/` at `:180-183`, and when that holds it requires the **same** PR to touch `docs/BACKLOG.md` or `docs/archive/backlog/` at `:194`. A code-closing PR touches those paths by definition. That context is live on branch protection: `gh api repos/:owner/:repo/branches/main/protection --jq '.required_status_checks.contexts[]'` returned 13 contexts on 2026-09-05 and it is the first of them.
+
+`CLAUDE.md:286` puts that PR on the Builder: *"The change, the commit, the push, and the PR carrying the `BACKLOG.md` update."* So the tool tells a Builder the ledger edit is somebody else's while a required check demands it of that Builder's own PR.
+
+**State the correction as the PR, not as closure.** The gate checks only that the PR touches the backlog namespace, never that a banner flipped to closed; its own remediation text allows an open banner on a partial implementation. The corrected value must say the Builder's PR carries the edit. It must not say the Builder declares the item closed.
+
+### Reach, and it is advice shown to a reader, not a verdict
+
+Calling `judge()` over the whole ledger namespace, 670 rows across `docs/BACKLOG.md` and `docs/archive/backlog/`, **taken at `c57903c2c` before this row and #1461 were written**:
+
+| what the returned reason says | rows | of those, open |
+|---|--:|--:|
+| names a retired seat | **132** | **130** |
+| "the LANDER flips the banner on merge" | **166** | **119** |
+| `banner-only` declared by any row | **0** | **0** |
+
+Per needle: ASVS Tracker 97, LIAISON 35, Dispatcher 33. The closing-act census is `code` 167, `scorecard-rescore` 97, `owner-ruling` 33, `blocked` 4, absent 369. **167 rows carry `code` but only 166 print the LANDER sentence**, because #1343 grades `advise` for an unrelated reason and the `read`/`advise` returns precede the `ok` path that prints it.
+
+**The `banner-only` zero was true when measured and is not true any more, and this row changed it.** At `c57903c2c` no row declared that closing act, so the entry never rendered. **#1461**, filed in the same commit as this row, declares `banner-only` because its work lands in the vault and leaves nothing but a banner here. So the entry now renders on exactly one row, and the string it prints names the Dispatcher.
+
+### The staleness moves no gate decision, and saying so is what holds this at P2
+
+Replacing every value in **both** constants with a placeholder changed the level on **0 of 670 rows** (`advise` 135, `refuse` 369, `ok` 166, before and after). **Positive control on the same experiment and the same corpus:** emptying `BUILDER_CLOSABLE_ACTS`, the frozenset at `backlog_status_check.py:108` that actually drives the branch at `dispatch_gate.py:471` and contains no seat name, moved **166** levels. So the instrument can detect a level change and did not detect one here. No branch compares a seat name; the gate never refuses on one.
+
+### Why CLAUDE.md's own rule does not absorb this
+
+`CLAUDE.md:274-276` tells a reader to treat a retired seat's naming as stale. That disposes of the **prose** instances, and nothing is filed for those. It cannot reach a Python string that a second module interpolates into output, and for two of the four values it does not apply at all:
+
+- For `CLOSING_SEAT["code"]` the rule is inapplicable, because the Lander is a live seat. There is no retired naming to discount.
+- For `scorecard-rescore` the rule removes the dangling name but supplies no successor, so a reader who applies it correctly is left holding a work act with no seat.
+
+### The successors, and the one that is not yet on main
+
+Two come straight off the roster table and need no ruling:
+
+- **Liaison becomes Console.** `CLAUDE.md:285` makes the Console "the only seat the owner talks to".
+- **Dispatcher, in its recording half, becomes Lander.** `CLAUDE.md:289` gives the Lander "Standing authority on the engine repo and the vault, with no per-action owner approval".
+
+The third has a ruling but not yet a merge. **Who performs an ASVS cell re-score under KORUS was ruled by the owner on 2026-09-05, and `CLAUDE.md` section 5's Lander row is where that ruling is recorded** -- read it there rather than here. **PR 929 carries it and was OPEN when this row was filed** (`gh pr view 929 --json state,mergedAt` returned `state OPEN`, `mergedAt null`). Until it is on `main`, correcting the `scorecard-rescore` value would put an operative instruction into shipped source citing a section that does not yet say it. **That value is the 97-row half, so it is the largest part of the fix and the part that must wait.**
+
+### Test coupling, and the CI leg is one unit
+
+Five assertions in `tests/test_coord_dispatch_gate.py` pin these strings: `:100` and `:796` assert `"ASVS Tracker"`, `:247` and `:274` assert `"LIAISON"`, and `:104` asserts `"LANDER"` and so pins the wrong banner assignment. **The two `LIAISON` assertions come from `GATED_VERDICTS`, not `CLOSING_SEAT`**, because both tests drive `closing-act: code`, which is in `BUILDER_CLOSABLE_ACTS`, so the `CLOSING_SEAT` branch never fires for them. A fixer who patches only `CLOSING_SEAT` and sees those two still passing will conclude wrongly that they are unrelated to this work.
+
+The constants and their assertions must move in one PR. `tests/tooling_manifest.txt:84` lists the module, `tests/conftest.py` marks manifest members `tooling`, `tooling` is in `ci-gate`'s `needs` in `.github/workflows/ci.yml`, and `CI gate` is a required context. The tooling path filter matches `scripts/` as well as the manifest paths, so a PR editing both the constants and the assertions fires one leg and goes green or red as a unit. There is no split red to manage.
+
+### Why this row was filed and not fixed on the same branch
+
+Three reasons, and the first is sufficient on its own.
+
+1. The largest half, `scorecard-rescore` at 97 rows, needs PR 929 on `main` first. Shipping the other five values would leave the constant half-corrected in a way a later reader could mistake for the finished state.
+2. A half-fix touches `tests/test_coord_dispatch_gate.py` twice across two PRs.
+3. The owner's ask was to file it. This row records each value, its line, its successor and the assertions that move with it, so the follow-on edit is mechanical rather than a re-derivation.
+
+### The justifying comment rests on two dead line numbers
+
+`backlog_status_check.py:114-115` cites `BUILDER.md:253` and `:148`. In the live vault file, line 253 is empty and line 148 is mid-paragraph ADR prose. **Both anchors resolved exactly when written** and broke in a later condensation of that playbook, so this is line drift, not a fabricated citation. It is one instance of the class already filed as **#1315**; correct these two anchors while the comment is being rewritten anyway and file nothing new for it. **Do not repoint `:253` at `:148`'s sentence** -- they cite two different rules, and the quotation `:253` carries, "banner flips and ledger reconciles are not the builder's", is absent from the current `BUILDER.md` entirely.
+
+### The upstream disagrees, and correcting it is a different row
+
+Vault `roles/BUILDER.md:216` reads *"Do **not** edit `docs/BACKLOG.md`. The lander writes the banner."* That is the source of this constant's wording, it is a write outside this repository, and it is filed as **#1461**.
+
+### Controls, each able to fire
+
+1. **Reach loop, needles swapped for live seats** (`Steward`, `Regulator`, `Console`): **0** rows, against 132 for retired names. The loop does not match everything.
+2. **Level counterfactual, positive arm:** emptying `BUILDER_CLOSABLE_ACTS` moved 166 levels, so a level change is detectable; the constants' placeholder swap moved 0.
+3. **Ledger duplicate census, dead needle** `ZZQQ_IMPOSSIBLE`: 0 and 0 across both ledger files, against a same-corpus control of "banner" returning 513 and 57. `CLOSING_SEAT` returns 0 and 0, so the absence is real. `GATED_VERDICTS` returns 3 in the live file, and all three sit inside **#1334**, which covers whether the gate advises on those verdicts, not the seat names inside the advice.
+4. **Test-assertion needle, invented seats** (`Quartermaster`, `Bosun`): exit 1, against 6 real hits for the seat-name pattern in the same file.
+5. **Contention scan, positive arm:** of 67 open PRs (`gh pr list --limit 200`, asserted strictly below the limit), **0** touch `dispatch_gate.py`, `backlog_status_check.py` or `test_coord_dispatch_gate.py`, while **64** touch `docs/BACKLOG.md` on the identical loop. The zero is measured, not an empty instrument.
+
+### Not checked
+
+I did not census retired-seat naming outside these three files and the vault `roles/` folder. I ran no hosted CI leg, so the claim that the tooling job carries this module is read from `tooling_manifest.txt`, `conftest.py` and `ci.yml` text plus the live branch-protection query, not from an observed run. I did not re-derive the provenance of the fixture behind the `:796` assertion. I read only `roles/` in the vault and ran no git history there.
+
+---
+
+## 1461. three vault role playbooks still give the Lander the ledger banner that CLAUDE.md section 5 puts in the Builder's PR
+
+> 🔢 **Filed 2026-09-05 -- not started. A BUILDER CANNOT CLOSE THIS. The work is a write to the separate `MessageFoundry-vault` repository, which sits outside this repo's PR flow. `CLAUDE.md:289` gives the Lander "Standing authority on the engine repo and the vault, with no per-action owner approval", so the Lander performs it and needs no owner ruling first.** Value **4/10** · Difficulty **2/10** · _fill-in_. Three role playbooks carry the pre-2026-09-01 banner assignment as live instruction. `BUILDER.md:216` forbids the Builder the exact edit `CLAUDE.md:286` assigns it, and justifies the ban with a gate rule that does not apply. `LANDER.md` states the same assignment four times, and `DISPATCHER.md:209` states it in a retired seat's voice.
+> Verdict: build
+> Research: none
+> Closing-act: banner-only
+
+**Cluster:** coordination tooling / role playbooks. **Priority:** P2. **Verdict:** build.
+**Severity:** no deployment axis (sec. 0). These are instructions to a seat, in a separate repository. No engine behaviour, no shipped artifact, no PHI. The cost is a Builder that declines a ledger edit its own PR needs, and a handoff each seat believes the other performs.
+
+**`banner-only` is the closing act because nothing lands in THIS repository except the banner.** The work is a vault edit, so no engine-repo commit records it, and the last act that closes the item here is the banner flip. That is the same two-act shape as `scorecard-rescore`, which exists as its own value only because the vault half there is a scorecard re-score specifically. **This is the first row on the ledger to declare `banner-only`**, so it is also the first time that entry of `CLOSING_SEAT` renders -- and the value it renders names a retired seat, which is **#1460**'s subject.
+
+**Measured 2026-09-05.** Engine checkout at `c57903c2c`, byte-equal to `origin/main`. Vault read from the working tree of the clone beside it.
+
+### The contradiction, in two sentences side by side
+
+`CLAUDE.md:286`, the Builder's Owns column: *"The change, the commit, the push, and the PR carrying the `BACKLOG.md` update."*
+
+Vault `roles/BUILDER.md:213-217`, under the heading "Closing a ledger row makes your PR red, and both escapes are violations": *"a PR citing `BACKLOG #N` needs a banner edit in the same PR, and single-writer forbids you making it. Do **not** drop the citation to clear the check -- it then passes while looking at nothing. Do **not** edit `docs/BACKLOG.md`. The lander writes the banner."*
+
+### The stated justification is measurably false, not merely superseded
+
+`BUILDER.md:216` grounds the ban on "single-writer forbids you making it". `scripts/hooks/ledger_check.py` records the opposite: *"Editing the BODY of an item that already exists was never policed here either way -- the rule compares NUMBER SETS, `head - base`"*. A banner flip is a body edit, so the pre-commit ledger gate refuses no Builder for making one.
+
+`main` already follows `CLAUDE.md`. PR 902 (`8432ad496`), a code fix citing BACKLOG #1456, carries the `docs/BACKLOG.md` edit in the same commit, and most recent `main` commits do the same.
+
+### CLAUDE.md's stale-naming rule provably does not reach these lines
+
+`CLAUDE.md:274-276` fires on a **retired seat** or a **retired rule**, and forbids extending that to a whole document. `BUILDER.md:216` names only the Lander, a live seat, and "single-writer", which appears zero times in `CLAUDE.md`. So a Builder applying the rule correctly still reads line 216 as binding. `DISPATCHER.md:209` is the one hit the rule does cover, and it lives in a retired seat's own file.
+
+### The population, measured with a dead-needle control
+
+`grep -rn -i -E "(writes the banner|flips the banner|write the banner|banner is written)" roles/` returns 4 lines in 3 files:
+
+| file and line | what it says |
+|---|---|
+| `roles/BUILDER.md:216` | "Do **not** edit `docs/BACKLOG.md`. The lander writes the banner." |
+| `roles/DISPATCHER.md:209` | "**Ledger authorship and push are held by DIFFERENT SEATS.** You write the banner; the Lander pushes it." |
+| `roles/LANDER.md:816` | "**The lander writes the banner INTO the worker's PR** as a separate commit" |
+| `roles/LANDER.md:940` | "the banner is written later, by this seat" |
+
+**Zero of the four assigns the banner to a Builder.** Dead-needle control on the same instrument and corpus, "writes the pennant": exit 1, no output. The instrument discriminates, so the zero is measured.
+
+`LANDER.md` carries the assignment twice more in section 7g, which the needle above does not match: `:926` *"Deciding an item is closed is YOURS, and it is a separate act from recomputing the census"*, and `:933` *"The vault ASVS cell is re-scored first, and the banner flips second. The second act is yours."*
+
+### One line becomes newly stale the moment PR 929 merges
+
+`LANDER.md:933` also says of the ASVS re-score: *"No live seat performs the first, so read the scorecard commits yourself rather than waiting on a notice."* The owner ruled on 2026-09-05 that the Lander performs the vault scorecard re-score, and `CLAUDE.md` section 5's Lander row is where that ruling is recorded. PR 929 carries it and was OPEN when this row was filed. **Once it merges, "no live seat performs the first" is false**, so whoever fixes this row should correct that sentence in the same pass rather than leaving a second stale claim behind.
+
+### Two things the fixer must not do
+
+1. **Do not edit the dated records.** `LANDER.md` section 7g carries measurements from 2026-08-22 and a table of what a drain found. Those are history; rewriting them destroys the evidence. Only the present-tense instructions move.
+2. **Do not pick a winner where the playbooks merely disagree with each other.** This row resolves one question only, the one `CLAUDE.md:286` already answers: the Builder's PR carries the `BACKLOG.md` edit. `BUILDER.md:73-74` separately routes "who writes the ledger banner" to `LANDER` as the authority, and that routing is what made this survive the roster rewrite. Correcting it is part of the same fix.
+
+### Not checked
+
+I read only `roles/` in the vault and ran no git history there, so I cannot date when any of these lines was written. Eleven of the fourteen playbooks were matched by the needle above but not read, so treat the population as **at least three files**, not a total. I did not check whether any workflow or CI job reads a playbook, and I confirmed no case in which a seat actually followed `BUILDER.md:216` and produced a red PR -- I measured the instruction and the gate, not an incident.
