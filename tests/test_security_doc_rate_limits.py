@@ -1518,3 +1518,136 @@ def test_limit_defaults_quoted_in_the_table_match_the_code(field: str, pinned: o
         f"docs/CONFIGURATION.md's `{field}` row states default {rendered!r}, but the live default "
         f"is {live!r}. The operator configuration reference is what an operator tunes from."
     )
+
+
+# --- BACKLOG #1131 (ASVS 6.1.1): the map's "no limiter" row is a CLAIM, so derive it --------------
+#
+# Every assertion above runs in one direction: what the code charges must be documented. Nothing ran
+# the other way, so a route the doc filed under "No limiter of any kind" could start charging one and
+# the suite stayed green. Two did. `DELETE /me/mfa` rides `require_step_up_action`, which BACKLOG
+# #1148 made charge the admin-write floor -- the same promotion the row already narrates for
+# `PATCH /users/{user_id}`, one clause earlier -- and the console's two WebAuthn staging POSTs ride
+# `require_ui`, which charges it on every non-GET.
+#
+# Why the existing derivation cannot see either: `_route_limiter_calls` walks the route function's own
+# BODY, so a limiter charged inside the DEPENDENCY is structurally invisible to it. This gate reads
+# the dependency names instead, which is where those charges live.
+
+
+def _charging_console_gates() -> set[str]:
+    """Console `require*` factories that charge the admin-write floor, derived two levels deep.
+
+    ``require_ui`` charges it directly; the four action gates charge it by building on ``require_ui``.
+    Derived rather than listed for the reason ``_pacing_charging_factories`` records: a hand-kept set
+    of names keeps passing after a factory stops charging.
+    """
+    tree = ast.parse((_WEBCONSOLE / "_auth.py").read_text(encoding="utf-8"))
+    factories = {
+        node.name
+        for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef)
+        and node.name.startswith("require")
+        and _calls_to(node, {"allow_admin_write"})
+    }
+    assert factories, "no console gate charges allow_admin_write any more; this guard is now blind"
+    derived = {
+        node.name
+        for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef)
+        and node.name.startswith("require")
+        and _calls_to(node, factories)
+    }
+    return factories | derived
+
+
+def _route_dependency_names(path: Path) -> dict[str, set[str]]:
+    """`"POST /x"` -> every bare name appearing in that route's parameter defaults.
+
+    Keyed by ``METHOD /path``, which is the form the documentation writes and NOT what
+    ``_decorated_path`` returns -- it yields the path alone, so keying on it here would make every
+    lookup miss and the guard below pass vacuously. That is exactly what the first draft did, and the
+    planted mutation is what showed it; the count assertion in the test is the standing control.
+
+    The defaults are where ``Depends(...)`` lives, and a gate may be a plain name
+    (``Depends(require_ui_step_up)``) or a factory call (``Depends(require_step_up_action(ACTION))``),
+    so every ``Name`` in the subtree is collected rather than only the outermost callee.
+    """
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    out: dict[str, set[str]] = {}
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef):
+            continue
+        names: set[str] = set()
+        for default in [*node.args.defaults, *node.args.kw_defaults]:
+            if default is None:
+                continue
+            names |= {n.id for n in ast.walk(default) if isinstance(n, ast.Name)}
+        for deco in node.decorator_list:
+            if not isinstance(deco, ast.Call) or not isinstance(deco.func, ast.Attribute):
+                continue
+            method = deco.func.attr.upper()
+            if method not in {"GET", "POST", "PUT", "PATCH", "DELETE"} or not deco.args:
+                continue
+            first = deco.args[0]
+            if isinstance(first, ast.Constant) and isinstance(first.value, str):
+                out.setdefault(f"{method} {first.value}", set()).update(names)
+    return out
+
+
+def test_routes_documented_as_unpaced_really_charge_nothing() -> None:
+    """The "No limiter of any kind" row must not list a route that charges the admin-write floor.
+
+    An over-claim here is worse than an omission: an operator reading it would front a route with a
+    proxy limiter it does not need, and -- the real cost -- would trust the same row about the routes
+    that genuinely have none. On a first deployment nothing is exposed either way; what would be wrong
+    is the operator's picture of where the engine's own pacing stops.
+    """
+    row = next(
+        (
+            r
+            for table in _tables(_section("### Route → limiter map"))
+            for r in table
+            if "No limiter of any kind" in r[0]
+        ),
+        None,
+    )
+    assert row is not None, "the Route -> limiter map lost its 'No limiter of any kind' row"
+    # ONLY the leading enumeration, not the whole cell. The cell also NARRATES routes that have LEFT
+    # this row, and reading every backticked token in it would report those as offenders -- measured,
+    # the first draft did exactly that and accused `PATCH /users/{user_id}`, which the same cell
+    # explains is paced. Presence of a token is not the same claim as membership of the list.
+    enumeration = row[-1].split(". ", 1)[0]
+    documented = {m.group(1) for m in _ROUTE_TOKEN_RE.finditer(enumeration)}
+    assert len(documented) >= 5, (
+        f"the 'No limiter of any kind' enumeration parsed to {sorted(documented)}. The guard reads the "
+        "leading sentence of that cell; if the row was restructured, re-point it rather than accepting "
+        "a green -- a parse that finds nothing cannot find an offender either."
+    )
+
+    charging = _pacing_charging_factories() | _charging_console_gates()
+    deps: dict[str, set[str]] = {}
+    for source in (_APP, _AUTH_ROUTES, *sorted(_CONSOLE_ROUTES.glob("*.py"))):
+        for route, names in _route_dependency_names(source).items():
+            deps.setdefault(route, set()).update(names)
+
+    matched = documented & deps.keys()
+    assert len(matched) >= len(documented) // 2, (
+        f"only {len(matched)} of {len(documented)} documented routes were found in the route table "
+        f"({sorted(documented - deps.keys())} missing). The guard cannot answer the question if it "
+        "cannot find the routes -- fix the key form rather than accepting a green."
+    )
+
+    offenders: dict[str, set[str]] = {}
+    for route in sorted(documented):
+        method = route.split(" ", 1)[0]
+        if method == "GET":
+            continue  # the floor is non-GET only, so a GET here is correct by construction
+        gates = deps.get(route, set()) & charging
+        if gates:
+            offenders[route] = gates
+    assert not offenders, (
+        "docs/SECURITY.md files these under 'No limiter of any kind', but they charge the per-actor "
+        f"admin-write floor through the gate named beside each: { {k: sorted(v) for k, v in offenders.items()} }. "
+        "Move them out of that row (the map documents the AUTH-SURFACE limiters; the floor is the "
+        "2.1.3 table) rather than deleting the gate."
+    )
