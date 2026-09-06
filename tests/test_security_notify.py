@@ -17,11 +17,14 @@ import pytest
 from messagefoundry.auth.notifications import (
     ACCOUNT_LOCKED,
     EMAIL_CHANGED,
+    MFA_CREDENTIAL_REMOVED,
+    MFA_DISABLED,
     RECOVERY_CODE_USED,
     SecurityEvent,
 )
 from messagefoundry.config.settings import AlertsSettings
 from messagefoundry.pipeline.security_notify import (
+    _SUBJECTS,
     SecurityEventNotifier,
     _build_body,
     security_notifier_from_settings,
@@ -163,6 +166,32 @@ def test_body_names_the_new_address_on_a_repoint_and_does_not_say_removed() -> N
     )
     assert "New email on file: new@example.org" in body
     assert "removed" not in body.lower()
+
+
+def test_a_non_last_factor_removal_renders_its_own_subject_and_body() -> None:
+    """BACKLOG #1139 (ASVS 6.3.7): MFA_CREDENTIAL_REMOVED must be wired into BOTH renderers.
+
+    THE TEST EXISTS BECAUSE BOTH FALL BACK SILENTLY. ``_SUBJECTS.get`` degrades to a generic
+    "MessageFoundry security alert" and ``_DESCRIPTIONS.get`` to "A security event occurred on your
+    account", so a half-wired event type sends a mail that looks well-formed and tells the holder
+    nothing. Neither renderer raises, so nothing else in the suite would notice.
+
+    It also pins the one thing this arm must NOT say. The account still holds another second factor,
+    so the MFA_DISABLED wording would be a false statement in a security notice.
+    """
+    assert _SUBJECTS[MFA_CREDENTIAL_REMOVED] != _SUBJECTS[MFA_DISABLED]
+    body = _build_body(
+        SecurityEvent(
+            MFA_CREDENTIAL_REMOVED,
+            username="bob",
+            email="bob@example.org",
+            detail={"factor": "webauthn"},
+        )
+    )
+    assert "A security event occurred on your account." not in body
+    assert "removed" in body.lower()
+    # Says the account is still protected, and does not claim a disable.
+    assert "disabled" not in body.lower()
 
 
 def test_body_says_a_directory_repoint_came_from_the_directory() -> None:

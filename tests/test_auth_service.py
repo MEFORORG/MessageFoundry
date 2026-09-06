@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import logging
 import sqlite3
 import time
 from pathlib import Path
@@ -29,6 +30,10 @@ from messagefoundry.store.store import MessageStore
 
 GOOD_PASSWORD = "Sup3rSecret!!"
 NEW_PASSWORD = "An0ther-Str0ng-Pass!!"
+
+# The service's own logger, named once so the capture filter and the module cannot drift apart
+# (matching tests/test_security_notify.py, which names its module's logger the same way).
+_AUTH_LOGGER = "messagefoundry.auth.service"
 
 
 class _FakeNotifier:
@@ -1223,6 +1228,47 @@ async def test_notifier_failure_is_isolated_from_the_auth_op() -> None:
         # admin role change fires ROLES_CHANGED → notifier raises → role change still applied
         await service.set_roles("u1", ["viewer"], actor="admin")
         assert await store.get_user_role_ids("u1") == ["viewer"]
+    finally:
+        await store.close()
+
+
+async def test_missing_notifier_reports_the_drop_rather_than_swallowing_it(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """BACKLOG #1139 (ASVS 6.3.7): with no notifier wired, ``_notify_security`` returned on
+    ``self._security_notifier is None`` without a word, while its own docstring three lines above
+    said a missing notifier was logged. Only the FAILURE arm logged, which
+    ``test_notifier_failure_is_isolated_from_the_auth_op`` above already covers.
+
+    THIS DROP IS WIDER THAN THE SIBLING IN ``pipeline/security_notify.py``, which loses one account.
+    ``security_notifier_from_settings`` returns ``None`` whenever ``[alerts]`` names no SMTP host or
+    sender, so an instance running with ``notify_security_events`` on and no relay configured would
+    drop every notice for every account on a first deployment, with the lifespan wiring reporting
+    nothing either.
+    """
+    store = await _store()
+    try:
+        # No ``security_notifier=`` -- exactly what the factory hands the lifespan with no SMTP host.
+        service = AuthService(store, AuthSettings())
+        await _local_user(store)
+        with caplog.at_level(logging.WARNING, logger=_AUTH_LOGGER):
+            # EMAIL_CHANGED rather than any other event, because ITS DETAIL CARRIES AN ADDRESS -- so
+            # this one case pins the never-log-detail rule as well as the drop itself.
+            await service.update_user(
+                "u1",
+                display_name=None,
+                email="repointed@example.net",
+                disabled=None,
+                actor="admin",
+            )
+        dropped = [r for r in caplog.records if r.name == _AUTH_LOGGER]
+        assert len(dropped) == 1, "a dropped notice must be reported, not silently swallowed"
+        message = dropped[0].getMessage()
+        # Names WHICH notice and WHOSE account, so an operator can act on it.
+        assert EMAIL_CHANGED in message
+        assert "bob" in message
+        # Never the event detail: on this event type it holds an email address.
+        assert "repointed@example.net" not in message
     finally:
         await store.close()
 

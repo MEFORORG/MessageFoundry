@@ -20,7 +20,11 @@ from webauthn.helpers import base64url_to_bytes  # noqa: E402
 
 from messagefoundry.auth import webauthn as wa  # noqa: E402
 from messagefoundry.auth.identity import Identity  # noqa: E402
-from messagefoundry.auth.notifications import MFA_DISABLED, SecurityEvent  # noqa: E402
+from messagefoundry.auth.notifications import (  # noqa: E402
+    MFA_CREDENTIAL_REMOVED,
+    MFA_DISABLED,
+    SecurityEvent,
+)
 from messagefoundry.auth.service import AuthService  # noqa: E402
 from messagefoundry.config.settings import AuthSettings  # noqa: E402
 from messagefoundry.store.store import MessageStore  # noqa: E402
@@ -408,6 +412,48 @@ async def test_last_factor_delete_notifies_when_not_required() -> None:
         assert await store.has_webauthn_credentials(identity.user_id) is False
         assert any(e.event_type == MFA_DISABLED for e in notifier.events)
         assert "auth.webauthn_removed" in await _events(service, identity.username)
+    finally:
+        await store.close()
+
+
+async def test_removing_a_passkey_notifies_even_when_another_factor_remains() -> None:
+    """BACKLOG #1139 (ASVS 6.3.7): removal parity. ``delete_webauthn_credential`` wrote its audit row
+    unconditionally but notified only ``if last_second_factor``, so removing a passkey while another
+    factor remained produced no out-of-band notice at all -- and that is exactly the removal someone
+    holding a stolen session makes, stripping the holder's own authenticator while keeping theirs.
+    Removing a passkey is an update to the account's authentication details either way, which is the
+    requirement's own verb.
+
+    The two arms stay DIFFERENT event types rather than one type carrying a flag: MFA_DISABLED
+    asserts the account has no second factor left, which is false while another passkey stands, and
+    existing consumers read it as that state change.
+    """
+    store = await MessageStore.open(":memory:")
+    try:
+        notifier = _FakeNotifier()
+        service = await _service(store, notifier=notifier)  # require_mfa off
+        identity, token, _ = await _bootstrap_login(service)
+        await _enroll(service, identity, token, label="first key")
+        await _enroll(service, identity, token, label="second key")
+        creds = await store.list_webauthn_credentials(identity.user_id)
+        assert len(creds) == 2
+
+        assert (
+            await service.delete_webauthn_credential(identity, creds[0].credential_id_hash) is True
+        )
+        removed = [e for e in notifier.events if e.event_type == MFA_CREDENTIAL_REMOVED]
+        assert len(removed) == 1, "a passkey removal must notify even when another factor remains"
+        assert removed[0].username == identity.username
+        # The account still HAS a second factor, so the disable event would be a false statement.
+        assert [e for e in notifier.events if e.event_type == MFA_DISABLED] == []
+        assert "auth.webauthn_removed" in await _events(service, identity.username)
+
+        # The last-factor arm is unchanged: it still fires MFA_DISABLED, and only once.
+        assert (
+            await service.delete_webauthn_credential(identity, creds[1].credential_id_hash) is True
+        )
+        assert len([e for e in notifier.events if e.event_type == MFA_DISABLED]) == 1
+        assert len([e for e in notifier.events if e.event_type == MFA_CREDENTIAL_REMOVED]) == 1
     finally:
         await store.close()
 

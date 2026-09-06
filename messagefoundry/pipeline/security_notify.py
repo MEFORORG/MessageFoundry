@@ -25,6 +25,7 @@ from messagefoundry.auth.notifications import (
     EMAIL_CHANGED,
     FEDERATED_IDENTITY_BOUND,
     LOGIN_AFTER_FAILURES,
+    MFA_CREDENTIAL_REMOVED,
     MFA_DISABLED,
     MFA_ENABLED,
     PASSWORD_CHANGED,
@@ -51,6 +52,7 @@ _SUBJECTS = {
     ACCOUNT_DISABLED: "Your MessageFoundry account was disabled",
     MFA_ENABLED: "Two-factor authentication was enabled on your MessageFoundry account",
     MFA_DISABLED: "Two-factor authentication was disabled on your MessageFoundry account",
+    MFA_CREDENTIAL_REMOVED: "A second factor was removed from your MessageFoundry account",
     RECOVERY_CODE_USED: "A MessageFoundry recovery code was used on your account",
     ADMIN_NEW_IP: "A sensitive action on your MessageFoundry account from a new location",
 }
@@ -66,6 +68,15 @@ _DESCRIPTIONS = {
     ACCOUNT_DISABLED: "Your account was disabled by an administrator.",
     MFA_ENABLED: "A two-factor authenticator (TOTP) was enrolled on your account.",
     MFA_DISABLED: "Two-factor authentication was removed from your account.",
+    # BACKLOG #1139: this arm reports WHAT CHANGED and states what still stands. It must not borrow
+    # the MFA_DISABLED wording, which asserts the account has no second factor left -- untrue here by
+    # construction, and a security notice the holder can falsify is one they stop reading. WHICH
+    # credential went is deliberately not named: the label is user-authored free text, and the audit
+    # row (``auth.webauthn_removed``) already carries it somewhere better protected than a mailbox.
+    MFA_CREDENTIAL_REMOVED: (
+        "One of the second factors on your account was removed. At least one other factor remains, "
+        "so two-factor authentication is still in force."
+    ),
     RECOVERY_CODE_USED: (
         "One of your single-use recovery codes was accepted as a second factor. That code is now "
         "spent and cannot be used again."

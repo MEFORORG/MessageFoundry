@@ -35,6 +35,7 @@ from messagefoundry.auth.notifications import (
     EMAIL_CHANGED,
     FEDERATED_IDENTITY_BOUND,
     LOGIN_AFTER_FAILURES,
+    MFA_CREDENTIAL_REMOVED,
     MFA_DISABLED,
     MFA_ENABLED,
     PASSWORD_CHANGED,
@@ -2836,8 +2837,11 @@ class AuthService:
         """Self-service: remove one of the caller's own passkeys (the API gates this behind the
         full step-up). Returns ``False`` for an unknown/foreign credential (self-scoped). Raises
         :class:`ValueError` when this is the last remaining second factor while MFA is still
-        required — "enroll another factor first" (ADR 0068 decision 5). Deleting the last factor
-        when NOT required fires the MFA_DISABLED-class notification (ASVS 6.3.7 parity)."""
+        required — "enroll another factor first" (ADR 0068 decision 5).
+
+        EVERY successful removal notifies out of band (ASVS 6.3.7, BACKLOG #1139), on the event type
+        that describes the resulting state: MFA_DISABLED where this was the last factor and MFA was
+        not required, MFA_CREDENTIAL_REMOVED where at least one other factor remains."""
         user = await self._store.get_user(identity.user_id)
         if user is None:
             return False
@@ -2861,9 +2865,33 @@ class AuthService:
             detail=_json({"label": target.label}),
             client=client,
         )
+        # BACKLOG #1139 (ASVS 6.3.7): EVERY removal notifies, not only the last one. This used to
+        # emit under ``if last_second_factor`` alone, so removing a passkey while another factor
+        # remained wrote the audit row above and nothing else — leaving the audit log as the sole
+        # record of precisely the removal someone holding a stolen session makes, stripping the
+        # holder's own authenticator while keeping their own. Losing one of several factors is still
+        # an update to the account's authentication details, which is the requirement's own verb.
+        #
+        # TWO EVENT TYPES RATHER THAN ONE CARRYING A FLAG, because they are different statements
+        # about the resulting state. MFA_DISABLED asserts the account has no second factor left;
+        # emitting it while another passkey stands would be false, and consumers already read it as
+        # that state change. The last-factor arm is therefore untouched.
         if last_second_factor:
             await self._notify_security(
                 MFA_DISABLED,
+                username=user.username,
+                email=user.notify_email,
+                client=client,
+                detail={"factor": "webauthn"},
+            )
+        else:
+            # No remaining-factor COUNT in the detail. ``len(creds) - 1`` is off by one for every
+            # credential a concurrent caller removed between this method's read and its own delete,
+            # and the recovery-code sibling pays a re-read to avoid exactly that. Here the count buys
+            # the reader nothing the fixed wording does not already give them, so it is not carried
+            # rather than carried wrong.
+            await self._notify_security(
+                MFA_CREDENTIAL_REMOVED,
                 username=user.username,
                 email=user.notify_email,
                 client=client,
@@ -3287,10 +3315,39 @@ class AuthService:
         client: str | None = None,
         detail: dict[str, Any] | None = None,
     ) -> None:
-        """Best-effort out-of-band security-event push (ASVS 6.3.5/6.3.7). A missing notifier or a
-        notifier failure is swallowed (logged) — a notification must never break a login or an admin
-        action. The event is also already in the audit log (the /me/security-events feed)."""
+        """Best-effort out-of-band security-event push (ASVS 6.3.5/6.3.7). A missing notifier and a
+        notifier failure are each WARNED and then swallowed — a notification must never break a login
+        or an admin action. The event is also already in the audit log (the /me/security-events
+        feed).
+
+        The docstring used to promise both arms were logged while only the failure arm was (BACKLOG
+        #1139), so read the branches rather than this paragraph if they ever diverge again."""
         if self._security_notifier is None:
+            # BACKLOG #1139: SAY SO, matching the sibling drop in ``pipeline/security_notify.py``
+            # (CLAUDE.md §6 forbids the silent swallow independently of ASVS).
+            #
+            # THIS DROP IS WIDER THAN THAT SIBLING, which loses one account.
+            # ``security_notifier_from_settings`` returns ``None`` whenever ``[alerts]`` names no SMTP
+            # host or sender, so an instance running with ``notify_security_events`` on and no relay
+            # configured would drop every notice for every account on a first deployment — and the
+            # lifespan wiring reports nothing either. Neither the serve gate nor
+            # ``_assert_security_notice_is_deliverable`` covers that on a non-PHI instance, so
+            # without this line the whole channel would be undetectably absent rather than merely
+            # unconfigured.
+            #
+            # Per occurrence rather than once per process, matching the sibling and the two drops it
+            # matched in turn: each line is a distinct notice nobody received, and collapsing them
+            # would hide the count — which is the figure that separates a missing relay from a quiet
+            # instance.
+            #
+            # **Never ``detail``** — an EMAIL_CHANGED carries the new address in it.
+            _log.warning(
+                "security notice %s for %s dropped: no security-event notifier is configured, so "
+                "the account was not told out of band (the /me/security-events feed still records "
+                "it)",
+                event_type,
+                username,
+            )
             return
         try:
             await self._security_notifier.notify(
