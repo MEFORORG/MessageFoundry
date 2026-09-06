@@ -81,10 +81,20 @@ Never write a bare "console". The method is named KORUS, and
 - Rules a Builder needs belong in the **account's** `settings.json`, outside git.
   `.claude/settings.json` is tracked, and every worktree carries its own copy from its own branch, so
   an uncommitted edit to the primary checkout reaches nothing else.
-- Read a role playbook from the `MessageFoundry-vault` primary's `roles/` folder (owner ruling, vault
-  commit `5e361756`). That exception covers `roles/` and nothing else in that tree: the rest of the
-  checkout sits on a branch that is not an ancestor of `origin/main`, and an `ls` of a directory is
-  not evidence that you have a file.
+- Read a role playbook from the **`wshallwshall/korus`** repository's `roles/` folder. Owner
+  instruction 2026-09-05.
+- **SUPERSEDED 2026-09-05, and recorded rather than deleted, because seats still quote it:** this
+  line named the `MessageFoundry-vault` primary's `roles/` folder (owner ruling, vault commit
+  `5e361756`). korus became the gold copy on 2026-09-04 (korus `5728484`) on the ground that the
+  vault was the ungated copy and the ungated copy decays. **This pointer did not move with the
+  authority**, so every session spawned here between those dates read a copy last changed
+  2026-08-29.
+- The vault read exception, where you still need it, covers `roles/` and nothing else in that tree:
+  the rest of the checkout sits on a branch that is not an ancestor of `origin/main`, and an `ls` of
+  a directory is not evidence that you have a file.
+- **The failure this cost is the one to carry forward.** A pointer and the thing it points at are
+  two edits, and nothing fails when only the first is made. Move both in the same change, or the
+  stale one wins silently for as long as nobody re-reads it.
 
 ### Branch, commit one layer, open the PR
 
