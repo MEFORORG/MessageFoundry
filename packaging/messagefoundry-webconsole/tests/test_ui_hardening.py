@@ -73,8 +73,14 @@ async def _login(c: httpx.AsyncClient, username: str) -> httpx.Response:
 
 
 async def test_http_cookie_is_byte_identical(engine: Engine) -> None:
-    """Over cleartext loopback the session cookie is unchanged: plain ``mf_session``, HttpOnly,
-    SameSite=Strict, NO Secure, NO __Host- prefix (byte-identity with pre-#192)."""
+    """Over a cleartext ``/ui`` scheme the session cookie is unchanged: plain ``mf_session``, HttpOnly,
+    SameSite=Strict, NO Secure, NO __Host- prefix (byte-identity with pre-#192).
+
+    **A function posture, not a startable one** (BACKLOG #1117/#1118). Since ADR 0172 the engine always
+    mints and serves TLS, and the one topology it excludes (``tls_terminated_upstream``) will not start
+    without ``trusted_proxies``, so ``exposure_protected`` — and with it ``effective_https`` — is true
+    there. No ``messagefoundry serve`` posture reaches this branch; it pins the resolver's behaviour on
+    an input the shipped wiring no longer produces."""
     service = await _service(engine)
     await _add(service, "op", Role.OPERATOR)
     async with _client(engine, service, scheme="http") as c:
@@ -202,9 +208,15 @@ async def test_http_hardening_is_a_noop(engine: Engine) -> None:
 async def test_loopback_http_engages_headers_but_keeps_plain_cookie(engine: Engine) -> None:
     """ADR 0143 HYBRID: over a loopback secure-context (http://127.0.0.1, ``app.state.loopback``) the
     http-SAFE headers ENGAGE (nonce-CSP + COOP + CORP + Reporting-Endpoints), but the session cookie
-    STAYS the plain ``mf_session`` (no Secure / __Host-) — a browser rejects a Secure/__Host- cookie
-    over http, so keying the cookie on loopback would break login. The two are CONSISTENT: headers on,
-    cookie plain, and the plain cookie still authenticates the dashboard. HSTS stays OFF (no auto-TLS)."""
+    STAYS the plain ``mf_session`` (no Secure / __Host-). The two are CONSISTENT: headers on, cookie
+    plain, and the plain cookie still authenticates the dashboard. HSTS stays OFF on this branch.
+
+    **This pins a FUNCTION posture, not a deployment** (BACKLOG #1117/#1118). Since ADR 0172 the engine
+    mints a self-signed pair and serves https, so no ``messagefoundry serve`` posture reaches an http
+    ``/ui`` scheme with ``exposure_protected`` false — a grader reading this test alone would wrongly
+    conclude the shipped default is cleartext. The old docstring also justified the plain cookie with
+    "a browser rejects a Secure/__Host- cookie over http", which was measured false on this very origin
+    (Chrome 148 stored both on ``http://127.0.0.1``); see :func:`_auth.security_headers_context`."""
     service = await _service(engine)
     await _add(service, "op", Role.OPERATOR)
     async with _client(engine, service, scheme="http", loopback=True) as c:

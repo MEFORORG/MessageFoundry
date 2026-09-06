@@ -110,11 +110,19 @@ def security_headers_context(app_state: object, scheme: str) -> bool:
     Deliberately BROADER than :func:`effective_https`, which still SOLELY gates the session cookie's
     Secure flag + ``__Host-`` prefix. Splitting the two lets the header hardening engage over cleartext
     loopback (a trustworthy origin where a conformant browser honours these headers) while the cookie
-    stays the plain ``mf_session`` — a browser REJECTS a Secure / ``__Host-`` cookie over http, so keying
-    the cookie on loopback would break login. HSTS is unaffected (the engine emits it only over real
-    https / ``exposure_protected``, never on loopback). Reads only the public ``app.state`` attribute the
+    stays the plain ``mf_session``. HSTS is unaffected (the engine emits it only over real https /
+    ``exposure_protected``, never on loopback). Reads only the public ``app.state`` attribute the
     engine exposes; imports no engine module (a graceful default keeps it compatible with an older
     engine that predates the ``loopback`` seam).
+
+    **The plain-cookie half no longer rests on the browser fact it used to cite** (BACKLOG #1117). This
+    docstring said a browser REJECTS a Secure / ``__Host-`` cookie over http, which is true off-loopback
+    and FALSE on the origin the sentence was written to justify: measured 2026-09-06 against Chrome
+    148.0.7778.280, an ``http://127.0.0.1`` origin STORED and returned ``__Host-``, ``__Secure-`` and a
+    bare-Secure cookie alike, with a domain-mismatch control dropped in the same run. That is what a
+    *potentially-trustworthy* origin means for cookies. The split stands on two other grounds instead:
+    Safari and Firefox are unmeasured, and since ADR 0172 no ``messagefoundry serve`` posture reaches
+    this branch at all, so widening it would trade a measured-inert behaviour for an unmeasured one.
     """
     return effective_https(app_state, scheme) or bool(getattr(app_state, "loopback", False))
 
