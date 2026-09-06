@@ -9488,6 +9488,37 @@ For whoever performs the closing act (scorecard-rescore, in the vault, not here)
 
 **This pass wrote no code, changed no schema, and touched no vault file.** Research only, per its brief.
 
+---
+
+### THIRD PASS, 2026-09-05 AT ENGINE `a083cdb89`. THE DESIGN IS NOW [ADR 0184](adr/0184-identify-a-federated-login-by-the-idp-namespaced-subject-not-by-the-username-it-claims.md). THE VERDICT AND THE BLOCKING DECISION ARE UNCHANGED.
+
+**The 2026-09-04 table re-measures TRUE in every row, including the row that says the schema limb shipped.** Five conditions hold, uniqueness exists on all three backends, and this pass adds nothing to that verdict. It adds four things the earlier passes did not have.
+
+**STOP CITING LINE NUMBERS IN THIS ITEM.** Three sets of them, all moved, and the 2026-09-04 pass had to say so in its own opening. `roles/COMMON.md` already carries the rule -- *"cite a file by symbol name or section heading, and never by a line number"* -- and this item is the strongest evidence in the repository for it. Everything below is cited by symbol. `AuthService.authenticate_oidc`, `AuthService._complete_ad_login`, `AuthService._upsert_ad_user`, `AuthService.reconcile_directory_sessions` and `AuthService._probe_principal` will still resolve when the next reader arrives.
+
+**1. FOUR PLACES IN THIS REPOSITORY NAME #1143 AS THE FIX FOR A LIMB THIS ITEM'S TEXT DOES NOT COVER, AND THE CLOSING ACT WOULD ORPHAN ALL FOUR.** This item is scoped end to end to the OIDC-versus-directory limb of 6.8.1. These four are about the **AD `sAMAccountName` recycle**: `_upsert_ad_user` adopts a surviving mirror row by username and re-binds its `user_id`, so a directory-side recycle without a MessageFoundry `delete_user` hands the new holder the departed operator's immutable id.
+
+| Site | What it says #1143 will fix |
+|---|---|
+| `messagefoundry/api/app.py`, `_may_access_upload` docstring | Object-level authorization over uploaded PHI; names #1143 as "not solvable inside this function" |
+| `messagefoundry/uploads.py`, `UploadedFileMeta` docstring | The same id, keying ownership and the per-uploader quota |
+| `tests/test_upload_api.py`, the recycle test's scope note | Says the default AD path "is not closeable by this key" |
+| [ADR 0136](adr/0136-per-user-saved-and-layered-log-search-filter-presets-extends-the-adr-0046-search-seam.md) | Saved search presets: "BACKLOG #1143 is the real close" |
+
+A recycled name inside one directory is **not** cross-IdP spoofing, so a 6.8.1 rescore can be entirely honest and leave all four unaddressed. **Whoever closes this item must re-point those four or keep it open for that limb.** The failure is quiet by construction: a citation to a closed item reads as done, which is the shape [`docs/LEDGER-GATE.md`](LEDGER-GATE.md) warns about arriving from the other direction.
+
+**2. THE ADMINISTRATIVE BINDING SURFACE IS ENTAILED, NOT ONE OPTION OF FOUR.** Measured 2026-09-05: `set_user_federated_subject` has exactly **one** caller in the engine, the bind-on-first-presentation site inside `_complete_ad_login`. Positive control, same probe, same run: the sibling `set_user_roles` has **five**. `api/auth_routes.py` carries no federated route and the web console no federated surface. **So the engine's only way to create a binding today is the one the verb forbids.** That collapses the ceremony table: bind-on-first-presentation *is* the defect, and each of the other three presupposes an out-of-band bind that only an administrative surface provides -- ADR 0142 Amendment A's option (a) even says so in its own words, *"until an operator binds them"*, while stating (a) and (b) as alternatives. They are not alternatives. **The open decision is therefore narrower than four ways: it is what, BESIDES that surface, may create a binding.** That residue is still an owner trust decision and is still the one thing blocking the build.
+
+**3. AN UNBIND IS UNREPRESENTABLE, AND NOBODY HAS PRICED IT.** `AuthStore.set_user_federated_subject` takes `issuer: str, subject: str`, both required. A surface that must *clear* a binding rather than only re-point one is a **protocol change plus three backend implementations**, not a set of routes. Whether it needs a clear at all follows from the ceremony decision, so the cost is recorded here and the choice belongs there. The ceremony table's "Largest build" did not name this.
+
+**4. TWO SHIPPED CODE COMMENTS STILL ASSERT THE ABSENCE THAT #1256 FALSIFIED, and one of them contradicts the code twelve lines below it.** `AuthService._complete_ad_login` and `AuthStore.get_user_by_federated_subject` both carry the 2026-08 measurement *"no UNIQUE constraint names these columns on any backend (0/0/0, positive control 13/8/10)"*. The same file then catches an integrity error and explains that `ux_users_federated_subject` "refuses the loser on all three backends". A reader who trusts the first sentence concludes the structural half is unbuilt -- which is exactly the error this item's own re-score banner made, and which the brief that dispatched this pass repeated. **Named and NOT built**, following this item's own convention for the reconciler: it is a comment correction in `messagefoundry/auth/service.py` and `messagefoundry/store/base.py`, it belongs to whoever takes it as their own item, and smuggling it in here would put an engine-code edit inside a research pass.
+
+**ADDED TO THE TRACKER HANDOFF.** Points 1 through 6 above stand. Add: **(7)** re-read them by symbol, because every line number in them has moved again; **(8)** the four citations in finding 1 decide whether closing this item is honest; **(9)** ADR 0184 is the design of record for the login-path fix and carries the priced options, so the re-score does not need to re-derive them.
+
+**DECISIONS LEFT FOR THE OWNER, unchanged in substance from 2026-09-04 and narrowed in shape by finding 2.** What, besides an administrative binding surface, may create a federated binding. Whether refusing every federated login on a fresh deployment until an operator binds each account is the shipped default. Whether `reconcile_directory_sessions` excludes bound rows (no schema, trades away directory disable and role reconciliation for those accounts) or re-keys `_probe_principal` to `objectGUID` (one nullable column on three backends, no index, plus an LDAP attribute read and a lookup path -- and it is the same work the four citations in finding 1 are waiting on). All four sit in ADR 0184's *To resolve on acceptance*.
+
+**This pass wrote no engine code, changed no schema, ran no migration, and touched no vault file.** It wrote one ADR and this section.
+
 ## 1144. research an honest pass for ASVS 6.8.4 -- IdP-asserted strength and recentness when two of the three login legs assert nothing
 
 > 🔢 **Re-scored 2026-08-20 -> P2.** Value **6/10** · Difficulty **5/10** · _quick win_. Gap stands on both axes: auth_time appears nowhere in the auth tree, flow.py requests no max_age, and service.py:884/:914 still mint mfa_verified=True on the directory legs with no IdP evidence, so a directory session would satisfy the step-up gate on a first deployment (value 6). The remainder prices at 5, not 6: the AD arm is deferred to #296 by the item's own text, so the deliverable is a research finding plus at most an OIDC-leg recency check, a setting and a SECURITY.md fallback, with the store limb bounded to one nullable column on a sessions table that already gained reauth_at the same way (store.py:3181). _(was 6/10 · 7/10.)_
