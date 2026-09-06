@@ -2053,7 +2053,7 @@ class AuthSettings(_Section):
     oidc_prompt: str | None = None  # requested `prompt` authorize param
     oidc_jwks_ttl_seconds: int = 3600
     oidc_jwks_min_refetch_seconds: int = 300  # the amplification bound
-    oidc_flow_ttl_seconds: int = 300
+    oidc_flow_ttl_seconds: int = 300  # single-use flow window; validator-capped 30..1800
     oidc_flow_cache_max: int = 512  # reject-when-full (never evict — that is a login DoS)
     oidc_session_max_hours: int | None = None  # G2: cap below id_token.exp if tighter is wanted
 
@@ -2128,25 +2128,16 @@ class AuthSettings(_Section):
     @field_validator("oidc_flow_ttl_seconds")
     @classmethod
     def _check_oidc_flow_ttl(cls, value: int) -> int:
-        # The pending-flow TTL decides two things at once, which is why it needs a bound at BOTH
-        # ends rather than the upper bound alone (BACKLOG #1156, ASVS 10.1.2).
+        # Bounded at BOTH ends (BACKLOG #1156, ASVS 10.1.2), because each end fails differently.
+        # FLOOR: the value becomes the flow cookie's `Max-Age`, so at or below zero the browser
+        # discards the cookie on receipt and every federated login then fails `flow_binding_missing`
+        # with nothing naming the cause. CEILING: this is both the single-use replay window for the
+        # staged `(state, nonce, code_verifier)` and how long one abandoned flow holds an
+        # `oidc_flow_cache_max` slot -- see that field for why the cache rejects rather than evicts.
         #
-        # MEASURED, and these are the facts the endpoints rest on:
-        #   * The value is handed straight to the flow cookie's `Max-Age`
-        #     (messagefoundry_webconsole/routes/oidc.py). At <= 0 the browser discards the cookie on
-        #     receipt, so EVERY federated login then fails the `flow_binding_missing` refusal with
-        #     nothing in the error naming the cause.
-        #   * `FlowCache._prune` reclaims only entries whose deadline has PASSED, and the cache is
-        #     reject-when-full rather than evict-oldest (`oidc_flow_cache_max`, deliberately -- see
-        #     that field). So this value IS the window an abandoned flow holds a slot for, and a
-        #     large enough one turns `oidc_flow_cache_max` abandoned logins into a console outage
-        #     that only a restart clears.
-        #   * It is also the single-use replay window for a staged `(state, nonce, code_verifier)`,
-        #     which is the ASVS 10.1.2 half.
-        #
-        # The exact endpoints are a JUDGMENT, not a measurement: 30 s is short of any realistic
-        # interactive IdP round trip with MFA, and 1800 s matches the order of the longest bounded
-        # lifetime already in this section (`oidc_jwks_ttl_seconds`). What is not a judgment is that
+        # The endpoints are a JUDGMENT with no measured anchor, and no neighbouring field supplies
+        # one: every other lifetime and size in this OIDC block is itself unbounded (verified by
+        # execution -- `oidc_jwks_ttl_seconds` accepts 10_000_000). What is NOT a judgment is that
         # an unbounded value is wrong in both directions.
         if not 30 <= value <= 1800:
             raise ValueError("oidc_flow_ttl_seconds must be between 30 and 1800")

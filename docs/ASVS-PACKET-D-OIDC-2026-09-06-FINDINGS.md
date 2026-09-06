@@ -146,6 +146,43 @@ and it is unresolved. Building against a requirement that may not apply is what 
 no vocabulary and sets no boundary the section did not already have, and the reasoning that would fill
 an ADR is in the validator's own comment where the next reader of that line will meet it.
 
+**Did not floor `oidc_flow_cache_max`, and this is the least comfortable omission in the packet.** It
+sits on the line directly below the field this change bounds, and its degenerate value is worse:
+measured, `oidc_flow_cache_max = 0` raises `FlowCacheFullError` on the FIRST flow, because `put`
+refuses at `len(entries) >= global_cap`, so zero denies every federated sign-in outright. `-1` also
+loads. `docs/SECURITY.md` control 7 already documents this in terms, ending *"No validator floors it;
+treat it as a security-relevant value"*, and `tests/test_security_doc_rate_limits.py` already pins the
+behaviour. Two reasons it is not here rather than one. Adding the floor makes that documented sentence
+**false**, so the fix has to carry a `docs/SECURITY.md` edit in the same change -- and that file is
+held by **eight** open PRs. And the field belongs to a different control family with its own doc row
+and its own tests, not to any row in this packet. The measurement is complete and the fix is about six
+lines of the shape now sitting above it; it wants the seat that owns that row, in one change with the
+doc correction.
+
+## A class defect this packet found and cannot file
+
+`AuthSettings` holds **22 of the 42 unbounded numeric fields** in `messagefoundry/config/settings.py`,
+after this change. That is not a project without bounds discipline: fourteen other sections are fully
+bounded, `RetentionSettings` 13 of 13 and `PipelineSettings` 9 of 9 among them. The discipline exists
+and was not applied in the authentication section, which is the worst place for it to be missing.
+
+Confirmed by execution, all of these load clean today: `password_min_length = 0`,
+`lockout_threshold = 0`, `lockout_minutes = -1`, `session_idle_timeout_minutes = 0`,
+`max_sessions_per_user = -1`, `step_up_max_age_seconds = 1_000_000_000`, and
+`login_rate_limit_per_ip = 0` -- the last of which **disables the brute-force bound**, because
+`SlidingWindowRateLimiter` gates on `bool(self._per_key)`. That one is fail-OPEN, while
+`oidc_flow_cache_max = 0` is fail-CLOSED, so two limiters wired from adjacent fields in the same
+section give `0` opposite meanings and neither is refused at load.
+
+**A blanket floor would be wrong**, which is why this is a filing and not a sweep: `0` is a
+documented, load-bearing "off" for at least `mfa_recovery_code_count`, `ad_session_recheck_seconds`
+and `phi_read_rate_limit_global`. The deep fix is per-field semantics.
+
+**No number is cited for this deliberately.** A Builder must not cite a `#N` it has not allocated, and
+filing routes elsewhere. The subject is: *unbounded numeric settings in `AuthSettings`, with the
+per-field zero semantics decided rather than defaulted*. The nearest existing precedent for how to
+file it is the one-item-per-field row already in the ledger for `retry_max_attempts` having no floor.
+
 ## The one question this packet leaves open
 
 **10.4.13 needs an owner ruling, not more evidence, and the cell already says so.** The requirement
