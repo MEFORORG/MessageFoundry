@@ -24215,3 +24215,46 @@ Vault `roles/BUILDER.md:213-217`, under the heading "Closing a ledger row makes 
 ### Not checked
 
 I read only `roles/` in the vault and ran no git history there, so I cannot date when any of these lines was written. Eleven of the fourteen playbooks were matched by the needle above but not read, so treat the population as **at least three files**, not a total. I did not check whether any workflow or CI job reads a playbook, and I confirmed no case in which a seat actually followed `BUILDER.md:216` and produced a red PR -- I measured the instruction and the gate, not an incident.
+
+## 1474. clearing a federated binding is unrepresentable: set_user_federated_subject requires both issuer and subject
+
+> 🔢 **Filed 2026-09-06.** Value **5/10** · Difficulty **6/10** · _fill-in_. Value 5 because nothing is
+> wrong in shipped behaviour today -- the gap only becomes reachable once #1143's administrative
+> binding surface exists, and that surface is now ruled rather than hypothetical. Difficulty 6 because
+> the fix is a Store protocol signature plus three backend implementations plus their tests, which is
+> the same shape as every other protocol widening in this repo and is mechanical rather than subtle.
+> Verdict: build
+> Closing-act: code
+
+**Cluster:** Security / authentication. **Priority:** P3. **Verdict:** build.
+**Severity:** none today. On a first deployment carrying #1143's binding surface, an operator who
+bound the wrong account would be able to RE-POINT the binding but never REMOVE it, so an account
+would remain federated-bindable with no way back to unbound.
+
+**What is missing.** `AuthStore.set_user_federated_subject` takes `issuer: str, subject: str`, both
+required and neither nullable. There is no `clear_user_federated_subject`, and no argument spelling
+that expresses "this account has no federated binding". So the operation the setter's own name
+implies a complement for -- unbind -- cannot be called, and a surface offering "set, unbind, rebind"
+can only offer two of the three.
+
+**Why it is filed now and not with #1143.** It was surfaced during that row's ceremony research and
+is genuinely separate: #1143 asks WHO may create a binding, this asks whether a created binding can
+be undone. The ceremony ruling of 2026-09-06 -- an administrative binding surface is the only thing
+that may create a federated binding, taken by the owner directly -- is what makes this reachable,
+because an operator-created binding is exactly the kind that gets created by mistake. ADR 0184's
+"Largest build" option did not price an unbind, so the cost is unrecorded anywhere.
+
+**The likely shape, stated as a starting point rather than a design.** Either a nullable pair on the
+existing setter, or a separate clear method on the protocol; three backends either way
+(`store/store.py`, `store/postgres.py`, `store/sqlserver.py`), plus whatever the filtered unique
+index `ux_users_federated_subject` requires of a row whose pair becomes NULL. The index is already
+filtered, which is why this is plausibly a fill-in rather than a schema change -- but that should be
+measured before it is believed.
+
+**What would NOT be an honest close.** Adding a clear path that leaves the account's `auth_provider`
+untouched, so an unbound account still reports as a directory identity and is still swept by
+`reconcile_directory_sessions`. Unbinding has to leave a coherent account, not just a NULL pair.
+
+**Source:** surfaced by the packet A builder while researching #1143's ceremony question, and handed
+over by that row's claim holder, who confirmed it is not in their record. Filed rather than left in
+mail because a gap recorded only in a message is one nobody can re-read.
