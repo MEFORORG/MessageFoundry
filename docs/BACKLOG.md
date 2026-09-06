@@ -18312,8 +18312,10 @@ the gate stops keying on the committing worktree.
 scorecard writer takes, naming for each anchor what the control ref found, both line numbers, the commit
 the cell stamps, and the resolved sha of the control ref itself. Three properties, each with a
 mutation-killed arm. The emission REFUSES without `--control-ref`, because a mass re-anchor raises the
-apparent rate and a working-tree derivation records an inflated population -- measured against the live
-record, the control ref removes 223 anchors of inflation from a population of 935. The payload BODY comes
+apparent rate and a working-tree derivation records an inflated population. Measured 2026-09-06 over 2091
+anchors: the annotated population is **935** under the pre-repair control ref against **1171** on the live
+record alone, so naming the ref removes **236** anchors of inflation (on born-wrong alone the pair is 893
+against 1158). Both halves of that pair come from this tool, not from an earlier note. The payload BODY comes
 from the live record and only the annotation from the control ref, so applying it adds one key per anchor
 and reverts nothing; built the other way it would carry the control ref's older lines back and undo the
 repairs it documents. An anchor already carrying a witness is counted and SKIPPED, since overwriting it is
