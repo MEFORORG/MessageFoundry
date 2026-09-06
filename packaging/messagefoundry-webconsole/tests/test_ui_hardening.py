@@ -74,7 +74,18 @@ async def _login(c: httpx.AsyncClient, username: str) -> httpx.Response:
 
 async def test_http_cookie_is_byte_identical(engine: Engine) -> None:
     """Over cleartext loopback the session cookie is unchanged: plain ``mf_session``, HttpOnly,
-    SameSite=Strict, NO Secure, NO __Host- prefix (byte-identity with pre-#192)."""
+    SameSite=Strict, NO Secure, NO prefix of either kind (byte-identity with pre-#192).
+
+    **NO ``messagefoundry serve`` POSTURE REACHES THIS BRANCH ANY MORE (ADR 0172), and a reader who
+    takes this test for the shipped default will conclude the console ships cleartext.** It does
+    not: the engine always serves TLS, minting a self-signed pair when no chain is configured, and
+    the only topology that still speaks plaintext to the app declares a terminator -- which forces
+    ``exposure_protected``, so ``effective_https`` holds there anyway
+    (``test_ui_cookie_prefix_wire.py`` drives both on a real socket). This arm grades the FUNCTION,
+    not the deployment, and it is kept rather than deleted because it is the control that stops an
+    unconditional rename: a browser drops a ``Secure``/``__Host-``/``__Secure-`` cookie that is not
+    Secure, so the bare name is the correct answer on a genuinely cleartext origin.
+    """
     service = await _service(engine)
     await _add(service, "op", Role.OPERATOR)
     async with _client(engine, service, scheme="http") as c:
@@ -204,7 +215,12 @@ async def test_loopback_http_engages_headers_but_keeps_plain_cookie(engine: Engi
     http-SAFE headers ENGAGE (nonce-CSP + COOP + CORP + Reporting-Endpoints), but the session cookie
     STAYS the plain ``mf_session`` (no Secure / __Host-) — a browser rejects a Secure/__Host- cookie
     over http, so keying the cookie on loopback would break login. The two are CONSISTENT: headers on,
-    cookie plain, and the plain cookie still authenticates the dashboard. HSTS stays OFF (no auto-TLS)."""
+    cookie plain, and the plain cookie still authenticates the dashboard. HSTS stays OFF (no auto-TLS).
+
+    **Same annotation as ``test_http_cookie_is_byte_identical`` above, and for the same reason: no
+    ``messagefoundry serve`` posture reaches this branch since ADR 0172.** The hybrid it pins is a
+    property of the function, not a description of what ships; read the shipped postures off
+    ``test_ui_cookie_prefix_wire.py``, which drives them on a real socket."""
     service = await _service(engine)
     await _add(service, "op", Role.OPERATOR)
     async with _client(engine, service, scheme="http", loopback=True) as c:
@@ -329,8 +345,9 @@ def test_csp_report_summary_shapes() -> None:
 async def test_opt_out_reverts_to_legacy_over_https(
     engine: Engine, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """With the opt-out env set, https reverts to the pre-#192 posture — plain ``mf_session`` name and
-    static self-CSP, no nonce/COOP — but Secure stays on (transport security never downgraded)."""
+    """With the opt-out env set, https reverts to the pre-#192 shell — static self-CSP, no
+    nonce/COOP — and the cookie drops to ``__Secure-mf_session``: the ``__Host-`` prefix is gone but
+    Secure stays on, so the weaker prefix is still available (owner ruling 2026-09-05, #1117)."""
     monkeypatch.setenv("MEFOR_WEBCONSOLE_DISABLE_BROWSER_HARDENING", "1")
     service = await _service(engine)
     await _add(service, "op", Role.OPERATOR)
@@ -338,7 +355,7 @@ async def test_opt_out_reverts_to_legacy_over_https(
         r = await _login(c, "op")
         set_cookie = r.headers["set-cookie"]
         low = set_cookie.lower()
-        assert set_cookie.split("=", 1)[0] == "mf_session"  # __Host- prefix reverted
+        assert set_cookie.split("=", 1)[0] == "__Secure-mf_session"  # __Host- reverted, not both
         assert "secure" in low  # transport security still enforced over https
         page = await c.get("/ui/login")
         csp = page.headers["content-security-policy"]
@@ -557,6 +574,57 @@ def test_the_name_a_response_writes_is_the_name_a_later_request_reads(
     assert session_cookie_name(request).startswith("__Host-") is expected_prefixed
 
 
+# --- BACKLOG #1117: what the org opt-out costs, ruled 2026-09-05 ---------------------------------
+
+
+_OPT_OUT_POSTURES = [
+    pytest.param("https", False, "__Secure-", True, id="minted-tls-default"),
+    pytest.param("http", True, "__Secure-", True, id="declared-terminator"),
+    pytest.param("http", False, "", False, id="cleartext-undeclared"),
+]
+
+
+@pytest.mark.parametrize(("scheme", "exposure", "prefix", "secure"), _OPT_OUT_POSTURES)
+def test_the_opt_out_drops_host_only_and_keeps_the_secure_prefix(
+    scheme: str, exposure: bool, prefix: str, secure: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """OWNER RULING 2026-09-05 (#1117): the org opt-out drops ``__Host-`` ONLY, so ``__Secure-`` is
+    the fallback wherever Secure is genuinely set -- on BOTH cookies, not only the session one.
+
+    It had never been written down whether the hatch meant "no ``__Host-``" or "no prefix at all",
+    and the code took the second reading, so ASVS 3.3.1's second limb failed on every opt-out
+    posture. ``__Secure-`` constrains strictly less than ``__Host-`` (it requires only Secure, where
+    ``__Host-`` additionally requires ``Path=/`` and no ``Domain``), so it survives the one realistic
+    proxy failure the hatch exists for and costs the operator nothing they opted out of.
+
+    **The cleartext arm is not an oversight and must stay bare.** A browser drops a ``__Secure-``
+    cookie that is not Secure exactly as it drops a ``__Host-`` one, so naming it there would break
+    login while a grep and a scorecard read as hardened. The prefix is asserted alongside the Secure
+    attribute in the same row for that reason -- the two must move together or not at all.
+    """
+    monkeypatch.setenv(BROWSER_HARDENING_OPT_OUT_ENV, "1")
+    request = _cookie_request(scheme, exposure_protected=exposure)
+
+    session = StarletteResponse()
+    set_session_cookie(session, "a-token", request=request)
+    flow = StarletteResponse()
+    set_oidc_flow_cookie(flow, "a-flow-id", request=request, max_age=300)
+
+    session_name, session_attrs = _guards(session)
+    flow_name, flow_attrs = _guards(flow)
+    assert ("secure" in session_attrs) is secure, session_attrs
+    assert ("secure" in flow_attrs) is secure, flow_attrs
+    assert session_name == f"{prefix}mf_session"
+    assert flow_name == f"{prefix}mf_oidc_flow"
+    # NOT the hardened name on any of these arms -- the ruling widened the fallback, it did not
+    # quietly re-enable the prefix the operator turned off.
+    assert not session_name.startswith("__Host-") and not flow_name.startswith("__Host-")
+    # And the read site agrees with what the set wrote, on every arm (the #1118 single-resolver
+    # guarantee, which a second prefix branch is exactly the kind of edit that could break).
+    assert session_cookie_name(request) == session_name
+    assert oidc_flow_cookie_name(request) == flow_name
+
+
 async def test_opt_out_logout_over_https_still_deletes_with_secure(
     engine: Engine, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -571,7 +639,7 @@ async def test_opt_out_logout_over_https_still_deletes_with_secure(
         assert out.status_code == 303
         set_cookie = out.headers["set-cookie"]
         low = set_cookie.lower()
-        assert set_cookie.split("=", 1)[0] == "mf_session"  # opt-out keeps the bare name
+        assert set_cookie.split("=", 1)[0] == "__Secure-mf_session"  # the opt-out's fallback name
         assert "secure" in low and "httponly" in low and "samesite=strict" in low
         # and the deletion really ended the session
         assert (await c.get("/ui")).status_code in (302, 303, 401)

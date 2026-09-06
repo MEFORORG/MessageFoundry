@@ -1726,17 +1726,24 @@ def test_browser_hardening_opt_out_is_reported_at_start(
     who set this env — or inherited it from a service environment — got a quietly weaker console with
     no signal anywhere. Since ADR 0172 made the engine always serve TLS this is the only remaining
     way a default deployment loses the `__Host-` binding, which is what makes the silence worth
-    fixing. The message must name the env, the two unprefixed cookie names, and the fact that Secure
-    is not downgraded, because an operator who reads only "hardening off" cannot tell which of those
-    three things happened.
+    fixing. The message must name the env, the two cookie names it falls back TO, and the fact that
+    Secure is not downgraded, because an operator who reads only "hardening off" cannot tell which of
+    those three things happened.
+
+    BACKLOG #1117 (owner ruling 2026-09-05) moved the fallback: the opt-out drops `__Host-` only, so
+    the names it reverts to are the `__Secure-` twins rather than the bare ones. A report still
+    naming `mf_session / mf_oidc_flow` would send an operator looking for a cookie the browser is
+    not holding.
     """
     monkeypatch.setenv("MEFOR_WEBCONSOLE_DISABLE_BROWSER_HARDENING", "1")
     assert _bare_loopback_serve(tmp_path, monkeypatch) == 0
     err = capsys.readouterr().err
     assert "MEFOR_WEBCONSOLE_DISABLE_BROWSER_HARDENING is set" in err
-    assert "mf_session / mf_oidc_flow" in err  # the names it reverts TO
+    assert (
+        "__Secure-mf_session" in err and "__Secure-mf_oidc_flow" in err
+    )  # the names it reverts TO
     assert "__Host-" in err  # what is lost
-    assert "Secure is still set over https" in err  # what is NOT lost
+    assert "Secure is still set over https" in err  # what is NOT lost, and what keeps the fallback
 
 
 def test_browser_hardening_default_reports_nothing(
