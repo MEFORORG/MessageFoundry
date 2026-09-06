@@ -59,6 +59,7 @@ from messagefoundry.api.models import (
     MessageDetail,
     MessageList,
     MessageSearchResults,
+    PendingApprovalResponse,
     PurgeResult,
     ReloadResult,
     ReplayResult,
@@ -84,6 +85,11 @@ _ALLOWED_URL_SCHEMES = frozenset({"http", "https"})
 # TEST process (where the coupling is harmless) and fails if either drifts.
 MAX_REQUEST_URL_LEN = 8192
 MAX_REQUEST_HEADER_VALUE_LEN = 8192
+
+# ASVS 2.3.5 (BACKLOG #1113): the status the engine answers when dual-control holds a gated
+# operation for a second approver instead of running it. Pinned against the engine's own route
+# handlers by test_apiclient_approval_hold.py, which reads the code back rather than trusting 202.
+_HTTP_PENDING_APPROVAL = 202
 
 
 class ApiError(RuntimeError):
@@ -115,6 +121,27 @@ def _decode_list(response: httpx.Response, model: type[_Model]) -> list[_Model]:
         return [model.model_validate(item) for item in response.json()]
     except (ValidationError, JSONDecodeError, TypeError) as exc:
         raise ApiError(f"invalid response from engine: {exc}") from exc
+
+
+def _decode_approvable(  # noqa: UP047
+    response: httpx.Response, model: type[_Model]
+) -> _Model | PendingApprovalResponse:
+    """Decode a 2xx body from a route that dual-control may hold (ASVS 2.3.5, BACKLOG #1113).
+
+    A held operation is **not** an error and **not** a completed one. The engine answers
+    :data:`_HTTP_PENDING_APPROVAL` with a :class:`PendingApprovalResponse` instead of executing
+    inline, and its route signatures say so (``response_model=X | PendingApprovalResponse`` on
+    ``/connections/{name}/purge``, ``/dead-letters/replay`` and ``/config/reload``). This decoder is
+    the client half of that contract, so the three gated methods answer a hold identically.
+
+    The status code is the discriminator, not the body shape. It is what the engine actually
+    varies, and a pydantic union over two models whose fields are disjoint-but-all-optional-looking
+    would guess. ``_decode`` still does the validating, so a malformed body of either shape stays an
+    :class:`ApiError` rather than a bare ``ValidationError`` escaping into a caller's event loop.
+    """
+    if response.status_code == _HTTP_PENDING_APPROVAL:
+        return _decode(response, PendingApprovalResponse)
+    return _decode(response, model)
 
 
 def _seg(value: str | int) -> str:
@@ -528,8 +555,16 @@ class EngineClient:
     def restart_connection(self, name: str) -> None:
         self._request("POST", f"/connections/{_seg(name)}/restart")
 
-    def purge_connection(self, name: str, scope: str = "all") -> PurgeResult:
-        return _decode(
+    def purge_connection(
+        self, name: str, scope: str = "all"
+    ) -> PurgeResult | PendingApprovalResponse:
+        """Soft-cancel queued deliveries to an outbound connection.
+
+        Returns a :class:`PurgeResult` when the purge ran, or a :class:`PendingApprovalResponse`
+        when dual-control held it for a second approver (ASVS 2.3.5). Narrow with
+        ``isinstance(result, PendingApprovalResponse)``. The two models share no field, so mypy
+        refuses ``result.cancelled`` until the hold is handled."""
+        return _decode_approvable(
             self._request("POST", f"/connections/{_seg(name)}/purge", params={"scope": scope}),
             PurgeResult,
         )
@@ -659,23 +694,38 @@ class EngineClient:
 
     def replay_dead_letters(
         self, *, channel_id: str | None = None, destination_name: str | None = None
-    ) -> DeadLetterReplayResult:
+    ) -> DeadLetterReplayResult | PendingApprovalResponse:
         """Re-queue dead-lettered deliveries (``None`` scope = all; a channel-scoped user must
-        name their channel — an unscoped replay-all is denied server-side)."""
-        return DeadLetterReplayResult.model_validate(
+        name their channel — an unscoped replay-all is denied server-side).
+
+        Returns a :class:`DeadLetterReplayResult` when the replay ran, or a
+        :class:`PendingApprovalResponse` when dual-control held it for a second approver (ASVS
+        2.3.5). Narrow with ``isinstance(result, PendingApprovalResponse)``. The two models share no
+        field, so mypy refuses ``result.requeued`` until the hold is handled."""
+        return _decode_approvable(
             self._request(
                 "POST",
                 "/dead-letters/replay",
                 json={"channel_id": channel_id, "destination_name": destination_name},
-            ).json()
+            ),
+            DeadLetterReplayResult,
         )
 
     # --- config --------------------------------------------------------------
 
-    def reload_config(self, config_dir: str | None = None) -> ReloadResult:
-        """Apply code-first config atomically (``None`` = the server's startup --config dir)."""
-        return ReloadResult.model_validate(
-            self._request("POST", "/config/reload", json={"config_dir": config_dir}).json()
+    def reload_config(
+        self, config_dir: str | None = None
+    ) -> ReloadResult | PendingApprovalResponse:
+        """Apply code-first config atomically (``None`` = the server's startup --config dir).
+
+        Returns a :class:`ReloadResult` when the graph was swapped, or a
+        :class:`PendingApprovalResponse` when dual-control held the reload for a second approver
+        (ASVS 2.3.5). Narrow with ``isinstance(result, PendingApprovalResponse)``. The two models
+        share no field, so mypy refuses ``result.inbound`` until the hold is handled. A held reload
+        has changed nothing yet; the captured ``config_dir`` is replayed on release."""
+        return _decode_approvable(
+            self._request("POST", "/config/reload", json={"config_dir": config_dir}),
+            ReloadResult,
         )
 
     def stats(self) -> StatsResponse:
