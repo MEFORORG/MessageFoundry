@@ -624,11 +624,12 @@ current position on it.
 - **Transport TLS:** native **API HTTPS/WSS** and **MLLP-over-TLS** (TLS 1.2+, opt-in via cert config),
   with optional client-certificate **mTLS** (API `tls_client_ca_file`; MLLP `tls_ca_file`), an
   off-loopback bind guard, and a certificate-expiry monitor — ADR 0002 / WP-13a/13b.
-- **Operator strong-auth (control plane):** native **RFC 6238 TOTP MFA** for **local** accounts
+- **Operator strong-auth (control plane):** native **RFC 6238 TOTP MFA** for **every** account
   (ADR 0002 WP-14, built 2026-06-17) — enrolled per user, enforced for the Administrator role via
-  `[auth].require_mfa` and re-verified at the sensitive-operation step-up boundary; AD/Entra users'
-  MFA is delegated to the IdP. Recovery codes are argon2id-hashed; the TOTP secret is store-cipher
-  protected.
+  `[auth].require_mfa` and re-verified at the sensitive-operation step-up boundary. AD/Entra users'
+  MFA was delegated to the IdP until BACKLOG #1144, which retired that: a directory ticket asserts
+  no strength the engine can read, so the engine asks for its own factor. Recovery codes are
+  argon2id-hashed; the TOTP secret is store-cipher protected.
 - **Operator / directory (control plane, not interface auth):** **LDAPS** directory bind
   (certificate-validated; cleartext `ldap://` refused fail-closed), **Kerberos / SPNEGO** Windows SSO,
   and **AD security-group → role** mapping for RBAC. These authenticate **human operators** to the
@@ -701,10 +702,10 @@ per-requirement verdicts: `security/ASVS-L3-ASSESSMENT.md`. Reviewed at
 each release and on any trigger below. Those are maintainer-internal documents;
 [`SECURITY-DOCS-POLICY.md`](SECURITY-DOCS-POLICY.md) explains what is withheld and what you can request.
 
-- **6.3.3 — multi-factor authentication.** **Satisfied for local accounts** — native RFC 6238 TOTP MFA
+- **6.3.3 — multi-factor authentication.** **Satisfied** — native RFC 6238 TOTP MFA
   is **built** (ADR 0002 WP-14, 2026-06-17), enforced for the Administrator role via `[auth].require_mfa`
-  at the step-up boundary; **AD/Entra-account MFA is delegated to the IdP** (the supported enterprise
-  path). No longer a deferred Fail. *(Hardware/WebAuthn second factors are now **built** — browser
+  at the step-up boundary, and it covers **every** account since BACKLOG #1144 retired the
+  AD/Entra delegation to the IdP. No longer a deferred Fail. *(Hardware/WebAuthn second factors are now **built** — browser
   WebAuthn passkeys as the phishing-resistant second factor at the step-up boundary, ADR 0068 / WP-14b,
   behind the `[webauthn]` extra.)*
 - **4.1.5 — per-message digital signatures on the PHI data plane.** Deferred-by-design. Transport-level
