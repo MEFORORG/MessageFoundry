@@ -58,7 +58,10 @@ Usage:
   scan_forbidden.py                 # scan all git-tracked files in the current repo
   scan_forbidden.py --self-test     # probe each LOADED class with a string derived from itself, so a
                                     #   table that parsed but cannot match is caught. Counts and class
-                                    #   names only -- never a token, so it is safe in public CI.
+                                    #   names only -- never a token, so it is safe in public CI. Each
+                                    #   class also states how many loaded entries no probe could be
+                                    #   built for, because a ratio that silently drops those reads as
+                                    #   full coverage over a hole.
 
 Exit: 0 clean, 1 forbidden content found (fail closed), 2 usage error / required-tokens-missing /
 self-test failure (an instrument that cannot see is not a content hit; the two need different fixes).
@@ -71,6 +74,7 @@ import re
 import subprocess
 import sys
 from pathlib import Path
+from typing import NamedTuple
 
 # --------------------------------------------------------------------------------------------------
 # Structural detectors (NO customer data -- safe to commit). These run regardless of the token source.
@@ -1280,6 +1284,12 @@ def plain_word_name_probes(text: str) -> list[str]:
 
     Returns the recovered WORDS, which are token content, so a caller must not print them. Recovering
     nothing is not an error here; the caller decides what an unprobeable class means.
+
+    DEDUPED, because ``_parse_tokens`` dedupes the entries these mirror. Two identical source lines
+    compile to ONE detector, so returning the word twice would count two probes against one loaded
+    entry -- and a caller measuring coverage would understate what went untested. Deduping at a call
+    site instead would put the rule in one caller and not the other, which is the drift this helper
+    was made public to prevent.
     """
     probes: list[str] = []
     in_names = False
@@ -1292,7 +1302,59 @@ def plain_word_name_probes(text: str) -> list[str]:
             continue
         if m := _PLAIN_WORD_NAME.fullmatch(line.split("|")[0].strip()):
             probes.append(m.group(1))
-    return probes
+    return list(dict.fromkeys(probes))
+
+
+class _ClassCoverage(NamedTuple):
+    """One token class's self-test coverage, and why any of it went unprobed.
+
+    ``label`` IS the key ``loaded_token_counts`` prints for this class and ``loaded`` IS that key's
+    value, so the report and the counts block above it share one vocabulary. Deriving the denominator
+    separately reintroduces exactly the cross-block arithmetic this change removes: an earlier draft
+    printed ``estate_file_scanned ... of 14 loaded`` under a counts line reading
+    ``estate_file_scanned=13``, each internally consistent and disagreeing with the other.
+
+    ``unprobed_reason`` travels WITH the class rather than sitting in a table keyed by label. A table
+    needs a default, and a default silently degrades the one channel this whole check exists to make
+    legible the day a class is renamed.
+
+    Counts and class names only -- never a token, never a probe. These fields print in a
+    world-readable Actions log on the one run that holds the real secret.
+    """
+
+    label: str
+    fired: int
+    probeable: int
+    loaded: int
+    unprobed_reason: str
+
+    @property
+    def unprobed(self) -> int:
+        """Loaded entries no probe could be built for, clamped at zero in ONE place.
+
+        A ``[names]`` entry can be recoverable as a plain word and still be DROPPED at parse time
+        (too many fields, an invisible codepoint), which would otherwise give a negative residual.
+        Nothing is lost by clamping: that entry has no detector, so it cannot fire, and the
+        ``fired != probeable`` check reports it as an inert detector -- the accurate reading.
+        """
+        return max(self.loaded - self.probeable, 0)
+
+    def line(self) -> str:
+        """This class's report line, with the UNPROBED residual NAMED rather than left to subtraction.
+
+        ``fired 6/6`` reads as full coverage. Measured against the REAL table on 2026-09-05, unchanged
+        from the 2026-09-03 run this check shipped with: the three class lines read ``2/2``, ``13/13``
+        and ``6/6 probeable of 8 loaded`` while THREE of the 24 loaded entries had never been probed
+        at all -- two ``[names]`` regexes the prober cannot invert, plus one ``[estate_body_only]``
+        hold-out visible only by subtracting a number in the report from a number in the counts block
+        printed above it. A ratio whose denominator silently drops what it could not test is the same
+        green-line-over-a-hole this check exists to remove, so the residual is stated in words, on the
+        same line, in the same units as the numerator.
+        """
+        line = f"{self.label} fired {self.fired}/{self.probeable} probeable of {self.loaded} loaded"
+        if self.unprobed:
+            line += f"; {self.unprobed} UNPROBED ({self.unprobed_reason})"
+        return line
 
 
 def self_test() -> tuple[list[str], list[str]]:
@@ -1303,17 +1365,35 @@ def self_test() -> tuple[list[str], list[str]]:
 
     Probing is TOTAL for ``site_prefix`` and for the file-scanned ``estate`` subset: a prefix is ASCII
     digits and an estate pattern is ``re.escape``d around its own literal, so a matching string is
-    derivable from every entry that loaded. There a shortfall is a FAILURE. ``names`` is partial by
-    nature (see ``plain_word_name_probes``), so an unprobeable entry is counted, not failed --
-    a required gate that reds on a legitimate list shape gets switched off, and the value here is in
-    running on every real load rather than in being maximally strict on one.
+    derivable from every entry that loaded. There a shortfall between what was probed and what FIRED
+    is a FAILURE -- a detector that loaded and cannot match its own value is inert.
 
-    The one unconditional failure is a run that probed NOTHING. That is the vacuous pass this check
-    exists to remove, and it must not be reported as a clean bill.
+    WHICH WAY A SHORTFALL IN *PROBEABILITY* FAILS, AND WHY IT IS SPLIT IN TWO:
+
+    * A PARTIAL shortfall is REPORTED, not failed -- fail-open, deliberately. A rich ``[names]``
+      regex and an ``[estate_body_only]`` hold-out are both legitimate, intended list shapes, and a
+      required merge context that reds on a correct list is a required merge context somebody
+      switches off. The price of fail-open is that nothing downstream alarms, so the residual is
+      instead made impossible to miss: every class states its own UNPROBED count, and a final
+      aggregate line states the total across classes.
+    * A TOTAL shortfall -- a class that loaded entries and could probe NONE of them -- is a FAILURE.
+      It is not a false failure but an accurate report that the class was never exercised, and it is
+      the rule this function already enforced globally, now applied per class. Without it a run can
+      print ``names fired 0/0 probeable of 8 loaded``, exit 0 because a sibling class happened to
+      probe, and leave the class this gate was built for entirely unverified.
+
+    EVERY CLASS THAT LOADED ANYTHING REPORTS A LINE. These guards were once ``if <probes>``, so a
+    class whose entries were all unprobeable vanished from the report and its silence read as
+    "nothing to say" rather than "nothing was checked".
     """
     report: list[str] = []
     failures: list[str] = []
-    probed_anything = False
+    # ONE source for every "loaded" number, here and in the counts block main prints directly above
+    # this report. Re-deriving them from len(_SITE_PREFIXES) / len(ESTATE_TOKENS) / len(FORBIDDEN)
+    # would be a second definition of the same numbers, and the drift would be invisible: each block
+    # stays internally consistent while disagreeing with the other.
+    counts = loaded_token_counts()
+    coverage: list[_ClassCoverage] = []
 
     # [site_prefix] -- the class that falls back to _NEVER, so the class where a silent load failure
     # and a clean tree are the same green tick. The probe wraps the code in identifier separators
@@ -1324,8 +1404,18 @@ def self_test() -> tuple[list[str], list[str]]:
         if m is not None and m.group(0).startswith(prefix):
             fired += 1
     if _SITE_PREFIXES:
-        probed_anything = True
-        report.append(f"site_prefix fired {fired}/{len(_SITE_PREFIXES)}")
+        coverage.append(
+            _ClassCoverage(
+                "site_prefixes",
+                fired,
+                len(_SITE_PREFIXES),
+                counts["site_prefixes"],
+                # Unreachable by construction: a prefix is ASCII digits, so a probe is derivable from
+                # every entry that loads and probeable always equals loaded. Kept as a tripwire rather
+                # than a generic default -- if this text ever prints, that invariant has broken.
+                "probing is total for this class, so a residual here is a bug",
+            )
+        )
         if fired != len(_SITE_PREFIXES):
             failures.append(
                 f"site_prefix: {len(_SITE_PREFIXES) - fired} of {len(_SITE_PREFIXES)} loaded "
@@ -1333,15 +1423,24 @@ def self_test() -> tuple[list[str], list[str]]:
                 "is loaded and inert"
             )
 
-    # [estate] -- only the FILE-SCANNED subset. An [estate_body_only] token never enters scan_file, so
-    # probing one would assert nothing about the gate that guards tracked files.
+    # [estate] -- only the FILE-SCANNED subset can be probed. An [estate_body_only] token never enters
+    # scan_file, so probing one would assert nothing about the gate that guards tracked files. The
+    # denominator is the WHOLE class, which is what turns that hold-out from a gap between two numbers
+    # in two different blocks into a stated count on this class's own line.
     fired = 0
     for token, pattern in _ESTATE_FILE_RES:
         if pattern.search(f"OB_{token}_ORU"):
             fired += 1
-    if _ESTATE_FILE_RES:
-        probed_anything = True
-        report.append(f"estate_file_scanned fired {fired}/{len(_ESTATE_FILE_RES)}")
+    if ESTATE_TOKENS:
+        coverage.append(
+            _ClassCoverage(
+                "estate",
+                fired,
+                len(_ESTATE_FILE_RES),
+                counts["estate"],
+                "held out of the file scan by [estate_body_only]",
+            )
+        )
         if fired != len(_ESTATE_FILE_RES):
             failures.append(
                 f"estate: {len(_ESTATE_FILE_RES) - fired} of {len(_ESTATE_FILE_RES)} file-scanned "
@@ -1356,23 +1455,52 @@ def self_test() -> tuple[list[str], list[str]]:
         for word in words
         if any(pat.search(f"contact {word} about the interface") for pat, _reason in FORBIDDEN)
     )
-    if words:
-        probed_anything = True
-    report.append(f"names fired {fired}/{len(words)} probeable of {len(FORBIDDEN)} loaded")
-    if words and fired != len(words):
-        failures.append(
-            f"names: {len(words) - fired} of {len(words)} plain-word entries did not match their "
-            "own word -- the entry parsed but the detector is inert"
+    if FORBIDDEN:
+        coverage.append(
+            _ClassCoverage(
+                "names",
+                fired,
+                len(words),
+                counts["names"],
+                "not a plain word in word boundaries, so no probe string is derivable",
+            )
         )
-    if FORBIDDEN and not words:
-        report.append(
-            "names UNPROVEN: no entry is a plain word, so no probe could be derived for this class"
-        )
+        # No `words and` guard: fired is derived from words, so an empty words gives 0 != 0, which is
+        # already false. The empty case is the total shortfall below, and it is a different finding.
+        if fired != len(words):
+            failures.append(
+                f"names: {len(words) - fired} of {len(words)} plain-word entries did not match their "
+                "own word -- the entry parsed but the detector is inert"
+            )
 
-    if not probed_anything:
+    for cov in coverage:
+        report.append(cov.line())
+        if cov.probeable == 0:
+            failures.append(
+                f"{cov.label}: none of the {cov.loaded} loaded entries could be probed, so this run "
+                f"proved nothing about the {cov.label} class -- the per-class form of the vacuous "
+                "pass this check exists to remove. Extend the prober to the shape this class now "
+                "uses; silencing it leaves the class unverified either way"
+            )
+
+    # THE AGGREGATE, and it is here because three class lines each reading "fired N/N" add up to a
+    # report a skimmer reads as full coverage. One line, one pair of numbers, in the units the counts
+    # block already uses, so the size of the untested remainder cannot be missed by reading down.
+    total_loaded = sum(cov.loaded for cov in coverage)
+    unprobed = sum(cov.unprobed for cov in coverage)
+    summary = f"coverage {total_loaded - unprobed} of {total_loaded} loaded entries probed"
+    if unprobed:
+        blind = sum(1 for cov in coverage if cov.unprobed)
+        summary += f"; {unprobed} UNPROBED across {blind} class(es)"
+    report.append(summary)
+
+    # The per-class rule above covers every class that LOADED something, so what is left for this one
+    # is a call that reached here with empty tables. ``main`` refuses that before it gets this far, but
+    # a direct caller can reach it, and an empty run must not come back as a clean bill.
+    if not coverage:
         failures.append(
-            "no class could be probed at all, so this run proved nothing about detection -- which "
-            "is the vacuous pass the self-test exists to remove"
+            "no class loaded anything, so this run proved nothing about detection -- which is the "
+            "vacuous pass the self-test exists to remove"
         )
     return report, failures
 
