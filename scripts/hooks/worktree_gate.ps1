@@ -1119,6 +1119,16 @@ function Get-ScannableSegments([string]$Cmd, [string]$Convention = 'none') {
     #     never probed. Read the number as AT LEAST four -- nothing here ranged over the whole input
     #     space, so it is a floor rather than an enumeration.
     #
+    #     THE CLASS IS NARROWER THAN THIS ENTRY'S OWN HEADING SAYS, and BACKLOG #1427's opposite
+    #     reading is why the wording matters rather than being pedantry. That row tabled the per-line
+    #     split as "6 spellings driven, 0 allowed" and cited the sentence corrected above. Both
+    #     readings are true, OF DIFFERENT SHAPES. The hole needs the gated command on a line carrying
+    #     the CLOSING quote of one newline-crossing span AND the OPENING quote of the next. Give it a
+    #     line of its own, drop one of the two spans, or put both spans on the same side of it, and it
+    #     DENIES. Measured 2026-09-04 over 36 spellings with five controls in every batch: 4 allowed,
+    #     all four that one shape. The near-miss neighbours are pinned as must-KEEP-denying rows in
+    #     tests/test_worktree_gate_line_split_discriminator.py, so a fix has both halves to hold.
+    #
     #     STILL NOT FIXED HERE, and now for a stated reason rather than a false one: closing it means
     #     carrying quote state ACROSS the split, which changes what every rule sees on every multi-line
     #     command -- a far wider blast radius than the span-ownership fix this function is. Filed as

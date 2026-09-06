@@ -4272,6 +4272,10 @@ async def test_sso_cross_site_hygiene(engine: Engine, monkeypatch: pytest.Monkey
                 **_negotiate_headers(),
                 "Sec-Fetch-Mode": "navigate",
                 "Sec-Fetch-Site": "cross-site",
+                # A real browser sends this on a top-level navigation; #1122 made the middleware's
+                # destination check an allowlist, so omitting it here would 403 at the middleware
+                # and this test would stop exercising the SSO leg it is named for.
+                "Sec-Fetch-Dest": "document",
             },
         )
         assert r.status_code == 303 and r.headers["location"] == "/ui"
@@ -5436,7 +5440,15 @@ async def test_oidc_callback_survives_a_cross_site_navigation(engine: Engine) ->
     async with _oidc_client(engine, service) as c:
         r = await c.get(
             "/ui/oidc/callback?code=abc&state=xyz",
-            headers={"Sec-Fetch-Site": "cross-site", "Sec-Fetch-Mode": "navigate"},
+            headers={
+                "Sec-Fetch-Site": "cross-site",
+                "Sec-Fetch-Mode": "navigate",
+                # The IdP's redirect back IS a top-level navigation and carries this. #1122 made the
+                # middleware's destination check an allowlist; note it deliberately does NOT also
+                # demand Sec-Fetch-User, because this hop has none when the IdP session is already
+                # established.
+                "Sec-Fetch-Dest": "document",
+            },
             follow_redirects=False,
         )
         # Refused for the MISSING COOKIE, not for being cross-site (403 would mean the wrong gate).
@@ -5553,7 +5565,11 @@ async def test_oidc_full_round_trip_lands_a_session_via_meta_refresh(
 
         r = await c.get(
             "/ui/oidc/callback?code=authcode&state=" + quote(params["state"]),
-            headers={"Sec-Fetch-Site": "cross-site", "Sec-Fetch-Mode": "navigate"},
+            headers={
+                "Sec-Fetch-Site": "cross-site",
+                "Sec-Fetch-Mode": "navigate",
+                "Sec-Fetch-Dest": "document",  # what a browser sends; see #1122
+            },
             follow_redirects=False,
         )
         assert r.status_code == 200, r.text

@@ -1047,7 +1047,7 @@ The Handler produces a **JSON-object** body; the connector binds its keys to the
 | `database` | — | database name — **required** for `dialect="sqlserver"`; optional for `"generic"` |
 | `statement` | — (required) | parameterized SQL / proc call with `:name` placeholders, e.g. `INSERT INTO obs (mrn, val) VALUES (:mrn, :val)` |
 | `dialect` | `sqlserver` | `sqlserver` preset · `generic` ODBC (see [*Generic ODBC*](#generic-odbc-postgresql--oracle--mysql)) |
-| `auth` | `sql` | `sql` · `integrated` (Windows) · `entra` (ActiveDirectoryDefault) — **SQL Server preset only** |
+| `auth` | `sql` | `sql` · `integrated` (Windows) · `entra` (ActiveDirectoryDefault) — **SQL Server preset only**. On `dialect="generic"` this setting is **not read at all**: that arm emits `username`/`password` under `odbc_user_key`/`odbc_password_key`, so writing `auth="integrated"` there still produces a static login. `messagefoundry check`'s advisory `static-db-credentials` line names every DATABASE hop on an unchanging credential (ASVS 13.2.1), including that case — see [*Static database credentials*](#static-database-credentials) |
 | `username` / `password` | — | SQL-auth credentials (`password` is a **secret** — via `env()`) |
 | `port` | `1433` | server port |
 | `encrypt` | `true` | TLS to the DB (**SQL Server preset only** — see the generic-ODBC note below). `false` is a weakened hop and is **refused at construction**; `MEFOR_ALLOW_INSECURE_TLS` relaxes it **only while `[security].enforcement` is not `enforce`** — the escape is **clamped** (#200, ADR 0092 decision 2) and is **inert on the shipped default** |
@@ -1144,6 +1144,39 @@ The DSN is built as `DRIVER={odbc_driver};SERVER=<server>;[DATABASE={database};]
 > **out of scope** (dep-heavy) — the generic path is ODBC-only. The `test_connection` reachability probe
 > runs `SELECT 1` (works on PostgreSQL / MySQL / SQL Server; Oracle needs `SELECT 1 FROM DUAL`, so its
 > probe reports an error even though delivery works). Read-only `db_lookup` (ADR 0010) stays SQL-Server-only.
+
+#### Static database credentials
+
+ASVS 13.2.1 asks that a backend hop authenticate with an individual service account, a short-term token
+or a certificate rather than an unchanging credential. On SQL Server that means `auth="integrated"` (a
+gMSA or Windows machine principal) or `auth="entra"`; `auth="sql"`, the shipped default, is a static
+username and password.
+
+`messagefoundry check` prints an advisory **`static-db-credentials`** line naming every declared database
+hop that presents an unchanging credential, with its peer. It is an **inventory, not a gate** — it
+refuses nothing and blocks nothing. A named hop may be entirely legitimate, and a site whose database
+offers no managed-identity mode has no compliant option to move to.
+
+It covers **four** factories, because four of them dial a database with a credential:
+
+| Factory | Table | Reported as |
+|---------|-------|-------------|
+| `Database(...)` | outbound | `<name>` |
+| `DatabasePoll(...)` | inbound | `inbound:<name>` |
+| `DatabaseLookup(...)` | `db_lookup` read pool (ADR 0010) | `db_lookup:<name>` |
+| `DatabaseRef(...)` | reference source (ADR 0006) | `reference:<name>` |
+
+> **`[store].require_managed_identity` does NOT cover any of them.** That flag is a `StoreSettings`
+> method, so it reads the `[store]` service settings and nothing else — no connector, lookup or
+> reference hop is within its reach. Its name reads as though it governs the engine's whole database
+> posture; it governs the store hop. See
+> [`docs/CONFIGURATION.md`](CONFIGURATION.md) for the flag and
+> [`docs/SECURITY.md`](SECURITY.md) for the delegation boundary.
+
+One case is deliberately **not** reported: a `dialect="generic"` hop that sets no top-level
+`username`/`password`. A credential may still ride in `odbc_params` under an arbitrary driver keyword,
+and the engine cannot enumerate an arbitrary driver's keywords — the same limit the generic-ODBC TLS
+note above records. Classifying it would be guessing, and a guess belongs in no security report.
 
 ```python
 from messagefoundry import outbound, Database, env

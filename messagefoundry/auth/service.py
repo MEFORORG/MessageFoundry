@@ -1453,16 +1453,37 @@ class AuthService:
                     detail=_json({"user_id": user_id, "source": "directory"}),
                     client=client,
                 )
-                # ADDRESSED TO THE OLD ADDRESS WHERE ONE EXISTS, matching ``update_user``: the holder
-                # of the address being replaced is the party who needs to hear about the replacement,
-                # and the new address is whatever the directory now asserts. Where the account
-                # carried NO address, the new one is the only reachable party and there is no earlier
-                # holder to protect, so it is the target -- otherwise the first-set case is announced
-                # to nobody at all.
+                # ADDRESSED TO THE ENGINE-OWNED ``notify_email`` FIRST (BACKLOG #1139, ADR 0182).
+                # This read used to start at ``existing.email``, the profile mirror, which is the one
+                # column a directory repoint is free to move -- so the notice about a repoint could
+                # be delivered to an address an earlier repoint had installed. That is ADR 0182
+                # option 3, rejected in terms: "whoever repointed the attribute is the party the
+                # notice would reach". Two ways it came apart, both driven rather than argued:
+                #
+                #   - the SECOND consecutive repoint, where the mirror holds what the first one
+                #     wrote while ``notify_email`` still holds the address the account was born
+                #     with; and
+                #   - any repoint after an administrator clears the profile address, where the empty
+                #     mirror falls through to the directory's NEW value even though the engine-owned
+                #     address is standing and deliverable (ADR 0182 AC-4 guarantees it survives).
+                #
+                # The fallbacks are ordered by what the directory cannot reach. ``notify_email`` is
+                # engine-owned and no directory-sync statement names it, so it is the target while it
+                # exists -- which is the OLD-HOLDER PRINCIPLE the local sibling ``update_user``
+                # follows when it addresses its own EMAIL_CHANGED to ``before.notify_email``.
+                #
+                # THE MIRROR FALLBACK IS NOT DEAD, AND IT IS NOT WHAT ``update_user`` DOES -- that
+                # sibling reads one term. It is reachable in exactly one state, which only this
+                # method can produce: an account created with NO address, which later acquired one
+                # from the directory, because ``update_user_profile`` writes the mirror and never
+                # seeds ``notify_email``. On that account's next repoint the mirror is the prior
+                # holder. Failing both terms the account has never carried an address at all, so the
+                # incoming value is the only reachable party and there is no earlier holder to
+                # protect -- it is the target rather than announcing a first set to nobody.
                 await self._notify_security(
                     EMAIL_CHANGED,
                     username=principal.username,
-                    email=existing.email or email,
+                    email=existing.notify_email or existing.email or email,
                     client=client,
                     detail={"new_email": email, "source": "directory"},
                 )
