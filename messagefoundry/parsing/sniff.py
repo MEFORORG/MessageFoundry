@@ -7,9 +7,12 @@ Cheap, side-effect-free magic-byte checks shared by the file transports (``trans
 import a transport), and the attachment detach/download paths (``pipeline/wiring_runner.py`` /
 ``api/app.py``). Two families live here:
 
-* **Ingress content-vs-declared-type sniff** (:func:`_content_matches_declared`) — do a file's leading
+* **Ingress content-vs-declared-type sniff** (:func:`_content_matches_declared`) — do a body's leading
   bytes structurally match the inbound connection's declared ``content_type``? Rejects a binary/non-HL7
-  drop that merely carries the right extension before its bytes reach the pipeline.
+  drop that merely carries the right extension before its bytes reach the pipeline. The file sources
+  call it on a file's original bytes; the network listeners (MLLP/TCP/HTTP/database poll) reach it
+  through the shared ingress handler in ``pipeline/wiring_runner.py``, on the head that
+  :func:`text_sniff_head` derives from their already-decoded body (BACKLOG #1109).
 * **Attachment MIME-vs-magic agreement** (:func:`attachment_mime_agrees`) — do a detached OBX-5 ED
   document's leading bytes agree with the sender-declared OBX-5.2 MIME? A contradiction (an ``image/png``
   label on non-PNG bytes) is stored/served as ``application/octet-stream`` so a mislabelled
@@ -58,6 +61,32 @@ def _lstrip_bom_ws(raw: bytes) -> bytes:
     if head.startswith(b"\xef\xbb\xbf"):  # UTF-8 BOM
         head = head[3:].lstrip(_LEADING_WS)
     return head
+
+
+#: The str-domain twin of :data:`_LEADING_WS`, plus U+FEFF (what a UTF-8/UTF-16 BOM decodes to). Derived
+#: from the byte set rather than retyped, so the tolerated leading noise has ONE definition.
+_LEADING_WS_STR = _LEADING_WS.decode("ascii") + "\ufeff"
+
+#: Characters of a decoded body that :func:`text_sniff_head` encodes. The longest text magic is three
+#: bytes (``ISA`` / ``MSH``); eight characters leave headroom for a multi-byte first character while
+#: keeping the work O(1) instead of re-encoding a whole 16 MiB body.
+_TEXT_SNIFF_HEAD_CHARS = 8
+
+
+def text_sniff_head(text: str) -> bytes:
+    """UTF-8 head bytes of an already-DECODED body, to hand to :func:`_content_matches_declared`.
+
+    The file sources sniff a file's original bytes because they have no declared encoding to decode
+    with. A network listener does: it decodes with the connection's ``encoding`` before anything else,
+    so sniffing its ORIGINAL bytes would quarantine a legitimate ``encoding="utf-16"`` JSON body, which
+    leads with the two BOM bytes and then ``{`` interleaved with NULs, never a bare ``{``. Sniffing the
+    decoded head instead makes the check encoding-independent, and identical to the byte sniff for every
+    ASCII-superset encoding (utf-8, latin-1, cp1252, ascii).
+
+    Leading whitespace/BOM is stripped in str space first, so the head starts at the first significant
+    character however much whitespace preceded it; :func:`_content_matches_declared` strips again in
+    byte space, which is idempotent."""
+    return text.lstrip(_LEADING_WS_STR)[:_TEXT_SNIFF_HEAD_CHARS].encode("utf-8")
 
 
 def _content_matches_declared(content_type: ContentType | None, raw: bytes) -> bool:
