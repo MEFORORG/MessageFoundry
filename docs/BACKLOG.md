@@ -9529,8 +9529,9 @@ That covers every startable topology, not just the loopback default. The one pos
 
 > **VERIFIED 2026-09-06 (builder). NO BUILD TAKEN, AND THAT IS THE FINDING.** No code was written for
 > this row and none should be yet. [ADR 0184](adr/0184-identify-a-federated-login-by-the-idp-namespaced-subject-not-by-the-username-it-claims.md)
-> is **Proposed** and its status line says in terms that the build must not start; five boxes under
-> its own *To resolve on acceptance* are unchecked, and the first is an owner trust decision.
+> is **Proposed** and its status line says in terms that the build must not start. The first item
+> under its own *To resolve on acceptance* is an owner trust decision; the count of what remains open
+> is stated once, below, rather than twice here.
 >
 > **THE OWNER DECISION THIS ROW WAS WAITING ON WAS TAKEN THE SAME DAY. RULED 2026-09-06: NOTHING
 > ELSE.** The administrative binding surface is the only path that may create a federated binding --
