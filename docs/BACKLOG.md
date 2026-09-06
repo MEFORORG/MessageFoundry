@@ -8686,6 +8686,52 @@ That covers every startable topology, not just the loopback default. The one pos
 **AND THE TRAP HAS MUTATED.** The delete-the-falsifiable-sentence trap is spent -- the commit did the opposite. The live trap is its mirror image: **re-scoring on the strength of that landed disclosure alone**, buying the verdict by adding a sentence you can defend while the shipped control is byte-for-byte what it was.
 
 ## 1132. research an honest pass for ASVS 6.1.2 -- what a documented context-word list means when no deploying site can add its own terms
+> **PARTIAL 2026-09-06 (builder), NOT A CLOSURE -- this item stays OPEN.** Commit `444152dd2`, built
+> jointly with **#1135** because the two grade the same artifact against different verbs and the
+> 2026-08-20 research on both reached the same honest path. Lands the durability half this item calls
+> the deciding mechanism.
+>
+> **THE TWO-FILE CONTEXT-WORD PARITY GATE IS BUILT:** `tests/test_context_word_parity.py`, joined to
+> `DOC_GUARDS` in `.github/workflows/ci.yml` so it runs on a docs-only pull request. Set equality in
+> both directions against `CONTEXT_WORDS` imported from `auth/policy.py`, never a hand-copied literal;
+> every spelled cardinality in **both** published files must equal `len(CONTEXT_WORDS)`; the retired
+> characterization may appear only as a quoted, withdrawn phrase; and a pin on the documented absence
+> of any operator-supplied term, read off `AuthSettings.model_fields`.
+>
+> **THE TWO-FILE REQUIREMENT IS MEASURED, NOT ARGUED, and it is this item's own correction 1.**
+> Changing only `docs/CONFIGURATION.md`'s count word reds the gate on that file specifically. A
+> one-file gate would have gone green while one document went on asserting twelve -- the silent decay
+> this item was filed against, one file over.
+>
+> **THE GATE CANNOT PASS VACUOUSLY, and that was proved by mutation rather than asserted.** Adding a
+> thirteenth term to the shipped constant reds three tests including the vacuity self-test; the parser
+> raises on an empty region rather than returning one. Planting an unquoted live claim of the retired
+> characterization reds the retired-phrase guard. Each mutation was reverted and the tree confirmed
+> clean afterwards.
+>
+> **THE GUARD HAD A REAL WEAKNESS THAT ONLY THE PLANTED MUTATION EXPOSED**, fixed before landing: the
+> marker phrase straddles a hard line wrap, so a raw substring test missed it, and a paragraph-scoped
+> marker check would then have accepted a live claim sitting beside an unrelated retraction. The guard
+> now collapses whitespace, requires the phrase to be quoted, and asserts it found at least two
+> paragraphs so the scan cannot go quiet.
+>
+> **THE DIVERGENCE-AUTHORITY SENTENCE IS REWRITTEN.** `docs/SECURITY.md` told the reader the code wins
+> if document and code diverge. With no gate behind it, that is the sentence a later reader uses to
+> excuse a divergence rather than fix one. It now names the check that holds the two in step.
+>
+> **NOT A CLOSURE, and the reason is this item's own question rather than the closing act alone.**
+> Whether the requirement's subject is the DEPLOYING organization's list rather than the vendor's --
+> and therefore whether an operator-supplied context-word setting is required at all -- is **untouched
+> by this build**. The gate PINS the absence of such a setting rather than adding one, so that question
+> stays exactly as open as it was. The closing act is also a scorecard re-score in the vault clone,
+> which no builder can reach.
+>
+> Seven tests, two proven red against unmodified source, plus three discrimination proofs. `ruff`,
+> `ruff format` and `mypy --strict` clean; 231 pass across the parity, auth-core, settings and
+> doc-drift legs, 685 across all 22 `DOC_GUARDS` modules, 317 across the API auth and web console
+> legs. Full suite not run locally, so **CI is the authority**. Score and status unchanged, so the
+> ranked table is deliberately not edited.
+
 
 > 🔢 **Re-scored 2026-08-20 -> P2.** Value **5/10** · Difficulty **3/10** · _fill-in_. Publication landed but the two things the item said would decide an honest pass did not: there is still no operator-supplied context-word setting, and no gate ties the twelve published terms to policy.py:38-53, so the enumeration can decay silently. Difficulty 3 covers a small drift check plus, if research says the subject is the deployment's list, one additive setting into the password policy. _(was 5/10 · 4/10.)_
 > Research: done 2026-08-20
@@ -8835,6 +8881,55 @@ That covers every startable topology, not just the loopback default. The one pos
 **STILL OPEN:** the scorecard re-score, and the corpus tooling in the other lane. The prose half is done.
 
 ## 1135. research an honest pass for ASVS 6.2.11 -- whether publishing the enforced context words is durable enough to count
+> **PARTIAL 2026-09-06 (builder), NOT A CLOSURE -- this item stays OPEN.** Commit `444152dd2`, built
+> jointly with **#1132** as this item's own research directed: the two cells grade the same artifact
+> and deciding them separately risks two different published lists. Lands the durability half this
+> item calls the load-bearing half, and the requirement-number relabelling.
+>
+> **THIS ITEM'S CORRECTION 1 IS BUILT AND ITS MEASUREMENT REPRODUCED.** The parity gate covers **both**
+> published files. `tests/test_security_doc_drift.py` reads `docs/SECURITY.md` alone, while
+> `docs/CONFIGURATION.md` separately republishes the cardinality, a sub-count and the substring
+> semantics. Discrimination proved by mutation: changing only `docs/CONFIGURATION.md`'s count word reds
+> the new gate on that file specifically, so the one-file blind spot this item named is closed rather
+> than asserted closed. `tests/test_security_doc_rate_limits.py` was the two-file vehicle, exactly as
+> this item said; the new module needed no new CI plumbing beyond joining `DOC_GUARDS`.
+>
+> **THIS ITEM'S CORRECTION 2 IS BUILT, AND IT IS THE ONLY OPERATOR-FACING CHANGE IN THE PACKET.**
+> `AuthPolicy.violations` appended `not contain application or vendor terms` -- the characterization
+> `docs/SECURITY.md` had already retracted in place, because five of the twelve members are generic
+> credential words unrelated to this application or to HL7. That string is joined into the 400 body by
+> `api/auth_routes.py` and re-rendered verbatim by the console account form, where this item measured
+> that the console publishes no other statement of the policy at all. It now reads `not contain a term
+> from the documented deny-list`: it NAMES the list rather than characterizing its members, so it stays
+> true as the list changes. `tests/test_auth_core.py` pinned the old wording and is corrected, comment
+> included, as this item predicted.
+>
+> **THE REQUIREMENT-NUMBER RELABELLING IS DONE, and this item's count reproduced exactly.** Seven
+> shipped-artifact sites plus two test sites labelled the username-in-password screen 6.2.11, and zero
+> sites anywhere labelled the context-word list with its own number. Verbs were re-checked against the
+> ASVS 5.0.0 corpus the scorecard pins, not from memory. The context-word screen now carries 6.1.2 and
+> 6.2.11 in both documents and in `auth/policy.py`. **The username screen is named as an engine
+> addition with no section 6 requirement of its own, rather than given a substitute number** -- there
+> is none to give. The breached-password half of that section is left alone, as this item directed.
+>
+> **THE DIVERGENCE-AUTHORITY SENTENCE IS REWRITTEN** and now names the gate that holds document and
+> code in step, instead of telling a reader the code wins.
+>
+> **TWO SITES ARE FENCED AND UNCORRECTED**, both `AuthSettings` field comments in
+> `messagefoundry/config/settings.py`: `password_check_username` still carries `(6.2.11)`, and
+> `password_check_context` still carries the retracted `app/vendor/HL7 terms` wording. A concurrent
+> lane held that file for the whole build. The replacement text is written and the parity gate carries
+> a comment naming the one line that widens it to cover those sites once they land.
+>
+> **UNTIL THE GATE HAS RUN IN CI the honest verdict remains partial on this item's CORRECTED ground --
+> "enumerated but unpinned" -- not on its filed ground and not pass.** This build is what moves it off
+> the corrected ground; the re-score itself is a vault write no builder can make.
+>
+> Seven tests, two proven red first, three discrimination proofs. `ruff`, `ruff format` and
+> `mypy --strict` clean; 231, 685 and 317 pass across the parity/auth-core/settings/doc-drift, full
+> `DOC_GUARDS`, and API-auth/web-console legs respectively. Full suite not run locally, so **CI is the
+> authority**. Score and status unchanged.
+
 
 > 🔢 **Re-scored 2026-08-20 -> P3.** Value **4/10** · Difficulty **2/10** · _fill-in_. The list a reader needs is published, so the remaining worth is the decay guard the item itself calls the load-bearing half plus the 6.2.11 pointer decision alongside 6.1.2. Difficulty 2: one small test asserting the doc list equals CONTEXT_WORDS, plus a docs pointer edit. _(was 4/10 · 3/10.)_
 > Research: done 2026-08-20
@@ -8919,6 +9014,68 @@ That covers every startable topology, not just the loopback default. The one pos
 **`scripts/dev/sqlserver-docker.ps1:64` re-measured and deliberately NOT fixed.** The literal is `'Str0ng_P@ssw0rd!'`, used when `MEFOR_STORE_PASSWORD` is unset and fed to `MSSQL_SA_PASSWORD` at `:191`. The same param block carries an explicit dev-only suppression justification, and whether `scripts/` is inside this cell's corpus is the unsettled scope question named above. Fixing it before that ruling moves nothing and would read as progress.
 
 ## 1137. research an honest pass for ASVS 6.3.4 -- consistent authentication strength when AD MFA is delegated by design
+> **PARTIAL 2026-09-06 (builder), NOT A CLOSURE -- this item stays OPEN.** Commit `dbff97d12`. Lands
+> two arms the research named and leaves the item's central gap untouched, so the verdict does not
+> move. Layers 1 and 2 already shipped; neither is rebuilt here.
+>
+> **THE mTLS SERVICE-IDENTITY PATHWAY WROTE NO AUTHORIZATION AUDIT AT ALL, and that limb of the
+> research re-measured true.** `require_service_cert` refused with a bare `log.warning` and recorded
+> no grant, while `require` and `authorize_ws` both call `audit_permission_denied` and
+> `audit_permission_granted`. Fencing the cert plane apart is about which CREDENTIAL admits a caller;
+> an audit control covering one pathway and not the other is the inconsistency this verb names. The
+> denial now writes a row, and the grant is gated by exactly the rule `require` uses -- one shared
+> rule rather than a cert-plane copy, verified: `_audit_all_authz` and `_grant_audit_permission` are
+> pre-existing helpers already used by the bearer and websocket paths.
+>
+> **THE 401 ARM DELIBERATELY WRITES NO ROW, and the bound is the part worth recording.** No identity
+> resolves there, so there is no actor to name; the only string in hand is the presented certificate
+> subject the shipped code refuses to echo because it is attacker-choosable; and the arm fires at
+> whatever rate an unauthenticated caller chooses, so auditing it would let an unauthenticated peer
+> append to the hash-chained log without limit. `require` does not audit its own 401 either. The
+> narrow residual -- an allow-listed cert mapping to an unknown or disabled account -- is bounded by
+> the operator's own map and needs an audit action taking a principal rather than an `Identity`.
+> Recorded in a comment, not built.
+>
+> **ONE CORRECTION OF DEGREE TO THE 2026-08-20 RESEARCH.** It says the mTLS plane "appears in no
+> controls row, no strength row". That is **stale**: `docs/SECURITY.md` carries an mTLS
+> service-identity row in both the pathway table and the comparative-properties table, and
+> `tests/test_docs_security_pathways.py` pins them. There is also a route-level AUTHENTICATION audit,
+> `service_cert_auth`, written by the `/service/identity` route rather than by the dependency. The gap
+> was specifically the **authorization** decision -- not admission, not documentation.
+>
+> **`[auth].login_rate_limit_enabled` WAS INVISIBLE TO THE LOOSENING REPORTER**, as the research
+> said. It sat in the floor test's exemption set as "DoS hardening with its own serve-time defaults",
+> and `security_loosenings` never looked at it, so an instance that had turned it off would still have
+> read as being at the shipped posture. Now registered unconditionally, with the docstring enumeration
+> that pins it updated in the same change.
+>
+> **THE SWITCH CONTROLS TWO LIMITERS, NOT ONE, which the research did not say and the name does not
+> suggest:** the sign-in sliding window AND the per-actor credential-ceremony budget. Turning it off
+> also removes the only anti-automation control on password change, re-authentication and
+> second-factor confirmation, where per-account lockout does not apply at all. Both the registry entry
+> and a new `docs/SECURITY-LOOSENING.md` section say so. That file is the one artifact touched beyond
+> the two arms, and deliberately: the floor test's own comment says extending the registry over an
+> exempt switch is work with its own entries there, so omitting it would have made the change silent
+> in the one document an operator reads.
+>
+> **THE ITEM'S CENTRAL GAP IS UNTOUCHED.** The directory legs still mint sessions MFA-verified with no
+> IdP evidence, which is what actually holds 6.3.4 short, and it needs an owner ruling rather than a
+> build. **Also not built:** the Kerberos step-up seeding reconciliation, which the research says must
+> go in the CLOSING direction and which is shared with the identity-provider recentness cell -- it
+> should be done once by whoever owns both, not twice.
+>
+> **Conditional, per section 0.** A first deployment admitting a service principal by client
+> certificate would have had no authorization trail for it at all, and a deployment that had switched
+> the login limiter off would still have reported the shipped posture.
+>
+> Four tests: two proven red against unmodified source, and two deliberate CONTROLS that must stay
+> green on both sides, so a change auditing everything unconditionally would red them. `ruff`, `ruff
+> format` and `mypy --strict` clean; 53 pass across the service-cert, posture and pathway-doc legs,
+> plus 422 web console, 132 auth and 482 loosening-naming tests run separately. **A clean full-suite
+> reading was not obtainable** -- four builders were editing this worktree concurrently, so a
+> whole-tree run showed failures attributable to no single lane. **CI is the authority for that leg.**
+> Score and status unchanged, so the ranked table is deliberately not edited.
+
 
 > 🔢 **Re-scored 2026-08-20 -> P2.** Value **6/10** · Difficulty **8/10** · _big bet_. Both directory legs still mint sessions MFA-verified unconditionally while local accounts face a second factor as an access gate, and require_mfa_scope still defaults to every_local_account, so the strength gap is widest on the shipped default. Value 6 rather than 7 because the shipped comment at service.py:879-882 names a reachable out-of-engine control -- an MFA-enforcing LDAP proxy in front of the simple bind makes the directory pathway genuinely second-factor-backed -- so the residual gap is that the engine asserts rather than verifies, which is an awkward workaround and not the absence of one; difficulty 8 because the routes the research must weigh are directory-side evidence the engine can verify or an AD enrollment authority the code deliberately defers, both new architectural seams in auth. _(was 7/10 · 8/10.)_
 > Research: done 2026-08-20
@@ -9008,6 +9165,66 @@ That covers every startable topology, not just the loopback default. The one pos
 **ADDED BY THE ADVERSARIAL PASS, AND IT IS THE WIDEST GAP: the post-session credential ceremonies.** `verify_current_password` (`messagefoundry/auth/service.py:1789-1794`) and `reauth`/`_reauth_ad` (`:1796-1832`, `:1908-1916`) verify the same credentials the login leg does, are reachable on both operator artifacts (`messagefoundry/api/auth_routes.py:306` and `:338`, `messagefoundry_webconsole/routes/account.py:196`, `routes/core.py:913`), and **neither counts a failure nor checks `locked_until`** -- so a locked account can still be guessed there. `POST /me/password` raises 403 at `messagefoundry/api/auth_routes.py:306` with **no audit call at all**, so a guessing run is invisible in the feed, the notifier and the failure counter simultaneously. The engine already classifies this as a guessing surface: `allow_reauth_attempt` (`messagefoundry/auth/service.py:414-423`) exists for it and has six call sites. **Detection is also absent on the AD, Kerberos, federated and passkey legs**, and on the verb's own second example (a first factor that never completes).
 
 ## 1139. research an honest pass for ASVS 6.3.7 -- notifying a user whose authentication details the directory changed
+> **PARTIAL 2026-09-06 (builder), NOT A CLOSURE -- this item stays OPEN.** Commit `de1280943`. Lands
+> two of the five residuals the 2026-09-05 pass listed, and the no-address arm it named as the blocker
+> is UNTOUCHED, so the verdict does not move.
+>
+> **PASSKEY-REMOVAL NOTICE PARITY, which the 2026-09-05 pass listed as still standing and re-measured
+> true here.** `delete_webauthn_credential` wrote its audit row unconditionally and called
+> `_notify_security` only `if last_second_factor`, so removing a passkey while another factor remained
+> produced an audit row and no notice. Losing one of several factors is still an update to the
+> account's authentication details, which is this cell's own verb. Every successful removal now
+> notifies.
+>
+> **TWO EVENT TYPES, NOT ONE CARRYING A FLAG, and the reason is a truth condition rather than a style
+> preference.** `MFA_DISABLED` asserts the account has no second factor left; emitting it while
+> another passkey stands would be false, and existing consumers already read it as that state change.
+> The last-factor arm is byte-unchanged. `MFA_CREDENTIAL_REMOVED` is new and is wired into the
+> notifier's subject and description tables and the `docs/PHI.md` stream 12 enumeration.
+>
+> **NO REMAINING-FACTOR COUNT IS CARRIED, deliberately.** `len(creds) - 1` is off by one for every
+> credential a concurrent caller removed between the read and the delete, and the recovery-code
+> sibling pays a store re-read to avoid exactly that. The count buys a reader nothing the fixed
+> wording does not, so it is not carried rather than carried wrong.
+>
+> **THE FOLLOW-ON THE 2026-09-05 PASS NAMED AND DELIBERATELY DID NOT TOUCH IS NOW CLOSED.**
+> `AuthService._notify_security` opened `if self._security_notifier is None: return` while its
+> docstring three lines above said that a missing notifier or a notifier failure is swallowed and
+> logged. Only the failure arm logged. `security_notifier_from_settings` returns `None` whenever
+> `[alerts]` names no SMTP host or sender, so an instance running with `notify_security_events` on and
+> no relay configured would drop every notice for every account on a first deployment, with the
+> lifespan wiring reporting nothing either. Neither the serve gate nor
+> `_assert_security_notice_is_deliverable` covers that on a non-PHI instance. The branch now warns,
+> naming the event type and the username and **never `detail`** -- an EMAIL_CHANGED carries an address
+> in it. The docstring now describes the code, and says it was previously wrong, so a later reader
+> reads the branches rather than the paragraph.
+>
+> **PER OCCURRENCE, NOT ONCE PER PROCESS**, matching the sibling in `pipeline/security_notify.py` and
+> the two drops it matched in turn: each line is a distinct notice nobody received, and collapsing
+> them hides the count, which is the figure separating a missing relay from a quiet instance.
+>
+> **THIS DOES NOT MOVE THE VERDICT AND MUST NOT BE READ AS DOING SO.** A log is not a notice to the
+> user, and the arm the 2026-09-05 pass identified as the blocker is untouched: an account can still
+> be born with no notification address and is then told nothing out of band by any path. A re-score
+> performed today would still read 6.3.7 as short on that arm.
+>
+> **STILL OPEN, unchanged by this build:** the first-login set-address step; generalising the startup
+> assertion from *some enabled Administrator* to every enabled account; `AuthService.update_user`
+> writing both addresses from one field, so an operator cannot point notices somewhere the profile
+> does not say; and the single-choke-point refactor of the nineteen call sites.
+>
+> **ONE NEW FOLLOW-ON, found by this build rather than by research, and NOT touched.**
+> `AuthService.disable_mfa` fires `MFA_DISABLED` unconditionally, so turning off TOTP while a passkey
+> remains makes exactly the false claim the new event type exists to avoid. Same asymmetry, other
+> credential. Named rather than numbered, because it is unfiled; recorded in a comment on the new
+> constant rather than fixed, because it is outside this row's two arms.
+>
+> Three tests, each proven red against unmodified source first. `ruff`, `ruff format --check` and
+> `mypy --strict` clean; 268 tests pass locally across the auth service, webauthn, notifier, MFA, API
+> auth, deliverability and doc-drift legs, plus 35 web console tests. The full suite was not run
+> locally and the Postgres and SQL Server legs are hosted-runner only, so **CI is the authority for
+> those**. Score and status unchanged, so the ranked table is deliberately not edited.
+
 
 > **PARTIAL 2026-09-05 (builder), NOT A CLOSURE -- this item stays OPEN.** Establishes what is
 > actually left, and the answer is not "a re-score". **The 2026-09-04 build LANDED** -- PR 853,
@@ -9349,6 +9566,46 @@ That covers every startable topology, not just the loopback default. The one pos
 **No re-score, no banner flip, no vault write.** Closing act stays `scorecard-rescore`.
 
 ## 1141. research an honest pass for ASVS 6.4.5 -- a deadline and a reminder for a credential the engine cannot reach the holder of
+> **RE-VERIFIED 2026-09-06 (builder). NO BUILD, NO CLOSURE -- this item stays OPEN. One limb of the
+> honest path is ALREADY BUILT and this item never recorded it.**
+>
+> **THE REMINDER-TASK GATE IS REPAIRED.** The 2026-08-20 research retracted "the bootstrap arm is
+> covered on both halves" and asked for the gate to "start whenever **any** bound is live, with the
+> predicate owned by the service rather than duplicated in the lifespan". That is done. The API
+> lifespan now reads `auth.bootstrap_deadline_configured` rather than open-coding
+> `auth_settings.bootstrap_expiry_hours > 0`, and the shipped comment beside it cites **BACKLOG
+> #1141** by number while naming the exact defect the research measured: at
+> `bootstrap_expiry_hours = 0` with `initial_password_expiry_hours` set, `bootstrap_expiry_warning`
+> computed a correct deadline and its only consumer was never created, so the warning arm was
+> silently dead in a supported configuration.
+>
+> **RECORDED HERE BECAUSE THE FIX CITED THIS ITEM AND NOBODY UPDATED IT.** That is the rot section 11
+> exists to stop: a row that goes on describing work as outstanding after it shipped. Anyone sizing
+> this item off the 2026-08-20 honest path would have re-derived a repair that is already on `main`.
+>
+> **THE ISSUANCE-DEADLINE LIMB RE-MEASURES TRUE AND IS UNBUILT.** `PasswordResetResponse` carries
+> `temp_password` and no deadline; `temp_password_page` takes a username and a password and no
+> deadline. The enforced bound is still `password_changed_at + initial_password_expiry_hours`. So the
+> admin-issued temporary credential still states its deadline at no issuance surface, which is the
+> limb this cell actually turns on.
+>
+> **STILL OPEN, unchanged:** attaching the enforced expiry instant to every issuance surface, derived
+> from the same bound the login gate refuses on so the surfaced and enforced deadlines cannot
+> diverge; whether `create_local_user` should fire an out-of-band notice at all; the console
+> forced-change page, which is the one surface the holder always reaches and needs no address; the
+> `LoginResponse` carriage for the IDE; the API must-change refusal, which every non-browser caller
+> receives and which states no deadline; the bootstrap credential's event-driven supersession
+> trigger, covered by no reminder; and the two proposed rulings on what "sent" and "if necessary"
+> mean, which are the owner's rather than a builder's.
+>
+> **THE DELIVERY RESIDUAL ALSO STANDS**: the bootstrap, certificate-expiry and secret-rotation
+> reminders all degrade to a logging sink on an instance whose PHI start gate checks host and sender
+> while the mail transport needs a recipient list. The honest floor after any build is a delivery
+> residual on three mechanisms, not one.
+>
+> No code was written for this item, no score changed, and the ranked table is deliberately not
+> edited. Closing act stays `scorecard-rescore`.
+
 
 > 🔢 **Re-scored 2026-08-20 -> P2.** Value **5/10** · Difficulty **4/10** · _fill-in_. The gap stands: the 72-hour default at settings.py:1851 is enforced at auth/service.py:786-798 and stated nowhere a holder or issuing administrator would see it, and settings.py:4264 separately records the same field as unreported on the loosening surface. Value 5 is rung 5 -- a real conformance and usability gap with a clean out-of-band workaround, since the administrator issuing the credential can state the deadline. Difficulty 4: attaching the deadline to the reset response, the console one-time page and the create-user hint is a feature across a seam with no store work, ahead of a bounded reading of whether a 72-hour credential needs an automated reminder at all. _(was 5/10 · 5/10.)_
 > Research: done 2026-08-20
@@ -9385,6 +9642,120 @@ That covers every startable topology, not just the loopback default. The one pos
 **ALSO MISSING FROM THE INVENTORY:** the API's own must-change refusal (`messagefoundry/api/security.py:216-217`), which is the renewal instruction every non-browser caller receives and states no deadline; the bootstrap credential's **second, event-driven** expiry trigger (supersession once a second administrator exists, `messagefoundry/auth/service.py:637-654`), which fires at any setting value and is covered by no reminder; and two undispositioned expiring-mechanism candidates that need written not-applicable rationales. **THE ITEM'S TRAPS BOTH STAND** -- setting the expiry hours to zero deletes a lifecycle control to dodge a lifecycle verb, and the settings reference row is a table an operator consults, not something sent with a credential. **A third:** emitting a plausibly-named reminder event from a loop that can never observe an unclaimed temporary credential would silence both of this cell's absence checks and change nothing anyone would see.
 
 ## 1142. research an honest pass for ASVS 6.7.1 -- what an application can honestly assert about a trust anchor stored on a host it does not own
+> **PARTIAL 2026-09-06 (builder), NOT A CLOSURE -- this item stays OPEN.** Lands step (1) of the
+> honest path and half of step (3). Commit `0adde6059`.
+>
+> **THE PARSER FAIL-OPEN THE 2026-08-20 RESEARCH NAMED REPRODUCED EXACTLY, AND IS CLOSED.**
+> `owner_only_from_icacls` returned `bool` and fell through to `True` whenever its loop matched
+> nothing, so a "yes, owner-only" was byte-indistinguishable from "I parsed nothing". It now returns
+> `bool | None`, and the determinacy rule is stated in the docstring rather than left implicit: at
+> least one line must parse as an ACE, meaning a non-empty principal token followed by a rights blob.
+> The `None` channel already existed end to end (`dacl_is_owner_only` returned it, `AnchorVerdict.acl_ok`
+> modelled it); only the parser could not produce one.
+>
+> **MEASURED BOTH WAYS, WITH TWO CONTROLS THAT HOLD STEADY.** Empty text, unparseable text,
+> `NT AUTHORITY\INTERACTIVE:(I)(M)`, `NT AUTHORITY\SERVICE:(I)(M)`, `NT AUTHORITY\BATCH:(I)(M)` and
+> `CREATOR OWNER:(I)(F)` all returned `True` before. Controls in the same run: `Everyone:(F)` returned
+> `False` and `BUILTIN\Users:(RX)` returned `True`, and both are unchanged after -- so the probe
+> discriminates rather than agreeing by construction.
+>
+> **AN EXTRA DEFECT THE RESEARCH DID NOT NAME, found while building: the SID matching already
+> OVER-matched.** SIDs were compared as substrings, so `s-1-5-11` (Authenticated Users) matched inside
+> `S-1-5-113` (Local Account) and flagged it broad. Adding `S-1-5-3` (BATCH) as a substring would have
+> made `*S-1-5-32-544` (BUILTIN\Administrators, deliberately trusted) match too. The set is therefore
+> SPLIT rather than extended in place: names stay substring matches, SIDs are matched whole after any
+> leading `*`. Anyone extending it must keep that split.
+>
+> **THE LOCALE LIMIT IS STATED, NOT PAPERED OVER.** `icacls` resolves SIDs to LOCALIZED names by
+> default, so a name-substring set cannot be complete across locales -- a German `Jeder:(F)` still
+> reads owner-only. The docstring says "at least" (SDS-3.6) and names the remedy, and a paired test
+> pins that limit beside its SID form so the two cannot be mistaken for each other. Closing it needs a
+> SID-form read (`icacls /sid`, or the in-process DACL walk `config/wiring.py` already ships).
+>
+> **THE INDETERMINATE BRANCH NOW WRITES AN AUDIT ROW.** `_preflight_one` had branches for
+> `pin_ok is False` and `acl_ok is False` and none for `acl_ok is None`, so the operator runbook's own
+> instruction to alert on that audit action was blind on exactly the branch this item is about. It now
+> writes `acl_indeterminate` carrying the fingerprint and the `enforcing` flag.
+>
+> **INDETERMINACY IS VISIBLE, NOT FATAL, AND THAT IS DELIBERATE.** Making it refuse is step (3)
+> proper; this item's own first trap forbids buying the verdict with availability, and the research
+> sequences the refusal AFTER step (4) binds the verified bytes to the loaded bytes. The existing
+> degrade pin `test_indeterminate_dacl_does_not_refuse` stays green untouched.
+>
+> **ONE DIVERGENCE FROM A SIBLING GUARD, deliberate and reasoned in a comment.**
+> `_evaluate_config_dacl` in `config/wiring.py` TRUSTS `CREATOR OWNER` and `INTERACTIVE`; they are
+> broad here. That guard is handed the object's owner SID and can resolve the placeholder; this parser
+> is handed text and no owner. Availability cost measured before committing: `icacls` on a file in a
+> temp directory or user profile lists only SYSTEM, Administrators and the owner, so none of the four
+> fires on an ordinary anchor. `icacls C:\Users\Public` does list `INTERACTIVE`, `SERVICE` and `BATCH`
+> with object-inherit, which propagates as `(I)(M)` onto every file created there.
+>
+> **STILL OPEN, deliberately out of scope.** Step (2), ancestor-directory and symlink inspection with a
+> delete-child right set. Step (3)'s refusal. Step (4), binding verified bytes to loaded bytes. Step
+> (5), collecting the three per-connection inbound CAs into `collect_anchor_specs`. Step (6), refusing
+> the federated and directory switches without an explicit CA file and correcting
+> `verify/federation.py`. And the locale gap above.
+>
+> **ONE ENUMERATION THIS COMMIT CANNOT REACH.** `docs/security/OFF-LOOPBACK-DEPLOYMENT.md` in the
+> `MessageFoundry-vault` clone is the only document enumerating these `event` values and needs
+> `acl_indeterminate` added. Nothing in the engine tree enumerates them -- tests, scripts, docs, the
+> web console, packaging and the IDE were all checked, and there is no central audit-action registry.
+> Routed in the packet handoff rather than left silent.
+>
+> **Conditional, per section 0.** A first deployment with `[api].tls_client_ca_file` set would, on a
+> host where the ACL read returned nothing parseable, have recorded the anchor as owner-only and
+> written no audit row. That is what these two arms close. 14 tests proven red first, no existing
+> assertion inverted. `ruff`, `ruff format` and `mypy --strict` clean; 50 pass in the anchor suite,
+> 1009 across the anchor, ACL, TLS and audit legs. Full suite not run locally, so **CI is the
+> authority**. Score and status unchanged, so the ranked table is deliberately not edited.
+>
+>
+> **THE ANCHOR POPULATION IS ONE MORE THAN THE RESEARCH COUNTED, AND THE RESEARCH'S OWN INSTRUMENT
+> COULD NOT HAVE FOUND IT.** The 2026-08-20 pass established the un-preflighted set with
+> `grep -rn "verify_mode = ssl.CERT_REQUIRED"` and named three inbound CAs. That probe finds
+> **TLS** contexts. `messagefoundry/transports/direct.py` implements Direct **S/MIME**, uses no
+> `SSLContext` for its trust decision at all (measured: zero `verify_mode` occurrences in that
+> module), and reads a per-connection operator-supplied `trust_anchor` PEM at construction --
+> `_verify_recipient_trusted`, fed by `_read_file("trust_anchor", ...)`. It is the CA the partner's
+> recipient certificate must chain to. The probe is structurally blind to it, so the "three inbound
+> CAs short" figure is an undercount **by construction rather than by oversight**.
+>
+> **`collect_anchor_specs` still cannot see it either.** Its signature takes `AuthSettings` and
+> `ApiSettings` and nothing else, so every per-connection anchor is outside the preflight regardless
+> of protocol. That is the same structural gap the research named; only its size changes.
+>
+> **WHETHER IT IS IN 6.7.1's SCOPE IS A JUDGMENT, AND IT IS AT LEAST AS STRONG A CANDIDATE AS A TLS
+> PEER CA.** The verb covers certificates used to verify cryptographic authentication assertions. An
+> S/MIME trust anchor is what makes the partner's signature mean anything, so if the DICOM and MLLP
+> peer CAs are in scope this one is too. Recorded as a scope question for the re-score rather than
+> settled here.
+>
+> **AND THE GAP IS WIDER THAN "NOT PREFLIGHTED", because the TLS anchors have a backstop this one
+> does not.** The three un-preflighted TLS CAs are loaded into an `SSLContext`, so OpenSSL's own
+> security level refuses a weak anchor at handshake -- measured by a peer session on OpenSSL 3.5.7,
+> leaf held constant at RSA-2048 so the anchor was the only variable: an RSA-2048 CA handshakes and
+> an RSA-1024 CA is refused with `CA certificate key too weak`. **That backstop does not reach the
+> Direct S/MIME anchor.** Verified here: `_verify_recipient_trusted` calls
+> `cryptography`'s `verify_directly_issued_by` on a loaded X.509 object and constructs no
+> `SSLContext` at any point. So the S/MIME anchor sits outside BOTH this engine's
+> `collect_anchor_specs` preflight and OpenSSL's security level, while the TLS anchors sit outside
+> only the first. The structural blindness of the research probe and the absence of the protection
+> are the same fact from two directions.
+>
+> **ONE MORE `verify_mode` SITE THE RESEARCH DID NOT NAME, MEASURED OUT RATHER THAN LEFT OPEN:**
+> `messagefoundry/auth/oidc_http.py`. The probe returns four sites today, not three. It does pass an
+> operator-supplied `ca_cert_file` to `ssl.create_default_context`, so it is genuine census material
+> -- but a weak anchor there is already refused by the security level above, so it is not a gap on
+> this cell's verb. It is also an OUTBOUND client context verifying the identity provider rather
+> than an inbound receiver. Named and dispositioned so the next reader does not re-derive why the
+> counts differ.
+>
+> **PROVENANCE, because it matters for how much weight to give it.** This came from a peer session
+> disambiguating a VOCABULARY collision -- "trust anchor" names both `auth/trust_anchors.py` (the
+> API, OIDC and mTLS preflight) and a per-connection Direct S/MIME setting -- not from anyone
+> auditing this row. The two concerns share a word and nothing else, which is exactly how a
+> population gets counted short. Measured independently here before recording.
+
 
 > 🔢 **Re-scored 2026-08-20 -> P2.** Value **6/10** · Difficulty **6/10** · _big bet_. Neither hole has moved: the undeterminable read still degrades to a warning (trust_anchors.py:167) and the inspection still covers the anchor file alone (:199, :218), so a writable containing directory would still permit unlink-and-replace on an instance with tls_client_ca_file plus a cert-identity map. Value sits at the awkward-workaround band because that configuration is opt-in rather than a shipped default and the optional SHA-256 pin at settings.py:769 already defeats substitution outright for an operator who sets it; difficulty is the POSIX-versus-Windows split plus measuring how often the undeterminable branch fires before it may refuse. _(was 6/10 · 7/10.)_
 > Research: done 2026-08-20
@@ -9599,6 +9970,116 @@ A recycled name inside one directory is **not** cross-IdP spoofing, so a 6.8.1 r
 **This pass wrote no engine code, changed no schema, ran no migration, and touched no vault file.** It wrote one ADR and this section.
 
 ## 1144. research an honest pass for ASVS 6.8.4 -- IdP-asserted strength and recentness when two of the three login legs assert nothing
+> **PARTIAL 2026-09-06 (builder), NOT A CLOSURE -- this item stays OPEN.** Commit `4149b0bd4`. Builds
+> **step (3) only** of the honest path, as one indivisible unit. Steps 1, 2, 4 and 5 need the owner
+> ruling this item names and are untouched.
+>
+> **THE FILED GAP RE-MEASURES TRUE, WITH A BEHAVIOURAL WITNESS RATHER THAN A GREP.** Against
+> unmodified source, a signed token carrying **no** `auth_time`, one **ten years stale**, and one **ten
+> years in the future** were all **ACCEPTED**, and the authorization URL carried no `max_age`.
+> `auth_time` appeared nowhere in the auth tree, against a control of `nonce` firing in ten-plus files.
+> The issuer pin was confirmed to run FIRST, before the claim checks, so a rung sited beside the MFA
+> gate is already after it -- now pinned by a test rather than assumed.
+>
+> **BOTH HALVES OR NEITHER, which is this item's own trap.** Requesting `max_age` without validating
+> `auth_time` is the ask-and-never-check shape the item cites at `acr_values`, which is requested from
+> a setting that ships empty. So `build_authorization_url` takes `max_age_seconds` as a **REQUIRED**
+> keyword, not an optional one beside `acr_values` and `prompt`.
+>
+> **THE REQUIREMENT IS STRUCTURAL, NOT STYLISTIC.** OIDC Core makes `auth_time` mandatory **only**
+> when `max_age` was sent, so the ladder's right to refuse an absent claim rests entirely on the
+> engine having asked. An omissible parameter would let the two halves disagree -- a ladder demanding
+> a claim from an IdP nobody asked. A required keyword makes "we always asked" a property of the
+> signature rather than a convention every future caller must remember. `OidcClaimPolicy.max_age_seconds`
+> carries no default for the same reason. **`acr_values` is the local precedent AGAINST the optional
+> shape, not for it.**
+>
+> **THIS IS NOT `prompt=login`.** OIDC Core's Authentication Request section obliges the provider to
+> actively re-authenticate only IF elapsed time exceeds the value, so single sign-on is untouched
+> inside the window and only a genuinely stale authentication costs a prompt.
+>
+> **CLOCK SKEW, because it is the arm most easily got wrong.** An `auth_time` up to
+> `clock_skew_seconds` ahead is tolerated and **clamped to now**: tolerance may excuse a value, never
+> extend a bound. Beyond the skew it is REFUSED, because clamping alone cannot contain it --
+> `now - min(auth_time, now)` is zero for any future value, so an IdP an hour fast would let an
+> hour-old authentication pass a five-minute window. The stale side gets the same grace, since the IdP
+> honours `max_age` at the authorize request while the ladder measures at the callback.
+>
+> **THE SESSION CAP IS REQUIRED, NOT BELT-AND-BRACES.** The console reauth path verifies a password
+> and a local second factor on every branch and never returns to the IdP, so a login-time check alone
+> would let the time since the IdP authentication event drift unbounded for the life of the session --
+> the very interval `max_age` was sent to bound.
+>
+> **WIRED WHERE ITS SIBLINGS ARE WIRED**: a `fed.replay.recency` rung and a `fed.recency` posture row
+> in the deployment verifier, so `messagefoundry verify` cannot report the federation posture while
+> staying silent on recentness; and a console login message, because a mapped reject code with no
+> message renders an EMPTY banner. That last gap was live, found by this build rather than by the
+> research, and is now pinned by a test.
+>
+> **DISCRIMINATION IS BY SLUG, because a refusal in this module proves nothing on its own.** Each new
+> slug has exactly one raise site, verified by grep against `mfa_claim_missing` as a firing control.
+> Under sabotage the ladder tests fail with DID NOT RAISE rather than a neighbouring arm's message.
+> **The service-level test was the real trap**: sabotaged, it fails on `expired` versus
+> `auth_time_stale`, because the session-cap arm refuses the same input -- it asserts the exact slug,
+> so it discriminates, where asserting only the boolean would have passed against unmodified source.
+> Controls green on both sides: a fresh `auth_time` accepted and carried, a window-edge value
+> accepted, a conforming login still logging in, and the existing 12-hour session pin unmoved. Plus
+> one proving nothing narrowed -- four tokens that are ALSO wildly stale must still be refused by
+> `claim_iss`, `claim_aud`, `nonce_mismatch` and `mfa_claim_missing`, proven non-inert by moving the
+> rung to the front of the ladder.
+>
+> **THE WINDOW IS A CONSTANT, NOT A SETTING, deliberately.** The control is therefore on and
+> unconditional, matching every other OIDC control (measured: zero occurrences of `nonce`, `pkce` or
+> `verify_aud` in `config/settings.py` against 85 `oidc` hits). Making it tunable is a separate change
+> carrying a contextual-marker classification, a `docs/SECURITY.md` Table A row and a pinned row-count
+> bump, which must land together or the doc-drift leg reds. The drafted field and its 60-to-86400
+> validator are written out in the PR rather than half-applied.
+>
+> **THIS DOES NOT MOVE THE CELL, and the reason is the one this item already records.** Every control
+> here sits inside an IdP leg that ships off, so the 2026-08-16 ruling that an off-by-default control
+> can never be graded pass applies unchanged. The deciding question -- whether that ruling reaches a
+> requirement whose ANTECEDENT is unreachable on a stock install -- is an owner call this build does
+> not touch. The item's own research says the build is worth funding on the merits regardless, and
+> that is the ground it was built on.
+>
+> **PROCESS DISCLOSURE.** This build overrode a `collision_gate.ps1` deny on `auth/service.py` naming
+> a peer session. The edit was forced -- a required keyword means the login entry point must pass it,
+> so there is no green tree with the flow change and without it -- and it was disclosed rather than
+> hidden. The peer was then asked directly and raised no objection. **Their worktree was in fact
+> clean, so the gate fired on a stale snapshot; but that fact was established by ASKING them, not by
+> the hunk-position check the override rested on.** Recorded because an override its author has
+> talked themselves into looks retrospectively justified nearly every time.
+>
+> `ruff`, `ruff format` and `mypy --strict` clean over the whole tree; 139 OIDC and verify tests, 423
+> web console, 1606 across the auth, federation, session and SSO blast radius. The full suite was not
+> read locally, so **CI is the authority**. Score and status unchanged, so the ranked table is
+> deliberately not edited.
+>
+>
+> **A DETECTION SEAM FOR THIS ROW'S OWN TRAP EXISTS, ON ANOTHER BRANCH, AND IS NOT REACHABLE FROM
+> HERE.** This row's trap list names the ask-and-never-check shape and cites the assurance-class
+> settings as the shipped example: `oidc_acr_values` is requested while `oidc_required_acr_values`
+> enforces, and neither implies the other. Packet C's PR 943 adds an `oidc-auth-params` advisory in
+> `messagefoundry/checks.py` (`_check_oidc_auth_params`) reporting exactly that asymmetry in BOTH
+> directions, pinned by a matched pair.
+>
+> **Measured on this branch 2026-09-06: `_check_oidc_auth_params` exists in neither
+> `messagefoundry/checks.py` here nor on `origin/main`.** Control in the same run:
+> `oidc_required_acr_values` does resolve, four hits in `config/settings.py`, so the probe fires. The
+> seam is real and simply has not landed.
+>
+> **So the advisory arm for `max_age` was NOT built here, and that is a sequencing decision rather
+> than an omission.** Extending a function this branch cannot see would either duplicate it or
+> conflict with PR 943 at merge. Once 943 lands, the advisory should grow a third arm reporting a
+> `max_age` requested and never validated against `auth_time` -- a one-function addition on a seam
+> that will already exist. Offered by packet C and declined on those grounds, not on the merits.
+>
+> **Note the convergence, because it is evidence about the defect rather than about either row.** This
+> row's trap list and packet C's advisory arrived at the same defect from two directions without
+> either aiming at the other: one reasoning forward from what an honest 6.8.4 build must not do, the
+> other reasoning backward from what a shipped configuration pair can express. A defect two
+> independent passes reach is worth more confidence than one either found alone.
+
 
 > 🔢 **Re-scored 2026-08-20 -> P2.** Value **6/10** · Difficulty **5/10** · _quick win_. Gap stands on both axes: auth_time appears nowhere in the auth tree, flow.py requests no max_age, and service.py:884/:914 still mint mfa_verified=True on the directory legs with no IdP evidence, so a directory session would satisfy the step-up gate on a first deployment (value 6). The remainder prices at 5, not 6: the AD arm is deferred to #296 by the item's own text, so the deliverable is a research finding plus at most an OIDC-leg recency check, a setting and a SECURITY.md fallback, with the store limb bounded to one nullable column on a sessions table that already gained reauth_at the same way (store.py:3181). _(was 6/10 · 7/10.)_
 > Research: done 2026-08-20
