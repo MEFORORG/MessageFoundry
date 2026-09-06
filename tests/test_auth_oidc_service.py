@@ -29,6 +29,7 @@ from messagefoundry.auth import oidc
 from messagefoundry.auth.identity import AuthProvider
 from messagefoundry.auth.ldap import AdPrincipal
 from messagefoundry.auth.notifications import FEDERATED_IDENTITY_BOUND
+from messagefoundry.auth.oidc import DEFAULT_MAX_AGE_SECONDS
 from messagefoundry.auth.service import AuthService, LoginOutcome
 from messagefoundry.auth.tokens import hash_token
 from messagefoundry.config.models import SignatureAlgorithm
@@ -89,6 +90,9 @@ def _claims(**over: Any) -> dict[str, Any]:
         "nonce": NONCE,
         "preferred_username": "jdoe@corp.example",
         "amr": ["pwd", "mfa"],
+        # REQUIRED of every accepted id_token: the engine always requests `max_age`, and OIDC Core 2
+        # makes the claim mandatory whenever it does (BACKLOG #1144 step 3).
+        "auth_time": now,
     }
     base.update(over)
     return base
@@ -600,6 +604,101 @@ async def test_a_long_lived_token_does_not_extend_the_local_lifetime(
         assert session is not None
         absolute = AuthSettings().session_absolute_hours * 3600
         assert session.expires_at - session.created_at == pytest.approx(absolute, abs=2)
+    finally:
+        await store.close()
+
+
+async def test_the_session_is_capped_at_the_recency_window_from_auth_time(
+    rsa_key: rsa.RSAPrivateKey, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The third limb of the cap (BACKLOG #1144 step 3): a session must not outlive the recency
+    window it was minted under.
+
+    A login-time check alone would not bound the interval, because `/ui/reauth` verifies a password
+    and a local second factor and never returns to the IdP — so without this the time since the IdP
+    authentication event would drift unbounded for the session's whole life, which is what the
+    request parameter was sent to prevent. Here the token's `exp` is a long way out and the local
+    absolute lifetime is 12 h, so only the recency bound can produce this deadline.
+    """
+    store = await MessageStore.open(":memory:")
+    try:
+        service = await _service(store, rsa_key)
+        now = time.time()
+        # Authenticated at the IdP most of the window ago: the remaining recency budget is far
+        # shorter than either the token's exp or the local absolute lifetime, so it must bind.
+        auth_time = now - (DEFAULT_MAX_AGE_SECONDS - 900)
+        _stub_exchange(
+            monkeypatch, _mint(rsa_key, _claims(exp=now + 30 * 86400, auth_time=auth_time))
+        )
+
+        out = await service.authenticate_oidc(
+            AUTH_CODE, _flow(), redirect_uri="https://ops.example/ui/oidc/callback"
+        )
+        assert out.ok and out.token is not None
+        session = await store.get_session(hash_token(out.token))
+        assert session is not None
+        assert session.expires_at == pytest.approx(auth_time + DEFAULT_MAX_AGE_SECONDS, abs=2)
+    finally:
+        await store.close()
+
+
+async def test_a_stale_idp_authentication_is_refused_at_login(
+    rsa_key: rsa.RSAPrivateKey, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """End to end through the service: a token whose authentication event predates the window is
+    refused with a closed-set reason and an audit row, not accepted with a short session."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service = await _service(store, rsa_key)
+        stale = time.time() - (DEFAULT_MAX_AGE_SECONDS + 600)
+        _stub_exchange(monkeypatch, _mint(rsa_key, _claims(auth_time=stale)))
+
+        out = await service.authenticate_oidc(
+            AUTH_CODE, _flow(), redirect_uri="https://ops.example/ui/oidc/callback"
+        )
+        assert not out.ok
+        assert out.token is None
+        assert out.reason == "auth_time_stale"
+        rows = await _audit_rows(store, "auth.login_failed")
+        assert any('"reason": "auth_time_stale"' in (r["detail"] or "") for r in rows)
+    finally:
+        await store.close()
+
+
+async def test_a_fresh_idp_authentication_still_logs_in(
+    rsa_key: rsa.RSAPrivateKey, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """NEGATIVE CONTROL for the refusal above, at the service layer: the same path with a fresh
+    `auth_time` must still mint a session. Without it the pair cannot distinguish a working recency
+    gate from a federated login leg that refuses everything."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service = await _service(store, rsa_key)
+        _stub_exchange(monkeypatch, _mint(rsa_key, _claims(auth_time=time.time() - 30)))
+
+        out = await service.authenticate_oidc(
+            AUTH_CODE, _flow(), redirect_uri="https://ops.example/ui/oidc/callback"
+        )
+        assert out.ok and out.token is not None
+    finally:
+        await store.close()
+
+
+async def test_the_authorization_request_asks_for_the_recency_window(
+    rsa_key: rsa.RSAPrivateKey,
+) -> None:
+    """The request half, measured where the engine actually builds it. Checking only the URL builder
+    would leave the one production caller free to pass a value that asks for nothing."""
+    import urllib.parse
+
+    store = await MessageStore.open(":memory:")
+    try:
+        service = await _service(store, rsa_key)
+        _flow_id, url = await service.begin_oidc_login(
+            client="10.0.0.1", public_origin="https://ops.example"
+        )
+        q = urllib.parse.parse_qs(urllib.parse.urlparse(url).query)
+        assert q["max_age"] == [str(DEFAULT_MAX_AGE_SECONDS)]
     finally:
         await store.close()
 

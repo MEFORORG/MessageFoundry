@@ -74,6 +74,11 @@ _RUNGS: tuple[tuple[str, str, frozenset[str]], ...] = (
     ("fed.replay.nonce", "nonce (browser flow binding)", frozenset({"nonce_mismatch"})),
     ("fed.replay.mfa", "amr / acr MFA gate", frozenset({"mfa_claim_missing"})),
     (
+        "fed.replay.recency",
+        "auth_time recency (max_age) gate",
+        frozenset({"auth_time_missing", "auth_time_stale", "auth_time_in_future"}),
+    ),
+    (
         "fed.replay.username",
         "username claim + UPN suffix allow-list",
         frozenset({"username_claim_missing", "username_domain_not_allowed"}),
@@ -98,6 +103,10 @@ def _disabled_row() -> CheckResult:
 def _config_rows(settings: ServiceSettings) -> list[CheckResult]:
     """Report the pinned posture. MANUAL, not PASS: the settings validators already refuse an
     unusable combination at load, so a PASS here would be a check that cannot fail."""
+    # Lazy, matching `_replay_rows` and `_secret_row`: `messagefoundry.auth.oidc` pulls in
+    # cryptography, and this section stays cheap for a run that never reaches federation.
+    from messagefoundry.auth.oidc import DEFAULT_MAX_AGE_SECONDS  # noqa: PLC0415
+
     auth = settings.auth
     rows = [
         CheckResult(
@@ -148,6 +157,22 @@ def _config_rows(settings: ServiceSettings) -> list[CheckResult]:
                 "no MFA assertion at all. This gives up the control BACKLOG #99(g) exists for",
             )
         )
+
+    # BACKLOG #1144 step 3. MANUAL for the same reason as the rows above: the window is fixed in the
+    # engine, so a PASS here would be a check that cannot fail. It is reported at all because without
+    # it an operator running `verify` with no captured token sees NOTHING about the recency control,
+    # and the number is exactly what they need to sanity-check against their IdP's own session policy.
+    rows.append(
+        CheckResult(
+            "fed.recency",
+            "IdP authentication recency (max_age)",
+            Status.MANUAL,
+            "the engine requests this max_age on every authorization request and REFUSES a token "
+            "whose auth_time is absent, stale or in the future. It bounds how long ago the human "
+            "authenticated at the IdP — it does not force a fresh credential prompt inside the window",
+            evidence=f"max_age={DEFAULT_MAX_AGE_SECONDS}s; skew={auth.oidc_clock_skew_seconds}s",
+        )
+    )
 
     # AC-11. Also MANUAL (the validator refuses an empty source when stripping), but the effective
     # list is exactly what an operator needs to eyeball: it is what stops a federated principal
@@ -267,7 +292,13 @@ def _replay_rows(
     settings: ServiceSettings, id_token_file: str, jwks_file: str, nonce: str | None
 ) -> list[CheckResult]:
     """Drive a captured ``id_token`` through the real ladder and report a verdict per rung."""
-    from messagefoundry.auth.oidc import ClaimsError, JwksCache, OidcClaimPolicy, validate_id_token
+    from messagefoundry.auth.oidc import (
+        DEFAULT_MAX_AGE_SECONDS,
+        ClaimsError,
+        JwksCache,
+        OidcClaimPolicy,
+        validate_id_token,
+    )
     from messagefoundry.config.models import SignatureAlgorithm
 
     rows: list[CheckResult] = []
@@ -301,6 +332,7 @@ def _replay_rows(
         mfa_amr_values=auth.oidc_mfa_amr_values,
         required_acr_values=auth.oidc_required_acr_values,
         clock_skew_seconds=auth.oidc_clock_skew_seconds,
+        max_age_seconds=DEFAULT_MAX_AGE_SECONDS,
     )
     # The cache's fetch is a closure over the supplied file — no socket, so this stays offline.
     cache = JwksCache(lambda: jwks_bytes)
@@ -342,6 +374,22 @@ def _replay_rows(
                         Status.SKIP,
                         "no --fed-nonce supplied — the browser flow binding cannot be verified "
                         "offline (it is exercised by the live lab cells)",
+                    )
+                )
+            elif failed_reason == "auth_time_stale":
+                # Same judgement as the `expired` arm below, for the same reason: a CAPTURE ages.
+                # The authentication event behind a token sitting in a file is by construction older
+                # every minute, so reporting FAIL here would indict the deployment for the age of the
+                # evidence. A MISSING or FUTURE auth_time is different and still FAILs -- neither is
+                # a function of how long ago the token was captured.
+                stopped_because = "the captured token's IdP authentication event is outside max_age"
+                rows.append(
+                    CheckResult(
+                        rid,
+                        title,
+                        Status.SKIP,
+                        "the captured id_token's auth_time is older than the requested max_age "
+                        "— re-capture to exercise this rung",
                     )
                 )
             elif failed_reason == "expired":

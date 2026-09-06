@@ -79,6 +79,9 @@ def _policy(nonce: str = "n-123", **over: Any) -> oidc.OidcClaimPolicy:
         # _good_claims() carries preferred_username "jdoe@corp.example"; stripping is fail-closed
         # without an allow-list, so the suffix has to be attested here.
         "allowed_username_domains": frozenset({"corp.example"}),
+        # The recency window (BACKLOG #1144 step 3). The policy field carries NO default, so every
+        # constructor states the window it asked the IdP for — see OidcClaimPolicy.max_age_seconds.
+        "max_age_seconds": oidc.DEFAULT_MAX_AGE_SECONDS,
     }
     base.update(over)
     return oidc.OidcClaimPolicy(**base)
@@ -95,6 +98,9 @@ def _good_claims(nonce: str = "n-123", **over: Any) -> dict[str, Any]:
         "nonce": nonce,
         "preferred_username": "jdoe@corp.example",
         "amr": ["pwd", "mfa"],
+        # REQUIRED of every id_token the engine accepts, because the engine always requests
+        # `max_age` (OIDC Core 2). A conforming IdP mints it; the fixture must too.
+        "auth_time": now,
     }
     base.update(over)
     return base
@@ -379,6 +385,138 @@ def test_acr_satisfies_the_mfa_gate(rsa_key: rsa.RSAPrivateKey) -> None:
     assert principal.acr == "phrh"
 
 
+# --- recentness: the auth_time half of the federated recency control (BACKLOG #1144 step 3) --------
+#
+# The request half lives in test_authorization_request_always_carries_max_age below. The two are one
+# control: requesting `max_age` without checking `auth_time` asserts a recentness that was never
+# established, and checking `auth_time` without requesting `max_age` refuses conforming IdPs, because
+# OIDC Core 2 makes the claim REQUIRED only when `max_age` was asked for.
+
+
+def test_a_fresh_auth_time_is_accepted_and_carried(rsa_key: rsa.RSAPrivateKey) -> None:
+    """NEGATIVE CONTROL for the three refusals below: a token whose authentication event is inside
+    the window must still log in. Without this the refusal tests cannot tell "refuses a stale
+    assertion" from "refuses everything", which is the failure mode a fail-closed rung invites.
+
+    It also pins the typed field: the caller caps the session from `principal.auth_time` and must
+    never re-parse the token to recover it (the second-read bug `expires_at` already forecloses)."""
+    jws = _mint(rsa_key, "k1", _good_claims(auth_time=1_000_000))
+    principal = oidc.validate_id_token(jws, _policy(), _cache_for(rsa_key), clock=lambda: 1_000_100)
+    assert principal.username == "jdoe"
+    assert principal.auth_time == 1_000_000
+
+
+def test_a_token_with_no_auth_time_is_refused(rsa_key: rsa.RSAPrivateKey) -> None:
+    """The engine ALWAYS requests `max_age`, so OIDC Core 2 makes `auth_time` REQUIRED in every
+    id_token it accepts. An absent claim means the IdP did not honour the request; proceeding would
+    record a recency the assertion never carried, which is the exact defect this rung closes."""
+    claims = _good_claims()
+    del claims["auth_time"]
+    with pytest.raises(claims_mod.ClaimsError) as exc:
+        oidc.validate_id_token(
+            _mint(rsa_key, "k1", claims), _policy(), _cache_for(rsa_key), clock=lambda: 1_000_100
+        )
+    assert exc.value.reason == "auth_time_missing"
+
+
+@pytest.mark.parametrize("bad", ["1000000", True, None, [1_000_000]])
+def test_a_non_numeric_auth_time_is_refused(rsa_key: rsa.RSAPrivateKey, bad: object) -> None:
+    """Same fault as absence: the IdP minted no usable authentication time. `True` is in the set
+    because `isinstance(True, int)` holds in Python, so a bool would otherwise be read as epoch 1."""
+    with pytest.raises(claims_mod.ClaimsError) as exc:
+        oidc.validate_id_token(
+            _mint(rsa_key, "k1", _good_claims(auth_time=bad)),
+            _policy(),
+            _cache_for(rsa_key),
+            clock=lambda: 1_000_100,
+        )
+    assert exc.value.reason == "auth_time_missing"
+
+
+def test_an_auth_time_older_than_the_window_is_refused(rsa_key: rsa.RSAPrivateKey) -> None:
+    """The whole point of the control. The token is otherwise perfect — signature, issuer, audience,
+    nonce, exp and the amr MFA gate all pass — and it is refused solely because the human's
+    authentication event at the IdP is older than the window the engine asked for.
+
+    The window is `max_age + clock_skew_seconds`, so this token is one second past 600 + 60."""
+    policy = _policy(max_age_seconds=600, clock_skew_seconds=60)
+    jws = _mint(rsa_key, "k1", _good_claims(auth_time=1_000_100 - 661))
+    with pytest.raises(claims_mod.ClaimsError) as exc:
+        oidc.validate_id_token(jws, policy, _cache_for(rsa_key), clock=lambda: 1_000_100)
+    assert exc.value.reason == "auth_time_stale"
+
+
+def test_an_auth_time_at_the_window_edge_is_accepted(rsa_key: rsa.RSAPrivateKey) -> None:
+    """Boundary control paired with the test above: exactly `max_age + skew` old still passes, so the
+    refusal is a real edge and not an off-by-one that rejects a whole window's worth of logins.
+
+    The skew grace is load-bearing here, not decoration. A provider honours `max_age` as measured at
+    the AUTHORIZE request while the ladder measures at the CALLBACK, so a strict comparison would
+    refuse a conforming provider for however long the browser redirect itself took."""
+    policy = _policy(max_age_seconds=600, clock_skew_seconds=60)
+    jws = _mint(rsa_key, "k1", _good_claims(auth_time=1_000_100 - 660))
+    principal = oidc.validate_id_token(jws, policy, _cache_for(rsa_key), clock=lambda: 1_000_100)
+    assert principal.auth_time == 1_000_100 - 660
+
+
+def test_an_auth_time_inside_the_skew_grace_is_accepted_but_clamped(
+    rsa_key: rsa.RSAPrivateKey,
+) -> None:
+    """Clock skew is real: an IdP whose clock runs a little fast mints an auth_time in our future.
+    Within `clock_skew_seconds` that is tolerated — the same grace `iat` already gets — but the value
+    is CLAMPED to our own clock before it is carried, so tolerance can never EXTEND a bound. The
+    caller derives the session deadline from this field, and an unclamped 30 s of skew would buy 30 s
+    of session the assertion did not justify."""
+    jws = _mint(rsa_key, "k1", _good_claims(auth_time=1_000_130))
+    principal = oidc.validate_id_token(
+        jws, _policy(clock_skew_seconds=60), _cache_for(rsa_key), clock=lambda: 1_000_100
+    )
+    assert principal.auth_time == 1_000_100
+
+
+def test_an_auth_time_beyond_the_skew_grace_is_refused(rsa_key: rsa.RSAPrivateKey) -> None:
+    """A future auth_time is the ONE shape that makes a stale authentication look fresh, and
+    clamping alone does not stop it: `now - min(auth_time, now)` is zero for any future value, so the
+    staleness test passes trivially. An IdP an hour fast would let an hour-old authentication satisfy
+    a five-minute window. Beyond the tolerated grace it is refused, mirroring the `iat` rung."""
+    jws = _mint(rsa_key, "k1", _good_claims(auth_time=1_000_161))
+    with pytest.raises(claims_mod.ClaimsError) as exc:
+        oidc.validate_id_token(
+            jws, _policy(clock_skew_seconds=60), _cache_for(rsa_key), clock=lambda: 1_000_100
+        )
+    assert exc.value.reason == "auth_time_in_future"
+
+
+@pytest.mark.parametrize(
+    ("over", "expected"),
+    [
+        ({"iss": "https://evil.example"}, "claim_iss"),
+        ({"aud": "someone-else"}, "claim_aud"),
+        ({"nonce": "not-the-flow-nonce"}, "nonce_mismatch"),
+        ({"amr": ["pwd"]}, "mfa_claim_missing"),
+    ],
+)
+def test_an_older_rung_still_owns_its_own_refusal(
+    rsa_key: rsa.RSAPrivateKey, over: dict[str, Any], expected: str
+) -> None:
+    """The new rung must NARROW nothing and STEAL nothing.
+
+    Every token here is ALSO wildly stale, so the recency rung would refuse it if it ran first. Each
+    must still be refused by the rung that owns the fault, with that rung's own slug. Two ways this
+    could go wrong and both are caught here: a recency check placed too early would report
+    `auth_time_stale` for a token from the wrong issuer (reading a datum out of a token the engine
+    has not agreed to trust, and telling the operator the wrong thing), and a recency check that
+    swallowed its neighbours would make the amr/acr gate unattributable.
+
+    The MFA case is the sharp one: `_check_mfa_gate` runs immediately before the recency rung, so it
+    is the neighbour a mis-ordered insertion would displace.
+    """
+    jws = _mint(rsa_key, "k1", _good_claims(auth_time=1, **over))
+    with pytest.raises(claims_mod.ClaimsError) as exc:
+        oidc.validate_id_token(jws, _policy(), _cache_for(rsa_key), clock=lambda: 1_000_100)
+    assert exc.value.reason == expected
+
+
 def test_every_reason_slug_is_declared() -> None:
     """The ClaimsError constructor refuses any reason outside the closed set."""
     with pytest.raises(AssertionError):
@@ -579,11 +717,57 @@ def test_authorization_url_carries_pkce_and_response_mode() -> None:
         nonce="no",
         code_challenge="ch",
         scopes=["openid", "profile"],
+        max_age_seconds=600,
     )
     q = urllib.parse.parse_qs(urllib.parse.urlparse(url).query)
     assert q["code_challenge_method"] == ["S256"]
     assert q["response_type"] == ["code"]
     assert q["scope"] == ["openid profile"]
+
+
+def test_authorization_request_always_carries_max_age() -> None:
+    """The request half of the recency control (BACKLOG #1144 step 3).
+
+    ``max_age_seconds`` is a REQUIRED keyword joining the FIXED parameter block, deliberately unlike
+    its optional neighbours ``acr_values`` and ``prompt``. Two reasons, and the second is the one that
+    makes it structural rather than stylistic:
+
+    * an optional recency request is one a caller can forget, and a forgotten one leaves the ladder
+      demanding ``auth_time`` from an IdP that was never asked for it — the halves would disagree;
+    * OIDC Core 2 makes ``auth_time`` REQUIRED **only** when ``max_age`` was requested, so "we always
+      asked" is what earns the ladder the right to refuse an absent claim. A required keyword makes
+      that a property of the signature instead of a convention every future caller must remember.
+    """
+    import urllib.parse
+
+    url = oidc.build_authorization_url(
+        authorization_endpoint="https://idp.example/authorize",
+        client_id="mefor-console",
+        redirect_uri="http://localhost:8765/ui/oidc/callback",
+        state="st",
+        nonce="no",
+        code_challenge="ch",
+        scopes=["openid"],
+        max_age_seconds=600,
+    )
+    q = urllib.parse.parse_qs(urllib.parse.urlparse(url).query)
+    assert q["max_age"] == ["600"]
+
+
+def test_the_authorization_url_builder_refuses_to_omit_max_age() -> None:
+    """The structural half of the test above: omitting the window is a TypeError, not a quiet URL
+    without a ``max_age``. This is what stops the request half regressing to the shape the item
+    names, where the engine asks for nothing and the validation rung has nothing to stand on."""
+    with pytest.raises(TypeError):
+        oidc.build_authorization_url(  # type: ignore[call-arg]
+            authorization_endpoint="https://idp.example/authorize",
+            client_id="mefor-console",
+            redirect_uri="http://localhost:8765/ui/oidc/callback",
+            state="st",
+            nonce="no",
+            code_challenge="ch",
+            scopes=["openid"],
+        )
 
 
 # --- exchange_code: hermetic (injected opener) -----------------------------------------------------

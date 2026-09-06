@@ -19,6 +19,7 @@ import pytest
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
 
+from messagefoundry.auth.oidc import DEFAULT_MAX_AGE_SECONDS
 from messagefoundry.config.models import SignatureAlgorithm
 from messagefoundry.config.settings import ServiceSettings
 from messagefoundry.transports.signing import CompactJwtSigner
@@ -68,6 +69,9 @@ def _mint(key: rsa.RSAPrivateKey, **over: Any) -> str:
         "nonce": NONCE,
         "preferred_username": "jdoe@corp.example",
         "amr": ["pwd", "mfa"],
+        # The engine always requests `max_age`, so OIDC Core 2 makes this REQUIRED in every
+        # id_token it accepts (BACKLOG #1144 step 3). A capture without one is a real defect.
+        "auth_time": now,
     }
     claims.update(over)
     pem = key.private_bytes(
@@ -193,11 +197,38 @@ def test_replay_all_rungs_pass_with_the_real_nonce(
         "fed.replay.claims",
         "fed.replay.nonce",
         "fed.replay.mfa",
+        "fed.replay.recency",
         "fed.replay.username",
     ):
         assert rows[rid].status is Status.PASS, rid
     assert rows["fed.replay.principal"].status is Status.MANUAL
     assert "jdoe" in rows["fed.replay.principal"].evidence
+
+
+def test_a_stale_capture_skips_the_recency_rung_rather_than_failing_it(
+    rsa_key: rsa.RSAPrivateKey, tmp_path: Path
+) -> None:
+    """A capture AGES. The IdP authentication event behind a token sitting in a file gets older every
+    minute, so FAIL here would indict the deployment for the age of the evidence: the same judgement
+    the ``expired`` arm already makes. The paired case above (an ABSENT auth_time) still FAILs, which
+    is what stops this SKIP from swallowing a real defect."""
+    tok = tmp_path / "t.jwt"
+    # `exp` far out so the token is NOT expired: only the recency rung can stop this walk, which is
+    # what makes the SKIP attributable to auth_time rather than to the earlier claims rung.
+    stale = time.time() - (DEFAULT_MAX_AGE_SECONDS + 3600)
+    tok.write_text(_mint(rsa_key, exp=time.time() + 30 * 86400, auth_time=stale), encoding="ascii")
+    jwks = tmp_path / "j.json"
+    jwks.write_bytes(_jwks_bytes(rsa_key))
+
+    rows = _by_id(
+        run_federation_checks(_settings(), id_token_file=str(tok), jwks_file=str(jwks), nonce=NONCE)
+    )
+    assert rows["fed.replay.claims"].status is Status.PASS
+    assert rows["fed.replay.mfa"].status is Status.PASS
+    assert rows["fed.replay.recency"].status is Status.SKIP
+    assert "re-capture" in rows["fed.replay.recency"].detail
+    # Unreached is not passing.
+    assert rows["fed.replay.username"].status is Status.SKIP
 
 
 def test_without_a_nonce_the_binding_rung_skips_and_later_rungs_are_not_claimed_passed(
@@ -233,6 +264,11 @@ def test_without_a_nonce_the_binding_rung_skips_and_later_rungs_are_not_claimed_
             "fed.replay.claims",
         ),
         ({"amr": ["pwd"]}, "fed.replay.mfa"),
+        # An IdP that mints no auth_time did not honour the `max_age` the engine sends on every
+        # authorization request. That is a DEPLOYMENT defect, not an aged capture, so it FAILs --
+        # contrast the stale case, which SKIPs (see the test below).
+        ({"auth_time": None}, "fed.replay.recency"),
+        ({"auth_time": time.time() + 86400}, "fed.replay.recency"),
         ({"preferred_username": "Administrator@attacker.example"}, "fed.replay.username"),
     ],
 )

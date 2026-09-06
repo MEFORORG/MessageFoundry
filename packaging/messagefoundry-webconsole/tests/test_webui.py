@@ -5542,6 +5542,10 @@ async def test_oidc_full_round_trip_lands_a_session_via_meta_refresh(
         params = dict(parse_qsl(urlsplit(start.headers["location"]).query))
         flow_id = c.cookies.get("mf_oidc_flow")
         assert flow_id
+        # The recency control's request half, seen on the wire a browser is actually redirected to
+        # (BACKLOG #1144 step 3). Asserting it HERE rather than only at the URL builder is what ties
+        # the request to the `auth_time` the callback below is required to carry.
+        assert int(params["max_age"]) == _oidc.DEFAULT_MAX_AGE_SECONDS
 
         pem = key.private_bytes(
             encoding=_ser.Encoding.PEM,
@@ -5559,6 +5563,10 @@ async def test_oidc_full_round_trip_lands_a_session_via_meta_refresh(
                 "nonce": params["nonce"],
                 "preferred_username": "jdoe@corp.example",
                 "amr": ["pwd", "mfa"],
+                # The engine sends `max_age` on the authorization request above, so OIDC Core 2
+                # makes this REQUIRED in the response (BACKLOG #1144 step 3). A conforming IdP
+                # mints it; without it the callback correctly refuses with `auth_time_missing`.
+                "auth_time": now,
             }
         )
         monkeypatch.setattr(_oidc, "exchange_code", lambda **kw: {"id_token": id_token})
@@ -5632,6 +5640,35 @@ def _managed_oidc_app(tmp_path: object, *, oidc_enabled: bool) -> object:
         serve_ui=True,
         public_origin="https://ops.example",
     )
+
+
+def test_every_mapped_oidc_reject_code_renders_a_message() -> None:
+    """A code in ``_REASON_TO_CODE`` with no entry in the login page's ``notes`` renders an EMPTY
+    banner: the user is bounced back to the sign-in form with no explanation and nothing logs a
+    problem. The two tables live in different modules, so nothing but this connects them.
+
+    RULE: mapping a new reject reason to a new code needs a login-page message in the same change.
+
+    It also re-pins the direction that matters more: every mapped SLUG must be one the claims ladder
+    can actually raise. A typo'd key here is a mapping that silently never fires, which looks exactly
+    like a code path nobody reaches.
+    """
+    from messagefoundry.auth.oidc import REASONS
+    from messagefoundry_webconsole.pages.account import login
+    from messagefoundry_webconsole.routes.oidc import _REASON_TO_CODE
+
+    # The service's own non-ladder reject reasons; the rest must come from the closed claims set.
+    service_reasons = {"state_unknown", "state_mismatch", "not_configured", "idp_unavailable"}
+    unknown = set(_REASON_TO_CODE) - REASONS - service_reasons
+    assert not unknown, f"mapped reasons that nothing can raise: {sorted(unknown)}"
+
+    # An unmapped code still renders a banner ELEMENT, just an empty one, so "a banner exists" is
+    # not the test. Compare against a sentinel: a mapped code must render something this does not.
+    blank = login("__no_such_error_code__")
+    for code in sorted(set(_REASON_TO_CODE.values()) | {"oidc_failed"}):
+        assert login(code) != blank, (
+            f"{code} renders an empty banner — it has no login-page message"
+        )
 
 
 def test_oidc_routes_register_on_the_production_serve_path(tmp_path: Path) -> None:

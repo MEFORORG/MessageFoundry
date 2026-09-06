@@ -14,6 +14,7 @@ from a token claim.
 from __future__ import annotations
 
 from messagefoundry.auth.oidc.claims import (
+    DEFAULT_MAX_AGE_SECONDS,
     REASONS,
     ClaimsError,
     FederatedPrincipal,
@@ -49,6 +50,7 @@ __all__ = [
     "DEFAULT_FLOW_TTL_SECONDS",
     "DEFAULT_JWKS_MIN_REFETCH_SECONDS",
     "DEFAULT_JWKS_TTL_SECONDS",
+    "DEFAULT_MAX_AGE_SECONDS",
     "REASONS",
     "ClaimsError",
     "FederatedPrincipal",

@@ -65,6 +65,14 @@ _REASON_TO_CODE = {
     "state_unknown": "flow_binding_missing",
     "state_mismatch": "flow_binding_missing",
     "mfa_claim_missing": "sso_mfa_required",
+    # BACKLOG #1144 step 3. ONLY the stale case gets its own code, and the split is by what the
+    # operator can do about it: a stale authentication event is fixable by signing in again (the
+    # provider re-prompts once the elapsed time exceeds the max_age the engine asked for), so saying
+    # so saves a support call. `auth_time_missing` and `auth_time_in_future` are IdP or clock defects
+    # that a retry cannot clear; they collapse to the generic `oidc_failed` because telling an
+    # operator to retry something that cannot succeed is worse than telling them nothing. The audit
+    # row carries the real slug either way.
+    "auth_time_stale": "sso_reauth_required",
 }
 
 

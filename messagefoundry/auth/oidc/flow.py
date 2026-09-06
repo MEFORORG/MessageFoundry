@@ -199,10 +199,28 @@ def build_authorization_url(
     nonce: str,
     code_challenge: str,
     scopes: Sequence[str],
+    max_age_seconds: int,
     acr_values: str | None = None,
     prompt: str | None = None,
 ) -> str:
-    """Build the front-channel authorization-code + PKCE (S256) redirect URL (``response_mode=query``)."""
+    """Build the front-channel authorization-code + PKCE (S256) redirect URL (``response_mode=query``).
+
+    ``max_age_seconds`` is REQUIRED and joins the FIXED parameter block, unlike the optional
+    ``acr_values`` and ``prompt`` beneath it (BACKLOG #1144 step 3). Two reasons:
+
+    * an optional recency request is one a caller can forget, and the claims ladder's right to refuse
+      an absent ``auth_time`` rests on the request having been made — OIDC Core 2 makes the claim
+      REQUIRED only when ``max_age`` was sent. A required keyword makes "we always asked" a property
+      of the signature rather than a convention;
+    * ``acr_values`` is the local precedent AGAINST the optional shape, not for it. It is requested
+      from a setting that ships empty, so the assurance class is asked for and nothing turns on the
+      answer — the ask-and-never-check pattern this parameter exists to avoid repeating.
+
+    Unlike ``prompt=login``, this does not force a credential prompt on every round trip: OIDC
+    Core's Authentication Request section obliges the provider to actively re-authenticate only IF
+    the elapsed time exceeds the value, so single sign-on is untouched for everyone inside the
+    window.
+    """
     params: dict[str, str] = {
         "response_type": "code",
         "response_mode": "query",
@@ -213,6 +231,7 @@ def build_authorization_url(
         "nonce": nonce,
         "code_challenge": code_challenge,
         "code_challenge_method": "S256",
+        "max_age": str(max_age_seconds),
     }
     if acr_values:
         params["acr_values"] = acr_values

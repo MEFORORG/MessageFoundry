@@ -970,6 +970,12 @@ class AuthService:
             mfa_amr_values=s.oidc_mfa_amr_values,
             required_acr_values=s.oidc_required_acr_values,
             clock_skew_seconds=s.oidc_clock_skew_seconds,
+            # The window the engine asked the IdP for, and therefore the one `auth_time` is judged
+            # against (BACKLOG #1144 step 3). It reads the SAME source as `begin_oidc_login`, so the
+            # request and the check can never diverge: a ladder enforcing a window the engine never
+            # requested would refuse conforming providers, since OIDC Core 2 makes `auth_time`
+            # REQUIRED only when `max_age` was sent.
+            max_age_seconds=oidc.DEFAULT_MAX_AGE_SECONDS,
         )
 
     def _exchange_and_validate(
@@ -1029,6 +1035,13 @@ class AuthService:
             nonce=flow.nonce,
             code_challenge=challenge,
             scopes=self._settings.oidc_scopes,
+            # Requested on EVERY authorization round trip, never conditionally (BACKLOG #1144 step
+            # 3). This is not `prompt=login`: OIDC Core's Authentication Request section obliges the
+            # provider to actively re-authenticate only IF the elapsed time exceeds the value, so SSO is
+            # untouched for everyone inside the window and only a genuinely stale authentication
+            # costs a credential prompt. The same constant feeds `_oidc_policy`, which is what
+            # earns the ladder its right to refuse an absent `auth_time`.
+            max_age_seconds=oidc.DEFAULT_MAX_AGE_SECONDS,
             acr_values=self._settings.oidc_acr_values,
             prompt=self._settings.oidc_prompt,
         )
@@ -1169,10 +1182,27 @@ class AuthService:
             max_expires_at = min(
                 max_expires_at, time.time() + self._settings.oidc_session_max_hours * 3600
             )
+        # The recency limb of the cap (BACKLOG #1144 step 3), and it is REQUIRED rather than belt-and-
+        # braces: `/ui/reauth` verifies a password and a local second factor on every branch and never
+        # returns to the IdP, so a login-time check alone would let the time since the IdP
+        # authentication event drift unbounded for the whole life of the session -- the interval the
+        # `max_age` request was sent to bound. Capping here makes the session die when the window the
+        # login stood on does. `auth_time` is already clamped to the validation clock by the ladder,
+        # so tolerated IdP clock lead can never push this deadline out.
+        max_expires_at = min(
+            max_expires_at, principal_claims.auth_time + oidc.DEFAULT_MAX_AGE_SECONDS
+        )
         if max_expires_at <= time.time():
             # The ladder accepts an exp up to clock_skew_seconds in the PAST, so a token inside the
             # grace window would otherwise mint an already-dead session: the user "logs in" and is
             # revoked on their first request, with no audited reason. Refuse loudly instead.
+            #
+            # The recency limb can land here the same way and for the same reason: `_check_recency`
+            # tolerates `max_age + clock_skew_seconds`, so `auth_time + max_age` may sit up to the
+            # skew behind now. Both cases audit as `expired`, which is accurate at THIS seam (the
+            # deadline really is past) but does not name which bound produced it. A genuinely stale
+            # authentication never reaches here at all -- the ladder refuses it as `auth_time_stale`
+            # -- so the ambiguity is confined to the grace window.
             await self._directory_reject_audit(username, "oidc", "expired")
             return LoginOutcome(ok=False, error="federated sign-in failed", reason="expired")
 
@@ -1196,6 +1226,10 @@ class AuthService:
                 "acr": principal_claims.acr,
                 "sub": principal_claims.subject,
                 "mfa_verified": mfa_verified,
+                # WHEN the IdP authenticated the human, not when it minted the token. The audit is
+                # where an operator answers "how old was the authentication this session stands on",
+                # and the claim is the only evidence for it (BACKLOG #1144 step 3).
+                "auth_time": principal_claims.auth_time,
             },
             max_expires_at=max_expires_at,
             federated_subject=(principal_claims.issuer, principal_claims.subject),

@@ -82,6 +82,10 @@ def login(
         "sso_mfa_required": (
             "Your identity provider did not confirm multi-factor authentication for this sign-in."
         ),
+        "sso_reauth_required": (
+            "Your identity provider signed you in from an older session — sign in again to "
+            "re-confirm your identity."
+        ),
     }
     banner = el("p", notes.get(error or "", ""), class_="banner") if error else Markup("")
     # NO PROVIDER SELECTOR. The directory simple-bind login pathway is retired (BACKLOG #1137,

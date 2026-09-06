@@ -5,7 +5,15 @@
 Given a compact ``id_token``, the pinned config, and a :class:`~messagefoundry.auth.oidc.jwks.JwksCache`,
 this verifies the signature (via ``transports.signing.verify_compact_jws``) and then walks the OIDC
 core claim checks — ``iss``, ``aud``/``azp``, ``exp``/``iat``/``nbf`` within a bounded skew, ``nonce``
-— and finally the optional MFA-claim gate (``amr``/``acr``), which is BACKLOG #99(g)'s real control.
+— then the optional MFA-claim gate (``amr``/``acr``), which is BACKLOG #99(g)'s real control, and
+finally the ``auth_time`` recency gate (BACKLOG #1144 step 3).
+
+Recency and the ``max_age`` parameter :func:`~messagefoundry.auth.oidc.flow.build_authorization_url`
+sends are ONE control split across two modules, and neither half is meaningful alone: requesting a
+maximum authentication age and never checking what comes back asserts a recentness that was never
+established, while checking ``auth_time`` without requesting ``max_age`` would refuse conforming
+providers, since OIDC Core 2 makes the claim REQUIRED only when it was asked for. That is why the
+request parameter is a required keyword and the policy field carries no default.
 
 Every rejection is a :class:`ClaimsError` carrying a **closed-set reason slug** (:data:`REASONS`) — the
 browser layer maps that slug to an allow-listed error code and audits it, never reflecting IdP text.
@@ -52,10 +60,33 @@ REASONS: frozenset[str] = frozenset(
         "issued_in_future",
         "nonce_mismatch",
         "mfa_claim_missing",
+        # The recency rung (BACKLOG #1144 step 3). THREE slugs, not one, because they indict three
+        # different parties: `missing` says the IdP did not honour a `max_age` OIDC Core 2 makes
+        # binding, `stale` says the human's authentication event is genuinely too old (the only one
+        # of the three that is normal operation), and `in_future` says a clock is materially wrong.
+        # Collapsing them would repeat the fault this module already fixed twice — see
+        # `_require_number` and `_verify_signature` on what one slug across two faults cost.
+        "auth_time_missing",
+        "auth_time_stale",
+        "auth_time_in_future",
         "username_claim_missing",
         "username_domain_not_allowed",
     }
 )
+
+#: The recency window the engine requests and enforces, in seconds — 12 hours.
+#:
+#: Matched to `[security].max_session_hours` (12), the engine's own absolute session ceiling: a
+#: federated login may not stand on an authentication event older than the longest session the engine
+#: would have kept from it anyway. Any larger value asserts a "recent" authentication the engine
+#: itself would already have timed out.
+#:
+#: It is a CONSTANT rather than an off switch. A setting that only chooses the WINDOW is legitimate
+#: operator tuning; a setting that could switch the CHECK off would let configuration buy a pass on
+#: the requirement, which is the trap BACKLOG #1144 names. When the `[auth].oidc_max_age_seconds`
+#: field lands, it replaces the two call-site references to this constant and nothing else — the
+#: ladder keeps validating unconditionally either way.
+DEFAULT_MAX_AGE_SECONDS: int = 43200
 
 
 class ClaimsError(ValueError):
@@ -76,6 +107,12 @@ class OidcClaimPolicy:
     client_id: str
     signing_algorithms: Sequence[SignatureAlgorithm]
     nonce: str
+    #: The `max_age` (seconds) that was sent on the authorization request, and therefore the window
+    #: `auth_time` is checked against. Carries **no default**, deliberately: the ladder's right to
+    #: refuse an absent `auth_time` rests entirely on the engine having asked for `max_age` (OIDC
+    #: Core 2 makes the claim REQUIRED only then), so every constructor must state the window it
+    #: asked for rather than inherit one. Mirrors the required keyword on `build_authorization_url`.
+    max_age_seconds: int
     username_claim: str = "preferred_username"
     username_strip_domain: bool = True
     #: Lower-cased UPN suffixes the username claim may carry when ``username_strip_domain`` is on.
@@ -110,6 +147,14 @@ class FederatedPrincipal:
     # a federated session can never outlive the assertion it was minted from. Carried as a typed field
     # precisely so no caller re-parses the raw token to recover it.
     expires_at: float
+    # The signature-verified ``auth_time`` (epoch seconds) — WHEN the IdP authenticated the human,
+    # which is a different question from when it minted the token (``iat``). BACKLOG #1144 step 3.
+    #
+    # Already CLAMPED to the validation-time clock, so it is never in the future: the rung tolerates
+    # up to ``clock_skew_seconds`` of IdP clock lead, and the caller derives a session deadline from
+    # this value, so an unclamped lead would let skew BUY session lifetime. Tolerance may excuse a
+    # value, never extend a bound.
+    auth_time: float
 
 
 #: The ``typ`` values an ``id_token`` may declare, after normalisation. RFC 7519 §5.1 makes the header
@@ -310,6 +355,59 @@ def _check_mfa_gate(
     return amr, acr_str
 
 
+def _check_recency(claims: Mapping[str, object], policy: OidcClaimPolicy, now: float) -> float:
+    """Enforce the federated recentness gate and return the verified ``auth_time``, clamped to ``now``.
+
+    BACKLOG #1144 step 3, and the half that turns a request into a control. The engine sends
+    ``max_age`` on every authorization request; OIDC Core 2 then makes ``auth_time`` REQUIRED in the
+    returned ``id_token``, and OIDC Core's Authentication Request section obliges the provider to
+    actively re-authenticate the
+    end user only IF the elapsed time exceeds that value. That conditional is why single sign-on
+    survives: everyone inside the window is redirected back silently, and only a genuinely stale
+    authentication costs a credential prompt.
+
+    Sending ``max_age`` and never reading ``auth_time`` would be strictly worse than sending nothing.
+    It reads as a recency control in the request, in the settings reference and in a review, while
+    accepting an authentication of any age — the shape this item was filed to close.
+
+    Three refusals, each its own slug:
+
+    * **absent or non-numeric** — the IdP did not honour a request it is required to honour. Silently
+      proceeding would assert a recentness that was never established, so it is a hard refusal rather
+      than a fallback. This is also why the request parameter is not optional: were it omissible, a
+      conforming IdP that legitimately omitted ``auth_time`` would be refused here.
+    * **older than the window, plus ``clock_skew_seconds``** — the ordinary case, and the one the
+      control exists for. The grace is the same one ``exp`` already gets at the core-claims rung, and
+      here it does two jobs: it absorbs an IdP clock running behind ours, and it absorbs the browser
+      round trip. A provider honours ``max_age`` as measured at the AUTHORIZE request, but the ladder
+      measures at the CALLBACK, so without the grace a conforming provider that answered a boundary
+      case exactly right would have its token refused for the time the redirect itself took.
+    * **further ahead than ``clock_skew_seconds``** — refused because clamping alone cannot contain
+      it. ``now - min(auth_time, now)`` is zero for ANY future value, so a provider whose clock ran an
+      hour fast would let an hour-old authentication satisfy a five-minute window. Inside the grace it
+      is tolerated and clamped, mirroring how ``iat`` is already handled at the core-claims rung.
+    """
+    raw = claims.get("auth_time")
+    if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+        # `bool` is excluded explicitly: `isinstance(True, int)` holds in Python, so a boolean claim
+        # would otherwise be read as epoch 1 and refused as `auth_time_stale` — a slug blaming the
+        # END USER for what is an IdP defect.
+        raise ClaimsError(
+            "auth_time_missing",
+            "id_token carries no numeric auth_time, though max_age was requested",
+        )
+    auth_time = float(raw)
+    skew = policy.clock_skew_seconds
+    if auth_time > now + skew:
+        raise ClaimsError("auth_time_in_future", "id_token auth_time is in the future")
+    if now - auth_time > policy.max_age_seconds + skew:
+        raise ClaimsError(
+            "auth_time_stale",
+            "the IdP authentication event is older than the requested max_age",
+        )
+    return min(auth_time, now)
+
+
 def _resolve_username(claims: Mapping[str, object], policy: OidcClaimPolicy) -> str:
     """Resolve the on-prem account name from the username claim.
 
@@ -357,13 +455,25 @@ def validate_id_token(
     :class:`ClaimsError` with a closed-set ``reason``.
 
     Order is deliberate: signature first (nothing downstream trusts an unverified claim), then the
-    core OIDC claims, then the MFA gate, then username resolution. ``clock`` is wall-clock ``time.time``
-    (token lifetimes are wall-clock, unlike the monotonic caches) and injectable for tests.
+    core OIDC claims, then the MFA gate, then recency, then username resolution. ``clock`` is
+    wall-clock ``time.time`` (token lifetimes are wall-clock, unlike the monotonic caches) and
+    injectable for tests.
+
+    Recency sits immediately after the MFA gate because the two answer the same kind of question — what
+    the IdP asserts about the authentication EVENT, strength then age — and because both must run after
+    ``_check_core_claims`` has pinned the issuer. A rung that read ``auth_time`` before the issuer was
+    matched would be reading a datum from a token the engine has not yet agreed to trust.
+
+    ``clock()`` is read ONCE and shared by the core-claims and recency rungs. Two reads would let
+    ``exp`` and ``auth_time`` be judged against different instants — small, but it is the kind of
+    inconsistency that makes a boundary test pass and a boundary login fail.
     """
+    now = clock()
     key, _alg = _select_key_and_alg(id_token, policy, jwks)
     claims = _verify_signature(id_token, key, policy)
-    expires_at, subject = _check_core_claims(claims, policy, clock())
+    expires_at, subject = _check_core_claims(claims, policy, now)
     amr, acr = _check_mfa_gate(claims, policy)
+    auth_time = _check_recency(claims, policy, now)
     username = _resolve_username(claims, policy)
 
     return FederatedPrincipal(
@@ -373,4 +483,5 @@ def validate_id_token(
         amr=amr,
         acr=acr,
         expires_at=expires_at,
+        auth_time=auth_time,
     )
