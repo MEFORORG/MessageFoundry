@@ -11224,9 +11224,28 @@ it measures the OPERATOR'S proxy. **What is newly true and nobody wrote down: #1
 a strict positive allowlist, verified by execution with a passing control. **What holds the cell short
 is that the same list does not govern the SHIPPED DEFAULT**, which is CPython's inherited 17 suites,
 of which exactly six are the CBC-SHA2 family that lives in Mozilla **Old** and never in Intermediate.
-**The interop justification for keeping them DOES NOT EXIST:** a tree-wide grep for the hospital-peer
-claim returns three hits, all inside `tls_policy.py` itself -- the docstring asserting it and the
-comment quoting it -- against a control of 93 `harden_cipher_suites` hits in the same run. Removal is
+**The interop justification for keeping them DOES NOT EXIST, and BOTH repositories agree.** In the
+ENGINE tree a grep for the hospital-peer claim returns three hits, all inside `tls_policy.py` itself
+-- the docstring asserting it and the comment quoting it -- against a control of 93
+`harden_cipher_suites` hits in the same run. **That measurement alone would prove nothing about the
+world**, because `docs/security/` is gitignored here, so it was checked against the VAULT as well.
+The vault's own `docs/security/ASVS-HONEST-PASS-RESEARCH-SALVAGED-2026-08-20.json`, reached
+independently from the 11.3.5 side, states that what `harden_cipher_suites` records as measured is
+the SUITE-SET DELTA of a candidate `set_ciphers` string, that the clause about real MLLP and DICOM
+peers still speaking those suites is an assertion about the world with no cited census anywhere in
+the engine tree or the vault, and therefore that *"there is no interop measurement to RE-run; the
+honest form is to RUN one for the first time."* **Two passes from different cells, neither aiming at
+the other, on the same defect.**
+**"OWNER-RATIFIED" IS SPECIFICALLY UNSUPPORTED, and this is worth pinning because the phrase is
+already spreading.** The 2026-08-10 gate lane escalated the retention to *"a measured, owner-ratified
+interop decision"*; the vault entry above searched both `OWNER-RULINGS-2026-08-17.md` and
+`ASVS-GATE-RULINGS-2026-08-10.md` with a positive control of 19 `ruling` hits in each and found no
+owner ruling on the six suites, concluding *"'owner-ratified' is unsupported as well"*. A comment
+asserting an owner ratification that no rulings document carries is a compensating control resting
+on a false premise, which the standards forbid by name. The honest wording is that the retention is a
+recorded IN-CODE decision whose interop premise is unmeasured, and that retiring the six is an owner
+call **because** nobody has run the census -- which tells the next reader both why not to act alone
+and what would settle it. Removal is
 one file: pass the approved list to `set_ciphers` inside `harden_cipher_suites` before the four
 assertions, and invert the comment that currently argues the allowlist must never touch an inherited
 context. The peers that would lose interop are TLS-1.2-only ones offering ONLY ECDHE/DHE CBC-SHA2 with
