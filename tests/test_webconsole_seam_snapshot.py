@@ -15,7 +15,10 @@ from __future__ import annotations
 
 import difflib
 import importlib.util
+import os
+import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -45,6 +48,26 @@ _FAILURE_HINT = (
 )
 
 
+# Pure ASCII, like _FAILURE_HINT above and for the same reason. Named separately because it teaches a
+# DIFFERENT repair: _FAILURE_HINT says the contract moved, this says the instrument is reading the
+# wrong tree, and offering the first for the second is what sends a reader to re-derive a gate that
+# was already right.
+_ANCHOR_HINT = """\
+scripts/webconsole_seam_snapshot.py must resolve `messagefoundry` from the repository it lives in,
+not from whatever sys.path offers (BACKLOG #1439). Keep the anchor near the top of it:
+
+    _REPO_ROOT = Path(__file__).resolve().parents[1]
+    sys.path.insert(0, str(_REPO_ROOT))
+
+ABOVE the `from messagefoundry...` imports. Python puts the SCRIPT's directory on sys.path[0], never
+the caller's cwd, so without it the import falls through to site-packages -- which in a worktree with
+no .venv of its own is the PRIMARY checkout's editable install, a different tree. Same rule as
+scripts/coord/alloc.ps1 (BACKLOG #1060) and the siblings under scripts/bench and scripts/tray.
+
+Do NOT repair this by setting PYTHONPATH at the call site: that fixes one caller and leaves the
+script wrong for every other one, including the by-hand run docs/WEBCONSOLE-PACKAGE.md prescribes."""
+
+
 def _build_snapshot() -> str:
     """Load the generator script by path (scripts/ is not an importable package) and run it."""
     spec = importlib.util.spec_from_file_location("_webconsole_seam_snapshot", _SCRIPT)
@@ -53,6 +76,17 @@ def _build_snapshot() -> str:
     spec.loader.exec_module(module)
     snapshot: str = module.build_snapshot()
     return snapshot
+
+
+def _build_digest() -> str:
+    """The digest as THIS process derives it, for comparison against a by-path subprocess run."""
+    spec = importlib.util.spec_from_file_location("_webconsole_seam_digest", _SCRIPT)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules["_webconsole_seam_digest"] = module
+    spec.loader.exec_module(module)
+    digest: str = module.contract_digest()
+    return digest
 
 
 def test_webconsole_seam_snapshot_matches_golden() -> None:
@@ -192,3 +226,72 @@ def test_the_digest_moves_when_a_rendered_dto_gains_a_field() -> None:
         models.UploadedFileList = original  # type: ignore[misc]
 
     assert module.contract_digest() == before  # and it restores exactly
+
+
+def _digest_by_path(env_extra: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
+    """Run the generator THE WAY A HUMAN RUNS IT: by path, as its own process.
+
+    ``cwd`` is deliberately NOT the repo root and ``PYTHONPATH`` is deliberately scrubbed. Both are
+    the rescues that hid BACKLOG #1439: under pytest the root is already on ``sys.path``, so the
+    in-process loads above cannot see the defect at all, and a subprocess that inherited either one
+    would pass for a reason that has nothing to do with the script.
+    """
+    env = dict(os.environ)
+    env.pop("PYTHONPATH", None)
+    env.update(env_extra or {})
+    return subprocess.run(
+        [sys.executable, str(_SCRIPT), "--digest"],
+        capture_output=True,
+        text=True,
+        cwd=tempfile.gettempdir(),
+        env=env,
+    )
+
+
+def test_the_script_run_by_path_computes_the_same_digest() -> None:
+    """The SCRIPT and the TEST must derive one value (BACKLOG #1439).
+
+    They are two instruments reading one contract, and they used to be able to disagree silently.
+    ``sys.path[0]`` is the SCRIPT's directory, never the caller's cwd, so ``scripts/`` led the path
+    and ``import messagefoundry`` fell through to site-packages -- in a worktree with no ``.venv``,
+    the primary checkout's, via its path-based editable install. Measured 2026-09-03: ``--write``
+    printed the primary tree's digest, rewrote both files with it and reported SUCCESS, while the
+    golden test kept failing against the worktree digest the script had never computed. Nothing was
+    louder than the word "rewrote", so the conclusion on offer was that this gate was broken.
+    """
+    result = _digest_by_path()
+    assert result.returncode == 0, f"the script failed to run by path:\n{result.stderr}"
+    assert result.stdout.strip() == _build_digest(), (
+        "the script and this test derive DIFFERENT digests, so they are reading different trees.\n"
+        f"  script (run by path): {result.stdout.strip()}\n"
+        f"  this test (in-process): {_build_digest()}\n"
+        f"{_ANCHOR_HINT}"
+    )
+
+
+def test_the_script_prefers_its_own_repo_over_an_earlier_path_entry() -> None:
+    """MADE TO FAIL ON PURPOSE. Delete the ``sys.path`` insert and this test reds.
+
+    The test above cannot carry that weight alone: on a hosted runner there is exactly ONE engine
+    tree, so an unanchored script finds the right one by luck and agrees with everything. This test
+    supplies the second tree itself -- a decoy ``messagefoundry`` package on ``PYTHONPATH``, which
+    for a by-path invocation sits AHEAD of site-packages and BEHIND an explicit ``sys.path.insert(0,
+    repo_root)``. So the decoy wins if and only if the anchor is gone, on any machine.
+
+    A test whose environment cannot produce the failure is not evidence that the failure is absent.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        decoy = Path(tmp) / "messagefoundry"
+        decoy.mkdir()
+        (decoy / "__init__.py").write_text(
+            'raise ImportError("DECOY engine tree: the script resolved messagefoundry from '
+            'PYTHONPATH instead of its own repository (BACKLOG #1439)")\n',
+            encoding="utf-8",
+        )
+        result = _digest_by_path({"PYTHONPATH": tmp})
+
+    assert result.returncode == 0, (
+        f"the decoy engine tree won: the script is no longer anchored to its own repository.\n"
+        f"{_ANCHOR_HINT}\n\n{result.stderr}"
+    )
+    assert result.stdout.strip() == _build_digest()

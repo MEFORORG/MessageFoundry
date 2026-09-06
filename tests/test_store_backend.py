@@ -79,6 +79,7 @@ def test_messagestore_satisfies_store_protocol() -> None:
         "set_password",
         "set_user_disabled",
         "update_user_profile",
+        "set_user_notify_email",
         "delete_user",
         "record_login_success",
         "record_login_failure",

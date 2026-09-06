@@ -456,6 +456,21 @@ Write-Host "result   : $totalCommits commits on $($where -join ' and ') exist on
 Write-Host ""
 Write-Host "Remedy, which buys durability without publication or review:"
 Write-Host "  git config mefor.durabilityRemote <private-remote>   # once, per repository"
-Write-Host "  git push --force <private-remote> <branch>:refs/tags/rescue/branch/<branch>"
+Write-Host "  pwsh -NoProfile -File scripts\coord\rescue.ps1 -Anchor <name>   # IN the checkout holding the work"
+Write-Host "  git push --force <private-remote> refs/tags/rescue/<name>"
 Write-Host "Verify the remote is private BEFORE nominating it:  gh repo view <owner>/<repo> --json visibility"
+# THE -Anchor STEP IS THE REMEDY, NOT DECORATION (BACKLOG #1349). This block used to print a bare
+# `git push --force <remote> <branch>:refs/tags/rescue/branch/<branch>`, so an operator who followed
+# the tool's own advice wrote a ref recording NOTHING about what it captured. That ref can then only
+# be graded against a branch that still exists -- which is precisely the population a rescue ref was
+# never needed for. Measured 2026-09-03 in this checkout: rescue.ps1 -Check examined 1671 refs and
+# returned UNVERIFIABLE for all 1671, every one of them written by a bare push like the one this
+# script was printing. -Anchor writes an annotated tag whose message carries the commit, the branch
+# and whether it was that branch's head at the instant of capture, and -Check reads that back after
+# the branch is gone.
+Write-Host ""
+Write-Host "-Anchor is what makes the ref readable LATER: it records the commit, the branch and"
+Write-Host "whether the capture was that branch's head. A bare push records none of that, and a"
+Write-Host "rescue ref is read once -- after the branch it names is already gone. Audit what you"
+Write-Host "have with:  pwsh -NoProfile -File scripts\coord\rescue.ps1 -Check"
 exit 1

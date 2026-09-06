@@ -51,15 +51,16 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 
+_ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(_ROOT))
+# The rollup vocabulary is GitHub's, not ours, and check_unread_prs.py reads the same array to answer
+# a different question. One module owns it so the two cannot drift — a conclusion string neither copy
+# classified would read as GREEN, which is the exact defect both scripts exist to catch.
+from scripts.ci._pr_checks import counts as _counts  # noqa: E402
+
 #: The merge state that means "head is behind base". GitHub computes this server-side; it is not
 #: derivable from the check rollup, which is why the rollup alone cannot see this defect.
 _BEHIND = "BEHIND"
-
-#: Conclusions that count as a failure. A stalled PR has NONE of these — that is the point.
-_FAILING = frozenset({"FAILURE", "TIMED_OUT", "CANCELLED", "ACTION_REQUIRED", "STARTUP_FAILURE"})
-
-#: Statuses that mean a check has not settled yet.
-_UNSETTLED = frozenset({"QUEUED", "IN_PROGRESS", "WAITING", "PENDING", "REQUESTED"})
 
 #: The fields this check needs. Kept beside the parser so the two cannot drift.
 PR_FIELDS = "number,title,state,mergeStateStatus,autoMergeRequest,statusCheckRollup,headRefName"
@@ -79,34 +80,6 @@ class Stall:
         # code page is cp1252, where a non-ASCII dash renders as a replacement char.
         flag = "ARMED -- auto-merge will never fire" if self.armed else "not armed"
         return f"#{self.number} [{self.branch}] {self.title[:60]} ({flag})"
-
-
-def _counts(rollup: object) -> tuple[int, int]:
-    """``(failing, unsettled)`` over a ``statusCheckRollup`` payload.
-
-    Tolerates both node shapes GitHub returns: CheckRun (``status``/``conclusion``) and StatusContext
-    (``state``). A node whose shape is unrecognised is counted as UNSETTLED rather than ignored —
-    "I could not classify this" must not read as "this is green", which is the failure mode this whole
-    script exists to catch.
-    """
-    if not isinstance(rollup, list):
-        return (0, 0)
-    failing = unsettled = 0
-    for node in rollup:
-        if not isinstance(node, dict):
-            unsettled += 1
-            continue
-        status = str(node.get("status") or "").upper()
-        conclusion = str(node.get("conclusion") or "").upper()
-        state = str(node.get("state") or "").upper()
-        verdict = conclusion or state
-        if status in _UNSETTLED or state in _UNSETTLED:
-            unsettled += 1
-        elif verdict in _FAILING:
-            failing += 1
-        elif not verdict and not status:
-            unsettled += 1
-    return (failing, unsettled)
 
 
 def scan(prs: list[dict[str, object]]) -> list[Stall]:

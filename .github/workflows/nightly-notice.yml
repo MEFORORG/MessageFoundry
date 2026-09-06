@@ -34,6 +34,12 @@ name: Nightly failure notice
 # The issue title is DERIVED from the completed workflow's name, so a green nightly CI cannot close an
 # issue opened by a red Security or DAST run: a single shared title would let one signal close
 # another, which is the same silence this workflow exists to end.
+#
+# THE `run:` BODY BELOW IS EXECUTED BY A TEST, VERBATIM, so edit it knowing that. The `if:` gate and
+# the whole script are driven under `bash -e` against a stubbed `gh` by tests/test_nightly_notice.py,
+# which asserts what each (workflow, conclusion) pair actually does -- including that a green CI run
+# leaves a red DAST run's issue alone. That harness runs the body UNCHANGED, which holds only while
+# every input arrives through `env:` and nothing here interpolates `${{ }}` into the script.
 on:
   workflow_run:
     workflows: ["CI", "Security", "DAST"]

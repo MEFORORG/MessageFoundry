@@ -174,9 +174,18 @@ def _audit_all_authz(app_state: object) -> bool:
     ``create_app`` always writes the attribute onto ``app.state``, and its own parameter defaults True,
     so every app built through the factory carries the shipped posture. The ``False`` fallback here
     covers only a hand-built ``app.state`` that never went through the factory — a test double or an
-    embedder assembling state by hand. It stays False deliberately: this helper cannot tell "the
-    embedder wants the narrow trail" from "the attribute was never set", and inventing a grant row for
-    an app whose auth wiring is unknown is not a safer guess than declining to."""
+    embedder assembling state by hand. It stays False to PRESERVE THE PRIOR BEHAVIOUR of those callers:
+    the narrow trail is what a hand-built state got before #1277, and nothing on such a state says its
+    author wanted anything else. Both sides are pinned in ``tests/test_auth_hardening.py`` — this
+    fallback for a hand-built state, and the wide shipped default through the factory.
+
+    THAT IS A COMPATIBILITY ARGUMENT, NOT A SECURITY ONE, and it is weaker than the reason this
+    docstring used to give. The old wording said a wider fallback would be "inventing a grant row for an
+    app whose auth wiring is unknown". It would not be: both call sites read this only AFTER
+    authorization has already succeeded — in :func:`require` the read sits below the permission loop,
+    and :func:`authorize_ws` has the same shape — so a row written here would record a grant that really
+    happened, and nothing would be invented. Revisit the argument rather than inherit it if this
+    fallback is ever touched (BACKLOG #1421, cost 3)."""
     return bool(getattr(app_state, "audit_all_authz", False))
 
 

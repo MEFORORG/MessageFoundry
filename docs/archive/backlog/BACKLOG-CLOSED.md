@@ -6786,6 +6786,131 @@ environments.py:79 `if not base_dir: return cwd`              <-- and base_dir i
 
 ---
 
+## 1069. Rule 3c matched the disarm key on the quote-blanked scan string, so a QUOTED key was invisible
+> ✅ **CLOSED 2026-09-04 -- the filed defect is fixed and RE-MEASURED at HEAD, and the multi-word
+> spelling stays OPEN BY DESIGN.** Nothing below is workable: the fix is present and working in the
+> shipped gate, the length-preserving mask was deliberately not built for the reason this row records,
+> and the residual is DECLINED rather than deferred. This is the archive pass the banner below asks for.
+>
+> **THE BLOB CITATION IN THE 2026-09-03 NOTE BELOW IS STALE, WHICH IS WHY THIS WAS RE-MEASURED RATHER
+> THAN INHERITED.** That note names blob `b194d0a0`. The repository copy of
+> [`scripts/hooks/worktree_gate.ps1`](../../../scripts/hooks/worktree_gate.ps1) at `a2eef0f3` is blob
+> `8d5c4d50`, because BACKLOG #1229's sixth round rewrote the SAME quoted-span scanner afterwards. A
+> reading taken before that rewrite no longer describes the shipped file.
+>
+> **THE 2026-08-27 DATE BELOW IS NEITHER CONFIRMED NOR REFUTED HERE, and the instrument that tried is
+> worth recording.** An agent checkout of this repository is SHALLOW -- 110 commits, oldest visible
+> `72bfddfad` (2026-08-31), which has NO parent. `git log -S` compares a commit against its parent, so
+> at a graft boundary it reports that commit as introducing every string present there: asked when the
+> bare-word unmask arrived, it named a docs-and-CI commit whose subject mentions neither this item nor
+> the gate. That is an artifact of the clone depth, not a finding, and it read exactly like one. The
+> fix predates the visible history; what is measured here is that it is PRESENT AND WORKING, never when
+> it landed.
+>
+> **The pair isolates this carve-out as the cause rather than asserting it.** The BEFORE arm is the file
+> at HEAD with the bare-word unmask condition inside `Remove-QuotedSpans` rewritten so its branch cannot
+> fire; the quoted-git-path branch and the blanked-pair emit stay byte for byte. The rewrite is ASSERTED
+> to have matched exactly once, so a control that silently changed nothing cannot pass as agreement. The
+> AFTER arm is the shipped file. No disarmed git command was executed -- the hook is driven with
+> constructed payloads against a throwaway governed repo.
+>
+> **THE UNQUOTED SPELLING DENIED IN BOTH ARMS, so every ALLOW here is a reading and not a dead probe.**
+> `git config core.hooksPath /dev/null` DENY before, DENY after (control). All five quoted spellings this
+> row lists: ALLOW before, DENY after. All three prose commit messages quoting the key: ALLOW before,
+> ALLOW after, so the false deny this fix must not admit is still not admitted. `git -c 'alias.ci=commit
+> --no-verify' ci -m x`: ALLOW before, ALLOW after, the class that is open by design.
+> [`tests/test_worktree_gate_quoted_key.py`](../../../tests/test_worktree_gate_quoted_key.py) is
+> 10 passed at the same commit.
+>
+> **WHAT REMAINS OPEN, AND CLOSING THIS ROW DOES NOT CLOSE IT.** A quoted span holding whitespace stays
+> masked, so `-c '<alias>=<multi-word command>'` is still invisible to rule 3c. That is the carve-out
+> working as designed: the discriminator IS whitespace, and reaching the multi-word value costs the prose
+> false-deny the rows above pin. It is held by `test_a_QUOTED_MULTI_WORD_alias_value_is_still_invisible`,
+> which asserts ALLOW deliberately. A DENY there is a BEHAVIOUR CHANGE to review, and the response is to
+> invert that test and this banner together, never to delete either.
+>
+> **The re-score below is SUPERSEDED and kept for history.** Its three grounds -- no length-preserving
+> mask, no bare-word unmask, and the pinned ALLOW test absent from `tests/` -- were read on 2026-08-20,
+> before the fix. The second and third are false at HEAD; the first is a design decision this row
+> records, not a gap. Its `worktree_gate.ps1` line anchors have drifted and are not repaired: read
+> `Remove-QuotedSpans` and `Get-ScannableSegments` by name.
+>
+> **A repository-copy reading still says nothing about the installed hook on any machine.** Archiving
+> does not change that; the 2026-09-03 note on it below stands as written.
+>
+> **THE QUOTED-KEY FAIL-OPEN IS FIXED 2026-08-27; the banner stays open for the archive pass, and the
+> multi-word spelling below REMAINS OPEN BY DESIGN.** `Remove-QuotedSpans` now UNMASKS a quoted span
+> holding a single BARE WORD -- no whitespace, quote, `$`, bracket, brace, semicolon, ampersand, pipe
+> or backtick. Prose keeps its spaces and stays masked; a config key has none and becomes visible.
+>
+> **Measured before and after, with the UNQUOTED spelling as a known-answer control** (it denied in
+> both arms, so an ALLOW below is a reading and not a dead probe): all five quoted spellings this row
+> lists ALLOWED before and DENY after; three prose commit messages quoting `core.hooksPath` ALLOW in
+> both arms, so the false-deny this item warns about was not admitted.
+>
+> **THE LENGTH-PRESERVING MASK THIS ROW PRESCRIBES WAS DELIBERATELY NOT BUILT, and the reason is a
+> measurement rather than a preference.** Its stated rationale is that *"length preservation is what
+> lets the same offsets read paths back out of the raw text afterwards"* -- and NO RULE DOES THAT.
+> Every path site re-runs `[regex]::Match($seg.Raw, ...)` and computes its offsets inside `Raw` from
+> scratch. Length-preserving masking would change what every OTHER rule sees, for zero benefit to the
+> defect being closed. **Widening scope beyond the defect is precisely how the earlier attempt at this
+> item acquired five new fail-opens**, which is the outcome this row's own DO-NOT-SHIP order records.
+>
+> The banked patch remains unshipped and untouched.
+>
+> **THE PIN EXISTS AND PASSES, so the re-score's "absent from tests/" clause below is SUPERSEDED, not
+> wrong when written.** That reading was taken 2026-08-20 and the fix landed 2026-08-27, after it.
+> Re-checked 2026-09-03: `test_a_QUOTED_MULTI_WORD_alias_value_is_still_invisible` lives in
+> [`tests/test_worktree_gate_quoted_key.py`](../../../tests/test_worktree_gate_quoted_key.py) and the file
+> is 10 passed. It asserts ALLOW deliberately, and its docstring says so: a DENY there is a BEHAVIOUR
+> CHANGE to review, and the response is to invert the test and this banner together, never to delete
+> either.
+>
+> **Re-verified 2026-09-03 on the REPOSITORY copy** of `scripts/hooks/worktree_gate.ps1`, blob
+> `b194d0a0`, by driving the hook with constructed payloads against a throwaway governed repo -- no
+> disarmed git command was ever run. The unquoted spelling is the KNOWN-ANSWER CONTROL and it DENIED,
+> so the ALLOW rows are readings rather than a dead probe: `git config core.hooksPath /dev/null` DENY
+> (control); `git config "core.hooksPath" /dev/null` DENY; `git -c "core.hooksPath=/dev/null" commit
+> -m x` DENY; `git commit -m "do not set core.hooksPath in a worktree"` ALLOW, so the false deny this
+> fix must not admit was not admitted; `git -c 'alias.ci=commit --no-verify' ci -m x` ALLOW, the class
+> that is open by design.
+>
+> **A repo-copy reading is a statement about the SOURCE, not about the live gate on this machine.**
+> The installed user-scope copy at `%USERPROFILE%\.claude\hooks\worktree_gate.ps1` is a DIFFERENT blob
+> (`cd37d320`), so it is not this file. Read-only, it does carry this item's bare-word unmask and names
+> `#1069`, so the two agree on THIS fix and differ somewhere else; nothing here measures where.
+
+> **Re-scored 2026-08-20 -> P2.** Value **7/10** · Difficulty **4/10** · _quick win_. Rule 3c still decides on $seg.Scan at worktree_gate.ps1:976-978 while Remove-QuotedSpans at :347-388 blanks every closed quoted span, so a quoted danger key is erased before the disarm regex runs; grep finds no length-preserving mask, no bare-word unmask, and the pinned ALLOW test the item names is absent from tests/. Value 7 because the fail-open needs no unusual spelling and disarms the ledger, claim and leak commit gates for every worktree at once with no compensating detection, but its blast radius is the developer harness rather than a deployment; difficulty 4 because the one written fix was rejected on verification after acquiring five new fail-opens, so the remainder is a scanner rewrite plus an adversarial test round. _(was 8/10 · 3/10.)_
+>
+> **Filed 2026-08-06 — a fix was WRITTEN and then REJECTED BY VERIFICATION, and ONE SPELLING OF THIS DEFECT REMAINS OPEN BY DESIGN. ⛔ DO NOT SHIP THE BANKED PATCH.** The round that closed this also introduced at least five new fail-opens; see #1061's banner. ⛔ The gate governing this machine is unchanged — still commit `a67838d2`, blob `3e7db362`.
+> Verdict: build
+> Closing-act: code
+
+**Cluster:** Session-drift controls / gate integrity. **Priority:** P1. **Severity:** a FAIL-OPEN on `core.hooksPath` needing no unusual spelling — quoting an argument is ordinary.
+
+**Mechanism.** Rule 3c matched the danger key against `$seg.Scan`, and `Get-ScannableSegments` BLANKS every quoted span before returning it. Quoting the key therefore erased it before the disarm list ever ran. Measured ALLOW on the committed gate, every one:
+
+```
+git -c "core.hooksPath=/dev/null" commit -m x
+git -c 'core.hooksPath=/dev/null' commit -m x
+git config "core.hooksPath" /dev/null
+git config 'core.hooksPath' '/dev/null'
+git config --add "core.hooksPath" /dev/null
+git -c 'alias.ci=commit --no-verify' ci -m x
+```
+
+**Why matching the RAW text instead is not the fix.** It creates a false deny with a shape this workstream writes constantly: a commit message quoting the rule's own name would refuse. The fix is a LENGTH-PRESERVING quote mask that unmasks only a quoted span holding a SINGLE BARE WORD — no whitespace, separators, quotes, parentheses or `$`. Prose has spaces and stays masked; a quoted key does not and is seen. Length preservation is what lets the same offsets read paths back out of the raw text afterwards. Seven prose controls stay green.
+
+**What is NOT closed, and it is the spelling that motivated the item.** A quoted span WITH whitespace stays masked, so `-c 'alias.<name>=<multi-word command>'` is still invisible — and because that value contains a space, quoting is its only writable spelling, so the whole class is open. Pinned as an ALLOW by `test_a_QUOTED_MULTI_WORD_alias_value_is_still_invisible` so a later change cannot close it silently or claim it was never there. Closing it wants a real argument tokeniser, and the one pass that built one acquired five fail-opens elsewhere in the process.
+
+**The consolation is measured, not assumed:** the bare command such an alias exists to smuggle — `git commit --no-verify`, `git commit -n` — is ALLOWED by the committed gate, by the rejected patch and by this fix alike, and `-c` persists nothing (scope `command`, in-memory). The marginal capability the open spelling grants is small. It is not zero.
+
+**Related:** #1066 (whose source note recorded this half and had no number to give it), #1065, #1061, #1072 (the other text shapes this rule cannot read), #1000.
+
+**Source:** found 2026-08-06 by the design pass for the third attempt at rule 3c, measuring what the committed gate's `Scan` string can and cannot see. None of the four earlier verification passes filed it.
+
+---
+
 ## 1073. Mine the free ASCQM 1.1 weakness catalogue against the existing gates; decline ISO 5055 as a measure
 
 > ✅ **SHIPPED 2026-08-07 — the pass ran over all 74 live elements; the measure stays declined.** Value **4/10** · Difficulty **3/10**. Findings filed as #1089, #1090, #1091, #1092 and the #1093 inventory. The decline marker now sits in [`../CLAUDE.md`](../../../CLAUDE.md) §12, which is the part that outlives this item — a decline recorded only here would vanish when this item archives, exactly as #26 and #27 would have. Original filing follows. ISO/IEC 5055:2021 defines four quality measures as **counts** of CWE-keyed severe weaknesses. The **measure** is declined for the reasons below and should not be re-litigated. The **catalogue** behind it is free, curated by a standards body, and contains a slice worth one bounded pass: the system-level weaknesses that a unit-level linter structurally cannot see.

@@ -9,6 +9,7 @@ import datetime
 import ssl
 from collections.abc import Awaitable, Callable
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import httpx
@@ -1620,3 +1621,113 @@ def test_the_minted_pair_builds_a_serving_context(tmp_path: Path) -> None:
     serving = api.model_copy(update={"tls_cert_file": cert, "tls_key_file": key})
     ctx = build_api_ssl_context(serving)
     assert ctx.minimum_version is ssl.TLSVersion.TLSv1_2
+
+
+# --- BACKLOG #1118 / ASVS 3.3.3: what always-serve-TLS did to the `__Host-` cookie prefix ---------
+
+
+def test_a_minted_pair_does_not_satisfy_the_off_loopback_exposure_gate(tmp_path: Path) -> None:
+    """THE TRAP, pinned. A generated certificate must never make `exposure_protected` true.
+
+    `tls_enabled` is literally `bool(tls_cert_file)` and `exposure_protected` is
+    `tls_enabled or (tls_terminated_upstream and trusted_proxies)`. So surfacing the minted pair
+    through `[api].tls_cert_file` would flip the off-loopback /ui refusal open on EVERY bind, and a
+    self-signed placeholder with no chain of trust would silently satisfy a gate written for an
+    operator chain. The serve path avoids it by copying the paths into a LOCAL `model_copy` that
+    uvicorn reads and no gate does; this test is what stops a later refactor from "simplifying" that
+    copy back into `settings.api`.
+    """
+    api = ApiSettings()
+    cert, key = ensure_api_tls_material(api, state_dir=tmp_path)
+    assert Path(cert).exists()  # it really did mint -- otherwise the assertions below are vacuous
+    assert not api.tls_enabled
+    assert not api.exposure_protected
+    # POSITIVE CONTROL: the same two properties DO flip for an operator-supplied chain, which is the
+    # posture the gate was written for. Without this arm the assertions above would also pass if
+    # `exposure_protected` were broken to a constant False.
+    operator = api.model_copy(update={"tls_cert_file": cert, "tls_key_file": key})
+    assert operator.tls_enabled and operator.exposure_protected
+
+
+def _cookie_names_for(scheme: str, *, exposure_protected: bool) -> tuple[str, str]:
+    """The two cookie names the /ui resolvers pick for a connection with this scheme + declaration."""
+    from messagefoundry_webconsole._auth import oidc_flow_cookie_name, session_cookie_name
+
+    conn: Any = SimpleNamespace(
+        app=SimpleNamespace(state=SimpleNamespace(exposure_protected=exposure_protected)),
+        url=SimpleNamespace(scheme=scheme),
+    )
+    return session_cookie_name(conn), oidc_flow_cookie_name(conn)
+
+
+def test_the_shipped_default_mints_tls_and_so_resolves_both_cookies_to_their_host_twins(
+    tmp_path: Path,
+) -> None:
+    """The #1118 premise measurement, made durable -- and JOINED to the thing it depends on.
+
+    The item was filed to research how to reach ASVS 3.3.3 without breaking a cleartext loopback
+    login. ADR 0172 removed the cleartext loopback bind, so the request scheme is https and the
+    cookie code that was already correct resolves both names to their `__Host-` twins with no edit
+    at all.
+
+    **This test used to hand `"https"` in as a literal, and its docstring claimed that a change
+    reintroducing a cleartext default would fail it. That was false** -- the body never touched the
+    serve path, so the claim named a guarantee the instrument did not provide (SDS-3.8: confirm the
+    instrument answers the question you asked, not one adjacent to it). It now DERIVES the scheme
+    from `ensure_api_tls_material`, which is the same predicate the serve path uses to decide
+    whether to hand uvicorn an `ssl_context_factory`. Remove the mint and this test goes red naming
+    the cookie consequence, which is what it always said it did.
+    """
+    api = ApiSettings()  # the shipped default: no operator chain, no declared proxy
+    material = ensure_api_tls_material(api, state_dir=tmp_path)
+    assert material is not None  # not vacuous: the default really does mint rather than opt out
+    assert Path(material[0]).exists()
+    # The serve path's own rule: material -> an ssl_context_factory -> the socket speaks https.
+    # `test_serve_loopback_without_a_certificate_now_mints_and_serves_tls` pins that half through
+    # `main`; this derives the scheme from the same predicate so the two halves cannot drift apart.
+    served_scheme = "https" if material is not None else "http"
+    assert _cookie_names_for(served_scheme, exposure_protected=api.exposure_protected) == (
+        "__Host-mf_session",
+        "__Host-mf_oidc_flow",
+    )
+
+    # POSITIVE CONTROL -- the pre-0172 default, and the reason an unconditional rename is wrong: a
+    # browser rejects a `__Host-` cookie that is not Secure, so over cleartext the bare name is the
+    # correct answer rather than a weaker one. It also proves the resolver is not a constant.
+    assert _cookie_names_for("http", exposure_protected=False) == ("mf_session", "mf_oidc_flow")
+
+
+def test_the_upstream_terminator_topology_keeps_the_host_prefix_without_minting(
+    tmp_path: Path,
+) -> None:
+    """The one topology ADR 0172 deliberately excludes still earns the prefix, and nothing else did.
+
+    `[api].tls_terminated_upstream` says a reverse proxy terminates TLS in front and speaks
+    plaintext to the engine, so `ensure_api_tls_material` mints NOTHING -- serving https underneath
+    that proxy would break the proxy's own hop. The wire scheme reaching the cookie code is
+    therefore `http`, which every scheme-keyed intuition reads as "bare name". The correct answer is
+    the prefixed one, because the BROWSER's origin is https, and `effective_https` gets there only
+    through its `exposure_protected` disjunct.
+
+    **That disjunct is a deletion magnet.** Once the default mints TLS it reads as redundant, and
+    dropping it would silently revert both cookies to their bare names on the single topology that
+    still reaches the app over cleartext -- with every scheme-keyed test in the suite staying green,
+    because they all run with `exposure_protected` false. #1117's
+    `test_session_clear_follows_exposure_protected_not_only_the_wire_scheme` builds this posture but
+    grades Secure and set/clear symmetry, never the NAME.
+    """
+    proxied = ApiSettings(tls_terminated_upstream=True, trusted_proxies=["10.0.0.7"])
+    assert ensure_api_tls_material(proxied, state_dir=tmp_path) is None  # the proxy hop is intact
+    assert not any(tmp_path.iterdir())  # and it really minted nothing, rather than minting quietly
+    assert proxied.exposure_protected  # the declaration, which is what carries the prefix here
+    assert _cookie_names_for("http", exposure_protected=proxied.exposure_protected) == (
+        "__Host-mf_session",
+        "__Host-mf_oidc_flow",
+    )
+
+    # WHY THE DECLARATION CANNOT BE HALF-PRESENT: validation refuses the proxy posture without
+    # `trusted_proxies`, so there is no startable topology that reaches the app over cleartext with
+    # `exposure_protected` false. Without this arm the assertion above would look like it depended
+    # on an operator remembering to set both keys.
+    with pytest.raises(ValidationError, match="requires .api..trusted_proxies"):
+        ApiSettings(tls_terminated_upstream=True)

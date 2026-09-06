@@ -873,8 +873,10 @@ class _FakeWS:
         # opens ws://, an https page wss:// — and store the session token under the SAME name a real
         # browser on that origin would hold: plain ``mf_session`` over cleartext (byte-identity), the
         # ``__Host-mf_session`` prefix over https (#192, ASVS 3.4.3), so the resolver reads it back.
+        # ``.url.path`` is read by the denial audit (the row records the path, never the full URL);
+        # /ws/stats is the console's only socket.
         scheme = "wss" if (origin or "").startswith("https") else "ws"
-        self.url = SimpleNamespace(scheme=scheme)
+        self.url = SimpleNamespace(scheme=scheme, path="/ws/stats")
         cookie_name = "__Host-mf_session" if scheme == "wss" else "mf_session"
         self.cookies = {cookie_name: cookie} if cookie is not None else {}
 
@@ -931,6 +933,68 @@ async def test_ws_cookie_auth_requires_cookie_and_origin(engine: Engine) -> None
     # A bad/expired cookie value → rejected.
     bad = _FakeWS(origin="http://t", host="t", cookie="not-a-real-token", app=app)
     assert (await authorize_ui_ws(bad, Permission.MONITORING_READ))[0] is None  # type: ignore[arg-type]
+
+
+async def test_ws_cookie_auth_permission_denial_is_audited(engine: Engine) -> None:
+    """BACKLOG #1197 (ASVS 16.3.2): a refused console WebSocket authorization writes a denial row.
+
+    This gate is a browser handshake's only credential path, and the engine's header-path fallback
+    cannot cover it — that path reads the token from the Authorization header only, and its Origin
+    check refuses every browser Origin against the shipped empty allowlist before its permission loop
+    runs. Nor does any setting reach it. Without the call inside the loop a deploying site would have
+    no record of the failed attempt anywhere, so pin it here.
+
+    The exact-equality assertion on ``detail`` is the second half of the test and is deliberate: the
+    row must carry the permission and the path and NOTHING else. Widening it to the full URL would put
+    an operator's query string — where a clinician's search terms live — into the hash chain.
+    """
+    from messagefoundry.auth import Permission
+    from messagefoundry_webconsole import authorize_ui_ws
+
+    service = await _service(engine)
+    await _add(service, "vw", Role.VIEWER)
+    app, token = await _token(engine, service, "vw")
+
+    async def _denials() -> list[dict[str, object]]:
+        return [
+            a for a in await engine.store.list_audit() if a["action"] == "auth.permission_denied"
+        ]
+
+    # Negative control: the sign-in above audits, but it audits nothing of this action.
+    assert await _denials() == []
+
+    # VIEWER holds monitoring:read but not config:deploy, so the permission loop is what refuses.
+    ws = _FakeWS(origin="http://t", host="t", cookie=token, app=app)
+    identity, tok = await authorize_ui_ws(ws, Permission.CONFIG_DEPLOY)  # type: ignore[arg-type]
+    assert identity is None and tok is None  # behaviour unchanged: the caller still falls through
+
+    rows = await _denials()
+    assert len(rows) == 1, "the refused handshake left no denial row"
+    assert rows[0]["actor"] == "vw"
+    assert json.loads(str(rows[0]["detail"])) == {
+        "permission": "config:deploy",
+        "path": "/ws/stats",
+    }
+
+
+async def test_ws_cookie_auth_grant_writes_no_denial_row(engine: Engine) -> None:
+    """The denial audit fires on the denial branch only — an authorized handshake stays quiet here.
+
+    BACKLOG #1197 keeps grant parity for the console OUT of scope (it is ruling- and measurement-gated
+    on audit volume), so this is also the guard against a later change quietly mirroring grants in.
+    """
+    from messagefoundry.auth import Permission
+    from messagefoundry_webconsole import authorize_ui_ws
+
+    service = await _service(engine)
+    await _add(service, "op", Role.OPERATOR)
+    app, token = await _token(engine, service, "op")
+    ws = _FakeWS(origin="http://t", host="t", cookie=token, app=app)
+    identity, _ = await authorize_ui_ws(ws, Permission.MONITORING_READ)  # type: ignore[arg-type]
+    assert identity is not None
+    actions = {a["action"] for a in await engine.store.list_audit()}
+    assert "auth.permission_denied" not in actions
+    assert "auth.permission_granted" not in actions
 
 
 def test_rows_table_marks_adjustable() -> None:
@@ -4208,6 +4272,10 @@ async def test_sso_cross_site_hygiene(engine: Engine, monkeypatch: pytest.Monkey
                 **_negotiate_headers(),
                 "Sec-Fetch-Mode": "navigate",
                 "Sec-Fetch-Site": "cross-site",
+                # A real browser sends this on a top-level navigation; #1122 made the middleware's
+                # destination check an allowlist, so omitting it here would 403 at the middleware
+                # and this test would stop exercising the SSO leg it is named for.
+                "Sec-Fetch-Dest": "document",
             },
         )
         assert r.status_code == 303 and r.headers["location"] == "/ui"
@@ -5372,7 +5440,15 @@ async def test_oidc_callback_survives_a_cross_site_navigation(engine: Engine) ->
     async with _oidc_client(engine, service) as c:
         r = await c.get(
             "/ui/oidc/callback?code=abc&state=xyz",
-            headers={"Sec-Fetch-Site": "cross-site", "Sec-Fetch-Mode": "navigate"},
+            headers={
+                "Sec-Fetch-Site": "cross-site",
+                "Sec-Fetch-Mode": "navigate",
+                # The IdP's redirect back IS a top-level navigation and carries this. #1122 made the
+                # middleware's destination check an allowlist; note it deliberately does NOT also
+                # demand Sec-Fetch-User, because this hop has none when the IdP session is already
+                # established.
+                "Sec-Fetch-Dest": "document",
+            },
             follow_redirects=False,
         )
         # Refused for the MISSING COOKIE, not for being cross-site (403 would mean the wrong gate).
@@ -5489,7 +5565,11 @@ async def test_oidc_full_round_trip_lands_a_session_via_meta_refresh(
 
         r = await c.get(
             "/ui/oidc/callback?code=authcode&state=" + quote(params["state"]),
-            headers={"Sec-Fetch-Site": "cross-site", "Sec-Fetch-Mode": "navigate"},
+            headers={
+                "Sec-Fetch-Site": "cross-site",
+                "Sec-Fetch-Mode": "navigate",
+                "Sec-Fetch-Dest": "document",  # what a browser sends; see #1122
+            },
             follow_redirects=False,
         )
         assert r.status_code == 200, r.text

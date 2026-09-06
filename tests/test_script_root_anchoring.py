@@ -239,7 +239,14 @@ def _run_claim(script_tree: Path, cwd: Path, *args: str) -> subprocess.Completed
 #: Not the whole line: it interpolates two absolute paths and PowerShell hard-wraps host output at the
 #: console width, so an equality assertion would fail on formatting rather than on behaviour. This
 #: fragment carries the instruction a reader has to act on and nothing that varies.
-_DIVERGENCE = "but this script lives in"
+#:
+#: REWORDED BY BACKLOG #1346, and the reword was forced rather than cosmetic. The note used to say "this
+#: script lives in <path>", which was true only while one value answered both *where the script is* and
+#: *who holds the claim*. ``-AsWorktree`` splits those, so the note now compares against the HOLDER and
+#: the old sentence would be false in exactly the case the flag exists for. The behaviour under test --
+#: that the note fires on a divergence and stays silent without one -- is unchanged; only the sentence
+#: naming which tree the claim landed against moved.
+_DIVERGENCE = "but this claim is recorded against"
 
 
 def test_the_divergence_note_FIRES_on_take_from_a_foreign_cwd(tmp_path: Path) -> None:

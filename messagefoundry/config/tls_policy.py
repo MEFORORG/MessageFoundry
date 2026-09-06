@@ -36,7 +36,7 @@ import os
 import ssl
 import time
 import urllib.request
-from collections.abc import Callable, Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
@@ -411,19 +411,20 @@ def validate_proxy_tls_posture(min_version: str | None, ciphers: str | None) -> 
 def validate_tls_ciphers(value: str, *, require_approved_suites: bool = True) -> str:
     """Validate an operator OpenSSL cipher string, rejecting non-forward-secret key exchange.
 
-    ``require_approved_suites`` gates the :data:`_APPROVED_TLS_SUITES` allow-list only; the three
+    ``require_approved_suites`` gates the :data:`_APPROVED_TLS_SUITES` allow-list only; the four
     property checks always run. Pass ``False`` where the string DESCRIBES A COMPONENT THE ENGINE DOES
     NOT OPERATE -- today that is ``[api].proxy_tls_ciphers``, which declares what an external
     TLS-terminating proxy speaks. A declaration and a configuration are different things: refusing an
     unlisted-but-sound suite there would not harden anything, it would stop an operator describing
     their proxy truthfully, and a gate that punishes accurate declarations gets fed inaccurate ones.
-    The properties still bind, because declaring a NULL or anonymous proxy floor is a real defect
-    whoever operates it.
+    The properties still bind, because declaring a NULL, anonymous or 64-bit proxy floor is a real
+    defect whoever operates it.
 
-    Returns ``value`` unchanged when it parses and every resolved TLS 1.2 suite uses (EC)DHE (TLS 1.3
-    suites are inherently ECDHE + AEAD). Raises ``ValueError`` — surfaced as a config-load error — for
-    an unparseable string or one that would admit a static-RSA/DH key exchange, closing the 11.6.2 gap
-    that a misconfigured ``tls_ciphers`` could widen the key exchange below policy."""
+    Returns ``value`` unchanged when it parses and every resolved suite is forward-secret, encrypting,
+    peer-authenticating and rated at :data:`_MIN_TLS_STRENGTH_BITS` or above. Raises ``ValueError`` —
+    surfaced as a config-load error — for an unparseable string or one failing any of those, closing
+    the 11.6.2 gap that a misconfigured ``tls_ciphers`` could widen the key exchange below policy and
+    the 11.2.3 gap that it could drop the negotiated strength below 128 bits."""
     probe = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     try:
         probe.set_ciphers(value)
@@ -451,6 +452,18 @@ def validate_tls_ciphers(value: str, *, require_approved_suites: bool = True) ->
             "tls_ciphers must resolve to suites that AUTHENTICATE THE PEER (ASVS 12.1.2); these are "
             f"anonymous key exchanges and are trivially intercepted: {', '.join(anonymous)}"
         )
+    # BACKLOG #1166. The fourth property, and the one the other three cannot see (_is_strong_enough
+    # explains why). Placed before the allow-list so the reason an operator gets is the strength, not
+    # a bare "not on the list" -- and OUTSIDE the require_approved_suites guard so it also binds on
+    # the proxy DECLARATION path, where the allow-list deliberately does not run and this is the only
+    # thing left to catch it.
+    weak = _weak_suite_labels(resolved)
+    if weak:
+        raise ValueError(
+            f"tls_ciphers must resolve only to suites of at least {_MIN_TLS_STRENGTH_BITS} bits of "
+            f"security (ASVS 11.2.3); these are rated below it: {', '.join(weak)}. A truncated "
+            "authentication tag weakens a suite whose cipher and key length look fine."
+        )
     if not require_approved_suites:
         return value
     # The allow-list is last so an operator hitting a specific property failure above gets the precise
@@ -473,9 +486,10 @@ def validate_tls_ciphers(value: str, *, require_approved_suites: bool = True) ->
 
 
 def harden_cipher_suites(ctx: ssl.SSLContext, *, connector: str) -> None:
-    """**Assert** that every suite ``ctx`` would negotiate is forward-secret, and raise if not.
+    """**Assert** that every suite ``ctx`` would negotiate is forward-secret, encrypting,
+    peer-authenticating and at least :data:`_MIN_TLS_STRENGTH_BITS` strong, and raise if not.
 
-    ASVS 12.1.2 / 11.6.2. ``validate_tls_ciphers`` already rejects a *configured* ``tls_ciphers`` /
+    ASVS 12.1.2 / 11.6.2 / 11.2.3. ``validate_tls_ciphers`` already rejects a *configured* ``tls_ciphers`` /
     ``proxy_tls_ciphers`` that admits static RSA/DH — but that validator only fires when an operator
     sets the knob. A context built without one **inherits the interpreter's default suite list and
     nothing checked it**, which is the real residual: inheritance without assertion, not (as the
@@ -525,6 +539,18 @@ def harden_cipher_suites(ctx: ssl.SSLContext, *, connector: str) -> None:
             f"{', '.join(anonymous)} (ASVS 12.1.2), which authenticate no peer and are trivially "
             f"intercepted."
         )
+    # BACKLOG #1166, ASVS 11.2.3. Same move again: an inherited property becomes a checked one. The
+    # shipped default resolves to 128 and 256 bits on every context shape this module builds, so this
+    # raises on no supported configuration today; it exists so a context that reaches here carrying a
+    # sub-floor suite is refused at construction instead of negotiated on the wire.
+    weak = _weak_suite_labels(resolved)
+    if weak:
+        raise ValueError(
+            f"{connector}: the TLS context would negotiate suite(s) below "
+            f"{_MIN_TLS_STRENGTH_BITS} bits of security (ASVS 11.2.3): {', '.join(weak)}. Forward "
+            f"secrecy, encryption and peer authentication all hold for these, so none of the checks "
+            f"above can see them."
+        )
 
 
 #: Suites an operator-configured ``tls_ciphers`` string may resolve to (BACKLOG #1317, ASVS 12.1.2).
@@ -570,6 +596,62 @@ def _is_encrypting(cipher: Mapping[str, object]) -> bool:
     BACKLOG #1317.
     """
     return "Enc=None" not in str(cipher.get("description", ""))
+
+
+#: The security strength, in bits, every negotiable suite must carry (ASVS 11.2.3, BACKLOG #1166).
+#:
+#: 128 is the standard's own number: *"all cryptographic primitives utilize a minimum of 128-bits of
+#: security based on the algorithm, key size, and CONFIGURATION"*. The configuration clause is what
+#: this gate reaches -- a truncated authentication tag weakens a suite whose cipher and key are fine.
+#:
+#: **This is NOT the floor in force on operator KEY MATERIAL, and the two must not be conflated.**
+#: The effective floor at the ``load_cert_chain`` sites is OpenSSL's security level, measured on
+#: CPython 3.14.6 / OpenSSL 3.5.7 as **2** on every context this module builds
+#: (``create_default_context()`` and both ``SSLContext`` shapes), i.e. roughly 112 bits, and
+#: ``SSLContext.security_level`` is READ-ONLY there (``AttributeError`` on assignment). Raising that
+#: is a separate, counterparty-facing decision and is deliberately not made here.
+_MIN_TLS_STRENGTH_BITS = 128
+
+
+def _is_strong_enough(cipher: Mapping[str, object]) -> bool:
+    """Whether OpenSSL rates the suite at or above :data:`_MIN_TLS_STRENGTH_BITS`.
+
+    **The property the three predicates above cannot see, and the one place it is explained.** Reads
+    ``strength_bits``, which is OpenSSL's own rating and is NOT ``alg_bits``: a ``*-CCM8`` suite can
+    report ``alg_bits`` 128 or 256 with ``strength_bits`` **64**, because an 8-octet authentication
+    tag caps the integrity strength whatever the cipher key is. Such a suite is forward-secret,
+    encrypting and peer-authenticating, so every earlier check passes it.
+
+    **WHICH suites this catches is a property of the linked OpenSSL, not of TLS, and the two builds
+    in CI disagree.** Measured at engine commit 3004b10e5: on Windows (CPython 3.14.6 / OpenSSL
+    3.5.7) all ten visible ``*-CCM8`` suites rate 64, and six of the 80 suites surviving the three
+    checks above sit below 128. On the ubuntu-latest runner the same
+    ``ECDHE-ECDSA-AES256-CCM8`` rates **256**, so the sub-floor population there is different and may
+    be empty. Do NOT restate either census as a fact about the product: this gate is a floor on
+    whatever the local OpenSSL reports, and the set it bites on varies. A first cut of the tests
+    asserted the Windows census and went red on ubuntu for exactly that reason.
+
+    It refuses nothing any supported configuration selects on either build -- every default context
+    shape resolves to 128 and 256 only, which is asserted rather than assumed.
+
+    Fails closed on a missing or non-integer rating. A cipher dict we cannot grade must not pass; a
+    predicate that shrugged would report success on precisely the shapes it was added to catch."""
+    bits = cipher.get("strength_bits")
+    return isinstance(bits, int) and bits >= _MIN_TLS_STRENGTH_BITS
+
+
+def _weak_suite_labels(resolved: Sequence[Mapping[str, object]]) -> list[str]:
+    """The sub-floor suites in ``resolved``, rendered ``name (N bits)`` for an operator message.
+
+    Shared by the two callers so the offender rendering has ONE home; the three sibling checks each
+    inline a one-line name collector, which this cannot be because it carries the rating too."""
+    return sorted(
+        {
+            f"{c.get('name', '?')} ({c.get('strength_bits', '?')} bits)"
+            for c in resolved
+            if not _is_strong_enough(c)
+        }
+    )
 
 
 def _is_peer_authenticated(cipher: Mapping[str, object]) -> bool:
@@ -1325,7 +1407,6 @@ def smtp_login_approved(
     password: str,
     *,
     channel_encrypted: bool,
-    escape_permitted: bool,
     cell: str,
 ) -> None:
     """Authenticate over SMTP with an approved hash, and ONLY over an encrypted channel.
@@ -1333,23 +1414,36 @@ def smtp_login_approved(
     TWO HALVES, NEITHER CORRECT ALONE. Restricting the mechanism removes the disallowed hash;
     requiring encryption is what stops that restriction putting a cleartext password on the wire.
 
-    ``escape_permitted`` is the caller's already-clamped
-    ``weakened_tls_escape_permitted`` answer, threaded in rather than read here because this module
-    must not import ``settings`` -- ``settings`` imports THIS one, so the reverse edge is circular.
-    That is the same explicit-posture threading the store hop and the other out-of-gate cells use, and
-    it is the SAME clamped escape governing the LDAPS bind, the MLLP/FTPS contexts, the SFTP host-key
-    acceptance and the webhook sink, so an enforcing-PHI hop is never relaxed by it.
+    **THE CLEARTEXT-AUTH REFUSAL IS ABSOLUTE, and that is the settled posture rather than an
+    omission.** This function shipped with an ``escape_permitted`` parameter documented as the
+    caller's already-clamped ``weakened_tls_escape_permitted`` answer, and the posture threading that
+    would have supplied it was never built: every one of the five shipped call sites passed a literal
+    ``False``, so the escape arm was reachable from the test suite alone. Threading the real posture
+    in would have been the WRONG completion, because all three SMTP cells refuse a
+    username beside ``use_tls=false`` at CONSTRUCTION *even with the escape set* -- the
+    ``refuse_cleartext_credentials`` posture (``transports/rest.py``), which is the shape this repo
+    uses for a CREDENTIAL rather than the escapable shape it uses for a payload hop (the webhook
+    sink, the LDAPS bind, the MLLP/FTPS contexts, the SFTP host-key acceptance). An escapable
+    send-time check behind an absolute construction-time gate is weaker than the gate it backs up,
+    which is how a backstop becomes a hole. So the parameter is gone rather than wired
+    (BACKLOG #1171; zero deployments, so the narrower signature costs nothing).
 
     ``smtplib.SMTP.login`` is deliberately NOT called: its preference order is internal and puts
     CRAM-MD5 first. ``auth()`` is driven directly against the server's advertised list instead.
     """
-    if not channel_encrypted and not escape_permitted:
+    if not channel_encrypted:
+        # NO ESCAPE IS NAMED HERE, deliberately. This text used to end "or set MEFOR_ALLOW_INSECURE_TLS
+        # for a non-PHI hop", which no shipped cell could honour: the construction gate refuses this
+        # combination with that variable set. An operator who followed it would weaken every OTHER hop
+        # on the instance and still be refused here -- remediation advice resting on a false premise.
         raise InsecureHopRefused(
             f"{cell}: refusing SMTP AUTH over an unencrypted channel. The approved mechanisms "
             f"({', '.join(APPROVED_SMTP_AUTH_MECHANISMS)}) SEND THE PASSWORD, so authenticating "
             "without TLS would put it on the wire in clear -- which is why the mechanism restriction "
-            "and this refusal ship together. Enable STARTTLS for this connection, or set "
-            "MEFOR_ALLOW_INSECURE_TLS for a non-PHI hop (BACKLOG #1171, ASVS 11.4.1)."
+            "and this refusal ship together. Enable STARTTLS for this connection, or drop the "
+            "username/password to send unauthenticated. There is no escape for this one: it is the "
+            "same absolute cleartext-credential refusal the connector applies at construction "
+            "(BACKLOG #1171, ASVS 11.4.1)."
         )
     smtp.ehlo_or_helo_if_needed()
     if not smtp.has_extn("auth"):

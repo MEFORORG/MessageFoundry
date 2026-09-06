@@ -184,6 +184,40 @@ acceptable / compensating controls* — the inverted-hardening-guide CISA prescr
   > value; the dedicated PHI-access audit path already records those. **The second §5 judgment below,
   > the PHI-vs-synthetic split, is untouched by this amendment.** If the volume proves too high, the
   > answer is a rate or sampling bound on read grants, not an off switch on the whole trail.
+  >
+  > **WHAT WAS ASKED, AND THE SEVEN OPTIONS THAT WERE NOT TAKEN.** An outcome plus a delegation is not
+  > a reviewable decision: a reader sees one result and no alternatives, which reads as inevitability.
+  > It was not. **Two questions went to the owner, four options each**, and both are set down here with
+  > the owner's answers quoted rather than paraphrased. Provenance: [comment 5515263760 on PR
+  > 749](https://github.com/MEFORORG/MessageFoundry/pull/749#issuecomment-5515263760), written
+  > 2026-09-02 by the Console that decided; this paragraph moves that record into the artifact a reader
+  > actually consults (BACKLOG [#1421](../BACKLOG.md), cost 4).
+  >
+  > **Question 1 — ratify the flip? Put to the owner before any Builder was spawned.** The four options
+  > offered: (a) ratify the flip; (b) keep the default false and correct only the refuted comment;
+  > (c) hold the row and screen a different backlog item; (d) ratify, with a volume measurement taken
+  > first. The owner answered, in their words: *"Do as you judge best."* That is a **delegation, not a
+  > ratification**, which is why every record of this flip says the Console decided and says the value
+  > was not owner-ratified.
+  >
+  > **The Console took (a).** Two of its three reasons are the *Why* and *What it buys* paragraphs
+  > above. The third is stated nowhere else: with zero deployments the cost of moving to the correct end
+  > state is zero today and rises with every adopter. It deliberately did **not** gate the flip on a
+  > volume threshold, on the grounds that a threshold nobody had measured would later read as a measured
+  > figure; it required the Builder to measure and report instead.
+  >
+  > **Question 2 — merge or hold, once two costs surfaced after the delegation?** Neither cost was known
+  > when the Console decided; the Builder found both during the build. They are that **nothing bounds
+  > `audit_log` growth** (`[retention].audit_days` is accepted at load and not enforced, and the Store
+  > protocol declares no audit purge), and that **the per-request cost is a standalone commit on the
+  > store write lock**, not merely a row, because audit is excluded by name from the
+  > [ADR 0055](0055-group-commit-durable-write.md) group committer. So a first deployment's `audit_log`
+  > would grow for the life of the instance, and each authenticated request on an affected route would
+  > contend with ingest for that lock. The Console held the PR, put both facts to the owner verbatim, and
+  > offered four options: (a) merge, then file the costs; (b) merge as-is; (c) hold, and file the costs
+  > first; (d) reverse the flip outright on the strength of the lock contention. The owner answered, in
+  > their words: *"Merge, then file the costs."* The costs are therefore tracked work rather than an
+  > oversight: they are filed as BACKLOG [#1421](../BACKLOG.md), which records them and picks no fix.
 - **Preserve the PHI-vs-synthetic split, made visible.** A synthetic/dev instance carries no ePHI, so the
   strict PHI-only gates (at-rest-encryption refusal, deny-by-default egress, bounded retention) staying
   relaxed there is defensible risk-based tailoring and preserves dev ergonomics — it is what the engine

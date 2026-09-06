@@ -260,6 +260,97 @@ def test_rotate_key_reencrypts_under_active_key(
     assert asyncio.run(read_with_b_only()) == 1  # readable under the new key alone
 
 
+def _seed_store_and_upload(db: Path, uploads: Path, key: str) -> str:
+    """Write one queued message and one uploaded file under ``key``; return the upload's file id.
+
+    The upload store is built on the STORE's own cipher instance, which is what `api/app.py` does
+    and what the ASVS 11.3.4 invocation bound requires — a second cipher over the same DEK charges
+    nothing to the key's persisted count.
+    """
+    import asyncio
+
+    from messagefoundry.store.crypto import make_cipher
+    from messagefoundry.store.store import MessageStore
+    from messagefoundry.uploads import UploadStore
+
+    async def run() -> str:
+        store = await MessageStore.open(db, cipher=make_cipher(key))
+        try:
+            await store.enqueue_message(channel_id="ch", raw=ADT_A01, deliveries=[("d", ADT_A01)])
+            meta = await UploadStore(uploads, store.cipher(), max_bytes=1 << 20).save(
+                data=ADT_A01.encode(), filename="partner.hl7", uploader="op", uploader_id="u-op"
+            )
+            return meta.file_id
+        finally:
+            await store.close()
+
+    return asyncio.run(run())
+
+
+def _rotate_env(
+    monkeypatch: pytest.MonkeyPatch, *, active: str, retired: str, uploads: Path
+) -> None:
+    monkeypatch.setenv("MEFOR_STORE_ENCRYPTION_KEY", active)
+    monkeypatch.setenv("MEFOR_STORE_ENCRYPTION_KEYS_RETIRED", retired)
+    monkeypatch.setenv("MEFOR_STORE_UPLOADS_DIR", str(uploads))
+
+
+def test_rotate_key_also_reseals_the_uploaded_file_store(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """BACKLOG #1169: uploaded files ride the SAME cipher, and rotation used to skip them entirely.
+
+    The store's columns were re-encrypted and every uploaded file was left under the retired key —
+    so the operator's documented next step, dropping that key, silently destroyed them. Rotate, then
+    read back with the new key ALONE, which is the assertion the store's own rotation test makes.
+    """
+    import asyncio
+
+    from messagefoundry.store.crypto import generate_key, make_cipher
+    from messagefoundry.store.store import MessageStore
+    from messagefoundry.uploads import UploadStore
+
+    monkeypatch.chdir(tmp_path)
+    db, uploads = tmp_path / "rot-uploads.db", tmp_path / "uploads"
+    key_a, key_b = generate_key(), generate_key()
+    file_id = _seed_store_and_upload(db, uploads, key_a)
+
+    _rotate_env(monkeypatch, active=key_b, retired=key_a, uploads=uploads)
+    assert main(["rotate-key", "--db", str(db)]) == 0
+    captured = capsys.readouterr()
+    assert "uploaded-file value(s) re-sealed" in captured.out
+    assert captured.err == ""  # nothing was skipped, so no retire-the-key warning
+
+    async def read_with_b_only() -> bytes:
+        store = await MessageStore.open(db, cipher=make_cipher(key_b))  # key A is gone
+        try:
+            return await UploadStore(uploads, store.cipher(), max_bytes=1 << 20).read_bytes(file_id)
+        finally:
+            await store.close()
+
+    assert asyncio.run(read_with_b_only()).decode() == ADT_A01
+
+
+def test_rotate_key_warns_when_an_uploaded_file_could_not_be_resealed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A skipped file is STILL under the prior key, so "OK" alone would mislead the operator into
+    dropping a key that is still load-bearing. The warning names that consequence."""
+    from messagefoundry.store.crypto import generate_key
+
+    monkeypatch.chdir(tmp_path)
+    db, uploads = tmp_path / "rot-skip.db", tmp_path / "uploads"
+    key_a, key_b = generate_key(), generate_key()
+    file_id = _seed_store_and_upload(db, uploads, key_a)
+    (uploads / f"{file_id}.blob").unlink()  # a half-deleted pair
+
+    _rotate_env(monkeypatch, active=key_b, retired=key_a, uploads=uploads)
+    assert main(["rotate-key", "--db", str(db)]) == 0
+    err = capsys.readouterr().err
+    assert "could not be read and were NOT re-sealed" in err
+    assert "MEFOR_STORE_ENCRYPTION_KEYS_RETIRED" in err
+
+
 def test_rotate_key_requires_a_key(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -1612,6 +1703,54 @@ def test_serve_ui_default_on_loopback_mounts_ui(
     )  # loopback secure-context signal threaded (http://127.0.0.1)
     # no /ui exposure-gate refusal on the loopback default
     assert "refusing to serve the browser ops dashboard" not in capsys.readouterr().err
+
+
+def _bare_loopback_serve(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> int:
+    """A bare loopback `serve` — the shipped default, with uvicorn and the app build stubbed out."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("MEFOR_STORE_ENCRYPTION_KEY", "x" * 44)
+    (tmp_path / "messagefoundry.toml").write_text(
+        "security.handles_real_patient_data = false\n", encoding="utf-8"
+    )
+    monkeypatch.setattr("messagefoundry.api.create_managed_app", lambda **kw: object())
+    monkeypatch.setattr("uvicorn.run", lambda *a, **k: None)
+    return main(["serve", "--config", str(SAMPLES_CONFIG), "--env", "dev"])
+
+
+def test_browser_hardening_opt_out_is_reported_at_start(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """BACKLOG #1118: setting the opt-out must SAY so at start, naming what reverts.
+
+    The predicate was read only from `_auth.py` and `_security.py`, both per-request, so an operator
+    who set this env — or inherited it from a service environment — got a quietly weaker console with
+    no signal anywhere. Since ADR 0172 made the engine always serve TLS this is the only remaining
+    way a default deployment loses the `__Host-` binding, which is what makes the silence worth
+    fixing. The message must name the env, the two unprefixed cookie names, and the fact that Secure
+    is not downgraded, because an operator who reads only "hardening off" cannot tell which of those
+    three things happened.
+    """
+    monkeypatch.setenv("MEFOR_WEBCONSOLE_DISABLE_BROWSER_HARDENING", "1")
+    assert _bare_loopback_serve(tmp_path, monkeypatch) == 0
+    err = capsys.readouterr().err
+    assert "MEFOR_WEBCONSOLE_DISABLE_BROWSER_HARDENING is set" in err
+    assert "mf_session / mf_oidc_flow" in err  # the names it reverts TO
+    assert "__Host-" in err  # what is lost
+    assert "Secure is still set over https" in err  # what is NOT lost
+
+
+def test_browser_hardening_default_reports_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Positive control for the arm above: on the shipped default the warning must be ABSENT.
+
+    Without this, a warning that fired unconditionally would pass the test above while telling every
+    operator their console is weakened. `delenv(raising=False)` because the arm keys on the env being
+    absent, and a leaked value from another test would make this pass for the wrong reason.
+    """
+    monkeypatch.delenv("MEFOR_WEBCONSOLE_DISABLE_BROWSER_HARDENING", raising=False)
+    assert _bare_loopback_serve(tmp_path, monkeypatch) == 0
+    assert "MEFOR_WEBCONSOLE_DISABLE_BROWSER_HARDENING" not in capsys.readouterr().err
 
 
 def test_serve_ui_explicit_offloopback_still_refuses(

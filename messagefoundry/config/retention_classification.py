@@ -16,10 +16,18 @@ passed in CI.) That single fact is what makes the two-way equality real rather t
 
 **What is deliberately NOT here.** `[retention].audit_days` is reserved and unenforced by design —
 there is no `purge_audit*` on the Store protocol, and the keep-forever rationale rests on the
-audit-retention requirement itself (see `docs/PHI.md` §8), not on chain-breakage. Tiers classified
+audit-retention requirement itself, not on chain-breakage. Tiers classified
 `UNBOUNDED — honest gap` in §2 are absent for the same reason: this tuple describes windows that
 EXIST, and inventing an entry for a tier nothing purges would be the false-coverage claim the whole
 column was built to prevent.
+
+**"Not on chain-breakage" is narrower than it used to read, and the narrowing is the point.** It
+rules chain-breakage out as the REASON `audit_days` is reserved; it does not rule the effect out.
+Measured 2026-09-03 (BACKLOG #1421): whether a delete breaks `verify_audit_chain` depends on WHICH
+rows go, and an oldest-first window — the shape an age bound would use — does break it. So an
+in-place age window is closed on its own terms, even though that is not why this key is reserved.
+The reasoning is stated in ONE place, the `audit_days` row in `docs/CONFIGURATION.md`; read it there
+rather than restating it here, because four copies of it are how the records drifted apart.
 """
 
 from __future__ import annotations

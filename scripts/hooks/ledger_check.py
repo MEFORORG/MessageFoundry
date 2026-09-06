@@ -242,6 +242,77 @@ class Ledger:
                 out.setdefault(m.group(1), f.rsplit("/", 1)[-1])
         return out
 
+    # -- merge parents -------------------------------------------------------------------------------
+    #
+    # A MERGE COMMIT ALLOCATES NOTHING. It carries forward numbers another branch already committed, and
+    # the ownership rule below is keyed on the worktree that ran the allocator -- so without this, a
+    # merge resolved by anyone other than the item's author is refused for carrying that author's number.
+    #
+    # MEASURED 2026-09-05. The Lander resolved a docs/BACKLOG.md tail conflict on PR 850 -- the routine
+    # kind, two branches appending different items -- verified it (zero deleted or changed lines against
+    # main, 158 added, byte-identical to the branch's own section) and could not commit it: `#1441 was
+    # not allocated to this worktree`. The gate then named the owning worktree and said to commit from
+    # there, which the WORKTREE gate refuses, because operating in another session's tree is what that
+    # one exists to stop. Two correct controls, and between them a duty the Lander playbook assigns
+    # ("docs/BACKLOG.md row conflicts -- Lander, locally") that could not be discharged from any seat.
+    #
+    # THIS OPENS NO HOLE, and the reason is that the grandfathered numbers are not asserted, they are
+    # READ OFF A COMMIT. To launder a number this way you would need a commit that already contains it,
+    # and producing one means passing this same gate on the worktree that allocated it. Editing the BODY
+    # of an item that already exists was never policed here either way -- the rule compares NUMBER SETS,
+    # `head - base`, so a merge cannot smuggle a subject past a check that never read subjects.
+    def _merge_parents(self) -> list[str]:
+        """EVERY parent of the merge commit being built, HEAD included; empty outside a merge.
+
+        ***HEAD IS A PARENT, AND LEAVING IT OUT MISSED THE CASE THIS WAS WRITTEN FOR.*** The first
+        version of this read only ``MERGE_HEAD``, which covers *their branch merged into mine* and
+        not *main merged into theirs* -- and the second is the shape a Lander actually resolves,
+        because the number then sits on HEAD rather than on MERGE_HEAD. Measured 2026-09-05, after
+        the first fix had already landed: a faithful reproduction of the PR 850 case was still
+        refused with ``#1441 was not allocated to this worktree``.
+
+        **The test that shipped with that version merged the sibling INTO main -- the easy direction
+        -- so it passed, and two mutations proved its arms disjoint from each other while both
+        exercised the wrong direction.** Disjointness is not coverage.
+
+        ``MERGE_HEAD`` is read as LINES, not via ``git rev-parse MERGE_HEAD``: an octopus merge
+        writes one sha per line and rev-parse would answer only the first, silently policing the
+        rest. CI never has a merge in progress -- there HEAD is already the merge commit -- so this
+        is empty there and the CI path is unchanged.
+        """
+        if self.ci:
+            return []
+        path = Path(git("rev-parse", "--path-format=absolute", "--git-path", "MERGE_HEAD").strip())
+        if not path.is_file():
+            return []
+        parents = [ln.strip() for ln in path.read_text(encoding="utf-8").splitlines() if ln.strip()]
+        if not parents:
+            return []
+        # HEAD only counts once a merge is confirmed in progress. Outside one it is the commit being
+        # built on, and folding it in unconditionally would stop policing an ordinary second commit
+        # that adds a number to a branch -- a real narrowing, and not this fix's business.
+        return [*parents, "HEAD"]
+
+    def _backlog_numbers_at(self, ref: str) -> set[str]:
+        """Every ``## N.`` number carried by ``ref``, across the live file and the archive.
+
+        Mirrors :meth:`backlog_paths` for an arbitrary commit rather than for base/head, and probes each
+        path's existence for the same reason that method does: a listed-but-absent path makes `git show`
+        exit 128, which :func:`git` correctly raises on and which would read here as a crash rather than
+        as "this ref has no archive".
+        """
+        paths = [BACKLOG_PATH] if _obj_exists(f"{ref}:{BACKLOG_PATH}") else []
+        listing = git("ls-tree", "-r", "--name-only", ref, f"{BACKLOG_ARCHIVE_DIR}/")
+        paths += [p for p in listing.split() if p.endswith(".md")]
+        out: set[str] = set()
+        for p in paths:
+            out |= set(BACKLOG_HEADING.findall(git("show", f"{ref}:{p}")))
+        return out
+
+    def _carried_by_a_merge_parent(self, path: str) -> bool:
+        """Does ``path`` already exist on a commit this merge is bringing in?"""
+        return any(_obj_exists(f"{parent}:{path}") for parent in self._merge_parents())
+
     # -- ownership -----------------------------------------------------------------------------------
     def owns(self, kind: str, number: str) -> bool:
         """Was this number allocated to THIS worktree by scripts/coord/alloc.ps1?
@@ -297,6 +368,49 @@ class Ledger:
     def fail(self, what: str, why: str, fix: str) -> None:
         self.failures.append(f"  BLOCKED: {what}\n  {why}\n\n  Do this:\n      {fix}\n")
 
+    def ownership_remedy(self, kind: str, number: str) -> str:
+        """What to actually DO about an ownership refusal -- RECOVER the number, or allocate a new one.
+
+        ***THE OLD TEXT NAMED ONLY THE ALLOCATOR, AND THAT IS WHAT BURNS NUMBERS.*** A refusal here is
+        usually the gate working correctly: the number belongs to a live session in another worktree,
+        or to this session's own other tree. Both are recoverable -- commit from the recorded worktree,
+        or check out the recorded branch -- and neither was ever mentioned. So a seat that hit a correct
+        refusal was steered into `alloc.ps1`, which issues a FRESH number, and the first one became a
+        permanent hole ("holes are free, collisions are not" makes that irreversible).
+
+        The cost is measurable rather than theoretical. `scripts/coord/alloc_strand_sweep.py --titles`
+        reports 19 titles on this clone holding more than one number, including BACKLOG #1297/#1298,
+        #1422/#1423 and #1425/#1426 -- each a number spent twice on one piece of work.
+
+        The gate already READ the claim to decide the refusal, so naming the owner costs nothing. The
+        recorded values are FOLDED through :func:`_safe_for_message` because they come out of a JSON
+        field and land in prose an agent then acts on -- the BACKLOG #1040 injection route, and a
+        remedy block is precisely what that defect forged.
+        """
+        allocate = f'pwsh -NoProfile -File scripts\\coord\\alloc.ps1 -Kind {kind} -Title "<title>"'
+        try:
+            claim = json.loads((self.alloc / kind / f"{number}.json").read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            # No record at all: nobody holds it, so allocating is the only move and the ONLY case
+            # where it is the right one.
+            return allocate
+        worktree = _safe_for_message(claim.get("worktree", ""))
+        branch = _safe_for_message(claim.get("branch", ""))
+        lines = ["this number is already allocated -- RECOVER it, do not allocate another:", ""]
+        if worktree:
+            lines.append(f"    1. commit from the worktree that holds it:  {worktree}")
+        if branch:
+            lines.append(f"    2. or check that branch out and commit there: {branch}")
+        lines += [
+            "       (git refuses a branch held by another worktree; from the worktree in 1 you can",
+            "        still reach it with: git checkout -b <alias> <branch>, then push <alias>:<branch>)",
+            "    3. ONLY if neither tree nor branch still exists, allocate a new number:",
+            f"       {allocate}",
+            "",
+            "    See docs/LEDGER-GATE.md, 'Recovering a number the gate has refused'.",
+        ]
+        return "\n      ".join(lines)
+
     # -- rules ---------------------------------------------------------------------------------------
     def check_adrs(self) -> None:
         base_adrs = self.base_adr_numbers()
@@ -330,12 +444,16 @@ class Ledger:
                         'pwsh -NoProfile -File scripts\\coord\\alloc.ps1 -Kind adr -Title "<title>"'
                         "   # then rename your file to the number it prints",
                     )
-            elif not self.ci and not self.owns("adr", number):
+            elif (
+                not self.ci
+                and not self.owns("adr", number)
+                and not self._carried_by_a_merge_parent(path)
+            ):
                 self.fail(
                     f"ADR {number} was not allocated to this worktree",
                     f"Nothing in {self.alloc / 'adr' / (number + '.json')} names {self.repo}. A sibling "
                     "session may be holding this number right now.",
-                    'pwsh -NoProfile -File scripts\\coord\\alloc.ps1 -Kind adr -Title "<title>"',
+                    self.ownership_remedy("adr", number),
                 )
 
             # Only ADDED files are checked for an index row: three legacy ADRs (0077/0079/0080) shipped
@@ -402,6 +520,10 @@ class Ledger:
         base: set[str] = set()
         for p in base_paths:
             base |= set(BACKLOG_HEADING.findall(self.base_text(p)))
+        # A merge allocates nothing: numbers the other parent already carries are not new here. See
+        # the MERGE PARENTS block above for why this is safe and what it cost when it was missing.
+        for parent in self._merge_parents():
+            base |= self._backlog_numbers_at(parent)
         # Only `head - base` is examined, so everything already on origin/main -- including the
         # pre-partition overlap -- is grandfathered by construction. No allowlist, nothing to maintain.
         for number in sorted(head - base, key=int):
@@ -424,7 +546,7 @@ class Ledger:
                     f"BACKLOG item #{number} was not allocated to this worktree",
                     "BACKLOG numbers are '## N.' headings inside ONE 6.7k-line file. Two sessions adding "
                     "#N land ~1,600 lines apart, merge CLEAN, and both ship (cf. 5b7d046 / #598).",
-                    'pwsh -NoProfile -File scripts\\coord\\alloc.ps1 -Kind backlog -Title "<title>"',
+                    self.ownership_remedy("backlog", number),
                 )
 
     def run(self) -> int:
