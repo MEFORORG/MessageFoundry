@@ -934,7 +934,7 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         if mfa_enrolled and not satisfied:
             code = form.get("code", "").strip()
             code_elevation = (
-                await auth.verify_mfa(token, code, client=client) if code else Elevation(ok=False)
+                await auth.verify_mfa(token, code, client=client) if code else Elevation()
             )
             if code_elevation.session_lost:
                 return login_redirect_response()  # session ended under a correct code
