@@ -24166,17 +24166,21 @@ Vault `roles/BUILDER.md:213-217`, under the heading "Closing a ledger row makes 
 
 I read only `roles/` in the vault and ran no git history there, so I cannot date when any of these lines was written. Eleven of the fourteen playbooks were matched by the needle above but not read, so treat the population as **at least three files**, not a total. I did not check whether any workflow or CI job reads a playbook, and I confirmed no case in which a seat actually followed `BUILDER.md:216` and produced a red PR -- I measured the instruction and the gate, not an incident.
 
-## 1466. a claim outlives its session when the worktree survives, so it is neither releasable nor forceable
+## 1466. nothing can tell whether a claim's holder is live, so every takeover is a judgment under uncertainty
 
-> 🔢 **Filed 2026-09-06 -- not started. Measured by the Lander while two packet sessions were blocked on it.** Value **5/10** · Difficulty **3/10** · _quick win_. `claim.ps1` releases only from the worktree that holds the claim, and `-Force` releases another worktree's claim on the recorded precedent that the holder's worktree is GONE. Neither reaches the common case: a session ends while its worktree survives. The claim then has no live holder AND no evidence of abandonment, so nobody can release it and the item is unclaimable by anyone else.
+> 🔢 **Filed 2026-09-06 -- not started. Measured by the Lander while two packet sessions were blocked, and CORRECTED the same day by a third that read the source.** Value **4/10** · Difficulty **3/10** · _quick win_. A session can end while its worktree survives. Its claims then have no live holder and no observable evidence of abandonment. `-Force` recovers them -- that is what it is for -- but the seat using it cannot distinguish an abandoned claim from a quiet one, and **74 of 76 live claims sit in exactly that ambiguity.**
 > Verdict: build
 > Research: none
 > Closing-act: code
 
-**Cluster:** coordination tooling / claim registry. **Priority:** P2. **Verdict:** build.
-**Severity:** no deployment axis (sec. 0). No engine behaviour, no shipped artifact, no PHI. The cost is built work that cannot open a pull request, and an item no other seat may take.
+**Cluster:** coordination tooling / claim registry. **Priority:** P3. **Verdict:** build.
+**Severity:** no deployment axis (sec. 0). No engine behaviour, no shipped artifact, no PHI. The cost is a seat guessing about another seat's liveness, and built work that waits on the guess.
 
-**THE GATE IS NOT MALFUNCTIONING AND MUST NOT BE "FIXED" BY WEAKENING IT.** `claim.ps1` states its own rule: *"Releasing is manual and claims do NOT expire: an abandoned claim is a stale note"*, and a transfer verb was considered and declined. A note reading `release on merge` is a human intention, not a machine condition -- notes are free text and nothing evaluates them. Every observed refusal in this item is the gate doing what it says.
+**THE FILED VERSION OF THIS ITEM WAS WRONG AND IS CORRECTED HERE RATHER THAN QUIETLY EDITED.** Its heading and first paragraph said such a claim is "neither releasable nor forceable" and that "nobody can release it". **That is false.** `claim.ps1:421` is the only enforcement -- `if (-not $info.IsMine -and -not $Force)` -- and **nothing anywhere tests whether the worktree exists**. `:253` records that `docs/WORKTREES.md` describes `-Release <key> -Force` as the ordinary by-hand remedy for exactly this case, and `:246` records that CLAUDE.md carries no prohibition on the switch.
+
+**How the error was made, because the shape recurs.** The script's header narrates a 2026-08-10 release performed "after establishing on evidence that the holder's worktree was gone", and calls that release CORRECT. **A described good instance was read as a required precondition.** Nothing in the code says the worktree must be gone; a well-judged example was mistaken for a gate. The correction came from a peer session that read the source before choosing, on its way to being archived.
+
+**WHAT SURVIVES THE CORRECTION, AND IT IS THE WHOLE SUBJECT.** `-Force` is available; what is missing is any basis for using it. The script is emphatic on the point in its own refusal path: it deliberately stopped recommending `-Force` unconditionally because that was "an instruction to guess, printed at exactly the moment" a seat is least able to check. **Quiet is not dead, and an occupied worktree cannot prove a session alive.** So the switch exists, the evidence for pulling it does not, and every takeover is a judgment nobody can ground.
 
 **MEASURED 2026-09-06 over the live registry, all 76 claim files parsed:**
 
@@ -24184,15 +24188,16 @@ I read only `roles/` in the vault and ran no git history there, so I cannot date
 |---|---|
 | claims held | **76** |
 | worktree still present | **74** |
-| worktree gone -- the precedent's precondition | **2** (`#1453`, `#1416`) |
+| worktree absent | **2** (`#1453`, `#1416`) |
 
-**So the registry is NOT full of abandoned claims, which is the reading the two blocked sessions reached and the one this item exists to refute.** Only two claims meet the force-release precondition, and neither is one anybody is waiting on.
+**That table measures worktree survival, which is what was counted. It does NOT measure releasability, which is what the filed version wrongly inferred from it.** The number is retained; the inference is withdrawn.
 
-**The two live instances, both of which FAIL the precondition:** `BACKLOG #1188`, held for PR 935 with the note `release on merge` -- PR 935 merged 2026-09-06T16:20:52Z, and the holding worktree still exists. `BACKLOG #1210`, whose holder mailed the release command itself and whose worktree also still exists. In both cases the holder is gone in every sense that matters and present in the only sense the gate can see.
+**Two live instances that day.** `BACKLOG #1188`, held for PR 935 with the note `release on merge` -- PR 935 merged 2026-09-06T16:20:52Z and the holding worktree still existed. `BACKLOG #1210`, whose holder mailed the release command itself, likewise. Both were recoverable by `-Force` throughout; what neither the holder nor the Lander could establish was whether the holding session was still alive.
 
-**Why the path key cannot answer this, stated so nobody re-derives it.** `ledger_check.owns()` records why the path is keyed and why `BACKLOG #1282` added the branch as a second key: *"THE PATH IS MORTAL AND THE BRANCH IS NOT"*, because a worktree removed outside `scripts/worktree/remove.ps1` leaves a number uncommittable by anyone. That fix addressed the path VANISHING. This item is the opposite failure -- the path SURVIVING its session -- and the same reasoning does not reach it.
+**A THIRD CASE THE SAME DAY SHOWS THE CHEAP FIX ALREADY WORKS.** A session about to be archived was asked whether it would strand eight claims. It released all eight itself, in seconds, and explained why it declined to remove its worktree instead: doing so to satisfy a precondition that does not exist would have been risk for nothing. **A holder that releases on its way out costs nothing and removes the ambiguity entirely.** The gap is that nothing asks it to.
 
-**What a fix must preserve.** The exclusivity argument: git refuses to check one branch out in two worktrees, so "the session on this branch" is single-valued. Any liveness signal added here must not become a way for one seat to take a number another seat is using, which is the hole the declined transfer verb would have opened.
+**Why the path key cannot answer this.** `ledger_check.owns()` records why `BACKLOG #1282` added the branch as a second key: *"THE PATH IS MORTAL AND THE BRANCH IS NOT"*, because a worktree removed outside `scripts/worktree/remove.ps1` leaves a number uncommittable. That fix addressed the path VANISHING. This is the opposite failure -- the path SURVIVING its session -- and the same reasoning does not reach it.
 
-**Shapes worth considering, none of them chosen here:** a heartbeat the holder refreshes, so staleness becomes observable rather than inferred (`refreshed` is already recorded and already stale on both instances); a release that a MERGED pull request can satisfy, since both instances name a PR and one has merged; or a `-Force` precondition widened past worktree-existence to something that can distinguish a live session from a live directory. Each has a different failure mode and this item does not pick one.
+**What a fix must preserve.** Git refuses to check one branch out in two worktrees, so "the session on this branch" is single-valued. Any liveness signal must not become a way for one seat to take a number another seat is actively using, which is the hole the declined transfer verb would have opened.
 
+**Shapes worth considering, none chosen here:** a heartbeat the holder refreshes, so staleness is observable rather than inferred -- `refreshed` is already recorded and was already stale on both instances; a release a MERGED pull request can satisfy, since both instances named a PR and one had merged; or a prompt at session end asking a holder to release, which is what the third case did by hand.
