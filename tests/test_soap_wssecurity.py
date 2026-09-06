@@ -188,24 +188,38 @@ async def test_password_text_default(monkeypatch: pytest.MonkeyPatch) -> None:
     assert "wsse:Nonce" not in env  # PasswordText carries no Nonce/Created in the token
 
 
-async def test_password_digest_computed_in_send(monkeypatch: pytest.MonkeyPatch) -> None:
-    dest = _dest(
-        soap_version="1.2",
-        ws_security=True,
-        ws_username="u",
-        ws_password="secret",
-        ws_password_type="digest",
-    )
+def test_password_digest_is_retired() -> None:
+    """BACKLOG #1171 (ASVS 11.4.1). PasswordDigest is Base64(SHA1(Nonce + Created + Password)) by
+    profile definition, so the option could not be moved to an approved hash without leaving the
+    profile. It is refused at construction rather than ignored, because a silently-dropped setting
+    would leave an operator believing they had selected something."""
+    with pytest.raises(ValueError, match="retired"):
+        _dest(
+            soap_version="1.2",
+            ws_security=True,
+            ws_username="u",
+            ws_password="secret",
+            ws_password_type="digest",
+        )
+
+
+async def test_no_username_token_carries_a_sha1_digest(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The POSITIVE CONTROL for the retirement: the only reachable token shape is PasswordText, and
+    it carries none of the PasswordDigest apparatus. Without this, the refusal test above would pass
+    just as well against a build that still emitted a digest by some other route."""
+    dest = _dest(soap_version="1.2", ws_security=True, ws_username="u", ws_password="secret")
     monkeypatch.setattr(dest, "_now_fn", lambda: 1_700_000_000.0)
-    monkeypatch.setattr(dest, "_nonce_fn", lambda: b"\x01" * 16)
     env = await _send_capture(dest, "<op/>")
+    assert "#PasswordText" in env
+    assert "#PasswordDigest" not in env
+    assert "wsse:Nonce" not in env
+    # The digest a pre-#1171 build would have produced for these exact inputs, recomputed here so
+    # its absence is measured rather than assumed.
     created = soap_mod._iso(1_700_000_000.0)
-    expected = base64.b64encode(
+    legacy = base64.b64encode(
         hashlib.sha1(b"\x01" * 16 + created.encode() + b"secret").digest()  # noqa: S324
     ).decode("ascii")
-    assert "#PasswordDigest" in env
-    assert expected in env
-    assert base64.b64encode(b"\x01" * 16).decode("ascii") in env  # the Nonce
+    assert legacy not in env
 
 
 async def test_stamped_values_are_xml_escaped(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -337,3 +351,12 @@ def test_factory_client_cert_verify_tls_false() -> None:
 def test_factory_bad_password_type() -> None:
     with pytest.raises(WiringError, match="ws_password_type"):
         build_outbound_connection("OB", Soap(url=URL, soap_version="1.2", ws_password_type="md5"))
+
+
+def test_factory_refuses_the_retired_digest_by_name() -> None:
+    # A distinct arm from the unknown-value one above: 'digest' was legal until BACKLOG #1171, so it
+    # gets a refusal naming the retirement and its reason, not "unrecognised value".
+    with pytest.raises(WiringError, match="retired"):
+        build_outbound_connection(
+            "OB", Soap(url=URL, soap_version="1.2", ws_password_type="digest")
+        )
