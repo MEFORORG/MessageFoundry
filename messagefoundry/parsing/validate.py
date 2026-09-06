@@ -41,11 +41,22 @@ class ValidationResult:
         return self.ok
 
 
+# There is deliberately NO ``profile`` parameter here, and a new one must not be added until
+# something reads it. One sat in this signature until 2026-09-06, typed ``object | None`` and
+# documented as "reserved for a conformance-profile object (Phase 2+); passing one today is
+# accepted but not yet enforced" -- accepted by every call and read by none. That is a
+# control-shaped parameter that is not a control: a Handler author who passed a conformance
+# profile would reasonably believe conformance was being checked, and nothing at runtime would
+# have told them otherwise. ``object | None`` accepts anything, so strict mypy could not warn
+# them either. Measured across the tree on 2026-09-06: ZERO call sites passed it, against a
+# positive control of 13 sites passing the sibling ``expected_version=``, so deleting it broke
+# no caller. The roadmap commitment is not lost -- a persisted message-definition model plus a
+# conformance validator is BACKLOG #78, demand-gated -- and when that lands it should add a
+# TYPED parameter rather than restore an untyped placeholder.
 def validate(
     raw: str | bytes,
     *,
     expected_version: str | None = None,
-    profile: object | None = None,
     max_bytes: int | None = DEFAULT_MAX_MESSAGE_BYTES,
     max_segments: int | None = DEFAULT_MAX_SEGMENTS,
 ) -> ValidationResult:
@@ -53,9 +64,8 @@ def validate(
 
     ``expected_version`` cross-checks MSH-12: if the message declares a different version
     that is reported as an error (a feed sending the wrong version is a misconfiguration
-    a strict channel should reject). ``profile`` is reserved for a conformance-profile
-    object (Phase 2+); passing one today is accepted but not yet enforced. ``max_bytes`` /
-    ``max_segments`` reject an oversized message before the (slow) strict parse.
+    a strict channel should reject). ``max_bytes`` / ``max_segments`` reject an oversized
+    message before the (slow) strict parse.
     """
     from hl7apy.exceptions import HL7apyException
     from hl7apy.parser import parse_message

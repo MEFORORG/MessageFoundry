@@ -676,11 +676,21 @@ class Destination(BaseModel):
 
 class Validation(BaseModel):
     """Parse/validate behaviour. Tolerant by default — non-conformant messages
-    still route; ``strict`` runs full hl7apy profile validation and NACKs on failure."""
+    still route; ``strict`` runs full hl7apy structural validation and NACKs on failure.
+
+    "Structural", not "profile": hl7apy checks a message against the official HL7 structure
+    for its version. It does not take a conformance profile, and neither does this model."""
 
     hl7_version: str | None = None  # e.g. "2.5.1"; None = infer from MSH-12
     strict: bool = False
-    profile: str | None = None  # path to a conformance profile, optional
+    # No ``profile`` field, deliberately. It read ``profile: str | None = None  # path to a
+    # conformance profile, optional`` until 2026-09-06 and was removed alongside the sibling
+    # ``profile`` parameter on messagefoundry/parsing/validate.py, whose comment carries the full
+    # argument. Two facts specific to this field: no authoring path could set it (``inbound()``
+    # never passed it, so neither could connections.toml), and nothing anywhere read it. Removing
+    # it changes no construction, because this model takes Pydantic's default ``extra="ignore"``
+    # -- ``Validation(profile=...)`` was silently ignored before and is silently ignored now.
+
     # Wall-clock seconds a strict hl7apy validate may run before the message dead-letters (#89, DoS
     # backstop against a pathological body that makes hl7apy's structure/cardinality parse spin). A
     # slow-parse input can otherwise pin the listener; the timeout bounds it. ``None`` inherits the
