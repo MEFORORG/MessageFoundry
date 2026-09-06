@@ -756,7 +756,28 @@ that enumeration was wrong — the SCP is a receiver of remote-pushed content on
 two HTTP routes. None of the drop-directory policy below applies to it: its size ceilings, peer
 controls and transport security are connector settings documented under
 [DICOM](#dicom--dicom-inbound-c-store-scp--outbound-c-store-scuc-echo-and-dicomweb-stow-rs-adr-0025),
-and a deploying site must set them there rather than assume this block covers them. The **directory
+and a deploying site must set them there rather than assume this block covers them. **The embedded-document detach is a STAGE, not a fifth receiver, and its ceilings are stated here
+because the requirement asks for unpacked size wherever content is accepted.** When an inbound sets
+`stream_threshold_bytes` (default `None`, so the whole path is OFF unless a feed asks for it), a body
+at or above that size has its opaque documents detached from the transformable skeleton
+([ADR 0105](adr/0105-streaming-very-large-hl7-attachments-detach-the-opaque-document-from-the-transformable-skeleton.md))
+and stored for the attachment-download route above. Nothing new arrives on the wire -- the bytes came
+in through one of the receivers already listed -- which is why the count above does not move. Two
+ceilings bound it, and they bound different things:
+
+- the inbound's own **`max_message_bytes`** bounds a SINGLE body, and applies whether or not a detach
+  happens;
+- **`[inbound].stream_inflight_budget_bytes`** bounds the AGGREGATE bytes of over-threshold bodies
+  concurrently mid-detach across all inbounds. Its default is `0`, which means **unlimited in the
+  aggregate**. Read that precisely: no single body escapes `max_message_bytes`, but the number of
+  such bodies in flight at once is uncapped until an operator sets this. A detach that would cross a
+  positive budget is refused with backpressure, `ERROR`-ed rather than accepted-and-dropped.
+
+Permitted **types** on this path are whatever the inbound declared. Outside the handful of families
+with a leading magic signature, a detached document's type is accepted as sent
+(`messagefoundry/parsing/sniff.py`), so this stage is not a content gate and must not be read as one.
+
+The **directory
 source's** handling of an untrusted drop directory is fixed policy (the HTTP uploaded-logs surface has
 its own policy block below):
 

@@ -137,7 +137,10 @@ The engine's certificate **is verified**, against the **Windows trust store**. S
 
 - an **internal-CA / AD-CS** engine cert works on a domain-joined box with no extra setup;
 - a **self-signed** engine cert works once you import it into **Local Computer → Trusted Root
-  Certification Authorities** on this machine.
+  Certification Authorities** on this machine. **The engine's own minted pair is one of these**, so
+  on a stock install the tray reaches the right socket and then reports the engine down until you
+  import that certificate. The generated pair is written beside the store database as
+  `api-generated-cert.pem`.
 
 There is no option to skip verification. If the certificate does not verify, the probe fails and the
 tray reports the engine as down rather than trusting an unidentified responder — check the cert's
