@@ -24650,6 +24650,48 @@ run 1 -- so it is a mis-attribution rather than an invention. **It is not eviden
 intake:** it sits inside a verdict that says the audit could not answer, and `store_rows=0` beside
 it is the failed read, not a count. Do not cite it as a result.
 
+**A FOURTH SIGHTING, ON A HOSTED RUNNER -- AND IT BELONGS TO A CLOSED ITEM RATHER THAN TO THIS ONE.
+Recorded here only as a pointer, because two seats in one day nearly filed it against the wrong
+row, myself included.** Reported 2026-09-06 from a CI leg on `windows-2025, py3.14`: two tests in
+the SAME module failed and neither is this item's, which passed in that run.
+
+| | this item (#1467) | the fourth sighting |
+|---|---|---|
+| test | `test_no_accept_acked_message_is_absent_from_the_stopped_engines_store` | `test_no_loss_reconciles_at_every_step`, `test_the_run_reports_overall_success` |
+| symptom | the probe could not READ: `store sweep failed: OperationalError: disk I/O error` | the probe read fine; the intake FLOOR was missed: `engine_read 11 < intake floor 12 (half of 24 sent)` |
+| counts | `sent=36 confirmed=36 unconfirmed=0 store_rows=0` | `confirmed=11 unconfirmed=13 store_rows=11` |
+
+**THE FOURTH SIGHTING IS #1292's SUBJECT, AND #1292 IS CLOSED AS SHIPPED.** That row is *"connscale
+smoke reports a message acked but not observed at intake, and nothing discriminates harness race from
+real intake loss"*, and it already records this exact shape across four earlier runs on two operating
+systems, including `fixed_aggregate, count=12, sent=36, acked=13`. It is worth reading before anyone
+files a sibling here.
+
+**IT IS NOT A REGRESSION OF #1292, and the distinction is the useful part.** What #1292 shipped is the
+**discriminator** -- the thing that separates a harness reconciliation race from a real
+count-and-log violation -- not a fix for the shortfall. The fourth sighting's own output is that
+discriminator speaking and clearing the engine: `missing_accepted=0`, `missing_rejected=0`. So the
+post-#1292 state is exactly what #1292 bought: the shortfall can still occur, and now the harness
+tells you which kind it is. The assertion text differs from #1292's pre-fix example (`intake floor`
+rather than `confirmed sent`), which is consistent with the new discriminator code rather than with a
+revert.
+
+**WHAT THE TWO ITEMS GENUINELY SHARE, and it is why this pointer sits here rather than nowhere.** In
+both, the connscale harness fails a run in which its own audit reports NO message loss -- here
+because the audit could not answer at all, there because it answered and cleared the engine. Neither
+is evidence of a product defect, and this item's severity clause covers both.
+
+**WHAT IS NOT ESTABLISHED.** That the two share a cause. Resource contention on a loaded machine
+would explain a failed disk read and a throughput shortfall alike, but nothing has tested that. The
+reporter holds one CI observation with no isolation arm and says so; they also verified rather than
+assumed that their own branch could not be responsible -- of its seven changed files only
+`tests/conftest.py` could reach ordering, and every added line there is a comment, which I re-drove
+independently and confirmed empty.
+
+**DO NOT SPLIT THIS ITEM ON THE FOURTH SIGHTING.** Its title names a disk I/O error and that is still
+the right title for what it covers. The fourth sighting's home is #1292, reopened if anyone judges
+the shortfall worth pursuing past the discriminator that closed it.
+
 **Source:** filed 2026-09-06 from the ASVS packet C full-suite run, corroborated by the packet B
 run, at the request of the Console seat triaging the CI-signal rows, which confirmed no existing
 item covers it (`no_accept_acked_message_is_absent` returns zero across the ledger; the nearby
