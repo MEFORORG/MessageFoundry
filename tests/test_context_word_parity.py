@@ -42,6 +42,9 @@ _DOC = _ROOT / "docs" / "SECURITY.md"
 #: it is a publishing site in its own right, not a pointer.
 _CONFIG_DOC = _ROOT / "docs" / "CONFIGURATION.md"
 _POLICY = _ROOT / "messagefoundry" / "auth" / "policy.py"
+#: The settings module carries the same two screens as field comments, and carried the same
+#: requirement-number mislabel until BACKLOG #1132/#1135 corrected it.
+_SETTINGS = _ROOT / "messagefoundry" / "config" / "settings.py"
 
 # --- anchors the gate slices on (change a doc lead-in -> change these together) ----------------------
 _ENUM_LEAD = "**The context-word deny-list, in full"
@@ -325,11 +328,13 @@ def test_the_context_word_screen_carries_its_own_requirement_numbers() -> None:
         f"CONTEXT_WORDS is still tagged ASVS {_NOT_ITS_REQUIREMENT}, which is a different verb"
     )
 
-    # 6.2.11 names the deny-list, so no line in the policy module may attach it to the username
-    # screen. (``config/settings.py`` carries the same mislabel on its ``password_check_username``
-    # comment; extend this loop to that file once the line is corrected.)
-    for number, line in enumerate(_POLICY.read_text(encoding="utf-8").splitlines(), start=1):
-        if "6.2.11" in line:
-            assert "username" not in line.lower(), (
-                f"auth/policy.py line {number} labels the username screen ASVS 6.2.11: {line.strip()}"
-            )
+    # 6.2.11 names the deny-list, so no line in either module may attach it to the username screen.
+    # ``config/settings.py`` joined this loop once BACKLOG #1132/#1135 corrected its two field
+    # comments; it was fenced by a concurrent lane when the rest of this module landed.
+    for source in (_POLICY, _SETTINGS):
+        label = source.name
+        for number, line in enumerate(source.read_text(encoding="utf-8").splitlines(), start=1):
+            if "6.2.11" in line:
+                assert "username" not in line.lower(), (
+                    f"{label} line {number} labels the username screen ASVS 6.2.11: {line.strip()}"
+                )

@@ -1866,10 +1866,16 @@ class AuthSettings(_Section):
     password_require_digit: bool = False
     password_require_symbol: bool = False
     password_check_breached: bool = True  # reject known common/breached passwords (offline corpus)
-    password_check_context: bool = True  # reject passwords containing app/vendor/HL7 terms
-    password_check_username: bool = (
-        True  # reject passwords containing the user's own username (6.2.11)
-    )
+    # The context-word screen (ASVS 6.1.2 / 6.2.11): reject a password CONTAINING any CONTEXT_WORDS
+    # term. Do NOT call them "app/vendor/HL7 terms" — docs/SECURITY.md retracted that in place,
+    # because five of the twelve members are generic credential words unrelated to this application
+    # or to HL7 (BACKLOG #1132/#1135). tests/test_context_word_parity.py holds the published list and
+    # the constant in step.
+    password_check_context: bool = True
+    # Reject a password containing the user's own username. An ENGINE ADDITION with no ASVS section 6
+    # requirement of its own; this comment previously cited 6.2.11, which is the context-word screen
+    # above, not this one (BACKLOG #1135).
+    password_check_username: bool = True
     # Optional path to a larger offline breach corpus that augments the bundled one (6.2.12): a
     # plaintext list OR an HIBP-style SHA-1-hash export (HASH[:count] lines, auto-detected). Fully
     # offline — no live HIBP call. Use a curated subset, not the full ~40 GB HIBP set (loaded into
