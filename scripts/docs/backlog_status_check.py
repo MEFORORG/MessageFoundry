@@ -109,25 +109,42 @@ BUILDER_CLOSABLE_ACTS = frozenset({"code"})
 
 # Who performs each closing act. A dispatch NAMES this rather than refusing the item.
 #
-# EVERY ENTRY NAMES TWO ACTS, AND THAT IS THE POINT. The first version said "scorecard-rescore: the
-# ASVS Tracker" -- one seat -- and a reader concludes the item finishes there. It does not.
-# `BUILDER.md:253` forbids a builder concluding an item CLOSED ("banner flips and ledger reconciles
-# are not the builder's") and `:148` gives the banner to the LANDER. So the work act and the banner
-# act have different owners, and the handoff between them is where an item stalls: the re-score
-# lands in a vault file gitignored from every engine checkout, so the seat that must flip the banner
-# cannot see that the first act happened. Both seats do their job correctly and the item stays open.
+# NAMING ONLY THE FIRST ACT IS THE DEFECT THIS BLOCK EXISTS TO PREVENT. The first version said
+# "scorecard-rescore: the ASVS Tracker" -- one act -- and a reader concludes the item finishes
+# there. It does not. A re-score is TWO acts: the vault cell is re-scored, and only then does the
+# ledger banner flip. BUILDER.md forbids a builder concluding one ("You may not conclude an item
+# CLOSED") and hands the ledger edit to the Lander ("The lander writes the banner").
 #
-# Naming only the first act is how a tool tells a reader the item is somebody else's problem, when
-# what it actually needs is a message.
+# BOTH ACTS ARE NOW ONE SEAT'S, AND THAT DID NOT MAKE THE SECOND ONE SAFE. Owner ruling 2026-09-05:
+# the LANDER performs vault scorecard re-scores. It already held the banner and standing vault
+# authority -- see the Lander row of CLAUDE.md section 5. So a handoff that used to travel between
+# two seats is now a sequencing obligation inside one. What made it fail is unchanged: the re-score
+# lands in a vault file gitignored from every engine checkout, so NOTHING IN THIS REPOSITORY REPORTS
+# THAT ACT ONE HAPPENED. An item whose work is genuinely done sits open and no gate, diff or
+# reviewer sees the disagreement. Measured 2026-08-22, while the acts still had two owners: three
+# re-scores, zero banner flips, and no flip was ever requested.
+#
+# THE SEATS NAMED BELOW ARE THE CURRENT ROSTER, NOT THE ONE THAT WROTE THIS BLOCK. CLAUDE.md
+# section 5 replaced the pre-2026-09-01 method and retired seven seats; three of the four values
+# here named one of them -- ASVS Tracker, Liaison, Dispatcher. A dispatcher reading a retired seat
+# is told the item belongs to somebody who cannot act on it, which is indistinguishable from being
+# told it is not their problem.
+#
+# CITE THE CLAIM, NOT THE LINE, WHEN THE FILE IS NOT IN THIS REPOSITORY. This block used to cite
+# `BUILDER.md:253` and `:148`. Both had drifted -- the claims quoted above are at :142 and :216
+# today -- and neither drift was detectable here. BUILDER.md lives in the MessageFoundry-vault
+# `roles/` folder, so no checkout of this repository can resolve it, and `citation_line_check.py`
+# REFUSES a bare filename rather than guess which file is meant. A line number nothing can check
+# decays in silence, so the quotes carry the claim instead.
 CLOSING_SEAT = {
     "code": "the builder writes it; the LANDER flips the banner on merge",
     "scorecard-rescore": (
-        "the ASVS Tracker re-scores the cell in the vault, THEN mails the LANDER the item numbers "
-        "for the banner flip. Two acts, two seats -- the re-score alone does not close it, and the "
-        "vault file is invisible from an engine checkout, so the handoff must be a message"
+        "the LANDER, twice: it re-scores the cell in the vault, THEN flips the banner in the "
+        "ledger. Two acts, one seat -- the re-score alone does not close it, and the vault file is "
+        "invisible from an engine checkout, so nothing here will report that the first one happened"
     ),
-    "owner-ruling": "the owner rules via the LIAISON; the Dispatcher or Lander records it",
-    "banner-only": "the DISPATCHER or LANDER, in the ledger",
+    "owner-ruling": "the owner rules to the CONSOLE; a builder writes it and the LANDER lands it",
+    "banner-only": "the LANDER, in the ledger",
 }
 
 # BACKLOG #1259: an unresolved git conflict parses CLEANLY here without this check, and the reason is

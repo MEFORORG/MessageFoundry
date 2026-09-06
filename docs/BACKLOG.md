@@ -23102,3 +23102,52 @@ The gate's remedy named the owning worktree and said to commit from there. **`wo
 **The grandfathered numbers are not asserted, they are read off a commit.** Laundering a number this way needs a commit that already contains it, and producing one means passing this same gate on the worktree that allocated it. Editing the BODY of an existing item was never policed here in either direction -- the rule compares NUMBER SETS (`head - base`), so a merge cannot smuggle a subject past a check that never read subjects.
 
 **Two mutations hold the arms disjoint**, and the first attempt did not: an assertion about the carried number was written into the invented-number arm, so disabling the fix reddened both and the pair localised nothing. Corrected, then re-measured. Fix disabled reds only `test_a_merge_carrying_ANOTHER_worktrees_number_is_committable`; ownership skipped wholesale during a merge reds only `test_a_number_INVENTED_during_a_merge_is_still_refused`.
+
+## 1462. CLOSING_SEAT named three retired seats, so a dispatch told a reader the item belonged to nobody
+
+> 🔢 **Filed 2026-09-05. The fix and its two arms are built on this branch.** Value **5/10** · Difficulty **2/10** · _quick win_. `CLOSING_SEAT` in `scripts/docs/backlog_status_check.py` is the string a dispatch PRINTS when it names who finishes an item. Three of its four values named a seat CLAUDE.md section 5 retired -- ASVS Tracker, Liaison, Dispatcher -- and roughly 40 open rows carry `closing-act: scorecard-rescore` alone.
+
+**Cluster:** repository gates / ledger hygiene. **Priority:** P2. **Verdict:** build.
+**Severity:** no deployment axis (sec. 0). A coordination constant read at dispatch time. No engine behaviour, no shipped artifact, no PHI.
+
+### What was wrong
+
+CLAUDE.md section 5 replaced the pre-2026-09-01 method and retired seven seats. `dispatch_gate.py` reads `CLOSING_SEAT` at `judge()` and folds the value straight into the advice a dispatcher reads:
+
+```
+closes by 'scorecard-rescore', performed by <value> -- NOT by the builder.
+```
+
+So the value is not documentation, it is output. Naming a seat that cannot act is indistinguishable from being told the item is not your problem, and nothing anywhere reports the difference.
+
+| Act | Named | Live? |
+| --- | --- | --- |
+| `code` | the builder, then the LANDER | yes -- unchanged |
+| `scorecard-rescore` | the ASVS Tracker, then the LANDER | **no** -- Tracker retired |
+| `owner-ruling` | the owner via the LIAISON; Dispatcher or Lander | **no** -- both retired |
+| `banner-only` | the DISPATCHER or LANDER | **no** -- Dispatcher retired |
+
+### What shipped
+
+Each value now names a seat in the current roster. `scorecard-rescore` follows the **owner ruling of 2026-09-05: the LANDER performs vault scorecard re-scores.** It already held the banner and standing vault authority, so the act's two steps now sit with one seat.
+
+**The two-step reasoning is kept, because the failure it describes is unchanged.** A re-score lands in a vault file gitignored from every engine checkout, so nothing in this repository reports that step one happened. What moved is the failure's shape: it was a handoff message that never got sent between two seats, and it is now a sequencing obligation inside one. Measured 2026-08-22, while the acts still had two owners: three re-scores, zero banner flips, and no flip ever requested.
+
+### The stale citations, and why nothing here could have caught them
+
+The comment cited `BUILDER.md:253` and `:148`. Both had drifted -- the claims are at `:142` ("You may not conclude an item CLOSED") and `:216` ("The lander writes the banner") today. **Neither drift was detectable from this repository, by construction:**
+
+1. `BUILDER.md` lives in the `MessageFoundry-vault` `roles/` folder. No checkout of this repository carries it, so no gate here can resolve the path at all.
+2. `citation_line_check.py` REFUSES a bare filename rather than guess which file is meant -- 935 of 3,086 citations are in that bucket, and this was two of them.
+
+Both citations are now QUOTES of the claim. A line number nothing can check decays in silence; a quoted sentence can be searched for wherever the file ends up.
+
+### The arms, and the control that earned them
+
+`test_no_closing_seat_value_names_a_retired_seat` walks every value against the seven retired seat names. **It asserts the matcher fires on a known-bad string first**, and that control did its job during construction: the word-boundary anchors were written into the file as literal backspace bytes, the pattern matched nothing, and a silently-broken checker over a repaired map is green. Only the control told them apart.
+
+`test_every_closing_seat_value_names_a_live_seat` is its pair. Deleting a retired name and leaving the value saying nothing passes the first check while a dispatcher reads a value naming no performer at all. Either assertion alone is satisfiable by the other's failure.
+
+### Not taken
+
+`docs/BACKLOG.md` carries three further `BUILDER.md:253` citations (around lines 16620, 16755 and 17122). All three RECORD what was measured when the acts had two owners, so they are accurate history, not instructions. Left alone.
