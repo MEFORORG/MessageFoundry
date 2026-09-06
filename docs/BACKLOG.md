@@ -24214,3 +24214,31 @@ I read only `roles/` in the vault and ran no git history there, so I cannot date
 **What a fix must preserve.** Git refuses to check one branch out in two worktrees, so "the session on this branch" is single-valued. Any liveness signal must not become a way for one seat to take a number another seat is actively using, which is the hole the declined transfer verb would have opened.
 
 **Shapes worth considering, none chosen here:** a heartbeat the holder refreshes, so staleness is observable rather than inferred -- `refreshed` is already recorded and was already stale on both instances; a release a MERGED pull request can satisfy, since both instances named a PR and one had merged; or a prompt at session end asking a holder to release, which is what the third case did by hand.
+
+## 1468. the ledger gate has no path for RESTORING a number main lost, only for allocating or recovering one
+
+> 🔢 **Filed 2026-09-06 -- not started. Found because the gate REFUSED a repair it should accept, and the Lander first dismissed that refusal as noise.** Value **5/10** · Difficulty **3/10** · _quick win_. `ledger_check` refuses any `## N.` heading whose number this worktree did not allocate. That is right for a fresh allocation. It is wrong for a RESTORATION -- a number that is in `main`'s own history, fell out of the file, and is being put back -- because the two are indistinguishable to a diff and only one of them is a defect.
+
+> Verdict: build
+> Research: none
+> Closing-act: code
+
+**Cluster:** coordination tooling / ledger gate. **Priority:** P2. **Verdict:** build.
+**Severity:** no deployment axis (sec. 0). No engine behaviour, no shipped artifact, no PHI. The cost is a ledger that cannot be repaired by the seat that notices the damage.
+
+**THE INSTANCE, MEASURED 2026-09-06.** PR 855 (`642225f78`) stripped the `## 1147.` heading and concatenated that item's title onto the end of #1146's closing paragraph. Nothing else changed: the body survives, orphaned and unaddressable. **`origin/main` carries 442 live items where it should carry 443**, `parse_items` cannot see #1147, and six files still cite it. It is not in the archive either -- a positive control in the same run matched 237 headings there, so the instrument reached the corpus.
+
+**The repair is one line break and a restored marker, and it was verified before this item was filed:** applying it brings the count to 443 and `## 1147.` parses again. It is not a rewrite, a renumber, or a judgment call.
+
+**WHY IT CANNOT LAND.** The gate names two recoveries and neither reaches this case:
+
+1. **Commit from the owning worktree.** It **no longer exists** -- removed at some point without releasing the number.
+2. **Check out the owning branch.** It survives locally, is **369 commits behind main with 313 commits that exist in no remote**, and rebasing it onto main fails on an old history-reset commit. Forcing it would destroy unrecoverable local history to fix a formatting defect.
+3. The gate's third option -- allocate a new number -- **renumbers a live item**, which `ledger_check.py:58-61` argues against in terms: renumbering "would only make stale citations resolve uniquely and WRONGLY, which is worse than resolving ambiguously".
+
+**WHAT IS MISSING, STATED AS THE DISCRIMINATOR RATHER THAN AS A FEATURE.** A restoration is provably not a fresh allocation: **the number appears in this repository's own history, under the same heading text, before the commit that removed it.** That is a checkable fact -- `git log -S` over the ledger finds it -- and it is exactly what the gate cannot currently ask. Any widening must rest on that test and nothing weaker, because a rule that merely trusts the committer re-opens the hole the non-transferable design exists to close.
+
+**THE GATE WORKED. THE SEAT DID NOT.** `ledger_check` refused a commit with `BLOCKED: BACKLOG item #1147 was not allocated to this worktree` roughly an hour before this item was filed. **The Lander read that as a stale base, rebased the number away, and continued.** The corruption was then found independently by a packet session merging `main`. Recorded because it is the more useful half: the detector fired correctly and its signal was discarded, so a louder detector is not the fix -- the fix is a path that lets the person holding the repair commit it.
+
+**NOT PROPOSED HERE:** which shape the widening takes. A `-Restore` verb, an automatic exemption when the number is found in history, and a recorded one-off override are all defensible and have different failure modes. This item is the requirement, not the design.
+
