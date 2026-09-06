@@ -24253,7 +24253,7 @@ That convention is the concrete answer to the caution above. Repairs land in **s
 
 So retiring one of the 16 false absence claims is not something to design. It is `apply.py --allow-retirement` with a declared `retired_absence`, and **the retirement itself must be re-confirmed with the owner rather than inherited from whoever first called it confirmed.** One of the 16 is being worked that way now, so the procedure has a live worked example and not just a specification.
 
-### The sharper finding: the tooling exists and most of it runs only when a human runs it
+### The sharper finding: the tooling exists, and in THIS repository most of it runs only when a human runs it
 
 **The gap is NOT "no tooling exists".** Six tools sit in `scripts/asvs/`: `scorecard.py` verifies, `apply.py` writes under the guards above, `anchor_report.py` and `anchor_provenance.py` cover anchor work, `rescore_handoff_check.py` answers *"did a cell get re-scored AFTER its item's banner was last touched"*, and `prove_report.py` reports absence proofs.
 
@@ -24270,7 +24270,19 @@ Measured at `ebdfa44a6`, counting workflow and `.pre-commit-config.yaml` referen
 
 **Three of the six are referenced by no workflow and no hook in this repository**, and the two that are wired run in jobs [#1405](#1405-nothing-writes-the-security-scorecard-so-its-anchors-go-stale-exactly-when-the-code-improves) already records as gated on a repository variable that deliberately does not exist, because a vault read credential held in the public repository would collapse the boundary the vault creates.
 
-**What runs automatically on the VAULT side is NOT established here, and two sources disagree.** #1405 records an unconditional daily cron in the vault that reads the same anchors and opens an alarm issue on failure; a peer reports that vault CI is off and the pre-commit framework absent there. I did not read the vault, so this row **does not resolve that** -- it flags it as the first thing the next reader should measure, because the two answers imply very different amounts of remaining work.
+### RESOLVED: a scorecard change opened as a vault pull request IS gated
+
+This row first flagged the vault side as unestablished, because two sources disagreed and neither had been measured. It has since been measured, and **the answer that made the remedy sound large was the wrong one.**
+
+**The generalisation that failed is worth keeping, because it is the kind that reads as safe.** The vault workflow literally named `CI` is disabled, and [ADR 0160](adr/0160-public-repo-content-policy-operator-and-security-review-material-only.md) records it at `:336`: `ci.yml`, *"the only one that runs a test suite, is among the disabled"*. From there it is one short and false step to *"no CI runs in the vault"*. **The same line reports 8 workflows ACTIVE alongside the 17 disabled.** A workflow named `CI` being off is not the CI estate being off, and the sentence carrying the alarming half carries the correcting half one clause away.
+
+`asvs-scorecard.yml` is among the active ones. It fires on push to `main`, on pull request and on manual dispatch, path-filtered to a set that INCLUDES the record itself and the `verified_at` gate beside it. The estate was cut back at the 2026-07-27 cutover to avoid duplicating public CI, and that workflow was deliberately kept, because the doc-drift guards assert against documents that exist only in the vault.
+
+**So the gap is not the gate. It is the LOCAL commit-time net.** The `pre-commit` framework is not installed in that clone, so the fail-closed `asvs-scorecard` hook its `.pre-commit-config.yaml` declares never fires at commit. CI catches the change at pull-request time instead -- later, but not never.
+
+**This SHRINKS the item, which is why the question was worth asking before sizing it.** The remedy is not *"build a gate"*; a gate exists and runs. The drift accumulated anyway, so the live question is narrower and a reader can go and settle it: **does the gate not assert what we assumed, or does it assert it only on the paths it filters?** Answer that before estimating the rest.
+
+Not verified here: the daily cron #1405 describes. The trigger set measured is push, pull request and manual dispatch.
 
 ### One false absence claim is substantive, and it corroborates a finding already on `main`
 
