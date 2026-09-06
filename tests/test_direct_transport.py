@@ -637,3 +637,138 @@ def test_envelope_key_transport_is_out_of_reach_of_this_setting() -> None:
     params = inspect.signature(pkcs7.PKCS7EnvelopeBuilder.add_recipient).parameters
     assert "rsa_padding" not in params
     assert set(params) == {"self", "certificate"}
+
+
+# --- key-strength floor on all three S/MIME surfaces (ASVS 11.2.3, BACKLOG #1166) -------------------
+#
+# Measured before the floor existed: a full RSA-1024 set (signing key, recipient cert, trust anchor)
+# CONSTRUCTED without complaint, with an RSA-2048 set constructing in the same run as the positive
+# control -- so the loaders were live and simply never asked how big the modulus was.
+
+
+def _weak_pki(tmp_path: Path, bits: int = 1024) -> dict[str, Any]:
+    """A complete Direct PKI at `bits`, minted the same way as the `pki` fixture. Separate rather than
+    parameterized on the fixture so the default path in every other test stays at 2048."""
+    ca_key = rsa.generate_private_key(public_exponent=65537, key_size=bits)
+    name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "Weak Direct CA")])
+    now = datetime.datetime.now(datetime.UTC)
+    ca_cert = (
+        x509.CertificateBuilder()
+        .subject_name(name)
+        .issuer_name(name)
+        .public_key(ca_key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(now - datetime.timedelta(days=1))
+        .not_valid_after(now + datetime.timedelta(days=3650))
+        .add_extension(x509.BasicConstraints(ca=True, path_length=None), critical=True)
+        .sign(ca_key, hashes.SHA256())
+    )
+
+    def leaf(cn: str) -> tuple[rsa.RSAPrivateKey, x509.Certificate]:
+        k = rsa.generate_private_key(public_exponent=65537, key_size=bits)
+        c = (
+            x509.CertificateBuilder()
+            .subject_name(x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, cn)]))
+            .issuer_name(ca_cert.subject)
+            .public_key(k.public_key())
+            .serial_number(x509.random_serial_number())
+            .not_valid_before(now - datetime.timedelta(days=1))
+            .not_valid_after(now + datetime.timedelta(days=365))
+            .sign(ca_key, hashes.SHA256())
+        )
+        return k, c
+
+    signer_key, signer_cert = leaf("Weak Sender")
+    recip_key, recip_cert = leaf("weak@hisp.example")
+    tag = f"weak{bits}"
+    paths = {
+        "signing_cert": tmp_path / f"{tag}_signer.crt",
+        "signing_key": tmp_path / f"{tag}_signer.key",
+        "recipient_cert": tmp_path / f"{tag}_recip.crt",
+        "trust_anchor": tmp_path / f"{tag}_ca.crt",
+    }
+    _write_pem(paths["signing_cert"], signer_cert)
+    _write_key(paths["signing_key"], signer_key)
+    _write_pem(paths["recipient_cert"], recip_cert)
+    _write_pem(paths["trust_anchor"], ca_cert)
+    out: dict[str, Any] = {k: str(v) for k, v in paths.items()}
+    out["recip_key"] = recip_key
+    return out
+
+
+def test_weak_signing_key_is_refused(pki: dict[str, Any], tmp_path: Path) -> None:
+    weak = _weak_pki(tmp_path)
+    with pytest.raises(ValueError, match="signing_key.*RSA-1024"):
+        DirectDestination(
+            _dest(pki, signing_cert=weak["signing_cert"], signing_key=weak["signing_key"])
+        )
+
+
+def test_weak_recipient_cert_is_refused(pki: dict[str, Any], tmp_path: Path) -> None:
+    # A counterparty-chosen surface. Refused anyway, because no certificate policy governing Direct
+    # permits RSA-1024 -- so this cannot break a correspondent who is following their own rules.
+    weak = _weak_pki(tmp_path)
+    with pytest.raises(ValueError, match="recipient_cert.*RSA-1024"):
+        DirectDestination(_dest(pki, recipient_cert=weak["recipient_cert"]))
+
+
+def test_weak_trust_anchor_is_refused(pki: dict[str, Any], tmp_path: Path) -> None:
+    weak = _weak_pki(tmp_path)
+    with pytest.raises(ValueError, match="trust_anchor.*RSA-1024"):
+        DirectDestination(_dest(pki, trust_anchor=weak["trust_anchor"]))
+
+
+def test_a_weak_anchor_is_refused_even_when_another_anchor_issues_the_recipient(
+    pki: dict[str, Any], tmp_path: Path
+) -> None:
+    """The discriminating case for WHERE the anchor check sits.
+
+    The issuance loop returns on the first anchor that verifies, so a floor applied inside it would
+    leave a weak sibling anchor unexamined and still trusted for every future recipient. This bundles
+    the real (2048) anchor with a weak one and requires a refusal even though the real one matches.
+    """
+    weak = _weak_pki(tmp_path)
+    bundle = tmp_path / "bundle.pem"
+    bundle.write_bytes(
+        Path(pki["trust_anchor"]).read_bytes() + Path(weak["trust_anchor"]).read_bytes()
+    )
+    with pytest.raises(ValueError, match="trust_anchor.*RSA-1024"):
+        DirectDestination(_dest(pki, trust_anchor=str(bundle)))
+
+
+def test_the_default_2048_pki_still_constructs(pki: dict[str, Any]) -> None:
+    # POSITIVE CONTROL for all four refusals above: the floor admits what every Direct certificate
+    # policy requires, so the refusals are not green merely because construction always fails.
+    DirectDestination(_dest(pki))
+
+
+def test_an_ec_p256_signer_clears_the_floor(pki: dict[str, Any], tmp_path: Path) -> None:
+    # P-256 is 128-bit and therefore actually MEETS ASVS 11.2.3, which the RSA-2048 floor does not.
+    DirectDestination(_dest(pki, **_ec_signer(pki, tmp_path)))
+
+
+def test_an_unapproved_ec_curve_is_refused(pki: dict[str, Any], tmp_path: Path) -> None:
+    key = ec.generate_private_key(ec.SECP192R1())
+    now = datetime.datetime.now(datetime.UTC)
+    cert = (
+        x509.CertificateBuilder()
+        .subject_name(x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "p192")]))
+        .issuer_name(pki["ca_cert"].subject)
+        .public_key(key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(now - datetime.timedelta(days=1))
+        .not_valid_after(now + datetime.timedelta(days=365))
+        .sign(pki["ca_key"], hashes.SHA256())
+    )
+    cert_p = tmp_path / "p192.crt"
+    key_p = tmp_path / "p192.key"
+    _write_pem(cert_p, cert)
+    key_p.write_bytes(
+        key.private_bytes(
+            serialization.Encoding.PEM,
+            serialization.PrivateFormat.PKCS8,
+            serialization.NoEncryption(),
+        )
+    )
+    with pytest.raises(ValueError, match="secp192r1"):
+        DirectDestination(_dest(pki, signing_cert=str(cert_p), signing_key=str(key_p)))

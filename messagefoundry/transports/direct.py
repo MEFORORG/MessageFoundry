@@ -55,7 +55,7 @@ from typing import Any
 from cryptography import x509
 from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives import hashes, serialization
-from cryptography.hazmat.primitives.asymmetric import padding, rsa
+from cryptography.hazmat.primitives.asymmetric import ec, padding, rsa
 from cryptography.hazmat.primitives.serialization import pkcs7
 
 from messagefoundry.config.models import ConnectorType, Destination
@@ -123,6 +123,65 @@ def _load_cert(setting: str, data: bytes) -> x509.Certificate:
             ) from exc
 
 
+#: Smallest RSA modulus this connector will use for ANY Direct S/MIME key material -- the sender's
+#: signing key, the partner's recipient certificate, and the trust anchor (ASVS 11.2.3, BACKLOG #1166).
+#: Measured before this floor existed: every one of those three loaders was a parse-and-type check
+#: only, and a full RSA-1024 set constructed without complaint, against an RSA-2048 positive control
+#: in the same run showing the loaders were live and simply never asked how big the modulus was.
+#:
+#: **2048 is chosen because it refuses nothing a conformant Direct partner could supply, and that is
+#: the whole argument for putting it on counterparty-chosen material.** DirectTrust's Community X.509
+#: Certificate Policy requires end-entity keys of at least 2048 bits, as does the CA/Browser Forum's
+#: S/MIME baseline. So this floor cannot break a correspondent who is already following the rules
+#: their own certificate was issued under; it refuses only material that no current policy permits.
+#:
+#: **IT DOES NOT MEET ASVS 11.2.3, AND MUST NOT BE READ AS DOING SO.** The verb asks for 128 bits of
+#: security and names RSA-3072 as the equivalent; RSA-2048 is roughly 112. Raising this to 3072 is a
+#: SEPARATE and counterparty-facing decision needing partner field data nobody has gathered, and it
+#: would be a live availability choice about a hospital's certificate rather than a tightening of our
+#: own. What this floor closes is the UNBOUNDED case -- that a deploying site could configure
+#: RSA-1024 and nothing would object -- not the requirement.
+#:
+#: An EC key reaches the verb today with no such conversation: P-256 is 128-bit, and this connector
+#: accepts EC signing keys (see :meth:`DirectDestination._select_rsa_padding`).
+_MIN_RSA_BITS = 2048
+
+#: EC curves admitted for Direct S/MIME material. All three are at or above 128-bit security, so
+#: unlike the RSA floor this list needs no "does not meet the verb" caveat. Named positively so a
+#: curve nobody considered is excluded by construction rather than admitted by an absent deny-rule.
+_APPROVED_EC_CURVES = frozenset({"secp256r1", "secp384r1", "secp521r1"})
+
+
+def _require_key_strength(key: Any, setting: str) -> None:
+    """Refuse Direct S/MIME key material that parses and is the right shape but is too weak to use.
+
+    Applied to all three operator-supplied surfaces. Two of them are counterparty-chosen -- the
+    partner's ``recipient_cert`` and the issuing ``trust_anchor`` -- which is normally a reason for
+    caution, because refusing someone else's certificate is an availability decision about their
+    infrastructure rather than a tightening of ours. It is safe at THIS value for the reason recorded
+    on :data:`_MIN_RSA_BITS`: no certificate policy governing Direct permits what it refuses.
+
+    A key type this connector cannot classify passes rather than raises. The floor exists to catch a
+    weak key of a KNOWN type; turning it into a second, silent type gate would refuse Ed25519 on a
+    day someone adds it, for a reason that has nothing to do with strength.
+    """
+    if isinstance(key, (rsa.RSAPrivateKey, rsa.RSAPublicKey)) and key.key_size < _MIN_RSA_BITS:
+        raise ValueError(
+            f"Direct destination '{setting}' is RSA-{key.key_size}, below the {_MIN_RSA_BITS}-bit "
+            f"floor for Direct S/MIME material (DirectTrust and CA/Browser Forum S/MIME both require "
+            f"at least {_MIN_RSA_BITS}). Supply key material of at least {_MIN_RSA_BITS} bits."
+        )
+    if (
+        isinstance(key, (ec.EllipticCurvePrivateKey, ec.EllipticCurvePublicKey))
+        and key.curve.name not in _APPROVED_EC_CURVES
+    ):
+        approved = ", ".join(sorted(_APPROVED_EC_CURVES))
+        raise ValueError(
+            f"Direct destination '{setting}' uses EC curve {key.curve.name!r}, which is not on "
+            f"the approved list ({approved}). Supply a key on an approved curve."
+        )
+
+
 #: The RSA signature paddings an operator may select for the CMS SignerInfo, by ``signature_padding``
 #: setting value (ASVS 11.3.1, BACKLOG #1168). ``pkcs1v15`` is the default and stays the default: see
 #: :meth:`DirectDestination._select_rsa_padding` for why that is an interoperability finding rather
@@ -179,6 +238,9 @@ class DirectDestination(DestinationConnector):
             s.get("signing_key"), s.get("signing_key_password")
         )
         self._verify_signing_key_matches_cert()
+        # The signing cert's public half is compared byte-for-byte against this key just above, so
+        # flooring the key covers the cert too -- they cannot differ by the time this runs.
+        _require_key_strength(self._signing_key, "signing_key")
         # Which RSA padding the CMS SignerInfo carries. Parsed AFTER the key loads because the
         # validation needs the key's type: `pss` on an EC key is refused here rather than at wire time.
         self.signature_padding: str = self._parse_signature_padding(s.get("signature_padding"))
@@ -189,6 +251,7 @@ class DirectDestination(DestinationConnector):
         self._recipient_cert = _load_cert(
             "recipient_cert", _read_file("recipient_cert", s.get("recipient_cert"))
         )
+        _require_key_strength(self._recipient_cert.public_key(), "recipient_cert")
         # Trust anchor — the CA(s) the recipient cert must chain to. Verified at construction so a cert
         # from an untrusted issuer is refused before we ever encrypt PHI to it.
         self._verify_recipient_trusted(_read_file("trust_anchor", s.get("trust_anchor")))
@@ -393,6 +456,11 @@ class DirectDestination(DestinationConnector):
                 ) from exc
         if not anchors:
             raise ValueError("Direct destination 'trust_anchor' contained no certificates")
+        # Floored BEFORE the issuance check, so a weak anchor is refused whether or not it happens to
+        # be the one that issues this recipient. The loop below returns on the first match, so
+        # checking inside it would leave a weak sibling anchor unexamined and still trusted.
+        for anchor in anchors:
+            _require_key_strength(anchor.public_key(), "trust_anchor")
         for anchor in anchors:
             try:
                 # verify_directly_issued_by checks the issuer/subject name match AND that the anchor's
