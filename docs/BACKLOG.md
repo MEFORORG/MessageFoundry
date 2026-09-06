@@ -10068,6 +10068,33 @@ Interpreter named rather than assumed, since the extra-gated coverage hazard abo
 
 **Anchor drift in the record, all resolving by token under the content-addressed resolver:** `messagefoundry/auth/service.py` recorded at `:848` resolves at `:938`; `messagefoundry/config/settings.py` recorded at `:1958` resolves at `:1966`.
 
+
+**RE-MEASURED 2026-09-06. This item's "crosses SILENTLY" claim about `tls_hop_attested` is WRONG at
+HEAD, and the correction narrows the finding without removing it.** `_enforce_shipped_hop`
+(`transports/rest.py:430`) logs at WARNING when an attestation suppresses an enforcing refusal, and
+`[security].enforcement` ships `ENFORCE`, so a first deployment lands on that branch and gets the line.
+**Two narrower claims are true and are the ones to write down.** First, the asymmetry is between
+LOUD-AND-AUDITED and LOUD-BUT-UNAUDITED, not between loud and silent: `cleartext_accepted` gets both a
+warning and an audit record, while `tls_hop_attested` produces a log line and no audit record, because
+the acceptance audit sink is passed only on the WARN-and-accepted arm. Second, the crossing IS fully
+silent -- quieter than the same hop with no attestation, which would at least WARN -- on an instance
+where the operator ALSO sets `[security].enforcement = warn`, because the attested arm returns ALLOW
+before the enforcing check is reached. The disqualifying configuration this item names is therefore
+real and independent of federated login, and it would put a minted OAuth bearer on a readable segment.
+**Two other measurements, both confirming.** The four-axis claim holds as four minting PATHS but only
+THREE enablement KEYS -- `FhirLookup` composed with `with_smart_backend` is switched by the same
+`smart_token_url` that enables the symmetric client-credentials path, though it remains a distinct
+spec, executor and opener table. And the other four cells in this family genuinely DO have federated
+login as their sole binding limb: zero `id_token` occurrences in `smart.py`, `http_auth.py` and
+`fhir.py`, against a firing control of 7, 9 and 4 `access_token` hits in the same run. So apply Owner
+Ruling 1's disposition to all six and inherit its PREMISE on five. **A process finding that outranks
+any of this, and it is not this item's fault: the 2026-08-17 ruling is not written anywhere in the
+engine tree.** A tree-wide search returns CI comments, three unrelated documents, a lock-file timestamp
+and BACKLOG paraphrases -- no ruling text. Six items now defer to a document nobody can read, while the
+method's own rule says never to reason from a paraphrase. Get its text into
+`docs/ASVS-ASSESSMENT-METHOD.md` before any cell cites it. Anchor drift: `oidc_enabled` resolves at
+`config/settings.py:2003` and the `ad_enabled` precondition at `:2245`; enabling OIDC needs **14**
+further site-supplied values, measured by adding one at a time until the config loaded.
 ## 1156. research an honest pass for ASVS 10.1.2 when the flow-binding secrets are unconditional but the flow ships off
 
 > 🔢 **Re-scored 2026-08-20 -> P3.** Value **4/10** · Difficulty **3/10** · _fill-in_. The enablement premise is unchanged (oidc_enabled ships False, now at settings.py:1942 rather than the cited :1880, and :2190-2210 refuses it without ad_enabled) and both live deltas the research must carry are present: the flow cookie's __Host- twin at _auth.py:783 and the hardening opt-out env at :77. Value 4 because the residual reads every binding on the acceptance path as unconditional, leaving a scorecard and method question with no product effect; difficulty 3 because the code half is one conditional in a single console auth module already covered at test_ui_hardening.py:322, and the cleartext branch is decided by the browser's own rule that a __Host- cookie requires Secure, not by engineering. _(was 4/10 · 6/10.)_
@@ -10189,6 +10216,7 @@ Interpreter named rather than assumed, since the extra-gated coverage hazard abo
 > 🔢 **Re-scored 2026-08-20 -> P2.** Value **6/10** · Difficulty **4/10** · _quick win_. Gap stands unchanged: both scope settings reach the wire through a bare str() at smart.py:305 and http_auth.py:305 with no cross-check against the connector's declared interaction, checks.py carries no scope rule, and the wildcard example survives in at least five artifacts including the shipped wiring sample at wiring.py:531 (value 6). The remainder prices at 4: a research call on whether required scope is derivable, then an additive advisory check on the established checks.py CheckResult seam (four such checks already at :219/:253/:292/:424) plus doc narrowing, with a refusing gate ruled out. _(was 6/10 · 5/10.)_
 > Research: done 2026-08-20
 > Partly built 2026-09-03: the SMART over-grant advisory and the artifact narrowing landed. Still open -- no re-score, and the rule-4 ruling plus the five other authorization parameters are untouched. See "WHAT LANDED" below.
+> Partly built 2026-09-06: the relying-party advisory landed as `oidc-auth-params`. Still open -- no re-score; the audience limb and the rule-4 ruling are untouched. See "THE SEVENTH PARAMETER" below.
 >
 > **Filed 2026-08-08 - not started. RESEARCH item: the goal is an HONEST pass, and "cannot honestly reach pass" is a valid finding.** ASVS **10.2.3** (L3) currently scores **partial**. The pinned verb asks that the OAuth client request only the scopes it requires. What holds it short is that `smart_scope` and `oauth2_scope` travel from operator config to the wire through one `str(...)` conversion and nothing else (`messagefoundry/transports/smart.py:305`, `messagefoundry/transports/http_auth.py:305`).
 > Verdict: research
@@ -10235,6 +10263,30 @@ Interpreter named rather than assumed, since the extra-gated coverage hazard abo
 
 **THE FIVE ARTIFACTS ARE NARROWED; THE TWO TEST ASSERTIONS WERE LEFT, AND THAT IS A CORRECTION TO THIS ITEM.** `transports/smart.py`, `docs/CONNECTIONS.md` (both the worked example and the settings-table row) and `docs/adr/0024` now show `system/Patient.c` against their `interaction="create"` connections, and the `FhirLookup` sample in `config/wiring.py` shows `system/Patient.rs`. `docs/CONNECTIONS.md` gains a *Least scope* section giving the letter alphabet, the per-shape table the check computes from, and the reason the check never blocks. `tests/test_smart_backend.py:131/:229/:279` still carry `system/*.rs` and did NOT move with the correction: they pin round-tripping of an ARBITRARY configured scope string through the token request, so the value is a fixture and not an example, and no code they exercise changed.
 
+
+**THE SEVENTH PARAMETER, and this item's count of six omits it. Built 2026-09-06: `oidc-auth-params`.**
+`[auth].oidc_scopes` is unvalidated. Its only validator, `_split_oidc_lists`, is a SHAPE normaliser --
+it comma-splits an env string into a list and screens no content -- so `["not-a-real-scope"]` with no
+`openid` at all loads clean, measured by execution against a settings object that otherwise loads.
+**The shipped DEFAULT is minimal and that is worth saying plainly:** `oidc_username_claim` defaults to
+`preferred_username`, which OIDC Core places in `profile`, so `["openid", "profile"]` is exactly what
+this configuration needs. The gap is the OVERRIDE, and it is a COUPLED one -- an operator may change
+the scopes and the username claim independently, with nothing relating them. **The line worth having
+is not a least-privilege report at all:** the login path reads exactly one scope-gated claim and
+raises `username_claim_missing` when the token lacks it, so pointing that setting at `email` without
+the `email` scope would, on a first deployment, produce a login that fails at its LAST HOP on a live
+user, reporting a missing claim rather than a missing scope. It is computable at config load and
+nothing computed it. The advisory reports that, the ACR request/require asymmetry in both directions,
+and a `prompt` value outside the OIDC Core set; it is advisory for `smart-scope`'s reason and stays
+silent on a custom username claim, whose carrying scope only the identity provider knows. **The cell
+does not move on it** -- the federated login ships off, so the shipped default builds no authorization
+request at all. **One correction for the next implementer: this item names TWO DIFFERENT four-check
+families and conflates them.** The re-score line's `:219/:253/:292/:424` are the config-dir advisories
+(now `checks.py:230/264/303/435`); the WHAT LANDED note names the posture family (now
+`:1546/:1592/:1638`). For `[auth]` settings the right template is neither -- it is
+`_check_alert_smtp_tls`, the only advisory that reads `messagefoundry.toml` rather than `load_config`.
+Anchor drift: `smart.py:305/306` resolves at `:395/:396`; `http_auth.py:305/307` at `:328/:330`;
+`wiring.py:531` at `:534`.
 ## 1160. research an honest pass for ASVS 10.5.1 when the ID Token nonce check is unconditional but the relying party ships off
 
 > 🔢 **Re-scored 2026-08-20 -> P3.** Value **2/10** · Difficulty **2/10** · _fill-in_. The control is complete and unguarded in the shipped code, so the cell is already substantially covered and only enablement holds it short. The item forbids both engine changes available to it, flipping oidc_enabled and adding a refuse-to-boot gate, and directs the shared optional-feature question to be answered once across all six siblings, so this item's own remainder is applying that ruling and recording the outcome, which ships nothing runnable and costs a record-grade edit. _(was 4/10 · 6/10.)_
@@ -10313,6 +10365,20 @@ Interpreter named rather than assumed, since the extra-gated coverage hazard abo
 
 **One unknown worth recording:** whether "equal to" in the pinned verb permits the containment reading the code implements. For a single-valued audience, membership in a one-element set IS equality, so the verb is met literally; for a multi-valued audience the code requires containment PLUS a matching authorized party, which is stricter than the OIDC Core recommendation. The cell records the alternative reading (reject any multi-audience token outright) as a re-score trigger and notes it lands on partial either way, so it cannot change this verdict -- but it is unsettled and a second assessor could legitimately raise it.
 
+
+**MEASURED 2026-09-06, and this item's own defect reproduces: A WHITESPACE-ONLY `oidc_client_id`
+LOADS.** `_require_oidc_fields` tests the five required fields with `if not value`, which catches the
+empty string and lets a run of spaces through, while the client-secret guard twenty lines below already
+STRIPS before testing -- the validator disagrees with itself. Executed against a settings object that
+otherwise loads: the empty string is refused, a three-space value and a lone tab both load, and a real
+value loads as the control. It is not cosmetic. `oidc_client_id` is the expected `aud`, so the ID Token
+audience check would compare an incoming claim against whitespace; and for the four pinned URLs the
+same test defers the failure to the https check, which then reports a SCHEME problem for what is really
+a missing value. The fix is one character class: strip before testing, exactly as the sibling guard
+does. **NOT BUILT HERE:** `messagefoundry/config/settings.py` was held by another live session's
+uncommitted work and the collision gate refused the edit; the finding is recorded so it is not lost.
+**The cell does not move on it** -- a blank value also rides the authorization request and fails closed
+at the identity provider, so this is config hygiene on a fence the record calls load-bearing.
 ## 1162. research an honest pass for ASVS 11.1.1 -- a key-management policy covering all six keys, and an oversharing bound that does not fight escrow
 
 > 🔢 **Re-scored 2026-08-20 -> P3.** Value **2/10** · Difficulty **2/10** · _fill-in_. The one-of-six scope gap and the missing oversharing bound are both answered in the shipped document, and the answer took the honest route the item demanded rather than re-declaring the scope. What is left is re-verifying the cell against that text and rewriting its residual, which is a verifier run plus a vault edit rather than repo work. _(was 6/10 · 5/10.)_
@@ -11053,6 +11119,37 @@ Nothing here touches the TLS/FTPS context in the same module, which was already 
 
 **OWNER RULING 2026-08-22 -- a strict positive allowlist. The re-scoping removed the cheap arm of this ruling before it was put.** The packet priced one reading as cheap because the operator cipher knob admitted CCM-8, a Disallowed but cryptographically strong mechanism, which is where candidate lists differ. Run end-to-end through the *shipped* context builder rather than through the validator alone, that same documented `[api].tls_ciphers` knob installs `ECDHE-RSA-NULL-SHA` (no confidentiality) and `ADH-AES256-GCM-SHA384` (no peer authentication) on a browser-facing listener, with every gate saying yes. Those fail every candidate list, so **the build is required under both readings** and the ruling decides only allowlist width. The ruling is: admit only suites appearing on every current candidate list, refuse everything unnamed, and refuse at config load. At zero deployments the compatibility cost of being strict is zero. The build is filed as **#1317**, which also records the trap: `_is_forward_secret` is not the defect -- both bad suites genuinely ARE forward-secret, and forward secrecy is simply the only property anything tests.
 
+
+**RE-READ 2026-09-06. WHICH LIST BINDS IS SETTLED, AND IT IS NOT APPENDIX C -- this item's
+binding-list claim is WRONG, and so is the Appendix C reading it rests on.** The ASVS 5.0.0 V12
+chapter that CARRIES 12.1.2 names its own references, verbatim: *Mozilla's Server Side TLS
+configuration guide* and *Mozilla's tool to generate known good TLS configurations*. Appendix C scopes
+itself in its own words to complementing the **Cryptography** chapter, which is V11, and 12.1.2's word
+is "recommended" rather than "approved". **So Mozilla Server Side TLS 5.7 binds**, and its Intermediate
+`openssl` list is nine TLS 1.2 suites, all AEAD, zero CBC. **Two further corrections.** This item says
+that dropping the six CBC suites leaves seven AES-128 suites *"also Legacy, one of them
+`TLS_AES_128_GCM_SHA256`"* -- false: Appendix C marks **GCM status A with an empty Restrictions cell**,
+and **CBC** is the row marked **L**. The item conflated a 128-bit key length with a Legacy status that
+belongs to CBC MODE, and its conclusion that the forbidden move *"pays the interop cost and still fails
+limb 1"* rests entirely on that. Corrected, the move succeeds under either candidate list. And
+`config/tls_probe.py` should not be graded as engine support for limb 3: `__main__.py` gates it on
+`tls_terminated_upstream` AND PHI AND enforcing AND a public origin, so it fires only in Posture B and
+it measures the OPERATOR'S proxy. **What is newly true and nobody wrote down: #1317 landed and
+`_APPROVED_TLS_SUITES` (`config/tls_policy.py:570`) already IS Mozilla Intermediate** -- the three TLS
+1.3 suites plus eight of Mozilla's nine, missing only `DHE-RSA-CHACHA20-POLY1305`. The operator knob is
+a strict positive allowlist, verified by execution with a passing control. **What holds the cell short
+is that the same list does not govern the SHIPPED DEFAULT**, which is CPython's inherited 17 suites,
+of which exactly six are the CBC-SHA2 family that lives in Mozilla **Old** and never in Intermediate.
+**The interop justification for keeping them DOES NOT EXIST:** a tree-wide grep for the hospital-peer
+claim returns three hits, all inside `tls_policy.py` itself -- the docstring asserting it and the
+comment quoting it -- against a control of 93 `harden_cipher_suites` hits in the same run. Removal is
+one file: pass the approved list to `set_ciphers` inside `harden_cipher_suites` before the four
+assertions, and invert the comment that currently argues the allowlist must never touch an inherited
+context. The peers that would lose interop are TLS-1.2-only ones offering ONLY ECDHE/DHE CBC-SHA2 with
+no GCM or ChaCha20 suite, which is Mozilla Old territory. Adjacent and confirmed:
+`ide/src/engineClient.ts` claims Node's default suite excludes the weak families, and Node 22.17.1's
+`defaultCoreCipherList` resolves to 52 suites of which 10 are NOT forward-secret; the code fix and the
+docstring correction must land together.
 ## 1176. research an honest pass for ASVS 12.1.5 -- whether ECH is reachable at all before CPython exposes an API
 
 > 🔢 **Re-scored 2026-08-20 -> P3.** Value **2/10** · Difficulty **2/10** · _fill-in_. Re-measured on the pinned runtime: an SSLContext exposes no ECH attribute, the routing half is unreachable from either authoring surface, and the Go sidecar the record leans on was retired from the tree, so the cannot-honestly-reach-pass finding is better supported now than when filed. Difficulty 2 because the deliverable is a recorded finding whose external blockers are confirmable in one probe and two greps. _(was 2/10 · 3/10.)_
@@ -11095,6 +11192,32 @@ Nothing here touches the TLS/FTPS context in the same module, which was already 
 **AND THE LANDED FIX DOES NOT MOVE THE CELL -- REPORTED BY THE RESEARCHING SEAT, 2026-08-22, AS ITS OWN FINDING.** In their words: `#488` carries this item's work and is *"fine as a defect fix, but do not read it as moving the cell... cannot honestly reach pass, verdict stays fail. A real defect closed, not a verdict change."*
 
 **So this item and its cell close on different evidence, and the item closing first is the normal case.** Whoever re-scores reads the researching seat's finding, not this item's status banner -- a shipped fix is a necessary and routinely insufficient condition for a verdict to move, and treating the two as one step is how a cell gets marked pass off a green board.
+
+**RE-MEASURED 2026-09-06. The blocker reproduces and BOTH of this item's proposed product fixes have
+SHIPPED, so its work list is stale rather than false.** Executed on the pinned interpreter: CPython
+**3.14.6** (satisfying the `>=3.14` floor), OpenSSL **3.5.7**, and `[a for a in dir(ssl) if 'ech' in
+a.lower()]` returns **zero**. The `cryptography` wheel reports a bundled OpenSSL 4.0.1, but it is
+statically linked into `_rust.pyd` and reachable by no `ssl` API, so this item's narrowing still holds.
+The ADR 0139 Go re-originator is **not in the tree** -- it was retired 2026-08-10 by owner ruling
+(#1011) and what ships is the engine-side routing plus a published contract for an operator-supplied
+sidecar; the hop it creates is cleartext LOOPBACK, refused outright if non-loopback, so it is not a
+network exposure. Shipped since this item was written: the non-REST closure is hoisted into
+`transports/base.py` at `build_source`/`build_destination` rather than copied per connector, and
+`transports/http_auth.py` threads `ech_sidecar` end to end, closing the token-endpoint SNI seam.
+**One residual reproduces and was reproduced by EXECUTION rather than inherited:**
+`tests/test_ech_egress.py` `test_both_refusal_sites_carry_the_same_message` does not witness the seam.
+Disarming ONLY the seam at runtime left the test green, because SOAP also routes through
+`egress_route_from_settings`, which raises the identical constant -- so the first `pytest.raises` block
+cannot tell which site fired. The repair is one test file and moves nothing: assert on a connector that
+reaches only the seam, and confirm it reds under the plant. **Grade it `fail`, not "the ceiling is
+partial":** nothing in the honest path conceals a single SNI byte, and a reader taking the softer
+phrase as licence to move the cell would record a posture-neutral movement. **DATED RE-CHECK, and the
+blocker is now one conjunct -- CPython must ship an `ssl`-module ECH API.** Re-run the probe above at
+**CPython 3.15.0 final, or 2027-05-01, whichever is sooner**; trigger early on a CPython release
+bundling OpenSSL 4.0 or later, or on the `ssl` ECH pull request merging. Pass condition: the `dir(ssl)`
+probe returns non-empty AND a client context has a `set_ech_config` attribute. Even then the cell stays
+short on the second wall, because ECH is not unilaterally satisfiable -- a re-measured DoH type-65
+probe of the EHR and FHIR hosts in scope must find at least one publishing an `ECHConfig`.
 ## 1177. research an honest pass for ASVS 12.2.1 -- refusing a cleartext outbound hop that carries a body rather than a credential
 
 > 🔢 **Re-scored 2026-08-20 -> P2.** Value **5/10** · Difficulty **2/10** · _fill-in_. The outbound refusal the item was filed against ships and fires on the DEFAULT posture, not only in production: enforcement defaults to ENFORCE at settings.py:3654 and feeds enforcing at :2471, so a cleartext non-loopback http destination is refused at construction unless the operator explicitly attests the hop, declares cleartext_accepted, or turns the dial to warn. The scored remainder is the honest-pass adjudication only, whether an audited operator declaration can carry an L1 pass and the unsettled narrow-versus-broad V12.2 reading, which is reading plus a scorecard re-read. _(was 8/10 · 5/10.)_
@@ -11127,6 +11250,35 @@ Nothing here touches the TLS/FTPS context in the same module, which was already 
 
 **Still not an honest pass:** the item's named trap holds -- an owner ruling adopting the narrow reading moves the cell with no code change, and the record supplies its own tell, since the same exposure is carried by 12.3.1. But it is no longer the tempting move; the tempting move now is the opposite, re-scoring to pass on the newly-found outbound refusal alone, which grades the inbound and outbound limbs and silently drops the client limb -- "covers only part of the in-scope surface" verbatim. Nor declaring the IDE's tokenless probes out of scope because they carry no credential (the verb says all connectivity, not all credentialed connectivity, and the poll fires every fifteen seconds against whatever the setting names). Nor making `cleartext_accepted` refuse under enforcement and calling that the fix: defensible product work, but it touches neither the client limb nor the fallback limb, and it would remove raw TCP and X12 from off-loopback use on every enforcing instance until the unbuilt raw-transport TLS work lands -- buying the cell with the product's purpose. Nor citing `check_egress_allowed`, a host-and-port allowlist blind to scheme, which cannot express the requirement at all. Proposed work, unallocated and by subject: validating the IDE engine-URL setting at read; promoting the IDE target gate from a credential gate to a connectivity gate across the status-bar probe, its poll and read-environment callers and the AI-policy read, with a distinct rendered state so a refusal does not render as an outage; naming and overturning the browsable-URL gate's documented rationale so the two external-launch sites stop handing the OS browser a cleartext off-box origin; refusing rather than degrading a non-loopback cleartext tray engine URL, and explicitly NOT adding an https-then-http probe, which would create the fallback this cell forbids; deleting the apiclient non-loopback warn-and-cross escape (zero deployments, so the removal costs nothing) and updating the two load-harness call sites; adding a scheme gate to the two Vault client constructions, routed through the one authority AND its refusal floor rather than the bare authority, which only warns on a non-enforcing instance; a limb-A decision on the upstream-termination relaxation -- record it in the residual or close it by requiring a loopback bind when TLS terminates upstream; retiring the residual's false outbound sentence and re-anchoring onto the outbound refusal and its call sites; and correcting the off-loopback deployment note that tells operators the cleartext-egress refusal is PHI-posture gated, measured false at HEAD where it refuses on every posture.
 
+
+**RE-MEASURED 2026-09-06. THE OUTBOUND BODY LIMB DOES NOT REPRODUCE -- every body-carrying hop is
+gated, on every posture -- and this item's residual sentence asserting otherwise should be RETIRED.**
+The two functions are distinct and must not be conflated: `refuse_cleartext_egress` (`rest.py:578`)
+keys on the BODY, `refuse_cleartext_credential_hop` (`rest.py:510`) on a named CREDENTIAL. The body
+guard is called from `rest.py:1297`, `soap.py:381`, `fhir.py:373` and `:907`, and `dicomweb.py:246` --
+every HTTP-family destination plus the FHIR read path. Of the 14 registered outbound connectors, the
+seven socket and data-layer ones reach the same shared authority through `InsecureHopGuard.capture`,
+and `File` needs no guard. Executed across three postures with controls: a cleartext off-box REST or
+SOAP destination is REFUSED on production-PHI-enforcing, on enforcing-non-PHI AND on the NON-enforcing
+staging posture, via the decision-5 floor, while the loopback and https controls build. **A security
+record that under-claims a shipped fail-closed refusal is something operators configure around, which
+is why the retirement matters.** **What actually holds the cell short is the IDE client limb, and it
+reproduces:** `ide/src/engineTarget.ts` `assertTargetAllowed` is a real refusal whose message reads
+*"refusing to send credentials over plain http"* -- a CREDENTIAL gate, where this verb ranges over
+connectivity -- and its sibling `assertBrowsableUrl` deliberately DROPS the cleartext-off-box check on
+the documented ground that opening a console page sends no credentials, a rationale that does not hold
+for its own second caller, the sign-in path. Smallest honest change: validate
+`messagefoundry.engineUrl` at read in `ide/src/cli.ts`, which all five paths derive from, and promote
+`assertTargetAllowed` to a connectivity gate, correcting its message; overturning the
+`assertBrowsableUrl` rationale must land in the same change or the revert is invited. **One narrow
+finding that is NOT a 12.2.1 hole and should be filed as a consistency defect:**
+`transports/direct.py` is the single body-carrying destination whose cleartext decision does not route
+through the one shared authority, using the `is_phi`-keyed process-wide env escape where its
+`email.py` sibling was deliberately moved onto `InsecureHopGuard`. Measured: on an enforcing NON-PHI
+instance with the escape set, `direct.py` permits where the shared authority refuses. Two honest
+caveats -- the Direct payload is S/MIME signed and encrypted, so the exposure would be envelope
+metadata rather than the clinical body, and 12.2.1's verb names HTTP-based services, so SMTP falls to
+12.3.1. Anchor drift: `settings.py:3654` resolves at `:3715`, `:2471` at `:2532`.
 ## 1178. research an honest pass for ASVS 12.3.1 -- what a no-fallback claim means under the owner-ratified cleartext gradient
 
 > 🔢 **Re-scored 2026-08-20 -> P2.** Value **7/10** · Difficulty **4/10** · _quick win_. Both limbs re-read at HEAD and both hold: transports/tcp.py:150-152 and transports/x12.py:124-125 declare cleartext_accepted a PERMANENT, STRUCTURAL declaration with no tls parameter to migrate to, and config/tls_policy.py:503-519 documents the loopback, hop_attested, cleartext_accepted and not-enforcing arms ahead of REFUSE. Value 7 because a first deployment would put a raw-TCP or X12 partner hop on the wire in the clear with no in-product configuration that changes it; difficulty 4 because this item's own remainder is the reading against the ADR 0153 gradient plus an owner ruling, with the connector TLS build tracked at #311. _(was 7/10 · 5/10.)_
@@ -11166,6 +11318,22 @@ Nothing here touches the TLS/FTPS context in the same module, which was already 
 
 **Scope held deliberately narrow, and three things are measured-and-unclosed.** (1) The SQL Server preset keeps its own posture-keyed weakened-TLS refusal; moving that arm onto this gradient would ADD the loopback and `cleartext_accepted` relaxations to a path that refuses today, which is a loosening. (2) The `database.py` attested-before-the-clamp ordering stands: the clamp it precedes is the global `MEFOR_ALLOW_INSECURE_TLS` escape, so per-connection-attestation-then-clamped-escape is the ratified precedence, and moving it would retire the attestation arm on this cell -- which is the owner-gated question, not this build. (3) The `(trust or not encrypt)` condition still lets `tls_hop_attested=true` emit an outright plaintext `Encrypt=no` ODBC session rather than only verify-off. Narrowing it would make the module's two dialects disagree about what an attestation licenses, since the shared gradient's arm 2 lets an attestation ALLOW a cleartext hop everywhere else. It belongs to the item's own "re-scoping the attestation retirement across every consumer of that flag", which is owner-gated. The remaining data-layer sites and the partner-feed scope question are both untouched, so the cell does not rescore on this alone.
 
+
+**Built 2026-09-06, and it is one call site rather than a data-layer hop: the shared reachability probe
+no longer opens a plaintext socket for a hop the configuration says is encrypted.**
+`probe_tcp_reachable` (`transports/base.py`) dialled plaintext unconditionally, so `test_connection` on
+a `tls=true` MLLP destination tested a transport the operator never configured. It now takes a
+keyword-only `ssl_context` and, when given one, dials with it and with `server_hostname` exactly as the
+delivery dial does. Two consequences on a first deployment, and the second is the one an operator
+feels: the engine would fall back to an unencrypted protocol on an encrypted hop, which is this cell's
+own verb; and a broken certificate, CA or hostname would pass a GREEN connection test and then fail
+every delivery, because the probe never performed the handshake. **MLLP is the only socket destination
+with the mismatch** -- `tcp.py` and `x12.py` carry zero `ssl` references, so their cleartext probe is
+honest, and the DICOM SCU already associates its C-ECHO through the same `tls_args` as a C-STORE.
+**The MLLP CALL SITE IS UNLANDED and is the remaining half:** `transports/mllp.py` was held by another
+live session's uncommitted work and the collision gate refused the edit, so `MLLP()` is unchanged until
+one line passes `self._ssl` through. **The cell does not move on this** -- the partner-feed scope
+question and the remaining ungated data-layer hop sites are both untouched.
 ## 1179. research an honest pass for ASVS 12.3.3 -- internal-hop transport encryption when a certificate cannot be a shipped default
 
 > 🚧 **IN PROGRESS 2026-08-22 -- builder-1 lane**, banner written by the dispatcher: `BUILDER.md` puts banner flips outside a builder's lane and the lane-versus-broadcast expiry is ambiguous enough that two builders read it differently, so this seat writes it. Claimed via `claim.ps1`; the coord ledger and this banner are different artifacts with different writers. The 2026-08-20 pass is being applied in its own order -- scope correction first, then the shipped-surface refusal case, then the build. **Not a closure.**
@@ -11218,6 +11386,26 @@ Nothing here touches the TLS/FTPS context in the same module, which was already 
 
 **MEASURED AND DELIBERATELY LEFT, so nobody reads the clamp as more than it is.** The clamp is scoped to NON-loopback hops, so the shipped client default is untouched: `EngineClient`'s `base_url` still defaults to `http://127.0.0.1:8765`, and a loopback http request against a TLS listener returned the same `ReadError` after this change as before it. That is the *first-party client scheme migration*, a separate line in this item's proposed work, which moves `tray/` and `ide/` in lockstep and which ADR 0172 sizes as an XL. It is not this pass's, and on shipped defaults those bytes would stay on loopback. The `tls_terminated_upstream` hop, the IDE certificate-authority seam and the partner-feed scope question are all likewise untouched, so **nothing here shortens what holds this cell short.**
 
+
+**RE-VERIFIED 2026-09-06. Everything this item's own amendments claim landed HAS landed, and NO BUILD
+REMAINS ON THE ENCRYPTION LIMB.** Confirmed by symbol: `ensure_api_tls_material` mints when
+`[api].tls_cert_file` is unset and `uvicorn.run` receives the context (one occurrence in engine
+source); `docker/Dockerfile` is a single https probe arm with the cleartext fallback gone; the IP-SAN
+fix is live at both coupled sites in `pki.py`; and the apiclient clamp is live at three call sites.
+**Keep the two limb classes apart, because only one of them carries the cell.** The hops that CANNOT be
+encrypted number exactly ONE: the `tls_terminated_upstream` proxy hop, where `api/tls.py` returns None
+BY WRITTEN DECISION, with the reason in the code -- serving https underneath that proxy breaks the
+proxy's own hop. That is the deliberate exclusion `CLAUDE.md` section 2 names, no product change
+reaches it, and refusing to start over it would contradict the shipped decision. The hops that merely
+DEFAULT unencrypted are weaker: three first-party client defaults still spell `http`, but since ADR
+0172 the engine's end is https, so each writes plaintext into a TLS socket and the connection breaks --
+a broken client rather than a working cleartext channel, and on shipped defaults the bytes stay on
+loopback. `proxy_intra_service_auth` remains measurably inert, six tree-wide occurrences outside tests
+of which three are message strings. The IDE certificate-authority seam is still absent, re-measured
+with this item's own control: zero hits across 108 TypeScript files against a positive control firing
+five times in the same run. **The closing act here is a re-score and not a Builder's**, which is the
+honest outcome rather than a shortfall. Anchor drift: `uvicorn.run` moved from `:2868` to
+`__main__.py:3184`.
 ## 1180. research an honest pass for ASVS 12.3.4 -- narrowing internal TLS trust when the anchor is an artifact only the deployer holds
 
 > 🔢 **Re-scored 2026-08-20 -> P2.** Value **7/10** · Difficulty **6/10** · _big bet_. Both shortfalls confirmed at HEAD: the anchor ships off, and on the HTTP egress family it is inexpressible, since resolve_trust_anchor reaches only dicom, mllp and remotefile while rest.py and soap.py expose verify_tls alone and both hvac sites pass no CA. On a first deployment every internal REST, SOAP, FHIR, DICOMweb and Vault hop would verify against the whole OS store, including the hop that hands out the store data-encryption key. Difficulty 6 because this is a client-construction change across rest.py, soap.py and both hvac sites plus a refuse-versus-fall-back posture decision, not a default flip. _(was 7/10 · 6/10.)_
@@ -11252,6 +11440,48 @@ Nothing here touches the TLS/FTPS context in the same module, which was already 
 
 **Still not an honest pass:** the item's two traps hold -- shipping `trust_anchor_mode = "pinned"` as the default is refused at config load without an internal CA (`config/settings.py:1025-1031`) so every stock configuration would fail to start, and arguing that a hospital's OS trust store IS the enterprise CA is a property of the operator's image build laundered into a product control. The sharpest trap is a third the item does not name: the cell's own re-score trigger says to watch for the anchor resolver or a CA parameter appearing on those HTTP factories, so **the expressibility work trips that trigger by construction, and if it lands and the cell is re-scored while every default is still permissive, that is wiring an existing toolkit into the pipeline so an absence claim stops firing -- wearing the hat of a trigger the cell wrote for itself.** Expressibility must never be scored without the forcing control. Two more, both reachable from the record: re-scoring on the discovery that the generic ODBC dialect passes operator keywords through (a newly FOUND opt-in capability is not a newly BUILT control, and that dialect is not the default), and re-scoring on the syslog hop (one hop of roughly a dozen, reached only by opting into a non-default protocol). Proposed work, unallocated and by subject: the HTTP-egress trust-anchor threading across ALL FOUR factories that lack a certificate parameter, including the lookup executor's own opener map and the separate webhook opener; the Vault client CA argument and scheme gate, with the honest note that it needs new settings and a posture handle on a lazy environment-fed path rather than reusing the shipped ladder; the FTPS factory's lost CA and verification parameters; the DATABASE default-dialect server-certificate parity fix, which the store code already emits against the identical driver; the tray probe CA pin; the IDE certificate-authority setting AND a separate IDE-side forcing rule with its own publicly-certified-peer arm, since no engine-side gate can reach a separate process; the anchor-discipline posture gate, owner-gated and specified against a public-chain-probe predicate wherever measurement is possible with the declaration arm confined to the ODBC and Schannel hops; posture reporting of an unnarrowed internal hop as a first-class loosening; an explicit disposition for the augmenting trust mode, which keeps the OS roots and so does not satisfy the word ONLY; an ECH-sidecar egress ruling rather than leaving it in the unknowns while a pass is claimed; and extending the anchor-integrity preflight beyond the three auth-path anchors.
 
+
+**RE-MEASURED 2026-09-06. The two stated shortfalls reproduce; THREE of this item's supporting claims
+do not, and the third changes what a build must include.** **Correction 1, the resolver's reach is
+WIDER than stated.** `resolve_trust_anchor` (`config/tls_policy.py:1276`) reaches dicom, mllp and
+remotefile as recorded, and also **three SMTP hops** -- `transports/email.py`, `transports/direct.py`
+and `pipeline/alert_sinks.py` -- indirectly through `build_smtp_tls_context`. That is a fourth pattern
+and it is the one worth copying: the builder lives in `tls_policy.py`, so a transport imports one
+function and never touches the resolver. `rest.py` imports 13 names from `tls_policy` and none is the
+resolver; `soap.py` imports exactly two. **Correction 2, the factory count and the gap set.** There are
+**24** uppercase factories in `wiring.py`, not 25. Probed by signature with `Rest(verify_tls=True)`
+accepted as the positive control and `Tcp()`/`X12()` as TLS-incapable negative controls, the gap set is
+**FIVE**: `Rest()`, `FHIR()`, `DICOMweb()`, `FhirLookup()` and **`Ftp()`**, which this item does not
+name and which is the sharpest case -- `remotefile._ftps_ssl_context` READS six TLS settings that the
+factory writes none of, so `Ftp(tls_ca_file=...)` raises `TypeError`. Two qualifiers: `Http()`'s
+`tls_ca_file` is a SERVER-side client-cert CA and counting it as expressibility would be an error, and
+`Direct()`'s `trust_anchor` is the S/MIME message-layer CA, which the docstring already warns is easy
+to confuse. **Correction 3, and it refutes this item's answer to its own third unknown.** The
+attestation template's POLICY and VALIDATION halves ship as described, but a **fourth limb the item
+never checked is missing: `tls_hop_attested` has NO AUTHORING SURFACE.** `Rest(tls_hop_attested=True)`
+and `MLLP(tls_hop_attested=True)` both raise `TypeError`; it is in no factory signature and in neither
+`_INBOUND_KEYS` nor `_OUTBOUND_KEYS`, so `connections.toml` refuses it too -- and the repository
+already says so in `docs/CONNECTIONS.md` and `docs/CONFIGURATION.md`. So *"the answer is yes, and the
+pattern already ships"* is wrong as written: an anchor attestation copying it verbatim would be
+validated, read, honoured and unreachable. **The Vault correction this item already carries is right in
+direction and needs one refinement:** both `hvac.Client` sites pass no CA and `requests` defaults to
+the certifi PUBLIC bundle, read from the lock-pinned source rather than an installed copy, so an
+internal-CA Vault FAILS CLOSED -- but *"cannot reach one at all"* is too strong, because hvac reads
+`VAULT_CACERT` when `verify` is None, which is exactly what both sites produce. That is an environment
+workaround rather than product configuration, and `VAULT_CACERT` appears nowhere in this repository.
+There are also **three** consumers, not two: `store/crypto_transit.py` reuses
+`keyprovider_vault._build_client`, so one fix covers two. **Cost of the expressibility build is LOWER
+than this item prices it**, for a reason neither pass recorded: `Destination.trust_anchor_policy` is
+already a typed field threaded at the single `_dest_config` choke point and delivered to all four HTTP
+destinations, which simply never read it, and a per-connection `tls_ca_file` rides the existing
+settings mapping -- so `FhirLookupExecutor` needs no signature change and `connections.toml` inherits
+the fix free, because the factory is the schema. The one non-mechanical part is the opener: `pinned`
+mode cannot reuse urllib's context, and a fresh one must explicitly replicate the ALPN and
+post-handshake-auth settings urllib sets and `create_default_context` does not, or the pinned hop
+silently loses both. **BUILD IT AND DO NOT SCORE IT** -- expressibility trips this cell's own re-score
+trigger by construction, and landing it while every default stays permissive is the trap this item
+names. Anchor drift: `trust_anchor_mode` at `config/settings.py:1031`, `internal_ca_file` at `:1025`,
+the pinned validator at `:1033-1048`.
 ## 1181. research an honest pass for ASVS 12.3.5 -- intra-service endpoint authentication on an engine whose coordination is store-mediated
 
 > 🔢 **Re-scored 2026-08-20 -> P2.** Value **6/10** · Difficulty **7/10** · _big bet_. The setting is still attestation-only: its sole consumer at settings.py:850 collapses four values to a boolean, so a declared "mtls" changes nothing. Value 6 rather than 7 because the hop the item's own severity names is genuinely closable today -- setting [api].tls_client_ca_file makes the API listener CERT_REQUIRED-verify the proxy's client cert (api/tls.py:58-62) -- so the gap is an unverified declaration beside a working control rather than an unavailable one; difficulty 7 because an honest pass must decide whether an attestation-only setting should exist at all, whether mutual PKI is reachable for the store and Vault hops given the drivers in use, and whether the IDE, tray and apiclient fall inside the requirement's scope. _(was 7/10 · 7/10.)_
@@ -11387,6 +11617,25 @@ Nothing here touches the TLS/FTPS context in the same module, which was already 
 **That makes FIVE of this wave's items with code on `main` and ZERO with a closed banner.** The gap is systematic, not per-item: a merge lands engine code and touches no ledger line, so every one of them reads as unstarted to the next lane.
 
 **The landing seat verified the allowlist in both directions and nearly filed a false alarm doing it** -- a slash-less `git show origin/main:.gitleaks.toml` is rewritten by MSYS path conversion into an invalid revision, and its empty output read as nine missing literals. **A pre-existing literal used as a positive control is what caught it**, because that too came back missing and a repo cannot lose a line nobody touched.
+
+**RE-MEASURED 2026-09-06. THE REDACTION LIMB NO LONGER REPRODUCES. The read-privilege limb does.**
+All five strings this item recorded as surviving VERBATIM are now redacted at HEAD, executed together
+with both of its original positive controls and a negative control that proves the instrument
+discriminates rather than blanket-scrubbing: `password=hunter2`, `Driver=x;PWD=hunter2;`,
+`secret=hunter2`, `postgres://mefor:hunter2@db.invalid:5432/mefor` and the exact cast-failure echo
+`setting 'password' (env 'MEFOR_VALUE_PW'='hunter2')` all lose the value while an ordinary log line
+carrying no secret passes through untouched. `support/redact.py` now carries `_CREDENTIAL_KV`,
+`_DSN_PASSWORD` and a quote-tolerant `_MEFOR_SECRET`, and its docstring records that every pattern is
+derived by AST in `tests/test_log_redaction_secret_domain.py` and must be claimed by a named secret
+family -- the machine-closed domain this item asked for. The bearer defect is fixed and the item
+already records it. **This item's `0o077|0o044|S_IROTH|S_IRGRP` absence measurement still holds**,
+re-run with the write-class mask as the positive control in the same pass: the read-class search
+returns a single hit and it is a display format string in an error message, not a policy test, while
+`0o022` fires three times across `auth/trust_anchors.py` and `config/wiring.py`. So the load-bearing
+limb is unchanged and the reusable pure evaluator is still where this item says it is. **Not built
+here, and the reason is scope rather than difficulty:** the preflight's own discovery source, the
+machine-closed file-borne asset registry, does not exist, so the mask swap this item prices at a
+re-derivation is gated behind building the registry first.
 ## 1184. research an honest pass for ASVS 14.2.1 -- getting the PHI search needle off the query string without breaking GET search
 
 > 🔢 **Re-scored 2026-08-20 -> P1.** Value **8/10** · Difficulty **6/10** · _big bet_. All three sibling routes still take the needle on the query string (api/app.py:3020-3022 and :3112-3114, uploaded_logs.py:173-175 with the anchor moved from :88), and logging_setup.py:174-177 records that uvicorn emits the full request line including the query string into the stream NSSM captures and an off-box forwarder ships, with neither parameter in _CREDENTIAL_QUERY_KEYS. Value 8 because redaction.py's own docstring at :68-72 concedes the residual is single-token identifiers, so an operator-typed MRN would survive into that log on a first deployment, and proxy logs, browser history and referrers are outside any filter; difficulty 6 because moving the needle off a GET URL is cross-cutting across the API, console, harness, IDE extension and apiclient, each of which must be priced explicitly. _(was 8/10 · 6/10.)_
@@ -18874,6 +19123,32 @@ federation on, the authorization request would travel the browser-visible front 
 identity provider is the only party positioned to reject tampering. That is true, and it is not by
 itself a finding against this cell.
 
+
+**RESEARCHED 2026-09-06 against the ASVS 5.0.0 corpus at tag `v5.0.0`, fetched rather than paraphrased.
+THE APPLICABILITY QUESTION THIS ITEM SAYS WAS NEVER ASKED HAS NOW BEEN ASKED, AND IT DISPOSES OF THE
+CELL: `na` ON SCOPE.** The pinned text is *"Verify that grant type 'code' is always used together with
+pushed authorization requests (PAR)."* Its `section_id` is **V10.4**, `section_name` **"OAuth
+Authorization Server"**, and the chapter's own prose under that heading reads *"These requirements
+detail the responsibilities for OAuth authorization servers, including OpenID Providers."*
+**This engine hosts none.** Its 93 API paths include no `/authorize`, `/token`, `/par`, `/introspect`,
+`/revoke` or `/.well-known/openid-configuration`; an absence grep for the authorization-server
+vocabulary returns ZERO across the engine and web console against a live positive control of 61 hits
+for the CLIENT-side terms in the same file set; and `auth/tokens.py` `mint_token` mints the engine's
+own opaque session tokens, not OAuth tokens for third-party clients. **Four reasons the passive-voice
+counter-reading fails**, stated because it is the reading that moved this cell off `na` once already.
+ASVS 5.0 splits V10 BY ACTOR and assigns each section in its own intro prose. Every PAR mention in the
+chapter sits inside V10.4; V10.2 "OAuth Client" holds three requirements and names PAR in none of them,
+and V10.5 "OIDC Client" holds five and does the same, so ASVS placed no PAR obligation on a client
+anywhere. The sibling rows 10.4.10, 10.4.12 and 10.4.15 all say "the authorization server" outright, so
+10.4.13's passive voice is elision inside an already-scoped section. **And independently of all three:
+a PAR client could not satisfy this verb at all** -- the requirement is that grant type code is ALWAYS
+used with PAR, and only an authorization server can enforce "always", because only it can refuse a
+non-PAR request. **Do not scope PAR. No engine build is owed.** The narrow engineering statement this
+item already carries survives and is unaffected: on a first deployment with federation on, the
+authorization request would travel the browser-visible front channel. **One thing the record holder
+must check that a Builder cannot: if the sibling V10.4 cells are already `na` on scope, then this cell
+alone sitting at `needs-review` is an internal inconsistency, and it points at the move off `na` as the
+error rather than at any engine defect.**
 ## 1356. PR 487's five-file resolver conflict is a judgment merge whose obvious resolution re-arms a fixed defect
 
 > 🔢 **Filed 2026-08-22 by the lander, under a live 5-hour rung, because it cannot be finished in the remaining window.** Value **5/10** -- Difficulty **5/10**. PR **#487** (`lander/432-resolved`, draft, 45 ahead / 26 behind) conflicts with `origin/main` in FIVE files, all in the bash-interpreter resolver area that **#505** rewrote: `tests/_bash_resolver.py`'s consumers plus `tests/tooling_manifest.txt`.
