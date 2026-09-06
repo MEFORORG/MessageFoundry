@@ -119,6 +119,7 @@ tests/test_merge_gate_controls.py
 tests/test_negative_controls.py
 tests/test_new_dependency_check.py
 tests/test_nightly_notice.py
+tests/test_operator_docs_no_warning_sign.py
 tests/test_private_paths_stay_ignored.py
 tests/test_push_guard.py
 tests/test_quality_advisory_invariants.py
