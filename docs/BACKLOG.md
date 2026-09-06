@@ -8930,6 +8930,79 @@ That covers every startable topology, not just the loopback default. The one pos
 
 ## 1139. research an honest pass for ASVS 6.3.7 -- notifying a user whose authentication details the directory changed
 
+> **PARTIAL 2026-09-05 (builder), NOT A CLOSURE -- this item stays OPEN.** Establishes what is
+> actually left, and the answer is not "a re-score". **The 2026-09-04 build LANDED** -- PR 853,
+> `bad4bdfdb`, an ancestor of `main` at `a083cdb89`. Do not rebuild it. Everything the banner below
+> named as still standing was re-measured here, limb by limb, at that ref, and **all of it still
+> stands**.
+>
+> **AN HONEST PASS IS STILL NOT REACHABLE, and the blocker is a missing control arm rather than a
+> record question.** The pinned verb is that users are *notified*. Three birth paths still land
+> `users.notify_email` NULL, and an account holding NULL receives nothing:
+> `_ensure_bootstrap_admin` calls `create_user` with no `email=` at all (`auth/service.py`);
+> `create_user` takes `email: str | None = None` on all three backends and `seed_notify_email`
+> normalises blank to NULL (`store/store.py`); and a directory account whose `mail` attribute the
+> directory never returns is born with none. On a first deployment the account holding
+> `frozenset(Permission)` would be one of them.
+>
+> **The startup gate does not close that, and it says so itself.**
+> `_assert_security_notice_is_deliverable` (`api/app.py`) returns early unless `auth.enabled`,
+> `notify_security_events`, `[alerts].security_notifications_required` and a PHI posture all hold;
+> it then asks only whether SOME enabled Administrator carries an address, and under `warn` it only
+> logs. A non-administrator is not covered, nor is administrator two of two, nor any account born
+> without an address after the lifespan has already run.
+>
+> **RE-MEASURED AND STILL STANDING**, each read in the code rather than carried over: the
+> first-login set-address step is unbuilt; the startup assertion is still scoped to *some enabled
+> Administrator*; `delete_webauthn_credential` notifies only `if last_second_factor`, so removing a
+> passkey while another factor remains writes an audit row and no notice; and
+> `AuthService.update_user` takes ONE `email` parameter and feeds it to both `update_user_profile`
+> and `set_user_notify_email`, so the two addresses cannot be set apart. The nineteen
+> `_notify_security` call sites do all read `notify_email` -- that count and that property were
+> re-measured (19 `await self._notify_security(` plus the one definition, and none outside
+> `auth/service.py`), not assumed.
+>
+> **BUILT HERE, and it is the smallest of the five: the silent drop now says so.**
+> `SecurityEventNotifier.notify` returned on `if not event.email` without a word. It was the only
+> silent drop of the three in that class -- a full queue warns and a failed send warns -- and it is
+> the most permanent, because those two are transient while an account carrying no address loses
+> every later notice, not one. It now logs a WARNING naming the event type and the username, never
+> `event.detail` (an EMAIL_CHANGED carries an address in it). CLAUDE.md section 6 forbids the silent
+> swallow independently of ASVS.
+>
+> **THAT DOES NOT MOVE THE VERDICT AND MUST NOT BE READ AS DOING SO.** A log is not a notice to the
+> user. It converts an undetectable control failure into a detectable one, and it covers exactly
+> where the startup gate cannot see. The comment on the branch names those cases, because the
+> obvious example -- the first-run bootstrap administrator -- is the one case a PHI instance under
+> `enforce` refuses to start over, so the line never runs there. Writing that account as the
+> justification would have been a control resting on a false premise (SDS-3.7).
+>
+> **ONE FOLLOW-ON IS NEW, came out of the review rather than the research, and is a WIDER silent
+> drop than the one just closed -- with a docstring that misdescribes it.**
+> `AuthService._notify_security` opens `if self._security_notifier is None: return`, while its
+> docstring three lines above says *"A missing notifier or a notifier failure is swallowed
+> (logged)"* -- only the failure arm logs. With `notify_security_events` on and no `[alerts]` SMTP
+> host, `security_notifier_from_settings` returns `None`, every notice for every account is dropped,
+> and the lifespan wiring reports nothing either. On a non-PHI instance neither the serve gate nor
+> the startup assertion covers that. Named rather than numbered, because it is unfiled. It sits in
+> `auth/service.py`, held by at least four open pull requests when this was written, so it was
+> deliberately not touched here.
+>
+> **WHAT A GRADER WOULD NOW MEASURE.** The closing act is a scorecard re-score, the record is not in
+> this repository, and nothing here was written to it. Measurable today and not before: every
+> `_notify_security` call site addresses an engine-owned column no directory statement can move; the
+> directory-repoint notice is reachable end to end rather than only structurally present; and an
+> undeliverable notice is reported rather than swallowed. **Still measurably absent:** an account can
+> be born with no notification address, and is then told nothing out of band by any path, for as long
+> as it holds none. A re-score performed today would read 6.3.7 as still short on that arm.
+>
+> Score and status unchanged, so the ranked table above is deliberately not edited. `ruff check`,
+> `ruff format --check` and `mypy --strict` clean over the engine and the changed test; 132 tests pass
+> locally across the notifier, auth service, auth store, notifiable-admin, SMTP TLS and
+> secret-provider legs. The new test was proven red against unmodified source twice -- before and
+> after the `/simplify` pass rewrote it. The full suite was not run locally, and the Postgres and SQL
+> Server legs are hosted-runner only, so **CI is the authority for those.**
+
 > **PARTIAL 2026-09-04 (builder), NOT A CLOSURE -- this item stays OPEN.** Re-measures the banner
 > below and lands the one thing it got wrong. **Three of its four load-bearing claims hold; the
 > fourth is refuted, and it is the claim the item's own question rests on.**
