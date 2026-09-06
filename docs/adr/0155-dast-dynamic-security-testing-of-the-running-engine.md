@@ -164,6 +164,58 @@ second, contradictory answer to the question *has anything independent run?*
 - **AC-11** — WHILE a passage outside the two permitted carriers restates the scope boundary, THE
   SYSTEM SHALL fail the required test legs.
   → `tests/test_dast_claims.py::test_no_stray_paraphrase_of_the_boundary`
+- **AC-12** — WHEN the administrator token is used against the non-`GET` rows, THEN THE SYSTEM SHALL
+  report at least 40 of them answering outside `{401, 403, 429}`, and SHALL probe every non-`GET`
+  BFLA candidate row.
+  → `tests/test_dast_auth_sweep.py::test_receipt_names_what_it_examined`
+- **AC-13** — IF a write probe destroys the session it is probing with, THEN THE SYSTEM SHALL mint a
+  fresh one and record the row, so no later row is miscounted as refused.
+  → `tests/test_dast_auth_sweep.py::test_a_session_destroying_write_probe_does_not_poison_the_rows_after_it`
+- **AC-14** — WHILE write probes destroy the scan session more often than the policy cap allows, THE
+  SYSTEM SHALL exit 2 (could not measure) rather than report a reach number.
+  → `tests/test_dast_auth_sweep.py::test_a_session_that_keeps_dying_fails_closed_rather_than_grinding`
+
+## Amendment — 2026-09-05, non-`GET` reach and BFLA are built
+
+**This supersedes the *Non-`GET` reach and non-`GET` BFLA* bullet under *What this does NOT give us*
+and the mention of them under *Out of scope*.** Both are dated records of the increment-1 decision and
+are deliberately left standing; this section is the current answer. Nothing else about the tier moves
+— the *Scope boundary* section above is unchanged, and this amendment adds no claim to it.
+
+**The bullet's stated blocker was wrong, and measuring it is what showed that.** It said extending past
+`GET` "needs a per-probe store reset". It does not. Three properties do the work instead, and the third
+is the one that was actually load-bearing:
+
+1. **No body is ever sent.** FastAPI solves a route's dependencies — where every `require*()` gate
+   lives — *before* it validates the body and the path/query parameters, so a gate's 401/403 always
+   answers before a 422. Wherever a route declares a body or a required parameter, an empty request
+   therefore stops at validation with the authorization question already answered and the handler never
+   run. Measured against the shipped app: of 55 gated non-`GET` rows, 27 stop at 422 and 20 execute a
+   handler, 11 of those answering 404 because the path placeholder names nothing.
+2. **The target is disposable** — an empty store in a temporary directory, an empty `Registry`, no
+   config dir, destroyed when the sweep returns. An executed handler has nothing real to act on.
+3. **A probe can destroy the session it is probing with.** `POST /auth/logout` answers a valid
+   administrator bearer with 200 and revokes the session; measured, every one of the 44 rows after it
+   then answered 401, scored as refused, and would have landed as an unexplained-unreached finding.
+   One real side effect, 44 false ones, and the collapse of the one number this tier is built on. The
+   answer is **not** a hand-kept skip list — that rots the day a route lands, and it would also stop
+   the sweep measuring the very rows most worth measuring. The sweep re-checks the probing identity's
+   session after **every** write probe and mints a fresh one when a probe destroyed it, so the result
+   is independent of row order and a new self-destroying route is recorded rather than fatal. Rebuilds
+   are capped by the policy; over the cap is exit 2, and so is a re-mint that fails.
+
+**What the passes added.** BFLA now covers **every** candidate row the walk derives — asserted as an
+equation over run-derived numbers, not a hand count — where increment 1 printed a ratio of 19 of about
+60. Write reach measured 47 of 55 rows. The other 8 sit behind an **action-scoped** step-up gate
+(`X-Step-Up-Action`) that a password login does not satisfy, so they are entered in the policy's
+`unreachable_allowlist` with that reason and a guard requires every entry to name a row the live route
+table still has. Both new passes carry their own fail-closed floors, and the `bfla` canary now floors
+its GET and write violations **separately**: with one combined count, a write pass that had gone blind
+would still be certified by its neighbour.
+
+**Still out of scope, unchanged:** schema-driven breadth, the unauthenticated MLLP/TCP/X12/DICOM
+ingress plane, DICOM DIMSE, the `/ui` console plane, a TLS black-box target, the shipped-defaults
+controls probe, and the relaxed posture.
 
 ## Options considered
 
@@ -237,10 +289,11 @@ receipt needs the same boundary.
 - **TLS and the https-gated controls.** The `__Host-` cookie prefix, the `Secure` flag, HSTS, the
   effective-https response-header bundle for `/ui`, and the configured TLS floor are all keyed on a
   real https origin and are structurally unobservable over a cleartext loopback target.
-- **Non-`GET` reach and non-`GET` BFLA.** A reach or BFLA probe carries a **valid** token and would
-  actually execute a mutating endpoint, so extending past `GET` needs a per-probe store reset. The
-  receipt therefore prints its BFLA ratio (19 of about 60 candidate rows) rather than implying full
-  BFLA coverage.
+- **Non-`GET` reach and non-`GET` BFLA.** *(Dated 2026-07-31, superseded by the 2026-09-05 amendment
+  above, which built both and measured the stated blocker to be wrong. Left standing as the record of
+  what was decided then.)* A reach or BFLA probe carries a **valid** token and would actually execute a
+  mutating endpoint, so extending past `GET` needs a per-probe store reset. The receipt therefore
+  prints its BFLA ratio (19 of about 60 candidate rows) rather than implying full BFLA coverage.
 
 **Controls relaxed in the scanned posture, and what does exercise them.** To make the sweep
 deterministic the target runs with MFA off, the four rate limiters off, lockout effectively disabled
@@ -322,9 +375,10 @@ that status, and this tier must not be cited as if it did.
 
 **Out of scope**
 
-Named in full in *What this does NOT give us* above; in short, at least the unauthenticated
-MLLP/TCP/X12/DICOM ingress plane, the `/ui` console plane, TLS and the https-gated controls, non-`GET`
-reach and non-`GET` BFLA, and the relaxed posture.
+Named in full in *What this does NOT give us* above, as amended 2026-09-05; in short, at least the
+unauthenticated MLLP/TCP/X12/DICOM ingress plane, the `/ui` console plane, TLS and the https-gated
+controls, and the relaxed posture. Non-`GET` reach and non-`GET` BFLA were on this list until the
+2026-09-05 amendment built them.
 
 ## PHI
 
