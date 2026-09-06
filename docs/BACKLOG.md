@@ -8661,6 +8661,55 @@ That covers every startable topology, not just the loopback default. The one pos
 > Verdict: research
 > Closing-act: scorecard-rescore
 
+> **PARTIAL 2026-09-06 (builder), NOT A CLOSURE -- this row stays OPEN.** Lands the enumeration
+> repair the honest path names. The closing act is the scorecard re-score, the record is not in this
+> repository, and nothing here was written to it.
+>
+> **THE MAP WAS WRONG IN BOTH DIRECTIONS, AND THE OVER-CLAIM IS THE WORSE HALF.** `DELETE /me/mfa`
+> sat under "No limiter of any kind" while riding `require_step_up_action` -- the same gate whose
+> promotion the row already narrates one clause earlier for `PATCH /users/{user_id}`. #1148 made that
+> factory charge the admin-write floor, `PATCH` was moved out, and `DELETE /me/mfa` was left behind.
+> Control 8's residual made the same claim about the console's two WebAuthn staging POSTs, which
+> charge the floor through `require_ui` on every non-GET. An operator reading that row to site a
+> proxy limiter would spend effort where the engine already paces, and would carry that trust to the
+> routes in the same list that genuinely have none.
+>
+> **ONE ROUTE IS GENUINELY UNPACED AND WAS ABSENT.** `POST /alerts/test-email` takes a plain
+> `require(Permission.SERVICE_CONFIGURE)` and dials a live outbound SMTP server per request. Measured
+> over the route table, it is the only unpaced non-GET route in `api/app.py` missing from the map.
+>
+> **THE MAP NEVER STATED ITS OWN SCOPE**, which is why five `/ui/account` writes read as unpaced: it
+> enumerates the auth-surface limiters, and the admin-write floor belongs to the 2.1.3 table. Said
+> once at the top of the map with the five named, rather than fifty rows restating the floor.
+>
+> **FIVE CITATIONS NO LONGER RESOLVED; the row said three.** All five are re-anchored by symbol, and
+> the three `auth/service.py` ones rewritten package-relative -- `scripts/docs/citation_line_check.py`
+> pointed at this file today reports four unreadable citations and then prints OK, which is its own
+> unfiled defect, named here rather than numbered.
+>
+> **THE GATE READ ONE DIRECTION ONLY, and that is the reusable part.**
+> `tests/test_security_doc_rate_limits.py` asserted that what the code charges is documented; nothing
+> asserted that what the doc calls unpaced charges nothing, so both over-claims sat under 42 green
+> tests. The new test derives the charging gate set from source (two levels deep on the console side,
+> since four gates charge by building on `require_ui`) and reads route DEPENDENCY names, which is
+> where those charges live and why the existing body walk is structurally blind to them.
+>
+> **TWO INSTRUMENT FAULTS, both found by planting the mutation rather than by review, both recorded
+> in the test.** The first draft keyed routes on `_decorated_path`, which returns the path WITHOUT the
+> method, so every lookup missed and the guard passed vacuously with the defect planted -- there is now
+> a coverage assertion that fails loudly instead. The second read every backticked token in the cell
+> and accused `PATCH /users/{user_id}`, which that same cell explains is paced: presence of a token is
+> not membership of the list, so the parse is scoped to the leading enumeration.
+>
+> **STILL OPEN:** the re-score, and the reading dependency this row exists to settle -- whether
+> "prevent malicious account lockout" grades the document alone or names a property the control must
+> hold. Untouched here. **`admin_new_ip_step_up` remains absent from the graded protection set**, and
+> the mechanical reason is now measured: the completeness gate derives its registry from structural
+> controls, the two auth-surface limiter accessors and `*FullError` raisers, and `flag_new_client_ip`
+> is none of those, so no seam derivation can find it. That is a gate blind spot rather than an
+> oversight, and whether it belongs in this requirement's protection set is an assessor ruling to
+> write down. Score and status unchanged, so the ranked table is deliberately not edited.
+
 **Cluster:** Security / ASVS remediation research. **Priority:** P1. **Verdict:** research.
 **Severity:** no product effect on the control itself; on a first deployment an operator reading the documented protection set would not learn that a known local username can be held refused by repetition at roughly five requests per fifteen minutes, ~~nor that no dedicated administrative unlock exists.~~ **[STRUCK -- an unlock DOES ship, step-up-gated, via forced password rotation; see the 2026-08-13 amendment above.]**
 
@@ -8726,6 +8775,54 @@ That covers every startable topology, not just the loopback default. The one pos
 > **Filed 2026-08-08 - not started. RESEARCH item: the goal is an HONEST pass, and "cannot honestly reach pass" is a valid finding.** ASVS **6.1.3** (L2) currently scores **partial**. The pinned verb asks that multiple authentication pathways be documented together with the controls and the authentication strength which must be consistently enforced across them. The enumeration half is strong; the paragraph that cites the requirement carries statements false against the shipped code.
 > Verdict: research
 > Closing-act: scorecard-rescore
+
+> **PARTIAL 2026-09-06 (builder), NOT A CLOSURE -- this row stays OPEN.** Lands the accuracy half.
+> The row's own question -- whether a documentation cell can pass while the strength it documents is
+> inconsistently enforced -- is untouched, and the closing act is the scorecard re-score, which is not
+> in this repository.
+>
+> **THE ROW'S CENTRAL PREMISE NO LONGER REPRODUCES.** It says the retracted framing is live at
+> `docs/SECURITY.md:788-793`. It is not: `be7627d13` (**#1388**, 2026-08-29, nine days after this
+> row's research) rewrote that paragraph, and a search for the framing in that file now returns zero.
+> `docs/SECURITY.md` was left untouched and is used as the link target instead.
+>
+> **THE SAME CLAIM WAS STILL LIVE IN AT LEAST SEVEN OTHER PLACES.** The shipped rule, read from code:
+> `require_mfa_scope` defaults to `every_local_account` on both the internal and operator-facing
+> models, and the second factor is enforced as an ACCESS gate on every authorized route outside
+> `_MFA_EXEMPT_ROUTES`, answering 403 with `X-MFA-Required`. Two documents said it scopes to
+> Administrators at the step-up boundary; two more said that and added a directory delegation
+> **#1144** retired; one told the reader to enable a switch that ships on. Each now states the rule
+> once or links, rather than restating it a fourth time.
+>
+> **EIGHT LINES WOULD HAVE FAILED AN OPERATOR WHO COPIED THEM**, naming a key the loader refuses in
+> assignment shape: the console-enablement instruction in `README.md`, `docs/TRAY.md` and
+> `docs/USER-GUIDE.md`; the network bind in `docs/REMOTE-CONSOLE-CUSTOMER-GUIDE.md`, a customer-facing
+> guide whose whole TOML block was unusable; and three in `docs/CONTAINER-EXPOSURE-EVALUATION.md` and
+> `docs/PHI.md`. The bind needed more than a rename -- `listen_address` does nothing until
+> `local_access_only` is false -- so the block gained that line.
+>
+> **THREE SHIPPED CLI STRINGS UNDERSTATED THEIR OWN SCOPE**, saying the Administrator role is
+> single-factor over the network where the shipped scope covers every account `require_mfa_scope`
+> names. The substring the CLI tests pin was not touched.
+>
+> **THE GATE THAT SHOULD HOLD THIS IS BLIND TO THE SHAPE MOST OF THESE TOOK, and that is the finding
+> worth carrying.** `tests/test_docs_cite_no_refused_config_keys.py` (**#1383**) imports
+> `_RELOCATED_TO_SECURITY` so its forbidden set cannot drift, and its ratchet measured exact -- yet
+> eleven of the sites corrected here were invisible to it and its baseline did not move for them. Its
+> lookbehind rejects a match preceded by a dot, so the qualified `[api].serve_ui = true` shape an
+> operator document naturally writes never matches; it is also section-blind, so a bare `key = value`
+> under a CORRECT `[security]` header counts as a defect while the real one does not; and its corpus
+> stops at `docs/`, so `README.md` is never read. Exactly one baseline row moved, and it was DELETED
+> rather than lowered, because that ratchet fails on a row that is too low as well as too high.
+>
+> **STILL OPEN:** the re-score; the row's reading question; widening that gate (a matching-rule change
+> plus a section tracker and a full rebaseline, deliberately not smuggled into a prose PR); and the
+> **ingest-plane** limb, re-measured and unchanged -- `intake_auth` appears zero times in
+> `docs/SECURITY.md` while shipping with 24 occurrences in `config/wiring.py`, and the two admission
+> tables sit 296 lines from the strength grading, so the togetherness limb cannot be graded verified.
+> The roughly 400 DESCRIPTIVE mentions of retired spellings are untouched on purpose: most are correct
+> as written, and editing an accurate sentence because it names an old key is the sweep **#1388**'s
+> own commit message warns against. Score and status unchanged.
 
 **Cluster:** Security / ASVS remediation research. **Priority:** P2. **Verdict:** research.
 **Severity:** on a first deployment a reader would draw the local pathway weaker and the delegated pathways laxer than the code makes them, and an operator following the pathway table would meet a configuration-load refusal, because the table names `[auth]` keys the loader rejects.
@@ -9429,6 +9526,66 @@ That covers every startable topology, not just the loopback default. The one pos
 > **Filed 2026-08-08 - not started. RESEARCH item: the goal is an HONEST pass, and "cannot honestly reach pass" is a valid finding.** ASVS **6.8.1** (L2) currently scores **partial**. The pinned verb asks that a user's identity cannot be spoofed via another supported identity provider, and names the standard mitigation: register and identify the user by IdP ID plus the user's ID in that IdP. What holds it short is structural -- `users.username` is `TEXT NOT NULL UNIQUE` (`messagefoundry/store/store.py:1590`), one identifier namespace shared by every provider, with the provider carried as a column beside the key rather than inside it.
 > Verdict: research
 > Closing-act: scorecard-rescore
+
+> **VERIFIED 2026-09-06 (builder). NO BUILD TAKEN, AND THAT IS THE FINDING.** No code was written for
+> this row and none should be yet. [ADR 0184](adr/0184-identify-a-federated-login-by-the-idp-namespaced-subject-not-by-the-username-it-claims.md)
+> is **Proposed** and its status line says in terms that the build must not start; five boxes under
+> its own *To resolve on acceptance* are unchecked, and the first is an owner trust decision.
+>
+> **THE OWNER DECISION THIS ROW IS WAITING ON, as one answerable question.** *Besides an
+> administrative binding surface, which is entailed rather than optional, what may create a federated
+> binding: bind-on-first-presentation inside a bounded bootstrap window, a self-service link proved by
+> the user's own directory password, or nothing at all?*
+>
+> **THE RANKED-TABLE ENTRY ABOVE ASSERTS TWO THINGS THAT ARE FALSE AT HEAD**, and a dispatcher reads
+> that entry rather than this body. **(a) "No uniqueness of any kind on the OIDC columns on any
+> backend" is refuted on all three.** A filtered unique index `ux_users_federated_subject` over
+> `(oidc_issuer, oidc_subject)` exists in `store/store.py`, `store/postgres.py` and
+> `store/sqlserver.py`, shipped under **#1256**. Instrument: `grep -c` per file, with `UNIQUE` counts
+> of 10/6/8 as the positive control, matching what the 2026-09-04 pass recorded -- so the probe still
+> discriminates and the August 0/0/0 was a true absence rather than a broken pattern. **(b) "No audit
+> can tell a federated session from an LDAP simple bind" is false**: the login-success row carries
+> `detail["mech"]`, and binding emits `auth.federated_subject_bound`. What genuinely cannot
+> discriminate is any RUNTIME decision -- `SessionRecord` carries no mechanism field.
+> **Difficulty 7 is therefore overpriced**: both of its named drivers, the ADR and the three-backend
+> schema and index change, are already discharged. The SQL Server width trap is discharged too, at
+> `NVARCHAR(256)` with the 1024-byte composite key reasoned out in the file.
+>
+> **THE ELIMINATED OPTION THAT IS ACTUALLY STILL LIVE.** This row struck directory-held immutable
+> attributes (`objectGUID` / `objectSid`) twice, on the ground that a directory-readable attribute is
+> not secret. **That argument is sound only where the attribute is used as an AUTHENTICATOR.** It says
+> nothing about the same attribute as a RE-RESOLUTION KEY for an account already identified by other
+> means, where no assertion is trusted. The row repairs the premise twice in passing without ever
+> re-opening the strike, so the option has stayed off every list it belonged on. It is measurably
+> unbuilt: `objectGUID`/`objectSid` appear in exactly one file and only as a docstring naming a future
+> key, against a positive control of 13 `sAMAccountName` hits across 5 files. **Filed as #1471.**
+>
+> **THE FOUR ORPHAN CITATIONS ARE AT LEAST SEVEN**, and both this row and ADR 0184 say four. The three
+> the enumeration misses are `docs/SECURITY.md`, and this ledger's own #1152 and #1225. Every one is
+> about the AD recycle and therefore outside this row's OIDC-versus-directory scope, so a 6.8.1
+> re-score can be entirely honest and leave all seven unaddressed -- at which point they resolve to a
+> CLOSED item, which reads as done. That is `docs/LEDGER-GATE.md`'s stale-citation hazard arriving
+> from the closure direction. #1471 is where they should point.
+>
+> **THE STRONGEST ARGUMENT AGAINST HOLDING, recorded rather than dismissed.** The resolution
+> re-ordering needs no DDL, is scoped for free by an existing `None` default, and has waited through
+> three research passes and one ADR. It could be built BEHIND the current continuity short-circuit,
+> improving identification for already-bound accounts while the ruling arrives. Two reasons it does
+> not win: ADR 0184 names the half-done ordering as a **privilege-transfer** hazard (resolve by the
+> pair to one row, then carry on with the principal resolved from the claimed username, and the role
+> mapping writes one account's directory groups onto another), so the partial build is the riskiest
+> ordering rather than the safest; and it would not move the cell, so the closing act still could not
+> fire. If the owner wants motion before the ruling, that is the increment to ask for, and its guard
+> is a test asserting the row `_upsert_ad_user` touches and the row the session is issued for are the
+> same row.
+>
+> **DO NOT ABSORB THE SPLIT-OFF SIBLINGS.** #1248 (the silent binding write) is closed and shipped.
+> #1256 owns BOTH halves of subject exclusivity -- the veto and the index -- and both are built. This
+> row's remaining scope is the login-path resolution ORDER and the first-contact ceremony, nothing
+> else in the federated binding story.
+>
+> Score unchanged pending the ranked-table correction above, which is a dispatcher-facing edit rather
+> than a re-score. Status unchanged: OPEN.
 
 **Cluster:** Security / ASVS remediation research. **Priority:** P1. **Verdict:** research.
 **Severity:** on a first deployment running both the directory and the pinned OIDC issuer, a principal that issuer will mint an allow-listed-suffix UPN for could land on a never-federated AD account and inherit its directory-derived roles, with no credential compromise required. Whether an operator's IdP will mint such a UPN is a property of that tenancy, not of this engine.
@@ -24178,3 +24335,91 @@ Vault `roles/BUILDER.md:213-217`, under the heading "Closing a ledger row makes 
 ### Not checked
 
 I read only `roles/` in the vault and ran no git history there, so I cannot date when any of these lines was written. Eleven of the fourteen playbooks were matched by the needle above but not read, so treat the population as **at least three files**, not a total. I did not check whether any workflow or CI job reads a playbook, and I confirmed no case in which a seat actually followed `BUILDER.md:216` and produced a red PR -- I measured the instruction and the gate, not an incident.
+
+
+## 1471. bind an AD account to a directory-immutable identifier, the way OIDC binds (issuer, sub)
+
+> 🔢 **Filed 2026-09-06 -- not started.** Value **7/10** · Difficulty **5/10** · _quick win_. Split out
+> of **#1143**'s verification pass, where it was found to have been eliminated on a false premise and
+> to be the work at least seven citations across the repository are already waiting on.
+> Verdict: build
+> Closing-act: code
+
+**Cluster:** Security / authentication. **Priority:** P2. **Verdict:** build.
+**Severity:** on a first deployment, a site that recycles a `sAMAccountName` in its directory without
+also running a MessageFoundry `delete_user` would hand the new holder the departed operator's
+immutable `user_id`, and with it everything keyed on that id -- uploaded-file ownership, per-uploader
+quota, and saved search presets. Nothing would report it.
+
+**What ships today.** `_upsert_ad_user` (`messagefoundry/auth/service.py`) resolves an AD principal by
+`sAMAccountName` and mints a fresh `user_id` **only when no mirror row survives** -- that is, only
+after a `delete_user`. On the default path the surviving row is adopted and its `user_id` is re-bound
+to the new principal. `AdPrincipal` (`messagefoundry/auth/ldap.py`) carries `username`,
+`display_name`, `email`, `dn` and `groups`; `dn` is the only durable-looking attribute and it is the
+wrong one, because a DN changes on a rename or a move between organizational units.
+
+**Measured 2026-09-06:** `objectGUID` and `objectSid` occur in exactly one tracked engine file, as a
+docstring naming them as the future key. Positive control in the same run: `sAMAccountName` returns
+13 hits across 5 files, so the probe discriminates and the zero is real. **The LDAP layer reads no
+immutable directory identifier at all.**
+
+**Why this is not #1143, and must not be folded into it.** #1143 is scoped end to end to the
+OIDC-versus-directory limb of ASVS 6.8.1 and is blocked on an unresolved first-contact ceremony
+decision ([ADR 0184](adr/0184-identify-a-federated-login-by-the-idp-namespaced-subject-not-by-the-username-it-claims.md),
+Proposed). This is the AD limb, it is not blocked on that decision, and #1143 could close honestly
+without touching it.
+
+**Why the option looked closed and is not.** #1143 struck directory-held immutable attributes twice,
+on the ground that a directory-readable attribute is not secret so an issuer willing to mint an
+arbitrary username claim will mint any claim. **That holds only where the attribute is an
+AUTHENTICATOR.** Here it is a re-resolution key for an account already identified by other means, and
+no assertion is being trusted. #1143 repairs the premise twice in its own body without ever
+re-opening the strike.
+
+**At least seven sites name #1143 as the fix for this**, and would resolve to a closed item that reads
+as done if #1143 closed as scoped: `messagefoundry/api/app.py` (`_may_access_upload` docstring),
+`messagefoundry/uploads.py` (`UploadedFileMeta`), `tests/test_upload_api.py`, ADR 0136,
+`docs/SECURITY.md`, and this ledger's **#1152** and **#1225**. Re-point them here. Enumerated with
+`git grep`; treat it as at least seven and re-run the grep rather than working the list.
+
+**Shape of the work.** One nullable column on `users` across the three backends, following the
+`reauth_at` convention already in each (`PRAGMA table_info` guard on SQLite, `information_schema`
+on Postgres, a `COL_LENGTH` guard in the SQL Server `_SCHEMA` list). **No index, so no SQL Server
+index-key width trap.** The real cost is upstream of the column: an added LDAP attribute read into
+`AdPrincipal`, and a lookup path, because `resolve_principal` takes only a username today. A
+first-contact rule is needed for accounts that predate the column -- but unlike #1143's, it is a
+backfill question and not a trust-ceremony one.
+
+**What would NOT be an honest close.** Adding the column and continuing to resolve by
+`sAMAccountName`, so the identifier is stored and never consulted. The acceptance test is a recycle:
+a directory-side name reuse with the MessageFoundry row left in place must NOT adopt that row.
+
+## 1472. two shipped comments assert a 0/0/0 uniqueness absence that the filtered unique index has closed
+
+> 🔢 **Filed 2026-09-06 -- not started.** Value **4/10** · Difficulty **1/10** · _fill-in_. Found while
+> verifying **#1143**; a comment correction with no behaviour change.
+> Verdict: build
+> Closing-act: code
+
+**Cluster:** Security / documentation accuracy. **Priority:** P3. **Verdict:** build.
+**Severity:** no product effect. The cost is to a reader: both comments state that the structural half
+of federated-subject exclusivity is unbuilt, and it shipped under **#1256**.
+
+**The two sites**, by symbol rather than line, because the anchors drift: the comment above the
+exclusivity veto in `messagefoundry/auth/service.py`, and the one on the federated-subject setter's
+declaration in `messagefoundry/store/base.py`. Both assert that no `UNIQUE` constraint names the OIDC
+columns on any backend, quoting a measurement of 0/0/0 against a positive control of 13/8/10.
+
+**Measured 2026-09-06:** a filtered unique index `ux_users_federated_subject` over
+`(oidc_issuer, oidc_subject)` exists on all three backends -- `store/store.py`, `store/postgres.py`
+and `store/sqlserver.py` -- each guarded for in-place upgrade. The `UNIQUE` positive control now reads
+10/6/8, so the original measurement was true when written and the code moved underneath it.
+
+**The service.py one contradicts code roughly twenty lines below it**, which explains that the index
+"refuses the loser on all three backends". A reader who trusts the first sentence concludes the
+structural half is missing -- which is the same error #1143's own ranked-table entry made and carried
+for weeks.
+
+**Do not simply delete the numbers.** They are evidence of a real prior state and the reason the veto
+is written the way it is. Rewrite them to say the index now exists and name what the veto adds on top
+of it (an ordered, audited refusal rather than an integrity error surfacing as a 500).
