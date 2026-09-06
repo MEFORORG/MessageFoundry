@@ -880,13 +880,29 @@ upload chokepoint enforces a fixed policy independent of the directory-source po
 **Downloads are made safe at serve (ASVS 1.3.4).** The attachment download route (GET
 `/messages/{message_id}/attachments/{attachment_id}`, and its `/ui` delegate) serves the stored bytes
 **verbatim** (the preserve-the-original invariant forbids rewriting a clinical payload) but neutralizes
-them at the response: the sender-influenced OBX-5.2 MIME is forced through `_safe_attachment_content_type`
-to `application/octet-stream` on any non-clean value **and** on any **browser-active** type (`html`,
-`xml`, `script`, `svg` subtypes + `multipart`, matched case-folded, length-bounded); the response carries
-`Content-Disposition: attachment` (a download, never an inline render), `X-Content-Type-Options: nosniff`
-(no MIME re-sniff), and `Content-Security-Policy: default-src 'none'; sandbox` (an opaque origin with
-scripts/forms disabled), re-asserted on the `/ui` delegate from **outside** the console's own CSP writers
-so a browser-active representation can never execute in the application origin.
+them at the response. The sender-influenced OBX-5.2 MIME goes through `_safe_attachment_content_type`,
+which is an **allow-list**: it declares the stored label only when the label exactly names one of a short,
+reviewable set of inert types (`application/pdf`, `application/dicom`, `application/json`, `text/plain`,
+`text/csv`, and the raster image types), matched case-folded and length-bounded. Everything else is served
+as `application/octet-stream` -- every **browser-active** type (`text/html`, `image/svg+xml`,
+`application/hta`), every type nobody listed, and every non-clean or over-long value. The direction
+matters: the earlier control listed the browser-active subtypes to refuse, which asked a reviewer to prove
+no further executable type existed, and `application/hta` showed that negative could not be proved. The
+same table supplies the download-name extension, defaulting to `.bin`, so the served filename is a
+property of the product rather than of the host's MIME registry.
+
+The allow-list decides what is **declared**, never whether the file is served: an unrecognized type
+downloads exactly as a refused one does. The response carries `Content-Disposition: attachment` (a
+download, never an inline render), `X-Content-Type-Options: nosniff` (no MIME re-sniff), and
+`Content-Security-Policy: default-src 'none'; sandbox` (an opaque origin with scripts/forms disabled),
+re-asserted on the `/ui` delegate from **outside** the console's own CSP writers, so a browser-active
+representation can never execute in the application origin.
+
+`application/pdf` is allow-listed by a decision recorded beside the table in `api/app.py`, not by
+oversight: a PDF can carry script that runs in a viewer once a saved file is opened, but that script runs
+against the document rather than against the serving origin, and the declared type stops governing the
+moment the file is on disk. The instrument for the local-open threat would be content scanning, which this
+route does not do.
 
 ### Remote file — `Sftp(...)` / `Ftp(...)`
 

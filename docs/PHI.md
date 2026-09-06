@@ -815,12 +815,15 @@ control unchanged (`messages:view_raw`/`view_summary` RBAC, field-level redactio
 - **Attachments are neutralized at serve, never rewritten.** A detached document (ADR 0105) is a
   verbatim clinical payload carrying its own attacker-influenced `OBX-5.2` MIME label, and the
   preserve-the-original invariant forbids editing the stored bytes — so the browser-safety control runs
-  at *serve* time, not on the stored document: a browser-active label (`html`/`xml`/`script`/`svg`,
-  case-folded) is downgraded to `application/octet-stream`, which also strips a `.svg`/`.html` download
-  name, and the response carries `Content-Disposition: attachment`, `X-Content-Type-Options: nosniff`
-  and `Content-Security-Policy: default-src 'none'; sandbox` on both the JSON route and the `/ui`
-  delegate. No served representation can execute in the application origin. Trade-off: `svg`/`html`
-  attachments no longer preview in the browser; the bytes are unchanged and still downloadable.
+  at *serve* time, not on the stored document. The served `Content-Type` comes from an **allow-list** of
+  inert types matched case-folded and exactly (`api/app.py`); a browser-active label such as `text/html`,
+  `image/svg+xml` or `application/hta` is simply not on it, so it is declared `application/octet-stream`,
+  and the same table gives the download name a `.bin` extension instead of `.svg`/`.html`/`.hta`. The
+  response carries `Content-Disposition: attachment`, `X-Content-Type-Options: nosniff` and
+  `Content-Security-Policy: default-src 'none'; sandbox` on both the JSON route and the `/ui` delegate.
+  No served representation can execute in the application origin. Trade-off: `svg`/`html` attachments no
+  longer preview in the browser; the bytes are unchanged and still downloadable, since the allow-list
+  governs the declared type and never whether the file is served.
 - **XSS-safe rendering.** All HL7/message content is escaped by an autoescape-by-default renderer and a
   strict CSP (`script-src 'self'`, no `unsafe-*`); attacker-influenced HL7 cannot execute in the DOM.
 - **Residual (documented, not a claimed control):** a shared clinical workstation, browser devtools, or a

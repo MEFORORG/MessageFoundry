@@ -9,14 +9,21 @@ the byte round-trip, the RBAC gate (Viewer → 403), the channel-scope + linkage
 crux: never pull a shared content-addressed blob unlinked to an in-scope message), the audit chain
 (``record_view`` + ``attachment_download`` with NO bytes), and the Content-Type / Content-Disposition.
 
-**ASVS 1.3.4 (browser-active downgrade + sandbox CSP).** The stored ``content_type`` is a verbatim,
+**ASVS 1.3.4 (inert-type allow-list + sandbox CSP).** The stored ``content_type`` is a verbatim,
 attacker-influenced OBX-5.2 label. The serve-time control is *neutralize at serve*, never a sanitizing
-rewrite of the stored clinical bytes (ADR 0105 Approach B keeps the OBX-5.5 value verbatim): a
-browser-active label is downgraded to ``application/octet-stream`` — case-folded, so ``Image/SVG+XML``
-is treated exactly like ``image/svg+xml`` — which also keeps a ``.svg``/``.html`` extension out of the
-download name, and every download response carries ``Content-Security-Policy: default-src 'none';
-sandbox``, **including the console's ``/ui`` delegate**, where two ``/ui``-scoped middlewares would
-otherwise overwrite a route-level CSP with a console policy that has no ``sandbox``.
+rewrite of the stored clinical bytes (ADR 0105 Approach B keeps the OBX-5.5 value verbatim): the label is
+DECLARED only when it exactly names one of the inert types on ``_INERT_ATTACHMENT_TYPES``, and everything
+else — browser-active, unknown or malformed — is declared ``application/octet-stream``. The match is
+case-folded, so ``Image/SVG+XML`` is treated exactly like ``image/svg+xml``. The same table supplies the
+download-name extension (default ``.bin``), so no ``.svg``/``.html``/``.hta`` name is produced and the
+served filename no longer depends on ``mimetypes``, which reads the Windows registry. Every download
+response carries ``Content-Security-Policy: default-src 'none'; sandbox``, **including the console's
+``/ui`` delegate**, where two ``/ui``-scoped middlewares would otherwise overwrite a route-level CSP with
+a console policy that has no ``sandbox``.
+
+The allow-list is what makes these tests meaningful in BOTH directions. A table where every input
+downgrades would pass against a function that returns the constant, so ``_PASS_THROUGH_LABELS`` is the
+negative control and is asserted just as hard.
 """
 
 from __future__ import annotations
@@ -31,7 +38,12 @@ import httpx
 import pytest
 
 from messagefoundry.api import create_app
-from messagefoundry.api.app import _ATTACHMENT_CSP
+from messagefoundry.api.app import (
+    _ATTACHMENT_CSP,
+    _DEFAULT_ATTACHMENT_EXT,
+    _INERT_ATTACHMENT_TYPES,
+    _safe_attachment_content_type,
+)
 from messagefoundry.auth import Role
 from messagefoundry.auth.service import AuthService
 from messagefoundry.config.settings import AuthSettings
@@ -45,13 +57,21 @@ ADT = "MSH|^~\\&|S|F|R|RF|20260604||ADT^A01|MSG1|P|2.5.1\rPID|1||100^^^H^MR||DOE
 DOC = b"%PDF-1.4\nsynthetic document body \x00\x01\x02 not real PHI\n%%EOF\n"
 DOC_B64 = base64.b64encode(DOC).decode("ascii")
 
-#: Labels a browser may EXECUTE or render as markup — every one of them must serve as the inert binary
-#: type. Beyond the four subtypes and the ``+xml`` family the assessor named, this pins the vectors an
-#: exact-subtype / suffix test misses: ``application/x-javascript`` (browsers honour it as script),
-#: ``image/svg`` (no ``+xml``), ``application/xml-dtd``, ``multipart/x-mixed-replace`` (browser-rendered)
-#: and ``text/x-html`` — plus the MIXED-CASE vectors, which the token grammar admits verbatim today and
-#: which ``mimetypes`` still resolves to ``.svg``/``.html``.
+#: Labels whose specifications describe an executable or markup representation — none of them is on the
+#: inert allow-list, so every one must serve as the generic binary type. The first block is the family the
+#: retired four-token refusal list caught (``html``/``xml``/``script``/``svg`` + ``multipart``), including
+#: the vectors an exact-subtype or ``+xml``-suffix test misses (``application/x-javascript``, ``image/svg``
+#: with no ``+xml``, ``application/xml-dtd``, ``text/x-html``) and the MIXED-CASE spellings the token
+#: grammar admits verbatim.
+#:
+#: The second block is what the refusal list DID NOT catch, and is the reason the classifier was inverted:
+#: each of these passes all four tokens and the ``multipart`` rule. ``application/hta`` is the decisive
+#: one — a scriptable HTML Application whose registry-derived extension is ``.hta``. Their presence here
+#: is a specification claim about the types, NOT a browser measurement: nobody has exercised a browser.
+#: The allow-list is what makes that distinction stop mattering, because a type nobody thought of is
+#: refused for the same reason a listed one is — it is simply not on the list.
 _BROWSER_ACTIVE_LABELS = (
+    # caught by the retired four-token refusal list
     "image/svg+xml",
     "text/html",
     "Image/SVG+XML",
@@ -69,18 +89,73 @@ _BROWSER_ACTIVE_LABELS = (
     "application/xml-dtd",
     "multipart/x-mixed-replace",
     "text/x-html",
+    # MISSED by the retired four-token refusal list
+    "application/hta",
+    "text/x-component",
+    "application/x-xpinstall",
+    "application/x-shockwave-flash",
+    "application/x-msdownload",
+)
+
+#: Shapes that never reach the allow-list at all because the MIME *shape* screen rejects them first: a
+#: parameterized type (the screen admits no ``;``), and a header-splitting attempt. Both must land on the
+#: same generic type, so the two screens compose rather than leaving a gap between them.
+_MALFORMED_LABELS = (
+    "image/svg+xml; charset=utf-8",
+    "text/plain; charset=utf-8",
+    "text/html\r\nX-Evil: 1",
 )
 
 #: Inert labels that must keep passing through under their own type — the operator still gets a usable
-#: download hint, and browser PDF/image viewers are themselves sandboxed.
-_PASS_THROUGH_LABELS = ("application/pdf", "image/png", "application/dicom", "text/plain")
+#: download hint. **This is the negative control.** A downgrade table alone would pass against a
+#: ``_safe_attachment_content_type`` that returned ``application/octet-stream`` unconditionally; these
+#: cases are what force the allow-list to actually allow.
+_PASS_THROUGH_LABELS = (
+    "application/pdf",
+    "image/png",
+    "image/jpeg",
+    "image/gif",
+    "application/dicom",
+    "application/json",
+    "text/plain",
+    "text/csv",
+)
 #: Leading magic so a CORRECTLY-labelled inert attachment agrees with its declared MIME (ASVS 5.2.2):
 #: the download-side MIME-vs-magic check downgrades a sniffable label whose bytes contradict it.
-#: dicom/text carry no leading signature, so they need none.
+#: dicom/text/bmp carry no leading signature in that table, so they need none.
 _PASS_THROUGH_MAGIC: dict[str, bytes] = {
     "application/pdf": b"%PDF-",
     "image/png": bytes.fromhex("89504e470d0a1a0a"),  # PNG signature
+    "image/jpeg": bytes.fromhex("ffd8ff"),
+    "image/gif": b"GIF89a",
+    "application/json": b"{",  # leading-brace sniff, not a magic-byte family
 }
+
+#: The extension the SHIPPED allow-list gives each served type. Pinned as LITERALS on purpose. The old
+#: assertions computed the expectation with ``mimetypes.guess_extension`` — the very call the endpoint
+#: made — so they agreed with the endpoint by construction and would have agreed with a wrong endpoint
+#: too. The extension is now a property of the product rather than of the host, so there is nothing
+#: machine-local left to compute and a literal is the honest expectation.
+_SERVED_EXT: dict[str, str] = {
+    "application/dicom": ".dcm",
+    "application/json": ".json",
+    "application/pdf": ".pdf",
+    "image/bmp": ".bmp",
+    "image/gif": ".gif",
+    "image/jpeg": ".jpg",
+    "image/png": ".png",
+    "image/tiff": ".tif",
+    "text/csv": ".csv",
+    "text/plain": ".txt",
+}
+#: What every non-allow-listed type gets, refused or merely unknown.
+_OCTET = "application/octet-stream"
+_OCTET_EXT = ".bin"
+
+
+def _disposition(ref: str, ext: str) -> str:
+    """The exact ``Content-Disposition`` the route must serve for ``ref`` at ``ext``."""
+    return f'attachment; filename="attachment-{ref[:16]}{ext}"'
 
 
 @pytest.fixture
@@ -184,12 +259,11 @@ async def test_download_round_trips_to_original_bytes(
     assert r.content == DOC
     assert r.headers["content-type"].startswith("application/pdf")
     # 5.4.1 re-score: pin the FULL served Content-Disposition, not just a substring — the fixed
-    # 'attachment; filename="attachment-' prefix + the sha256 content address cut to 16 hex + a
-    # mimetypes extension hint, quoted; no user/attacker text reaches the header
+    # 'attachment; filename="attachment-' prefix + the sha256 content address cut to 16 hex + the
+    # allow-list's extension, quoted; no user/attacker text reaches the header
     # (api/app.py:_attachment_filename). Seeded straight through the store, so this holds WITHOUT
-    # enabling the opt-in stream_threshold_bytes. Compute ext the same way the endpoint does.
-    ext = mimetypes.guess_extension("application/pdf") or ""
-    assert r.headers["content-disposition"] == f'attachment; filename="attachment-{ref[:16]}{ext}"'
+    # enabling the opt-in stream_threshold_bytes. The extension is a literal now, not a mimetypes call.
+    assert r.headers["content-disposition"] == _disposition(ref, ".pdf")
 
 
 async def test_download_audits_view_and_download_before_returning(
@@ -235,10 +309,9 @@ async def test_download_content_type_defaults_when_not_clean_mime(
     # header survives.
     assert r.headers["content-type"] == "application/octet-stream"
     assert "X-Evil" not in r.headers
-    # The served-filename control still holds on a rejected MIME: the extension hint then derives
-    # from the octet-stream default, never the attacker text.
-    ext = mimetypes.guess_extension("application/octet-stream") or ""
-    assert r.headers["content-disposition"] == f'attachment; filename="attachment-{ref[:16]}{ext}"'
+    # The served-filename control still holds on a rejected MIME: the extension is the allow-list's
+    # default, never the attacker text and never a host-registry lookup.
+    assert r.headers["content-disposition"] == _disposition(ref, _OCTET_EXT)
 
 
 async def test_download_downgrades_mislabelled_active_mime_to_octet_stream(
@@ -266,35 +339,38 @@ async def test_browser_active_label_is_downgraded_to_octet_stream(
     """A label a browser would execute or render as markup is NEVER served verbatim.
 
     Mechanically: the served ``Content-Type`` is exactly ``application/octet-stream``, and the served
-    filename is exactly the one derived from that inert type — so no ``.svg``/``.html``/``.js`` name is
+    filename carries the allow-list's ``.bin`` default — so no ``.svg``/``.html``/``.hta``/``.js`` name is
     produced either. Mixed-case vectors are in the table because the token grammar admits uppercase and
-    ``mimetypes`` lower-cases internally, so ``Image/SVG+XML`` yielded a ``.svg`` name before the fix."""
+    the allow-list lookup is case-folded, so ``Image/SVG+XML`` must resolve exactly as ``image/svg+xml``
+    does."""
     mid, ref = await _seed_labelled(engine, label, marker=label)
     r = await client.get(f"/messages/{mid}/attachments/{ref}")
     assert r.status_code == 200
-    assert _base_media_type(r) == "application/octet-stream"
-    # Compute the extension the way the endpoint does (mimetypes is machine-local — never pin a
-    # literal): the served name must be the octet-stream one, never a scriptable extension.
-    ext = mimetypes.guess_extension("application/octet-stream") or ""
-    assert r.headers["content-disposition"] == f'attachment; filename="attachment-{ref[:16]}{ext}"'
-    assert not r.headers["content-disposition"].rstrip('"').endswith((".svg", ".html", ".xml"))
+    assert _base_media_type(r) == _OCTET
+    assert r.headers["content-disposition"] == _disposition(ref, _OCTET_EXT)
+    assert (
+        not r.headers["content-disposition"].rstrip('"').endswith((".svg", ".html", ".xml", ".hta"))
+    )
 
 
 @pytest.mark.parametrize("label", _PASS_THROUGH_LABELS)
 async def test_inert_label_passes_through_unchanged(
     engine: Engine, client: httpx.AsyncClient, label: str
 ) -> None:
-    """The downgrade is targeted, not a blanket octet-stream: a correctly-labelled inert type still
-    serves as itself (and still supplies the download-name extension), so operators keep a usable hint.
-    Sniffable families (pdf/png) are seeded with matching magic so the 5.2.2 MIME-vs-magic check agrees."""
+    """THE NEGATIVE CONTROL. The downgrade is targeted, not a blanket octet-stream: a correctly-labelled
+    inert type still serves as itself and still supplies the download-name extension, so operators keep a
+    usable hint. Without these cases the downgrade table above would pass against a
+    ``_safe_attachment_content_type`` that returned the constant.
+
+    Sniffable families (pdf/png/jpeg/gif/json) are seeded with matching magic so the 5.2.2 MIME-vs-magic
+    check agrees; dicom/text carry no signature in that table."""
     mid, ref = await _seed_labelled(
         engine, label, marker=label, prefix=_PASS_THROUGH_MAGIC.get(label, b"")
     )
     r = await client.get(f"/messages/{mid}/attachments/{ref}")
     assert r.status_code == 200
     assert _base_media_type(r) == label
-    ext = mimetypes.guess_extension(label) or ""
-    assert r.headers["content-disposition"] == f'attachment; filename="attachment-{ref[:16]}{ext}"'
+    assert r.headers["content-disposition"] == _disposition(ref, _SERVED_EXT[label])
 
 
 async def test_overlong_label_is_downgraded(engine: Engine, client: httpx.AsyncClient) -> None:
@@ -303,7 +379,148 @@ async def test_overlong_label_is_downgraded(engine: Engine, client: httpx.AsyncC
     mid, ref = await _seed_labelled(engine, "application/" + "a" * 300, marker="overlong")
     r = await client.get(f"/messages/{mid}/attachments/{ref}")
     assert r.status_code == 200
-    assert _base_media_type(r) == "application/octet-stream"
+    assert _base_media_type(r) == _OCTET
+    assert r.headers["content-disposition"] == _disposition(ref, _OCTET_EXT)
+
+
+# --- ASVS 1.3.4: the classifier is an ALLOW-LIST, and the extension is ours ---------------------
+
+
+@pytest.mark.parametrize("label", _BROWSER_ACTIVE_LABELS + _MALFORMED_LABELS)
+def test_only_allowlisted_types_are_declared(label: str) -> None:
+    """Unit-level twin of the download parametrization, at the function the whole control rests on.
+
+    Every label here is refused for ONE reason: it is not on ``_INERT_ATTACHMENT_TYPES``. That is the
+    inversion. The retired control listed what to refuse, which asked review to prove no further
+    executable type existed; ``application/hta`` in the table above is the counterexample that shows the
+    negative could not be proved. Adding ``hta`` to a refusal list would have closed one vector and left
+    the shape of the defect intact."""
+    assert _safe_attachment_content_type(label) == _OCTET
+
+
+@pytest.mark.parametrize("label", sorted(_INERT_ATTACHMENT_TYPES))
+def test_allowlisted_types_are_declared_verbatim(label: str) -> None:
+    """The negative control at unit level, over the WHOLE shipped allow-list: every listed type is
+    declared as itself. Driven off ``_INERT_ATTACHMENT_TYPES`` rather than ``_PASS_THROUGH_LABELS`` so
+    entries the HTTP table cannot exercise (``image/tiff`` and ``image/bmp`` need magic bytes the seeded
+    document does not carry) are still covered here."""
+    assert _safe_attachment_content_type(label) == label
+
+
+@pytest.mark.parametrize(
+    "label",
+    [
+        "application/pdf-javascript",  # CONTAINS an allow-listed type
+        "xapplication/pdf",
+        "application/pdf+xml",
+        "text/plain-html",
+        "image/png2",
+    ],
+)
+def test_allowlist_match_is_exact_not_substring(label: str) -> None:
+    """The allow-list is matched EXACTLY, never as a substring or a prefix.
+
+    The refusal list it replaced matched substrings on purpose, and that reasoning was right for a
+    refusal list: near-miss spellings of active types are dense. Turned around, the same density is a
+    hazard — a substring match in the allow direction would hand ``application/pdf-javascript`` a pass
+    because it contains ``application/pdf``. This pins the direction of the match, not just its result."""
+    assert _safe_attachment_content_type(label) == _OCTET
+
+
+@pytest.mark.parametrize("label", ["Text/Plain", "IMAGE/PNG", "aPPlicaTion/PDF"])
+def test_allowlist_lookup_is_case_folded(label: str) -> None:
+    """Browsers match media types case-insensitively, so the lookup folds case — and what is SERVED is
+    the canonical key from the table, not the stored spelling, so no attacker-influenced byte reaches the
+    ``Content-Type`` header at all."""
+    served = _safe_attachment_content_type(label)
+    assert served == label.casefold()
+    assert served in _INERT_ATTACHMENT_TYPES
+
+
+def test_none_and_blank_content_type_are_declared_generic() -> None:
+    """A missing OBX-5.2 label declares nothing, so it gets the generic type like any other non-match."""
+    assert _safe_attachment_content_type(None) == _OCTET
+    assert _safe_attachment_content_type("") == _OCTET
+    assert _safe_attachment_content_type("   ") == _OCTET
+
+
+def test_served_extension_table_covers_the_shipped_allowlist() -> None:
+    """Drift guard on the literals above: a lane that adds a type to ``_INERT_ATTACHMENT_TYPES`` has to
+    pin its extension here too, so ``_SERVED_EXT`` cannot quietly stop covering the shipped list."""
+    assert set(_SERVED_EXT) == set(_INERT_ATTACHMENT_TYPES)
+    assert _SERVED_EXT == _INERT_ATTACHMENT_TYPES
+    assert _DEFAULT_ATTACHMENT_EXT == _OCTET_EXT
+
+
+def test_app_module_no_longer_imports_mimetypes() -> None:
+    """The served filename must not be a property of the HOST.
+
+    ``mimetypes.guess_extension`` reads the Windows registry, so the extension the engine served was
+    whatever the machine happened to have registered — measured on a Windows host,
+    ``mimetypes.guess_extension("application/hta")`` returns ``.hta``. The module no longer imports the
+    library at all, which is the strongest form of the assertion."""
+    from messagefoundry.api import app as app_module
+
+    assert not hasattr(app_module, "mimetypes")
+
+
+async def test_served_extension_does_not_depend_on_mimetypes(
+    engine: Engine, client: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Differential test: force ``mimetypes.guess_extension`` to answer ``.hta`` for EVERY type and show
+    the served filename is unmoved.
+
+    This is the assertion that separates the shipped code from the code it replaced. An expectation
+    written only as an output value would have passed on the old endpoint for most inputs, because the
+    host registry usually agrees with the intent. Under this patch the old endpoint would have served
+    ``attachment-<ref>.hta`` for both cases below."""
+    monkeypatch.setattr(mimetypes, "guess_extension", lambda *a, **k: ".hta")
+
+    # An allow-listed type keeps the allow-list's own extension.
+    mid, ref = await _seed_labelled(engine, "application/pdf", marker="mt-pdf", prefix=b"%PDF-")
+    r = await client.get(f"/messages/{mid}/attachments/{ref}")
+    assert r.status_code == 200
+    assert r.headers["content-disposition"] == _disposition(ref, ".pdf")
+
+    # A refused type keeps the allow-list's default extension.
+    mid2, ref2 = await _seed_labelled(engine, "application/hta", marker="mt-hta")
+    r2 = await client.get(f"/messages/{mid2}/attachments/{ref2}")
+    assert r2.status_code == 200
+    assert r2.headers["content-disposition"] == _disposition(ref2, _OCTET_EXT)
+
+
+async def test_unrecognized_type_still_downloads(engine: Engine, client: httpx.AsyncClient) -> None:
+    """The allow-list decides what is DECLARED, never whether the file is served.
+
+    An inert-but-unlisted type (``audio/wav``) and an executable one (``application/hta``) take the same
+    path: 200, bytes byte-for-byte, generic type, ``.bin`` name. Nothing about the route's availability
+    or the count-and-log invariant moves — a stricter classifier that started refusing downloads would
+    fail here."""
+    for label, marker in (("audio/wav", "unlisted-audio"), ("application/hta", "unlisted-hta")):
+        mid, ref = await _seed_labelled(engine, label, marker=marker)
+        r = await client.get(f"/messages/{mid}/attachments/{ref}")
+        assert r.status_code == 200
+        assert r.content == f"synthetic document {marker} not real PHI".encode()
+        assert _base_media_type(r) == _OCTET
+        assert r.headers["content-disposition"] == _disposition(ref, _OCTET_EXT)
+
+
+def test_pdf_stays_on_the_allowlist_by_recorded_decision() -> None:
+    """``application/pdf`` is allow-listed on purpose, and the reasoning lives beside the table.
+
+    PDF is the one entry that is not inert: a PDF may carry ``/JavaScript`` that runs when a saved file
+    is opened in a viewer. It stays because the header this control sets governs rendering in the
+    APPLICATION ORIGIN, and viewer script does not run there; because the declared type stops governing
+    once the file is on disk, where the operator's own extension and file association take over; and
+    because the instrument for the local-open threat is content scanning, which this route does not do.
+
+    This test pins the decision so a later lane removing PDF has to confront the argument rather than
+    silently reverse it. What it does NOT assert is anything about browser behaviour: no browser has been
+    exercised by anyone, and the inline-rendering claim for ``Content-Disposition: attachment`` rests on
+    specification alone."""
+    assert _INERT_ATTACHMENT_TYPES["application/pdf"] == ".pdf"
+    doc = _safe_attachment_content_type.__doc__ or ""
+    assert "never whether the file is served" in doc
 
 
 async def test_download_carries_sandbox_csp(engine: Engine, client: httpx.AsyncClient) -> None:
