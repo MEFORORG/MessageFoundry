@@ -55,6 +55,7 @@ from typing import Any
 from cryptography import x509
 from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import ec, padding, rsa
 from cryptography.hazmat.primitives.serialization import pkcs7
 
 from messagefoundry.config.models import ConnectorType, Destination
@@ -122,6 +123,75 @@ def _load_cert(setting: str, data: bytes) -> x509.Certificate:
             ) from exc
 
 
+#: Smallest RSA modulus this connector will use for ANY Direct S/MIME key material -- the sender's
+#: signing key, the partner's recipient certificate, and the trust anchor (ASVS 11.2.3, BACKLOG #1166).
+#: Measured before this floor existed: every one of those three loaders was a parse-and-type check
+#: only, and a full RSA-1024 set constructed without complaint, against an RSA-2048 positive control
+#: in the same run showing the loaders were live and simply never asked how big the modulus was.
+#:
+#: **2048 is chosen because it refuses nothing a conformant Direct partner could supply, and that is
+#: the whole argument for putting it on counterparty-chosen material.** DirectTrust's Community X.509
+#: Certificate Policy requires end-entity keys of at least 2048 bits, as does the CA/Browser Forum's
+#: S/MIME baseline. So this floor cannot break a correspondent who is already following the rules
+#: their own certificate was issued under; it refuses only material that no current policy permits.
+#:
+#: **IT DOES NOT MEET ASVS 11.2.3, AND MUST NOT BE READ AS DOING SO.** The verb asks for 128 bits of
+#: security and names RSA-3072 as the equivalent; RSA-2048 is roughly 112. Raising this to 3072 is a
+#: SEPARATE and counterparty-facing decision needing partner field data nobody has gathered, and it
+#: would be a live availability choice about a hospital's certificate rather than a tightening of our
+#: own. What this floor closes is the UNBOUNDED case -- that a deploying site could configure
+#: RSA-1024 and nothing would object -- not the requirement.
+#:
+#: An EC key reaches the verb today with no such conversation: P-256 is 128-bit, and this connector
+#: accepts EC signing keys (see :meth:`DirectDestination._select_rsa_padding`).
+_MIN_RSA_BITS = 2048
+
+#: EC curves admitted for Direct S/MIME material. All three are at or above 128-bit security, so
+#: unlike the RSA floor this list needs no "does not meet the verb" caveat. Named positively so a
+#: curve nobody considered is excluded by construction rather than admitted by an absent deny-rule.
+_APPROVED_EC_CURVES = frozenset({"secp256r1", "secp384r1", "secp521r1"})
+
+
+def _require_key_strength(key: Any, setting: str) -> None:
+    """Refuse Direct S/MIME key material that parses and is the right shape but is too weak to use.
+
+    Applied to all three operator-supplied surfaces. Two of them are counterparty-chosen -- the
+    partner's ``recipient_cert`` and the issuing ``trust_anchor`` -- which is normally a reason for
+    caution, because refusing someone else's certificate is an availability decision about their
+    infrastructure rather than a tightening of ours. It is safe at THIS value for the reason recorded
+    on :data:`_MIN_RSA_BITS`: no certificate policy governing Direct permits what it refuses.
+
+    A key type this connector cannot classify passes rather than raises. The floor exists to catch a
+    weak key of a KNOWN type; turning it into a second, silent type gate would refuse Ed25519 on a
+    day someone adds it, for a reason that has nothing to do with strength.
+    """
+    if isinstance(key, (rsa.RSAPrivateKey, rsa.RSAPublicKey)) and key.key_size < _MIN_RSA_BITS:
+        raise ValueError(
+            f"Direct destination '{setting}' is RSA-{key.key_size}, below the {_MIN_RSA_BITS}-bit "
+            f"floor for Direct S/MIME material (DirectTrust and CA/Browser Forum S/MIME both require "
+            f"at least {_MIN_RSA_BITS}). Supply key material of at least {_MIN_RSA_BITS} bits."
+        )
+    if (
+        isinstance(key, (ec.EllipticCurvePrivateKey, ec.EllipticCurvePublicKey))
+        and key.curve.name not in _APPROVED_EC_CURVES
+    ):
+        approved = ", ".join(sorted(_APPROVED_EC_CURVES))
+        raise ValueError(
+            f"Direct destination '{setting}' uses EC curve {key.curve.name!r}, which is not on "
+            f"the approved list ({approved}). Supply a key on an approved curve."
+        )
+
+
+#: The RSA signature paddings an operator may select for the CMS SignerInfo, by ``signature_padding``
+#: setting value (ASVS 11.3.1, BACKLOG #1168). ``pkcs1v15`` is the default and stays the default: see
+#: :meth:`DirectDestination._select_rsa_padding` for why that is an interoperability finding rather
+#: than an oversight, and what it would take to move it.
+_RSA_SIGNATURE_PADDINGS: dict[str, str] = {
+    "pkcs1v15": "RSASSA-PKCS1-v1_5",
+    "pss": "RSASSA-PSS",
+}
+
+
 class DirectDestination(DestinationConnector):
     """Deliver each transformed payload as a signed+encrypted S/MIME message over SMTP (Direct
     Project, outbound only — ADR 0085 PR1).
@@ -168,12 +238,20 @@ class DirectDestination(DestinationConnector):
             s.get("signing_key"), s.get("signing_key_password")
         )
         self._verify_signing_key_matches_cert()
+        # The signing cert's public half is compared byte-for-byte against this key just above, so
+        # flooring the key covers the cert too -- they cannot differ by the time this runs.
+        _require_key_strength(self._signing_key, "signing_key")
+        # Which RSA padding the CMS SignerInfo carries. Parsed AFTER the key loads because the
+        # validation needs the key's type: `pss` on an EC key is refused here rather than at wire time.
+        self.signature_padding: str = self._parse_signature_padding(s.get("signature_padding"))
+        self._rsa_padding: padding.PSS | padding.PKCS1v15 | None = self._select_rsa_padding()
         # Per-partner recipient certificate — the encryption target. Direct is 1:1 with a HISP
         # correspondent, so PR1 supports a single recipient cert (a per-recipient cert map is a later
         # phase, ADR 0085).
         self._recipient_cert = _load_cert(
             "recipient_cert", _read_file("recipient_cert", s.get("recipient_cert"))
         )
+        _require_key_strength(self._recipient_cert.public_key(), "recipient_cert")
         # Trust anchor — the CA(s) the recipient cert must chain to. Verified at construction so a cert
         # from an untrusted issuer is refused before we ever encrypt PHI to it.
         self._verify_recipient_trusted(_read_file("trust_anchor", s.get("trust_anchor")))
@@ -301,6 +379,64 @@ class DirectDestination(DestinationConnector):
                 "Direct destination 'signing_key' does not match 'signing_cert' (public keys differ)"
             )
 
+    def _parse_signature_padding(self, value: Any) -> str:
+        """Validate the ``signature_padding`` setting, defaulting to ``pkcs1v15``.
+
+        Refuses an unknown value **and** ``pss`` on a non-RSA key at construction, so both fail at
+        ``check``/dry-run/start rather than on the first message. The second refusal is not defensive
+        tidiness: ``add_signer(..., rsa_padding=...)`` raises ``TypeError: Padding is only supported
+        for RSA keys``, so an EC signer plus ``pss`` would otherwise abort every delivery at wire time.
+        """
+        if value is None:
+            return "pkcs1v15"
+        choice = str(value).strip().lower()
+        if choice not in _RSA_SIGNATURE_PADDINGS:
+            allowed = ", ".join(sorted(_RSA_SIGNATURE_PADDINGS))
+            raise ValueError(
+                f"Direct destination 'signature_padding' must be one of: {allowed} (got {choice!r})"
+            )
+        if choice == "pss" and not isinstance(self._signing_key, rsa.RSAPrivateKey):
+            raise ValueError(
+                "Direct destination 'signature_padding=pss' requires an RSA 'signing_key'; this key "
+                "is EC (ECDSA), which has no padding parameter. Remove the setting — an EC signer "
+                "already avoids PKCS#1 v1.5 entirely."
+            )
+        return choice
+
+    def _select_rsa_padding(self) -> padding.PSS | padding.PKCS1v15 | None:
+        """The padding object handed to ``add_signer``, or ``None`` to leave the library default.
+
+        **Why ``pkcs1v15`` is still the default, and what would change it.** ASVS 11.3.1 names PKCS#1
+        v1.5 as a weak padding scheme, so the honest end state is an RSASSA-PSS default. It is not the
+        default here because the counterparty chose the verifier: a Direct/HISP peer must be able to
+        VERIFY what this engine signs, and an S/MIME stack that only implements PKCS#1 v1.5 rejects a
+        PSS SignerInfo outright. That is the same distinction ``transports/signing.py`` draws for its
+        key-strength floor -- a setting nobody else chose can be tightened unilaterally, a setting the
+        far side must interoperate with cannot. Moving the default needs partner PSS support data that
+        has not been gathered, not a code change.
+
+        **The escape from the dilemma is a different key type.** An EC (ECDSA) ``signing_key`` reaches
+        an approved signature with no padding parameter at all, and this connector already accepts one.
+
+        **The key-transport half of the message is NOT addressed here and cannot be.** Measured
+        against the pinned ``cryptography`` (50.0.1, ``requirements.lock``):
+        ``PKCS7EnvelopeBuilder.add_recipient()`` takes only a certificate, ``encrypt()`` takes only an
+        encoding and an option list, and neither exposes RSAES-OAEP -- a DER envelope built by this
+        library carries the ``rsaEncryption`` key-transport OID and no reachable alternative. So the
+        enveloped half of every Direct message would use RSAES-PKCS1-v1_5 on a first deployment
+        regardless of this setting, and closing that would mean leaving the pinned library for a
+        hand-built CMS path. Stated so this setting is not misread as covering the whole message.
+        """
+        if self.signature_padding == "pss":
+            # SHA-256 throughout: the digest is already SHA-256 at add_signer, and DIGEST_LENGTH keeps
+            # the salt equal to it, which is the widely-interoperable PSS parameter set.
+            return padding.PSS(
+                mgf=padding.MGF1(hashes.SHA256()), salt_length=padding.PSS.DIGEST_LENGTH
+            )
+        # None, not an explicit PKCS1v15() object: the library treats them identically for RSA, and
+        # None is also the only value an EC key accepts, so one branch covers both key types.
+        return None
+
     def _verify_recipient_trusted(self, anchor_data: bytes) -> None:
         """Refuse a recipient cert that is not directly issued by (or equal to) an operator-supplied
         trust anchor, so PHI is never encrypted to a certificate from an untrusted issuer (the reason a
@@ -320,6 +456,11 @@ class DirectDestination(DestinationConnector):
                 ) from exc
         if not anchors:
             raise ValueError("Direct destination 'trust_anchor' contained no certificates")
+        # Floored BEFORE the issuance check, so a weak anchor is refused whether or not it happens to
+        # be the one that issues this recipient. The loop below returns on the first match, so
+        # checking inside it would leave a weak sibling anchor unexamined and still trusted.
+        for anchor in anchors:
+            _require_key_strength(anchor.public_key(), "trust_anchor")
         for anchor in anchors:
             try:
                 # verify_directly_issued_by checks the issuer/subject name match AND that the anchor's
@@ -357,14 +498,23 @@ class DirectDestination(DestinationConnector):
         #                    implementation guide (signingTime, ESSCertIDv2/signingCertificate) are a
         #                    documented later-phase refinement (ADR 0085), not a PR1 requirement; the
         #                    core authenticity + integrity guarantee holds without them.
-        signed = (
+        #   * rsa_padding  — the operator's `signature_padding` choice (ASVS 11.3.1, #1168). None keeps
+        #                    the library default (RSASSA-PKCS1-v1_5) and is the only value an EC key
+        #                    accepts; `pss` selects RSASSA-PSS. Passed as a keyword rather than
+        #                    branching the builder chain, so there is one call site to read.
+        builder = (
             pkcs7.PKCS7SignatureBuilder()
             .set_data(body)
-            .add_signer(self._signing_cert, self._signing_key, hashes.SHA256())
-            .sign(
-                serialization.Encoding.DER,
-                [pkcs7.PKCS7Options.NoAttributes, pkcs7.PKCS7Options.Binary],
+            .add_signer(
+                self._signing_cert,
+                self._signing_key,
+                hashes.SHA256(),
+                rsa_padding=self._rsa_padding,
             )
+        )
+        signed = builder.sign(
+            serialization.Encoding.DER,
+            [pkcs7.PKCS7Options.NoAttributes, pkcs7.PKCS7Options.Binary],
         )
         # ENCRYPT the signed blob to the partner's recipient cert (sign-then-encrypt: the signature is
         # itself confidential). DER output is carried as the S/MIME application/pkcs7-mime body.
