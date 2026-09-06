@@ -18,10 +18,16 @@
 #     per pull request" into `gh pr list --label unread`, which is the difference between a poll a
 #     SEAT can afford to run and one it cannot. Same claim, same limits, as `ci-red`.
 #
-# WHY `workflow_run` AND NOT `pull_request`. The state becomes true when the LAST required check goes
+# WHY `workflow_run` CARRIES THE MAIN ARM. The state becomes true when the LAST required check goes
 # green, which is a workflow COMPLETING -- there is no pull_request event at that moment. `workflow_run`
-# also runs from the default branch with its own permissions and, unlike `pull_request_target`, never
-# executes code from the head. failure-signal.yml and nightly-notice.yml already use it.
+# also runs from the default branch with its own permissions and never executes code from the head.
+# failure-signal.yml and nightly-notice.yml already use it.
+#
+# AND WHY A SECOND ARM RUNS ON `pull_request_target`. Becoming unread is a check settling; ceasing to
+# be unread is somebody adding a LABEL, and no `workflow_run` observes that. The two arms watch two
+# different events because the state has two different edges. `pull_request_target` was chosen over
+# `pull_request` on the checkout, not on convenience -- the full reasoning sits on the arm itself,
+# under `on:` below, so it is beside the line a reader would change.
 #
 # NOT REQUIRED, AND MUST NOT BECOME REQUIRED. It reports a fact ABOUT a pull request from outside that
 # pull request's own event, on the same reasoning stalled-prs.yml records for itself. It also fires on
@@ -50,23 +56,64 @@ on:
     # `review gate` WAS in this list and was what made the label self-clearing: labelling a pull
     # request `reviewed` re-ran that gate, whose completion re-triggered this workflow, which
     # withdrew the `unread` label. The owner retired the reviewer requirement on 2026-09-04 and
-    # review-gate.yml was deleted, so the entry named a workflow that no longer exists.
+    # review-gate.yml was deleted, so the entry named a workflow that no longer exists and
     # test_every_watched_workflow_exists_by_name failed on it, correctly.
     #
-    # KNOWN REGRESSION, RECORDED RATHER THAN HIDDEN. `review gate` was the ONLY watched workflow
-    # firing on a `labeled` event: ci.yml, security.yml and backlog-hygiene.yml declare no `types:`
-    # and cla.yml declares [opened, synchronize]. So `unread` no longer withdraws when somebody
-    # reads a pull request and labels it. It clears on the NEXT PUSH, when a watched workflow next
-    # completes. A flag that survives being read is worse than no flag, and this one now does until
-    # that push.
+    # THAT LEFT A REGRESSION, IT SHIPPED, AND THE `pull_request_target` ARM BELOW IS ITS FIX.
+    # `review gate` was the ONLY watched workflow firing on a `labeled` event: ci.yml, security.yml
+    # and backlog-hygiene.yml declare no `types:` and cla.yml declares [opened, synchronize]. With
+    # it gone, `unread` withdrew only when a watched workflow next COMPLETED, which is not the
+    # moment somebody reads a pull request.
     #
-    # THE FIX IS NOT A ONE-LINE TRIGGER ADD, which is why it is not done here. Restoring the
-    # behaviour needs an arm firing on `labeled`, and this file deliberately uses `workflow_run`
-    # rather than `pull_request` -- see WHY `workflow_run` AND NOT `pull_request` above, and NOT
-    # REQUIRED, AND MUST NOT BECOME REQUIRED. A pull_request arm changes where this runs and what it
-    # can do, which is a security-surface decision and the owner's to make.
+    # MEASURED on PR 897, 2026-09-05, from the run log rather than inferred: a person added
+    # `reviewed` at 20:39:02Z; run 33990769043 of this workflow, triggered by a `workflow_run`
+    # completion, printed `Resolved to pull request 897` and `pull request 897 -> clear`, and
+    # `unread` came off at 20:42:38Z as `github-actions[bot]`. Three and a half minutes, and the
+    # thing that ended them was a workflow finishing, not the read.
+    #
+    # THE SHORT WAIT IS A PROPERTY OF THE LOAD, NOT OF THE MECHANISM. This repository runs a fleet
+    # of sessions and completes workflows almost continuously, so a stale flag is usually collected
+    # within minutes by a completion it has nothing to do with. A pull request that is finished and
+    # green has no completion coming, and that is exactly the pull request this signal is about.
     workflows: [CI, Security, backlog-hygiene, CLA Assistant]
     types: [completed]
+
+  # THE SELF-CLEARING ARM. `pull_request_target` is the SAFER of the two events that can carry it,
+  # not a relaxation of the rule above -- a label event exists on `pull_request` and
+  # `pull_request_target` and nowhere else, so restoring the behaviour needs one of them.
+  #
+  #   * `pull_request` reads the WORKFLOW FILE from the head, and with no `ref:` its checkout takes
+  #     the MERGE commit -- the pull request's own code, fetched and run here. That is the
+  #     pwn-request hole this file's zizmor suppression says is closed, and it would open it.
+  #   * `pull_request_target` reads the workflow file from the BASE, and with no `ref:` its checkout
+  #     takes the base branch. Trusted on both counts.
+  #     scripts/quality/workflow_local_action_check.py records the same rule at its source: "under
+  #     pull_request_target the DEFAULT checkout takes the BASE, which is the safe form."
+  #
+  # So the `ref:`-lessness that makes the `workflow_run` arm safe makes this one safe by the same
+  # single word, and tests/test_unread_signal.py::test_the_checkout_never_names_a_ref now guards
+  # both arms with one assertion. Nothing here fetches or executes the head.
+  #
+  # WHO CAN FIRE IT: only an account with write or triage permission on this repository, because
+  # only such an account can label a pull request. A fork contributor cannot reach this arm at all.
+  #
+  # NO `if:` NARROWING IT TO THE `reviewed` LABEL, and that is a decision rather than an omission.
+  # Only that label can change the verdict, so gating on `github.event.label.name` would cut runs --
+  # at the price of a compound expression that, once it stopped matching, would disable this arm
+  # while reddening nothing. That is the failure this file already shipped once. An evaluation that
+  # changes nothing also WRITES nothing, because `decide()` returns `keep` or `none`.
+  #
+  # AND THE RUNS IT WOULD HAVE CUT ARE MOSTLY NOT THERE TO CUT. By GitHub's own rule a GITHUB_TOKEN
+  # event starts no workflow run, and the labels that fly around this repository -- `ci-red` from
+  # failure-signal.yml, `unread` from this workflow -- are all written with GITHUB_TOKEN. So this arm
+  # fires on a PERSON's label action and essentially nothing else, which is the event it exists for.
+  #
+  # THE SAME RULE IS WHY THERE IS NO LOOP: the writes below cannot re-trigger this workflow. If that
+  # ever changed, the label is its own idempotency token and the second evaluation returns `keep`, so
+  # the chain terminates either way.
+  pull_request_target:
+    types: [labeled, unlabeled]
+
   workflow_dispatch:
     inputs:
       pr:
@@ -83,7 +130,18 @@ concurrency:
   # asking "is this pull request unread" are the SAME fact, and letting them overlap would post the
   # comment twice. `cancel-in-progress: false` serialises instead of cancelling: the second run then
   # sees the label the first added and returns `keep`, which is the whole idempotency mechanism.
-  group: unread-signal-${{ github.event.workflow_run.head_branch || inputs.pr }}
+  #
+  # `pull_request.head.ref` IS THE SAME STRING AS `workflow_run.head_branch` -- both are the head's
+  # unqualified branch name -- so a label event and a workflow completion for one pull request land
+  # in ONE group and serialise against each other. Keying the new arm on the pull-request NUMBER
+  # would have read correctly and put the two arms in different groups, which is the overlap this
+  # block exists to prevent.
+  #
+  # THE DISPATCH ARM DOES NOT JOIN THEM, and that is pre-existing rather than introduced here: a
+  # `workflow_dispatch` supplies a number and no branch, and concurrency is evaluated before any job
+  # runs, so nothing can resolve one to the other. A hand-run dispatch can therefore overlap an
+  # automatic run for the same pull request. The cost is bounded by the same `keep` idempotency.
+  group: unread-signal-${{ github.event.workflow_run.head_branch || github.event.pull_request.head.ref || inputs.pr }}
   cancel-in-progress: false
 
 jobs:
@@ -110,19 +168,30 @@ jobs:
       - name: Find the pull request behind this run, if there is one
         id: resolve
         env:
-          # EVERY value below is attacker-influenceable -- a branch name is chosen by whoever opened
-          # the branch. They go through the environment and are matched against a strict pattern.
-          # Interpolating them into the script body would be a template-injection hole.
+          # THE HANDLING IS UNIFORM WHETHER OR NOT A VALUE IS ATTACKER-INFLUENCEABLE, and the
+          # uniformity is the point: every value below reaches the script through the environment
+          # and is matched against a strict pattern, so no future addition here needs anyone to
+          # re-derive which ones are safe. Interpolating any of them into the script body would be
+          # a template-injection hole. HEAD_BRANCH is the one genuinely chosen by an attacker -- a
+          # branch name belongs to whoever opened the branch.
           PR_FROM_EVENT: ${{ toJSON(github.event.workflow_run.pull_requests) }}
           HEAD_BRANCH: ${{ github.event.workflow_run.head_branch }}
           RUN_EVENT: ${{ github.event.workflow_run.event }}
           DISPATCH_PR: ${{ inputs.pr }}
+          # The `pull_request_target` arm carries its number directly, so that arm needs no resolver
+          # at all. Empty on every other event.
+          EVENT_PR: ${{ github.event.pull_request.number }}
         run: |
           set -euo pipefail
           pr=""
           if [ -n "${DISPATCH_PR:-}" ]; then
             # Anchored, so a dispatch input can only ever be digits.
             pr="$(printf '%s' "$DISPATCH_PR" | grep -oE '^[0-9]+$' || true)"
+          elif [ -n "${EVENT_PR:-}" ]; then
+            # GitHub supplies this one, not a branch author, so it is not attacker-influenceable the
+            # way HEAD_BRANCH is. Anchored anyway: every value that reaches `pr` here is matched
+            # against the same pattern, so no future arm can widen it by being added.
+            pr="$(printf '%s' "$EVENT_PR" | grep -oE '^[0-9]+$' || true)"
           else
             # `type == "array"` guards the null this key holds on a non-workflow_run event.
             pr="$(printf '%s' "$PR_FROM_EVENT" | jq -r 'if type == "array" and length > 0 then .[0].number else "" end')"
@@ -138,7 +207,7 @@ jobs:
             echo "Resolved to pull request $pr"
           else
             echo "pr=" >> "$GITHUB_OUTPUT"
-            echo "No pull request behind this run; event was ${RUN_EVENT:-workflow_dispatch}"
+            echo "No pull request behind this run; triggering event was ${RUN_EVENT:-none}"
           fi
 
       - name: Decide whether it is green and unread
