@@ -677,6 +677,50 @@ def test_a_number_INVENTED_during_a_merge_is_still_refused(repo: Path, tmp_path:
     # the overlap that stops a pair from localising a failure -- caught by running the mutation.
 
 
+def test_MAIN_merged_INTO_another_seats_branch_is_committable(repo: Path, tmp_path: Path) -> None:
+    """The direction the first fix MISSED, and the one a Lander actually resolves.
+
+    ***THE TWO DIRECTIONS ARE NOT SYMMETRIC AND THE FIRST VERSION ONLY HANDLED ONE.*** Merging their
+    branch into mine puts their number on MERGE_HEAD. Merging main into THEIRS puts it on HEAD, and a
+    rule that reads only MERGE_HEAD refuses it. The arm above covers the first; without this one the
+    pair passed while the measured PR 850 case stayed broken -- two mutations proved those arms
+    disjoint FROM EACH OTHER, which says nothing about whether either points at the real shape.
+
+    ***THE MERGER MUST BE ON A DIFFERENTLY-NAMED BRANCH, AND THAT IS NOT INCIDENTAL.*** git refuses
+    one branch in two worktrees, so a merger cannot stand on the author's branch -- it cuts its own
+    from theirs, exactly as `lander-fix/850` was cut. Stay on the author's branch NAME and `owns()`'s
+    branch fallback (BACKLOG #1282) returns True, so the run passes for a reason unrelated to merging.
+    The first reproduction of this did precisely that and reported a false all-clear.
+    """
+    git(repo, "checkout", "-q", "-b", "sibling")
+    backlog = (repo / "docs/BACKLOG.md").read_text(encoding="utf-8")
+    write(repo, "docs/BACKLOG.md", backlog + "\n## 1441. Filed by the sibling\n\nbody\n")
+    allocate(repo, "backlog", "1441", worktree=repo, branch="sibling")
+    git(repo, "commit", "-qam", "sibling files #1441")
+
+    # ***MAIN MUST TOUCH docs/BACKLOG.md TOO, OR THIS TEST PASSES VACUOUSLY.*** check_backlog()
+    # returns early unless the STAGED diff contains a ledger file. If main moves only in some other
+    # file, the merge stages only that file, the rule is never reached, and the arm reports success
+    # without having exercised anything. The first version of this test did exactly that: it passed
+    # under a mutation that restored the very bug it was written to catch.
+    git(repo, "checkout", "-q", "main")
+    backlog = (repo / "docs/BACKLOG.md").read_text(encoding="utf-8")
+    write(repo, "docs/BACKLOG.md", backlog + "\n## 1440. Filed on main\n\nbody\n")
+    allocate(repo, "backlog", "1440", worktree=repo, branch="main")
+    git(repo, "commit", "-qam", "main files #1440")
+    git(repo, "update-ref", "refs/remotes/origin/main", "HEAD")
+
+    # The number now belongs to a worktree that is not this one AND a branch this one is not on.
+    allocate(repo, "backlog", "1441", worktree=tmp_path / "somewhere-else", branch="sibling")
+
+    git(repo, "checkout", "-q", "-b", "lander-fix/850", "sibling")
+    git(repo, "merge", "--no-commit", "--no-ff", "origin/main")
+    git(repo, "add", "-A")
+
+    code, out = run_check(repo)
+    assert code == 0, f"main merged into another seat's branch must commit; got:\n{out}"
+
+
 def _ledger_hook() -> dict[str, object]:
     """The ledger-gate entry from .pre-commit-config.yaml, or fail loudly.
 

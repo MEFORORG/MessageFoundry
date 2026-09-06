@@ -146,3 +146,77 @@ def test_a_spawned_node_is_handed_the_anchor_as_operator_material() -> None:
     assert node._env["MEFOR_API_TLS_KEY_FILE"] == key
     assert node.cacert == cert
     assert node.url.startswith("https://")
+
+
+# --- BACKLOG #1179: the three `--insecure` hints stop promising a fix the flag cannot deliver ------
+
+
+def _harness_sources() -> list[Path]:
+    root = Path(__file__).resolve().parents[1] / "harness"
+    files = sorted(root.rglob("*.py"))
+    assert len(files) > 20, f"the harness corpus did not load: {len(files)} files"
+    return files
+
+
+def test_the_retired_insecure_hint_is_gone_from_the_harness() -> None:
+    """The three two-box drives printed "(hint: pass --insecure for a trusted-network http engine)"
+    on an ``ApiError`` exit. That promised a fix the flag cannot deliver: measured 2026-09-05 against
+    a real TLS listener, ``--insecure`` clears only THIS CLIENT's construction-time refusal, and a
+    stock engine has served TLS since ADR 0172 -- so the poll then dies at the handshake with an
+    opaque ``httpx.ReadError`` instead. An operator who follows the hint trades a named refusal for
+    an unnamed transport error.
+
+    The positive control is the point: a pattern that finds nothing anywhere is indistinguishable
+    from a clean repo, so this asserts the corpus is searchable in the SAME run.
+
+    Mutation: restore any one of the three old strings. Red: it is named with its file."""
+    retired = "pass --insecure for a trusted-network http engine"
+    control = "--insecure"
+    offenders: list[str] = []
+    control_hits = 0
+    for path in _harness_sources():
+        text = path.read_text(encoding="utf-8")
+        if retired in text:
+            offenders.append(str(path))
+        control_hits += text.count(control)
+    assert control_hits > 0, "the search found no `--insecure` at all -- the instrument is broken"
+    assert offenders == [], f"the retired hint survives in: {offenders}"
+
+
+def test_the_corrected_hint_is_single_sourced_at_three_sites() -> None:
+    """Three copies of one sentence is how they drifted apart in the first place, so the correction
+    is a module constant the three exits interpolate (SDS-3.5: state a load-bearing fact once).
+
+    Mutation: inline the text at one site. Red: the reference count is 2, not 3."""
+    from harness.__main__ import _INSECURE_HINT
+
+    source = (Path(__file__).resolve().parents[1] / "harness" / "__main__.py").read_text(
+        encoding="utf-8"
+    )
+    interpolations = source.count("{_INSECURE_HINT}")
+    assert interpolations == 3, f"expected 3 hint sites, found {interpolations}"
+    # It must say what the flag CANNOT do -- that is the whole correction.
+    assert "cannot make a TLS-serving engine" in _INSECURE_HINT
+    assert "ADR 0172" in _INSECURE_HINT
+    assert "carries no credential" in _INSECURE_HINT
+
+
+def test_the_insecure_flag_help_no_longer_asserts_the_engine_api_is_http() -> None:
+    """The three ``--insecure`` help strings carried the same false premise as the hints -- "REQUIRED
+    when the engine API is http" / "REQUIRED for a two-box http engine" -- which reads as a statement
+    that the engine API IS http. Since ADR 0172 a stock engine serves TLS, so the flag is required
+    only where the operator DECLARED the engine plaintext.
+
+    Mutation: restore any "REQUIRED ... http engine" phrasing. Red: the count is not 3."""
+    source = (Path(__file__).resolve().parents[1] / "harness" / "__main__.py").read_text(
+        encoding="utf-8"
+    )
+    assert "REQUIRED when the engine API is http" not in source
+    assert "REQUIRED for a two-box http engine" not in source
+    # Each of the three flags now conditions the permission on the engine genuinely serving plaintext.
+    # Counted on the BARE WORD: two of the three wrap mid-phrase, so "GENUINELY serves" is not
+    # contiguous in the source and a phrase count would silently read 2 and still pass a `>=` bound.
+    assert source.count("GENUINELY") == 3, (
+        "expected all three --insecure help strings to condition on a genuinely-plaintext engine, "
+        f"found {source.count('GENUINELY')}"
+    )
