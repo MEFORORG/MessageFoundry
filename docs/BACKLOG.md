@@ -9728,6 +9728,34 @@ A recycled name inside one directory is **not** cross-IdP spoofing, so a 6.8.1 r
 So this column does not close an unguarded hole. It replaces incidental, extra-gated coverage with a direct guard that names the field.
 
 **Still unbuilt, named by subject rather than number:** the full-factor re-authentication mint; the self-service password lanes above; the target-scoped action grant; the console admin user-update edit-unlock work; the client full-factor reauth channel; the API-Kerberos step-up seeding asymmetry; and the golden's remaining blind spots, the `step_up` / `auto_retry` / `unlock` flags, which the action column deliberately did not take on. The closing act stays the scorecard re-score, which is the tracking seat's work and is not claimed here.
+
+**RE-MEASURED 2026-09-05 at `c57903c2c`. THE OPENING BLOCKQUOTES OF THIS ITEM ARE STALE AND ARE CORRECTED HERE, NOT REWRITTEN ABOVE.** A builder was dispatched to build the action binding on both planes and found the whole named deliverable already shipped. Every claim was re-run by execution rather than carried forward; anchors are on symbols, not line numbers.
+
+| what the row's re-score and filing blockquotes still assert | instrument | result at HEAD |
+|---|---|---|
+| the admin lane "still rides the shared window", `require_step_up` on reset-MFA | read `reset_user_mfa` / `reset_user_password` in `api/auth_routes.py` | **FALSE.** Both take `require_step_up_action` with their own action constant |
+| the browser twin rides it too | read `ui_user_reset_mfa` / `ui_user_reset_password` in `routes/admin.py` | **FALSE.** Both take `require_ui_step_up_action` |
+| "no admin reset-MFA or reset-password action" (absence claim) | `grep -n "^STEP_UP_ACTION_"` on `auth/service.py` | **FALSE.** Both constants ship |
+| the combined untagged registry entry | read the `register_ui_action` block in `routes/admin.py` | **FALSE.** Split per-action; revoke-sessions and delete stay combined and untagged on purpose |
+| the gate-ON factory, not the gate-OFF one | `grep` both factory names, both planes | **TRUE, still.** Neither reset lane uses the reauth-only family |
+
+**One positive control moved, and only its number.** This item's 2026-08-22 retraction rests on `require_reauth_only_action` appearing "at exactly two sites, both self-service enrollment". It is now **four** route sites: the two enrollment lanes plus `DELETE /me/sessions/{session_id}` and `DELETE /me/sessions`, both added for #1149's session-terminate work. All four are **self-service**, so the argument the retraction makes is untouched -- an admin-on-third-party lane still never uses the gate-OFF family. The count is what went stale. Recorded so the next reader does not treat a correct count of 4 as evidence the retraction lapsed.
+
+**Two downgrade classes were probed and are GUARDED, which is worth recording because both look unguarded from the item's prose.** Swapping a console reset lane's `require_ui_step_up_action` for `require_ui_step_up` reds `test_reset_password_shows_temp_once` on its bounce assertion. Swapping it for the MFA-gate-OFF `require_ui_reauth_only_action` reds `test_security_doc_drift::test_every_ui_route_appears_in_the_ui_route_map`, which compares the dependency name against a row in **`docs/SECURITY.md` -- public and tracked**, so that guard is not vaulted and not extra-gated.
+
+**Residual closed: the golden's `step_up` / `auto_retry` / `unlock` blind spots**, named above as proposed and unbuilt. `_UI_WRITE_ACTIONS` is by its own comment the only source of truth for what the step-up re-auth may hand control back to -- "the gate that stops the re-auth becoming an open POST/redirect gadget" -- and those three fields decide it: `auto_retry` puts a path in the re-POST allow-list, `unlock` in the 303-GET-redirect one, `step_up` drives the enroll-first branch. The golden compared `pattern` and `action` only, so all three sat outside it. The golden now pins `pattern<TAB>action<TAB>flags` for all 28 registrations.
+
+***THIS ONE WAS ACTUALLY UNGUARDED, WHICH THE ACTION COLUMN BEFORE IT WAS NOT.*** One probe, behaviourally silent by construction: `step_up=False` added to the `/ui/users/{id}/reset-mfa` registration, whose disabled branch fires only for a required-but-unenrolled operator.
+
+| instrument run against the probe | result |
+|---|---|
+| the full console suite | **422 passed, 3 skipped -- GREEN** |
+| engine security-doc drift + rate-limit + security-static + seam-discovery + lint-parity + full API-auth + the golden itself | **242 passed -- GREEN** |
+| the same golden after this column lands | **RED**, naming the flag that moved |
+
+Interpreter named rather than assumed, since the extra-gated coverage hazard above is a property of the interpreter: the worktree `.venv` on CPython 3.14.6, `cryptography` 50.0.1 matching `requirements.lock`, and **the optional `[webauthn]` extra installed** (`webauthn` 3.0.0), so the two WebAuthn console lanes were live in every run above.
+
+**Deliberately not done here**, each already named above as a reason: shrinking `step_up_max_age_seconds`, flipping `seed_reauth`, and binding the roles or channel-scope routes. The four items still unbuilt are unchanged, minus the golden flags. **The verdict stays `research` and the closing act stays the scorecard re-score, which no builder performs -- this item stays open.**
 ## 1149. research an honest pass for ASVS 7.5.2 -- what "authenticated again" means when the step-up window is seeded at login
 
 > 🔢 **Re-scored 2026-08-20 -> P2.** Value **5/10** · Difficulty **3/10** · _fill-in_. The seeding still happens at login: store/store.py carries seed_reauth as a create_session parameter defaulting True with the comment that reauth_at = now seeds the step-up window from login, one line above the INSERT (around :8380-8385; the item's :8287 anchor and the scorecard's :8263 have both drifted). View and terminate ship at api/auth_routes.py:451, :474 and :488, and seed_reauth is already threaded through auth/service.py (:887, :1039, :1177), so the open work is a semantic reading and a re-verify, not a mechanism. _(was 5/10 · 4/10.)_
