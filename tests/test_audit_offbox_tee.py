@@ -281,27 +281,68 @@ def test_tee_docstring_and_cipher_registry_agree_about_audit_log() -> None:
     depth over an already-sealed column, when it is the only thing standing between an HL7 fragment
     and the off-box copy.
 
-    This guard fails in BOTH directions, which is the point: revert the docstring and it goes red;
-    add ``audit_log`` to ``_CIPHER_COLUMNS`` without updating the prose and it goes red too. Coverage
-    is not a one-line change -- ``audit_row_hash`` hashes the PLAINTEXT ``detail`` into the
-    tamper-evident chain and key rotation rewrites every cipher column, so naive coverage breaks
-    verification on the first rekey (BACKLOG #1198).
+    This guard fails in BOTH directions, and until 2026-09-06 the second direction was UNREACHABLE.
+
+    It read only ``_CIPHER_COLUMNS``, the ID-KEYED registry. ``audit_log.id`` is ``AUTOINCREMENT``
+    (SQLite), ``BIGSERIAL`` (Postgres) and ``IDENTITY`` (SQL Server), and ``store.py`` states the rule
+    that follows from that: "The autoincrement-id tables bind cell_aad to natural columns (see
+    _CIPHER_COLUMNS)". So ``audit_log`` could never legitimately enter that tuple, and the branch
+    testing for it was ruled out by the schema rather than merely untriggered -- while this docstring
+    told a reader the claim was pinned in both directions. A control that cannot produce a different
+    answer is decoration, and an assurance broader than its control is the SDS-3.7 shape.
+
+    The tell was in this same docstring: the three columns it names as cipher-covered
+    (``message_events.detail``, ``connection_event.reason``, ``alert_instance.reason``) are absent
+    from ``_CIPHER_COLUMNS`` too, for exactly that reason. The mechanism that would actually cover
+    ``audit_log.detail`` is the one this guard could not see.
+
+    It now reads BOTH mechanisms via ``_cipher_registry.covered_tables()``. Settled by adversarial
+    review, where both sides recommended widening and the side arguing to keep it narrow conceded on
+    the schema fact above.
+
+    Coverage is still not a one-line change -- ``audit_row_hash`` hashes the PLAINTEXT ``detail`` into
+    the tamper-evident chain and key rotation rewrites every cipher column, so naive coverage breaks
+    verification on the first rekey. The red below therefore says VERIFY rather than "edit the
+    prose": a single literal on one backend is work in progress, and instructing a coverage claim
+    into the docstring from it would recreate the false statement this guard exists to prevent
+    (BACKLOG #1198).
     """
+    from _cipher_registry import covered_tables
+
     from messagefoundry.store.store import MessageStore
 
-    covered = {table for table, _column in MessageStore._CIPHER_COLUMNS}
+    narrow = {table for table, _column in MessageStore._CIPHER_COLUMNS}
+    covered = covered_tables()
     doc = audit_tee.emit_audit_tee.__doc__ or ""
 
-    # POSITIVE CONTROL: the registry must be readable and non-trivial, or an empty `covered` would
-    # make the branch below pass vacuously.
+    # POSITIVE CONTROL 1: the derivation must be readable and non-trivial, or an empty `covered`
+    # would make the branch below pass vacuously.
     assert "messages" in covered, (
         "cipher registry unreadable or empty -- the assertion below is void"
     )
 
+    # POSITIVE CONTROL 2, AND IT IS THE ONE THAT PROVES THE WIDENING HAPPENED. These three tables are
+    # cipher-covered by composite passes and appear in NO id-keyed registry. If this fails, the guard
+    # has silently reverted to reading `_CIPHER_COLUMNS` alone and its `audit_log` branch is
+    # unreachable again -- which is the exact defect being fixed, and it would otherwise look green.
+    composite_only = {"message_events", "connection_event", "alert_instance"}
+    assert composite_only <= covered, (
+        f"the widened derivation lost the composite mechanism: {sorted(composite_only - covered)} "
+        "are cipher-covered but not seen. The audit_log branch below is unreachable in this state."
+    )
+    assert not (composite_only & narrow), (
+        "these tables have entered the id-keyed registry, which the store's own design note says "
+        "cannot work for a server-assigned id -- re-read _CIPHER_COLUMNS before trusting this guard"
+    )
+
     if "audit_log" in covered:  # pragma: no cover - fires only once someone adds coverage
         assert "NOT a cipher column at rest" not in doc, (
-            "audit_log is now cipher-covered but audit_tee's docstring still says it is not. "
-            "Update the prose, and check audit_row_hash/rekey against the chain (BACKLOG #1198)."
+            "audit_log now appears cipher-covered somewhere, and audit_tee's docstring still says it "
+            "is not. VERIFY BEFORE EDITING THE PROSE: confirm the column is covered on ALL THREE "
+            "backends, not just the one you touched, and check audit_row_hash and rekey against the "
+            "tamper-evident chain. A single literal on one backend is work in progress, and writing "
+            "a coverage claim into the docstring from it recreates the false statement this guard "
+            "exists to prevent (BACKLOG #1198)."
         )
     else:
         assert "NOT a cipher column at rest" in doc, (
