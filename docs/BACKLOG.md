@@ -10087,12 +10087,39 @@ THREE enablement KEYS -- `FhirLookup` composed with `with_smart_backend` is swit
 spec, executor and opener table. And the other four cells in this family genuinely DO have federated
 login as their sole binding limb: zero `id_token` occurrences in `smart.py`, `http_auth.py` and
 `fhir.py`, against a firing control of 7, 9 and 4 `access_token` hits in the same run. So apply Owner
-Ruling 1's disposition to all six and inherit its PREMISE on five. **A process finding that outranks
-any of this, and it is not this item's fault: the 2026-08-17 ruling is not written anywhere in the
-engine tree.** A tree-wide search returns CI comments, three unrelated documents, a lock-file timestamp
-and BACKLOG paraphrases -- no ruling text. Six items now defer to a document nobody can read, while the
-method's own rule says never to reason from a paraphrase. Get its text into
-`docs/ASVS-ASSESSMENT-METHOD.md` before any cell cites it. Anchor drift: `oidc_enabled` resolves at
+Ruling 1's disposition to all six and inherit its PREMISE on five. **RETRACTED SAME DAY, and the retraction is worth more than the claim was.** This
+amendment first said the 2026-08-17 ruling was "not written anywhere in the engine tree ... a document
+nobody can read", and asked for its text to be copied into `docs/ASVS-ASSESSMENT-METHOD.md`. **The
+measurement was true and the conclusion was false.** The ruling is
+`docs/security/OWNER-RULINGS-2026-08-17.md` in the VAULT, on `origin/main`, added by vault commit
+`9b311054`; the federated-login ruling is **Ruling 1**, at lines 6-38. It is not in the engine tree
+BY DESIGN, because rulings live in the vault, so nothing needs copying anywhere and the six items
+defer to a document that reads fine. **The instrument could not have returned anything else:**
+`docs/security/` is gitignored from every engine checkout, which `CLAUDE.md` section 12 names as a
+trap in terms -- from an engine checkout the record "does not look misplaced, it looks like it does
+not exist, which is why sessions conclude there is nothing to read". A tree-wide engine search was
+the wrong question asked confidently.
+
+**WHAT READING THE ACTUAL RULING CHANGES, now that it has been read.** Two things, and the first
+strengthens this item's surviving finding rather than weakening it. **Ruling 1 scopes itself in its
+own words to "the six cells whose SOLE BINDING LIMB is that the federated-login feature ships off".**
+That is the premise this amendment measured as false for 10.1.1, and the ruling's own sentence is now
+the citation: this verb also ranges over outbound OAuth minting paths that ship independently of
+`[auth].oidc_enabled`, so 10.1.1 is not a cell whose sole binding limb is federated login. The
+ruling's DISPOSITION still applies -- the cell is permanently partial on the rubric gate either way,
+and the ruling says in terms that this is not a scope-out and the verdict does not move. Only its
+stated premise misses this one cell of the six.
+
+**Second, the ruling's own count has drifted by one and should be re-based when convenient.** It says
+enabling federated login "requires fifteen operator-supplied values" and rests that on execution.
+Measured again 2026-09-06 by REMOVAL rather than addition -- start from a configuration that loads,
+drop one key at a time, keep the ones whose absence refuses the load -- the answer is **fourteen**:
+thirteen in `[auth]` plus `[security].web_console_public_address`. Baseline-loads and
+drop-a-non-required-value controls both fired in the same run. **The ruling's argument is unaffected**
+-- at fourteen or fifteen, a gate demanding them would refuse to start for every site that does not
+federate -- so this is a figure to correct, not a conclusion to revisit. Note that
+`[api].public_origin` was renamed to `[security].web_console_public_address` under ADR 0118 and the
+old spelling is now REFUSED at load, which is the kind of change that moves a count like this. Anchor drift: `oidc_enabled` resolves at
 `config/settings.py:2003` and the `ad_enabled` precondition at `:2245`; enabling OIDC needs **14**
 further site-supplied values, measured by adding one at a time until the config loaded.
 ## 1156. research an honest pass for ASVS 10.1.2 when the flow-binding secrets are unconditional but the flow ships off
