@@ -89,6 +89,7 @@ from messagefoundry.transports.base import (
 )
 from messagefoundry.transports.file import (
     DEFAULT_MAX_FILE_BYTES,
+    DEFAULT_MAX_FILES_PER_POLL,
     LEAVE_SEEN_CACHE_MAX,
     ScanRejected,
     _content_matches_declared,
@@ -1008,6 +1009,15 @@ class RemoteFileSource(SourceConnector):
         self._validate_directory: bool = bool(s.get("validate_directory", False))
         mfb = s.get("max_file_bytes", DEFAULT_MAX_FILE_BYTES)
         self._max_file_bytes: int | None = int(mfb) if mfb else None
+        # Per-tick ceiling (ASVS 2.4.1, BACKLOG #1114), shared verbatim with the local File source —
+        # same key, same default, same "falsy disables" rule, imported rather than restated so the two
+        # poll sources cannot drift on what one tick is allowed to do. It bites HARDER here than it
+        # does locally, because each file on this source costs a network round trip.
+        mfp = s.get("max_files_per_poll", DEFAULT_MAX_FILES_PER_POLL)
+        self._max_files_per_poll: int | None = int(mfp) if mfp else None
+        #: Whether the LAST poll hit the ceiling — gates a single transition log (the `_skipping`
+        #: pattern this class already uses for the leader gate).
+        self._deferring = False
         self._processed_dir = posixpath.join(
             self._remote_dir, s.get("processed_subdir", ".processed")
         )
@@ -1119,6 +1129,8 @@ class RemoteFileSource(SourceConnector):
         await asyncio.to_thread(self._client.ensure_dir, self._error_dir)
         entries = await asyncio.to_thread(self._client.list_dir, self._remote_dir)
         newly_recorded = 0  # #142: files marked processed THIS poll — gates one end-of-poll prune
+        touched = 0  # files this poll actually did I/O on — what max_files_per_poll bounds
+        deferred = False  # whether the ceiling cut this poll short (for the transition log)
         for name, size in sorted(entries):
             if self._stop.is_set():
                 break  # shutting down — leave the rest for the next start (at-least-once)
@@ -1147,6 +1159,15 @@ class RemoteFileSource(SourceConnector):
             file_key = self._file_key(name, size) if self._after_read == "leave" else None
             if file_key is not None and await self._leave_already_ingested(file_key):
                 continue
+            # Per-tick ceiling (ASVS 2.4.1, BACKLOG #1114). Checked HERE, after the name, pattern and
+            # dedup filters and before the first byte of I/O, so it counts the files this poll actually
+            # WORKS on. Counting listing entries instead would let a directory of 10k non-matching
+            # names starve the handful that match — a ceiling that bounds the wrong thing. Deferral is
+            # not a drop: the remainder stays on the share and the next poll takes it.
+            if self._max_files_per_poll is not None and touched >= self._max_files_per_poll:
+                deferred = True
+                break
+            touched += 1
             if self._max_file_bytes is not None and size > self._max_file_bytes:
                 # Transport-level reject *before* any bytes are read — parallels the File source's
                 # oversize guard. It never became a "received message", so there's no store
@@ -1247,6 +1268,23 @@ class RemoteFileSource(SourceConnector):
                 # Record AFTER emit success (the FILE — not each split message — is the dedup unit).
                 await self._leave_record(file_key)
                 newly_recorded += 1
+        # One log line at each edge of the ceiling, never one per poll — a draining backlog would
+        # otherwise report every interval. COUNTS ONLY: a remote filename can carry an MRN and this
+        # source never logs one at INFO or above.
+        if deferred != self._deferring:
+            self._deferring = deferred
+            if deferred:
+                logger.info(
+                    "REMOTEFILE source %s is deferring: it hit max_files_per_poll (%d) this poll and "
+                    "left the rest on the share for the next one (nothing is dropped)",
+                    _redact(self._host, self._remote_dir),
+                    self._max_files_per_poll,
+                )
+            else:
+                logger.info(
+                    "REMOTEFILE source %s is no longer deferring: the backlog now fits one poll",
+                    _redact(self._host, self._remote_dir),
+                )
         if newly_recorded and self.processed_ledger is not None:
             await (
                 self.processed_ledger.prune()

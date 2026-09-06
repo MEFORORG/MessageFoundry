@@ -1779,6 +1779,8 @@ def File(
     sort: str = "name",  # inbound: process order — "name" | "mtime"
     recursive: bool = False,  # inbound: also scan subdirectories
     max_file_bytes: int | None = 16 * 1024 * 1024,  # inbound: skip files over this (OOM guard)
+    max_files_per_poll: int | None = 1000,  # inbound: files ONE poll may take (ASVS 2.4.1, #1114);
+    # the rest wait for the next tick — deferred, never dropped. None/0 disables.
     validate_directory: bool = False,  # both directions (#114): fail-fast at start on a missing/unusable dir, and never create it; default defers to run time
     overwrite: bool = False,  # outbound: overwrite vs. uniquify a name collision
     processed_subdir: str = ".processed",
@@ -1799,6 +1801,13 @@ def File(
     """A File endpoint. Inbound polls ``directory`` for ``pattern``; outbound writes ``filename``
     (atomically). ``encoding`` is the file charset (outbound). ``max_file_bytes`` mirrors
     transports.file.DEFAULT_MAX_FILE_BYTES (pass None/0 to disable).
+
+    ``max_files_per_poll`` (inbound, ASVS 2.4.1 / BACKLOG #1114; mirrors
+    transports.file.DEFAULT_MAX_FILES_PER_POLL, None/0 disables) bounds how many files ONE poll takes.
+    It **ships on**, unlike the message-rate pacer on the listen intakes, because the excess is
+    **deferred, not refused**: the remaining files stay in the directory and the next tick takes them,
+    so nothing is dropped and there is no sender to back-pressure. A too-low value costs latency —
+    one extra poll interval per ceiling's worth of backlog — never a message.
 
     ``after_read`` (inbound) chooses the source-file disposition: ``move`` (→ ``processed_subdir``,
     the default), ``delete``, or ``leave`` — **process in place** for a read-only share / a directory
@@ -1836,6 +1845,7 @@ def File(
         "sort": sort,
         "recursive": recursive,
         "max_file_bytes": max_file_bytes,
+        "max_files_per_poll": max_files_per_poll,
         "validate_directory": validate_directory,
         "overwrite": overwrite,
         "processed_subdir": processed_subdir,
@@ -2259,6 +2269,10 @@ def DICOM(
     max_object_bytes: int | None = 128 * 1024 * 1024,  # per-C-STORE-object cap; over-cap → DIMSE
     # failure BEFORE the durable commit (the X12 max_interchange_bytes analog; OOM/DoS guard, §9)
     max_associations: int = 10,  # cap concurrent associations (connection-flood guard)
+    max_associations_per_second: float | None = None,  # SCP: sustained association-ACCEPTANCE rate
+    # (ASVS 2.4.1 / #1114). None = no bound, the shipped default — deliberately, like the listen
+    # intakes' max_messages_per_second: this one makes a real modality wait.
+    association_burst: float | None = None,  # SCP: tokens the bucket holds (default = the rate)
     max_pdu_size: int = 16384,  # cap one PDU's bytes (0 = unbounded); DoS guard
     timeout_seconds: float = 30.0,  # ACSE/DIMSE/network timeout
     connect_timeout: float = 10.0,  # outbound SCU: association-request timeout (Phase 2)
@@ -2282,7 +2296,21 @@ def DICOM(
     bytes from the base64 carriage (ADR 0028), runs the blocking association **off the event loop**, and
     classifies the C-STORE status onto the retry model (out-of-resources → retry; a hard refusal →
     dead-letter). ``test_connection`` issues a **C-ECHO** (the DIMSE reachability ping). The modern HTTP
-    imaging lane is the sibling :func:`DICOMweb` STOW-RS destination."""
+    imaging lane is the sibling :func:`DICOMweb` STOW-RS destination.
+
+    **Association-rate pacing (SCP, ASVS 2.4.1 / 15.2.2, BACKLOG #1114).**
+    ``max_associations_per_second`` bounds how fast this SCP ACCEPTS new associations;
+    ``association_burst`` is how large a burst passes before the sustained rate applies (default: one
+    second's worth). Over budget the SCP **waits before reading the association request**, so the peer
+    is back-pressured by TCP and then served in full — nothing is dropped, refused or answered
+    differently, and a rejected association charges nothing. **The unit is an association, not a
+    message**, and that is a property of DIMSE rather than a shortcut: ``pynetdicom`` owns the read
+    loop, so by the time a C-STORE reaches this engine the object has already been read and decoded,
+    and pacing there would delay a message the count-and-log invariant has already obliged us to
+    account for. So an established association is NOT bounded in the objects it may push — those are
+    bounded by ``max_object_bytes`` and ``timeout_seconds`` instead. Unset = no bound, deliberately: a
+    guessed rate throttles a real modality, so the number has to come from your own feed profile. Pair
+    it with ``max_associations``, which must be high enough to hold the peers waiting behind a pace."""
     return ConnectionSpec(
         ConnectorType.DIMSE,
         {
@@ -2302,6 +2330,8 @@ def DICOM(
             "tls_allow_expired": tls_allow_expired,
             "max_object_bytes": max_object_bytes,
             "max_associations": max_associations,
+            "max_associations_per_second": max_associations_per_second,
+            "association_burst": association_burst,
             "max_pdu_size": max_pdu_size,
             "timeout_seconds": timeout_seconds,
             "connect_timeout": connect_timeout,
@@ -2766,6 +2796,8 @@ def Sftp(
     ] = "move",  # inbound: "move" (to processed_subdir) | "delete" | "leave" (process in place, #142)
     min_age_seconds: float = 0.0,  # inbound: skip files modified within this window (partial writes)
     max_file_bytes: int | None = 16 * 1024 * 1024,  # inbound: skip files over this (OOM guard)
+    max_files_per_poll: int | None = 1000,  # inbound: files ONE poll may take (ASVS 2.4.1, #1114);
+    # the rest wait for the next tick — deferred, never dropped. None/0 disables.
     validate_directory: bool = False,  # both directions (#114): fail-fast at start on an unreachable remote dir, and never create it
     overwrite: bool = False,  # outbound: overwrite vs. uniquify a name collision
     processed_subdir: str = ".processed",
@@ -2786,7 +2818,11 @@ def Sftp(
     ``validate_directory`` (#114, both directions) makes an unreachable/missing ``remote_dir`` **fail
     startup** — the connection is reported ``failed`` — instead of the default deferral to run time; on
     an outbound it additionally stops the upload directory from ever being created (on send, or by the
-    on-demand test probe). Off by default: an intermittently-available remote dir must still start."""
+    on-demand test probe). Off by default: an intermittently-available remote dir must still start.
+
+    ``max_files_per_poll`` (inbound, ASVS 2.4.1 / BACKLOG #1114) bounds how many files ONE poll takes;
+    it behaves exactly as it does on :func:`File`, and it bites harder here because each file on this
+    source costs a network round trip. Deferred, never dropped."""
     return ConnectionSpec(
         ConnectorType.REMOTEFILE,
         {
@@ -2805,6 +2841,7 @@ def Sftp(
             "after_read": after_read,
             "min_age_seconds": min_age_seconds,
             "max_file_bytes": max_file_bytes,
+            "max_files_per_poll": max_files_per_poll,
             "validate_directory": validate_directory,
             "overwrite": overwrite,
             "processed_subdir": processed_subdir,
@@ -2831,6 +2868,8 @@ def Ftp(
     ] = "move",  # inbound: "move" (to processed_subdir) | "delete" | "leave" (process in place, #142)
     min_age_seconds: float = 0.0,  # inbound: skip files modified within this window (partial writes)
     max_file_bytes: int | None = 16 * 1024 * 1024,  # inbound: skip files over this (OOM guard)
+    max_files_per_poll: int | None = 1000,  # inbound: files ONE poll may take (ASVS 2.4.1, #1114);
+    # the rest wait for the next tick — deferred, never dropped. None/0 disables.
     validate_directory: bool = False,  # both directions (#114): fail-fast at start on an unreachable remote dir, and never create it
     overwrite: bool = False,  # outbound: overwrite vs. uniquify a name collision
     processed_subdir: str = ".processed",
@@ -2844,8 +2883,8 @@ def Ftp(
     plain ``ftp`` is **refused** unless ``MEFOR_ALLOW_INSECURE_TLS`` is set (use ``tls=True`` for FTPS,
     or :func:`Sftp`). FTPS encrypts the control + data channels, so credentials are fine there. Put
     secrets (``password``) in ``env()``. The host is gated by ``[egress].allowed_remote`` (both
-    directions). At-least-once → downstreams **must be idempotent**. ``validate_directory`` behaves
-    exactly as it does on :func:`Sftp`."""
+    directions). At-least-once → downstreams **must be idempotent**. ``validate_directory`` and
+    ``max_files_per_poll`` behave exactly as they do on :func:`Sftp`."""
     return ConnectionSpec(
         ConnectorType.REMOTEFILE,
         {
@@ -2862,6 +2901,7 @@ def Ftp(
             "after_read": after_read,
             "min_age_seconds": min_age_seconds,
             "max_file_bytes": max_file_bytes,
+            "max_files_per_poll": max_files_per_poll,
             "validate_directory": validate_directory,
             "overwrite": overwrite,
             "processed_subdir": processed_subdir,
