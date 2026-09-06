@@ -550,11 +550,22 @@ def _build_approval_gate(engine: Engine, settings: ApprovalsSettings) -> Approva
         # gate surfaces it). The same fingerprint-bearing config_reload audit row is written so the
         # released reload is bound to the bytes that actually loaded (defeating attribution-laundering).
         config_dir = p.get("config_dir")
-        registry = await engine.reload(config_dir, dry_run=False, propagate=True)
-        await _record_reload_audit(engine, actor=str(p["requester"]), dir_arg=config_dir)
+        # reload_detail for parity with the inline route (BACKLOG #1111): a released reload that
+        # swapped the graph and then failed a follow-on step must report the same degraded outcome
+        # the inline path reports, or dual control would be the quieter of the two.
+        outcome = await engine.reload_detail(config_dir, dry_run=False, propagate=True)
+        registry = outcome.registry
+        await _record_reload_audit(
+            engine,
+            actor=str(p["requester"]),
+            dir_arg=config_dir,
+            failed_steps=[f.step for f in outcome.failures],
+        )
         return {
             "inbound": len(registry.inbound),
             "outbound": len(registry.outbound),
+            "degraded": outcome.degraded,
+            "failures": [f.step for f in outcome.failures],
         }
 
     gate.register("dead_letter_replay", "Replay dead-lettered deliveries", _replay)
@@ -564,7 +575,12 @@ def _build_approval_gate(engine: Engine, settings: ApprovalsSettings) -> Approva
 
 
 async def _record_reload_audit(
-    engine: Engine, *, actor: str, dir_arg: object, client: str | None = None
+    engine: Engine,
+    *,
+    actor: str,
+    dir_arg: object,
+    client: str | None = None,
+    failed_steps: Sequence[str] = (),
 ) -> None:
     """Write the ``config_reload`` audit row with the ADR 0041 D1 content fingerprint of what loaded.
 
@@ -576,7 +592,12 @@ async def _record_reload_audit(
     ``client`` (ADR 0150) is the address of the actor named in the row. The inline endpoint passes the
     requester's own address. The dual-control executor deliberately does NOT: there the row's ``actor``
     is the original *requester*, while the request in flight belongs to the *approver*, so stamping the
-    approver's address would attribute one person's action to another's host — worse than NULL."""
+    approver's address would attribute one person's action to another's host — worse than NULL.
+
+    ``failed_steps`` names the follow-on steps that did not complete when the graph DID swap
+    (BACKLOG #1111). It is recorded on the row rather than only returned, because the response goes
+    to one caller once and the audit is what a later reader has: a reload whose reference sets never
+    re-armed must be findable after the fact, not only by whoever happened to read the 200."""
     fingerprint: dict[str, object] = {}
     if engine.last_reload_dir is not None:
         try:
@@ -593,6 +614,7 @@ async def _record_reload_audit(
                 "inbound": len(rr.registry.inbound) if rr else 0,
                 "outbound": len(rr.registry.outbound) if rr else 0,
                 "dry_run": False,
+                **({"degraded": True, "failed_steps": list(failed_steps)} if failed_steps else {}),
                 **fingerprint,
             }
         ),
@@ -2982,9 +3004,14 @@ def create_app(
             # propagate=True on the real apply so an operator reload on one node bumps the cluster-wide
             # config version and every other node converges (Track B Step 6); a dry_run never propagates
             # (it doesn't apply anything) and single-node ignores it (is_clustered() False).
-            registry = await engine.reload(
+            # reload_detail, not reload: the graph swap can succeed while a follow-on step (the
+            # provenance fingerprint, the reference-set reconcile, the cluster version bump) fails,
+            # and reload() projects that away to a Registry. Reporting it is the whole point of
+            # BACKLOG #1111 -- without this the route answers a degraded apply as clean success.
+            outcome = await engine.reload_detail(
                 req.config_dir, dry_run=req.dry_run, propagate=not req.dry_run
             )
+            registry = outcome.registry
         except ConfigReloadDenied as exc:
             await engine.store.record_audit(
                 "config_reload_denied",
@@ -3052,7 +3079,11 @@ def create_app(
             )
         else:
             await _record_reload_audit(
-                engine, actor=user.username, dir_arg=req.config_dir, client=client_ip(request)
+                engine,
+                actor=user.username,
+                dir_arg=req.config_dir,
+                client=client_ip(request),
+                failed_steps=[f.step for f in outcome.failures],
             )
         rr = engine.registry_runner
         return ReloadResult(
@@ -3062,6 +3093,8 @@ def create_app(
             handlers=len(registry.handlers),
             running=bool(rr and rr.running),
             dry_run=req.dry_run,
+            degraded=outcome.degraded,
+            failures=[f.step for f in outcome.failures],
         )
 
     # --- messages ------------------------------------------------------------

@@ -502,10 +502,12 @@ async def test_db_poll_stops_at_the_shipped_ceiling_and_leaves_the_rest_in_the_t
         await src._poll_once()
     assert len(handler.bodies) == DEFAULT_MAX_ITEMS_PER_POLL
     assert table.rows == [(500, _ADT.format(n=500))]  # deferred, unmarked, still selectable
-    # The ceiling is charged at the FETCH: the driver is asked for the ceiling plus one probe row,
-    # never for the whole result set.
-    assert fetches == [("fetchmany", DEFAULT_MAX_ITEMS_PER_POLL + 1)]
-    assert "reached poll_max_rows" in caplog.text
+    # The ceiling is charged at the FETCH: the driver is asked for EXACTLY the ceiling, never for the
+    # whole result set and never for a probe row past it. A row here can carry a message body
+    # (`body_column`), so a ceiling+1 probe would marshal a whole payload out of the driver and throw
+    # it away on every poll, to decide one word in a log line.
+    assert fetches == [("fetchmany", DEFAULT_MAX_ITEMS_PER_POLL)]
+    assert "filled poll_max_rows" in caplog.text
 
 
 async def test_db_second_poll_drains_the_deferred_rows() -> None:
@@ -530,9 +532,16 @@ async def test_db_poll_below_the_ceiling_is_unchanged(caplog: pytest.LogCaptureF
     log line.
 
     Red mutation: fetch ``poll_max_rows - 1``, or log the ceiling unconditionally — either reds here
-    while the over-ceiling tests stay green."""
+    while the over-ceiling tests stay green.
+
+    STRICTLY below, three rows against a ceiling of four, and the margin is load-bearing. Since the
+    fetch asks for exactly the ceiling rather than a probe row past it, a FULL batch is the only
+    signal that more may remain, so a result set of exactly ``poll_max_rows`` logs the deferral even
+    when the table happens to be empty behind it. That is the accepted imprecision of not paying for
+    a probe row, and this test would silently stop being a negative control if it sat on the
+    boundary."""
     table = _FakeTable(3)
-    src = _db_source(poll_max_rows=3)
+    src = _db_source(poll_max_rows=4)
     fetches = _attach(src, table)
     handler = _RecordingHandler()
     src._handler = handler
@@ -541,6 +550,7 @@ async def test_db_poll_below_the_ceiling_is_unchanged(caplog: pytest.LogCaptureF
     assert [b.decode() for b in handler.bodies] == [_ADT.format(n=n) for n in range(3)]
     assert table.rows == []  # all three marked
     assert fetches == [("fetchmany", 4)]
+    assert "poll_max_rows" not in caplog.text  # nothing deferred, so nothing said
     assert "poll_max_rows" not in caplog.text
 
 

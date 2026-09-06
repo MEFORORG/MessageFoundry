@@ -826,7 +826,21 @@ class FileSource(SourceConnector):
             return False  # vanished/locked — let the read path handle it
 
     def _candidates(self) -> list[Path]:
-        """Files ready to process, honoring recursion, min-age, and sort order."""
+        """Files ready to process, honoring recursion, min-age, and sort order.
+
+        **The per-tick ceiling bounds the INGEST, not this listing, and the asymmetry is real rather
+        than an oversight.** Selecting the first N in name or mtime order requires knowing the whole
+        candidate set, so the glob and the per-candidate screens below are paid every tick regardless
+        of the ceiling. In steady state that is unchanged from before the ceiling existed. Draining a
+        LARGE backlog is where it bites: the ceiling turns one expensive tick into many, so this
+        listing is now paid once per tick over a shrinking set instead of once in total.
+
+        Bounding it properly is a separate change and a real one -- deferring ``is_file`` and
+        ``_within_root`` into the scan loop so they are paid only for candidates actually reached,
+        which is available under ``sort="name"`` because that key needs no syscall, and not under
+        ``sort="mtime"`` because the key IS the syscall. It also costs the accurate ``remaining``
+        count the ceiling's log line carries. Not folded in here: it changes what the screens mean
+        for the ceiling's budget, and this method's contract is worth keeping simple."""
         globber = self.directory.rglob if self.recursive else self.directory.glob
         try:
             matched = list(globber(self.pattern))
@@ -845,13 +859,23 @@ class FileSource(SourceConnector):
             and self.error_dir not in p.parents
             and self._within_root(p)
         ]
-        if self.min_age_seconds > 0:
-            cutoff = time.time() - self.min_age_seconds
-            files = [p for p in files if _mtime(p) <= cutoff]  # skip files still being written
+        # Decorate-sort-undecorate under `sort="mtime"`: the min-age filter and the sort key are the
+        # SAME stat, and reading it twice per candidate doubled the syscalls on the one path that
+        # already pays the most. That cost is charged on every tick, and the per-tick ceiling means a
+        # backlog is now drained over many ticks rather than one, so a redundant stat is multiplied
+        # by the number of ticks it takes to drain. Under `sort="name"` the key is pure and no stat
+        # is needed at all.
         if self.sort == "mtime":
-            files.sort(key=_mtime)
-        else:
-            files.sort(key=lambda p: p.name)
+            cutoff = time.time() - self.min_age_seconds if self.min_age_seconds > 0 else None
+            dated = [(_mtime(p), p) for p in files]
+            if cutoff is not None:
+                dated = [pair for pair in dated if pair[0] <= cutoff]  # still being written
+            dated.sort(key=lambda pair: pair[0])
+            return [p for _, p in dated]
+        if self.min_age_seconds > 0:
+            cutoff_name = time.time() - self.min_age_seconds
+            files = [p for p in files if _mtime(p) <= cutoff_name]  # skip files still being written
+        files.sort(key=lambda p: p.name)
         return files
 
     def _within_root(self, path: Path) -> bool:

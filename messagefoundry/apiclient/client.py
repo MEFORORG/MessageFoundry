@@ -577,12 +577,16 @@ class EngineClient:
         codes (shown **once**). Raises :class:`ApiError` (400) on a wrong code.
 
         Confirming an enrolment elevates the session, so it also re-keys it (ASVS 7.2.4) and the new
-        token is adopted here — the caller keeps getting just the codes."""
-        result = _decode(
-            self._request("POST", "/me/mfa/confirm", json={"code": code}), MfaConfirmResponse
-        )
-        self._token = result.token
-        return result.recovery_codes
+        token is adopted here — the caller keeps getting just the codes.
+
+        Through :meth:`_adopt_rotated` like the other two elevation calls, deliberately. Assigning
+        ``self._token`` directly worked only by accident of an annotation elsewhere:
+        ``MfaConfirmResponse.token`` is a required ``str`` today, so a token-less body fails in
+        ``_decode`` rather than clearing the session. That is a property of a different file, not of
+        the rule, and the rule is the one thing all three sites must share."""
+        response = self._request("POST", "/me/mfa/confirm", json={"code": code})
+        self._adopt_rotated(response)
+        return _decode(response, MfaConfirmResponse).recovery_codes
 
     def verify_mfa(self, code: str) -> None:
         """Satisfy the current session's second factor with a TOTP or single-use recovery code. Raises

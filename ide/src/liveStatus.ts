@@ -31,7 +31,7 @@
 import * as vscode from "vscode";
 import { peekToken } from "./auth";
 import { engineUrl, environments } from "./cli";
-import { getJson } from "./engineClient";
+import { getJson, HttpError } from "./engineClient";
 import { resolveEngineStatusTarget } from "./engineStatusModel";
 import { assertTargetAllowed } from "./engineTarget";
 import type { GraphProvider } from "./graphTree";
@@ -85,6 +85,16 @@ export class LiveStatusPoller implements vscode.Disposable {
     this.timer = setInterval(() => void this.poll(), intervalMs);
   }
 
+  /** Stop the timer without touching the decorations already shown, for a failure that repeating
+   *  cannot fix. Distinct from `applySettings()`'s stop, which also clears the tree: here the engine
+   *  simply will not answer this route tokenlessly, and the rows are already undecorated. */
+  private standDown(): void {
+    if (this.timer) {
+      clearInterval(this.timer);
+      this.timer = undefined;
+    }
+  }
+
   /** One poll cycle. Every failure path degrades silently to "no live data" — a background timer
    *  must never surface an error toast loop (the status bar already tells the user the engine is
    *  down; a missing/expired session is a normal state, not an error). */
@@ -110,13 +120,21 @@ export class LiveStatusPoller implements vscode.Disposable {
         try {
           const rows = await getJson<ConnectionRowLite[]>(url, entry.route, bearer);
           map = Array.isArray(rows) ? buildRuntimeMap(rows) : undefined;
-        } catch {
+        } catch (e) {
           // Unauthorized / unreachable / non-JSON → undecorated rows, silently. Nothing is cleared
           // here: the poll sends no bearer, so a 401 is the engine saying "this route needs auth",
           // NOT evidence that the cached session died. Clearing on it would sign the user out from a
           // timer over a request their session never took part in. `auth.withAuth` still clears on a
           // 401 from a request that DID carry the token — the only place that inference is sound.
           map = undefined;
+          // A 401 against a TOKENLESS plan entry is deterministic, not transient: the plan is a
+          // compile-time constant, so nothing this timer can do will make the next attempt succeed.
+          // Left running it would issue a guaranteed-waste request every intervalMs for the life of
+          // the window. Stand down instead; applySettings() re-arms on a settings or target change,
+          // which is the only thing that could change the answer.
+          if (e instanceof HttpError && e.status === 401 && !entry.authenticated) {
+            this.standDown();
+          }
         }
       }
     } finally {

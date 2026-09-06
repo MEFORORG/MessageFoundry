@@ -1185,8 +1185,8 @@ class DatabaseSource(SourceConnector):
 
         **The ceiling is charged at the FETCH, not after it.** ``fetchmany`` leaves the rest of the
         result set in the driver and the cursor is closed on the way out, so a poll of a table holding a
-        million rows pulls the ceiling (plus one probe row, see below) into memory rather than all of
-        them — the ``fetchall`` this replaced materialised the whole set before anything could bound it.
+        million rows pulls exactly the ceiling into memory rather than all of them — the ``fetchall``
+        this replaced materialised the whole set before anything could bound it.
         The rows not taken are untouched in the table, so the next poll re-runs ``poll_statement`` and
         takes the next batch; nothing is dropped, errored or marked. Progress depends on the
         ``mark_statement`` removing a handled row from ``poll_statement``'s own predicate, which is the
@@ -1204,15 +1204,18 @@ class DatabaseSource(SourceConnector):
             if self._poll_max_rows is None:
                 rows = list(await cur.fetchall())
             else:
-                # limit + 1 (the same probe auth/oidc uses on a bounded read): one row past the
-                # ceiling is enough to know a backlog is waiting, and it is dropped from the batch —
-                # never handed to the handler, never marked, so the next poll selects it again.
-                rows = list(await cur.fetchmany(self._poll_max_rows + 1))
-                if len(rows) > self._poll_max_rows:
-                    rows = rows[: self._poll_max_rows]
+                # Exactly the ceiling, NOT ceiling+1. The +1 probe is the usual idiom for "is there
+                # more?", and it is wrong here: this connector's rows can carry a message BODY
+                # (`body_column`), so the probe row would marshal a whole payload out of the driver
+                # and discard it on every poll — hundreds of KB every `poll_seconds` to decide one
+                # word in a log line. A full batch is the signal instead: it means the ceiling bound
+                # this poll, and cannot distinguish "exactly N remained" from "more remain", which is
+                # why the message says at least rather than naming a remainder.
+                rows = list(await cur.fetchmany(self._poll_max_rows))
+                if len(rows) == self._poll_max_rows:
                     logger.info(
-                        "DATABASE source reached poll_max_rows (%s) this poll; the rest of the result "
-                        "set is left for the next poll (deferred, not dropped)",
+                        "DATABASE source filled poll_max_rows (%s) this poll; any remaining rows are "
+                        "left for the next poll (deferred, not dropped)",
                         self._poll_max_rows,
                     )
         finally:

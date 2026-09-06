@@ -19,7 +19,7 @@ import asyncio
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import ClassVar, Protocol
+from typing import Any, ClassVar, Protocol
 
 from messagefoundry.config.models import ConnectorType, ContentType, Destination, Source
 
@@ -88,7 +88,7 @@ __all__ = [
 DEFAULT_MAX_ITEMS_PER_POLL = 500
 
 
-def resolve_poll_ceiling(value: object, *, knob: str, transport: str) -> int | None:
+def resolve_poll_ceiling(value: Any, *, knob: str, transport: str) -> int | None:
     """Read one poll source's per-tick ceiling from its settings: a positive count, or ``None`` for the
     documented unlimited opt-out (a falsy ``0``/``None``).
 
@@ -101,7 +101,10 @@ def resolve_poll_ceiling(value: object, *, knob: str, transport: str) -> int | N
     if not value:
         return None
     # A non-numeric setting raises here, which is the same build-time refusal a bad value gets below.
-    ceiling: int = int(value)  # type: ignore[call-overload]
+    # ``value`` is typed Any rather than object because every call site reads it out of an untyped
+    # settings mapping; object would need a `type: ignore` on this line, and a suppression a reader
+    # has to decide whether to trust is worse than the honest Any.
+    ceiling: int = int(value)
     if ceiling < 1:
         raise ValueError(
             f"{transport} {knob}={value!r} must be a positive number of items per poll "

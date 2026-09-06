@@ -433,7 +433,14 @@ class ReloadRequest(RequestModel):
 
 class ReloadResult(BaseModel):
     """Summary of the graph that is now live after a reload — or, for a dry run, the graph that
-    *would* go live (``dry_run=True``; ``running`` then reflects the still-current graph)."""
+    *would* go live (``dry_run=True``; ``running`` then reflects the still-current graph).
+
+    ``degraded`` reports the third outcome (ASVS 2.3.3, BACKLOG #1111): the graph SWAPPED and a
+    follow-on step did not complete, so ``failures`` names each one. A 200 with ``degraded`` True
+    is not a clean reload — the new graph is live and an operator has a step to finish by hand.
+    Reporting outright failure there would describe an engine that does not exist; reporting plain
+    success would hide the step. The step labels are stable and PHI-free
+    (``config_fingerprint``, ``reference_sync``, ``cluster_propagate``)."""
 
     inbound: int
     outbound: int
@@ -441,6 +448,8 @@ class ReloadResult(BaseModel):
     handlers: int
     running: bool
     dry_run: bool = False
+    degraded: bool = False
+    failures: list[str] = []
 
 
 class ConfigProvenance(BaseModel):

@@ -228,6 +228,28 @@ suite("liveStatus poll — the timer may not carry a bearer (AUTH-IDLE / CWE-613
       "liveStatus must not clear a token from a background timer",
     );
   });
+
+  test("a tokenless 401 STANDS THE TIMER DOWN rather than retrying for the life of the window", () => {
+    // Dropping the bearer made this failure DETERMINISTIC: LIVE_STATUS_PLAN is a compile-time
+    // constant with authenticated:false, so against an auth-enabled engine every tick 401s and no
+    // amount of waiting changes it. Left running that is one guaranteed-waste request every
+    // intervalMs, forever — 360-720/hour per open window. applySettings() re-arms, which is the only
+    // thing that can change the answer.
+    const text = fs.readFileSync(LIVE_STATUS_TS, "utf8");
+    assert.ok(
+      text.includes("standDown"),
+      "vacuity guard: the stand-down path must exist in the shell at all",
+    );
+    assert.ok(
+      /e\.status === 401 && !entry\.authenticated/.test(text),
+      "the stand-down must be gated on a TOKENLESS 401 — an authenticated 401 is a dead session, " +
+        "which is a different fact and must not silently stop the poller",
+    );
+    assert.ok(
+      /clearInterval/.test(text.slice(text.indexOf("private standDown"))),
+      "standDown must actually clear the interval, not merely mark a flag",
+    );
+  });
 });
 
 suite("liveStatus contributions", () => {
