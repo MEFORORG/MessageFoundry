@@ -800,9 +800,19 @@ with TLS + a public origin. It is a client of the existing API and reuses every 
 control unchanged (`messages:view_raw`/`view_summary` RBAC, field-level redaction, the per-access
 `message_view` audit, the `require_phi_read` throttle). The browser-specific PHI rules:
 
-- **No PHI in browser storage.** The only stored item is the session token, in an **HttpOnly + SameSite=
-  Strict** cookie JS cannot read (`mf_session`). Nothing is written to `localStorage`/`sessionStorage`/
-  `IndexedDB`. **No operator-typed search term in a URL** (BACKLOG #1184, ASVS 14.2.1). `content` and `field_value` are declared on no GET signature — not `/messages/search`, `/messages/export`, `/uploads/{file_id}/messages`, nor either console twin — and travel in a POST body instead; `tests/test_content_search.py::test_no_get_or_head_route_declares_a_phi_needle_parameter` walks both planes' route tables and reds if either name is declared on a GET or HEAD again. What a `/ui` GET still declares is engine-minted ids, structural locators (`field_path`, an HL7 path such as `PID-3`, never a value), bounded enums, paging integers and the low-sensitivity `control_id`/`message_type` keys of §2. No *message body* is ever placed in a URL, and `Referrer-Policy: no-referrer` is set. **Retracted here, because this bullet asserted the opposite until #1184 landed:** until then the console's search and uploaded-log browse did take the needle as a query parameter, so a search URL could carry a patient identifier into history, bookmarks and `Referer`. What survives that removal is a log residual rather than a URL the product emits — §7 states it.
+- **No PHI in browser storage.** The session token lives in an **HttpOnly + SameSite=Strict** cookie
+  JS cannot read (`mf_session`). **One** thing is written to `localStorage`, deliberately and
+  PHI-free: per-table column widths and visibility, under the `mfcols:v2:` prefix
+  (`messagefoundry_webconsole/static/app.js`), keyed by pathname and table ordinal. They are
+  operator display preferences, carry no message content, and are the reason
+  `Clear-Site-Data` is sent as `"cache"` and not `"storage"` on logout
+  (`messagefoundry_webconsole/_auth.py`). Nothing else is written to `localStorage`, and nothing
+  at all to `sessionStorage` or `IndexedDB`; `tests/test_browser_storage_doc_drift.py` reds if
+  the console writes a prefix this sentence does not name.
+  **This bullet asserted the opposite until BACKLOG #1186 corrected it**, saying nothing was
+  written to any of the three. The column preferences had shipped since 2026-07-07 and no test
+  read this sentence, so the claim was false and nothing could red on it.
+- **No operator-typed search term in a URL** (BACKLOG #1184, ASVS 14.2.1). `content` and `field_value` are declared on no GET signature — not `/messages/search`, `/messages/export`, `/uploads/{file_id}/messages`, nor either console twin — and travel in a POST body instead; `tests/test_content_search.py::test_no_get_or_head_route_declares_a_phi_needle_parameter` walks both planes' route tables and reds if either name is declared on a GET or HEAD again. What a `/ui` GET still declares is engine-minted ids, structural locators (`field_path`, an HL7 path such as `PID-3`, never a value), bounded enums, paging integers and the low-sensitivity `control_id`/`message_type` keys of §2. No *message body* is ever placed in a URL, and `Referrer-Policy: no-referrer` is set. **Retracted here, because this bullet asserted the opposite until #1184 landed:** until then the console's search and uploaded-log browse did take the needle as a query parameter, so a search URL could carry a patient identifier into history, bookmarks and `Referer`. What survives that removal is a log residual rather than a URL the product emits — §7 states it.
 - **No caching.** Every `/ui` HTML response and every PHI JSON read is served `Cache-Control: no-store`,
   so a browser/proxy never retains a message body on disk. The covered set is the PHI-read route
   families — `/messages*`, `/dead-letters*`, `/search*`, `/logs*`, `/uploads*` (`_NO_STORE_PREFIXES` in
