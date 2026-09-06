@@ -75,8 +75,12 @@ def test_password_policy_screens_breached_and_context() -> None:
     assert "not be a common or breached password" in PasswordPolicy(min_length=6).violations(
         "letmein"
     )
-    # app/vendor terms are rejected even inside an otherwise-long password
-    assert "not contain application or vendor terms" in policy.violations(
+    # A deny-list term is rejected even inside an otherwise-long password. The clause names the
+    # DOCUMENTED list rather than characterizing its members: five of the twelve are generic
+    # credential words, so the old "application or vendor terms" wording stated a rule the code does
+    # not enforce, and it is the only statement of this policy the console shows on its password form.
+    # tests/test_context_word_parity.py holds the clause to the published enumeration.
+    assert "not contain a term from the documented deny-list" in policy.violations(
         "my-messagefoundry-passphrase"
     )
     # both screens are individually switchable off
@@ -88,8 +92,9 @@ def test_password_policy_screens_breached_and_context() -> None:
 
 def test_password_policy_rejects_username_in_password() -> None:
     policy = PasswordPolicy()  # check_username on by default
-    # The user's own username inside an otherwise-fine password is rejected (6.2.11) — including the
-    # common "username + suffix" pattern, which exact-equality would miss.
+    # The user's own username inside an otherwise-fine password is rejected — including the
+    # common "username + suffix" pattern, which exact-equality would miss. This screen is an engine
+    # addition; ASVS 6.2.11 names the context-word list, not this check.
     assert "not contain your username" in policy.violations(
         "jsmith-favorite-passphrase", username="jsmith"
     )

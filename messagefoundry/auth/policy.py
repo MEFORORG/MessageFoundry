@@ -4,9 +4,9 @@
 
 Modernized per ASVS 5.0 (WP-3): length-first (15+), **no mandatory character-class composition**
 (the class rules are kept as *opt-in* knobs, default off), plus **offline breached/common-password
-screening**, a small **context-word deny-list** (app/vendor/HL7 terms), and **username-in-password
-rejection** (6.2.11). Defaults remain a direct improvement on Mirth, whose password requirements
-default to zero. Operators tune these via the ``[auth]`` settings section.
+screening**, a small **context-word deny-list** (6.1.2 / 6.2.11 — see ``CONTEXT_WORDS`` below), and
+**username-in-password rejection**. Defaults remain a direct improvement on Mirth, whose password
+requirements default to zero. Operators tune these via the ``[auth]`` settings section.
 
 The breach corpus is a bundled offline common-password list (see ``data/common_passwords.txt`` and
 its ``.NOTICE``, which carries the entry counts and the policy filter that built the list — BACKLOG
@@ -34,10 +34,17 @@ _MIN_USERNAME_MATCH = 4
 #: hashed corpus from its first entry.
 _HASH_LINE = re.compile(r"[0-9A-Fa-f]{40}(:\d+)?")
 
-#: App/vendor/protocol terms a local password must not *contain* (case-insensitive) — so an obvious
-#: in-context credential like ``messagefoundry2026`` or ``Mefor-Admin!`` is rejected (ASVS 6.2.5).
-#: Deliberately app-specific (not a generic dictionary) to keep false-positives rare; the broader
+#: The context-word deny-list (ASVS 6.1.2 documents it, 6.2.11 requires the documented list be the
+#: one enforced). A local password must not *contain* any member, case-insensitively, so an obvious
+#: in-context credential like ``messagefoundry2026`` or ``Mefor-Admin!`` is rejected. It mixes
+#: product, vendor and protocol names with generic credential words — do not describe it as
+#: "app/vendor terms", which is the characterization ``docs/SECURITY.md`` retracted in place.
+#: Deliberately short (not a generic dictionary) to keep false-positives rare; the broader
 #: "common word" coverage comes from the breach corpus.
+#:
+#: This list is PUBLISHED, in full, in ``docs/SECURITY.md`` "Password policy" and its cardinality is
+#: republished in ``docs/CONFIGURATION.md``. Editing it here without editing both documents reds
+#: ``tests/test_context_word_parity.py`` — that is the gate, not a courtesy.
 CONTEXT_WORDS: frozenset[str] = frozenset(
     {
         "messagefoundry",
@@ -99,8 +106,8 @@ class PasswordPolicy:
     require_digit: bool = False
     require_symbol: bool = False
     check_breached: bool = True  # reject known common/breached passwords (offline corpus)
-    check_context: bool = True  # reject passwords containing app/vendor/HL7 terms
-    check_username: bool = True  # reject passwords containing the user's own username (6.2.11)
+    check_context: bool = True  # reject passwords containing a CONTEXT_WORDS term (6.1.2 / 6.2.11)
+    check_username: bool = True  # reject passwords containing the user's own username
     breach_corpus_file: str | None = None  # optional operator-supplied offline corpus (6.2.12)
     lockout_threshold: int = 5  # consecutive failed logins before the account locks
     lockout_minutes: int = 15  # how long a locked account stays locked
@@ -109,8 +116,8 @@ class PasswordPolicy:
         """Return clauses completing *"password must …"*; an empty list means the password is
         acceptable. Order: length → opt-in character classes → breach → username → context.
 
-        ``username`` enables the 6.2.11 own-username check (omit it where there is no user context,
-        e.g. generating the bootstrap password)."""
+        ``username`` enables the own-username check (omit it where there is no user context, e.g.
+        generating the bootstrap password)."""
         problems: list[str] = []
         if len(password) < self.min_length:
             problems.append(f"be at least {self.min_length} characters")
@@ -135,7 +142,11 @@ class PasswordPolicy:
         ):
             problems.append("not contain your username")
         if self.check_context and any(word in lowered for word in CONTEXT_WORDS):
-            problems.append("not contain application or vendor terms")
+            # Names the DOCUMENTED list rather than characterizing its members. Several members are
+            # generic credential words, so "application or vendor terms" — the wording this replaces
+            # — told a user a rule the code does not enforce, and this clause is the only statement
+            # of the rule the console shows. Naming the list keeps it true as the list changes.
+            problems.append("not contain a term from the documented deny-list")
         return problems
 
     def _in_operator_corpus(self, password: str) -> bool:

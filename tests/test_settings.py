@@ -382,7 +382,9 @@ def test_auth_password_policy_defaults_are_asvs_aligned() -> None:
         or a.password_require_symbol
     )
     assert a.password_check_breached and a.password_check_context
-    assert a.password_check_username  # v2: own-username rejection on by default (6.2.11)
+    # v2: own-username rejection on by default. An engine addition -- ASVS 6.2.11 names the
+    # context-word list (password_check_context above), not this screen.
+    assert a.password_check_username
     assert a.password_breach_corpus_file is None  # opt-in larger offline corpus (6.2.12)
     assert a.bootstrap_expiry_hours == 72
 

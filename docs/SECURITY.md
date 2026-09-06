@@ -1504,9 +1504,10 @@ corpus, no live HIBP call) and a fixed **context-word deny-list**, enumerated in
 identically on create-user and change-password; tune via `[auth]` (see
 [CONFIGURATION.md](CONFIGURATION.md)). AD passwords are governed by Active Directory.
 
-**The context-word deny-list, in full.** A local password is refused if it *contains* any of these
-twelve terms as a case-insensitive substring, anywhere in the value — not only as a prefix, and not
-only as a whole word:
+**The context-word deny-list, in full (ASVS 6.1.2 / 6.2.11).** A local password is refused if it
+*contains* any of these twelve terms as a case-insensitive substring, anywhere in the value — not
+only as a prefix, and not only as a whole word. 6.1.2 asks that the list be documented; 6.2.11 asks
+that the documented list be the one enforced, so the enumeration below is the control itself:
 
 `messagefoundry`, `mefor`, `mllp`, `hl7`, `corepoint`, `mirth`, `rhapsody`, `changeme`, `bootstrap`,
 `admin`, `administrator`, `password`
@@ -1517,7 +1518,15 @@ twelve as examples. That description was wrong in a way a reader could act on: f
 connection to this application, to a vendor, or to HL7, so a passphrase chosen on the strength of the
 old sentence could still be refused with no indication of which rule fired. The list above is the
 whole of it, mirrored from `CONTEXT_WORDS` in
-[`auth/policy.py`](../messagefoundry/auth/policy.py); the code is the authority if the two diverge.
+[`auth/policy.py`](../messagefoundry/auth/policy.py).
+
+**The two cannot diverge.** `tests/test_context_word_parity.py` compares this enumeration with
+`CONTEXT_WORDS` in both directions on every commit, and checks the count word against the constant
+here and in [CONFIGURATION.md](CONFIGURATION.md) — so a term added in code and not here reds the
+build, as does a term added here and not in code. The gate also plants a mutation on its own parser,
+because a doc scraper that quietly stops matching goes green on a page that says nothing. An earlier
+revision of this paragraph told the reader the code wins if the two diverge; with the gate behind it
+that sentence had no work left to do except excuse a divergence instead of fixing one.
 
 **What a deploying site can and cannot tune here.** `password_check_context` is a whole-list on/off
 switch, on by default. There is **no** setting that adds a site's own terms — its hospital
@@ -1527,16 +1536,18 @@ substring collides with a legitimate local word. A site that wants wider coverag
 against the **whole** password, so a term added there is refused only when it *is* the password, never
 when it appears inside a longer passphrase.
 
-Two further screens (ASVS 6.2.11 / 6.2.12), both on by default and fully offline:
+Two further screens, both on by default and fully offline:
 
 - **Username-in-password rejection** (`password_check_username`) — a password that *contains* the
   user's own username (case-insensitive, for usernames ≥ 4 chars) is rejected, catching the common
-  `jsmith2026`-style choice that the corpus can't.
-- **Larger operator breach corpus** (`password_breach_corpus_file`) — point this at an offline list to
-  augment the bundled corpus: a **plaintext** file *or* an **HIBP-style SHA-1-hash export**
-  (`HASH[:count]` lines, auto-detected), checked locally with no network call. Use a curated subset
-  (it's loaded into memory), not the full ~40 GB HIBP set; a configured-but-unreadable path is warned
-  at startup and falls back to the bundled list.
+  `jsmith2026`-style choice that the corpus can't. This screen is an engine addition and carries no
+  requirement number of its own. An earlier revision of this page labelled it ASVS 6.2.11, which is
+  the context-word requirement above — a reader following that number arrived at the wrong control.
+- **Larger operator breach corpus** (ASVS 6.2.12, `password_breach_corpus_file`) — point this at an
+  offline list to augment the bundled corpus: a **plaintext** file *or* an **HIBP-style SHA-1-hash
+  export** (`HASH[:count]` lines, auto-detected), checked locally with no network call. Use a
+  curated subset (it's loaded into memory), not the full ~40 GB HIBP set; a configured-but-unreadable
+  path is warned at startup and falls back to the bundled list.
 
 ### Authentication pathways — comparative strength
 
