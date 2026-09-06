@@ -19182,9 +19182,9 @@ site_prefixes   1      2       50.0%   <- would FAIL a flat 80% rule
 
 ## 1374. fleet.ps1 originMainAgeMinutes reports fetch recency but measures when origin/main last MOVED, and on the packed-refs path it is null so the stop condition cannot fire
 
-> 🔢 **Filed 2026-08-28 (lander) - reported by the dispatcher and the cleaner; corroborated independently before filing.**
+> ✅ **Filed 2026-08-28 (lander). BOTH HALVES ARE ON `main`: the first via `3279141e2` (PR 774), the remainder via `430566152` (PR 871, merged 2026-09-05T17:01:30Z).** Reported by the dispatcher and the cleaner; corroborated independently before filing.
 >
-> **Scored 2026-09-03 -> P1.** Value **6/10** · Difficulty **2/10** · _quick win_. Scored as not started; SUPERSEDED -- see the banner below for what merged and what is built and unmerged. At scoring time nothing outside docs/BACKLOG.md cited this item, and both halves reproduce in this checkout. scripts/coord/fleet.ps1:178 stats the ref file refs/remotes/origin/main while naming the variable $fetchHead; measured here that loose ref is dated 2026-09-02 19:41 against a .git/FETCH_HEAD of 2026-09-03 12:27, so the stop at scripts/coord/fleet.ps1:275 would print DO NOT TREAT THE ROSTER BELOW AS COMPLETE (scripts/coord/fleet.ps1:491) about a fetch made sixteen hours later. The packed-refs half is live rather than theoretical: .git/packed-refs line 634 already carries a stale refs/remotes/origin/main at 4b3b2f96, so the loose ref is the only thing keeping the field non-null, and without it Test-Path fails, the value stays null, and the null guard at scripts/coord/fleet.ps1:275 makes a blind instrument render exactly like a healthy one. Landing it is a small change on one existing seam -- read a real fetch clock, make the unmeasurable case a stop rather than silence, and pin both directions in a Windows-gated test beside tests/test_coord_handoff_pointer.py.
+> **Scored 2026-09-03 -> P1.** Value **6/10** · Difficulty **2/10** · _quick win_. Scored as not started; SUPERSEDED -- both halves have merged since, see the banner below. At scoring time nothing outside docs/BACKLOG.md cited this item, and both halves reproduce in this checkout. scripts/coord/fleet.ps1:178 stats the ref file refs/remotes/origin/main while naming the variable $fetchHead; measured here that loose ref is dated 2026-09-02 19:41 against a .git/FETCH_HEAD of 2026-09-03 12:27, so the stop at scripts/coord/fleet.ps1:275 would print DO NOT TREAT THE ROSTER BELOW AS COMPLETE (scripts/coord/fleet.ps1:491) about a fetch made sixteen hours later. The packed-refs half is live rather than theoretical: .git/packed-refs line 634 already carries a stale refs/remotes/origin/main at 4b3b2f96, so the loose ref is the only thing keeping the field non-null, and without it Test-Path fails, the value stays null, and the null guard at scripts/coord/fleet.ps1:275 makes a blind instrument render exactly like a healthy one. Landing it is a small change on one existing seam -- read a real fetch clock, make the unmeasurable case a stop rather than silence, and pin both directions in a Windows-gated test beside tests/test_coord_handoff_pointer.py.
 > Verdict: build
 > Closing-act: code
 >
@@ -19215,8 +19215,8 @@ site_prefixes   1      2       50.0%   <- would FAIL a flat 80% rule
 > fleet real effort on a neighbouring item the same day. Both were written before PR 774 merged and
 > neither was re-read after. Corrected 2026-09-04.
 >
-> **THE STATED REMAINDER IS BUILT 2026-09-04 on branch `claude/fleet-clock-1374`. NOT merged, so the
-> banner flip stays the Lander's.** A `FETCH_HEAD` now counts as this clock only if it NAMES origin's
+> **THE STATED REMAINDER MERGED 2026-09-05 in PR 871 at `430566152`, from branch
+> `claude/fleet-clock-1374`.** A `FETCH_HEAD` now counts as this clock only if it NAMES origin's
 > main. git records what it fetched, one line per ref, so `branch 'main' of <origin url>` is the
 > evidence and nothing else qualifies. Measured in a sandbox 2026-09-04: `git fetch origin`, `git
 > fetch origin main` and `git fetch origin refs/heads/main` all write that line, while `git fetch
@@ -19232,6 +19232,19 @@ site_prefixes   1      2       50.0%   <- would FAIL a flat 80% rule
 > ANY fetch, so with a pull-ref fetch one minute old beside a main fetch three hours old its honest
 > value is 180, which its own name contradicts. Both retired keys are pinned absent. Five new arms,
 > each shown to redden under a mutation of its own seam.
+>
+> **THAT LINE THEN READ FALSE A THIRD TIME, and the instrument is the whole lesson.** It said NOT
+> merged while `430566152` was already on `main`. Two natural checks agree on "not merged" here and
+> BOTH answer a different question than the one asked: `git ls-remote --heads origin` finds no
+> `claude/fleet-clock-1374` because the branch was DELETED after its merge, and `git merge-base
+> --is-ancestor 49b0bbd8c origin/main` is false because the PR was SQUASHED, so the branch commit
+> sits on no ancestry path. The instrument that answers is a CONTENT compare, and it is empty:
+> `git diff origin/main claude/fleet-clock-1374 -- scripts/coord/fleet.ps1
+> tests/test_coord_fleet_fetch_clock.py`, with both blobs hashing identical (`40419f26a70f`,
+> `2dd4013ed5f7`). `docs/BACKLOG.md` was the only path that still differed. Re-verified 2026-09-05 at
+> `origin/main` = `c57903c2c`: the suite RUNS rather than skips on Windows, 14 passed in 19.89s.
+> This is `CLAUDE.md` SDS-3.8 inside one row -- name the question, then check the tool answers the
+> same sentence -- and the row has now cost three readers the same hour.
 >
 > **WHAT REMAINS, and it is a deliberate limit rather than unfinished work.** `git ls-remote origin
 > main` would answer the real question directly in about 0.7 seconds and stays DECLINED -- this
