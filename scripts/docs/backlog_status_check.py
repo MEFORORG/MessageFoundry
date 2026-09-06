@@ -130,6 +130,11 @@ BUILDER_CLOSABLE_ACTS = frozenset({"code"})
 # is told the item belongs to somebody who cannot act on it, which is indistinguishable from being
 # told it is not their problem.
 #
+# `GATED_VERDICTS` in `scripts/coord/dispatch_gate.py` is the SIBLING SOURCE and had the same rot.
+# Repair them together or not at all: a reader who sees the closing act named correctly has no
+# reason to doubt the verdict sentence printed beside it. BACKLOG #1460 (filed, not yet on `main`)
+# carries the joint measurement; #1462 carries this fix.
+#
 # CITE THE CLAIM, NOT THE LINE, WHEN THE FILE IS NOT IN THIS REPOSITORY. This block used to cite
 # `BUILDER.md:253` and `:148`. Both had drifted -- the claims quoted above are at :142 and :216
 # today -- and neither drift was detectable here. BUILDER.md lives in the MessageFoundry-vault

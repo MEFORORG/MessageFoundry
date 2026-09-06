@@ -122,16 +122,26 @@ _RETIRED_SEATS = (
 _RETIRED_RE = re.compile(r"\b(?:" + "|".join(re.escape(s) for s in _RETIRED_SEATS) + r")\b")
 
 
-def test_no_closing_seat_value_names_a_retired_seat(gate: ModuleType) -> None:
-    """BACKLOG #1462. Three of the four values named a seat that no longer exists.
+def _seat_maps(gate: ModuleType) -> dict[str, dict[str, str]]:
+    """Every constant whose values name a seat and reach a reader through `judge()`.
 
-    `scorecard-rescore` named the ASVS Tracker, `owner-ruling` the Liaison and the Dispatcher,
-    `banner-only` the Dispatcher. CLAUDE.md section 5 retired all three on 2026-09-01.
+    BOTH, ALWAYS. `CLOSING_SEAT` and `GATED_VERDICTS` are independent sources of the same defect,
+    and a reader who sees one sentence naming a live seat has no reason to doubt the other beside
+    it. Repairing one alone is worse than repairing neither.
+    """
+    return {"CLOSING_SEAT": gate.CLOSING_SEAT, "GATED_VERDICTS": gate.GATED_VERDICTS}
 
-    THIS MAP IS WHAT A DISPATCH PRINTS, so a retired seat here reaches a reader on every affected
-    row -- roughly 40 open rows carry `closing-act: scorecard-rescore` alone. Being told an item
-    belongs to a seat that cannot act on it is indistinguishable from being told it is not your
-    problem, and nothing anywhere reports the difference.
+
+def test_no_seat_map_value_names_a_retired_seat(gate: ModuleType) -> None:
+    """BACKLOG #1462, filed as #1460. Both constants named seats that no longer exist.
+
+    `CLOSING_SEAT` named the ASVS Tracker, the Liaison and the Dispatcher across three of its four
+    values; `GATED_VERDICTS` named the Liaison in both of its two, and the Dispatcher in one.
+
+    THESE MAPS ARE WHAT A DISPATCH PRINTS. Measured over `origin/main`'s 434 ledger rows by calling
+    `judge()` on each: ASVS Tracker on 97, LIAISON on 35, Dispatcher on 33 -- 132 distinct rows, 130
+    of them open. Being told an item belongs to a seat that cannot act on it is indistinguishable
+    from being told it is not your problem, and nothing anywhere reports the difference.
 
     The matcher is exercised against a known-bad string first. A needle list that matched nothing
     and a repaired map produce the same green, and only the control tells them apart.
@@ -141,15 +151,16 @@ def test_no_closing_seat_value_names_a_retired_seat(gate: ModuleType) -> None:
     )
 
     offenders = {
-        act: _RETIRED_RE.findall(who)
-        for act, who in gate.CLOSING_SEAT.items()
-        if _RETIRED_RE.search(who)
+        f"{name}[{key!r}]": _RETIRED_RE.findall(value)
+        for name, mapping in _seat_maps(gate).items()
+        for key, value in mapping.items()
+        if _RETIRED_RE.search(value)
     }
-    assert not offenders, f"CLOSING_SEAT names retired seats: {offenders}"
+    assert not offenders, f"a seat map names retired seats: {offenders}"
 
 
-def test_every_closing_seat_value_names_a_live_seat(gate: ModuleType) -> None:
-    """The map must not go quiet instead of going stale -- an empty answer is also a wrong one.
+def test_every_seat_map_value_names_a_live_seat(gate: ModuleType) -> None:
+    """The maps must not go quiet instead of going stale -- an empty answer is also a wrong one.
 
     Paired with the test above deliberately. Deleting a retired seat name and leaving the value
     saying nothing passes that check, and a dispatcher then reads a value that names no performer
@@ -158,10 +169,11 @@ def test_every_closing_seat_value_names_a_live_seat(gate: ModuleType) -> None:
     # The KORUS roster of CLAUDE.md section 5. The OWNER is deliberately absent: the owner rules,
     # but performs no closing act, so a value naming only them still names no performer.
     live = ("BUILDER", "LANDER", "CONSOLE", "REGULATOR", "STEWARD")
-    for act, who in gate.CLOSING_SEAT.items():
-        assert any(seat in who.upper() for seat in live), (
-            f"{act!r} names no seat in the current roster: {who!r}"
-        )
+    for name, mapping in _seat_maps(gate).items():
+        for key, value in mapping.items():
+            assert any(seat in value.upper() for seat in live), (
+                f"{name}[{key!r}] names no seat in the current roster: {value!r}"
+            )
 
 
 def test_a_build_item_passes(gate: ModuleType) -> None:
@@ -303,7 +315,9 @@ def test_a_demand_gate_verdict_is_advised_not_green(gate: ModuleType) -> None:
     # The LEVEL alone is a weak assertion: an over-broad fix that advises every non-build verdict
     # would also produce it. The reason text is the only thing that tells a seat what gates the item.
     assert "DO NOT JUST BUILD IT" in reason
-    assert "LIAISON" in reason
+    # Was `"LIAISON" in reason`. Section 5 retired that seat AND the hop it named, so the assertion
+    # is on where an owner ruling actually goes now -- the CONSOLE (BACKLOG #1462).
+    assert "CONSOLE" in reason
 
 
 def test_a_demand_gate_verdict_stays_advised_when_research_is_done(gate: ModuleType) -> None:
@@ -330,7 +344,7 @@ def test_an_owner_ruling_verdict_is_advised_not_green(gate: ModuleType) -> None:
     assert level == "advise"
     assert "DO NOT JUST BUILD IT" in reason
     assert "owner" in reason.lower()
-    assert "LIAISON" in reason
+    assert "CONSOLE" in reason
 
 
 def test_an_owner_ruling_verdict_stays_advised_when_research_is_done(gate: ModuleType) -> None:
