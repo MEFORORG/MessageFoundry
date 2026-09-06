@@ -432,6 +432,14 @@ def test_the_delegated_row_discloses_the_unconditional_mfa_satisfied_grant() -> 
     RETIREMENT NOTE (BACKLOG #1137): the hard ``True`` used to be read off ``_login_ad``. That leg is
     gone, so the assertion follows the FACT to the caller that still makes the grant — Kerberos —
     rather than being dropped. The disclosure did not change; only which pathway carries it did.
+
+    ANCHOR NOTE (BACKLOG #1140): for the same reason, the Kerberos anchor now reads
+    ``_authenticate_kerberos`` rather than the public ``authenticate_kerberos``. The public method
+    became a thin wrapper that holds a FAILED challenge to a fixed deadline (ASVS 6.3.8) and
+    delegates, so the ``mfa_verified`` grant sits one frame down. The fact is unchanged and the guard
+    keeps its teeth — it still fails the moment the Kerberos leg stops passing a hard ``True``. What
+    it cannot see is a grant that moves again; the anchor is a source-level name, so a future split
+    reds this test rather than silently passing, which is the safe direction.
     """
 
     def _mfa_grant(func: object) -> list[ast.expr]:
@@ -444,7 +452,7 @@ def test_the_delegated_row_discloses_the_unconditional_mfa_satisfied_grant() -> 
             if kw.arg == "mfa_verified"
         ]
 
-    bind_grant = _mfa_grant(AuthService.authenticate_kerberos)
+    bind_grant = _mfa_grant(AuthService._authenticate_kerberos)
     assert bind_grant and all(
         isinstance(v, ast.Constant) and v.value is True for v in bind_grant
     ), (
