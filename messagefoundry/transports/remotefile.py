@@ -77,6 +77,7 @@ from messagefoundry.config.tls_policy import (
 )
 from messagefoundry.controlchars import has_control_char
 from messagefoundry.transports.base import (
+    DEFAULT_MAX_ITEMS_PER_POLL,
     DeliveryError,
     DestinationConnector,
     DestinationStartupError,
@@ -86,6 +87,7 @@ from messagefoundry.transports.base import (
     SourceStartupError,
     register_destination,
     register_source,
+    resolve_poll_ceiling,
 )
 from messagefoundry.transports.file import (
     DEFAULT_MAX_FILE_BYTES,
@@ -1008,6 +1010,15 @@ class RemoteFileSource(SourceConnector):
         self._validate_directory: bool = bool(s.get("validate_directory", False))
         mfb = s.get("max_file_bytes", DEFAULT_MAX_FILE_BYTES)
         self._max_file_bytes: int | None = int(mfb) if mfb else None
+        # Per-tick intake ceiling, SHIPPED ON (DEFAULT_MAX_ITEMS_PER_POLL — the number and the reason a
+        # poll source may default this on are stated once, in transports/base.py). Caps how many files
+        # ONE poll disposes of; the rest stay on the remote share and the next poll takes them. A falsy
+        # value (None/0) disables the cap, matching max_file_bytes above.
+        self._poll_max_files: int | None = resolve_poll_ceiling(
+            s.get("poll_max_files", DEFAULT_MAX_ITEMS_PER_POLL),
+            knob="poll_max_files",
+            transport="REMOTEFILE source",
+        )
         self._processed_dir = posixpath.join(
             self._remote_dir, s.get("processed_subdir", ".processed")
         )
@@ -1119,9 +1130,13 @@ class RemoteFileSource(SourceConnector):
         await asyncio.to_thread(self._client.ensure_dir, self._error_dir)
         entries = await asyncio.to_thread(self._client.list_dir, self._remote_dir)
         newly_recorded = 0  # #142: files marked processed THIS poll — gates one end-of-poll prune
-        for name, size in sorted(entries):
+        listing = sorted(entries)
+        disposed = 0  # files this poll finished with — the per-tick ceiling's budget (_at_ceiling)
+        for position, (name, size) in enumerate(listing):
             if self._stop.is_set():
                 break  # shutting down — leave the rest for the next start (at-least-once)
+            if self._at_ceiling(disposed, len(listing) - position):
+                break
             if not _is_contained_name(name):
                 # #1238 (ASVS 5.3.2): the server chose this name. Refuse it HERE — at the source,
                 # before the pattern filter — because the raw name reaches at least four consumers
@@ -1160,6 +1175,7 @@ class RemoteFileSource(SourceConnector):
                     self._max_file_bytes,
                 )
                 await self._move(path, self._error_dir, name)
+                disposed += 1
                 continue
             try:
                 raw = await asyncio.to_thread(
@@ -1177,6 +1193,7 @@ class RemoteFileSource(SourceConnector):
                     self._max_file_bytes,
                 )
                 await self._move(path, self._error_dir, name)
+                disposed += 1
                 continue
             except _RemoteError as exc:
                 # Transient (locked / vanished mid-poll): leave it in place to retry next poll rather
@@ -1203,6 +1220,7 @@ class RemoteFileSource(SourceConnector):
                     (self.content_type or ContentType.HL7V2).value,
                 )
                 await self._move(path, self._error_dir, name)
+                disposed += 1
                 continue
             try:
                 await asyncio.to_thread(scan_inbound_file, raw, name)
@@ -1217,6 +1235,7 @@ class RemoteFileSource(SourceConnector):
                     exc,
                 )
                 await self._move(path, self._error_dir, name)
+                disposed += 1
                 continue
             except Exception as exc:  # noqa: BLE001 - operator scan hook: any failure fails closed
                 # The scan hook MALFUNCTIONED (AV/ICAP unreachable, a plugin bug) — NOT a content
@@ -1243,6 +1262,7 @@ class RemoteFileSource(SourceConnector):
                 )
                 continue
             await self._after_processing(path, name)
+            disposed += 1
             if file_key is not None:
                 # Record AFTER emit success (the FILE — not each split message — is the dedup unit).
                 await self._leave_record(file_key)
@@ -1251,6 +1271,35 @@ class RemoteFileSource(SourceConnector):
             await (
                 self.processed_ledger.prune()
             )  # bound growth (age + count), only when something new
+
+    def _at_ceiling(self, disposed: int, remaining: int) -> bool:
+        """True when this poll has spent its per-tick budget (``poll_max_files``) and must stop, leaving
+        ``remaining`` listing entries for the next poll.
+
+        **Nothing is dropped.** A file this poll does not reach is still on the share, so the next poll
+        takes it — the same at-least-once deferral a transient retrieve failure already produces. No
+        message was received, so there is no disposition to record.
+
+        **What charges the budget.** Only a file this poll FINISHED with: one handed to the pipeline, or
+        one quarantined to ``error_subdir`` (over the listed size, over the retrieved size, a
+        content-vs-type mismatch, a scanner rejection). Those leave the poll directory, so the next poll
+        starts on new work. The arms that leave a file **in place** for a later retry — a refused unsafe
+        listing name, a transient retrieve failure, a malfunctioning scan hook, a handler failure — do
+        NOT charge, because a stuck file that sorts early would otherwise eat the whole budget every
+        poll and starve the healthy files behind it. This mirrors
+        :meth:`~messagefoundry.transports.file.FileSource._at_ceiling`, which states the rule in full.
+
+        PHI-safe: the log names the redacted host/dir and two counts, never a filename."""
+        if self._poll_max_files is None or disposed < self._poll_max_files:
+            return False
+        logger.info(
+            "REMOTEFILE source %s reached poll_max_files (%s) this poll; %d listing entr(ies) left for "
+            "the next poll (deferred, not dropped)",
+            _redact(self._host, self._remote_dir),
+            self._poll_max_files,
+            remaining,
+        )
+        return True
 
     def _file_key(self, name: str, size: int) -> str:
         """A stable, HASHED identity for a remote source file, for the leave-in-place dedup ledger

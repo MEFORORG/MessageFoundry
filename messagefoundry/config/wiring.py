@@ -1779,6 +1779,8 @@ def File(
     sort: str = "name",  # inbound: process order — "name" | "mtime"
     recursive: bool = False,  # inbound: also scan subdirectories
     max_file_bytes: int | None = 16 * 1024 * 1024,  # inbound: skip files over this (OOM guard)
+    poll_max_files: int
+    | None = 500,  # inbound: files ONE scan may take; the rest wait for the next scan (0/None = unlimited)
     validate_directory: bool = False,  # both directions (#114): fail-fast at start on a missing/unusable dir, and never create it; default defers to run time
     overwrite: bool = False,  # outbound: overwrite vs. uniquify a name collision
     processed_subdir: str = ".processed",
@@ -1799,6 +1801,12 @@ def File(
     """A File endpoint. Inbound polls ``directory`` for ``pattern``; outbound writes ``filename``
     (atomically). ``encoding`` is the file charset (outbound). ``max_file_bytes`` mirrors
     transports.file.DEFAULT_MAX_FILE_BYTES (pass None/0 to disable).
+
+    ``poll_max_files`` (inbound) mirrors transports.base.DEFAULT_MAX_ITEMS_PER_POLL and **ships on**: one
+    scan takes at most this many files and the rest wait in the drop directory for the next scan. A
+    deferral, not a drop — nothing is quarantined, errored or unaccounted for. Raise it (or pass None/0
+    for unlimited) if a site's periodic drop is larger than the ceiling and its ``poll_seconds`` is long
+    enough that the backlog would take too many scans to clear.
 
     ``after_read`` (inbound) chooses the source-file disposition: ``move`` (→ ``processed_subdir``,
     the default), ``delete``, or ``leave`` — **process in place** for a read-only share / a directory
@@ -1836,6 +1844,7 @@ def File(
         "sort": sort,
         "recursive": recursive,
         "max_file_bytes": max_file_bytes,
+        "poll_max_files": poll_max_files,
         "validate_directory": validate_directory,
         "overwrite": overwrite,
         "processed_subdir": processed_subdir,
@@ -2505,6 +2514,8 @@ def DatabasePoll(
     | None = None,  # UPDATE/DELETE run per row after the handler succeeds (:name)
     body_column: str | None = None,  # None → whole row as JSON; set → that column's value verbatim
     poll_seconds: float = 5.0,
+    poll_max_rows: int
+    | None = 500,  # rows ONE poll may take; the rest wait for the next poll (0/None = unlimited)
     auth: Literal[
         "sql", "integrated", "entra"
     ] = "sql",  # sql | integrated | entra (SQL Server preset only)
@@ -2538,6 +2549,13 @@ def DatabasePoll(
     ``env()``; TLS is on by default (weakening needs ``MEFOR_ALLOW_INSECURE_TLS``); the polled ``server``
     is gated by ``[egress].allowed_db``.
 
+    ``poll_max_rows`` mirrors transports.base.DEFAULT_MAX_ITEMS_PER_POLL and **ships on**: one poll
+    fetches at most this many rows and leaves the rest of the result set in the table for the next poll.
+    A deferral, not a drop — an unfetched row is not read, not marked and not errored. It bounds the
+    fetch itself, so a long-unattended table is no longer materialised whole into memory. Progress needs
+    ``mark_statement`` to take a handled row out of ``poll_statement``'s predicate, which is the shape
+    this connector already requires. Pass None/0 for the unbounded fetch.
+
     ``dialect='generic'`` (#66) polls any OS-installed ODBC driver (PostgreSQL / Oracle / MySQL) — name it
     in ``odbc_driver``, pass driver keywords via ``odbc_params``, and configure TLS through the driver's own
     keyword (the SQL-Server weakened-TLS refusal does not apply on that path). Credentials stay in
@@ -2553,6 +2571,7 @@ def DatabasePoll(
             "mark_statement": mark_statement,
             "body_column": body_column,
             "poll_seconds": poll_seconds,
+            "poll_max_rows": poll_max_rows,
             "auth": auth,
             "username": username,
             "password": password,
@@ -2766,6 +2785,8 @@ def Sftp(
     ] = "move",  # inbound: "move" (to processed_subdir) | "delete" | "leave" (process in place, #142)
     min_age_seconds: float = 0.0,  # inbound: skip files modified within this window (partial writes)
     max_file_bytes: int | None = 16 * 1024 * 1024,  # inbound: skip files over this (OOM guard)
+    poll_max_files: int
+    | None = 500,  # inbound: files ONE poll may take; the rest wait for the next poll (0/None = unlimited)
     validate_directory: bool = False,  # both directions (#114): fail-fast at start on an unreachable remote dir, and never create it
     overwrite: bool = False,  # outbound: overwrite vs. uniquify a name collision
     processed_subdir: str = ".processed",
@@ -2786,7 +2807,11 @@ def Sftp(
     ``validate_directory`` (#114, both directions) makes an unreachable/missing ``remote_dir`` **fail
     startup** — the connection is reported ``failed`` — instead of the default deferral to run time; on
     an outbound it additionally stops the upload directory from ever being created (on send, or by the
-    on-demand test probe). Off by default: an intermittently-available remote dir must still start."""
+    on-demand test probe). Off by default: an intermittently-available remote dir must still start.
+
+    ``poll_max_files`` (inbound) mirrors transports.base.DEFAULT_MAX_ITEMS_PER_POLL and **ships on**: one
+    poll takes at most this many files and the rest stay on the share for the next poll. A deferral, not
+    a drop. Pass None/0 for unlimited."""
     return ConnectionSpec(
         ConnectorType.REMOTEFILE,
         {
@@ -2805,6 +2830,7 @@ def Sftp(
             "after_read": after_read,
             "min_age_seconds": min_age_seconds,
             "max_file_bytes": max_file_bytes,
+            "poll_max_files": poll_max_files,
             "validate_directory": validate_directory,
             "overwrite": overwrite,
             "processed_subdir": processed_subdir,
@@ -2831,6 +2857,8 @@ def Ftp(
     ] = "move",  # inbound: "move" (to processed_subdir) | "delete" | "leave" (process in place, #142)
     min_age_seconds: float = 0.0,  # inbound: skip files modified within this window (partial writes)
     max_file_bytes: int | None = 16 * 1024 * 1024,  # inbound: skip files over this (OOM guard)
+    poll_max_files: int
+    | None = 500,  # inbound: files ONE poll may take; the rest wait for the next poll (0/None = unlimited)
     validate_directory: bool = False,  # both directions (#114): fail-fast at start on an unreachable remote dir, and never create it
     overwrite: bool = False,  # outbound: overwrite vs. uniquify a name collision
     processed_subdir: str = ".processed",
@@ -2844,8 +2872,8 @@ def Ftp(
     plain ``ftp`` is **refused** unless ``MEFOR_ALLOW_INSECURE_TLS`` is set (use ``tls=True`` for FTPS,
     or :func:`Sftp`). FTPS encrypts the control + data channels, so credentials are fine there. Put
     secrets (``password``) in ``env()``. The host is gated by ``[egress].allowed_remote`` (both
-    directions). At-least-once → downstreams **must be idempotent**. ``validate_directory`` behaves
-    exactly as it does on :func:`Sftp`."""
+    directions). At-least-once → downstreams **must be idempotent**. ``validate_directory`` and
+    ``poll_max_files`` behave exactly as they do on :func:`Sftp`."""
     return ConnectionSpec(
         ConnectorType.REMOTEFILE,
         {
@@ -2862,6 +2890,7 @@ def Ftp(
             "after_read": after_read,
             "min_age_seconds": min_age_seconds,
             "max_file_bytes": max_file_bytes,
+            "poll_max_files": poll_max_files,
             "validate_directory": validate_directory,
             "overwrite": overwrite,
             "processed_subdir": processed_subdir,

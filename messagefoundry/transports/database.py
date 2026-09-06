@@ -60,6 +60,7 @@ from messagefoundry.config.settings import (
 )
 from messagefoundry.config.tls_policy import InsecureHopRefused, current_hop_posture
 from messagefoundry.transports.base import (
+    DEFAULT_MAX_ITEMS_PER_POLL,
     DeliveryError,
     DeliveryResponse,
     DestinationConnector,
@@ -68,6 +69,7 @@ from messagefoundry.transports.base import (
     SourceConnector,
     register_destination,
     register_source,
+    resolve_poll_ceiling,
 )
 from messagefoundry.transports.mllp import InsecureHopGuard
 
@@ -1059,6 +1061,15 @@ class DatabaseSource(SourceConnector):
         self._mark_sql, self._mark_names = _parse_named_params(str(mark)) if mark else (None, [])
         self._body_column: str | None = s.get("body_column") or None
         self._poll_seconds = float(s.get("poll_seconds", 5.0))
+        # Per-tick row ceiling, SHIPPED ON (DEFAULT_MAX_ITEMS_PER_POLL — the number and the reason a
+        # poll source may default this on are stated once, in transports/base.py). Caps how many rows
+        # ONE poll takes from poll_statement's result set; the rest stay in the table and the next poll
+        # takes them. A falsy value (None/0) disables the cap, matching the file sources' knobs.
+        self._poll_max_rows: int | None = resolve_poll_ceiling(
+            s.get("poll_max_rows", DEFAULT_MAX_ITEMS_PER_POLL),
+            knob="poll_max_rows",
+            transport="DATABASE source",
+        )
         self._encoding: str = s.get("encoding", "utf-8")
         self._pool_max = int(s.get("pool_max", 5))
         self._acquire_timeout = float(s.get("acquire_timeout", _DEFAULT_DB_ACQUIRE_TIMEOUT))
@@ -1168,9 +1179,21 @@ class DatabaseSource(SourceConnector):
                 )
 
     async def _select(self) -> tuple[list[str], list[Any]]:
-        """Run ``poll_statement`` and return ``(column_names, rows)``. The connection is released before
-        the rows are handed to the (possibly slow) handler, so a batch never holds a pool connection
-        hostage to downstream store I/O."""
+        """Run ``poll_statement`` and return ``(column_names, rows)``, at most ``poll_max_rows`` of them.
+        The connection is released before the rows are handed to the (possibly slow) handler, so a batch
+        never holds a pool connection hostage to downstream store I/O.
+
+        **The ceiling is charged at the FETCH, not after it.** ``fetchmany`` leaves the rest of the
+        result set in the driver and the cursor is closed on the way out, so a poll of a table holding a
+        million rows pulls the ceiling (plus one probe row, see below) into memory rather than all of
+        them — the ``fetchall`` this replaced materialised the whole set before anything could bound it.
+        The rows not taken are untouched in the table, so the next poll re-runs ``poll_statement`` and
+        takes the next batch; nothing is dropped, errored or marked. Progress depends on the
+        ``mark_statement`` removing a handled row from ``poll_statement``'s own predicate, which is the
+        shape this connector already documents and requires — without a mark the same rows re-emit every
+        poll, ceiling or no ceiling.
+
+        A falsy ``poll_max_rows`` disables the ceiling and restores the unbounded ``fetchall``."""
         pool = await self._get_pool()
         conn = await _acquire(pool, self._acquire_timeout)
         cur: Any = None
@@ -1178,7 +1201,20 @@ class DatabaseSource(SourceConnector):
             cur = await conn.cursor()
             await cur.execute(self._poll_sql)
             columns = [d[0] for d in cur.description]
-            rows = list(await cur.fetchall())
+            if self._poll_max_rows is None:
+                rows = list(await cur.fetchall())
+            else:
+                # limit + 1 (the same probe auth/oidc uses on a bounded read): one row past the
+                # ceiling is enough to know a backlog is waiting, and it is dropped from the batch —
+                # never handed to the handler, never marked, so the next poll selects it again.
+                rows = list(await cur.fetchmany(self._poll_max_rows + 1))
+                if len(rows) > self._poll_max_rows:
+                    rows = rows[: self._poll_max_rows]
+                    logger.info(
+                        "DATABASE source reached poll_max_rows (%s) this poll; the rest of the result "
+                        "set is left for the next poll (deferred, not dropped)",
+                        self._poll_max_rows,
+                    )
         finally:
             await _close_cursor(cur)
             await pool.release(conn)

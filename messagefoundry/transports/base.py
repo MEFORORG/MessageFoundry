@@ -55,7 +55,60 @@ __all__ = [
     "ECH_UNSUPPORTED_SOURCE_MSG",
     "peer_ip_allowed",
     "probe_tcp_reachable",
+    "DEFAULT_MAX_ITEMS_PER_POLL",
+    "resolve_poll_ceiling",
 ]
+
+#: Per-tick intake ceiling for the three POLL sources — FILE, REMOTEFILE and DATABASE, which are
+#: exactly the sources that set :attr:`SourceConnector.polls_shared_resource`. **It ships ON.** One
+#: tick hands at most this many items to the pipeline and leaves the rest where they are; the next
+#: tick takes the next batch. Each connector exposes it as its own setting (``poll_max_files`` on the
+#: two file sources, ``poll_max_rows`` on the database poll), and a falsy value (None/0) disables it.
+#:
+#: **Why a poll source may default this ON while the MLLP message pacer deliberately ships OFF**
+#: (``transports/mllp.py`` ``DEFAULT_MAX_MESSAGES_PER_SECOND``, ruled 2026-08-11). Here a ceiling is a
+#: DEFERRAL, not a drop: an unread file stays in the drop directory and an unselected row stays in the
+#: table, so the next tick picks it up. Nothing is refused, no disposition changes, and the
+#: count-and-log invariant is untouched — a deferred item was never received, so there is nothing to
+#: count. On a listen socket the same bound has to refuse or stall a sender mid-conversation, which is
+#: why that one waits for the site's own number. **Do not "fix" the inconsistency by defaulting these
+#: three off**; the two cases differ in what a bound does to the sender, not in taste.
+#:
+#: **Why 500.** The published measurements are the anchor: ``docs/THROUGHPUT.md`` records ~450 msg/s at
+#: intake (ACK-on-receipt) and ~60 msg/s end-to-end on one ordered interface, and
+#: ``docs/SYSTEM-REQUIREMENTS.md`` puts the highest rate ever measured from one engine process at ~97
+#: msg/s sustained (~107 as a burst). At the shipped poll intervals 500 items per tick allows 500/s on
+#: the FILE source (``poll_seconds`` 1.0) and 100/s on REMOTEFILE and DATABASE (``poll_seconds`` 5.0) —
+#: at or above every one of those figures, so the ceiling cannot be the constraint that throttles a
+#: feed the engine could otherwise have kept up with. It is also low enough to bind the pathological
+#: tick this exists for: a partner dropping a hundred thousand files at once, or a queue table that has
+#: gone unattended for a week. Ingesting faster than the engine drains would not deliver anything
+#: sooner anyway — it moves the backlog from the source system, where it is visible and its owner
+#: controls it, into this engine's store.
+DEFAULT_MAX_ITEMS_PER_POLL = 500
+
+
+def resolve_poll_ceiling(value: object, *, knob: str, transport: str) -> int | None:
+    """Read one poll source's per-tick ceiling from its settings: a positive count, or ``None`` for the
+    documented unlimited opt-out (a falsy ``0``/``None``).
+
+    A **negative** value is refused at construction rather than clamped or accepted. Accepted, it would
+    stop the source ingesting anything at all while the connection still reported running — the worst
+    outcome this control can produce, and one an operator would have no reason to expect from a typo.
+    Clamping it to 1 would instead silently ingest at a rate nobody asked for. The connector already
+    raises a :class:`ValueError` for a bad ``after_read``, so a bad number surfaces the same way: at
+    wiring / ``messagefoundry check``, before the connection ever starts."""
+    if not value:
+        return None
+    # A non-numeric setting raises here, which is the same build-time refusal a bad value gets below.
+    ceiling: int = int(value)  # type: ignore[call-overload]
+    if ceiling < 1:
+        raise ValueError(
+            f"{transport} {knob}={value!r} must be a positive number of items per poll "
+            f"(or 0 for unlimited)"
+        )
+    return ceiling
+
 
 # A source hands each inbound message (raw bytes, MLLP framing already stripped) to this
 # callback and sends whatever it returns back to the sender. Return ``None`` for

@@ -41,6 +41,7 @@ from messagefoundry.parsing.sniff import _content_matches_declared, _looks_like_
 from messagefoundry.parsing.split import split_batch
 from messagefoundry.transports import wincred
 from messagefoundry.transports.base import (
+    DEFAULT_MAX_ITEMS_PER_POLL,
     DeliveryError,
     DestinationConnector,
     DestinationStartupError,
@@ -50,6 +51,7 @@ from messagefoundry.transports.base import (
     encode_wire_body,
     register_destination,
     register_source,
+    resolve_poll_ceiling,
 )
 
 __all__ = [
@@ -57,6 +59,7 @@ __all__ = [
     "FileSource",
     "render_filename",
     "DEFAULT_MAX_FILE_BYTES",
+    "DEFAULT_MAX_ITEMS_PER_POLL",
     "LEAVE_SEEN_CACHE_MAX",
     # Re-exported from parsing.sniff (ASVS 5.2.2) so remotefile.py + existing tests import them here.
     "_content_matches_declared",
@@ -382,6 +385,15 @@ class FileSource(SourceConnector):
         self.encoding: str = s.get("encoding", "utf-8")
         mfb = s.get("max_file_bytes", DEFAULT_MAX_FILE_BYTES)
         self.max_file_bytes: int | None = int(mfb) if mfb else None
+        # Per-tick intake ceiling, SHIPPED ON (DEFAULT_MAX_ITEMS_PER_POLL — the number and the reason a
+        # poll source may default this on are stated once, in transports/base.py). Caps how many files
+        # ONE scan disposes of; the rest stay in the drop directory and the next scan takes them. A
+        # falsy value (None/0) disables the cap, matching max_file_bytes above.
+        self.poll_max_files: int | None = resolve_poll_ceiling(
+            s.get("poll_max_files", DEFAULT_MAX_ITEMS_PER_POLL),
+            knob="poll_max_files",
+            transport="file source",
+        )
         # Optional inbound decompression (ADR 0123): "gzip" gunzips each file's bytes BEFORE the sniff /
         # AV scan / batch split (they must see the real HL7). None (default) is byte-identical to before.
         self.decompress: str | None = _validate_compression(s.get("decompress"), "decompress")
@@ -529,7 +541,11 @@ class FileSource(SourceConnector):
         newly_recorded = (
             0  # #142: files marked processed THIS tick — gates a single end-of-tick prune
         )
-        for path in await self._run_fs(self._candidates):
+        candidates = await self._run_fs(self._candidates)
+        disposed = 0  # files this tick finished with — the per-tick ceiling's budget (_at_ceiling)
+        for position, path in enumerate(candidates):
+            if self._at_ceiling(disposed, len(candidates) - position):
+                break
             # #142 leave-in-place dedup: skip a file this connection already ingested. In-memory set
             # first (no I/O), then the durable ledger (survives restart / a fresh process). Keyed on a
             # HASHED file id (name+mtime+size) — never a cleartext filename, never logged at INFO+.
@@ -551,6 +567,7 @@ class FileSource(SourceConnector):
                     self.max_file_bytes,
                 )
                 await self._run_fs(self._move, path, self.error_dir)
+                disposed += 1
                 continue
             try:
                 raw = await self._run_fs(path.read_bytes)
@@ -576,6 +593,7 @@ class FileSource(SourceConnector):
                         "file %s failed to gunzip (%s); routing to error dir", path.name, exc
                     )
                     await self._run_fs(self._move, path, self.error_dir)
+                    disposed += 1
                     continue
             if not _content_matches_declared(self.content_type, raw):
                 # Content doesn't match the declared content_type (a PDF on a json inbound, a non-ISA
@@ -595,6 +613,7 @@ class FileSource(SourceConnector):
                     (self.content_type or ContentType.HL7V2).value,
                 )
                 await self._run_fs(self._move, path, self.error_dir)
+                disposed += 1
                 continue
             try:
                 # The scan hook operates on already-read bytes (it may itself dial an AV/ICAP service),
@@ -611,6 +630,7 @@ class FileSource(SourceConnector):
                     exc,
                 )
                 await self._run_fs(self._move, path, self.error_dir)
+                disposed += 1
                 continue
             except Exception as exc:  # noqa: BLE001 - operator scan hook: any failure fails closed
                 # The scan hook MALFUNCTIONED (AV/ICAP unreachable, a plugin bug) — NOT a content
@@ -643,6 +663,7 @@ class FileSource(SourceConnector):
                 logger.warning("handler failed for %s (will retry next scan): %s", path.name, exc)
                 continue
             await self._run_fs(self._after_processing, path)
+            disposed += 1
             if self.after_read == "leave" and file_key is not None:
                 # Record AFTER emit success (the FILE — not each split message — is the dedup unit), so a
                 # partial-emit crash re-reads and re-emits the whole file (at-least-once), never dropping.
@@ -652,6 +673,39 @@ class FileSource(SourceConnector):
             # Bound the ledger's growth (age + count); only when this tick recorded something, so a stable
             # read-only share (nothing new) never churns the store.
             await self.processed_ledger.prune()
+
+    def _at_ceiling(self, disposed: int, remaining: int) -> bool:
+        """True when this scan has spent its per-tick budget (``poll_max_files``) and must stop, leaving
+        ``remaining`` candidates for the next scan.
+
+        **Nothing is dropped.** A file this scan does not reach is still in the drop directory, so the
+        next scan takes it — the same at-least-once deferral a transient read failure already produces.
+        No message was received, so there is no disposition to record and the count-and-log invariant is
+        untouched.
+
+        **What charges the budget, and why the exceptions are not an oversight.** Only a file this scan
+        FINISHED with charges: one handed to the pipeline, or one quarantined to ``.error`` (oversize,
+        a failed gunzip, a content-vs-type mismatch, a scanner rejection). Each of those leaves the
+        candidate set, so the next scan starts on new work. The arms that leave a file **in place** to be
+        retried — a locked/vanished file, a malfunctioning scan hook, a handler failure — deliberately do
+        NOT charge. If they did, a permanently stuck file that sorts early would eat the whole budget on
+        every scan and the healthy files behind it would never be ingested. A budget can only be charged
+        by something that makes progress.
+
+        This bounds the INGEST, not the listing: ``_candidates`` still globs and sorts the whole
+        directory, because picking the first N in name/mtime order requires seeing all of them. The
+        per-file cost the ceiling removes is the read, the scan hook, the pipeline hand-off and the
+        durable commit — not the stat."""
+        if self.poll_max_files is None or disposed < self.poll_max_files:
+            return False
+        logger.info(
+            "file source %s reached poll_max_files (%s) this scan; %d candidate(s) left for the next "
+            "poll (deferred, not dropped)",
+            self.directory,
+            self.poll_max_files,
+            remaining,
+        )
+        return True
 
     def _file_key(self, path: Path) -> str:
         """A stable, HASHED identity for a source file, for the leave-in-place dedup ledger (#142).
