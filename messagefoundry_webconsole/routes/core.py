@@ -25,7 +25,7 @@ from messagefoundry.api.models import (
 from messagefoundry.api.security import get_auth
 from messagefoundry.auth import Identity, Permission
 from messagefoundry.auth.identity import AuthProvider
-from messagefoundry.auth.service import AuthService, MfaStatus
+from messagefoundry.auth.service import AuthService, Elevation, MfaStatus
 from messagefoundry.auth.tokens import hash_token
 from messagefoundry.parsing import HL7PeekError, parse_tree
 
@@ -785,8 +785,17 @@ def register(app: FastAPI, deps: UiDeps) -> None:
             # budget — a different hint for the same limiter would just misreport when it clears.
             raise HTTPException(429, "too many attempts", headers={"Retry-After": "30"})
         form = dict(parse_qsl((await request.body()).decode("utf-8", "replace")))
-        if await auth.verify_mfa(token, form.get("code", ""), client=client):
-            return RedirectResponse("/ui", status_code=303)
+        elevation = await auth.verify_mfa(token, form.get("code", ""), client=client)
+        if elevation.ok and elevation.token is not None:
+            # The session was re-keyed (ASVS 7.2.4), so the cookie this browser holds is now dead.
+            # Re-set it on the redirect or the operator is signed out by their own correct code.
+            resp = RedirectResponse("/ui", status_code=303)
+            set_session_cookie(resp, elevation.token, request=request)
+            return resp
+        if elevation.session_lost:
+            # A correct code on a session revoked underneath it: there is nothing to re-render the
+            # gate for, and the cookie is dead. Land on login like any other post-termination exit.
+            return login_redirect_response()
         mfa = await auth.mfa_status(identity)
         wa_options, wa_notice = await _reauth_webauthn_state(request, auth, token, mfa, False)
         # The submitted code is NOT echoed back — it is a bearer credential, and verify_mfa has
@@ -895,6 +904,7 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         client = request.client.host if request.client else None
         if not allow_reauth_attempt(auth, identity, client):  # per-ACTOR, not the sign-in budget
             raise HTTPException(429, "too many attempts", headers={"Retry-After": "30"})
+
         # Satisfy whichever factor is pending — TOTP first (mirrors require_step_up), then
         # password. The code is only demanded from a user with an ENROLLED authenticator
         # (decision 1(c): the code branch keys on TOTP enrollment alone — a WebAuthn-only
@@ -904,13 +914,37 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         # require_reauth_only. Error re-renders re-stage FRESH assertion options (decision
         # 1(e)): the prior challenge was single-use, and the passkey button must survive a
         # failed password/code attempt.
+        # THIS HANDLER CAN ROTATE TWICE IN ONE REQUEST — the code leg below, then the password leg.
+        # Two consequences, and both are load-bearing:
+        #  1. `token` is REBOUND after each rotation. The second call must run against the live hash;
+        #     against the retired one it fails closed and a correct password reads as wrong.
+        #  2. EVERY return path past the first rotation re-sets the cookie, the error exits included.
+        #     A correct code followed by a wrong password rotates once and then renders an error page;
+        #     without the cookie on that response the browser would be left holding a dead cookie in
+        #     the middle of the ceremony, which presents as an unexplained sign-out.
+        def _keep_session(resp: Response, tok: str) -> Response:
+            """Carry the session's CURRENT token onto an outgoing response.
+
+            Takes the token as an argument rather than closing over it: a closure would capture the
+            variable, and the whole point here is that it is rebound mid-handler."""
+            set_session_cookie(resp, tok, request=request)
+            return resp
+
         mfa_enrolled = mfa.enabled
         if mfa_enrolled and not satisfied:
             code = form.get("code", "").strip()
-            if not code or not await auth.verify_mfa(token, code, client=client):
+            code_elevation = (
+                await auth.verify_mfa(token, code, client=client) if code else Elevation(ok=False)
+            )
+            if code_elevation.session_lost:
+                return login_redirect_response()  # session ended under a correct code
+            if code_elevation.ok and code_elevation.token is not None:
+                token = code_elevation.token  # rotation 1 of 2
+            else:
                 wa_options, wa_notice = await _reauth_webauthn_state(
                     request, auth, token, mfa, await auth.mfa_satisfied(token)
                 )
+                # Nothing rotated on this leg, so the cookie the browser holds is still live.
                 return HTMLResponse(
                     pages.reauth(
                         next_,
@@ -923,30 +957,38 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         # 7.5.1 (ADR 0077): mint the single-use grant bound to this continuation's action. action.action
         # is None for every non-factor continuation (replay/purge/config/create-user), so reauth mints
         # nothing there and those flows stay byte-identical; the factor-binding lanes tag their action.
-        if not await auth.reauth(
+        pw_elevation = await auth.reauth(
             identity, form.get("password", ""), token=token, client=client, purpose=action.action
-        ):
+        )
+        if pw_elevation.session_lost:
+            return login_redirect_response()
+        if not pw_elevation.ok or pw_elevation.token is None:
             still_unsatisfied = not await auth.mfa_satisfied(token)
             wa_options, wa_notice = await _reauth_webauthn_state(
                 request, auth, token, mfa, not still_unsatisfied
             )
-            return HTMLResponse(
-                pages.reauth(
-                    next_,
-                    mfa_needed=mfa_enrolled and still_unsatisfied,
-                    webauthn_options=wa_options,
-                    webauthn_notice=wa_notice,
-                    error="Incorrect password.",
-                )
+            # The wrong-password exit AFTER a successful code leg — the stranded-cookie case.
+            return _keep_session(
+                HTMLResponse(
+                    pages.reauth(
+                        next_,
+                        mfa_needed=mfa_enrolled and still_unsatisfied,
+                        webauthn_options=wa_options,
+                        webauthn_notice=wa_notice,
+                        error="Incorrect password.",
+                    )
+                ),
+                token,
             )
+        token = pw_elevation.token  # rotation 2 of 2
         # Fully stepped up. Hand control back per the action's continuation style:
         #  - an unlock target is a GET admin form → 303-GET-redirect so it re-opens inside the now
         #    fresh window; the operator then submits the body-carrying POST (incl. a create-user
         #    password) once, never crossing /ui/reauth (the stateless confirm-after-step-up path).
         #  - otherwise it is a body-less POST action → auto-retry it via the same-origin submit form.
         if is_unlock_action(next_):
-            return RedirectResponse(next_, status_code=303)
-        return HTMLResponse(pages.reauth_continue(next_))
+            return _keep_session(RedirectResponse(next_, status_code=303), token)
+        return _keep_session(HTMLResponse(pages.reauth_continue(next_)), token)
 
     # ADR 0068 decision 6: the browser passkey leg of step-up. A cookie-authed JSON POST
     # (the sanctioned /ui carve — the cookie stays confined to /ui deps; bearer_token()
@@ -981,14 +1023,21 @@ def register(app: FastAPI, deps: UiDeps) -> None:
             response_json = json.dumps(body["response"])
         except (ValueError, KeyError, TypeError):
             return JSONResponse({"ok": False, "error": "malformed request"}, status_code=400)
-        ok = await auth.finish_webauthn_assertion(
+        elevation = await auth.finish_webauthn_assertion(
             token, response_json, client=client, rp_id=rp[0], origin=rp[1]
         )
-        if not ok:
+        if elevation.session_lost:
+            return JSONResponse({"ok": False, "error": "session expired"}, status_code=401)
+        if not elevation.ok or elevation.token is None:
             return JSONResponse(
                 {"ok": False, "error": "passkey verification failed"}, status_code=400
             )
-        return JSONResponse({"ok": True})
+        # The assertion re-keyed the session (ASVS 7.2.4). The new cookie rides this JSON response,
+        # because the page's next request is the POST /ui/reauth password leg — it would otherwise
+        # present the retired token and be refused on a correct password.
+        resp = JSONResponse({"ok": True})
+        set_session_cookie(resp, elevation.token, request=request)
+        return resp
 
     # Bulk dead-letter replay (M3): re-queue ALL dead deliveries for one channel. Like message
     # replay it is require_step_up (→ require_ui_step_up, which 303s to /ui/reauth on a stale

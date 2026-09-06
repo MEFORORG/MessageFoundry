@@ -163,9 +163,26 @@ class MfaConfirmRequest(RequestModel):
 
 class MfaConfirmResponse(BaseModel):
     """The one-time single-use recovery codes minted on enrollment — shown **once** for the user to
-    save (lost-authenticator escape hatch)."""
+    save (lost-authenticator escape hatch), plus the rotated session token.
+
+    ``token`` is the caller's NEW bearer token: confirming an enrolment elevates the session, and
+    ASVS 7.2.4 re-keys it on every elevation, so the token the client authenticated this very call
+    with has stopped working. A client that ignores this field has locked itself out."""
 
     recovery_codes: list[str]
+    token: str
+
+
+class ElevatedResponse(BaseModel):
+    """A ceremony that RAISED the session's authentication state, and the token it was re-keyed to.
+
+    ``token`` is the caller's NEW bearer token (ASVS 7.2.4). The one the request carried no longer
+    authenticates, so a client MUST adopt this or it has just ended its own session. The responses
+    carrying this field are sent ``Cache-Control: no-store`` — a body holding a live session token
+    must not sit in a shared cache."""
+
+    detail: str
+    token: str
 
 
 class MfaStatusResponse(BaseModel):

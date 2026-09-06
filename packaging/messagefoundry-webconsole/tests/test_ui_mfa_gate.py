@@ -94,9 +94,13 @@ async def _enroll_totp(service: AuthService, username: str = "op") -> str:
     outcome = await service.login(username, PW)
     assert outcome.ok and outcome.token is not None
     enrollment = await service.begin_mfa_enrollment(identity)
-    assert await service.confirm_mfa_enrollment(
-        identity, totp.totp(enrollment.secret), token=outcome.token
-    )
+    # `.ok`, not the result object: confirm_mfa_enrollment returns an Elevation (ASVS 7.2.4), and a
+    # frozen dataclass is ALWAYS truthy — a bare assert on it would pass on a failed enrolment.
+    assert (
+        await service.confirm_mfa_enrollment(
+            identity, totp.totp(enrollment.secret), token=outcome.token
+        )
+    ).ok
     return enrollment.secret
 
 
@@ -306,3 +310,58 @@ async def test_must_change_outranks_the_second_factor_on_the_gate_page(
         assert r.status_code == 303 and r.headers["location"] == "/ui/account/password"
         r = await c.get("/ui/mfa")
         assert r.status_code == 303 and r.headers["location"] == "/ui/account/password"
+
+
+# --- ASVS 7.2.4: the cookie plane of session rotation on re-authentication ---
+
+
+async def test_a_correct_code_then_a_wrong_password_leaves_a_working_cookie(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """RED when: POST /ui/reauth stops re-setting the cookie on its ERROR exits.
+
+    ``/ui/reauth`` can rotate TWICE in one request — the code leg, then the password leg. A correct
+    code followed by a wrong password rotates ONCE and then renders an error page. If that response
+    does not carry the new cookie the browser is stranded on a dead one mid-ceremony, and the next
+    click reads as an unexplained sign-out rather than a wrong password.
+
+    Also RED when: the handler stops rebinding its local ``token`` between the two calls — the
+    password leg would then run against the retired hash and fail closed on a CORRECT password.
+    """
+    service = await _service(engine, require_mfa=True)
+    await _add(service, "op", Role.OPERATOR)
+    t0 = 1_000_000.0
+    _pin_totp_clock(monkeypatch, t0)
+    secret = await _enroll_totp(service, "op")
+
+    async with _client(engine, service) as c:
+        assert (await _login(c)).status_code == 303
+        before = c.cookies.get("mf_session")
+        assert before is not None
+
+        # A strictly later step: enrollment consumed its own (BACKLOG #1021).
+        t1 = t0 + totp.DEFAULT_PERIOD
+        _pin_totp_clock(monkeypatch, t1)
+        r = await c.post(
+            "/ui/reauth",
+            data={
+                "next": "/ui/account/mfa/disable",
+                "code": totp.totp(secret, now=t1),
+                "password": "definitely-not-the-password",
+            },
+            headers={"origin": "http://t"},
+        )
+
+        assert r.status_code == 200
+        assert "Incorrect password." in r.text, (
+            "the password leg did not run, or ran on a dead hash"
+        )
+        after = c.cookies.get("mf_session")
+        assert after is not None and after != before, "the rotated cookie was not handed back"
+
+        # The whole point: the browser can still act. A dead cookie would 303 to /ui/login.
+        assert await service.identity_for_token(after) is not None
+        assert await service.mfa_satisfied(after) is True, "the code leg's stamp did not survive"
+        assert await service.identity_for_token(before) is None, (
+            "the old cookie still authenticates"
+        )

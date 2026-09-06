@@ -239,9 +239,11 @@ async def test_an_enrolled_account_cannot_self_promote_by_binding_a_second_facto
     setup = await service.login("vic", PW)
     assert setup.ok and setup.token is not None
     enrollment = await service.begin_mfa_enrollment(identity)
-    assert await service.confirm_mfa_enrollment(
-        identity, totp.totp(enrollment.secret), token=setup.token
-    )
+    assert (
+        await service.confirm_mfa_enrollment(
+            identity, totp.totp(enrollment.secret), token=setup.token
+        )
+    ).ok
 
     async with _client(engine, service) as c:
         # The attacker knows the password and nothing else.
@@ -253,6 +255,11 @@ async def test_an_enrolled_account_cannot_self_promote_by_binding_a_second_facto
         # succeeds as a re-auth (the session window legitimately refreshes)...
         r = await c.post("/me/reauth", json={"password": PW, "purpose": "mfa_enroll"}, headers=h)
         assert r.status_code == 200
+        # The re-auth re-keyed the session (ASVS 7.2.4), so the rest of the chain has to be driven
+        # with the ROTATED bearer -- otherwise the enroll below would 401 on a dead token and the
+        # test would "pass" without ever reaching the guard it exists to prove.
+        tok = str(r.json()["token"])
+        h = _auth(tok)
 
         # ...but it must NOT have minted the action grant, so the enrollment route stays shut.
         enroll = await c.post("/me/mfa/enroll", headers=h)
@@ -279,9 +286,11 @@ async def test_bootstrap_enrollment_from_a_pending_session_still_works(engine: E
         tok = await _login(c, "fresh")
         h = _auth(tok)
         assert (await c.get("/messages", headers=h)).status_code == 403
-        assert (
-            await c.post("/me/reauth", json={"password": PW, "purpose": "mfa_enroll"}, headers=h)
-        ).status_code == 200
+        elevated = await c.post(
+            "/me/reauth", json={"password": PW, "purpose": "mfa_enroll"}, headers=h
+        )
+        assert elevated.status_code == 200
+        h = _auth(str(elevated.json()["token"]))  # re-keyed by the re-auth
         assert (await c.post("/me/mfa/enroll", headers=h)).status_code == 200
 
 

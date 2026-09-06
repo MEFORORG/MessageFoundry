@@ -7,7 +7,7 @@ above it: ``AuthService._rotate_session_token`` and the process-local state ``_r
 must carry with it.
 
 Why this file exists at all. The primitive landed ahead of its call sites (the five elevation sites
-are the remaining 7.2.4 work, BACKLOG #314), so it had NO coverage and no caller — and its job is
+are the remaining 7.2.4 work), so it had NO coverage and no caller — and its job is
 precisely the part that fails *silently*: three in-memory maps keyed on the session's token hash,
 each of which strands differently if it is missed. Untested code whose failure mode is silence is
 worse than absent code, so it is tested here rather than left to the wiring commit.

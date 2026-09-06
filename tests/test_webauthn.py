@@ -65,8 +65,13 @@ async def _enroll(
     *,
     label: str = "test key",
     auth: SoftAuthenticator | None = None,
-) -> SoftAuthenticator:
-    """Run a full real registration ceremony; returns the enrolled soft authenticator."""
+) -> tuple[SoftAuthenticator, str]:
+    """Run a full real registration ceremony.
+
+    Returns ``(authenticator, token)`` -- the token is the ROTATED one, because enrolling a passkey
+    marks the session MFA-satisfied and every elevation re-keys the session (ASVS 7.2.4). The one
+    passed in has stopped authenticating by the time this returns, so callers must take the new one.
+    """
     auth = auth or SoftAuthenticator(rp_id=RP, origin=ORIGIN)
     opts = json.loads(
         await service.begin_webauthn_registration(
@@ -74,7 +79,7 @@ async def _enroll(
         )
     )
     challenge = base64url_to_bytes(opts["challenge"])
-    ok = await service.finish_webauthn_registration(
+    elevation = await service.finish_webauthn_registration(
         identity,
         auth.create_response(challenge, transports=["usb"]),
         label=label,
@@ -82,19 +87,25 @@ async def _enroll(
         rp_id=RP,
         origin=ORIGIN,
     )
-    assert ok is True
-    return auth
+    assert elevation.ok is True and elevation.token is not None
+    return auth, elevation.token
 
 
 async def _assert_once(
     service: AuthService, token: str, auth: SoftAuthenticator, *, sign_count: int | None = None
-) -> bool:
+) -> tuple[bool, str]:
+    """Run one real assertion ceremony; returns ``(ok, the token to use next)``.
+
+    A successful assertion re-keys the session (ASVS 7.2.4), so the caller must rebind its token or
+    every later call runs against a hash that no longer resolves. A FAILED assertion rotates nothing
+    and the incoming token is handed straight back."""
     options = await service.begin_webauthn_assertion(token, rp_id=RP)
     assert options is not None
     challenge = base64url_to_bytes(json.loads(options)["challenge"])
-    return await service.finish_webauthn_assertion(
+    elevation = await service.finish_webauthn_assertion(
         token, auth.get_response(challenge, sign_count=sign_count), rp_id=RP, origin=ORIGIN
     )
+    return elevation.ok, (elevation.token or token)
 
 
 async def _events(service: AuthService, username: str) -> list[str]:
@@ -113,7 +124,7 @@ async def test_register_then_assert_e2e() -> None:
         status = await service.mfa_status(identity)
         assert status.webauthn_enrolled is False and status.required is False
 
-        auth = await _enroll(service, identity, token)
+        auth, token = await _enroll(service, identity, token)
         # Registration options exclude the enrolled credential on the next ceremony.
         opts = json.loads(
             await service.begin_webauthn_registration(
@@ -131,7 +142,8 @@ async def test_register_then_assert_e2e() -> None:
         # The enrolling session was marked MFA-verified (confirm_mfa_enrollment parity).
         assert await service.mfa_satisfied(token) is True
 
-        assert await _assert_once(service, token, auth) is True
+        ok, token = await _assert_once(service, token, auth)
+        assert ok is True
         actions = await _events(service, identity.username)
         assert "auth.webauthn_enrolled" in actions and "auth.webauthn_verified" in actions
     finally:
@@ -143,13 +155,14 @@ async def test_fresh_session_is_mfa_pending_until_assertion() -> None:
     try:
         service = await _service(store)
         identity, token, password = await _bootstrap_login(service)
-        auth = await _enroll(service, identity, token)
+        auth, token = await _enroll(service, identity, token)
 
         out = await service.login("admin", password)
         assert out.ok and out.token is not None
         fresh = out.token
         assert await service.mfa_satisfied(fresh) is False  # webauthn-enrolled ⇒ required
-        assert await _assert_once(service, fresh, auth) is True
+        ok, fresh = await _assert_once(service, fresh, auth)
+        assert ok is True
         assert await service.mfa_satisfied(fresh) is True
     finally:
         await store.close()
@@ -164,14 +177,16 @@ async def test_assertion_stamps_mfa_only_never_reauth() -> None:
     try:
         service = await _service(store)
         identity, token, password = await _bootstrap_login(service)
-        auth = await _enroll(service, identity, token)
+        auth, token = await _enroll(service, identity, token)
 
         out = await service.login("admin", password)
         fresh = out.token
         assert fresh is not None
         before = await store.get_session(hash_token(fresh))
         assert before is not None and before.reauth_at is None  # MFA-pending: no seeded step-up
-        assert await _assert_once(service, fresh, auth) is True
+        ok, fresh = await _assert_once(service, fresh, auth)
+        assert ok is True
+        # Read back under the ROTATED token: the assertion re-keyed the row.
         after = await store.get_session(hash_token(fresh))
         assert after is not None
         assert after.mfa_verified_at is not None
@@ -192,7 +207,7 @@ async def test_registration_rejects_wrong_origin() -> None:
         )
         challenge = base64url_to_bytes(opts["challenge"])
         evil = SoftAuthenticator(rp_id=RP, origin="http://evil")
-        ok = await service.finish_webauthn_registration(
+        elevation = await service.finish_webauthn_registration(
             identity,
             evil.create_response(challenge),
             label="evil",
@@ -200,7 +215,7 @@ async def test_registration_rejects_wrong_origin() -> None:
             rp_id=RP,
             origin=ORIGIN,
         )
-        assert ok is False  # origin binding — the phishing-resistance property
+        assert elevation.ok is False  # origin binding — the phishing-resistance property
         assert "auth.webauthn_failed" in await _events(service, identity.username)
         assert (await service.mfa_status(identity)).webauthn_enrolled is False
     finally:
@@ -216,16 +231,22 @@ async def test_sign_count_cas_clone_detection_nonzero() -> None:
         service = await _service(store)
         identity, token, _ = await _bootstrap_login(service)
         auth = SoftAuthenticator(rp_id=RP, origin=ORIGIN, sign_count=5)
-        await _enroll(service, identity, token, auth=auth)
+        _, token = await _enroll(service, identity, token, auth=auth)
 
-        assert await _assert_once(service, token, auth, sign_count=6) is True
+        # Each SUCCESSFUL assertion rotates, so the token is rebound through the chain; the failed
+        # ones rotate nothing and hand the same token straight back.
+        ok, token = await _assert_once(service, token, auth, sign_count=6)
+        assert ok is True
         # A cloned authenticator replays a non-advancing counter: py_webauthn rejects it and the
         # service audits the clone signal.
-        assert await _assert_once(service, token, auth, sign_count=6) is False
+        ok, token = await _assert_once(service, token, auth, sign_count=6)
+        assert ok is False
         assert "auth.webauthn_clone_suspected" in await _events(service, identity.username)
-        assert await _assert_once(service, token, auth, sign_count=5) is False
+        ok, token = await _assert_once(service, token, auth, sign_count=5)
+        assert ok is False
         # The genuine key advancing again is fine.
-        assert await _assert_once(service, token, auth, sign_count=7) is True
+        ok, token = await _assert_once(service, token, auth, sign_count=7)
+        assert ok is True
     finally:
         await store.close()
 
@@ -235,9 +256,10 @@ async def test_sign_count_zero_synced_passkey_accepted_repeatedly() -> None:
     try:
         service = await _service(store)
         identity, token, _ = await _bootstrap_login(service)
-        auth = await _enroll(service, identity, token)  # sign_count stays 0 (synced passkey)
+        auth, token = await _enroll(service, identity, token)  # sign_count 0 (synced passkey)
         for _ in range(3):
-            assert await _assert_once(service, token, auth, sign_count=0) is True
+            ok, token = await _assert_once(service, token, auth, sign_count=0)
+            assert ok is True
         creds = await store.list_webauthn_credentials(identity.user_id)
         assert creds[0].sign_count == 0 and creds[0].last_used_at is not None
     finally:
@@ -252,7 +274,7 @@ async def test_challenge_single_use_ttl_and_per_user_bound() -> None:
     try:
         service = await _service(store)
         identity, token, _ = await _bootstrap_login(service)
-        auth = await _enroll(service, identity, token)
+        auth, token = await _enroll(service, identity, token)
 
         # Single-use: the replay of an already-consumed challenge fails (covered E2E above); an
         # expired challenge fails legibly. Swap in a controllable clock.
@@ -262,10 +284,10 @@ async def test_challenge_single_use_ttl_and_per_user_bound() -> None:
         assert options is not None
         challenge = base64url_to_bytes(json.loads(options)["challenge"])
         clock[0] = wa.CHALLENGE_TTL_SECONDS + 1  # expire it
-        ok = await service.finish_webauthn_assertion(
+        expired = await service.finish_webauthn_assertion(
             token, auth.get_response(challenge, sign_count=0), rp_id=RP, origin=ORIGIN
         )
-        assert ok is False
+        assert expired.ok is False
         assert "auth.webauthn_failed" in await _events(service, identity.username)
 
         # A new ceremony overwrites the session's pending one: the FIRST challenge dies.
@@ -274,12 +296,10 @@ async def test_challenge_single_use_ttl_and_per_user_bound() -> None:
         o2 = await service.begin_webauthn_assertion(token, rp_id=RP)
         assert o1 is not None and o2 is not None
         c1 = base64url_to_bytes(json.loads(o1)["challenge"])
-        assert (
-            await service.finish_webauthn_assertion(
-                token, auth.get_response(c1, sign_count=0), rp_id=RP, origin=ORIGIN
-            )
-            is False
+        stale = await service.finish_webauthn_assertion(
+            token, auth.get_response(c1, sign_count=0), rp_id=RP, origin=ORIGIN
         )
+        assert stale.ok is False
 
         # Per-user cap evicts the user's OWN oldest — never another principal's (two-user
         # interleave); the global safety bound refuses with a cause-naming error.
@@ -336,7 +356,7 @@ async def test_duplicate_label_and_duplicate_credential_rejected() -> None:
     try:
         service = await _service(store)
         identity, token, _ = await _bootstrap_login(service)
-        auth = await _enroll(service, identity, token, label="mykey")
+        auth, token = await _enroll(service, identity, token, label="mykey")
 
         # Same label again (different authenticator) → legible refusal via the integrity path.
         opts = json.loads(
@@ -381,7 +401,7 @@ async def test_last_factor_delete_refused_while_required() -> None:
         # require_mfa targets local Administrators — the bootstrap admin qualifies.
         service = await _service(store, notifier=notifier, require_mfa=True)
         identity, token, _ = await _bootstrap_login(service)
-        await _enroll(service, identity, token)
+        _, token = await _enroll(service, identity, token)
         creds = await store.list_webauthn_credentials(identity.user_id)
         with pytest.raises(ValueError, match="enroll another factor first"):
             await service.delete_webauthn_credential(identity, creds[0].credential_id_hash)
@@ -396,7 +416,7 @@ async def test_last_factor_delete_notifies_when_not_required() -> None:
         notifier = _FakeNotifier()
         service = await _service(store, notifier=notifier)  # require_mfa off
         identity, token, _ = await _bootstrap_login(service)
-        await _enroll(service, identity, token)
+        _, token = await _enroll(service, identity, token)
         creds = await store.list_webauthn_credentials(identity.user_id)
 
         # Self-scoped: a foreign/unknown hash removes nothing.
@@ -417,7 +437,7 @@ async def test_admin_reset_mfa_clears_webauthn_credentials() -> None:
     try:
         service = await _service(store)
         identity, token, _ = await _bootstrap_login(service)
-        await _enroll(service, identity, token)
+        _, token = await _enroll(service, identity, token)
         await service.admin_reset_mfa(identity.user_id, actor="boss")
         assert await store.has_webauthn_credentials(identity.user_id) is False
         # Sessions were revoked (existing semantics unchanged).
@@ -433,14 +453,12 @@ async def test_assertion_failures_never_lock_the_account() -> None:
     try:
         service = await _service(store)
         identity, token, _ = await _bootstrap_login(service)
-        await _enroll(service, identity, token)
+        _, token = await _enroll(service, identity, token)
         for _ in range(10):
-            assert (
-                await service.finish_webauthn_assertion(
-                    token, '{"rawId": "garbage"}', rp_id=RP, origin=ORIGIN
-                )
-                is False
+            garbage = await service.finish_webauthn_assertion(
+                token, '{"rawId": "garbage"}', rp_id=RP, origin=ORIGIN
             )
+            assert garbage.ok is False
         user = await store.get_user(identity.user_id)
         assert user is not None
         assert user.locked_until is None and user.failed_attempts == 0
@@ -455,8 +473,8 @@ async def test_verify_mfa_stays_totp_specific() -> None:
     try:
         service = await _service(store)
         identity, token, _ = await _bootstrap_login(service)
-        await _enroll(service, identity, token)
-        assert await service.verify_mfa(token, "123456") is False
+        _, token = await _enroll(service, identity, token)
+        assert (await service.verify_mfa(token, "123456")).ok is False
         user = await store.get_user(identity.user_id)
         assert user is not None and user.failed_attempts == 0
     finally:
@@ -470,7 +488,7 @@ async def test_rp_mismatch_makes_credentials_unusable() -> None:
     try:
         service = await _service(store)
         identity, token, _ = await _bootstrap_login(service)
-        await _enroll(service, identity, token)
+        _, token = await _enroll(service, identity, token)
         assert await service.begin_webauthn_assertion(token, rp_id="other.example") is None
     finally:
         await store.close()

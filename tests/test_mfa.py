@@ -63,10 +63,12 @@ async def test_enroll_confirm_status_and_recovery_codes() -> None:
         assert enroll.secret and enroll.otpauth_uri.startswith("otpauth://totp/")
         assert (await service.mfa_status(identity)).enabled is False  # staged, not active
 
-        recovery = await service.confirm_mfa_enrollment(
+        enrolled = await service.confirm_mfa_enrollment(
             identity, fresh_totp(enroll.secret), token=token
         )
-        assert recovery is not None and len(recovery) == 10
+        assert enrolled.ok and len(enrolled.recovery_codes) == 10
+        token = enrolled.token  # the confirm re-keyed the session (ASVS 7.2.4)
+        assert token is not None
 
         status = await service.mfa_status(identity)
         assert status.enabled and status.recovery_codes_remaining == 10 and status.required
@@ -99,13 +101,16 @@ async def test_login_requires_second_factor_after_enrollment(
         assert await service.mfa_satisfied(out.token) is False  # step-up gate would 403
 
         wrong = "000000" if activating != "000000" else "111111"
-        assert await service.verify_mfa(out.token, wrong) is False
+        assert (await service.verify_mfa(out.token, wrong)).ok is False
         assert await service.mfa_satisfied(out.token) is False
         # The successful login verify must sit in a strictly later step than enrollment consumed.
         t1 = t0 + totp.DEFAULT_PERIOD
         pin_totp_clock(monkeypatch, t1)
-        assert await service.verify_mfa(out.token, totp.totp(enroll.secret, now=t1)) is True
-        assert await service.mfa_satisfied(out.token) is True
+        verified = await service.verify_mfa(out.token, totp.totp(enroll.secret, now=t1))
+        assert verified.ok is True
+        # Read the satisfied state on the ROTATED token: the verify re-keyed the session (7.2.4),
+        # so out.token no longer resolves and would report False for the wrong reason.
+        assert await service.mfa_satisfied(verified.token) is True
     finally:
         await store.close()
 
@@ -127,14 +132,14 @@ async def test_enrollment_consumes_the_activating_step(monkeypatch: pytest.Monke
         pin_totp_clock(monkeypatch, t0)
         activating = totp.totp(enroll.secret, now=t0)
         # Confirm succeeds and consumes step S0 (returns the recovery codes, not None).
-        assert await service.confirm_mfa_enrollment(identity, activating, token=_token) is not None
+        assert (await service.confirm_mfa_enrollment(identity, activating, token=_token)).ok
 
         # A fresh login, then replay the SAME activating code while still pinned to step S0: refused,
         # because enrollment already consumed S0 (the login path advances the high-water mark to S0
         # at enroll, so this replay resolves to a non-greater step).
         out = await service.login("admin", password)
         assert out.token is not None
-        assert await service.verify_mfa(out.token, activating) is False
+        assert (await service.verify_mfa(out.token, activating)).ok is False
         assert await service.mfa_satisfied(out.token) is False
     finally:
         await store.close()
@@ -161,20 +166,23 @@ async def test_recovery_code_single_use() -> None:
         service = AuthService(store, AuthSettings(mfa_recovery_code_count=3))
         identity, token, password = await _bootstrap_login(service)
         enroll = await service.begin_mfa_enrollment(identity)
-        codes = await service.confirm_mfa_enrollment(
+        enrolled = await service.confirm_mfa_enrollment(
             identity, fresh_totp(enroll.secret), token=token
         )
-        assert codes is not None and len(codes) == 3
+        assert enrolled.ok and len(enrolled.recovery_codes) == 3
+        codes = enrolled.recovery_codes
 
         out = await service.login("admin", password)
         assert out.token is not None
-        assert await service.verify_mfa(out.token, codes[0]) is True  # consumes it
+        assert (await service.verify_mfa(out.token, codes[0])).ok is True  # consumes it
         assert (await service.mfa_status(identity)).recovery_codes_remaining == 2
 
         out2 = await service.login("admin", password)
         assert out2.token is not None
-        assert await service.verify_mfa(out2.token, codes[0]) is False  # reuse rejected
-        assert await service.verify_mfa(out2.token, codes[1]) is True  # a fresh one still works
+        assert (await service.verify_mfa(out2.token, codes[0])).ok is False  # reuse rejected
+        assert (
+            await service.verify_mfa(out2.token, codes[1])
+        ).ok is True  # a fresh one still works
     finally:
         await store.close()
 
@@ -201,12 +209,12 @@ async def test_totp_code_is_single_use_within_its_window(
         code = totp.totp(enroll.secret, now=t1)
         out = await service.login("admin", password)
         assert out.token is not None
-        assert await service.verify_mfa(out.token, code) is True  # consumes the step
+        assert (await service.verify_mfa(out.token, code)).ok is True  # consumes the step
 
         out2 = await service.login("admin", password)
         assert out2.token is not None
         # Same code, still inside its window, fresh session → rejected (replay within the window).
-        assert await service.verify_mfa(out2.token, code) is False
+        assert (await service.verify_mfa(out2.token, code)).ok is False
     finally:
         await store.close()
 
@@ -247,7 +255,9 @@ async def test_disable_and_admin_reset_clear_mfa(monkeypatch: pytest.MonkeyPatch
         t0 = 1_000_000.0
         pin_totp_clock(monkeypatch, t0)
         activating = totp.totp(enroll.secret, now=t0)
-        await service.confirm_mfa_enrollment(identity, activating, token=token)
+        first = await service.confirm_mfa_enrollment(identity, activating, token=token)
+        assert first.ok and first.token is not None
+        token = first.token  # re-keyed by the confirm; the re-enroll below needs the live token
 
         await service.disable_mfa(identity)
         assert (await service.mfa_status(identity)).enabled is False
@@ -265,7 +275,7 @@ async def test_disable_and_admin_reset_clear_mfa(monkeypatch: pytest.MonkeyPatch
         reenrolled = await service.confirm_mfa_enrollment(
             identity, totp.totp(enroll2.secret, now=t1), token=token
         )
-        assert reenrolled is not None
+        assert reenrolled.ok
         assert (await service.mfa_status(identity)).enabled is True
         await service.admin_reset_mfa(identity.user_id, actor="admin")
         assert (await service.mfa_status(identity)).enabled is False
@@ -322,17 +332,18 @@ async def test_recovery_code_consume_is_atomic_under_concurrency() -> None:
         service = AuthService(store, AuthSettings(mfa_recovery_code_count=3))
         identity, token, password = await _bootstrap_login(service)
         enroll = await service.begin_mfa_enrollment(identity)
-        codes = await service.confirm_mfa_enrollment(
+        enrolled = await service.confirm_mfa_enrollment(
             identity, fresh_totp(enroll.secret), token=token
         )
-        assert codes is not None
+        assert enrolled.ok
+        codes = enrolled.recovery_codes
 
         outs = [await service.login("admin", password) for _ in range(5)]
         tokens = [o.token for o in outs]
         assert all(tokens)
 
         results = await asyncio.gather(*(service.verify_mfa(t, codes[0]) for t in tokens))
-        assert sum(1 for r in results if r) == 1  # exactly one caller wins the single-use code
+        assert sum(1 for r in results if r.ok) == 1  # one caller wins the single-use code
         assert (await service.mfa_status(identity)).recovery_codes_remaining == 2  # consumed once
     finally:
         await store.close()
@@ -363,14 +374,15 @@ async def test_spending_a_recovery_code_is_audited_distinguishably_and_notified(
         # are indistinguishable, and the assertion below passes either way.
         await store.set_user_notify_email(identity.user_id, email="admin-notify@example.org")
         enroll = await service.begin_mfa_enrollment(identity)
-        codes = await service.confirm_mfa_enrollment(
+        enrolled = await service.confirm_mfa_enrollment(
             identity, fresh_totp(enroll.secret), token=token
         )
-        assert codes is not None and len(codes) == 2
+        assert enrolled.ok and len(enrolled.recovery_codes) == 2
+        codes = enrolled.recovery_codes
 
         out = await service.login("admin", password)
         assert out.token is not None
-        assert await service.verify_mfa(out.token, codes[0], client="10.0.0.7") is True
+        assert (await service.verify_mfa(out.token, codes[0], client="10.0.0.7")).ok is True
 
         spent = [e for e in notifier.events if e.event_type == RECOVERY_CODE_USED]
         assert len(spent) == 1
@@ -425,14 +437,13 @@ async def test_an_ordinary_totp_verify_spends_no_recovery_code_and_announces_not
             await service.confirm_mfa_enrollment(
                 identity, totp.totp(enroll.secret, now=t0), token=token
             )
-            is not None
-        )
+        ).ok
 
         out = await service.login("admin", password)
         assert out.token is not None
         t1 = t0 + totp.DEFAULT_PERIOD
         pin_totp_clock(monkeypatch, t1)
-        assert await service.verify_mfa(out.token, totp.totp(enroll.secret, now=t1)) is True
+        assert (await service.verify_mfa(out.token, totp.totp(enroll.secret, now=t1))).ok is True
 
         assert [e for e in notifier.events if e.event_type == RECOVERY_CODE_USED] == []
         assert [
@@ -455,16 +466,17 @@ async def test_the_losing_racer_reports_no_second_consumption() -> None:
         )
         identity, token, password = await _bootstrap_login(service)
         enroll = await service.begin_mfa_enrollment(identity)
-        codes = await service.confirm_mfa_enrollment(
+        enrolled = await service.confirm_mfa_enrollment(
             identity, fresh_totp(enroll.secret), token=token
         )
-        assert codes is not None
+        assert enrolled.ok
+        codes = enrolled.recovery_codes
 
         outs = [await service.login("admin", password) for _ in range(5)]
         tokens = [o.token for o in outs]
         assert all(tokens)
         results = await asyncio.gather(*(service.verify_mfa(t, codes[0]) for t in tokens))
-        assert sum(1 for r in results if r) == 1
+        assert sum(1 for r in results if r.ok) == 1
 
         assert len([e for e in notifier.events if e.event_type == RECOVERY_CODE_USED]) == 1
         assert (
@@ -495,10 +507,10 @@ async def test_mfa_failures_trip_the_per_account_lockout() -> None:
         good = totp.totp(enroll.secret)
         wrong = "000000" if good != "000000" else "111111"
         for _ in range(5):  # exhaust lockout_threshold with wrong codes
-            assert await service.verify_mfa(out.token, wrong) is False
+            assert (await service.verify_mfa(out.token, wrong)).ok is False
 
         # The account is now locked: even a CORRECT code is refused...
-        assert await service.verify_mfa(out.token, fresh_totp(enroll.secret)) is False
+        assert (await service.verify_mfa(out.token, fresh_totp(enroll.secret))).ok is False
         # ...and the lock is shared with the password path (a fresh login is locked too).
         relogin = await service.login("admin", password)
         assert relogin.ok is False and relogin.error == "account locked"
