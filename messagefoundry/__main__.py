@@ -1987,6 +1987,37 @@ def _serve(args: argparse.Namespace) -> int:
                 f"{loopback_note}",
                 file=sys.stderr,
             )
+        # --- BACKLOG #1181 (ASVS 12.3.5): the ONE Posture-B attestation the engine can check --------
+        # "mtls" says the proxy PRESENTS A CLIENT CERTIFICATE on this hop. The engine is the far end of
+        # that hop, and it verifies a client certificate in exactly one configuration: with
+        # [api].tls_client_ca_file set, api/tls.py loads the anchor and sets ssl.CERT_REQUIRED. With no
+        # client CA the engine verifies nothing, so its own configuration CONTRADICTS the declaration —
+        # and that is the one contradiction visible from here. The other two values name controls that
+        # live entirely outside the process (a segment, a header a proxy injects); nothing the engine
+        # can read decides them, which is why they get no arm.
+        #
+        # WARNS, NEVER REFUSES, and the reason is a real topology rather than caution: a sidecar or
+        # stunnel on the same host can terminate the proxy's mTLS in front of the engine, leaving a
+        # genuinely mutually-authenticated hop that the engine sees as plaintext loopback. A refusal
+        # would be wrong there, and would be a refusal purchased on an unobservable premise.
+        #
+        # THIS IS A DIAGNOSTIC, NOT ENFORCEMENT. The setting remains an attestation: no byte on any wire
+        # changes with its value, and docs/CONFIGURATION.md still says so. It exists to stop the engine
+        # staying silent while a control reports itself on and does nothing.
+        if (
+            settings.api.proxy_intra_service_auth == "mtls"
+            and not settings.api.tls_client_ca_file
+            and data_class is DataClass.PHI
+        ):
+            print(
+                "warning: [api].proxy_intra_service_auth is declared 'mtls' but this engine verifies "
+                "no client certificate — [api].tls_client_ca_file is unset, so nothing here checks the "
+                "proxy's identity. If the proxy terminates its mTLS at a sidecar in front of the "
+                "engine, this is expected; otherwise set [api].tls_cert_file + [api].tls_client_ca_file "
+                "so the engine itself requires and verifies the proxy's certificate. The declaration is "
+                "an attestation either way — the engine enforces nothing on this hop.",
+                file=sys.stderr,
+            )
 
     # The browser ops console ([api].serve_ui, ADR 0065) is a SEPARATE optional wheel
     # (messagefoundry-webconsole) mounted same-origin in-process. Refuse serve_ui when it is absent with

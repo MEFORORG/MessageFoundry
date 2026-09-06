@@ -16,7 +16,8 @@ pure stdlib ``re``) so bundled logs get exactly the same HL7-segment / field-run
 coverage as stored ``last_error``/log lines — instead of a second, narrower copy that drifts out of sync
 (DELTA-07). This module adds the **secret** markers the engine redactor does not carry — at least
 ``mfb64:`` bodies, ``MEFOR_*`` values, bearer/authorization tokens, ``password=``/``PWD=``/``secret=``
-pairs, an inline DSN password, and a long base64 run as the backstop.
+pairs, an inline DSN password, and a long base64 run as the backstop. A credential label may carry a
+dotted/underscored/hyphenated prefix (``client_secret=``, ``bearer_token=``) — see ``_LABEL_PREFIX``.
 
 **Which patterns exist is not a claim to be read off this docstring.** Every pattern
 :func:`redact_log_line` applies is derived by AST in ``tests/test_log_redaction_secret_domain.py`` and
@@ -42,6 +43,21 @@ REDACTION_PLACEHOLDER = "[REDACTED]"
 # A base64 binary-carriage marker (ADR 0028) and the embedded blob that follows it: definitely a body.
 _MFB64 = re.compile(r"mfb64:v1:[A-Za-z0-9+/=]+")
 
+# An optional dotted / underscored / hyphenated PREFIX on a credential label, so a snake_case label
+# reaches the keyword at its tail.
+#
+# ``\b`` DOES NOT FIRE AFTER AN UNDERSCORE, because ``_`` is a word character. Without this prefix the
+# label patterns below could only ever match a credential word standing alone — which is not how this
+# engine names its credentials. ``client_secret``, ``bearer_token``, ``basic_password``,
+# ``ad_bind_password`` and ``tls_key_password`` are all real identifiers in this tree, and every one of
+# them survived the redactor verbatim (BACKLOG #1183, re-verified 2026-09-06). The engine's own setting
+# vocabulary was the shape its log redactor could not see.
+#
+# Each segment must END in a separator, so the prefix cannot cross a space, a ";" in an ODBC string or
+# any other delimiter — it widens the LABEL only, never the value span. It is spliced into group 1 of
+# both patterns below so ``_keep_label`` still prints the whole label a reviewer needs to see.
+_LABEL_PREFIX = r"(?:[A-Za-z0-9]+[._-])*"
+
 # A bearer/authorization token or an opaque session token in a header-ish or "token=" shape.
 #
 # The ``(?:bearer|basic|digest)\s+`` group is load-bearing, not decoration: without it ``\S+`` matches
@@ -49,7 +65,7 @@ _MFB64 = re.compile(r"mfb64:v1:[A-Za-z0-9+/=]+")
 # "Bearer" and emitted <tok> verbatim. Making the group optional keeps the plain "token=<tok>" shape
 # working, and the value class excludes quotes so a quoted credential loses the value, not the quote.
 _BEARER = re.compile(
-    r"(?i)\b(bearer|authorization|token|session|api[_-]?key)\b"
+    r"(?i)\b(" + _LABEL_PREFIX + r"(?:bearer|authorization|token|session|api[_-]?key))\b"
     r"\s*[:=]\s*(?:(?:bearer|basic|digest)\s+)?['\"]?[^\s'\"]+"
 )
 
@@ -80,7 +96,8 @@ _MEFOR_SECRET = re.compile(r"\b(MEFOR_[A-Z0-9_]+)\b['\"]?\s*[:=]\s*['\"]?[^\s'\"
 # cache keys, dictionary keys all appear as "key=" in log text — so it would discriminate nothing. The
 # credential-bearing spelling "api_key" is carried by ``_BEARER`` instead.
 _CREDENTIAL_KV = re.compile(
-    r"(?i)\b(pass(?:word|wd|phrase)?|pwd|secret|credential)\b['\"]?\s*[:=]\s*['\"]?[^\s'\";,&]+"
+    r"(?i)\b(" + _LABEL_PREFIX + r"(?:pass(?:word|wd|phrase)?|pwd|secret|credential))\b"
+    r"['\"]?\s*[:=]\s*['\"]?[^\s'\";,&]+"
 )
 
 # An inline password in a URL-shaped DSN: "postgres://user:<pw>@host/db". The scheme and the user

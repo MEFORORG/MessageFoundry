@@ -146,6 +146,24 @@ FAMILIES: tuple[Family, ...] = (
         secret="pw-C4st_Val-66",
         patterns=("_MEFOR_SECRET",),
     ),
+    # --- families that survived VERBATIM at ebdfa44a6 (BACKLOG #1183, ASVS packet C) ---------------
+    # The engine's OWN credential vocabulary is snake_case, and ``\b`` does not fire after an
+    # underscore, so a label like ``ad_bind_password=`` never reached the keyword at its tail. Measured
+    # leaking verbatim: ``client_secret``, ``bearer_token``, ``basic_password``, ``ad_bind_password``,
+    # ``tls_key_password`` and ``vault_token`` — five of the six are real identifiers in this tree.
+    # ONE family per widened pattern, because that is what the mutation fixture below can prove.
+    Family(
+        name="snake_case_credential_label",
+        line="ldap bind failed ad_bind_password=pw-Ad_Bind-77 for svc",
+        secret="pw-Ad_Bind-77",
+        patterns=("_CREDENTIAL_KV",),
+    ),
+    Family(
+        name="snake_case_token_label",
+        line="rest connector configured bearer_token=tk-Rest_Tok-88",
+        secret="tk-Rest_Tok-88",
+        patterns=("_BEARER",),
+    ),
 )
 
 
@@ -253,6 +271,11 @@ ORDINARY_DIAGNOSTICS = (
     "SOAP ws_password_type must be 'text' (ADR 0015, BACKLOG #1171)",
     "INFO engine started on port 8765",
     "connection IB_DEMO_ADT bound, password rotation scheduled",
+    # The label-prefix widening (BACKLOG #1183) reaches a credential word at the TAIL of a snake_case
+    # label. These two carry the word in the MIDDLE, where the trailing "\b" cannot fire, so a path
+    # and a mode name survive — the widening must not turn a filename into a redaction.
+    "password_file=/etc/mefor/pw.txt",
+    "ws_password_type=text on the SOAP hop",
 )
 
 
