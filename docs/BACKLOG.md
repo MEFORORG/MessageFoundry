@@ -11752,8 +11752,8 @@ Nothing here touches the TLS/FTPS context in the same module, which was already 
 
 **Proposed work, unallocated and by subject:** the owner ruling, put with both governing records and the table together since neither record cites the other; the residual factual correction, owed regardless; striking the vault-in-scope trigger as measured; the public risky-component designation document with its criterion stated and its assessed-but-not-designated set named; the denominator re-derivation that must precede it; and a drift guard for that document reading a TRACKED path, on the anchor-registry-plus-self-test pattern the existing guard already uses.
 
-**Measured 2026-09-06 -- the denominator re-derivation, and NO designation document, because the
-ruling is still owed.** The row asks for the public risky-component designation to be preceded by a
+**Measured 2026-09-06 -- the denominator re-derivation.** _(Superseded in part: the ruling came the
+same day and the document is now BUILT. See the entry below.)_ The row asks for the public risky-component designation to be preceded by a
 denominator re-derivation, "because a manifest-only enumeration is structurally short". It is, and
 here is the size of it: the manifest names **19** core distributions directly, the core runtime
 closure is **41**, and the committed `requirements.lock` holds **100**. Naming every extra raises the
@@ -11762,10 +11762,37 @@ denominator, and any designation must state which one it means. **The 100 is NOT
 must not be quoted as one** -- `requirements.lock`'s own header records `uv export --all-extras`, so
 it carries the `dev` extra and its transitive closure; all seven dev tool names resolve inside it.
 The three figures were taken from `uv export` with and without extras and reconciled against the
-committed lock, which matched the all-extras export by name set exactly. A builder cannot ask and
-wait for the owner ruling this row needs, so no designation document was written. The empty tracked
+committed lock, which matched the all-extras export by name set exactly. At the time of this measurement no designation
+document had been written, because a Builder cannot ask and wait for a ruling. The empty tracked
 `security/vex/messagefoundry.openvex.json` was deliberately left empty: the row names populating it
 as explicitly not an honest pass, and it still is not. [PR 942](https://github.com/MEFORORG/MessageFoundry/pull/942).
+
+**BUILT 2026-09-06, after the owner ruled the scope: the core runtime closure.** The ruling settled
+the question this row was blocked on, and `docs/RISKY-COMPONENTS.md` is the designation. It assesses
+**41** distributions -- what a default install actually executes, transitive dependencies included,
+no extras and no development toolchain -- and states the denominator table on its face, because the
+choice moves the answer by about half. **The 100 in `requirements.lock` must never be quoted as a
+runtime figure**: that file is an `--all-extras` export and carries the dev toolchain. The criterion
+is stated and checkable -- hostile input, secrets and trust, or protocol termination -- with native
+compiled code an aggravating factor inside a tier rather than a tier of its own. **Twenty-six of the
+forty-one are designated, and the proportion is the finding rather than an embarrassment:** this is
+an integration engine, so parsing traffic from partners it does not control and terminating network
+protocols is most of what its runtime closure does. The **assessed-but-not-designated** set is named
+in full with a reason each, which is the half a designation list alone cannot supply, and the page
+prints its own arithmetic so a reader can confirm the set is closed without counting rows.
+`security/runtime-closure-core.txt` is a new tracked anchor, added because that denominator was
+**not recoverable from any other tracked artifact**. The drift guard the row asks for is
+`tests/test_risky_component_designation.py`: it fails in BOTH directions -- an unclassified new
+dependency, a classified name that is no longer a dependency, a package in both tables, or a printed
+count the tables no longer support -- cross-checks the closure against `requirements.lock` for
+containment rather than equality, and leads with a positive control, since "every closure member is
+classified" passes vacuously against an empty parse. Both controls were run and both fire.
+**The guard caught a defect in ITSELF on its first run**, reading the scope table's
+`requirements.lock` row as a designation and reporting 27 instead of 26; the parser now starts at the
+first tier heading, and that is recorded in the code because a count inflated by its own instrument
+is precisely what this file exists to prevent. Still open on this row: the residual factual
+correction, striking the void vault-in-scope trigger, and the extras, which this page does not cover
+and says so. [PR 942](https://github.com/MEFORORG/MessageFoundry/pull/942).
 
 ## 1190. research an honest pass for ASVS 15.1.5 -- which dangerous-functionality classes can be highlighted publicly without becoming the roadmap
 
