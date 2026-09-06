@@ -24,6 +24,8 @@ from messagefoundry_webconsole._auth import (
     BROWSER_HARDENING_OPT_OUT_ENV,
     clear_oidc_flow_cookie,
     clear_session_cookie,
+    oidc_flow_cookie_name,
+    session_cookie_name,
     set_oidc_flow_cookie,
     set_session_cookie,
 )
@@ -468,6 +470,91 @@ def test_session_clear_follows_exposure_protected_not_only_the_wire_scheme() -> 
     clear_session_cookie(cleared, request)
     assert "secure" in _guards(written)[1]  # control: the set really does key on the declaration
     assert _guards(cleared) == _guards(written)
+
+
+# --- BACKLOG #1118 / ASVS 3.3.3: the prefix on the one topology that still speaks cleartext -------
+
+
+def test_upstream_terminator_emits_the_host_prefixed_names_over_a_cleartext_wire() -> None:
+    """Both cookies carry the ``__Host-`` prefix on the ``tls_terminated_upstream`` topology, whose
+    wire scheme is http.
+
+    ADR 0172 makes the engine always serve TLS, so the shipped default is https and the prefix falls
+    out of code that was already correct. The declared-proxy topology is the one ADR 0172 excludes:
+    the proxy terminates TLS in front and speaks plaintext to the engine, so minting here would break
+    the proxy's own hop and the engine mints nothing. The BROWSER's origin is still https, which is
+    what the prefix is about, and ``effective_https`` reaches that fact only through its
+    ``exposure_protected`` disjunct.
+
+    **Why the NAME needs its own arm.** The sibling above builds this exact posture but grades Secure
+    and set/clear symmetry. Deleting the disjunct does turn it red -- measured -- yet it reports a
+    lost Secure attribute, which sends a reader to the wrong conjunct. Nothing anywhere asserted what
+    the name IS on the one topology that still reaches the app over a cleartext wire, and every other
+    cleartext test in this file runs with ``exposure_protected`` false.
+    """
+    proxied = _cookie_request("http", exposure_protected=True)
+    session = StarletteResponse()
+    set_session_cookie(session, "a-token", request=proxied)
+    flow = StarletteResponse()
+    set_oidc_flow_cookie(flow, "a-flow-id", request=proxied, max_age=300)
+    assert _guards(session)[0] == "__Host-mf_session"
+    assert _guards(flow)[0] == "__Host-mf_oidc_flow"
+
+    # NEGATIVE CONTROL -- the same cleartext wire with NO declaration is a genuinely plaintext bind,
+    # where the bare name is correct: a browser rejects a `__Host-` cookie that is not Secure. Without
+    # this arm the assertions above would also pass if the resolver had been hard-coded to the prefix.
+    plain = _cookie_request("http", exposure_protected=False)
+    bare_session = StarletteResponse()
+    set_session_cookie(bare_session, "a-token", request=plain)
+    bare_flow = StarletteResponse()
+    set_oidc_flow_cookie(bare_flow, "a-flow-id", request=plain, max_age=300)
+    assert _guards(bare_session)[0] == "mf_session"
+    assert _guards(bare_flow)[0] == "mf_oidc_flow"
+    assert "secure" not in _guards(bare_session)[1]  # and it is Secure-less, which is why
+
+
+_NAME_POSTURES = [
+    pytest.param("https", False, True, id="shipped-default-https"),
+    pytest.param("http", True, True, id="upstream-terminator"),
+    pytest.param("http", False, True, id="genuinely-plaintext"),
+    pytest.param("https", False, False, id="https-org-opt-out"),
+]
+
+
+@pytest.mark.parametrize(("scheme", "exposure", "hardening"), _NAME_POSTURES)
+def test_the_name_a_response_writes_is_the_name_a_later_request_reads(
+    scheme: str, exposure: bool, hardening: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """On every posture the SET writes the same cookie name the READ looks for (BACKLOG #1118).
+
+    ``session_cookie_name`` calls itself "the ONE resolver every set/clear/read site threads through,
+    so the name a response writes and the name a later request reads always agree". The clear and read
+    sites did thread through it; **the two SET sites recomputed the same expression inline**, so the
+    guarantee the docstring asserted did not structurally exist -- a compensating control resting on a
+    false premise (SDS-3.7). The expressions agreed, so nothing was wrong on the wire; an edit to
+    either copy alone is what this closes.
+
+    The failure that split would produce is silent and total: the browser holds the name the set
+    wrote, ``session_token`` asks for the name the resolver returns, finds nothing, and the operator
+    is bounced back to login forever with no error naming a cause.
+    """
+    if hardening:
+        monkeypatch.delenv(BROWSER_HARDENING_OPT_OUT_ENV, raising=False)
+    else:
+        monkeypatch.setenv(BROWSER_HARDENING_OPT_OUT_ENV, "1")
+    request = _cookie_request(scheme, exposure_protected=exposure)
+
+    session = StarletteResponse()
+    set_session_cookie(session, "a-token", request=request)
+    flow = StarletteResponse()
+    set_oidc_flow_cookie(flow, "a-flow-id", request=request, max_age=300)
+
+    assert _guards(session)[0] == session_cookie_name(request)
+    assert _guards(flow)[0] == oidc_flow_cookie_name(request)
+    # VACUITY CONTROL: the resolver is not a constant across this parametrisation, so the equalities
+    # above are comparing something that actually moves.
+    expected_prefixed = (scheme == "https" or exposure) and hardening
+    assert session_cookie_name(request).startswith("__Host-") is expected_prefixed
 
 
 async def test_opt_out_logout_over_https_still_deletes_with_secure(

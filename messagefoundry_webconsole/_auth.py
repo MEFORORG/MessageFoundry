@@ -772,10 +772,12 @@ def set_session_cookie(response: Response, token: str, *, request: Request) -> N
     handshake at the root can carry it (M2); the cookie is only ever *read* by ``require_ui`` on /ui
     routes, never by the JSON API deps.
     """
+    # BACKLOG #1118: the NAME comes from the shared resolver, not a second copy of its expression.
+    # `secure` stays its own `effective_https` call because the two are DIFFERENT conjuncts -- see
+    # `clear_session_cookie` for why #1117 forbids inferring one from the other.
     secure = effective_https(request.app.state, request.url.scheme)
-    name = HOST_COOKIE_NAME if (secure and browser_hardening_enabled()) else COOKIE_NAME
     response.set_cookie(
-        name,
+        session_cookie_name(request),
         token,
         httponly=True,
         samesite="strict",
@@ -858,10 +860,11 @@ def set_oidc_flow_cookie(
     ``max_age`` bounds it to the server-side flow TTL so an abandoned login does not leave a cookie
     behind indefinitely.
     """
+    # BACKLOG #1118: the NAME comes from the shared resolver -- see `set_session_cookie` for why
+    # `secure` is still computed separately rather than inferred from it.
     secure = effective_https(request.app.state, request.url.scheme)
-    name = HOST_FLOW_COOKIE_NAME if (secure and browser_hardening_enabled()) else FLOW_COOKIE_NAME
     response.set_cookie(
-        name,
+        oidc_flow_cookie_name(request),
         flow_id,
         max_age=max_age,
         httponly=True,

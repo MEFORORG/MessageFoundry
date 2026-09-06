@@ -30,13 +30,16 @@ import httpx
 import pytest
 
 from scripts.security import dast_target as dast_target_module
+from scripts.security import route_gates
 from scripts.security.dast_auth_sweep import (
     INDEPENDENCE_NOTICE,
+    _write_pass,
     annotation_level,
     evaluate,
     is_refused,
     load_policy,
     main,
+    write_probe_outcome,
 )
 from scripts.security.dast_target import (
     ADMIN_USERNAME,
@@ -113,12 +116,34 @@ def test_receipt_names_what_it_examined(clean_run: tuple[int, dict[str, Any]]) -
     )
     assert receipt["bfla_probes"] >= 15, receipt["bfla_probes"]
 
-    # Partiality is stated, never implied away: the receipt prints the probed/candidate ratio.
-    assert receipt["bfla_probes"] <= receipt["bfla_candidate_rows_total"]
-    assert receipt["bfla_candidate_rows_total"] > receipt["bfla_probes"], (
-        "increment 1 probes only the GET subset of the BFLA candidates; if that is no longer true the "
-        "receipt's ratio claim needs revisiting rather than silently becoming a completeness claim."
+    # BFLA coverage of the candidate set is now whole, and it is asserted as an EQUATION over numbers
+    # the run derived from the live route table — never against a hand-counted total. Increment 1
+    # probed the GET subset and printed a ratio; the write pass closed the remainder, so the honest
+    # claim moved from "19 of about 60" to "every candidate row the walk derived". A new verb class
+    # landing unprobed breaks the equation rather than quietly shrinking the denominator.
+    assert (
+        receipt["bfla_probes"] + receipt["write_bfla_probes"]
+        == (receipt["bfla_candidate_rows_total"])
+    ), (
+        f"{receipt['bfla_probes']} GET + {receipt['write_bfla_probes']} write BFLA probes do not "
+        f"account for all {receipt['bfla_candidate_rows_total']} candidate rows. Some candidate is "
+        "reaching neither pass, and the receipt's coverage line would overstate what was examined."
     )
+    assert receipt["write_bfla_probes"] >= 35, receipt["write_bfla_probes"]
+    assert receipt["write_reached"] >= 40, (
+        f"only {receipt['write_reached']} gated non-GET operation(s) admitted the administrator "
+        "identity; the write reach pass is measuring a wall, not authorization."
+    )
+
+    # The positive control for "the write passes are a real extension": there must BE non-GET gated
+    # rows. Without this, a route table that lost every write verb would satisfy every assertion above
+    # by probing nothing — the exact shape this whole module is organised against.
+    assert receipt["write_rows"] > 0 and receipt["write_bfla_candidate_rows_total"] > 0, receipt
+
+    # The side-effect accounting is the write passes' safety claim, so it must add up to the rows
+    # probed rather than being a decorative count.
+    outcomes = receipt["write_probe_outcomes"]
+    assert sum(outcomes.values()) == receipt["write_rows"], outcomes
 
     # The scan RELAXES five controls to stay deterministic. The receipt must print every relaxation, so
     # no reader can mistake the scanned posture for the shipped default.
@@ -300,7 +325,17 @@ def test_canary_bfla_is_detected(tmp_path: Path) -> None:
         "the bfla canary must inject ONLY an authorization defect; a negative finding here means it "
         "also broke authentication, and the two canaries would no longer be independent"
     )
-    assert all(f["pass_name"] == "bfla" for f in receipt["findings"])
+
+    # BOTH BFLA detectors must be shown to see the injected defect, not just one. A canary red on the
+    # GET half alone would certify a write pass that had gone blind — the failure mode a shared
+    # violation count hides, and the reason the two carry separate canary floors.
+    assert receipt["write_bfla_violations"] >= 10, receipt["write_bfla_violations"]
+    classes = {f["pass_name"] for f in receipt["findings"]}
+    assert classes == {"bfla", "bfla-write"}, (
+        f"the bfla canary produced finding classes {sorted(classes)}. It must red BOTH BFLA passes "
+        "and nothing else: another class means the injected defect is no longer confined to "
+        "authorization, and a missing one means that pass detected nothing."
+    )
 
 
 # =====================================================================================================
@@ -419,12 +454,219 @@ def test_a_policy_without_floors_fails_closed(tmp_path: Path) -> None:
             "negative_probes": 198,
             "reached": 46,
             "bfla_probes": 19,
+            "write_reached": 47,
+            "write_bfla_probes": 43,
             "ungated_routes": policy["anonymous_allowlist"],
         },
         policy,
     )
     assert code == 2
     assert any("declares no floor" in line for line in errors), errors
+
+
+# =====================================================================================================
+# The write passes — a probe that carries a valid token and really executes
+# =====================================================================================================
+
+
+async def test_a_session_destroying_write_probe_does_not_poison_the_rows_after_it() -> None:
+    """THE REGRESSION THE WRITE PASSES EXIST AROUND, driven end to end against the real listener.
+
+    ``POST /auth/logout`` answers a valid administrator bearer with 200 and revokes the session. In a
+    naive write pass every row probed after it answers 401, scores as refused, and lands as an
+    unexplained-unreached finding: measured, one real side effect manufactured 44 false ones and
+    collapsed the reach number the whole tier is built on.
+
+    So ``_write_pass`` re-checks the session after every probe and re-mints it. Logout is placed FIRST
+    here on purpose — the defect only shows when a destroyer precedes other rows, and pinning it to
+    wherever logout happens to sit in route order would make this case a hostage to route ordering.
+
+    The NEGATIVE CONTROL is the half that makes the rest evidence: the original token is re-probed at
+    the end and must now be rejected. Without it, a logout that had quietly stopped revoking sessions
+    would produce the same green result, and this test would be guarding a shape that cannot occur.
+    """
+    async with dast_target() as target:
+        gated = route_gates.gated_http_rows(target.app)
+        logout = next(r for r in gated if r.method == "POST" and r.path == "/auth/logout")
+        followers = [r for r in gated if r.method != "GET" and r.path != "/auth/logout"][:6]
+        assert followers, "no non-GET rows follow the destroyer, so this case proves nothing"
+
+        original = target.admin_token
+        rebuilt: list[str] = []
+        async with httpx.AsyncClient(base_url=target.base_url, timeout=30.0) as client:
+            results = await _write_pass(
+                client,
+                [logout, *followers],
+                target=target,
+                username=ADMIN_USERNAME,
+                token=original,
+                placeholder=route_gates.PATH_PARAM_PLACEHOLDER,
+                max_rebuilds=5,
+                rebuilt=rebuilt,
+            )
+
+            assert rebuilt == ["POST /auth/logout"], (
+                f"expected the logout probe to be recorded as destroying the session, got {rebuilt}"
+            )
+            after = [(row.method, row.path, status) for row, status in results[1:]]
+            assert all(status != 401 for _m, _p, status in after), (
+                f"rows probed after the session-destroying one answered 401: {after}. The re-mint did "
+                "not happen, so every one of them would be counted as refused."
+            )
+
+            # Negative control: the token the pass started with really was revoked.
+            revoked = await client.get(
+                dast_target_module.PREFLIGHT_PATH,
+                headers={"Authorization": f"Bearer {original}"},
+            )
+            assert revoked.status_code == 401, (
+                f"the pre-logout token still answers {revoked.status_code}, so the probe destroyed "
+                "nothing and the case above passed without exercising the re-mint at all"
+            )
+
+
+async def test_a_session_that_keeps_dying_fails_closed_rather_than_grinding() -> None:
+    """A target that cannot keep a session alive while being probed cannot support a reach number.
+
+    Driven by handing the pass a cap of 0 with a genuinely session-destroying row, so the REAL guard
+    fires on a REAL side effect rather than on a stubbed one.
+    """
+    async with dast_target() as target:
+        logout = next(
+            r
+            for r in route_gates.gated_http_rows(target.app)
+            if r.method == "POST" and r.path == "/auth/logout"
+        )
+        rebuilt: list[str] = []
+        async with httpx.AsyncClient(base_url=target.base_url, timeout=30.0) as client:
+            with pytest.raises(DastTargetUnusable) as caught:
+                await _write_pass(
+                    client,
+                    [logout],
+                    target=target,
+                    username=ADMIN_USERNAME,
+                    token=target.admin_token,
+                    placeholder=route_gates.PATH_PARAM_PLACEHOLDER,
+                    max_rebuilds=0,
+                    rebuilt=rebuilt,
+                )
+    assert "measured nothing" in str(caught.value), caught.value
+
+
+def test_write_probe_outcome_separates_a_stopped_probe_from_an_executed_one() -> None:
+    """The side-effect accounting, driven on the shipped function rather than restated beside it.
+
+    422 is the SAFE outcome and the reason an empty body is sent: FastAPI solves a route's dependencies
+    — where every ``require*()`` gate lives — before it validates the body, so a gate meaning to refuse
+    always answers first, and a 422 therefore means the authorization question was answered and the
+    handler never ran. A 400 stays in ``executed`` because a handler may return one itself; on a claim
+    about what a scan EXECUTED, over-reporting is the honest error.
+    """
+    assert write_probe_outcome(403) == "refused"
+    assert write_probe_outcome(401) == "refused"
+    assert write_probe_outcome(429) == "refused"
+    assert write_probe_outcome(422) == "stopped-at-validation"
+    assert write_probe_outcome(200) == "executed"
+    assert write_probe_outcome(404) == "executed"
+    assert write_probe_outcome(400) == "executed"
+
+
+def test_a_write_pass_that_never_ran_fails_closed() -> None:
+    """A write pass that quietly stopped probing must exit 2, not 0.
+
+    This is the same anti-fake-green rule the GET floors carry, applied to the passes added after them:
+    absent counts read as zero, breach the floor, and refuse to report a pass. Without it, deleting the
+    write passes would turn a clean run into a cleaner-looking one.
+    """
+    policy = _policy()
+    receipt = {
+        "gated_http_rows": 102,
+        "route_rows_examined": 108,
+        "negative_probes": 204,
+        "reached": 46,
+        "bfla_probes": 19,
+        "unreached_unexplained": 0,
+        "ungated_routes": policy["anonymous_allowlist"],
+        "findings": [],
+    }
+    code, errors = evaluate(receipt, policy)
+    assert code == 2, f"a receipt with no write counts exited {code}"
+    assert any("min_write_rows_reached" in line for line in errors), errors
+    assert any("min_write_bfla_probes" in line for line in errors), errors
+
+
+def test_the_bfla_canary_floors_the_write_pass_separately() -> None:
+    """Each detector needs its own canary floor, or one can go blind behind a sibling.
+
+    With a single combined violation count, a write BFLA pass that stopped probing would still clear a
+    floor the GET pass alone satisfies — a blinded detector certified by its neighbour. Driven here by
+    a canary receipt whose GET half is healthy and whose write half reports nothing.
+    """
+    policy = _policy()
+    receipt = {
+        "gated_http_rows": 102,
+        "route_rows_examined": 108,
+        "negative_probes": 204,
+        "reached": 46,
+        "bfla_probes": 19,
+        "write_reached": 47,
+        "write_bfla_probes": 43,
+        "unreached_unexplained": 0,
+        "ungated_routes": policy["anonymous_allowlist"],
+        "findings": [],
+        "canary": "bfla",
+        "bfla_violations": 19,
+        "write_bfla_violations": 0,
+    }
+    code, errors = evaluate(receipt, policy)
+    assert code == 2, f"a canary whose write pass detected nothing exited {code}"
+    assert any("bfla_min_write_violations" in line for line in errors), errors
+
+
+def test_too_many_destroyed_sessions_is_a_could_not_measure() -> None:
+    """The receipt-side half of the rebuild cap, so a receipt read on its own reaches the same verdict
+    as the run that produced it."""
+    policy = _policy()
+    receipt = {
+        "gated_http_rows": 102,
+        "route_rows_examined": 108,
+        "negative_probes": 204,
+        "reached": 46,
+        "bfla_probes": 19,
+        "write_reached": 47,
+        "write_bfla_probes": 43,
+        "unreached_unexplained": 0,
+        "ungated_routes": policy["anonymous_allowlist"],
+        "findings": [],
+        "write_session_rebuilds": int(policy["max_write_session_rebuilds"]) + 1,
+        "write_session_rebuild_rows": ["POST /auth/logout"],
+    }
+    code, errors = evaluate(receipt, policy)
+    assert code == 2, f"a run whose session kept dying exited {code}"
+    assert any("destroyed the scan session" in line for line in errors), errors
+
+
+def test_every_unreachable_allowlist_entry_names_a_real_row_and_a_reason(
+    clean_run: tuple[int, dict[str, Any]],
+) -> None:
+    """An exemption may only shrink the scan for a stated reason, and only for a row that EXISTS.
+
+    Eight write rows sit behind an action-scoped step-up wall a password login cannot satisfy, so they
+    are exempted rather than reached. That is how a scan quietly shrinks, so both halves are pinned: no
+    entry may be reason-free, and no entry may name a row the live route table no longer has — a stale
+    exemption is an exemption nobody is checking.
+    """
+    _code, receipt = clean_run
+    policy = _policy()
+    live = {(r.method, r.path) for r in route_gates.gated_http_rows()}
+    for entry in policy["unreachable_allowlist"]:
+        assert entry.get("reason"), entry
+        assert (entry["method"], entry["path"]) in live, (
+            f"{entry['method']} {entry['path']} is exempted from the reach pass but is no longer a "
+            "gated row on the live app; the exemption is stale and is shrinking nothing."
+        )
+    # The exemptions must not be able to swallow the pass: reach still clears its floor beside them.
+    assert receipt["write_reached"] > receipt["write_unreached_allowlisted"], receipt
 
 
 # =====================================================================================================
@@ -522,6 +764,8 @@ def test_bfla_oracle_treats_404_as_a_violation() -> None:
         "negative_probes": 198,
         "reached": 46,
         "bfla_probes": 19,
+        "write_reached": 47,
+        "write_bfla_probes": 43,
         "bfla_violations": 1,
         "unreached_unexplained": 0,
         "ungated_routes": policy["anonymous_allowlist"],
@@ -551,6 +795,8 @@ def test_an_unexplained_unreached_operation_is_a_finding() -> None:
         "negative_probes": 198,
         "reached": 46,
         "bfla_probes": 19,
+        "write_reached": 47,
+        "write_bfla_probes": 43,
         "unreached_unexplained": 3,
         "ungated_routes": policy["anonymous_allowlist"],
         "findings": [],
@@ -573,6 +819,8 @@ def test_a_newly_ungated_route_reds_the_run() -> None:
         "negative_probes": 198,
         "reached": 46,
         "bfla_probes": 19,
+        "write_reached": 47,
+        "write_bfla_probes": 43,
         "unreached_unexplained": 0,
         "ungated_routes": [*policy["anonymous_allowlist"], {"method": "GET", "path": "/messages"}],
         "findings": [],
