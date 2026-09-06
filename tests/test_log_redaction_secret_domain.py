@@ -287,6 +287,29 @@ def test_ordinary_engine_diagnostics_are_not_eaten_by_the_credential_patterns(li
     )
 
 
+def test_the_label_prefix_repetition_stays_bounded() -> None:
+    """An UNBOUNDED label prefix is quadratic in line length, on attacker-influenceable log text.
+
+    ``_`` suppresses ``\\b``, but "." and "-" do not, so an N-segment dotted or hyphenated run gives the
+    regex N start positions and the group re-walks O(N) segments from each. Measured over 20 passes of
+    one ~6 KB run: 1.5 ms before the widening, **827 ms with ``*``**, 11 ms at ``{0,6}``. Base64url uses
+    "-", so a JWT echoed into a log line is exactly that shape, and both surfaces this module backstops
+    would carry the cost.
+
+    Pinned structurally rather than by a stopwatch: a timing assertion on a shared CI runner flakes, and
+    the property that matters is that a bound EXISTS. The value is free to move.
+    """
+    assert re.fullmatch(r"\(\?:\[A-Za-z0-9\]\+\[\._-\]\)\{0,\d+\}", redact_mod._LABEL_PREFIX), (
+        f"_LABEL_PREFIX is {redact_mod._LABEL_PREFIX!r} -- it must carry an explicit {{0,N}} bound. "
+        "With '*' or '+' the two credential patterns become quadratic in line length (827 ms on one "
+        "6 KB hyphen run, against 1.5 ms before the widening)."
+    )
+    # And the bound must still reach the labels it was added for -- a bound low enough to be safe and
+    # too low to be useful would pass the assertion above while silently reverting the fix.
+    for label in ("ad_bind_password", "tls_key_password", "client_secret", "bearer_token"):
+        assert REDACTION_PLACEHOLDER in redact_log_line(f"{label}=pw-B0und_Chk-99")
+
+
 def test_redactor_is_the_backstop_for_both_named_surfaces() -> None:
     """The support archive and the log-tail route both go through this module, so a hole lands twice.
 

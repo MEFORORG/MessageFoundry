@@ -90,6 +90,14 @@ backstop. Fixed by widening the label group of two patterns with a separator-ter
 two families in the AST-derived domain guard so the mutation fixture proves the widened pattern is
 what does the work.
 
+**The first version of that fix shipped a new defect, and review caught it.** An unbounded prefix
+makes both patterns quadratic in line length on exactly this surface: `_` suppresses the word
+boundary but `.` and `-` do not, so an N-segment run gives the regex N start positions and the group
+re-walks O(N) segments from each. Measured over 20 passes of one 6 KB run: 1.5 ms before the
+widening, 827 ms unbounded, 11 ms bounded. Base64url uses `-`, so a JWT echoed into an upstream
+error is precisely that shape. A repair for a confidentiality defect had opened an availability one.
+Bounded at six segments, pinned by a guard proven to reject `*`, `+` and `{0,}`.
+
 **The limb the verdict should rest on holds.** Zero read-class permission constants anywhere in
 `messagefoundry/`, against 8 write-class sites in the same run. Both shipped permission predicates
 are write-axis by construction. `pipeline/sandbox.py:616` still spawns the isolation worker with no

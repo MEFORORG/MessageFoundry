@@ -56,7 +56,22 @@ _MFB64 = re.compile(r"mfb64:v1:[A-Za-z0-9+/=]+")
 # Each segment must END in a separator, so the prefix cannot cross a space, a ";" in an ODBC string or
 # any other delimiter — it widens the LABEL only, never the value span. It is spliced into group 1 of
 # both patterns below so ``_keep_label`` still prints the whole label a reviewer needs to see.
-_LABEL_PREFIX = r"(?:[A-Za-z0-9]+[._-])*"
+#
+# THE REPETITION BOUND IS LOAD-BEARING AND IT IS NOT TASTE. Unbounded (``*``) this is QUADRATIC in line
+# length, on log text an attacker can influence. ``_`` suppresses ``\b``, but "." and "-" do not, so an
+# N-segment dotted or hyphenated run offers N word-boundary start positions and the group re-walks the
+# remaining O(N) segments from each one. Measured on this interpreter over 20 passes of one ~6 KB
+# hyphen-and-dot run: 1.5 ms for the pre-change pattern, 827 ms unbounded, 11 ms at ``{0,6}``. **Base64url
+# uses "-", so a JWT echoed in an upstream error is exactly the bad shape**, which makes this reachable
+# rather than theoretical on ``GET /logs/tail`` and in the support bundle. Cost grows LINEARLY with the
+# bound (8 ms at 4, 11 at 6, 14 at 8), so six is bought cheaply.
+#
+# WHAT THE BOUND COSTS, stated because it fails SILENTLY in one direction: a label with more than six
+# prefix segments joined by UNDERSCORES is not matched, since ``_`` offers no later start position to
+# retry from. A dotted or hyphenated label of any depth still matches, for the same ``\b`` reason that
+# makes it expensive. Six is 3x the longest real label this fixes (``ad_bind_password``,
+# ``tls_key_password`` — two prefix segments each) and nothing in this tree comes close.
+_LABEL_PREFIX = r"(?:[A-Za-z0-9]+[._-]){0,6}"
 
 # A bearer/authorization token or an opaque session token in a header-ish or "token=" shape.
 #
