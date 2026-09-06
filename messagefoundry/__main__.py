@@ -100,7 +100,9 @@ def main(argv: list[str] | None = None) -> int:
         default=None,
         help="run only the inbound connections tagged with this shard id (L3 multi-process "
         "sharding). Outbound/routers/handlers are shared; only intake is partitioned. Omit to run "
-        "the whole graph. `messagefoundry supervise` sets this per subprocess.",
+        "the whole graph. `messagefoundry supervise` sets this per subprocess. A config declaring "
+        "more than one shard requires a server-DB store (Postgres or SQL Server) so every shard "
+        "shares ONE unified database (ADR 0063); serve refuses it on a single-file backend.",
     )
     serve.add_argument(
         "--allow-insecure-bind",
@@ -2982,8 +2984,12 @@ def _serve(args: argparse.Namespace) -> int:
     # exactly as before. The supervisor spawns one such process per shard with its own --db and --port.
     registry_filter = None
     if args.shard is not None:
-        from messagefoundry.config.wiring import Registry
-        from messagefoundry.pipeline.sharding import filter_registry_for_shard
+        from messagefoundry.config.wiring import Registry, WiringError
+        from messagefoundry.pipeline.sharding import (
+            filter_registry_for_shard,
+            require_unified_store,
+            shard_ids,
+        )
 
         # ADR 0073: engine sharding and [cluster] active-passive are mutually exclusive, fail-closed.
         # The cluster leadership lease is store-wide, so leadership would transfer ACROSS shard ids —
@@ -3002,8 +3008,41 @@ def _serve(args: argparse.Namespace) -> int:
             return 2
 
         shard_id: str = args.shard
+        shard_store_backend = settings.store.backend
 
         def registry_filter(reg: Registry) -> Registry:  # noqa: F811 (local shard-bound closure)
+            # ADR 0063 no-split-store guard, ON THE DIRECT ENTRYPOINT (BACKLOG #1112). `supervise`
+            # calls require_unified_store before it spawns anything; a hand-run `serve --shard`
+            # reached NO call site of it, so the supported path refused a config the direct one ran.
+            #
+            # Sited HERE because this closure is the only place on the serve path that sees the
+            # UNFILTERED registry — it alone knows the whole engine-shard universe — at startup AND
+            # on every reload, with no second load_config. A pre-flight load would be the obvious
+            # alternative and is rejected: load_config EXECUTES the operator's config modules, so it
+            # would run arbitrary config code twice on every sharded start.
+            #
+            # This NARROWS the defect, it does not close it. Two plain `serve` processes over one
+            # SQLite file are still unguarded, and are worse: an unsharded registry yields
+            # owned=None, so the second process's startup reset_stale_inflight re-pends EVERY
+            # in-flight row store-wide, including the live sibling's. Closing that needs a
+            # single-writer guard at store open, which is a different mechanism (a new dependency or
+            # a per-platform primitive) and a separate subject. Neither guard subsumes the other:
+            # a store-open lock cannot see a LONE `serve --shard a` against a >1-shard config (one
+            # writer, no lock tripped) whose non-owned outbound lanes would have no delivery
+            # consumer at all under ADR 0073 rendezvous ownership.
+            try:
+                require_unified_store(shard_store_backend, shard_ids(reg))
+            except ValueError as exc:
+                # WiringError, not the raw ValueError: it is the type the engine already raises for
+                # "this config cannot run in this process" (the ADR 0073 shard-set reload refusal in
+                # Engine.reload), and /config/reload maps it to a clean 422 instead of a 500.
+                raise WiringError(
+                    f"{exc} This process was started as `serve --shard {shard_id}` directly; "
+                    "`messagefoundry supervise` refuses this same config before it spawns anything. "
+                    "Starting just ONE shard of a multi-shard config is not a workaround: outbound-"
+                    "lane ownership (ADR 0073) is pinned to the whole shard universe, so the lanes "
+                    "owned by the shards you did not start would have no delivery consumer at all."
+                ) from exc
             return filter_registry_for_shard(reg, shard_id)
 
     # ADR 0118: reflect the serve-gate EFFECTIVE flips (egress deny-by-default, retention auto-bound) back
