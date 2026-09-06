@@ -1181,3 +1181,305 @@ def test_no_dispatch_control_number_is_written_as_a_citation(screen_mod: ModuleT
                 f"{path.name} writes the joined citation form for #{num}, so the sweep would find "
                 f"this very file and the control would be measuring itself"
             )
+
+
+# --------------------------------------------------- the dispatch fence (BACKLOG #1469)
+#
+# TWO ROWS ON THE LEDGER SAY IN TERMS "Do not dispatch it to a builder", AND THE GATE HAD NO CONCEPT
+# OF A FENCE AT ALL. Measured 2026-09-06 at 679 items: a case-insensitive grep for "fence" over
+# `dispatch_gate.py` returned 0; `dispatch_gate.py 1007 1246 --explain` reported "items closing by
+# the builder's own act: 2 of 2" and named no fence; `--refuse` exited 0 on both.
+#
+# THAT IS NOT A BROKEN GATE. On the same run it correctly raised MUST BE READ on two other rows from
+# landed-code citations. The warning channel works and populates from the tree. A fence was simply
+# not one of its inputs.
+#
+# THIS LIMB REFUSES, WHICH NO OTHER MUST-BE-READ DOES, and the difference is the KIND of sentence.
+# Every other level here is inferred -- a token match in prose, or a citation in the tree -- and the
+# gate's own output warns against blocking on one, citing the screen that discarded 46 percent of the
+# live ledger. A fence is an imperative a person wrote deliberately about one row. Two exist in 679.
+#
+# THE FIXTURES OWN THE PROPERTY UNDER TEST. The live-ledger arms come last, because a needle proven
+# only against the two known rows is indistinguishable from one that hardcodes them.
+
+# The real fence, verbatim from the two live rows, with the row's own subject replaced. Both carry
+# this text byte-identically.
+_FENCED_BODY = (
+    "## 4253. the residual prose carries ungated file-line citations\n"
+    "\n"
+    "**Cluster:** Security record. The gate validates anchors and does not read residual at all.\n"
+    "\n"
+    "**DISPATCH FENCE 2026-08-23: THIS ROW EDITS THE SECURITY RECORD'S OWN PROSE, so it needs the\n"
+    "vaulted data and belongs to the seat that owns that record -- NOT to a build lane.** *Do not\n"
+    "dispatch it to a builder.*\n"
+)
+
+# THE SELF-REFERENCE TWIN, and it is THIS CHANGE'S OWN ROW. #1469 is the first row on the ledger to
+# discuss dispatch fencing without being fenced, so it is the only false positive available -- and it
+# does not exist until this change lands. Measured 2026-09-06 over 679 items: a needle for "dispatch"
+# within 120 characters of "fenc" fires on the two fenced rows and on nothing else.
+_DISCUSSES_FENCING = (
+    "## 4254. the dispatch gate does not read a row's DISPATCH FENCE\n"
+    "\n"
+    "Two rows carry a dispatch fence and the gate reads none of it. The marker is the words\n"
+    "DISPATCH FENCE followed by a date and a colon, at the start of a line. A row that merely\n"
+    "discusses fencing, as this one does, must not trip it -- do not dispatch it to a builder is\n"
+    "the imperative the two rows carry, and quoting it is not declaring it.\n"
+)
+
+# A fence quoted inside a markdown table, which is how a documenting row lists the fenced population.
+_FENCE_IN_A_TABLE = (
+    "## 4255. the dispatch gate does not read a row's DISPATCH FENCE\n"
+    "\n"
+    "| row | the sentence in it |\n"
+    "|---|---|\n"
+    "| #4253 | \"DISPATCH FENCE 2026-08-23: THIS ROW EDITS THE SECURITY RECORD'S OWN PROSE ... "
+    'NOT to a build lane." |\n'
+)
+
+# The heading twin. A title may narrate the marker; the retirement limb's heading needle is anchored
+# at the title's start, and this one scans free text, so it must refuse to start on a heading at all.
+_FENCE_IN_A_HEADING = (
+    "## 4256. DISPATCH FENCE 2026-08-23: the marker no screen in this repo reads\n"
+    "\n"
+    "**Cluster:** coord. Nothing on the dispatch path reads an item's body for this marker.\n"
+)
+
+# A real line from the live ledger: a bold, line-leading "Scope fence" that is not a dispatch fence.
+# A needle keyed on the bare word stops it.
+_SCOPE_FENCE = (
+    "## 4257. one bounded pass over the weakness catalogue\n"
+    "\n"
+    "**Scope fence, and it is the load-bearing part of this item.** The output is items or rules.\n"
+)
+
+
+def test_a_fenced_row_is_not_graded_like_a_live_one(gate: ModuleType) -> None:
+    """THE DISCRIMINATION. Identical fields, identical call -- only the body differs.
+
+    Before this limb both calls returned the same level AND the same note, byte for byte: "closes by
+    'code', performed by the builder writes it; the LANDER flips the banner on merge". A dispatcher
+    reading that about a fenced row is told to build a row that says do not dispatch it to a builder.
+    """
+    fenced_level, fenced_note = gate.judge(_item(gate, **_BUILDABLE), body=_FENCED_BODY)
+    plain_level, plain_note = gate.judge(_item(gate, **_BUILDABLE), body=_PLAIN_BODY)
+
+    assert fenced_note != plain_note, (
+        "same fields, different bodies, identical note -- judge() is not reading the fence at all"
+    )
+    assert fenced_level == "read"
+    assert "MUST BE READ" in fenced_note
+    assert "DISPATCH FENCE" in fenced_note, "the note must QUOTE what fired, so a reader can check"
+    # AND THE QUOTE MUST CARRY THE BAR, not just its opening clause. The ledger hard-wraps at ~100
+    # columns and both live fences put "NOT to a build lane" on the SECOND line, so a first-line
+    # capture quotes "...so it needs the vaulted" -- a reader cannot check half a sentence.
+    assert "not to a build lane" in fenced_note.lower()
+    # The opposite direction, asserted rather than trusted: a limb that flagged every row would
+    # satisfy every assertion above it.
+    assert plain_level == "ok"
+    assert "DISPATCH FENCE" not in plain_note
+
+
+def test_a_row_that_discusses_fencing_is_not_fenced(gate: ModuleType) -> None:
+    """The self-reference trap, and this change's own row is the instance that creates it.
+
+    A detector that flags correct prose is not noisy, it is wrong: a reader stopped by the row that
+    DESCRIBES the fence never reaches the rows that carry one.
+    """
+    level, note = gate.judge(_item(gate, **_BUILDABLE), body=_DISCUSSES_FENCING)
+    assert level == "ok"
+    assert "DISPATCH FENCE" not in note
+
+
+def test_a_fence_quoted_as_a_blockquote_is_not_this_rows_fence(gate: ModuleType) -> None:
+    """The narrowing the already-built needle deliberately does NOT make, pinned rather than argued.
+
+    That needle reads the banner, where every line is a blockquote, so it must allow the prefix.
+    This one reads prose, where no fence has ever been written as one -- both live instances open
+    with bold. Allowing it would widen the needle toward the one false positive that matters here:
+    a row documenting the convention by quoting a real fence.
+    """
+    quoted = (
+        "## 4258. the dispatch gate does not read a row's DISPATCH FENCE\n"
+        "\n"
+        "The two fenced rows carry this, verbatim:\n"
+        "\n"
+        "> **DISPATCH FENCE 2026-08-23: THIS ROW EDITS THE SECURITY RECORD'S OWN PROSE ... NOT to\n"
+        "> a build lane.** *Do not dispatch it to a builder.*\n"
+    )
+    level, _ = gate.judge(_item(gate, **_BUILDABLE), body=quoted)
+    assert level == "ok"
+
+
+def test_a_fence_quoted_in_a_table_is_not_this_rows_fence(gate: ModuleType) -> None:
+    """A documenting row lists the fenced population in a table, quoting the marker verbatim."""
+    level, _ = gate.judge(_item(gate, **_BUILDABLE), body=_FENCE_IN_A_TABLE)
+    assert level == "ok"
+
+
+def test_a_heading_that_names_the_marker_is_not_a_fence(gate: ModuleType) -> None:
+    """The heading is in the body this needle reads, and it must not start a match."""
+    level, _ = gate.judge(_item(gate, **_BUILDABLE), body=_FENCE_IN_A_HEADING)
+    assert level == "ok"
+
+
+def test_a_scope_fence_is_not_a_dispatch_fence(gate: ModuleType) -> None:
+    """A bold, line-leading use of the word about SCOPE. A bare-word needle stops it.
+
+    38 of 679 bodies carry the bare word at this branch's base, in at least four unrelated senses --
+    leader-election fencing, a ciphertext prefix, a scope fence, and a fenced file.
+    """
+    level, _ = gate.judge(_item(gate, **_BUILDABLE), body=_SCOPE_FENCE)
+    assert level == "ok"
+
+
+def test_a_retirement_still_leads_a_fence(gate: ModuleType) -> None:
+    """A retirement is the stronger claim: the row is dead, not merely in the wrong lane."""
+    _, note = gate.judge(_item(gate, **_BUILDABLE), body=_RETIRED_BODY + _FENCED_BODY)
+    assert "RETIRED IN PLACE" in note
+    assert "DISPATCH FENCE" in note, "precondition: both leads present, or there is no order"
+    assert note.index("RETIRED IN PLACE") < note.index("DISPATCH FENCE")
+
+
+def test_the_fence_note_leads_the_already_built_note(gate: ModuleType) -> None:
+    """A fence says WHO may work the row; already-built is a claim about its state.
+
+    Read first, "this work has shipped" sends a dispatcher to close a row that is barred from a
+    build lane in the first place.
+    """
+    _, note = gate.judge(_item(gate, **_BUILDABLE), body=_FENCED_BODY + _ALREADY_BUILT_BODY)
+    assert "DISPATCH FENCE" in note
+    assert "ALREADY BUILT" in note, "precondition: both leads present, or there is no order"
+    assert note.index("DISPATCH FENCE") < note.index("ALREADY BUILT")
+
+
+def test_an_undeclared_row_is_still_told_it_is_fenced(gate: ModuleType) -> None:
+    """Refuse still wins the LEVEL, but not the whole message.
+
+    Without the lead, the reader of a fenced, undeclared row is told to go and add three banner lines
+    to a row that is not theirs to work.
+    """
+    level, note = gate.judge(_item(gate), body=_FENCED_BODY)
+    assert level == "refuse"
+    assert "missing:" in note, "the refusal must still enumerate what to add"
+    assert note.startswith("MUST BE READ -- THIS ROW CARRIES A DISPATCH FENCE")
+
+
+def test_no_body_makes_no_fence_claim(gate: ModuleType) -> None:
+    """No body, no claim -- the same contract every other needle here keeps."""
+    level, note = gate.judge(_item(gate, **_BUILDABLE))
+    assert level == "ok"
+    assert "FENCE" not in note
+
+
+_FENCED_LEDGER = _FILLER + (
+    f"## 999996. the residual prose carries ungated citations\n{_OPEN}\n> Closing-act: code\n\n"
+    "**DISPATCH FENCE 2026-08-23: THIS ROW EDITS THE SECURITY RECORD'S OWN PROSE, so it needs the\n"
+    "vaulted data and belongs to the seat that owns that record -- NOT to a build lane.** *Do not\n"
+    "dispatch it to a builder.*\n"
+)
+
+
+def test_a_fenced_row_does_not_block_by_default(
+    gate: ModuleType, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Exit 0 without --refuse, like every other level. The default names, it does not withhold."""
+    root = _ledger_root(tmp_path, _FENCED_LEDGER)
+    assert gate.main(["999996", "--root", str(root), "--no-tree"]) == 0
+    out = capsys.readouterr().out
+    assert "DISPATCH FENCE" in out, "the fence must be named on the default path too"
+
+
+def test_a_fenced_row_blocks_under_refuse(
+    gate: ModuleType, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """THE ONE MUST-BE-READ --refuse BLOCKS ON, and the exit code is the whole promise.
+
+    Measured before this limb: the same two rows under --refuse exited 0.
+    """
+    root = _ledger_root(tmp_path, _FENCED_LEDGER)
+    assert gate.main(["999996", "--root", str(root), "--no-tree", "--refuse"]) == 1
+    out = capsys.readouterr().out
+    assert "DISPATCH-FENCED" in out, "the refusal must name why, not just exit 1"
+
+
+# ---------------------------------------------------------- the live-ledger arms (BACKLOG #1469)
+#
+# Measured 2026-09-06 on this branch's base: 679 items across the two ledger files. Exactly two carry
+# a fence, both with byte-identical text, and both graded `ok` before this limb.
+#
+# WHEN THIS GOES RED, RE-MEASURE -- do not delete the number. A row moving to the archive is fine:
+# both files are read as one namespace. What this catches is the fence WORDING drifting out from
+# under the needle, and that is a real miss, not a test fault.
+_FENCED_ROWS = {1007, 1246}
+
+# Rows that must NOT fire, each a different sense of the word, each read on the live ledger:
+#   #41    "self-fencing leader election" -- the distributed-systems sense
+#   #62    a ciphertext prefix that contains the letters -- a substring accident
+#   #1073  "**Scope fence, and it is the load-bearing part of this item.**" -- bold, line-leading
+#   #1137  "the correct handling of a fenced file" -- a third sense again
+#   #1469  THIS CHANGE'S OWN ROW, which describes the marker: the only self-reference trap available
+_MUST_NOT_FIRE_FENCE = {41, 62, 1073, 1137, 1469}
+
+
+def test_every_fenced_row_in_the_live_ledger_is_named(gate: ModuleType) -> None:
+    """Non-vacuity. A needle proven only on fixtures fires on nothing real and looks identical."""
+    rows = gate.load_ledger(_ROOT)
+    assert len(rows) >= gate.MIN_ITEMS, (
+        f"instrument: parsed {len(rows)} items from {_ROOT}, below the gate's own floor of "
+        f"{gate.MIN_ITEMS}. The ledger did not resolve, so nothing below is evidence."
+    )
+    absent = _FENCED_ROWS - set(rows)
+    assert not absent, f"the ledger no longer carries {sorted(absent)} -- re-measure this test"
+
+    for num in sorted(_FENCED_ROWS):
+        row = rows[num]
+        level, note = gate.judge(row.item, body=row.body, banner=row.banner)
+        assert "DISPATCH FENCE" in note, f"#{num} dispatches without its fence named: {note}"
+        assert level == "read", f"#{num}: {level}"
+
+
+def test_the_fence_needle_does_not_fire_on_the_rest_of_the_ledger(gate: ModuleType) -> None:
+    """The over-fire arm, WITH THE COMPARED COUNT, because a clean run otherwise reads as coverage.
+
+    A checker that finds nothing because its parse stopped matching is indistinguishable from a clean
+    one, so the population it compared is named in the failure message and pinned by the ratio.
+    """
+    rows = gate.load_ledger(_ROOT)
+    assert len(rows) >= gate.MIN_ITEMS, "instrument: the ledger did not resolve"
+
+    fired = {n for n, r in rows.items() if gate.fence_marker(r.body) is not None}
+    bare = {n for n, r in rows.items() if "fenc" in r.body.lower()}
+
+    hit = _MUST_NOT_FIRE_FENCE & fired
+    assert not hit, f"fired on a row that uses the word in another sense: {sorted(hit)}"
+    assert fired == _FENCED_ROWS, (
+        f"the fenced population moved: fired on {sorted(fired)} of {len(rows)} rows, expected "
+        f"{sorted(_FENCED_ROWS)}. Re-measure before changing the needle."
+    )
+    # THE COMPARED COUNT IS PART OF THE RESULT. Measured 2026-09-06 at this branch's base: 38 of 679
+    # bodies carry the bare word and 2 declare a fence; with this change's own row filed, 39 of 680
+    # and the same 2. If those numbers converge, the corpus has stopped containing the landmine and
+    # a bare-word detector would pass this file -- which is the wrong needle.
+    assert len(fired) * 3 < len(bare), (
+        f"the narrowing is not exercised: {len(bare)} of {len(rows)} bodies carry the bare word and "
+        f"{len(fired)} fired. Close numbers mean this file no longer proves the needle is narrow."
+    )
+
+
+def test_the_two_live_fenced_rows_block_under_refuse(
+    gate: ModuleType, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The wiring, end to end, on the rows this change was filed from.
+
+    This is the run that reproduced the defect: exit 0, "items closing by the builder's own act: 2
+    of 2", and no sentence anywhere about a fence.
+    """
+    argv = [str(n) for n in sorted(_FENCED_ROWS)] + ["--root", str(_ROOT), "--no-tree"]
+    assert gate.main(argv) == 0
+    assert "DISPATCH FENCE" in capsys.readouterr().out
+
+    assert gate.main([*argv, "--refuse"]) == 1
+    out = capsys.readouterr().out
+    for num in sorted(_FENCED_ROWS):
+        assert f"#{num}" in out, f"#{num} blocked the wave without being named in the output"
