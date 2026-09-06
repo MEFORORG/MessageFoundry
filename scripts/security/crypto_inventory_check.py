@@ -383,6 +383,15 @@ INVENTORY: dict[str, frozenset[str]] = {
     # digests. The HMAC key is HKDF-derived (in crypto.py) from the DEK. store.crypto seam = the at-rest
     # cipher (MARKER_PREFIX/cell_aad/CipherError) it drives over the PHI columns.
     "messagefoundry/store/store.py": frozenset({"hashlib", "hmac", "messagefoundry.store.crypto"}),
+    # BACKLOG #1178: `probe_tcp_reachable`, the reachability probe the socket destinations share for
+    # `test_connection`, takes an optional `ssl_context` and dials with it. It BUILDS no context and
+    # imports `ssl` under TYPE_CHECKING only — the value is a pass-through it never dereferences —
+    # but this is where a caller's context is APPLIED to a probe socket, so it is a real site: the
+    # decision whether a connection test speaks the hop's own transport or a plaintext approximation
+    # of it is made here. Before #1178 the probe was unconditionally cleartext, so a tls=true MLLP
+    # destination tested a transport the operator never configured. `None` (the default) is the
+    # honest value for TCP and X12, which cannot speak TLS in any configuration.
+    "messagefoundry/transports/base.py": frozenset({"ssl"}),
     # ADR 0025: the DICOM C-STORE SCP's server SSLContext (Phase 1) + the C-STORE SCU's client SSLContext
     # (Phase 2) for DICOM-over-TLS (the MLLP inbound/outbound posture).
     "messagefoundry/transports/dicom.py": frozenset({"messagefoundry.config.tls_policy", "ssl"}),
