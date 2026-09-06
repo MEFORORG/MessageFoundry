@@ -11261,9 +11261,10 @@ citation checks out. A reader spot-checking "is there an owner ruling in this mo
 resolves to a real file. The 2026-08-22 ruling on the allow-list is recorded in **BACKLOG #1317**
 (*"What to build, per the 2026-08-22 owner ruling"*) -- **not** in any rulings document, and not in
 the vault. Searching for it by DATE across both repositories, and by subject across the vault's
-`docs/security/` rulings files, returned nothing: the vault's only 2026-08-22 ruling artefact is a
-ruling-REQUEST packet listing fourteen cells awaiting a decision, which is the opposite of a record
-of one. **So an owner ruling in this project may be recorded in the live ledger under an item
+`docs/security/` rulings files, returned nothing: the vault's only 2026-08-22 ruling artefact is
+`docs/security/ASVS-OWNER-RULING-PACKET-2026-08-22.md`, which **reads on its filename as a record of
+decisions and is the opposite** -- a ruling-REQUEST packet listing fourteen cells awaiting one. A
+searcher who stops at that filename concludes the ruling was made and cannot find its text. **So an owner ruling in this project may be recorded in the live ledger under an item
 number and nowhere else, and an instrument that looks only in rulings documents will report a
 sound citation as unsourced.** Check the ledger before calling any ruling citation unsupported. Removal is
 one file: pass the approved list to `set_ciphers` inside `harden_cipher_suites` before the four
