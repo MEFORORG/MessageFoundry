@@ -1270,6 +1270,7 @@ def _serve(args: argparse.Namespace) -> int:
     from messagefoundry.config.tls_policy import (
         HopDisposition,
         in_process_tls_revocation_refused,
+        proxy_mtls_declared_but_unverified,
         tls_revocation_attested,
     )
     from messagefoundry.crashdump import suppress_crash_dumps
@@ -1988,26 +1989,14 @@ def _serve(args: argparse.Namespace) -> int:
                 file=sys.stderr,
             )
         # --- BACKLOG #1181 (ASVS 12.3.5): the ONE Posture-B attestation the engine can check --------
-        # "mtls" says the proxy PRESENTS A CLIENT CERTIFICATE on this hop. The engine is the far end of
-        # that hop, and it verifies a client certificate in exactly one configuration: with
-        # [api].tls_client_ca_file set, api/tls.py loads the anchor and sets ssl.CERT_REQUIRED. With no
-        # client CA the engine verifies nothing, so its own configuration CONTRADICTS the declaration —
-        # and that is the one contradiction visible from here. The other two values name controls that
-        # live entirely outside the process (a segment, a header a proxy injects); nothing the engine
-        # can read decides them, which is why they get no arm.
-        #
-        # WARNS, NEVER REFUSES, and the reason is a real topology rather than caution: a sidecar or
-        # stunnel on the same host can terminate the proxy's mTLS in front of the engine, leaving a
-        # genuinely mutually-authenticated hop that the engine sees as plaintext loopback. A refusal
-        # would be wrong there, and would be a refusal purchased on an unobservable premise.
-        #
-        # THIS IS A DIAGNOSTIC, NOT ENFORCEMENT. The setting remains an attestation: no byte on any wire
-        # changes with its value, and docs/CONFIGURATION.md still says so. It exists to stop the engine
-        # staying silent while a control reports itself on and does nothing.
-        if (
-            settings.api.proxy_intra_service_auth == "mtls"
-            and not settings.api.tls_client_ca_file
-            and data_class is DataClass.PHI
+        # The rule, why it warns instead of refusing, and why the sibling values get no arm all live on
+        # the predicate, beside in_process_tls_revocation_refused -- the other pure serve-gate predicate
+        # on the same subject. It WARNS and never refuses: a sidecar in front of the engine can terminate
+        # the proxy's mTLS legitimately. This is a DIAGNOSTIC, not enforcement.
+        if proxy_mtls_declared_but_unverified(
+            declared=settings.api.proxy_intra_service_auth,
+            client_ca_configured=bool(settings.api.tls_client_ca_file),
+            is_phi=data_class is DataClass.PHI,
         ):
             print(
                 "warning: [api].proxy_intra_service_auth is declared 'mtls' but this engine verifies "

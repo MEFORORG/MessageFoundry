@@ -58,6 +58,11 @@ mTLS legitimately, leaving a true `"mtls"` hop the engine sees as plaintext, so 
 on an unobservable premise. `"network"` and `"shared_secret"` get no arm because nothing in the
 process can read them.
 
+The rule is a pure predicate in `config/tls_policy.py`, beside `in_process_tls_revocation_refused`,
+so the whole 16-cell truth table is testable without a settings load. That is not tidiness: each
+case reachable through `serve` costs a TOML, a `chdir` and five stubs to reach one boolean, so the
+arm that *silences* the warning had no test -- and that is the arm a regression breaks quietly.
+
 **The successor absence claim, specified in the same change as the row requires.** The old claim
 ("nothing branches on which value is set") now matches, for a diagnostic that changes no byte on any
 wire. The claim that survives and decides the verdict is *no value of `proxy_intra_service_auth`
