@@ -705,7 +705,15 @@ def test_the_browser_support_doc_states_the_floor_it_was_derived_from() -> None:
     An unresolved row and a forgotten row look identical in a document. This pins the two claims the
     derivation actually rests on -- that the floor is CSP nonce-source support, and that
     ``'strict-dynamic'`` is not part of it -- plus the explicit statement that no version table is
-    published. Authoring one later without a pinned dataset reds here.
+    stated. Authoring one later without a pinned dataset reds here.
+
+    **The pinned phrase is "not STATED" rather than "not published", and that is constrained by a
+    second gate rather than a preference** (BACKLOG #1116). ``tests/test_install_instruction_provenance.py``
+    reds when tracked prose asserts a distribution is unpublished while it classifies that
+    distribution PUBLISHED, and its pattern matches a bare ``not published``. The sibling sentence in
+    ``docs/SYSTEM-REQUIREMENTS.md`` sits beside the ``messagefoundry-webconsole`` wheel name and
+    tripped exactly that, on three platforms. The claim here is about VERSION NUMBERS not being
+    named; it was never about a wheel's absence from an index. Do not "restore" the older wording.
     """
     override = os.environ.get(_SUPPORT_DOC_ENV, "").strip()
     doc = (
@@ -716,8 +724,10 @@ def test_the_browser_support_doc_states_the_floor_it_was_derived_from() -> None:
     text = " ".join(doc.read_text(encoding="utf-8").split())
     assert "nonce sources" in text
     assert "'strict-dynamic'` is not part of the floor" in text
-    assert "Minimum browser versions are not published" in text
+    assert "Minimum browser versions are deliberately not stated" in text
     assert "Unresolved" in text
+    # and the wording stays compatible with the unpublished-distribution scan (see the docstring)
+    assert "not published" not in text
     # the console never blocks: the OTHER half of the 3.1.1 verb (warn the user OR block access)
     assert "warns, it never blocks" in text or "No browser is blocked" in text
 
