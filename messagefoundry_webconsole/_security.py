@@ -70,11 +70,17 @@ degrades-silently-with-a-named compensating control:
 3. the **session cookie's security attributes** (``__Host-`` prefix / ``Secure`` / ``HttpOnly`` /
    ``SameSite``), which no page script can observe at all.
 
-This list is the in-code source of truth the runbook's operator-facing copy mirrors, and a CI guard
-(``test_ui_csp_canary.py``) derives all three sets from the CODE — the header writes, the
-``window.<Feature>`` reads, and the ``set_cookie`` attributes — and fails if any member is missing
-HERE, so a newly-shipped header, detect or cookie attribute cannot slip in unbucketed. Anything
-OUTSIDE those three sets is outside the claim.
+This list is the in-code source of truth. Its operator-facing statement is
+``docs/BROWSER-SUPPORT.md``, which a deploying site receives; the vaulted runbook carries a third
+copy. A CI guard (``test_ui_csp_canary.py``) re-derives all three sets from the CODE — the header
+names, the ``window.<Feature>`` reads, and the ``set_cookie`` attributes — and reds if a member is
+absent from this contract or lands in no bucket. **The guard's reach is exactly the code it reads**,
+which is at least the whole console package plus each engine emitter declared in its ``_EMITTERS``
+tuple; a companion test walks both trees for header writes and reds when one turns up outside that
+list, so the reach cannot narrow silently. It does NOT extend to header names this file is the only
+place to mention: the contract text is stripped from the search before matching, so a row here is
+never its own evidence (BACKLOG #1116 — ``Cross-Origin-Embedder-Policy``, named above as deliberately
+NOT set, was the one row in that state). Anything OUTSIDE those three sets is outside the claim.
 
 The parallel check that the RUNBOOK still mirrors this list skips wherever
 ``docs/security/OFF-LOOPBACK-DEPLOYMENT.md`` is absent, which is every public checkout — that path is
