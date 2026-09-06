@@ -30,6 +30,9 @@ from messagefoundry.logging_setup import build_stderr_handler, configure_logging
 from messagefoundry.store import MessageStore, audit_tee
 from messagefoundry.store.audit_tee import emit_audit_tee
 
+# A stand-in chain head for the direct-call cases. Shape only: a real one comes from `audit_row_hash`.
+_HASH = "a" * 64
+
 
 class _ListHandler(logging.Handler):
     """Capture each record's rendered message (what would be shipped) into a list."""
@@ -76,6 +79,9 @@ async def test_record_audit_tees_metadata_off_box(store, audit_capture) -> None:
         client="10.4.2.9",
         now=123.0,
     )
+    cur = await store._db.execute("SELECT id, row_hash FROM audit_log")
+    row = await cur.fetchone()
+    assert row is not None
     rec = _only(audit_capture)
     assert rec == {
         "event": "audit",
@@ -84,6 +90,9 @@ async def test_record_audit_tees_metadata_off_box(store, audit_capture) -> None:
         "actor": "alice",
         "channel_id": "IB_ACME_ADT",
         "client": "10.4.2.9",  # ADR 0150: the recorded address travels off-box with the row
+        # BACKLOG #1198 anchor fields, taken from the row that actually committed.
+        "row_id": row["id"],
+        "row_hash": row["row_hash"],
         "detail": None,
     }
     assert audit_capture.records[0].levelno == logging.INFO
@@ -138,6 +147,31 @@ async def test_audit_row_persists_and_tee_emits_together(store, audit_capture) -
     assert _only(audit_capture)["action"] == "admin.user_create"
 
 
+async def test_tee_anchor_fields_name_the_row_that_was_actually_committed(
+    store, audit_capture
+) -> None:
+    """BACKLOG #1198: the anchor fields must be READ BACK from the committed row, not guessed.
+
+    An anchor whose id or hash did not match the store would be worse than none — a collector holding
+    it would report a break on an untouched chain, or miss one on a truncated chain. So this compares
+    each emitted record against the row the store persisted, over three appends, so an off-by-one in
+    the id (or a hash taken from the previous row) cannot pass.
+    """
+    for i in range(3):
+        await store.record_audit("act", actor="u", detail=f'{{"n":{i}}}', now=float(i))
+
+    cur = await store._db.execute("SELECT id, row_hash FROM audit_log ORDER BY id")
+    persisted = [(r["id"], r["row_hash"]) for r in await cur.fetchall()]
+    teed = [(json.loads(m)["row_id"], json.loads(m)["row_hash"]) for m in audit_capture.messages]
+
+    # POSITIVE CONTROL: an empty chain would make the comparison below pass vacuously.
+    assert len(persisted) == 3, persisted
+    assert teed == persisted
+    assert (
+        len({h for _id, h in persisted}) == 3
+    )  # three distinct hashes, so equality is not trivial
+
+
 # --- the shared redaction path, tested directly (covers Postgres + SQL Server, which wire into the
 # same emit_audit_tee but can't run here without a live DB) ---------------------------------------
 
@@ -150,6 +184,8 @@ def test_emit_audit_tee_shape_is_metadata_only(audit_capture) -> None:
         detail=None,
         client="10.4.2.9",
         ts=10.0,
+        row_id=7,
+        row_hash=_HASH,
     )
     assert _only(audit_capture) == {
         "event": "audit",
@@ -161,6 +197,11 @@ def test_emit_audit_tee_shape_is_metadata_only(audit_capture) -> None:
         # source address without parsing the redacted detail blob. It is an infrastructure
         # identifier, not message content, so it is forwarded verbatim (never through safe_text).
         "client": "10.4.2.9",
+        # BACKLOG #1198 anchor fields: the row's chain position and head hash, also discrete. A
+        # counter and a digest — no PHI, no key material. Whole-dict equality is what keeps this a
+        # real shape guard: a field added later must be declared here or the assertion fails.
+        "row_id": 7,
+        "row_hash": _HASH,
         "detail": None,
     }
     assert audit_capture.records[0].levelno == logging.INFO
@@ -169,7 +210,15 @@ def test_emit_audit_tee_shape_is_metadata_only(audit_capture) -> None:
 def test_emit_audit_tee_client_defaults_to_none_for_engine_internal_writes(audit_capture) -> None:
     """An engine-internal write omits ``client`` entirely; the field must ship as null, never as a
     stale address inherited from whatever request happened to run last (ADR 0150)."""
-    emit_audit_tee(action="retention.purge", actor="system", channel_id=None, detail=None, ts=3.0)
+    emit_audit_tee(
+        action="retention.purge",
+        actor="system",
+        channel_id=None,
+        detail=None,
+        ts=3.0,
+        row_id=1,
+        row_hash=_HASH,
+    )
     assert _only(audit_capture)["client"] is None
 
 
@@ -180,6 +229,8 @@ def test_emit_audit_tee_redacts_hl7_in_detail(audit_capture) -> None:
         channel_id=None,
         detail="PID|1||123456^^^HOSP^MR||DOE^JANE^Q||19800101|F",
         ts=1.0,
+        row_id=1,
+        row_hash=_HASH,
     )
     line = audit_capture.messages[0]
     assert "DOE" not in line and "JANE" not in line and "123456" not in line
@@ -189,7 +240,15 @@ def test_emit_audit_tee_redacts_hl7_in_detail(audit_capture) -> None:
 def test_emit_audit_tee_redacts_bare_delimiter_run_without_segment(audit_capture) -> None:
     # A field/component dump that is PHI even without a segment header (≥2 HL7 delimiters) must also
     # be scrubbed before it ships off-box.
-    emit_audit_tee(action="x", actor=None, channel_id=None, detail="DOE^JANE^M^MR", ts=1.0)
+    emit_audit_tee(
+        action="x",
+        actor=None,
+        channel_id=None,
+        detail="DOE^JANE^M^MR",
+        ts=1.0,
+        row_id=1,
+        row_hash=_HASH,
+    )
     line = audit_capture.messages[0]
     assert "DOE" not in line and "JANE" not in line
     assert "[redacted]" in line
@@ -201,7 +260,15 @@ def test_emit_audit_tee_is_best_effort_on_logging_failure(audit_capture, monkeyp
 
     monkeypatch.setattr(audit_tee.audit_logger, "info", boom)
     # Must swallow the logging failure — the caller's audit row is already durable.
-    emit_audit_tee(action="auth.login", actor="z", channel_id=None, detail=None, ts=1.0)
+    emit_audit_tee(
+        action="auth.login",
+        actor="z",
+        channel_id=None,
+        detail=None,
+        ts=1.0,
+        row_id=1,
+        row_hash=_HASH,
+    )
 
 
 def test_tee_docstring_and_cipher_registry_agree_about_audit_log() -> None:
@@ -403,7 +470,15 @@ def test_the_handlerless_shape_is_the_one_the_defect_needs() -> None:
 
 def test_the_tee_reaches_a_handler_with_no_root_handler_installed(capsys) -> None:
     with _handlerless_process():
-        emit_audit_tee(action="auth.login", actor="alice", channel_id=None, detail=None, ts=1.0)
+        emit_audit_tee(
+            action="auth.login",
+            actor="alice",
+            channel_id=None,
+            detail=None,
+            ts=1.0,
+            row_id=1,
+            row_hash=_HASH,
+        )
 
     captured = capsys.readouterr()
     assert [r["action"] for r in _audit_records_in(captured.err)] == ["auth.login"]
@@ -416,7 +491,15 @@ def test_the_tee_does_not_double_emit_when_a_sink_is_already_configured(audit_ca
     """A configured process must be untouched. The fallback exists for the ``found == 0`` case the
     standard library diverts to its last resort, so a process that configured a sink keeps exactly
     one copy -- serve and supervise included."""
-    emit_audit_tee(action="auth.login", actor="alice", channel_id=None, detail=None, ts=1.0)
+    emit_audit_tee(
+        action="auth.login",
+        actor="alice",
+        channel_id=None,
+        detail=None,
+        ts=1.0,
+        row_id=1,
+        row_hash=_HASH,
+    )
 
     assert [json.loads(m)["action"] for m in audit_capture.messages] == ["auth.login"]
     assert audit_tee.audit_logger.handlers == [audit_capture]
@@ -427,7 +510,15 @@ def test_the_fallback_sink_carries_the_identical_redaction_chain() -> None:
     would ship what the configured path scrubs. Pinned against the shared builder, which is the one
     definition both the configured stderr sink and this fallback are built from."""
     with _handlerless_process():
-        emit_audit_tee(action="auth.login", actor="alice", channel_id=None, detail=None, ts=1.0)
+        emit_audit_tee(
+            action="auth.login",
+            actor="alice",
+            channel_id=None,
+            detail=None,
+            ts=1.0,
+            row_id=1,
+            row_hash=_HASH,
+        )
         installed = list(audit_tee.audit_logger.handlers)
         assert len(installed) == 1, installed
         chain = [type(f).__name__ for f in installed[0].filters]
@@ -454,10 +545,26 @@ def test_the_fallback_sink_renders_phi_exactly_as_the_configured_sink_does(capsy
     """
     phi = "PID|1||123456^^^HOSP^MR||DOE^JANE^Q||19800101|F"
     with _handlerless_process():
-        emit_audit_tee(action="message.error", actor="svc", channel_id=None, detail=phi, ts=1.0)
+        emit_audit_tee(
+            action="message.error",
+            actor="svc",
+            channel_id=None,
+            detail=phi,
+            ts=1.0,
+            row_id=1,
+            row_hash=_HASH,
+        )
         # The same record through the handler `serve` installs, for a side-by-side rendering.
         configure_logging("INFO")
-        emit_audit_tee(action="message.error", actor="svc", channel_id=None, detail=phi, ts=1.0)
+        emit_audit_tee(
+            action="message.error",
+            actor="svc",
+            channel_id=None,
+            detail=phi,
+            ts=1.0,
+            row_id=1,
+            row_hash=_HASH,
+        )
 
     captured = capsys.readouterr()
     assert "DOE" not in captured.err and "JANE" not in captured.err
@@ -477,11 +584,27 @@ def test_the_fallback_sink_is_removed_once_the_process_configures_logging() -> N
     must not then get every later record twice."""
     late = _ListHandler()
     with _handlerless_process():
-        emit_audit_tee(action="first", actor=None, channel_id=None, detail=None, ts=1.0)
+        emit_audit_tee(
+            action="first",
+            actor=None,
+            channel_id=None,
+            detail=None,
+            ts=1.0,
+            row_id=1,
+            row_hash=_HASH,
+        )
         assert len(audit_tee.audit_logger.handlers) == 1  # the fallback went in
 
         audit_tee.audit_logger.addHandler(late)
-        emit_audit_tee(action="second", actor=None, channel_id=None, detail=None, ts=2.0)
+        emit_audit_tee(
+            action="second",
+            actor=None,
+            channel_id=None,
+            detail=None,
+            ts=2.0,
+            row_id=1,
+            row_hash=_HASH,
+        )
 
         assert audit_tee.audit_logger.handlers == [late]
     assert [json.loads(m)["action"] for m in late.messages] == ["second"]
