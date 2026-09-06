@@ -10248,11 +10248,13 @@ the `iss` parameter attests who issued the authorization RESPONSE, not where the
 fix is a coherence check in `_require_oidc_fields` after the existing per-URL loop. **NOT BUILT
 HERE:** `config/settings.py` was held by another live session's uncommitted work and the collision
 gate refused the edit.
-**ONE THING A READER WILL GET WRONG, supplied by the packet A session and worth stating in terms
-because it is the natural objection:** `auth/oidc/claims.py` pins the issuer before any continuity
-guard runs, so a reader who finds that pin will assume it closes the window above. It does not. The
-pin is on the TOKEN, which the engine does not hold until `exchange_code` has already returned -- it
-is the same check, at the same point in the sequence, and the sequence is the finding.
+**ONE THING A READER WILL GET WRONG, and it is the natural objection, so state it in terms.**
+**#1143** records that `auth/oidc/claims.py:227` pins the issuer before any continuity guard runs --
+it uses that fact to rule out grounding ITS cell on the (issuer, sub) pair -- so a reader arriving
+here from that row will assume the same pin closes the window above. It does not, and the reason is
+the one this item already turns on: the pin is on the TOKEN, which the engine does not hold until
+`exchange_code` has already returned. It is the same check, at the same point in the sequence, and
+the sequence is the finding. Cite #1143 rather than re-deriving the pin.
 Anchor drift: `flow.py:307` resolves at `:306`; `flow.py:253-262` at `:252-260`;
 `settings.py:1943` at `:2003`; `settings.py:2236-2248` at `:2296-2310`.
 ## 1159. research an honest pass for ASVS 10.2.3 -- least-privilege OAuth scopes the engine never validates
