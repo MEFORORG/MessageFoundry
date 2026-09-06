@@ -23431,3 +23431,26 @@ The round-number rows are dead on an assumption worth naming: **that an estate c
 **A `--show-context` run echoed a real token value into a session transcript.** The scanner's own docstring says that flag is never used in CI because a hit means the content is already tracked, so echoing it copies the leak into a public log. It was used once here on a scratch probe file outside the repository, the value reached no tracked file, no commit and no pull request, and every later run in this review was reasons-only. Recorded because a control that is bypassed quietly is worse than one that is bypassed loudly.
 
 **No concrete six-digit value appears in this item, deliberately.** Writing one is the trap **#322** documents: a placeholder built from a loaded prefix is a real hit in tracked content, and nothing warns you before the hook fires.
+
+## 1444. a backlog item can be filed with no value or difficulty, so a scoring pass decays at the filing rate
+
+> 🔢 **Filed 2026-09-04 - not started. This is a DECISION, not a defect: the items are behaving correctly and the ledger has no gate.** Value **5/10** · Difficulty **3/10** · _fill-in_. Value 5 because the ranked tables silently stop being a complete view of the corpus, and a reader has no way to tell a ranked ledger from a partly-ranked one; a re-run is a real workaround, which is what holds it out of the higher bands. Difficulty 3 because either remedy is small on its own and the cost is the ruling above it, not the code.
+
+**Cluster:** repository tooling / ledger integrity. **Priority:** P3. **Verdict:** research.
+**Severity:** no engine effect, no PHI axis, and **no deployment axis (sec. 0)** -- this is a property of `docs/BACKLOG.md`, which ships in no wheel. The cost is that a planning read of the ranked tables understates the corpus by however many items were filed since the last pass.
+
+**The mechanism, in one sentence: a scoring pass is a SNAPSHOT, and nothing in CI requires a score at filing, so the gap re-opens at the filing rate.**
+
+**Measured 2026-09-04 against `main` at `685d4f548`, and independently confirmed by the seat that ran the pass:** **278** open items, **5** carrying no value or difficulty -- #1424, #1427, #1429, #1430 and #1439. Every one of the five was filed on 2026-09-03. The previous pass closed this to zero on 2026-09-03 when PR 754 merged, so **the gap went from 0 to 5 in about a day.**
+
+**The items are not doing anything wrong, and #1427 says so in its own banner:** *"NO SCORE. Value and difficulty belong to a scoring pass"*. That is a deliberate convention, and it is exactly what makes this a decision rather than a bug report.
+
+**The two remedies, and why neither is free.**
+
+*Move the gate to filing time.* One check instead of recurring passes. It **contradicts the convention #1427 states**, so it needs a ruling before it needs code. And it would **red on the five existing unscored items on day one**, so it is unshippable without a grandfather baseline or a changed-lines-only scope -- the same shape as **#1435**, which is open in PR 831 and **not yet on `main`** -- there, an unscoped ledger gate measured 22 day-one failures and was deliberately not built for that reason.
+
+*Re-run the pass periodically.* Keeps the convention intact and needs no gate, but it is unbounded recurring work whose cadence nobody has set, and the gap re-opens between every run. That is precisely what just happened.
+
+**What would NOT settle this:** scoring the five and calling it closed. That is another snapshot, and it decays the same way. The thing to fix is the absence of a gate or a cadence, not the current five.
+
+**Source:** reported 2026-09-04 by the seat that ran the 2026-09-03 scoring pass, one day after that pass closed the gap to zero. Re-measured here with `parse_items` rather than a hand-rolled scan, against that seat's figures, and both the count and the exact five item numbers agreed.
