@@ -23,7 +23,9 @@ runs, no audit rows, no new settings effects):
    substitute the CA and defeat authentication) is **refused** at ``[security].enforcement = enforce``
    and **warned + audited** at ``warn``. It reuses ``_secure_file``'s ``icacls`` DACL mechanism as a
    *verify-only* companion — it inspects the DACL and never changes it. Readability is deliberately not
-   the threat (a CA certificate is public); tamperability is.
+   the threat (a CA certificate is public); tamperability is. The verdict is **tri-state**: a DACL the
+   engine could not read is ``acl_indeterminate``, audited and warned but not refused, and never
+   reported as owner-only (BACKLOG #1142).
 2. An **optional SHA-256 fingerprint pin** per anchor. A configured pin that the PEM's SHA-256 does not
    match **refuses** — always, independent of the enforcement dial — at construction and at reload.
 3. An **anchor-changed audit event**: when a configured anchor's SHA-256 differs from the previously
@@ -51,8 +53,10 @@ if TYPE_CHECKING:
 
 log = logging.getLogger(__name__)
 
-#: The audit action for every trust-anchor observation (baseline / changed / violation). One action so
-#: an operator can filter the whole family, and so :func:`_last_fingerprint` can find the prior load.
+#: The audit action for every trust-anchor observation. One action so an operator can filter the whole
+#: family, and so :func:`_last_fingerprint` can find the prior load. The ``event`` field in the detail
+#: carries which one: ``observed`` (baseline), ``changed``, ``pin_mismatch``, ``acl_insecure``, and
+#: ``acl_indeterminate`` (the ACL could not be read at all — BACKLOG #1142).
 AUDIT_ACTION = "auth.trust_anchor"
 
 
@@ -113,18 +117,55 @@ def _normalize_pin(pin: str) -> str:
 # --- read-only DACL inspection (mirrors _secure_file's icacls mechanism, verify-only) -----------
 
 #: Group/world principals whose members are not the file owner — a WRITE grant to any of them means a
-#: non-owner can substitute the anchor. Matched as a lowercase substring of the icacls principal token
-#: (so ``BUILTIN\Users``, ``DOMAIN\Domain Users``, an unresolved ``*S-1-5-32-545`` all match). SYSTEM and
-#: Administrators are deliberately absent: they are already trusted (they can rewrite any file regardless).
-_BROAD_PRINCIPALS: tuple[str, ...] = (
+#: non-owner can substitute the anchor. SYSTEM and Administrators are deliberately absent: they are
+#: already trusted (they can rewrite any file regardless).
+#:
+#: The English display names, matched as a lowercase substring of the icacls principal token (so
+#: ``BUILTIN\Users`` and ``DOMAIN\Domain Users`` both match). This half is **at least** these and can
+#: never be complete: ``icacls`` resolves a SID to its *localized* name by default, so a German
+#: ``Jeder`` or a Spanish ``Todos`` is Everyone under a name this set does not carry. The SID half
+#: below is the locale-invariant matcher; this one is a convenience for the host that speaks English.
+#: The ``NT AUTHORITY\`` prefix is kept on the three pseudo-groups so a real account named
+#: ``DOMAIN\ServiceAccount`` is not mistaken for ``NT AUTHORITY\SERVICE``.
+_BROAD_PRINCIPAL_NAMES: tuple[str, ...] = (
     "everyone",
     "authenticated users",
     "\\users",  # BUILTIN\Users or DOMAIN\Users
     "domain users",
-    "s-1-1-0",  # Everyone
-    "s-1-5-11",  # Authenticated Users
-    "s-1-5-32-545",  # BUILTIN\Users
+    "nt authority\\interactive",
+    "nt authority\\service",
+    "nt authority\\batch",
+    "creator owner",
 )
+
+#: The locale-invariant half: well-known SIDs, matched **whole** against the principal token (icacls
+#: renders an unresolvable SID with a leading ``*``). Whole-token matching is load-bearing rather than
+#: tidiness — as substrings, ``S-1-5-3`` (BATCH) is a prefix of ``S-1-5-32-544``
+#: (``BUILTIN\Administrators``, deliberately trusted) and ``S-1-5-11`` (Authenticated Users) of
+#: ``S-1-5-113`` (Local Account), so a substring set would report the administrators ACE that sits on
+#: every ordinary Windows file as a broad-principal write.
+_BROAD_PRINCIPAL_SIDS: frozenset[str] = frozenset(
+    {
+        "s-1-1-0",  # Everyone
+        "s-1-5-11",  # Authenticated Users
+        "s-1-5-32-545",  # BUILTIN\Users
+        "s-1-5-4",  # NT AUTHORITY\INTERACTIVE
+        "s-1-5-6",  # NT AUTHORITY\SERVICE
+        "s-1-5-3",  # NT AUTHORITY\BATCH
+        "s-1-3-0",  # CREATOR OWNER
+    }
+)
+
+# INTERACTIVE / SERVICE / BATCH / CREATOR OWNER are broad here and are *trusted* by
+# ``_evaluate_config_dacl`` (``messagefoundry/config/wiring.py``). That divergence is deliberate: the
+# config guard is handed the object's owner SID and can therefore resolve the CREATOR OWNER
+# placeholder to a principal it already trusts, while this parser is handed text and no owner, so it
+# cannot tell the owner from any other creator. Measured on Windows 11: ``icacls`` on a file in a
+# temp directory or a user profile lists only SYSTEM, Administrators and the owner, so none of the
+# four fires on an ordinary anchor placement — whereas ``icacls C:\Users\Public`` lists
+# ``NT AUTHORITY\INTERACTIVE:(OI)(CI)(IO)(M,DC)`` and the same for SERVICE and BATCH, which
+# object-inherit propagates as ``(I)(M)`` onto every file created there. An anchor placed in that
+# directory is modifiable by every interactive logon, and before BACKLOG #1142 it read as owner-only.
 
 #: icacls right tokens that permit modifying the file's contents (simple + specific write masks).
 _WRITE_RIGHTS: frozenset[str] = frozenset(
@@ -132,12 +173,39 @@ _WRITE_RIGHTS: frozenset[str] = frozenset(
 )
 
 
-def owner_only_from_icacls(text: str, *, anchor_path: str) -> bool:
-    """Parse ``icacls <path>`` output; ``True`` when no broad group/world principal has a write-capable
-    right (owner-only-writable). Pure — unit-tested with synthetic icacls output.
+def _is_broad_principal(principal: str) -> bool:
+    """Whether an already-lowercased icacls principal token names an identity broader than the file's
+    owner. The SID is matched whole (after any leading ``*``); the display name as a substring."""
+    if principal.lstrip("*") in _BROAD_PRINCIPAL_SIDS:
+        return True
+    return any(name in principal for name in _BROAD_PRINCIPAL_NAMES)
+
+
+def owner_only_from_icacls(text: str, *, anchor_path: str) -> bool | None:
+    """Parse ``icacls <path>`` output into a **tri-state** verdict. Pure — unit-tested with synthetic
+    icacls output.
+
+    * ``True`` — at least one ACE was read and no broad group/world principal holds a write-capable
+      right (owner-only-writable).
+    * ``False`` — such a principal does hold one.
+    * ``None`` — the DACL could **not be determined**.
+
+    **Determined means exactly this: at least one line parsed as an ACE, i.e. a non-empty principal
+    token followed by a ``:(rights)`` blob.** Empty output, a truncated read, a banner or trailer with
+    no ACE under it, and text that is not icacls output at all therefore all answer ``None``. Before
+    BACKLOG #1142 this returned ``bool`` and fell through to ``True``, so "no broad principal has
+    write" and "I parsed nothing" were the same answer — and the second is an affirmative assertion of
+    owner-only storage the parser has no basis for. ``None`` is the caller's cue to degrade.
+
+    Broad principals are matched by locale-invariant SID and by **at least** the English display names
+    in :data:`_BROAD_PRINCIPAL_NAMES`. Because ``icacls`` resolves SIDs to localized names by default,
+    that name set cannot be complete across locales, so a ``True`` from a non-English host is weaker
+    than the same answer from an English one. Closing that gap needs a SID-form read (``icacls /sid``
+    or the in-process DACL walk ``config/wiring.py`` already ships) and is not done here.
 
     The known ``anchor_path`` is stripped from the leading line so a path that legitimately contains
     ``\\Users`` (e.g. ``C:\\Users\\svc\\anchor.pem``) is never mistaken for a ``BUILTIN\\Users`` ACE."""
+    saw_ace = False
     for raw in text.splitlines():
         line = raw.strip()
         if not line:
@@ -153,15 +221,18 @@ def owner_only_from_icacls(text: str, *, anchor_path: str) -> bool:
         if idx == -1:
             continue
         principal = line[:idx].strip().lower()
+        if not principal:
+            continue  # a rights blob with nothing in front of it is attributable to nobody
+        saw_ace = True
         rights_blob = line[idx:]
-        if not any(bp in principal for bp in _BROAD_PRINCIPALS):
+        if not _is_broad_principal(principal):
             continue
         if "(deny)" in rights_blob.lower():
             continue  # a DENY reduces access; it never grants write
         tokens = {t.strip().upper() for t in re.split(r"[(),]", rights_blob) if t.strip()}
         if tokens & _WRITE_RIGHTS:
-            return False
-    return True
+            return False  # a broad write settles it; the rest of the DACL cannot take it back
+    return True if saw_ace else None
 
 
 def dacl_is_owner_only(path: str | os.PathLike[str]) -> bool | None:
@@ -169,6 +240,10 @@ def dacl_is_owner_only(path: str | os.PathLike[str]) -> bool | None:
     i.e. no group/world principal can modify it. READ-ONLY: it never changes the file's ACL (unlike
     ``_secure_file``, whose ``icacls`` mechanism it mirrors). ``None`` when the DACL cannot be
     determined, so the caller degrades rather than refusing on an inconclusive read.
+
+    Three things make it undeterminable on Windows, and all three are ``None``: ``icacls`` could not
+    be run, it exited non-zero, or (BACKLOG #1142) it exited zero with output carrying no ACE the
+    parser could attribute to a principal. Each logs a warning naming which one happened.
 
     * POSIX: no group- or other-WRITE bit (``mode & 0o022 == 0``).
     * Windows: read the DACL with ``icacls <path>`` (no modifying flags) and flag any broad-group ACE
@@ -194,7 +269,14 @@ def dacl_is_owner_only(path: str | os.PathLike[str]) -> bool | None:
                 (result.stderr or result.stdout or "").strip(),
             )
             return None
-        return owner_only_from_icacls(result.stdout, anchor_path=os.fspath(path))
+        parsed = owner_only_from_icacls(result.stdout, anchor_path=os.fspath(path))
+        if parsed is None:
+            log.warning(
+                "icacls exited 0 for %s but its output carried no readable ACE; the DACL could "
+                "not be determined",
+                path,
+            )
+        return parsed
     try:
         mode = Path(path).stat().st_mode
     except OSError as exc:
@@ -339,6 +421,17 @@ async def _preflight_one(store: Store, spec: AnchorSpec, *, enforcing: bool) -> 
     if verdict.acl_ok is False:
         await _record(
             store, spec, "acl_insecure", fingerprint=verdict.fingerprint, enforcing=enforcing
+        )
+    elif verdict.acl_ok is None:
+        # BACKLOG #1142. This branch used to write no row at all, so an operator following the
+        # runbook's "alert on auth.trust_anchor" instruction saw nothing on the one branch where the
+        # engine cannot vouch for the anchor — a detective control blind on its own subject.
+        #
+        # It is deliberately VISIBLE and NOT FATAL. Refusing here would buy the verdict with
+        # availability, and it must not ship before the verified bytes are bound to the bytes the
+        # opener actually loads: until then a refusal would attest a file that is re-read afterwards.
+        await _record(
+            store, spec, "acl_indeterminate", fingerprint=verdict.fingerprint, enforcing=enforcing
         )
     _enforce_verdict(spec, verdict, enforcing=enforcing)
 
