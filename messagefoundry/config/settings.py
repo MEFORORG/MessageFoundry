@@ -4320,8 +4320,9 @@ def security_loosenings(
     ``[security]`` switch — pinned by a completeness floor in ``tests/test_security_posture_defaults.py``
     that iterates ``SecuritySettings.model_fields`` and fails on an unreported, unexempted one — plus an
     ENUMERATED set of deviations that live elsewhere: ``[store].aad_bind``,
-    ``[auth].ad_session_recheck_seconds``, ``[alerts].email_use_tls``/``email_tls_verify`` (#323
-    layer 3), and three per-connection deviations — ``cleartext_accepted``, ``tls_allow_expired``, and a
+    ``[auth].ad_session_recheck_seconds``, ``[auth].login_rate_limit_enabled`` (#1137),
+    ``[alerts].email_use_tls``/``email_tls_verify`` (#323 layer 3), and three per-connection
+    deviations — ``cleartext_accepted``, ``tls_allow_expired``, and a
     generic-ODBC ``DATABASE`` hop with TLS unenforced (#333). It is NOT yet
     an exhaustive registry of every security-relevant switch in every section; ``[store]``/``[auth]``
     carry others (``encrypt``, ``trust_server_certificate``, ``enabled``, ``require_mfa``,
@@ -4525,6 +4526,23 @@ def security_loosenings(
                 "aad_bind",
                 "at-rest values are NOT bound to their (table, column, row) cell — a ciphertext moved "
                 "between cells decrypts instead of failing its auth tag (no effect without a store key)",
+            )
+        )
+    # BACKLOG #1137 (ASVS 6.3.4). UNCONDITIONAL, unlike ad_session_recheck_seconds below: every shipped
+    # sign-in pathway charges this window, so there is no deployment shape on which turning it off is
+    # the only meaningful choice. It is named here because it is the ONE engine-side control the
+    # delegated pathways share — Kerberos and OIDC present no factor the engine verifies and carry no
+    # engine per-account lockout, so switching it off leaves them with no engine-side control at all,
+    # while the posture read-out went on reporting the shipped posture.
+    if not auth.login_rate_limit_enabled:
+        out.append(
+            (
+                "login_rate_limit_enabled",
+                "the sign-in window is OFF — password-spraying across many accounts is unthrottled "
+                "(per-account lockout still bites, but only on the local pathway), and the SAME "
+                "switch removes the per-actor re-authentication budget, so password change, "
+                "re-authentication and second-factor confirmation lose their only anti-automation "
+                "control; the delegated directory pathways have no engine-side control left",
             )
         )
     # Conditional on ad_enabled, like allowed_client_networks above: with no directory there is nothing to

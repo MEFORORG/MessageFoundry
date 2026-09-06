@@ -439,6 +439,11 @@ def require_service_cert(*permissions: Permission) -> Callable[[Request], Awaita
     - **PHI-fenced** — refuses at construction to gate a PHI-view permission (:data:`_PHI_VIEW_PERMISSIONS`);
       a cert-identity must never authorize patient data because there is no step-up to gate it. A
       misconfiguration fails **loud** at app build, not silently at request time.
+    - **audited like the bearer plane** — the authorization decision writes the SAME rows
+      :func:`require` writes, under the same ``[diagnostics].audit_all_authz`` gate (BACKLOG #1137,
+      ASVS 6.3.4). Fencing the pathway apart is about which CREDENTIAL admits a caller; a control that
+      applies to one pathway and not the other is the inconsistency 6.3.4 names, and until this landed
+      a first deployment would have had no authorization trail for a service principal at all.
 
     None of :func:`require`'s session concerns (must-change, step-up, MFA, per-actor throttles) apply —
     they are meaningless for an attested service hop."""
@@ -453,21 +458,49 @@ def require_service_cert(*permissions: Permission) -> Callable[[Request], Awaita
 
     async def dependency(request: Request) -> Identity:
         identity = await resolve_client_cert_identity(request)
-        if identity is None:
+        # Re-read rather than assert: the resolver already returned None unless auth was attached AND
+        # enabled, so the second disjunct below is unreachable by construction — it is here to give the
+        # audit calls a non-optional service without widening the 401's meaning.
+        auth = get_auth(request)
+        if identity is None or auth is None:
             # No subject in the message (no cert / unmapped) — never echo the presented subject (could be
             # attacker-chosen); a generic 401 keeps the deny-by-default surface uniform.
+            #
+            # DELIBERATELY UNAUDITED, and this is the same call require() makes on its own 401. There is
+            # no resolved identity, so audit_permission_denied has no actor to name, and the only string
+            # in hand is the presented subject the line above refuses to echo. It is also the bound on
+            # the rows below: this arm fires for a caller that has proven nothing, at whatever rate that
+            # caller chooses, so auditing it would let an unauthenticated peer append to the hash-chained
+            # log without limit. The narrow residual is a cert that IS allow-listed but maps to an
+            # unknown/disabled account — bounded by the operator's own map, and arguably worth its own
+            # row — but naming it needs an audit action that takes a principal instead of an Identity,
+            # which does not exist yet. Recorded, not built.
             raise HTTPException(status.HTTP_401_UNAUTHORIZED, "client certificate not authorized")
         for permission in permissions:
             if not identity.has(permission):
+                # The WARNING stays: on a service hop there is no operator watching a 403 in a browser,
+                # so the log line is the immediate signal. The audit row is the durable one — a log is
+                # neither hash-chained nor queryable, and this refusal left no trail in the chain at all
+                # before BACKLOG #1137.
                 log.warning(
                     "service-cert authz denied: actor=%s path=%s missing=%s",
                     identity.username,
                     request.url.path,
                     permission.value,
                 )
+                await auth.audit_permission_denied(identity, permission, request.url.path)
                 raise HTTPException(
                     status.HTTP_403_FORBIDDEN, f"missing permission: {permission.value}"
                 )
+        # The grant side, gated exactly as require() gates it (one shared rule, not a cert-plane copy):
+        # under [diagnostics].audit_all_authz every satisfied route is recorded, and with the switch off
+        # a GET falls out and only the sensitive set survives. PHI-view never reaches here — the
+        # constructor above refuses to gate one.
+        audit_all = _audit_all_authz(request.app.state)
+        if audit_all or request.method != "GET":
+            audited = _grant_audit_permission(permissions, audit_all=audit_all)
+            if audited is not None:
+                await auth.audit_permission_granted(identity, audited, request.url.path)
         return identity
 
     return dependency

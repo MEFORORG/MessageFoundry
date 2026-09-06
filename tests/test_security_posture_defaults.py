@@ -157,6 +157,40 @@ def test_recheck_at_the_default_with_ad_enabled_is_not_a_loosening() -> None:
     assert "ad_session_recheck_seconds" not in _names(auth=_ad())
 
 
+# --- [auth].login_rate_limit_enabled ---------------------------------------------------------
+
+
+def test_login_rate_limit_off_is_a_named_loosening() -> None:
+    """BACKLOG #1137 (ASVS 6.3.4): the sign-in limiter is the one engine-side control the DELEGATED
+    pathways share, and the registry could not see it being turned off.
+
+    Kerberos and OIDC present no factor the engine verifies and carry no engine per-account lockout, so
+    with this off a first deployment would run those pathways with no engine-side control at all — and
+    the posture read-out would still say the instance is at the shipped posture.
+
+    Both arms in one test, so the detector is shown to be able to produce a different answer: the
+    switch at its shipped value must NOT be reported, or the list becomes noise."""
+    named = dict(
+        security_loosenings(
+            SecuritySettings(),
+            StoreSettings(),
+            AuthSettings(login_rate_limit_enabled=False),
+            AlertsSettings(),
+            (),
+            (),
+            (),
+        )
+    )
+    assert "login_rate_limit_enabled" in named
+    risk = named["login_rate_limit_enabled"]
+    # BOTH limiters, because the one flag builds NEITHER (`_login_limiter` and `_reauth_limiter`).
+    # Naming only the sign-in window would understate what the operator gave up, which is the
+    # compensating-control-on-a-false-premise shape this registry exists to prevent.
+    assert "sign-in" in risk
+    assert "re-authentication" in risk
+    assert "login_rate_limit_enabled" not in _names()
+
+
 # --- the cross-field refusal, keyed on model_fields_set ---------------------------------------
 #
 # These go through load_settings, NOT the constructor. Constructing AuthSettings(...) in Python marks
@@ -799,7 +833,6 @@ def test_every_store_and_auth_bool_is_reported_or_exempt() -> None:
         "ad_tls_verify",  # gated by weakened_tls_escape_permitted
         "ad_allow_insecure_ldap",  # gated by the same clamp
         "oidc_require_mfa_claim",  # gated by the OIDC serve gate
-        "login_rate_limit_enabled",  # DoS hardening with its own serve-time defaults
         "phi_read_rate_limit_enabled",
         "admin_write_rate_limit_enabled",
     }

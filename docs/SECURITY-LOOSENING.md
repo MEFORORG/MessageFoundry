@@ -388,6 +388,27 @@ the call to the Console on 2026-09-02; the Console decided ([ADR 0118](adr/0118-
   design, so it was never a substitute for these.
 - **See:** [ADR 0079](adr/0079-kerberos-idp-session-coordination.md) (2026-07-28 amendment).
 
+### `[auth].login_rate_limit_enabled = false` — the sign-in window **and** the re-authentication budget both disappear
+> **One switch, two limiters.** Setting it false constructs neither the sign-in sliding window nor the
+> per-actor credential-ceremony budget. Reading the name as "the login limiter" understates it by half,
+> which is why the registry entry names both.
+- **What you lose:** password-spraying across many accounts is unthrottled. Per-account lockout still
+  bites, but it only covers **local** accounts, so a spray that tries one password against a thousand
+  directory usernames trips nothing. You also lose the only anti-automation control on the
+  post-session credential ceremonies — password change, re-authentication, and second-factor
+  confirmation — where lockout does not apply at all.
+- **Why it is worth its own entry:** it is the one engine-side control the **delegated** pathways
+  share. Kerberos and OIDC present no factor the engine verifies and carry no engine per-account
+  lockout, so with this off they have no engine-side control left. Until BACKLOG #1137 the posture
+  read-out could not see it, and a deployment that had turned it off would still have read as being at
+  the shipped posture.
+- **When acceptable:** a load test or a CI leg driving synthetic sign-ins; a bench measuring argon2
+  cost. Not a production posture on any bind.
+- **Compensating controls:** front the API with a proxy or WAF limiter — the engine's limiter is
+  in-process, so a multi-host deployment needs one regardless. Keep the per-account lockout at its
+  default, and review the WARNING-logged throttle events.
+- **See:** [SECURITY.md](SECURITY.md) "Route → limiter map".
+
 ### `cleartext_accepted = true` on a connection — a declared cleartext hop
 > **Connection-scoped, unlike every other entry here.** It is not a `[security]` switch; it is a field on
 > one connection — an `outbound(...)` or a `FhirLookup(...)` — declared next to the host it governs, with
@@ -525,6 +546,7 @@ carried from that drive-to-pass, not re-derived here.**
 | `enforcement` (refuse/warn dial) | V13 Configuration (secure defaults) | **CM-6** Configuration Settings · **CM-7** Least Functionality (secure-by-default) | §164.308(a)(1) Risk Analysis / Management |
 | `[store].aad_bind` (at-rest cell binding) | V11 Cryptography | **SC-28(1)** Cryptographic Protection · **SI-7** Software, Firmware, and Information Integrity | §164.312(c)(1) Integrity · §164.312(a)(2)(iv) Encryption and Decryption |
 | `[auth].ad_session_recheck_seconds` (directory revocation propagation) | V7 Session Management · V6 Authentication | **AC-2(3)** Disable Accounts · **AC-12** Session Termination | §164.312(a)(2)(i) Unique User Identification · §164.308(a)(3)(ii)(C) Termination Procedures |
+| `[auth].login_rate_limit_enabled` (sign-in window + re-authentication budget) | V6 Authentication (anti-automation) · V2 Validation and Business Logic | **AC-7** Unsuccessful Logon Attempts · **SC-5** Denial-of-Service Protection | §164.308(a)(5)(ii)(C) Log-in Monitoring · §164.312(d) Person or Entity Authentication |
 | `cleartext_accepted` (per-connection declared cleartext hop) | V12 Secure Communication | **SC-8** Transmission Confidentiality and Integrity · **SC-8(1)** Cryptographic Protection | §164.312(e)(1) Transmission Security · §164.312(e)(2)(ii) Encryption |
 | `tls_allow_expired` (per-connection expiry-only relaxation) | V12 Secure Communication | **SC-8(1)** Cryptographic Protection · **SC-12** Cryptographic Key Establishment and Management | §164.312(e)(1) Transmission Security · §164.312(e)(2)(ii) Encryption |
 | generic-ODBC `DATABASE` TLS unenforced (per-connection, driver-owned) | V12 Secure Communication | **SC-8** Transmission Confidentiality and Integrity · **SC-8(1)** Cryptographic Protection | §164.312(e)(1) Transmission Security · §164.312(e)(2)(ii) Encryption |
