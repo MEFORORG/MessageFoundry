@@ -547,9 +547,17 @@ def harden_cipher_suites(ctx: ssl.SSLContext, *, connector: str) -> None:
     # An earlier draft of this comment called it "owner-ratified", which was wrong and is retracted
     # here rather than quietly deleted. No owner ruling on these six suites exists in this tree. Two
     # real rulings sit close enough to borrow from by accident, and that is how the error was made:
-    # the STRICT ALLOW-LIST below carries an owner ruling of 2026-08-22, and the posture PRECEDENCE
-    # gradient in this module is owner-ratified under ADR 0153. Neither is about retaining a suite
-    # the interpreter default already enables.
+    # the STRICT ALLOW-LIST below carries an owner ruling of 2026-08-22, recorded in BACKLOG #1317
+    # ("What to build, per the 2026-08-22 owner ruling"), and the posture PRECEDENCE gradient in this
+    # module is owner-ratified under ADR 0153. Neither is about retaining a suite the interpreter
+    # default already enables.
+    #
+    # BOTH CITATIONS NAME WHERE THE RULING LIVES, ON PURPOSE. The 2026-08-22 ruling exists ONLY in
+    # the live ledger under its item number -- measured, the sole engine-tree files mentioning it are
+    # docs/BACKLOG.md and this one. A reader checking it against a rulings document, or against the
+    # vault, finds nothing and would report a sound citation as unsourced; the packet C session came
+    # one query short of doing exactly that. So: check the LEDGER before calling any ruling citation
+    # in this repository unsupported, and cite the item number rather than the bare date.
     #
     # The interop half is unmeasured too. The rejection note above says real MLLP/DICOM hospital
     # peers still speak these suites; no census is cited for that, here or anywhere this module can
