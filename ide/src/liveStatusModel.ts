@@ -8,6 +8,29 @@
 // never hidden behind a healthy sibling. Node-side unit-tested (no Extension Host).
 
 import { runtimeKey, type RuntimeInfo, type RuntimeMap } from "./graphModel";
+import type { ProbePlanEntry } from "./engineStatusModel";
+
+/** The one engine route this feature reads. Deliberately NOT added to engineStatusModel's
+ *  PROBE_ENDPOINTS: that is the engine-link DOCTOR's frozen allowlist, and a test keeps
+ *  `/connections` out of it because probing workload is how an indicator becomes a monitor. Live
+ *  decorations are the sanctioned exception (ADR 0091), so the route is named here instead. */
+export const CONNECTIONS_ROUTE = "/connections";
+
+/**
+ * What the live-decorations TIMER is allowed to do. The single entry is `authenticated: false`, and
+ * a test asserts exactly that — the same `ProbePlanEntry` vocabulary, and the same rule, as
+ * engineStatusModel's `POLL_PLAN`.
+ *
+ * Why it may not carry a bearer: `GET /connections` is gated by plain `require(...)`, and
+ * `require()` resolves the token with `identity_for_token(bearer_token(request))` — the default
+ * `activity=True`, which refreshes the session's idle clock. So a bearer on a 5-to-10-second timer
+ * from an open VS Code window would keep refreshing that clock and make the engine's 30-minute idle
+ * timeout unreachable for as long as the window stays open (CWE-613) — on a client that sits open
+ * all day. A comment saying "do not add a token here" is not a control; this list is.
+ */
+export const LIVE_STATUS_PLAN: readonly ProbePlanEntry[] = [
+  { route: CONNECTIONS_ROUTE, authenticated: false },
+];
 
 /** The subset of the engine's ConnectionRow (api/models.py) the IDE consumes. Everything else in
  *  the payload (peers, ports, backlog, shard ownership …) is deliberately ignored — the tree shows

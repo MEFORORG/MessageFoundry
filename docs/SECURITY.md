@@ -1407,12 +1407,26 @@ session alive. `[auth].max_sessions_per_user` caps concurrent sessions (default 
 the cap revokes the user's oldest — ASVS 7.1.2; `0` = unlimited). Clients send the token as
 `Authorization: Bearer <token>` (the WebSocket prefers the header; the legacy `?token=` query param is
 deprecated because it leaks into proxy/access logs). The token is a **PHI-scoped** credential (the
-user's full RBAC for the session lifetime): the web console holds it in the browser session and the
-`apiclient` (test harness / automation) keeps it in memory, each re-validating it against `/auth/me`
-before use (discarding a stale/revoked one); `apiclient` also **refuses to send credentials over
-plaintext `http` to a non-loopback host** (no TLS yet) unless explicitly run with `--insecure` for
-trusted-network dev. (The retired PySide6 desktop console's OS-keyring token cache is an accepted
-retirement loss — BACKLOG #103.)
+user's full RBAC for the session lifetime), so where each client keeps it matters. **At least** these
+three shipped clients hold one:
+
+| Client | Where the token lives | Outlives the process that got it? |
+|---|---|---|
+| Web console | the browser session | no |
+| `apiclient` (test harness / automation) | process memory | no |
+| VS Code extension (`ide/src/auth.ts`) | VS Code **SecretStorage**, keyed by engine URL | **yes** |
+
+The console and `apiclient` each re-validate against `/auth/me` before use, discarding a stale or
+revoked token; `apiclient` also **refuses to send credentials over plaintext `http` to a non-loopback
+host** (no TLS yet) unless explicitly run with `--insecure` for trusted-network dev. The extension is
+the one holder that puts the credential in **durable, OS-managed** storage. It persists across VS Code
+restarts, so on a deploying site the token would outlive the editor window that acquired it and stay
+usable until the session's own idle or absolute timeout retires it server-side. The extension clears
+its copy on sign-out (revoking the session on the engine first, where the engine is reachable) and on
+a 401 from a request that carried the token; a background timer never clears it, because a request the
+session took no part in is not evidence about the session. (The retired PySide6 desktop console's
+OS-keyring token cache is an accepted retirement loss — BACKLOG #103. That retired one *instance* of
+durable token storage, not the shape: the extension's SecretStorage cache is a live one.)
 
 ### Directory session reconciliation — propagating an AD disable (ADR 0079 mechanism 2)
 
