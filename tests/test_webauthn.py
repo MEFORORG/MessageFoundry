@@ -305,7 +305,15 @@ async def test_challenge_single_use_ttl_and_per_user_bound() -> None:
 # --- lifecycle + factor generalization -------------------------------------------
 
 
-async def test_ad_user_cannot_enroll_passkey() -> None:
+async def test_a_directory_account_can_enroll_a_passkey() -> None:
+    """RED when: either passkey ceremony re-adds a ``!= AuthProvider.LOCAL`` refusal.
+
+    This test used to assert the opposite (BACKLOG #1144). The refusal was true while the directory
+    legs minted MFA-satisfied, and it is what made that relaxation self-sealing: the engine could not
+    stop granting satisfaction on an assertion it cannot read, because a directory account had no
+    engine factor to fall back on. Both halves move together or the change is a lockout, so this
+    exercises the WHOLE ceremony rather than the guard alone.
+    """
     from messagefoundry.auth.ldap import AdPrincipal
 
     store = await MessageStore.open(":memory:")
@@ -319,14 +327,13 @@ async def test_ad_user_cannot_enroll_passkey() -> None:
             dn="CN=aduser,DC=x",
             groups=frozenset(),
         )
-        # mfa_verified is the per-mechanism grant (ASVS 6.3.4); the simple-bind leg passes True under
-        # the signed delegated-directory relaxation, which is what this AD principal stands in for.
+        # mfa_verified is the per-mechanism grant (ASVS 6.3.4). Passing True here stands in for a
+        # federated sign-in that DID carry a verified claim; what is under test is the enrollment
+        # ceremony, and a satisfied session keeps the fixture free of the MFA gate.
         out = await service._complete_ad_login(principal, None, mfa_verified=True)
         assert out.ok and out.identity is not None and out.token is not None
-        with pytest.raises(ValueError, match="only local users"):
-            await service.begin_webauthn_registration(
-                out.identity, token=out.token, rp_id=RP, rp_name="MessageFoundry"
-            )
+        await _enroll(service, out.identity, out.token, label="ad-key")
+        assert await service.store.has_webauthn_credentials(out.identity.user_id) is True
     finally:
         await store.close()
 

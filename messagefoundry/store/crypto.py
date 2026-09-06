@@ -52,10 +52,38 @@ wipe are *best-effort*: they swallow every failure (no privilege, ``rlimit`` exh
 buffer) and never raise or log — they are hardening, not correctness.
 
 This is an **honest, documented PARTIAL** close of 13.3.3, not a complete one. The unavoidable
-**residual**: (1) CPython ``str``/``bytes`` are **immutable** with no wipe hook, so the caller's
-plaintext ``str``, the base64 marker ``str`` we return, and the ``bytes`` ``cryptography`` hands back
-from ``decrypt`` linger in the interpreter's heap until GC/reuse; (2) ``cryptography`` copies the key
-into an **internal OpenSSL** ``EVP`` buffer we cannot reach to wipe. Full **11.7.1** in-use memory
+**residual**: (1) CPython ``str`` is **immutable** with no wipe hook, so the caller's plaintext
+``str`` and the base64 marker ``str`` we return linger in the interpreter's heap until GC/reuse;
+(2) ``cryptography`` copies the key into an **internal OpenSSL** ``EVP`` buffer we cannot reach to
+wipe.
+
+**One clause of that residual USED TO NAME THE LIBRARY BOUNDARY, and it was wrong (BACKLOG #1174).**
+It read that the ``bytes`` ``cryptography`` hands back from ``decrypt`` are immutable with no wipe
+hook, which invited the reading that the wall is the library and nothing a caller writes could move
+it. Measured against the PINNED ``cryptography`` (50.0.1, ``requirements.lock``; not the 49.0.0 a
+stale interpreter may report): ``AESGCM.decrypt_into(nonce, ct, aad, buf)`` exists, writes the
+plaintext straight into a caller-owned ``bytearray``, and still raises ``InvalidTag`` on a tampered
+input. So the plaintext need never become immutable ``bytes`` at the boundary at all.
+
+**The wall is one hop later, at** ``pt.decode("utf-8")``, where an immutable ``str`` is minted and
+``hasattr(s, "__setitem__")`` is False. State it there, because the two are not the same limit and
+only the second is binding.
+
+**11.7.2 (encrypt-after-use) is a reasoned CANNOT-PASS, and it does not turn on either wall.** Three
+grounds, each independently sufficient. First, the verb asks for ENCRYPTION after use, and every
+mechanism available here is DESTRUCTION -- switching to ``decrypt_into`` plus ``memset`` would be a
+strictly better wipe than this module has today and would still not be an encryption; counting one as
+the other is the substitution this project's own review rules forbid. Second, the copy set is
+unbounded and author-controlled: Routers and Handlers are code-first Python, so every split, slice,
+regex group and f-string a Handler writes mints a fresh immutable object this module never sees, and
+a control that cannot enumerate its own surface cannot claim to cover it. Third, "as soon as
+feasible" modifies WHEN, not WHETHER, and the in-process body is never re-encrypted at all.
+
+On a first deployment (CLAUDE.md section 0 -- there are none) the PERSISTED copy would be encrypted
+correctly and the mutable buffers this module owns would be locked and zeroized; the clinical body in
+the engine's address space would linger in plaintext until GC, alongside any Handler-derived copies.
+Reaching that requires memory access to the engine process -- a core dump, a debugger attach,
+unencrypted swap, or local administrator -- so it is defence in depth, not a reachable defect. Full **11.7.1** in-use memory
 *encryption* is **host/hypervisor territory** (SGX/SEV/TDX, encrypted RAM) — out of this process's
 reach; the deployment therefore carries it as a **stated environment requirement** (trusted host,
 disabled/encrypted swap, restricted local admin) accepted via a signed risk acceptance, not something
