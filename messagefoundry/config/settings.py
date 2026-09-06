@@ -2125,6 +2125,33 @@ class AuthSettings(_Section):
             raise ValueError("oidc_clock_skew_seconds must be between 0 and 300")
         return value
 
+    @field_validator("oidc_flow_ttl_seconds")
+    @classmethod
+    def _check_oidc_flow_ttl(cls, value: int) -> int:
+        # The pending-flow TTL decides two things at once, which is why it needs a bound at BOTH
+        # ends rather than the upper bound alone (BACKLOG #1156, ASVS 10.1.2).
+        #
+        # MEASURED, and these are the facts the endpoints rest on:
+        #   * The value is handed straight to the flow cookie's `Max-Age`
+        #     (messagefoundry_webconsole/routes/oidc.py). At <= 0 the browser discards the cookie on
+        #     receipt, so EVERY federated login then fails the `flow_binding_missing` refusal with
+        #     nothing in the error naming the cause.
+        #   * `FlowCache._prune` reclaims only entries whose deadline has PASSED, and the cache is
+        #     reject-when-full rather than evict-oldest (`oidc_flow_cache_max`, deliberately -- see
+        #     that field). So this value IS the window an abandoned flow holds a slot for, and a
+        #     large enough one turns `oidc_flow_cache_max` abandoned logins into a console outage
+        #     that only a restart clears.
+        #   * It is also the single-use replay window for a staged `(state, nonce, code_verifier)`,
+        #     which is the ASVS 10.1.2 half.
+        #
+        # The exact endpoints are a JUDGMENT, not a measurement: 30 s is short of any realistic
+        # interactive IdP round trip with MFA, and 1800 s matches the order of the longest bounded
+        # lifetime already in this section (`oidc_jwks_ttl_seconds`). What is not a judgment is that
+        # an unbounded value is wrong in both directions.
+        if not 30 <= value <= 1800:
+            raise ValueError("oidc_flow_ttl_seconds must be between 30 and 1800")
+        return value
+
     @field_validator("totp_skew_steps")
     @classmethod
     def _check_totp_skew(cls, value: int) -> int:
