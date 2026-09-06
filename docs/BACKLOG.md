@@ -24614,6 +24614,15 @@ exists to replace"*. Nor retrying the sweep until it reads, which converts a res
 slower resource problem and hides how often it happens. Nor marking the test `xfail` under a full
 suite, which is the same concession with a nicer name.
 
+**THE MOST LIKELY TRIGGER IS ENVIRONMENTAL, AND SAYING SO IS THE POINT -- otherwise the next reader
+hunts for a bug in the store and there may not be one.** Both runs happened while several full
+suites were executing concurrently on one machine, so **disk contention is the leading hypothesis**.
+Stated at its real strength: the packet B session reports seven concurrent sessions at the time;
+independently I can confirm only that at least four full-suite runs overlapped in that window (two
+of mine, one per packet). **The causal link is UNTESTED.** Nobody has run this suite alone on an
+idle box and shown the failure disappears, which is the cheap experiment and the one that would
+settle it. Until then "environmental" is the best-supported reading, not a finding.
+
 **Unknowns worth naming for whoever takes it.** Whether the disk I/O error is contention over the
 temp store path, file-handle exhaustion late in a long run, an antivirus or indexer touching the
 file on Windows, or the 60-second per-test timeout interacting with a slow read; whether it
