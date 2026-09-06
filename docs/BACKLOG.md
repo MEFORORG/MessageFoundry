@@ -26156,3 +26156,61 @@ question for the owner, not for this row.**
 
 **Cluster:** Fleet coordination. **Priority:** unscored -- filed after the 2026-09-03 scoring pass, so it carries no row in the ranking table above. **Verdict:** build (small), pending that measurement. **Severity:** no engine effect, no PHI axis, no deployment axis (sec. 0). It costs duplicated Builder turns and prose conflicts resolved by hand.
 
+
+## 1476. a whole-file scorecard re-render from a stale clone silently reverts every cell landed since that clone's base, and nothing compares stated scope against cells touched
+
+> 🔢 **Filed 2026-09-06 -- not started. Scored at filing.** Value **6/10** · Difficulty **3/10** · _quick win_. A vault commit whose subject names one cell re-rendered the whole scorecard and reverted an owner-approved repair to an unrelated cell. The reverted bytes are identical to the pre-repair state, so the write came from a base predating the repair rather than from any edit to it. It stood three days undetected. The recurrence vector is loaded rather than theoretical: the vault clone checked out beside the engine is 54 commits behind `origin/main`, and a re-render from it would revert every cell landed since its base. The remainder is two additive guards on the existing tool -- refuse to write from a clone behind its remote, and compare the cells a payload NAMES against the cells the write actually changes. Difficulty 3 for two guards plus must-fire and must-not-fire arms.
+> Verdict: build
+> Research: none
+> Closing-act: code
+
+**Cluster:** ASVS record integrity. **Priority:** P2. **Verdict:** build.
+**Severity:** no deployment axis (sec. 0). This is the security **record**, not engine behaviour -- no shipped artifact, no PHI, no runtime path. What it corrupts is the evidence an assessor would read, and the decisions an owner already made.
+
+**The defect, in one sentence:** a targeted scorecard edit is written as a whole-file re-render, so it carries the writer's stale base over every cell it never meant to touch, and nothing compares what the commit says it did against what it did.
+
+### It has already fired once, and the proof is a hash rather than a diff read
+
+Vault commit `0d4df75c` (2026-08-28) re-patterned one cell's absence claim. Its own body records the authority: *"Owner-approved 2026-08-28, as drafted, via the Liaison"*, and it states that the change was carried to the owner as **not** a like-for-like repair.
+
+Vault commit `c117e0a2` (2026-09-03), whose subject names a different cell and a different item, reverted it.
+
+Hashing that cell's absence block across four revisions settles the mechanism without anyone reading a 1,483-line diff:
+
+| revision | absence block |
+|---|---|
+| `0d4df75c^` (before the repair) | `a68537c3d858` |
+| `0d4df75c` (the owner-approved repair) | `90851aadcb04` |
+| `c117e0a2^` (still repaired) | `90851aadcb04` |
+| `c117e0a2` (the sweep) | `a68537c3d858` |
+| `origin/main` today | `a68537c3d858` |
+
+The sweep's output is **byte-identical to the pre-repair state**. That is the discriminating fact: a deliberate re-edit would land on some third hash, and a merge would conflict. Reproducing the old bytes exactly means the writer rendered from a base that predated the repair.
+
+The blast radius was not one cell. The overwhelming majority of cells in the file changed real content under that one-cell subject, and the change was not cosmetic -- normalising each cell to its sorted set of stripped lines leaves the count unchanged, so key reordering and re-indentation explain none of it. Most of it is a legitimate re-verify: anchor `line` values drift as engine code moves, and `verified_at` moves with them. The reverted claim is not, and it rode in under the same commit with nothing separating the two.
+
+### Why the existing guard does not catch it
+
+The preservation guard compares **key sets**. Here no key was added or removed -- the same three fields carry different values -- so it passes by construction. That is the value-corruption blindness `#1242` already records, reached from a new direction: `#1242` is about a writer mangling a value it was handed, and this is about a writer faithfully rendering a value it should never have been holding.
+
+Neither row should be closed on the strength of the other, and a fix to either leaves this open.
+
+### The instrument trap, recorded because it cost this session a wrong answer
+
+`git log -S"<needle>" -- docs/security/asvs-scorecard.toml`, run with no explicit ref in the vault clone beside the engine, **does not list `c117e0a2` at all**. That clone is 4 ahead and 54 behind, `c117e0a2` is not an ancestor of its `HEAD`, and `git log` defaults to `HEAD`. The query returns a short, plausible, wrong list, and nothing about the output says a ref was assumed.
+
+Worse for a reader trying to check the record: that clone's working file still carries the **repaired** form. Anyone who opens it concludes the fix is in place and nothing is wrong.
+
+Name the ref (`git log ... origin/main --`) and confirm ancestry with `git merge-base --is-ancestor` before concluding a commit did not touch a file. This is **SDS-3.8** in its purest form -- the instrument answered "what happened on this branch", and the question was "what happened to the record".
+
+### What would prove a fix
+
+1. A write attempted from a clone behind its remote is **refused**, and the refusal names the gap. The check must run against a clone that is genuinely behind, not a fresh one, or it passes on the only state that was never the problem.
+2. A payload naming one cell that produces changes to cells it does not name is **refused or reported**, with the out-of-scope ids listed. A legitimate whole-file re-verify must have an explicit way to say so, or the guard gets disabled the first time it is inconvenient.
+3. A regression arm replaying this exact pair: apply `c117e0a2`'s shape over a tree carrying `0d4df75c`, and assert the repair survives.
+
+**Related:** `#1242` (the sibling blindness in the same guard -- value corruption rather than key loss, and latent where this one has fired). `#1187` (the ledger row for the reverted cell; its own re-score is a separate act and is not this).
+
+**Source:** measured 2026-09-06 while putting the cell's retirement question to adversarial review. Two of three independent readers found the revert; the hash comparison and the ancestry trap above were confirmed directly afterwards.
+
+---
