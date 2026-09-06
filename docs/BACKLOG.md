@@ -24566,3 +24566,70 @@ Vault `roles/BUILDER.md:213-217`, under the heading "Closing a ledger row makes 
 ### Not checked
 
 I read only `roles/` in the vault and ran no git history there, so I cannot date when any of these lines was written. Eleven of the fourteen playbooks were matched by the needle above but not read, so treat the population as **at least three files**, not a total. I did not check whether any workflow or CI job reads a playbook, and I confirmed no case in which a seat actually followed `BUILDER.md:216` and produced a red PR -- I measured the instruction and the gate, not an incident.
+
+## 1467. the connscale intake-audit probe fails a full-suite run with a SQLite disk I/O error and passes in isolation
+
+> 🔢 **Filed 2026-09-06 -- not started. Reproduced twice, on two branches, by two sessions that were not looking for it.** Value **5/10** · Difficulty **4/10** · _fill-in_. `tests/test_connscale_smoke.py::test_no_accept_acked_message_is_absent_from_the_stopped_engines_store` fails in a full-suite run and passes in isolation. The test is behaving CORRECTLY: its intake audit returns `PROBE_UNUSABLE` because the store sweep raised `OperationalError: disk I/O error`, and the assertion refuses to tolerate a probe that could not answer.
+> Verdict: research
+> Research: none
+> Closing-act: code
+
+**Cluster:** Test suite / CI signal. **Priority:** P3. **Verdict:** research.
+**Severity:** no product defect established, and the engine is NOT implicated. The audit's
+`engine_suspect` arm did not trip -- only the `conclusive` arm did -- so nothing here is evidence
+that a deploying site would lose an acknowledged message. What it costs is a red leg whose cause is
+unattributed, which is exactly the state this check was built to replace.
+
+**What was measured, and by whom.** Two full-suite runs on two branches, neither session aiming at
+this and neither aware of the other until afterwards:
+
+| Run | Branch | Result |
+|---|---|---|
+| 1 | the ASVS packet C branch | 15,198 passed, this one failed |
+| 2 | the ASVS packet B branch | 15,612 passed, this one failed; 11 passed in isolation in 23s |
+
+Isolation on run 1's branch: **passed in 21s**, same interpreter and same worktree as the failing
+full run. **Two agreeing runs corroborate the OBSERVATION, not the cause.**
+
+**THE FAILURE TEXT NAMES A MECHANISM, so this is better than "an ordering flake" and the word
+should not be used for it.** Verbatim from run 1:
+
+> `INTAKE AUDIT COULD NOT ANSWER -- fixed_aggregate@N=12: intake audit [post_mortem]
+> PROBE_UNUSABLE: the store sweep failed: OperationalError: disk I/O error (sent=36 confirmed=36
+> unconfirmed=0 store_rows=0 missing_accepted=0 missing_rejected=0 late_unconfirmed=0 seqs=[]
+> codes=[])`
+
+So the sweep reached the stopped engine's store and SQLite refused the read. `store_rows=0` is a
+consequence of the failed read, not a finding about the store.
+
+**Test order is DETERMINISTIC here, which makes this reproducible rather than seeded.** Neither
+`pytest-randomly` nor `pytest-random-order` nor `xdist` is installed (each probed by
+`importlib.util.find_spec`, all absent), and `pyproject.toml` `addopts` is
+`--timeout=60 --timeout-method=thread` with no ordering flag. So "only under a full suite" is a
+stable property to bisect against, not a seed to chase.
+
+**WHAT WOULD NOT BE A FIX.** Tolerating `PROBE_UNUSABLE` so the leg goes green: the assertion's own
+message forecloses it in terms -- *"tolerating it restores exactly the unattributable red this check
+exists to replace"*. Nor retrying the sweep until it reads, which converts a resource problem into a
+slower resource problem and hides how often it happens. Nor marking the test `xfail` under a full
+suite, which is the same concession with a nicer name.
+
+**Unknowns worth naming for whoever takes it.** Whether the disk I/O error is contention over the
+temp store path, file-handle exhaustion late in a long run, an antivirus or indexer touching the
+file on Windows, or the 60-second per-test timeout interacting with a slow read; whether it
+reproduces on the Linux leg or only on Windows; and which module immediately precedes it in
+collection order, which is the cheapest bisect handle and was not captured before this was filed.
+
+**A FIGURE FROM THIS FAILURE IS ALREADY CIRCULATING MIS-ATTRIBUTED, and it settles nothing.** A
+handoff credited the packet B session with a *"sent=36 confirmed=36 missing=0"*
+intake-audit reading they say they never ran and never reported. The figure is REAL -- it appears
+verbatim inside the assertion message quoted above, as part of the `PROBE_UNUSABLE` summary from
+run 1 -- so it is a mis-attribution rather than an invention. **It is not evidence of a clean
+intake:** it sits inside a verdict that says the audit could not answer, and `store_rows=0` beside
+it is the failed read, not a count. Do not cite it as a result.
+
+**Source:** filed 2026-09-06 from the ASVS packet C full-suite run, corroborated by the packet B
+run, at the request of the Console seat triaging the CI-signal rows, which confirmed no existing
+item covers it (`no_accept_acked_message_is_absent` returns zero across the ledger; the nearby
+ordering-flavoured rows are a PATH-order finding and #1304's windows-2025 pwsh launch timeout,
+neither of which is this).
