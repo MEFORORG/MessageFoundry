@@ -42,7 +42,10 @@ from messagefoundry.transports.file import _content_matches_declared, _looks_lik
 
 def test_argon2_parameters_are_pinned() -> None:
     h = passwords._hasher
-    # Pinned (not library defaults) so a dependency upgrade can't silently change the work factor.
+    # Pinned so a dependency upgrade cannot silently change the work factor. NOT a claim that these
+    # differ from argon2-cffi's defaults -- measured against the pinned 25.1.0, all five are
+    # identical to them, and this comment said otherwise until BACKLOG #1352. The pin still bites:
+    # it is what makes a future default change fail here instead of shipping.
     assert h.time_cost == 3
     assert h.memory_cost == 65536  # 64 MiB — exceeds OWASP's argon2id memory minimum
     assert h.parallelism == 4
