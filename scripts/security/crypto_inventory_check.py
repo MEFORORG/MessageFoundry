@@ -445,8 +445,11 @@ INVENTORY: dict[str, frozenset[str]] = {
     "messagefoundry/transports/smart.py": frozenset(
         {"messagefoundry.config.tls_policy", "messagefoundry.transports.signing", "secrets"}
     ),
+    # BACKLOG #1171 retired ws_password_type='digest', which was this file's only hashlib use (the
+    # WS-Security PasswordDigest SHA-1 construction). The row is bidirectional, so the token had to go
+    # with the code or the gate would red the other way.
     "messagefoundry/transports/soap.py": frozenset(
-        {"messagefoundry.config.tls_policy", "messagefoundry.transports.signing", "hashlib", "ssl"}
+        {"messagefoundry.config.tls_policy", "messagefoundry.transports.signing", "ssl"}
     ),
     # ADR 0113 (2026-07-22 amendment): the tray's TOKENLESS /health + /ui probes must verify the
     # engine's server cert when [api].tls_cert_file makes the loopback bind serve https. Builds the

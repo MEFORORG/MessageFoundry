@@ -2677,9 +2677,7 @@ def Soap(
     ws_security: bool = False,  # stamp <wsse:Security> (Timestamp + optional UsernameToken) in send()
     ws_username: str | EnvRef | None = None,  # UsernameToken username (defaults to basic_user)
     ws_password: str | EnvRef | None = None,  # UsernameToken password (defaults to basic_password)
-    ws_password_type: Literal[
-        "text", "digest"
-    ] = "text",  # "text" (PasswordText; recommended over mTLS) | "digest"
+    ws_password_type: Literal["text"] = "text",  # PasswordText; "digest" retired (#1171)
     ws_addressing: bool = False,  # stamp <wsa:Action/To/MessageID> in send(); requires soap_version 1.2
     ws_timestamp_ttl_seconds: int = 300,  # Created→Expires window (must be >= max retry backoff)
     # ADR 0015 amendment (#236): {placeholder_token: env(secret)} substituted into the <Body> at send
@@ -4583,10 +4581,18 @@ def build_outbound_connection(
                 "(presenting an identity to an unverified peer is incoherent) (ADR 0015)."
             )
         pw_type = spec.settings.get("ws_password_type", "text")
-        if pw_type not in ("text", "digest"):
+        if pw_type == "digest":  # nosec B105 -- a password *type*, not a secret
             raise WiringError(
-                f"outbound connection {name!r}: SOAP ws_password_type must be 'text' or 'digest', "
-                f"got {pw_type!r} (ADR 0015)."
+                f"outbound connection {name!r}: SOAP ws_password_type='digest' is retired "
+                "(BACKLOG #1171, ASVS 11.4.1). Its PasswordDigest construction is SHA-1 by profile "
+                "definition, and it protected nothing this connector was not already protecting: a "
+                "UsernameToken over a cleartext hop is refused, so the channel carries the "
+                "credential either way. Use 'text'."
+            )
+        if pw_type != "text":
+            raise WiringError(
+                f"outbound connection {name!r}: SOAP ws_password_type must be 'text', "
+                f"got {pw_type!r} (ADR 0015, BACKLOG #1171)."
             )
         if (spec.settings.get("ws_security") or spec.settings.get("ws_addressing")) and str(
             spec.settings.get("soap_version", "1.1")

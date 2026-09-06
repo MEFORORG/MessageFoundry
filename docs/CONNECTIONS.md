@@ -1317,7 +1317,7 @@ wrapping an HL7 payload) — **not** the full envelope. The transport builds the
 | `client_key_password` | — | key passphrase (a **secret** — via `env()`) |
 | `ws_security` | `false` | stamp `<wsse:Security>` (a `Timestamp` + optional `UsernameToken`) |
 | `ws_username` / `ws_password` | `basic_*` | `UsernameToken` credentials (secrets — via `env()`) |
-| `ws_password_type` | `text` | `text` (PasswordText; **recommended over mTLS**) or `digest` (PasswordDigest, computed in `send()`) |
+| `ws_password_type` | `text` | `text` (PasswordText) only. `digest` (PasswordDigest) was **retired** in BACKLOG #1171 (ASVS 11.4.1): the construction is SHA-1 by profile definition, and a UsernameToken over a cleartext hop is refused anyway, so the channel already carried the credential. Setting it raises |
 | `ws_addressing` | `false` | stamp `<wsa:Action>` (from `soap_action`), `<wsa:To>` (from `url`), `<wsa:MessageID>` (per-call) |
 | `ws_timestamp_ttl_seconds` | `300` | the `Created`→`Expires` window |
 
