@@ -99,7 +99,7 @@ path.
 
 ## 4. The engine starts processes
 
-Seven places, and the reason differs at each:
+Eight places, and the reason differs at each:
 
 | What | File | When |
 |---|---|---|

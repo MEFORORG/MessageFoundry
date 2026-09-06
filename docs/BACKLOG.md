@@ -11849,7 +11849,9 @@ bound from the lookup alone turns three red. `docs/SECURITY.md` gets a row becau
 by claiming it lists every enforced limit. **Still open, and it is the cell's actual shortfall:** the
 shared ingest admission seam, the Router/Handler wall-clock cap, the `monitoring:read` GET pacing,
 the paced read on the other unauthenticated intakes, and the vault half of the documented strategy.
-The cell's short-fall was always the data plane, not egress. [PR 942](https://github.com/MEFORORG/MessageFoundry/pull/942).
+The cell's short-fall was always the data plane, not egress.
+
+**Count precision, corrected 2026-09-06 after a self-audit rather than after someone quoted it back.** The 17 above is the number of BOUNDED SITES, and they do not all have the same shape. **Sixteen** go through the shared `read_bounded`/`read_bounded_text` helper (AST-counted, imports excluded, against a misspelled-name control returning zero), and **one** -- the local PEM signing-key read at `transports/signing.py` -- is bounded by its own `_MAX_KEY_FILE_BYTES` constant using the identical `limit + 1` idiom, because it reads a FILE rather than an HTTP response. So "17 egress response reads" is the wrong label for the set even though every member of it is bounded: the honest phrasing is sixteen egress response reads plus one local key-file read. A reader quoting the bare 17 forward as a count of network reads would be off by one. Zero unbounded reads remain in `transports/` or `pipeline/`; the only two textual matches left are a docstring and a "never echo this" comment. [PR 942](https://github.com/MEFORORG/MessageFoundry/pull/942).
 
 ## 1192. research an honest pass for ASVS 15.2.3 -- getting development subcommands out of the wheel without taking dryrun off the operator's box
 
