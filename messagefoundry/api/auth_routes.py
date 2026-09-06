@@ -367,7 +367,7 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
             # back in X-Step-Up-Action). None => refresh only the session window, as before.
             purpose=body.purpose,
         )
-        if not elevation.ok or elevation.token is None:
+        if elevation.token is None:
             # session_lost is a good password on a session revoked mid-ceremony: 401, not the 403 a
             # wrong password gets, so the client re-authenticates instead of re-prompting for a
             # password that was already correct.
@@ -399,7 +399,7 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
         if token is None:
             raise HTTPException(status.HTTP_401_UNAUTHORIZED, "invalid code")
         elevation = await service.verify_mfa(token, body.code, client=_client(request))
-        if not elevation.ok or elevation.token is None:
+        if elevation.token is None:
             # A correct code on a session revoked mid-ceremony is already a 401 here, so unlike
             # /me/reauth there is no status to split — only the message differs.
             detail = "session ended; sign in again" if elevation.session_lost else "invalid code"
@@ -464,7 +464,7 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
             )
         except ValueError as exc:
             raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc)) from exc
-        if not elevation.ok or elevation.token is None:
+        if elevation.token is None:
             if elevation.session_lost:
                 raise HTTPException(status.HTTP_401_UNAUTHORIZED, "session ended; sign in again")
             raise HTTPException(status.HTTP_400_BAD_REQUEST, "invalid code")

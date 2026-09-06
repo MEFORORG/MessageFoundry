@@ -786,7 +786,7 @@ def register(app: FastAPI, deps: UiDeps) -> None:
             raise HTTPException(429, "too many attempts", headers={"Retry-After": "30"})
         form = dict(parse_qsl((await request.body()).decode("utf-8", "replace")))
         elevation = await auth.verify_mfa(token, form.get("code", ""), client=client)
-        if elevation.ok and elevation.token is not None:
+        if elevation.token is not None:
             # The session was re-keyed (ASVS 7.2.4), so the cookie this browser holds is now dead.
             # Re-set it on the redirect or the operator is signed out by their own correct code.
             resp = RedirectResponse("/ui", status_code=303)
@@ -938,7 +938,7 @@ def register(app: FastAPI, deps: UiDeps) -> None:
             )
             if code_elevation.session_lost:
                 return login_redirect_response()  # session ended under a correct code
-            if code_elevation.ok and code_elevation.token is not None:
+            if code_elevation.token is not None:
                 token = code_elevation.token  # rotation 1 of 2
             else:
                 wa_options, wa_notice = await _reauth_webauthn_state(
@@ -962,7 +962,7 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         )
         if pw_elevation.session_lost:
             return login_redirect_response()
-        if not pw_elevation.ok or pw_elevation.token is None:
+        if pw_elevation.token is None:
             still_unsatisfied = not await auth.mfa_satisfied(token)
             wa_options, wa_notice = await _reauth_webauthn_state(
                 request, auth, token, mfa, not still_unsatisfied
@@ -1028,7 +1028,7 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         )
         if elevation.session_lost:
             return JSONResponse({"ok": False, "error": "session expired"}, status_code=401)
-        if not elevation.ok or elevation.token is None:
+        if elevation.token is None:
             return JSONResponse(
                 {"ok": False, "error": "passkey verification failed"}, status_code=400
             )

@@ -289,7 +289,7 @@ def register(app: FastAPI, deps: UiDeps) -> None:
             # A correct code on a session revoked mid-enrolment: MFA IS now on, but this browser's
             # cookie is dead, so the recovery codes cannot be shown here. Land on login.
             return login_redirect_response()
-        if not elevation.ok or elevation.token is None:
+        if elevation.token is None:
             return HTMLResponse(pages.mfa_confirm_page(error="Invalid code."), status_code=400)
         # Activated: the recovery codes render ONCE — never re-fetchable. The confirm re-keyed the
         # session (ASVS 7.2.4), so this response must carry the new cookie or the operator is signed
@@ -471,7 +471,7 @@ def register(app: FastAPI, deps: UiDeps) -> None:
             return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
         if elevation.session_lost:
             return JSONResponse({"ok": False, "error": "session expired"}, status_code=401)
-        if not elevation.ok or elevation.token is None:
+        if elevation.token is None:
             return JSONResponse(
                 {"ok": False, "error": "passkey verification failed"}, status_code=400
             )

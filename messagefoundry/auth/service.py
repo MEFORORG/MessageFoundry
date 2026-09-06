@@ -186,12 +186,23 @@ class Elevation:
       happened rather than report a correct credential as incorrect.
 
     ``recovery_codes`` is populated only by :meth:`AuthService.confirm_mfa_enrollment` (shown once).
+
+    ``ok`` is DERIVED, not stored, and that is load-bearing rather than tidiness. Held as a field it
+    was a second spelling of ``token is not None`` -- true of all 19 constructions -- so the type
+    could represent a state the system never produces, mypy could not narrow ``token`` from ``ok``,
+    and every consuming site paid ``if not elevation.ok or elevation.token is None``: a second clause
+    whose only job was to re-derive the first in a form the checker accepts. As a property the
+    impossible combination cannot be constructed and one clause narrows.
     """
 
-    ok: bool
     token: str | None = None
     session_lost: bool = False
     recovery_codes: tuple[str, ...] = ()
+
+    @property
+    def ok(self) -> bool:
+        """Elevated: a new session token was minted. See the class docstring for the three states."""
+        return self.token is not None
 
 
 @dataclass(frozen=True)
@@ -1883,14 +1894,14 @@ class AuthService:
                 detail=_json({"ceremony": ceremony, "reason": "session_gone"}),
                 client=client,
             )
-            return Elevation(ok=False, session_lost=True)
+            return Elevation(session_lost=True)
         await self._audit(
             "auth.session_rotated",
             actor=actor,
             detail=_json({"ceremony": ceremony}),
             client=client,
         )
-        return Elevation(ok=True, token=rotated, recovery_codes=recovery_codes)
+        return Elevation(token=rotated, recovery_codes=recovery_codes)
 
     async def identity_for_token(
         self, token: str | None, *, activity: bool = True
@@ -2082,7 +2093,7 @@ class AuthService:
             ok = await self._reauth_ad(identity.username, password)
         else:
             ok = await self.verify_current_password(identity, password)
-        elevation = Elevation(ok=False)
+        elevation = Elevation()
         if ok:
             # (1) Every stamp for this elevation, against the OLD hash. The rotation carries these
             # columns forward; a stamp issued after it would silently write nothing.
@@ -2449,7 +2460,7 @@ class AuthService:
                 detail=_json({"phase": "enroll"}),
                 client=client,
             )
-            return Elevation(ok=False)
+            return Elevation()
         plain = totp.generate_recovery_codes(self._settings.mfa_recovery_code_count)
         hashes = [await self._argon2(hash_password, c) for c in plain]
         await self._store.enable_totp(identity.user_id, recovery_code_hashes=hashes)
@@ -2480,13 +2491,13 @@ class AuthService:
         before the second factor would be elevated in place to a fully authenticated session on a
         first deployment."""
         if not token:
-            return Elevation(ok=False)
+            return Elevation()
         session = await self._store.get_session(hash_token(token))
         if session is None or session.revoked_at is not None:
-            return Elevation(ok=False)
+            return Elevation()
         user = await self._store.get_user(session.user_id)
         if user is None or user.disabled or not user.totp_enabled:
-            return Elevation(ok=False)
+            return Elevation()
         now = time.time()
         # Per-account lockout covers the SECOND factor too (parity with the password path): a run of
         # wrong codes locks the account, so MFA guessing isn't bounded only by the shared per-IP login
@@ -2498,7 +2509,7 @@ class AuthService:
                 detail=_json({"reason": "locked"}),
                 client=client,
             )
-            return Elevation(ok=False)
+            return Elevation()
         if await self._verify_second_factor(user, code, client=client):
             # ORDER-CRITICAL: this whole three-write group lands against the OLD hash, and only then
             # does the session rotate. Moving any of them after the rotation writes NOTHING and reports
@@ -2528,7 +2539,7 @@ class AuthService:
                 client=client,
                 detail={"failed_attempts": attempts},
             )
-        return Elevation(ok=False)
+        return Elevation()
 
     async def _verify_second_factor(
         self, user: UserRecord, code: str, *, client: str | None = None
@@ -2805,7 +2816,7 @@ class AuthService:
                 detail=_json({"phase": "enroll"}),
                 client=client,
             )
-            return Elevation(ok=False)
+            return Elevation()
         credential_id_hash = hash_bytes(result.credential_id)
         if await self._store.get_webauthn_credential(credential_id_hash) is not None:
             raise ValueError("this passkey is already enrolled")
@@ -2899,13 +2910,13 @@ class AuthService:
         secrets and a flaky authenticator must not lock the account; abuse is bounded by the
         route's ``allow_login_attempt`` gate + cookie-holder-only reachability + these audits."""
         if not token:
-            return Elevation(ok=False)
+            return Elevation()
         session = await self._store.get_session(hash_token(token))
         if session is None or session.revoked_at is not None:
-            return Elevation(ok=False)
+            return Elevation()
         user = await self._store.get_user(session.user_id)
         if user is None or user.disabled:
-            return Elevation(ok=False)
+            return Elevation()
         now = time.time()
         # A locked account is refused BEFORE any verify (verify_mfa parity).
         if user.locked_until is not None and now < user.locked_until:
@@ -2915,7 +2926,7 @@ class AuthService:
                 detail=_json({"reason": "locked"}),
                 client=client,
             )
-            return Elevation(ok=False)
+            return Elevation()
         pending = self._webauthn_challenges.pop((hash_token(token), "assert"))
         if pending is None or pending.user_id != user.id:
             await self._audit(
@@ -2924,7 +2935,7 @@ class AuthService:
                 detail=_json({"reason": "expired"}),
                 client=client,
             )
-            return Elevation(ok=False)
+            return Elevation()
         try:
             raw_id = webauthn.credential_id_from_response(response_json)
         except webauthn.WebAuthnVerificationError:
@@ -2934,7 +2945,7 @@ class AuthService:
                 detail=_json({"reason": "malformed"}),
                 client=client,
             )
-            return Elevation(ok=False)
+            return Elevation()
         cred = await self._store.get_webauthn_credential(hash_bytes(raw_id))
         if cred is None or cred.user_id != user.id or cred.rp_id != rp_id:
             # Unknown credential, another user's, or minted under a different origin — same
@@ -2945,7 +2956,7 @@ class AuthService:
                 detail=_json({"reason": "unknown_credential"}),
                 client=client,
             )
-            return Elevation(ok=False)
+            return Elevation()
         try:
             new_count = webauthn.verify_assertion(
                 response_json=response_json,
@@ -2964,7 +2975,7 @@ class AuthService:
                 detail=_json({"label": cred.label}) if clone else None,
                 client=client,
             )
-            return Elevation(ok=False)
+            return Elevation()
         if not await self._store.update_webauthn_sign_count(
             cred.credential_id_hash, expected=cred.sign_count, new=new_count, used_at=now
         ):
@@ -2975,7 +2986,7 @@ class AuthService:
                 detail=_json({"label": cred.label}),
                 client=client,
             )
-            return Elevation(ok=False)
+            return Elevation()
         await self._store.mark_session_mfa_verified(hash_token(token))
         await self._audit("auth.webauthn_verified", actor=user.username, client=client)
         return await self._elevated(
