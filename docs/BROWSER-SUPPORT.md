@@ -37,10 +37,10 @@ does not recognise it, ignores it, and matches the nonce instead, so the console
 Only nonce-source support decides the outcome. The two cases look identical in a smoke test, which is
 why the distinction is written down here rather than left to a tester.
 
-### Minimum browser versions are not published
+### Minimum browser versions are deliberately not stated
 
 **Unresolved.** MessageFoundry ships no pinned browser-compatibility dataset, so there is no version
-table here that anyone could check against a source. Publishing engine versions without one would mean
+table here that anyone could check against a source. Naming engine versions without one would mean
 writing numbers chosen to match what already works, which tells you nothing about the feature the
 console actually needs.
 
