@@ -648,7 +648,23 @@ def test_envelope_key_transport_is_out_of_reach_of_this_setting() -> None:
 
 def _weak_pki(tmp_path: Path, bits: int = 1024) -> dict[str, Any]:
     """A complete Direct PKI at `bits`, minted the same way as the `pki` fixture. Separate rather than
-    parameterized on the fixture so the default path in every other test stays at 2048."""
+    parameterized on the fixture so the default path in every other test stays at 2048.
+
+    **CodeQL FLAGS THE TWO 1024-BIT GENERATIONS BELOW AS "use of weak cryptographic key", AND IT IS
+    RIGHT ABOUT THE CODE AND WRONG ABOUT THE RISK.** These keys exist ONLY to be REFUSED: they are the
+    negative controls for the `_require_key_strength` floor added under BACKLOG #1166, and deleting
+    them to clear the alert would delete the only proof that the floor works, which is strictly worse
+    security than the alert describes. No key minted here is ever offered to a peer, written outside
+    `tmp_path`, or used to sign or encrypt anything -- every one is fed to a constructor that must
+    raise. The repository already carries five fixtures of exactly this shape for the same reason, in
+    `test_auth_oidc.py` and `test_outbound_signing.py`; those are unflagged only because the PR check
+    reports alerts on CHANGED lines, not because they differ.
+
+    Left unsuppressed deliberately. CodeQL is not a required context (verified 2026-09-06 against
+    branch protection, not against the checked-in mirror), so this costs no merge, and an inline
+    suppression directive whose effect nobody had measured would be a worse artifact than a comment
+    a reader can check.
+    """
     ca_key = rsa.generate_private_key(public_exponent=65537, key_size=bits)
     name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "Weak Direct CA")])
     now = datetime.datetime.now(datetime.UTC)
