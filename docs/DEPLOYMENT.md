@@ -237,7 +237,9 @@ HIPAA posture (BAA, KMS, PrivateLink, region pinning), see [`CLOUD-PHI-HIPAA.md`
    C-STORE SCU default to plaintext** and need `tls = true` per connection (raw TCP and X12 have no
    `tls` to set at all), and RemoteFile `protocol=ftp` is cleartext. Either way, a
    **cleartext off-loopback hop is refused** on any `enforcement = enforce` instance — the hop authority
-   no longer reads the instance's data label, so a *synthetic* box is refused too. Per-connection, the only
+   no longer reads the instance's data label, so a *synthetic* box is refused too, and for the HTTP family
+   the dial does not soften it either (see the authority note under the
+   [matrix](#channel--tls-posture-matrix)). Per-connection, the only
    honest way across is `cleartext_accepted = true` + `cleartext_reason` (ADR 0153: warn + audit at every
    construction, listed by `messagefoundry check` and `GET /security/posture`). Do **not** set
    `MEFOR_ALLOW_INSECURE_TLS` in production — it no longer influences a cleartext hop at all, and where it
@@ -309,6 +311,14 @@ ALLOW, then a per-connection `cleartext_accepted` + `cleartext_reason` WARN (log
 construction), then WARN while `[security].enforcement` is not `enforce`, else **REFUSE**. It no longer
 reads the instance's data label, and `MEFOR_ALLOW_INSECURE_TLS` no longer reaches it at all. MLLP, raw
 TCP, X12, the DICOM SCU, the HTTP family and EMAIL all decide there.
+
+**The `enforcement` dial does not free the HTTP family, and that is the one asymmetry to carry out of
+this paragraph.** ADR 0092 decision 5 floors a would-be WARN back to REFUSE for a cleartext hop, so a
+cleartext off-loopback **REST / SOAP / FHIR / DICOMweb** destination is refused at construction on a
+**non**-enforcing instance as well. Measured across all four postures (PHI and non-PHI, enforcing and
+not): those four refuse on every one, while MLLP, raw TCP and X12 build on the non-enforcing arm in the
+same run. So `enforcement = warn` is not a way to stand up a cleartext HTTP destination —
+`cleartext_accepted` is the only one, and it is audited at every construction.
 
 **Two outbound channels do not — and they are the two that reach furthest.** Confirming that MLLP and
 REST obey the authority does not settle these:

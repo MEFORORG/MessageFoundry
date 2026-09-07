@@ -10,7 +10,10 @@ incremental decompression-bomb ceiling on every decompressor, corrupt/truncated 
 from __future__ import annotations
 
 import gzip
+import io
+import os
 import time
+import zipfile
 
 import pytest
 
@@ -23,6 +26,7 @@ from messagefoundry.parsing.compression import (
     zip_compress,
     zip_decompress,
 )
+from messagefoundry.parsing.sniff import archive_member_name_reason
 
 _BODY = b"MSH|^~\\&|SEND|FAC|RECV|FAC|20260717||ADT^A01|1|P|2.5\rPID|1||123^^^MRN\r" * 200
 
@@ -225,3 +229,164 @@ def test_max_entries_keeps_its_default() -> None:  # #1237
     import inspect
 
     assert inspect.signature(zip_decompress).parameters["max_entries"].default == 1024
+
+
+# --- archive-member admission (#1128, ASVS 5.2.2 within-an-archive / 5.3.2) ---
+
+
+def _hostile_zip(entries: dict[str, bytes]) -> bytes:
+    """Build a ZIP whose member names bypass ``zip_compress`` (which a Handler would not control).
+
+    ``zipfile.ZipInfo`` writes the filename verbatim, so this is the only way to produce the names a
+    hostile or compromised partner would put in an archive. Synthetic data only."""
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        for name, payload in entries.items():
+            zf.writestr(zipfile.ZipInfo(filename=name, date_time=(1980, 1, 1, 0, 0, 0)), payload)
+    return buf.getvalue()
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "../../etc/passwd.hl7",  # the *.hl7 pattern matches it; fnmatch's * spans /
+        "sub/../../escape.hl7",  # traversal in the middle, not the head
+        "/abs/adt.hl7",  # absolute
+        "C:evil.hl7",  # drive-relative: carries NO separator, slips a slash-only check
+        "..",
+        ".",
+        "win\\dir\\adt.hl7",  # backslash: APPNOTE mandates /, so this is a smuggled separator
+        "double//slash.hl7",  # empty component
+        "",
+        "bad\x00name.hl7",
+        "bell\x07.hl7",
+    ],
+)
+def test_archive_member_name_reason_refuses_traversal(name: str) -> None:
+    assert archive_member_name_reason(name) is not None
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "adt.hl7",
+        "sub/dir/b.hl7",
+        "file with spaces.hl7",
+        "unicode-é.hl7",
+        ".gitignore",  # a leading dot on the leaf is a name, not an extension
+        "no_extension",
+        "a..b.hl7",  # dots that are not a whole component
+    ],
+)
+def test_archive_member_name_reason_admits_legitimate(name: str) -> None:
+    # The must-not-fire arm. A check that refuses everything is not a control.
+    assert archive_member_name_reason(name) is None
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "../../etc/passwd.hl7",
+        "sub/../../escape.hl7",
+        "/abs/adt.hl7",
+        "C:evil.hl7",
+    ],
+)
+def test_zip_decompress_refuses_traversal_member_names(name: str) -> None:
+    # End to end through the reader, on the shapes CPython's zipfile hands back intact. Two hostile
+    # shapes are pinned elsewhere because its own writer/reader normalize them away, which is a fact
+    # about the library and not about the guard: a NUL-bearing name is TRUNCATED at the NUL on read
+    # (measured: "bad\x00name.hl7" reads back as "bad"), so it can never reach the guard through this
+    # door and is pinned on the guard directly above; a backslash reaches the guard only off Windows,
+    # for the reason the next test records.
+    blob = _hostile_zip({name: _BODY})
+    with pytest.raises(CompressionError, match="refused"):
+        zip_decompress(blob, max_output_bytes=None)
+
+
+@pytest.mark.skipif(
+    os.sep == "\\",
+    reason=(
+        "zipfile._sanitize_filename replaces os.sep with '/', so on Windows a backslash member name "
+        "cannot reach the guard through zipfile at all -- measured on CPython 3.14. It DOES reach it "
+        "wherever os.sep is not a backslash, which is where this arm runs."
+    ),
+)
+def test_zip_decompress_refuses_backslash_member_name() -> None:
+    # A hostile archive can carry a literal backslash in the stored name, which a slash-only containment
+    # check reads as one long harmless filename. ZipInfo will not write one, so patch the stored bytes:
+    # the two names are the same length, so both the local header and the central directory copies swap
+    # in place with no offset fixups.
+    blob = _hostile_zip({"win/dir/adt.hl7": _BODY}).replace(
+        b"win/dir/adt.hl7", b"win\\dir\\adt.hl7"
+    )
+    with zipfile.ZipFile(
+        io.BytesIO(blob)
+    ) as zf:  # the patch must survive the reader, or this proves
+        assert zf.namelist() == ["win\\dir\\adt.hl7"]  # nothing about the guard
+    with pytest.raises(CompressionError, match="backslash"):
+        zip_decompress(blob, max_output_bytes=None)
+
+
+def test_zip_decompress_admits_legitimate_nested_and_odd_names() -> None:
+    entries = {
+        "sub/dir/b.hl7": _BODY,
+        "file with spaces.hl7": _BODY,
+        "unicode-é.hl7": _BODY,
+        "notes.txt": b"free text, no signature to check",
+        ".gitignore": b"*.pyc",
+        "no_extension": b"\x00\x01\x02",
+    }
+    assert zip_decompress(_hostile_zip(entries), max_output_bytes=None) == entries
+
+
+def test_zip_decompress_refuses_member_contradicting_its_extension() -> None:
+    # ASVS 5.2.2: the member's own extension names the expected type, and these bytes are not it.
+    with pytest.raises(CompressionError, match=r"does not match the \.hl7 extension"):
+        zip_decompress(_hostile_zip({"adt.hl7": b"%PDF-1.7 not hl7"}), max_output_bytes=None)
+    with pytest.raises(CompressionError, match=r"does not match the \.json extension"):
+        zip_decompress(_hostile_zip({"r.json": b"<Patient/>"}), max_output_bytes=None)
+    with pytest.raises(CompressionError, match=r"does not match the \.pdf extension"):
+        zip_decompress(_hostile_zip({"doc.pdf": _BODY}), max_output_bytes=None)
+
+
+def test_zip_decompress_admits_members_matching_their_extension() -> None:
+    entries = {
+        "adt.hl7": _BODY,
+        "r.json": b'{"resourceType":"Patient"}',
+        "r.xml": b"<Patient/>",
+        "doc.pdf": b"%PDF-1.7\nbody",
+        "img.png": b"\x89PNG\r\n\x1a\nrest",
+        "inner.gz": gzip_compress(b"x"),
+        "claim.edi": b"ISA*00*",
+    }
+    assert zip_decompress(_hostile_zip(entries), max_output_bytes=None) == entries
+
+
+def test_zip_decompress_leaves_unmodelled_extensions_unchecked() -> None:
+    # Stated so the limit is pinned rather than assumed: at least .txt, .csv and .dat carry no signature
+    # to check, so this gate does NOT close the verb's L2 "all files being accepted" clause on its own.
+    entries = {"a.txt": b"\x00\x01", "b.csv": b"%PDF-1.7", "c.dat": b"anything"}
+    assert zip_decompress(_hostile_zip(entries), max_output_bytes=None) == entries
+
+
+def test_zip_member_refusal_names_no_content_or_filename() -> None:
+    # PHI guard: a member name can carry a patient identifier, so the refusal names the member's
+    # POSITION and the structural reason only -- never the name, never the body.
+    blob = _hostile_zip({"../SMITH_JOHN_999-99-9999.hl7": b"PID|1||SSN-999-99-9999"})
+    try:
+        zip_decompress(blob, max_output_bytes=None)
+    except CompressionError as exc:
+        assert "SMITH" not in str(exc)
+        assert "999-99" not in str(exc)
+        assert "member 1" in str(exc)
+    else:  # pragma: no cover - the guard must fire
+        raise AssertionError("expected CompressionError")
+
+
+def test_zip_member_name_is_refused_before_any_bytes_are_read() -> None:
+    # The name check dominates the size ceiling: a traversal name in a bomb archive is refused for what
+    # it is, before the bomb is spent. Both would raise, so assert on WHICH reason came back.
+    blob = _hostile_zip({"../bomb.dat": b"\x00" * 4_000_000})
+    with pytest.raises(CompressionError, match="relative path component"):
+        zip_decompress(blob, max_output_bytes=1000)
