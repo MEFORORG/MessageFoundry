@@ -24278,6 +24278,27 @@ A session working the ASVS scorecard has filed an item proposing two guards for 
 
 Nothing here assumes the check gets built. If the owner rules to build it, the natural home is **beside the existing advisory checks** -- the way `dangling backlog citations (advisory)` is wired in `.github/workflows/quality-advisory.yml`, which reports into the step summary, never gates a merge, and carries no paths filter (a defect of this class is introduced by editing prose, so a paths-filtered job would miss it). It should not be a new hard gate: the population it screens is a single number today, and a gate that has fired once has not yet earned the right to block anyone.
 
+### The WIRING is the load-bearing half, and this repo already holds the counter-example
+
+**A correct checker that nothing runs is not a weak guard, it is worse than none**, because it reads in the tree as though the class is covered. Do not accept a build of this that adds `scripts/docs/*.py` and stops there.
+
+Measured 2026-09-07: [`scripts/docs/citation_line_check.py`](../scripts/docs/citation_line_check.py) exists and is referenced **zero** times under `.github/workflows/` and **zero** times in `.pre-commit-config.yaml`. Tracked mentions are its own test, `tests/tooling_manifest.txt`, and this file. Nothing runs it, so nothing reports what it finds. `backlog_status_check.py` sits in `.pre-commit-config.yaml`, which is exactly why its failures get noticed at all. The two tools differ in wiring, not in quality.
+
+So the acceptance test for a build is a **wiring** entry plus a **negative control**, not a passing run:
+
+1. Add the workflow step or hook entry in the same change as the checker.
+2. **Deliberately break a row and confirm the guard reds.** A guard whose only true positive was repaired before the test existed has never been observed failing, and a green run proves nothing about it. This trick is how a builder established that `citation_line_check.py` does not cover `docs/BACKLOG.md` citations at all -- they corrupted one of their own citations, watched the checker pass, and reported the gap rather than claiming coverage.
+
+   **Already run, so the acceptance test is demonstrated rather than proposed.** Deleting the `## 3. ` prefix from item `#3` -- which carries a ranked row -- moved the verdict from `[1147]` to `[3, 1147]` on this branch. **The file's line count did not change at all**, which is the same measurement as check 2 above and the reason a diffstat cannot be trusted here: `642225f78` reported one deletion for an item it destroyed.
+
+### The guard's first real user is whoever lands it
+
+New items append at the ledger tail, so concurrent filings are scheduled conflicts against one boundary, and the resolution is keep-both. **That manoeuvre is how `#1147` died** -- `642225f78` was itself a tail append. So this detector is the post-rebase verification for its own merge, and for every ledger rebase after it. Three checks, in order:
+
+1. Count parsed items before and after. It must rise by **exactly** the number of items added -- not roughly, and not "the file got longer".
+2. Inspect the boundary line itself. `#1147` died as a *prefix* deletion, so the heading text survived glued to the previous paragraph and the line count barely moved. **Length is not the signal.**
+3. Run the row-versus-item comparison in its loose form.
+
 ### Two traps that cost measurement time
 
 1. **Set `PYTHONIOENCODING=utf-8` before printing anything derived from the banner alphabet.** A stock Windows console is cp1252 and raises `UnicodeEncodeError` on the status glyphs. It cost two separate runs here.
