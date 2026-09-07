@@ -8,9 +8,14 @@ drops. This module is the primitive: a Handler calls it on demand against a
 body, and the File connector uses the single-stream ``gzip`` pair for its ``compress=``/``decompress=``
 option (:mod:`messagefoundry.transports.file`).
 
-It is **pure** — stdlib only (:mod:`gzip`, :mod:`zlib`, :mod:`zipfile`, :mod:`io`), **no engine
+It is **pure** — stdlib (:mod:`gzip`, :mod:`zlib`, :mod:`zipfile`, :mod:`io`) plus one sibling under
+``parsing/`` (:mod:`messagefoundry.parsing.sniff`, for the archive-member admission checks), **no engine
 imports** — so it sits under the ``parsing/`` carve-out (a client may import it, mirroring
-:mod:`messagefoundry.parsing.binary` / :mod:`messagefoundry.parsing.x12`). Compression is **orthogonal**
+:mod:`messagefoundry.parsing.binary` / :mod:`messagefoundry.parsing.x12`). The sibling import is
+deliberate rather than a copied magic-byte table: the extension-keyed check and the declared-type check
+must not be able to drift apart.
+
+Compression is **orthogonal**
 to the ADR 0028 base64 *carriage* codec: carriage makes bytes NUL-safe over the str/TEXT store;
 compression shrinks them. They compose but never share a marker.
 
@@ -46,6 +51,11 @@ import io
 import zipfile
 import zlib
 from collections.abc import Mapping
+
+from messagefoundry.parsing.sniff import (
+    archive_member_content_reason,
+    archive_member_name_reason,
+)
 
 __all__ = [
     "CompressionError",
@@ -205,7 +215,16 @@ def zip_decompress(
     ``max_entries`` caps the member count (a many-entry archive is a bomb axis too). ``max_output_bytes``
     caps the **total** decompressed size across all members, enforced with per-member bounded reads so a
     lying central-directory size cannot force full expansion. A corrupt archive, too many members, or an
-    over-ceiling total raises :class:`CompressionError`."""
+    over-ceiling total raises :class:`CompressionError`.
+
+    Each member is also **admitted or refused** (ASVS 5.2.2 / 5.3.2, BACKLOG #1128) — its name must be a
+    safe relative path and its bytes must correspond to the type its own extension names. Both checks are
+    unconditional and take no parameter: an archive member names its own type, so nothing here depends on
+    operator policy. See :mod:`messagefoundry.parsing.sniff` for what each one refuses and why refusal,
+    not sanitization, is the treatment. A refused member raises :class:`CompressionError` for the WHOLE
+    archive rather than being skipped — silently dropping one member of a feed is the accept-and-drop this
+    project forbids ([CLAUDE.md](../../CLAUDE.md) §12), and the raise routes the message to the caller's
+    error / dead-letter path."""
     _check_ceiling(max_output_bytes)
     if not isinstance(max_entries, int) or max_entries < 0:
         raise CompressionError(f"max_entries must be a non-negative int, got {max_entries!r}")
@@ -218,9 +237,14 @@ def zip_decompress(
                 raise CompressionError(
                     f"zip archive has {len(names)} members, over the {max_entries}-member cap"
                 )
-            for info in zf.infolist():
+            for position, info in enumerate(zf.infolist(), start=1):
                 if info.is_dir():
                     continue
+                # Name first, BEFORE a single byte is read: a traversal name is refused for what it is,
+                # not for what it expands to, and refusing early spends nothing on a hostile archive.
+                name_reason = archive_member_name_reason(info.filename)
+                if name_reason is not None:
+                    raise CompressionError(f"zip archive member {position} refused: {name_reason}")
                 with zf.open(info, "r") as member:
                     chunks = bytearray()
                     while True:
@@ -234,7 +258,13 @@ def zip_decompress(
                                 f"zip archive decompresses beyond the {max_output_bytes}-byte ceiling "
                                 "(possible decompression bomb)"
                             )
-                result[info.filename] = bytes(chunks)
+                body = bytes(chunks)
+                content_reason = archive_member_content_reason(info.filename, body)
+                if content_reason is not None:
+                    raise CompressionError(
+                        f"zip archive member {position} refused: {content_reason}"
+                    )
+                result[info.filename] = body
     except (zipfile.BadZipFile, OSError, EOFError, zlib.error) as exc:
         raise CompressionError(f"corrupt or truncated zip archive: {exc}") from exc
     return result

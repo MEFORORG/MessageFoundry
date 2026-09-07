@@ -69,10 +69,12 @@ from messagefoundry.api.client_networks import ClientNetworkMiddleware
 from messagefoundry.api.field_authz import count_exposed, count_masked, redact_unauthorized
 from messagefoundry.api.header_floor import (
     BASELINE_SECURITY_HEADERS,
+    CSP_HEADER,
+    FRAME_ANCESTORS_CSP,
     HSTS_HEADER,
     HSTS_VALUE,
     SecurityHeaderFloorMiddleware,
-    hsts_applies,
+    hsts_notable,
 )
 from messagefoundry.api.metrics import (
     METRICS_CONTENT_TYPE,
@@ -663,12 +665,18 @@ _BROWSER_ACTIVE_SUBTYPE_TOKENS = ("html", "xml", "script", "svg")
 #: Top-level types that are browser-active whatever the subtype (``multipart/x-mixed-replace`` renders).
 _BROWSER_ACTIVE_TYPES = ("multipart",)
 
-#: The attachment download's Content-Security-Policy (ASVS 1.3.4). ``default-src 'none'`` denies every
-#: subresource and fetch; ``sandbox`` with NO ``allow-*`` token drops the response into a unique opaque
-#: origin with scripts, forms, popups and same-origin access all disabled. Layered UNDER the MIME
+#: The attachment download's Content-Security-Policy (ASVS 1.3.4 + 3.4.6). ``default-src 'none'`` denies
+#: every subresource and fetch; ``sandbox`` with NO ``allow-*`` token drops the response into a unique
+#: opaque origin with scripts, forms, popups and same-origin access all disabled. Layered UNDER the MIME
 #: downgrade, the unconditional ``Content-Disposition: attachment`` and the global ``nosniff``, so even
 #: a representation a browser would otherwise treat as markup cannot execute in the application origin.
-_ATTACHMENT_CSP = "default-src 'none'; sandbox"
+#:
+#: ``frame-ancestors 'none'`` is NAMED HERE rather than left to the header floor's appended policy,
+#: because ``frame-ancestors`` takes no fallback from ``default-src``: without it this response -- the
+#: strictest policy the engine writes -- was the one document family carrying no framing decision at
+#: all. The floor's carrier now skips a response whose policy already names the directive, so this
+#: constant is what that response is governed by, and it stays correct if the floor is ever removed.
+_ATTACHMENT_CSP = "default-src 'none'; sandbox; frame-ancestors 'none'"
 #: ``GET /messages/{message_id}/attachments/{attachment_id}`` and the web console's same-handler
 #: delegate ``GET /ui/messages/...`` — see :class:`AttachmentSecurityHeadersMiddleware`.
 _ATTACHMENT_PATH_RE = re.compile(r"^(?:/ui)?/messages/[^/]+/attachments/[^/]+$")
@@ -1285,7 +1293,10 @@ def create_app(
         # SecurityHeaderFloorMiddleware is in this response's path, and a 500 shipped with none of
         # them. Status and body are unchanged: this adds headers only.
         headers = dict(BASELINE_SECURITY_HEADERS)
-        if hsts_applies(request.url.scheme, exposure_protected):
+        # ASVS 3.4.6: the floor's frame-ancestors carrier cannot reach this response either, and a
+        # 500 is as navigable as any other, so the same directive is set here by hand.
+        headers[CSP_HEADER] = FRAME_ANCESTORS_CSP
+        if hsts_notable(request.url.scheme, exposure_protected, host=request.url.hostname or ""):
             headers[HSTS_HEADER] = HSTS_VALUE
         return JSONResponse({"detail": "internal error"}, status_code=500, headers=headers)
 
@@ -1341,7 +1352,11 @@ def create_app(
         # exists for the PATH-CONDITIONAL work below, which the floor deliberately does not duplicate.
         for name, value in BASELINE_SECURITY_HEADERS:
             response.headers.setdefault(name, value)
-        if hsts_applies(request.url.scheme, exposure_protected):
+        # hsts_notable, NOT hsts_applies: this middleware is the INNERMOST writer, so it wins the
+        # setdefault race against the floor. Leaving the bare scheme test here would put HSTS on
+        # every routed response of the minted-certificate default and the floor could never take it
+        # off again -- the guard has to hold at both emitters or it holds at neither.
+        if hsts_notable(request.url.scheme, exposure_protected, host=request.url.hostname or ""):
             response.headers.setdefault(HSTS_HEADER, HSTS_VALUE)
         # /ui browser surface (ADR 0065 §5): a strict CSP (no unsafe-*) and no-store on every HTML
         # response; the vendored /ui/static assets keep StaticFiles' own cache. PHI JSON reads also get
@@ -5656,7 +5671,11 @@ async def _assert_security_notice_is_deliverable(
         "early when the recipient has no address). The [alerts] SMTP transport being configured "
         "does not make a notice deliverable -- on a first run the bootstrap administrator is created "
         "without one. Set an address on at least one enabled Administrator, or accept the pull-only "
-        "/me/security-events feed in writing via [alerts].security_notifications_required=false."
+        "/me/security-events feed in writing via [alerts].security_notifications_required=false. "
+        "(On a NEW install, `messagefoundry provision-admin --username <name> --email <address>` "
+        "before the first serve avoids this state entirely -- BACKLOG #1136. It is not a fix for "
+        "the instance that just refused: it declines once an enabled Administrator exists, which "
+        "by this point one does.)"
     )
     enforcement = (security_settings or SecuritySettings()).enforcement
     if enforcement is SecurityEnforcement.ENFORCE:
