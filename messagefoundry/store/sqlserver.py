@@ -1331,12 +1331,14 @@ _SCHEMA: list[str] = [
         name NVARCHAR(256) COLLATE Latin1_General_100_BIN2 NOT NULL PRIMARY KEY,
         version NVARCHAR(64) COLLATE Latin1_General_100_BIN2 NOT NULL,
         synced_at FLOAT NOT NULL, row_count INT NOT NULL)""",
+    # row_hash is NOT NULL (BACKLOG #1198): every row the engine writes is chained at INSERT, so an
+    # unchained row has no legitimate producer. See the SQLite `_SCHEMA` for the full reasoning. The
+    # `IF COL_LENGTH(...) ADD row_hash` shim that used to sit below is gone with it — it added the
+    # column as NULLable for stores written before hash-chaining, a population that does not exist.
     """IF OBJECT_ID('audit_log','U') IS NULL CREATE TABLE audit_log (
         id INT IDENTITY(1,1) PRIMARY KEY, ts FLOAT NOT NULL, actor NVARCHAR(256) NULL,
         action NVARCHAR(128) NOT NULL, channel_id NVARCHAR(256) NULL, detail NVARCHAR(MAX) NULL,
-        client NVARCHAR(256) NULL, row_hash NVARCHAR(64) NULL)""",
-    """IF COL_LENGTH('audit_log','row_hash') IS NULL
-        ALTER TABLE audit_log ADD row_hash NVARCHAR(64) NULL""",
+        client NVARCHAR(256) NULL, row_hash NVARCHAR(64) NOT NULL)""",
     # ADR 0150 client attribution for a pre-existing audit_log. NVARCHAR(256) mirrors sessions.client so
     # the two attribution columns share one width. NULL on every existing row is CORRECT (their address
     # was never captured) and is what preserves their row_hash: audit_row_hash omits the conditional 7th
@@ -2469,7 +2471,6 @@ class SqlServerStore:
             # no-op when the cipher carries no bound (keyless / `vault_transit`).
             await store.checkpoint_cipher_invocations()
             await store._encrypt_existing_rows()  # one-time PHI-at-rest migration when a key is set
-            await store._backfill_audit_chain()  # chain any pre-existing (unhashed) audit rows
             await store._load_audit_chain_meta()  # load/auto-init the #190 keying watermark
             await store._load_state_cache()  # ADR 0005 read-through cache warm-up
             await store._load_reference_cache()  # ADR 0006 reference-snapshot read cache
@@ -2480,41 +2481,7 @@ class SqlServerStore:
             raise
         return store
 
-    async def _backfill_audit_chain(self) -> None:
-        """Fill ``row_hash`` for audit rows written before hash-chaining (idempotent; fills only
-        NULLs, chained from the prior row)."""
-        rows = await self._fetchall(
-            "SELECT id, ts, actor, action, channel_id, detail, client, row_hash"
-            " FROM audit_log ORDER BY id"
-        )
-        prev = ""
-        updates: list[tuple[str, int]] = []
-        for r in rows:
-            if r["row_hash"]:
-                prev = r["row_hash"]
-                continue
-            prev = audit_row_hash(
-                prev,
-                ts=r["ts"],
-                actor=r["actor"],
-                action=r["action"],
-                channel_id=r["channel_id"],
-                detail=r["detail"],
-                client=r["client"],
-            )
-            updates.append((prev, r["id"]))
-        if updates:
-            # Runs in open() before the store is returned, so no concurrent record_audit can race it.
-            async with self._acquire() as conn, self._cursor(conn) as cur:
-                try:
-                    for row_hash, rid in updates:
-                        await cur.execute(
-                            "UPDATE audit_log SET row_hash=? WHERE id=?", (row_hash, rid)
-                        )
-                    await self._commit(conn)
-                except Exception:
-                    await conn.rollback()
-                    raise
+    # `_backfill_audit_chain` was deleted with BACKLOG #1198 — see the SQLite twin for why.
 
     async def _load_audit_chain_meta(self) -> None:
         """Load the #190 audit-chain keying watermark; auto-enable keying from row 1 for a FRESH
@@ -5820,12 +5787,33 @@ class SqlServerStore:
         Each batch's re-encrypt list is built UP FRONT so an undecryptable value raises BEFORE any
         UPDATE (all-or-nothing; PHI never dropped). Skips rows already under the active key and
         blank/purged values."""
-        if not isinstance(self._cipher, AesGcmCipher):
-            return 0
+        cipher = self._cipher
+        if not isinstance(cipher, AesGcmCipher):
+            # BACKLOG #1165 (ASVS 11.2.2). Two very different cases used to share this return,
+            # and the comment named only the harmless one. IdentityCipher means NO key is
+            # configured, so there is genuinely nothing to rotate and 0 is the truthful answer.
+            # Any OTHER non-AesGcmCipher -- today TransitCipher, whose keys live in Vault --
+            # HOLDS keys this loop cannot rewrite, and answering 0 there made
+            # `messagefoundry rotate-key` print "OK: re-encrypted 0 value(s) under the active
+            # key" and exit 0 having rotated nothing. A rotation that silently rotates nothing
+            # is precisely what 11.2.2's "keys replaceable with data re-encrypted" clause exists
+            # to prevent, and on a first deployment an operator would believe it.
+            #
+            # NotImplementedError deliberately: `messagefoundry rotate-key` already catches it,
+            # prints the message and exits 2, so the refusal reaches the operator as an error
+            # rather than as a success with a zero in it.
+            if not isinstance(cipher, IdentityCipher):
+                raise NotImplementedError(
+                    f"{type(cipher).__name__} cannot re-encrypt store values in place: its keys"
+                    " are held by the provider, not by this engine, so rotation happens at the"
+                    " provider. Reporting 0 rewritten values here would be indistinguishable"
+                    " from a completed rotation (BACKLOG #1165, ASVS 11.2.2)."
+                )
+            return 0  # identity cipher (no key) -- nothing to rotate
         # Active-format prefix through the active key's fingerprint (M9): `mfenc:v1:<kid>:` or, for a
         # v2-active cipher, `mfenc:v2:<alg>:<kid>:`. Built off the cipher (not a baked-in v1 prefix+keyid)
         # so a v2-active rotation matches v2 rows and the loop terminates.
-        active_like = f"{self._cipher.active_marker_prefix}%"
+        active_like = f"{cipher.active_marker_prefix}%"
         total = 0
         # summary/metadata (EF-3): MRN/name PHI on messages — rotated like raw. error/last_error (H4):
         # exception text that may embed raw HL7 fragments — rotated too, or a later retired-key drop
@@ -9011,12 +8999,18 @@ class SqlServerStore:
                         key=_key,
                         mac=_mac,
                     )
+                    # OUTPUT INSERTED.id gives the anchor id in the same statement, so it cannot name
+                    # a row another session inserted (which is what SCOPE_IDENTITY over a pooled
+                    # connection risks). The table carries no trigger, so no OUTPUT INTO is needed.
                     await cur.execute(
                         "INSERT INTO audit_log"
                         " (ts, actor, action, channel_id, detail, client, row_hash)"
+                        " OUTPUT INSERTED.id"
                         " VALUES (?,?,?,?,?,?,?)",
                         (now, actor, action, channel_id, detail, client, row_hash),
                     )
+                    inserted = await cur.fetchone()
+                    row_id = int(inserted[0]) if inserted is not None else 0
                     await self._commit(conn)
                 except Exception:
                     await conn.rollback()
@@ -9024,7 +9018,14 @@ class SqlServerStore:
         # Tee off-box AFTER commit + outside the audit lock / pooled connection (only forward what
         # truly persisted; a synchronous syslog send must never hold the lock). Shared redaction path.
         emit_audit_tee(
-            action=action, actor=actor, channel_id=channel_id, detail=detail, client=client, ts=now
+            action=action,
+            actor=actor,
+            channel_id=channel_id,
+            detail=detail,
+            client=client,
+            ts=now,
+            row_id=row_id,
+            row_hash=row_hash,
         )
 
     # --- per-key AES-GCM invocation bound (ASVS 11.3.4) ----------------------
