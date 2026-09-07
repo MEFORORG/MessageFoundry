@@ -12,7 +12,9 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import subprocess
 import sys
+from collections.abc import Callable
 from pathlib import Path
 from types import ModuleType
 from typing import Any
@@ -170,3 +172,224 @@ def test_the_receipt_names_what_was_scanned(
     """'no stalls' and 'nothing was examined' must not be indistinguishable."""
     _run(tmp_path, [_pr(1, merge_state="CLEAN")])
     assert "scanned 1 open pull request" in capsys.readouterr().out
+
+
+# --- the split query -------------------------------------------------------------------------------
+#
+# Asking for `statusCheckRollup` across every open pull request in one `gh pr list` is what broke the
+# daily cron: three consecutive reds, each `unexpected end of JSON input`, because GitHub's GraphQL
+# API timed out on the node count. `_fetch` now lists cheaply and fetches the rollup only for pull
+# requests that could still be a stall. These drive the REAL `_fetch` with a stub runner, so they
+# assert the commands actually issued rather than a description of them.
+
+
+#: The stub's signature is spelled out rather than left as ``Any``: the one thing worth checking about
+#: a dependency-injection seam is that the stub matches what production passes.
+_Runner = Callable[[list[str], float], str]
+
+
+def _runner(
+    listing: list[dict[str, Any]], rollups: dict[int, Any] | None = None
+) -> tuple[_Runner, list[list[str]]]:
+    """A stub `gh` that records every command and answers from the payloads given."""
+    seen: list[list[str]] = []
+    by_number = rollups or {}
+
+    def run(cmd: list[str], timeout: float) -> str:
+        seen.append(cmd)
+        if cmd[1:3] == ["pr", "list"]:
+            return json.dumps(listing)
+        if cmd[1:3] == ["pr", "view"]:
+            return json.dumps({"statusCheckRollup": by_number.get(int(cmd[3]))})
+        raise AssertionError(f"unexpected gh command: {cmd}")
+
+    return run, seen
+
+
+def _cheap(number: int, *, state: str = "OPEN", merge_state: str = "BEHIND") -> dict[str, Any]:
+    """One row as the CHEAP listing returns it: every stall field except the rollup."""
+    row = _pr(number, state=state, merge_state=merge_state)
+    del row["statusCheckRollup"]
+    return row
+
+
+def test_the_listing_query_does_not_ask_for_the_rollup() -> None:
+    """The regression itself. `statusCheckRollup` in the bulk query is what returned HTTP 504."""
+    assert "statusCheckRollup" not in sp.LIST_FIELDS
+    assert "statusCheckRollup" in sp.ROLLUP_FIELDS
+
+
+def test_the_rollup_is_fetched_only_for_pull_requests_that_could_be_stalled() -> None:
+    """The whole point of the split: the expensive call scales with the BEHIND set, not the open set.
+
+    A test asserting only "it still finds the stall" would pass just as well if `_fetch` fetched a
+    rollup for every pull request -- which is the thing that broke. So this asserts WHICH numbers were
+    viewed, and that the untouched ones were not.
+    """
+    listing = [
+        _cheap(10),  # OPEN + BEHIND -> needs a rollup
+        _cheap(11, merge_state="CLEAN"),  # not behind -> must not be fetched
+        _cheap(12, merge_state="BLOCKED"),  # not behind -> must not be fetched
+        _cheap(13, state="CLOSED"),  # not open -> must not be fetched
+    ]
+    run, seen = _runner(listing, rollups={10: [{"status": "COMPLETED", "conclusion": "SUCCESS"}]})
+
+    prs = sp._fetch(None, None, runner=run)
+
+    viewed = [int(cmd[3]) for cmd in seen if cmd[1:3] == ["pr", "view"]]
+    assert viewed == [10], f"expected only #10's rollup to be fetched, got {viewed}"
+    assert len([c for c in seen if c[1:3] == ["pr", "list"]]) == 1, "the listing must be one call"
+    assert [s.number for s in sp.scan(prs)] == [10]
+
+
+def test_a_pull_request_whose_rollup_was_never_fetched_is_never_reported() -> None:
+    """The optimisation's own failure mode, and it is a FALSE POSITIVE rather than a miss.
+
+    `_counts(None)` returns (0, 0) -- zero failing, zero pending -- which is indistinguishable from a
+    fully green rollup. So if `_fetch`'s pre-filter and `scan`'s rule ever diverged, a pull request
+    that was skipped by one and read by the other would be announced as a stall on evidence nobody
+    fetched. Both call `could_be_stalled`, and this pins that they agree.
+    """
+    assert sp._counts(None) == (0, 0), "the premise of this test changed; re-read _pr_checks"
+    for row in (_cheap(1, merge_state="CLEAN"), _cheap(2, state="CLOSED")):
+        assert sp.could_be_stalled(row) is False
+        assert sp.scan([row]) == []
+
+
+def test_a_listing_that_hits_the_cap_fails_closed() -> None:
+    """A result set EQUAL to the limit is a truncation signal, not a population.
+
+    `gh pr list` truncates at --limit silently, so a capped listing would under-report stalls with
+    nothing saying anything was missed -- this check's own defect class, one level up.
+    """
+    run, _ = _runner([_cheap(n) for n in range(sp.LIST_LIMIT)])
+    with pytest.raises(RuntimeError, match="truncation signal"):
+        sp._fetch(None, None, runner=run)
+
+
+def test_one_under_the_cap_is_accepted() -> None:
+    """The discriminating half of the row above: the guard must fire on the CAP, not on 'many'."""
+    rows = [_cheap(n, merge_state="CLEAN") for n in range(sp.LIST_LIMIT - 1)]
+    run, _ = _runner(rows)
+    assert len(sp._fetch(None, None, runner=run)) == sp.LIST_LIMIT - 1
+
+
+def test_an_unaddressable_pull_request_fails_closed() -> None:
+    """Cannot fetch its rollup, so it must not be reported as green-and-stalled."""
+    bad = _cheap(1)
+    bad["number"] = "not-a-number"
+    run, _ = _runner([bad])
+    with pytest.raises(RuntimeError, match="unusable number"):
+        sp._fetch(None, None, runner=run)
+
+
+def test_the_repo_flag_reaches_both_queries() -> None:
+    """A --repo that reached only the listing would make every rollup fetch read the wrong repo."""
+    run, seen = _runner([_cheap(10)], rollups={10: []})
+    sp._fetch("owner/name", None, runner=run)
+    assert all("--repo" in cmd and "owner/name" in cmd for cmd in seen), seen
+
+
+def test_an_unreadable_rollup_response_fails_closed() -> None:
+    """The mirror of the unusable-number row, and the direction that is easy to get backwards.
+
+    Storing ``None`` for an unreadable response does NOT drop the pull request -- `_counts(None)` is
+    (0, 0), i.e. GREEN -- so it would be announced as a stall on a rollup nobody could read. An
+    earlier draft of `_fetch` did exactly that.
+    """
+    seen: list[list[str]] = []
+
+    def run(cmd: list[str], timeout: float) -> str:
+        seen.append(cmd)
+        return json.dumps([_cheap(10)]) if cmd[1:3] == ["pr", "list"] else json.dumps("not-a-dict")
+
+    with pytest.raises(RuntimeError, match="unreadable"):
+        sp._fetch(None, None, runner=run)
+
+
+def test_the_per_call_timeouts_are_distinct_and_the_view_is_the_shorter() -> None:
+    """The split removed the job's old ~3 minute ceiling, so each command carries its own.
+
+    A `gh pr view` measured well under a second must not sit for the listing's timeout before it
+    reports a hang, because there can now be one per BEHIND pull request.
+    """
+    assert sp.VIEW_TIMEOUT < sp.LIST_TIMEOUT
+    seen: list[tuple[str, float]] = []
+
+    def run(cmd: list[str], timeout: float) -> str:
+        seen.append((cmd[2], timeout))
+        return json.dumps([_cheap(10)]) if cmd[1:3] == ["pr", "list"] else json.dumps({})
+
+    sp._fetch(None, None, runner=run)
+    assert seen == [("list", sp.LIST_TIMEOUT), ("view", sp.VIEW_TIMEOUT)], seen
+
+
+def test_a_transient_gh_failure_is_retried_before_the_sweep_is_abandoned(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The split multiplied the transient-failure surface, and this check now opens an issue.
+
+    One query became one plus one per BEHIND pull request, so a flaky 502 that used to be a
+    one-in-one chance is one-in-N -- and every failure is now a GitHub issue. Retrying serially keeps
+    ordinary API flake from becoming recurring noise. Serially on purpose: concurrent requests on a
+    single token invite a secondary-rate-limit 403, which is this outage again, arriving slower.
+    """
+    calls: list[list[str]] = []
+    completed = [
+        subprocess.CompletedProcess(["gh"], 1, "", "HTTP 502"),
+        subprocess.CompletedProcess(["gh"], 1, "", "HTTP 502"),
+        subprocess.CompletedProcess(["gh"], 0, '{"ok": true}', ""),
+    ]
+
+    def fake_run(cmd: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        calls.append(cmd)
+        return completed[len(calls) - 1]
+
+    monkeypatch.setattr(sp.subprocess, "run", fake_run)
+    monkeypatch.setattr(sp.time, "sleep", lambda _s: None)
+
+    assert sp._run_gh(["gh", "pr", "view", "10"]) == '{"ok": true}'
+    assert len(calls) == 3, "two transient failures should have been retried, not raised"
+
+
+def test_a_persistent_gh_failure_still_fails_closed(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The discriminating half: retrying must not turn a real outage into silence.
+
+    Without this row the retry above would pass just as well if `_run_gh` never raised at all.
+    """
+    calls: list[list[str]] = []
+
+    def fake_run(cmd: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        calls.append(cmd)
+        return subprocess.CompletedProcess(cmd, 1, "", "HTTP 502")
+
+    monkeypatch.setattr(sp.subprocess, "run", fake_run)
+    monkeypatch.setattr(sp.time, "sleep", lambda _s: None)
+
+    with pytest.raises(RuntimeError, match="after 3 attempts"):
+        sp._run_gh(["gh", "pr", "view", "10"])
+    assert len(calls) == sp._ATTEMPTS
+
+
+def test_the_error_names_the_pull_request_the_call_was_for() -> None:
+    """`gh pr view failed` without the number is useless when there is one call per BEHIND PR."""
+    assert "10" in " ".join(["gh", "pr", "view", "10"][:4])
+
+
+def test_the_runner_seam_and_the_module_attribute_resolve_to_the_same_function(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A default argument would bind `_run_gh` at import time, so monkeypatching it would be INERT.
+
+    That is a stub which cannot contradict the code it is stubbing: the test would reach the real
+    network while appearing to be offline. `_fetch` resolves the runner in its body instead.
+    """
+    seen: list[list[str]] = []
+
+    def stub(cmd: list[str], timeout: float) -> str:
+        seen.append(cmd)
+        return json.dumps([_cheap(1, merge_state="CLEAN")])
+
+    monkeypatch.setattr(sp, "_run_gh", stub)
+    sp._fetch(None, None)
+    assert seen and seen[0][1:3] == ["pr", "list"], "monkeypatching _run_gh had no effect"

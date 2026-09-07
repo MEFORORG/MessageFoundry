@@ -252,6 +252,18 @@ def require_ui(
         # ASVS 6.3.3, the cookie mirror of the JSON gate. Ordering matches require(): must_change
         # above, permissions below — a pending session must not learn whether it holds a permission.
         if not allow_mfa_pending and not await auth.mfa_satisfied(token):
+            # BACKLOG #1197, ASVS 16.3.2: audit the refusal, exactly as the engine's own gates do
+            # (api/security.py, both the HTTP and the WebSocket path). The reasoning in
+            # AuthService.audit_mfa_denied is why: this gate sits ABOVE the permission loop, so
+            # audit_permission_denied never fires for a refusal here, and without a row of its own a
+            # stolen password-only cookie could walk the whole authenticated /ui surface and leave
+            # the trail silent. The console is the surface a human actually uses, so the silence
+            # would be on the more-travelled plane, not the lesser one.
+            #
+            # BEFORE the raise, not after: _mfa_redirect returns an exception, and raising first
+            # would skip the row. Awaited rather than fired-and-forgotten so a store failure
+            # surfaces instead of dropping the record.
+            await auth.audit_mfa_denied(identity, request.url.path)
             raise _mfa_redirect()
         for permission in permissions:
             if not identity.has(permission):

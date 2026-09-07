@@ -75,8 +75,8 @@ class _FakeResp:
         self.headers = headers
         self.status = status
 
-    def read(self) -> bytes:
-        return self._body
+    def read(self, amt: int = -1) -> bytes:
+        return self._body if amt < 0 else (self._body)[:amt]
 
     def __enter__(self) -> _FakeResp:
         return self

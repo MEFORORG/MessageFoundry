@@ -69,27 +69,50 @@ hypothesis rather than a finding. Its falsifiable form is "find a single later r
 lines resolve". ``--at <ref>`` answers that in one run: if a candidate ref resolves the born-wrong
 population, the hypothesis is supported; if none does, it is refuted cheaply.
 
+**IT EMITS THE WITNESS AS DATA AND DOES NOT WRITE IT.** ``--annotate`` produces a payload for the ASVS
+writer, adding a per-anchor ``never_verified`` table to each anchor the control ref finds was not
+verifiable where the record says it was. Landing it belongs to the seat that holds the record; this tool
+only derives it. Three properties make the emission safe to hand over:
+
+* ``--control-ref`` is REQUIRED, and is resolved to a sha that every annotation carries. The pre-repair
+  ref is part of the measurement -- see the inflation paragraph above -- so a run cannot default to the
+  working tree, and the ref cannot survive only in an operator's shell history.
+* The payload BODY comes from the LIVE record and only the annotation from the control ref. Copying the
+  control record's own cell would write its pre-repair line numbers back, undoing repairs while claiming
+  to annotate them. Anchors are matched by ``path`` and ``expect``, never by line, because the line is
+  what a repair changes.
+* An anchor already carrying the annotation is counted and SKIPPED. A second pass under a different
+  control ref would otherwise overwrite the first pass's witness, which is this item's own defect
+  arriving through its fix.
+
 Usage::
 
     python scripts/asvs/anchor_provenance.py --scorecard <vault>/docs/security/asvs-scorecard.toml \\
-        --root <engine checkout> [--at <ref>] [--detail out.json]
+        --root <engine checkout> [--control-ref <ref>] [--at <ref>] [--detail out.json] \\
+        [--annotate payload.json]
 """
 
 from __future__ import annotations
 
 import argparse
+import copy
+import datetime
 import json
 import subprocess
 import sys
+import tempfile
+import tomllib
 from collections import Counter
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from scorecard import (  # noqa: E402
     ANCHOR_AMBIGUOUS,
     ANCHOR_GONE,
+    Anchor,
     Cell,
     load_scorecard,
     locate_anchor,
@@ -110,15 +133,49 @@ NO_COMMIT = "cell_records_no_commit"
 #: rather than spelled out at each site, so a later verdict change cannot drift between them.
 NEVER_VERIFIED = frozenset({BORN_WRONG, ABSENT, PATH_GONE})
 
+#: The per-anchor key ``--annotate`` lands the witness under. NAMED FOR THE CLAIM, not for one of its
+#: three causes: ``born_wrong`` would be a lie on the two ABSENT verdicts, which are the same claim about
+#: the record reached by a different route. The status inside says which route.
+#:
+#: Nothing in ``scorecard.py`` reads this back, deliberately. It is a witness, not a control -- a key the
+#: gate consumed would make the record's own history load-bearing on a gate run, and BACKLOG #1369 is
+#: what happens when a writer instruction gets stored as a record field.
+ANNOTATION_KEY = "never_verified"
+
 
 @dataclass(frozen=True)
 class AnchorVerdict:
     cell: str
     path: str
+    #: THE TOKEN, carried so a verdict can identify its own anchor without the record in hand. Placement
+    #: matches on ``path`` plus this and never on the line, because the line is what a repair changes --
+    #: matching on it would miss exactly the repaired anchors whose witness is most at risk.
+    expect: str
     recorded_line: int
     actual_line: int | None
     verdict: str
     ref: str
+
+
+def _show(repo: Path, spec: str) -> str | None:
+    """``git show <spec>`` as text, or None when git refused it. One caller for two questions.
+
+    Used for engine sources at a stamped commit and for the record itself at a control ref. Those are
+    different repositories asking the same thing, and a second copy of this subprocess is a second place
+    for the decoding to drift.
+    """
+    # git is read-only here and every argument is a ref or path the scorecard authored, never a
+    # caller-supplied executable.
+    proc = subprocess.run(  # nosec B603 B607 - fixed argv, no shell; read-only git
+        # Explicit UTF-8: ``text=True`` alone decodes with the LOCALE encoding, so a source file
+        # carrying any non-ASCII byte would be mangled and its token offsets shifted.
+        ["git", "-C", str(repo), "show", spec],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    return proc.stdout if proc.returncode == 0 else None
 
 
 def _blob(root: Path, ref: str, path: str, cache: dict[tuple[str, str], str | None]) -> str | None:
@@ -129,21 +186,33 @@ def _blob(root: Path, ref: str, path: str, cache: dict[tuple[str, str], str | No
     cannot be resolved. Distinguished by asking git about the ref separately.
     """
     key = (ref, path)
-    if key in cache:
-        return cache[key]
-    # git is read-only here and every argument is a ref or path the scorecard authored, never a
-    # caller-supplied executable.
+    if key not in cache:
+        cache[key] = _show(root, f"{ref}:{path}")
+    return cache[key]
+
+
+def _repo_root(inside: Path) -> Path | None:
+    """The git checkout containing a path, or None. The record lives in ITS OWN repository, and the
+    control ref is a fact about that one rather than about the engine tree ``--root`` names."""
     proc = subprocess.run(  # nosec B603 B607 - fixed argv, no shell; read-only git
-        # Explicit UTF-8: ``text=True`` alone decodes with the LOCALE encoding, so a source file
-        # carrying any non-ASCII byte would be mangled and its token offsets shifted.
-        ["git", "-C", str(root), "show", f"{ref}:{path}"],
+        ["git", "-C", str(inside), "rev-parse", "--show-toplevel"],
         capture_output=True,
         text=True,
-        encoding="utf-8",
-        errors="replace",
     )
-    cache[key] = proc.stdout if proc.returncode == 0 else None
-    return cache[key]
+    return Path(proc.stdout.strip()) if proc.returncode == 0 and proc.stdout.strip() else None
+
+
+def _resolve_commit(repo: Path, ref: str) -> str | None:
+    """A ref as a full sha, or None when git cannot resolve it.
+
+    THE SHA IS THE POINT. ``HEAD~1``, a branch or a tag names a different commit next week, so a record
+    carrying the NAME carries nothing a later reader can check. Resolving here is what turns a remembered
+    control into a recorded one.
+    """
+    proc = subprocess.run(  # nosec B603 B607 - fixed argv, no shell; rev-parse takes no input
+        ["git", "-C", str(repo), "rev-parse", f"{ref}^{{commit}}"], capture_output=True, text=True
+    )
+    return proc.stdout.strip() if proc.returncode == 0 else None
 
 
 def _ref_exists(root: Path, ref: str, cache: dict[str, bool]) -> bool:
@@ -178,6 +247,22 @@ def classify(text: str, expect: str, recorded_line: int) -> tuple[str, int | Non
     return (AT_LINE if found.line == recorded_line else BORN_WRONG), found.line
 
 
+def _row(
+    cell: Cell, anchor: Anchor, verdict: str, ref: str, actual: int | None = None
+) -> AnchorVerdict:
+    """One verdict, assembled from the cell and the anchor it is about. Six positional fields spelled
+    out at four call sites is where the fifth one gets an argument in the wrong slot."""
+    return AnchorVerdict(
+        cell=cell.id,
+        path=anchor.path,
+        expect=anchor.expect,
+        recorded_line=anchor.line,
+        actual_line=actual,
+        verdict=verdict,
+        ref=ref,
+    )
+
+
 def audit(cells: list[Cell], root: Path, override_ref: str | None = None) -> list[AnchorVerdict]:
     blob_cache: dict[tuple[str, str], str | None] = {}
     ref_cache: dict[str, bool] = {}
@@ -186,17 +271,17 @@ def audit(cells: list[Cell], root: Path, override_ref: str | None = None) -> lis
         ref = override_ref or cell.verified_at
         for anchor in cell.evidence:
             if not ref:
-                out.append(AnchorVerdict(cell.id, anchor.path, anchor.line, None, NO_COMMIT, ""))
+                out.append(_row(cell, anchor, NO_COMMIT, ""))
                 continue
             if not _ref_exists(root, ref, ref_cache):
-                out.append(AnchorVerdict(cell.id, anchor.path, anchor.line, None, UNREADABLE, ref))
+                out.append(_row(cell, anchor, UNREADABLE, ref))
                 continue
             text = _blob(root, ref, anchor.path, blob_cache)
             if text is None:
-                out.append(AnchorVerdict(cell.id, anchor.path, anchor.line, None, PATH_GONE, ref))
+                out.append(_row(cell, anchor, PATH_GONE, ref))
                 continue
             verdict, actual = classify(text, anchor.expect, anchor.line)
-            out.append(AnchorVerdict(cell.id, anchor.path, anchor.line, actual, verdict, ref))
+            out.append(_row(cell, anchor, verdict, ref, actual))
     return out
 
 
@@ -245,6 +330,146 @@ def summarise(verdicts: list[AnchorVerdict]) -> str:
     return "\n".join(lines)
 
 
+def _cells_from(record_text: str, name: str) -> list[Cell]:
+    """The record's cells, read by ``load_scorecard`` from whichever TEXT the caller has.
+
+    THE ONE READER, DELIBERATELY. A control-ref run holds the record as a git blob and a live run holds
+    it as a file, and a second parser for the blob would be a second definition of what a cell is --
+    the same drift ``classify``'s docstring refuses for the anchor locator. A temp copy is the cheap way
+    to keep one definition; it is deleted before this returns.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        copied = Path(tmp) / name
+        copied.write_text(record_text, encoding="utf-8")
+        return load_scorecard(copied)
+
+
+def _repairs_declared(record_text: str) -> int:
+    """How many cells in this record declare an anchor repair.
+
+    THE FLOOR CAVEAT, MADE COUNTABLE. Every repair at or before the ref being measured has already
+    overwritten its own witness, so what the run finds is what survived them -- "at least", never
+    "exactly". A caveat in prose is not the same artifact as a number a reader can compare between two
+    refs, and the tool that has the record open is the one that can print it.
+
+    ``anchor_repair`` is a WRITER instruction that persists into the record (BACKLOG #1369), which is
+    a defect on its own row and is exactly why it is legible here: nothing else in the record says a
+    repair happened.
+    """
+    return sum(1 for c in tomllib.loads(record_text).get("cell", []) if c.get("anchor_repair"))
+
+
+@dataclass
+class Annotation:
+    """What ``--annotate`` did with the never-verified population, counted by outcome.
+
+    Every count is reported. A payload row is only half the answer: the anchors this could NOT annotate
+    are the ones whose witness a repair already destroyed, and dropping them would leave a clean-looking
+    file over a population it failed to place.
+    """
+
+    payload: list[dict[str, Any]] = field(default_factory=list)
+    placed: int = 0
+    already: int = 0
+    cell_gone: int = 0
+    anchor_gone: int = 0
+    ambiguous: int = 0
+
+    @property
+    def found(self) -> int:
+        """Anchors the control ref found were not verifiable at their own stamped commit.
+
+        DERIVED, not counted alongside. The per-cell loop puts every such anchor in exactly one of the
+        buckets above, so a hand-maintained total is a second bookkeeping site that a later bucket can
+        silently drift from -- and the drift would show up as a refusal that fires on the wrong runs.
+        """
+        return self.placed + self.already + self.cell_gone + self.anchor_gone + self.ambiguous
+
+
+def _witness(
+    v: AnchorVerdict, control_sha: str, engine_head: str, derived_on: str
+) -> dict[str, Any]:
+    """The annotation for one anchor, self-sufficient by design.
+
+    It carries the ref pair it was derived under rather than pointing at a commit message. The item this
+    tool serves exists because a previous population's born-wrong status survived ONLY in a commit
+    message, which is a witness nobody can query and the next repair does not touch.
+
+    ``found_line`` is OMITTED rather than nulled on the two ABSENT verdicts. TOML has no null, so a
+    placeholder would render as a number or a string and read as a measurement.
+    """
+    row: dict[str, Any] = {"status": v.verdict, "recorded_line": v.recorded_line}
+    if v.actual_line is not None:
+        row["found_line"] = v.actual_line
+    row["at"] = v.ref
+    row["control_scorecard"] = control_sha
+    row["engine_head"] = engine_head
+    row["derived_on"] = derived_on
+    return row
+
+
+def annotate(
+    verdicts: list[AnchorVerdict],
+    live_cells: dict[str, dict[str, Any]],
+    *,
+    control_sha: str,
+    engine_head: str,
+    derived_on: str,
+) -> Annotation:
+    """A writer payload that adds the witness to the LIVE record and changes nothing else.
+
+    THE BODY COMES FROM THE LIVE CELL, and the alternative is the trap. Building each row from the
+    CONTROL record -- which is where the classification came from -- would carry that record's older
+    verdict, residual, stamps and line numbers back into the live file: an annotation pass that silently
+    reverts the repairs it is documenting. So the control ref decides WHICH anchors are annotated and the
+    live record supplies every byte that gets written.
+
+    Anchors are matched on ``path`` plus ``expect``. A repair changes the LINE, so line-matching would
+    fail on exactly the repaired anchors; a re-anchor to a different token is a real loss and is counted
+    as one rather than guessed at.
+    """
+    result = Annotation()
+    by_cell: dict[str, list[AnchorVerdict]] = {}
+    for v in verdicts:
+        if v.verdict in NEVER_VERIFIED:
+            by_cell.setdefault(v.cell, []).append(v)
+
+    for cell_id, rows in by_cell.items():
+        live = live_cells.get(cell_id)
+        if live is None:
+            result.cell_gone += len(rows)
+            continue
+        # Copied, never mutated in place: the caller's parse is also what a later comparison reads.
+        cell = copy.deepcopy(live)
+        entries: list[dict[str, Any]] = cell.get("evidence") or []
+        touched = 0
+        for v in rows:
+            hits = [
+                i
+                for i, e in enumerate(entries)
+                if (e.get("path"), e.get("expect")) == (v.path, v.expect)
+            ]
+            if not hits:
+                result.anchor_gone += 1
+                continue
+            if len(hits) > 1:
+                result.ambiguous += 1
+                continue
+            if ANNOTATION_KEY in entries[hits[0]]:
+                # A SECOND PASS MUST NOT OVERWRITE THE FIRST PASS'S WITNESS. That is this item's own
+                # defect one field over: the earlier annotation may have been derived under an earlier
+                # control ref, so replacing it destroys a record of a population that is no longer
+                # reachable. Counted so the skip is visible rather than inferred from a short payload.
+                result.already += 1
+                continue
+            entries[hits[0]][ANNOTATION_KEY] = _witness(v, control_sha, engine_head, derived_on)
+            touched += 1
+        if touched:
+            result.payload.append(cell)
+            result.placed += touched
+    return result
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--scorecard", type=Path, required=True)
@@ -261,13 +486,45 @@ def main(argv: list[str] | None = None) -> int:
         "population, the hypothesis is supported; if none does, it is refuted.",
     )
     ap.add_argument(
+        "--control-ref",
+        help="derive the population from the record as it stood at this ref of the repository that "
+        "HOLDS it, rather than from the working tree. A mass re-anchor inflates the apparent rate, so "
+        "the pre-repair ref is part of the measurement. Resolved to a sha and recorded.",
+    )
+    ap.add_argument(
         "--detail",
         type=Path,
         help="write the per-cell record here. It names cell identifiers beside file paths, which is "
         "the pairing CLAUDE.md section 12 keeps vaulted -- point this INSIDE the vault, never at the "
         "engine tree.",
     )
+    ap.add_argument(
+        "--annotate",
+        type=Path,
+        help="write a scorecard-writer payload here, adding the per-anchor witness to the LIVE record "
+        "without changing anything else. Requires --control-ref. Names cell identifiers beside file "
+        "paths, so point it INSIDE the vault, never at the engine tree. This tool does not apply it.",
+    )
     args = ap.parse_args(argv)
+
+    # THE ANNOTATION'S TWO ARGUMENT REFUSALS, before any work, because both are decidable from the
+    # arguments alone -- which is what this tool's 2 means.
+    if args.annotate and not args.control_ref:
+        sys.stderr.write(
+            "REFUSING: --annotate needs --control-ref. A repair RAISES the apparent rate (42.0 "
+            "percent before one real repair, 60.5 after), so an annotation derived from the working "
+            "tree records an inflated population, and a ref remembered in a shell history is not "
+            "recorded at all.\n"
+        )
+        return 2
+    if args.annotate and args.at:
+        sys.stderr.write(
+            "REFUSING: --annotate with --at. --at judges every cell against ONE ref instead of its "
+            "own recorded commit, which is the later-tree hypothesis test. Its answers are not claims "
+            "about what the record says it verified, so writing one into the record would assert "
+            "something the run never measured.\n"
+        )
+        return 2
 
     if not args.scorecard.is_file():
         sys.stderr.write(f"scorecard not found: {args.scorecard}\n")
@@ -294,17 +551,54 @@ def main(argv: list[str] | None = None) -> int:
     # no commits ``git rev-parse HEAD`` exits 128 and still ECHOES THE LITERAL ``HEAD`` ON STDOUT, so
     # an unchecked read stamps ``engine=HEAD`` -- which reads as a deliberate value rather than as a
     # failure, and passes review forever. An empty string would at least have invited a second look.
-    rev = subprocess.run(  # nosec B603 B607 - fixed argv, no shell; rev-parse takes no input
-        ["git", "-C", str(args.root), "rev-parse", "HEAD"], capture_output=True, text=True
-    )
-    if rev.returncode != 0:
+    #
+    # Resolved through the same helper the control ref uses. This was an inline ``rev-parse`` beside a
+    # general helper that already did the job, which is how two refusal styles for one question end up
+    # in one function -- and the helper is the safer of the two here, because it returns the sha ONLY on
+    # a zero exit, so the echoed literal cannot reach a caller at all.
+    head = _resolve_commit(args.root, "HEAD") or ""
+    if not head:
         sys.stderr.write(
-            f"REFUSING: cannot resolve HEAD in {args.root} (exit {rev.returncode}). The engine ref "
-            "is part of this measurement, and git echoes the literal 'HEAD' on this failure, so an "
-            "unchecked read would stamp engine=HEAD and look deliberate.\n"
+            f"REFUSING: cannot resolve HEAD in {args.root}. The engine ref is part of this "
+            "measurement, and git echoes the literal 'HEAD' on this failure, so an unchecked read "
+            "would stamp engine=HEAD and look deliberate.\n"
         )
         return 3
-    head = rev.stdout.strip()
+
+    # THE CONTROL REF IS RESOLVED HERE, IN THE REPOSITORY THAT HOLDS THE RECORD -- not the engine tree
+    # ``--root`` names. Two repositories are in play and their refs are not interchangeable; reading the
+    # record at an ENGINE sha would resolve to nothing or, worse, to some unrelated commit.
+    control_sha = ""
+    control_text: str | None = None
+    if args.control_ref:
+        vault = _repo_root(args.scorecard.parent)
+        rel = ""
+        if vault is not None:
+            try:
+                rel = args.scorecard.resolve().relative_to(vault.resolve()).as_posix()
+            except (OSError, ValueError):
+                rel = ""
+        if vault is None or not rel:
+            sys.stderr.write(
+                f"REFUSING: cannot locate {args.scorecard} inside a git repository, so --control-ref "
+                "has nothing to resolve against. The control ref is a ref of the repository that "
+                "HOLDS the record.\n"
+            )
+            return 2
+        resolved = _resolve_commit(vault, args.control_ref)
+        if resolved is None:
+            sys.stderr.write(
+                f"REFUSING: {args.control_ref!r} does not resolve to a commit in {vault}.\n"
+            )
+            return 3
+        control_sha = resolved
+        control_text = _show(vault, f"{control_sha}:{rel}")
+        if control_text is None:
+            sys.stderr.write(
+                f"REFUSING: {rel} does not exist at {control_sha[:12]}. A ref that predates the "
+                "record cannot be its control.\n"
+            )
+            return 3
 
     # THE READER'S OWN DIAGNOSTIC IS ASSESSMENT CONTENT, so this refusal quotes the exception's CLASS
     # and nothing else. Nine of the ten refusals in ``load_scorecard`` open by naming the graded row
@@ -365,11 +659,21 @@ def main(argv: list[str] | None = None) -> int:
     # stop withholding. The durable reason is that this is a CLI and its stderr goes wherever the
     # caller sends it -- a redirect, a paste, or a future workflow, which the sibling
     # anchor_report.py already has in .github/workflows/asvs-anchor-report.yml.
+    #
+    # THE READ IS INSIDE THE GUARD TOO, and for the same reason rather than for tidiness: a record that
+    # does not decode raises UnicodeDecodeError, whose ``args[1]`` holds the WHOLE document, and an
+    # unguarded read would put that on stderr under exit 1 -- a code this contract defines nowhere.
+    # ONE read serves both the load and the repair count below, so the two cannot come from different
+    # states of a working tree several sessions share.
     try:
-        cells = load_scorecard(args.scorecard)
+        record_text = (
+            control_text if control_text is not None else args.scorecard.read_text(encoding="utf-8")
+        )
+        cells = _cells_from(record_text, args.scorecard.name)
     except Exception as exc:
+        where = f" at {control_sha[:12]}" if control_sha else ""
         sys.stderr.write(
-            f"REFUSING: the scorecard at {args.scorecard} would not load "
+            f"REFUSING: the scorecard at {args.scorecard}{where} would not load "
             f"({type(exc).__name__}). The reader's own message is WITHHELD: it CAN name the graded "
             "row it rejected and CAN list the grading vocabulary in full, and nothing here can "
             "know where this stream ends up. Read the detail where the record lives, with the verifier there.\n"
@@ -396,17 +700,91 @@ def main(argv: list[str] | None = None) -> int:
         return 3
 
     # NO NUMBER HERE IS A FACT WITHOUT THE PAIR IT WAS MEASURED AGAINST -- the same rule the scorecard's
-    # own verify header states. Printed as part of the measurement, not as decoration.
+    # own verify header states. Printed as part of the measurement, not as decoration. The control ref
+    # joins the pair: the same engine history over two states of the record gives two different rates.
     print(
-        f"# anchor-provenance scorecard={args.scorecard} engine={head[:12]} at={args.at or 'per-cell'}"
+        f"# anchor-provenance scorecard={args.scorecard} "
+        f"control={control_sha[:12] or 'working-tree'} engine={head[:12]} "
+        f"at={args.at or 'per-cell'}"
     )
     print(summarise(verdicts))
+    repairs = _repairs_declared(record_text)
+    print(
+        f"\ncells in this record declaring an anchor repair: {repairs}. Every repair at or before this "
+        "state already overwrote its own witness, so the count above is a FLOOR -- read it as 'at "
+        "least'."
+    )
 
     if args.detail:
         args.detail.write_text(
             json.dumps([v.__dict__ for v in verdicts], indent=1, sort_keys=True), encoding="utf-8"
         )
         print(f"\nper-cell detail written to {args.detail}")
+
+    if args.annotate:
+        return _write_annotation(args.scorecard, args.annotate, verdicts, control_sha, head)
+    return 0
+
+
+def _write_annotation(
+    scorecard: Path,
+    destination: Path,
+    verdicts: list[AnchorVerdict],
+    control_sha: str,
+    head: str,
+) -> int:
+    """Derive the witness under the control ref, place it on the LIVE record, and write the payload.
+
+    Separate from ``main`` because it needs the live record a second time -- the control run read the
+    blob, and the payload body must come from the file as it stands now.
+
+    Takes the two paths rather than the parsed arguments: under mypy strict a ``Namespace`` attribute is
+    ``Any``, so a mistyped flag name would type-check here and fail at run time.
+    """
+    try:
+        live_cells = {
+            str(c["id"]): c
+            for c in tomllib.loads(scorecard.read_text(encoding="utf-8")).get("cell", [])
+        }
+    except Exception as exc:
+        # Class only, for the reason the load guard states: a TOML failure can carry the whole document.
+        sys.stderr.write(
+            f"REFUSING: the LIVE record at {scorecard} would not parse ({type(exc).__name__}), "
+            "so there is nothing to annotate. The control ref loaded, so this is the working tree.\n"
+        )
+        return 3
+
+    result = annotate(
+        verdicts,
+        live_cells,
+        control_sha=control_sha,
+        engine_head=head,
+        derived_on=datetime.date.today().isoformat(),
+    )
+
+    # A POPULATION FOUND AND PLACED NOWHERE MUST NOT BE WRITTEN AS AN EMPTY FILE. An empty payload
+    # applies cleanly and reads afterwards as "nothing was ever born wrong", which is the opposite of
+    # what the run found. ``already`` is excluded from the trigger on purpose: a run that placed nothing
+    # because the record already carries every witness has succeeded, and refusing it would make the
+    # second run of a completed pass look like a failure.
+    if result.found and not result.placed and not result.already:
+        sys.stderr.write(
+            f"REFUSING: {result.found} anchor(s) were not verifiable at their own recorded commit and "
+            "NONE could be placed on the live record. An empty payload would read as 'nothing was born "
+            "wrong'. Check --scorecard names the live record this annotation is for.\n"
+        )
+        return 3
+
+    destination.write_text(json.dumps(result.payload, indent=1), encoding="utf-8")
+    print(
+        f"\nannotation written to {destination}: {result.placed} anchor(s) across "
+        f"{len(result.payload)} cell(s). Apply it with scripts/asvs/apply.py where the record lives; "
+        "this tool does not write the record."
+    )
+    print(f"  already carried a witness, left alone      {result.already}")
+    print(f"  cell no longer in the live record          {result.cell_gone}")
+    print(f"  anchor no longer in the live cell          {result.anchor_gone}")
+    print(f"  token not unique in the live cell          {result.ambiguous}")
     return 0
 
 
