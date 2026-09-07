@@ -2026,26 +2026,41 @@ All knobs live in the `[auth]` section of `messagefoundry.toml` (the AD bind pas
 
 ## Supply-chain & CI security
 
-Automated security scanning runs in CI (`.github/workflows/security.yml`), so it lives there
-rather than in the per-author `messagefoundry check` gate:
+Automated security scanning runs in CI ([`.github/workflows/security.yml`](../.github/workflows/security.yml)),
+so the enforced set lives there rather than in the per-author `messagefoundry check` gate. Read that
+workflow for what each job does and whether it blocks;
+[`.github/required-contexts.txt`](../.github/required-contexts.txt) is the authority on which checks
+branch protection requires. At least these run:
 
 - **pip-audit** — audits the **committed lockfile** (`requirements.lock`) for known-CVE dependencies,
-  so the audit is reproducible rather than auditing a fresh latest-resolve (advisory for now).
-- **bandit** — Python SAST over `messagefoundry/` (advisory).
+  so the audit is reproducible rather than auditing a fresh latest-resolve.
+- **bandit** — Python SAST over `messagefoundry/`.
+- **gitleaks** — the secret scan, in the job named `gitleaks (secret scan)`. Its step is *Scan the ref
+  under test for secrets*, and that step's comment states the scan's scope and the reason for it. Read
+  it there; this page does not restate it. A `gitleaks` hook in
+  [`.pre-commit-config.yaml`](../.pre-commit-config.yaml) runs the same tool before a commit. That hook
+  is a local aid, not a second gate: a fresh clone lacks it until `pre-commit install` runs, and
+  `git commit --no-verify` skips it.
+- **SBOMs** — CycloneDX bills of materials for the Python engine, the VS Code extension, and the
+  container image, kept as build artifacts, so "are we exposed to CVE-X?" is answerable from a recorded
+  bill of materials rather than a fresh resolve. Advisory, and generated on a cron rather than per pull
+  request. How they are built, scored, and used: [SUPPLY-CHAIN.md](SUPPLY-CHAIN.md) and
+  [ADR 0149](adr/0149-multi-ecosystem-sbom-vex-and-sbom-quality-gate.md).
 - **Dependabot** (`.github/dependabot.yml`) — weekly PRs for `pip` and `github-actions` updates.
 - A private vulnerability-disclosure policy lives at [`.github/SECURITY.md`](../.github/SECURITY.md).
 
-Enable via **GitHub Advanced Security** in repo settings (they need GHAS on a private repo, so they
-can't be added by file alone): **CodeQL** code scanning and **secret scanning** + push protection.
+**CodeQL** runs from [`.github/workflows/codeql.yml`](../.github/workflows/codeql.yml). This repository
+is public, so CodeQL is free here and needs no GitHub Advanced Security licence. GitHub's own **secret
+scanning** and push protection are repository settings rather than files in the tree. Read the settings
+for their current state; this page does not track them.
 
-**Planned CI additions:**
-
-- **SBOM** — generate a CycloneDX SBOM (e.g. `cyclonedx-py`) from the committed lockfile in CI and keep it
-  as a build artifact, so "are we exposed to CVE-X?" is answerable from a recorded bill of materials rather
-  than a fresh resolve.
-- **Secret-history scan** — a `gitleaks` (or trufflehog) job over the **full git history** in CI, to
-  complement GHAS secret scanning above. Kept in CI rather than a per-author pre-commit hook, to match the
-  pip-audit/bandit stance (one enforced gate, not optional local tooling).
+**What this section used to say, named so a reader who believed it can recognise the shape.** Until
+2026-09-07 it filed the gitleaks and SBOM jobs under "Planned CI additions", called pip-audit and bandit
+advisory, and told the reader to turn CodeQL on through Advanced Security. Every job it named was already
+built, and pip-audit and bandit had stopped being advisory. The gitleaks entry also said the scan was kept
+in CI "rather than a per-author pre-commit hook", while that hook sat pinned in the same tree, and it
+described the scan as covering the full git history, which BACKLOG #1479 changed. Corrected under
+BACKLOG #1485.
 
 ### Dependency lockfile (DEP-1)
 

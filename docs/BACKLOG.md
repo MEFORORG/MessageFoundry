@@ -24617,3 +24617,39 @@ A PAR client on the relying-party side: POST the authorization parameters to the
 
 This row was **filed, not built**. Nobody has read the pinned requirement text against `flow.py` for this row's purposes, and no provider-support survey was run. The `na` ruling above is reported as the routing fact that makes this row necessary; this row does not re-derive it and does not depend on it being correct.
 
+
+## 1485. docs/SECURITY.md files the built gitleaks and SBOM jobs under Planned CI additions
+
+> 🚧 **Filed 2026-09-07 -- the doc fix ships in this PR.** Value **4/10** · Difficulty **1/10** · _quick win_. The "Supply-chain & CI security" section listed the `gitleaks` secret scan and the CycloneDX SBOM build under **Planned CI additions**. Both are built, and `gitleaks (secret scan)` is a required context. The same two bullets carried three further stale claims, each independently checkable and each corrected here. Per `CLOSING_SEAT["code"]` the banner flip on merge is the LANDER's.
+> Verdict: build
+> Research: none
+> Closing-act: code
+
+**Cluster:** documentation honesty / security prose. **Priority:** P3. **Verdict:** build.
+**Severity:** no deployment axis (sec. 0). Nothing here is engine behaviour, a shipped artifact, or PHI, so no deploying site would meet it. The cost falls on a reader of the security record: they are told a built control is planned, told the wrong scope for a required gate, and told a local hook does not exist when it does.
+
+**Measured 2026-09-07** at engine `4c68c28eb`, which was `origin/main`'s tip in the same run.
+
+### Five claims, and what the tree says
+
+| the claim, as it stood | what the tree says |
+|---|---|
+| **SBOM** is a planned CI addition | `security.yml`'s `sbom` job builds CycloneDX bills of materials for the Python engine and the VS Code extension, scores them with `sbomqs`, and uploads them; the `trivy` job adds the container image. ADR 0149 and `docs/SUPPLY-CHAIN.md` document it. |
+| **Secret-history scan** is a planned CI addition | `security.yml` job `gitleaks`, `name: gitleaks (secret scan)`, and that exact string is listed in `.github/required-contexts.txt`. |
+| the scan is "Kept in CI rather than a per-author pre-commit hook" | `.pre-commit-config.yaml` pins `repo: https://github.com/gitleaks/gitleaks`, `rev: v8.18.4`, hook id `gitleaks`. Both exist. |
+| the scan runs "over the **full git history**" | BACKLOG #1479 scoped it with `--log-opts HEAD`. The reason lives once, on the scan step's own comment, and this ledger row does not restate it either. |
+| **pip-audit** and **bandit** are advisory | Both job comments read `BLOCKING`, neither declares `continue-on-error`, and both context strings are in `.github/required-contexts.txt`. |
+
+A sixth line was stale in a different direction: the section told the reader to turn **CodeQL** on through GitHub Advanced Security "on a private repo". `.github/workflows/codeql.yml` has run here for months and this repository is public, so no licence is involved. `security.yml`'s own header already records that correction.
+
+### The fix
+
+`docs/SECURITY.md` now carries one list of what CI runs, with `gitleaks` and the SBOM job in it, and no "Planned CI additions" block. It states the scan's scope **nowhere**: it names the step that holds it and stops, because a second copy of that fact is what went false last time. The section closes with a short paragraph naming what it used to say, so a reader who absorbed the old text can recognise the shape rather than be silently overwritten.
+
+### One dependent edit, and why it was not left to drift
+
+`tests/test_cutover_slug_rot.py`'s triage taxonomy cited the removed sentence by name, as a KEEP example ("a true statement about GitHub's pricing"). Removing the sentence without that edit would have left a docstring citing a line that no longer exists. The retirement is recorded in its place. The ratchet count falls 39 to 38 against a ceiling of 41; `test_the_ratchet_is_not_slack` allows up to 8 slack, so the ceiling is deliberately left alone.
+
+### Not taken here, and it is the same fact
+
+`docs/Secure_Build_Scorecard_MEFOR.md` says "gitleaks full-history" in three places (lines 31, 58 and 93), one of them the evidence for signal 5 graded **Built -- Strong**. That evidence is now overstated by exactly the scope BACKLOG #1479 removed. It is **not edited here**: that file is a dated scoring snapshot ("Scored 2026-07-14, against HEAD") whose own convention is that re-scoring is an owner act, and it already carries a precedent blockquote flagging a correction for the next re-sign rather than folding it silently. Naming the three lines is the handoff; whoever re-signs the scorecard folds them.
