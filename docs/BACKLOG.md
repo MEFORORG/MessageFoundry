@@ -24207,7 +24207,7 @@ I read only `roles/` in the vault and ran no git history there, so I cannot date
 
 ## 1479. Scope the required gitleaks scan to the ref under test; today any pushed branch can red main and freeze the queue
 
-> 🚧 **Filed 2026-09-07 -- the code fix ships in this PR. THE GATE IS RED AS THIS IS WRITTEN, from a SECOND branch, so this is a live freeze and not a post-mortem.** Value **9/10** · Difficulty **2/10** · _quick win_. The `gitleaks (secret scan)` job ran with no `--log-opts`, so it walked every ref the `fetch-depth: 0` checkout had fetched. Branch protection reads its answer as a statement about the ref under test; the job was answering it about the whole repository. On 2026-09-06 an unmerged branch's synthetic fixture reddened `main` and the merge queue with it, freezing merging for over four hours and evicting five entries. Per `CLOSING_SEAT["code"]` the banner flip on merge is the LANDER's.
+> 🚧 **Filed 2026-09-07 -- the code fix ships in this PR. THE GATE IS RED AS THIS IS WRITTEN, on TWO unmerged branches at once, so this is a live freeze and not a post-mortem.** Value **9/10** · Difficulty **2/10** · _quick win_. The `gitleaks (secret scan)` job ran with no `--log-opts`, so it walked every ref the `fetch-depth: 0` checkout had fetched. Branch protection reads its answer as a statement about the ref under test; the job was answering it about the whole repository. On 2026-09-06 an unmerged branch's synthetic fixture reddened `main` and the merge queue with it, freezing merging for over four hours and evicting five entries. Per `CLOSING_SEAT["code"]` the banner flip on merge is the LANDER's.
 > Verdict: build
 > Research: none
 > Closing-act: code
@@ -24252,9 +24252,32 @@ The 2026-09-06 fixture was not a one-off. Read 2026-09-07 from the run log:
 | 34128038803 | `pull_request` | `redact-domain-e1` | `gitleaks (secret scan)` |
 | 34127868996 | `pull_request` | `claude/1147-restore-heading` | `gitleaks (secret scan)` |
 
-The finding in all three is commit `c456ee586` in `tests/test_logging_credential_scrub.py` -- carried
-only by `origin/log-filter-domain-f1`, and **not an ancestor of `main`**. A different branch from the
-first incident, the same mechanism.
+Run 34117701056 reports **`leaks found: 20`, across TWO commits on TWO different unmerged branches**:
+
+| findings | commit | file | branch | ancestor of `main`? |
+|---|---|---|---|---|
+| 14 | `c456ee586` | `tests/test_logging_credential_scrub.py` | `origin/log-filter-domain-f1` | no |
+| 6 | `833b98096` | `tests/test_log_redaction_secret_domain.py` | `origin/redact-domain-e1` | no |
+
+(The two pull-request runs were read only for which job failed, not for their findings.)
+
+**The strongest evidence is that the tree does not have to change for the answer to change.** Main's
+commit `68693cfc2` carries THREE runs of this required context, on an identical tree:
+
+| started | conclusion | run |
+|---|---|---|
+| 2026-09-06T22:36:29Z | success | 101566686715 |
+| 2026-09-07T00:38:51Z | **failure** | 101582322125 |
+| 2026-09-07T11:39:01Z | **failure** | 101728268133 |
+
+Nothing in `main` moved between them. Only the set of fetched refs did. A gate whose verdict on a
+fixed tree depends on what other people have pushed is not measuring that tree.
+
+**AND THE ATTRIBUTED COMMIT MOVES TOO, which is what rules out the tempting workaround.** The same six
+findings were reported at `0b47402cd` on 2026-09-06 and at `833b98096` on 2026-09-07 -- the fixtures
+did not change; a branch update made the merge commit the attributed one. So a commit-pinned allowlist
+entry goes stale on the next push to any affected branch, and a *pattern* entry is a permanent hole in
+a required secret gate. Neither is a fix; both are a second defect.
 
 `claude/1147-restore-heading` is the one that shows the shape plainly: it is a **docs-only branch that
 restores a heading**, and it cannot merge because a secret-shaped fixture on a stranger's branch fails

@@ -276,10 +276,17 @@ BACKLOG #1479. The defect was measured, not inferred: on 2026-09-06 a synthetic 
 this required context red after three clean runs, and reddened the `merge_group` runs for pr-953,
 pr-954 and pr-963 with it. Merging was frozen over four hours and five queue entries were evicted.
 
-AND THEN IT FIRED AGAIN, FROM A DIFFERENT BRANCH, which is why this is a class and not an incident.
-Read 2026-09-07: run 34117701056 (`schedule`, on `main`) failed on this job over `c456ee586`, carried
-only by `origin/log-filter-domain-f1` and likewise not an ancestor of `main`. Both pull-request runs
-that day failed on the same job, one of them on a docs-only branch that changes no code at all.
+AND THE SAME TREE GRADES BOTH WAYS, which is the measurement that settles it. Main's commit
+`68693cfc2` carries three runs of this required context: success at 2026-09-06T22:36:29Z, then failure
+at 00:38:51Z and again at 11:39:01Z on 2026-09-07. Nothing in `main` moved; only the set of fetched
+refs did. The 11:39Z run reports `leaks found: 20` over TWO commits on TWO unmerged branches --
+`c456ee586` (14) and `833b98096` (6), neither an ancestor of `main`. Both pull-request runs that day
+failed on the same job, one of them a docs-only branch that changes no code at all.
+
+THE ATTRIBUTED COMMIT ALSO MOVES: those 6 findings were reported at `0b47402cd` a day earlier, and a
+branch update made `833b98096` the attributed commit without the fixtures changing. That is why no
+allowlist entry can be the control here -- a commit-pinned one goes stale, and a pattern one is a
+permanent hole in the gate this file exists to keep honest.
 
 RUN AGAINST THE PINNED BINARY, 2026-09-07, gitleaks 8.18.4 (the version security.yml installs), in a
 repository whose `main` held 3 commits and whose unmerged branch held 4 more: unset, it reported "7
