@@ -241,6 +241,23 @@ class BootstrapAdmin:
     expires_at: float | None = None
 
 
+class FirstAdministratorRefused(RuntimeError):
+    """:meth:`AuthService.provision_first_administrator` declined. The message is operator-facing."""
+
+
+@dataclass(frozen=True)
+class ProvisionedAdministrator:
+    """The outcome of an offline first-administrator provision (BACKLOG #1136).
+
+    ``repaired`` distinguishes a fresh provision from completing one an earlier run left half-written,
+    so the CLI can say which happened rather than reporting both as "created".
+    """
+
+    user_id: str
+    username: str
+    repaired: bool
+
+
 @dataclass(frozen=True)
 class CustomRoleInfo:
     """An admin-defined custom role and its resolved permission subset (ADR 0045)."""
@@ -655,14 +672,163 @@ class AuthService:
                 return candidate
         return secrets.token_urlsafe(length) + "aA1!"  # defensive: satisfies any class requirement
 
-    async def _other_enabled_admin_exists(self, exclude_id: str) -> bool:
-        """True iff some enabled administrator other than ``exclude_id`` exists."""
+    async def _other_enabled_admin_exists(self, exclude_id: str | None = None) -> bool:
+        """True iff some enabled administrator other than ``exclude_id`` exists.
+
+        ``exclude_id`` is optional so :meth:`has_enabled_administrator` can ask the unrestricted
+        question without a sentinel value.
+        """
         for user in await self._store.list_users():
             if user.disabled or user.id == exclude_id:
                 continue
             if Role.ADMINISTRATOR.value in await self._store.get_user_role_ids(user.id):
                 return True
         return False
+
+    async def has_enabled_administrator(self) -> bool:
+        """True iff some enabled account holds Administrator.
+
+        Delegates rather than re-looping, so the provisioning refusal below and the WP-3 supersession
+        test share ONE definition of "an enabled account holding Administrator" and cannot drift
+        apart. (Three further open-coded copies of that enumeration already exist -- see
+        :meth:`has_notifiable_admin` -- and unifying them is its own item, not this one.)
+        """
+        return await self._other_enabled_admin_exists()
+
+    async def provision_first_administrator(
+        self,
+        *,
+        username: str,
+        password: str,
+        display_name: str | None = None,
+        notify_email: str | None = None,
+        actor: str,
+    ) -> ProvisionedAdministrator:
+        """Create the first administrator from an operator-supplied name and credential (#1136).
+
+        THIS IS THE "NOT PRESENT" ARM OF ASVS 6.3.2, and it is the half that has to exist before the
+        other half can be built. The verb asks that default user accounts "are not present in the
+        application or are disabled". The disabled arm is unexpressible at two altitudes --
+        ``Store.create_user`` carries no ``disabled`` parameter and all three backends hardcode the
+        column -- so the honest route is that no account is minted at all until an operator names one.
+        An operator who runs this before the first ``serve`` gets an install with no account named
+        ``admin``, because :meth:`_ensure_bootstrap_admin` then sees a non-empty table and declines.
+
+        **The way in is filesystem authority over the store, not an account** -- the host gate argued
+        once on :func:`messagefoundry.__main__._admin_unlock` and in ADR 0171, and not restated here.
+
+        **THE REFUSAL ASKS FOR AN ENABLED ADMINISTRATOR, NOT AN EMPTY TABLE, AND THE DIFFERENCE IS
+        THIS ITEM'S OWN NAMED RISK.** ``count_users() == 0`` is safe only while nothing else can put
+        the first row in; a directory sign-in can. ``_upsert_ad_user`` calls ``create_user`` and
+        assigns no role, so one completed sign-in leaves a roleless row, a non-empty table, and no
+        administrator -- reached entirely through shipped code. A command guarded on emptiness would
+        refuse exactly there, which is the state where the install has no way in. That refusal is
+        wider than the bootstrap guard by design: it makes this a standing recovery path whenever
+        every administrator is lost, which overlaps BACKLOG #1236's subject on the same host boundary.
+
+        **THE CREDENTIAL IS CLAIMED AT BIRTH, so there is no half-claimed state to restart into.**
+        The password is typed by the operator at a TTY and reaches no file, no argv and no log, so
+        "the holder set their own credential" is already true and ``users.password_claimed_at`` is
+        stamped here rather than deferred to a forced rotation. ASVS 6.4.6's one-time temp governs an
+        admin-ISSUED credential handed to a second party; there is no second party here. The stamp is
+        also load-bearing against WP-3: an operator who names this account ``admin`` would otherwise
+        satisfy :meth:`_unclaimed_bootstrap`, and the retirement sweep would disable the only
+        administrator on the deployment at ``bootstrap_expiry_hours``.
+
+        **EVERY INTERRUPTION POINT LEAVES A RECOVERABLE STORE, and the test for that is HOLDS NO
+        ROLES -- one signal, chosen because it is the only one true at both of them.** The row is
+        created with no password hash, then the credential is set, then the role is assigned, so the
+        two states a crash can leave are *no hash, no roles* and *hash, no roles*. An earlier draft
+        also refused a stamped ``password_claimed_at``, which is set by the credential write: that
+        refused the SECOND state, leaving a row this command could never complete and WP-3 could never
+        retire -- a stranded install, which is exactly the risk the design exists to avoid. Roleless
+        is also what makes the takeover safe rather than merely convenient: the account holds no
+        permission to inherit, and this branch is reachable only when the store has no enabled
+        administrator at all, which is already the state an operator needs recovering from.
+
+        Not reused from :meth:`create_local_user`, which does the same four writes: that method
+        creates WITH a hash and forces a rotation, and the ordering above is a durability property
+        rather than a preference. The divergence is deliberate and is recorded in ADR 0183.
+
+        Raises :class:`FirstAdministratorRefused` on every declined case, with operator-facing text.
+        """
+        username = username.strip()
+        # Normalized ONCE, so the three later readers cannot disagree about what "an address was
+        # supplied" means: a whitespace-only --email must not reach `users.email` untrimmed on the
+        # create, and must not audit as `"notified": true`.
+        notify_email = (notify_email or "").strip() or None
+        if not username:
+            raise FirstAdministratorRefused("a username is required and must not be blank")
+        if await self.has_enabled_administrator():
+            raise FirstAdministratorRefused(
+                "this store already has an enabled Administrator, so there is nothing to provision "
+                "-- create further accounts from the web console, and use `admin-unlock` if the "
+                "administrator is locked out"
+            )
+        violations = self._policy.violations(password, username=username)
+        if violations:
+            raise FirstAdministratorRefused("; ".join(violations))
+
+        existing = await self._store.get_user_by_username(username)
+        repaired = existing is not None
+        if existing is not None:
+            # A directory identity draws its authority from the directory, so it is never promoted
+            # here whatever its role state -- provision a separate local account instead.
+            if existing.auth_provider != AuthProvider.LOCAL.value:
+                raise FirstAdministratorRefused(
+                    f"{username!r} is a {existing.auth_provider} account -- provision a separate "
+                    "local administrator under a different name"
+                )
+            # Refused rather than re-enabled: an operator who disabled this account did so on
+            # purpose, and silently reviving it under a new credential is not a recovery.
+            if existing.disabled:
+                raise FirstAdministratorRefused(
+                    f"the account named {username!r} is disabled -- re-enable it from the web "
+                    "console, or provision under a different username"
+                )
+            if await self._store.get_user_role_ids(existing.id):
+                raise FirstAdministratorRefused(
+                    f"an account named {username!r} already exists and holds roles -- choose "
+                    "another username"
+                )
+            user_id = existing.id
+        else:
+            user_id = uuid4().hex
+            await self._store.create_user(
+                user_id=user_id,
+                username=username,
+                auth_provider=AuthProvider.LOCAL.value,
+                display_name=display_name,
+                # Seeds `notify_email` too (see `store.seed_notify_email`), which is the column the
+                # PHI security-notice start gate reads.
+                email=notify_email,
+                # No hash yet, deliberately: an account with no credential cannot be signed into, so
+                # the window before `set_password` below admits nobody. The flag is therefore
+                # unobservable until that write, which is what actually decides it.
+                password_hash=None,
+                must_change_password=True,
+            )
+        await self._seed_roles()
+        await self._store.set_password(
+            user_id,
+            password_hash=await self._argon2(hash_password, password),
+            must_change_password=False,
+        )
+        if notify_email is not None:
+            # Unconditional rather than fresh-path-only, because the invariant "the supplied address
+            # always lands" is simpler than the case analysis. On the fresh path `create_user` already
+            # seeded the same value; on a REPAIRED row an earlier run created the account, so this
+            # write is the only one that carries it.
+            await self._store.set_user_notify_email(user_id, email=notify_email)
+        await self._store.set_user_roles(user_id, [Role.ADMINISTRATOR.value], assigned_by=actor)
+        await self._audit(
+            "auth.first_administrator_provisioned",
+            actor=actor,
+            detail=_json(
+                {"username": username, "repaired": repaired, "notified": bool(notify_email)}
+            ),
+        )
+        return ProvisionedAdministrator(user_id=user_id, username=username, repaired=repaired)
 
     async def _unclaimed_bootstrap(self) -> UserRecord | None:
         """The first-run bootstrap admin while it is still present, enabled and **never claimed** —

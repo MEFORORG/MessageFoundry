@@ -48,20 +48,29 @@ gzip/zip/deflate surface in the codec for Handler use.
 Stdlib-only (`gzip`, `zlib`, `zipfile`, `io`) — **no engine imports** — so it sits under the `parsing/`
 carve-out (a client may import it, like `parsing/binary.py` / `parsing/x12`). Public surface:
 
-- `gzip_compress(data, *, level=6) -> bytes` / `gzip_decompress(data, *, max_output_bytes=None) -> bytes`
-- `deflate_compress(data, *, level=6) -> bytes` / `deflate_decompress(data, *, max_output_bytes=None) -> bytes`
+- `gzip_compress(data, *, level=6) -> bytes` / `gzip_decompress(data, *, max_output_bytes) -> bytes`
+- `deflate_compress(data, *, level=6) -> bytes` / `deflate_decompress(data, *, max_output_bytes) -> bytes`
   (zlib-wrapped DEFLATE, the "deflate" of HTTP/PDF)
 - `zip_compress(entries, *, level=None) -> bytes` (build a multi-entry archive) /
-  `zip_decompress(data, *, max_output_bytes=None, max_entries=1024) -> dict[str, bytes]`
+  `zip_decompress(data, *, max_output_bytes, max_entries=1024) -> dict[str, bytes]`
 - `CompressionError(ValueError)` — every corrupt/oversized/invalid-argument failure raises this one
   type; subclassing `ValueError` means an existing connector `except (TimeoutError, OSError)` does not
   swallow it and it surfaces as the deliberate content error it is.
+
+> **Amendment 2026-09-06 (BACKLOG #1127): `max_output_bytes` is REQUIRED, and this page said the
+> opposite.** The three signatures above were written here as `max_output_bytes=None`. Under BACKLOG
+> #1237 all three became keyword-only with **no default**, and the module docstring states why: a
+> caller who has not thought about the ceiling must not silently get an unbounded inflate. Pass an
+> explicit `None` to mean "no ceiling". This mattered beyond bookkeeping because this ADR is the only
+> shipped documentation of that API, and it understated the control -- a Handler author reading it
+> would believe the safe behaviour is the default when the code makes it a decision. Found while
+> re-verifying #1127's file-surface inventory, which names this as free work that should not wait.
 
 **Determinism (re-run purity).** `gzip_compress` fixes `mtime=0` in the header so the output is a pure
 function of `(data, level)` — a gzipping Handler stays re-run-stable. `zip_compress` fixes each entry's
 ZIP date to a constant. This is the load-bearing correctness point, not a nicety.
 
-**Decompression-bomb ceiling.** Every decompress takes an optional `max_output_bytes`. It is enforced
+**Decompression-bomb ceiling.** Every decompress takes a **required** `max_output_bytes`. It is enforced
 **incrementally** (bounded reads via `gzip.GzipFile.read(n)` / a `zlib.decompressobj` `max_length`
 loop / per-entry bounded zip reads) so a bomb is refused **after producing at most the ceiling**, never
 after fully expanding in memory. Exceeding it raises `CompressionError`; a truncated/corrupt stream
