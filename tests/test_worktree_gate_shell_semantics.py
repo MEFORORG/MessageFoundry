@@ -296,8 +296,15 @@ def test_a_crafted_path_cannot_forge_extra_log_records(primary: Path, repos_file
 # a path that is not a repository while a verb DENIES on path governance alone:
 #
 #     git -C . checkout main                     -> DENY
-#     git -C . checkout main                    -> ALLOW      <- proves nothing about resolution
+#     git -C . <disarm write>                    -> ALLOW      <- proves nothing about resolution
 #     git checkout main                          -> DENY
+#
+# THE MIDDLE ROW IS A PLACEHOLDER, NOT A COMMAND, AND IT MUST STAY ONE. It read `git -C . checkout main`
+# until 2026-09-04, byte-identical to the row above it and carrying the opposite verdict, so the table
+# asserted that one command both DENIES and ALLOWS and the paragraph above it had no evidence left. The
+# loss happened when these tests moved into this module (72bfddfad); the originating commit a490993b4
+# wrote the placeholder. Spelling the real payload here would be a literal disarm-key write, which rule 3
+# scans for and correctly refuses -- so the placeholder is the only writable form.
 #
 # The first draft of these tests used the disarm payload and three of them failed. They failed IDENTICALLY
 # against the UNFIXED gate, which is what showed the fault was in the test and not in the fix -- an

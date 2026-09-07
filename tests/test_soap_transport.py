@@ -116,8 +116,8 @@ class _Resp:
         self.status = status
         self._body = body
 
-    def read(self) -> bytes:
-        return self._body
+    def read(self, amt: int = -1) -> bytes:
+        return self._body if amt < 0 else (self._body)[:amt]
 
     def __enter__(self) -> _Resp:
         return self

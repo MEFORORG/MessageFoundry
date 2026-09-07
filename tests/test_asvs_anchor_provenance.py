@@ -20,9 +20,13 @@ from __future__ import annotations
 import json
 import subprocess
 import sys
+import tomllib
 from pathlib import Path
+from typing import Any
 
 import pytest
+
+from scripts.asvs import apply as writer
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts" / "asvs"))
@@ -648,3 +652,361 @@ def test_the_guard_is_not_so_wide_that_it_swallows_an_interrupt(
     monkeypatch.setattr(anchor_provenance, "load_scorecard", _interrupt)
     with pytest.raises(KeyboardInterrupt):
         main(["--scorecard", str(card), "--root", str(repo)])
+
+
+# ------------------------------------------------------------------ the annotation, emitted as data
+
+
+def _record(line: int, stamp: str, *, expect: str = "NEEDLE", repair: bool = False) -> str:
+    """One graded row citing ``mod.py``, with the recorded line and the stamped commit as parameters.
+
+    Those two are the only variables the born-wrong question has, so every arm below moves one of them
+    and nothing else.
+    """
+    return (
+        f'[[cell]]\nid = "{SENTINEL_ID}"\nlevel = 1\nverdict = "pass"\n'
+        f'residual = "no residual"\nlast_verified = "2026-09-06"\nverified_at = "{stamp}"\n'
+        f'reviewed_by = "a builder"\n'
+        + ("anchor_repair = true\n" if repair else "")
+        + f'[[cell.evidence]]\npath = "mod.py"\nline = {line}\nexpect = "{expect}"\n'
+    )
+
+
+@pytest.fixture
+def vault(tmp_path: Path, history: tuple[Path, str, str]) -> tuple[Path, str, str]:
+    """A RECORD WITH A HISTORY, because the control ref is a fact about the record's own repository.
+
+    Two commits of the same row, both stamping the LATER engine commit. The first records line 2, which
+    the token has not occupied since the earlier engine commit -- born wrong. The second records line 4,
+    where the token really is -- a repair. So the working tree is the repaired live record and the first
+    commit is the pre-repair control, which is exactly the pairing the item says the measurement needs.
+    """
+    _repo, _early, later = history
+    root = tmp_path / "vault"
+    git("init", "-b", "main", str(root), cwd=tmp_path)
+    git("config", "user.email", "t@example.com", cwd=root)
+    git("config", "user.name", "t", cwd=root)
+    card = root / "docs" / "security" / "asvs-scorecard.toml"
+    card.parent.mkdir(parents=True)
+
+    card.write_text(_record(2, later), encoding="utf-8")
+    git("add", "-A", cwd=root)
+    git("commit", "-m", "record as written", cwd=root)
+    pre = git("rev-parse", "HEAD", cwd=root)
+
+    card.write_text(_record(4, later), encoding="utf-8")
+    git("add", "-A", cwd=root)
+    git("commit", "-m", "record after the line was re-derived", cwd=root)
+    post = git("rev-parse", "HEAD", cwd=root)
+    return card, pre, post
+
+
+def _annotations(payload: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    key = anchor_provenance.ANNOTATION_KEY
+    return [e[key] for cell in payload for e in cell.get("evidence", []) if key in e]
+
+
+def test_the_annotation_is_refused_without_a_named_control_ref(
+    history: tuple[Path, str, str],
+    vault: tuple[Path, str, str],
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A REPAIR RAISES THE APPARENT RATE, so an annotation derived from the live record is inflated.
+
+    The tool's own header says so: measured across one real repair, 42.0 percent before it and 60.5
+    after, on the same anchors and the same engine history. The ref that predates the repairs is
+    therefore part of the measurement, and leaving it to the operator to remember is how the number
+    ends up recorded without it. So the emission refuses rather than defaulting to the working tree.
+    """
+    repo, _early, _later = history
+    card, _pre, _post = vault
+    out = tmp_path / "annotation.json"
+    code, stream = _run(
+        ["--scorecard", str(card), "--root", str(repo), "--annotate", str(out)], capsys
+    )
+    assert code == 2, stream
+    assert not out.exists(), "an annotation was written with no control ref to derive it under"
+    assert "--control-ref" in stream
+    _assert_no_assessment_content(stream)
+
+
+def test_the_annotation_is_refused_on_an_override_ref_run(
+    history: tuple[Path, str, str],
+    vault: tuple[Path, str, str],
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """``--at`` judges every cell against ONE ref instead of its own stamp, which is a hypothesis test.
+
+    Its answers are not claims about what the record says it verified, so writing one into the record
+    would assert something the run never measured.
+    """
+    repo, early, _later = history
+    card, pre, _post = vault
+    out = tmp_path / "annotation.json"
+    code, stream = _run(
+        [
+            "--scorecard", str(card), "--root", str(repo),
+            "--control-ref", pre, "--at", early, "--annotate", str(out),
+        ],
+        capsys,
+    )  # fmt: skip
+    assert code == 2, stream
+    assert not out.exists()
+    assert "--at" in stream
+    _assert_no_assessment_content(stream)
+
+
+def test_the_control_ref_decides_the_population_not_the_live_record(
+    history: tuple[Path, str, str],
+    vault: tuple[Path, str, str],
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """THE CONTROL THAT CAN FIRE, and it is a pair rather than a single arm.
+
+    Both runs read the same live record, the same engine history and the same working tree. Only the
+    control ref moves. Under the pre-repair ref the row is born wrong and one annotation is emitted;
+    under the post-repair ref there is nothing to annotate and the payload is empty. A checker that
+    hardcoded the population, or one that quietly measured the live record, cannot produce both.
+    """
+    repo, _early, _later = history
+    card, pre, post = vault
+
+    under_pre = tmp_path / "pre.json"
+    code, stream = _run(
+        [
+            "--scorecard", str(card), "--root", str(repo),
+            "--control-ref", pre, "--annotate", str(under_pre),
+        ],
+        capsys,
+    )  # fmt: skip
+    assert code == 0, stream
+    _assert_no_assessment_content(stream)
+    payload = json.loads(under_pre.read_text(encoding="utf-8"))
+    rows = _annotations(payload)
+    assert len(rows) == 1, payload
+    assert rows[0]["status"] == BORN_WRONG
+    assert rows[0]["recorded_line"] == 2
+    assert rows[0]["found_line"] == 4
+    # The identifier and its path reach the file and nothing else, the same split ``--detail`` holds.
+    assert payload[0]["id"] == SENTINEL_ID
+
+    under_post = tmp_path / "post.json"
+    code, stream = _run(
+        [
+            "--scorecard", str(card), "--root", str(repo),
+            "--control-ref", post, "--annotate", str(under_post),
+        ],
+        capsys,
+    )  # fmt: skip
+    assert code == 0, stream
+    _assert_no_assessment_content(stream)
+    assert json.loads(under_post.read_text(encoding="utf-8")) == []
+
+
+def test_the_payload_annotates_the_repaired_anchor_without_reverting_it(
+    history: tuple[Path, str, str],
+    vault: tuple[Path, str, str],
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """THE WITNESS IS RECOVERED FROM THE CONTROL REF AND CARRIED ONTO THE REPAIRED LIVE ANCHOR.
+
+    The obvious way to build this payload -- copy the cell out of the control record -- writes the
+    pre-repair line back into the record, undoing the repair while claiming to annotate it. So the
+    payload body must come from the LIVE record and only the annotation from the control ref. The
+    anchor is matched by its token rather than by its line, because the line is what a repair changes.
+    """
+    repo, _early, _later = history
+    card, pre, _post = vault
+    out = tmp_path / "annotation.json"
+    code, stream = _run(
+        [
+            "--scorecard", str(card), "--root", str(repo),
+            "--control-ref", pre, "--annotate", str(out),
+        ],
+        capsys,
+    )  # fmt: skip
+    assert code == 0, stream
+    entry = json.loads(out.read_text(encoding="utf-8"))[0]["evidence"][0]
+    assert entry["line"] == 4, "the payload carried the pre-repair line back into the record"
+    assert entry[anchor_provenance.ANNOTATION_KEY]["recorded_line"] == 2
+
+
+def test_the_annotation_records_the_resolved_sha_of_a_symbolic_control_ref(
+    history: tuple[Path, str, str],
+    vault: tuple[Path, str, str],
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A NAME IS NOT A CONTROL. ``HEAD~1`` names a different commit tomorrow, so a record carrying the
+    name carries nothing checkable. The tool resolves it and writes the sha, which is the whole
+    difference between a recorded control and a remembered one.
+    """
+    repo, _early, _later = history
+    card, pre, _post = vault
+    out = tmp_path / "annotation.json"
+    code, stream = _run(
+        [
+            "--scorecard", str(card), "--root", str(repo),
+            "--control-ref", "HEAD~1", "--annotate", str(out),
+        ],
+        capsys,
+    )  # fmt: skip
+    assert code == 0, stream
+    row = _annotations(json.loads(out.read_text(encoding="utf-8")))[0]
+    assert row["control_scorecard"] == pre
+    assert len(row["control_scorecard"]) == 40
+    _assert_no_assessment_content(stream)
+
+
+def test_applying_the_payload_changes_nothing_but_the_annotation(
+    history: tuple[Path, str, str],
+    vault: tuple[Path, str, str],
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """THE EMISSION IS ONLY DATA IF THE WRITER TAKES IT, so the writer is driven rather than trusted.
+
+    An unknown per-anchor key is expected to render through untouched. This asserts that end to end and
+    asserts the stronger property beside it: applying the payload changes the record ONLY by adding the
+    annotation. Strip the added key from the result and every remaining byte of structure is what was
+    there before -- verdict, residual, stamps, and the repaired line itself.
+    """
+    repo, _early, _later = history
+    card, pre, _post = vault
+    out = tmp_path / "annotation.json"
+    code, _stream = _run(
+        [
+            "--scorecard", str(card), "--root", str(repo),
+            "--control-ref", pre, "--annotate", str(out),
+        ],
+        capsys,
+    )  # fmt: skip
+    assert code == 0
+    before = tomllib.loads(card.read_text(encoding="utf-8"))
+
+    assert writer.main([str(out), "--scorecard", str(card), "--apply"]) == 0
+    capsys.readouterr()
+    after = tomllib.loads(card.read_text(encoding="utf-8"))
+
+    key = anchor_provenance.ANNOTATION_KEY
+    landed = after["cell"][0]["evidence"][0].pop(key)
+    assert landed["status"] == BORN_WRONG
+    assert landed["control_scorecard"] == pre
+    assert after == before, "the writer changed something other than the annotation"
+
+
+def test_an_anchor_already_carrying_a_witness_is_left_alone(
+    history: tuple[Path, str, str],
+    vault: tuple[Path, str, str],
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """OVERWRITING AN EARLIER WITNESS IS THE ITEM'S OWN DEFECT, arriving through its fix.
+
+    A second pass under a different control ref would re-derive the same anchor and replace what the
+    first pass recorded -- the same destruction as a silent repair, one field over. So an anchor that
+    already carries the annotation is counted and skipped, and a run that placed nothing because
+    everything was already recorded is a success rather than the empty-payload refusal below.
+    """
+    repo, _early, later = history
+    card, pre, _post = vault
+    card.write_text(
+        _record(4, later).replace(
+            'expect = "NEEDLE"\n',
+            f'expect = "NEEDLE"\n{anchor_provenance.ANNOTATION_KEY} = '
+            '{ status = "born_wrong", control_scorecard = "an earlier pass" }\n',
+        ),
+        encoding="utf-8",
+    )
+    out = tmp_path / "annotation.json"
+    code, stream = _run(
+        [
+            "--scorecard", str(card), "--root", str(repo),
+            "--control-ref", pre, "--annotate", str(out),
+        ],
+        capsys,
+    )  # fmt: skip
+    assert code == 0, stream
+    assert "already" in stream
+    assert json.loads(out.read_text(encoding="utf-8")) == []
+    assert "an earlier pass" in card.read_text(encoding="utf-8")
+    _assert_no_assessment_content(stream)
+
+
+def test_a_population_that_can_be_placed_nowhere_is_refused_not_emitted_empty(
+    history: tuple[Path, str, str],
+    vault: tuple[Path, str, str],
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """AN EMPTY PAYLOAD READS AS "NOTHING WAS BORN WRONG", and here it would mean the opposite.
+
+    The live anchor now cites a different token, so the control ref's finding has nowhere to land --
+    which is what a repair that re-anchored by content leaves behind, and the one case where the
+    witness really is gone. Emitting an empty file would hand the operator a clean-looking artifact
+    over a population it failed to place.
+    """
+    repo, _early, later = history
+    card, pre, _post = vault
+    (repo / "mod.py").write_text("first\nsecond\nthird\nNEEDLE\nOTHER\n", encoding="utf-8")
+    git("add", "-A", cwd=repo)
+    git("commit", "-m", "a second token", cwd=repo)
+    card.write_text(_record(5, later, expect="OTHER"), encoding="utf-8")
+
+    out = tmp_path / "annotation.json"
+    code, stream = _run(
+        [
+            "--scorecard", str(card), "--root", str(repo),
+            "--control-ref", pre, "--annotate", str(out),
+        ],
+        capsys,
+    )  # fmt: skip
+    assert code == REFUSED, stream
+    assert not out.exists()
+    assert "could be placed" in stream
+    _assert_no_assessment_content(stream)
+
+
+@pytest.mark.parametrize(("repaired", "want"), [(True, 1), (False, 0)])
+def test_the_summary_counts_the_repairs_the_control_ref_already_carries(
+    history: tuple[Path, str, str],
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    repaired: bool,
+    want: int,
+) -> None:
+    """A RECOVERED FIGURE IS A FLOOR, and the reason is countable rather than a caveat in prose.
+
+    Repairs that landed at or before the control ref have already overwritten their own witnesses, so
+    the population under that ref is what survived them. The count of rows declaring a repair is
+    printed beside the total -- including when it is zero, because a stated zero is checkable and an
+    absent line is not.
+
+    BOTH VALUES ARE DRIVEN, and that is what makes the count a measurement rather than a caption. A
+    single arm asserting the caveat appears passes against a line that prints a constant, and a single
+    arm asserting "1" passes against almost any output this tool produces -- it prints line numbers and
+    percentages. Measured: the first version of this arm survived a mutation that broke the sentence.
+    """
+    repo, _early, later = history
+    root = tmp_path / "repaired-vault"
+    git("init", "-b", "main", str(root), cwd=tmp_path)
+    git("config", "user.email", "t@example.com", cwd=root)
+    git("config", "user.name", "t", cwd=root)
+    card = root / "asvs-scorecard.toml"
+    card.write_text(_record(2, later, repair=repaired), encoding="utf-8")
+    git("add", "-A", cwd=root)
+    git("commit", "-m", "a record, repaired before or not", cwd=root)
+    ref = git("rev-parse", "HEAD", cwd=root)
+
+    code, stream = _run(
+        ["--scorecard", str(card), "--root", str(repo), "--control-ref", ref], capsys
+    )
+    assert code == 0, stream
+    assert f"declaring an anchor repair: {want}" in stream, stream
+    assert "FLOOR" in stream
+    assert f"control={ref[:12]}" in stream
+    _assert_no_assessment_content(stream)
