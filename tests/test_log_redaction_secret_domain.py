@@ -72,10 +72,15 @@ class Family:
 FAMILIES: tuple[Family, ...] = (
     # --- families that already worked at 4633a295, kept as live positive controls ------------------
     Family(
+        # TWO patterns cover this one, and the second arrived later: ``_KEY_MATERIAL`` (BACKLOG #1475)
+        # is case-insensitive, so ``_LABEL_PREFIX`` matches "MEFOR_STORE_" and its ``encryption_key``
+        # alternate matches the SCREAMING_SNAKE tail. Declaring only ``_MEFOR_SECRET`` reds the
+        # mutation fixture below, which is that fixture doing its job: an undeclared second cover is
+        # exactly how a family's green stops being evidence about its own pattern.
         name="mefor_env_value",
         line="startup MEFOR_STORE_ENCRYPTION_KEY=kv-Str0ng_Key-11 loaded",
         secret="kv-Str0ng_Key-11",
-        patterns=("_MEFOR_SECRET",),
+        patterns=("_MEFOR_SECRET", "_KEY_MATERIAL"),
     ),
     Family(
         name="labelled_token",
@@ -164,7 +169,88 @@ FAMILIES: tuple[Family, ...] = (
         secret="tk-Rest_Tok-88",
         patterns=("_BEARER",),
     ),
+    # --- key material: the five names the label-prefix widening still could not reach (#1475) -------
+    # No shipped pattern carried these: "key" is ordinary vocabulary and is deliberately absent from
+    # ``_CREDENTIAL_KV``, and ``_BEARER``'s ``api[_-]?key`` cannot fire on ``intake_api_key_next``
+    # because "_next" follows. FIVE families over FOUR alternates -- one per distinct REACH PATH, which
+    # is the granularity the mutation fixture below can prove. ``prefixed_private_key_material`` is not
+    # a fifth alternate; it is the only fixture that isolates ``_LABEL_PREFIX`` composing with
+    # ``_KEY_MATERIAL``, since the other family covered by two patterns declares both.
+    Family(
+        name="private_key_material",
+        line="signing setup private_key=pk-Priv_Key-33 for IB_ACME_ADT",
+        secret="pk-Priv_Key-33",
+        patterns=("_KEY_MATERIAL",),
+    ),
+    Family(
+        # The label prefix carries this one: the module has no ``smart_private_key`` alternate.
+        name="prefixed_private_key_material",
+        line="smart backend smart_private_key=pk-Sm4rt_Key-11 configured",
+        secret="pk-Sm4rt_Key-11",
+        patterns=("_KEY_MATERIAL",),
+    ),
+    Family(
+        name="store_encryption_key",
+        line="store opened encryption_key=ek-Enc_Key-44 active",
+        secret="ek-Enc_Key-44",
+        patterns=("_KEY_MATERIAL",),
+    ),
+    Family(
+        # A COMMA-JOINED list (``store/keyprovider.py::_split_retired``). Its pattern admits commas so
+        # the whole list goes, not just the first element -- the sentinel here is the LAST element,
+        # which a comma-terminated value class would have printed verbatim.
+        name="retired_encryption_keys_list",
+        line="rotation ready encryption_keys_retired=k1-Ret_A-01,k2-Ret_B-02,k3-Ret_C-03 done",
+        secret="k3-Ret_C-03",
+        patterns=("_KEY_MATERIAL",),
+    ),
+    Family(
+        name="intake_api_key_rotation_partner",
+        line="listener armed intake_api_key_next=nk-N3xt_Key-22 pending",
+        secret="nk-N3xt_Key-22",
+        patterns=("_KEY_MATERIAL",),
+    ),
 )
+
+
+#: Settings the ENGINE'S OWN classifier calls credentials that :func:`redact_log_line` deliberately
+#: does NOT redact, each with the reason it is out.
+#:
+#: This table is the point of BACKLOG #1475. It converts "the redactor's credential vocabulary is
+#: hand-chosen" from a standing defect into a reviewed statement, and
+#: ``test_every_engine_credential_setting_is_redacted_or_excluded`` below goes red the day someone adds
+#: a credential setting this module cannot see.
+#:
+#: ALL SIX ARE THE USERNAME CLASS, and they are out on measured grounds rather than on taste:
+#:
+#: 1. **The widening buys nothing.** Every string literal the engine passes to a logging call or an
+#:    exception constructor was extracted by AST -- 5,826 across 268 modules -- and a candidate username
+#:    pattern shaped exactly like ``_CREDENTIAL_KV`` fired **zero** times. The shipped
+#:    ``_CREDENTIAL_KV`` fired **4** times on the same corpus in the same run, so the instrument works;
+#:    a dead needle returned 0, so the corpus was read. Re-measured 2026-09-06.
+#: 2. **It reaches the wrong shape anyway.** A ``label=value`` rule does not match how a username
+#:    actually leaks: ``Login failed for user 'svc'`` (ODBC prose), ``UID=svc;PWD=`` (a different
+#:    keyword), ``CN=svc,OU=`` (a directory DN), the engine's own ``actor=`` audit field, or userinfo
+#:    inside a URL.
+#: 3. **The engine already ruled on this class at the layer that owns it.**
+#:    ``messagefoundry/redaction.py`` scrubs multi-token name runs and states its own residual outright
+#:    -- "the residual is now an adversarially-crafted *single-token* ... identifier" (:16, :69). A
+#:    username IS a single-token identifier. ``docs/PHI.md`` says the same from the other end: the
+#:    forwarded log stream "still carries usernames", and that is its stated reason for gating the
+#:    off-box hop. Scrubbing usernames here would contradict a documented position two layers deep.
+#:
+#: THE CONSEQUENCE IS WRITTEN DOWN RATHER THAN LEFT IMPLIED: a support bundle and ``GET /logs/tail``
+#: can carry an operator username. ``messagefoundry support-bundle --help`` and ``docs/PHI.md`` stream
+#: 14 both say so, so no reader is told the archive is secret-free while the engine's own classifier
+#: disagrees.
+EXCLUDED_FROM_REDACTION: dict[str, str] = {
+    "username": "username class: the generic principal setting",
+    "basic_user": "username class: HTTP Basic principal",
+    "credential_username": "username class: Windows/UNC share principal (ADR 0132)",
+    "http_auth_user": "username class: HTTP Digest/NTLM principal",
+    "proxy_user": "username class: forward-proxy principal (ADR 0126)",
+    "ws_username": "username class: WS-Security UsernameToken principal (ADR 0015)",
+}
 
 
 def _applied_pattern_names() -> set[str]:
@@ -276,6 +362,13 @@ ORDINARY_DIAGNOSTICS = (
     # and a mode name survive — the widening must not turn a filename into a redaction.
     "password_file=/etc/mefor/pw.txt",
     "ws_password_type=text on the SOAP hop",
+    # Three lines the key-material pattern (BACKLOG #1475) must leave alone: a header NAME, a PATH and
+    # a REFERENCE. Why it uses literal alternates rather than a general rule is stated once, on
+    # ``_KEY_MATERIAL`` in ``messagefoundry/support/redact.py``. These pin the line survives INTACT;
+    # ``test_the_key_material_pattern_spares_the_engines_non_secret_siblings`` pins the reason.
+    "intake_api_key_header=x-acme-key on the listener",
+    "private_key_file=/etc/mefor/sign.pem loaded",
+    "encryption_key_ref=vault-kv-store-dek resolved",
 )
 
 
@@ -308,6 +401,155 @@ def test_the_label_prefix_repetition_stays_bounded() -> None:
     # too low to be useful would pass the assertion above while silently reverting the fix.
     for label in ("ad_bind_password", "tls_key_password", "client_secret", "bearer_token"):
         assert REDACTION_PLACEHOLDER in redact_log_line(f"{label}=pw-B0und_Chk-99")
+
+
+#: A sentinel carrying a hyphen AND an underscore, so ``_LONG_B64`` cannot reach it. Without that the
+#: derived test below would score a name as covered on the strength of the backstop sweep -- the exact
+#: false green this file was built to make impossible. The property is ASSERTED in the derived test
+#: rather than only claimed here, the same way the Family sentinels are checked above.
+_REGISTRY_SENTINEL = "zz-Sekr3t_Val-99"
+
+
+def _engine_credential_settings() -> set[str]:
+    """Every setting name the ENGINE classifies as a credential, read from the engine.
+
+    Two registries, because the engine keeps two and they do not agree:
+    ``config/wiring.py::_SECRET_SETTING_KEYS`` is the connector-settings set ``/metadata`` redacts, and
+    ``config/settings.py::_FILE_SECRET_KEYS`` is the service-settings set that must live in the
+    environment rather than the config file. ``encryption_key``, ``encryption_keys_retired``,
+    ``ad_bind_password``, ``oidc_client_secret`` and ``email_password`` are in the second and not the
+    first, so reading either one alone is a domain narrower than the engine's own belief."""
+    from messagefoundry.config.settings import _FILE_SECRET_KEYS
+    from messagefoundry.config.wiring import _SECRET_SETTING_KEYS
+
+    return set(_SECRET_SETTING_KEYS) | {key for _section, key in _FILE_SECRET_KEYS}
+
+
+def test_every_engine_credential_setting_is_redacted_or_excluded() -> None:
+    """THE VOCABULARY IS DERIVED FROM THE ENGINE, NOT HAND-CHOSEN HERE (BACKLOG #1475).
+
+    Before this guard, ``support/redact.py`` picked its credential words by hand. That is the
+    narrow-domain defect ``test_connection_factory_redaction_domain.py`` records failing five times on
+    the sibling surface, and it fails silently in the one direction that matters: a credential setting
+    the redactor cannot see does not error, it just prints.
+
+    So the domain is read from the engine's own two registries, and every name in it must be either
+    redacted by ``redact_log_line`` or carry a reason in :data:`EXCLUDED_FROM_REDACTION`.
+
+    Measured 2026-09-06 on the merged tree, with ``_SECRET_SETTING_KEYS | _FILE_SECRET_KEYS`` at 30
+    names: 27 survived verbatim before the snake_case label prefix, 11 after it, and 6 after the
+    key-material pattern -- and those 6 are the whole of the username class, which is out on the
+    grounds recorded above the table.
+
+    THE ASSERTION IS TWO-SIDED ON PURPOSE. A one-sided "everything leaked is excused" version goes
+    green forever once the table is wide enough, and an exclusion that has quietly become false is a
+    worse record than no record: it tells a reader the engine leaks something it now scrubs."""
+    names = _engine_credential_settings()
+
+    # Positive control on the derivation itself. A registry import that silently returned an empty or
+    # tiny set would make every assertion below vacuously true.
+    assert len(names) >= 25, (
+        f"the engine's credential registry read as {sorted(names)} -- too small"
+    )
+
+    # And on the sentinel: were it reachable by the long-base64 sweep, every name below would score as
+    # covered on the backstop's work rather than on its own pattern's.
+    assert not redact_mod._LONG_B64.search(_REGISTRY_SENTINEL), (
+        f"{_REGISTRY_SENTINEL!r} is reachable by the long-base64 sweep, so this test would measure the "
+        "backstop instead of the credential patterns -- give it a hyphen and an underscore"
+    )
+
+    leaked = {
+        name
+        for name in names
+        if _REGISTRY_SENTINEL
+        in redact_log_line(f"connect failed {name}={_REGISTRY_SENTINEL} for endpoint")
+    }
+
+    unexplained = leaked - set(EXCLUDED_FROM_REDACTION)
+    assert not unexplained, (
+        "the engine classifies these settings as credentials, but redact_log_line prints their values "
+        f"verbatim and no reason is recorded for it: {sorted(unexplained)}. A support bundle and GET "
+        "/logs/tail both pass through this module, so a hole lands on both. Either widen the module or "
+        "add the name to EXCLUDED_FROM_REDACTION with the reason it is deliberately out."
+    )
+
+    stale = set(EXCLUDED_FROM_REDACTION) - leaked
+    assert not stale, (
+        f"EXCLUDED_FROM_REDACTION excuses these, but redact_log_line already redacts them: "
+        f"{sorted(stale)}. A stale exclusion is a false record -- it tells a reader the engine leaks "
+        "something it does not. Remove the entry."
+    )
+
+    # And the table must not invent a name. An entry outside the registry is excusing nothing, and it
+    # would survive the registry dropping the setting entirely.
+    unknown = set(EXCLUDED_FROM_REDACTION) - names
+    assert not unknown, (
+        f"EXCLUDED_FROM_REDACTION names settings the engine's registries do not carry: "
+        f"{sorted(unknown)}. The table must excuse real names, or it excuses nothing."
+    )
+
+
+def test_the_excluded_settings_are_the_username_class_the_engine_itself_names() -> None:
+    """The exclusion is a CLASS THE ENGINE ALREADY NAMES, not a list of whatever happened to leak.
+
+    Pinned separately from the derived test because the two fail for different reasons: that one dies
+    if the domain regresses, this one dies if the exclusion drifts off the class the ruling covers.
+    Nothing but a username is excusable here -- a password, token or key that ends up in this table is
+    a hole being annotated rather than fixed, and it would pass the derived test above.
+
+    MEMBERSHIP, NOT A SUBSTRING, AND THE DIFFERENCE IS THE WHOLE ASSERTION.
+    ``wiring._NON_ROTATABLE_SECRET_SETTING_KEYS`` is the engine's own statement of exactly this class
+    -- its docstring calls it the single source of truth for "settings keys that are IDENTIFIERS
+    (usernames), not rotatable credentials" -- and measured 2026-09-06 it is character-for-character
+    this table's key set. An earlier version of this test asked ``"user" in name`` instead, which
+    ACCEPTS ``db_user_password``, ``user_token`` and ``superuser_api_key``: a future maintainer could
+    excuse a leaked password by writing a username reason beside it and pass both guards. That is the
+    falsely-accepting checker this test exists to be, so it reads the engine's set."""
+    from messagefoundry.config.wiring import _NON_ROTATABLE_SECRET_SETTING_KEYS
+
+    assert set(EXCLUDED_FROM_REDACTION) == set(_NON_ROTATABLE_SECRET_SETTING_KEYS), (
+        "the settings this module deliberately does not redact must be exactly the identifier class "
+        "the engine names in _NON_ROTATABLE_SECRET_SETTING_KEYS. Excused here but not there: "
+        f"{sorted(set(EXCLUDED_FROM_REDACTION) - set(_NON_ROTATABLE_SECRET_SETTING_KEYS))}; named "
+        f"there but redacted here: {sorted(set(_NON_ROTATABLE_SECRET_SETTING_KEYS) - set(EXCLUDED_FROM_REDACTION))}"
+    )
+    for name, reason in EXCLUDED_FROM_REDACTION.items():
+        assert reason.startswith("username class:"), f"{name}: reason does not state the class"
+
+
+def test_the_key_material_pattern_spares_the_engines_non_secret_siblings() -> None:
+    """The five names #1475 widened onto have non-secret siblings one word away.
+
+    The reason literal alternates were chosen over a general rule is stated ONCE, on ``_KEY_MATERIAL``
+    in ``messagefoundry/support/redact.py``; this asserts the property that argument turns on rather
+    than restating it. ``intake_api_key_header`` is the sharpest case, and this test pins WHY it
+    survives -- the engine does not classify it as a credential -- where ORDINARY_DIAGNOSTICS pins only
+    that the line comes back unchanged.
+
+    THE SENTINEL VALUES DIFFER FROM THE FAMILY FIXTURES ON PURPOSE. These lines are bare
+    ``label=value`` with no surrounding words, so they also cover start-of-string anchoring, which no
+    Family line reaches."""
+    from messagefoundry.config.wiring import _SECRET_SETTING_KEYS
+
+    assert "intake_api_key_header" not in _SECRET_SETTING_KEYS  # the engine's own classification
+    for sibling in ("intake_api_key_header", "private_key_file", "encryption_key_ref"):
+        line = f"{sibling}=nonsecret-value_01 in use"
+        assert redact_log_line(line) == line, f"{sibling} was eaten by the key-material pattern"
+
+    # And the targets themselves must still go. Assert the VALUE IS ABSENT, not merely that a
+    # placeholder appeared: a value class narrowed to stop at "-" leaves the secret's tail on the line
+    # beside a placeholder, which a placeholder-only assertion reports as a pass.
+    for target in (
+        "private_key",
+        "smart_private_key",
+        "encryption_key",
+        "encryption_keys_retired",
+        "intake_api_key_next",
+    ):
+        out = redact_log_line(f"{target}=km-K3y_Mat-77")
+        assert "km-K3y_Mat-77" not in out, f"{target}: the value survived -- got {out!r}"
+        assert REDACTION_PLACEHOLDER in out, f"{target}: nothing was marked redacted -- got {out!r}"
 
 
 def test_redactor_is_the_backstop_for_both_named_surfaces() -> None:

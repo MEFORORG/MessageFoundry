@@ -473,8 +473,18 @@ def main(argv: list[str] | None = None) -> int:
 
     support_bundle = sub.add_parser(
         "support-bundle",
-        help="write a SECRET-FREE / PHI-free support zip (engine version + config summary + a "
-        "/status snapshot + a REDACTED app-log tail) to hand to support (#49)",
+        # The old wording read "a SECRET-FREE / PHI-free support zip". That is true of the config
+        # summary and the status snapshot and NOT of the log tail, whose redaction is best-effort: a
+        # single-token identifier survives it (messagefoundry/redaction.py states that residual), and an
+        # operator username is exactly that shape while this engine's own settings classifier calls a
+        # username a credential. A blanket claim resting on a member that does not meet it is the
+        # false-premise shape CLAUDE.md section 11 forbids, so the claim was repaired rather than the
+        # control -- see BACKLOG #1475 and the exclusion table in
+        # tests/test_log_redaction_secret_domain.py for why the username class stays out.
+        help="write a support zip to hand to support (#49): a secret-free config summary "
+        "(counts/names only) + a PHI-free /status snapshot + a REDACTED app-log tail. The tail's "
+        "redaction is BEST-EFFORT: a single-token identifier can survive it, an operator username "
+        "included",
     )
     support_bundle.add_argument(
         "--out", required=True, help="path to write the support-bundle .zip"
@@ -5159,9 +5169,13 @@ def _verify(args: argparse.Namespace) -> int:
 
 
 def _support_bundle(args: argparse.Namespace) -> int:
-    """Write a secret-free / PHI-free support zip (#49): engine version + a config summary (registry
-    COUNTS/names only — never settings values or secrets) + a ``/status`` snapshot built from the real
-    status models + a REDACTED app-log tail. Offline: touches no network, starts no server. The status
+    """Write a support zip (#49): engine version + a config summary (registry COUNTS/names only — never
+    settings values or secrets) + a ``/status`` snapshot built from the real status models + a REDACTED
+    app-log tail. **The blanket "secret-free / PHI-free" this docstring used to open with covered the
+    first two members and not the tail**, whose redaction is best-effort with a single-token residual
+    that includes an operator username (BACKLOG #1475; the argparse help above carries the reasoning,
+    and ``docs/PHI.md`` stream 14 is the record). Offline: touches no network, starts no server. The
+    status
     snapshot + log tail come from the service settings (the configured store + ``[logging].log_dir``);
     the config summary comes from ``--config``. A missing service config or store is tolerated — the
     bundle is still produced (support is most wanted when something is already broken)."""

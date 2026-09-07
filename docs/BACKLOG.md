@@ -24182,3 +24182,171 @@ Vault `roles/BUILDER.md:213-217`, under the heading "Closing a ledger row makes 
 ### Not checked
 
 I read only `roles/` in the vault and ran no git history there, so I cannot date when any of these lines was written. Eleven of the fourteen playbooks were matched by the needle above but not read, so treat the population as **at least three files**, not a total. I did not check whether any workflow or CI job reads a playbook, and I confirmed no case in which a seat actually followed `BUILDER.md:216` and produced a red PR -- I measured the instruction and the gate, not an incident.
+
+## 1475. Derive the log redactor's secret vocabulary from the settings registry, with a reasoned exclusion table
+
+> 🔢 **Filed 2026-09-06 -- the fix rides the PR that files this row; the banner stays open until the Lander flips it on merge.** Value **6/10** · Difficulty **3/10** · _fill-in_. `support/redact.py` chose its credential words by hand, so the engine's own credential registry could grow past what its log redactor can see and nothing would report it. **Measured 2026-09-06** against `_SECRET_SETTING_KEYS | _FILE_SECRET_KEYS` (30 names): **27 printed verbatim** before #1183's snake_case label prefix, **11 after it**, **6 after this row's key-material pattern** -- and those 6 are the whole username class, which is out on measured grounds recorded in the guard.
+> Verdict: build
+> Research: none
+> Closing-act: code
+
+**Cluster:** support bundle / log redaction. **Priority:** P2. **Verdict:** build.
+**Severity:** sec. 0 applies -- there are zero deployments, so nothing is leaking today. A deploying site that ran `support-bundle` or `GET /logs/tail` **would** hand out key material in the archive.
+
+**Two surfaces, one hole.** `support/redact.py` is the second-pass backstop for the support archive (`support/bundle.py`) and for `GET /logs/tail` (`api/app.py`), so a gap in it lands on both.
+
+### The defect: a hand-chosen vocabulary cannot report its own narrowness
+
+The module picked its credential words by review. The engine states what it believes a credential is in two registries, and nothing compared them:
+
+| registry | where | what it governs |
+|---|---|---|
+| `_SECRET_SETTING_KEYS` | `config/wiring.py` | connector settings `/metadata` redacts (25 names) |
+| `_FILE_SECRET_KEYS` | `config/settings.py` | service settings that must live in the environment, not the config file (8 pairs) |
+
+Reading either alone is narrower than the engine's own belief: `encryption_key`, `encryption_keys_retired`, `ad_bind_password`, `oidc_client_secret` and `email_password` are in the second and not the first. The union is **30 names**.
+
+### What was measured, on this worktree's `.venv` against the `requirements.lock` pin
+
+Sentinel `zz-Sekr3t_Val-99`, carrying a hyphen and an underscore so the `_LONG_B64` sweep cannot reach it and score a name as covered when its own pattern did nothing.
+
+| tree state | reached | printed verbatim |
+|---|---|---|
+| `origin/main` at `ebdfa44a6` | 3 | **27** |
+| plus #1183's `_LABEL_PREFIX` (PR 965) | 19 | **11** |
+| plus this row's `_KEY_MATERIAL` | 24 | **6** |
+
+Positive control in the same run: `password=` redacted, `connection_name=` survived -- so the instrument reports both outcomes.
+
+**The 11 reproduce the handed-down split exactly**, name for name: `basic_user`, `credential_username`, `http_auth_user`, `proxy_user`, `username`, `ws_username` excluded; `private_key`, `smart_private_key`, `encryption_key`, `encryption_keys_retired`, `intake_api_key_next` to reach.
+
+### The fix is literal alternates, not a suffix rule, and that is the whole design
+
+`_KEY_MATERIAL` splices #1183's bounded `_LABEL_PREFIX` onto four literal alternates. `smart_private_key` needs no alternate of its own -- the prefix reaches it.
+
+**The two general rules fail in OPPOSITE directions, which is why neither is used.** Measured 2026-09-06, both spliced onto `_LABEL_PREFIX` with the pattern's own trailing word boundary:
+
+| candidate rule | reaches | eats |
+|---|---|---|
+| label **ends in** a key word | **3 of 5** -- cannot reach `encryption_keys_retired` or `intake_api_key_next` at all | `idempotency_key`, `delivery_key` |
+| a key word **anywhere** in the label | 5 of 5 | `intake_api_key_header`, `private_key_file`, `encryption_key_ref`, and the ordinary vocabulary below |
+
+The sharpest of those is `intake_api_key_header`, which this engine classifies non-secret on purpose: it is the header NAME an intake credential arrives in, not the credential (`config/wiring.py`, pinned by name in `tests/test_connection_api.py`). Redacting it costs an operator the field saying WHERE the credential was expected and buys no confidentiality. Measured: planting the contains-rule widening reds three tests, including the one written for this claim.
+
+**The census, tokenized so comments and strings are excluded and the comment stating it cannot count itself:** 78 distinct identifiers ending `_key`/`_keys` in `messagefoundry/`, 577 occurrences, led by `file_key` 59 and `idempotency_key` 58 against `private_key` 22. `idempotency_key` is how an operator traces a message through the staged pipeline, so a contains rule would blind the reader the support bundle exists for.
+
+The value class **admits a comma**, unlike `_CREDENTIAL_KV`, because `encryption_keys_retired` ships as a comma-joined list (`store/keyprovider.py::_split_retired`) and a comma terminator would redact the first retired key and print the rest. **Residual, stated rather than left implied:** a list written with a SPACE after the comma leaves its later elements to the `_LONG_B64` sweep.
+
+### The exclusion table is the product, and it is two-sided
+
+`EXCLUDED_FROM_REDACTION` in `tests/test_log_redaction_secret_domain.py` carries the 6 username-class names with the reason each is out. The guard asserts in **both** directions:
+
+1. a registry name that leaks and is not in the table fails -- so a credential setting added to the engine that the redactor cannot see reds the suite;
+2. a table entry that is **already redacted** fails -- a stale exclusion is a false record, telling a reader the engine leaks something it now scrubs;
+3. a table entry outside the registry fails -- the table must excuse real names.
+
+### Why the username class stays out: three grounds, each re-measured here
+
+1. **The widening buys nothing.** Every string literal the engine passes to a logging call or an exception constructor, extracted by AST: **5,826 across 268 modules**. A candidate username pattern shaped exactly like `_CREDENTIAL_KV` fired **zero** times. The shipped `_CREDENTIAL_KV` fired **4** times on the same corpus in the same run (the control), and a dead needle returned 0 (the corpus was read). *The handed-down figure was 1,258 literals with the same 0-and-4 split; the corpus size differs by extraction breadth, and the two counts that carry the argument are identical.*
+2. **It reaches the wrong shape anyway.** `Login failed for user 'svc'` (ODBC prose), `UID=svc;PWD=` (a different keyword), `CN=svc,OU=` (a DN), the engine's own `actor=` audit field, userinfo in a URL. A `label=value` rule matches none of them.
+3. **The engine already ruled on this class at the layer that owns it.** `messagefoundry/redaction.py` states its own residual at `:16` and `:69` -- an adversarially-crafted **single-token** identifier survives, by convention. A username is exactly that. `docs/PHI.md` says the same from the other end: the forwarded log stream "still carries usernames", which is its stated reason for gating the off-box hop.
+
+### The claim was repaired, not the control (SDS-3.7)
+
+`messagefoundry/__main__.py` advertised a "SECRET-FREE / PHI-free support zip". That is true of the config summary and the status snapshot and **not** of the log tail. The help string now states the residual, and `docs/PHI.md` stream 14 records that the residual includes an operator username, which the engine's own classifier calls a credential. `bundle.py` already described its tail as redacted and best-effort, so only the CLI help was loose.
+
+### Red-first, with the mutants hash-verified
+
+Nine mutations planted one at a time, each scored only after a SHA-256 comparison proved it changed the file, each reverted to a byte-identical file. **All nine killed**, and the reds are specific:
+
+| mutant | killed by |
+|---|---|
+| stop applying `_KEY_MATERIAL` | the derived guard, the family fixtures, the AST domain test, the sibling test |
+| drop the `intake_api_key_next` alternate | the derived guard + 2 |
+| drop the `private_key` alternate | the derived guard + 2 |
+| excuse a name that IS redacted | the derived guard's stale arm + the class test |
+| **add a credential setting the engine cannot see** | **the derived guard alone -- one specific red** |
+| widen to a general label-suffix rule | the sibling test, the ordinary-diagnostics fixture, the mutation fixture |
+| unbound `_LABEL_PREFIX` | #1183's bound test |
+| **excuse `db_user_password` as username-class** | **the class test -- the falsely-accepting hole, now closed** |
+| the engine drops a name from its identifier class | the class test |
+
+The fifth is the one this row exists for, and the eighth is the one the review put there. The existing mutation fixture also **caught a real overlap while this was being built**: `_KEY_MATERIAL` is case-insensitive, so it now also covers `MEFOR_STORE_ENCRYPTION_KEY=`, and the `mefor_env_value` family had to declare both patterns. An undeclared second cover is exactly how a family's green stops being evidence about its own pattern.
+
+### Timing, because a pattern that widens a known cost is a regression
+
+The redactor is roughly 36x more expensive on a base64url run than on plain text, and `GET /logs/tail` runs it per line. That cost is **pre-existing and reproduced**; it was not to be fixed here, and it must not be made worse. One ~6 KB line, min of 9x20 passes, best of 3 runs:
+
+| | base64url (6,206 B) | plain (6,187 B) |
+|---|---|---|
+| before `_KEY_MATERIAL` | **36.6 ms** | **1.01 ms** |
+| after | **36.1 ms** | **1.28 ms** |
+
+The base64url cost is unchanged inside its own noise; the plain-text cost rises ~0.27 ms, which is one more linear pass.
+
+**A corrected mechanism, offered as a finding.** Timed per pattern on the same base64url line, all nine of this module's patterns sum to **0.27 ms** -- and `_KEY_MATERIAL` costs **0.043 ms**, identical to its sibling `_CREDENTIAL_KV` at 0.043 ms. The shared engine PHI pass alone costs **38.4 ms** on that line against **0.36 ms** on plain. **So the 36x gap lives in `messagefoundry/redaction.py`, not in `support/redact.py`, whose own patterns are cheaper on base64url (0.27 ms) than on plain text (0.72 ms).** The cost is real and the attribution was to the wrong module. Not filed as its own row -- naming it here so the next reader does not re-optimise the module that is not paying it.
+
+### What an adversarial review of this change caught, before it shipped
+
+Four review agents read the diff. Two findings were real and both are fixed here; recording them because a repair round is not monotonic and the notes are worth more than the verdict.
+
+1. **The guard itself falsely ACCEPTED.** The class assertion asked `"user" in name`, which accepts `db_user_password`, `user_token` and `superuser_api_key` -- so a future maintainer could excuse a leaked password by writing a username reason beside it and pass both arms. The engine already names this class: `wiring._NON_ROTATABLE_SECRET_SETTING_KEYS` is "settings keys that are IDENTIFIERS (usernames), not rotatable credentials", and measured 2026-09-06 it is **character-for-character** this row's exclusion table. The test now asserts set equality against it. **A check that falsely accuses is loud; one that falsely accepts just sits there**, and this one was in the code written to prevent exactly that.
+2. **The design was defended by one example, and the example was the wrong one.** The argument named only `intake_api_key_header` and claimed a suffix rule "covers all five". It covers three -- and with the trailing word boundary a suffix rule does not reach `intake_api_key_header` either. The rule that reaches all five is a CONTAINS rule, which is what the mutation actually planted. **Every number in the first census was also correct when taken and unreproducible afterwards**, because the comment naming `file_key` and `idempotency_key` was itself inside the corpus being censused: each named count came back exactly one higher. Re-run over NAME tokens only, which a comment cannot enter, it is stable. Two defects in one paragraph, both caught by reading rather than by any gate.
+
+**One handed-down premise did not survive, and it was mine to check.** The module docstring's "no engine state -- so it stays usable from the offline CLI" reads as a bar on importing the registries. Measured: `import messagefoundry.support.redact` already loads **64** engine modules including `config.wiring` and pydantic, because the package root imports it. The literal list is still right, on the two grounds now recorded beside it, but **not** on that one. The docstring line is pre-existing and another open PR holds the file, so it was left alone rather than rewritten in passing.
+
+**And one alarm was my own instrument, pointed at the wrong subject.** `username_access_key_screen.py` returned rc=1 when handed this PR's changed files. Run the way pre-commit actually invokes it -- `always_run`, `pass_filenames: false`, walking its own `DEFAULT_SCOPE` -- it returns **rc=0**. Its own wiring comment predicts the mistake: handing it a changed-file list "would silently narrow what it looked at while still printing a confident total". Widening it past its scope does the mirror thing. No defect; recorded so the next reader does not re-raise it.
+
+### Not done, deliberately
+
+- **The base64url cost itself.** Pre-existing, and belongs to `messagefoundry/redaction.py` on the measurement above.
+- **The write-time handler filters, and this is the larger half of the surface.** `logging_setup.py` installs `RedactionFilter`, `CredentialQueryScrubFilter` and `ControlCharScrubFilter` on every record, on the stdout handler NSSM captures and on the syslog/SIEM forwarder (there is no `FileHandler`). `support/redact.py` is a READ-time backstop and reaches neither the log file at rest nor the forwarded copy.
+
+  **Measured 2026-09-06, and it is worse than "a third vocabulary".** Seven credential shapes were pushed through all three filters in order. **Every one passed VERBATIM** -- `encryption_key=`, `private_key=`, `password=`, ODBC `PWD=`, `MEFOR_*=`, DSN userinfo, and `Authorization: Bearer`. The control, an OIDC `?code=&state=` query, scrubbed correctly in the same run, so the instrument works. `CredentialQueryScrubFilter`'s vocabulary is the OIDC query keys and nothing else.
+
+  **Consequence, in the conditional (sec. 0):** a deploying site that named a `[logging].forward_host` -- forwarding is default-on once a collector is configured -- would ship its store DEK to that collector, and to `service.out.log` on disk, with none of this row's work in the path.
+
+  **Deliberately NOT built here.** The brief scoped this row to the read-time backstop, and widening it silently is the wrong call. **The subject is named rather than numbered, because it is unfiled:** a derived-domain guard over the write-time filters' vocabularies. One constraint for whoever takes it -- the guard cannot be lifted into `logging_setup.py` at runtime, because `config/settings.py` imports `LOG_LEVELS` from it and its own docstring pins that direction, so the derivation has to stay test-side exactly as it is here.
+- **`ad_bind_dn`** is not classed secret; only `ad_bind_password` is. Confirmed, not changed.
+
+## 1477. PAR or JAR for the OIDC relying party's authorization request, as hardening beyond ASVS
+
+> 🔢 **Filed 2026-09-06 -- not started. This is PRODUCT HARDENING, not a compliance gap: do not file it in the risk-acceptance register as one.** Value **3/10** · Difficulty **4/10** · _fill-in_. This engine's OIDC relying party builds an authorization-code redirect with PKCE S256 and `response_mode=query`, so the authorization request travels the browser-visible front channel by construction. Pushed Authorization Requests (RFC 9126) or JWT-Secured Authorization Requests would remove that front-channel visibility altogether. The subject is worth keeping; whether to build it is an ordinary product decision that queues like any other.
+> Verdict: build
+> Research: none
+> Closing-act: code
+
+**Cluster:** auth / OIDC relying party. **Priority:** P3. **Verdict:** build.
+**Severity:** sec. 0 applies -- zero deployments. The exposure a deploying site would carry is front-channel parameter visibility and tampering that the identity provider must reject, not a session-forging path. That is why the value is 3 and not higher.
+
+### Why this row exists at all: the subject was about to evaporate
+
+An adversarial review ruled that **ASVS 10.4.13 scores `na` on scope** -- the requirement's actor is the authorization server, this engine hosts none, and the assessment's own precedent already answers the actor question consistently across that requirement's siblings. **The vault holder performs that re-score; no builder can.**
+
+The PAR/JAR hardening subject is carried today by exactly one open ledger row, **#1351**, whose closing act **is** that re-score. So the re-score closes #1351 and the subject goes with it. **It has already survived one such near-miss**: cell 10.4.15's residual ordered this filed independently on 2026-08-04 and that was never done. This row is the durable home, and filing it is why the ruling is two acts rather than one.
+
+**Verdict is `build`, not `research`, and that is load-bearing.** No research-verdict row has ever closed in this ledger -- zero across roughly 480 graded items -- because a research row's closing act is a vault re-score no builder can perform. Filing this one as research would recreate the exact evaporation the ruling is trying to prevent.
+
+### Measured 2026-09-06: no PAR exists in any configuration
+
+`git grep` over the tracked tree:
+
+| needle | files |
+|---|---|
+| `pushed_authorization` | **0** |
+| `request_uri` | **0** |
+| `pushed_auth` | **0** |
+| `PAR_ENDPOINT` | **0** |
+| `code_challenge` **(control)** | **6**, of which 4 are code, including `messagefoundry/auth/oidc/flow.py` |
+
+The control fires on the same instrument, same corpus, same run, so the zeros are measured rather than an unread corpus. The scope is the **tracked working tree**, not every ref -- a dormant branch is invisible to it.
+
+### What a build would be
+
+A PAR client on the relying-party side: POST the authorization parameters to the provider's pushed-authorization endpoint over the back channel, then redirect the browser with only `client_id` and the returned `request_uri`. It is a client addition, not a redesign of `auth/oidc/flow.py`. JAR is the alternative shape -- sign the request object rather than push it -- and choosing between them is part of the work, so an ADR is warranted.
+
+**Gate it on provider support.** PAR is an optional provider capability advertised at `pushed_authorization_request_endpoint` in the discovery document, so the build must degrade to today's behaviour when a provider does not offer it, rather than refusing to start.
+
+### Not done here
+
+This row was **filed, not built**. Nobody has read the pinned requirement text against `flow.py` for this row's purposes, and no provider-support survey was run. The `na` ruling above is reported as the routing fact that makes this row necessary; this row does not re-derive it and does not depend on it being correct.

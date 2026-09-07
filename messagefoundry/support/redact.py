@@ -16,8 +16,16 @@ pure stdlib ``re``) so bundled logs get exactly the same HL7-segment / field-run
 coverage as stored ``last_error``/log lines — instead of a second, narrower copy that drifts out of sync
 (DELTA-07). This module adds the **secret** markers the engine redactor does not carry — at least
 ``mfb64:`` bodies, ``MEFOR_*`` values, bearer/authorization tokens, ``password=``/``PWD=``/``secret=``
-pairs, an inline DSN password, and a long base64 run as the backstop. A credential label may carry a
-dotted/underscored/hyphenated prefix (``client_secret=``, ``bearer_token=``) — see ``_LABEL_PREFIX``.
+pairs, key material (``private_key=``, ``encryption_key=``), an inline DSN password, and a long base64
+run as the backstop. A credential label may carry a dotted/underscored/hyphenated prefix
+(``client_secret=``, ``bearer_token=``) — see ``_LABEL_PREFIX``.
+
+**The credential VOCABULARY is derived from the engine, not hand-chosen here.**
+``tests/test_log_redaction_secret_domain.py`` reads the engine's own registry of credential settings —
+``config/wiring.py::_SECRET_SETTING_KEYS`` and ``config/settings.py::_FILE_SECRET_KEYS`` — and requires
+every name in it to be either redacted by this module or listed in that file's exclusion table with a
+stated reason. A credential setting added to the engine that this module cannot see therefore reds the
+suite rather than shipping as a silent hole (BACKLOG #1475).
 
 **Which patterns exist is not a claim to be read off this docstring.** Every pattern
 :func:`redact_log_line` applies is derived by AST in ``tests/test_log_redaction_secret_domain.py`` and
@@ -115,6 +123,51 @@ _CREDENTIAL_KV = re.compile(
     r"['\"]?\s*[:=]\s*['\"]?[^\s'\";,&]+"
 )
 
+# Key MATERIAL in a "<label>=<value>" pair, where the label ends in a credential word neither pattern
+# above can reach. Measured 2026-09-06 against the engine's own credential registry: five settings it
+# classifies as secrets survived every pattern in this module verbatim — ``private_key``,
+# ``smart_private_key``, ``encryption_key``, ``encryption_keys_retired`` and ``intake_api_key_next``
+# (BACKLOG #1475). ``smart_private_key`` needs no alternate of its own: ``_LABEL_PREFIX`` reaches it.
+#
+# LITERAL ALTERNATES, BECAUSE THE TWO GENERAL RULES FAIL IN OPPOSITE DIRECTIONS. Measured 2026-09-06,
+# both spliced onto ``_LABEL_PREFIX`` with this pattern's own trailing ``\b``:
+#
+#   a SUFFIX rule ("the label ENDS in a key word") reaches 3 of the 5. It cannot reach
+#   ``encryption_keys_retired`` or ``intake_api_key_next`` at all, because neither ends in a key word.
+#
+#   a CONTAINS rule ("a key word ANYWHERE in the label") reaches all 5 and eats
+#   ``intake_api_key_header``, ``private_key_file`` and ``encryption_key_ref`` -- plus the ordinary
+#   vocabulary. Censused over ``messagefoundry/`` by tokenizing, so comments and strings are excluded
+#   and this comment cannot count itself: 78 distinct identifiers ending ``_key``/``_keys``, 577
+#   occurrences, led by ``file_key`` 59 and ``idempotency_key`` 58 against ``private_key`` 22.
+#   ``idempotency_key`` is how an operator traces a message through the staged pipeline, so a contains
+#   rule would blind the reader the support bundle exists for.
+#
+# ``intake_api_key_header`` is the sharpest of those: this engine classifies it NON-SECRET on purpose,
+# being the header NAME an intake credential arrives in rather than the credential (``config/wiring.py``,
+# pinned by name in ``tests/test_connection_api.py``). Bare ``key`` stays out for the reason already
+# stated at ``_CREDENTIAL_KV``.
+#
+# The alternates are NOT derived from ``_SECRET_SETTING_KEYS`` at runtime, though the import would now
+# be free: that registry is ``/metadata``'s redaction policy, so a name dropped from it for a display
+# reason would silently stop being scrubbed here, and it carries the six usernames this module
+# deliberately does not redact. A literal list cannot be weakened by a registry edit; the derived guard
+# in ``tests/test_log_redaction_secret_domain.py`` catches the drift loudly instead.
+#
+# The alternate must END the label — the trailing ``\b`` cannot fire before "_" — so a PATH or a name
+# keeps its value: ``private_key_file=``, ``encryption_key_ref=`` and ``intake_api_key_header=`` all
+# survive this pattern intact.
+#
+# WHY THE VALUE CLASS ADMITS A COMMA, unlike ``_CREDENTIAL_KV``: ``encryption_keys_retired`` ships as a
+# COMMA-JOINED LIST (``store/keyprovider.py::_split_retired``), so a comma terminator would redact the
+# first retired key and print the rest. Whitespace, quotes, ";" and "&" still terminate, so a redaction
+# cannot swallow the rest of a log line. RESIDUAL, stated because this pattern does not cover it: a list
+# written with a SPACE after the comma leaves its later elements to the ``_LONG_B64`` sweep.
+_KEY_MATERIAL = re.compile(
+    r"(?i)\b(" + _LABEL_PREFIX + r"(?:encryption_keys_retired|encryption_key|private_key"
+    r"|intake_api_key_next))\b['\"]?\s*[:=]\s*['\"]?[^\s'\";&]+"
+)
+
 # An inline password in a URL-shaped DSN: "postgres://user:<pw>@host/db". The scheme and the user
 # survive so an operator can still tell which connection failed.
 _DSN_PASSWORD = re.compile(r"(?i)\b([a-z][a-z0-9+.\-]*://[^\s:/@]+):[^\s/@]+@")
@@ -147,6 +200,7 @@ def redact_log_line(line: str) -> str:
     body = _BEARER.sub(_keep_label, body)
     body = _AUTH_SCHEME.sub(_keep_scheme, body)
     body = _CREDENTIAL_KV.sub(_keep_label, body)
+    body = _KEY_MATERIAL.sub(_keep_label, body)
     body = _DSN_PASSWORD.sub(_keep_dsn_user, body)
     body = _redact_phi(
         body
