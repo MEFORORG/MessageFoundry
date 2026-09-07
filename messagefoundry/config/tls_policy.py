@@ -82,6 +82,7 @@ __all__ = [
     "insecure_hop_disposition",
     "is_loopback_hop_host",
     "phi_read_hop_disposition",
+    "proxy_mtls_declared_but_unverified",
     "resolve_trust_anchor",
     "revocation_hop_disposition",
     "tls_revocation_attested",
@@ -371,6 +372,36 @@ def in_process_tls_revocation_refused(
     if attested:  # noqa: SIM103
         return False  # operator attested their terminator/PKI enforces revocation (the opt-out)
     return True
+
+
+def proxy_mtls_declared_but_unverified(
+    *, declared: str, client_ca_configured: bool, is_phi: bool
+) -> bool:
+    """Whether ``serve`` must WARN that the Posture-B mTLS attestation contradicts this engine's config.
+
+    ``[api].proxy_intra_service_auth = "mtls"`` says the proxy PRESENTS A CLIENT CERTIFICATE on the
+    proxy-to-engine hop (BACKLOG #1181, ASVS 12.3.5). The engine is the far end of that hop, and it
+    verifies a client certificate in exactly one configuration: with ``[api].tls_client_ca_file`` set,
+    :func:`messagefoundry.api.tls.build_api_ssl_context` loads the anchor and sets ``ssl.CERT_REQUIRED``.
+    With no client CA the engine verifies nothing, so its own configuration contradicts the declaration
+    -- and that is the ONE contradiction visible from inside the process.
+
+    The sibling values get no arm, deliberately. ``"network"`` names an isolated segment and
+    ``"shared_secret"`` a header a proxy injects; nothing the engine can read decides either, so a
+    warning on them would be noise rather than a check. ``"none"`` is undeclared and is already the
+    subject of the Posture-B fail-closed gate.
+
+    **WARNS, NEVER REFUSES**, and the reason is a real topology rather than caution: a sidecar or
+    stunnel on the same host can terminate the proxy's mTLS in front of the engine, leaving a genuinely
+    mutually-authenticated hop that the engine sees as plaintext loopback. A refusal there would be
+    purchased on a premise the engine cannot observe.
+
+    This does NOT make the setting enforcing. It is a diagnostic: no byte on any wire changes with the
+    value, and :func:`validate_proxy_tls_posture` below is the sibling coherence check on the other
+    Posture-B attestation. Pure predicate so the ``_serve`` gate stays a one-liner and the truth table is
+    testable without a settings load -- the same reason :func:`in_process_tls_revocation_refused` above
+    is one."""
+    return declared == "mtls" and not client_ca_configured and is_phi
 
 
 def validate_proxy_tls_posture(min_version: str | None, ciphers: str | None) -> None:
