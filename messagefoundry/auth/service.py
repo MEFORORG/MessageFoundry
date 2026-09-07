@@ -3228,19 +3228,59 @@ class AuthService:
                 return True
         return False
 
+    async def _revoke_ad_sessions(self) -> int:
+        """Revoke every live session held by a directory account. Returns the number revoked.
+
+        BACKLOG #1154 (ASVS 8.3.2). The two AD map setters below are authorization-value mutators:
+        the group maps resolve to role sets and to channel scope, which is exactly what an
+        authorization decision reads. Every SIBLING mutator already revokes -- :meth:`set_roles`,
+        :meth:`set_channel_scope`, custom-role update and delete, disable, password reset -- so an
+        edit here was the one that did not apply until the affected principals happened to log in
+        again. On a first deployment that would leave a session running on the pre-edit mapping for
+        as long as it stayed alive, which the requirement's first arm ("applied immediately") does
+        not allow and which no mitigating control covered.
+
+        **Scoped to AD accounts, and deliberately not narrowed further.** Resolving which principals
+        a map edit actually affects would mean re-binding to the directory, and both a removed
+        mapping and an added one change an outcome, so the affected set is not derivable from the
+        entries alone. Local accounts read neither map and are left alone.
+
+        Enumerates the way the reconciler does -- ``list_users`` filtered on provider and disabled,
+        then ``list_sessions`` -- so this needs no schema change on any backend. Unlike the
+        reconciler this is NOT counted against the mass-revoke breaker: that breaker exists to catch
+        a directory the engine cannot read, and this is an administrator's own step-up-gated edit.
+        """
+        revoked = 0
+        for user in await self._store.list_users():
+            if user.auth_provider != AuthProvider.AD.value or user.disabled:
+                continue
+            if not await self._store.list_sessions(user.id):
+                continue
+            revoked += await self._store.revoke_user_sessions(user.id)
+        return revoked
+
     async def set_ad_group_map(self, entries: Sequence[tuple[str, str]], *, actor: str) -> None:
+        """Replace the AD-group → role map (C3). Revokes directory sessions so it applies at once."""
         await self._store.set_ad_group_role_map(entries)
+        revoked = await self._revoke_ad_sessions()
         await self._audit(
-            "ad_group_map.updated", actor=actor, detail=_json({"count": len(entries)})
+            "ad_group_map.updated",
+            actor=actor,
+            detail=_json({"count": len(entries), "sessions_revoked": revoked}),
         )
 
     async def set_ad_group_scope_map(
         self, entries: Sequence[tuple[str, str]], *, actor: str
     ) -> None:
-        """Replace the AD-group → channel-scope map (C3). Takes effect on each AD user's next login."""
+        """Replace the AD-group → channel-scope map (C3). Revokes directory sessions so it applies
+        at once. This docstring used to end "Takes effect on each AD user's next login", which was
+        an accurate description of the defect BACKLOG #1154 names and is no longer true."""
         await self._store.set_ad_group_scope_map(entries)
+        revoked = await self._revoke_ad_sessions()
         await self._audit(
-            "ad_group_scope_map.updated", actor=actor, detail=_json({"count": len(entries)})
+            "ad_group_scope_map.updated",
+            actor=actor,
+            detail=_json({"count": len(entries), "sessions_revoked": revoked}),
         )
 
     # --- audit ---------------------------------------------------------------
