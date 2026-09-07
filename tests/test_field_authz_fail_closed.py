@@ -89,10 +89,12 @@ def test_a_freshly_built_phi_model_serializes_its_gated_properties_as_null() -> 
     )
     # Positive control: the SAME model, released, emits the values — so the assertion above is about
     # the gate, not about a seed that never carried PHI or a dump that drops every field. The reveal
-    # is passed so the control observes the COMPLETE value: this test is about the release gate, and
-    # a masked value would leave it unable to tell a working gate from a mask.
+    # is passed for EVERY masked property so the control observes the COMPLETE value: this test is
+    # about the release gate, and a masked value would leave it unable to tell a gate from a mask.
     released = redact_unauthorized(
-        _summary(), _identity(Permission.MESSAGES_VIEW_SUMMARY), revealed=frozenset({"summary"})
+        _summary(),
+        _identity(Permission.MESSAGES_VIEW_SUMMARY),
+        revealed=frozenset({"summary", "metadata"}),
     )
     emitted = released.model_dump(mode="json")
     assert emitted["summary"] == _SUMMARY
@@ -153,13 +155,13 @@ async def test_a_route_that_forgets_redact_unauthorized_denies_rather_than_expos
 
     @app.get("/test-made-the-call", response_model=MessageDetail)
     async def remembered() -> MessageDetail:
-        # Reveals summary so this control observes the COMPLETE value. Without it the control would
+        # Reveals every masked property so this control observes the COMPLETE value. Without it it
         # still be non-null and would still prove the route released something — but it would no
         # longer distinguish "the gate works" from "the mask works", and this test is about the gate.
         return redact_unauthorized(
             _detail(),
             _identity(Permission.MESSAGES_VIEW_SUMMARY),
-            revealed=frozenset({"summary"}),
+            revealed=frozenset({"summary", "metadata"}),
         )
 
     transport = httpx.ASGITransport(app=app)
