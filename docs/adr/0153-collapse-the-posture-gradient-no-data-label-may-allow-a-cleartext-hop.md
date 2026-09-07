@@ -85,11 +85,32 @@ It is deliberately **separate** from `tls_hop_attested`, with the opposite claim
 
 | field | claim | disposition |
 |---|---|---|
-| `tls_hop_attested` | this hop **is** secure, by means the engine cannot see | ALLOW, silent |
+| `tls_hop_attested` | this hop **is** secure, by means the engine cannot see | ALLOW; **one WARNING line off-loopback**, silent on loopback; never audited |
 | `cleartext_accepted` | this hop is **not** secure, and we accept that | WARN, logged + audited |
 
 Collapsing the two would leave the audit trail unable to distinguish a proxy-terminated hop from plaintext
 PHI on a flat network, which is the one distinction it exists to preserve.
+
+**AMENDED 2026-09-06 (BACKLOG #1155).** The `tls_hop_attested` row previously read **"ALLOW, silent"**,
+and that is wrong for the posture this ADR is actually about. The shipped code warns off-loopback; only
+the loopback case is silent, which is the ADR 0139 sidecar shape rather than the forward-proxy shape the
+paragraph above describes. Measured by driving `transports/rest.py`'s `_enforce_shipped_hop` at an
+enforcing PHI posture, with a bare non-loopback hop as the control that refuses in the same run: attested
+plus a non-loopback host crosses ALLOW and emits `insecure transport hop ATTESTED secure (suppresses an
+enforcing refusal)`; attested plus `127.0.0.1` crosses ALLOW and emits nothing; `cleartext_accepted`
+emits two lines, the second naming the connection and the reason.
+
+**The distinction this table draws survives, and it is narrower than "loud versus silent".** Both fields
+emit a `logger.warning` and neither writes an audit-trail row -- `cleartext_acceptance_audit_sink` is a
+plain callable, so `config/` never imports the engine's `AlertSink`. What separates them is
+**attributability**: the accepted path names the connection and the operator's stated reason, the
+attested path names neither.
+
+**Why the correction is recorded rather than made quietly.** The false row propagated. A 2026-08-20
+assessment pass read this table, wrote "crosses SILENTLY" into a ledger residual, and the claim was still
+standing three weeks later. A security document that understates a control it describes is the inverted
+form of the compensating-control-on-a-false-premise defect, and the record of how far it travelled is
+worth more than the one-row fix.
 
 **Destination-only.** Inbound binds are governed by a different mechanism —
 `_inbound_insecure_bind_permitted` and the four exposed-gates, keyed on `--allow-insecure-bind` and

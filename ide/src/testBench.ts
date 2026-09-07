@@ -14,7 +14,7 @@ import { configDir, messageSetsDir, pythonPath, runJson, workspaceDir } from "./
 import { hexdump } from "./hexdump";
 import { diffMessages } from "./hl7diff";
 import { buildTraceDetail, type TraceDetail, type TraceEntry } from "./traceView";
-import { nonce } from "./cspNonce";
+import { WEBVIEW_GUARD_NOTE, guardScript, openChannel, postToWebview } from "./webviewMessaging";
 import {
   compareCase,
   type DeliveryComparison,
@@ -144,7 +144,7 @@ export class TestBench {
     const items = Object.values(map)
       .map((c) => ({ name: c.name, cases: c.cases.length }))
       .sort((a, b) => a.name.localeCompare(b.name));
-    await this.panel.webview.postMessage({ type: "collections", items });
+    await postToWebview(this.panel.webview, { type: "collections", items });
   }
 
   /** Snapshot the currently-loaded rows as a named collection: input `raw` + the current deliveries. */
@@ -253,7 +253,7 @@ export class TestBench {
         };
       });
       const passed = results.filter((r) => r.pass).length;
-      await this.panel.webview.postMessage({
+      await postToWebview(this.panel.webview, {
         type: "collectionRun",
         name,
         passed,
@@ -285,7 +285,7 @@ export class TestBench {
     if (!row || !this.panel) {
       return;
     }
-    await this.panel.webview.postMessage({
+    await postToWebview(this.panel.webview, {
       type: "hex",
       source: row.source,
       dump: hexdump(row.raw),
@@ -382,7 +382,7 @@ export class TestBench {
       return srcCache.get(file) ?? null;
     };
     const detail: TraceDetail = buildTraceDetail(entry, readSource);
-    await this.panel.webview.postMessage({ type: "trace", detail });
+    await postToWebview(this.panel.webview, { type: "trace", detail });
   }
 
   private async showDiff(index: number): Promise<void> {
@@ -412,7 +412,7 @@ export class TestBench {
     }
     // Compute the segment/field-aware diff here (pure, in the extension host) and post the aligned
     // result; the webview only renders it. diffMessages tolerates \r / \n / \r\n itself.
-    await this.panel.webview.postMessage({
+    await postToWebview(this.panel.webview, {
       type: "detail",
       source: row.source,
       to,
@@ -467,7 +467,7 @@ export class TestBench {
   }
 
   private html(webview: vscode.Webview): string {
-    const n = nonce();
+    const { nonce: n, token } = openChannel(webview);
     const body = this.rows.length
       ? `<table>
           <thead><tr><th>Message</th><th>Type</th><th>Disposition</th><th>Routed →</th><th>Outputs</th><th></th></tr></thead>
@@ -581,7 +581,7 @@ export class TestBench {
   <div id="results">${body}</div>
   <div id="detail"></div>
   <script nonce="${n}">
-    const vscode = acquireVsCodeApi();
+    const vscode = acquireVsCodeApi();${guardScript(token)}
     const results = document.getElementById('results');
     const detail = document.getElementById('detail');
     const back = document.getElementById('back');
@@ -781,9 +781,9 @@ export class TestBench {
       b.addEventListener('click', () => vscode.postMessage({ command: b.dataset.act, index: Number(b.dataset.i) }));
     }
 
-    // Origin is NOT checked here — see webviewMessaging.ts.
+    ${WEBVIEW_GUARD_NOTE}
     window.addEventListener('message', (ev) => {
-      const m = ev.data;
+      const m = mfTrusted(ev);
       if (!m) return;
       if (m.type === 'detail') {
         const diff = m.diff || { before: [], after: [] };

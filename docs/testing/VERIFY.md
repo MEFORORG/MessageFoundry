@@ -41,7 +41,27 @@ messagefoundry verify --report-md verify.md --report-json verify.json
 | **store** | Opens the configured store backend (`[store]`/`MEFOR_STORE_*`) and confirms it connects — **no test-data writes** beyond the idempotent schema-ensure. Run once per backend the box is pointed at. |
 | **smoke** | `self` (default) routes a synthetic HL7 through your config via dry-run — **no store, no network, no side effects**; `live` MLLP-sends one synthetic message to the running engine and confirms an **AA ACK**; `none` skips. Add **`--check-disposition`** (+ `--service-config`) to also poll the store and **FAIL unless the message reached `PROCESSED`** (a new `smoke.disposition` row). |
 | **manual** | Echoes the human-only steps (AD/Kerberos login, TOTP MFA, API bind+TLS, NSSM service, end-to-end disposition in the console) as MANUAL with instructions. |
-| **federation** | Federated SSO posture ([ADR 0142](../adr/0142-federated-sso-oidc-authorization-code-pkce-relying-party-hybrid-ad-backed.md)) — **offline**, no socket is opened. With `[auth].oidc_enabled` false it emits a single SKIP. Enabled, it reports the pinned endpoints, the MFA-claim gate and the username UPN-suffix allow-list as **MANUAL** (the settings validators already refuse an unusable combination at load, so a PASS there would be a check that cannot fail), and **PASS/FAIL**s the things that genuinely can: the client secret resolving, the pinned TLS context building, and — with `--fed-id-token <file> --fed-jwks <file>` — a captured `id_token` replayed through the real validation ladder with a **verdict per rung**. Add `--fed-nonce` to cover the flow-binding rung; without it that rung and everything after it report SKIP, never PASS. |
+| **federation** | Federated SSO posture ([ADR 0142](../adr/0142-federated-sso-oidc-authorization-code-pkce-relying-party-hybrid-ad-backed.md)) — **offline**, no socket is opened. With `[auth].oidc_enabled` false it emits a single SKIP. Enabled, it reports the pinned endpoints, the MFA-claim gate and the username UPN-suffix allow-list as **MANUAL** (the settings validators already refuse an unusable combination at load, so a PASS there would be a check that cannot fail), and **PASS/FAIL**s the things that genuinely can: the client secret resolving, the pinned TLS context building, and — with `--fed-id-token <file> --fed-jwks <file>` — a captured `id_token` replayed through the real validation ladder with a **verdict per rung**. Add `--fed-nonce` to cover the flow-binding rung; without it that rung and everything after it report SKIP, never PASS. **Handle that file as a credential — see below.** |
+
+### Handling a captured `id_token`
+
+`--fed-id-token` is the one place this tool asks you to put a credential in a file, so it is the one place
+that needs saying out loud. An `id_token` is a bearer-class artifact: anyone holding it holds a signed
+assertion of the user's identity until it expires.
+
+1. Write it to a path only you can read, under your own profile — **never** the config directory, the
+   store directory, a repository working tree, or a share.
+2. Treat it as live for the whole of its `exp` claim, which the IdP sets and this tool does not shorten.
+3. Delete it as soon as the run finishes. It is not needed between runs; capture a fresh one.
+4. Keep it out of anything that travels: a ticket, a support bundle, a CI log, a screenshot, a commit.
+
+The tool itself does not persist it. It opens no socket, reads the file once, and its report carries the
+resulting **claims** — `username`, `sub`, `amr`, `acr` — not the token. The exposure is the file you made,
+which is why it is yours to remove.
+
+> **Why this is spelled out.** The rule under *Per-DB validation* — *"Secrets (DB creds) come from
+> `MEFOR_*` env only — never a file or the report"* — is scoped to database credentials, and a reader who
+> takes that scope literally concludes an `id_token` is not a secret. It is.
 
 ## self vs live smoke
 - **`--smoke self`** — safe anywhere (CI, a fresh box, before the engine is even running). Proves your
