@@ -473,8 +473,18 @@ def main(argv: list[str] | None = None) -> int:
 
     support_bundle = sub.add_parser(
         "support-bundle",
-        help="write a SECRET-FREE / PHI-free support zip (engine version + config summary + a "
-        "/status snapshot + a REDACTED app-log tail) to hand to support (#49)",
+        # The old wording read "a SECRET-FREE / PHI-free support zip". That is true of the config
+        # summary and the status snapshot and NOT of the log tail, whose redaction is best-effort: a
+        # single-token identifier survives it (messagefoundry/redaction.py states that residual), and an
+        # operator username is exactly that shape while this engine's own settings classifier calls a
+        # username a credential. A blanket claim resting on a member that does not meet it is the
+        # false-premise shape CLAUDE.md section 11 forbids, so the claim was repaired rather than the
+        # control -- see BACKLOG #1475 and the exclusion table in
+        # tests/test_log_redaction_secret_domain.py for why the username class stays out.
+        help="write a support zip to hand to support (#49): a secret-free config summary "
+        "(counts/names only) + a PHI-free /status snapshot + a REDACTED app-log tail. The tail's "
+        "redaction is BEST-EFFORT: a single-token identifier can survive it, an operator username "
+        "included",
     )
     support_bundle.add_argument(
         "--out", required=True, help="path to write the support-bundle .zip"
@@ -1270,6 +1280,7 @@ def _serve(args: argparse.Namespace) -> int:
     from messagefoundry.config.tls_policy import (
         HopDisposition,
         in_process_tls_revocation_refused,
+        proxy_mtls_declared_but_unverified,
         tls_revocation_attested,
     )
     from messagefoundry.crashdump import suppress_crash_dumps
@@ -1985,6 +1996,25 @@ def _serve(args: argparse.Namespace) -> int:
                 "[api].proxy_intra_service_auth and [api].proxy_tls_min_version before exposure — the "
                 "engine cannot verify the internal hop or the proxy's TLS/KEX for itself (attestation)."
                 f"{loopback_note}",
+                file=sys.stderr,
+            )
+        # --- BACKLOG #1181 (ASVS 12.3.5): the ONE Posture-B attestation the engine can check --------
+        # The rule, why it warns instead of refusing, and why the sibling values get no arm all live on
+        # the predicate, beside in_process_tls_revocation_refused -- the other pure serve-gate predicate
+        # on the same subject. It WARNS and never refuses: a sidecar in front of the engine can terminate
+        # the proxy's mTLS legitimately. This is a DIAGNOSTIC, not enforcement.
+        if proxy_mtls_declared_but_unverified(
+            declared=settings.api.proxy_intra_service_auth,
+            client_ca_configured=bool(settings.api.tls_client_ca_file),
+            is_phi=data_class is DataClass.PHI,
+        ):
+            print(
+                "warning: [api].proxy_intra_service_auth is declared 'mtls' but this engine verifies "
+                "no client certificate — [api].tls_client_ca_file is unset, so nothing here checks the "
+                "proxy's identity. If the proxy terminates its mTLS at a sidecar in front of the "
+                "engine, this is expected; otherwise set [api].tls_cert_file + [api].tls_client_ca_file "
+                "so the engine itself requires and verifies the proxy's certificate. The declaration is "
+                "an attestation either way — the engine enforces nothing on this hop.",
                 file=sys.stderr,
             )
 
@@ -5148,9 +5178,13 @@ def _verify(args: argparse.Namespace) -> int:
 
 
 def _support_bundle(args: argparse.Namespace) -> int:
-    """Write a secret-free / PHI-free support zip (#49): engine version + a config summary (registry
-    COUNTS/names only — never settings values or secrets) + a ``/status`` snapshot built from the real
-    status models + a REDACTED app-log tail. Offline: touches no network, starts no server. The status
+    """Write a support zip (#49): engine version + a config summary (registry COUNTS/names only — never
+    settings values or secrets) + a ``/status`` snapshot built from the real status models + a REDACTED
+    app-log tail. **The blanket "secret-free / PHI-free" this docstring used to open with covered the
+    first two members and not the tail**, whose redaction is best-effort with a single-token residual
+    that includes an operator username (BACKLOG #1475; the argparse help above carries the reasoning,
+    and ``docs/PHI.md`` stream 14 is the record). Offline: touches no network, starts no server. The
+    status
     snapshot + log tail come from the service settings (the configured store + ``[logging].log_dir``);
     the config summary comes from ``--config``. A missing service config or store is tolerated — the
     bundle is still produced (support is most wanted when something is already broken)."""

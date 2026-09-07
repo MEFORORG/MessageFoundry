@@ -11334,6 +11334,7 @@ Nothing here touches the TLS/FTPS context in the same module, which was already 
 > Research: done 2026-08-20
 >
 > **Filed 2026-08-08 - not started. RESEARCH item: the goal is an HONEST pass, and "cannot honestly reach pass" is a valid finding.** ASVS **12.3.5** (L3) currently scores **partial**. The pinned verb asks for strong, PKI-based, replay-resistant authentication verifying each endpoint of an intra-service hop. The engine's only setting named for it, `proxy_intra_service_auth: Literal[...] = "none"` at `messagefoundry/config/settings.py:771`, is read in exactly one place -- `return self.proxy_intra_service_auth != "none"` at `:804` -- so nothing branches on its value (verified at 166634c9).
+> **RE-VERIFIED 2026-09-06 (ASVS packet C).** **Every load-bearing claim HOLDS at `ebdfa44a6`, EVERY anchor in this row and its re-score has DRIFTED, and the hop this row calls closable is now MEASURED closable rather than read.** Corrected anchors: the setting is `config/settings.py:833` (this row says `:771`, the research says `:817`); its sole read is `return self.proxy_intra_service_auth != "none"` at `:866` (this row says `:804`, the re-score `:850`, the research `:850`); the predicate `proxy_intra_service_declared` has exactly one consumer, `__main__.py:1954`, with three further occurrences at `:1956`, `:1969` and `:1985` that are message text. **Nothing branches on WHICH value is set** -- one value comparison tree-wide, the declaredness check, plus one doc test; the research's stated control (14 hits for a setting that IS branched on) did NOT reproduce for me, so I used a different one and name it: `policy.mode == "system"` / `== "pinned"` at `config/tls_policy.py:1343`, `:1346`, two hits in the same run, which proves the probe can see a Literal branched on by value. Also still true, re-measured: `load_cert_chain` appears zero times in `messagefoundry/store/` against a positive control of **12** elsewhere in the engine (the research said nine, so the control moved, not the finding); the cert-identity plane has exactly one route consumer, now `api/app.py:5121` behind `require_service_cert` (the research says `:4849`); the `[alerts]` webhook sink still declares `webhook_url` / `webhook_timeout` / `webhook_allowed_hosts` at `config/settings.py:2942-2947` and no credential field of any kind; the AI broker still sends a static `x-api-key`, at `transports/ai_broker.py:161` (the research says `:197`); and the OIDC static `client_secret` at `auth/oidc/flow.py:259-260` is the ONE anchor in this row that did not move. **THE "CLOSABLE TODAY" CLAIM WAS ALREADY MEASURED, AND BOTH THIS ROW AND ITS RE-SCORE CITE THE WRONG ARTIFACT.** The re-score justifies it by reading `api/tls.py:58-62`. The repository has carried a real socket-level mutual-TLS test since the #200 residual -- `tests/test_api_tls.py::test_real_mutual_tls_handshake_on_built_context` drives an actual handshake against the exact context the serve path builds, and it already covers both arms the re-score needed: a client presenting the CA-signed certificate completes, a client presenting none is refused. Nothing in this row, its re-score or its research names it. **This pass first built a second handshake harness before finding that one, and the duplicate was deleted rather than landed** -- recorded because "ask whether the work already exists on a branch before you build it" is the rule it broke, and because the same reading error is what put the citation on the source file instead of on the test. **THREE ARMS THAT WERE GENUINELY MISSING, now added beside the existing test and reusing its fixtures:** a certificate from an UNCONFIGURED ISSUER is refused, so presenting some certificate is not enough; **the causation control** -- drop `tls_client_ca_file` and the identical harness ADMITS the uncertificated peer, without which "no certificate is refused" is equally consistent with a broken port, an unreadable anchor or a bad server key, every one of which also refuses and every one of which reads as "mTLS works"; and reachability in the topology the setting is actually about. **That last one is the fact nobody had established.** `ensure_api_tls_material` returns `None` under `tls_terminated_upstream`, because serving https beneath a proxy that speaks plaintext would break the proxy's own hop -- and read alone that says the mTLS this setting names is unreachable exactly where it is declared. It is not: the operator-supplied branch sits ABOVE the no-mint one, so terminator + trusted proxies + `tls_cert_file` + `tls_client_ca_file` is a valid configuration and the engine really does `CERT_REQUIRED`-verify the proxy. One property worth knowing that the suite already documents rather than this pass discovering: that verification is strict RFC 5280 (`harden_verify_flags`, ASVS 12.1.4), so a hand-minted proxy certificate without the key-identifier pair is refused with `Missing Authority Key Identifier` and a CA without `keyCertSign` with `CA cert does not include key usage extension`. `_strict_ca_and_leaf`'s docstring names that constraint; this pass rediscovered it as two reds and then found the existing helper. **The SEVERITY sentence is half dead and should be re-worded.** "A control that reports itself on while doing nothing" is exactly right about the mechanism. "An operator who declared mtls would BELIEVE the hop was mutually authenticated" is weaker than it reads: `docs/CONFIGURATION.md` and the setting's own comment both say **Attestation only, the engine enforces nothing at run time**. Documentation is not a control (SDS-3.7), so the mechanism limb stands unchanged; the belief limb rests on an operator not reading the one page that describes the setting. **BUILT: the one coherence check the engine can actually make.** Declaring `"mtls"` on a PHI instance while `[api].tls_client_ca_file` is unset now WARNS at `serve` -- the engine is the far end of that hop and verifies a client certificate in exactly one configuration, so with none its own config contradicts the declaration. It WARNS and never refuses, and the reason is a topology rather than caution: a sidecar or stunnel in front of the engine can terminate the proxy's mTLS legitimately, leaving a true `"mtls"` hop the engine sees as plaintext, so a refusal would be purchased on an unobservable premise. `"network"` and `"shared_secret"` get no arm because nothing in the process can read them. The rule is a pure predicate, `proxy_mtls_declared_but_unverified` in `config/tls_policy.py`, sited beside `in_process_tls_revocation_refused` -- the other pure serve-gate predicate on the same subject -- so the whole 16-cell truth table is testable without a settings load. That matters here rather than being tidiness: the three cases reachable through `serve` each need a TOML, a `chdir` and five stubs to reach one boolean, so the arm that SILENCES the warning had no test at all, and that is the arm a regression breaks quietly -- the engine would nag a site that had done the work, and the obvious fix for a nag is to delete the check. **THE SUCCESSOR ABSENCE CLAIM, specified here because this row required it in the same change.** The old claim -- "nothing branches on WHICH value is set" -- now matches, for a diagnostic that changes no byte on any wire, and a cell resting on it would start reading as a control. The claim that survives and that actually decides the verdict is: **no value of `proxy_intra_service_auth` changes what the listener accepts**, pinned in code by `tests/test_api_tls.py::test_no_value_of_the_declaration_changes_the_listener`, which builds the context under all four values and requires one peer-verification state. **What this deliberately did NOT do:** default the setting to `"mtls"`; make any value enforcing; refuse anything; touch the store, Vault, OIDC, AI-broker or webhook hops; or answer whether an attestation-only setting should exist at all, which is an owner decision and not a build. **VERDICT: stay `partial`**, and the reasoned cannot-pass stands on the limb the research already isolated -- the engine-to-SQL-Server store login, where the wire protocol has no place to put a certificate. Nothing here moves it.
 > Verdict: research
 > Closing-act: scorecard-rescore
 
@@ -11419,6 +11420,9 @@ Nothing here touches the TLS/FTPS context in the same module, which was already 
 > Research: done 2026-08-20
 >
 > **Filed 2026-08-08 - not started. RESEARCH item: the goal is an HONEST pass, and "cannot honestly reach pass" is a valid finding.** ASVS **13.3.2** (L2) currently scores **partial**. The pinned verb asks that access to secret assets adhere to least privilege. The recorded basis is that `require_managed_identity: bool = False` (`messagefoundry/config/settings.py:488`) is the one engine-side check and covers only the store slice -- but the 2026-08-08 triage calls that a category error, and the sibling cell 13.2.2 says so in the scorecard's own words.
+> **RE-VERIFIED 2026-09-06 (ASVS packet C).** **`partial` IS the right verdict, and NOT ONE of the reasons this row records for it survives.** The recorded basis drifted twice over: `require_managed_identity` is at `config/settings.py:521`, not `:488`, and the sibling cells already refuted the substance -- so the verdict is right by accident and must be re-anchored, which is what this row asked for a step earlier than its neighbours. **PREMISE DEAD on the whole redaction paragraph, and the row records its own fix without amending the list.** All five strings this row says survive VERBATIM past `support/redact.py`, and the bearer defect it describes emitting the token, are redacted at `ebdfa44a6`: `password=`, `Driver=x;PWD=`, `secret=`, the inline `postgres://user:pw@host` DSN, the cast-failure `(env 'MEFOR_VALUE_PW'='...')` echo, and `Authorization: Bearer <tok>`. Re-executed with this row's own two positive controls (`token=` and `MEFOR_STORE_PASSWORD=`, both redacted in the same run) plus a negative control that must NOT be touched (`routing key=adt_a01 handler=demo`, returned byte-identical) so a redactor that scrubbed everything could not read as a pass. The row itself records the fix at `77d03ca1` / PR 491 further down; a reader who stops at the survival list carries six dead findings away. Also dead: "five hand-written regexes with no derived domain and no coverage assertion" -- `tests/test_log_redaction_secret_domain.py` derives the applied set by AST from the body of `redact_log_line` and carries a per-family mutation fixture that disables a family's own patterns and REQUIRES the secret to leak. **LIVE, NEW, AND FIXED HERE: the engine's own credential vocabulary was invisible to its own log redactor.** `\b` does not fire after an underscore, because `_` is a word character, so a label like `ad_bind_password=` never reached the keyword at its tail. Measured leaking VERBATIM at `ebdfa44a6`, against the same positive and negative controls: `client_secret`, `bearer_token`, `basic_password`, `ad_bind_password`, `tls_key_password` and `vault_token`. Five of those six are real identifiers in this tree (23, 45, 24, 12 and 24 occurrences respectively; `vault_token` is zero, and a fabricated name returns zero as the negative control), and the exposure lands on BOTH surfaces this row names -- the support archive and `GET /logs/tail` -- because they share this one backstop. Fixed by widening the label group of `_BEARER` and `_CREDENTIAL_KV` with an optional dotted/underscored/hyphenated prefix; each prefix segment must end in a separator, so it widens the LABEL only and cannot cross a space or the `;` in an ODBC string. Two families added to the domain guard, one per widened pattern, so the mutation fixture proves the declared pattern is what does the work. **THE FIRST VERSION OF THAT FIX SHIPPED A NEW DEFECT AND REVIEW CAUGHT IT, WHICH IS WORTH MORE THAN THE FIX.** An UNBOUNDED prefix (`*`) makes both patterns QUADRATIC in line length on exactly the surface this cell is about: `_` suppresses `\b`, but `.` and `-` do not, so an N-segment run gives the regex N start positions and the group re-walks O(N) segments from each. Measured over 20 passes of one 6 KB run: **1.5 ms before the widening, 827 ms unbounded, 11 ms at `{0,6}`** -- and base64url uses `-`, so a JWT echoed into an upstream error is precisely that shape, on log text an attacker can influence, reaching both surfaces. A repair for a confidentiality defect had opened an availability one. Bounded at `{0,6}`, with the cost measured as LINEAR in the bound (8 ms at 4, 11 at 6, 14 at 8) so the headroom is bought cheaply, and pinned by a guard proven to reject `*`, `+` and `{0,}` while accepting the bounded form. **What the bound costs, recorded because it fails silently in one direction:** an underscore-joined label deeper than six segments is not matched, since `_` offers no later start position to retry from; a dotted or hyphenated label of any depth still matches, for the same reason it was expensive. Nothing in this tree is close to six. **AND THE VOCABULARY IS STILL HAND-CHOSEN, WHICH IS THE SHAPE THIS ROW EXISTS TO REFUSE -- measured, so the next pass starts from a number.** Against the engine's own two credential-name tables, 11 names are still not reached by the widened patterns, verified here rather than relayed: `username`, `basic_user`, `ws_username`, `proxy_user`, `http_auth_user`, `credential_username`, `private_key`, `smart_private_key`, `encryption_key`, `encryption_keys_retired` and `intake_api_key_next` (control: `ad_bind_password` and `client_secret` ARE reached in the same run). Three different causes, and only one is an oversight: the six username spellings are the class `config/wiring.py` classifies as secret and this module does not; the four key spellings are a DOCUMENTED exclusion, since `key` alone is ordinary vocabulary here -- but `private_key=` and `encryption_key=` are not ambiguous the way a bare `key=` is; and `intake_api_key_next` puts the keyword MID-label, which the trailing `\b` cannot reach by construction, so it is excluded by the same rule that keeps `password_file=` safe. **Proposed work, unallocated and by subject:** derive the vocabulary in the GUARD rather than the module -- assert every name in `wiring`'s secret-setting set and `settings`' file-secret set is redacted -- which keeps `redact.py` stdlib-only as its docstring requires, and turns a hand-written list into the derived domain the sibling connection-settings guard already is. It needs an owner call on the username class first, because widening onto it is a scope decision and not a bug fix.
+>
+> **Deliberately NOT fixed, and named so the next reader does not think it was missed:** the separator-free prose form (`... failed with password <value>`) still leaks. A bare-space arm would eat `connection IB_DEMO_ADT bound, password rotation scheduled`, which the guard's own ordinary-diagnostics fixture pins, so the safe direction here is the under-redacting one. **THE LOAD-BEARING LIMB HOLDS, and it is the one the verdict should rest on.** Verification on READ: zero occurrences of `0o077`, `0o044`, `S_IROTH`, `S_IRGRP`, `FILE_READ_DATA`, `GENERIC_READ` or `FILE_READ_EA` anywhere in `messagefoundry/`, against a positive control of 8 write-class sites in the same run (`auth/trust_anchors.py:173`, `:203`; `config/wiring.py:4890`, `:4905`, `:4906`, `:4913` and neighbours). Both permission predicates are still WRITE-axis, and `docs/SECURITY.md:171` still concedes "the rest is asserted, not engine-checked" -- the row cites `:152`, so that anchor drifted too. In-process need-to-know: `pipeline/sandbox.py:616` still spawns the isolation worker with no `env=` argument (the row says `:442`). Secret-store privilege: zero calls to any capability or token-introspection endpoint, against a positive control of four `X-Vault-Token` sites in the same run. **WHY NOT THE OTHER VERDICTS.** Not `pass`: the read limb is unimplemented and the two live guards are write-axis by construction, so nothing in the engine grades who may READ a key file. Not `na`: the substrate argument fails on the project's own precedent, since the engine creates these files, sets their permissions, and already refuses to start on an OS permission twice. Not `fail`: real controls exist and are load-bearing -- `_assert_safe_config_source` (`config/wiring.py:5203`, with the pure policy evaluator at `:4945`), the trust-anchor guard, `_secure_file`, and now a machine-derived redaction domain. **So: stay `partial`, with the residual rewritten from `require_managed_identity` onto the read-axis absence** -- and the residual must ALSO drop the sibling's subject, because grading what credential the engine PRESENTS is 13.2.1's question, not this one. **What this deliberately did NOT do:** build the read-privilege preflight, the file-borne asset registry, the process-principal self-check, the environment scrub, or the subprocess environment -- all of them remain this row's proposed work, unallocated and by subject. **The row stays OPEN**: a shipped fix is necessary and routinely insufficient for a verdict to move, and the closing act is a vault scorecard re-score no Builder can perform.
 > Verdict: research
 > Closing-act: scorecard-rescore
 
@@ -24387,3 +24391,174 @@ The detector control stayed green in all four, which is the asymmetry: it flags 
 ### Not checked
 
 I did not read gitleaks' source, so "walks every ref when the flag is unset" rests on the commit counts above and not on the code. I did not test a fork pull request, where the checkout and the available refs differ. I did not check whether any other workflow in this repository scans with a whole-repository default; only `security.yml`'s secret job was examined.
+
+
+## 1475. Derive the log redactor's secret vocabulary from the settings registry, with a reasoned exclusion table
+
+> 🔢 **Filed 2026-09-06 -- the fix rides the PR that files this row; the banner stays open until the Lander flips it on merge.** Value **6/10** · Difficulty **3/10** · _fill-in_. `support/redact.py` chose its credential words by hand, so the engine's own credential registry could grow past what its log redactor can see and nothing would report it. **Measured 2026-09-06** against `_SECRET_SETTING_KEYS | _FILE_SECRET_KEYS` (30 names): **27 printed verbatim** before #1183's snake_case label prefix, **11 after it**, **6 after this row's key-material pattern** -- and those 6 are the whole username class, which is out on measured grounds recorded in the guard.
+> Verdict: build
+> Research: none
+> Closing-act: code
+
+**Cluster:** support bundle / log redaction. **Priority:** P2. **Verdict:** build.
+**Severity:** sec. 0 applies -- there are zero deployments, so nothing is leaking today. A deploying site that ran `support-bundle` or `GET /logs/tail` **would** hand out key material in the archive.
+
+**Two surfaces, one hole.** `support/redact.py` is the second-pass backstop for the support archive (`support/bundle.py`) and for `GET /logs/tail` (`api/app.py`), so a gap in it lands on both.
+
+### The defect: a hand-chosen vocabulary cannot report its own narrowness
+
+The module picked its credential words by review. The engine states what it believes a credential is in two registries, and nothing compared them:
+
+| registry | where | what it governs |
+|---|---|---|
+| `_SECRET_SETTING_KEYS` | `config/wiring.py` | connector settings `/metadata` redacts (25 names) |
+| `_FILE_SECRET_KEYS` | `config/settings.py` | service settings that must live in the environment, not the config file (8 pairs) |
+
+Reading either alone is narrower than the engine's own belief: `encryption_key`, `encryption_keys_retired`, `ad_bind_password`, `oidc_client_secret` and `email_password` are in the second and not the first. The union is **30 names**.
+
+### What was measured, on this worktree's `.venv` against the `requirements.lock` pin
+
+Sentinel `zz-Sekr3t_Val-99`, carrying a hyphen and an underscore so the `_LONG_B64` sweep cannot reach it and score a name as covered when its own pattern did nothing.
+
+| tree state | reached | printed verbatim |
+|---|---|---|
+| `origin/main` at `ebdfa44a6` | 3 | **27** |
+| plus #1183's `_LABEL_PREFIX` (PR 965) | 19 | **11** |
+| plus this row's `_KEY_MATERIAL` | 24 | **6** |
+
+Positive control in the same run: `password=` redacted, `connection_name=` survived -- so the instrument reports both outcomes.
+
+**The 11 reproduce the handed-down split exactly**, name for name: `basic_user`, `credential_username`, `http_auth_user`, `proxy_user`, `username`, `ws_username` excluded; `private_key`, `smart_private_key`, `encryption_key`, `encryption_keys_retired`, `intake_api_key_next` to reach.
+
+### The fix is literal alternates, not a suffix rule, and that is the whole design
+
+`_KEY_MATERIAL` splices #1183's bounded `_LABEL_PREFIX` onto four literal alternates. `smart_private_key` needs no alternate of its own -- the prefix reaches it.
+
+**The two general rules fail in OPPOSITE directions, which is why neither is used.** Measured 2026-09-06, both spliced onto `_LABEL_PREFIX` with the pattern's own trailing word boundary:
+
+| candidate rule | reaches | eats |
+|---|---|---|
+| label **ends in** a key word | **3 of 5** -- cannot reach `encryption_keys_retired` or `intake_api_key_next` at all | `idempotency_key`, `delivery_key` |
+| a key word **anywhere** in the label | 5 of 5 | `intake_api_key_header`, `private_key_file`, `encryption_key_ref`, and the ordinary vocabulary below |
+
+The sharpest of those is `intake_api_key_header`, which this engine classifies non-secret on purpose: it is the header NAME an intake credential arrives in, not the credential (`config/wiring.py`, pinned by name in `tests/test_connection_api.py`). Redacting it costs an operator the field saying WHERE the credential was expected and buys no confidentiality. Measured: planting the contains-rule widening reds three tests, including the one written for this claim.
+
+**The census, tokenized so comments and strings are excluded and the comment stating it cannot count itself:** 78 distinct identifiers ending `_key`/`_keys` in `messagefoundry/`, 577 occurrences, led by `file_key` 59 and `idempotency_key` 58 against `private_key` 22. `idempotency_key` is how an operator traces a message through the staged pipeline, so a contains rule would blind the reader the support bundle exists for.
+
+The value class **admits a comma**, unlike `_CREDENTIAL_KV`, because `encryption_keys_retired` ships as a comma-joined list (`store/keyprovider.py::_split_retired`) and a comma terminator would redact the first retired key and print the rest. **Residual, stated rather than left implied:** a list written with a SPACE after the comma leaves its later elements to the `_LONG_B64` sweep.
+
+### The exclusion table is the product, and it is two-sided
+
+`EXCLUDED_FROM_REDACTION` in `tests/test_log_redaction_secret_domain.py` carries the 6 username-class names with the reason each is out. The guard asserts in **both** directions:
+
+1. a registry name that leaks and is not in the table fails -- so a credential setting added to the engine that the redactor cannot see reds the suite;
+2. a table entry that is **already redacted** fails -- a stale exclusion is a false record, telling a reader the engine leaks something it now scrubs;
+3. a table entry outside the registry fails -- the table must excuse real names.
+
+### Why the username class stays out: three grounds, each re-measured here
+
+1. **The widening buys nothing.** Every string literal the engine passes to a logging call or an exception constructor, extracted by AST: **5,826 across 268 modules**. A candidate username pattern shaped exactly like `_CREDENTIAL_KV` fired **zero** times. The shipped `_CREDENTIAL_KV` fired **4** times on the same corpus in the same run (the control), and a dead needle returned 0 (the corpus was read). *The handed-down figure was 1,258 literals with the same 0-and-4 split; the corpus size differs by extraction breadth, and the two counts that carry the argument are identical.*
+2. **It reaches the wrong shape anyway.** `Login failed for user 'svc'` (ODBC prose), `UID=svc;PWD=` (a different keyword), `CN=svc,OU=` (a DN), the engine's own `actor=` audit field, userinfo in a URL. A `label=value` rule matches none of them.
+3. **The engine already ruled on this class at the layer that owns it.** `messagefoundry/redaction.py` states its own residual at `:16` and `:69` -- an adversarially-crafted **single-token** identifier survives, by convention. A username is exactly that. `docs/PHI.md` says the same from the other end: the forwarded log stream "still carries usernames", which is its stated reason for gating the off-box hop.
+
+### The claim was repaired, not the control (SDS-3.7)
+
+`messagefoundry/__main__.py` advertised a "SECRET-FREE / PHI-free support zip". That is true of the config summary and the status snapshot and **not** of the log tail. The help string now states the residual, and `docs/PHI.md` stream 14 records that the residual includes an operator username, which the engine's own classifier calls a credential. `bundle.py` already described its tail as redacted and best-effort, so only the CLI help was loose.
+
+### Red-first, with the mutants hash-verified
+
+Nine mutations planted one at a time, each scored only after a SHA-256 comparison proved it changed the file, each reverted to a byte-identical file. **All nine killed**, and the reds are specific:
+
+| mutant | killed by |
+|---|---|
+| stop applying `_KEY_MATERIAL` | the derived guard, the family fixtures, the AST domain test, the sibling test |
+| drop the `intake_api_key_next` alternate | the derived guard + 2 |
+| drop the `private_key` alternate | the derived guard + 2 |
+| excuse a name that IS redacted | the derived guard's stale arm + the class test |
+| **add a credential setting the engine cannot see** | **the derived guard alone -- one specific red** |
+| widen to a general label-suffix rule | the sibling test, the ordinary-diagnostics fixture, the mutation fixture |
+| unbound `_LABEL_PREFIX` | #1183's bound test |
+| **excuse `db_user_password` as username-class** | **the class test -- the falsely-accepting hole, now closed** |
+| the engine drops a name from its identifier class | the class test |
+
+The fifth is the one this row exists for, and the eighth is the one the review put there. The existing mutation fixture also **caught a real overlap while this was being built**: `_KEY_MATERIAL` is case-insensitive, so it now also covers `MEFOR_STORE_ENCRYPTION_KEY=`, and the `mefor_env_value` family had to declare both patterns. An undeclared second cover is exactly how a family's green stops being evidence about its own pattern.
+
+### Timing, because a pattern that widens a known cost is a regression
+
+The redactor is roughly 36x more expensive on a base64url run than on plain text, and `GET /logs/tail` runs it per line. That cost is **pre-existing and reproduced**; it was not to be fixed here, and it must not be made worse. One ~6 KB line, min of 9x20 passes, best of 3 runs:
+
+| | base64url (6,206 B) | plain (6,187 B) |
+|---|---|---|
+| before `_KEY_MATERIAL` | **36.6 ms** | **1.01 ms** |
+| after | **36.1 ms** | **1.28 ms** |
+
+The base64url cost is unchanged inside its own noise; the plain-text cost rises ~0.27 ms, which is one more linear pass.
+
+**A corrected mechanism, offered as a finding.** Timed per pattern on the same base64url line, all nine of this module's patterns sum to **0.27 ms** -- and `_KEY_MATERIAL` costs **0.043 ms**, identical to its sibling `_CREDENTIAL_KV` at 0.043 ms. The shared engine PHI pass alone costs **38.4 ms** on that line against **0.36 ms** on plain. **So the 36x gap lives in `messagefoundry/redaction.py`, not in `support/redact.py`, whose own patterns are cheaper on base64url (0.27 ms) than on plain text (0.72 ms).** The cost is real and the attribution was to the wrong module. Not filed as its own row -- naming it here so the next reader does not re-optimise the module that is not paying it.
+
+### What an adversarial review of this change caught, before it shipped
+
+Four review agents read the diff. Two findings were real and both are fixed here; recording them because a repair round is not monotonic and the notes are worth more than the verdict.
+
+1. **The guard itself falsely ACCEPTED.** The class assertion asked `"user" in name`, which accepts `db_user_password`, `user_token` and `superuser_api_key` -- so a future maintainer could excuse a leaked password by writing a username reason beside it and pass both arms. The engine already names this class: `wiring._NON_ROTATABLE_SECRET_SETTING_KEYS` is "settings keys that are IDENTIFIERS (usernames), not rotatable credentials", and measured 2026-09-06 it is **character-for-character** this row's exclusion table. The test now asserts set equality against it. **A check that falsely accuses is loud; one that falsely accepts just sits there**, and this one was in the code written to prevent exactly that.
+2. **The design was defended by one example, and the example was the wrong one.** The argument named only `intake_api_key_header` and claimed a suffix rule "covers all five". It covers three -- and with the trailing word boundary a suffix rule does not reach `intake_api_key_header` either. The rule that reaches all five is a CONTAINS rule, which is what the mutation actually planted. **Every number in the first census was also correct when taken and unreproducible afterwards**, because the comment naming `file_key` and `idempotency_key` was itself inside the corpus being censused: each named count came back exactly one higher. Re-run over NAME tokens only, which a comment cannot enter, it is stable. Two defects in one paragraph, both caught by reading rather than by any gate.
+
+**One handed-down premise did not survive, and it was mine to check.** The module docstring's "no engine state -- so it stays usable from the offline CLI" reads as a bar on importing the registries. Measured: `import messagefoundry.support.redact` already loads **64** engine modules including `config.wiring` and pydantic, because the package root imports it. The literal list is still right, on the two grounds now recorded beside it, but **not** on that one. The docstring line is pre-existing and another open PR holds the file, so it was left alone rather than rewritten in passing.
+
+**And one alarm was my own instrument, pointed at the wrong subject.** `username_access_key_screen.py` returned rc=1 when handed this PR's changed files. Run the way pre-commit actually invokes it -- `always_run`, `pass_filenames: false`, walking its own `DEFAULT_SCOPE` -- it returns **rc=0**. Its own wiring comment predicts the mistake: handing it a changed-file list "would silently narrow what it looked at while still printing a confident total". Widening it past its scope does the mirror thing. No defect; recorded so the next reader does not re-raise it.
+
+### Not done, deliberately
+
+- **The base64url cost itself.** Pre-existing, and belongs to `messagefoundry/redaction.py` on the measurement above.
+- **The write-time handler filters, and this is the larger half of the surface.** `logging_setup.py` installs `RedactionFilter`, `CredentialQueryScrubFilter` and `ControlCharScrubFilter` on every record, on the stdout handler NSSM captures and on the syslog/SIEM forwarder (there is no `FileHandler`). `support/redact.py` is a READ-time backstop and reaches neither the log file at rest nor the forwarded copy.
+
+  **Measured 2026-09-06, and it is worse than "a third vocabulary".** Seven credential shapes were pushed through all three filters in order. **Every one passed VERBATIM** -- `encryption_key=`, `private_key=`, `password=`, ODBC `PWD=`, `MEFOR_*=`, DSN userinfo, and `Authorization: Bearer`. The control, an OIDC `?code=&state=` query, scrubbed correctly in the same run, so the instrument works. `CredentialQueryScrubFilter`'s vocabulary is the OIDC query keys and nothing else.
+
+  **Consequence, in the conditional (sec. 0):** a deploying site that named a `[logging].forward_host` -- forwarding is default-on once a collector is configured -- would ship its store DEK to that collector, and to `service.out.log` on disk, with none of this row's work in the path.
+
+  **Deliberately NOT built here.** The brief scoped this row to the read-time backstop, and widening it silently is the wrong call. **The subject is named rather than numbered, because it is unfiled:** a derived-domain guard over the write-time filters' vocabularies. One constraint for whoever takes it -- the guard cannot be lifted into `logging_setup.py` at runtime, because `config/settings.py` imports `LOG_LEVELS` from it and its own docstring pins that direction, so the derivation has to stay test-side exactly as it is here.
+- **`ad_bind_dn`** is not classed secret; only `ad_bind_password` is. Confirmed, not changed.
+
+
+## 1477. PAR or JAR for the OIDC relying party's authorization request, as hardening beyond ASVS
+
+> 🔢 **Filed 2026-09-06 -- not started. This is PRODUCT HARDENING, not a compliance gap: do not file it in the risk-acceptance register as one.** Value **3/10** · Difficulty **4/10** · _fill-in_. This engine's OIDC relying party builds an authorization-code redirect with PKCE S256 and `response_mode=query`, so the authorization request travels the browser-visible front channel by construction. Pushed Authorization Requests (RFC 9126) or JWT-Secured Authorization Requests would remove that front-channel visibility altogether. The subject is worth keeping; whether to build it is an ordinary product decision that queues like any other.
+> Verdict: build
+> Research: none
+> Closing-act: code
+
+**Cluster:** auth / OIDC relying party. **Priority:** P3. **Verdict:** build.
+**Severity:** sec. 0 applies -- zero deployments. The exposure a deploying site would carry is front-channel parameter visibility and tampering that the identity provider must reject, not a session-forging path. That is why the value is 3 and not higher.
+
+### Why this row exists at all: the subject was about to evaporate
+
+An adversarial review ruled that **ASVS 10.4.13 scores `na` on scope** -- the requirement's actor is the authorization server, this engine hosts none, and the assessment's own precedent already answers the actor question consistently across that requirement's siblings. **The vault holder performs that re-score; no builder can.**
+
+The PAR/JAR hardening subject is carried today by exactly one open ledger row, **#1351**, whose closing act **is** that re-score. So the re-score closes #1351 and the subject goes with it. **It has already survived one such near-miss**: cell 10.4.15's residual ordered this filed independently on 2026-08-04 and that was never done. This row is the durable home, and filing it is why the ruling is two acts rather than one.
+
+**Verdict is `build`, not `research`, and that is load-bearing.** No research-verdict row has ever closed in this ledger -- zero across roughly 480 graded items -- because a research row's closing act is a vault re-score no builder can perform. Filing this one as research would recreate the exact evaporation the ruling is trying to prevent.
+
+### Measured 2026-09-06: no PAR exists in any configuration
+
+`git grep` over the tracked tree:
+
+| needle | files |
+|---|---|
+| `pushed_authorization` | **0** |
+| `request_uri` | **0** |
+| `pushed_auth` | **0** |
+| `PAR_ENDPOINT` | **0** |
+| `code_challenge` **(control)** | **6**, of which 4 are code, including `messagefoundry/auth/oidc/flow.py` |
+
+The control fires on the same instrument, same corpus, same run, so the zeros are measured rather than an unread corpus. The scope is the **tracked working tree**, not every ref -- a dormant branch is invisible to it.
+
+### What a build would be
+
+A PAR client on the relying-party side: POST the authorization parameters to the provider's pushed-authorization endpoint over the back channel, then redirect the browser with only `client_id` and the returned `request_uri`. It is a client addition, not a redesign of `auth/oidc/flow.py`. JAR is the alternative shape -- sign the request object rather than push it -- and choosing between them is part of the work, so an ADR is warranted.
+
+**Gate it on provider support.** PAR is an optional provider capability advertised at `pushed_authorization_request_endpoint` in the discovery document, so the build must degrade to today's behaviour when a provider does not offer it, rather than refusing to start.
+
+### Not done here
+
+This row was **filed, not built**. Nobody has read the pinned requirement text against `flow.py` for this row's purposes, and no provider-support survey was run. The `na` ruling above is reported as the routing fact that makes this row necessary; this row does not re-derive it and does not depend on it being correct.
+
