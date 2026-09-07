@@ -13,7 +13,8 @@ each ``(sweep_mode, N)`` step it:
    EnginePoller`, preflights that the engine serves all N inbound ports;
 3. ramps N :class:`~harness.load.sender.PersistentConnection`s open in batches (avoid a connect storm)
    and waits until the engine's ``/connections`` reports N inbound rows;
-4. HOLDS a steady aggregate rate for ``hold_seconds``, sampling the engine + the FD probe each tick;
+4. HOLDS a steady aggregate rate for ``hold_seconds``, sampling the engine on one task and the OS
+   probe on another (they shared a tick until BACKLOG #1430, which cost the step its samples);
 5. optionally fires a grow-reload mid-hold and times it (wall #5);
 6. stops offering, drains, takes a final sample, and appends a :class:`ConnScaleRecord`.
 
@@ -359,7 +360,11 @@ async def _run_one_step(
         db_path=db_path,
     )
     node = EngineNode(tag, api_port, env=node_env, config_dir=_CONFIG_DIR, cwd=cwd)
-    poller = EnginePoller(node.url, token=None, origin=time.perf_counter())
+    # Named rather than inlined: the OS probe now runs on its own task and stamps its readings with the
+    # instant each was taken, and those instants must sit on the SAME clock as `EngineSample.elapsed_s`
+    # or nothing downstream can put a probe reading beside the engine sample it belongs next to.
+    origin = time.perf_counter()
+    poller = EnginePoller(node.url, token=None, origin=origin)
     # BACKLOG #1292: the per-message send ledger the intake audit reads. None disables the audit
     # wholesale (the sender's write path is then byte-identical to pre-#1292).
     ledger = IntakeLedger() if profile.intake_audit else None
@@ -373,6 +378,11 @@ async def _run_one_step(
     )
     fd_sampler: FdSampler | None = None
     samples: list[EngineSample] = []
+    proc_readings: list[ProcReading] = []
+    # Declared before the `try` so the cleanup can reach them on any path out of the step. A leaked
+    # probe task keeps walking the process table for the whole REST of the sweep, and `run_connscale`
+    # lets a failed step fall through to the next one rather than ending the run.
+    sampler_tasks: list[asyncio.Task[Any]] = []
     try:
         await sink.start()
         # SERVER backend: empty the shared store so THIS step starts clean — the analog of the SQLite
@@ -417,9 +427,21 @@ async def _run_one_step(
             connect_batch=profile.connect_batch, batch_pause_s=profile.connect_batch_pause_s
         )
         sampler_stop = asyncio.Event()
+        # TWO tasks off one stop event, not one task doing both (BACKLOG #1430). The engine poll is
+        # cheap; the OS probe is a process-table walk. Welded to a single tick, the probe's cost set
+        # the step's ENGINE sample count, and at the CI cell's 1.5 s hold that count was one.
         sample_task = asyncio.create_task(
-            _sample_loop(poller, fd_sampler, profile.poll_interval_s, sampler_stop, samples)
+            _sample_loop(poller, profile.poll_interval_s, sampler_stop, samples)
         )
+        sampler_tasks.append(sample_task)
+        if fd_sampler is not None:
+            sampler_tasks.append(
+                asyncio.create_task(
+                    _probe_loop(
+                        fd_sampler, profile.poll_interval_s, sampler_stop, proc_readings, origin
+                    )
+                )
+            )
         reload_seconds: float | None = None
         hold_task = asyncio.create_task(
             driver.run_hold(
@@ -439,8 +461,14 @@ async def _run_one_step(
 
         # Stop offering; drain the pipeline; final sample.
         sampler_stop.set()
-        with contextlib.suppress(asyncio.CancelledError):
-            await sample_task
+        for task in sampler_tasks:
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+        # The in-hold count, taken BEFORE the post-drain final is appended, so it is the number of
+        # readings the hold itself produced rather than that number plus one. Its provenance travels
+        # with it: how many of those readings the FLOOR had to supply past the hold's end.
+        in_hold_samples = len(samples)
+        in_hold_floor_ticks = sample_task.result()
         # Stop the driver FIRST (flush every queued send + grace the in-flight ACKs) BEFORE draining,
         # so all offered messages have reached the engine's ingress stage before we wait for the
         # pipeline to empty. Draining first would let a message still in the driver's send queue arrive
@@ -471,6 +499,9 @@ async def _run_one_step(
             # would only compound a genuine failure across sweep steps into the pytest watchdog.
             final = await poller.sample_once()
         if final is not None:
+            # `in_hold_samples` was read BEFORE this append and must stay that way: this line is what
+            # makes `samples` the rate window rather than the hold, and a count taken after it would
+            # report the tail as in-hold. The smoke asserts a FLOOR, so an inflated count would pass.
             samples.append(final)
 
         # --- BACKLOG #1292: the intake audit, at its TWO moments -------------------------------
@@ -544,12 +575,17 @@ async def _run_one_step(
             ack_hist=metrics.ack,
             poller=poller,
             samples=samples,
+            in_hold_samples=in_hold_samples,
+            in_hold_floor_ticks=in_hold_floor_ticks,
+            proc_readings=proc_readings,
             drain_seconds=drain_seconds,
             reload_seconds=reload_seconds,
             audit_live=audit_live,
             audit_final=audit_final,
         )
     finally:
+        for task in sampler_tasks:
+            task.cancel()
         with contextlib.suppress(Exception):
             await driver.stop(_STOP_GRACE)
         with contextlib.suppress(Exception):
@@ -829,31 +865,109 @@ def _count_inbound_rows(poller: EnginePoller) -> int:
         return 0
 
 
+#: The floor on engine samples one sweep step's in-hold sampler must produce (BACKLOG #1430).
+#:
+#: TWO, because two is what a WINDOW needs and nothing here needs a third. `_empty_claim_rates` and
+#: `_throughput_rates` each read a first and a last reading; both currently reach two only by counting
+#: the post-drain final, which is why #1420's fix (a) -- excluding that final -- cannot be built until
+#: the hold itself yields two. Raising the floor higher would buy no property and would push a starved
+#: host further past the hold, so it stays at the number the arithmetic actually asks for.
+_MIN_IN_HOLD_SAMPLES = 2
+
+
+@dataclass(frozen=True)
+class ProcReading:
+    """One OS-side probe reading and the instant it was taken, on the poller's own elapsed clock.
+
+    The reading used to be keyed to the engine sample it rode, in a module-level map by ``id()``. That
+    was true only while the probe and the poll shared a tick. They no longer do (BACKLOG #1430), so
+    the instant travels WITH the reading: :func:`_derive_proc` divides CPU-seconds by the difference
+    between consecutive instants, and lending it a sample's timestamp would divide by a span the
+    reading was never taken over.
+    """
+
+    elapsed_s: float
+    proc: ProcSample
+
+
 async def _sample_loop(
     poller: EnginePoller,
-    fd_sampler: FdSampler | None,
     interval: float,
     stop: asyncio.Event,
     out: list[EngineSample],
-) -> None:
-    """Sample the engine + the FD probe every ``interval`` until ``stop``. The FD probe rides the same
-    tick OFF the event loop (run_in_executor), like the engine poll, so neither blocks the loop."""
-    loop = asyncio.get_running_loop()
-    while not stop.is_set():
+    min_samples: int = _MIN_IN_HOLD_SAMPLES,
+) -> int:
+    """Sample the engine every ``interval`` until ``stop``, and never return with fewer than
+    ``min_samples`` readings (BACKLOG #1430). Returns how many MAKE-UP ticks the floor had to spend
+    past ``stop``, which is zero on a hold that met the floor on its own.
+
+    That return value is provenance, not a gauge, and it is reported for the same reason
+    ``fd_probe_degraded`` is: a step that limped to the floor and a step that reached it comfortably
+    produce the same ``in_hold_samples``, and a reader choosing a verdict needs to tell them apart.
+
+    THE FLOOR IS THE POINT, AND IT TOOK TWO CHANGES. The OS probe used to ride this tick, so one tick
+    cost the interval PLUS a process-table walk -- measured on the maintainer's box at 0.99-1.47 s per
+    front-load walk against a 0.25 s interval. Against the CI cell's 1.5 s hold the first tick alone
+    outlasts the hold, so every cell yielded ONE in-hold reading, by arithmetic rather than bad luck.
+    Moving the probe to :func:`_probe_loop` is what makes the natural cadence fast enough; this floor
+    is what GUARANTEES the count on a host where even the poll is slow.
+
+    COUNTING THE READINGS IS HALF THE PROPERTY; SPACING THEM IS THE OTHER HALF. Two readings taken
+    microseconds apart span nearly no time, and a rate over that span is a fabricated number --
+    strictly worse than the zeros the ``len(samples) < 2`` guards return today. So a make-up reading
+    sleeps out the REST of its tick's interval. It cannot just wait on ``stop`` again: ``stop`` is
+    already set by then and the wait would return instantly. Nor can it wait a fresh interval and call
+    that the spacing -- ``stop`` normally fires PART WAY through a wait, which is how the first draft
+    of this loop produced two readings 0.06 s apart against a 0.25 s interval.
+
+    The overshoot is bounded and cheap: at most ``min_samples`` further ticks after ``stop``, under one
+    interval each, by which point the driver has stopped offering. ATTEMPTS are counted rather than
+    readings, so a poll that keeps answering ``None`` cannot spin here.
+    """
+    past_stop = 0
+    while True:
+        started = time.monotonic()
         sample = await poller.sample_once()
         if sample is not None:
-            if fd_sampler is not None:
-                proc = await loop.run_in_executor(None, fd_sampler.sample_proc)
-                _PROC_BY_SAMPLE[id(sample)] = proc
             out.append(sample)
+        if not stop.is_set():
+            with contextlib.suppress(TimeoutError):
+                await asyncio.wait_for(stop.wait(), timeout=interval)
+        # Asked again rather than nested under the wait: the wait above returns on EITHER the timeout
+        # or `stop`, and only the second answer ends the hold.
+        if not stop.is_set():
+            continue
+        if len(out) >= min_samples or past_stop >= min_samples:
+            return past_stop
+        past_stop += 1
+        await asyncio.sleep(max(0.0, interval - (time.monotonic() - started)))
+
+
+async def _probe_loop(
+    fd_sampler: FdSampler,
+    interval: float,
+    stop: asyncio.Event,
+    out: list[ProcReading],
+    origin: float,
+) -> None:
+    """Read the OS-side process footprint every ``interval`` until ``stop``, on its OWN task.
+
+    It rode the engine poll's tick until BACKLOG #1430, which made the step's ENGINE sample count a
+    function of the probe's cost -- :func:`_sample_loop` carries the measurement. It still runs OFF
+    the event loop either way; what changed is that a slow walk no longer delays the next engine
+    sample. It does not carry a floor of its own: `fd_probe_ticks` is reported as provenance and
+    grades nothing, and a probe that answers once per step is the same coarse gauge it was before.
+
+    ONE PROBE AT A TIME. :class:`~harness.load.connscale.probe.FdSampler` holds the front-load counter
+    and the resolved subtree as mutable state, so overlapping calls would race them. This loop is
+    sequential by construction and is the only caller.
+    """
+    loop = asyncio.get_running_loop()
+    while not stop.is_set():
+        proc = await loop.run_in_executor(None, fd_sampler.sample_proc)
+        out.append(ProcReading(time.perf_counter() - origin, proc))
         with contextlib.suppress(TimeoutError):
             await asyncio.wait_for(stop.wait(), timeout=interval)
-
-
-# OS-side process readings (handle count + CPU-seconds + working set) are keyed to the EngineSample
-# they were taken alongside (EngineSample is frozen + shared, so we don't bloat it with connscale-only
-# footprint fields). A small side map by sample identity, drained when the record is built.
-_PROC_BY_SAMPLE: dict[int, ProcSample] = {}
 
 
 async def _time_reload(poller: EnginePoller) -> float | None:
@@ -876,6 +990,9 @@ def _build_record(
     ack_hist: Histogram,
     poller: EnginePoller,
     samples: list[EngineSample],
+    in_hold_samples: int,
+    in_hold_floor_ticks: int,
+    proc_readings: list[ProcReading],
     drain_seconds: float | None,
     reload_seconds: float | None,
     audit_live: IntakeAudit | None = None,
@@ -928,9 +1045,9 @@ def _build_record(
     # because it is the operator-facing number.
     empty_per_msg = _empty_claims_per_msg(total_per_s, achieved_read_per_s)
 
-    # Wall #4 + footprint: handle peak + CPU-seconds + working set, drained from the side map (each
-    # None where the OS probe couldn't read).
-    proc = _drain_proc(samples)
+    # Wall #4 + footprint: handle peak + CPU-seconds + working set from the OS probe's own readings
+    # (each None where it couldn't read).
+    proc = _derive_proc(proc_readings)
 
     # Wall #6: ACK percentiles for this N step.
     ack = ack_hist.summary()
@@ -965,6 +1082,8 @@ def _build_record(
         fd_probe_ticks=proc.probe_ticks,
         fd_probe_degraded_ticks=proc.probe_degraded_ticks,
         fd_probe_degraded=proc.probe_degraded,
+        in_hold_samples=in_hold_samples,
+        in_hold_floor_ticks=in_hold_floor_ticks,
         reload_seconds=reload_seconds,
         ack_p50_ms=ack.p50_ms,
         ack_p95_ms=ack.p95_ms,
@@ -1249,7 +1368,14 @@ def _empty_claims_per_msg(total_per_s: float, achieved_read_per_s: float) -> flo
 
 def _throughput_rates(samples: list[EngineSample]) -> tuple[float, float]:
     """Achieved (read/s, written/s) over the window, first→last sample (same span as the empty-claim
-    rates), so both arms are measured identically for the A/B non-regression guard."""
+    rates), so both arms are measured identically for the A/B non-regression guard.
+
+    That span is the hold PLUS the step's post-drain tail, not the hold alone; it is defined once, in
+    :func:`_empty_claim_rates`, and this docstring points there rather than restating it (BACKLOG
+    #1420). ``achieved_read_per_s`` is the DENOMINATOR of :func:`_empty_claims_per_msg`, so the two
+    must be read over the same window for the span to cancel -- which is why this reads ``samples[-1]``
+    rather than the last in-hold sample.
+    """
     if len(samples) < 2:
         return 0.0, 0.0
     first, last = samples[0], samples[-1]
@@ -1292,11 +1418,16 @@ class _ProcDerived:
     probe_degraded: tuple[str, ...]
 
 
-def _drain_proc(samples: list[EngineSample]) -> _ProcDerived:
-    """Drain the per-sample :class:`ProcSample` side map and derive the footprint gauges: peak handle
-    count, peak working set, total CPU-seconds consumed over the window, and the peak/mean CPU
-    utilisation (cores busy). A cumulative CPU-seconds counter isn't meaningfully "averaged", so
-    peak/mean are reported as cores-busy.
+def _derive_proc(readings: list[ProcReading]) -> _ProcDerived:
+    """Derive the footprint gauges from the OS probe's own readings: peak handle count, peak working
+    set, total CPU-seconds consumed over the window, and the peak/mean CPU utilisation (cores busy). A
+    cumulative CPU-seconds counter isn't meaningfully "averaged", so peak/mean are reported as
+    cores-busy.
+
+    It reads a list of :class:`ProcReading`, each carrying the instant it was taken. It used to drain a
+    module-level map keyed by the identity of the engine sample the probe rode, and to date the reading
+    by that sample; the probe now runs on its own task (BACKLOG #1430), so there is no such sample and
+    borrowing one's timestamp would put a 1.4 s reading over a 0.25 s span in the arithmetic below.
 
     CPU is derived as a **piecewise sum over consecutive intervals whose summed-over PID set is
     unchanged**, NOT as endpoint-difference (``last − first``). Each reading is a SUM across the engine
@@ -1313,19 +1444,16 @@ def _drain_proc(samples: list[EngineSample]) -> _ProcDerived:
     how many of those were full gaps, and the distinct causes behind them. The gauges alone cannot
     express the difference between "the host was too slow to answer" and "the enumerator returned zero
     rows" — both are ``None`` — and a consumer that has to choose a verdict needs exactly that."""
-    readings: list[tuple[float, ProcSample]] = []
-    for s in samples:
-        proc = _PROC_BY_SAMPLE.pop(id(s), None)
-        if proc is not None:
-            readings.append((s.elapsed_s, proc))
-    handles = [p.handles for _, p in readings if p.handles is not None]
-    working_set = [p.working_set_bytes for _, p in readings if p.working_set_bytes is not None]
+    handles = [r.proc.handles for r in readings if r.proc.handles is not None]
+    working_set = [
+        r.proc.working_set_bytes for r in readings if r.proc.working_set_bytes is not None
+    ]
     # A CPU reading is usable only when both its counter AND the PID set it summed are known — the set
     # is what lets us tell a clean interval from a membership-changed one (#220).
     cpu_readings = [
-        (e, p.cpu_seconds, p.cpu_pids)
-        for e, p in readings
-        if p.cpu_seconds is not None and p.cpu_pids is not None
+        (r.elapsed_s, r.proc.cpu_seconds, r.proc.cpu_pids)
+        for r in readings
+        if r.proc.cpu_seconds is not None and r.proc.cpu_pids is not None
     ]
 
     handles_peak = max(handles) if handles else None
@@ -1335,7 +1463,7 @@ def _drain_proc(samples: list[EngineSample]) -> _ProcDerived:
     # that reads None because the enumerator is broken are the same value and opposite findings, so the
     # causes the probe recorded per tick are carried through to the record rather than discarded here.
     probe_ticks = len(readings)
-    degraded = [p.degraded for _, p in readings if p.degraded is not None]
+    degraded = [r.proc.degraded for r in readings if r.proc.degraded is not None]
     causes = tuple(sorted({str(c) for c in degraded}))
 
     def _derived(

@@ -203,21 +203,38 @@ def _normalize_url(url: str) -> str:
     return url.rstrip("/")
 
 
-def service_toml_uses_tls(service_toml: dict[str, object] | None) -> bool:
-    """True when the engine's service settings set ``[api].tls_cert_file`` — i.e. it serves https.
+def engine_serves_https(service_toml: dict[str, object] | None) -> bool:
+    """True when the engine's service settings make its API bind serve https.
 
-    Pure, and deliberately narrow: presence of the cert path is exactly the engine's own
-    ``ServiceSettings.tls_enabled`` predicate. Nothing else is read out of this file — it is
-    operator data reached via an untrusted registry hint, so the tray takes one boolean from it
-    and no paths, hosts, or secrets.
+    **The predicate is no longer ``[api].tls_cert_file``, and the name changed with it** (BACKLOG
+    #1126/#1118). Since ADR 0172 the engine ALWAYS serves TLS, minting a self-signed pair when the
+    operator configures no chain. Keying the tray's scheme on the cert path alone read the SHIPPED
+    DEFAULT — no cert, no declared proxy — as ``http``, so the tray probed an https socket and
+    would render a running engine as WEDGED. That is the one failure this function exists to
+    prevent, and the old predicate caused it on the commonest posture.
+
+    Mirrors the three return paths of :func:`messagefoundry.api.tls.ensure_api_tls_material`, the
+    single source of the served scheme: an operator cert always wins and serves https; a DECLARED
+    upstream terminator mints nothing and speaks plaintext to the proxy; everything else mints and
+    serves https. So it is a cert path, OR not ``tls_terminated_upstream``.
+
+    **An absent, unreadable or api-less file therefore answers True**, which is why the old name
+    was retired: the engine runs on its own defaults there, and those mint. A wrong guess costs the
+    same either way — a probe against a socket speaking the other protocol — and https is right in
+    strictly more postures, since declaring an upstream terminator REQUIRES a settings file to
+    declare it in.
+
+    Pure, and still deliberately narrow. It takes two booleans out of this file and no paths, hosts
+    or secrets — it is operator data reached via an untrusted registry hint, and the cert path is
+    tested for presence only, never read or resolved.
     """
-    if not service_toml:
-        return False
-    api = service_toml.get("api")
+    api = (service_toml or {}).get("api")
     if not isinstance(api, dict):
-        return False
+        return True
     cert = api.get("tls_cert_file")
-    return isinstance(cert, str) and bool(cert.strip())
+    if isinstance(cert, str) and cert.strip():
+        return True
+    return api.get("tls_terminated_upstream") is not True
 
 
 def compose_config(
@@ -313,7 +330,8 @@ def load_config(config_dir: Path, reader: RegistryReader | None = None) -> TrayC
 
     Missing file → all defaults. A malformed TOML file is treated as absent (defaults + hints).
     The engine's *own* settings TOML is also read — read-only, fail-soft — for the single fact
-    the registry cannot carry: whether ``[api].tls_cert_file`` makes the bind serve https.
+    the registry cannot carry: which scheme the API bind serves. Since ADR 0172 that is no longer
+    the question "is a cert configured" — see :func:`engine_serves_https`.
     """
     toml_data = _read_toml(config_dir / "tray.toml")
 
@@ -322,7 +340,7 @@ def load_config(config_dir: Path, reader: RegistryReader | None = None) -> TrayC
         reg = reader.read_service_params(_resolve_service_name(toml_data))
 
     svc_path = service_toml_path(reg)
-    engine_tls = service_toml_uses_tls(_read_toml(svc_path) if svc_path is not None else None)
+    engine_tls = engine_serves_https(_read_toml(svc_path) if svc_path is not None else None)
 
     return compose_config(toml_data, reg, engine_tls=engine_tls)
 
@@ -344,8 +362,10 @@ TRAY_TOML_TEMPLATE = """\
 # then restart the tray (its menu "Exit", then relaunch) so the change takes effect.
 
 # The engine's API base URL the tray polls for status. Both http and https loopback engines are
-# fully managed; use https when the engine sets [api].tls_cert_file. Only a REMOTE host puts the
-# tray in monitor-only mode (service control + Open-Repo disabled — they need the local box).
+# fully managed. Use https for almost every engine: since ADR 0172 the engine mints its own
+# self-signed pair and serves TLS unless [api].tls_terminated_upstream declares a reverse proxy in
+# front of it. Only a REMOTE host puts the tray in monitor-only mode (service control + Open-Repo
+# disabled — they need the local box).
 # An https engine's certificate is verified against the Windows trust store, so a self-signed
 # engine cert must be installed under Trusted Root Certification Authorities on this machine.
 # engine_url = "http://127.0.0.1:8765"

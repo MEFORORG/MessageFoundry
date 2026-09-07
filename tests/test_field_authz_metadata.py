@@ -7,8 +7,17 @@ field-level authorization map exactly like ``summary``/``error``.
 correlation lineage today, operator/handler-attached values by design). Before this fix it was absent
 from :data:`PHI_FIELDS`, so a caller lacking ``messages:view_summary`` received it un-redacted and its
 exposure was never fed to the PHI-exposure audit coalescer. These tests pin that ``metadata`` is now
-nulled for a non-holder, audited via ``count_exposed`` when populated, and that the map cannot silently
-drift away from the model (drift-guard)."""
+nulled for a non-holder, audited via ``count_exposed`` when populated AND revealed, and that the map
+cannot silently drift away from the model (drift-guard).
+
+**Updated under BACKLOG #1187 (ASVS 14.2.6), and the distinction matters.** ``metadata`` joined
+``summary`` in ``MASKED_UNTIL_REVEALED``, so an authorized holder now sees it DISPLAY-MASKED unless
+the call names it in ``revealed``. That is a second decision on top of the one this file grades:
+authorization says the caller MAY see such values, the reveal says they asked for THIS record's.
+Every holder assertion below therefore passes ``revealed`` -- these are positive controls proving the
+GATE releases, and a masked value would leave them unable to tell a working gate from a working mask.
+The non-holder assertions are untouched, because masking changes nothing for a caller who was never
+authorized: they still get ``None``."""
 
 from __future__ import annotations
 
@@ -79,28 +88,52 @@ def test_metadata_nulled_for_non_view_summary_holder_on_summary() -> None:
     # A Viewer (messages:read, no view_summary) must NOT see the decrypted metadata.
     m = redact_unauthorized(_summary(), _identity(Permission.MESSAGES_READ))
     assert m.metadata is None
-    # Holder still sees it.
-    held = redact_unauthorized(_summary(), _identity(Permission.MESSAGES_VIEW_SUMMARY))
+    # Holder still sees it. The reveal is passed because this control is about the GATE: without it
+    # the value comes back masked, which is also non-None, and the assertion would stop
+    # distinguishing "the gate released" from "the mask ran".
+    held = redact_unauthorized(
+        _summary(),
+        _identity(Permission.MESSAGES_VIEW_SUMMARY),
+        revealed=frozenset({"metadata"}),
+    )
     assert held.metadata == METADATA_JSON
+    # The masked state is a THIRD outcome, distinct from both released and withheld. Asserted here so
+    # dropping metadata from MASKED_UNTIL_REVEALED reds this file rather than passing quietly.
+    masked = redact_unauthorized(_summary(), _identity(Permission.MESSAGES_VIEW_SUMMARY))
+    assert masked.metadata is not None, "masked is not withheld"
+    assert masked.metadata != METADATA_JSON, "an unrevealed read returned the complete value"
 
 
 def test_metadata_nulled_for_non_view_summary_holder_on_detail() -> None:
     nonholder = _identity(Permission.MESSAGES_READ)  # reaches the detail route, lacks view_summary
     assert redact_unauthorized(_detail(), nonholder).metadata is None
     holder = _identity(Permission.MESSAGES_VIEW_SUMMARY)
-    assert redact_unauthorized(_detail(), holder).metadata == METADATA_JSON
+    revealed = redact_unauthorized(_detail(), holder, revealed=frozenset({"metadata"}))
+    assert revealed.metadata == METADATA_JSON
 
 
 def test_count_exposed_counts_metadata_only_phi() -> None:
-    # A row whose ONLY non-null PHI field is metadata must still count as exposed pre-redaction and
-    # zero after redaction for a non-holder — proving metadata feeds the exposure audit.
+    # A row whose ONLY non-null PHI field is metadata must count as exposed when it is actually shown
+    # complete, and zero for a non-holder — proving metadata feeds the exposure audit.
+    #
+    # BACKLOG #1187 added a third case between those two, and it is the one worth stating: a holder
+    # who did NOT reveal sees a mask, and a mask is NOT an exposure. count_exposed skips masked
+    # properties by design (mark_phi_masked), which is what makes the counter mean "PHI actually put
+    # on screen" rather than "PHI the caller could have asked for". metadata now behaves exactly as
+    # summary already did.
     holder, nonholder = (
         _identity(Permission.MESSAGES_VIEW_SUMMARY),
         _identity(Permission.MESSAGES_READ),
     )
     rows = [_summary()]  # summary/error None, metadata populated
-    assert count_exposed([redact_unauthorized(r, holder) for r in rows]) == 1
+    revealed = [redact_unauthorized(r, holder, revealed=frozenset({"metadata"})) for r in rows]
+    assert count_exposed(revealed) == 1, "a revealed, complete metadata value must count as exposed"
     assert count_exposed([redact_unauthorized(r, nonholder) for r in rows]) == 0
+    assert count_exposed([redact_unauthorized(r, holder) for r in rows]) == 0, (
+        "a MASKED metadata value counted as an exposure; the counter would then over-report every "
+        "list surface, and an operator reading the PHI-exposure audit could not tell a page of masks "
+        "from a page of identifiers"
+    )
 
 
 def test_metadata_is_gated_and_map_does_not_drift() -> None:

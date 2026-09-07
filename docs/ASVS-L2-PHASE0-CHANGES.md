@@ -98,10 +98,29 @@ for, not how it is protected before it gets there.
 > (`hashlib`, `secrets`, `hmac`, `ssl`, `argon2`, `cryptography`); the third-party crypto libraries
 > `hvac` / `truststore` / `webauthn` / `signxml`; and the **first-party delegated-crypto seams**
 > (`store/crypto.py`, `store/keyprovider.py`, `store/keyprovider_vault.py`, `store/crypto_transit.py`,
-> `store/backup_codec.py`) — so `store/crypto_transit.py` (all Vault-Transit AEAD + the audit MAC ride
-> the HTTP seam; it imports none of the six) is now discovered and inventoried. It **fails the build**
-> on any undocumented or stale usage. When a module starts (or stops) using a crypto primitive or a
-> seam, update both this section and that script's `INVENTORY`.
+> `store/backup_codec.py`, `config/tls_policy.py`, `transports/signing.py`) — so
+> `store/crypto_transit.py` (all Vault-Transit AEAD + the audit MAC ride the HTTP seam; it imports
+> none of the six) is now discovered and inventoried. It **fails the build** on any undocumented or
+> stale usage. When a module starts (or stops) using a crypto primitive or a seam, update both this
+> section and that script's `INVENTORY`.
+>
+> **Read the seam list as the script's `CRYPTO_SEAM_MODULES`, not as a closed set.** It has grown
+> twice since it was first written and nothing ties this prose to the code, so the script is the
+> source of record and this list can lag it. The last two additions each surfaced a first-party
+> surface the gate could not previously SEE at all: `config/tls_policy.py` (BACKLOG #1323, whose
+> worked example was `pipeline/alert_sinks.py`) and `transports/signing.py` (BACKLOG #1164, whose
+> worked example was `transports/fhir.py`). Note the distinction those two turn on — an inventory row
+> records what a file USES, while a seam entry is what makes that file's IMPORTERS visible, so a
+> module can be inventoried while everything reaching crypto through it stays invisible.
+>
+> **A SECOND ARM covers the non-Python tree** (BACKLOG #1172, ASVS 11.5.1) and rides the same required
+> context. The walk above is an `import ast` pass over `*.py` and is Python-only by construction, so
+> `check_non_python_randomness` scans `ide/` and `messagefoundry_webconsole/` for randomness sources
+> by pattern and diffs them against `NON_PYTHON_INVENTORY` the same bidirectional way. A weak source
+> (`Math.random()`) fails with no inventory row to hide behind, and an empty walk is a violation
+> rather than a clean result. **Randomness is the whole claim that arm supports** — the TLS floor
+> `ide/src/engineClient.ts` applies to every https request is first-party crypto in a shipped
+> artifact and is discoverable from neither arm.
 
 | Asset | Algorithm / detail | Source / storage | Lifecycle |
 |---|---|---|---|
@@ -446,8 +465,8 @@ tables in [`CONNECTIONS.md`](CONNECTIONS.md) §"Resource management & limits" (A
 | SMART Backend Services token endpoint (ADR 0024) | outbound | HTTPS POST to the operator-pinned token URL (no discovery); routed through the connection's forward proxy when one resolves for the **token** host | the REST verifying no-redirect opener; a cleartext-`http` token URL is **refused** unless `MEFOR_ALLOW_INSECURE_TLS` (the client assertion is a credential) | a signed `client_assertion` JWT (`smart_private_key`, optionally passphrase-protected) | **yes** — `smart_token_url` per Connection | `smart_token_url`, `smart_client_id`, `smart_private_key`, `smart_scope`, `smart_timeout_seconds`, `smart_expiry_skew_seconds` |
 | Generic OAuth2 client-credentials token endpoint | outbound | HTTPS POST for the non-SMART REST/SOAP/FHIR/DICOMweb bearer path; also proxy-routed per token host | the same verifying no-redirect opener; a cleartext-`http` credential hop is posture-keyed and refused | `oauth2_client_id` + `oauth2_client_secret`, sent `basic` or `post` per `oauth2_auth_style` | **yes** — `oauth2_token_url` per Connection | `oauth2_token_url`, `oauth2_client_id`, `oauth2_client_secret`, `oauth2_scope`, `oauth2_auth_style`, `oauth2_timeout_seconds` |
 | Engine-brokered AI assistance (ADR 0135) | outbound | HTTPS POST of a `code_only` assist prompt to a **customer-managed / self-hosted** LLM endpoint; runs off the event loop | the REST verifying no-redirect opener; a cleartext-`http` endpoint carrying the key is refused unless `MEFOR_ALLOW_INSECURE_TLS` | `MEFOR_AI_API_KEY`, sent as the `x-api-key` header | **yes** — verbatim the requirement's "the end user provides an external location" | `[ai].endpoint`, `[ai].api_key`, `[ai].allowed_endpoints` (a **dedicated fail-closed** SSRF allowlist — an EMPTY list refuses everything; deliberately **not** `[egress].allowed_http`), `[ai].provider`, `[ai].model` |
-| HashiCorp Vault Transit — store DEK envelope-decrypt (ADR 0019) | outbound | HTTPS via `hvac` (the `[vault]` extra); port from the address | TLS verification is `hvac`/`requests`' own default — the engine sets no explicit client TLS options here | a Vault token — `MEFOR_STORE_VAULT_TOKEN` (`hvac` falls back to `VAULT_TOKEN` when unset) | **yes** — `MEFOR_STORE_VAULT_ADDR` (opt-in; fail-closed) | `MEFOR_STORE_VAULT_ADDR`, `MEFOR_STORE_VAULT_TOKEN`, `MEFOR_STORE_VAULT_TRANSIT_KEY` |
-| HashiCorp Vault Transit — **bulk at-rest cipher** (`[store].cipher_provider = vault_transit`, ADR 0138) | outbound (**per store operation**) | HTTPS via the same shared `hvac` client build; port from the address. **One `encrypt_data` / `decrypt_data` round trip per encrypted CELL** on every store write and read, plus one `generate_hmac` per audit row — not a startup-only hop | as the DEK hop: `hvac`/`requests` defaults, no engine-set client TLS options | the same Vault token (`MEFOR_STORE_VAULT_TOKEN`) | **yes** — `MEFOR_STORE_VAULT_ADDR` (shared with the DEK hop) | `[store].cipher_provider`, `MEFOR_STORE_TRANSIT_KEY`, `MEFOR_STORE_TRANSIT_AUDIT_KEY` |
+| HashiCorp Vault Transit — store DEK envelope-decrypt (ADR 0019) | outbound | HTTPS via `hvac` (the `[vault]` extra); port from the address | TLS verification defaults to `hvac`/`requests`' own **public** bundle. `MEFOR_STORE_VAULT_CA_FILE` (BACKLOG #1180, ASVS 12.3.4) narrows it to one internal CA, resolved through the same `resolve_trust_anchor` every other outbound hop uses; unset, the client is constructed exactly as before | a Vault token — `MEFOR_STORE_VAULT_TOKEN` (`hvac` falls back to `VAULT_TOKEN` when unset) | **yes** — `MEFOR_STORE_VAULT_ADDR` (opt-in; fail-closed) | `MEFOR_STORE_VAULT_ADDR`, `MEFOR_STORE_VAULT_TOKEN`, `MEFOR_STORE_VAULT_TRANSIT_KEY`, `MEFOR_STORE_VAULT_CA_FILE` |
+| HashiCorp Vault Transit — **bulk at-rest cipher** (`[store].cipher_provider = vault_transit`, ADR 0138) | outbound (**per store operation**) | HTTPS via the same shared `hvac` client build; port from the address. **One `encrypt_data` / `decrypt_data` round trip per encrypted CELL** on every store write and read, plus one `generate_hmac` per audit row — not a startup-only hop | as the DEK hop — same shared client build, so `MEFOR_STORE_VAULT_CA_FILE` narrows this hop too | the same Vault token (`MEFOR_STORE_VAULT_TOKEN`) | **yes** — `MEFOR_STORE_VAULT_ADDR` (shared with the DEK hop) | `[store].cipher_provider`, `MEFOR_STORE_TRANSIT_KEY`, `MEFOR_STORE_TRANSIT_AUDIT_KEY` |
 | DR backup destination (ADR 0049) | outbound (scheduled + on-demand) | local filesystem, or **SMB/CIFS over TCP when `[backup].destination` is a UNC path** (the OS redirector owns the port); a cloud URL is **rejected at load** | n/a — no engine-terminated TLS on this hop; SMB dialect security is the OS's | the engine service account's **own** identity — `[backup]` exposes no `credential_*` impersonation knob, unlike the FILE connector | **yes** — `[backup].destination` | `[backup].enabled`, `[backup].destination`, `schedule_at`, `retention_keep`, `snapshot_method`, `allow_unencrypted` |
 | Security-event notification email, per user | outbound | SMTP through the **same** `[alerts]` transport and default port 587, but a **second, independent** background dispatcher — its own 1000-item queue and its own drain task — mailing each affected USER's own address, not the operator `email_to` list | STARTTLS **and certificate verification**, as the operator sink — plumbed at this call site in its own right (`pipeline/security_notify.py`), not inherited implicitly | as the operator sink | **yes** — the same `[alerts].email_smtp_host` | `[auth].notify_security_events`, `[alerts].email_*` |
 | HashiCorp Vault KV v2 — connector-credential secrets provider (ADR 0019) | outbound | HTTPS via `hvac`, a **separate client** from the Transit one behind the same extra | as above | a Vault token — `MEFOR_SECRETS_VAULT_TOKEN` (falls back to `VAULT_TOKEN`) | **yes** — `MEFOR_SECRETS_VAULT_ADDR` (opt-in; fail-closed) | `MEFOR_SECRETS_VAULT_ADDR`, `MEFOR_SECRETS_VAULT_TOKEN`, `[secrets].provider` |

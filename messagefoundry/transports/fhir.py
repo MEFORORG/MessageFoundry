@@ -47,6 +47,7 @@ from collections.abc import Mapping
 from typing import Any
 
 from messagefoundry.config.models import ConnectorType, Destination
+from messagefoundry.config.tls_policy import TrustAnchorPolicy
 from messagefoundry.controlchars import has_control_char
 from messagefoundry.fhirsearch import FhirSearchParams, resolve_search_pairs
 from messagefoundry.parsing.fhir import FhirPeek, FhirPeekError
@@ -57,6 +58,11 @@ from messagefoundry.transports.base import (
     NegativeAckError,
     encode_wire_body,
     register_destination,
+)
+from messagefoundry.transports.bounded_read import (
+    ResponseTooLargeError,
+    read_bounded,
+    read_bounded_text,
 )
 
 # Reuse REST's hardened HTTP plumbing — same transports/ package, same no-redirect + TLS posture
@@ -77,6 +83,7 @@ from messagefoundry.transports.rest import (
     enforce_send_time_length_limits,
     enforce_signature_header_limits,
     find_outbound_length_violation,
+    http_family_trust_anchor,
     normalize_header_allowlist,
     outbound_headers_from_metadata,
     refuse_cleartext_credentials,
@@ -419,13 +426,20 @@ class FhirDestination(DestinationConnector):
             )
             # #129 (ADR 0094): granular expiry-only relaxation — verify chain + hostname but tolerate an
             # expired FHIR-server cert (opt-in; default off = the shared verifying opener, byte-identical).
+            # #1180 (ADR 0093): the client trust anchor for this https hop.
+            anchor = http_family_trust_anchor(
+                s, url=self.base_url, trust_anchor_policy=config.trust_anchor_policy
+            )
             if bool(s.get("tls_allow_expired", False)):
                 self._opener: urllib.request.OpenerDirector = _expiry_relaxed_opener(
-                    urllib.parse.urlsplit(self.base_url).hostname or "", *proxy_handlers
+                    urllib.parse.urlsplit(self.base_url).hostname or "",
+                    *proxy_handlers,
+                    trust_anchor=anchor,
                 )
-            elif proxy_handlers:
+            elif proxy_handlers or anchor.narrows:
                 # A forward proxy → a per-connection verifying opener carrying it (never the shared one).
-                self._opener = _no_redirect_opener(*proxy_handlers)
+                # A narrowed trust anchor needs its own opener for the same reason.
+                self._opener = _no_redirect_opener(*proxy_handlers, trust_anchor=anchor)
             else:
                 self._opener = _NO_REDIRECT_OPENER
         else:
@@ -617,7 +631,10 @@ class FhirDestination(DestinationConnector):
             raise
         try:
             with self._opener.open(req, timeout=self.timeout) as resp:
-                resp.read()
+                # ASVS 15.2.2: the probe body is discarded, but draining it unbounded would let a
+                # reachability check be turned into a memory exhaustion. A CapabilityStatement is the
+                # largest honest reply here and sits far under the 16 MiB ceiling.
+                read_bounded(resp, connector=f"FHIR {_redact_url(self.base_url)} probe")
         except urllib.error.HTTPError as exc:
             if exc.code in (401, 403):
                 raise DeliveryError(
@@ -681,7 +698,13 @@ class FhirDestination(DestinationConnector):
                 method=method,
             )
             with self._opener.open(req, timeout=self.timeout) as resp:
-                body = resp.read().decode(self.encoding, errors="replace")
+                # ASVS 15.2.2: bounded on the socket read. A FHIR write returns the created resource
+                # or an OperationOutcome, both orders of magnitude under the 16 MiB ceiling.
+                body = read_bounded_text(
+                    resp,
+                    connector=f"FHIR {_redact_url(self.base_url)}",
+                    encoding=self.encoding,
+                )
                 status = int(getattr(resp, "status", 200))
                 # #154: capture only the allow-listed response headers (empty allow-list → {}).
                 headers_out = capture_response_headers(
@@ -690,7 +713,23 @@ class FhirDestination(DestinationConnector):
                 return body, status, headers_out
         except urllib.error.HTTPError as exc:
             try:
-                body = exc.read().decode(self.encoding, errors="replace")
+                # ASVS 15.2.2: the error body is bounded too. It is only ever read to CLASSIFY the
+                # non-2xx, so an over-cap one is logged and dropped rather than raised: the delivery
+                # already fails below on the status, and raising here would swap a classified
+                # failure for an unclassified one.
+                body = read_bounded_text(
+                    exc,
+                    connector=f"FHIR {_redact_url(self.base_url)} error body",
+                    encoding=self.encoding,
+                )
+            except ResponseTooLargeError:
+                logger.warning(
+                    "FHIR %s returned an HTTP %s error body over the response bound; "
+                    "classifying on the status alone",
+                    _redact_url(self.base_url),
+                    exc.code,
+                )
+                body = ""
             except Exception:  # noqa: BLE001 - a body we can't read just becomes status-only
                 body = ""
             if self._token_provider is not None and exc.code == 401:
@@ -834,8 +873,17 @@ class FhirLookupExecutor:
     ``OperationOutcome`` issue code, a redacted host) — never the returned body, the query's parameter
     values, or the SMART token."""
 
-    def __init__(self, connections: Mapping[str, Mapping[str, Any]]) -> None:
+    def __init__(
+        self,
+        connections: Mapping[str, Mapping[str, Any]],
+        *,
+        trust_anchor_policy: TrustAnchorPolicy | None = None,
+    ) -> None:
         # connections: name -> already-env-resolved settings (the runner substitutes env() first).
+        # trust_anchor_policy (#1180, ADR 0093): the instance [tls] client anchor policy, threaded by
+        # the runner. A FhirLookup connection has no Destination to carry it (unlike every other
+        # HTTP-family hop), which is why this executor's opener map could not name an internal CA at
+        # all. `None` (a direct test build) = the OS trust store, byte-identical.
         from messagefoundry.transports.smart import token_provider_from_settings
 
         self._base: dict[str, str] = {}
@@ -915,8 +963,16 @@ class FhirLookupExecutor:
             self._headers[cname] = headers
             self._token[cname] = token
             if bool(s.get("verify_tls", True)):
+                # #1180 (ADR 0093): the sanctioned live read-only lookup against an internal FHIR
+                # server is the most on-point instance of 12.3.4's condition in the product, and it
+                # could not name an anchor at all.
+                lookup_anchor = http_family_trust_anchor(
+                    s, url=url, trust_anchor_policy=trust_anchor_policy
+                )
                 self._opener[cname] = (
-                    _no_redirect_opener(*proxy_handlers) if proxy_handlers else _NO_REDIRECT_OPENER
+                    _no_redirect_opener(*proxy_handlers, trust_anchor=lookup_anchor)
+                    if proxy_handlers or lookup_anchor.narrows
+                    else _NO_REDIRECT_OPENER
                 )
             else:
                 # verify_tls=false makes the https hop MITM-able — a posture-keyed insecure hop (#200).
@@ -1024,9 +1080,21 @@ class FhirLookupExecutor:
         )
         try:
             with self._opener[connection].open(req, timeout=self._timeout[connection]) as resp:
-                read_body = resp.read().decode(encoding, errors="replace")
+                # ASVS 15.2.2 -- the byte bound on the live lookup (ADR 0043). This is the one egress
+                # read whose size a Handler's own query shapes: a `_count` the Handler chose, or a
+                # partner that ignores paging, would otherwise buffer a whole searchset inside the
+                # transform worker, where it is charged against the engine and not against a message.
+                read_body = read_bounded_text(
+                    resp,
+                    connector=f"FHIR {_redact_url(base)} lookup",
+                    encoding=encoding,
+                )
                 status = int(getattr(resp, "status", 200))
                 return read_body, status
+        except ResponseTooLargeError as exc:
+            # A FhirLookupError, not a delivery error: this read runs inside a Handler, so there is
+            # no message to dead-letter and the Handler sees the failure directly.
+            raise FhirLookupError(f"fhir_lookup on {connection!r}: {exc}") from exc
         except urllib.error.HTTPError as exc:
             if token is not None and exc.code == 401:
                 token.invalidate()  # the bearer may have expired between mint and use — drop it
@@ -1089,7 +1157,11 @@ class FhirLookupExecutor:
         )
         try:
             with self._opener[connection].open(req, timeout=self._timeout[connection]) as resp:
-                resp.read()
+                # ASVS 15.2.2: the probe body is discarded, but an unbounded drain would let a
+                # reachability check be turned into a memory exhaustion.
+                read_bounded(resp, connector=f"FHIR {_redact_url(base)} lookup probe")
+        except ResponseTooLargeError as exc:
+            raise FhirLookupError(f"FhirLookup {connection!r}: {exc}") from exc
         except urllib.error.HTTPError as exc:
             if exc.code in (401, 403):
                 raise FhirLookupError(

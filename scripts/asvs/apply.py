@@ -5,8 +5,16 @@
 Rewrites only the named cells and leaves every other byte of the file alone, because the vault
 working tree is shared and a whole-file re-emit would silently reformat another session's work.
 
-Input JSON: [ {id, level, verdict, residual, evidence:[{path,line,expect}],
-               absence:[{pattern,positive_control,mutation}]}, ... ]
+Input JSON: [ {id, level, verdict, residual, evidence:[{path,line,expect,...}],
+               absence:[{pattern,positive_control,mutation,...}]}, ... ]
+
+Those sub-table keys are the ones this writer ORDERS, not the ones it accepts. Every other key on
+an entry -- at least ``sym`` and ``ctx`` today, plus whatever is added next -- is emitted verbatim
+by :func:`_carried`. **Enumerate what you ORDER, never what you KEEP**, which is the rule that
+function states and this line used to break: read as exhaustive, it says the writer drops
+``sym``/``ctx``, and the careful response to that is a hand edit "to preserve them" which loses the
+very fields the tool would have kept. No count is given here on purpose -- a tally in a docstring
+goes stale silently, and the field list is the thing that must not be re-enumerated.
 """
 
 from __future__ import annotations

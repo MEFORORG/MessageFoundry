@@ -193,3 +193,100 @@ def test_breach_corpus_growth_did_not_over_block_or_regress() -> None:
     assert "not be a common or breached password" in policy.violations("1234567891234567")
     # OVER-BLOCK arm: a strong passphrase that is not in the corpus is still accepted.
     assert policy.violations("correct-horse-battery-staple-xyz") == []
+
+
+# --- BACKLOG #1134 residual: the NOTICE's load-bearing numbers, made falsifiable ------------------
+#
+# The headline "at least 3000 clear the policy" was already gated above. What was not is the
+# BY-FLOOR table the headroom claim is derived FROM -- so the one sentence an operator would act on
+# ("raising password_min_length past 16 needs a corpus regeneration") sat in prose that nothing read.
+# Both tests below parse the NOTICE rather than restating its numbers, so the data file stays the
+# single source and the two cannot drift apart.
+
+_NOTICE = Path(__file__).resolve().parents[1] / "messagefoundry/auth/data/common_passwords.NOTICE"
+_CORPUS = Path(__file__).resolve().parents[1] / "messagefoundry/auth/data/common_passwords.txt"
+
+
+def _clearing_at(floor: int) -> int:
+    """How many bundled entries clear the policy at ``min_length=floor``.
+
+    ``check_breached`` is off for the same reason it is off in the depth test above -- with it on
+    every entry rejects itself against the corpus it belongs to. ``check_username`` is off because a
+    corpus entry has no user context. That is the filter the corpus was BUILT with, so this measures
+    the same thing the NOTICE does.
+    """
+    from messagefoundry.auth.policy import _common_passwords
+
+    policy = PasswordPolicy(min_length=floor, check_breached=False, check_username=False)
+    return sum(1 for entry in _common_passwords() if not policy.violations(entry))
+
+
+def _notice_floor_table() -> dict[int, int]:
+    """The `floor -> policy-clearing entries` rows of the NOTICE's coverage table.
+
+    Parsed rather than duplicated: a test that hard-codes the same numbers is a second copy that can
+    silently disagree with the file an operator actually reads.
+    """
+    rows: dict[int, int] = {}
+    for line in _NOTICE.read_text(encoding="utf-8").splitlines():
+        parts = line.split()
+        # A row is `<floor> <count>` with the count comma-grouped; trailing `<- comment` is ignored.
+        if len(parts) >= 2 and parts[0].isdigit() and parts[1].replace(",", "").isdigit():
+            rows[int(parts[0])] = int(parts[1].replace(",", ""))
+    return rows
+
+
+def test_breach_corpus_coverage_by_floor_matches_the_notice() -> None:
+    """Every floor the NOTICE tabulates re-measures true through the shipped loader.
+
+    This is the gate the corpus work asked for and never got. The depth test above pins only the
+    shipped floor, so a corpus change could hold 3,000 at 15 while collapsing at 16 and nothing would
+    report it -- which is exactly the number the regeneration warning rests on.
+    """
+    table = _notice_floor_table()
+    assert len(table) >= 5, f"the NOTICE coverage table did not parse (got {table})"
+
+    for floor, expected in sorted(table.items()):
+        actual = _clearing_at(floor)
+        assert actual == expected, (
+            f"at min_length={floor} the corpus clears {actual} entries, the NOTICE says {expected}. "
+            "Re-measure the table rather than editing it to match."
+        )
+
+
+def test_the_asvs_6_2_4_headroom_is_exactly_one_step() -> None:
+    """The claim an operator would act on: 16 still clears the bar, 17 does not.
+
+    Stated as the property rather than the counts, so it keeps its meaning after a corpus swap. It is
+    a POLICY statement, not a corpus statistic -- raising the shipped minimum past 16 means
+    regenerating the corpus, and this is what makes that fail loudly instead of quietly.
+    """
+    assert _clearing_at(16) >= 3000, (
+        "the corpus no longer clears ASVS 6.2.4 one step above the shipped floor"
+    )
+    assert _clearing_at(17) < 3000, (
+        "the corpus now clears the bar at min_length=17, so the NOTICE's regeneration warning "
+        "understates the headroom -- re-measure the table and move the warning"
+    )
+
+
+def test_corpus_provenance_digest_matches_the_recorded_one() -> None:
+    """The NOTICE's sha256 reproduces over the corpus's LF bytes.
+
+    Normalized before hashing on purpose. `.gitattributes` pins the file to LF, but a clone made
+    before that pin keeps CRLF in its working tree until the file is touched, and a line ending is
+    not a content change -- so hashing raw bytes here would accuse a clean checkout of tampering.
+    This is a PROVENANCE record; runtime tamper-detection is `messagefoundry.integrity`, which sources
+    its baseline from the installed wheel's RECORD and deliberately never from a digest in source.
+    """
+    recorded = ""
+    for line in _NOTICE.read_text(encoding="utf-8").splitlines():
+        if line.startswith("sha256 = "):
+            recorded = line.removeprefix("sha256 = ").strip()
+    assert len(recorded) == 64, f"the NOTICE records no readable sha256 (got {recorded!r})"
+
+    lf_bytes = _CORPUS.read_bytes().replace(b"\r\n", b"\n")
+    assert hashlib.sha256(lf_bytes).hexdigest() == recorded, (
+        "the corpus does not match the digest recorded in its NOTICE. If you changed the corpus on "
+        "purpose, re-measure the digest AND the coverage table; do not edit one alone."
+    )

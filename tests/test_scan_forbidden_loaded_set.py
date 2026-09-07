@@ -77,6 +77,65 @@ def _load(monkeypatch: pytest.MonkeyPatch, source: str | None) -> Any:
     return sfm
 
 
+#: The stem every synthetic token below is built from. Deliberately a non-word: these strings are
+#: committed to a PUBLIC repository and are then loaded, in CI, ALONGSIDE the real token list, so a
+#: plausible-looking invented partner name risks colliding with a real one and turning this file into
+#: the leak it tests for. A stem no customer or vendor is named cannot collide.
+_STEM = "Nonesuch"
+
+
+def _source(
+    names: list[str],
+    estate: list[str] | None = None,
+    body_only: list[str] | None = None,
+    prefixes: list[str] | None = None,
+) -> str:
+    """A synthetic token source, assembled in the real sectioned format.
+
+    Built here rather than written out per test so a test states only the SHAPE it is about -- how
+    many entries of each class load, and how many of them a probe can be derived from.
+    """
+    lines = ["[names]", *names]
+    if estate:
+        lines += ["[estate]", *estate]
+    if body_only:
+        lines += ["[estate_body_only]", *body_only]
+    if prefixes:
+        lines += ["[site_prefix]", *prefixes]
+    return "\n".join(lines) + "\n"
+
+
+#: ``[names]`` entries a probe string CAN be recovered from: a plain word in word boundaries.
+_PROBEABLE_NAMES = [rf"\b{_STEM}{c}\b" for c in ("alpha", "bravo", "charlie", "delta")]
+#: ``[names]`` entries a probe string CANNOT be recovered from. Both are legitimate, intended list
+#: shapes -- an alternation and an optional character -- which is why the check reports them rather
+#: than failing. Each carries a distinctive literal, so a report that echoed one would be detectable.
+_UNPROBEABLE_NAMES = [rf"\b(?:{_STEM}echo|{_STEM}foxtrot)\b", rf"\b{_STEM}go?lf\b"]
+#: Two estate tokens, so a test can hold exactly one of them out under ``[estate_body_only]``.
+_ESTATE = [f"{_STEM}estatealpha".lower(), f"{_STEM}estatebravo".lower()]
+#: A synthetic site prefix. Every source below carries one so ``site_prefixes`` is a HEALTHY sibling
+#: class: a test about one class going unprobed proves nothing if every class went unprobed.
+_PREFIX = ["4242"]
+
+
+@pytest.fixture
+def load(monkeypatch: pytest.MonkeyPatch) -> Any:
+    """A ``load(source)`` callable that restores the ambient token source on teardown.
+
+    The seven residual tests below each need a differently-shaped source, so the fixed ``example``
+    fixture cannot serve them -- but they need its teardown exactly. Restoring in a fixture rather
+    than a per-test ``try/finally`` keeps the module-global token tables from leaking a test's
+    synthetic source into every later test file in the session.
+    """
+
+    def _loader(source: str) -> Any:
+        return _load(monkeypatch, source)
+
+    yield _loader
+    monkeypatch.undo()
+    sfm.reload_tokens()
+
+
 @pytest.fixture
 def example(monkeypatch: pytest.MonkeyPatch) -> Any:
     """The committed synthetic example, loaded through the real pipeline.
@@ -256,7 +315,7 @@ def test_the_self_test_fires_every_class_of_the_example(example: Any) -> None:
     report, failures = example.self_test()
     assert failures == []
     joined = " ".join(report)
-    for label in ("site_prefix fired", "estate_file_scanned fired", "names fired"):
+    for label in ("site_prefixes fired", "estate fired", "names fired"):
         assert label in joined, f"the self-test reported nothing for {label!r}"
     # A report that says "fired 0/0" everywhere would satisfy the line above while proving nothing.
     assert "0/0" not in joined
@@ -321,7 +380,7 @@ def test_the_self_test_cli_reports_the_load_mode_beside_its_result(
     assert sfm.main(["--self-test"]) == 0
     out = capsys.readouterr().out
     assert "mode=synthetic" in out
-    assert "self-test: site_prefix fired" in out
+    assert "self-test: site_prefixes fired" in out
     monkeypatch.undo()
     sfm.reload_tokens()
 
@@ -365,6 +424,177 @@ def test_the_ambient_token_source_survives_its_own_self_test() -> None:
     )
     _report, failures = sfm.self_test()
     assert failures == [], "; ".join(failures)
+
+
+# --- can the self-test SEE what it did not probe? (BACKLOG #321, the residual) ----------------------
+# Measured against the REAL table at 2026-09-05, and identical to the run the check shipped with on
+# 2026-09-03: the report read ``site_prefix fired 2/2``, ``estate_file_scanned fired 13/13`` and
+# ``names fired 6/6 probeable of 8 loaded``, exit 0 -- three perfect ratios over 24 loaded entries, of
+# which THREE had never been probed at all. Two were [names] regexes the prober cannot invert; one was
+# an [estate_body_only] hold-out visible only by subtracting a number in the report from a number in
+# the counts block above it. A permanent skip and a pass are the same line in a summary, which is the
+# sentence this item is named for, so these tests hold the residual to being stated rather than
+# derivable. (Those two class labels are quoted as the report printed them THAT DAY. They are now
+# `site_prefixes` and `estate`, the keys the counts block uses, so a denominator and the count it
+# should be read against can no longer be spelled two different ways.)
+
+
+def _line_for(report: list[str], label: str) -> str:
+    """The report line for one class, or a failure naming what was reported instead."""
+    for line in report:
+        if line.startswith(f"{label} "):
+            return line
+    raise AssertionError(f"no self-test line for class {label!r}; got {report!r}")
+
+
+def test_the_unprobed_residual_is_stated_rather_than_left_to_subtraction(load: Any) -> None:
+    """Reproduces the real table's SHAPE: more entries loaded than the prober can build probes for.
+
+    The numerator and denominator were both honest before this; what was missing is any statement
+    that they describe different populations. ``fired 6/6`` is what a reader carries away, and it is
+    a true sentence about a subset nothing named.
+    """
+    mod = load(_source(_PROBEABLE_NAMES + _UNPROBEABLE_NAMES, estate=_ESTATE, prefixes=_PREFIX))
+    report, failures = mod.self_test()
+    assert failures == [], "; ".join(failures)
+    names_line = _line_for(report, "names")
+    assert "of 6 loaded" in names_line, names_line
+    assert "2 UNPROBED" in names_line, (
+        f"the residual was left to subtraction rather than stated: {names_line!r}"
+    )
+
+
+def test_an_estate_token_held_out_of_the_file_scan_counts_as_unprobed_on_its_own_line(
+    load: Any,
+) -> None:
+    """The hold-out is deliberate; being able to see it only by cross-block arithmetic is not.
+
+    The counts block prints ``estate`` and ``estate_file_scanned`` as separate keys, so before this
+    the reader had to notice that a number in the report and a number in the counts block disagreed,
+    and then know why they may legitimately disagree.
+    """
+    mod = load(_source(_PROBEABLE_NAMES, estate=_ESTATE, body_only=[_ESTATE[1]], prefixes=_PREFIX))
+    report, failures = mod.self_test()
+    assert failures == [], "; ".join(failures)
+    line = _line_for(report, "estate")
+    assert "1/1 probeable of 2 loaded" in line, line
+    assert "1 UNPROBED" in line, line
+
+
+def test_each_class_reports_its_own_reason_rather_than_a_shared_default(load: Any) -> None:
+    """The reason is the one part of this that a reader ACTS on, so it must be per class.
+
+    A table keyed by class name needs a default, and a default is what a renamed class silently falls
+    back to -- a line that still looks explained while explaining nothing. Asserted here so the
+    reason cannot rot into the generic text without a test noticing.
+    """
+    mod = load(
+        _source(
+            _PROBEABLE_NAMES + _UNPROBEABLE_NAMES,
+            estate=_ESTATE,
+            body_only=[_ESTATE[1]],
+            prefixes=_PREFIX,
+        )
+    )
+    report, _failures = mod.self_test()
+    assert "held out of the file scan by [estate_body_only]" in _line_for(report, "estate")
+    assert "not a plain word in word boundaries" in _line_for(report, "names")
+
+
+def test_a_class_that_probed_nothing_fails_even_when_a_sibling_class_probed(load: Any) -> None:
+    """THE FAIL-CLOSED HALF, and the one the old global rule could not reach.
+
+    ``probed_anything`` was a single flag across all classes, so a healthy ``site_prefixes`` satisfied
+    it while every ``[names]`` detector -- the class carrying the partner product name this item is
+    about -- went entirely unexercised, and the required context stayed green.
+    """
+    mod = load(_source(_UNPROBEABLE_NAMES, estate=_ESTATE, prefixes=_PREFIX))
+    report, failures = mod.self_test()
+    assert any("names" in f and "proved nothing" in f for f in failures), (
+        f"a class with zero probeable entries passed beside a healthy sibling: {report!r}"
+    )
+    # The sibling classes are healthy, so this must be the ONLY thing reported wrong.
+    assert not any(f.startswith("site_prefix") or f.startswith("estate") for f in failures)
+
+
+def test_a_class_whose_entries_are_all_unprobeable_still_reports_a_line(load: Any) -> None:
+    """A class that reports nothing reads as a class with nothing to say.
+
+    The estate line used to be guarded on the file-scanned SUBSET, so a source whose estate tokens
+    were all body-only dropped the class out of the report entirely -- no line, no count, no
+    failure -- while the counts block still showed a populated ``estate``.
+    """
+    mod = load(_source(_PROBEABLE_NAMES, estate=_ESTATE, body_only=_ESTATE, prefixes=_PREFIX))
+    report, failures = mod.self_test()
+    line = _line_for(report, "estate")
+    assert "0/0 probeable of 2 loaded" in line, line
+    assert any(f.startswith("estate") and "proved nothing" in f for f in failures)
+
+
+def test_the_self_test_reports_aggregate_coverage_across_classes(load: Any) -> None:
+    """Three class lines each reading ``fired N/N`` add up to a report that reads as full coverage.
+
+    The aggregate exists so the size of the untested remainder survives reading down the list, in the
+    same units as the counts block.
+    """
+    mod = load(
+        _source(
+            _PROBEABLE_NAMES + _UNPROBEABLE_NAMES,
+            estate=_ESTATE,
+            body_only=[_ESTATE[1]],
+            prefixes=_PREFIX,
+        )
+    )
+    report, _failures = mod.self_test()
+    # 4 names + 1 estate + 1 prefix probeable, against 6 + 2 + 1 loaded.
+    assert "coverage 6 of 9 loaded entries probed; 3 UNPROBED across 2 class(es)" in report
+
+
+def test_a_fully_probeable_source_says_so_rather_than_staying_silent(load: Any) -> None:
+    """THE POSITIVE CONTROL for every assertion above.
+
+    They all look for the word UNPROBED, and a format that emitted it unconditionally would satisfy
+    all of them while saying nothing. A source with no residual must produce no residual.
+    """
+    mod = load(_source(_PROBEABLE_NAMES, estate=_ESTATE, prefixes=_PREFIX))
+    report, failures = mod.self_test()
+    assert failures == [], "; ".join(failures)
+    assert "coverage 7 of 7 loaded entries probed" in report
+    assert not any("UNPROBED" in line for line in report), report
+
+
+def test_the_unprobed_report_never_echoes_the_entry_it_could_not_probe(load: Any) -> None:
+    """THE ATTACK ON THIS CHANGE. The new lines describe entries the prober could not handle.
+
+    The obvious way to make an UNPROBED count useful is to say WHICH entry, and on this class that
+    would publish a customer or partner token into a world-readable Actions log on the one run that
+    holds the real secret. The reason is a property of the CLASS for that reason, and this asserts it
+    against the literals actually present in the unprobeable entries rather than against a wording.
+    """
+    mod = load(
+        _source(
+            _PROBEABLE_NAMES + _UNPROBEABLE_NAMES,
+            estate=_ESTATE,
+            body_only=[_ESTATE[1]],
+            prefixes=_PREFIX,
+        )
+    )
+    report, failures = mod.self_test()
+    printed = " ".join(report + failures).lower()
+    assert "unprobed" in printed, "precondition: this source HAS unprobeable entries"
+    # Every string the unprobeable entries could disclose: the alternation's two branches, both
+    # strings the optional-character entry matches, the held-out estate token, and the prefix.
+    for value in (
+        f"{_STEM}echo",
+        f"{_STEM}foxtrot",
+        f"{_STEM}golf",
+        f"{_STEM}glf",
+        _ESTATE[1],
+        _PREFIX[0],
+    ):
+        assert value.lower() not in printed, (
+            f"the self-test echoed {value!r} from an entry it could not probe"
+        )
 
 
 # --- the real set, when one is configured ---------------------------------------------------------
