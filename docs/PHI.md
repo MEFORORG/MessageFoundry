@@ -828,8 +828,10 @@ control unchanged (`messages:view_raw`/`view_summary` RBAC, field-level redactio
   at *serve* time, not on the stored document: a browser-active label (`html`/`xml`/`script`/`svg`,
   case-folded) is downgraded to `application/octet-stream`, which also strips a `.svg`/`.html` download
   name, and the response carries `Content-Disposition: attachment`, `X-Content-Type-Options: nosniff`
-  and `Content-Security-Policy: default-src 'none'; sandbox` on both the JSON route and the `/ui`
-  delegate. No served representation can execute in the application origin. Trade-off: `svg`/`html`
+  and `Content-Security-Policy: default-src 'none'; sandbox; frame-ancestors 'none'` on both the JSON
+  route and the `/ui` delegate. No served representation can execute in the application origin, and
+  none can be framed -- `frame-ancestors` is named in that policy rather than left to the API's header
+  floor because it takes no fallback from `default-src` (ASVS 3.4.6). Trade-off: `svg`/`html`
   attachments no longer preview in the browser; the bytes are unchanged and still downloadable.
 - **XSS-safe rendering.** All HL7/message content is escaped by an autoescape-by-default renderer and a
   strict CSP (`script-src 'self'`, no `unsafe-*`); attacker-influenced HL7 cannot execute in the DOM.
