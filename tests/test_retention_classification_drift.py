@@ -91,7 +91,7 @@ def _documented_settings() -> set[str]:
             documented.update(found)
             continue
         assert any(form in cell for form in _PROSE_FORMS), (
-            f"unrecognised Retention cell {cell!r}. Every cell must be one of the seven vocabulary "
+            f"unrecognised Retention cell {cell!r}. Every cell must be one of the eight vocabulary "
             f"forms — a bounded form naming a backticked `[section].setting`, or one of {_PROSE_FORMS}. "
             f"An unparsed cell would otherwise read as 'no window' and silently drop a PHI tier out of "
             f"the generated gate list."

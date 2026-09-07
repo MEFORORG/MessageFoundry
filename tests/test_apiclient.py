@@ -437,3 +437,131 @@ def test_apiclient_sends_the_search_needle_in_the_body_not_the_url() -> None:
             f"the needle {needle!r} reached neither the URL nor the body — it was dropped, not moved"
         )
     assert b"PID-5" in sent.content  # the structural locator travels with its value
+
+
+# --- ASVS 12.3.3 (BACKLOG #1179): the plaintext escape carries no credential -----------------------
+#
+# `allow_insecure` used to permit ANYTHING over a non-loopback plaintext hop -- including the bearer
+# token and the password its own refusal text names as the reason the hop is refused. ADR 0172 makes
+# a stock engine mint a certificate and serve TLS, so the escape can now only ever reach an engine an
+# operator DECLARED plaintext (`tls_terminated_upstream`), and it is clamped to unauthenticated reads.
+#
+# Removing the parameter outright was the alternative. It was rejected because it would delete the
+# only expression of that topology and leave the two-box bench rig with no posture at all, while the
+# clamp removes the harm and keeps the expression. Measured 2026-09-05: every caller that threads
+# `allow_insecure=True` polls tokenless, so the clamp costs them nothing.
+
+_REMOTE_HTTP = "http://engine.example.com:8765"
+
+
+def _stub_ok(client: EngineClient) -> list[httpx.Request]:
+    """Replace the transport seam and record what reached it."""
+    captured: list[httpx.Request] = []
+
+    def _capture(request: httpx.Request, *args: object, **kwargs: object) -> httpx.Response:
+        captured.append(request)
+        return httpx.Response(200, json={}, request=request)
+
+    client._http.send = _capture  # type: ignore[method-assign]
+    return captured
+
+
+def test_the_plaintext_escape_still_permits_an_unauthenticated_remote_read() -> None:
+    """NEGATIVE CONTROL, and the reason the clamp is a clamp rather than a deletion.
+
+    A clamp that refused everything would look identical to a correct one. The two-box bench pollers
+    (``harness/load/shardcert.py``) read ``/stats`` and ``/health`` over exactly this hop with
+    ``token=None``, so an unauthenticated read must still go out, with no Authorization header.
+
+    Mutation: move the guard from ``_request``'s token branch to the top of ``_request``. Red: the
+    read raises instead of reaching the transport."""
+    client = EngineClient(_REMOTE_HTTP, allow_insecure=True)
+    captured = _stub_ok(client)
+    try:
+        with contextlib.suppress(ApiError):
+            client.health()
+    finally:
+        client.close()
+    assert captured, "the tokenless read never reached the transport -- the clamp is too wide"
+    assert "authorization" not in {k.lower() for k in captured[0].headers}
+
+
+@pytest.mark.parametrize(
+    ("call", "what"),
+    [
+        (lambda c: c.set_token("tok"), "a bearer token"),
+        (lambda c: c.login("alice", "hunter2"), "a password"),
+        (lambda c: c.reauth("hunter2"), "a password"),
+        (lambda c: c.verify_mfa("123456"), "a second factor"),
+    ],
+    ids=["set_token", "login", "reauth", "verify_mfa"],
+)
+def test_the_plaintext_escape_refuses_every_credential(
+    call: Callable[[EngineClient], object], what: str
+) -> None:
+    """Each of the four entry points that attaches or proves a credential must refuse, and the
+    refusal must reach the transport seam ZERO times -- a credential that goes out and is then
+    reported as refused has already crossed the wire.
+
+    Mutation: drop any one ``_refuse_credential_on_cleartext`` call. Red: that parametrization
+    records a request on a hop the message says carries none."""
+    client = EngineClient(_REMOTE_HTTP, allow_insecure=True)
+    captured = _stub_ok(client)
+    try:
+        with pytest.raises(ApiError, match="never a credential") as excinfo:
+            call(client)
+        assert what in str(excinfo.value)
+    finally:
+        client.close()
+    assert captured == [], f"{what} reached the transport before the refusal"
+
+
+def test_a_token_copied_past_the_entry_points_still_cannot_cross() -> None:
+    """``for_polling`` assigns ``poll._token`` DIRECTLY, so a clamp that lived only on ``set_token``
+    would hold by accident rather than by construction. ``_request`` re-checks, so any future path
+    that sets the attribute without going through an entry point is covered too.
+
+    Mutation: delete the token branch in ``_request``. Red: the Authorization header goes out over
+    plaintext http to a non-loopback host."""
+    client = EngineClient(_REMOTE_HTTP, allow_insecure=True)
+    captured = _stub_ok(client)
+    client._token = "smuggled"
+    try:
+        with pytest.raises(ApiError, match="never a credential"):
+            client.health()
+    finally:
+        client.close()
+    assert captured == [], "the smuggled bearer token reached the transport"
+
+
+def test_the_clamp_is_scoped_to_the_cleartext_hop() -> None:
+    """POSITIVE CONTROL for the scope: loopback http and https are not cleartext non-loopback hops,
+    so a credential must still attach there. Without this, a clamp that fired on every client would
+    pass every test above while breaking the console and the harness monitor.
+
+    Mutation: make ``_assert_safe_transport`` return True unconditionally. Red: both arms raise."""
+    for url in ("http://127.0.0.1:8765", "https://engine.example.com:8765"):
+        client = EngineClient(url)
+        assert client._cleartext_hop is False, url
+        client._refuse_credential_on_cleartext("a bearer token")  # must not raise
+        client.close()
+
+
+def test_the_remote_plaintext_refusal_no_longer_advertises_the_escape_as_a_fix() -> None:
+    """The refusal used to end "Use an https URL, or pass --insecure for a trusted-network dev
+    setup", which offered cleartext as a co-equal answer. ADR 0172 makes that false: a stock engine
+    serves TLS, so ``--insecure`` cannot make it answer http -- measured 2026-09-05 against a real TLS
+    listener, the escape got the client built and the first request died with an opaque
+    ``httpx.ReadError``. Advertising a fallback the ASVS verb forbids, which also does not work, is
+    the sentence this pins out of the tree.
+
+    Mutation: restore the old sentence. Red: the retired phrasing is found."""
+    with pytest.raises(ApiError) as excinfo:
+        EngineClient(_REMOTE_HTTP)
+    message = str(excinfo.value)
+    assert "or pass --insecure for a trusted-network dev setup" not in message
+    assert "Use an https URL" in message
+    assert "ADR 0172" in message, "the refusal must say WHY http is the wrong scheme"
+    assert "carries no credential" in message, (
+        "the refusal must state what the escape now cannot do"
+    )
