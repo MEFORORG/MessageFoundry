@@ -53,18 +53,44 @@ import sys
 from pathlib import Path
 from typing import Any
 
-from messagefoundry.api import security
-from messagefoundry.api._ui_seam import (
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+_CONSOLE_DIR = _REPO_ROOT / "messagefoundry_webconsole"
+_ENGINE_DIR = _REPO_ROOT / "messagefoundry"
+
+# ANCHOR ON THE SCRIPT, NOT ON WHATEVER sys.path OFFERS (BACKLOG #1439). It is the same rule
+# scripts/coord/alloc.ps1 states for `git` (BACKLOG #1060), and the same insert the siblings
+# scripts/bench/stage_residency.py and scripts/tray/make_icons.py already carry. This file measures
+# the engine/console contract of the repository it LIVES IN; without the insert it measured whichever
+# engine the interpreter happened to find, and said nothing about the difference.
+#
+# Python puts the SCRIPT's directory on sys.path[0], never the current directory, so `scripts/` led
+# the path and no entry offered `messagefoundry` until site-packages. In a worktree with no .venv of
+# its own -- the normal state for these sessions -- the interpreter reached for is the primary
+# checkout's, whose site-packages holds a path-based editable install (`_editable_impl_*.pth`
+# containing the PRIMARY checkout's root). So `import messagefoundry` resolved to the PRIMARY tree
+# while the discovery walk below read _CONSOLE_DIR and _ENGINE_DIR out of THIS one.
+#
+# The failure was silent and it pointed the wrong way. Measured 2026-09-03 in a worktree with no
+# .venv of its own: `--write` printed the unchanged digest, rewrote both files with it, and
+# reported success, while tests/test_webconsole_seam_snapshot.py (which runs under pytest,
+# with the repo root already on sys.path) kept failing against a digest the script had never
+# computed. The script's own success output is what misled -- a reader concludes the GATE is broken
+# and starts "fixing" a gate that was right. This is the SDS-3.8 shape: an instrument answering a
+# question adjacent to the one asked.
+#
+# Inserted at 0, so it wins over that .pth entry. tests/test_webconsole_seam_snapshot.py::
+# test_the_script_run_by_path_computes_the_same_digest holds the property from outside, in a
+# subprocess, because nothing INSIDE this process can observe which tree it failed to import.
+sys.path.insert(0, str(_REPO_ROOT))
+
+from messagefoundry.api import security  # noqa: E402
+from messagefoundry.api._ui_seam import (  # noqa: E402
     ENGINE_UI_SEAM,
     AdminHandlers,
     CoreHandlers,
     UiDeps,
 )
-from messagefoundry.auth.service import AuthService
-
-_REPO_ROOT = Path(__file__).resolve().parents[1]
-_CONSOLE_DIR = _REPO_ROOT / "messagefoundry_webconsole"
-_ENGINE_DIR = _REPO_ROOT / "messagefoundry"
+from messagefoundry.auth.service import AuthService  # noqa: E402
 
 
 def _load_discovery() -> Any:

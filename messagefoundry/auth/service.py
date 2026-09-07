@@ -39,6 +39,7 @@ from messagefoundry.auth.notifications import (
     MFA_ENABLED,
     PASSWORD_CHANGED,
     PASSWORD_RESET,
+    RECOVERY_CODE_USED,
     ROLES_CHANGED,
     SUSPICIOUS_LOGIN_FAILURE_THRESHOLD,
     SecurityEvent,
@@ -82,7 +83,7 @@ def _warn_if_corpus_unreadable(path: str | None) -> None:
     except OSError as exc:
         _log.warning(
             "password_breach_corpus_file %r could not be read (%s); the larger breach corpus is "
-            "disabled (the bundled top-10k list still applies)",
+            "disabled (the bundled corpus still applies)",
             path,
             exc,
         )
@@ -152,9 +153,12 @@ class LoginOutcome:
     identity: Identity | None = None
     must_change_password: bool = False
     error: str | None = None
-    #: The password was accepted but the session still needs a second factor (TOTP / recovery code)
-    #: before it may perform step-up (sensitive) operations — the client should prompt for a code and
-    #: call ``POST /auth/mfa-verify`` (WP-14, ASVS 6.3.3). Always False for an MFA-delegated AD login.
+    #: The credential was accepted but the session still owes a second factor before it may reach an
+    #: authorized route — the client should prompt for a code and call ``POST /auth/mfa-verify``, or
+    #: enrol a factor first if it has none (WP-14, ASVS 6.3.3). It used to be documented as always
+    #: False for a directory login; that stopped being true when the Kerberos leg began minting at the
+    #: minimum (BACKLOG #1144), and reporting False there would tell a JSON client no factor is needed
+    #: seconds before the gate refuses it with ``X-MFA-Required: 1``.
     mfa_required: bool = False
     #: A CLOSED-SET reject slug for the federated path (ADR 0142), so the browser layer can pick an
     #: allow-listed error code without parsing ``error`` (free prose) or seeing any IdP-supplied text.
@@ -817,7 +821,7 @@ class AuthService:
                 await self._notify_security(
                     ACCOUNT_LOCKED,
                     username=user.username,
-                    email=user.email,
+                    email=user.notify_email,
                     client=client,
                     detail={"failed_attempts": attempts},
                 )
@@ -887,7 +891,7 @@ class AuthService:
             await self._notify_security(
                 LOGIN_AFTER_FAILURES,
                 username=user.username,
-                email=user.email,
+                email=user.notify_email,
                 client=client,
                 detail={"failed_attempts": prior_failures},
             )
@@ -946,12 +950,20 @@ class AuthService:
         if principal is None:
             await self._directory_reject_audit(username, "kerberos", "not_in_directory")
             return LoginOutcome(ok=False, error="user not found in directory")
-        # The signed delegated-directory relaxation (ASVS 6.3.4): a Kerberos service ticket carries no
-        # factor-strength assertion that pyspnego surfaces, so directory delegation stands. Since the
-        # AD password sign-in was retired (BACKLOG #1137) this is the ONLY leg passing a hard True --
-        # docs/SECURITY.md's Kerberos rows are where that grant is now disclosed.
+        # MINT AT THE MINIMUM (BACKLOG #1144, ASVS 6.8.4). A Kerberos service ticket carries no
+        # factor-strength assertion that pyspnego surfaces, so the engine learns NOTHING about what
+        # the domain enforced. It used to pass a hard True here under the signed delegated-directory
+        # relaxation, which is the inverted fallback: the requirement's clause says an application
+        # that receives no assertion must assume the MINIMUM mechanism was used, and minting verified
+        # assumes the maximum. False is that minimum -- one factor proven, none asserted -- so the
+        # session is MFA-pending and the engine's own second factor decides the rest.
+        #
+        # This is only safe CO-LANDED with directory-account engine-factor enrollment (the same item):
+        # a minimum-minted directory session reaches nothing outside api/security.py's six-entry
+        # MFA-exempt set, so without an enrollment ceremony that accepts a directory account it is a
+        # lockout rather than a control.
         return await self._complete_ad_login(
-            principal, client, mfa_verified=True, seed_reauth=seed_reauth
+            principal, client, mfa_verified=False, seed_reauth=seed_reauth
         )
 
     def _oidc_policy(self, nonce: str) -> oidc.OidcClaimPolicy:
@@ -1234,7 +1246,7 @@ class AuthService:
                 client=client,
             )
             return LoginOutcome(ok=False, error="account conflict")
-        user = await self._upsert_ad_user(principal)
+        user = await self._upsert_ad_user(principal, client=client)
         if (
             federated_subject is not None
             and (
@@ -1314,7 +1326,7 @@ class AuthService:
             await self._notify_security(
                 FEDERATED_IDENTITY_BOUND,
                 username=user.username,
-                email=user.email,
+                email=user.notify_email,
                 client=client,
                 detail={"issuer": federated_subject[0]},
             )
@@ -1338,7 +1350,7 @@ class AuthService:
             await self._notify_security(
                 ROLES_CHANGED,
                 username=user.username,
-                email=user.email,
+                email=user.notify_email,
                 client=client,
                 detail={"roles": role_ids},
             )
@@ -1354,10 +1366,10 @@ class AuthService:
             allowed_channels=_allowed_channels(user, ad_roles),
             extra_permissions=ad_custom_permissions,
         )
-        # ASVS 6.3.4: the second-factor grant is the CALLER's per-mechanism decision, not a blanket
-        # literal. AD simple-bind and Kerberos pass True under the owner-signed delegated-directory-MFA
-        # relaxation (the bind/ticket teaches the engine nothing about directory-side strength); the
-        # federated leg passes the engine-verified amr/acr result. See the callers for each rationale.
+        # ASVS 6.3.4 / 6.8.4: the second-factor grant is the CALLER's per-mechanism decision, not a
+        # blanket literal. Kerberos passes False -- a ticket asserts nothing about directory-side
+        # strength, so the engine assumes the minimum (BACKLOG #1144); the federated leg passes the
+        # engine-verified amr/acr result. See the callers for each rationale.
         token = await self._issue_session(
             user.id,
             client,
@@ -1376,7 +1388,16 @@ class AuthService:
         await self._audit(
             "auth.login_success", actor=user.username, detail=_json(detail), client=client
         )
-        return LoginOutcome(ok=True, token=token, identity=identity)
+        # Ask the GATE, not the grant (BACKLOG #1144). A leg that granted nothing has not necessarily
+        # left a debt: with require_mfa off and no factor enrolled the shared rule still admits the
+        # session, so `not mfa_verified` would over-report and prompt for a factor the caller does not
+        # owe. One extra read on a rare path buys a single source for the answer.
+        return LoginOutcome(
+            ok=True,
+            token=token,
+            identity=identity,
+            mfa_required=not await self.mfa_satisfied(token),
+        )
 
     async def _sync_ad_channel_scope(
         self, user: UserRecord, roles: frozenset[Role], groups: Iterable[str]
@@ -1405,7 +1426,9 @@ class AuthService:
         )
         return await self._store.get_user(user.id) or user
 
-    async def _upsert_ad_user(self, principal: AdPrincipal) -> UserRecord:
+    async def _upsert_ad_user(
+        self, principal: AdPrincipal, *, client: str | None = None
+    ) -> UserRecord:
         existing = await self._store.get_user_by_username(principal.username)
         if existing is None:
             user_id = uuid4().hex
@@ -1418,9 +1441,72 @@ class AuthService:
             )
         else:
             user_id = existing.id
-            await self._store.update_user_profile(
-                user_id, display_name=principal.display_name, email=principal.email
-            )
+            # BACKLOG #1139. AN ABSENT DIRECTORY ATTRIBUTE IS NOT AN INSTRUCTION TO ERASE.
+            # ``update_user_profile``'s write is unconditional, so passing ``principal.email``
+            # straight through let a directory that returned no ``mail`` blank the stored address on
+            # the next login -- and "returned no mail" covers an unset attribute, one the bind
+            # account cannot read, and one trimmed from the search attribute list, none of which is
+            # a site saying "remove this address".
+            #
+            # The address is this account's ONLY notification target, so that erase also excluded the
+            # account from every later notice: ``SecurityEventNotifier.notify`` returns early on an
+            # empty address. A directory that has nothing to say now leaves the stored value alone.
+            #
+            # THE COST, STATED: a site that deliberately clears ``mail`` in the directory no longer
+            # propagates that clear on the next login. An administrator can still clear the address
+            # through ``PATCH /users/{id}``, which is audited and notified, so nothing becomes
+            # unreachable -- only the silent path is closed.
+            display_name = principal.display_name or existing.display_name
+            email = principal.email or existing.email
+            await self._store.update_user_profile(user_id, display_name=display_name, email=email)
+            if email != existing.email:
+                # BACKLOG #1139, ASVS 6.3.7. The directory owns the attribute, but repointing it
+                # decides where every later security notice on this account is delivered -- so it is
+                # an update to the account's authentication details, and it gets the same two records
+                # the local sibling ``update_user`` emits: an audit row and an out-of-band notice.
+                #
+                # This method sits on the SHARED directory completion path, so this covers the
+                # simple-bind, Kerberos and federated legs alike, not AD alone.
+                await self._audit(
+                    "auth.ad_profile_email_changed",
+                    actor=principal.username,
+                    detail=_json({"user_id": user_id, "source": "directory"}),
+                    client=client,
+                )
+                # ADDRESSED TO THE ENGINE-OWNED ``notify_email`` FIRST (BACKLOG #1139, ADR 0182).
+                # This read used to start at ``existing.email``, the profile mirror, which is the one
+                # column a directory repoint is free to move -- so the notice about a repoint could
+                # be delivered to an address an earlier repoint had installed. That is ADR 0182
+                # option 3, rejected in terms: "whoever repointed the attribute is the party the
+                # notice would reach". Two ways it came apart, both driven rather than argued:
+                #
+                #   - the SECOND consecutive repoint, where the mirror holds what the first one
+                #     wrote while ``notify_email`` still holds the address the account was born
+                #     with; and
+                #   - any repoint after an administrator clears the profile address, where the empty
+                #     mirror falls through to the directory's NEW value even though the engine-owned
+                #     address is standing and deliverable (ADR 0182 AC-4 guarantees it survives).
+                #
+                # The fallbacks are ordered by what the directory cannot reach. ``notify_email`` is
+                # engine-owned and no directory-sync statement names it, so it is the target while it
+                # exists -- which is the OLD-HOLDER PRINCIPLE the local sibling ``update_user``
+                # follows when it addresses its own EMAIL_CHANGED to ``before.notify_email``.
+                #
+                # THE MIRROR FALLBACK IS NOT DEAD, AND IT IS NOT WHAT ``update_user`` DOES -- that
+                # sibling reads one term. It is reachable in exactly one state, which only this
+                # method can produce: an account created with NO address, which later acquired one
+                # from the directory, because ``update_user_profile`` writes the mirror and never
+                # seeds ``notify_email``. On that account's next repoint the mirror is the prior
+                # holder. Failing both terms the account has never carried an address at all, so the
+                # incoming value is the only reachable party and there is no earlier holder to
+                # protect -- it is the target rather than announcing a first set to nobody.
+                await self._notify_security(
+                    EMAIL_CHANGED,
+                    username=principal.username,
+                    email=existing.notify_email or existing.email or email,
+                    client=client,
+                    detail={"new_email": email, "source": "directory"},
+                )
         user = await self._store.get_user(user_id)
         assert user is not None  # just upserted
         return user
@@ -1649,7 +1735,7 @@ class AuthService:
             await self._notify_security(
                 ACCOUNT_DISABLED if revocation.role_ids is None else ROLES_CHANGED,
                 username=user.username,
-                email=user.email,
+                email=user.notify_email,
                 detail={"reason": revocation.reason},
             )
 
@@ -1687,9 +1773,10 @@ class AuthService:
             seed_reauth=mfa_verified if seed_reauth is None else seed_reauth,
         )
         if mfa_verified:
-            # No second factor pending (MFA not required for this user, or delegated to AD/Kerberos):
-            # mark the session's 2nd factor satisfied at issuance so the step-up gate never blocks it.
-            # An MFA-required local login leaves it NULL until POST /auth/mfa-verify (WP-14).
+            # No second factor pending (MFA is not required for this user, or the federated IdP
+            # asserted one): mark the session's 2nd factor satisfied at issuance so the step-up gate
+            # never blocks it. An MFA-required login leaves it NULL until POST /auth/mfa-verify
+            # (WP-14) -- including the Kerberos leg, which asserts nothing and mints at the minimum.
             await self._store.mark_session_mfa_verified(token_hash)
         cap = self._settings.max_sessions_per_user
         if cap and cap > 0:
@@ -2107,7 +2194,7 @@ class AuthService:
         await self._notify_security(
             ADMIN_NEW_IP,
             username=username,
-            email=user.email if user is not None else None,
+            email=user.notify_email if user is not None else None,
             client=client_ip,
             detail={"known_ip": session.client},
         )
@@ -2140,12 +2227,12 @@ class AuthService:
         await self._notify_security(
             PASSWORD_CHANGED,
             username=identity.username,
-            email=user.email if user is not None else None,
+            email=user.notify_email if user is not None else None,
             client=client,
         )
         return []
 
-    # --- MFA: native TOTP second factor (local accounts, WP-14, ASVS 6.3.3) --
+    # --- MFA: native TOTP second factor (every account, WP-14, ASVS 6.3.3) -----
 
     async def _second_factor_enrolled(self, user: UserRecord) -> bool:
         """Any second factor enrolled — TOTP **or** ≥1 WebAuthn passkey (ADR 0068 decision 5). The
@@ -2162,14 +2249,12 @@ class AuthService:
         covers them — ``every_local_account`` (default, ASVS 6.3.3) or, under ``administrators``,
         only the Administrator role.
 
-        **AD is an ALLOW-LIST exemption, not a denylist.** Directory MFA is delegated to the directory
-        (Entra Conditional Access / an MFA proxy) under the owner-signed relaxation, so an ``ad`` user
-        is exempt — but any OTHER provider value falls through to the local rules and is REQUIRED.
-        Failing closed matters because :meth:`_identity_for_user` maps an unrecognized provider back to
-        ``LOCAL`` when building the :class:`Identity`; a denylist (``!= LOCAL``) would let such a row
-        present as local everywhere else while silently skipping the second factor here."""
-        if user.auth_provider == AuthProvider.AD.value:
-            return False
+        **THE RULE READS NO PROVIDER (BACKLOG #1144, ASVS 6.8.4),** which is what keeps it closed
+        against an unrecognized value — :meth:`_identity_for_user` maps one back to ``LOCAL`` when it
+        builds the :class:`Identity`, so a row that skipped the factor here would present as local
+        everywhere else. It used to open with a blanket ``auth_provider == ad -> False`` exemption; a
+        ticket or a bind asserts nothing about what the directory enforced, so that exempted on no
+        evidence, and the enrollment ceremonies now accept a directory account."""
         if second_factor_enrolled:
             return True
         if not self._settings.require_mfa:
@@ -2193,21 +2278,22 @@ class AuthService:
         user = await self._store.get_user(session.user_id)
         if user is None:
             return False
-        if user.auth_provider == AuthProvider.AD.value:
-            # ASVS 6.3.4 — the directory leg, decided per SESSION rather than per user. Reaching here
-            # means the session was minted WITHOUT an engine-verified factor (:_issue_session stamps
-            # mfa_verified_at only when mfa_verified was True). AD simple-bind and Kerberos ALWAYS
-            # mint verified under the owner-signed delegated-MFA relaxation, so the ONLY way to be
-            # here is a FEDERATED (OIDC) session issued while [auth].oidc_require_mfa_claim was off —
-            # i.e. the engine verified nothing about the IdP's factor strength.
+        if user.auth_provider == AuthProvider.AD.value and self._settings.require_mfa:
+            # THE DIRECTORY FLOOR, decided per SESSION rather than per user (ASVS 6.3.4 / 6.8.4).
+            # Reaching here means the session was minted with NO factor asserted at all -- every
+            # Kerberos session, and any federated one issued while oidc_require_mfa_claim was off.
             #
-            # Deciding it here, not in _mfa_required_for, is deliberate: that helper is keyed on the
-            # USER and is also consulted by mfa_status / the last-factor-delete guard, where "is this
-            # person exempt" is the right question. Only the session knows what was actually proven.
-            # Without this, making the OIDC mint conditional would move a timestamp and gate nothing.
-            # [auth].require_mfa remains the global off-switch so an operator who has deliberately
-            # opted out of the claim gate is not left without one.
-            return not self._settings.require_mfa
+            # It decides exactly one case the shared rule below would decide differently:
+            # require_mfa_scope="administrators" + a non-Administrator + no factor enrolled. A LOCAL
+            # non-admin is satisfied there, having at least proven a password to the ENGINE; this
+            # session proved nothing to the engine, so the scope dial does not reach it. Every other
+            # combination is already produced by the shared rule, and when require_mfa is off this
+            # falls through to it -- an enrolled directory account satisfies the factor it enrolled.
+            #
+            # Keyed on the SESSION rather than folded into _mfa_required_for on purpose: that helper
+            # answers "is this person exempt" for mfa_status and the last-factor-delete guard, and
+            # only the session knows what was actually proven at mint time.
+            return False
         roles = _roles_from_ids(await self._store.get_user_role_ids(user.id))
         # The extra store read only executes for sessions not already MFA-verified (the
         # mfa_verified_at early-return above short-circuits the common case).
@@ -2215,12 +2301,20 @@ class AuthService:
         return not self._mfa_required_for(user, roles, second_factor_enrolled=enrolled)
 
     async def begin_mfa_enrollment(self, identity: Identity) -> MfaEnrollment:
-        """Stage a fresh TOTP secret for a local user and return it + the ``otpauth://`` URI for the
-        QR. Not active until proven via :meth:`confirm_mfa_enrollment`. Raises :class:`ValueError` for
-        an AD account or when MFA is already enabled (disable it first to re-enroll)."""
+        """Stage a fresh TOTP secret and return it + the ``otpauth://`` URI for the QR. Not active
+        until proven via :meth:`confirm_mfa_enrollment`. Raises :class:`ValueError` for an unknown
+        account or when MFA is already enabled (disable it first to re-enroll).
+
+        **A DIRECTORY ACCOUNT MAY ENROLL (BACKLOG #1144, ASVS 6.8.4).** This refused anything but
+        ``LOCAL``, which made the delegated-directory relaxation self-sealing: the engine could not
+        assume the minimum on a leg that asserts nothing, because assuming it locked out every
+        directory operator. The secret and its recovery codes are engine-held state on the engine's
+        own user row, which a directory account already has (``_upsert_ad_user``); nothing here reads
+        or writes the directory. The step-up in front of this ceremony re-proves a directory
+        credential by a live bind (:meth:`_reauth_ad`), so the proof is real on both providers."""
         user = await self._store.get_user(identity.user_id)
-        if user is None or user.auth_provider != AuthProvider.LOCAL.value:
-            raise ValueError("only local users can enroll a TOTP authenticator")
+        if user is None:
+            raise ValueError("no such user")
         if user.totp_enabled:
             raise ValueError("MFA is already enabled; disable it before re-enrolling")
         secret = totp.generate_secret()
@@ -2235,10 +2329,11 @@ class AuthService:
         single-use recovery codes (returned **once**, plaintext, for the user to save), mark the
         current session MFA-verified, audit + notify. Returns the recovery codes, or ``None`` when the
         code was wrong or its time-step was already consumed (single-use, BACKLOG #1021). Raises
-        :class:`ValueError` if no enrollment is staged / the user isn't local."""
+        :class:`ValueError` for an unknown account or when no enrollment is staged. Accepts a
+        directory account, for the reason :meth:`begin_mfa_enrollment` states."""
         user = await self._store.get_user(identity.user_id)
-        if user is None or user.auth_provider != AuthProvider.LOCAL.value:
-            raise ValueError("only local users can enroll a TOTP authenticator")
+        if user is None:
+            raise ValueError("no such user")
         secret = await self._store.get_totp_secret(identity.user_id)
         if not secret:
             raise ValueError("no enrollment in progress")
@@ -2271,7 +2366,7 @@ class AuthService:
         await self._store.mark_session_mfa_verified(hash_token(token))
         await self._audit("auth.mfa_enrolled", actor=identity.username, client=client)
         await self._notify_security(
-            MFA_ENABLED, username=user.username, email=user.email, client=client
+            MFA_ENABLED, username=user.username, email=user.notify_email, client=client
         )
         return plain
 
@@ -2299,7 +2394,7 @@ class AuthService:
                 client=client,
             )
             return False
-        if await self._verify_second_factor(user, code):
+        if await self._verify_second_factor(user, code, client=client):
             # The 2nd factor is now satisfied; also seed the step-up window (the session has completed
             # password + MFA) and clear the failure counter. (Initial enrollment has no factor to verify,
             # so this never fires there — keeping the enrollment step-up gate honest, WP-14.)
@@ -2319,16 +2414,21 @@ class AuthService:
             await self._notify_security(
                 ACCOUNT_LOCKED,
                 username=user.username,
-                email=user.email,
+                email=user.notify_email,
                 client=client,
                 detail={"failed_attempts": attempts},
             )
         return False
 
-    async def _verify_second_factor(self, user: UserRecord, code: str) -> bool:
+    async def _verify_second_factor(
+        self, user: UserRecord, code: str, *, client: str | None = None
+    ) -> bool:
         """True iff ``code`` is the user's current TOTP **or** an unused recovery code (consumed on
         match). TOTP is checked first (fast, no argon2); recovery codes are argon2id-hashed and
-        single-use. Codes never collide (TOTP is 6 digits; recovery codes are dashed alphanumerics)."""
+        single-use. Codes never collide (TOTP is 6 digits; recovery codes are dashed alphanumerics).
+
+        ``client`` is the caller's address, carried onto the recovery-code audit row and notice
+        (BACKLOG #1139) so the holder can tell their own use from someone else's."""
         code = code.strip()
         if not code:
             return False
@@ -2378,7 +2478,38 @@ class AuthService:
             return False
         # Atomic compare-and-delete: only the caller that actually removes the hash wins, so a
         # concurrent verify of the same single-use code can't double-spend it (WP-14).
-        return await self._store.consume_recovery_code_hash(user.id, real[matched])
+        if not await self._store.consume_recovery_code_hash(user.id, real[matched]):
+            # Lost the race to a concurrent verify of the SAME code. That caller removed the hash and
+            # writes the records below; writing them here too would report one consumption twice.
+            return False
+        # BACKLOG #1139, ASVS 6.3.7. Spending a recovery code PERMANENTLY DELETES a stored
+        # credential, so it is an update to the account's authentication details and earns its own
+        # records. Before this the only row was the generic ``auth.mfa_verified`` the caller writes,
+        # which carries no detail -- leaving a recovery-code burn byte-indistinguishable from an
+        # ordinary TOTP verify, on precisely the event that usually means either the holder lost
+        # their authenticator or somebody else has their codes.
+        # RE-READ RATHER THAN ``len(real) - 1``. The arithmetic is off by one for every code a
+        # concurrent caller spent between this method's read and its own consume, and this notice
+        # exists to be acted on -- an overstated count tells the holder they have a spare they do
+        # not. One extra store read, on a path that only runs when a code is actually burned.
+        remaining = len(await self._store.get_recovery_code_hashes(user.id))
+        await self._audit(
+            "auth.mfa_recovery_code_used",
+            actor=user.username,
+            detail=_json({"remaining": remaining}),
+            client=client,
+        )
+        # THE REMAINING COUNT, NEVER THE CODE OR ITS HASH. The holder needs to know a code was spent
+        # and how close they are to none left; an operator gets everything else from the audit row,
+        # which is stored somewhere better protected than a mailbox.
+        await self._notify_security(
+            RECOVERY_CODE_USED,
+            username=user.username,
+            email=user.notify_email,
+            client=client,
+            detail={"remaining": remaining},
+        )
+        return True
 
     async def disable_mfa(self, identity: Identity, *, client: str | None = None) -> None:
         """Self-service: turn off the caller's TOTP MFA (the API gates this behind step-up). Audited +
@@ -2415,7 +2546,7 @@ class AuthService:
         await self._notify_security(
             MFA_DISABLED,
             username=identity.username,
-            email=user.email if user is not None else None,
+            email=user.notify_email if user is not None else None,
             client=client,
         )
 
@@ -2423,12 +2554,16 @@ class AuthService:
         """Admin: clear a user's MFA — TOTP **and** every WebAuthn passkey (lost authenticator + no
         recovery path; ADR 0068 extends this to credentials) — and revoke their sessions so they
         re-enroll. The always-available recovery for a locked-out passkey user. Raises
-        :class:`ValueError` for an unknown or non-local user."""
+        :class:`ValueError` for an unknown user.
+
+        **IT COVERS A DIRECTORY ACCOUNT (BACKLOG #1144).** The non-local refusal that stood here was
+        true while no directory account could hold an engine factor. Once one can, keeping it would
+        make enrollment a one-way door: a directory user who lost the authenticator would have no
+        recovery at all, because every route that could help stands behind the factor they lost. This
+        is the widest of the refusals the item names, and it is included for that reason."""
         user = await self._store.get_user(user_id)
         if user is None:
             raise ValueError("no such user")
-        if user.auth_provider != AuthProvider.LOCAL.value:
-            raise ValueError("only local users have MFA to reset")
         await self._store.disable_totp(user_id)
         removed = await self._store.delete_all_webauthn_credentials(user_id)
         await self._store.revoke_user_sessions(user_id)
@@ -2444,7 +2579,7 @@ class AuthService:
             ),
         )
         await self._notify_security(
-            MFA_DISABLED, username=user.username, email=user.email, detail={"reset": True}
+            MFA_DISABLED, username=user.username, email=user.notify_email, detail={"reset": True}
         )
 
     async def mfa_status(self, identity: Identity) -> MfaStatus:
@@ -2472,7 +2607,7 @@ class AuthService:
             webauthn_enrolled=webauthn_enrolled,
         )
 
-    # --- MFA: WebAuthn passkeys second factor (local accounts, WP-14b / ADR 0068) ---
+    # --- MFA: WebAuthn passkeys second factor (every account, WP-14b / ADR 0068) ---
 
     def webauthn_available(self) -> bool:
         """Whether the optional ``[webauthn]`` extra is installed (the UI hides the passkey surface
@@ -2501,11 +2636,12 @@ class AuthService:
         """Stage a passkey registration ceremony; returns the browser creation-options JSON. The
         API gates this behind the password-only re-proof (``require_ui_reauth_only`` — WP-14: a
         stolen pre-MFA cookie must never bind an attacker's passkey). Raises :class:`ValueError`
-        for an AD account (parity with :meth:`begin_mfa_enrollment`); a full challenge cache
-        raises :class:`webauthn.ChallengeCacheFullError` (cause-naming, rendered legibly)."""
+        for an unknown account; a full challenge cache raises
+        :class:`webauthn.ChallengeCacheFullError` (cause-naming, rendered legibly). Accepts a
+        directory account, in parity with :meth:`begin_mfa_enrollment` and for its stated reason."""
         user = await self._store.get_user(identity.user_id)
-        if user is None or user.auth_provider != AuthProvider.LOCAL.value:
-            raise ValueError("only local users can enroll a passkey")
+        if user is None:
+            raise ValueError("no such user")
         existing = await self._store.list_webauthn_credentials(identity.user_id)
         challenge = webauthn.new_challenge()
         options = webauthn.registration_options(
@@ -2533,13 +2669,14 @@ class AuthService:
     ) -> bool:
         """Verify an attestation response and persist the passkey. Returns ``False`` when the
         response fails verification (audited — parity with a wrong TOTP code); raises
-        :class:`ValueError` for flow errors with safe, renderable messages (AD account, bad label,
-        expired ceremony, duplicate label/credential). On success the enrolling session is marked
-        MFA-verified (exact :meth:`confirm_mfa_enrollment` parity) — **no recovery codes are
-        minted** (ADR 0068 decision 5)."""
+        :class:`ValueError` for flow errors with safe, renderable messages (unknown account, bad
+        label, expired ceremony, duplicate label/credential). On success the enrolling session is
+        marked MFA-verified (exact :meth:`confirm_mfa_enrollment` parity) — **no recovery codes are
+        minted** (ADR 0068 decision 5). Accepts a directory account, for the reason
+        :meth:`begin_mfa_enrollment` states."""
         user = await self._store.get_user(identity.user_id)
-        if user is None or user.auth_provider != AuthProvider.LOCAL.value:
-            raise ValueError("only local users can enroll a passkey")
+        if user is None:
+            raise ValueError("no such user")
         label = label.strip()
         if not label or len(label) > self._WEBAUTHN_LABEL_MAX:
             raise ValueError("label must be 1-100 characters")
@@ -2599,7 +2736,7 @@ class AuthService:
             client=client,
         )
         await self._notify_security(
-            MFA_ENABLED, username=user.username, email=user.email, client=client
+            MFA_ENABLED, username=user.username, email=user.notify_email, client=client
         )
         return True
 
@@ -2763,7 +2900,7 @@ class AuthService:
             await self._notify_security(
                 MFA_DISABLED,
                 username=user.username,
-                email=user.email,
+                email=user.notify_email,
                 client=client,
                 detail={"factor": "webauthn"},
             )
@@ -2826,6 +2963,19 @@ class AuthService:
     ) -> None:
         before = await self._store.get_user(user_id)  # capture old email/disabled for notifications
         await self._store.update_user_profile(user_id, display_name=display_name, email=email)
+        # THE ENGINE-OWNED NOTIFICATION ADDRESS MOVES ONLY HERE, AND ONLY UPWARDS (BACKLOG #1139).
+        # This is an administrator acting on the engine's own surface, so it is the one write allowed
+        # to repoint where notices go — the directory sync above (`update_user_profile`, which
+        # `_upsert_ad_user` also calls) is not.
+        #
+        # A BLANK ADDRESS FALLS THROUGH DELIBERATELY, and that is the durability rule in force: the
+        # profile mirror clears, and the notification address stands. Requiring an address at creation
+        # would not have achieved this on its own, because an explicit null still strips it afterwards
+        # — and an account with no address is excluded from every later notice, which is exactly the
+        # structural exclusion this item was filed against. `set_user_notify_email` takes `str`, so
+        # there is no way to spell the clear even by mistake.
+        if email is not None and email.strip():
+            await self._store.set_user_notify_email(user_id, email=email)
         if disabled is not None:
             await self._store.set_user_disabled(user_id, disabled=disabled)
             if disabled:
@@ -2853,12 +3003,12 @@ class AuthService:
                 await self._notify_security(
                     EMAIL_CHANGED,
                     username=before.username,
-                    email=before.email,
+                    email=before.notify_email,
                     detail={"new_email": email},
                 )
             if disabled and not before.disabled:
                 await self._notify_security(
-                    ACCOUNT_DISABLED, username=before.username, email=before.email
+                    ACCOUNT_DISABLED, username=before.username, email=before.notify_email
                 )
 
     async def delete_user(self, user_id: str, *, actor: str) -> None:
@@ -2878,7 +3028,7 @@ class AuthService:
             await self._notify_security(
                 ROLES_CHANGED,
                 username=user.username,
-                email=user.email,
+                email=user.notify_email,
                 detail={"roles": list(roles)},
             )
 
@@ -3017,7 +3167,7 @@ class AuthService:
             actor=actor,
             detail=_json({"user_id": user_id, "username": user.username}),
         )
-        await self._notify_security(PASSWORD_RESET, username=user.username, email=user.email)
+        await self._notify_security(PASSWORD_RESET, username=user.username, email=user.notify_email)
         return temp
 
     async def set_channel_scope(
@@ -3054,7 +3204,7 @@ class AuthService:
         return admins == {user_id}
 
     async def has_notifiable_admin(self) -> bool:
-        """True iff at least one ENABLED administrator has an email address on file.
+        """True iff at least one ENABLED administrator carries a NOTIFICATION address.
 
         BACKLOG #1020. The PHI startup gate computes notification readiness from the SMTP transport
         alone (``notify_security_events`` + ``email_smtp_host`` + ``email_from``), which answers
@@ -3069,6 +3219,12 @@ class AuthService:
         privileged account has the identical hole. Keying on the bootstrap user alone would close
         the instance this was found on and leave the class open.
 
+        **Reads ``notify_email``, not ``email`` (BACKLOG #1139).** Those are two columns now: ``email``
+        is the profile address and, on a directory account, a mirror the next AD login overwrites,
+        while ``notify_email`` is where the notice is actually addressed. Asking about ``email`` would
+        be the instrument answering the adjacent question (SDS-3.8) -- an administrator whose mirror
+        the directory had just repointed would read as notifiable on an address no notice uses.
+
         Enumerates as :meth:`is_last_enabled_admin` and :meth:`_other_enabled_admin_exists` do --
         same store calls, same disabled-skip, same role test. **That agreement is a convention, not
         a mechanism, and this docstring must not claim otherwise:** these are now THREE independent
@@ -3078,7 +3234,7 @@ class AuthService:
         here, because it would rewrite two guards this change has no business touching.
         """
         for user in await self._store.list_users():
-            if user.disabled or not user.email:
+            if user.disabled or not user.notify_email:
                 continue
             if Role.ADMINISTRATOR.value in await self._store.get_user_role_ids(user.id):
                 return True

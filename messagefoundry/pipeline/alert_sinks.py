@@ -482,14 +482,13 @@ def send_plain_email(
             # NOT smtp.login(): it tries CRAM-MD5 FIRST, an HMAC over MD5 (BACKLOG #1171,
             # ASVS 11.4.1). The refusal above already guarantees use_tls here, so
             # channel_encrypted is not merely asserted -- it is the same value that gate read.
-            # escape_permitted=False: this cell's cleartext-credential refusal has no escape,
-            # matching the two connectors rather than introducing a third posture.
+            # The helper's own cleartext-AUTH refusal is absolute, matching that gate: this cell
+            # has no escape, and neither do the two connectors.
             smtp_login_approved(
                 smtp,
                 username,
                 password or "",
                 channel_encrypted=use_tls,
-                escape_permitted=False,
                 cell="alerts SMTP transport",
             )
         smtp.send_message(msg)

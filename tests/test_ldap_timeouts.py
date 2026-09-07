@@ -42,7 +42,7 @@ from typing import Any
 
 import pytest
 
-from messagefoundry.auth.ldap import LdapAuthenticator
+from messagefoundry.auth.ldap import AdPrincipal, LdapAuthenticator
 from messagefoundry.config.settings import AuthSettings
 
 _CONNECT_TIMEOUT = 7.5  # deliberately not the default, so a hardcoded literal cannot pass
@@ -92,9 +92,17 @@ class _Recorder:
     def __init__(self) -> None:
         self.servers: list[dict[str, Any]] = []
         self.connections: list[dict[str, Any]] = []
+        # One entry per bind/unbind ROUND TRIP (see the #1140 section below for why constructions
+        # are not enough), each holding the DN it was issued as — which is what makes the "never
+        # aim the decoy at a real principal" assertion expressible at all.
+        self.binds: list[str | None] = []
+        self.unbinds: list[str | None] = []
 
 
-def _install_fakes(monkeypatch: pytest.MonkeyPatch) -> _Recorder:
+def _install_fakes(monkeypatch: pytest.MonkeyPatch, *, bind_ok: bool = True) -> _Recorder:
+    """Install recording ``ldap3`` doubles. ``bind_ok=False`` makes every EXPLICIT bind fail, which
+    is how the valid-user-wrong-password branch is driven (the service-account connection is built
+    with ``auto_bind=True``, which these doubles do not honour, so it is never an explicit bind)."""
     import ldap3
 
     rec = _Recorder()
@@ -107,6 +115,7 @@ def _install_fakes(monkeypatch: pytest.MonkeyPatch) -> _Recorder:
         def __init__(self, server: Any = None, **kwargs: Any) -> None:
             rec.connections.append({"server": server, **kwargs})
             self.entries: list[_FakeEntry] = []
+            self._bind_dn: str | None = kwargs.get("user")
 
         def __enter__(self) -> FakeConnection:
             return self
@@ -139,10 +148,11 @@ def _install_fakes(monkeypatch: pytest.MonkeyPatch) -> _Recorder:
             return True
 
         def bind(self) -> bool:
-            return True
+            rec.binds.append(self._bind_dn)
+            return bind_ok
 
         def unbind(self) -> None:
-            return None
+            rec.unbinds.append(self._bind_dn)
 
     monkeypatch.setattr(ldap3, "Server", FakeServer)
     monkeypatch.setattr(ldap3, "Connection", FakeConnection)
@@ -235,34 +245,6 @@ def _shape_search(monkeypatch: pytest.MonkeyPatch, *, uac: str | None) -> None:
     monkeypatch.setattr(ldap3, "Connection", Shaped)
 
 
-@pytest.mark.parametrize(
-    ("uac", "why"),
-    [(None, "no such principal"), ("514", "present but ACCOUNTDISABLE (512|0x2)")],
-)
-def test_rejected_principal_costs_the_same_ldap_work_as_an_accepted_one(
-    monkeypatch: pytest.MonkeyPatch, uac: str | None, why: str
-) -> None:
-    """Both rejection branches must build the SAME Server+Connection pair the success path builds.
-
-    Before #1140 the absent/disabled branch returned before the password-verifying bind, so one case
-    cost a Server build, a TCP connect and a bind round trip that the other did not -- a username
-    oracle behind an identical response. The success-path counts are pinned one test above at 2/2,
-    which is what makes 2/2 here an EQUALITY claim rather than a bare number.
-    """
-    rec = _install_fakes(monkeypatch)
-    _shape_search(monkeypatch, uac=uac)
-
-    principal = LdapAuthenticator(_ad_settings()).authenticate("ghost", "synthetic-user-pw")
-
-    assert principal is None, f"{why} must not authenticate"
-    assert len(rec.servers) == 2, f"{why}: expected 2 Server builds, got {len(rec.servers)}"
-    assert len(rec.connections) == 2, (
-        f"{why}: expected 2 Connection builds, got {len(rec.connections)} -- the equalizing bind "
-        "did not run, so this branch is cheaper than the accepted one and leaks existence"
-    )
-    _assert_all_finite(rec)  # the equalizing connection is not exempt from the timeout rule
-
-
 def test_equalizing_the_bind_did_not_move_the_disabled_check_off_the_kerberos_path(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -276,6 +258,113 @@ def test_equalizing_the_bind_did_not_move_the_disabled_check_off_the_kerberos_pa
     _shape_search(monkeypatch, uac="514")  # present, ACCOUNTDISABLE set
 
     assert LdapAuthenticator(_ad_settings()).resolve_principal("ghost") is None
+
+
+# --- #1140, the round trip itself: counting CONSTRUCTIONS cannot see a decoy that never binds ----
+#
+# The tests above pin how many ldap3 objects the ACCEPTED path builds. Pinning the same numbers for
+# the rejection branches was the original #1140 guard, and it was blind to the failure that item
+# names as its own trap: "a decoy that constructs a connection object and never binds -- the round
+# trip is the cost". Measured on the shipped code by deleting `conn.bind()` from `_equalizing_bind`:
+# every test in this file stayed GREEN, because a built-and-unbound connection still counts as one
+# construction. The parity claim was resting on a guard that could not see it being withdrawn.
+#
+# What follows replaces that guard, and asserts the round trips rather than the allocations.
+
+
+def _drive(
+    *, uac: str | None, bind_ok: bool, username: str = "ghost"
+) -> tuple[_Recorder, AdPrincipal | None]:
+    """Run one login branch against fresh doubles; return what the directory was asked to do, and
+    the outcome. Each branch gets its own ``MonkeyPatch`` context so one test can drive several and
+    compare them to EACH OTHER rather than to a number repeated once per branch."""
+    with pytest.MonkeyPatch.context() as mp:
+        rec = _install_fakes(mp, bind_ok=bind_ok)
+        _shape_search(mp, uac=uac)
+        principal = LdapAuthenticator(_ad_settings()).authenticate(username, "synthetic-user-pw")
+    return rec, principal
+
+
+def test_no_login_can_be_told_from_another_by_the_directory_work_it_costs() -> None:
+    """ASVS 6.3.8 on the AD leg: every outcome must cost the same connects, binds and releases.
+
+    Three failures share one response, so any of these counts differing between them is a username
+    oracle that the sign-in limiter rate-bounds and never removes. The accepted branch is driven as
+    the CONTROL and must match: successes are deliberately not padded (a valid credential already
+    tells the attacker the account exists), but a success must not be CHEAPER than a failure either,
+    which would leak in the other direction. Matching the control is also what makes these numbers
+    an equality claim rather than four pinned constants.
+
+    ``binds`` is the assertion construction counts could not make -- a connection built and never
+    bound costs no network round trip. ``unbinds`` is its resource-release twin: a rejection path
+    that skipped the release would leak a connection per attempt, under exactly the flood of
+    nonexistent usernames this control exists to blunt (ASVS 13.1.3).
+    """
+    branches: list[tuple[str, str | None, bool]] = [
+        ("no such principal", None, True),
+        ("present but ACCOUNTDISABLE (512|0x2)", "514", True),
+        ("present and enabled, wrong password", "512", False),
+        ("present and enabled, correct password (the CONTROL)", "512", True),
+    ]
+    measured: dict[str, tuple[int, int, int, int]] = {}
+    for why, uac, bind_ok in branches:
+        rec, principal = _drive(uac=uac, bind_ok=bind_ok)
+        assert (principal is not None) is (uac == "512" and bind_ok), (
+            f"{why}: the branch did not reach the outcome it names, so the counts below measure "
+            "some other code path"
+        )
+        _assert_all_finite(rec)  # the equalizing connection is not exempt from the timeout rule
+        measured[why] = (len(rec.servers), len(rec.connections), len(rec.binds), len(rec.unbinds))
+
+    assert len(set(measured.values())) == 1, (
+        "the login branches do not cost the same directory work, so a failed challenge tells an "
+        "attacker which usernames exist -- (servers, connections, binds, unbinds) per branch: "
+        f"{measured}"
+    )
+    # The equality above is satisfied by four identical ZEROES, which would mean the doubles were
+    # never driven. Only the bind/release pair is pinned here: the construction counts are already
+    # owned by test_authenticate_builds_only_finitely_timed_ldap_objects, and a second copy of that
+    # number is a second place to update.
+    _, _, binds, unbinds = next(iter(measured.values()))
+    assert (binds, unbinds) == (1, 1), (
+        f"expected every branch to issue exactly one bind and release it once; got {measured}"
+    )
+
+
+def test_the_equalizing_bind_is_never_aimed_at_a_principal_the_caller_named() -> None:
+    """THE INVERSION GUARD. The decoy must bind as a fixed DN of the engine's own choosing.
+
+    #1140's live trap: a decoy aimed at a REAL principal sends failed binds at that account, so
+    under the site's own lockout policy the account locks. After that the decoy branch answers
+    instantly, the oracle INVERTS, and nothing in the engine can detect it -- the control has become
+    the attack. Deriving the decoy DN from the attempted username is the natural-looking change that
+    would do it ("bind as what they typed"), and it would hand an attacker the aim.
+
+    There is no lab to measure a controller's real lockout behaviour against (owner ruling
+    2026-08-20), which is exactly why this is asserted structurally instead: the engine must never
+    let attacker-supplied input choose who gets the failed binds.
+    """
+    a, _ = _drive(uac=None, bind_ok=True, username="victim-a")
+    b, _ = _drive(uac=None, bind_ok=True, username="victim-b")
+
+    assert a.binds == b.binds, (
+        f"the decoy bind DN moved with the attempted username ({a.binds} vs {b.binds}) -- an "
+        "attacker can aim the engine's failed binds at any account and lock it out"
+    )
+    (dn,) = a.binds
+    assert dn is not None
+    assert "victim-a" not in dn and "victim-b" not in dn, (
+        f"the decoy bind DN {dn!r} carries caller-supplied text"
+    )
+
+    # The other way to aim it at a real principal: reuse the DN the directory just returned. On the
+    # disabled branch the search DOES yield one, so this branch is where that mistake is reachable.
+    disabled, _ = _drive(uac="514", bind_ok=True)
+    (disabled_dn,) = disabled.binds
+    assert disabled_dn == dn, (
+        f"the disabled branch bound as {disabled_dn!r} rather than the fixed decoy {dn!r} -- it is "
+        "sending failed binds at the real, findable account it just refused"
+    )
 
 
 # --- static guard: no construction site can escape the runtime tests -----------------------------
@@ -453,29 +542,17 @@ def test_a_rejected_password_still_unbinds_the_user_connection(
     spray — left the LDAP connection to be reclaimed by GC, while the doc said "the user bind is
     explicitly unbound".
     """
-    import ldap3
+    # ``bind_ok=False`` fails the USER bind only: the service-account connection is built with
+    # auto_bind=True, which these doubles do not honour, so it never takes the explicit-bind path.
+    rec = _install_fakes(monkeypatch, bind_ok=False)
 
-    rec = _install_fakes(monkeypatch)
-    unbound: list[int] = []
-    real_connection = ldap3.Connection
-
-    class RejectingConnection(real_connection):  # type: ignore[misc, valid-type]
-        """The SECOND connection (the user bind) refuses; the first (service) still binds."""
-
-        def bind(self) -> bool:
-            return len(rec.connections) < 2
-
-        def unbind(self) -> None:
-            unbound.append(id(self))
-
-    monkeypatch.setattr(ldap3, "Connection", RejectingConnection)
     assert LdapAuthenticator(_ad_settings()).authenticate("alice", "wrong-password") is None, (
         "the fake user bind returned False, so authentication must fail"
     )
     assert len(rec.connections) == 2, (
         f"expected a service bind then a user bind; recorded {len(rec.connections)}"
     )
-    assert unbound, (
+    assert len(rec.unbinds) == 1, (
         "the user connection was NOT unbound on the rejected-password path — the release procedure "
         "documented in docs/CONNECTIONS.md Table B does not run where it matters most (ASVS 13.1.3)"
     )

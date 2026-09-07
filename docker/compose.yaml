@@ -131,7 +131,9 @@ services:
     stop_grace_period: 30s
 
     restart: unless-stopped
-    # The image HEALTHCHECK already probes https://127.0.0.1:8443/health (-k) then http://...:8765/health.
+    # The image HEALTHCHECK is a SINGLE https arm, `https://127.0.0.1:${MEFOR_API_PORT}/health` with -k
+    # (BACKLOG #1179). MEFOR_API_PORT is 8443 here, so it probes 8443. There is no cleartext fallback:
+    # a container whose TLS is broken now reports unhealthy instead of downgrading to http.
 
   # --- Multi-node-ready local HA backend (OPT-IN; profile "ha") ------------------------------------
   # A local Postgres + a PAIR of clustered engines so you can exercise the ACTIVE-PASSIVE HA shape

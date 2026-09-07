@@ -1031,6 +1031,83 @@ def test_ci_bandit_scans_the_repo_not_an_allow_list() -> None:
     )
 
 
+_BANDIT_REPO = "PyCQA/bandit"
+
+
+def _bandit_repo_rev() -> str:
+    """The `rev:` pinning the bandit hook, found by URL the way `_ruff_repo` finds ruff's.
+
+    Asserts exactly one match for the same reason: two bandit entries lets this test pin one rev
+    while a different one actually runs.
+    """
+    matches = [r for r in _config()["repos"] if _BANDIT_REPO in str(r.get("repo", ""))]
+    assert len(matches) == 1, (
+        f"expected exactly one .pre-commit-config.yaml repo whose URL contains {_BANDIT_REPO!r}; "
+        f"found {[r.get('repo') for r in matches]!r}."
+    )
+    return str(matches[0]["rev"]).lstrip("v")
+
+
+def _ci_scanner_pin(package: str) -> str:
+    """The EXACT version `[dependency-groups] ci-scanners` pins for ``package``.
+
+    Parsed as TOML rather than regexed, for the reason `_pyproject_ruff_specifier` gives: the group
+    carries a long comment naming versions and findings, and a regex over the raw text would happily
+    mine a version out of that prose.
+
+    THE `==` IS ASSERTED HERE rather than borrowed from tests/test_ci_venv_pinning.py's
+    `EXACT_GROUP_PINS`. A floor would make the comparison below meaningless in a way that still looks
+    green: `uv export` writes a fully `==`-pinned lock from a `>=` spec just as readily, so nothing
+    downstream reveals the difference, and this assertion would then be holding the hook's rev
+    against a version nobody promised to install.
+    """
+    pyproject = tomllib.loads(_PYPROJECT.read_text(encoding="utf-8"))
+    group: list[str] = pyproject["dependency-groups"]["ci-scanners"]
+    pins = [r.specifier for r in (Requirement(entry) for entry in group) if r.name == package]
+    assert len(pins) == 1, (
+        f"expected exactly one {package} requirement in [dependency-groups] ci-scanners; found "
+        f"{[str(s) for s in pins]!r}. If it left the group this test goes with it, rather than "
+        "passing vacuously."
+    )
+    spec = str(pins[0])
+    assert spec.startswith("=="), (
+        f"ci-scanners pins {package} as {spec!r}, not an exact `==`. The comparison below would then "
+        "hold the hook's rev against a RANGE, so Dependabot's weekly uv PR could move the installed "
+        "version inside uv.lock with no pyproject diff to review, and this test would stay green "
+        "while the two halves diverged."
+    )
+    return spec.removeprefix("==")
+
+
+def test_bandit_hook_rev_matches_the_version_ci_installs() -> None:
+    """The bandit `rev:` and the ci-scanners pin must name ONE bandit.
+
+    SCOPE has been pinned by the two arms above since the hook and CI first drifted. VERSION was not,
+    and it is the same divergence one level down: `--skip B101,...` means different findings under
+    different bandit releases. The group's own comment records exactly that happening -- an unpinned
+    1.9.x upgrade changed `# nosec` parsing and broke a green branch -- so two halves that agree on
+    every skip and every exclude can still enforce different standards, with nothing saying so.
+
+    IT MATTERS MOST ON A COMMIT NOBODY GATED. BACKLOG #1395: git does not run pre-commit for a commit
+    created by the sequencer, so after a rebase the CI build is the only bandit that ever looked. A
+    developer whose commit passed locally has learned nothing about the version that will judge it.
+
+    `pre-commit autoupdate` is the likely author. .pre-commit-config.yaml already warns that a bare
+    run walks the RUFF rev past its cap; it walks this one too, and until now nothing objected.
+    """
+    hook_rev = _bandit_repo_rev()
+    installed = _ci_scanner_pin("bandit")
+    print(f"[lint-scope] bandit: hook rev {hook_rev}, ci-scanners pin {installed}")
+    assert hook_rev == installed, (
+        f"the bandit pre-commit hook pins {hook_rev} while [dependency-groups] ci-scanners installs "
+        f"{installed}, so the commit-time gate and the REQUIRED CI bandit job are different builds "
+        f"of the same scanner. Each can report a finding the other does not, and on a rebase-created "
+        f"commit only the CI one runs at all (BACKLOG #1395). Move the rev and the pin together, and "
+        f"re-export the lock -- `uv lock` then the export command in ci/locks/ci-scanners.lock's "
+        f"header, or DEP-1 goes red."
+    )
+
+
 def _ci_command(run: str, program: str) -> str:
     """The single-line form of the `program ...` command inside a multi-line CI step body.
 

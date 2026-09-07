@@ -12,11 +12,33 @@ name: CLA Assistant
 # See .github/required-contexts.txt.
 
 on:
-  # BACKLOG #340 step 1. INERT UNTIL A MERGE QUEUE EXISTS: with no queue configured GitHub never
-  # emits merge_group, so this workflow behaves identically today. It is added FIRST and separately
-  # because the failure mode of the reverse order is total -- enable a queue while a required
-  # context's workflow has no merge_group trigger and that check never reports in the queue, so
-  # NOTHING MERGES.
+  # BACKLOG #340 step 1. THE QUEUE IS LIVE, SO THIS TRIGGER IS LOAD-BEARING -- DO NOT REMOVE IT.
+  # `cla` is a REQUIRED context, and branch protection evaluates required contexts on the
+  # MERGE-GROUP commit, so removing this trigger means `cla` never reports in the queue and NOTHING
+  # MERGES. That is not hypothetical: codeql.yml's header records PR 619 sitting AWAITING_CHECKS on
+  # the queue's first entry with its CodeQL contexts simply absent.
+  #
+  # THIS JOB'S GREEN MEANS TWO DIFFERENT THINGS UNDER ONE CONTEXT NAME, AND THE NAME CANNOT SHOW
+  # THE DIFFERENCE. The `CLA Assistant` step below is gated to the comment triggers and to
+  # `pull_request_target`, so on a merge_group event it is SKIPPED and the job still reports `cla`
+  # success. Measured 2026-09-03 on PR 754, a paired run on one change: run 33796353619
+  # (pull_request_target) RAN the step, run 33797809984 (merge_group) SKIPPED it, and both jobs
+  # were green. That is BACKLOG #340's option (i), whose own 2026-08-14 amendment warns it
+  # manufactures a permanent green-that-means-not-applicable on the merge path -- the silent-control
+  # decay ADR 0158 names.
+  #
+  # WHETHER THAT QUEUE-TIME GREEN IS MERELY DECORATIVE IS UNESTABLISHED. DO NOT READ IT EITHER WAY.
+  # PR 754 did carry a green PR-time `cla` before it was queued (check-run success 19:25:55Z, the
+  # only `cla` among 41 check-runs on head 1e9f1cb3), which is consistent with the PR-time check
+  # being the one that does the work. But nobody has established that GitHub REQUIRES that PR-time
+  # green before an entry may join the queue, and no negative case was manufactured to find out. It
+  # is recorded as open on BACKLOG #340. Signing enforcement is NOT weakened by anything written
+  # here; it is also not proven by it.
+  #
+  # THIS COMMENT USED TO SAY "INERT UNTIL A MERGE QUEUE EXISTS ... behaves identically today".
+  # That was true when the trigger landed on 2026-08-26 and became false once a queue was
+  # configured; corrected 2026-09-03. BACKLOG #340 carries the measurements and STAYS OPEN -- a
+  # live queue is not that item being finished, and who enabled the queue is recorded nowhere.
   merge_group:
   issue_comment:
     types: [created]

@@ -2,13 +2,13 @@
 # Copyright (C) 2026 MessageFoundry Organization and contributors
 """Structural AND behavioural regression tests for the Dependabot auto-merge guardrails (SEC-007).
 
-Most of these assert the YAML wiring of ``.github/workflows/dependabot-auto-merge.yml``; the last
-three go further and **execute the shipped ``run:`` bodies under ``bash -e``** — the shell GitHub
-Actions applies by default on Linux — because the guardrails are shell logic and "the YAML names a
-step" is a much weaker claim than "the step holds what it must hold". That is possible only because
-both new steps take every input through ``env:`` and interpolate
-nothing — asserted by ``test_new_steps_take_every_input_through_env_not_interpolation``, which is a
-precondition for the behavioural tests as much as it is zizmor template-injection parity.
+Most of these assert the YAML wiring of ``.github/workflows/dependabot-auto-merge.yml``; the
+behavioural ones go further and **execute the shipped ``run:`` bodies under ``bash -e``** — the shell
+GitHub Actions applies by default on Linux — because the guardrails are shell logic and "the YAML
+names a step" is a much weaker claim than "the step holds what it must hold". That is possible only
+because both new steps take every input through ``env:`` and interpolate nothing — asserted by
+``test_new_steps_take_every_input_through_env_not_interpolation``, which is a precondition for the
+behavioural tests as much as it is zizmor template-injection parity.
 
 The guardrail numbers below are DEPENDENCY-POSTURE-REVIEW.md's, carried with two corrections that
 document does not yet make — do not read them as claims about its text:
@@ -628,18 +628,108 @@ def test_the_advisory_guard_fails_closed_when_the_api_errors(
     )
 
 
+def _curl_journal(tmp_path: Path) -> Path:
+    """Where the curl stub records THAT IT RAN, and with what arguments (BACKLOG #1312).
+
+    Deliberately OUTSIDE the stub directory. ``_assert_stubs_win`` probes ``command -v`` for every
+    file it finds in the directory it is handed, so a journal sitting beside the stub would be asked
+    to resolve as a command, come back ``MISSING-curl.calls``, and be reported as a bypass.
+    """
+    return tmp_path / "curl.calls"
+
+
 def _curl_stub(tmp_path: Path, payload: str | None) -> Path:
-    """A ``curl`` on PATH that ignores its arguments. ``payload=None`` makes it fail like a network
-    or HTTP error would (``--fail`` exits non-zero), which must route to manual review."""
+    """A ``curl`` on PATH that ignores its arguments and RECORDS THAT IT WAS ASKED.
+
+    ``payload=None`` makes it fail like a network or HTTP error would (``--fail`` exits non-zero),
+    which must route to manual review.
+
+    **The journal line is BACKLOG #1312's fix.** Prepending this directory to PATH is not the same
+    as the step body consulting it, and when it does not, the body reaches pypi.org -- where the
+    pinned fixture package genuinely IS old, so the aged row gets back the answer the fixture wanted
+    and its assertion passes having measured the package index. The stub therefore writes its own
+    argv where the caller can require it, so a verdict can be refused unless this record says the
+    fixture is where the answer came from.
+    """
     stub_dir = tmp_path / "stub"
     stub_dir.mkdir()
     stub = stub_dir / "curl"
-    if payload is None:
-        stub.write_text("#!/usr/bin/env bash\nexit 1\n", encoding="utf-8")
-    else:
-        stub.write_text(f"#!/usr/bin/env bash\ncat <<'JSON'\n{payload}\nJSON\n", encoding="utf-8")
+    # The journal write comes FIRST in both arms, so the failing arm still proves it was consulted.
+    record = "printf '%s\\n' \"$*\" >> '" + _curl_journal(tmp_path).as_posix() + "'\n"
+    answer = "exit 1\n" if payload is None else f"cat <<'JSON'\n{payload}\nJSON\n"
+    stub.write_text("#!/usr/bin/env bash\n" + record + answer, encoding="utf-8")
     stub.chmod(0o755)
     return stub_dir
+
+
+def _assert_the_fixture_answered(tmp_path: Path, run: StepRun, url_fragment: str) -> None:
+    """The stub RAN, and ran for the package the fixture names (BACKLOG #1312).
+
+    Without this the aged row is satisfied by a step that never opened the fixture at all: it emits
+    ``age_ok=true`` off pypi.org, because the pinned package really is old. That is a fact about the
+    package index and not about the guardrail, and **an assertion that cannot fail for the reason it
+    names is not a control.**
+
+    Refusing a verdict is the point. A test that renders no verdict when its fixture was bypassed is
+    strictly better than one that renders the right verdict for the wrong reason, because the first
+    gets investigated.
+    """
+    journal = _curl_journal(tmp_path)
+    calls = journal.read_text(encoding="utf-8").splitlines() if journal.exists() else []
+    assert calls, (
+        "THE CURL STUB WAS NEVER INVOKED, so whatever answered this step is not the fixture -- on a "
+        f"runner, that is live pypi.org. Nothing was recorded at {journal}. Do not read the age_ok "
+        f"assertion below as a statement about the guardrail.{_diagnostic(run)}"
+    )
+    assert any(url_fragment in line for line in calls), (
+        f"the stub ran but was never asked for {url_fragment!r}, so the answer the step used did "
+        f"not come from this fixture. Recorded calls: {calls}{_diagnostic(run)}"
+    )
+
+
+#: The step prints the age it computed twice over -- as a ``::notice::`` when the release passes the
+#: minimum and as a ``::warning::`` when it does not -- so one pattern covers both dated rows.
+_AGE_IN_STEP_OUTPUT = re.compile(r"was published (\d+)h ago|is (\d+)h old")
+
+
+def _fixture_age_hours(payload: str | None) -> int | None:
+    """The age the step must compute from ``payload``, or None when the fixture dates nothing.
+
+    Derived FROM the payload rather than passed in beside it, so the expected age and the fixture
+    cannot drift apart. ``min()`` mirrors the step's own ``sort | .[0]``.
+    """
+    if payload is None:
+        return None
+    stamps = re.findall(r'"upload_time_iso_8601"\s*:\s*"([^"]+)"', payload)
+    if not stamps:
+        return None
+    when = dt.datetime.strptime(min(stamps), "%Y-%m-%dT%H:%M:%S.%fZ").replace(tzinfo=dt.UTC)
+    return int((dt.datetime.now(dt.UTC) - when).total_seconds() // 3600)
+
+
+def _assert_the_age_is_the_fixtures(run: StepRun, payload: str | None) -> None:
+    """The age the step COMPUTED matches the fixture's own timestamp (BACKLOG #1312).
+
+    The second half of the same question, and the half no PATH probe can answer. ``command -v``
+    reports which binary the shell WOULD choose; this reports whose CLOCK the verdict actually came
+    off. A proxy, a cache, a wrapper, or anything else that answers in the stub's place is caught
+    here even when resolution looks correct.
+    """
+    expected = _fixture_age_hours(payload)
+    if expected is None:
+        return
+    found = _AGE_IN_STEP_OUTPUT.search(run.stdout)
+    assert found is not None, (
+        f"the step printed no age at all, so there is nothing to hold against the fixture's "
+        f"{expected}h{_diagnostic(run)}"
+    )
+    reported = int(found.group(1) or found.group(2))
+    # An hour of slack, because `_iso()` stamps the payload at COLLECTION time while the step
+    # divides by 3600 at RUN time -- a slow or xdist-sharded run legitimately reads one hour older.
+    assert abs(reported - expected) <= 1, (
+        f"the step computed {reported}h but the fixture says {expected}h, so the timestamp it used "
+        f"came from somewhere else -- on a runner, live pypi.org{_diagnostic(run)}"
+    )
 
 
 def _iso(hours_ago: float) -> str:
@@ -658,7 +748,11 @@ def _iso(hours_ago: float) -> str:
     ("label", "payload", "expected"),
     [
         # The discriminating PASS — without this row the whole release-age suite would be satisfied
-        # by a step that denies unconditionally.
+        # by a step that denies unconditionally. It discriminates ONLY while the answer provably
+        # came from the fixture: `requests==2.32.3` is genuinely old on pypi.org, so a bypassed stub
+        # returns `true` here too and the row goes green about the package index (BACKLOG #1312).
+        # `_assert_the_fixture_answered` and `_assert_the_age_is_the_fixtures` below are what make
+        # the reason as testable as the verdict.
         ("aged 30 days", f'{{"urls":[{{"upload_time_iso_8601":"{_iso(24 * 30)}"}}]}}', "true"),
         ("published 1 hour ago", f'{{"urls":[{{"upload_time_iso_8601":"{_iso(1)}"}}]}}', "false"),
         ("no dateable artifact", '{"urls":[]}', "false"),
@@ -677,7 +771,14 @@ def _iso(hours_ago: float) -> str:
 def test_release_age_passes_an_aged_release_and_holds_a_fresh_one(
     label: str, payload: str | None, expected: str, tmp_path: Path
 ) -> None:
-    """The security-track happy path and its three failure modes, against a stubbed PyPI."""
+    """The security-track happy path and its three failure modes, against a stubbed PyPI.
+
+    **THE PROVENANCE CHECKS RUN BEFORE THE VERDICT, and the order is the fix (BACKLOG #1312).** A
+    row whose fixture was bypassed has nothing to say about the guardrail, so it must refuse to
+    report a boolean rather than report one that happens to be right. The `rc` check stays first
+    because an aborted body is a harness finding and would leave the journal empty for a reason that
+    has nothing to do with PATH.
+    """
     run = _run_step_body(
         "age",
         {
@@ -692,8 +793,86 @@ def test_release_age_passes_an_aged_release_and_holds_a_fresh_one(
         f"the age body aborted under `bash -e` (rc={run.rc}) — CI would fail the step"
         f"{_diagnostic(run)}"
     )
+    _assert_the_fixture_answered(tmp_path, run, "requests/2.32.3/json")
+    _assert_the_age_is_the_fixtures(run, payload)
     assert run.outputs.get("age_ok") == expected, (
         f"{label} -> age_ok={run.outputs.get('age_ok')!r}, expected {expected!r}{_diagnostic(run)}"
+    )
+
+
+@pytest.mark.skipif(
+    shutil.which("jq") is None,  # bash via require_bash (BACKLOG #1216)
+    reason="needs bash + jq, the same runner matrix as the release-age rows above",
+)
+def test_a_bypassed_curl_stub_is_refused_rather_than_passed_off_the_network(tmp_path: Path) -> None:
+    """THE NEGATIVE CONTROL FOR THE ROW ABOVE (BACKLOG #1312), and it reaches no network.
+
+    A guard nobody has watched fail is a guard nobody has tested. This drives the bypass on purpose
+    and requires both provenance checks to go red on a run the pre-existing assertion calls green --
+    which is the whole of #1312 made executable.
+
+    **The decoy answers the way pypi.org answers**: far older than the fixture's 30 days, because
+    ``requests==2.32.3`` really was published long ago. That is what makes the boolean useless here.
+    Both the honest fixture and the impostor produce ``age_ok=true``, so ``expected`` cannot separate
+    them and only the provenance can.
+
+    **PATH is passed through ``env`` rather than ``path_prepend``, on purpose.** ``path_prepend``
+    would run ``_assert_stubs_win``, and the state being reproduced is the one where that probe is
+    NOT what fails: it resolves in its own child process, and this asserts about the process that
+    actually rendered the verdict. This reproduces the OBSERVABLE -- a fixture that was not consulted
+    while the row still read ``true`` -- and makes no claim about which interpreter a runner picks,
+    which the item states cannot be measured off the runner.
+    """
+    aged = f'{{"urls":[{{"upload_time_iso_8601":"{_iso(24 * 30)}"}}]}}'
+    fixture_dir = _curl_stub(tmp_path, aged)
+
+    decoy_dir = tmp_path / "decoy"
+    decoy_dir.mkdir()
+    decoy = decoy_dir / "curl"
+    live_like = f'{{"urls":[{{"upload_time_iso_8601":"{_iso(24 * 460)}"}}]}}'
+    decoy.write_text(f"#!/usr/bin/env bash\ncat <<'JSON'\n{live_like}\nJSON\n", encoding="utf-8")
+    decoy.chmod(0o755)
+
+    bash = require_bash(tmp_path)
+    inherited = probe_env(Path(bash), dict(os.environ))["PATH"]
+    inputs = {
+        "SECURITY_TRACK": "true",
+        "DEP_ECOSYSTEM": "uv",
+        "DEPS_JSON": '[{"dependencyName":"requests","newVersion":"2.32.3"}]',
+    }
+    bypassed = _run_step_body(
+        "age",
+        {
+            **inputs,
+            "PATH": os.pathsep.join([decoy_dir.as_posix(), fixture_dir.as_posix(), inherited]),
+        },
+        tmp_path,
+    )
+
+    assert bypassed.rc == 0, (
+        f"the age body aborted under `bash -e` (rc={bypassed.rc}), so this run says nothing about "
+        f"provenance{_diagnostic(bypassed)}"
+    )
+    # THE FINDING, EXECUTABLE. The assertion that shipped before this item is fully satisfied by a
+    # run that never opened the fixture. This line is the hollow pass.
+    assert bypassed.outputs.get("age_ok") == "true", (
+        "the bypass must still emit the verdict the aged row expects, or this is not the state "
+        f"BACKLOG #1312 describes{_diagnostic(bypassed)}"
+    )
+    with pytest.raises(AssertionError, match="NEVER INVOKED"):
+        _assert_the_fixture_answered(tmp_path, bypassed, "requests/2.32.3/json")
+    with pytest.raises(AssertionError, match="came from somewhere else"):
+        _assert_the_age_is_the_fixtures(bypassed, aged)
+
+    # THE POSITIVE HALF, because a guard that raised for everything would satisfy the negative half
+    # on its own -- the same pairing `test_the_stub_self_certification_fires_when_a_stub_loses`
+    # makes. Same fixture, same journal, decoy gone.
+    honest = _run_step_body("age", inputs, tmp_path, path_prepend=fixture_dir)
+    assert honest.rc == 0, f"the age body aborted (rc={honest.rc}){_diagnostic(honest)}"
+    _assert_the_fixture_answered(tmp_path, honest, "requests/2.32.3/json")
+    _assert_the_age_is_the_fixtures(honest, aged)
+    assert honest.outputs.get("age_ok") == "true", (
+        f"the aged fixture must still pass when it IS consulted{_diagnostic(honest)}"
     )
 
 

@@ -114,6 +114,16 @@ Frequently forgotten in discussions of "the gate", but it is the same problem cl
   *subject* declares `BACKLOG #N` with a code-touching diff must hold a claim on N **for this worktree**.
   Motivated by a recorded incident: three sessions independently fixed one npm advisory; two PRs were
   closed as duplicates and the one that merged had not tested the failure mode the others found.
+- **One registry can serve two repositories, and before BACKLOG #1346 it could not.** Set
+  `git config mefor.claimsRoot <path>` in the repository that does *not* host the registry — the
+  separate `MessageFoundry-vault` clone is the case it was built for. Both halves then resolve from the
+  repository the claim is **for**, never from the tree a script happens to live in, so `claim.ps1` and
+  `claim_check.py` cannot disagree about where to look. Take a claim in another tree's name with
+  `claim.ps1 -Take <key> -AsWorktree <that-tree>`. Unset — this repository's own state — nothing
+  changes. `install-git-hooks.ps1 -Status` prints which claims directory the gate actually reads;
+  an unresolvable pointer **fails closed** rather than falling back to a local registry nothing writes,
+  because that fallback would make a misconfigured pointer present as an honestly unclaimed item. The
+  reasoning is stated once, in those two scripts.
 - **[`scripts/coord/alloc.ps1`](../scripts/coord/alloc.ps1)** + **[`ledger_check.py`](../scripts/hooks/ledger_check.py)**
   — the same test-and-set for ADR/BACKLOG *numbers*. See [LEDGER-GATE.md](LEDGER-GATE.md).
 

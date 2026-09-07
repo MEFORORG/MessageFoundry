@@ -222,6 +222,75 @@ explicit `alloc.ps1 -Reassign` (honest, but it puts a hole in the non-transferab
 on), and letting a missing owner fall through to the CI carve-out (narrowest, but it fails **open** once
 per number, so "missing" would have to be unforgeable).
 
+## Recovering a number the gate has refused (BACKLOG #1414)
+
+**A refusal is almost never a lost number, and the old refusal text said otherwise by omission.** It
+named `alloc.ps1` and nothing else. `alloc.ps1` issues a **new** number, so a seat that hit a
+*correct* refusal was steered into spending a second number and abandoning the first — and claims are
+never released, so that hole is permanent. **Measured on the maintainer clone, 2026-09-03: 19 titles
+hold more than one number**, including [#1297](#1297)/[#1298](#1298), backlog 1422/1423 and 1425/1426. The
+refusal text now names the recorded worktree and branch and lists the three recoveries below.
+
+*(Those last two pairs are written without the `#` sigil on purpose: the numbers are allocated, but
+their items are still in an unmerged pull request, so a live cross-reference would dangle today.)*
+
+**Read the state first, then pick the row.** `scripts/coord/alloc_strand_sweep.py` is read-only and
+prints, for every allocation, which worktree can still commit it:
+
+```bash
+python scripts/coord/alloc_strand_sweep.py --detail       # every unlanded claim, and where to commit it
+python scripts/coord/alloc_strand_sweep.py --titles       # numbers already spent twice on one title
+python scripts/coord/alloc_strand_sweep.py --skip-written # same census without the slow ref scan
+```
+
+| what the sweep says | what to do |
+|---|---|
+| `aligned`, `drifted-branch-free`, `drifted-branch-held` | **Commit from the recorded worktree.** The path key ignores which branch that tree is standing on. |
+| `orphan-branch-held` | Commit from the worktree already holding the recorded branch. |
+| `orphan-branch-free` | `git checkout` the recorded branch anywhere, and commit there. |
+| `orphan-branch-absent` | **Recreate a worktree at the recorded path** (the ruling above), then commit. |
+
+**The work is on a branch the entitled worktree cannot check out.** This is #1414's own worked
+example, and git genuinely refuses: `fatal: '<branch>' is already used by worktree at '<path>'`. It
+refuses only the *checkout*, never a **new branch at the same commit**, so the entitled tree can reach
+the work under another name:
+
+```bash
+# in the RECORDED worktree, which is what owns() accepts
+git checkout -b <alias> <held-branch>     # allowed; the checkout of <held-branch> is not
+# ... add the ADR file or the '## N.' heading, then commit normally
+git push origin <alias>:<held-branch>     # fast-forwards the PR branch
+```
+
+**Measured end to end, including the push, which #1414 recorded as unverified.** In a throwaway repo:
+the checkout refused with exit 128, `checkout -b` succeeded, the real `ledger_check.py` **refused**
+from the branch-holding worktree and **passed** from the aliased entitled one, and the push updated
+the PR branch. `tests/test_coord_alloc_strand_sweep.py` pins every step, and pins the recreate ruling
+above — which had been carried as an owner ruling since 2026-08-21 with nothing ever executing it.
+
+**Allocating for another seat: use `-For`, do not allocate in your own tree.** A Console that
+allocates on a Builder's behalf records **its own** worktree, both keys then miss for the Builder, and
+the gate correctly refuses a commit nobody can make from the right place. That is not drift — the
+claim is born pointing at the wrong tree, which is the third limb #1414 does not name.
+
+```powershell
+pwsh -NoProfile -File scripts\coord\alloc.ps1 -Kind backlog -Title "<title>" -For <builder-worktree>
+```
+
+**`-For` is not the `-Reassign` this file declined, and the difference is the whole argument.** A
+transfer verb would let a seat take a number **another session is actively holding**, which is the
+collision the gate exists to prevent. `-For` sets the owner inside the same atomic `CreateNew` that
+**issues** the number — an instant when no session holds it and none can — and it never changes an
+existing claim's owner. The non-transferable rule is untouched. It **refuses** a path that is not a
+live worktree of this clone, because a typo would otherwise reproduce exactly the defect it prevents.
+
+**What the sweep cannot see, and why the number is a floor rather than a total.** It reads committed
+state, so **uncommitted** work is invisible — and #1414's instance A was precisely a patch the gate
+had stopped anyone committing. A claim in a **different clone** is invisible too, correctly: that
+clone has its own registry. And `--titles` both under-reports (a re-file whose wording changed does
+not pair) and over-reports (`#240`–`#247` pair because the allocator was simply run twice), so a pair
+is a **disputed number**, not a confirmed strand, until someone reads it.
+
 ## The ref store, and the cleanup of 2026-08-05
 
 This section exists because the ratchet warning above names refs a future session will go looking for and
