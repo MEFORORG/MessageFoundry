@@ -21,9 +21,11 @@ from messagefoundry.logging_setup import (
     _CREDENTIAL_QUERY_KEYS,
     ControlCharScrubFilter,
     CredentialQueryScrubFilter,
+    CredentialScrubFilter,
     JsonFormatter,
     RedactionFilter,
     SyslogForward,
+    _install_phi_filters,
     _make_formatter,
     configure_logging,
     configure_stderr_logging,
@@ -266,8 +268,15 @@ _RECORD_PREFIX_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z ")
 
 def _production_lines(record: logging.LogRecord) -> list[str]:
     """Render ``record`` the way a text sink does: the production filter chain, in the order
-    ``_install_phi_filters`` installs it, then the production text formatter."""
-    for scrub in (RedactionFilter(), CredentialQueryScrubFilter(), ControlCharScrubFilter()):
+    ``_install_phi_filters`` installs it, then the production text formatter.
+
+    The chain is BUILT by ``_install_phi_filters`` rather than listed here. Listing it meant this
+    helper silently ran a chain no handler carried the moment a fourth filter was installed
+    (BACKLOG #1478) -- and a stale chain here weakens every assertion below without failing."""
+    handler = logging.NullHandler()
+    _install_phi_filters(handler)
+    for scrub in handler.filters:
+        assert isinstance(scrub, logging.Filter)
         scrub.filter(record)
     return _make_formatter("text").format(record).split("\n")
 
@@ -800,6 +809,7 @@ def test_configure_stderr_logging_installs_the_filter_chain() -> None:
     assert [type(f) for f in handler.filters] == [
         RedactionFilter,
         CredentialQueryScrubFilter,
+        CredentialScrubFilter,  # BACKLOG #1478 -- the credential-label vocabulary
         ControlCharScrubFilter,
     ]
 

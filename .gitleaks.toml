@@ -22,6 +22,41 @@ regexes = [
   # Fake test-fixture lease key (ADR 0114 claim-proc live test, tests/test_adr0114_claim_proc_live.py):
   # a hardcoded literal string naming the test scenario, not a credential — trips generic-api-key on entropy.
   '''adr0114-fence-test''',
+  # --- BACKLOG #1478 -- WRITE-TIME log-filter credential fixtures ---------------------------------
+  # Nine SYNTHETIC needles invented for tests/test_logging_credential_scrub.py. Each is a value that
+  # test asserts does NOT survive the production log-handler filter chain, so each is published in
+  # test source by construction. They trip generic-api-key on ENTROPY, and the entropy is deliberate:
+  # every token carries a hyphen AND an underscore so no fixture can pass for the wrong reason.
+  #
+  # They share the shape of the #1183 block below and NONE of its values. That file covers the
+  # READ-time redactor (support/redact.py); this one covers the WRITE-time handler filters. Distinct
+  # sentinels keep each file's needles its own, so a reader can tell which surface a flagged value
+  # belongs to and neither block has to be edited when the other's fixtures move.
+  #
+  # EXACT LITERALS, never a family prefix -- the practice the #1183 block sets. A tidy `wt-.*` would
+  # also allowlist a REAL leaked key that happened to match the shape, leaving the scanner blind to
+  # the exact thing it exists to catch. ONLY THE NINE THAT ACTUALLY TRIP ARE LISTED: the file carries
+  # 22 sentinels and gitleaks flagged these nine on entropy, so allowlisting the other 13
+  # pre-emptively would widen the scanner's blind spot to buy nothing.
+  #
+  # `encryption_key=` on the store-open line; pattern _KEY_MATERIAL.
+  '''wt-Enc_Key-51''',
+  # `vault_token=`; pattern _BEARER, reached through _LABEL_PREFIX.
+  '''wt-V4ult_Tok-52''',
+  # `private_key=` on the signing-setup line; pattern _KEY_MATERIAL.
+  '''wt-Priv_Key-56''',
+  # `smart_private_key=` (ADR 0024), reached through _LABEL_PREFIX; pattern _KEY_MATERIAL.
+  '''wt-Sm4rt_Key-66''',
+  # `intake_api_key_next=` (ADR 0154 rotation partner); pattern _KEY_MATERIAL.
+  '''wt-N3xt_Key-65''',
+  # An ODBC connection string's PWD=; pattern _CREDENTIAL_KV.
+  '''wt-0dbc_Pass-60''',
+  # The inline password of a URL-shaped DSN; pattern _DSN_PASSWORD.
+  '''wt-D5n_Pass-61''',
+  # The quoted MEFOR_* echo resolve_env_settings emits on a cast failure; pattern _MEFOR_SECRET.
+  '''wt-C4st_Val-59''',
+  # The credential arriving through %s args, proving the filter reads the RENDERED message.
+  '''wt-L4zy_Arg-68''',
   # --- BACKLOG #1183 -- log-redaction secret-domain fixtures --------------------------------------
   # Nine SYNTHETIC needles invented for tests/test_log_redaction_secret_domain.py (plus one sibling in
   # tests/test_environments.py). Each is a value a redaction test asserts does NOT survive a log line,
