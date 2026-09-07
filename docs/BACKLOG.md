@@ -24205,6 +24205,145 @@ Vault `roles/BUILDER.md:213-217`, under the heading "Closing a ledger row makes 
 
 I read only `roles/` in the vault and ran no git history there, so I cannot date when any of these lines was written. Eleven of the fourteen playbooks were matched by the needle above but not read, so treat the population as **at least three files**, not a total. I did not check whether any workflow or CI job reads a playbook, and I confirmed no case in which a seat actually followed `BUILDER.md:216` and produced a red PR -- I measured the instruction and the gate, not an incident.
 
+## 1479. Scope the required gitleaks scan to the ref under test; today any pushed branch can red main and freeze the queue
+
+> 🚧 **Filed 2026-09-07 -- the code fix ships in this PR. THE GATE IS RED AS THIS IS WRITTEN, on TWO unmerged branches at once, so this is a live freeze and not a post-mortem.** Value **9/10** · Difficulty **2/10** · _quick win_. The `gitleaks (secret scan)` job ran with no `--log-opts`, so it walked every ref the `fetch-depth: 0` checkout had fetched. Branch protection reads its answer as a statement about the ref under test; the job was answering it about the whole repository. On 2026-09-06 an unmerged branch's synthetic fixture reddened `main` and the merge queue with it, freezing merging for over four hours and evicting five entries. Per `CLOSING_SEAT["code"]` the banner flip on merge is the LANDER's.
+> Verdict: build
+> Research: none
+> Closing-act: code
+
+**Cluster:** CI merge gates / availability. **Priority:** P1. **Verdict:** build.
+**Severity:** no deployment axis (sec. 0). Nothing here is engine behaviour, a shipped artifact, or PHI, and no deploying site would ever meet it. The cost is entirely to this repository's own ability to merge -- which is why it is P1 rather than P3.
+
+**Measured 2026-09-07** against `.github/workflows/security.yml` at `68693cfc2`, and against the pinned gitleaks 8.18.4 binary the job itself installs.
+
+### The configuration overshot the question the job's own name asks
+
+Three facts, all in the same job:
+
+| where | what |
+|---|---|
+| the checkout step | `fetch-depth: 0`, commented "full history so the scan also covers earlier commits, not just the tip" |
+| the scan step | `gitleaks detect --config .gitleaks.toml --redact --verbose --no-banner` -- no `--log-opts` |
+| gitleaks' default | with the flag unset it walks every ref |
+
+`fetch-depth: 0` fetches every branch and tag, so the unset default had every one of them to walk. The job therefore answered **"does ANY ref in this repository contain a secret"** while branch protection read the answer as **"does THIS ref contain a secret"**. The workflow comment states the narrower intent; nothing implemented it.
+
+**The commit counts are the instrument, not the argv.** In a repository whose `main` held 3 commits and whose unmerged side branch held 4 more, gitleaks 8.18.4 reported `7 commits scanned` with the flag unset and `3 commits scanned` with `--log-opts HEAD` -- exactly `git rev-list --count --all` and `git rev-list --count HEAD`. An attempt to capture the child `git` argv through a shim returned nothing (the binary invokes `git.exe`), so the walk is characterised by the set it reaches rather than by a command line nobody here has observed.
+
+### It has already fired, and not as a near miss
+
+A synthetic redaction fixture at commit `0b47402cd` -- present only on `origin/redact-domain-e1`, never an ancestor of `main` -- turned `main`'s required context red at 00:08Z on 2026-09-06, after three clean runs. Because `security.yml` also runs on `merge_group`, it reddened the queue: the merge-group runs for pr-953, pr-954 and pr-963 all failed on this job. Merging was frozen for over four hours and five entries were evicted.
+
+Re-derivable from any clone:
+
+```
+git branch -r --contains 0b47402cd                    # origin/redact-domain-e1 and a rescue mirror
+git merge-base --is-ancestor 0b47402cd origin/main    # false
+```
+
+### It has now fired twice, from two different branches, and is red as this is written
+
+The 2026-09-06 fixture was not a one-off. Read 2026-09-07 from the run log:
+
+| run | event | ref | failing job |
+|---|---|---|---|
+| 34117701056 | `schedule` | `main` | `gitleaks (secret scan)` |
+| 34128038803 | `pull_request` | `redact-domain-e1` | `gitleaks (secret scan)` |
+| 34127868996 | `pull_request` | `claude/1147-restore-heading` | `gitleaks (secret scan)` |
+
+Run 34117701056 reports **`leaks found: 20`, across TWO commits on TWO different unmerged branches**:
+
+| findings | commit | file | branch | ancestor of `main`? |
+|---|---|---|---|---|
+| 14 | `c456ee586` | `tests/test_logging_credential_scrub.py` | `origin/log-filter-domain-f1` | no |
+| 6 | `833b98096` | `tests/test_log_redaction_secret_domain.py` | `origin/redact-domain-e1` | no |
+
+(The two pull-request runs were read only for which job failed, not for their findings.)
+
+**The strongest evidence is that the tree does not have to change for the answer to change.** Main's
+commit `68693cfc2` carries THREE runs of this required context, on an identical tree:
+
+| started | conclusion | run |
+|---|---|---|
+| 2026-09-06T22:36:29Z | success | 101566686715 |
+| 2026-09-07T00:38:51Z | **failure** | 101582322125 |
+| 2026-09-07T11:39:01Z | **failure** | 101728268133 |
+
+Nothing in `main` moved between them. Only the set of fetched refs did. A gate whose verdict on a
+fixed tree depends on what other people have pushed is not measuring that tree.
+
+**AND THE ATTRIBUTED COMMIT MOVES TOO, which is what rules out the tempting workaround.** The same six
+findings were reported at `0b47402cd` on 2026-09-06 and at `833b98096` on 2026-09-07 -- the fixtures
+did not change; a branch update made the merge commit the attributed one. So a commit-pinned allowlist
+entry goes stale on the next push to any affected branch, and a *pattern* entry is a permanent hole in
+a required secret gate. Neither is a fix; both are a second defect.
+
+`claude/1147-restore-heading` is the one that shows the shape plainly: it is a **docs-only branch that
+restores a heading**, and it cannot merge because a secret-shaped fixture on a stranger's branch fails
+its secret scan. Of the 60 `security.yml` runs since 2026-09-06, 35 failed and 16 succeeded.
+
+**So this row does not describe a repaired outage. It describes one in progress.**
+
+### The class is worse than the outage
+
+**Anyone who can push a branch can red `main`'s required secret gate and stop all merging, with no pull request and no review.** No approval is involved, because no pull request is involved. That is an availability lever over the merge gate, and here it fired **by accident** -- nobody was testing whether it worked.
+
+### The fix, and what it costs
+
+`--log-opts HEAD` on the scan step. One literal, correct on all five of the workflow's triggers, and it keeps a `${{ }}` expression out of a `run:` block -- the template-injection shape zizmor exists to catch. An event-dependent range would need one, for no gain.
+
+**The cost, stated rather than sold as free: a branch nobody has opened a pull request for is no longer scanned.** That coverage is genuinely given up. It is not relocated, and this row should not be read as claiming otherwise.
+
+**There is already a workflow whose job is exactly that gap.** `.github/workflows/branch-leak-scan.yml`
+watches branch pushes with no pull request -- its own header says the `forbidden-content` gate misses
+that shape and that this is the backstop -- and it runs `scan_forbidden.py` only. Relocating secret
+detection there is the obvious follow-up. **It is not done here** and no number is allocated for it:
+that workflow is deliberately detection-and-not-a-gate, so what it should do on a hit is a separate
+decision from this scoping fix.
+
+**Coverage of the merge path is unchanged**, because the workflow's other arms already cover it:
+
+| trigger | what HEAD is | what is walked |
+|---|---|---|
+| `pull_request` | the merge ref | the base plus the pull request's own commits |
+| `merge_group` | the queue commit | everything the queue is about to merge |
+| `push: branches: [main]` | `main` | `main`'s full history |
+| `schedule` / `workflow_dispatch` | the default or dispatched ref | that ref's full history |
+
+So every path by which content can reach `main` is still walked in full. What is no longer walked is a branch that is not on any of those paths.
+
+**What scoping does NOT fix, said so nobody reads this row as more than it is.** HEAD's ancestry on a
+pull request includes all of `main`, so a secret that actually *merges* still reddens every pull
+request and every queue entry at once. The remedy for that is an allowlist entry or a history rewrite,
+never a per-pull-request workaround. Scoping removes the *unreviewed-branch* lever; it does not make
+the gate immune to its own history.
+
+### A coupling the fix creates, asserted because its failure is silent
+
+`--log-opts HEAD` walks HEAD's ancestors, which a shallow clone has not fetched. Before the scoping, losing `fetch-depth: 0` cost history depth on a scan that was over-broad anyway. Now it would quietly reduce a required secret gate to a single commit while it went on reporting success. `test_the_gitleaks_checkout_still_fetches_the_full_history_of_that_ref` holds that.
+
+### The controls, and the one that first passed for the wrong reason
+
+Four controls land in `tests/test_merge_gate_controls.py` and are registered in `tests/negative_controls.toml`. The suite does not install gitleaks, so the behavioural control exercises the mechanism the scanner delegates to: the commit set a `git log` walk reaches under the shipped `--log-opts`.
+
+Measured against a neutered `security.yml`, restored byte-identical after each arm:
+
+| arm | controls red |
+|---|---|
+| `--log-opts` removed (the pre-fix state) | 2 of 4 |
+| re-widened to `--log-opts "--all"` | 2 of 4 |
+| `fetch-depth` dropped to 1 | 1 of 4 |
+| scope pointed away from the ref under test | 1 of 4 |
+
+The detector control stayed green in all four, which is the asymmetry: it flags a widened scope without demanding the flag be absent.
+
+**The behavioural control's first version reddened for the wrong reason, and only the neutering run said so.** It verified the scope with `git rev-parse --verify`, which rejects every multi-revision and option-carrying value -- so under `--log-opts "--all"` it fired on that guard, *before* the needle assertions, which had therefore never been observed doing any work. A guard that pre-empts the control it guards, on exactly the shapes that control exists for, is the defect this file is full of. The precondition now asks only whether the scope produces a walk.
+
+### Not checked
+
+I did not read gitleaks' source, so "walks every ref when the flag is unset" rests on the commit counts above and not on the code. I did not test a fork pull request, where the checkout and the available refs differ. I did not check whether any other workflow in this repository scans with a whole-repository default; only `security.yml`'s secret job was examined.
+
 ## 1480. an append that absorbs the next item heading deletes an item with every ledger gate green -- compare the ranked table's rows against the parsed items
 > 🔢 **Filed 2026-09-07 (youthful-stonebraker-883561) -- the detector is measured and ships with a positive control on both sides; whether to BUILD it is a separate owner decision and is NOT part of this filing.** Value **5/10** · Difficulty **2/10** · _quick win_. Value 5 because this class deletes a whole item while every wired gate stays green: it has fired once, on `#1147`, and neither CI nor `pre-commit` reported anything. It is ledger integrity only, with no engine, PHI or deployment axis (sec. 0). Difficulty 2 for roughly fifteen lines that reuse `parse_items`, against a fixture frozen in history and a control measured in both states.
 >
@@ -24315,6 +24454,8 @@ New items append at the ledger tail, so concurrent filings are scheduled conflic
 
 1. Count parsed items before and after. It must rise by **exactly** the number of item headings added -- not roughly, and not "the file got longer". **Compute that expected number at merge time from the diffs of the pull requests that actually landed; never carry a remembered constant.** Count headings, not pull requests: three queued PRs added four items here, because one of them filed two. The error is not symmetric -- expect one too few and a clean merge merely raises a phantom, but expect one too few while exactly one heading is absorbed and **the count matches, the check passes, and the absorption ships**. An off-by-one blinds this check to precisely one absorbed item, which is the modal case: `642225f78` absorbed exactly one.
 2. Inspect the boundary line itself. `#1147` died as a *prefix* deletion, so the heading text survived glued to the previous paragraph and the line count barely moved. **Length is not the signal.**
+
+   **A missing blank line before the heading is NOT this defect, and believing it is buys a false control.** Measured: with the blank line, without it, and with the `## ` prefix deleted, `parse_items` returns both items in the first two cases and loses one only in the third. An ATX heading interrupts a paragraph without a blank line, in CommonMark and in this parser alike. Restoring the separator at a merge boundary is good hygiene and worth doing -- it is simply **not** what stops an absorption, so a resolver who adds it and moves on has checked nothing. Only the count in check 1 catches the real shape.
 3. Run the row-versus-item comparison in its loose form.
 
 ### Two traps that cost measurement time
