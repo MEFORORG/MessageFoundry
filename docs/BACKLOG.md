@@ -24456,7 +24456,7 @@ New items append at the ledger tail, so concurrent filings are scheduled conflic
 2. Inspect the boundary line itself. `#1147` died as a *prefix* deletion, so the heading text survived glued to the previous paragraph and the line count barely moved. **Length is not the signal.**
 
    **A missing blank line before the heading is NOT this defect, and believing it is buys a false control.** Measured: with the blank line, without it, and with the `## ` prefix deleted, `parse_items` returns both items in the first two cases and loses one only in the third. An ATX heading interrupts a paragraph without a blank line, in CommonMark and in this parser alike. Restoring the separator at a merge boundary is good hygiene and worth doing -- it is simply **not** what stops an absorption, so a resolver who adds it and moves on has checked nothing. Only the count in check 1 catches the real shape.
-3. Run the row-versus-item comparison in its loose form.
+3. Run the row-versus-item comparison in its bounded form, and **read it differentially: compare the merged tree's orphan set against `main`'s at that same moment, not against empty.** A pre-existing orphan is not yours. Measured 2026-09-07: this branch's own merge reported `[1147]`, which is the defect this item documents, still on `main` because its fix had not landed -- a first-time runner sees a non-empty result and reasonably suspects their own resolve. **Do not write the expected value down either.** `[1147]` stops being the baseline the moment that fix merges, exactly as the item counts went stale at 442, then 443, then 444 inside two hours. Compute both sides at merge time; the check is `merged_orphans - main_orphans`, and only that difference is yours.
 
 ### Two traps that cost measurement time
 
