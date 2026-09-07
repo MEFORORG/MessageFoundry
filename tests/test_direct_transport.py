@@ -35,7 +35,7 @@ from typing import Any
 import pytest
 from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
-from cryptography.hazmat.primitives.asymmetric import padding, rsa
+from cryptography.hazmat.primitives.asymmetric import ec, padding, rsa
 from cryptography.hazmat.primitives.serialization import pkcs7
 from cryptography.x509.oid import NameOID
 
@@ -498,6 +498,301 @@ def test_credentials_over_a_fully_verified_hop_still_construct(pki: dict[str, An
     # POSITIVE CONTROL: proves the new gate can be PASSED, so the refusal test above is not green
     # merely because DirectDestination rejects every credentialed construction.
     DirectDestination(_dest(pki, username="svc", password="pw"))
+
+
+# --- signature_padding: the ASVS 11.3.1 operator choice (BACKLOG #1168) ------------------------------
+#
+# Measured against the PINNED cryptography (50.0.1 in requirements.lock), not the interpreter that
+# happened to be on the builder's box, which reported 49.0.0. `add_signer` takes a keyword-only
+# `rsa_padding`; `PKCS7EnvelopeBuilder.add_recipient` takes none, so the ENVELOPE half is out of
+# reach of this setting and is asserted as such below rather than left to inference.
+
+#: DER encoding of the RSASSA-PSS algorithm OID 1.2.840.113549.1.1.10, as it appears in a SignerInfo.
+_RSASSA_PSS_OID_DER = bytes.fromhex("06092a864886f70d01010a")
+
+
+def _mint_ec_leaf(
+    common_name: str, ca_key: rsa.RSAPrivateKey, ca_cert: x509.Certificate
+) -> tuple[ec.EllipticCurvePrivateKey, x509.Certificate]:
+    """An EC (P-256) leaf issued by the RSA test CA — the key type that reaches an approved signature
+    with no padding parameter at all."""
+    key = ec.generate_private_key(ec.SECP256R1())
+    subject = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, common_name)])
+    now = datetime.datetime.now(datetime.UTC)
+    cert = (
+        x509.CertificateBuilder()
+        .subject_name(subject)
+        .issuer_name(ca_cert.subject)
+        .public_key(key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(now - datetime.timedelta(days=1))
+        .not_valid_after(now + datetime.timedelta(days=365))
+        .sign(ca_key, hashes.SHA256())
+    )
+    return key, cert
+
+
+def _ec_signer(pki: dict[str, Any], tmp_path: Path) -> dict[str, str]:
+    """Overrides swapping the RSA signer for an EC one. Only the SIGNER changes — the recipient cert
+    and trust anchor are untouched, so this isolates the key type."""
+    key, cert = _mint_ec_leaf("EC Sender Direct", pki["ca_key"], pki["ca_cert"])
+    cert_p = tmp_path / "ec_signer.crt"
+    key_p = tmp_path / "ec_signer.key"
+    _write_pem(cert_p, cert)
+    key_p.write_bytes(
+        key.private_bytes(
+            serialization.Encoding.PEM,
+            serialization.PrivateFormat.PKCS8,
+            serialization.NoEncryption(),
+        )
+    )
+    return {"signing_cert": str(cert_p), "signing_key": str(key_p)}
+
+
+def test_signature_padding_defaults_to_pkcs1v15(pki: dict[str, Any]) -> None:
+    # The default is deliberate and interoperability-driven, so pin it: a silent flip to PSS would
+    # break any HISP peer whose S/MIME stack verifies only PKCS#1 v1.5.
+    d = DirectDestination(_dest(pki))
+    assert d.signature_padding == "pkcs1v15"
+    assert d._rsa_padding is None  # None, not PKCS1v15() — the one branch EC keys also accept
+
+
+async def test_signature_padding_pss_changes_the_signerinfo_algorithm(
+    monkeypatch: pytest.MonkeyPatch, pki: dict[str, Any]
+) -> None:
+    """`signature_padding='pss'` really reaches the CMS SignerInfo, and the default really does not."""
+    body = _SYNTHETIC_HL7.encode("utf-8")
+
+    _install_fake(monkeypatch)
+    await DirectDestination(_dest(pki)).send(_SYNTHETIC_HL7)
+    [smtp_default] = _FakeSMTP.instances
+    signed_default = pkcs7.pkcs7_decrypt_der(
+        _sent_smime_bytes(smtp_default), pki["recip_cert"], pki["recip_key"], []
+    )
+
+    _install_fake(monkeypatch)
+    d = DirectDestination(_dest(pki, signature_padding="pss"))
+    assert d.signature_padding == "pss"
+    await d.send(_SYNTHETIC_HL7)
+    [smtp_pss] = _FakeSMTP.instances
+    signed_pss = pkcs7.pkcs7_decrypt_der(
+        _sent_smime_bytes(smtp_pss), pki["recip_cert"], pki["recip_key"], []
+    )
+
+    # The algorithm identifier moves, and the NEGATIVE half is what makes this a measurement rather
+    # than a presence check: the default must NOT carry the PSS OID.
+    assert _RSASSA_PSS_OID_DER in signed_pss
+    assert _RSASSA_PSS_OID_DER not in signed_default
+
+    # The discriminating control. PKCS#1 v1.5 is deterministic, so the exact signature the default
+    # produces is reproducible — and it must be ABSENT from the PSS blob. Without this, a change that
+    # wrote a PSS algorithm identifier while still signing PKCS#1 v1.5 would pass the OID assertions.
+    pkcs1_sig = pki["signer_key"].sign(body, padding.PKCS1v15(), hashes.SHA256())
+    assert pkcs1_sig in signed_default
+    assert pkcs1_sig not in signed_pss
+
+    # Both blobs still carry the signer cert and the exact synthetic body — PSS changed the padding
+    # and nothing else about the message.
+    assert body in signed_pss
+    assert any(c == pki["signer_cert"] for c in pkcs7.load_der_pkcs7_certificates(signed_pss))
+
+
+def test_signature_padding_rejects_an_unknown_value(pki: dict[str, Any]) -> None:
+    # Fail loud at construction (check/dry-run/start), never as a wire-time surprise.
+    with pytest.raises(ValueError, match="signature_padding"):
+        DirectDestination(_dest(pki, signature_padding="oaep"))
+
+
+def test_signature_padding_pss_is_refused_on_an_ec_key(pki: dict[str, Any], tmp_path: Path) -> None:
+    # cryptography raises `TypeError: Padding is only supported for RSA keys` from add_signer, which
+    # would abort every delivery at wire time. Refuse it at construction instead, with an error that
+    # says what to do.
+    with pytest.raises(ValueError, match="requires an RSA 'signing_key'"):
+        DirectDestination(_dest(pki, signature_padding="pss", **_ec_signer(pki, tmp_path)))
+
+
+async def test_ec_signing_key_avoids_pkcs1_padding_entirely(
+    monkeypatch: pytest.MonkeyPatch, pki: dict[str, Any], tmp_path: Path
+) -> None:
+    # POSITIVE CONTROL for the refusal above, and the documented escape from the interoperability
+    # dilemma: an EC signer needs no padding parameter, so it reaches an approved signature under the
+    # DEFAULT setting. Proves the refusal is about `pss` on EC, not about EC keys being unusable.
+    _install_fake(monkeypatch)
+    d = DirectDestination(_dest(pki, **_ec_signer(pki, tmp_path)))
+    assert d._rsa_padding is None
+    await d.send(_SYNTHETIC_HL7)
+    [smtp] = _FakeSMTP.instances
+    signed = pkcs7.pkcs7_decrypt_der(
+        _sent_smime_bytes(smtp), pki["recip_cert"], pki["recip_key"], []
+    )
+    assert _SYNTHETIC_HL7.encode("utf-8") in signed
+    assert _RSASSA_PSS_OID_DER not in signed  # ECDSA, so no RSA padding identifier at all
+
+
+def test_envelope_key_transport_is_out_of_reach_of_this_setting() -> None:
+    """The ENVELOPE half of ASVS 11.3.1 is a reasoned cannot-pass on the pinned library, and this
+    test is the instrument that would notice if a future bump changed that.
+
+    `PKCS7EnvelopeBuilder.add_recipient` exposes no padding parameter, so a Direct message's key
+    transport would be RSAES-PKCS1-v1_5 on a first deployment whatever `signature_padding` says.
+    If a later `cryptography` adds the parameter, this test fails and the finding must be re-read.
+    """
+    import inspect
+
+    params = inspect.signature(pkcs7.PKCS7EnvelopeBuilder.add_recipient).parameters
+    assert "rsa_padding" not in params
+    assert set(params) == {"self", "certificate"}
+
+
+# --- key-strength floor on all three S/MIME surfaces (ASVS 11.2.3, BACKLOG #1166) -------------------
+#
+# Measured before the floor existed: a full RSA-1024 set (signing key, recipient cert, trust anchor)
+# CONSTRUCTED without complaint, with an RSA-2048 set constructing in the same run as the positive
+# control -- so the loaders were live and simply never asked how big the modulus was.
+
+
+def _weak_pki(tmp_path: Path, bits: int = 1024) -> dict[str, Any]:
+    """A complete Direct PKI at `bits`, minted the same way as the `pki` fixture. Separate rather than
+    parameterized on the fixture so the default path in every other test stays at 2048.
+
+    **CodeQL FLAGS THE TWO 1024-BIT GENERATIONS BELOW AS "use of weak cryptographic key", AND IT IS
+    RIGHT ABOUT THE CODE AND WRONG ABOUT THE RISK.** These keys exist ONLY to be REFUSED: they are the
+    negative controls for the `_require_key_strength` floor added under BACKLOG #1166, and deleting
+    them to clear the alert would delete the only proof that the floor works, which is strictly worse
+    security than the alert describes. No key minted here is ever offered to a peer, written outside
+    `tmp_path`, or used to sign or encrypt anything -- every one is fed to a constructor that must
+    raise. The repository already carries five fixtures of exactly this shape for the same reason, in
+    `test_auth_oidc.py` and `test_outbound_signing.py`; those are unflagged only because the PR check
+    reports alerts on CHANGED lines, not because they differ.
+
+    Left unsuppressed deliberately. CodeQL is not a required context (verified 2026-09-06 against
+    branch protection, not against the checked-in mirror), so this costs no merge, and an inline
+    suppression directive whose effect nobody had measured would be a worse artifact than a comment
+    a reader can check.
+    """
+    ca_key = rsa.generate_private_key(public_exponent=65537, key_size=bits)
+    name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "Weak Direct CA")])
+    now = datetime.datetime.now(datetime.UTC)
+    ca_cert = (
+        x509.CertificateBuilder()
+        .subject_name(name)
+        .issuer_name(name)
+        .public_key(ca_key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(now - datetime.timedelta(days=1))
+        .not_valid_after(now + datetime.timedelta(days=3650))
+        .add_extension(x509.BasicConstraints(ca=True, path_length=None), critical=True)
+        .sign(ca_key, hashes.SHA256())
+    )
+
+    def leaf(cn: str) -> tuple[rsa.RSAPrivateKey, x509.Certificate]:
+        k = rsa.generate_private_key(public_exponent=65537, key_size=bits)
+        c = (
+            x509.CertificateBuilder()
+            .subject_name(x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, cn)]))
+            .issuer_name(ca_cert.subject)
+            .public_key(k.public_key())
+            .serial_number(x509.random_serial_number())
+            .not_valid_before(now - datetime.timedelta(days=1))
+            .not_valid_after(now + datetime.timedelta(days=365))
+            .sign(ca_key, hashes.SHA256())
+        )
+        return k, c
+
+    signer_key, signer_cert = leaf("Weak Sender")
+    recip_key, recip_cert = leaf("weak@hisp.example")
+    tag = f"weak{bits}"
+    paths = {
+        "signing_cert": tmp_path / f"{tag}_signer.crt",
+        "signing_key": tmp_path / f"{tag}_signer.key",
+        "recipient_cert": tmp_path / f"{tag}_recip.crt",
+        "trust_anchor": tmp_path / f"{tag}_ca.crt",
+    }
+    _write_pem(paths["signing_cert"], signer_cert)
+    _write_key(paths["signing_key"], signer_key)
+    _write_pem(paths["recipient_cert"], recip_cert)
+    _write_pem(paths["trust_anchor"], ca_cert)
+    out: dict[str, Any] = {k: str(v) for k, v in paths.items()}
+    out["recip_key"] = recip_key
+    return out
+
+
+def test_weak_signing_key_is_refused(pki: dict[str, Any], tmp_path: Path) -> None:
+    weak = _weak_pki(tmp_path)
+    with pytest.raises(ValueError, match="signing_key.*RSA-1024"):
+        DirectDestination(
+            _dest(pki, signing_cert=weak["signing_cert"], signing_key=weak["signing_key"])
+        )
+
+
+def test_weak_recipient_cert_is_refused(pki: dict[str, Any], tmp_path: Path) -> None:
+    # A counterparty-chosen surface. Refused anyway, because no certificate policy governing Direct
+    # permits RSA-1024 -- so this cannot break a correspondent who is following their own rules.
+    weak = _weak_pki(tmp_path)
+    with pytest.raises(ValueError, match="recipient_cert.*RSA-1024"):
+        DirectDestination(_dest(pki, recipient_cert=weak["recipient_cert"]))
+
+
+def test_weak_trust_anchor_is_refused(pki: dict[str, Any], tmp_path: Path) -> None:
+    weak = _weak_pki(tmp_path)
+    with pytest.raises(ValueError, match="trust_anchor.*RSA-1024"):
+        DirectDestination(_dest(pki, trust_anchor=weak["trust_anchor"]))
+
+
+def test_a_weak_anchor_is_refused_even_when_another_anchor_issues_the_recipient(
+    pki: dict[str, Any], tmp_path: Path
+) -> None:
+    """The discriminating case for WHERE the anchor check sits.
+
+    The issuance loop returns on the first anchor that verifies, so a floor applied inside it would
+    leave a weak sibling anchor unexamined and still trusted for every future recipient. This bundles
+    the real (2048) anchor with a weak one and requires a refusal even though the real one matches.
+    """
+    weak = _weak_pki(tmp_path)
+    bundle = tmp_path / "bundle.pem"
+    bundle.write_bytes(
+        Path(pki["trust_anchor"]).read_bytes() + Path(weak["trust_anchor"]).read_bytes()
+    )
+    with pytest.raises(ValueError, match="trust_anchor.*RSA-1024"):
+        DirectDestination(_dest(pki, trust_anchor=str(bundle)))
+
+
+def test_the_default_2048_pki_still_constructs(pki: dict[str, Any]) -> None:
+    # POSITIVE CONTROL for all four refusals above: the floor admits what every Direct certificate
+    # policy requires, so the refusals are not green merely because construction always fails.
+    DirectDestination(_dest(pki))
+
+
+def test_an_ec_p256_signer_clears_the_floor(pki: dict[str, Any], tmp_path: Path) -> None:
+    # P-256 is 128-bit and therefore actually MEETS ASVS 11.2.3, which the RSA-2048 floor does not.
+    DirectDestination(_dest(pki, **_ec_signer(pki, tmp_path)))
+
+
+def test_an_unapproved_ec_curve_is_refused(pki: dict[str, Any], tmp_path: Path) -> None:
+    key = ec.generate_private_key(ec.SECP192R1())
+    now = datetime.datetime.now(datetime.UTC)
+    cert = (
+        x509.CertificateBuilder()
+        .subject_name(x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "p192")]))
+        .issuer_name(pki["ca_cert"].subject)
+        .public_key(key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(now - datetime.timedelta(days=1))
+        .not_valid_after(now + datetime.timedelta(days=365))
+        .sign(pki["ca_key"], hashes.SHA256())
+    )
+    cert_p = tmp_path / "p192.crt"
+    key_p = tmp_path / "p192.key"
+    _write_pem(cert_p, cert)
+    key_p.write_bytes(
+        key.private_bytes(
+            serialization.Encoding.PEM,
+            serialization.PrivateFormat.PKCS8,
+            serialization.NoEncryption(),
+        )
+    )
+    with pytest.raises(ValueError, match="secp192r1"):
+        DirectDestination(_dest(pki, signing_cert=str(cert_p), signing_key=str(key_p)))
 
 
 # --- library-capability tripwire for BACKLOG #1168 --------------------------------------------------

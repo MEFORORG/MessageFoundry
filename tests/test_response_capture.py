@@ -393,8 +393,8 @@ class _Resp:
     def __init__(self, body: bytes = b"", status: int = 200) -> None:
         self._body, self.status = body, status
 
-    def read(self) -> bytes:
-        return self._body
+    def read(self, amt: int = -1) -> bytes:
+        return self._body if amt < 0 else (self._body)[:amt]
 
     def __enter__(self) -> _Resp:
         return self
