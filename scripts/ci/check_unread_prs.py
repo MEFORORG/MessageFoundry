@@ -84,6 +84,14 @@ REVIEWED_LABEL = "reviewed"
 #: consume: `gh pr list --label unread` finds every pull request in this state in ONE call. Named for
 #: the STATE and not for a person, because the `reviewed` label is a PROCESS gate -- it records that a
 #: step happened, and neither label may be described as establishing that an independent party looked.
+#:
+#: WHAT WITHDRAWS IT, because the comment body promises this to a reader and a promise that stops
+#: being true is worse than none. `.github/workflows/unread-signal.yml` evaluates on two edges: a
+#: watched workflow COMPLETING, and a pull request being LABELLED or UNLABELLED. Between
+#: 2026-09-04 and this line the second edge did not exist -- `review gate` was the only watched
+#: workflow firing on a label event and it was deleted with the reviewer requirement -- and the
+#: comment claimed automatic withdrawal anyway. The measurement that caught it is recorded on the
+#: trigger list in that workflow, at the arm that fixed it, rather than restated here.
 UNREAD_LABEL = "unread"
 
 #: The review gate's own status-check context. Excluded from the rollup -- see TRAP 2 above. This is
@@ -204,7 +212,11 @@ DO NOT TRIAGE THIS FROM `mergeStateStatus`. It returns one value with precedence
 something else. This check never reads that field; see `scripts/ci/check_unread_prs.py`.
 
 A seat can find every pull request in this state in one call: `gh pr list --label {UNREAD_LABEL}`.
-The label is withdrawn automatically once this pull request leaves the state.
+
+Adding `{REVIEWED_LABEL}` withdraws `{UNREAD_LABEL}`: the label event re-evaluates this pull request,
+and so does the next completion of a watched workflow. Those are the two edges that clear it, so a
+change neither of them reports -- converting to a draft, say -- can leave the label standing until one
+of them next happens.
 
 The `{REVIEWED_LABEL}` label is a PROCESS gate. It records that a step happened. It does not
 establish that an independent party looked, and nothing here should be read as saying it does.

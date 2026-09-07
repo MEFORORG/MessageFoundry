@@ -39,7 +39,10 @@ class _RecordingHvac:
 
 class _FakeTransit:
     def read_key(self, *, name: str) -> dict[str, Any]:
-        return {"data": {"name": name}}
+        # `type` is required, not decoration: BACKLOG #1166 made the key type a checked precondition
+        # of building the Transit cipher, and a response without one fails closed. This test is about
+        # the CLIENT's redirect policy, so it reports a valid data-key type and gets out of the way.
+        return {"data": {"name": name, "type": "aes256-gcm96"}}
 
 
 class _FakeSecrets:
