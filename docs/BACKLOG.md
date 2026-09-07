@@ -10579,6 +10579,26 @@ Proof: nine mutations, each red, zero vacuous -- each of the three key-type chec
 
 **Still open:** the XML signature-verification algorithm policy, the WebAuthn advertised-algorithm restriction, the PKCS#12 import and inbound mTLS rows, and the verdict itself. The cell moves by a scorecard re-score, which no Builder can perform.
 
+**A FIFTH LIMB BUILT 2026-09-05: the WebAuthn advertised-algorithm restriction -- AND THIS ITEM'S OWN ROW UNDERSTATES THE DEFECT ON TWO AXES.** The row records that `auth/webauthn.py:204` "calls the registration-options builder with no `supported_pub_key_algs` anywhere in the file, so the relying party advertises the library default set". True, and re-measured true at engine `c57903c2c` on the pinned `webauthn==3.0.0`, from this worktree's own venv rather than any other interpreter on the box (`sys.executable` printed beside every version; `cryptography` read 50.0.1, matching `requirements.lock`). It understates it twice.
+
+**Axis one: advertising is not the control, and a fix aimed only there would have been the shape this item exists to catch.** `verify_registration_response` takes the SAME `supported_pub_key_algs` parameter and was ALSO left at the library default. Advertisement is a hint an authenticator may ignore; the verify call is the only place a credential is refused. Restricting the advertised set alone would have made the relying party read conformant while accepting exactly the same credentials -- "the cell would read better while the product accepted exactly the same keys", in this item's own words about `jwks.py`.
+
+**Axis two: the row says the default set; the default set has no floor at all.** Measured by execution before building, with three positive controls in the same run: an RS256 (`-257`) credential over a **2048-bit** modulus registered and was ACCEPTED, and so did one over a **1024-bit** modulus. Controls: an ES256 credential was accepted (the fixture builds valid credentials), a garbage response was refused (the verifier is live), and a PS256 (`-37`) credential was refused (the library's algorithm screen was RUNNING and DISCRIMINATING, so the RS256 acceptance was a real allow rather than an unreached branch). The "or smaller" clause that the 2026-08-20 research measured FALSE for every TLS role is TRUE here.
+
+**Built:** one module constant, `SUPPORTED_COSE_ALGS = (-8, -7)` (EdDSA, ES256), passed to BOTH ceremony halves through a single lazy resolver, so the offered set and the accepted set cannot drift. RSA is dropped in full and that is the point: a COSE RSA identifier fixes the padding and the hash and leaves the MODULUS unbounded, so no RSA identifier can carry a 128-bit floor. EdDSA and ES256 carry no equivalent hole -- the curve rides in the credential rather than in the identifier, but a credential whose curve is unknown or mismatched cannot produce a verifiable assertion (measured: it registers, then every assertion against it is refused), so no sub-floor EC2 or OKP credential is ever usable. That asymmetry is why the floor is expressible here as a set of identifiers, and it is the same reasoning the 2026-08-22 signing-key limb recorded for EC.
+
+**The cost is real, is stated rather than hidden, and is not made an operator setting.** An authenticator that offers only RS256 can no longer enrol a passkey; TPM-backed Windows Hello is the population that registers RSA credentials. **This cost is reasoned, not measured -- no real authenticator was driven here, only the pinned library.** Those operators keep TOTP, which ADR 0068's 2026-07-17 amendment already records as the alternative second factor. A knob re-admitting `-257` was deliberately not built: it would be exactly the operator-supplied weak configuration this requirement is failing on. ADR 0068 carries a 2026-09-05 amendment recording the pin as a third policy pin beside `attestation=NONE` and `user_verification=PREFERRED`.
+
+**This also closes half of a row filed under a different item, which is recorded here rather than edited there.** #1168 (ASVS 11.3.1) names this same site from the padding angle: "the shipped relying party advertises COSE -257 and every enrolled credential is verified with PKCS#1 v1.5 at each login". No credential can now be enrolled under `-257`, so that sentence is stale for new enrolments as of this change. Whoever works #1168 should re-measure it rather than relay it.
+
+**Proof:** three mutations, each red, each checked to FAIL rather than ERROR (the mutation runner compiled the file before running, because a first cut of three mutations in this item's own history broke the syntax instead of the behaviour): the advertise-side argument removed (2 failed), the enforce-side argument removed (2 failed), and `-257` re-admitted to the pinned set (4 failed). Eight new rows in `tests/test_webauthn_algs.py`, one of which fires if a future `webauthn` release narrows its own default to match the pin, so the file cannot pass vacuously. 271 tests green across the WebAuthn, MFA, API-auth, crypto-inventory and security-static suites; `mypy --strict` clean over 268 source files.
+
+**The instrument trap was checked, not assumed, and again it did not fire.** This requirement's recorded absence pattern keys on a 3072-bit RSA modulus comparison. Every line this change adds (281, tracked diff plus the new test file) was swept with that pattern: zero matches, against a positive control in the same run where a planted comparison matched. So the machine guard is still firing and no re-cut was needed. The claim's own positive control still speaks in the corpus.
+
+**A MEASURED RESIDUAL, UNFILED AND NAMED BY SUBJECT.** The COSE `crv` field is not validated at registration, so a credential whose curve is unknown or does not match its key ENROLS and only fails at first assertion. On the mismatched-curve path the failure arrives as a raw `ValueError` from `cryptography` rather than a `WebAuthnException`, so `verify_assertion`'s `except WebAuthnException` does not catch it and the rejection would not land on the audited invalid-input path ADR 0068 decision 1 requires -- it would be a 500. Self-harm only (the enrolling user is authenticated and breaks their own credential), and this pin neither causes nor fixes it.
+
+**Still open after this limb:** the XML signature-verification algorithm policy, the PKCS#12 import and inbound mTLS rows, the unvalidated-`crv` residual above, and the verdict itself. The cell moves by a scorecard re-score, which no Builder can perform, and nothing in this limb re-scores it.
+
 ## 1167. research an honest pass for ASVS 11.2.4 -- constant-time recovery-code verification without turning ten argon2id slots into an amplification target
 
 > 🔢 **Re-scored 2026-08-20 -> P3.** Value **4/10** · Difficulty **7/10** · _money pit_. The data-dependent early return survives on the shipped MFA path: _verify_second_factor walks the argon2id recovery hashes and returns on the first match, so the number of ~64 MiB verifications is a function of which code was presented. Value 4 because the leak is a wall-clock signal on an already-authenticated second factor rather than a bypass; difficulty 7 because the obvious constant-time loop multiplies a 64 MiB argon2id verification by the slot count on every attempt, converting a timing leak into a memory and CPU amplification target, and the evidentiary half has no precedent in this tree. _(was 4/10 · 7/10.)_
@@ -21479,6 +21499,12 @@ Within `scripts/coord` and `scripts/hooks` specifically, four files are caught b
 >
 > **THE PART THAT IS NOT MOOT IS THE PART THAT SHIPPED.** `unread-signal.yml` and `scripts/ci/check_unread_prs.py` are on `main`, they still key on the `reviewed` label, and that label now gates nothing. **They will keep announcing pull requests as unread against a standard nothing enforces**, which is a live defect and not a cosmetic one: a signal whose condition no longer decides anything trains its readers to ignore it. **This amendment does not delete them.** Retiring a shipped feature is a product decision the owner has not made, and the three options -- keep the label as an advisory reading habit, repoint the signal at whatever replaces the gate, or retire the workflow -- are not equivalent. Filed as a decision for the owner; no number is allocated here for it. The banner stays open for that reason rather than because the trigger is missing.
 >
+> **AMENDED 2026-09-05 -- THE SIGNAL'S SELF-CLEARING HALF WAS BROKEN BY THE SAME RETIREMENT, AND IS NOW FIXED. THE OWNER DECISION ABOVE IS UNTOUCHED AND STILL OPEN.** `review gate` was the ONLY watched workflow firing on a `labeled` event, so deleting it left `unread-signal.yml` able to RAISE the `unread` flag and unable to WITHDRAW it on a read: the label came off at the next watched-workflow completion, which on a finished green pull request is not coming. The workflow's own header had recorded the consequence -- *"A flag that survives being read is worse than no flag"* -- and `scripts/ci/check_unread_prs.py` was telling every reader, in the comment it posts to their pull request, that *"The label is withdrawn automatically once this pull request leaves the state"*, which had stopped being true. **MEASURED on PR 897, 2026-09-05, from the run log:** a person added `reviewed` at 20:39:02Z and `unread` came off at 20:42:38Z, written by `github-actions[bot]` from run 33990769043 -- a `workflow_run` completion, not the read. Three and a half minutes, and **that short wait is a property of this repository's LOAD, not of the mechanism**: a fleet completing workflows continuously collects stale flags by accident, and a quiet pull request has nothing coming. Fixed by a `pull_request_target: [labeled, unlabeled]` arm -- the safer of the two label-bearing events, because its `ref:`-less checkout takes the BASE while `pull_request`'s takes the merge commit -- plus the corrected sentence in the comment body.
+>
+> **WHAT THE OWNER STILL HAS TO DECIDE IS UNCHANGED BY THAT FIX, and the fix was deliberately scoped not to pre-empt it.** The three options named in the paragraph above -- keep the label as an advisory reading habit, repoint the signal at whatever replaces the gate, or retire the workflow -- are still the live question, and this repair makes the signal do correctly whatever it is eventually decided to do. Restoring a mechanism is not an argument for keeping the feature; it removes the cost of leaving the decision open. **The banner stays open for that reason, the same reason the 2026-09-04 amendment gave.**
+>
+> **AND THE TRIGGER LIST NOW HAS ITS OWN TEST, which is the part that generalises.** `.github/required-contexts.txt` already recorded the finding -- A CONTROL BUILT ON ONE TRIGGER CAN BE BLIND TO ITS OWN REMOVAL, measured 2026-08-31 when dropping `labeled` from the review gate's `types:` reddened NOTHING across 65 passing tests. This workflow then shipped that exact failure, because the finding had a citation and no test. `tests/test_unread_signal.py` now carries a gap detector fed LITERAL trigger sets, both control arms (must-trip and must-not-trip), and eight mutations of the shipped file that each name their break: deleting the label arm, swapping it to `pull_request`, leaving it bare so GitHub's default types apply, dropping `unlabeled`, dropping `completed`, adding a `ref:`, deleting the resolver plumbing, and breaking the concurrency key.
+>
 > **Scored 2026-09-03 -> P2.** Value **6/10** · Difficulty **4/10** · _quick win_. Not started, re-measured at HEAD: none of requested_reviewers, review_requested, pull_request_review, gh pr review or --reviewer appears in any of the 27 files under .github/workflows/, against a positive control of runs-on in 27 of 27. The nearest existing signal does not cover it either -- scripts/ci/check_stalled_prs.py:56 and :122 key the daily cron on mergeStateStatus BEHIND, and an unread pull request reads BLOCKED, so it falls outside that report. The gate itself is correct and must stay fail-closed: .github/workflows/review-gate.yml:30 records that nothing automated ever adds the label and :100 strips it on synchronize, so what is left to build is only the trigger that says a finished, green, unread pull request exists. The cost is throughput rather than product, and a seat polling gh pr list is an awkward but real workaround, which is what holds this out of the higher bands. Landing it is a small workflow or a mail drop on an existing seam, and the hard half is reaching a background session bound to another account, which the gate header records as blocked and which partly lives outside this repository.
 > Verdict: build
 > Research: none
@@ -24184,3 +24210,142 @@ Vault `roles/BUILDER.md:213-217`, under the heading "Closing a ledger row makes 
 ### Not checked
 
 I read only `roles/` in the vault and ran no git history there, so I cannot date when any of these lines was written. Eleven of the fourteen playbooks were matched by the needle above but not read, so treat the population as **at least three files**, not a total. I did not check whether any workflow or CI job reads a playbook, and I confirmed no case in which a seat actually followed `BUILDER.md:216` and produced a red PR -- I measured the instruction and the gate, not an incident.
+
+## 1479. Scope the required gitleaks scan to the ref under test; today any pushed branch can red main and freeze the queue
+
+> 🚧 **Filed 2026-09-07 -- the code fix ships in this PR. THE GATE IS RED AS THIS IS WRITTEN, on TWO unmerged branches at once, so this is a live freeze and not a post-mortem.** Value **9/10** · Difficulty **2/10** · _quick win_. The `gitleaks (secret scan)` job ran with no `--log-opts`, so it walked every ref the `fetch-depth: 0` checkout had fetched. Branch protection reads its answer as a statement about the ref under test; the job was answering it about the whole repository. On 2026-09-06 an unmerged branch's synthetic fixture reddened `main` and the merge queue with it, freezing merging for over four hours and evicting five entries. Per `CLOSING_SEAT["code"]` the banner flip on merge is the LANDER's.
+> Verdict: build
+> Research: none
+> Closing-act: code
+
+**Cluster:** CI merge gates / availability. **Priority:** P1. **Verdict:** build.
+**Severity:** no deployment axis (sec. 0). Nothing here is engine behaviour, a shipped artifact, or PHI, and no deploying site would ever meet it. The cost is entirely to this repository's own ability to merge -- which is why it is P1 rather than P3.
+
+**Measured 2026-09-07** against `.github/workflows/security.yml` at `68693cfc2`, and against the pinned gitleaks 8.18.4 binary the job itself installs.
+
+### The configuration overshot the question the job's own name asks
+
+Three facts, all in the same job:
+
+| where | what |
+|---|---|
+| the checkout step | `fetch-depth: 0`, commented "full history so the scan also covers earlier commits, not just the tip" |
+| the scan step | `gitleaks detect --config .gitleaks.toml --redact --verbose --no-banner` -- no `--log-opts` |
+| gitleaks' default | with the flag unset it walks every ref |
+
+`fetch-depth: 0` fetches every branch and tag, so the unset default had every one of them to walk. The job therefore answered **"does ANY ref in this repository contain a secret"** while branch protection read the answer as **"does THIS ref contain a secret"**. The workflow comment states the narrower intent; nothing implemented it.
+
+**The commit counts are the instrument, not the argv.** In a repository whose `main` held 3 commits and whose unmerged side branch held 4 more, gitleaks 8.18.4 reported `7 commits scanned` with the flag unset and `3 commits scanned` with `--log-opts HEAD` -- exactly `git rev-list --count --all` and `git rev-list --count HEAD`. An attempt to capture the child `git` argv through a shim returned nothing (the binary invokes `git.exe`), so the walk is characterised by the set it reaches rather than by a command line nobody here has observed.
+
+### It has already fired, and not as a near miss
+
+A synthetic redaction fixture at commit `0b47402cd` -- present only on `origin/redact-domain-e1`, never an ancestor of `main` -- turned `main`'s required context red at 00:08Z on 2026-09-06, after three clean runs. Because `security.yml` also runs on `merge_group`, it reddened the queue: the merge-group runs for pr-953, pr-954 and pr-963 all failed on this job. Merging was frozen for over four hours and five entries were evicted.
+
+Re-derivable from any clone:
+
+```
+git branch -r --contains 0b47402cd                    # origin/redact-domain-e1 and a rescue mirror
+git merge-base --is-ancestor 0b47402cd origin/main    # false
+```
+
+### It has now fired twice, from two different branches, and is red as this is written
+
+The 2026-09-06 fixture was not a one-off. Read 2026-09-07 from the run log:
+
+| run | event | ref | failing job |
+|---|---|---|---|
+| 34117701056 | `schedule` | `main` | `gitleaks (secret scan)` |
+| 34128038803 | `pull_request` | `redact-domain-e1` | `gitleaks (secret scan)` |
+| 34127868996 | `pull_request` | `claude/1147-restore-heading` | `gitleaks (secret scan)` |
+
+Run 34117701056 reports **`leaks found: 20`, across TWO commits on TWO different unmerged branches**:
+
+| findings | commit | file | branch | ancestor of `main`? |
+|---|---|---|---|---|
+| 14 | `c456ee586` | `tests/test_logging_credential_scrub.py` | `origin/log-filter-domain-f1` | no |
+| 6 | `833b98096` | `tests/test_log_redaction_secret_domain.py` | `origin/redact-domain-e1` | no |
+
+(The two pull-request runs were read only for which job failed, not for their findings.)
+
+**The strongest evidence is that the tree does not have to change for the answer to change.** Main's
+commit `68693cfc2` carries THREE runs of this required context, on an identical tree:
+
+| started | conclusion | run |
+|---|---|---|
+| 2026-09-06T22:36:29Z | success | 101566686715 |
+| 2026-09-07T00:38:51Z | **failure** | 101582322125 |
+| 2026-09-07T11:39:01Z | **failure** | 101728268133 |
+
+Nothing in `main` moved between them. Only the set of fetched refs did. A gate whose verdict on a
+fixed tree depends on what other people have pushed is not measuring that tree.
+
+**AND THE ATTRIBUTED COMMIT MOVES TOO, which is what rules out the tempting workaround.** The same six
+findings were reported at `0b47402cd` on 2026-09-06 and at `833b98096` on 2026-09-07 -- the fixtures
+did not change; a branch update made the merge commit the attributed one. So a commit-pinned allowlist
+entry goes stale on the next push to any affected branch, and a *pattern* entry is a permanent hole in
+a required secret gate. Neither is a fix; both are a second defect.
+
+`claude/1147-restore-heading` is the one that shows the shape plainly: it is a **docs-only branch that
+restores a heading**, and it cannot merge because a secret-shaped fixture on a stranger's branch fails
+its secret scan. Of the 60 `security.yml` runs since 2026-09-06, 35 failed and 16 succeeded.
+
+**So this row does not describe a repaired outage. It describes one in progress.**
+
+### The class is worse than the outage
+
+**Anyone who can push a branch can red `main`'s required secret gate and stop all merging, with no pull request and no review.** No approval is involved, because no pull request is involved. That is an availability lever over the merge gate, and here it fired **by accident** -- nobody was testing whether it worked.
+
+### The fix, and what it costs
+
+`--log-opts HEAD` on the scan step. One literal, correct on all five of the workflow's triggers, and it keeps a `${{ }}` expression out of a `run:` block -- the template-injection shape zizmor exists to catch. An event-dependent range would need one, for no gain.
+
+**The cost, stated rather than sold as free: a branch nobody has opened a pull request for is no longer scanned.** That coverage is genuinely given up. It is not relocated, and this row should not be read as claiming otherwise.
+
+**There is already a workflow whose job is exactly that gap.** `.github/workflows/branch-leak-scan.yml`
+watches branch pushes with no pull request -- its own header says the `forbidden-content` gate misses
+that shape and that this is the backstop -- and it runs `scan_forbidden.py` only. Relocating secret
+detection there is the obvious follow-up. **It is not done here** and no number is allocated for it:
+that workflow is deliberately detection-and-not-a-gate, so what it should do on a hit is a separate
+decision from this scoping fix.
+
+**Coverage of the merge path is unchanged**, because the workflow's other arms already cover it:
+
+| trigger | what HEAD is | what is walked |
+|---|---|---|
+| `pull_request` | the merge ref | the base plus the pull request's own commits |
+| `merge_group` | the queue commit | everything the queue is about to merge |
+| `push: branches: [main]` | `main` | `main`'s full history |
+| `schedule` / `workflow_dispatch` | the default or dispatched ref | that ref's full history |
+
+So every path by which content can reach `main` is still walked in full. What is no longer walked is a branch that is not on any of those paths.
+
+**What scoping does NOT fix, said so nobody reads this row as more than it is.** HEAD's ancestry on a
+pull request includes all of `main`, so a secret that actually *merges* still reddens every pull
+request and every queue entry at once. The remedy for that is an allowlist entry or a history rewrite,
+never a per-pull-request workaround. Scoping removes the *unreviewed-branch* lever; it does not make
+the gate immune to its own history.
+
+### A coupling the fix creates, asserted because its failure is silent
+
+`--log-opts HEAD` walks HEAD's ancestors, which a shallow clone has not fetched. Before the scoping, losing `fetch-depth: 0` cost history depth on a scan that was over-broad anyway. Now it would quietly reduce a required secret gate to a single commit while it went on reporting success. `test_the_gitleaks_checkout_still_fetches_the_full_history_of_that_ref` holds that.
+
+### The controls, and the one that first passed for the wrong reason
+
+Four controls land in `tests/test_merge_gate_controls.py` and are registered in `tests/negative_controls.toml`. The suite does not install gitleaks, so the behavioural control exercises the mechanism the scanner delegates to: the commit set a `git log` walk reaches under the shipped `--log-opts`.
+
+Measured against a neutered `security.yml`, restored byte-identical after each arm:
+
+| arm | controls red |
+|---|---|
+| `--log-opts` removed (the pre-fix state) | 2 of 4 |
+| re-widened to `--log-opts "--all"` | 2 of 4 |
+| `fetch-depth` dropped to 1 | 1 of 4 |
+| scope pointed away from the ref under test | 1 of 4 |
+
+The detector control stayed green in all four, which is the asymmetry: it flags a widened scope without demanding the flag be absent.
+
+**The behavioural control's first version reddened for the wrong reason, and only the neutering run said so.** It verified the scope with `git rev-parse --verify`, which rejects every multi-revision and option-carrying value -- so under `--log-opts "--all"` it fired on that guard, *before* the needle assertions, which had therefore never been observed doing any work. A guard that pre-empts the control it guards, on exactly the shapes that control exists for, is the defect this file is full of. The precondition now asks only whether the scope produces a walk.
+
+### Not checked
+
+I did not read gitleaks' source, so "walks every ref when the flag is unset" rests on the commit counts above and not on the code. I did not test a fork pull request, where the checkout and the available refs differ. I did not check whether any other workflow in this repository scans with a whole-repository default; only `security.yml`'s secret job was examined.
