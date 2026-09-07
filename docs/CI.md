@@ -95,10 +95,9 @@ owner decision too.
 Worth keeping in view if it is ever reconsidered: the label is applied by hand, commonly by the PR's own
 author, so the check proved a **step happened**, not that an independent party looked. Two further
 findings the gate produced outlive it, because neither was about that one workflow. It failed **stale
-rather than closed** -- a run reported SUCCESS from a webhook payload snapshotted before the label was
-stripped, so PR 724 carried the context green with no `reviewed` label for 10 minutes on 2026-09-01,
-and `strict: true` is what stopped it merging (BACKLOG #1417; any gate reading `github.event.*`
-inherits the same skew). And **nothing ever told a reviewer a pull request was waiting**, measured as
+rather than closed**, and `strict: true` is what stopped the one measured case merging (BACKLOG #1417).
+The mechanism is not specific to that workflow, so it is written up once under *Gotchas*, in the bullet
+on reading `github.event.*`. And **nothing ever told a reviewer a pull request was waiting**, measured as
 zero hits for each of `requested_reviewers`, `review_requested`, `pull_request_review`, `--reviewer`
 and `gh pr review` across the workflow directory, against a `runs-on` positive control that hit every
 file (BACKLOG #1413).
@@ -110,6 +109,22 @@ nothing adds or removes the label -- labels already sitting on open PRs are iner
 `reviewed` label, so **that signal now reports against a standard nothing enforces**. It is left
 running deliberately rather than by oversight: retiring a shipped feature is a product decision the
 owner has not made.
+
+### "What was required when this merged" is not answerable
+
+GitHub exposes **no history for branch-protection settings**. The endpoint above reads the present set,
+and nothing reads a past one. So for a pull request that has already merged, the set of checks required
+at the moment it merged cannot be recovered from the API.
+[`.github/required-contexts.txt`](../.github/required-contexts.txt) exists because the live set is
+unreadable from a clone, and it records only the present as well. It is a mirror, not a log.
+
+**Treat that as a known limit of this repository's own auditability**, written down here so nobody hunts
+for a log that was never kept. It has already cost one answer: PR 712 merged on 2026-08-31 with the
+review verdict red and no `reviewed` label, and the likeliest reading -- that the context was not
+required yet at that instant -- can be neither proved nor disproved (BACKLOG #1417 records it as
+unresolved rather than explained away). The 2026-09-04 retirement added a second undated transition to
+the same gap. Closing the gap would mean recording each change to the required set with its date, which
+nothing does today.
 
 The `quality-advisory.yml` jobs create **no code-scanning category** and **no _required_ check context** —
 they do report as ordinary advisory checks, and they **must never be added to the required list**. Two
@@ -212,6 +227,25 @@ an unrelated PR without turning the gate red.
   `run:` as template injection. The fix is to route the value through `env:` — the remedy endorsed in
   `.github/zizmor.yml` — not to suppress the rule. The same applies to any secret used in a `run:` step:
   write it to a file via an intermediate `env:` var rather than inlining `${{ secrets.* }}`.
+- **A workflow reading `github.event.*` is reading a snapshot; branch protection is not.** The webhook
+  payload freezes when the event fires. Branch protection then picks the newest check-run by
+  **execution** time. Those are two different clocks, so a queued run reports the state from its own
+  creation moment, however long ago that was. Measured on PR 724 on 2026-09-01: a run created at
+  13:24:22Z executed at 13:43:46Z against its stale payload, reported SUCCESS, and overwrote the correct
+  FAILURE from a run created earlier. The pull request then carried a green review context with no
+  `reviewed` label for ten minutes. **Read the state live inside the job** (`gh pr view --json labels` at
+  run time), or make the verdict invalidate itself when its payload is older than what it claims to have
+  read. One near-miss is worth naming, because two sessions adopted it before it was refuted: reading the
+  check **context** instead of the label does not help, because the context inherits the same staleness
+  through the same snapshot. The gate that produced this is retired, so it is a constraint on the next
+  control rather than a defect in a live one (BACKLOG #1417).
+- **Every `gh api` list route defaults to `per_page=30`, so it will answer confidently about a population
+  it cannot see.** Measured on two routes: check-runs returned 30 where the heads carried 39 to 48, and
+  `issues/<n>/timeline` returned 30 and hid a label re-application two hours past the cut, which sent its
+  reader to the wrong conclusion. A truncated list looks exactly like a short one, and nothing in the
+  reply says it was cut. Use `--paginate`, and when a count decides something, reconcile it against a
+  paginated count. `per_page=100` covered the largest population seen and is not a permanent guarantee;
+  `scripts/ci/report_ci_red.py` uses it with that caveat written beside the call (BACKLOG #1417).
 - **The advisory `dast.yml` scan has a merge-blocking half, and it lives somewhere else.**
   `tests/test_dast_auth_sweep.py` runs inside the existing required `test` legs and drives the *same*
   shipped sweep, proving its two canaries still detect an injected defect. So a change that **blinds the

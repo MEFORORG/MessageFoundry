@@ -3500,9 +3500,9 @@ def create_app(
         # between calls, so it cannot become a session-wide toggle by accident.
         outbox = [redact_unauthorized(o, identity) for o in detail.outbox]
         events = [redact_unauthorized(e, identity) for e in detail.events]
-        detail = redact_unauthorized(detail, identity, revealed=frozenset({"summary"})).model_copy(
-            update={"outbox": outbox, "events": events}
-        )
+        detail = redact_unauthorized(
+            detail, identity, revealed=frozenset({"summary", "metadata"})
+        ).model_copy(update={"outbox": outbox, "events": events})
         rows = [detail, *outbox, *events]
         exposed, masked = count_exposed(rows), count_masked(rows)
         if exposed or masked:
