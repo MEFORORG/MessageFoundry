@@ -98,10 +98,29 @@ for, not how it is protected before it gets there.
 > (`hashlib`, `secrets`, `hmac`, `ssl`, `argon2`, `cryptography`); the third-party crypto libraries
 > `hvac` / `truststore` / `webauthn` / `signxml`; and the **first-party delegated-crypto seams**
 > (`store/crypto.py`, `store/keyprovider.py`, `store/keyprovider_vault.py`, `store/crypto_transit.py`,
-> `store/backup_codec.py`) — so `store/crypto_transit.py` (all Vault-Transit AEAD + the audit MAC ride
-> the HTTP seam; it imports none of the six) is now discovered and inventoried. It **fails the build**
-> on any undocumented or stale usage. When a module starts (or stops) using a crypto primitive or a
-> seam, update both this section and that script's `INVENTORY`.
+> `store/backup_codec.py`, `config/tls_policy.py`, `transports/signing.py`) — so
+> `store/crypto_transit.py` (all Vault-Transit AEAD + the audit MAC ride the HTTP seam; it imports
+> none of the six) is now discovered and inventoried. It **fails the build** on any undocumented or
+> stale usage. When a module starts (or stops) using a crypto primitive or a seam, update both this
+> section and that script's `INVENTORY`.
+>
+> **Read the seam list as the script's `CRYPTO_SEAM_MODULES`, not as a closed set.** It has grown
+> twice since it was first written and nothing ties this prose to the code, so the script is the
+> source of record and this list can lag it. The last two additions each surfaced a first-party
+> surface the gate could not previously SEE at all: `config/tls_policy.py` (BACKLOG #1323, whose
+> worked example was `pipeline/alert_sinks.py`) and `transports/signing.py` (BACKLOG #1164, whose
+> worked example was `transports/fhir.py`). Note the distinction those two turn on — an inventory row
+> records what a file USES, while a seam entry is what makes that file's IMPORTERS visible, so a
+> module can be inventoried while everything reaching crypto through it stays invisible.
+>
+> **A SECOND ARM covers the non-Python tree** (BACKLOG #1172, ASVS 11.5.1) and rides the same required
+> context. The walk above is an `import ast` pass over `*.py` and is Python-only by construction, so
+> `check_non_python_randomness` scans `ide/` and `messagefoundry_webconsole/` for randomness sources
+> by pattern and diffs them against `NON_PYTHON_INVENTORY` the same bidirectional way. A weak source
+> (`Math.random()`) fails with no inventory row to hide behind, and an empty walk is a violation
+> rather than a clean result. **Randomness is the whole claim that arm supports** — the TLS floor
+> `ide/src/engineClient.ts` applies to every https request is first-party crypto in a shipped
+> artifact and is discoverable from neither arm.
 
 | Asset | Algorithm / detail | Source / storage | Lifecycle |
 |---|---|---|---|
