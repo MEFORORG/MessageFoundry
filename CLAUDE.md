@@ -286,7 +286,7 @@ is not thereby retired; this section binds on seats and rules, not on the machin
 | **Builder** | ephemeral, one per brief | The change, the commit, the push, and the PR carrying the `BACKLOG.md` update. | Guess at something the brief left open, or wait for an answer; it writes the question to the Console, comments it on the PR, and stops. Plan and wait for a "go". Declare its own seat. Spawn another session. |
 | **Regulator** | spawned on a red | Deciding whose failure it is: the PR's, `main`'s, a flake's, or the queue's. Keeps a log. | Assume it remembers an earlier red; it starts with none. Send anything but the PR's own failure back to a Builder. |
 | **Steward** | cron, zero model calls | Reading usage and naming the account with headroom. | Warn a running session. Nothing can interrupt one. |
-| **Lander** | as needed | Merging. Standing authority on the engine repo and the vault, with no per-action owner approval. | Merge a diff it has not read. Arm auto-merge. |
+| **Lander** | as needed | Merging, and the vault scorecard re-score (owner ruling 2026-09-05). Standing authority on the engine repo and the vault, with no per-action owner approval. | Merge a diff it has not read. Arm auto-merge. |
 
 The Console spawns a Builder where it holds the spawn permission, and that is per config root. The
 grant is a rule matching `Bash(claude:*)` or `PowerShell(claude:*)` under `permissions.allow` in the

@@ -99,6 +99,23 @@ def test_it_also_watches_the_dast_workflow() -> None:
     )
 
 
+def test_it_also_watches_the_stalled_prs_workflow() -> None:
+    """A detector whose own failure hides itself is worse than the defect it was built to catch.
+
+    ``stalled-prs.yml`` is schedule-and-dispatch only, so it can never report on a pull request, and
+    it reports on OTHER pull requests -- so a run that stopped producing a report is indistinguishable
+    from a day with nothing to report. It FAILED THREE MORNINGS RUNNING (2026-09-03, 09-04 and 09-05;
+    runs 33753049186, 33870995359, 33962763074) and nothing anywhere said so.
+    """
+    watched = _on(_load(_NOTICE))["workflow_run"]["workflows"]
+    stalled_name = _load(_WORKFLOWS / "stalled-prs.yml").get("name")
+    assert stalled_name, "stalled-prs.yml has no `name:` -- workflow_run has nothing to key on"
+    assert stalled_name in watched, (
+        f"nightly-notice.yml watches {watched} but stalled-prs.yml is named {stalled_name!r}. Its "
+        "daily red would then reach nobody, and its silence reads exactly like a clean sweep."
+    )
+
+
 def test_every_watched_workflow_exists_and_can_actually_fire() -> None:
     """A watched name that no workflow answers to, or that has no cron, is dead config reading as
     coverage.

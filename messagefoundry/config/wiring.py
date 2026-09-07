@@ -2175,6 +2175,7 @@ def Direct(
     trust_anchor: str
     | EnvRef,  # path to the PEM/DER CA the recipient_cert must chain to (required)
     signing_key_password: str | EnvRef | None = None,  # passphrase for signing_key (use env())
+    signature_padding: str = "pkcs1v15",  # RSA signature padding: "pkcs1v15" (default) or "pss"
     port: int | EnvRef = 587,  # 587 STARTTLS submission (default); 465 → implicit TLS (SMTP_SSL)
     subject: str | EnvRef = "",  # static Subject
     username: str | EnvRef | None = None,  # optional SMTP AUTH user (use env() for the secret)
@@ -2202,7 +2203,17 @@ def Direct(
     is gated by ``[egress].allowed_direct``. Put secrets in ``env()`` (``signing_key_password``,
     ``username``/``password``), never inline. Delivery is at-least-once, so a retry re-sends — a Direct
     mailbox has no idempotency key, so a rare duplicate is possible and accepted (a duplicate beats a
-    drop). Crypto is core ``cryptography`` (``serialization.pkcs7``) — no new dependency. ADR 0085."""
+    drop). Crypto is core ``cryptography`` (``serialization.pkcs7``) — no new dependency. ADR 0085.
+
+    **``signature_padding`` selects the RSA signature padding** on the CMS SignerInfo (ASVS 11.3.1,
+    #1168): ``"pkcs1v15"`` (the default) or ``"pss"`` for RSASSA-PSS. The default is an
+    interoperability position, not a preference — a HISP peer whose S/MIME stack implements only
+    PKCS#1 v1.5 cannot verify a PSS signature, and the counterparty chose the verifier. Set ``"pss"``
+    once the partner is known to support it, or supply an **EC signing key**, which reaches an
+    approved signature with no padding parameter at all. The setting is refused at construction on a
+    non-RSA key. It governs the SIGNATURE only: the ENVELOPE's key transport is RSAES-PKCS1-v1_5 and
+    the pinned ``cryptography`` exposes no OAEP alternative on ``PKCS7EnvelopeBuilder``, so this
+    setting does not make the whole message OAEP-clean."""
     return ConnectionSpec(
         ConnectorType.DIRECT,
         {
@@ -2212,6 +2223,7 @@ def Direct(
             "signing_cert": signing_cert,
             "signing_key": signing_key,
             "signing_key_password": signing_key_password,
+            "signature_padding": signature_padding,
             "recipient_cert": recipient_cert,
             "trust_anchor": trust_anchor,
             "port": port,
@@ -2665,9 +2677,7 @@ def Soap(
     ws_security: bool = False,  # stamp <wsse:Security> (Timestamp + optional UsernameToken) in send()
     ws_username: str | EnvRef | None = None,  # UsernameToken username (defaults to basic_user)
     ws_password: str | EnvRef | None = None,  # UsernameToken password (defaults to basic_password)
-    ws_password_type: Literal[
-        "text", "digest"
-    ] = "text",  # "text" (PasswordText; recommended over mTLS) | "digest"
+    ws_password_type: Literal["text"] = "text",  # PasswordText; "digest" retired (#1171)
     ws_addressing: bool = False,  # stamp <wsa:Action/To/MessageID> in send(); requires soap_version 1.2
     ws_timestamp_ttl_seconds: int = 300,  # Created→Expires window (must be >= max retry backoff)
     # ADR 0015 amendment (#236): {placeholder_token: env(secret)} substituted into the <Body> at send
@@ -4571,10 +4581,18 @@ def build_outbound_connection(
                 "(presenting an identity to an unverified peer is incoherent) (ADR 0015)."
             )
         pw_type = spec.settings.get("ws_password_type", "text")
-        if pw_type not in ("text", "digest"):
+        if pw_type == "digest":  # nosec B105 -- a password *type*, not a secret
             raise WiringError(
-                f"outbound connection {name!r}: SOAP ws_password_type must be 'text' or 'digest', "
-                f"got {pw_type!r} (ADR 0015)."
+                f"outbound connection {name!r}: SOAP ws_password_type='digest' is retired "
+                "(BACKLOG #1171, ASVS 11.4.1). Its PasswordDigest construction is SHA-1 by profile "
+                "definition, and it protected nothing this connector was not already protecting: a "
+                "UsernameToken over a cleartext hop is refused, so the channel carries the "
+                "credential either way. Use 'text'."
+            )
+        if pw_type != "text":
+            raise WiringError(
+                f"outbound connection {name!r}: SOAP ws_password_type must be 'text', "
+                f"got {pw_type!r} (ADR 0015, BACKLOG #1171)."
             )
         if (spec.settings.get("ws_security") or spec.settings.get("ws_addressing")) and str(
             spec.settings.get("soap_version", "1.1")
