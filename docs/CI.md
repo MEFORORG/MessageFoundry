@@ -200,6 +200,28 @@ an unrelated PR without turning the gate red.
 > from running on PRs (path-gate it, or make it schedule-only), make sure it is **not** in the required
 > list first. Add a job to the required list only once you have seen it report on a real PR.
 
+### Baseline for a path-gated leg
+
+A path-gated leg (`postgres store`, `sql server`, `load test`, `windows service smoke`,
+`docker image smoke`) runs only when its paths change, so it is thinly sampled and a red one has
+no recent green to judge it against. The nightly already provides that baseline, and nothing here
+said so:
+
+```
+gh run list --repo MEFORORG/MessageFoundry --workflow=ci.yml --event=schedule --limit 7
+```
+
+A **green nightly run** means every gated leg was green on `main` that night, because `CI gate`
+`needs:` them all -- one run conclusion answers it, with no per-job walk.
+
+Two limits, stated so nobody reads more into a green than it carries:
+
+- **`tooling` is not in the nightly.** The schedule arm sets `tooling=false`, so `repo harness
+  tests` has no nightly baseline. Its baseline is the push arm: `--event=push`, then read the
+  failing job names.
+- **One issue per workflow masks siblings.** `nightly-notice.yml` opens a single issue naming the
+  run, not the leg, so a chronically red leg hides the state of every other leg beside it.
+
 ## Gotchas
 
 - **`actionlint` runs on every workflow edit — let it.** GitHub interpolates `${{ }}` expressions
