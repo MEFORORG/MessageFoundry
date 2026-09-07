@@ -47,6 +47,7 @@ from collections.abc import Mapping
 from typing import Any
 
 from messagefoundry.config.models import ConnectorType, Destination
+from messagefoundry.config.tls_policy import TrustAnchorPolicy
 from messagefoundry.controlchars import has_control_char
 from messagefoundry.parsing.fhir import FhirPeek, FhirPeekError
 from messagefoundry.transports.base import (
@@ -76,6 +77,7 @@ from messagefoundry.transports.rest import (
     enforce_send_time_length_limits,
     enforce_signature_header_limits,
     find_outbound_length_violation,
+    http_family_trust_anchor,
     normalize_header_allowlist,
     outbound_headers_from_metadata,
     refuse_cleartext_credentials,
@@ -418,13 +420,20 @@ class FhirDestination(DestinationConnector):
             )
             # #129 (ADR 0094): granular expiry-only relaxation — verify chain + hostname but tolerate an
             # expired FHIR-server cert (opt-in; default off = the shared verifying opener, byte-identical).
+            # #1180 (ADR 0093): the client trust anchor for this https hop.
+            anchor = http_family_trust_anchor(
+                s, url=self.base_url, trust_anchor_policy=config.trust_anchor_policy
+            )
             if bool(s.get("tls_allow_expired", False)):
                 self._opener: urllib.request.OpenerDirector = _expiry_relaxed_opener(
-                    urllib.parse.urlsplit(self.base_url).hostname or "", *proxy_handlers
+                    urllib.parse.urlsplit(self.base_url).hostname or "",
+                    *proxy_handlers,
+                    trust_anchor=anchor,
                 )
-            elif proxy_handlers:
+            elif proxy_handlers or anchor.narrows:
                 # A forward proxy → a per-connection verifying opener carrying it (never the shared one).
-                self._opener = _no_redirect_opener(*proxy_handlers)
+                # A narrowed trust anchor needs its own opener for the same reason.
+                self._opener = _no_redirect_opener(*proxy_handlers, trust_anchor=anchor)
             else:
                 self._opener = _NO_REDIRECT_OPENER
         else:
@@ -838,8 +847,17 @@ class FhirLookupExecutor:
     ``OperationOutcome`` issue code, a redacted host) — never the returned body, the query's parameter
     values, or the SMART token."""
 
-    def __init__(self, connections: Mapping[str, Mapping[str, Any]]) -> None:
+    def __init__(
+        self,
+        connections: Mapping[str, Mapping[str, Any]],
+        *,
+        trust_anchor_policy: TrustAnchorPolicy | None = None,
+    ) -> None:
         # connections: name -> already-env-resolved settings (the runner substitutes env() first).
+        # trust_anchor_policy (#1180, ADR 0093): the instance [tls] client anchor policy, threaded by
+        # the runner. A FhirLookup connection has no Destination to carry it (unlike every other
+        # HTTP-family hop), which is why this executor's opener map could not name an internal CA at
+        # all. `None` (a direct test build) = the OS trust store, byte-identical.
         from messagefoundry.transports.smart import token_provider_from_settings
 
         self._base: dict[str, str] = {}
@@ -919,8 +937,16 @@ class FhirLookupExecutor:
             self._headers[cname] = headers
             self._token[cname] = token
             if bool(s.get("verify_tls", True)):
+                # #1180 (ADR 0093): the sanctioned live read-only lookup against an internal FHIR
+                # server is the most on-point instance of 12.3.4's condition in the product, and it
+                # could not name an anchor at all.
+                lookup_anchor = http_family_trust_anchor(
+                    s, url=url, trust_anchor_policy=trust_anchor_policy
+                )
                 self._opener[cname] = (
-                    _no_redirect_opener(*proxy_handlers) if proxy_handlers else _NO_REDIRECT_OPENER
+                    _no_redirect_opener(*proxy_handlers, trust_anchor=lookup_anchor)
+                    if proxy_handlers or lookup_anchor.narrows
+                    else _NO_REDIRECT_OPENER
                 )
             else:
                 # verify_tls=false makes the https hop MITM-able — a posture-keyed insecure hop (#200).
