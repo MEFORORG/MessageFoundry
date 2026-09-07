@@ -33,6 +33,7 @@ from messagefoundry.store.store import MessageStatus, MessageStore, Stage
 from messagefoundry.transports import http_listener as http_mod
 from messagefoundry.transports.base import build_source
 from messagefoundry.transports.http_listener import (
+    _BASELINE_RESPONSE_HEADERS,
     DEFAULT_MAX_BODY_BYTES,
     HttpRequestError,
     HttpSource,
@@ -506,6 +507,58 @@ def test_build_response_shape() -> None:
     assert out.endswith(b'{"ok":1}')
 
 
+def test_build_response_carries_the_browser_safety_baseline() -> None:
+    """ASVS 3.4.4 / 3.4.6. This listener is a SECOND HTTP server in the tree and it emitted no
+    security header in any configuration. The sharpest case is the ADR 0154 sync-reply path, which
+    echoes a downstream partner's Content-Type verbatim beside partner-supplied bytes — so it can
+    serve a partner-derived `text/html` document over this listener's own TLS.
+
+    Driven through the chokepoint every one of the twelve call sites feeds, with the negative control
+    beside it: a name NOT in the baseline is absent from the same bytes, so this is evidence about the
+    baseline rather than about the instrument."""
+    out = build_response(200, "<p>hi</p>", content_type="text/html")
+    for name, value in _BASELINE_RESPONSE_HEADERS:
+        assert f"\r\n{name}: {value}\r\n".encode() in out, name
+    assert b"\r\nX-Not-A-Real-Header:" not in out
+    # It rides every status this listener answers with, refusals included — a 405 or a 503 is as
+    # framable and as sniffable as a 200.
+    for status in (202, 204, 400, 403, 405, 413, 422, 500, 503):
+        body = build_response(status)
+        for name, value in _BASELINE_RESPONSE_HEADERS:
+            assert f"\r\n{name}: {value}\r\n".encode() in body, (status, name)
+
+
+def test_the_listener_baseline_has_not_drifted_from_the_api_header_floor() -> None:
+    """The listener carries its OWN copy of the baseline because `transports/` must not import
+    `api/` (this module's docstring states that rule, and `header_floor` pulls in Starlette). A copy
+    that can drift silently is the exact failure `header_floor` exists to end, so this is the single
+    place a divergence reds — and it asserts the VALUES, not just the names."""
+    from messagefoundry.api.header_floor import (
+        BASELINE_SECURITY_HEADERS,
+        CSP_HEADER,
+        FRAME_ANCESTORS_CSP,
+    )
+
+    assert (
+        *BASELINE_SECURITY_HEADERS,
+        (CSP_HEADER, FRAME_ANCESTORS_CSP),
+    ) == _BASELINE_RESPONSE_HEADERS
+
+
+def test_a_caller_supplied_header_wins_over_the_baseline() -> None:
+    """setdefault semantics, not an unconditional write: a name the caller decided is emitted ONCE,
+    with the caller's value. A duplicated Content-Security-Policy would be a second policy the
+    intersection then enforces, which is not what a caller overriding one means."""
+    out = build_response(
+        200, "{}", extra_headers={"content-security-policy": "frame-ancestors 'self'"}
+    )
+    assert out.count(b"Content-Security-Policy") == 0  # only the caller's spelling appears
+    assert out.count(b"content-security-policy: frame-ancestors 'self'") == 1
+    assert (
+        b"\r\nX-Content-Type-Options: nosniff\r\n" in out
+    )  # the names it did not decide still ride
+
+
 def test_build_response_carries_extra_headers() -> None:
     # What lets a 401 carry WWW-Authenticate and a 429 carry Retry-After (ADR 0154 D6 wire shapes).
     out = build_response(
@@ -764,8 +817,11 @@ def test_a_204_carries_no_entity_headers() -> None:
     # default answer for a partner reply that is deliberately empty.
     out = build_response(204)
     assert out.startswith(b"HTTP/1.1 204 No Content\r\n")
-    assert b"Content-Type" not in out
-    assert b"Content-Length" not in out
+    # The field line, not the substring: the baseline carries `X-Content-Type-Options`, in which
+    # `Content-Type` is a substring, so a bare `not in` here would red on a change that adds no
+    # entity header at all.
+    assert b"\r\nContent-Type:" not in out
+    assert b"\r\nContent-Length:" not in out
     assert b"Connection: close\r\n" in out
     assert out.endswith(b"\r\n\r\n")
 
