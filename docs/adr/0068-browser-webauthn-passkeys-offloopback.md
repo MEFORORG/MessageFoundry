@@ -438,3 +438,43 @@ password + TOTP — so 6.3.3 / 6.5.7 / 6.7.2 stay **Partial at strict L3** for t
 deployment. A clean Pass needs an **owner** serve gate that *requires* the `[webauthn]` extra + an
 enrolled passkey for admin at exposure (an owner decision; not landed here). ADR 0115 does not
 re-score.
+
+## Amendment (2026-09-05) — the credential algorithm set is pinned, and RS256 is dropped (ASVS 11.2.3, BACKLOG #1166)
+
+**Status:** Behaviour changed. A third policy pin joins `attestation=NONE` and
+`user_verification=PREFERRED` in decision 1: `messagefoundry/auth/webauthn.py` now declares
+`SUPPORTED_COSE_ALGS = (-8, -7)` (EdDSA, ES256) and passes it to **both** ceremony halves, instead
+of inheriting py_webauthn's default set of EdDSA, ES256 and **RS256 (-257)**.
+
+**Why RS256 goes.** ASVS 11.2.3 asks every primitive for at least 128 bits of security. A COSE RSA
+identifier cannot promise that: `-257` fixes the padding and the hash and leaves the modulus
+unbounded, so the authenticator chooses the strength. Measured against this module at engine commit
+`c57903c2c` on the pinned `webauthn==3.0.0` before the pin landed: an RS256 credential over a
+2048-bit modulus registered and was accepted, and so did one over a **1024-bit** modulus. EdDSA and
+ES256 have no equivalent hole. The curve rides in the credential rather than in the identifier, but
+a credential whose curve is unknown or does not match its key cannot produce a verifiable
+assertion, measured in the same run, so no sub-floor EC2 or OKP credential is ever usable.
+
+**Both halves, deliberately.** `generate_registration_options` decides what the browser is
+*offered*; an authenticator may ignore it. `verify_registration_response` is the only place a
+credential is *refused*. Restricting the advertisement alone would have read like a fix while
+accepting exactly the same credentials, so one tuple feeds both calls and a test pins that they
+cannot drift.
+
+**The cost, stated rather than hidden.** An authenticator that offers only RS256 can no longer
+enrol a passkey; TPM-backed Windows Hello is the population that registers RSA credentials. Those
+operators keep TOTP, which the 2026-07-17 amendment above already records as the alternative second
+factor, and the password leg is unchanged. This is **not** an operator setting, on purpose: a knob
+that re-admits `-257` would be exactly the operator-supplied weak configuration ASVS 11.2.3 is
+failing on.
+
+**Not a re-score.** ASVS 11.2.3 stays `partial`. Its verdict moves only by a scorecard re-score,
+and other surfaces named in BACKLOG #1166 are still open.
+
+**Measured residual, unfiled and named by subject rather than by a number.** The COSE `crv` field
+is not validated at registration, so a credential whose curve is unknown or mismatched enrols and
+then fails at first assertion. On the mismatched-curve path the failure arrives as a raw
+`ValueError` from `cryptography` rather than a `WebAuthnException`, so `verify_assertion`'s
+`except WebAuthnException` does not catch it and the rejection would not land on the audited
+invalid-input path decision 1 requires. It is self-harm only (the enrolling user is authenticated
+and breaks their own credential) and this pin neither causes nor fixes it.

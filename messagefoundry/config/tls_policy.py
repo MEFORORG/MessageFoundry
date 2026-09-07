@@ -525,6 +525,48 @@ def harden_cipher_suites(ctx: ssl.SSLContext, *, connector: str) -> None:
     # carries six CBC-SHA2 suites, so applying it to an INHERITED context would refuse every current
     # configuration. The allow-list governs what an operator may CONFIGURE, not what a default may
     # contain; conflating the two is how a strict list becomes an outage.
+    #
+    # THE RFC 7366 (encrypt-then-MAC) QUESTION IS SETTLED HERE, AND THE ANSWER IS THAT IT CANNOT BE
+    # ASKED (ASVS 11.3.5, BACKLOG #1170). Those six retained CBC-SHA2 suites are the only MAC-then-
+    # encrypt exposure left on any hop -- the application's own cryptography is AEAD-only and so is
+    # encrypt-then-MAC by construction -- which invites the next reader to try asserting the
+    # negotiated RFC 7366 state instead of the suite list. There is nothing to assert. Measured on
+    # CPython 3.14.6 / OpenSSL 3.5.7, with positive controls in the same run (`cipher` and
+    # `shared_ciphers` are found; `OP_NO_TICKET` exists): the `ssl` module exposes no name containing
+    # "etm", no `OP_NO_ENCRYPT_THEN_MAC`, and no `ssl.Options` member naming encryption-then-MAC, and
+    # neither `SSLObject` nor `SSLSocket` exposes any accessor for it. `cipher()` returns
+    # (name, protocol, bits), and a suite NAME is compatible with both compositions, so it cannot
+    # answer the question either.
+    #
+    # So the verb is unsatisfiable BY OBSERVATION on this interpreter, not merely unimplemented. The
+    # remedy available is the one already taken: constrain what an operator may CONFIGURE
+    # (`validate_tls_ciphers` refuses CBC-SHA2 outright) and leave the inherited default's six suites
+    # in place.
+    #
+    # THAT RETENTION IS AN IN-CODE DECISION RECORDED ABOVE, AND ITS INTEROP PREMISE IS UNMEASURED.
+    # An earlier draft of this comment called it "owner-ratified", which was wrong and is retracted
+    # here rather than quietly deleted. No owner ruling on these six suites exists in this tree. Two
+    # real rulings sit close enough to borrow from by accident, and that is how the error was made:
+    # the STRICT ALLOW-LIST below carries an owner ruling of 2026-08-22, recorded in BACKLOG #1317
+    # ("What to build, per the 2026-08-22 owner ruling"), and the posture PRECEDENCE gradient in this
+    # module is owner-ratified under ADR 0153. Neither is about retaining a suite the interpreter
+    # default already enables.
+    #
+    # BOTH CITATIONS NAME WHERE THE RULING LIVES, ON PURPOSE. The 2026-08-22 ruling exists ONLY in
+    # the live ledger under its item number -- measured, the sole engine-tree files mentioning it are
+    # docs/BACKLOG.md and this one. A reader checking it against a rulings document, or against the
+    # vault, finds nothing and would report a sound citation as unsourced; the packet C session came
+    # one query short of doing exactly that. So: check the LEDGER before calling any ruling citation
+    # in this repository unsupported, and cite the item number rather than the bare date.
+    #
+    # The interop half is unmeasured too. The rejection note above says real MLLP/DICOM hospital
+    # peers still speak these suites; no census is cited for that, here or anywhere this module can
+    # point at. What `harden_cipher_suites` actually measures is the SUITE-SET DELTA of a candidate
+    # `set_ciphers` string against the default -- a fact about two lists, not about any peer.
+    #
+    # So retiring the six is an owner call PRECISELY BECAUSE nobody has run that census, which is a
+    # stronger reason not to act unilaterally than a ruling would have been: it says what is missing
+    # and what would settle it. Run the peer census first; do not read this paragraph as a refusal.
     plaintext = sorted({str(c.get("name", "?")) for c in resolved if not _is_encrypting(c)})
     if plaintext:
         raise ValueError(
