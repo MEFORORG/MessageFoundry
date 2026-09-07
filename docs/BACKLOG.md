@@ -24204,3 +24204,103 @@ Vault `roles/BUILDER.md:213-217`, under the heading "Closing a ledger row makes 
 ### Not checked
 
 I read only `roles/` in the vault and ran no git history there, so I cannot date when any of these lines was written. Eleven of the fourteen playbooks were matched by the needle above but not read, so treat the population as **at least three files**, not a total. I did not check whether any workflow or CI job reads a playbook, and I confirmed no case in which a seat actually followed `BUILDER.md:216` and produced a red PR -- I measured the instruction and the gate, not an incident.
+
+## 1478. The write-time log handler filters carry no credential vocabulary, so a forwarded log line would leave the host unredacted
+
+> 🔢 **Filed 2026-09-06 -- built in the same pull request, banner left OPEN for the Lander.** Value **8/10** · Difficulty **4/10** · _no research_. The three filters `logging_setup._install_phi_filters` puts on every handler -- `RedactionFilter`, `CredentialQueryScrubFilter`, `ControlCharScrubFilter` -- carry no credential vocabulary between them. Seven credential shapes passed all three verbatim, with the OIDC `code`/`state` control scrubbing in the same run. Those filters sit on the stdout handler NSSM captures **and on the off-box syslog forwarder**, and there is no `FileHandler`, so they are the whole of what stands between a log call and the two sinks that leave the process.
+> Verdict: build
+> Research: none
+> Closing-act: code
+
+**Cluster:** logging / secret redaction. **Priority:** P1. **Verdict:** build.
+**Severity:** no live exposure (sec. 0 -- zero deployments). Written in the conditional throughout: **a deploying site that set `[logging].forward_host` would ship credential-bearing log lines off the host to its collector**, with none of `support/redact.py`'s work in the path. Nothing is exposed today because nothing is running. That removes the urgency and none of the fix.
+
+### The defect, measured three times
+
+Measured at `ebdfa44a6` by a builder working #1475, re-measured at `redact-domain-e1`'s head by the seat that filed this row, and re-measured here at `68693cfc2` before any code was written. All three agree. The instrument drives `RedactionFilter()`, `CredentialQueryScrubFilter()` and `ControlCharScrubFilter()` in production order over one `LogRecord` and reads `getMessage()`.
+
+| shape | before |
+|---|---|
+| `store encryption_key=<secret>` | passes verbatim |
+| `vault_token=<secret>` | passes verbatim |
+| `client_secret=<secret>` | passes verbatim |
+| `ad_bind_password=<secret>` | passes verbatim |
+| `tls_key_password=<secret>` | passes verbatim |
+| `private_key=<secret>` | passes verbatim |
+| `Authorization: Bearer <secret>` | passes verbatim |
+| **control:** `code=<secret>&state=abc` | **scrubbed, both parameters** |
+
+The control fired in the same run, so the instrument discriminates and the seven zeros are measured rather than assumed.
+
+**`CredentialQueryScrubFilter` was the only credential-aware filter on the chain, and it is scoped to a URL query string.** Its six keys are `code`, `state`, `id_token`, `access_token`, `token`, `session_state` -- the OIDC callback shape ADR 0142 AC-10 names. It reaches no engine setting name.
+
+### Why `support/redact.py` does not cover this
+
+`support/redact.py` is a **second** pass, over the support archive (`support/bundle.py`) and `GET /logs/tail`. It reads a log that has already been written. The syslog forwarder ships each record at write time, so a record on its way to a collector never passes through that module. Two surfaces, two passes, and only one of them had a credential vocabulary.
+
+### The fix, and the design call it rests on
+
+The credential-label vocabulary moves to a new package-root neutral leaf, **`messagefoundry/secretscrub.py`** -- stdlib `re` only, no engine, config, FastAPI or Qt imports, sited beside `redaction.py`, `controlchars.py` and `credential.py` for the reason `credential.py`'s own docstring gives. `logging_setup` imports it for its DEFINITION, the way it already imports `controlchars`. A fourth filter, `CredentialScrubFilter`, applies it to the rendered message, `exc_text` and `stack_info`, installed **after** `RedactionFilter` (which is what renders `exc_info` into `exc_text`) and **before** `ControlCharScrubFilter` (which must stay last).
+
+**A second, unplanned hole closed with it.** Three filters had hand-copied the same record walk and the fourth, `CredentialQueryScrubFilter`, carried only the message half -- so an OIDC authorization `code` inside a **traceback** was scrubbed by nothing, which ADR 0142 AC-10 forbids outright. No reviewer comparing four separate `filter` methods would see a field missing from one of them. The walk is now `_rewrite_record`, shared by three of the four filters, and the omission cannot be written. `RedactionFilter` keeps its own body because it also renders and clears `exc_info`, which is a different act.
+
+**Built BESIDE PR 973, not on top of it.** That PR (#1475, #1477) rewrites `support/redact.py` and also carries all four commits of PR 965, and neither is on `main`. Refactoring `support/redact.py` to compose the new module would have guaranteed a conflict on an open pull request and made this change depend on two unlanded ones. So the six credential patterns are stated in the new module and `support/redact.py` is untouched. **The follow-up is unfiled and named rather than numbered: once #1475 lands, `support/redact.py` should compose `secretscrub` instead of holding its own copy of those six, keeping its `mfb64:`, long-base64 and leading-timestamp markers, which are properties of that surface rather than of the vocabulary.**
+
+**Three of `support/redact.py`'s markers are deliberately NOT here**, and the reason is the surface, not the vocabulary:
+
+| marker | why it stays on the read-time surface |
+|---|---|
+| `_MFB64` | a message body is PHI, owned by `redaction.py` and by the "never log full bodies at INFO+" rule |
+| `_LONG_B64` | over-redaction is right for a file that leaves the box, wrong for a live operator console -- it would eat an `idempotency_key`, the identifier an operator traces a message by |
+| `_LEADING_TS` | a `LogRecord` carries its timestamp in `record.created`, not in the message, so there is nothing to carve |
+
+**`CredentialQueryScrubFilter` is NOT folded in either.** `code` and `state` are ordinary operational vocabulary (`code=404`, `state=RUNNING`); they are safe only because that filter is scoped to a query string. Admitting them to a general `label=value` rule would redact operator diagnostics and buy nothing. That list also carries a ruling about two names deliberately absent from it (#1184). **Two vocabularies with a stated boundary, not one vocabulary stated twice.**
+
+**The registries are not read at runtime**, and that is a decision rather than a limitation. `config/settings.py` imports `LOG_LEVELS` from `logging_setup`, so a `logging_setup` importing the registries back would close a cycle. #1475 separately refused the runtime read on its own ground: `_SECRET_SETTING_KEYS` is `/metadata`'s redaction policy, so a name dropped from it for a display reason would silently stop being scrubbed. The vocabulary is literal; the **guard** is derived.
+
+### The guard is #1475's, pointed at the write-time surface
+
+`tests/test_logging_credential_scrub.py::test_every_engine_credential_setting_is_scrubbed_or_excluded` reads `config/wiring.py::_SECRET_SETTING_KEYS` and `config/settings.py::_FILE_SECRET_KEYS` and requires every name in the union to be scrubbed by the production filter chain or excused in `EXCLUDED_FROM_SCRUBBING` with a stated reason. The assertion is two-sided: an exclusion that has quietly become false reds as loudly as a hole. A credential setting added to the engine that the log filters cannot see reds the suite rather than shipping silently.
+
+**Six names are excluded, and they are the whole of the username class** -- `username`, `basic_user`, `credential_username`, `http_auth_user`, `proxy_user`, `ws_username`. They are out on grounds the engine already recorded two layers deep: `redaction.py` states its own residual as an adversarially-crafted single-token identifier, and a username is one; `docs/PHI.md` says the forwarded stream still carries usernames and gives that as its reason for gating the off-box hop. A `label=value` rule reaches the wrong shape anyway -- a username leaks as `Login failed for user 'svc'`, as `UID=svc;`, as `CN=svc,OU=` or as the engine's own `actor=` audit field.
+
+### Cost, measured before and after -- this is a per-record path
+
+Reported as the **minimum single-call time over interleaved samples**. This box runs a fleet, so a mean carries other sessions' load; a minimum is the one statistic a load spike cannot inflate. The before/after **subtraction on the 6 KB lines is not reportable** -- the pre-existing PHI pass swings from 33 ms to 53 ms between runs, which is more than the whole delta -- so the marginal column below is measured directly, on the new filter alone, and it is self-consistent with the subtraction on every line short enough for the subtraction to be stable.
+
+| line | chain before | chain after | added |
+|---|---|---|---|
+| plain 65-char operational line | 6.4 us | 7.2 us | **+0.9 us** |
+| a real credential line (`ad_bind_password=...`) | 5.6 us | 9.3 us | **+3.7 us** |
+| 6 KB hyphen-and-dot run, naming no credential word | 33.25 ms | 33.27 ms | +15 us |
+| 6 KB base64url, naming one credential word | 33.18 ms | 33.70 ms | +0.49 ms |
+| 6 KB hyphen-and-dot run naming EVERY family | 33.26 ms | 54.67 ms | **+21 ms** |
+
+The first two are the cost actually paid. **The last row is the adversarial ceiling and it is stated rather than hidden.** Log text is attacker-influenceable and `_LABEL_PREFIX`'s bounded repetition is O(6N) per word-boundary start position, so a long dotted-or-hyphenated run naming every family defeats every admission gate. It is not a new class of hazard: `redaction.redact` costs 33 ms on the same line before this module runs at all, and `support/redact.py` has the identical property on `GET /logs/tail` today.
+
+**Two gate decisions carry the small numbers, and both were measured rather than assumed.**
+
+1. **A casefolded substring test, not a compiled alternation.** A `(?i)` alternation defeats the regex engine's literal-prefix optimisation, so it trial-matches every branch at every start position. On the plain line the union alternation cost 5.07 us and was **100 percent** of what this module added; `casefold()` plus `in` costs 0.40 us. `casefold` and not `lower`: `(?i)s` matches U+017F and `(?i)k` matches U+212A, while `lower()` leaves both alone, so a `lower()`-folded gate would be NARROWER than the pattern behind it. That is pinned with the leaked credential as the control, and a mutant swapping it is killed.
+2. **One gate per pass, not one shared.** On a 6 KB hyphen-and-dot run carrying the word "token": **21.8 ms** shared against **1.3 ms** per-pass, because only the token family is admitted.
+
+A gate that can narrow is a hole, so `test_the_hint_gates_never_change_the_result` compares the gated and ungated passes over every fixture rather than trusting the argument.
+
+**One lever was rejected on purpose.** A bounded lookahead requiring a separator within N characters of the label would collapse the adversarial row, and it would silently stop scrubbing a credential whose label is longer than the bound. Trading a silent security narrowing for time on a synthetic input, against a cost this module does not dominate, is the wrong direction.
+
+### The tests were proved able to fail
+
+**19 mutants, each hash-verified applied and reverted byte-identical, every one killed**, scored against `test_logging_credential_scrub.py`, `test_logging.py` and `test_phi_logging_inventory.py` together. A mutant whose replacement string does not match the file is refused rather than scored, because a mutant that did not apply and a test that cannot fail print the same passing count. The planted changes: uninstall the filter; install it before `RedactionFilter`; make the shared record walk read `record.msg`, or stop covering `exc_text`, or stop covering `stack_info`; put the query filter back on a message-only walk; give the query filter a second spelling of the placeholder; empty each of the three word tuples; drop `_LABEL_PREFIX`; break `_AUTH_SCHEME`, `_MEFOR_SECRET` and `_DSN_PASSWORD`; **narrow one admission gate below its pattern**; fold the gate with `lower()` instead of `casefold()`; gate on raw rather than folded text; excuse a real credential as a username; and drop the filter from `docs/PHI.md`.
+
+**The gate mutants are the ones worth naming.** Narrowing a gate leaves every family passing and every diagnostic intact -- only the gated-versus-ungated comparison sees it. Without that assertion a narrowed gate would be a silent hole wearing a green suite.
+
+**And one survivor was informative rather than a gap.** A first run scored "fold the word tuples with `lower()`" as unkillable, which is correct: every word in every tuple is ASCII, so `lower` and `casefold` agree on all of them. The load-bearing fold is on the TEXT, not the words. The mutant was re-aimed at the text, where it is killed, and the module comment was corrected to say which of the two folds carries the property.
+
+### Residuals, stated because the fix does not close them
+
+1. **A comma-joined `encryption_keys_retired` written with a SPACE after each comma** leaves its later elements unmatched. Unlike the support-bundle surface there is no long-base64 sweep behind this pass to catch them.
+2. **A label with more than six underscore-joined prefix segments is not reached.** Six is 3x the longest real label in this tree and nothing comes close, but the failure is silent in the one direction that matters.
+3. **Usernames are out of scope by design** (above), so the stdout log and the forwarded stream can carry an operator username. `docs/PHI.md` already says so.
+
+### Not checked
+
+I did not enumerate the engine's actual logging call sites to ask which of these shapes a running engine emits -- the filter is a by-construction control precisely so that question does not have to be answered per call site. I did not measure on a hosted runner; every number here is from one Windows box under fleet load, which is why the minimum statistic was used. I did not touch `support/redact.py` or `docs/SECURITY.md`. `.gitleaks.toml` gained an allowlist block for the nine synthetic sentinels the new fixtures trip on entropy -- exact literals, only the nine that actually trip, inserted before the #1183 block rather than appended, because PR 973 appends its own at the tail. `docs/PHI.md` section 7 was updated because it is the record for Gate #1 and `tests/test_phi_logging_inventory.py` derives the filter list from `logging_setup.__all__` -- a fourth filter reds that suite until the doc names it.
