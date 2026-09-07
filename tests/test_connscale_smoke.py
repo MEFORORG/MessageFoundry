@@ -39,10 +39,25 @@ paragraphs above spell out the loss and not only the replacement.
 
 It does NOT regression-cover wall #1 (executor) or wall #2 (pool) as REAL curves: at small N on
 SQLite the pool wall is a documented no-op and the executor is under-threshold — stated honestly here.
-The Postgres CI leg (pool_size forced to 1-2) gives the acquire-wait wall real small-N coverage.
+The Postgres CI leg gives the acquire-wait wall its real small-N coverage. It forces the pool to 4,
+NOT 1-2: ``.github/workflows/ci.yml`` sets ``MEFOR_STORE_POOL_SIZE: "4"`` on the ``postgres-store``
+job, and the comment above it records that "4 (not 1-2) is deliberate". That job runs ``pytest
+tests/test_connscale_postgres.py -v``. Its ``if`` is ``schedule || workflow_dispatch || merge_group
+|| serverdb == 'true'``, so an ordinary push build does not run it.
 
-A small N (12 → 24) keeps it inside the pytest-timeout budget; the shipped ``connscale-smoke`` profile
-(N=50/100), run via the ``--connscale`` CLI in CI, is the larger-N variant.
+A small N (12 to 24) keeps this module inside the pytest-timeout budget. THE SHIPPED
+``connscale-smoke`` PROFILE (N=50/100) IS NOT A CI VARIANT, AND THIS DOCSTRING USED TO SAY IT WAS
+(BACKLOG #1419). No workflow invokes it, and ``--connscale`` occurs nowhere under ``.github/``. The
+measurement is at ``harness/load/profiles/connscale-smoke.toml:6-12``; its ``description`` field and
+``tests/test_connscale_empty_claims_per_msg.py`` agree. Read it there, not here.
+
+CI'S CONNECTION-SCALE COVERAGE IS THIS MODULE'S OWN INLINE N=12/24 SWEEP. The whole-suite step
+``Tests (pytest)`` (``id: tests`` in ``ci.yml``) collects it. This file is not in
+``tests/tooling_manifest.txt``, and ``tests/conftest.py`` derives the ``tooling`` mark from that
+manifest by basename, so ``-m 'not tooling'`` does not filter it out. That step's ``if`` is ``code ==
+'true' || push || workflow_dispatch || merge_group``, so a pull request touching no code skips the
+step, and this coverage does not happen. Wiring a real N=50/100 leg up is PERF-36, named at
+``connscale-smoke.toml:11-12`` and stranded with the master-test-plan directory described above.
 """
 
 from __future__ import annotations
