@@ -42,10 +42,8 @@ from __future__ import annotations
 
 import asyncio
 import base64
-import hashlib
 import io
 import logging
-import os
 import re
 import ssl
 import time
@@ -130,13 +128,6 @@ _NS_WSU = "http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-ut
 _PW_TEXT = (
     "http://docs.oasis-open.org/wss/2004/01/"
     "oasis-200401-wss-username-token-profile-1.0#PasswordText"
-)
-_PW_DIGEST = (
-    "http://docs.oasis-open.org/wss/2004/01/"
-    "oasis-200401-wss-username-token-profile-1.0#PasswordDigest"
-)
-_NONCE_ENC = (
-    "http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-soap-message-security-1.0#Base64Binary"
 )
 
 # The envelope skeleton (SOAP 1.2 only; WS-* requires 1.2). Built by string concatenation, NOT
@@ -283,11 +274,6 @@ def _default_message_id() -> str:
     return f"urn:uuid:{uuid.uuid4()}"
 
 
-def _default_nonce() -> bytes:
-    """A fresh WS-Security nonce; overridable for deterministic tests."""
-    return os.urandom(16)
-
-
 class SoapDestination(DestinationConnector):
     """POST each SOAP envelope to a web-service endpoint (plain or WS-* mode; ADR 0003 + 0015)."""
 
@@ -333,7 +319,6 @@ class SoapDestination(DestinationConnector):
         # nonce and assert the values are minted in send() (ADR 0015 testing strategy).
         self._now_fn: Callable[[], float] = time.time
         self._uuid_fn: Callable[[], str] = _default_message_id
-        self._nonce_fn: Callable[[], bytes] = _default_nonce
 
         # #200 (ADR 0092): the per-connection insecure-hop attestation, keying the posture-keyed refusal.
         attested = config.tls_hop_attested
@@ -601,8 +586,19 @@ class SoapDestination(DestinationConnector):
                     "SOAP client cert is incompatible with verify_tls=false — the peer must be "
                     "verified (ADR 0015)"
                 )
-        if self.ws_password_type not in ("text", "digest"):
-            raise ValueError("SOAP ws_password_type must be 'text' or 'digest' (ADR 0015)")
+        if self.ws_password_type == "digest":  # nosec B105 -- a password *type*, not a secret
+            raise ValueError(
+                "SOAP ws_password_type='digest' is retired (BACKLOG #1171, ASVS 11.4.1). The "
+                "WS-Security UsernameToken PasswordDigest construction is defined by its profile as "
+                "Base64(SHA1(Nonce + Created + Password)), so the option could not be moved to an "
+                "approved hash without leaving the profile. It also bought nothing here: this "
+                "connector already refuses a UsernameToken over a cleartext hop, so the channel "
+                "protects the credential either way, and PasswordDigest additionally requires the "
+                "far side to store the password recoverably. Use ws_password_type='text' over the "
+                "TLS hop this connector already requires."
+            )
+        if self.ws_password_type != "text":  # nosec B105 -- a password *type*, not a secret
+            raise ValueError("SOAP ws_password_type must be 'text' (ADR 0015, BACKLOG #1171)")
         if self._ws_mode and self.version != "1.2":
             raise ValueError("SOAP ws_addressing/ws_security require soap_version='1.2' (ADR 0015)")
         # A UsernameToken password over cleartext http is a credential on the wire — refuse like the
@@ -670,23 +666,9 @@ class SoapDestination(DestinationConnector):
 
     def _build_username_token(self, created: str) -> str:
         username = _xml_escape(self.ws_username or "")
-        if self.ws_password_type == "digest":  # nosec B105 — a WS-Security password *type*, not a secret
-            nonce = self._nonce_fn()
-            # Legacy WS-Security UsernameToken digest = Base64(SHA1(Nonce + Created + Password)). This
-            # is the spec's token construction, NOT a message-integrity signature (SHA1 here is the
-            # profile's defined hash; XML-DSig is deferred — ADR 0015 §4a).
-            digest = base64.b64encode(
-                hashlib.sha1(  # noqa: S324  # nosec B324 — WS-Security UsernameToken profile, not integrity
-                    nonce + created.encode() + (self.ws_password or "").encode()
-                ).digest()
-            ).decode("ascii")
-            nonce_b64 = base64.b64encode(nonce).decode("ascii")
-            return (
-                f"<wsse:UsernameToken><wsse:Username>{username}</wsse:Username>"
-                f'<wsse:Password Type="{_PW_DIGEST}">{_xml_escape(digest)}</wsse:Password>'
-                f'<wsse:Nonce EncodingType="{_NONCE_ENC}">{nonce_b64}</wsse:Nonce>'
-                f"<wsu:Created>{created}</wsu:Created></wsse:UsernameToken>"
-            )
+        # PasswordText only. The PasswordDigest alternative was retired in BACKLOG #1171 -- see
+        # __init__'s refusal for the reasoning. `created` stays a parameter because the enclosing
+        # <wsu:Timestamp> uses it; the UsernameToken itself no longer carries a Created or a Nonce.
         password = _xml_escape(self.ws_password or "")
         return (
             f"<wsse:UsernameToken><wsse:Username>{username}</wsse:Username>"
