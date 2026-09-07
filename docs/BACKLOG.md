@@ -24644,9 +24644,11 @@ This row was **filed, not built**. Nobody has read the pinned requirement text a
 
 **This row is about the NEXT edit.** The moment someone makes the range event-aware -- which #1479's own comment explains was declined only because three of five triggers carry no base SHA -- the range acquires the ability to be empty, and on the trigger where the base is unpopulated it silently will be.
 
-### The fix, and why it must not re-derive the range
+### The fix: read the scanner's own report, never recompute its subject
 
-Assert the scan **walked something**, by reading the scanner's own reported count:
+**A check that recomputes its subject rather than reading the subject's own report is not a check.** That is the whole of this row, and it decides the implementation before any of the detail below.
+
+Assert the scan **walked something**, by reading the count the scanner itself printed:
 
 ```
 grep -qE '(^|[^0-9])[1-9][0-9]* commits scanned' gitleaks-scan.log
@@ -24654,9 +24656,15 @@ grep -qE '(^|[^0-9])[1-9][0-9]* commits scanned' gitleaks-scan.log
 
 Verified against real 8.18.4 output on four cases -- clean+scoped, empty range, unscoped, and a run carrying a finding: it fires on exactly the empty-range case and passes the other three. The count line is present even when findings are reported, so the guard does not depend on a clean run.
 
-**Do NOT implement this with `git rev-list --count <range>`.** That is a second copy of the range, free to drift from the flag it is supposed to be checking and to keep passing after that flag changes -- which is precisely the second-definition defect #1479 removed from this job's own header. The scanner's count is the one number that cannot drift from what the scanner did.
+**Do NOT implement this with `git rev-list --count <range>`.** That is a second copy of the range, free to agree today and drift tomorrow, and to go on passing after the flag it guards has changed -- which is precisely the second-definition defect #1479 removed from this job's own header. A guard that drifts from the flag it guards keeps passing, which is the exact failure it was written to prevent. The scanner's own count cannot drift from what the scanner did.
 
-Capturing the count needs the scan piped through `tee`, which needs `set -o pipefail`: GitHub's default `run:` shell is `bash -e`, without pipefail, so a findings-exit of 1 would otherwise be discarded by the pipe and the required gate would report success. That is the same vacuous-pass class, one layer down, so it must land in the same change.
+### The pipefail half, and the shortcut that must not be taken
+
+Capturing the count needs the scan piped through `tee`, and a pipe swallows the exit code that matters. GitHub's default `run:` shell is `bash -e {0}` -- **`-e` without `pipefail`** -- so a findings-exit of 1 would be discarded by the pipe and this required gate would report success. Same vacuous-pass class, one layer down, so `set -o pipefail` must land in the same change. Verified: the scan step declares no `shell:`, so it takes that default.
+
+**THE SHORTCUT IS `shell: bash`, AND IT IS THE WRONG FIX.** Naming the shell explicitly makes GitHub substitute `bash --noprofile --norc -eo pipefail {0}` instead of the bare default -- so the step would **silently acquire pipefail as a side effect of naming a shell it was already using**. Reject it. A reader seeing `shell: bash` cannot tell that error semantics changed, and a later edit removing it as redundant re-introduces the defect while looking like a cleanup. That is the same hidden-mechanism hazard this row is about, one layer further down again.
+
+The repository already agrees, measured 2026-09-07 over `.github/workflows/*.yml`: **12 workflows set `pipefail` explicitly; 3 files use `shell: bash` at all.** Explicit is both the local idiom and the legible one.
 
 ### Add a control, or the guard is deletable in silence
 
@@ -24664,7 +24672,7 @@ Capturing the count needs the scan piped through `tee`, which needs `set -o pipe
 
 ### Provenance
 
-Raised by a peer session reviewing #1479, which asked what the range evaluates to on a `merge_group` run and named the failure mode as a silent pass rather than a red. That was the right question: #1479's stated posture was "if the merge-group run fails, that is the finding", which covers the red case and not this one. The range turned out to be safe; the hazard it pointed at is real and is filed here rather than bolted onto a green pull request that was unblocking a frozen merge queue.
+Raised by a peer session reviewing #1479, which asked what the range evaluates to on a `merge_group` run and named the failure mode as a silent pass rather than a red. The same session then supplied the `shell: bash` trap above and the generalisation that leads the fix section -- both are theirs, and the row is better for them. That was the right question: #1479's stated posture was "if the merge-group run fails, that is the finding", which covers the red case and not this one. The range turned out to be safe; the hazard it pointed at is real and is filed here rather than bolted onto a green pull request that was unblocking a frozen merge queue.
 
 ### Not checked
 
