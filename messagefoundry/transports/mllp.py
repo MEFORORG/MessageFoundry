@@ -27,7 +27,6 @@ import ssl
 import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
-from datetime import datetime
 from typing import Any
 
 import hl7
@@ -60,6 +59,7 @@ from messagefoundry.config.tls_policy import (
 from messagefoundry.parsing.message import emit_raw_separators
 from messagefoundry.parsing.peek import HL7PeekError, Peek, normalize
 from messagefoundry.redaction import safe_exc
+from messagefoundry.timezone import hl7_now
 from messagefoundry.transports.base import (
     DeliveryError,
     DeliveryResponse,
@@ -353,10 +353,16 @@ def build_ack(
     echoing the inbound control id). ``timestamp`` is MSH-7; pass one to pin it (tests),
     otherwise it defaults to the current HL7 DTM so strict senders that reject an empty
     MSH-7 don't NAK-loop and re-send (review low-6).
+
+    The default MSH-7 carries an **explicit numeric UTC offset** (``YYYYMMDDHHMMSS±ZZZZ``, the
+    HL7 v2 DTM/TS form). A bare local stamp would be ambiguous across a daylight-saving fall-back —
+    the same wall-clock hour occurs twice — so a receiver correlating an acknowledgement against its
+    own UTC-stamped record would mis-order events by an hour. An explicit offset pins the instant.
+    An operator-supplied ``timestamp`` is used verbatim; the caller owns its form.
     """
     if code not in _CODES[AckMode.ORIGINAL]:
         raise ValueError(f"unknown ack code {code!r} (expected AA, AE or AR)")
-    timestamp = timestamp or datetime.now().strftime("%Y%m%d%H%M%S")
+    timestamp = timestamp or hl7_now(with_offset=True)
     msa1 = _CODES[ack_mode if ack_mode is not AckMode.NONE else AckMode.ORIGINAL][code]
 
     try:

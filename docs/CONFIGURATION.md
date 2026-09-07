@@ -1175,7 +1175,11 @@ A provider is consulted **only** for a credential whose per-credential `*_secret
 store password is seam-only (managed identity is preferred there). A reference is `"<kv-path>"` or
 `"<kv-path>#<field>"` for `vault` (field defaults to `value`; KV mount from `MEFOR_SECRETS_VAULT_KV_MOUNT`,
 default `secret`); Vault address/token come from `MEFOR_SECRETS_VAULT_ADDR` / `MEFOR_SECRETS_VAULT_TOKEN`
-(falling back to hvac's `VAULT_ADDR` / `VAULT_TOKEN`). **Fail-closed:** a reference with `provider = none`,
+(falling back to hvac's `VAULT_ADDR` / `VAULT_TOKEN`). Point `MEFOR_SECRETS_VAULT_CA_FILE` at the PEM of
+the CA that issued your Vault server's certificate to verify that hop against your own PKI instead of the
+public bundle `requests` ships with (BACKLOG #1180; the store KeyProvider's twin is
+`MEFOR_STORE_VAULT_CA_FILE`) — a path, not a secret, and unset leaves the hop exactly as it was.
+**Fail-closed:** a reference with `provider = none`,
 an unknown provider, a missing `[vault]` extra, or an unresolvable/empty secret raises at load/connect —
 never a blank credential; the value is never logged.
 
