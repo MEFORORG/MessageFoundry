@@ -592,11 +592,20 @@ jobs:
   gitleaks:
     name: gitleaks (secret scan)
     runs-on: ubuntu-latest
-    # BLOCKING: full-history scan came back clean; a newly-introduced secret now fails the build.
+    # BLOCKING: a newly-introduced secret fails the build.
+    #
+    # THE SCOPE IS STATED ONCE, ON THE SCAN STEP BELOW, AND MUST NOT BE RESTATED HERE. This line read
+    # "full-history scan came back clean" until 2026-09-07, which was a second definition of the scope
+    # sitting thirty lines above the real one -- and it went false the moment the scan was scoped
+    # (BACKLOG #1479). That is the drift CLAUDE.md section 11 (SDS-3.5) forbids, on the exact fact.
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          fetch-depth: 0 # full history so the scan also covers earlier commits, not just the tip
+          # Full history of the ref under test, so the scan covers earlier commits and not just the
+          # tip. STILL LOAD-BEARING AFTER THE `--log-opts` SCOPING BELOW, and for the same reason it
+          # always was: that flag walks every ancestor of HEAD, which a shallow clone has not fetched.
+          # Dropping this to 1 would silently reduce the scan to one commit.
+          fetch-depth: 0
       - name: Install gitleaks (pinned + checksum-verified)
         run: |
           # Pin the release; bump deliberately. Verify the tag exists if this step 404s.
@@ -617,8 +626,55 @@ jobs:
           tar -xzf "$asset" gitleaks
           sudo install -m 0755 gitleaks /usr/local/bin/gitleaks
           gitleaks version
-      - name: Scan repository for secrets
-        run: gitleaks detect --config .gitleaks.toml --redact --verbose --no-banner
+      - name: Scan the ref under test for secrets
+        # `--log-opts HEAD` IS THE WHOLE POINT OF THIS LINE. With the flag unset gitleaks walks EVERY
+        # REF, and the `fetch-depth: 0` above has fetched every branch and tag -- so the job answered
+        # "does ANY ref in this repository contain a secret" while branch protection read the answer
+        # as "does THIS ref contain a secret". The job's own name and the comment above it both stated
+        # the narrower question; the configuration overshot it.
+        #
+        # MEASURED on the pinned 8.18.4 binary, in a repository whose `main` holds 3 commits and whose
+        # unmerged side branch holds 4 more (7 reachable in total). Unset, it reports "7 commits
+        # scanned"; with `--log-opts HEAD`, "3 commits scanned" -- exactly `git rev-list --count --all`
+        # and `git rev-list --count HEAD`. The commit COUNTS are the instrument here rather than the
+        # argv, because they answer the question actually being asked: which commits get graded.
+        #
+        # NOT A HYPOTHETICAL. On 2026-09-06 a synthetic redaction fixture at commit 0b47402cd --
+        # present only on the unmerged branch `origin/redact-domain-e1`, never an ancestor of `main`
+        # -- turned this required context red at 00:08Z after three clean runs. Because this workflow
+        # also runs on `merge_group`, it reddened the queue: the merge-group runs for pr-953, pr-954
+        # and pr-963 all failed here. Merging was frozen for over four hours and five entries were
+        # evicted. Reproduce the reachability with:
+        #     git branch -r --contains 0b47402cd
+        #     git merge-base --is-ancestor 0b47402cd origin/main    # false
+        #
+        # THE CLASS, WHICH IS WORSE THAN THE OUTAGE: anyone who can push a branch could red `main`'s
+        # required secret gate and stop all merging, with no pull request and no review. That is an
+        # availability lever, and here it fired by accident.
+        #
+        # THE COST, STATED RATHER THAN SOLD AS FREE. A branch nobody has opened a pull request for is
+        # no longer scanned -- that coverage is genuinely given up, not relocated. `branch-leak-scan.yml`
+        # is the workflow that already watches branch pushes with no pull request, and it runs only
+        # `scan_forbidden.py`; relocating secret detection there is the obvious follow-up and is NOT
+        # done here. Coverage of the MERGE PATH is unchanged: this workflow also runs on `pull_request`
+        # (where checkout resolves the merge ref, so HEAD's ancestors are the base plus the pull
+        # request's own commits) and on `push: branches: [main]` (where HEAD is `main`'s full history).
+        # Under `merge_group`, HEAD is the queue commit. So every path by which content can reach
+        # `main` is still walked in full.
+        #
+        # WHAT SCOPING DOES NOT FIX, said plainly so nobody reads it as more than it is: HEAD's
+        # ancestry on a pull request INCLUDES all of `main`, so a secret that actually merges still
+        # reddens every pull request and every queue entry at once. The remedy for that is an
+        # allowlist entry or a history rewrite -- never a per-pull-request workaround.
+        #
+        # `HEAD` RATHER THAN AN EVENT-DEPENDENT RANGE, and the real reason is not the one you would
+        # guess: only TWO of the five triggers above carry a base SHA at all (`pull_request.base.sha`
+        # and `merge_group.base_sha`). `push`, `schedule` and `workflow_dispatch` carry none, so a
+        # range needs a three-way fallback AND would drop the post-merge sweep of `main`'s own
+        # history. The template-injection objection -- an expression interpolated into a `run:` body --
+        # is NOT the reason: this repo already hoists base SHAs into a step `env:` for exactly that
+        # (backlog-hygiene.yml, precommit-replay.yml), so a range would have been reachable.
+        run: gitleaks detect --config .gitleaks.toml --log-opts HEAD --redact --verbose --no-banner
 
   semgrep:
     name: semgrep (project SAST rules)
