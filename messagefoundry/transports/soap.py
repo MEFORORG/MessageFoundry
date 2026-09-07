@@ -63,7 +63,13 @@ from xml.sax.saxutils import escape as _xml_escape  # nosec B406 — pure string
 from xml.sax.xmlreader import InputSource  # nosec B406 — fed only the hardened, no-DTD parser
 
 from messagefoundry.config.models import ConnectorType, Destination
-from messagefoundry.config.tls_policy import harden_cipher_suites, relax_verify_expiry
+from messagefoundry.config.tls_policy import (
+    SYSTEM_TRUST_ANCHOR,
+    TrustAnchor,
+    build_verifying_client_context,
+    harden_cipher_suites,
+    relax_verify_expiry,
+)
 from messagefoundry.transports.base import (
     DeliveryError,
     DeliveryResponse,
@@ -71,6 +77,11 @@ from messagefoundry.transports.base import (
     NegativeAckError,
     encode_wire_body,
     register_destination,
+)
+from messagefoundry.transports.bounded_read import (
+    ResponseTooLargeError,
+    read_bounded,
+    read_bounded_text,
 )
 
 # Reuse REST's hardened HTTP plumbing — same transports/ package, same no-redirect + TLS posture.
@@ -88,6 +99,7 @@ from messagefoundry.transports.rest import (
     enforce_outbound_length_limits,
     enforce_send_time_length_limits,
     enforce_signature_header_limits,
+    http_family_trust_anchor,
     normalize_header_allowlist,
     refuse_cleartext_credential_hop,
     refuse_cleartext_credentials,
@@ -179,6 +191,7 @@ def _client_cert_opener(
     *extra_handlers: urllib.request.BaseHandler,
     allow_expired: bool = False,
     host: str = "",
+    trust_anchor: TrustAnchor = SYSTEM_TRUST_ANCHOR,
 ) -> urllib.request.OpenerDirector:
     """A no-redirect opener that presents a **client certificate** for mutual TLS (ADR 0015 §3).
 
@@ -189,8 +202,14 @@ def _client_cert_opener(
 
     ``allow_expired`` (#129, ADR 0094) relaxes ONLY the peer cert's validity-period check (chain +
     hostname stay enforced) — the granular expiry tolerance, composable with mTLS. Default off =
-    byte-identical."""
-    ctx = ssl.create_default_context()
+    byte-identical.
+
+    ``trust_anchor`` (#1180, ADR 0093) selects the roots that verify the SERVER; the client identity
+    loaded below is a separate direction and is untouched by it. The default resolves to the OS trust
+    store, which is the ``ssl.create_default_context()`` this line used to be. mTLS is exactly the
+    deployment where an internal CA is likeliest, so leaving this hop unable to name one was the
+    sharpest edge of the inexpressible slice."""
+    ctx = build_verifying_client_context(trust_anchor)
     ctx.minimum_version = ssl.TLSVersion.TLSv1_2
     ctx.load_cert_chain(certfile, keyfile, password)
     if allow_expired:
@@ -392,6 +411,11 @@ class SoapDestination(DestinationConnector):
                 revocation_attested=config.tls_revocation_attested,
             )
 
+        # #1180 (ADR 0093): the client trust anchor, shared by every VERIFYING branch below. Not
+        # resolved on the verify_tls=false branch, which is CERT_NONE and has no roots to choose.
+        anchor = http_family_trust_anchor(
+            s, url=self.url, trust_anchor_policy=config.trust_anchor_policy
+        )
         if self.client_cert_file and self.client_key_file:  # NEW — mutual TLS, takes precedence
             self._opener: urllib.request.OpenerDirector = _client_cert_opener(
                 self.client_cert_file,
@@ -400,17 +424,21 @@ class SoapDestination(DestinationConnector):
                 *proxy_handlers,  # ADR 0126: forward proxy threaded through the mTLS opener too
                 allow_expired=bool(s.get("tls_allow_expired", False)),  # #129 (ADR 0094)
                 host=urllib.parse.urlsplit(self.url).hostname or "",
+                trust_anchor=anchor,
             )
         elif bool(s.get("verify_tls", True)):
             # #129 (ADR 0094): granular expiry-only relaxation — verify chain + hostname but tolerate an
             # expired peer cert (opt-in; default off = the shared verifying opener, byte-identical).
             if bool(s.get("tls_allow_expired", False)):
                 self._opener = _expiry_relaxed_opener(
-                    urllib.parse.urlsplit(self.url).hostname or "", *proxy_handlers
+                    urllib.parse.urlsplit(self.url).hostname or "",
+                    *proxy_handlers,
+                    trust_anchor=anchor,
                 )
-            elif proxy_handlers:
+            elif proxy_handlers or anchor.narrows:
                 # A forward proxy → a per-connection verifying opener carrying it (never the shared one).
-                self._opener = _no_redirect_opener(*proxy_handlers)
+                # A narrowed trust anchor needs its own opener for the same reason.
+                self._opener = _no_redirect_opener(*proxy_handlers, trust_anchor=anchor)
             else:
                 self._opener = _NO_REDIRECT_OPENER
         else:
@@ -750,7 +778,10 @@ class SoapDestination(DestinationConnector):
         )
         try:
             with self._opener.open(req, timeout=self.timeout) as resp:
-                resp.read()
+                # ASVS 15.2.2: the HEAD probe body is discarded, but an unbounded drain would let a
+                # reachability check be turned into a memory exhaustion. Unlike the length gate this
+                # method deliberately omits, this bound CAN fire: the peer chooses the body.
+                read_bounded(resp, connector=f"SOAP {_redact_url(self.url)} probe")
         except urllib.error.HTTPError as exc:
             if exc.code in (401, 403):
                 raise DeliveryError(
@@ -809,7 +840,11 @@ class SoapDestination(DestinationConnector):
             raise
         try:
             with self._opener.open(req, timeout=self.timeout) as resp:
-                body = resp.read().decode(self.encoding, errors="replace")
+                # ASVS 15.2.2: bounded on the socket read. One SOAP response envelope sits far under
+                # the 16 MiB ceiling, so this refuses only a peer that is broken or hostile.
+                body = read_bounded_text(
+                    resp, connector=f"SOAP {_redact_url(self.url)}", encoding=self.encoding
+                )
                 status = int(getattr(resp, "status", 200))
                 # #154: capture only the allow-listed response headers (empty allow-list → {}).
                 headers = capture_response_headers(
@@ -818,7 +853,23 @@ class SoapDestination(DestinationConnector):
                 return body, status, headers
         except urllib.error.HTTPError as exc:
             try:
-                body = exc.read().decode(self.encoding, errors="replace")
+                # ASVS 15.2.2: the fault body is bounded too. It is only ever read to CLASSIFY the
+                # non-2xx, so an over-cap one is logged and dropped rather than raised: the delivery
+                # already fails below on the status, and raising here would swap a classified
+                # failure for an unclassified one.
+                body = read_bounded_text(
+                    exc,
+                    connector=f"SOAP {_redact_url(self.url)} fault body",
+                    encoding=self.encoding,
+                )
+            except ResponseTooLargeError:
+                logger.warning(
+                    "SOAP %s returned an HTTP %s fault body over the response bound; "
+                    "classifying on the status alone",
+                    _redact_url(self.url),
+                    exc.code,
+                )
+                body = ""
             except Exception:  # noqa: BLE001 - a body we can't read just becomes status-only
                 body = ""
             # A non-2xx status: _classify_soap always returns a failure here (it returns None only on

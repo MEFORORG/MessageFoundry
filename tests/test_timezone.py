@@ -200,6 +200,36 @@ def test_hl7_now_zoned_date_precision_carries_no_offset() -> None:
     assert len(out) == 8 and out.isdigit()
 
 
+def test_hl7_now_with_offset_appends_the_hosts_own_offset() -> None:
+    # BACKLOG #1196: a caller stamping a value another system will correlate needs an instant, not a
+    # bare wall clock, and cannot always name an IANA zone. Pin the offset value, not just the shape.
+    out = hl7_now(with_offset=True)
+    assert len(out) == 19 and out[14] in "+-"
+    host_offset = datetime.now().astimezone().utcoffset()
+    assert host_offset is not None
+    total = int(host_offset.total_seconds() // 60)
+    sign = "+" if total >= 0 else "-"
+    assert out[14:] == f"{sign}{abs(total) // 60:02d}{abs(total) % 60:02d}"
+
+
+def test_hl7_now_with_offset_is_ignored_for_date_precision() -> None:
+    # Same rule the tz path already follows: an offset on a date-only value is nonsensical.
+    out = hl7_now(precision="day", with_offset=True)
+    assert len(out) == 8 and out.isdigit()
+
+
+def test_hl7_now_tz_wins_over_with_offset() -> None:
+    # A named zone already appends its own offset; with_offset must not double-stamp or override it.
+    out = hl7_now(precision="second", tz=EASTERN, with_offset=True)
+    assert len(out) == 19
+    assert out[-5:] in ("-0400", "-0500")
+
+
+def test_hl7_now_default_still_carries_no_offset() -> None:
+    # The new keyword must not change the default: existing callers keep the bare local stamp.
+    assert hl7_now().isdigit()
+
+
 def test_hl7_now_rejects_bad_precision() -> None:
     with pytest.raises(ValueError, match="precision"):
         hl7_now(precision="century")
