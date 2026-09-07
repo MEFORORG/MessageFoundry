@@ -58,6 +58,11 @@ from messagefoundry.transports.base import (
     encode_wire_body,
     register_destination,
 )
+from messagefoundry.transports.bounded_read import (
+    ResponseTooLargeError,
+    read_bounded,
+    read_bounded_text,
+)
 
 # Reuse REST's hardened HTTP plumbing — same transports/ package, same no-redirect + TLS posture
 # (NOT a wrapper around RestDestination; ADR 0022 §2, exactly as soap.py does).
@@ -625,7 +630,10 @@ class FhirDestination(DestinationConnector):
             raise
         try:
             with self._opener.open(req, timeout=self.timeout) as resp:
-                resp.read()
+                # ASVS 15.2.2: the probe body is discarded, but draining it unbounded would let a
+                # reachability check be turned into a memory exhaustion. A CapabilityStatement is the
+                # largest honest reply here and sits far under the 16 MiB ceiling.
+                read_bounded(resp, connector=f"FHIR {_redact_url(self.base_url)} probe")
         except urllib.error.HTTPError as exc:
             if exc.code in (401, 403):
                 raise DeliveryError(
@@ -689,7 +697,13 @@ class FhirDestination(DestinationConnector):
                 method=method,
             )
             with self._opener.open(req, timeout=self.timeout) as resp:
-                body = resp.read().decode(self.encoding, errors="replace")
+                # ASVS 15.2.2: bounded on the socket read. A FHIR write returns the created resource
+                # or an OperationOutcome, both orders of magnitude under the 16 MiB ceiling.
+                body = read_bounded_text(
+                    resp,
+                    connector=f"FHIR {_redact_url(self.base_url)}",
+                    encoding=self.encoding,
+                )
                 status = int(getattr(resp, "status", 200))
                 # #154: capture only the allow-listed response headers (empty allow-list → {}).
                 headers_out = capture_response_headers(
@@ -698,7 +712,23 @@ class FhirDestination(DestinationConnector):
                 return body, status, headers_out
         except urllib.error.HTTPError as exc:
             try:
-                body = exc.read().decode(self.encoding, errors="replace")
+                # ASVS 15.2.2: the error body is bounded too. It is only ever read to CLASSIFY the
+                # non-2xx, so an over-cap one is logged and dropped rather than raised: the delivery
+                # already fails below on the status, and raising here would swap a classified
+                # failure for an unclassified one.
+                body = read_bounded_text(
+                    exc,
+                    connector=f"FHIR {_redact_url(self.base_url)} error body",
+                    encoding=self.encoding,
+                )
+            except ResponseTooLargeError:
+                logger.warning(
+                    "FHIR %s returned an HTTP %s error body over the response bound; "
+                    "classifying on the status alone",
+                    _redact_url(self.base_url),
+                    exc.code,
+                )
+                body = ""
             except Exception:  # noqa: BLE001 - a body we can't read just becomes status-only
                 body = ""
             if self._token_provider is not None and exc.code == 401:
@@ -1052,9 +1082,21 @@ class FhirLookupExecutor:
         )
         try:
             with self._opener[connection].open(req, timeout=self._timeout[connection]) as resp:
-                read_body = resp.read().decode(encoding, errors="replace")
+                # ASVS 15.2.2 -- the byte bound on the live lookup (ADR 0043). This is the one egress
+                # read whose size a Handler's own query shapes: a `_count` the Handler chose, or a
+                # partner that ignores paging, would otherwise buffer a whole searchset inside the
+                # transform worker, where it is charged against the engine and not against a message.
+                read_body = read_bounded_text(
+                    resp,
+                    connector=f"FHIR {_redact_url(base)} lookup",
+                    encoding=encoding,
+                )
                 status = int(getattr(resp, "status", 200))
                 return read_body, status
+        except ResponseTooLargeError as exc:
+            # A FhirLookupError, not a delivery error: this read runs inside a Handler, so there is
+            # no message to dead-letter and the Handler sees the failure directly.
+            raise FhirLookupError(f"fhir_lookup on {connection!r}: {exc}") from exc
         except urllib.error.HTTPError as exc:
             if token is not None and exc.code == 401:
                 token.invalidate()  # the bearer may have expired between mint and use — drop it
@@ -1117,7 +1159,11 @@ class FhirLookupExecutor:
         )
         try:
             with self._opener[connection].open(req, timeout=self._timeout[connection]) as resp:
-                resp.read()
+                # ASVS 15.2.2: the probe body is discarded, but an unbounded drain would let a
+                # reachability check be turned into a memory exhaustion.
+                read_bounded(resp, connector=f"FHIR {_redact_url(base)} lookup probe")
+        except ResponseTooLargeError as exc:
+            raise FhirLookupError(f"FhirLookup {connection!r}: {exc}") from exc
         except urllib.error.HTTPError as exc:
             if exc.code in (401, 403):
                 raise FhirLookupError(
