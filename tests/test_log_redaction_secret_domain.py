@@ -210,6 +210,20 @@ FAMILIES: tuple[Family, ...] = (
         secret="nk-N3xt_Key-22",
         patterns=("_KEY_MATERIAL",),
     ),
+    Family(
+        # A SCREAMING_SNAKE key label, declaring ``_KEY_MATERIAL`` ALONE. Measured 2026-09-06 with a
+        # mutation harness: dropping the case fold from ``_KEY_MATERIAL`` left this whole file green
+        # without this row. ``mefor_env_value`` is the only other family reaching an upper-case key
+        # label, and its comment says outright that it declares ``_KEY_MATERIAL`` *because* the pattern
+        # folds case -- but it declares ``_MEFOR_SECRET`` too, and the mutation fixture disables both
+        # at once, so it could not tell a folding pattern from a non-folding one. This row can.
+        # ``ENCRYPTION_KEYS_RETIRED`` rather than a shorter label so the folded reach also crosses the
+        # ``(?:s_retired)?`` tail of the factored alternate.
+        name="screaming_snake_key_material",
+        line="rotation ready ENCRYPTION_KEYS_RETIRED=ek-Upr_Key-12 pending",
+        secret="ek-Upr_Key-12",
+        patterns=("_KEY_MATERIAL",),
+    ),
 )
 
 
@@ -401,6 +415,94 @@ def test_the_label_prefix_repetition_stays_bounded() -> None:
     # too low to be useful would pass the assertion above while silently reverting the fix.
     for label in ("ad_bind_password", "tls_key_password", "client_secret", "bearer_token"):
         assert REDACTION_PLACEHOLDER in redact_log_line(f"{label}=pw-B0und_Chk-99")
+
+
+#: Patterns whose case fold is scoped to an inline ``(?i:...)`` rather than set for the whole regex.
+#: The set is exact, so scoping a fourth pattern is a deliberate edit that also lands in the guard.
+SCOPED_CASE_FOLD_PATTERNS = ("_BEARER", "_CREDENTIAL_KV", "_KEY_MATERIAL")
+
+#: Lines the fold guard below runs in four case spellings each. Built from the fixtures this file
+#: already maintains, so it widens automatically as families and diagnostics are added, plus the
+#: label shapes that only ``_BEARER``'s second alternation reaches.
+_CASE_FOLD_CORPUS: tuple[str, ...] = (
+    *(fam.line for fam in FAMILIES),
+    *ORDINARY_DIAGNOSTICS,
+    "upstream sent Authorization: Bearer sk-live-AbCdEf_1234-XYZ",
+    "upstream sent Authorization: Basic sk-live-AbCdEf_1234-XYZ",
+    "upstream sent Authorization: Digest sk-live-AbCdEf_1234-XYZ",
+    "a.b.c.d.e.f.encryption_keys_retired=k1-Ret_A-01,k2-Ret_B-02",
+    "a-b-c-d-e-f-private_key=pk-Priv_Key-33",
+    "svc_client_secret='sc-V4ult_Val-44';UID=svc",
+)
+
+
+@pytest.mark.parametrize("name", SCOPED_CASE_FOLD_PATTERNS)
+def test_a_scoped_case_fold_matches_exactly_what_a_global_one_would(name: str) -> None:
+    """Scoping ``(?i)`` down to ``(?i:...)`` is an OPTIMIZATION, so it must change no match.
+
+    Three patterns fold case on an alternation of literal keywords instead of on the whole regex,
+    because a global fold also folds the scanned ``_LABEL_PREFIX`` class and costs 18 to 30 percent for
+    nothing. The reasoning and the numbers are on ``_BEARER`` in the module.
+
+    THE CONTROL IS THE PATTERN'S OWN SOURCE RECOMPILED WITH ``re.IGNORECASE``, which is the thing the
+    scoped form is claiming to be equivalent to. That makes this a structural guard rather than an
+    enumeration: it covers every ``(?i:...)`` site at once -- ``_BEARER`` has TWO, and its second one
+    is the load-bearing auth-scheme group -- and it covers the fourth site the day someone adds one.
+    Nine hand-picked spellings would cover only the sites that exist today.
+
+    THE HAZARD IT EXISTS FOR IS A PARTIAL EDIT. With one global flag, the fold could not be half
+    removed. As a local token repeated per alternation, a tidy-up can drop it from one site and leave
+    the others, and the shipped fixtures cannot see that: the family covering the auth-scheme line
+    declares ``_AUTH_SCHEME`` alongside ``_BEARER``, so it stays green on the other pattern's work --
+    this file's own "green a DIFFERENT pattern bought" failure, one layer down.
+    """
+    scoped: re.Pattern[str] = getattr(redact_mod, name)
+    globally_folded = re.compile(scoped.pattern, re.IGNORECASE)
+
+    # Positive control: a corpus that never exercises a case difference would make this vacuous.
+    assert any(line != line.upper() for line in _CASE_FOLD_CORPUS)
+
+    for line in _CASE_FOLD_CORPUS:
+        for variant in (line, line.upper(), line.lower(), line.title()):
+            assert [(m.span(), m.group(1)) for m in scoped.finditer(variant)] == [
+                (m.span(), m.group(1)) for m in globally_folded.finditer(variant)
+            ], (
+                f"{name}: the scoped (?i:...) does not match what a global (?i) would, on {variant!r}. "
+                "A fold has been dropped from one alternation, or added to a span that changes a match."
+            )
+
+
+@pytest.mark.parametrize("scheme", ("bearer", "Bearer", "basic", "Basic", "digest", "Digest"))
+def test_the_bearer_pattern_folds_case_on_the_auth_scheme_word(
+    scheme: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``_BEARER``'s optional ``(?:bearer|basic|digest)\\s+`` group must consume the auth scheme.
+
+    THIS IS NOT THE FOLD GUARD -- ``test_a_scoped_case_fold_matches_exactly_what_a_global_one_would``
+    is, and it covers this group's ``(?i:...)`` along with every other. This one covers what an
+    equivalence check structurally cannot: DELETING the scheme group leaves the scoped and the globally
+    folded spellings equivalent to each other, and leaks the credential. Without the group, ``\\S+``
+    matches the scheme WORD rather than the token, so "Authorization: Bearer <tok>" redacts "Bearer"
+    and prints <tok>. That is BACKLOG #1183's original defect.
+
+    NOTHING ELSE IN THIS FILE CAN SEE THAT EITHER. ``authorization_bearer_header`` declares
+    ``_AUTH_SCHEME`` beside ``_BEARER``, so it stays green on the other pattern's work -- this file's
+    own "green a DIFFERENT pattern bought" failure, one layer down. So ``_AUTH_SCHEME`` is disabled
+    here and ``_BEARER`` has to do the whole job alone.
+
+    ONE LOWERCASE AND ONE CAPITALISED SPELLING PER SCHEME WORD, and each pair has a job: the lowercase
+    proves the word is still IN the alternation, the capitalised proves the group folds. Further
+    spellings of the same word (BEARER, BeArEr) cannot fail independently of the pair, so they would be
+    one case wearing three names.
+    """
+    monkeypatch.setattr(redact_mod, "_AUTH_SCHEME", NEVER_MATCHES)
+    secret = "sk-live-AbCdEf_1234-XYZ"
+    out = redact_log_line(f"upstream sent Authorization: {scheme} {secret}")
+    assert secret not in out, (
+        f"{scheme}: the credential survived _BEARER with _AUTH_SCHEME disabled, so the scheme group is "
+        f"not folding case -- it matched the scheme word as the value instead. Got {out!r}"
+    )
+    assert REDACTION_PLACEHOLDER in out, f"{scheme}: nothing was marked redacted -- got {out!r}"
 
 
 #: A sentinel carrying a hyphen AND an underscore, so ``_LONG_B64`` cannot reach it. Without that the
