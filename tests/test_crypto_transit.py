@@ -27,7 +27,12 @@ import pytest
 from messagefoundry.config.settings import StoreSettings
 from messagefoundry.store import crypto_transit
 from messagefoundry.store.base import build_store_cipher
-from messagefoundry.store.crypto import Cipher, CipherError, cell_aad
+from messagefoundry.store.crypto import (
+    Cipher,
+    CipherError,
+    IdentityCipher,
+    cell_aad,
+)
 from messagefoundry.store.crypto_transit import TransitCipher, build_transit_cipher
 from messagefoundry.store.keyprovider import KeyProviderError
 from messagefoundry.store.store import MessageStore
@@ -536,5 +541,69 @@ async def test_live_open_store_lands_dek_free_at_rest(tmp_path: Path) -> None:
         # The store's own live Transit cipher round-trips a controlled cell.
         probe = store._cipher.encrypt("x", aad=cell_aad("t", "c", 1))
         assert store._cipher.decrypt(probe, aad=cell_aad("t", "c", 1)) == "x"
+    finally:
+        await store.close()
+
+
+class _StubProviderCipher:
+    """A cipher that HOLDS keys but cannot rewrite them in place, like ``TransitCipher``.
+
+    Deliberately not a TransitCipher: building one needs Vault. What is under test is the branch
+    that separates "no key, nothing to rotate" from "keys exist elsewhere", so any non-identity,
+    non-AesGcm cipher exercises it.
+    """
+
+    active_marker_prefix = "mfenc:v3:stub:"
+
+    def encrypt(self, plaintext: str, *, aad: bytes | None = None) -> str:
+        return self.active_marker_prefix + plaintext
+
+    def decrypt(self, stored: str, *, aad: bytes | None = None) -> str:
+        return stored.removeprefix(self.active_marker_prefix)
+
+
+# --- rotation must REFUSE, never report zero (BACKLOG #1165, ASVS 11.2.2) ---------------------------
+
+
+async def test_rotation_refuses_rather_than_reporting_zero_under_a_provider_cipher(
+    tmp_path: Path,
+) -> None:
+    """A cipher whose keys live in the provider cannot re-encrypt in place, and must SAY so.
+
+    Measured before this refusal existed: `reencrypt_to_active` returned 0 for every
+    non-``AesGcmCipher``, under a comment naming only the identity case, so
+    ``messagefoundry rotate-key`` printed "OK: re-encrypted 0 value(s) under the active key" and
+    exited 0 having rotated nothing. That is 11.2.2's "keys replaceable with data re-encrypted"
+    clause failing in the one way an operator would not notice.
+
+    The cipher is swapped on an already-open store rather than opened through Transit, so this runs
+    with no Vault and pins the REFUSAL, not the provider.
+    """
+    from messagefoundry.store.base import open_store
+
+    store = await open_store(StoreSettings(path=str(tmp_path / "refuse.db")))
+    assert isinstance(store, MessageStore)
+    try:
+        store._cipher = _StubProviderCipher()  # type: ignore[assignment]
+        with pytest.raises(NotImplementedError, match="cannot re-encrypt store values in place"):
+            await store.reencrypt_to_active()
+    finally:
+        await store.close()
+
+
+async def test_rotation_still_reports_zero_for_the_identity_cipher(tmp_path: Path) -> None:
+    """POSITIVE CONTROL for the refusal above, and the case the original comment described.
+
+    With NO key configured there is genuinely nothing to rotate, so 0 is the truthful answer and
+    must NOT become an error. Without this, the refusal test would pass just as well against a build
+    that raised on every cipher, which would break an unencrypted store's rotate-key.
+    """
+    from messagefoundry.store.base import open_store
+
+    store = await open_store(StoreSettings(path=str(tmp_path / "identity.db")))
+    assert isinstance(store, MessageStore)
+    try:
+        assert isinstance(store._cipher, IdentityCipher)  # no key configured on this path
+        assert await store.reencrypt_to_active() == 0
     finally:
         await store.close()
