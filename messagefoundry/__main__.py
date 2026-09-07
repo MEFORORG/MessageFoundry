@@ -2182,9 +2182,18 @@ def _serve(args: argparse.Namespace) -> int:
             and not settings.auth.admin_new_ip_step_up
             and data_class is DataClass.PHI
         ):
-            # Advisory only — the default deliberately stays False (a flip would churn NAT'd
-            # hospital networks; flag_new_client_ip stays advisory-only, preserving the ASVS
-            # 8.1.3/8.1.4/8.2.4 N/A keystone). Mirrors the require_mfa advisory pattern.
+            # Advisory only — the default deliberately stays False, because a flip would churn
+            # NAT'd hospital networks and, on the shipped loopback bind, would change nothing at
+            # all: _same_host folds 127.0.0.1 and ::1 into one host, so the flipped control still
+            # returns False on every request a stock install sees.
+            #
+            # BACKLOG #1153: this comment used to end "preserving the ASVS 8.1.3/8.1.4/8.2.4 N/A
+            # keystone", which asserted a grade the record does not carry — 8.2.4 is graded
+            # PARTIAL, not not-applicable. A source comment claiming a cell is N/A is a false
+            # premise sitting in a distributed artifact, where a later assessor reads it as
+            # authority for a decision nobody made. The reasons above are the real ones and they
+            # stand on their own; a grade is the scorecard's to state, not this file's.
+            # Mirrors the require_mfa advisory pattern.
             print(
                 "warning: the browser console is exposed on a PHI instance with "
                 "[auth].admin_new_ip_step_up off — enabling it forces a step-up when an admin "
