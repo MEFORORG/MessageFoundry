@@ -13,7 +13,7 @@
 // Promote is offered (the same messagefoundry.promote command the connection editor reuses).
 import * as vscode from "vscode";
 import { configDir, runJson, workspaceDir } from "./cli";
-import { nonce } from "./cspNonce";
+import { WEBVIEW_GUARD_NOTE, guardScript, openChannel, postToWebview } from "./webviewMessaging";
 
 // §2 DETAIL/GRID — the shape `show` emits and `upsert` consumes. Rows are an array-of-arrays (a grid
 // is positional; headers carry the names once in `columns`), each inner row aligned to `columns`.
@@ -149,7 +149,7 @@ async function save(
     await runJson(args, ws);
   } catch (e) {
     // Surface the validation/CLI error inline so the user can fix the grid (file was not changed).
-    current.webview.postMessage({ command: "error", message: String(e) });
+    postToWebview(current.webview, { command: "error", message: String(e) });
     return;
   }
   current.dispose();
@@ -176,7 +176,7 @@ async function rename(
   try {
     await runJson(["codeset", "rename", "--config", configDir(), "--name", name, "--to", to], ws);
   } catch (e) {
-    current.webview.postMessage({ command: "error", message: String(e) });
+    postToWebview(current.webview, { command: "error", message: String(e) });
     return;
   }
   current.dispose();
@@ -200,7 +200,7 @@ async function remove(name: string, current: vscode.WebviewPanel, onSaved?: () =
   try {
     await runJson(["codeset", "remove", "--config", configDir(), "--name", name], ws);
   } catch (e) {
-    current.webview.postMessage({ command: "error", message: String(e) });
+    postToWebview(current.webview, { command: "error", message: String(e) });
     return;
   }
   current.dispose();
@@ -219,7 +219,7 @@ export function codeSetFormHtml(
   readonly: boolean,
   existing: string[],
 ): string {
-  const n = nonce();
+  const { nonce: n, token } = openChannel(webview);
   return `<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -316,7 +316,7 @@ export function codeSetFormHtml(
   </div>
 
   <script nonce="${n}">
-    const vscode = acquireVsCodeApi();
+    const vscode = acquireVsCodeApi();${guardScript(token)}
     const INITIAL = ${embed(initial)};         // Detail | null
     const READONLY = ${embed(readonly)};       // true => TOML, view-only
     const EXISTING = ${embed(existing)};       // existing code-set names (client-side dup warning)
@@ -518,9 +518,10 @@ export function codeSetFormHtml(
     $('delete').addEventListener('click', () => { if (originalName) vscode.postMessage({ command: 'delete', name: originalName }); });
 
     // CLI/validation errors arrive here and stay inline so the grid is still editable (file unchanged).
-    // Origin is NOT checked here — see webviewMessaging.ts.
+    ${WEBVIEW_GUARD_NOTE}
     window.addEventListener('message', (e) => {
-      if (e.data && e.data.command === 'error') { errorEl.textContent = e.data.message; errorEl.style.display = ''; }
+      const d = mfTrusted(e);
+      if (d && d.command === 'error') { errorEl.textContent = d.message; errorEl.style.display = ''; }
     });
 
     render();

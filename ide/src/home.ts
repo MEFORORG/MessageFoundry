@@ -4,7 +4,7 @@
 // extension commands. Every action is live; the `soon` flag renders a "soon" badge for any action
 // still queued in the backlog. Monitoring + engine run/stop deliberately live in the Console, not here.
 import * as vscode from "vscode";
-import { nonce } from "./cspNonce";
+import { WEBVIEW_GUARD_NOTE, guardScript, openChannel, postToWebview } from "./webviewMessaging";
 
 interface Action {
   id: string; // command id
@@ -91,11 +91,14 @@ export class HomeView implements vscode.WebviewViewProvider {
 
   /** Reflect an externally-set filter (e.g. the funnel command) back into the search box. */
   setFilterText(text: string): void {
-    void this.view?.webview.postMessage({ command: "setFilter", text });
+    const view = this.view;
+    if (view) {
+      void postToWebview(view.webview, { command: "setFilter", text });
+    }
   }
 
   private html(webview: vscode.Webview, initialFilter: string): string {
-    const n = nonce();
+    const { nonce: n, token } = openChannel(webview);
     const groups = GROUPS.map(
       (g) =>
         `<details class="group" data-key="${esc(g.title)}" data-default="${
@@ -150,7 +153,7 @@ export class HomeView implements vscode.WebviewViewProvider {
   </div>
   ${groups}
   <script nonce="${n}">
-    const vscode = acquireVsCodeApi();
+    const vscode = acquireVsCodeApi();${guardScript(token)}
     // Persistent filter box for the Connections tree (drives graph.setFilter → also the #228
     // Definitions). Debounced so each keystroke doesn't re-project the tree; two-way synced with the
     // funnel command via an inbound 'setFilter' message.
@@ -166,10 +169,11 @@ export class HomeView implements vscode.WebviewViewProvider {
         vscode.postMessage({ command: 'filter', text: '' });
       }
     });
-    // Origin is NOT checked here — see webviewMessaging.ts.
+    ${WEBVIEW_GUARD_NOTE}
     window.addEventListener('message', (e) => {
-      if (e.data && e.data.command === 'setFilter' && e.data.text !== search.value) {
-        search.value = e.data.text;
+      const d = mfTrusted(e);
+      if (d && d.command === 'setFilter' && d.text !== search.value) {
+        search.value = d.text;
       }
     });
     const state = vscode.getState() || {};
