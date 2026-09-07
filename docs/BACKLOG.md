@@ -24617,3 +24617,39 @@ A PAR client on the relying-party side: POST the authorization parameters to the
 
 This row was **filed, not built**. Nobody has read the pinned requirement text against `flow.py` for this row's purposes, and no provider-support survey was run. The `na` ruling above is reported as the routing fact that makes this row necessary; this row does not re-derive it and does not depend on it being correct.
 
+## 1484. `scripts/asvs/apply.py` cannot retire a cell's LAST absence claim -- the field-preservation guard refuses before `--allow-retirement` runs
+
+> 🔢 **Filed 2026-09-07 -- not started.** Value **3/10** · Difficulty **4/10** -- _quick win_. **Found while doing BACKLOG #1004's vault half; it did not block that work and is filed because it outlives the cell it was found on.** The sanctioned scorecard writer grew a retirement path for exactly one situation -- an absence claim whose gap has CLOSED, so the record should stop asserting it -- and that path cannot execute when the cell holds only one claim. It is reachable only for a cell holding two or more.
+> Verdict: build
+> Research: none
+> Closing-act: code
+
+**Cluster:** ASVS tooling. **Priority:** P3. **Verdict:** build.
+**Severity:** low. Nothing is wrong in the engine and nothing in the record is false. The cost is that a legitimate, sanctioned edit is unavailable through the writer, so whoever needs it either leaves a closed gap asserted in the record or reaches for a hand edit -- and a hand edit of this file is the move behind the incident measured on vault commit `c117e0a2`: a subject naming ONE cell, **298 of 345 cells changed**, an owner-approved repair to an unrelated cell silently reverted, undetected for three days. Re-measured here 2026-09-07 by parsing both sides rather than reading the report. That incident has its own filed row; it is deliberately not cited by number, because the number a peer named for it does not resolve on `main` at the time of writing and a citation that resolves to nothing today starts resolving to unrelated work the day someone legitimately allocates it.
+
+### The defect
+
+`--allow-retirement` permits a cell's `evidence` or `absence` list to SHRINK when the payload DECLARES what it is retiring. The declaration is checked, and the arithmetic is checked: declare one and drop two and it still refuses. That design is right.
+
+It is unreachable for a 1 -> 0 drop. A payload carrying `"absence": []` renders a cell with no `absence` key at all, because an empty array of tables emits nothing. The **field-preservation invariant** runs first and compares key sets:
+
+```
+REFUSING: cell 13.3.4 would LOSE field(s) ['absence']
+```
+
+So the guard that exists to catch a DROPPED KEY fires on a DECLARED RETIREMENT, before the code written to authorise that retirement is reached. The flag can shrink a list of several; it cannot empty one.
+
+### Measured 2026-09-07
+
+Against cell 13.3.4, whose single absence claim had genuinely closed -- the engine half of #1004 shipped the refusal the claim recorded as missing. Payload built by the sanctioned route, `--allow-retirement` passed, `retired_absence` declared with the drop accounted for. The run refused as above and never printed the `RETIRING:` line, which is the writer's own evidence that the retirement branch did not execute.
+
+**Positive control on the same instrument, same run:** the identical payload with the claim REWRITTEN rather than emptied -- cardinality 1 -> 1 -- was accepted, re-rendered one cell block, and left 345 cells intact. So the refusal is specific to emptying the list, not to the payload, the flag, or the declaration.
+
+### Why the workaround is not a fix
+
+#1004 rewrote its claim instead, re-aiming it at a sibling gap that is still open. That was the better outcome **on its own merits** and would have been chosen anyway. It is not always available: a cell whose only claim has closed, with no adjacent gap worth guarding, has nowhere to re-aim. That cell's options today are an asserted-but-closed gap or a hand edit.
+
+### Not done here, and named rather than implied
+
+No fix is proposed in this row. The obvious shapes -- emit an empty `absence` key, or order the retirement check before the key-set check -- both touch an invariant that exists because a truncating repair once cut one cell 15 -> 10 and another 17 -> 1 **with the verifier green throughout**. Whoever builds this must not weaken that guard to reach the retirement path; the two need to be ordered, not traded. The writer is `scripts/asvs/apply.py` in this repository, which is the ORIGINAL -- the vault carries a mirror, and mirror drift is a separate, separately-tracked condition.
+
