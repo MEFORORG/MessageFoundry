@@ -24236,24 +24236,28 @@ The diffstat read **5 insertions, 1 deletion**, and the commit message never men
 Compare the **ranked tables' row set** against the **parsed-item set**, taking items from BOTH ledger files (`docs/BACKLOG.md` and `docs/archive/backlog/BACKLOG-CLOSED.md`) into one namespace. Import `parse_items`; never hand-roll the scan (CLAUDE.md sec. 11). Rows extract with:
 
 ```python
-re.findall(r"^\|\s*\d+\s*\|\s*\*\*#(\d+)\*\*\s*\|", text, re.M)
+re.findall(r"^\|\s*(?:\d+\s*\|\s*)?\*\*#(\d+)\*\*\s*\|", text, re.M)
 ```
 
-**Only rows-with-no-item is a defect. Items-with-no-row is the normal state and must never be reported.** Measured at `68693cfc2`: 444 distinct rows against 679 parsed items, so most items legitimately carry no row. The five ranked tables are all *dated scoring-pass snapshots* (`re-scored 2026-08-20`, `first score 2026-09-03`, and so on), not a live index that every filing joins -- which is also why a new item does not get a row, and why the reverse comparison would report several hundred false positives on a clean file.
+**Make the rank column optional, as above. The obvious regex requires it and is blind to a whole table.** Measured at `68693cfc2`: requiring a leading `| N |` rank cell sees **444** distinct numbers, and the optional form sees **459**. The 15 it adds are `#207`-`#222` less `#214`, whose only rows live in *Post-re-score additions -- #206-#222*, a table that carries no rank column at all -- its rows open `| **#219** |`. That blind spot happens to hold no defect today (all 15 have parsed items), so a check built on the strict regex would look correct while never being able to see an absorbed heading for any of them. Both forms return the same `[1147]` on the control below.
+
+**Only rows-with-no-item is a defect. Items-with-no-row is the normal state and must never be reported.** 459 rows against 679 parsed items at the same ref, so most items legitimately carry no row. Every ranked table found is a *dated scoring-pass snapshot* (`re-scored 2026-08-20`, `re-scored 2026-08-03`, `re-scored 2026-07-10`, `first score 2026-09-03`, and the rank-less additions table), not a live index that every filing joins -- which is also why a new item does not get a row, and why the reverse comparison would report several hundred false positives on a clean file. That census was taken by walking every contiguous run of matching rows up to its nearest heading, so it covers **at least** those five; a table shaped unlike all of them would not be reached by the instrument that found these.
 
 ### The positive control, on a fixture that cannot perish
 
 | state | ref | rows | parsed items | rows with no item |
 |---|---|--:|--:|---|
-| pre-fix | `68693cfc2` (`main` tip that day) | 444 | 679 | **`[1147]`** |
-| the causing commit | `642225f78` | 444 | 679 | **`[1147]`** |
-| post-fix | PR 975 head | 444 | 680 | none |
+| pre-fix | `68693cfc2` (`main` tip that day) | 459 | 679 | **`[1147]`** |
+| the causing commit | `642225f78` | 459 | 679 | **`[1147]`** |
+| post-fix | PR 975 head | 459 | 680 | none |
+
+Row counts are the optional-rank regex above; the strict form reads 444 in all three rows and returns the same verdict.
 
 It fires on the one real case and is silent otherwise. **Both pre-fix shas are ancestors of `origin/main`** (`git merge-base --is-ancestor` returns true for each, measured 2026-09-07), so PR 975 merging does not take the fixture away -- a merge adds a commit, it removes nothing from history. Anyone told to capture the pre-fix state before PR 975 lands has been told something false; cite the sha instead.
 
 ### DEAD END: the mid-line heading probe. Do not build on it
 
-The obvious signature is a `## N.` heading appearing **mid-line**, and it is worthless here. The absorbed heading loses its `## ` prefix *and* its number entirely rather than losing its newline, so no heading-shaped remnant survives the fusion at all. Measured on `origin/main`: a mid-line `## N.` scan returns six hits, and **all six are prose** -- items quoting a heading inside a sentence or in backticks. Zero are absorbed headings, in either state. A guard built on that signature reports a clean repository forever while producing a steady trickle of false positives, which is the worst pair of properties available. That negative result is the reason the row-versus-item comparison is the right instrument.
+The obvious signature is a `## N.` heading appearing **mid-line**, and it is worthless here. The absorbed heading loses its `## ` prefix *and* its number entirely rather than losing its newline, so no heading-shaped remnant survives the fusion at all. Measured on `origin/main`: a mid-line `## N.` scan returns six hits -- `1022`, `1203`, `1204`, `1379` twice, and `1431` -- and **all six are prose**, items quoting a heading inside a sentence or in backticks. Zero are absorbed headings, in either state. **Write the probe loosely or it lies to you differently.** A first pass requiring whitespace after the period returned nothing at all, because every real occurrence is followed by a quote character or a backtick; that produced a true statement about one regex, published as a fact about the signature. A guard built on that signature reports a clean repository forever while producing a steady trickle of false positives, which is the worst pair of properties available. That negative result is the reason the row-versus-item comparison is the right instrument.
 
 ### If you ever act on a hit, WHERE you re-insert the heading changes the outcome
 
@@ -24277,4 +24281,4 @@ Nothing here assumes the check gets built. If the owner rules to build it, the n
 ### Two traps that cost measurement time
 
 1. **Set `PYTHONIOENCODING=utf-8` before printing anything derived from the banner alphabet.** A stock Windows console is cp1252 and raises `UnicodeEncodeError` on the status glyphs. It cost two separate runs here.
-2. **Deduplicate the row set.** The regex above returns **547** raw matches but only **444** distinct numbers on `origin/main`, because the five dated scoring passes re-rank many of the same items. Comparing the raw list instead of the set inflates every count and makes the control unreproducible.
+2. **Deduplicate the row set.** At `68693cfc2` the regex above returns **570** raw matches against **459** distinct numbers (the strict rank-requiring form: **547** against **444**), because the dated scoring passes re-rank many of the same items. Comparing the raw list instead of the set inflates every count and makes the control unreproducible.
