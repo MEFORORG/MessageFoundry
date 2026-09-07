@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import asyncio
 import hmac
+import sqlite3
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -66,8 +67,11 @@ def counted(monkeypatch: pytest.MonkeyPatch) -> _CompareCounter:
 
 
 def test_audit_mac_bytes_maps_null_row_hash_to_never_equal_bytes() -> None:
-    # row_hash is NULLable on all three backends; `hmac.compare_digest(None, ...)` raises TypeError,
-    # which the startup verifier would swallow into a fail-OPEN "could not run" log with no alert.
+    # row_hash is NOT NULL on all three backends since BACKLOG #1198, so the ENGINE cannot produce a
+    # None here — but the column lives in a store the operator owns, so a NULL arriving out-of-band is
+    # exactly the tampering this comparison exists to report. `hmac.compare_digest(None, ...)` raises
+    # TypeError, which the startup verifier would swallow into a fail-OPEN "could not run" log with no
+    # alert, so the mapping stays total on purpose.
     assert audit_mac_bytes(None) == b""
     assert not hmac.compare_digest(audit_mac_bytes(None), audit_mac_bytes("deadbeef"))
 
@@ -153,15 +157,22 @@ async def test_sqlite_first_divergent_row_is_reported_not_the_last(store: Messag
     assert not ok and "id=2" in (message or "")
 
 
-async def test_sqlite_null_row_hash_is_a_break_not_a_type_error(store: MessageStore) -> None:
-    # A row whose hash was never filled (pre-chaining legacy row reaching verify before the backfill,
-    # or an out-of-band write on a live server DB) must REPORT a break, not raise.
+async def test_sqlite_null_row_hash_is_refused_by_the_schema(store: MessageStore) -> None:
+    """BACKLOG #1198: since ``row_hash`` became NOT NULL, SQLite refuses the NULL rather than letting
+    verify interpret a hole.
+
+    This test used to blank a row's hash and assert verify REPORTED a break instead of raising. That
+    property has not been dropped -- it moved to the level where it still holds. The engine can no
+    longer write a NULL, so the totality of the comparison is pinned as a unit property of
+    ``audit_mac_bytes`` above and against the offline server-backend rows below, where a NULL can be
+    constructed. What is pinned here is the constraint itself."""
     for i in range(3):
         await store.record_audit("act", actor="u", detail=f'{{"n":{i}}}')
-    await store._db.execute("UPDATE audit_log SET row_hash=NULL WHERE id=2")
-    await store._db.commit()
+    with pytest.raises(sqlite3.IntegrityError, match="NOT NULL"):
+        await store._db.execute("UPDATE audit_log SET row_hash=NULL WHERE id=2")
+    await store._db.rollback()
     ok, message = await store.verify_audit_chain()
-    assert not ok and "id=2" in (message or "")
+    assert ok, message  # the refused write left the chain intact
 
 
 # --- Postgres / SQL Server: the real verify method, offline ------------------

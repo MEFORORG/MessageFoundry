@@ -54,8 +54,8 @@ def _http_error(code: int) -> urllib.error.HTTPError:
 
 
 class _FakeResp:
-    def read(self) -> bytes:
-        return b""
+    def read(self, amt: int = -1) -> bytes:
+        return b"" if amt < 0 else (b"")[:amt]
 
     def __enter__(self) -> _FakeResp:
         return self

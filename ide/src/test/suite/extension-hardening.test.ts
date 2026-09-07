@@ -8,7 +8,7 @@ import * as path from "path";
 import { nonce } from "../../cspNonce";
 import { assertBrowsableUrl, assertTargetAllowed } from "../../engineTarget";
 import { getJson, postJson } from "../../engineClient";
-import { WEBVIEW_ORIGIN_NOTE } from "../../webviewMessaging";
+import { WEBVIEW_GUARD_NOTE } from "../../webviewMessaging";
 
 // Four hardening properties of the extension, asserted against the SOURCE as well as against
 // behaviour. Reading the source matters here for a measured reason: the extension has already shipped
@@ -51,18 +51,31 @@ function productionSources(): { file: string; rel: string; text: string }[] {
  * today; it is what makes tomorrow's addition visible.
  */
 function webviewAssetSources(): { file: string; rel: string; text: string }[] {
-  const dir = path.join(IDE_ROOT, "media");
-  if (!fs.existsSync(dir)) {
+  const root = path.join(IDE_ROOT, "media");
+  if (!fs.existsSync(root)) {
     return [];
   }
-  return fs
-    .readdirSync(dir)
-    .filter((n) => n.endsWith(".js"))
-    .map((n) => ({
-      file: path.join(dir, n),
-      rel: `media/${n}`,
-      text: fs.readFileSync(path.join(dir, n), "utf8"),
-    }));
+  // RECURSIVE, and .mjs as well as .js. The non-recursive .js-only read this replaces was narrower
+  // than the guarantee the scans below state: a receiver added under media/walkthrough/, or spelled
+  // .mjs, never reached the regexes at all, so "no offending line found" was answering a smaller
+  // question than the one asked. Nothing moves today (the count is unchanged); tomorrow's does.
+  const out: { file: string; rel: string; text: string }[] = [];
+  const walk = (dir: string): void => {
+    for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+      const full = path.join(dir, entry.name);
+      if (entry.isDirectory()) {
+        walk(full);
+      } else if (entry.name.endsWith(".js") || entry.name.endsWith(".mjs")) {
+        out.push({
+          file: full,
+          rel: `media/${path.relative(root, full).split(path.sep).join("/")}`,
+          text: fs.readFileSync(full, "utf8"),
+        });
+      }
+    }
+  };
+  walk(root);
+  return out;
 }
 
 /** Every file that can carry a CSP nonce or a webview message receiver. */
@@ -305,61 +318,145 @@ suite("https requests carry a pinned TLS floor", () => {
   });
 });
 
-suite("webview message receivers state the origin position explicitly", () => {
-  test("every window message listener carries the documented origin note", () => {
-    // Shape validation is not origin validation, and the two get conflated. VS Code exposes no
-    // origin a webview could verify (a generated per-panel vscode-webview://<uuid> the extension is
-    // never told), so no check is written — and the absence is recorded at every receiver rather
-    // than left for a reviewer to rediscover. This test is what makes a NEW receiver answer the
-    // question instead of inheriting silence.
-    const sources = webviewCodeSources();
-    const receivers = sources.flatMap(({ rel, text }) => {
-      const lines = text.split(/\r?\n/);
-      return lines
-        .map((line, i) => ({ rel, line: line.trim(), n: i + 1, prev: (lines[i - 1] ?? "").trim() }))
-        .filter(({ line }) => /window\.addEventListener\(\s*['"]message['"]/.test(line));
-    });
+/**
+ * How a webview `message` receiver can be spelled, deliberately wider than the code uses.
+ *
+ * The count and the marker guarantee below are stated over "every receiver", so the instrument has
+ * to be able to FIND every receiver. `window.addEventListener('message'` was the only spelling the
+ * regex admitted; `globalThis.`, `self.` and a bare `addEventListener('message'` all evaded it, and a
+ * completeness claim resting on that instrument was answering a narrower question than it stated.
+ * Measured: widening changes no count today.
+ */
+const RECEIVER_RE = /(?:^|[^.\w$])(?:window|globalThis|self|top|parent)?\.?addEventListener\(\s*['"`]message['"`]/;
+
+/** The source text a `.ts` panel writes to emit the marker; `media/*.js` would carry the literal. */
+const MARKER_INTERPOLATION = "${WEBVIEW_GUARD_NOTE}";
+
+/** Every webview `message` receiver in the shipped corpus, with the line above it and its body. */
+function receivers(): { rel: string; n: number; prev: string; body: string }[] {
+  return webviewCodeSources().flatMap(({ rel, text }) => {
+    const lines = text.split(/\r?\n/);
+    return lines
+      .map((line, i) => ({
+        rel,
+        line: line.trim(),
+        n: i + 1,
+        prev: (lines[i - 1] ?? "").trim(),
+        body: lines.slice(i, i + 12).join("\n"),
+      }))
+      .filter(({ line }) => RECEIVER_RE.test(line));
+  });
+}
+
+suite("webview message receivers check origin, source and the channel token", () => {
+  test("every window message listener carries the guard marker", () => {
+    // Shape validation is not origin validation, and the two get conflated. Each receiver now runs
+    // its event through mfTrusted() first, and says so on the line above. This test is what makes a
+    // NEW receiver answer the question instead of inheriting silence.
+    const found = receivers();
+    const scanned = webviewCodeSources().length;
     assert.strictEqual(
-      receivers.length,
+      found.length,
       8,
-      `expected the 8 known webview message receivers; found ${receivers.length} across ${sources.length} files — ` +
+      `expected the 8 known webview message receivers; found ${found.length} across ${scanned} files — ` +
         "a new one must be reviewed and this count updated deliberately",
     );
-    const silent = receivers.filter(({ prev }) => prev !== WEBVIEW_ORIGIN_NOTE);
+    const silent = found.filter(
+      ({ prev }) => prev !== MARKER_INTERPOLATION && prev !== WEBVIEW_GUARD_NOTE,
+    );
     assert.deepStrictEqual(
       silent.map((s) => `${s.rel}:${s.n}`),
       [],
-      `each receiver must be preceded by exactly: ${WEBVIEW_ORIGIN_NOTE}`,
+      `each receiver must be preceded by ${MARKER_INTERPOLATION} (or, outside a .ts template, its literal text)`,
     );
   });
 
-  test("every webview message receiver still discriminates on a message shape", () => {
-    // The other half, and the one that actually bounds what a message can ask for. Each receiver
-    // dispatches on a `command`/`type` discriminator and ignores anything else; assert that rather
-    // than assume it, since an unguarded receiver would be the more serious of the two defects.
-    const sources = webviewCodeSources();
+  test("the widened receiver regex still finds what the narrow one found", () => {
+    // POSITIVE CONTROL for the widening, and a falsification of it: the spellings that used to evade
+    // must now match, and a non-message listener must still not.
+    const spellings = [
+      "window.addEventListener('message', (e) => {",
+      "globalThis.addEventListener('message', (e) => {",
+      'self.addEventListener("message", (e) => {',
+      "addEventListener('message', (e) => {",
+    ];
+    for (const spelling of spellings) {
+      assert.ok(RECEIVER_RE.test(spelling), `the receiver regex missed: ${spelling}`);
+    }
+    const decoys = [
+      "el.addEventListener('click', () => {})",
+      "port.addEventListener('messageerror', () => {})",
+      "socket.onmessage = () => {}",
+    ];
+    for (const decoy of decoys) {
+      assert.ok(!RECEIVER_RE.test(decoy), `the receiver regex over-matched: ${decoy}`);
+    }
+  });
+
+  test("every webview message receiver routes its event through the guard", () => {
+    // The discard itself, which is the half a documented rationale could never supply. A receiver
+    // that read `e.data` directly would be back where this started.
+    const offenders = receivers()
+      .filter(({ body }) => !/mfTrusted\(/.test(body))
+      .map(({ rel, n }) => `${rel}:${n}`);
+    assert.deepStrictEqual(offenders, [], "a receiver read its event without the mfTrusted() guard");
+  });
+
+  test("no host-to-webview send bypasses the token stamp", () => {
+    // The other end of the same channel. An unstamped send is discarded by the receiver, so a bypass
+    // is a silently dead feature rather than a visible error — which is exactly why it is pinned.
     const offenders: string[] = [];
-    for (const { rel, text } of sources) {
-      const lines = text.split(/\r?\n/);
-      lines.forEach((line, i) => {
-        if (!/window\.addEventListener\(\s*['"]message['"]/.test(line)) {
-          return;
-        }
-        const body = lines.slice(i, i + 12).join("\n");
-        if (!/\.(command|type)\s*===|\b(command|type)\s*===/.test(body)) {
+    for (const { rel, text } of productionSources()) {
+      if (rel === "webviewMessaging.ts") {
+        continue; // the one legitimate raw send: the stamping call itself
+      }
+      text.split(/\r?\n/).forEach((line, i) => {
+        if (/webview\s*\.\s*postMessage\(/.test(line)) {
           offenders.push(`${rel}:${i + 1}`);
         }
       });
     }
+    assert.deepStrictEqual(
+      offenders,
+      [],
+      "post through postToWebview() so the send carries this render's channel token",
+    );
+  });
+
+  test("every panel that embeds a receiver also opens a channel and embeds the guard", () => {
+    // Counts rather than a per-file map, so the pin does not need editing when a panel moves.
+    const sources = productionSources().filter((s) => s.rel !== "webviewMessaging.ts");
+    const count = (needle: RegExp): number =>
+      sources.reduce((acc, s) => acc + (s.text.match(needle)?.length ?? 0), 0);
+    assert.strictEqual(count(/guardScript\(token\)/g), 8, "one embedded guard per receiver");
+    assert.strictEqual(count(/openChannel\(/g), 8, "one channel opened per receiver-bearing render");
+  });
+
+  test("every webview message receiver still discriminates on a message shape", () => {
+    // The other half, and the one that bounds what a message can ASK FOR rather than who sent it.
+    // The token guard does not retire it: a host-side bug posts a validly stamped wrong payload.
+    const offenders = receivers()
+      .filter(({ body }) => !/\.(command|type)\s*===|\b(command|type)\s*===/.test(body))
+      .map(({ rel, n }) => `${rel}:${n}`);
     assert.deepStrictEqual(offenders, [], "a receiver dispatched without a shape discriminator");
   });
 
-  test("the shared rationale says what it is relied on for", () => {
-    // Guards against the note decaying into a bare "not checked" marker. The claim it must keep
-    // making is that the nonce CSP is the enforcement property, which is exactly why the nonce being
-    // cryptographically random (the suite above) is load-bearing and not cosmetic.
+  test("the shared rationale says what the checks are and what they rest on", () => {
+    // Guards against the note decaying back into a bare marker. It must keep naming the delivery
+    // measurement the checks are derived from — an opaque origin would make the origin arm vacuous,
+    // and `window.parent` is shadowed by the bridge, which is why the source arm is written against
+    // `window` — and it must keep saying the nonce CSP is the enforcement property, which is why the
+    // nonce being cryptographically random (the suite above) is load-bearing and not cosmetic.
     const text = fs.readFileSync(path.join(SRC, "webviewMessaging.ts"), "utf8");
-    for (const claim of ["vscode-webview://", "nonce", "cspNonce.ts"]) {
+    const claims = [
+      "vscode-webview://",
+      "nonce",
+      "cspNonce.ts",
+      "window.parent = window",
+      "ev.origin === window.origin",
+      "opaque",
+    ];
+    for (const claim of claims) {
       assert.ok(text.includes(claim), `the rationale no longer mentions ${claim}`);
     }
   });

@@ -10,7 +10,9 @@ here. A copy of every record can also be **forwarded off-box** to a syslog/SIEM 
 (``[logging].forward_*``; sec-offbox-log, ASVS 16.x) so log evidence survives a host compromise; PHI
 redaction + control-char scrubbing apply to the forwarded stream exactly as to stdout. The off-box
 transport is UDP (RFC 5426), plaintext TCP (RFC 6587), or **native TLS** (RFC 5425 — an ``ssl``-wrapped
-TCP socket, ADR 0080), so evidence can be encrypted on the wire without a local forwarding agent.
+TCP socket, ADR 0080), so evidence can be encrypted on the wire without a local forwarding agent. That
+socket is reached through a **bounded hand-off queue drained by its own thread**
+(:class:`_ForwardQueueHandler`), so the network send never runs on the thread that logged the record.
 
 This module also exposes :func:`query_sntp_offset`, the bounded stdlib SNTP probe behind the opt-in
 startup clock-sync gate (``[logging].require_time_sync``; ASVS 16.2.2) — cross-host log correlation
@@ -19,14 +21,17 @@ depends on synchronized clocks. The gate's *policy* (warn vs refuse) lives in ``
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import logging.handlers
 import os
+import queue
 import re
 import socket
 import ssl
 import sys
+import threading
 import time
 from dataclasses import dataclass
 from typing import Any
@@ -306,20 +311,67 @@ class SyslogForward:
     tls_client_cert: str | None = None
 
 
-#: Socket timeout (seconds) pinned on a **TCP** off-box forwarder. The engine logs synchronously from
-#: asyncio workers on the event-loop thread, so an unbounded blocking ``sendall`` to a stalled-but-
-#: connected collector (TCP back-pressure / a wedged SIEM) would block the whole event loop. With this
-#: timeout, ``SysLogHandler.emit`` raises ``socket.timeout``, swallows it via ``handleError``, and drops
-#: the record — so a stalled collector costs at most this many seconds per record, never an indefinite
-#: stall. UDP is connectionless (fire-and-forget) and needs no timeout. For a high-volume feed prefer
-#: UDP or a local forwarding agent; a synchronous TCP forward is best-effort by design.
+#: Socket timeout (seconds) pinned on a **TCP** off-box forwarder.
+#:
+#: The send now runs on the forwarder's own listener thread (:class:`_ForwardQueueHandler`), never on
+#: the thread that logged the record, so this timeout no longer stands between a stalled collector and
+#: the engine's event loop — the queue does. It still bounds two things that would otherwise be
+#: unbounded. **The drain:** an unbounded blocking ``sendall`` to a stalled-but-connected collector
+#: (TCP back-pressure / a wedged SIEM) would park the listener for good, so the hand-off queue would
+#: fill and the engine would drop records it could otherwise have shipped. **Shutdown:**
+#: :meth:`_ForwardQueueListener.stop_within` waits out at most one in-flight send, and an unbounded one
+#: would hold process exit open.
+#:
+#: On the timeout ``SysLogHandler.emit`` raises ``socket.timeout`` and routes it to ``handleError``,
+#: which loses that record and drops the socket so the next one reconnects (see
+#: :meth:`_TimeoutSysLogHandler.handleError`). UDP is connectionless (fire-and-forget) and needs no
+#: timeout. Off-box forwarding is best-effort by design; a collector that never drains is a collector
+#: that loses records, and the drop is reported rather than silent.
 _FORWARD_TCP_TIMEOUT = 5.0
+
+#: Depth of the hand-off queue between the engine's threads and the forwarder's listener thread.
+#: Bounded on purpose: unbounded, a long collector outage becomes unbounded memory growth, which is a
+#: worse failure than losing log lines. Sized an order of magnitude above
+#: ``pipeline.alert_sinks._MAX_QUEUE`` because that queue carries rare operator alerts while this one
+#: carries ordinary log traffic — at a few hundred bytes of rendered text per record this holds single-
+#: digit megabytes at full depth.
+#:
+#: **The count-and-log invariant (CLAUDE.md §2) is not in play here.** That invariant governs received
+#: *messages*, which are persisted before the ACK and never accepted-and-dropped. A log record is not a
+#: message. Dropping one under back-pressure is a legitimate choice for this queue in a way that
+#: dropping a message never is — provided the drop is **reported**, which
+#: :meth:`_ForwardQueueHandler.enqueue` is what makes true.
+_FORWARD_QUEUE_MAXSIZE = 10_000
+
+#: Seconds :meth:`_ForwardQueueHandler.close` gives the listener to drain what is already queued before
+#: it starts discarding the remainder. Shutdown must not hang on a wedged collector one send at a time.
+_FORWARD_DRAIN_TIMEOUT = 5.0
+
+#: Minimum seconds between two "records were dropped" warnings. The drop report is **itself a log
+#: record**, so one per drop would be self-amplifying during the exact outage it reports on. This is
+#: the one place this queue must not behave like ``alert_sinks._BackgroundDispatcher``, which warns per
+#: dropped item because an alert is a rare, operator-facing event rather than log traffic.
+_FORWARD_DROP_REPORT_INTERVAL = 60.0
+
+#: How many queued records :meth:`_ForwardQueueListener.enqueue_sentinel` will discard to make room for
+#: the stop sentinel before giving up and letting the bounded join report the thread instead.
+_SENTINEL_PUT_ATTEMPTS = 100
 
 
 class _TimeoutSysLogHandler(logging.handlers.SysLogHandler):
     """:class:`~logging.handlers.SysLogHandler` that pins a socket timeout on its socket — including on
-    any reconnect inside ``emit`` — so a runtime send to a stalled TCP collector can't block the calling
-    thread (the asyncio event loop) indefinitely."""
+    any reconnect inside ``emit`` — so a runtime send to a stalled TCP collector can't park the calling
+    thread indefinitely. That thread is the forwarder's listener thread (:class:`_ForwardQueueHandler`);
+    :data:`_FORWARD_TCP_TIMEOUT` says what the bound still buys once the send is off the event loop.
+
+    It also makes ``emit``'s reconnect branch reachable — see :meth:`handleError`."""
+
+    #: ANNOTATION ONLY (no value), so nothing is created at runtime and the base class's own attribute
+    #: is inherited untouched. ``SysLogHandler.socket`` is set at runtime and is absent from typeshed,
+    #: so without this line the checker infers the attribute's type from the first assignment it finds
+    #: in this class — ``None`` in :meth:`handleError` — and then rejects the ``SSLSocket`` the TLS
+    #: subclass legitimately assigns. ``Any`` states the runtime truth instead of encoding one arm.
+    socket: Any
 
     def __init__(self, *args: Any, timeout: float | None = None, **kwargs: Any) -> None:
         self._sock_timeout = timeout
@@ -344,6 +396,33 @@ class _TimeoutSysLogHandler(logging.handlers.SysLogHandler):
         sock = getattr(self, "socket", None)
         if self._sock_timeout is not None and sock is not None:
             sock.settimeout(self._sock_timeout)
+
+    def handleError(self, record: logging.LogRecord) -> None:
+        """Drop the socket after a network error, so the **next** record reconnects (BACKLOG #1199).
+
+        ``SysLogHandler.emit`` reconnects only under ``if not self.socket``, and it never clears
+        ``self.socket`` when a send fails. On the shipped handler a stream forwarder that broke
+        mid-run would therefore stay broken for the life of the process, and silently: ``emit``
+        swallows the error through this method. Clearing the socket here is the whole of what turns
+        that dead branch back into a reconnect loop.
+
+        **Only an ``OSError`` resets it.** ``handleError`` also fires for a formatting error, which is
+        not the socket's fault; reconnecting on one would buy nothing and would hide the real bug.
+
+        A collector that is down then costs one bounded connect attempt per record. That is paid on
+        the listener thread, and the bounded queue is what stops it costing anything else: it fills,
+        and :meth:`_ForwardQueueHandler.enqueue` reports the drops. A backoff between attempts, and
+        the on-disk spool that would let an outage survive at all, stay open on BACKLOG #1199.
+        """
+        if isinstance(sys.exception(), OSError):
+            sock = getattr(self, "socket", None)
+            if sock is not None:
+                self.socket = None  # cleared first; a concurrent emit must not use a closing socket
+                # Already-broken sockets raise here. Closing was housekeeping; the point (stop reusing
+                # it) is achieved above, and logging from inside the logging error path would recurse.
+                with contextlib.suppress(OSError):
+                    sock.close()
+        super().handleError(record)
 
 
 def _build_tls_context(forward: SyslogForward) -> ssl.SSLContext:
@@ -374,10 +453,10 @@ class _TlsSysLogHandler(_TimeoutSysLogHandler):
     """A TCP :class:`~logging.handlers.SysLogHandler` whose connected socket is wrapped in TLS (RFC
     5425 syslog-over-TLS). The wrap happens in ``createSocket`` *after* the base handler has connected
     and pinned the socket timeout, so the TLS handshake itself runs under ``_FORWARD_TCP_TIMEOUT`` — a
-    collector that completes the TCP connect but stalls the handshake can't block the calling thread
-    (the asyncio event loop) indefinitely. A handshake/verification failure raises ``ssl.SSLError``
-    (a subclass of ``OSError``), so :func:`configure_logging` treats a bad-cert collector at startup as
-    best-effort (skipped with a warning) exactly like an unreachable one."""
+    collector that completes the TCP connect but stalls the handshake can't park the calling thread
+    (the forwarder's listener thread) indefinitely. A handshake/verification failure raises
+    ``ssl.SSLError`` (a subclass of ``OSError``), so :func:`configure_logging` treats a bad-cert
+    collector at startup as best-effort (skipped with a warning) exactly like an unreachable one."""
 
     def __init__(
         self, *args: Any, ssl_context: ssl.SSLContext, server_hostname: str, **kwargs: Any
@@ -407,9 +486,14 @@ def _install_phi_filters(handler: logging.Handler) -> None:
     """Attach the PHI-redaction + control-char-scrub filters to ``handler``.
 
     Order matters: redact PHI from the raw content first, then scrub control chars from the result.
-    Applied to **every** handler (stdout and the off-box forwarder) so the forwarded stream is held to
-    the same PHI-safety + log-injection guarantees as stdout. The filters are idempotent, so a record
-    dispatched to multiple filtered handlers is safely re-scrubbed."""
+    Applied to **every** handler a logger carries (stdout, stderr, and the off-box forwarder's queue
+    handler) so the forwarded stream is held to the same PHI-safety + log-injection guarantees as
+    stdout. The filters are idempotent, so a record dispatched to multiple filtered handlers is safely
+    re-scrubbed.
+
+    For the forwarder this means the **queue** handler, on the near side of the hand-off, and the
+    socket handler behind it carries no chain of its own — see :class:`_ForwardQueueHandler`, which is
+    where that placement is argued."""
     handler.addFilter(RedactionFilter())  # PHI redaction — message + exception traceback (Gate #1)
     handler.addFilter(CredentialQueryScrubFilter())  # OIDC code/state in a URL (ADR 0142 AC-10)
     handler.addFilter(ControlCharScrubFilter())  # log-injection defense (16.4.1)
@@ -421,8 +505,16 @@ def _build_syslog_handler(forward: SyslogForward) -> logging.handlers.SysLogHand
     connects (and, for TLS, completes the handshake) and may raise ``OSError`` if the collector is down
     or its certificate can't be verified at startup (:func:`configure_logging` treats that as best-
     effort — ``ssl.SSLError`` is an ``OSError`` subclass), and a runtime socket timeout
-    (``_FORWARD_TCP_TIMEOUT``) is pinned so a stalled collector can't block the calling thread (the
-    event loop) indefinitely — emit drops the record."""
+    (``_FORWARD_TCP_TIMEOUT``) is pinned so a stalled collector can't park the listener thread
+    indefinitely — that record is lost and the socket is dropped for a reconnect.
+
+    The handler this returns is **not** attached to a logger directly. :func:`configure_logging` puts
+    it behind :class:`_ForwardQueueHandler`, which is what keeps the send off the caller's thread.
+
+    **The UDP arm stays the plain stdlib handler**, deliberately. Its socket is unconnected and it
+    sends with ``sendto``, so there is no connection to lose mid-run and nothing for
+    :meth:`_TimeoutSysLogHandler.handleError`'s reconnect to repair; the permanent-break defect that
+    override closes is a stream-socket defect."""
     if forward.protocol == "tls":
         return _TlsSysLogHandler(
             address=(forward.host, forward.port),
@@ -440,6 +532,254 @@ def _build_syslog_handler(forward: SyslogForward) -> logging.handlers.SysLogHand
     return logging.handlers.SysLogHandler(
         address=(forward.host, forward.port), socktype=socket.SOCK_DGRAM
     )
+
+
+class _ForwardQueueListener(logging.handlers.QueueListener):
+    """The thread that owns the off-box socket. It takes rendered lines off the hand-off queue and
+    hands them to the syslog handler, so every blocking network call belongs to this thread and to no
+    other. :class:`_ForwardQueueHandler` is the near side and carries the reasoning for the split.
+
+    Two stdlib behaviours are replaced because both fail on exactly the queue this design bounds.
+    ``enqueue_sentinel`` uses ``put_nowait``, which raises on a **full** queue; and ``stop`` joins
+    without a timeout, which on a wedged collector never returns."""
+
+    #: Annotation only — the stdlib's own ``_sentinel = None`` is inherited untouched. Typeshed does
+    #: not declare it, and :meth:`enqueue_sentinel` has to name it.
+    _sentinel: Any
+
+    def __init__(self, records: queue.Queue[Any], target: logging.Handler) -> None:
+        super().__init__(records, target)
+        #: The same object as ``self.queue``, typed. Typeshed narrows ``QueueListener.queue`` to a
+        #: put-only protocol, and :meth:`enqueue_sentinel` needs ``get_nowait`` to make room.
+        self._records = records
+        #: Set by :meth:`stop_within`. Past it a still-queued record is counted and discarded rather
+        #: than sent, so shutdown cannot be held open one bounded send at a time.
+        self._drain_deadline: float | None = None
+        #: Records the deadline above discarded. :meth:`_ForwardQueueHandler.close` reports it.
+        self.undrained = 0
+        #: Whether the stop sentinel is on the queue and not yet consumed. The sentinel occupies a
+        #: slot, so ``qsize`` counts it — and the shutdown report would claim one more lost record
+        #: than there is. Tracked rather than inferred.
+        self._sentinel_queued = False
+
+    def handle(self, record: logging.LogRecord) -> None:
+        deadline = self._drain_deadline
+        if deadline is not None and time.monotonic() >= deadline:
+            self.undrained += 1
+            return
+        super().handle(record)
+
+    def dequeue(self, block: bool) -> Any:
+        record = super().dequeue(block)
+        if record is self._sentinel:
+            self._sentinel_queued = False
+        return record
+
+    def undelivered(self) -> int:
+        """A **floor** on the records that did not reach the collector: what the drain deadline
+        discarded, plus what is still on the queue, minus the sentinel's slot. A record already
+        inside the target's ``emit`` is in neither count, which is why this is a floor."""
+        pending = self._records.qsize() - (1 if self._sentinel_queued else 0)
+        return max(0, self.undrained + pending)
+
+    def enqueue_sentinel(self) -> None:
+        """Put the stop sentinel on the queue **even when it is full**, by discarding queued records
+        to make room.
+
+        The stdlib's ``put_nowait`` raises ``queue.Full`` here, and a full queue is precisely the
+        state a collector outage produces — so the shipped call would raise out of ``stop`` during
+        shutdown and leave the listener thread running with its socket open. Losing a record already
+        destined for a collector that is not draining costs nothing that the drop report has not
+        already accounted for."""
+        for _ in range(_SENTINEL_PUT_ATTEMPTS):
+            try:
+                self._records.put_nowait(self._sentinel)
+                self._sentinel_queued = True
+                return
+            except queue.Full:
+                # Empty may fire if another thread drained it between the two calls; the retry fits.
+                with contextlib.suppress(queue.Empty):
+                    self._records.get_nowait()
+        # Out of attempts: a producer is refilling faster than this loop empties. Fall through — the
+        # bounded join below reports the surviving thread rather than blocking on it.
+
+    def stop_within(self, timeout: float) -> bool:
+        """Drain for at most ``timeout`` seconds, then stop. Returns whether the thread actually ended.
+
+        The join allows the drain window plus one :data:`_FORWARD_TCP_TIMEOUT`, because a send may
+        already be in flight when the deadline is set and nothing can shorten that one; every record
+        behind it is discarded by :meth:`handle` without touching the socket. The thread is a daemon
+        (the stdlib makes it one), so a ``False`` here delays nothing at interpreter exit — it means
+        the queued tail did not reach the collector, which is what the caller reports."""
+        thread = self._thread
+        if thread is None:
+            return True
+        self._drain_deadline = time.monotonic() + timeout
+        self.enqueue_sentinel()
+        thread.join(timeout + _FORWARD_TCP_TIMEOUT + 1.0)
+        if thread.is_alive():
+            return False
+        self._thread = None
+        return True
+
+
+class _ForwardQueueHandler(logging.handlers.QueueHandler):
+    """The near side of the off-box hand-off: the only forwarder handler a logger ever carries.
+
+    **Why it exists.** The engine logs synchronously from asyncio workers on the event-loop thread.
+    Attached directly, the syslog handler's ``sendall`` to a stalled-but-connected collector would run
+    on that thread, so on a first deployment a wedged SIEM would cost the whole event loop up to
+    :data:`_FORWARD_TCP_TIMEOUT` per record — and then lose the record anyway. This handler enqueues
+    instead, and :class:`_ForwardQueueListener` does the sending on its own thread.
+
+    **The filter chain is on THIS side of the queue, and that placement is the load-bearing decision.**
+    :func:`_install_phi_filters` runs on the caller's thread, inline, before anything is enqueued, so
+    what the queue holds is already redacted, credential-scrubbed and control-char-escaped. Filters on
+    the far side would put PHI-bearing records into an in-memory queue — and into any later on-disk
+    spool — unredacted, which is the opposite of what the chain is for. Two smaller consequences fall
+    out the same way and both matter:
+
+    * ``QueueHandler.prepare`` clears ``exc_info``/``exc_text``/``stack_info`` after formatting, so a
+      :class:`RedactionFilter` on the far side would find no traceback left to redact. Its exception
+      limb, which is the realistic PHI vector, would be dead.
+    * A far-side chain would re-redact an already-rendered line. On the JSON format that is a known
+      framing defect (an HL7-shaped run inside the rendered object reads as a segment and is cut to
+      end of line, losing the closing brace), recorded on BACKLOG #1199 as pre-existing on the
+      double-redacted audit-tee path. Filtering once, near side, does not reproduce it here.
+
+    **The formatter is on this side too**, and the socket handler is left with an identity formatter,
+    so the object on the queue is the exact line that goes on the wire. That is the strongest available
+    statement about queue contents: not "a record that will be redacted later" but "the redacted text".
+    It also keeps the rendering cost exactly where it is today — inline on the caller — so the only
+    thing this change moves off that thread is the network.
+    """
+
+    def __init__(self, records: queue.Queue[Any], listener: _ForwardQueueListener) -> None:
+        super().__init__(records)
+        #: The same object as ``self.queue``, typed. Typeshed narrows ``QueueHandler.queue`` to a
+        #: put-only protocol, and :meth:`close` needs ``qsize`` to report what it left behind.
+        self._records = records
+        self._listener = listener
+        #: Cleared by :meth:`close` so producers stop refilling and the drain can terminate.
+        self._accepting = True
+        self._stopped = False
+        self._counter_lock = threading.Lock()
+        #: Records dropped for a full queue over the life of this handler. Read it for posture.
+        self.dropped = 0
+        self._dropped_since_report = 0
+        self._last_drop_report: float | None = None
+        #: Re-entrancy guard: the drop report is a log record that reaches this handler.
+        self._reporting = threading.local()
+
+    @property
+    def targets(self) -> tuple[logging.Handler, ...]:
+        """The handlers on the far side of the queue — the syslog forwarder itself."""
+        return tuple(self._listener.handlers)
+
+    def enqueue(self, record: logging.LogRecord) -> None:
+        """Hand ``record`` to the listener, or **count and report** it when the queue is full.
+
+        A full queue means the collector is not draining. The choice made here is to drop the
+        **newest** record: it is one failed ``put_nowait`` rather than a non-atomic evict-then-insert,
+        and it keeps the oldest evidence, which is the part an incident reconstruction needs first to
+        establish what happened before the outage. Dropping the oldest would also silently rewrite
+        evidence the engine had already accepted.
+
+        The drop is never silent — that is what BACKLOG #1199 objects to — but the warning is rate
+        limited to one per :data:`_FORWARD_DROP_REPORT_INTERVAL` and carries the batch count, because
+        the report is itself a log record arriving at this same full queue."""
+        if not self._accepting:
+            self._count_drop()
+            return
+        try:
+            self.queue.put_nowait(record)
+        except queue.Full:
+            self._count_drop()
+
+    def _count_drop(self) -> None:
+        with self._counter_lock:
+            self.dropped += 1
+            self._dropped_since_report += 1
+            if getattr(self._reporting, "active", False):
+                # We ARE the report. Counting is all we may do here; warning again would recurse.
+                return
+            now = time.monotonic()
+            last = self._last_drop_report
+            if last is not None and now - last < _FORWARD_DROP_REPORT_INTERVAL:
+                return
+            self._last_drop_report = now
+            batch, total = self._dropped_since_report, self.dropped
+            self._dropped_since_report = 0
+        self._reporting.active = True
+        try:
+            _log.warning(
+                "off-box log forwarding dropped %d record(s): the hand-off queue is full (depth %d) "
+                "because the collector is not draining it; %d dropped since this process started. "
+                "Evidence for this window does not reach the collector.",
+                batch,
+                _FORWARD_QUEUE_MAXSIZE,
+                total,
+            )
+        finally:
+            self._reporting.active = False
+
+    def close(self) -> None:
+        """Stop accepting, drain what is queued within :data:`_FORWARD_DRAIN_TIMEOUT`, then close the
+        socket handler.
+
+        **No new shutdown path was wired for this.** ``logging.shutdown`` is registered with ``atexit``
+        by the standard library and closes every handler it ever handed out, newest first — and this
+        handler is built after the syslog handler it wraps, so it drains before that socket closes. One
+        hook covers every entry point at once, which a per-entry-point call would not.
+        :func:`configure_logging` also calls this on its own previously-installed forwarder, so a
+        second call cannot leak a thread and a socket."""
+        if self._stopped:
+            return
+        self._stopped = True
+        self._accepting = False
+        drained = self._listener.stop_within(_FORWARD_DRAIN_TIMEOUT)
+        undelivered = self._listener.undelivered()  # a floor, and the message says so
+        for target in self.targets:
+            target.close()
+        if not drained or undelivered:
+            _log.warning(
+                "off-box log forwarding shut down with at least %d record(s) undelivered after "
+                "%.1fs (listener stopped cleanly: %s); they did not reach the collector.",
+                undelivered,
+                _FORWARD_DRAIN_TIMEOUT,
+                drained,
+            )
+        super().close()
+
+
+def _build_queued_forwarder(target: logging.Handler, *, fmt: str) -> _ForwardQueueHandler:
+    """Wrap ``target`` in a started :class:`_ForwardQueueListener` and return the handler to attach.
+
+    ``target`` keeps an identity formatter on purpose: the line is rendered on the near side, by the
+    formatter installed here, so the far side re-renders nothing. :class:`_ForwardQueueHandler` says
+    why both halves of that arrangement matter."""
+    target.setFormatter(logging.Formatter("%(message)s"))
+    records: queue.Queue[Any] = queue.Queue(maxsize=_FORWARD_QUEUE_MAXSIZE)
+    listener = _ForwardQueueListener(records, target)
+    handler = _ForwardQueueHandler(records, listener)
+    handler.setFormatter(_make_formatter(fmt))
+    _install_phi_filters(handler)  # near side — see _ForwardQueueHandler for why that is the point
+    listener.start()
+    return handler
+
+
+def _forward_targets(logger: logging.Logger) -> list[logging.Handler]:
+    """The off-box handlers reachable from ``logger``, looked up **through** the queue hand-off.
+
+    The forwarder is no longer a handler on the logger — the logger carries the queue handler and the
+    socket lives on the listener — so the older
+    ``[h for h in root.handlers if isinstance(h, SysLogHandler)]`` returns nothing on a forwarding
+    engine. This is the replacement for that idiom."""
+    targets: list[logging.Handler] = []
+    for handler in logger.handlers:
+        if isinstance(handler, _ForwardQueueHandler):
+            targets.extend(handler.targets)
+    return targets
 
 
 def _resolve_level(level: str) -> int:
@@ -464,12 +804,16 @@ def configure_logging(
     handlers carry the same PHI-redaction + control-char-scrub filters, so the off-box stream is held
     to the same guarantees as stdout.
 
-    The forwarder is **best-effort, never blocking the engine indefinitely**: UDP is fire-and-forget; a
-    TCP collector that is **unreachable at startup** is skipped (the connect error is logged on stdout
-    and the service starts without it), and a TCP collector that **stalls at runtime** is bounded by a
-    socket timeout (``_FORWARD_TCP_TIMEOUT``) so a wedged SIEM costs at most that per record (the record
-    is then dropped) rather than blocking the event-loop thread the engine logs from. The send is still
-    synchronous, so for a high-volume feed prefer UDP or a local forwarding agent.
+    The forwarder is **best-effort and never blocks the engine**: UDP is fire-and-forget; a TCP
+    collector that is **unreachable at startup** is skipped (the connect error is logged on stdout and
+    the service starts without it); and the send itself runs on the forwarder's own listener thread
+    (:class:`_ForwardQueueHandler`), so a collector that **stalls at runtime** costs the engine's
+    threads nothing at all. A stalled collector instead fills a bounded hand-off queue, and records
+    that no longer fit are dropped **with a rate-limited warning** rather than silently.
+
+    That is the durability half of BACKLOG #1199. **Two pieces of it are not built:** there is no
+    on-disk spool, so records queued at process exit or dropped for a full queue are gone; and the
+    reconnect (:meth:`_TimeoutSysLogHandler.handleError`) retries per record with no backoff.
 
     Idempotent: replaces any handlers a previous call installed, so it is safe to call from tests as
     well as the CLI. Pair with ``uvicorn.run(..., log_config=None)`` so uvicorn's loggers propagate to
@@ -484,6 +828,11 @@ def configure_logging(
     root = logging.getLogger()
     for existing in list(root.handlers):
         root.removeHandler(existing)
+        if isinstance(existing, _ForwardQueueHandler):
+            # OURS, and it owns a live thread and an open socket, so removing it is not enough. Only
+            # ours is closed: a handler this function did not install is removed, never closed, since
+            # a caller (pytest, an embedding host) may still be using it.
+            existing.close()
     root.addHandler(stdout_handler)
     root.setLevel(numeric)
 
@@ -502,9 +851,10 @@ def configure_logging(
                 exc,
             )
         else:
-            fwd_handler.setFormatter(_make_formatter(forward.fmt))
-            _install_phi_filters(fwd_handler)
-            root.addHandler(fwd_handler)
+            # The formatter and the PHI filter chain go on the QUEUE handler, not on fwd_handler.
+            # _ForwardQueueHandler carries the reasoning; the short form is that a record must be
+            # redacted before it is queued, not after.
+            root.addHandler(_build_queued_forwarder(fwd_handler, fmt=forward.fmt))
             forwarder_installed = True
 
     # Let uvicorn's loggers flow to the root handler(s) (one shared format/stream/forwarder).

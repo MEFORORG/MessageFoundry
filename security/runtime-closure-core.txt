@@ -1,0 +1,55 @@
+# The CORE runtime closure: every distribution a default engine install carries, transitive
+# dependencies included, with NO optional extras and NO development toolchain.
+#
+# This file is the denominator for docs/RISKY-COMPONENTS.md (BACKLOG #1189, ASVS 15.1.4). It exists
+# because that denominator is not recoverable from any other tracked artifact: requirements.lock is
+# exported with --all-extras and therefore carries the dev toolchain, and pyproject.toml names only
+# the direct dependencies, which is roughly half of what actually runs.
+#
+# Regenerate with, from the repository root:
+#     uv export --no-emit-project --format requirements.txt -o <tmp>
+# then take the name==version pairs, lowercase and sort them.
+#
+# tests/test_risky_component_designation.py fails when this file and the designation document
+# disagree, so a dependency added here without being classified there is a loud failure.
+aiosqlite==0.22.1
+annotated-doc==0.0.4
+annotated-types==0.7.0
+anyio==4.14.0
+argon2-cffi==25.1.0
+argon2-cffi-bindings==25.1.0
+certifi==2026.6.17
+cffi==2.0.0
+click==8.4.1
+colorama==0.4.6
+cryptography==50.0.1
+defusedxml==0.7.1
+fastapi==0.141.1
+h11==0.16.0
+hl7==0.4.5
+hl7apy==1.3.5
+httpcore==1.0.9
+httptools==0.8.0
+httpx==0.28.1
+idna==3.18
+ldap3==2.9.1
+prometheus-client==0.26.0
+psutil==7.2.2
+pyasn1==0.6.4
+pycparser==3.0
+pydantic==2.13.5
+pydantic-core==2.46.5
+pyspnego==0.12.2
+python-dotenv==1.2.2
+pyyaml==6.0.3
+sspilib==0.5.0
+starlette==1.6.0
+tomlkit==0.15.1
+truststore==0.10.4
+typing-extensions==4.15.0
+typing-inspection==0.4.2
+tzdata==2026.3
+uvicorn==0.49.0
+uvloop==0.22.1
+watchfiles==1.2.0
+websockets==16.0
