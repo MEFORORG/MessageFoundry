@@ -58,8 +58,23 @@ _ENGINE_IMPORT = re.compile(
 # scanner is still a guard on the thing it scans.
 _STAYS_WITHOUT_IMPORTING = frozenset(
     {
+        # Reads messagefoundry/config/models.py (the ActiveWindow/Schedule window evaluator, as its
+        # positive control) and rglobs messagefoundry/auth/**.py (the absence assertion). The absence
+        # arm is exactly why this cannot be tooling: what it guards against is a time-window read
+        # appearing inside auth/, which arrives as an ENGINE diff and does not trip the tooling job's
+        # path gate (scripts/**, .github/**, the ledger). Listed as tooling it would face nothing on
+        # the change that breaks it. Its other half reads docs/SECURITY.md, which is what makes it a
+        # doc-drift guard, but the doc half is not the reason it stays.
+        "test_adaptive_attributes_doc_drift.py",
         "test_asvs_apply.py",
         "test_asvs_residual_lint.py",
+        # Reads messagefoundry_webconsole/static/app.js off disk. That is shipped product source by
+        # this file's own stated rule -- the `_webconsole` arm of _ENGINE_IMPORT above exists to say
+        # the console counts as the product -- so a test whose SUBJECT is that file is engine-subject
+        # even though it imports nothing. The guard fires when the console starts writing a browser
+        # storage prefix docs/PHI.md does not name, which arrives as a console diff and does not trip
+        # the tooling path gate.
+        "test_browser_storage_doc_drift.py",
         "test_c901_delta.py",
         # NOT engine source, so this entry WIDENS the list's stated rule and the claim is spelled out
         # for review. Its subject is the TEST TREES: it scans both `testpaths` roots for a bare
