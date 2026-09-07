@@ -1834,9 +1834,10 @@ class AuthSettings(_Section):
     require_action_step_up: bool = True
 
     # Multi-factor authentication (WP-14, ADR 0002 §3; ASVS 6.3.3) — a native RFC 6238 TOTP second
-    # factor for LOCAL accounts. AD/Kerberos MFA is delegated to the directory (Entra Conditional
-    # Access / an MFA proxy), so a directory login is never prompted for an engine TOTP. When
-    # require_mfa is on, an in-scope local account (see require_mfa_scope) MUST enroll a factor and
+    # factor. It covers EVERY account, directory ones included (BACKLOG #1144, ASVS 6.8.4): a ticket
+    # or a bind asserts nothing about what the directory enforced, so the engine grants nothing on it
+    # and asks for its own factor instead of exempting the leg. When require_mfa is on, an in-scope
+    # account (see require_mfa_scope) MUST enroll a factor and
     # satisfy it before its session may reach ANY authorized route — MFA is an ACCESS gate, not only
     # a step-up gate (ASVS 6.3.3). A user who has already enrolled a factor is always required to
     # satisfy it, whatever the scope.
@@ -1858,16 +1859,22 @@ class AuthSettings(_Section):
     # session, not merely step-up operations — an MFA-pending session is refused with 403 +
     # ``X-MFA-Required: 1`` (api/security.py:require) and, in the browser, confined to /ui/mfa.
     require_mfa: bool = True
-    # WHICH local accounts an un-enrolled session's access gate covers when require_mfa is on (ASVS
-    # 6.3.3). ``every_local_account`` (default) means any local account must carry a second factor;
+    # WHICH accounts an un-enrolled session's access gate covers when require_mfa is on (ASVS 6.3.3).
+    # ``every_local_account`` (default) means any account must carry a second factor;
     # ``administrators`` is the pre-6.3.3 posture where only the Administrator role must. An account
     # that has ALREADY enrolled a factor is required to satisfy it under either value — this dial only
-    # decides who must enroll in the first place. Directory (AD/Kerberos) identities are out of scope
-    # under either value: their MFA is delegated to the directory (owner-signed relaxation).
+    # decides who must enroll in the first place.
     #
-    # OPERATOR NOTE: under ``every_local_account`` a non-interactive LOCAL bearer-token service account
+    # THE ``every_local_account`` SPELLING IS NOW WIDER THAN ITS NAME (BACKLOG #1144). Directory
+    # identities used to be exempt under either value; they are not, because the directory legs assert
+    # no strength and the engine grants nothing on that. Renaming the Literal reaches this model, the
+    # CONFIGURATION.md table and the tests that pin both -- its own coherent change, not a rider on a
+    # security fix. THIS IS THE SINGLE PLACE that mismatch is explained; do not restate it (SDS-3.5).
+    #
+    # OPERATOR NOTE: under ``every_local_account`` a non-interactive bearer-token service account
     # becomes MFA-pending and cannot enroll unattended — move it to mTLS (api/security.py:
-    # require_service_cert, which is exempt by design) or to AD, or set this to ``administrators``.
+    # require_service_cert, which is exempt by design) or set this to ``administrators``. Moving it to
+    # AD is NO LONGER an escape: a directory account is in scope like any other.
     require_mfa_scope: Literal["administrators", "every_local_account"] = "every_local_account"
     # TOTP clock-skew tolerance, in 30-second time steps, applied when verifying a submitted code
     # (BACKLOG #187; ASVS 6.5.5). Default 0 = STRICT: only the current 30 s step is accepted, so a
@@ -2081,7 +2088,7 @@ class AuthSettings(_Section):
     oidc_prompt: str | None = None  # requested `prompt` authorize param
     oidc_jwks_ttl_seconds: int = 3600
     oidc_jwks_min_refetch_seconds: int = 300  # the amplification bound
-    oidc_flow_ttl_seconds: int = 300
+    oidc_flow_ttl_seconds: int = 300  # single-use flow window; validator-capped 30..1800
     oidc_flow_cache_max: int = 512  # reject-when-full (never evict — that is a login DoS)
     oidc_session_max_hours: int | None = None  # G2: cap below id_token.exp if tighter is wanted
 
@@ -2151,6 +2158,24 @@ class AuthSettings(_Section):
     def _check_oidc_skew(cls, value: int) -> int:
         if not 0 <= value <= 300:
             raise ValueError("oidc_clock_skew_seconds must be between 0 and 300")
+        return value
+
+    @field_validator("oidc_flow_ttl_seconds")
+    @classmethod
+    def _check_oidc_flow_ttl(cls, value: int) -> int:
+        # Bounded at BOTH ends (BACKLOG #1156, ASVS 10.1.2), because each end fails differently.
+        # FLOOR: the value becomes the flow cookie's `Max-Age`, so at or below zero the browser
+        # discards the cookie on receipt and every federated login then fails `flow_binding_missing`
+        # with nothing naming the cause. CEILING: this is both the single-use replay window for the
+        # staged `(state, nonce, code_verifier)` and how long one abandoned flow holds an
+        # `oidc_flow_cache_max` slot -- see that field for why the cache rejects rather than evicts.
+        #
+        # The endpoints are a JUDGMENT with no measured anchor, and no neighbouring field supplies
+        # one: every other lifetime and size in this OIDC block is itself unbounded (verified by
+        # execution -- `oidc_jwks_ttl_seconds` accepts 10_000_000). What is NOT a judgment is that
+        # an unbounded value is wrong in both directions.
+        if not 30 <= value <= 1800:
+            raise ValueError("oidc_flow_ttl_seconds must be between 30 and 1800")
         return value
 
     @field_validator("totp_skew_steps")
@@ -4480,7 +4505,8 @@ def security_loosenings(
         out.append(
             (
                 "require_mfa",
-                "every local account is single-factor — no native TOTP second factor is required",
+                "every account is single-factor — no engine second factor is required, and a "
+                "directory session is admitted on a ticket that asserts no strength",
             )
         )
     elif sec.require_mfa_scope != "every_local_account":
@@ -4489,8 +4515,8 @@ def security_loosenings(
         out.append(
             (
                 "require_mfa_scope",
-                "only Administrators must enroll a second factor — every other local account is "
-                "single-factor until it opts in by enrolling",
+                "only Administrators must enroll a second factor — every other account, local or "
+                "directory, is single-factor until it opts in by enrolling",
             )
         )
     if sec.allow_single_factor_admin_when_exposed:
