@@ -94,8 +94,8 @@ async def test_recipients_never_reach_the_webhook_payload(
         def __exit__(self, *a: object) -> None:
             return None
 
-        def read(self) -> bytes:
-            return b""
+        def read(self, amt: int = -1) -> bytes:
+            return b"" if amt < 0 else (b"")[:amt]
 
     def fake_open(req: Any, timeout: float | None = None) -> _Resp:
         captured["body"] = req.data

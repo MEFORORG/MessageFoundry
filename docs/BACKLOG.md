@@ -11889,6 +11889,48 @@ Nothing here touches the TLS/FTPS context in the same module, which was already 
 
 **Proposed work, unallocated and by subject:** the owner ruling, put with both governing records and the table together since neither record cites the other; the residual factual correction, owed regardless; striking the vault-in-scope trigger as measured; the public risky-component designation document with its criterion stated and its assessed-but-not-designated set named; the denominator re-derivation that must precede it; and a drift guard for that document reading a TRACKED path, on the anchor-registry-plus-self-test pattern the existing guard already uses.
 
+**Measured 2026-09-06 -- the denominator re-derivation.** _(Superseded in part: the ruling came the
+same day and the document is now BUILT. See the entry below.)_ The row asks for the public risky-component designation to be preceded by a
+denominator re-derivation, "because a manifest-only enumeration is structurally short". It is, and
+here is the size of it: the manifest names **19** core distributions directly, the core runtime
+closure is **41**, and the committed `requirements.lock` holds **100**. Naming every extra raises the
+direct count to 42, still against 100. So a manifest reading undercounts by roughly half at either
+denominator, and any designation must state which one it means. **The 100 is NOT a runtime figure and
+must not be quoted as one** -- `requirements.lock`'s own header records `uv export --all-extras`, so
+it carries the `dev` extra and its transitive closure; all seven dev tool names resolve inside it.
+The three figures were taken from `uv export` with and without extras and reconciled against the
+committed lock, which matched the all-extras export by name set exactly. At the time of this measurement no designation
+document had been written, because a Builder cannot ask and wait for a ruling. The empty tracked
+`security/vex/messagefoundry.openvex.json` was deliberately left empty: the row names populating it
+as explicitly not an honest pass, and it still is not. [PR 942](https://github.com/MEFORORG/MessageFoundry/pull/942).
+
+**BUILT 2026-09-06, after the owner ruled the scope: the core runtime closure.** The ruling settled
+the question this row was blocked on, and `docs/RISKY-COMPONENTS.md` is the designation. It assesses
+**41** distributions -- what a default install actually executes, transitive dependencies included,
+no extras and no development toolchain -- and states the denominator table on its face, because the
+choice moves the answer by about half. **The 100 in `requirements.lock` must never be quoted as a
+runtime figure**: that file is an `--all-extras` export and carries the dev toolchain. The criterion
+is stated and checkable -- hostile input, secrets and trust, or protocol termination -- with native
+compiled code an aggravating factor inside a tier rather than a tier of its own. **Twenty-six of the
+forty-one are designated, and the proportion is the finding rather than an embarrassment:** this is
+an integration engine, so parsing traffic from partners it does not control and terminating network
+protocols is most of what its runtime closure does. The **assessed-but-not-designated** set is named
+in full with a reason each, which is the half a designation list alone cannot supply, and the page
+prints its own arithmetic so a reader can confirm the set is closed without counting rows.
+`security/runtime-closure-core.txt` is a new tracked anchor, added because that denominator was
+**not recoverable from any other tracked artifact**. The drift guard the row asks for is
+`tests/test_risky_component_designation.py`: it fails in BOTH directions -- an unclassified new
+dependency, a classified name that is no longer a dependency, a package in both tables, or a printed
+count the tables no longer support -- cross-checks the closure against `requirements.lock` for
+containment rather than equality, and leads with a positive control, since "every closure member is
+classified" passes vacuously against an empty parse. Both controls were run and both fire.
+**The guard caught a defect in ITSELF on its first run**, reading the scope table's
+`requirements.lock` row as a designation and reporting 27 instead of 26; the parser now starts at the
+first tier heading, and that is recorded in the code because a count inflated by its own instrument
+is precisely what this file exists to prevent. Still open on this row: the residual factual
+correction, striking the void vault-in-scope trigger, and the extras, which this page does not cover
+and says so. [PR 942](https://github.com/MEFORORG/MessageFoundry/pull/942).
+
 ## 1190. research an honest pass for ASVS 15.1.5 -- which dangerous-functionality classes can be highlighted publicly without becoming the roadmap
 
 > 🔢 **Re-scored 2026-08-20 -> P3.** Value **4/10** · Difficulty **3/10** · _fill-in_. Only the dynamic-execution class is highlighted in-tree, the other classes the item names appear in no shipped document, and docs/security/ is still ignored at .gitignore:170. The remainder is deciding which classes can be named publicly without the highlight becoming the exploitation guide, then writing them where an adopter receives them. _(was 4/10 · 5/10.)_
@@ -11923,6 +11965,27 @@ Nothing here touches the TLS/FTPS context in the same module, which was already 
 
 
 **OWNER RULING 2026-08-22 -- the highlight covers the engine wheel AND the documented deployment path it invokes.** The disclosure question the packet posed is **settled by measurement, not judgement**: native library calls, Windows impersonation and the installer's privilege grant return **zero across the entire withheld threat model**, against a positive control of 23 for `sandbox` in the same document and the same run. None of it is withheld-derived, so the disclosure ruling never reached it, and the mechanisms are already public here -- 24 tracked documents name the native mechanism, 13 name impersonation, 13 name elevation. What replaces it is a scope question nobody had asked, and the ruling answers it: the deployment path is in. That decision is made **knowing its cost, which is stated rather than assumed** -- the most privilege-consequential site in the surface, the installer granting `SeServiceLogonRight` via `secedit` with an `-AllowLocalSystem` switch, is in neither the wheel nor the withheld document, and **no instrument in this repository can currently reach it**. Choosing this scope creates a measurement gap that has to be filled, not waved at.
+
+**Built 2026-09-06 -- the in-tree dangerous-functionality highlight, and it WIDENS 15.2.5's
+precondition rather than narrowing anything.** `docs/DANGEROUS-FUNCTIONALITY.md`, linked from
+`.github/SECURITY.md`, covering the engine wheel plus the documented deployment path per the
+2026-08-22 owner ruling. Seven classes, each with what constrains it: operator-authored Router and
+Handler execution with the sandbox trade that keeps isolation off by default; the config loader
+importing every non-underscore module by path; three provider seams that import a class named in
+configuration; eight process starts; fourteen modules calling native libraries through `ctypes`; the
+one path that changes thread identity; and the parsers, with the tolerance premise stated so nobody
+later reaches a pass by making the HL7 parser strict. **The class enumeration was re-derived rather
+than taken from this row**, each pattern carrying a misspelled control, all returning zero. **A
+first attempt matched `re.compile` across the whole tree and was discarded -- a real match on the
+wrong feature.** **Two claims drafted from this row's framing were FALSE and were corrected before
+landing:** every process start does NOT pass an argument list, because `pipeline/dr.py` calls
+`asyncio.create_subprocess_shell` and runs the operator's command through a shell; and the
+`parsing/peek.py` guard is not a per-segment cap but a 16 MiB whole-message ceiling plus a
+10,000-segment count, either disableable. **Consequence for #1194, and it is owed to whoever
+re-scores 15.2.5:** that verb bites where dangerous functionality is DOCUMENTED, and before this only
+the Router/Handler class was (`docs/CONFIGURATION.md`). Six more classes are now documented, so
+15.2.5 reaches all of them and is HARDER to pass than it was. Still open on this row: the class
+re-derivation the document should seed, the guard re-point, and the owner ruling. [PR 942](https://github.com/MEFORORG/MessageFoundry/pull/942).
 
 ## 1191. research an honest pass for ASVS 15.2.2 -- an availability bound on the MLLP data plane that does not accept-and-drop
 
@@ -11962,6 +12025,32 @@ Nothing here touches the TLS/FTPS context in the same module, which was already 
 
 **Two measurements to carry forward, and one limb a builder cannot reach from this repository.** The sixteen unbounded egress reads are confirmed: `grep -rnE '\b(resp|exc)\.read\(\)' messagefoundry/` returns 17 hits, of which one (`transports/ai_broker.py:206`) is a comment saying never to echo such a body, leaving **16 call sites**; the two the earlier count of fourteen missed are the HTTP-error path `exc.read()` at `transports/fhir.py:649` and `transports/soap.py:839` (the research cited `:647` and `:832`, so both anchors have drifted a little). The positive control is that the same pattern class finds the two sites that ARE bounded, `auth/oidc/flow.py:292` and `auth/oidc_http.py:135`, both reading `limit + 1` -- so a scan returning nothing would have been visibly broken rather than reassuring. **Fixing those sixteen is still open and was deliberately not attempted here.** The other direction of the doc limb is genuinely unreachable from an engine PR: both `docs/SECURITY.md` and `docs/CONFIGURATION.md` point at `security/THREAT-MODEL.md` Resource-demanding functionality for the full inventory, and `docs/security/` is gitignored out of this repository (`.gitignore:177`) because it lives in the vault clone. That section carries both staleness directions plus the total absence of this new bound, and correcting it is a vault edit, not an engine one. `tests/test_threat_model_doc_drift.py` says so in its own skip warning, and it is the instrument for the vault half: its `_RESOURCE_ANCHORS` registry already pins `max_file_bytes` and `RemoteFile` in that document, so a seat holding the vault can enforce the content assertions from an engine checkout with `MEFOR_THREAT_MODEL_DOC=<path>` (or make the absence hard with `MEFOR_REQUIRE_THREAT_MODEL_DOC=1`). **A read-side anchor was deliberately NOT added to that registry here:** the registry is public and the document is not, so adding one reds a tree this builder cannot see or repair. Add it in the same change that rewrites the row, the way the 15.1.5 sandbox-IPC anchor comment already describes coupling such an edit. **Still open, unchanged:** the shared ingest admission seam and its depth query; the Router/Handler wall-clock cap; the sixteen egress reads and the live-lookup byte bound; the `monitoring:read` GET pacing; the paced read on the other unauthenticated intakes; the vault half of the documented strategy; and the regression gates. **Still not an honest pass, unchanged:** flipping the MLLP message-rate default, which reverses the ruling written into `transports/mllp.py:109-115`; setting `stream_inflight_budget_bytes` or `max_db_mb` to arbitrary non-zero values; editing the documented strategy to declare unbounded ingest the strategy; and reversing the `[sandbox].mode='off'` default (ADR 0087). The closing act is still a scorecard re-score, which is the tracking seat's act.
 
+**Built 2026-09-06 -- the egress-read limb, all of it, and the count was 17 rather than 16.**
+`messagefoundry/transports/bounded_read.py` asks the socket for `limit + 1` bytes, so receiving that
+many proves the body is over the bound without ever buffering the whole of it; peak buffer is the
+ceiling plus one. Applied at every outbound read: REST, SOAP, the FHIR write and the ADR 0043 live
+lookup, DICOMweb STOW-RS, the OAuth2 and SMART token endpoints, the AI broker, the alert webhook, the
+local PEM key read, and each of their reachability probes. **The 16 MiB ceiling is not a new number**
+-- it is `parsing.peek.DEFAULT_MAX_MESSAGE_BYTES`, imported rather than redefined, on the argument
+that the largest body the engine accepts AS a message bounds the largest it buffers from a reply TO
+one; token endpoints get 256 KiB, matching what the engine's own OIDC relying party already applies.
+**THE TWO SIXTEENS WERE DIFFERENT SETS OF SIXTEEN AND AGREED BY COINCIDENCE**: this row's grep
+included `pipeline/alert_sinks.py` and excluded `transports/signing.py`; a second grep did the
+reverse. The union is 17, all bounded, none ruled out. `ResponseTooLargeError` subclasses
+`DeliveryError`, so an over-cap reply is transient and takes the retry-then-dead-letter path a
+mid-read timeout always had; the two HTTP-error-body reads instead WARNING-log and classify on status
+alone, because raising there would swap a classified failure for an unclassified one. **EGRESS ONLY
+-- every site reads a reply to a request the engine made, so the count-and-log invariant is untouched
+and none of this can drop a received message.** 30 tests whose fake raises if called with no
+argument, so a regression to a bare `read()` fails loudly, plus a source-level gate; removing the
+bound from the lookup alone turns three red. `docs/SECURITY.md` gets a row because that section opens
+by claiming it lists every enforced limit. **Still open, and it is the cell's actual shortfall:** the
+shared ingest admission seam, the Router/Handler wall-clock cap, the `monitoring:read` GET pacing,
+the paced read on the other unauthenticated intakes, and the vault half of the documented strategy.
+The cell's short-fall was always the data plane, not egress.
+
+**Count precision, corrected 2026-09-06 after a self-audit rather than after someone quoted it back.** The 17 above is the number of BOUNDED SITES, and they do not all have the same shape. **Sixteen** go through the shared `read_bounded`/`read_bounded_text` helper (AST-counted, imports excluded, against a misspelled-name control returning zero), and **one** -- the local PEM signing-key read at `transports/signing.py` -- is bounded by its own `_MAX_KEY_FILE_BYTES` constant using the identical `limit + 1` idiom, because it reads a FILE rather than an HTTP response. So "17 egress response reads" is the wrong label for the set even though every member of it is bounded: the honest phrasing is sixteen egress response reads plus one local key-file read. A reader quoting the bare 17 forward as a count of network reads would be off by one. Zero unbounded reads remain in `transports/` or `pipeline/`; the only two textual matches left are a docstring and a "never echo this" comment. [PR 942](https://github.com/MEFORORG/MessageFoundry/pull/942).
+
 ## 1192. research an honest pass for ASVS 15.2.3 -- getting development subcommands out of the wheel without taking dryrun off the operator's box
 
 > 🔢 **Re-scored 2026-08-20 -> P2.** Value **5/10** · Difficulty **4/10** · _fill-in_. Clause (a) still binds: messagefoundry/__main__.py registers dryrun (:162), adr-analyze (:225), generate (:350), lens (:375) and import corepoint (:442, :449) as unconditional subparsers on the same entrypoint as serve (:63), while clause (b) stays clean via the sdist only-include at pyproject.toml:21. Value 5 on the item's own severity, low product effect and no added network surface, which makes this shipped-artifact hygiene; difficulty 4 for a research pass that must settle whether an entrypoint gate reads as does-not-include, plus CLI tests if it becomes a build. _(was 6/10 · 5/10.)_
@@ -11995,6 +12084,25 @@ Nothing here touches the TLS/FTPS context in the same module, which was already 
 **Still not an honest pass:** reading "the production environment" as the network surface only, which is what graded this cell Pass once; `argparse.SUPPRESS`, which changes help text while the code stays in the wheel; putting the toolkit behind a development EXTRA, which is mechanically incapable of satisfying the clause because a PEP 621 extra adds dependencies and removes no files; and inlining the synthetic message so `generators/` has no importer left and reporting it unreachable, which is the disqualified no-op move run in reverse -- `messagefoundry/anon/` has zero importers today and is in the wheel today.
 
 **Proposed work, unallocated and by subject:** the authoring and development toolkit distribution, built the way the two existing sibling distributions are; the dry-run CLI-driver split, or a recorded ruling that dry-run-as-a-library is required; the verifier's synthetic-message inlining at `verify/smoke.py:27-30`, the single edit that unblocks the generators; the de-identification package rehoming, landable on its own; the security-lint disposition WITH its documentation half in the same change; gates that inspect built-artifact MANIFESTS (engine, console, harness and the image) rather than an import namespace, plus the CLI subcommand-set equality test; a written scope reading for the container image; and ratification of the required-versus-extraneous rule before building, after fixing it -- on its two nearest cases, `validate` at `__main__.py:152` and `check` at `:195`, it does not discriminate, because a config directory is simultaneously the deployed instance's config and a source artifact.
+
+**Built 2026-09-06 -- the verifier's synthetic-message inlining, the single edit this row names
+as unblocking the generators.** `verify/smoke.py` no longer imports `messagefoundry.generators`; the
+message is a module constant, taken verbatim from `generate_message("ADT", "A01", 0)` except that
+every person name was replaced with the `ZZZTEST` family, because `smoke_live` sends this into a live
+engine where it lands in that operator's own store and the generator's pool emits names no operator
+would read as a probe. The edited form was re-checked through the generator's own compliance gate and
+hl7apy strict validation at 2.5.1. Both dead "could not generate a synthetic message" handlers go
+with it. **The literal is pinned on CONFORMANCE, not byte-equality with the generator**, deliberately:
+an equality test would go red the day the generators leave the engine distribution, which is the end
+state this inlining exists to unblock. Two guards hold the edge shut, one at runtime in a fresh
+interpreter and one over the AST; both were negative-controlled by re-adding the import. **The source
+guard walks the AST rather than scanning for a substring -- the first attempt used a substring and
+went red on this module's own prose explaining the package's absence.** **This does NOT lift the
+cell**: cutting the last importer of `generators/` removes no file from the wheel, and `anon/` has
+had zero importers all along. Two measurements to carry: `docker/Dockerfile` copies the whole package
+and its entrypoint exposes all 32 subcommands, so a deploying operator's container would carry
+`dryrun --include-body`; and the wheel's actual file list is still unmeasured, because there is no
+`[tool.hatch.build.targets.wheel]` table at all and hatchling is not installed here. [PR 942](https://github.com/MEFORORG/MessageFoundry/pull/942).
 
 ## 1193. research an honest pass for ASVS 15.2.4 -- provenance for the web-console distribution the engine loads by import name
 
@@ -12038,6 +12146,22 @@ Nothing here touches the TLS/FTPS context in the same module, which was already 
 **Still not an honest pass:** editing the guard's classification so CI agrees with whichever artifact is convenient, now with the sign flipped -- re-adding a false entry to make a green check red is the same defect inverted; re-scoring to pass on the registration measurement alone, which would leave two compensating controls resting on false premises inside the very cell whose defect class is a compensating control on a false premise; and adding signing and attestation artifacts that no documented install consumes and counting them as the control. That work is worth doing as doc-truth repair with a real verification consumer; it is not what earns the verdict.
 
 **Proposed work, unallocated and by subject:** retiring the five stale pre-claim assertions (`release.yml:360-364`, `docs/WEBCONSOLE-PACKAGE.md:17-20`, `packaging/messagefoundry-webconsole/RELEASE.md:9` and its reference to an extra `pyproject.toml` does not declare, the two web-console test-plan rows, and the `messagefoundry/api/app.py:5165-5175` comment that contradicts the string beneath it); a verifying console install taken as a whole trigger arm, including publishing the lock per release and REMOVING the bare-name form from shipped text; the console distribution's provenance verification at load, or a recorded ruling declining it; extending signing, provenance attestation and the SBOM to the console and harness release jobs so the README's claim becomes true; the supply-chain document corrections; widening the guard's file set onto the two in-scope artifact trees it scans zero files of and adding a prose arm that fails when tracked text asserts a distribution is unpublished while it is classified published; and a written scope reading, with rows if in scope, for the container image, its dependency locks, the deploy-time supervisor download and the four hook repositories pinned by mutable tag against a workflow set pinned by full commit id.
+
+**Re-verified 2026-09-06 and NOT worked, because the premise no longer reproduces.** Two of
+the three concrete limbs this row proposes have already landed from an earlier pass, and manufacturing
+work against them would have been the wrong call. `_UNPUBLISHED_DISTRIBUTIONS` in
+`tests/test_install_instruction_provenance.py` is an empty `frozenset` carrying a docstring that says
+empty is the goal state rather than a disabled guard, with
+`test_a_new_distribution_must_be_classified` holding it there. The guard's `_SHIPPED_TEXT_GLOBS` now
+covers `messagefoundry_webconsole/**/*.py` and `harness/**/*.py`, the two in-scope artifact trees this
+row records it scanning zero files of, and its own comment cites this row by number for the widening.
+`packaging/messagefoundry-webconsole/RELEASE.md` carries a "corrected 2026-09-03" banner citing this
+row. What remains is release-infrastructure work rather than a code defect: extending signing,
+provenance attestation and the SBOM to the console and harness release jobs, and a written scope
+reading for the container image and its locks. **A bare-name install form does survive in two
+documents** (`docs/SERVICE.md` and `docs/WEBCONSOLE-PACKAGE.md`), but the name is now claimed on PyPI,
+so it is no longer the dependency-confusion primitive this row's severity sentence describes. [PR 942](https://github.com/MEFORORG/MessageFoundry/pull/942)
+carries no change for this row.
 
 ## 1194. research an honest pass for ASVS 15.2.5 -- isolation around Router/Handler code that does not fail closed on the sanctioned live lookups
 
@@ -12087,6 +12211,21 @@ Nothing here touches the TLS/FTPS context in the same module, which was already 
 
 **Proposed work, unallocated and by subject:** a phase-scoped `[sandbox]` mode so the ROUTER and its `accepts=` predicates can be isolated without the transform phase's live-lookup sacrifice, which the measurement prices at 0.18 ms per message; decoupling worker CARDINALITY from the connection count (a bounded shared pool rather than one child per inbound), without which no default flip clears the 1,500-connection target on memory whatever it costs per message; the IPC-brokered read-only lookup back-channel WITH the egress allowlist inverted to deny-by-default in the same piece; the throughput benchmark of the brokered isolated worker against the baseline on a server database; the isolated worker as the shipped default, which is the single instrument; moving config-module top-level execution out of the engine parent, scoped FIRST because it plausibly exceeds the other pieces combined; a runtime protection around handler-imported third-party packages, or a recorded ruling that the operator's supply chain is out of this cell; protections around the disaster-recovery shell hook and the elevation site; the re-derivation of the dangerous-functionality population from the artifact that documents it rather than from a CI test's allowlist; and corrections to the ADR 0087 encapsulation claim and to the risk register's re-score trigger, which is unreachable as written because the ADR it names declares a default-on mode out of scope.
 
+**Re-verified 2026-09-06: this row's own deliverable already landed and nothing further was
+built.** The per-message overhead measurement the row records as asserted-and-unmeasured is in the
+tree, with the ADR 0087 cost correction beside it and the benchmark under
+`benchmarks/results/2026-09-04-adr0087-sandbox-dispatch/`. `[sandbox].mode` still defaults to `"off"`
+(`config/settings.py`), and the remaining proposed work -- the phase-scoped mode, the IPC-brokered
+lookup back-channel, decoupling worker cardinality -- are builds outside one pass. **One thing a
+re-score must not miss, and it moves the cell the wrong way.** This verb bites where dangerous
+functionality is DOCUMENTED, and until 2026-09-06 the only documented class was Router and Handler
+execution. `docs/DANGEROUS-FUNCTIONALITY.md` (#1190, [PR 942](https://github.com/MEFORORG/MessageFoundry/pull/942)) now also documents the `ctypes` surface,
+eight process starts, the Windows thread-impersonation path, the shell-invoked disaster-recovery hook,
+the config loader's import-by-path and three provider dispatches. Read strictly, 15.2.5 now requires
+additional protections around all of them, so **the precondition widened and the cell became harder to
+pass, not easier.** That is the honest consequence of documenting a surface rather than a reason not
+to document it.
+
 ## 1195. research an honest pass for ASVS 15.4.4 -- fair thread access on the shipped SQLite posture, or a measured argument that the existing pools already suffice
 
 > **PARTIAL 2026-08-26 (lander), NOT A CLOSURE -- this item stays OPEN.** Lands one concrete instance
@@ -12134,6 +12273,26 @@ Nothing here touches the TLS/FTPS context in the same module, which was already 
 
 **Proposed work, unallocated and by subject:** the per-subsystem executor partition on every store backend and on the shipped default posture; the SFTP channel read timeout; maintenance-job thread containment; bounds or containment for the store content scan, the uploaded-file tier and the retention sweeps; the close-path executor repair at `messagefoundry/transports/wincred.py:176`, which parks a DEFAULT-pool thread joining a worker that may be inside an unbounded filesystem operation and which the partition would not fix because the target is hard-coded; a disposition for the ASGI worker-thread pool, either asynchronous providers or an owned, sized and instrumented pool; the always-on per-executor saturation gauge and a fairness regression test that saturates the CPU and connector executors and asserts an authentication verify completes inside a stated budget; and the residual correction striking MLLP from the mitigation sentence in both the cell and this item.
 
+**Built 2026-09-06 -- the SFTP thread-parking bounds. The `wincred.py` limb this row leads with
+NO LONGER REPRODUCES.** `transports/wincred.py` was re-checked first and is already fixed: its
+`close` docstring cites this row and ASVS 15.4.4 by name, it calls `shutdown(wait=False)`, and no
+thread is parked joining a worker. No work was manufactured there. What does reproduce is the SFTP
+path: paramiko's `connect(timeout=...)` bounds the TCP connect only, so the banner exchange,
+authentication and every read on an established channel were unbounded, and a partner share that
+accepted a connection and then went silent would hold one REMOTEFILE worker thread per stuck
+operation. Three bounds now, all hard-coded module values rather than new config surface:
+`banner_timeout` and `auth_timeout` at connect, and `SFTP_CHANNEL_READ_TIMEOUT_SECONDS` on the
+channel, which bounds each individual READ rather than the transfer -- a slow but live transfer keeps
+resetting it, so a large file over a thin link is unaffected. The expiry maps to a transient
+`_RemoteError`, because a silent peer is a live-again-later peer. An absent channel is a no-op, since
+refusing a transfer over a missing channel would be worse than the unbounded read it replaces. Five
+tests, each asserting the bound is finite and positive, because `None` and `0` are both paramiko
+spellings for "wait indefinitely" and either would satisfy a was-it-called check while restoring the
+defect; with the constant present but unapplied, two fail. `docs/CONNECTIONS.md`'s REMOTEFILE timeout
+sentence is corrected in the same change. **Still open:** the per-subsystem executor partition, the
+ASGI worker-thread pool disposition, the per-executor saturation gauge and the fairness regression
+test -- the cell's substance is untouched by this. [PR 942](https://github.com/MEFORORG/MessageFoundry/pull/942).
+
 ## 1196. research an honest pass for ASVS 16.2.2 -- the synchronized-sources conjunct on an engine with no shippable time peer
 
 > 🔢 **Re-scored 2026-08-20 -> P2.** Value **6/10** · Difficulty **6/10** · _big bet_. The SNTP gate still ships warn-only with no peer (config/settings.py:1447-1448; the item's :1393 anchor has moved) and the validator at :1513-1515 confirms the structural bind the item describes -- flipping the flag alone makes every stock config fail to load. Value 6 for an evidence-quality gap with no in-engine skew check on the default and only an awkward out-of-product substitute; difficulty 6 because the hinge is a reading of the standard about whether host-level clock discipline satisfies a synchronization verb for an application that does not own the clock, followed by a clinical judgement on fail-closed behaviour. _(was 6/10 · 6/10.)_
@@ -12165,6 +12324,40 @@ Nothing here touches the TLS/FTPS context in the same module, which was already 
 **Still not an honest pass:** flipping `require_time_sync`, doubly disqualified now (the validator makes it a load failure without a peer, and shipping a default peer was ruled NO); declaring the cell operator-substrate and not applicable, which fails because the engine built the mechanism and because the format conjunct is in-scope engine behaviour the engine SATISFIES on a shipped default at `messagefoundry/logging_setup.py:349` and `:222`; and passing on DOCUMENTATION by writing "operators must run a time daemon" into the install guide -- neither limb of rule 4, and a compensating control resting on an unmeasured operator action. That documentation is still worth WRITING: measured, no operator-facing document states clock discipline as a deployment requirement outside the clustered case, and one apparent hit in `docs/SERVICE.md` was a false positive inside a longer word.
 
 **Proposed work, unallocated and by subject:** the peer-free host clock-sync gate, running before listeners and refusing under the enforcing posture, reusing the existing skew tolerance at `settings.py:1451`; the store-clock cross-check, labelled as corroborating AGREEMENT rather than a reference and with its clustered-only reachability stated; the narrowed ADR-premise correction applied everywhere the sentence is read; decoupling the requirement flag from the peer; extension timestamp work covering BOTH channels by stamping an explicit UTC value into each emitted line; extension skew surfacing off a header it already receives; the single-node clock-discipline deployment requirement in the service and install guides, which must never be scored; and a measurement of what the sync probe returns inside `docker/Dockerfile`'s image, which has no service manager -- a gate that refuses on an unreadable probe would refuse on every container start. Adjacent and separate: `messagefoundry/transports/mllp.py:358` stamps an acknowledgement with naive local time and no offset, which is not security event metadata and would be wrong on a first deployment spanning a daylight-saving boundary.
+
+**Built 2026-09-06 -- the adjacent ACK-timestamp defect in BOTH copies, and the synchronized-sources
+conjunct is a reasoned cannot-pass.** `build_ack` stamped MSH-7 with
+`datetime.now().strftime("%Y%m%d%H%M%S")`: a naive local wall-clock reading with no offset, so on a
+first deployment a receiver correlating an acknowledgement against its own UTC-stamped record would
+mis-order events by an hour across a daylight-saving fall-back. It now renders the HL7 v2 DTM form
+with a numeric offset through the existing `timezone.hl7_now`, which gains `with_offset` rather than
+growing a second spelling of the same formatting. **The same defect was then found in `tee/mllp.py`,
+which carries its own vendored `build_ack`, and was fixed too** -- fixing one copy and leaving the
+other is worse than leaving both, because a reader who checks the engine's copy concludes it is
+handled. The tee imports no `messagefoundry` module by construction, so a test now reads both
+implementations and fails if they stamp different offsets on the same host. Tests pin the offset
+VALUE against the host's own `utcoffset`, not the grammar, and one resolves MSH-7 to an absolute
+instant -- which catches UTC digits stamped with a local offset, a form that satisfies both the
+grammar and a naive value check and is still an hour wrong. **This does NOT move the cell**: an
+acknowledgement timestamp is not security event metadata. **On the cell itself, a reasoned
+cannot-pass.** A default-ON peer-free refusing gate is not buildable: measured 2026-09-06 on one box
+in one minute, `w32tm /query /status` returned exit 38 `0x80070426` with W32Time Stopped, while
+`timedatectl` in WSL2 on the SAME box returned `NTPSynchronized=yes`. That is a THIRD state the
+2026-08-22 measurement did not cover -- unreadable, not merely undisciplined -- and it is the common
+one on a Windows pilot host, where an enforcing gate would refuse to start. `docker/Dockerfile` ships
+no systemd and no service manager, so a shell-out probe returns command-not-found on every container
+start. Once a gate must pass on an unreadable probe it is a warning, which is what already ships.
+**Two further naive stamps were found and deliberately left, each needing its own row:**
+`wiring_runner.py`'s BHS-7 batch DTM renders UTC digits with no `+0000` suffix, so a receiver reading
+it as local is off by its own offset, and fixing it would move a golden; and
+`generators/_hl7data.py` has the same shape in test data. **A CITATION IN THIS ROW DOES NOT RESOLVE:**
+the 2026-08-22 correction, this row's most load-bearing paragraph, cites
+`docs/research/asvs-16-2-2-clock-sync-gate-measurements.md`. `git ls-files | grep -c docs/research`
+returns 0 and no such directory exists on disk. Either the file is vaulted and the citation needs the
+vault prefix, or the measurements were never landed -- and a correction whose evidence cannot be read
+invites someone to re-derive the withdrawn claim. **One measurement worth commissioning before anyone
+re-proposes the gate:** what `ntp_adjtime` returns through `ctypes` inside that image under Docker's
+default seccomp profile, which was not measurable here. [PR 942](https://github.com/MEFORORG/MessageFoundry/pull/942).
 
 ## 1197. research an honest pass for ASVS 16.3.2 -- measuring the audit-flood cost that the all-decisions clause is traded against
 
@@ -12259,6 +12452,26 @@ QT_QPA_PLATFORM=offscreen pytest packaging/messagefoundry-webconsole/tests/test_
 
 **Two things a rescore must not take from this work.** The measurement does not lift the cell: ARM A's zero is evidence that the console's absence of grant rows is structural, which is the *reason* the coverage gap is real, not evidence against it. And the flooding cost is now measured rather than asserted, which removes the excuse for leaving the trail narrow -- it does not by itself authorise turning console parity on, because ARM C shows a first deployment would already be accumulating 172,800 rows a day per polling client with `audit_days` reserved and unenforced. **The drain is the precondition this item already named, and the measurement strengthens it rather than retiring it.**
 
+**Built 2026-09-06 -- the console MFA-denial audit, one item from this row's list.**
+`messagefoundry_webconsole/_auth.py`'s `require_ui` refused an MFA-pending session with a bare 303 and
+recorded nothing, where the engine's own HTTP and WebSocket gates both call `audit_mfa_denied`.
+`AuthService.audit_mfa_denied` states the reason in its own docstring: the MFA gate sits ABOVE the
+permission loop, so `audit_permission_denied` never fires for a refusal there, and without a row of
+its own a stolen password-only cookie could walk the whole authenticated surface and leave the trail
+silent. On a first deployment that silence would have sat on the plane a human actually uses. It
+writes the engine's own `auth.mfa_denied` action rather than a console-specific name, because a
+distinct name would satisfy a was-anything-logged check while staying invisible to every query
+written against the engine's vocabulary. Six tests, three of them controls rather than happy-path
+assertions: the trail is asserted EMPTY before the refused navigation so the row that appears cannot
+be the login's; three refusals must write three rows, because an enumeration attempt is a sequence
+and one-row-then-silence would hide the walk; `/ui/mfa` itself must NOT be audited, since a pending
+session arriving there is the intended outcome and auditing it would bury real denials under a row
+per page load -- the flood cost this cell's all-decisions clause is traded against; and a session
+with MFA not required must write nothing, which catches an audit call placed outside the branch. With
+the call removed, four of the six fail; `test_ui_mfa_gate` passes unchanged. **Still open:** grant
+parity across the eighty-eight gate applications, the service-certificate denial audit, per-channel
+grant recording, archive-first pruning, and the full re-verification this row asks for. [PR 942](https://github.com/MEFORORG/MessageFoundry/pull/942).
+
 ## 1198. research an honest pass for ASVS 16.4.2 -- what "cannot be modified" can mean for logs the operator's substrate owns
 
 > 🔢 **Re-scored 2026-08-20 -> P2.** Value **6/10** · Difficulty **6/10** · _big bet_. The disputed limb resolves in the triage's favour at HEAD -- store/store.py:2251-2254 documents that only rows missing a hash are filled and existing valid hashes are left untouched, enforced by the skip at :2259, with :2288 confirming a rewrite needs the explicit chain-verifying rekey -- while audit_verify_on_start still ships False at settings.py:3309, so the gap the item actually names, absent modification prevention, stands. Value 6 rather than 7 because prevention has an awkward but real operator-side workaround the item itself enumerates (append-only grants, a WORM volume, a write-only remote sink) on top of the shipped hash chain and its verify knob; difficulty 6 because the outcome is bimodal, either a standards reading that decides the whole cell for near-zero cost or a prevention seam the engine does not have. _(was 7/10 · 6/10.)_
@@ -12296,6 +12509,33 @@ QT_QPA_PLATFORM=offscreen pytest packaging/messagefoundry-webconsole/tests/test_
 **Still not an honest pass:** flipping `audit_verify_on_start`, which is documented alert-only at `settings.py:3306-3308`, cannot make a row unchangeable, and as detection is a BARE walk passing no anchor and therefore blind to exactly the tail truncation an attacker hiding their tracks would use; deleting the disputed residual sentence and reading the cell as closed, when the sentence being wrong is a reason to re-verify and the limb that binds was never its subject; recording a permanent-partial and stopping, while buildable default-on prevention sits specified and unbuilt; and shipping the deny rules and reporting the table as immutable, which would make an absence grep stop returning zero while the actor class the verb cares about is unchanged.
 
 **Proposed work, unallocated and by subject:** the owner ruling on whether "cannot be modified" requires prevention or is answered by no product-exposed path plus keyed tamper-evidence plus an external truncation witness, and the separable chapter-wide question of whether "logs" means security logs only; the audit-log write-deny work with the two constraints above; the plaintext `detail` decision -- cipher-cover it or correct the docstring, never both left standing; the anchor fields on the tee, with its transport properties stated; a decision on the tee's same-host copy (gate it on a configured forwarder, protect the sink, or record why it is accepted -- and label gating it as the shipped-behaviour change it is); costing the supported server backend's ledger tables before any ceiling sentence is written, since the engine already emits its own schema there; and a re-verification, because the surface is also short by the off-box forwarder, the CLI as an unauthenticated access route (`__main__.py:4990-5010` includes chain verification, anchoring, re-keying, key rotation, backup and support-bundle, all operating directly on the store with no RBAC), the in-store event logs, the console's uploaded-log deletion path, the second extension output channel and the support bundle's derived log copy.
+
+**Built 2026-09-06 -- the work this row names as owed regardless of the ruling, plus the tee
+anchors.** `row_hash` is `NOT NULL` on all three backends; `_backfill_audit_chain` is deleted from all
+three, with the SQLite `ADD COLUMN` shim; `emit_audit_tee` carries `row_id` and `row_hash` as discrete
+fields, read back at insert via `lastrowid` inside the write lock on SQLite, `RETURNING id` on
+Postgres and `OUTPUT INSERTED.id` on SQL Server. Both anchor parameters are REQUIRED rather than
+defaulted, because a silently-omittable anchor makes "no anchor sent" and "the writer chose not to
+send one" indistinguishable at the collector. **Per CLAUDE.md section 0 the backfill's removal costs
+nothing** -- zero deployments, so no store holds an unhashed row, and a migration shim would be paid
+to protect users who do not exist. **One correction to this row's own premise:** it says the anchor
+fields "cost nothing -- the head hash carries no PHI and no secret". In the default KEYLESS posture
+that is slightly too strong, since `row_hash` is then a plain SHA-256 whose other preimage members
+travel in the same record or the one before it, so a reader of the forwarded stream could test offline
+guesses at a span `safe_text` cut. Narrow, and it vanishes under keying; recorded in the docstring
+and in `docs/PHI.md` rather than left for rediscovery. **Two doc corrections this row was blocked on
+are now landed:** `docs/SECURITY.md` no longer claims rows written before the feature are chained on
+first start, which the deleted backfill made false, and `docs/PHI.md` lists the tee's new anchor
+fields. **A guard blind spot found and NOT fixed:** the two-way docstring guard reads only the
+id-keyed `_CIPHER_COLUMNS` tuple, so a column cipher-covered by a composite `cell_aad` pass would
+leave it green while the docstring's claim went false; fixing it needs a design decision and a
+brittle source-scan would be worse than the gap. **Postgres and SQL Server were NOT exercised** --
+no container on the build box, those legs skip silently, and the gated CI legs must be read before
+this is called green. **The cell should resolve as a reasoned cannot-pass on the prevention limb,
+held at partial:** the engine can now make modification evident and has removed the last application
+path that wrote to an audit row, but the store and filesystem belong to the operator, so "cannot be
+modified" is a substrate property the engine cannot supply from inside its own boundary. The current
+residual sentence about the engine rewriting row hashes is false at HEAD. [PR 942](https://github.com/MEFORORG/MessageFoundry/pull/942).
 
 ## 1199. research an honest pass for ASVS 16.4.3 -- an engine that ships no collector against a verb that requires transmission
 
@@ -12392,6 +12632,35 @@ reporting for the absence of forwarding and for hop attestation; and the extensi
 subject ruling. **Nothing under `docs/DEPLOYMENT.md` was touched** -- the runbook purchase is this
 cell's recorded wrong move, and it was reversed in two days once already -- `forward_protocol` was not
 flipped while the collector host stays unset, and `forward_hop_attested` was not credited anywhere.
+
+**Built 2026-09-06 -- the durability half, and the "mid-run break is permanent" limb of this
+cell's reasoning is now FALSE.** The forwarder was a root handler, so the syslog send ran inline on
+whatever thread logged, including the event loop on a clinical message path. The module recorded the
+defect itself: `_FORWARD_TCP_TIMEOUT`'s docstring said a stalled-but-connected collector would block
+the loop and that its own mitigation was a five-second timeout after which the record is DROPPED.
+`configure_logging` now attaches a `QueueHandler`, and a `QueueListener` owns the socket on its own
+thread. **The redaction chain stays on the NEAR side, inline on the caller's thread, and that
+placement is the load-bearing decision:** far-side filters would put PHI-bearing records into the
+queue unredacted, and would be partly dead anyway, because `QueueHandler.prepare` clears `exc_info`
+and `exc_text` after formatting so a far-side `RedactionFilter` would find no traceback left to
+redact. The queue is bounded at 10,000 and drops the NEWEST record, keeping the oldest evidence an
+incident reconstruction needs first; drops are counted and reported at WARNING, rate limited to one
+per 60s because the report is itself a record arriving at the same full queue. **Dropping a LOG
+RECORD under back-pressure is not the count-and-log invariant, which governs received messages** --
+stated at the constant so nobody reads it as accept-and-drop. **A dead reconnect branch was also
+fixed:** `SysLogHandler.emit`'s `if not self.socket` path was unreachable because the socket is never
+cleared on a send failure, so a stream forwarder that broke mid-run would have stayed silently broken
+for the process lifetime. **NINE defeat controls**, each mechanism disabled one at a time with the
+tests that claim it re-run: baseline 61 passed, every defeat red, every restore green. **Two were
+GREEN under defeat on the first attempt and the tests were rewritten rather than accepted** -- the
+recursion test passed because the rate limiter independently stopped the cascade, and the drain test
+passed because an instant collector finished on its own. **NOT built, each needing its own item:** the
+bounded on-disk spool (it needs a file format, rotation, a PHI-at-rest disposition, a replay-ordering
+contract and crash safety), and a backoff between reconnect attempts; without the spool, records
+queued at exit or dropped for a full queue are gone. The verb-shaped start gate and the
+collector-separation probe were deliberately untouched, per the 2026-08-10 ruling. **The cell stays
+partial and the aim clause still fails** -- the shipped default transmits nothing, `forward_host` is
+still `None` -- but the reasoning must drop the no-buffering-and-no-retry limb. [PR 942](https://github.com/MEFORORG/MessageFoundry/pull/942).
 
 ## 1202. the vault ASVS gate runs a verifier this repo owns, on a bare interpreter, and nothing here checked it would run
 

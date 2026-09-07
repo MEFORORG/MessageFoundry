@@ -431,8 +431,8 @@ def test_https_verified_connector_has_no_send_guard(
 class _Resp:
     status = 200
 
-    def read(self) -> bytes:
-        return b""
+    def read(self, amt: int = -1) -> bytes:
+        return b"" if amt < 0 else (b"")[:amt]
 
     def __enter__(self) -> _Resp:
         return self
