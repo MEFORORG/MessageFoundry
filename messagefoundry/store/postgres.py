@@ -17,8 +17,8 @@ fencing yet — but per-message finalize, the audit chain, and schema init are s
 
 * **H-6** — the pool sets ``command_timeout`` so a statement actually times out (the SQL Server
   backend's per-connection timeout was inert on some drivers).
-* **H-7** — ``record_audit`` and ``_backfill_audit_chain`` take ``pg_advisory_xact_lock`` on the audit
-  chain before read-tail + insert, so concurrent writers can't fork the chain.
+* **H-7** — ``record_audit`` takes ``pg_advisory_xact_lock`` on the audit chain before read-tail +
+  insert, so concurrent writers can't fork the chain.
 * **H-8** — :meth:`_maybe_finalize_message` ports the full multi-stage finalizer (not the simpler
   outbound-only one) and is serialized per ``message_id`` with a per-message advisory lock, so it
   re-counts on a fresh snapshot — no double-finalize; different ids never contend. A finalizer that
@@ -490,7 +490,9 @@ _SCHEMA: list[str] = [
         channel_id TEXT,
         detail     TEXT,
         client     TEXT,
-        row_hash   TEXT
+        -- NOT NULL (BACKLOG #1198): every row the engine writes is chained at INSERT, so an unchained
+        -- row has no legitimate producer. See the SQLite `_SCHEMA` for the full reasoning.
+        row_hash   TEXT NOT NULL
     )""",
     # ADR 0150 client attribution for a pre-existing audit_log. Nullable with NO default: NULL on every
     # existing row is CORRECT (their address was never captured) and is exactly what preserves their
@@ -1013,7 +1015,6 @@ class PostgresStore:
         # the cipher carries no bound (keyless / `vault_transit`).
         await store.checkpoint_cipher_invocations()
         await store._encrypt_existing_rows()  # one-time PHI-at-rest migration when a key is set
-        await store._backfill_audit_chain()  # chain any pre-existing (unhashed) audit rows
         await store._load_audit_chain_meta()  # load/auto-init the #190 keying watermark
         await (
             store._load_state_cache()
@@ -1685,34 +1686,7 @@ class PostgresStore:
             refreshed.append(ns)
         return refreshed
 
-    async def _backfill_audit_chain(self) -> None:
-        """Fill ``row_hash`` for audit rows written before hash-chaining (idempotent; fills only
-        NULLs, chained from the prior row). H-7: takes the audit-chain advisory lock first so a
-        concurrent ``record_audit`` can't fork the chain while this backfills."""
-        async with self._timed_acquire() as conn, conn.transaction():
-            await self._advisory_lock(conn, _LOCK_CLASS_AUDIT, _AUDIT_LOCK)
-            rows = await conn.fetch(
-                "SELECT id, ts, actor, action, channel_id, detail, client, row_hash FROM audit_log"
-                " ORDER BY id"
-            )
-            prev = ""
-            updates: list[tuple[str, int]] = []
-            for r in rows:
-                if r["row_hash"]:
-                    prev = r["row_hash"]
-                    continue
-                prev = audit_row_hash(
-                    prev,
-                    ts=r["ts"],
-                    actor=r["actor"],
-                    action=r["action"],
-                    channel_id=r["channel_id"],
-                    detail=r["detail"],
-                    client=r["client"],
-                )
-                updates.append((prev, r["id"]))
-            for row_hash, rid in updates:
-                await conn.execute("UPDATE audit_log SET row_hash=$1 WHERE id=$2", row_hash, rid)
+    # `_backfill_audit_chain` was deleted with BACKLOG #1198 — see the SQLite twin for why.
 
     async def _load_audit_chain_meta(self) -> None:
         """Load the #190 audit-chain keying watermark; auto-enable keying from row 1 for a FRESH
@@ -1930,7 +1904,27 @@ class PostgresStore:
         Returns the number of values rewritten. Ported, not stubbed — Postgres supports rotation."""
         cipher = self._cipher
         if not isinstance(cipher, AesGcmCipher):
-            return 0  # identity cipher (no key) — nothing to rotate
+            # BACKLOG #1165 (ASVS 11.2.2). Two very different cases used to share this return,
+            # and the comment named only the harmless one. IdentityCipher means NO key is
+            # configured, so there is genuinely nothing to rotate and 0 is the truthful answer.
+            # Any OTHER non-AesGcmCipher -- today TransitCipher, whose keys live in Vault --
+            # HOLDS keys this loop cannot rewrite, and answering 0 there made
+            # `messagefoundry rotate-key` print "OK: re-encrypted 0 value(s) under the active
+            # key" and exit 0 having rotated nothing. A rotation that silently rotates nothing
+            # is precisely what 11.2.2's "keys replaceable with data re-encrypted" clause exists
+            # to prevent, and on a first deployment an operator would believe it.
+            #
+            # NotImplementedError deliberately: `messagefoundry rotate-key` already catches it,
+            # prints the message and exits 2, so the refusal reaches the operator as an error
+            # rather than as a success with a zero in it.
+            if not isinstance(cipher, IdentityCipher):
+                raise NotImplementedError(
+                    f"{type(cipher).__name__} cannot re-encrypt store values in place: its keys"
+                    " are held by the provider, not by this engine, so rotation happens at the"
+                    " provider. Reporting 0 rewritten values here would be indistinguishable"
+                    " from a completed rotation (BACKLOG #1165, ASVS 11.2.2)."
+                )
+            return 0  # identity cipher (no key) -- nothing to rotate
         # Active-format prefix through the active key's fingerprint (M9): `mfenc:v1:<kid>:` or, for a
         # v2-active cipher, `mfenc:v2:<alg>:<kid>:`. Built off the cipher (not a baked-in v1 prefix+keyid)
         # so a v2-active rotation matches v2 rows and the loop terminates.
@@ -6064,9 +6058,11 @@ class PostgresStore:
                 key=_key,
                 mac=_mac,
             )
-            await conn.execute(
+            # RETURNING gives the anchor id without a second round trip or a currval() read that
+            # another session's insert could race.
+            new_id = await conn.fetchval(
                 "INSERT INTO audit_log (ts, actor, action, channel_id, detail, client, row_hash)"
-                " VALUES ($1,$2,$3,$4,$5,$6,$7)",
+                " VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING id",
                 now,
                 actor,
                 action,
@@ -6078,7 +6074,14 @@ class PostgresStore:
         # Tee off-box AFTER the transaction commits + the connection is released (only forward what
         # truly persisted; never hold the advisory lock / a pooled connection across a syslog send).
         emit_audit_tee(
-            action=action, actor=actor, channel_id=channel_id, detail=detail, client=client, ts=now
+            action=action,
+            actor=actor,
+            channel_id=channel_id,
+            detail=detail,
+            client=client,
+            ts=now,
+            row_id=int(new_id or 0),
+            row_hash=row_hash,
         )
 
     async def list_audit(

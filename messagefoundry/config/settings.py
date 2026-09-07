@@ -2101,7 +2101,7 @@ class AuthSettings(_Section):
     oidc_prompt: str | None = None  # requested `prompt` authorize param
     oidc_jwks_ttl_seconds: int = 3600
     oidc_jwks_min_refetch_seconds: int = 300  # the amplification bound
-    oidc_flow_ttl_seconds: int = 300
+    oidc_flow_ttl_seconds: int = 300  # single-use flow window; validator-capped 30..1800
     oidc_flow_cache_max: int = 512  # reject-when-full (never evict — that is a login DoS)
     oidc_session_max_hours: int | None = None  # G2: cap below id_token.exp if tighter is wanted
 
@@ -2171,6 +2171,24 @@ class AuthSettings(_Section):
     def _check_oidc_skew(cls, value: int) -> int:
         if not 0 <= value <= 300:
             raise ValueError("oidc_clock_skew_seconds must be between 0 and 300")
+        return value
+
+    @field_validator("oidc_flow_ttl_seconds")
+    @classmethod
+    def _check_oidc_flow_ttl(cls, value: int) -> int:
+        # Bounded at BOTH ends (BACKLOG #1156, ASVS 10.1.2), because each end fails differently.
+        # FLOOR: the value becomes the flow cookie's `Max-Age`, so at or below zero the browser
+        # discards the cookie on receipt and every federated login then fails `flow_binding_missing`
+        # with nothing naming the cause. CEILING: this is both the single-use replay window for the
+        # staged `(state, nonce, code_verifier)` and how long one abandoned flow holds an
+        # `oidc_flow_cache_max` slot -- see that field for why the cache rejects rather than evicts.
+        #
+        # The endpoints are a JUDGMENT with no measured anchor, and no neighbouring field supplies
+        # one: every other lifetime and size in this OIDC block is itself unbounded (verified by
+        # execution -- `oidc_jwks_ttl_seconds` accepts 10_000_000). What is NOT a judgment is that
+        # an unbounded value is wrong in both directions.
+        if not 30 <= value <= 1800:
+            raise ValueError("oidc_flow_ttl_seconds must be between 30 and 1800")
         return value
 
     @field_validator("totp_skew_steps")
