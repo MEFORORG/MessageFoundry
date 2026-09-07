@@ -24204,3 +24204,77 @@ Vault `roles/BUILDER.md:213-217`, under the heading "Closing a ledger row makes 
 ### Not checked
 
 I read only `roles/` in the vault and ran no git history there, so I cannot date when any of these lines was written. Eleven of the fourteen playbooks were matched by the needle above but not read, so treat the population as **at least three files**, not a total. I did not check whether any workflow or CI job reads a playbook, and I confirmed no case in which a seat actually followed `BUILDER.md:216` and produced a red PR -- I measured the instruction and the gate, not an incident.
+
+## 1480. an append that absorbs the next item heading deletes an item with every ledger gate green -- compare the ranked table's rows against the parsed items
+> 🔢 **Filed 2026-09-07 (youthful-stonebraker-883561) -- the detector is measured and ships with a positive control on both sides; whether to BUILD it is a separate owner decision and is NOT part of this filing.** Value **5/10** · Difficulty **2/10** · _quick win_. Value 5 because this class deletes a whole item while every wired gate stays green: it has fired once, on `#1147`, and neither CI nor `pre-commit` reported anything. It is ledger integrity only, with no engine, PHI or deployment axis (sec. 0). Difficulty 2 for roughly fifteen lines that reuse `parse_items`, against a fixture frozen in history and a control measured in both states.
+>
+> Verdict: owner-ruling
+> Research: done 2026-09-07 -- the detector, its control, and the dead end are all measured below
+> Closing-act: owner-ruling
+
+**Cluster:** Ledger integrity / repository gates. **Priority:** P2. **Verdict:** owner-ruling.
+**Severity:** no engine effect and **no deployment axis (sec. 0)** -- nothing here reaches shipped code. The cost falls on the record. An item's entire body, its status banner and its fields stay in the file, silently re-attributed to the item above it, while the ranked table still carries a row promising a section that no longer exists. A reader following that row finds nothing. A seat dispatching from the ledger cannot see the item at all, and no instrument says so.
+
+### What happened, and the diffstat is the part that should worry you
+
+Commit `642225f78` appended three `#1146` re-verification paragraphs to `docs/BACKLOG.md`. Its last appended line absorbed the `## 1147.` heading that followed it. The `## 1147. ` prefix was deleted outright and the title text was concatenated onto the tail of the `#1146` paragraph, where it still sits on `main`:
+
+```
+... **The cell should not move on this commit** -- a suite that pins the gap is not the gap
+closed. research an honest pass for ASVS 7.4.3 -- offering session termination as part of the
+MFA-change ceremony rather than beside it
+```
+
+The diffstat read **5 insertions, 1 deletion**, and the commit message never mentioned `#1147`. The deletion is the heading; nothing in the diff names the item that was destroyed. `#1147`'s body, its `🔢` banner and its three fields all survived on `main`, re-attributed to `#1146`. PR 975 split the fused line back apart.
+
+### Why no wired gate sees it
+
+`parse_items` in [`scripts/docs/backlog_status_check.py`](../scripts/docs/backlog_status_check.py) reads only an item's **leading** blockquote block -- the block ends at the first line that is neither blank nor a blockquote. The orphaned banner sat *below* `#1146`'s own block, so it parsed as ordinary mid-item prose. The ledger stayed structurally valid with a whole item missing from it. `backlog_citation_check` and `ledger_check` were green as well. There is nothing to fix in any of the three: each answers the question it was built to answer, and none of them is asked whether the file still contains every item the file itself points at.
+
+### The detector, and it is one-directional by construction
+
+Compare the **ranked tables' row set** against the **parsed-item set**, taking items from BOTH ledger files (`docs/BACKLOG.md` and `docs/archive/backlog/BACKLOG-CLOSED.md`) into one namespace. Import `parse_items`; never hand-roll the scan (CLAUDE.md sec. 11). Rows extract with:
+
+```python
+re.findall(r"^\|\s*\d+\s*\|\s*\*\*#(\d+)\*\*\s*\|", text, re.M)
+```
+
+**Only rows-with-no-item is a defect. Items-with-no-row is the normal state and must never be reported.** Measured at `68693cfc2`: 444 distinct rows against 679 parsed items, so most items legitimately carry no row. The five ranked tables are all *dated scoring-pass snapshots* (`re-scored 2026-08-20`, `first score 2026-09-03`, and so on), not a live index that every filing joins -- which is also why a new item does not get a row, and why the reverse comparison would report several hundred false positives on a clean file.
+
+### The positive control, on a fixture that cannot perish
+
+| state | ref | rows | parsed items | rows with no item |
+|---|---|--:|--:|---|
+| pre-fix | `68693cfc2` (`main` tip that day) | 444 | 679 | **`[1147]`** |
+| the causing commit | `642225f78` | 444 | 679 | **`[1147]`** |
+| post-fix | PR 975 head | 444 | 680 | none |
+
+It fires on the one real case and is silent otherwise. **Both pre-fix shas are ancestors of `origin/main`** (`git merge-base --is-ancestor` returns true for each, measured 2026-09-07), so PR 975 merging does not take the fixture away -- a merge adds a commit, it removes nothing from history. Anyone told to capture the pre-fix state before PR 975 lands has been told something false; cite the sha instead.
+
+### DEAD END: the mid-line heading probe. Do not build on it
+
+The obvious signature is a `## N.` heading appearing **mid-line**, and it is worthless here. The absorbed heading loses its `## ` prefix *and* its number entirely rather than losing its newline, so no heading-shaped remnant survives the fusion at all. Measured on `origin/main`: a mid-line `## N.` scan returns six hits, and **all six are prose** -- items quoting a heading inside a sentence or in backticks. Zero are absorbed headings, in either state. A guard built on that signature reports a clean repository forever while producing a steady trickle of false positives, which is the worst pair of properties available. That negative result is the reason the row-versus-item comparison is the right instrument.
+
+### If you ever act on a hit, WHERE you re-insert the heading changes the outcome
+
+A restored heading has to go **above the banner that carries the status glyph**, which is not always the earliest banner. `#1147`'s block opens with `Re-scored 2026-08-20 -> P2`, carrying both the score and the `🔢`; its `Filed 2026-08-08` banner comes later and carries no glyph. Measured counterfactual on the two placements:
+
+| heading placed above | status banners | score | fields |
+|---|--:|---|---|
+| the `Re-scored` banner (what PR 975 did) | 1 (`🔢`) | 5 | 3 of 3 |
+| the `Filed` banner | **0** | **None** | 2 of 3 (`research` lost) |
+
+Zero banners is a hard error in `backlog_status_check` -- *"Every backlog item must declare exactly one status banner"* -- so the wrong placement trades a silent orphan for a broken gate, which is louder but not better. **Read `main`, not a branch.** Unmerged branches open their copy of the item with the `Filed` banner because they predate the re-score, so branch text actively misleads about placement.
+
+### Siblings, not duplicates. Closing one for the other loses a real guard
+
+A session working the ASVS scorecard has filed an item proposing two guards for the **vault scorecard**: refuse a write from a clone behind its remote, and compare the cells a payload NAMES against the cells the write actually CHANGES. That second guard and this row-versus-item comparison ask the same shape of question about **different files with different tools**, and neither covers the other. Both will read as "the out-of-scope-edit guard" to whoever picks either one up, and building one invites closing the other. **They are siblings. Do not close either for the other.** That item's number was allocated but was not on `main` as of 2026-09-07, so it is named here by subject rather than by number -- CLAUDE.md forbids citing a `#N` that cannot resolve.
+
+### Scope: this filing is the ask. Building it is a separate owner decision
+
+Nothing here assumes the check gets built. If the owner rules to build it, the natural home is **beside the existing advisory checks** -- the way `dangling backlog citations (advisory)` is wired in `.github/workflows/quality-advisory.yml`, which reports into the step summary, never gates a merge, and carries no paths filter (a defect of this class is introduced by editing prose, so a paths-filtered job would miss it). It should not be a new hard gate: the population it screens is a single number today, and a gate that has fired once has not yet earned the right to block anyone.
+
+### Two traps that cost measurement time
+
+1. **Set `PYTHONIOENCODING=utf-8` before printing anything derived from the banner alphabet.** A stock Windows console is cp1252 and raises `UnicodeEncodeError` on the status glyphs. It cost two separate runs here.
+2. **Deduplicate the row set.** The regex above returns **547** raw matches but only **444** distinct numbers on `origin/main`, because the five dated scoring passes re-rank many of the same items. Comparing the raw list instead of the set inflates every count and makes the control unreproducible.
