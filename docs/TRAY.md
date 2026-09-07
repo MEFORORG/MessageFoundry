@@ -113,7 +113,12 @@ the tray just runs unbranded and is listed as "Python" — nothing else changes.
 **monitor-only** — service control and Open-Repo are disabled (they are meaningless against a remote
 host). Multiple engine shards / `supervise` are not supported by the tray.
 
-## TLS engines (`[api].tls_cert_file`)
+## TLS engines
+
+**Almost every engine is one.** Since [ADR 0172](adr/0172-the-engine-always-serves-tls-minting-a-self-signed-certificate-on-first-run.md)
+the engine always serves TLS, minting a self-signed pair on first run when the operator has
+configured no chain. The single exception is `[api].tls_terminated_upstream`, which declares a
+reverse proxy terminating TLS in front of the engine and speaking plaintext to it.
 
 A loopback engine that terminates TLS is **fully managed** — https is not remoteness, and only the
 host decides whether the tray offers Start/Stop/Restart and Open-Repo. (This was a bug before
@@ -123,15 +128,19 @@ as down. See the ADR 0113 amendment.)
 The tray discovers the scheme the same way it discovers host and port — from the service's NSSM
 registry entry. There is no `serve` TLS flag, so it also reads the engine's own settings TOML
 (`serve --service-config`, or `messagefoundry.toml` under the service's `AppDirectory`) and takes
-exactly one fact from it: whether `[api].tls_cert_file` is set. That read is read-only and
-fail-soft — a missing or malformed file just means "no TLS hint". Setting `engine_url` in
-`tray.toml` overrides all of it.
+two booleans from it: whether `[api].tls_cert_file` is set, and whether
+`[api].tls_terminated_upstream` is declared. That read is read-only and fail-soft — a missing or
+malformed file means the engine is running on its own defaults, which mint, so the tray assumes
+https. Setting `engine_url` in `tray.toml` overrides all of it.
 
 The engine's certificate **is verified**, against the **Windows trust store**. So:
 
 - an **internal-CA / AD-CS** engine cert works on a domain-joined box with no extra setup;
 - a **self-signed** engine cert works once you import it into **Local Computer → Trusted Root
-  Certification Authorities** on this machine.
+  Certification Authorities** on this machine. **The engine's own minted pair is one of these**, so
+  on a stock install the tray reaches the right socket and then reports the engine down until you
+  import that certificate. The generated pair is written beside the store database as
+  `api-generated-cert.pem`.
 
 There is no option to skip verification. If the certificate does not verify, the probe fails and the
 tray reports the engine as down rather than trusting an unidentified responder — check the cert's

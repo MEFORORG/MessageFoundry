@@ -756,7 +756,28 @@ that enumeration was wrong — the SCP is a receiver of remote-pushed content on
 two HTTP routes. None of the drop-directory policy below applies to it: its size ceilings, peer
 controls and transport security are connector settings documented under
 [DICOM](#dicom--dicom-inbound-c-store-scp--outbound-c-store-scuc-echo-and-dicomweb-stow-rs-adr-0025),
-and a deploying site must set them there rather than assume this block covers them. The **directory
+and a deploying site must set them there rather than assume this block covers them. **The embedded-document detach is a STAGE, not a fifth receiver, and its ceilings are stated here
+because the requirement asks for unpacked size wherever content is accepted.** When an inbound sets
+`stream_threshold_bytes` (default `None`, so the whole path is OFF unless a feed asks for it), a body
+at or above that size has its opaque documents detached from the transformable skeleton
+([ADR 0105](adr/0105-streaming-very-large-hl7-attachments-detach-the-opaque-document-from-the-transformable-skeleton.md))
+and stored for the attachment-download route above. Nothing new arrives on the wire -- the bytes came
+in through one of the receivers already listed -- which is why the count above does not move. Two
+ceilings bound it, and they bound different things:
+
+- the inbound's own **`max_message_bytes`** bounds a SINGLE body, and applies whether or not a detach
+  happens;
+- **`[inbound].stream_inflight_budget_bytes`** bounds the AGGREGATE bytes of over-threshold bodies
+  concurrently mid-detach across all inbounds. Its default is `0`, which means **unlimited in the
+  aggregate**. Read that precisely: no single body escapes `max_message_bytes`, but the number of
+  such bodies in flight at once is uncapped until an operator sets this. A detach that would cross a
+  positive budget is refused with backpressure, `ERROR`-ed rather than accepted-and-dropped.
+
+Permitted **types** on this path are whatever the inbound declared. Outside the handful of families
+with a leading magic signature, a detached document's type is accepted as sent
+(`messagefoundry/parsing/sniff.py`), so this stage is not a content gate and must not be read as one.
+
+The **directory
 source's** handling of an untrusted drop directory is fixed policy (the HTTP uploaded-logs surface has
 its own policy block below):
 
@@ -884,9 +905,12 @@ them at the response: the sender-influenced OBX-5.2 MIME is forced through `_saf
 to `application/octet-stream` on any non-clean value **and** on any **browser-active** type (`html`,
 `xml`, `script`, `svg` subtypes + `multipart`, matched case-folded, length-bounded); the response carries
 `Content-Disposition: attachment` (a download, never an inline render), `X-Content-Type-Options: nosniff`
-(no MIME re-sniff), and `Content-Security-Policy: default-src 'none'; sandbox` (an opaque origin with
-scripts/forms disabled), re-asserted on the `/ui` delegate from **outside** the console's own CSP writers
-so a browser-active representation can never execute in the application origin.
+(no MIME re-sniff), and `Content-Security-Policy: default-src 'none'; sandbox; frame-ancestors 'none'`
+(an opaque origin with scripts/forms disabled, and no framing), re-asserted on the `/ui` delegate from
+**outside** the console's own CSP writers so a browser-active representation can never execute in the
+application origin. `frame-ancestors` is named in that policy rather than left to the API's security
+header floor because it takes **no fallback from `default-src`** — without it, the strictest policy the
+engine writes was the one response family carrying no framing decision at all (ASVS 3.4.6).
 
 ### Remote file — `Sftp(...)` / `Ftp(...)`
 
@@ -2399,7 +2423,7 @@ connection-count knob** (the stdlib opener exposes none) — the same framing 13
 **Timeouts are per-connector, not universal.** Only the MLLP/TCP/X12/DICOM families expose both a
 `connect_timeout` and a `timeout_seconds`; the REST/SOAP/FHIR/DICOMweb HTTP family exposes
 `timeout_seconds` only (a single per-request wall clock — there is no separate connect timeout);
-REMOTEFILE (SFTP/FTP/FTPS) exposes **no** timeout argument — the 30 s whole-socket value is a hard-coded module fallback in `transports/remotefile.py`, not operator-configurable;
+REMOTEFILE (SFTP/FTP/FTPS) exposes **no** timeout argument, and its bounds are hard-coded module values in `transports/remotefile.py`, not operator-configurable: a 30 s connect value on all three protocols, applied on SFTP to the banner and authentication phases as well, plus a `SFTP_CHANNEL_READ_TIMEOUT_SECONDS` bound on each read from an established SFTP channel (BACKLOG #1195) that FTP and FTPS do not have;
 DATABASE exposes `connect_timeout` + `acquire_timeout` and no statement timeout; local FILE exposes
 none (filesystem I/O is unbounded by design). The MLLP/TCP/X12/HTTP listeners expose
 `receive_timeout`; the DICOM SCP instead applies `timeout_seconds` to its three pynetdicom timers. For

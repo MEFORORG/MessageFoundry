@@ -53,6 +53,7 @@ from messagefoundry.transports.base import (
     NegativeAckError,
     register_destination,
 )
+from messagefoundry.transports.bounded_read import read_bounded, read_bounded_text
 from messagefoundry.transports.dicom import recover_dicom_object_bytes
 
 # Reuse REST's hardened HTTP plumbing — same transports/ package, same no-redirect + TLS posture (NOT a
@@ -392,7 +393,11 @@ class DicomWebDestination(DestinationConnector):
         )
         try:
             with self._opener.open(req, timeout=self.timeout) as resp:
-                resp.read()
+                # ASVS 15.2.2: the probe body is discarded, but draining it unbounded would let an
+                # unreachability check be turned into a memory exhaustion. Over-cap raises
+                # ResponseTooLargeError (a DeliveryError), which the operator sees as a failed
+                # "test connection" rather than as a reachable host.
+                read_bounded(resp, connector=f"DICOMweb {_redact_url(self.base_url)} probe")
         except urllib.error.HTTPError as exc:
             if exc.code in (401, 403):
                 raise DeliveryError(
@@ -426,7 +431,13 @@ class DicomWebDestination(DestinationConnector):
                 method="POST",
             )
             with self._opener.open(req, timeout=self.timeout) as resp:
-                body = resp.read().decode(self.encoding, errors="replace")
+                # ASVS 15.2.2: bounded on the socket read. A STOW-RS reply is a small result
+                # document, so the 16 MiB ceiling refuses only a peer that is broken or hostile.
+                body = read_bounded_text(
+                    resp,
+                    connector=f"DICOMweb {_redact_url(self.base_url)}",
+                    encoding=self.encoding,
+                )
                 status = int(getattr(resp, "status", 200))
                 return body, status
         except urllib.error.HTTPError as exc:
