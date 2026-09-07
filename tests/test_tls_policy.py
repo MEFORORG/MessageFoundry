@@ -41,6 +41,7 @@ from messagefoundry.config.tls_policy import (
     insecure_hop_disposition,
     is_loopback_hop_host,
     kex_groups_report,
+    proxy_mtls_declared_but_unverified,
     smtp_login_approved,
     tls_revocation_attested,
     validate_tls_ciphers,
@@ -287,6 +288,45 @@ def test_in_process_tls_revocation_refused_matrix(
         )
         is expected_refuse
     )
+
+
+# --- BACKLOG #1181 (ASVS 12.3.5): the Posture-B mTLS coherence predicate --------------------------
+#
+# The WHOLE truth table, not a sample. The three cases reachable through `serve` are covered in
+# tests/test_api_tls.py, but each of those writes a TOML, chdirs and stubs five call sites to reach one
+# boolean -- so the arm that SILENCES the warning (a client CA configured) had no test at all there.
+# That arm is the one a regression would break quietly: the engine would nag a site that had actually
+# done the work, and the fix for the nag is to delete the check.
+
+
+@pytest.mark.parametrize("declared", ["none", "mtls", "network", "shared_secret"])
+@pytest.mark.parametrize("client_ca_configured", [False, True])
+@pytest.mark.parametrize("is_phi", [False, True])
+def test_proxy_mtls_declared_but_unverified_matrix(
+    declared: str, client_ca_configured: bool, is_phi: bool
+) -> None:
+    # WARN on exactly one combination: the declaration says the proxy presents a certificate, the
+    # engine verifies none, and the instance carries PHI. Everything else is byte-identical silence.
+    expected = declared == "mtls" and not client_ca_configured and is_phi
+    assert (
+        proxy_mtls_declared_but_unverified(
+            declared=declared, client_ca_configured=client_ca_configured, is_phi=is_phi
+        )
+        is expected
+    )
+
+
+def test_proxy_mtls_predicate_warns_on_exactly_one_of_sixteen() -> None:
+    """The matrix above derives `expected` from the same rule the predicate implements, so on its own
+    it would pass for a predicate that always returned False. This counts the True cells."""
+    warned = [
+        (d, ca, phi)
+        for d in ("none", "mtls", "network", "shared_secret")
+        for ca in (False, True)
+        for phi in (False, True)
+        if proxy_mtls_declared_but_unverified(declared=d, client_ca_configured=ca, is_phi=phi)
+    ]
+    assert warned == [("mtls", False, True)]
 
 
 @pytest.mark.parametrize("val", ["1", "true", "TRUE", "Yes", "on"])

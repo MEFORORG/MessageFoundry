@@ -210,8 +210,8 @@ def test_webhook_transport_posts_json(monkeypatch: pytest.MonkeyPatch) -> None:
         def __exit__(self, *a: object) -> None:
             return None
 
-        def read(self) -> bytes:
-            return b""
+        def read(self, amt: int = -1) -> bytes:
+            return b"" if amt < 0 else (b"")[:amt]
 
     def fake_open(req: Any, data: Any = None, timeout: float | None = None) -> _Resp:
         captured["url"] = req.full_url

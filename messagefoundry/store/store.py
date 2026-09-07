@@ -1126,9 +1126,11 @@ def audit_mac_bytes(value: str | None) -> bytes:
     and fires **no** ``integrity_drift`` alert. A forged row carrying one non-ASCII character would then
     silently downgrade a tamper alarm to a log breadcrumb. Encoding first makes the comparison total.
 
-    ``row_hash`` is also NULLable on all three backends (rows written before hash-chaining, until
-    :meth:`MessageStore._backfill_audit_chain` fills them), so ``None`` maps to empty bytes — which can
-    never equal a real digest, preserving today's "a NULL hash is a break" outcome without a type error.
+    ``row_hash`` is NOT NULL on all three backends since BACKLOG #1198, so the engine cannot produce a
+    ``None`` here. The mapping stays TOTAL anyway, and deliberately: the column lives in a store the
+    operator owns, so a NULL arriving out-of-band is exactly the tampering this comparison exists to
+    report. ``None`` maps to empty bytes, which can never equal a real digest, so such a row is a
+    reported break rather than a ``TypeError`` that would fail open.
 
     ``surrogatepass`` keeps the mapping TOTAL and injective for every ``str`` CPython can hold: a lone
     surrogate smuggled into the column encodes rather than raising, and two distinct strings can never
@@ -1779,7 +1781,10 @@ CREATE TABLE IF NOT EXISTS audit_log (
     channel_id  TEXT,
     detail      TEXT,                 -- JSON: filter, counts, exposed ids, ...
     client      TEXT,                 -- WHERE from: caller's network address; NULL for engine-internal writes
-    row_hash    TEXT                  -- sha256/hmac chain over (prev_hash + this row): tamper-evidence
+    -- sha256/hmac chain over (prev_hash + this row): tamper-evidence. NOT NULL — every row the engine
+    -- writes is chained at INSERT, so an unchained row has no legitimate producer and the column
+    -- refuses one rather than leaving a hole a verify has to interpret (BACKLOG #1198).
+    row_hash    TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS ix_audit_ts ON audit_log(ts);
 
@@ -2278,7 +2283,6 @@ class MessageStore:
         # the cipher carries no bound (keyless / `vault_transit`).
         await store.checkpoint_cipher_invocations()
         await store._encrypt_existing_rows()  # one-time PHI-at-rest migration when a key is set
-        await store._backfill_audit_chain()  # chain any pre-existing (unhashed) audit rows
         await store._load_audit_chain_meta()  # load/auto-init the #190 keying watermark
         await (
             store._load_state_cache()
@@ -2451,35 +2455,11 @@ class MessageStore:
                 )
         self._reference_cache = cache
 
-    async def _backfill_audit_chain(self) -> None:
-        """Fill ``row_hash`` for audit rows written before hash-chaining (idempotent).
-
-        Only rows missing a hash are filled, chained from the prior row — existing valid hashes are
-        left untouched (so this can't silently re-bless a tampered row)."""
-        cur = await self._db.execute(
-            "SELECT id, ts, actor, action, channel_id, detail, client, row_hash"
-            " FROM audit_log ORDER BY id"
-        )
-        prev = ""
-        updates: list[tuple[str, int]] = []
-        for r in await cur.fetchall():
-            if r["row_hash"]:
-                prev = r["row_hash"]
-                continue
-            prev = audit_row_hash(
-                prev,
-                ts=r["ts"],
-                actor=r["actor"],
-                action=r["action"],
-                channel_id=r["channel_id"],
-                detail=r["detail"],
-                client=r["client"],
-            )
-            updates.append((prev, r["id"]))
-        if updates:
-            async with self._lock:
-                await self._db.executemany("UPDATE audit_log SET row_hash=? WHERE id=?", updates)
-                await self._commit()
+    # `_backfill_audit_chain` was deleted with BACKLOG #1198. It filled `row_hash` on audit rows
+    # written before hash-chaining existed. At zero deployments no such row exists, so the method was a
+    # compatibility path for a population that was never created, and it was the one audit-row UPDATE a
+    # reader had to read the guard of before believing the log is append-only. Do not reintroduce it:
+    # `row_hash` is NOT NULL, so the rows it existed to repair can no longer be written at all.
 
     async def _load_audit_chain_meta(self) -> None:
         """Load the #190 audit-chain keying watermark and, for a FRESH encrypted store, auto-enable
@@ -2916,7 +2896,27 @@ class MessageStore:
         number of values rewritten."""
         cipher = self._cipher
         if not isinstance(cipher, AesGcmCipher):
-            return 0  # identity cipher (no key) — nothing to rotate
+            # BACKLOG #1165 (ASVS 11.2.2). Two very different cases used to share this return,
+            # and the comment named only the harmless one. IdentityCipher means NO key is
+            # configured, so there is genuinely nothing to rotate and 0 is the truthful answer.
+            # Any OTHER non-AesGcmCipher -- today TransitCipher, whose keys live in Vault --
+            # HOLDS keys this loop cannot rewrite, and answering 0 there made
+            # `messagefoundry rotate-key` print "OK: re-encrypted 0 value(s) under the active
+            # key" and exit 0 having rotated nothing. A rotation that silently rotates nothing
+            # is precisely what 11.2.2's "keys replaceable with data re-encrypted" clause exists
+            # to prevent, and on a first deployment an operator would believe it.
+            #
+            # NotImplementedError deliberately: `messagefoundry rotate-key` already catches it,
+            # prints the message and exits 2, so the refusal reaches the operator as an error
+            # rather than as a success with a zero in it.
+            if not isinstance(cipher, IdentityCipher):
+                raise NotImplementedError(
+                    f"{type(cipher).__name__} cannot re-encrypt store values in place: its keys"
+                    " are held by the provider, not by this engine, so rotation happens at the"
+                    " provider. Reporting 0 rewritten values here would be indistinguishable"
+                    " from a completed rotation (BACKLOG #1165, ASVS 11.2.2)."
+                )
+            return 0  # identity cipher (no key) -- nothing to rotate
         # The active-format prefix THROUGH the active key's fingerprint (M9): `mfenc:v1:<kid>:` or, for a
         # v2-active cipher, `mfenc:v2:<alg>:<kid>:`. Rotation rewrites everything NOT already under this
         # prefix, so a value re-encrypted to the active key/format matches next round and the loop ends.
@@ -3286,8 +3286,10 @@ class MessageStore:
                 await db.execute(f"ALTER TABLE messages ADD COLUMN {column} {decl}")
         cur = await db.execute("PRAGMA table_info(audit_log)")
         audit_cols = {row["name"] for row in await cur.fetchall()}
-        if "row_hash" not in audit_cols:
-            await db.execute("ALTER TABLE audit_log ADD COLUMN row_hash TEXT")
+        # There is deliberately NO `row_hash` ADD COLUMN here. It existed for stores written before
+        # hash-chaining; the column is now NOT NULL in `_SCHEMA` and an ALTER cannot add a NOT NULL
+        # column to a populated SQLite table without a default, so the shim and the constraint are
+        # mutually exclusive. The constraint is the one worth having (BACKLOG #1198).
         # ADR 0150 client attribution: a pre-existing DB's audit_log predates the column. NULL on every
         # existing row is CORRECT (their address was never captured) *and* is what keeps their row_hash
         # valid — audit_row_hash omits the 7th element entirely when client is None.
@@ -7642,16 +7644,24 @@ class MessageStore:
                 key=_key,
                 mac=_mac,
             )
-            await self._db.execute(
+            ins = await self._db.execute(
                 "INSERT INTO audit_log (ts, actor, action, channel_id, detail, client, row_hash)"
                 " VALUES (?,?,?,?,?,?,?)",
                 (now, actor, action, channel_id, detail, client, row_hash),
             )
+            row_id = int(ins.lastrowid or 0)  # read INSIDE the lock: another append would move it
             await self._commit()
         # Tee off-box AFTER commit (only forward what truly persisted) and OUTSIDE the lock (a
         # synchronous syslog send must never hold the write lock or block the event loop under it).
         emit_audit_tee(
-            action=action, actor=actor, channel_id=channel_id, detail=detail, client=client, ts=now
+            action=action,
+            actor=actor,
+            channel_id=channel_id,
+            detail=detail,
+            client=client,
+            ts=now,
+            row_id=row_id,
+            row_hash=row_hash,
         )
 
     async def list_audit(

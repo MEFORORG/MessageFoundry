@@ -110,6 +110,20 @@ _T = TypeVar("_T")
 #: refused at most this far past ``max_file_bytes``.
 RETRIEVE_CHUNK_BYTES = 1024 * 1024  # 1 MiB
 
+#: Wall-clock bound on a single read from an established SFTP channel (BACKLOG #1195, ASVS 15.4.4).
+#:
+#: paramiko's ``connect(timeout=...)`` bounds the TCP connect and the handshake only. Once the
+#: transport is up the channel reverts to a blocking socket, so a peer that accepts the connection
+#: and then stops sending would park the calling thread for as long as it stayed silent. Every
+#: REMOTEFILE operation runs on a worker thread, so a first deployment polling a hung share would
+#: lose one thread per stuck operation and, with enough of them, would delay unrelated work sharing
+#: the same pool.
+#:
+#: This bounds each individual read, not the whole transfer. A slow but live transfer keeps resetting
+#: it, so a large file over a thin link is unaffected; only a peer that goes silent for this long is
+#: cut off. The refusal is transient -- the caller retries it.
+SFTP_CHANNEL_READ_TIMEOUT_SECONDS = 120.0
+
 
 def _is_contained_name(name: object) -> bool:
     """True if ``name`` is a single, safe path component — a listing entry we may join onto the
@@ -542,6 +556,26 @@ def _import_paramiko() -> Any:
     return paramiko
 
 
+def _bound_sftp_channel_reads(sftp: Any) -> None:
+    """Put :data:`SFTP_CHANNEL_READ_TIMEOUT_SECONDS` on the SFTP channel's socket.
+
+    Every read the client makes on this channel then raises :class:`TimeoutError` once the server has
+    sent nothing for that long, instead of blocking the worker thread forever (BACKLOG #1195).
+
+    ``get_channel`` is documented to return ``None`` for a client not backed by a channel, and the
+    test doubles this module is exercised with do not always provide one, so an absent channel is a
+    no-op rather than an error: the caller's work is still correct without the bound, and refusing a
+    transfer over a missing test-double attribute would be a worse failure than the one being fixed.
+    """
+    channel = getattr(sftp, "get_channel", None)
+    if channel is None:
+        return
+    sock = channel()
+    if sock is None:
+        return
+    sock.settimeout(SFTP_CHANNEL_READ_TIMEOUT_SECONDS)
+
+
 class _SftpClient(_RemoteClient):
     """SFTP client over paramiko. Host-key verification is ON by default (system known_hosts + an
     optional ``known_hosts`` file, paramiko ``RejectPolicy``); an unknown key is refused unless the
@@ -607,6 +641,13 @@ class _SftpClient(_RemoteClient):
             password=str(self._password) if self._password else None,
             pkey=pkey,
             timeout=self._timeout,
+            # ``timeout`` covers the TCP connect. It does NOT cover the banner exchange or the
+            # authentication round trips: paramiko bounds those with their own keywords, so a peer
+            # that completes the TCP handshake and then stalls would hold the worker thread well
+            # past ``timeout``. Pinned here rather than left to paramiko's defaults so all three
+            # bounds are readable at the one call that makes the socket (BACKLOG #1195).
+            banner_timeout=self._timeout,
+            auth_timeout=self._timeout,
             allow_agent=False,
             look_for_keys=False,
         )
@@ -694,6 +735,7 @@ class _SftpClient(_RemoteClient):
             raise _RemoteError(f"SFTP connect failed: {exc}", permanent=False) from exc
         try:
             sftp = client.open_sftp()
+            _bound_sftp_channel_reads(sftp)
             try:
                 return fn(sftp)
             finally:
@@ -702,6 +744,15 @@ class _SftpClient(_RemoteClient):
             raise _RemoteError(f"SFTP path not found: {exc}", permanent=True) from exc
         except paramiko.SSHException as exc:
             raise _RemoteError(f"SFTP operation failed: {exc}", permanent=False) from exc
+        except TimeoutError as exc:
+            # A silent peer, not a broken one: the channel bound fired (BACKLOG #1195). Transient, so
+            # the caller retries. Named before the OSError arm below only to say so in the message --
+            # TimeoutError is an OSError subclass and would otherwise be classified identically.
+            raise _RemoteError(
+                f"SFTP read timed out after {SFTP_CHANNEL_READ_TIMEOUT_SECONDS:g}s "
+                f"with no data from the server: {exc}",
+                permanent=False,
+            ) from exc
         except OSError as exc:
             raise _RemoteError(f"SFTP operation failed: {exc}", permanent=False) from exc
         finally:

@@ -394,8 +394,8 @@ class _Resp:
         self._body = body
         self.headers = None
 
-    def read(self) -> bytes:
-        return self._body
+    def read(self, amt: int = -1) -> bytes:
+        return self._body if amt < 0 else (self._body)[:amt]
 
     def __enter__(self) -> _Resp:
         return self
