@@ -306,17 +306,15 @@ class EmailDestination(DestinationConnector):
                     # no default-off escape). smtp_login_approved drives auth() against the server's
                     # advertised list restricted to PLAIN/LOGIN.
                     #
-                    # escape_permitted=False DELIBERATELY. The helper's escape arm exists for callers
-                    # whose cleartext-credential decision is escapable; this cell's is NOT — the
-                    # construction gate above refuses username+use_tls=false outright, even with the
-                    # escape. Passing True would make the send-time check weaker than the
-                    # construction-time one it backs up, which is how a backstop becomes a hole.
+                    # The helper's cleartext-AUTH refusal is ABSOLUTE, which is what this cell needs:
+                    # the construction gate above refuses username+use_tls=false outright, even with
+                    # the escape set. A send-time check weaker than the construction-time one it
+                    # backs up is how a backstop becomes a hole (BACKLOG #1171).
                     smtp_login_approved(
                         smtp,
                         self.username,
                         self.password or "",
                         channel_encrypted=self.use_tls,
-                        escape_permitted=False,
                         cell="EMAIL outbound",
                     )
                 smtp.send_message(msg)
@@ -360,7 +358,6 @@ class EmailDestination(DestinationConnector):
                         self.username,
                         self.password or "",
                         channel_encrypted=self.use_tls,
-                        escape_permitted=False,
                         cell="EMAIL outbound probe",
                     )
                 smtp.noop()

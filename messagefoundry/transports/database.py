@@ -14,9 +14,12 @@ job. ``dialect='generic'`` is a **generic ODBC path** decoupled from Driver-18/T
 any OS-installed ODBC driver (PostgreSQL / Oracle / MySQL) + supplies driver-specific keywords via
 ``odbc_params`` (:func:`_build_odbc_dsn`), so no new Python DB-driver dependency is needed. On the generic
 path TLS is the operator's responsibility (configured through the driver's own keyword) — MessageFoundry
-cannot introspect an arbitrary driver's TLS posture, so the SQL-Server weakened-TLS refusal does not apply;
-construction instead logs the delegation as a fail-safe (a WARNING when no TLS keyword is set — see
-:func:`_warn_generic_tls_unenforced`). The live aioodbc round-trip is exercised by the CI SQL Server service-container job
+cannot introspect an arbitrary driver's TLS posture, so the SQL-Server weakened-TLS refusal does not apply.
+Construction logs the delegation as a fail-safe (a WARNING when no TLS keyword is set — see
+:func:`_warn_generic_tls_unenforced`) and **gates it**: a generic hop whose ``odbc_params`` say TLS is not
+required goes through the shared cleartext-hop authority like every other cleartext transport, so an
+enforcing instance refuses it off-loopback rather than crossing in the clear (BACKLOG #1178 — see
+:func:`generic_cleartext_hop_guard`). The live aioodbc round-trip is exercised by the CI SQL Server service-container job
 (``tests/test_database_connector_integration.py``); the connector logic is also unit-tested with a
 faked driver. The SQL Server *store* backend is a **separate** (also production) layer — this
 connector does not depend on it.
@@ -66,6 +69,7 @@ from messagefoundry.transports.base import (
     register_destination,
     register_source,
 )
+from messagefoundry.transports.mllp import InsecureHopGuard
 
 __all__ = ["DatabaseDestination", "DatabaseLookupExecutor", "DatabaseSource"]
 
@@ -264,7 +268,13 @@ def generic_odbc_tls_unenforced(params: Mapping[str, Any]) -> str | None:
     no TLS keyword at all, or a TLS keyword pinned to a no-TLS value (the latter names the offenders).
     Shares :func:`generic_odbc_no_tls_params` with the construction reminder — see that docstring for
     why a value deny-list, and for the encrypted-but-unverified residual this deliberately does not
-    classify."""
+    classify.
+
+    Since BACKLOG #1178 this predicate also decides whether the hop is GATED, not just reported: a
+    non-``None`` reason is what builds :func:`generic_cleartext_hop_guard`. Same single definition, so
+    the log line, the operator report and the refusal can never disagree about which hops are at risk —
+    but widening it now widens a refusal, which the deny-list's deliberate narrowness should be read
+    against."""
     disabling = generic_odbc_no_tls_params(params)
     if disabling:
         return "TLS is explicitly not required: " + ", ".join(sorted(disabling))
@@ -302,7 +312,13 @@ def _build_odbc_dsn(s: dict[str, Any], *, connection: str | None = None) -> str:
     driver's own keyword in ``odbc_params`` (e.g. psqlODBC ``SSLmode=verify-full``, MySQL
     ``SSLMODE=VERIFY_IDENTITY``). Because that delegation is otherwise invisible, construction logs it
     (:func:`_warn_generic_tls_unenforced`): a **WARNING** when no TLS keyword is present, DEBUG when one
-    is. See docs/CONNECTIONS.md."""
+    is.
+
+    Delegating TLS is not the same as declining to gate the hop. A connection whose ``odbc_params`` say
+    TLS is **not required** is refused off-loopback on an enforcing instance by
+    :func:`generic_cleartext_hop_guard` (BACKLOG #1178), which the connectors call beside this builder.
+    What stays delegated is the case this path genuinely cannot judge: a driver keyword IS set, and the
+    engine cannot tell whether its value verifies anything. See docs/CONNECTIONS.md."""
     driver = str(s.get("odbc_driver") or "").strip()
     if not driver:
         raise ValueError("DATABASE generic dialect requires an 'odbc_driver' setting")
@@ -345,13 +361,19 @@ def _warn_generic_tls_unenforced(
     """Fail-safe visibility for the generic ODBC dialect (#66 review): unlike the SQL Server preset, this
     path **cannot introspect the driver's TLS posture**, so the posture-keyed weakened-TLS refusal
     (#200 / ADR 0092) does not apply and :func:`_build_connection` reports the hop as non-weakened. That
-    is a deliberate operator-owned-TLS model — but it must not be *silent*, or a generic PHI connection
-    with no TLS keyword would cross in plaintext with no refusal and no trace.
+    is a deliberate operator-owned-TLS model, and it must not be *silent*.
 
     So at construction we log the delegation loudly: a **WARNING** when :func:`generic_odbc_tls_unenforced`
     says the hop may cross in plaintext — no ssl/tls/encrypt-ish keyword in ``odbc_params``, or one
     pinned to a no-TLS value like ``SSLmode=disable`` — dropped to **DEBUG** when the operator has taken
-    TLS ownership. This is advisory only; it never gates or changes the connection.
+    TLS ownership.
+
+    **This line is visibility, not the control.** It never gates or changes the connection, and until
+    BACKLOG #1178 it was the whole of what stood between a generic PHI connection with no TLS keyword
+    and a plaintext crossing. The refusal now lives in :func:`generic_cleartext_hop_guard`, which puts
+    the same classifier's verdict through the shared hop authority. This still fires beside that gate,
+    and it is the ONLY report on the arm the gate no-ops: an unstamped posture (a direct embedding, or
+    a live-serve rebuild after the enforced pre-flight already vetted the config).
 
     ``connection`` names the declaring connection (#333). Without it a site running several generic DB
     connections gets a line it cannot act on — the remedy is per-connection, so the report must be too.
@@ -379,6 +401,123 @@ def _warn_generic_tls_unenforced(
         )
 
 
+# --- the generic-ODBC dialect's cleartext hop, GATED (BACKLOG #1178) ---------------------------
+#
+# :func:`_warn_generic_tls_unenforced` above is visibility, not a control — it logs and returns. Before
+# this gate the generic dialect reached no TLS gate of any family: :func:`_build_connection` reports it
+# non-weakened, which also disarms the :func:`_assert_send_hop` tripwire, and the SQL Server preset's
+# refusal never runs on this path. A deploying site would put a DB hop on the wire in the clear with
+# nothing refusing it — cleartext by absence, not by a signed per-connection relaxation.
+#
+# The arm is routed through the SAME shared authority every other cleartext transport consumes
+# (:class:`~messagefoundry.transports.mllp.InsecureHopGuard` ->
+# :func:`~messagefoundry.config.tls_policy.insecure_hop_disposition`), exactly as ``TcpDestination`` and
+# ``X12Destination`` do. One owner-ratified gradient, applied in one place, never re-forked. It can only
+# refuse or warn where the shipped code was silent, so ADR 0092 decision 5 (no-loosen) holds by
+# construction.
+#
+# SCOPE IS DELIBERATE: the generic dialect only, and only when the classifier returns a reason. The SQL
+# Server preset keeps its own posture-keyed weakened-TLS refusal (:func:`_build_dsn`) — moving that arm
+# onto this gradient would ADD the loopback and ``cleartext_accepted`` relaxations to a path that
+# refuses today, which is a loosening.
+
+
+def _port_or_zero(text: str) -> int:
+    """``text`` as a port number, or 0 when it is not one — the ONE definition of "is this a port",
+    used at both places :func:`_generic_hop_endpoint` looks for one.
+
+    The five-digit bound is what a port is, and it also keeps ``int()`` away from CPython's
+    string-to-int digit limit on an absurd operator value, which would turn a log detail into a crash."""
+    text = text.strip()
+    return int(text) if text.isdigit() and len(text) <= 5 else 0
+
+
+def _generic_hop_endpoint(server: str, params: Mapping[str, Any]) -> tuple[str, int]:
+    """Split a generic-dialect ``server`` setting into ``(host, port)`` for the hop guard.
+
+    The loopback carve-out is decided on the HOST alone and
+    :func:`~messagefoundry.config.tls_policy.is_loopback_hop_host` never resolves DNS, so a
+    ``host,port`` / ``host:port`` / ``[v6]:port`` suffix has to come off first: left on,
+    ``"127.0.0.1,5432"`` parses as a name rather than an address, is treated as remote, and a genuinely
+    on-box dev hop is refused.
+
+    A port the ``server`` string does not carry is read from the documented generic ``PORT`` keyword,
+    and falls back to 0 when neither says. The port is REPORT-ONLY — it never changes the disposition —
+    so an unknown port is a cosmetic gap in one log line, never a gap in the gate."""
+    host = server.strip()
+    port_text = ""
+    if host.startswith("["):  # a bracketed IPv6 literal, optionally followed by ":port"
+        close = host.find("]")
+        if close != -1:
+            host, rest = host[1:close], host[close + 1 :]
+            port_text = rest[1:] if rest.startswith(":") else ""
+    elif "," in host:  # the SQL-Server-style "host,port"
+        host, _, port_text = host.partition(",")
+    elif host.count(":") == 1:  # "host:port" — a bare IPv6 literal carries more than one colon
+        host, _, port_text = host.partition(":")
+    # A usable port in `server` wins; otherwise the PORT keyword; otherwise unknown. 0 is the "neither
+    # said" value, so `or` reads correctly here — a port is never legitimately 0.
+    keyword = next((str(v) for k, v in params.items() if str(k).strip().lower() == "port"), "")
+    return host.strip(), _port_or_zero(port_text) or _port_or_zero(keyword)
+
+
+def generic_cleartext_hop_guard(
+    settings: Mapping[str, Any],
+    *,
+    cell: str,
+    attested: bool,
+    attested_reason: str | None,
+    cleartext_accepted: bool = False,
+    cleartext_reason: str | None = None,
+    connection: str | None = None,
+) -> InsecureHopGuard | None:
+    """The cleartext-hop guard for a generic-ODBC ``DATABASE`` connection, or ``None`` when there is
+    nothing on this arm to gate (BACKLOG #1178).
+
+    ``None`` covers two different situations. A non-``generic`` dialect is not this arm at all — the SQL
+    Server preset keeps its own posture-keyed weakened-TLS refusal in :func:`_build_dsn`. A generic
+    connection whose ``odbc_params`` addressed TLS returns ``None`` because
+    :func:`generic_odbc_tls_unenforced` found no reason to think the hop crosses in plaintext; the
+    engine still cannot VERIFY an arbitrary driver's keyword, and that residual is unchanged and
+    written down in :func:`generic_odbc_no_tls_params`.
+
+    Otherwise the hop is decided by the one shared authority, identically to every other cleartext
+    transport: an on-box hop ALLOWs, a per-connection ``tls_hop_attested`` ALLOWs (audited),
+    ``cleartext_accepted`` WARNs (audited), a non-enforcing instance WARNs, and an enforcing instance
+    REFUSES. The authority reads no data label — ADR 0153 removed ``is_phi`` from it — so an enforcing
+    instance refuses this hop whether or not it is declared PHI-carrying.
+
+    ``cleartext_accepted`` is an outbound-only declaration on the config model, so an inbound
+    ``DatabasePoll`` reaches the gate with the attestation as its only per-connection relaxation. That
+    asymmetry is inherited, not introduced here.
+
+    Pure — it reads the settings plus the ambient hop posture, and touches nothing else."""
+    if str(settings.get("dialect", "sqlserver")).lower() != "generic":
+        return None
+    params = settings.get("odbc_params") or {}
+    if not isinstance(params, Mapping):
+        # A malformed odbc_params is :func:`_build_odbc_dsn`'s own ValueError, not a hop decision —
+        # guessing a disposition off a value that will not load would report the wrong cause.
+        return None
+    reason = generic_odbc_tls_unenforced(params)
+    if reason is None:
+        return None
+    host, port = _generic_hop_endpoint(str(settings.get("server") or ""), params)
+    return InsecureHopGuard.capture(
+        host=host,
+        port=port,
+        cell=cell,
+        # The classifier's reason rides in the description so the refusal names WHAT is unset, not just
+        # that something is: the remedy is a specific driver keyword.
+        description=f"cleartext generic-ODBC DATABASE hop ({reason})",
+        attested=attested,
+        attested_reason=attested_reason,
+        cleartext_accepted=cleartext_accepted,
+        cleartext_reason=cleartext_reason,
+        connection=connection,
+    )
+
+
 def _build_connection(
     s: dict[str, Any],
     *,
@@ -390,6 +529,12 @@ def _build_connection(
     runs the byte-identical SQL Server preset (:func:`_build_dsn`, weakened-TLS refusal + optional
     read-only intent); ``dialect='generic'`` runs :func:`_build_odbc_dsn` (operator-owned TLS, so never
     reported weakened — a construction-time WARNING flags the unenforced-TLS delegation instead).
+
+    ``weakened_tls`` is the SQL-Server-preset flag only, and a ``False`` from the generic arm has never
+    meant "this hop is safe" — it means "this preset's TLS keywords are not what governs it". The
+    generic arm's own refusal is :func:`generic_cleartext_hop_guard`, called by the connectors beside
+    this dispatcher rather than from inside it, so a direct DSN-shape caller (tests, checks) still gets
+    a string back without a hop decision it did not ask for.
 
     ``connection`` names the declaring connection in that WARNING (#333); it is used on the generic path
     only, since the SQL Server preset refuses rather than warns."""
@@ -649,6 +794,20 @@ class DatabaseDestination(DestinationConnector):
         self._dsn, self._weakened_tls = _build_connection(
             s, attested=self._hop_attested, connection=config.name
         )  # fail fast on a weakened-TLS / bad-auth / bad-generic config
+        # BACKLOG #1178: the generic dialect's cleartext arm, which reaches none of the refusals above.
+        # Built AFTER _build_connection so a malformed server/keyword keeps reporting its own shape
+        # error rather than a TLS refusal — the operator's first fix is the one that will not load.
+        self._cleartext_guard = generic_cleartext_hop_guard(
+            s,
+            cell="DATABASE outbound",
+            attested=self._hop_attested,
+            attested_reason=config.tls_hop_attested_reason,
+            cleartext_accepted=config.cleartext_accepted,
+            cleartext_reason=config.cleartext_reason,
+            connection=config.name,
+        )
+        if self._cleartext_guard is not None:
+            self._cleartext_guard.enforce_construction()
         self._sql, self._param_names = _parse_named_params(str(s["statement"]))
         self._pool_max = int(s.get("pool_max", 5))
         self._acquire_timeout = float(s.get("acquire_timeout", _DEFAULT_DB_ACQUIRE_TIMEOUT))
@@ -690,6 +849,11 @@ class DatabaseDestination(DestinationConnector):
         # catching a reload / build that reached send() around it. Fixed DSN target → this only ever
         # fires as a tripwire.
         _assert_send_hop(weakened=self._weakened_tls, attested=self._hop_attested)
+        # BACKLOG #1178: the generic dialect's twin of the line above. That tripwire is keyed on
+        # `weakened`, which the generic path never sets, so this arm needed its own re-assertion at the
+        # byte crossing. None when there is no cleartext arm to re-assert.
+        if self._cleartext_guard is not None:
+            self._cleartext_guard.assert_send()
         params = _bind_params(payload, self._param_names)  # NegativeAckError(permanent) on bad data
         pool = await self._get_pool()
         conn = await _acquire(pool, self._acquire_timeout)
@@ -872,6 +1036,21 @@ class DatabaseSource(SourceConnector):
         self._dsn, _ = _build_connection(
             s, attested=config.tls_hop_attested, connection=config.name
         )  # fail fast on a weakened-TLS / bad-auth / bad-generic config
+        # BACKLOG #1178: the poll link dials OUT on the same generic-dialect hop the destination does,
+        # with the same credential in the same DSN, so it is gated identically. Construction only —
+        # there is no per-payload byte crossing here to backstop, and `_run` swallows-and-retries a poll
+        # failure, so raising per tick would produce log noise rather than a second control. `Source`
+        # carries no `cleartext_accepted`, so an inbound's only per-connection relaxation is the
+        # attestation.
+        self._cleartext_guard = generic_cleartext_hop_guard(
+            s,
+            cell="DATABASE inbound poll",
+            attested=config.tls_hop_attested,
+            attested_reason=config.tls_hop_attested_reason,
+            connection=config.name,
+        )
+        if self._cleartext_guard is not None:
+            self._cleartext_guard.enforce_construction()
         self._poll_sql = str(s["poll_statement"])
         mark = s.get("mark_statement")
         # mark_statement is optional (a read-only/idempotent feed may omit it); its :name params bind

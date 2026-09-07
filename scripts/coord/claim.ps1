@@ -54,7 +54,20 @@ param(
     # What the work is -- recorded so a sibling session sees WHY the key is taken.
     [string]$Note,
     # Release a claim held by ANOTHER worktree (for a session that died without releasing).
-    [switch]$Force
+    [switch]$Force,
+    # Hold the claim in the name of THIS tree instead of the one this script lives in (BACKLOG #1346).
+    #
+    # ONE VALUE USED TO ANSWER TWO QUESTIONS -- *where the registry is* and *who holds the claim* -- and
+    # inside a single repository those are always the same tree, so the conflation was invisible. Across
+    # two repositories that share a registry they diverge, and there was no way to say "the tool lives
+    # over there, the committing tree is here". `scripts/hooks/claim_check.py` compares the record's
+    # worktree against the tree being committed, so without this the gate in a second repository refused
+    # a claim that had just been taken for it.
+    #
+    # THIS IS NOT A RETREAT FROM THE $PSScriptRoot ANCHORING (BACKLOG #1060). That defect was a SILENT
+    # read of the caller's cwd; this is an explicit argument, recorded in the claim, printed back on
+    # every surface that shows a holder. Nothing changes unless someone asks for it.
+    [string]$AsWorktree
 )
 
 $ErrorActionPreference = "Stop"
@@ -76,25 +89,66 @@ if (-not $repo) { throw "scripts/coord/ is not inside a git repository: $PSScrip
 try { . "$PSScriptRoot/occupancy.ps1" } catch { }
 $repo = $repo.Trim()
 
+# WHO HOLDS THE CLAIM, which is a different question from where this script lives (BACKLOG #1346).
+# Defaults to $repo, so every existing invocation behaves exactly as it always has.
+$holder = $repo
+if ($AsWorktree) {
+    $holderTop = (& git -C $AsWorktree rev-parse --path-format=absolute --show-toplevel 2>$null)
+    if (-not $holderTop) { throw "-AsWorktree '$AsWorktree' is not inside a git repository." }
+    # Its TOPLEVEL, not the string as typed: a subdirectory, a trailing slash or a relative path would
+    # otherwise be recorded verbatim, and the gate compares this field against `git rev-parse
+    # --show-toplevel` in the committing tree. A record that cannot match is a claim nothing honours.
+    $holder = $holderTop.Trim()
+}
+
 # ONE divergence test, three call sites (BACKLOG #1358). The note used to be written inline at the very
 # end of the script, which put it after the `-Take` success block and therefore made it UNREACHABLE from
 # `-Release` -- the script stated the release rule at claim time and went silent at the moment the
 # operator applied it. `$Subject` is the only part that varies, because the true sentence differs: a take
 # is recorded to $repo, whereas a release is BOTH recorded to it and adjudicated against it.
 #
-# Deliberately reads $repo at CALL time from script scope rather than taking it as a parameter: a second
-# copy of "which tree is this" is exactly the drift this note exists to report.
+# Deliberately reads $holder at CALL time from script scope rather than taking it as a parameter: a
+# second copy of "which tree is this" is exactly the drift this note exists to report.
+#
+# Compares against $holder, not $repo. The note exists to warn that the claim is being recorded against a
+# tree the operator is not standing in -- so once `-AsWorktree` names the tree they ARE standing in, there
+# is no divergence left to warn about and firing anyway would be a false alarm on the correct usage.
 function Write-DivergenceNote([Parameter(Mandatory)][string]$Subject) {
     $cwdTop = (& git rev-parse --path-format=absolute --show-toplevel 2>$null)
     if (-not $cwdTop) { return }
     $a = ($cwdTop.Trim() -replace '\\', '/').TrimEnd('/')
-    $b = ($repo -replace '\\', '/').TrimEnd('/')
+    $b = ($holder -replace '\\', '/').TrimEnd('/')
     if ($a -ieq $b) { return }
-    Write-Host "  NOTE: your shell is in $a, but this script lives in $b," -ForegroundColor Yellow
+    Write-Host "  NOTE: your shell is in $a, but this claim is recorded against $b," -ForegroundColor Yellow
     Write-Host "        so the $Subject" -ForegroundColor Yellow
 }
 
-$common = (& git -C $repo rev-parse --path-format=absolute --git-common-dir).Trim()
+# WHERE THE REGISTRY LIVES, resolved from the repository the claim is FOR (BACKLOG #1346).
+#
+# Anchored on $holder rather than $repo so that the tool and `scripts/hooks/claim_check.py` resolve from
+# the SAME tree. The gate reads this key in the repository being committed; if the tool read it anywhere
+# else the two could disagree, and a claim written where the gate never looks is the unpassable state this
+# fixes. `mefor.claimsRoot` is unset in this repository, so the ordinary path is unchanged: $holder's own
+# common dir, exactly as before.
+#
+# ONE HOP. If the host repository sets the key too, its own gate follows the same single hop, so both
+# sides still land together and a chain cannot split them.
+$registryRepo = $holder
+$claimsRoot = $null
+try { $claimsRoot = (& git -C $holder config --get mefor.claimsRoot 2>$null) } catch { $claimsRoot = $null }
+if ($claimsRoot) {
+    $claimsRoot = $claimsRoot.Trim()
+    $rootTop = (& git -C $claimsRoot rev-parse --path-format=absolute --show-toplevel 2>$null)
+    # THROW rather than fall back. A silent fallback would write this claim into a registry the gate does
+    # not read, which looks like success and refuses at commit time with no way to see why -- the exact
+    # shape of #1346.
+    if (-not $rootTop) {
+        throw "mefor.claimsRoot in $holder names '$claimsRoot', which is not a git repository. Fix it with: git -C $holder config mefor.claimsRoot <path>"
+    }
+    $registryRepo = $rootTop.Trim()
+}
+
+$common = (& git -C $registryRepo rev-parse --path-format=absolute --git-common-dir).Trim()
 $claims = Join-Path $common "mefor-coord/claims"
 New-Item -ItemType Directory -Force -Path $claims | Out-Null
 
@@ -137,7 +191,7 @@ function ConvertTo-Stamp($Value) {
 function Get-Mine([string]$Path) {
     $c = Get-Content $Path -Raw | ConvertFrom-Json
     $held = ($c.worktree -replace '\\', '/').TrimEnd('/')
-    $me = ($repo -replace '\\', '/').TrimEnd('/')
+    $me = ($holder -replace '\\', '/').TrimEnd('/')
     [pscustomobject]@{ Claim = $c; IsMine = ($held -ieq $me) }
 }
 
@@ -301,7 +355,7 @@ function Get-HolderLiveness([string]$HeldPath) {
 function Show-List {
     $files = @(Get-ChildItem $claims -Filter *.json -EA SilentlyContinue | Sort-Object Name)
     if (-not $files) { Write-Host "No active claims."; return }
-    $me = ($repo -replace '\\', '/').TrimEnd('/')
+    $me = ($holder -replace '\\', '/').TrimEnd('/')
     Write-Host ""
     Write-Host "Active work claims ($($files.Count)):"
     foreach ($f in $files) {
@@ -356,8 +410,8 @@ function Show-List {
 
 # Resolved for BOTH paths, not just -Take. A release record that names who released the claim is only
 # half an answer without the branch they were standing on -- the same question -Take records.
-$branch = & git -C $repo branch --show-current
-if ([string]::IsNullOrWhiteSpace($branch)) { $branch = "detached@" + (& git -C $repo rev-parse --short HEAD) }
+$branch = & git -C $holder branch --show-current
+if ([string]::IsNullOrWhiteSpace($branch)) { $branch = "detached@" + (& git -C $holder rev-parse --short HEAD) }
 $branch = $branch.Trim()
 
 if ($Release) {
@@ -413,7 +467,7 @@ if ($Release) {
         # tree, so "another worktree" can be the operator's OWN, with the foreign thing being the copy of
         # this script they invoked. Without the note that reads as a genuine cross-session collision and
         # invites a -Force, which is the one action the whole block exists to talk them out of.
-        Write-DivergenceNote "ownership was judged against it, NOT against your shell's tree -- re-run this from $repo before concluding anyone else holds it."
+        Write-DivergenceNote "ownership was judged against it, NOT against your shell's tree -- re-run this from $holder, or pass -AsWorktree, before concluding anyone else holds it."
         exit 1
     }
     # RECORD FIRST, then act. Both orders can lie once and only one lie is recoverable: removing first
@@ -428,7 +482,7 @@ if ($Release) {
         ts              = (Get-Date).ToString("o")
         event           = "release"
         key             = $Release
-        released_by     = $repo
+        released_by     = $holder
         released_branch = $branch
         prior_holder    = ConvertTo-Stamp $info.Claim.worktree
         prior_branch    = ConvertTo-Stamp $info.Claim.branch
@@ -458,7 +512,7 @@ if ($Release) {
                 ts          = (Get-Date).ToString("o")
                 event       = "release-failed"
                 key         = $Release
-                released_by = $repo
+                released_by = $holder
                 reason      = $_.Exception.Message
             } | ConvertTo-Json -Compress) | Out-Null
         throw
@@ -619,7 +673,7 @@ try {
         key      = $Take
         note     = if ($Note) { $Note } else { "(no note)" }
         branch   = $branch
-        worktree = $repo
+        worktree = $holder
         claimed  = (Get-Date).ToString("o")
     } | ConvertTo-Json -Compress
     # UTF8 WITHOUT a BOM: the python-side gate reads this with encoding="utf-8", and a BOM makes
@@ -632,9 +686,20 @@ try {
 
 Write-Host ""
 Write-Host "CLAIMED '$Take'" -ForegroundColor Green
-Write-Host "  by   : $repo [$branch]"
+Write-Host "  by   : $holder [$branch]"
 Write-Host "  note : $(if ($Note) { $Note } else { '(no note)' })"
-Write-Host "  release when done:  pwsh -NoProfile -File scripts\coord\claim.ps1 -Release $Take"
+# Built outside the string: a nested double-quoted subexpression inside a double-quoted string is a
+# PowerShell parse error, not a runtime one, so it takes the whole script down at load time.
+$releaseArgs = "-Release $Take"
+if ($AsWorktree) { $releaseArgs += " -AsWorktree `"$holder`"" }
+Write-Host "  release when done:  pwsh -NoProfile -File scripts\coord\claim.ps1 $releaseArgs"
+# Say where it landed WHENEVER that is not this tree's own registry. A claim written into another
+# repository's registry is the correct outcome under mefor.claimsRoot and an alarming one unexplained,
+# and the operator has to know the answer to read `-List` anywhere (BACKLOG #1346).
+if ($registryRepo -ne $holder) {
+    Write-Host "  registry: $claims" -ForegroundColor Yellow
+    Write-Host "            (SHARED -- mefor.claimsRoot in $holder points at $registryRepo)" -ForegroundColor Yellow
+}
 
 # Same note alloc.ps1 prints, for the same reason (BACKLOG #1060): anchoring is correct but surprising,
 # and a claim recorded to a worktree the caller is not standing in otherwise surfaces only as a refused

@@ -2,14 +2,21 @@
 # Copyright (C) 2026 MessageFoundry Organization and contributors
 """Off-box audit tee — the single PHI-redaction path shared by every store backend (sec-offbox-log).
 
-Each store backend (SQLite, Postgres, SQL Server) calls :func:`emit_audit_tee` immediately after a
-``record_audit`` row is durably committed, so a **PHI-safe metadata** copy of the audit record is
-shipped off-box via the ``messagefoundry.audit`` logger — which propagates to the root stdout +
-optional syslog/SIEM forwarder configured by :mod:`messagefoundry.logging_setup`. So the audit trail
-survives a host/DB compromise (ASVS 16.x).
+Each store backend's ``record_audit`` (``SqliteStore``, ``PostgresStore``, ``SqlServerStore``) calls
+:func:`emit_audit_tee` immediately after the row is durably committed, so a **PHI-safe metadata** copy
+of the audit record is shipped off-box via the ``messagefoundry.audit`` logger — which propagates to
+the root stdout + optional syslog/SIEM forwarder configured by :mod:`messagefoundry.logging_setup`.
+So the audit trail survives a host/DB compromise (ASVS 16.x).
 
 One helper means there is exactly **one** place the off-box PHI-redaction guarantee lives, identical
 across all three backends — not three copies that could drift.
+
+**Propagation is only half the guarantee.** A record reaches that forwarder only if the process
+installed a handler for it to propagate to, which is a property of the *process*, not of this module
+— so :func:`~messagefoundry.logging_setup.ensure_logger_sink` supplies one when nothing else has
+(BACKLOG #1199; that function states the defect, and this file does not restate it). The copy still
+only reaches an operator and whatever the service manager captures: nothing here transmits off the
+host, and the durable off-box forwarder remains unbuilt.
 """
 
 from __future__ import annotations
@@ -17,6 +24,7 @@ from __future__ import annotations
 import json
 import logging
 
+from messagefoundry.logging_setup import ensure_logger_sink
 from messagefoundry.redaction import safe_text
 
 __all__ = ["audit_logger", "emit_audit_tee"]
@@ -80,6 +88,8 @@ def emit_audit_tee(
         "detail": safe_text(detail) if detail else None,
     }
     try:
+        # Inside the guard: a sink that cannot be built must not fail the caller's audit write either.
+        ensure_logger_sink(audit_logger)
         audit_logger.info(json.dumps(record, ensure_ascii=False))
     except Exception:  # noqa: BLE001 — the audit row is durable; the off-box tee is best-effort
         log.warning("off-box audit tee failed for action=%s", action, exc_info=True)

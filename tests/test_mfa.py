@@ -2,10 +2,11 @@
 # Copyright (C) 2026 MessageFoundry Organization and contributors
 """AuthService-level MFA (TOTP) tests (WP-14, ASVS 6.3.3).
 
-Covers the full second-factor lifecycle on local accounts — enrollment → confirm → recovery codes,
-the step-up MFA gate, the ``require_mfa`` administrator enforcement, recovery-code single-use, and
-disable/admin-reset — plus the AD/Kerberos **delegation** guarantee (a directory login is never
-prompted for an engine TOTP and is MFA-satisfied at issuance).
+Covers the full second-factor lifecycle — enrollment to confirm to recovery codes, the step-up MFA
+gate, the ``require_mfa`` administrator enforcement, recovery-code single-use, and
+disable/admin-reset — on a **local and a directory** account alike. The AD/Kerberos delegation
+guarantee this file used to pin is retired (BACKLOG #1144): a directory sign-in no longer clears the
+engine's MFA gates on an assertion the engine never receives.
 """
 
 from __future__ import annotations
@@ -18,7 +19,12 @@ from _totp_clock import fresh_totp, pin_totp_clock
 from messagefoundry.auth import totp
 from messagefoundry.auth.identity import Identity
 from messagefoundry.auth.ldap import AdPrincipal
-from messagefoundry.auth.notifications import MFA_DISABLED, MFA_ENABLED, SecurityEvent
+from messagefoundry.auth.notifications import (
+    MFA_DISABLED,
+    MFA_ENABLED,
+    RECOVERY_CODE_USED,
+    SecurityEvent,
+)
 from messagefoundry.auth.service import AuthService
 from messagefoundry.config.settings import AuthSettings
 from messagefoundry.store.store import MessageStore
@@ -268,7 +274,18 @@ async def test_disable_and_admin_reset_clear_mfa(monkeypatch: pytest.MonkeyPatch
         await store.close()
 
 
-async def test_ad_login_is_mfa_satisfied_by_delegation() -> None:
+async def test_a_directory_account_enrolls_and_satisfies_an_engine_factor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """RED when: ``_mfa_required_for`` re-adds a provider exemption, or an enrollment ceremony
+    re-adds a non-local refusal.
+
+    This used to be ``test_ad_login_is_mfa_satisfied_by_delegation`` and asserted the reverse
+    (BACKLOG #1144): a directory sign-in cleared every engine MFA gate on an assertion the engine
+    never received. The two halves are one change — the exemption can only go once the account has a
+    factor it can enrol — so this walks the whole path: mint, find the session unsatisfied, enrol,
+    verify, find it satisfied.
+    """
     store = await _store()
     try:
         principal = AdPrincipal(
@@ -287,7 +304,7 @@ async def test_ad_login_is_mfa_satisfied_by_delegation() -> None:
                 return principal if username == "jdoe" else None
 
         settings = AuthSettings(
-            require_mfa=True,  # even with MFA required + an admin role, AD MFA is delegated
+            require_mfa=True,  # MFA required + an admin role: the directory earns no exemption
             ad_enabled=True,
             ad_server="ldaps://x",
             ad_user_search_base="DC=x",
@@ -298,13 +315,34 @@ async def test_ad_login_is_mfa_satisfied_by_delegation() -> None:
         await service.initialize()
         await service.set_ad_group_map([("CN=MF-Admins,DC=x", "administrator")], actor="admin")
 
-        # The subject is DELEGATED MFA, not the login mechanism. The simple-bind pathway is retired
-        # (BACKLOG #1137), so this mints the session through _complete_ad_login -- the shared tail
-        # where mfa_verified is stamped, reached identically by Kerberos and OIDC.
-        out = await service._complete_ad_login(principal, None, mfa_verified=True)
-        assert out.ok and out.token is not None
-        assert out.mfa_required is False  # delegated to the directory, never an engine TOTP
+        # The subject is the engine factor on a DIRECTORY account, not the login mechanism. The
+        # simple-bind pathway is retired (BACKLOG #1137), so this mints through _complete_ad_login --
+        # the shared tail where mfa_verified is stamped, reached identically by Kerberos and OIDC.
+        # False is what the Kerberos leg passes: the ticket asserts nothing the engine can read.
+        out = await service._complete_ad_login(principal, None, mfa_verified=False)
+        assert out.ok and out.token is not None and out.identity is not None
+        assert await service.mfa_satisfied(out.token) is False
+
+        # The ceremony accepts the directory account -- the half that makes the mint above safe.
+        t0 = 1_700_000_000.0
+        pin_totp_clock(monkeypatch, t0)
+        enroll = await service.begin_mfa_enrollment(out.identity)
+        codes = await service.confirm_mfa_enrollment(
+            out.identity, totp.totp(enroll.secret, now=t0), token=out.token
+        )
+        assert codes  # recovery codes are minted for a directory account like any other
         assert await service.mfa_satisfied(out.token) is True
+
+        # A NEW directory session is still unsatisfied: the factor is now enrolled, so it is required
+        # under either require_mfa_scope value, and only proving it lifts the gate. The later code
+        # must live in a HIGHER step -- enrollment consumed t0's (BACKLOG #1021).
+        second = await service._complete_ad_login(principal, None, mfa_verified=False)
+        assert second.ok and second.token is not None
+        assert await service.mfa_satisfied(second.token) is False
+        t1 = t0 + totp.DEFAULT_PERIOD
+        pin_totp_clock(monkeypatch, t1)
+        assert await service.verify_mfa(second.token, totp.totp(enroll.secret, now=t1)) is True
+        assert await service.mfa_satisfied(second.token) is True
     finally:
         await store.close()
 
@@ -329,6 +367,149 @@ async def test_recovery_code_consume_is_atomic_under_concurrency() -> None:
         results = await asyncio.gather(*(service.verify_mfa(t, codes[0]) for t in tokens))
         assert sum(1 for r in results if r) == 1  # exactly one caller wins the single-use code
         assert (await service.mfa_status(identity)).recovery_codes_remaining == 2  # consumed once
+    finally:
+        await store.close()
+
+
+# --- BACKLOG #1139 / ASVS 6.3.7: spending a recovery code -----------------------
+#
+# Consuming a single-use recovery code permanently DELETES a stored credential. It used to emit only
+# the generic ``auth.mfa_verified`` row the caller writes, which carries no detail -- leaving the burn
+# byte-indistinguishable from an ordinary TOTP verify, on the event that most often means the holder
+# lost their authenticator or somebody else has their codes.
+
+
+async def test_spending_a_recovery_code_is_audited_distinguishably_and_notified() -> None:
+    store = await _store()
+    try:
+        notifier = _FakeNotifier()
+        service = AuthService(
+            store, AuthSettings(mfa_recovery_code_count=2), security_notifier=notifier
+        )
+        identity, token, password = await _bootstrap_login(service)
+        await store.update_user_profile(
+            identity.user_id, display_name=None, email="admin@example.org"
+        )
+        # THE TWO ADDRESSES MUST DIFFER OR THIS TEST CANNOT SEE THE DEFECT IT EXISTS FOR. ADR 0182
+        # splits the directory mirror from the engine-owned notification target; with both set to
+        # one string, a spent-code notice sent to `user.email` and one sent to `user.notify_email`
+        # are indistinguishable, and the assertion below passes either way.
+        await store.set_user_notify_email(identity.user_id, email="admin-notify@example.org")
+        enroll = await service.begin_mfa_enrollment(identity)
+        codes = await service.confirm_mfa_enrollment(
+            identity, fresh_totp(enroll.secret), token=token
+        )
+        assert codes is not None and len(codes) == 2
+
+        out = await service.login("admin", password)
+        assert out.token is not None
+        assert await service.verify_mfa(out.token, codes[0], client="10.0.0.7") is True
+
+        spent = [e for e in notifier.events if e.event_type == RECOVERY_CODE_USED]
+        assert len(spent) == 1
+        ev = spent[0]
+        assert ev.username == "admin"
+        assert ev.email == "admin-notify@example.org", (
+            "a spent-recovery-code notice must go to the ENGINE-OWNED address, not the "
+            "directory mirror -- see ADR 0182 / BACKLOG #1139"
+        )
+        assert ev.client_ip == "10.0.0.7"
+        assert ev.detail["remaining"] == 1
+
+        rows = [
+            r
+            for r in await store.list_audit(limit=50)
+            if r["action"] == "auth.mfa_recovery_code_used"
+        ]
+        assert len(rows) == 1
+        assert rows[0]["actor"] == "admin"
+        assert rows[0]["client"] == "10.0.0.7"
+        assert '"remaining": 1' in rows[0]["detail"]
+        # The code itself and its hash never reach the audit row or the notice.
+        assert codes[0] not in rows[0]["detail"]
+
+        # The mailbox is the arm that can be absent; the pull feed is the arm that cannot. It selects
+        # ``auth.%`` rows whose ACTOR is the user, so an action named or attributed any other way
+        # would be invisible to exactly the accounts the address gate already excludes.
+        feed = await service.security_events_for("admin")
+        assert [e for e in feed if e["action"] == "auth.mfa_recovery_code_used"]
+    finally:
+        await store.close()
+
+
+async def test_an_ordinary_totp_verify_spends_no_recovery_code_and_announces_nothing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The control the test above needs: without it, a records-on-every-verify implementation would
+    # pass and the audit log would still not tell the two mechanisms apart.
+    store = await _store()
+    try:
+        notifier = _FakeNotifier()
+        service = AuthService(
+            store, AuthSettings(mfa_recovery_code_count=2), security_notifier=notifier
+        )
+        identity, token, password = await _bootstrap_login(service)
+        enroll = await service.begin_mfa_enrollment(identity)
+        # Enrollment consumes its activating step (BACKLOG #1021), so the login verify has to sit in
+        # a strictly later one.
+        t0 = 1_700_000_000.0
+        pin_totp_clock(monkeypatch, t0)
+        assert (
+            await service.confirm_mfa_enrollment(
+                identity, totp.totp(enroll.secret, now=t0), token=token
+            )
+            is not None
+        )
+
+        out = await service.login("admin", password)
+        assert out.token is not None
+        t1 = t0 + totp.DEFAULT_PERIOD
+        pin_totp_clock(monkeypatch, t1)
+        assert await service.verify_mfa(out.token, totp.totp(enroll.secret, now=t1)) is True
+
+        assert [e for e in notifier.events if e.event_type == RECOVERY_CODE_USED] == []
+        assert [
+            r
+            for r in await store.list_audit(limit=50)
+            if r["action"] == "auth.mfa_recovery_code_used"
+        ] == []
+    finally:
+        await store.close()
+
+
+async def test_the_losing_racer_reports_no_second_consumption() -> None:
+    # One code, five concurrent verifies, one winner. Exactly one set of records must exist -- the
+    # obvious implementation (emit beside the store call, ignoring its return) writes five.
+    store = await _store()
+    try:
+        notifier = _FakeNotifier()
+        service = AuthService(
+            store, AuthSettings(mfa_recovery_code_count=3), security_notifier=notifier
+        )
+        identity, token, password = await _bootstrap_login(service)
+        enroll = await service.begin_mfa_enrollment(identity)
+        codes = await service.confirm_mfa_enrollment(
+            identity, fresh_totp(enroll.secret), token=token
+        )
+        assert codes is not None
+
+        outs = [await service.login("admin", password) for _ in range(5)]
+        tokens = [o.token for o in outs]
+        assert all(tokens)
+        results = await asyncio.gather(*(service.verify_mfa(t, codes[0]) for t in tokens))
+        assert sum(1 for r in results if r) == 1
+
+        assert len([e for e in notifier.events if e.event_type == RECOVERY_CODE_USED]) == 1
+        assert (
+            len(
+                [
+                    r
+                    for r in await store.list_audit(limit=50)
+                    if r["action"] == "auth.mfa_recovery_code_used"
+                ]
+            )
+            == 1
+        )
     finally:
         await store.close()
 

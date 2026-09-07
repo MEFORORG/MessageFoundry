@@ -394,10 +394,11 @@ icacls "C:\ProgramData\MessageFoundry\logs" /inheritance:r `
 
 This service is **headless**. Operators watch and run it from the **browser web console** served
 same-origin at `/ui` (not part of the service runtime — a separate, version-matched wheel the engine
-mounts in-process). The wheel is **not published to an index yet**, so install it by path:
+mounts in-process). It publishes as its **own** distribution, so install it into the engine venv:
 
 ```powershell
-pip install -e packaging/messagefoundry-webconsole   # into the engine venv
+pip install messagefoundry-webconsole                # into the engine venv
+pip install -e packaging/messagefoundry-webconsole   # or, from a source checkout
 ```
 
 No switch is needed: the console is **on by default** for a loopback bind

@@ -473,8 +473,18 @@ def main(argv: list[str] | None = None) -> int:
 
     support_bundle = sub.add_parser(
         "support-bundle",
-        help="write a SECRET-FREE / PHI-free support zip (engine version + config summary + a "
-        "/status snapshot + a REDACTED app-log tail) to hand to support (#49)",
+        # The old wording read "a SECRET-FREE / PHI-free support zip". That is true of the config
+        # summary and the status snapshot and NOT of the log tail, whose redaction is best-effort: a
+        # single-token identifier survives it (messagefoundry/redaction.py states that residual), and an
+        # operator username is exactly that shape while this engine's own settings classifier calls a
+        # username a credential. A blanket claim resting on a member that does not meet it is the
+        # false-premise shape CLAUDE.md section 11 forbids, so the claim was repaired rather than the
+        # control -- see BACKLOG #1475 and the exclusion table in
+        # tests/test_log_redaction_secret_domain.py for why the username class stays out.
+        help="write a support zip to hand to support (#49): a secret-free config summary "
+        "(counts/names only) + a PHI-free /status snapshot + a REDACTED app-log tail. The tail's "
+        "redaction is BEST-EFFORT: a single-token identifier can survive it, an operator username "
+        "included",
     )
     support_bundle.add_argument(
         "--out", required=True, help="path to write the support-bundle .zip"
@@ -1058,6 +1068,196 @@ def _emit_anchor_diagnostics(
 _DEFAULT_SERVICE_TOML = "messagefoundry.toml"
 
 
+# --- Web-console load-path provenance (ASVS 15.2.4, BACKLOG #1193) --------------------------------
+#
+# The engine mounts the web console IN-PROCESS, so whatever occupies the import name below executes
+# with the engine's own privileges. `serve` used to gate that on `find_spec(...) is not None` --
+# PRESENCE, not provenance -- which answers "can this name be imported?" and not "is this our code?".
+# The check here answers the second question BEFORE the import, which is the only point at which it
+# can still be answered: a wheel's payload runs at import time, so a pre-import refusal intercepts it.
+#
+# HONEST SCOPE, three limits, none of them repairable from here:
+#   1. It covers the DOCUMENTED deployment path (`messagefoundry serve` / the NSSM service, which
+#      runs the same entrypoint). An embedder calling `create_app(serve_ui=True)` in its own process
+#      bypasses this module entirely and gets the guarded import in api/app.py, unchecked.
+#   2. It cannot help against a squatted SDIST. An sdist executes its build backend during
+#      `pip install`, before any engine process exists, so no engine-side check is reachable. The
+#      shape it does reach is the WHEEL, whose payload executes at import.
+#   3. It verifies that the module about to execute belongs to the distribution we expect. It is not
+#      a signature check and does not verify what that distribution CONTAINS.
+
+
+#: The top-level import name the engine mounts, and the distribution expected to own it.
+WEBCONSOLE_IMPORT_NAME = "messagefoundry_webconsole"
+WEBCONSOLE_DISTRIBUTION = "messagefoundry-webconsole"
+
+#: Named opt-out, in the `MEFOR_*` environment convention the rest of the CLI uses. Set it to `1` to
+#: downgrade the refusal to a warning -- for a packaging layout this check cannot recognise (a vendored
+#: install, a distro-built package, a zipapp). It is deliberately named and deliberately not a config
+#: key: an operator who takes it must be able to see they took it, in the process environment.
+WEBCONSOLE_PROVENANCE_OPT_OUT = "MEFOR_ALLOW_UNVERIFIED_WEBCONSOLE"
+
+
+def _normalized_distribution(name: str) -> str:
+    """PEP 503 distribution-name normalization (``MessageFoundry_WebConsole`` -> the canonical form).
+
+    Character-identical to ``checks._normalize_dist``, and deliberately not imported from it: that
+    module is the ``messagefoundry check`` gate, and pulling it in would put the whole gate on the
+    serve startup path for a one-line rule. Two copies of one rule is the cost; both are named here
+    so a reader knows the other exists.
+    """
+    import re
+
+    return re.sub(r"[-_.]+", "-", name).strip().lower()
+
+
+def _is_console_source_checkout(root: Path) -> bool:
+    """Whether ``root`` is a checkout of THIS repository that builds the console.
+
+    A source checkout is the one case where the console's provenance is *stronger* than an index
+    install rather than weaker: nothing resolved a name against a registry at all, the code sits in
+    the same tree as the engine code that is running, and it is the install form the docs prescribe
+    for a checkout (``pip install -e packaging/messagefoundry-webconsole``).
+
+    Both markers are required, so a bare directory dropped onto ``sys.path`` cannot pass as a
+    checkout. An attacker who can also write ``packaging/<dist>/pyproject.toml`` beside the engine's
+    own package directory already has write access to the installed engine and has won long before
+    this check runs -- this arm adds no surface that was not already conceded.
+    """
+    try:
+        return (root / "packaging" / WEBCONSOLE_DISTRIBUTION / "pyproject.toml").is_file() and (
+            root / WEBCONSOLE_IMPORT_NAME / "__init__.py"
+        ).is_file()
+    except OSError:
+        return False
+
+
+def _editable_source_roots(direct_url_json: str | None) -> list[Path]:
+    """Candidate checkout roots recorded by a PEP 610 ``direct_url.json``, for an EDITABLE install.
+
+    An editable install's own metadata records the local directory it was installed from, which is a
+    provenance statement made by the installer rather than one inferred here. The recorded URL points
+    at ``<checkout>/packaging/messagefoundry-webconsole``; the import package is two levels up, which
+    is this repository's force-include layout (see that package's ``pyproject.toml``). Anything that
+    is not a local editable directory yields no candidate.
+    """
+    if not direct_url_json:
+        return []
+    try:
+        data = json.loads(direct_url_json)
+    except (json.JSONDecodeError, TypeError):
+        return []
+    if not isinstance(data, dict):
+        return []
+    dir_info = data.get("dir_info")
+    if not isinstance(dir_info, dict) or not dir_info.get("editable"):
+        return []
+    url = data.get("url")
+    if not isinstance(url, str) or not url.startswith("file://"):
+        return []
+    from urllib.parse import urlsplit
+    from urllib.request import url2pathname
+
+    try:
+        located = Path(url2pathname(urlsplit(url).path)).resolve()
+    except (OSError, ValueError):
+        return []
+    parents = located.parents
+    return [parents[1]] if len(parents) >= 2 else []
+
+
+def _webconsole_provenance_problem(
+    *,
+    origin: Path | None,
+    providers: list[str],
+    installed_roots: list[Path],
+    checkout_roots: list[Path],
+) -> str | None:
+    """Describe why the console load path is unverifiable, or ``None`` when it verifies.
+
+    Pure: every measurement is passed in, so the negative controls in
+    ``tests/test_webconsole_provenance.py`` can drive each branch without an install.
+    """
+    expected = _normalized_distribution(WEBCONSOLE_DISTRIBUTION)
+    if origin is None:
+        return (
+            f"the import name {WEBCONSOLE_IMPORT_NAME!r} resolves to a namespace package with no "
+            f"module file of its own, so nothing identifies the code that would be imported"
+        )
+    claimed = {_normalized_distribution(name) for name in providers}
+    foreign = sorted(claimed - {expected})
+    if foreign:
+        return (
+            f"the import name {WEBCONSOLE_IMPORT_NAME!r} is provided by installed distribution "
+            f"{foreign} -- expected {expected!r}, and only {expected!r}"
+        )
+    for root in checkout_roots:
+        if _is_under(str(origin), root / WEBCONSOLE_IMPORT_NAME):
+            return None
+    if expected in claimed:
+        for root in installed_roots:
+            if _is_under(str(origin), root):
+                return None
+    return (
+        f"the import name {WEBCONSOLE_IMPORT_NAME!r} resolves to {str(origin)!r}, which belongs "
+        f"neither to the installed {expected!r} distribution nor to a source checkout of this "
+        f"repository; installed distributions claiming that import name: "
+        f"{sorted(claimed) or ['(none)']}"
+    )
+
+
+def _measure_webconsole_provenance() -> str | None:
+    """Collect the load-path facts and classify them. ``None`` means verified, or not installed.
+
+    ABSENCE is not a provenance failure: a missing console is the caller's own soft-degrade/refuse
+    decision, made just below this call, and reporting it twice in different words would be worse
+    than reporting it once.
+    """
+    import contextlib
+    import importlib.metadata
+    import importlib.util
+
+    try:
+        spec = importlib.util.find_spec(WEBCONSOLE_IMPORT_NAME)
+    except (ImportError, ValueError):
+        return None
+    if spec is None:
+        return None
+
+    origin: Path | None = None
+    if spec.origin:
+        try:
+            origin = Path(spec.origin).resolve()
+        except (OSError, ValueError):
+            origin = Path(spec.origin)
+
+    providers = list(importlib.metadata.packages_distributions().get(WEBCONSOLE_IMPORT_NAME, []))
+    installed_roots: list[Path] = []
+    candidate_roots: list[Path] = [Path(__file__).resolve().parent.parent]
+    try:
+        dist = importlib.metadata.distribution(WEBCONSOLE_DISTRIBUTION)
+    except importlib.metadata.PackageNotFoundError:
+        pass
+    else:
+        # A metadata read that fails leaves the corresponding arm with NO candidate, so the classifier
+        # falls through to a refusal. Unreadable metadata is not a reason to accept the import.
+        if any((f.parts or ())[:1] == (WEBCONSOLE_IMPORT_NAME,) for f in dist.files or ()):
+            with contextlib.suppress(OSError, ValueError):
+                installed_roots.append(
+                    Path(str(dist.locate_file(WEBCONSOLE_IMPORT_NAME))).resolve()
+                )
+        with contextlib.suppress(OSError, ValueError):
+            candidate_roots.extend(_editable_source_roots(dist.read_text("direct_url.json")))
+
+    checkout_roots = [root for root in candidate_roots if _is_console_source_checkout(root)]
+    return _webconsole_provenance_problem(
+        origin=origin,
+        providers=providers,
+        installed_roots=installed_roots,
+        checkout_roots=checkout_roots,
+    )
+
+
 def _serve(args: argparse.Namespace) -> int:
     import uvicorn
     from pydantic import ValidationError
@@ -1080,6 +1280,7 @@ def _serve(args: argparse.Namespace) -> int:
     from messagefoundry.config.tls_policy import (
         HopDisposition,
         in_process_tls_revocation_refused,
+        proxy_mtls_declared_but_unverified,
         tls_revocation_attested,
     )
     from messagefoundry.crashdump import suppress_crash_dumps
@@ -1804,15 +2005,36 @@ def _serve(args: argparse.Namespace) -> int:
                 f"{loopback_note}",
                 file=sys.stderr,
             )
+        # --- BACKLOG #1181 (ASVS 12.3.5): the ONE Posture-B attestation the engine can check --------
+        # The rule, why it warns instead of refusing, and why the sibling values get no arm all live on
+        # the predicate, beside in_process_tls_revocation_refused -- the other pure serve-gate predicate
+        # on the same subject. It WARNS and never refuses: a sidecar in front of the engine can terminate
+        # the proxy's mTLS legitimately. This is a DIAGNOSTIC, not enforcement.
+        if proxy_mtls_declared_but_unverified(
+            declared=settings.api.proxy_intra_service_auth,
+            client_ca_configured=bool(settings.api.tls_client_ca_file),
+            is_phi=data_class is DataClass.PHI,
+        ):
+            print(
+                "warning: [api].proxy_intra_service_auth is declared 'mtls' but this engine verifies "
+                "no client certificate — [api].tls_client_ca_file is unset, so nothing here checks the "
+                "proxy's identity. If the proxy terminates its mTLS at a sidecar in front of the "
+                "engine, this is expected; otherwise set [api].tls_cert_file + [api].tls_client_ca_file "
+                "so the engine itself requires and verifies the proxy's certificate. The declaration is "
+                "an attestation either way — the engine enforces nothing on this hop.",
+                file=sys.stderr,
+            )
 
     # The browser ops console ([api].serve_ui, ADR 0065) is a SEPARATE optional wheel
     # (messagefoundry-webconsole) mounted same-origin in-process. Refuse serve_ui when it is absent with
     # a clean, actionable message BEFORE the exposure gates below (mirrors the sqlserver find_spec
     # precedent) — the guarded mount_ui import in create_app would otherwise RuntimeError deeper in.
+    # find_spec answers PRESENCE only; the else-branch below asks the provenance question it cannot
+    # (ASVS 15.2.4, BACKLOG #1193).
     if settings.api.serve_ui:
         import importlib.util
 
-        if importlib.util.find_spec("messagefoundry_webconsole") is None:
+        if importlib.util.find_spec(WEBCONSOLE_IMPORT_NAME) is None:
             if settings.api.serve_ui_explicit:
                 # (b) [security].serve_web_console was EXPLICITLY set true but the optional wheel is
                 # absent — keep the HARD refuse (ADR 0143 soft-degrade contract): the operator asked
@@ -1836,6 +2058,43 @@ def _serve(args: argparse.Namespace) -> int:
                 file=sys.stderr,
             )
             settings.api.serve_ui = False
+        else:
+            # ASVS 15.2.4 (BACKLOG #1193). The name RESOLVES; ask whose code it is before importing it.
+            # Sited here, in the same branch as the presence check and BEFORE create_managed_app runs
+            # the guarded `from messagefoundry_webconsole import ...` — a wheel's payload executes at
+            # import, so this is the last point at which the question can still be asked.
+            provenance = _measure_webconsole_provenance()
+            if provenance is not None:
+                import os
+
+                if os.environ.get(WEBCONSOLE_PROVENANCE_OPT_OUT, "").strip().lower() in {
+                    "1",
+                    "true",
+                    "yes",
+                    "on",
+                }:
+                    print(
+                        f"warning: the web console's provenance is UNVERIFIED and "
+                        f"{WEBCONSOLE_PROVENANCE_OPT_OUT} is set, so it will be imported anyway: "
+                        f"{provenance}",
+                        file=sys.stderr,
+                    )
+                else:
+                    # FAIL CLOSED. Not a soft-degrade to JSON-only: the two cases differ in kind. A
+                    # missing package is a packaging choice; an unidentifiable one occupying the import
+                    # name the engine executes in-process is a supply-chain answer the operator has to
+                    # see, and silently serving on would bury it.
+                    print(
+                        f"error: refusing to mount the web console — {provenance}. The engine imports "
+                        f"that package into its own process, so it verifies the code's origin before "
+                        f"importing it. Install the console from its own distribution "
+                        f"('pip install messagefoundry-webconsole'), or set "
+                        f"[security].serve_web_console=false to run JSON-only. To proceed anyway on a "
+                        f"packaging layout this check does not recognise, set "
+                        f"{WEBCONSOLE_PROVENANCE_OPT_OUT}=1.",
+                        file=sys.stderr,
+                    )
+                    return 2
 
     # ADR 0143: the console defaults ON for LOCAL loopback binds — the local-operator convenience. When
     # the instance is EXPOSED off-box it stays OPT-IN: an off-box browser console is a stricter surface
@@ -1960,13 +2219,55 @@ def _serve(args: argparse.Namespace) -> int:
             and not settings.auth.admin_new_ip_step_up
             and data_class is DataClass.PHI
         ):
-            # Advisory only — the default deliberately stays False (a flip would churn NAT'd
-            # hospital networks; flag_new_client_ip stays advisory-only, preserving the ASVS
-            # 8.1.3/8.1.4/8.2.4 N/A keystone). Mirrors the require_mfa advisory pattern.
+            # Advisory only — the default deliberately stays False, because a flip would churn
+            # NAT'd hospital networks and, on the shipped loopback bind, would change nothing at
+            # all: _same_host folds 127.0.0.1 and ::1 into one host, so the flipped control still
+            # returns False on every request a stock install sees.
+            #
+            # BACKLOG #1153: this comment used to end "preserving the ASVS 8.1.3/8.1.4/8.2.4 N/A
+            # keystone", which asserted a grade the record does not carry — 8.2.4 is graded
+            # PARTIAL, not not-applicable. A source comment claiming a cell is N/A is a false
+            # premise sitting in a distributed artifact, where a later assessor reads it as
+            # authority for a decision nobody made. The reasons above are the real ones and they
+            # stand on their own; a grade is the scorecard's to state, not this file's.
+            # Mirrors the require_mfa advisory pattern.
             print(
                 "warning: the browser console is exposed on a PHI instance with "
                 "[auth].admin_new_ip_step_up off — enabling it forces a step-up when an admin "
                 "session appears from a new client address (recommended at exposure).",
+                file=sys.stderr,
+            )
+
+    # BACKLOG #1118: REPORT THE BROWSER-HARDENING OPT-OUT AT START. The #192 hardening defaults ON and
+    # the env below reverts it, and until this arm the reversion was reported NOWHERE — the predicate
+    # was read only from `_auth.py` and `_security.py`, both per-request, so an operator who set it (or
+    # inherited it from a service environment) got a quietly weaker console with no signal at all.
+    #
+    # WHY IT MATTERS MORE SINCE ADR 0172, not less: the engine now always serves TLS, so `effective_https`
+    # holds on the shipped default and both cookies resolve to their `__Host-` twins. This env is
+    # therefore the ONLY remaining way a default deployment loses the browser-enforced host binding.
+    # Before 0172 a cleartext bind lost it too, which made this one signal among several; now it is the
+    # signal.
+    #
+    # A WARNING IS NOT A CONTROL, and this arm is deliberately not offered as one (owner ruling
+    # 2026-08-17: a warning earns nothing by itself). It reports an operator's explicit choice; it does
+    # not gate, refuse, or re-enable anything. Imported from the console package root rather than its
+    # private `_auth` module, and reached only when serve_ui survived the find_spec gate above, so the
+    # wheel is present by construction.
+    if settings.api.serve_ui:
+        from messagefoundry_webconsole import (
+            BROWSER_HARDENING_OPT_OUT_ENV,
+            browser_hardening_enabled,
+        )
+
+        if not browser_hardening_enabled():
+            print(
+                f"warning: {BROWSER_HARDENING_OPT_OUT_ENV} is set — the /ui browser hardening is OFF "
+                "for this run. The session and OIDC flow cookies revert to their unprefixed names "
+                "(mf_session / mf_oidc_flow), losing the browser-enforced '__Host-' host binding, and "
+                "the per-response nonce CSP, COOP and CSP reporting are not emitted. Transport "
+                "security is NOT downgraded: Secure is still set over https. Unset this variable to "
+                "restore the secure-by-default posture.",
                 file=sys.stderr,
             )
 
@@ -2005,9 +2306,9 @@ def _serve(args: argparse.Namespace) -> int:
     # keyless-store / open-egress posture: refuse on a production PHI instance (the prod fail-closed
     # analogue), warn on a non-production PHI instance, stay quiet on a synthetic instance. Reached only
     # for an otherwise-permitted exposed bind (the TLS gate above ran first); the loopback default (now
-    # require_mfa on) never trips it. AD/Kerberos MFA is delegated to the directory, so require_mfa only
-    # gates LOCAL Administrator accounts (the bootstrap admin is one) — it is safe to leave on even on
-    # an AD-only deployment.
+    # require_mfa on) never trips it. Since BACKLOG #1144 require_mfa gates DIRECTORY accounts too — a
+    # ticket asserts no factor strength the engine can read, so the engine asks for its own factor —
+    # which makes leaving it on correct on an AD-only deployment rather than merely harmless there.
     #
     # L5b review fix (ADR 0068 §8), corrected by BACKLOG #326: the gate keys on the same EXPOSURE signal
     # as the ladder above, not the bind host alone — the runbook's RECOMMENDED topology (loopback bind
@@ -2030,8 +2331,8 @@ def _serve(args: argparse.Namespace) -> int:
                     f"instance ({env_name!r}) with [security].require_mfa off; refusing to start — the "
                     "Administrator role would authenticate with a single factor over the network. "
                     "Enable native TOTP MFA with [security].require_mfa=true (WP-14) before exposing the "
-                    "API (safe even on an AD-only deployment — it gates only local Administrator "
-                    "accounts); or set [security].allow_single_factor_admin_when_exposed=true to "
+                    "API (on an AD-only deployment it binds directory principals too, each enrolling "
+                    "an engine factor); or set [security].allow_single_factor_admin_when_exposed=true to "
                     "deliberately permit single-factor admin at exposure (audited).",
                     file=sys.stderr,
                 )
@@ -2234,8 +2535,10 @@ def _serve(args: argparse.Namespace) -> int:
     # --- #186(a) secure-by-default data retention (ASVS 14.2.4) --------------------------------------
     # RetentionSettings defaults every window to 0 (keep-forever) and RetentionRunner then purges
     # NOTHING, so a PHI instance accumulates PHI bodies indefinitely. Both PHI-body windows must be
-    # bounded: messages_days (inbound bodies) AND dead_letter_days (dead-lettered outbound bodies stay
-    # replayable, i.e. full PHI, until their own window purges them). Mirror the open-egress / MFA-at-
+    # bounded: messages_days (inbound bodies) AND dead_letter_days (a dead-lettered row at ANY stage
+    # stays replayable, i.e. full PHI, until its own window purges it — #1188 widened that purge past
+    # the outbound stage, so this window now also bounds a dead ingress/routed row, which carries the
+    # whole raw body). Mirror the open-egress / MFA-at-
     # exposure posture: a PRODUCTION PHI instance with EITHER window unbounded REFUSES to start; a
     # non-production PHI instance (staging / declared-PHI loopback) AUTO-BOUNDS each UNSET window to 30
     # days (WP243/#243, secure-by-default) and only WARNS on a window explicitly left unbounded; a
@@ -4209,6 +4512,7 @@ def _rotate_key(args: argparse.Namespace) -> int:
     from messagefoundry.store.base import open_store, resolve_active_key
     from messagefoundry.store.crypto import CipherError
     from messagefoundry.store.keyprovider import KeyProviderError
+    from messagefoundry.uploads import ResealResult, UploadStore
 
     cli: dict[str, dict[str, object]] = {}
     if args.db is not None:
@@ -4240,7 +4544,7 @@ def _rotate_key(args: argparse.Namespace) -> int:
         )
         return 2
 
-    async def run() -> int:
+    async def run() -> tuple[int, ResealResult]:
         import datetime
 
         from messagefoundry.store.store import SecretRotationMetaStore
@@ -4248,6 +4552,21 @@ def _rotate_key(args: argparse.Namespace) -> int:
         store = await open_store(settings.store)
         try:
             count = await store.reencrypt_to_active()
+            # BACKLOG #1169: the uploaded-file store is the OTHER surface this cipher covers, and it
+            # had no rotation of any kind — a rotation re-sealed every database cell and left every
+            # uploaded file under the retired key, so the operator's next step (dropping that key)
+            # silently destroyed them. Re-seal it in the SAME command, on the store's own live cipher
+            # instance so the AES-GCM invocation bound (ASVS 11.3.4) charges to the new key exactly
+            # as the store's own pass does. A second cipher over the same DEK would charge nothing.
+            uploads = (
+                await UploadStore(
+                    settings.store.uploads_dir,
+                    store.cipher(),
+                    max_bytes=settings.store.max_upload_bytes,
+                ).reseal_to_active()
+                if settings.store.uploads_dir
+                else ResealResult()
+            )
             # ASVS 13.3.4: stamp the DEK rotation so the watcher's clock resets automatically (rotation
             # auto-detected). The store is open under the NEW active key, so its key-id is the new
             # fingerprint; preserve the tracked-since floor. NON-SECRET (key-id + dates only).
@@ -4263,21 +4582,37 @@ def _rotate_key(args: argparse.Namespace) -> int:
                         tracked_since=prior.tracked_since if prior is not None else today,
                         last_rotated=today,
                     )
-            return count
+            return count, uploads
         finally:
             await store.close()
 
     try:
-        count = asyncio.run(run())
+        count, uploads = asyncio.run(run())
     except CipherError as exc:
-        # A value couldn't be decrypted by any supplied key — the prior key is missing. Nothing was
-        # corrupted (a batch is all-or-nothing); supply the key and re-run.
+        # A value couldn't be decrypted by any supplied key — the prior key is missing. Nothing is
+        # corrupted: every pass is all-or-nothing per batch AND idempotent, so re-running with the
+        # key supplied finishes the job. Note the command now spans TWO surfaces (the store, then
+        # the uploaded-file store), so a failure in the second leaves the FIRST already committed
+        # and the ASVS 13.3.4 rotation stamp unwritten. That is safe precisely because both passes
+        # skip what is already under the active key — it is a resumable rotation, not a rollback.
         print(f"error: rotation aborted — {exc}", file=sys.stderr)
         return 1
     except NotImplementedError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
-    print(f"OK: re-encrypted {count} value(s) under the active key")
+    print(
+        f"OK: re-encrypted {count} value(s) under the active key"
+        f" (+{uploads.resealed} uploaded-file value(s) re-sealed)"
+    )
+    if uploads.skipped:
+        # Say it plainly and on stderr: a skipped file is STILL under the old key, so retiring that
+        # key now destroys it. This is the one outcome where "OK" alone would mislead.
+        print(
+            f"warning: {uploads.skipped} uploaded-file value(s) could not be read and were NOT "
+            "re-sealed — they are still under the prior key. Fix the cause and re-run rotate-key "
+            "BEFORE removing MEFOR_STORE_ENCRYPTION_KEYS_RETIRED.",
+            file=sys.stderr,
+        )
     return 0
 
 
@@ -4850,9 +5185,13 @@ def _verify(args: argparse.Namespace) -> int:
 
 
 def _support_bundle(args: argparse.Namespace) -> int:
-    """Write a secret-free / PHI-free support zip (#49): engine version + a config summary (registry
-    COUNTS/names only — never settings values or secrets) + a ``/status`` snapshot built from the real
-    status models + a REDACTED app-log tail. Offline: touches no network, starts no server. The status
+    """Write a support zip (#49): engine version + a config summary (registry COUNTS/names only — never
+    settings values or secrets) + a ``/status`` snapshot built from the real status models + a REDACTED
+    app-log tail. **The blanket "secret-free / PHI-free" this docstring used to open with covered the
+    first two members and not the tail**, whose redaction is best-effort with a single-token residual
+    that includes an operator username (BACKLOG #1475; the argparse help above carries the reasoning,
+    and ``docs/PHI.md`` stream 14 is the record). Offline: touches no network, starts no server. The
+    status
     snapshot + log tail come from the service settings (the configured store + ``[logging].log_dir``);
     the config summary comes from ``--config``. A missing service config or store is tolerated — the
     bundle is still produced (support is most wanted when something is already broken)."""

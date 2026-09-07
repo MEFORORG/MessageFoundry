@@ -204,6 +204,30 @@ have.
 paraphrase it from memory, from an earlier assessment, or from another agent — and never treat a green
 corpus check as evidence about a claim the corpus cannot represent.
 
+### 2.1b "Approved", in a V11 cryptography verb, means Appendix C status A — not the NIST list
+
+**This is the standing definition. State it here and cite this section; do not restate it.** It is an
+instance of §2.1a: which list "approved" binds to is a claim about chapter prose, so the pinned corpus
+cannot settle it and every corpus check comes back clean.
+
+The V11 chapter says so in its own words, fetched at the `v5.0.0` tag and quoted verbatim:
+
+> "provides more in-depth technical information about the requirements in Appendix C ... includ[ing]
+> algorithms and modes that are considered 'approved' for the purposes of the requirements in this
+> chapter."
+
+**Read the appendix's status column, and read the Restrictions cell beside it.** Status **A** is
+approved; **L** is legacy, restricted by the text in its own row; **D** is disallowed for any
+cryptographic purpose. A row's restriction binds only where the row says so, so an **L** mechanism is
+not automatically out of every use.
+
+**Substituting the NIST list is a live error with a measured cost.** It graded a keyed BLAKE2b
+de-identification seed as unapproved through three successive assessment passes. BLAKE2b is status
+**A** in the appendix's general-use hash table with an empty Restrictions cell. The corroborating
+consequence: the same appendix approves argon2id for password storage, and argon2's core permutation
+**is** BLAKE2b, so a NIST-only reading has the standard mandating a KDF built on a primitive it
+disapproves. The measurement, and the wrong fix it nearly bought, are recorded once at BACKLOG #1171.
+
 ### 2.2 A count movement is not a posture movement — read the counts accordingly
 
 **The single most misreadable thing this method produces is a change in the bucket totals.** Counts move

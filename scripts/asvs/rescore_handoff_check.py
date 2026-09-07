@@ -36,7 +36,47 @@ fingerprint.** That makes the check report the banner as OLDER than it really is
 rather than under-fires. Over-firing is the tolerable direction here -- the item's own text says *"a
 nonzero count still needs the entry read"* -- but a hit is a prompt to read, never a finding on its own.
 
-**IT NAMES NO CELLS.** Output is item numbers and dates. Cell identifiers stay vaulted.
+**A TRUNCATED LEDGER IS NOT AUTOMATICALLY AN UNANSWERABLE RUN, AND TREATING IT AS ONE REFUSED EVERY
+REAL RUN THIS TOOL HAS.** The engine checkout is shallow, its whole visible history begins at a graft,
+and both ledger files exist at that boundary -- so the truncation test fired, the tool exited 3, and
+the date comparison the item calls "the open work" never produced an answer at all. Deepening the clone
+writes to an object store shared by every worktree and is the owner's call, so the tool has to be
+correct on the clone it actually ships into.
+
+***THE TRUNCATION TEST WAS NECESSARY BUT NOT SUFFICIENT, AND THE MISSING HALF IS A DATE.*** A graft
+floors an affected item's last-touch at the boundary, and a floored date is always LATER than or equal
+to the true one. So the floor can only ever suppress a hit whose re-score is AT OR BEFORE that
+boundary; a re-score strictly AFTER it is decided identically on the floored date and on the true one,
+because ``re-score > floored >= true``. The same inequality rules out the other direction: a flag
+raised against a floored date is still a true flag, so truncation cannot manufacture one.
+
+**THE VERDICT IS THEREFORE PER PAIR, NOT PER RUN.** Pairs dated after the boundary are answered
+exactly. Pairs dated at or before it are UNDECIDABLE, and they are named and held out of the all-clear
+rather than folded into it -- the whole run is refused only when nothing is decidable, because an
+all-clear over zero decided pairs is the same reassuring-answer-to-an-unasked-question this file
+already refuses twice.
+
+**THE OTHER HALF OF THE DISTINCTION HOLDS BY CONSTRUCTION AND IS NOW PINNED RATHER THAN ASSUMED.** A
+graft OLDER than the ledger's first revision hides nothing, and ``git log -- <path>`` never reports it,
+because that walk lists only revisions where the path changed. So the oldest listed revision is a graft
+exactly when the path already existed at the boundary. That is why the test below is on the walk's own
+first revision and not on the repository's shallowness.
+
+***AND A DATE MOVE IS NOT A RE-SCORE, WHICH IS THE QUESTION THIS FILE'S OWN TITLE ASKS.***
+``last_verified`` bumps every time a cell is looked at again -- when the grade changes, and
+identically when a re-check CONFIRMS the grade already there. So the date comparison above answers
+*"was this cell revisited after the banner moved"*, which is adjacent to the question asked and not
+the same sentence (``CLAUDE.md`` section 11, SDS-3.8).
+
+**Measured 2026-09-04 against the vault record at engine ``a2eef0f37``: 35 hits over 28 items, of
+which 22 items had NO covering grade change at all after the banner moved.** Four in five hits were
+confirmations, and each one still cost a reader the full two-record read. The screen was not wrong --
+over-firing is its documented safe direction -- but a prompt list that is four-fifths noise is one
+nobody finishes, which is the failure the item was filed about. ``grade_history`` and ``classify``
+below split the list, and the reading order is MOVED first.
+
+**IT NAMES NO CELLS.** Output is item numbers, dates, and a direction. Cell identifiers and grade
+VALUES stay vaulted; "the grade moved down" is the actionable fact and discloses no value.
 
 Usage::
 
@@ -51,6 +91,7 @@ import re
 import subprocess
 import sys
 from dataclasses import dataclass
+from itertools import pairwise
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "docs"))
@@ -58,6 +99,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "docs"))
 from backlog_status_check import (  # type: ignore[import-not-found]  # noqa: E402
     parse_items,
 )
+
+# The AUTHORITATIVE verdict vocabulary, imported rather than retyped. ``scorecard.py`` is this
+# script's own sibling, so it is already importable wherever this file runs.
+from scorecard import VERDICTS  # noqa: E402
 
 #: The ONLY accepted spelling. See the module docstring: a bare ``#N`` is not reliably a backlog number.
 ITEM_REF = re.compile(r"BACKLOG #(\d+)")
@@ -67,14 +112,59 @@ BARE_REF = re.compile(r"(?<!BACKLOG )#(\d+)")
 #: ``[[cell]]`` tables are flat, so a cell's own span runs to the next top-level table header.
 CELL_START = re.compile(r"^\[\[cell\]\]", re.M)
 LAST_VERIFIED = re.compile(r'^\s*last_verified\s*=\s*"([^"]*)"', re.M)
+#: Read to JOIN a cell to its own grade history. Never printed -- cell ids stay vaulted.
+CELL_ID = re.compile(r'^\s*id\s*=\s*"([^"]*)"', re.M)
+VERDICT = re.compile(r'^\s*verdict\s*=\s*"([^"]*)"', re.M)
+#: Strength order, used ONLY to say which DIRECTION a grade moved. The ORDER is this file's own
+#: judgement and is not derivable from :data:`scorecard.Verdict`, which declares the vocabulary
+#: without ranking it -- so the ranking is written here and the VOCABULARY is checked against the
+#: type below rather than retyped a third time.
+GRADE_RANK = {  # nosec B105 - "pass" here is an ASVS grade name, not a credential
+    "unverified": 0,
+    "fail": 1,
+    "needs-review": 2,
+    "partial": 3,
+    "pass": 4,
+}
+#: Outside the ordering on purpose: ``na`` means the requirement does not apply, so a move into or out
+#: of it is a scope change, and ranking it would report that as a strengthening or a weakening.
+UNRANKED = frozenset({"na"})
+
+# A SEVENTH VERDICT MUST NOT LAND HERE SILENTLY, AND THIS EXACT DRIFT HAS ALREADY HAPPENED ONCE.
+# ``scorecard.py`` derives VERDICT_ORDER from the ``Verdict`` type precisely because a hand-written
+# second list enumerated five states against a stated six (BACKLOG #1012). GRADE_RANK is a third such
+# list, and an unranked verdict does not raise in ``classify`` -- it makes the comparison skip, so a
+# genuine downgrade renders as GRADE MOVED instead of GRADE MOVED DOWN, which is the one direction the
+# classifier exists for. Failing at import is the whole point: a checker whose vocabulary has silently
+# gone stale gives a confident wrong answer, which is what every refusal in this file exists to stop.
+if set(GRADE_RANK) | UNRANKED != VERDICTS:
+    raise RuntimeError(
+        "GRADE_RANK has drifted from scorecard.Verdict. Ranked "
+        f"{sorted(set(GRADE_RANK) | UNRANKED)}, but the record defines {sorted(VERDICTS)}. "
+        "Rank the new verdict or add it to UNRANKED -- leaving it out makes a downgrade into or out "
+        "of it render as a neutral move."
+    )
 
 
 @dataclass(frozen=True)
 class Pair:
-    """One (item, re-score date) linkage, read from a single cell's own text."""
+    """One (item, re-score date) linkage, read from a single cell's own text.
+
+    ``cell`` is carried so the grade history below can be looked up per cell, and it is NEVER
+    printed. Cell identifiers stay vaulted (``CLAUDE.md`` section 12); this field exists only to join
+    two in-memory tables.
+    """
 
     item: int
     last_verified: str
+    cell: str = ""
+
+
+#: What ``classify`` returns, in the order a reader should care about them.
+GRADE_UNCHANGED = "GRADE UNCHANGED since before the banner moved"
+GRADE_MOVED = "GRADE MOVED after the banner"
+GRADE_MOVED_DOWN = "GRADE MOVED DOWN after the banner -- a closed banner here may rest on a premise"
+GRADE_UNKNOWN = "grade history unavailable"
 
 
 @dataclass(frozen=True)
@@ -82,6 +172,13 @@ class Flag:
     item: int
     last_verified: str
     banner_touched: str
+    cell: str = ""
+
+
+def _by_item(entry: tuple[Flag, str]) -> int:
+    """Sort key for the printed hit list. A named function rather than a lambda, so mypy --strict
+    checks the tuple shape at the call site instead of inferring it."""
+    return entry[0].item
 
 
 def read_pairs(scorecard_text: str) -> tuple[list[Pair], int]:
@@ -105,10 +202,166 @@ def read_pairs(scorecard_text: str) -> tuple[list[Pair], int]:
         verified = LAST_VERIFIED.search(block)
         if verified is None:
             continue
+        cell = CELL_ID.search(block)
         ambiguous += len(set(BARE_REF.findall(block)))
         for num in sorted({int(n) for n in ITEM_REF.findall(block)}):
-            pairs.append(Pair(item=num, last_verified=verified.group(1)))
+            pairs.append(
+                Pair(
+                    item=num,
+                    last_verified=verified.group(1),
+                    cell=cell.group(1) if cell else "",
+                )
+            )
     return pairs, ambiguous
+
+
+def grade_history(scorecard: Path) -> dict[str, list[tuple[str, str]]] | None:
+    """Per cell, the dates its GRADE actually changed -- or None when that cannot be read.
+
+    ***THIS IS THE HALF THAT SEPARATES A RE-SCORE FROM A RE-VERIFICATION, AND WITHOUT IT THIS TOOL
+    ANSWERS A QUESTION ADJACENT TO THE ONE ITS OWN TITLE ASKS.*** ``last_verified`` moves every time a
+    cell is looked at again. It moves when the grade changes, and it moves identically when a re-check
+    CONFIRMS the grade already there. The date comparison cannot tell those apart, so it fires on both.
+
+    **Measured 2026-09-04 against the vault record at engine ``a2eef0f37``: of 28 flagged items, 22
+    had no covering grade change at all after the banner moved.** So roughly four in five hits were
+    confirmations, and every one of them cost a reader the full two-record read the item demands. The
+    screen was not wrong -- over-firing is its documented safe direction -- but a prompt list that is
+    four-fifths noise is one nobody finishes, which is the failure mode the item was filed about.
+
+    The grade is read from the scorecard's OWN git history, oldest first, recording only the
+    revisions where a cell's verdict differs from the previous one. A cell absent from a revision
+    simply contributes nothing there.
+
+    **RETURNS None RATHER THAN AN EMPTY DICT WHEN THE HISTORY CANNOT BE READ**, because an empty dict
+    would classify every hit as ``GRADE UNCHANGED`` -- the most reassuring possible answer, produced
+    by having failed to look. That is the same shape as the refusals this file already carries twice.
+
+    **IT STORES GRADES BUT PRINTS NONE.** The caller turns this into MOVED / UNCHANGED / MOVED DOWN.
+    Cell ids and grade values stay vaulted; a direction is the actionable fact and discloses no value.
+    """
+    repo = subprocess.run(  # nosec B603 B607 - fixed argv, no shell; read-only
+        ["git", "-C", str(scorecard.parent), "rev-parse", "--show-toplevel"],
+        capture_output=True,
+        text=True,
+        # EXPLICIT, like the two calls below it. This one sets the root the others use, and it was
+        # the one call in this function that first went without -- which is exactly how the cp1252
+        # trap recorded at length further down got in the first time.
+        encoding="utf-8",
+    )
+    if repo.returncode != 0:
+        return None
+    root = Path(repo.stdout.strip())
+    try:
+        relative = scorecard.resolve().relative_to(root.resolve()).as_posix()
+    except ValueError:
+        return None
+    walk = subprocess.run(  # nosec B603 B607 - fixed argv, no shell; read-only git log
+        ["git", "-C", str(root), "log", "--format=%H %cs", "--reverse", "--", relative],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+    )
+    if walk.returncode != 0 or not walk.stdout.strip():
+        return None
+    history: dict[str, list[tuple[str, str]]] = {}
+    for line in walk.stdout.splitlines():
+        sha, _, date = line.partition(" ")
+        blob = subprocess.run(  # nosec B603 B607 - fixed argv, no shell; one blob read
+            # EXPLICIT ENCODING, for the reason the ledger walk below records at length: locale
+            # decoding on this box is cp1252 and silently mangles the file.
+            ["git", "-C", str(root), "show", f"{sha}:{relative}"],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+        if blob.returncode != 0:
+            continue
+        starts = [m.start() for m in CELL_START.finditer(blob.stdout)]
+        if not starts:
+            continue
+        for lo, hi in zip(starts, starts[1:] + [len(blob.stdout)], strict=True):
+            block = blob.stdout[lo:hi]
+            cell, verdict = CELL_ID.search(block), VERDICT.search(block)
+            if cell is None or verdict is None:
+                continue
+            seen = history.setdefault(cell.group(1), [])
+            if not seen or seen[-1][1] != verdict.group(1):
+                seen.append((date.strip(), verdict.group(1)))
+    return history or None
+
+
+def classify(
+    flag: Flag, history: dict[str, list[tuple[str, str]]] | None, boundary: str = ""
+) -> str:
+    """Did this cell's GRADE move after the banner did, or was it merely looked at again?
+
+    A change strictly AFTER ``banner_touched`` is the real handoff signal. A cell whose grade has not
+    moved since before the banner moved was re-verified and confirmed, which is the in-sync state.
+
+    ``na`` sits outside the ordering rather than at one end of it: it means the requirement does not
+    apply, so a move into or out of it is a scope change and not a strengthening or a weakening.
+
+    ***THE FLOORED-DATE REASONING RUNS THE OPPOSITE WAY HERE, AND REUSING IT UNEXAMINED INVERTED THE
+    ANSWER TO THE REASSURING SIDE.*** ``evaluate`` compares ``re-score > banner_touched``, where a
+    floored banner date is safe: it is later than or equal to the truth, so it can only SUPPRESS a
+    hit. This function asks whether any grade change lands after that same date -- and pushing the
+    date later DELETES change points from the window, turning a real MOVED into a confident
+    UNCHANGED. Same date, same inequality, opposite direction, because one asks whether a single
+    point clears the date and the other asks what survives above it.
+
+    So a floored banner date is answered per case rather than as a whole:
+
+    * a change ABOVE the floor is still a true change, since ``change > floored >= true``, and it is
+      reported as MOVED exactly as it would be on the real date;
+    * NO change above the floor decides nothing, because a change could sit between the true touch
+      and the floor where this walk cannot see it. That is UNKNOWN, never UNCHANGED.
+
+    Without ``boundary`` no date is treated as floored, which is right for an untruncated run.
+    """
+    # No history at all and no history FOR THIS CELL are the same answer: nothing was read, so
+    # nothing is claimed.
+    timeline = history.get(flag.cell) if history else None
+    if not timeline:
+        return GRADE_UNKNOWN
+    # A touch date sitting exactly ON the boundary is a floor, not a measurement -- the same test the
+    # printer uses when it refuses to render that date bare.
+    floored = bool(boundary) and flag.banner_touched == boundary
+    if not any(point[0] > flag.banner_touched for point in timeline):
+        # UNCHANGED is a claim about everything above the reference date, so it is only available
+        # when that date was measured. See the docstring: the floor hides the window it would need.
+        return GRADE_UNKNOWN if floored else GRADE_UNCHANGED
+    for earlier, later in pairwise(timeline):
+        if later[0] <= flag.banner_touched:
+            continue
+        before_rank, after_rank = GRADE_RANK.get(earlier[1]), GRADE_RANK.get(later[1])
+        if before_rank is not None and after_rank is not None and after_rank < before_rank:
+            return GRADE_MOVED_DOWN
+    return GRADE_MOVED
+
+
+@dataclass(frozen=True)
+class LedgerWalk:
+    """What ONE ledger path's walk actually saw, including where it began and why it stopped there.
+
+    Round two recorded truncation as a bare path name, which is enough to REFUSE and not enough to
+    decide anything finer. The boundary DATE is the whole discriminator -- it is what separates a pair
+    the floor could suppress from one it provably cannot -- so it is carried here rather than
+    re-derived by a caller that would have to walk the history again to find it.
+    """
+
+    path: str
+    #: Revisions the walk found for this path, before ``--limit`` narrows the window.
+    revisions_found: int
+    #: Revisions actually opened and fingerprinted. Equal to the above unless ``--limit`` was used.
+    revisions_walked: int
+    #: The oldest revision touching this path, and its committer date. Empty when the path has none.
+    oldest_rev: str
+    oldest_date: str
+    #: True when that oldest revision is a graft point git itself recorded, which means the path
+    #: already existed at the boundary and its earlier history is invisible.
+    graft_bounded: bool
 
 
 @dataclass(frozen=True)
@@ -125,8 +378,26 @@ class Walk:
     #: Revisions whose blob ``git show`` could not read. A revision that DELETED the path fails
     #: legitimately, so this is reported rather than refused.
     unreadable_revisions: int
-    #: Ledger paths whose walk began at a shallow graft boundary, so history before it is invisible.
-    truncated: tuple[str, ...]
+    #: Every ledger path walked, in the order given. Reported in full so an empty scan and a clean
+    #: scan cannot render alike.
+    ledgers: tuple[LedgerWalk, ...]
+    #: Every graft point read from ``.git/shallow``, whether or not it bounded any of these walks.
+    grafts_considered: tuple[str, ...]
+
+    @property
+    def truncated(self) -> tuple[LedgerWalk, ...]:
+        """The ledgers whose walk began at a graft, so history before that point is invisible."""
+        return tuple(walked for walked in self.ledgers if walked.graft_bounded)
+
+    @property
+    def boundary(self) -> str:
+        """The LATEST graft boundary date over every truncated ledger, or "" when none is.
+
+        The latest rather than the earliest, because this date is used as a floor that a pair must
+        clear to be decidable, and a pair must clear every floor that could apply to it. An item is
+        walked in both ledgers and the later touch wins, so the safe bound is the later boundary.
+        """
+        return max((walked.oldest_date for walked in self.truncated), default="")
 
 
 def banner_fingerprint(text: str) -> dict[int, str]:
@@ -157,9 +428,12 @@ def banner_last_touched(root: Path, backlog_paths: list[str], limit: int | None)
     """
     touched: dict[int, str] = {}
     unreadable = 0
-    truncated: list[str] = []
+    ledgers: list[LedgerWalk] = []
     # A SHALLOW CLONE IS THE ORDINARY STATE OF THIS REPOSITORY, NOT AN EDGE CASE. Measured
     # 2026-08-29: the primary and every worktree report true, over 856 commits with 3 graft points.
+    # RE-MEASURED 2026-09-03 AND BOTH NUMBERS HAD MOVED: 719 commits and 20 graft points, and the
+    # ONLY parentless commit reachable from HEAD is itself a graft. So the shape of this is not
+    # stable across re-fetches and neither figure should be relied on -- only the per-path test is.
     # So refusing on shallowness ALONE would refuse every real run on this machine -- which is why
     # the discriminator below is per-path rather than per-repository.
     #
@@ -211,11 +485,30 @@ def banner_last_touched(root: Path, backlog_paths: list[str], limit: int | None)
         # and not whether the oldest revision has a parent. Only a commit git itself recorded in
         # ``.git/shallow`` marks history it cannot see; a parentless commit that is not in that list
         # is a real beginning, and the walk that reached it saw everything there is.
-        if grafts and revs and revs[0].partition(" ")[0] in grafts:
-            truncated.append(backlog_path)
+        #
+        # AND THIS IS ALSO WHERE THE OTHER HALF OF THE DISTINCTION IS DECIDED, BY CONSTRUCTION
+        # RATHER THAN BY A SECOND TEST. ``git log -- <path>`` lists only revisions where the path
+        # CHANGED, so a graft that predates the ledger's own first revision is never the oldest line
+        # here -- the oldest line is the commit that created the ledger, which has a visible parent.
+        # The oldest revision is a graft exactly when the path ALREADY EXISTED at the boundary, which
+        # is exactly when earlier banner history is hidden. Recording the boundary DATE rather than
+        # just the fact lets the caller decide which pairs that hidden history could actually move.
+        oldest_rev, _, oldest_date = revs[0].partition(" ") if revs else ("", "", "")
+        graft_bounded = bool(grafts and revs and oldest_rev in grafts)
 
+        found = len(revs)
         if limit is not None:
             revs = revs[-limit:]
+        ledgers.append(
+            LedgerWalk(
+                path=backlog_path,
+                revisions_found=found,
+                revisions_walked=len(revs),
+                oldest_rev=oldest_rev,
+                oldest_date=oldest_date.strip(),
+                graft_bounded=graft_bounded,
+            )
+        )
 
         previous: dict[int, str] = {}
         for line in revs:
@@ -254,7 +547,12 @@ def banner_last_touched(root: Path, backlog_paths: list[str], limit: int | None)
                     if stamp > touched.get(num, ""):
                         touched[num] = stamp
             previous = current
-    return Walk(touched=touched, unreadable_revisions=unreadable, truncated=tuple(truncated))
+    return Walk(
+        touched=touched,
+        unreadable_revisions=unreadable,
+        ledgers=tuple(ledgers),
+        grafts_considered=tuple(sorted(grafts)),
+    )
 
 
 def evaluate(pairs: list[Pair], touched: dict[int, str]) -> tuple[list[Flag], list[int]]:
@@ -271,8 +569,50 @@ def evaluate(pairs: list[Pair], touched: dict[int, str]) -> tuple[list[Flag], li
             unknown.append(pair.item)
             continue
         if pair.last_verified and pair.last_verified > when:
-            flags.append(Flag(pair.item, pair.last_verified, when))
+            flags.append(Flag(pair.item, pair.last_verified, when, pair.cell))
     return flags, sorted(set(unknown))
+
+
+def split_by_boundary(
+    pairs: list[Pair], boundary: str, touched: dict[int, str]
+) -> tuple[list[Pair], list[Pair]]:
+    """Split pairs into the ones a graft boundary cannot affect and the ones it can.
+
+    A graft floors an affected item's last-touch date AT the boundary, and the floor is always later
+    than or equal to the truth. So for a pair dated strictly after the boundary,
+    ``re-score > floored >= true`` holds and the verdict is the same on either date -- decidable. A
+    pair dated at or before it could have a true touch on either side of its own date, and no reading
+    of the visible history can say which -- undecidable, and the reason it is named rather than
+    silently answered.
+
+    ***THE SAME INEQUALITY DECIDES A SECOND CLASS, AND READING IT ONLY ONE WAY CALLED MEASURED DATES
+    UNDECIDABLE.*** Hidden revisions all sit at or before the boundary, so an item's true last touch
+    is ``max(visible, something <= boundary)``. When the VISIBLE touch is already strictly after the
+    boundary, that max is the visible date itself -- the walk measured it, the graft cannot raise it,
+    and the pair is decidable whatever its own re-score date is. Only an item whose visible touch is
+    still at or before the boundary is genuinely floored.
+
+    **The measured gain is small and is stated rather than implied**: against the vault record at
+    engine ``a2eef0f37``, this widening decides one further pair at the 2026-09-03 graft boundary and
+    none at the 2026-08-31 one. It is here because calling a measured date undecidable is a wrong
+    answer, not because it moved a count.
+
+    ``touched`` is REQUIRED, not defaulted. There is one production caller and nothing outside this
+    file imports the function, so a compatibility default protects nobody (section 0: with zero
+    deployments the cost of a breaking signature is zero). It would instead leave a silently weaker
+    path where "the caller passed no map" and "these items have no measured touch" collapse into the
+    same expression -- and that path errs toward UNDECIDABLE, which suppresses hits and makes the
+    whole-run refusal more likely. An empty ``boundary`` means no walk began at a graft, so
+    everything is decidable.
+    """
+    if not boundary:
+        return list(pairs), []
+    decidable: list[Pair] = []
+    undecidable: list[Pair] = []
+    for pair in pairs:
+        clears = pair.last_verified > boundary or touched.get(pair.item, "") > boundary
+        (decidable if clears else undecidable).append(pair)
+    return decidable, undecidable
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -332,13 +672,32 @@ def main(argv: list[str] | None = None) -> int:
         sys.stderr.write(f"REFUSING: {exc}\n")
         return 3
     touched = walk.touched
-    if walk.truncated:
+    boundary = walk.boundary
+    decidable, undecidable = split_by_boundary(pairs, boundary, touched)
+    if boundary and not decidable:
+        oldest = min((pair.last_verified for pair in pairs if pair.last_verified), default="")
         sys.stderr.write(
-            "REFUSING: the ledger history is TRUNCATED at a shallow graft boundary for "
-            f"{list(walk.truncated)}, so every banner date floors at that boundary. A floored date "
-            "reads as a LATER touch, which SUPPRESSES real hits rather than inventing them -- the "
-            "one direction this check exists to rule out. Deepen the clone (git fetch --unshallow) "
-            "and re-run.\n"
+            "REFUSING: the ledger history is TRUNCATED at a shallow graft boundary dated "
+            f"{boundary} for {[walked.path for walked in walk.truncated]}, and EVERY pair read is "
+            "dated at or before it, so this run can decide nothing. A floored date reads as a LATER "
+            "touch, which SUPPRESSES real hits rather than inventing them -- the one direction this "
+            "check exists to rule out.\n"
+            "\n"
+            "THE CHEAP REMEDY IS A SEPARATE CLONE, NOT A DEEPER SHARED ONE, and the difference is "
+            "who has to approve it. 'git fetch --unshallow' writes to an object store shared by "
+            "every worktree, which is why deepening this checkout is the owner's call. A throwaway "
+            "clone shares no object store, so that objection does not reach it, and this tool "
+            "already takes the history source as an argument:\n"
+            "\n"
+            "    git clone --single-branch --branch main --no-checkout <remote> <scratch>\n"
+            f"    {Path(sys.argv[0]).name} --scorecard <scorecard> --root <scratch>\n"
+            "\n"
+            "Measured 2026-09-04: 35 MB in 17 seconds, against 3.7 GB for the shared store. "
+            f"The oldest re-score this run must cover is {oldest}, so a clone reaching that date is "
+            "enough; --unshallow is more than the question needs.\n"
+            "\n"
+            "DO NOT pass --filter=blob:none for this. A blobless clone fetches each ledger revision "
+            "on demand, one network round trip per revision, and did not finish in ten minutes.\n"
         )
         return 3
     # THE GUARD THIRTY LINES ABOVE, FOR THE OTHER INPUT, AND THE REASONING TRANSFERS VERBATIM. With
@@ -351,7 +710,7 @@ def main(argv: list[str] | None = None) -> int:
             f"to 'unknown' while the verdict still printed the all-clear. Walked: {ledgers}\n"
         )
         return 3
-    flags, unknown = evaluate(pairs, touched)
+    flags, unknown = evaluate(decidable, touched)
 
     print(f"# rescore-handoff scorecard={args.scorecard} engine={head[:12]}")
     print(
@@ -361,6 +720,45 @@ def main(argv: list[str] | None = None) -> int:
     print(f"items whose banner history was found: {len(touched)}")
     # STATED EVEN WHEN ZERO. An absent line cannot be checked; a printed zero can.
     print(f"revisions the walk could not read: {walk.unreadable_revisions}")
+    # WHAT THE WALK ACTUALLY SCANNED, PER PATH. An empty scan and a clean scan must not render
+    # alike, and this tool has already shipped one failure of exactly that shape: a locale-decoded
+    # blob destroyed every banner glyph, so the walk found no change anywhere and said so in
+    # perfectly plausible output. A revision count is the cheapest thing that would have caught it.
+    print(f"graft points git recorded in .git/shallow: {len(walk.grafts_considered)}")
+    for walked in walk.ledgers:
+        began = (
+            f"oldest {walked.oldest_rev[:12]} ({walked.oldest_date})"
+            if walked.oldest_rev
+            else "none"
+        )
+        where = (
+            "AT A GRAFT, so earlier banner history is hidden"
+            if walked.graft_bounded
+            else "not at a graft, so the walk saw every revision of this path there is"
+        )
+        print(
+            f"walked {walked.path}: {walked.revisions_walked} of {walked.revisions_found} "
+            f"revisions, {began}, {where}"
+        )
+    # WHICH BRANCH OF THE DISTINCTION THIS RUN TOOK, NAMED RATHER THAN INFERRED FROM THE ABSENCE OF
+    # A REFUSAL. The two branches produce different guarantees, and a reader cannot tell them apart
+    # from a verdict line that reads the same either way.
+    if not boundary:
+        print(
+            "truncation branch: NONE -- no ledger walk began at a graft, so every pair is decided "
+            "against a true last-touch date"
+        )
+    else:
+        print(
+            f"truncation branch: BOUNDED at {boundary}. A floored date can only suppress a hit "
+            f"dated at or before it, so {len(decidable)} pairs are decided exactly and "
+            f"{len(undecidable)} are UNDECIDABLE"
+        )
+    if undecidable:
+        print(
+            "items NOT covered by the verdict below (re-scored at or before the graft boundary): "
+            f"{sorted({pair.item for pair in undecidable})}"
+        )
     if unknown:
         print(f"items referenced but absent from every ledger walked: {sorted(unknown)}")
     print()
@@ -375,14 +773,74 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 0
     if not flags:
-        print("no item was re-scored after its banner was last touched")
+        # THE QUALIFIER IS THE POINT. An unqualified all-clear over a run that could not decide some
+        # of its pairs is the same wrong answer the refusals above exist to prevent, arriving one
+        # step later -- so the scope of the clean verdict is stated in the verdict itself, not left
+        # to a reader who is expected to have read the branch line four lines earlier.
+        if undecidable:
+            print(
+                f"no DECIDABLE item was re-scored after its banner was last touched "
+                f"({len(decidable)} of {len(pairs)} pairs). The "
+                f"{len({pair.item for pair in undecidable})} undecidable items above are NOT "
+                "covered by this line."
+            )
+        else:
+            print("no item was re-scored after its banner was last touched")
         return 0
-    print(f"RE-SCORED AFTER THE BANNER WAS LAST TOUCHED: {len(flags)}")
-    for flag in sorted(flags, key=lambda f: f.item):
+    history = grade_history(args.scorecard)
+    # ONE ORDERED LIST, COUNTED AND PRINTED FROM THE SAME STRUCTURE. Keying this on the Flag itself
+    # made the counts silently disagree with the lines below: two flags equal in every field collapse
+    # to one dict entry, so the summary would describe fewer hits than it went on to print.
+    ranked = sorted(((flag, classify(flag, history, boundary)) for flag in flags), key=_by_item)
+    if history is None:
         print(
-            f"  BACKLOG #{flag.item}: re-scored {flag.last_verified}, banner last touched {flag.banner_touched}"
+            "GRADE HISTORY UNAVAILABLE -- the scorecard is not in a readable git checkout, so every "
+            "hit below is a bare date move and cannot be told apart from a re-verification that "
+            "confirmed the grade already there."
+        )
+    else:
+        # THREE BUCKETS, NOT TWO, AND COUNTING THEM AS TWO MADE THIS LINE SAY THE OPPOSITE OF THE
+        # TRUTH. The first cut counted everything that was not UNCHANGED as "moved", so a hit whose
+        # grade history could not be read was reported as a grade that MOVED -- failure-to-look
+        # rendering as the strongest possible signal, in the one summary sentence a reader acts on.
+        # Each bucket is now counted by naming it, so a fourth verdict cannot silently join another.
+        confirmed = sum(1 for _, verdict in ranked if verdict == GRADE_UNCHANGED)
+        unreadable = sum(1 for _, verdict in ranked if verdict == GRADE_UNKNOWN)
+        moved = sum(1 for _, verdict in ranked if verdict in (GRADE_MOVED, GRADE_MOVED_DOWN))
+        print(
+            f"of these, {moved} sit on a cell whose GRADE moved after the banner, {confirmed} on a "
+            f"cell that was only re-verified, and {unreadable} could not be decided. A "
+            "re-verification bumps last_verified without changing anything, so it is the IN-SYNC "
+            "state and not a handoff."
+        )
+        # A COUNT THAT DOES NOT ADD UP TO THE LINES PRINTED BELOW IS THE BUG THIS BLOCK ALREADY HAD
+        # ONCE, so the arithmetic is asserted rather than trusted.
+        assert confirmed + unreadable + moved == len(ranked), "a verdict escaped every bucket"
+    print(f"RE-SCORED AFTER THE BANNER WAS LAST TOUCHED: {len(ranked)}")
+    for flag, verdict in ranked:
+        # A TOUCH DATE SITTING EXACTLY ON THE BOUNDARY IS A FLOOR, NOT A MEASUREMENT, AND PRINTING
+        # IT BARE WOULD HAND A READER A FLIP DATE THAT NEVER HAPPENED. The FLAG is still sound --
+        # the re-score cleared the floor and the floor is later than or equal to the truth -- but
+        # the item's real last touch is somewhere before the boundary and this walk cannot see it.
+        # Equality cannot separate "floored" from "genuinely touched by the graft revision", and it
+        # does not need to: the true date is at or before the boundary in both cases.
+        when = (
+            f"at or before {boundary} (FLOORED at the graft, not measured)"
+            if boundary and flag.banner_touched == boundary
+            else flag.banner_touched
+        )
+        print(
+            f"  BACKLOG #{flag.item}: re-scored {flag.last_verified}, banner last touched {when}"
+            f"  [{verdict}]"
         )
     print()
+    # ONLY WHEN THERE IS SUCH A LINE TO READ. Printed unconditionally, this told a reader to start
+    # with a category the output above did not contain.
+    if any(verdict in (GRADE_MOVED, GRADE_MOVED_DOWN) for _, verdict in ranked):
+        print(
+            "READ THE 'GRADE MOVED' LINES FIRST. A 'GRADE UNCHANGED' line is a cell that was looked"
+        )
+        print("at again and confirmed, which is what an in-sync pair looks like.")
     print(
         "A hit is a PROMPT TO READ THE ENTRY, not a finding. The item's own first run produced two"
     )

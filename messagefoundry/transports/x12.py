@@ -49,6 +49,8 @@ from messagefoundry.transports.mllp import (
     DEFAULT_MAX_CONNECTIONS,
     DEFAULT_RECEIVE_TIMEOUT,
     InsecureHopGuard,
+    _MessagePacer,
+    _pacing_settings,
 )
 
 __all__ = ["X12Source", "X12Destination"]
@@ -471,6 +473,11 @@ class X12Source(SourceConnector):
         self.receive_timeout: float | None = float(rt) if rt else None
         mib = s.get("max_interchange_bytes", DEFAULT_MAX_INTERCHANGE_BYTES)
         self.max_interchange_bytes: int | None = int(mib) if mib else None
+        # Message-rate pacing (BACKLOG #1114), read through the shared helper so this connector
+        # cannot drift from MLLP on what "unset" means. Absent -> OFF, unlike the caps above. One
+        # token per INTERCHANGE, which is what this connector's frame is. The port changed
+        # REACHABILITY, never the default -- a stock X12 inbound still has no rate bound.
+        self.max_messages_per_second, self.message_burst = _pacing_settings(s)
         # Per-connection peer-IP allowlist (Tier 4 operability): refuse a non-listed peer at accept.
         # Absent/empty = no restriction. Mirrors TcpSource/MLLPSource.
         sa = s.get("source_ip_allowlist")
@@ -544,7 +551,11 @@ class X12Source(SourceConnector):
             self._active += 1
             try:
                 decoder = X12FrameReader(max_interchange_bytes=self.max_interchange_bytes)
+                pacer = _MessagePacer.for_rate(self.max_messages_per_second, self.message_burst)
                 while True:
+                    # ASVS 2.4.1 / 15.2.2 — the wait is BEFORE the read, never around the handler.
+                    if pacer is not None:
+                        await pacer.pace()
                     if self.receive_timeout:
                         try:
                             chunk = await asyncio.wait_for(reader.read(4096), self.receive_timeout)
@@ -555,11 +566,16 @@ class X12Source(SourceConnector):
                     if not chunk:
                         break
                     try:
+                        decoded = 0
                         for interchange in decoder.feed(chunk):
+                            decoded += 1
                             reply = await self._handler(interchange)
                             if reply is not None:
                                 writer.write(reply.encode(self.encoding))  # verbatim reply
                                 await writer.drain()
+                        # Charge AFTER the interchanges in this chunk are fully handled.
+                        if pacer is not None:
+                            pacer.settle(decoded)
                     except X12FrameError as exc:
                         peer = writer.get_extra_info("peername")
                         logger.warning(

@@ -1313,11 +1313,14 @@ def _peer_host(writer: asyncio.StreamWriter) -> str | None:
 
 
 class _MessagePacer:
-    """Per-connection message-rate pacing for the MLLP data plane (ASVS 2.4.1, and the availability
+    """Message-rate pacing for the inbound data plane (ASVS 2.4.1, and the availability
     bound of 15.2.2 — one control, because building them apart yields two halves that interact).
 
     Charges one token per DECODED message and answers ONE question: how long to wait before
     consuming more from the socket.
+
+    Built for MLLP and shared verbatim by the raw-TCP, X12 and HTTP intakes (BACKLOG #1114), which
+    import it from here rather than growing a second implementation that could drift.
 
     **It never drops, never NAKs and never refuses, and that is the whole design.** The count-and-log
     invariant forbids accept-and-drop, so a limiter that discards is not available. NAKing would mean
@@ -1332,22 +1335,28 @@ class _MessagePacer:
     budget and *become* the denial of service this exists to prevent. A delay bounded by the deficit
     paces the peer without pinning capacity.
 
-    Scoped per connection, deliberately. MLLP peers are unauthenticated and identified only by
+    **Never scoped per PEER, on any intake.** These peers are unauthenticated and identified only by
     address, so a per-IP budget collapses under NAT or a shared integration host — it would throttle
-    unrelated feeds that happen to share an egress address. A per-connection budget is honest about
-    what it bounds; a peer opening more connections is bounded by ``max_connections`` instead.
+    unrelated feeds that happen to share an egress address. A budget is honest about what it bounds
+    or it is not worth having; a peer opening more connections is bounded by ``max_connections``.
+
+    **Beyond that, the consumer picks its scope by which pair of methods it calls.** A STREAM intake
+    reads many messages down one connection, so it holds a pacer per connection and drives it with
+    :meth:`pace` / :meth:`settle`. A listener whose connections carry a single message each has no
+    next read on the same connection to settle against, so it holds ONE pacer for the whole listener
+    and drives it with :meth:`deficit` / :meth:`charge`. There is no flag and no branch in here.
     """
 
-    __slots__ = ("_capacity", "_last", "_rate", "_tokens", "pending_wait")
+    __slots__ = ("_capacity", "_last", "_pending_wait", "_rate", "_tokens")
 
     def __init__(self, rate: float, burst: float, *, now: float) -> None:
         self._rate = rate
         self._capacity = max(burst, 1.0)
         self._tokens = self._capacity
         self._last = now
-        #: Debt owed before the next read, in seconds. Carried on the pacer rather than in a local so
-        #: the read loop has exactly one place to consult and one place to clear.
-        self.pending_wait = 0.0
+        #: Debt owed before the next read, in seconds. PRIVATE, and settled only through pace() —
+        #: a consult-then-clear a caller performs by hand is an invariant restated once per loop.
+        self._pending_wait = 0.0
 
     def charge(self, messages: int, *, now: float) -> float:
         """Charge ``messages`` and return the seconds to wait before reading again (0.0 if none).
@@ -1359,6 +1368,60 @@ class _MessagePacer:
         self._last = now
         self._tokens -= messages
         return 0.0 if self._tokens >= 0 else -self._tokens / self._rate
+
+    async def pace(self) -> None:
+        """Wait off whatever is owed BEFORE the next read, then clear the debt — the stream pair.
+
+        ASVS 2.4.1 / 15.2.2. The wait belongs before the read and never around the handler: stopping
+        consumption lets TCP back-pressure the sender, so the excess is never framed and never
+        becomes a received message. Delaying anything AFTER decode would pace a message the
+        count-and-log invariant has already obliged us to account for — the same control with none
+        of the property.
+        """
+        if (wait := self._pending_wait) > 0.0:
+            self._pending_wait = 0.0
+            await asyncio.sleep(wait)
+
+    def settle(self, messages: int) -> None:
+        """Charge ``messages`` and hold the debt for the next :meth:`pace` — the stream pair.
+
+        Called once a chunk's messages are fully handled, so the debt is paid before the NEXT read
+        and never by withholding a reply the sender is already owed.
+        """
+        if messages:
+            self._pending_wait = self.charge(messages, now=time.monotonic())
+
+    def deficit(self, *, now: float) -> float:
+        """Seconds still owed before the next read, charging NOTHING — the listener-scoped read.
+
+        A stream intake caches its debt at charge time; a listener-wide bucket shared by concurrent
+        connections has to recompute it at read time instead. Delegates to :meth:`charge` rather
+        than re-deriving the arithmetic, so the two can never disagree.
+        """
+        return self.charge(0, now=now)
+
+    @classmethod
+    def for_rate(cls, rate: float | None, burst: float) -> _MessagePacer | None:
+        """Build a pacer, or ``None`` when no rate is configured — the shipped default.
+
+        The single place the off-default is honoured, so the four intakes that pace cannot drift
+        apart on what "unset" means. See :data:`DEFAULT_MAX_MESSAGES_PER_SECOND` for why off.
+        """
+        return cls(rate, burst, now=time.monotonic()) if rate else None
+
+
+def _pacing_settings(settings: Mapping[str, Any]) -> tuple[float | None, float]:
+    """Read ``(max_messages_per_second, message_burst)`` from one connection's settings.
+
+    Shared by every intake that paces, so a rename, a default change or a coercion fix lands once
+    instead of in four places that must agree. Absent rate -> OFF, deliberately against this
+    module's "key absent -> secure default" convention; see :data:`DEFAULT_MAX_MESSAGES_PER_SECOND`.
+    Burst defaults to one second's worth, so a peer that sends in bursts is not paced until it
+    exceeds the SUSTAINED rate; it is meaningless when pacing is off.
+    """
+    mps = settings.get("max_messages_per_second", DEFAULT_MAX_MESSAGES_PER_SECOND)
+    rate = float(mps) if mps else None
+    return rate, float(settings.get("message_burst") or rate or 0.0)
 
 
 class MLLPSource(SourceConnector):
@@ -1380,14 +1443,9 @@ class MLLPSource(SourceConnector):
         self.receive_timeout: float | None = float(rt) if rt else None
         mf = s.get("max_frame_bytes", DEFAULT_MAX_FRAME_BYTES)
         self.max_frame_bytes: int | None = int(mf) if mf else None
-        # Message-rate pacing. Absent -> OFF, unlike the caps above; see
+        # Message-rate pacing. Absent -> OFF, unlike the caps above; see _pacing_settings and
         # DEFAULT_MAX_MESSAGES_PER_SECOND for why that deviation is deliberate and ruled.
-        mps = s.get("max_messages_per_second", DEFAULT_MAX_MESSAGES_PER_SECOND)
-        self.max_messages_per_second: float | None = float(mps) if mps else None
-        # Burst defaults to one second's worth, so a peer that sends in bursts is not paced until it
-        # exceeds the SUSTAINED rate. Meaningless when pacing is off.
-        mb = s.get("message_burst") or self.max_messages_per_second or 0.0
-        self.message_burst: float = float(mb)
+        self.max_messages_per_second, self.message_burst = _pacing_settings(s)
         # Per-connection peer-IP allowlist (Tier 4 operability): when set, a connecting peer whose IP
         # is not listed is refused at accept time. Absent/empty = no restriction.
         sa = s.get("source_ip_allowlist")
@@ -1503,24 +1561,11 @@ class MLLPSource(SourceConnector):
             await self._emit_event("established", peer_host=peer_host)
             try:
                 decoder = MLLPDecoder(max_frame_bytes=self.max_frame_bytes)
-                pacer = (
-                    _MessagePacer(
-                        self.max_messages_per_second,
-                        self.message_burst,
-                        now=time.monotonic(),
-                    )
-                    if self.max_messages_per_second
-                    else None
-                )
+                pacer = _MessagePacer.for_rate(self.max_messages_per_second, self.message_burst)
                 while True:
-                    # ASVS 2.4.1 / 15.2.2. The wait happens BEFORE the read and never around the
-                    # handler: stopping consumption lets TCP back-pressure the sender, so the excess
-                    # is never framed and never becomes a received message. Delaying anything AFTER
-                    # decode would pace a message the count-and-log invariant has already obliged us
-                    # to account for -- which is the same control with none of the property.
-                    if pacer is not None and (wait := pacer.pending_wait) > 0.0:
-                        pacer.pending_wait = 0.0
-                        await asyncio.sleep(wait)
+                    # ASVS 2.4.1 / 15.2.2 — the wait is BEFORE the read, never around the handler.
+                    if pacer is not None:
+                        await pacer.pace()
                     if self.receive_timeout:
                         try:
                             chunk = await asyncio.wait_for(reader.read(4096), self.receive_timeout)
@@ -1539,10 +1584,9 @@ class MLLPSource(SourceConnector):
                             if reply is not None:
                                 writer.write(frame(reply, self.encoding))
                                 await writer.drain()
-                        # Charge AFTER the messages in this chunk are fully handled and ACKed. The
-                        # debt is settled before the NEXT read, never by withholding an ACK.
-                        if pacer is not None and decoded:
-                            pacer.pending_wait = pacer.charge(decoded, now=time.monotonic())
+                        # Charge AFTER the messages in this chunk are fully handled and ACKed.
+                        if pacer is not None:
+                            pacer.settle(decoded)
                     except MLLPFrameError as exc:
                         peer = writer.get_extra_info("peername")
                         logger.warning(

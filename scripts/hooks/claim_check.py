@@ -29,6 +29,22 @@ never receives the commit message, so the check would look installed and silentl
 
 Stdlib only, no `messagefoundry` import: most worktrees have no .venv, and a gate that silently skips is
 worse than no gate.
+
+ONE REGISTRY CAN SERVE TWO REPOSITORIES (BACKLOG #1346), and before that it could not. This gate is
+installed in more than one repository -- the engine carries it, and the separate MessageFoundry-vault
+clone runs the same file. Each read the claims directory of the tree it was committing in, while
+``scripts/coord/claim.ps1`` writes the claims directory of the checkout the SCRIPT lives in. Inside one
+repository those are the same directory and the split is invisible; across two they are not, so a second
+repository's commit whose SUBJECT cited a ledger number could NEVER pass, however honestly the item was
+held -- its gate looked in a registry nothing had ever written. The only route through was to cite the
+item in the commit BODY, which this gate permits by design, and a gate whose sole remedy is a sanctioned
+way around it is the state that manufactures evasion.
+
+``git config mefor.claimsRoot <path-to-the-repository-that-hosts-the-registry>`` fixes it, set in the
+repository that does NOT host the registry. Both halves then resolve the same way -- **from the
+repository the claim is FOR, never from the tree a script happens to live in** -- so the tool and the
+gate cannot disagree about where to look. Unset, which is the default and this repository's own state,
+nothing changes: the registry is this repository's own, exactly as it has always been.
 """
 
 from __future__ import annotations
@@ -105,8 +121,19 @@ def _safe_for_message(value: object, limit: int = 400) -> str:
     return text
 
 
+#: Set in a repository whose work claims live in ANOTHER repository's registry. Its value is a path to
+#: that repository. Kept in git config rather than a tracked file because it is a property of one CLONE
+#: on one box, not of a branch: a tracked pointer would travel to every checkout of the repository,
+#: including ones sitting beside a different engine tree or none at all.
+_CLAIMS_ROOT_KEY = "mefor.claimsRoot"
+
+
 class GitReadError(RuntimeError):
     """git could not answer, so nothing downstream may treat its silence as an answer."""
+
+
+class ClaimRegistryError(RuntimeError):
+    """The registry pointer is SET and cannot be resolved, so where to look is unknown -- not empty."""
 
 
 def _git(*args: str) -> str:
@@ -167,24 +194,94 @@ def _touches_code(paths: list[str]) -> bool:
     return False
 
 
-def _claims_dir() -> Path:
-    common = _git("rev-parse", "--path-format=absolute", "--git-common-dir").strip()
-    return Path(common) / "mefor-coord" / "claims"
+def _config(repo: str, key: str) -> str | None:
+    """One git config value, with UNSET told apart from UNREADABLE.
+
+    ``git config --get`` exits 1 for a missing key and 2-or-more for a real failure, so the two ARE
+    distinguishable -- and they must be. Collapsing them turns a broken read into "not configured",
+    which is the silent fallback the registry resolution below exists to refuse: it would send this
+    gate to a directory nothing writes, where every claim reads as absent and a misconfigured pointer
+    presents as an honestly unclaimed item.
+    """
+    proc = subprocess.run(  # nosec B603 B607 - fixed argv, no shell, no caller-supplied executable
+        ["git", "-C", repo, "config", "--get", key],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    if proc.returncode == 1:
+        return None
+    if proc.returncode != 0:
+        detail = (proc.stderr or "").strip().splitlines()
+        raise GitReadError(
+            f"git config --get {key} exited {proc.returncode}: "
+            f"{detail[0] if detail else 'no output'}"
+        )
+    return proc.stdout.strip() or None
+
+
+def _claims_dir(repo: str) -> tuple[Path, str | None]:
+    """Where ``repo``'s work claims live, plus the repository hosting them when that is somewhere else.
+
+    BACKLOG #1346. Resolved from the repository the claim is FOR -- the one being committed -- and never
+    from wherever a script sits, because that is the only anchor both this gate and ``claim.ps1`` can
+    agree on without calling each other.
+
+    ONE HOP, deliberately. If the host repository sets the key too, that is its own business: its own
+    gate follows the same single hop, so both sides still land in the same place and a chain cannot split
+    them. Following the chain here would add a second definition of "where" for no reachable gain.
+    """
+    shared = _config(repo, _CLAIMS_ROOT_KEY)
+    host = repo
+    if shared:
+        try:
+            host = _git(
+                "-C", shared, "rev-parse", "--path-format=absolute", "--show-toplevel"
+            ).strip()
+        except GitReadError as exc:
+            raise ClaimRegistryError(str(exc)) from exc
+        if not host:
+            raise ClaimRegistryError(f"'{shared}' is not a git repository")
+    common = _git("-C", host, "rev-parse", "--path-format=absolute", "--git-common-dir").strip()
+    return Path(common) / "mefor-coord" / "claims", (host if shared else None)
 
 
 def _repo() -> str:
     return _git("rev-parse", "--path-format=absolute", "--show-toplevel").strip()
 
 
+def _claim_command(repo: str, host: str | None, args: str, *, holds: bool = False) -> str:
+    """The remedy line, spelled so it can be RUN FROM THE REPOSITORY IT IS PRINTED IN.
+
+    THE REMEDY A GATE PRINTS IS ITS TEACHING SURFACE. Unshared, the repository-relative path is right
+    and familiar. Shared, it can name nothing: the second repository need not carry ``claim.ps1`` at
+    all, so an operator following a relative path gets "the file does not exist", lands back at the same
+    refusal, and learns that the way past this gate is the commit body. That is how a gate teaches the
+    evasion instead of the fix, which is exactly what #1346 recorded.
+
+    ``holds`` marks the verbs that record an OWNER -- take and release. A listing has no owner, so
+    ``-AsWorktree`` on it would name a tree the command never consults.
+
+    Quoted, because a Windows checkout path can contain spaces and an unquoted one silently binds only
+    its first word.
+    """
+    if host is None:
+        return f"pwsh -NoProfile -File scripts\\coord\\claim.ps1 {args}"
+    tool = Path(host) / "scripts" / "coord" / "claim.ps1"
+    owner = f' -AsWorktree "{repo}"' if holds else ""
+    return f'pwsh -NoProfile -File "{tool}" {args}{owner}'
+
+
 def _norm(p: str) -> str:
     return p.replace("\\", "/").rstrip("/").casefold()
 
 
-def _holder(item: str) -> dict[str, object] | None:
+def _holder(claims: Path, item: str) -> dict[str, object] | None:
     """The claim record for `item`, or None if unclaimed/unreadable. A malformed claim reads as UNCLAIMED
     on purpose: the gate then asks for a claim rather than silently passing on a corrupt one. A non-object
     payload (a bare list/string) is treated the same way -- it cannot name a holder, so it grants nothing."""
-    f = _claims_dir() / f"{item}.json"
+    f = claims / f"{item}.json"
     try:
         loaded = json.loads(f.read_text(encoding="utf-8"))
     except (OSError, ValueError):
@@ -221,7 +318,8 @@ def main() -> int:
     # for a dead board. A commit hook has no such surface.
     try:
         paths = _staged_paths()
-        me = _norm(_repo())
+        repo = _repo()
+        me = _norm(repo)
     except GitReadError as exc:
         sys.stderr.write(
             f"\nCLAIM GATE: git could not be read, so this commit was NOT checked.\n"
@@ -236,18 +334,38 @@ def main() -> int:
     if not _touches_code(paths):
         return 0  # docs/ledger-only: cites the item, does not build it
 
+    # RESOLVED AFTER the docs-only exit, on purpose: a banner flip or a ledger reconcile must stay
+    # unblockable, and a misconfigured pointer is not a reason to stop one.
+    try:
+        claims, host = _claims_dir(repo)
+    except (GitReadError, ClaimRegistryError) as exc:
+        sys.stderr.write(
+            f"\nCLAIM GATE: the claim registry could not be resolved, so this commit was NOT checked.\n"
+            f"  {_safe_for_message(exc)}\n"
+            f"  Where this gate looks is decided by {_CLAIMS_ROOT_KEY}: set, it names another\n"
+            f"  repository whose registry serves this one; unset, the registry is this repository's\n"
+            f"  own. That read failed. The gate refuses rather than fall back to a registry nothing\n"
+            f"  writes, where every claim would read as absent and a misconfigured pointer would\n"
+            f"  present as an honestly unclaimed item.\n"
+            f"  Check it, then commit again:\n"
+            f"      git config --get {_CLAIMS_ROOT_KEY}\n"
+        )
+        return 1
+
     problems: list[str] = []
     for item in dict.fromkeys(items):  # de-dupe, keep order
-        claim = _holder(item)
+        claim = _holder(claims, item)
         if claim is None:
+            take = _claim_command(repo, host, f'-Take {item} -Note "<what>"', holds=True)
             problems.append(
                 f"  BACKLOG #{item} is NOT CLAIMED.\n"
                 f"      Another session may already be building it -- that is the duplicate work this\n"
                 f"      gate exists to stop. Claim it, then commit again:\n"
-                f'          pwsh -NoProfile -File scripts\\coord\\claim.ps1 -Take {item} -Note "<what>"'
+                f"          {take}"
             )
             continue
         if _norm(str(claim.get("worktree", ""))) != me:
+            release = _claim_command(repo, host, f"-Release {item} -Force", holds=True)
             problems.append(
                 f"  BACKLOG #{item} is claimed by ANOTHER worktree:\n"
                 f"      held by: {_safe_for_message(claim.get('worktree'))} "
@@ -255,7 +373,7 @@ def main() -> int:
                 f"      since  : {_safe_for_message(claim.get('claimed'))}\n"
                 f"      note   : {_safe_for_message(claim.get('note'))}\n"
                 f"      Do not build it in parallel. Coordinate with that session, or if it is dead:\n"
-                f"          pwsh -NoProfile -File scripts\\coord\\claim.ps1 -Release {item} -Force"
+                f"          {release}"
             )
 
     if not problems:
@@ -263,8 +381,19 @@ def main() -> int:
 
     sys.stderr.write("\nMessageFoundry claim gate\n\n")
     sys.stderr.write("\n\n".join(problems))
+    sys.stderr.write(f"\n\n  See who is building what:  {_claim_command(repo, host, '-List')}\n")
+    if host is not None:
+        # SAY WHERE YOU LOOKED. The absence of this line is why BACKLOG #1346 stayed invisible for
+        # months: a refusal against a registry in another repository is indistinguishable, from the
+        # outside, from an item nobody has claimed -- so the operator re-ran a claim tool that wrote
+        # somewhere this gate never reads, got the same refusal, and concluded the gate was broken
+        # rather than that the two halves disagreed about WHERE.
+        sys.stderr.write(
+            f"  Claims are SHARED: this repository's {_CLAIMS_ROOT_KEY} points at\n"
+            f"      {_safe_for_message(host)}\n"
+            f"  so a claim must be held in THIS tree's name ({_safe_for_message(repo)}) there.\n"
+        )
     sys.stderr.write(
-        "\n\n  See who is building what:  pwsh -NoProfile -File scripts\\coord\\claim.ps1 -List\n"
         "  This fires only on a code-touching commit whose SUBJECT says 'BACKLOG #N'.\n"
         "  A docs-only commit (banner flip, ledger reconcile) is never blocked.\n\n"
     )

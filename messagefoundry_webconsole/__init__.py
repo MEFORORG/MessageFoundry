@@ -45,7 +45,7 @@ __version__ = "0.2.15"
 # If cross-seam support is ever genuinely wanted, re-widen this set AND add the CI matrix that
 # installs the MIN and MAX supported engine builds — the claim and its test land together, or not
 # at all.
-SUPPORTED_ENGINE_SEAMS: frozenset[str] = frozenset({"93ba1f10b9dccfc8"})
+SUPPORTED_ENGINE_SEAMS: frozenset[str] = frozenset({"266cbfd342b22819"})
 
 #: The vendored static assets shipped in THIS wheel (mounted at /ui/static by :func:`mount_ui`).
 STATIC_DIR = Path(__file__).parent / "static"
@@ -72,6 +72,7 @@ def assert_engine_seam(engine_seam: str) -> None:
 # and ``messagefoundry_webconsole.pages``. Both are leaf modules (no cycle with :mod:`.mount`).
 from . import pages  # noqa: E402
 from ._auth import (  # noqa: E402
+    BROWSER_HARDENING_OPT_OUT_ENV,
     COOKIE_NAME,
     UI_CSP,
     WEBAUTHN_EXTRA_MISSING_NOTICE,
@@ -81,6 +82,7 @@ from ._auth import (  # noqa: E402
     assert_not_cross_site,
     assert_same_origin,
     authorize_ui_ws,
+    browser_hardening_enabled,
     clear_session_cookie,
     is_safe_ui_action,
     is_unlock_action,
@@ -99,6 +101,7 @@ from ._auth import (  # noqa: E402
 from .mount import mount_ui  # noqa: E402
 
 __all__ = [
+    "BROWSER_HARDENING_OPT_OUT_ENV",
     "COOKIE_NAME",
     "STATIC_DIR",
     "SUPPORTED_ENGINE_SEAMS",
@@ -113,6 +116,7 @@ __all__ = [
     "assert_not_cross_site",
     "assert_same_origin",
     "authorize_ui_ws",
+    "browser_hardening_enabled",
     "clear_session_cookie",
     "is_safe_ui_action",
     "is_unlock_action",

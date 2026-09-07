@@ -67,7 +67,7 @@ param(
 # the drift, but a stamp that disagrees with the verdict beside it is the exact ambiguity this machinery
 # exists to remove. -Status now prints the SHA prefix on both lines, so agreement is visible rather than
 # asserted, and this label can never again be the only thing a reader compares.
-$GateVersion = "2026.08.13.1"
+$GateVersion = "2026.09.03.1"
 
 # Fail OPEN: any unhandled error must let the tool call through, never block it.
 $ErrorActionPreference = "SilentlyContinue"
@@ -664,34 +664,128 @@ function Get-GitTargetCandidatesRaw([string]$Line, [string]$Prefix, [string]$Cwd
     $out | Where-Object { $_ }
 }
 
+# THE ESCAPE TABLE LIVES HERE AND ONLY HERE (BACKLOG #1229 residual, fifth round). `[char]0` means
+# this host escapes nothing.
+#
+# TWO PLACES NEED THIS FACT -- the span scanner below, and the interpreter-argument EXTRACTION regex
+# in Get-ScannableSegments -- AND THE THIRD ROUND WAS A MEASURED FAIL-OPEN CAUSED BY EXACTLY THOSE
+# TWO DISAGREEING about where an argument ends. That round fixed the disagreement and left the
+# structural condition intact: the character was still spelled twice, once as a `[char]` and once
+# inside a hand-written regex. Spelling it twice re-creates the defect even while the current values
+# happen to agree, and no test can see the gap, because a source-text assertion pins each spelling
+# separately. So a sixth host is added HERE, and the extraction regex is DERIVED from this.
+#
+# WHAT AN UNMEASURED HOST GETS, and why it is not a guess: nothing. `cmd` escapes with `^`, which
+# nobody has measured here, so it falls to the default rather than borrowing a neighbour's rule.
+# Both regressions in this function's history came from applying one host's escape to another
+# host's text.
+function Get-EscapeChar([string]$Convention) {
+    switch ($Convention) {
+        'posix' { [char]0x5C }   # backslash: sh, bash, dash, zsh
+        'pwsh' { [char]0x60 }    # backtick: PowerShell's own escape
+        default { [char]0 }      # cmd, none, and any tool name not recognised
+    }
+}
+
+# THE TEXT AFTER THE OUTER HOST HAS FINISHED WITH IT (BACKLOG #1229 residual, SIXTH round).
+#
+# An interpreter argument is extracted from the OUTER line, so it arrives in the OUTER host's
+# ENCODING -- its escapes are still spelled out, because the outer host has not run yet. The inner
+# interpreter never sees them: by the time it is handed the argument, the outer host has consumed
+# them. This turns that text into what the interpreter actually receives.
+#
+# ESCAPED QUOTES ONLY, AND THE NARROWNESS IS MEASURED RATHER THAN CAUTIOUS. Stripping EVERY escape
+# is what an escape rule reads like, and it is wrong on the host that matters most here: inside a
+# double-quoted word `sh` honours the backslash before `$` `` ` `` `"` `\` and newline and NOWHERE
+# ELSE, so a Windows path keeps its separators. MEASURED with `printf '%s'` over a double-quoted
+# `D:\Work\x`, which prints back unchanged. A blanket strip turned that into `D:Workx`, which stops
+# resolving to the repository it names, so the view built to SEE a gated command lost its target.
+# The escaped QUOTE is the whole of the defect this exists for, on both conventions.
+#
+# READS THE SAME TABLE AS EVERYTHING ELSE, for the reason stated above it: a second spelling of the
+# escape character is what round 3 was.
+function Remove-EscapeChars([string]$s, [string]$Convention) {
+    $esc = Get-EscapeChar $Convention
+    if ($esc -eq [char]0) { return $s }
+    $out = [System.Text.StringBuilder]::new()
+    for ($i = 0; $i -lt $s.Length; $i++) {
+        $nxt = $(if ($i + 1 -lt $s.Length) { $s[$i + 1] } else { [char]0 })
+        if ($s[$i] -eq $esc -and ($nxt -eq '"' -or $nxt -eq "'")) { [void]$out.Append($nxt); $i++ }
+        else { [void]$out.Append($s[$i]) }
+    }
+    $out.ToString()
+}
+
+# `cmd /c "<string>"` RUNS `<string>`, and the quotes are cmd's, not the command's. This is cmd.exe's
+# own documented rule ("cmd /?", the /C and /K quote logic): where the first character is a quote,
+# cmd strips that quote and the LAST quote on the line, then executes what is left. Its other arm --
+# quotes PRESERVED when the quoted text names an executable file -- is a filesystem question this
+# hook cannot answer, and getting it wrong here only makes MORE text visible, never less.
+function Remove-CmdWrapperQuotes([string]$s) {
+    $t = $s.TrimStart()
+    if (-not $t.StartsWith('"')) { return $s }
+    $last = $t.LastIndexOf('"')
+    if ($last -le 0) { return $s }
+    $t.Substring(1, $last - 1) + $t.Substring($last + 1)
+}
+
 # Decide from the COMMAND, never from prose inside it -- but "prose" and "code" are not the same as
 # "quoted" and "unquoted", and conflating them was a measured regression.
 #
 # Three false positives came from scanning the raw string: a two-line command whose second line read
 # `echo about to merge stuff` denied with verb=merge; `echo "git checkout main"` denied; and
-function Remove-QuotedSpans([string]$s, [bool]$PosixEscapes = $false) {
+function Remove-QuotedSpans([string]$s, [string]$Convention = 'none') {
     <#
-    ``$PosixEscapes`` -- DOES THIS HOST TREAT A BACKSLASH AS AN ESCAPE? (BACKLOG #1229 residual, second
-    round.) `sh` does; **PowerShell does NOT** -- its escape is the BACKTICK, so `"C:\Temp\"` is a
-    COMPLETE string there and whatever follows it RUNS.
+    ``$Convention`` -- WHICH CHARACTER ESCAPES A QUOTE ON THIS HOST? `posix` means the BACKSLASH (sh,
+    bash, dash, zsh); `pwsh` means the BACKTICK, which is PowerShell's own escape; anything else --
+    `cmd`, `none`, an unrecognised tool name -- means NOTHING is treated as an escape.
 
-    THIS PARAMETER EXISTS BECAUSE ITS ABSENCE RE-CREATED #1229's OWN DEFECT ON THE OTHER HOST. The
-    first version of this fix honoured the escape unconditionally, which is correct POSIX -- but line
-    999 scans BOTH tool names through ONE matcher, so on a PowerShell payload the scan held a span open
-    that PowerShell had already closed, straddled the live command between it and a later quote, and
-    blanked it. MEASURED on the shipped fix, both tool names:
+    THIS PARAMETER EXISTS BECAUSE A SINGLE ESCAPE RULE RE-CREATED #1229's OWN DEFECT ON THE OTHER HOST,
+    TWICE, ONCE IN EACH DIRECTION. Both are recorded because each one refutes the obvious reading of
+    the other.
+
+    ROUND 2 -- HONOURING THE BACKSLASH EVERYWHERE. The first version of this fix honoured it
+    unconditionally, which is correct POSIX -- but this file scans BOTH tool names through ONE matcher,
+    so on a PowerShell payload the scan held a span open that PowerShell had already closed, straddled
+    the live command between it and a later quote, and blanked it. MEASURED, both tool names:
 
         Write-Output "C:\Temp\" ; git -C <governed> reset --hard ; Write-Output "x"     ALLOW
         ... same line with ONE FEWER backslash (control)                                DENY
         ... same line with TWO backslashes (even count)                                 DENY
 
-    An ODD count before the closer was the trigger. Verified the middle statement really executes with
-    an inert payload that COMPUTES rather than echoes, so an echo-back could not be mistaken for a run.
+    An ODD count before the closer was the trigger.
 
-    DEFAULT IS $false, AND THE DIRECTION IS THE WHOLE POINT. Honouring the escape makes spans LONGER,
-    so it BLANKS MORE and can hide a command -- fail OPEN. Refusing it makes spans shorter, leaving more
-    text visible to the rules -- fail CLOSED. An unknown or unrecognised host therefore gets the
-    conservative reading, and only a host known to use backslash escapes opts in.
+    ROUND 5 -- REFUSING THE HOST'S OWN ESCAPE. Round 2 left `pwsh` with NO escape at all, on the
+    reasoning quoted below, and that reasoning is WRONG AS A GENERAL CLAIM. It is corrected here rather
+    than deleted, because it is the sentence the next reader would act on:
+
+        "Honouring the escape makes spans LONGER, so it BLANKS MORE and can hide a command -- fail
+         OPEN. Refusing it makes spans shorter, leaving more text visible to the rules -- fail CLOSED."
+
+    THAT IS TRUE OF SPAN LENGTH AND FALSE OF SPAN POSITION. Refusing an escape the host really honours
+    does not just shorten the first span -- it SHIFTS every pairing after it, and the shifted pair
+    straddles the live command. Which is #1229's own mechanism, arriving through the door built to
+    keep it out. MEASURED on the PowerShell tool with a payload that COMPUTES (`111*3` -> 333, so an
+    echo-back cannot be mistaken for a run):
+
+        Write-Output "a`"b" ; git -C <governed> reset --hard ; Write-Output "c`"d"   333 printed: RAN
+          on the round-2 scanner                                                     ALLOW  fail-open
+        ... same shape with the DOUBLED-quote escape ("") instead     (control)      333 printed: DENY
+        ... same shape with no escape at all                          (control)      333 printed: DENY
+        ... the IDENTICAL characters under the Bash tool              (control)   unexpected EOF: INERT
+
+    So the rule is not "opt in to escapes when it is safe". It is: MODEL THE HOST YOU WERE GIVEN. A
+    scanner that agrees with the shell has no straddle by construction, in either direction.
+
+    THE DEFAULT IS STILL THE CONSERVATIVE ONE AND STILL 'none'. An unknown host gets no escape rule,
+    because guessing one is how both rounds above happened; and `cmd` keeps 'none' deliberately, since
+    cmd.exe's escape is `^` and nobody has measured it here. Only a host whose escape was measured
+    opts in.
+
+    NOT MODELLED, STATED SO NO STRONGER CLAIM IS INFERRED: PowerShell's OTHER escape, the doubled quote
+    `""`. Naive pairing already covers the same extent for it -- it closes at the first of the pair and
+    reopens at the second, leaving no gap for live code -- so it needs no rule here, and the extraction
+    regex below is left equally blind to it so the two cannot disagree (see round 3).
     #>
 
     <#
@@ -718,30 +812,39 @@ function Remove-QuotedSpans([string]$s, [bool]$PosixEscapes = $false) {
     a lone quote would fail OPEN, turning one stray character into a total bypass, so on reaching the
     end still inside a quote this emits the original text from the opener onward.
     #>
+    # HOISTED OUT OF THE PER-CHARACTER LOOP, both of them. `$esc` is one table lookup and `$hasEsc`
+    # is one comparison; inside the loop each would be paid per character of every scanned line, on a
+    # hook that runs on every tool call.
+    $esc = Get-EscapeChar $Convention
+    $hasEsc = $esc -ne [char]0
+
     $out = [System.Text.StringBuilder]::new()
     $quote = [char]0
     $openAt = -1
     for ($i = 0; $i -lt $s.Length; $i++) {
         $ch = $s[$i]
         if ($quote -eq [char]0) {
-            # A BACKSLASH ESCAPE OUTSIDE A SPAN IS A LITERAL AND OPENS NOTHING (BACKLOG #1229
-            # residual). `\"` is an ordinary character to the shell, so the command around it RUNS --
-            # but this scan treated it as an opener, paired it with the next escaped quote, and blanked
-            # the live command between them. Same straddle as the two-regex defect above, one character
-            # class over, and RULE-AGNOSTIC: it disarms whatever rule sits behind it, so it hid
-            # `reset --hard` and `worktree add` and not only `checkout`.
-            if ($PosixEscapes -and $ch -eq '\' -and $i + 1 -lt $s.Length) {
+            # AN ESCAPED QUOTE OUTSIDE A SPAN IS A LITERAL AND OPENS NOTHING (BACKLOG #1229
+            # residual). `\"` in sh, and `` `" `` in PowerShell, are ordinary characters, so the
+            # command around them RUNS -- but this scan treated one as an opener, paired it with the
+            # next escaped quote, and blanked the live command between them. Same straddle as the
+            # two-regex defect above, one character class over, and RULE-AGNOSTIC: it disarms whatever
+            # rule sits behind it, so it hid `reset --hard` and not only `checkout`.
+            if ($hasEsc -and $ch -eq $esc -and $i + 1 -lt $s.Length) {
                 [void]$out.Append($ch); [void]$out.Append($s[$i + 1]); $i++
             }
             elseif ($ch -eq '"' -or $ch -eq "'") { $quote = $ch; $openAt = $i }
             else { [void]$out.Append($ch) }
         }
-        elseif ($PosixEscapes -and $quote -eq '"' -and $ch -eq '\' -and $i + 1 -lt $s.Length) {
-            # Inside a DOUBLE-quoted span a backslash escapes the next character, so `\"` does not
-            # close it. DELIBERATELY NOT APPLIED INSIDE A SINGLE-QUOTED SPAN: sh gives the backslash no
-            # special meaning there, so `'a\'` really does close at that quote. Treating the two alike
-            # would swallow the rest of the line from a trailing backslash -- fail-open, which is the
-            # direction this whole function exists to avoid.
+        elseif ($hasEsc -and $quote -eq '"' -and $ch -eq $esc -and $i + 1 -lt $s.Length) {
+            # Inside a DOUBLE-quoted span the escape character escapes the next one, so the quote after
+            # it does not close the span. DELIBERATELY NOT APPLIED INSIDE A SINGLE-QUOTED SPAN, ON BOTH
+            # HOSTS AND FOR THE SAME REASON: sh gives the backslash no special meaning there, and a
+            # PowerShell single-quoted string is fully literal too. MEASURED on pwsh 7.6.4 --
+            # `Write-Output 'a`' ; 111*3 ; Write-Output 'b`'` prints 333, so the middle RUNS and the
+            # span really does close at that apostrophe. Treating the two alike would swallow the rest
+            # of the line from a trailing escape -- fail-open, the direction this function exists to
+            # avoid.
             $i++
         }
         elseif ($ch -eq $quote) {
@@ -831,7 +934,15 @@ function Remove-QuotedSpans([string]$s, [bool]$PosixEscapes = $false) {
 function Get-FlagOwner([string]$Left) {
     <#
     WHICH PROGRAM OWNS THE FLAG THAT WAS JUST MATCHED, and does it EXECUTE its argument?
-    (BACKLOG #1229 residual, fourth round.) Returns 'posix', 'win' or 'none'.
+    (BACKLOG #1229 residual, fourth round.) Returns 'posix', 'pwsh', 'cmd' or 'none' -- the name of an
+    ESCAPE CONVENTION, which is what the caller actually needs, not a family label.
+
+    THE WINDOWS FAMILY IS SPLIT AND THAT IS NOT COSMETIC (residual, fifth round). This returned a
+    single 'win' for pwsh, powershell, cmd and wsl, which was harmless while 'win' meant "no escapes"
+    -- and stopped being harmless the moment PowerShell got its backtick rule, because cmd.exe escapes
+    with `^` and nobody has measured it here. Folding cmd in with pwsh would have handed it an escape
+    it does not have, which lengthens spans and hides commands: a fail-open, manufactured by tidiness.
+    `cmd` therefore keeps the reading it has today, byte for byte.
 
     THE FLAG SHAPE IS NOT THE QUESTION, AND IT IS BARELY CORRELATED WITH THE ANSWER. `$shFlag` is
     `-[a-z]*c` under (?i), which matches `-C`, `-ic`, `-rc`, `-static`, `-sync`, `-exec` -- and
@@ -869,8 +980,12 @@ function Get-FlagOwner([string]$Left) {
     IDENTITY, and this function does not close them: an unknown name gets no recursion, which is the
     disclosed cost recorded at the caller. Four of five, not five of five.
     #>
-    # Both hosts take their code under `/c` as well as `-Command`, so a cmd-family match is theirs.
-    $winSet = @('pwsh', 'powershell', 'cmd', 'wsl')
+    # Both PowerShell hosts take their code under `/c` as well as `-Command`, so a cmd-family FLAG
+    # match still belongs to them -- which is why the flag shape cannot decide the convention and the
+    # PROGRAM NAME has to.
+    $pwshSet = @('pwsh', 'powershell')
+    # Kept apart from the two above, with no escape rule of its own. See the docstring.
+    $cmdSet = @('cmd', 'wsl')
     # Anything that runs the string it is handed. `find` is NOT optional: `-exec` ends in `c`, so the
     # matcher reaches it, and `find . -name x -exec '<gated>' \;` really executes -- dropping find from
     # this list was measured to regress it from DENY to ALLOW.
@@ -896,14 +1011,29 @@ function Get-FlagOwner([string]$Left) {
         # cannot be a blanket "starts with a slash" skip.
         if ($t -match '^/[^/]*$') { continue }
         if ($t -match '^[A-Za-z_][A-Za-z0-9_]*=') { continue }  # FOO=1, an assignment prefix
-        $name = ($t -split '[\\/]')[-1] -replace '(?i)\.exe$', ''
-        if ($winSet -contains $name.ToLowerInvariant()) { return 'win' }
-        if ($posixSet -contains $name.ToLowerInvariant()) { return 'posix' }
+        # Casefolded ONCE. Splitting the Windows family in two added a third membership test, and
+        # each one used to re-lowercase the name -- an allocation per token, per leftward scan.
+        $name = (($t -split '[\\/]')[-1] -replace '(?i)\.exe$', '').ToLowerInvariant()
+        if ($pwshSet -contains $name) { return 'pwsh' }
+        if ($cmdSet -contains $name) { return 'cmd' }
+        if ($posixSet -contains $name) { return 'posix' }
     }
     'none'
 }
 
-function Get-ScannableSegments([string]$Cmd, [bool]$PosixEscapes = $false) {
+# WHICH ESCAPE CONVENTION DOES THE TOOL'S OWN COMMAND LINE USE (BACKLOG #1229 residual, fifth round).
+# The tool name is the only evidence available about the outer line, and it is good evidence: the Bash
+# tool's line really is sh, and the PowerShell tool's really is PowerShell. An unrecognised name gets
+# 'none', which escapes nothing -- see Remove-QuotedSpans on why guessing is the expensive move.
+function Get-HostConvention([string]$ToolName) {
+    switch ($ToolName) {
+        'Bash' { 'posix' }
+        'PowerShell' { 'pwsh' }
+        default { 'none' }
+    }
+}
+
+function Get-ScannableSegments([string]$Cmd, [string]$Convention = 'none') {
     # Fold line continuations FIRST, or the per-line split below separates `git \` from its verb and the
     # rule stops seeing the command at all. Prose does not end a line with a continuation character, so
     # this does not resurrect the `echo about to merge stuff` false positive.
@@ -967,12 +1097,44 @@ function Get-ScannableSegments([string]$Cmd, [bool]$PosixEscapes = $false) {
     #     main"` is the shape sitting next to it that must keep allowing). It is the one residual this
     #     audit ADDED to this list rather than inherited.
     #   * More than one level of nesting, unchanged from before (BACKLOG #1066/#1067 record it).
-    #   * A quoted argument SPANNING LINES, because the split above is per line. Both multi-line forms
-    #     deny today anyway: every line of such a span reaches the scanner RAW and the payload line
-    #     carries the git token and the verb by itself. That is an accident of the raw scan rather than a
-    #     property of this function, and a change that blanks message bodies removes it (BACKLOG #1086).
-    #     It is left alone here because no test on THIS gate could tell the two mechanisms apart, and a
-    #     fix whose green nobody could watch fail is not evidence.
+    #   * A quoted argument SPANNING LINES, because the split above is per line. **THIS ENTRY USED TO
+    #     SAY "Both multi-line forms deny today anyway", AND THAT IS MEASURED FALSE.** The claim is
+    #     corrected in place rather than deleted, because it is a compensating control resting on a
+    #     false premise: it told the next reader the class was harmless, so nobody probed it.
+    #
+    #     What it got right is that every line reaches the scanner RAW. What it missed is that the
+    #     payload line does not only carry the git token -- it can also carry ONE QUOTE FROM EACH of the
+    #     two multi-line spans around it, and those two pair ACROSS the gated command and blank it.
+    #     Which is #1229's straddle exactly, reached through the line split instead of the pass order.
+    #     MEASURED on the shipped gate, cwd inside the governed repo, with the middle statement pinned
+    #     to whether it RUNS (`expr 111 \* 3` and `111*3` -> 333, so an echo-back proves nothing):
+    #
+    #         echo 'a<NL>b' ; git -C <governed> checkout main ; echo 'c<NL>d'    bash 333    ALLOW
+    #         echo "a<NL>b" ; git -C <governed> checkout main ; echo "c<NL>d"    bash 333    ALLOW
+    #         Write-Output 'a<NL>b' ; git -C <governed> reset --hard ; ...       pwsh 333    ALLOW
+    #         Write-Output "a<NL>b" ; git -C <governed> reset --hard ; ...       pwsh 333    ALLOW
+    #
+    #     THE FOURTH ROW WAS MISSING AND THE COUNT WENT OUT AS THREE. Both tools times both quote
+    #     characters is four; the double-quoted PowerShell row measures identically and was simply
+    #     never probed. Read the number as AT LEAST four -- nothing here ranged over the whole input
+    #     space, so it is a floor rather than an enumeration.
+    #
+    #     THE CLASS IS NARROWER THAN THIS ENTRY'S OWN HEADING SAYS, and BACKLOG #1427's opposite
+    #     reading is why the wording matters rather than being pedantry. That row tabled the per-line
+    #     split as "6 spellings driven, 0 allowed" and cited the sentence corrected above. Both
+    #     readings are true, OF DIFFERENT SHAPES. The hole needs the gated command on a line carrying
+    #     the CLOSING quote of one newline-crossing span AND the OPENING quote of the next. Give it a
+    #     line of its own, drop one of the two spans, or put both spans on the same side of it, and it
+    #     DENIES. Measured 2026-09-04 over 36 spellings with five controls in every batch: 4 allowed,
+    #     all four that one shape. The near-miss neighbours are pinned as must-KEEP-denying rows in
+    #     tests/test_worktree_gate_line_split_discriminator.py, so a fix has both halves to hold.
+    #
+    #     STILL NOT FIXED HERE, and now for a stated reason rather than a false one: closing it means
+    #     carrying quote state ACROSS the split, which changes what every rule sees on every multi-line
+    #     command -- a far wider blast radius than the span-ownership fix this function is. Filed as
+    #     BACKLOG #1429 with the rows above, and pinned as a tripwire in
+    #     tests/test_worktree_gate_quote_straddle.py so the ALLOW is KNOWN rather than assumed absent.
+    #     BACKLOG #1086's message-flag blanking is a different change and does not close this.
     #
     # COST, measured rather than assumed: recursion only ADDS a scan line, and a line still needs a git
     # token AND a gated verb to deny, so a path argument behind a family flag (`git -C "<path>"`,
@@ -1152,34 +1314,54 @@ function Get-ScannableSegments([string]$Cmd, [bool]$PosixEscapes = $false) {
     # The payload is a NAMED group. It was Groups[1], which still resolves correctly (.NET numbers
     # unnamed groups before named ones) -- but only by an ordering rule no reader should have to know,
     # now that $sigil contributes a named group of its own.
+    # THE EXTRACTION MUST AGREE WITH THE BLANKING ABOUT WHERE THE ARGUMENT ENDS
+    # (BACKLOG #1229 residual, third round). `[^"]*` is escape-BLIND: it stops at the first
+    # quote, INCLUDING an escaped one. Once Remove-QuotedSpans became escape-AWARE, the two
+    # disagreed -- and the inner code was never re-scanned:
+    #
+    #     bash -c "bash -c \\"git -C <governed> reset --hard\\""
+    #     extraction got:  `bash -c \\`   -- truncated at the escaped quote, no verb
+    #     blanking removed: the whole span     -- so nothing reached any rule  -> ALLOW
+    #
+    # MEASURED: main DENY x3, the escape-aware fix ALLOW x3, and the control (same nesting,
+    # NO escape) DENY on both -- so the trigger is the ESCAPE, not the nesting. The inner
+    # command really runs: `bash -c "bash -c \\"expr 111 \\* 3\\""` prints 333.
+    #
+    # ON MAIN THE TWO AGREED BY ACCIDENT, both being escape-blind, which left the verb visible
+    # OUTSIDE the span. Making one side escape-aware removed the accident without replacing it.
+    # This is why a host flag alone cannot close it: the failing host is BASH, where the escape
+    # is real and honouring it is correct.
+    #
+    # DERIVED FROM Get-EscapeChar RATHER THAN SPELLED OUT (residual, fifth round). Three literal
+    # patterns used to stand here, one per convention -- correct, and a second copy of the escape
+    # table 500 lines from the first. Round 3 above is what that costs when the copies drift, so the
+    # copy is removed instead of being watched: this pattern is now UNABLE to disagree with the
+    # scanner, rather than merely observed to agree. Verified byte-identical to the three literals it
+    # replaces, all four conventions.
+    #
+    # The SINGLE-quoted arm stays escape-blind on purpose, on BOTH hosts: sh gives the backslash no
+    # special meaning inside a single-quoted word and a PowerShell single-quoted string is fully
+    # literal, which is the same asymmetry Remove-QuotedSpans keeps.
+    #
+    # HOISTED OUT OF THE PER-LINE LOOP: it depends only on $Convention, a parameter.
+    $extractEsc = Get-EscapeChar $Convention
+    $dqCode = if ($extractEsc -eq [char]0) {
+        '(?<code>[^"]*)'
+    } else {
+        $e = [regex]::Escape($extractEsc)
+        "(?<code>(?:${e}.|[^`"${e}])*)"
+    }
+
     $inner = @()
     foreach ($ln in $lines) {
-        # THE EXTRACTION MUST AGREE WITH THE BLANKING ABOUT WHERE THE ARGUMENT ENDS
-        # (BACKLOG #1229 residual, third round). `[^"]*` is escape-BLIND: it stops at the first
-        # quote, INCLUDING an escaped one. Once Remove-QuotedSpans became escape-AWARE, the two
-        # disagreed -- and the inner code was never re-scanned:
-        #
-        #     bash -c "bash -c \\"git -C <governed> reset --hard\\""
-        #     extraction got:  `bash -c \\`   -- truncated at the escaped quote, no verb
-        #     blanking removed: the whole span     -- so nothing reached any rule  -> ALLOW
-        #
-        # MEASURED: main DENY x3, the escape-aware fix ALLOW x3, and the control (same nesting,
-        # NO escape) DENY on both -- so the trigger is the ESCAPE, not the nesting. The inner
-        # command really runs: `bash -c "bash -c \\"expr 111 \\* 3\\""` prints 333.
-        #
-        # ON MAIN THE TWO AGREED BY ACCIDENT, both being escape-blind, which left the verb visible
-        # OUTSIDE the span. Making one side escape-aware removed the accident without replacing it.
-        # This is why a host flag alone cannot close it: the failing host is BASH, where the escape
-        # is real and honouring it is correct.
-        #
-        # The SINGLE-quoted arm stays escape-blind on purpose: sh gives the backslash no special
-        # meaning inside a single-quoted word, which is the same asymmetry Remove-QuotedSpans keeps.
-        $dqCode = if ($PosixEscapes) { "(?<code>(?:\\.|[^`"\\])*)" } else { "(?<code>[^`"]*)" }
-        foreach ($pat in @(
-            "(?i)(?:^|\s)$flagThenSep`"$dqCode`""
-            "(?i)(?:^|\s)$flagThenSep'(?<code>[^']*)'"
+        # WHICH ARM MATCHED IS RECORDED, because only the double-quoted one can carry an outer escape.
+        # A single-quoted word is fully literal on BOTH hosts, so its payload already IS what the
+        # interpreter receives and re-decoding it would corrupt a legitimate backslash or backtick.
+        foreach ($spec in @(
+            @{ Pat = "(?i)(?:^|\s)$flagThenSep`"$dqCode`""; Escaped = $true }
+            @{ Pat = "(?i)(?:^|\s)$flagThenSep'(?<code>[^']*)'"; Escaped = $false }
         )) {
-            foreach ($m in [regex]::Matches($ln, $pat)) {
+            foreach ($m in [regex]::Matches($ln, $spec.Pat)) {
                 # WHO OWNS THIS FLAG DECIDES BOTH QUESTIONS -- whether to recurse at all, and under
                 # WHICH ESCAPE CONVENTION (BACKLOG #1229 residual, fourth round). `(?:^|\s)` consumes
                 # the separator, so $m.Index lands on the whitespace before the flag and the text left
@@ -1195,7 +1377,7 @@ function Get-ScannableSegments([string]$Cmd, [bool]$PosixEscapes = $false) {
                 # accidental rather than designed, but it is a deliberate move against origin/main.
                 if ($owner -eq 'none') { continue }
                 # THE CONVENTION MUST COME FROM THE INTERPRETER, NOT THE OUTER TOOL NAME, and that was
-                # a live fail-open. `$PosixEscapes` is decided once from the tool name at each call
+                # a live fail-open. The convention is decided once from the tool name at each call
                 # site, so a Bash tool call invoking pwsh applied POSIX backslash rules to a PowerShell
                 # payload; the span straddled `C:\Temp\` and swallowed the gated command between it and
                 # a later quote. MEASURED to really run, with a payload that COMPUTES (marker 333):
@@ -1204,12 +1386,20 @@ function Get-ScannableSegments([string]$Cmd, [bool]$PosixEscapes = $false) {
                 # under `bash -c` is INERT on this host (bash reports an unterminated quote), so the
                 # ALLOW there is CORRECT -- the same characters have opposite right answers depending
                 # on which interpreter receives them, which is why one flag for the whole line cannot
-                # express it. `win` maps to $false, which is also the direction the parameter's own
-                # docstring names conservative: shorter spans, more text left visible, fail CLOSED.
+                # express it.
+                #
+                # `$owner` IS PASSED THROUGH WHOLE rather than collapsed to a bool, which is the fifth
+                # round's change here. It used to become `Posix = ($owner -eq 'posix')`, and that bool
+                # could say only "sh" or "not sh" -- so a `pwsh` payload and a `cmd` payload arrived
+                # identical, and PowerShell's own backtick escape had nowhere to live.
                 #
                 # The EXTRACTION regex above keeps the OUTER convention on purpose: it is parsing the
                 # OUTER command line's quoting, and that line really is the outer host's.
-                $inner += [pscustomobject]@{ Text = $m.Groups['code'].Value; Posix = ($owner -eq 'posix') }
+                $inner += [pscustomobject]@{
+                    Text    = $m.Groups['code'].Value
+                    Conv    = $owner
+                    Escaped = [bool]$spec.Escaped
+                }
             }
         }
     }
@@ -1228,15 +1418,56 @@ function Get-ScannableSegments([string]$Cmd, [bool]$PosixEscapes = $false) {
         # with a bare token -- verb and arguments gone, nothing left for any rule to match. Ownership
         # cannot be decided by a regex that has no idea which quote opened first, which is the same
         # sentence this file already wrote about the blanking order.
-        $s = Remove-QuotedSpans $line $PosixEscapes
+        $s = Remove-QuotedSpans $line $Convention
         [pscustomobject]@{ Raw = $line; Scan = $s }
     }
 
     # Each extracted payload carries ITS OWN convention, taken from the interpreter that was matched
     # rather than from the tool name at the call site. See the note at the extraction above.
     foreach ($item in $inner) {
-        $s = Remove-QuotedSpans $item.Text $item.Posix
+        $s = Remove-QuotedSpans $item.Text $item.Conv
         [pscustomobject]@{ Raw = $item.Text; Scan = $s }
+    }
+
+    # =================================================================================================
+    # THE SAME PAYLOAD AGAIN, IN THE ENCODING ITS INTERPRETER ACTUALLY RECEIVES
+    # (BACKLOG #1229 residual, SIXTH round -- a fail-open THE FIFTH ROUND'S OWN FIX INTRODUCED).
+    #
+    # THE DEFECT. The loop above scans the extracted text under the INNER interpreter's convention,
+    # but that text is still in the OUTER host's encoding -- so the same characters get read twice,
+    # under two different conventions, and the pairing shifts. #1229's own straddle, one level in,
+    # arriving through the door built to keep it out. MEASURED against gate copies hash-verified
+    # byte-identical to `origin/main` and to the fifth round, cwd inside the governed repo, with the
+    # middle statement pinned to whether it RUNS (an inert marker computing `set /a 111*3` -> 333):
+    #
+    #     cmd /c "`"git -C <governed> reset --hard`""   PowerShell tool   main DENY  round5 ALLOW  RUNS
+    #     cmd /k "`"git -C <governed> reset --hard`""   PowerShell tool   main DENY  round5 ALLOW  RUNS
+    #     cmd /c "git -C <governed> reset --hard"       no backtick, ctl  main DENY  round5 DENY
+    #     git -C <governed> reset --hard                positive control  main DENY  round5 DENY
+    #
+    # TWO STEPS ARE NEEDED AND NEITHER IS ENOUGH ALONE, measured: decoding leaves `"git -C <governed>
+    # reset --hard"`, which the scanner then blanks as an ordinary quoted span; unwrapping without
+    # decoding finds a BACKTICK in first position and does nothing.
+    #
+    # THIS IS AN EXTRA VIEW, NOT A REPLACEMENT, AND THAT IS THE WHOLE SAFETY ARGUMENT. Decoding IN
+    # PLACE is the tidier change and it is REFUTED: it re-opens round 3's nested `bash -c "bash -c
+    # \"<gated>\""` (DENY -> ALLOW), because this function recurses ONE level and the round-3 DENY
+    # depends on the escaped text staying visible at this level. Two new fail-opens, measured, for a
+    # change that reads as a correction. Adding a segment cannot do that: every rule here reaches a
+    # segment through a `continue`-or-deny loop, so an extra segment can only ADD a deny. Appended
+    # AFTER every existing segment, so rule 3's first-verb-wins bookkeeping sees exactly what it saw.
+    #
+    # SCOPED TO `cmd` BECAUSE THAT IS WHAT WAS MEASURED. `Get-FlagOwner` answers `cmd` for cmd and
+    # wsl alike; the wrapper rule is cmd.exe's, so for wsl this view is an over-approximation, which
+    # is the harmless direction. Do NOT widen it to the other conventions on the strength of this
+    # note -- no probe here separates them, and widening a security control by analogy is how the
+    # rounds above happened.
+    # =================================================================================================
+    foreach ($item in $inner) {
+        if (-not $item.Escaped -or $item.Conv -ne 'cmd') { continue }
+        $unwrapped = Remove-CmdWrapperQuotes (Remove-EscapeChars $item.Text $Convention)
+        if ($unwrapped -ceq $item.Text) { continue }
+        [pscustomobject]@{ Raw = $unwrapped; Scan = (Remove-QuotedSpans $unwrapped $item.Conv) }
     }
 }
 
@@ -1395,21 +1626,65 @@ function Get-RootCommonDirCmp($Root) {
 }
 
 # ---------------------------------------------------------------------------------------------------
-# Rule 3b -- hijacking a LINKED WORKTREE by switching it onto an ALREADY-EXISTING branch. Rule 3 below
-# protects only the shared PRIMARY; this protects every OTHER governed worktree from the one move that
+# Rule 3b -- MOVING THE HEAD of a LINKED WORKTREE that belongs to some other session. Rule 3 below
+# protects only the shared PRIMARY; this protects every OTHER governed worktree from the move that
 # actually happened here: a session with no worktree of its own ran `git checkout <a-branch>` inside
 # somebody else's worktree, yanking that session's files onto a different branch mid-task. git permits
 # it because its native guard only blocks a branch ALREADY checked out somewhere -- a "free" branch can
 # be grabbed by any worktree.
 #
-# Deliberately narrow: only a switch onto an EXISTING LOCAL BRANCH is denied. Creating a new branch
-# (-b/-c), restoring files (`--`/pathspec), and reset/rebase/merge of the worktree's OWN branch stay
-# allowed -- a worktree owns its own history; it just may not be pulled onto another in-flight branch.
-# The gate cannot tell a worktree's rightful session from a squatter (both share the cwd), so it blocks
-# the move for both; the rightful owner's escape hatch is a PLAIN terminal (never gated) or a fresh
-# worktree for the other branch. Returns normally to ALLOW; calls Write-Deny (which exits) to block.
-function Test-WorktreeHijack([string]$Verb, [string]$Cmd, [string]$WtRaw) {
-    if ($Verb -notin @("checkout", "switch")) { return }
+# TWO CLASSES OF VERB, AND THEY ARE NOT INTERCHANGEABLE (BACKLOG #1359). This rule used to take its
+# hand-off by verb and knew only two, so eight of rule 3's twelve that DO move a HEAD were never
+# evaluated against a linked worktree at all: `git -C <somebody else's worktree> reset --hard main`
+# was ALLOWED, and so were the `rebase` and fast-forward `merge` spellings of the same move.
+#
+#   CLASS A, THE BRANCH SWITCH ($hijackSwitchVerbs). Denied wherever the target is a governed linked
+#   worktree, INCLUDING the session's own, because the gate cannot tell a worktree's rightful session
+#   from a squatter (both stand in the same cwd) and a switch onto another in-flight branch is nearly
+#   never what the owner wanted. Narrowed by the DESTINATION instead: only an existing local branch,
+#   only one that is not already HEAD, and only one git would not have refused on its own.
+#
+#   CLASS B, THE HEAD MOVE AIMED FROM OUTSIDE ($hijackHeadMoveVerbs). Denied ONLY when the target tree
+#   is not the tree this session is standing in. That asymmetry is the entire reason the classes are
+#   separate: `git rebase main`, `git merge main` and `git reset --hard main` in your OWN worktree are
+#   the most ordinary things a session does, and BACKLOG #308 already recorded what denying that exact
+#   shape costs -- a block that depended on how the command was SPELLED rather than on what it touched.
+#   No destination analysis here: the harm is aiming a HEAD-moving verb at another session's checkout,
+#   and it is identical whether the destination is a branch, a tag, a raw SHA or absent.
+#
+# THE PER-VERB RULING over rule 3's twelve, one line each. The question asked of every verb: does it
+# move the TARGET worktree's HEAD -- either which ref HEAD names, or which commit that ref names?
+#   checkout     KEPT      class A. Repoints HEAD at another branch. The origin case.
+#   switch       KEPT      class A. The same move, newer spelling.
+#   reset        ADDED     class B. `--hard <ref>` repoints that worktree's branch and rewrites its files.
+#   rebase       ADDED     class B. Rewrites that worktree's branch onto a new base; every SHA changes.
+#   merge        ADDED     class B. A fast-forward moves the branch ref straight onto another branch.
+#   cherry-pick  ADDED     class B. Commits onto that worktree's branch and edits its files.
+#   revert       ADDED     class B. The same shape as cherry-pick: a new commit on that branch.
+#   am           ADDED     class B. Applies a mailbox as commits, advancing that branch.
+#   restore      EXCLUDED  Never moves HEAD. It is the pathspec case class A's `--` bail already allows.
+#   stash        EXCLUDED  Never moves HEAD. It moves UNCOMMITTED work, which this rule never governed.
+#   clean        EXCLUDED  Never moves HEAD. Deletes untracked files only.
+#   apply        EXCLUDED  Never moves HEAD. Writes the working tree and index from a patch.
+#
+# THE FOUR EXCLUSIONS ARE NOT COVERED ANYWHERE ELSE, AND SAYING SO IS THE POINT. Rule 3 catches all
+# twelve only at the PRIMARY, 3c governs `config`, 3d governs `worktree remove|move`. So `git -C
+# <somebody else's worktree> clean -fdx` stays allowed, exactly as it was before this change. That is
+# a stated residual on #1359 -- not coverage. A rule implying it guarded another session's uncommitted
+# work would be a compensating control resting on a false premise.
+#
+# The rightful owner's escape hatch, for either class, is a PLAIN terminal (never gated) or a fresh
+# worktree. Returns normally to ALLOW; calls Write-Deny (which exits) to block.
+#
+# KEEP EACH ASSIGNMENT BELOW ON ONE LINE. tests/test_worktree_gate.py rebuilds a PRE-FIX gate by
+# rewriting the $hijackHeadMoveVerbs line to an empty array, which is how the fail-open direction of
+# this change is MEASURED (BACKLOG #1229) rather than asserted.
+$hijackSwitchVerbs = @("checkout", "switch")
+$hijackHeadMoveVerbs = @("reset", "rebase", "merge", "cherry-pick", "revert", "am")
+function Test-WorktreeHijack([string]$Verb, [string]$Cmd, [string]$WtRaw, [string]$CwdRaw) {
+    $isSwitch = $hijackSwitchVerbs -contains $Verb
+    $isHeadMove = $hijackHeadMoveVerbs -contains $Verb
+    if (-not ($isSwitch -or $isHeadMove)) { return }
 
     # $WtRaw is resolved ONCE by rule 3 (Get-GitTargetCandidatesRaw) and handed down, so the two rules
     # cannot disagree about which tree a command acts on -- they used to have separate parsers, and a real
@@ -1419,26 +1694,32 @@ function Test-WorktreeHijack([string]$Verb, [string]$Cmd, [string]$WtRaw) {
     if (-not $WtRaw) { return }
     $wtRaw = $WtRaw
 
-    # Everything AFTER the first verb, up to the next command separator (so `git checkout x && ...`
-    # does not drag the next command's tokens in). Parsing args here -- not the whole command -- keeps
-    # git's pre-verb `-C`/`-c` globals from being read as checkout's `-b` / switch's `-c`.
-    $after = ($Cmd -replace ('(?s)^.*?\b' + [regex]::Escape($Verb) + '\b'), '')
-    $after = ($after -split '(?:&&|\|\||;|\|)', 2)[0]
-
-    # Not a branch switch onto an existing branch? Leave it alone.
-    #   `--`                       -> pathspec / file restore (`git checkout -- f`, `git checkout r -- f`)
-    #   -b/-B (checkout) / -c/-C (switch) AFTER the verb -> creating a branch, not moving onto one
-    if ($after -cmatch '(^|\s)--(\s|$)') { return }
-    if ($after -cmatch '(^|\s)-[bBcC](?=\s|$)') { return }
-
-    # The destination ref = first positional (non-flag) token after the verb.
+    # CLASS A ONLY, and the guard is the point: every bail below reads a DESTINATION REF, which is what
+    # narrows a branch switch. Class B has no destination to read -- `git reset --hard` with no argument
+    # and `git rebase --abort` both move the target worktree's HEAD -- so running these bails for it
+    # would allow exactly the shapes it exists to catch.
     $dest = $null
-    foreach ($tok in @($after -split '\s+' | Where-Object { $_ })) {
-        if ($tok.StartsWith('-')) { continue }
-        $dest = $tok.Trim('"', "'")
-        break
+    if ($isSwitch) {
+        # Everything AFTER the first verb, up to the next command separator (so `git checkout x && ...`
+        # does not drag the next command's tokens in). Parsing args here -- not the whole command -- keeps
+        # git's pre-verb `-C`/`-c` globals from being read as checkout's `-b` / switch's `-c`.
+        $after = ($Cmd -replace ('(?s)^.*?\b' + [regex]::Escape($Verb) + '\b'), '')
+        $after = ($after -split '(?:&&|\|\||;|\|)', 2)[0]
+
+        # Not a branch switch onto an existing branch? Leave it alone.
+        #   `--`                       -> pathspec / file restore (`git checkout -- f`, `git checkout r -- f`)
+        #   -b/-B (checkout) / -c/-C (switch) AFTER the verb -> creating a branch, not moving onto one
+        if ($after -cmatch '(^|\s)--(\s|$)') { return }
+        if ($after -cmatch '(^|\s)-[bBcC](?=\s|$)') { return }
+
+        # The destination ref = first positional (non-flag) token after the verb.
+        foreach ($tok in @($after -split '\s+' | Where-Object { $_ })) {
+            if ($tok.StartsWith('-')) { continue }
+            $dest = $tok.Trim('"', "'")
+            break
+        }
+        if (-not $dest) { return }
     }
-    if (-not $dest) { return }
 
     # Classify $wtRaw against git itself (robust for BOTH nested .claude/worktrees and sibling
     # worktrees): find the MAIN worktree of whatever repo it belongs to; act only if that main worktree
@@ -1455,6 +1736,63 @@ function Test-WorktreeHijack([string]$Verb, [string]$Cmd, [string]$WtRaw) {
     $selfTopRaw = "$(& git -C $wtRaw rev-parse --show-toplevel 2>$null)".Trim()
     $selfTop = Get-ComparablePath $selfTopRaw
     if (-not $selfTop -or $selfTop -eq $mainWt) { return }        # $wtRaw IS the primary -- Rule 3 owns it
+
+    if ($isHeadMove) {
+        # CLASS B. The target is a governed LINKED worktree; the only remaining question is whether it is
+        # the tree THIS SESSION is standing in. If it is, this is a session doing its own ordinary work
+        # and must be allowed -- see the class note above for why that is not a judgement call.
+        #
+        # RESOLVED THROUGH GIT, NOT BY COMPARING THE TWO PATH STRINGS. A session's cwd is routinely a
+        # SUBDIRECTORY of its worktree (`<wt>/scripts`), and a string comparison calls that a different
+        # tree -- which would deny every session that happened to have stepped into a subdirectory. Both
+        # sides therefore go through `rev-parse --show-toplevel` and are compared as toplevels.
+        #
+        # RAW path into `git -C`, never the Get-ComparablePath form: this file warns three times that a
+        # lowercased path passes on Windows and misses the real directory on a case-sensitive filesystem.
+        #
+        # FAILS OPEN, and the residual is stated rather than implied: if the session's own toplevel does
+        # not resolve -- no cwd in the payload, a cwd outside any repository, any git failure -- this
+        # returns and allows. Treating an unresolved cwd as "therefore not the owner" would deny on a
+        # transient git failure, which is the BACKLOG #308 false positive arriving through a new door.
+        # What it leaves open is a session standing outside every repository reaching into a worktree
+        # with a class B verb; that is narrower than the hole this rule closes, and it is not new.
+        if (-not $CwdRaw) { return }
+        $ownTopRaw = "$(& git -C $CwdRaw rev-parse --show-toplevel 2>$null)".Trim()
+        if ($LASTEXITCODE -ne 0 -or -not $ownTopRaw) { return }
+        if ((Get-ComparablePath $ownTopRaw) -eq $selfTop) { return }   # the session's OWN worktree
+
+        $head = "$(& git -C $wtRaw rev-parse --abbrev-ref HEAD 2>$null)".Trim()
+        # EVERY interpolation goes through one of the two helpers, chosen ONLY by whether the value lands
+        # in PROSE or in a COMMAND (BACKLOG #1040/#1076) -- the same discipline the class A message keeps,
+        # and for the same reason: the branch name below is ATTACKER-CHOSEN from a public fork.
+        #
+        # NO `new.ps1` LINE HERE, unlike class A, and that is deliberate. Class A knows a real destination
+        # branch to hand `-Branch`; class B does not, and the only ref it holds is the branch the VICTIM
+        # worktree has checked out -- for which `new.ps1` would die with "already checked out at ...".
+        # That is the unrunnable-remediation defect of #1032/#1035, so the bullet is omitted rather than
+        # filled with a placeholder the reader would have to guess at.
+        $selfTopQ = Get-SafeForCommand $selfTopRaw
+        $verbMsg = Get-SafeForMessage $Verb
+        $headMsg = Get-SafeForMessage $head
+        Write-Deny -Rule "3b" -Detail "git $Verb -> $selfTopRaw" -Reason @"
+BLOCKED: 'git $verbMsg' would move the HEAD of a LINKED WORKTREE ($(Get-SafeForMessage $selfTopRaw)) that this session is not standing in.
+
+That worktree belongs to another session, which is building on '$headMsg' right now. 'git $verbMsg' repoints
+what that session's branch names and rewrites every file under it mid-task -- silently. Nothing in git
+refuses this: its only worktree guard blocks a second CHECKOUT of a live branch, and a HEAD-moving verb
+aimed at a worktree from outside never trips it. It is a worktree of $(Get-SafeForMessage $gov.Display).
+
+What to do instead:
+  * If this is YOUR work, do it in YOUR OWN worktree -- drop the `-C` (or the `cd`) that aims this command
+    at that directory, and run it where you are standing.
+  * To READ that worktree's branch without touching one file of it, use the plumbing:
+        git -C $selfTopQ show $(Get-SafeForCommand $head -Suffix ':<path>')
+        git -C $selfTopQ diff $(Get-SafeForCommand $head -Prefix 'HEAD..')
+  * If you genuinely OWN that worktree and must do this, do it from a PLAIN terminal -- the gate governs
+    agents, not you. Do not route around this with a shell script; that only hides the collision.
+"@
+        return
+    }
 
     # Only an EXISTING local branch, and only if it is not the branch we are already on (a no-op).
     & git -C $wtRaw rev-parse --verify --quiet ("refs/heads/" + $dest) *> $null
@@ -1620,7 +1958,7 @@ if ($tool -in @("Bash", "PowerShell")) {
     # sibling worktrees and the primary alike. Any git failure falls through to ALLOW.
     # -----------------------------------------------------------------------------------------------
     $dangerKeys = 'core\.hookspath|core\.worktree|alias\.[\w.-]+|include\.path|includeif\.'
-    foreach ($seg in (Get-ScannableSegments $cmd ($tool -eq "Bash"))) {
+    foreach ($seg in (Get-ScannableSegments $cmd (Get-HostConvention $tool))) {
         if ($seg.Scan -cnotmatch $gitInvocation) { continue }
         # [regex]::Match RATHER THAN `-notmatch`, FOR ITS INDEX (BACKLOG #1065). The pattern STRING is
         # unchanged; what is new is that the rule can now ask WHERE on the line the disarm sits, which is
@@ -2004,7 +2342,7 @@ What to do instead:
     # entirely. Ask git whether the path is a registered worktree of a governed repo instead. Any git
     # failure -- a path that is not a worktree, or does not exist -- falls through to ALLOW.
     # -----------------------------------------------------------------------------------------------
-    foreach ($seg in (Get-ScannableSegments $cmd ($tool -eq "Bash"))) {
+    foreach ($seg in (Get-ScannableSegments $cmd (Get-HostConvention $tool))) {
         if ($seg.Scan -cnotmatch $gitInvocation) { continue }
         if ($seg.Scan -cnotmatch '\bworktree\s+(?<wtverb>remove|move)(?=\s|$)') { continue }
         $wtVerb = $Matches['wtverb']
@@ -2293,7 +2631,7 @@ $cleanupBullet
     # must not second-guess it -- `cd <primary> && git -C <sibling> rebase` acts on the sibling, and
     # denying it because the primary's path appears in the `cd` is a false positive.
     $anyInferredTarget = $false
-    foreach ($seg in (Get-ScannableSegments $cmd ($tool -eq "Bash"))) {
+    foreach ($seg in (Get-ScannableSegments $cmd (Get-HostConvention $tool))) {
         # Match a git invocation however it is spelled: git, git.exe, or an absolute path to either.
         if ($seg.Scan -cnotmatch $gitInvocation) { continue }
         if ($seg.Scan -cnotmatch "\bgit(\.exe)?\b[^|;&]*?\s(?<verb>$verbs)(?=\s|$)") { continue }
@@ -2391,10 +2729,14 @@ $cleanupBullet
     }
     if (-not $root) {
         # Not the shared primary. It may still be a governed LINKED WORKTREE being hijacked onto an
-        # existing branch (rule 3b) -- Write-Deny + exit if so; otherwise this returns and we allow.
+        # existing branch, or having its HEAD moved from outside (rule 3b) -- Write-Deny + exit if so;
+        # otherwise this returns and we allow.
         # Hand down the LINE the verb was found on and the tree already resolved from it, so 3b judges
-        # the same command rule 3 did (including one recursed out of an interpreter argument).
-        Test-WorktreeHijack $verb $verbLine $targetRaw
+        # the same command rule 3 did (including one recursed out of an interpreter argument). The
+        # session cwd goes down too: 3b's class B needs to tell "another session's worktree" from "the
+        # one I am standing in", and reading a script-scope variable inside the function would hide that
+        # dependency from the reader of the call site.
+        Test-WorktreeHijack $verb $verbLine $targetRaw $cwdRaw
         exit 0
     }
 

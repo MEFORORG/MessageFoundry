@@ -4,6 +4,11 @@
 
 from __future__ import annotations
 
+import sqlite3
+from pathlib import Path
+
+import pytest
+
 from messagefoundry.store.store import MessageStore
 
 
@@ -132,5 +137,123 @@ async def test_delete_user_cascades_roles_and_sessions() -> None:
         assert await store.get_user("u1") is None
         assert await store.get_user_role_ids("u1") == []
         assert await store.get_session("t") is None
+    finally:
+        await store.close()
+
+
+# ---------------------------------------------------------------------------------------------
+# BACKLOG #1139 (ASVS 6.3.7): ``users.email`` is the PROFILE MIRROR, ``users.notify_email`` is the
+# ENGINE-OWNED NOTIFICATION ADDRESS, and the two are separate columns so a directory repoint cannot
+# replace the address the resulting notice has to reach.
+#
+# Every test below fails on the pre-split schema, three of them on a column and a method that did
+# not exist. That is the point: there was one column, so there was nothing to assert about a second.
+# ---------------------------------------------------------------------------------------------
+
+
+async def test_create_user_seeds_the_notification_address_from_the_one_it_is_given() -> None:
+    """Account birth is the one moment the engine adopts an address without a separate decision --
+    there is exactly one in hand. An account created with none carries none, and NULL is the honest
+    encoding: the notifier drops such a notice rather than sending to an empty string."""
+    store = await _store()
+    try:
+        await store.create_user(
+            user_id="u1", username="alice", auth_provider="local", email="a@example.org"
+        )
+        await store.create_user(user_id="u2", username="bob", auth_provider="local")
+        await store.create_user(user_id="u3", username="carol", auth_provider="local", email="   ")
+        alice = await store.get_user("u1")
+        assert alice is not None
+        assert alice.email == "a@example.org" and alice.notify_email == "a@example.org"
+        bob = await store.get_user("u2")
+        assert bob is not None and bob.notify_email is None
+        # Blank normalises to NULL rather than entering the column as an address that is present
+        # and undeliverable.
+        carol = await store.get_user("u3")
+        assert carol is not None and carol.notify_email is None
+    finally:
+        await store.close()
+
+
+async def test_the_directory_sync_write_cannot_move_the_notification_address() -> None:
+    """THE DEFECT, at the store layer. ``update_user_profile`` is the ONLY call ``_upsert_ad_user``
+    makes against an existing account, and it runs on every AD/OIDC login with whatever the
+    directory's ``mail`` attribute says. Before the split it wrote the notification target, so a
+    repointed directory attribute would silently become the destination of every later notice on the
+    account -- including the notice about the repoint itself."""
+    store = await _store()
+    try:
+        await store.create_user(
+            user_id="u1", username="alice", auth_provider="ad", email="a@corp.example"
+        )
+        # The directory now says something else. This is exactly the shape of a repoint.
+        await store.update_user_profile("u1", display_name="Alice A", email="attacker@evil.example")
+        user = await store.get_user("u1")
+        assert user is not None
+        assert user.email == "attacker@evil.example"  # the mirror follows the directory
+        assert user.notify_email == "a@corp.example"  # the notification target does not
+        # An absent directory attribute is the same story: it clears the mirror, never the target.
+        await store.update_user_profile("u1", display_name="Alice A", email=None)
+        user = await store.get_user("u1")
+        assert user is not None and user.email is None
+        assert user.notify_email == "a@corp.example"
+    finally:
+        await store.close()
+
+
+async def test_the_notification_address_is_repointable_but_not_erasable() -> None:
+    """THE DURABILITY RULE. Requiring an address at creation would not have made it durable, because
+    an explicit null still strips it afterwards -- and a stripped account is excluded from every
+    later notice, since ``SecurityEventNotifier.notify`` returns early on an empty address. So the
+    setter takes a non-empty ``str``: a repoint is allowed and an erasure is refused."""
+    store = await _store()
+    try:
+        await store.create_user(
+            user_id="u1", username="alice", auth_provider="local", email="a@example.org"
+        )
+        await store.set_user_notify_email("u1", email="new@example.org")
+        user = await store.get_user("u1")
+        assert user is not None and user.notify_email == "new@example.org"
+        # The whitespace-only string is the clear the ``str`` type cannot refuse on its own, so the
+        # implementation refuses it. Without this arm, "" enters the column and reads as present.
+        for blank in ("", "   ", "\t\n"):
+            with pytest.raises(ValueError, match="non-empty"):
+                await store.set_user_notify_email("u1", email=blank)
+        user = await store.get_user("u1")
+        assert user is not None and user.notify_email == "new@example.org"  # still standing
+    finally:
+        await store.close()
+
+
+async def test_the_schema_upgrade_seeds_the_new_column_on_a_pre_split_database(
+    tmp_path: Path,
+) -> None:
+    """A database opened before the split has no ``notify_email``, and NULL on every row would mean
+    every existing account silently stopped receiving notices. The ADD is therefore paired with a
+    one-time seed from the column that IS the notification target on that schema.
+
+    Driven against a REAL pre-split table rather than a fresh open: a fresh open runs the CREATE
+    TABLE, which already carries the column, so it would exercise nothing.
+    """
+    db = tmp_path / "pre-split.db"
+    store = await MessageStore.open(str(db))
+    try:
+        await store.create_user(
+            user_id="u1", username="alice", auth_provider="local", email="a@example.org"
+        )
+        await store.create_user(user_id="u2", username="bob", auth_provider="local")
+    finally:
+        await store.close()
+    # Drop the column to reproduce the pre-split shape (SQLite supports DROP COLUMN since 3.35).
+    with sqlite3.connect(db) as raw:
+        raw.execute("ALTER TABLE users DROP COLUMN notify_email")
+        cols = {r[1] for r in raw.execute("PRAGMA table_info(users)")}
+        assert "notify_email" not in cols  # positive control: the column really is gone
+    store = await MessageStore.open(str(db))
+    try:
+        alice = await store.get_user("u1")
+        assert alice is not None and alice.notify_email == "a@example.org"
+        bob = await store.get_user("u2")
+        assert bob is not None and bob.notify_email is None  # nothing to seed from
     finally:
         await store.close()

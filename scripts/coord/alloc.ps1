@@ -26,9 +26,28 @@
     Numbers are never reclaimed. An abandoned branch holds its number forever and the sequence develops
     holes. That is deliberate: holes are free, collisions are not.
 
+    -For NAMES THE OWNER AT BIRTH. IT IS NOT A TRANSFER VERB, AND THE DIFFERENCE IS THE WHOLE ARGUMENT.
+    A claim records the tree that will COMMIT the number, and by default that is the tree the allocator
+    runs in. When one seat allocates on another seat's behalf -- a Console reading the backlog and
+    cutting a brief for a Builder in a different worktree -- the default records the wrong tree, both of
+    ledger_check.py's ownership keys miss, and the gate correctly refuses the Builder's commit. Nothing
+    can then move the number, so the work is re-filed at a fresh one and the first is burned. Measured
+    on this clone: BACKLOG #1297/#1298, #1422/#1423 and #1425/#1426 are three such pairs.
+
+    A TRANSFER verb was considered and DECLINED (docs/LEDGER-GATE.md): it "puts a hole in the
+    non-transferable rule the gate rests on", because it would let a seat take a number another session
+    is actively holding. -For does not, and cannot: it sets the owner inside the same atomic CreateNew
+    that ISSUES the number, at an instant when no session holds it and none can. No existing claim's
+    owner is ever changed, by this switch or any other. The exclusivity the gate rests on is untouched.
+
+    It REFUSES a path that is not a live worktree of THIS clone, because the failure it exists to
+    prevent is a claim born pointing somewhere the gate will never accept -- and a silent typo would
+    reproduce that exactly.
+
 .EXAMPLE
     pwsh -NoProfile -File scripts\coord\alloc.ps1 -Kind adr -Title "Worktree gate"
     pwsh -NoProfile -File scripts\coord\alloc.ps1 -Kind backlog -Title "Ledger allocator"
+    pwsh -NoProfile -File scripts\coord\alloc.ps1 -Kind backlog -Title "Builder's item" -For C:\path\to\builder\worktree
     pwsh -NoProfile -File scripts\coord\alloc.ps1 -List
 #>
 [CmdletBinding()]
@@ -45,7 +64,12 @@ param(
     # on the question. That makes the floor's own correctness the one property nobody re-tests, which
     # is how it went a whole release reading two refs while its header promised all of them. A gate
     # that cannot be inspected without altering the thing it guards will not be inspected.
-    [switch]$ShowFloor
+    [switch]$ShowFloor,
+    # Record the claim against ANOTHER live worktree of this clone -- the one that will commit the
+    # number -- instead of the tree this allocator runs in. See the -For discussion in .DESCRIPTION:
+    # it names the owner at BIRTH and never moves an existing claim, so it is not the transfer verb
+    # docs/LEDGER-GATE.md declined.
+    [string]$For
 )
 
 $ErrorActionPreference = "Stop"
@@ -95,6 +119,35 @@ if (-not $Title -and -not $ShowFloor) { throw "-Title is required (it is recorde
 $branch = & git -C $repo branch --show-current
 if ([string]::IsNullOrWhiteSpace($branch)) { $branch = "detached@" + (& git -C $repo rev-parse --short HEAD) }
 $branch = $branch.Trim()
+
+# THE RECORDED OWNER, WHICH IS NOT NECESSARILY THE TREE WE ARE RUNNING IN.
+#
+# $repo stays the tree the FLOOR is computed against -- every sweep below reads this checkout, and
+# repointing it at -For would make a number drafted here invisible and free to re-issue, which is the
+# collision the whole script exists to prevent. Only the two recorded fields move.
+$ownerRepo = $repo
+$ownerBranch = $branch
+if ($For) {
+    # Resolve through git rather than through the filesystem, so the recorded string is BYTE-IDENTICAL
+    # to what ledger_check.py will compute when it runs there. Both comparisons casefold and swap
+    # separators today, so this is belt and braces -- but the recorded value is a field nothing pins,
+    # and deriving it two different ways is how the two definitions start drifting.
+    $target = (& git -C $For rev-parse --path-format=absolute --show-toplevel 2>$null)
+    if (-not $target) { throw "-For '$For' is not inside a git worktree, so a claim recorded to it could never be committed." }
+    $target = $target.Trim()
+    # SAME CLONE, CHECKED. The registry lives under this clone's common dir, so a claim recorded to a
+    # worktree of a DIFFERENT clone is stranded the instant it is written: that clone has its own
+    # registry and will never look here. Refusing beats writing an unusable claim.
+    $targetCommon = (& git -C $target rev-parse --path-format=absolute --git-common-dir 2>$null)
+    if (-not $targetCommon) { throw "-For '$For' has no resolvable git common dir." }
+    if (($targetCommon.Trim() -replace '\\', '/').TrimEnd('/') -ine ($common -replace '\\', '/').TrimEnd('/')) {
+        throw "-For '$target' belongs to a DIFFERENT clone. Its allocations live in that clone's own registry, so a claim written here would never be found."
+    }
+    $ownerRepo = $target
+    $ownerBranch = & git -C $target branch --show-current
+    if ([string]::IsNullOrWhiteSpace($ownerBranch)) { $ownerBranch = "detached@" + (& git -C $target rev-parse --short HEAD) }
+    $ownerBranch = $ownerBranch.Trim()
+}
 
 # FLOOR = max over (origin/main) U (every local + remote ref) U (existing allocations).
 function Get-Floor {
@@ -408,8 +461,8 @@ for ($i = $start; $i -lt $start + 500; $i++) {
             number   = $name
             kind     = $Kind
             title    = $Title
-            branch   = $branch
-            worktree = $repo
+            branch   = $ownerBranch
+            worktree = $ownerRepo
             claimed  = (Get-Date).ToString("o")
         } | ConvertTo-Json -Compress
         $bytes = [System.Text.Encoding]::UTF8.GetBytes($claim)
@@ -429,7 +482,14 @@ for ($i = $start; $i -lt $start + 500; $i++) {
         Write-Host "  heading : ## $name. $Title"
         Write-Host "  file    : docs/BACKLOG.md"
     }
-    Write-Host "  claimed by: $repo [$branch]"
+    Write-Host "  claimed by: $ownerRepo [$ownerBranch]"
+
+    # -For is a deliberate redirection, so the surprise note below (which fires on the ACCIDENTAL kind)
+    # would be noise. Say the useful thing instead: which tree has to do the committing.
+    if ($For) {
+        Write-Host "  -For: recorded to the named worktree, NOT the one this ran in. Commit from" -ForegroundColor Yellow
+        Write-Host "        $ownerRepo -- the gate will refuse it anywhere else." -ForegroundColor Yellow
+    }
 
     # SAY IT AT THE POINT OF USE when the shell is standing somewhere else (BACKLOG #1060). Anchoring is
     # now correct, but it is also SURPRISING: a caller who runs this by absolute path from worktree A gets
@@ -438,7 +498,7 @@ for ($i = $start; $i -lt $start + 500; $i++) {
     # deferred, misdirected refusal into an immediate, accurate note. Silent on the ordinary same-tree
     # invocation, so it stays worth reading.
     $cwdTop = (& git rev-parse --path-format=absolute --show-toplevel 2>$null)
-    if ($cwdTop) {
+    if ($cwdTop -and -not $For) {
         $a = ($cwdTop.Trim() -replace '\\', '/').TrimEnd('/')
         $b = ($repo -replace '\\', '/').TrimEnd('/')
         if ($a -ine $b) {
