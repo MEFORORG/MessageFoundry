@@ -167,12 +167,23 @@ bounded, `RetentionSettings` 13 of 13 and `PipelineSettings` 9 of 9 among them. 
 and was not applied in the authentication section, which is the worst place for it to be missing.
 
 Confirmed by execution, all of these load clean today: `password_min_length = 0`,
-`lockout_threshold = 0`, `lockout_minutes = -1`, `session_idle_timeout_minutes = 0`,
-`max_sessions_per_user = -1`, `step_up_max_age_seconds = 1_000_000_000`, and
-`login_rate_limit_per_ip = 0` -- the last of which **disables the brute-force bound**, because
-`SlidingWindowRateLimiter` gates on `bool(self._per_key)`. That one is fail-OPEN, while
-`oidc_flow_cache_max = 0` is fail-CLOSED, so two limiters wired from adjacent fields in the same
-section give `0` opposite meanings and neither is refused at load.
+`lockout_threshold = 0`, `lockout_minutes = -1`, `max_sessions_per_user = -1`,
+`step_up_max_age_seconds = 1_000_000_000`, and `login_rate_limit_per_ip = 0` -- the last of which
+**disables the brute-force bound**, because `SlidingWindowRateLimiter` gates on
+`bool(self._per_key)`. That one is fail-OPEN, while `oidc_flow_cache_max = 0` is fail-CLOSED, so
+two limiters wired from adjacent fields in the same section give `0` opposite meanings and neither
+is refused at load.
+
+**The idle timeout belongs in that list, and it reaches the field by a different spelling.**
+`session_idle_timeout_minutes` is an unbounded numeric `AuthSettings` field like the six above.
+ADR 0118 moved its operator-facing name, so `_reject_relocated_keys` raises on the `[auth]`
+spelling before the value reaches validation. The form an operator can write is
+`[security].sign_out_after_idle_minutes`. Measured here, it loads clean at `0` and at `-1`, and
+desugars through `_SECURITY_PASSTHROUGH` onto that same field. **Relocating a key to its canonical
+home did not bound it.** The refusal governs where the switch lives, not what it may hold, so this
+section's bounds gap survives the move. This packet's own first draft of the list used the `[auth]`
+spelling, which no reader could have pasted; `tests/test_docs_cite_no_refused_config_keys.py`
+caught it.
 
 **A blanket floor would be wrong**, which is why this is a filing and not a sweep: `0` is a
 documented, load-bearing "off" for at least `mfa_recovery_code_count`, `ad_session_recheck_seconds`
