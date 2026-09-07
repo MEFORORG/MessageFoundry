@@ -59,3 +59,18 @@ messagefoundry/** text=auto eol=lf
 /README.md text=auto eol=lf
 /CHANGELOG.md text=auto eol=lf
 /pyproject.toml text=auto eol=lf
+
+# tee/anon/ is a VENDORED COPY of messagefoundry/anon/, and tests/test_anon_parity.py compares the
+# two BYTE FOR BYTE. The stanza above pins the engine side. Leaving this side unpinned makes that
+# comparison fail on any Windows checkout with `core.autocrlf=true`, because git converts the
+# unpinned copy and not the pinned one -- the files agree in the repository and differ on disk.
+# Measured on this PR's own CI: both parity tests failed on windows-2022 and windows-2025 and
+# PASSED on ubuntu-latest, where no conversion happens.
+#
+# This is NOT the shipped-set rule above and must not be folded into it: `tee/` does not ship, so
+# `test_every_shipped_path_is_pinned_to_lf` never reaches it. The rule here is narrower and its own
+# thing -- two files compared for byte equality must share one line-ending policy, wherever they
+# live. Scoped to `anon/` rather than all of `tee/` because that is exactly the compared surface:
+# every path the parity test reads is `tee/anon/<name>`, and a future file added to that directory
+# and to _BYTE_IDENTICAL is covered without widening the pin to tee's own unvendored modules.
+tee/anon/** text=auto eol=lf
