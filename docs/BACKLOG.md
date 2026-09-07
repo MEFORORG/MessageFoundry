@@ -25072,3 +25072,34 @@ A PAR client on the relying-party side: POST the authorization parameters to the
 
 This row was **filed, not built**. Nobody has read the pinned requirement text against `flow.py` for this row's purposes, and no provider-support survey was run. The `na` ruling above is reported as the routing fact that makes this row necessary; this row does not re-derive it and does not depend on it being correct.
 
+
+## 1483. apply.py's module docstring enumerates the evidence fields and so denies the two it carries
+
+> 🔢 **Filed 2026-09-07 -- not started.** Value **3/10** · Difficulty **1/10** · _fill-in_. `scripts/asvs/apply.py`'s module docstring advertises its input as `evidence:[{path,line,expect}]`. That is a name-keyed enumeration of the fields that happen to exist today, and it sits one screen above `_carried()`, whose own docstring forbids exactly that. The writer in fact carries every key it does not ORDER, so `sym` and `ctx` survive a whole-block replacement. A reader who believes the header concludes the opposite.
+> Verdict: build
+> Research: none
+> Closing-act: code
+
+**Cluster:** tooling / ASVS scorecard writer. **Priority:** P3. **Verdict:** build.
+**Severity:** sec. 0 applies -- zero deployments, and this is a developer-facing doc defect in a vault-writing tool rather than anything a deploying site would carry. The value is 3 because the failure it invites damages a **security record**, not because the engine is exposed.
+
+### The defect is that the header does the thing the function below it forbids
+
+`_carried()` states the rule in terms: *"enumerate what you ORDER, never what you KEEP"*, and *"Deliberately NOT keyed on the field names that happen to exist today: a name-keyed fix satisfies the symptom and drops the next field anyone adds, which is the defect itself with a longer list."*
+
+The module docstring is a name-keyed enumeration of today's fields. This is CLAUDE.md section 11's **SDS-3.6** -- prefer *"at least"* to an enumeration -- with the code's own reasoning already written out beside it.
+
+### Why it is worth a row rather than a shrug: it recruits careful readers into the failure
+
+The harm path is not "a reader is mildly misinformed". It is specific and it runs the wrong way:
+
+1. A reader takes the header as exhaustive and concludes the writer will drop `sym` and `ctx`.
+2. Those are the assertion fields. The verifier's own output says **absence of the field is NOT agreement**, so losing them silently weakens the evidence rather than breaking anything visibly.
+3. The careful response to that belief is to hand-edit the TOML "to preserve them".
+4. The hand edit is what actually loses them -- along with the block-level guards `apply.py` applies -- because the tool would have kept them all along.
+
+**This is a near-miss and not a hypothesis.** A Manager seat briefed a builder to hand-edit the scorecard before finding that `apply.py` existed. Recorded 2026-09-07 by the two seats that hit it from opposite directions.
+
+### Closing act
+
+One docstring edit in `scripts/asvs/apply.py`, stating that the listed keys are the ones the writer ORDERS and that any other key is carried verbatim. Deliberately **no count** of the carried fields: a tally in a docstring goes stale silently, which is the same defect wearing a number.
