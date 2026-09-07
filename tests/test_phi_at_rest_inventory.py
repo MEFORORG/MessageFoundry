@@ -39,6 +39,7 @@ import textwrap
 from pathlib import Path
 
 import pytest
+from _cipher_registry import covered_pairs, string_pairs
 
 from messagefoundry.config.settings import ServiceSettings
 from messagefoundry.store.base import Store
@@ -183,70 +184,9 @@ def _section(number: int, text: str | None = None) -> str:
 # --- code-derived cipher registry ----------------------------------------------------------------
 
 
-def _cell_aad_pairs() -> set[tuple[str, str]]:
-    """Every ``cell_aad("<table>", "<column>", ...)`` literal call across the package."""
-    pairs: set[tuple[str, str]] = set()
-    for path in sorted(_PKG.rglob("*.py")):
-        tree = ast.parse(path.read_text(encoding="utf-8"))
-        for node in ast.walk(tree):
-            if not (
-                isinstance(node, ast.Call)
-                and isinstance(node.func, ast.Name)
-                and node.func.id == "cell_aad"
-                and len(node.args) >= 2
-            ):
-                continue
-            first, second = node.args[0], node.args[1]
-            if not (isinstance(first, ast.Constant) and isinstance(second, ast.Constant)):
-                continue
-            table, column = first.value, second.value
-            if isinstance(table, str) and isinstance(column, str):
-                pairs.add((table, column))
-    return pairs
-
-
-def _string_pairs(node: ast.AST) -> set[tuple[str, str]]:
-    out: set[tuple[str, str]] = set()
-    for sub in ast.walk(node):
-        if not (isinstance(sub, ast.Tuple) and len(sub.elts) == 2):
-            continue
-        first, second = sub.elts
-        if not (isinstance(first, ast.Constant) and isinstance(second, ast.Constant)):
-            continue
-        table, column = first.value, second.value
-        if isinstance(table, str) and isinstance(column, str):
-            out.add((table, column))
-    return out
-
-
-def _migration_pass_pairs() -> set[tuple[str, str]]:
-    """Literal ``(table, column)`` pairs in each backend's cipher registry / migration / rotation code.
-
-    Only pairs whose first element is a table that backend's own DDL creates are kept, so AAD *column*
-    tuples (``("namespace", "key")``, ``("attachment_id", "seq")``) can never masquerade as tiers.
-    """
-    pairs: set[tuple[str, str]] = set()
-    for path in _BACKEND_MODULES:
-        src = path.read_text(encoding="utf-8")
-        tables = {m.lower() for m in _CREATE_TABLE_RE.findall(src)}
-        tree = ast.parse(src)
-        for node in ast.walk(tree):
-            interesting = isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef) and (
-                node.name in _CIPHER_PASS_FUNCS
-            )
-            if isinstance(node, ast.Assign) and any(
-                isinstance(t, ast.Name) and t.id == "_CIPHER_COLUMNS" for t in node.targets
-            ):
-                interesting = True
-            if not interesting:
-                continue
-            pairs |= {p for p in _string_pairs(node) if p[0].lower() in tables}
-    return pairs
-
-
 def _cipher_cells() -> set[str]:
     """The code-derived set of ``table.column`` tokens the doc must classify."""
-    return {f"{t}.{c}" for t, c in (_cell_aad_pairs() | _migration_pass_pairs())}
+    return {f"{t}.{c}" for t, c in covered_pairs()}
 
 
 # --- assertions (reusable so the self-test can plant an omission) --------------------------------
@@ -704,7 +644,7 @@ def _per_backend_cipher_counts() -> dict[str, int]:
             ):
                 interesting = True
             if interesting:
-                pairs |= {p for p in _string_pairs(node) if p[0].lower() in tables}
+                pairs |= {p for p in string_pairs(node) if p[0].lower() in tables}
             if (
                 isinstance(node, ast.Call)
                 and isinstance(node.func, ast.Name)

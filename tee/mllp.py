@@ -129,7 +129,16 @@ def build_ack(message: bytes, *, code: str = "AA", timestamp: str | None = None)
     receiving_fac = _no_seg_sep(_field(parts, 5))
     control = _no_seg_sep(_field(parts, 9))
     version = _no_seg_sep(_field(parts, 11)) or "2.5.1"
-    ts = timestamp or datetime.now().strftime("%Y%m%d%H%M%S")
+    # MSH-7 carries an explicit numeric UTC offset (BACKLOG #1196), matching the engine's own
+    # build_ack. A bare local stamp is ambiguous across a daylight-saving fall-back, where the
+    # same wall-clock hour occurs twice, so a partner correlating this acknowledgement against
+    # its own UTC-stamped record would mis-order events by an hour. astimezone() attaches the
+    # host's offset for THIS instant, so the value stays correct either side of a transition.
+    #
+    # Spelled out here rather than imported: the tee is standalone by construction and imports
+    # no messagefoundry module, so it cannot reuse timezone.hl7_now. The two must be kept in
+    # step by hand, and tests/test_tee_mllp.py pins the form on this side.
+    ts = timestamp or datetime.now().astimezone().strftime("%Y%m%d%H%M%S%z")
 
     msh = field_sep.join(
         [

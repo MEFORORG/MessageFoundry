@@ -453,7 +453,11 @@ INVENTORY: dict[str, frozenset[str]] = {
     # signer (`signer_from_destination`) and emits detached JWS signature headers per request, so
     # it performs signature crypto through the signing seam with none of the six stdlib imports of
     # its own. It appeared nowhere in this gate before the seam entry was added.
-    "messagefoundry/transports/fhir.py": frozenset({"messagefoundry.transports.signing"}),
+    # #1180 (ASVS 12.3.4) adds the TLS-policy seam alongside it: the same hop now resolves its
+    # trust anchor through the common helper instead of building a context of its own.
+    "messagefoundry/transports/fhir.py": frozenset(
+        {"messagefoundry.config.tls_policy", "messagefoundry.transports.signing"}
+    ),
     "messagefoundry/transports/remotefile.py": frozenset(
         {"messagefoundry.config.tls_policy", "ssl", "hashlib"}
     ),
@@ -498,7 +502,11 @@ INVENTORY: dict[str, frozenset[str]] = {
     # ADR 0019 §5: the `vault` connector-secret provider does a Vault KV v2 read of a connector
     # credential (AD bind / SMTP password) over hvac, fail-closed, value never logged — the delegated
     # transport/crypto is hvac's (behind the optional [vault] extra, lazy-imported).
-    "messagefoundry/config/secretprovider_vault.py": frozenset({"hvac"}),
+    # #1180 (ASVS 12.3.4): also resolves the Vault hop's trust anchor through the TLS-policy
+    # seam, so an operator-named internal CA reaches hvac's single `verify=` bundle path.
+    "messagefoundry/config/secretprovider_vault.py": frozenset(
+        {"hvac", "messagefoundry.config.tls_policy"}
+    ),
     # BACKLOG #31: the lazy [xml]-extra loader for signxml (which pulls cryptography for the XML-DSig
     # digest/signature primitives). The sibling parsing/xml/signature.py hashlib anchor already
     # documents the DSig primitives; this loader is where the signxml dependency actually enters.
@@ -528,8 +536,9 @@ INVENTORY: dict[str, frozenset[str]] = {
     ),
     # ADR 0019: the Vault Transit KeyProvider envelope-unwraps the store DEK INSIDE Vault over hvac
     # (fail-closed; key material never logged), reusing store.keyprovider's errors + retired-key split.
+    # #1180 (ASVS 12.3.4): also resolves the Vault hop's trust anchor through the TLS-policy seam.
     "messagefoundry/store/keyprovider_vault.py": frozenset(
-        {"hvac", "messagefoundry.store.keyprovider"}
+        {"hvac", "messagefoundry.config.tls_policy", "messagefoundry.store.keyprovider"}
     ),
     # --- non-messagefoundry roots (#283's _CRYPTO_SITES_OUTSIDE_THE_PACKAGE, now walked by this gate) ---
     # ASVS 3.4.7/3.4.8: mints the per-response CSP script nonce (secrets) stamped into <script> for the
