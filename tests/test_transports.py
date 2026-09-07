@@ -10,7 +10,9 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import re
 import time
+from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -20,6 +22,7 @@ from messagefoundry.config.wiring import MLLP, File
 from messagefoundry.parsing import RawMessage
 from messagefoundry.parsing.compression import gzip_compress, gzip_decompress
 from messagefoundry.parsing.peek import Peek
+from messagefoundry.timezone import parse_hl7_timestamp
 from messagefoundry.transports import build_destination, build_source
 from messagefoundry.transports.base import (
     DeliveryError,
@@ -92,6 +95,9 @@ def test_decoder_discards_inter_frame_noise() -> None:
 
 # --- ACK building ------------------------------------------------------------
 
+#: An HL7 v2 DTM to whole seconds carrying an explicit numeric UTC offset (the MSH-7 the ACK stamps).
+_DTM_WITH_OFFSET = re.compile(r"(?P<stem>\d{14})(?P<offset>[+-]\d{4})")
+
 
 def test_build_ack_accept_swaps_sender_receiver_and_echoes_control() -> None:
     ack = build_ack(ADT, code="AA", timestamp="20260604120001")
@@ -106,11 +112,47 @@ def test_build_ack_accept_swaps_sender_receiver_and_echoes_control() -> None:
 
 
 def test_build_ack_defaults_msh7_to_now() -> None:
-    # An omitted timestamp must yield a populated MSH-7 (a 14-digit HL7 DTM), not an empty field a
+    # An omitted timestamp must yield a populated MSH-7 (an HL7 DTM), not an empty field a
     # strict sender would reject (low-6). An explicit timestamp is still honored (test above).
     ack = build_ack(ADT, code="AA")
     msh7 = Peek.parse(ack).field("MSH-7")
-    assert msh7 is not None and len(msh7) == 14 and msh7.isdigit()
+    assert msh7 is not None and _DTM_WITH_OFFSET.fullmatch(msh7)
+
+
+def test_build_ack_msh7_carries_an_explicit_utc_offset() -> None:
+    # BACKLOG #1196: a bare local stamp is ambiguous across a daylight-saving fall-back, so the
+    # default MSH-7 must carry the HL7 v2 +/-ZZZZ offset. Pin the offset VALUE, not just the shape:
+    # a stamp that appends the wrong offset still matches the grammar.
+    ack = build_ack(ADT, code="AA")
+    msh7 = Peek.parse(ack).field("MSH-7")
+    assert msh7 is not None
+    m = _DTM_WITH_OFFSET.fullmatch(msh7)
+    assert m is not None, f"MSH-7 {msh7!r} is not a DTM with an explicit offset"
+
+    host_offset = datetime.now().astimezone().utcoffset()
+    assert host_offset is not None
+    total = int(host_offset.total_seconds() // 60)
+    sign = "+" if total >= 0 else "-"
+    expected = f"{sign}{abs(total) // 60:02d}{abs(total) % 60:02d}"
+    assert m.group("offset") == expected
+
+
+def test_build_ack_msh7_offset_pins_the_right_instant() -> None:
+    # The offset must be attached to the wall-clock reading it belongs to. Stamping UTC digits with
+    # the local offset (or local digits with +0000) matches the grammar above and is still an hour
+    # or more wrong, so resolve MSH-7 to an absolute instant and compare against UTC now.
+    ack = build_ack(ADT, code="AA")
+    msh7 = Peek.parse(ack).field("MSH-7")
+    assert msh7 is not None
+    naive, precision, offset = parse_hl7_timestamp(msh7)
+    assert precision == "second"
+    assert offset is not None
+    sign = 1 if offset[0] == "+" else -1
+    stamped = naive.replace(
+        tzinfo=timezone(timedelta(hours=sign * int(offset[1:3]), minutes=sign * int(offset[3:5])))
+    )
+    drift = abs((stamped - datetime.now(UTC)).total_seconds())
+    assert drift < 120, f"MSH-7 {msh7!r} resolves {drift}s away from now"
 
 
 def test_build_ack_enhanced_mode_uses_commit_codes() -> None:

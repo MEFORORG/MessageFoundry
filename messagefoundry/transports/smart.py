@@ -48,6 +48,7 @@ from typing import TYPE_CHECKING, Any
 from messagefoundry.config.models import ConnectorType, Destination, SignatureAlgorithm
 from messagefoundry.config.tls_policy import InsecureHopRefused
 from messagefoundry.transports.base import DeliveryError
+from messagefoundry.transports.bounded_read import MAX_TOKEN_RESPONSE_BYTES, read_bounded_text
 
 # Reuse rest.py's hardened opener + URL redaction (no new HTTP plumbing) — exactly as fhir.py/soap.py
 # do. rest.py imports this module's provider LAZILY (inside __init__) so there is no import cycle.
@@ -267,7 +268,16 @@ class SmartBackendTokenProvider:
         )
         try:
             with self._opener.open(req, timeout=self.timeout_seconds) as resp:
-                body = resp.read().decode("utf-8", errors="replace")
+                # ASVS 15.2.2: bounded on the socket read, at the tighter token ceiling. A SMART
+                # Backend Services token response is a bearer, a TTL and a scope list; anything past
+                # 256 KiB is not one. Over-cap raises ResponseTooLargeError, already a DeliveryError,
+                # so it takes this provider's normal mint-failure path.
+                body = read_bounded_text(
+                    resp,
+                    limit=MAX_TOKEN_RESPONSE_BYTES,
+                    connector=f"SMART token endpoint {_redact_url(self.token_url)}",
+                    encoding="utf-8",
+                )
         except urllib.error.HTTPError as exc:
             raise DeliveryError(
                 f"SMART token endpoint {_redact_url(self.token_url)} returned HTTP {exc.code}"
