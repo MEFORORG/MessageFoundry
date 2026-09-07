@@ -250,3 +250,76 @@ def test_known_phi_fields_are_mapped() -> None:
     assert set(gated_properties(OutboxInfo)) == {"last_error"}
     assert set(gated_properties(EventInfo)) == {"detail"}
     assert set(gated_properties(CapturedResponseInfo)) == {"detail"}
+
+
+# --- metadata is masked until revealed (BACKLOG #1187, ASVS 14.2.6) -----------------------------
+
+
+def test_metadata_is_masked_on_a_list_surface_and_complete_on_a_reveal() -> None:
+    """``metadata`` is display-masked like ``summary``, not returned complete beside a masked field.
+
+    ``PHI_FIELDS`` rates ``metadata`` on the same view_summary tier as ``summary``, for the same
+    reason: it carries ingest-derived MRN and patient-name PHI. Before BACKLOG #1187 only ``summary``
+    was in ``MASKED_UNTIL_REVEALED``, so a list surface masked one field while returning the same
+    class of identifier complete one field over -- a partial control that reads as a whole one, which
+    is what ``field_authz.py``'s own comment called it.
+
+    The reveal is the control, and it is the half that matters: this must be a MASK, not a
+    withholding. A caller who deliberately opens one record still gets the complete value, which is
+    what keeps the console able to do its job.
+    """
+    holder = _identity(Permission.MESSAGES_VIEW_SUMMARY)
+    meta = "MRN 100001"
+
+    listed = redact_unauthorized(_summary(metadata=meta), holder)
+    assert listed.metadata is not None, "masked is not withheld -- a mask must still return a value"
+    assert listed.metadata != meta, "metadata came back complete on a surface that revealed nothing"
+
+    revealed = redact_unauthorized(
+        _summary(metadata=meta), holder, revealed=frozenset({"summary", "metadata"})
+    )
+    assert revealed.metadata == meta, "a deliberate reveal must return the complete value"
+
+
+def test_metadata_with_an_unknown_grammar_fails_closed() -> None:
+    """``mask_for_display`` reads the composed-summary grammar; ``metadata`` need not follow it.
+
+    Its values are code- and operator-attached and its mechanism is documented as TBD, so the mask
+    must not pass an unrecognized shape through. It degrades to the whole-part mask instead. This is
+    asserted rather than left to the summary tests, because it is the case that decides whether
+    extending the mask set to ``metadata`` is safe at all.
+    """
+    holder = _identity(Permission.MESSAGES_VIEW_SUMMARY)
+    blob = '{"user": {"note": "MRN 100001 attached by a handler"}}'
+    masked = redact_unauthorized(_summary(metadata=blob), holder).metadata
+    assert masked is not None and "100001" not in masked, (
+        f"an unrecognized metadata shape leaked an identifier through the mask: {masked!r}"
+    )
+
+
+def test_the_reveal_set_on_the_detail_route_covers_every_masked_property() -> None:
+    """The one reveal call site must name every masked property, or a field silently stays masked.
+
+    ``MASKED_UNTIL_REVEALED`` and the detail route's ``revealed=`` set are two statements about one
+    policy. Adding a property to the first and forgetting the second would mask it everywhere with no
+    way to see it -- a product break that no masking test would catch, because masking is what every
+    other test asserts. Read from the source rather than restated, so it cannot drift.
+    """
+    import pathlib
+    import re
+
+    from messagefoundry.api.field_authz import MASKED_UNTIL_REVEALED
+
+    app_py = pathlib.Path(__file__).resolve().parents[1] / "messagefoundry" / "api" / "app.py"
+    calls = re.findall(r"revealed=frozenset\(\{([^}]*)\}\)", app_py.read_text(encoding="utf-8"))
+    assert len(calls) == 1, (
+        f"expected exactly ONE reveal call site in api/app.py, found {len(calls)}. A second one is "
+        f"not automatically wrong, but this guard compares against a single site -- widen it "
+        f"deliberately rather than letting the extra site go unchecked."
+    )
+    named = set(re.findall(r'"([^"]+)"', calls[0]))
+    assert named == set(MASKED_UNTIL_REVEALED), (
+        f"the detail route reveals {sorted(named)} but MASKED_UNTIL_REVEALED is "
+        f"{sorted(MASKED_UNTIL_REVEALED)}. A masked property the reveal never names is invisible to "
+        f"an operator who deliberately opened the record."
+    )
