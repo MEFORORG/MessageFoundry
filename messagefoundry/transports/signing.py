@@ -84,6 +84,14 @@ _P256_COORD_BYTES = 32
 # ES384 = ECDSA on P-384: each of r and s is a fixed 48-byte big-endian integer (ADR 0024).
 _P384_COORD_BYTES = 48
 
+# ASVS 15.2.2: ceiling on the signing-key FILE read below. A PEM private key is a few kilobytes even
+# encrypted at RSA-4096, so 1 MiB is far past any real one; it matches the engine's existing 1 MiB
+# ceiling on a small operator-supplied artifact (``api/app.py`` ``_MAX_REQUEST_BODY_BYTES``). This is
+# NOT one of the egress response reads -- the key file is local and operator-configured, not a reply
+# from a peer -- but a bare read of a path that turns out to be a huge file would still buffer the
+# whole of it, so the read is bounded on the same principle.
+_MAX_KEY_FILE_BYTES = 1024 * 1024
+
 
 class SigningError(ValueError):
     """A signing key/algorithm/JWS was misconfigured or malformed.
@@ -112,17 +120,31 @@ b64u_decode = _b64u_decode
 
 def _read_key_material(private_key: str) -> bytes:
     """The PEM bytes of the signing key: the value verbatim if it is inline PEM, else read from the
-    path it names (a PEM key file, OS-protected like a TLS key)."""
+    path it names (a PEM key file, OS-protected like a TLS key).
+
+    The file read is bounded at :data:`_MAX_KEY_FILE_BYTES` (ASVS 15.2.2), so a path that turns out to
+    name a huge file raises a :class:`SigningError` at connector construction instead of buffering it.
+    """
     if "-----BEGIN" in private_key:
         return private_key.encode("utf-8")
     try:
         with open(private_key, "rb") as handle:
-            return handle.read()
+            # One byte past the ceiling: getting it proves the file is over the bound without ever
+            # buffering the whole of it. Nothing is truncated silently -- an over-cap file raises.
+            material = handle.read(_MAX_KEY_FILE_BYTES + 1)
     except OSError as exc:
         # Name the failure but never echo the path's contents; the path itself is operator config.
         raise SigningError(
             f"could not read the signing-key file {private_key!r}: {exc.strerror}"
         ) from exc
+    # Outside the try: a SigningError is a ValueError, so it would not be caught above anyway, and
+    # keeping it out says so rather than leaving a reader to work it out.
+    if len(material) > _MAX_KEY_FILE_BYTES:
+        raise SigningError(
+            f"the signing-key file {private_key!r} is over the {_MAX_KEY_FILE_BYTES}-byte "
+            "bound; a PEM private key is a few kilobytes -- check the path"
+        )
+    return material
 
 
 def _load_private_key(private_key: str, password: str | None) -> _PrivateKey:

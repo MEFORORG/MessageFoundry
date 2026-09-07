@@ -33,15 +33,18 @@ from cryptography.hazmat.primitives.asymmetric import rsa
 from messagefoundry.config.models import ConnectorType, Destination, Source
 from messagefoundry.config.wiring import (
     DICOM,
+    FHIR,
     MLLP,
     X12,
     ConnectionSpec,
+    DICOMweb,
     Email,
     File,
     Rest,
     Soap,
     Tcp,
 )
+from messagefoundry.transports import base as transport_base
 from messagefoundry.transports import build_destination, build_source
 from messagefoundry.transports.base import (
     ECH_UNSUPPORTED_DESTINATION_MSG,
@@ -290,19 +293,83 @@ def test_rest_is_the_one_exempt_outbound() -> None:
     assert d._ech_sidecar == _SIDECAR
 
 
-def test_both_refusal_sites_carry_the_same_message() -> None:
-    """A connector can reach BOTH refusals (SOAP/DICOMweb/FHIR route through the resolver and are also
-    built through the shared seam). They must not offer an operator two different explanations for one
-    key, so both raise the one constant."""
-    spec = Soap(url="https://partner.example/svc", soap_action="urn:x")
+#: The connectors that reach BOTH ech refusals: their builders call `egress_route_from_settings`
+#: themselves (`soap.py:338`, `fhir.py:345`, `dicomweb.py:217`) AND they are built through the shared
+#: `build_destination` seam. Every one of them therefore carries the blind spot below, so the pair of
+#: tests is parametrized over all three rather than proving it for SOAP and leaving two unwitnessed.
+_DOUBLY_COVERED: list[tuple[str, ConnectorType, Callable[[], ConnectionSpec]]] = [
+    (
+        "soap",
+        ConnectorType.SOAP,
+        lambda: Soap(url="https://partner.example/svc", soap_action="urn:x"),
+    ),
+    ("fhir", ConnectorType.FHIR, lambda: FHIR(url="https://partner.example/fhir")),
+    ("dicomweb", ConnectorType.DICOMWEB, lambda: DICOMweb(url="https://partner.example/studies")),
+]
+_DOUBLY_COVERED_IDS = [label for label, _, _ in _DOUBLY_COVERED]
+
+
+def _seam_spy(reached: list[str], what: str) -> Callable[[Destination], DestinationConnector]:
+    """A stand-in builder that records the name it was handed and then fails loudly.
+
+    ``AssertionError`` deliberately, because ``pytest.raises(ValueError)`` does not catch it: a test
+    expecting the seam's ``ValueError`` turns RED rather than swallowing the spy's complaint."""
+
+    def _spy(config: Destination) -> DestinationConnector:
+        reached.append(config.name)
+        raise AssertionError(f"build_destination let ech_egress reach the {what} builder")
+
+    return _spy
+
+
+@pytest.mark.parametrize(("label", "kind", "make"), _DOUBLY_COVERED, ids=_DOUBLY_COVERED_IDS)
+def test_both_refusal_sites_carry_the_same_message(
+    label: str,
+    kind: ConnectorType,
+    make: Callable[[], ConnectionSpec],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A connector can reach BOTH refusals. They must not offer an operator two different explanations
+    for one key, so both raise the one constant.
+
+    **The spy is what makes this test witness its own seam, and it is not decoration.** Recorded on
+    2026-08-22 and re-measured on 2026-09-06 (BACKLOG #1176): the earlier form of this test PASSED
+    under a plant that deleted the ``build_destination`` refusal, because the connector's own builder
+    calls :func:`egress_route_from_settings`, so the RESOLVER raised the identical constant and the
+    assertion could not tell the two sites apart. Standing a spy in for the registered builder proves
+    WHICH site refused -- with the seam present the builder never runs.
+
+    ``monkeypatch.setitem`` on the registry rather than :func:`register_destination`, deliberately:
+    the public function has no undo, so restoring the real builder would be a hand-rolled try/finally
+    that a raise between register and restore can leak into every later test in the session."""
+    reached: list[str] = []
+    monkeypatch.setitem(transport_base._DESTINATIONS, kind, _seam_spy(reached, label))
     with pytest.raises(ValueError) as from_seam:
-        _dest(spec, "soap", ech_egress=True, ech_sidecar=_SIDECAR)
+        _dest(make(), label, ech_egress=True, ech_sidecar=_SIDECAR)
+    assert reached == []
     with pytest.raises(ValueError) as from_resolver:
         egress_route_from_settings(
             {"ech_egress": True, "ech_sidecar": _SIDECAR}, dest_scheme="https"
         )
     assert str(from_seam.value) == ECH_UNSUPPORTED_DESTINATION_MSG
     assert str(from_resolver.value) == ECH_UNSUPPORTED_DESTINATION_MSG
+
+
+@pytest.mark.parametrize(("label", "kind", "make"), _DOUBLY_COVERED, ids=_DOUBLY_COVERED_IDS)
+def test_the_spy_reaches_the_builder_without_the_ech_key(
+    label: str,
+    kind: ConnectorType,
+    make: Callable[[], ConnectionSpec],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Positive control for the spy above: with no ``ech_egress`` key, ``build_destination`` runs the
+    registered builder. Without this, a spy that was never wired at all would read exactly like a seam
+    that refused, and the ``reached == []`` assertion above would pass for the wrong reason."""
+    reached: list[str] = []
+    monkeypatch.setitem(transport_base._DESTINATIONS, kind, _seam_spy(reached, label))
+    with pytest.raises(AssertionError, match=f"reach the {label} builder"):
+        _dest(make(), label)
+    assert reached == [f"OB_{label.upper()}"]
 
 
 def test_inbound_builds_without_any_ech_key() -> None:

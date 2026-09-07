@@ -32,6 +32,7 @@ import os
 from collections.abc import Mapping, Sequence
 from typing import TYPE_CHECKING, Any
 
+from messagefoundry.config.tls_policy import vault_client_verify_kwargs
 from messagefoundry.store.keyprovider import KeyProviderError, _split_retired
 
 if TYPE_CHECKING:
@@ -52,6 +53,12 @@ _ENV_TRANSIT_KEY = "MEFOR_STORE_VAULT_TRANSIT_KEY"
 #: The wrapped DEK ciphertext (``vault:v1:…``). Not itself a secret (it is KEK-encrypted), but supplied
 #: via env alongside the token so a deployment keeps all Vault wiring in one place.
 _ENV_WRAPPED_DEK = "MEFOR_STORE_VAULT_WRAPPED_DEK"
+#: PEM path to the CA that issued the Vault server's certificate (#1180, ASVS 12.3.4). A PATH, not a
+#: secret — the same status as ``[tls].internal_ca_file`` and ``tls_cert_file``. Env-fed, beside the
+#: address and token it belongs with; ``[tls].internal_ca_file`` cannot reach this hop yet, and
+#: :func:`~messagefoundry.config.tls_policy.vault_client_verify_kwargs` records what that would take.
+#: Unset = hvac's own default, which is ``requests``' PUBLIC certifi bundle.
+_ENV_CA_FILE = "MEFOR_STORE_VAULT_CA_FILE"
 
 
 def _import_hvac() -> Any:
@@ -68,6 +75,30 @@ def _import_hvac() -> Any:
             f"importable): install 'messagefoundry[{_EXTRA}]'."
         ) from exc
     return hvac
+
+
+def _vault_ca_kwargs(addr: str | None) -> dict[str, str]:
+    """This Vault hop's ``verify=`` keyword arguments — ``{}`` when no anchor is configured.
+
+    #1180 (ASVS 12.3.4): the client that hands out the store's data-encryption key took no CA argument
+    at all, so an operator running Vault behind their own PKI could not say so. The env-supplied CA is
+    this hop's own anchor and so wins verbatim — trust ONLY it, no public bundle — exactly as a
+    connection's ``tls_ca_file`` does; see
+    :func:`~messagefoundry.config.tls_policy.vault_client_verify_kwargs` for the shared resolution and
+    for what still has to be threaded before ``[tls].internal_ca_file`` can reach this hop.
+
+    Fails closed here rather than there, because the error type and cell name are this module's:
+    ``requests`` would otherwise raise deep inside the first Transit call, surfacing as an opaque
+    store-open failure that names no cause."""
+    ca = os.environ.get(_ENV_CA_FILE) or None
+    if ca is not None and not os.path.isfile(ca):
+        raise KeyProviderError(
+            f"[store].key_provider={_EXTRA!r}: {_ENV_CA_FILE} names {ca!r}, which is not a readable "
+            f"file — point it at the PEM of the CA that issued the Vault server certificate."
+        )
+    return vault_client_verify_kwargs(
+        ca_file=ca, addr=addr, cell=f"[store].key_provider={_EXTRA!r}"
+    )
 
 
 def _build_client(addr: str | None, token: str | None) -> Any:
@@ -94,7 +125,11 @@ def _build_client(addr: str | None, token: str | None) -> Any:
     # header on a same-host redirect. Measured against hvac 2.4.0: the kwarg lands on the adapter,
     # which passes it to requests.Session.request. Shared with crypto_transit.py, so the Transit
     # cipher inherits the policy from this one construction point.
-    client: Any = hvac.Client(url=addr, token=token, allow_redirects=False)
+    # #1180 (ASVS 12.3.4): narrow the trust anchor when the operator named one. The keyword is OMITTED
+    # when they did not, so the stock construction is unchanged rather than passed an explicit default.
+    client: Any = hvac.Client(
+        url=addr, token=token, allow_redirects=False, **_vault_ca_kwargs(addr)
+    )
     return client
 
 
