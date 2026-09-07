@@ -5656,7 +5656,11 @@ async def _assert_security_notice_is_deliverable(
         "early when the recipient has no address). The [alerts] SMTP transport being configured "
         "does not make a notice deliverable -- on a first run the bootstrap administrator is created "
         "without one. Set an address on at least one enabled Administrator, or accept the pull-only "
-        "/me/security-events feed in writing via [alerts].security_notifications_required=false."
+        "/me/security-events feed in writing via [alerts].security_notifications_required=false. "
+        "(On a NEW install, `messagefoundry provision-admin --username <name> --email <address>` "
+        "before the first serve avoids this state entirely -- BACKLOG #1136. It is not a fix for "
+        "the instance that just refused: it declines once an enabled Administrator exists, which "
+        "by this point one does.)"
     )
     enforcement = (security_settings or SecuritySettings()).enforcement
     if enforcement is SecurityEnforcement.ENFORCE:
