@@ -24238,10 +24238,26 @@ The diffstat read **5 insertions, 1 deletion**, and the commit message never men
 Compare the **ranked tables' row set** against the **parsed-item set**, taking items from BOTH ledger files (`docs/BACKLOG.md` and `docs/archive/backlog/BACKLOG-CLOSED.md`) into one namespace. Import `parse_items`; never hand-roll the scan (CLAUDE.md sec. 11). Rows extract with:
 
 ```python
-re.findall(r"^\|\s*(?:\d+\s*\|\s*)?\*\*#(\d+)\*\*\s*\|", text, re.M)
+ROW = re.compile(r"^\|\s*(?:\d+\s*\|\s*)?\*\*#(\d+)\*\*\s*\|")          # the rank cell is optional
+HDR = re.compile(r"^\|.*\|\s*V\s*\|\s*D\s*\|\s*Quadrant\s*\|\s*Tier\s*\|")   # ...but the TABLE must be ranked
 ```
 
-**Make the rank column optional, as above. The obvious regex requires it and is blind to a whole table.** Measured at `68693cfc2`: requiring a leading `| N |` rank cell sees **444** distinct numbers, and the optional form sees **459**. The 15 it adds are `#207`-`#222` less `#214`, whose only rows live in *Post-re-score additions -- #206-#222*, a table that carries no rank column at all -- its rows open `| **#219** |`. **State the consequence as a property of the guard, not as a past mistake.** It is not that the strict regex was wrong; it is that **the strict form can never report an absorbed heading for the 15 rows of the unranked table**, whatever the ledger does. That sentence survives a reader who thinks a small widening has fixed it; "the regex was wrong" does not. All 15 have parsed items today, so the blind spot holds no defect and the check would read correct forever -- **a gate that cannot fail, which is indistinguishable from a clean result.** That is the shape this repo keeps finding, and it is why the census above names its instrument. Both forms return the same `[1147]` on the control below, so a green run discriminates between them not at all.
+Keep a row only when the header of **its own table block** matches `HDR` -- walk up from the row while the previous line still starts with `|`. The regex needs **widening and bounding, in opposite directions**, and the next two paragraphs are why each half is load-bearing.
+
+**Make the rank column optional, as above. The obvious regex requires it and is blind to a whole table.** Measured at `68693cfc2`: requiring a leading `| N |` rank cell sees **444** distinct numbers, and the optional form sees **459**. The 15 it adds are `#207`-`#222` less `#214`, whose only rows live in *Post-re-score additions -- #206-#222*, a table that carries no rank column at all -- its rows open `| **#219** |`. Nor is that the only one: `#1415` sits in a two-row continuation table introduced by a **bolded lead-in rather than a heading**. **State the consequence as a property of the guard, not as a past mistake.** It is not that the strict regex was wrong; it is that **the strict form can never report an absorbed heading for the 15 rows of the unranked table**, whatever the ledger does. That sentence survives a reader who thinks a small widening has fixed it; "the regex was wrong" does not. All 15 have parsed items today, so the blind spot holds no defect and the check would read correct forever -- **a gate that cannot fail, which is indistinguishable from a clean result.** That is the shape this repo keeps finding, and it is why the census above names its instrument. Both forms return the same `[1147]` on the control below, so a green run discriminates between them not at all.
+
+**The bound is the other half, and widening WITHOUT it trades a blind spot for a false-positive source.** `ROW` alone matches **any** markdown row whose first or second cell is a bolded item number, and two items carry exactly that shape in their own bodies. Every rank-less row on `origin/main`:
+
+| lines | numbers | the header of its table | verdict |
+|---|---|---|---|
+| 609 | `#1415` | `\| Item \| Title \| V \| D \| Quadrant \| Tier \| Why \|` | ranked, keep |
+| 983-998 | `#207`-`#222` | `\| # \| Item \| V \| D \| Quadrant \| Tier \| Why \|` | ranked, keep |
+| 3958-3961 | `#99 #98 #320 #351` | `\| Item \| The run \| What it needs \|` | prose in `## 1003.`, drop |
+| 22709-22710 | `#1040 #1229` | `\| item \| what had already landed \| ... \|` | prose in `## 1426.`, drop |
+
+Injecting one prose row citing an unfiled number into the `## 1426.` table gives `[1147, 99999]` unbounded against `[1147]` bounded. **A detector that fires on correct prose is worse than none**, because it sends a reader hunting a heading that was never meant to exist -- and prose citing a number with no section is a sanctioned pattern, not a defect.
+
+**Do not reach for a positional rule. It fails in both directions, and this was built and measured before being discarded.** "No `## N.` heading nearer than the last table heading" reports the `## 1426.` prose rows as unenclosed, because item bodies carry `###` subheadings and the walk stops at `### The defect, measured twice on one day`. In the other direction, `#1415`'s table has no heading of any level above it, only a bolded lead-in. **Position is the wrong key; the table's own header is the right one**, because it describes what the table *is* rather than where it sits.
 
 **Only rows-with-no-item is a defect. Items-with-no-row is the normal state and must never be reported.** 459 rows against 679 parsed items at the same ref, so most items legitimately carry no row. Every ranked table found is a *dated scoring-pass snapshot* (`re-scored 2026-08-20`, `re-scored 2026-08-03`, `re-scored 2026-07-10`, `first score 2026-09-03`, and the rank-less additions table), not a live index that every filing joins -- which is also why a new item does not get a row, and why the reverse comparison would report several hundred false positives on a clean file. That census was taken by walking every contiguous run of matching rows up to its nearest heading, so it covers **at least** those five; a table shaped unlike all of them would not be reached by the instrument that found these.
 
@@ -24297,7 +24313,7 @@ So the acceptance test for a build is a **wiring** entry plus a **negative contr
 
 New items append at the ledger tail, so concurrent filings are scheduled conflicts against one boundary, and the resolution is keep-both. **That manoeuvre is how `#1147` died** -- `642225f78` was itself a tail append. So this detector is the post-rebase verification for its own merge, and for every ledger rebase after it. Three checks, in order:
 
-1. Count parsed items before and after. It must rise by **exactly** the number of items added -- not roughly, and not "the file got longer".
+1. Count parsed items before and after. It must rise by **exactly** the number of item headings added -- not roughly, and not "the file got longer". **Compute that expected number at merge time from the diffs of the pull requests that actually landed; never carry a remembered constant.** Count headings, not pull requests: three queued PRs added four items here, because one of them filed two. The error is not symmetric -- expect one too few and a clean merge merely raises a phantom, but expect one too few while exactly one heading is absorbed and **the count matches, the check passes, and the absorption ships**. An off-by-one blinds this check to precisely one absorbed item, which is the modal case: `642225f78` absorbed exactly one.
 2. Inspect the boundary line itself. `#1147` died as a *prefix* deletion, so the heading text survived glued to the previous paragraph and the line count barely moved. **Length is not the signal.**
 3. Run the row-versus-item comparison in its loose form.
 
