@@ -1,13 +1,15 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 MessageFoundry Organization and contributors
-"""RFC 6238 TOTP — the local-account second factor (WP-14, ADR 0002 §3).
+"""RFC 6238 TOTP — the engine's own second factor (WP-14, ADR 0002 §3).
 
 Pure standard-library crypto (``hmac`` / ``hashlib`` / ``base64`` / ``secrets``) so MFA adds **no new
 dependency**: a software authenticator app (Google/Microsoft Authenticator, Authy, 1Password) and the
 engine independently compute the same short code from a shared base32 secret plus the current
-30-second time step. Used only for **local** users — AD/Kerberos MFA is delegated to the directory
-(see :class:`~messagefoundry.auth.service.AuthService`). This module is side-effect-free and unit-
-tested against the RFC 6238 vectors; it never touches the store, the event loop, or config.
+30-second time step. Available to **every** account, directory ones included — a Kerberos ticket
+asserts no factor strength the engine can read, so the engine asks for its own factor rather than
+assuming one (BACKLOG #1144; see :class:`~messagefoundry.auth.service.AuthService`). This module is
+side-effect-free and unit-tested against the RFC 6238 vectors; it never touches the store, the event
+loop, or config.
 
 Security notes:
 
