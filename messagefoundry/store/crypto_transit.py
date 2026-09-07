@@ -28,9 +28,10 @@ INSIDE the isolated module and the key never enters heap. This lifts the audit c
 mode). The MAC key defaults to the data key and is overridable to a dedicated Transit key via
 ``MEFOR_STORE_TRANSIT_AUDIT_KEY`` for domain separation.
 
-**Fail-closed (ADR 0138).** Missing config or an unreachable/unknown Transit key at construction raises
-:class:`~messagefoundry.store.keyprovider.KeyProviderError` (``open_store`` propagates it → ``serve`` refuses
-to start, never an in-process fallback). A per-operation Transit failure raises :class:`CipherError` — the
+**Fail-closed (ADR 0138).** Missing config, an unreachable/unknown Transit key, or a key whose TYPE
+cannot run the operation asked of it (BACKLOG #1166) raises
+:class:`~messagefoundry.store.keyprovider.KeyProviderError` at construction (``open_store`` propagates it
+→ ``serve`` refuses to start, never an in-process fallback). A per-operation Transit failure raises :class:`CipherError` — the
 store's existing at-rest error discipline. **No plaintext/PHI is EVER placed in a message** (only the
 exception TYPE): the base64 plaintext handed to Transit is the message body.
 
@@ -47,7 +48,13 @@ from typing import TYPE_CHECKING, Any
 
 from messagefoundry.store.crypto import _V3_PREFIX, MARKER_PREFIX, AuditMacFn, CipherError
 from messagefoundry.store.keyprovider import KeyProviderError
-from messagefoundry.store.keyprovider_vault import _EXTRA, _build_client
+from messagefoundry.store.keyprovider_vault import (
+    _EXTRA,
+    TRANSIT_KEY_TYPES_AUDIT,
+    TRANSIT_KEY_TYPES_DATA,
+    _build_client,
+    require_transit_key_type,
+)
 
 if TYPE_CHECKING:
     from messagefoundry.config.settings import StoreSettings
@@ -62,9 +69,12 @@ _ENV_TOKEN = "MEFOR_STORE_VAULT_TOKEN"  # nosec B105 — env-var NAME, not a tok
 #: The Transit key the store data is encrypted/decrypted under (the isolated-module data key).
 _ENV_TRANSIT_KEY = "MEFOR_STORE_TRANSIT_KEY"
 #: The Transit key the audit-chain HMAC is computed under (ADR 0138 §To-resolve follow-up). Optional —
-#: unset ⇒ reuse the data key (``_ENV_TRANSIT_KEY``): Transit ``generate_hmac`` works on any key type
-#: (verified against an ``aes256-gcm96`` key), so the audit chain is keyed-in-Transit out of the box in
-#: ``vault_transit`` mode. Set it to a DEDICATED Transit key for domain separation from the data key.
+#: unset ⇒ reuse the data key (``_ENV_TRANSIT_KEY``): Transit ``generate_hmac`` works on the AEAD key
+#: types (verified against an ``aes256-gcm96`` key), so the audit chain is keyed-in-Transit out of the
+#: box in ``vault_transit`` mode. Set it to a DEDICATED Transit key for domain separation from the data
+#: key. Either way the type is CHECKED at startup against
+#: :data:`~messagefoundry.store.keyprovider_vault.TRANSIT_KEY_TYPES_AUDIT` (BACKLOG #1166); a shared key
+#: is held to the narrower data-key set, because it has to do both jobs.
 _ENV_AUDIT_KEY = "MEFOR_STORE_TRANSIT_AUDIT_KEY"
 #: Transit HMAC hash algorithm (matches the SHA-256 the in-process chain used). Byte-length differs from
 #: SHA-256 hex, but the audit column is opaque TEXT — verify recomputes and string-compares, so any
@@ -188,7 +198,8 @@ def build_transit_cipher(settings: StoreSettings) -> TransitCipher:
             f"[store].cipher_provider={PROVIDER_NAME!r} is selected but {_ENV_TRANSIT_KEY} is not set — "
             f"supply the Transit data-key name via the environment."
         )
-    # Optional dedicated audit-HMAC key; unset ⇒ reuse the data key (Transit HMAC works on any key type).
+    # Optional dedicated audit-HMAC key; unset ⇒ reuse the data key. Either way the type is checked
+    # below — see the _ENV_AUDIT_KEY comment above for which types each use admits and why.
     audit_key = os.environ.get(_ENV_AUDIT_KEY) or key_name
     addr = os.environ.get(_ENV_ADDR)
     token = os.environ.get(_ENV_TOKEN)
@@ -196,14 +207,30 @@ def build_transit_cipher(settings: StoreSettings) -> TransitCipher:
         client = _build_client(
             addr, token
         )  # lazy hvac import; fails closed naming the [vault] extra
-        # Startup connectivity + key-existence check: read the key metadata (no crypto, no secrets). This
-        # turns a mis-provisioned Vault into a refuse-to-start rather than a first-write dead-letter.
-        client.secrets.transit.read_key(name=key_name)
-        # Same fail-closed existence check for a DEDICATED audit key (skip the redundant read when it is
-        # the data key we just verified) — a mis-set audit key must refuse to start, not dead-letter the
-        # first audit-row append.
+        # Startup connectivity + key-existence + key-TYPE check: read the key metadata (no crypto, no
+        # secrets). This turns a mis-provisioned Vault into a refuse-to-start rather than a first-write
+        # dead-letter. BACKLOG #1166, owner ruling 2026-08-22: the round trip was already being paid for
+        # and the ANSWER was thrown away, so an operator could back every at-rest PHI encrypt with a
+        # signing-only, MAC-only or sub-128-bit key and nothing objected. The answer is now read.
+        require_transit_key_type(
+            client,
+            key_name,
+            allowed=TRANSIT_KEY_TYPES_DATA,
+            use="at-rest PHI encryption (Transit encrypt/decrypt with cell associated_data)",
+            selector=_ENV_TRANSIT_KEY,
+        )
+        # Same fail-closed existence + type check for a DEDICATED audit key (skip the redundant read
+        # when it is the data key we just verified) — a mis-set audit key must refuse to start, not
+        # dead-letter the first audit-row append. A SHARED key therefore lands on the narrower
+        # data-key set, which is correct: it has to do both jobs.
         if audit_key != key_name:
-            client.secrets.transit.read_key(name=audit_key)
+            require_transit_key_type(
+                client,
+                audit_key,
+                allowed=TRANSIT_KEY_TYPES_AUDIT,
+                use="the audit-chain MAC (Transit generate_hmac)",
+                selector=_ENV_AUDIT_KEY,
+            )
     except KeyProviderError:
         raise
     except Exception as exc:
