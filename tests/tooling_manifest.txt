@@ -35,7 +35,9 @@ tests/test_asvs_scorecard.py
 tests/test_asvs_tally_lint.py
 tests/test_asvs_verifier_vault_contract.py
 tests/test_backlog_citation_check.py
+tests/test_backlog_dependency_census.py
 tests/test_backlog_hygiene_claim_extraction.py
+tests/test_backlog_score_advisory.py
 tests/test_backlog_status_check.py
 tests/test_banner_sha_check.py
 tests/test_bash_probe_path.py
@@ -43,6 +45,7 @@ tests/test_bash_resolver.py
 tests/test_blanket_stage_guard.py
 tests/test_ci_docs_only_detector.py
 tests/test_ci_engine_step_excludes_webconsole.py
+tests/test_ci_faulthandler_belts.py
 tests/test_ci_leg_data_class.py
 tests/test_ci_red_reader.py
 tests/test_ci_retry_native_crash.py
@@ -136,6 +139,7 @@ tests/test_session_mail.py
 tests/test_session_registry.py
 tests/test_setup_leak_gate_reports_source.py
 tests/test_stalled_prs.py
+tests/test_subject_exists_screen.py
 tests/test_testpaths_webconsole_coverage.py
 tests/test_unread_prs.py
 tests/test_unread_signal.py
@@ -151,6 +155,7 @@ tests/test_worktree_gate_git.py
 tests/test_worktree_gate_hijack.py
 tests/test_worktree_gate_interpreter_flags.py
 tests/test_worktree_gate_interpreter_sigils.py
+tests/test_worktree_gate_line_split_discriminator.py
 tests/test_worktree_gate_path_aliases.py
 tests/test_worktree_gate_quote_straddle.py
 tests/test_usage_headroom_inject.py

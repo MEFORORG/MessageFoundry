@@ -28,8 +28,17 @@ a common-dir-only read reports the PRIMARY's last fetch. Live in the engine chec
 three clocks disagreeing at once: loose ref 34 minutes, ``<common>/FETCH_HEAD`` 17 minutes, newest
 worktree ``FETCH_HEAD`` 3 minutes.
 
-THE POSITIVE CONTROL RUNS FIRST. Every other arm here asserts a stop condition or a null, and a
-suite that only ever asserts failure states would pass against a script hard-coded to fire.
+**AND A FETCH CLOCK IS STILL NOT A MAIN CLOCK.** ``FETCH_HEAD`` says "a fetch happened", not
+"origin/main was refreshed": ``git fetch origin refs/pull/N/head``, or a fetch of another remote,
+bumps the mtime and leaves the ref alone. That reads FRESH against a stale ref, the dangerous
+direction. Measured 2026-09-04 and pinned by ``TestOnlyAFetchOfOriginMainCountsAsTheClock``: git
+records WHAT it fetched, one line per ref, so ``branch 'main' of <origin url>`` is the evidence and
+nothing else counts. Two traps live in that compare -- git STRIPS the ``.git`` suffix from the url it
+writes, and it REWRITES the file rather than appending, so an earlier main line does not linger.
+
+THE POSITIVE CONTROL RUNS FIRST, in each class. Every other arm here asserts a stop condition or a
+null, and a suite that only ever asserts failure states would pass against a script hard-coded to
+fire.
 """
 
 from __future__ import annotations
@@ -103,27 +112,65 @@ def upstream(tmp_path_factory: pytest.TempPathFactory) -> Path:
     return up
 
 
-@pytest.fixture
-def clone(tmp_path: Path, upstream: Path) -> Path:
-    """A throwaway CLONE carrying its OWN copy of the script under test.
+def make_clone(source: Path, dest: Path) -> Path:
+    """Clone ``source`` to ``dest`` and give it its OWN copy of the script under test.
 
     A clone rather than a bare ``git init``, because the packed-refs state this item is about is
     something ``git clone`` produces and ``git init`` cannot. fleet.ps1 anchors on where it LIVES,
     so copying it in is what keeps this sandbox out of the real registry.
     """
-    c = tmp_path / "clone"
     subprocess.run(
-        ["git", "clone", "-q", str(upstream), str(c)],
+        ["git", "clone", "-q", str(source), str(dest)],
         check=True,
         capture_output=True,
         timeout=TIMEOUT,
     )
-    git(c, "config", "user.email", "t@example.invalid")
-    git(c, "config", "user.name", "t")
-    (c / "scripts" / "coord").mkdir(parents=True)
+    git(dest, "config", "user.email", "t@example.invalid")
+    git(dest, "config", "user.name", "t")
+    (dest / "scripts" / "coord").mkdir(parents=True)
     for name in ("fleet.ps1", "mail-key.ps1", "session-registry.ps1"):
-        shutil.copy2(COORD / name, c / "scripts" / "coord" / name)
-    return c
+        shutil.copy2(COORD / name, dest / "scripts" / "coord" / name)
+    return dest
+
+
+@pytest.fixture
+def clone(tmp_path: Path, upstream: Path) -> Path:
+    """A throwaway clone of the plain upstream."""
+    return make_clone(upstream, tmp_path / "clone")
+
+
+@pytest.fixture(scope="session")
+def upstream_bare(tmp_path_factory: pytest.TempPathFactory, upstream: Path) -> Path:
+    """A BARE upstream whose path ends in ``.git`` and which carries a ref that is not a branch.
+
+    Two separate traps, one fixture, both measured 2026-09-04:
+
+    * **The url is not written the way it is configured.** git strips the ``.git`` suffix when it
+      writes FETCH_HEAD, while ``git remote get-url`` returns it intact -- measured
+      ``.../remote.git`` against ``.../remote`` in one clone. A literal compare of the two never
+      matches, which would send every arm here to UNMEASURABLE. Pinned by
+      ``test_a_dot_git_remote_url_still_matches_the_url_fetch_head_writes``.
+    * **``refs/pull/7/head`` is the shape that bumps the clock without refreshing origin/main.**
+      Fetching it writes ``'refs/pull/7/head' of <url>`` with no ``branch`` prefix and no mention of
+      main, and it REWRITES the file, so any earlier main line is gone.
+
+    Session-scoped and never mutated by an arm, for the same reason ``upstream`` is.
+    """
+    bare = tmp_path_factory.mktemp("bare") / "up.git"
+    subprocess.run(
+        ["git", "clone", "-q", "--bare", str(upstream), str(bare)],
+        check=True,
+        capture_output=True,
+        timeout=TIMEOUT,
+    )
+    git(bare, "update-ref", "refs/pull/7/head", "refs/heads/main")
+    return bare
+
+
+@pytest.fixture
+def pull_clone(tmp_path: Path, upstream_bare: Path) -> Path:
+    """A throwaway clone of the bare ``.git``-suffixed upstream that has a pull ref to fetch."""
+    return make_clone(upstream_bare, tmp_path / "clone")
 
 
 def fleet(clone: Path, render: str) -> str:
@@ -157,7 +204,7 @@ def fleet_text(clone: Path) -> str:
 
 def fetch_stops(receipt: dict) -> list[str]:
     """Only this rung's stops. Other rungs fire in a sandbox and are not what these arms measure."""
-    return [s for s in receipt["stopConditions"] if "lastFetch" in s]
+    return [s for s in receipt["stopConditions"] if "originMainFetch" in s]
 
 
 class TestTheClockIsTheFetchAndNotTheRef:
@@ -169,9 +216,11 @@ class TestTheClockIsTheFetchAndNotTheRef:
         """
         git(clone, "fetch", "origin")
         receipt = fleet_json(clone)["receipt"]
-        assert receipt["lastFetchAgeMinutes"] is not None, receipt
-        assert receipt["lastFetchAgeMinutes"] < 60
-        assert receipt["lastFetchClock"].endswith("FETCH_HEAD"), receipt["lastFetchClock"]
+        assert receipt["originMainFetchAgeMinutes"] is not None, receipt
+        assert receipt["originMainFetchAgeMinutes"] < 60
+        assert receipt["originMainFetchClock"].endswith("FETCH_HEAD"), receipt[
+            "originMainFetchClock"
+        ]
         assert fetch_stops(receipt) == []
 
     def test_a_stale_ref_beside_a_fresh_fetch_raises_no_stop(self, clone: Path) -> None:
@@ -194,7 +243,9 @@ class TestTheClockIsTheFetchAndNotTheRef:
         backdate(loose, minutes=24 * 60)
 
         receipt = fleet_json(clone)["receipt"]
-        assert receipt["lastFetchAgeMinutes"] < 60, "the FETCH is fresh, whatever the ref says"
+        assert receipt["originMainFetchAgeMinutes"] < 60, (
+            "the FETCH is fresh, whatever the ref says"
+        )
         assert fetch_stops(receipt) == [], "a fresh fetch must not be reported as a stale ref"
 
     def test_a_fetch_older_than_an_hour_still_fires_the_stop(self, clone: Path) -> None:
@@ -204,10 +255,10 @@ class TestTheClockIsTheFetchAndNotTheRef:
             backdate(head, minutes=180)
 
         receipt = fleet_json(clone)["receipt"]
-        assert receipt["lastFetchAgeMinutes"] >= 170, receipt["lastFetchAgeMinutes"]
+        assert receipt["originMainFetchAgeMinutes"] >= 170, receipt["originMainFetchAgeMinutes"]
         stops = fetch_stops(receipt)
         assert len(stops) == 1, stops
-        assert "lastFetchAgeMinutes=" in stops[0]
+        assert "originMainFetchAgeMinutes=" in stops[0]
         assert "stale origin/main" in stops[0], stops[0]
 
 
@@ -238,14 +289,14 @@ class TestBlindMustNotRenderAsHealthy:
         assert fetch_heads(clone) == []
 
         receipt = fleet_json(clone)["receipt"]
-        assert receipt["lastFetchAgeMinutes"] is None, receipt["lastFetchAgeMinutes"]
+        assert receipt["originMainFetchAgeMinutes"] is None, receipt["originMainFetchAgeMinutes"]
         stops = fetch_stops(receipt)
         assert len(stops) == 1, stops
         assert "UNMEASURABLE" in stops[0], stops[0]
         # The neighbouring receipt field must not be blank either. A null age printed as an empty
         # column is the same silence in a different place.
-        assert receipt["lastFetchClock"], "the clock field must never render empty"
-        assert "UNMEASURABLE" in receipt["lastFetchClock"], receipt["lastFetchClock"]
+        assert receipt["originMainFetchClock"], "the clock field must never render empty"
+        assert "UNMEASURABLE" in receipt["originMainFetchClock"], receipt["originMainFetchClock"]
 
     def test_the_text_render_refuses_to_call_a_blind_roster_complete(self, clone: Path) -> None:
         """The reader of this output is the person least equipped to notice a missing warning.
@@ -254,7 +305,7 @@ class TestBlindMustNotRenderAsHealthy:
 
         THIS ARM ASSERTED THE WRONG FEATURE FIRST AND SURVIVED A MUTATION IT SHOULD HAVE CAUGHT.
         ``STOP CONDITIONS FIRED`` and a bare ``UNMEASURABLE`` are both satisfied without this rung:
-        an empty sandbox already fires ``recordsExamined=0``, and ``lastFetchClock`` prints the word
+        an empty sandbox already fires ``recordsExamined=0``, and ``originMainFetchClock`` prints the word
         in the receipt block whatever the guard does. Re-put the null guard back and the arm stayed
         green. It now reads the STOP BLOCK ITSELF and looks for this rung's own line.
         """
@@ -265,7 +316,7 @@ class TestBlindMustNotRenderAsHealthy:
         marker = "STOP CONDITIONS FIRED"
         assert marker in out, out[:2000]
         block = out.split(marker, 1)[1].split("\n\n", 1)[0]
-        assert "lastFetchAgeMinutes=UNMEASURABLE" in block, block
+        assert "originMainFetchAgeMinutes=UNMEASURABLE" in block, block
 
     def test_a_null_receipt_field_prints_a_sentinel_instead_of_whitespace(
         self, clone: Path
@@ -289,7 +340,9 @@ class TestBlindMustNotRenderAsHealthy:
             if ln.startswith("  ") and ln.strip()
         }
         assert lines["originMainSha"].endswith("(null)"), lines["originMainSha"]
-        assert lines["lastFetchAgeMinutes"].endswith("(null)"), lines["lastFetchAgeMinutes"]
+        assert lines["originMainFetchAgeMinutes"].endswith("(null)"), lines[
+            "originMainFetchAgeMinutes"
+        ]
 
 
 class TestTheWholeCloneIsRead:
@@ -312,24 +365,166 @@ class TestTheWholeCloneIsRead:
         backdate(common / "FETCH_HEAD", minutes=24 * 60)
 
         receipt = fleet_json(clone)["receipt"]
-        assert receipt["lastFetchAgeMinutes"] < 60, receipt["lastFetchAgeMinutes"]
-        assert "worktrees" in receipt["lastFetchClock"], receipt["lastFetchClock"]
+        assert receipt["originMainFetchAgeMinutes"] < 60, receipt["originMainFetchAgeMinutes"]
+        assert "worktrees" in receipt["originMainFetchClock"], receipt["originMainFetchClock"]
         assert fetch_stops(receipt) == []
 
 
-class TestTheFieldNamesTheClockItReads:
-    def test_the_misnamed_predecessor_key_is_gone(self, clone: Path) -> None:
-        """A key that claims fetch recency and times a ref file must not survive the fix.
+class TestOnlyAFetchOfOriginMainCountsAsTheClock:
+    """A fetch clock is not a main clock, and the difference reads FRESH -- the dangerous way.
 
-        Checked before renaming rather than after: nothing outside ``docs/BACKLOG.md`` reads this
-        key by name, in this repo or in the vault's ``origin/main``, with ``fleet.ps1`` itself as
-        the positive control that the search could see. So it was renamed, not doubled -- a
-        consumer pinned to the old key now finds no key, which is the honest failure.
+    ``FETCH_HEAD`` says "a fetch happened", not "origin/main was refreshed". Every arm here builds
+    the gap between those two sentences with real git and asserts the receipt reports the second.
+    """
+
+    def test_a_dot_git_remote_url_still_matches_the_url_fetch_head_writes(
+        self, pull_clone: Path
+    ) -> None:
+        """POSITIVE CONTROL FOR THIS CLASS, and it runs first.
+
+        Every other arm below asserts UNMEASURABLE or a stop, and a class that only ever asserts
+        failure states passes against a match that never succeeds. It also pins the url trap on its
+        own: with a remote configured as ``.../up.git`` the fetched url reaches FETCH_HEAD as
+        ``.../up``, so this arm fails if the compare is ever made literal.
+
+        The asymmetry is asserted directly rather than inferred from the receipt, so a future reader
+        sees the measurement and not just its consequence.
+        """
+        git(pull_clone, "fetch", "origin")
+        assert git(pull_clone, "remote", "get-url", "origin").endswith(".git")
+        head = (common_dir(pull_clone) / "FETCH_HEAD").read_text(encoding="utf-8")
+        main_line = next(ln for ln in head.splitlines() if "branch 'main' of " in ln)
+        assert not main_line.endswith(".git"), (
+            f"git is expected to strip the .git suffix when writing FETCH_HEAD: {main_line!r}"
+        )
+
+        receipt = fleet_json(pull_clone)["receipt"]
+        assert receipt["originMainFetchAgeMinutes"] is not None, receipt["originMainFetchClock"]
+        assert receipt["originMainFetchAgeMinutes"] < 60
+        assert fetch_stops(receipt) == []
+
+    def test_a_pull_ref_fetch_alone_is_unmeasurable_rather_than_fresh(
+        self, pull_clone: Path
+    ) -> None:
+        """THE CORE ARM. The clock is seconds old and origin/main was never fetched.
+
+        The predecessor took the newest FETCH_HEAD unconditionally, so this state reported a
+        single-digit age and fired no stop -- an instrument reading FRESH about a ref it had no
+        evidence for.
+
+        The premise is asserted rather than hoped: the file must exist, must be recent, and must
+        contain no main line at all.
+        """
+        git(pull_clone, "fetch", "origin", "refs/pull/7/head")
+        head = common_dir(pull_clone) / "FETCH_HEAD"
+        assert head.exists(), "the arm needs the clock it is about"
+        assert "branch 'main' of " not in head.read_text(encoding="utf-8")
+        assert (time.time() - head.stat().st_mtime) < 600, "and that clock must be FRESH"
+
+        receipt = fleet_json(pull_clone)["receipt"]
+        assert receipt["originMainFetchAgeMinutes"] is None, receipt["originMainFetchClock"]
+        stops = fetch_stops(receipt)
+        assert len(stops) == 1, stops
+        assert "UNMEASURABLE" in stops[0], stops[0]
+
+    def test_the_blind_pull_ref_stop_does_not_claim_the_clone_has_no_clock(
+        self, pull_clone: Path
+    ) -> None:
+        """The two blind states are both UNMEASURABLE and must not share a sentence.
+
+        Telling this reader that no FETCH_HEAD exists anywhere would be FALSE ON ITS FACE -- they
+        just ran a fetch and can see the file -- and an instrument caught in an obvious lie stops
+        being read at all, including on the rungs where it is right.
+        """
+        git(pull_clone, "fetch", "origin", "refs/pull/7/head")
+        blind = fetch_stops(fleet_json(pull_clone)["receipt"])[0]
+
+        for head in fetch_heads(pull_clone):
+            head.unlink()
+        absent = fetch_stops(fleet_json(pull_clone)["receipt"])[0]
+
+        assert blind != absent, "one sentence for two different states is the defect, not the fix"
+        assert "no FETCH_HEAD exists anywhere" in absent, absent
+        assert "no FETCH_HEAD exists anywhere" not in blind, blind
+        assert "NOT ONE records a fetch of origin/main" in blind, blind
+
+    def test_a_stale_main_fetch_beats_a_fresh_pull_ref_fetch(self, pull_clone: Path) -> None:
+        """THE MUTATION ARM: newest-clock-wins must not survive.
+
+        Two git dirs, because FETCH_HEAD is per-worktree and one file cannot hold both states -- the
+        pull-ref fetch REWRITES it. The common dir fetched main three hours ago; a linked worktree
+        fetched a pull ref just now.
+
+        Restore "take the newest clock" and the age reads single digits with no stop, so this arm
+        reddens on exactly the seam it covers. The clock path is asserted too: naming the worktree
+        file would mean the answer came from the wrong fetch even if the number looked right.
+        """
+        git(pull_clone, "fetch", "origin")
+        common = common_dir(pull_clone)
+        wt = pull_clone.parent / "wt"
+        git(pull_clone, "worktree", "add", "-q", "-b", "side", str(wt))
+        git(wt, "fetch", "origin", "refs/pull/7/head")
+
+        wt_head = Path(git(wt, "rev-parse", "--path-format=absolute", "--git-dir")) / "FETCH_HEAD"
+        assert wt_head.exists(), "the arm needs the fresher, non-main clock it is about"
+        backdate(common / "FETCH_HEAD", minutes=180)
+
+        receipt = fleet_json(pull_clone)["receipt"]
+        assert receipt["originMainFetchAgeMinutes"] >= 170, receipt["originMainFetchAgeMinutes"]
+        assert "worktrees" not in receipt["originMainFetchClock"], receipt["originMainFetchClock"]
+        stops = fetch_stops(receipt)
+        assert len(stops) == 1, stops
+        assert "stale origin/main" in stops[0], stops[0]
+
+    def test_a_fetch_of_a_different_remote_is_not_a_fetch_of_origin(self, clone: Path) -> None:
+        """The url half of the match, isolated. Both remotes have a ``main``.
+
+        Drop the url compare and the second remote's ``branch 'main' of <other-url>`` line satisfies
+        the match, so this clone would report a fresh origin/main it never fetched. Naming the
+        second remote ``upstream`` is deliberate: matching on the remote NAME is the other tempting
+        shortcut, and FETCH_HEAD records the url and never the name.
+        """
+        other = clone.parent / "other"
+        subprocess.run(
+            ["git", "clone", "-q", str(clone), str(other)],
+            check=True,
+            capture_output=True,
+            timeout=TIMEOUT,
+        )
+        git(clone, "remote", "add", "upstream", str(other))
+        git(clone, "fetch", "upstream")
+
+        head = (common_dir(clone) / "FETCH_HEAD").read_text(encoding="utf-8")
+        assert "branch 'main' of " in head, "the arm needs a main line from the WRONG remote"
+
+        receipt = fleet_json(clone)["receipt"]
+        assert receipt["originMainFetchAgeMinutes"] is None, receipt["originMainFetchClock"]
+        assert "UNMEASURABLE" in fetch_stops(receipt)[0]
+
+
+class TestTheFieldNamesTheClockItReads:
+    def test_both_misnamed_predecessor_keys_are_gone(self, clone: Path) -> None:
+        """Two retired keys, pinned absent, because each gave a different wrong answer.
+
+        ``originMainAgeMinutes`` claimed fetch recency and timed the REF FILE.
+        ``lastFetchAgeMinutes`` timed a real fetch but ANY fetch, so with a pull-ref fetch one
+        minute old beside a main fetch three hours old its honest value is 180 -- which its own
+        name contradicts.
+
+        BOTH are pinned rather than only the older one: the names are close enough that a later
+        reader could reintroduce either believing it to be the current spelling.
+
+        Checked before each rename rather than after: nothing outside ``docs/BACKLOG.md`` and this
+        file reads these keys by name, with ``originMainSha`` as the positive control that the
+        search could see the files. So each was renamed, not doubled -- a consumer pinned to an old
+        key now finds no key, which is the honest failure.
         """
         git(clone, "fetch", "origin")
         receipt = fleet_json(clone)["receipt"]
         assert "originMainAgeMinutes" not in receipt, sorted(receipt)
-        assert "lastFetchAgeMinutes" in receipt, sorted(receipt)
-        assert "lastFetchClock" in receipt, sorted(receipt)
+        assert "lastFetchAgeMinutes" not in receipt, sorted(receipt)
+        assert "lastFetchClock" not in receipt, sorted(receipt)
+        assert "originMainFetchAgeMinutes" in receipt, sorted(receipt)
+        assert "originMainFetchClock" in receipt, sorted(receipt)
         # The sha is a different question and stays.
         assert receipt["originMainSha"], receipt
