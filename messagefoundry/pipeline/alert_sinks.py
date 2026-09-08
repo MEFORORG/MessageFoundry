@@ -381,9 +381,17 @@ class WebhookTransport:
             headers={"Content-Type": "application/json"},
             method="POST",
         )
+        # Bounded so the drain cannot be turned into a memory exhaustion by a webhook host that
+        # answers an alert POST with an arbitrarily large body (ASVS 15.2.2). Imported lazily for the
+        # same reason as the length gate above. An over-cap reply raises ResponseTooLargeError, which
+        # the notifier's fan-out treats like any other failed sink send: the alert is not delivered
+        # here, and the engine's own message flow is untouched.
+        from messagefoundry.transports.bounded_read import read_bounded
+
         # The no-redirect opener (not urllib.request.urlopen) so a 3xx can't divert the POST (15.3.2).
         with _NO_REDIRECT_OPENER.open(req, timeout=self.timeout) as resp:
-            resp.read()  # drain so the connection can be reused/closed cleanly
+            # Drain (bounded) so the connection can be reused/closed cleanly.
+            read_bounded(resp, connector=f"alert webhook {host}")
 
 
 def send_plain_email(
@@ -790,6 +798,25 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
         # #46: an outbound lane went down. The shared _emit throttle keys on (type, connection), so a
         # retry storm on one lane collapses to one notification per cooldown. detail is safe_exc-scrubbed.
         self._emit({"type": "connection_error", "connection": name, "kind": kind, "detail": detail})
+
+    def log_write_failed(
+        self, name: str, *, stage: str, reason: str, stopped: int | None = None
+    ) -> None:
+        # #122 (ADR 0162): an application-log sink was rolled (stage 1) or is unwritable (stage 2). The
+        # sink LABEL stands in for "connection" so the realert throttle + ADR 0044 dedup key per sink,
+        # exactly like storage_threshold does with a DB path. The payload is the sink label, the stage,
+        # a safe_exc reason and a count — never message content, and never the record that failed to
+        # write. This is the one alert whose delivery path must not depend on the application log, which
+        # is why it goes through the notifier's transports rather than a log line.
+        self._emit(
+            {
+                "type": "log_write_failed",
+                "connection": name,
+                "stage": stage,
+                "detail": reason,
+                "stopped": stopped,
+            }
+        )
 
     def content_match(self, connection: str, *, label: str, rule_id: str | None = None) -> None:
         # #81 (ADR 0133): a code-first Handler ("Action Point") inspected a message and decided to alert.

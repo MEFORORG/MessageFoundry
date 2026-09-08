@@ -13,6 +13,7 @@ import asyncio
 import inspect
 import json
 import re
+import ssl
 import urllib.error
 from collections.abc import Callable
 from pathlib import Path
@@ -83,6 +84,129 @@ async def test_probe_tcp_reachable_refused() -> None:
     port = await _dead_port()
     with pytest.raises(DeliveryError, match="connect to"):
         await probe_tcp_reachable("127.0.0.1", port, 5.0, "TEST")
+
+
+# --- the probe crosses the connector's OWN hop (BACKLOG #1178, ASVS 12.3.1) ---
+#
+# Measured before the fix: a tls=true MLLP destination's test_connection() opened a bare TCP socket
+# to the partner, so the connection test crossed an unencrypted hop the send path would never use --
+# and, being handshake-free, could not see a bad cert, an untrusted CA or a hostname mismatch.
+
+
+def _probe_self_signed(tmp_path: Path) -> tuple[str, str]:
+    """A throwaway cert/key for a loopback TLS listener, SAN=localhost so hostname checking is real."""
+    import datetime
+
+    from cryptography import x509
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import ec
+    from cryptography.x509.oid import NameOID
+
+    key = ec.generate_private_key(ec.SECP256R1())
+    name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "localhost")])
+    now = datetime.datetime(2020, 1, 1, tzinfo=datetime.UTC)
+    cert = (
+        x509.CertificateBuilder()
+        .subject_name(name)
+        .issuer_name(name)
+        .public_key(key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(now)
+        .not_valid_after(now.replace(year=2040))
+        .add_extension(x509.SubjectAlternativeName([x509.DNSName("localhost")]), critical=False)
+        .sign(key, hashes.SHA256())
+    )
+    cert_file, key_file = tmp_path / "probe-cert.pem", tmp_path / "probe-key.pem"
+    cert_file.write_bytes(cert.public_bytes(serialization.Encoding.PEM))
+    key_file.write_bytes(
+        key.private_bytes(
+            serialization.Encoding.PEM,
+            serialization.PrivateFormat.PKCS8,
+            serialization.NoEncryption(),
+        )
+    )
+    return str(cert_file), str(key_file)
+
+
+async def _tls_listening_port(cert: str, key: str) -> tuple[asyncio.AbstractServer, int]:
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    ctx.load_cert_chain(cert, key)
+
+    async def _accept(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        writer.close()
+
+    server = await asyncio.start_server(_accept, "127.0.0.1", 0, ssl=ctx)
+    return server, server.sockets[0].getsockname()[1]
+
+
+async def _recording_port() -> tuple[asyncio.AbstractServer, int, list[bytes]]:
+    """A plaintext listener that records the first bytes each peer sends before closing."""
+    seen: list[bytes] = []
+
+    async def _accept(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        try:
+            seen.append(await asyncio.wait_for(reader.read(64), 3.0))
+        except (TimeoutError, OSError):
+            seen.append(b"")
+        writer.close()
+
+    server = await asyncio.start_server(_accept, "127.0.0.1", 0)
+    return server, server.sockets[0].getsockname()[1], seen
+
+
+async def test_probe_over_tls_completes_the_handshake(tmp_path: Path) -> None:
+    cert, key = _probe_self_signed(tmp_path)
+    server, port = await _tls_listening_port(cert, key)
+    ctx = ssl.create_default_context(ssl.Purpose.SERVER_AUTH, cafile=cert)
+    try:
+        await probe_tcp_reachable(
+            "127.0.0.1", port, 5.0, "TEST", ssl_context=ctx, server_hostname="localhost"
+        )  # no raise = the TLS hop is good
+    finally:
+        server.close()
+        await server.wait_closed()
+
+
+async def test_probe_over_tls_reports_a_handshake_failure_as_one(tmp_path: Path) -> None:
+    """A trust-anchor problem must not read as an unreachable partner, and must never downgrade."""
+    cert, key = _probe_self_signed(tmp_path)
+    server, port = await _tls_listening_port(cert, key)
+    ctx = ssl.create_default_context(ssl.Purpose.SERVER_AUTH)  # cannot anchor a self-signed cert
+    try:
+        with pytest.raises(DeliveryError, match="TLS handshake to"):
+            await probe_tcp_reachable(
+                "127.0.0.1", port, 5.0, "TEST", ssl_context=ctx, server_hostname="localhost"
+            )
+    finally:
+        server.close()
+        await server.wait_closed()
+
+
+async def test_probe_sends_a_client_hello_only_when_given_a_context(tmp_path: Path) -> None:
+    """The #1178 regression, with its positive control in the same run against the same recorder.
+
+    Without a context the recorder must see a connection carrying ZERO bytes -- that is the bare TCP
+    hop the item names. With one it must see a ClientHello, which proves the recorder can observe a
+    handshake at all, so the zero-byte reading is a finding rather than a blind instrument. Neither
+    arm may put an application byte on the wire: this stays a no-data probe.
+    """
+    server, port, seen = await _recording_port()
+    ctx = ssl.create_default_context(
+        ssl.Purpose.SERVER_AUTH, cafile=_probe_self_signed(tmp_path)[0]
+    )
+    try:
+        await probe_tcp_reachable("127.0.0.1", port, 5.0, "TEST")
+        with pytest.raises(DeliveryError):  # the recorder speaks no TLS, so the handshake fails
+            await probe_tcp_reachable(
+                "127.0.0.1", port, 5.0, "TEST", ssl_context=ctx, server_hostname="localhost"
+            )
+    finally:
+        server.close()
+        await server.wait_closed()
+    assert len(seen) == 2, f"the recorder saw {len(seen)} connection(s), expected 2"
+    plaintext, over_tls = seen
+    assert plaintext == b"", f"a no-data probe must send nothing, saw {plaintext[:16]!r}"
+    assert over_tls[:2] == b"\x16\x03", f"expected a TLS ClientHello, saw {over_tls[:8]!r}"
 
 
 @pytest.mark.parametrize("conn_type", [ConnectorType.MLLP, ConnectorType.TCP, ConnectorType.X12])
@@ -222,7 +346,7 @@ _NOT_A_SECRET: dict[str, str] = {
     "tls_key_file": "filesystem path to the TLS key — not the key material",
     "client_key_file": "filesystem path to the mTLS client key — not the key material",
     "signing_key": "filesystem path to the Direct S/MIME signing key — not the key material",
-    "ws_password_type": "WS-Security password *mode*: 'text' | 'digest'",
+    "ws_password_type": "WS-Security password *mode*: 'text' ('digest' retired, #1171)",
     "odbc_user_key": "the ODBC keyword the username is emitted under (e.g. 'UID')",
     "odbc_password_key": "the ODBC keyword the password is emitted under (e.g. 'PWD')",
     # This IS secret-carrying, but the Soap() factory desugars it into flat body_secret_value_<i>
@@ -314,7 +438,7 @@ def test_ws_security_and_direct_credentials_are_redacted() -> None:
             "ws_password": "SEKRET-WS-PW",
             "client_key_password": "SEKRET-KEYPASS",
             "signing_key_password": "SEKRET-SIGNPASS",
-            "ws_password_type": "digest",
+            "ws_password_type": "text",
             "client_key_file": "/etc/mf/client.key",
         }
     )
@@ -322,7 +446,7 @@ def test_ws_security_and_direct_credentials_are_redacted() -> None:
     assert out["ws_password"] == "***"
     assert out["client_key_password"] == "***"
     assert out["signing_key_password"] == "***"
-    assert out["ws_password_type"] == "digest"  # a mode, not a credential
+    assert out["ws_password_type"] == "text"  # a mode, not a credential
     assert out["client_key_file"] == "/etc/mf/client.key"  # a path, not the key
     assert "SEKRET" not in json.dumps(out)
 

@@ -1057,6 +1057,10 @@ _CRYPTO_SITES_OUTSIDE_THE_PACKAGE = {
     # identity nobody picks by hand. A change detector over public type signatures and field names --
     # no key, no secret, nothing user- or PHI-derived.
     "scripts/webconsole_seam_snapshot.py": frozenset({"hashlib"}),
+    # BACKLOG #1433: SHA-256 over the shipped common-password corpus, recorded in the generated
+    # block of its .NOTICE so the notice cannot describe a file that no longer exists. A change
+    # detector over a published third-party wordlist -- no key, no secret, nothing PHI-derived.
+    "scripts/security/build_password_corpus.py": frozenset({"hashlib"}),
 }
 
 
@@ -1138,6 +1142,38 @@ def test_the_alert_smtp_tls_seam_is_visible_to_the_gate() -> None:
         "messagefoundry.config.tls_policy but no stdlib crypto module, so it is only reachable "
         "through the seam set — check that messagefoundry.config.tls_policy is still in "
         "CRYPTO_SEAM_MODULES."
+    )
+    assert target in gate.INVENTORY, f"{target} is seen by the gate but carries no inventory row"
+
+
+def test_the_jws_signing_seam_is_visible_to_the_gate() -> None:
+    """BACKLOG #1164's worked example, pinned so the widening cannot silently revert.
+
+    ``transports/fhir.py`` resolves a signer through ``transports/signing.py`` and emits detached JWS
+    headers per request, while importing none of the six stdlib crypto modules itself. MEASURED
+    before the fix: the gate reported GREEN over 77 sites with this file appearing NOWHERE in it --
+    not undocumented, UNSEEN. Adding the signing seam made it and five siblings visible, taking the
+    gate to 78 sites, still green.
+
+    **Being inventoried is not being a seam, and that distinction is the whole defect.**
+    ``transports/signing.py`` already carried an inventory row, which records what THAT file uses; a
+    seam entry is what makes its IMPORTERS visible. A reader who checked only that signing.py was
+    inventoried would have concluded the signature surface was covered.
+
+    Asserts BOTH limbs on purpose: discovered (the gate can see it) and inventoried (it is accounted
+    for). Either alone can hold while the other fails, and they fail for opposite reasons.
+    """
+    gate = _crypto_gate_module()
+    discovered: dict[str, frozenset[str]] = {}
+    for root in _CRYPTO_ROOTS:
+        discovered |= gate.discover(root)
+
+    target = "messagefoundry/transports/fhir.py"
+    assert (_REPO / target).is_file(), f"{target} has moved -- re-derive this pin from the symbol"
+    assert target in discovered, (
+        f"{target} is a first-party signature seam the crypto gate cannot SEE. It reaches signature "
+        "crypto only through messagefoundry.transports.signing, so it is reachable only through the "
+        "seam set -- check that messagefoundry.transports.signing is still in CRYPTO_SEAM_MODULES."
     )
     assert target in gate.INVENTORY, f"{target} is seen by the gate but carries no inventory row"
 

@@ -8,8 +8,12 @@ raises, the smoke/store paths behave, the report renders, and the CLI wires up +
 
 from __future__ import annotations
 
+import ast
 import asyncio
 import socket
+import ssl
+import subprocess
+import sys
 import threading
 from pathlib import Path
 
@@ -129,6 +133,150 @@ def test_self_smoke_routes_synthetic_adt() -> None:
 def test_synthetic_message_is_hl7() -> None:
     msg = smoke.synthetic_message()
     assert msg.startswith("MSH|")
+    assert msg.endswith("\r")  # segment-terminated, as the generator emitted it and MLLP expects
+
+
+def test_synthetic_message_strict_validates() -> None:
+    """The inlined literal (#1192) is still a conformant 2.5.1 ADT^A01.
+
+    Nothing regenerates the message any more, so something has to keep it honest. This pins
+    CONFORMANCE rather than byte-equality with ``messagefoundry.generators``, deliberately: an
+    equality test would go red the day the generators leave the engine distribution -- the end state
+    this inlining exists to unblock -- and would churn on any unrelated generator edit while proving
+    nothing extra, since a generator change does not make the existing literal non-conformant.
+    Conformance is the property ``smoke_self`` and ``smoke_live`` actually depend on.
+    """
+    from messagefoundry.parsing.validate import validate
+
+    result = validate(smoke.synthetic_message(), expected_version="2.5.1")
+    assert result.ok, result.errors
+    assert result.version == "2.5.1"
+
+
+def test_synthetic_message_reads_as_a_probe_not_a_patient() -> None:
+    """Synthetic only (CLAUDE.md section 9), and OBVIOUSLY so.
+
+    ``smoke_live`` sends this message into a real engine, where it lands in the operator's own
+    store. Every person name is the ZZZTEST family and MSH-10 carries the tool's own prefix, so an
+    operator reading that row sees a probe rather than a patient.
+    """
+    from messagefoundry.parsing.message import Message
+
+    msg = Message.parse(smoke.synthetic_message())
+    assert msg.message_type == "ADT^A01^ADT_A01"
+    control_id = msg.control_id
+    assert control_id is not None and control_id.startswith("MEFOR"), control_id
+    assert msg["PID-5.1"] == "ZZZTEST"
+    for occurrence in range(1, msg.count_segments("NK1") + 1):
+        assert msg.field("NK1-2.1", occurrence=occurrence) == "ZZZTEST"
+    for occurrence in range(1, msg.count_segments("PV1") + 1):
+        assert msg.field("PV1-7.2", occurrence=occurrence) == "ZZZTEST"
+        assert msg.field("PV1-17.2", occurrence=occurrence) == "ZZZTEST"
+
+
+# ---- the verifier must not carry the development generators (#1192 / ASVS 15.2.3) --------------
+
+# Run in a FRESH interpreter: this pytest process has already imported the generators for other
+# suites, so an in-process sys.modules read could never answer the question.
+_GENERATORS_PROBE = """\
+import sys
+
+import messagefoundry.verify
+from messagefoundry.verify import checks, federation, model, report, runner, smoke
+
+smoke.synthetic_message()
+
+found = sorted(m for m in sys.modules if m.startswith("messagefoundry.generators"))
+print("AFTER_VERIFY=" + ",".join(found))
+
+# Positive control. Without it an empty line above is indistinguishable from a probe that cannot
+# see a generators import at all.
+import messagefoundry.generators.all_types  # noqa: F401
+
+found = sorted(m for m in sys.modules if m.startswith("messagefoundry.generators"))
+print("AFTER_CONTROL=" + ",".join(found))
+"""
+
+
+def test_verify_does_not_import_the_generators() -> None:
+    """``messagefoundry.verify`` must not pull ``messagefoundry.generators`` into its runtime.
+
+    This is the guarantee the inlining buys. Without this test the import edge could come back on
+    any later edit and nothing would report it.
+    """
+    repo_root = Path(__file__).resolve().parents[1]
+    proc = subprocess.run(
+        [sys.executable, "-c", _GENERATORS_PROBE],
+        capture_output=True,
+        text=True,
+        timeout=300,
+        cwd=repo_root,  # sys.path[0] for -c, so the probe reads THIS tree, not an editable install
+    )
+    assert proc.returncode == 0, proc.stderr
+    lines = dict(
+        line.split("=", 1) for line in proc.stdout.splitlines() if line.startswith("AFTER_")
+    )
+    assert lines["AFTER_VERIFY"] == "", (
+        f"messagefoundry.verify imported the generators: {lines['AFTER_VERIFY']}"
+    )
+    assert "messagefoundry.generators.all_types" in lines["AFTER_CONTROL"], (
+        "positive control failed -- the probe cannot detect a generators import at all, so its "
+        "clean answer above means nothing"
+    )
+
+
+def _generator_imports(source: str) -> list[str]:
+    """Every way ``source`` could reach ``messagefoundry.generators``, by symbol not by text.
+
+    A plain substring scan cannot do this job: the prose in ``smoke.py`` names the package to
+    explain why it is absent, and a scan would read that as the defect it documents. Walk the AST
+    instead -- ``import``, ``from ... import``, and the string form an ``importlib.import_module``
+    call takes.
+    """
+    hits: list[str] = []
+    for node in ast.walk(ast.parse(source)):
+        if isinstance(node, ast.Import):
+            hits += [a.name for a in node.names if a.name.startswith("messagefoundry.generators")]
+        elif (
+            isinstance(node, ast.ImportFrom)
+            and node.module is not None
+            and node.module.startswith("messagefoundry.generators")
+        ):
+            hits.append(node.module)
+        elif (
+            isinstance(node, ast.Constant)
+            and isinstance(node.value, str)
+            and node.value.startswith("messagefoundry.generators")
+        ):
+            hits.append(node.value)
+    return hits
+
+
+def test_no_verify_source_imports_the_generators() -> None:
+    """Source-level companion to the import probe.
+
+    The probe only sees imports that actually execute; a lazy ``from messagefoundry.generators
+    import ...`` inside an un-taken branch, or a dotted path handed to ``importlib``, would slip
+    past it.
+    """
+    verify_dir = Path(__file__).resolve().parents[1] / "messagefoundry" / "verify"
+    sources = sorted(verify_dir.glob("*.py"))
+    assert sources, f"no verify sources found under {verify_dir}"
+    hits = {
+        path.name: found
+        for path in sources
+        if (found := _generator_imports(path.read_text(encoding="utf-8")))
+    }
+    assert not hits, f"verify still imports the generators: {hits}"
+
+    # Positive control on all three forms. Without it, the clean result above is indistinguishable
+    # from a predicate that can never fire.
+    control = (
+        "import messagefoundry.generators.all_types\n"
+        "from messagefoundry.generators import _core\n"
+        'importlib.import_module("messagefoundry.generators.adt")\n'
+    )
+    assert len(_generator_imports(control)) == 3, _generator_imports(control)
 
 
 # ---- self smoke: snapshot_on_send thread-through (#241 F3) -------------------------------------
@@ -252,6 +400,190 @@ def test_live_smoke_fails_on_nak() -> None:
 def test_live_smoke_fails_when_unreachable() -> None:
     r = smoke.smoke_live(host="127.0.0.1", port=_free_port(), message="MSH|x", timeout=2.0)
     assert r.status is Status.FAIL
+
+
+# ---- live smoke over TLS (BACKLOG #1178, ASVS 12.3.1) -------------------------------------------
+#
+# The defect these cover, measured before the fix: smoke_live wrote a whole MLLP frame onto a bare
+# socket regardless of the target inbound's TLS posture, so `verify --smoke live` against a
+# `tls = true` inbound put a synthetic message BODY on the wire in the clear and then failed with
+# an unexplained "0 bytes received".
+
+
+def _self_signed(tmp_path: Path) -> tuple[str, str]:
+    """A throwaway cert/key for a loopback TLS listener, SAN=localhost so hostname checking is real."""
+    import datetime
+
+    from cryptography import x509
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import ec
+    from cryptography.x509.oid import NameOID
+
+    key = ec.generate_private_key(ec.SECP256R1())
+    name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "localhost")])
+    now = datetime.datetime(2020, 1, 1, tzinfo=datetime.UTC)
+    cert = (
+        x509.CertificateBuilder()
+        .subject_name(name)
+        .issuer_name(name)
+        .public_key(key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(now)
+        .not_valid_after(now.replace(year=2040))
+        .add_extension(x509.SubjectAlternativeName([x509.DNSName("localhost")]), critical=False)
+        .sign(key, hashes.SHA256())
+    )
+    cert_file, key_file = tmp_path / "smoke-cert.pem", tmp_path / "smoke-key.pem"
+    cert_file.write_bytes(cert.public_bytes(serialization.Encoding.PEM))
+    key_file.write_bytes(
+        key.private_bytes(
+            serialization.Encoding.PEM,
+            serialization.PrivateFormat.PKCS8,
+            serialization.NoEncryption(),
+        )
+    )
+    return str(cert_file), str(key_file)
+
+
+def _serve_one_tls(ack: bytes, cert: str, key: str) -> int:
+    """A one-shot MLLP-over-TLS listener that replies with ``ack``; returns its port."""
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    ctx.load_cert_chain(cert, key)
+    srv = socket.socket()
+    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    srv.bind(("127.0.0.1", 0))
+    srv.listen(1)
+    port = int(srv.getsockname()[1])
+
+    def handle() -> None:
+        try:
+            conn, _ = srv.accept()
+            with ctx.wrap_socket(conn, server_side=True) as tls:
+                tls.recv(65536)
+                tls.sendall(b"\x0b" + ack + b"\x1c\x0d")
+        except OSError:
+            pass
+        finally:
+            srv.close()
+
+    threading.Thread(target=handle, daemon=True).start()
+    return port
+
+
+def _record_first_bytes() -> tuple[socket.socket, int, list[bytes]]:
+    """A raw listener that records the first bytes of each connection. Yields (server, port, seen)."""
+    seen: list[bytes] = []
+    srv = socket.socket()
+    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    srv.bind(("127.0.0.1", 0))
+    srv.listen(4)
+
+    def handle() -> None:
+        while True:
+            try:
+                conn, _ = srv.accept()
+            except OSError:
+                return
+            with conn:
+                conn.settimeout(3.0)
+                try:
+                    seen.append(conn.recv(64))
+                except OSError:
+                    seen.append(b"")
+
+    threading.Thread(target=handle, daemon=True).start()
+    return srv, int(srv.getsockname()[1]), seen
+
+
+def test_live_smoke_over_tls_passes_on_aa(tmp_path: Path) -> None:
+    cert, key = _self_signed(tmp_path)
+    port = _serve_one_tls(b"MSH|^~\\&|R|R|S|S|20260101||ACK|1|P|2.5.1\rMSA|AA|1\r", cert, key)
+    r = smoke.smoke_live(
+        host="127.0.0.1",
+        port=port,
+        message=smoke.synthetic_message(),
+        timeout=5.0,
+        ssl_context=smoke.live_smoke_ssl_context(ca_file=cert),
+        server_hostname="localhost",
+    )
+    assert r.status is Status.PASS, r.detail
+
+
+def test_live_smoke_over_tls_puts_no_plaintext_frame_on_the_wire(tmp_path: Path) -> None:
+    """The whole point of #1178's smoke limb, with its own positive control in the same run.
+
+    Both calls hit the SAME raw recorder, so the plaintext arm proves the recorder can see an MLLP
+    frame at all — a TLS arm that observed nothing against a broken recorder would be reporting the
+    instrument, not the fix.
+    """
+    srv, port, seen = _record_first_bytes()
+    try:
+        smoke.smoke_live(host="127.0.0.1", port=port, message="MSH|^~\\&|A", timeout=2.0)
+        smoke.smoke_live(
+            host="127.0.0.1",
+            port=port,
+            message="MSH|^~\\&|A",
+            timeout=2.0,
+            ssl_context=smoke.live_smoke_ssl_context(ca_file=_self_signed(tmp_path)[0]),
+            server_hostname="localhost",
+        )
+    finally:
+        srv.close()
+    assert len(seen) == 2, f"the recorder saw {len(seen)} connection(s), expected 2"
+    plaintext, over_tls = seen
+    assert plaintext.startswith(b"\x0bMSH"), "positive control: the cleartext arm must be visible"
+    assert over_tls[:2] == b"\x16\x03", f"expected a TLS ClientHello, saw {over_tls[:8]!r}"
+    assert b"MSH" not in over_tls, "an application byte preceded or escaped the handshake"
+
+
+def test_live_smoke_tls_handshake_failure_is_named_as_such(tmp_path: Path) -> None:
+    """A cert problem must not read as an unreachable partner — that sends the operator to the
+    firewall for what is a trust-anchor question."""
+    cert, key = _self_signed(tmp_path)
+    port = _serve_one_tls(b"MSH|x\rMSA|AA|1\r", cert, key)
+    r = smoke.smoke_live(
+        host="127.0.0.1",
+        port=port,
+        message="MSH|^~\\&|A",
+        timeout=5.0,
+        ssl_context=smoke.live_smoke_ssl_context(),  # system trust store: cannot anchor this cert
+        server_hostname="localhost",
+    )
+    assert r.status is Status.FAIL
+    assert "TLS handshake" in r.detail, r.detail
+
+
+def test_plaintext_live_smoke_against_a_silent_listener_names_tls_as_a_cause() -> None:
+    """Zero bytes back is what a TLS inbound does to a cleartext frame. Say so; never retry."""
+    srv, port, _seen = _record_first_bytes()
+    try:
+        r = smoke.smoke_live(host="127.0.0.1", port=port, message="MSH|^~\\&|A", timeout=2.0)
+    finally:
+        srv.close()
+    assert r.status is Status.FAIL
+    assert "0 bytes received" in r.detail
+    assert "--smoke-tls" in r.detail, r.detail
+    assert "never retries" in r.detail, r.detail
+
+
+def test_live_smoke_ssl_context_offers_no_verify_off_escape() -> None:
+    ctx = smoke.live_smoke_ssl_context()
+    assert ctx.verify_mode is ssl.CERT_REQUIRED
+    assert ctx.check_hostname is True
+    assert ctx.minimum_version >= ssl.TLSVersion.TLSv1_2
+
+
+def test_live_smoke_ssl_context_asserts_forward_secrecy(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Reaching the shared assertion is observable only when it can fire, so make it fire.
+
+    Mirrors ``tests/test_tls_cipher_assertion_sites.py``: the shipped suite list is entirely
+    forward-secret, so a correctly-wired call site and a missing one look identical without this.
+    """
+    from messagefoundry.config import tls_policy
+
+    monkeypatch.setattr(tls_policy, "_is_forward_secret", lambda cipher: False)
+    with pytest.raises(ValueError, match="verify live smoke"):
+        smoke.live_smoke_ssl_context()
 
 
 # ---- store connectivity -----------------------------------------------------------------------

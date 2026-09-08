@@ -69,10 +69,12 @@ from messagefoundry.api.client_networks import ClientNetworkMiddleware
 from messagefoundry.api.field_authz import count_exposed, count_masked, redact_unauthorized
 from messagefoundry.api.header_floor import (
     BASELINE_SECURITY_HEADERS,
+    CSP_HEADER,
+    FRAME_ANCESTORS_CSP,
     HSTS_HEADER,
     HSTS_VALUE,
     SecurityHeaderFloorMiddleware,
-    hsts_applies,
+    hsts_notable,
 )
 from messagefoundry.api.metrics import (
     METRICS_CONTENT_TYPE,
@@ -127,6 +129,7 @@ from messagefoundry.api.models import (
     LogInfo,
     LogLevelInfo,
     LogLevelUpdate,
+    LogSinkInfo,
     LogTailPage,
     MessageDetail,
     MessageExportRequest,
@@ -276,6 +279,7 @@ from messagefoundry.config.wiring import (
 )
 from messagefoundry.integrity import run_startup_attestation
 from messagefoundry.last_resort import install_loop_exception_handler
+from messagefoundry.logging_guard import active_guard as active_log_guard
 from messagefoundry.logging_setup import LOG_LEVELS, current_log_level, set_runtime_level
 from messagefoundry.parsing.sniff import attachment_mime_agrees, nontext_upload_reason
 from messagefoundry.pipeline import ConfigReloadDenied, Engine
@@ -353,7 +357,48 @@ _WS_REVALIDATE_SECONDS = 3.0  # re-check the session on an open /ws/stats this o
 #: outside it. Non-GET routes under these prefixes pick the header up too, which is harmless.
 #: The ``/ui`` HTML surface is covered by its own branch in the middleware below.
 _NO_STORE_PREFIXES = ("/messages", "/dead-letters", "/search", "/logs", "/uploads")
+#: Route path TEMPLATES (not URL prefixes) whose responses project a column ``docs/PHI.md`` rates
+#: PL-1/PL-2/PL-3, but which no ``_NO_STORE_PREFIXES`` family reaches. They are gated on
+#: ``monitoring:read`` / ``monitoring:diagnose`` rather than on a PHI permission, and that is the whole
+#: reason they were missed: the control above is keyed to the PHI-read families, so sensitivity that
+#: arrives under a different permission falls outside it. ``connection_event.reason`` and
+#: ``alert_instance.reason`` are both **PL-2** free text (§2 of ``docs/PHI.md``), so these responses
+#: were served with no cache directive at all.
+#:
+#: TEMPLATES, because ``/connections/{name}/events`` cannot be written as a prefix without blanketing
+#: the whole ``/connections`` dashboard family — most of which returns no classified column. The
+#: middleware reads the template off ``request.scope["route"]``, which the router populates during
+#: ``call_next``. An exact set is safe here only because
+#: ``tests/test_no_store_phi_coverage.py`` selects routes by what their response model CARRIES rather
+#: than by what permission gates it: a new classified route that nobody adds here reds that guard.
+#:
+#: The PREFIX set above does not become redundant, and the reason is not style. A route can carry PHI
+#: with NO response model to inspect: ``GET /messages/{message_id}/attachments/{attachment_id}``
+#: streams raw detached-document bytes and declares no ``response_model`` at all, so no model walk can
+#: ever see it. Prefixes cover the families; this set covers the classified stragglers outside them.
+_NO_STORE_ROUTE_PATHS = frozenset(
+    {
+        "/events",
+        "/connections/{name}/events",
+        "/alerts/active",
+        # The alert-mutation replies return the same AlertInstanceInfo, PL-2 ``reason`` included.
+        "/alerts/{alert_id}/ack",
+        "/alerts/{alert_id}/resolve",
+        "/alerts/{alert_id}/suspend",
+        "/alerts/{alert_id}/resume",
+    }
+)
 _log = logging.getLogger(__name__)
+
+
+def _matched_route_path(request: Request) -> str | None:
+    """The matched route's path TEMPLATE (``/connections/{name}/events``), or ``None``.
+
+    The router writes the matched route into the request scope while ``call_next`` runs, so this is
+    readable in a middleware only AFTER the downstream call returns. ``None`` covers a 404 (nothing
+    matched) and a mount, neither of which is in :data:`_NO_STORE_ROUTE_PATHS`.
+    """
+    return getattr(request.scope.get("route"), "path", None)
 
 
 def _peer_display(value: Any) -> str | None:
@@ -435,6 +480,28 @@ def _log_storage(log_dir: str | None) -> LogInfo | None:
     except OSError:
         return None
     return LogInfo(path=str(path), size_bytes=total, disk_free_bytes=free)
+
+
+def _log_sink_health() -> list[LogSinkInfo]:
+    """Per-sink application-log WRITE health (#122, ADR 0162) for ``GET /status``.
+
+    In-memory only — no filesystem access, so unlike :func:`_log_storage` it cannot be defeated by the
+    very unwritable directory it is reporting on, and it is safe to call on the event loop. Empty when
+    logging was not configured through ``configure_logging`` (an embedding or a test)."""
+    guard = active_log_guard()
+    if guard is None:
+        return []
+    return [
+        LogSinkInfo(
+            sink=status.sink,
+            state=status.state,
+            rollovers=status.rollovers,
+            last_event=status.last_event,
+            last_event_at=status.last_event_at,
+            rolled_aside=status.rolled_aside,
+        )
+        for status in guard.status()
+    ]
 
 
 def _read_log_tail(log_dir: str | None, *, limit: int, offset: int) -> tuple[list[str], int, bool]:
@@ -663,12 +730,18 @@ _BROWSER_ACTIVE_SUBTYPE_TOKENS = ("html", "xml", "script", "svg")
 #: Top-level types that are browser-active whatever the subtype (``multipart/x-mixed-replace`` renders).
 _BROWSER_ACTIVE_TYPES = ("multipart",)
 
-#: The attachment download's Content-Security-Policy (ASVS 1.3.4). ``default-src 'none'`` denies every
-#: subresource and fetch; ``sandbox`` with NO ``allow-*`` token drops the response into a unique opaque
-#: origin with scripts, forms, popups and same-origin access all disabled. Layered UNDER the MIME
+#: The attachment download's Content-Security-Policy (ASVS 1.3.4 + 3.4.6). ``default-src 'none'`` denies
+#: every subresource and fetch; ``sandbox`` with NO ``allow-*`` token drops the response into a unique
+#: opaque origin with scripts, forms, popups and same-origin access all disabled. Layered UNDER the MIME
 #: downgrade, the unconditional ``Content-Disposition: attachment`` and the global ``nosniff``, so even
 #: a representation a browser would otherwise treat as markup cannot execute in the application origin.
-_ATTACHMENT_CSP = "default-src 'none'; sandbox"
+#:
+#: ``frame-ancestors 'none'`` is NAMED HERE rather than left to the header floor's appended policy,
+#: because ``frame-ancestors`` takes no fallback from ``default-src``: without it this response -- the
+#: strictest policy the engine writes -- was the one document family carrying no framing decision at
+#: all. The floor's carrier now skips a response whose policy already names the directive, so this
+#: constant is what that response is governed by, and it stays correct if the floor is ever removed.
+_ATTACHMENT_CSP = "default-src 'none'; sandbox; frame-ancestors 'none'"
 #: ``GET /messages/{message_id}/attachments/{attachment_id}`` and the web console's same-handler
 #: delegate ``GET /ui/messages/...`` — see :class:`AttachmentSecurityHeadersMiddleware`.
 _ATTACHMENT_PATH_RE = re.compile(r"^(?:/ui)?/messages/[^/]+/attachments/[^/]+$")
@@ -1285,7 +1358,10 @@ def create_app(
         # SecurityHeaderFloorMiddleware is in this response's path, and a 500 shipped with none of
         # them. Status and body are unchanged: this adds headers only.
         headers = dict(BASELINE_SECURITY_HEADERS)
-        if hsts_applies(request.url.scheme, exposure_protected):
+        # ASVS 3.4.6: the floor's frame-ancestors carrier cannot reach this response either, and a
+        # 500 is as navigable as any other, so the same directive is set here by hand.
+        headers[CSP_HEADER] = FRAME_ANCESTORS_CSP
+        if hsts_notable(request.url.scheme, exposure_protected, host=request.url.hostname or ""):
             headers[HSTS_HEADER] = HSTS_VALUE
         return JSONResponse({"detail": "internal error"}, status_code=500, headers=headers)
 
@@ -1341,13 +1417,19 @@ def create_app(
         # exists for the PATH-CONDITIONAL work below, which the floor deliberately does not duplicate.
         for name, value in BASELINE_SECURITY_HEADERS:
             response.headers.setdefault(name, value)
-        if hsts_applies(request.url.scheme, exposure_protected):
+        # hsts_notable, NOT hsts_applies: this middleware is the INNERMOST writer, so it wins the
+        # setdefault race against the floor. Leaving the bare scheme test here would put HSTS on
+        # every routed response of the minted-certificate default and the floor could never take it
+        # off again -- the guard has to hold at both emitters or it holds at neither.
+        if hsts_notable(request.url.scheme, exposure_protected, host=request.url.hostname or ""):
             response.headers.setdefault(HSTS_HEADER, HSTS_VALUE)
         # /ui browser surface (ADR 0065 §5): a strict CSP (no unsafe-*) and no-store on every HTML
         # response; the vendored /ui/static assets keep StaticFiles' own cache. PHI JSON reads also get
         # no-store (every _NO_STORE_PREFIXES family, ASVS 14.2.2) so a browser/proxy never caches a
-        # message body, a search hit, a log line or an uploaded file's split messages. These are SET
-        # (override) so a stale cache directive can't slip through. nosniff/frame-deny/HSTS still apply.
+        # message body, a search hit, a log line or an uploaded file's split messages. The second arm,
+        # _NO_STORE_ROUTE_PATHS, carries the classified responses that arrive under a MONITORING
+        # permission and so sit outside every PHI-read family. These are SET (override) so a stale
+        # cache directive can't slip through. nosniff/frame-deny/HSTS still apply.
         path = request.url.path
         if (path == "/ui" or path.startswith("/ui/")) and not path.startswith("/ui/static"):
             # The /ui CSP is co-versioned with the app.js/app.css it governs, so the web console owns
@@ -1358,7 +1440,11 @@ def create_app(
             if ui_csp is not None:
                 response.headers["Content-Security-Policy"] = ui_csp
             response.headers["Cache-Control"] = "no-store"
-        elif path.startswith(_NO_STORE_PREFIXES):
+        # Prefix test first: it is a C-level startswith over a 5-tuple and short-circuits the whole
+        # PHI-read surface before the scope lookup is reached.
+        elif path.startswith(_NO_STORE_PREFIXES) or (
+            _matched_route_path(request) in _NO_STORE_ROUTE_PATHS
+        ):
             response.headers["Cache-Control"] = "no-store"
         return response
 
@@ -1586,6 +1672,11 @@ def create_app(
         # stash-or-default pattern — settings-scoped, so this route reports it completely even with no
         # graph loaded, unlike the connection-scoped cleartext_accepted set below.
         alerts_settings = getattr(request.app.state, "alerts_settings", None) or AlertsSettings()
+        # BACKLOG #1004: [secret_rotation] carries the store DEK's calendar-expiry opt-out. Same
+        # stash-or-default pattern — settings-scoped, so this route reports it completely with no graph.
+        secret_rotation_settings = (
+            getattr(request.app.state, "secret_rotation_settings", None) or SecretRotationSettings()
+        )
         # ADR 0153 + #333: the THREE connection-scoped deviations. Read LIVE off the running graph (so a
         # reload is reflected) — this route is where an operator learns a cleartext hop is being crossed
         # by declaration, an expired certificate is being honoured, or a generic DB hop has no verifying
@@ -1616,6 +1707,7 @@ def create_app(
                 store,
                 auth_settings,
                 alerts_settings,
+                secret_rotation_settings,
                 cleartext_hops,
                 expired_hops,
                 db_hops,
@@ -3481,9 +3573,9 @@ def create_app(
         # between calls, so it cannot become a session-wide toggle by accident.
         outbox = [redact_unauthorized(o, identity) for o in detail.outbox]
         events = [redact_unauthorized(e, identity) for e in detail.events]
-        detail = redact_unauthorized(detail, identity, revealed=frozenset({"summary"})).model_copy(
-            update={"outbox": outbox, "events": events}
-        )
+        detail = redact_unauthorized(
+            detail, identity, revealed=frozenset({"summary", "metadata"})
+        ).model_copy(update={"outbox": outbox, "events": events})
         rows = [detail, *outbox, *events]
         exposed, masked = count_exposed(rows), count_masked(rows)
         if exposed or masked:
@@ -5019,6 +5111,7 @@ def create_app(
                 synchronous=db.synchronous,
             ),
             logs=logs,
+            log_sinks=_log_sink_health(),
             update=update,
             pool=pool,
             claim_proc=claim_proc,
@@ -5656,7 +5749,11 @@ async def _assert_security_notice_is_deliverable(
         "early when the recipient has no address). The [alerts] SMTP transport being configured "
         "does not make a notice deliverable -- on a first run the bootstrap administrator is created "
         "without one. Set an address on at least one enabled Administrator, or accept the pull-only "
-        "/me/security-events feed in writing via [alerts].security_notifications_required=false."
+        "/me/security-events feed in writing via [alerts].security_notifications_required=false. "
+        "(On a NEW install, `messagefoundry provision-admin --username <name> --email <address>` "
+        "before the first serve avoids this state entirely -- BACKLOG #1136. It is not a fix for "
+        "the instance that just refused: it declines once an enabled Administrator exists, which "
+        "by this point one does.)"
     )
     enforcement = (security_settings or SecuritySettings()).enforcement
     if enforcement is SecurityEnforcement.ENFORCE:
@@ -6154,6 +6251,10 @@ def create_managed_app(
             # window. None (the direct create_app / embedding path) leaves that check inert — deny-by-default
             # for a monitoring signal, and byte-identical to before.
             app.state.cert_monitor_settings = cert_monitor_settings
+            # BACKLOG #1004: back GET /security/posture's enforce_store_key_expiry loosening entry.
+            # None (direct create_app / embedding) leaves the route on shipped defaults, which report
+            # nothing — correct, because an app built without [secret_rotation] has not opted out.
+            app.state.secret_rotation_settings = secret_rotation_settings
             # #118: expose the connector SecretProvider so POST /alerts/test-email can resolve an
             # email_password_secret reference (fail-closed) exactly as notifier_from_settings does. None on
             # the embedded/test path — then only a plain env-sourced email_password can be tested.

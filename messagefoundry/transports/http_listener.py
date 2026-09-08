@@ -194,6 +194,28 @@ def _validated_header(name: str, value: str) -> str:
     return f"{name}: {value}"
 
 
+#: The browser-safety baseline every response from this listener carries (ASVS 3.4.4 / 3.4.6).
+#:
+#: **This is a deliberate SECOND copy of ``api/header_floor.BASELINE_SECURITY_HEADERS`` and the
+#: ``frame-ancestors`` policy beside it, and the duplication is forced by the dependency rule this
+#: module's own docstring states: ``transports/`` must not import ``api/``** (and ``header_floor``
+#: imports Starlette, which has no business in a connector). A copy that can drift silently is the
+#: failure ``header_floor`` exists to end, so it does not drift silently here either:
+#: ``tests/test_inbound_http_source.py`` imports both and asserts they are equal, which is the single
+#: place a divergence reds. Do not "fix" this by importing across the boundary.
+#:
+#: ``Strict-Transport-Security`` is deliberately ABSENT. It would have to be gated on THIS
+#: connection's own TLS context (``Http(tls_certfile=...)``) rather than on the API's, and on the same
+#: RFC 6797 notability tests the API applies -- that is a separate piece of work, named rather than
+#: half-built, because a wrongly-gated HSTS is worse than none.
+_BASELINE_RESPONSE_HEADERS: tuple[tuple[str, str], ...] = (
+    ("X-Content-Type-Options", "nosniff"),
+    ("Referrer-Policy", "no-referrer"),
+    ("X-Frame-Options", "DENY"),
+    ("Content-Security-Policy", "frame-ancestors 'none'"),
+)
+
+
 def build_response(
     status: int,
     body: str = "",
@@ -207,6 +229,14 @@ def build_response(
 
     ``extra_headers`` carries the auth challenges intake authentication owes a peer —
     ``WWW-Authenticate`` on a ``401``, ``Retry-After`` on a ``429``.
+
+    **Every response also carries :data:`_BASELINE_RESPONSE_HEADERS`** (ASVS 3.4.4 / 3.4.6). This
+    function is the chokepoint all twelve call sites feed, so the baseline is a property of the
+    serializer rather than a list of remembered call sites. It matters most on the ADR 0154 sync-reply
+    path below, which echoes a DOWNSTREAM PARTNER'S ``Content-Type`` verbatim beside partner-supplied
+    bytes: without ``nosniff`` and a framing decision that response can serve a partner-derived
+    ``text/html`` document over this listener's own TLS. ``extra_headers`` still wins on a name
+    collision.
 
     **Every header name and value, including ``content_type``, is validated here rather than at the
     call site.** This function joins the header block with ``\\r\\n``, so it *is* the chokepoint: a
@@ -224,6 +254,15 @@ def build_response(
     if status != 204:
         headers.append(_validated_header("Content-Type", content_type))
         headers.append(f"Content-Length: {len(payload)}")
+    supplied = {name.casefold() for name in (extra_headers or {})}
+    # setdefault semantics, not an unconditional write: a caller that has made its own decision about
+    # one of these names keeps it, and no name is ever emitted twice. Placed BEFORE extra_headers so
+    # the reading order matches the precedence.
+    headers.extend(
+        _validated_header(name, value)
+        for name, value in _BASELINE_RESPONSE_HEADERS
+        if name.casefold() not in supplied
+    )
     headers.extend(_validated_header(name, value) for name, value in (extra_headers or {}).items())
     headers.extend(("Connection: close", "", ""))
     return "\r\n".join(headers).encode("ascii") + payload

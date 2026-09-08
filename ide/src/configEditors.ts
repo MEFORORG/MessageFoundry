@@ -15,6 +15,7 @@
 // a text view.
 import * as vscode from "vscode";
 import { configDir, runJson, workspaceDir } from "./cli";
+import { postToWebview } from "./webviewMessaging";
 import { connectionFormHtml, formSchemaFor } from "./connectionEditor";
 import { type ConnObj, nameCollisionError, planSave } from "./connectionMerge";
 import { Detail, codeSetFormHtml } from "./codeSetEditor";
@@ -151,7 +152,7 @@ export class ConnectionsCustomEditorProvider implements vscode.CustomTextEditorP
         // (registered during script parse) and be dropped. A "ready" handshake would mean editing the
         // shared form HTML in connectionEditor.ts; left as-is — a dropped load error is non-fatal (the
         // form is still usable and any refresh re-posts it).
-        panel.webview.postMessage({ command: "error", message: listError });
+        postToWebview(panel.webview, { command: "error", message: listError });
       }
     };
 
@@ -176,7 +177,7 @@ export class ConnectionsCustomEditorProvider implements vscode.CustomTextEditorP
           try {
             fresh = await runJson<ConnObj[]>(["connection", "list", "--config", configDir()], ws);
           } catch (e) {
-            panel.webview.postMessage({
+            postToWebview(panel.webview, {
               command: "error",
               message:
                 "could not re-read connections.toml before saving (nothing was written) — " +
@@ -189,7 +190,7 @@ export class ConnectionsCustomEditorProvider implements vscode.CustomTextEditorP
             editingName: renderedName ?? undefined,
           });
           if (plan.collision) {
-            panel.webview.postMessage({ command: "error", message: nameCollisionError(plan.collision) });
+            postToWebview(panel.webview, { command: "error", message: nameCollisionError(plan.collision) });
             return;
           }
           markSaving();
@@ -197,7 +198,7 @@ export class ConnectionsCustomEditorProvider implements vscode.CustomTextEditorP
             await runJson(["connection", "upsert", "--config", configDir(), "--data", JSON.stringify(plan.conn)], ws);
           } catch (e) {
             clearGuard();
-            panel.webview.postMessage({ command: "error", message: e instanceof Error ? e.message : String(e) });
+            postToWebview(panel.webview, { command: "error", message: e instanceof Error ? e.message : String(e) });
             return;
           }
           desired = m.conn.name; // stay on the just-saved connection
@@ -217,7 +218,7 @@ export class ConnectionsCustomEditorProvider implements vscode.CustomTextEditorP
             await runJson(["connection", "remove", "--config", configDir(), "--name", m.name], ws);
           } catch (e) {
             clearGuard();
-            panel.webview.postMessage({ command: "error", message: e instanceof Error ? e.message : String(e) });
+            postToWebview(panel.webview, { command: "error", message: e instanceof Error ? e.message : String(e) });
             return;
           }
           desired = undefined;
@@ -309,7 +310,7 @@ export class CodeSetCustomEditorProvider implements vscode.CustomTextEditorProvi
         // Only surface the load error when we truly fell back to an empty grid (not a populated one).
         // F7: like the connections provider, this can race the webview's listener and be dropped — a
         // non-fatal load hint, so it is not worth a "ready" handshake into the shared grid HTML.
-        panel.webview.postMessage({ command: "error", message: showError });
+        postToWebview(panel.webview, { command: "error", message: showError });
       }
     };
 
@@ -325,7 +326,7 @@ export class CodeSetCustomEditorProvider implements vscode.CustomTextEditorProvi
             await runJson(["codeset", "upsert", "--config", configDir(), "--data", JSON.stringify(m.detail)], ws);
           } catch (e) {
             clearGuard();
-            panel.webview.postMessage({ command: "error", message: e instanceof Error ? e.message : String(e) });
+            postToWebview(panel.webview, { command: "error", message: e instanceof Error ? e.message : String(e) });
             return;
           }
           await render();
@@ -342,7 +343,7 @@ export class CodeSetCustomEditorProvider implements vscode.CustomTextEditorProvi
           try {
             await runJson(["codeset", "remove", "--config", configDir(), "--name", m.name], ws);
           } catch (e) {
-            panel.webview.postMessage({ command: "error", message: e instanceof Error ? e.message : String(e) });
+            postToWebview(panel.webview, { command: "error", message: e instanceof Error ? e.message : String(e) });
             return;
           }
           void vscode.window.showInformationMessage(`MessageFoundry: removed code set ${m.name}.`);
