@@ -175,9 +175,40 @@ writes when measured.
 
 ### Recovery and lifecycle
 
-`rescue.ps1` (move dirty primary work into a worktree), `restore-primary.ps1` (re-attach a detached
-primary, refuses if dirty), `sessions.ps1 -Rehome` (find and re-file a relocated transcript), and
-`new.ps1` / `spawn.ps1` / `remove.ps1` / `prune-merged.ps1`.
+`scripts\worktree\rescue.ps1` (move dirty primary work into a worktree), `restore-primary.ps1`
+(re-attach a detached primary, refuses if dirty), `sessions.ps1 -Rehome` (find and re-file a relocated
+transcript), and `new.ps1` / `spawn.ps1` / `remove.ps1` / `prune-merged.ps1`.
+
+**Two different scripts are named `rescue.ps1`, so spell the folder.** The one above moves work.
+[`scripts\coord\rescue.ps1`](../scripts/coord/rescue.ps1) is the other: it writes and audits **rescue
+refs**, the commit anchors a session leaves behind so its work can still be found after the branch is
+gone. `-Anchor` writes one, `-Check` grades the population.
+
+#### Name the clone when you name a ref
+
+**One server-side rescue tag arrives under two local names.** A reader who compares ref names across
+clones gets a false answer, and nothing reports a problem.
+
+```
+git config --get-all remote.private.fetch
+-> +refs/tags/rescue/*:refs/remotes/private/rescuetags/*
+```
+
+That refspec copies every `refs/tags/rescue/*` tag into `refs/remotes/private/rescuetags/*`. So one
+object sits under two refnames in the same clone, and `git tag -l 'rescue/*'` sees only one of them.
+That is how two readers each verified a real object with an instrument structurally blind to the
+other's, and each read the other's report as wrong.
+
+**So name the clone and the full refname, every time you write one down.** "the rescue tag for my
+branch" is not an address. `refs/tags/rescue/auto/<repo>/<branch>, in the engine primary` is. The rule
+is about naming and nothing else: **it is not a claim that any clone is missing a ref.** Two clones
+holding different refs is two repositories, not a defect (BACKLOG #1378).
+
+Reading the audit needs one more distinction, and `rescue.ps1 -Check` prints it: a `refs/tags/rescue/*`
+ref is a **snapshot**, so one behind its branch is behind it forever and that is recorded rather than
+faulted, while a `refs/remotes/<remote>/rescuetags/*` ref is **push-updated** and may merely be lagging
+a live branch. The script's own header carries the reasoning and rules that chasing snapshot staleness
+is not its job (BACKLOG #1349).
 
 ### Status table
 
