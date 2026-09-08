@@ -45,11 +45,41 @@ def emit_audit_tee(
     channel_id: str | None,
     detail: str | None,
     ts: float,
+    row_id: int,
+    row_hash: str,
     client: str | None = None,
 ) -> None:
     """Tee a just-persisted ``audit_log`` record off-box as PHI-safe metadata (sec-offbox-log, ASVS
-    16.x). Emits actor / action / channel / client address / timestamp plus a **redacted** ``detail``
-    to the ``messagefoundry.audit`` logger.
+    16.x). Emits actor / action / channel / client address / timestamp / chain anchor plus a
+    **redacted** ``detail`` to the ``messagefoundry.audit`` logger.
+
+    ``row_id`` and ``row_hash`` are the just-committed row's primary key and its chain hash -- the
+    ANCHOR fields (BACKLOG #1198). They are required, not optional: an anchor that could be omitted
+    silently would make an off-box copy with no anchor indistinguishable from one whose writer chose
+    not to send it. Neither carries PHI directly and neither discloses a key: the id is a counter and
+    ``row_hash`` is a digest, or under #190 keying an HMAC.
+
+    **One residual, stated because "the head hash carries nothing" is very slightly too strong.** In
+    the DEFAULT keyless posture ``row_hash`` is a plain SHA-256 over a canonical list whose every other
+    member -- the previous row's hash, ``ts``, ``actor``, ``action``, ``channel_id``, ``client`` --
+    travels in this same record or the one before it. So for a record whose ``detail`` ``safe_text``
+    actually cut, a reader of the log can TEST guesses at the removed span offline, one hash per guess.
+    That is narrow (it needs an exact byte-for-byte reconstruction of a redacted exception string, and
+    an audit ``detail`` that was not HL7-shaped is forwarded unredacted anyway, so there is nothing left
+    to guess) and it disappears entirely once the chain is keyed, where the digest is an HMAC under a
+    DEK-derived subkey. It is recorded here rather than left for a reader to rediscover.
+
+    **What the anchor fields do and do not buy, stated here so nobody over-reads them.** A within-store
+    chain walk cannot see TAIL truncation -- deleting the newest rows leaves a prefix that still
+    verifies -- so an off-box record of ``(row_id, row_hash)`` is the witness that the chain once
+    reached that length with that head. That witness is only as good as the hop it travels. The default
+    forwarder is lossy by
+    :func:`~messagefoundry.logging_setup.configure_logging`'s own account: UDP is fire-and-forget, a TCP
+    collector unreachable at startup is skipped for the process lifetime, and a stalled one drops
+    records after a bounded socket timeout. Over that transport a gap in the collector's copy is
+    AMBIGUOUS (dropped in flight, or truncated in the store) and a forged anchor line is injectable, so
+    these fields close tail truncation only over an authenticated, gap-detecting hop. Do not describe
+    them as making the audit log unmodifiable.
 
     ``client`` (ADR 0150) is the caller's network address, or ``None`` for an engine-internal write. It
     is forwarded verbatim — it is an infrastructure identifier, not message content, and the whole point
@@ -84,6 +114,11 @@ def emit_audit_tee(
         "actor": actor,
         "channel_id": channel_id,
         "client": client,
+        # Anchor fields (BACKLOG #1198): the row's position in the chain and its head hash. Discrete
+        # fields so a SIEM can index them without parsing the redacted blob. See the docstring for
+        # what they close and what the default transport leaves open.
+        "row_id": row_id,
+        "row_hash": row_hash,
         # PHI chokepoint: redact HL7-shaped content + bound length before it ships off-box.
         "detail": safe_text(detail) if detail else None,
     }

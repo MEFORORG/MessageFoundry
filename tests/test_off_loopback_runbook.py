@@ -440,6 +440,11 @@ def test_runbook_documents_the_shipped_download_safety_mechanism() -> None:
         "application/octet-stream",
         "Content-Disposition: attachment",
         "nosniff",
-        _ATTACHMENT_CSP,  # default-src 'none'; sandbox
+        # default-src 'none'; sandbox; frame-ancestors 'none' -- the directive was added under
+        # BACKLOG #1121, because frame-ancestors takes no fallback from default-src. This module
+        # skips wherever docs/security/ is absent, which is every public checkout and CI, so this
+        # assertion will NOT red here: it reds for a reader with the vault checked out, until that
+        # runbook sentence gains the directive too. That is vault work, not engine work.
+        _ATTACHMENT_CSP,
     ):
         assert token in section, f"runbook attachment section no longer documents {token!r}"
