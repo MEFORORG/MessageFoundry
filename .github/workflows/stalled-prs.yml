@@ -39,6 +39,11 @@ jobs:
   stalled:
     name: open PRs can still reach a merge
     runs-on: ubuntu-latest
+    # The check used to make ONE `gh` call, so its own 180s subprocess timeout bounded this job at
+    # about three minutes. It now makes one call per open pull request that is BEHIND -- see
+    # scripts/ci/check_stalled_prs.py's ROLLUP_FIELDS for why -- and that ceiling went with it.
+    # Without this the runaway bound is GitHub's 360-minute default, on a job nobody watches run.
+    timeout-minutes: 15
     permissions:
       contents: read
       pull-requests: read # list PRs + their merge state; no write scope anywhere

@@ -39,6 +39,31 @@ from tests.test_store_capability_matrix import _BACKENDS
 _PLACEHOLDER = re.compile(r"\A(\?|\$\d+|%s)\Z")
 
 
+async def _directory_signed_in(store: Store) -> str:
+    """Complete one directory sign-in against ``store`` and return the username.
+
+    Shared with ``tests/test_provision_first_administrator.py``, which builds on this measurement:
+    a completed sign-in leaves a non-empty table with no administrator, so the provisioning guard
+    cannot ask "is the table empty". Extracted rather than copied because two copies of one
+    precondition can drift apart silently -- the same reason ``_BACKENDS`` is imported above.
+
+    Driven through ``_complete_ad_login``, the shared tail every directory mechanism (Kerberos,
+    simple bind, OIDC) ends at, which is the seam the neighbouring AD tests use.
+    """
+    principal = AdPrincipal(
+        username="dana",
+        display_name="Dana Example",
+        email="dana@example.invalid",
+        dn="cn=dana,ou=people,dc=example,dc=invalid",
+        groups=frozenset({"cn=everyone,ou=groups,dc=example,dc=invalid"}),
+    )
+    outcome = await AuthService(store, AuthSettings())._complete_ad_login(
+        principal, None, mfa_verified=True
+    )
+    assert outcome.ok, "the directory sign-in itself succeeds"
+    return principal.username
+
+
 async def test_fresh_store_gets_an_enabled_account_named_admin() -> None:
     """Neither arm of 6.3.2 holds at creation: the account is present AND enabled.
 
@@ -123,21 +148,11 @@ async def test_a_directory_sign_in_creates_a_roleless_row() -> None:
     store = await MessageStore.open(":memory:")
     try:
         service = AuthService(store, AuthSettings())
-        principal = AdPrincipal(
-            username="dana",
-            display_name="Dana Example",
-            email="dana@example.invalid",
-            dn="cn=dana,ou=people,dc=example,dc=invalid",
-            groups=frozenset({"cn=everyone,ou=groups,dc=example,dc=invalid"}),
-        )
+        # Deliberately NOT preceded by initialize(): this is the store state the redesign creates,
+        # where nothing seeded an administrator first.
+        username = await _directory_signed_in(store)
 
-        # The shared tail every directory mechanism ends at (Kerberos, simple bind, OIDC), driven at
-        # the seam the neighbouring AD tests use. Deliberately NOT preceded by initialize(): this is
-        # the store state the redesign creates, where nothing seeded an administrator first.
-        outcome = await service._complete_ad_login(principal, None, mfa_verified=True)
-        assert outcome.ok, "the directory sign-in itself succeeds"
-
-        user = await store.get_user_by_username("dana")
+        user = await store.get_user_by_username(username)
         assert user is not None
         assert await store.count_users() == 1, "the table is no longer empty"
         assert await store.get_user_role_ids(user.id) == [], "and the row holds no role"
