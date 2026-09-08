@@ -457,6 +457,10 @@ def require_service_cert(*permissions: Permission) -> Callable[[Request], Awaita
             # No subject in the message (no cert / unmapped) — never echo the presented subject (could be
             # attacker-chosen); a generic 401 keeps the deny-by-default surface uniform.
             raise HTTPException(status.HTTP_401_UNAUTHORIZED, "client certificate not authorized")
+        # An identity implies a live AuthService — :func:`resolve_client_cert_identity` returns None
+        # when auth is absent or disabled. Narrowed rather than asserted so a later refactor of that
+        # resolver degrades to a missing audit row instead of a 500 on the request path.
+        auth = get_auth(request)
         for permission in permissions:
             if not identity.has(permission):
                 log.warning(
@@ -465,6 +469,23 @@ def require_service_cert(*permissions: Permission) -> Callable[[Request], Awaita
                     request.url.path,
                     permission.value,
                 )
+                if auth is not None:
+                    # ASVS 16.3.2 / BACKLOG #1197 — the cert plane's failed authorization attempts have
+                    # to reach the tamper-evident chain, not only the application log. Measured at HEAD
+                    # before this call existed: a refused cert-identity wrote ZERO audit rows while
+                    # :func:`require`'s denial wrote ``auth.permission_denied`` for the same principal on
+                    # the same store in the same run.
+                    #
+                    # The GRANT side is deliberately NOT mirrored here, and that is a scope decision
+                    # rather than an oversight: a grant row is per-request, and #1197's part (a)
+                    # measured that the audit chain has no drain — ``[retention].audit_days`` is
+                    # reserved and unenforced, ``[retention].max_db_mb`` ships at 0 — so widening the
+                    # per-request trail waits on that drain. A denial is rare by construction and does
+                    # not. Note the admission is not silent today either: the one shipped route on this
+                    # gate, ``GET /service/identity``, writes its own ``service_cert_auth`` row in the
+                    # ROUTE BODY. That covers authentication for that route only; a future route built
+                    # on this factory inherits nothing, which is the gap the grant work would close.
+                    await auth.audit_permission_denied(identity, permission, request.url.path)
                 raise HTTPException(
                     status.HTTP_403_FORBIDDEN, f"missing permission: {permission.value}"
                 )
