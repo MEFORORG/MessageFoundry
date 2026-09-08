@@ -133,3 +133,91 @@ def test_the_summary_reports_the_compared_denominator(tmp_path: Path, capsys) ->
     assert rc == 0
     assert "ALSO carry a prose re-score naming a verdict and were compared" in out
     assert "1 agree" in out
+
+
+# --------------------------------------------------------------------------------------------
+# Advisory mode, and the refusal it must NOT swallow (BACKLOG #1342).
+# --------------------------------------------------------------------------------------------
+
+
+def _diverging(tmp_path: Path) -> Path:
+    """One item whose banner contradicts its own re-score -- the shape the exit code keys on."""
+    return _ledger(
+        tmp_path,
+        f"## 500. an item\r\n\r\n> {CLOSED} **Re-scored 2026-08-20 -> DEMAND-GATE.**\r\n"
+        "> Verdict: build\r\n\r\nprose\r\n",
+    )
+
+
+def test_a_divergence_exits_1_by_default_and_0_under_advisory(tmp_path: Path, capsys) -> None:  # type: ignore[no-untyped-def]
+    """BOTH ARMS ON ONE LEDGER, because either alone is satisfiable by the wrong implementation.
+
+    A flag that always returns 0 passes the advisory arm; a flag that is never read passes the
+    default arm. Only the pair pins that ``--advisory`` is what moved the code, and the shared
+    ledger is what makes the two arms differ in exactly one thing.
+    """
+    led = _diverging(tmp_path)
+    mod = _load()
+
+    assert mod.main(["--backlog", str(led)]) == 1, "the default must still fail on a divergence"
+    default_out = capsys.readouterr().out
+
+    assert mod.main(["--backlog", str(led), "--advisory"]) == 0, "--advisory must report, not fail"
+    advisory_out = capsys.readouterr().out
+
+    # The finding is REPORTED either way. A flag that quiets the output as well as the exit code
+    # would make an advisory job green AND silent, which is the failure the wiring exists to avoid.
+    for out in (default_out, advisory_out):
+        assert "#500: banner says Verdict: build" in out
+        assert "1 DIVERGE" in out
+
+
+def test_a_ledger_with_no_open_items_is_refused_in_BOTH_modes(tmp_path: Path, capsys) -> None:  # type: ignore[no-untyped-def]
+    """A parse that yields nothing must not render as agreement, and ``--advisory`` must not hide it.
+
+    ``0 open items ... 0 compared`` is what a broken ``parse_items``, a renamed banner block, or the
+    wrong file looks like -- and it exits 0 while printing ``OK``. That green is a statement about
+    the INSTRUMENT, not about the ledger, and it is indistinguishable from a clean tree.
+
+    THE SECOND ARM IS THE PROPERTY THE ADVISORY WIRING RESTS ON. ``--advisory`` downgrades a
+    FINDING; if it also downgraded a malfunction, the workflow's re-raised exit status could never be
+    non-zero and the job could not tell a clean scan from one that read nothing.
+    """
+    led = _ledger(tmp_path, "no headings here, so no items at all\r\n")
+    mod = _load()
+
+    assert mod.main(["--backlog", str(led)]) == 2, (
+        "an empty population is a malfunction, not a clean result"
+    )
+    assert "refusing" in capsys.readouterr().err.lower()
+
+    assert mod.main(["--backlog", str(led), "--advisory"]) == 2, (
+        "--advisory suppresses a finding, never a malfunction"
+    )
+
+
+def test_a_ledger_whose_open_items_carry_no_banner_verdict_is_refused(
+    tmp_path: Path, capsys
+) -> None:  # type: ignore[no-untyped-def]
+    """The BANNER is this check's whole subject, so zero banners means the field is unreadable.
+
+    Distinct from the arm above: the items parse fine and the compared population is still zero.
+    An item legitimately carrying no verdict is not compared (see the single-item arm above); a
+    LEDGER in which nothing carries one means the banner parse is dead.
+    """
+    led = _ledger(
+        tmp_path,
+        f"## 500. an item\r\n\r\n> {CLOSED} **Filed.**\r\n\r\nprose\r\n"
+        f"\r\n## 501. another item\r\n\r\n> {CLOSED} **Filed.**\r\n\r\nprose\r\n",
+    )
+    rc = _load().main(["--backlog", str(led)])
+    err = capsys.readouterr().err
+    assert rc == 2
+    assert "banner" in err.lower()
+
+
+def test_a_missing_ledger_is_refused_under_advisory_too(tmp_path: Path) -> None:
+    """The other malfunction on the same reasoning: a path that does not exist reports nothing, and
+    reporting nothing must never render as reporting no divergences."""
+    missing = tmp_path / "nope.md"
+    assert _load().main(["--backlog", str(missing), "--advisory"]) == 2
