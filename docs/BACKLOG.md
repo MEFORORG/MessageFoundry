@@ -3970,6 +3970,12 @@ So the registered control for a context should record **what it does not break**
 
 ## 1004. ASVS 13.3.4 — the store DEK's calendar expiry alerts and never refuses; build the enforced stop with a loud opt-out
 
+> 🚧 **ENGINE HALF BUILT 2026-09-03; THE ORDERING PRECONDITION IS MET AND WAS MEASURED, NOT ASSUMED.** This banner replaces one reading *"DRAFT AND HELD -- the vault half has not landed and this must not land alone"*, which was **wrong when it was written**: the vault half's strictly-before part had already landed on **2026-08-21**, as vault PR 1347, *"asvs(13.3.4): re-key the DEK-expiry absence claim on behaviour, not the exception name"*, whose own commit body says *"BACKLOG #1004 step 1, owner-ordered to land BEFORE the engine half"*. The builder inferred otherwise from this PR touching no vault file, which is an instrument answering a nearby question -- this PR not touching the vault says nothing about whether a **different** vault PR did the work. Re-measured 2026-09-07: cell 13.3.4 extracted from that merge and from vault `origin/main` today is **byte-identical**, so the re-key survives 240 commits of vault main and this repository's known history of sweeps reverting merged cells. **The remainder of the vault half cannot precede this merge and is not supposed to**: the vault's own memo records that the evidence anchors *"cannot be re-pointed against code that is not written yet"* and that the residual down-triggers must be re-read *"after the engine half is final, not before"*. The vault half is therefore staged -- step 1 strictly before, step 2 strictly after -- and step 2 is what keeps this item open. The refusal ships as `enforce_store_key_expiry()` in `pipeline/secret_rotation.py`, called from `Engine.start` **outside** the blanket `except Exception` that guards the rotation-meta reconcile; an overdue calendar age and an **undetermined** age both refuse; `[secret_rotation].enforce_store_key_expiry` (default `true`) is the opt-out and `security_loosenings()` names it. Twelve engine-level and unit arms, plus a proven mutation control: moving the call inside that handler reds three tests, and the swallowed run logs *"secret-rotation stamp reconcile failed; continuing with config dates"* while the engine starts on an expired key.
+>
+> 🚧 **THE EXCEPTION NAME IS `StoreKeyRotationOverdueError`, and reporting it is the point.** This item rules that the name is a coordination-visible decision because the 13.3.4 absence claim is keyed on the exception NAME rather than on behaviour. `StoreKeyRotationOverdueError` carries **both** a rotation token and an overdue token, chosen deliberately over the more obvious `StoreKeyExpiredError` so that a name-keyed claim trips and the drift gate goes **red** — which this item calls the SAFE outcome, because it is the record noticing. **That is an intent, not a measurement:** `docs/security/` is gitignored here, so a builder in an engine checkout cannot read the token set and cannot confirm the claim actually fires. Whoever holds the vault half must check it rather than inherit this line. If it does **not** fire, the recorded absence has gone false silently and someone has to be told. **ANSWERED 2026-09-07, and the answer is better than the question assumed: the claim is no longer name-keyed at all.** Step 1 re-keyed it onto BEHAVIOUR, so it fires on any refusal on this axis whatever the exception is called, and the careful choice of `StoreKeyRotationOverdueError` turned out not to be load-bearing. Measured with the engine's own `scripts/asvs/scorecard.py`, against this PR's own merge-base and then against its head merged onto current `main`: the merge adds **exactly two** findings and both are on 13.3.4 -- the absence claim going false (0 matches at the base, 1 at the head) and one evidence anchor going GONE, that anchor being the *"does not force-rotate or hard-expire"* sentence this PR deliberately rewrote. No other cell moves in either direction. **The lockstep fires as designed, and the recorded absence does not go false silently.**
+>
+> 🚧 **The measuring-document edits are RECORD CORRECTIONS that FOLLOW the code, not the forbidden lever.** `docs/ASVS-L2-PHASE0-CHANGES.md`'s *"does not force-rotate or hard-expire a secret"* and its ENFORCE-escalation bullet became false the moment the refusal landed; leaving them standing would be the compensating-control-on-a-false-premise defect. They are corrected to describe shipped behaviour. `docs/CONFIGURATION.md`'s *"still an alert, never a refusal"* and a new `docs/SECURITY-LOOSENING.md` entry moved for the same reason. **No vault file was read or written.**
+
 > 🔢 **Re-scored 2026-08-20 -> P1.** Value **8/10** · Difficulty **6/10** · _big bet_. Nothing shipped: the calendar axis in secret_rotation.py:319-351 still only alerts while crypto.py:688 refuses unconditionally on the usage axis, and enforce_store_key_expiry does not exist. Value 8 is now confirmed rather than assumed -- the 13.3.4 cell reads verdict=partial at level=3, so rung 8's first limb holds and the item's own conditional drop to 6 does not fire. Difficulty 6 because the refusal must be sited outside the blanket handler at engine.py:1062, the undetermined-age branch must refuse, the opt-out wires into security_loosenings (settings.py:4238), and the paired vault edit lands with it. _(was 8/10; difficulty was unscored.)_
 >
 > **Filed 2026-08-04 — IN PROGRESS 2026-08-14. Scored 2026-08-04 → P1.** **Score of the item's own filing, SUPERSEDED by the re-score above:** Value **8/10** · Difficulty
@@ -23070,6 +23076,8 @@ The author identified this failure mode precisely, named its consequence exactly
 > **Scored 2026-09-03 -> P1.** Value **6/10** · Difficulty **2/10** · _quick win_. All four costs stand at HEAD and none has been closed. Nothing bounds audit_log: [retention].audit_days defaults 0 and is documented reserved and unenforced at messagefoundry/config/settings.py:1675-1678, messagefoundry/store/base.py declares eight purge entry points between :1202 and :1849 with none for audit, and a grep of messagefoundry/ finds no reader of audit_days outside those two files, so an operator who sets a window gets no purge and no warning -- the accepted-but-inert knob is the gap, and the only workaround is flipping the #1277 default back off, which lowers the rate without bounding the table. The three records still disagree about why: messagefoundry/config/retention_classification.py:17-19 rests the rationale on the retention requirement "not on chain-breakage" while messagefoundry/config/settings.py:1675-1677 and docs/PHI.md:118 give both reasons, and that question decides whether in-place deletion is open at all. Cost 3's docstring is unchanged at messagefoundry/api/security.py:177-179, and ADR 0118's amendment at docs/adr/0118-secure-by-default-security-configuration-section.md:165 still records the outcome and the delegation without the two questions or the eight options. What this row ships is an owner ruling plus reconciled prose across five artifacts, so the cost is doc work held consistent rather than engine change.
 >
 > **Update 2026-09-03 -- the two limbs that need no ruling shipped; this row STAYS OPEN on costs 1 and 2.** **Cost 4 is closed.** ADR 0118's section 5 amendment now carries both questions put to the owner, all eight options and both answers quoted, with [comment 5515263760 on PR 749](https://github.com/MEFORORG/MessageFoundry/pull/749#issuecomment-5515263760) kept as provenance, so the record sits in the artifact a reader consults rather than only in a pull-request comment. **Cost 3 is closed.** The `_audit_all_authz` docstring in [`api/security.py`](../messagefoundry/api/security.py) no longer argues that a wider fallback would invent a grant row -- both call sites read it only after authorization has already succeeded, which the change states -- and it now gives the real reason, that the fallback preserves prior behaviour for a hand-built `app.state`. The behaviour did not change and both sides stay pinned in [`tests/test_auth_hardening.py`](../tests/test_auth_hardening.py). **Costs 1 and 2 remain OPEN**, and so does this row: they wait on the owner ruling this row's verdict names -- whether deleting an `audit_log` row breaks the tamper-evident hash chain -- because that answer decides whether in-place deletion is available at all and therefore which lever can be sized. Nothing was chosen or built for them here: no retention bound, no rate or sampling bound, no audit purge entry point, no group-committer change, and `[retention].audit_days` is still accepted and unenforced.
+>
+> **Update 2026-09-05 -- the options memo the ruling needs now EXISTS. The ruling is still OUTSTANDING and this row STAYS OPEN.** [ADR 0185](adr/0185-retention-levers-for-the-tamper-evident-audit-log-what-each-deletion-shape-costs-verifiability.md) lays out the retention levers so the owner can choose, and deliberately chooses none of them. It re-establishes the mechanism from the code at HEAD rather than inheriting it: the line numbers this row cites are from `fd44b0f17` and have since drifted, so read the ADR's. `audit_row_hash` is at `store/store.py:1009` and its payload at `:1057`; the row `id` is not in it, and the walk chains from the STORED hash at `:7998`, which is the line that decides most of the question. A verifier exists and is reachable three ways, and `[integrity].audit_verify_on_start` still ships `False` (`config/settings.py:3370`). **Eight shapes were driven at `c57903c2c` with both controls firing**, alongside a second full walk beside the shipped one because the shipped verifier returns only the FIRST divergent row. That reproduces this row's cases A, B and D and adds **three findings this row does not carry**: a break is LOCAL and does not spread, so every row after the damaged one still verifies and keeps its evidentiary value; deleting an INTERIOR row leaves the anchor head byte-identical, so an anchor catches that shape by its COUNT and not by its hash; and a tombstone that preserves the stored `row_hash` still breaks the walk at the tombstoned row, so preserving the link bounds the damage without removing it. **The crux for the ruling:** a delete-then-reseal verifies clean, which is what an attacker who can write the table would produce, so a re-sealing purge would leave a held off-box anchor as the only working control. Six levers are costed against chain, build and operator, and the ADR carries a Builder recommendation marked as separable from the findings. **Nothing was chosen and no engine behaviour changed**: no purge, no new config field, no default moved, and `[retention].audit_days` is still accepted and unenforced. **Costs 1 and 2 remain OPEN.**
 > Verdict: owner-ruling
 > Research: none
 > Closing-act: owner-ruling
@@ -23891,8 +23899,6 @@ All 137 listed entries were swept for a repo-rooted read of `messagefoundry/**`.
 
 1. **The five pull requests above.** A Builder must not push to another seat's branch, so each is fixed by whoever next touches it: append `tests/<name>.py` to `tests/tooling_manifest.txt`, keeping the list alphabetical. **The gate is passable and two pull requests that night passed it correctly -- nothing here asks for it to be weakened.**
 2. **Three copies of the manifest parser, pinned against nothing.** This file, `_tooling_basenames` in `tests/conftest.py` (the copy that actually applies the marker), and `_manifest_paths` in `tests/test_ci_tooling_gate.py` all implement the same rule. Extracting one `tests/_tooling_manifest.py` is the real fix. Related: `test_every_manifest_entry_trips_its_own_gate` in `tests/test_ci_tooling_gate.py` feeds each manifest entry back as its own changed path, so on the manifest arm every entry matches itself unconditionally.
-
-
 
 ## 1454. the leak gate has no URL detector of any kind, so a private artifact link commits clean
 
@@ -24782,8 +24788,6 @@ Vault `roles/BUILDER.md:213-217`, under the heading "Closing a ledger row makes 
 
 I read only `roles/` in the vault and ran no git history there, so I cannot date when any of these lines was written. Eleven of the fourteen playbooks were matched by the needle above but not read, so treat the population as **at least three files**, not a total. I did not check whether any workflow or CI job reads a playbook, and I confirmed no case in which a seat actually followed `BUILDER.md:216` and produced a red PR -- I measured the instruction and the gate, not an incident.
 
-
-
 ## 1479. Scope the required gitleaks scan to the ref under test; today any pushed branch can red main and freeze the queue
 
 > 🚧 **Filed 2026-09-07 -- the code fix ships in this PR. THE GATE IS RED AS THIS IS WRITTEN, on TWO unmerged branches at once, so this is a live freeze and not a post-mortem.** Value **9/10** · Difficulty **2/10** · _quick win_. The `gitleaks (secret scan)` job ran with no `--log-opts`, so it walked every ref the `fetch-depth: 0` checkout had fetched. Branch protection reads its answer as a statement about the ref under test; the job was answering it about the whole repository. On 2026-09-06 an unmerged branch's synthetic fixture reddened `main` and the merge queue with it, freezing merging for over four hours and evicting five entries. Per `CLOSING_SEAT["code"]` the banner flip on merge is the LANDER's.
@@ -25092,8 +25096,67 @@ A PAR client on the relying-party side: POST the authorization parameters to the
 ### Not done here
 
 This row was **filed, not built**. Nobody has read the pinned requirement text against `flow.py` for this row's purposes, and no provider-support survey was run. The `na` ruling above is reported as the routing fact that makes this row necessary; this row does not re-derive it and does not depend on it being correct.
+## 1481. A scoped secret scan can walk zero commits and pass; nothing asserts the range is non-empty
 
+> 🔢 **Filed 2026-09-07 -- not started. FILED ONLY: nothing here is fixed on this branch.** Value **6/10** · Difficulty **2/10** · _quick win_. #1479 scopes the required `gitleaks (secret scan)` job with `--log-opts`. A range is a thing that can resolve EMPTY, and an empty range makes the scanner report `0 commits scanned` and exit **0** -- a PASS, indistinguishable in the checks UI from a clean scan, on a required secret gate. The shipped range is a literal and is measured safe; this row is about the next edit to it.
+> Verdict: build
+> Research: none
+> Closing-act: code
 
+**Cluster:** CI merge gates / instrument honesty. **Priority:** P3. **Verdict:** build.
+**Severity:** no deployment axis (sec. 0). Nothing here is engine behaviour, a shipped artifact, or PHI. The cost is a required secret gate that could report success having looked at nothing.
+
+**Measured 2026-09-07 on the pinned gitleaks 8.18.4 binary** -- the version `.github/workflows/security.yml` installs, downloaded from the release and version-checked, not a local build.
+
+### The hazard, demonstrated
+
+| invocation | reported | exit |
+|---|---|---|
+| `--log-opts HEAD` (what #1479 ships) | `2 commits scanned` | 1, planted secret caught |
+| `--log-opts HEAD..HEAD` (an empty range) | `0 commits scanned` | **0** |
+| no `--log-opts` (the pre-#1479 default) | `2 commits scanned` | 1 |
+
+**`0 commits scanned` and exit 0 is a green tick.** Nothing downstream distinguishes it from a clean scan, and a gate that cannot tell *found nothing* from *looked at nothing* is the same defect class the negative-control registry exists for.
+
+### The shipped range is safe, and that is why this is P3 rather than P1
+
+`--log-opts HEAD` is a **literal**, not built from a base SHA, a head ref or a pull-request number. Measured on a merge-commit HEAD shaped like a merge-queue commit (two parents): `2 commits scanned`, planted secret caught, exit 1. So it cannot resolve empty on any of the workflow's five triggers.
+
+**This row is about the NEXT edit.** The moment someone makes the range event-aware -- which #1479's own comment explains was declined only because three of five triggers carry no base SHA -- the range acquires the ability to be empty, and on the trigger where the base is unpopulated it silently will be.
+
+### The fix: read the scanner's own report, never recompute its subject
+
+**A check that recomputes its subject rather than reading the subject's own report is not a check.** That is the whole of this row, and it decides the implementation before any of the detail below.
+
+Assert the scan **walked something**, by reading the count the scanner itself printed:
+
+```
+grep -qE '(^|[^0-9])[1-9][0-9]* commits scanned' gitleaks-scan.log
+```
+
+Verified against real 8.18.4 output on four cases -- clean+scoped, empty range, unscoped, and a run carrying a finding: it fires on exactly the empty-range case and passes the other three. The count line is present even when findings are reported, so the guard does not depend on a clean run.
+
+**Do NOT implement this with `git rev-list --count <range>`.** That is a second copy of the range, free to agree today and drift tomorrow, and to go on passing after the flag it guards has changed -- which is precisely the second-definition defect #1479 removed from this job's own header. A guard that drifts from the flag it guards keeps passing, which is the exact failure it was written to prevent. The scanner's own count cannot drift from what the scanner did.
+
+### The pipefail half, and the shortcut that must not be taken
+
+Capturing the count needs the scan piped through `tee`, and a pipe swallows the exit code that matters. GitHub's default `run:` shell is `bash -e {0}` -- **`-e` without `pipefail`** -- so a findings-exit of 1 would be discarded by the pipe and this required gate would report success. Same vacuous-pass class, one layer down, so `set -o pipefail` must land in the same change. Verified: the scan step declares no `shell:`, so it takes that default.
+
+**THE SHORTCUT IS `shell: bash`, AND IT IS THE WRONG FIX.** Naming the shell explicitly makes GitHub substitute `bash --noprofile --norc -eo pipefail {0}` instead of the bare default -- so the step would **silently acquire pipefail as a side effect of naming a shell it was already using**. Reject it. A reader seeing `shell: bash` cannot tell that error semantics changed, and a later edit removing it as redundant re-introduces the defect while looking like a cleanup. That is the same hidden-mechanism hazard this row is about, one layer further down again.
+
+The repository already agrees, measured 2026-09-07 over `.github/workflows/*.yml`: **12 workflows set `pipefail` explicitly; 3 files use `shell: bash` at all.** Explicit is both the local idiom and the legible one.
+
+### Add a control, or the guard is deletable in silence
+
+`tests/negative_controls.toml` registers two controls for this context under #1479. A third belongs here: the guard step must exist and must be asserted to fire, or it becomes decoration that a later edit removes without anything going red.
+
+### Provenance
+
+Raised by a peer session reviewing #1479, which asked what the range evaluates to on a `merge_group` run and named the failure mode as a silent pass rather than a red. The same session then supplied the `shell: bash` trap above and the generalisation that leads the fix section -- both are theirs, and the row is better for them. That was the right question: #1479's stated posture was "if the merge-group run fails, that is the finding", which covers the red case and not this one. The range turned out to be safe; the hazard it pointed at is real and is filed here rather than bolted onto a green pull request that was unblocking a frozen merge queue.
+
+### Not checked
+
+I did not test a fork pull request. I did not check whether any other scanner in `.github/workflows/` can be given an empty scope -- #1479's altitude pass established that gitleaks is the only ref-walking scanner, but "can its input be made empty" is a different question from "does it walk refs", and I did not ask it of the working-tree scanners.
 
 
 ## 1483. apply.py's module docstring enumerates the evidence fields and so denies the two it carries
@@ -25126,6 +25189,43 @@ The harm path is not "a reader is mildly misinformed". It is specific and it run
 ### Closing act
 
 One docstring edit in `scripts/asvs/apply.py`, stating that the listed keys are the ones the writer ORDERS and that any other key is carried verbatim. Deliberately **no count** of the carried fields: a tally in a docstring goes stale silently, which is the same defect wearing a number.
+
+
+## 1485. docs/SECURITY.md files the built gitleaks and SBOM jobs under Planned CI additions
+
+> 🚧 **Filed 2026-09-07 -- the doc fix ships in this PR.** Value **4/10** · Difficulty **1/10** · _quick win_. The "Supply-chain & CI security" section listed the `gitleaks` secret scan and the CycloneDX SBOM build under **Planned CI additions**. Both are built, and `gitleaks (secret scan)` is a required context. The same two bullets carried three further stale claims, each independently checkable and each corrected here. Per `CLOSING_SEAT["code"]` the banner flip on merge is the LANDER's.
+> Verdict: build
+> Research: none
+> Closing-act: code
+
+**Cluster:** documentation honesty / security prose. **Priority:** P3. **Verdict:** build.
+**Severity:** no deployment axis (sec. 0). Nothing here is engine behaviour, a shipped artifact, or PHI, so no deploying site would meet it. The cost falls on a reader of the security record: they are told a built control is planned, told the wrong scope for a required gate, and told a local hook does not exist when it does.
+
+**Measured 2026-09-07** at engine `4c68c28eb`, which was `origin/main`'s tip in the same run.
+
+### Five claims, and what the tree says
+
+| the claim, as it stood | what the tree says |
+|---|---|
+| **SBOM** is a planned CI addition | `security.yml`'s `sbom` job builds CycloneDX bills of materials for the Python engine and the VS Code extension, scores them with `sbomqs`, and uploads them; the `trivy` job adds the container image. ADR 0149 and `docs/SUPPLY-CHAIN.md` document it. |
+| **Secret-history scan** is a planned CI addition | `security.yml` job `gitleaks`, `name: gitleaks (secret scan)`, and that exact string is listed in `.github/required-contexts.txt`. |
+| the scan is "Kept in CI rather than a per-author pre-commit hook" | `.pre-commit-config.yaml` pins `repo: https://github.com/gitleaks/gitleaks`, `rev: v8.18.4`, hook id `gitleaks`. Both exist. |
+| the scan runs "over the **full git history**" | BACKLOG #1479 scoped it with `--log-opts HEAD`. The reason lives once, on the scan step's own comment, and this ledger row does not restate it either. |
+| **pip-audit** and **bandit** are advisory | Both job comments read `BLOCKING`, neither declares `continue-on-error`, and both context strings are in `.github/required-contexts.txt`. |
+
+A sixth line was stale in a different direction: the section told the reader to turn **CodeQL** on through GitHub Advanced Security "on a private repo". `.github/workflows/codeql.yml` has run here for months and this repository is public, so no licence is involved. `security.yml`'s own header already records that correction.
+
+### The fix
+
+`docs/SECURITY.md` now carries one list of what CI runs, with `gitleaks` and the SBOM job in it, and no "Planned CI additions" block. It states the scan's scope **nowhere**: it names the step that holds it and stops, because a second copy of that fact is what went false last time. The section closes with a short paragraph naming what it used to say, so a reader who absorbed the old text can recognise the shape rather than be silently overwritten.
+
+### One dependent edit, and why it was not left to drift
+
+`tests/test_cutover_slug_rot.py`'s triage taxonomy cited the removed sentence by name, as a KEEP example ("a true statement about GitHub's pricing"). Removing the sentence without that edit would have left a docstring citing a line that no longer exists. The retirement is recorded in its place. The ratchet count falls 39 to 38 against a ceiling of 41; `test_the_ratchet_is_not_slack` allows up to 8 slack, so the ceiling is deliberately left alone.
+
+### Not taken here, and it is the same fact
+
+`docs/Secure_Build_Scorecard_MEFOR.md` says "gitleaks full-history" in three places (lines 31, 58 and 93), one of them the evidence for signal 5 graded **Built -- Strong**. That evidence is now overstated by exactly the scope BACKLOG #1479 removed. It is **not edited here**: that file is a dated scoring snapshot ("Scored 2026-07-14, against HEAD") whose own convention is that re-scoring is an owner act, and it already carries a precedent blockquote flagging a correction for the next re-sign rather than folding it silently. Naming the three lines is the handoff; whoever re-signs the scorecard folds them.
 
 
 ## 1437. redact() is quadratic on a delimiter-free run and its linear-scan test cannot see it
@@ -25190,4 +25290,3 @@ The mutation removes the `(?<![^\s|^~&])` lookbehind, restoring the pattern that
 
 - **Other single-sample wall-clock arms are not surveyed.** This row fixed the one it was pointed at and the sibling under #1385. Nobody has swept the suite for the same shape.
 - **`safe_text` redacts before it truncates, and that ordering is unchanged.** It is the safe ordering for PHI -- truncating first could cut a span mid-match -- and with the scan linear the cost argument for reversing it is gone. Recorded so the next reader does not re-derive the question.
-
