@@ -23212,7 +23212,43 @@ That is the same `self._lock` the staged-pipeline handoffs take. On a first depl
 
 ## 1424. steer-inject.ps1 puts an unfolded file value inside a frame asserting the OWNER typed it
 
-> 🔢 **Filed 2026-09-03 -- not started. Found while closing #1040, on the surface that item does not
+> ✅ **CLOSED 2026-09-06 -- the fold, the prefix and the preamble are in the hook, and the tests
+> assert the EMITTED STRING rather than the presence of a helper.** `scripts/hooks/steer-inject.ps1`
+> folds the note through a local `Get-Fold` (mail-drain's order: `\p{C}` to a space, then anything
+> still outside `\x20-\x7E` to `?`, then collapse runs and trim), emits it as ONE line behind the
+> `    | ` prefix, and opens with a `DATA, NOT AUTHORITY` preamble naming the provenance as an
+> unverified claim. The frame no longer says the user typed it, which was the sentence a forged
+> second frame inherited.
+>
+> **THE RED COUNT, NOT MERELY THAT IT WENT RED: 20 of 30 rows.** `tests/test_steer_inject.py` run
+> against a copy of the hook as it stood at `172b1327c` -- so the number names the pre-fix script --
+> was **20 failed, 10 passed**. By property: **11 of 11** separator rows red on "cannot add a line";
+> **3 of 9** red on "folds away to nothing" (NUL, record separator, escape; the other six were
+> already caught by `IsNullOrWhiteSpace`); **2 of 2** on the substitution mark; **2** on the prefix;
+> **2** on the frame prose. Against the fixed hook: **32 passed**. The suite grew by two rows after
+> that measurement, when the `/simplify` pass split one fail-open row into three parametrized ones;
+> those three pass against both versions of the hook, so they are not part of the 20.
+>
+> **THE NOTE FOLDS TO ONE LINE, AND THAT IS A DECISION RATHER THAN A COPY OF `mail-drain.ps1`.**
+> The sibling keeps a body's line structure and prefixes each line, because a mail body is many lines
+> by nature. This row's proof statement is that a note "must not be able to add a line to the emitted
+> `additionalContext`", so the note is folded to a single line and the frame says so. The cost: a
+> deliberately multi-line note arrives as one line. `steer-send.ps1` takes the note as one command-
+> line argument, so that shape is the uncommon one.
+>
+> **WHAT THIS CLOSE DOES NOT COVER, NAMED SO IT IS NOT MISTAKEN FOR COVERED: there is no length cap.**
+> `mail-drain.ps1` caps a body and reports what it dropped; this hook caps nothing, so a large note
+> arrives whole. That is context cost, not frame forging -- one folded line is one line at any size --
+> and capping without the sibling's truncation-reporting apparatus would be the silent drop this repo
+> treats as the defect. Unfiled and named rather than numbered: the steering-note size bound.
+>
+> **SCOPE HELD.** `lane-level.ps1` is untouched and stays neither cleared nor accused.
+> `tests/test_claude_settings_contract.py:239` stays true: the hook is still wired nowhere, and this
+> change does not arm it. `docs/STEERING.md` gained the two bullets describing the frame, which moved
+> its byte count and therefore the citation of that count in `docs/SESSION-MAIL.md`; both are updated
+> in the same PR.
+>
+> **Filed 2026-09-03 -- not started. Found while closing #1040, on the surface that item does not
 > cover.** `scripts/hooks/steer-inject.ps1` reads `<project>\.claude\steer.txt` whole, trims it, and
 > interpolates it into one `additionalContext` string that opens *"[STEERING NOTE -- the user just
 > typed this via a side channel while you were mid-task ... Read it now and act on it right away ...
