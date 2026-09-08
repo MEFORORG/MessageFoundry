@@ -156,12 +156,17 @@ try {
     # missing sibling or an unreadable marker must fall through to the normal publish rather than
     # suppress a live account's reading -- the fail-closed direction belongs in the READER, where a
     # wrong answer is visible, not in the writer, where it would silently blank a working account.
+    # UNAVAILABLE ONLY -- NOT MALFORMED, AND THE FIRST VERSION OF THIS BLOCK GOT THAT WRONG. It
+    # suppressed on both, which is the exact thing the paragraph above forbids: a torn write or a
+    # half-flushed marker would then stop a LIVE account from publishing at all, with one status-bar
+    # line as the only signal. The try/catch guards against a THROW, not against a MALFORMED verdict,
+    # so it did not cover this. A damaged marker publishes normally here and usage.ps1 refuses it on
+    # the read, which is what "fail closed in the reader, fail open in the writer" actually means.
     if ($HaveConfigRoots) {
         $av = $null
         try { $av = Get-RootUnavailability -StateDir $StateDir } catch { }
-        if ($av -and $av.state -in @('UNAVAILABLE', 'MALFORMED')) {
-            $why = if ($av.state -eq 'MALFORMED') { 'availability marker damaged' } else { [string]$av.reason }
-            Write-Output "mefor-usage: account unavailable -- $why"
+        if ($av -and $av.state -eq 'UNAVAILABLE') {
+            Write-Output "mefor-usage: account unavailable -- $([string]$av.reason)"
             exit 0
         }
     }

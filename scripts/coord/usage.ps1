@@ -482,7 +482,13 @@ function Get-WindowReport($w, [string]$Label, [string]$Key, [string]$ResetKey, [
 $five = Get-WindowReport $doc.five_hour "session (5h)" "five_hour" "five_reset" $readRoot
 $seven = Get-WindowReport $doc.seven_day "weekly (7d)" "seven_day" "seven_reset" $readRoot
 
-$rank = @{ "OK" = 0; "WARN" = 10; "CRITICAL" = 11; "UNKNOWN" = 20; "UNAVAILABLE" = 21 }
+# NO "UNAVAILABLE" ENTRY, DELIBERATELY. It would be unreachable: Get-WindowReport only ever emits the
+# four states below, and the UNAVAILABLE path exits far above this line. Adding it would also make this
+# table disagree with the three sibling lists that have no UNAVAILABLE arm -- the verdict chain, the
+# $advice switch (which would fall through to "Normal working") and Show-Window's colours. The comment
+# below already warns that two lists naming different states is how the prose and the exit code come to
+# describe different situations; a fifth key here would be that defect, planted.
+$rank = @{ "OK" = 0; "WARN" = 10; "CRITICAL" = 11; "UNKNOWN" = 20 }
 $states = @($five.state, $seven.state)
 # CRITICAL outranks UNKNOWN: a known emergency in one window is not softened by the other being unknown.
 # ONE LIST, READ TWICE. The warning printed below and the verdict computed here must name the same
@@ -600,8 +606,11 @@ if ($Json) {
         advice       = $advice
         not_measured = $blindSpot
         provenance   = $provenance
-        # PRESENT ONLY WHEN THERE IS A DATE. A key that is always there and usually null invites a
-        # consumer to test the key rather than the value, and this one changes a spending decision.
+        # ALWAYS PRESENT, null when there is no pending cancellation. An earlier comment here claimed
+        # the key was emitted only when dated, which was simply false -- an [ordered] literal emits the
+        # key whatever the value, and the test asserts the null. The five_hour/seven_day keys really
+        # are absent on the UNAVAILABLE path and are pinned that way; this one is not, and a comment
+        # describing a shape the code does not have is worse than no comment.
         cancellation_pending_from = $(if ($avail.state -eq 'PENDING') { $avail.effective_from } else { $null })
         statusline_state = $dx.state
         wired_state_dir = $dx.wired_state_dir

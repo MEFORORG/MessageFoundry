@@ -2297,3 +2297,32 @@ def test_an_unmarked_root_is_untouched_by_any_of_this(tmp_path: Path) -> None:
     assert code == OK, doc
     assert doc["five_hour"]["used_percentage"] == pytest.approx(61.0)
     assert doc["cancellation_pending_from"] is None
+
+
+def test_a_damaged_marker_does_not_stop_a_live_account_publishing(tmp_path: Path) -> None:
+    """FAIL CLOSED IN THE READER, FAIL OPEN IN THE WRITER -- and the first version of the collector
+    guard got this backwards.
+
+    It suppressed on MALFORMED as well as UNAVAILABLE, so a torn write or a half-flushed marker would
+    stop a LIVE account publishing at all, with one status-bar line as the only signal. That is exactly
+    what the collector's own comment forbids, and the try/catch around the call did not cover it: the
+    guard catches a THROW, not a MALFORMED verdict.
+
+    The asymmetry is deliberate and this test is the only thing pinning it. A damaged marker must still
+    REFUSE on the read -- asserted here in the same test, so a fix that simply stopped honouring
+    MALFORMED anywhere would fail rather than pass.
+    """
+    root = tmp_path / ".claude-account-9"
+    root.mkdir()
+    state = root / "mefor-usage"
+    state.mkdir()
+    (state / "unavailable.json").write_text("{ torn write", encoding="utf-8")
+
+    line = collect(state, {"rate_limits": {"five_hour": window(42.0, 3600)}})
+    assert "unavailable" not in line, f"a damaged marker blanked a live account: {line}"
+    assert latest(state)["five_hour"]["used_percentage"] == pytest.approx(42.0)
+
+    # ... and the reader still refuses it, which is where fail-closed belongs.
+    code, doc = read(state)
+    assert code == UNAVAILABLE, doc
+    assert doc["marker_state"] == "MALFORMED"
