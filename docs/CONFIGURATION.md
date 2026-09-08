@@ -1175,7 +1175,11 @@ A provider is consulted **only** for a credential whose per-credential `*_secret
 store password is seam-only (managed identity is preferred there). A reference is `"<kv-path>"` or
 `"<kv-path>#<field>"` for `vault` (field defaults to `value`; KV mount from `MEFOR_SECRETS_VAULT_KV_MOUNT`,
 default `secret`); Vault address/token come from `MEFOR_SECRETS_VAULT_ADDR` / `MEFOR_SECRETS_VAULT_TOKEN`
-(falling back to hvac's `VAULT_ADDR` / `VAULT_TOKEN`). **Fail-closed:** a reference with `provider = none`,
+(falling back to hvac's `VAULT_ADDR` / `VAULT_TOKEN`). Point `MEFOR_SECRETS_VAULT_CA_FILE` at the PEM of
+the CA that issued your Vault server's certificate to verify that hop against your own PKI instead of the
+public bundle `requests` ships with (BACKLOG #1180; the store KeyProvider's twin is
+`MEFOR_STORE_VAULT_CA_FILE`) — a path, not a secret, and unset leaves the hop exactly as it was.
+**Fail-closed:** a reference with `provider = none`,
 an unknown provider, a missing `[vault]` extra, or an unresolvable/empty secret raises at load/connect —
 never a blank credential; the value is never logged.
 
@@ -1189,10 +1193,17 @@ age** and raises the rotation-due alert (an [`[alerts]`](#alerts) event) when it
 `warn_days` of due. **Route it as `event_type = "secret_rotation"`** — that is the wire name the rule
 validator accepts; the longer `secret_rotation_due` is the internal `AlertSink` method name and is
 **rejected at config load** if you write it in a rule. It reads only the rotation
-**dates** you configure here — **never any secret value** (PHI-free). This is a *reminder*, not
-enforcement: it never rotates a key or blocks startup (run `rotate-key` to rotate the store DEK). Under
-`[security].enforcement = enforce`, a store DEK past `store_key_max_age_days + enforce_grace_days`
-escalates its alert at restart (`enforced = true`) — still an alert, never a refusal.
+**dates** you configure here — **never any secret value** (PHI-free). It never *rotates* a key (run
+`rotate-key` for that), and for every secret class except the store DEK it is a reminder only.
+
+**The store DEK's calendar expiry is ENFORCED** (ASVS 13.3.4, BACKLOG #1004). Under
+`[security].enforcement = enforce` with a keyed store, a DEK past `store_key_max_age_days +
+enforce_grace_days` escalates its alert at restart (`enforced = true`) **and refuses to start the
+engine**. A DEK whose age cannot be determined — the rotation-meta reconcile failed and no
+`store_key_last_rotated` is set — refuses on the same rule: an undetermined age is not a young one. This
+matches the same key's **usage** ceiling, which has always refused unconditionally at 2^32 encrypts. Set
+`enforce_store_key_expiry = false` to keep the alert and drop the refusal; that is a **security
+loosening** and it is named on every boot and in `GET /security/posture`.
 
 The store DEK is tracked **live-by-default** (ASVS 13.3.4): at first keyed start the engine records a
 non-secret tracked-since stamp (the DEK key-id + first-seen date) in store meta and watches the DEK off
@@ -1208,7 +1219,8 @@ tracked; set `warn_days = 0` to disable the reminder.
 | `store_key_last_rotated` | str | — | ISO `YYYY-MM-DD` the store DEK was last rotated; **unset ⇒ the DEK is still tracked live-by-default** off a persisted first-seen stamp (this date is an override) |
 | `store_key_max_age_days` | int | 365 | rotate the store DEK within this many days of its effective last-rotated (the operator date if set, else the persisted stamp) |
 | `secret_max_age_days` | int | 365 | max age for the **non-DEK** tracked secret classes (connector/AD/SMTP/Vault/OIDC), alerted this many days after their last observed fingerprint change |
-| `enforce_grace_days` | int | 30 | under `[security].enforcement=enforce`, a DEK older than `store_key_max_age_days + this` escalates its rotation alert at restart (still an alert, never a refusal) |
+| `enforce_grace_days` | int | 30 | under `[security].enforcement=enforce`, a DEK older than `store_key_max_age_days + this` escalates its rotation alert **and refuses to start** (see `enforce_store_key_expiry`) |
+| `enforce_store_key_expiry` | bool | `true` | under `[security].enforcement=enforce`, a store DEK past `store_key_max_age_days + enforce_grace_days` — or one whose age cannot be determined — **aborts engine start**. `false` keeps the alert, drops the refusal, and is reported as a **security loosening** |
 
 ```toml
 [secret_rotation]

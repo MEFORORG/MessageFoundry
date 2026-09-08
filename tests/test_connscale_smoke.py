@@ -80,7 +80,11 @@ from harness.load.connscale.report import (
     ConnScaleReport,
     herd_floor_readings,
 )
-from harness.load.connscale.runner import _MONOTONIC_TOLERANCE, run_connscale
+from harness.load.connscale.runner import (
+    _MIN_IN_HOLD_SAMPLES,
+    _MONOTONIC_TOLERANCE,
+    run_connscale,
+)
 from tests._connscale_ports import (
     INBOUND_PORT_HI,
     INBOUND_PORT_LO,
@@ -491,6 +495,31 @@ def test_the_sweep_produces_one_record_per_mode_and_count(smoke_report: ConnScal
         ("fixed_per_conn", 12),
         ("fixed_per_conn", 24),
     }
+
+
+def test_every_step_took_at_least_two_in_hold_samples(smoke_report: ConnScaleReport) -> None:
+    """BACKLOG #1430, END TO END: the hold must produce a WINDOW, not a point.
+
+    Every rate and every peak this record carries is derived from the step's in-hold readings, and a
+    step that took one reading has a window of zero width -- ``_empty_claim_rates`` and
+    ``_throughput_rates`` then reach two samples only by counting the post-drain final, and
+    ``in_pipeline_peak`` and the wall #1/#2 peaks are each a single instant wearing the word "peak".
+    That was the state in 20 of 20 cells, and NOTHING FAILED ON IT: no test asserted a floor on the
+    sample count, and ``report.py``'s diagnostic text calls a low probe-tick count "a coarse gauge,
+    not a fault". This assertion is what makes the state visible.
+
+    It is asserted HERE, on a real sweep, as well as at the loop in
+    ``tests/test_connscale_sample_floor.py``. The unit tests pin the floor's mechanism against a fake
+    poller; only a live cell can show that the cadence survives an engine, a driver, an OS probe and a
+    mid-hold reload probe all competing for the same host."""
+    for r in smoke_report.records:
+        assert r.in_hold_samples >= _MIN_IN_HOLD_SAMPLES, (
+            f"{r.sweep_mode}@N={r.count} took {r.in_hold_samples} in-hold sample(s), under the floor "
+            f"of {_MIN_IN_HOLD_SAMPLES}. Every window derived from this step spans a single reading "
+            f"(BACKLOG #1430). The floor supplied {r.in_hold_floor_ticks} of them, and the FD probe "
+            f"read {r.fd_probe_degraded_ticks}/{r.fd_probe_ticks} tick(s) degraded "
+            f"{tuple(r.fd_probe_degraded)}."
+        )
 
 
 def test_no_loss_reconciles_at_every_step(smoke_report: ConnScaleReport) -> None:
