@@ -25,6 +25,10 @@ import hashlib
 import re
 from dataclasses import dataclass
 from importlib.resources import files
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:  # annotation only -- this module stays runtime-free of config, see from_settings
+    from messagefoundry.config.settings import AuthSettings
 
 #: Shortest username we'll substring-match inside a password — below this the false-positive risk on a
 #: legitimate long passphrase outweighs the value (a 2-3 char username fragment is too common).
@@ -104,6 +108,36 @@ class PasswordPolicy:
     breach_corpus_file: str | None = None  # optional operator-supplied offline corpus (6.2.12)
     lockout_threshold: int = 5  # consecutive failed logins before the account locks
     lockout_minutes: int = 15  # how long a locked account stays locked
+
+    @classmethod
+    def from_settings(cls, settings: AuthSettings) -> PasswordPolicy:
+        """Build the policy an operator's ``[auth]`` settings describe.
+
+        THE SINGLE CONSTRUCTION OF "THE SHIPPED SCREENING POLICY" (BACKLOG #1433). ``AuthService``
+        used to spell this mapping out inline, and it was the only place that knew it -- so
+        ``scripts/security/build_password_corpus.py``, which must filter the bundled corpus through
+        the policy that actually screens a password, had to copy the mapping. A copy takes the
+        DATACLASS default for any field added later while the engine takes the SETTING, and the
+        corpus would then be filtered and counted under a policy that is not the shipped one, with
+        the corpus gate unable to see it: it would apply the same wrong policy on both sides of its
+        own comparison. Add a screening field here and every caller picks it up.
+
+        The annotation is import-free at runtime (``TYPE_CHECKING``) so this module keeps its
+        property of depending on no engine state -- ``settings`` is only read for its fields.
+        """
+        return cls(
+            min_length=settings.password_min_length,
+            require_uppercase=settings.password_require_uppercase,
+            require_lowercase=settings.password_require_lowercase,
+            require_digit=settings.password_require_digit,
+            require_symbol=settings.password_require_symbol,
+            check_breached=settings.password_check_breached,
+            check_context=settings.password_check_context,
+            check_username=settings.password_check_username,
+            breach_corpus_file=settings.password_breach_corpus_file,
+            lockout_threshold=settings.lockout_threshold,
+            lockout_minutes=settings.lockout_minutes,
+        )
 
     def violations(self, password: str, *, username: str | None = None) -> list[str]:
         """Return clauses completing *"password must …"*; an empty list means the password is
