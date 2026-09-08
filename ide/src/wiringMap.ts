@@ -14,7 +14,7 @@ import * as vscode from "vscode";
 import type { ElementKind } from "./graphModel";
 import { buildWiringMap, MAX_HOPS, type MapFocus } from "./wiringMapModel";
 import type { GraphProvider } from "./graphTree";
-import { nonce } from "./cspNonce";
+import { WEBVIEW_GUARD_NOTE, guardScript, openChannel, postToWebview } from "./webviewMessaging";
 
 type Incoming =
   | { command: "ready" }
@@ -62,7 +62,7 @@ export class WiringMapPanel {
       this.context.subscriptions,
     );
     this.panel.webview.onDidReceiveMessage((m: Incoming) => void this.onMessage(m));
-    this.panel.webview.html = this.html();
+    this.panel.webview.html = this.html(this.panel.webview);
     // The webview posts "ready" once its script runs; the first map payload answers it.
   }
 
@@ -103,7 +103,7 @@ export class WiringMapPanel {
         names.push({ kind: "outbound", name: o.name });
       }
     }
-    void this.panel.webview.postMessage({
+    void postToWebview(this.panel.webview, {
       type: "map",
       map,
       focus: this.focus,
@@ -111,8 +111,8 @@ export class WiringMapPanel {
     });
   }
 
-  private html(): string {
-    const n = nonce();
+  private html(webview: vscode.Webview): string {
+    const { nonce: n, token } = openChannel(webview);
     // All dynamic content (element names from the user's config) reaches this document ONLY via
     // postMessage + createElementNS/textContent — nothing config-derived is interpolated here.
     return `<!DOCTYPE html>
@@ -213,7 +213,7 @@ export class WiringMapPanel {
   </div>
   </div>
   <script nonce="${n}">
-    const vscode = acquireVsCodeApi();
+    const vscode = acquireVsCodeApi();${guardScript(token)}
     const SVGNS = 'http://www.w3.org/2000/svg';
     const KINDS = ['inbound', 'router', 'handler', 'outbound'];
     const HEADERS = ['INBOUND', 'ROUTERS', 'HANDLERS', 'OUTBOUND'];
@@ -394,9 +394,9 @@ export class WiringMapPanel {
       }
     });
 
-    // Origin is NOT checked here — see webviewMessaging.ts.
+    ${WEBVIEW_GUARD_NOTE}
     window.addEventListener('message', (ev) => {
-      const m = ev.data;
+      const m = mfTrusted(ev);
       if (m && m.type === 'map') { state = m; render(); }
     });
     vscode.postMessage({ command: 'ready' });

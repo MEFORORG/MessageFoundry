@@ -381,10 +381,26 @@ but **no label any of them applies gates a merge**, and no seat has to clear one
 - Rules a Builder needs belong in the **account's** `settings.json`, outside git.
   `.claude/settings.json` is tracked, and every worktree carries its own copy from its own branch, so
   an uncommitted edit to the primary checkout reaches nothing else.
-- Read a role playbook from the `MessageFoundry-vault` primary's `roles/` folder (owner ruling, vault
-  commit `5e361756`). That exception covers `roles/` and nothing else in that tree: the rest of the
-  checkout sits on a branch that is not an ancestor of `origin/main`, and an `ls` of a directory is
-  not evidence that you have a file.
+- Read a role playbook from the **`wshallwshall/korus`** repository, and read it at `origin/main`
+  rather than out of a working tree. Owner ruling 2026-09-04.
+
+      git -C <korus clone> fetch origin
+      git -C <korus clone> show origin/main:roles/BUILDER.md
+
+- **SUPERSEDED 2026-09-05, recorded rather than deleted because seats still quote it.** This line
+  named the `MessageFoundry-vault` primary's `roles/` folder (owner ruling, vault commit
+  `5e361756`).
+- **Name the ref, not the checkout.** The superseded line said a checkout, and its own next sentence
+  warned that a checkout is not a ref. Both halves were right and the first one won.
+- **What that costs, measured 2026-09-06.** The korus primary sat on a branch 15 commits ahead of
+  `origin/main` and 14 behind it. `roles/REVIEWER.md` was absent from its working tree and present
+  on `origin/main`.
+- **So a seat reading the folder finds no Reviewer playbook, and no error.** An `ls` of a directory
+  is not evidence that you have a file, and a missing file is the quietest failure in this list.
+- **The failure this cost is the one to carry forward.** A pointer and the thing it points at are
+  two edits, and nothing fails when only the first is made. The playbooks moved on 2026-09-04 and
+  this line was not changed until 2026-09-06, so every seat in between read a stale copy and no
+  gate reported it.
 
 ### Branch, commit one layer, open the PR
 
