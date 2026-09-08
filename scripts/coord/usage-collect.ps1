@@ -146,6 +146,26 @@ try {
     if (-not (Test-Path -LiteralPath (Split-Path $StateDir -Parent) -PathType Container)) {
         Write-Output "mefor-usage: no config root to publish to"; exit 0
     }
+    # A CANCELLED ACCOUNT PUBLISHES NOTHING, and the reason is the freshness stamp rather than the
+    # percentage. Every write here rewrites captured_at, so a session that somehow runs under a root
+    # with no subscription would keep that root's document looking freshly measured -- disarming the
+    # staleness guard on the one account where staleness is the truth. Refusing the write leaves the
+    # marker as the only thing a reader finds, which is the answer.
+    #
+    # GUARDED ON $HaveConfigRoots AND WRAPPED. This is a statusLine: never throws, never blocks. A
+    # missing sibling or an unreadable marker must fall through to the normal publish rather than
+    # suppress a live account's reading -- the fail-closed direction belongs in the READER, where a
+    # wrong answer is visible, not in the writer, where it would silently blank a working account.
+    if ($HaveConfigRoots) {
+        $av = $null
+        try { $av = Get-RootUnavailability -StateDir $StateDir } catch { }
+        if ($av -and $av.state -in @('UNAVAILABLE', 'MALFORMED')) {
+            $why = if ($av.state -eq 'MALFORMED') { 'availability marker damaged' } else { [string]$av.reason }
+            Write-Output "mefor-usage: account unavailable -- $why"
+            exit 0
+        }
+    }
+
     New-Item -ItemType Directory -Force -Path $StateDir | Out-Null
     if ($CaptureRaw) { Write-AtomicText (Join-Path $StateDir "raw-payload.json") $raw | Out-Null }
 

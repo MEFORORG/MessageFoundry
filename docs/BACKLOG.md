@@ -26935,3 +26935,96 @@ off; if it is re-enabled, this row is the thing to argue with.
 **Source:** measured 2026-09-08 by the Lander while draining the merge queue, after the queue
 dropped a green pull request for want of a runner.
 ---
+
+## 1492. a cancelled account reads as headroom: usage tracking has no idea a config root has no subscription
+
+> ✅ **SHIPPED 2026-09-08.** Owner instruction the same day: the subscription on one account root was
+> cancelled, and the usage tracking was to handle it. It now does, at every surface that reads the
+> published state.
+>
+> Filed and shipped in one change because the defect was named by the owner rather than found by a
+> sweep, so there was never an interval in which this row was an open question.
+
+### The failure is that a dead account looks like the emptiest pool
+
+`usage.ps1` carries four honesty rules, and every one of them is about a reading that is stale, thin,
+or from the wrong account. None of them catches a **cancelled** account, and that case fails in the
+direction that gets the account **chosen**:
+
+- a cancelled account stops burning quota, so its last percentage **freezes low**;
+- nothing publishes there any more, so its publish directory **goes quiet**;
+- both of those are byte-identical to an **idle** account with a full pool.
+
+So a seat comparing roots to find the one with headroom is steered straight at the account that has
+none. Worse, the reader's own remedy for a quiet root -- *"Start a NEW session pinned to this root"* --
+points at a subscription that no longer exists, and following it produces nothing and reports nothing.
+
+This is the same class as the silent-control defect ADR 0158 names: the guard is present, it looks
+present, and the state it cannot represent is the one that matters.
+
+### What shipped
+
+An availability **marker** per config root, at `<root>/mefor-usage/unavailable.json` -- the publish
+directory, which is already the per-account partition key (`Get-UsageStateDir`). A marker therefore
+cannot describe a different account than the numbers beside it.
+
+| surface | before | after |
+|---|---|---|
+| `usage.ps1` | serves the frozen percentage | `UNAVAILABLE`, exit **21**, and no `five_hour`/`seven_day` keys at all |
+| `usage.ps1 -AllRoots` | ranks the dead root as the emptiest | one `UNAVAILABLE` row, in its own colour, never a percentage |
+| `usage-headroom-inject.ps1` | would report `UNKNOWN` | `UNAVAILABLE`, with the reason |
+| `usage-collect.ps1` | refreshes `captured_at` on every fire | publishes nothing, so the staleness guard stays armed |
+| `account-availability.ps1` | did not exist | `-Mark` / `-Clear` / `-Status [-AllRoots]` |
+
+**21 is deliberately not 20.** `UNKNOWN` means no measurement was obtained, and the advice attached to
+it is *treat headroom as unknown*. `UNAVAILABLE` means a measurement **was** obtained and it is
+zero-spendable-forever. Folding the second into the first understates a known fact and leaves a caller
+waiting for a reading that is never coming. It is not `CRITICAL`/11 either: that says commit now
+because a live pool is about to run out, which is not an account that has none.
+
+**A damaged marker fails CLOSED.** The file exists because somebody put it there, so the reachable
+states are "cancelled" and "cancelled, and the note about it is damaged". Reading a damaged note as an
+all-clear is how a guard goes silent while still looking present. `MALFORMED` is reported separately
+from `UNAVAILABLE` so the operator is told to fix the file rather than left wondering why an account
+they never marked is refusing.
+
+**A cancellation with a future date does not throw the pool away.** A subscription normally runs to the
+end of its billing period, and until then the numbers are real and worth spending. A marker carrying a
+future `effective_from` reports `PENDING`: the reading is published and served as usual, with the end
+date printed beside it.
+
+### The fact lives on the box; only the mechanism is in this repository
+
+`config-roots.ps1` discovers roots by name shape and has never listed them, deliberately -- a root is
+one person's credential set and this repository is public and on PyPI. A checked-in "account N is
+cancelled" would put an operator's private account state in an open repository and would be wrong for
+every other box that runs this. So the marker is a file the operator writes, and nothing here names an
+account, an email, or a number.
+
+### Evidence
+
+`tests/test_coord_usage.py` and `tests/test_usage_headroom_inject.py`, 12 new tests, **98 passed**
+across both files. Every arm is driven as a real subprocess against a real fixture, because a Python
+re-implementation of a PowerShell rule only proves the re-implementation agrees with itself.
+
+Three of them carry a **positive control in the same test**, because this is a suppression and a
+suppression that suppresses everything passes a naive assertion:
+
+- the cancelled-account test reads the root **before** marking it and requires the percentage back, so
+  the guard is measured rather than an inert fixture;
+- the survey test requires the tempting `3%` row to be visible before the mark, and requires the live
+  account's `61%` to survive after it;
+- the collector test publishes to a live root in the same test, so a blanket suppression fails.
+
+The fixture percentage is **low** on purpose. A frozen `3%` is the shape that gets an account chosen; a
+frozen `95%` would be skipped for the right answer by accident, and a fixture that cannot fail the way
+the defect fails proves nothing about the guard.
+
+### One thing found in passing and left alone
+
+`scripts/coord/seat_clock_alarm.py:76` reads a hardcoded `~/.claude/mefor-usage` and so ignores
+`CLAUDE_CONFIG_DIR` entirely -- it reads the default root's state whichever account the session is
+pinned to. That is a **pre-existing** per-root defect, not one this change introduces, and it is
+unfiled. Named here so it is not lost; it is not this row's scope.
+
+---
