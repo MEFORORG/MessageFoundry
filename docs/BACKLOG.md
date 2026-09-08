@@ -22460,6 +22460,21 @@ Nothing writes the `reviewed` label, and that is held by a test rather than by p
 **Nearest existing mechanism:** the floor is already computed and recorded on every run, pass or fail, into the readings artifact and the step summary, and `harness/load/profiles/connscale-smoke.toml` already carries the `[slo]` table an armed check would key off. So the build is a threshold plus a negative control on an existing seam. **The harvest is the cost, and criterion 1 is most of it.**
 **Related:** [#1211](#1211-empty_claims_per_msg-is-not-contention-immune-the-ratio-form-excursions-past-its-own-slo-band-on-a-hosted-runner) is the single home for the harvest table, the five measured defects and the owner ruling -- read it there, and do not restate the table here. #1357 covers the FD arm of the test #1211 split. #1366's design premise that two metrics carry a band is now one, corrected in place there. #1414 is the allocation-transfer path this item's number history is an instance of.
 
+## 1416. review-gate reads a stale label payload, so a queued run can report success unread
+
+> ✅ **Allocated 2026-09-01 at 10:17:26, never filed. FILED AND CLOSED 2026-09-05 in one act -- the workflow it names was deleted, so the defect has no site.** It is written down rather than dropped because allocation here is one-way: `scripts/coord/alloc.ps1` has no release path, so an allocated number with no row reads to a later reader as lost work rather than as a duplicate that resolved.
+
+**Cluster:** CI gates / merge protection. **Priority:** closed. **Verdict:** moot.
+**Severity:** no engine effect, no PHI axis, and **no deployment axis (sec. 0)** -- repository-side merge tooling; nothing here reaches shipped code.
+
+### It was the third allocation against one defect
+
+Three numbers were allocated against the same finding -- the review gate reading a snapshotted label payload -- by seats that could not see each other. Read from the allocation records: 1416 at 10:17:26 and 1417 at 10:18:37 on 2026-09-01, **seventy-one seconds apart**, from two different worktrees, and a third on 2026-09-03. #1417 was filed and carries the evidence; this one never was. #1413 records that collision, and names the missing waiting-pull-request signal as its cause.
+
+### Why it closes without a fix
+
+`review-gate.yml`, `unread-signal.yml`, `scripts/ci/check_unread_prs.py` and the required context `a reviewer has read this` were removed on 2026-09-05 at the owner's instruction. **The server had already dropped that context**: read from the API that day, branch protection carried 13 contexts and it was not among them, while `.github/required-contexts.txt` still claimed 14. So the removal made the repository's claim match the server rather than changing what the server enforces. What blocks a merge now is exactly the 13 required contexts, and review here is a human practice rather than a machine gate.
+
 ## 1409. diff-coverage (advisory) is killed by its 20-minute timeout on every pull request, so the coverage signal is never measured
 
 > ✅ **SHIPPED -- verified on `origin/main` at `f01b991d9`, 2026-09-08.** Closed as a banner flip: the work is on `main` and only this row still read open. Three limbs, all on origin/main (ca4e85e5d), landed by 4107615cc (PR 724, via git log -S"not tooling"). Ledger anchors are ~10 lines stale, so cited by content: (1) .github/workflows/quality-advisory.yml:477 `pytest -q -m 'not tooling' --cov=messagefoundry ...`; (2) :348 `timeout-minutes: 30`, inside the `coverage:` job spanning :276-562, named `diff-coverage (advisory)` at :284;
@@ -25162,6 +25177,51 @@ This item was opened to assess exactly that. The assessment is negative, for rea
 ### The prose in the pin comment that is now half true
 
 `tests/test_required_contexts.py` lines 114 to 118 say the pin "GOES STALE IN THE DIRECTION THAT LOOKS FINE" and that "a count that only ever fails when someone edits the FILE cannot notice the server moving underneath it". **Both sentences are still literally true of that test** and should stay. What has changed is the implication a reader draws from them, which is that nothing notices. Something does. The paragraph needs one clause naming it, not a rewrite.
+
+## 1453. adopt the three hook patterns the orchestration survey found genuinely missing: a context-budget guard, a gh-run-watch denial, and a PreCompact re-prime
+
+> 🚧 **Filed 2026-09-05. Three hooks are built, tested and wired on this branch. The survey that motivated them ALSO found that two of its top-ranked gaps were already closed, and that correction is the more useful half of this item.** A survey of ten agent-orchestration repositories ranked eight Claude Code hook and skill patterns for adoption. Measured against the INSTALLED configuration rather than against `CLAUDE.md` prose, three of the eight were genuinely absent, two were already built, and three are structural changes to how seats spawn that are deliberately not in this change.
+
+**Cluster:** CI gates / development harness. **Priority:** P3. **Verdict:** build.
+**Severity:** no deployment axis (sec. 0). These are repository-side developer hooks. No engine behaviour, no shipped artifact, and no configuration a deploying site would meet.
+
+### What was measured, and how the ranking was wrong
+
+The adoption ranking was written by reading `CLAUDE.md` and never reading `~/.claude-account-1/settings.json`. That is the method document, not the running configuration, and the two disagree.
+
+| Ranked item | Claimed gap | Measured state |
+|---|---|---|
+| Stop-hook mail injection | "nothing pushes a notice to a seat" | **Already built.** `scripts/hooks/mail-drain.ps1` is wired at `Stop` and emits `hookSpecificOutput.additionalContext`. |
+| UserPromptSubmit mail inject | "mail drains at SessionStart only" | **Already substantially covered** by the same `Stop` drain. |
+| Context-budget guard | no instrument for context-window fullness | **Absent.** Built here. |
+| `gh run watch` denial | no guard on shared API budget | **Absent.** Built here. |
+| PreCompact re-prime | context lost at compaction | **Absent.** Built here. |
+
+The claim `"every notice is polled, and nothing is pushed"` in section 5 is scoped to **workflows** by its own following sentences, and was over-read as covering session messaging. KORUS has the channel; what it lacked was an automatic trigger on the events below.
+
+### What is built
+
+1. **`scripts/hooks/context-budget.ps1`** (`UserPromptSubmit`). Reports how full THIS SESSION'S context window is, at 0.75 / 0.85 / 0.92. It measures a different quantity from `usage-headroom-inject.ps1`, which reads **account pool** headroom -- a seat with a fresh pool can still be one turn from a compaction, and both get called "usage". It **reports and never blocks**: gastown's original hard-gates by role, but a Builder blocked at its prompt has no next turn in which to be told, so blocking burns the brief rather than saving it. Fails open on every path.
+2. **`scripts/hooks/block-api-burn.ps1`** (`PreToolUse` on `Bash` and `PowerShell`). Denies `gh run watch`, any `gh ... --watch`, and hand-rolled `gh` poll loops. Every seat acts as one GitHub identity against one 5000/hr budget, and `gh run watch` polls every three seconds. The denial reason names the single-shot replacement. `gh` must sit in **command position**: the first draft denied `echo "gh run watch is banned"`, which would have blocked writing this very item.
+3. **`scripts/hooks/precompact-reprime.ps1`** (`PreCompact`). Restores the seat, the goal, the ledger numbers this worktree holds, and whether the branch is pushed. **It refuses to restore a declaration whose branch differs from the current one**, because worktrees are re-used and a stale goal reads as authoritative. Run live in the allocating worktree it correctly reported the declaration as a previous occupant's, on branch `ci/retire-review-gate`, 2.6 days old.
+
+### What is deliberately NOT in this change
+
+Three ranked items alter how every seat launches, and six sessions were live while this was written.
+
+1. **Separate autonomous and interactive settings profiles.** `scripts/worktree/spawn.ps1` has no profile or `--settings` logic today.
+2. **A base-to-role settings merge passed with `--settings`.** This is the real fix for tracked `.claude/settings.json` being per-worktree-per-branch, and it is a spawn-path change.
+3. **A contributor skill carrying an executable pre-commit self-check.** Additive and low risk, but it belongs with the two above so the checks it runs match the profile the seat launched under.
+
+**Where `--settings` could actually go, measured 2026-09-05. Read this before picking up item 2, because the sentence above points at the wrong file.** `scripts/worktree/spawn.ps1` is not the seam: it never invokes `claude` at all (`grep -c claude` returns 0), it calls `new.ps1` and opens a VS Code window for a person to start a chat in. Nor is `new.ps1`, which creates worktrees at `<repo-parent>/MessageFoundry-<name>` -- 18 of the 21 worktrees on this clone, including all eight live sessions, sit at `.claude/worktrees/<name>-<hash>`, the harness's own layout. Three do match `new.ps1`'s layout, so it is not dead code, but no live session is in one. **A `--settings` flag can only be passed by whoever runs `claude`, so it reaches a Console-spawned Builder and nothing else.**
+
+**The divergence item 2 is really about is confirmed.** Tracked `.claude/settings.json` is per-worktree-per-branch: 3352 bytes and 6 hook entries on this branch against 2267 bytes and 3 in the primary checkout at `main`. The three hooks above therefore bind only sessions running on this branch until it merges.
+
+**The layer that already binds every seat is the account file.** `~/.claude-account-1/settings.json` wires 16 hook scripts and applies regardless of worktree or branch, and this session shows both layers firing together. Whoever takes item 2 should first say why that file is not the answer.
+
+### Where the evidence lives
+
+The full ranked register, its corrections and its per-item evidence strength are a published artifact, not a repository document, so a repository search for it returns zero and **that zero is not evidence the work was not done**.
 
 ## 1457. zizmor 1.30.0 flags cla.yml self-repository, and the bump that introduced it merged with its own gate red
 
