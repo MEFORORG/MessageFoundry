@@ -101,8 +101,9 @@ Mirror ADR 0010's split **exactly**: a declared, pooled, env()-resolvable **conn
   and the `LookupRunner` type). `query` is **one of two read shapes**, both read-only:
   - a **read-by-id**: `fhir_lookup("epic", "Patient/123")` (or a structured `("Patient", "123")`) → `GET {base}/Patient/123`;
   - a **search**: ~~`fhir_lookup("epic", "Patient?identifier=MRN|123")` → `GET {base}/Patient?identifier=MRN|123`.~~
-    **SUPERSEDED by the 2026-08-13 amendment below (BACKLOG #1243).** The flat `?`-query is refused; a search is
-    the path in `query` plus the fields in `params` — `fhir_lookup("epic", "Patient", {"identifier": "MRN|123"})`.
+    **SUPERSEDED by the 2026-08-13 and 2026-09-03 amendments below (BACKLOG #1243).** The flat `?`-query is
+    refused; a search is the path in `query` plus the fields in `params`, and each value states its kind —
+    `fhir_lookup("epic", "Patient", {"identifier": FhirToken("MRN", mrn)})`.
   It returns the parsed result as a **plain dict** (a single resource) or a **`Bundle` searchset dict** (a search),
   read on demand by the Handler via the pure `parsing/fhir/` codec (`FhirPeek`/`FhirResource`) — never a typed object
   pushed through the pipeline. `config/` stays import-clean: it owns **only** the accessor + the active-runner holder;
@@ -198,8 +199,8 @@ check` / the console **without** issuing a PHI-bearing read — the natural FHIR
   → `tests/test_fhir_lookup.py::test_read_by_id_returns_resource`
 - **AC-2** — ~~WHEN a Handler calls `fhir_lookup(connection, "Patient?identifier=MRN|123")`, THE SYSTEM SHALL issue a
   read-only `GET {base}/Patient?identifier=MRN|123` and return the searchset `Bundle` dict.~~
-  **SUPERSEDED by the 2026-08-13 amendment below (BACKLOG #1243).** The flat `?`-query is refused; a search is
-  `fhir_lookup(connection, "Patient", {"identifier": "MRN|123"})`.
+  **SUPERSEDED by the 2026-08-13 and 2026-09-03 amendments below (BACKLOG #1243).** The flat `?`-query is
+  refused; a search is `fhir_lookup(connection, "Patient", {"identifier": FhirToken("MRN", mrn)})`.
   → `tests/test_fhir_lookup.py::test_structured_params_are_the_only_search_form`
 - **AC-3** — WHEN `fhir_lookup` is called on a **Router** or in the **dry-run / Test Bench** path, THE SYSTEM SHALL
   raise `FhirLookupError` (no active runner), never return live data.
@@ -354,4 +355,69 @@ delimiters. It does **not** neutralise `,`, `|` and `$`, which are **FHIR search
 they survive percent-decoding and reach the server with their separator meaning intact, so a value
 carrying one still alters the query's semantics one layer above the URL. That gap is open, is tracked
 on **BACKLOG #1243 limb B**, and is **not** resolved here — the two questions were filed together
-precisely because closing this one alone does not close ASVS 1.2.2.
+precisely because closing this one alone does not close ASVS 1.2.2. **Closed by the 2026-09-03
+amendment below.**
+
+## Amendment (2026-09-03) — a search value states its KIND, and a literal that carries a separator is REFUSED (BACKLOG #1243 limb B)
+
+**This closes the gap the amendment above left open.** The owner lifted limb B's 2026-08-22 block on
+2026-09-03, on the finding that the FHIR specification answers normatively the question a real FHIR
+server was wanted for, and chose this design over an ADR-first route.
+
+**The specification is the evidence, and it is not ours to test.** R4 section 3.1.1.4.19 and R5
+section 3.2.1.5.7 carry the same two sentences. The first says the backslash escape applies to
+parameter values *after* they have been unescaped on the server while being read from the HTTP
+headers. The second says that escaping sits at a different level from the percent encoding RFC 3986
+defines, that standard percent escaping still applies, and that the URLs it then shows have the same
+meaning — R5 following it with a character-exact pair in which a **percent-encoded comma is still the
+OR separator** across three values. So the server percent-decodes first and reads FHIR's syntax
+second. **Cite R5 for the examples:** R4's second pair percent-encodes with decimal character codes
+(`%58` for `:`, `%44` for `,`), so a reader checking R4 alone hits a garbled example and may write the
+whole section off. These citations live in the code, on `messagefoundry/fhirsearch.py`, and are
+deliberately **not** a test assertion — this repository's suite cannot arbitrate wire behaviour, and
+pretending it could is the defect limb B exists to record.
+
+**The design: three kinds of value, because one string cannot carry two provenances.** The idiom this
+replaces, `{"identifier": "MRN|" + msg["PID-3.1"]}`, is one string whose head is the author's syntax
+and whose tail is message data. No encoder can tell those halves apart, so the author says which is
+which:
+
+| kind | meaning | what happens to `,` `\|` `$` |
+|---|---|---|
+| a plain `str` | data | **refused** — a PHI-safe `ValueError` naming the parameter key and the character, never the value |
+| `FhirToken(system, code)` | a `system\|code` token | the system half is an author literal and passes through; the code half is data and screens |
+| `FhirRaw("...")` | FHIR search syntax the author wrote | percent-encoded only, never screened |
+
+**What the screen does NOT cover, stated rather than left to be discovered.** The **backslash** is not
+screened. FHIR names it in the same breath as these three, because it introduces the escape, so a
+server that implements the unescape reads a bare `\` in a value as an introducer rather than as data.
+It is out because the ruling that authorised this screen named three characters, and widening a
+refusal is a behaviour change that should be ruled rather than assumed. Recorded in the code beside
+the constant, and named by subject rather than by a number. A non-string scalar is also refused: it was
+never in the declared type, but `urlencode` used to coerce it, so `{"_count": 50}` becomes `"50"`.
+
+**Why refusal and not FHIR's backslash escape, and this is the load-bearing reason.** The escape is
+correct only if the server implements the unescape, and server behaviour there is demonstrably
+variable — HAPI FHIR issue #192 reports an escaped comma coming back with the backslash still in it.
+**A value that never leaves the process cannot be misread by any server.** Refusal's correctness does
+not depend on the far end; escaping's does. Backslash escaping is therefore deliberately **not** built:
+it is an additive **fourth** kind for a site that has a real FHIR server and can verify it, which
+defers the one genuinely unknowable fact to the only party who can know it.
+
+**Why `FhirRaw` is required rather than a convenience, and why it does not reopen limb A's objection.**
+FHIR's own grammar puts separators inside a single value: `code-value-quantity=code$loinc|12907-2,value$ge150|http://unitsofmeasure.org|mmol/L`
+is **one value** carrying `$`, three `|` and a `,`, every one structural; a quantity is
+`[prefix][number]|[system]|[code]`; `_sort` and `_elements` take comma-separated lists. There is also
+an AND/OR trap: FHIR ANDs repeated parameters, so a `list` value is an **AND**, and a comma inside one
+value is the only way to express OR. Refusing commas with no `FhirRaw` would remove OR from the
+surface entirely. Limb A rejected a sink reachable **by default**; `FhirRaw` carries **author-authored**
+syntax, not message data — the same line `conditional_query` already draws on the write side. Operator
+strings reaching a sink is **BACKLOG #1241**, filed separately.
+
+**What moved with it, in the same commit.** The taught idiom moved everywhere it is taught — the IDE
+snippet, `config/fhir_lookup.py`, `config/wiring.py`, this ADR — and the five assertions in
+`tests/test_fhir_lookup.py` that pinned `%7C` on the wire were rewritten to the token form. They pinned
+the defective behaviour, so rewriting them is the intended act; with zero deployments (CLAUDE.md
+section 0) a breaking change costs nothing, and limb A set the precedent by deleting a setting rather
+than flipping it. The wire output for a token search is byte-identical to what those assertions pinned;
+what changed is that the author now has to say which half is which.
