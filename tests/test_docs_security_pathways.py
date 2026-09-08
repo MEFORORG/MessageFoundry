@@ -429,14 +429,22 @@ def test_the_directory_rows_disclose_what_each_leg_actually_grants() -> None:
     ``oidc_require_mfa_claim``. Asserting both halves keeps the two legs from silently converging in
     either direction.
 
-    TWO RETIREMENT NOTES. BACKLOG #1137: the grant used to be read off ``_login_ad``; that leg is
-    gone, so the assertion follows the fact to the caller that still makes it. BACKLOG #1144: the
-    grant this test pinned was a hard ``True`` under the owner-signed delegated-directory relaxation.
-    That relaxation is retired, so the polarity here is inverted rather than the test dropped —
-    the table must disclose the current grant, whichever way it points.
+    RETIREMENT NOTE (BACKLOG #1137): the grant used to be read off ``_login_ad``; that leg is gone,
+    so the assertion follows the fact to the caller that still makes it -- Kerberos.
+
+    POLARITY (BACKLOG #1144): the grant this test pinned was a hard ``True`` under the owner-signed
+    delegated-directory relaxation. That relaxation is retired, so the polarity here is inverted
+    rather than the test dropped -- the table must disclose the current grant, whichever way it
+    points.
+
+    ANCHOR (BACKLOG #1140): the Kerberos anchor now reads ``_authenticate_kerberos`` rather than the
+    public ``authenticate_kerberos``. The public method became a thin wrapper that holds a FAILED
+    challenge to a fixed deadline (ASVS 6.3.8) and delegates, so the grant sits one frame down. The
+    anchor is a source-level name, so a future split reds this test rather than passing on a method
+    that no longer carries the grant, which is the safe direction.
     """
 
-    kerberos_grant = mfa_grant_values(AuthService.authenticate_kerberos)
+    kerberos_grant = mfa_grant_values(AuthService._authenticate_kerberos)
     assert kerberos_grant and all(
         isinstance(v, ast.Constant) and v.value is False for v in kerberos_grant
     ), (

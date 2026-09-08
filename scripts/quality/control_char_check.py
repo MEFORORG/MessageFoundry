@@ -98,6 +98,22 @@ NAMES = {
 NUL_IS_CONTENT_UNDER = ("ide/src/",)
 
 
+def is_disallowed(byte: int) -> bool:
+    """Whether *byte* is a control character text must not contain: C0 outside :data:`ALLOWED`, or DEL.
+
+    Extracted from :func:`offences` so a caller that classifies BYTES IT ALREADY HOLDS can ask this
+    file rather than restate the rule. :func:`offences` reads a path, which is the wrong shape for a
+    caller holding an in-memory string -- and the first such caller
+    (``scripts/security/build_password_corpus.py``, BACKLOG #1433) had copied the predicate verbatim.
+    A second copy of a classification rule agrees today and diverges the day this one is tightened,
+    with nothing reporting it.
+
+    The NUL allowance is NOT applied here: it is per-PATH (:data:`NUL_IS_CONTENT_UNDER`), so only a
+    caller that has a path can decide it. :func:`offences` still does.
+    """
+    return byte < 0x20 and byte not in ALLOWED or byte == 0x7F
+
+
 def in_scope(path: str) -> bool:
     """True when *path* carries an in-scope text extension."""
     return Path(path).suffix.lower() in TEXT_SUFFIXES
@@ -151,7 +167,7 @@ def offences(path: str) -> tuple[list[tuple[int, int, int]], int]:
             line += 1
             col = 1
             continue
-        if b < 0x20 and b not in ALLOWED or b == 0x7F:
+        if is_disallowed(b):
             if b == 0x00 and allow_nul:
                 allowed += 1
             else:
