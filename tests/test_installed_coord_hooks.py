@@ -47,12 +47,16 @@ common git dir, where the same silent-staleness applies and no instrument was wa
 2026-09-03 on the reference box: the allowlist named two roots, and the second one carried an installed
 ``claim_check.py`` that nothing in either checkout compared against anything.
 
-**THE COMPARISON IS PER-ROOT AND SELF-REFERENTIAL, DELIBERATELY.** Each root's installed payload is
-judged against THAT ROOT's own committed ``scripts/hooks/`` source, using THAT ROOT's own installer to
-say which payloads it manages. No copy is ever compared across roots. Which checkout's copy of a shared
-script is authoritative when two of them disagree is an open owner ruling (BACKLOG #1376), and a test
-that compared one root's installed file against another root's source would decide it silently. This one
-cannot: it only asserts that whatever a root committed is what that root runs.
+**THE COMPARISON IS PER-ROOT AND SELF-REFERENTIAL, AND AN OWNER RULING NOW REQUIRES IT.** Each root's
+installed payload is judged against THAT ROOT's own committed ``scripts/hooks/`` source, using THAT
+ROOT's own installer to say which payloads it manages. No copy is ever compared across roots.
+
+The question this shape was built to avoid deciding was *which checkout's copy of a shared governance
+script is authoritative when two of them disagree*. **The owner ruled on 2026-09-03 (BACKLOG #1376):
+each repository owns its own copy, and there is no cross-repo authority.** So the question does not
+arise, and a test comparing one root's installed file against another root's source would do worse than
+decide it silently -- it would assert an authority relationship the ruling says does not exist. This one
+only asserts that whatever a root committed is what that root runs.
 
 LOCAL-MACHINE TESTS. CI has no user settings and no allowlist, so these skip there, and that is honest:
 an unresolvable shim is a developer-box condition, not a repository one. **What CI therefore does not
@@ -879,8 +883,9 @@ def test_the_installed_shim_matches_the_installer_here_string(var: str) -> None:
 # Everything above roots its git-hook half at THIS repository. A second primary checkout on the same
 # box that also ships install-git-hooks.ps1 installs its own payloads into its own common git dir, and
 # nothing anywhere compared them. Read the comparison rule in the docstring before editing anything
-# here: every check below is PER-ROOT and SELF-REFERENTIAL, and it must stay that way while which
-# checkout's copy of a shared script is authoritative remains an open owner ruling.
+# here: every check below is PER-ROOT and SELF-REFERENTIAL, and an owner ruling requires it to stay
+# that way -- ruled 2026-09-03 (BACKLOG #1376), each repository owns its own copy of a shared
+# governance script and there is no cross-repo authority.
 
 # The worktree gate's machine allowlist, resolved the way scripts/hooks/worktree_gate.ps1's $ReposFile
 # default resolves it: USERPROFILE first, the user-profile folder otherwise. Not a repository file --
@@ -948,9 +953,12 @@ def audit_governed_root(root: Path, hooks_dir: Path | None) -> tuple[list[str], 
             f"this parser can read, so NOTHING about what that root runs was compared -- and an empty "
             f"payload list reads exactly like agreement, which is the state BACKLOG #1376 filed. "
             f"REMEDY: either that root's installer gains the $payloads declaration this one has, or "
-            f"payloads_declared_by learns that installer's shape. WHICH OF THE TWO is the open ruling "
-            f"in #1376; do not guess a payload list for a shape nobody has read, because a wrong guess "
-            f"reports confident parity over the wrong files"
+            f"payloads_declared_by learns that installer's shape. The owner ruled on 2026-09-03 that "
+            f"each repository owns its own copy and there is no cross-repo authority, so BOTH repairs "
+            f"keep this audit self-referential and the ruling picks NEITHER -- choosing between them "
+            f"is an ordinary engineering call, tracked in #1376. Do not guess a payload list for a "
+            f"shape nobody has read, because a wrong guess reports confident parity over the wrong "
+            f"files"
         )
         return findings, notes
 
@@ -1041,9 +1049,11 @@ def test_every_governed_root_runs_the_hook_payloads_its_own_checkout_committed()
         "finding carries its own remedy; read the one that fired, they are not the same repair:\n\n"
         + "\n\n".join(f"  * {f}" for f in findings)
         + "\n\nEvery root above was measured ONLY against its own installer and its own committed "
-        "scripts/hooks/ source. Nothing here compares one checkout's copy against another's, so no "
-        "finding above says which checkout's copy of a shared script is authoritative -- that is the "
-        "open owner ruling in BACKLOG #1376, and this test deliberately does not answer it.\n"
+        "scripts/hooks/ source. Nothing here compares one checkout's copy against another's, and no "
+        "finding above says which checkout's copy of a shared script is authoritative. The owner "
+        "ruled on 2026-09-03 that none of them is: each repository owns its own copy and there is no "
+        "cross-repo authority (BACKLOG #1376). A cross-root comparison would assert a relationship "
+        "the ruling says does not exist, so do not add one here.\n"
         "This is a developer-box condition, not a repository one: it is fixed by an operator action in "
         "the root that is named, not by an edit here. Do not delete or deselect this test to get a "
         "green -- that restores the exact blindness #1376 was filed for."
