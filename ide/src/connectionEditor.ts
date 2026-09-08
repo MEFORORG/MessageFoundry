@@ -10,7 +10,7 @@ import { configDir, runJson, workspaceDir } from "./cli";
 import { type ConnObj, nameCollisionError, planSave } from "./connectionMerge";
 import { type FieldGroup, buildForm } from "./connectionForm";
 import { connectionSchema } from "./connectionSchema";
-import { nonce } from "./cspNonce";
+import { WEBVIEW_GUARD_NOTE, guardScript, openChannel, postToWebview } from "./webviewMessaging";
 
 // The ConnObj shape lives in the pure connectionMerge.ts (the mocha-run unit tests import it and
 // must not pull vscode); re-exported here so existing consumers keep their import path.
@@ -135,7 +135,7 @@ export async function openConnectionEditor(
         // rather than being reimplemented in webview script.
         const rebuilt = await formSchemaFor(ws, m.transport, m.direction, m.settings ?? {});
         if (rebuilt) {
-          void current.webview.postMessage({ command: "fields", groups: rebuilt.groups });
+          void postToWebview(current.webview, { command: "fields", groups: rebuilt.groups });
         }
       }
     },
@@ -178,7 +178,7 @@ async function save(
   try {
     entries = await runJson<ConnObj[]>(["connection", "list", "--config", configDir()], ws);
   } catch (e) {
-    current.webview.postMessage({
+    postToWebview(current.webview, {
       command: "error",
       message: `could not re-read connections.toml before saving (nothing was written) — ${String(e)}`,
     });
@@ -190,7 +190,7 @@ async function save(
   });
   if (plan.collision) {
     // Create/clone under an existing name would silently destroy that connection (full replace).
-    current.webview.postMessage({ command: "error", message: nameCollisionError(plan.collision) });
+    postToWebview(current.webview, { command: "error", message: nameCollisionError(plan.collision) });
     return;
   }
   try {
@@ -200,7 +200,7 @@ async function save(
     );
   } catch (e) {
     // Surface the validation/egress error inline so the user can fix the form (file was not changed).
-    current.webview.postMessage({ command: "error", message: String(e) });
+    postToWebview(current.webview, { command: "error", message: String(e) });
     return;
   }
   current.dispose();
@@ -230,7 +230,7 @@ async function remove(name: string, current: vscode.WebviewPanel, onSaved?: () =
   try {
     await runJson(["connection", "remove", "--config", configDir(), "--name", name], ws);
   } catch (e) {
-    current.webview.postMessage({ command: "error", message: String(e) });
+    postToWebview(current.webview, { command: "error", message: String(e) });
     return;
   }
   current.dispose();
@@ -262,7 +262,7 @@ export function connectionFormHtml(
   clone?: boolean,
   form?: FormSchema,
 ): string {
-  const n = nonce();
+  const { nonce: n, token } = openChannel(webview);
   return `<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -369,7 +369,7 @@ export function connectionFormHtml(
   </div>
 
   <script nonce="${n}">
-    const vscode = acquireVsCodeApi();
+    const vscode = acquireVsCodeApi();${guardScript(token)}
     const INITIAL = ${embed(initial)};
     const ROUTERS = ${embed(routers)};
     // The installed engine's transport list when it could be fetched, else the legacy constant.
@@ -630,13 +630,15 @@ export function connectionFormHtml(
     $('cancel').addEventListener('click', () => vscode.postMessage({ command: 'cancel' }));
     $('delete').addEventListener('click', () => vscode.postMessage({ command: 'delete', name: INITIAL.name }));
 
-    // Origin is NOT checked here — see webviewMessaging.ts.
+    ${WEBVIEW_GUARD_NOTE}
     window.addEventListener('message', (e) => {
-      if (e.data && e.data.command === 'error') { errorEl.textContent = e.data.message; errorEl.style.display = ''; }
+      const d = mfTrusted(e);
+      if (!d) { return; }
+      if (d.command === 'error') { errorEl.textContent = d.message; errorEl.style.display = ''; }
       // Rebuilt descriptors after a transport/direction change. The grouping rules stay in the tested
       // module; the webview only draws what it is handed.
-      if (e.data && e.data.command === 'fields' && Array.isArray(e.data.groups)) {
-        FIELD_GROUPS = e.data.groups;
+      if (d.command === 'fields' && Array.isArray(d.groups)) {
+        FIELD_GROUPS = d.groups;
         renderGroups(FIELD_GROUPS);
       }
     });

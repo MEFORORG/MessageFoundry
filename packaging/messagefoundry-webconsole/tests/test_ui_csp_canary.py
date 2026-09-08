@@ -41,8 +41,11 @@ from pathlib import Path
 import httpx
 import pytest
 
+import messagefoundry
 import messagefoundry.api.app as engine_app
+import messagefoundry.api.client_networks as engine_client_networks
 import messagefoundry.api.header_floor as engine_header_floor
+import messagefoundry.api.request_timeout as engine_request_timeout
 import messagefoundry_webconsole
 import messagefoundry_webconsole._auth as webconsole_auth
 import messagefoundry_webconsole._security as security
@@ -496,9 +499,51 @@ COOKIE_SECURITY_ATTRIBUTES = (
 #: The first cell of the degrade-contract row that must carry the cookie attributes.
 COOKIE_ATTRIBUTE_ROW_LABEL = "Session-cookie security attributes"
 
+#: What separates a degrade-contract bullet's LEAD (what the bullet is about) from its verdict and
+#: rationale. Pinned as a constant because the whole bucket-correctness check turns on it.
+_BUCKET_SEPARATOR = "— "
+
+#: Where the bucket list starts inside the module docstring. The docstring opens with a DIFFERENT
+#: bullet list -- the headers the middleware sets -- whose entries lead with the same header names
+#: and carry no verdict, because describing what is emitted is not the same statement as saying what
+#: happens when a browser ignores it. Measured: without this split the bucket check reads the
+#: emission bullet for COOP/CORP and reports a missing verdict that is not missing.
+_BUCKET_LIST_HEADING = "Which relied-on features are actively DETECTED"
+
 _HEADER_WRITE_RE = re.compile(r'headers\[\s*"([A-Za-z0-9-]+)"\s*\]\s*=')
 _WINDOW_READ_RE = re.compile(r"window\.([A-Za-z_$][A-Za-z0-9_$]*)")
 _PACKAGE_DIR = Path(messagefoundry_webconsole.__file__).parent
+
+#: The ENGINE modules that stamp browser-security headers onto a response the console's own package
+#: cannot see. The console package itself is always read; these are the additions.
+_EMITTERS = (
+    engine_app,
+    engine_client_networks,
+    engine_header_floor,
+    engine_request_timeout,
+)
+
+#: Modules that write a browser-security header onto a response NO browser ever renders as /ui, with
+#: the reason. Reading them would widen the degrade contract to headers no console operator can be
+#: affected by. This is a CLASSIFICATION, not an exclusion list: a new emitter must land in one tuple
+#: or the other, and the guard reds until somebody decides which.
+_NOT_UI_EMITTERS = {
+    "http_listener.py": (
+        "the HL7-over-HTTP ingress listener. Its responses go to a sending SYSTEM on a partner "
+        "connection, never to the console origin, so its headers are not part of the /ui contract."
+    ),
+}
+
+#: The shapes a browser-security header is WRITTEN in across both trees: subscript assignment, a
+#: ``{"Name": "value"}`` mapping entry, a ``("Name", "value")`` pair, and the raw-ASGI
+#: ``(b"name", b"value")`` pair. Used only to find modules that write one -- the emitted SET itself
+#: is derived by name presence, which also catches the constants and response constructors these
+#: patterns miss.
+_HEADER_WRITE_SHAPES = (
+    re.compile(r'headers\[\s*["\']([A-Za-z0-9-]+)["\']\s*\]\s*='),
+    re.compile(r'["\']([A-Za-z0-9-]+)["\']\s*:\s*["\']'),
+    re.compile(r'\(\s*b?["\']([A-Za-z0-9-]+)["\']\s*,\s*b?["\']'),
+)
 
 
 class RunbookContractUnenforced(UserWarning):
@@ -581,6 +626,112 @@ def _runbook_contract() -> str:
     return contract.split("## Per-message signing", 1)[0]
 
 
+#: Point this at ``docs/BROWSER-SUPPORT.md`` from a checkout that does not carry the engine's docs
+#: tree. Unlike the runbook, this document is PUBLIC and in-tree, so its absence is a failure rather
+#: than an announced stand-down: nothing about it is deny-listed, and a skip here would recreate the
+#: exact defect BACKLOG #1116 filed -- a contract whose only checker cannot reach it.
+_SUPPORT_DOC_ENV = "MEFOR_WEBCONSOLE_BROWSER_SUPPORT_DOC"
+
+#: The two bucket headings in ``docs/BROWSER-SUPPORT.md``. The rows an emitted feature must land in
+#: sit between the first and the end of the section.
+_SUPPORT_DOC_SECTION = "## What each absence does"
+_SUPPORT_DOC_SECTION_END = "## Two configurations turn the warnings off"
+
+
+def _support_doc_rows() -> str:
+    """The TABLE ROWS of the operator-facing browser-support statement.
+
+    Rows only, not the whole section: a feature named in the surrounding prose has been mentioned, and
+    the requirement this guards ("behaves as documented when a feature is missing") is a per-feature
+    statement. That is the same rule the ``_security.py`` bucket check applies to the in-code
+    contract, applied to the shipped document.
+    """
+    override = os.environ.get(_SUPPORT_DOC_ENV, "").strip()
+    doc = (
+        Path(override)
+        if override
+        else Path(__file__).resolve().parents[3] / "docs/BROWSER-SUPPORT.md"
+    )
+    assert doc.exists(), (
+        f"{doc} is absent. The operator-facing browser-support contract is public and in-tree by "
+        f"design (BACKLOG #1116); set {_SUPPORT_DOC_ENV} if this checkout carries it elsewhere."
+    )
+    text = doc.read_text(encoding="utf-8")
+    assert _SUPPORT_DOC_SECTION in text, _SUPPORT_DOC_SECTION
+    section = text.split(_SUPPORT_DOC_SECTION, 1)[1].split(_SUPPORT_DOC_SECTION_END, 1)[0]
+    return "\n".join(line for line in section.splitlines() if line.startswith("|"))
+
+
+def test_the_shipped_browser_support_doc_carries_every_relied_on_feature() -> None:
+    """The operator-facing half of the enumeration, and the half a deploying site actually receives.
+
+    The runbook comparison below stands down in every public checkout by design, which left the
+    shipped contract compared against nothing a `pip install` adopter could ever read. This leg
+    compares the same CODE-derived sets against ``docs/BROWSER-SUPPORT.md``, so it runs everywhere.
+
+    Both sides stay derived: the sets come from the header names, the ``window.<Feature>`` reads and
+    the cookie attributes, never from a literal here. Deleting a bucketed row from the document reds
+    this; adding a header write to the console reds it too, because the new name is then in the
+    derived set and in no row.
+    """
+    rows = _support_doc_rows()
+    for header in sorted(_emitted_browser_security_headers()):
+        assert header in rows, (
+            f"{header} reaches a /ui response but has no row in docs/BROWSER-SUPPORT.md, so the "
+            f"document a deploying site receives does not say what its absence costs"
+        )
+    for feature in sorted(_detected_browser_security_features()):
+        assert feature in rows, (
+            f"window.{feature} is feature-detected by the console but has no row in "
+            f"docs/BROWSER-SUPPORT.md"
+        )
+    source = Path(webconsole_auth.__file__).read_text(encoding="utf-8")
+    for code_token, doc_token in COOKIE_SECURITY_ATTRIBUTES:
+        if code_token not in source:
+            continue
+        assert doc_token.strip("`") in rows, (
+            f"{doc_token.strip('`')} is set on the session cookie but no docs/BROWSER-SUPPORT.md "
+            f"row names it"
+        )
+    # positive control: the section split found real table rows, so a green run above means the
+    # document names these features rather than that the extraction returned an empty string every
+    # ``in`` test then passes against nothing
+    assert rows.count("\n") >= 12, rows
+
+
+def test_the_browser_support_doc_states_the_floor_it_was_derived_from() -> None:
+    """The version rows are UNRESOLVED, and that has to stay a stated finding rather than an omission.
+
+    An unresolved row and a forgotten row look identical in a document. This pins the two claims the
+    derivation actually rests on -- that the floor is CSP nonce-source support, and that
+    ``'strict-dynamic'`` is not part of it -- plus the explicit statement that no version table is
+    stated. Authoring one later without a pinned dataset reds here.
+
+    **The pinned phrase is "not STATED" rather than "not published", and that is constrained by a
+    second gate rather than a preference** (BACKLOG #1116). ``tests/test_install_instruction_provenance.py``
+    reds when tracked prose asserts a distribution is unpublished while it classifies that
+    distribution PUBLISHED, and its pattern matches a bare ``not published``. The sibling sentence in
+    ``docs/SYSTEM-REQUIREMENTS.md`` sits beside the ``messagefoundry-webconsole`` wheel name and
+    tripped exactly that, on three platforms. The claim here is about VERSION NUMBERS not being
+    named; it was never about a wheel's absence from an index. Do not "restore" the older wording.
+    """
+    override = os.environ.get(_SUPPORT_DOC_ENV, "").strip()
+    doc = (
+        Path(override)
+        if override
+        else Path(__file__).resolve().parents[3] / "docs/BROWSER-SUPPORT.md"
+    )
+    text = " ".join(doc.read_text(encoding="utf-8").split())
+    assert "nonce sources" in text
+    assert "'strict-dynamic'` is not part of the floor" in text
+    assert "Minimum browser versions are deliberately not stated" in text
+    assert "Unresolved" in text
+    # and the wording stays compatible with the unpublished-distribution scan (see the docstring)
+    assert "not published" not in text
+    # the console never blocks: the OTHER half of the 3.1.1 verb (warn the user OR block access)
+    assert "warns, it never blocks" in text or "No browser is blocked" in text
+
+
 def _runbook_contract_table() -> str:
     """Just the TABLE — the per-feature bucket rows. Narrower than the section on purpose: a new
     feature must earn a ROW, not merely be mentioned somewhere in the surrounding prose."""
@@ -600,23 +751,51 @@ def _detected_browser_security_features() -> set[str]:
     return names & set(BROWSER_SECURITY_JS_FEATURES)
 
 
-def _emitted_browser_security_headers() -> set[str]:
-    """Every :data:`BROWSER_SECURITY_HEADERS` name present in the code that reaches a /ui response:
-    the whole console package, plus the ENGINE modules that stamp headers onto /ui responses.
+def _emitter_sources() -> list[str]:
+    """The source text of everything that can stamp a browser-security header on a /ui response: the
+    whole console package plus each declared engine emitter.
 
-    ``api/header_floor.py`` is named alongside ``api/app.py`` because the baseline header LITERALS
-    live there now, and a derivation that misses the emitter goes circular rather than red: the only
-    remaining occurrence of a name would be the ``_security.py`` degrade-contract docstring, which is
-    the very text this guard then asserts the name appears in. Deleting a bucket row would drop the
-    header from ``emitted`` too, and the loop below would simply stop checking it. Measured on this
-    branch: with ``header_floor.py`` absent from this list, removing ``X-Frame-Options: DENY`` from
-    the docstring left the module GREEN. **Any future module that writes one of these names has to be
-    added here** — the contract this guard enforces is only as wide as the code it reads."""
+    ``header_floor.py`` is named alongside ``app.py`` because the baseline header LITERALS live there
+    now, and a derivation that misses an emitter goes circular rather than red: the only remaining
+    occurrence of a name would be the ``_security.py`` degrade-contract docstring, which is the very
+    text the guard then asserts the name appears in. Measured on this branch: with
+    ``header_floor.py`` absent from this list, removing ``X-Frame-Options: DENY`` from the docstring
+    left the module GREEN.
+
+    ``client_networks.py`` and ``request_timeout.py`` were added by BACKLOG #1116: both write
+    browser-security headers today and neither was read, so a header shipped only from one of them
+    could not have reddened this guard. Adding them changed the derived set by ZERO names, which is
+    the measurement -- the hole was structural, not an outstanding gap.
+    ``test_every_module_that_writes_a_header_is_classified`` is what keeps this list
+    from going stale again; do not extend the list without letting that test tell you to."""
     sources = [p.read_text(encoding="utf-8") for p in _PACKAGE_DIR.rglob("*.py")]
-    sources.append(Path(engine_app.__file__).read_text(encoding="utf-8"))
-    sources.append(Path(engine_header_floor.__file__).read_text(encoding="utf-8"))
-    blob = "\n".join(sources)
-    return {name for name in BROWSER_SECURITY_HEADERS if name in blob}
+    sources.extend(Path(module.__file__ or "").read_text(encoding="utf-8") for module in _EMITTERS)
+    return sources
+
+
+def _emitted_browser_security_headers() -> set[str]:
+    """Every :data:`BROWSER_SECURITY_HEADERS` name the emitting code carries.
+
+    The degrade contract itself is EXCLUDED from the search text. Without that, a header whose only
+    occurrence in the read set is the contract prose satisfies the ``header in docstring`` check
+    about itself, and no edit to the console can make it fail. Measured on this branch: exactly one
+    name was in that state (``Cross-Origin-Embedder-Policy``, present only in the sentence saying it
+    is deliberately NOT set), and dropping the contract text takes the derived set from 11 names to
+    10. The contract still explains COEP's absence; it just no longer counts as evidence of itself.
+
+    Header names are matched case-sensitively, plus the lower-case bytes spelling
+    (``b"x-frame-options"``) that the raw-ASGI emitters use. A blanket case-insensitive match is
+    wrong here: ``report-to`` is a CSP DIRECTIVE inside :func:`build_ui_csp` as well as a header
+    name, so it would enter the set without anything emitting it."""
+    contract = security.__doc__ or ""
+    blob = "\n".join(_emitter_sources())
+    if contract:
+        blob = blob.replace(contract, "")
+    return {
+        name
+        for name in BROWSER_SECURITY_HEADERS
+        if name in blob or f'b"{name.lower()}"' in blob or f"b'{name.lower()}'" in blob
+    }
 
 
 def test_the_middleware_header_constant_matches_what_it_actually_writes() -> None:
@@ -631,6 +810,89 @@ def test_the_middleware_header_constant_matches_what_it_actually_writes() -> Non
         written,
         security.SECURITY_HEADER_NAMES,
     )
+
+
+def test_every_module_that_writes_a_header_is_classified() -> None:
+    """The read list is what bounds the whole contract, and nothing used to check it.
+
+    ``_emitter_sources`` names its engine modules by hand, so a header shipped from a module nobody
+    added is invisible to every assertion below: the derived set never contains it, the loop never
+    looks for it, and the suite stays green. That is how ``client_networks.py`` and
+    ``request_timeout.py`` sat outside the contract while writing four browser-security headers each
+    (BACKLOG #1116). This walks BOTH trees for header-write shapes and requires every module it finds
+    to be classified -- read as a /ui emitter, or named in :data:`_NOT_UI_EMITTERS` with the reason it
+    cannot reach a console response.
+
+    It fails LOUD rather than resolving either way on its own. Widening the read list widens what the
+    contract must bucket; excusing a module narrows it. Both are decisions, and a test that guessed
+    would make the wrong one silently. Measured while this was written: the guard reddened within
+    minutes on ``transports/http_listener.py``, which had just started writing four of these names on
+    a partner-facing ingress response.
+    """
+    read = {Path(module.__file__ or "").resolve() for module in _EMITTERS}
+    read |= {p.resolve() for p in _PACKAGE_DIR.rglob("*.py")}
+    names = {name.lower(): name for name in BROWSER_SECURITY_HEADERS}
+    roots = (Path(messagefoundry.__file__ or "").parent, _PACKAGE_DIR)
+    unclassified: dict[str, list[str]] = {}
+    for root in roots:
+        for path in sorted(root.rglob("*.py")):
+            source = path.read_text(encoding="utf-8")
+            written = {
+                names[found.lower()]
+                for shape in _HEADER_WRITE_SHAPES
+                for found in shape.findall(source)
+                if found.lower() in names
+            }
+            if written and path.resolve() not in read and path.name not in _NOT_UI_EMITTERS:
+                unclassified[path.name] = sorted(written)
+    assert not unclassified, (
+        f"these modules write a browser-security header and are classified neither as a /ui emitter "
+        f"(_EMITTERS, which puts their headers inside the degrade contract) nor as out of scope "
+        f"(_NOT_UI_EMITTERS, which needs a reason they cannot reach a console response): "
+        f"{unclassified}"
+    )
+    # positive control: the scan finds the emitters we DO read, so an empty result above means the
+    # classification is complete rather than that the shapes stopped matching anything.
+    found_in_read = {
+        path.name
+        for path in read
+        if path.exists()
+        and any(shape.search(path.read_text(encoding="utf-8")) for shape in _HEADER_WRITE_SHAPES)
+    }
+    assert {"app.py", "header_floor.py", "_security.py"} <= found_in_read, found_in_read
+    # and the excuses stay live: a module that stopped writing headers, or moved, leaves a standing
+    # reason nobody rechecks, which is how an exclusion list rots into an exemption
+    seen = {path.name for root in roots for path in root.rglob("*.py")}
+    stale = sorted(name for name in _NOT_UI_EMITTERS if name not in seen)
+    assert not stale, f"_NOT_UI_EMITTERS names modules that are no longer in the tree: {stale}"
+
+
+def test_every_emitted_header_lands_in_one_of_the_two_buckets() -> None:
+    """Bucket CORRECTNESS, which the presence check below cannot reach.
+
+    ``header in docstring`` is satisfied by a header named anywhere at all -- in the intro prose, in
+    another bullet's compensating-control sentence, in a parenthetical. The contract's claim is
+    narrower than that: every relied-on feature sits in EXACTLY ONE bucket, detected-and-warned or
+    degrades-silently-with-a-named-compensating-control. So the header must own a bullet whose LEAD
+    names it, and that bullet must carry a verdict.
+    """
+    docstring = security.__doc__ or ""
+    assert _BUCKET_LIST_HEADING in docstring, "the bucket list lost its heading"
+    buckets = docstring.split(_BUCKET_LIST_HEADING, 1)[1]
+    bullets = [f"* {block}" for block in buckets.split("\n* ")[1:]]
+    assert len(bullets) >= 10, len(bullets)
+    verdict = re.compile(r"DETECTED and WARNED|DEGRADES? SILENTLY")
+    for header in sorted(_emitted_browser_security_headers()):
+        owning = [b for b in bullets if header in b.split(_BUCKET_SEPARATOR, 1)[0]]
+        assert owning, (
+            f"{header} reaches a /ui response but no degrade-contract bullet is ABOUT it -- it is "
+            f"mentioned somewhere in the prose at best, which is not a bucket"
+        )
+        for bullet in owning:
+            assert verdict.search(bullet), (
+                f"the degrade-contract bullet for {header} states no verdict: it must say either "
+                f"DETECTED and WARNED or DEGRADES SILENTLY with a compensating control"
+            )
 
 
 def test_degrade_contract_enumerates_every_relied_on_feature() -> None:

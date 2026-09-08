@@ -35,7 +35,7 @@ import os
 import re
 import secrets
 import time
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Iterator
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Protocol
@@ -44,7 +44,7 @@ from messagefoundry.parsing.peek import HL7PeekError, Peek
 from messagefoundry.parsing.sniff import _looks_like_hl7, _lstrip_bom_ws
 from messagefoundry.parsing.split import split_batch
 from messagefoundry.store.content_search import SearchSpec, row_matches
-from messagefoundry.store.crypto import Cipher, cell_aad
+from messagefoundry.store.crypto import AesGcmCipher, Cipher, CipherError, cell_aad
 
 _log = logging.getLogger(__name__)
 
@@ -299,6 +299,19 @@ def browse_messages(
     )
 
 
+@dataclass(frozen=True)
+class ResealResult:
+    """What one :meth:`UploadStore.reseal_to_active` pass did.
+
+    ``skipped`` is load-bearing, not decoration: an operator reads it to decide whether it is safe to
+    drop the retired key. A file this pass could not read is a file still sealed under the OLD key,
+    and dropping that key makes it permanently unreadable — so a non-zero ``skipped`` means "run it
+    again before you retire anything"."""
+
+    resealed: int = 0
+    skipped: int = 0
+
+
 class UploadQuotaLedger(Protocol):
     """The ONE thing :class:`UploadStore` needs from the message store: an atomic, cross-process
     reservation of an uploader's in-flight upload budget (ASVS 2.3.4).
@@ -437,25 +450,62 @@ class UploadStore:
             message_count=int(d.get("message_count", 0)),
         )
 
-    def _scan_metas_sync(self) -> list[UploadedFileMeta]:
-        """Walk the uploads root and decrypt every well-formed ``.meta`` sidecar (UNSORTED). A
-        bad/foreign/undecryptable sidecar is skipped with a warning (never a body in the log), so a
-        rotated-away key can neither sink the listing nor silently drop a quota/retention pass. Pure
-        filesystem read — the caller runs it off the event loop."""
+    def _iter_sidecars(self) -> Iterator[tuple[str, Path]]:
+        """Every ``(file_id, sidecar path)`` pair in the uploads root — the ONE definition of "a file
+        of ours". Both the listing scan and the re-seal pass consume it, so the id shape and the
+        sidecar suffix cannot drift apart between them. Anything else in the directory (an operator's
+        stray file, a temp file, an id that fails the strict 32-hex shape) is not ours and is skipped
+        without being opened."""
         root = self._root
         if not root.is_dir():
-            return []
-        out: list[UploadedFileMeta] = []
+            return
         for entry in root.iterdir():
             if not entry.name.endswith(_META_SUFFIX):
                 continue
             fid = entry.name[: -len(_META_SUFFIX)]
-            if not _FILE_ID_RE.match(fid):
-                continue
+            if _FILE_ID_RE.match(fid):
+                yield fid, entry
+
+    def _scan_metas_sync(self) -> list[UploadedFileMeta]:
+        """Walk the uploads root and decrypt every well-formed ``.meta`` sidecar (UNSORTED). A
+        bad/foreign/undecryptable sidecar is skipped **with its cause named** (never a body in the
+        log), so a rotated-away key can neither sink the listing nor silently drop a quota/retention
+        pass. Pure filesystem read — the caller runs it off the event loop.
+
+        **Each failure class is caught on its own and logged distinctly (BACKLOG #1169, CLAUDE.md
+        §6).** One blanket ``except Exception`` used to fold all three into a single
+        "skipping unreadable sidecar" line, which made three unrelated conditions indistinguishable
+        in the log: a key that was rotated away, a sidecar whose bytes are damaged, and the cipher
+        REFUSING a value. The third is the one that matters — it is the class a strict-ciphertext
+        read would raise in, on exactly the surface where planting a file is easiest (a pair of
+        plain files in a directory, no database write needed). A refusal folded into the same line
+        as a routine post-rotation skip is a refusal nobody can see, so the strict read cannot
+        honestly be built on top of this handler until the classes are separated. Separating them
+        does not itself refuse anything: an unmarked sidecar is still accepted today by the cipher's
+        read passthrough (``store/crypto.py`` ``decrypt``), which awaits an owner ruling.
+
+        The cipher's own message is safe to log — every ``CipherError`` carries only key ids,
+        marker versions and algorithm names, never a decrypted value. The malformed-shape branch
+        logs only the exception TYPE, because a ``ValueError`` from coercing a metadata field can
+        echo that field's value back into the message."""
+        out: list[UploadedFileMeta] = []
+        for fid, entry in self._iter_sidecars():
             try:
                 out.append(self._decrypt_meta(entry.read_text(encoding="utf-8"), fid))
-            except Exception:  # noqa: BLE001 — a bad/foreign sidecar must not sink the scan
-                _log.warning("skipping unreadable uploaded-file sidecar %s", fid)
+            except CipherError as exc:
+                # The cipher declined the value. Today that is a wrong/rotated-away key or a blob
+                # relocated into another cell; once a strict-ciphertext read ships it is ALSO the
+                # refusal of an unmarked (planted or downgraded) sidecar. Named on its own so the
+                # two can be told apart in a log.
+                _log.warning("uploaded-file sidecar %s: cipher declined it: %s", fid, exc)
+            except (OSError, UnicodeDecodeError) as exc:
+                # The bytes never reached the cipher — unreadable file, or not valid UTF-8.
+                _log.warning("uploaded-file sidecar %s: unreadable on disk: %s", fid, exc)
+            except (ValueError, TypeError, KeyError) as exc:
+                # Decrypted, but the JSON is malformed or a field will not coerce. Type only.
+                _log.warning(
+                    "uploaded-file sidecar %s: malformed metadata (%s)", fid, type(exc).__name__
+                )
         return out
 
     # --- public API (all disk/crypto/split work off the event loop) --------------------------------
@@ -704,6 +754,108 @@ class UploadStore:
 
         return await asyncio.to_thread(_delete)
 
+    async def reseal_to_active(self) -> ResealResult:
+        """Re-seal every uploaded ``(blob, meta)`` pair under the **active** key — the uploads half of
+        ``messagefoundry rotate-key`` (BACKLOG #1169, ASVS 11.2.2/11.3.3).
+
+        The store's :meth:`~messagefoundry.store.base.Store.reencrypt_to_active` has covered its
+        cipher columns since WP-5; this surface had **no pass of any kind**, so an uploaded file was
+        left behind by both transitions the store handles. A first key-enable left it plaintext on
+        disk forever, and a key rotation left it under the retired key — which is a data-loss defect
+        on its own, because the operator's next step is to drop that key and every upload written
+        before the rotation then stops decrypting.
+
+        **The two transitions are not closed the same way, and the difference is deliberate.** The
+        store seals legacy plaintext AUTOMATICALLY, in ``_encrypt_existing_rows`` at every keyed open.
+        This pass has one caller, ``rotate-key``, so it closes the rotation half automatically and
+        the first-key-enable half only when an operator runs that command. Wiring a whole-directory
+        crypto sweep into API startup is unbounded boot-time work over a directory with no batching
+        seam, which is a different risk and a separate decision — so it is named here rather than
+        quietly assumed.
+
+        Same contract as the store's pass: rewrites values that are plaintext **or** under a retired
+        key, skips values already under the active key (so it is idempotent), and lets a
+        :class:`CipherError` propagate rather than dropping data — a value no configured key opens
+        means the prior key was not supplied, and the CLI says so. Also mirrors its **limitation**:
+        a non-``AesGcmCipher`` (the identity cipher, or a ``vault_transit`` cipher whose DEK never
+        enters the heap) rotates nothing and returns zeros, exactly as ``reencrypt_to_active`` does.
+
+        Re-sealing happens at the **cipher** layer — ``encrypt(decrypt(stored))`` over the stored
+        string — so a body's base64 envelope is never decoded and the plaintext bytes are never
+        reassembled here. Files are processed one at a time and each is rewritten through the same
+        atomic temp-and-replace the write path uses. Peak memory is a SMALL MULTIPLE of ``max_bytes``,
+        not ``max_bytes`` itself: base64 and the AES-GCM round trip each hold their own copy, so a
+        25 MiB upload transiently costs a few hundred MiB. A file already under the active key is
+        detected from its first bytes and never read whole.
+
+        **This pass LAUNDERS an unmarked value, and that is not an oversight to overlook.** Handed a
+        plaintext file, the cipher's read passthrough returns it unchanged and this method then seals
+        it into a genuine, AAD-bound ciphertext — after which nothing distinguishes it from a file
+        the engine wrote itself. The store's rotation has the identical property. That is precisely
+        why #1169 wants a strict-ciphertext read, and this method does not substitute for one: it is
+        a **precondition** for it. A refusal built before this pass existed would fire on legitimate
+        pre-rotation uploads, because until now nothing could ever seal them. The refusal itself
+        awaits an owner ruling and is deliberately not built here.
+
+        Runs entirely off the event loop."""
+        return await asyncio.to_thread(self._reseal_to_active_sync)
+
+    def _reseal_to_active_sync(self) -> ResealResult:
+        """The blocking half of :meth:`reseal_to_active` (disk + cipher). Caller runs it off-loop."""
+        cipher = self._cipher
+        if not isinstance(cipher, AesGcmCipher):
+            return ResealResult()  # identity / transit cipher — nothing this process can rotate
+        root = self._root
+        if not root.is_dir():
+            return ResealResult()
+        active = cipher.active_marker_prefix
+        resealed = skipped = 0
+        for fid, _sidecar in self._iter_sidecars():
+            try:
+                blob_path, meta_path = self._paths(fid)
+            except UploadPathError:
+                # Unreachable for an id that passed _FILE_ID_RE — the guard re-checks the same shape.
+                # Kept anyway, because `prune_expired` guards its unlink the same way: a path guard
+                # this pass skipped would be the one place a bad id reaches the filesystem.
+                skipped += 1
+                _log.warning("uploaded file %s: skipped, its id fails the path guard", fid)
+                continue
+            # The sidecar carries the AAD kind "meta"; the body carries "body" (see _encrypt_meta /
+            # _encrypt_blob). Re-binding the SAME cell AAD is what keeps a re-sealed value readable.
+            for path, kind in ((meta_path, "meta"), (blob_path, "body")):
+                try:
+                    # Read the MARKER first, not the file. The idempotency test is a prefix compare,
+                    # and a sealed 25 MiB upload is ~44 MiB on disk — reading it whole only to skip
+                    # it made a re-run cost a full pass over every already-current file. The store's
+                    # own passes push this filter into SQL (`WHERE col NOT LIKE ...`) for the same
+                    # reason; on a filesystem the equivalent is a bounded read.
+                    with path.open(encoding="utf-8") as handle:
+                        if handle.read(len(active)) == active:
+                            continue  # already under the active key in the active format
+                    stored = path.read_text(encoding="utf-8")
+                except (OSError, UnicodeDecodeError) as exc:
+                    # A half-deleted pair or an unreadable file. Counted and named, never silent:
+                    # this file is still under the OLD key and the operator must not retire it yet.
+                    skipped += 1
+                    _log.warning("uploaded file %s (%s): skipped, unreadable: %s", fid, kind, exc)
+                    continue
+                aad = cell_aad("uploaded_file", kind, fid)
+                # A CipherError here means a prior key was not supplied. It PROPAGATES, before any
+                # write, so the operator is told to supply it rather than losing the file.
+                _atomic_write_text(root, path, _reencrypt_value(cipher, stored, aad))
+                # Drop the file-sized buffer before the next iteration allocates its own. Without
+                # this the previous file's plaintext stays reachable from the frame while the next
+                # one is read, roughly doubling peak memory for no reason.
+                del stored
+                resealed += 1
+        if resealed or skipped:
+            _log.info(
+                "re-sealed %d uploaded-file value(s) under the active key (%d skipped)",
+                resealed,
+                skipped,
+            )
+        return ResealResult(resealed=resealed, skipped=skipped)
+
     async def prune_expired(
         self, *, now: float | None = None, retention_days: int | None = None
     ) -> list[UploadedFileMeta]:
@@ -816,6 +968,19 @@ class UploadRetentionRunner:
             except Exception:
                 _log.warning("uploaded-logs prune audit failed for %s", meta.file_id, exc_info=True)
         return pruned
+
+
+def _reencrypt_value(cipher: AesGcmCipher, stored: str, aad: bytes) -> str:
+    """Decrypt (keyring — any configured key) then re-encrypt under the active key, rebinding the
+    SAME cell AAD (ASVS 11.3.3).
+
+    Deliberately named to match ``MessageStore._reencrypt_value`` and its Postgres and SQL Server
+    twins, which are the identical computation for the database half. They are four spellings of one
+    seam and folding them into ``store/crypto.py`` is worth doing — but those three are staticmethods
+    on store classes this LEAF module may not import (see the module docstring), so the shared name
+    is what keeps a grep for ``_reencrypt_value`` from missing this one. Pairing a decrypt and an
+    encrypt with different AADs is the mistake the single-expression form exists to prevent."""
+    return cipher.encrypt(cipher.decrypt(stored, aad=aad), aad=aad)
 
 
 def _atomic_write_text(root: Path, path: Path, text: str) -> None:

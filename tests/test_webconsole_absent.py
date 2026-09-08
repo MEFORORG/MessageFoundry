@@ -103,9 +103,11 @@ async def test_serve_ui_off_builds_json_app_with_webui_absent(
         assert (await c.get("/health")).status_code == 200  # the JSON API is unaffected
         r = await c.get("/ui/login")
         assert r.status_code == 404  # no /ui served
-        # CSP hook absent → no /ui CSP header (JSON-only serves no HTML), but Cache-Control still set.
-        header_names = {k.lower() for k in r.headers}
-        assert "content-security-policy" not in header_names
+        # CSP hook absent → no /ui NONCE policy (JSON-only serves no HTML), but Cache-Control still
+        # set. The ONE policy present is the header floor's unconditional framing decision, which is
+        # not the console's and does not come from the hook — asserting on its exact value is what
+        # keeps this a severed-coupling test rather than a bare "some CSP exists".
+        assert r.headers.get_list("content-security-policy") == ["frame-ancestors 'none'"]
         assert r.headers.get("cache-control") == "no-store"
 
 
