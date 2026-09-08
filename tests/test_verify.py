@@ -11,6 +11,7 @@ from __future__ import annotations
 import ast
 import asyncio
 import socket
+import ssl
 import subprocess
 import sys
 import threading
@@ -399,6 +400,190 @@ def test_live_smoke_fails_on_nak() -> None:
 def test_live_smoke_fails_when_unreachable() -> None:
     r = smoke.smoke_live(host="127.0.0.1", port=_free_port(), message="MSH|x", timeout=2.0)
     assert r.status is Status.FAIL
+
+
+# ---- live smoke over TLS (BACKLOG #1178, ASVS 12.3.1) -------------------------------------------
+#
+# The defect these cover, measured before the fix: smoke_live wrote a whole MLLP frame onto a bare
+# socket regardless of the target inbound's TLS posture, so `verify --smoke live` against a
+# `tls = true` inbound put a synthetic message BODY on the wire in the clear and then failed with
+# an unexplained "0 bytes received".
+
+
+def _self_signed(tmp_path: Path) -> tuple[str, str]:
+    """A throwaway cert/key for a loopback TLS listener, SAN=localhost so hostname checking is real."""
+    import datetime
+
+    from cryptography import x509
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import ec
+    from cryptography.x509.oid import NameOID
+
+    key = ec.generate_private_key(ec.SECP256R1())
+    name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "localhost")])
+    now = datetime.datetime(2020, 1, 1, tzinfo=datetime.UTC)
+    cert = (
+        x509.CertificateBuilder()
+        .subject_name(name)
+        .issuer_name(name)
+        .public_key(key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(now)
+        .not_valid_after(now.replace(year=2040))
+        .add_extension(x509.SubjectAlternativeName([x509.DNSName("localhost")]), critical=False)
+        .sign(key, hashes.SHA256())
+    )
+    cert_file, key_file = tmp_path / "smoke-cert.pem", tmp_path / "smoke-key.pem"
+    cert_file.write_bytes(cert.public_bytes(serialization.Encoding.PEM))
+    key_file.write_bytes(
+        key.private_bytes(
+            serialization.Encoding.PEM,
+            serialization.PrivateFormat.PKCS8,
+            serialization.NoEncryption(),
+        )
+    )
+    return str(cert_file), str(key_file)
+
+
+def _serve_one_tls(ack: bytes, cert: str, key: str) -> int:
+    """A one-shot MLLP-over-TLS listener that replies with ``ack``; returns its port."""
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    ctx.load_cert_chain(cert, key)
+    srv = socket.socket()
+    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    srv.bind(("127.0.0.1", 0))
+    srv.listen(1)
+    port = int(srv.getsockname()[1])
+
+    def handle() -> None:
+        try:
+            conn, _ = srv.accept()
+            with ctx.wrap_socket(conn, server_side=True) as tls:
+                tls.recv(65536)
+                tls.sendall(b"\x0b" + ack + b"\x1c\x0d")
+        except OSError:
+            pass
+        finally:
+            srv.close()
+
+    threading.Thread(target=handle, daemon=True).start()
+    return port
+
+
+def _record_first_bytes() -> tuple[socket.socket, int, list[bytes]]:
+    """A raw listener that records the first bytes of each connection. Yields (server, port, seen)."""
+    seen: list[bytes] = []
+    srv = socket.socket()
+    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    srv.bind(("127.0.0.1", 0))
+    srv.listen(4)
+
+    def handle() -> None:
+        while True:
+            try:
+                conn, _ = srv.accept()
+            except OSError:
+                return
+            with conn:
+                conn.settimeout(3.0)
+                try:
+                    seen.append(conn.recv(64))
+                except OSError:
+                    seen.append(b"")
+
+    threading.Thread(target=handle, daemon=True).start()
+    return srv, int(srv.getsockname()[1]), seen
+
+
+def test_live_smoke_over_tls_passes_on_aa(tmp_path: Path) -> None:
+    cert, key = _self_signed(tmp_path)
+    port = _serve_one_tls(b"MSH|^~\\&|R|R|S|S|20260101||ACK|1|P|2.5.1\rMSA|AA|1\r", cert, key)
+    r = smoke.smoke_live(
+        host="127.0.0.1",
+        port=port,
+        message=smoke.synthetic_message(),
+        timeout=5.0,
+        ssl_context=smoke.live_smoke_ssl_context(ca_file=cert),
+        server_hostname="localhost",
+    )
+    assert r.status is Status.PASS, r.detail
+
+
+def test_live_smoke_over_tls_puts_no_plaintext_frame_on_the_wire(tmp_path: Path) -> None:
+    """The whole point of #1178's smoke limb, with its own positive control in the same run.
+
+    Both calls hit the SAME raw recorder, so the plaintext arm proves the recorder can see an MLLP
+    frame at all — a TLS arm that observed nothing against a broken recorder would be reporting the
+    instrument, not the fix.
+    """
+    srv, port, seen = _record_first_bytes()
+    try:
+        smoke.smoke_live(host="127.0.0.1", port=port, message="MSH|^~\\&|A", timeout=2.0)
+        smoke.smoke_live(
+            host="127.0.0.1",
+            port=port,
+            message="MSH|^~\\&|A",
+            timeout=2.0,
+            ssl_context=smoke.live_smoke_ssl_context(ca_file=_self_signed(tmp_path)[0]),
+            server_hostname="localhost",
+        )
+    finally:
+        srv.close()
+    assert len(seen) == 2, f"the recorder saw {len(seen)} connection(s), expected 2"
+    plaintext, over_tls = seen
+    assert plaintext.startswith(b"\x0bMSH"), "positive control: the cleartext arm must be visible"
+    assert over_tls[:2] == b"\x16\x03", f"expected a TLS ClientHello, saw {over_tls[:8]!r}"
+    assert b"MSH" not in over_tls, "an application byte preceded or escaped the handshake"
+
+
+def test_live_smoke_tls_handshake_failure_is_named_as_such(tmp_path: Path) -> None:
+    """A cert problem must not read as an unreachable partner — that sends the operator to the
+    firewall for what is a trust-anchor question."""
+    cert, key = _self_signed(tmp_path)
+    port = _serve_one_tls(b"MSH|x\rMSA|AA|1\r", cert, key)
+    r = smoke.smoke_live(
+        host="127.0.0.1",
+        port=port,
+        message="MSH|^~\\&|A",
+        timeout=5.0,
+        ssl_context=smoke.live_smoke_ssl_context(),  # system trust store: cannot anchor this cert
+        server_hostname="localhost",
+    )
+    assert r.status is Status.FAIL
+    assert "TLS handshake" in r.detail, r.detail
+
+
+def test_plaintext_live_smoke_against_a_silent_listener_names_tls_as_a_cause() -> None:
+    """Zero bytes back is what a TLS inbound does to a cleartext frame. Say so; never retry."""
+    srv, port, _seen = _record_first_bytes()
+    try:
+        r = smoke.smoke_live(host="127.0.0.1", port=port, message="MSH|^~\\&|A", timeout=2.0)
+    finally:
+        srv.close()
+    assert r.status is Status.FAIL
+    assert "0 bytes received" in r.detail
+    assert "--smoke-tls" in r.detail, r.detail
+    assert "never retries" in r.detail, r.detail
+
+
+def test_live_smoke_ssl_context_offers_no_verify_off_escape() -> None:
+    ctx = smoke.live_smoke_ssl_context()
+    assert ctx.verify_mode is ssl.CERT_REQUIRED
+    assert ctx.check_hostname is True
+    assert ctx.minimum_version >= ssl.TLSVersion.TLSv1_2
+
+
+def test_live_smoke_ssl_context_asserts_forward_secrecy(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Reaching the shared assertion is observable only when it can fire, so make it fire.
+
+    Mirrors ``tests/test_tls_cipher_assertion_sites.py``: the shipped suite list is entirely
+    forward-secret, so a correctly-wired call site and a missing one look identical without this.
+    """
+    from messagefoundry.config import tls_policy
+
+    monkeypatch.setattr(tls_policy, "_is_forward_secret", lambda cipher: False)
+    with pytest.raises(ValueError, match="verify live smoke"):
+        smoke.live_smoke_ssl_context()
 
 
 # ---- store connectivity -----------------------------------------------------------------------
