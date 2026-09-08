@@ -33,7 +33,12 @@
 > `[retention].audit_days` (**reserved/keep-forever by design**), `[reference].max_staleness_seconds`,
 > `[ai].baa_attested`, and `[update_check].index_url`/`index_allowed_hosts`. The former
 > "accepted-but-ignored" keys that were never fields at all — `[delivery].outbox_workers`/`dead_letter`
-> and `[logging].file`/`max_bytes`/`backups` — now **refuse**.
+> and `[logging].max_bytes`/`backups` — now **refuse**. **`[logging].file` is no longer one of them:**
+> #122 / ADR 0162 made it a real, engine-owned field, and the two legacy spellings beside it refuse.
+> **They refuse on BOTH layers, and only one of those is the general rule.** In the file they hit the
+> unknown-key refusal above (`max_bytes` is even suggested onward as `file_max_bytes`; `backups` is
+> refused naming nothing). From **env** — where a misspelled `MEFOR_*` is otherwise dropped in
+> silence — they hit a dedicated `[logging]` validator that names the replacement for both.
 
 ## Principle — two kinds of configuration
 
@@ -674,7 +679,7 @@ Only `baa_attested` is still a forward-compat placeholder (accepted-but-ignored)
 |---|---|---|---|
 | `level` | enum | `info` | log level. `debug` can surface full message bodies / raw field values into the general log. **`serve` refuses `debug` on a `production_instance` only** (Gate #1, keyed on the production tier alone — see `[security].production_instance`). It is **not** keyed on PHI: since [ADR 0148](adr/0148-phi-default-posture-and-an-explicit-security-enforcement-level.md) a `dev`/`staging` instance also carries PHI, and one of those **will start at `debug` with nothing refusing**. Don't raise any PHI box to `debug` — the gate will not stop you. |
 | `format` | enum | `text` | stdout rendering: `text` (default) or structured `json` (one object per line). Stdlib only — no structlog |
-| `log_dir` | str | _unset_ | the directory NSSM (or another supervisor) **rotates the engine's captured stdout/stderr into**. The engine never writes log **files** itself (it logs to stdout); set this only to tell it where the supervisor parks them, and `GET /status` then **meters that directory's total bytes + filesystem free space** alongside the DB metrics (#50). Unset = stdout-only, no metering. **Metadata only** — the file contents are never read. |
+| `log_dir` | str | _unset_ | the directory NSSM (or another supervisor) **rotates the engine's captured stdout/stderr into**. The engine writes no log **file** of its own unless `file` below is set (opt-in, off by default); set this only to tell it where the supervisor parks the captured stdout, and `GET /status` then **meters that directory's total bytes + filesystem free space** alongside the DB metrics (#50). Unset = stdout-only, no metering. **Metadata only** — the file contents are never read. |
 | `forward_enabled` | bool | _derived_ | ship a copy of every record off-box to a syslog/SIEM collector (sec-offbox-log) so evidence survives a host compromise. **Default-on-when-configured (ADR 0080):** unset ⇒ on iff `forward_host` is set. Set `false` to opt out even with a host; no `forward_host` ⇒ off (stdout-only, unchanged) |
 | `forward_host` | str | — | syslog/SIEM collector host. Setting it turns forwarding on by default (above) |
 | `forward_port` | int | `514` | collector port (1–65535) |
@@ -689,7 +694,10 @@ Only `baa_attested` is still a forward-compat placeholder (accepted-but-ignored)
 | `ntp_peer` | str | — | NTP/SNTP host to compare the local clock against (**required** when `require_time_sync`) |
 | `time_sync_max_skew_seconds` | float | `2.0` | \|local − peer\| above this is "skewed" (must be > 0) |
 | `time_sync_fail_closed` | bool | `false` | **refuse to start** (instead of warn) on skew or an unreachable peer. Further opt-in; requires `require_time_sync` |
-| `file`, `max_bytes`, `backups` | str/int | — | **REFUSED** — none is a `LoggingSettings` field, and an unrecognized key now fails the start rather than loading silently. The engine logs to stdout and NSSM rotates it; `log_dir` above is how you point the engine at where it lands |
+| `file` | str | _unset_ | **opt-in application-log file the ENGINE owns end to end** (#122, ADR 0162) — it opens it, size-rotates it, and rolls it aside on a write failure. Distinct from `log_dir` above, which is where the **supervisor** parks the captured stdout: **one file, one rotation owner**, so a `file` inside `log_dir` is **refused at load** rather than left to fight NSSM. Unset (the default) = stdout-only, unchanged. A path the engine cannot open **refuses startup** — an engine that starts unable to log is the blindness this closes |
+| `file_max_bytes` | int | `50000000` | size-rotate `file` at ~50 MB (`0` = never rotate on size). Engine-side rotation, unrelated to NSSM's. The legacy planned spelling `max_bytes` is **refused at load** naming this key, rather than silently ignored -- from the file by the unknown-key refusal, and from `MEFOR_LOGGING_MAX_BYTES` by a `[logging]` validator, which is the layer the general file refusal does not reach |
+| `file_backup_count` | int | `5` | how many `file.1` … `file.N` backups to keep. The legacy planned spelling `backups` is likewise refused on both layers, though only the env one names this key: the file refusal's nearest-name hint does not reach it. The `*.broken-*` files a write failure rolls aside are **deliberately outside** this chain — they are incident evidence, and a rotation that could delete them would delete the record of the failure |
+| `on_write_failure` | enum | `stop` | **fail-closed control (#122):** when a log sink cannot be written **and** the fresh sink rolled into its place cannot be written either, stop every connection this engine **process** owns, in all three tiers — inbounds stop accepting, messages already accepted stop being routed and transformed, and outbounds pause with their queued rows **retained** (never dead-lettered). Recover by **fixing the log and then** restarting the affected connections, inbound **and** outbound (or the service): a `/config/reload` re-arms the inbounds it re-binds but deliberately never resumes a paused outbound, so on its own it moves the backlog one stage and stops. Every re-arm path is **gated on the log working again** — the engine re-checks by writing a real record to each dead sink at the moment you ask, and a restart issued against a still-unwritable log is **refused** (the connection stays halted, its listener stays down, and another `log_write_failed` names the refusal), so restarting repeatedly is not a way around the control. A first failure alone never stops anything; the roll absorbs the transient. Scope is the process because the application log is process-global and no per-connection attribution exists (ADR 0162 §4); under engine sharding that is the shard's connections. `continue` is the documented opt-out — it still rolls and still alerts, it just keeps processing with no log. The stop is announced by a `log_write_failed` alert through the notifier, a `connection_stopped` per halted connection naming the cause, and `GET /status`'s `log_sinks` block |
 
 > PHI redaction + control-char scrubbing are **always-on handler filters** (not a toggle) applied to
 > **every** sink, including the off-box forwarder ([`logging_setup.py`](../messagefoundry/logging_setup.py),
@@ -1193,10 +1201,17 @@ age** and raises the rotation-due alert (an [`[alerts]`](#alerts) event) when it
 `warn_days` of due. **Route it as `event_type = "secret_rotation"`** — that is the wire name the rule
 validator accepts; the longer `secret_rotation_due` is the internal `AlertSink` method name and is
 **rejected at config load** if you write it in a rule. It reads only the rotation
-**dates** you configure here — **never any secret value** (PHI-free). This is a *reminder*, not
-enforcement: it never rotates a key or blocks startup (run `rotate-key` to rotate the store DEK). Under
-`[security].enforcement = enforce`, a store DEK past `store_key_max_age_days + enforce_grace_days`
-escalates its alert at restart (`enforced = true`) — still an alert, never a refusal.
+**dates** you configure here — **never any secret value** (PHI-free). It never *rotates* a key (run
+`rotate-key` for that), and for every secret class except the store DEK it is a reminder only.
+
+**The store DEK's calendar expiry is ENFORCED** (ASVS 13.3.4, BACKLOG #1004). Under
+`[security].enforcement = enforce` with a keyed store, a DEK past `store_key_max_age_days +
+enforce_grace_days` escalates its alert at restart (`enforced = true`) **and refuses to start the
+engine**. A DEK whose age cannot be determined — the rotation-meta reconcile failed and no
+`store_key_last_rotated` is set — refuses on the same rule: an undetermined age is not a young one. This
+matches the same key's **usage** ceiling, which has always refused unconditionally at 2^32 encrypts. Set
+`enforce_store_key_expiry = false` to keep the alert and drop the refusal; that is a **security
+loosening** and it is named on every boot and in `GET /security/posture`.
 
 The store DEK is tracked **live-by-default** (ASVS 13.3.4): at first keyed start the engine records a
 non-secret tracked-since stamp (the DEK key-id + first-seen date) in store meta and watches the DEK off
@@ -1212,7 +1227,8 @@ tracked; set `warn_days = 0` to disable the reminder.
 | `store_key_last_rotated` | str | — | ISO `YYYY-MM-DD` the store DEK was last rotated; **unset ⇒ the DEK is still tracked live-by-default** off a persisted first-seen stamp (this date is an override) |
 | `store_key_max_age_days` | int | 365 | rotate the store DEK within this many days of its effective last-rotated (the operator date if set, else the persisted stamp) |
 | `secret_max_age_days` | int | 365 | max age for the **non-DEK** tracked secret classes (connector/AD/SMTP/Vault/OIDC), alerted this many days after their last observed fingerprint change |
-| `enforce_grace_days` | int | 30 | under `[security].enforcement=enforce`, a DEK older than `store_key_max_age_days + this` escalates its rotation alert at restart (still an alert, never a refusal) |
+| `enforce_grace_days` | int | 30 | under `[security].enforcement=enforce`, a DEK older than `store_key_max_age_days + this` escalates its rotation alert **and refuses to start** (see `enforce_store_key_expiry`) |
+| `enforce_store_key_expiry` | bool | `true` | under `[security].enforcement=enforce`, a store DEK past `store_key_max_age_days + enforce_grace_days` — or one whose age cannot be determined — **aborts engine start**. `false` keeps the alert, drops the refusal, and is reported as a **security loosening** |
 
 ```toml
 [secret_rotation]
