@@ -24251,8 +24251,6 @@ All 137 listed entries were swept for a repo-rooted read of `messagefoundry/**`.
 1. **The five pull requests above.** A Builder must not push to another seat's branch, so each is fixed by whoever next touches it: append `tests/<name>.py` to `tests/tooling_manifest.txt`, keeping the list alphabetical. **The gate is passable and two pull requests that night passed it correctly -- nothing here asks for it to be weakened.**
 2. **Three copies of the manifest parser, pinned against nothing.** This file, `_tooling_basenames` in `tests/conftest.py` (the copy that actually applies the marker), and `_manifest_paths` in `tests/test_ci_tooling_gate.py` all implement the same rule. Extracting one `tests/_tooling_manifest.py` is the real fix. Related: `test_every_manifest_entry_trips_its_own_gate` in `tests/test_ci_tooling_gate.py` feeds each manifest entry back as its own changed path, so on the manifest arm every entry matches itself unconditionally.
 
-
-
 ## 1454. the leak gate has no URL detector of any kind, so a private artifact link commits clean
 
 > ✅ **Filed 2026-09-05. LANDED 2026-09-05 on main via `55be5371a` (PR 897).** The detector, both test arms and the mutation suite are on `main`; the leak gate ran green on the merge. Value **6/10** - Difficulty **2/10**. **PREVENTIVE, NOT REMEDIAL: the population is zero.** `scripts/security/scan_forbidden.py` -- the `forbidden-content (customer/PHI leak guard)` required context -- carried four structural detectors and **no URL detector of any kind**, so a link of the form `claude.ai/code/artifact/<uuid>` pasted into a doc, an ADR, a backlog row or a PR-derived file would have been committed with nothing turning red.
@@ -25141,8 +25139,6 @@ Vault `roles/BUILDER.md:213-217`, under the heading "Closing a ledger row makes 
 
 I read only `roles/` in the vault and ran no git history there, so I cannot date when any of these lines was written. Eleven of the fourteen playbooks were matched by the needle above but not read, so treat the population as **at least three files**, not a total. I did not check whether any workflow or CI job reads a playbook, and I confirmed no case in which a seat actually followed `BUILDER.md:216` and produced a red PR -- I measured the instruction and the gate, not an incident.
 
-
-
 ## 1479. Scope the required gitleaks scan to the ref under test; today any pushed branch can red main and freeze the queue
 
 > 🚧 **Filed 2026-09-07 -- the code fix ships in this PR. THE GATE IS RED AS THIS IS WRITTEN, on TWO unmerged branches at once, so this is a live freeze and not a post-mortem.** Value **9/10** · Difficulty **2/10** · _quick win_. The `gitleaks (secret scan)` job ran with no `--log-opts`, so it walked every ref the `fetch-depth: 0` checkout had fetched. Branch protection reads its answer as a statement about the ref under test; the job was answering it about the whole repository. On 2026-09-06 an unmerged branch's synthetic fixture reddened `main` and the merge queue with it, freezing merging for over four hours and evicting five entries. Per `CLOSING_SEAT["code"]` the banner flip on merge is the LANDER's.
@@ -25281,8 +25277,6 @@ The detector control stayed green in all four, which is the asymmetry: it flags 
 ### Not checked
 
 I did not read gitleaks' source, so "walks every ref when the flag is unset" rests on the commit counts above and not on the code. I did not test a fork pull request, where the checkout and the available refs differ. I did not check whether any other workflow in this repository scans with a whole-repository default; only `security.yml`'s secret job was examined.
-
-
 
 
 ## 1475. Derive the log redactor's secret vocabulary from the settings registry, with a reasoned exclusion table
@@ -25514,8 +25508,6 @@ Raised by a peer session reviewing #1479, which asked what the range evaluates t
 ### Not checked
 
 I did not test a fork pull request. I did not check whether any other scanner in `.github/workflows/` can be given an empty scope -- #1479's altitude pass established that gitleaks is the only ref-walking scanner, but "can its input be made empty" is a different question from "does it walk refs", and I did not ask it of the working-tree scanners.
-
-
 
 
 ## 1483. apply.py's module docstring enumerates the evidence fields and so denies the two it carries
