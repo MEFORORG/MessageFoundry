@@ -89,3 +89,6 @@ see [`docs/SECURITY-DOCS-POLICY.md`](../docs/SECURITY-DOCS-POLICY.md).
 - Configuration is **executed Python** (Routers/Handlers) from an admin-owned config directory;
   the ability of a config author to run code in-process is by design, not a vulnerability — see
   `docs/SECURITY.md` and `docs/SERVICE.md` for the trust boundary and required directory ACLs.
+- The engine's other deliberately-powerful surfaces — native calls, process starts, thread
+  impersonation, plug-in dispatch and the hostile-input parsers — are listed in
+  [`docs/DANGEROUS-FUNCTIONALITY.md`](../docs/DANGEROUS-FUNCTIONALITY.md), with what constrains each one.

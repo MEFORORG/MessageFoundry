@@ -728,6 +728,26 @@ class LogInfo(BaseModel):
     disk_free_bytes: int  # free space on the log directory's filesystem
 
 
+class LogSinkInfo(BaseModel):
+    """Health of one guarded **application-log sink** (BACKLOG #122, ADR 0162).
+
+    The pull-side counterpart of the ``log_write_failed`` alert, and the reason it is worth having:
+    the other two channels can both be down at once — a log line about a broken log sink may never
+    land, and an engine with no notifier configured sends no page — but ``/status`` answers over HTTP
+    from process memory, which an application-log failure does not touch. ``state`` is ``healthy`` /
+    ``rolled`` (stage 1 absorbed a write failure and healed) / ``unwritable`` (stage 2 — the
+    replacement failed too, and under ``[logging].on_write_failure="stop"`` this process's connections
+    were stopped). **Metadata only — never any log content** (no PHI): a sink label, a state, a count,
+    a scrubbed reason and a path."""
+
+    sink: str  # "stdout" | "file"
+    state: str  # "healthy" | "rolled" | "unwritable"
+    rollovers: int
+    last_event: str | None = None  # safe_exc-scrubbed cause, never record content
+    last_event_at: str | None = None  # ISO-8601 UTC
+    rolled_aside: str | None = None  # where the broken file was renamed to
+
+
 class LogLevelInfo(BaseModel):
     """Runtime log-verbosity state (BACKLOG #171, ADR 0130). ``level`` is the current effective root
     level; ``configured`` is the startup ``[logging].level`` baseline a restart returns to; ``levels`` is
@@ -752,7 +772,11 @@ class LogTailPage(BaseModel):
     ``total_lines`` is that file's line count, so the viewer can page. ``available`` is False when no
     ``[logging].log_dir`` is configured or no readable log file exists (the viewer degrades gracefully).
     Best-effort redaction — a residual single-token identifier can survive, so this route is RBAC-gated +
-    audited like a message view."""
+    audited like a message view. **That residual includes an operator USERNAME**, which the engine's own
+    settings classifier calls a credential; BACKLOG #1475 and the exclusion table in
+    ``tests/test_log_redaction_secret_domain.py`` record why the username class is deliberately not
+    scrubbed. Stated here as well as on the support bundle because both surfaces share this one
+    redactor, so whatever survives it surfaces twice."""
 
     lines: list[str]
     total_lines: int
@@ -847,6 +871,10 @@ class SystemStatus(BaseModel):
     # App-log disk metering (#50), alongside the DB metrics. ``None`` when no [logging].log_dir is
     # configured (the engine logs to stdout under NSSM) or the directory is unreadable — never raises.
     logs: LogInfo | None = None
+    # #122 (ADR 0162): per-sink application-log WRITE health — the "can the engine still log?" question,
+    # which the byte/free-space metering above deliberately does not answer. Empty when logging was not
+    # configured through configure_logging (an embedding/test), so the existing payload is unchanged.
+    log_sinks: list[LogSinkInfo] = []
     # No-network version-update signal (#30, ADR 0026). Additive + ``None`` when [update_check] is
     # disabled or the runner hasn't produced a result yet, so the existing payload is unchanged when off.
     update: UpdateInfo | None = None

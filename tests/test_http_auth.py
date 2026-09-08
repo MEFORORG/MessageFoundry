@@ -52,8 +52,8 @@ class _FakeTokenResp:
     def __init__(self, body: bytes) -> None:
         self._body = body
 
-    def read(self) -> bytes:
-        return self._body
+    def read(self, amt: int = -1) -> bytes:
+        return self._body if amt < 0 else (self._body)[:amt]
 
     def __enter__(self) -> _FakeTokenResp:
         return self
@@ -272,8 +272,8 @@ def test_rest_oauth2_bearer_on_the_wire() -> None:
         headers: dict[str, str] = {}
         status = 200
 
-        def read(self) -> bytes:
-            return b"ok"
+        def read(self, amt: int = -1) -> bytes:
+            return b"ok" if amt < 0 else (b"ok")[:amt]
 
         def __enter__(self) -> _Resp:
             return self

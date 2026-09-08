@@ -6,6 +6,7 @@ serve-time wiring + bind-guard (a non-loopback API bind is allowed once TLS is c
 from __future__ import annotations
 
 import datetime
+import json
 import ssl
 from collections.abc import Awaitable, Callable
 from pathlib import Path
@@ -18,6 +19,7 @@ from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.x509.oid import ExtendedKeyUsageOID, NameOID
+from fastapi import HTTPException
 from pydantic import ValidationError
 from starlette.requests import Request
 
@@ -607,6 +609,44 @@ def test_serve_posture_b_synthetic_is_quiet(
     assert "proxy_intra_service_auth" not in capsys.readouterr().err
 
 
+# --- BACKLOG #1181 (ASVS 12.3.5): the one attestation the engine can check against its own config --
+# "mtls" says the proxy presents a client certificate. The engine verifies one only with
+# [api].tls_client_ca_file set, so with no client CA its configuration contradicts the declaration.
+# It WARNS and never refuses -- a sidecar can terminate the proxy's mTLS in front of the engine, which
+# is a true "mtls" hop the engine sees as plaintext. What the handshake actually does with a client CA
+# is measured on a real socket in tests/test_proxy_intra_service_auth.py.
+
+
+def test_serve_warns_when_mtls_is_declared_but_the_engine_verifies_no_client_cert(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _posture_b_toml(tmp_path, intra="mtls", floor="1.2")
+    assert _run_posture_b(tmp_path, monkeypatch, env="prod") == 0  # a warning, never a refusal
+    err = capsys.readouterr().err
+    assert "verifies no client certificate" in err
+    assert "tls_client_ca_file" in err
+    assert "refusing to serve" not in err
+
+
+def test_serve_says_nothing_about_client_certs_when_the_declaration_is_not_mtls(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The discriminating arm. "network" names a control outside the process, so there is nothing here
+    to contradict it — a warning on every declared value would be noise rather than a check."""
+    _posture_b_toml(tmp_path, intra="network", floor="1.2")
+    assert _run_posture_b(tmp_path, monkeypatch, env="prod") == 0
+    assert "verifies no client certificate" not in capsys.readouterr().err
+
+
+def test_serve_mtls_coherence_warning_is_quiet_on_a_synthetic_instance(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Byte-identical on a synthetic box, exactly like the two attestation arms above."""
+    _posture_b_toml(tmp_path, intra="mtls", floor="1.2", synthetic=True)
+    assert _run_posture_b(tmp_path, monkeypatch, env="dev", key=False) == 0
+    assert "verifies no client certificate" not in capsys.readouterr().err
+
+
 def test_serve_loopback_emits_no_new_stderr(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -1076,6 +1116,12 @@ def _wrap_with_cert(
     return wrapped
 
 
+#: The 'svc' account's passphrase. Named rather than inlined so the bearer-plane POSITIVE CONTROL in
+#: ``test_service_cert_authz_denial_is_audited`` signs in with the SAME credential this creates — a
+#: second copy that drifted would fail the login, and the control would report a tidy, wrong zero.
+_SVC_PW = "Correct-horse-battery-9"
+
+
 async def _svc_app(tmp_path: Path, db: str, *roles: Role) -> tuple[Any, Any]:
     """An engine + create_app wired with a cert-identity map for username 'svc' (given ``roles``)."""
     engine = await Engine.create(tmp_path / db, poll_interval=0.02)
@@ -1083,13 +1129,22 @@ async def _svc_app(tmp_path: Path, db: str, *roles: Role) -> tuple[Any, Any]:
     await service.initialize()
     uid = await service.create_local_user(
         username="svc",
-        password="Correct-horse-battery-9",
+        password=_SVC_PW,
         display_name=None,
         email=None,
         roles=[r.value for r in roles],
         actor="test",
     )
     assert uid
+    # Clear the first-login must-change flag. The CERT plane never consults it (require_service_cert
+    # carries none of require()'s session concerns), so this is inert for the tests that only drive
+    # the cert gate — but require() refuses a must-change identity ABOVE its permission loop, which
+    # would make the bearer-plane POSITIVE CONTROL below record no denial row and report a false zero.
+    user = await service.store.get_user(uid)
+    assert user is not None and user.password_hash is not None
+    await service.store.set_password(
+        uid, password_hash=user.password_hash, must_change_password=False
+    )
     app = create_app(engine, auth=service, tls_client_cert_identities={"CN:svc.internal": "svc"})
     return engine, app
 
@@ -1159,6 +1214,119 @@ async def test_service_cert_auth_emits_audit_event(tmp_path: Path) -> None:
         async with httpx.AsyncClient(transport=t_spoof, base_url="http://t") as c:
             assert (await c.get("/service/identity")).status_code == 401
         assert len(await engine.store.list_audit(action="service_cert_auth")) == 1
+    finally:
+        await engine.stop()
+
+
+# --- BACKLOG #1197 (ASVS 16.3.2): the cert plane's AUTHORIZATION decisions ------------------------
+# The row above covers AUTHENTICATION, and it is written by the ROUTE BODY of `GET /service/identity`
+# rather than by the gate — so it says nothing about the authorization decision, and a future route
+# built on the same factory inherits none of it. These two pin the gate's own behaviour.
+
+
+def _shim_cert_request(app: object, cn: str = "svc.internal") -> Request:
+    """A request carrying a verified, mapped client cert — the shape the connection-made SHIM leaves.
+
+    Named apart from :func:`_cert_request` above on purpose: that one stashes the cert on
+    ``scope['transport']`` (the TLS-extension-capable server arm) and this one on ``scope['state']``
+    (the shipped shim arm). They are different code paths in :func:`peer_cert_from_request`, and a
+    module-level redefinition would silently rebind every earlier caller to the wrong one.
+
+    Driven through the FACTORY rather than through ``GET /service/identity`` because every built-in
+    role holds ``monitoring:read``, so the only wired route cannot produce a denial at all; and because
+    the property under test belongs to the gate that any future service route would also use. The
+    query string is deliberately non-empty: the audit row must carry the PATH and never the full URL.
+    """
+    return Request(
+        {
+            "type": "http",
+            "method": "GET",
+            "path": "/service/probe",
+            "query_string": b"q=a-clinician-search-term",
+            "headers": [],
+            "app": app,
+            "scheme": "http",
+            "server": ("t", 80),
+            "state": {MF_CLIENT_PEERCERT_STATE_KEY: _peercert(cn)},
+        }
+    )
+
+
+async def test_service_cert_authz_denial_is_audited(tmp_path: Path) -> None:
+    """A refused cert-identity authorization reaches the tamper-evident chain, not only the log.
+
+    RED when the ``audit_permission_denied`` call is removed from ``require_service_cert``. Measured at
+    HEAD before it existed: the denial emitted a ``log.warning`` and ZERO audit rows. The positive
+    control is re-run here rather than quoted — ``require``'s bearer-plane denial writes its row for
+    the same principal, on the same store, through the same counter — because a zero is otherwise a
+    fact about the instrument rather than about the gate.
+
+    The exact-equality assertion on ``detail`` is the second half and is deliberate: widening it to the
+    full URL would put the query string, where an operator's search terms live, into the chain.
+    """
+    from messagefoundry.api.security import require
+
+    engine, app = await _svc_app(tmp_path, "svc_authz_denial.db", Role.VIEWER)
+    try:
+        # VIEWER holds monitoring:read but not users:manage, so the permission loop is what refuses.
+        with pytest.raises(HTTPException) as excinfo:
+            await require_service_cert(Permission.USERS_MANAGE)(_shim_cert_request(app))
+        assert excinfo.value.status_code == 403
+
+        rows = await engine.store.list_audit(action="auth.permission_denied")
+        assert len(rows) == 1, "the refused cert-identity left no denial row"
+        assert rows[0]["actor"] == "svc"
+        assert json.loads(str(rows[0]["detail"])) == {
+            "permission": "users:manage",
+            "path": "/service/probe",
+        }
+
+        # POSITIVE CONTROL, same store and same counter: the bearer plane's denial also lands, so the
+        # zero this test was written against could not have been an inert audit path on this app.
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://t"
+        ) as client:
+            token = (
+                await client.post("/auth/login", json={"username": "svc", "password": _SVC_PW})
+            ).json()["token"]
+        bearer = Request(
+            {
+                "type": "http",
+                "method": "GET",
+                "path": "/probe-bearer",
+                "query_string": b"",
+                "app": app,
+                "scheme": "http",
+                "server": ("t", 80),
+                "headers": [(b"authorization", f"Bearer {token}".encode())],
+            }
+        )
+        with pytest.raises(HTTPException):
+            await require(Permission.USERS_MANAGE)(bearer)
+        assert len(await engine.store.list_audit(action="auth.permission_denied")) == 2
+    finally:
+        await engine.stop()
+
+
+async def test_service_cert_grant_writes_no_authorization_row(tmp_path: Path) -> None:
+    """The cert plane's GRANT side stays out of the chain, and that is a scope decision, not a bug.
+
+    BACKLOG #1197 measured that a grant row is per-request while the audit chain has no drain
+    (``[retention].audit_days`` is reserved and unenforced, ``[retention].max_db_mb`` ships at 0), so
+    grant parity waits on the drain. This is the guard that a later mirror cannot arrive unnoticed.
+
+    It also pins the measured fact that ``[diagnostics].audit_all_authz`` does not reach this gate:
+    the switch is asserted True on this app and the grant still writes nothing. Reading that as an
+    access-control hole would be wrong — the DENIAL row above is unconditional.
+    """
+    engine, app = await _svc_app(tmp_path, "svc_authz_grant.db", Role.VIEWER)
+    try:
+        assert app.state.audit_all_authz is True  # the shipped default (BACKLOG #1277)
+        identity = await require_service_cert(Permission.MONITORING_READ)(_shim_cert_request(app))
+        assert identity.username == "svc"
+        actions = {row["action"] for row in await engine.store.list_audit()}
+        assert "auth.permission_granted" not in actions
+        assert "auth.permission_denied" not in actions
     finally:
         await engine.stop()
 
@@ -1409,6 +1577,90 @@ def test_real_mutual_tls_handshake_on_built_context(tmp_path: Path) -> None:
     # Negative: no client cert → the server (CERT_REQUIRED) refuses the handshake.
     with pytest.raises(OSError):
         _handshake(server_ctx, _verifying_client_ctx(ca), client_cert=None)
+
+
+# --- BACKLOG #1181 (ASVS 12.3.5): the three arms the mutual-TLS test above leaves open -------------
+#
+# That test covers trusted-cert-completes and no-cert-refused. The cell's severity turns on a claim
+# those two arms cannot settle: that the proxy→engine hop is CLOSABLE TODAY by setting
+# `[api].tls_client_ca_file`. Three things were missing. (1) An unconfigured issuer: presenting SOME
+# certificate must not be enough. (2) The causation control -- without it a refusal is consistent with
+# a harness that refuses everything, so the same harness must ADMIT the uncertificated peer once the
+# client CA is dropped. (3) Reachability in the topology the setting is actually about (Posture B).
+
+
+def test_a_client_certificate_the_configured_ca_did_not_sign_is_refused(tmp_path: Path) -> None:
+    ca, cert, key = _strict_ca_and_leaf(tmp_path)
+    stranger_cert, stranger_key = _self_signed(tmp_path)  # a different issuer entirely
+    server_ctx = build_api_ssl_context(
+        ApiSettings(tls_cert_file=str(cert), tls_key_file=str(key), tls_client_ca_file=str(ca))
+    )
+    with pytest.raises(OSError):
+        _handshake(server_ctx, _verifying_client_ctx(ca), client_cert=(stranger_cert, stranger_key))
+
+
+def test_dropping_the_client_ca_admits_the_same_uncertificated_peer(tmp_path: Path) -> None:
+    """The causation control for the refusal above: the client CA is what refuses, not the harness.
+
+    Without this arm, "no client cert is refused" is equally consistent with a bad port, an unreadable
+    anchor or a broken server key -- every one of which also refuses, and every one of which would
+    read as "mTLS works".
+    """
+    ca, cert, key = _strict_ca_and_leaf(tmp_path)
+    no_client_ca = build_api_ssl_context(
+        ApiSettings(tls_cert_file=str(cert), tls_key_file=str(key))
+    )
+    assert no_client_ca.verify_mode == ssl.CERT_NONE
+    assert _handshake(no_client_ca, _verifying_client_ctx(ca), client_cert=None)  # admitted
+
+
+def test_mtls_is_reachable_under_a_declared_upstream_terminator(tmp_path: Path) -> None:
+    """Posture B plus an operator certificate plus a client CA is a VALID, VERIFYING configuration.
+
+    `test_the_upstream_terminator_topology_keeps_the_host_prefix_without_minting` pins the other half:
+    with no operator certificate, `ensure_api_tls_material` mints nothing, because serving https
+    underneath a proxy that speaks plaintext would break the proxy's own hop. Read alone, that says the
+    mTLS `[api].proxy_intra_service_auth = "mtls"` names is unreachable exactly where it is declared.
+    It is not -- the operator-supplied branch sits ABOVE the no-mint one, so a site that wants the
+    engine itself to verify the proxy's certificate can have it. The handshake is not repeated here;
+    `test_real_mutual_tls_handshake_on_built_context` owns that arm.
+    """
+    ca, cert, key = _strict_ca_and_leaf(tmp_path)
+    api = ApiSettings(
+        tls_terminated_upstream=True,
+        trusted_proxies=["10.0.0.9"],
+        proxy_intra_service_auth="mtls",
+        proxy_tls_min_version="1.2",
+        tls_cert_file=str(cert),
+        tls_key_file=str(key),
+        tls_client_ca_file=str(ca),
+    )
+    assert ensure_api_tls_material(api, state_dir=tmp_path) == (str(cert), str(key))
+    assert build_api_ssl_context(api).verify_mode == ssl.CERT_REQUIRED
+
+
+def test_no_value_of_the_declaration_changes_the_listener(tmp_path: Path) -> None:
+    """THE SUCCESSOR ABSENCE CLAIM for ASVS 12.3.5, pinned in code.
+
+    The cell's original claim was "nothing branches on WHICH value is set". A startup diagnostic now
+    does (see the Posture-B coherence warning above), so that claim would start matching for a reason
+    that is not a control. The claim that survives, and that actually decides the verdict, is: **no
+    value of `proxy_intra_service_auth` changes what the listener accepts.**
+    """
+    cert, key = _self_signed(tmp_path)
+    verify_modes = {
+        build_api_ssl_context(
+            ApiSettings(
+                tls_cert_file=str(cert), tls_key_file=str(key), proxy_intra_service_auth=mode
+            )
+        ).verify_mode
+        for mode in ("none", "mtls", "network", "shared_secret")
+    }
+    assert verify_modes == {ssl.CERT_NONE}, (
+        "a value of proxy_intra_service_auth changed the listener's peer verification — the setting "
+        "is documented as an attestation, so this is either a new control that needs documenting or "
+        "an accident"
+    )
 
 
 # NOTE (residual, honest scope): a full uvicorn-on-a-real-socket mTLS handshake through the serve path

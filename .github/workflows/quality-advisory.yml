@@ -26,13 +26,15 @@ name: quality-advisory
 #                                                         PRs too; survivor table in the step summary.
 # signal 10 (lint breadth) is a coordinated one-shot sweep, not an advisory job; DORA is a context caveat, not a gate.
 #
-# ONE JOB HERE IS NOT A RUBRIC SIGNAL, AND IT IS HERE ON PURPOSE (BACKLOG #1431). `dangling-citations`
-# reports backlog `#N` references that name no filed item in either ledger. It is a LEDGER-hygiene check,
-# not a code-quality measurement, and its natural sibling -- backlog-hygiene.yml -- is the wrong home:
-# that workflow's only job IS a required context, so a step added there could block every merge. This
-# file is the repository's one place where a check can report without being able to gate, which is the
-# property that job needs. Promoting it to blocking is an owner decision and is deliberately untaken;
-# see the item for the reasoning and for what the nine current findings actually are.
+# TWO JOBS HERE ARE NOT RUBRIC SIGNALS, AND BOTH ARE HERE ON PURPOSE. `dangling-citations` (BACKLOG
+# #1431) reports backlog `#N` references that name no filed item in either ledger; `verdict-divergence`
+# (BACKLOG #1342) reports an open item whose banner `Verdict` contradicts a re-score line in its own
+# body. Both are LEDGER-hygiene checks, not code-quality measurements, and their natural sibling --
+# backlog-hygiene.yml -- is the wrong home: that workflow's only job IS a required context, so a step
+# added there could block every merge. This file is the repository's one place where a check can report
+# without being able to gate, which is the property both jobs need. Promoting either to blocking is an
+# owner decision and is deliberately untaken; see each item for the reasoning and for what its current
+# findings actually are.
 #
 # WHY THIS USES WORKFLOW-COMMAND ANNOTATIONS AND *NOT* CODE SCANNING / SARIF. This was measured, not
 # assumed, and the measurements are recorded here so a future session does not "helpfully" add a SARIF
@@ -836,6 +838,83 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
           if [ "$TOOL_STATUS" -ne 0 ]; then
             echo "::warning title=Dangling-citation scan did not complete::the checker exited ${TOOL_STATUS} in advisory mode, which means a malfunction rather than a finding. See the job log."
+          fi
+          # Re-raise the checker's status. `continue-on-error` above keeps the JOB green; this keeps a
+          # broken scan distinguishable from a clean one.
+          exit "$TOOL_STATUS"
+
+  verdict-divergence:
+    # BACKLOG #1342 -- the second working detector in this repository that ran nowhere, and it lands
+    # here for the same reason the citation job above does rather than by copying it.
+    #
+    # `scripts/docs/verdict_divergence_check.py` reports an OPEN backlog item whose banner
+    # `Verdict:` field contradicts a `Re-scored ... -> X` line in its own body. Every tool reads the
+    # BANNER -- parse_items exposes it, the dispatch gate consults it, dispatch screens filter on it
+    # -- so a contradicted row dispatches as freely workable while its own prose says it must not be.
+    #
+    # WHY IT REPORTS AND CANNOT GATE, which is a decision and not an omission. Wiring it blocking
+    # would red the tree on three rows the item DELIBERATELY refuses to reconcile: which source wins
+    # when banner and prose disagree is an assessor call, not a mechanical one. A gate that fails on
+    # a question nobody has answered is not a gate, it is a merge freeze. Making a check RUN is a
+    # Builder's call; making one BLOCK is the owner's. Promotion stays available and untaken.
+    #
+    # The same four things keep it advisory, and tests/test_verdict_divergence_advisory.py pins the
+    # three a repository test can see: this workflow holds no required context; `--advisory` turns a
+    # finding into exit 0; `continue-on-error: true` means even the checker's REFUSAL cannot fail the
+    # job; and the job is absent from `liveness`'s `needs`.
+    #
+    # THE EXIT CODE IS RE-RAISED, NOT SWALLOWED WITH `|| true`. Under `--advisory` the only non-zero
+    # exit left is 2 -- the checker's refusal to report on an empty population, which is what a dead
+    # `parse_items` or the wrong file looks like. A clean scan and a scan that read nothing must not
+    # render alike, so that stays visible as a red STEP inside a green job.
+    #
+    # NO PATHS FILTER ON THIS WORKFLOW, which is what makes the job worth having: a divergence is
+    # introduced by editing docs/BACKLOG.md, and the pytest tier holding this tool's unit test is
+    # skipped on a documentation-only pull request. This job runs on all of them.
+    #
+    # A SEPARATE JOB, NOT A SECOND STEP IN `dangling-citations`, AND THE COST IS REAL: the two are
+    # trigger-identical, so this pays for one extra runner and one extra checkout per pull request to
+    # run a stdlib-only script for a couple of seconds. Bought deliberately. A job's `name:` IS the
+    # status context, so a separate job is a separate line in the checks list; folded in as a step,
+    # this check appears nowhere until a reader opens a job named after a DIFFERENT check. For a
+    # check whose entire product is visibility, hiding it behind another check's label is the wrong
+    # trade -- and renaming the sibling job to cover both would change a context that a shipped guard
+    # already pins. Revisit if a third ledger check lands and the boilerplate is worth a shared
+    # runner script.
+    name: banner-vs-prose verdict divergence (advisory)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Check out the source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Report items whose banner contradicts their own re-score (advisory - never gates)
+        continue-on-error: true
+        run: |
+          echo "== open items whose banner Verdict contradicts a Re-scored -> line in their body =="
+          echo "== advisory: this reports, it never gates a merge =="
+          TOOL_STATUS=0
+          python3 scripts/docs/verdict_divergence_check.py --advisory \
+            > verdict-divergence.txt 2>&1 || TOOL_STATUS=$?
+          cat verdict-divergence.txt
+          {
+            echo "## Banner-vs-prose verdict divergence"
+            echo ""
+            echo "Advisory only. A reported row is a DISAGREEMENT, not a defect in either source:"
+            echo "which of the two wins is an assessor decision, and BACKLOG item 1342 leaves it"
+            echo "open on purpose. The denominator is printed beside the count -- a clean run that"
+            echo "compared three items must not read like one that compared them all."
+            echo ""
+            echo '```'
+            # $GITHUB_STEP_SUMMARY is capped at 1 MiB per step and an oversized write is DROPPED
+            # ENTIRELY, so truncate rather than silently lose the whole summary.
+            head -c 200000 verdict-divergence.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [ "$TOOL_STATUS" -ne 0 ]; then
+            echo "::warning title=Verdict-divergence scan did not complete::the checker exited ${TOOL_STATUS} in advisory mode, which means it measured nothing rather than that it found something. See the job log."
           fi
           # Re-raise the checker's status. `continue-on-error` above keeps the JOB green; this keeps a
           # broken scan distinguishable from a clean one.
