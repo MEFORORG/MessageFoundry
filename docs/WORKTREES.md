@@ -18,7 +18,18 @@ scripts\worktree\new.ps1 -Name alerts
 
 This first runs `git fetch origin`, then creates a **sibling** directory `..\MessageFoundry-alerts` on
 a new branch `alerts` (off `origin/main`, the freshly fetched remote tip — so a stale local `main`
-can't seed it), then bootstraps `..\MessageFoundry-alerts\.venv` with `pip install -e ".[dev,harness]"`.
+can't seed it), then bootstraps `..\MessageFoundry-alerts\.venv` with
+
+```
+pip install --constraint constraints.lock -e ".[dev,harness,fhir,dicom,x12,xml,webauthn]" -e packaging/messagefoundry-webconsole
+```
+
+**That is CI's install line, and a test holds it there.** `ci.yml`'s test leg installs the same extras
+and the same web console package, and `tests/test_worktree_venv_extras_parity.py` compares the two and
+goes red when they drift. Nobody has to remember. The reason it needs a test is that a lane short of an
+extra fails quietly: the suites gated on that extra skip at **module** scope, so the lane collects fewer
+tests, prints a couple of skip lines, and still reads green (BACKLOG #1335).
+
 Options:
 
 - `-Branch <ref>` — the git branch to reuse or create, when it should differ from `-Name`. `-Name` is

@@ -18,6 +18,7 @@ THE MAPPING IS NOT OBVIOUS, which is why it lives in one place:
 
 from __future__ import annotations
 
+import functools
 import re
 from pathlib import Path
 from typing import Any
@@ -82,17 +83,35 @@ def _context_pattern(declared: str) -> re.Pattern[str]:
     return re.compile(f"^{body}$")
 
 
-def reportable_contexts() -> dict[str, tuple[str, str]]:
-    """Every context a workflow here CAN report -> (workflow file, job key).
+@functools.cache
+def _reportable_contexts() -> dict[str, tuple[str, str]]:
+    """The uncached scan, memoised. See :func:`reportable_contexts` for the contract.
 
-    Keys are the declared (possibly templated) strings; use :func:`resolve` to match a concrete
-    context against them.
+    WHY THIS IS CACHED AND WHY THAT IS SAFE. One call globs and parses EVERY workflow here -- 28
+    files, one of them 213 KB. `resolve()` calls it once per context, and its callers resolve a whole
+    required set in a loop, so the same trees were parsed dozens of times per test module. Measured:
+    caching cut one module from 10.5s to 1.4s.
+
+    Nothing writes into the real `.github/workflows` during a run -- the suites that build workflow
+    files build them under a tmp_path repo -- so a per-process cache cannot serve a stale answer.
     """
     found: dict[str, tuple[str, str]] = {}
     for wf_path in sorted(WORKFLOWS.glob("*.yml")):
         for job_key, job in jobs_of(wf_path.name).items():
             found[context_of(job_key, job)] = (wf_path.name, job_key)
     return found
+
+
+def reportable_contexts() -> dict[str, tuple[str, str]]:
+    """Every context a workflow here CAN report -> (workflow file, job key).
+
+    Keys are the declared (possibly templated) strings; use :func:`resolve` to match a concrete
+    context against them.
+
+    Returns a FRESH dict each call, over the cached scan. A cached mutable return would let one
+    caller's edit reach every later caller, and the copy costs nothing beside the parse it skips.
+    """
+    return dict(_reportable_contexts())
 
 
 def resolve(context: str) -> tuple[str, str] | None:
