@@ -25803,6 +25803,35 @@ A sixth line was stale in a different direction: the section told the reader to 
 
 ---
 
+## 1488. test_connscale_smoke.py's probes assert a measurement was taken, so a contended runner fails them and evicts whatever is in the merge queue
+
+> 🔢 **Filed 2026-09-08 -- not started.** Two probes in `tests/test_connscale_smoke.py` fail on a loaded runner and take the merge-queue entry down with them. Measured 2026-09-08: **9 of 10 sampled failed `merge_group` CI runs** failed on this one file, out of **25 failed merge-group builds that day**. It evicted PR 879 three times and PRs 933, 955 and 833 once each.
+>
+> **Scored 2026-09-08 -> P2.** Value **7/10** · Difficulty **3/10** · _quick win_. Value 7 -- it is the largest single consumer of merge-queue capacity measured so far, and every eviction also forces the entries behind it to rebuild. Difficulty 3 -- the change is confined to two test bodies and needs no product change.
+
+### What fails
+
+    FAILED tests/test_connscale_smoke.py::test_the_fd_probe_measured_or_named_why_it_could_not
+    FAILED tests/test_connscale_smoke.py::test_the_reload_probe_measured_at_least_one_step
+
+    Error: WALL #4 NEVER COMPARED -- no (sweep_mode, claim_mode) group
+
+Counts were 1, 1 and 2 failures against roughly 12,300 passes, and **a different assertion failed on each OS leg of the same run** -- the signature of a timing- or load-sensitive test rather than a consistent defect. The same file passes on the same commit when the runners are quiet.
+
+### Why it is a test defect and not a product defect
+
+The first probe's own name says `measured_or_named_why_it_could_not`. That is the correct contract: take the measurement, or record why it was unavailable. The body does not honour it -- it asserts the measurement exists, so a runner too busy to produce a sample fails the assertion instead of recording the reason. The second probe asserts `at_least_one_step` of a reload sweep completed, which has the same shape.
+
+**A machine too slow to produce a sample is a finding to record, not an error to raise.** `ingress-rate-probe.yml` already states that principle for its own measurement; these two probes predate it.
+
+### The fix
+
+Make each probe record an unavailable measurement and pass, exactly as its name promises, and keep the assertion only for a measurement that was actually taken and is out of range. That preserves the regression coverage -- a real scaling regression still produces a bad sample, which still fails -- while removing the failure mode where no sample is produced at all.
+
+### Not taken here
+
+Quarantining the two probes was considered and refused by the owner on 2026-09-08. Skipping them would stop the evictions immediately but would remove a connection-scaling guard, and a real regression in that area would then land unnoticed. The slower fix keeps the coverage.
+
 ## 1448. a dispatched brief is frozen at spawn: the chip cannot be corrected and nothing tells the receiver it has drifted
 
 > 🔢 **FILED 2026-09-04 by the session that read the stale brief.** Not started. A **fleet-process** defect with no engine, PHI or deployment axis (sec. 0) -- nothing here reaches a running instance, because there are none. What it would cost is duplicated Builder turns and a prose merge conflict a human then resolves by hand.
