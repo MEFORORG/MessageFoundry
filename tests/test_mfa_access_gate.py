@@ -375,7 +375,7 @@ def test_the_per_user_rule_reads_no_provider_at_all(engine: Engine) -> None:
 
 
 def test_the_kerberos_leg_mints_at_the_minimum() -> None:
-    """RED when: ``authenticate_kerberos`` goes back to passing ``mfa_verified=True``.
+    """RED when: ``_authenticate_kerberos`` goes back to passing ``mfa_verified=True``.
 
     A Kerberos service ticket carries no factor-strength assertion ``pyspnego`` surfaces, so the leg
     must grant nothing. The source read lives in ``tests/_mfa_grant.py``, shared with the doc-drift
@@ -383,7 +383,7 @@ def test_the_kerberos_leg_mints_at_the_minimum() -> None:
     behavioural test is
     ``test_a_directory_session_minted_at_the_minimum_is_confined_until_it_enrolls``.
     """
-    grants = mfa_grant_values(AuthService.authenticate_kerberos)
+    grants = mfa_grant_values(AuthService._authenticate_kerberos)
     assert grants, "the Kerberos leg passes no mfa_verified at all — the seam moved"
     assert all(isinstance(v, ast.Constant) and v.value is False for v in grants), (
         "the Kerberos leg mints MFA-satisfied again; docs/SECURITY.md's Kerberos rows say it does "

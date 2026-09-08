@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import abc
 import asyncio
+import ssl
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
 from enum import Enum
@@ -641,14 +642,50 @@ def build_destination(config: Destination) -> DestinationConnector:
     return builder(config)
 
 
-async def probe_tcp_reachable(host: str, port: int, timeout: float, label: str) -> None:
-    """Open a TCP connection to ``host:port`` and immediately close it — a no-data reachability probe
+async def probe_tcp_reachable(
+    host: str,
+    port: int,
+    timeout: float,
+    label: str,
+    *,
+    ssl_context: ssl.SSLContext | None = None,
+    server_hostname: str | None = None,
+) -> None:
+    """Open a connection to ``host:port`` and immediately close it — a no-data reachability probe
     shared by the socket destinations (MLLP/TCP/X12) for ``test_connection``. Raises
-    :class:`DeliveryError` if the connect fails or times out."""
+    :class:`DeliveryError` if the connect, the TLS handshake, or either one's timeout fails.
+
+    ``ssl_context`` makes the probe cross **the hop the connector itself would cross** (BACKLOG
+    #1178, ASVS 12.3.1). Two things go wrong when it is omitted for a ``tls=true`` destination.
+    The probe puts an unencrypted hop to the partner on the wire, which the cell counts however
+    few bytes ride it — "it sends zero bytes so nothing is disclosed" is about disclosure, and the
+    verb ranges over the protocol. And a connection test that never handshakes cannot see a bad
+    cert, an untrusted CA, an expired chain or a hostname mismatch, so it reports the partner
+    reachable and the first real delivery finds the break instead.
+
+    ``None`` (the default) keeps the plaintext probe. That is the honest posture for a connector
+    with no TLS to speak — raw TCP and X12 have no ``tls`` parameter at all — where the plaintext
+    socket *is* the hop, gated separately by :class:`InsecureHopGuard` at construction.
+
+    It stays a **no-data** probe either way: under TLS the handshake is all that crosses and no
+    application byte is ever sent. There is deliberately no plaintext retry when the handshake
+    fails — that downgrade is the fall-back ASVS 12.3.1 forbids, and the failure is the finding.
+    ``server_hostname`` defaults to ``host``, matching the send path's SNI and hostname-check
+    subject."""
+    # asyncio rejects server_hostname on a plaintext connection, so it is threaded only alongside
+    # a context.
+    hostname = (server_hostname or host) if ssl_context is not None else None
     try:
-        _reader, writer = await asyncio.wait_for(asyncio.open_connection(host, port), timeout)
+        _reader, writer = await asyncio.wait_for(
+            asyncio.open_connection(host, port, ssl=ssl_context, server_hostname=hostname),
+            timeout,
+        )
     except (TimeoutError, OSError) as exc:
-        raise DeliveryError(f"{label} connect to {host}:{port} failed: {exc}") from exc
+        # ssl.SSLError subclasses OSError, so the handshake arm is already caught here; name it
+        # separately because "connect failed" reads as an unreachable partner and sends the
+        # operator to the firewall for what is a certificate problem.
+        stage = "TLS handshake" if isinstance(exc, ssl.SSLError) else "connect"
+        raise DeliveryError(f"{label} {stage} to {host}:{port} failed: {exc}") from exc
     writer.close()
     try:  # noqa: SIM105
         await writer.wait_closed()
