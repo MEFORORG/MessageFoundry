@@ -1794,7 +1794,15 @@ def _serve(args: argparse.Namespace) -> int:
     # preflight's own log line + audit row once the lifespan opens the store, and completely by
     # GET /security/posture. None here is "not yet observed", never "observed and clean".
     _loosenings = security_loosenings(
-        settings.security, settings.store, settings.auth, settings.alerts, (), (), (), None
+        settings.security,
+        settings.store,
+        settings.auth,
+        settings.alerts,
+        settings.secret_rotation,
+        (),
+        (),
+        (),
+        None,
     )
     if _loosenings:
         _seclog = logging.getLogger(__name__)
@@ -5472,6 +5480,7 @@ def _security(args: argparse.Namespace) -> int:
     from messagefoundry.config.settings import (
         AlertsSettings,
         AuthSettings,
+        SecretRotationSettings,
         SecuritySettings,
         StoreSettings,
         load_settings,
@@ -5487,6 +5496,9 @@ def _security(args: argparse.Namespace) -> int:
     # reporting a subset as if it were everything.
     _loosenings_partial = False
     _store, _auth, _alerts = StoreSettings(), AuthSettings(), AlertsSettings()
+    # BACKLOG #1004: [secret_rotation].enforce_store_key_expiry is a posture deviation too, so it is
+    # resolved from the same whole-file read and degrades with the same `loosenings_partial` marker.
+    _rotation = SecretRotationSettings()
     if Path(path).exists():
         # An ABSENT file is not a degraded read — the shipped defaults ARE the effective posture there,
         # and `security show` is expected to work offline before any config exists. Only a file that
@@ -5494,6 +5506,7 @@ def _security(args: argparse.Namespace) -> int:
         try:
             _full = load_settings(config_path=path)
             _store, _auth, _alerts = _full.store, _full.auth, _full.alerts
+            _rotation = _full.secret_rotation
         except (ValidationError, tomllib.TOMLDecodeError, OSError, ValueError):
             # The specific ways a settings file fails to resolve: a schema/cross-field violation,
             # malformed TOML, an unreadable path, and the plain ValueErrors load_settings raises for a
@@ -5509,7 +5522,9 @@ def _security(args: argparse.Namespace) -> int:
         # posture. `messagefoundry check` and GET /security/posture are the complete surfaces.
         return [
             {"switch": s, "risk": r}
-            for s, r in security_loosenings(sec, _store, _auth, _alerts, (), (), (), None)
+            for s, r in security_loosenings(
+                sec, _store, _auth, _alerts, _rotation, (), (), (), None
+            )
         ]
 
     #: Emitted alongside every loosening list this subcommand prints, so a reader can never mistake a

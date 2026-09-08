@@ -28,6 +28,7 @@ from messagefoundry.api import create_app
 from messagefoundry.config.settings import (
     AlertsSettings,
     AuthSettings,
+    SecretRotationSettings,
     SecuritySettings,
     ServiceSettings,
     StoreSettings,
@@ -55,6 +56,7 @@ def _names(
     store: StoreSettings | None = None,
     auth: AuthSettings | None = None,
     alerts: AlertsSettings | None = None,
+    rotation: SecretRotationSettings | None = None,
     cleartext_hops: tuple[str, ...] = (),
     expiry_hops: tuple[str, ...] = (),
     db_hops: tuple[str, ...] = (),
@@ -67,6 +69,7 @@ def _names(
             store or StoreSettings(),
             auth or AuthSettings(),
             alerts or AlertsSettings(),
+            rotation or SecretRotationSettings(),
             cleartext_hops,
             expiry_hops,
             db_hops,
@@ -101,6 +104,7 @@ def test_aad_bind_off_is_a_named_loosening() -> None:
             StoreSettings(aad_bind=False),
             AuthSettings(),
             AlertsSettings(),
+            SecretRotationSettings(),
             (),
             (),
             (),
@@ -124,6 +128,7 @@ def test_aad_bind_loosening_names_its_no_op_caveat() -> None:
             StoreSettings(aad_bind=False),
             AuthSettings(),
             AlertsSettings(),
+            SecretRotationSettings(),
             (),
             (),
             (),
@@ -140,7 +145,15 @@ def test_recheck_zero_with_ad_enabled_is_a_named_loosening() -> None:
     auth = _ad(ad_session_recheck_seconds=0)
     named = dict(
         security_loosenings(
-            SecuritySettings(), StoreSettings(), auth, AlertsSettings(), (), (), (), None
+            SecuritySettings(),
+            StoreSettings(),
+            auth,
+            AlertsSettings(),
+            SecretRotationSettings(),
+            (),
+            (),
+            (),
+            None,
         )
     )
     assert "ad_session_recheck_seconds" in named
@@ -429,6 +442,7 @@ def test_cleartext_accepted_is_a_named_loosening() -> None:
             StoreSettings(),
             AuthSettings(),
             AlertsSettings(),
+            SecretRotationSettings(),
             ("OB_LEGACY", "OB_LAB"),
             (),
             (),
@@ -463,6 +477,7 @@ def test_expiry_relaxation_is_a_named_loosening() -> None:
             StoreSettings(),
             AuthSettings(),
             AlertsSettings(),
+            SecretRotationSettings(),
             (),
             ("OB_PARTNER_ADT", "OB_LAB_ORU"),
             (),
@@ -489,6 +504,7 @@ def test_generic_odbc_unenforced_tls_is_a_named_loosening() -> None:
             StoreSettings(),
             AuthSettings(),
             AlertsSettings(),
+            SecretRotationSettings(),
             (),
             (),
             ("OB_PG_RESULTS", "inbound:IB_PG_ORDERS"),

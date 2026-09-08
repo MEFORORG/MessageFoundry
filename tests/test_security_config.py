@@ -20,6 +20,7 @@ from messagefoundry.config.ai_policy import DataClass
 from messagefoundry.config.settings import (
     AlertsSettings,
     AuthSettings,
+    SecretRotationSettings,
     SecuritySettings,
     ServiceSettings,
     StoreSettings,
@@ -35,7 +36,15 @@ def _loosenings(sec: SecuritySettings) -> list[tuple[str, str]]:
     deviation the registry cannot see is a second posture by the back door). The tests below are about
     the ``[security]`` switches specifically, so the other three are pinned at shipped values here."""
     return security_loosenings(
-        sec, StoreSettings(), AuthSettings(), AlertsSettings(), (), (), (), None
+        sec,
+        StoreSettings(),
+        AuthSettings(),
+        AlertsSettings(),
+        SecretRotationSettings(),
+        (),
+        (),
+        (),
+        None,
     )
 
 

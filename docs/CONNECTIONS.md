@@ -1663,6 +1663,15 @@ assertion, exchanges it at the **token endpoint**, caches the bearer with expiry
 **per request** (re-minting on a `401`). No new dependency — the JWT is signed by the ADR 0018 core-
 `cryptography` signer. The minted bearer **overrides** any static `bearer_token` on the spec.
 
+**It is not only for SMART servers, and the name hides that.** What reaches the wire is a plain
+**RFC 7523 section 2.2 `private_key_jwt`** exchange — `grant_type=client_credentials` plus a signed
+assertion — with no FHIR or SMART field in it, so this composes over a bare `Rest(...)` against **any**
+authorization server that registers a public key for your client. Prefer it to
+`with_oauth2_client_credentials(...)` whenever your partner offers the choice: a shared `client_secret`
+is reusable at every endpoint it is registered with, while the assertion's `aud` is this connection's
+pinned token endpoint and the key never leaves the engine (BACKLOG #1158). Pass `algorithm="RS256"` for
+a generic partner — the `RS384` default below is SMART's own requirement, not this engine's.
+
 | `with_smart_backend(...)` arg | Default | Notes |
 |---|---|---|
 | `token_url` | — (required) | the authorization server's token endpoint (`https`; `env()`). **Also gated by `[egress].allowed_http`** — it is a second egress host. |
