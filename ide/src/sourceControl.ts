@@ -9,7 +9,7 @@ import * as path from "node:path";
 import * as vscode from "vscode";
 import { configDir, messageSetsDir, run, workspaceDir } from "./cli";
 import { findGit, getHooksPath, getRemoteUrl, git, isRepo } from "./git";
-import { nonce as scNonce } from "./cspNonce";
+import { WEBVIEW_GUARD_NOTE, guardScript, openChannel, postToWebview } from "./webviewMessaging";
 
 const GITIGNORE_MARKER = "# --- MessageFoundry ---";
 // Kept deliberately minimal; NOTE we do NOT ignore .vscode/ (so a team shares messagefoundry.*
@@ -384,7 +384,7 @@ export async function setRepoStorage(): Promise<void> {
     vscode.ViewColumn.Active,
     { enableScripts: true },
   );
-  panel.webview.html = renderRepoStorageHtml(current);
+  panel.webview.html = renderRepoStorageHtml(panel.webview, current);
   panel.webview.onDidReceiveMessage(
     async (m: { command?: string; mode?: string; url?: string }) => {
       if (m.command === "cancel") {
@@ -399,7 +399,7 @@ export async function setRepoStorage(): Promise<void> {
         if (hadRemote) {
           const res = await git(bin, ["remote", "remove", "origin"], ws);
           if (res.code !== 0) {
-            panel.webview.postMessage({ command: "error", text: `Could not remove remote — ${res.stderr.trim()}` });
+            postToWebview(panel.webview, { command: "error", text: `Could not remove remote — ${res.stderr.trim()}` });
             return;
           }
           void vscode.window.showInformationMessage(
@@ -414,14 +414,14 @@ export async function setRepoStorage(): Promise<void> {
       // Shared remote: set-url if one exists, else add. Never fetches/pushes — provider-agnostic.
       const url = (m.url ?? "").trim();
       if (!url) {
-        panel.webview.postMessage({ command: "error", text: "Enter a remote URL or path." });
+        postToWebview(panel.webview, { command: "error", text: "Enter a remote URL or path." });
         return;
       }
       const res = hadRemote
         ? await git(bin, ["remote", "set-url", "origin", url], ws)
         : await git(bin, ["remote", "add", "origin", url], ws);
       if (res.code !== 0) {
-        panel.webview.postMessage({ command: "error", text: `Could not set remote — ${res.stderr.trim()}` });
+        postToWebview(panel.webview, { command: "error", text: `Could not set remote — ${res.stderr.trim()}` });
         return;
       }
       void vscode.window.showInformationMessage(
@@ -440,8 +440,8 @@ function scEscape(v: string): string {
     .replace(/"/g, "&quot;");
 }
 
-function renderRepoStorageHtml(current: string): string {
-  const n = scNonce();
+function renderRepoStorageHtml(webview: vscode.Webview, current: string): string {
+  const { nonce: n, token } = openChannel(webview);
   const isRemote = current.length > 0;
   const currentLabel = isRemote
     ? `Shared remote — <code>${scEscape(current)}</code>`
@@ -494,7 +494,7 @@ function renderRepoStorageHtml(current: string): string {
     <button id="cancel" class="secondary">Cancel</button>
   </div>
   <script nonce="${n}">
-    const vscode = acquireVsCodeApi();
+    const vscode = acquireVsCodeApi();${guardScript(token)}
     const url = document.getElementById('url');
     const err = document.getElementById('err');
     function mode() { return document.querySelector('input[name=mode]:checked').value; }
@@ -509,9 +509,10 @@ function renderRepoStorageHtml(current: string): string {
     document.getElementById('cancel').addEventListener('click', function () {
       vscode.postMessage({ command: 'cancel' });
     });
-    // Origin is NOT checked here — see webviewMessaging.ts.
+    ${WEBVIEW_GUARD_NOTE}
     window.addEventListener('message', function (e) {
-      if (e.data && e.data.command === 'error') { err.textContent = e.data.text; }
+      const d = mfTrusted(e);
+      if (d && d.command === 'error') { err.textContent = d.text; }
     });
     sync();
   </script>

@@ -12,7 +12,7 @@
 // obvious"). A change takes effect on the next engine restart (the TOML is read at startup).
 import * as vscode from "vscode";
 import { runJson, serviceConfig, workspaceDir } from "./cli";
-import { nonce } from "./cspNonce";
+import { WEBVIEW_GUARD_NOTE, guardScript, openChannel, postToWebview } from "./webviewMessaging";
 
 type FieldType = "bool" | "int" | "string" | "tristate";
 
@@ -149,9 +149,9 @@ async function refresh(current: vscode.WebviewPanel): Promise<void> {
       ["security", "show", "--service-config", serviceConfig()],
       ws,
     );
-    current.webview.postMessage({ command: "state", state });
+    postToWebview(current.webview, { command: "state", state });
   } catch (e) {
-    current.webview.postMessage({ command: "error", message: String(e) });
+    postToWebview(current.webview, { command: "error", message: String(e) });
   }
 }
 
@@ -171,7 +171,7 @@ async function save(
       ws,
     );
   } catch (e) {
-    current.webview.postMessage({ command: "error", message: String(e) });
+    postToWebview(current.webview, { command: "error", message: String(e) });
     return;
   }
   await refresh(current);
@@ -185,7 +185,7 @@ function embed(value: unknown): string {
 }
 
 function formHtml(webview: vscode.Webview): string {
-  const n = nonce();
+  const { nonce: n, token } = openChannel(webview);
   return `<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -230,7 +230,7 @@ function formHtml(webview: vscode.Webview): string {
   </div>
 
   <script nonce="${n}">
-    const vscode = acquireVsCodeApi();
+    const vscode = acquireVsCodeApi();${guardScript(token)}
     const FIELDS = ${embed(FIELDS)};
     const $ = (id) => document.getElementById(id);
     const errorEl = $('error');
@@ -318,9 +318,10 @@ function formHtml(webview: vscode.Webview): string {
     $('save').addEventListener('click', () => vscode.postMessage({ command: 'save', updates: collectUpdates() }));
     $('close').addEventListener('click', () => vscode.postMessage({ command: 'cancel' }));
 
-    // Origin is NOT checked here — see webviewMessaging.ts.
+    ${WEBVIEW_GUARD_NOTE}
     window.addEventListener('message', (e) => {
-      const d = e.data || {};
+      const d = mfTrusted(e);
+      if (!d) { return; }
       if (d.command === 'state') { render(d.state || {}); }
       else if (d.command === 'error') { show(d.message); }
     });
