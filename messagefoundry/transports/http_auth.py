@@ -46,6 +46,7 @@ from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 from messagefoundry.config.models import ConnectorType
 from messagefoundry.config.tls_policy import InsecureHopRefused
 from messagefoundry.transports.base import DeliveryError
+from messagefoundry.transports.bounded_read import MAX_TOKEN_RESPONSE_BYTES, read_bounded_text
 from messagefoundry.transports.rest import (
     _NO_REDIRECT_OPENER,
     ProxyConfig,
@@ -274,7 +275,16 @@ class OAuth2ClientCredentialsProvider:
         req = self._token_request(data, headers)
         try:
             with self._opener.open(req, timeout=self.timeout_seconds) as resp:
-                body = resp.read().decode("utf-8", errors="replace")
+                # ASVS 15.2.2: bounded on the socket read, at the tighter token ceiling. A
+                # client_credentials response is a bearer, a TTL and a scope list; anything past
+                # 256 KiB is not a token response. Over-cap raises ResponseTooLargeError, already a
+                # DeliveryError, so it takes this connector's normal mint-failure path.
+                body = read_bounded_text(
+                    resp,
+                    limit=MAX_TOKEN_RESPONSE_BYTES,
+                    connector=f"OAuth2 token endpoint {_redact_url(self.token_url)}",
+                    encoding="utf-8",
+                )
         except urllib.error.HTTPError as exc:
             raise DeliveryError(
                 f"OAuth2 token endpoint {_redact_url(self.token_url)} returned HTTP {exc.code}"

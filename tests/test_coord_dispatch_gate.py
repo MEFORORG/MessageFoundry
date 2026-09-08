@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import importlib.util
 import re
+import subprocess
 import sys
 from pathlib import Path
 from types import ModuleType
@@ -924,3 +925,259 @@ def test_a_must_be_read_row_does_not_block_even_under_refuse(
     out = capsys.readouterr().out
     assert "MUST BE READ" in out
     assert "DOES NOT BLOCK" in out
+
+
+# ---------------------------------------------------------------------------
+# The tree limb (BACKLOG #1398): the gate stops reading the row and asks git.
+#
+# THE WEIGHT HERE IS ON THE PAIR, NOT ON EITHER ARM. A limb that elevates every row and one that
+# elevates none both look correct against a single-sided check, and both fail silently -- the first
+# floods a wave until the level is ignored, the second is invisible and lets a shipped row dispatch,
+# which is the failure the limb was added for. So the live tests below always drive both.
+#
+# NO CONTROL NUMBER IS EVER WRITTEN HERE IN THE JOINED CITATION FORM. This file lives under
+# ``tests/``, which the sweep searches, so a joined form for a control would make this file answer
+# the question it asks: the negative arm would flip the day it landed and the positive would pass
+# for the wrong reason. ``test_no_dispatch_control_number_is_written_as_a_citation`` pins that
+# rather than trusting this comment.
+# ---------------------------------------------------------------------------
+
+#: Open on the ledger, and BUILT AND SHIPPED ON ``main`` with nothing in its text saying so. This is
+#: the live instance the row was filed from: a dispatcher screened it as open, unclaimed, in no pull
+#: request and carrying no bar, and only found out by starting the work.
+_TREE_POSITIVE = 1300
+
+#: Filed 2026-08-29 and unbuilt, so landed code cites it nowhere. IF THIS ARM REDDENS, READ THE
+#: LEDGER BEFORE READING THE CODE: a pinned negative row can be built for real, and then the control
+#: is doing its job by reporting that the corpus moved. Re-pin on a row filed recently enough that
+#: nobody has cited it, and record the day it was measured.
+_TREE_NEGATIVE = 1396
+
+
+@pytest.fixture(scope="module")
+def screen_mod(gate: ModuleType) -> ModuleType:
+    """The screen module the GATE actually calls, resolved through a function it imported.
+
+    NOT ``sys.modules`` by name. ``test_coord_landed_citation_screen.py`` loads this same module
+    under that same name with ``importlib``, and if it ran second the name would point at a second
+    module object while the gate's imported functions kept reading the first one's globals. A
+    monkeypatch on the wrong object silently does nothing and the control arm below passes empty.
+    """
+    return sys.modules[gate.check_controls.__module__]
+
+
+@pytest.fixture(scope="module")
+def live_ref(gate: ModuleType) -> str:
+    """A real tree to ask.
+
+    The fallbacks exist so this never SKIPS. A control that quietly does not run is the same nothing
+    as a control that cannot fail, and both pinned answers hold on any of these refs, because
+    neither number is written into this change in the form the sweep matches.
+    """
+    for ref in (gate.DEFAULT_REF, "main", "HEAD"):
+        done = subprocess.run(
+            ["git", "-C", str(_ROOT), "rev-parse", "--verify", f"{ref}^{{commit}}"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if done.returncode == 0:
+            return str(ref)
+    pytest.fail("no git ref resolved, so nothing below could have measured a tree")
+
+
+def test_a_cited_row_is_raised_to_must_be_read(gate: ModuleType) -> None:
+    """THE POSITIVE ARM, and on #1300's own shape.
+
+    #1300 grades ``ok`` on every field this gate reads -- ``Closing-act: code``, nothing in its
+    prose, no bar -- so the tree is the only limb here that can say anything about it at all.
+    """
+    level, note = gate.merge_tree_finding(
+        "ok", "closes by 'code'", "origin/main", ("tests/t.py:9",)
+    )
+    assert level == "read", "a row landed code cites must stop being reported as ordinary work"
+    assert note.startswith("MUST BE READ -- LANDED CODE"), (
+        "on an ok row the tree sentence is the only one contradicting 'there is work to start', so "
+        "it leads; appended, it sits behind a sentence that says the opposite"
+    )
+    assert "tests/t.py:9" in note, (
+        "the reader's next act is to open the file, so hand them the line"
+    )
+
+
+def test_a_clear_row_comes_back_byte_identical(gate: ModuleType) -> None:
+    """THE NEGATIVE ARM, and the one a single-sided check cannot distinguish.
+
+    A fold that elevated everything passes the test above and fails this one. The assertion is
+    equality rather than absence: the gate's answer for a row the tree did not cite must be exactly
+    what it was before this limb existed, never a fresh claim derived from a measurement.
+    """
+    for level in ("ok", "advise", "read", "refuse"):
+        got_level, got_note = gate.merge_tree_finding(level, "the original note", "origin/main", ())
+        assert (got_level, got_note) == (level, "the original note"), (
+            f"a clear {level!r} row was modified by a tree limb that found nothing"
+        )
+
+
+def test_a_tree_hit_does_not_displace_the_rows_own_claim(gate: ModuleType) -> None:
+    """The ordering the existing note tests pin must survive the new limb.
+
+    A ``read`` note already opens with the row's own already-built declaration and a ``refuse`` note
+    may open with a RETIREMENT, which is the strongest claim this file makes. Leading with a weaker
+    tree signal there would invert an order two other tests hold, so the tree note is appended.
+    """
+    for level in ("read", "refuse"):
+        got_level, got_note = gate.merge_tree_finding(
+            level, "RETIRED IN PLACE -- DO NOT BUILD IT.", "origin/main", ("tests/t.py:9",)
+        )
+        assert got_level == level, "a tree hit does not lower a stronger level"
+        assert got_note.startswith("RETIRED IN PLACE"), "the stronger claim keeps the lead"
+        assert "LANDED CODE" in got_note, "and the tree sentence still travels, after it"
+
+
+def test_only_the_joined_form_elevates(gate: ModuleType) -> None:
+    """A bare ``#N`` spells a pull-request number just as well as an item number.
+
+    The two namespaces cannot be told apart by shape, so the weaker level buys nothing a dispatcher
+    can act on and is left to the standalone screen. Widening this to ``Finding.loose`` is the
+    plausible wrong fix -- it looks like more coverage and is more noise.
+    """
+    joined = gate.Finding(num=7, strict=("tests/t.py:1",), loose=())
+    bare = gate.Finding(num=7, strict=(), loose=("tests/t.py:2",))
+    assert gate.cited_locations(joined) == ("tests/t.py:1",)
+    assert gate.cited_locations(bare) == (), "a bare mention must not reach the dispatch path"
+    assert gate.cited_locations(None) == (), "a row the sweep never saw is not a finding"
+
+
+def test_the_tree_limb_holds_both_arms_against_a_real_tree(gate: ModuleType, live_ref: str) -> None:
+    """THE CONTROL PAIR THE ROW NAMES, run against real git rather than a fixture.
+
+    A known-BUILT row must come back cited and a known-UNBUILT one must come back clear. Without
+    both, a broken pattern or an unfetched ref returns zero for every row and reads as *"nothing is
+    built"* -- a false zero the row records firing twice in one session.
+    """
+    found, why = gate.ask_the_tree(_ROOT, [_TREE_POSITIVE, _TREE_NEGATIVE], live_ref)
+    assert why is None, (
+        f"the tree could not be asked, so neither arm below measured anything: {why}"
+    )
+
+    built = gate.cited_locations(found.get(_TREE_POSITIVE))
+    unbuilt = gate.cited_locations(found.get(_TREE_NEGATIVE))
+    assert built, (
+        f"#{_TREE_POSITIVE} is built and shipped on main and came back clear. The sweep lost its "
+        f"needle, or the ref is stale -- either way nothing else in this file is evidence"
+    )
+    assert not unbuilt, (
+        f"#{_TREE_NEGATIVE} came back cited at {unbuilt}. Read the ledger before the code: the row "
+        f"may have been built, in which case re-pin this arm on a newer unbuilt row"
+    )
+
+
+def test_the_control_pair_travels_all_the_way_through_main(
+    gate: ModuleType, live_ref: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The wiring, not the screen. A limb that answers correctly and prints nothing is not wired.
+
+    This is the test that would have caught the shape the row describes: #1300 grading ``ok`` and
+    dispatching with no sentence anywhere in the output about the tree.
+    """
+    code = gate.main(
+        [str(_TREE_POSITIVE), str(_TREE_NEGATIVE), "--root", str(_ROOT), "--tree-ref", live_ref]
+    )
+    out = capsys.readouterr().out
+    assert code == 0, "MUST BE READ is a level, never a verdict, and the exit code is the promise"
+
+    lines = {
+        line.strip().split(":", 1)[0]: line for line in out.splitlines() if line.startswith("  #")
+    }
+    assert f"#{_TREE_POSITIVE}" in lines, "the cited row printed nothing at all"
+    assert "LANDED CODE" in lines[f"#{_TREE_POSITIVE}"]
+    assert "LANDED CODE" not in lines.get(f"#{_TREE_NEGATIVE}", ""), (
+        "the clear row was given a tree sentence, so the limb is not discriminating"
+    )
+    assert "tree asked:" in out, "the header must say the tree was asked and over what"
+    assert "CLEAR IS NOT PROOF OF UNBUILT" in out, (
+        "the half nobody guesses has to travel with the finding, not sit in a docstring"
+    )
+
+
+def test_a_tree_hit_never_changes_the_exit_code(
+    gate: ModuleType, live_ref: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """At the measured flag rate a blocking tree limb refuses most waves and is off within a day.
+
+    ``--refuse`` is the place that would betray it, exactly as it is for the row's own claim.
+    """
+    code = gate.main(
+        [str(_TREE_POSITIVE), "--root", str(_ROOT), "--tree-ref", live_ref, "--refuse"]
+    )
+    assert code == 0
+    assert "LANDED CODE" in capsys.readouterr().out
+
+
+def test_an_unreachable_ref_returns_a_reason_never_an_empty_result(gate: ModuleType) -> None:
+    """THE FAILURE MODE THAT LOOKS EXACTLY LIKE DATA.
+
+    A ref that does not resolve yields no lines, which is byte-identical to a tree where nothing is
+    cited. Returning ``{}`` with no reason would report every candidate as clear and reproduce the
+    failure this limb exists for, while looking greener than before it was added.
+    """
+    found, why = gate.ask_the_tree(_ROOT, [_TREE_POSITIVE], "refs/heads/no-such-ref-for-this-test")
+    assert found == {}
+    assert why is not None and "resolve" in why
+
+
+def test_a_failed_control_discards_the_whole_sweep(
+    gate: ModuleType, screen_mod: ModuleType, live_ref: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A reader handed a plausible listing under a caveat keeps the listing and forgets the caveat.
+
+    So a broken instrument yields no row result at all rather than a qualified one. The controls are
+    the screen's own and this pins that the gate honours them instead of reading past them.
+    """
+    inverted = tuple(
+        screen_mod.Control(c.num, not c.expect_cited, c.why) for c in screen_mod.CONTROLS
+    )
+    monkeypatch.setattr(screen_mod, "CONTROLS", inverted)
+
+    found, why = gate.ask_the_tree(_ROOT, [_TREE_POSITIVE], live_ref)
+    assert found == {}
+    assert why is not None and "controls did not hold" in why
+
+
+def test_a_run_that_could_not_ask_the_tree_says_which_class_it_cannot_see(
+    gate: ModuleType, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A LIMB THAT DEGRADES QUIETLY IS WORSE THAN NO LIMB.
+
+    The output looks the same, one whole class of row stops being detected, and the reader has no
+    way to tell. A fresh worktree with no fetched remote is the ordinary case, not the exotic one.
+    """
+    assert gate.main([str(_TREE_POSITIVE), "--root", str(_ROOT), "--no-tree"]) == 0
+    out = capsys.readouterr().out
+    assert "TREE NOT ASKED" in out
+    assert "NOTHING IN ITS TEXT SAYING SO" in out, "name the class that went undetected"
+    assert "LANDED CODE" not in out, "no tree claim may survive a run that did not ask the tree"
+
+
+def test_no_dispatch_control_number_is_written_as_a_citation(screen_mod: ModuleType) -> None:
+    """THE INSTRUMENT MUST NOT ENTER ITS OWN DATA.
+
+    The gate and this file both live under paths the sweep searches. Writing a control number in the
+    joined form here would make these files answer the question they are asking: the positive arm
+    would pass for the wrong reason and the negative arm would flip the moment this landed. The
+    needles are built from the numbers at run time, and this pins that they stayed that way.
+
+    Deliberately scoped to this change's own two files. Sweeping the repository would block an
+    unrelated builder legitimately working the pinned row, and the run-time control already reports
+    that case with a message naming the fix.
+    """
+    guarded = {_TREE_POSITIVE, _TREE_NEGATIVE} | {c.num for c in screen_mod.CONTROLS}
+    for path in (_GATE, Path(__file__)):
+        text = path.read_text(encoding="utf-8")
+        for num in sorted(guarded):
+            joined = f"{screen_mod._STRICT_PREFIX}{num}"
+            assert joined not in text, (
+                f"{path.name} writes the joined citation form for #{num}, so the sweep would find "
+                f"this very file and the control would be measuring itself"
+            )

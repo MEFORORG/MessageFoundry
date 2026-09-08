@@ -1,12 +1,18 @@
 # MessageFoundry documentation
 
-There are **377 markdown files** under `docs/`. Most of them are maintainer planning history, not
-documentation. This page exists so you do not have to guess which is which.
+Most of `docs/` is maintainer planning history, not documentation. This page exists so you do not
+have to guess which is which.
 
 **Filenames in this repository are unreliable signals.** `docs/CI.md` and `docs/ADOPTER-CI.md` describe
 different repositories for opposite audiences. `docs/ASVS-L2-PHASE0-CHANGES.md` is operator notes.
 `docs/testing/VERIFY.md` is an operator tool, not a test plan. Where a name misleads, this index says so
 rather than repeating it.
+
+**A path you cannot open is not proof the work was never done.** Parts of `docs/` are kept in a separate
+maintainer repository, so a citation elsewhere in the tree can be real and still not resolve here.
+[`testing/README.md`](testing/README.md) covers `docs/testing/`, and
+[`SECURITY-DOCS-POLICY.md`](SECURITY-DOCS-POLICY.md) states the separate rule for `docs/security/` and
+`docs/reviews/`, including how to request the withheld material.
 
 > **Reporting a security vulnerability?** → **[`.github/SECURITY.md`](../.github/SECURITY.md)**, the
 > disclosure policy. **Not** `docs/SECURITY.md`, which despite the identical filename is the

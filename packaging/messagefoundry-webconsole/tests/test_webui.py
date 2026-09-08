@@ -2859,6 +2859,9 @@ def test_the_error_banner_escapes_hostile_text() -> None:
 async def test_ad_user_carveouts_on_ui_surface(engine: Engine) -> None:
     # An AD account: roles come from the AD-group map and the password from the directory — the
     # detail page hides those forms, and a forged direct POST is refused by the handler guards.
+    # Reset MFA is NOT among them since BACKLOG #1144: a directory account can hold an engine factor,
+    # so the button is its only recovery from a lost authenticator and hiding it would make
+    # enrollment a one-way door. That is the half of the carve-out set this test now pins OPEN.
     service = await _service(engine)
     await service.store.create_user(
         user_id="ad-user-1", username="aduser", auth_provider="ad", display_name="AD User"
@@ -2869,6 +2872,7 @@ async def test_ad_user_carveouts_on_ui_surface(engine: Engine) -> None:
         assert "AD users get roles from the AD-group map" in detail.text
         assert 'action="/ui/users/ad-user-1/roles"' not in detail.text
         assert 'action="/ui/users/ad-user-1/reset-password"' not in detail.text
+        assert 'action="/ui/users/ad-user-1/reset-mfa"' in detail.text
         r = await _post_pairs(c, "/ui/users/ad-user-1/roles", [("roles", "viewer")])
         assert r.status_code == 400 and "AD-group map" in r.text
         assert await service.store.get_user_role_ids("ad-user-1") == []
@@ -4249,6 +4253,14 @@ async def test_sso_success_mints_one_cookie_session(
         assert len(sessions) == 1  # ONE session per navigation into the route
         r = await c.get("/ui/account")
         assert r.status_code == 200 and "Signed in as jdoe (ad)" in r.text
+        # BACKLOG #1144: the enrolment surface is REACHABLE for a directory account. The Kerberos leg
+        # mints MFA-pending, and /ui/account is MFA-pending-exempt, so this page is where such a user
+        # lands and where the confinement has to be survivable. The page used to say "AD accounts use
+        # directory MFA, not an engine TOTP" and offer nothing.
+        assert 'action="/ui/account/mfa/enroll"' in r.text
+        assert "Add a passkey" in r.text
+        # Still directory-gated, and correctly so: there is no engine password to change.
+        assert 'href="/ui/account/password"' not in r.text
 
 
 async def test_sso_session_not_reauth_seeded(
@@ -4268,7 +4280,12 @@ async def test_sso_session_not_reauth_seeded(
         jdoe = await service.store.get_user_by_username("jdoe")
         sessions = await service.store.list_sessions(jdoe.id)
         assert sessions[0].reauth_at is None  # seed_reauth=False (ADR 0068 §9)
-        assert sessions[0].mfa_verified_at is not None  # directory-delegated MFA
+        # BACKLOG #1144: the ticket asserts no factor strength the engine can read, so the leg grants
+        # nothing and the session is born MFA-pending. This assertion used to read `is not None`,
+        # under the delegated-directory relaxation that is now retired. The two stamps are
+        # INDEPENDENT and both must be pinned: reauth_at is the step-up window (seeding is ADR 0068
+        # §9 and unchanged here), mfa_verified_at is the second-factor grant.
+        assert sessions[0].mfa_verified_at is None
 
         # The directory-password step-up completes at /ui/reauth (auth.reauth live-rebinds AD).
         r = await c.post(
@@ -4289,6 +4306,8 @@ async def test_sso_session_not_reauth_seeded(
     assert out.ok and out.token is not None
     session = await service.store.get_session(hash_token(out.token))
     assert session is not None and session.reauth_at is not None
+    # The grant is the same on BOTH Kerberos legs -- only the step-up seeding differs (BACKLOG #1144).
+    assert session.mfa_verified_at is None
 
 
 async def test_sso_cross_site_hygiene(engine: Engine, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -4307,6 +4326,10 @@ async def test_sso_cross_site_hygiene(engine: Engine, monkeypatch: pytest.Monkey
                 **_negotiate_headers(),
                 "Sec-Fetch-Mode": "navigate",
                 "Sec-Fetch-Site": "cross-site",
+                # A real browser sends this on a top-level navigation; #1122 made the middleware's
+                # destination check an allowlist, so omitting it here would 403 at the middleware
+                # and this test would stop exercising the SSO leg it is named for.
+                "Sec-Fetch-Dest": "document",
             },
         )
         assert r.status_code == 303 and r.headers["location"] == "/ui"
@@ -5471,7 +5494,15 @@ async def test_oidc_callback_survives_a_cross_site_navigation(engine: Engine) ->
     async with _oidc_client(engine, service) as c:
         r = await c.get(
             "/ui/oidc/callback?code=abc&state=xyz",
-            headers={"Sec-Fetch-Site": "cross-site", "Sec-Fetch-Mode": "navigate"},
+            headers={
+                "Sec-Fetch-Site": "cross-site",
+                "Sec-Fetch-Mode": "navigate",
+                # The IdP's redirect back IS a top-level navigation and carries this. #1122 made the
+                # middleware's destination check an allowlist; note it deliberately does NOT also
+                # demand Sec-Fetch-User, because this hop has none when the IdP session is already
+                # established.
+                "Sec-Fetch-Dest": "document",
+            },
             follow_redirects=False,
         )
         # Refused for the MISSING COOKIE, not for being cross-site (403 would mean the wrong gate).
@@ -5588,7 +5619,11 @@ async def test_oidc_full_round_trip_lands_a_session_via_meta_refresh(
 
         r = await c.get(
             "/ui/oidc/callback?code=authcode&state=" + quote(params["state"]),
-            headers={"Sec-Fetch-Site": "cross-site", "Sec-Fetch-Mode": "navigate"},
+            headers={
+                "Sec-Fetch-Site": "cross-site",
+                "Sec-Fetch-Mode": "navigate",
+                "Sec-Fetch-Dest": "document",  # what a browser sends; see #1122
+            },
             follow_redirects=False,
         )
         assert r.status_code == 200, r.text

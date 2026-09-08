@@ -91,7 +91,7 @@ def _documented_settings() -> set[str]:
             documented.update(found)
             continue
         assert any(form in cell for form in _PROSE_FORMS), (
-            f"unrecognised Retention cell {cell!r}. Every cell must be one of the seven vocabulary "
+            f"unrecognised Retention cell {cell!r}. Every cell must be one of the eight vocabulary "
             f"forms — a bounded form naming a backticked `[section].setting`, or one of {_PROSE_FORMS}. "
             f"An unparsed cell would otherwise read as 'no window' and silently drop a PHI tier out of "
             f"the generated gate list."
@@ -240,3 +240,92 @@ def test_each_prose_form_is_actually_used(form: str) -> None:
         f"the vocabulary form {form!r} appears in no §2 Retention cell. If a classification genuinely "
         f"no longer applies, remove it from the legend in the same commit."
     )
+
+
+# --- §2's residual forms must be listed in §8 (BACKLOG #1188, ASVS 14.2.7) ------------------------
+
+#: The three §2 Retention forms whose legend text PROMISES a §8 listing. `UNBOUNDED — honest gap`
+#: says "every one of these is also listed in §8"; `orphan-only` and `dead-only` each say "the
+#: residual stays listed in §8". The other five forms make no such promise: a bounded window is
+#: covered, `keep-forever by design` and `n/a — not PHI` are not gaps, and `keep-N` is a count bound.
+_RESIDUAL_FORMS = ("UNBOUNDED — honest gap", "orphan-only", "dead-only")
+
+#: A backticked token, used as the join key between a §2 Location cell and a §8 Tier cell. The two
+#: tables word the same tier differently on purpose -- §2 carries the provenance ("OS temp dir, ADR
+#: 0049"), §8 carries the reason -- so a whole-cell comparison would red on prose that is not drift.
+#: The backticked identifiers are the part both tables must agree on.
+_BACKTICKED = re.compile(r"`([^`]+)`")
+
+
+def _honest_gap_table() -> list[str]:
+    """The §8 "Tiers with no retention today" table as raw lines, located by its own heading."""
+    lines = _PHI_MD.read_text(encoding="utf-8").splitlines()
+    heads = [
+        i for i, line in enumerate(lines) if line.startswith("### Tiers with **no** retention")
+    ]
+    assert len(heads) == 1, (
+        f"expected exactly ONE §8 honest-gaps heading in docs/PHI.md, found {len(heads)} at lines "
+        f"{[i + 1 for i in heads]}. Zero means it was renamed and this guard asserts nothing."
+    )
+    i = heads[0]
+    while i < len(lines) and not lines[i].lstrip().startswith("|"):
+        i += 1
+    rows: list[str] = []
+    while i < len(lines) and lines[i].lstrip().startswith("|"):
+        rows.append(lines[i])
+        i += 1
+    # Liveness receipt. A slicer that matched nothing would make the assertion below pass vacuously,
+    # which is the failure mode this guard exists to remove rather than to reproduce.
+    assert len(rows) >= 7, (
+        f"only {len(rows)} lines parsed from the §8 honest-gaps table (expected 10+ including the "
+        f"header and separator). The table moved or the slicer is broken."
+    )
+    return rows
+
+
+def test_every_residual_tier_in_section_2_is_listed_in_section_8() -> None:
+    """§2's legend claims a §8 listing for the three residual forms. This is what makes that true.
+
+    Measured 2026-09-06 under BACKLOG #1188: the claim was FALSE in two places. The File-connector
+    spill dirs carried `UNBOUNDED — honest gap` in §2 with no §8 row at all, and the
+    `reference.name`/`.version`/`.key` columns carried `orphan-only` while §8 named only the
+    `reference.value` they key. Both were repaired in the same commit as this guard.
+
+    Mutation: delete either §8 row -- reds naming the tier. Add a §2 row with a residual form and no
+    §8 entry -- reds the same way. Both were executed before this was committed.
+    """
+    gap_text = "\n".join(_honest_gap_table())
+    checked: dict[str, int] = dict.fromkeys(_RESIDUAL_FORMS, 0)
+    missing: list[str] = []
+
+    for row in _inventory_rows():
+        location, retention = row[0], row[-1]
+        forms = [form for form in _RESIDUAL_FORMS if form in retention]
+        if not forms:
+            continue
+        checked[forms[0]] += 1
+        tokens = _BACKTICKED.findall(location)
+        assert tokens, (
+            f"§2 row {location!r} carries a residual form but names no backticked identifier, so "
+            f"there is nothing to join on. Give the Location cell a backticked tier name."
+        )
+        if not any(token in gap_text for token in tokens):
+            missing.append(f"  {location}\n      form: {forms[0]}\n      tokens: {tokens}")
+
+    assert not missing, (
+        "docs/PHI.md §2 classifies these tiers with a residual form whose legend PROMISES they are "
+        "listed in §8's honest-gaps table, and none of their backticked identifiers appears there:\n"
+        + "\n".join(missing)
+        + "\n\n  Fix the DOC, not this test: either add the tier to §8, or name it in the §8 row of "
+        "the tier it rides. Weakening the join would restore a completeness claim nothing checks, "
+        "which is the SDS-3.6 liability this guard exists to remove."
+    )
+
+    # Second liveness receipt: the walk must actually have exercised each form it claims to cover.
+    # A §2 table that stopped using a form would otherwise make this test pass by finding nothing.
+    for form, seen in checked.items():
+        assert seen > 0, (
+            f"no §2 Retention cell carries {form!r}, so this guard checked nothing for it. If the "
+            f"form is genuinely retired, drop it from _RESIDUAL_FORMS and from the §2 legend "
+            f"together -- do not leave a promise in the legend that nothing measures."
+        )

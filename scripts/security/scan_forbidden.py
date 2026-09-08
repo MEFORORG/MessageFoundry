@@ -12,9 +12,10 @@ Why a custom scanner in addition to gitleaks: gitleaks finds *secrets* (keys/tok
 routable host IP -- which are not credentials but must never reach the open-source repo.
 
 Token authority is EXTERNALIZED. The committed source carries only STRUCTURAL detectors -- at least a
-routable-IPv4 detector, a worktree/branch slug detector, an absolute-home-path detector and the
-prefix-free estate-identifier *shape*; the real customer/vendor name patterns, estate substrings, and
-the site-code numeric prefix are loaded at runtime from, in order of precedence:
+routable-IPv4 detector, a worktree/branch slug detector, an absolute-home-path detector, a private
+artifact-URL detector and the prefix-free estate-identifier *shape*; the real customer/vendor name
+patterns, estate substrings, and the site-code numeric prefix are loaded at runtime from, in order
+of precedence:
 
   1. ``MEFOR_FORBIDDEN_TOKENS`` -- either a path to a token file OR the token content inline
      (newline-separated, same format). Used in CI via the Actions secret of the same name.
@@ -57,7 +58,10 @@ Usage:
   scan_forbidden.py                 # scan all git-tracked files in the current repo
   scan_forbidden.py --self-test     # probe each LOADED class with a string derived from itself, so a
                                     #   table that parsed but cannot match is caught. Counts and class
-                                    #   names only -- never a token, so it is safe in public CI.
+                                    #   names only -- never a token, so it is safe in public CI. Each
+                                    #   class also states how many loaded entries no probe could be
+                                    #   built for, because a ratio that silently drops those reads as
+                                    #   full coverage over a hole.
 
 Exit: 0 clean, 1 forbidden content found (fail closed), 2 usage error / required-tokens-missing /
 self-test failure (an instrument that cannot see is not a content hit; the two need different fixes).
@@ -70,6 +74,7 @@ import re
 import subprocess
 import sys
 from pathlib import Path
+from typing import NamedTuple
 
 # --------------------------------------------------------------------------------------------------
 # Structural detectors (NO customer data -- safe to commit). These run regardless of the token source.
@@ -194,6 +199,77 @@ _HOME_PATH = re.compile(
     r"|me|svc|you|user|username|example)[\\/\s\"'`]"
     r")"
     r"[A-Za-z][A-Za-z0-9._-]*"
+)
+
+# Private artifact URL (BACKLOG #1454). The UUID here is not a name, it is a CAPABILITY: whoever holds
+# the URL can fetch the artifact, so the string discloses the CONTENT the way a token does rather than
+# the way a hostname does. Every other detector in this file recognises something that IDENTIFIES a
+# party; this one recognises something that GRANTS ACCESS, which is why none of them can stand in for
+# it. An artifact URL carries no home path, no host address and no estate identifier.
+#
+# It arrives the way this whole class arrives -- pasted out of one session into a note, a handoff or a
+# backlog row that a later commit sweeps into the tree. This repo is public on GitHub and on PyPI, so
+# the paste and the publication are one step apart.
+#
+# PREVENTIVE, NOT REMEDIAL, and measured rather than assumed. At 16efb8cde over the 2095 tracked files
+# the population is zero. THE CONTROL IS THE PART THAT MAKES THAT ZERO MEAN ANYTHING, and it must be a
+# control that FIRES over this same corpus -- an earlier draft of this block quoted a slug-detector
+# count as its control, which is itself zero on a healthy tree, so every row was a zero and the block
+# demonstrated only that something had been typed:
+#
+#     detector hits over 2095 tracked files                      = 0
+#     CONTROL needle='<uuid-shape>' (bare UUID) over that corpus = 8 files / 35 lines   (FIRES)
+#     CONTROL planted URL through scan_file                      = 1 hit                (FIRES)
+#
+# Filed anyway because the sibling project hit it for real: KORUS carried two of these on its own
+# origin/main from the commit that brought its playbooks over, and its leak gate passed them both.
+# They came out because a person read the diff, which is the review this gate exists to make cheaper.
+#
+# THE UUID SHAPE IS REQUIRED ON PURPOSE, and it is what keeps the detector off its own documentation.
+# The placeholder this file, its tests and any future ADR have to print -- claude.ai/code/artifact/
+# followed by a bracketed <uuid> -- is not a hit. The alternative is a detector whose own manual trips
+# it, which earns an allowlist line, and an allowlist line here is a per-line veto over every OTHER
+# detector on that line too.
+#
+# THREE ADDRESSES, NOT ONE, and this is read off the vendor's own grammar rather than guessed. The
+# installed client (claude.exe 2.1.259, recovered with `grep -a`, negative control returning 0) parses
+#
+#     /code/(?:artifact|frame)/(?:([A-Za-z0-9_-]*)-)?(<uuid>)(?:[/?#]|$)
+#
+# and separately builds `${uuid}.frame.${env}claudeusercontent.com`. So `frame` is a sibling of
+# `artifact`, an OPTIONAL human-readable vanity segment may sit between the path and the UUID, and the
+# content host carries the UUID as a SUBDOMAIN with the string `claude.ai` absent entirely. A pattern
+# anchored on `artifact/` immediately followed by the UUID -- which is what this detector shipped as
+# first, and what KORUS still carries -- reports a file holding any of the other forms as CLEAN. The
+# vanity form is the one that matters most, because it is the shape a person's address bar produces
+# and pasting is the whole arrival path above.
+#
+# A PUBLICLY SHARED artifact still does not match: that path segment is plural (/public/artifacts/),
+# so the singular literal cannot reach it. A deliberately published URL is not a disclosure.
+#
+# NO BARE-UUID DETECTOR, and that is a decision with a number behind it. A bare UUID names no host, no
+# account and no project -- it is an opaque 128-bit integer, and it becomes a disclosure only when
+# something says what it addresses, which is exactly what the URL prefix supplies. Measured over the
+# same 2095 files, a bare-UUID detector would fire on 35 lines across 8 files TODAY, every one of them
+# innocent: a vendored CLA action bundle, a deployment guide, an HL7 sample message, and five test
+# modules that build session ids. That is a false-positive storm on the first run, each one answered
+# with an allowlist line that switches this whole gate off for the lines it covers. A gate people mute
+# is worth nothing. (KORUS reasoned to the same conclusion from a zero; a zero argues weakly either
+# way, so the number above is the one to cite.)
+#: The UUID, written once so the two arms below cannot drift into different ideas of one -- the same
+#: single-atom discipline the slug detector's two arms follow.
+_ARTIFACT_UUID = r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
+
+_ARTIFACT_URL = re.compile(
+    # ARM 1 -- the path form on claude.ai. The vanity segment is bounded at 64 characters rather than
+    # left unbounded as the vendor writes it: the grammar's `*` is safe there because it is anchored
+    # at both ends, and here it is not. {0,64} still admits the vendor's own cap of 60.
+    rf"claude\.ai/(?:code/)?(?:artifact|frame)/(?:[A-Za-z0-9_-]{{0,64}}-)?{_ARTIFACT_UUID}"
+    # ARM 2 -- the direct content host, where the UUID is a SUBDOMAIN and `claude.ai` never appears,
+    # so arm 1 cannot see it however it is widened. A literal host anchors it, so it carries no
+    # false-positive risk worth trading against.
+    rf"|{_ARTIFACT_UUID}\.frame\.(?:staging\.)?claudeusercontent\.com",
+    re.IGNORECASE,
 )
 
 # Ported-estate identifier SHAPE. The site-code detectors below are keyed on a numeric PREFIX loaded
@@ -1034,6 +1110,11 @@ def scan_file(path: Path, rel_posix: str | None = None, *, show_context: bool = 
             hits.append(f"{posix}:{lineno}: worktree/branch slug (internal project name)")
         if _HOME_PATH.search(line):
             hits.append(f"{posix}:{lineno}: absolute user-home path (OS account name)")
+        # Reason-only, and NOT ctx-appended even under show_context. The other reason-only detectors
+        # withhold the value because it NAMES someone; this one withholds it because the URL IS the
+        # access. Echoing it into a public CI log would hand out the capability the hit reports.
+        if _ARTIFACT_URL.search(line):
+            hits.append(f"{posix}:{lineno}: private artifact URL (the link itself grants access)")
         # Security-record content (BACKLOG #1337). REASON-ONLY, never the value, for the same reason
         # as the slug above: the identifier-verdict pair IS the disclosure, so echoing it into a
         # public CI log would publish exactly what the hit reports.
@@ -1203,6 +1284,12 @@ def plain_word_name_probes(text: str) -> list[str]:
 
     Returns the recovered WORDS, which are token content, so a caller must not print them. Recovering
     nothing is not an error here; the caller decides what an unprobeable class means.
+
+    DEDUPED, because ``_parse_tokens`` dedupes the entries these mirror. Two identical source lines
+    compile to ONE detector, so returning the word twice would count two probes against one loaded
+    entry -- and a caller measuring coverage would understate what went untested. Deduping at a call
+    site instead would put the rule in one caller and not the other, which is the drift this helper
+    was made public to prevent.
     """
     probes: list[str] = []
     in_names = False
@@ -1215,7 +1302,59 @@ def plain_word_name_probes(text: str) -> list[str]:
             continue
         if m := _PLAIN_WORD_NAME.fullmatch(line.split("|")[0].strip()):
             probes.append(m.group(1))
-    return probes
+    return list(dict.fromkeys(probes))
+
+
+class _ClassCoverage(NamedTuple):
+    """One token class's self-test coverage, and why any of it went unprobed.
+
+    ``label`` IS the key ``loaded_token_counts`` prints for this class and ``loaded`` IS that key's
+    value, so the report and the counts block above it share one vocabulary. Deriving the denominator
+    separately reintroduces exactly the cross-block arithmetic this change removes: an earlier draft
+    printed ``estate_file_scanned ... of 14 loaded`` under a counts line reading
+    ``estate_file_scanned=13``, each internally consistent and disagreeing with the other.
+
+    ``unprobed_reason`` travels WITH the class rather than sitting in a table keyed by label. A table
+    needs a default, and a default silently degrades the one channel this whole check exists to make
+    legible the day a class is renamed.
+
+    Counts and class names only -- never a token, never a probe. These fields print in a
+    world-readable Actions log on the one run that holds the real secret.
+    """
+
+    label: str
+    fired: int
+    probeable: int
+    loaded: int
+    unprobed_reason: str
+
+    @property
+    def unprobed(self) -> int:
+        """Loaded entries no probe could be built for, clamped at zero in ONE place.
+
+        A ``[names]`` entry can be recoverable as a plain word and still be DROPPED at parse time
+        (too many fields, an invisible codepoint), which would otherwise give a negative residual.
+        Nothing is lost by clamping: that entry has no detector, so it cannot fire, and the
+        ``fired != probeable`` check reports it as an inert detector -- the accurate reading.
+        """
+        return max(self.loaded - self.probeable, 0)
+
+    def line(self) -> str:
+        """This class's report line, with the UNPROBED residual NAMED rather than left to subtraction.
+
+        ``fired 6/6`` reads as full coverage. Measured against the REAL table on 2026-09-05, unchanged
+        from the 2026-09-03 run this check shipped with: the three class lines read ``2/2``, ``13/13``
+        and ``6/6 probeable of 8 loaded`` while THREE of the 24 loaded entries had never been probed
+        at all -- two ``[names]`` regexes the prober cannot invert, plus one ``[estate_body_only]``
+        hold-out visible only by subtracting a number in the report from a number in the counts block
+        printed above it. A ratio whose denominator silently drops what it could not test is the same
+        green-line-over-a-hole this check exists to remove, so the residual is stated in words, on the
+        same line, in the same units as the numerator.
+        """
+        line = f"{self.label} fired {self.fired}/{self.probeable} probeable of {self.loaded} loaded"
+        if self.unprobed:
+            line += f"; {self.unprobed} UNPROBED ({self.unprobed_reason})"
+        return line
 
 
 def self_test() -> tuple[list[str], list[str]]:
@@ -1226,17 +1365,35 @@ def self_test() -> tuple[list[str], list[str]]:
 
     Probing is TOTAL for ``site_prefix`` and for the file-scanned ``estate`` subset: a prefix is ASCII
     digits and an estate pattern is ``re.escape``d around its own literal, so a matching string is
-    derivable from every entry that loaded. There a shortfall is a FAILURE. ``names`` is partial by
-    nature (see ``plain_word_name_probes``), so an unprobeable entry is counted, not failed --
-    a required gate that reds on a legitimate list shape gets switched off, and the value here is in
-    running on every real load rather than in being maximally strict on one.
+    derivable from every entry that loaded. There a shortfall between what was probed and what FIRED
+    is a FAILURE -- a detector that loaded and cannot match its own value is inert.
 
-    The one unconditional failure is a run that probed NOTHING. That is the vacuous pass this check
-    exists to remove, and it must not be reported as a clean bill.
+    WHICH WAY A SHORTFALL IN *PROBEABILITY* FAILS, AND WHY IT IS SPLIT IN TWO:
+
+    * A PARTIAL shortfall is REPORTED, not failed -- fail-open, deliberately. A rich ``[names]``
+      regex and an ``[estate_body_only]`` hold-out are both legitimate, intended list shapes, and a
+      required merge context that reds on a correct list is a required merge context somebody
+      switches off. The price of fail-open is that nothing downstream alarms, so the residual is
+      instead made impossible to miss: every class states its own UNPROBED count, and a final
+      aggregate line states the total across classes.
+    * A TOTAL shortfall -- a class that loaded entries and could probe NONE of them -- is a FAILURE.
+      It is not a false failure but an accurate report that the class was never exercised, and it is
+      the rule this function already enforced globally, now applied per class. Without it a run can
+      print ``names fired 0/0 probeable of 8 loaded``, exit 0 because a sibling class happened to
+      probe, and leave the class this gate was built for entirely unverified.
+
+    EVERY CLASS THAT LOADED ANYTHING REPORTS A LINE. These guards were once ``if <probes>``, so a
+    class whose entries were all unprobeable vanished from the report and its silence read as
+    "nothing to say" rather than "nothing was checked".
     """
     report: list[str] = []
     failures: list[str] = []
-    probed_anything = False
+    # ONE source for every "loaded" number, here and in the counts block main prints directly above
+    # this report. Re-deriving them from len(_SITE_PREFIXES) / len(ESTATE_TOKENS) / len(FORBIDDEN)
+    # would be a second definition of the same numbers, and the drift would be invisible: each block
+    # stays internally consistent while disagreeing with the other.
+    counts = loaded_token_counts()
+    coverage: list[_ClassCoverage] = []
 
     # [site_prefix] -- the class that falls back to _NEVER, so the class where a silent load failure
     # and a clean tree are the same green tick. The probe wraps the code in identifier separators
@@ -1247,8 +1404,18 @@ def self_test() -> tuple[list[str], list[str]]:
         if m is not None and m.group(0).startswith(prefix):
             fired += 1
     if _SITE_PREFIXES:
-        probed_anything = True
-        report.append(f"site_prefix fired {fired}/{len(_SITE_PREFIXES)}")
+        coverage.append(
+            _ClassCoverage(
+                "site_prefixes",
+                fired,
+                len(_SITE_PREFIXES),
+                counts["site_prefixes"],
+                # Unreachable by construction: a prefix is ASCII digits, so a probe is derivable from
+                # every entry that loads and probeable always equals loaded. Kept as a tripwire rather
+                # than a generic default -- if this text ever prints, that invariant has broken.
+                "probing is total for this class, so a residual here is a bug",
+            )
+        )
         if fired != len(_SITE_PREFIXES):
             failures.append(
                 f"site_prefix: {len(_SITE_PREFIXES) - fired} of {len(_SITE_PREFIXES)} loaded "
@@ -1256,15 +1423,24 @@ def self_test() -> tuple[list[str], list[str]]:
                 "is loaded and inert"
             )
 
-    # [estate] -- only the FILE-SCANNED subset. An [estate_body_only] token never enters scan_file, so
-    # probing one would assert nothing about the gate that guards tracked files.
+    # [estate] -- only the FILE-SCANNED subset can be probed. An [estate_body_only] token never enters
+    # scan_file, so probing one would assert nothing about the gate that guards tracked files. The
+    # denominator is the WHOLE class, which is what turns that hold-out from a gap between two numbers
+    # in two different blocks into a stated count on this class's own line.
     fired = 0
     for token, pattern in _ESTATE_FILE_RES:
         if pattern.search(f"OB_{token}_ORU"):
             fired += 1
-    if _ESTATE_FILE_RES:
-        probed_anything = True
-        report.append(f"estate_file_scanned fired {fired}/{len(_ESTATE_FILE_RES)}")
+    if ESTATE_TOKENS:
+        coverage.append(
+            _ClassCoverage(
+                "estate",
+                fired,
+                len(_ESTATE_FILE_RES),
+                counts["estate"],
+                "held out of the file scan by [estate_body_only]",
+            )
+        )
         if fired != len(_ESTATE_FILE_RES):
             failures.append(
                 f"estate: {len(_ESTATE_FILE_RES) - fired} of {len(_ESTATE_FILE_RES)} file-scanned "
@@ -1279,23 +1455,52 @@ def self_test() -> tuple[list[str], list[str]]:
         for word in words
         if any(pat.search(f"contact {word} about the interface") for pat, _reason in FORBIDDEN)
     )
-    if words:
-        probed_anything = True
-    report.append(f"names fired {fired}/{len(words)} probeable of {len(FORBIDDEN)} loaded")
-    if words and fired != len(words):
-        failures.append(
-            f"names: {len(words) - fired} of {len(words)} plain-word entries did not match their "
-            "own word -- the entry parsed but the detector is inert"
+    if FORBIDDEN:
+        coverage.append(
+            _ClassCoverage(
+                "names",
+                fired,
+                len(words),
+                counts["names"],
+                "not a plain word in word boundaries, so no probe string is derivable",
+            )
         )
-    if FORBIDDEN and not words:
-        report.append(
-            "names UNPROVEN: no entry is a plain word, so no probe could be derived for this class"
-        )
+        # No `words and` guard: fired is derived from words, so an empty words gives 0 != 0, which is
+        # already false. The empty case is the total shortfall below, and it is a different finding.
+        if fired != len(words):
+            failures.append(
+                f"names: {len(words) - fired} of {len(words)} plain-word entries did not match their "
+                "own word -- the entry parsed but the detector is inert"
+            )
 
-    if not probed_anything:
+    for cov in coverage:
+        report.append(cov.line())
+        if cov.probeable == 0:
+            failures.append(
+                f"{cov.label}: none of the {cov.loaded} loaded entries could be probed, so this run "
+                f"proved nothing about the {cov.label} class -- the per-class form of the vacuous "
+                "pass this check exists to remove. Extend the prober to the shape this class now "
+                "uses; silencing it leaves the class unverified either way"
+            )
+
+    # THE AGGREGATE, and it is here because three class lines each reading "fired N/N" add up to a
+    # report a skimmer reads as full coverage. One line, one pair of numbers, in the units the counts
+    # block already uses, so the size of the untested remainder cannot be missed by reading down.
+    total_loaded = sum(cov.loaded for cov in coverage)
+    unprobed = sum(cov.unprobed for cov in coverage)
+    summary = f"coverage {total_loaded - unprobed} of {total_loaded} loaded entries probed"
+    if unprobed:
+        blind = sum(1 for cov in coverage if cov.unprobed)
+        summary += f"; {unprobed} UNPROBED across {blind} class(es)"
+    report.append(summary)
+
+    # The per-class rule above covers every class that LOADED something, so what is left for this one
+    # is a call that reached here with empty tables. ``main`` refuses that before it gets this far, but
+    # a direct caller can reach it, and an empty run must not come back as a clean bill.
+    if not coverage:
         failures.append(
-            "no class could be probed at all, so this run proved nothing about detection -- which "
-            "is the vacuous pass the self-test exists to remove"
+            "no class loaded anything, so this run proved nothing about detection -- which is the "
+            "vacuous pass the self-test exists to remove"
         )
     return report, failures
 
