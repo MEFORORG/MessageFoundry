@@ -25948,6 +25948,80 @@ Quarantining the two probes was considered and refused by the owner on 2026-09-0
 stands and is unaffected by this retraction: skipping them would stop the evictions and remove a
 connection-scaling guard.
 
+## 1489. the log write guard prints its roll notice to stdout, so it lands inside captured CLI output and breaks --json readers
+
+> 🔢 **Filed 2026-09-08 -- not started.** `messagefoundry/logging_guard.py` (shipped by PR #883 at 07:24Z, commit `995fc2790`) writes `application log sink stdout was rolled after a write` to the **stdout sink**. A CLI command invoked with `--json` writes its payload to that same stream, so a reader doing `json.loads(...)` sees the notice first and raises `Extra data: line 1 column 5`. Six tests in `tests/test_checks.py` fail this way, and it has already failed one merge-queue build.
+>
+> **Scored 2026-09-08 -> P2.** Value **6/10** · Difficulty **3/10** · _quick win_. Value 6 -- it makes `--json` output unreliable for any consumer, and it evicts merge-queue entries at random. Difficulty 3 -- the notice needs a stream that is not the machine-readable one.
+
+### What fails
+
+    FAILED tests/test_checks.py::test_check_clean_sample_passes
+    FAILED tests/test_checks.py::test_check_dryrun_accepts_single_file
+    FAILED tests/test_checks.py::test_check_dryrun_fails_on_bad_message
+    FAILED tests/test_checks.py::test_check_dryrun_fails_on_missing_messages_path
+    FAILED tests/test_checks.py::test_check_dryrun_gates_when_fixtures_present
+    FAILED tests/test_checks.py::test_check_dryrun_skipped_without_fixtures
+
+All six raise the same `json.JSONDecodeError: Extra data: line 1 column 5` from `json.loads(capsys.readouterr().out)`.
+
+### Why this is the guard and not the PR that fails
+
+It surfaced on PR 976, whose **entire diff is `docs/BACKLOG.md`** -- that change cannot reach the code path. Sampled failed CI runs mentioning `tests/test_checks.py`:
+
+| Window | Sampled | Mentioning the file |
+|---|---|---|
+| 09-07 12:00Z to 09-08 07:23Z, before the guard merged | 12 | **0** |
+| 09-08 07:24Z onward, after it merged | 12 | **2** |
+
+**Both numbers are samples of twelve, not a census.** They are consistent with the mechanism rather than proof of it; the mechanism is the load-bearing part, and it is not in doubt -- the module did not exist before `995fc2790`, and the failure text is the notice that module writes.
+
+### Why it looks like a flake
+
+`main`'s own CI has been green on every commit since the guard landed, and the failure has only been seen on `windows-2025`. The roll only happens sometimes, so the notice only sometimes precedes the payload. **That is the shape that gets a real defect filed as bad luck**, which is why the before/after split is recorded here rather than left to a later reader to re-derive.
+
+### The fix is NOT what this item first said -- corrected before merge
+
+**The original text prescribed sending the roll notice to stderr. That would break the control.**
+It is recorded rather than quietly replaced, because the reasoning is the useful part.
+
+`_GuardedSinkMixin.handleError` writes the notice to the **replacement stream on purpose**, and says
+why: *"STAGE 1 is only complete once the REPLACEMENT has actually accepted a write. Both writes below
+go to the fresh stream; either raising means the replacement is no better than the file it replaced,
+which is precisely the Stage 2 condition."* The notice **is the proof that the rolled sink recovered**.
+Move it to stderr and stage 1 can no longer tell a healed stdout sink from a dead one, so the
+fail-closed halt loses its trigger. `_last_resort` already writes to stderr for the case where there is
+no working sink at all; that is a different channel for a different fact.
+
+### What the defect actually is
+
+Two streams with different contracts share one file descriptor. `messagefoundry check --json` writes a
+machine-readable payload to stdout, and the default log sink writes to stdout as well. Under pytest's
+capture the guard's re-resolve fires -- **the scenario `GuardedStreamHandler`'s docstring was written
+for**, naming "pytest's capture teardown" by name -- and the notice lands in the captured buffer ahead
+of the payload, so `json.loads` reports `Extra data: line 1 column 5`.
+
+So the question is not which stream the notice takes. It is one of:
+
+1. **A `--json` payload should not share a stream with logging.** A parser contract and a
+   human-readable log on one descriptor is the collision, and the CLI is where that is decided.
+2. **The tests should not assert stdout is pure JSON while logging is live.** `test_checks.py` reads
+   `json.loads(capsys.readouterr().out)`, which is only sound if nothing else may write there.
+
+Both are real and neither is inside `logging_guard.py`. **Whoever takes this up should start from the
+guard's docstrings and choose between those two, not from a prescription in this item.**
+
+### How this item went wrong, since it is the second time in one day
+
+The seat matched a symptom to a mechanism and proposed changing code it had not read. BACKLOG #1488
+failed the same way and had to be retracted after it merged. The tell in both cases is the same: the
+proposed change made a guard weaker, and the guard's own comments already recorded the measurement that
+put it there. **A prescription that weakens a control is the one that most needs the code read first.**
+
+### Not taken here
+
+No revert of #883 is proposed. The guard is wanted and its re-resolve design is deliberate.
+
 ## 1448. a dispatched brief is frozen at spawn: the chip cannot be corrected and nothing tells the receiver it has drifted
 
 > 🔢 **FILED 2026-09-04 by the session that read the stale brief.** Not started. A **fleet-process** defect with no engine, PHI or deployment axis (sec. 0) -- nothing here reaches a running instance, because there are none. What it would cost is duplicated Builder turns and a prose merge conflict a human then resolves by hand.
