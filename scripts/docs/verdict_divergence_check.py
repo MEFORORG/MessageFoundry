@@ -44,6 +44,17 @@ WHAT THIS DELIBERATELY DOES NOT DO
 item was filed without scoping it on purpose. This makes the divergence VISIBLE and resolves none of
 it. Choosing a winner here would encode an answer nobody has given, and a wrong machine-readable
 verdict is worse than a visible disagreement: one is refusable, the other is trusted.
+
+WHERE IT RUNS, AND WHY IT CANNOT FAIL A MERGE
+-----------------------------------------------
+``.github/workflows/quality-advisory.yml`` runs it on every pull request, with ``--advisory``, in the
+one workflow in this repository that holds no required status-check context. That is the whole
+wiring: no pre-commit hook, no blocking gate. **Making a check RUN is a Builder's call; making one
+BLOCK is the owner's** -- and here the blocking form is not merely unauthorised, it is unanswerable
+by a machine, because the rows it would fail on are exactly the reconciliation above.
+
+``tests/test_verdict_divergence_advisory.py`` pins that shape. A wiring claim in a docstring is only
+as fresh as the day it was written, so trust that file over this paragraph where they disagree.
 """
 
 from __future__ import annotations
@@ -136,6 +147,11 @@ def main(argv: list[str] | None = None) -> int:
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
     ap.add_argument("--backlog", type=Path, default=_ROOT / "docs" / "BACKLOG.md")
+    ap.add_argument(
+        "--advisory",
+        action="store_true",
+        help="report and exit 0 even when a banner contradicts its own re-score (default: exit 1)",
+    )
     args = ap.parse_args(argv)
 
     if not args.backlog.is_file():
@@ -146,6 +162,33 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     r = scan(args.backlog)
+
+    # REFUSE AN EMPTY POPULATION RATHER THAN REPORT IT CLEAN, and refuse it under `--advisory` too.
+    #
+    # Without this the tool prints `0 open item(s); 0 carry a banner Verdict ... 0 DIVERGE` and exits
+    # 0 -- a green that describes the INSTRUMENT rather than the ledger, and identical on screen to a
+    # reconciled tree. Both zeros mean the same thing: this is not the ledger, or the parse is dead.
+    #
+    # ONE TEST, NOT TWO, because `with_banner` counts a SUBSET of the open items -- `scan` increments
+    # it only inside the open-item branch, so it is zero whenever `open_items` is. Testing both would
+    # read as two independent failure modes and be one, which is the shape of a guard that cannot
+    # fire. The message prints both counts, so a reader still sees which way it died: no items at all
+    # is `parse_items` or the file, items with no banner among them is the BANNER block. A SINGLE
+    # item legitimately carrying no verdict is ordinary and `scan` skips it; a ledger where NOTHING
+    # carries one is not.
+    #
+    # Exit 2, not 1, and the difference is what the advisory wiring reads: 1 is a FINDING (suppressed
+    # by --advisory), 2 is "the tool did not measure" (never suppressed). With that split, a non-zero
+    # exit under --advisory means a malfunction and nothing else, which is what lets an advisory job
+    # keep a broken scan visible while a real divergence stays green.
+    if r.with_banner == 0:
+        print(
+            f"verdict-divergence: refusing to report on an empty population -- {r.open_items} open "
+            f"item(s), {r.with_banner} carrying a banner Verdict, in {args.backlog}.\n"
+            "                    A clean result over nothing is not a clean result.",
+            file=sys.stderr,
+        )
+        return 2
 
     # THE DENOMINATOR IS PART OF THE RESULT. Without `with_rescore` a reader cannot tell whether the
     # comparison examined three items or three hundred, and a clean run would look like coverage.
@@ -168,7 +211,13 @@ def main(argv: list[str] | None = None) -> int:
         "  Every tool reads the BANNER, so each of these dispatches as freely workable. Which source "
         "wins is an ASSESSOR decision and this check does not make it."
     )
-    return 1
+    # FAIL CLOSED BY DEFAULT; `--advisory` is the opt-out the wiring passes. The item's build detail
+    # asked for "fails rather than warns", and that default is kept: a divergence is never benign.
+    # What the advisory flag buys is the ability to RUN the check at all -- the three rows on the
+    # tree today are exactly the reconciliation this item refuses to make, so a blocking gate would
+    # red every merge on a decision nobody has taken. Reporting is a Builder's call; blocking is the
+    # owner's, and the same split governs the sibling dangling-citation check.
+    return 0 if args.advisory else 1
 
 
 if __name__ == "__main__":  # pragma: no cover
