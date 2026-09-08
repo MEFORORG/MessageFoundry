@@ -25096,8 +25096,6 @@ Vault `roles/BUILDER.md:213-217`, under the heading "Closing a ledger row makes 
 
 I read only `roles/` in the vault and ran no git history there, so I cannot date when any of these lines was written. Eleven of the fourteen playbooks were matched by the needle above but not read, so treat the population as **at least three files**, not a total. I did not check whether any workflow or CI job reads a playbook, and I confirmed no case in which a seat actually followed `BUILDER.md:216` and produced a red PR -- I measured the instruction and the gate, not an incident.
 
-
-
 ## 1479. Scope the required gitleaks scan to the ref under test; today any pushed branch can red main and freeze the queue
 
 > 🚧 **Filed 2026-09-07 -- the code fix ships in this PR. THE GATE IS RED AS THIS IS WRITTEN, on TWO unmerged branches at once, so this is a live freeze and not a post-mortem.** Value **9/10** · Difficulty **2/10** · _quick win_. The `gitleaks (secret scan)` job ran with no `--log-opts`, so it walked every ref the `fetch-depth: 0` checkout had fetched. Branch protection reads its answer as a statement about the ref under test; the job was answering it about the whole repository. On 2026-09-06 an unmerged branch's synthetic fixture reddened `main` and the merge queue with it, freezing merging for over four hours and evicting five entries. Per `CLOSING_SEAT["code"]` the banner flip on merge is the LANDER's.
@@ -25236,8 +25234,6 @@ The detector control stayed green in all four, which is the asymmetry: it flags 
 ### Not checked
 
 I did not read gitleaks' source, so "walks every ref when the flag is unset" rests on the commit counts above and not on the code. I did not test a fork pull request, where the checkout and the available refs differ. I did not check whether any other workflow in this repository scans with a whole-repository default; only `security.yml`'s secret job was examined.
-
-
 
 
 ## 1475. Derive the log redactor's secret vocabulary from the settings registry, with a reasoned exclusion table
@@ -25469,8 +25465,6 @@ Raised by a peer session reviewing #1479, which asked what the range evaluates t
 ### Not checked
 
 I did not test a fork pull request. I did not check whether any other scanner in `.github/workflows/` can be given an empty scope -- #1479's altitude pass established that gitleaks is the only ref-walking scanner, but "can its input be made empty" is a different question from "does it walk refs", and I did not ask it of the working-tree scanners.
-
-
 
 
 ## 1483. apply.py's module docstring enumerates the evidence fields and so denies the two it carries
