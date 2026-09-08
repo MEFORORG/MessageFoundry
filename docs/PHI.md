@@ -629,8 +629,8 @@ it is carried as a **stated deployment requirement** (§10) accepted via a signe
 (ASVS-L3-RISK-ACCEPTANCE-REGISTER.md theme 5), not code.
 The compensating controls are the documented restricted-service-account + volume-encryption posture (§10)
 on a single-tenant host: keep the decrypted-secret window inside an OS-isolated process whose memory and
-swap an attacker cannot reach without already owning the host. ⚠️ **Both halves are operator-asserted
-and engine-unchecked — say so whenever this is offered as compensating.** §2 records it directly: there
+swap an attacker cannot reach without already owning the host. **CAUTION: both halves are
+operator-asserted and engine-unchecked — say so whenever this is offered as compensating.** §2 records it directly: there
 is **no** `[security].volume_encryption_declared` setting at HEAD and **nothing in the engine verifies
 that FDE is on**. So this mitigates only where the operator actually applied it, and the engine cannot
 tell you whether they did. *(Qualified 2026-08-02: the sentence previously read as though the posture
@@ -656,7 +656,7 @@ where it is absent.
 rule 1 takes it out of scope. Re-scoring remains an owner decision rather than a side effect of
 shipping a build.
 
-⚠️ **The record is the scorecard itself** — `docs/security/asvs-scorecard.toml`, rendered and CI-gated
+**NOTE: the record is the scorecard itself** — `docs/security/asvs-scorecard.toml`, rendered and CI-gated
 ([ADR 0156](adr/0156-asvs-scorecard-as-data-a-derived-count-verified-evidence-anchors-and-a-fail-closed-drift-gate.md))
 — **never a prose assessment.** ADR 0156 replaced the dated-document lineage precisely because prose
 asserts facts about code and the code moves; do not cite a dated assessment file as the verdict of
