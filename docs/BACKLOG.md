@@ -12699,6 +12699,73 @@ QT_QPA_PLATFORM=offscreen pytest packaging/messagefoundry-webconsole/tests/test_
 
 **Two things a rescore must not take from this work.** The measurement does not lift the cell: ARM A's zero is evidence that the console's absence of grant rows is structural, which is the *reason* the coverage gap is real, not evidence against it. And the flooding cost is now measured rather than asserted, which removes the excuse for leaving the trail narrow -- it does not by itself authorise turning console parity on, because ARM C shows a first deployment would already be accumulating 172,800 rows a day per polling client with `audit_days` reserved and unenforced. **The drain is the precondition this item already named, and the measurement strengthens it rather than retiring it.**
 
+### Built 2026-09-05 -- the two DENIAL audits this item named, and nothing else
+
+**Two refusals that reached no audit row now reach one, and both were RE-MEASURED at HEAD before
+anything was written.** The item's proposed-work list names them; the rest of that list is untouched
+and **this item stays open**, because its closing act is a scorecard re-score in the vault that no
+build performs.
+
+**Re-measurement, executed, each arm carrying a control that must fire.** The console's
+`authorize_ui_ws` wrote **zero** audit rows for an MFA-pending session while the engine's header-path
+`authorize_ws` wrote `auth.mfa_denied` for the **same session, on the same store, through the same
+counter, in the same run** -- that contrast is the control, and without it a zero is a fact about the
+instrument rather than about the gate. `require_service_cert` wrote **zero** rows on a refused
+authorization while emitting its `log.warning`, against the same shape of control: `require`'s
+bearer-plane denial wrote `auth.permission_denied` for the same principal in the same run. Two further
+controls guard the console arm specifically -- `mfa_satisfied` was asserted False and the identity was
+asserted to resolve, so the gate demonstrably reached the MFA branch instead of returning at an
+earlier one and reporting a tidy, meaningless zero.
+
+**What shipped.** `authorize_ui_ws` now calls `audit_mfa_denied` before returning the empty pair on an
+MFA-pending session, matching what the engine's gates already do and for the same stated reason: the
+refusal sits ABOVE the permission loop, so the denial call inside that loop cannot reach it and the
+header-path fallback never sees a browser handshake. `require_service_cert`'s dependency now calls
+`audit_permission_denied` beside its existing log line. Both rows carry the permission (where there is
+one) and the PATH, never the full URL -- the no-payload limb this item calls load-bearing and fragile.
+Behaviour is otherwise unchanged: the console still returns `(None, None)` and still falls through,
+and the cert gate still raises the same 403.
+
+**The GRANT side was deliberately NOT built, on this item's own evidence.** A grant row is
+per-request and the chain has no drain, which part (a) measured rather than assumed. Console grant
+parity across the gate applications is the flood and stays gated on the drain and on a ruling. The
+cert plane's grant is left with it rather than taken as a cheap exception.
+
+**Four tests hold it, and the denial pair was DRIVEN.** With both source changes reverted,
+`test_ws_cookie_auth_mfa_pending_refusal_is_audited` and `test_service_cert_authz_denial_is_audited`
+fail and the rest of both files pass; with them restored all pass. The console test asserts `detail`
+equals exactly `{"path": "/ws/stats"}`, so widening the row to the full URL goes red, and it asserts a
+permission the actor does NOT hold while requiring that no `auth.permission_denied` row appears --
+an ordering guard, because refusing below the permission loop would tell an unverified caller whether
+it holds the permission. `test_ws_cookie_auth_mfa_satisfied_writes_no_mfa_row` and
+`test_service_cert_grant_writes_no_authorization_row` pass in BOTH states by design: they are the
+guards that a later mirror of the grant side cannot arrive unnoticed, and the second of them pins the
+measured fact that `[diagnostics].audit_all_authz` is True on that app and still does not reach that
+gate.
+
+**THREE CORRECTIONS THIS ITEM OWES, and the first one changes the residual drafted above.**
+
+1. **The drafted replacement residual names `authorize_ui_ws`'s silent return on an MFA-pending
+   session as uncovered. That is REPAIRED as of this change and must not be carried into a re-score** --
+   it is exactly the failure the same paragraph warns about, a rescore repairing a defect that no
+   longer exists. Part (b)'s "the cheap reading would not even work" argument rested on that same
+   silent return; the conclusion it supports is unaffected, because the L2 limb is still short by the
+   per-item list and graph withholds and by per-property redaction's unrecorded withhold, but the
+   sentence naming this gate is now historical. Read the rest of that residual as standing: the
+   console's `require_ui` family, the nav-status inline branch, and per-property redaction are
+   untouched, and the "at least" framing still binds.
+2. **The proposed-work line anchors the service-certificate work at `api/security.py:434-444`, which
+   is the DOCSTRING of `require_service_cert`, not the denial.** The denial lives in the closure that
+   factory returns. Anchor by symbol -- `require_service_cert`, `resolve_client_cert_identity` -- as
+   the re-score paragraph already requires of the others.
+3. **"and its grant path, which records nothing in any configuration" is right about the GATE and
+   incomplete about the surface.** The one shipped route on that gate, `GET /service/identity`, writes
+   its own `service_cert_auth` row **in the route body**, so the mTLS admission is not silent for that
+   route -- `docs/SECURITY.md` states this in two places and both remain true. What is genuinely
+   absent is any record of the authorization DECISION, and any record at all for a future route built
+   on the same factory, which is what the grant work would close.
+
+
 **Built 2026-09-06 -- the console MFA-denial audit, one item from this row's list.**
 `messagefoundry_webconsole/_auth.py`'s `require_ui` refused an MFA-pending session with a bare 303 and
 recorded nothing, where the engine's own HTTP and WebSocket gates both call `audit_mfa_denied`.
