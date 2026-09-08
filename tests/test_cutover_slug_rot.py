@@ -29,7 +29,9 @@ TRIAGE TAXONOMY, for whoever lowers the ratchet next. Of the current hits:
     test_threat_model_doc_drift, test_ui_csp_canary), and the "pre-cutover this said X" annotations
     added when the guards above were fixed. These describe the past accurately.
   * KEEP — not about this repo: `docs/INSTALL-GUIDE.md` / `docs/VERSION-CONTROL.md` mean the ADOPTER's
-    own private repo; `docs/SECURITY.md`'s GHAS note is a true statement about GitHub's pricing.
+    own private repo. This list also named `docs/SECURITY.md`'s GHAS note, which was retired on
+    2026-09-07 (BACKLOG #1485) because its ADVICE had gone stale on a public repo, not because the
+    pricing claim in it was rot. Its removal is why the count fell by one.
   * KEEP — idiom: "the mirror image of" in PLAN-PHASE4-GROUP-COMMIT and test_ledger_check.
   * FIX — present-tense claims that this repo is a mirror, or that a private source repo runs CI.
 
