@@ -94,6 +94,7 @@ __all__ = [
     "DiagnosticsSettings",
     "EnvironmentsSettings",
     "LoggingSettings",
+    "LogWriteFailurePolicy",
     "LogFormat",
     "SyslogProtocol",
     "ReferenceSettings",
@@ -1410,6 +1411,17 @@ class LogFormat(str, Enum):  # noqa: UP042
     JSON = "json"  # one JSON object per line — structured for a log shipper / SIEM
 
 
+class LogWriteFailurePolicy(str, Enum):  # noqa: UP042
+    """What the engine does when an application-log sink is unwritable AND its replacement is too."""
+
+    # Fail-closed (the default): stop every connection this process owns. Never fires on a first
+    # failure — only when the rolled replacement is unwritable as well (#122 stage 2, ADR 0162).
+    STOP = "stop"
+    # Alert + roll, but keep running. The documented opt-out; an operator choosing it accepts that
+    # messages can be processed with no application-log record of the processing.
+    CONTINUE = "continue"
+
+
 class SyslogProtocol(str, Enum):  # noqa: UP042
     # RFC 5426; fire-and-forget, never blocks the engine (the default).
     UDP = "udp"
@@ -1435,11 +1447,29 @@ class LoggingSettings(_Section):
     # a log shipper tailing NSSM's captured stdout).
     format: LogFormat = LogFormat.TEXT
     # Optional directory NSSM (or another supervisor) rotates the engine's captured stdout/stderr into.
-    # We never write log FILES ourselves (the engine logs to stdout — see logging_setup), but if an
+    # The engine writes no log FILE of its own unless `file` below is set (opt-in, #122), but if an
     # operator tells us where the supervisor parks them, GET /status meters that directory's total bytes
     # + filesystem free space alongside the DB metrics (#50). None (the default) = stdout-only, no
     # metering. Metadata only — the contents are never read.
     log_dir: str | None = None
+
+    # --- Engine-managed application log file + fail-closed write guard (#122, ADR 0162) ----------
+    # OPT-IN second sink the ENGINE owns end to end: it opens it, it size-rotates it (file_max_bytes /
+    # file_backup_count) and it rolls it aside on a write failure. None (the default) = stdout-only,
+    # byte-identical to before, and NSSM stays the sole rotation owner of the captured stdout files.
+    # ONE FILE, ONE OWNER: the validator below refuses a `file` inside `log_dir` (the supervisor's
+    # rotation territory) — two rotation owners renaming one file is how a log gets shredded. See
+    # docs/SERVICE.md "Who owns which log file".
+    file: str | None = None
+    file_max_bytes: int = 50_000_000  # size-rotate at ~50 MB (0 = never rotate on size)
+    file_backup_count: int = 5  # keep app.log.1 .. app.log.N alongside the live file
+    # THE FAIL-CLOSED CONTROL (#122). "stop" (default): when a log sink cannot be written AND the
+    # replacement rolled into its place cannot be written either, every connection this PROCESS owns
+    # stops — an engine that cannot log must not keep processing (CLAUDE.md §1 count-and-log). A first
+    # failure alone NEVER stops anything; the roll absorbs the transient. "continue" is the documented
+    # opt-out for an operator who would rather run blind than stop a feed; it still alerts and still
+    # rolls, it just does not stop.
+    on_write_failure: LogWriteFailurePolicy = LogWriteFailurePolicy.STOP
 
     # --- Off-box forwarding to a syslog/SIEM collector (ASVS 16.x; ADR 0080) ----------
     # Ship a copy of every log record to a remote syslog collector so log evidence survives a host
@@ -1497,6 +1527,43 @@ class LoggingSettings(_Section):
     time_sync_fail_closed: bool = (
         False  # refuse to start on skew / unreachable peer (further opt-in)
     )
+
+    @model_validator(mode="before")
+    @classmethod
+    def _refuse_renamed_file_keys(cls, data: Any) -> Any:
+        """Refuse the legacy planned spellings instead of silently ignoring them.
+
+        ``[logging]`` is pydantic ``extra="ignore"`` and CONFIGURATION.md carried ``max_bytes`` /
+        ``backups`` as accepted-but-ignored *planned* keys while the engine-managed file was unbuilt.
+        Now that the sink is real, ignoring them would hand an operator the 50 MB / 5-backup defaults
+        while their config said otherwise — a control that reports success while doing something
+        else. ``mode="before"`` because ``extra="ignore"`` drops them before any field validator
+        could see them.
+
+        **WHICH LAYER ACTUALLY REFUSES DEPENDS ON WHERE THE KEY CAME FROM, and this validator is not
+        the one an operator meets first.** :func:`_reject_unknown_file_keys` refuses an unrecognized
+        key in the TOML **file** before any model is built, so a file carrying either spelling never
+        reaches here. Measured: ``[logging].max_bytes`` in a file is refused by the loader *and*
+        suggested onward as ``file_max_bytes``, while ``[logging].backups`` is refused naming no
+        replacement — the loader's nearest-name heuristic does not reach ``file_backup_count``.
+
+        **The layer this one covers is ENV, which the file refusal deliberately does not.**
+        ``_env_overrides`` scrapes ``MEFOR_LOGGING_*`` straight into the section dict, and a
+        misspelled env var is otherwise dropped in silence (docs/CONFIGURATION.md, "The refusal covers
+        the FILE"). Measured: ``MEFOR_LOGGING_MAX_BYTES`` and ``MEFOR_LOGGING_BACKUPS`` each reach
+        this validator and are refused naming their replacement. So the two spellings are the rare
+        env keys that fail loudly, and that is worth keeping rather than folding into the loader."""
+        if isinstance(data, dict):
+            for legacy, actual in (
+                ("max_bytes", "file_max_bytes"),
+                ("backups", "file_backup_count"),
+            ):
+                if legacy in data:
+                    raise ValueError(
+                        f"[logging].{legacy} is not a setting — the engine-managed application-log "
+                        f"file uses [logging].{actual} (BACKLOG #122, ADR 0162)"
+                    )
+        return data
 
     @field_validator("level")
     @classmethod
@@ -1562,6 +1629,24 @@ class LoggingSettings(_Section):
             )
         if self.time_sync_fail_closed and not self.require_time_sync:
             raise ValueError("[logging].time_sync_fail_closed requires [logging].require_time_sync")
+        # ONE FILE, ONE ROTATION OWNER (#122, ADR 0162 §6). `log_dir` is where the SUPERVISOR (NSSM)
+        # parks and rotates the captured stdout; `file` is a log the ENGINE opens, rotates and rolls.
+        # Putting the engine's file inside the supervisor's directory points two rotators at one
+        # directory, and the loser of that race is the log an operator reads after an incident.
+        if self.file is not None and self.log_dir is not None:
+            engine_file = Path(self.file).expanduser().resolve(strict=False)
+            supervisor_dir = Path(self.log_dir).expanduser().resolve(strict=False)
+            if engine_file == supervisor_dir or supervisor_dir in engine_file.parents:
+                raise ValueError(
+                    f"[logging].file ({self.file}) is inside [logging].log_dir ({self.log_dir}), "
+                    "which the supervisor (NSSM) rotates. Two rotation owners on one directory "
+                    "corrupt the log they are meant to preserve — put the engine-managed file "
+                    "somewhere the supervisor does not rotate (docs/SERVICE.md)"
+                )
+        if self.file_max_bytes < 0:
+            raise ValueError("[logging].file_max_bytes must be >= 0 (0 = never rotate on size)")
+        if self.file_backup_count < 0:
+            raise ValueError("[logging].file_backup_count must be >= 0")
         return self
 
 
@@ -1799,9 +1884,10 @@ class AuthSettings(_Section):
     require_action_step_up: bool = True
 
     # Multi-factor authentication (WP-14, ADR 0002 §3; ASVS 6.3.3) — a native RFC 6238 TOTP second
-    # factor for LOCAL accounts. AD/Kerberos MFA is delegated to the directory (Entra Conditional
-    # Access / an MFA proxy), so a directory login is never prompted for an engine TOTP. When
-    # require_mfa is on, an in-scope local account (see require_mfa_scope) MUST enroll a factor and
+    # factor. It covers EVERY account, directory ones included (BACKLOG #1144, ASVS 6.8.4): a ticket
+    # or a bind asserts nothing about what the directory enforced, so the engine grants nothing on it
+    # and asks for its own factor instead of exempting the leg. When require_mfa is on, an in-scope
+    # account (see require_mfa_scope) MUST enroll a factor and
     # satisfy it before its session may reach ANY authorized route — MFA is an ACCESS gate, not only
     # a step-up gate (ASVS 6.3.3). A user who has already enrolled a factor is always required to
     # satisfy it, whatever the scope.
@@ -1823,16 +1909,22 @@ class AuthSettings(_Section):
     # session, not merely step-up operations — an MFA-pending session is refused with 403 +
     # ``X-MFA-Required: 1`` (api/security.py:require) and, in the browser, confined to /ui/mfa.
     require_mfa: bool = True
-    # WHICH local accounts an un-enrolled session's access gate covers when require_mfa is on (ASVS
-    # 6.3.3). ``every_local_account`` (default) means any local account must carry a second factor;
+    # WHICH accounts an un-enrolled session's access gate covers when require_mfa is on (ASVS 6.3.3).
+    # ``every_local_account`` (default) means any account must carry a second factor;
     # ``administrators`` is the pre-6.3.3 posture where only the Administrator role must. An account
     # that has ALREADY enrolled a factor is required to satisfy it under either value — this dial only
-    # decides who must enroll in the first place. Directory (AD/Kerberos) identities are out of scope
-    # under either value: their MFA is delegated to the directory (owner-signed relaxation).
+    # decides who must enroll in the first place.
     #
-    # OPERATOR NOTE: under ``every_local_account`` a non-interactive LOCAL bearer-token service account
+    # THE ``every_local_account`` SPELLING IS NOW WIDER THAN ITS NAME (BACKLOG #1144). Directory
+    # identities used to be exempt under either value; they are not, because the directory legs assert
+    # no strength and the engine grants nothing on that. Renaming the Literal reaches this model, the
+    # CONFIGURATION.md table and the tests that pin both -- its own coherent change, not a rider on a
+    # security fix. THIS IS THE SINGLE PLACE that mismatch is explained; do not restate it (SDS-3.5).
+    #
+    # OPERATOR NOTE: under ``every_local_account`` a non-interactive bearer-token service account
     # becomes MFA-pending and cannot enroll unattended — move it to mTLS (api/security.py:
-    # require_service_cert, which is exempt by design) or to AD, or set this to ``administrators``.
+    # require_service_cert, which is exempt by design) or set this to ``administrators``. Moving it to
+    # AD is NO LONGER an escape: a directory account is in scope like any other.
     require_mfa_scope: Literal["administrators", "every_local_account"] = "every_local_account"
     # TOTP clock-skew tolerance, in 30-second time steps, applied when verifying a submitted code
     # (BACKLOG #187; ASVS 6.5.5). Default 0 = STRICT: only the current 30 s step is accepted, so a
@@ -2046,7 +2138,7 @@ class AuthSettings(_Section):
     oidc_prompt: str | None = None  # requested `prompt` authorize param
     oidc_jwks_ttl_seconds: int = 3600
     oidc_jwks_min_refetch_seconds: int = 300  # the amplification bound
-    oidc_flow_ttl_seconds: int = 300
+    oidc_flow_ttl_seconds: int = 300  # single-use flow window; validator-capped 30..1800
     oidc_flow_cache_max: int = 512  # reject-when-full (never evict — that is a login DoS)
     oidc_session_max_hours: int | None = None  # G2: cap below id_token.exp if tighter is wanted
 
@@ -2116,6 +2208,24 @@ class AuthSettings(_Section):
     def _check_oidc_skew(cls, value: int) -> int:
         if not 0 <= value <= 300:
             raise ValueError("oidc_clock_skew_seconds must be between 0 and 300")
+        return value
+
+    @field_validator("oidc_flow_ttl_seconds")
+    @classmethod
+    def _check_oidc_flow_ttl(cls, value: int) -> int:
+        # Bounded at BOTH ends (BACKLOG #1156, ASVS 10.1.2), because each end fails differently.
+        # FLOOR: the value becomes the flow cookie's `Max-Age`, so at or below zero the browser
+        # discards the cookie on receipt and every federated login then fails `flow_binding_missing`
+        # with nothing naming the cause. CEILING: this is both the single-use replay window for the
+        # staged `(state, nonce, code_verifier)` and how long one abandoned flow holds an
+        # `oidc_flow_cache_max` slot -- see that field for why the cache rejects rather than evicts.
+        #
+        # The endpoints are a JUDGMENT with no measured anchor, and no neighbouring field supplies
+        # one: every other lifetime and size in this OIDC block is itself unbounded (verified by
+        # execution -- `oidc_jwks_ttl_seconds` accepts 10_000_000). What is NOT a judgment is that
+        # an unbounded value is wrong in both directions.
+        if not 30 <= value <= 1800:
+            raise ValueError("oidc_flow_ttl_seconds must be between 30 and 1800")
         return value
 
     @field_validator("totp_skew_steps")
@@ -2711,6 +2821,11 @@ _ALERT_EVENT_TYPES = frozenset(
         # ASVS 6.4.5 arm 2: an UNCLAIMED first-run bootstrap admin is nearing its auto-disable deadline
         # (payload is the ISO deadline + whole hours remaining — never the password; PHI-free)
         "bootstrap_admin_expiring",
+        # #122 (ADR 0162): an application-log sink was rolled after a write failure (stage 1) or is
+        # UNWRITABLE and this process's connections were stopped (stage 2). Routable on its own so an
+        # operator can page on "the engine went deaf" apart from the per-connection connection_stopped
+        # events the stop also emits.
+        "log_write_failed",
         # NOTE: the INVERSE events (leadership_lost / dr_released) are auto-resolve-only (alert_sinks
         # _AUTO_RESOLVE), NOT rule-targetable alert types — a step-down / fail-back needs no page.
     }
@@ -3212,6 +3327,14 @@ class SecretRotationSettings(_Section):
     of due. It reads **only** the rotation *dates* an operator supplied here — never any secret value
     (PHI-free). Set ``warn_days`` to 0 to disable the reminder.
 
+    **The store DEK's calendar expiry is ENFORCED, not merely announced** (ASVS 13.3.4, BACKLOG #1004).
+    Under ``[security].enforcement=ENFORCE`` with a keyed store, a DEK past ``store_key_max_age_days +
+    enforce_grace_days`` — or one whose age cannot be determined at all — **aborts engine start**
+    (``StoreKeyRotationOverdueError``), alongside the escalated alert rather than instead of it. That
+    matches the same key's **usage** axis, which has always refused unconditionally at ``2**32``
+    encrypts. ``enforce_store_key_expiry = false`` keeps the alert and drops the refusal; it is a
+    reported security loosening, not a quiet switch.
+
     The store DEK is tracked **live-by-default** (ASVS 13.3.4, BACKLOG #282): at first keyed start the
     engine persists a non-secret tracked-since stamp (the DEK key-id + first-seen date) in store meta and
     watches the DEK off it, so setting ``store_key_last_rotated`` (an ISO ``YYYY-MM-DD`` date) is an
@@ -3240,6 +3363,14 @@ class SecretRotationSettings(_Section):
     # ENFORCE escalation grace (ASVS 13.3.4): under [security].enforcement=ENFORCE, a DEK older than
     # store_key_max_age_days + this grace escalates its rotation alert (higher severity) at restart.
     enforce_grace_days: int = 30
+    # ASVS 13.3.4 / BACKLOG #1004 — the calendar axis REFUSES, not just alerts. Under
+    # [security].enforcement=ENFORCE with a keyed store, a DEK past store_key_max_age_days +
+    # enforce_grace_days (or one whose age cannot be determined) aborts engine start. Default TRUE:
+    # the DEK's USAGE axis already refuses unconditionally at 2**32 encrypts, so a calendar axis
+    # shipping OFF would be strictly weaker than its own sibling on the same key, and a default-off
+    # build would buy the setting without the posture. Setting it false is a LOOSENING and
+    # security_loosenings() names it, so the opt-out is never silent.
+    enforce_store_key_expiry: bool = True
 
     @field_validator("warn_days")
     @classmethod
@@ -4309,6 +4440,7 @@ def security_loosenings(
     store: StoreSettings,
     auth: AuthSettings,
     alerts: AlertsSettings,
+    secret_rotation: SecretRotationSettings,
     cleartext_hops: Sequence[str],
     expiry_relaxed_hops: Sequence[str],
     unverified_db_hops: Sequence[str],
@@ -4321,7 +4453,8 @@ def security_loosenings(
     that iterates ``SecuritySettings.model_fields`` and fails on an unreported, unexempted one — plus an
     ENUMERATED set of deviations that live elsewhere: ``[store].aad_bind``,
     ``[auth].ad_session_recheck_seconds``, ``[alerts].email_use_tls``/``email_tls_verify`` (#323
-    layer 3), and three per-connection deviations — ``cleartext_accepted``, ``tls_allow_expired``, and a
+    layer 3), ``[secret_rotation].enforce_store_key_expiry`` (#1004), and three per-connection
+    deviations — ``cleartext_accepted``, ``tls_allow_expired``, and a
     generic-ODBC ``DATABASE`` hop with TLS unenforced (#333). It is NOT yet
     an exhaustive registry of every security-relevant switch in every section; ``[store]``/``[auth]``
     carry others (``encrypt``, ``trust_server_certificate``, ``enabled``, ``require_mfa``,
@@ -4445,7 +4578,8 @@ def security_loosenings(
         out.append(
             (
                 "require_mfa",
-                "every local account is single-factor — no native TOTP second factor is required",
+                "every account is single-factor — no engine second factor is required, and a "
+                "directory session is admitted on a ticket that asserts no strength",
             )
         )
     elif sec.require_mfa_scope != "every_local_account":
@@ -4454,8 +4588,8 @@ def security_loosenings(
         out.append(
             (
                 "require_mfa_scope",
-                "only Administrators must enroll a second factor — every other local account is "
-                "single-factor until it opts in by enrolling",
+                "only Administrators must enroll a second factor — every other account, local or "
+                "directory, is single-factor until it opts in by enrolling",
             )
         )
     if sec.allow_single_factor_admin_when_exposed:
@@ -4525,6 +4659,20 @@ def security_loosenings(
                 "aad_bind",
                 "at-rest values are NOT bound to their (table, column, row) cell — a ciphertext moved "
                 "between cells decrypts instead of failing its auth tag (no effect without a store key)",
+            )
+        )
+    # BACKLOG #1004 (ASVS 13.3.4). Stated as what the SITE gives up rather than "a setting is off": the
+    # engine keeps starting on a key past its documented cadence, and the only remaining signal is an
+    # alert nobody has to answer. Named here because a silent opt-out from a refusal is indistinguishable
+    # from the refusal never having been built — which is the defect the refusal replaced.
+    if not secret_rotation.enforce_store_key_expiry:
+        out.append(
+            (
+                "enforce_store_key_expiry",
+                "the store data-encryption key's CALENDAR expiry does not stop anything — a DEK past "
+                "its max age plus grace, or one whose age cannot be determined, still starts the "
+                "engine and keeps encrypting PHI at rest, with an alert as the only signal (the same "
+                "key's 2**32-encrypt usage ceiling still refuses unconditionally)",
             )
         )
     # Conditional on ad_enabled, like allowed_client_networks above: with no directory there is nothing to

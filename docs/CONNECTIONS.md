@@ -757,7 +757,28 @@ that enumeration was wrong — the SCP is a receiver of remote-pushed content on
 two HTTP routes. None of the drop-directory policy below applies to it: its size ceilings, peer
 controls and transport security are connector settings documented under
 [DICOM](#dicom--dicom-inbound-c-store-scp--outbound-c-store-scuc-echo-and-dicomweb-stow-rs-adr-0025),
-and a deploying site must set them there rather than assume this block covers them. The **directory
+and a deploying site must set them there rather than assume this block covers them. **The embedded-document detach is a STAGE, not a fifth receiver, and its ceilings are stated here
+because the requirement asks for unpacked size wherever content is accepted.** When an inbound sets
+`stream_threshold_bytes` (default `None`, so the whole path is OFF unless a feed asks for it), a body
+at or above that size has its opaque documents detached from the transformable skeleton
+([ADR 0105](adr/0105-streaming-very-large-hl7-attachments-detach-the-opaque-document-from-the-transformable-skeleton.md))
+and stored for the attachment-download route above. Nothing new arrives on the wire -- the bytes came
+in through one of the receivers already listed -- which is why the count above does not move. Two
+ceilings bound it, and they bound different things:
+
+- the inbound's own **`max_message_bytes`** bounds a SINGLE body, and applies whether or not a detach
+  happens;
+- **`[inbound].stream_inflight_budget_bytes`** bounds the AGGREGATE bytes of over-threshold bodies
+  concurrently mid-detach across all inbounds. Its default is `0`, which means **unlimited in the
+  aggregate**. Read that precisely: no single body escapes `max_message_bytes`, but the number of
+  such bodies in flight at once is uncapped until an operator sets this. A detach that would cross a
+  positive budget is refused with backpressure, `ERROR`-ed rather than accepted-and-dropped.
+
+Permitted **types** on this path are whatever the inbound declared. Outside the handful of families
+with a leading magic signature, a detached document's type is accepted as sent
+(`messagefoundry/parsing/sniff.py`), so this stage is not a content gate and must not be read as one.
+
+The **directory
 source's** handling of an untrusted drop directory is fixed policy (the HTTP uploaded-logs surface has
 its own policy block below):
 
@@ -885,9 +906,12 @@ them at the response: the sender-influenced OBX-5.2 MIME is forced through `_saf
 to `application/octet-stream` on any non-clean value **and** on any **browser-active** type (`html`,
 `xml`, `script`, `svg` subtypes + `multipart`, matched case-folded, length-bounded); the response carries
 `Content-Disposition: attachment` (a download, never an inline render), `X-Content-Type-Options: nosniff`
-(no MIME re-sniff), and `Content-Security-Policy: default-src 'none'; sandbox` (an opaque origin with
-scripts/forms disabled), re-asserted on the `/ui` delegate from **outside** the console's own CSP writers
-so a browser-active representation can never execute in the application origin.
+(no MIME re-sniff), and `Content-Security-Policy: default-src 'none'; sandbox; frame-ancestors 'none'`
+(an opaque origin with scripts/forms disabled, and no framing), re-asserted on the `/ui` delegate from
+**outside** the console's own CSP writers so a browser-active representation can never execute in the
+application origin. `frame-ancestors` is named in that policy rather than left to the API's security
+header floor because it takes **no fallback from `default-src`** — without it, the strictest policy the
+engine writes was the one response family carrying no framing decision at all (ASVS 3.4.6).
 
 ### Remote file — `Sftp(...)` / `Ftp(...)`
 
@@ -1319,7 +1343,7 @@ wrapping an HL7 payload) — **not** the full envelope. The transport builds the
 | `client_key_password` | — | key passphrase (a **secret** — via `env()`) |
 | `ws_security` | `false` | stamp `<wsse:Security>` (a `Timestamp` + optional `UsernameToken`) |
 | `ws_username` / `ws_password` | `basic_*` | `UsernameToken` credentials (secrets — via `env()`) |
-| `ws_password_type` | `text` | `text` (PasswordText; **recommended over mTLS**) or `digest` (PasswordDigest, computed in `send()`) |
+| `ws_password_type` | `text` | `text` (PasswordText) only. `digest` (PasswordDigest) was **retired** in BACKLOG #1171 (ASVS 11.4.1): the construction is SHA-1 by profile definition, and a UsernameToken over a cleartext hop is refused anyway, so the channel already carried the credential. Setting it raises |
 | `ws_addressing` | `false` | stamp `<wsa:Action>` (from `soap_action`), `<wsa:To>` (from `url`), `<wsa:MessageID>` (per-call) |
 | `ws_timestamp_ttl_seconds` | `300` | the `Created`→`Expires` window |
 
@@ -1443,7 +1467,7 @@ instance — see [CONFIGURATION.md `[egress]`](CONFIGURATION.md#egress). (The ke
 `[security].block_unlisted_outbound`; `[egress].deny_by_default` moved there under ADR 0118 and is
 **rejected at config load**.)
 
-⚠️ **`allowed_smtp` is one of the two lists that does *not* count as "egress is restricted".** The
+**CAUTION: `allowed_smtp` is one of the two lists that does *not* count as "egress is restricted".** The
 open-egress startup gate reads only `allowed_mllp`/`allowed_tcp`/`allowed_http`/`allowed_db`/
 `allowed_remote`/`allowed_file_dirs`, so a PHI instance whose **only** declared egress is this `Email()`
 relay populates `allowed_smtp`, declares its one destination — and still **exits 2** with *"outbound
@@ -1501,7 +1525,7 @@ of the transport TLS. Crypto is core `cryptography` (`serialization.pkcs7`) and 
 | `port` | `587` | `587` = STARTTLS submission; `465` = implicit TLS (`SMTP_SSL`) |
 | `subject` | `""` | static `Subject` |
 | `username` / `password` | — | optional SMTP `AUTH` credentials (secrets — via `env()`) |
-| `use_tls` | `true` | STARTTLS by default. `false` is refused unless `MEFOR_ALLOW_INSECURE_TLS` is set, and SMTP `AUTH` over cleartext is **refused outright**. ⚠️ **This is not the same posture as `Email(...)` — the shipped enforcing default does not close it.** `Direct()` consults the **raw** escape variable directly: it does **not** route through the shared cleartext-hop authority, so `[security].enforcement = enforce` does **not** clamp it and `cleartext_accepted` / `cleartext_reason` on the outbound are **not consulted** (declaring them changes nothing here). With the variable set, a cleartext-SMTP Direct hop crosses on a production-PHI enforcing instance. The S/MIME body stays signed + encrypted either way — but the SMTP envelope (sender, recipients, subject) does not. |
+| `use_tls` | `true` | STARTTLS by default. `false` is refused unless `MEFOR_ALLOW_INSECURE_TLS` is set, and SMTP `AUTH` over cleartext is **refused outright**. **WARNING: this is not the same posture as `Email(...)` — the shipped enforcing default does not close it.** `Direct()` consults the **raw** escape variable directly: it does **not** route through the shared cleartext-hop authority, so `[security].enforcement = enforce` does **not** clamp it and `cleartext_accepted` / `cleartext_reason` on the outbound are **not consulted** (declaring them changes nothing here). With the variable set, a cleartext-SMTP Direct hop crosses on a production-PHI enforcing instance. The S/MIME body stays signed + encrypted either way — but the SMTP envelope (sender, recipients, subject) does not. |
 | `timeout_seconds` | `30.0` | passed to the `smtplib` constructor (covers connect and each command) |
 | `encoding` | `utf-8` | charset the body is encoded with before signing |
 
@@ -1641,6 +1665,15 @@ assertion, exchanges it at the **token endpoint**, caches the bearer with expiry
 **per request** (re-minting on a `401`). No new dependency — the JWT is signed by the ADR 0018 core-
 `cryptography` signer. The minted bearer **overrides** any static `bearer_token` on the spec.
 
+**It is not only for SMART servers, and the name hides that.** What reaches the wire is a plain
+**RFC 7523 section 2.2 `private_key_jwt`** exchange — `grant_type=client_credentials` plus a signed
+assertion — with no FHIR or SMART field in it, so this composes over a bare `Rest(...)` against **any**
+authorization server that registers a public key for your client. Prefer it to
+`with_oauth2_client_credentials(...)` whenever your partner offers the choice: a shared `client_secret`
+is reusable at every endpoint it is registered with, while the assertion's `aud` is this connection's
+pinned token endpoint and the key never leaves the engine (BACKLOG #1158). Pass `algorithm="RS256"` for
+a generic partner — the `RS384` default below is SMART's own requirement, not this engine's.
+
 | `with_smart_backend(...)` arg | Default | Notes |
 |---|---|---|
 | `token_url` | — (required) | the authorization server's token endpoint (`https`; `env()`). **Also gated by `[egress].allowed_http`** — it is a second egress host. |
@@ -1736,13 +1769,13 @@ MWL, Query/Retrieve (C-FIND/C-MOVE/C-GET), and pixel-data handling.
 | `tls_key_password` | `None` → unencrypted key | passphrase for a PKCS#8-encrypted `tls_key_file` (`env()`-sourced, mirroring MLLP's `MEFOR_*_TLS_KEY_PASSWORD`). An encrypted key supplied with **no/wrong** passphrase **fails fast** at startup/`check` rather than hanging on an interactive TTY prompt (there is no TTY under an NSSM service account / in a container). |
 | `tls_ca_file` | — | opt-in **mTLS**: require + verify a calling peer's client certificate |
 
-The **bind interface** is the service-level `[inbound].bind_host` (or a per-connection `bind_address`) and the **peer-IP gate** is the per-connection **`source_ip_allowlist`** — both are set on the `inbound(...)` call, not as `DICOM()` arguments. ⚠️ **`source_ip_allowlist` is *not* a key of the `[inbound]` section in `messagefoundry.toml`.** That section carries only `bind_host`, `ack_after` and `stream_inflight_budget_bytes`, and an unrecognized key in a known section is **refused at load** — so writing `source_ip_allowlist` under `[inbound]` in the service TOML **fails the start** (`serve` exit 2), naming the section and the key. It used to be accepted silently and do nothing, which is the failure mode the refusal exists to remove. (Verified: `InboundSettings.model_fields` is exactly those three; `[inbound].source_ip_allowlist` raises `unrecognized config key(s)`, while a sibling `bind_host` loads.) `bind_address` is the same story — a per-connection keyword, not a `[inbound]` key. The reachable forms are `inbound("IB_…", DICOM(...), source_ip_allowlist=["10.20.0.0/16"])` and, for the transports available as data, the **top-level** `source_ip_allowlist` key in `connections.toml` (shown in the [`connections.toml` example](#connections-as-data--connectionstoml-adr-0007) above) — `DICOM()` is code-first only, so for a SCP it is the `inbound(...)` keyword. A non-loopback cleartext SCP is **refused at startup** unless `tls=true` (the generalized [cleartext] bind-guard — `check_dimse_tls_exposure`). `serve --allow-insecure-bind` downgrades that refusal to a warning, but the flag is **clamped** exactly as it is for the MLLP/HTTP/TCP listeners: on a PHI-classified instance under the default `[security].enforcement = enforce` the bind is refused *even with it*, so on a stock instance `tls=true` is the only way to bind off-loopback. (`host` / `called_ae_title` / `connect_timeout` on `DICOM()` are for the **Phase-2 outbound SCU** and are unused by the inbound SCP.)
+The **bind interface** is the service-level `[inbound].bind_host` (or a per-connection `bind_address`) and the **peer-IP gate** is the per-connection **`source_ip_allowlist`** — both are set on the `inbound(...)` call, not as `DICOM()` arguments. **NOTE: `source_ip_allowlist` is *not* a key of the `[inbound]` section in `messagefoundry.toml`.** That section carries only `bind_host`, `ack_after` and `stream_inflight_budget_bytes`, and an unrecognized key in a known section is **refused at load** — so writing `source_ip_allowlist` under `[inbound]` in the service TOML **fails the start** (`serve` exit 2), naming the section and the key. It used to be accepted silently and do nothing, which is the failure mode the refusal exists to remove. (Verified: `InboundSettings.model_fields` is exactly those three; `[inbound].source_ip_allowlist` raises `unrecognized config key(s)`, while a sibling `bind_host` loads.) `bind_address` is the same story — a per-connection keyword, not a `[inbound]` key. The reachable forms are `inbound("IB_…", DICOM(...), source_ip_allowlist=["10.20.0.0/16"])` and, for the transports available as data, the **top-level** `source_ip_allowlist` key in `connections.toml` (shown in the [`connections.toml` example](#connections-as-data--connectionstoml-adr-0007) above) — `DICOM()` is code-first only, so for a SCP it is the `inbound(...)` keyword. A non-loopback cleartext SCP is **refused at startup** unless `tls=true` (the generalized [cleartext] bind-guard — `check_dimse_tls_exposure`). `serve --allow-insecure-bind` downgrades that refusal to a warning, but the flag is **clamped** exactly as it is for the MLLP/HTTP/TCP listeners: on a PHI-classified instance under the default `[security].enforcement = enforce` the bind is refused *even with it*, so on a stock instance `tls=true` is the only way to bind off-loopback. (`host` / `called_ae_title` / `connect_timeout` on `DICOM()` are for the **Phase-2 outbound SCU** and are unused by the inbound SCP.)
 
-> **Fail-closed peer controls (deny-by-default).** DICOM has no transport authentication on its own, so a **non-loopback** SCP **MUST** set a **verifiable** peer control — either a per-connection `source_ip_allowlist` (an `inbound(...)` keyword — **not** a `[inbound]` service-TOML key, see the ⚠️ above), or **mTLS** (`tls=true` **and** `tls_ca_file`, which makes the SCP require + verify a client cert). With **neither** set, a non-loopback SCP is **refused at construction** (the connection degrades per ADR 0031 startup fault isolation; surfaced under `check`/dry-run). This is the **authentication** analog of the `check_dimse_tls_exposure` cleartext bind-guard above (which is the orthogonal **confidentiality** guard): TLS-without-mTLS encrypts the channel but does **not** authenticate the peer. A **loopback** bind (`127.0.0.1`/`localhost`/`::1`, the common dev/single-box case) is exempt.
+> **Fail-closed peer controls (deny-by-default).** DICOM has no transport authentication on its own, so a **non-loopback** SCP **MUST** set a **verifiable** peer control — either a per-connection `source_ip_allowlist` (an `inbound(...)` keyword — **not** a `[inbound]` service-TOML key, see the note above), or **mTLS** (`tls=true` **and** `tls_ca_file`, which makes the SCP require + verify a client cert). With **neither** set, a non-loopback SCP is **refused at construction** (the connection degrades per ADR 0031 startup fault isolation; surfaced under `check`/dry-run). This is the **authentication** analog of the `check_dimse_tls_exposure` cleartext bind-guard above (which is the orthogonal **confidentiality** guard): TLS-without-mTLS encrypts the channel but does **not** authenticate the peer. A **loopback** bind (`127.0.0.1`/`localhost`/`::1`, the common dev/single-box case) is exempt.
 >
-> ⚠️ **`calling_ae_allowlist` does not satisfy this gate on its own (BACKLOG #316).** It used to: the three controls were counted as co-equal. But a Calling AE Title is a string the caller asserts about **itself** in the association request — no key, no signature, nothing to verify — and AE Titles are published in conformance statements and visible in any capture. An SCP whose only control was an AE-title list was reachable by anyone who could route to it and knew one string, while passing a check named "fail-closed peer controls". **Keep it — it is still enforced at association time and is a genuinely useful filter** (it catches a misrouted sender and pins intent). It simply has to be **paired** with `source_ip_allowlist` or mTLS off-loopback.
+> **CAUTION: `calling_ae_allowlist` does not satisfy this gate on its own (BACKLOG #316).** It used to: the three controls were counted as co-equal. But a Calling AE Title is a string the caller asserts about **itself** in the association request — no key, no signature, nothing to verify — and AE Titles are published in conformance statements and visible in any capture. An SCP whose only control was an AE-title list was reachable by anyone who could route to it and knew one string, while passing a check named "fail-closed peer controls". **Keep it — it is still enforced at association time and is a genuinely useful filter** (it catches a misrouted sender and pins intent). It simply has to be **paired** with `source_ip_allowlist` or mTLS off-loopback.
 >
-> ⚠️ **The construction gate counts controls, so the wrong spelling passes it.** Set
+> **WARNING: the construction gate counts controls, so the wrong spelling passes it.** Set
 > `calling_ae_allowlist` (AE titles are attacker-chosen strings on an unauthenticated association —
 > trivially spoofable) plus a `[inbound].source_ip_allowlist` in `messagefoundry.toml` and the SCP
 > builds and runs happily, because the AE list alone satisfies the "at least one" test — while the
@@ -1797,7 +1830,7 @@ A **hardened non-loopback** SCP (bound to an imaging VLAN) pairs DICOM-over-TLS 
 least one peer control for authentication — here an AE-title allowlist, mTLS **and** the peer-IP gate
 (secrets are always `env()` references, never inline). Note where each control lives: the TLS/AE settings
 are `DICOM()` arguments, while **`bind_address` and `source_ip_allowlist` are `inbound(...)` keywords** —
-the whole point of the ⚠️ above. Without a `bind_address` (or a non-loopback `[inbound].bind_host` in
+the whole point of the `[inbound]`-versus-`inbound(...)` note above. Without a `bind_address` (or a non-loopback `[inbound].bind_host` in
 `messagefoundry.toml`) this listener binds `127.0.0.1` and is not the non-loopback SCP the heading
 describes:
 
@@ -2403,7 +2436,7 @@ connection-count knob** (the stdlib opener exposes none) — the same framing 13
 **Timeouts are per-connector, not universal.** Only the MLLP/TCP/X12/DICOM families expose both a
 `connect_timeout` and a `timeout_seconds`; the REST/SOAP/FHIR/DICOMweb HTTP family exposes
 `timeout_seconds` only (a single per-request wall clock — there is no separate connect timeout);
-REMOTEFILE (SFTP/FTP/FTPS) exposes **no** timeout argument — the 30 s whole-socket value is a hard-coded module fallback in `transports/remotefile.py`, not operator-configurable;
+REMOTEFILE (SFTP/FTP/FTPS) exposes **no** timeout argument, and its bounds are hard-coded module values in `transports/remotefile.py`, not operator-configurable: a 30 s connect value on all three protocols, applied on SFTP to the banner and authentication phases as well, plus a `SFTP_CHANNEL_READ_TIMEOUT_SECONDS` bound on each read from an established SFTP channel (BACKLOG #1195) that FTP and FTPS do not have;
 DATABASE exposes `connect_timeout` + `acquire_timeout` and no statement timeout; local FILE exposes
 none (filesystem I/O is unbounded by design). The MLLP/TCP/X12/HTTP listeners expose
 `receive_timeout`; the DICOM SCP instead applies `timeout_seconds` to its three pynetdicom timers. For

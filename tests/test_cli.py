@@ -1057,9 +1057,9 @@ def test_serve_exposed_prod_phi_single_factor_ack_starts_with_warning(
 def test_serve_refuses_exposed_without_mfa_even_with_ad_enabled(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    # The gate keys on require_mfa only — AD/Kerberos MFA is delegated to the directory — so an
-    # AD-enabled prod exposed bind with require_mfa off is STILL refused, pinning the error text's
-    # "safe even on an AD-only deployment (it gates only local Administrator accounts)".
+    # The gate keys on require_mfa only, so an AD-enabled prod exposed bind with require_mfa off is
+    # STILL refused. Since BACKLOG #1144 the error text no longer promises the knob is a no-op for
+    # directory users: turning it on binds them too, each enrolling an engine factor.
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("MEFOR_STORE_ENCRYPTION_KEY", "x" * 44)
     monkeypatch.setenv("MEFOR_AUTH_AD_BIND_PASSWORD", "s3cret-pw")
@@ -1074,7 +1074,7 @@ def test_serve_refuses_exposed_without_mfa_even_with_ad_enabled(
         '[api]\ntls_terminated_upstream = true\ntrusted_proxies = ["10.0.0.1"]\n'
         'proxy_intra_service_auth = "network"\nproxy_tls_min_version = "1.2"\n'
         # Opt out of the BACKLOG #187 secure default so the single-factor-at-exposure gate fires even
-        # on an AD-enabled bind (the gate keys on require_mfa only; AD MFA is delegated to the directory).
+        # on an AD-enabled bind (the gate keys on require_mfa only, whatever the providers in play).
         "[auth]\nad_enabled = true\n"
         'ad_server = "ldaps://dc1.example.com:636"\n'
         'ad_user_search_base = "ou=users,dc=example,dc=com"\n'
@@ -1726,17 +1726,24 @@ def test_browser_hardening_opt_out_is_reported_at_start(
     who set this env — or inherited it from a service environment — got a quietly weaker console with
     no signal anywhere. Since ADR 0172 made the engine always serve TLS this is the only remaining
     way a default deployment loses the `__Host-` binding, which is what makes the silence worth
-    fixing. The message must name the env, the two unprefixed cookie names, and the fact that Secure
-    is not downgraded, because an operator who reads only "hardening off" cannot tell which of those
-    three things happened.
+    fixing. The message must name the env, the two cookie names it falls back TO, and the fact that
+    Secure is not downgraded, because an operator who reads only "hardening off" cannot tell which of
+    those three things happened.
+
+    BACKLOG #1117 (owner ruling 2026-09-05) moved the fallback: the opt-out drops `__Host-` only, so
+    the names it reverts to are the `__Secure-` twins rather than the bare ones. A report still
+    naming `mf_session / mf_oidc_flow` would send an operator looking for a cookie the browser is
+    not holding.
     """
     monkeypatch.setenv("MEFOR_WEBCONSOLE_DISABLE_BROWSER_HARDENING", "1")
     assert _bare_loopback_serve(tmp_path, monkeypatch) == 0
     err = capsys.readouterr().err
     assert "MEFOR_WEBCONSOLE_DISABLE_BROWSER_HARDENING is set" in err
-    assert "mf_session / mf_oidc_flow" in err  # the names it reverts TO
+    assert (
+        "__Secure-mf_session" in err and "__Secure-mf_oidc_flow" in err
+    )  # the names it reverts TO
     assert "__Host-" in err  # what is lost
-    assert "Secure is still set over https" in err  # what is NOT lost
+    assert "Secure is still set over https" in err  # what is NOT lost, and what keeps the fallback
 
 
 def test_browser_hardening_default_reports_nothing(

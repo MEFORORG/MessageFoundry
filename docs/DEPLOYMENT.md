@@ -237,7 +237,9 @@ HIPAA posture (BAA, KMS, PrivateLink, region pinning), see [`CLOUD-PHI-HIPAA.md`
    C-STORE SCU default to plaintext** and need `tls = true` per connection (raw TCP and X12 have no
    `tls` to set at all), and RemoteFile `protocol=ftp` is cleartext. Either way, a
    **cleartext off-loopback hop is refused** on any `enforcement = enforce` instance — the hop authority
-   no longer reads the instance's data label, so a *synthetic* box is refused too. Per-connection, the only
+   no longer reads the instance's data label, so a *synthetic* box is refused too, and for the HTTP family
+   the dial does not soften it either (see the authority note under the
+   [matrix](#channel--tls-posture-matrix)). Per-connection, the only
    honest way across is `cleartext_accepted = true` + `cleartext_reason` (ADR 0153: warn + audit at every
    construction, listed by `messagefoundry check` and `GET /security/posture`). Do **not** set
    `MEFOR_ALLOW_INSECURE_TLS` in production — it no longer influences a cleartext hop at all, and where it
@@ -298,8 +300,8 @@ authentication on the channel · **Egress gate** = the `[egress]` allow-list tha
 | **DICOMweb destination** (STOW-RS, ADR 0025) | dials URL | **HTTPS by default** — `verify_tls=true` default (downgrade refused without the escape); reuses the REST client | optional bearer / basic, refused over plaintext | `[egress].allowed_http` |
 | **DICOM C-STORE SCU** (`DICOM()`, ADR 0025) | dials host:port (default `104`) | **Yes** — per-connection opt-in `tls=true`; **chain and hostname are always verified** (there is no `tls_verify=false` on this connector), but **expiry checking is relaxable per connection** via `tls_allow_expired` — see the note below; opt-in client-cert mTLS. **Plaintext by default** | calling / called AE title (DIMSE has no transport auth of its own) | `[egress].allowed_tcp` (a raw socket) |
 | **EMAIL destination** (SMTP, ADR 0029) | dials host:port (default `587`) | **STARTTLS by default** (`use_tls=true`; implicit TLS on `465`). `use_tls=false` routes through the cleartext-hop authority; SMTP AUTH credentials are refused over cleartext **either way** | optional SMTP AUTH | `[egress].allowed_smtp` |
-| **Direct destination** (S/MIME HISP relay, ADR 0085) | dials HISP relay host:port (default `587`) | **STARTTLS by default** (`use_tls=true`); the body is S/MIME signed + encrypted regardless. ⚠️ `use_tls=false` is gated by the **raw** `MEFOR_ALLOW_INSECURE_TLS` — it does **not** route through the cleartext-hop authority and is **not clamped** by `enforcement` (AUTH credentials stay refused) | S/MIME cert trust + optional SMTP AUTH | `[egress].allowed_direct` |
-| **DATABASE destination** | dials server:port | **Dialect-dependent** — `dialect='sqlserver'` (default): `Encrypt=yes` **default**, `TrustServerCertificate=false` default (weakened only via the escape). ⚠️ `dialect='generic'` (ODBC to Postgres/Oracle/MySQL): TLS is the **driver's** own keyword in `odbc_params` and is **never engine-enforced or verified** — a hop with no TLS keyword, **or one pinned to a no-TLS value** (`SSLmode=disable`/`allow`/`prefer`, `Encrypt=no`), logs a WARNING naming the connection at construction, is **reported** by `security_loosenings()` / `GET /security/posture` / `messagefoundry check`, and connects anyway, on any posture | ODBC `sql` / `integrated` / `entra` | `[egress].allowed_db` |
+| **Direct destination** (S/MIME HISP relay, ADR 0085) | dials HISP relay host:port (default `587`) | **STARTTLS by default** (`use_tls=true`); the body is S/MIME signed + encrypted regardless. **WARNING:** `use_tls=false` is gated by the **raw** `MEFOR_ALLOW_INSECURE_TLS` — it does **not** route through the cleartext-hop authority and is **not clamped** by `enforcement` (AUTH credentials stay refused) | S/MIME cert trust + optional SMTP AUTH | `[egress].allowed_direct` |
+| **DATABASE destination** | dials server:port | **Dialect-dependent** — `dialect='sqlserver'` (default): `Encrypt=yes` **default**, `TrustServerCertificate=false` default (weakened only via the escape). **WARNING:** `dialect='generic'` (ODBC to Postgres/Oracle/MySQL): TLS is the **driver's** own keyword in `odbc_params` and is **never engine-enforced or verified** — a hop with no TLS keyword, **or one pinned to a no-TLS value** (`SSLmode=disable`/`allow`/`prefer`, `Encrypt=no`), logs a WARNING naming the connection at construction, is **reported** by `security_loosenings()` / `GET /security/posture` / `messagefoundry check`, and connects anyway, on any posture | ODBC `sql` / `integrated` / `entra` | `[egress].allowed_db` |
 | **File destination** | local filesystem | n/a (no network) | n/a | `[egress].allowed_file_dirs` |
 | **RemoteFile destination + source** (SFTP / FTPS / FTP) | dials remote host | **Protocol-dependent** — **SFTP** encrypted (SSH host-key verify on by default); **FTPS** explicit TLS; **FTP** plaintext (credentials refused without the escape) | username/password or SSH key | `[egress].allowed_remote` |
 
@@ -309,6 +311,14 @@ ALLOW, then a per-connection `cleartext_accepted` + `cleartext_reason` WARN (log
 construction), then WARN while `[security].enforcement` is not `enforce`, else **REFUSE**. It no longer
 reads the instance's data label, and `MEFOR_ALLOW_INSECURE_TLS` no longer reaches it at all. MLLP, raw
 TCP, X12, the DICOM SCU, the HTTP family and EMAIL all decide there.
+
+**The `enforcement` dial does not free the HTTP family, and that is the one asymmetry to carry out of
+this paragraph.** ADR 0092 decision 5 floors a would-be WARN back to REFUSE for a cleartext hop, so a
+cleartext off-loopback **REST / SOAP / FHIR / DICOMweb** destination is refused at construction on a
+**non**-enforcing instance as well. Measured across all four postures (PHI and non-PHI, enforcing and
+not): those four refuse on every one, while MLLP, raw TCP and X12 build on the non-enforcing arm in the
+same run. So `enforcement = warn` is not a way to stand up a cleartext HTTP destination —
+`cleartext_accepted` is the only one, and it is audited at every construction.
 
 **Two outbound channels do not — and they are the two that reach furthest.** Confirming that MLLP and
 REST obey the authority does not settle these:

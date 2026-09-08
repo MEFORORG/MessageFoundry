@@ -34,6 +34,7 @@ from typing import Any
 from messagefoundry import __version__
 from messagefoundry.logging_setup import (
     LOG_LEVELS,
+    LogFile,
     SyslogForward,
     configure_logging,
     query_sntp_offset,
@@ -473,8 +474,18 @@ def main(argv: list[str] | None = None) -> int:
 
     support_bundle = sub.add_parser(
         "support-bundle",
-        help="write a SECRET-FREE / PHI-free support zip (engine version + config summary + a "
-        "/status snapshot + a REDACTED app-log tail) to hand to support (#49)",
+        # The old wording read "a SECRET-FREE / PHI-free support zip". That is true of the config
+        # summary and the status snapshot and NOT of the log tail, whose redaction is best-effort: a
+        # single-token identifier survives it (messagefoundry/redaction.py states that residual), and an
+        # operator username is exactly that shape while this engine's own settings classifier calls a
+        # username a credential. A blanket claim resting on a member that does not meet it is the
+        # false-premise shape CLAUDE.md section 11 forbids, so the claim was repaired rather than the
+        # control -- see BACKLOG #1475 and the exclusion table in
+        # tests/test_log_redaction_secret_domain.py for why the username class stays out.
+        help="write a support zip to hand to support (#49): a secret-free config summary "
+        "(counts/names only) + a PHI-free /status snapshot + a REDACTED app-log tail. The tail's "
+        "redaction is BEST-EFFORT: a single-token identifier can survive it, an operator username "
+        "included",
     )
     support_bundle.add_argument(
         "--out", required=True, help="path to write the support-bundle .zip"
@@ -612,6 +623,31 @@ def main(argv: list[str] | None = None) -> int:
     )
     admin_unlock.add_argument("--db", default=None, help="store path (overrides [store].path)")
     admin_unlock.add_argument("--json", action="store_true", help="emit JSON")
+
+    # BACKLOG #1136 (ASVS 6.3.2). Run before the first `serve` and the engine never mints a default
+    # account: `_ensure_bootstrap_admin` seeds only an EMPTY user table. There is deliberately no
+    # --password and no --password-file -- see `_provision_admin`.
+    provision_admin = sub.add_parser(
+        "provision-admin",
+        help="create the first administrator offline, so no default account is ever minted",
+    )
+    provision_admin.add_argument(
+        "--username", required=True, help="the administrator to create (no default, on purpose)"
+    )
+    provision_admin.add_argument("--display-name", default=None, help="optional display name")
+    provision_admin.add_argument(
+        "--email",
+        default=None,
+        help="notification address for out-of-band security notices; a PHI instance under "
+        "[security].enforcement=enforce refuses to serve without one on some enabled Administrator",
+    )
+    provision_admin.add_argument(
+        "--service-config",
+        default=None,
+        help="service settings TOML (default: ./messagefoundry.toml if present)",
+    )
+    provision_admin.add_argument("--db", default=None, help="store path (overrides [store].path)")
+    provision_admin.add_argument("--json", action="store_true", help="emit JSON")
 
     audit_verify = sub.add_parser(
         "audit-verify", help="verify the audit-log hash chain (tamper-evidence)"
@@ -1260,6 +1296,7 @@ def _serve(args: argparse.Namespace) -> int:
         platform_memory_encryption_readout,
     )
     from messagefoundry.config.settings import (
+        LogWriteFailurePolicy,
         StoreBackend,
         SyslogProtocol,
         forward_hop_disposition,
@@ -1270,6 +1307,7 @@ def _serve(args: argparse.Namespace) -> int:
     from messagefoundry.config.tls_policy import (
         HopDisposition,
         in_process_tls_revocation_refused,
+        proxy_mtls_declared_but_unverified,
         tls_revocation_attested,
     )
     from messagefoundry.crashdump import suppress_crash_dumps
@@ -1701,9 +1739,37 @@ def _serve(args: argparse.Namespace) -> int:
                 settings.logging.forward_port,
                 _forward_why,
             )
-    forwarder_live = configure_logging(
-        settings.logging.level, fmt=settings.logging.format.value, forward=log_forward
+    # #122 (ADR 0162): the OPT-IN engine-managed application-log file + the fail-closed write guard.
+    # `file` unset (the default) leaves this None and the engine stdout-only, exactly as before; the
+    # guard still wraps stdout, so the two-stage roll/stop applies either way.
+    _log_file = (
+        LogFile(
+            path=settings.logging.file,
+            max_bytes=settings.logging.file_max_bytes,
+            backup_count=settings.logging.file_backup_count,
+        )
+        if settings.logging.file is not None
+        else None
     )
+    try:
+        forwarder_live = configure_logging(
+            settings.logging.level,
+            fmt=settings.logging.format.value,
+            forward=log_forward,
+            log_file=_log_file,
+            stop_on_write_failure=settings.logging.on_write_failure is LogWriteFailurePolicy.STOP,
+        )
+    except OSError as exc:
+        # FAIL CLOSED at configuration time: the operator named an application-log path this process
+        # cannot open. Starting anyway is precisely the silent blindness #122 exists to end, so refuse
+        # — and say so on stderr, since the log we would normally warn on is the thing that failed.
+        print(
+            f"error: [logging].file ({settings.logging.file!r}) cannot be opened for writing: {exc}. "
+            "The engine refuses to start rather than run unable to log (BACKLOG #122, ADR 0162); fix "
+            "the path/permissions, or unset [logging].file to run stdout-only.",
+            file=sys.stderr,
+        )
+        return 2
     if forwarder_live and log_forward is not None:
         # Only announce forwarding when configure_logging actually installed the handler — a TCP
         # collector that is down at startup is skipped (it warns), so this must not contradict it.
@@ -1754,7 +1820,14 @@ def _serve(args: argparse.Namespace) -> int:
     # with its reason and an audit record; the #333 generic-ODBC TLS reminder naming the connection),
     # and completely by `messagefoundry check` and GET /security/posture, which both have the graph.
     _loosenings = security_loosenings(
-        settings.security, settings.store, settings.auth, settings.alerts, (), (), ()
+        settings.security,
+        settings.store,
+        settings.auth,
+        settings.alerts,
+        settings.secret_rotation,
+        (),
+        (),
+        (),
     )
     if _loosenings:
         _seclog = logging.getLogger(__name__)
@@ -1987,6 +2060,25 @@ def _serve(args: argparse.Namespace) -> int:
                 f"{loopback_note}",
                 file=sys.stderr,
             )
+        # --- BACKLOG #1181 (ASVS 12.3.5): the ONE Posture-B attestation the engine can check --------
+        # The rule, why it warns instead of refusing, and why the sibling values get no arm all live on
+        # the predicate, beside in_process_tls_revocation_refused -- the other pure serve-gate predicate
+        # on the same subject. It WARNS and never refuses: a sidecar in front of the engine can terminate
+        # the proxy's mTLS legitimately. This is a DIAGNOSTIC, not enforcement.
+        if proxy_mtls_declared_but_unverified(
+            declared=settings.api.proxy_intra_service_auth,
+            client_ca_configured=bool(settings.api.tls_client_ca_file),
+            is_phi=data_class is DataClass.PHI,
+        ):
+            print(
+                "warning: [api].proxy_intra_service_auth is declared 'mtls' but this engine verifies "
+                "no client certificate — [api].tls_client_ca_file is unset, so nothing here checks the "
+                "proxy's identity. If the proxy terminates its mTLS at a sidecar in front of the "
+                "engine, this is expected; otherwise set [api].tls_cert_file + [api].tls_client_ca_file "
+                "so the engine itself requires and verifies the proxy's certificate. The declaration is "
+                "an attestation either way — the engine enforces nothing on this hop.",
+                file=sys.stderr,
+            )
 
     # The browser ops console ([api].serve_ui, ADR 0065) is a SEPARATE optional wheel
     # (messagefoundry-webconsole) mounted same-origin in-process. Refuse serve_ui when it is absent with
@@ -2182,9 +2274,18 @@ def _serve(args: argparse.Namespace) -> int:
             and not settings.auth.admin_new_ip_step_up
             and data_class is DataClass.PHI
         ):
-            # Advisory only — the default deliberately stays False (a flip would churn NAT'd
-            # hospital networks; flag_new_client_ip stays advisory-only, preserving the ASVS
-            # 8.1.3/8.1.4/8.2.4 N/A keystone). Mirrors the require_mfa advisory pattern.
+            # Advisory only — the default deliberately stays False, because a flip would churn
+            # NAT'd hospital networks and, on the shipped loopback bind, would change nothing at
+            # all: _same_host folds 127.0.0.1 and ::1 into one host, so the flipped control still
+            # returns False on every request a stock install sees.
+            #
+            # BACKLOG #1153: this comment used to end "preserving the ASVS 8.1.3/8.1.4/8.2.4 N/A
+            # keystone", which asserted a grade the record does not carry — 8.2.4 is graded
+            # PARTIAL, not not-applicable. A source comment claiming a cell is N/A is a false
+            # premise sitting in a distributed artifact, where a later assessor reads it as
+            # authority for a decision nobody made. The reasons above are the real ones and they
+            # stand on their own; a grade is the scorecard's to state, not this file's.
+            # Mirrors the require_mfa advisory pattern.
             print(
                 "warning: the browser console is exposed on a PHI instance with "
                 "[auth].admin_new_ip_step_up off — enabling it forces a step-up when an admin "
@@ -2217,11 +2318,12 @@ def _serve(args: argparse.Namespace) -> int:
         if not browser_hardening_enabled():
             print(
                 f"warning: {BROWSER_HARDENING_OPT_OUT_ENV} is set — the /ui browser hardening is OFF "
-                "for this run. The session and OIDC flow cookies revert to their unprefixed names "
-                "(mf_session / mf_oidc_flow), losing the browser-enforced '__Host-' host binding, and "
+                "for this run. The session and OIDC flow cookies lose the browser-enforced '__Host-' "
+                "host binding and fall back to '__Secure-mf_session' / '__Secure-mf_oidc_flow', and "
                 "the per-response nonce CSP, COOP and CSP reporting are not emitted. Transport "
-                "security is NOT downgraded: Secure is still set over https. Unset this variable to "
-                "restore the secure-by-default posture.",
+                "security is NOT downgraded: Secure is still set over https, which is what keeps the "
+                "'__Secure-' prefix writable. Unset this variable to restore the secure-by-default "
+                "posture.",
                 file=sys.stderr,
             )
 
@@ -2260,9 +2362,9 @@ def _serve(args: argparse.Namespace) -> int:
     # keyless-store / open-egress posture: refuse on a production PHI instance (the prod fail-closed
     # analogue), warn on a non-production PHI instance, stay quiet on a synthetic instance. Reached only
     # for an otherwise-permitted exposed bind (the TLS gate above ran first); the loopback default (now
-    # require_mfa on) never trips it. AD/Kerberos MFA is delegated to the directory, so require_mfa only
-    # gates LOCAL Administrator accounts (the bootstrap admin is one) — it is safe to leave on even on
-    # an AD-only deployment.
+    # require_mfa on) never trips it. Since BACKLOG #1144 require_mfa gates DIRECTORY accounts too — a
+    # ticket asserts no factor strength the engine can read, so the engine asks for its own factor —
+    # which makes leaving it on correct on an AD-only deployment rather than merely harmless there.
     #
     # L5b review fix (ADR 0068 §8), corrected by BACKLOG #326: the gate keys on the same EXPOSURE signal
     # as the ladder above, not the bind host alone — the runbook's RECOMMENDED topology (loopback bind
@@ -2285,8 +2387,8 @@ def _serve(args: argparse.Namespace) -> int:
                     f"instance ({env_name!r}) with [security].require_mfa off; refusing to start — the "
                     "Administrator role would authenticate with a single factor over the network. "
                     "Enable native TOTP MFA with [security].require_mfa=true (WP-14) before exposing the "
-                    "API (safe even on an AD-only deployment — it gates only local Administrator "
-                    "accounts); or set [security].allow_single_factor_admin_when_exposed=true to "
+                    "API (on an AD-only deployment it binds directory principals too, each enrolling "
+                    "an engine factor); or set [security].allow_single_factor_admin_when_exposed=true to "
                     "deliberately permit single-factor admin at exposure (audited).",
                     file=sys.stderr,
                 )
@@ -4277,6 +4379,136 @@ def _admin_unlock(args: argparse.Namespace) -> int:
     return 0
 
 
+class _PasswordEntryRefused(RuntimeError):
+    """The interactive credential prompt declined. The message is operator-facing."""
+
+
+def _read_new_password(prompt: str) -> str:
+    """Read a new password twice from the controlling terminal, or raise with an explanation.
+
+    TTY-ONLY, AND THE REFUSAL IS THE POINT RATHER THAN AN OVERSIGHT (BACKLOG #1136). An unattended
+    MSI/Ansible/NSSM install has no terminal, so the pressure to add ``--password`` or
+    ``--password-file`` is structural. Either one lands a standing Administrator credential in argv
+    -- readable by every other process on the host -- or on disk, which is the shape the first-run
+    redesign exists to remove. So unattended provisioning is refused in terms: an operator who needs
+    it should provision interactively, or supply the credential from their own secret store by
+    driving this command's prompt. Never a default, and never a fallback.
+    """
+    import getpass
+
+    if not sys.stdin.isatty():
+        raise _PasswordEntryRefused(
+            "refusing to provision without a terminal: the password is read interactively and "
+            "there is deliberately no --password or --password-file (either would put a standing "
+            "Administrator credential in argv or on disk). Run this from a console."
+        )
+    first = getpass.getpass(prompt)
+    if not first:
+        raise _PasswordEntryRefused("empty password")
+    if getpass.getpass("Confirm: ") != first:
+        raise _PasswordEntryRefused("the two entries did not match")
+    return first
+
+
+def _provision_admin(args: argparse.Namespace) -> int:
+    """Create the first administrator offline (BACKLOG #1136, ASVS 6.3.2).
+
+    Run before the first ``serve`` and the engine never creates the account named ``admin``: the
+    seeding path fires only on an EMPTY user table, so an operator-named administrator pre-empts it.
+    That is the "not present" arm of the verb, reached by an operator action rather than by a
+    configuration knob. The shipped default is unchanged and still mints one -- retiring the
+    auto-create is the remaining half of the item, and it is not this command.
+
+    The gate is host access, argued once on :func:`_admin_unlock` and in ADR 0171. What differs is
+    the refusal: this one declines when an ENABLED ADMINISTRATOR exists rather than when the table is
+    non-empty, because a directory sign-in can fill the table without producing an administrator.
+    """
+    import asyncio
+    import getpass
+
+    from pydantic import ValidationError
+
+    from messagefoundry.auth.service import (
+        AuthService,
+        FirstAdministratorRefused,
+        ProvisionedAdministrator,
+    )
+    from messagefoundry.config.settings import load_settings
+    from messagefoundry.store.base import open_store
+
+    cli: dict[str, dict[str, object]] = {}
+    if args.db is not None:
+        cli.setdefault("store", {})["path"] = args.db
+    try:
+        settings = load_settings(config_path=args.service_config, cli=cli)
+    except (FileNotFoundError, ValueError, ValidationError) as exc:
+        return _emit_error(str(exc), as_json=args.json)
+
+    try:
+        password = _read_new_password("New administrator password: ")
+    except _PasswordEntryRefused as exc:
+        # Read BEFORE the store is opened, so a refusal cannot leave a SQLite file behind that the
+        # next `serve` would find non-empty.
+        return _emit_error(str(exc), as_json=args.json)
+
+    async def run() -> tuple[ProvisionedAdministrator, str]:
+        store = await open_store(settings.store)
+        try:
+            outcome = await AuthService(store, settings.auth).provision_first_administrator(
+                username=args.username,
+                password=password,
+                display_name=args.display_name,
+                notify_email=args.email,
+                actor=f"cli:{getpass.getuser()}",
+            )
+            # NO M-31 "the store must already exist" guard here, and the difference from
+            # `admin-unlock` is deliberate: the ordinary sequence is install, provision, serve, so on
+            # a first run the SQLite store legitimately does NOT exist and creating it is correct.
+            # The typo hazard M-31 covers is real all the same -- a mistyped --db provisions into a
+            # store `serve` will never open, and `serve` then mints the default account after all.
+            # The substitute is naming the target below. It is read off the OPENED store rather than
+            # off `[store].path`, which is the SQLite field and would name a file that was never
+            # touched on the two server backends.
+            return (outcome, store.path)
+        finally:
+            await store.close()
+
+    try:
+        outcome, store_path = asyncio.run(run())
+    except FirstAdministratorRefused as exc:
+        return _emit_error(str(exc), as_json=args.json)
+
+    if args.json:
+        _print_json(
+            {
+                "ok": True,
+                # The account's own name, not the raw argv: the service strips it, and reporting a
+                # name that differs from the one created is how an operator ends up unable to log in.
+                "username": outcome.username,
+                "user_id": outcome.user_id,
+                "repaired": outcome.repaired,
+                "store": store_path,
+                "notify_email_set": bool(args.email and args.email.strip()),
+            },
+            compact=True,
+        )
+        return 0
+    verb = "completed an incomplete provision of" if outcome.repaired else "created"
+    # `_safe_print`, not `print`: both the username and the store path are operator-supplied, and a
+    # UnicodeEncodeError on a legacy Windows console would traceback AFTER the account was created.
+    _safe_print(f"OK: {verb} Administrator {outcome.username!r} in {store_path}")
+    _safe_print(
+        "The engine will NOT create a default 'admin' account: the user table is no longer empty."
+    )
+    if not (args.email and args.email.strip()):
+        _safe_print(
+            "WARNING: no notification address. A PHI instance under [security].enforcement=enforce "
+            "refuses to start unless some enabled Administrator carries one -- re-run with --email, "
+            "or set one from the web console."
+        )
+    return 0
+
+
 def _audit_verify(args: argparse.Namespace) -> int:
     import asyncio
     from pathlib import Path
@@ -5139,9 +5371,13 @@ def _verify(args: argparse.Namespace) -> int:
 
 
 def _support_bundle(args: argparse.Namespace) -> int:
-    """Write a secret-free / PHI-free support zip (#49): engine version + a config summary (registry
-    COUNTS/names only — never settings values or secrets) + a ``/status`` snapshot built from the real
-    status models + a REDACTED app-log tail. Offline: touches no network, starts no server. The status
+    """Write a support zip (#49): engine version + a config summary (registry COUNTS/names only — never
+    settings values or secrets) + a ``/status`` snapshot built from the real status models + a REDACTED
+    app-log tail. **The blanket "secret-free / PHI-free" this docstring used to open with covered the
+    first two members and not the tail**, whose redaction is best-effort with a single-token residual
+    that includes an operator username (BACKLOG #1475; the argparse help above carries the reasoning,
+    and ``docs/PHI.md`` stream 14 is the record). Offline: touches no network, starts no server. The
+    status
     snapshot + log tail come from the service settings (the configured store + ``[logging].log_dir``);
     the config summary comes from ``--config``. A missing service config or store is tolerated — the
     bundle is still produced (support is most wanted when something is already broken)."""
@@ -5269,6 +5505,7 @@ def _security(args: argparse.Namespace) -> int:
     from messagefoundry.config.settings import (
         AlertsSettings,
         AuthSettings,
+        SecretRotationSettings,
         SecuritySettings,
         StoreSettings,
         load_settings,
@@ -5284,6 +5521,9 @@ def _security(args: argparse.Namespace) -> int:
     # reporting a subset as if it were everything.
     _loosenings_partial = False
     _store, _auth, _alerts = StoreSettings(), AuthSettings(), AlertsSettings()
+    # BACKLOG #1004: [secret_rotation].enforce_store_key_expiry is a posture deviation too, so it is
+    # resolved from the same whole-file read and degrades with the same `loosenings_partial` marker.
+    _rotation = SecretRotationSettings()
     if Path(path).exists():
         # An ABSENT file is not a degraded read — the shipped defaults ARE the effective posture there,
         # and `security show` is expected to work offline before any config exists. Only a file that
@@ -5291,6 +5531,7 @@ def _security(args: argparse.Namespace) -> int:
         try:
             _full = load_settings(config_path=path)
             _store, _auth, _alerts = _full.store, _full.auth, _full.alerts
+            _rotation = _full.secret_rotation
         except (ValidationError, tomllib.TOMLDecodeError, OSError, ValueError):
             # The specific ways a settings file fails to resolve: a schema/cross-field violation,
             # malformed TOML, an unreadable path, and the plain ValueErrors load_settings raises for a
@@ -5305,7 +5546,7 @@ def _security(args: argparse.Namespace) -> int:
         # posture. `messagefoundry check` and GET /security/posture are the complete surfaces.
         return [
             {"switch": s, "risk": r}
-            for s, r in security_loosenings(sec, _store, _auth, _alerts, (), (), ())
+            for s, r in security_loosenings(sec, _store, _auth, _alerts, _rotation, (), (), ())
         ]
 
     #: Emitted alongside every loosening list this subcommand prints, so a reader can never mistake a
@@ -5418,6 +5659,7 @@ _DISPATCH = {
     "cert": _cert,
     "protect-key": _protect_key,
     "admin-unlock": _admin_unlock,
+    "provision-admin": _provision_admin,
     "audit-verify": _audit_verify,
     "audit-anchor": _audit_anchor,
     "rekey-audit": _rekey_audit,

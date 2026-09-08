@@ -76,8 +76,8 @@ def ec_pem() -> str:
 class _FakeResp:
     status = 200
 
-    def read(self) -> bytes:
-        return b""
+    def read(self, amt: int = -1) -> bytes:
+        return b"" if amt < 0 else (b"")[:amt]
 
     def __enter__(self) -> _FakeResp:
         return self
