@@ -607,6 +607,44 @@ def test_serve_posture_b_synthetic_is_quiet(
     assert "proxy_intra_service_auth" not in capsys.readouterr().err
 
 
+# --- BACKLOG #1181 (ASVS 12.3.5): the one attestation the engine can check against its own config --
+# "mtls" says the proxy presents a client certificate. The engine verifies one only with
+# [api].tls_client_ca_file set, so with no client CA its configuration contradicts the declaration.
+# It WARNS and never refuses -- a sidecar can terminate the proxy's mTLS in front of the engine, which
+# is a true "mtls" hop the engine sees as plaintext. What the handshake actually does with a client CA
+# is measured on a real socket in tests/test_proxy_intra_service_auth.py.
+
+
+def test_serve_warns_when_mtls_is_declared_but_the_engine_verifies_no_client_cert(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _posture_b_toml(tmp_path, intra="mtls", floor="1.2")
+    assert _run_posture_b(tmp_path, monkeypatch, env="prod") == 0  # a warning, never a refusal
+    err = capsys.readouterr().err
+    assert "verifies no client certificate" in err
+    assert "tls_client_ca_file" in err
+    assert "refusing to serve" not in err
+
+
+def test_serve_says_nothing_about_client_certs_when_the_declaration_is_not_mtls(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The discriminating arm. "network" names a control outside the process, so there is nothing here
+    to contradict it — a warning on every declared value would be noise rather than a check."""
+    _posture_b_toml(tmp_path, intra="network", floor="1.2")
+    assert _run_posture_b(tmp_path, monkeypatch, env="prod") == 0
+    assert "verifies no client certificate" not in capsys.readouterr().err
+
+
+def test_serve_mtls_coherence_warning_is_quiet_on_a_synthetic_instance(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Byte-identical on a synthetic box, exactly like the two attestation arms above."""
+    _posture_b_toml(tmp_path, intra="mtls", floor="1.2", synthetic=True)
+    assert _run_posture_b(tmp_path, monkeypatch, env="dev", key=False) == 0
+    assert "verifies no client certificate" not in capsys.readouterr().err
+
+
 def test_serve_loopback_emits_no_new_stderr(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -1411,6 +1449,90 @@ def test_real_mutual_tls_handshake_on_built_context(tmp_path: Path) -> None:
         _handshake(server_ctx, _verifying_client_ctx(ca), client_cert=None)
 
 
+# --- BACKLOG #1181 (ASVS 12.3.5): the three arms the mutual-TLS test above leaves open -------------
+#
+# That test covers trusted-cert-completes and no-cert-refused. The cell's severity turns on a claim
+# those two arms cannot settle: that the proxy→engine hop is CLOSABLE TODAY by setting
+# `[api].tls_client_ca_file`. Three things were missing. (1) An unconfigured issuer: presenting SOME
+# certificate must not be enough. (2) The causation control -- without it a refusal is consistent with
+# a harness that refuses everything, so the same harness must ADMIT the uncertificated peer once the
+# client CA is dropped. (3) Reachability in the topology the setting is actually about (Posture B).
+
+
+def test_a_client_certificate_the_configured_ca_did_not_sign_is_refused(tmp_path: Path) -> None:
+    ca, cert, key = _strict_ca_and_leaf(tmp_path)
+    stranger_cert, stranger_key = _self_signed(tmp_path)  # a different issuer entirely
+    server_ctx = build_api_ssl_context(
+        ApiSettings(tls_cert_file=str(cert), tls_key_file=str(key), tls_client_ca_file=str(ca))
+    )
+    with pytest.raises(OSError):
+        _handshake(server_ctx, _verifying_client_ctx(ca), client_cert=(stranger_cert, stranger_key))
+
+
+def test_dropping_the_client_ca_admits_the_same_uncertificated_peer(tmp_path: Path) -> None:
+    """The causation control for the refusal above: the client CA is what refuses, not the harness.
+
+    Without this arm, "no client cert is refused" is equally consistent with a bad port, an unreadable
+    anchor or a broken server key -- every one of which also refuses, and every one of which would
+    read as "mTLS works".
+    """
+    ca, cert, key = _strict_ca_and_leaf(tmp_path)
+    no_client_ca = build_api_ssl_context(
+        ApiSettings(tls_cert_file=str(cert), tls_key_file=str(key))
+    )
+    assert no_client_ca.verify_mode == ssl.CERT_NONE
+    assert _handshake(no_client_ca, _verifying_client_ctx(ca), client_cert=None)  # admitted
+
+
+def test_mtls_is_reachable_under_a_declared_upstream_terminator(tmp_path: Path) -> None:
+    """Posture B plus an operator certificate plus a client CA is a VALID, VERIFYING configuration.
+
+    `test_the_upstream_terminator_topology_keeps_the_host_prefix_without_minting` pins the other half:
+    with no operator certificate, `ensure_api_tls_material` mints nothing, because serving https
+    underneath a proxy that speaks plaintext would break the proxy's own hop. Read alone, that says the
+    mTLS `[api].proxy_intra_service_auth = "mtls"` names is unreachable exactly where it is declared.
+    It is not -- the operator-supplied branch sits ABOVE the no-mint one, so a site that wants the
+    engine itself to verify the proxy's certificate can have it. The handshake is not repeated here;
+    `test_real_mutual_tls_handshake_on_built_context` owns that arm.
+    """
+    ca, cert, key = _strict_ca_and_leaf(tmp_path)
+    api = ApiSettings(
+        tls_terminated_upstream=True,
+        trusted_proxies=["10.0.0.9"],
+        proxy_intra_service_auth="mtls",
+        proxy_tls_min_version="1.2",
+        tls_cert_file=str(cert),
+        tls_key_file=str(key),
+        tls_client_ca_file=str(ca),
+    )
+    assert ensure_api_tls_material(api, state_dir=tmp_path) == (str(cert), str(key))
+    assert build_api_ssl_context(api).verify_mode == ssl.CERT_REQUIRED
+
+
+def test_no_value_of_the_declaration_changes_the_listener(tmp_path: Path) -> None:
+    """THE SUCCESSOR ABSENCE CLAIM for ASVS 12.3.5, pinned in code.
+
+    The cell's original claim was "nothing branches on WHICH value is set". A startup diagnostic now
+    does (see the Posture-B coherence warning above), so that claim would start matching for a reason
+    that is not a control. The claim that survives, and that actually decides the verdict, is: **no
+    value of `proxy_intra_service_auth` changes what the listener accepts.**
+    """
+    cert, key = _self_signed(tmp_path)
+    verify_modes = {
+        build_api_ssl_context(
+            ApiSettings(
+                tls_cert_file=str(cert), tls_key_file=str(key), proxy_intra_service_auth=mode
+            )
+        ).verify_mode
+        for mode in ("none", "mtls", "network", "shared_secret")
+    }
+    assert verify_modes == {ssl.CERT_NONE}, (
+        "a value of proxy_intra_service_auth changed the listener's peer verification — the setting "
+        "is documented as an attestation, so this is either a new control that needs documenting or "
+        "an accident"
+    )
+
+
 # NOTE (residual, honest scope): a full uvicorn-on-a-real-socket mTLS handshake through the serve path
 # (build_api_ssl_context wired into a live uvicorn bind) is a CI/infra-bound integration left to the
 # windows-service-smoke / TLS CI legs — the handshake logic above exercises the SAME server context the
@@ -1649,31 +1771,85 @@ def test_a_minted_pair_does_not_satisfy_the_off_loopback_exposure_gate(tmp_path:
     assert operator.tls_enabled and operator.exposure_protected
 
 
-def test_the_served_https_scheme_resolves_both_cookies_to_their_host_twins() -> None:
-    """The #1118 premise measurement, made durable.
+def _cookie_names_for(scheme: str, *, exposure_protected: bool) -> tuple[str, str]:
+    """The two cookie names the /ui resolvers pick for a connection with this scheme + declaration."""
+    from messagefoundry_webconsole._auth import oidc_flow_cookie_name, session_cookie_name
+
+    conn: Any = SimpleNamespace(
+        app=SimpleNamespace(state=SimpleNamespace(exposure_protected=exposure_protected)),
+        url=SimpleNamespace(scheme=scheme),
+    )
+    return session_cookie_name(conn), oidc_flow_cookie_name(conn)
+
+
+def test_the_shipped_default_mints_tls_and_so_resolves_both_cookies_to_their_host_twins(
+    tmp_path: Path,
+) -> None:
+    """The #1118 premise measurement, made durable -- and JOINED to the thing it depends on.
 
     The item was filed to research how to reach ASVS 3.3.3 without breaking a cleartext loopback
     login. ADR 0172 removed the cleartext loopback bind, so the request scheme is https and the
-    cookie code that was already correct now resolves both names to their `__Host-` twins with no
-    edit at all. Pinning it here means a change that reintroduces a cleartext default fails a test
-    naming the consequence, instead of quietly moving the cell back to partial.
+    cookie code that was already correct resolves both names to their `__Host-` twins with no edit
+    at all.
 
-    The http arm is the positive control AND the reason an unconditional rename is wrong: a browser
-    rejects a `__Host-` cookie that is not Secure, so over cleartext the bare name is the correct
-    answer rather than a weaker one.
+    **This test used to hand `"https"` in as a literal, and its docstring claimed that a change
+    reintroducing a cleartext default would fail it. That was false** -- the body never touched the
+    serve path, so the claim named a guarantee the instrument did not provide (SDS-3.8: confirm the
+    instrument answers the question you asked, not one adjacent to it). It now DERIVES the scheme
+    from `ensure_api_tls_material`, which is the same predicate the serve path uses to decide
+    whether to hand uvicorn an `ssl_context_factory`. Remove the mint and this test goes red naming
+    the cookie consequence, which is what it always said it did.
     """
-    from messagefoundry_webconsole._auth import oidc_flow_cookie_name, session_cookie_name
+    api = ApiSettings()  # the shipped default: no operator chain, no declared proxy
+    material = ensure_api_tls_material(api, state_dir=tmp_path)
+    assert material is not None  # not vacuous: the default really does mint rather than opt out
+    assert Path(material[0]).exists()
+    # The serve path's own rule: material -> an ssl_context_factory -> the socket speaks https.
+    # `test_serve_loopback_without_a_certificate_now_mints_and_serves_tls` pins that half through
+    # `main`; this derives the scheme from the same predicate so the two halves cannot drift apart.
+    served_scheme = "https" if material is not None else "http"
+    assert _cookie_names_for(served_scheme, exposure_protected=api.exposure_protected) == (
+        "__Host-mf_session",
+        "__Host-mf_oidc_flow",
+    )
 
-    def conn(scheme: str) -> Any:
-        return SimpleNamespace(
-            app=SimpleNamespace(state=SimpleNamespace(exposure_protected=False)),
-            url=SimpleNamespace(scheme=scheme),
-        )
+    # POSITIVE CONTROL -- the pre-0172 default, and the reason an unconditional rename is wrong: a
+    # browser rejects a `__Host-` cookie that is not Secure, so over cleartext the bare name is the
+    # correct answer rather than a weaker one. It also proves the resolver is not a constant.
+    assert _cookie_names_for("http", exposure_protected=False) == ("mf_session", "mf_oidc_flow")
 
-    served = conn("https")  # what ADR 0172 puts on the wire by shipped default
-    assert session_cookie_name(served) == "__Host-mf_session"
-    assert oidc_flow_cookie_name(served) == "__Host-mf_oidc_flow"
 
-    cleartext = conn("http")  # POSITIVE CONTROL -- the pre-0172 default, still correct behaviour
-    assert session_cookie_name(cleartext) == "mf_session"
-    assert oidc_flow_cookie_name(cleartext) == "mf_oidc_flow"
+def test_the_upstream_terminator_topology_keeps_the_host_prefix_without_minting(
+    tmp_path: Path,
+) -> None:
+    """The one topology ADR 0172 deliberately excludes still earns the prefix, and nothing else did.
+
+    `[api].tls_terminated_upstream` says a reverse proxy terminates TLS in front and speaks
+    plaintext to the engine, so `ensure_api_tls_material` mints NOTHING -- serving https underneath
+    that proxy would break the proxy's own hop. The wire scheme reaching the cookie code is
+    therefore `http`, which every scheme-keyed intuition reads as "bare name". The correct answer is
+    the prefixed one, because the BROWSER's origin is https, and `effective_https` gets there only
+    through its `exposure_protected` disjunct.
+
+    **That disjunct is a deletion magnet.** Once the default mints TLS it reads as redundant, and
+    dropping it would silently revert both cookies to their bare names on the single topology that
+    still reaches the app over cleartext -- with every scheme-keyed test in the suite staying green,
+    because they all run with `exposure_protected` false. #1117's
+    `test_session_clear_follows_exposure_protected_not_only_the_wire_scheme` builds this posture but
+    grades Secure and set/clear symmetry, never the NAME.
+    """
+    proxied = ApiSettings(tls_terminated_upstream=True, trusted_proxies=["10.0.0.7"])
+    assert ensure_api_tls_material(proxied, state_dir=tmp_path) is None  # the proxy hop is intact
+    assert not any(tmp_path.iterdir())  # and it really minted nothing, rather than minting quietly
+    assert proxied.exposure_protected  # the declaration, which is what carries the prefix here
+    assert _cookie_names_for("http", exposure_protected=proxied.exposure_protected) == (
+        "__Host-mf_session",
+        "__Host-mf_oidc_flow",
+    )
+
+    # WHY THE DECLARATION CANNOT BE HALF-PRESENT: validation refuses the proxy posture without
+    # `trusted_proxies`, so there is no startable topology that reaches the app over cleartext with
+    # `exposure_protected` false. Without this arm the assertion above would look like it depended
+    # on an operator remembering to set both keys.
+    with pytest.raises(ValidationError, match="requires .api..trusted_proxies"):
+        ApiSettings(tls_terminated_upstream=True)

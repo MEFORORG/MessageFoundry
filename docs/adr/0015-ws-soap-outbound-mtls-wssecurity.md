@@ -3,6 +3,21 @@
 - **Status:** **Accepted (2026-06-15)** — ratified on the owner's "go"; the open questions below are resolved. **No code written yet** (build authorized; not started).
 - **Resolved open questions (owner go, 2026-06-15):** (1) **Fragment validation** = the hardened, non-resolving, no-DTD well-formedness check on the isolated `<Body>` (XXE-negative, and it still catches a malformed HL7-derived body) — adopted over the zero-parser balance check. (2) **XML-DSig body signing stays deferred** to a follow-up ADR (it needs a non-stdlib C14N+RSA dependency, which would breach ADR 0003's stdlib-only rule); a stable engine-side **idempotency key is designed alongside it**, not now. (3) **UsernameToken default = `ws_password_type="text"`** (PasswordText over mutual TLS); `PasswordDigest` is opt-in for partners that mandate it. (4) **WS-\* requires SOAP 1.2** — the `Soap()` factory raises on `soap_version="1.1"` when `ws_addressing`/`ws_security` is set. (5) **Egress gate** keeps the project-wide *fail-closed-once-configured* framing (no special hard-require); a `docs/CONNECTIONS.md` warning + dry-run surfacing flag a PHI mTLS destination whose `[egress].allowed_http` is empty. (6) **Idempotency** = accept that an at-least-once re-send mints a fresh `<wsa:MessageID>` (correct WS-\* retry semantics); the partner's submit operation must dedup — a stable engine-side key is deferred with #2.
 - **Built:** nothing yet. This document is the design only.
+- **AMENDMENT (2026-09-06, BACKLOG #1171, ASVS 11.4.1) -- resolved question 3 is PARTLY REVERSED:
+  `ws_password_type="digest"` is RETIRED.** The 2026-06-15 ruling kept PasswordDigest as an opt-in
+  for partners that mandate it, and section 4a below still argues that case. That half no longer
+  describes the code: the value is refused at construction and in the `Soap()` factory, and
+  `"text"` is the only reachable mode. The section is left standing rather than rewritten, because
+  an ADR records what was decided when; read it as history from here.
+
+  Two reasons, and neither is that the profile changed. First, the construction is
+  `Base64(SHA1(Nonce + Created + Password))` by the UsernameToken profile's own definition, so the
+  option could not be moved to an approved hash while remaining the thing partners asked for --
+  retiring it was the only remedy available. Second, and this is what makes the retirement cheap
+  rather than a trade: it protected nothing this connector was not already protecting. A
+  UsernameToken over a cleartext hop is refused at construction, so the credential travels inside
+  TLS either way, and PasswordDigest additionally requires the far side to store the password
+  recoverably. Zero deployments (CLAUDE.md section 0), so no partner is stranded.
 - **Decision in one line:** add an **opt-in WS-\* mode to the existing SOAP destination**
   ([`transports/soap.py:92`](../../messagefoundry/transports/soap.py)) — **not** a new connector type — so
   it gains (a) a **per-connection client-certificate TLS opener** for mutual TLS and (b) a transport that

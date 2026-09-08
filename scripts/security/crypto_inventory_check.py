@@ -47,8 +47,12 @@ than feeding it. Four facts, each measured, that are not obvious from the code b
 **A SECOND ARM COVERS THE NON-PYTHON TREE (BACKLOG #1172, ASVS 11.5.1).** Everything above is an
 ``import ast`` walk of ``*.py``, so it is Python-only *by construction* and cannot see a randomness
 draw in another language however the walk-set is spelled. :func:`check_non_python_randomness` scans
-:data:`NON_PYTHON_WALK_ROOTS` (``ide/``, the shipped TypeScript VS Code extension) for randomness
-sources and diffs them against :data:`NON_PYTHON_INVENTORY` the same bidirectional way. Three
+:data:`NON_PYTHON_WALK_ROOTS` (``ide/``, the shipped TypeScript VS Code extension, and
+``messagefoundry_webconsole/``, whose ``static/*.js`` is the operator console's own first-party
+JavaScript) for randomness sources and diffs them against :data:`NON_PYTHON_INVENTORY` the same
+bidirectional way. Note that the second root is ALSO a Python walk root: a first-party root may be
+mixed-language, and requiring otherwise is what kept the console's JavaScript out of both arms until
+the ASVS 11.5.1 scope pass (see :data:`NON_PYTHON_WALK_ROOTS`). Three
 properties are the point of it, and each is pinned by a test in
 ``tests/test_crypto_inventory_scanner.py``:
 
@@ -115,11 +119,30 @@ WALK_ROOTS = ("messagefoundry", "messagefoundry_webconsole", "harness", "tee", "
 # --------------------------------------------------------------------------------------------
 # The NON-PYTHON randomness arm (BACKLOG #1172, ASVS 11.5.1).
 # --------------------------------------------------------------------------------------------
-#: First-party roots that hold shipped source in a language the AST walk above cannot read. Today
-#: that is ``ide/``, the TypeScript VS Code extension. Kept separate from :data:`WALK_ROOTS` on
-#: purpose: the two arms read different file types with different instruments, and merging them
-#: would let one arm's green stand in for the other's silence.
-NON_PYTHON_WALK_ROOTS = ("ide",)
+#: First-party roots that hold shipped source in a language the AST walk above cannot read: ``ide/``
+#: (the TypeScript VS Code extension) and ``messagefoundry_webconsole/`` (the operator console's
+#: hand-written JavaScript under ``static/``).
+#:
+#: THIS SET DELIBERATELY OVERLAPS :data:`WALK_ROOTS`, and it used to be asserted disjoint from it.
+#: That assertion cost real coverage (BACKLOG #1172, ASVS 11.5.1 scope pass). Its stated reason —
+#: "the two arms read different file types with different instruments, and merging them would let
+#: one arm's green stand in for the other's silence" — is sound, and it argues for keeping the two
+#: ARMS separate, which they still are: different instruments, separately reported corpus sizes,
+#: neither substituting for the other. It does NOT argue that a first-party ROOT must be
+#: single-language, which is what disjointness actually asserted.
+#:
+#: ``messagefoundry_webconsole`` is the counter-example that was sitting in the tree the whole time.
+#: Its Python is in :data:`WALK_ROOTS`, so the root reported green and READ as covered, while
+#: ``static/app.js`` and ``static/csp-probe.js`` were read by neither arm — :func:`discover` rglobs
+#: ``*.py``, and this walk stopped at ``ide/``. The green was a true statement about the root's
+#: ``.py`` and an accidental one about everything else in it. Coverage was being reasoned about per
+#: ROOT while the instruments split per LANGUAGE, and disjointness froze that mismatch as an
+#: invariant with nothing checking whether it should hold.
+#:
+#: The console's JavaScript is not incidental to security: ``csp-probe.js`` is the ASVS 3.7.5
+#: CSP-enforcement canary, and ``app.js`` registers the page's security controls ahead of its
+#: cosmetic ones. Both are served to an authenticated operator's browser at ``/ui``.
+NON_PYTHON_WALK_ROOTS = ("ide", "messagefoundry_webconsole")
 
 #: Suffixes the non-Python arm reads. Source only.
 NON_PYTHON_SUFFIXES = (".ts", ".js", ".mjs", ".cjs")
@@ -192,6 +215,15 @@ CRYPTO_SEAM_MODULES = frozenset(
         # whether that surface was sound or not. pipeline/alert_sinks.py was the worked example: it
         # imports smtplib and this module, and no entry could see it.
         "messagefoundry.config.tls_policy",
+        # BACKLOG #1164. The SIGNING seam: importing it means this file mints or verifies a detached
+        # JWS through the shared signer rather than calling a primitive itself. transports/signing.py
+        # was already INVENTORIED as a crypto site, but being inventoried is not being a seam -- an
+        # inventory row records what a file uses, while a seam entry is what makes its IMPORTERS
+        # visible. So every module reaching signature crypto through it stayed invisible unless some
+        # other trigger happened to catch it. transports/fhir.py is the worked example: it resolves a
+        # signer and emits detached JWS headers per request, and before this entry it appeared
+        # nowhere in the gate at all.
+        "messagefoundry.transports.signing",
     }
 )
 
@@ -225,9 +257,13 @@ INVENTORY: dict[str, frozenset[str]] = {
     #     legs share. Pinned-only trust when [auth].oidc_tls_ca_cert_file is set (mirroring
     #     ad_tls_ca_cert_file); otherwise truststore reads the live OS store. No insecure escape
     #     exists here by design — the IdP hop carries an authentication assertion.
-    "messagefoundry/auth/oidc/claims.py": frozenset({"cryptography", "hmac"}),
+    "messagefoundry/auth/oidc/claims.py": frozenset(
+        {"cryptography", "hmac", "messagefoundry.transports.signing"}
+    ),
     "messagefoundry/auth/oidc/flow.py": frozenset({"hashlib", "hmac", "secrets"}),
-    "messagefoundry/auth/oidc/jwks.py": frozenset({"cryptography"}),
+    "messagefoundry/auth/oidc/jwks.py": frozenset(
+        {"cryptography", "messagefoundry.transports.signing"}
+    ),
     "messagefoundry/auth/oidc_http.py": frozenset({"messagefoundry.config.tls_policy", "ssl"}),
     "messagefoundry/auth/passwords.py": frozenset({"argon2"}),
     "messagefoundry/auth/policy.py": frozenset({"hashlib"}),
@@ -392,18 +428,32 @@ INVENTORY: dict[str, frozenset[str]] = {
     # escape, mirroring mllp.py's outbound posture. ADR 0129 (#142): hashlib = sha256 of a remote file's
     # name+size as a HASHED dedup key for the leave-in-place processed_files ledger (a derived id, never
     # a cleartext filename).
+    # BACKLOG #1164. The row this seam entry EXISTS to surface: the FHIR destination resolves a
+    # signer (`signer_from_destination`) and emits detached JWS signature headers per request, so
+    # it performs signature crypto through the signing seam with none of the six stdlib imports of
+    # its own. It appeared nowhere in this gate before the seam entry was added.
+    # #1180 (ASVS 12.3.4) adds the TLS-policy seam alongside it: the same hop now resolves its
+    # trust anchor through the common helper instead of building a context of its own.
+    "messagefoundry/transports/fhir.py": frozenset(
+        {"messagefoundry.config.tls_policy", "messagefoundry.transports.signing"}
+    ),
     "messagefoundry/transports/remotefile.py": frozenset(
         {"messagefoundry.config.tls_policy", "ssl", "hashlib"}
     ),
-    "messagefoundry/transports/rest.py": frozenset({"messagefoundry.config.tls_policy", "ssl"}),
+    "messagefoundry/transports/rest.py": frozenset(
+        {"messagefoundry.config.tls_policy", "messagefoundry.transports.signing", "ssl"}
+    ),
     "messagefoundry/transports/signing.py": frozenset({"cryptography"}),
     # ADR 0024: a random `jti` for the SMART Backend Services client_assertion JWT (the JWT signing
     # itself reuses signing.py's `cryptography`).
     "messagefoundry/transports/smart.py": frozenset(
-        {"messagefoundry.config.tls_policy", "secrets"}
+        {"messagefoundry.config.tls_policy", "messagefoundry.transports.signing", "secrets"}
     ),
+    # BACKLOG #1171 retired ws_password_type='digest', which was this file's only hashlib use (the
+    # WS-Security PasswordDigest SHA-1 construction). The row is bidirectional, so the token had to go
+    # with the code or the gate would red the other way.
     "messagefoundry/transports/soap.py": frozenset(
-        {"messagefoundry.config.tls_policy", "hashlib", "ssl"}
+        {"messagefoundry.config.tls_policy", "messagefoundry.transports.signing", "ssl"}
     ),
     # ADR 0113 (2026-07-22 amendment): the tray's TOKENLESS /health + /ui probes must verify the
     # engine's server cert when [api].tls_cert_file makes the loopback bind serve https. Builds the
@@ -433,6 +483,8 @@ INVENTORY: dict[str, frozenset[str]] = {
     # transport/crypto is hvac's (behind the optional [vault] extra, lazy-imported). tls_policy since
     # ADR 0180: hvac exposes no SSLContext, so `_build_client` asserts the suite list urllib3 will
     # build for this hop (ASVS 12.1.2) before the client is constructed.
+    # transport/crypto is hvac's (behind the optional [vault] extra, lazy-imported).
+    # seam, so an operator-named internal CA reaches hvac's single `verify=` bundle path.
     "messagefoundry/config/secretprovider_vault.py": frozenset(
         {"hvac", "messagefoundry.config.tls_policy"}
     ),
@@ -467,12 +519,14 @@ INVENTORY: dict[str, frozenset[str]] = {
     # (fail-closed; key material never logged), reusing store.keyprovider's errors + retired-key split.
     # tls_policy since ADR 0180: `_build_client` asserts the suite list urllib3 will build for this hop
     # (ASVS 12.1.2). crypto_transit shares this construction point, so its client inherits it.
+    # #1180 (ASVS 12.3.4): also resolves the Vault hop's trust anchor through the TLS-policy seam.
     "messagefoundry/store/keyprovider_vault.py": frozenset(
         {
             "hvac",
             "messagefoundry.config.tls_policy",
             "messagefoundry.store.keyprovider",
         }
+        # #1180 (ASVS 12.3.4): also resolves the Vault hop's trust anchor through the TLS-policy seam.
     ),
     # --- non-messagefoundry roots (#283's _CRYPTO_SITES_OUTSIDE_THE_PACKAGE, now walked by this gate) ---
     # ASVS 3.4.7/3.4.8: mints the per-response CSP script nonce (secrets) stamped into <script> for the

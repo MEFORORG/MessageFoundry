@@ -1,32 +1,80 @@
 {
   "_about": "Tunables for scripts/security/dast_auth_sweep.py. Every floor is a MINIMUM with headroom under a value measured against an unchanged app; a count drifting BELOW a floor exits 2 (could not measure), never 0. Raise a floor when the real number grows; NEVER lower one to make a run pass.",
   "_provenance": {
-    "min_route_rows_examined": "measured 105 on 2026-07-31 against 2fd1ad8a",
-    "min_gated_http_rows": "measured 99 on 2026-07-31 against 2fd1ad8a",
-    "min_negative_probes": "measured 198 on 2026-07-31 against 2fd1ad8a",
-    "min_get_rows_reached": "measured 46 on 2026-07-31 against 2fd1ad8a",
-    "min_bfla_probes": "measured 19 on 2026-07-31 against 2fd1ad8a",
-    "_canary_floor_units": "The two canary floors below are compared against negative_non_401 and bfla_violations, which count PROBES, not rows. The open-auth canary sends 2 probes per gated row, so its finding count is roughly twice the row count -- do not re-derive a floor from a row number.",
+    "min_route_rows_examined": "measured 105 on 2026-07-31 against 2fd1ad8a; re-measured 108 on 2026-09-05 against c57903c2",
+    "min_gated_http_rows": "measured 99 on 2026-07-31 against 2fd1ad8a; re-measured 102 on 2026-09-05 against c57903c2",
+    "min_negative_probes": "measured 198 on 2026-07-31 against 2fd1ad8a; re-measured 204 on 2026-09-05 against c57903c2",
+    "min_get_rows_reached": "measured 46 on 2026-07-31 against 2fd1ad8a; re-measured 47 on 2026-09-05 against c57903c2",
+    "min_bfla_probes": "measured 19 on 2026-07-31 against 2fd1ad8a; re-measured 19 on 2026-09-05 against c57903c2",
+    "min_write_rows_reached": "measured 47 of 55 gated non-GET rows on 2026-09-05 against c57903c2; the 8 that refused the administrator are the action-scoped step-up rows in unreachable_allowlist below",
+    "min_write_bfla_probes": "measured 43 write BFLA candidate rows, all 43 refused, on 2026-09-05 against c57903c2",
+    "_canary_floor_units": "The canary floors below are compared against negative_non_401, bfla_violations and write_bfla_violations, which count PROBES, not rows. The open-auth canary sends 2 probes per gated row, so its finding count is roughly twice the row count -- do not re-derive a floor from a row number.",
     "open-auth_min_negative_findings": "measured 196 failing PROBES (98 of 99 gated rows x 2 probes; the holdout is the mTLS-only GET /service/identity) on 2026-07-31 against 2fd1ad8a",
-    "bfla_min_violations": "measured 19 failing PROBES (all 19 GET BFLA candidates) on 2026-07-31 against 2fd1ad8a"
+    "bfla_min_violations": "measured 19 failing PROBES (all 19 GET BFLA candidates) on 2026-07-31 against 2fd1ad8a",
+    "bfla_min_write_violations": "measured 40 failing PROBES of 43 write BFLA candidates on 2026-09-05 against c57903c2; the 3 that still refused the over-granted identity are the action-scoped step-up rows under /users/{user_id}",
+    "max_write_session_rebuilds": "measured 1 on 2026-09-05 against c57903c2 -- POST /auth/logout answers a valid administrator token 200 and revokes the session"
   },
   "floors": {
     "min_route_rows_examined": 95,
     "min_gated_http_rows": 90,
     "min_negative_probes": 180,
     "min_get_rows_reached": 40,
-    "min_bfla_probes": 15
+    "min_bfla_probes": 15,
+    "min_write_rows_reached": 40,
+    "min_write_bfla_probes": 35
   },
   "max_unexplained_unreached": 0,
+  "max_write_session_rebuilds": 5,
   "canary_floors": {
     "open-auth_min_negative_findings": 50,
-    "bfla_min_violations": 5
+    "bfla_min_violations": 5,
+    "bfla_min_write_violations": 10
   },
   "unreachable_allowlist": [
     {
       "method": "GET",
       "path": "/service/identity",
       "reason": "mTLS client-certificate identity only; it accepts no bearer token by design (ADR 0083)"
+    },
+    {
+      "method": "POST",
+      "path": "/me/mfa/enroll",
+      "reason": "action-scoped step-up (X-Step-Up-Action: mfa_enroll); a password login does not satisfy it and the scan performs no per-action re-auth"
+    },
+    {
+      "method": "POST",
+      "path": "/me/mfa/confirm",
+      "reason": "action-scoped step-up (X-Step-Up-Action: mfa_confirm); a password login does not satisfy it and the scan performs no per-action re-auth"
+    },
+    {
+      "method": "DELETE",
+      "path": "/me/mfa",
+      "reason": "action-scoped step-up (X-Step-Up-Action: mfa_disable); a password login does not satisfy it and the scan performs no per-action re-auth"
+    },
+    {
+      "method": "DELETE",
+      "path": "/me/sessions",
+      "reason": "action-scoped step-up (X-Step-Up-Action: session_terminate); a password login does not satisfy it and the scan performs no per-action re-auth"
+    },
+    {
+      "method": "DELETE",
+      "path": "/me/sessions/{session_id}",
+      "reason": "action-scoped step-up (X-Step-Up-Action: session_terminate); a password login does not satisfy it and the scan performs no per-action re-auth"
+    },
+    {
+      "method": "PATCH",
+      "path": "/users/{user_id}",
+      "reason": "action-scoped step-up (X-Step-Up-Action: admin_user_update); a password login does not satisfy it and the scan performs no per-action re-auth"
+    },
+    {
+      "method": "POST",
+      "path": "/users/{user_id}/reset-password",
+      "reason": "action-scoped step-up (X-Step-Up-Action: admin_reset_password); a password login does not satisfy it and the scan performs no per-action re-auth"
+    },
+    {
+      "method": "POST",
+      "path": "/users/{user_id}/reset-mfa",
+      "reason": "action-scoped step-up (X-Step-Up-Action: admin_reset_mfa); a password login does not satisfy it and the scan performs no per-action re-auth"
     }
   ],
   "anonymous_allowlist": [

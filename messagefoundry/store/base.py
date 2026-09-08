@@ -1316,10 +1316,12 @@ class QueueStore(StoreLifecycle, Protocol):
         now: float | None = None,
         connection_cutoffs: Mapping[str, float] | None = None,
     ) -> int:
-        """Null dead-lettered outbound bodies updated before ``older_than`` (their own window).
-        ``connection_cutoffs`` (#34, ADR 0027) optionally overrides the cutoff per ``destination_name``
-        (``float('-inf')`` = keep forever); default empty ⇒ a single global cutoff. Returns the number
-        purged."""
+        """Null dead-lettered bodies updated before ``older_than`` (their own window), at **every
+        stage** — a dead ``ingress``/``routed`` row carries the full raw body and is reached here
+        (#1188, ASVS 14.2.7), not only a dead ``outbound`` row. ``connection_cutoffs`` (#34, ADR 0027)
+        optionally overrides the cutoff per ``destination_name`` (``float('-inf')`` = keep forever);
+        default empty ⇒ a single global cutoff. A row with a NULL ``destination_name`` (ingress, routed,
+        response) always takes the global window. Returns the number purged."""
         ...
 
     async def purge_state(self, *, older_than: float, now: float | None = None) -> int:

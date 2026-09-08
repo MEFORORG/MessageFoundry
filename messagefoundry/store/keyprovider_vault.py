@@ -29,10 +29,13 @@ stubs**, so the client is contained as a typed ``Any`` local here — never a re
 from __future__ import annotations
 
 import os
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from typing import TYPE_CHECKING, Any
 
-from messagefoundry.config.tls_policy import assert_hvac_tls_suites
+from messagefoundry.config.tls_policy import (
+    assert_hvac_tls_suites,
+    vault_client_verify_kwargs,
+)
 from messagefoundry.store.keyprovider import KeyProviderError, _split_retired
 
 if TYPE_CHECKING:
@@ -57,6 +60,12 @@ _ENV_TRANSIT_KEY = "MEFOR_STORE_VAULT_TRANSIT_KEY"
 #: The wrapped DEK ciphertext (``vault:v1:…``). Not itself a secret (it is KEK-encrypted), but supplied
 #: via env alongside the token so a deployment keeps all Vault wiring in one place.
 _ENV_WRAPPED_DEK = "MEFOR_STORE_VAULT_WRAPPED_DEK"
+#: PEM path to the CA that issued the Vault server's certificate (#1180, ASVS 12.3.4). A PATH, not a
+#: secret — the same status as ``[tls].internal_ca_file`` and ``tls_cert_file``. Env-fed, beside the
+#: address and token it belongs with; ``[tls].internal_ca_file`` cannot reach this hop yet, and
+#: :func:`~messagefoundry.config.tls_policy.vault_client_verify_kwargs` records what that would take.
+#: Unset = hvac's own default, which is ``requests``' PUBLIC certifi bundle.
+_ENV_CA_FILE = "MEFOR_STORE_VAULT_CA_FILE"
 
 
 def _import_hvac() -> Any:
@@ -73,6 +82,30 @@ def _import_hvac() -> Any:
             f"importable): install 'messagefoundry[{_EXTRA}]'."
         ) from exc
     return hvac
+
+
+def _vault_ca_kwargs(addr: str | None) -> dict[str, str]:
+    """This Vault hop's ``verify=`` keyword arguments — ``{}`` when no anchor is configured.
+
+    #1180 (ASVS 12.3.4): the client that hands out the store's data-encryption key took no CA argument
+    at all, so an operator running Vault behind their own PKI could not say so. The env-supplied CA is
+    this hop's own anchor and so wins verbatim — trust ONLY it, no public bundle — exactly as a
+    connection's ``tls_ca_file`` does; see
+    :func:`~messagefoundry.config.tls_policy.vault_client_verify_kwargs` for the shared resolution and
+    for what still has to be threaded before ``[tls].internal_ca_file`` can reach this hop.
+
+    Fails closed here rather than there, because the error type and cell name are this module's:
+    ``requests`` would otherwise raise deep inside the first Transit call, surfacing as an opaque
+    store-open failure that names no cause."""
+    ca = os.environ.get(_ENV_CA_FILE) or None
+    if ca is not None and not os.path.isfile(ca):
+        raise KeyProviderError(
+            f"[store].key_provider={_EXTRA!r}: {_ENV_CA_FILE} names {ca!r}, which is not a readable "
+            f"file — point it at the PEM of the CA that issued the Vault server certificate."
+        )
+    return vault_client_verify_kwargs(
+        ca_file=ca, addr=addr, cell=f"[store].key_provider={_EXTRA!r}"
+    )
 
 
 def _build_client(addr: str | None, token: str | None) -> Any:
@@ -103,7 +136,16 @@ def _build_client(addr: str | None, token: str | None) -> Any:
     # ONE dict feeds both the assertion and the construction, deliberately. The LDAPS site had to
     # grow a second test to prove its asserted arguments were the ones its bind used, because the two
     # lived in different methods; here they cannot drift, because they are the same object.
-    kwargs: dict[str, object] = {"url": addr, "token": token, "allow_redirects": False}
+    #
+    # #1180 (ASVS 12.3.4) rides in the SAME dict: narrow the trust anchor when the operator named
+    # one, omitting the keyword when they did not so the stock construction is unchanged. Putting it
+    # here rather than at the call means the operator's CA is inside what the assertion below sees.
+    kwargs: dict[str, object] = {
+        "url": addr,
+        "token": token,
+        "allow_redirects": False,
+        **_vault_ca_kwargs(addr),
+    }
     # ASVS 12.1.2 (BACKLOG #1317, ADR 0180): hvac exposes no SSLContext, so this asserts the context
     # urllib3 will build for this hop. Raises ValueError at construction. Shared with
     # crypto_transit.py, so the Transit cipher's client inherits the assertion from here too — the
@@ -111,6 +153,83 @@ def _build_client(addr: str | None, token: str | None) -> Any:
     assert_hvac_tls_suites(kwargs, connector=_VAULT_TRANSIT_CONNECTOR)
     client: Any = hvac.Client(**kwargs)
     return client
+
+
+# --- Transit key-TYPE validation (BACKLOG #1166, owner ruling 2026-08-22, ASVS 11.2.3) -------------
+#
+# Every Vault Transit key this product uses is OPERATOR-CHOSEN by name, and the product read its type
+# and threw the answer away. Measured at engine commit 2b8bccb43 with a fake Transit backend: the
+# data-key path ACCEPTED `ecdsa-p256` (a signing-only key that cannot encrypt at all), `aes128-cmac`
+# (MAC-only) and `rsa-2048` (112 bits of security, and no `associated_data` support), while a positive
+# control in the same run -- an unreachable key -- DID refuse. The KEK path read the type ZERO times.
+# The ruling: check the type against what each use requires and refuse to start on a mismatch.
+#
+# There is NO counterparty on any of these three keys. The operator provisions their own Vault, so a
+# refusal here breaks no handshake with anybody -- the same profile that made the signing-key floor
+# safe to land, and the reason this limb does not need the interop ruling the peer-chain floor does.
+
+#: The store DATA key (``vault_transit`` cipher), and the base of the other two sets: Transit key
+#: types whose ``encrypt``/``decrypt`` is an AEAD accepting ``associated_data``, at or above the 128
+#: bits ASVS 11.2.3 names.
+#:
+#: The ``associated_data`` clause is load-bearing, not decoration: the store passes
+#: ``cell_aad(table, column, *pk)`` on every Transit call and the cell-binding property (ASVS 11.3.3)
+#: depends on Transit binding it. A key type that silently ignores or rejects the parameter would
+#: leave a blob cut-and-pasted between cells decrypting cleanly.
+TRANSIT_KEY_TYPES_DATA = frozenset(
+    {
+        "aes128-gcm96",
+        "aes256-gcm96",
+        "chacha20-poly1305",
+        "xchacha20-poly1305",
+    }
+)
+
+#: The audit-chain MAC key (``vault_transit`` cipher): Transit ``generate_hmac``. The data set,
+#: because that key DEFAULTS to the data key and must stay usable for both, plus Vault's dedicated
+#: ``hmac`` key type -- which is the correct type for this use and would be perverse to refuse.
+TRANSIT_KEY_TYPES_AUDIT = TRANSIT_KEY_TYPES_DATA | {"hmac"}
+
+#: The Key-Encryption Key (``vault`` KeyProvider): Transit ``decrypt`` of the wrapped DEK, no AAD.
+#: Adds the RSA key-transport types AT OR ABOVE the floor. ``rsa-2048`` is deliberately ABSENT: it
+#: provides roughly 112 bits, which is the exact shortfall this requirement is about, and the operator
+#: generates this KEK themselves so refusing it costs no counterparty anything.
+TRANSIT_KEY_TYPES_KEK = TRANSIT_KEY_TYPES_DATA | {"rsa-3072", "rsa-4096"}
+
+
+def require_transit_key_type(
+    client: Any, key_name: str, *, allowed: frozenset[str], use: str, selector: str
+) -> None:
+    """Read ``key_name``'s Transit type and REFUSE unless it is one ``use`` can be run under.
+
+    ``selector`` names the setting or environment variable the operator used to choose the key, so
+    the refusal says which knob to change.
+
+    **The allow-list is positive and an unrecognised type refuses**, as does a response whose type
+    we cannot read at all. A deny-list would admit every key type Vault adds after this line was
+    written, and a validator that cannot see the type and returns anyway is a control reporting
+    success forever -- worse than the absence it replaces, because the record would then claim a
+    check that never runs. Widening a set for a new Transit type is a deliberate edit with the
+    requirement in view, not a configuration override.
+
+    Raises :class:`KeyProviderError` so ``open_store`` propagates it and ``serve`` refuses to start
+    (ADR 0019 §4 / ADR 0138 fail-closed), never a degrade to a weaker path."""
+    response: Any = client.secrets.transit.read_key(name=key_name)
+    data = response.get("data") if isinstance(response, Mapping) else None
+    raw = data.get("type") if isinstance(data, Mapping) else None
+    key_type = raw.strip() if isinstance(raw, str) else ""
+    if not key_type:
+        raise KeyProviderError(
+            f"Vault Transit did not report a key type for {key_name!r} (expected "
+            f"response['data']['type']); refusing to start rather than using a key of unknown type."
+        )
+    if key_type not in allowed:
+        raise KeyProviderError(
+            f"Vault Transit key {key_name!r} (from {selector}) is of type {key_type!r}, which "
+            f"cannot be used for {use}. Supported types: {', '.join(sorted(allowed))} "
+            f"(ASVS 11.2.3 -- at least 128 bits of security, and the key must support the "
+            f"operation the engine performs on it). Provision a key of a supported type."
+        )
 
 
 class VaultKeyProvider:
@@ -151,6 +270,22 @@ class VaultKeyProvider:
         # both paths propagate out of open_store and serve refuses to start.
         client = _build_client(addr, token)
         try:
+            client = _build_client(addr, token)
+            # BACKLOG #1166. Check the KEK's TYPE before unwrapping under it. Unlike the Transit
+            # cipher, this path paid for NO metadata round trip -- measured zero read_key calls at
+            # engine commit 2b8bccb43 -- so this ADDS one, to turn an operator-chosen key of an
+            # unsuitable or sub-128-bit type into a refusal to start. The cost is one Vault round
+            # trip everywhere active_key() is already called, which is at least every store open
+            # (once per `serve` process and once per key-resolving CLI command) and every DR-backup
+            # pass; it is nowhere near a per-message path -- the store's per-cell crypto uses the
+            # already-built Cipher and never re-enters the provider.
+            require_transit_key_type(
+                client,
+                transit_key,
+                allowed=TRANSIT_KEY_TYPES_KEK,
+                use="envelope-decrypting the store DEK (Transit decrypt)",
+                selector=_ENV_TRANSIT_KEY,
+            )
             # transit.decrypt_data unwraps the DEK inside Vault against the non-extractable KEK and
             # returns response['data']['plaintext'] — already base64 of the sealed raw-32 DEK bytes, so
             # it IS the active_key() contract with no re-encoding (ADR 0019 §3, no double-base64).
