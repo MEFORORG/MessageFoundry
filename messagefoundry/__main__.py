@@ -805,6 +805,20 @@ def main(argv: list[str] | None = None) -> int:
     verify.add_argument("--engine-host", default="127.0.0.1", help="live smoke: engine host")
     verify.add_argument("--mllp-port", type=int, default=2575, help="live smoke: inbound MLLP port")
     verify.add_argument(
+        "--smoke-tls",
+        action="store_true",
+        help="live smoke: send the frame over TLS, for an inbound configured tls = true. Declare "
+        "it: the smoke never probes in the clear and retries over TLS (ASVS 12.3.1 forbids that "
+        "fall-back), so without this the synthetic message crosses in cleartext",
+    )
+    verify.add_argument(
+        "--smoke-tls-ca",
+        default=None,
+        help="live smoke: CA/certificate file that anchors the engine's inbound certificate "
+        "(needed for the self-signed pair the engine mints on first run). No verify-off switch: a "
+        "smoke that accepts any certificate proves the port answers, not that it is the engine",
+    )
+    verify.add_argument(
         "--inbound",
         default=None,
         help="self smoke: inbound connection name (if config has several)",
@@ -5358,6 +5372,8 @@ def _verify(args: argparse.Namespace) -> int:
         inbound=args.inbound,
         check_disposition=args.check_disposition,
         disposition_timeout=args.disposition_timeout,
+        smoke_tls=args.smoke_tls,
+        smoke_tls_ca=args.smoke_tls_ca,
         fed_id_token=args.fed_id_token,
         fed_jwks=args.fed_jwks,
         fed_nonce=args.fed_nonce,
