@@ -24,8 +24,29 @@
 # `gh-readonly-queue/<base>/pr-<N>-<sha>`, so an ejection can still be attributed to the pull request
 # it ejected.
 #
-# CLA Assistant is deliberately NOT watched. A CLA failure is the contributor's to resolve and needs
-# no attribution; labelling it would train readers to ignore the label.
+# AN EJECTION NOW SAYS WHICH JOB DID IT (#1403). Recovering the number was only half of it. For a
+# resolved pull request the workflow used to add a bare `ci-red` label and stop, while the run name
+# and URL were written only on the branch where NO pull request resolves. So an ejection left a red
+# label on a pull request whose own head is green and named nothing. The attribution step below fills
+# that in, and it is scoped to `merge_group` on purpose: a comment on every red pull request is noise
+# the reader learns to skip, while on an ejection the comment is the only record there is.
+#
+# WHAT THIS FILE DOES NOT WATCH, ON THE RECORD (#1402). Watching is not self-describing: a required
+# workflow missing from the list above looks exactly like one nobody thought about. So every required
+# workflow must be either watched or named here with its reason, one per line, in the form
+#
+#     not-watched: <workflow file> -- <reason>
+#
+# `tests/test_failure_signal.py` PARSES those lines and reads `.github/required-contexts.txt` for the
+# other side. An exclusion that is not written here is therefore not an exclusion; the guard goes red
+# rather than passing quietly, which is the direction that catches a newly required workflow.
+#
+# THAT GUARD READS THE CHECKED-IN FILE, NOT THE SERVER, and the two are different questions. Branch
+# protection lives on the server, so a context armed there reaches the guard only once somebody
+# transcribes it into `required-contexts.txt`. Reconciling the file against the live set is
+# `scripts/ci/check_required_contexts_drift.py`'s job, on a schedule. Neither covers the other.
+#
+# not-watched: cla.yml -- a CLA failure is the contributor's to resolve and needs no attribution, and labelling it would train readers to ignore the label
 
 name: failure signal
 
@@ -90,6 +111,39 @@ jobs:
           set -euo pipefail
           gh label create ci-red --repo "$REPO" --color B60205 --description "A required check went red. Attribute it before retrying." 2>/dev/null || true
           gh pr edit "$PR" --repo "$REPO" --add-label ci-red
+
+      - name: Say which job ejected it, when the red came from the merge queue
+        id: attribute-ejection
+        # SCOPED TO `merge_group` DELIBERATELY (#1403). On an ordinary pull-request red the author can
+        # find the run from the checks tab, so a comment adds nothing and teaches readers to skip
+        # comments here. An ejection is the opposite case: the pull request's OWN head is green, the
+        # ejecting job may be one the pull request never ran (the path gates come off in the queue),
+        # and the label alone names none of that.
+        #
+        # The step needs no new permission: `gh pr comment` posts an issue comment, and the job
+        # already holds `issues: write` for the standing tracker below.
+        #
+        # TWO PLACES NOW TEST `merge_group` AND THEY ASK DIFFERENT QUESTIONS, so neither is a copy of
+        # the other and neither should become an output of the other. The resolve step's shell gates
+        # THE REF PARSE -- may I read a number out of an attacker-chosen branch name. This gates THE
+        # ATTRIBUTION -- did this red come from the queue at all, which is also true of a queue run
+        # that resolved through `pull_requests[0]` and never reached that parse. They must still move
+        # together: widening the resolve step past `merge_group` without widening this one puts the
+        # bare label back, which is the defect #1403 closed.
+        if: steps.resolve.outputs.pr != '' && github.event.workflow_run.event == 'merge_group'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ steps.resolve.outputs.pr }}
+          REPO: ${{ github.repository }}
+          # Same rule as the resolve step: the run's own name is repository-controlled, but it reaches
+          # the script through the environment anyway. A template expression spliced into a `run:`
+          # body is a shell-injection hole regardless of which field happens to be safe today.
+          RUN_NAME: ${{ github.event.workflow_run.name }}
+          RUN_URL: ${{ github.event.workflow_run.html_url }}
+        run: |
+          set -euo pipefail
+          printf '%s failed while this pull request was in the merge queue, so the queue ejected it.\n\nIts own head can still be green: the queue revalidates the merge, and the path gates that skip on a pull request run there. Read the run before retrying.\n\n%s\n' "$RUN_NAME" "$RUN_URL" > ejection-body.md
+          gh pr comment "$PR" --repo "$REPO" --body-file ejection-body.md
 
       - name: Otherwise record it against the standing tracker
         if: steps.resolve.outputs.pr == ''
