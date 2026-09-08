@@ -25803,6 +25803,46 @@ A sixth line was stale in a different direction: the section told the reader to 
 
 ---
 
+## 1489. the log write guard prints its roll notice to stdout, so it lands inside captured CLI output and breaks --json readers
+
+> 🔢 **Filed 2026-09-08 -- not started.** `messagefoundry/logging_guard.py` (shipped by PR #883 at 07:24Z, commit `995fc2790`) writes `application log sink stdout was rolled after a write` to the **stdout sink**. A CLI command invoked with `--json` writes its payload to that same stream, so a reader doing `json.loads(...)` sees the notice first and raises `Extra data: line 1 column 5`. Six tests in `tests/test_checks.py` fail this way, and it has already failed one merge-queue build.
+>
+> **Scored 2026-09-08 -> P2.** Value **6/10** · Difficulty **3/10** · _quick win_. Value 6 -- it makes `--json` output unreliable for any consumer, and it evicts merge-queue entries at random. Difficulty 3 -- the notice needs a stream that is not the machine-readable one.
+
+### What fails
+
+    FAILED tests/test_checks.py::test_check_clean_sample_passes
+    FAILED tests/test_checks.py::test_check_dryrun_accepts_single_file
+    FAILED tests/test_checks.py::test_check_dryrun_fails_on_bad_message
+    FAILED tests/test_checks.py::test_check_dryrun_fails_on_missing_messages_path
+    FAILED tests/test_checks.py::test_check_dryrun_gates_when_fixtures_present
+    FAILED tests/test_checks.py::test_check_dryrun_skipped_without_fixtures
+
+All six raise the same `json.JSONDecodeError: Extra data: line 1 column 5` from `json.loads(capsys.readouterr().out)`.
+
+### Why this is the guard and not the PR that fails
+
+It surfaced on PR 976, whose **entire diff is `docs/BACKLOG.md`** -- that change cannot reach the code path. Sampled failed CI runs mentioning `tests/test_checks.py`:
+
+| Window | Sampled | Mentioning the file |
+|---|---|---|
+| 09-07 12:00Z to 09-08 07:23Z, before the guard merged | 12 | **0** |
+| 09-08 07:24Z onward, after it merged | 12 | **2** |
+
+**Both numbers are samples of twelve, not a census.** They are consistent with the mechanism rather than proof of it; the mechanism is the load-bearing part, and it is not in doubt -- the module did not exist before `995fc2790`, and the failure text is the notice that module writes.
+
+### Why it looks like a flake
+
+`main`'s own CI has been green on every commit since the guard landed, and the failure has only been seen on `windows-2025`. The roll only happens sometimes, so the notice only sometimes precedes the payload. **That is the shape that gets a real defect filed as bad luck**, which is why the before/after split is recorded here rather than left to a later reader to re-derive.
+
+### The fix
+
+Send the roll notice to a stream that is never the machine-readable one. `logging_guard.py` already resolves `stream = sys.stderr` for its other notice path; the stdout sink's roll notice should not be an exception. A `--json` payload is a contract with a parser, and nothing else may share that stream.
+
+### Not taken here
+
+This item does not propose reverting `995fc2790`. The guard is wanted; only its choice of stream for one notice is wrong.
+
 ## 1448. a dispatched brief is frozen at spawn: the chip cannot be corrected and nothing tells the receiver it has drifted
 
 > 🔢 **FILED 2026-09-04 by the session that read the stale brief.** Not started. A **fleet-process** defect with no engine, PHI or deployment axis (sec. 0) -- nothing here reaches a running instance, because there are none. What it would cost is duplicated Builder turns and a prose merge conflict a human then resolves by hand.
