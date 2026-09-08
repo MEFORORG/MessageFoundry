@@ -41,13 +41,16 @@ on:
   # configured; corrected 2026-09-03, after PR 754 merged through the queue. BACKLOG #340 carries
   # the measurements and STAYS OPEN -- a live queue is not that item being finished, and who
   # enabled the queue is recorded nowhere.
+  #
+  # THIS ARM ALSO CARRIES THE FULLY-LOADED SCAN OF FORK-CONTRIBUTED CONTENT, which a post-merge
+  # `push: branches: [main]` arm used to carry until it was removed on 2026-09-08. `forbidden-content`
+  # degrades to a STRUCTURAL-ONLY scan on a fork pull request because MEFOR_FORBIDDEN_TOKENS is
+  # withheld from a fork by design. A merge_group run is a base-repo event: the secret is present and
+  # `github.event.pull_request` is null, so that job takes its secret-present branch over the tree the
+  # queue entry is about to merge. Same coverage as the post-merge arm, one step earlier -- and here a
+  # finding can still stop the merge, which after the merge it never could.
   merge_group:
   pull_request:
-  # Post-merge re-scan (main only). A fork PR is scanned STRUCTURAL-ONLY by design -- the secret is
-  # unavailable to it -- so without this arm no fully-loaded scan ever sees fork-contributed content.
-  # Scoped to main so branch pushes do not double-run alongside their own PR.
-  push:
-    branches: [main]
   schedule:
     # Daily, so a CVE freshly disclosed against an UNCHANGED pinned dep (no push/PR to trigger a scan)
     # is caught within ~24h instead of up to 7 days — a weekly cadence can't meet a 72h-class remediation

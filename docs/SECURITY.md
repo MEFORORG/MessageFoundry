@@ -2146,9 +2146,10 @@ these limits hold, and a reader should assume there are others:
   commit **tree** taken from another ref and never pass through the index.
 - **Detection runs after the push.** `.github/workflows/branch-leak-scan.yml` scans every branch
   push. It exists because the `forbidden-content` job in `security.yml` triggers on pull requests,
-  pushes to `main`, and a daily cron, so a branch pushed with no pull request is scanned by none of
-  them. On a public repository the content is public the instant the push completes, so this layer
-  reports a leak and cannot prevent one.
+  on merge-queue entries and on a daily cron (read that workflow's `on:` block for the live set), so
+  a branch pushed with no pull request is scanned by none of them. On a public repository the
+  content is public the instant the push completes, so this layer reports a leak and cannot prevent
+  one.
 
 **What to do with this.** If you keep the private corpus beside this checkout, run
 `scripts/coord/install-git-hooks.ps1` in every clone and worktree, and never reach for `--no-verify`
