@@ -93,6 +93,22 @@ _RETIRED_CLAIMS = (
     # precisely what this scanner exists to catch.
     "installs no file handler",
     "installs **no file handler**",
+    # BACKLOG #1184 (ASVS 14.2.1): PHI.md described the search needle as riding the query string and
+    # its removal as future work. Both names are gone from every GET signature; see PHI.md §7 for
+    # what survives. Retiring the wording, not the residual.
+    "takes the needle as a QUERY PARAMETER",
+    "search needle out of the URL is tracked separately",
+    # BACKLOG #1184, second pass. §7 named the residual's sender as "an operator's stale bookmark",
+    # a population that cannot exist: the parameter was deleted before any first deployment, so no
+    # operator ever held a working `?content=` URL to bookmark (CLAUDE.md §0). A hand-crafted URL is
+    # the honest sender and is what the paragraph says now. The fragment carries the possessive
+    # deliberately -- §5 legitimately narrates bookmarks as the PRE-#1184 leak vector, and a bare
+    # "stale bookmark" would red that honest history.
+    "an operator's stale bookmark",
+    # And it then called the filter chain "the only control left over a shape the product no longer
+    # emits" — two sentences after measuring that the chain does NOT scrub that shape. A compensating
+    # control resting on a false premise (SDS-3.7); the paragraph now states there is no control.
+    "only control left over a shape",
 )
 
 
