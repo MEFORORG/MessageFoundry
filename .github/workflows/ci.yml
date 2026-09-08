@@ -945,8 +945,45 @@ jobs:
   # job-level `if:` would skip the job outright, and `ci-gate` reads `needs.*.result`, where a skipped
   # job reports `skipped` rather than `success`. Keeping the job running and no-oping its steps keeps
   # that roll-up honest on a docs-only PR.
+  #
+  # NO PUSH-TO-MAIN ARM, AND THAT DOES NOT CONTRADICT THE PARAGRAPH ABOVE. The docs-only axis gates
+  # STEPS because a docs-only PR still has to report a result. This axis is different: push-to-main has
+  # nothing left to evaluate. `push:` here is filtered to `branches: [main]`, so it fires AFTER a merge
+  # -- and the `merge_group` entry that produced that merge already ran this job against the same tree.
+  # That is the argument `changes` already writes down for serverdb/docker: "a merge touching those
+  # surfaces was already path-gated on its own PR minutes ago."
+  #
+  # WHAT IT BUYS. About 199 push runs a week at three legs each -- roughly 597 runner-slot acquisitions
+  # -- returned to a 20-slot account whose merge queue is currently evicting green PRs. The concurrency
+  # block at the top of this file independently counts 163 push-event runs in the week to 2026-09-07,
+  # so the rate is the right order. Queue entries and push runs draw on the SAME pool, so a slot this
+  # job stops taking is one an entry can have.
+  #
+  # SAFE ONLY BECAUSE THIS JOB IS NOT A REQUIRED CONTEXT. `ci-gate` is `if: always()` and fails on a
+  # need's `failure` or `cancelled` only; its passing step says "All gated CI legs succeeded or were
+  # skipped." `tooling` already rides that same behaviour, path-gated and skipped on most PRs. DO NOT
+  # copy this onto `test`, `ci-gate` or anything backing a required context -- a required context that
+  # stops reporting blocks every PR forever, which is what the job-level-`if:` allowlist in
+  # tests/test_security_posture.py exists to prevent.
+  #
+  # THE `github.event_name == 'push'` ARM IN THE FOUR GATED STEPS BELOW IS NOW DEAD, AND IS KEPT ON
+  # PURPOSE. Each reads `code == 'true' || push || workflow_dispatch`; the push arm can no longer be
+  # true here, but the other two still can, so no step is orphaned. Deleting the dead arm would mean
+  # removing this job-level `if:` no longer restores the old behaviour, with nothing to say so.
+  #
+  # MERGE-QUEUE COVERAGE NOW RESTS ON A FALL-THROUGH -- READ THIS BEFORE EDITING `changes`. These steps
+  # carry no `merge_group` arm of their own, unlike `test`'s, which spell one out. They run in the
+  # queue because `changes` has no merge_group arm either: the event falls through to the pull_request
+  # branch, `github.event.pull_request.base.sha` is empty, the diff comes back empty, and the
+  # `-z "$changed"` case sets `code=true`. Give `changes` a merge_group arm that sets `code=false` and
+  # this job stops running in the queue AS WELL as on push, leaving the PR as its only coverage. That
+  # was proposed once (PR 710, closed unmerged); if it returns, add the explicit merge_group arm to the
+  # four gated steps below in the same change.
   webconsole:
     name: web console tests (${{ matrix.os }}, py${{ matrix.python-version }})
+    # See "NO PUSH-TO-MAIN ARM" above. Deliberately NOT a `needs.changes.outputs.code` gate -- the
+    # docs-only axis stays per-step, for the reason recorded five paragraphs up.
+    if: github.event_name != 'push'
     needs: changes
     strategy:
       fail-fast: false
