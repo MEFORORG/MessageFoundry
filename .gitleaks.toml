@@ -87,6 +87,22 @@ regexes = [
   # tests/test_environments.py -- the needle proving a cast failure never echoes an env() value into
   # the startup error (#1183). Never a real credential; it is chosen to FAIL int() on purpose.
   '''pw-C4st_Val-66''',
+  # --- BACKLOG #1475 -- key-material fixtures for the same test file -----------------------------
+  # Three more SYNTHETIC needles, invented for the families covering `_KEY_MATERIAL`. Same
+  # construction and same reason as the #1183 block above: each is a value a redaction test asserts
+  # does NOT survive a log line, so each is published in test source by necessity, and each carries a
+  # hyphen and an underscore on purpose so the long-base64 sweep cannot cover its family by accident.
+  #
+  # ONLY THE THREE THAT ACTUALLY TRIP ARE LISTED, which is the practice the #1183 block already sets:
+  # #1475 added six needles and gitleaks flagged these three on entropy. Allowlisting the other three
+  # pre-emptively would widen the scanner's blind spot to buy nothing.
+  #
+  # Family "private_key_material" -- a `private_key=` signing-setup line.
+  '''pk-Priv_Key-33''',
+  # Family "prefixed_private_key_material" -- `smart_private_key=`, reached through `_LABEL_PREFIX`.
+  '''pk-Sm4rt_Key-11''',
+  # Family "intake_api_key_rotation_partner" -- `intake_api_key_next=`, the ADR 0154 rotation partner.
+  '''nk-N3xt_Key-22''',
 ]
 
 # BACKLOG #1091's `mefor-defaulted-credential` RULE LIVED HERE AND WAS DELIBERATELY REMOVED, not

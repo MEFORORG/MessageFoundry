@@ -9,6 +9,7 @@ import logging
 import logging.handlers
 import re
 import sys
+import threading
 import time
 from collections.abc import Iterator
 from types import SimpleNamespace
@@ -25,6 +26,9 @@ from messagefoundry.logging_setup import (
     JsonFormatter,
     RedactionFilter,
     SyslogForward,
+    _build_queued_forwarder,
+    _forward_targets,
+    _ForwardQueueHandler,
     _install_phi_filters,
     _make_formatter,
     configure_logging,
@@ -484,6 +488,18 @@ def _has(filters: list[logging.Filter], cls: type) -> bool:
     return any(isinstance(f, cls) for f in filters)
 
 
+def _forwarder(root: logging.Logger | None = None) -> _ForwardQueueHandler:
+    """The off-box forwarder's queue handler on ``root``, asserting there is exactly one.
+
+    BACKLOG #1199: the syslog handler is no longer a root handler — the root carries this queue
+    handler and the socket lives on the listener thread behind it — so a test that wants the
+    forwarder asks for it here rather than scanning ``root.handlers`` for a ``SysLogHandler``."""
+    handlers = (root or logging.getLogger()).handlers
+    queued = [h for h in handlers if isinstance(h, _ForwardQueueHandler)]
+    assert len(queued) == 1, f"expected exactly one queued forwarder, got {queued}"
+    return queued[0]
+
+
 def test_configure_logging_json_format_installs_json_formatter() -> None:
     installed = configure_logging("INFO", fmt="json")
     assert installed is False  # no forwarder configured
@@ -500,24 +516,30 @@ def test_configure_logging_adds_off_box_forwarder() -> None:
     )
     assert installed is True
     handlers = logging.getLogger().handlers
-    assert len(handlers) == 2  # stdout + forwarder
-    fwd = [h for h in handlers if isinstance(h, logging.handlers.SysLogHandler)]
-    assert len(fwd) == 1
-    # The forwarder carries the SAME two PHI filters as stdout (the hard rule: every sink, both filters).
-    assert _has(fwd[0].filters, RedactionFilter) and _has(fwd[0].filters, ControlCharScrubFilter)
-    assert isinstance(fwd[0].formatter, JsonFormatter)  # JSON is the off-box default
+    assert len(handlers) == 2  # stdout + the forwarder's queue handler
+    fwd = _forwarder()
+    # The socket handler sits BEHIND the queue, on the listener thread, and is reachable only there.
+    targets = _forward_targets(logging.getLogger())
+    assert len(targets) == 1 and isinstance(targets[0], logging.handlers.SysLogHandler)
+    # The forwarder carries the SAME two PHI filters as stdout (the hard rule: every sink, both
+    # filters) — and carries them on the NEAR side, so nothing unredacted is ever enqueued.
+    assert _has(fwd.filters, RedactionFilter) and _has(fwd.filters, ControlCharScrubFilter)
+    assert isinstance(fwd.formatter, JsonFormatter)  # JSON is the off-box default
 
 
 def test_configure_logging_forwarder_text_format_uses_plain_formatter() -> None:
     # forward_format="text" must select a plain text Formatter, NOT JsonFormatter (independent of stdout).
+    #
+    # Asserted on the QUEUE handler, which is where the rendering happens. Asserting it on the socket
+    # handler would now pass for BOTH formats — that handler carries the identity formatter either
+    # way — so the older spelling of this test would have kept passing while measuring nothing.
     installed = configure_logging(
         "INFO", forward=SyslogForward(host="127.0.0.1", port=5514, protocol="udp", fmt="text")
     )
     assert installed is True
-    fwd = [h for h in logging.getLogger().handlers if isinstance(h, logging.handlers.SysLogHandler)]
-    assert len(fwd) == 1
-    assert isinstance(fwd[0].formatter, logging.Formatter)
-    assert not isinstance(fwd[0].formatter, JsonFormatter)
+    fwd = _forwarder()
+    assert isinstance(fwd.formatter, logging.Formatter)
+    assert not isinstance(fwd.formatter, JsonFormatter)
 
 
 def test_configure_logging_tolerates_unreachable_tcp_collector(
@@ -573,9 +595,8 @@ def test_serve_wires_off_box_forwarder_and_logs_enabled(
         ["serve", "--config", str(tmp_path), "--db", str(tmp_path / "x.db"), "--env", "dev"]
     )
     assert rc == 0
-    fwd = [h for h in logging.getLogger().handlers if isinstance(h, logging.handlers.SysLogHandler)]
-    assert len(fwd) == 1
-    assert not isinstance(fwd[0].formatter, JsonFormatter)  # forward_format="text" honored
+    assert len(_forward_targets(logging.getLogger())) == 1
+    assert not isinstance(_forwarder().formatter, JsonFormatter)  # forward_format="text" honored
     assert "off-box log forwarding enabled" in capsys.readouterr().out
 
 
@@ -781,15 +802,473 @@ def test_configure_logging_tls_forwarder_roundtrip(tmp_path: Any) -> None:
             ),
         )
         assert installed is True  # CA-verified, hostname-checked handshake succeeded
-        fwd = [
-            h for h in logging.getLogger().handlers if isinstance(h, logging.handlers.SysLogHandler)
-        ]
-        assert len(fwd) == 1
+        assert len(_forward_targets(logging.getLogger())) == 1
         logging.getLogger("mefor.tls").warning("tls_marker_%s", "OB_ACME")
+        # The send is on the listener thread now, so the record arrives asynchronously — the wait
+        # below is what makes that a bounded assertion rather than a race.
         assert server.wait_for_data(timeout=10.0), "collector received no data"
         assert b"tls_marker_OB_ACME" in bytes(server.received)
     finally:
         server.close()
+
+
+# --- BACKLOG #1199: the durable off-box hand-off (queue handler + listener) ----
+# The defect these cover: attached directly to the root logger, the syslog handler's blocking send ran
+# on the thread that logged the record -- the asyncio event loop. On a first deployment a stalled-but-
+# connected collector would therefore cost the whole event loop up to _FORWARD_TCP_TIMEOUT per record
+# and then lose the record anyway. The forwarder now sits behind a bounded queue drained by its own
+# thread. What is NOT built here: the on-disk spool, and a backoff between reconnect attempts.
+
+
+class _CapturingHandler(logging.Handler):
+    """Stands in for the syslog socket handler on the far side of the queue.
+
+    Records what the listener thread hands it, optionally after waiting on a gate — which is how a
+    test holds the drain open to model a stalled-but-connected collector."""
+
+    def __init__(
+        self, gate: threading.Event | None = None, wait: float = 30.0, delay: float = 0.0
+    ) -> None:
+        super().__init__()
+        self.gate = gate
+        self.wait = wait
+        self.delay = delay  # a slow-but-working collector, for the drain-on-shutdown assertion
+        self.seen: list[logging.LogRecord] = []
+        self.closed = False
+
+    def emit(self, record: logging.LogRecord) -> None:
+        if self.gate is not None:
+            self.gate.wait(self.wait)
+        if self.delay:
+            time.sleep(self.delay)
+        self.seen.append(record)
+
+    def close(self) -> None:
+        self.closed = True
+        super().close()
+
+
+class _FakeSocket:
+    """Stands in for the forwarder's connected socket, so a mid-run send failure is deterministic
+    rather than dependent on a real collector going away at the right moment."""
+
+    def __init__(self) -> None:
+        self.fail: BaseException | None = None
+        self.sent: list[bytes] = []
+        self.closed = False
+
+    def settimeout(self, timeout: float | None) -> None:
+        pass
+
+    def sendall(self, data: bytes) -> None:
+        if self.fail is not None:
+            raise self.fail
+        self.sent.append(data)
+
+    def close(self) -> None:
+        self.closed = True
+
+
+@pytest.fixture
+def forward_logger() -> Iterator[logging.Logger]:
+    """A private, NON-propagating logger plus teardown that closes whatever the test attached.
+
+    Non-propagating so the test's own (PHI-bearing) records never reach pytest's root handlers, which
+    leaves ``caplog`` holding only the forwarder's own warnings — the thing these tests assert on."""
+    logger = logging.getLogger("mefor.test.forward")
+    logger.setLevel(logging.DEBUG)
+    logger.propagate = False
+    try:
+        yield logger
+    finally:
+        for handler in logger.handlers[:]:
+            logger.removeHandler(handler)
+            handler.close()  # stops the listener thread and closes the target
+
+
+def _drain_queue(handler: _ForwardQueueHandler) -> list[logging.LogRecord]:
+    """Everything sitting in the hand-off queue, taken off it. Only meaningful with the listener
+    already stopped, which is how the callers below make the assertion race-free."""
+    return [handler._records.get_nowait() for _ in range(handler._records.qsize())]
+
+
+def test_a_forwarded_record_is_redacted_before_it_enters_the_queue(
+    forward_logger: logging.Logger,
+) -> None:
+    """THE load-bearing property of the hand-off. The PHI chain runs on the NEAR side, inline on the
+    caller, so what the queue holds is already redacted. Filters on the far side would leave PHI
+    sitting in an in-memory queue — and in any later on-disk spool — which is the opposite of what
+    the chain exists for.
+
+    This reads the queue itself rather than the far side, because "what is IN the queue" is the claim.
+    """
+    target = _CapturingHandler()
+    fwd = _build_queued_forwarder(target, fmt="text")
+    forward_logger.addHandler(fwd)
+    # Stop the listener FIRST so nothing drains: what the caller enqueues stays put, and the
+    # assertion is about the queue's contents rather than a race with a background thread.
+    assert fwd._listener.stop_within(1.0)
+
+    forward_logger.warning("transform failed for %s", SYNTHETIC_PHI)
+
+    queued = _drain_queue(fwd)
+    assert len(queued) == 1
+    line = queued[0].getMessage()
+    assert "DOE" not in line and "JANE" not in line and "19800101" not in line
+    assert "[redacted]" in line
+    # The RENDERED line, not a lazy msg/args pair — the formatter is on this side too, so the object
+    # on the queue is the exact text that goes on the wire.
+    assert line.startswith(time.strftime("%Y-%m-%dT", time.gmtime(queued[0].created)))
+    # …and the far side carries no chain of its own. Moving the filters there reds the assertions
+    # above instead of quietly passing on a second, later redaction.
+    assert target.filters == []
+
+
+def test_a_forwarded_exception_traceback_is_redacted_before_it_enters_the_queue(
+    forward_logger: logging.Logger,
+) -> None:
+    """The realistic PHI vector, and the reason far-side filters could not work even if the queue's
+    contents did not matter: ``QueueHandler.prepare`` clears ``exc_info``/``exc_text`` after
+    formatting, so a ``RedactionFilter`` behind the queue would find no traceback left to redact and
+    its exception limb would be dead."""
+    target = _CapturingHandler()
+    fwd = _build_queued_forwarder(target, fmt="text")
+    forward_logger.addHandler(fwd)
+    assert fwd._listener.stop_within(1.0)
+
+    try:
+        raise ValueError(f"cannot transform {SYNTHETIC_PHI}")
+    except ValueError:
+        forward_logger.exception("handler failed")
+
+    queued = _drain_queue(fwd)
+    assert len(queued) == 1
+    line = queued[0].getMessage()
+    assert "ValueError" in line  # the traceback really did make it into the queued text…
+    assert "DOE" not in line and "19800101" not in line  # …and it is redacted there
+    # The structural half of the same point: nothing is left for a far-side filter to work on.
+    assert queued[0].exc_info is None and queued[0].exc_text is None
+
+
+def test_the_queued_forwarder_renders_exactly_what_the_direct_attachment_rendered(
+    forward_logger: logging.Logger,
+) -> None:
+    """The chain is IDENTICAL, not merely similar.
+
+    The control is the pre-#1199 arrangement built from the same two shared pieces
+    (``_install_phi_filters`` + ``_make_formatter``) that ``configure_logging`` used to put straight
+    on the socket handler. Its output is compared byte for byte with what now reaches the far side."""
+    target = _CapturingHandler()
+    fwd = _build_queued_forwarder(target, fmt="json")
+    forward_logger.addHandler(fwd)
+
+    control = logging.Handler()
+    control.setFormatter(_make_formatter("json"))
+    _install_phi_filters(control)
+
+    def _record() -> logging.LogRecord:
+        return logging.LogRecord(
+            "mefor.fwd", logging.WARNING, __file__, 1, "bad message: %s", (SYNTHETIC_PHI,), None
+        )
+
+    through_queue, direct = _record(), _record()
+    direct.created = through_queue.created  # the rendered timestamp is per-second; pin it
+
+    fwd.handle(through_queue)
+    # The sentinel goes on the TAIL of the queue, so stopping drains everything ahead of it first.
+    assert fwd._listener.stop_within(5.0)
+    assert len(target.seen) == 1
+    assert control.filter(direct)
+
+    try:
+        assert target.format(target.seen[0]) == control.format(direct)
+    finally:
+        control.close()
+
+
+def test_a_stalled_collector_does_not_block_the_caller(forward_logger: logging.Logger) -> None:
+    """The whole point of the hand-off, with the control that makes it mean something.
+
+    On a first deployment a wedged SIEM attached directly would hold the calling thread — the
+    event loop — for the socket timeout, per record. Behind the queue the caller pays a
+    ``put_nowait``. The control arm is the SAME blocking handler attached the old way, so a green
+    result cannot come from the stand-in simply failing to block."""
+    gate = threading.Event()
+    stalled = _CapturingHandler(gate=gate, wait=30.0)
+    fwd = _build_queued_forwarder(stalled, fmt="text")
+    forward_logger.addHandler(fwd)
+    try:
+        start = time.monotonic()
+        for i in range(5):
+            forward_logger.warning("record %d", i)
+        queued_elapsed = time.monotonic() - start
+    finally:
+        gate.set()  # release the listener thread so the fixture's close() can drain
+    assert queued_elapsed < 0.5, f"the caller waited {queued_elapsed:.2f}s on a stalled collector"
+
+    # CONTROL: the same blocking emit, attached the old way, DOES hold the caller.
+    control_logger = logging.getLogger("mefor.test.forward.control")
+    control_logger.setLevel(logging.DEBUG)
+    control_logger.propagate = False
+    blocking = _CapturingHandler(gate=threading.Event(), wait=0.5)  # never set — waits it out
+    control_logger.addHandler(blocking)
+    try:
+        start = time.monotonic()
+        control_logger.warning("record")
+        direct_elapsed = time.monotonic() - start
+    finally:
+        control_logger.removeHandler(blocking)
+        blocking.close()
+    assert direct_elapsed >= 0.4, "the control did not block, so the queued arm measures nothing"
+
+
+def test_the_hand_off_queue_is_bounded_and_reports_what_it_drops(
+    forward_logger: logging.Logger,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """An unbounded queue turns a long collector outage into unbounded memory growth. This one has a
+    depth, and what does not fit is dropped WITH A REPORT rather than silently — a silent drop is
+    what BACKLOG #1199 objects to.
+
+    The count-and-log invariant (CLAUDE.md §2) governs received MESSAGES, not log records, so
+    dropping a record here is a legitimate choice in a way that dropping a message never is."""
+    from messagefoundry import logging_setup
+
+    monkeypatch.setattr(logging_setup, "_FORWARD_QUEUE_MAXSIZE", 3)
+    target = _CapturingHandler()
+    fwd = _build_queued_forwarder(target, fmt="text")
+    forward_logger.addHandler(fwd)
+    assert fwd._listener.stop_within(1.0)  # nothing drains, so the arithmetic below is exact
+
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.logging_setup"):
+        for i in range(10):
+            forward_logger.warning("record %d", i)
+
+    assert fwd._records.qsize() == 3  # the bound held…
+    assert fwd.dropped == 7  # …and the rest were counted, not quietly lost
+    drops = [r for r in caplog.records if "hand-off queue is full" in r.getMessage()]
+    # ONE report for seven drops. The report is itself a log record, so one per drop would amplify
+    # the outage it reports on. The FIRST drop reports immediately (an operator should not wait a
+    # minute to hear that evidence is being lost), so its batch is 1 and the six behind it are held.
+    assert len(drops) == 1
+    assert "dropped 1 record(s)" in drops[0].getMessage()
+    assert "depth 3" in drops[0].getMessage()
+
+    # The held six are not forgotten — the NEXT report carries them. Collapsing the interval is what
+    # makes that assertable in a test; without it this arm would just be the same single report.
+    monkeypatch.setattr(logging_setup, "_FORWARD_DROP_REPORT_INTERVAL", 0.0)
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.logging_setup"):
+        forward_logger.warning("one more")
+    later = [r for r in caplog.records if "hand-off queue is full" in r.getMessage()]
+    assert len(later) == 2
+    assert "dropped 7 record(s)" in later[1].getMessage()
+    assert "8 dropped since this process started" in later[1].getMessage()
+
+
+def test_the_drop_report_does_not_recurse_on_the_root_logger(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``configure_logging`` attaches the forwarder to the ROOT logger, so the drop warning is itself
+    a record arriving at the very queue that produced it. Without the re-entrancy guard that is
+    unbounded recursion, on the outage path, in a process that is already degraded.
+
+    **The report interval is collapsed to zero on purpose.** At its shipped value the rate limiter
+    also stops the recursion, because it stamps the clock before it warns — so this test passed with
+    the guard removed and measured nothing. Zero takes the rate limiter out of the answer and leaves
+    the guard as the only thing standing between the drop path and a ``RecursionError``.
+
+    **The assertion counts REPORTS rather than watching for an exception**, for the same reason: a
+    ``RecursionError`` raised deep in the cascade is caught by ``QueueHandler.emit``'s own
+    ``except Exception`` and routed to ``handleError``, so nothing escapes to the caller and the
+    stack still blew. One report per originating drop is the observable difference."""
+    from messagefoundry import logging_setup
+
+    monkeypatch.setattr(logging_setup, "_FORWARD_QUEUE_MAXSIZE", 2)
+    monkeypatch.setattr(logging_setup, "_FORWARD_DROP_REPORT_INTERVAL", 0.0)
+    monkeypatch.setattr(logging, "raiseExceptions", False)  # keep a defeated run's output readable
+    installed = configure_logging(
+        "INFO", forward=SyslogForward(host="127.0.0.1", port=5514, protocol="udp")
+    )
+    assert installed is True
+    fwd = _forwarder()
+    assert fwd._listener.stop_within(1.0)
+
+    reports = _CapturingHandler()
+    logging.getLogger().addHandler(reports)
+    try:
+        for i in range(6):
+            logging.getLogger("mefor.recursion").warning("record %d", i)
+    finally:
+        logging.getLogger().removeHandler(reports)
+
+    assert fwd._records.qsize() == 2  # records 0 and 1 fit; 2 through 5 do not
+    assert fwd.dropped >= 4
+    # EXACTLY four: one report per dropped record, and each report's own drop reports nothing. Without
+    # the guard each report re-enters the drop path and the count runs to the recursion limit.
+    full = [r for r in reports.seen if "hand-off queue is full" in r.getMessage()]
+    assert len(full) == 4, f"expected one report per drop, got {len(full)}"
+
+
+def test_shutdown_drains_what_is_already_queued(forward_logger: logging.Logger) -> None:
+    """The listener must stop without throwing away records it could still deliver. ``close`` is the
+    hook the standard library's own ``logging.shutdown`` atexit handler calls, so this is the path
+    every entry point takes at process exit.
+
+    The collector is deliberately SLOW rather than instant. Against an instant one, a ``close`` that
+    drained nothing still passed, because the listener finished on its own between the last record
+    and the assertion — a race that read as a green result and measured nothing."""
+    target = _CapturingHandler(delay=0.05)  # five records take about 250ms to deliver
+    fwd = _build_queued_forwarder(target, fmt="text")
+    forward_logger.addHandler(fwd)
+    for i in range(5):
+        forward_logger.warning("record %d", i)
+
+    fwd.close()
+
+    assert fwd._listener._thread is None  # close() JOINED the listener, it did not leave it running
+    assert (
+        len(target.seen) == 5
+    )  # every queued record reached the collector before the thread ended
+    assert fwd._listener.undrained == 0
+    assert target.closed  # …and the socket handler behind the queue was closed too
+
+
+def test_shutdown_does_not_hang_on_a_wedged_collector(
+    forward_logger: logging.Logger,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Draining must be bounded. A collector that never answers would otherwise hold process exit
+    open one send at a time, and ``QueueListener.stop`` joins without a timeout."""
+    from messagefoundry import logging_setup
+
+    monkeypatch.setattr(logging_setup, "_FORWARD_DRAIN_TIMEOUT", 0.2)
+    monkeypatch.setattr(logging_setup, "_FORWARD_TCP_TIMEOUT", 0.2)
+    gate = threading.Event()
+    target = _CapturingHandler(gate=gate, wait=30.0)
+    fwd = _build_queued_forwarder(target, fmt="text")
+    forward_logger.addHandler(fwd)
+    try:
+        for i in range(5):
+            forward_logger.warning("record %d", i)
+        with caplog.at_level(logging.WARNING, logger="messagefoundry.logging_setup"):
+            start = time.monotonic()
+            fwd.close()
+            elapsed = time.monotonic() - start
+    finally:
+        gate.set()  # let the orphaned listener finish so it does not outlive the test
+
+    assert elapsed < 5.0, f"close() took {elapsed:.2f}s against a collector that never answers"
+    losses = [r for r in caplog.records if "undelivered" in r.getMessage()]
+    assert losses, "shutdown dropped records without saying so"
+    assert "at least 4 record(s)" in losses[0].getMessage()
+
+
+def test_a_full_queue_still_accepts_the_stop_sentinel(
+    forward_logger: logging.Logger,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The stdlib's ``enqueue_sentinel`` uses ``put_nowait``, which raises ``queue.Full`` — and a full
+    queue is exactly the state a collector outage produces. Unreplaced, that would raise out of
+    ``stop`` during shutdown and leave the listener thread running with its socket open.
+
+    The queue has to be full **while the listener is alive**, which is why the collector here is
+    gated rather than merely absent. An earlier spelling stopped the listener first and then filled
+    the queue; restarting it drained everything before ``close`` ran, so the sentinel always fit and
+    the test passed with the stdlib behaviour restored."""
+    from messagefoundry import logging_setup
+
+    monkeypatch.setattr(logging_setup, "_FORWARD_QUEUE_MAXSIZE", 2)
+    monkeypatch.setattr(logging_setup, "_FORWARD_DRAIN_TIMEOUT", 0.2)
+    monkeypatch.setattr(logging_setup, "_FORWARD_TCP_TIMEOUT", 0.2)
+    gate = threading.Event()
+    target = _CapturingHandler(gate=gate, wait=30.0)
+    fwd = _build_queued_forwarder(target, fmt="text")
+    forward_logger.addHandler(fwd)
+    try:
+        for i in range(8):
+            forward_logger.warning("record %d", i)
+        # The listener parks inside emit on the first record it takes; everything behind it stays on
+        # the queue. Wait for that steady state rather than assuming the thread has been scheduled.
+        deadline = time.monotonic() + 5.0
+        while fwd._records.qsize() < 2 and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert fwd._records.qsize() == 2, (
+            "the queue never filled, so the sentinel is not under test"
+        )
+
+        fwd.close()  # must not raise queue.Full
+    finally:
+        gate.set()
+    assert fwd._stopped
+
+
+def test_a_broken_stream_forwarder_reconnects_on_the_next_record(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``SysLogHandler.emit`` reconnects only under ``if not self.socket``, and never clears the
+    socket when a send fails — so on the shipped handler a stream forwarder that broke mid-run would
+    stay broken for the life of the process, silently (BACKLOG #1199). ``handleError`` now drops the
+    dead socket, which is the whole of what makes that branch reachable again."""
+    import socket as socket_mod
+
+    from messagefoundry.logging_setup import _TimeoutSysLogHandler
+
+    monkeypatch.setattr(
+        logging, "raiseExceptions", False
+    )  # handleError prints a traceback otherwise
+    made: list[_FakeSocket] = []
+
+    def _fake_create(self: Any) -> None:
+        # unixsocket is set by the REAL createSocket, and emit reads it before it sends. A fake that
+        # leaves it unset makes emit die on an AttributeError instead of the socket error under test,
+        # which reads as "the reconnect did not fire".
+        self.unixsocket = False
+        sock = _FakeSocket()
+        made.append(sock)
+        self.socket = sock
+
+    monkeypatch.setattr(_TimeoutSysLogHandler, "createSocket", _fake_create)
+    handler = _TimeoutSysLogHandler(
+        address=("127.0.0.1", 514), socktype=socket_mod.SOCK_STREAM, timeout=0.1
+    )
+    assert len(made) == 1  # the constructor connected
+
+    record = logging.LogRecord("t", logging.WARNING, __file__, 1, "first", (), None)
+    made[0].fail = ConnectionResetError("collector went away")
+    handler.emit(record)
+    assert handler.socket is None and made[0].closed  # the dead socket was dropped
+
+    handler.emit(record)
+    assert len(made) == 2, "the next record did not reconnect"
+    assert made[1].sent, "the reconnected socket carried the record"
+
+    # CONTROL: a non-network error must NOT drop the socket. Reconnecting on a formatting bug would
+    # buy nothing and would hide the bug.
+    class _BadFormatter(logging.Formatter):
+        def format(self, record: logging.LogRecord) -> str:
+            raise ValueError("formatter is broken")
+
+    handler.setFormatter(_BadFormatter())
+    handler.emit(record)
+    assert handler.socket is made[1] and len(made) == 2
+    handler.close()
+
+
+def test_reconfiguring_closes_the_previous_forwarder_rather_than_leaking_it() -> None:
+    """``configure_logging`` is documented as idempotent. The forwarder now owns a thread and a
+    socket, so removing its handler is no longer enough to keep that true."""
+    configure_logging("INFO", forward=SyslogForward(host="127.0.0.1", port=5514, protocol="udp"))
+    first = _forwarder()
+    first_target = first.targets[0]
+
+    configure_logging("INFO", forward=SyslogForward(host="127.0.0.1", port=5514, protocol="udp"))
+    second = _forwarder()
+
+    assert second is not first
+    assert first._listener._thread is None  # the old listener was joined, not orphaned
+    assert getattr(first_target, "socket", "unset") is None  # …and its socket closed
 
 
 # --- configure_stderr_logging (BACKLOG #1054) ---------------------------------
