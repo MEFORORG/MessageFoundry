@@ -53,6 +53,22 @@
             "statusMessage": "Asking this seat to declare its goal"
           }
         ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "pwsh",
+            "args": [
+              "-NoProfile",
+              "-NonInteractive",
+              "-File",
+              "${CLAUDE_PROJECT_DIR}/scripts/hooks/role-card-inject.ps1"
+            ],
+            "timeout": 20,
+            "statusMessage": "Injecting this worktree's role card"
+          }
+        ]
       }
     ],
     "PreToolUse": [
