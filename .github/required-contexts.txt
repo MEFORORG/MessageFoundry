@@ -200,6 +200,13 @@ a PR that implements BACKLOG #N must update BACKLOG.md
 #                                 that day. This entry is the reason that reading is the settled one,
 #                                 so do not transcribe a future sighting over it -- reinstating them
 #                                 is an owner decision that has to retract the fork-PR cost first.
+#                                 COUPLING, added 2026-09-07: codeql.yml's `analyze` job is guarded
+#                                 with `github.event_name != 'merge_group'`, so it does NOT run in
+#                                 the queue (it is analysed on the PR and on the push instead, and
+#                                 the queue pass was discarded). Promoting either CodeQL context to
+#                                 required therefore requires REMOVING that guard in the SAME change
+#                                 -- otherwise the context never reports in the queue and NOTHING
+#                                 MERGES, which is the required-but-absent trap docs/CI.md names.
 #                                 scorecard.yml additionally has no `pull_request` trigger at all
 #                                 (`push`, `schedule`, `branch_protection_rule`, `workflow_dispatch`),
 #                                 so it can never report on one -- the required-but-absent trap, on

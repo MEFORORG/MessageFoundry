@@ -239,7 +239,7 @@ def _frac_of(ts: str) -> str | None:
 # meant for stamping an output, not for a routing decision.
 
 
-def hl7_now(*, precision: str = "second", tz: str | None = None) -> str:
+def hl7_now(*, precision: str = "second", tz: str | None = None, with_offset: bool = False) -> str:
     """Render the current instant as an HL7 v2 timestamp at ``precision``.
 
     Args:
@@ -251,6 +251,12 @@ def hl7_now(*, precision: str = "second", tz: str | None = None) -> str:
             suffix (a bare local stamp). An offset is only appended when ``tz`` is given **and**
             ``precision`` includes a time field (``hour``/``minute``/``second``) — HL7 attaches an
             offset to a date-only value nonsensically.
+        with_offset: stamp the **host's** own DST-correct numeric offset when no ``tz`` is named, so
+            the value pins an instant rather than a bare wall-clock reading. Use it for a timestamp a
+            receiver will correlate against its own clock (an MLLP acknowledgement's MSH-7): a bare
+            local stamp is ambiguous across a daylight-saving fall-back, where the same wall-clock
+            hour occurs twice. Ignored when ``tz`` is given (that path already appends an offset) and
+            when ``precision`` carries no time field, for the same reason as ``tz``.
 
     This is the **one** clock-reading helper; keep it out of routing/transform decisions (it would
     break re-run purity) — use it to stamp a freshly built outbound message.
@@ -265,6 +271,10 @@ def hl7_now(*, precision: str = "second", tz: str | None = None) -> str:
     if tz is not None and has_time:
         # _render appends the zone's DST-correct numeric offset; only meaningful with a time field.
         return _render(datetime.now(ZoneInfo(tz)), precision, None)
+    if with_offset and has_time:
+        # astimezone() on a naive local reading attaches the host's offset for *this* instant, so the
+        # rendered value stays correct either side of a DST transition.
+        return _render(datetime.now().astimezone(), precision, None)
     now = datetime.now(ZoneInfo(tz)) if tz is not None else datetime.now()
     return _stem(now, precision)
 

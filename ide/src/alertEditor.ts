@@ -11,7 +11,7 @@
 // at startup, so it takes effect on the next engine restart (not via Promote/reload) — the UI says so.
 import * as vscode from "vscode";
 import { runJson, serviceConfig, workspaceDir } from "./cli";
-import { nonce } from "./cspNonce";
+import { WEBVIEW_GUARD_NOTE, guardScript, openChannel, postToWebview } from "./webviewMessaging";
 
 const EVENT_TYPES = [
   "any",
@@ -92,9 +92,9 @@ async function refresh(current: vscode.WebviewPanel): Promise<void> {
   }
   try {
     const rules = await runJson<Rule[]>(["alert", "list", "--service-config", serviceConfig()], ws);
-    current.webview.postMessage({ command: "rules", rules });
+    postToWebview(current.webview, { command: "rules", rules });
   } catch (e) {
-    current.webview.postMessage({ command: "error", message: String(e) });
+    postToWebview(current.webview, { command: "error", message: String(e) });
   }
 }
 
@@ -110,7 +110,7 @@ async function add(rule: NewRule, current: vscode.WebviewPanel): Promise<void> {
     );
   } catch (e) {
     // Surface the validation error inline so the user can fix the form (file was not changed).
-    current.webview.postMessage({ command: "error", message: String(e) });
+    postToWebview(current.webview, { command: "error", message: String(e) });
     return;
   }
   await refresh(current);
@@ -138,7 +138,7 @@ async function remove(index: number, current: vscode.WebviewPanel): Promise<void
       ws,
     );
   } catch (e) {
-    current.webview.postMessage({ command: "error", message: String(e) });
+    postToWebview(current.webview, { command: "error", message: String(e) });
     return;
   }
   await refresh(current);
@@ -149,7 +149,7 @@ function embed(value: unknown): string {
 }
 
 function formHtml(webview: vscode.Webview): string {
-  const n = nonce();
+  const { nonce: n, token } = openChannel(webview);
   return `<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -230,7 +230,7 @@ function formHtml(webview: vscode.Webview): string {
   </div>
 
   <script nonce="${n}">
-    const vscode = acquireVsCodeApi();
+    const vscode = acquireVsCodeApi();${guardScript(token)}
     const EVENT_TYPES = ${embed(EVENT_TYPES)};
     const SEVERITIES = ${embed(SEVERITIES)};
     const $ = (id) => document.getElementById(id);
@@ -312,9 +312,10 @@ function formHtml(webview: vscode.Webview): string {
     });
     $('close').addEventListener('click', () => vscode.postMessage({ command: 'cancel' }));
 
-    // Origin is NOT checked here — see webviewMessaging.ts.
+    ${WEBVIEW_GUARD_NOTE}
     window.addEventListener('message', (e) => {
-      const d = e.data || {};
+      const d = mfTrusted(e);
+      if (!d) { return; }
       if (d.command === 'rules') { renderRules(d.rules || []); errorEl.style.display = 'none'; }
       else if (d.command === 'error') { show(d.message); }
     });

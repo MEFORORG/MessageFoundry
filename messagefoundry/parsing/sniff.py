@@ -5,7 +5,7 @@
 Cheap, side-effect-free magic-byte checks shared by the file transports (``transports/file.py``,
 ``transports/remotefile.py``), the offline uploaded-logs store (``uploads.py`` — a leaf that must not
 import a transport), and the attachment detach/download paths (``pipeline/wiring_runner.py`` /
-``api/app.py``). Two families live here:
+``api/app.py``). Three families live here:
 
 * **Ingress content-vs-declared-type sniff** (:func:`_content_matches_declared`) — do a body's leading
   bytes structurally match the inbound connection's declared ``content_type``? Rejects a binary/non-HL7
@@ -17,6 +17,10 @@ import a transport), and the attachment detach/download paths (``pipeline/wiring
   document's leading bytes agree with the sender-declared OBX-5.2 MIME? A contradiction (an ``image/png``
   label on non-PNG bytes) is stored/served as ``application/octet-stream`` so a mislabelled
   active-content payload can never render as its claimed inert type (narrows the 1.3.4 residual).
+* **Archive-member admission** (:func:`archive_member_name_reason` / :func:`archive_member_content_reason`)
+  — is a ZIP member's name a safe relative path, and do its bytes correspond to the type its own
+  extension names? Called by :func:`~messagefoundry.parsing.compression.zip_decompress`, which is the
+  Handler-facing archive reader, so members reach Handler code already checked (BACKLOG #1128).
 
 Kept in ``parsing/`` (not ``transports/``) so a leaf like ``uploads.py`` can reuse them without importing
 a transport. The one config dependency is :class:`~messagefoundry.config.models.ContentType`; these stay
@@ -28,6 +32,7 @@ import base64
 import binascii
 
 from messagefoundry.config.models import ContentType
+from messagefoundry.controlchars import has_control_char
 
 # Segment ids a valid HL7 v2 payload (single message or batch file) may start with.
 _HL7_LEADING_SEGMENTS = (b"MSH", b"FHS", b"BHS")
@@ -230,3 +235,111 @@ def b64_head(b64: str, max_bytes: int = 32) -> bytes:
         return base64.b64decode(chunk)
     except (binascii.Error, ValueError):
         return b""
+
+
+# --- archive-member admission (ASVS 5.2.2 "within an archive", 5.3.2) --------------------------------
+# ASVS 5.2.2 asks that an accepted file, "either on its own or within an archive such as a zip file",
+# have its extension checked against an expected extension and its contents validated as corresponding
+# to the type that extension represents. The ingress sniff above answers a DIFFERENT question — it keys
+# on the inbound connection's DECLARED content_type — and a ZIP member has no connection declaring
+# anything. What a member does carry is its own name, and therefore its own extension, so the verb is
+# directly expressible here with no policy input: the archive names the type, and the bytes either
+# correspond or they do not. That is why this arm needs no ceiling parameter and no operator setting.
+#
+# Every discriminator below is the SAME one the declared-type arm uses (via _content_matches_declared or
+# _MAGIC_PREFIXES), so extension-keyed and declaration-keyed checks cannot drift apart.
+
+#: Extensions whose expected content is a structured format the engine already discriminates. Mapped to
+#: the ContentType so the check is literally :func:`_content_matches_declared` — one definition.
+_EXTENSION_CONTENT_TYPE: dict[str, ContentType] = {
+    ".hl7": ContentType.HL7V2,
+    ".json": ContentType.JSON,
+    ".fhir": ContentType.FHIR,
+    ".xml": ContentType.XML,
+    ".dcm": ContentType.DICOM,
+    ".edi": ContentType.X12,
+    ".x12": ContentType.X12,
+}
+
+#: Extensions whose expected content is an opaque container with a leading magic signature. Aliased onto
+#: the attachment table above rather than retyped, for the same single-definition reason. ``.gz`` is the
+#: one entry with no MIME twin there (RFC 1952 header magic).
+_EXTENSION_MAGIC: dict[str, tuple[bytes, ...]] = {
+    ".pdf": _MAGIC_PREFIXES["application/pdf"],
+    ".png": _MAGIC_PREFIXES["image/png"],
+    ".jpg": _MAGIC_PREFIXES["image/jpeg"],
+    ".jpeg": _MAGIC_PREFIXES["image/jpeg"],
+    ".gif": _MAGIC_PREFIXES["image/gif"],
+    ".tif": _MAGIC_PREFIXES["image/tiff"],
+    ".tiff": _MAGIC_PREFIXES["image/tiff"],
+    ".zip": _MAGIC_PREFIXES["application/zip"],
+    ".gz": (b"\x1f\x8b",),
+}
+
+
+def _member_extension(name: str) -> str:
+    """Lower-cased extension of an archive member's own leaf name, or ``""`` when it has none. A dot that
+    starts the leaf (``.gitignore``) is not an extension."""
+    leaf = name.rsplit("/", 1)[-1]
+    dot = leaf.rfind(".")
+    return leaf[dot:].lower() if dot > 0 else ""
+
+
+def archive_member_name_reason(name: object) -> str | None:
+    """Return a human reason when an archive member's name is not a safe RELATIVE path, else ``None``
+    (ASVS 5.3.2). The name is chosen by whoever built the archive — for an inbound feed, a remote party —
+    so it is untrusted data that a Handler will join onto a directory.
+
+    **Reject, never rewrite**, for the reason measured on the remote file source
+    (:func:`messagefoundry.transports.remotefile._is_contained_name`): stripping the traversal off
+    ``../../adt.hl7`` yields ``adt.hl7``, which aliases onto a REAL file in the caller's own directory, so
+    mutation converts a refusal into a wrong-file read. Refusing one archive is strictly better.
+
+    Nested directories are ADMITTED (``sub/b.hl7``), because a legitimate archive carries them and this
+    check bounds where the path can land rather than how deep it goes. What is refused is anything that
+    could leave the extraction root, plus the shapes a naive join cannot see: an absolute path, an empty
+    or ``.``/``..`` component, a backslash (ZIP APPNOTE mandates ``/`` as the separator, so a backslash is
+    a Windows separator smuggled through a slash-only check), a drive-relative prefix (``C:x.hl7`` carries
+    no separator at all), and any control character.
+
+    Two of those arms are unreachable through CPython's own reader, which is a fact about the library and
+    not a reason to drop them. ``zipfile._sanitize_filename`` runs inside ``ZipInfo.__init__`` on the read
+    path as well as the write path: it truncates a member name at the first NUL everywhere, and replaces
+    ``os.sep`` with ``/`` — so the backslash arm is live wherever ``os.sep`` is not a backslash and dead on
+    Windows. Measured on CPython 3.14. A caller reading the archive by some other route still gets both."""
+    if not isinstance(name, str) or not name:
+        return "member name is empty"
+    if has_control_char(name):
+        return "member name contains a control character"
+    if "\\" in name:
+        return "member name contains a backslash, which a slash-only containment check cannot see"
+    if len(name) >= 2 and name[0].isascii() and name[0].isalpha() and name[1] == ":":
+        return "member name is drive-relative"
+    if name.startswith("/"):
+        return "member name is an absolute path"
+    for part in name.split("/"):
+        if part in ("", ".", ".."):
+            return "member name has an empty or relative path component"
+    return None
+
+
+def archive_member_content_reason(name: str, data: bytes) -> str | None:
+    """Return a human reason when an archive member's CONTENT contradicts the type its own extension
+    names, else ``None`` (ASVS 5.2.2). Call it after :func:`archive_member_name_reason`.
+
+    An extension this table does not name has no expected signature, so the member is accepted unchecked
+    and the caller stays the real validator. That keeps the gate superset-permissive — it can only refuse
+    a member that positively contradicts itself, never one whose type is merely unmodelled — which is why
+    it does not have to be switched on or configured. It is also why it does NOT close the verb's L2 "all
+    files being accepted" clause on its own: at least ``.txt``, ``.csv`` and ``.dat`` carry no signature to
+    check, and asserting otherwise would be a control resting on a false premise."""
+    ext = _member_extension(name)
+    declared = _EXTENSION_CONTENT_TYPE.get(ext)
+    prefixes = _EXTENSION_MAGIC.get(ext)
+    if declared is not None:
+        matches = _content_matches_declared(declared, data)
+    elif prefixes is not None:
+        matches = data.startswith(prefixes)
+    else:
+        return None  # no expected signature for this extension — accepted unchecked
+    return None if matches else f"member content does not match the {ext} extension it carries"

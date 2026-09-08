@@ -180,7 +180,7 @@ The one row that *does* vary:
 | `tls_client_cert_files` | list[str] | `[]` | **(ASVS 6.4.5):** PEM paths of **inbound service callers'** client certs you hold a copy of. Folded into the [`[cert_monitor]`](#cert_monitor) scan, so a caller's cert expiry is caught **even while that caller has stopped connecting** — the handshake-time check can only see a cert still being presented. These are certs the engine *verifies*, not ones it *presents*, so the served-cert scan cannot see them. Public certificates only (never a key); empty = off. |
 | `trusted_proxies` | list[str] | `[]` | **`[BUILT]` (WP-15):** reverse-proxy IP(s) whose `X-Forwarded-For`/`-Proto` are trusted (uvicorn `forwarded_allow_ips`), so the audit/rate-limit source IP is the **real client**, not the proxy. **Empty = trust nothing** (the direct TCP peer is used). Set ONLY to the proxy's address(es), or XFF spoofing returns — every host inside an entry may declare its own source address, so a broad range (e.g. `10.0.0.0/8` on a LAN numbered out of 10/8) makes every workstation a trusted spoofer. `"*"` and unparseable entries are **refused at load** (uvicorn would silently treat the latter as a never-matching literal, collapsing every client to the proxy). |
 | `tls_terminated_upstream` | bool | `false` | **`[BUILT]` (WP-15):** declare that a reverse proxy / load balancer terminates TLS in front of the engine. Lets a non-loopback bind satisfy the TLS gate **without** in-process TLS — but only when `trusted_proxies` is set (else refused at load). |
-| `proxy_intra_service_auth` | enum | `none` | **Posture-B operator attestation (#200, ADR 0002)** — *how* the proxy→engine hop is authenticated, so a rogue peer on the internal segment cannot impersonate the proxy. `none` (the default) is **undeclared**; declare `mtls` (the proxy presents a client cert), `network` (an isolated proxy↔engine segment / host firewall allow-list) or `shared_secret` (a pre-shared header the proxy injects). **Attestation only — the engine enforces nothing at run time**; it is the record that the hop was considered. Left undeclared under `tls_terminated_upstream` on a PHI instance, `serve` **refuses** when `[security].enforcement = enforce` **and** the bind is non-loopback, and **warns** otherwise (including the recommended loopback-behind-proxy topology). |
+| `proxy_intra_service_auth` | enum | `none` | **Posture-B operator attestation (#200, ADR 0002)** — *how* the proxy→engine hop is authenticated, so a rogue peer on the internal segment cannot impersonate the proxy. `none` (the default) is **undeclared**; declare `mtls` (the proxy presents a client cert), `network` (an isolated proxy↔engine segment / host firewall allow-list) or `shared_secret` (a pre-shared header the proxy injects). **Attestation only — the engine enforces nothing at run time**; it is the record that the hop was considered. Left undeclared under `tls_terminated_upstream` on a PHI instance, `serve` **refuses** when `[security].enforcement = enforce` **and** the bind is non-loopback, and **warns** otherwise (including the recommended loopback-behind-proxy topology). **One coherence check (BACKLOG #1181, ASVS 12.3.5):** declaring `mtls` on a PHI instance while `[api].tls_client_ca_file` is unset **warns**. The engine is the far end of that hop and verifies a client certificate only with a client CA configured, so with none its own configuration contradicts the declaration. It stays a warning because a sidecar in front of the engine can legitimately terminate the proxy's mTLS, and it changes nothing on the wire — the setting is still an attestation. To have the engine itself require and verify the proxy's certificate, set `tls_cert_file` **and** `tls_client_ca_file`; both are valid alongside `tls_terminated_upstream`, because an operator-supplied certificate wins ahead of the no-mint branch. |
 | `proxy_tls_min_version` | str | _unset_ | the operator-**declared** TLS version floor the reverse proxy negotiates with browsers: `1.2` or `1.3` (NIST SP 800-52r2) — any other value is refused at load. The engine terminates no browser TLS in Posture-B, so it cannot inspect the proxy's negotiated version (ASVS 11.6.2); this is the attested floor, validated only for coherence. Unset = undeclared, gated exactly like `proxy_intra_service_auth` above. |
 | `proxy_tls_ciphers` | str | _unset_ | an **optional** declared OpenSSL cipher list for that proxy floor. When set it must resolve to suites that are forward-secret (ASVS 11.6.2), that encrypt, and that authenticate the peer — so a declared floor can't itself name a non-forward-secret key exchange, a NULL cipher, or an anonymous one. It uses the same validator as `tls_ciphers` but **deliberately without the approved-suite allow-list** ([BACKLOG #1317](BACKLOG.md)): this field *declares* what a proxy the engine does not operate already speaks, and refusing an unlisted-but-sound suite would not harden anything — it would stop an operator describing their proxy accurately. Unset = no cipher declaration; it is **not** required to satisfy the Posture-B gate (only `proxy_intra_service_auth` + `proxy_tls_min_version` are). |
 | `serve_ui` | | | **→ moved to `[security].serve_web_console`** (ADR 0118) — set it there; no longer accepted in `[api]`. |
@@ -1175,7 +1175,11 @@ A provider is consulted **only** for a credential whose per-credential `*_secret
 store password is seam-only (managed identity is preferred there). A reference is `"<kv-path>"` or
 `"<kv-path>#<field>"` for `vault` (field defaults to `value`; KV mount from `MEFOR_SECRETS_VAULT_KV_MOUNT`,
 default `secret`); Vault address/token come from `MEFOR_SECRETS_VAULT_ADDR` / `MEFOR_SECRETS_VAULT_TOKEN`
-(falling back to hvac's `VAULT_ADDR` / `VAULT_TOKEN`). **Fail-closed:** a reference with `provider = none`,
+(falling back to hvac's `VAULT_ADDR` / `VAULT_TOKEN`). Point `MEFOR_SECRETS_VAULT_CA_FILE` at the PEM of
+the CA that issued your Vault server's certificate to verify that hop against your own PKI instead of the
+public bundle `requests` ships with (BACKLOG #1180; the store KeyProvider's twin is
+`MEFOR_STORE_VAULT_CA_FILE`) — a path, not a secret, and unset leaves the hop exactly as it was.
+**Fail-closed:** a reference with `provider = none`,
 an unknown provider, a missing `[vault]` extra, or an unresolvable/empty secret raises at load/connect —
 never a blank credential; the value is never logged.
 
@@ -1189,10 +1193,17 @@ age** and raises the rotation-due alert (an [`[alerts]`](#alerts) event) when it
 `warn_days` of due. **Route it as `event_type = "secret_rotation"`** — that is the wire name the rule
 validator accepts; the longer `secret_rotation_due` is the internal `AlertSink` method name and is
 **rejected at config load** if you write it in a rule. It reads only the rotation
-**dates** you configure here — **never any secret value** (PHI-free). This is a *reminder*, not
-enforcement: it never rotates a key or blocks startup (run `rotate-key` to rotate the store DEK). Under
-`[security].enforcement = enforce`, a store DEK past `store_key_max_age_days + enforce_grace_days`
-escalates its alert at restart (`enforced = true`) — still an alert, never a refusal.
+**dates** you configure here — **never any secret value** (PHI-free). It never *rotates* a key (run
+`rotate-key` for that), and for every secret class except the store DEK it is a reminder only.
+
+**The store DEK's calendar expiry is ENFORCED** (ASVS 13.3.4, BACKLOG #1004). Under
+`[security].enforcement = enforce` with a keyed store, a DEK past `store_key_max_age_days +
+enforce_grace_days` escalates its alert at restart (`enforced = true`) **and refuses to start the
+engine**. A DEK whose age cannot be determined — the rotation-meta reconcile failed and no
+`store_key_last_rotated` is set — refuses on the same rule: an undetermined age is not a young one. This
+matches the same key's **usage** ceiling, which has always refused unconditionally at 2^32 encrypts. Set
+`enforce_store_key_expiry = false` to keep the alert and drop the refusal; that is a **security
+loosening** and it is named on every boot and in `GET /security/posture`.
 
 The store DEK is tracked **live-by-default** (ASVS 13.3.4): at first keyed start the engine records a
 non-secret tracked-since stamp (the DEK key-id + first-seen date) in store meta and watches the DEK off
@@ -1208,7 +1219,8 @@ tracked; set `warn_days = 0` to disable the reminder.
 | `store_key_last_rotated` | str | — | ISO `YYYY-MM-DD` the store DEK was last rotated; **unset ⇒ the DEK is still tracked live-by-default** off a persisted first-seen stamp (this date is an override) |
 | `store_key_max_age_days` | int | 365 | rotate the store DEK within this many days of its effective last-rotated (the operator date if set, else the persisted stamp) |
 | `secret_max_age_days` | int | 365 | max age for the **non-DEK** tracked secret classes (connector/AD/SMTP/Vault/OIDC), alerted this many days after their last observed fingerprint change |
-| `enforce_grace_days` | int | 30 | under `[security].enforcement=enforce`, a DEK older than `store_key_max_age_days + this` escalates its rotation alert at restart (still an alert, never a refusal) |
+| `enforce_grace_days` | int | 30 | under `[security].enforcement=enforce`, a DEK older than `store_key_max_age_days + this` escalates its rotation alert **and refuses to start** (see `enforce_store_key_expiry`) |
+| `enforce_store_key_expiry` | bool | `true` | under `[security].enforcement=enforce`, a store DEK past `store_key_max_age_days + enforce_grace_days` — or one whose age cannot be determined — **aborts engine start**. `false` keeps the alert, drops the refusal, and is reported as a **security loosening** |
 
 ```toml
 [secret_rotation]

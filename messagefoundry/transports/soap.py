@@ -42,10 +42,8 @@ from __future__ import annotations
 
 import asyncio
 import base64
-import hashlib
 import io
 import logging
-import os
 import re
 import ssl
 import time
@@ -65,7 +63,13 @@ from xml.sax.saxutils import escape as _xml_escape  # nosec B406 — pure string
 from xml.sax.xmlreader import InputSource  # nosec B406 — fed only the hardened, no-DTD parser
 
 from messagefoundry.config.models import ConnectorType, Destination
-from messagefoundry.config.tls_policy import harden_cipher_suites, relax_verify_expiry
+from messagefoundry.config.tls_policy import (
+    SYSTEM_TRUST_ANCHOR,
+    TrustAnchor,
+    build_verifying_client_context,
+    harden_cipher_suites,
+    relax_verify_expiry,
+)
 from messagefoundry.transports.base import (
     DeliveryError,
     DeliveryResponse,
@@ -73,6 +77,11 @@ from messagefoundry.transports.base import (
     NegativeAckError,
     encode_wire_body,
     register_destination,
+)
+from messagefoundry.transports.bounded_read import (
+    ResponseTooLargeError,
+    read_bounded,
+    read_bounded_text,
 )
 
 # Reuse REST's hardened HTTP plumbing — same transports/ package, same no-redirect + TLS posture.
@@ -90,6 +99,7 @@ from messagefoundry.transports.rest import (
     enforce_outbound_length_limits,
     enforce_send_time_length_limits,
     enforce_signature_header_limits,
+    http_family_trust_anchor,
     normalize_header_allowlist,
     refuse_cleartext_credential_hop,
     refuse_cleartext_credentials,
@@ -130,13 +140,6 @@ _NS_WSU = "http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-ut
 _PW_TEXT = (
     "http://docs.oasis-open.org/wss/2004/01/"
     "oasis-200401-wss-username-token-profile-1.0#PasswordText"
-)
-_PW_DIGEST = (
-    "http://docs.oasis-open.org/wss/2004/01/"
-    "oasis-200401-wss-username-token-profile-1.0#PasswordDigest"
-)
-_NONCE_ENC = (
-    "http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-soap-message-security-1.0#Base64Binary"
 )
 
 # The envelope skeleton (SOAP 1.2 only; WS-* requires 1.2). Built by string concatenation, NOT
@@ -188,6 +191,7 @@ def _client_cert_opener(
     *extra_handlers: urllib.request.BaseHandler,
     allow_expired: bool = False,
     host: str = "",
+    trust_anchor: TrustAnchor = SYSTEM_TRUST_ANCHOR,
 ) -> urllib.request.OpenerDirector:
     """A no-redirect opener that presents a **client certificate** for mutual TLS (ADR 0015 §3).
 
@@ -198,8 +202,14 @@ def _client_cert_opener(
 
     ``allow_expired`` (#129, ADR 0094) relaxes ONLY the peer cert's validity-period check (chain +
     hostname stay enforced) — the granular expiry tolerance, composable with mTLS. Default off =
-    byte-identical."""
-    ctx = ssl.create_default_context()
+    byte-identical.
+
+    ``trust_anchor`` (#1180, ADR 0093) selects the roots that verify the SERVER; the client identity
+    loaded below is a separate direction and is untouched by it. The default resolves to the OS trust
+    store, which is the ``ssl.create_default_context()`` this line used to be. mTLS is exactly the
+    deployment where an internal CA is likeliest, so leaving this hop unable to name one was the
+    sharpest edge of the inexpressible slice."""
+    ctx = build_verifying_client_context(trust_anchor)
     ctx.minimum_version = ssl.TLSVersion.TLSv1_2
     ctx.load_cert_chain(certfile, keyfile, password)
     if allow_expired:
@@ -283,11 +293,6 @@ def _default_message_id() -> str:
     return f"urn:uuid:{uuid.uuid4()}"
 
 
-def _default_nonce() -> bytes:
-    """A fresh WS-Security nonce; overridable for deterministic tests."""
-    return os.urandom(16)
-
-
 class SoapDestination(DestinationConnector):
     """POST each SOAP envelope to a web-service endpoint (plain or WS-* mode; ADR 0003 + 0015)."""
 
@@ -333,7 +338,6 @@ class SoapDestination(DestinationConnector):
         # nonce and assert the values are minted in send() (ADR 0015 testing strategy).
         self._now_fn: Callable[[], float] = time.time
         self._uuid_fn: Callable[[], str] = _default_message_id
-        self._nonce_fn: Callable[[], bytes] = _default_nonce
 
         # #200 (ADR 0092): the per-connection insecure-hop attestation, keying the posture-keyed refusal.
         attested = config.tls_hop_attested
@@ -407,6 +411,11 @@ class SoapDestination(DestinationConnector):
                 revocation_attested=config.tls_revocation_attested,
             )
 
+        # #1180 (ADR 0093): the client trust anchor, shared by every VERIFYING branch below. Not
+        # resolved on the verify_tls=false branch, which is CERT_NONE and has no roots to choose.
+        anchor = http_family_trust_anchor(
+            s, url=self.url, trust_anchor_policy=config.trust_anchor_policy
+        )
         if self.client_cert_file and self.client_key_file:  # NEW — mutual TLS, takes precedence
             self._opener: urllib.request.OpenerDirector = _client_cert_opener(
                 self.client_cert_file,
@@ -415,17 +424,21 @@ class SoapDestination(DestinationConnector):
                 *proxy_handlers,  # ADR 0126: forward proxy threaded through the mTLS opener too
                 allow_expired=bool(s.get("tls_allow_expired", False)),  # #129 (ADR 0094)
                 host=urllib.parse.urlsplit(self.url).hostname or "",
+                trust_anchor=anchor,
             )
         elif bool(s.get("verify_tls", True)):
             # #129 (ADR 0094): granular expiry-only relaxation — verify chain + hostname but tolerate an
             # expired peer cert (opt-in; default off = the shared verifying opener, byte-identical).
             if bool(s.get("tls_allow_expired", False)):
                 self._opener = _expiry_relaxed_opener(
-                    urllib.parse.urlsplit(self.url).hostname or "", *proxy_handlers
+                    urllib.parse.urlsplit(self.url).hostname or "",
+                    *proxy_handlers,
+                    trust_anchor=anchor,
                 )
-            elif proxy_handlers:
+            elif proxy_handlers or anchor.narrows:
                 # A forward proxy → a per-connection verifying opener carrying it (never the shared one).
-                self._opener = _no_redirect_opener(*proxy_handlers)
+                # A narrowed trust anchor needs its own opener for the same reason.
+                self._opener = _no_redirect_opener(*proxy_handlers, trust_anchor=anchor)
             else:
                 self._opener = _NO_REDIRECT_OPENER
         else:
@@ -601,8 +614,19 @@ class SoapDestination(DestinationConnector):
                     "SOAP client cert is incompatible with verify_tls=false — the peer must be "
                     "verified (ADR 0015)"
                 )
-        if self.ws_password_type not in ("text", "digest"):
-            raise ValueError("SOAP ws_password_type must be 'text' or 'digest' (ADR 0015)")
+        if self.ws_password_type == "digest":  # nosec B105 -- a password *type*, not a secret
+            raise ValueError(
+                "SOAP ws_password_type='digest' is retired (BACKLOG #1171, ASVS 11.4.1). The "
+                "WS-Security UsernameToken PasswordDigest construction is defined by its profile as "
+                "Base64(SHA1(Nonce + Created + Password)), so the option could not be moved to an "
+                "approved hash without leaving the profile. It also bought nothing here: this "
+                "connector already refuses a UsernameToken over a cleartext hop, so the channel "
+                "protects the credential either way, and PasswordDigest additionally requires the "
+                "far side to store the password recoverably. Use ws_password_type='text' over the "
+                "TLS hop this connector already requires."
+            )
+        if self.ws_password_type != "text":  # nosec B105 -- a password *type*, not a secret
+            raise ValueError("SOAP ws_password_type must be 'text' (ADR 0015, BACKLOG #1171)")
         if self._ws_mode and self.version != "1.2":
             raise ValueError("SOAP ws_addressing/ws_security require soap_version='1.2' (ADR 0015)")
         # A UsernameToken password over cleartext http is a credential on the wire — refuse like the
@@ -670,23 +694,9 @@ class SoapDestination(DestinationConnector):
 
     def _build_username_token(self, created: str) -> str:
         username = _xml_escape(self.ws_username or "")
-        if self.ws_password_type == "digest":  # nosec B105 — a WS-Security password *type*, not a secret
-            nonce = self._nonce_fn()
-            # Legacy WS-Security UsernameToken digest = Base64(SHA1(Nonce + Created + Password)). This
-            # is the spec's token construction, NOT a message-integrity signature (SHA1 here is the
-            # profile's defined hash; XML-DSig is deferred — ADR 0015 §4a).
-            digest = base64.b64encode(
-                hashlib.sha1(  # noqa: S324  # nosec B324 — WS-Security UsernameToken profile, not integrity
-                    nonce + created.encode() + (self.ws_password or "").encode()
-                ).digest()
-            ).decode("ascii")
-            nonce_b64 = base64.b64encode(nonce).decode("ascii")
-            return (
-                f"<wsse:UsernameToken><wsse:Username>{username}</wsse:Username>"
-                f'<wsse:Password Type="{_PW_DIGEST}">{_xml_escape(digest)}</wsse:Password>'
-                f'<wsse:Nonce EncodingType="{_NONCE_ENC}">{nonce_b64}</wsse:Nonce>'
-                f"<wsu:Created>{created}</wsu:Created></wsse:UsernameToken>"
-            )
+        # PasswordText only. The PasswordDigest alternative was retired in BACKLOG #1171 -- see
+        # __init__'s refusal for the reasoning. `created` stays a parameter because the enclosing
+        # <wsu:Timestamp> uses it; the UsernameToken itself no longer carries a Created or a Nonce.
         password = _xml_escape(self.ws_password or "")
         return (
             f"<wsse:UsernameToken><wsse:Username>{username}</wsse:Username>"
@@ -768,7 +778,10 @@ class SoapDestination(DestinationConnector):
         )
         try:
             with self._opener.open(req, timeout=self.timeout) as resp:
-                resp.read()
+                # ASVS 15.2.2: the HEAD probe body is discarded, but an unbounded drain would let a
+                # reachability check be turned into a memory exhaustion. Unlike the length gate this
+                # method deliberately omits, this bound CAN fire: the peer chooses the body.
+                read_bounded(resp, connector=f"SOAP {_redact_url(self.url)} probe")
         except urllib.error.HTTPError as exc:
             if exc.code in (401, 403):
                 raise DeliveryError(
@@ -827,7 +840,11 @@ class SoapDestination(DestinationConnector):
             raise
         try:
             with self._opener.open(req, timeout=self.timeout) as resp:
-                body = resp.read().decode(self.encoding, errors="replace")
+                # ASVS 15.2.2: bounded on the socket read. One SOAP response envelope sits far under
+                # the 16 MiB ceiling, so this refuses only a peer that is broken or hostile.
+                body = read_bounded_text(
+                    resp, connector=f"SOAP {_redact_url(self.url)}", encoding=self.encoding
+                )
                 status = int(getattr(resp, "status", 200))
                 # #154: capture only the allow-listed response headers (empty allow-list → {}).
                 headers = capture_response_headers(
@@ -836,7 +853,23 @@ class SoapDestination(DestinationConnector):
                 return body, status, headers
         except urllib.error.HTTPError as exc:
             try:
-                body = exc.read().decode(self.encoding, errors="replace")
+                # ASVS 15.2.2: the fault body is bounded too. It is only ever read to CLASSIFY the
+                # non-2xx, so an over-cap one is logged and dropped rather than raised: the delivery
+                # already fails below on the status, and raising here would swap a classified
+                # failure for an unclassified one.
+                body = read_bounded_text(
+                    exc,
+                    connector=f"SOAP {_redact_url(self.url)} fault body",
+                    encoding=self.encoding,
+                )
+            except ResponseTooLargeError:
+                logger.warning(
+                    "SOAP %s returned an HTTP %s fault body over the response bound; "
+                    "classifying on the status alone",
+                    _redact_url(self.url),
+                    exc.code,
+                )
+                body = ""
             except Exception:  # noqa: BLE001 - a body we can't read just becomes status-only
                 body = ""
             # A non-2xx status: _classify_soap always returns a failure here (it returns None only on

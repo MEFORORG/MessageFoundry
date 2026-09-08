@@ -44,8 +44,7 @@ from harness.load.connscale.probe import (
     _posix_stat_ppid_starttime,
     _validated_descendants,
 )
-from harness.load.connscale.runner import _PROC_BY_SAMPLE, _drain_proc
-from harness.load.enginepoll import EngineSample
+from harness.load.connscale.runner import ProcReading, _derive_proc
 
 #: How long to keep re-walking before declaring the subtree re-resolution broken.
 #:
@@ -91,25 +90,6 @@ _WATCHDOG_SHARE = 0.7
 _BUDGET_CONSUMED_FRACTION = 0.9
 
 
-def _sample(elapsed: float) -> EngineSample:
-    return EngineSample(
-        elapsed_s=elapsed,
-        pending=0,
-        inflight=0,
-        done=0,
-        dead=0,
-        read=0,
-        written=0,
-        out_dead=0,
-        queue_depth=0,
-        in_pipeline=0,
-        db_size_bytes=0,
-        journal_mode="wal",
-        synchronous="normal",
-        uptime_s=elapsed,
-    )
-
-
 # A stable single-PID subtree — the common case, where every interval is a clean same-set delta.
 _STABLE_PIDS = frozenset({1234})
 
@@ -125,7 +105,7 @@ _WS_BYTES_PER_PID = 6_000_000
 
 
 def _derive(pairs: list[tuple[float, float | None]]) -> object:
-    """Drive ``_drain_proc`` over (elapsed_s, cumulative_cpu_seconds) readings, holding the summed-over
+    """Drive ``_derive_proc`` over (elapsed_s, cumulative_cpu_seconds) readings, holding the summed-over
     PID set constant so every interval is a clean CPU delta (the stable-subtree common case)."""
     return _derive_sets([(e, c, _STABLE_PIDS) for e, c in pairs])
 
@@ -133,23 +113,26 @@ def _derive(pairs: list[tuple[float, float | None]]) -> object:
 def _derive_sets(
     triples: list[tuple[float, float | None, frozenset[int] | None]],
 ) -> object:
-    """Drive ``_drain_proc`` over (elapsed_s, cumulative_cpu_seconds, cpu_pids) readings, so a test can
+    """Drive ``_derive_proc`` over (elapsed_s, cumulative_cpu_seconds, cpu_pids) readings, so a test can
     change the summed-over subtree between ticks (#220).
 
     ``handles`` / ``working_set_bytes`` are DERIVED from that tick's PID set (see ``_HANDLES_PER_PID``),
     never pinned: a tick with no observed set reports both as gaps, and a tick over a wider set reports
     a proportionally wider footprint."""
-    samples = []
-    for elapsed, cpu, pids in triples:
-        s = _sample(elapsed)
-        _PROC_BY_SAMPLE[id(s)] = ProcSample(
-            handles=None if pids is None else _HANDLES_PER_PID * len(pids),
-            cpu_seconds=cpu,
-            working_set_bytes=None if pids is None else _WS_BYTES_PER_PID * len(pids),
-            cpu_pids=pids,
-        )
-        samples.append(s)
-    return _drain_proc(samples)
+    return _derive_proc(
+        [
+            ProcReading(
+                elapsed,
+                ProcSample(
+                    handles=None if pids is None else _HANDLES_PER_PID * len(pids),
+                    cpu_seconds=cpu,
+                    working_set_bytes=None if pids is None else _WS_BYTES_PER_PID * len(pids),
+                    cpu_pids=pids,
+                ),
+            )
+            for elapsed, cpu, pids in triples
+        ]
+    )
 
 
 def test_flat_cpu_counter_over_a_long_span_is_a_gap_not_zero() -> None:
@@ -742,12 +725,10 @@ def _bfs_unvalidated(rows: list[ProcRow], root: int) -> list[int]:
 
 
 def _handles_peak_over(sampler: FdSampler, pids: list[int]) -> int | None:
-    """Sum a REAL per-PID OS read over ``pids`` and push it through ``_drain_proc``, so what the test
+    """Sum a REAL per-PID OS read over ``pids`` and push it through ``_derive_proc``, so what the test
     asserts is the reported ``handles_peak`` gauge rather than an intermediate."""
     raw = sampler._sample_windows(pids) if sys.platform == "win32" else sampler._sample_posix(pids)
-    s = _sample(0.0)
-    _PROC_BY_SAMPLE[id(s)] = raw
-    return _drain_proc([s]).handles_peak
+    return _derive_proc([ProcReading(0.0, raw)]).handles_peak
 
 
 @pytest.mark.skipif(sys.platform not in ("win32", "linux"), reason="OS process-table probe path")
@@ -886,12 +867,7 @@ def _handles_summed_over(root_pid: int, pids: list[int]) -> int | None:
 def _peak_of(readings: list[ProcSample]) -> int | None:
     """Push REAL probe readings through the SHIPPED derivation, so what the test asserts is
     ``handles_peak`` -- the gauge the connscale FD SLO judges -- and never an intermediate."""
-    samples = []
-    for i, raw in enumerate(readings):
-        s = _sample(float(i))
-        _PROC_BY_SAMPLE[id(s)] = raw
-        samples.append(s)
-    return _drain_proc(samples).handles_peak
+    return _derive_proc([ProcReading(float(i), raw) for i, raw in enumerate(readings)]).handles_peak
 
 
 @pytest.mark.skipif(sys.platform not in ("win32", "linux"), reason="OS process-table probe path")

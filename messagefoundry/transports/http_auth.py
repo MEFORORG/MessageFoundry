@@ -46,6 +46,7 @@ from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 from messagefoundry.config.models import ConnectorType
 from messagefoundry.config.tls_policy import InsecureHopRefused
 from messagefoundry.transports.base import DeliveryError
+from messagefoundry.transports.bounded_read import MAX_TOKEN_RESPONSE_BYTES, read_bounded_text
 from messagefoundry.transports.rest import (
     _NO_REDIRECT_OPENER,
     ProxyConfig,
@@ -274,7 +275,16 @@ class OAuth2ClientCredentialsProvider:
         req = self._token_request(data, headers)
         try:
             with self._opener.open(req, timeout=self.timeout_seconds) as resp:
-                body = resp.read().decode("utf-8", errors="replace")
+                # ASVS 15.2.2: bounded on the socket read, at the tighter token ceiling. A
+                # client_credentials response is a bearer, a TTL and a scope list; anything past
+                # 256 KiB is not a token response. Over-cap raises ResponseTooLargeError, already a
+                # DeliveryError, so it takes this connector's normal mint-failure path.
+                body = read_bounded_text(
+                    resp,
+                    limit=MAX_TOKEN_RESPONSE_BYTES,
+                    connector=f"OAuth2 token endpoint {_redact_url(self.token_url)}",
+                    encoding="utf-8",
+                )
         except urllib.error.HTTPError as exc:
             raise DeliveryError(
                 f"OAuth2 token endpoint {_redact_url(self.token_url)} returned HTTP {exc.code}"
@@ -498,7 +508,25 @@ def with_oauth2_client_credentials(
     ``token_url`` / ``client_id`` / ``client_secret`` / ``audience`` may be
     :func:`~messagefoundry.config.wiring.env` references — keep the secret in ``env()``. The minted bearer
     **overrides** any static ``bearer_token``; it is mutually exclusive with SMART auth and HTTP Digest
-    (a loud error at construction otherwise). Mutates ``spec`` in place and returns it."""
+    (a loud error at construction otherwise). Mutates ``spec`` in place and returns it.
+
+    **What this mode does not give you, and where the stronger one already is** (BACKLOG #1158, ASVS
+    10.2.2). Both ``auth_style`` values send the ``client_secret`` itself — ``basic`` in an
+    ``Authorization`` header, ``post`` in the form body — so the credential a token endpoint receives is
+    **reusable**: nothing in it names the endpoint it was sent to or bounds its lifetime, and the same
+    secret registered at a second authorization server authenticates there too. Where your
+    authorization server will register a **public key**, compose
+    :func:`~messagefoundry.transports.smart.with_smart_backend` over the same ``Rest()`` spec instead.
+    Despite the name it is a plain **RFC 7523 section 2.2 ``private_key_jwt``** client —
+    ``grant_type=client_credentials`` plus a signed assertion whose ``aud`` is this connection's pinned
+    token endpoint, with nothing FHIR- or SMART-specific on the wire — so a partner validating ``aud``
+    (RFC 7523 section 3) rejects a replayed assertion and the key never leaves this process. Pass
+    ``algorithm="RS256"`` for a generic partner; the ``RS384`` default is SMART's own requirement.
+
+    A symmetric ``client_secret_jwt`` (RFC 7523 with an HMAC) is **deliberately not offered**: the
+    authorization server must hold the same secret to verify such an assertion, so it can mint one for
+    any other audience. It would stop transmitting the secret without restoring the property above.
+    ``tests/test_oauth2_destination_binding.py`` holds both halves of this paragraph."""
     _require_http_spec(spec, "OAuth2 client-credentials")
     spec.settings.update(
         {
