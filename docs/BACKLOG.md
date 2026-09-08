@@ -26127,6 +26127,61 @@ A sixth line was stale in a different direction: the section told the reader to 
 
 ---
 
+## 1486. Number allocation should land the item's section heading on main, so filing an item edits its own lines instead of inserting at a shared anchor
+
+> 🔢 **Filed 2026-09-07 (lander). Value **7/10** · difficulty 3/10 · _quick win_.** Twenty open pull requests block each other pairwise, and the cause is one line of file structure rather than anything about their content. Measured, not inferred; the discriminator below is exact at n=20.
+> Verdict: build
+> Research: none
+> Closing-act: code
+
+**Cluster:** Development harness / ledger mechanics. **Priority:** P2. **Verdict:** build (small).
+**Severity:** no engine effect, no PHI axis, no deployment axis (sec. 0). This costs seat time, nothing else.
+
+### What is wrong
+
+Every pull request that files a backlog item appends its section at the END of `docs/BACKLOG.md`. Git cannot merge two insertions made at the same anchor, so any two such branches conflict with each other, whatever they contain. The result is not a gradient of cost -- it is a clique.
+
+**Measured 2026-09-07 against main `43f0bad2f`, over the 45 mergeable pull requests then open.** Each candidate was merged into main in memory (`git merge-tree --write-tree`, then `commit-tree`), and every other clean pull request was merged against that simulated main:
+
+- **18 pull requests break nobody.** Not individually and not in sequence: simulating all eighteen landing back to back leaves every remaining pull request still clean.
+- **20 form a mutually blocking set**, each breaking 17 to 19 of the others. The pairwise graph over those twenty has density 0.93 -- 176 of 190 edges -- with a maximum independent set of 2 and a maximum matching of 2. **That is a floor of 18 resolution rounds**, and ordering buys exactly two of them back.
+
+**The discriminator is the insertion ANCHOR, and it is exact.** Of the twenty, eighteen place their last ledger hunk at the final line of their own base file; those break 17 to 19 others. The two that do not -- #943 at 0.988 of the file and #960 at 0.994 -- break 13 and 12.
+
+**Three plausible explanations were tested and refuted, and they are recorded so nobody re-derives them:**
+
+| Hypothesis | Refuted by |
+|---|---|
+| Any ledger-touching merge conflicts every other one | #969 changes 3 ledger lines and breaks 0, with 40 ledger-touching pull requests open |
+| Cost tracks the SIZE of the ledger edit | **#921 changes 67 lines and breaks 0**; #958 changes 84 and breaks 19 |
+| Cost tracks the region of the file | Both free and costly members sit in the last few percent; the free set contains edits of 95, 67 and 56 lines |
+
+**#921 is the whole argument in one row.** It changes 67 ledger lines, its last hunk sits at 0.499 of the file, and it collides with nothing. A pull request's page shows none of this: #969 and #943 both read MERGEABLE, and one is free while the other breaks thirteen.
+
+### What to build
+
+**Make allocation land the SECTION, not only the number.** `scripts/coord/alloc.ps1` already allocates a number atomically, and `pre-commit`'s ledger gate already refuses a number nobody allocated (`docs/LEDGER-GATE.md`). The missing half is that the allocated heading never reaches `main` until the work that fills it does -- confirmed while filing this item: `alloc.ps1 -Kind backlog` reserved #1486 and wrote no heading anywhere, so this very entry was appended at the shared anchor like every other.
+
+If allocation puts a stub heading on `main` -- the `## N.` line and a banner declaring the item unstarted -- then the branch that later fills it in **edits its own section at lines nobody else touches**. Two such branches no longer share an anchor, and the clique stops forming.
+
+**The cost is one extra round trip**: an allocation has to reach `main` before the work starts, rather than travelling with it. That is the trade, and it is worth stating plainly rather than discovering later.
+
+**What this does NOT fix.** The twenty already open still conflict and still need hand resolution; this stops the twenty-first. All eighteen conflicts among them are the same shape -- two appended sections at one anchor -- and resolve by keeping both in number order.
+
+### Rejected, with the reason
+
+**A merge driver for `docs/BACKLOG.md`** would end the class outright, and it changes the behaviour of every merge in the repository. That is a larger blast radius than the defect, and it wants its own item and a ruling.
+
+**One file per item with a generated index** dissolves the problem rather than avoiding it, and is the right long-term shape. It is a migration over 686 items and 12 referencing files, and the status banner alphabet is machine-parsed (`scripts/docs/backlog_status_check.py`), so it is not a doc edit. Its own item, if anyone wants it.
+
+**Reproducing the measurement.** Entirely offline against a static main, no CI and no waiting:
+
+    T=$(git merge-tree --write-tree "$MAIN" "$CAND" | head -1)
+    AFTER=$(git commit-tree "$T" -p "$MAIN" -p "$CAND" -m sim)
+    git merge-tree --write-tree "$AFTER" "$OTHER"   # non-zero exit means this one breaks
+
+About 45 calls per candidate, seconds each. The same shape stack-tests a merge-queue batch before enqueuing it, by merging each candidate onto the accumulated result rather than onto main.
+
 ## 1488. test_connscale_smoke.py's probes assert a measurement was taken, so a contended runner fails them and evicts whatever is in the merge queue
 
 > 🔢 **Filed 2026-09-08 -- not started.** Two probes in `tests/test_connscale_smoke.py` fail on a loaded runner and take the merge-queue entry down with them. Measured 2026-09-08: **9 of 10 sampled failed `merge_group` CI runs** failed on this one file, out of **25 failed merge-group builds that day**. It evicted PR 879 three times and PRs 933, 955 and 833 once each.
