@@ -48,6 +48,7 @@ from typing import TYPE_CHECKING
 
 from messagefoundry.config.settings import INSECURE_TLS_ESCAPE_ENV, weakened_tls_escape_permitted
 from messagefoundry.config.tls_policy import HopPosture
+from messagefoundry.transports.bounded_read import ResponseTooLargeError, read_bounded_text
 
 # Reuse rest.py's hardened, TLS-verifying, no-redirect opener + URL redaction (no new HTTP plumbing) —
 # exactly as smart.py / fhir.py / soap.py do. No import cycle: rest.py never imports this module.
@@ -201,7 +202,18 @@ class AiBroker:
         )
         try:
             with self._opener.open(req, timeout=self.timeout_seconds) as resp:
-                body = resp.read().decode("utf-8", errors="replace")
+                # ASVS 15.2.2: bounded on the socket read. The AI endpoint is operator-configured but
+                # off-premises, so its reply is the least-trusted body the engine buffers on egress.
+                body = read_bounded_text(
+                    resp,
+                    connector=f"AI endpoint {_redact_url(self.endpoint)}",
+                    encoding="utf-8",
+                )
+        except ResponseTooLargeError as exc:
+            # Mapped onto this module's single error type: the API route handles AiBrokerError, and a
+            # DeliveryError escaping here would be unmapped. The message already names only the
+            # redacted host, the bound and the class.
+            raise AiBrokerError(str(exc)) from exc
         except urllib.error.HTTPError as exc:
             # Never echo exc.read() — the error body may carry provider detail; redacted host + status only.
             raise AiBrokerError(

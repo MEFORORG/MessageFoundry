@@ -15,9 +15,9 @@ a bounded, TTL'd, process-local :class:`ChallengeCache` (the rate-limiter preced
 process is structural; ADR 0068 records the store-backed table as the multi-node upgrade path).
 
 Policy pins (ADR 0068 §1/§6): ``attestation=NONE`` (passkey norm — no attestation certificates are
-requested or stored, keeping ASVS 6.7.1 N/A) and ``user_verification=PREFERRED`` (the knowledge
+requested or stored, keeping ASVS 6.7.1 N/A), ``user_verification=PREFERRED`` (the knowledge
 factor is the password that accompanies every step-up; ``REQUIRED`` would brick PIN-less U2F keys
-for no factor gain).
+for no factor gain), and the credential algorithm set (:data:`SUPPORTED_COSE_ALGS`).
 """
 
 from __future__ import annotations
@@ -27,11 +27,39 @@ import secrets
 import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:  # the [webauthn] extra is optional — the runtime import is lazy, per-call
+    from webauthn.helpers.cose import COSEAlgorithmIdentifier
 
 CHALLENGE_BYTES = 64
 CHALLENGE_TTL_SECONDS = 120.0
 PER_USER_PENDING_CAP = 16
 GLOBAL_PENDING_CAP = 4096
+
+#: The COSE algorithm identifiers (IANA COSE Algorithms registry) this relying party will register:
+#: EdDSA and ES256. Deliberately NARROWER than py_webauthn's default set, which also carries RS256
+#: (-257) — ASVS 11.2.3 asks every primitive for at least 128 bits of security, and an RSA
+#: identifier cannot promise that. ``-257`` fixes the padding and the hash and leaves the MODULUS
+#: unbounded, so an authenticator answers it with whatever size it holds. Measured against this
+#: module before the restriction landed (BACKLOG #1166): RS256 over a 2048-bit modulus registered
+#: and was accepted, and so did RS256 over a **1024**-bit one.
+#:
+#: EdDSA (-8) and ES256 (-7) carry no equivalent hole. The curve rides in the credential rather
+#: than in the identifier, but a credential whose curve is unknown or does not match its key cannot
+#: produce a verifiable assertion — measured: it registers, then every assertion against it is
+#: refused — so no sub-floor EC2 or OKP credential is ever usable. That is the property the RSA
+#: identifier cannot offer, and it is why the floor can be expressed here as a set of identifiers.
+#:
+#: **Stated rather than hidden: this refuses an authenticator that offers only RS256.** TPM-backed
+#: Windows Hello is the population that registers RSA credentials. Those operators keep TOTP, which
+#: ADR 0068's 2026-07-17 amendment already records as the alternative second factor. It is NOT an
+#: operator setting on purpose: a knob that re-admits -257 would be exactly the operator-supplied
+#: weak configuration this requirement is failing on.
+#:
+#: Plain ints so this module still imports without the extra; :func:`_supported_pub_key_algs`
+#: resolves them to the library enum at call time.
+SUPPORTED_COSE_ALGS: tuple[int, ...] = (-8, -7)
 
 _INSTALL_HINT = (
     "WebAuthn support requires the [webauthn] extra: pip install messagefoundry[webauthn]"
@@ -68,6 +96,18 @@ class ChallengeCacheFullError(RuntimeError):
     Reachable only via mass account provisioning (per-user caps confine ordinary abuse to
     self-eviction); ``admin_reset_mfa`` remains the always-available recovery (ADR 0068 §2).
     """
+
+
+def _supported_pub_key_algs() -> list[COSEAlgorithmIdentifier]:
+    """Resolve :data:`SUPPORTED_COSE_ALGS` to the library enum (lazy — the extra is optional).
+
+    Both ceremony halves call this, so the set the relying party ADVERTISES and the set it ACCEPTS
+    cannot drift apart. That is the whole control: advertisement is a hint an authenticator may
+    ignore, and ``verify_registration_response`` is the only place a credential is refused.
+    """
+    from webauthn.helpers.cose import COSEAlgorithmIdentifier
+
+    return [COSEAlgorithmIdentifier(alg) for alg in SUPPORTED_COSE_ALGS]
 
 
 def new_challenge() -> bytes:
@@ -187,9 +227,9 @@ def registration_options(
 ) -> str:
     """Build the browser ``navigator.credentials.create`` options as a JSON string.
 
-    ``attestation=NONE`` + ``user_verification=PREFERRED`` are pinned here (module docstring);
-    ``exclude_credential_ids`` carries the user's existing credentials so re-registering the same
-    authenticator is refused client-side.
+    ``attestation=NONE``, ``user_verification=PREFERRED`` and :data:`SUPPORTED_COSE_ALGS` are
+    pinned here (module docstring); ``exclude_credential_ids`` carries the user's existing
+    credentials so re-registering the same authenticator is refused client-side.
     """
     _require_webauthn()
     from webauthn import generate_registration_options
@@ -214,6 +254,7 @@ def registration_options(
         exclude_credentials=[
             PublicKeyCredentialDescriptor(id=cid) for cid in exclude_credential_ids
         ],
+        supported_pub_key_algs=_supported_pub_key_algs(),
     )
     return options_to_json(options)
 
@@ -222,6 +263,10 @@ def verify_registration(
     *, response_json: str, challenge: bytes, rp_id: str, origin: str
 ) -> RegistrationResult:
     """Verify an attestation response against the staged challenge; raise on any invalid input.
+
+    **This is where :data:`SUPPORTED_COSE_ALGS` is enforced**, not merely advertised: an
+    authenticator that answers with an identifier outside the set is refused here, and a refusal
+    lands on the same audited invalid-input path as any other bad response.
 
     ``transports`` ride ``RegistrationCredential.response.transports`` (struct path verified
     against webauthn 3.0.0 at build time per ADR 0068's open item) — extracted defensively from
@@ -237,6 +282,7 @@ def verify_registration(
             expected_challenge=challenge,
             expected_rp_id=rp_id,
             expected_origin=origin,
+            supported_pub_key_algs=_supported_pub_key_algs(),
         )
     except WebAuthnException as exc:
         # The BASE class, deliberately (PR-A review HIGH): structurally-malformed browser input

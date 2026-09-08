@@ -38,8 +38,7 @@ import pytest
 from harness.load.connscale import probe as probe_module
 from harness.load.connscale.probe import FdSampler, ProbeDegraded, ProcSample, _gap
 from harness.load.connscale.report import ConnScaleRecord, ConnScaleReport, NoLoss, SloCheck
-from harness.load.connscale.runner import _PROC_BY_SAMPLE, _drain_proc
-from harness.load.enginepoll import EngineSample
+from harness.load.connscale.runner import ProcReading, _derive_proc
 
 # The smoke test owns the verdict helper, beside the assertion it serves and the prose explaining it.
 # Imported here rather than re-stated, so this file cannot encode a second, quietly different rule
@@ -391,32 +390,8 @@ def test_a_live_sample_records_a_cause_exactly_when_it_reads_nothing() -> None:
 # --- the cause reaches the record --------------------------------------------------------------------
 
 
-def _engine_sample(elapsed: float) -> EngineSample:
-    return EngineSample(
-        elapsed_s=elapsed,
-        pending=0,
-        inflight=0,
-        done=0,
-        dead=0,
-        read=0,
-        written=0,
-        out_dead=0,
-        queue_depth=0,
-        in_pipeline=0,
-        db_size_bytes=0,
-        journal_mode="wal",
-        synchronous="normal",
-        uptime_s=elapsed,
-    )
-
-
 def _drain(procs: list[ProcSample]) -> Any:
-    samples = []
-    for i, p in enumerate(procs):
-        s = _engine_sample(float(i))
-        _PROC_BY_SAMPLE[id(s)] = p
-        samples.append(s)
-    return _drain_proc(samples)
+    return _derive_proc([ProcReading(float(i), p) for i, p in enumerate(procs)])
 
 
 def _reading(handles: int, pid: int = 1234) -> ProcSample:
@@ -450,7 +425,7 @@ def test_a_clean_window_records_no_causes() -> None:
 
 
 def test_the_no_clean_interval_cpu_gap_path_keeps_the_provenance() -> None:
-    # `_drain_proc` has THREE exits and two of them are CPU-gap early returns. Each is a separate
+    # `_derive_proc` has THREE exits and two of them are CPU-gap early returns. Each is a separate
     # `return`, so each can independently forget to carry the cause -- which would be this change
     # failing precisely where a gap is being reported. Exit 1: every interval crossed a subtree
     # membership change, so no clean CPU delta survives.
@@ -470,19 +445,12 @@ def test_the_flat_counter_cpu_gap_path_keeps_the_provenance() -> None:
     # Exit 2: a flat cumulative CPU counter across a span past the guard (a wrong PID binding). The
     # elapsed values must exceed `_CPU_FLAT_GAP_SPAN_S` or this silently falls through to the tail
     # return and stops testing the branch it names.
-    samples = [
-        _engine_sample(0.0),
-        _engine_sample(10.0),
-        _engine_sample(20.0),
-    ]
     flat = [
         ProcSample(61, 12.5, 6_000_000, frozenset({1}), None),
         ProcSample(61, 12.5, 6_000_000, frozenset({1}), None),
         _gap(ProbeDegraded.WALK_TIMEOUT),
     ]
-    for s, p in zip(samples, flat, strict=True):
-        _PROC_BY_SAMPLE[id(s)] = p
-    d = _drain_proc(samples)
+    d = _derive_proc([ProcReading(e, p) for e, p in zip((0.0, 10.0, 20.0), flat, strict=True)])
     assert d.cpu_seconds_total is None  # confirms the flat-counter exit was taken
     assert d.probe_degraded == ("walk_timeout",)
     assert (d.probe_degraded_ticks, d.probe_ticks) == (1, 3)

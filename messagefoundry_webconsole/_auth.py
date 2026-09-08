@@ -71,27 +71,28 @@ COOKIE_NAME = "mf_session"
 #: (byte-identity): ``__Host-`` can never be set without Secure, which cleartext cannot carry.
 HOST_COOKIE_NAME = "__Host-mf_session"
 
-#: The ``__Secure-`` prefixed session cookie name — the FALLBACK when the org opt-out withdraws
-#: ``__Host-`` in an effective-https context (owner ruling 2026-09-05, BACKLOG #1117 / ASVS 3.3.1).
+#: The ``__Secure-`` prefixed session cookie name — the name used when the org opt-out withholds
+#: ``__Host-`` but the context is still effective-https (BACKLOG #1117, ASVS 3.3.1).
 #:
-#: **The opt-out drops ``__Host-`` ONLY, not every prefix.** ``__Secure-`` constrains strictly less: it
-#: requires only Secure, where ``__Host-`` additionally requires ``Path=/`` and no ``Domain``. So it
-#: survives the realistic failure the hatch exists for — a legacy proxy that rewrites ``Path`` or adds a
-#: ``Domain`` — while still binding the cookie to a secure transport.
-#:
-#: **Only ever used where Secure is genuinely set.** A browser drops a ``__Secure-`` cookie without
-#: Secure exactly as it drops a ``__Host-`` one, so naming it over a cleartext origin would break login
-#: while a grep and a scorecard read as hardened. Both this name and the Secure attribute key on
-#: :func:`effective_https` — the SAME predicate, reached by each site's own call (#1117 forbids
-#: inferring either conjunct from the other), which is what keeps them true together.
+#: **It constrains strictly LESS than** :data:`HOST_COOKIE_NAME`, and that is the whole point of it.
+#: ``__Secure-`` requires only the Secure attribute; ``__Host-`` additionally requires ``Path=/`` and
+#: no ``Domain``. So it survives the one realistic failure the opt-out exists for — a legacy proxy
+#: that rewrites Path or adds a Domain — while still refusing to be set over a non-secure origin.
+#: Choosing the middle rung rather than no prefix keeps the second limb of the pinned verb met on
+#: every startable arm: a cookie that is not ``__Host-`` must be ``__Secure-``.
 SECURE_COOKIE_NAME = "__Secure-mf_session"
 
 #: Org opt-out for the #192 /ui browser hardening. DEFAULT is hardening ON (secure-by-default); set this
-#: env truthy to REVERT the /ui surface to the pre-#192 posture — the engine's static self-CSP and no
-#: per-response nonce / COOP / CSP-reporting, with the cookie name falling back from ``__Host-`` to
-#: :data:`SECURE_COOKIE_NAME` (Secure is untouched, so transport security is never downgraded). The
-#: escape hatch for a legacy proxy/browser that cannot tolerate ``__Host-``/nonce-CSP, per the
-#: secure-by-default-with-explicit-opt-out rule.
+#: env truthy to REVERT the /ui surface to the pre-#192 posture — the engine's static self-CSP, and no
+#: per-response nonce / COOP / CSP-reporting. Transport security is never downgraded: Secure still
+#: follows the scheme, and since BACKLOG #1117 the cookie NAME falls back to :data:`SECURE_COOKIE_NAME`
+#: rather than all the way to the bare name. The escape hatch for a legacy proxy/browser that cannot
+#: tolerate ``__Host-``/nonce-CSP, per the secure-by-default-with-explicit-opt-out rule.
+#:
+#: **What this hatch is FOR was an open question and is now decided** (owner delegated the call to the
+#: Builder, 2026-09-06; BACKLOG #1117). It reads, in this file's own words, as the hatch for a browser
+#: or proxy that cannot tolerate ``__Host-`` — it does not say "no prefix", and nothing else in the tree
+#: did either. So it withholds ``__Host-`` and nothing more.
 BROWSER_HARDENING_OPT_OUT_ENV = "MEFOR_WEBCONSOLE_DISABLE_BROWSER_HARDENING"
 
 
@@ -128,11 +129,19 @@ def security_headers_context(app_state: object, scheme: str) -> bool:
     Deliberately BROADER than :func:`effective_https`, which still SOLELY gates the session cookie's
     Secure flag + ``__Host-`` prefix. Splitting the two lets the header hardening engage over cleartext
     loopback (a trustworthy origin where a conformant browser honours these headers) while the cookie
-    stays the plain ``mf_session`` — a browser REJECTS a Secure / ``__Host-`` cookie over http, so keying
-    the cookie on loopback would break login. HSTS is unaffected (the engine emits it only over real
-    https / ``exposure_protected``, never on loopback). Reads only the public ``app.state`` attribute the
+    stays the plain ``mf_session``. HSTS is unaffected (the engine emits it only over real https /
+    ``exposure_protected``, never on loopback). Reads only the public ``app.state`` attribute the
     engine exposes; imports no engine module (a graceful default keeps it compatible with an older
     engine that predates the ``loopback`` seam).
+
+    **The plain-cookie half no longer rests on the browser fact it used to cite** (BACKLOG #1117). This
+    docstring said a browser REJECTS a Secure / ``__Host-`` cookie over http, which is true off-loopback
+    and FALSE on the origin the sentence was written to justify: measured 2026-09-06 against Chrome
+    148.0.7778.280, an ``http://127.0.0.1`` origin STORED and returned ``__Host-``, ``__Secure-`` and a
+    bare-Secure cookie alike, with a domain-mismatch control dropped in the same run. That is what a
+    *potentially-trustworthy* origin means for cookies. The split stands on two other grounds instead:
+    Safari and Firefox are unmeasured, and since ADR 0172 no ``messagefoundry serve`` posture reaches
+    this branch at all, so widening it would trade a measured-inert behaviour for an unmeasured one.
     """
     return effective_https(app_state, scheme) or bool(getattr(app_state, "loopback", False))
 
@@ -141,14 +150,18 @@ def session_cookie_name(conn: Request | WebSocket) -> str:
     """The session cookie name for this connection. The ONE resolver every set/clear/read site threads
     through, so the name a response writes and the name a later request reads always agree.
 
-    Three answers, and the transport decides first (BACKLOG #1117, owner ruling 2026-09-05):
+    THREE rungs, and the middle one is why this is not a boolean (BACKLOG #1117, ASVS 3.3.1):
 
-    * effective-https, hardening on (the shipped posture) — :data:`HOST_COOKIE_NAME`;
-    * effective-https, org opt-out set — :data:`SECURE_COOKIE_NAME`. The opt-out withdraws ``__Host-``
-      and nothing else, so the cookie keeps the weaker prefix rather than going bare;
-    * not effective-https — the plain :data:`COOKIE_NAME` (byte-identity with pre-#192). NEITHER prefix
-      is writable without Secure, so this branch is the correct answer and not a weaker one.
-    """
+    * effective-https, hardening on  -> :data:`HOST_COOKIE_NAME`, the strongest binding.
+    * effective-https, org opt-out   -> :data:`SECURE_COOKIE_NAME`. The opt-out withholds ``__Host-``,
+      NOT every prefix, so the verb's "if not ``__Host-`` then ``__Secure-``" limb still holds. Secure
+      is already set on this arm, which is exactly what ``__Secure-`` requires.
+    * not effective-https            -> :data:`COOKIE_NAME`. A prefixed name cannot be set without
+      Secure, and Secure follows the scheme, so there is no prefix available here at all. Since
+      ADR 0172 no ``messagefoundry serve`` posture reaches this rung.
+
+    The rungs are ordered by what the BROWSER enforces, not by preference: each one drops exactly the
+    constraint the layer below it cannot satisfy."""
     if not effective_https(conn.app.state, conn.url.scheme):
         return COOKIE_NAME
     return HOST_COOKIE_NAME if browser_hardening_enabled() else SECURE_COOKIE_NAME
@@ -277,6 +290,18 @@ def require_ui(
         # ASVS 6.3.3, the cookie mirror of the JSON gate. Ordering matches require(): must_change
         # above, permissions below — a pending session must not learn whether it holds a permission.
         if not allow_mfa_pending and not await auth.mfa_satisfied(token):
+            # BACKLOG #1197, ASVS 16.3.2: audit the refusal, exactly as the engine's own gates do
+            # (api/security.py, both the HTTP and the WebSocket path). The reasoning in
+            # AuthService.audit_mfa_denied is why: this gate sits ABOVE the permission loop, so
+            # audit_permission_denied never fires for a refusal here, and without a row of its own a
+            # stolen password-only cookie could walk the whole authenticated /ui surface and leave
+            # the trail silent. The console is the surface a human actually uses, so the silence
+            # would be on the more-travelled plane, not the lesser one.
+            #
+            # BEFORE the raise, not after: _mfa_redirect returns an exception, and raising first
+            # would skip the row. Awaited rather than fired-and-forgotten so a store failure
+            # surfaces instead of dropping the record.
+            await auth.audit_mfa_denied(identity, request.url.path)
             raise _mfa_redirect()
         for permission in permissions:
             if not identity.has(permission):
@@ -790,10 +815,10 @@ async def authorize_ui_ws(
 
 def set_session_cookie(response: Response, token: str, *, request: Request) -> None:
     """Set the confined session cookie: HttpOnly + SameSite=Strict, Path=/, and — in an effective-https
-    context — the ``__Host-`` prefixed name (ADR 0065 §hardening / #192, ASVS 3.4.3), falling back to
-    the ``__Secure-`` name under the org opt-out (#1117). Secure is ALWAYS set when the effective scheme
-    is https, even under the opt-out (transport security is never downgraded). Over cleartext this is
-    byte-identical to the pre-#192 cookie (``mf_session``, no Secure). Path=/ (not /ui) so a future same-origin WebSocket
+    context (and unless the org opt-out is set) — the ``__Host-`` prefixed name (ADR 0065 §hardening /
+    #192, ASVS 3.4.3). Secure is ALWAYS set when the effective scheme is https, even under the opt-out
+    (transport security is never downgraded). Over cleartext loopback this is byte-identical to the
+    pre-#192 cookie (``mf_session``, no Secure). Path=/ (not /ui) so a future same-origin WebSocket
     handshake at the root can carry it (M2); the cookie is only ever *read* by ``require_ui`` on /ui
     routes, never by the JSON API deps.
     """
@@ -856,8 +881,9 @@ FLOW_COOKIE_NAME = "mf_oidc_flow"
 #: The ``__Host-`` twin, used on the same effective-https terms as :data:`HOST_COOKIE_NAME`.
 HOST_FLOW_COOKIE_NAME = "__Host-mf_oidc_flow"
 
-#: The ``__Secure-`` twin, used on the same opt-out terms as :data:`SECURE_COOKIE_NAME` — read that
-#: constant for why the opt-out drops ``__Host-`` only and why the prefix follows Secure.
+#: The ``__Secure-`` twin, used on the same opt-out terms as :data:`SECURE_COOKIE_NAME` (BACKLOG
+#: #1117). The flow cookie is graded by ASVS 3.3.1 exactly as the session cookie is, and the two must
+#: not answer the same posture differently.
 SECURE_FLOW_COOKIE_NAME = "__Secure-mf_oidc_flow"
 
 
@@ -865,10 +891,10 @@ def oidc_flow_cookie_name(conn: Request | WebSocket) -> str:
     """The flow-cookie name for this connection — the ONE resolver the set/read/clear sites share, so
     the name the start leg writes and the name the callback reads can never disagree.
 
-    Mirrors :func:`session_cookie_name` branch for branch, including the org opt-out's ``__Secure-``
-    fallback (BACKLOG #1117): a browser silently DROPS a prefixed cookie that is not Secure, and
+    Mirrors :func:`session_cookie_name` rung for rung, including the ``__Secure-`` middle rung under
+    the org opt-out. A browser silently DROPS a prefixed cookie that is not Secure, and
     ``[api].public_origin`` legitimately permits an http:// origin, so on a cleartext origin the plain
-    name is used. Without that split, the callback would find no cookie and audit
+    name is used. Without that bottom rung the callback would find no cookie and audit
     ``flow_binding_missing`` forever on every dev deployment, with nothing pointing at the cause.
     """
     if not effective_https(conn.app.state, conn.url.scheme):
