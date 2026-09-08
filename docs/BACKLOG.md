@@ -25876,19 +25876,45 @@ A sixth line was stale in a different direction: the section told the reader to 
 
 Counts were 1, 1 and 2 failures against roughly 12,300 passes, and **a different assertion failed on each OS leg of the same run** -- the signature of a timing- or load-sensitive test rather than a consistent defect. The same file passes on the same commit when the runners are quiet.
 
-### Why it is a test defect and not a product defect
+### RETRACTED 2026-09-08, SAME DAY, BY THE SEAT THAT FILED IT
 
-The first probe's own name says `measured_or_named_why_it_could_not`. That is the correct contract: take the measurement, or record why it was unavailable. The body does not honour it -- it asserts the measurement exists, so a runner too busy to produce a sample fails the assertion instead of recording the reason. The second probe asserts `at_least_one_step` of a reload sweep completed, which has the same shape.
+**The two sections that stood here were wrong, and the fix they prescribed would reintroduce a defect
+this repository has already measured and closed.** They are removed rather than left with a correction
+appended, because a reader who acts on a prescription does not always read to the end of the item.
 
-**A machine too slow to produce a sample is a finding to record, not an error to raise.** `ingress-rate-probe.yml` already states that principle for its own measurement; these two probes predate it.
+**What they said.** That the probes "assert a measurement was taken" where their own names promise
+"measured or named why it could not", that this is a test defect rather than a product one, and that
+the fix is to record an unavailable measurement and pass.
 
-### The fix
+**Why that is wrong.** `_assert_fd_probe` in `tests/test_connscale_smoke.py` already tolerates a gap
+per record. What it refuses is a whole run in which no `(sweep_mode, claim_mode)` group ever got two
+readings to compare, and its comment records the measurement that bound exists for: forcing every step
+after the first to time out left one group with a single reading, **zero pairs actually compared**, and
+`fd_count_monotonic` still reported monotonic -- so a 1000-handle FD collapse passed green. The
+tolerance this item asked for is the exact tolerance that made a real collapse invisible. Assertion 4
+in that helper's docstring states the same bound in words, and this item did not engage it.
 
-Make each probe record an unavailable measurement and pass, exactly as its name promises, and keep the assertion only for a measurement that was actually taken and is out of range. That preserves the regression coverage -- a real scaling regression still produces a bad sample, which still fails -- while removing the failure mode where no sample is produced at all.
+**What is actually true.** The probes fail when the runner cannot take the measurement, and on
+2026-09-08 the runner could not because the merge queue and a large push wave were competing for it --
+a wave this seat generated. The failure is a true report about the machine, which is what the helper
+was rewritten to make it. **A test that goes red when its instrument cannot measure is not obviously
+broken; the alternative is a green that means nothing.**
+
+**What a real remedy would have to address**, none of it inside the assertion: the probe's timeout
+budget against a loaded runner, whether this smoke belongs in a contended lane at all, or the load
+itself. Whoever takes that up should start from `_assert_fd_probe`'s docstring and the
+`WALL #4 NEVER COMPARED` comment, not from this item's original text.
+
+**How this happened, since the shape recurs.** The seat read the test NAMES, matched them against a
+symptom, and proposed a change to code whose reasoning it had not read. The names were a genuine clue
+and the conclusion still did not follow. The item was filed, scored a quick win, merged, and was
+carrying a prescription to weaken a guard for about two hours.
 
 ### Not taken here
 
-Quarantining the two probes was considered and refused by the owner on 2026-09-08. Skipping them would stop the evictions immediately but would remove a connection-scaling guard, and a real regression in that area would then land unnoticed. The slower fix keeps the coverage.
+Quarantining the two probes was considered and refused by the owner on 2026-09-08. That decision
+stands and is unaffected by this retraction: skipping them would stop the evictions and remove a
+connection-scaling guard.
 
 ## 1448. a dispatched brief is frozen at spawn: the chip cannot be corrected and nothing tells the receiver it has drifted
 
