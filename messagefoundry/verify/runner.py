@@ -240,28 +240,18 @@ def run_verify(
                 smoke_self(config_dir, inbound=inbound, snapshot_on_send=snapshot_on_send)
             )
         elif smoke_mode == "live":
-            try:
-                msg = synthetic_message()
-            except Exception as exc:
-                results.append(
-                    CheckResult(
-                        "smoke.live",
-                        "Live smoke (MLLP + ACK)",
-                        Status.ERROR,
-                        f"could not generate a synthetic message: {exc}",
-                    )
-                )
-            else:
-                results += _run_live_smoke(
-                    msg,
-                    host=engine_host,
-                    port=mllp_port,
-                    settings=settings,
-                    check_disposition=check_disposition,
-                    disposition_timeout=disposition_timeout,
-                    smoke_tls=smoke_tls,
-                    smoke_tls_ca=smoke_tls_ca,
-                )
+            # synthetic_message() is a module constant since #1192, so there is no generator step
+            # left to fail here.
+            results += _run_live_smoke(
+                synthetic_message(),
+                host=engine_host,
+                port=mllp_port,
+                settings=settings,
+                check_disposition=check_disposition,
+                disposition_timeout=disposition_timeout,
+                smoke_tls=smoke_tls,
+                smoke_tls_ca=smoke_tls_ca,
+            )
         # smoke_mode == "none": nothing to run
 
     if "federation" in selected:

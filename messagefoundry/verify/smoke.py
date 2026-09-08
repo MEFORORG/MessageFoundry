@@ -10,14 +10,15 @@
 * store     — open the configured store backend and confirm it connects (no writes beyond the
   idempotent schema-ensure ``open_store`` already does).
 
-Synthetic HL7 only (the engine's own generators) — never real PHI.
+Synthetic HL7 only — never real PHI. The smoke message is inlined below rather than generated, so
+the verifier never imports ``messagefoundry.generators`` (BACKLOG #1192 / ASVS 15.2.3).
 """
 
 from __future__ import annotations
 
-import importlib
 import socket
 import ssl
+from typing import Final
 
 from messagefoundry.config.settings import StoreSettings
 from messagefoundry.config.tls_policy import (
@@ -27,13 +28,48 @@ from messagefoundry.config.tls_policy import (
 )
 from messagefoundry.verify.model import CheckResult, Status
 
+#: The smoke message, segment by segment.
+#:
+#: **Why it is a literal.** The deployment verifier is the one tool an operator runs on a real box,
+#: so anything it imports is functionality that install is required to carry. Generating the message
+#: pulled the whole ``messagefoundry.generators`` package — development tooling — into the verifier's
+#: runtime dependency set. Inlining removes that edge. Nothing else under ``messagefoundry/verify/``
+#: touches the generators, and ``tests/test_verify.py`` pins that.
+#:
+#: **Where it came from.** ``generate_message("ADT", "A01", 0)`` from the engine's own ADT generator
+#: at ``744a7a434``, verbatim, except that every person name was replaced with the ``ZZZTEST`` family
+#: so an operator who finds this message in their own store reads it as a probe rather than a
+#: patient. The edited form was re-checked through the generator's compliance gate and hl7apy strict
+#: validation at 2.5.1 before being pasted here, and ``tests/test_verify.py`` re-runs that validation
+#: on every test run — so the literal cannot rot into a non-conformant message unnoticed.
+#:
+#: Every value is fabricated: the demographics come from the generator's synthetic pools, the phone
+#: sits in the reserved 555-01xx fictional range, and MSH-10 carries the tool's own ``MEFOR`` prefix.
+#: No real PHI (CLAUDE.md section 9).
+_SYNTHETIC_ADT_A01_SEGMENTS: Final[tuple[str, ...]] = (
+    r"MSH|^~\&|ADT|MAINHOSP|PHARMACY|MAINHOSP|20260202114200||ADT^A01^ADT_A01"
+    r"|MEFORADTA0100000|P|2.5.1",
+    "EVN|A01|20260202114200||||20260202114200",
+    "PID|1||6824181^^^HOSP^MR||ZZZTEST^SYNTHETIC^C||20081018|U|||"
+    "26 HILLCREST AVE^^CLAYTON^MO^63105^USA||(834)555-0120|||||V2167387^^^HOSP^AN",
+    "NK1|1|ZZZTEST^KINONE|CHD^Child^HL70063",
+    "NK1|2|ZZZTEST^KINTWO|FND^Friend^HL70063",
+    "PV1|1|R|MATERNITY^412^B^SOUTH||||1008^ZZZTEST^PROVONE|||URO|||||||1006^ZZZTEST^PROVTWO"
+    "||V2167387^^^HOSP^VN|||||||||||||||||||||||||20260202114200",
+    "PV2|||R07.9^Chest pain unspecified^I10",
+    "DB1|1|PT",
+    "DB1|2|PT",
+    "OBX|1|NM|8302-2^Body height^LN||170|cm|||||F",
+    "AL1|1|DA^Drug allergy^HL70127|SULFA^Sulfa drugs^L|MO",
+)
+
+#: ``\r``-delimited with a trailing ``\r``, the form the generator emits and an MLLP frame carries.
+SYNTHETIC_ADT_A01: Final[str] = "\r".join(_SYNTHETIC_ADT_A01_SEGMENTS) + "\r"
+
 
 def synthetic_message() -> str:
-    """One conformant synthetic ADT^A01 (no PHI) from the engine's generators."""
-    importlib.import_module("messagefoundry.generators.all_types")  # registers built-in types
-    from messagefoundry.generators import _core
-
-    return _core.generate_message("ADT", "A01", 0)
+    """One conformant synthetic ADT^A01 (no PHI). See :data:`SYNTHETIC_ADT_A01`."""
+    return SYNTHETIC_ADT_A01
 
 
 def smoke_self(
@@ -67,15 +103,7 @@ def smoke_self(
             Status.FAIL,
             f"config failed to load: {exc}",
         )
-    try:
-        msg = synthetic_message()
-    except Exception as exc:  # generator failure is a tool/install problem
-        return CheckResult(
-            "smoke.self",
-            "Self smoke (dry-run routing)",
-            Status.ERROR,
-            f"could not generate a synthetic message: {exc}",
-        )
+    msg = synthetic_message()  # a module constant since #1192 — cannot fail
     try:
         result = dry_run(reg, msg, inbound=inbound, snapshot_on_send=snapshot_on_send)
     except ValueError as exc:  # ambiguous/unknown inbound

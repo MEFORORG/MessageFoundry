@@ -86,14 +86,22 @@ PHI_FIELDS: dict[type[BaseModel], dict[str, Permission]] = {
 
 #: Properties whose *authorized* value is still display-masked until a reveal act (ASVS 14.2.6).
 #: Authorization and reveal are two different decisions: permission says the caller MAY see the
-#: value, a reveal says they asked for THIS one. Only ``summary`` today, which is the subject that
-#: was allocated.
+#: value, a reveal says they asked for THIS one.
 #:
-#: **``metadata`` carries the same ingest-derived MRN/patient-name PHI** (see ``PHI_FIELDS`` above)
-#: and is the obvious next candidate — named here rather than silently included or silently left
-#: out, because masking one field while the same identifiers return complete one field over is a
-#: partial control that reads as a whole one.
-MASKED_UNTIL_REVEALED: frozenset[str] = frozenset({"summary"})
+#: **``metadata`` joined ``summary`` here under BACKLOG #1187.** This comment used to name it
+#: "the obvious next candidate" and leave it out, on the stated grounds that masking one field
+#: while the same identifiers return complete one field over is a partial control that reads as
+#: a whole one. That was an accurate description of the gap, so the gap is closed rather than
+#: re-described: ``PHI_FIELDS`` above rates ``metadata`` on the same view_summary tier for the
+#: same ingest-derived MRN/patient-name reason, and every list surface returned it complete on
+#: each row while ``summary`` beside it was masked.
+#:
+#: ``mask_for_display`` reads the composed-summary grammar, which ``metadata`` does not follow --
+#: its values are code- and operator-attached and its mechanism is still TBD. That is handled
+#: rather than overlooked: an unrecognized part is masked WHOLE, so an unknown shape degrades to
+#: the fixed-width mask rather than being passed through. Fail-closed is the right direction for
+#: a field whose grammar is not yet fixed, and the detail route's reveal still returns it whole.
+MASKED_UNTIL_REVEALED: frozenset[str] = frozenset({"summary", "metadata"})
 
 #: What a masked run is replaced with. ASCII on purpose (the no-glyph rule), and a fixed width so
 #: the mask never leaks the length of what it hides.
