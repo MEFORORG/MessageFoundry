@@ -37,7 +37,20 @@ concurrency:
   # gets a SEPARATE group (…-nightly): without this it would share `ci-refs/heads/main` with push-to-main
   # and a routine daytime push would cancel-in-progress the in-flight nightly LOAD run — silently killing
   # the very long-running coverage the cron exists to provide. Scheduled and push runs no longer collide.
-  group: ci-${{ github.ref }}${{ github.event_name == 'schedule' && '-nightly' || '' }}
+  # The PUSH arm gets its own group too, keyed on the commit, for the SAME reason the nightly does.
+  # Without it every push to main shares `ci-refs/heads/main`, so each merge cancel-in-progress'd the
+  # PREVIOUS merge's validation run. Measured 2026-09-07: of 163 push-event runs since 2026-09-01,
+  # 85 concluded `cancelled` -- more than half of all merges. That is not a cosmetic loss. `repo
+  # harness tests` and `ide build` are the only two jobs with NO merge_group arm and no schedule arm,
+  # so the push run is the ONLY place they execute; this file already calls that arm the SAFETY NET
+  # and says of it: "Set this false and the tier is effectively unguarded against everything except
+  # its own edits." Cancelling it has the same effect as switching it off, on 52 percent of merges,
+  # and a cancellation reports nothing.
+  #
+  # Pull requests are deliberately NOT changed: cancelling a superseded PR run is where
+  # cancel-in-progress earns its keep, because a new push to the branch supersedes the old answer.
+  # A push to main supersedes nothing -- each commit is a distinct tree that nothing else validates.
+  group: ci-${{ github.ref }}${{ github.event_name == 'schedule' && '-nightly' || '' }}${{ github.event_name == 'push' && format('-{0}', github.sha) || '' }}
   cancel-in-progress: true
 
 # Least privilege: every job here only reads the repo and runs tests/builds (no gh writes, no git push,
