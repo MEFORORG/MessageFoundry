@@ -967,18 +967,22 @@ jobs:
   # tests/test_security_posture.py exists to prevent.
   #
   # THE `github.event_name == 'push'` ARM IN THE FOUR GATED STEPS BELOW IS NOW DEAD, AND IS KEPT ON
-  # PURPOSE. Each reads `code == 'true' || push || workflow_dispatch`; the push arm can no longer be
-  # true here, but the other two still can, so no step is orphaned. Deleting the dead arm would mean
-  # removing this job-level `if:` no longer restores the old behaviour, with nothing to say so.
+  # PURPOSE. Each reads `code == 'true' || push || workflow_dispatch || merge_group`; the push arm can
+  # no longer be true here, but the other three still can, so no step is orphaned. Deleting the dead arm
+  # would mean removing this job-level `if:` no longer restores the old behaviour, with nothing to say
+  # so.
   #
-  # MERGE-QUEUE COVERAGE NOW RESTS ON A FALL-THROUGH -- READ THIS BEFORE EDITING `changes`. These steps
-  # carry no `merge_group` arm of their own, unlike `test`'s, which spell one out. They run in the
-  # queue because `changes` has no merge_group arm either: the event falls through to the pull_request
-  # branch, `github.event.pull_request.base.sha` is empty, the diff comes back empty, and the
-  # `-z "$changed"` case sets `code=true`. Give `changes` a merge_group arm that sets `code=false` and
-  # this job stops running in the queue AS WELL as on push, leaving the PR as its only coverage. That
-  # was proposed once (PR 710, closed unmerged); if it returns, add the explicit merge_group arm to the
-  # four gated steps below in the same change.
+  # MERGE-QUEUE COVERAGE IS EXPLICIT, NOT INCIDENTAL -- READ THIS BEFORE EDITING `changes`. The four
+  # gated steps below each carry a `merge_group` arm, spelled the way `test`'s eight are. That arm is
+  # BEHAVIOUR-NEUTRAL as the file stands: `changes` has no merge_group arm, so a queue entry falls
+  # through to its pull_request branch, `github.event.pull_request.base.sha` is empty, the diff comes
+  # back empty, and the `-z "$changed"` case already sets `code=true`. The arm exists so that
+  # fall-through stops being the SOLE path. With `push` gated off at the job level above, the queue is
+  # this job's only look at a tree before it lands, and giving `changes` a merge_group arm that sets
+  # `code=false` -- proposed once as PR 710, closed unmerged -- would otherwise have stopped this job
+  # running there, leaving the PR as its only coverage, with nothing reporting the loss. Commit
+  # 080fb235b armed `test` and the five heavy legs this way and named seven gates it left untouched --
+  # four of them this job's, on the grounds that none backs a required context. Those four are these.
   webconsole:
     name: web console tests (${{ matrix.os }}, py${{ matrix.python-version }})
     # See "NO PUSH-TO-MAIN ARM" above. Deliberately NOT a `needs.changes.outputs.code` gate -- the
@@ -1006,7 +1010,7 @@ jobs:
           python-version: ${{ matrix.python-version }}
 
       - name: Install Qt offscreen system libraries
-        if: (needs.changes.outputs.code == 'true' || github.event_name == 'push' || github.event_name == 'workflow_dispatch') && runner.os == 'Linux'
+        if: (needs.changes.outputs.code == 'true' || github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event_name == 'merge_group') && runner.os == 'Linux'
         # BOUNDED AND RETRIED. Unguarded, this step turns an external apt-mirror hiccup into a
         # blocked merge queue: measured 2026-08-18, three hangs across two attempts on three
         # different jobs, one of them 27+ minutes on `test (ubuntu-latest, py3.14)` -- a REQUIRED
@@ -1028,7 +1032,7 @@ jobs:
           exit 1
 
       - name: Set up uv
-        if: needs.changes.outputs.code == 'true' || github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+        if: needs.changes.outputs.code == 'true' || github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event_name == 'merge_group'
         uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
         with:
           cache-dependency-glob: |
@@ -1040,7 +1044,7 @@ jobs:
       # console-only set) means the two jobs cannot drift into testing different resolutions of the same
       # lock. It also shares the uv cache entry -- same key, already warm from the sibling job.
       - name: Install project (dev + console + fhir + dicom + x12 + xml extras)
-        if: needs.changes.outputs.code == 'true' || github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+        if: needs.changes.outputs.code == 'true' || github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event_name == 'merge_group'
         run: |
           uv pip install --system --constraint constraints.lock -e ".[dev,harness,fhir,dicom,x12,xml,webauthn]" -e packaging/messagefoundry-webconsole
 
@@ -1060,7 +1064,7 @@ jobs:
       # Adding workers would spend the contention risk the -n 8 trial measured to buy nothing.
       - name: Web console tests (pytest)
         id: webconsole
-        if: needs.changes.outputs.code == 'true' || github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+        if: needs.changes.outputs.code == 'true' || github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event_name == 'merge_group'
         timeout-minutes: ${{ matrix.webconsole_step_timeout }}
         env:
           QT_QPA_PLATFORM: offscreen
