@@ -77,6 +77,16 @@ concurrency:
   # are never superseded, never cancelled. This file is the repository's second-largest consumer of
   # runner minutes, so leaving seven superseded jobs alive per re-push was the costliest instance of
   # the gap. Nothing here is a required context, so a cancelled run gates nothing.
+  #
+  # THIS BUYS A KNOWN SPURIOUS RED ON `liveness`, RECORDED SO THE NEXT READER DOES NOT CHASE IT AS A
+  # REGRESSION. scripts/quality/liveness.py already names the mechanism: a run cancelled while a
+  # measurement job is mid-flight DOES reach that job's `always()` record step, so it leaves a
+  # receipt, and a receipt plus a non-success result is reported as a dead gate rather than excused.
+  # Until this block existed, only a manual run-level cancel could produce that here; now a fast
+  # second push can. The file judged that trade already -- "the cost is a spurious red on an ADVISORY
+  # gate, which is the right side to err on" -- and `liveness` is advisory and gates nothing, so the
+  # judgement carries over unchanged. It is a false RED, which is visible and gets investigated,
+  # never a false green.
   group: quality-advisory-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
@@ -230,6 +240,25 @@ jobs:
     # ~21k-LOC store-backend parity (store/sqlserver.py + store/postgres.py = deliberate T-SQL vs Postgres
     # dialect duplication, whitelisted in the rubric) is ignored so it does not drown the real signal.
     name: clone detection (advisory)
+    # OFF PULL REQUESTS, ON THE NIGHTLY CRON AND ON DISPATCH. Nothing in this file gates a merge (its
+    # analysis steps are `continue-on-error` and .github/required-contexts.txt records that no job
+    # here may ever be promoted), and this account runs about 25 slots' worth of demand against 20
+    # concurrent runners -- so an advisory job on every pull request is paid for in evicted merge
+    # queue entries. The scan is not removed; it moves to the cron, which is where a whole-repo
+    # duplication report belongs anyway.
+    #
+    # SAFE TO SKIP HERE AND NOT IN ITS FOUR SIBLINGS, and the difference is the whole reason this
+    # change gates two jobs rather than the five originally proposed:
+    #   * this job reads NO base ref and has NO step gated on `github.event_name == 'pull_request'`,
+    #     so nothing inside it becomes unreachable when the job stops running on pull requests;
+    #   * it carries no recorded decision to run on pull requests -- `complexity`, `mutation` and
+    #     `verdict-divergence` each do, in their own headers, and those are left alone;
+    #   * `liveness` lists this job in `needs:` and tolerates the skip: scripts/quality/liveness.py
+    #     excuses a job whose result is in `_DID_NOT_RUN` AND that emitted no receipt, and a job
+    #     skipped by this `if:` is exactly that shape. Its own comment names the case ("coverage is
+    #     PR-only"). The excuse is conditional on the MISSING RECEIPT, so this does not re-open the
+    #     silent-gate hole #1410 closed -- a job that never started cannot have written one.
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -814,6 +843,32 @@ jobs:
     # introduced by editing PROSE, and the pytest tier that holds this tool's unit test is skipped on
     # a documentation-only pull request. This job runs on all of them.
     name: dangling backlog citations (advisory)
+    # OFF PULL REQUESTS, ON THE NIGHTLY CRON AND ON DISPATCH -- see the `clone` job above for the
+    # slot-pressure reasoning, which is the same here and stated once.
+    #
+    # THE PARAGRAPH DIRECTLY ABOVE THIS ONE RESTS ON A PREMISE THAT IS NO LONGER TRUE, and that is
+    # why this job in particular can move while `verdict-divergence` below it cannot. It argues the
+    # job is worth running on every pull request because "the pytest tier that holds this tool's unit
+    # test is skipped on a documentation-only pull request". That was true when it was written. It is
+    # false now, twice over:
+    #   * ci.yml's `tooling` path filter matches `^docs/` and is deliberately NOT gated on `code` --
+    #     the filter says so in place -- so the tier runs on a documentation-only pull request,
+    #     narrowed to the ubuntu leg;
+    #   * ci.yml's ungated doc-guards step names tests/test_dangling_citation_check.py outright, and
+    #     that step exists precisely FOR the documentation-only shape.
+    #
+    # AND THE HARD FINDING IS ALREADY CAUGHT PRE-MERGE, MORE STRICTLY THAN HERE.
+    # tests/test_dangling_citation_check.py::test_no_docs_citation_names_a_number_that_can_still_be_issued
+    # walks the same population this job scans (docs/**/*.md) and ASSERTS it is empty, where this job
+    # runs `--advisory` and only reports. That test is tests/tooling_manifest.txt:99, so it runs in
+    # ci.yml's `tooling` job, which is a `needs:` of `ci-gate` -- a REQUIRED context. A live-shape
+    # citation therefore still fails a required check on every pull request.
+    #
+    # WHAT MOVES TO THE CRON IS THE TRIAGE REPORT, NOT THE GATE: the step summary additionally lists
+    # below-floor numbers and PR/issue/foreign-repo references, which the test does not rule on
+    # because they are not defects. That is a report for a human to read, and a day's latency on it
+    # costs nothing that the required test does not already hold.
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     permissions:
       contents: read
