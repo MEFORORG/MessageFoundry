@@ -1,147 +1,221 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 MessageFoundry Organization and contributors
+#Requires -Version 7.0
 <#
 .SYNOPSIS
-    Inject this worktree's role card at session start.
+    SessionStart hook. Injects this worktree's role card, or stays silent.
 
 .DESCRIPTION
-    A SessionStart hook. It reads the seat this WORKTREE holds, finds that seat's card under
-    docs/roles/, and hands it to the starting session.
+    WHAT THIS EXISTS FOR. A session is told its seat in its first message. That instruction is an
+    ordinary user turn: it competes with everything else in the context and it does not survive a
+    compaction. This hook binds the seat to the WORKTREE instead. Sessions come and go inside a
+    worktree; the marker survives a crash, a compaction, an account switch and a respawn.
 
-    WHY THIS EXISTS. A session is told its role in its first message. That works for the
-    conversation and dies with it. Measured 2026-09-05 across the live seats directory:
+    RESOLUTION ORDER, HIGHEST FIRST.
 
-        subagent boxes            25 records,  25 carry a role  (100%)
-        worktree sessions        968 records, 145 carry a role  (14%)
-        worktree, last 7 days    380 records,  49 carry a role  (12%)
+      1. .claude/seat.local.txt in the worktree root
+      2. $env:KORUS_SEAT
+      3. Nothing. No card is injected and the command that sets the marker is printed.
 
-    Subagents reach 100% because the Agent tool writes the seat mechanically. Worktree sessions
-    sit at 12% because a person says it out loud. The gap is not effort; it is who writes it. The
-    same records held 46 distinct strings for a six-seat roster, including eight spellings of
-    Builder, so the label is normalised through docs/roles/seats.json rather than trusted.
+    IT NEVER GUESSES FROM A BRANCH OR DIRECTORY NAME, and that omission is deliberate rather than
+    unfinished. A worktree name is a creation-time label that nothing keeps current. This
+    repository has one right now whose name describes a question its session answered in the first
+    two minutes. A card is injected at the weight of the working agreement, so a WRONG card
+    outranks the thing the session should have been reading. Silence costs one printed line; a
+    wrong card costs a session that confidently follows another seat's rules.
+    `TheHookNeverGuessesASeat` in tests/test_role_cards.py pins both the behaviour and the absence
+    of any branch read in this source.
 
-    IT NEVER GUESSES. Resolution stops at silence, never at a derived label:
+    IT NEVER FAILS A TURN. Every path exits 0, as the other hooks here do. A hook that can break a
+    session is a worse fault than an undeclared seat, and this one runs in every worktree.
 
-        1. .claude/seat in the worktree root
-        2. $env:MEFOR_SEAT
-        3. nothing -- print the command that sets it, inject no card
+    WHY THE MARKER CANNOT RIDE INTO A COMMIT. This repository's .gitignore carries `/.claude/*`
+    with ONE negation, `!/.claude/settings.json`, and the comment above that negation warns that a
+    second one would expose nested checkouts carrying `.venv` and the local database. So the marker
+    and the injected copy are ignored by the wildcard, and NOTHING here should be added to make
+    them so. Measured with `git check-ignore -v`, and pinned by `TheMarkerCannotRideIntoACommit`.
 
-    A branch or directory name is deliberately NOT a rung. CLAUDE.md section 5 records that a
-    worktree name is a creation-time label nothing keeps current, and that one is known to
-    describe work its session never did. A wrong card injected at CLAUDE.md weight is worse than
-    no card, so the silent path is the safe one. tests/test_role_cards.py pins that negative.
+    THE IGNORE RULE IS INVERTED FROM KORUS, where this hook came from. There `.claude/` is
+    deliberately TRACKED and machine-local files are named `.local.`. Do not carry that reasoning
+    across; the outcome matches and the reason does not.
 
-    THIS HOOK MUST NEVER FAIL THE TURN. It exits 0 on every path, exactly as seat-record.ps1 and
-    seat-declare-prompt.ps1 do. A hook that can break a session is a worse fault than an
-    undeclared seat, and this one runs in every worktree of a repo with a live fleet in it.
-
-.NOTES
-    Wired at SessionStart beside seat-declare-prompt.ps1. That hook asks for the GOAL, which no
-    machine can write; this one supplies the ROLE, which one can. They are complements.
+.PARAMETER WorktreeRoot
+    The worktree to resolve the seat for. Defaults to the current directory. Tests pass a
+    temporary root; a real session never passes this.
 #>
 
 [CmdletBinding()]
 param(
-    # The worktree to read. Normally derived from the invocation directory; the parameter exists
-    # so the tests can drive a tmp_path without a real session.
-    [string]$Worktree
+    [string] $WorktreeRoot = $PWD.Path
 )
 
-$ErrorActionPreference = 'Continue'
+Set-StrictMode -Version Latest
+$ErrorActionPreference = 'Stop'
 
-# Everything below is wrapped. See the header: this hook never fails a turn.
+# The hook reads stdin because the harness sends a JSON payload. Nothing here needs it, but a hook
+# that leaves stdin unread can make the caller block on the write.
+try { $null = [Console]::In.ReadToEnd() } catch { }
+
+$MarkerRelPath = '.claude/seat.local.txt'
+$RoleCopyRelPath = '.claude/ROLE.local.md'
+
+function Write-Note {
+    param([string] $Text)
+    # Plain stdout. See "the one thing not proven" in docs/ROLE-CARDS.md: whether a hook wired in
+    # a project's own settings can emit hookSpecificOutput.additionalContext is UNTESTED here, and
+    # plain stdout is the shape this repository has actually exercised at SessionStart.
+    Write-Output $Text
+}
+
 try {
-    if (-not $Worktree) { $Worktree = (Get-Location).Path }
-    $repo = Split-Path (Split-Path $PSScriptRoot -Parent) -Parent
-    $rolesDir = Join-Path $repo 'docs\roles'
-    $seatsJson = Join-Path $rolesDir 'seats.json'
+    $repoRoot = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
+    $seatsPath = Join-Path $repoRoot 'docs/roles/seats.json'
 
-    $setCmd = "Set-Content .claude\seat '<seat>'"
-
-    if (-not (Test-Path -LiteralPath $seatsJson)) {
-        Write-Output "[role] docs/roles/seats.json is missing from this checkout -- no card injected."
+    if (-not (Test-Path -LiteralPath $seatsPath)) {
+        Write-Note "[role-card] No roster at docs/roles/seats.json, so no card was injected."
         exit 0
     }
-    $seats = Get-Content -LiteralPath $seatsJson -Raw -Encoding UTF8 | ConvertFrom-Json
 
-    # --- Resolve the seat. Rungs in order; each falls through only on an EMPTY result. ---------
-    $raw = ''
-    $source = ''
+    $seats = Get-Content -LiteralPath $seatsPath -Raw | ConvertFrom-Json
 
-    $marker = Join-Path $Worktree '.claude\seat'
-    if (Test-Path -LiteralPath $marker) {
-        $raw = (Get-Content -LiteralPath $marker -Raw -Encoding UTF8)
-        $source = '.claude/seat'
-    }
-    if (-not $raw.Trim() -and $env:MEFOR_SEAT) {
-        $raw = $env:MEFOR_SEAT
-        $source = 'MEFOR_SEAT'
+    # ---------------------------------------------------------------- resolve the declared label
+    $raw = $null
+    $source = $null
+
+    $markerPath = Join-Path $WorktreeRoot $MarkerRelPath
+    if (Test-Path -LiteralPath $markerPath) {
+        $raw = (Get-Content -LiteralPath $markerPath -Raw -ErrorAction SilentlyContinue)
+        $source = $MarkerRelPath
     }
 
-    # Strip control characters before matching, so a mangled marker resolves to nothing rather
-    # than throwing. It is one line of a file anybody can edit by hand.
-    $key = ($raw -replace '[^\x20-\x7E]', '').Trim().ToLowerInvariant()
+    if ([string]::IsNullOrWhiteSpace($raw) -and $env:KORUS_SEAT) {
+        $raw = $env:KORUS_SEAT
+        $source = '$env:KORUS_SEAT'
+    }
 
-    if (-not $key) {
-        Write-Output @"
-[role] This worktree has no seat, so no role card was injected. Set one and every session here
-       gets that seat's rules at session start:
+    if ([string]::IsNullOrWhiteSpace($raw)) {
+        Write-Note @"
+[role-card] NO SEAT IS DECLARED FOR THIS WORKTREE, so no role card was injected.
 
-           $setCmd
+This is silence, not a failure. Nothing guessed a seat from the branch or directory name, because
+a worktree label is a creation-time string that nothing keeps current, and a wrong card would be
+injected at the weight of CLAUDE.md.
 
-       Seats: $($seats.seats -join ', ')
+Set one, from the worktree root, and it survives every later session here:
+
+    Set-Content $MarkerRelPath 'builder'
+
+Live seats: $($seats.live -join ', ').
 "@
         exit 0
     }
 
-    # --- Retired seats are named, never resolved. -----------------------------------------------
-    $retiredNames = $seats.retired.PSObject.Properties.Name
-    if ($retiredNames -contains $key) {
-        $why = $seats.retired.$key
-        Write-Output "[role] This worktree's seat is '$key', which is retired -- $why. No card injected. Set a live seat with: $setCmd"
+    $label = $raw.Trim().ToLowerInvariant()
+
+    # ------------------------------------------------------------------------ normalise the label
+    $canonical = $null
+    if ($seats.live -contains $label) {
+        $canonical = $label
+    }
+    elseif ($seats.aliases.PSObject.Properties.Name -contains $label) {
+        $canonical = $seats.aliases.$label
+    }
+
+    # ------------------------------------------------------------- a retired seat says so, loudly
+    if (-not $canonical -and ($seats.retired.PSObject.Properties.Name -contains $label)) {
+        Write-Note @"
+[role-card] '$label' IS A RETIRED SEAT. No card was injected.
+
+$($seats.retired.$label)
+
+Its playbook stays in korus at `origin/main:roles/retired/` as the record of what the seat did. A
+document that routes work through it is stale. Set a live seat in ${source}:
+
+    Set-Content $MarkerRelPath '<seat>'
+
+Live seats: $($seats.live -join ', ').
+"@
         exit 0
     }
 
-    # --- Normalise the spelling. An unmapped string resolves to nothing. -------------------------
-    $aliasNames = $seats.aliases.PSObject.Properties.Name
-    if ($aliasNames -notcontains $key) {
-        Write-Output "[role] '$key' (from $source) is not a known seat, so no card was injected. Seats: $($seats.seats -join ', ')"
+    # ------------------------------------------- a seat that is live in korus but not in this table
+    $elsewhere = $null
+    if ($seats.PSObject.Properties.Name -contains 'elsewhere') {
+        if ($seats.elsewhere.PSObject.Properties.Name -contains $label) {
+            $elsewhere = $seats.elsewhere.$label
+        }
+    }
+    if (-not $canonical -and $elsewhere) {
+        Write-Note @"
+[role-card] '$label' IS NOT A SEAT IN THIS REPOSITORY. No card was injected.
+
+$elsewhere
+
+This is a roster difference, not a typo and not a retirement. CLAUDE.md section 5 governs the
+roster here, and it is shorter than korus's. Set a seat from this table in ${source}:
+
+    Set-Content $MarkerRelPath '<seat>'
+
+Live seats: $($seats.live -join ', ').
+"@
         exit 0
     }
-    $seat = $seats.aliases.$key
 
-    $card = Join-Path $rolesDir "$seat.card.md"
-    if (-not (Test-Path -LiteralPath $card)) {
-        Write-Output "[role] seat '$seat' resolved, but docs/roles/$seat.card.md is missing from this checkout."
+    if (-not $canonical) {
+        Write-Note @"
+[role-card] '$label' (from $source) MATCHES NO SEAT, so no card was injected and nothing was
+guessed. An unmapped label resolves to nothing on purpose.
+
+Live seats: $($seats.live -join ', ').
+If '$label' is a spelling of one of those, add it to the aliases map in docs/roles/seats.json.
+"@
         exit 0
     }
-    $text = Get-Content -LiteralPath $card -Raw -Encoding UTF8
 
-    # --- Leave a copy a COMPACTED session can re-read. ------------------------------------------
-    # .claude/ is git-ignored by contents, so this can never dirty the tree. Best effort only:
-    # a read-only or absent directory must not cost the injection.
+    # ------------------------------------------------------------------------------ read the card
+    $cardPath = Join-Path $repoRoot "docs/roles/$canonical.card.md"
+    if (-not (Test-Path -LiteralPath $cardPath)) {
+        Write-Note "[role-card] Seat '$canonical' resolved, but docs/roles/$canonical.card.md is missing. No card was injected."
+        exit 0
+    }
+
+    $card = Get-Content -LiteralPath $cardPath -Raw
+
+    # The cap is enforced by the test suite as well. It is re-checked here so a card edited in a
+    # worktree that has not run the tests cannot quietly cost every session on the machine.
+    $maxBytes = 6 * 1024
+    if ([System.Text.Encoding]::UTF8.GetByteCount($card) -gt $maxBytes) {
+        Write-Note "[role-card] docs/roles/$canonical.card.md is over the $maxBytes-byte cap, so it was NOT injected. Trim it, or the seat runs without its card."
+        exit 0
+    }
+
+    # ------------------------------------------- leave a copy a compacted session can re-read
     try {
-        $dotClaude = Join-Path $Worktree '.claude'
-        if (-not (Test-Path -LiteralPath $dotClaude)) {
-            New-Item -ItemType Directory -Path $dotClaude -Force | Out-Null
+        $copyPath = Join-Path $WorktreeRoot $RoleCopyRelPath
+        $copyDir = Split-Path -Parent $copyPath
+        if (-not (Test-Path -LiteralPath $copyDir)) {
+            $null = New-Item -ItemType Directory -Path $copyDir -Force
         }
-        Set-Content -LiteralPath (Join-Path $dotClaude 'ROLE.md') -Value $text -Encoding UTF8
-    } catch { }
-
-    # --- Emit. -----------------------------------------------------------------------------------
-    # additionalContext is the form that renders at CLAUDE.md weight. Plain stdout is the proven
-    # fallback -- seat-declare-prompt.ps1 has always reached sessions that way -- so a harness
-    # that ignores the JSON still delivers the card, just framed as hook output.
-    $payload = [ordered]@{
-        hookSpecificOutput = [ordered]@{
-            hookEventName    = 'SessionStart'
-            additionalContext = $text
-        }
+        Set-Content -LiteralPath $copyPath -Value $card -Encoding utf8NoBOM
     }
-    Write-Output ($payload | ConvertTo-Json -Depth 5 -Compress)
-} catch {
-    # Deliberately swallowed. See the header: this hook never fails a turn.
-    Write-Output "[role] role card injection could not run: $($_.Exception.Message)"
-}
+    catch {
+        # Writing the copy is a convenience. Failing it must not cost the session its card.
+        Write-Note "[role-card] Could not write $RoleCopyRelPath ($($_.Exception.Message)). The card below is still in effect."
+    }
 
-exit 0
+    Write-Note @"
+[role-card] SEAT: $canonical (resolved from $source)
+
+The card below carries the rules for this seat. It is a SUMMARY: CLAUDE.md's seat table governs and
+the long playbook is named at the end of the card. A copy is at $RoleCopyRelPath, so it can be
+re-read after a compaction.
+
+$card
+"@
+    exit 0
+}
+catch {
+    # Never fail a turn. An undeclared seat is a smaller fault than a session that cannot start.
+    Write-Output "[role-card] The role-card hook failed and was skipped: $($_.Exception.Message)"
+    exit 0
+}

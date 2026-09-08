@@ -25100,6 +25100,67 @@ A PAR client on the relying-party side: POST the authorization parameters to the
 ### Not done here
 
 This row was **filed, not built**. Nobody has read the pinned requirement text against `flow.py` for this row's purposes, and no provider-support survey was run. The `na` ruling above is reported as the routing fact that makes this row necessary; this row does not re-derive it and does not depend on it being correct.
+## 1481. A scoped secret scan can walk zero commits and pass; nothing asserts the range is non-empty
+
+> 🔢 **Filed 2026-09-07 -- not started. FILED ONLY: nothing here is fixed on this branch.** Value **6/10** · Difficulty **2/10** · _quick win_. #1479 scopes the required `gitleaks (secret scan)` job with `--log-opts`. A range is a thing that can resolve EMPTY, and an empty range makes the scanner report `0 commits scanned` and exit **0** -- a PASS, indistinguishable in the checks UI from a clean scan, on a required secret gate. The shipped range is a literal and is measured safe; this row is about the next edit to it.
+> Verdict: build
+> Research: none
+> Closing-act: code
+
+**Cluster:** CI merge gates / instrument honesty. **Priority:** P3. **Verdict:** build.
+**Severity:** no deployment axis (sec. 0). Nothing here is engine behaviour, a shipped artifact, or PHI. The cost is a required secret gate that could report success having looked at nothing.
+
+**Measured 2026-09-07 on the pinned gitleaks 8.18.4 binary** -- the version `.github/workflows/security.yml` installs, downloaded from the release and version-checked, not a local build.
+
+### The hazard, demonstrated
+
+| invocation | reported | exit |
+|---|---|---|
+| `--log-opts HEAD` (what #1479 ships) | `2 commits scanned` | 1, planted secret caught |
+| `--log-opts HEAD..HEAD` (an empty range) | `0 commits scanned` | **0** |
+| no `--log-opts` (the pre-#1479 default) | `2 commits scanned` | 1 |
+
+**`0 commits scanned` and exit 0 is a green tick.** Nothing downstream distinguishes it from a clean scan, and a gate that cannot tell *found nothing* from *looked at nothing* is the same defect class the negative-control registry exists for.
+
+### The shipped range is safe, and that is why this is P3 rather than P1
+
+`--log-opts HEAD` is a **literal**, not built from a base SHA, a head ref or a pull-request number. Measured on a merge-commit HEAD shaped like a merge-queue commit (two parents): `2 commits scanned`, planted secret caught, exit 1. So it cannot resolve empty on any of the workflow's five triggers.
+
+**This row is about the NEXT edit.** The moment someone makes the range event-aware -- which #1479's own comment explains was declined only because three of five triggers carry no base SHA -- the range acquires the ability to be empty, and on the trigger where the base is unpopulated it silently will be.
+
+### The fix: read the scanner's own report, never recompute its subject
+
+**A check that recomputes its subject rather than reading the subject's own report is not a check.** That is the whole of this row, and it decides the implementation before any of the detail below.
+
+Assert the scan **walked something**, by reading the count the scanner itself printed:
+
+```
+grep -qE '(^|[^0-9])[1-9][0-9]* commits scanned' gitleaks-scan.log
+```
+
+Verified against real 8.18.4 output on four cases -- clean+scoped, empty range, unscoped, and a run carrying a finding: it fires on exactly the empty-range case and passes the other three. The count line is present even when findings are reported, so the guard does not depend on a clean run.
+
+**Do NOT implement this with `git rev-list --count <range>`.** That is a second copy of the range, free to agree today and drift tomorrow, and to go on passing after the flag it guards has changed -- which is precisely the second-definition defect #1479 removed from this job's own header. A guard that drifts from the flag it guards keeps passing, which is the exact failure it was written to prevent. The scanner's own count cannot drift from what the scanner did.
+
+### The pipefail half, and the shortcut that must not be taken
+
+Capturing the count needs the scan piped through `tee`, and a pipe swallows the exit code that matters. GitHub's default `run:` shell is `bash -e {0}` -- **`-e` without `pipefail`** -- so a findings-exit of 1 would be discarded by the pipe and this required gate would report success. Same vacuous-pass class, one layer down, so `set -o pipefail` must land in the same change. Verified: the scan step declares no `shell:`, so it takes that default.
+
+**THE SHORTCUT IS `shell: bash`, AND IT IS THE WRONG FIX.** Naming the shell explicitly makes GitHub substitute `bash --noprofile --norc -eo pipefail {0}` instead of the bare default -- so the step would **silently acquire pipefail as a side effect of naming a shell it was already using**. Reject it. A reader seeing `shell: bash` cannot tell that error semantics changed, and a later edit removing it as redundant re-introduces the defect while looking like a cleanup. That is the same hidden-mechanism hazard this row is about, one layer further down again.
+
+The repository already agrees, measured 2026-09-07 over `.github/workflows/*.yml`: **12 workflows set `pipefail` explicitly; 3 files use `shell: bash` at all.** Explicit is both the local idiom and the legible one.
+
+### Add a control, or the guard is deletable in silence
+
+`tests/negative_controls.toml` registers two controls for this context under #1479. A third belongs here: the guard step must exist and must be asserted to fire, or it becomes decoration that a later edit removes without anything going red.
+
+### Provenance
+
+Raised by a peer session reviewing #1479, which asked what the range evaluates to on a `merge_group` run and named the failure mode as a silent pass rather than a red. The same session then supplied the `shell: bash` trap above and the generalisation that leads the fix section -- both are theirs, and the row is better for them. That was the right question: #1479's stated posture was "if the merge-group run fails, that is the finding", which covers the red case and not this one. The range turned out to be safe; the hazard it pointed at is real and is filed here rather than bolted onto a green pull request that was unblocking a frozen merge queue.
+
+### Not checked
+
+I did not test a fork pull request. I did not check whether any other scanner in `.github/workflows/` can be given an empty scope -- #1479's altitude pass established that gitleaks is the only ref-walking scanner, but "can its input be made empty" is a different question from "does it walk refs", and I did not ask it of the working-tree scanners.
 
 
 ## 1483. apply.py's module docstring enumerates the evidence fields and so denies the two it carries
@@ -25132,3 +25193,41 @@ The harm path is not "a reader is mildly misinformed". It is specific and it run
 ### Closing act
 
 One docstring edit in `scripts/asvs/apply.py`, stating that the listed keys are the ones the writer ORDERS and that any other key is carried verbatim. Deliberately **no count** of the carried fields: a tally in a docstring goes stale silently, which is the same defect wearing a number.
+
+
+## 1485. docs/SECURITY.md files the built gitleaks and SBOM jobs under Planned CI additions
+
+> 🚧 **Filed 2026-09-07 -- the doc fix ships in this PR.** Value **4/10** · Difficulty **1/10** · _quick win_. The "Supply-chain & CI security" section listed the `gitleaks` secret scan and the CycloneDX SBOM build under **Planned CI additions**. Both are built, and `gitleaks (secret scan)` is a required context. The same two bullets carried three further stale claims, each independently checkable and each corrected here. Per `CLOSING_SEAT["code"]` the banner flip on merge is the LANDER's.
+> Verdict: build
+> Research: none
+> Closing-act: code
+
+**Cluster:** documentation honesty / security prose. **Priority:** P3. **Verdict:** build.
+**Severity:** no deployment axis (sec. 0). Nothing here is engine behaviour, a shipped artifact, or PHI, so no deploying site would meet it. The cost falls on a reader of the security record: they are told a built control is planned, told the wrong scope for a required gate, and told a local hook does not exist when it does.
+
+**Measured 2026-09-07** at engine `4c68c28eb`, which was `origin/main`'s tip in the same run.
+
+### Five claims, and what the tree says
+
+| the claim, as it stood | what the tree says |
+|---|---|
+| **SBOM** is a planned CI addition | `security.yml`'s `sbom` job builds CycloneDX bills of materials for the Python engine and the VS Code extension, scores them with `sbomqs`, and uploads them; the `trivy` job adds the container image. ADR 0149 and `docs/SUPPLY-CHAIN.md` document it. |
+| **Secret-history scan** is a planned CI addition | `security.yml` job `gitleaks`, `name: gitleaks (secret scan)`, and that exact string is listed in `.github/required-contexts.txt`. |
+| the scan is "Kept in CI rather than a per-author pre-commit hook" | `.pre-commit-config.yaml` pins `repo: https://github.com/gitleaks/gitleaks`, `rev: v8.18.4`, hook id `gitleaks`. Both exist. |
+| the scan runs "over the **full git history**" | BACKLOG #1479 scoped it with `--log-opts HEAD`. The reason lives once, on the scan step's own comment, and this ledger row does not restate it either. |
+| **pip-audit** and **bandit** are advisory | Both job comments read `BLOCKING`, neither declares `continue-on-error`, and both context strings are in `.github/required-contexts.txt`. |
+
+A sixth line was stale in a different direction: the section told the reader to turn **CodeQL** on through GitHub Advanced Security "on a private repo". `.github/workflows/codeql.yml` has run here for months and this repository is public, so no licence is involved. `security.yml`'s own header already records that correction.
+
+### The fix
+
+`docs/SECURITY.md` now carries one list of what CI runs, with `gitleaks` and the SBOM job in it, and no "Planned CI additions" block. It states the scan's scope **nowhere**: it names the step that holds it and stops, because a second copy of that fact is what went false last time. The section closes with a short paragraph naming what it used to say, so a reader who absorbed the old text can recognise the shape rather than be silently overwritten.
+
+### One dependent edit, and why it was not left to drift
+
+`tests/test_cutover_slug_rot.py`'s triage taxonomy cited the removed sentence by name, as a KEEP example ("a true statement about GitHub's pricing"). Removing the sentence without that edit would have left a docstring citing a line that no longer exists. The retirement is recorded in its place. The ratchet count falls 39 to 38 against a ceiling of 41; `test_the_ratchet_is_not_slack` allows up to 8 slack, so the ceiling is deliberately left alone.
+
+### Not taken here, and it is the same fact
+
+`docs/Secure_Build_Scorecard_MEFOR.md` says "gitleaks full-history" in three places (lines 31, 58 and 93), one of them the evidence for signal 5 graded **Built -- Strong**. That evidence is now overstated by exactly the scope BACKLOG #1479 removed. It is **not edited here**: that file is a dated scoring snapshot ("Scored 2026-07-14, against HEAD") whose own convention is that re-scoring is an owner act, and it already carries a precedent blockquote flagging a correction for the next re-sign rather than folding it silently. Naming the three lines is the handoff; whoever re-signs the scorecard folds them.
+
