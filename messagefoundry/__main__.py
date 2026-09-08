@@ -2288,11 +2288,12 @@ def _serve(args: argparse.Namespace) -> int:
         if not browser_hardening_enabled():
             print(
                 f"warning: {BROWSER_HARDENING_OPT_OUT_ENV} is set — the /ui browser hardening is OFF "
-                "for this run. The session and OIDC flow cookies revert to their unprefixed names "
-                "(mf_session / mf_oidc_flow), losing the browser-enforced '__Host-' host binding, and "
+                "for this run. The session and OIDC flow cookies lose the browser-enforced '__Host-' "
+                "host binding and fall back to '__Secure-mf_session' / '__Secure-mf_oidc_flow', and "
                 "the per-response nonce CSP, COOP and CSP reporting are not emitted. Transport "
-                "security is NOT downgraded: Secure is still set over https. Unset this variable to "
-                "restore the secure-by-default posture.",
+                "security is NOT downgraded: Secure is still set over https, which is what keeps the "
+                "'__Secure-' prefix writable. Unset this variable to restore the secure-by-default "
+                "posture.",
                 file=sys.stderr,
             )
 
