@@ -11,7 +11,7 @@ boundary** instead. They are a workaround for
 | | |
 |---|---|
 | [`scripts/hooks/steer-send.ps1`](../scripts/hooks/steer-send.ps1) | Run from a **second terminal**. Writes the note to `<worktree>/.claude/steer.txt`. |
-| [`scripts/hooks/steer-inject.ps1`](../scripts/hooks/steer-inject.ps1) | A `PreToolUse` hook. Reads the note, deletes it, and re-emits it as `additionalContext`. |
+| [`scripts/hooks/steer-inject.ps1`](../scripts/hooks/steer-inject.ps1) | A `PreToolUse` hook. Reads the note, deletes it, folds it, and re-emits it as `additionalContext`. |
 
 ## It is OPT-IN, and that is deliberate
 
@@ -62,6 +62,27 @@ To steer a *different* worktree than the one you are standing in, name it:
 pwsh -NoProfile -File scripts\hooks\steer-send.ps1 -ProjectDir C:\path\to\worktree "check the ACK path first"
 ```
 
+## The note cannot forge the frame it arrives in
+
+Every line of the note is prefixed `    | `, and the frame says so in its own text. Note content
+cannot reach column 0, so a line inside a note that looks like a delimiter, a system reminder, or a
+new speaker is quoting one rather than opening one. This is the same structural rule
+[`scripts/hooks/mail-drain.ps1`](../scripts/hooks/mail-drain.ps1) uses for session mail, and it is
+deliberately a rule about line structure rather than a list of forbidden strings — a denylist of
+framing tokens has to be re-proved every time the harness gains a new frame.
+
+**What it fixed** ([BACKLOG #1424](BACKLOG.md)): the note used to be interpolated whole and unfolded
+into a frame asserting the user had typed it, so one line break closed that frame and opened whatever
+came next. That is the same shape [BACKLOG #1040](BACKLOG.md) measured on the worktree gate's deny
+text, on a stronger surface — the frame being forged carries owner authority, which is the one
+authority that overrides everything else an agent has been told. The writer is anything running as
+this user on this machine, so the realistic actor is a stray process or another agent on a maintainer
+workstation. It is not a remote attacker, and the engine ships none of this.
+
+The frame also states provenance as a **claim**. A file any local process can write is not evidence
+that the operator typed anything, so the note can redirect your work and cannot stand in for the
+owner's approval.
+
 ## Notes
 
 - **The sender resolves the worktree root, never the current directory.** An earlier version wrote to
@@ -76,4 +97,12 @@ pwsh -NoProfile -File scripts\hooks\steer-send.ps1 -ProjectDir C:\path\to\worktr
 - **A note is data, not authority.** It arrives labelled as coming from the user via a side channel,
   but anything that reaches a session through a file is worth the same scrutiny as any other input —
   it does not carry more authority than a normal prompt, and it should never be treated as approval
-  for an action that would otherwise need confirmation.
+  for an action that would otherwise need confirmation. **The injected string now says this itself**,
+  because the session reading it is not reading this page at that moment.
+- **The note is folded to one line and quoted behind `    | `.** The hook reads a file any local
+  process can write, so the note is folded to a single printable-ASCII line and every character of it
+  sits behind that prefix. Any line in the injection that does not carry the prefix was written by the
+  hook. A note cannot reach column 0, so it cannot open a second frame that would inherit the
+  provenance sentence above it (BACKLOG #1424; the same class BACKLOG #1040 closed on the deny
+  surface). A multi-line note therefore arrives as one line, and characters outside printable ASCII
+  arrive as `?`.

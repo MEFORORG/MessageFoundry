@@ -18,19 +18,51 @@ labelling the pull request is the entire point. So the fork path is open, and th
 what that costs instead of pretending it is closed: no code from the head is fetched or run, the
 token cannot modify code, and the one attacker-influenceable field is gated on an event a fork cannot
 produce.
+
+THE FILE ALSO CARRIES A COVERAGE CLAIM NOW, AND THAT IS THE SECOND HALF OF THIS SUITE (BACKLOG
+#1402). `workflow_run` watches a list of workflow NAMES. Nothing in GitHub compares that list against
+the set of workflows that gate a merge, so a newly required workflow is unwatched from the moment it
+arrives and nothing anywhere goes red. The tests below close the loop in the other direction: every
+required context must resolve to a workflow that is either watched or named as an exclusion IN THE
+WORKFLOW'S OWN HEADER, with a reason.
+
+WHAT "REQUIRED" MEANS HERE IS THE CHECKED-IN CLAIM, NOT THE SERVER, and the difference decides what a
+green run is worth. These tests read `.github/required-contexts.txt`. Branch protection lives on the
+server, so a context armed there is invisible to this file until somebody transcribes it -- and the
+instrument that reconciles the two is `scripts/ci/check_required_contexts_drift.py`, which is
+scheduled and needs `gh` auth. **This suite catches an unwatched workflow at the moment the file is
+updated; the drift checker is what makes the file trustworthy in the first place.** Neither covers
+the other, and reading this one as a server-side guard is the exact misreading that checker's own
+header was written to prevent.
 """
 
 from __future__ import annotations
 
+import functools
 import re
+from collections.abc import Iterable, Mapping
 from pathlib import Path
 
 import pytest
+
+from tests._workflow_contexts import load_workflow, required_contexts, resolve
 
 yaml = pytest.importorskip("yaml")
 
 WORKFLOWS = Path(__file__).resolve().parents[1] / ".github" / "workflows"
 FILE = WORKFLOWS / "failure-signal.yml"
+
+#: One recorded exclusion, as written in `failure-signal.yml`'s header: `# not-watched: <file> -- why`.
+#:
+#: The header's own FORMAT line spells the placeholder `<workflow file>`, which cannot match this
+#: pattern, so documenting the format does not accidentally declare an exclusion.
+#:
+#: A BROKEN PARSER FAILS IN THE SAFE DIRECTION. If this stops matching, the exclusion set comes back
+#: empty and the coverage test below goes RED over a workflow that really is excluded. It cannot go
+#: quietly green, which is the failure mode a record-parsing test has to rule out.
+_NOT_WATCHED = re.compile(
+    r"^#\s*not-watched:\s*(?P<file>[A-Za-z0-9_.-]+\.yml)\s+--\s+(?P<reason>\S.*?)\s*$", re.M
+)
 
 
 def _doc() -> dict:
@@ -72,6 +104,94 @@ def _run_block(step_id: str) -> str:
     step = _step(step_id)
     assert "run" in step, f"step {step_id!r} has no `run:` body to inspect"
     return str(step["run"])
+
+
+# The four readers below are memoised. Each re-reads files that do not change during a run, and the
+# coverage tests call them repeatedly; uncached, this module cost 10.5s instead of 0.4s. Treat every
+# return as READ-ONLY -- the one test that varies them copies first.
+@functools.cache
+def _watched_names() -> frozenset[str]:
+    """The workflow NAMES this file's `workflow_run` trigger observes."""
+    watched = frozenset(_on(_doc())["workflow_run"]["workflows"])
+    assert watched, "the watch list is empty, so every assertion built on it would pass vacuously"
+    return watched
+
+
+@functools.cache
+def _workflow_names() -> dict[str, str]:
+    """Every workflow file here -> the `name:` it reports under. Unnamed files are omitted.
+
+    Parsed through the shared `load_workflow`, which ASSERTS the file parses to a mapping and names
+    it if not. A local `yaml.safe_load(...) or {}` would instead drop an unparseable workflow out of
+    this map silently -- and this map is the input every coverage assertion below rests on.
+    """
+    names: dict[str, str] = {}
+    for path in WORKFLOWS.glob("*.yml"):
+        name = load_workflow(path.name).get("name")
+        if isinstance(name, str):
+            names[path.name] = name
+    return names
+
+
+def _watched_files(names: Mapping[str, str], watched: Iterable[str]) -> set[str]:
+    """Workflow FILES whose `name:` is in `watched`.
+
+    `workflow_run` matches on the name, so every question here has to cross that indirection. Spelling
+    it out at each site is how three slightly different spellings of one rule appear.
+    """
+    watched_set = set(watched)
+    return {file for file, name in names.items() if name in watched_set}
+
+
+@functools.cache
+def _declared_exclusions() -> dict[str, str]:
+    """Workflow files this file says it deliberately does not watch -> the recorded reason.
+
+    Read from the workflow's OWN header rather than restated here. Two copies of one list are free to
+    drift, and a test that carries the second copy passes while the record it is meant to enforce is
+    wrong -- which is the defect BACKLOG #1335 was.
+    """
+    text = FILE.read_text(encoding="utf-8")
+    return {m.group("file"): m.group("reason") for m in _NOT_WATCHED.finditer(text)}
+
+
+@functools.cache
+def _required_context_workflows() -> dict[str, str]:
+    """Every required status-check context -> the workflow FILE that can report it."""
+    mapping: dict[str, str] = {}
+    for context in required_contexts():
+        where = resolve(context)
+        # The required-but-absent trap (docs/CI.md): a required context nothing can report blocks
+        # every pull request forever. Never skip it -- an unresolvable context is also a context this
+        # coverage check would otherwise pass over in silence.
+        assert where is not None, (
+            f"required context {context!r} resolves to no workflow in .github/workflows. Either the "
+            "job was renamed or .github/required-contexts.txt is stale; both wedge every pull request."
+        )
+        mapping[context] = where[0]
+    assert mapping, ".github/required-contexts.txt yielded no contexts, so nothing below is checked"
+    return mapping
+
+
+def _unwatched(
+    context_workflow: Mapping[str, str],
+    workflow_name: Mapping[str, str],
+    watched: Iterable[str],
+    excluded: Iterable[str],
+) -> dict[str, str]:
+    """Required contexts whose workflow is neither watched nor excluded on the record.
+
+    PURE OVER ITS ARGUMENTS ON PURPOSE. The anti-vacuity arm below drives it with mutated copies of
+    the real inputs, so the guard can be shown to produce a DIFFERENT answer without any test editing
+    `failure-signal.yml` or `required-contexts.txt` on disk.
+    """
+    watched_set = set(watched)
+    excluded_set = set(excluded)
+    return {
+        context: workflow
+        for context, workflow in context_workflow.items()
+        if workflow not in excluded_set and workflow_name.get(workflow) not in watched_set
+    }
 
 
 def test_it_pulls_in_no_third_party_actions() -> None:
@@ -156,14 +276,8 @@ def test_every_watched_workflow_exists() -> None:
     under "DELIBERATELY NOT REQUIRED", because its SARIF upload needs a scope fork-PR tokens lack.
     Watching a non-required workflow is intentional -- a red CodeQL run is still worth attributing.
     """
-    watched = set(_on(_doc())["workflow_run"]["workflows"])
-    assert watched, "the watch list is empty, so every assertion below would pass against nothing"
-    present = set()
-    for path in WORKFLOWS.glob("*.yml"):
-        doc = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
-        name = doc.get("name")
-        if isinstance(name, str):
-            present.add(name)
+    watched = _watched_names()
+    present = set(_workflow_names().values())
     # Positive control: the scan must actually be reading workflows, or `missing` below is just the
     # watch list back again and the failure message would blame the wrong file.
     assert len(present) > 5, f"the workflow scan found only {len(present)} named files"
@@ -183,3 +297,155 @@ def test_it_only_acts_on_a_real_failure() -> None:
     condition = _doc()["jobs"]["signal"]["if"]
     assert "conclusion == 'failure'" in condition
     assert "cancelled" not in condition
+
+
+# ---------------------------------------------------------------------------------------------------
+# COVERAGE IN THE OTHER DIRECTION (BACKLOG #1402). `test_every_watched_workflow_exists` asks whether
+# each watched name is real. These ask the reverse -- whether each workflow that GATES A MERGE is
+# watched -- which is the direction nothing checked, and the direction a newly armed context breaks.
+# ---------------------------------------------------------------------------------------------------
+
+
+def test_every_required_workflow_is_watched_or_excluded_on_the_record() -> None:
+    """A required workflow nobody watches goes red and signals nobody, which is the whole defect.
+
+    Silence is not self-describing: a required workflow missing from the watch list looks exactly like
+    one somebody decided not to watch. So the only difference this test can read is whether a reason
+    was written down, and it requires one.
+    """
+    uncovered = _unwatched(
+        _required_context_workflows(), _workflow_names(), _watched_names(), _declared_exclusions()
+    )
+    assert uncovered == {}, (
+        f"these required contexts report from workflows failure-signal.yml neither watches nor "
+        f"excludes: {uncovered}. Add the workflow's `name:` to the `workflows:` list, or add a "
+        f"`# not-watched: <file> -- <reason>` line to that file's header saying why a red there needs "
+        f"no attribution. If you believe a reason IS written, check that the line matches the format; "
+        f"an unparsed exclusion is not an exclusion (BACKLOG #1402)."
+    )
+
+
+def test_a_recorded_exclusion_names_a_real_workflow_that_really_is_required() -> None:
+    """An exclusion outlives what it excused, and then it reads as considered rather than stale."""
+    exclusions = _declared_exclusions()
+    known = set(_workflow_names())
+    required_workflows = set(_required_context_workflows().values())
+    for workflow, reason in exclusions.items():
+        assert workflow in known, (
+            f"failure-signal.yml excludes {workflow!r}, which is not a named workflow file here. "
+            "Either it was renamed or deleted; drop the exclusion with it."
+        )
+        assert workflow in required_workflows, (
+            f"failure-signal.yml excludes {workflow!r}, but no required context reports from it any "
+            "more, so the exclusion excuses nothing. Delete it rather than leaving a stale record."
+        )
+        assert len(reason) > 20, (
+            f"the exclusion for {workflow!r} gives the reason {reason!r}. A reason short enough to be "
+            "a label is not a reason; say what a reader should do with a red there instead."
+        )
+
+
+def test_nothing_is_both_watched_and_excluded() -> None:
+    """The two records must not contradict each other. One of them would then be wrong and unread."""
+    both = set(_declared_exclusions()) & _watched_files(_workflow_names(), _watched_names())
+    assert both == set(), (
+        f"{sorted(both)} are watched AND recorded as deliberately not watched. Whichever is stale, a "
+        "reader meeting one of them draws the wrong conclusion."
+    )
+
+
+def test_the_coverage_guard_can_produce_a_different_answer() -> None:
+    """THE ANTI-VACUITY ARM, and the load-bearing half of this pair.
+
+    The hole this item was scored on closed by accident: the one unwatched required workflow -- the
+    review gate -- was RETIRED on 2026-09-04, so the guard above passes for a reason that has nothing
+    to do with the guard. A check whose only evidence is a green run over healthy inputs cannot tell
+    "nothing is wrong" from "this asks nothing". So drive it with MUTATED COPIES of the real inputs
+    and show it says something different. Copies, never the files: a test that edits a workflow in
+    place breaks every sibling test running beside it.
+    """
+    contexts = _required_context_workflows()
+    names = _workflow_names()
+    watched = _watched_names()
+    excluded = _declared_exclusions()
+
+    # The untouched baseline. Without it the arms below prove only that the function returns
+    # something non-empty for some input, which any constant would satisfy.
+    assert _unwatched(contexts, names, watched, excluded) == {}
+
+    # 1. REMOVE A WATCHED NAME. Derived from the data rather than spelled out, so this arm keeps
+    #    testing the mechanism after the watch list changes.
+    covering = sorted(_watched_files(names, watched) & set(contexts.values()))
+    assert covering, "no required workflow is watched at all -- removing a watch cannot change this"
+    dropped = names[covering[0]]
+    assert _unwatched(contexts, names, watched - {dropped}, excluded) != {}, (
+        f"dropping {dropped!r} from the watch list left every required context still covered, so the "
+        "guard is not reading the watch list it claims to read"
+    )
+
+    # 2. ARM A NEW REQUIRED CONTEXT NOBODY WATCHES. This is the live case: the next context added to
+    #    branch protection arrives unwatched, and this is what must go red for it.
+    invented = dict(contexts) | {"a context armed after this test was written": "invented.yml"}
+    assert _unwatched(invented, names, watched, excluded) != {}, (
+        "a required context on a workflow nobody watches read as covered"
+    )
+
+    # 3. AN EXCLUSION THAT IS NOT WRITTEN DOWN IS NOT AN EXCLUSION -- and one that is, is honoured.
+    #    Both directions, or the exclusion set could be ignored entirely and arm 2 would not notice.
+    lone = {"a context on an unwatched workflow": "invented.yml"}
+    assert _unwatched(lone, names, watched, ()) != {}
+    assert _unwatched(lone, names, watched, {"invented.yml"}) == {}
+
+
+# ---------------------------------------------------------------------------------------------------
+# ATTRIBUTING A MERGE-QUEUE EJECTION (BACKLOG #1403).
+# ---------------------------------------------------------------------------------------------------
+
+
+def test_an_ejection_says_which_run_caused_it() -> None:
+    """A bare `ci-red` label on an ejected pull request points at nothing.
+
+    The pull request's own head is green, and the queue revalidates against a different job set, so
+    the ejecting job may be one the pull request never ran. The run name and URL are the only way in.
+    """
+    body = _run_block("attribute-ejection")
+    assert "gh pr comment" in body, (
+        "the attribution step no longer comments on the pull request, so an ejection is again a bare "
+        "label with nothing behind it"
+    )
+    assert "$RUN_NAME" in body and "$RUN_URL" in body, (
+        "the attribution comment names neither the run nor its URL, which is the only content that "
+        "makes it worth posting"
+    )
+
+
+def test_the_ejection_comment_is_scoped_to_the_merge_queue() -> None:
+    """A comment on every red pull request is noise a reader learns to skip.
+
+    Scoping it to `merge_group` is what keeps the comment worth reading: on an ordinary red the author
+    can find the run from the checks tab, so only the ejection case has nothing else to go on.
+    """
+    condition = str(_step("attribute-ejection")["if"])
+    assert "merge_group" in condition, (
+        "the attribution step is no longer gated on the merge-queue event. Ungated it comments on "
+        "every red pull request, which trains readers to ignore the comment."
+    )
+    assert "steps.resolve.outputs.pr" in condition, (
+        "the attribution step no longer requires a resolved pull request, so it would try to comment "
+        "on nothing when a queue run has no number to recover"
+    )
+
+
+def test_the_ejection_step_reads_its_run_values_from_the_environment() -> None:
+    """Same rule as the resolve step, asserted separately because it is a separate step.
+
+    The blanket scan above catches `${{` anywhere in a `run:` body. This adds the positive half for
+    THIS step: the values must actually arrive through `env:`, or the step could satisfy the blanket
+    scan by reading nothing at all.
+    """
+    env = _step("attribute-ejection").get("env", {})
+    from_event = {k for k, v in env.items() if "github.event" in str(v)}
+    assert from_event >= {"RUN_NAME", "RUN_URL"}, (
+        f"the attribution step's env carries {sorted(from_event)}. The run name and URL must reach "
+        "the script through the environment, never spliced into the body."
+    )
