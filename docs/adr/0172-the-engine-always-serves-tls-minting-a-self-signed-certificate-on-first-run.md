@@ -38,7 +38,7 @@ small. It is not small.
 
 | Client | How it decides the scheme |
 |---|---|
-| tray | **Infers** — `service_toml_uses_tls`, exactly ONE caller (`tray/config.py`) |
+| tray | **Infers** — `engine_serves_https` (was `service_toml_uses_tls`), exactly ONE caller (`tray/config.py`) |
 | `apiclient` | **Does not.** Zero references to `tls_cert_file`; it is *given* a base URL and only validates the scheme |
 | IDE | **Does not.** Its `tls_cert_file` hits are MLLP *connector* schema — the same name for a different setting |
 | harness | **Does not infer — it assumes.** Hardcoded `http://127.0.0.1:8765` |
@@ -140,7 +140,11 @@ reaches the engine over plaintext, and 0143's http-safe subset is what covers it
 - **`service_toml_uses_tls` does not become vestigial. It becomes wrong**, and that is worse. It
   reads `[api].tls_cert_file`, which a minting engine deliberately never writes, so it returns
   `False` while the engine serves https, and one caller turns that `False` into an `http` URL.
-  Repairing it is part B's first job.
+  Repairing it is part B's first job. **REPAIRED under BACKLOG #1126** (2026-09-06): the predicate
+  now mirrors `ensure_api_tls_material`'s three return paths -- a cert path, OR not
+  `tls_terminated_upstream` -- and is renamed `engine_serves_https`, because the retired name says
+  the file decides and the shipped default is the case where the file says nothing. That closes the
+  tray. `apiclient`, the IDE and the harness GUI are still part B.
 - **No deployment axis** ([§0](../../CLAUDE.md)) — zero instances, so nothing is served in the
   clear today and no upgrade breaks anyone. The change is cheap now and gets dearer with every
   client that learns the scheme its own way.

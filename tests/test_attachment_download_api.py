@@ -314,10 +314,14 @@ async def test_download_carries_sandbox_csp(engine: Engine, client: httpx.AsyncC
     mid, ref = await _seed_streaming(engine)
     r = await client.get(f"/messages/{mid}/attachments/{ref}")
     assert r.status_code == 200
-    assert r.headers["content-security-policy"] == "default-src 'none'; sandbox"
-    assert (
-        _ATTACHMENT_CSP == "default-src 'none'; sandbox"
-    )  # the constant the product actually ships
+    expected = "default-src 'none'; sandbox; frame-ancestors 'none'"
+    assert r.headers["content-security-policy"] == expected
+    assert expected == _ATTACHMENT_CSP  # the constant the product actually ships
+    # ASVS 3.4.6: `frame-ancestors` takes no fallback from `default-src`, so this policy NAMES it.
+    # Asserting the served value is ONE field is the point -- the header floor appends a second
+    # policy only where none names the directive, so this response stays governed by its own
+    # constant and would still deny framing if the floor were removed or re-ordered.
+    assert r.headers.get_list("content-security-policy") == [_ATTACHMENT_CSP]
     # The pre-existing layers are unchanged — the CSP is the fourth, not a replacement.
     assert r.headers["content-disposition"].startswith("attachment;")
     assert r.headers["x-content-type-options"] == "nosniff"

@@ -35,6 +35,7 @@ from messagefoundry.config.settings import (
     AlertsSettings,
     ApiSettings,
     AuthSettings,
+    SecretRotationSettings,
     SecuritySettings,
     ServiceSettings,
     StoreSettings,
@@ -51,7 +52,9 @@ def _loosenings(sec: SecuritySettings) -> list[tuple[str, str]]:
     The registry takes all four inputs as REQUIRED arguments deliberately (ADR 0148: one posture, and a
     deviation the registry cannot see is a second posture by the back door). The tests below are about
     the ``[security]`` switches specifically, so the other three are pinned at shipped values here."""
-    return security_loosenings(sec, StoreSettings(), AuthSettings(), AlertsSettings(), (), (), ())
+    return security_loosenings(
+        sec, StoreSettings(), AuthSettings(), AlertsSettings(), SecretRotationSettings(), (), (), ()
+    )
 
 
 PW = "a-strong-test-passphrase"  # >=15, no app/vendor terms — satisfies the ASVS policy
@@ -432,6 +435,26 @@ async def test_denial_carries_the_baseline_security_headers(engine: Engine) -> N
     assert resp.headers["Referrer-Policy"] == "no-referrer"
     assert resp.headers["X-Frame-Options"] == "DENY"
     assert resp.headers["Cache-Control"] == "no-store"
+
+
+async def test_both_denial_arms_carry_a_framing_decision(engine: Engine) -> None:
+    """ASVS 3.4.6. The JSON arm carried no Content-Security-Policy AT ALL, and the HTML page's policy
+    named `default-src 'none'` — from which `frame-ancestors` takes no fallback, so neither response
+    denied framing. Both are 403s a refused browser sees before sign-in.
+
+    Asserted on the EFFECTIVE value rather than on the directive's presence, and the page's own
+    `style-src 'unsafe-inline'` carve-out for its single inline block is pinned alongside, so a
+    change that bought the directive by dropping the carve-out reds here."""
+    app = _app(engine, WARD)
+    async with _client(app, "192.168.9.9") as c:
+        json_arm = await c.get("/status")
+        page = await c.get("/ui")
+    assert (
+        json_arm.headers["content-security-policy"] == "default-src 'none'; frame-ancestors 'none'"
+    )
+    assert page.headers["content-security-policy"] == (
+        "default-src 'none'; style-src 'unsafe-inline'; frame-ancestors 'none'"
+    )
 
 
 async def test_ui_and_html_clients_get_a_self_contained_denial_page(engine: Engine) -> None:

@@ -1,28 +1,28 @@
-^/ui/account/mfa/confirm$	mfa_confirm
-^/ui/account/mfa/disable$	mfa_disable
-^/ui/account/mfa/enroll$	mfa_enroll
-^/ui/account/sessions/[^/?#]+/revoke$	session_terminate
-^/ui/account/sessions/revoke-others$	session_terminate
-^/ui/account/webauthn/[^/?#]+/delete$	webauthn_delete
-^/ui/account/webauthn/enroll$	webauthn_enroll
-^/ui/ad-groups$	-
-^/ui/config/reload$	-
-^/ui/connections/[^/?#]+/purge/(top|all)$	-
-^/ui/connections/purge-confirm$	-
-^/ui/dead-letters/[^/?#]+(/[^/?#]+)?/replay$	-
-^/ui/dead-letters/replay-all$	-
-^/ui/messages/[^/?#]+/edit$	-
-^/ui/messages/[^/?#]+/replay$	-
-^/ui/messages/search$	-
-^/ui/messages/search/layered$	-
-^/ui/roles/[^/?#]+/edit$	-
-^/ui/roles/custom/[^/?#]+/delete$	-
-^/ui/roles/new$	-
-^/ui/uploaded-logs/file/[^/?#]+$	-
-^/ui/uploaded-logs/file/[^/?#]+/delete$	-
-^/ui/uploaded-logs/file/[^/?#]+/resend-confirm(\?[^#]*)?$	-
-^/ui/users/[^/?#]+$	-
-^/ui/users/[^/?#]+/(revoke-sessions|delete)$	-
-^/ui/users/[^/?#]+/reset-mfa$	admin_reset_mfa
-^/ui/users/[^/?#]+/reset-password$	admin_reset_password
-^/ui/users/new$	-
+^/ui/account/mfa/confirm$	mfa_confirm	step_up=0,auto_retry=0,unlock=1
+^/ui/account/mfa/disable$	mfa_disable	step_up=1,auto_retry=1,unlock=0
+^/ui/account/mfa/enroll$	mfa_enroll	step_up=0,auto_retry=1,unlock=0
+^/ui/account/sessions/[^/?#]+/revoke$	session_terminate	step_up=0,auto_retry=1,unlock=0
+^/ui/account/sessions/revoke-others$	session_terminate	step_up=0,auto_retry=1,unlock=0
+^/ui/account/webauthn/[^/?#]+/delete$	webauthn_delete	step_up=1,auto_retry=1,unlock=0
+^/ui/account/webauthn/enroll$	webauthn_enroll	step_up=0,auto_retry=1,unlock=0
+^/ui/ad-groups$	-	step_up=1,auto_retry=0,unlock=1
+^/ui/config/reload$	-	step_up=1,auto_retry=1,unlock=0
+^/ui/connections/[^/?#]+/purge/(top|all)$	-	step_up=1,auto_retry=1,unlock=0
+^/ui/connections/purge-confirm$	-	step_up=1,auto_retry=0,unlock=1
+^/ui/dead-letters/[^/?#]+(/[^/?#]+)?/replay$	-	step_up=1,auto_retry=1,unlock=0
+^/ui/dead-letters/replay-all$	-	step_up=1,auto_retry=1,unlock=0
+^/ui/messages/[^/?#]+/edit$	-	step_up=1,auto_retry=0,unlock=1
+^/ui/messages/[^/?#]+/replay$	-	step_up=1,auto_retry=1,unlock=0
+^/ui/messages/search$	-	step_up=1,auto_retry=0,unlock=1
+^/ui/messages/search/layered$	-	step_up=1,auto_retry=0,unlock=1
+^/ui/roles/[^/?#]+/edit$	-	step_up=1,auto_retry=0,unlock=1
+^/ui/roles/custom/[^/?#]+/delete$	-	step_up=1,auto_retry=1,unlock=0
+^/ui/roles/new$	-	step_up=1,auto_retry=0,unlock=1
+^/ui/uploaded-logs/file/[^/?#]+$	-	step_up=1,auto_retry=0,unlock=1
+^/ui/uploaded-logs/file/[^/?#]+/delete$	-	step_up=1,auto_retry=1,unlock=0
+^/ui/uploaded-logs/file/[^/?#]+/resend-confirm(\?[^#]*)?$	-	step_up=1,auto_retry=0,unlock=1
+^/ui/users/[^/?#]+$	-	step_up=1,auto_retry=0,unlock=1
+^/ui/users/[^/?#]+/(revoke-sessions|delete)$	-	step_up=1,auto_retry=1,unlock=0
+^/ui/users/[^/?#]+/reset-mfa$	admin_reset_mfa	step_up=1,auto_retry=1,unlock=0
+^/ui/users/[^/?#]+/reset-password$	admin_reset_password	step_up=1,auto_retry=1,unlock=0
+^/ui/users/new$	-	step_up=1,auto_retry=0,unlock=1

@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import json
+import time
 from collections.abc import AsyncIterator
 from pathlib import Path
 
@@ -152,3 +153,71 @@ async def test_ad_group_scope_map_admin_endpoint(engine: Engine) -> None:
         assert any(
             a["action"] == "ad_group_scope_map.updated" for a in await engine.store.list_audit()
         )
+
+
+# --- BACKLOG #1154 (ASVS 8.3.2): a map edit must apply immediately -----------
+
+
+async def _session_for(store: MessageStore, user_id: str, token: str) -> None:
+    """Give ``user_id`` one live session. Uses the store directly so the test does not depend on a
+    working directory bind, which is what the login path would need for an AD account."""
+    await store.create_session(
+        token_hash=token, user_id=user_id, expires_at=time.time() + 3600, client="pytest"
+    )
+
+
+@pytest.mark.parametrize(
+    ("setter", "action", "entry"),
+    [
+        # The two maps take DIFFERENT right-hand values -- a role id and a channel name -- and the
+        # role map has a foreign key onto the roles table, so a channel here fails the constraint
+        # rather than the assertion. Parametrised so each setter gets a value it will accept.
+        ("set_ad_group_map", "ad_group_map.updated", (Role.OPERATOR.value)),
+        ("set_ad_group_scope_map", "ad_group_scope_map.updated", "IB_A"),
+    ],
+)
+async def test_editing_an_ad_map_revokes_directory_sessions(
+    tmp_path: Path, setter: str, action: str, entry: str
+) -> None:
+    """Both AD map setters are authorization-value mutators, so both must revoke.
+
+    The group maps resolve to role sets and to channel scope, which is what an authorization
+    decision reads. Before BACKLOG #1154 neither setter revoked anything, so an edit did not reach a
+    session already running -- it waited for that principal's next login. Every sibling mutator
+    (`set_roles`, `set_channel_scope`, disable, password reset) already revoked.
+
+    The LOCAL account is the control, and it is the half that makes this test mean something: a
+    revoke-everything implementation would satisfy the AD assertion just as well, and this is what
+    tells the two apart. Neither map is read for a local account, so its session must survive.
+    """
+    store = await MessageStore.open(tmp_path / f"{setter}.db")
+    try:
+        service = AuthService(store, AuthSettings())
+        await service.initialize()
+
+        await store.create_user(user_id="ada", username="ada", auth_provider="ad")
+        await store.create_user(user_id="len", username="len", auth_provider="local")
+        await _session_for(store, "ada", f"h-ada-{setter}")
+        await _session_for(store, "len", f"h-len-{setter}")
+        # Liveness receipt: assert the precondition rather than assuming it. If session creation
+        # silently no-opped, every assertion below would pass on an empty table.
+        assert await store.list_sessions("ada"), "no AD session to revoke -- test proves nothing"
+        assert await store.list_sessions("len"), "no local session -- the control is not armed"
+
+        await getattr(service, setter)([("grp-a", entry)], actor="admin")
+
+        assert await store.list_sessions("ada") == [], (
+            f"{setter} left a directory session running on the pre-edit mapping"
+        )
+        assert await store.list_sessions("len"), (
+            f"{setter} revoked a LOCAL account's session; neither AD map is read for a local user"
+        )
+
+        rows = [a for a in await store.list_audit() if a["action"] == action]
+        assert len(rows) == 1, f"expected one {action} audit row, got {len(rows)}"
+        assert json.loads(rows[0]["detail"])["sessions_revoked"] == 1, (
+            "the audit row must record how many sessions the edit revoked, so an operator can see "
+            "the blast radius of a map change without reconstructing it"
+        )
+    finally:
+        await store.close()

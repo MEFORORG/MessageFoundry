@@ -88,6 +88,31 @@ import argparse
 import sys
 from datetime import UTC
 
+#: What `--insecure` actually does, printed beside the three two-box drives' ApiError exits.
+#:
+#: It replaced a one-line hint that simply told the operator to pass the flag, which promised a fix
+#: the flag cannot deliver (BACKLOG #1179). The retired sentence is quoted verbatim in that item and
+#: in `tests/test_harness_tls_anchor.py`, and NOWHERE under `harness/`: the test greps this corpus
+#: for it, and a copy sitting in a comment is indistinguishable from a copy still on an error path.
+#:
+#: Measured 2026-09-05 against a real TLS listener, on the lock-pinned httpx/cryptography: the flag
+#: clears THIS CLIENT's construction-time refusal and nothing else, so against a stock engine -- which
+#: mints a certificate and serves TLS since ADR 0172 -- the poll then dies at the TLS layer with an
+#: opaque `httpx.ReadError` instead. Trading a named refusal for an unnamed transport error is worse
+#: than the refusal, which is why the old wording had to go rather than be softened.
+#:
+#: The two-box rig has no https path yet, deliberately: the engine box is one this process never
+#: spawned, so `harness.load.tlsmat`'s anchor cannot cover it and `EnginePoller._cacert_for` declines
+#: to pin a non-loopback URL. Sharing one certificate across the two boxes is a rig-provisioning
+#: decision recorded in BACKLOG #1276 part B, not a code change here. Stated once and reused at all
+#: three sites so the three copies cannot drift apart again.
+_INSECURE_HINT = (
+    "(hint: --insecure only clears this client's own refusal -- it cannot make a TLS-serving engine "
+    "answer http. A stock engine serves TLS (ADR 0172), so the poll then fails at the handshake "
+    "instead. The flag helps only where the engine box genuinely serves plaintext http, and it now "
+    "carries no credential.)"
+)
+
 
 def main(argv: list[str] | None = None) -> int:
     # Scenario text uses arrows (U+2192); a legacy Windows console (cp1252) would otherwise raise
@@ -1238,9 +1263,9 @@ def _run_shardcert_driver(argv: list[str]) -> int:
     parser.add_argument(
         "--insecure",
         action="store_true",
-        help="allow the REMOTE /stats poller to use plaintext http to the engine box (a trusted-network "
-        "dev/bench setup; loopback never needs it). REQUIRED when the engine API is http, else the poller "
-        "fail-closes on the non-loopback URL at drain",
+        help="allow the REMOTE /stats poller plaintext http to an engine box that GENUINELY serves "
+        "plaintext http (loopback never needs it). Without it the poller fail-closes on the non-loopback "
+        "URL at drain. It does not make a TLS-serving engine answer http, and it carries no credential",
     )
     _add_coord_args(parser)
     parser.add_argument("--report-json", help="write the JSON report to this path")
@@ -1271,7 +1296,7 @@ def _run_shardcert_driver(argv: list[str]) -> int:
         ApiError
     ) as exc:  # plaintext http to a remote engine without --insecure — actionable, not a crash
         print(
-            f"shardcert-driver: {exc}\n(hint: pass --insecure for a trusted-network http engine)",
+            f"shardcert-driver: {exc}\n{_INSECURE_HINT}",
             file=sys.stderr,
         )
         return 2
@@ -1514,9 +1539,10 @@ def _run_shardcert_drive(argv: list[str]) -> int:
     parser.add_argument(
         "--insecure",
         action="store_true",
-        help="allow the engine /stats poller to use plaintext http to the REMOTE engine box (a "
-        "trusted-network dev/bench setup; loopback never needs it). REQUIRED for a two-box drive whose "
-        "engine API is http, else the poller fail-closes on the non-loopback URL after spawning children",
+        help="allow the engine /stats poller plaintext http to a REMOTE engine box that GENUINELY "
+        "serves plaintext http (loopback never needs it). Without it the poller fail-closes on the "
+        "non-loopback URL after spawning children. It does not make a TLS-serving engine answer http, "
+        "and it carries no credential",
     )
     _add_coord_args(parser)
     parser.add_argument("--report-json", help="write the JSON report to this path")
@@ -1550,7 +1576,7 @@ def _run_shardcert_drive(argv: list[str]) -> int:
         ApiError
     ) as exc:  # plaintext http to a remote engine without --insecure — actionable, not a crash
         print(
-            f"shardcert-drive: {exc}\n(hint: pass --insecure for a trusted-network http engine)",
+            f"shardcert-drive: {exc}\n{_INSECURE_HINT}",
             file=sys.stderr,
         )
         return 2
@@ -1843,7 +1869,8 @@ def _run_shardcert_drive_ladder(argv: list[str]) -> int:
     parser.add_argument(
         "--insecure",
         action="store_true",
-        help="allow the REMOTE /stats poller plaintext http to the engine box (REQUIRED for a two-box http engine)",
+        help="allow the REMOTE /stats poller plaintext http to an engine box that GENUINELY serves "
+        "plaintext http. It does not make a TLS-serving engine answer http, and it carries no credential",
     )
     parser.add_argument(
         "--engine-report-timeout",
@@ -1912,7 +1939,7 @@ def _run_shardcert_drive_ladder(argv: list[str]) -> int:
         return 2
     except ApiError as exc:  # plaintext http to a remote engine without --insecure
         print(
-            f"shardcert-drive-ladder: {exc}\n(hint: pass --insecure for a trusted-network http engine)",
+            f"shardcert-drive-ladder: {exc}\n{_INSECURE_HINT}",
             file=sys.stderr,
         )
         return 2

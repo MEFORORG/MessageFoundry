@@ -139,8 +139,12 @@ def _seg(value: str | int) -> str:
     return quote(str(value), safe="")
 
 
-def _assert_safe_transport(base_url: str, *, allow_insecure: bool) -> None:
+def _assert_safe_transport(base_url: str, *, allow_insecure: bool) -> bool:
     """Permit only safe URL schemes, then refuse plaintext ``http`` to a non-loopback host.
+
+    Returns ``True`` when the caller has opted into a **cleartext non-loopback hop** -- the one
+    permitted-but-unencrypted shape. :class:`EngineClient` stores that and refuses to put a
+    credential on such a hop; see :meth:`EngineClient._refuse_credential_on_cleartext`.
 
     Two checks, in this order, and the order is load-bearing.
 
@@ -157,10 +161,23 @@ def _assert_safe_transport(base_url: str, *, allow_insecure: bool) -> None:
     ``""``), which is a deliberate change: such a URL could never have reached an engine, and
     failing at construction beats failing later with an opaque transport error.
 
-    **Plaintext http to a remote host (CONSOLE-3).** A remote ``http://`` URL would put the bearer
-    token and PHI on the wire in cleartext, so a remote engine must be reached over the engine's
-    built-in TLS (``https://``, WP-13a). Loopback http and any https are fine; a non-loopback http
-    URL requires an explicit ``allow_insecure`` opt-in (trusted-network dev only), loudly warned.
+    **Plaintext http to a remote host (CONSOLE-3, ASVS 12.3.3, BACKLOG #1179).** A remote
+    ``http://`` URL would put the bearer token and PHI on the wire in cleartext, so a remote engine
+    must be reached over the engine's built-in TLS (``https://``, WP-13a). Loopback http and any
+    https are fine; a non-loopback http URL requires an explicit ``allow_insecure`` opt-in, loudly
+    warned -- and that opt-in is now **clamped to unauthenticated reads**.
+
+    **Why clamped rather than deleted, measured 2026-09-05 against a real TLS listener.**
+    [ADR 0172](../../docs/adr/0172-the-engine-always-serves-tls-minting-a-self-signed-certificate-on-first-run.md)
+    makes the engine mint a certificate and serve TLS when the operator configures none, so a stock
+    engine no longer answers ``http`` at all: with the escape on, the client constructs and then the
+    first request dies at the TLS layer with an opaque ``ReadError``. The escape therefore buys a
+    working hop in exactly one shipped topology -- an operator-declared ``tls_terminated_upstream``
+    engine, which ADR 0172 excludes on purpose and which genuinely speaks plaintext. Deleting the
+    parameter outright would remove the only way to express that topology and would leave the two-box
+    bench rig (``harness/load/shardcert.py``) with no posture at all, while the credential clamp
+    removes the harm the refusal text names without removing the expression. Every caller that
+    threads ``allow_insecure=True`` today polls tokenless, so the clamp costs them nothing.
     """
     parts = urlsplit(base_url)
     scheme = parts.scheme.lower()
@@ -171,19 +188,24 @@ def _assert_safe_transport(base_url: str, *, allow_insecure: bool) -> None:
             f"{' and '.join(sorted(_ALLOWED_URL_SCHEMES))} schemes."
         )
     if scheme == "https":
-        return
+        return False
     host = (parts.hostname or "").lower()
     if host in _LOOPBACK_HOSTS or host == "":
-        return
+        return False
     if allow_insecure:
         _log.warning(
-            "sending credentials over plaintext http to non-loopback host %r (allow_insecure)", host
+            "plaintext http to non-loopback host %r (allow_insecure): unauthenticated reads only -- "
+            "this client refuses to send a credential over it, and a stock engine serves TLS and "
+            "will not answer http at all",
+            host,
         )
-        return
+        return True
     raise ApiError(
         f"refusing to use plaintext http to non-loopback host {host!r}: the bearer token and PHI "
-        "would cross the network in cleartext. Use an https URL, or pass --insecure for a "
-        "trusted-network dev setup."
+        "would cross the network in cleartext. Use an https URL -- the engine serves TLS on its "
+        "shipped default (ADR 0172), so a stock engine will not answer http whatever this client "
+        "permits. The allow_insecure escape covers only an engine declared tls_terminated_upstream, "
+        "and it carries no credential."
     )
 
 
@@ -250,7 +272,9 @@ class EngineClient:
         self._cacert = cacert
         self._tls_client_cert = tls_client_cert
         self._tls_client_key = tls_client_key
-        _assert_safe_transport(self.base_url, allow_insecure=allow_insecure)
+        #: True only on a permitted-but-cleartext non-loopback hop (`allow_insecure`). Gates every
+        #: credential this client could emit -- see _refuse_credential_on_cleartext.
+        self._cleartext_hop = _assert_safe_transport(self.base_url, allow_insecure=allow_insecure)
         # How the engine's server cert is trusted (OS store by default; `cacert` to pin a self-signed /
         # internal-CA PEM) plus an optional client cert for mutual TLS (ASVS 12.3.5) when the engine
         # requires one (api.tls_client_ca_file → CERT_REQUIRED). See _build_verify_context.
@@ -318,6 +342,28 @@ class EngineClient:
 
     # --- requests ------------------------------------------------------------
 
+    def _refuse_credential_on_cleartext(self, what: str) -> None:
+        """Refuse to put ``what`` on a permitted-but-cleartext non-loopback hop (BACKLOG #1179).
+
+        The ``allow_insecure`` escape exists for an engine that genuinely serves plaintext http.
+        It is **not** a licence to send the credential the refusal text says it is protecting: a
+        bearer token, a password, or a second factor crossing that hop is exactly the harm ASVS
+        12.3.3 and CONSOLE-3 name. Unauthenticated reads (``/health``, ``/stats``) stay allowed --
+        that is what the bench pollers use it for, and they pass no token.
+
+        Raised at the credential's ENTRY point rather than at the header build, so the failure names
+        the call the operator made. ``_request`` re-checks because ``for_polling`` copies ``_token``
+        directly, so the invariant must hold structurally and not by the entry points alone.
+        """
+        if not self._cleartext_hop:
+            return
+        host = urlsplit(self.base_url).hostname or self.base_url
+        raise ApiError(
+            f"refusing to send {what} over plaintext http to non-loopback host {host!r}: "
+            "allow_insecure permits unauthenticated reads on a declared-plaintext engine, never a "
+            "credential. Use an https URL."
+        )
+
     def _get(self, path: str, **params: object) -> httpx.Response:
         return self._request("GET", path, params={k: v for k, v in params.items() if v is not None})
 
@@ -330,6 +376,8 @@ class EngineClient:
         _allow_mfa: bool = True,
         **kw: object,
     ) -> httpx.Response:
+        if self._token is not None:
+            self._refuse_credential_on_cleartext("a bearer token")
         headers = {"Authorization": f"Bearer {self._token}"} if self._token else None
         # ASVS 4.2.5: bound the request line and the bearer this client emits. The limits are
         # DUPLICATED from transports/rest.py rather than imported: ADR 0088 makes this package
@@ -411,6 +459,7 @@ class EngineClient:
         When the 403 that triggered this reauth named a per-action step-up (``X-Step-Up-Action``, ADR
         0077), the stashed action rides along as ``purpose`` so the engine mints a grant BOUND to it;
         a plain session-window step-up posts ``{"password": …}`` unchanged."""
+        self._refuse_credential_on_cleartext("a password")
         action = self._pending_step_up_action
         self._pending_step_up_action = None  # single-use: one reauth per named action
         body: dict[str, str] = {"password": password}
@@ -445,6 +494,7 @@ class EngineClient:
     def verify_mfa(self, code: str) -> None:
         """Satisfy the current session's second factor with a TOTP or single-use recovery code. Raises
         :class:`ApiError` (401) on a wrong code. Does not itself trigger the MFA handler."""
+        self._refuse_credential_on_cleartext("a second factor")
         self._request("POST", "/auth/mfa-verify", json={"code": code}, _allow_mfa=False)
 
     def disable_mfa(self) -> None:
@@ -692,6 +742,7 @@ class EngineClient:
 
     def set_token(self, token: str) -> None:
         """Adopt an existing token (e.g. from the OS keyring) and refresh the cached user."""
+        self._refuse_credential_on_cleartext("a bearer token")
         self._token = token
         self._user = self.me()
 
@@ -704,6 +755,7 @@ class EngineClient:
         return _decode(self._get("/auth/providers"), ProvidersInfo)
 
     def login(self, username: str, password: str, *, provider: str = "local") -> LoginResponse:
+        self._refuse_credential_on_cleartext("a password")
         result = _decode(
             self._request(
                 "POST",

@@ -28,6 +28,21 @@ All notable changes to MessageFoundry are documented here. The format follows
   to a truncated tail. ([BACKLOG #328](docs/BACKLOG.md))
 
 ### Changed
+- **An API request body with an unknown or misspelled key is now refused with HTTP 422 instead of
+  being accepted and silently dropped.** Pydantic's default is `extra="ignore"`, and none of the 125
+  models in `messagefoundry/api/models.py` and `messagefoundry/api/auth_models.py` overrode it — so a
+  key the engine did not recognise vanished and the route answered success. The sharpest case was
+  `PUT /users/{id}/channel-scope`: `channels` is optional and `None` means *all channels*, so
+  `{"chanels": ["IB_ACME_ADT"]}` asked for one connection and granted every one of them.
+  **The posture is request-scoped, and that is the whole design.** The 32 models FastAPI parses out
+  of a request body now subclass `messagefoundry.api.request_model.RequestModel`, which forbids
+  unknown keys; the 93 response-only models stay tolerant, because `messagefoundry.apiclient` reads
+  engine responses into those same classes and the web console ships as a separately-versioned wheel
+  — a strict response model would make an older client raise on a newer engine that merely grew a
+  field. Five shapes (`AdGroupMap`, `AdGroupMapEntry`, `AdGroupScopeEntry`, `AdGroupScopeMap`,
+  `ChannelScope`) travel in both directions; they carry the request rule because a dropped key on the
+  RBAC writes is a mis-grant, so adding a field to one of them needs the client bump in the same
+  release. ([BACKLOG #1109](docs/BACKLOG.md))
 - **The authorization-grant audit trail now defaults ON, so a deployment records every authorization
   grant rather than only the state-changing ones.** `[security].audit_all_authorization_decisions` and
   the internal `[diagnostics].audit_all_authz` it desugars to both default `true`. Until now only a

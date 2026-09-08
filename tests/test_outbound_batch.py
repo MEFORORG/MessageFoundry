@@ -12,12 +12,12 @@ from __future__ import annotations
 
 import asyncio
 import os
-import time
 from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any
 
 import pytest
+from _pace_probe import install_pace_probe
 
 from messagefoundry.config.models import BatchConfig, RetryPolicy
 from messagefoundry.config.wiring import Registry
@@ -352,30 +352,44 @@ async def test_max_count_caps_the_batch(store: Any) -> None:
 # --- BACKLOG #82: the BATCH send seam honors send pacing (the key remainder proof) ---------------
 
 
-async def test_batch_seam_is_paced(store: Any) -> None:
+async def test_batch_seam_is_paced(store: Any, monkeypatch: pytest.MonkeyPatch) -> None:
     # The pacing gate sits BEFORE the batch body in the delivery seam (_dispatch_delivery pooled /
     # _delivery_worker per_lane), so a whole BHS…BTS batch counts as ONE send interval. Prove it through
-    # _dispatch_delivery (the directly-callable pooled seam): the SECOND batch delivery is held ~interval
-    # after the first one began. This is the remainder that closes #82's unpaced-batch defect.
+    # _dispatch_delivery (the directly-callable pooled seam). This is the remainder that closes #82's
+    # unpaced-batch defect.
+    #
+    # THE ASSERTION IS WHAT THE PACER DECIDED, NOT HOW LONG THE BOX TOOK TO OBEY. Why the
+    # `elapsed >= 0.8 * interval` form this replaces could not do that job, and the measurement
+    # behind the claim: tests/_pace_probe.py.
+    #
+    # Mutations this refuses: delete `await self._pace_outbound(lane)` from _dispatch_delivery and
+    # `calls` comes back empty; delete the `await asyncio.sleep(...)` from _pace_outbound and `slept`
+    # comes back empty; move the gate inside the batch body's per-row loop and `calls` reads six.
     await _enqueue(store, 6)
     runner = _runner(store, claim_mode="pooled")
     rec = _Recorder()
     _wire_batch(runner, rec, BatchConfig(max_count=3, max_wait_ms=1))
     interval = 0.05
     runner._send_pace[DEST] = interval  # as _resolve_send_pace sets it from the connection settings
+    work = 0.02  # the first batch's body, charged to the pacer's clock
+    probe = install_pace_probe(monkeypatch, runner)
 
     head1 = await store.claim_next_fifo(DEST)
-    await runner._dispatch_delivery(DEST, head1)  # first batch: no prior send → not paced
+    await runner._dispatch_delivery(DEST, head1)  # first batch: no prior send → nothing owed
     assert "BTS|3" in rec.sent[0]
+    assert probe.calls == [DEST]  # the batch seam reached the pacer
+    assert probe.slept == []  # …and the pacer correctly asked for no wait
 
+    probe.advance(work)  # the first batch's framing/send/complete, as the pacer's clock sees it
     head2 = await store.claim_next_fifo(DEST)
-    t0 = time.monotonic()
-    await runner._dispatch_delivery(DEST, head2)  # second batch: held ~interval before its send
-    elapsed = time.monotonic() - t0
+    # Second batch: held for the REMAINDER of the interval, the first batch's work already credited.
+    await runner._dispatch_delivery(DEST, head2)
     assert "BTS|3" in rec.sent[1]
-    assert (
-        elapsed >= interval * 0.8
-    )  # the batch seam WAS paced (generous lower bound, no early return)
+    # ONE pace per BATCH: six messages in two envelopes, so the pacer ran twice, not six times.
+    assert probe.calls == [DEST, DEST]
+    # Exact, because both the credit for work already done and the wait itself are on a clock the test
+    # owns; the 1e-9 absorbs binary float representation only, never a timing difference.
+    assert probe.slept == [pytest.approx(interval - work, abs=1e-9)]
     depth, _ = await store.pending_depth(DEST)
     assert (
         depth == 0
