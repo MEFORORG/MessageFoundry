@@ -181,6 +181,19 @@ class ConnScaleRecord:
     fd_probe_ticks: int = 0
     fd_probe_degraded_ticks: int = 0
     fd_probe_degraded: tuple[str, ...] = ()
+    # How many engine readings the step's in-hold sampler produced, NOT counting the post-drain final
+    # (BACKLOG #1430). Every window derived from this step reads a first and a last reading, so a step
+    # that produced one has no window at all -- and until this field existed, nothing in the artifact
+    # said which had happened. `harness.load.connscale.runner._MIN_IN_HOLD_SAMPLES` is the floor the
+    # sampler now guarantees; the smoke asserts it per step. Defaults to 0 so an older artifact
+    # deserializes unchanged, and 0 there means "not recorded", not "the sampler read nothing".
+    in_hold_samples: int = 0
+    # How many of those readings the sampler's FLOOR had to supply past the hold's end. Zero on a hold
+    # that met the floor on its own, which is the healthy case. It is the SCOPE for the count above, in
+    # the same way `fd_probe_ticks` is the scope for `fd_probe_degraded_ticks`: a step that limped to
+    # the floor and a step that cleared it comfortably report the same `in_hold_samples`, and a reader
+    # choosing a verdict needs to tell those apart. Reported, never graded.
+    in_hold_floor_ticks: int = 0
     # --- BACKLOG #1292: the intake audit, the PER-MESSAGE discriminator for a no_loss shortfall ---
     # `no_loss` compares COUNTS, and a shortfall in it reads identically whether the engine lost an
     # acknowledged message or the `engine_read` gauge was short. These carry the per-message verdict
@@ -221,6 +234,10 @@ class ConnScaleRecord:
                 "timeouts": self.timeouts,
                 "in_pipeline_peak": self.in_pipeline_peak,
                 "drain_seconds": self.drain_seconds,
+                # The SCOPE of every peak and rate above it: those are derived from the in-hold
+                # readings, and one reading is a peak over a single instant (BACKLOG #1430).
+                "in_hold_samples": self.in_hold_samples,
+                "in_hold_floor_ticks": self.in_hold_floor_ticks,
             },
             "no_loss": {
                 "ok": self.no_loss.ok,

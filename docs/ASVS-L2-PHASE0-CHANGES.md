@@ -255,13 +255,25 @@ erasure.
 ### Rotation schedule (ASVS 13.1.4 / 13.3.4)
 
 A rotation cadence per critical secret, justified against the threat model + HIPAA. These are
-**operator-policy defaults** — the engine does **not** force-rotate or hard-expire a secret (rotation
-*execution* stays operator- / secret-manager-driven, by design). It **does** now **monitor** the cadence
+**operator-policy defaults** — the engine does **not** force-rotate a secret (rotation *execution* stays
+operator- / secret-manager-driven, by design). **The store DEK is the one exception, and it is a hard
+expiry**: see the note directly below. The engine **monitors** every cadence
 (ASVS 13.3.4, BACKLOG #282): the store DEK is tracked live-by-default and every configured secret class
 the engine holds is fingerprinted with a **DEK-derived keyed MAC** in store meta, so a **rotation is
 auto-detected** (the fingerprint changes → the clock resets) and a `secret_rotation_due` alert fires
 against the cadence below — never operator-attested, and carrying only dates + a one-way MAC, never a
-value. Under `[security].enforcement=ENFORCE` a DEK past its max-age + grace **escalates** at restart.
+value.
+
+> **The store DEK's calendar cadence is ENFORCED, not suggested** (ASVS 13.3.4, BACKLOG #1004). Under
+> `[security].enforcement=ENFORCE` with a keyed store, a DEK past `store_key_max_age_days +
+> enforce_grace_days` — or one whose age cannot be determined — **aborts engine start**
+> (`StoreKeyRotationOverdueError`), in addition to the escalated alert rather than instead of it. The
+> annual cadence in the table below is therefore a control on this one row, not a recommendation. The
+> same key's **usage** axis has always refused unconditionally at 2^32 encrypts; this brings the calendar
+> axis level with it. `[secret_rotation].enforce_store_key_expiry = false` keeps the alert and drops the
+> refusal, and is reported by `security_loosenings()` on every boot. **This paragraph is a RECORD
+> CORRECTION that FOLLOWS a shipped code change, not a lever:** the sentences it replaces became false
+> when the refusal landed, and an edit that *substituted* for the code would be the forbidden move.
 
 | Secret (env var / connector setting) | Suggested cadence | Trigger / notes |
 |---|---|---|
@@ -301,8 +313,9 @@ value. Under `[security].enforcement=ENFORCE` a DEK past its max-age + grace **e
 > cert (`[logging].forward_tls_client_cert`, a single combined PEM). Each secret **value** is
 > **`env()`-sourced — never the config file (the fixed `MEFOR_*` set is enforced by
 > `settings._FILE_SECRET_KEYS`) — and `/metadata` viewer-redacted**. Rotation *execution* stays operator-
-> / secret-manager-driven — the engine never force-rotates or hard-expires a secret (session tokens are the
-> one engine-expired credential) — but it now **monitors** the cadence and **auto-detects** a rotation
+> / secret-manager-driven — the engine never force-rotates a secret, and the only credentials it
+> hard-expires are session tokens and the **store DEK** (BACKLOG #1004: a calendar-overdue DEK refuses to
+> start under ENFORCE) — but it now **monitors** the cadence and **auto-detects** a rotation
 > (ASVS 13.3.4 — see the rotation-watcher note below). **This enumeration is drift-guarded by
 > `tests/test_secret_rotation_inventory.py`**, which fails the build when a new `MEFOR_*` secret name (`…_TOKEN` / `…_SECRET` / `…_PASSWORD` /
 > `…_KEY`) appears in `messagefoundry/` without a row here — the exact 2026-07-16 regression that put this cell
@@ -331,6 +344,13 @@ value. Under `[security].enforcement=ENFORCE` a DEK past its max-age + grace **e
 > - **ENFORCE escalation (committed).** Under `[security].enforcement=ENFORCE`, a DEK older than
 >   `store_key_max_age_days + enforce_grace_days` escalates its `secret_rotation_due` alert (`enforced`,
 >   logged at ERROR) at restart.
+> - **ENFORCE refusal (BACKLOG #1004).** The same condition, on the same arithmetic, then **stops the
+>   start**: `enforce_store_key_expiry` raises `StoreKeyRotationOverdueError` out of `Engine.start()`,
+>   aborting the ASGI lifespan. It is called **outside** the blanket handler guarding the reconcile above
+>   — beneath it the refusal would be logged and stepped over, which is a traceback rather than a
+>   control. An **undetermined** age (the reconcile failed and no `store_key_last_rotated` override is
+>   set) refuses too: an undetermined age is not a young one. `enforce_store_key_expiry = false` keeps the
+>   alert, drops the refusal, and is named as a security loosening on every boot.
 > - **Review cadence.** This section + the keyed-secret enumeration are reviewed **quarterly** and on any
 >   new `[store].cipher_provider` / `CRITICAL_SECRETS` change, tied to the drift guard above +
 >   `scripts/security/crypto_inventory_check.py` so the definition cannot silently rot.
@@ -465,8 +485,8 @@ tables in [`CONNECTIONS.md`](CONNECTIONS.md) §"Resource management & limits" (A
 | SMART Backend Services token endpoint (ADR 0024) | outbound | HTTPS POST to the operator-pinned token URL (no discovery); routed through the connection's forward proxy when one resolves for the **token** host | the REST verifying no-redirect opener; a cleartext-`http` token URL is **refused** unless `MEFOR_ALLOW_INSECURE_TLS` (the client assertion is a credential) | a signed `client_assertion` JWT (`smart_private_key`, optionally passphrase-protected) | **yes** — `smart_token_url` per Connection | `smart_token_url`, `smart_client_id`, `smart_private_key`, `smart_scope`, `smart_timeout_seconds`, `smart_expiry_skew_seconds` |
 | Generic OAuth2 client-credentials token endpoint | outbound | HTTPS POST for the non-SMART REST/SOAP/FHIR/DICOMweb bearer path; also proxy-routed per token host | the same verifying no-redirect opener; a cleartext-`http` credential hop is posture-keyed and refused | `oauth2_client_id` + `oauth2_client_secret`, sent `basic` or `post` per `oauth2_auth_style` | **yes** — `oauth2_token_url` per Connection | `oauth2_token_url`, `oauth2_client_id`, `oauth2_client_secret`, `oauth2_scope`, `oauth2_auth_style`, `oauth2_timeout_seconds` |
 | Engine-brokered AI assistance (ADR 0135) | outbound | HTTPS POST of a `code_only` assist prompt to a **customer-managed / self-hosted** LLM endpoint; runs off the event loop | the REST verifying no-redirect opener; a cleartext-`http` endpoint carrying the key is refused unless `MEFOR_ALLOW_INSECURE_TLS` | `MEFOR_AI_API_KEY`, sent as the `x-api-key` header | **yes** — verbatim the requirement's "the end user provides an external location" | `[ai].endpoint`, `[ai].api_key`, `[ai].allowed_endpoints` (a **dedicated fail-closed** SSRF allowlist — an EMPTY list refuses everything; deliberately **not** `[egress].allowed_http`), `[ai].provider`, `[ai].model` |
-| HashiCorp Vault Transit — store DEK envelope-decrypt (ADR 0019) | outbound | HTTPS via `hvac` (the `[vault]` extra); port from the address | TLS verification is `hvac`/`requests`' own default — the engine sets no explicit client TLS options here | a Vault token — `MEFOR_STORE_VAULT_TOKEN` (`hvac` falls back to `VAULT_TOKEN` when unset) | **yes** — `MEFOR_STORE_VAULT_ADDR` (opt-in; fail-closed) | `MEFOR_STORE_VAULT_ADDR`, `MEFOR_STORE_VAULT_TOKEN`, `MEFOR_STORE_VAULT_TRANSIT_KEY` |
-| HashiCorp Vault Transit — **bulk at-rest cipher** (`[store].cipher_provider = vault_transit`, ADR 0138) | outbound (**per store operation**) | HTTPS via the same shared `hvac` client build; port from the address. **One `encrypt_data` / `decrypt_data` round trip per encrypted CELL** on every store write and read, plus one `generate_hmac` per audit row — not a startup-only hop | as the DEK hop: `hvac`/`requests` defaults, no engine-set client TLS options | the same Vault token (`MEFOR_STORE_VAULT_TOKEN`) | **yes** — `MEFOR_STORE_VAULT_ADDR` (shared with the DEK hop) | `[store].cipher_provider`, `MEFOR_STORE_TRANSIT_KEY`, `MEFOR_STORE_TRANSIT_AUDIT_KEY` |
+| HashiCorp Vault Transit — store DEK envelope-decrypt (ADR 0019) | outbound | HTTPS via `hvac` (the `[vault]` extra); port from the address | TLS verification defaults to `hvac`/`requests`' own **public** bundle. `MEFOR_STORE_VAULT_CA_FILE` (BACKLOG #1180, ASVS 12.3.4) narrows it to one internal CA, resolved through the same `resolve_trust_anchor` every other outbound hop uses; unset, the client is constructed exactly as before | a Vault token — `MEFOR_STORE_VAULT_TOKEN` (`hvac` falls back to `VAULT_TOKEN` when unset) | **yes** — `MEFOR_STORE_VAULT_ADDR` (opt-in; fail-closed) | `MEFOR_STORE_VAULT_ADDR`, `MEFOR_STORE_VAULT_TOKEN`, `MEFOR_STORE_VAULT_TRANSIT_KEY`, `MEFOR_STORE_VAULT_CA_FILE` |
+| HashiCorp Vault Transit — **bulk at-rest cipher** (`[store].cipher_provider = vault_transit`, ADR 0138) | outbound (**per store operation**) | HTTPS via the same shared `hvac` client build; port from the address. **One `encrypt_data` / `decrypt_data` round trip per encrypted CELL** on every store write and read, plus one `generate_hmac` per audit row — not a startup-only hop | as the DEK hop — same shared client build, so `MEFOR_STORE_VAULT_CA_FILE` narrows this hop too | the same Vault token (`MEFOR_STORE_VAULT_TOKEN`) | **yes** — `MEFOR_STORE_VAULT_ADDR` (shared with the DEK hop) | `[store].cipher_provider`, `MEFOR_STORE_TRANSIT_KEY`, `MEFOR_STORE_TRANSIT_AUDIT_KEY` |
 | DR backup destination (ADR 0049) | outbound (scheduled + on-demand) | local filesystem, or **SMB/CIFS over TCP when `[backup].destination` is a UNC path** (the OS redirector owns the port); a cloud URL is **rejected at load** | n/a — no engine-terminated TLS on this hop; SMB dialect security is the OS's | the engine service account's **own** identity — `[backup]` exposes no `credential_*` impersonation knob, unlike the FILE connector | **yes** — `[backup].destination` | `[backup].enabled`, `[backup].destination`, `schedule_at`, `retention_keep`, `snapshot_method`, `allow_unencrypted` |
 | Security-event notification email, per user | outbound | SMTP through the **same** `[alerts]` transport and default port 587, but a **second, independent** background dispatcher — its own 1000-item queue and its own drain task — mailing each affected USER's own address, not the operator `email_to` list | STARTTLS **and certificate verification**, as the operator sink — plumbed at this call site in its own right (`pipeline/security_notify.py`), not inherited implicitly | as the operator sink | **yes** — the same `[alerts].email_smtp_host` | `[auth].notify_security_events`, `[alerts].email_*` |
 | HashiCorp Vault KV v2 — connector-credential secrets provider (ADR 0019) | outbound | HTTPS via `hvac`, a **separate client** from the Transit one behind the same extra | as above | a Vault token — `MEFOR_SECRETS_VAULT_TOKEN` (falls back to `VAULT_TOKEN`) | **yes** — `MEFOR_SECRETS_VAULT_ADDR` (opt-in; fail-closed) | `MEFOR_SECRETS_VAULT_ADDR`, `MEFOR_SECRETS_VAULT_TOKEN`, `[secrets].provider` |
